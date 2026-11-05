@@ -798,6 +798,8 @@ mod tests {
             layer: None,
             role: role.into(),
             scale_name: None,
+            quant: None,
+            swap_halves: false,
         }
     }
 
@@ -1430,6 +1432,8 @@ mod tests {
                             layer: Some(layer),
                             role: role.into(),
                             scale_name: None,
+                            quant: None,
+                            swap_halves: false,
                         },
                     );
                 }

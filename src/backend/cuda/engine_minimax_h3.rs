@@ -1,4 +1,7 @@
 //! MiniMax-H3 FL2VA transformer execution.
+use crate::backend::cuda::weights::{
+    DequantCopy, QuantKernels, dequantizes, device_slot_bytes, quant_source_finite,
+};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
@@ -13,16 +16,17 @@ use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig,
     PushKernelArg,
 };
-use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
+use crate::checkpoint::{TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
-use crate::minimax_h3::{AdalnPlan, H3Spec, MODALITIES, adaln_input};
-use anyhow::{Context, Result, ensure};
+use crate::gguf::GgmlType;
+use crate::minimax_h3::{AdalnPlan, AdalnTimeEmbedder, H3Spec, MODALITIES, adaln_input};
+use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use safetensors::Dtype;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 #[path = "engine_minimax_h3_audio.rs"]
@@ -105,6 +109,24 @@ impl EntryReader {
         Ok(())
     }
 
+    /// The tensor's source bytes in a device buffer, for a quantized GGUF entry.
+    fn read_device(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        name: &str,
+        entry: &TensorEntry,
+    ) -> Result<CudaSlice<u8>> {
+        let bytes = self.read(name, entry)?;
+        quant_source_finite(name, entry, bytes)?;
+        let mut buffer = stream.alloc_zeros::<u8>(entry.bytes)?;
+        let (pointer, record) = buffer.device_ptr_mut(stream);
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
+        }
+        drop(record);
+        Ok(buffer)
+    }
+
     /// Copies a finite BF16 tensor into host memory of exactly its size.
     fn read_into(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
         ensure!(
@@ -117,6 +139,18 @@ impl EntryReader {
         let bytes = self.read(name, entry)?;
         ensure!(<bf16 as Element>::finite(bytes), "{name}: nonfinite value");
         destination.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Copies a quantized tensor's stored source bytes into host memory of exactly its size.
+    fn read_raw(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
+        ensure!(
+            entry.bytes == destination.len(),
+            "{name}: {} B does not fill {} B",
+            entry.bytes,
+            destination.len()
+        );
+        destination.copy_from_slice(self.read(name, entry)?);
         Ok(())
     }
 
@@ -198,7 +232,6 @@ impl AdalnTable {
         d: &Device,
         blas: &mut Blas,
         transformer_dir: &Path,
-        checkpoint: &MappedCheckpoint,
         manifest: &TensorManifest,
         spec: &H3Spec,
         plan: &AdalnPlan,
@@ -207,14 +240,22 @@ impl AdalnTable {
         let timesteps = plan.timesteps.len();
         let width = 6 * spec.hidden;
         let modulation = width * MODALITIES as usize;
-        let entry = |name: &str| {
-            manifest
-                .entries
-                .get(name)
-                .with_context(|| format!("manifest lacks {name}"))
+        let mut source = Source::new(transformer_dir, manifest);
+        let time = AdalnTimeEmbedder {
+            linear_1_weight: source.host_f32(
+                s,
+                "time_embedder.linear_1.weight",
+                spec.time_hidden * spec.freq_dim,
+            )?,
+            linear_1_bias: source.host_f32(s, "time_embedder.linear_1.bias", spec.time_hidden)?,
+            linear_2_weight: source.host_f32(
+                s,
+                "time_embedder.linear_2.weight",
+                spec.time_dim * spec.time_hidden,
+            )?,
+            linear_2_bias: source.host_f32(s, "time_embedder.linear_2.bias", spec.time_dim)?,
         };
-        let x = s.clone_htod(&adaln_input(spec, checkpoint, &plan.timesteps)?)?;
-        let mut reader = EntryReader::new(transformer_dir);
+        let x = s.clone_htod(&adaln_input(spec, &time, &plan.timesteps)?)?;
         let mut weight = s.alloc_zeros::<bf16>(modulation * spec.time_dim)?;
         let mut bias = s.alloc_zeros::<bf16>(modulation)?;
         let y = s.alloc_zeros::<bf16>(timesteps * modulation)?;
@@ -231,7 +272,7 @@ impl AdalnTable {
             let base = format!("transformer_blocks.{layer}.adaln_proj.linear");
             for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
                 let name = format!("{base}.{suffix}");
-                reader.upload(s, &name, entry(&name)?, &mut buffer.slice_mut(..))?;
+                source.fill(s, &name, &mut buffer.slice_mut(..))?;
             }
             blas.linear_biased(
                 matrix(&weight, s, modulation, spec.time_dim)?,
@@ -254,7 +295,7 @@ impl AdalnTable {
         let mut norm_bias = s.alloc_zeros::<bf16>(norm)?;
         for (suffix, buffer) in [("weight", &mut norm_weight), ("bias", &mut norm_bias)] {
             let name = format!("norm_out.linear.{suffix}");
-            reader.upload(s, &name, entry(&name)?, &mut buffer.slice_mut(..))?;
+            source.fill(s, &name, &mut buffer.slice_mut(..))?;
         }
         let norm_out = s.alloc_zeros::<bf16>(timesteps * norm)?;
         blas.prepare_biased(
@@ -315,6 +356,7 @@ pub(crate) struct BlockWeights {
 pub(crate) struct Source<'a> {
     reader: EntryReader,
     manifest: &'a TensorManifest,
+    quant: OnceLock<QuantKernels>,
 }
 
 impl<'a> Source<'a> {
@@ -322,10 +364,20 @@ impl<'a> Source<'a> {
         Self {
             reader: EntryReader::new(dir),
             manifest,
+            quant: OnceLock::new(),
         }
     }
 
-    fn into<T: Element>(
+    fn quant_kernels(&self, s: &Arc<CudaStream>) -> Result<&QuantKernels> {
+        if let Some(kernels) = self.quant.get() {
+            return Ok(kernels);
+        }
+        let kernels = QuantKernels::new(s.context())?;
+        let _ = self.quant.set(kernels);
+        self.quant.get().context("quant kernels")
+    }
+
+    fn fill<T: Element>(
         &mut self,
         s: &Arc<CudaStream>,
         name: &str,
@@ -336,7 +388,32 @@ impl<'a> Source<'a> {
             .entries
             .get(name)
             .with_context(|| format!("manifest lacks {name}"))?;
-        self.reader.upload(s, name, entry, destination)
+        let quant = match entry.quant {
+            Some(quant) => quant,
+            None => return self.reader.upload(s, name, entry, destination),
+        };
+        match quant {
+            GgmlType::F32 | GgmlType::Bf16 => self.reader.upload(s, name, entry, destination),
+            GgmlType::F16 | GgmlType::Q4_0 => {
+                let src = self.reader.read_device(s, name, entry)?;
+                let kernels = self.quant_kernels(s)?;
+                let elements = destination.len();
+                let (pointer, _record) = destination.device_ptr_mut(s);
+                kernels.dequant(
+                    s,
+                    name,
+                    entry,
+                    DequantCopy {
+                        source: src.device_ptr(s).0,
+                        destination: pointer,
+                        elements,
+                        dtype: T::DTYPE,
+                    },
+                )?;
+                Ok(())
+            }
+            other => bail!("{name}: unsupported GGUF type {other:?}"),
+        }
     }
 
     fn tensor<T: Element + crate::backend::gpu::ValidAsZeroBits>(
@@ -346,8 +423,13 @@ impl<'a> Source<'a> {
         elements: usize,
     ) -> Result<CudaSlice<T>> {
         let mut buffer = s.alloc_zeros::<T>(elements)?;
-        self.into(s, name, &mut buffer.slice_mut(..))?;
+        self.fill(s, name, &mut buffer.slice_mut(..))?;
         Ok(buffer)
+    }
+
+    fn host_f32(&mut self, s: &Arc<CudaStream>, name: &str, elements: usize) -> Result<Vec<f32>> {
+        let tensor = self.tensor::<f32>(s, name, elements)?;
+        Ok(s.clone_dtoh(&tensor)?)
     }
 }
 
@@ -397,7 +479,7 @@ fn matrix_layout(
                 ],
             ),
         );
-        elements += entry.bytes / 2;
+        elements += entry.shape[0] * entry.shape[1];
     }
     ensure!(
         layout.len() == roles.len() && roles.iter().all(|r| layout.contains_key(*r)),
@@ -421,7 +503,7 @@ impl BlockWeights {
         let mut storage = s.alloc_zeros::<bf16>(elements)?;
         for (role, (offset, shape)) in &layout {
             let count = shape[0] as usize * shape[1] as usize;
-            base.into(
+            base.fill(
                 s,
                 &format!("{block}.{role}"),
                 &mut storage.slice_mut(*offset..offset + count),
@@ -475,7 +557,7 @@ impl BlockWeights {
         let (h, w, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
         let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
         for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
-            lora.into(
+            lora.fill(
                 s,
                 &format!("{block}.attn.{name}.lora_A.default.weight"),
                 &mut qkv_a.slice_mut(i * r * h..(i + 1) * r * h),
@@ -1256,13 +1338,67 @@ fn cast_rows(
     Ok(())
 }
 
-/// Dense streaming of `layers` (per-layer matrix bytes, `largest` matrix) beside `owned` resident bytes: placement
-/// derived from free device memory and host RAM, or forced streamed / disk-only; host-tier copies are filled from
-/// `base` in `roles` order before the first `begin`.
+/// Per-layer device slot bytes, stored source bytes, the largest slot and the staging/transient bytes of a
+/// manifest's dense linears.
+struct DenseSizing {
+    layers: Vec<usize>,
+    source_layers: Vec<usize>,
+    largest: usize,
+    staging: usize,
+    transient: usize,
+}
+
+/// Sizing of a manifest's dense linears: a dequantized entry's device slot holds its BF16 tile, a pass-through
+/// entry's holds its stored bytes, and a stored type with no device path is an error.
+fn dense_sizing(manifest: &TensorManifest, layers: usize) -> Result<DenseSizing> {
+    let mut device_layers = vec![0usize; layers];
+    let mut source_layers = vec![0usize; layers];
+    let mut dequant_layer = vec![false; layers];
+    let mut largest = 0usize;
+    for (name, entry) in &manifest.entries {
+        if let Some(layer) = entry.layer
+            && entry.load
+            && entry.shape.len() == 2
+        {
+            let device_bytes = device_slot_bytes(name, entry)?;
+            device_layers[layer as usize] += device_bytes;
+            source_layers[layer as usize] += entry.bytes;
+            largest = largest.max(device_bytes);
+            if dequantizes(entry.quant) {
+                dequant_layer[layer as usize] = true;
+            }
+        }
+    }
+    let staging = dequant_layer
+        .iter()
+        .zip(&source_layers)
+        .filter_map(|(dequant, source)| dequant.then_some(*source))
+        .max()
+        .unwrap_or(0);
+    let transient = manifest
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.load && dequantizes(entry.quant))
+        .map(|(_, entry)| entry.bytes)
+        .max()
+        .unwrap_or(0);
+    Ok(DenseSizing {
+        layers: device_layers,
+        source_layers,
+        largest,
+        staging,
+        transient,
+    })
+}
+
+/// Dense streaming of `layers` (per-layer device matrix bytes, `largest` device matrix) beside `owned` resident bytes:
+/// placement derived from free device memory and host RAM, or forced streamed / disk-only. `source_layers` sizes the
+/// host/disk tier; it equals `layers` for a native BF16 manifest and is the stored source size for a quantized one.
+/// Host-tier copies are filled from `base` in `roles` order before the first `begin`.
 fn place_layers(
     d: &Device,
     base: &mut Source<'_>,
-    (layers, largest, owned, media): (&[usize], usize, usize, usize),
+    (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
     name: impl Fn(usize) -> String,
     roles: &[&str],
@@ -1275,7 +1411,7 @@ fn place_layers(
         ensure!(slots <= budget, "two block slots exceed the device budget");
         budget = slots;
     }
-    let mut plan = DensePlacement::new(layers, budget, 0)?;
+    let mut plan = DensePlacement::new(layers, Some(source_layers), budget, 0)?;
     let mut host = None;
     if plan.slot_bytes > 0 {
         let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
@@ -1293,7 +1429,7 @@ fn place_layers(
             #[cfg(test)]
             Placement::StreamedDisk => 0,
         };
-        plan = DensePlacement::new(layers, budget, host_bytes)?;
+        plan = DensePlacement::new(layers, Some(source_layers), budget, host_bytes)?;
         host = Some(available);
     }
     ensure!(
@@ -1311,19 +1447,32 @@ fn place_layers(
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d)?;
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
-            let (layout, elements) = matrix_layout(base.manifest, &name, roles)?;
+            let (layout, _) = matrix_layout(base.manifest, &name, roles)?;
             let host = dense
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
-            ensure!(host.len() == 2 * elements, "{name}: pinned copy size");
+            ensure!(
+                host.len() == source_layers[layer],
+                "{name}: pinned copy size"
+            );
+            let mut source_offset = 0usize;
             for (role, (offset, _)) in &layout {
                 let tensor = format!("{name}.{role}");
                 let entry = &base.manifest.entries[&tensor];
-                base.reader.read_into(
-                    &tensor,
-                    entry,
-                    &mut host[2 * offset..2 * offset + entry.bytes],
-                )?;
+                if entry.quant.is_some() {
+                    base.reader.read_raw(
+                        &tensor,
+                        entry,
+                        &mut host[source_offset..source_offset + entry.bytes],
+                    )?;
+                } else {
+                    base.reader.read_into(
+                        &tensor,
+                        entry,
+                        &mut host[2 * offset..2 * offset + entry.bytes],
+                    )?;
+                }
+                source_offset += entry.bytes;
             }
         }
         Some(dense)
@@ -1441,17 +1590,7 @@ impl Dit {
         let audio = s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?;
         let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
 
-        let mut layers = vec![0usize; spec.layers];
-        let mut largest = 0usize;
-        for entry in base.manifest.entries.values() {
-            if let Some(layer) = entry.layer
-                && entry.load
-                && entry.shape.len() == 2
-            {
-                layers[layer as usize] += entry.bytes;
-                largest = largest.max(entry.bytes);
-            }
-        }
+        let sizing = dense_sizing(base.manifest, spec.layers)?;
         let owned = lora
             .manifest
             .entries
@@ -1459,17 +1598,25 @@ impl Dit {
             .filter(|(name, _)| name.starts_with("transformer_blocks."))
             .map(|(_, entry)| entry.bytes)
             .sum::<usize>()
-            + spec.layers * 2 * (2 * h + 2 * spec.head_dim);
+            + spec.layers * 2 * (2 * h + 2 * spec.head_dim)
+            + sizing.staging
+            + sizing.transient;
         let dense = place_layers(
             d,
             &mut base,
-            (&layers, largest, owned, 0),
+            (
+                &sizing.layers,
+                &sizing.source_layers,
+                sizing.largest,
+                owned,
+                0,
+            ),
             placement,
             |layer| format!("transformer_blocks.{layer}"),
             &LINEAR_ROLES,
         )?;
         let mut blocks = Vec::with_capacity(spec.layers);
-        for (layer, &bytes) in layers.iter().enumerate() {
+        for (layer, &bytes) in sizing.layers.iter().enumerate() {
             let name = format!("transformer_blocks.{layer}");
             let slot = match &dense {
                 Some(dense) if dense.plan.slots[layer].is_some() => {
@@ -1865,7 +2012,7 @@ impl TextLayer {
                 let mut owned = s.alloc_zeros::<bf16>(elements)?;
                 for (role, (offset, shape)) in &layout {
                     let count = shape[0] as usize * shape[1] as usize;
-                    base.into(
+                    base.fill(
                         s,
                         &format!("{block}.{role}"),
                         &mut owned.slice_mut(*offset..offset + count),
@@ -1999,7 +2146,7 @@ impl Conditioner {
         let dense = place_layers(
             d,
             &mut base,
-            (&bytes, largest, owned, media),
+            (&bytes, &bytes, largest, owned, media),
             placement,
             name,
             &TEXT_ROLES,
@@ -2324,14 +2471,16 @@ pub(crate) fn draw_normals(
 
 /// Runs one MiniMax-H3 i2va request on GPU `device` with the transformer LoRA at `lora` (cuBLAS calibration under
 /// `runtime`) and returns its u8 frames and stereo PCM. The four noise draws are generated natively on device from
-/// `request.seed`; there is no recorded-draw path.
+/// `request.seed`; there is no recorded-draw path. `gguf` replaces the transformer safetensors with one
+/// community GGUF file.
 pub fn generate(
     model: &Path,
     lora: &Path,
     request: &crate::minimax_h3::H3Request,
     (device, runtime): (usize, &Path),
+    gguf: Option<&Path>,
 ) -> Result<crate::minimax_h3::H3Output> {
-    Ok(pipeline::run(model, lora, request, (device, runtime))?.output)
+    Ok(pipeline::run(model, lora, request, (device, runtime), gguf)?.output)
 }
 
 /// One Qwen3-VL conditioner prompt: prompt tokens with their image grids and packed `pixel_values`.
@@ -2413,6 +2562,7 @@ pub(crate) fn conditioner_embeds(
 mod tests {
     use super::*;
     use crate::backend::cuda::{closure::Closure, ops::Ops};
+    use crate::checkpoint::MappedCheckpoint;
     use crate::minimax_h3::{
         Geometry, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, noise_draws,
         row_timestep_plan,
@@ -2697,15 +2847,7 @@ mod tests {
             &runtime,
             Rc::new(Closure::new(true, "MiniMax-H3 AdaLN gate".into())),
         )?;
-        let table = AdalnTable::build(
-            &device,
-            &mut blas,
-            &transformer,
-            &checkpoint,
-            &manifest,
-            &spec,
-            &adaln,
-        )?;
+        let table = AdalnTable::build(&device, &mut blas, &transformer, &manifest, &spec, &adaln)?;
         let blocks: Vec<f64> = device
             .stream
             .clone_dtoh(&table.blocks)?
@@ -2969,6 +3111,526 @@ mod tests {
         Ok(())
     }
 
+    /// The GGUF layer gate: one H3 transformer block with the gguf-py-dequantized weights, run by the engine on the
+    /// definition reference's dumped input and conditioning, compared with the definition's own output. The floor is
+    /// the max over the reference's pairwise arm spreads and the engine's official-weight spread; the control
+    /// re-runs with the fused gate+up halves unswapped.
+    /// 2026-11-04: the `official` arm keeps the GGUF AdaLN and the GGUF fixed projections, and the floor adds the
+    /// `bf16_strict` arm. The earlier floor was the FP32-vs-BF16 spread alone, and the `official` dump it scored
+    /// against predated the harness revision that put the GGUF modulation in that arm. The thresholds below were
+    /// re-derived from the regenerated arms before the candidate was rerun. The `bf16_strict` spread against
+    /// `bf16` is exactly 0 because `allow_bf16_reduced_precision_reduction=False` is a no-op on the CPU
+    /// reference, so the floor is the FP32-vs-BF16 spread in practice.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_BLOCK_OUT, FF_H3_LORA"]
+    fn gguf_block_matches_the_definition_reference() -> Result<()> {
+        let var = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = var("FF_MODEL")?;
+        let gguf_path = var("FF_H3_GGUF")?;
+        let out = var("FF_H3_GGUF_BLOCK_OUT")?;
+        let lora_path = var("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let transformer = model.join("transformer");
+        let official = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+
+        let input_map = mapped(&out.join("input.safetensors"))?;
+        let input = SafeTensors::deserialize(&input_map)?;
+        let hidden = input.tensor("hidden_states")?;
+        ensure!(
+            hidden.dtype() == Dtype::BF16 && hidden.shape().len() == 3,
+            "hidden_states {:?} {:?}",
+            hidden.dtype(),
+            hidden.shape()
+        );
+        let rows = hidden.shape()[1];
+        let input_host: Vec<bf16> = hidden
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        let table = input.tensor("modulation")?;
+        ensure!(
+            table.dtype() == Dtype::BF16 && table.shape().len() == 2,
+            "modulation {:?} {:?}",
+            table.dtype(),
+            table.shape()
+        );
+        let entries = u32::try_from(table.shape()[0])?;
+        let table_host: Vec<bf16> = table
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        let rotary = input.tensor("rotary_table")?;
+        ensure!(
+            rotary.dtype() == Dtype::BF16 && rotary.shape() == [rows, 6 * spec.rope_freq_dim],
+            "rotary_table {:?} {:?}",
+            rotary.dtype(),
+            rotary.shape()
+        );
+        let rotary_host: Vec<bf16> = rotary
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        let (indices, _) = decoded(&input, "adaln_indices")?;
+        let index_host: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let output = |arm: &str| -> Result<Vec<f64>> {
+            let map = mapped(&out.join(format!("output_{arm}.safetensors")))?;
+            let file = SafeTensors::deserialize(&map)?;
+            let tensor = file.tensor("output")?;
+            ensure!(
+                tensor.shape() == [1, rows, spec.hidden],
+                "{arm} output {:?} {:?}",
+                tensor.dtype(),
+                tensor.shape()
+            );
+            Ok(match tensor.dtype() {
+                Dtype::BF16 => tensor
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f64::from(bf16::from_le_bytes(*b).to_f32()))
+                    .collect(),
+                Dtype::F32 => tensor
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f64::from(f32::from_le_bytes(*b)))
+                    .collect(),
+                other => bail!("{arm} output dtype {other:?}"),
+            })
+        };
+        let reference_bf16 = output("bf16")?;
+        let reference_fp32 = output("fp32")?;
+        let reference_bf16_strict = output("bf16_strict")?;
+        let reference_official = output("official")?;
+
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-block-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 GGUF block gate".into())),
+        )?;
+        let r = adapter.rank;
+        let gguf_dir = gguf_path.parent().context("GGUF directory")?;
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let weights = BlockWeights::resident(
+            s,
+            &spec,
+            r,
+            "transformer_blocks.0",
+            &mut Source::new(gguf_dir, &manifest),
+            &mut Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let mut wrong = manifest.clone();
+        wrong
+            .entries
+            .get_mut("transformer_blocks.0.ff.net.0.proj.weight")
+            .context("fc1 entry")?
+            .swap_halves = false;
+        let wrong_weights = BlockWeights::resident(
+            s,
+            &spec,
+            r,
+            "transformer_blocks.0",
+            &mut Source::new(gguf_dir, &wrong),
+            &mut Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let official_weights = BlockWeights::resident(
+            s,
+            &spec,
+            r,
+            "transformer_blocks.0",
+            &mut Source::new(&transformer, &official),
+            &mut Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let mut work = BlockWork::new(s, &spec, r, rows)?;
+        work.prepare(&blas, &spec)?;
+        let rotary_device = s.clone_htod(&rotary_host)?;
+        let table_device = s.clone_htod(&table_host)?;
+        let index_device = s.clone_htod(&index_host)?;
+        let modulation = Modulation {
+            table: &table_device,
+            offset: 0,
+            entries,
+            index: &index_device,
+        };
+        let conditioning = Conditioning::Modulated {
+            rotary: &rotary_device,
+            modulation: &modulation,
+        };
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+        let mut run = |weights: &BlockWeights| -> Result<Vec<f64>> {
+            let mut x = s.clone_htod(&input_host)?;
+            block_forward(
+                &context,
+                &mut flash,
+                weights,
+                &conditioning,
+                &mut x,
+                &mut work,
+            )?;
+            Ok(s.clone_dtoh(&x)?
+                .into_iter()
+                .map(|v| f64::from(v.to_f32()))
+                .collect())
+        };
+        let candidate = run(&weights)?;
+        let control = run(&wrong_weights)?;
+        let engine_official = run(&official_weights)?;
+
+        // The floor on this gate's own input: the reference's max pairwise arm spread, and the engine's
+        // block-vs-definition arithmetic spread measured here with the official BF16 weights on the same
+        // conditioning (the `official` arm shares the GGUF temb/rotary and the GGUF AdaLN table).
+        let arm_pairs = [
+            ("bf16_vs_fp32", distance(&reference_bf16, &reference_fp32)),
+            (
+                "bf16_vs_bf16_strict",
+                distance(&reference_bf16, &reference_bf16_strict),
+            ),
+            (
+                "fp32_vs_bf16_strict",
+                distance(&reference_fp32, &reference_bf16_strict),
+            ),
+        ];
+        let arm_floor = arm_pairs.iter().fold([0.0f64, 0.0, 2.0], |floor, (_, d)| {
+            [floor[0].max(d[0]), floor[1].max(d[1]), floor[2].min(d[2])]
+        });
+        let engine_floor = distance(&engine_official, &reference_official);
+        let floor = [
+            arm_floor[0].max(engine_floor[0]),
+            arm_floor[1].max(engine_floor[1]),
+            arm_floor[2].min(engine_floor[2]),
+        ];
+        let d = distance(&candidate, &reference_bf16);
+        let d_control = distance(&control, &reference_bf16);
+        let abs_tau = (2.0 * floor[0]).max(1e-5);
+        let rel_tau = (2.0 * floor[1]).max(1e-6);
+        let cos_tau = 1.0 - 2.0 * (1.0 - floor[2]);
+        let ok = d[0] <= abs_tau && d[1] <= rel_tau && d[2] >= cos_tau;
+        let control_abs_ratio = d_control[0] / abs_tau;
+        let control_rel_ratio = d_control[1] / rel_tau;
+        let caught = control_abs_ratio > 10.0 || control_rel_ratio > 10.0;
+        println!(
+            "H3_GGUF_BLOCK candidate={d:?} arm_pairs={arm_pairs:?} arm_floor={arm_floor:?} engine_floor={engine_floor:?} floor={floor:?} control={d_control:?} control_abs_ratio={control_abs_ratio:.3} control_rel_ratio={control_rel_ratio:.3} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}"
+        );
+        ensure!(
+            candidate.iter().all(|v| v.is_finite()),
+            "non-finite block output"
+        );
+        ensure!(ok, "GGUF block output {d:?} outside the floor {floor:?}");
+        ensure!(
+            caught,
+            "unswapped-fc1 control stayed within 10x tau (abs {:.3}x, rel {:.3}x)",
+            control_abs_ratio,
+            control_rel_ratio
+        );
+        fs::remove_dir(&runtime)?;
+        println!("H3_GGUF_BLOCK_GATE PASS control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// The streamed quantized path gate: the real target's GGUF manifest placed `Streamed` (host tier) and
+    /// `StreamedDisk` (disk tier), every layer's device slot compared bit-exact against `BlockWeights::resident`
+    /// for the same layer. The control shifts one entry's source offset by one Q4_0 block (18 B) and must fail.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_LORA"]
+    fn gguf_streamed_slots_match_resident_weights() -> Result<()> {
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let model = var("FF_MODEL")?;
+        let gguf_path = var("FF_H3_GGUF")?;
+        let lora_path = var("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let gguf_dir = gguf_path.parent().context("GGUF directory")?.to_owned();
+
+        let sizing = dense_sizing(&manifest, spec.layers)?;
+        let owned = lora_manifest
+            .entries
+            .iter()
+            .filter(|(name, _)| name.starts_with("transformer_blocks."))
+            .map(|(_, entry)| entry.bytes)
+            .sum::<usize>()
+            + spec.layers * 2 * (2 * spec.hidden + 2 * spec.head_dim)
+            + sizing.staging
+            + sizing.transient;
+
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let mismatches =
+            |placement: Placement, perturb: Option<(usize, &str, isize)>| -> Result<Vec<usize>> {
+                let mut base = Source::new(&gguf_dir, &manifest);
+                let mut dense = place_layers(
+                    &device,
+                    &mut base,
+                    (
+                        &sizing.layers,
+                        &sizing.source_layers,
+                        sizing.largest,
+                        owned,
+                        0,
+                    ),
+                    placement,
+                    |layer| format!("transformer_blocks.{layer}"),
+                    &LINEAR_ROLES,
+                )?
+                .context("streamed placement")?;
+                if let Some((layer, name, delta)) = perturb {
+                    dense.shift_source_offset(layer, name, delta)?;
+                }
+                let mut mismatches = Vec::new();
+                for (layer, &layer_bytes) in sizing.layers.iter().enumerate() {
+                    let name = format!("transformer_blocks.{layer}");
+                    let resident = BlockWeights::resident(
+                        stream,
+                        &spec,
+                        adapter.rank,
+                        &name,
+                        &mut Source::new(&gguf_dir, &manifest),
+                        &mut Source::new(&lora_dir, &lora_manifest),
+                    )?;
+                    let expected = stream
+                        .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
+                    dense.begin(layer, stream)?;
+                    let pointer = dense.pointer(layer, 0, layer_bytes)?;
+                    let actual = stream.alloc_zeros::<bf16>(expected.len())?;
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtod_async(
+                            actual.device_ptr(stream).0,
+                            pointer,
+                            layer_bytes,
+                            stream.cu_stream(),
+                        )?;
+                    }
+                    dense.end(layer, stream)?;
+                    let actual = stream.clone_dtoh(&actual)?;
+                    if actual
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .ne(expected.iter().map(|v| v.to_bits()))
+                    {
+                        mismatches.push(layer);
+                    }
+                }
+                Ok(mismatches)
+            };
+        for placement in [Placement::Streamed, Placement::StreamedDisk] {
+            let clean = mismatches(placement, None)?;
+            ensure!(
+                clean.is_empty(),
+                "{placement:?}: streamed slots differ from resident in layers {clean:?}"
+            );
+            let control = mismatches(
+                placement,
+                Some((0, "transformer_blocks.0.attn.to_q.weight", 18)),
+            )?;
+            ensure!(
+                control == vec![0],
+                "{placement:?}: the shifted source offset control did not fail exactly layer 0: {control:?}"
+            );
+            println!(
+                "H3_GGUF_STREAMED {placement:?} layers={} bit_exact_mismatches=0 control=FAIL_AS_REQUIRED",
+                spec.layers
+            );
+        }
+        println!("H3_GGUF_STREAMED_GATE PASS");
+        Ok(())
+    }
+
+    /// The GGUF AdaLN gate: the 50 `adaln_proj` weights dequantized from the GGUF into the engine's AdaLN table,
+    /// against the definition's per-block modulation for the same timesteps (the harness dump, layer-major). The
+    /// floor is the reference's own FP32-vs-BF16 arm spread; the control swaps the video/audio tags.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_ADALN_OUT"]
+    fn gguf_adaln_matches_the_definition_modulation() -> Result<()> {
+        let var = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = var("FF_MODEL")?;
+        let gguf_path = var("FF_H3_GGUF")?;
+        let out = var("FF_H3_GGUF_ADALN_OUT")?;
+        let spec = H3Spec::read(&model)?;
+        let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
+
+        let adaln_map = mapped(&out.join("adaln.safetensors"))?;
+        let adaln = SafeTensors::deserialize(&adaln_map)?;
+        let timesteps_tensor = adaln.tensor("timesteps")?;
+        ensure!(
+            timesteps_tensor.dtype() == Dtype::F32 && timesteps_tensor.shape().len() == 1,
+            "timesteps {:?} {:?}",
+            timesteps_tensor.dtype(),
+            timesteps_tensor.shape()
+        );
+        let timesteps: Vec<f32> = timesteps_tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let width = 6 * spec.hidden;
+        let modulation = |arm: &str| -> Result<Vec<bf16>> {
+            let tensor = adaln.tensor(&format!("modulation_{arm}"))?;
+            ensure!(
+                tensor.shape().len() == 2
+                    && tensor.shape()[0] == spec.layers * timesteps.len() * MODALITIES as usize
+                    && tensor.shape()[1] == width,
+                "modulation_{arm} {:?} {:?} for {} layers x {} timesteps",
+                tensor.dtype(),
+                tensor.shape(),
+                spec.layers,
+                timesteps.len()
+            );
+            Ok(match tensor.dtype() {
+                Dtype::BF16 => tensor
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| bf16::from_le_bytes(*b))
+                    .collect(),
+                Dtype::F32 => tensor
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| bf16::from_f32(f32::from_le_bytes(*b)))
+                    .collect(),
+                other => bail!("modulation_{arm} dtype {other:?}"),
+            })
+        };
+        let to_f64 = |values: &[bf16]| -> Vec<f64> {
+            values.iter().map(|&v| f64::from(v.to_f32())).collect()
+        };
+        let expected_bf16 = to_f64(&modulation("bf16")?);
+        let expected_fp32 = to_f64(&modulation("fp32")?);
+        let floor = distance(&expected_bf16, &expected_fp32);
+
+        let pairs: Vec<(u32, u8)> = (0..timesteps.len() as u32)
+            .flat_map(|t| (0..MODALITIES).map(move |tag| (t, tag as u8)))
+            .collect();
+        let plan = AdalnPlan {
+            timesteps: timesteps.clone(),
+            pairs: pairs.clone(),
+            row_pairs: Vec::new(),
+            row_timesteps: Vec::new(),
+        };
+
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-adaln-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 GGUF AdaLN gate".into())),
+        )?;
+        let gguf_dir = gguf_path.parent().context("GGUF directory")?;
+        let table = AdalnTable::build(&device, &mut blas, gguf_dir, &manifest, &spec, &plan)?;
+        let blocks: Vec<f64> = s
+            .clone_dtoh(&table.blocks)?
+            .into_iter()
+            .map(|v| f64::from(v.to_f32()))
+            .collect();
+        fs::remove_dir(&runtime)?;
+
+        let mut candidate = Vec::new();
+        let mut expected = Vec::new();
+        let mut control_candidate = Vec::new();
+        let mut control_expected = Vec::new();
+        for layer in 0..spec.layers {
+            for (pair, &(t, tag)) in pairs.iter().enumerate() {
+                let row = layer * pairs.len() + pair;
+                let c = &blocks[row * width..][..width];
+                candidate.extend_from_slice(c);
+                expected.extend_from_slice(&expected_bf16[row * width..][..width]);
+                if tag != 1 {
+                    control_candidate.extend_from_slice(c);
+                    let other = layer * pairs.len()
+                        + t as usize * MODALITIES as usize
+                        + (2 - usize::from(tag));
+                    control_expected.extend_from_slice(&expected_bf16[other * width..][..width]);
+                }
+            }
+        }
+        let d = distance(&candidate, &expected);
+        let d_control = distance(&control_candidate, &control_expected);
+        let abs_tau = (2.0 * floor[0]).max(1e-5);
+        let rel_tau = (2.0 * floor[1]).max(1e-6);
+        let cos_tau = 1.0 - 2.0 * (1.0 - floor[2]);
+        let ok = d[0] <= abs_tau && d[1] <= rel_tau && d[2] >= cos_tau;
+        let caught = d_control[0] > 10.0 * abs_tau || d_control[1] > 10.0 * rel_tau;
+        println!(
+            "H3_GGUF_ADALN timesteps={} pairs={} candidate={d:?} arm_floor={floor:?} control={d_control:?} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}",
+            timesteps.len(),
+            pairs.len()
+        );
+        ensure!(
+            candidate.iter().all(|v| v.is_finite()),
+            "non-finite AdaLN table"
+        );
+        ensure!(ok, "GGUF AdaLN table {d:?} outside the arm floor {floor:?}");
+        ensure!(caught, "tag-swap control stayed within 10x tau");
+        println!("H3_GGUF_ADALN_GATE PASS control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
     /// Blocks placed per `FF_H3_PLACEMENT`, eager (the H3 path captures no graph), native AdaLN table. Keyframe
     /// conditioning rows are the captured FP32 VAE-encoder latents, the form under which the frozen keyframe cells
     /// are 0. Every step in `FF_H3_STEPS` (each held by `FF_H3_REPLAY`): the native velocity of the generated video
@@ -3049,7 +3711,6 @@ mod tests {
             &device,
             &mut blas,
             &transformer,
-            &checkpoint,
             &manifest,
             &spec,
             &adaln_plan,
@@ -3299,7 +3960,6 @@ mod tests {
             &device,
             &mut blas,
             &transformer,
-            &checkpoint,
             &manifest,
             &spec,
             &adaln_plan,
@@ -4473,7 +5133,7 @@ mod tests {
         let mut seed43 = None;
         for (cell, seed) in [("A", 42), ("P", 42), ("B", 42), ("A", 43)] {
             let request = seeded_request(&s0, cell, seed)?;
-            let generated = super::pipeline::run(&model, &lora, &request, (0, &runtime))?;
+            let generated = super::pipeline::run(&model, &lora, &request, (0, &runtime), None)?;
             let o = &generated.output;
             println!(
                 "H3_E2E cell={cell} seed={seed} frames={} size={}x{} samples={} rate={} video_u8_mean={:.3}",
@@ -4744,6 +5404,75 @@ mod tests {
             bail!("H3_N9C_GATE DEFECT streams outside frozen bounds: {defects:?}");
         }
         println!("H3_N9C_GATE PASS streams=8 controls_detected=8");
+        Ok(())
+    }
+
+    /// GGUF measurement: one seeded cell A request run twice through `generate`, once with the official BF16
+    /// transformer manifest and once with the community GGUF, and the frames/PCM distance printed. The two
+    /// arms share the request, so only the transformer weights differ; the numbers are a measurement, not a gate.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_OUT"]
+    fn gguf_end_to_end_measurement_against_the_bf16_path() -> Result<()> {
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let (model, gguf, lora, s0, out) = (
+            var("FF_MODEL")?,
+            var("FF_H3_GGUF")?,
+            var("FF_H3_LORA")?,
+            var("FF_H3_S0")?,
+            var("FF_H3_E2E_OUT")?,
+        );
+        let request = seeded_request(&s0, "A", 42)?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-e2e-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let bf16 = super::generate(&model, &lora, &request, (0, &runtime), None)?;
+        let quantized = super::generate(&model, &lora, &request, (0, &runtime), Some(&gguf))?;
+        fs::remove_dir_all(&runtime)?;
+        let (a, b) = (&bf16, &quantized);
+        ensure!(
+            a.frames == b.frames
+                && a.height == b.height
+                && a.width == b.width
+                && a.video.len() == b.video.len()
+                && a.samples == b.samples
+                && a.audio.len() == b.audio.len(),
+            "the two arms differ in extent"
+        );
+        ensure!(b.audio.iter().all(|v| v.is_finite()), "non-finite GGUF PCM");
+        let video: Vec<f64> = a.video.iter().map(|&v| f64::from(v)).collect();
+        let video_b: Vec<f64> = b.video.iter().map(|&v| f64::from(v)).collect();
+        let pcm: Vec<f64> = a.audio.iter().map(|&v| f64::from(v)).collect();
+        let pcm_b: Vec<f64> = b.audio.iter().map(|&v| f64::from(v)).collect();
+        let video_d = distance(&video, &video_b);
+        let pcm_d = distance(&pcm, &pcm_b);
+        ensure!(
+            a.video != b.video || a.audio != b.audio,
+            "the GGUF arm left the output unchanged"
+        );
+        let dir = out.join("A-gguf");
+        fs::create_dir_all(&dir)?;
+        let mut t = crate::tensors::Tensors::default();
+        t.u8(
+            "video_u8".into(),
+            vec![b.frames, b.height, b.width, 3],
+            &b.video,
+        )?;
+        t.f32("audio_decoded".into(), vec![2, 1, b.samples], &b.audio)?;
+        t.save_new(
+            &dir.join("native.safetensors"),
+            [("sampling_rate".to_owned(), b.sampling_rate.to_string())].into(),
+        )?;
+        println!(
+            "H3_GGUF_E2E cell=A frames={} video_max_abs={:.6e} video_rel_rms={:.6e} video_cosine={:.9} pcm_max_abs={:.6e} pcm_rel_rms={:.6e} pcm_cosine={:.9}",
+            b.frames, video_d[0], video_d[1], video_d[2], pcm_d[0], pcm_d[1], pcm_d[2]
+        );
+        println!(
+            "H3_GGUF_E2E_MEASUREMENT frames={} video={video_d:?} pcm={pcm_d:?}",
+            b.frames
+        );
         Ok(())
     }
 

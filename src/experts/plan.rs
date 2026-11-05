@@ -712,6 +712,7 @@ impl BlockResidency {
             .context("block host staging exceeds available RAM")?;
         let dense = crate::prefill::DensePlacement::new(
             &layers,
+            None,
             usize::try_from(dense_budget)?,
             usize::try_from(host_dense_budget)?,
         )?;

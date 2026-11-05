@@ -120,7 +120,7 @@ impl Loader<'_, '_> {
             elements <= self.staging.len(),
             "{name}: {elements} elements exceed the staging buffer"
         );
-        Source::into::<f32>(
+        Source::fill::<f32>(
             &mut self.source,
             self.s,
             name,

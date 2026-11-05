@@ -11263,6 +11263,8 @@ mod tests {
                             layer: None,
                             role: suffix.into(),
                             scale_name: None,
+                            quant: None,
+                            swap_halves: false,
                         },
                     );
                     bytes += size;

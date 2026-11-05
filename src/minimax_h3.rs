@@ -985,12 +985,20 @@ impl AdalnPlan {
     }
 }
 
+/// The F32 time-embedder tensors (`time_embedder.linear_1/2`) the AdaLN input is computed from.
+pub struct AdalnTimeEmbedder {
+    pub linear_1_weight: Vec<f32>,
+    pub linear_1_bias: Vec<f32>,
+    pub linear_2_weight: Vec<f32>,
+    pub linear_2_bias: Vec<f32>,
+}
+
 /// `silu(time_embedder(sinusoid(t)))` rounded to BF16, `[timesteps, time_dim]`: the input of every AdaLN projection.
 /// Sinusoid `[cos(t f_i), sin(t f_i)]`, `f_i = exp(-ln(10000) * i / half)` in f32; the two F32 linears accumulate in
 /// f64 and round once.
 pub fn adaln_input(
     spec: &H3Spec,
-    checkpoint: &crate::checkpoint::MappedCheckpoint,
+    time: &AdalnTimeEmbedder,
     timesteps: &[f32],
 ) -> Result<Vec<half::bf16>> {
     let half = spec.freq_dim / 2;
@@ -1005,41 +1013,31 @@ pub fn adaln_input(
     }
     let silu = |v: f32| v / (1.0 + (-v).exp());
     let hidden = f32_linear(
-        checkpoint,
-        "time_embedder.linear_1",
+        &time.linear_1_weight,
+        &time.linear_1_bias,
         &x,
         spec.freq_dim,
-        spec.time_hidden,
-    )?;
+    );
     let hidden: Vec<f32> = hidden.into_iter().map(silu).collect();
     let embedding = f32_linear(
-        checkpoint,
-        "time_embedder.linear_2",
+        &time.linear_2_weight,
+        &time.linear_2_bias,
         &hidden,
         spec.time_hidden,
-        spec.time_dim,
-    )?;
+    );
     Ok(embedding
         .into_iter()
         .map(|v| half::bf16::from_f32(silu(v)))
         .collect())
 }
 
-/// `x [rows, input] * weight[output, input]^T + bias` from the published F32 tensors.
-fn f32_linear(
-    checkpoint: &crate::checkpoint::MappedCheckpoint,
-    base: &str,
-    x: &[f32],
-    input: usize,
-    output: usize,
-) -> Result<Vec<f32>> {
-    let weight = checkpoint.f32_tensor(&format!("{base}.weight"), &[output, input])?;
-    let bias = checkpoint.f32_tensor(&format!("{base}.bias"), &[output])?;
-    Ok(x.chunks_exact(input)
+/// `x [rows, input] * weight[output, input]^T + bias`.
+fn f32_linear(weight: &[f32], bias: &[f32], x: &[f32], input: usize) -> Vec<f32> {
+    x.chunks_exact(input)
         .flat_map(|row| {
             weight
                 .chunks_exact(input)
-                .zip(&bias)
+                .zip(bias)
                 .map(|(w, &b)| {
                     (row.iter()
                         .zip(w)
@@ -1049,7 +1047,7 @@ fn f32_linear(
                 })
                 .collect::<Vec<_>>()
         })
-        .collect())
+        .collect()
 }
 
 /// `[rows, 6 * rope_freq_dim]` BF16 rotary table: the cosines of each row's `3 * rope_freq_dim` angles, then their

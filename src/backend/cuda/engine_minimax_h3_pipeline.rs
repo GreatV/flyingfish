@@ -247,11 +247,14 @@ fn decoder_bytes(video: &TensorManifest, audio: &TensorManifest) -> usize {
 }
 
 /// Runs `request` through the native path with the transformer LoRA at `lora`, cuBLAS calibration in `runtime`.
+/// `gguf` replaces the transformer safetensors with one community GGUF file; the conditioner and keyframe VAE
+/// stay on the published safetensors.
 pub(crate) fn run(
     model: &Path,
     lora: &Path,
     request: &H3Request,
     (index, runtime): (usize, &Path),
+    gguf: Option<&Path>,
 ) -> Result<Generated> {
     let device = Device::new(index)?;
     let ops = Ops::new(&device.ctx)?;
@@ -323,8 +326,18 @@ pub(crate) fn run(
     video_rows.extend(patchify(&video_noise, (lc, latent_frames, lh, lw), patch));
 
     let transformer = model.join("transformer");
-    let checkpoint = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?;
-    let manifest = checkpoint.minimax_h3_manifest(&spec)?;
+    let manifest = match gguf {
+        Some(path) => {
+            let gguf = crate::gguf::GgufFile::open(path)?;
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?
+        }
+        None => MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?,
+    };
+    let source_dir = match gguf {
+        Some(path) => path.parent().context("GGUF directory")?.to_path_buf(),
+        None => transformer.clone(),
+    };
     let lora_dir = lora.parent().context("LoRA directory")?;
     let stem = lora
         .file_name()
@@ -341,8 +354,7 @@ pub(crate) fn run(
         let table = AdalnTable::build(
             &device,
             &mut blas,
-            &transformer,
-            &checkpoint,
+            &source_dir,
             &manifest,
             &spec,
             &adaln_plan,
@@ -352,7 +364,7 @@ pub(crate) fn run(
             &mut blas,
             &spec,
             (adapter.rank, &layout),
-            Source::new(&transformer, &manifest),
+            Source::new(&source_dir, &manifest),
             Source::new(lora_dir, &lora_manifest),
             Placement::Derived,
         )?;

@@ -1,7 +1,8 @@
 //! Shared mmap/index audit, independent of device upload and model execution.
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
+use safetensors::tensor::TensorView;
+use safetensors::{Dtype, SafeTensors};
 use serde::{
     Deserialize, Deserializer,
     de::{Error, MapAccess, Visitor},
@@ -301,6 +302,7 @@ impl MappedCheckpoint {
         Ok(())
     }
     /// Host copy of one published F32 tensor with the given shape.
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn f32_tensor(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
         let tensor = self.tensor(name)?;
         ensure!(
@@ -2568,6 +2570,8 @@ impl MappedCheckpoint {
                     layer,
                     role,
                     scale_name,
+                    quant: None,
+                    swap_halves: false,
                 },
             );
         }
@@ -2586,92 +2590,175 @@ impl MappedCheckpoint {
     /// MiniMax-H3 transformer: F32 patch, time-embedding and output projections, BF16 elsewhere. The per-block AdaLN
     /// projections are Dormant: read once at setup into the modulation table, never part of the per-step layer set.
     pub fn minimax_h3_manifest(&self, spec: &crate::minimax_h3::H3Spec) -> Result<TensorManifest> {
-        let scope = TensorScope::Text;
-        let mut expected = BTreeMap::new();
-        for (base, n, k) in [
-            ("proj_in", spec.hidden, spec.video_row_width()),
-            ("audio_proj_in", spec.hidden, spec.audio_in_channels),
-            ("time_embedder.linear_1", spec.time_hidden, spec.freq_dim),
-            ("time_embedder.linear_2", spec.time_dim, spec.time_hidden),
-            ("proj_out", spec.video_row_width(), spec.hidden),
-            ("audio_proj_out", spec.audio_in_channels, spec.hidden),
-        ] {
-            put(
-                &mut expected,
-                format!("{base}.weight"),
-                Dtype::F32,
-                vec![n, k],
-                scope,
-            );
-            put(
-                &mut expected,
-                format!("{base}.bias"),
-                Dtype::F32,
-                vec![n],
-                scope,
-            );
-        }
-        let modulation = 6 * spec.hidden * crate::minimax_h3::MODALITIES as usize;
-        for (name, shape) in [
-            ("context_embedder.weight", vec![spec.hidden, spec.text_dim]),
-            ("context_embedder.bias", vec![spec.hidden]),
-            ("token_refiner.final_norm.weight", vec![spec.hidden]),
-            ("norm_out.norm.weight", vec![spec.hidden]),
-            (
-                "norm_out.linear.weight",
-                vec![2 * spec.hidden, spec.time_dim],
-            ),
-            ("norm_out.linear.bias", vec![2 * spec.hidden]),
-        ] {
-            put(&mut expected, name.to_owned(), Dtype::BF16, shape, scope);
-        }
-        let blocks = (0..spec.refiner_layers)
-            .map(|i| (format!("token_refiner.refiner_blocks.{i}"), false))
-            .chain((0..spec.layers).map(|i| (format!("transformer_blocks.{i}"), true)));
-        for (block, adaln) in blocks {
-            for (name, shape) in [
-                ("norm1.weight", vec![spec.hidden]),
-                ("norm2.weight", vec![spec.hidden]),
-                ("attn.norm_q.weight", vec![spec.head_dim]),
-                ("attn.norm_k.weight", vec![spec.head_dim]),
-            ] {
-                put(
-                    &mut expected,
-                    format!("{block}.{name}"),
-                    Dtype::BF16,
-                    shape,
-                    scope,
-                );
-            }
-            if adaln {
-                let base = format!("{block}.adaln_proj.linear");
-                put(
-                    &mut expected,
-                    format!("{base}.weight"),
-                    Dtype::BF16,
-                    vec![modulation, spec.time_dim],
-                    TensorScope::Dormant,
-                );
-                put(
-                    &mut expected,
-                    format!("{base}.bias"),
-                    Dtype::BF16,
-                    vec![modulation],
-                    TensorScope::Dormant,
-                );
-            }
-        }
-        for (base, n, k) in spec.block_linears() {
-            put(
-                &mut expected,
-                format!("{base}.weight"),
-                Dtype::BF16,
-                vec![n, k],
-                scope,
-            );
-        }
+        let expected = minimax_h3_expected(spec)?;
         let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
         self.assemble_manifest("MiniMax-H3", expected, LoadPolicy::TextOnly, planned, None)
+    }
+
+    /// MiniMax-H3 transformer weights from one community GGUF file. The expected set is `minimax_h3_expected`;
+    /// every GGUF tensor is matched by name, checked against the official shape and stored type, and mapped to its
+    /// official entry. `rope.inv_freq` has no official counterpart and is ignored; any other unknown tensor is an
+    /// error, as is any expected tensor the GGUF does not produce.
+    pub fn minimax_h3_gguf_manifest(
+        spec: &crate::minimax_h3::H3Spec,
+        gguf: &crate::gguf::GgufFile,
+    ) -> Result<TensorManifest> {
+        let expected = minimax_h3_expected(spec)?;
+        let shard = gguf
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("GGUF path has no file name")?
+            .to_owned();
+        let mut entries = BTreeMap::new();
+        let mut resident_bytes = 0usize;
+        for tensor in gguf.tensors() {
+            let (block_len, block_bytes) = ggml_block(tensor.ggml_type)?;
+            let dims = &tensor.dims;
+            let count = dims.iter().product::<u64>();
+            let official: Vec<u64> = match gguf.orig_shape(&tensor.name) {
+                Some(shape) => shape.iter().map(|&v| u64::from(v)).collect(),
+                None => dims.iter().rev().copied().collect(),
+            };
+            ensure!(
+                official.iter().product::<u64>() == count,
+                "GGUF tensor {} official shape {official:?} does not cover {count} elements",
+                tensor.name
+            );
+            let input = *official.last().context("GGUF official shape is empty")?;
+            ensure!(
+                input % block_len == 0,
+                "GGUF tensor {} has input {input}, not a multiple of the {}-element {:?} block",
+                tensor.name,
+                block_len,
+                tensor.ggml_type
+            );
+            let full_bytes = count / block_len * block_bytes;
+            ensure!(
+                full_bytes == tensor.nbytes as u64,
+                "GGUF tensor {} stores {} B, its {count} elements require {full_bytes} B",
+                tensor.name,
+                tensor.nbytes
+            );
+            let base = gguf
+                .data_start()
+                .checked_add(tensor.offset)
+                .context("GGUF tensor offset overflow")?;
+            for map in map_gguf_tensor(spec, &tensor.name)? {
+                let (dtype, shape, scope) = expected.get(&map.official).with_context(|| {
+                    format!(
+                        "GGUF tensor {} maps to unknown official tensor {}",
+                        tensor.name, map.official
+                    )
+                })?;
+                let (data_start, nbytes) = match map.range {
+                    Some((start, end)) => {
+                        ensure!(
+                            official.len() == 2
+                                && official[1] == shape[1] as u64
+                                && official[0] == 3 * shape[0] as u64
+                                && end <= official[0]
+                                && start < end
+                                && end - start == shape[0] as u64,
+                            "GGUF tensor {} fused range {start}..{end} does not match official {} shape {shape:?}",
+                            tensor.name,
+                            map.official
+                        );
+                        let row_blocks = input / block_len;
+                        let offset = start
+                            .checked_mul(row_blocks)
+                            .and_then(|n| n.checked_mul(block_bytes))
+                            .context("GGUF tensor offset overflow")?;
+                        let nbytes = (end - start)
+                            .checked_mul(row_blocks)
+                            .and_then(|n| n.checked_mul(block_bytes))
+                            .context("GGUF tensor size overflow")?;
+                        (
+                            base.checked_add(offset)
+                                .context("GGUF tensor offset overflow")?,
+                            nbytes,
+                        )
+                    }
+                    None => {
+                        let matches = official.len() == shape.len()
+                            && official
+                                .iter()
+                                .zip(shape)
+                                .all(|(got, want)| *got == *want as u64);
+                        ensure!(
+                            matches,
+                            "GGUF tensor {} official shape {official:?} does not match {} shape {shape:?}",
+                            tensor.name,
+                            map.official
+                        );
+                        (base, tensor.nbytes as u64)
+                    }
+                };
+                ensure!(
+                    !entries.contains_key(&map.official),
+                    "GGUF tensor {} maps to already-produced official tensor {}",
+                    tensor.name,
+                    map.official
+                );
+                ensure!(
+                    !map.swap_halves || tensor.ggml_type == crate::gguf::GgmlType::Q4_0,
+                    "GGUF tensor {} stores the fused fc1 as {:?}, which has no half-swap path",
+                    tensor.name,
+                    tensor.ggml_type
+                );
+                let pass_through = match tensor.ggml_type {
+                    crate::gguf::GgmlType::F32 => Some(Dtype::F32),
+                    crate::gguf::GgmlType::Bf16 => Some(Dtype::BF16),
+                    _ => None,
+                };
+                if let Some(stored) = pass_through {
+                    ensure!(
+                        stored == *dtype,
+                        "GGUF tensor {} stores {:?} bytes for the {:?} tensor {}",
+                        tensor.name,
+                        tensor.ggml_type,
+                        dtype,
+                        map.official
+                    );
+                }
+                let (layer, role) = split_layer_role(&map.official)?;
+                let load = LoadPolicy::TextOnly.selects_tensor(*scope, &map.official);
+                let nbytes = usize::try_from(nbytes)?;
+                if load {
+                    resident_bytes = resident_bytes
+                        .checked_add(nbytes)
+                        .context("resident size overflow")?;
+                }
+                entries.insert(
+                    map.official.clone(),
+                    TensorEntry {
+                        dtype: *dtype,
+                        shape: shape.clone(),
+                        shard: shard.clone(),
+                        bytes: nbytes,
+                        load,
+                        data_start,
+                        data_offsets: [0, nbytes as u64],
+                        scope: *scope,
+                        layer,
+                        role,
+                        scale_name: None,
+                        quant: Some(tensor.ggml_type),
+                        swap_halves: map.swap_halves,
+                    },
+                );
+            }
+        }
+        ensure!(
+            entries.len() == expected.len(),
+            "MiniMax-H3 GGUF manifest incomplete: expected {} official tensors, produced {}",
+            expected.len(),
+            entries.len()
+        );
+        Ok(TensorManifest {
+            entries,
+            resident_bytes,
+        })
     }
 
     /// MiniMax-H3 video VAE (published F32): every tensor's name and shape from `vae/config.json`. The decoder side
@@ -3063,6 +3150,279 @@ impl MappedCheckpoint {
     }
 }
 
+/// The official MiniMax-H3 tensor set: F32 patch, time-embedding and output projections, BF16 elsewhere. The
+/// per-block AdaLN projections are Dormant: read once at setup into the modulation table, never part of the
+/// per-step layer set.
+pub(crate) fn minimax_h3_expected(
+    spec: &crate::minimax_h3::H3Spec,
+) -> Result<BTreeMap<String, ExpectedTensor>> {
+    let scope = TensorScope::Text;
+    let mut expected = BTreeMap::new();
+    for (base, n, k) in [
+        ("proj_in", spec.hidden, spec.video_row_width()),
+        ("audio_proj_in", spec.hidden, spec.audio_in_channels),
+        ("time_embedder.linear_1", spec.time_hidden, spec.freq_dim),
+        ("time_embedder.linear_2", spec.time_dim, spec.time_hidden),
+        ("proj_out", spec.video_row_width(), spec.hidden),
+        ("audio_proj_out", spec.audio_in_channels, spec.hidden),
+    ] {
+        put(
+            &mut expected,
+            format!("{base}.weight"),
+            Dtype::F32,
+            vec![n, k],
+            scope,
+        );
+        put(
+            &mut expected,
+            format!("{base}.bias"),
+            Dtype::F32,
+            vec![n],
+            scope,
+        );
+    }
+    let modulation = 6 * spec.hidden * crate::minimax_h3::MODALITIES as usize;
+    for (name, shape) in [
+        ("context_embedder.weight", vec![spec.hidden, spec.text_dim]),
+        ("context_embedder.bias", vec![spec.hidden]),
+        ("token_refiner.final_norm.weight", vec![spec.hidden]),
+        ("norm_out.norm.weight", vec![spec.hidden]),
+        (
+            "norm_out.linear.weight",
+            vec![2 * spec.hidden, spec.time_dim],
+        ),
+        ("norm_out.linear.bias", vec![2 * spec.hidden]),
+    ] {
+        put(&mut expected, name.to_owned(), Dtype::BF16, shape, scope);
+    }
+    let blocks = (0..spec.refiner_layers)
+        .map(|i| (format!("token_refiner.refiner_blocks.{i}"), false))
+        .chain((0..spec.layers).map(|i| (format!("transformer_blocks.{i}"), true)));
+    for (block, adaln) in blocks {
+        for (name, shape) in [
+            ("norm1.weight", vec![spec.hidden]),
+            ("norm2.weight", vec![spec.hidden]),
+            ("attn.norm_q.weight", vec![spec.head_dim]),
+            ("attn.norm_k.weight", vec![spec.head_dim]),
+        ] {
+            put(
+                &mut expected,
+                format!("{block}.{name}"),
+                Dtype::BF16,
+                shape,
+                scope,
+            );
+        }
+        if adaln {
+            let base = format!("{block}.adaln_proj.linear");
+            put(
+                &mut expected,
+                format!("{base}.weight"),
+                Dtype::BF16,
+                vec![modulation, spec.time_dim],
+                TensorScope::Dormant,
+            );
+            put(
+                &mut expected,
+                format!("{base}.bias"),
+                Dtype::BF16,
+                vec![modulation],
+                TensorScope::Dormant,
+            );
+        }
+    }
+    for (base, n, k) in spec.block_linears() {
+        put(
+            &mut expected,
+            format!("{base}.weight"),
+            Dtype::BF16,
+            vec![n, k],
+            scope,
+        );
+    }
+    Ok(expected)
+}
+
+/// One official tensor produced by a GGUF tensor.
+struct GgufTensorMap {
+    official: String,
+    /// Row range `[start, end)` of the official `[out, in]` tensor; `None` for the whole tensor.
+    range: Option<(u64, u64)>,
+    /// The source rows are the two halves of the official tensor in the opposite order (fused gate+up).
+    swap_halves: bool,
+}
+
+/// GGUF tensors with no official MiniMax-H3 counterpart.
+const UNUSED_GGUF_TENSORS: &[&str] = &["rope.inv_freq"];
+
+/// Community GGUF names to official MiniMax-H3 names. The GGUF data is the official row-major flat buffer; a 2-D
+/// tensor's declared dims are `[ne0=in, ne1=out]` (or a packed `[64, N]`/`[256, N]` view with the original input
+/// dim in `comfy.gguf.orig_shape.<name>`), so no transpose is needed. `blocks.{i}` is a transformer block,
+/// `token_refiner.blocks.{i}` a refiner block. The fused `attn.qkv_proj` is `[3*inner, hidden]` with q, k, v
+/// contiguous along rows; the fused `mlp.fc1` is `[2*ffn, hidden]` with the two halves in the opposite order to the
+/// official `ff.net.0.proj`.
+fn map_gguf_tensor(spec: &crate::minimax_h3::H3Spec, name: &str) -> Result<Vec<GgufTensorMap>> {
+    let width = (spec.heads * spec.head_dim) as u64;
+    let mut out = Vec::new();
+    if UNUSED_GGUF_TENSORS.contains(&name) {
+        return Ok(out);
+    }
+    for (weight, bias, official) in [
+        (
+            "video_patch_proj.weight",
+            "video_patch_proj.bias",
+            "proj_in",
+        ),
+        (
+            "audio_patch_proj.weight",
+            "audio_patch_proj.bias",
+            "audio_proj_in",
+        ),
+        (
+            "condition_proj.weight",
+            "condition_proj.bias",
+            "context_embedder",
+        ),
+        (
+            "time_embedder.proj_in.weight",
+            "time_embedder.proj_in.bias",
+            "time_embedder.linear_1",
+        ),
+        (
+            "time_embedder.proj_out.weight",
+            "time_embedder.proj_out.bias",
+            "time_embedder.linear_2",
+        ),
+        (
+            "final_layer.video_out.weight",
+            "final_layer.video_out.bias",
+            "proj_out",
+        ),
+        (
+            "final_layer.audio_out.weight",
+            "final_layer.audio_out.bias",
+            "audio_proj_out",
+        ),
+        (
+            "final_layer.adaln_proj.linear.weight",
+            "final_layer.adaln_proj.linear.bias",
+            "norm_out.linear",
+        ),
+    ] {
+        if name == weight {
+            out.push(GgufTensorMap {
+                official: format!("{official}.weight"),
+                range: None,
+                swap_halves: false,
+            });
+            return Ok(out);
+        }
+        if name == bias {
+            out.push(GgufTensorMap {
+                official: format!("{official}.bias"),
+                range: None,
+                swap_halves: false,
+            });
+            return Ok(out);
+        }
+    }
+    match name {
+        "final_layer.norm.weight" => {
+            out.push(GgufTensorMap {
+                official: "norm_out.norm.weight".into(),
+                range: None,
+                swap_halves: false,
+            });
+            return Ok(out);
+        }
+        "token_refiner.final_norm.weight" => {
+            out.push(GgufTensorMap {
+                official: "token_refiner.final_norm.weight".into(),
+                range: None,
+                swap_halves: false,
+            });
+            return Ok(out);
+        }
+        _ => {}
+    }
+    for (prefix, official, layers, adaln) in [
+        ("blocks.", "transformer_blocks.", spec.layers, true),
+        (
+            "token_refiner.blocks.",
+            "token_refiner.refiner_blocks.",
+            spec.refiner_layers,
+            false,
+        ),
+    ] {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let (index, suffix) = rest
+            .split_once('.')
+            .with_context(|| format!("GGUF block tensor {name} has no suffix"))?;
+        let index: usize = index
+            .parse()
+            .with_context(|| format!("GGUF block index in {name}"))?;
+        ensure!(
+            index < layers,
+            "GGUF block index {index} out of range in {name}"
+        );
+        let block = format!("{official}{index}");
+        let mapped = match suffix {
+            "attn.qkv_proj.weight" => {
+                for (suffix, range) in [
+                    ("to_q", (0, width)),
+                    ("to_k", (width, 2 * width)),
+                    ("to_v", (2 * width, 3 * width)),
+                ] {
+                    out.push(GgufTensorMap {
+                        official: format!("{block}.attn.{suffix}.weight"),
+                        range: Some(range),
+                        swap_halves: false,
+                    });
+                }
+                return Ok(out);
+            }
+            "attn.out_proj.weight" => format!("{block}.attn.to_out.0.weight"),
+            "mlp.fc1.weight" => {
+                out.push(GgufTensorMap {
+                    official: format!("{block}.ff.net.0.proj.weight"),
+                    range: None,
+                    swap_halves: true,
+                });
+                return Ok(out);
+            }
+            "mlp.fc2.weight" => format!("{block}.ff.net.2.weight"),
+            "norm1.weight" => format!("{block}.norm1.weight"),
+            "norm2.weight" => format!("{block}.norm2.weight"),
+            "attn.q_norm.weight" => format!("{block}.attn.norm_q.weight"),
+            "attn.k_norm.weight" => format!("{block}.attn.norm_k.weight"),
+            "adaln_proj.linear.weight" if adaln => {
+                format!("{block}.adaln_proj.linear.weight")
+            }
+            "adaln_proj.linear.bias" if adaln => format!("{block}.adaln_proj.linear.bias"),
+            _ => bail!("unknown MiniMax-H3 GGUF tensor {name}"),
+        };
+        out.push(GgufTensorMap {
+            official: mapped,
+            range: None,
+            swap_halves: false,
+        });
+        return Ok(out);
+    }
+    bail!("unknown MiniMax-H3 GGUF tensor {name}")
+}
+
+/// `(block_len, block_bytes)` of a supported GGUF type; the block runs along `ne0`.
+fn ggml_block(ggml_type: crate::gguf::GgmlType) -> Result<(u64, u64)> {
+    match ggml_type {
+        crate::gguf::GgmlType::F32 => Ok((1, 4)),
+        crate::gguf::GgmlType::F16 | crate::gguf::GgmlType::Bf16 => Ok((1, 2)),
+        crate::gguf::GgmlType::Q4_0 => Ok((32, 18)),
+        other => bail!("unsupported MiniMax-H3 GGUF type {other:?}"),
+    }
+}
+
 /// Layer name prefixes of the published checkpoints.
 const LAYER_PREFIXES: [&str; 7] = [
     "model.layers.",
@@ -3257,7 +3617,7 @@ impl LoadPolicy {
         self.selects(scope)
     }
 }
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TensorEntry {
     pub dtype: Dtype,
     pub shape: Vec<usize>,
@@ -3270,6 +3630,9 @@ pub struct TensorEntry {
     pub layer: Option<u32>,
     pub role: String,
     pub scale_name: Option<String>,
+    pub quant: Option<crate::gguf::GgmlType>,
+    /// The GGUF source rows are the two halves of the official tensor in the opposite order (fused gate+up).
+    pub swap_halves: bool,
 }
 impl TensorEntry {
     #[cfg(any(feature = "cuda", feature = "rocm", test))]
@@ -3320,7 +3683,7 @@ fn is_embed_tokens_role(name: &str) -> bool {
     name == "embed_tokens.weight" || name.ends_with(".embed_tokens.weight")
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TensorManifest {
     pub entries: BTreeMap<String, TensorEntry>,
     pub resident_bytes: usize,
@@ -3413,6 +3776,8 @@ impl MappedCheckpoint {
                     layer,
                     role,
                     scale_name: None,
+                    quant: None,
+                    swap_halves: false,
                 },
             );
         }
@@ -3746,6 +4111,8 @@ mod component_tests {
                     layer,
                     role,
                     scale_name: (*dtype == Dtype::F8_E4M3).then(|| format!("{}_scale_inv", name)),
+                    quant: None,
+                    swap_halves: false,
                 },
             );
             manifest.resident_bytes += bytes;
@@ -3858,6 +4225,8 @@ mod component_tests {
                 layer,
                 role,
                 scale_name: None,
+                quant: None,
+                swap_halves: false,
             };
             assert!(
                 entry.native_byte_storage(),
@@ -5383,6 +5752,494 @@ mod stored_zip_tests {
         ensure!(elements == 662544, "NAF storage element count");
         println!(
             "PASS stored_zip_tensor_layout valid=1 wrong_offset=rejected unknown_opcode=rejected compressed_member=rejected"
+        );
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod gguf_tests {
+    use super::*;
+    use crate::gguf::GgmlType;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct SyntheticTensor {
+        name: String,
+        ggml_type: GgmlType,
+        dims: Vec<u64>,
+        bytes: Vec<u8>,
+    }
+
+    fn put_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(buf: &mut Vec<u8>, value: u64) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_str(buf: &mut Vec<u8>, value: &str) {
+        put_u64(buf, value.len() as u64);
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    fn ggml_type_id(ggml_type: GgmlType) -> u32 {
+        match ggml_type {
+            GgmlType::F32 => 0,
+            GgmlType::F16 => 1,
+            GgmlType::Q4_0 => 2,
+            GgmlType::Bf16 => 30,
+            other => panic!("unsupported synthetic type {other:?}"),
+        }
+    }
+
+    fn tensor_bytes(ggml_type: GgmlType, dims: &[u64]) -> Vec<u8> {
+        let elements: u64 = dims.iter().product();
+        let len = match ggml_type {
+            GgmlType::F32 => elements * 4,
+            GgmlType::F16 | GgmlType::Bf16 => elements * 2,
+            GgmlType::Q4_0 => elements / 32 * 18,
+            other => panic!("unsupported synthetic type {other:?}"),
+        };
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn write_gguf(path: &Path, tensors: &[SyntheticTensor]) -> Result<()> {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        put_u32(&mut head, 3);
+        put_u64(&mut head, tensors.len() as u64);
+        put_u64(&mut head, 2);
+        put_str(&mut head, "general.architecture");
+        put_u32(&mut head, 8);
+        put_str(&mut head, "minimax_h3");
+        put_str(&mut head, "general.alignment");
+        put_u32(&mut head, 4);
+        put_u32(&mut head, 32);
+        let mut infos = Vec::new();
+        let mut offset = 0u64;
+        for tensor in tensors {
+            put_str(&mut infos, &tensor.name);
+            put_u32(&mut infos, tensor.dims.len() as u32);
+            for &dim in &tensor.dims {
+                put_u64(&mut infos, dim);
+            }
+            put_u32(&mut infos, ggml_type_id(tensor.ggml_type));
+            put_u64(&mut infos, offset);
+            offset += tensor.bytes.len() as u64;
+            offset = offset.div_ceil(32) * 32;
+        }
+        head.extend_from_slice(&infos);
+        head.resize(head.len().div_ceil(32) * 32, 0);
+        let mut file = head;
+        for tensor in tensors {
+            file.extend_from_slice(&tensor.bytes);
+            let padded = tensor.bytes.len().div_ceil(32) * 32;
+            file.resize(file.len() + padded - tensor.bytes.len(), 0);
+        }
+        std::fs::write(path, file)?;
+        Ok(())
+    }
+
+    struct TempGguf(PathBuf);
+
+    impl Drop for TempGguf {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp_gguf(tensors: &[SyntheticTensor]) -> Result<TempGguf> {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "flyingfish-gguf-manifest-{}-{}.gguf",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        write_gguf(&path, tensors)?;
+        Ok(TempGguf(path))
+    }
+
+    fn spec() -> crate::minimax_h3::H3Spec {
+        crate::minimax_h3::H3Spec {
+            hidden: 32,
+            heads: 1,
+            head_dim: 32,
+            layers: 1,
+            refiner_layers: 1,
+            ffn: 64,
+            in_channels: 4,
+            audio_in_channels: 4,
+            patch: [1, 2, 2],
+            text_dim: 16,
+            freq_dim: 8,
+            time_hidden: 16,
+            time_dim: 8,
+            rope_freq_dim: 4,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            qk_norm_eps: 1e-5,
+            final_norm_eps: 1e-5,
+        }
+    }
+
+    fn synthetic_tensors(spec: &crate::minimax_h3::H3Spec) -> Vec<SyntheticTensor> {
+        let hidden = spec.hidden as u64;
+        let width = (spec.heads * spec.head_dim) as u64;
+        let video = spec.video_row_width() as u64;
+        let audio = spec.audio_in_channels as u64;
+        let text = spec.text_dim as u64;
+        let freq = spec.freq_dim as u64;
+        let time_hidden = spec.time_hidden as u64;
+        let time_dim = spec.time_dim as u64;
+        let ffn = spec.ffn as u64;
+        let modulation = (6 * spec.hidden * crate::minimax_h3::MODALITIES as usize) as u64;
+        let mut out = Vec::new();
+        let mut push = |name: String, ggml_type: GgmlType, dims: Vec<u64>| {
+            let bytes = tensor_bytes(ggml_type, &dims);
+            out.push(SyntheticTensor {
+                name,
+                ggml_type,
+                dims,
+                bytes,
+            });
+        };
+        push(
+            "video_patch_proj.weight".into(),
+            GgmlType::F32,
+            vec![video, hidden],
+        );
+        push("video_patch_proj.bias".into(), GgmlType::F32, vec![hidden]);
+        push(
+            "audio_patch_proj.weight".into(),
+            GgmlType::F32,
+            vec![audio, hidden],
+        );
+        push("audio_patch_proj.bias".into(), GgmlType::F32, vec![hidden]);
+        push(
+            "condition_proj.weight".into(),
+            GgmlType::Bf16,
+            vec![text, hidden],
+        );
+        push("condition_proj.bias".into(), GgmlType::Bf16, vec![hidden]);
+        push(
+            "time_embedder.proj_in.weight".into(),
+            GgmlType::F32,
+            vec![freq, time_hidden],
+        );
+        push(
+            "time_embedder.proj_in.bias".into(),
+            GgmlType::F32,
+            vec![time_hidden],
+        );
+        push(
+            "time_embedder.proj_out.weight".into(),
+            GgmlType::F32,
+            vec![time_hidden, time_dim],
+        );
+        push(
+            "time_embedder.proj_out.bias".into(),
+            GgmlType::F32,
+            vec![time_dim],
+        );
+        push(
+            "final_layer.video_out.weight".into(),
+            GgmlType::F32,
+            vec![hidden, video],
+        );
+        push(
+            "final_layer.video_out.bias".into(),
+            GgmlType::F32,
+            vec![video],
+        );
+        push(
+            "final_layer.audio_out.weight".into(),
+            GgmlType::F32,
+            vec![hidden, audio],
+        );
+        push(
+            "final_layer.audio_out.bias".into(),
+            GgmlType::F32,
+            vec![audio],
+        );
+        push(
+            "final_layer.norm.weight".into(),
+            GgmlType::Bf16,
+            vec![hidden],
+        );
+        push(
+            "final_layer.adaln_proj.linear.weight".into(),
+            GgmlType::Bf16,
+            vec![time_dim, 2 * hidden],
+        );
+        push(
+            "final_layer.adaln_proj.linear.bias".into(),
+            GgmlType::Bf16,
+            vec![2 * hidden],
+        );
+        push(
+            "token_refiner.final_norm.weight".into(),
+            GgmlType::Bf16,
+            vec![hidden],
+        );
+        for (prefix, layers, adaln) in [
+            ("blocks.", spec.layers, true),
+            ("token_refiner.blocks.", spec.refiner_layers, false),
+        ] {
+            for index in 0..layers {
+                let block = format!("{prefix}{index}");
+                push(
+                    format!("{block}.attn.qkv_proj.weight"),
+                    GgmlType::Q4_0,
+                    vec![hidden, 3 * width],
+                );
+                push(
+                    format!("{block}.attn.out_proj.weight"),
+                    GgmlType::Bf16,
+                    vec![width, hidden],
+                );
+                push(
+                    format!("{block}.mlp.fc1.weight"),
+                    GgmlType::Q4_0,
+                    vec![hidden, 2 * ffn],
+                );
+                push(
+                    format!("{block}.mlp.fc2.weight"),
+                    GgmlType::Bf16,
+                    vec![ffn, hidden],
+                );
+                push(
+                    format!("{block}.norm1.weight"),
+                    GgmlType::Bf16,
+                    vec![hidden],
+                );
+                push(
+                    format!("{block}.norm2.weight"),
+                    GgmlType::Bf16,
+                    vec![hidden],
+                );
+                push(
+                    format!("{block}.attn.q_norm.weight"),
+                    GgmlType::Bf16,
+                    vec![spec.head_dim as u64],
+                );
+                push(
+                    format!("{block}.attn.k_norm.weight"),
+                    GgmlType::Bf16,
+                    vec![spec.head_dim as u64],
+                );
+                if adaln {
+                    push(
+                        format!("{block}.adaln_proj.linear.weight"),
+                        GgmlType::Bf16,
+                        vec![time_dim, modulation],
+                    );
+                    push(
+                        format!("{block}.adaln_proj.linear.bias"),
+                        GgmlType::Bf16,
+                        vec![modulation],
+                    );
+                }
+            }
+        }
+        push(
+            "rope.inv_freq".into(),
+            GgmlType::F32,
+            vec![spec.rope_freq_dim as u64],
+        );
+        out
+    }
+
+    #[test]
+    fn minimax_h3_gguf_manifest_maps_names_shapes_and_quants() -> Result<()> {
+        let spec = spec();
+        let file = temp_gguf(&synthetic_tensors(&spec))?;
+        let gguf = crate::gguf::GgufFile::open(&file.0)?;
+        let expected = minimax_h3_expected(&spec)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
+        ensure!(
+            manifest.entries.len() == expected.len(),
+            "manifest has {} entries, expected {}",
+            manifest.entries.len(),
+            expected.len()
+        );
+        let entry = &manifest.entries["proj_in.weight"];
+        ensure!(
+            entry.shape == [spec.hidden, spec.video_row_width()]
+                && entry.quant == Some(GgmlType::F32)
+                && entry.data_offsets == [0, 32 * 16 * 4]
+                && entry.shard == file.0.file_name().unwrap().to_str().unwrap(),
+            "proj_in mapping: {entry:?}"
+        );
+        let q = &manifest.entries["transformer_blocks.0.attn.to_q.weight"];
+        let k = &manifest.entries["transformer_blocks.0.attn.to_k.weight"];
+        let v = &manifest.entries["transformer_blocks.0.attn.to_v.weight"];
+        for entry in [q, k, v] {
+            ensure!(
+                entry.shape == [32, 32]
+                    && entry.quant == Some(GgmlType::Q4_0)
+                    && entry.bytes == 32 * 32 * 18 / 32
+                    && entry.data_offsets == [0, entry.bytes as u64],
+                "fused qkv slice mapping: {entry:?}"
+            );
+        }
+        ensure!(
+            k.data_start - q.data_start == q.bytes as u64
+                && v.data_start - k.data_start == q.bytes as u64,
+            "fused qkv column ranges are not contiguous"
+        );
+        let fc1 = &manifest.entries["transformer_blocks.0.ff.net.0.proj.weight"];
+        ensure!(
+            fc1.shape == [2 * spec.ffn, spec.hidden]
+                && fc1.quant == Some(GgmlType::Q4_0)
+                && fc1.bytes == 32 * 128 * 18 / 32,
+            "fused fc1 mapping: {fc1:?}"
+        );
+        ensure!(
+            manifest
+                .entries
+                .contains_key("token_refiner.refiner_blocks.0.attn.to_k.weight")
+                && manifest.entries.contains_key("norm_out.linear.weight")
+                && manifest.entries["norm_out.linear.weight"].shape
+                    == [2 * spec.hidden, spec.time_dim]
+                && !manifest.entries.contains_key("rope.inv_freq")
+                && !manifest.entries["transformer_blocks.0.adaln_proj.linear.weight"].load,
+            "fixed/refiner mapping mismatch"
+        );
+        let resident: usize = manifest
+            .entries
+            .values()
+            .filter(|entry| entry.load)
+            .map(|entry| entry.bytes)
+            .sum();
+        ensure!(
+            manifest.resident_bytes == resident,
+            "resident bytes {} != loaded entries {resident}",
+            manifest.resident_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_h3_gguf_manifest_rejects_unknown_tensor() -> Result<()> {
+        let spec = spec();
+        let mut tensors = synthetic_tensors(&spec);
+        tensors.push(SyntheticTensor {
+            name: "unknown.tensor".into(),
+            ggml_type: GgmlType::F32,
+            dims: vec![4],
+            bytes: tensor_bytes(GgmlType::F32, &[4]),
+        });
+        let file = temp_gguf(&tensors)?;
+        let gguf = crate::gguf::GgufFile::open(&file.0)?;
+        ensure!(
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf).is_err(),
+            "unknown GGUF tensor was accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_h3_gguf_manifest_rejects_a_half_swapped_non_q4_fc1() -> Result<()> {
+        let spec = spec();
+        let mut tensors = synthetic_tensors(&spec);
+        for tensor in &mut tensors {
+            if tensor.name == "blocks.0.mlp.fc1.weight" {
+                tensor.ggml_type = GgmlType::F16;
+                tensor.bytes = tensor_bytes(GgmlType::F16, &tensor.dims);
+            }
+        }
+        let file = temp_gguf(&tensors)?;
+        let gguf = crate::gguf::GgufFile::open(&file.0)?;
+        ensure!(
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf).is_err(),
+            "an F16 fused fc1 with swap_halves was accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_h3_gguf_manifest_rejects_a_pass_through_dtype_mismatch() -> Result<()> {
+        let spec = spec();
+        let mut tensors = synthetic_tensors(&spec);
+        for tensor in &mut tensors {
+            if tensor.name == "blocks.0.attn.out_proj.weight" {
+                tensor.ggml_type = GgmlType::F32;
+                tensor.bytes = tensor_bytes(GgmlType::F32, &tensor.dims);
+            }
+        }
+        let file = temp_gguf(&tensors)?;
+        let gguf = crate::gguf::GgufFile::open(&file.0)?;
+        ensure!(
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf).is_err(),
+            "an F32 source for the BF16 attn.out_proj was accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF"]
+    fn minimax_h3_gguf_manifest_matches_the_published_target() -> Result<()> {
+        let model = std::env::var("FF_MODEL").context("FF_MODEL missing")?;
+        let gguf_path = std::env::var("FF_H3_GGUF").context("FF_H3_GGUF missing")?;
+        let spec = crate::minimax_h3::H3Spec::read(std::path::Path::new(&model))?;
+        let gguf = crate::gguf::GgufFile::open(std::path::Path::new(&gguf_path))?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
+        ensure!(
+            manifest.entries.len() == 638,
+            "manifest has {} entries, expected 638",
+            manifest.entries.len()
+        );
+        let proj_in = &manifest.entries["proj_in.weight"];
+        ensure!(
+            proj_in.quant == Some(GgmlType::Q4_0)
+                && proj_in.shape == [spec.hidden, spec.video_row_width()]
+                && !proj_in.swap_halves,
+            "proj_in mapping: {proj_in:?}"
+        );
+        let fc1 = &manifest.entries["transformer_blocks.0.ff.net.0.proj.weight"];
+        ensure!(
+            fc1.swap_halves && fc1.quant == Some(GgmlType::Q4_0),
+            "fused fc1 mapping: {fc1:?}"
+        );
+        for (name, shape) in [
+            (
+                "transformer_blocks.0.attn.to_q.weight",
+                vec![spec.heads * spec.head_dim, spec.hidden],
+            ),
+            (
+                "transformer_blocks.0.ff.net.2.weight",
+                vec![spec.hidden, spec.ffn],
+            ),
+        ] {
+            let entry = &manifest.entries[name];
+            ensure!(
+                entry.quant == Some(GgmlType::Q4_0) && entry.shape == shape,
+                "{name} mapping: {entry:?}"
+            );
+        }
+        let norm = &manifest.entries["transformer_blocks.0.norm1.weight"];
+        ensure!(
+            norm.quant == Some(GgmlType::F16) && norm.dtype == Dtype::BF16,
+            "norm mapping: {norm:?}"
+        );
+        let adaln = &manifest.entries["transformer_blocks.0.adaln_proj.linear.weight"];
+        ensure!(
+            adaln.quant == Some(GgmlType::Q4_0) && !adaln.load,
+            "packed adaln mapping: {adaln:?}"
+        );
+        let resident: usize = manifest
+            .entries
+            .values()
+            .filter(|entry| entry.load)
+            .map(|entry| entry.bytes)
+            .sum();
+        ensure!(
+            manifest.resident_bytes == resident,
+            "resident bytes {} != loaded entries {resident}",
+            manifest.resident_bytes
         );
         Ok(())
     }
