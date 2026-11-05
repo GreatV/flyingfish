@@ -4140,6 +4140,10 @@ impl Engine {
             )?;
             engine.moe_slots = Some(slots);
             engine.chunk = engine.chunk.min(admitted_rows as usize);
+            #[cfg(feature = "cuda")]
+            {
+                engine.workspace_rows = admitted_rows as usize;
+            }
             engine
                 .forward_rows
                 .retain(|row| *row <= admitted_rows as usize);
