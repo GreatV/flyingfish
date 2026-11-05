@@ -1,6 +1,7 @@
 //! Qwen bindings and operators of the shared Engine.
 use super::*;
 use crate::backend::cuda::contracts::view;
+use crate::backend::cuda::moe::route::ROUTE_LOGITS_WORKSPACE_BYTES;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
@@ -1061,6 +1062,8 @@ impl Runtime {
         spec: &crate::model_spec::ModelSpec,
         manifest: &crate::checkpoint::TensorManifest,
         rows: usize,
+        waves: u32,
+        route_handle_bytes: usize,
     ) -> Result<usize> {
         use crate::experts::catalogue::{ExpertGeometry, ExpertLayout};
         let geometry = ExpertGeometry::from_model(spec)?;
@@ -1077,7 +1080,7 @@ impl Runtime {
         );
         let rows = u64::try_from(rows)?;
         let live = (rows * k).min(e);
-        let slots = layers * live * layout.slot_bytes();
+        let slots = u64::from(waves) * live * layout.slot_bytes();
         let quant = |width: u64| width + width.div_ceil(128) * 4;
         let row_buffers = e * 4
             + k * 16
@@ -1088,7 +1091,8 @@ impl Runtime {
             + 2 * quant(h)
             + quant(i)
             + 4;
-        let plans = layers * (rows * (4 * 1024 * 1024 + 64) + rows * (rows + 1) / 2 * row_buffers);
+        let route_plan = (ROUTE_LOGITS_WORKSPACE_BYTES + route_handle_bytes + 64) as u64;
+        let plans = layers * (rows * route_plan + rows * (rows + 1) / 2 * row_buffers);
         let tables = layers * (e * 6 * 8 + e * 4 + rows * e * 4);
         let native_inputs = manifest
             .entries
@@ -3418,29 +3422,52 @@ impl Engine {
             None
         };
         let native_budget = if glm {
+            let route_handle_bytes =
+                crate::backend::cuda::moe::route::blas_handle_bytes(&device.ctx, s)?;
+            let layers = crate::experts::catalogue::ExpertGeometry::from_model(&model_spec)?.layers;
+            let native_request = crate::prefill::WorkspaceRequest {
+                capacity: capacity.min(crate::linear_plan::MAX_SKINNY_ROWS),
+                alignment: 1,
+                ..request
+            };
+            let workspace = |rows: usize, waves: u32| {
+                Runtime::workspace(
+                    &model_spec,
+                    rows,
+                    capacity,
+                    gdn_policy,
+                    verify_rows,
+                    Some(s),
+                )?
+                .checked_add(Runtime::native_workspace(
+                    &model_spec,
+                    &catalog.manifest,
+                    rows,
+                    waves,
+                    route_handle_bytes,
+                )?)
+                .context("native GLM workspace overflow")
+            };
+            let select = |rows: usize| Ok(1usize << (usize::BITS - 1 - rows.leading_zeros()));
+            let all_layers_workspace = workspace(1, layers)?;
+            let one_row_all_layers = native_request
+                .row_bytes
+                .checked_add(native_request.fixed_transient_bytes)
+                .and_then(|bytes| bytes.checked_add(all_layers_workspace))
+                .context("native GLM all-layer byte count overflow")?;
+            let available = request
+                .free_after_resident
+                .checked_sub(request.total / 16)
+                .context("native GLM reserve exceeds free memory")?;
+            let waves = if one_row_all_layers <= available {
+                layers
+            } else {
+                1
+            };
             Some(crate::prefill::WorkspaceBudget::new(
-                crate::prefill::WorkspaceRequest {
-                    capacity: capacity.min(crate::linear_plan::MAX_SKINNY_ROWS),
-                    alignment: 1,
-                    ..request
-                },
-                |rows| {
-                    Runtime::workspace(
-                        &model_spec,
-                        rows,
-                        capacity,
-                        gdn_policy,
-                        verify_rows,
-                        Some(s),
-                    )?
-                    .checked_add(Runtime::native_workspace(
-                        &model_spec,
-                        &catalog.manifest,
-                        rows,
-                    )?)
-                    .context("native GLM workspace overflow")
-                },
-                |rows| Ok(1usize << (usize::BITS - 1 - rows.leading_zeros())),
+                native_request,
+                |rows| workspace(rows, waves),
+                select,
             )?)
         } else {
             None
@@ -6033,7 +6060,7 @@ impl Engine {
             s.memcpy_htod(&pointers, &mut native.pointers)?;
             s.memcpy_htod(&valid, &mut native.valid)?;
             plan.run(s, x, &y)?;
-            slots.record_all_readers(&self.device)?;
+            slots.record_all_readers(&self.device.stream)?;
             if all_layers(trace) || layer == self.trace_layer {
                 trace_value(
                     trace,

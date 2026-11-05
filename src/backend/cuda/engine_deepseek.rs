@@ -2440,6 +2440,11 @@ impl DeepseekFfn {
             };
             self.experts.run_dispatch(s, dispatch, &routed_scratch.0)?;
         }
+        if let Some(slots) = tier.as_mut()
+            && slots.has_pool()
+        {
+            slots.record_all_readers(s)?;
+        }
         for row in 0..rows {
             let sinter = g.shared_intermediate as u32;
             let hidden = g.hidden as u32;
@@ -6774,6 +6779,282 @@ mod tests {
             .count();
         println!("LAYER_CONTROL layer={layer} control=wrong-slot beyond={count}");
         ensure!(count > 0, "layer {layer} wrong-slot control escaped");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "GPU lease; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL, FF_DS41_ENGRAM_HASH"]
+    fn deepseek_expert_waves_match_gpu() -> Result<()> {
+        use super::super::moe::{PoolControl, delay_stream};
+
+        const REFERENCE_BYTES: usize = 4096;
+
+        fn layer_output(engine: &mut Engine, layer: usize) -> Result<Vec<bf16>> {
+            let ids: Vec<i32> = (0..6)
+                .map(|k| ((layer * 61 + k * 59 + 7) % 384) as i32)
+                .collect();
+            let weights: Vec<f32> = (1..=ids.len()).map(|k| k as f32 / 21.0).collect();
+            let input: Vec<_> = (0..5120)
+                .map(|i| bf16::from_f32(((i * 17) % 251) as f32 / 64.0 - 2.0))
+                .collect();
+            let Engine {
+                deepseek_ffn,
+                moe_slots,
+                work,
+                device,
+                ..
+            } = engine;
+            let ffn = deepseek_ffn.as_mut().context("DeepSeek-V4.1 FFN missing")?;
+            let slots = moe_slots
+                .as_mut()
+                .context("DeepSeek-V4.1 expert tiers missing")?;
+            let s = &device.stream;
+            slots.begin_token()?;
+            s.memcpy_htod(&input, &mut work.n.slice_mut(..5120))?;
+            ffn.run_with_tier(DeepseekFfnRun {
+                s,
+                rows: 1,
+                x: &work.n,
+                out: &mut work.out,
+                layer,
+                accumulator: Accumulator::Fp32,
+                tier: Some(slots),
+                fixed_routes: Some((ids, weights)),
+            })?;
+            slots.finish_token()?;
+            s.clone_dtoh(&work.out.slice(..5120))
+                .context("DeepSeek device readback")
+        }
+
+        fn outputs(engine: &mut Engine) -> Result<Vec<Vec<bf16>>> {
+            let layers = engine
+                .deepseek_ffn
+                .as_ref()
+                .context("DeepSeek-V4.1 FFN missing")?
+                .layers
+                .len();
+            (0..layers)
+                .map(|layer| layer_output(engine, layer))
+                .collect()
+        }
+
+        fn leased_head(engine: &mut Engine, layer: u32, ids: &[i32], hold: bool) -> Result<u64> {
+            let Engine {
+                moe_slots, device, ..
+            } = engine;
+            let slots = moe_slots.as_mut().context("tiers missing")?;
+            let s = &device.stream;
+            let weights = vec![1.0 / ids.len() as f32; ids.len()];
+            slots.begin_token()?;
+            slots.resolve_native(layer, ids, &weights)?;
+            slots.wait_refill(s)?;
+            let (pointers, _) = slots.native_dispatch(layer)?;
+            let head = pointers[*ids.iter().min().context("no ids")? as usize * 6];
+            if !hold {
+                s.synchronize()?;
+                slots.finish_token()?;
+            }
+            Ok(head)
+        }
+
+        fn read(engine: &Engine, pointer: u64) -> Result<Vec<u8>> {
+            let s = &engine.device.stream;
+            let mut bytes = vec![0u8; REFERENCE_BYTES];
+            // SAFETY: the host span holds REFERENCE_BYTES and the stream is synchronized before use.
+            unsafe {
+                crate::backend::cuda::copy::dtoh_raw(
+                    bytes.as_mut_ptr().cast(),
+                    pointer,
+                    REFERENCE_BYTES,
+                    s,
+                )?;
+            }
+            s.synchronize()?;
+            Ok(bytes)
+        }
+
+        fn consumer_delayed(
+            engine: &mut Engine,
+            control: PoolControl,
+            [first, second]: [(u32, &[i32]); 2],
+            reference: &[u8],
+        ) -> Result<bool> {
+            let sink = engine.device.stream.alloc_zeros::<u8>(REFERENCE_BYTES)?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("tiers missing")?
+                .pool_control = control;
+            let head = leased_head(engine, first.0, first.1, true)?;
+            {
+                let Engine {
+                    moe_slots, device, ..
+                } = engine;
+                let slots = moe_slots.as_mut().context("tiers missing")?;
+                let s = &device.stream;
+                delay_stream(s)?;
+                let (sink_ptr, _guard) = sink.device_ptr(s);
+                // SAFETY: the sink holds REFERENCE_BYTES, the leased slot is live until the recorded reader event, and both stay ordered on one stream.
+                unsafe {
+                    crate::backend::cuda::copy::dtod_raw(sink_ptr, head, REFERENCE_BYTES, s)?
+                };
+                slots.record_all_readers(s)?;
+                slots.finish_token()?;
+            }
+            leased_head(engine, second.0, second.1, false)?;
+            engine.device.stream.synchronize()?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("tiers missing")?
+                .pool_control = PoolControl::None;
+            let bytes = engine.device.stream.clone_dtoh(&sink)?;
+            Ok(bytes == reference)
+        }
+
+        ensure!(
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
+            "granted GPU window required"
+        );
+        let model_dir = PathBuf::from(std::env::var("FF_DS41_MODEL")?);
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "flyingfish-deepseek-expert-waves-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&runtime_dir)?;
+        let hash_record = PathBuf::from(std::env::var_os("FF_DS41_ENGRAM_HASH").context(
+            "FF_DS41_ENGRAM_HASH missing: the accepted engram-hash-v1 record is required",
+        )?);
+        std::fs::copy(&hash_record, runtime_dir.join("engram-hash-v1.json"))?;
+        let load = |forced: Option<u64>| -> Result<Engine> {
+            crate::experts::plan::FORCED_WAVES.set(forced);
+            let loaded = Engine::load(
+                &model_dir,
+                0,
+                130,
+                None,
+                Settings {
+                    tree_builder: TreeBuilder::Waves,
+                    spec_budget: SpecBudget::Chain,
+                    spec_graph: false,
+                    draft_model: None,
+                    runtime_dir: Some(runtime_dir.clone()),
+                    prefix_cache: false,
+                    device_budget_gib: None,
+                    kv_format: crate::kv::KvFormat::Bf16,
+                },
+            );
+            crate::experts::plan::FORCED_WAVES.set(None);
+            loaded
+        };
+
+        fn differing(a: &[Vec<bf16>], b: &[Vec<bf16>]) -> usize {
+            a.iter()
+                .zip(b)
+                .filter(|(x, y)| x.iter().zip(*y).any(|(p, q)| p.to_bits() != q.to_bits()))
+                .count()
+        }
+
+        let mut derived = load(None)?;
+        ensure!(
+            derived
+                .moe_slots
+                .as_ref()
+                .context("tiers missing")?
+                .has_pool(),
+            "the 4090 derivation held every layer's wave; the pool path is not exercised"
+        );
+        let expected = outputs(&mut derived)?;
+        drop(derived);
+
+        let mut middle = load(Some(7))?;
+        let seven = outputs(&mut middle)?;
+        drop(middle);
+        ensure!(
+            differing(&expected, &seven) == 0,
+            "forced seven waves differ from the derived plan"
+        );
+
+        let mut waved = load(Some(1))?;
+        ensure!(
+            waved
+                .moe_slots
+                .as_ref()
+                .context("tiers missing")?
+                .has_pool(),
+            "forced one wave did not select the shared pool"
+        );
+        let actual = outputs(&mut waved)?;
+        let differences = differing(&expected, &actual);
+        ensure!(
+            differences == 0,
+            "forced one wave differs from the derived plan in {differences} of {} layers",
+            expected.len()
+        );
+        println!(
+            "DS41_WAVES_IDENTITY PASS layers={} values={} derived_vs_seven_vs_one_bitwise_equal=true",
+            expected.len(),
+            expected.len() * 5120
+        );
+        waved
+            .moe_slots
+            .as_mut()
+            .context("tiers missing")?
+            .pool_control = PoolControl::Misindex;
+        let misindexed = outputs(&mut waved)?;
+        waved
+            .moe_slots
+            .as_mut()
+            .context("tiers missing")?
+            .pool_control = PoolControl::None;
+        let escaped = expected
+            .iter()
+            .zip(&misindexed)
+            .filter(|(a, b)| a.iter().zip(*b).all(|(x, y)| x.to_bits() == y.to_bits()))
+            .count();
+        println!(
+            "DS41_WAVES_CONTROL misindexed_pool layers_equal={escaped} of {}",
+            expected.len()
+        );
+        ensure!(
+            escaped < expected.len(),
+            "misindexed pool control escaped in every layer"
+        );
+
+        let ids_a: Vec<i32> = (0..6).map(|k| 11 + 7 * k).collect();
+        let ids_b: Vec<i32> = (0..6).map(|k| 101 + 5 * k).collect();
+        let reference_head = leased_head(&mut waved, 5, &ids_a, false)?;
+        let reference = read(&waved, reference_head)?;
+        let other_head = leased_head(&mut waved, 6, &ids_b, false)?;
+        ensure!(
+            other_head == reference_head && read(&waved, other_head)? != reference,
+            "pool reuse validity: the second layer did not overwrite the first layer's slot"
+        );
+        let ordered = consumer_delayed(
+            &mut waved,
+            PoolControl::None,
+            [(5, &ids_a), (6, &ids_b)],
+            &reference,
+        )?;
+        let planted = consumer_delayed(
+            &mut waved,
+            PoolControl::SkipReaderWait,
+            [(5, &ids_a), (6, &ids_b)],
+            &reference,
+        )?;
+        println!(
+            "DS41_WAVES_REUSE_ORDER consumer_read_intact={ordered} control_without_reader_wait_intact={planted}"
+        );
+        ensure!(
+            ordered,
+            "the next layer refilled the pool before the consumer read it"
+        );
+        ensure!(
+            !planted,
+            "the reader-wait control did not change the consumer's bytes"
+        );
+        println!("DS41_WAVES_GATE PASS");
         Ok(())
     }
 

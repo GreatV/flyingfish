@@ -220,6 +220,23 @@ pub(crate) struct RouteOps {
     stream: Arc<CudaStream>,
 }
 
+/// Device workspace of the MoE route-logits Lt plans.
+#[cfg(feature = "cuda")]
+pub(crate) const ROUTE_LOGITS_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(not(feature = "cuda"))]
+pub(crate) const ROUTE_LOGITS_WORKSPACE_BYTES: usize = 0;
+
+/// Device bytes one cuBLAS handle holds, measured by creating and dropping it.
+pub fn blas_handle_bytes(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<usize> {
+    let before = ctx.mem_get_info()?.0;
+    let blas = CudaBlas::new(stream.clone())?;
+    let after = ctx.mem_get_info()?.0;
+    drop(blas);
+    before
+        .checked_sub(after)
+        .context("cuBLAS handle probe saw free memory grow")
+}
+
 impl RouteOps {
     pub fn new(
         ctx: &Arc<CudaContext>,

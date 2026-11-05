@@ -335,7 +335,7 @@ impl SlotLayout {
         slots.try_reserve_exact(geometry.layers as usize)?;
         for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
             ensure!(
-                count > 0 && count <= geometry.experts,
+                (count > 0 || capacity.prefill_staging_slots > 0) && count <= geometry.experts,
                 "slot layout layer={layer} slots={count} experts={}",
                 geometry.experts
             );

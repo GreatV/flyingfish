@@ -585,6 +585,15 @@ struct PeerSlots {
     publish: CudaFunction,
 }
 
+/// Planted faults of the shared pool wave.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::backend::cuda::engine) enum PoolControl {
+    None,
+    Misindex,
+    SkipReaderWait,
+}
+
 pub(in crate::backend::cuda::engine) struct Slots {
     pub storage: super::super::super::weights::ExpertStorage,
     gate_up: CudaSlice<u64>,
@@ -600,6 +609,10 @@ pub(in crate::backend::cuda::engine) struct Slots {
     events: Events,
     pub(super) refill: CudaEvent,
     physical: Vec<Physical>,
+    streamed: Vec<bool>,
+    pool: Vec<Physical>,
+    leased: Vec<(u32, usize)>,
+    leased_layer: u32,
     publish: CudaFunction,
     routes: Vec<crate::experts::runtime::Route>,
     host_experts: Vec<u32>,
@@ -612,6 +625,8 @@ pub(in crate::backend::cuda::engine) struct Slots {
     pending_reads: u64,
     #[cfg(test)]
     delay_request: bool,
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) pool_control: PoolControl,
 }
 
 fn check_publish(
@@ -650,7 +665,7 @@ fn check_lifetime(expected: [Option<u64>; 2], owned: [Option<u64>; 2]) -> Result
 }
 
 #[cfg(test)]
-pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
+pub(in crate::backend::cuda::engine) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
     unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -729,6 +744,16 @@ impl Slots {
             host - host / 16,
             copies,
         )?;
+        let resident_layers = capacity
+            .slots_per_layer
+            .iter()
+            .filter(|&&count| count > 0)
+            .count();
+        let waves = if capacity.prefill_staging_slots > 0 {
+            resident_layers + 1
+        } else {
+            geometry.layers as usize
+        };
         let frequency = vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize];
         let initial = crate::experts::plan::initial_residency(
             &frequency,
@@ -743,6 +768,7 @@ impl Slots {
                 "device_fixed_or_external_bytes": total - free, "gpu_slots": capacity.slots_total(),
                 "host_blocks": capacity.host_blocks, "spare_blocks": capacity.spare_blocks,
                 "disk_bytes": capacity.disk_bytes, "live_rows": rows, "copy_engines": copies,
+                "waves_staged": waves, "resident_layers": resident_layers, "pool_slots": capacity.prefill_staging_slots,
                 "host_available_bytes": host, "source": "capacity; GPU compute; native host staging"
             }})
         );
@@ -848,6 +874,24 @@ impl Slots {
             "physical expert slot map has a hole"
         );
         let physical_map_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let streamed: Vec<bool> = input
+            .capacity
+            .slots_per_layer
+            .iter()
+            .map(|&count| count == 0)
+            .collect();
+        let pool = if streamed.contains(&true) {
+            (0..input.capacity.prefill_staging_slots)
+                .map(|slot| {
+                    Ok(Physical {
+                        pointer: storage.staging(slot)?.0,
+                        ..Physical::default()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let phase_started = std::time::Instant::now();
         let transfers = Transfers::new(
             device,
@@ -910,6 +954,10 @@ impl Slots {
             events,
             refill: device.ctx.new_event(None)?,
             physical,
+            streamed,
+            pool,
+            leased: Vec::new(),
+            leased_layer: u32::MAX,
             publish: super::super::super::cubin::module(&device.ctx, "moe_route")?
                 .load_function("moe_slot_publish")?,
             routes: Vec::with_capacity(input.max_rows as usize * geometry.top_k as usize),
@@ -937,6 +985,8 @@ impl Slots {
             pending_reads: 0,
             #[cfg(test)]
             delay_request: false,
+            #[cfg(test)]
+            pool_control: PoolControl::None,
         };
         let slots_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
@@ -1110,6 +1160,22 @@ impl Slots {
         generation: u64,
         source: MoveSource,
     ) -> Result<()> {
+        let destination = self.physical[slot as usize].pointer;
+        let staging = self.upload(layer, expert, destination, source)?;
+        let event = self.publish(layer, expert, victim, slot, generation)?;
+        if let MoveSource::Host(block) = source {
+            self.transfers.copied_host(block, staging, &event);
+        }
+        Ok(())
+    }
+
+    fn upload(
+        &mut self,
+        layer: u32,
+        expert: u32,
+        destination: u64,
+        source: MoveSource,
+    ) -> Result<Option<usize>> {
         let on_peer = self
             .peer
             .as_ref()
@@ -1134,7 +1200,7 @@ impl Slots {
                     // SAFETY: the portable registered ring guard remains alive until the copy is submitted.
                     unsafe {
                         copy::htod_raw(
-                            self.physical[slot as usize].pointer,
+                            destination,
                             pointer as *const std::ffi::c_void,
                             usize::try_from(self.catalogue.slot_bytes())?,
                             peer.upload.as_ref(),
@@ -1148,7 +1214,7 @@ impl Slots {
                     // SAFETY: the registered ring guard remains alive until the copy is submitted.
                     unsafe {
                         copy::htod_raw(
-                            self.physical[slot as usize].pointer,
+                            destination,
                             pointer as *const std::ffi::c_void,
                             usize::try_from(self.catalogue.slot_bytes())?,
                             self.transfers.h2d.as_ref(),
@@ -1169,7 +1235,7 @@ impl Slots {
                 // SAFETY: the source remains claimed or staged through the recorded copy.
                 unsafe {
                     copy::htod_raw(
-                        self.physical[slot as usize].pointer,
+                        destination,
                         pointer as *const std::ffi::c_void,
                         usize::try_from(self.catalogue.slot_bytes())?,
                         peer.upload.as_ref(),
@@ -1184,7 +1250,7 @@ impl Slots {
                 // SAFETY: the pinned source remains claimed or staged through the recorded copy.
                 unsafe {
                     copy::htod_raw(
-                        self.physical[slot as usize].pointer,
+                        destination,
                         pointer as *const std::ffi::c_void,
                         usize::try_from(self.catalogue.slot_bytes())?,
                         self.transfers.h2d.as_ref(),
@@ -1193,11 +1259,7 @@ impl Slots {
                 .context("copy native host expert into its physical slot")?;
             }
         }
-        let event = self.publish(layer, expert, victim, slot, generation)?;
-        if let MoveSource::Host(block) = source {
-            self.transfers.copied_host(block, staging, &event);
-        }
-        Ok(())
+        Ok(staging)
     }
 
     fn apply_move(&mut self, movement: PromptMove) -> Result<()> {
@@ -1359,6 +1421,40 @@ impl Slots {
         Ok(())
     }
 
+    fn lease_native(&mut self, layer: u32, experts: &[u32]) -> Result<usize> {
+        let leased = self.policy.lease(layer, experts)?;
+        ensure!(
+            leased.len() <= self.pool.len(),
+            "layer {layer} routes {} experts; the pool holds {}",
+            leased.len(),
+            self.pool.len()
+        );
+        self.leased.clear();
+        for (index, lease) in leased.iter().enumerate() {
+            let reader = self.pool[index].reader.take();
+            #[cfg(test)]
+            let reader = reader.filter(|_| self.pool_control != PoolControl::SkipReaderWait);
+            if let Some(reader) = reader {
+                self.events.wait(&self.transfers.h2d, reader.id)?;
+            }
+            let destination = self.pool[index].pointer;
+            let source = match lease.source_block {
+                Some(block) => MoveSource::Host(block),
+                None => MoveSource::Disk,
+            };
+            let staging = self.upload(layer, lease.expert, destination, source)?;
+            let copy = self.events.record(&self.transfers.h2d)?;
+            if let MoveSource::Host(block) = source {
+                self.transfers.copied_host(block, staging, &copy);
+            }
+            self.pool[index].copy = Some(copy);
+            self.leased.push((lease.expert, index));
+        }
+        self.leased_layer = layer;
+        self.refill.record(&self.transfers.h2d)?;
+        Ok(leased.len())
+    }
+
     pub fn resolve_native(&mut self, layer: u32, ids: &[i32], weights: &[f32]) -> Result<usize> {
         ensure!(
             ids.len() == weights.len(),
@@ -1386,6 +1482,9 @@ impl Slots {
             .collect();
         unique.sort_unstable();
         unique.dedup();
+        if self.streamed[layer as usize] {
+            return self.lease_native(layer, &unique);
+        }
         let published = self.policy.resolve(layer, &unique)?;
         let count = published.len();
         self.moves.clear();
@@ -1441,24 +1540,46 @@ impl Slots {
             ],
             _ => anyhow::bail!("native dispatch requires six-slice quantized expert storage"),
         };
+        let streamed = self.streamed[layer as usize];
+        ensure!(
+            !streamed || self.leased_layer == layer,
+            "native dispatch of layer {layer} without its pool lease"
+        );
         let mut pointers = Vec::with_capacity(geometry.experts as usize * offsets.len());
         let mut valid = Vec::with_capacity(geometry.experts as usize);
         for expert in 0..geometry.experts {
-            if self.policy.ledger().tier(layer, expert)? != Tier::Gpu {
+            let base = if streamed {
+                self.leased
+                    .iter()
+                    .position(|&(leased, _)| leased == expert)
+                    .map(|position| {
+                        #[cfg(test)]
+                        let position = if self.pool_control == PoolControl::Misindex {
+                            (position + 1) % self.leased.len()
+                        } else {
+                            position
+                        };
+                        self.pool[self.leased[position].1].pointer
+                    })
+            } else if self.policy.ledger().tier(layer, expert)? == Tier::Gpu {
+                let slot = self.policy.ledger().slot(layer, expert)?;
+                Some(
+                    self.physical
+                        .get(slot as usize)
+                        .context("native physical slot missing")?
+                        .pointer,
+                )
+            } else {
+                None
+            };
+            let Some(base) = base else {
                 pointers.extend(std::iter::repeat_n(0, offsets.len()));
                 valid.push(0);
                 continue;
-            }
-            let slot = self.policy.ledger().slot(layer, expert)?;
-            let physical = self
-                .physical
-                .get(slot as usize)
-                .context("native physical slot missing")?;
+            };
             for offset in offsets {
                 pointers.push(
-                    physical
-                        .pointer
-                        .checked_add(offset)
+                    base.checked_add(offset)
                         .context("native slot pointer overflow")?,
                 );
             }
@@ -1597,16 +1718,23 @@ impl Slots {
         self.physical.len() == geometry.layers as usize * geometry.experts as usize
     }
 
+    pub(in crate::backend::cuda::engine) fn has_pool(&self) -> bool {
+        !self.pool.is_empty()
+    }
+
     pub(in crate::backend::cuda::engine) fn record_all_readers(
         &mut self,
-        device: &Device,
+        stream: &Arc<CudaStream>,
     ) -> Result<()> {
         self.readers.clear();
         self.readers.extend(0..u32::try_from(self.physical.len())?);
-        let event = self.events.record(&device.stream)?;
+        let event = self.events.record(stream)?;
         self.policy.record_readers(&self.readers, event.id)?;
         for physical in &mut self.physical {
             physical.reader = Some(event.clone());
+        }
+        for slot in &mut self.pool {
+            slot.reader = Some(event.clone());
         }
         Ok(())
     }

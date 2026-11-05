@@ -59,6 +59,7 @@ unsafe fn heuristic_algos(
     ensure!(!ok.is_empty(), "cuBLASLt returned no successful algorithm");
     Ok(ok)
 }
+use crate::backend::cuda::moe::route::ROUTE_LOGITS_WORKSPACE_BYTES;
 use crate::backend::setup::{LinearChoice, LinearImpl, LinearShape, LtAlgorithm};
 use anyhow::{Context, Result, ensure};
 use cudarc::{
@@ -366,7 +367,7 @@ type RouteLogitsPlans = RefCell<BTreeMap<(usize, usize, usize), Plan>>;
 impl RouteLogits {
     pub(crate) fn new(stream: &Arc<CudaStream>) -> Result<Self> {
         let handle = lt::create_handle()?;
-        let workspace = stream.alloc_zeros::<u8>(4 * 1024 * 1024)?;
+        let workspace = stream.alloc_zeros::<u8>(ROUTE_LOGITS_WORKSPACE_BYTES)?;
         let workspace_ptr = {
             use cudarc::driver::DevicePtr;
             let (ptr, _guard) = workspace.device_ptr(stream);
