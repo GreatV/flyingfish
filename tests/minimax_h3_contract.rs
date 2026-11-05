@@ -662,14 +662,14 @@ fn check_conditioner_cell(
             "interpolation corner {k} weights differ"
         );
     }
-    println!("H3_N6A_TABLE rows={rows} patches={patches} mrope_max_abs={worst:e}");
+    println!("H3_MROPE_TABLE rows={rows} patches={patches} mrope_max_abs={worst:e}");
     Ok(())
 }
 
 /// Qwen3-VL conditioner inputs on the CPU: processor pixels bit-equal to the captured `pixel_values`; mRoPE
 /// positions, vision coordinates and bilinear tables equal to the model-definition dump; the mRoPE table within 4e-6.
 #[test]
-#[ignore = "CPU-only N6a gate; set FF_H3_TEXT_ENCODER, FF_H3_S0 (Stage 0 run root) and FF_H3_N6A_REF"]
+#[ignore = "CPU-only conditioner gate; set FF_H3_TEXT_ENCODER, FF_H3_S0 (Stage 0 run root) and FF_H3_N6A_REF"]
 fn minimax_h3_conditioner_inputs_equal_the_reference() -> Result<()> {
     let encoder =
         PathBuf::from(env::var_os("FF_H3_TEXT_ENCODER").context("FF_H3_TEXT_ENCODER missing")?);
@@ -748,13 +748,13 @@ fn minimax_h3_conditioner_inputs_equal_the_reference() -> Result<()> {
             check_conditioner_cell(&spec, &swapped, &reference).is_err(),
             "cell {name}: h/w swapped grid control matched the reference"
         );
-        println!("H3_N6A_CELL cell={name} PASS");
+        println!("H3_CONDITIONER_CELL cell={name} PASS");
     }
-    println!("H3_N6A_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+    println!("H3_CONDITIONER_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
     Ok(())
 }
 
-/// `FF_MODEL`, `FF_H3_S0` (Stage 0 runs) and `FF_H3_N9` (the N9 freeze) for the producer gates.
+/// `FF_MODEL`, `FF_H3_S0` (Stage 0 runs) and `FF_H3_N9` (the recorded freeze) for the producer gates.
 fn producer_env() -> Result<(PathBuf, PathBuf, PathBuf)> {
     let var = |key: &str| -> Result<PathBuf> {
         Ok(PathBuf::from(
@@ -797,7 +797,7 @@ fn recorded_presentation(s0: &std::path::Path, cell: &str) -> Result<(String, Ve
     Ok((prompt, tokens))
 }
 
-/// N9a: the native presentation of the recorded prompt and image grids equals the recorded token ids and text-row
+/// The native presentation of the recorded prompt and image grids equals the recorded token ids and text-row
 /// tags of cells A, P, B and D (D: two keyframes); control: one prompt character changed changes the ids.
 #[test]
 #[ignore = "FF_MODEL, FF_H3_S0, FF_H3_N9"]
@@ -816,7 +816,7 @@ fn minimax_h3_presentation_matches_the_recorded_tokens() -> Result<()> {
         let rows = i64s(&recorded(&run.join("layout.safetensors"), "text_indices")?.2);
         let want_tags: Vec<u8> = rows.iter().map(|&r| token_tags[r as usize] as u8).collect();
         println!(
-            "H3_N9A cell={cell} keyframes={} tokens={} ids_equal={} tags_equal={}",
+            "H3_PRESENTATION cell={cell} keyframes={} tokens={} ids_equal={} tags_equal={}",
             image_tokens.len(),
             ids.len(),
             ids == want,
@@ -835,11 +835,11 @@ fn minimax_h3_presentation_matches_the_recorded_tokens() -> Result<()> {
             "cell {cell}: a changed prompt kept the recorded ids"
         );
     }
-    println!("H3_N9A_GATE PASS cells=4 control=FAIL_AS_REQUIRED");
+    println!("H3_PRESENTATION_GATE PASS cells=4 control=FAIL_AS_REQUIRED");
     Ok(())
 }
 
-/// N9b: the native canvas equals the model definition's `resolve_canvas_size` table of the N9 freeze.
+/// The native canvas equals the model definition's `resolve_canvas_size` table of the recorded freeze.
 #[test]
 #[ignore = "FF_MODEL, FF_H3_S0, FF_H3_N9"]
 fn minimax_h3_canvas_matches_the_definition_table() -> Result<()> {
@@ -858,11 +858,11 @@ fn minimax_h3_canvas_matches_the_definition_table() -> Result<()> {
             v(1)?
         );
     }
-    println!("H3_N9B_CANVAS PASS rows={}", rows.len());
+    println!("H3_CANVAS_TABLE PASS rows={}", rows.len());
     Ok(())
 }
 
-/// N9b: the text encoder's image processor on the recorded canvas u8 reproduces the recorded `pixel_values` and grid
+/// The text encoder's image processor on the recorded canvas u8 reproduces the recorded `pixel_values` and grid
 /// (cells A and B, exact); the native keyframe (decode + Lanczos-3 of the source JPEG) lies within the frozen floor of
 /// the recorded canvas (max_abs at most twice the freeze's combined floor; the differing fraction is diagnostic).
 /// Control: the native keyframe shifted one pixel horizontally must exceed the max_abs bound by at least 10x in every
@@ -919,7 +919,7 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
             .collect::<Vec<_>>()
             == grid;
         println!(
-            "H3_N9B cell={cell} pixel_values_equal={} grid_equal={grid_equal}",
+            "H3_IMAGE_PRODUCER cell={cell} pixel_values_equal={} grid_equal={grid_equal}",
             packed.pixel_values == want
         );
         ensure!(
@@ -956,7 +956,7 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
         let mean = diff.iter().map(|&d| f64::from(d)).sum::<f64>() / diff.len() as f64;
         let ok = max <= max_bound;
         println!(
-            "H3_N9B cell={cell} keyframe max_abs={max} bound={max_bound} within={ok} differing_fraction={fraction:.6} (diagnostic, floor x2 {fraction_bound:.6}) mean_abs={mean:.6} native_pixel_values_equal={}",
+            "H3_IMAGE_PRODUCER cell={cell} keyframe max_abs={max} bound={max_bound} within={ok} differing_fraction={fraction:.6} (diagnostic, floor x2 {fraction_bound:.6}) mean_abs={mean:.6} native_pixel_values_equal={}",
             request.pixel_values == want
         );
         within_all &= ok;
@@ -970,17 +970,17 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
             .context("empty keyframe")?;
         let detected = f64::from(shifted_max) > 10.0 * max_bound;
         println!(
-            "H3_N9B cell={cell} one-pixel-shift control max_abs={shifted_max} required>{} detected={detected}",
+            "H3_IMAGE_PRODUCER cell={cell} one-pixel-shift control max_abs={shifted_max} required>{} detected={detected}",
             10.0 * max_bound
         );
         detected_all &= detected;
     }
     if detected_all {
         ensure!(within_all, "native keyframe outside the frozen floor");
-        println!("H3_N9B_GATE PASS cells=2 keyframe=GATED control=DETECTED");
+        println!("H3_IMAGE_PRODUCER_GATE PASS cells=2 keyframe=GATED control=DETECTED");
     } else {
         println!(
-            "H3_N9B_GATE PASS cells=2 keyframe=MEASUREMENT within={within_all} control=NOT_DETECTED_AT_10X"
+            "H3_IMAGE_PRODUCER_GATE PASS cells=2 keyframe=MEASUREMENT within={within_all} control=NOT_DETECTED_AT_10X"
         );
     }
     Ok(())
