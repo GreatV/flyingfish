@@ -1,7 +1,6 @@
 //! Shared mmap/index audit, independent of device upload and model execution.
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
 use safetensors::tensor::TensorView;
 use safetensors::{Dtype, SafeTensors};
 use serde::{
@@ -5038,7 +5037,6 @@ mod component_tests {
 
 #[derive(Clone)]
 struct StoredTensor {
-    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     shape: Vec<usize>,
     range: std::ops::Range<usize>,
 }
@@ -5375,7 +5373,6 @@ impl CheckpointPickle<'_> {
             "tensor storage byte count mismatch"
         );
         Ok(V::Tensor(StoredTensor {
-            #[cfg(any(feature = "cuda", feature = "rocm", test))]
             shape,
             range: range.clone(),
         }))
