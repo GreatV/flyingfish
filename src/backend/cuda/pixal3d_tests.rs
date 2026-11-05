@@ -2394,7 +2394,9 @@ fn surface_selection(cell: &Value) -> Result<(Vec<[i32; 4]>, HostTensor, HostTen
         tested > 0
             && selected
                 .values
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .all(|row| row.iter().any(|&v| v != 0.0))
             && cell["selected_decisions"].as_u64() == Some(tested as u64)
             && cell["selected_parents"].as_u64() == Some(coordinates.len() as u64)
