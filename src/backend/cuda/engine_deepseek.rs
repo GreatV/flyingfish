@@ -7120,64 +7120,6 @@ mod tests {
                 .context("DeepSeek device readback")
         }
 
-        fn evict(engine: &mut Engine, target: u32) -> Result<u32> {
-            engine
-                .moe_slots
-                .as_mut()
-                .context("tiers missing")?
-                .force_routes(0, &[target as i32])?;
-            let mut resident_ids = Vec::new();
-            {
-                let slots = engine.moe_slots.as_ref().context("tiers missing")?;
-                for expert in 0..384u32 {
-                    if expert != target && slots.tier(0, expert)? == Tier::Gpu {
-                        resident_ids.push(expert as i32);
-                    }
-                }
-            }
-            let decay = crate::experts::plan::F_DECAY;
-            let chunks = resident_ids.len().div_ceil(6) as i32;
-            ensure!(chunks > 0, "no other resident to warm");
-            let minimum_warm_score = decay.powi(chunks - 1);
-            let mut target_upper = 1.0 / (1.0 - decay);
-            while target_upper >= minimum_warm_score {
-                for chunk in resident_ids.chunks(6) {
-                    let misses = engine
-                        .moe_slots
-                        .as_mut()
-                        .context("tiers missing")?
-                        .force_routes(0, chunk)?;
-                    ensure!(misses == 0, "resident warming unexpectedly missed");
-                }
-                target_upper *= decay.powi(chunks);
-            }
-            let incoming = {
-                let slots = engine.moe_slots.as_ref().context("tiers missing")?;
-                (0..384u32)
-                    .find(|&expert| {
-                        expert != target
-                            && slots.tier(0, expert).is_ok_and(|tier| tier != Tier::Gpu)
-                    })
-                    .context("no incoming expert for eviction")?
-            };
-            let moves = engine
-                .moe_slots
-                .as_mut()
-                .context("tiers missing")?
-                .force_routes(0, &[incoming as i32])?;
-            ensure!(moves == 1, "target eviction resolved {moves} experts");
-            ensure!(
-                engine
-                    .moe_slots
-                    .as_ref()
-                    .context("tiers missing")?
-                    .tier(0, target)?
-                    != Tier::Gpu,
-                "target {target} remained resident"
-            );
-            Ok(incoming)
-        }
-
         ensure!(
             std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
             "granted GPU window required"
@@ -7233,7 +7175,11 @@ mod tests {
         );
         let baseline = fixed_output(&mut engine, &route)?;
 
-        let incoming = evict(&mut engine, miss)?;
+        let incoming = engine
+            .moe_slots
+            .as_mut()
+            .context("tiers missing")?
+            .evict_for_test(0, miss)?;
         let evicted = engine
             .moe_slots
             .as_ref()
@@ -7296,7 +7242,11 @@ mod tests {
                 .unwrap_or(graph_ids[0]);
             u32::try_from(selected)?
         };
-        let graph_incoming = evict(&mut engine, graph_miss)?;
+        let graph_incoming = engine
+            .moe_slots
+            .as_mut()
+            .context("tiers missing")?
+            .evict_for_test(0, graph_miss)?;
         let graph_refills = engine
             .moe_slots
             .as_mut()
@@ -7336,7 +7286,11 @@ mod tests {
             device.stream.synchronize()?;
             device.stream.clone_dtoh(&work.out.slice(..5120))?
         };
-        let replay_incoming = evict(&mut engine, graph_miss)?;
+        let replay_incoming = engine
+            .moe_slots
+            .as_mut()
+            .context("tiers missing")?
+            .evict_for_test(0, graph_miss)?;
         let replay_refills = engine
             .moe_slots
             .as_mut()

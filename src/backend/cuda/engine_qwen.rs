@@ -714,6 +714,8 @@ struct NativeFfn {
     pointers: CudaSlice<u64>,
     valid: CudaSlice<u32>,
     _bias: CudaSlice<u8>,
+    #[cfg(feature = "cuda")]
+    graphs: Option<(CudaGraph, CudaGraph)>,
 }
 
 impl NativeFfn {
@@ -806,7 +808,43 @@ impl NativeFfn {
             pointers,
             valid,
             _bias: bias,
+            #[cfg(feature = "cuda")]
+            graphs: None,
         }))
+    }
+
+    fn service_tier(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        slots: &mut super::moe::Slots,
+    ) -> Result<usize> {
+        let plan = self
+            .plans
+            .get(rows.checked_sub(1).context("empty native MoE step")?)
+            .context("native MoE rows outside setup closure")?;
+        let (ids, weights) = plan.read_route(stream)?;
+        let resolved = slots.resolve_native(self.slot_layer, &ids, &weights)?;
+        slots.wait_refill(stream)?;
+        let (pointers, valid) = slots.native_dispatch(self.slot_layer)?;
+        #[cfg(test)]
+        let pointers = {
+            let mut pointers = pointers;
+            if self.wrong_route {
+                let destination = ids[0] as usize * 6;
+                let source = ids[1] as usize * 6;
+                ensure!(
+                    destination != source,
+                    "native wrong-route control needs distinct experts"
+                );
+                let replacement: Vec<_> = pointers[source..source + 6].to_vec();
+                pointers[destination..destination + 6].copy_from_slice(&replacement);
+            }
+            pointers
+        };
+        stream.memcpy_htod(&pointers, &mut self.pointers)?;
+        stream.memcpy_htod(&valid, &mut self.valid)?;
+        Ok(resolved)
     }
 }
 enum BoundMixer {
@@ -2414,6 +2452,201 @@ impl Runtime {
     }
 }
 impl Engine {
+    #[cfg(feature = "cuda")]
+    pub(super) fn glm_graph_count(&self) -> usize {
+        self.qwen.as_ref().map_or(0, |runtime| {
+            runtime
+                .layers
+                .iter()
+                .filter_map(|layer| layer.native.as_ref())
+                .filter(|native| native.graphs.is_some())
+                .count()
+                * 2
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn capture_glm(&mut self) -> Result<()> {
+        ensure!(!self.poisoned, "GLM capture requires healthy state");
+        ensure!(
+            self.position < self.capacity,
+            "GLM capture exceeds capacity"
+        );
+        ensure!(self.spec.is_none(), "GLM graph draft is not bound");
+        self.ensure_decode()?;
+        self.prepare(1)?;
+        let runtime = self.qwen.as_ref().context("GLM graph runtime missing")?;
+        let first = runtime
+            .layers
+            .iter()
+            .position(|layer| layer.native.is_some())
+            .context("GLM graph native FFN missing")?;
+        ensure!(
+            runtime.layers[first..]
+                .iter()
+                .all(|layer| layer.native.is_some()),
+            "GLM graph routed layers must form a contiguous suffix"
+        );
+        let count = runtime.layers.len() - first;
+        if self.glm_graph_count() == count * 2 {
+            return Ok(());
+        }
+        ensure!(self.glm_graph_count() == 0, "partial GLM graph publication");
+        self.device.finish_upload()?;
+        let before = self.device.ctx.mem_get_info()?.0;
+        let mut graphs = Vec::with_capacity(count);
+        let result = (|| -> Result<()> {
+            for layer in first..self.config.num_hidden_layers {
+                let prefix = super::moe::graphs::record(self, |engine| {
+                    engine.glm_graph_segment(layer, first, false)
+                })?;
+                let suffix = super::moe::graphs::record(self, |engine| {
+                    engine.glm_graph_segment(layer, first, true)
+                })?;
+                graphs.push((prefix, suffix));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error.context("GLM graph capture transaction"));
+        }
+        let after = self.device.ctx.mem_get_info()?.0;
+        eprintln!(
+            "{}",
+            serde_json::json!({"glm_graph_binding": {
+                "segments": graphs.len() * 2,
+                "allocation_bytes": before.saturating_sub(after),
+                "capacity_basis": "free memory after graph allocation"
+            }})
+        );
+        let runtime = self.qwen.as_mut().context("GLM graph runtime missing")?;
+        for (native, pair) in runtime.layers[first..]
+            .iter_mut()
+            .filter_map(|layer| layer.native.as_mut())
+            .zip(graphs)
+        {
+            native.graphs = Some(pair);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn glm_graph_segment(&mut self, layer: usize, first: usize, suffix: bool) -> Result<()> {
+        use crate::model::{LayerProgram, LayerStage};
+        let step = crate::backend::Step {
+            rows: 1,
+            input: crate::backend::Input::Token,
+            mask: crate::backend::Mask::Causal,
+            head: Head::Last,
+        };
+        let LayerProgram::Hc(stages) = crate::model::layer_program(&self.model_spec, layer)? else {
+            anyhow::bail!("GLM graph requires mHC layer program");
+        };
+        let split = stages
+            .iter()
+            .position(|stage| matches!(stage, LayerStage::Ffn))
+            .context("GLM graph layer program has no FFN")?;
+        if !suffix && layer == first {
+            self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)?;
+            self.hc
+                .as_mut()
+                .context("GLM graph mHC missing")?
+                .begin_embedded(&self.device.stream, 1, &self.work.x)?;
+            for dense in 0..first {
+                self.run_layer(dense, step, &mut None)?;
+            }
+        }
+        if suffix {
+            let stream = &self.device.stream;
+            let native = self
+                .qwen
+                .as_ref()
+                .and_then(|runtime| runtime.layers[layer].native.as_ref())
+                .context("GLM graph native FFN missing")?;
+            let hidden = self.model_spec.hidden as usize;
+            native.plans[0].run(
+                stream,
+                matrix(&self.work.n, stream, 0, 1, hidden)?,
+                &TensorMut(matrix(&self.work.out, stream, 0, 1, hidden)?),
+            )?;
+            #[cfg(test)]
+            if let Some(calls) = self.qwen.as_ref().and_then(|q| q.glm_calls.as_ref()) {
+                calls.borrow_mut()[layer][split] += 1;
+            }
+        }
+        for (index, stage) in stages.into_iter().enumerate() {
+            if (suffix && index <= split) || (!suffix && index >= split) {
+                continue;
+            }
+            self.run_layer_stage(index, stage, layer, step, &mut None)?;
+        }
+        #[cfg(test)]
+        if suffix {
+            self.check_capture_layer(layer)?;
+        }
+        if !suffix {
+            self.qwen
+                .as_ref()
+                .and_then(|runtime| runtime.layers[layer].native.as_ref())
+                .context("GLM graph native FFN missing")?
+                .plans[0]
+                .enqueue_route(
+                    &self.device.stream,
+                    matrix(
+                        &self.work.n,
+                        &self.device.stream,
+                        0,
+                        1,
+                        self.model_spec.hidden as usize,
+                    )?,
+                )?;
+        } else if layer + 1 == self.config.num_hidden_layers {
+            self.run_operator(crate::backend::Operator::Head, 0, step, &mut None)?;
+            self.qwen_advance()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn run_glm_graph(&mut self) -> Result<()> {
+        let runtime = self.qwen.as_mut().context("GLM graph runtime missing")?;
+        let slots = self
+            .moe_slots
+            .as_mut()
+            .context("GLM graph tier slots missing")?;
+        if !slots.request_open {
+            slots.begin_staging_request()?;
+        }
+        slots.begin_token()?;
+        let executed = (|| -> Result<()> {
+            for native in runtime
+                .layers
+                .iter_mut()
+                .filter_map(|layer| layer.native.as_mut())
+            {
+                native
+                    .graphs
+                    .as_ref()
+                    .context("GLM decode graphs are not captured")?
+                    .0
+                    .launch()?;
+                native.service_tier(&self.device.stream, 1, slots)?;
+                native
+                    .graphs
+                    .as_ref()
+                    .context("GLM decode graphs are not captured")?
+                    .1
+                    .launch()?;
+                slots.record_all_readers(&self.device.stream)?;
+            }
+            Ok(())
+        })();
+        let completed = slots.finish_token();
+        executed?;
+        completed
+    }
+
     #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(super) fn inject_moe_test_positions(&mut self, axes: [&[i32]; 3]) -> Result<()> {
         let rows = axes[0].len();
@@ -3881,6 +4114,17 @@ impl Engine {
             engine.bind_invariant_arithmetic()?;
         }
         if glm {
+            #[cfg(feature = "cuda")]
+            {
+                engine.prepare(1)?;
+                engine
+                    .qwen
+                    .as_ref()
+                    .context("GLM runtime missing")?
+                    .ensure_complete()?;
+                engine.closure.freeze_fixed()?;
+                engine.capture_glm()?;
+            }
             let manifest = &engine
                 .qwen
                 .as_ref()
@@ -3896,10 +4140,6 @@ impl Engine {
             )?;
             engine.moe_slots = Some(slots);
             engine.chunk = engine.chunk.min(admitted_rows as usize);
-            #[cfg(feature = "cuda")]
-            {
-                engine.workspace_rows = admitted_rows as usize;
-            }
             engine
                 .forward_rows
                 .retain(|row| *row <= admitted_rows as usize);
@@ -3945,14 +4185,17 @@ impl Engine {
                 .prepare_linears(&engine.weights.head, &mut engine.blas, &profile, write)?;
             engine.closure.finish(profile, &engine.runtime, key)?;
         } else {
-            if !(flint && write) {
+            if !glm && !(flint && write) {
                 engine.closure.freeze_fixed()?;
             }
         }
         if !write {
             engine.reset()?;
             engine.prepare_graphs()?;
-            engine.closure.expect_captures(engine.graphs.len())?;
+            let captures = engine.graphs.len();
+            #[cfg(feature = "cuda")]
+            let captures = captures + engine.glm_graph_count();
+            engine.closure.expect_captures(captures)?;
             engine.check_graphs()?;
             engine.reset()?;
             engine.closure.ready(started)?;
@@ -6033,33 +6276,13 @@ impl Engine {
             let h = self.model_spec.hidden as usize;
             let x = matrix(&self.work.n, s, 0, step.rows, h)?;
             let y = TensorMut(matrix(&self.work.out, s, 0, step.rows, h)?);
-            let (ids, weights) = plan.route(s, x)?;
+            plan.enqueue_route(s, x)?;
             let slots = self
                 .moe_slots
                 .as_mut()
                 .context("native expert tier service missing")?;
-            let slot_layer = native.slot_layer;
-            slots.resolve_native(slot_layer, &ids, &weights)?;
-            slots.wait_refill(s)?;
-            let (pointers, valid) = slots.native_dispatch(slot_layer)?;
-            #[cfg(test)]
-            let pointers = {
-                let mut pointers = pointers;
-                if native.wrong_route {
-                    let destination = ids[0] as usize * 6;
-                    let source = ids[1] as usize * 6;
-                    ensure!(
-                        destination != source,
-                        "native wrong-route control needs distinct experts"
-                    );
-                    let replacement: Vec<_> = pointers[source..source + 6].to_vec();
-                    pointers[destination..destination + 6].copy_from_slice(&replacement);
-                }
-                pointers
-            };
-            s.memcpy_htod(&pointers, &mut native.pointers)?;
-            s.memcpy_htod(&valid, &mut native.valid)?;
-            plan.run(s, x, &y)?;
+            native.service_tier(s, step.rows, slots)?;
+            native.plans[step.rows - 1].run(s, x, &y)?;
             slots.record_all_readers(&self.device.stream)?;
             if all_layers(trace) || layer == self.trace_layer {
                 trace_value(

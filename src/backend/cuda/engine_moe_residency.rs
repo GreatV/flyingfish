@@ -1603,6 +1603,48 @@ impl Slots {
     }
 
     #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn evict_for_test(
+        &mut self,
+        layer: u32,
+        target: u32,
+    ) -> Result<u32> {
+        let geometry = self.catalogue.geometry();
+        let experts = geometry.experts;
+        let top_k = geometry.top_k as usize;
+        self.force_routes(layer, &[target as i32])?;
+        let mut resident_ids = Vec::new();
+        for expert in 0..experts {
+            if expert != target && self.tier(layer, expert)? == Tier::Gpu {
+                resident_ids.push(expert as i32);
+            }
+        }
+        let decay = crate::experts::plan::F_DECAY;
+        let chunks = resident_ids.len().div_ceil(top_k) as i32;
+        ensure!(chunks > 0, "no other resident to warm");
+        let minimum_warm_score = decay.powi(chunks - 1);
+        let mut target_upper = 1.0 / (1.0 - decay);
+        while target_upper >= minimum_warm_score {
+            for chunk in resident_ids.chunks(top_k) {
+                let misses = self.force_routes(layer, chunk)?;
+                ensure!(misses == 0, "resident warming unexpectedly missed");
+            }
+            target_upper *= decay.powi(chunks);
+        }
+        let incoming = (0..experts)
+            .find(|&expert| {
+                expert != target && self.tier(layer, expert).is_ok_and(|tier| tier != Tier::Gpu)
+            })
+            .context("no incoming expert for eviction")?;
+        let moves = self.force_routes(layer, &[incoming as i32])?;
+        ensure!(moves == 1, "target eviction resolved {moves} experts");
+        ensure!(
+            self.tier(layer, target)? != Tier::Gpu,
+            "target {target} remained resident"
+        );
+        Ok(incoming)
+    }
+
+    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn force_routes(
         &mut self,
         layer: u32,
