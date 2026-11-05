@@ -5407,9 +5407,9 @@ mod tests {
         Ok(())
     }
 
-    /// GGUF measurement: one recorded cell A run twice through `generate`, once with the official BF16 transformer
-    /// manifest and once with the community GGUF, and the frames/PCM distance printed. The two arms share the
-    /// recorded request, so only the transformer weights differ; the numbers are a measurement, not a gate.
+    /// GGUF measurement: one seeded cell A request run twice through `generate`, once with the official BF16
+    /// transformer manifest and once with the community GGUF, and the frames/PCM distance printed. The two
+    /// arms share the request, so only the transformer weights differ; the numbers are a measurement, not a gate.
     #[test]
     #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_OUT"]
     fn gguf_end_to_end_measurement_against_the_bf16_path() -> Result<()> {
