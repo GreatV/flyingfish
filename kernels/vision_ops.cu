@@ -1088,6 +1088,13 @@ extern "C" __global__ void vision_silu_f16(const __half* input, __half* output, 
     }
 }
 
+extern "C" __global__ void zero_head_tail_f16(__half* values, uint32_t count,
+    uint32_t width, uint32_t keep) {
+    if (!vision_flat_launch() || !values || !count || !width || keep >= width) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256)
+        if (i % width >= keep) values[i] = __float2half_rn(0.0f);
+}
+
 extern "C" __global__ void sparse_mean_seeded_f16(const __half* input,
     const uint32_t* offsets, const uint32_t* children, __half* output,
     uint32_t rows, uint32_t width) {

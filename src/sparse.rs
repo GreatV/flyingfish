@@ -59,6 +59,7 @@ impl SparseSites {
             .map(|p| {
                 coordinates
                     .binary_search(p)
+                    .ok()
                     .map(|i| i as u32)
                     .context("sparse parent not found")
             })
@@ -189,6 +190,13 @@ mod tests {
         assert_eq!(maps[3][13], 3);
         assert_eq!(maps[3].iter().filter(|&&r| r >= 0).count(), 1);
         assert_ne!(maps[0][22], maps[0][14]);
+        let (parents, inverse) = sites.downsample(2)?;
+        assert_eq!(
+            parents.coordinates(),
+            &[[0, 1, 1, 2], [0, 1, 1, 3], [1, 1, 1, 2]]
+        );
+        assert_eq!(inverse, [0, 0, 1, 2]);
+        assert!(sites.downsample(0).is_err());
         let masks = [
             [false, true, false, false, false, false, false, false],
             [false; 8],

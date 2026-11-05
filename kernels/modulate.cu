@@ -46,7 +46,10 @@ __device__ __forceinline__ void row_modulate_impl(
     const size_t param = (size_t)p * stride + d;
     const T one_plus = mod_from_f32<T>(1.0f + mod_to_f32(scale[param]));
     const T scaled = mod_from_f32<T>(mod_to_f32(x[at]) * mod_to_f32(one_plus));
-    y[at] = mod_from_f32<T>(mod_to_f32(scaled) + mod_to_f32(mod_from_f32<T>(mod_to_f32(shift[param]))));
+    T rounded_shift;
+    if constexpr (sizeof(P) == sizeof(T)) rounded_shift = shift[param];
+    else rounded_shift = mod_from_f32<T>(mod_to_f32(shift[param]));
+    y[at] = mod_from_f32<T>(mod_to_f32(scaled) + mod_to_f32(rounded_shift));
 }
 
 template <typename T, bool NULLABLE, typename P = T>
@@ -65,7 +68,10 @@ __device__ __forceinline__ void row_gated_add_impl(
     }
     if (p >= entries) __trap();
     const size_t at = (size_t)row * dim + d;
-    const T gated = mod_from_f32<T>(mod_to_f32(mod_from_f32<T>(mod_to_f32(gate[(size_t)p * stride + d]))) * mod_to_f32(y[at]));
+    T rounded_gate;
+    if constexpr (sizeof(P) == sizeof(T)) rounded_gate = gate[(size_t)p * stride + d];
+    else rounded_gate = mod_from_f32<T>(mod_to_f32(gate[(size_t)p * stride + d]));
+    const T gated = mod_from_f32<T>(mod_to_f32(rounded_gate) * mod_to_f32(y[at]));
     x[at] = mod_from_f32<T>(mod_to_f32(x[at]) + mod_to_f32(gated));
 }
 

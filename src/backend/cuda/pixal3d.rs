@@ -1,4 +1,4 @@
-//! Pixal3D flow execution on recorded conditioning and fixed coordinates.
+//! Shared flow execution on recorded conditioning and fixed coordinates.
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
 mod tests;
@@ -28,6 +28,21 @@ use std::{collections::BTreeMap, mem::size_of, path::Path, rc::Rc};
 
 fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
     x.device_ptr(&d.stream).0
+}
+fn zero_attention_tail(d: &Device, values: [u64; 3], rows: [usize; 3], width: usize) -> Result<()> {
+    let kernel = cubin::module(&d.ctx, "vision_ops")?.load_function("zero_head_tail_f16")?;
+    for (data, rows) in values.into_iter().zip(rows) {
+        unsafe {
+            d.stream
+                .launch_builder(&kernel)
+                .arg(&data)
+                .arg(&u32::try_from(rows * width)?)
+                .arg(&96u32)
+                .arg(&64u32)
+                .launch(flat(rows * width))?;
+        }
+    }
+    Ok(())
 }
 fn dense<T: DeviceRepr + Copy, const R: usize>(
     x: &CudaSlice<T>,
@@ -821,13 +836,15 @@ impl Kernels {
         Ok(())
     }
     fn cast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
+        let count32 = u32::try_from(count)?;
+        let count64 = count as u64;
         unsafe {
             let mut launch = d.stream.launch_builder(&self.cast);
             launch.arg(&input).arg(&output);
             if self.half {
-                launch.arg(&u32::try_from(count)?);
+                launch.arg(&count32);
             } else {
-                launch.arg(&(count as u64)).arg(&0f32).arg(&1f32);
+                launch.arg(&count64).arg(&0f32).arg(&1f32);
             }
             launch.launch(flat(count))?;
         }
@@ -910,6 +927,56 @@ impl Kernels {
     }
 }
 
+fn spatial_phases(
+    device: &Device,
+    kernels: &Kernels,
+    sites: &SparseSites,
+) -> Result<CudaSlice<f32>> {
+    let rows = sites.coordinates().len();
+    let points: Vec<_> = sites
+        .coordinates()
+        .iter()
+        .flat_map(|p| p[1..].iter().map(|&x| x as f32))
+        .collect();
+    let max = points.iter().copied().fold(0f32, f32::max) as usize;
+    let frequencies: Vec<_> = (0..48)
+        .map(|i| {
+            let f = 1.0 / 10000f32.powf((i % 16) as f32 / 16.0);
+            if max < 64 {
+                f
+            } else {
+                let wavelength = f * 64.0 / (2.0 * std::f32::consts::PI);
+                let stretch = 64.0 / ((64 + max) / 2) as f32;
+                let ratio = (wavelength - 1.0) / 23.0;
+                let ratio = if wavelength > 24.0 {
+                    1.0
+                } else if wavelength < 1.0 {
+                    stretch
+                } else {
+                    ratio + (1.0 - ratio) * stretch
+                };
+                f * ratio
+            }
+        })
+        .collect();
+    let points = device.stream.clone_htod(&points)?;
+    let frequencies = device.stream.clone_htod(&frequencies)?;
+    let phases = device.stream.alloc_zeros(rows * 96)?;
+    unsafe {
+        device
+            .stream
+            .launch_builder(&kernels.phases)
+            .arg(&points)
+            .arg(&frequencies)
+            .arg(&(rows as i32))
+            .arg(&1i32)
+            .arg(&96i32)
+            .arg(&phases)
+            .launch(flat(rows * 48))?;
+    }
+    Ok(phases)
+}
+
 struct Work<T: FlowElement> {
     row_index: CudaSlice<u32>,
     hidden: CudaSlice<T>,
@@ -955,13 +1022,13 @@ impl<T: FlowElement> Work<T> {
             cross_k: s.alloc_zeros(context_rows * h)?,
             cross_kn: s.alloc_zeros(context_rows * h)?,
             cross_v: s.alloc_zeros(context_rows * h)?,
-            cross_q32: s.alloc_zeros(n * h)?,
-            cross_k32: s.alloc_zeros(context_rows * h)?,
-            cross_v32: s.alloc_zeros(context_rows * h)?,
-            cross_out32: s.alloc_zeros(n * h)?,
-            outer: s.alloc_zeros(n * h)?,
-            input_rows: s.alloc_zeros(n * spec.in_channels)?,
-            output_rows: s.alloc_zeros(n * spec.in_channels)?,
+            cross_q32: s.alloc_zeros(if T::HALF { 0 } else { n * h })?,
+            cross_k32: s.alloc_zeros(if T::HALF { 0 } else { context_rows * h })?,
+            cross_v32: s.alloc_zeros(if T::HALF { 0 } else { context_rows * h })?,
+            cross_out32: s.alloc_zeros(if T::HALF { 0 } else { n * h })?,
+            outer: s.alloc_zeros(if T::HALF { 0 } else { n * h })?,
+            input_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.in_channels })?,
+            output_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.in_channels })?,
             block_mod: s.alloc_zeros(6 * h)?,
         })
     }
@@ -1376,12 +1443,44 @@ impl Flow<f16> {
         let context_rows = 2917;
         let steps = 50;
         let io_rows = coordinates.len();
-        let work_bytes = rows
-            .checked_mul((24 * h + 8 * h) * 2 + 4 * h * 4)
-            .and_then(|n| n.checked_add(context_rows * h * 20))
+        let count = |factors: &[usize]| {
+            factors.iter().try_fold(1usize, |a, &b| {
+                a.checked_mul(b)
+                    .context("flow placement byte count overflow")
+            })
+        };
+        let work_bytes = count(&[rows, h, 15, 2])?
+            .checked_add(count(&[context_rows, h, 5, 2])?)
+            .and_then(|n| {
+                n.checked_add(
+                    rows * 4 + 6 * h * 4 + rows * 96 * 4 + 2 * rows * 22 * 4 + steps * 7 * h * 2,
+                )
+            })
             .context("flow work bytes overflow")?;
-        let io_bytes = io_rows
-            .checked_mul(48_000)
+        let residual_bytes = [
+            (io_rows, 256, 256),
+            (rows, 256, h),
+            (io_rows, 2 * h, 256),
+            (io_rows, 512, 256),
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, (n, input, output)| -> Result<usize> {
+            let features = count(&[n, input + 3 * output, 2])?;
+            let maps = count(&[n, 2, 27, 4])?;
+            sum.checked_add(features)
+                .and_then(|s| s.checked_add(maps + 2 * output))
+                .context("sparse residual bytes overflow")
+        })?;
+        let io_bytes = count(&[io_rows, 2 * 256, 4])?
+            .checked_add(count(&[io_rows, 256 + 2 * h + 512 + 256, 2])?)
+            .and_then(|n| {
+                n.checked_add(
+                    rows * (256 + 2 * h) * 2
+                        + 2 * h
+                        + (2 * io_rows + rows + 1) * 4
+                        + residual_bytes,
+                )
+            })
             .context("sparse IO work bytes overflow")?;
         device.workspace_budget(
             free,
@@ -1466,47 +1565,7 @@ impl Flow<f16> {
             Linear::bind(&float, &device, "t_embedder.mlp.2", [h, h])?,
             Linear::bind(&float, &device, "adaLN_modulation.1", [6 * h, h])?,
         ];
-        let points: Vec<_> = parent
-            .coordinates()
-            .iter()
-            .flat_map(|p| p[1..].iter().map(|&x| x as f32))
-            .collect();
-        let max = points.iter().copied().fold(0f32, f32::max) as usize;
-        let frequencies: Vec<_> = (0..48)
-            .map(|i| {
-                let f = 1.0 / 10000f32.powf((i % 16) as f32 / 16.0);
-                if max < 64 {
-                    f
-                } else {
-                    let wavelength = f * 64.0 / (2.0 * std::f32::consts::PI);
-                    let stretch = 64.0 / ((64 + max) / 2) as f32;
-                    let ratio = (wavelength - 1.0) / 23.0;
-                    let ratio = if wavelength > 24.0 {
-                        1.0
-                    } else if wavelength < 1.0 {
-                        stretch
-                    } else {
-                        ratio + (1.0 - ratio) * stretch
-                    };
-                    f * ratio
-                }
-            })
-            .collect();
-        let points = device.stream.clone_htod(&points)?;
-        let frequencies = device.stream.clone_htod(&frequencies)?;
-        let phases = device.stream.alloc_zeros(rows * 96)?;
-        unsafe {
-            device
-                .stream
-                .launch_builder(&kernels.phases)
-                .arg(&points)
-                .arg(&frequencies)
-                .arg(&(rows as i32))
-                .arg(&1i32)
-                .arg(&96i32)
-                .arg(&phases)
-                .launch(flat(rows * 48))?;
-        }
+        let phases = spatial_phases(&device, &kernels, &parent)?;
         let work = Work::new(&device, rows, &spec, context_rows)?;
         let flash = Flash::new_f16(
             device.stream.clone(),
@@ -1541,7 +1600,19 @@ impl Flow<f16> {
             (&half, &float),
             remaining / 2,
         )?;
-        device.workspace_budget(free, budget, rows * spec.in_channels * 8 * 4)?;
+        let sampler_bytes = count(&[io_rows, spec.in_channels, 6, 4])?
+            .checked_add(8)
+            .context("sampler bytes overflow")?;
+        let conditioning_bytes = count(&[2, context_rows, spec.cond_channels, 2])?;
+        device.workspace_budget(free, budget, sampler_bytes + conditioning_bytes)?;
+        tracing::info!(
+            published_bytes = checkpoint.runtime_bytes,
+            work_bytes,
+            io_bytes,
+            sampler_bytes,
+            conditioning_bytes,
+            "sparse flow placement"
+        );
         Ok(Self {
             origin: Rc::new(()),
             device,
@@ -1705,7 +1776,7 @@ impl<T: FlowElement> Flow<T> {
             projected: cast(projected)?,
         })
     }
-    fn block(
+    fn block<const CONTROL: bool>(
         &mut self,
         index: usize,
         modulation: u64,
@@ -1775,6 +1846,9 @@ impl<T: FlowElement> Flow<T> {
                 }
             }
         }
+        if CONTROL {
+            zero_attention_tail(d, [q, kn, value], [n, n, n], h)?;
+        }
         T::attention(
             &mut self.flash,
             &self.work.q,
@@ -1821,6 +1895,14 @@ impl<T: FlowElement> Flow<T> {
             let CrossAttention::F16(cross) = &mut self.cross else {
                 anyhow::bail!("F16 cross binding missing");
             };
+            if CONTROL {
+                zero_attention_tail(
+                    d,
+                    [q, ptr(&self.work.cross_kn, d), ptr(&self.work.cross_v, d)],
+                    [n, context_rows, context_rows],
+                    h,
+                )?;
+            }
             T::attention(
                 cross,
                 &self.work.q,
@@ -2055,7 +2137,7 @@ impl<T: FlowElement> Flow<T> {
         }
         let modulation = ptr(&self.mods, &self.device) + (time * 6 * h * 2) as u64;
         for i in 0..self.blocks.len() {
-            self.block(i, modulation, conditioning)?;
+            self.block::<false>(i, modulation, conditioning)?;
             observe(self, i)?;
         }
         if let Some(io) = &mut self.io {

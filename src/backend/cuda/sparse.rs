@@ -67,6 +67,19 @@ impl SparseConv {
     pub(crate) fn workspace_bytes(&self) -> usize {
         self.neighbours.len() * size_of::<i32>() + self.columns.len() * size_of::<f16>()
     }
+    #[cfg(test)]
+    pub(crate) fn replace_neighbours(&mut self, maps: &[[i32; 27]]) -> Result<()> {
+        ensure!(
+            maps.len() == self.rows
+                && maps
+                    .iter()
+                    .flatten()
+                    .all(|&r| r >= -1 && r < self.rows as i32),
+            "invalid sparse neighbor map"
+        );
+        self.neighbours = self.device.stream.clone_htod(maps.as_flattened())?;
+        Ok(())
+    }
     pub fn run(
         &self,
         blas: &Blas,

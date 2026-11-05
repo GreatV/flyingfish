@@ -720,10 +720,10 @@ pub(crate) fn disjoint<T: Copy, U: Copy, const R: usize, const S: usize>(
     b.validate()?;
     super::contracts::no_overlap(a, b, "linear input", "linear output")
 }
-pub(crate) fn validate_call(
+pub(crate) fn validate_call<T: Copy>(
     weight: [u32; 2],
-    x: Tensor<bf16, 2>,
-    y: &Tensor<bf16, 2>,
+    x: Tensor<T, 2>,
+    y: &Tensor<T, 2>,
 ) -> Result<()> {
     x.validate()?;
     y.validate()?;
