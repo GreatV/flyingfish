@@ -10,7 +10,9 @@ use crate::{
     backend::gpu::{CudaFunction, CudaSlice, PushKernelArg},
     sparse::SparseSites,
 };
-use anyhow::{Context, Result, ensure};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use half::f16;
 use std::rc::Rc;
 
