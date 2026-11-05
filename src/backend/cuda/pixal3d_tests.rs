@@ -2367,20 +2367,7 @@ fn surface_fixed(
     Ok(())
 }
 
-fn surface_stable(
-    g: &mut DecoderGate,
-    case: &str,
-    phase: &str,
-    level: usize,
-    parents: &SparseSites,
-    logits: &[f32],
-) -> Result<()> {
-    let key = id(
-        &format!("m4-stable-decisions-{case}"),
-        &format!("{phase}-stage{level}"),
-        None,
-    );
-    let cell = &g.cells[&key];
+fn surface_selection(cell: &Value) -> Result<(Vec<[i32; 4]>, HostTensor, HostTensor)> {
     let path = Path::new(
         cell["selection_fixture"]
             .as_str()
@@ -2402,15 +2389,43 @@ fn surface_stable(
         selected.shape == [coordinates.len(), 8] && signs.shape == selected.shape,
         "invalid selection layout"
     );
+    let tested = selected.values.iter().filter(|&&v| v != 0.0).count();
+    ensure!(
+        tested > 0
+            && selected
+                .values
+                .chunks_exact(8)
+                .all(|row| row.iter().any(|&v| v != 0.0))
+            && cell["selected_decisions"].as_u64() == Some(tested as u64)
+            && cell["selected_parents"].as_u64() == Some(coordinates.len() as u64)
+            && cell["common_parents"]
+                .as_u64()
+                .is_some_and(|n| n >= coordinates.len() as u64),
+        "stable support changed"
+    );
+    Ok((coordinates, selected, signs))
+}
+
+fn surface_stable(
+    g: &mut DecoderGate,
+    case: &str,
+    phase: &str,
+    level: usize,
+    parents: &SparseSites,
+    logits: &[f32],
+) -> Result<()> {
+    let key = id(
+        &format!("m4-stable-decisions-{case}"),
+        &format!("{phase}-stage{level}"),
+        None,
+    );
+    let (coordinates, selected, signs) = surface_selection(&g.cells[&key])?;
     let mut tested = 0;
     let mut mismatches = 0;
     let mut missing = 0;
-    let mut selected_parents = 0;
     for (i, &point) in coordinates.iter().enumerate() {
         let row = parents.row(point);
-        let active = selected.values[i * 8..i * 8 + 8].iter().any(|&v| v != 0.0);
-        selected_parents += usize::from(active);
-        missing += usize::from(active && row.is_none());
+        missing += usize::from(row.is_none());
         for bit in 0..8 {
             if selected.values[i * 8 + bit] != 0.0 {
                 tested += 1;
@@ -2420,12 +2435,6 @@ fn surface_stable(
             }
         }
     }
-    ensure!(
-        cell["selected_decisions"].as_u64() == Some(tested as u64)
-            && cell["selected_parents"].as_u64() == Some(selected_parents as u64)
-            && cell["common_parents"].as_u64() == Some(coordinates.len() as u64),
-        "stable support changed"
-    );
     println!(
         "P1_M4A_STABLE_SUPPORT case={case} phase={phase} level={level} parents={} missing={missing}",
         coordinates.len()
@@ -2755,6 +2764,7 @@ fn pixal3d_surface_freeze_cpu() -> Result<()> {
                         && cell["selected_decisions"].as_u64().is_some_and(|n| n > 0),
                     "invalid stable-decision support"
                 );
+                surface_selection(cell)?;
             }
         }
     }
