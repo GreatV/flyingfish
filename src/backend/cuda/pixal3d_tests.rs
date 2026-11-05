@@ -63,6 +63,13 @@ fn tensor(path: &Path, key: &str) -> Result<HostTensor> {
             .iter()
             .map(|b| i64::from_le_bytes(*b) as f64)
             .collect(),
+        "U64" => t
+            .data
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b) as f64)
+            .collect(),
         "BOOL" => t.data.iter().map(|&x| x as f64).collect(),
         dtype => anyhow::bail!("unsupported reference dtype {dtype}"),
     };
@@ -1041,12 +1048,97 @@ fn conditioning_rejects_another_flow_with_the_same_row_count() -> Result<()> {
 }
 
 struct DecoderGate {
+    package: &'static str,
     cells: BTreeMap<CellId, Value>,
     anchors: BTreeMap<CellId, Value>,
     seen: BTreeSet<CellId>,
     defects: usize,
 }
 impl DecoderGate {
+    fn surface(geometry_only: bool) -> Result<Self> {
+        let bytes = std::fs::read(env_path("FF_PIXAL_FREEZE")?)?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes))
+                == "bc06c2394b677124a2041bacd29167d93a9a679e0205c4e229fd0afcefc0a3db",
+            "M4 freeze integrity mismatch"
+        );
+        let freeze: Value = serde_json::from_slice(&bytes)?;
+        ensure!(freeze["reference_valid"] == true, "invalid M4 reference");
+        let mut cells = BTreeMap::new();
+        let mut anchors = BTreeMap::new();
+        for table in freeze["tables"].as_array().context("M4 tables missing")? {
+            let family = table["family"].as_str().context("M4 family missing")?;
+            if family == "slat" || (family == "geometry") != geometry_only {
+                continue;
+            }
+            let table_name = table["source_table"]
+                .as_str()
+                .context("M4 table name missing")?;
+            for c in table["cells"].as_array().context("M4 cells missing")? {
+                let name = c["name"].as_str().context("M4 cell name missing")?;
+                if name == "guided-texture-coordinate-identity"
+                    || (family == "decoder-fixed" && name == "tex-fields")
+                    || name.starts_with("normalization-")
+                {
+                    continue;
+                }
+                let key = id(table_name, name, c["key"].as_str());
+                let mut anchor = c["anchor"].clone();
+                if anchor.is_null() && c["sources"].is_object() {
+                    anchor = c["sources"][c["comparison_anchor"]
+                        .as_str()
+                        .context("comparison arm missing")?]
+                    .clone();
+                }
+                if family == "geometry" && c["sources"].is_array() {
+                    let name = if let Some(suffix) = name.strip_prefix("compaction-") {
+                        suffix.to_owned()
+                    } else if name == "head-strict-edge-sign" {
+                        "f64.flags".into()
+                    } else {
+                        let (case, field) =
+                            name.rsplit_once('-').context("analytic field missing")?;
+                        format!("{case}.{field}")
+                    };
+                    anchor = serde_json::json!({"path":c["sources"][0], "key":name});
+                }
+                if !anchor.is_null() {
+                    anchors.insert(key.clone(), anchor);
+                }
+                ensure!(cells.insert(key, c.clone()).is_none(), "duplicate M4 cell");
+            }
+        }
+        println!(
+            "P1_M4A_FREEZE cells={} minimum_control_ratio={} unforced_topology=measurement reference_jaccard=0.5926020937353391",
+            cells.len(),
+            freeze["minimum_gated_control_ratio"]
+        );
+        Ok(Self {
+            package: if geometry_only {
+                "P1_M4A_GEOMETRY"
+            } else {
+                "P1_M4A_SHAPE"
+            },
+            cells,
+            anchors,
+            seen: BTreeSet::new(),
+            defects: 0,
+        })
+    }
+    fn exact_count(&mut self, key: CellId, tested: usize, mismatches: usize) -> Result<()> {
+        ensure!(
+            self.cells.contains_key(&key) && self.seen.insert(key.clone()),
+            "unknown or repeated exact cell {key:?}"
+        );
+        ensure!(tested > 0, "empty exact support {key:?}");
+        self.defects += usize::from(mismatches > 0);
+        println!(
+            "{}_EXACT {}",
+            self.package,
+            serde_json::json!({"table":key.0,"name":key.1,"tested":tested,"mismatches":mismatches,"result":if mismatches==0{"PASS"}else{"DEFECT"}})
+        );
+        Ok(())
+    }
     fn new() -> Result<Self> {
         let path = env_path("FF_PIXAL_FREEZE")?;
         let bytes = std::fs::read(&path)?;
@@ -1149,6 +1241,7 @@ impl DecoderGate {
             "M3b total coverage mismatch"
         );
         Ok(Self {
+            package: "P1_M3B",
             cells,
             anchors,
             seen: BTreeSet::new(),
@@ -1163,8 +1256,17 @@ impl DecoderGate {
         )
     }
     fn score(&mut self, k: CellId, shape: &[usize], values: &[f64]) -> Result<()> {
-        ensure!(self.seen.insert(k.clone()), "duplicate score {k:?}");
         let reference = self.anchor(&k)?;
+        self.score_against(k, shape, values, reference)
+    }
+    fn score_against(
+        &mut self,
+        k: CellId,
+        shape: &[usize],
+        values: &[f64],
+        reference: HostTensor,
+    ) -> Result<()> {
+        ensure!(self.seen.insert(k.clone()), "duplicate score {k:?}");
         let c = &self.cells[&k];
         ensure!(
             shape == reference.shape && values.len() == reference.values.len(),
@@ -1182,7 +1284,8 @@ impl DecoderGate {
                 let defect = gating && result[name.as_str()] > tau;
                 self.defects += usize::from(defect);
                 println!(
-                    "P1_M3B_METRIC {}",
+                    "{}_METRIC {}",
+                    self.package,
                     serde_json::json!({"table":k.0,"name":k.1,"key":k.2,"metric":name,"value":result[name.as_str()],"tau":tau,"gating":gating,"result":if defect{"DEFECT"}else{"PASS"}})
                 );
             }
@@ -1218,7 +1321,8 @@ impl DecoderGate {
             let gating = c["frozen_gating_metrics"]["exact"] == true;
             self.defects += usize::from(gating && mismatches > 0);
             println!(
-                "P1_M3B_EXACT {}",
+                "{}_EXACT {}",
+                self.package,
                 serde_json::json!({"table":k.0,"name":k.1,"stable":stable,"mismatches":mismatches,"gating":gating})
             );
         }
@@ -1234,19 +1338,20 @@ impl DecoderGate {
     fn finish(self) -> Result<()> {
         ensure!(
             self.seen.len() == self.cells.len(),
-            "unscored M3b cells: {:?}",
+            "unscored decoder cells: {:?}",
             self.cells
                 .keys()
                 .filter(|k| !self.seen.contains(*k))
                 .collect::<Vec<_>>()
         );
         println!(
-            "P1_M3B_GATE {} cells={} defects={} timing=false eager=true",
+            "{}_GATE {} cells={} defects={} timing=false eager=true",
+            self.package,
             if self.defects == 0 { "PASS" } else { "DEFECT" },
             self.seen.len(),
             self.defects
         );
-        ensure!(self.defects == 0, "M3b candidate defects");
+        ensure!(self.defects == 0, "decoder candidate defects");
         Ok(())
     }
 }
@@ -1316,11 +1421,10 @@ fn dense_decoder_cells(
                 } else {
                     fixture.into()
                 };
-                g.score_f32(
-                    id(&table, &name, if fixed { None } else { Some("logits") }),
-                    &[1, 1, 64, 64, 64],
-                    &logits,
-                )?;
+                let key = id(&table, &name, if fixed { None } else { Some("logits") });
+                if g.cells.contains_key(&key) {
+                    g.score_f32(key, &[1, 1, 64, 64, 64], &logits)?;
+                }
                 let table = format!("floors-decisions-{variant}.json");
                 let name = format!(
                     "{fixture}-{}-occupancy",
@@ -1786,5 +1890,905 @@ fn structure_sites_keep_xyz_order() -> Result<()> {
         .collect();
     assert_eq!(swapped.len(), expected.len());
     assert_ne!(swapped, expected);
+    let line = SparseSites::new((0..512).map(|x| [0, x, 0, 0]).collect())?;
+    assert_eq!(line.round_unique(512, 96)?.coordinates().len(), 96);
+    let (resolution, sites) = PixalDecoder::cascade_grid(&line, 1536, 96)?;
+    assert_eq!((resolution, sites.coordinates().len()), (1408, 88));
+    let (resolution, sites) = PixalDecoder::cascade_grid(&line, 1536, 88)?;
+    assert_eq!((resolution, sites.coordinates().len()), (1280, 80));
+    let (resolution, sites) = PixalDecoder::cascade_grid(&line, 1536, 1)?;
+    assert_eq!((resolution, sites.coordinates().len()), (1024, 64));
     Ok(())
+}
+
+fn geometry_compaction(g: &mut DecoderGate, d: &Device, input: &Path) -> Result<()> {
+    let sites = SparseSites::new(decoder_coordinates(input, "coords")?)?;
+    let logits = f32_tensor(input, "logits")?;
+    let masks: Vec<_> = logits
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|v| v.map(|x| x > 0.0))
+        .collect();
+    let (children, pairs) = sites.subdivide(&masks, sites.coordinates().len() * 8)?;
+    g.score(
+        id("m4-geometry-exact", "compaction-coords", None),
+        &[children.coordinates().len(), 4],
+        &children
+            .coordinates()
+            .as_flattened()
+            .iter()
+            .map(|&x| x as f64)
+            .collect::<Vec<_>>(),
+    )?;
+    for (name, key) in [
+        ("compaction-offsets", "counts"),
+        ("compaction-capacity_prefix", "capacity_counts"),
+    ] {
+        let values: Vec<u64> = tensor(input, key)?
+            .values
+            .into_iter()
+            .map(|x| x as u64)
+            .collect();
+        let counts = d.stream.clone_htod(&values)?;
+        let prefix = super::super::sparse::exclusive_scan(d, &counts)?;
+        let actual = d.stream.clone_dtoh(&prefix)?;
+        g.score(
+            id("m4-geometry-exact", name, None),
+            &[actual.len()],
+            &actual.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+        )?;
+        if key == "capacity_counts" {
+            ensure!(
+                actual.last().copied().unwrap() > u32::MAX as u64,
+                "wide-scan discriminator lost"
+            );
+        }
+    }
+    let rows = sites.coordinates().len();
+    let values: Vec<_> = (0..rows * 128)
+        .flat_map(|i| {
+            let bits = ((((i * 29 + 7) % 251) as f32 - 125.0) / 127.0).to_bits();
+            [
+                f16::from_bits(bits as u16),
+                f16::from_bits((bits >> 16) as u16),
+            ]
+        })
+        .collect();
+    let x = d.stream.clone_htod(&values)?;
+    let pairs = d.stream.clone_htod(pairs.as_flattened())?;
+    let y = d
+        .stream
+        .alloc_zeros::<f16>(children.coordinates().len() * 32)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    unsafe {
+        d.stream
+            .launch_builder(&module.load_function("channel_to_spatial_f16")?)
+            .arg(&x)
+            .arg(&pairs)
+            .arg(&y)
+            .arg(&(rows as u32))
+            .arg(&(children.coordinates().len() as u32))
+            .arg(&32u32)
+            .arg(&32u32)
+            .arg(&0i32)
+            .launch(flat(y.len()))?;
+    }
+    // Two adjacent F16 payloads preserve every bit of each F32 indexing fixture.
+    let raw = d.stream.clone_dtoh(&y)?;
+    let actual: Vec<f32> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| f32::from_bits(v[0].to_bits() as u32 | ((v[1].to_bits() as u32) << 16)))
+        .collect();
+    g.score_f32(
+        id("m4-geometry-exact", "compaction-features", None),
+        &[children.coordinates().len(), 16],
+        &actual,
+    )?;
+    let swapped = tensor(input, "wrong_axis_coords")?;
+    ensure!(
+        swapped.values
+            != children
+                .coordinates()
+                .as_flattened()
+                .iter()
+                .map(|&x| x as f64)
+                .collect::<Vec<_>>(),
+        "axis control vanished"
+    );
+    Ok(())
+}
+
+fn geometry_heads(g: &mut DecoderGate, d: &Device, input: &Path) -> Result<()> {
+    let fields = f32_tensor(input, "head_fields")?;
+    let rows = fields.len() / 7;
+    let values = d.stream.clone_htod(&fields)?;
+    let dual = d.stream.alloc_zeros::<f32>(rows * 3)?;
+    let flags = d.stream.alloc_zeros::<u8>(rows * 3)?;
+    let weights = d.stream.alloc_zeros::<f32>(rows)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    unsafe {
+        d.stream
+            .launch_builder(&module.load_function("dual_grid_head_f32")?)
+            .arg(&values)
+            .arg(&(rows as u32))
+            .arg(&dual)
+            .arg(&flags)
+            .arg(&weights)
+            .launch(flat(rows))?;
+        d.stream
+            .launch_builder(&module.load_function("activation_f32")?)
+            .arg(&weights)
+            .arg(&weights)
+            .arg(&(rows as u32))
+            .arg(&1u32)
+            .arg(&3i32)
+            .launch(flat(rows))?;
+    }
+    let host_dual = d.stream.clone_dtoh(&dual)?;
+    g.score_f32(
+        id("m4-geometry-pointwise", "head-dual", None),
+        &[rows, 3],
+        &host_dual,
+    )?;
+    g.score_f32(
+        id("m4-geometry-pointwise", "head-weight", None),
+        &[rows, 1],
+        &d.stream.clone_dtoh(&weights)?,
+    )?;
+    g.score(
+        id("m4-geometry-exact", "head-strict-edge-sign", None),
+        &[rows, 3],
+        &d.stream
+            .clone_dtoh(&flags)?
+            .iter()
+            .map(|&x| x as f64)
+            .collect::<Vec<_>>(),
+    )?;
+    let all_coords = decoder_coordinates(input, "coords")?;
+    let coordinates = d.stream.clone_htod(all_coords[..rows].as_flattened())?;
+    for resolution in [64u32, 1024, 1152, 1280, 1408, 1536] {
+        let vertices = d.stream.clone_htod(&host_dual)?;
+        unsafe {
+            d.stream
+                .launch_builder(&module.load_function("sparse_grid_world_f32")?)
+                .arg(&coordinates)
+                .arg(&vertices)
+                .arg(&(rows as u32))
+                .arg(&resolution)
+                .arg(&-0.5f32)
+                .launch(flat(rows * 3))?;
+        }
+        let name = if resolution == 64 {
+            "head-world".to_owned()
+        } else {
+            format!("head-world{resolution}")
+        };
+        g.score_f32(
+            id("m4-geometry-pointwise", &name, None),
+            &[rows, 3],
+            &d.stream.clone_dtoh(&vertices)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA and frozen geometry fixtures"]
+fn sparse_geometry_matches_frozen_definition_gpu() -> Result<()> {
+    let mut g = DecoderGate::surface(true)?;
+    let input = env_path("FF_PIXAL_TOPOLOGY")?;
+    let d = Device::new(0)?;
+    let (free, _) = d.ctx.mem_get_info()?;
+    geometry_compaction(&mut g, &d, &input)?;
+    geometry_heads(&mut g, &d, &input)?;
+    for axis in 0..3 {
+        for resolution in [8u32, 16] {
+            for case in [
+                "disconnected",
+                "open_boundary",
+                "tie",
+                "positive_split",
+                "negative_split",
+                "degenerate",
+            ] {
+                let name = format!("axis{axis}-grid{resolution}-{case}");
+                let vertex_key = id("m4-geometry-exact", &format!("{name}-vertices"), None);
+                let path = PathBuf::from(
+                    g.anchors[&vertex_key]["path"]
+                        .as_str()
+                        .context("analytic source missing")?,
+                );
+                let c = tensor(&path, &format!("{name}.coords"))?;
+                let coordinates = c
+                    .values
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|v| [0, v[0] as i32, v[1] as i32, v[2] as i32])
+                    .collect();
+                let sites = SparseSites::new(coordinates)?;
+                let dual = d
+                    .stream
+                    .clone_htod(&f32_tensor(&path, &format!("{name}.dual"))?)?;
+                let weights = d
+                    .stream
+                    .clone_htod(&f32_tensor(&path, &format!("{name}.weights"))?)?;
+                let flags = tensor(&path, &format!("{name}.flags"))?
+                    .values
+                    .into_iter()
+                    .map(|x| x as u8)
+                    .collect::<Vec<_>>();
+                let flags = d.stream.clone_htod(&flags)?;
+                let mesh = super::super::sparse::mesh_from_dual(
+                    &d,
+                    sites,
+                    dual,
+                    flags,
+                    weights,
+                    resolution,
+                    [free, free],
+                )?;
+                g.score_f32(vertex_key, &[mesh.vertices.len() / 3, 3], &mesh.vertices)?;
+                g.score(
+                    id("m4-geometry-exact", &format!("{name}-faces"), None),
+                    &[mesh.faces.len() / 3, 3],
+                    &mesh.faces.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                )?;
+                if case != "degenerate" {
+                    ensure!(
+                        mesh.faces.iter().map(|&x| x as f64).collect::<Vec<_>>()
+                            != tensor(&path, &format!("{name}.wrong_winding"))?.values,
+                        "winding control vanished"
+                    );
+                }
+            }
+        }
+    }
+    let counts: Vec<u64> = (0..1_048_589)
+        .map(|i| ((i * 7) % 1031) as u64 + if i % 4099 == 0 { 1u64 << 32 } else { 0 })
+        .collect();
+    let mut expected = Vec::with_capacity(counts.len() + 1);
+    expected.push(0u64);
+    for &v in &counts {
+        expected.push(
+            expected
+                .last()
+                .unwrap()
+                .checked_add(v)
+                .context("CPU prefix overflow")?,
+        );
+    }
+    let prefix = super::super::sparse::exclusive_scan(&d, &d.stream.clone_htod(&counts)?)?;
+    let actual = d.stream.clone_dtoh(&prefix)?;
+    ensure!(actual == expected, "hierarchical wide prefix defect");
+    ensure!(
+        actual.iter().any(|&x| x != x as u32 as u64),
+        "32-bit prefix control vanished"
+    );
+    println!(
+        "P1_M4A_SCAN PASS elements={} levels=3 exact=true u32_control=true",
+        counts.len()
+    );
+    let sites = SparseSites::new(vec![
+        [0, 0, 0, 0],
+        [0, 0, 0, 1],
+        [0, 0, 1, 0],
+        [0, 0, 1, 1],
+        [1, 0, 0, 0],
+        [1, 0, 0, 1],
+        [1, 0, 1, 0],
+    ])?;
+    let mut flags = vec![0u8; 21];
+    flags[0] = 1;
+    flags[12] = 1;
+    let mesh = super::super::sparse::mesh_from_dual(
+        &d,
+        sites,
+        d.stream.clone_htod(&[0.5f32; 21])?,
+        d.stream.clone_htod(&flags)?,
+        d.stream.clone_htod(&[1f32; 7])?,
+        8,
+        [free, free],
+    )?;
+    ensure!(
+        mesh.faces == [0, 1, 2, 2, 1, 3],
+        "cross-batch edge lookup defect"
+    );
+    let sites = SparseSites::new(vec![[0, 0, 0, 0]])?;
+    let mesh = super::super::sparse::mesh_from_dual(
+        &d,
+        sites,
+        d.stream.clone_htod(&[0.5f32; 3])?,
+        d.stream.clone_htod(&[0u8; 3])?,
+        d.stream.clone_htod(&[1f32])?,
+        8,
+        [free, free],
+    )?;
+    ensure!(
+        mesh.faces.is_empty() && mesh.vertices.len() == 3,
+        "empty edge set defect"
+    );
+    println!("P1_M4A_MESH_BOUNDARY PASS batch_isolation=true missing_corner=true empty_edges=true");
+    g.finish()
+}
+
+fn surface_signs(
+    g: &mut DecoderGate,
+    case: &str,
+    name: &str,
+    values: &[f32],
+    reference: &[f64],
+) -> Result<()> {
+    let key = id(&format!("m4-decisions-{case}.json"), name, None);
+    let cell = &g.cells[&key];
+    let margin = cell["margin_tau"].as_f64().context("sign margin missing")?;
+    ensure!(values.len() == reference.len(), "sign extent mismatch");
+    let mut selected = 0;
+    let mut mismatches = 0;
+    for (&value, &anchor) in values.iter().zip(reference) {
+        ensure!(value.is_finite(), "nonfinite sign input");
+        if anchor.abs() > margin {
+            selected += 1;
+            mismatches += usize::from((value > 0.0) != (anchor > 0.0));
+        }
+    }
+    ensure!(
+        Some(selected as u64) == cell["stable"].as_u64(),
+        "frozen sign support mismatch"
+    );
+    g.exact_count(key, selected, mismatches)
+}
+
+fn surface_count(case: &str, phase: &str, plan: [usize; 3], rows: [usize; 2]) -> Result<()> {
+    let [stage, parent_bytes, child_bytes] = plan;
+    let channels = 1024 >> stage;
+    let [parent, child] = rows;
+    let parent_map = parent * 27 * size_of::<i32>();
+    let child_map = child * 27 * size_of::<i32>();
+    let parent_columns = parent_bytes
+        .checked_sub(parent_map)
+        .context("parent map bound")?;
+    let child_columns = child_bytes
+        .checked_sub(child_map)
+        .context("child map bound")?;
+    let parent_tile = parent_columns / (27 * channels * size_of::<f16>());
+    let child_tile = child_columns / (27 * (channels / 2) * size_of::<f16>());
+    ensure!(parent_tile > 0 && child_tile > 0, "empty gather tile");
+    let calls =
+        ([4, 16, 8, 4][stage] + 1) * parent.div_ceil(parent_tile) + child.div_ceil(child_tile);
+    println!(
+        "P1_M4A_COUNT {}",
+        serde_json::json!({"case":case,"phase":phase,"stage":stage,"parent_rows":parent,"child_rows":child,"channels":channels,"parent_map_bytes":parent_map,"child_map_bytes":child_map,"parent_columns_bytes":parent_columns,"child_columns_bytes":child_columns,"parent_tile_rows":parent_tile,"child_tile_rows":child_tile,"gather_launches":calls,"bias_launches":calls,"gemm_dispatches":calls,"subdivision_d2h_bytes":parent*8*size_of::<f16>(),"child_pair_h2d_bytes":child*2*size_of::<u32>()})
+    );
+    Ok(())
+}
+
+fn surface_fixed(
+    g: &mut DecoderGate,
+    decoder: &PixalDecoder,
+    root: &Path,
+    case: (&str, &str, &str),
+) -> Result<()> {
+    let (case, capture, table) = case;
+    let capture = if case == "crab1408" {
+        format!("{capture}-decoder-r2")
+    } else {
+        capture.to_owned()
+    };
+    let base = root.join("evidence/P1-M1-r1").join(capture);
+    let path = base.join("result.safetensors");
+    let coordinates = decoder_coordinates(&path, "result.1.0.coords")?;
+    let latent = f32_tensor(&path, "result.1.0.features")?;
+    let topology = base.join("raw-geometry-material.safetensors");
+    let mut guide_coords = Vec::new();
+    let mut guide_logits = Vec::new();
+    for stage in 0..4 {
+        guide_coords.push(decoder_coordinates(
+            &topology,
+            &format!("subdivisions.{stage}.coords"),
+        )?);
+        guide_logits.push(f32_tensor(
+            &topology,
+            &format!("subdivisions.{stage}.features"),
+        )?);
+    }
+    let guides: Vec<_> = guide_coords
+        .iter()
+        .zip(&guide_logits)
+        .map(|(coordinates, logits)| SubdivisionGuide {
+            coordinates,
+            logits,
+        })
+        .collect();
+    let (sites, features) = decoder.sparse_decode(
+        coordinates,
+        &latent,
+        &guides,
+        |plan @ [stage, _, _], (parents, sub), (next, _)| {
+            surface_count(
+                case,
+                "fixed",
+                plan,
+                [parents.coordinates().len(), next.coordinates().len()],
+            )?;
+            let key = id(table, &format!("shape-subdivision{stage}"), None);
+            g.score_f32(key.clone(), &[sub.len() / 8, 8], sub)?;
+            let source = &g.cells[&key]["sources"]["r0a"];
+            let anchor = tensor(
+                Path::new(source["path"].as_str().context("sign anchor missing")?),
+                source["key"].as_str().context("sign tensor missing")?,
+            )?;
+            surface_signs(g, case, &format!("subdivision{stage}"), sub, &anchor.values)?;
+            println!(
+                "P1_M4A_FIXED_PROGRESS case={case} stage={stage} rows={}",
+                next.coordinates().len()
+            );
+            Ok(())
+        },
+    )?;
+    let output = decoder.shape_head(&sites, features)?;
+    let fields = decoder.device.stream.clone_dtoh(&output)?;
+    let expected = decoder_coordinates(
+        &base.join("shape_slat_decoder-fields.safetensors"),
+        "output.coords",
+    )?;
+    ensure!(
+        sites.coordinates() == expected,
+        "forced shape coordinate identity mismatch"
+    );
+    let key = id(table, "shape-fields", None);
+    g.score_f32(key.clone(), &[sites.coordinates().len(), 7], &fields)?;
+    let source = &g.cells[&key]["sources"]["r0a"];
+    let anchor = tensor(
+        Path::new(source["path"].as_str().context("edge anchor missing")?),
+        source["key"].as_str().context("edge key missing")?,
+    )?;
+    let reference: Vec<_> = anchor
+        .values
+        .as_chunks::<7>()
+        .0
+        .iter()
+        .flat_map(|v| v[3..6].iter().copied())
+        .collect();
+    let candidate: Vec<_> = fields
+        .as_chunks::<7>()
+        .0
+        .iter()
+        .flat_map(|v| v[3..6].iter().copied())
+        .collect();
+    surface_signs(g, case, "edges", &candidate, &reference)?;
+    println!(
+        "P1_M4A_FIXED_COMPLETE case={case} rows={} sparse_convolutions=40",
+        sites.coordinates().len()
+    );
+    Ok(())
+}
+
+fn surface_stable(
+    g: &mut DecoderGate,
+    case: &str,
+    phase: &str,
+    level: usize,
+    parents: &SparseSites,
+    logits: &[f32],
+) -> Result<()> {
+    let key = id(
+        &format!("m4-stable-decisions-{case}"),
+        &format!("{phase}-stage{level}"),
+        None,
+    );
+    let cell = &g.cells[&key];
+    let path = Path::new(
+        cell["selection_fixture"]
+            .as_str()
+            .context("selection path missing")?,
+    );
+    let bytes = std::fs::read(path)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes))
+            == cell["selection_fixture_sha256"]
+                .as_str()
+                .context("selection digest missing")?,
+        "selection integrity mismatch"
+    );
+    drop(bytes);
+    let coordinates = decoder_coordinates(path, "coords")?;
+    let selected = tensor(path, "selected")?;
+    let signs = tensor(path, "signs")?;
+    ensure!(
+        selected.shape == [coordinates.len(), 8] && signs.shape == selected.shape,
+        "invalid selection layout"
+    );
+    let mut tested = 0;
+    let mut mismatches = 0;
+    let mut missing = 0;
+    let mut selected_parents = 0;
+    for (i, &point) in coordinates.iter().enumerate() {
+        let row = parents.row(point);
+        let active = selected.values[i * 8..i * 8 + 8].iter().any(|&v| v != 0.0);
+        selected_parents += usize::from(active);
+        missing += usize::from(active && row.is_none());
+        for bit in 0..8 {
+            if selected.values[i * 8 + bit] != 0.0 {
+                tested += 1;
+                mismatches += usize::from(row.is_none_or(|row| {
+                    (logits[row as usize * 8 + bit] > 0.0) != (signs.values[i * 8 + bit] != 0.0)
+                }));
+            }
+        }
+    }
+    ensure!(
+        cell["selected_decisions"].as_u64() == Some(tested as u64)
+            && cell["selected_parents"].as_u64() == Some(selected_parents as u64)
+            && cell["common_parents"].as_u64() == Some(coordinates.len() as u64),
+        "stable support changed"
+    );
+    println!(
+        "P1_M4A_STABLE_SUPPORT case={case} phase={phase} level={level} parents={} missing={missing}",
+        coordinates.len()
+    );
+    g.exact_count(key, tested, mismatches)
+}
+
+fn surface_own(
+    g: &mut DecoderGate,
+    core: &str,
+    phase: &str,
+    level: usize,
+    parents: &SparseSites,
+    logits: &[f32],
+    children: &SparseSites,
+) -> Result<()> {
+    let mut row = 0;
+    let mut mismatches = 0;
+    for (&parent, values) in parents.coordinates().iter().zip(logits.as_chunks::<8>().0) {
+        for (bit, &value) in values.iter().enumerate() {
+            if value > 0.0 {
+                let expected = [
+                    parent[0],
+                    parent[1] * 2 + (bit as i32 & 1),
+                    parent[2] * 2 + ((bit as i32 >> 1) & 1),
+                    parent[3] * 2 + ((bit as i32 >> 2) & 1),
+                ];
+                mismatches += usize::from(children.coordinates().get(row) != Some(&expected));
+                row += 1;
+            }
+        }
+    }
+    mismatches += children.coordinates().len().abs_diff(row);
+    g.exact_count(
+        id(
+            &format!("m4-own-branch-contract-{core}"),
+            &format!("{phase}-stage{level}-own-mask-compaction"),
+            None,
+        ),
+        row.max(children.coordinates().len()),
+        mismatches,
+    )
+}
+
+fn surface_generated(
+    g: &mut DecoderGate,
+    decoder: &PixalDecoder,
+    root: &Path,
+    model: &Path,
+    case: (&str, &str, u32),
+) -> Result<()> {
+    let (case, core, requested) = case;
+    let base = root
+        .join("evidence/P1-M4-freeze-r1")
+        .join(format!("core-{core}-r0a-r2"));
+    let metadata: Value = serde_json::from_slice(&std::fs::read(base.join("metadata.json"))?)?;
+    let resolution = metadata["trace"]
+        .as_array()
+        .context("capture trace missing")?
+        .iter()
+        .find(|v| v["stage"] == "decode")
+        .context("decode stage missing")?["actual_resolution"]
+        .as_u64()
+        .context("actual grid missing")? as u32;
+    let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
+    let norm = &config["args"]["shape_slat_normalization"];
+    let mean: Vec<f32> = norm["mean"]
+        .as_array()
+        .context("shape mean missing")?
+        .iter()
+        .map(|x| x.as_f64().unwrap() as f32)
+        .collect();
+    let std: Vec<f32> = norm["std"]
+        .as_array()
+        .context("shape std missing")?
+        .iter()
+        .map(|x| x.as_f64().unwrap() as f32)
+        .collect();
+    let d = &decoder.device;
+    for (call, phase) in ["LR", "HR"].into_iter().enumerate() {
+        let input = base.join(format!("shape_slat-{call}-outputs.safetensors"));
+        let coords = decoder_coordinates(&input, "samples.coords")?;
+        let mut latent = d
+            .stream
+            .clone_htod(&f32_tensor(&input, "samples.features")?)?;
+        denormalize_shape(d, &mut latent, &mean, &std, mean.len())?;
+        let physical = d.stream.clone_dtoh(&latent)?;
+        drop(latent);
+        let (sites, features) = decoder.sparse_decode(coords, &physical, &[], |plan @ [level, _, _], (parents, logits), (next, _)| {
+            surface_count(case, phase, plan, [parents.coordinates().len(), next.coordinates().len()])?;
+            surface_stable(g, case, phase, level, parents, logits)?;
+            surface_own(g, core, phase, level, parents, logits, next)?;
+            let reference = base.join(format!("shape_slat_decoder.blocks.{level}.{}-call{call}-topology.safetensors", [4,16,8,4][level]));
+            let reference = decoder_coordinates(&reference, "child_coords")?;
+            let common = reference.iter().filter(|&&p| next.row(p).is_some()).count();
+            let union = reference.len() + next.coordinates().len() - common;
+            let disagreement = 1.0 - common as f64 / union as f64;
+            println!("P1_M4A_COORDINATE_MEASUREMENT case={case} phase={phase} level={level} candidate_rows={} reference_rows={} jaccard_disagreement={disagreement} gating=false input=recorded_flow_output reference_pair_cottage1024=0.5926020937353391", next.coordinates().len(), reference.len());
+            Ok(())
+        })?;
+        if phase == "LR" {
+            drop(features);
+            let (actual, quantized) = PixalDecoder::cascade_grid(&sites, requested, 49152)?;
+            println!(
+                "P1_M4A_CASCADE_MEASUREMENT case={case} requested={requested} actual={actual} rows={} recorded_actual={resolution} gating=false",
+                quantized.coordinates().len()
+            );
+        } else {
+            let fields = decoder.shape_head(&sites, features)?;
+            let mesh = super::super::sparse::dual_grid_mesh(
+                d,
+                sites,
+                fields,
+                resolution,
+                [decoder.initial_free, decoder.device_budget],
+            )?;
+            println!(
+                "P1_M4A_RAW_MESH_MEASUREMENT case={case} actual_grid={resolution} vertices={} triangles={} gating=false scope=generated_decoder_on_recorded_flow",
+                mesh.vertices.len() / 3,
+                mesh.faces.len() / 3
+            );
+            ensure!(
+                mesh.vertices.iter().all(|x| x.is_finite()),
+                "nonfinite generated raw mesh"
+            );
+            ensure!(
+                mesh.faces
+                    .iter()
+                    .all(|&x| x >= 0 && (x as usize) < mesh.vertices.len() / 3),
+                "raw mesh index outside vertices"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn surface_normalization(g: &mut DecoderGate, model: &Path, root: &Path) -> Result<()> {
+    let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
+    let d = Device::new(0)?;
+    for (fixture, capture) in [
+        ("cottage", "pipeline-single-1536-cottage-r0a"),
+        ("robot_crab", "pipeline-single-1536-robot_crab-r0a"),
+        ("mv4", "pipeline-mv-1024-mv4-r0a"),
+    ] {
+        for (kind, stage) in [("shape", "shape_slat-1"), ("tex", "tex_slat-0")] {
+            let norm = &config["args"][format!("{kind}_slat_normalization")];
+            let mean: Vec<_> = norm["mean"]
+                .as_array()
+                .context("normalization mean missing")?
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            let std: Vec<_> = norm["std"]
+                .as_array()
+                .context("normalization scale missing")?
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            let input = root
+                .join("evidence/P1-M1-r1")
+                .join(capture)
+                .join(format!("{stage}-outputs.safetensors"));
+            let host = tensor(&input, "samples.features")?;
+            let mut values = d
+                .stream
+                .clone_htod(&host.values.iter().map(|&x| x as f32).collect::<Vec<_>>())?;
+            denormalize_shape(&d, &mut values, &mean, &std, mean.len())?;
+            g.score_f32(
+                id(
+                    "floors-transition-published.json",
+                    &format!("{fixture}-{kind}"),
+                    None,
+                ),
+                &host.shape,
+                &d.stream.clone_dtoh(&values)?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn canonical_quad(faces: &[i32]) -> Option<([i32; 4], [i32; 6])> {
+    let mut sorted: [i32; 6] = faces.try_into().ok()?;
+    sorted.sort_unstable();
+    let mut key = [-1; 4];
+    let mut count = 0;
+    for (i, &v) in sorted.iter().enumerate() {
+        if i == 0 || v != sorted[i - 1] {
+            if count == 4 {
+                return None;
+            }
+            key[count] = v;
+            count += 1;
+        }
+    }
+    if count != 4 {
+        return None;
+    }
+    let mut triangles = [[0; 3]; 2];
+    for (i, face) in faces.as_chunks::<3>().0.iter().enumerate() {
+        let first = (0..3).min_by_key(|&j| face[j]).unwrap();
+        triangles[i] = [face[first], face[(first + 1) % 3], face[(first + 2) % 3]];
+    }
+    triangles.sort_unstable();
+    Some((key, triangles.as_flattened().try_into().unwrap()))
+}
+
+fn surface_mesh(g: &mut DecoderGate, root: &Path) -> Result<()> {
+    let d = Device::new(0)?;
+    let (free, _) = d.ctx.mem_get_info()?;
+    let base = root.join("evidence/P1-M1-r1/pipeline-single-1024-cottage-r2");
+    let path = base.join("shape_slat_decoder-fields.safetensors");
+    let sites = SparseSites::new(decoder_coordinates(&path, "output.coords")?)?;
+    let fields = f32_tensor(&path, "output.features")?;
+    let flags: Vec<u8> = fields
+        .as_chunks::<7>()
+        .0
+        .iter()
+        .flat_map(|v| v[3..6].iter().map(|&x| u8::from(x > 0.0)))
+        .collect();
+    drop(fields);
+    let mesh_path = root.join("evidence/P1-M1-r1/mesh-local/r0a.safetensors");
+    let dual = d
+        .stream
+        .clone_htod(&f32_tensor(&mesh_path, "dual_vertices")?)?;
+    let weights = d
+        .stream
+        .clone_htod(&f32_tensor(&mesh_path, "split_weight")?)?;
+    let mesh = super::super::sparse::mesh_from_dual(
+        &d,
+        sites,
+        dual,
+        d.stream.clone_htod(&flags)?,
+        weights,
+        1024,
+        [free, free],
+    )?;
+    g.score_f32(
+        id("floors-mesh-published-r2.json", "vertices", None),
+        &[mesh.vertices.len() / 3, 3],
+        &mesh.vertices,
+    )?;
+    let reference = tensor(&mesh_path, "faces")?
+        .values
+        .into_iter()
+        .map(|v| v as i32)
+        .collect::<Vec<_>>();
+    let weight = tensor(
+        &root.join(
+            "evidence/P1-M4-freeze-r1/replay/evidence/P1-M1-r1/mesh-local/r3math.safetensors",
+        ),
+        "split_weight",
+    )?
+    .values;
+    let key = id(
+        "floors-mesh-published-r2.json",
+        "stable_split_topology",
+        None,
+    );
+    let cell = &g.cells[&key];
+    let margin = cell["margin_tau"].as_f64().context("mesh margin missing")?;
+    let mut expected = Vec::new();
+    for pair in reference.as_chunks::<6>().0 {
+        let split = pair[3] == pair[0];
+        let quad = [
+            pair[0],
+            pair[1],
+            if split { pair[2] } else { pair[5] },
+            if split { pair[5] } else { pair[2] },
+        ];
+        let delta = weight[quad[0] as usize] * weight[quad[2] as usize]
+            - weight[quad[1] as usize] * weight[quad[3] as usize];
+        if delta.abs() > margin {
+            expected.push(canonical_quad(pair).context("invalid frozen quad")?);
+        }
+    }
+    ensure!(
+        cell["stable_quads"].as_u64() == Some(expected.len() as u64),
+        "frozen mesh support mismatch"
+    );
+    let mut actual: Vec<_> = mesh
+        .faces
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .filter_map(|p| canonical_quad(p))
+        .collect();
+    let invalid = mesh.faces.len() / 6 - actual.len();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    let mut cursor = 0;
+    let mut mismatches = invalid;
+    for pair in &expected {
+        while cursor < actual.len() && actual[cursor].0 < pair.0 {
+            cursor += 1;
+        }
+        if actual.get(cursor) == Some(pair) {
+            cursor += 1;
+        } else {
+            mismatches += 1;
+        }
+    }
+    g.exact_count(key, expected.len(), mismatches)?;
+    println!(
+        "P1_M4A_MESH_SUPPORT total_quads={} stable_quads={} outside_stable={} canonical_winding=true multiplicity=true",
+        reference.len() / 6,
+        expected.len(),
+        reference.len() / 6 - expected.len()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, published checkpoints and frozen decoder captures"]
+fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
+    let mut g = DecoderGate::surface(false)?;
+    let root = env_path("FF_PIXAL_REFERENCE")?;
+    let model = env_path("FF_PIXAL_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    dense_decoder_cells(&mut g, &root, &model, &runtime)?;
+    decoder_transitions(&mut g, &root)?;
+    surface_normalization(&mut g, &model, &root)?;
+    surface_mesh(&mut g, &root)?;
+    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
+    for (case, capture, table, core, requested) in [
+        (
+            "cottage1024",
+            "pipeline-single-1024-cottage-r2",
+            "m4-floors-decoder-fixed-cottage-angular-r1.json",
+            "single-1024-cottage",
+            1024,
+        ),
+        (
+            "crab1024",
+            "pipeline-single-1024-robot_crab-r2",
+            "m4-floors-decoder-fixed-robot_crab-angular-r1.json",
+            "single-1024-robot_crab",
+            1024,
+        ),
+        (
+            "cottage1536",
+            "pipeline-single-1536-cottage-r0a",
+            "floors-decoder-cottage1536-full-m4.json",
+            "single-1536-cottage",
+            1536,
+        ),
+        (
+            "crab1408",
+            "pipeline-single-1536-robot_crab-r0a",
+            "floors-decoder-crab1408-full-m4.json",
+            "single-1536-robot_crab",
+            1536,
+        ),
+        (
+            "mv41024",
+            "pipeline-mv-1024-mv4-r0a",
+            "floors-decoder-mv41024-full-m4.json",
+            "mv-1024-mv4",
+            1024,
+        ),
+    ] {
+        surface_fixed(&mut g, &decoder, &root, (case, capture, table))?;
+        surface_generated(&mut g, &decoder, &root, &model, (case, core, requested))?;
+    }
+    g.finish()
 }

@@ -330,7 +330,7 @@ pub struct TreeMetadata {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::pixal3d::PixalDecoder;
+pub use cuda::pixal3d::{PixalDecoder, SparseDecoderOutput};
 
 #[cfg(test)]
 mod tests {

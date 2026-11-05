@@ -1,11 +1,36 @@
 //! Sparse lattice indexing; batch is the leading coordinate.
 use anyhow::{Context, Result, ensure};
 
+pub struct SparseMesh {
+    /// Row-major [vertices,3] world coordinates.
+    pub vertices: Vec<f32>,
+    /// Row-major [triangles,3] indices; winding and multiplicity are retained.
+    pub faces: Vec<i32>,
+}
+
 pub struct SparseSites {
     coordinates: Vec<[i32; 4]>,
     sorted: Vec<([i32; 4], i32)>,
 }
 impl SparseSites {
+    /// Lexicographic unique coordinates and input-row to unique-row indices.
+    pub fn deduplicate(coordinates: Vec<[i32; 4]>) -> Result<(Self, Vec<u32>)> {
+        ensure!(
+            !coordinates.is_empty() && coordinates.len() <= i32::MAX as usize,
+            "invalid sparse corner count"
+        );
+        let mut order: Vec<_> = coordinates.into_iter().enumerate().collect();
+        order.sort_unstable_by_key(|&(_, p)| p);
+        let mut inverse = vec![0; order.len()];
+        let mut unique = Vec::new();
+        for (row, point) in order {
+            if unique.last() != Some(&point) {
+                unique.push(point);
+            }
+            inverse[row] = (unique.len() - 1) as u32;
+        }
+        Ok((Self::new(unique)?, inverse))
+    }
     pub fn new(coordinates: Vec<[i32; 4]>) -> Result<Self> {
         ensure!(
             !coordinates.is_empty() && coordinates.len() <= i32::MAX as usize,
@@ -37,6 +62,10 @@ impl SparseSites {
     }
     pub fn coordinates(&self) -> &[[i32; 4]] {
         &self.coordinates
+    }
+    #[cfg(feature = "cuda")]
+    pub(crate) fn sorted_rows(&self) -> &[([i32; 4], i32)] {
+        &self.sorted
     }
     pub fn row(&self, point: [i32; 4]) -> Option<i32> {
         self.sorted
@@ -107,7 +136,6 @@ impl SparseSites {
         }
         Ok((Self::new(coordinates)?, source))
     }
-    #[cfg(test)]
     pub fn scaled_coordinates(&self, source_grid: u32, target_grid: u32) -> Result<Vec<[f32; 3]>> {
         ensure!(
             source_grid > 0 && target_grid > 1 && target_grid <= i32::MAX as u32,
@@ -133,10 +161,9 @@ impl SparseSites {
         }
         Ok(coordinates)
     }
-    #[cfg(test)]
     pub fn round_unique(&self, source_grid: u32, target_grid: u32) -> Result<Self> {
         let scaled = self.scaled_coordinates(source_grid, target_grid)?;
-        let mut coordinates: Vec<_> = self
+        let coordinates: Vec<_> = self
             .coordinates
             .iter()
             .zip(scaled)
@@ -149,9 +176,7 @@ impl SparseSites {
                 ]
             })
             .collect();
-        coordinates.sort_unstable();
-        coordinates.dedup();
-        Self::new(coordinates)
+        Ok(Self::deduplicate(coordinates)?.0)
     }
 }
 
@@ -168,6 +193,13 @@ mod tests {
         assert_eq!(maps[3][13], 3);
         assert_eq!(maps[3].iter().filter(|&&r| r >= 0).count(), 1);
         assert_ne!(maps[0][22], maps[0][14]);
+        let (corners, inverse) =
+            SparseSites::deduplicate(vec![[1, 0, 2, 3], [0, 4, 5, 6], [0, 4, 5, 6], [0, 1, 2, 3]])?;
+        assert_eq!(
+            corners.coordinates(),
+            &[[0, 1, 2, 3], [0, 4, 5, 6], [1, 0, 2, 3]]
+        );
+        assert_eq!(inverse, [2, 1, 1, 0]);
         let masks = [
             [false, true, false, false, false, false, false, false],
             [false; 8],
