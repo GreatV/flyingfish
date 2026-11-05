@@ -491,11 +491,11 @@ fn glm_composition_gpu() -> Result<()> {
     };
     #[cfg(feature = "rocm")]
     Engine::calibrate(&model, 0, 640, None, settings.clone())?;
-    if let Some(waves) = std::env::var_os("G1_FORCED_WAVES") {
+    if let Some(waves) = std::env::var_os("FF_GLM_FORCED_WAVES") {
         crate::experts::plan::FORCED_WAVES.set(Some(
             waves
                 .to_str()
-                .context("G1_FORCED_WAVES is not text")?
+                .context("FF_GLM_FORCED_WAVES is not text")?
                 .parse()?,
         ));
     }
