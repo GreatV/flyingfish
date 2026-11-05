@@ -5854,7 +5854,7 @@ mod gguf_tests {
     fn temp_gguf(tensors: &[SyntheticTensor]) -> Result<TempGguf> {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "flyingfish-gguf-{}-{}.gguf",
+            "flyingfish-gguf-manifest-{}-{}.gguf",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

@@ -531,7 +531,7 @@ mod tests {
         fn new(bytes: &[u8]) -> Result<Self> {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let path = std::env::temp_dir().join(format!(
-                "flyingfish-gguf-{}-{}.gguf",
+                "flyingfish-gguf-reader-{}-{}.gguf",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
