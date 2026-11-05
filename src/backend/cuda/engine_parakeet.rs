@@ -1,0 +1,799 @@
+//! Native-F32 Parakeet FastConformer encoder.
+use crate::{
+    backend::{
+        cuda::{Device, cubin},
+        gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg},
+    },
+    checkpoint::MappedCheckpoint,
+    parakeet::ParakeetSpec,
+};
+use anyhow::{Context, Result, ensure};
+use cudarc::cublas::{CudaBlas, sys as cublas_sys};
+use std::{path::Path, sync::Arc};
+
+struct Linear {
+    weight: CudaSlice<f32>,
+    bias: Option<CudaSlice<f32>>,
+    output: u32,
+    input: u32,
+}
+
+struct Norm {
+    weight: CudaSlice<f32>,
+    bias: CudaSlice<f32>,
+}
+
+struct FeedForward {
+    norm: Norm,
+    up: Linear,
+    down: Linear,
+}
+
+struct Attention {
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
+    relative: Linear,
+    bias_u: CudaSlice<f32>,
+    bias_v: CudaSlice<f32>,
+}
+
+struct Convolution {
+    norm: Norm,
+    pointwise1: Linear,
+    depthwise: CudaSlice<f32>,
+    batch_weight: CudaSlice<f32>,
+    batch_bias: CudaSlice<f32>,
+    running_mean: CudaSlice<f32>,
+    running_var: CudaSlice<f32>,
+    pointwise2: Linear,
+}
+
+struct Block {
+    ff1: FeedForward,
+    ff2: FeedForward,
+    attention: Attention,
+    convolution: Convolution,
+    attention_norm: Norm,
+    output_norm: Norm,
+}
+
+struct HostConvSpec {
+    time: usize,
+    frequency: usize,
+    in_channels: usize,
+    out_channels: usize,
+    groups: usize,
+    valid_time: usize,
+}
+
+struct HostConv {
+    weight: Vec<f32>,
+    bias: Vec<f32>,
+}
+
+struct HostLinear {
+    weight: Vec<f32>,
+    bias: Vec<f32>,
+    output: usize,
+    input: usize,
+}
+
+struct HostSubsample {
+    conv: [HostConv; 3],
+    pointwise: [HostLinear; 2],
+}
+
+struct Ops {
+    depthwise: CudaFunction,
+    batch_norm: CudaFunction,
+    residual: CudaFunction,
+    relative_attention: CudaFunction,
+    activation: CudaFunction,
+    bias: CudaFunction,
+    layer_norm: CudaFunction,
+}
+
+pub struct ParakeetEncoder {
+    spec: ParakeetSpec,
+    stream: Arc<CudaStream>,
+    host_subsample: HostSubsample,
+    subsample_linear: Linear,
+    blas: CudaBlas,
+    blocks: Vec<Block>,
+    ops: Ops,
+}
+
+struct SubsampleOutput {
+    hidden: CudaSlice<f32>,
+    mask: Vec<u8>,
+    valid: usize,
+}
+
+fn tensor(
+    checkpoint: &MappedCheckpoint,
+    stream: &Arc<CudaStream>,
+    name: &str,
+    shape: &[usize],
+) -> Result<CudaSlice<f32>> {
+    let values = checkpoint.f32_tensor(name, shape)?;
+    ensure!(
+        values.iter().all(|value| value.is_finite()),
+        "non-finite published tensor {name}"
+    );
+    Ok(stream.clone_htod(&values)?)
+}
+
+fn linear(
+    checkpoint: &MappedCheckpoint,
+    stream: &Arc<CudaStream>,
+    name: &str,
+    output: u32,
+    input: u32,
+    bias: bool,
+) -> Result<Linear> {
+    linear_shaped(
+        checkpoint,
+        stream,
+        name,
+        output,
+        input,
+        bias,
+        &[output as usize, input as usize],
+    )
+}
+
+fn linear_shaped(
+    checkpoint: &MappedCheckpoint,
+    stream: &Arc<CudaStream>,
+    name: &str,
+    output: u32,
+    input: u32,
+    bias: bool,
+    stored_shape: &[usize],
+) -> Result<Linear> {
+    Ok(Linear {
+        weight: tensor(checkpoint, stream, &format!("{name}.weight"), stored_shape)?,
+        bias: if bias {
+            Some(tensor(
+                checkpoint,
+                stream,
+                &format!("{name}.bias"),
+                &[output as usize],
+            )?)
+        } else {
+            None
+        },
+        output,
+        input,
+    })
+}
+
+fn norm(checkpoint: &MappedCheckpoint, stream: &Arc<CudaStream>, prefix: &str) -> Result<Norm> {
+    Ok(Norm {
+        weight: tensor(checkpoint, stream, &format!("{prefix}.weight"), &[1024])?,
+        bias: tensor(checkpoint, stream, &format!("{prefix}.bias"), &[1024])?,
+    })
+}
+
+fn flat(count: usize) -> LaunchConfig {
+    super::ops::flat(count)
+}
+
+fn relative_positions(rows: usize, hidden: usize) -> Result<Vec<f32>> {
+    ensure!(
+        rows > 0 && hidden >= 2 && hidden.is_multiple_of(2),
+        "relative position shape"
+    );
+    let inverse: Vec<f32> = (0..hidden / 2)
+        .map(|index| 1.0f32 / 10000f32.powf((2 * index) as f32 / hidden as f32))
+        .collect();
+    let mut positions = Vec::with_capacity((2 * rows - 1) * hidden);
+    for row in 0..2 * rows - 1 {
+        let position = (rows as isize - 1 - row as isize) as f32;
+        for &frequency in &inverse {
+            let phase = position * frequency;
+            positions.push(phase.sin());
+            positions.push(phase.cos());
+        }
+    }
+    Ok(positions)
+}
+
+fn host_linear(
+    checkpoint: &MappedCheckpoint,
+    name: &str,
+    output: usize,
+    input: usize,
+    stored_shape: &[usize],
+) -> Result<HostLinear> {
+    Ok(HostLinear {
+        weight: checkpoint.f32_tensor(&format!("{name}.weight"), stored_shape)?,
+        bias: checkpoint.f32_tensor(&format!("{name}.bias"), &[output])?,
+        output,
+        input,
+    })
+}
+
+impl ParakeetEncoder {
+    pub fn load(directory: &Path, device: &Device) -> Result<Self> {
+        let spec = ParakeetSpec::read(directory)?;
+        let checkpoint = MappedCheckpoint::open(directory)?;
+        let stream = Arc::clone(&device.stream);
+        let blas = CudaBlas::new(Arc::clone(&stream))?;
+        unsafe {
+            cublas_sys::cublasSetMathMode(
+                *blas.handle(),
+                cublas_sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+            )
+            .result()?;
+        }
+        let speech = cubin::module(&device.ctx, "speech_ops")?;
+        let vision = cubin::module(&device.ctx, "vision_ops")?;
+        let common = cubin::module(&device.ctx, "q38_common")?;
+        let ops = Ops {
+            depthwise: speech.load_function("speech_depthwise_conv_f32")?,
+            batch_norm: speech.load_function("speech_batch_norm_f32")?,
+            residual: speech.load_function("speech_residual_f32")?,
+            relative_attention: speech.load_function("speech_relative_attention_f32")?,
+            activation: vision.load_function("activation_f32")?,
+            bias: vision.load_function("vision_bias_f32")?,
+            layer_norm: common.load_function("q38_layer_norm_f32")?,
+        };
+        let mut subsample_conv = Vec::new();
+        for index in [0, 2, 5] {
+            subsample_conv.push(HostConv {
+                weight: checkpoint.f32_tensor(
+                    &format!("encoder.subsampling.layers.{index}.weight"),
+                    &[256, 1, 3, 3],
+                )?,
+                bias: checkpoint
+                    .f32_tensor(&format!("encoder.subsampling.layers.{index}.bias"), &[256])?,
+            });
+        }
+        let mut subsample_pointwise = Vec::new();
+        for index in [3, 6] {
+            subsample_pointwise.push(host_linear(
+                &checkpoint,
+                &format!("encoder.subsampling.layers.{index}"),
+                256,
+                256,
+                &[256, 256, 1, 1],
+            )?);
+        }
+        let subsample_linear = linear(
+            &checkpoint,
+            &stream,
+            "encoder.subsampling.linear",
+            1024,
+            4096,
+            true,
+        )?;
+        let host_subsample = HostSubsample {
+            conv: subsample_conv
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("subsample convolution count"))?,
+            pointwise: subsample_pointwise
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("subsample pointwise count"))?,
+        };
+        let mut blocks = Vec::new();
+        for index in 0..spec.layers {
+            let prefix = format!("encoder.layers.{index}");
+            let feed_forward = |branch: &str| -> Result<FeedForward> {
+                Ok(FeedForward {
+                    norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_{branch}"))?,
+                    up: linear(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.{branch}.linear1"),
+                        4096,
+                        1024,
+                        false,
+                    )?,
+                    down: linear(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.{branch}.linear2"),
+                        1024,
+                        4096,
+                        false,
+                    )?,
+                })
+            };
+            let attention = |name: &str| -> Result<Linear> {
+                linear(
+                    &checkpoint,
+                    &stream,
+                    &format!("{prefix}.self_attn.{name}"),
+                    1024,
+                    1024,
+                    false,
+                )
+            };
+            blocks.push(Block {
+                ff1: feed_forward("feed_forward1")?,
+                ff2: feed_forward("feed_forward2")?,
+                attention: Attention {
+                    q: attention("q_proj")?,
+                    k: attention("k_proj")?,
+                    v: attention("v_proj")?,
+                    o: attention("o_proj")?,
+                    relative: attention("relative_k_proj")?,
+                    bias_u: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.self_attn.bias_u"),
+                        &[8, 128],
+                    )?,
+                    bias_v: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.self_attn.bias_v"),
+                        &[8, 128],
+                    )?,
+                },
+                convolution: Convolution {
+                    norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_conv"))?,
+                    pointwise1: linear_shaped(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.conv.pointwise_conv1"),
+                        2048,
+                        1024,
+                        false,
+                        &[2048, 1024, 1],
+                    )?,
+                    depthwise: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.conv.depthwise_conv.weight"),
+                        &[1024, 1, 9],
+                    )?,
+                    batch_weight: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.conv.norm.weight"),
+                        &[1024],
+                    )?,
+                    batch_bias: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.conv.norm.bias"),
+                        &[1024],
+                    )?,
+                    running_mean: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.conv.norm.running_mean"),
+                        &[1024],
+                    )?,
+                    running_var: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.conv.norm.running_var"),
+                        &[1024],
+                    )?,
+                    pointwise2: linear_shaped(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.conv.pointwise_conv2"),
+                        1024,
+                        1024,
+                        false,
+                        &[1024, 1024, 1],
+                    )?,
+                },
+                attention_norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_self_att"))?,
+                output_norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_out"))?,
+            });
+        }
+        stream.synchronize()?;
+        Ok(Self {
+            spec,
+            stream,
+            host_subsample,
+            subsample_linear,
+            blas,
+            blocks,
+            ops,
+        })
+    }
+
+    fn linear(&self, input: &CudaSlice<f32>, rows: u32, weight: &Linear) -> Result<CudaSlice<f32>> {
+        ensure!(rows > 0, "linear requires rows");
+        let output = self
+            .stream
+            .alloc_zeros(rows as usize * weight.output as usize)?;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        unsafe {
+            cublas_sys::cublasGemmEx(
+                *self.blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                weight.output as i32,
+                rows as i32,
+                weight.input as i32,
+                (&alpha as *const f32).cast(),
+                weight.weight.device_ptr(&self.stream).0 as *const core::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_32F,
+                weight.input as i32,
+                input.device_ptr(&self.stream).0 as *const core::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_32F,
+                weight.input as i32,
+                (&beta as *const f32).cast(),
+                output.device_ptr(&self.stream).0 as *mut core::ffi::c_void,
+                cublas_sys::cudaDataType_t::CUDA_R_32F,
+                weight.output as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        if let Some(bias) = &weight.bias {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.ops.bias)
+                    .arg(&output)
+                    .arg(bias)
+                    .arg(&output)
+                    .arg(&rows)
+                    .arg(&weight.output)
+                    .launch(flat(output.len()))?;
+            }
+        }
+        Ok(output)
+    }
+
+    fn activate(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        width: u32,
+        mode: i32,
+    ) -> Result<CudaSlice<f32>> {
+        let expected = rows as usize * width as usize * if mode == 2 { 2 } else { 1 };
+        ensure!(
+            input.len() == expected,
+            "activation shape mismatch: rows={rows} width={width} mode={mode} input={} expected={expected}",
+            input.len()
+        );
+        let output = self.stream.alloc_zeros(if mode == 2 {
+            input.len() / 2
+        } else {
+            input.len()
+        })?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.activation)
+                .arg(input)
+                .arg(&output)
+                .arg(&rows)
+                .arg(&width)
+                .arg(&mode)
+                .launch(flat(input.len()))?;
+        }
+        Ok(output)
+    }
+
+    fn normalize(&self, input: &CudaSlice<f32>, rows: u32, norm: &Norm) -> Result<CudaSlice<f32>> {
+        let output = self.stream.alloc_zeros(input.len())?;
+        let width = self.spec.hidden;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.layer_norm)
+                .arg(input)
+                .arg(&norm.weight)
+                .arg(&norm.bias)
+                .arg(&output)
+                .arg(&rows)
+                .arg(&1u32)
+                .arg(&width)
+                .arg(&u64::from(width))
+                .arg(&u64::from(width))
+                .arg(&1u64)
+                .arg(&u64::from(width))
+                .arg(&u64::from(width))
+                .arg(&1u64)
+                .arg(&1e-5f32)
+                .launch(super::ops::grid(rows as usize, 256))?;
+        }
+        Ok(output)
+    }
+
+    fn residual(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        delta: &CudaSlice<f32>,
+        scale: f32,
+    ) -> Result<()> {
+        let count = hidden.len() as u64;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.residual)
+                .arg(&*hidden)
+                .arg(delta)
+                .arg(&*hidden)
+                .arg(&count)
+                .arg(&scale)
+                .launch(flat(hidden.len()))?;
+        }
+        Ok(())
+    }
+
+    fn host_conv2d(input: &[f32], spec: HostConvSpec, conv: &HostConv) -> Vec<f32> {
+        let HostConvSpec {
+            time,
+            frequency,
+            in_channels,
+            out_channels,
+            groups,
+            valid_time,
+        } = spec;
+        let out_time = (time + 2 - 3) / 2 + 1;
+        let out_frequency = (frequency + 2 - 3) / 2 + 1;
+        let group_width = in_channels / groups;
+        let group_count = out_channels / groups;
+        let mut output = vec![0.0; out_time * out_frequency * out_channels];
+        for ot in 0..out_time {
+            for of in 0..out_frequency {
+                for channel in 0..out_channels {
+                    let mut sum = 0.0f32;
+                    if ot < valid_time {
+                        let first = channel / group_count * group_width;
+                        for ic in 0..group_width {
+                            for ky in 0..3 {
+                                for kx in 0..3 {
+                                    let it = ot * 2 + ky;
+                                    let iff = of * 2 + kx;
+                                    if it >= 1 && it <= time && iff >= 1 && iff <= frequency {
+                                        let source = (it - 1) * frequency + iff - 1;
+                                        let tap = ((channel * group_width + ic) * 3 + ky) * 3 + kx;
+                                        sum += input[source * in_channels + first + ic]
+                                            * conv.weight[tap];
+                                    }
+                                }
+                            }
+                        }
+                        sum += conv.bias[channel];
+                    }
+                    output[(ot * out_frequency + of) * out_channels + channel] = sum;
+                }
+            }
+        }
+        output
+    }
+
+    fn host_linear(input: &[f32], linear: &HostLinear) -> Vec<f32> {
+        let rows = input.len() / linear.input;
+        let mut output = vec![0.0; rows * linear.output];
+        for row in 0..rows {
+            for column in 0..linear.output {
+                let mut sum = linear.bias[column];
+                for inner in 0..linear.input {
+                    sum += input[row * linear.input + inner]
+                        * linear.weight[column * linear.input + inner];
+                }
+                output[row * linear.output + column] = sum;
+            }
+        }
+        output
+    }
+
+    fn subsample_device(&self, input: &[f32], valid: usize) -> Result<SubsampleOutput> {
+        ensure!(
+            valid > 0
+                && valid * 128 <= input.len()
+                && input.len().is_multiple_of(128)
+                && input.iter().all(|value| value.is_finite()),
+            "invalid mel extent or non-finite input"
+        );
+        let mut hidden = input.to_vec();
+        let mut time = hidden.len() / 128;
+        let mut frequency = 128usize;
+        let mut current_valid = valid;
+        for (index, conv) in self.host_subsample.conv.iter().enumerate() {
+            let next_time = time.div_ceil(2);
+            let next_frequency = frequency / 2;
+            let next_valid = current_valid.div_ceil(2);
+            let groups = if index == 0 { 1 } else { 256 };
+            let in_channels = if index == 0 { 1 } else { 256 };
+            hidden = Self::host_conv2d(
+                &hidden,
+                HostConvSpec {
+                    time,
+                    frequency,
+                    in_channels,
+                    out_channels: 256,
+                    groups,
+                    valid_time: next_valid,
+                },
+                conv,
+            );
+            time = next_time;
+            frequency = next_frequency;
+            current_valid = next_valid;
+            if index > 0 {
+                hidden = Self::host_linear(&hidden, &self.host_subsample.pointwise[index - 1]);
+                hidden[current_valid * frequency * 256..].fill(0.0);
+            }
+            for value in &mut hidden {
+                *value = value.max(0.0);
+            }
+        }
+        let mut packed = vec![0.0; hidden.len()];
+        for t in 0..time {
+            for f in 0..frequency {
+                for channel in 0..256 {
+                    packed[(t * 256 + channel) * frequency + f] =
+                        hidden[(t * frequency + f) * 256 + channel];
+                }
+            }
+        }
+        let packed = self.stream.clone_htod(&packed)?;
+        let hidden = self.linear(&packed, time as u32, &self.subsample_linear)?;
+        let mask = (0..time)
+            .map(|index| u8::from(index < current_valid))
+            .collect();
+        Ok(SubsampleOutput {
+            hidden,
+            mask,
+            valid: current_valid,
+        })
+    }
+
+    /// Input is `[frames,128]`; output is `[ceil(frames/8),1024]` plus the output mask.
+    pub fn subsample(&self, input: &[f32], valid: usize) -> Result<(Vec<f32>, Vec<u8>)> {
+        let output = self.subsample_device(input, valid)?;
+        Ok((self.stream.clone_dtoh(&output.hidden)?, output.mask))
+    }
+
+    fn positions(&self, rows: usize) -> Result<Vec<f32>> {
+        relative_positions(rows, self.spec.hidden as usize)
+    }
+
+    fn layer_device(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        mask: &[u8],
+        positions: &CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>> {
+        let block = self
+            .blocks
+            .get(index)
+            .context("encoder layer outside range")?;
+        let rows = u32::try_from(mask.len())?;
+        ensure!(
+            rows > 0
+                && input.len() == rows as usize * self.spec.hidden as usize
+                && mask.iter().all(|value| *value <= 1)
+                && positions.len() == (2 * rows - 1) as usize * self.spec.hidden as usize,
+            "encoder layer input, mask or position shape mismatch"
+        );
+        let mask = self.stream.clone_htod(mask)?;
+        let feed_forward =
+            |hidden: &mut CudaSlice<f32>, ff: &FeedForward, scale: f32| -> Result<()> {
+                let normalized = self.normalize(hidden, rows, &ff.norm)?;
+                let expanded = self.linear(&normalized, rows, &ff.up)?;
+                let activated = self.activate(&expanded, rows, 4096, 1)?;
+                let delta = self.linear(&activated, rows, &ff.down)?;
+                self.residual(hidden, &delta, scale)
+            };
+        let mut hidden = input.try_clone()?;
+        feed_forward(&mut hidden, &block.ff1, 0.5)?;
+        let normalized = self.normalize(&hidden, rows, &block.attention_norm)?;
+        let q = self.linear(&normalized, rows, &block.attention.q)?;
+        let k = self.linear(&normalized, rows, &block.attention.k)?;
+        let v = self.linear(&normalized, rows, &block.attention.v)?;
+        let relative = self.linear(positions, 2 * rows - 1, &block.attention.relative)?;
+        let core = self.stream.alloc_zeros(hidden.len())?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.relative_attention)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&relative)
+                .arg(&block.attention.bias_u)
+                .arg(&block.attention.bias_v)
+                .arg(&mask)
+                .arg(&core)
+                .arg(&rows)
+                .arg(&self.spec.heads)
+                .arg(&(1.0f32 / 128f32.sqrt()))
+                .launch(LaunchConfig {
+                    grid_dim: (rows, self.spec.heads, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: (8 + rows) * 4,
+                })?;
+        }
+        let delta = self.linear(&core, rows, &block.attention.o)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        let normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
+        let expanded = self.linear(&normalized, rows, &block.convolution.pointwise1)?;
+        let activated = self.activate(&expanded, rows, self.spec.hidden, 2)?;
+        let convolved: CudaSlice<f32> = self.stream.alloc_zeros(hidden.len())?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.depthwise)
+                .arg(&activated)
+                .arg(&block.convolution.depthwise)
+                .arg(&mask)
+                .arg(&convolved)
+                .arg(&rows)
+                .arg(&self.spec.hidden)
+                .arg(&self.spec.conv_kernel)
+                .launch(flat(convolved.len()))?;
+        }
+        let normalized: CudaSlice<f32> = self.stream.alloc_zeros(hidden.len())?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.batch_norm)
+                .arg(&convolved)
+                .arg(&block.convolution.batch_weight)
+                .arg(&block.convolution.batch_bias)
+                .arg(&block.convolution.running_mean)
+                .arg(&block.convolution.running_var)
+                .arg(&normalized)
+                .arg(&rows)
+                .arg(&self.spec.hidden)
+                .arg(&1e-5f32)
+                .launch(flat(normalized.len()))?;
+        }
+        let activated = self.activate(&normalized, rows, self.spec.hidden, 1)?;
+        let delta = self.linear(&activated, rows, &block.convolution.pointwise2)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        feed_forward(&mut hidden, &block.ff2, 0.5)?;
+        let output = self.normalize(&hidden, rows, &block.output_norm)?;
+        Ok(output)
+    }
+
+    /// Input and output are `[frames,1024]` in native F32.
+    pub fn layer(&self, index: usize, input: &[f32], mask: &[u8]) -> Result<Vec<f32>> {
+        let positions = self.stream.clone_htod(&self.positions(mask.len())?)?;
+        let input = self.stream.clone_htod(input)?;
+        let output = self.layer_device(index, &input, mask, &positions)?;
+        Ok(self.stream.clone_dtoh(&output)?)
+    }
+
+    /// Input is `[frames,128]`; output is `[ceil(frames/8),1024]`, its mask and valid row count.
+    pub fn encode(&self, input: &[f32], valid: usize) -> Result<(Vec<f32>, Vec<u8>, usize)> {
+        let subsampled = self.subsample_device(input, valid)?;
+        let positions = self
+            .stream
+            .clone_htod(&self.positions(subsampled.mask.len())?)?;
+        let mut hidden = subsampled.hidden;
+        for index in 0..self.blocks.len() {
+            hidden = self.layer_device(index, &hidden, &subsampled.mask, &positions)?;
+        }
+        Ok((
+            self.stream.clone_dtoh(&hidden)?,
+            subsampled.mask,
+            subsampled.valid,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    #[test]
+    fn relative_positions_are_signed_and_interleaved() -> Result<()> {
+        let table = relative_positions(3, 4)?;
+        assert_eq!(table.len(), 5 * 4);
+        for (row, expected) in [2.0f32, 1.0, 0.0, -1.0, -2.0].into_iter().enumerate() {
+            let first = row * 4;
+            assert!((table[first] - expected.sin()).abs() < 1e-6);
+            assert!((table[first + 1] - expected.cos()).abs() < 1e-6);
+            let frequency = 10000f32.powf(-0.5);
+            assert!((table[first + 2] - (expected * frequency).sin()).abs() < 1e-6);
+            assert!((table[first + 3] - (expected * frequency).cos()).abs() < 1e-6);
+        }
+        assert!(relative_positions(0, 4).is_err());
+        Ok(())
+    }
+}
