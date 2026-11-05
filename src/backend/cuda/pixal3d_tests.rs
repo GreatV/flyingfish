@@ -2891,6 +2891,111 @@ fn pixal3d_surface_freeze_cpu() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA, published checkpoints and frozen decoder captures"]
+fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
+    let root = env_path("FF_PIXAL_REFERENCE")?;
+    let model = env_path("FF_PIXAL_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let base = root.join("evidence/P1-M4-freeze-r1/core-single-1024-cottage-r0a-r2");
+    let input = base.join("shape_slat-0-outputs.safetensors");
+    let coordinates = decoder_coordinates(&input, "samples.coords")?;
+    let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
+    let norm = &config["args"]["shape_slat_normalization"];
+    let channels = |key: &str| -> Result<Vec<f32>> {
+        norm[key]
+            .as_array()
+            .context("shape normalization array missing")?
+            .iter()
+            .map(|x| Ok(x.as_f64().context("shape normalization value missing")? as f32))
+            .collect()
+    };
+    let mean = channels("mean")?;
+    let std = channels("std")?;
+    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
+    let d = &decoder.device;
+    let mut latent = d
+        .stream
+        .clone_htod(&f32_tensor(&input, "samples.features")?)?;
+    denormalize_shape(d, &mut latent, &mean, &std, mean.len())?;
+    let physical = d.stream.clone_dtoh(&latent)?;
+    drop(latent);
+    let mut guide_coords = Vec::new();
+    let mut guide_logits = Vec::new();
+    let mut paths = Vec::new();
+    for (level, block) in [4, 16, 8, 4].into_iter().enumerate() {
+        let path = base.join(format!(
+            "shape_slat_decoder.blocks.{level}.{block}-call0-topology.safetensors"
+        ));
+        guide_coords.push(decoder_coordinates(&path, "subdivision.coords")?);
+        guide_logits.push(f32_tensor(&path, "subdivision.features")?);
+        paths.push(path);
+    }
+    let guides: Vec<_> = guide_coords
+        .iter()
+        .zip(&guide_logits)
+        .map(|(coordinates, logits)| SubdivisionGuide {
+            coordinates,
+            logits,
+        })
+        .collect();
+    let mut baseline_logits = Vec::new();
+    let mut baseline_parents = Vec::new();
+    for forced_prefix in [0, 2, 4] {
+        println!("P1_M4A_TOPOLOGY_ISOLATION_BEGIN forced_prefix={forced_prefix} gating=false");
+        let mut gate = DecoderGate::surface(false)?;
+        gate.package = "P1_M4A_TOPOLOGY_ISOLATION";
+        let (sites, features) = decoder.sparse_decode(
+            coordinates.clone(),
+            &physical,
+            &guides[..forced_prefix],
+            |[level, _, _], (parents, logits), (next, _)| {
+                if level < 2 {
+                    if forced_prefix == 0 {
+                        baseline_logits.push(logits.to_vec());
+                        baseline_parents.push(parents.coordinates().to_vec());
+                    } else {
+                        ensure!(
+                            logits == baseline_logits[level]
+                                && parents.coordinates() == baseline_parents[level],
+                            "topology intervention changed an upstream input or logit"
+                        );
+                    }
+                }
+                let reference_children = decoder_coordinates(&paths[level], "child_coords")?;
+                if level == 0 || level < forced_prefix {
+                    ensure!(
+                        next.coordinates() == reference_children,
+                        "recorded topology intervention differs from reference"
+                    );
+                }
+                println!(
+                    "P1_M4A_TOPOLOGY_ISOLATION_STAGE forced_prefix={forced_prefix} level={level} parents={} children={} reference_children={} gating=false",
+                    parents.coordinates().len(), next.coordinates().len(), reference_children.len()
+                );
+                surface_stable(&mut gate, "cottage1024", "LR", level, parents, logits)?;
+                surface_divergence(["cottage1024", "LR"], level, parents, logits, &paths[level])?;
+                let point = [0, 38, 27, 60];
+                if level == 2 {
+                    println!(
+                        "P1_M4A_TOPOLOGY_ISOLATION_POINT {}",
+                        serde_json::json!({"forced_prefix":forced_prefix,"parent":point,"bit":6,"logit":parents.row(point).map(|row| logits[row as usize * 8 + 6]),"gating":false})
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        drop(features);
+        println!(
+            "P1_M4A_TOPOLOGY_ISOLATION_END forced_prefix={forced_prefix} scored_cells={} mismatching_cells={} final_rows={} gating=false",
+            gate.seen.len(),
+            gate.defects,
+            sites.coordinates().len()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, published checkpoints and frozen decoder captures"]
 fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
     let mut g = DecoderGate::surface(false)?;
     let root = env_path("FF_PIXAL_REFERENCE")?;

@@ -1828,8 +1828,8 @@ impl PixalDecoder {
             "shape decoder required"
         );
         ensure!(
-            guides.is_empty() || guides.len() == 4,
-            "expected generated subdivision or four recorded guides"
+            guides.len() <= 4,
+            "expected at most four recorded subdivision guides"
         );
         let mut sites = SparseSites::new(coordinates)?;
         let n = sites.coordinates().len();
