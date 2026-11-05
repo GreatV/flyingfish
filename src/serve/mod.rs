@@ -627,4 +627,66 @@ mod tests {
         );
         Ok(())
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "loads official GLM-5.3-Flash; set FF_GLM_MODEL and FLYINGFISH_RUNTIME_DIR"]
+    fn glm_plain_serving_decodes_past_the_first_token() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model_dir =
+            PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let settings = crate::backend::Settings {
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            device_budget_gib: None,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: Some(runtime),
+        };
+        let options = SpecOptions {
+            device: 0,
+            capacity: 64,
+            chunk: None,
+            backend: settings.clone(),
+            count: 4,
+            ignore_eos: true,
+        };
+        let mut model = Model::load(&model_dir, 0, 64, None, settings)?;
+        ensure!(
+            model.graph_decode() == cfg!(feature = "cuda"),
+            "GLM-5.3 graph capability differs from backend binding"
+        );
+        let prompt = [785, 10567, 1087];
+        let mut eager_ids = Vec::with_capacity(4);
+        model.reset()?;
+        let first = model.prefill(&prompt, None)?;
+        eager_ids.push(first);
+        for _ in 0..3 {
+            let next = model.decode(false, None)?;
+            eager_ids.push(next);
+        }
+        ensure!(eager_ids.len() == 4, "expected 4 eager greedy tokens");
+        for request in 0..2 {
+            let output = produce_plain_events(&mut model, &prompt, None, &options, &mut |_| true)?;
+            ensure!(
+                output.ids == eager_ids,
+                "request {request} serving ids {:?} differ from eager greedy ids {:?}",
+                output.ids,
+                eager_ids
+            );
+        }
+        println!(
+            "PASS glm_plain_serving requests=2 tokens=4 graph_decode={} ids_match_eager=true",
+            model.graph_decode()
+        );
+        Ok(())
+    }
 }
