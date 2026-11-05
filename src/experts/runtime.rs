@@ -1507,6 +1507,39 @@ mod tests {
         assert!(residency.finish_token()?.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn fully_host_backed_pool_only_plan_loads_residency() -> Result<()> {
+        let geometry = three_layers();
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
+        let (capacity, admission) =
+            crate::experts::plan::staging_capacity(geometry, layout, 1, 2 * slot, 40 * slot, 2)?;
+        assert_eq!(capacity.slots_per_layer, vec![0, 0, 0]);
+        assert_eq!(capacity.prefill_staging_slots, 2);
+        assert_eq!(capacity.host_blocks, 24);
+        assert_eq!(capacity.spare_blocks, 0);
+        let host = HostBlocks::new(
+            capacity.host_blocks + capacity.spare_blocks,
+            usize::try_from(slot / 2)?,
+        )?;
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = vec![vec![1.0; 8]; 3];
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
+        let (residency, _) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: Some(&host),
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        assert_eq!(residency.ledger().tier(0, 0)?, Tier::Host);
+        Ok(())
+    }
     #[test]
     fn synchronous_host_swap_recycles_source_after_copy() -> Result<()> {
         let mut state = build(4, 1)?;

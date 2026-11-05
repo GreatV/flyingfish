@@ -573,14 +573,18 @@ fn native_staging_capacity(
         (0, 0)
     } else {
         let blocks = host_expert_bytes / slot;
-        ensure!(
-            blocks > u64::from(live),
-            "native host budget cannot hold {live} live swaps and a host expert"
-        );
-        (
-            u32::try_from((blocks - u64::from(live)).min(non_gpu))?,
-            live,
-        )
+        if slots == 0 && blocks >= total {
+            (u32::try_from(total)?, 0)
+        } else {
+            ensure!(
+                blocks > u64::from(live),
+                "native host budget cannot hold {live} live swaps and a host expert"
+            );
+            (
+                u32::try_from((blocks - u64::from(live)).min(non_gpu))?,
+                live,
+            )
+        }
     };
     let disk_bytes = (non_gpu - u64::from(host_blocks))
         .checked_mul(slot)
