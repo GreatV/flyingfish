@@ -2316,11 +2316,7 @@ fn surface_fixed(
             )?;
             let key = id(table, &format!("shape-subdivision{stage}"), None);
             g.score_f32(key.clone(), &[sub.len() / 8, 8], sub)?;
-            let source = &g.cells[&key]["sources"]["r0a"];
-            let anchor = tensor(
-                Path::new(source["path"].as_str().context("sign anchor missing")?),
-                source["key"].as_str().context("sign tensor missing")?,
-            )?;
+            let anchor = g.anchor(&key)?;
             surface_signs(g, case, &format!("subdivision{stage}"), sub, &anchor.values)?;
             println!(
                 "P1_M4A_FIXED_PROGRESS case={case} stage={stage} rows={}",
@@ -2341,11 +2337,7 @@ fn surface_fixed(
     );
     let key = id(table, "shape-fields", None);
     g.score_f32(key.clone(), &[sites.coordinates().len(), 7], &fields)?;
-    let source = &g.cells[&key]["sources"]["r0a"];
-    let anchor = tensor(
-        Path::new(source["path"].as_str().context("edge anchor missing")?),
-        source["key"].as_str().context("edge key missing")?,
-    )?;
+    let anchor = g.anchor(&key)?;
     let reference: Vec<_> = anchor
         .values
         .as_chunks::<7>()
@@ -2431,9 +2423,16 @@ fn surface_stable(
         for bit in 0..8 {
             if selected.values[i * 8 + bit] != 0.0 {
                 tested += 1;
-                mismatches += usize::from(row.is_none_or(|row| {
+                let mismatch = row.is_none_or(|row| {
                     (logits[row as usize * 8 + bit] > 0.0) != (signs.values[i * 8 + bit] != 0.0)
-                }));
+                });
+                if mismatch && mismatches < 4 {
+                    println!(
+                        "P1_M4A_STABLE_DETAIL {}",
+                        serde_json::json!({"case":case,"phase":phase,"level":level,"parent":point,"bit":bit,"candidate":row.map(|r| logits[r as usize * 8 + bit]),"expected_positive":signs.values[i * 8 + bit] != 0.0})
+                    );
+                }
+                mismatches += usize::from(mismatch);
             }
         }
     }
@@ -2479,6 +2478,49 @@ fn surface_own(
         row.max(children.coordinates().len()),
         mismatches,
     )
+}
+
+fn surface_divergence(
+    label: [&str; 2],
+    level: usize,
+    parents: &SparseSites,
+    logits: &[f32],
+    path: &Path,
+) -> Result<()> {
+    let [case, phase] = label;
+    let coordinates = decoder_coordinates(path, "subdivision.coords")?;
+    let reference = f32_tensor(path, "subdivision.features")?;
+    ensure!(
+        reference.len() == coordinates.len() * 8,
+        "reference subdivision extent mismatch"
+    );
+    let mut flips = 0;
+    let mut missing = 0;
+    let mut maximum = 0.0f32;
+    for (point, values) in coordinates.iter().zip(reference.as_chunks::<8>().0) {
+        let Some(row) = parents.row(*point) else {
+            missing += 1;
+            continue;
+        };
+        for (bit, &expected) in values.iter().enumerate() {
+            let actual = logits[row as usize * 8 + bit];
+            maximum = maximum.max((actual - expected).abs());
+            if (actual > 0.0) != (expected > 0.0) {
+                if flips < 4 {
+                    println!(
+                        "P1_M4A_BRANCH_DETAIL {}",
+                        serde_json::json!({"case":case,"phase":phase,"level":level,"parent":point,"bit":bit,"candidate":actual,"r0a":expected,"gating":false})
+                    );
+                }
+                flips += 1;
+            }
+        }
+    }
+    println!(
+        "P1_M4A_BRANCH_MEASUREMENT {}",
+        serde_json::json!({"case":case,"phase":phase,"level":level,"r0a_parents":coordinates.len(),"missing_parents":missing,"common_parent_max_abs":maximum,"sign_flips":flips,"gating":false})
+    );
+    Ok(())
 }
 
 fn surface_generated(
@@ -2530,6 +2572,7 @@ fn surface_generated(
             surface_stable(g, case, phase, level, parents, logits)?;
             surface_own(g, core, phase, level, parents, logits, next)?;
             let reference = base.join(format!("shape_slat_decoder.blocks.{level}.{}-call{call}-topology.safetensors", [4,16,8,4][level]));
+            surface_divergence([case, phase], level, parents, logits, &reference)?;
             let reference = decoder_coordinates(&reference, "child_coords")?;
             let common = reference.iter().filter(|&&p| next.row(p).is_some()).count();
             let union = reference.len() + next.coordinates().len() - common;
@@ -2749,6 +2792,44 @@ fn surface_mesh(g: &mut DecoderGate, root: &Path) -> Result<()> {
     Ok(())
 }
 
+const SURFACE_CASES: [(&str, &str, &str, &str, u32); 5] = [
+    (
+        "cottage1024",
+        "pipeline-single-1024-cottage-r2",
+        "m4-floors-decoder-fixed-cottage-angular-r1.json",
+        "single-1024-cottage",
+        1024,
+    ),
+    (
+        "crab1024",
+        "pipeline-single-1024-robot_crab-r2",
+        "m4-floors-decoder-fixed-robot_crab-angular-r1.json",
+        "single-1024-robot_crab",
+        1024,
+    ),
+    (
+        "cottage1536",
+        "pipeline-single-1536-cottage-r0a",
+        "floors-decoder-cottage1536-full-m4.json",
+        "single-1536-cottage",
+        1536,
+    ),
+    (
+        "crab1408",
+        "pipeline-single-1536-robot_crab-r0a",
+        "floors-decoder-crab1408-full-m4.json",
+        "single-1536-robot_crab",
+        1536,
+    ),
+    (
+        "mv41024",
+        "pipeline-mv-1024-mv4-r0a",
+        "floors-decoder-mv41024-full-m4.json",
+        "mv-1024-mv4",
+        1024,
+    ),
+];
+
 #[test]
 #[ignore = "requires frozen surface captures; CPU only"]
 fn pixal3d_surface_freeze_cpu() -> Result<()> {
@@ -2770,6 +2851,41 @@ fn pixal3d_surface_freeze_cpu() -> Result<()> {
             }
         }
     }
+    let mut gate = DecoderGate::surface(false)?;
+    for (case, _, table, _, _) in SURFACE_CASES {
+        for level in 0..5 {
+            let name = if level == 4 {
+                "edges".to_owned()
+            } else {
+                format!("subdivision{level}")
+            };
+            let field = if level == 4 {
+                "shape-fields".to_owned()
+            } else {
+                format!("shape-{name}")
+            };
+            let key = id(table, &field, None);
+            let sign_key = id(&format!("m4-decisions-{case}.json"), &name, None);
+            ensure!(
+                gate.cells[&key]["comparison_anchor"] == gate.cells[&sign_key]["comparison_anchor"],
+                "sign and numeric comparison anchors differ"
+            );
+            let anchor = gate.anchor(&key)?;
+            let reference = if level == 4 {
+                anchor
+                    .values
+                    .as_chunks::<7>()
+                    .0
+                    .iter()
+                    .flat_map(|row| row[3..6].iter().copied())
+                    .collect()
+            } else {
+                anchor.values
+            };
+            let candidate: Vec<_> = reference.iter().map(|&v| v as f32).collect();
+            surface_signs(&mut gate, case, &name, &candidate, &reference)?;
+        }
+    }
     Ok(())
 }
 
@@ -2785,43 +2901,7 @@ fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
     surface_normalization(&mut g, &model, &root)?;
     surface_mesh(&mut g, &root)?;
     let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
-    for (case, capture, table, core, requested) in [
-        (
-            "cottage1024",
-            "pipeline-single-1024-cottage-r2",
-            "m4-floors-decoder-fixed-cottage-angular-r1.json",
-            "single-1024-cottage",
-            1024,
-        ),
-        (
-            "crab1024",
-            "pipeline-single-1024-robot_crab-r2",
-            "m4-floors-decoder-fixed-robot_crab-angular-r1.json",
-            "single-1024-robot_crab",
-            1024,
-        ),
-        (
-            "cottage1536",
-            "pipeline-single-1536-cottage-r0a",
-            "floors-decoder-cottage1536-full-m4.json",
-            "single-1536-cottage",
-            1536,
-        ),
-        (
-            "crab1408",
-            "pipeline-single-1536-robot_crab-r0a",
-            "floors-decoder-crab1408-full-m4.json",
-            "single-1536-robot_crab",
-            1536,
-        ),
-        (
-            "mv41024",
-            "pipeline-mv-1024-mv4-r0a",
-            "floors-decoder-mv41024-full-m4.json",
-            "mv-1024-mv4",
-            1024,
-        ),
-    ] {
+    for (case, capture, table, core, requested) in SURFACE_CASES {
         surface_fixed(&mut g, &decoder, &root, (case, capture, table))?;
         surface_generated(&mut g, &decoder, &root, &model, (case, core, requested))?;
     }
