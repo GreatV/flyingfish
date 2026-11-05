@@ -9873,7 +9873,7 @@ mod tests {
         use serde::Deserialize;
         // 2026-10-28 07:03:37 UTC: isolated-layer band = max(3*spread, analytic).
         const TF_POSITIONS: [usize; 9] = [0, 1, 2, 63, 64, 126, 127, 128, 129];
-        // Fixture parameters as recorded by deepseek_reference.py layer0 mode.
+        // Fixture parameters of the recorded layer-0 model-definition run.
         const SEED_POSITIONS: usize = 129;
         const DECODE_POSITIONS: usize = 1;
         const STREAM_COPIES: usize = 4;

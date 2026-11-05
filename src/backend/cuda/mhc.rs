@@ -1704,8 +1704,7 @@ mod tests {
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
     fn mhc_post_comb_matches_definition_reference() -> Result<()> {
-        // 50e35cc0:1335-1337,1346-1348 fixture from
-        // evidence/G1/roundB/B4/hc-boundary-reference.py; the old fused mode
+        // Model-definition fixture (50e35cc0:1335-1337,1346-1348); the old fused mode
         // produced 18706 differing bits against this expression.
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
