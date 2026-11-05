@@ -226,9 +226,9 @@ fn hi3d_flow_components_gpu() -> Result<()> {
     let common = gate.root.join("common.safetensors");
     let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
     let input_path = gate.root.join("component-inputs.safetensors");
-    let runtime = tempfile::tempdir()?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, runtime.path(), &coordinates, 8 << 30)?;
+        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
         for (name, cell) in gate.cells.clone() {
             if !name.starts_with(component) {
                 continue;
@@ -339,9 +339,9 @@ fn hi3d_flow_qk_rope_gpu() -> Result<()> {
     let common = gate.root.join("common.safetensors");
     let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
     let anchor = gate.root.join("qk/anchor.safetensors");
-    let runtime = tempfile::tempdir()?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, runtime.path(), &coordinates, 8 << 30)?;
+        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
         for (name, cell) in gate.cells.clone() {
             if !name.starts_with(component) {
                 continue;
@@ -459,10 +459,9 @@ fn hi3d_flow_blocks_gpu() -> Result<()> {
         .into_iter()
         .map(f16::from_f32)
         .collect();
-    let runtime = tempfile::tempdir()?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let mut flow =
-            Flow::<f16>::open_hi3d(&root, component, runtime.path(), &coordinates, 8 << 30)?;
+        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
         let conditioning = flow.conditioning(&context, &[], &coordinates)?;
         let modulation = flow.device.stream.clone_htod(&modulation)?;
         for index in [0, 12, 23] {
@@ -501,14 +500,8 @@ fn hi3d_flow_pool_inverse_gpu() -> Result<()> {
     let common = gate.root.join("common.safetensors");
     let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
     let root = env_path("FF_HI3D_MODEL")?;
-    let runtime = tempfile::tempdir()?;
-    let flow = Flow::<f16>::open_hi3d(
-        &root,
-        "transformer_512",
-        runtime.path(),
-        &coordinates,
-        8 << 30,
-    )?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let flow = Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
     let io = flow.io.as_ref().context("pool IO missing")?;
     let input: Vec<_> = f32_tensor(&common, "input_blocks.1.updown.features")?
         .into_iter()
@@ -605,9 +598,9 @@ fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
     let common = gate.root.join("common.safetensors");
     let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
     let inputs = gate.root.join("io-inputs.safetensors");
-    let runtime = tempfile::tempdir()?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, runtime.path(), &coordinates, 8 << 30)?;
+        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
         for (name, cell) in gate.cells.clone() {
             let Some(op) = name.strip_prefix(&format!("{component}.")) else {
                 continue;
@@ -778,14 +771,9 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
     let coordinates = lattice(&source, "coordinates")?;
     let noise = f32_tensor(&source, "noise")?;
     let context = f32_tensor(&fixtures.join("common.safetensors"), "context")?;
-    let runtime = tempfile::tempdir()?;
-    let mut flow = Flow::<f16>::open_hi3d(
-        &root,
-        "transformer_512",
-        runtime.path(),
-        &coordinates,
-        8 << 30,
-    )?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let mut flow =
+        Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
     let positive = flow.conditioning(&context, &[], &coordinates)?;
     let negative = flow.conditioning(&vec![0.0; context.len()], &[], &coordinates)?;
     let result = flow.sample_heun(&noise, &positive, &negative)?;
@@ -794,7 +782,7 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
         &fixtures.join("trajectory-repeat.safetensors"),
         "final_latents",
     )?;
-    let candidate = if reference.values.len() == result.len() {
+    let candidate: Vec<f64> = if reference.values.len() == result.len() {
         result.iter().map(|&v| v as f64).collect()
     } else {
         let selected = tensor(&source, "selected_rows")?;

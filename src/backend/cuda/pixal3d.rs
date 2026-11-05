@@ -1605,13 +1605,10 @@ impl Flow<f16> {
             .context("sampler bytes overflow")?;
         let conditioning_bytes = count(&[2, context_rows, spec.cond_channels, 2])?;
         device.workspace_budget(free, budget, sampler_bytes + conditioning_bytes)?;
-        tracing::info!(
-            published_bytes = checkpoint.runtime_bytes,
-            work_bytes,
-            io_bytes,
-            sampler_bytes,
-            conditioning_bytes,
-            "sparse flow placement"
+        #[cfg(test)]
+        println!(
+            "SPARSE_FLOW_PLACEMENT published_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes}",
+            checkpoint.runtime_bytes
         );
         Ok(Self {
             origin: Rc::new(()),
