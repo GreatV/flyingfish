@@ -1973,6 +1973,13 @@ mod resampling_tests {
         );
         let frozen: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        ensure!(
+            frozen["scope"] == "encoder62_preparation37"
+                && frozen["preparation"]
+                    .as_object()
+                    .is_some_and(|v| v.len() == 37),
+            "complete preparation freeze required before candidate"
+        );
         let source_bytes = std::fs::read(root.join("cpu-r2/inputs.safetensors"))?;
         let source = safetensors::SafeTensors::deserialize(&source_bytes)?;
         let anchor_bytes = std::fs::read(root.join("preparation-anchor.safetensors"))?;

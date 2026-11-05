@@ -6998,10 +6998,29 @@ impl Hi3DImageConditioner {
         rgba: &[u8],
         dimensions: [usize; 2],
         orientation: u8,
-        mut tap: Option<&mut VisionEncoderTap<'_>>,
+        tap: Option<&mut VisionEncoderTap<'_>>,
     ) -> Result<&CudaSlice<f32>> {
         self.encoded = false;
         let (rgb, shape) = crate::vision_input::prepare_rgba_white(rgba, dimensions, orientation)?;
+        self.encode_rgb_tapped(blas, &rgb, shape, tap)
+    }
+
+    fn encode_rgb_tapped(
+        &mut self,
+        blas: &Blas,
+        rgb: &[u8],
+        shape: [usize; 2],
+        mut tap: Option<&mut VisionEncoderTap<'_>>,
+    ) -> Result<&CudaSlice<f32>> {
+        self.encoded = false;
+        ensure!(
+            shape.iter().all(|&n| n > 0)
+                && shape[0]
+                    .checked_mul(shape[1])
+                    .and_then(|n| n.checked_mul(3))
+                    == Some(rgb.len()),
+            "prepared RGB extent mismatch"
+        );
         let pixels = rgb
             .iter()
             .map(|&v| f32::from(v) / 255.0)
@@ -7012,7 +7031,7 @@ impl Hi3DImageConditioner {
             [756, 756],
         )?;
         let clip = crate::serve::image::resize_lanczos(
-            &rgb,
+            rgb,
             [shape[0], shape[1], 3],
             [224, 224],
             crate::serve::image::ResizeRounding::Fixed22,
@@ -10735,6 +10754,13 @@ mod tests {
         let root = path("FF_HI3D_IMAGE_FIXTURES")?;
         let frozen: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        let preparation_frozen = match frozen["scope"].as_str() {
+            Some("encoder62_only") => false,
+            Some("encoder62_preparation37") => true,
+            _ => anyhow::bail!("unsupported image freeze scope"),
+        };
+        let prepared_bytes = std::fs::read(root.join("cpu-r2/preparation-anchor.safetensors"))?;
+        let prepared = safetensors::SafeTensors::deserialize(&prepared_bytes)?;
         let cells = frozen["cells"]
             .as_object()
             .context("image frozen cells missing")?;
@@ -10764,7 +10790,7 @@ mod tests {
         )?;
         let mut actual = BTreeMap::new();
         let mut replay = BTreeMap::new();
-        for name in ["cottage", "robot_crab", "cottage"] {
+        for (name, common) in [("cottage", true), ("robot_crab", true), ("cottage", false)] {
             let rgba = inputs.tensor(&format!("{name}.rgba"))?;
             let orientation = inputs.tensor(&format!("{name}.orientation"))?;
             let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
@@ -10791,13 +10817,23 @@ mod tests {
                 taps.insert(format!("{name}.{key}"), rows);
                 Ok(())
             };
-            let context = runtime.encode_rgba_tapped(
-                &blas,
-                rgba.data(),
-                [rgba.shape()[0], rgba.shape()[1]],
-                orientation,
-                Some(&mut tap),
-            )?;
+            let context = if common {
+                let rgb = prepared.tensor(&format!("{name}.prepared"))?;
+                runtime.encode_rgb_tapped(
+                    &blas,
+                    rgb.data(),
+                    [rgb.shape()[0], rgb.shape()[1]],
+                    Some(&mut tap),
+                )?
+            } else {
+                runtime.encode_rgba_tapped(
+                    &blas,
+                    rgba.data(),
+                    [rgba.shape()[0], rgba.shape()[1]],
+                    orientation,
+                    Some(&mut tap),
+                )?
+            };
             let context = stream.clone_dtoh(context)?;
             taps.insert(format!("{name}.context"), context);
             if actual.contains_key(&format!("{name}.context")) {
@@ -10879,7 +10915,8 @@ mod tests {
                          candidate: &[f32],
                          reference: &[f32],
                          control: bool,
-                         comparison: &str|
+                         comparison: &str,
+                         gated: bool|
          -> Result<()> {
             ensure!(
                 candidate.len() == reference.len()
@@ -10907,17 +10944,30 @@ mod tests {
                 } else {
                     value > bound
                 };
-                defects += usize::from(defect);
+                defects += usize::from(gated && defect);
                 println!(
                     "N5_M2A_IMAGE_METRIC cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} comparison={comparison} result={}",
-                    if defect { "DEFECT" } else { "PASS" }
+                    if !gated {
+                        "MEASUREMENT"
+                    } else if defect {
+                        "DEFECT"
+                    } else {
+                        "PASS"
+                    }
                 );
             }
             Ok(())
         };
         ensure!(replay.len() == 7, "A-B-A replay taps unexecuted");
         for (name, values) in &replay {
-            score(name, values, &actual[name], false, "A_B_A")?;
+            score(
+                name,
+                values,
+                &actual[name],
+                false,
+                "A_B_A_native_RGBA",
+                preparation_frozen,
+            )?;
         }
         for name in cells.keys() {
             let reference = read_f32_tensor(&anchor, name)?;
@@ -10927,13 +10977,21 @@ mod tests {
             } else {
                 "cottage"
             };
-            score(name, &actual[name], &reference, false, "definition")?;
+            score(
+                name,
+                &actual[name],
+                &reference,
+                false,
+                "definition_common_RGB",
+                true,
+            )?;
             score(
                 name,
                 &actual[&format!("{other}.{suffix}")],
                 &reference,
                 true,
                 "image_swap",
+                true,
             )?;
         }
         let calls = runtime.encoder_calls();
@@ -10944,7 +11002,7 @@ mod tests {
             "retained image context extent mismatch"
         );
         println!(
-            "N5_M2A_IMAGE_GATE {} cells={} defects={defects} calls={calls:?} A_B_A_checked=true allocated_bytes={allocated_bytes} retained_context_bytes={} encoder_storage_released=true no_timing=true",
+            "N5_M2A_IMAGE_GATE {} cells={} defects={defects} calls={calls:?} common_RGB_images=2 native_RGBA_gated={preparation_frozen} A_B_A_checked=true allocated_bytes={allocated_bytes} retained_context_bytes={} encoder_storage_released=true no_timing=true",
             if defects == 0 { "PASS" } else { "DEFECT" },
             cells.len(),
             context.num_bytes()
