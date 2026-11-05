@@ -735,18 +735,30 @@ fn graph_native_state(engine: &Engine, full: bool) -> Result<Vec<u8>> {
         } else {
             let pointers = stream.clone_dtoh(&native.pointers)?;
             let slots = engine.moe_slots.as_ref().context("tier service missing")?;
-            let (live_pointers, live_valid) = slots.native_dispatch(native.slot_layer)?;
-            for id in ids {
-                let expert = usize::try_from(id).context("negative selected expert")?;
-                ensure!(
-                    valid[expert] == 1
-                        && live_valid[expert] == 1
-                        && pointers[expert * 6..(expert + 1) * 6]
-                            == live_pointers[expert * 6..(expert + 1) * 6],
-                    "DEFECT stale native expert dispatch layer={} expert={expert}",
-                    native.slot_layer
-                );
-                integers!([valid[expert]]);
+            if slots.can_native_dispatch(native.slot_layer) {
+                let (live_pointers, live_valid) = slots.native_dispatch(native.slot_layer)?;
+                for id in ids {
+                    let expert = usize::try_from(id).context("negative selected expert")?;
+                    ensure!(
+                        valid[expert] == 1
+                            && live_valid[expert] == 1
+                            && pointers[expert * 6..(expert + 1) * 6]
+                                == live_pointers[expert * 6..(expert + 1) * 6],
+                        "DEFECT stale native expert dispatch layer={} expert={expert}",
+                        native.slot_layer
+                    );
+                    integers!([valid[expert]]);
+                }
+            } else {
+                for id in ids {
+                    let expert = usize::try_from(id).context("negative selected expert")?;
+                    ensure!(
+                        valid[expert] == 1,
+                        "DEFECT unrouted native expert dispatch layer={} expert={expert}",
+                        native.slot_layer
+                    );
+                    integers!([valid[expert]]);
+                }
             }
         }
     }

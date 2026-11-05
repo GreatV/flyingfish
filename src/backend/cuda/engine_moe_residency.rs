@@ -1536,6 +1536,11 @@ impl Slots {
         Ok(count)
     }
 
+    #[cfg(test)]
+    pub fn can_native_dispatch(&self, layer: u32) -> bool {
+        !self.streamed.get(layer as usize).copied().unwrap_or(false) || self.leased_layer == layer
+    }
+
     pub fn native_dispatch(&self, layer: u32) -> Result<(Vec<u64>, Vec<u32>)> {
         let geometry = self.catalogue.geometry();
         ensure!(
