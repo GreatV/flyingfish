@@ -1838,7 +1838,13 @@ impl<T: FlowElement> Flow<T> {
             global.len() == 2917 * self.spec.cond_channels,
             "device conditioning shape mismatch"
         );
-        let output = self.device.stream.alloc_zeros(global.len())?;
+        if self.device.stream.as_ref() != global.stream().as_ref() {
+            let ready = global.stream().record_event(Some(
+                cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+            ))?;
+            self.device.stream.wait(&ready)?;
+        }
+        let mut output = self.device.stream.alloc_zeros(global.len())?;
         let cast = cubin::module(&self.device.ctx, "vision_ops")?
             .load_function("vision_downcast_f32_to_f16_checked")?;
         unsafe {
@@ -1846,7 +1852,7 @@ impl<T: FlowElement> Flow<T> {
                 .stream
                 .launch_builder(&cast)
                 .arg(global)
-                .arg(&output)
+                .arg(&mut output)
                 .arg(&u32::try_from(global.len())?)
                 .launch(flat(global.len()))?;
         }

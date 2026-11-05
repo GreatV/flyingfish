@@ -1991,7 +1991,8 @@ mod resampling_tests {
                 .map(|v| f32::from_le_bytes(*v))
                 .collect())
         };
-        let score = |name: &str, actual: &[f32], control: bool| -> Result<()> {
+        let score = |name: &str, actual: &[f32], control: bool| -> Result<usize> {
+            let mut defects = 0;
             let expected = read_f32(anchor.tensor(name)?)?;
             ensure!(
                 expected.len() == actual.len() && actual.iter().all(|v| v.is_finite()),
@@ -2012,20 +2013,20 @@ mod resampling_tests {
                 let bound = frozen["preparation"][name]["bounds"][metric]
                     .as_f64()
                     .context("preparation frozen bound missing")?;
+                let defect = if control {
+                    value <= 10.0 * bound
+                } else {
+                    value > bound
+                };
+                defects += usize::from(defect);
                 println!(
-                    "N5_M2A_PREPARATION cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control}"
-                );
-                ensure!(
-                    if control {
-                        value > 10.0 * bound
-                    } else {
-                        value <= bound
-                    },
-                    "preparation metric outside frozen contract {name} {metric}"
+                    "N5_M2A_PREPARATION cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                    if defect { "DEFECT" } else { "PASS" }
                 );
             }
-            Ok(())
+            Ok(defects)
         };
+        let mut defects = 0;
         let mut cases = 0;
         for name in anchor
             .names()
@@ -2039,19 +2040,34 @@ mod resampling_tests {
                 prepare_rgba_white(rgba.data(), [rgba.shape()[0], rgba.shape()[1]], orientation)?;
             let expected = anchor.tensor(&format!("{name}.prepared"))?;
             ensure!(
-                shape == expected.shape()[..2] && rgb == expected.data(),
-                "definition prepared bytes mismatch {name}"
+                shape == expected.shape()[..2] && rgb.len() == expected.data().len(),
+                "definition prepared extent mismatch {name}"
             );
+            let mismatches = rgb
+                .iter()
+                .zip(expected.data())
+                .filter(|(a, b)| a != b)
+                .count();
+            defects += usize::from(mismatches > 0);
+            println!("N5_M2A_PREPARATION_EXACT cell={name}.prepared mismatches={mismatches}");
             let lanczos = crate::serve::image::resize_lanczos(
                 &rgb,
                 [shape[0], shape[1], 3],
                 [224, 224],
                 crate::serve::image::ResizeRounding::Fixed22,
             )?;
+            let expected = anchor.tensor(&format!("{name}.lanczos"))?;
             ensure!(
-                lanczos == anchor.tensor(&format!("{name}.lanczos"))?.data(),
-                "definition Lanczos bytes mismatch {name}"
+                lanczos.len() == expected.data().len(),
+                "definition Lanczos extent mismatch"
             );
+            let mismatches = lanczos
+                .iter()
+                .zip(expected.data())
+                .filter(|(a, b)| a != b)
+                .count();
+            defects += usize::from(mismatches > 0);
+            println!("N5_M2A_PREPARATION_EXACT cell={name}.lanczos mismatches={mismatches}");
             let values = rgb
                 .iter()
                 .map(|&x| f32::from(x) / 255.0)
@@ -2072,9 +2088,9 @@ mod resampling_tests {
                 }
                 Ok(out)
             };
-            score(&key, &selected(false)?, false)?;
+            defects += score(&key, &selected(false)?, false)?;
             if frozen["preparation"][&key]["control"]["affected"] == true {
-                score(&key, &selected(true)?, true)?;
+                defects += score(&key, &selected(true)?, true)?;
             }
             cases += 1;
         }
@@ -2095,12 +2111,14 @@ mod resampling_tests {
                 out.extend_from_slice(&resized[index * 1024..(index + 1) * 1024]);
             }
         }
-        score("position.bicubic", &selected[0], false)?;
-        score("position.bicubic", &selected[1], true)?;
+        defects += score("position.bicubic", &selected[0], false)?;
+        defects += score("position.bicubic", &selected[1], true)?;
         ensure!(cases == 12, "preparation cases unexecuted");
         println!(
-            "N5_M2A_PREPARATION PASS cases={cases} exact_prepared=true exact_lanczos=true spatial_lookup_control=true"
+            "N5_M2A_PREPARATION {} cases={cases} defects={defects} prepared_and_lanczos=exact_comparison spatial_lookup_control=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
         );
+        ensure!(defects == 0, "finite preparation candidate defects");
         Ok(())
     }
 
