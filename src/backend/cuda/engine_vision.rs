@@ -10771,8 +10771,9 @@ mod tests {
         let anchor = safetensors::SafeTensors::deserialize(&anchor_bytes)?;
         let operator_bytes = std::fs::read(root.join("cpu-r2/operator-inputs.safetensors"))?;
         let operator_inputs = safetensors::SafeTensors::deserialize(&operator_bytes)?;
-        let selected: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("cpu-r2/selected-rows.json"))?)?;
+        let observations: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("cpu-r2/observations.json"))?)?;
+        let selected = &observations["selected_rows"];
         let device = Device::new(0)?;
         let stream = &device.stream;
         let output = path("FF_HI3D_IMAGE_OUTPUT")?;
