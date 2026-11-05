@@ -660,7 +660,7 @@ __device__ __forceinline__ void q38_gelu_impl(
     }
 }
 
-template <typename InT, typename OutT>
+template <typename InT, typename OutT, bool FUSED_AFFINE = false>
 __device__ __forceinline__ void q38_layer_norm_f32_impl(
     const InT* x, const float* weight, const float* bias, OutT* y,
     uint32_t rows, uint32_t heads, uint32_t width,
@@ -685,7 +685,11 @@ __device__ __forceinline__ void q38_layer_norm_f32_impl(
     for(uint32_t d=threadIdx.x;d<width;d+=256) {
         float centered=__fsub_rn(q38_to_f32(x[uint64_t(d)*xs2]),mean);
         float normalized=__fmul_rn(centered,inv);
-        float out=weight ? __fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]) : normalized;
+        float out=normalized;
+        if(weight) {
+            if constexpr(FUSED_AFFINE) out=__fmaf_rn(normalized,weight[d],bias[d]);
+            else out=__fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]);
+        }
         y[uint64_t(d)*ys2]=q38_from_f32<OutT>(out);
     }
 }
@@ -1264,4 +1268,11 @@ extern "C" __global__ void channel_scale_residual_f16(
     const __half* residual, const __half* branch, const __half* scale, __half* y,
     uint32_t rows, uint32_t width) {
     channel_scale_residual(residual, branch, scale, y, rows, width);
+}
+
+extern "C" __global__ void q38_layer_norm_f16_fma(
+    const __half* x,const float* weight,const float* bias,__half* y,
+    uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
+    q38_layer_norm_f32_impl<__half, __half, true>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }

@@ -749,7 +749,7 @@ impl Kernels {
             heads: spec.num_heads,
             head_dim: spec.model_channels / spec.num_heads,
             norm: q.load_function(if T::HALF {
-                "q38_layer_norm_f16"
+                "q38_layer_norm_f16_fma"
             } else {
                 "q38_layer_norm_bf16_affine_f32"
             })?,
