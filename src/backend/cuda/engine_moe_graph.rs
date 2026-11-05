@@ -673,7 +673,7 @@ impl Engine {
                         .context("MoE resident graph missing")?
                         .launch()?;
                 }
-                slots.record_all_readers(&self.device)?;
+                slots.record_all_readers(&self.device.stream)?;
                 let layers = self.model_spec.layers.len() as u64 * rows as u64;
                 decode.stats[0] += layers;
                 decode.stats[1] += layers

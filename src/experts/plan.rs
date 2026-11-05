@@ -519,6 +519,18 @@ fn native_staging_capacity(
     let total = u64::from(geometry.layers) * u64::from(geometry.experts);
     let mut slots = (device_bytes / slot).min(total);
     let mut slots_per_layer = equal_slots(slots, geometry.layers)?;
+    let mut pool = 0u32;
+    if !cohorts {
+        let waves = staged_waves(geometry, live, device_bytes / slot)?;
+        if waves < geometry.layers {
+            let resident = waves - 1;
+            slots = u64::from(resident) * u64::from(live);
+            slots_per_layer = (0..geometry.layers)
+                .map(|layer| if layer < resident { live } else { 0 })
+                .collect();
+            pool = live;
+        }
+    }
     if cohorts {
         let fewest = *slots_per_layer
             .iter()
@@ -539,7 +551,9 @@ fn native_staging_capacity(
         );
     }
     ensure!(
-        slots_per_layer.iter().all(|&n| n >= live),
+        slots_per_layer
+            .iter()
+            .all(|&n| n >= live || (pool > 0 && n == 0)),
         "native GPU slots cannot hold {live} distinct routes per layer"
     );
 
@@ -559,14 +573,18 @@ fn native_staging_capacity(
         (0, 0)
     } else {
         let blocks = host_expert_bytes / slot;
-        ensure!(
-            blocks > u64::from(live),
-            "native host budget cannot hold {live} live swaps and a host expert"
-        );
-        (
-            u32::try_from((blocks - u64::from(live)).min(non_gpu))?,
-            live,
-        )
+        if slots == 0 && blocks >= total {
+            (u32::try_from(total)?, 0)
+        } else {
+            ensure!(
+                blocks > u64::from(live),
+                "native host budget cannot hold {live} live swaps and a host expert"
+            );
+            (
+                u32::try_from((blocks - u64::from(live)).min(non_gpu))?,
+                live,
+            )
+        }
     };
     let disk_bytes = (non_gpu - u64::from(host_blocks))
         .checked_mul(slot)
@@ -589,11 +607,35 @@ fn native_staging_capacity(
             disk_bytes,
             worker_count: 0,
             disk_workers: 0,
-            prefill_staging_slots: 0,
+            prefill_staging_slots: pool,
             pinned: false,
         },
         admission,
     ))
+}
+
+/// Layer waves of `live` slots staged at once: every layer when the budget holds them, else the
+/// budget's whole waves, of which one is the pool shared by the layers without resident slots.
+fn staged_waves(geometry: ExpertGeometry, live: u32, budget_slots: u64) -> Result<u32> {
+    ensure!(live > 0, "zero live routes per layer");
+    let fit = budget_slots / u64::from(live);
+    #[cfg(test)]
+    let fit = forced_waves(fit);
+    ensure!(
+        fit >= 1,
+        "native staging holds {budget_slots} slots; one wave needs {live}"
+    );
+    u32::try_from(fit.min(u64::from(geometry.layers))).context("staged wave count")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub static FORCED_WAVES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn forced_waves(fit: u64) -> u64 {
+    FORCED_WAVES.with(|forced| forced.get().unwrap_or(fit))
 }
 
 /// Setup topology and exact workspace reservations for one layer-major block.
@@ -1932,7 +1974,10 @@ mod tests {
             (5 << 30, 8 << 30, 1),
             (41 * slot, 16 * slot, 2),
         ] {
-            assert!(staging_capacity(geometry, layout.clone(), 32, device, host, copies).is_err());
+            assert_eq!(
+                staging_capacity(geometry, layout.clone(), 32, device, host, copies).is_err(),
+                device / slot < 256
+            );
             let (plan, admission) =
                 cohort_capacity(geometry, layout.clone(), 32, device, host, copies, 256)?;
             assert_eq!(plan.span_rows, 32);
@@ -2027,10 +2072,67 @@ mod tests {
         assert!(capacity.slots_per_layer.iter().all(|&n| n >= 32));
         assert!(u64::from(capacity.slots_total()) * slot <= 80 << 30);
         assert!(u64::from(capacity.host_blocks + capacity.spare_blocks + 6) * slot <= 24 << 30);
-        assert!(
-            staging_capacity(geometry, layout.clone(), 4, 42 * 32 * slot - 1, 24 << 30, 2).is_err()
-        );
+        let (short, _) =
+            staging_capacity(geometry, layout.clone(), 4, 42 * 32 * slot - 1, 24 << 30, 2)?;
+        assert_eq!(short.prefill_staging_slots, 32);
+        assert_eq!(short.slots_total(), 40 * 32);
+        assert_eq!(short.slots_per_layer.iter().filter(|&&n| n == 0).count(), 2);
         assert!(staging_capacity(geometry, layout, 4, 80 << 30, 38 * slot, 2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_staging_waves_follow_the_device_budget() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 3,
+            layers: 42,
+            experts: 288,
+            hidden: 4096,
+            intermediate: 2048,
+            top_k: 8,
+        };
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp8W8a16Block {
+                block: [128, 128],
+                scale_dtype: safetensors::Dtype::F32,
+            },
+            &geometry,
+        )?;
+        let slot = layout.slot_bytes();
+        assert_eq!(slot, 25_171_968);
+        let host = 24u64 << 30;
+        let (all, _) = staging_capacity(geometry, layout.clone(), 1, 42 * 8 * slot, host, 2)?;
+        assert_eq!(all.prefill_staging_slots, 0);
+        assert_eq!(all.slots_per_layer, vec![8; 42]);
+        let (large, _) = staging_capacity(geometry, layout.clone(), 1, 96 << 30, host, 2)?;
+        assert_eq!(large.prefill_staging_slots, 0);
+        assert_eq!(large.slots_total(), ((96u64 << 30) / slot) as u32);
+        let (one_short, _) =
+            staging_capacity(geometry, layout.clone(), 1, 42 * 8 * slot - 1, host, 2)?;
+        assert_eq!(one_short.prefill_staging_slots, 8);
+        assert_eq!(one_short.slots_total(), 40 * 8);
+        assert_eq!(one_short.slots_per_layer[..40], [8; 40]);
+        assert_eq!(one_short.slots_per_layer[40..], [0; 2]);
+        let (pool_only, _) = staging_capacity(geometry, layout.clone(), 1, 8 * slot, host, 2)?;
+        assert_eq!(pool_only.prefill_staging_slots, 8);
+        assert_eq!(pool_only.slots_total(), 0);
+        assert_eq!(
+            pool_only.disk_bytes + u64::from(pool_only.host_blocks) * slot,
+            42 * 288 * slot
+        );
+        let (wide, _) = staging_capacity(geometry, layout.clone(), 36, 8 * 288 * slot, host, 2)?;
+        assert_eq!(wide.prefill_staging_slots, 288);
+        assert_eq!(wide.slots_total(), 7 * 288);
+        assert!(staging_capacity(geometry, layout.clone(), 1, 8 * slot - 1, host, 2).is_err());
+        assert_eq!(staged_waves(geometry, 8, 311)?, 38);
+        assert_eq!(staged_waves(geometry, 8, 42 * 8)?, 42);
+        assert_eq!(staged_waves(geometry, 8, 100_000)?, 42);
+        assert!(staged_waves(geometry, 8, 7).is_err());
+        FORCED_WAVES.set(Some(1));
+        let (forced, _) = staging_capacity(geometry, layout, 1, 96 << 30, host, 2)?;
+        FORCED_WAVES.set(None);
+        assert_eq!(forced.prefill_staging_slots, 8);
+        assert_eq!(forced.slots_total(), 0);
         Ok(())
     }
 
@@ -2059,10 +2161,10 @@ mod tests {
                 staging_capacity(geometry, layout.clone(), rows, bytes, 24 << 30, 2)?;
             assert!(capacity.slots_per_layer.iter().all(|&n| n >= 6 * rows));
             if rows < 8 {
-                assert!(
-                    staging_capacity(geometry, layout.clone(), rows + 1, bytes, 24 << 30, 2)
-                        .is_err()
-                );
+                let (short, _) =
+                    staging_capacity(geometry, layout.clone(), rows + 1, bytes, 24 << 30, 2)?;
+                assert!(short.prefill_staging_slots > 0);
+                assert!(short.slots_per_layer.contains(&0));
             }
         }
         assert_eq!(staging_rows(geometry, 8, slot, 40 * 6 * slot)?, 1);
@@ -2074,17 +2176,16 @@ mod tests {
         assert!(capacity.slots_per_layer.iter().all(|&n| n >= 96));
         assert!(u64::from(capacity.slots_total()) * slot <= 80 << 30);
         assert!(u64::from(capacity.host_blocks + capacity.spare_blocks + 6) * slot <= 24 << 30);
-        assert!(
-            staging_capacity(
-                geometry,
-                layout.clone(),
-                16,
-                40 * 96 * slot - 1,
-                24 << 30,
-                2
-            )
-            .is_err()
-        );
+        let (short, _) = staging_capacity(
+            geometry,
+            layout.clone(),
+            16,
+            40 * 96 * slot - 1,
+            24 << 30,
+            2,
+        )?;
+        assert_eq!(short.prefill_staging_slots, 96);
+        assert_eq!(short.slots_total(), 38 * 96);
         assert!(staging_capacity(geometry, layout, 16, 80 << 30, 102 * slot, 2).is_err());
         Ok(())
     }

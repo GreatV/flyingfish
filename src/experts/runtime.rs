@@ -108,6 +108,15 @@ pub struct Published {
     pub generation: u64,
 }
 
+/// One routed expert of a layer without resident slots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Leased {
+    pub expert: u32,
+    /// Host block the pool copy reads; `None` reads the expert from disk.
+    pub source_block: Option<u32>,
+    pub generation: u64,
+}
+
 /// A vacated host block and the copy event captured for its reuse.
 #[derive(Clone, Copy, Debug)]
 struct ReleasedBlock {
@@ -885,6 +894,56 @@ impl Residency {
         Ok(std::mem::take(&mut self.published))
     }
 
+    /// Sources of the experts one layer without resident slots routes this token; each is read
+    /// into a pool slot for the layer step and keeps its host or disk tier.
+    pub fn lease(&mut self, layer: u32, experts: &[u32]) -> Result<Vec<Leased>> {
+        ensure!(self.token_open, "lease outside a token");
+        let l = layer as usize;
+        ensure!(
+            self.capacity.slots_per_layer.get(l) == Some(&0),
+            "layer {layer} has resident slots; it resolves instead of leasing"
+        );
+        ensure!(self.dispatched[l], "layer {layer} leased before dispatch");
+        let mut unique = experts.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        ensure!(
+            unique.len() <= self.capacity.prefill_staging_slots as usize,
+            "layer {layer} routes {} experts; the pool holds {}",
+            unique.len(),
+            self.capacity.prefill_staging_slots
+        );
+        let mut leased = Vec::with_capacity(unique.len());
+        for expert in unique {
+            ensure!(
+                expert < self.geometry.experts,
+                "lease expert {expert} of layer {layer} outside {}",
+                self.geometry.experts
+            );
+            let source_block = match self.ledger.tier(layer, expert)? {
+                Tier::Host => {
+                    let block = self.host_block[l][expert as usize];
+                    ensure!(
+                        block != NO_BLOCK,
+                        "host expert {expert} of layer {layer} has no block"
+                    );
+                    Some(block)
+                }
+                Tier::Disk => None,
+                Tier::Gpu => anyhow::bail!("expert {expert} of layer {layer} is GPU resident"),
+            };
+            self.next_generation += 1;
+            self.generation[l][expert as usize] = self.next_generation;
+            leased.push(Leased {
+                expert,
+                source_block,
+                generation: self.next_generation,
+            });
+        }
+        self.missed[l].clear();
+        Ok(leased)
+    }
+
     /// Publishes at most the hard per-token cap after validating block requirements.
     pub fn finish_token(&mut self) -> Result<&[Published]> {
         ensure!(self.token_open, "no token open");
@@ -1397,6 +1456,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn layers_without_resident_slots_lease_their_routes_and_keep_their_tiers() -> Result<()> {
+        let geometry = three_layers();
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
+        let (capacity, admission) =
+            crate::experts::plan::staging_capacity(geometry, layout, 1, 4 * slot, 40 * slot, 2)?;
+        assert_eq!(capacity.slots_per_layer, vec![2, 0, 0]);
+        assert_eq!(capacity.prefill_staging_slots, 2);
+        let host = HostBlocks::new(
+            capacity.host_blocks + capacity.spare_blocks,
+            usize::try_from(slot / 2)?,
+        )?;
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = vec![vec![1.0; 8]; 3];
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
+        assert_eq!(initial[1], Vec::<u32>::new());
+        let (mut residency, _) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: Some(&host),
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        residency.begin_request(&frequency)?;
+        residency.begin_token()?;
+        let routes = [route(0, 0, 3), route(0, 1, 5)];
+        let tiers: Vec<_> = [3u32, 5]
+            .iter()
+            .map(|&expert| residency.ledger().tier(1, expert))
+            .collect::<Result<_>>()?;
+        assert!(tiers.iter().all(|&tier| tier != Tier::Gpu));
+        residency.dispatch(1, &routes)?;
+        assert!(residency.lease(0, &[3]).is_err());
+        let leased = residency.lease(1, &[5, 3, 5])?;
+        assert_eq!(leased.iter().map(|l| l.expert).collect::<Vec<_>>(), [3, 5]);
+        assert!(leased[0].generation < leased[1].generation);
+        for (lease, &tier) in leased.iter().zip(&tiers) {
+            assert_eq!(lease.source_block.is_some(), tier == Tier::Host);
+            assert_eq!(residency.ledger().tier(1, lease.expert)?, tier);
+            assert_eq!(residency.generation(1, lease.expert)?, lease.generation);
+        }
+        residency.dispatch(2, &[route(0, 0, 1), route(0, 1, 2), route(1, 2, 4)])?;
+        assert!(residency.lease(2, &[1, 2, 4]).is_err());
+        assert!(residency.finish_token()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fully_host_backed_pool_only_plan_loads_residency() -> Result<()> {
+        let geometry = three_layers();
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
+        let (capacity, admission) =
+            crate::experts::plan::staging_capacity(geometry, layout, 1, 2 * slot, 40 * slot, 2)?;
+        assert_eq!(capacity.slots_per_layer, vec![0, 0, 0]);
+        assert_eq!(capacity.prefill_staging_slots, 2);
+        assert_eq!(capacity.host_blocks, 24);
+        assert_eq!(capacity.spare_blocks, 0);
+        let host = HostBlocks::new(
+            capacity.host_blocks + capacity.spare_blocks,
+            usize::try_from(slot / 2)?,
+        )?;
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = vec![vec![1.0; 8]; 3];
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
+        let (residency, _) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: Some(&host),
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        assert_eq!(residency.ledger().tier(0, 0)?, Tier::Host);
+        Ok(())
+    }
     #[test]
     fn synchronous_host_swap_recycles_source_after_copy() -> Result<()> {
         let mut state = build(4, 1)?;

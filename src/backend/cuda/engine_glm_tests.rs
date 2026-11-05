@@ -491,7 +491,17 @@ fn glm_composition_gpu() -> Result<()> {
     };
     #[cfg(feature = "rocm")]
     Engine::calibrate(&model, 0, 640, None, settings.clone())?;
-    let mut engine = Engine::load(&model, 0, 640, None, settings)?;
+    if let Some(waves) = std::env::var_os("FF_GLM_FORCED_WAVES") {
+        crate::experts::plan::FORCED_WAVES.set(Some(
+            waves
+                .to_str()
+                .context("FF_GLM_FORCED_WAVES is not text")?
+                .parse()?,
+        ));
+    }
+    let loaded = Engine::load(&model, 0, 640, None, settings);
+    crate::experts::plan::FORCED_WAVES.set(None);
+    let mut engine = loaded?;
     ensure!(
         engine.workspace_rows
             == engine

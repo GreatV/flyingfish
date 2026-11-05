@@ -334,8 +334,12 @@ impl SlotLayout {
         let mut slots = Vec::new();
         slots.try_reserve_exact(geometry.layers as usize)?;
         for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
+            // Zero-slot layers form a suffix and lease from the staging pool.
             ensure!(
-                count > 0 && count <= geometry.experts,
+                (count > 0
+                    || (capacity.prefill_staging_slots > 0
+                        && capacity.slots_per_layer[layer..].iter().all(|&n| n == 0)))
+                    && count <= geometry.experts,
                 "slot layout layer={layer} slots={count} experts={}",
                 geometry.experts
             );
@@ -718,6 +722,15 @@ mod tests {
         capacity.host_expert_bytes += 1;
         capacity.spare_blocks = u32::MAX;
         assert!(SlotLayout::new(geometry, &capacity).is_err());
+        let mut suffix = slot_capacity(geometry, [vec![2u32; 3], vec![0u32; 37]].concat())?;
+        assert!(SlotLayout::new(geometry, &suffix).is_ok());
+        let gap = slot_capacity(
+            geometry,
+            [vec![2u32; 3], vec![0u32; 1], vec![2u32; 36]].concat(),
+        )?;
+        assert!(SlotLayout::new(geometry, &gap).is_err());
+        suffix.prefill_staging_slots = 0;
+        assert!(SlotLayout::new(geometry, &suffix).is_err());
         assert!(HostBlocks::new(2, usize::MAX / 2).is_err());
         Ok(())
     }
