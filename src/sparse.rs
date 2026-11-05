@@ -44,6 +44,27 @@ impl SparseSites {
             .ok()
             .map(|i| self.sorted[i].1)
     }
+    pub fn downsample(&self, factor: i32) -> Result<(Self, Vec<u32>)> {
+        ensure!(factor > 0, "invalid sparse downsample factor");
+        let parents: Vec<_> = self
+            .coordinates
+            .iter()
+            .map(|p| [p[0], p[1] / factor, p[2] / factor, p[3] / factor])
+            .collect();
+        let mut coordinates = parents.clone();
+        coordinates.sort_unstable();
+        coordinates.dedup();
+        let inverse = parents
+            .iter()
+            .map(|p| {
+                coordinates
+                    .binary_search(p)
+                    .map(|i| i as u32)
+                    .context("sparse parent not found")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((Self::new(coordinates)?, inverse))
+    }
     /// Published [kx,ky,kz] order; the missing-neighbour sentinel is -1.
     pub fn neighbours_3x3(&self) -> Result<Vec<[i32; 27]>> {
         self.coordinates

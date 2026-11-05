@@ -45,7 +45,7 @@ pub use cuda::mhc::{
     MhcOps, mix_rows, validate_params,
 };
 #[cfg(feature = "cuda")]
-pub use cuda::pixal3d::{Conditioning as PixalFlowConditioning, PixalFlow};
+pub use cuda::pixal3d::{Conditioning as FlowConditioning, Flow};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod missing;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]

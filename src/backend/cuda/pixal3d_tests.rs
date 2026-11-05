@@ -387,7 +387,7 @@ impl FlowCase<'_> {
     }
 }
 fn flow_cells(
-    flow: &mut PixalFlow,
+    flow: &mut Flow,
     gate: &mut Gate,
     case: FlowCase<'_>,
     noise: &[f32],
@@ -454,7 +454,7 @@ fn flow_cells(
     );
     Ok(())
 }
-fn fixed_ss(flow: &mut PixalFlow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
+fn fixed_ss(flow: &mut Flow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
     let base = root.join(format!("evidence/P1-M1-r1/ss-operators-{variant}"));
     let table = format!("floors-ss-fixed-{variant}-angular-r1.json");
     for fixture in ["cottage", "robot_crab"] {
@@ -514,7 +514,7 @@ fn ss_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Resul
             "ss_flow_img_dit_1_3B_64_bf16{}",
             if variant == "mv" { "_mv" } else { "" }
         );
-        let mut flow = PixalFlow::open(
+        let mut flow = Flow::open(
             &model.join("ckpts"),
             &stem,
             runtime,
@@ -607,7 +607,7 @@ fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Re
                 if stage == 0 { 512 } else { 1024 },
                 if variant == "mv" { "_mv" } else { "" }
             );
-            let mut flow = PixalFlow::open(
+            let mut flow = Flow::open(
                 &model.join("ckpts"),
                 &stem,
                 runtime,
@@ -685,7 +685,7 @@ fn row_major(values: &[f32], rows: usize) -> Vec<f32> {
         .collect()
 }
 fn rotate(
-    flow: &PixalFlow,
+    flow: &Flow,
     values: &CudaSlice<bf16>,
     phases: &CudaSlice<f32>,
     head_major: bool,
@@ -747,7 +747,7 @@ impl Gate {
         Ok(())
     }
 }
-fn attention_ss(flow: &mut PixalFlow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
+fn attention_ss(flow: &mut Flow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
     let table = "floors-attention-index-published.json";
     let n = 4096;
     let base = root.join(format!("evidence/P1-M1-r1/ss-operators-{variant}"));
@@ -861,7 +861,7 @@ fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) 
         let input=root.join(format!("evidence/P1-M1-r1/pipeline-single-{resolution}-{fixture}-{arm}/shape_slat-{stage}-inputs.safetensors"));
         let coordinates = coordinates(&tensor(&input, "noise.coords")?)?;
         let n = coordinates.len();
-        let mut flow = PixalFlow::open(
+        let mut flow = Flow::open(
             &model.join("ckpts"),
             "slat_flow_img2shape_dit_1_3B_1024_bf16",
             runtime,
@@ -1717,7 +1717,7 @@ fn linked_lr(root: &Path, model: &Path, runtime: &Path) -> Result<Vec<f32>> {
     let input = root
         .join("evidence/P1-M1-r1/pipeline-single-1024-cottage-r2/shape_slat-0-inputs.safetensors");
     let points = coordinates(&tensor(&input, "noise.coords")?)?;
-    let mut flow = PixalFlow::open(
+    let mut flow = Flow::open(
         &model.join("ckpts"),
         "slat_flow_img2shape_dit_1_3B_512_bf16",
         runtime,

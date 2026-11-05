@@ -1080,7 +1080,54 @@ extern "C" __global__ void vision_downcast_f32_to_f16(
     }
 }
 
-template <typename T>
+extern "C" __global__ void vision_silu_f16(const __half* input, __half* output, uint32_t count) {
+    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        float x = __half2float(input[i]);
+        output[i] = __float2half_rn(x / (1.0f + expf(-x)));
+    }
+}
+
+extern "C" __global__ void sparse_mean_seeded_f16(const __half* input,
+    const uint32_t* offsets, const uint32_t* children, __half* output,
+    uint32_t rows, uint32_t width) {
+    if (!vision_flat_launch() || !input || !offsets || !children || !output || !rows || !width) {
+        __trap(); return;
+    }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * width;
+         i += uint64_t(gridDim.x) * 256) {
+        uint32_t r = i / width, c = i % width;
+        float sum = 0.0f;
+        for (uint32_t j = offsets[r]; j < offsets[r + 1]; ++j)
+            sum = __fadd_rn(sum, __half2float(input[uint64_t(children[j]) * width + c]));
+        output[i] = __float2half_rn(sum / float(offsets[r + 1] - offsets[r] + 1));
+    }
+}
+
+extern "C" __global__ void sparse_index_rows_f16(const __half* input,
+    const uint32_t* index, __half* output, uint32_t rows, uint32_t width) {
+    if (!vision_flat_launch() || !input || !output || !rows || !width) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * width;
+         i += uint64_t(gridDim.x) * 256) {
+        uint64_t r = i / width;
+        output[i] = input[(index ? index[r] : r) * width + i % width];
+    }
+}
+
+extern "C" __global__ void concat_rows_f16(const __half* first, const __half* second,
+    __half* output, uint32_t rows, uint32_t first_width, uint32_t second_width) {
+    if (!vision_flat_launch() || !first || !second || !output || !rows ||
+        !first_width || !second_width) { __trap(); return; }
+    uint64_t width = uint64_t(first_width) + second_width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * width;
+         i += uint64_t(gridDim.x) * 256) {
+        uint64_t r = i / width, c = i % width;
+        output[i] = c < first_width ? first[r * first_width + c]
+                                   : second[r * second_width + c - first_width];
+    }
+}
+
+template <typename T, bool K_HEAD_MAJOR = false>
 __device__ __forceinline__ void qkv_unpack_hm_impl(
     const T* packed, T* q_out, T* k_out, T* v_hm_out,
     uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
@@ -1106,11 +1153,11 @@ __device__ __forceinline__ void qkv_unpack_hm_impl(
         if (parts == 3) {
             const uint64_t base = row * (3ull * hd);
             q_out[i] = packed[base + rem];
-            k_out[i] = packed[base + hd + rem];
+            k_out[K_HEAD_MAJOR ? hm_idx : i] = packed[base + hd + rem];
             v_hm_out[hm_idx] = packed[base + 2ull * hd + rem];
         } else {
             const uint64_t base = row * (2ull * hd);
-            k_out[i] = packed[base + rem];
+            k_out[K_HEAD_MAJOR ? hm_idx : i] = packed[base + rem];
             v_hm_out[hm_idx] = packed[base + hd + rem];
         }
     }
@@ -1198,4 +1245,11 @@ extern "C" __global__ void pixel_shuffle_3d_f16(
 extern "C" __global__ void activation_f32(
     const float* input, float* output, uint32_t rows, uint32_t width, int mode) {
     activation(input,output,rows,width,mode);
+}
+
+extern "C" __global__ void kv_unpack_head_major_f16(
+    const __half* packed, __half* q, __half* k, __half* v,
+    uint32_t batch, uint32_t rows, uint32_t heads, uint32_t dim, int parts) {
+    if (parts != 2) { __trap(); return; }
+    qkv_unpack_hm_impl<__half, true>(packed, q, k, v, batch, rows, heads, dim, parts);
 }

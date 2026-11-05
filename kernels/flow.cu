@@ -4,6 +4,16 @@
 // contraction). Flat grid-stride launch.
 #include "gpu_compat.cuh"
 
+extern "C" __global__ void heun_update_f32(const float* sample, const float* first,
+    const float* second, float* output, unsigned long long count, float step_size) {
+    if (!sample || !first || !output || !count || !isfinite(step_size)) { __trap(); return; }
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)gridDim.x * blockDim.x) {
+        float slope = second ? __fmul_rn(0.5f, __fadd_rn(first[i], second[i])) : first[i];
+        output[i] = __fsub_rn(sample[i], __fmul_rn(step_size, slope));
+    }
+}
+
 extern "C" __global__ void euler_blend_f32(float* x, const float* v, unsigned long long count, float s,
                                            float r, float q) {
     for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;

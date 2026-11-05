@@ -2,7 +2,6 @@
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
 mod tests;
-#[cfg(test)]
 use super::sparse::SparseConv;
 use super::{
     Device,
@@ -10,13 +9,16 @@ use super::{
     closure::Closure,
     contracts::{Tensor, TensorMut, view},
     cubin,
+    flash::Score,
     flash::{F32Attention, Flash, Shape},
     linear::LinearBiasMode,
     ops::{Ops, flat, grid},
 };
 use crate::{
-    backend::gpu::{CudaFunction, CudaSlice, DevicePtr, DeviceRepr, PushKernelArg},
-    pixal3d::{DecoderCheckpoint, DecoderKind, FlowCheckpoint, FlowSpec},
+    backend::gpu::{
+        CudaFunction, CudaSlice, DevicePtr, DeviceRepr, PushKernelArg, ValidAsZeroBits,
+    },
+    pixal3d::{DecoderCheckpoint, DecoderKind, FlowCheckpoint, FlowSpec, Hi3DFlowCheckpoint},
     sparse::SparseSites,
 };
 use anyhow::{Context, Result, ensure};
@@ -50,6 +52,41 @@ fn matrix<T: Copy>(address: u64, rows: usize, width: usize) -> Result<Tensor<T, 
     }
 }
 
+fn run_linear_f32(
+    d: &Device,
+    blas: &Blas,
+    kernels: &Kernels,
+    linear: Linear<f32>,
+    rows: usize,
+    buffers: [u64; 2],
+    silu: bool,
+) -> Result<()> {
+    let [input, output] = buffers;
+    blas.linear_f32(
+        linear.weight,
+        matrix(input, rows, linear.weight.shape[1] as usize)?,
+        &mut TensorMut(matrix(output, rows, linear.weight.shape[0] as usize)?),
+    )?;
+    let width = linear.weight.shape[0];
+    unsafe {
+        let mut launch = d
+            .stream
+            .launch_builder(if silu { &kernels.silu } else { &kernels.bias });
+        launch.arg(&output).arg(&linear.bias.ptr).arg(&output);
+        launch
+            .arg(
+                &(if silu {
+                    rows as u32 * width
+                } else {
+                    rows as u32
+                }),
+            )
+            .arg(&width)
+            .launch(flat(rows * width as usize))?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct Linear<T> {
     weight: Tensor<T, 2>,
@@ -74,48 +111,157 @@ impl<T: DeviceRepr + Copy> Linear<T> {
         })
     }
 }
-impl Linear<bf16> {
-    fn prepare(self, blas: &mut Blas, rows: usize) -> Result<()> {
+pub trait FlowElement: DeviceRepr + Copy + Default + ValidAsZeroBits {
+    type Parameters: DeviceRepr + Copy + ValidAsZeroBits;
+    const HALF: bool;
+    fn from_f32(value: f32) -> Self;
+    fn finite(value: Self) -> bool;
+    fn prepare(
+        blas: &mut Blas,
+        rows: usize,
+        weights: (Tensor<Self, 2>, Tensor<Self, 1>),
+    ) -> Result<()>;
+    fn linear(
+        blas: &Blas,
+        weights: (Tensor<Self, 2>, Tensor<Self, 1>),
+        x: Tensor<Self, 2>,
+        y: &mut TensorMut<Self, 2>,
+    ) -> Result<()>;
+    fn attention(
+        op: &mut Flash,
+        q: &CudaSlice<Self>,
+        k: &CudaSlice<Self>,
+        v: &CudaSlice<Self>,
+        output: &mut CudaSlice<Self>,
+        shape: Shape,
+    ) -> Result<()>;
+}
+impl FlowElement for bf16 {
+    type Parameters = bf16;
+    const HALF: bool = false;
+    fn from_f32(value: f32) -> Self {
+        bf16::from_f32(value)
+    }
+    fn finite(value: Self) -> bool {
+        value.is_finite()
+    }
+    fn prepare(
+        blas: &mut Blas,
+        rows: usize,
+        weights: (Tensor<Self, 2>, Tensor<Self, 1>),
+    ) -> Result<()> {
         blas.prepare_biased(
             rows as u32,
-            self.weight.shape[0],
-            self.weight.shape[1],
-            self.bias,
+            weights.0.shape[0],
+            weights.0.shape[1],
+            weights.1,
             LinearBiasMode::BeforeOutputRound,
         )
     }
-    fn run(self, blas: &Blas, rows: usize, input: u64, output: u64) -> Result<()> {
+    fn linear(
+        blas: &Blas,
+        weights: (Tensor<Self, 2>, Tensor<Self, 1>),
+        x: Tensor<Self, 2>,
+        y: &mut TensorMut<Self, 2>,
+    ) -> Result<()> {
         blas.linear_biased(
-            self.weight,
-            self.bias,
+            weights.0,
+            weights.1,
+            x,
+            y,
+            LinearBiasMode::BeforeOutputRound,
+        )
+    }
+    fn attention(
+        op: &mut Flash,
+        q: &CudaSlice<Self>,
+        k: &CudaSlice<Self>,
+        v: &CudaSlice<Self>,
+        output: &mut CudaSlice<Self>,
+        shape: Shape,
+    ) -> Result<()> {
+        op.run(q, shape.q_heads * shape.head_dim, k, v, output, shape)
+    }
+}
+impl FlowElement for f16 {
+    type Parameters = f32;
+    const HALF: bool = true;
+    fn from_f32(value: f32) -> Self {
+        f16::from_f32(value)
+    }
+    fn finite(value: Self) -> bool {
+        value.is_finite()
+    }
+    fn prepare(
+        blas: &mut Blas,
+        _rows: usize,
+        _weights: (Tensor<Self, 2>, Tensor<Self, 1>),
+    ) -> Result<()> {
+        blas.prepare_f16_biased()
+    }
+    fn linear(
+        blas: &Blas,
+        weights: (Tensor<Self, 2>, Tensor<Self, 1>),
+        x: Tensor<Self, 2>,
+        y: &mut TensorMut<Self, 2>,
+    ) -> Result<()> {
+        blas.linear_f16_biased(weights.0, weights.1, x, y)
+    }
+    fn attention(
+        op: &mut Flash,
+        q: &CudaSlice<Self>,
+        k: &CudaSlice<Self>,
+        v: &CudaSlice<Self>,
+        output: &mut CudaSlice<Self>,
+        shape: Shape,
+    ) -> Result<()> {
+        op.run_f16(
+            &q.slice(..),
+            shape.q_heads * shape.head_dim,
+            &k.slice(..),
+            &v.slice(..),
+            &mut output.slice_mut(..),
+            (shape.rows, shape.capacity, shape.capacity),
+        )
+    }
+}
+impl<T: FlowElement> Linear<T> {
+    fn prepare(self, blas: &mut Blas, rows: usize) -> Result<()> {
+        T::prepare(blas, rows, (self.weight, self.bias))
+    }
+    fn run(self, blas: &Blas, rows: usize, input: u64, output: u64) -> Result<()> {
+        T::linear(
+            blas,
+            (self.weight, self.bias),
             matrix(input, rows, self.weight.shape[1] as usize)?,
             &mut TensorMut(matrix(output, rows, self.weight.shape[0] as usize)?),
-            LinearBiasMode::BeforeOutputRound,
         )
     }
 }
 
-struct Block {
-    qkv: Linear<bf16>,
-    self_out: Linear<bf16>,
-    cross_q: Linear<bf16>,
-    cross_kv: Linear<bf16>,
-    cross_out: Linear<bf16>,
-    projection: Linear<bf16>,
-    fc1: Linear<bf16>,
-    fc2: Linear<bf16>,
+struct Block<T: FlowElement> {
+    qkv: Linear<T>,
+    self_out: Linear<T>,
+    cross_q: Linear<T>,
+    cross_kv: Linear<T>,
+    cross_out: Linear<T>,
+    projection: Option<Linear<T>>,
+    fc1: Linear<T>,
+    fc2: Linear<T>,
     norm_weight: u64,
     norm_bias: u64,
     modulation: u64,
     gamma: [u64; 4],
 }
 struct Kernels {
+    half: bool,
     heads: usize,
     head_dim: usize,
     norm: CudaFunction,
     norm_f32: CudaFunction,
     l2: CudaFunction,
     unpack: CudaFunction,
+    unpack_cross: CudaFunction,
     rope: CudaFunction,
     rope_hm: CudaFunction,
     phases: CudaFunction,
@@ -131,33 +277,514 @@ struct Kernels {
     gelu: CudaFunction,
     transpose: CudaFunction,
 }
+enum CrossAttention {
+    F32(F32Attention),
+    F16(Flash),
+}
+
+struct ResidualIo {
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+    norm: [u64; 2],
+    conv: [SparseConv; 2],
+    conv_weights: [(Tensor<f16, 2>, Tensor<f16, 1>); 2],
+    embedding: Linear<f16>,
+    linear: Linear<f16>,
+    skip: Option<Linear<f16>>,
+    normalized: CudaSlice<f16>,
+    first: CudaSlice<f16>,
+    second: CudaSlice<f16>,
+    result: CudaSlice<f16>,
+    residual: CudaSlice<f16>,
+    parameters: CudaSlice<f16>,
+    silu: CudaFunction,
+    modulate: CudaFunction,
+}
+impl ResidualIo {
+    fn new(
+        d: &Device,
+        sites: &SparseSites,
+        weights: (
+            &BTreeMap<String, CudaSlice<f16>>,
+            &BTreeMap<String, CudaSlice<f32>>,
+        ),
+        name: &str,
+        widths: [usize; 3],
+        budget: usize,
+    ) -> Result<Self> {
+        let [input, output, embedding] = widths;
+        let hidden = output / 2;
+        let rows = sites.coordinates().len();
+        let (half, float) = weights;
+        let bind = |suffix: &str, out, input| {
+            Linear::bind(half, d, &format!("{name}.{suffix}"), [out, input])
+        };
+        let conv_weight = |suffix: &str, channels| -> Result<_> {
+            let p = format!("{name}.{suffix}.conv");
+            Ok((
+                dense(
+                    &half[&format!("{p}.weight")],
+                    d,
+                    [hidden as u32, (27 * channels) as u32],
+                )?,
+                dense(&half[&format!("{p}.bias")], d, [hidden as u32])?,
+            ))
+        };
+        Ok(Self {
+            rows,
+            input_width: input,
+            output_width: output,
+            norm: [
+                ptr(&float[&format!("{name}.norm1.weight")], d),
+                ptr(&float[&format!("{name}.norm1.bias")], d),
+            ],
+            conv: [
+                SparseConv::new(d, sites, input, budget / 2)?,
+                SparseConv::new(d, sites, hidden, budget / 2)?,
+            ],
+            conv_weights: [conv_weight("conv1", input)?, conv_weight("conv2", hidden)?],
+            embedding: bind("emb_layers.1", 2 * hidden, embedding)?,
+            linear: bind("linear", output, hidden)?,
+            skip: if input == output {
+                None
+            } else {
+                Some(bind("skip_connection", output, input)?)
+            },
+            normalized: d.stream.alloc_zeros(rows * input)?,
+            first: d.stream.alloc_zeros(rows * hidden)?,
+            second: d.stream.alloc_zeros(rows * hidden)?,
+            result: d.stream.alloc_zeros(rows * output)?,
+            residual: d.stream.alloc_zeros(rows * output)?,
+            parameters: d.stream.alloc_zeros(2 * hidden)?,
+            silu: cubin::module(&d.ctx, "vision_ops")?.load_function("vision_silu_f16")?,
+            modulate: cubin::module(&d.ctx, "modulate")?.load_function("row_modulate_f16")?,
+        })
+    }
+    fn run(
+        &mut self,
+        d: &Device,
+        blas: &Blas,
+        k: &Kernels,
+        input: &CudaSlice<f16>,
+        embedding: u64,
+    ) -> Result<()> {
+        let hidden = self.output_width / 2;
+        let activate = |x: u64, out: u64, count: usize| -> Result<()> {
+            unsafe {
+                d.stream
+                    .launch_builder(&self.silu)
+                    .arg(&x)
+                    .arg(&out)
+                    .arg(&u32::try_from(count)?)
+                    .launch(flat(count))?;
+            }
+            Ok(())
+        };
+        self.embedding
+            .run(blas, 1, embedding, ptr(&self.parameters, d))?;
+        k.norm(
+            d,
+            ptr(input, d),
+            ptr(&self.normalized, d),
+            [self.rows, self.input_width],
+            self.norm,
+            (1e-6, false),
+        )?;
+        activate(
+            ptr(&self.normalized, d),
+            ptr(&self.normalized, d),
+            self.normalized.len(),
+        )?;
+        self.conv[0].run(
+            blas,
+            &self.normalized,
+            self.conv_weights[0].0,
+            self.conv_weights[0].1,
+            &mut self.first,
+        )?;
+        k.norm(
+            d,
+            ptr(&self.first, d),
+            ptr(&self.first, d),
+            [self.rows, hidden],
+            [0, 0],
+            (1e-6, false),
+        )?;
+        let parameter = ptr(&self.parameters, d);
+        unsafe {
+            d.stream
+                .launch_builder(&self.modulate)
+                .arg(&self.first)
+                .arg(&(parameter + (hidden * 2) as u64))
+                .arg(&parameter)
+                .arg(&0u64)
+                .arg(&self.first)
+                .arg(&(self.rows as i32))
+                .arg(&(hidden as i32))
+                .arg(&((2 * hidden) as u64))
+                .arg(&1u32)
+                .launch(crate::backend::gpu::LaunchConfig {
+                    grid_dim: (self.rows as u32, hidden.div_ceil(256) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        activate(ptr(&self.first, d), ptr(&self.first, d), self.first.len())?;
+        self.conv[1].run(
+            blas,
+            &self.first,
+            self.conv_weights[1].0,
+            self.conv_weights[1].1,
+            &mut self.second,
+        )?;
+        activate(
+            ptr(&self.second, d),
+            ptr(&self.second, d),
+            self.second.len(),
+        )?;
+        self.linear
+            .run(blas, self.rows, ptr(&self.second, d), ptr(&self.result, d))?;
+        if let Some(skip) = self.skip {
+            skip.run(blas, self.rows, ptr(input, d), ptr(&self.residual, d))?;
+            k.residual(
+                d,
+                ptr(&self.result, d),
+                ptr(&self.residual, d),
+                self.result.len(),
+            )?;
+        } else {
+            k.residual(d, ptr(&self.result, d), ptr(input, d), self.result.len())?;
+        }
+        Ok(())
+    }
+}
+
+struct SparseFlowIo {
+    rows: usize,
+    inverse: CudaSlice<u32>,
+    offsets: CudaSlice<u32>,
+    children: CudaSlice<u32>,
+    blocks: [ResidualIo; 4],
+    projected: CudaSlice<f32>,
+    input: CudaSlice<f16>,
+    pooled: CudaSlice<f16>,
+    concat: CudaSlice<f16>,
+    expanded: CudaSlice<f16>,
+    last_concat: CudaSlice<f16>,
+    normalized: CudaSlice<f16>,
+    output_float: CudaSlice<f32>,
+    embedding: CudaSlice<f16>,
+    pool: CudaFunction,
+    index: CudaFunction,
+    concatenate: CudaFunction,
+    silu: CudaFunction,
+}
+impl SparseFlowIo {
+    fn new(
+        d: &Device,
+        sites: &SparseSites,
+        parent: &SparseSites,
+        inverse: &[u32],
+        weights: (
+            &BTreeMap<String, CudaSlice<f16>>,
+            &BTreeMap<String, CudaSlice<f32>>,
+        ),
+        budget: usize,
+    ) -> Result<Self> {
+        let rows = sites.coordinates().len();
+        let parents = parent.coordinates().len();
+        let mut lists = vec![Vec::new(); parents];
+        for (child, &p) in inverse.iter().enumerate() {
+            lists[p as usize].push(child as u32);
+        }
+        let mut offsets = vec![0u32];
+        let mut children = Vec::with_capacity(rows);
+        for list in lists {
+            children.extend(list);
+            offsets.push(children.len() as u32);
+        }
+        let v = cubin::module(&d.ctx, "vision_ops")?;
+        Ok(Self {
+            rows,
+            inverse: d.stream.clone_htod(inverse)?,
+            offsets: d.stream.clone_htod(&offsets)?,
+            children: d.stream.clone_htod(&children)?,
+            blocks: [
+                ResidualIo::new(
+                    d,
+                    sites,
+                    weights,
+                    "input_blocks.0",
+                    [256, 256, 2112],
+                    budget / 4,
+                )?,
+                ResidualIo::new(
+                    d,
+                    parent,
+                    weights,
+                    "input_blocks.1",
+                    [256, 2112, 2112],
+                    budget / 4,
+                )?,
+                ResidualIo::new(
+                    d,
+                    sites,
+                    weights,
+                    "out_blocks.0",
+                    [4224, 256, 2112],
+                    budget / 4,
+                )?,
+                ResidualIo::new(
+                    d,
+                    sites,
+                    weights,
+                    "out_blocks.1",
+                    [512, 256, 2112],
+                    budget / 4,
+                )?,
+            ],
+            projected: d.stream.alloc_zeros(rows * 256)?,
+            input: d.stream.alloc_zeros(rows * 256)?,
+            pooled: d.stream.alloc_zeros(parents * 256)?,
+            concat: d.stream.alloc_zeros(parents * 4224)?,
+            expanded: d.stream.alloc_zeros(rows * 4224)?,
+            last_concat: d.stream.alloc_zeros(rows * 512)?,
+            normalized: d.stream.alloc_zeros(rows * 256)?,
+            output_float: d.stream.alloc_zeros(rows * 256)?,
+            embedding: d.stream.alloc_zeros(2112)?,
+            pool: v.load_function("sparse_mean_seeded_f16")?,
+            index: v.load_function("sparse_index_rows_f16")?,
+            concatenate: v.load_function("concat_rows_f16")?,
+            silu: v.load_function("vision_silu_f16")?,
+        })
+    }
+    fn copy(
+        &self,
+        d: &Device,
+        input: u64,
+        index: u64,
+        output: u64,
+        rows: usize,
+        width: usize,
+    ) -> Result<()> {
+        unsafe {
+            d.stream
+                .launch_builder(&self.index)
+                .arg(&input)
+                .arg(&index)
+                .arg(&output)
+                .arg(&(rows as u32))
+                .arg(&(width as u32))
+                .launch(flat(rows * width))?;
+        }
+        Ok(())
+    }
+    fn concat(
+        &self,
+        d: &Device,
+        input: u64,
+        skip: u64,
+        output: u64,
+        rows: usize,
+        width: usize,
+    ) -> Result<()> {
+        unsafe {
+            d.stream
+                .launch_builder(&self.concatenate)
+                .arg(&input)
+                .arg(&skip)
+                .arg(&output)
+                .arg(&(rows as u32))
+                .arg(&(width as u32))
+                .arg(&(width as u32))
+                .launch(flat(rows * width * 2))?;
+        }
+        Ok(())
+    }
+    fn encode(
+        &mut self,
+        d: &Device,
+        blas: &Blas,
+        k: &Kernels,
+        input: Linear<f32>,
+        buffers: [u64; 3],
+    ) -> Result<()> {
+        let [values, embedding, hidden] = buffers;
+        run_linear_f32(
+            d,
+            blas,
+            k,
+            input,
+            self.rows,
+            [values, ptr(&self.projected, d)],
+            false,
+        )?;
+        k.cast(
+            d,
+            ptr(&self.projected, d),
+            ptr(&self.input, d),
+            self.input.len(),
+        )?;
+        unsafe {
+            d.stream
+                .launch_builder(&self.silu)
+                .arg(&embedding)
+                .arg(&self.embedding)
+                .arg(&2112u32)
+                .launch(flat(2112))?;
+        }
+        self.blocks[0].run(d, blas, k, &self.input, ptr(&self.embedding, d))?;
+        unsafe {
+            d.stream
+                .launch_builder(&self.pool)
+                .arg(&self.blocks[0].result)
+                .arg(&self.offsets)
+                .arg(&self.children)
+                .arg(&self.pooled)
+                .arg(&((self.offsets.len() - 1) as u32))
+                .arg(&256u32)
+                .launch(flat(self.pooled.len()))?;
+        }
+        self.blocks[1].run(d, blas, k, &self.pooled, ptr(&self.embedding, d))?;
+        self.copy(
+            d,
+            ptr(&self.blocks[1].result, d),
+            0,
+            hidden,
+            self.offsets.len() - 1,
+            2112,
+        )
+    }
+    fn decode(
+        &mut self,
+        d: &Device,
+        blas: &Blas,
+        k: &Kernels,
+        output: Linear<f32>,
+        hidden: u64,
+        values: u64,
+    ) -> Result<()> {
+        self.concat(
+            d,
+            hidden,
+            ptr(&self.blocks[1].result, d),
+            ptr(&self.concat, d),
+            self.offsets.len() - 1,
+            2112,
+        )?;
+        self.copy(
+            d,
+            ptr(&self.concat, d),
+            ptr(&self.inverse, d),
+            ptr(&self.expanded, d),
+            self.rows,
+            4224,
+        )?;
+        self.blocks[2].run(d, blas, k, &self.expanded, ptr(&self.embedding, d))?;
+        self.concat(
+            d,
+            ptr(&self.blocks[2].result, d),
+            ptr(&self.blocks[0].result, d),
+            ptr(&self.last_concat, d),
+            self.rows,
+            256,
+        )?;
+        self.blocks[3].run(d, blas, k, &self.last_concat, ptr(&self.embedding, d))?;
+        k.norm(
+            d,
+            ptr(&self.blocks[3].result, d),
+            ptr(&self.normalized, d),
+            [self.rows, 256],
+            [0, 0],
+            (1e-5, false),
+        )?;
+        k.upcast(
+            d,
+            ptr(&self.normalized, d),
+            ptr(&self.output_float, d),
+            self.normalized.len(),
+        )?;
+        run_linear_f32(
+            d,
+            blas,
+            k,
+            output,
+            self.rows,
+            [ptr(&self.output_float, d), values],
+            false,
+        )
+    }
+}
 impl Kernels {
-    fn load(d: &Device, spec: &FlowSpec) -> Result<Self> {
+    fn load<T: FlowElement>(d: &Device, spec: &FlowSpec) -> Result<Self> {
         let q = cubin::module(&d.ctx, "q38_common")?;
         let n = cubin::module(&d.ctx, "norm")?;
         let r = cubin::module(&d.ctx, "rope")?;
         let m = cubin::module(&d.ctx, "modulate")?;
         let v = cubin::module(&d.ctx, "vision_ops")?;
         Ok(Self {
+            half: T::HALF,
             heads: spec.num_heads,
             head_dim: spec.model_channels / spec.num_heads,
-            norm: q.load_function("q38_layer_norm_bf16_affine_f32")?,
+            norm: q.load_function(if T::HALF {
+                "q38_layer_norm_f16"
+            } else {
+                "q38_layer_norm_bf16_affine_f32"
+            })?,
             norm_f32: q.load_function("q38_layer_norm_f32")?,
-            l2: n.load_function("l2_norm_scale_bf16")?,
-            unpack: v.load_function("qkv_unpack_hm_bf16")?,
-            rope: r.load_function("rope_pair_tail_rn")?,
+            l2: n.load_function(if T::HALF {
+                "l2_norm_scale_f16"
+            } else {
+                "l2_norm_scale_bf16"
+            })?,
+            unpack: v.load_function(if T::HALF {
+                "qkv_unpack_hm_f16"
+            } else {
+                "qkv_unpack_hm_bf16"
+            })?,
+            unpack_cross: v.load_function(if T::HALF {
+                "kv_unpack_head_major_f16"
+            } else {
+                "qkv_unpack_hm_bf16"
+            })?,
+            rope: r.load_function(if T::HALF {
+                "rope_pair_tail_f16"
+            } else {
+                "rope_pair_tail_rn"
+            })?,
             rope_hm: r.load_function("rope_pair_tail_hm")?,
             phases: r.load_function("rope_pair_rows_3d_direct")?,
-            modulate: m.load_function("row_modulate")?,
-            gated: m.load_function("row_gated_add")?,
-            add_mod: m.load_function("add_row_bf16_f32")?,
-            residual: n.load_function("residual")?,
-            cast: v.load_function("vision_affine_cast_bf16")?,
-            upcast: v.load_function("vision_upcast_f32")?,
+            modulate: m.load_function(if T::HALF {
+                "row_modulate_f16_f32"
+            } else {
+                "row_modulate"
+            })?,
+            gated: m.load_function(if T::HALF {
+                "row_gated_add_f16_f32"
+            } else {
+                "row_gated_add"
+            })?,
+            add_mod: m.load_function(if T::HALF {
+                "add_row_f16_f32"
+            } else {
+                "add_row_bf16_f32"
+            })?,
+            residual: n.load_function(if T::HALF { "residual_f16" } else { "residual" })?,
+            cast: v.load_function(if T::HALF {
+                "vision_downcast_f32_to_f16"
+            } else {
+                "vision_affine_cast_bf16"
+            })?,
+            upcast: v.load_function(if T::HALF {
+                "vision_upcast_f16_to_f32"
+            } else {
+                "vision_upcast_f32"
+            })?,
             bias: v.load_function("vision_bias_f32")?,
             silu: v.load_function("vision_add_row_silu_f32")?,
             sinusoid: v.load_function("sinusoidal_embed_f32")?,
-            gelu: q.load_function("q38_gelu")?,
+            gelu: q.load_function(if T::HALF { "q38_gelu_f16" } else { "q38_gelu" })?,
             transpose: q.load_function("transpose_f32")?,
         })
     }
@@ -195,14 +822,14 @@ impl Kernels {
     }
     fn cast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
         unsafe {
-            d.stream
-                .launch_builder(&self.cast)
-                .arg(&input)
-                .arg(&output)
-                .arg(&(count as u64))
-                .arg(&0f32)
-                .arg(&1f32)
-                .launch(flat(count))?;
+            let mut launch = d.stream.launch_builder(&self.cast);
+            launch.arg(&input).arg(&output);
+            if self.half {
+                launch.arg(&u32::try_from(count)?);
+            } else {
+                launch.arg(&(count as u64)).arg(&0f32).arg(&1f32);
+            }
+            launch.launch(flat(count))?;
         }
         Ok(())
     }
@@ -252,7 +879,11 @@ impl Kernels {
     ) -> Result<()> {
         unsafe {
             d.stream
-                .launch_builder(&self.unpack)
+                .launch_builder(if parts == 2 {
+                    &self.unpack_cross
+                } else {
+                    &self.unpack
+                })
                 .arg(&input)
                 .arg(&outputs[0])
                 .arg(&outputs[1])
@@ -279,22 +910,22 @@ impl Kernels {
     }
 }
 
-struct Work {
+struct Work<T: FlowElement> {
     row_index: CudaSlice<u32>,
-    hidden: CudaSlice<bf16>,
-    norm: CudaSlice<bf16>,
-    projected: CudaSlice<bf16>,
-    qkv: CudaSlice<bf16>,
-    q: CudaSlice<bf16>,
-    k: CudaSlice<bf16>,
-    v: CudaSlice<bf16>,
-    kn: CudaSlice<bf16>,
-    attention: CudaSlice<bf16>,
-    ff: CudaSlice<bf16>,
-    cross_kv: CudaSlice<bf16>,
-    cross_k: CudaSlice<bf16>,
-    cross_kn: CudaSlice<bf16>,
-    cross_v: CudaSlice<bf16>,
+    hidden: CudaSlice<T>,
+    norm: CudaSlice<T>,
+    projected: CudaSlice<T>,
+    qkv: CudaSlice<T>,
+    q: CudaSlice<T>,
+    k: CudaSlice<T>,
+    v: CudaSlice<T>,
+    kn: CudaSlice<T>,
+    attention: CudaSlice<T>,
+    ff: CudaSlice<T>,
+    cross_kv: CudaSlice<T>,
+    cross_k: CudaSlice<T>,
+    cross_kn: CudaSlice<T>,
+    cross_v: CudaSlice<T>,
     cross_q32: CudaSlice<f32>,
     cross_k32: CudaSlice<f32>,
     cross_v32: CudaSlice<f32>,
@@ -302,10 +933,10 @@ struct Work {
     outer: CudaSlice<f32>,
     input_rows: CudaSlice<f32>,
     output_rows: CudaSlice<f32>,
-    block_mod: CudaSlice<bf16>,
+    block_mod: CudaSlice<T::Parameters>,
 }
-impl Work {
-    fn new(d: &Device, n: usize, spec: &FlowSpec) -> Result<Self> {
+impl<T: FlowElement> Work<T> {
+    fn new(d: &Device, n: usize, spec: &FlowSpec, context_rows: usize) -> Result<Self> {
         let s = &d.stream;
         let h = spec.model_channels;
         Ok(Self {
@@ -320,13 +951,13 @@ impl Work {
             kn: s.alloc_zeros(n * h)?,
             attention: s.alloc_zeros(n * h)?,
             ff: s.alloc_zeros(n * spec.feed_forward_width())?,
-            cross_kv: s.alloc_zeros(10 * h)?,
-            cross_k: s.alloc_zeros(5 * h)?,
-            cross_kn: s.alloc_zeros(5 * h)?,
-            cross_v: s.alloc_zeros(5 * h)?,
+            cross_kv: s.alloc_zeros(2 * context_rows * h)?,
+            cross_k: s.alloc_zeros(context_rows * h)?,
+            cross_kn: s.alloc_zeros(context_rows * h)?,
+            cross_v: s.alloc_zeros(context_rows * h)?,
             cross_q32: s.alloc_zeros(n * h)?,
-            cross_k32: s.alloc_zeros(5 * h)?,
-            cross_v32: s.alloc_zeros(5 * h)?,
+            cross_k32: s.alloc_zeros(context_rows * h)?,
+            cross_v32: s.alloc_zeros(context_rows * h)?,
             cross_out32: s.alloc_zeros(n * h)?,
             outer: s.alloc_zeros(n * h)?,
             input_rows: s.alloc_zeros(n * spec.in_channels)?,
@@ -344,35 +975,37 @@ fn validate_conditioning_origin(origin: &Rc<()>, flow: &Rc<()>) -> Result<()> {
     Ok(())
 }
 
-pub struct Conditioning {
+pub struct Conditioning<T: FlowElement = bf16> {
     origin: Rc<()>,
-    global: CudaSlice<bf16>,
-    projected: CudaSlice<bf16>,
+    global: CudaSlice<T>,
+    projected: CudaSlice<T>,
 }
-pub struct PixalFlow {
+pub struct Flow<T: FlowElement = bf16> {
     origin: Rc<()>,
     device: Device,
     spec: FlowSpec,
     rows: usize,
     coordinates: Vec<[i32; 3]>,
     steps: usize,
-    _bf16: BTreeMap<String, CudaSlice<bf16>>,
+    _inner_weights: BTreeMap<String, CudaSlice<T>>,
     _f32: BTreeMap<String, CudaSlice<f32>>,
-    blocks: Vec<Block>,
+    blocks: Vec<Block<T>>,
     input: Linear<f32>,
     output: Linear<f32>,
     time: [Linear<f32>; 3],
     kernels: Kernels,
     blas: Blas,
     flash: Flash,
-    cross: F32Attention,
-    work: Work,
+    cross: CrossAttention,
+    work: Work<T>,
     phases: CudaSlice<f32>,
-    mods: CudaSlice<bf16>,
+    mods: CudaSlice<T>,
     time_count: usize,
+    io: Option<SparseFlowIo>,
+    time_embeddings: CudaSlice<T>,
 }
 
-impl PixalFlow {
+impl Flow<bf16> {
     pub fn open(
         dir: &Path,
         stem: &str,
@@ -446,7 +1079,7 @@ impl PixalFlow {
             budget > 0 && budget <= total,
             "invalid admitted flow device budget"
         );
-        let kernels = Kernels::load(&device, &spec)?;
+        let kernels = Kernels::load::<bf16>(&device, &spec)?;
         let ops = Ops::new(&device.ctx)?;
         let mut blas = Blas::new(
             &device,
@@ -503,7 +1136,11 @@ impl PixalFlow {
                     spec.cond_channels,
                 )?,
                 cross_out: linear("cross_attn.cross_attn_block.to_out", h, h)?,
-                projection: linear("cross_attn.proj_linear", h, spec.projection_width())?,
+                projection: Some(linear(
+                    "cross_attn.proj_linear",
+                    h,
+                    spec.projection_width(),
+                )?),
                 fc1: linear("mlp.mlp.0", spec.feed_forward_width(), h)?,
                 fc2: linear("mlp.mlp.2", h, spec.feed_forward_width())?,
                 norm_weight: weight("norm2.weight"),
@@ -521,7 +1158,7 @@ impl PixalFlow {
                 b.self_out,
                 b.cross_q,
                 b.cross_out,
-                b.projection,
+                b.projection.context("projection missing")?,
                 b.fc1,
                 b.fc2,
             ] {
@@ -577,7 +1214,7 @@ impl PixalFlow {
         } else {
             fp.remove("rope_phases").context("SS phases missing")?
         };
-        let work = Work::new(&device, rows, &spec)?;
+        let work = Work::new(&device, rows, &spec, 5)?;
         let flash = Flash::new(device.stream.clone(), rows, heads, heads, dim)?;
         let mods = device.stream.alloc_zeros(steps * 6 * h)?;
         let condition_bytes = 4usize
@@ -603,12 +1240,12 @@ impl PixalFlow {
         device.workspace_budget(free, budget, live_bytes)?;
         Ok(Self {
             origin: Rc::new(()),
-            device,
+            device: device.clone(),
             spec,
             rows,
             coordinates: coordinates.to_vec(),
             steps,
-            _bf16: bf,
+            _inner_weights: bf,
             _f32: fp,
             blocks,
             input,
@@ -617,13 +1254,349 @@ impl PixalFlow {
             kernels,
             blas,
             flash,
-            cross,
+            cross: CrossAttention::F32(cross),
             work,
             phases,
             mods,
             time_count: 0,
+            io: None,
+            time_embeddings: device.stream.alloc_zeros(0)?,
         })
     }
+}
+
+impl Flow<f16> {
+    pub fn sample_heun(
+        &mut self,
+        noise: &[f32],
+        positive: &Conditioning<f16>,
+        negative: &Conditioning<f16>,
+    ) -> Result<Vec<f32>> {
+        let rows = self.io.as_ref().context("sparse IO missing")?.rows;
+        ensure!(
+            noise.len() == rows * self.spec.in_channels,
+            "Heun noise extent differs from setup"
+        );
+        validate_conditioning_origin(&positive.origin, &self.origin)?;
+        validate_conditioning_origin(&negative.origin, &self.origin)?;
+        let times = heun_schedule(rows, 25)?;
+        let model_times: Vec<_> = times
+            .iter()
+            .flat_map(|&(time, next)| [time * 1000.0, next * 1000.0])
+            .collect();
+        self.set_times(&model_times)?;
+        let mut state = Sampler::new(&self.device, noise)?;
+        let update = cubin::module(&self.device.ctx, "flow")?.load_function("heun_update_f32")?;
+        for (step, &(time, next)) in times.iter().enumerate() {
+            for (stage, t) in [time, next].into_iter().enumerate() {
+                let input = if stage == 0 { &state.state } else { &state.x0 };
+                self.forward(input, 2 * step + stage, positive, &mut state.positive)?;
+                let output = if stage == 0 {
+                    &mut state.velocity
+                } else {
+                    &mut state.positive_x0
+                };
+                let scale = if t >= 1.0 {
+                    4.0
+                } else if t >= 0.7 {
+                    10.0 * (t * t)
+                } else {
+                    1.0
+                };
+                if scale != 1.0 {
+                    self.forward(input, 2 * step + stage, negative, &mut state.negative)?;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&state.guided)
+                            .arg(&0u64)
+                            .arg(&state.positive)
+                            .arg(&state.negative)
+                            .arg(&scale)
+                            .arg(&0f32)
+                            .arg(&(noise.len() as i64))
+                            .arg(&0i32)
+                            .arg(&*output)
+                            .launch(flat(noise.len()))?;
+                    }
+                } else {
+                    self.device.stream.memcpy_dtod(&state.positive, output)?;
+                }
+                let target = if stage == 0 {
+                    ptr(&state.x0, &self.device)
+                } else {
+                    ptr(&state.state, &self.device)
+                };
+                let second = if stage == 0 {
+                    0
+                } else {
+                    ptr(&state.positive_x0, &self.device)
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&update)
+                        .arg(&state.state)
+                        .arg(&state.velocity)
+                        .arg(&second)
+                        .arg(&target)
+                        .arg(&(noise.len() as u64))
+                        .arg(&(time - next))
+                        .launch(flat(noise.len()))?;
+                }
+            }
+        }
+        let values = self.device.stream.clone_dtoh(&state.state)?;
+        ensure!(
+            values.iter().all(|x| x.is_finite()),
+            "non-finite Heun output"
+        );
+        Ok(values)
+    }
+
+    pub fn open_hi3d(
+        root: &Path,
+        component: &str,
+        runtime: &Path,
+        coordinates: &[[i32; 3]],
+        budget: usize,
+    ) -> Result<Self> {
+        let checkpoint = Hi3DFlowCheckpoint::open(root, component)?;
+        let spec = checkpoint.spec.flow_spec();
+        let sites = SparseSites::new(coordinates.iter().map(|p| [0, p[0], p[1], p[2]]).collect())?;
+        let (parent, inverse) = sites.downsample(2)?;
+        let rows = parent.coordinates().len();
+        ensure!(
+            rows <= i32::MAX as usize / (3 * spec.model_channels),
+            "flow row extent overflow"
+        );
+        let device = Device::new(0)?;
+        let (free, _) = device.ctx.mem_get_info()?;
+        let h = spec.model_channels;
+        let context_rows = 2917;
+        let steps = 50;
+        let io_rows = coordinates.len();
+        let work_bytes = rows
+            .checked_mul((24 * h + 8 * h) * 2 + 4 * h * 4)
+            .and_then(|n| n.checked_add(context_rows * h * 20))
+            .context("flow work bytes overflow")?;
+        let io_bytes = io_rows
+            .checked_mul(48_000)
+            .context("sparse IO work bytes overflow")?;
+        device.workspace_budget(
+            free,
+            budget,
+            checkpoint
+                .runtime_bytes
+                .checked_add(work_bytes)
+                .and_then(|n| n.checked_add(io_bytes))
+                .context("flow placement bytes overflow")?,
+        )?;
+        let kernels = Kernels::load::<f16>(&device, &spec)?;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            runtime,
+            Rc::new(Closure::new(true, "sparse flow".into())),
+        )?;
+        blas.prepare_f16_biased()?;
+        let mut half = BTreeMap::new();
+        let mut float = BTreeMap::new();
+        for (name, tensor) in checkpoint.mapped.component_tensors()? {
+            if tensor.dtype == "F16" {
+                let values: Vec<_> = tensor
+                    .data
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f16::from_le_bytes(*b))
+                    .collect();
+                ensure!(
+                    values.iter().all(|x| x.is_finite()),
+                    "non-finite weight {name}"
+                );
+                half.insert(name, device.stream.clone_htod(&values)?);
+            } else {
+                let values: Vec<_> = tensor
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect();
+                ensure!(
+                    values.iter().all(|x| x.is_finite()),
+                    "non-finite weight {name}"
+                );
+                float.insert(name, device.stream.clone_htod(&values)?);
+            }
+        }
+        let mut blocks = Vec::with_capacity(spec.num_blocks);
+        for i in 0..spec.num_blocks {
+            let p = format!("blocks.{i}");
+            let linear = |name: &str, out, input| {
+                Linear::bind(&half, &device, &format!("{p}.{name}"), [out, input])
+            };
+            let parameter = |name: &str| ptr(&float[&format!("{p}.{name}")], &device);
+            blocks.push(Block {
+                qkv: linear("self_attn.to_qkv", 3 * h, h)?,
+                self_out: linear("self_attn.to_out", h, h)?,
+                cross_q: linear("cross_attn.to_q", h, h)?,
+                cross_kv: linear("cross_attn.to_kv", 2 * h, spec.cond_channels)?,
+                cross_out: linear("cross_attn.to_out", h, h)?,
+                fc1: linear("mlp.mlp.0", 4 * h, h)?,
+                fc2: linear("mlp.mlp.2", h, 4 * h)?,
+                projection: None,
+                norm_weight: parameter("norm2.weight"),
+                norm_bias: parameter("norm2.bias"),
+                modulation: parameter("modulation"),
+                gamma: [
+                    parameter("self_attn.q_rms_norm.gamma"),
+                    parameter("self_attn.k_rms_norm.gamma"),
+                    0,
+                    0,
+                ],
+            });
+        }
+        let input = Linear::bind(&float, &device, "input_layer", [256, spec.in_channels])?;
+        let output = Linear::bind(&float, &device, "out_layer", [spec.out_channels, 256])?;
+        let time = [
+            Linear::bind(&float, &device, "t_embedder.mlp.0", [h, 256])?,
+            Linear::bind(&float, &device, "t_embedder.mlp.2", [h, h])?,
+            Linear::bind(&float, &device, "adaLN_modulation.1", [6 * h, h])?,
+        ];
+        let points: Vec<_> = parent
+            .coordinates()
+            .iter()
+            .flat_map(|p| p[1..].iter().map(|&x| x as f32))
+            .collect();
+        let max = points.iter().copied().fold(0f32, f32::max) as usize;
+        let frequencies: Vec<_> = (0..48)
+            .map(|i| {
+                let f = 1.0 / 10000f32.powf((i % 16) as f32 / 16.0);
+                if max < 64 {
+                    f
+                } else {
+                    let wavelength = f * 64.0 / (2.0 * std::f32::consts::PI);
+                    let stretch = 64.0 / ((64 + max) / 2) as f32;
+                    let ratio = (wavelength - 1.0) / 23.0;
+                    let ratio = if wavelength > 24.0 {
+                        1.0
+                    } else if wavelength < 1.0 {
+                        stretch
+                    } else {
+                        ratio + (1.0 - ratio) * stretch
+                    };
+                    f * ratio
+                }
+            })
+            .collect();
+        let points = device.stream.clone_htod(&points)?;
+        let frequencies = device.stream.clone_htod(&frequencies)?;
+        let phases = device.stream.alloc_zeros(rows * 96)?;
+        unsafe {
+            device
+                .stream
+                .launch_builder(&kernels.phases)
+                .arg(&points)
+                .arg(&frequencies)
+                .arg(&(rows as i32))
+                .arg(&1i32)
+                .arg(&96i32)
+                .arg(&phases)
+                .launch(flat(rows * 48))?;
+        }
+        let work = Work::new(&device, rows, &spec, context_rows)?;
+        let flash = Flash::new_f16(
+            device.stream.clone(),
+            rows,
+            22,
+            22,
+            96,
+            Score {
+                scale: 1.0 / 96f32.sqrt(),
+                window_left: None,
+            },
+        )?;
+        let cross = Flash::new_f16(
+            device.stream.clone(),
+            rows,
+            22,
+            22,
+            96,
+            Score {
+                scale: 1.0 / 96f32.sqrt(),
+                window_left: None,
+            },
+        )?;
+        let mods = device.stream.alloc_zeros(steps * 6 * h)?;
+        let time_embeddings = device.stream.alloc_zeros(steps * h)?;
+        let remaining = device.workspace_budget(free, budget, io_bytes)?;
+        let io = SparseFlowIo::new(
+            &device,
+            &sites,
+            &parent,
+            &inverse,
+            (&half, &float),
+            remaining / 2,
+        )?;
+        device.workspace_budget(free, budget, rows * spec.in_channels * 8 * 4)?;
+        Ok(Self {
+            origin: Rc::new(()),
+            device,
+            spec,
+            rows,
+            coordinates: coordinates.to_vec(),
+            steps,
+            _inner_weights: half,
+            _f32: float,
+            blocks,
+            input,
+            output,
+            time,
+            kernels,
+            blas,
+            flash,
+            cross: CrossAttention::F16(cross),
+            work,
+            phases,
+            mods,
+            time_count: 0,
+            io: Some(io),
+            time_embeddings,
+        })
+    }
+}
+
+fn heun_schedule(rows: usize, steps: usize) -> Result<Vec<(f32, f32)>> {
+    ensure!(rows > 0 && steps > 0, "invalid Heun schedule extent");
+    let warp =
+        ((19.0 * rows as f64 - 20000.0) / (3.0 * rows as f64 + 60000.0)).clamp(1.0, 5.0) as f32;
+    let rational = |t: f32, scale: f32| scale * t / (1.0 + (scale - 1.0) * t);
+    let delta = 1.0 / steps as f32;
+    let warped: Vec<_> = (0..=steps)
+        .map(|i| {
+            let base = if i <= (steps / 2) {
+                1.0 - i as f32 * delta
+            } else {
+                (steps - i) as f32 * delta
+            };
+            rational(rational(base, 2.0), warp)
+        })
+        .collect();
+    let sigmas: Vec<_> = warped.iter().map(|&t| 0.002 + 0.998 * t).collect();
+    Ok((0..steps)
+        .map(|i| {
+            (
+                sigmas[i] * (1.0 + if warped[i] > 0.985 { 0.04 } else { 0.002 }),
+                sigmas[i + 1],
+            )
+        })
+        .collect())
+}
+
+impl<T: FlowElement> Flow<T> {
     fn linear_f32(
         &self,
         linear: Linear<f32>,
@@ -632,31 +1605,15 @@ impl PixalFlow {
         output: u64,
         silu: bool,
     ) -> Result<()> {
-        self.blas.linear_f32(
-            linear.weight,
-            matrix(input, rows, linear.weight.shape[1] as usize)?,
-            &mut TensorMut(matrix(output, rows, linear.weight.shape[0] as usize)?),
-        )?;
-        let width = linear.weight.shape[0];
-        unsafe {
-            let mut launch = self.device.stream.launch_builder(if silu {
-                &self.kernels.silu
-            } else {
-                &self.kernels.bias
-            });
-            launch.arg(&output).arg(&linear.bias.ptr).arg(&output);
-            launch
-                .arg(
-                    &(if silu {
-                        rows as u32 * width
-                    } else {
-                        rows as u32
-                    }),
-                )
-                .arg(&width)
-                .launch(flat(rows * width as usize))?;
-        }
-        Ok(())
+        run_linear_f32(
+            &self.device,
+            &self.blas,
+            &self.kernels,
+            linear,
+            rows,
+            [input, output],
+            silu,
+        )
     }
     fn set_times(&mut self, times: &[f32]) -> Result<()> {
         ensure!(
@@ -689,6 +1646,10 @@ impl PixalFlow {
         }
         self.linear_f32(self.time[0], n, ptr(&embed, d), ptr(&first, d), true)?;
         self.linear_f32(self.time[1], n, ptr(&first, d), ptr(&second, d), false)?;
+        if T::HALF {
+            self.kernels
+                .cast(d, ptr(&second, d), ptr(&self.time_embeddings, d), n * h)?;
+        }
         let zero = d.stream.alloc_zeros::<f32>(h)?;
         unsafe {
             d.stream
@@ -711,14 +1672,19 @@ impl PixalFlow {
         global: &[f32],
         projected: &[f32],
         coordinates: &[[i32; 3]],
-    ) -> Result<Conditioning> {
+    ) -> Result<Conditioning<T>> {
         ensure!(
             coordinates == self.coordinates,
             "conditioning coordinate rows differ from flow setup"
         );
         ensure!(
-            global.len() == 5 * self.spec.cond_channels
-                && projected.len() == self.rows * self.spec.projection_width(),
+            global.len() == (if T::HALF { 2917 } else { 5 }) * self.spec.cond_channels
+                && projected.len()
+                    == if T::HALF {
+                        0
+                    } else {
+                        self.rows * self.spec.projection_width()
+                    },
             "flow conditioning shape mismatch"
         );
         ensure!(
@@ -726,10 +1692,10 @@ impl PixalFlow {
             "non-finite conditioning"
         );
         let cast = |values: &[f32]| -> Result<_> {
-            let values: Vec<_> = values.iter().map(|&v| bf16::from_f32(v)).collect();
+            let values: Vec<_> = values.iter().map(|&v| T::from_f32(v)).collect();
             ensure!(
-                values.iter().all(|x| x.is_finite()),
-                "conditioning overflows BF16"
+                values.iter().all(|x| T::finite(*x)),
+                "conditioning overflows flow element type"
             );
             Ok(self.device.stream.clone_htod(&values)?)
         };
@@ -739,7 +1705,12 @@ impl PixalFlow {
             projected: cast(projected)?,
         })
     }
-    fn block(&mut self, index: usize, modulation: u64, conditioning: &Conditioning) -> Result<()> {
+    fn block(
+        &mut self,
+        index: usize,
+        modulation: u64,
+        conditioning: &Conditioning<T>,
+    ) -> Result<()> {
         let d = &self.device;
         let n = self.rows;
         let h = self.spec.model_channels;
@@ -771,24 +1742,42 @@ impl PixalFlow {
         self.modulate(norm, bm, 0)?;
         b.qkv.run(&self.blas, n, norm, ptr(&self.work.qkv, d))?;
         k.unpack(d, ptr(&self.work.qkv, d), [q, key, value], n, 3)?;
-        k.l2(d, q, q, b.gamma[0], n, false)?;
-        k.l2(d, key, kn, b.gamma[1], n, true)?;
-        for (kernel, data) in [(&k.rope, q), (&k.rope_hm, kn)] {
-            unsafe {
-                d.stream
-                    .launch_builder(kernel)
-                    .arg(&data)
-                    .arg(&self.phases)
-                    .arg(&(n as i32))
-                    .arg(&(heads as i32))
-                    .arg(&(dim as i32))
-                    .arg(&(dim as i32))
-                    .launch(flat(n * heads * dim / 2))?;
+        if T::HALF {
+            for data in [q, key] {
+                unsafe {
+                    d.stream
+                        .launch_builder(&k.rope)
+                        .arg(&data)
+                        .arg(&self.phases)
+                        .arg(&(n as i32))
+                        .arg(&(heads as i32))
+                        .arg(&(dim as i32))
+                        .arg(&(dim as i32))
+                        .arg(&1i32)
+                        .launch(flat(n * heads * dim / 2))?;
+                }
             }
         }
-        self.flash.run(
+        k.l2(d, q, q, b.gamma[0], n, false)?;
+        k.l2(d, key, kn, b.gamma[1], n, true)?;
+        if !T::HALF {
+            for (kernel, data) in [(&k.rope, q), (&k.rope_hm, kn)] {
+                unsafe {
+                    d.stream
+                        .launch_builder(kernel)
+                        .arg(&data)
+                        .arg(&self.phases)
+                        .arg(&(n as i32))
+                        .arg(&(heads as i32))
+                        .arg(&(dim as i32))
+                        .arg(&(dim as i32))
+                        .launch(flat(n * heads * dim / 2))?;
+                }
+            }
+        }
+        T::attention(
+            &mut self.flash,
             &self.work.q,
-            h,
             &self.work.kn,
             &self.work.v,
             &mut self.work.attention,
@@ -814,65 +1803,107 @@ impl PixalFlow {
             (1e-6, false),
         )?;
         b.cross_q.run(&self.blas, n, norm, q)?;
-        b.cross_kv.run(
-            &self.blas,
-            5,
-            ptr(&conditioning.global, d),
-            ptr(&self.work.cross_kv, d),
-        )?;
-        k.unpack(
-            d,
-            ptr(&self.work.cross_kv, d),
-            [0, ptr(&self.work.cross_k, d), ptr(&self.work.cross_v, d)],
-            5,
-            2,
-        )?;
-        k.l2(d, q, q, b.gamma[2], n, false)?;
-        k.l2(
-            d,
-            ptr(&self.work.cross_k, d),
-            ptr(&self.work.cross_kn, d),
-            b.gamma[3],
-            5,
-            true,
-        )?;
-        k.upcast(d, q, ptr(&self.work.cross_q32, d), n * h)?;
-        k.upcast(
-            d,
-            ptr(&self.work.cross_kn, d),
-            ptr(&self.work.cross_k32, d),
-            5 * h,
-        )?;
-        k.upcast(
-            d,
-            ptr(&self.work.cross_v, d),
-            ptr(&self.work.cross_v32, d),
-            5 * h,
-        )?;
-        let q32 = view(
-            &self.work.cross_q32,
-            &d.stream,
-            0,
-            [heads as u32, n as u32, dim as u32],
-            [dim as u64, h as u64, 1],
-        )?;
-        let k32 = dense(&self.work.cross_k32, d, [heads as u32, 5, dim as u32])?;
-        let v32 = dense(&self.work.cross_v32, d, [heads as u32, 5, dim as u32])?;
-        let out32 = view(
-            &self.work.cross_out32,
-            &d.stream,
-            0,
-            [heads as u32, n as u32, dim as u32],
-            [dim as u64, h as u64, 1],
-        )?;
-        self.cross
-            .run(&self.blas, q32, k32, v32, &mut TensorMut(out32))?;
-        k.cast(d, ptr(&self.work.cross_out32, d), attention, n * h)?;
-        b.cross_out.run(&self.blas, n, attention, projected)?;
-        b.projection
-            .run(&self.blas, n, ptr(&conditioning.projected, d), norm)?;
-        k.residual(d, norm, projected, n * h)?;
-        k.residual(d, hidden, norm, n * h)?;
+        if T::HALF {
+            let context_rows = conditioning.global.len() / self.spec.cond_channels;
+            b.cross_kv.run(
+                &self.blas,
+                context_rows,
+                ptr(&conditioning.global, d),
+                ptr(&self.work.cross_kv, d),
+            )?;
+            k.unpack(
+                d,
+                ptr(&self.work.cross_kv, d),
+                [0, ptr(&self.work.cross_kn, d), ptr(&self.work.cross_v, d)],
+                context_rows,
+                2,
+            )?;
+            let CrossAttention::F16(cross) = &mut self.cross else {
+                anyhow::bail!("F16 cross binding missing");
+            };
+            T::attention(
+                cross,
+                &self.work.q,
+                &self.work.cross_kn,
+                &self.work.cross_v,
+                &mut self.work.attention,
+                Shape {
+                    rows: n,
+                    start: 0,
+                    capacity: context_rows,
+                    q_heads: heads,
+                    kv_heads: heads,
+                    head_dim: dim,
+                    causal: false,
+                    window_left: None,
+                },
+            )?;
+            b.cross_out.run(&self.blas, n, attention, projected)?;
+            k.residual(d, hidden, projected, n * h)?;
+        } else {
+            b.cross_kv.run(
+                &self.blas,
+                5,
+                ptr(&conditioning.global, d),
+                ptr(&self.work.cross_kv, d),
+            )?;
+            k.unpack(
+                d,
+                ptr(&self.work.cross_kv, d),
+                [0, ptr(&self.work.cross_k, d), ptr(&self.work.cross_v, d)],
+                5,
+                2,
+            )?;
+            k.l2(d, q, q, b.gamma[2], n, false)?;
+            k.l2(
+                d,
+                ptr(&self.work.cross_k, d),
+                ptr(&self.work.cross_kn, d),
+                b.gamma[3],
+                5,
+                true,
+            )?;
+            k.upcast(d, q, ptr(&self.work.cross_q32, d), n * h)?;
+            k.upcast(
+                d,
+                ptr(&self.work.cross_kn, d),
+                ptr(&self.work.cross_k32, d),
+                5 * h,
+            )?;
+            k.upcast(
+                d,
+                ptr(&self.work.cross_v, d),
+                ptr(&self.work.cross_v32, d),
+                5 * h,
+            )?;
+            let q32 = view(
+                &self.work.cross_q32,
+                &d.stream,
+                0,
+                [heads as u32, n as u32, dim as u32],
+                [dim as u64, h as u64, 1],
+            )?;
+            let k32 = dense(&self.work.cross_k32, d, [heads as u32, 5, dim as u32])?;
+            let v32 = dense(&self.work.cross_v32, d, [heads as u32, 5, dim as u32])?;
+            let out32 = view(
+                &self.work.cross_out32,
+                &d.stream,
+                0,
+                [heads as u32, n as u32, dim as u32],
+                [dim as u64, h as u64, 1],
+            )?;
+            let CrossAttention::F32(cross) = &mut self.cross else {
+                anyhow::bail!("F32 cross binding missing");
+            };
+            cross.run(&self.blas, q32, k32, v32, &mut TensorMut(out32))?;
+            k.cast(d, ptr(&self.work.cross_out32, d), attention, n * h)?;
+            b.cross_out.run(&self.blas, n, attention, projected)?;
+            b.projection
+                .context("projected cross branch missing")?
+                .run(&self.blas, n, ptr(&conditioning.projected, d), norm)?;
+            k.residual(d, norm, projected, n * h)?;
+            k.residual(d, hidden, norm, n * h)?;
+        }
         k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
         self.modulate(norm, bm, 3)?;
         b.fc1.run(&self.blas, n, norm, ptr(&self.work.ff, d))?;
@@ -899,8 +1930,8 @@ impl PixalFlow {
     }
     fn modulate(&self, values: u64, modulation: u64, part: usize) -> Result<()> {
         let h = self.spec.model_channels;
-        let shift = modulation + (part * h * 2) as u64;
-        let scale = shift + (h * 2) as u64;
+        let shift = modulation + (part * h * size_of::<T::Parameters>()) as u64;
+        let scale = shift + (h * size_of::<T::Parameters>()) as u64;
         unsafe {
             self.device
                 .stream
@@ -924,7 +1955,7 @@ impl PixalFlow {
     }
     fn gated_add(&self, values: u64, modulation: u64, part: usize) -> Result<()> {
         let h = self.spec.model_channels;
-        let gate = modulation + (part * h * 2) as u64;
+        let gate = modulation + (part * h * size_of::<T::Parameters>()) as u64;
         unsafe {
             self.device
                 .stream
@@ -949,7 +1980,7 @@ impl PixalFlow {
         &mut self,
         input: &CudaSlice<f32>,
         time: usize,
-        conditioning: &Conditioning,
+        conditioning: &Conditioning<T>,
         output: &mut CudaSlice<f32>,
     ) -> Result<()> {
         self.forward_observe(input, time, conditioning, output, |_, _| Ok(()))
@@ -958,56 +1989,85 @@ impl PixalFlow {
         &mut self,
         input: &CudaSlice<f32>,
         time: usize,
-        conditioning: &Conditioning,
+        conditioning: &Conditioning<T>,
         output: &mut CudaSlice<f32>,
         mut observe: impl FnMut(&Self, usize) -> Result<()>,
     ) -> Result<()> {
         ensure!(
             time < self.time_count
-                && input.len() == self.rows * self.spec.in_channels
+                && input.len()
+                    == self.io.as_ref().map_or(self.rows, |io| io.rows) * self.spec.in_channels
                 && output.len() == input.len(),
             "flow input/time extent differs from setup"
         );
         validate_conditioning_origin(&conditioning.origin, &self.origin)?;
         ensure!(
-            conditioning.global.len() == 5 * self.spec.cond_channels
-                && conditioning.projected.len() == self.rows * self.spec.projection_width(),
+            conditioning.global.len() == (if T::HALF { 2917 } else { 5 }) * self.spec.cond_channels
+                && conditioning.projected.len()
+                    == if T::HALF {
+                        0
+                    } else {
+                        self.rows * self.spec.projection_width()
+                    },
             "conditioning belongs to different flow geometry"
         );
         let n = self.rows;
         let h = self.spec.model_channels;
-        let input_ptr = if self.spec.sparse() {
-            ptr(input, &self.device)
+        if let Some(io) = &mut self.io {
+            let d = &self.device;
+            let embedding = ptr(&self.time_embeddings, d) + (time * h * 2) as u64;
+            io.encode(
+                d,
+                &self.blas,
+                &self.kernels,
+                self.input,
+                [ptr(input, d), embedding, ptr(&self.work.hidden, d)],
+            )?;
         } else {
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&self.kernels.transpose)
-                    .arg(input)
-                    .arg(&self.work.input_rows)
-                    .arg(&(self.spec.in_channels as i64))
-                    .arg(&(n as i64))
-                    .launch(flat(input.len()))?;
-            }
-            ptr(&self.work.input_rows, &self.device)
-        };
-        self.linear_f32(
-            self.input,
-            n,
-            input_ptr,
-            ptr(&self.work.outer, &self.device),
-            false,
-        )?;
-        self.kernels.cast(
-            &self.device,
-            ptr(&self.work.outer, &self.device),
-            ptr(&self.work.hidden, &self.device),
-            n * h,
-        )?;
+            let input_ptr = if self.spec.sparse() {
+                ptr(input, &self.device)
+            } else {
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&self.kernels.transpose)
+                        .arg(input)
+                        .arg(&self.work.input_rows)
+                        .arg(&(self.spec.in_channels as i64))
+                        .arg(&(n as i64))
+                        .launch(flat(input.len()))?;
+                }
+                ptr(&self.work.input_rows, &self.device)
+            };
+            self.linear_f32(
+                self.input,
+                n,
+                input_ptr,
+                ptr(&self.work.outer, &self.device),
+                false,
+            )?;
+            self.kernels.cast(
+                &self.device,
+                ptr(&self.work.outer, &self.device),
+                ptr(&self.work.hidden, &self.device),
+                n * h,
+            )?;
+        }
         let modulation = ptr(&self.mods, &self.device) + (time * 6 * h * 2) as u64;
         for i in 0..self.blocks.len() {
             self.block(i, modulation, conditioning)?;
             observe(self, i)?;
+        }
+        if let Some(io) = &mut self.io {
+            let d = &self.device;
+            return io.decode(
+                d,
+                &self.blas,
+                &self.kernels,
+                self.output,
+                ptr(&self.work.hidden, d),
+                ptr(output, d),
+            );
         }
         self.kernels.upcast(
             &self.device,
@@ -1189,7 +2249,7 @@ fn schedule(sparse: bool, steps: usize) -> Vec<f64> {
         })
         .collect()
 }
-impl PixalFlow {
+impl Flow<bf16> {
     pub fn sample(
         &mut self,
         noise: &[f32],
