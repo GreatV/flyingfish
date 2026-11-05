@@ -244,7 +244,6 @@ impl MappedCheckpoint {
             files: BTreeMap::from([(name.to_owned(), file)]),
         })
     }
-    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
         let shard = self
             .index
