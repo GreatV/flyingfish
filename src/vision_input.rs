@@ -1691,6 +1691,199 @@ mod loopvl_tests {
     }
 }
 
+/// EXIF-oriented alpha bounding square, white composite and centered 1.2 padding.
+pub fn prepare_rgba_white(
+    input: &[u8],
+    shape: [usize; 2],
+    orientation: u8,
+) -> Result<(Vec<u8>, [usize; 2])> {
+    let [height, width] = shape;
+    ensure!(
+        height > 0
+            && width > 0
+            && height.checked_mul(width).and_then(|n| n.checked_mul(4)) == Some(input.len())
+            && (1..=8).contains(&orientation),
+        "RGBA extent/orientation"
+    );
+    let [h, w] = if orientation >= 5 {
+        [width, height]
+    } else {
+        shape
+    };
+    let source = |x: usize, y: usize| {
+        let (sx, sy) = match orientation {
+            1 => (x, y),
+            2 => (width - 1 - x, y),
+            3 => (width - 1 - x, height - 1 - y),
+            4 => (x, height - 1 - y),
+            5 => (y, x),
+            6 => (y, height - 1 - x),
+            7 => (width - 1 - y, height - 1 - x),
+            8 => (width - 1 - y, x),
+            _ => unreachable!(),
+        };
+        &input[(sy * width + sx) * 4..][..4]
+    };
+    let mut bounds = [w, h, 0, 0];
+    for y in 0..h {
+        for x in 0..w {
+            if source(x, y)[3] != 0 {
+                bounds[0] = bounds[0].min(x);
+                bounds[1] = bounds[1].min(y);
+                bounds[2] = bounds[2].max(x + 1);
+                bounds[3] = bounds[3].max(y + 1);
+            }
+        }
+    }
+    let (left, top, crop_h, crop_w) = if bounds[2] == 0 {
+        (0, 0, h, w)
+    } else {
+        let bh = bounds[3] - bounds[1];
+        let bw = bounds[2] - bounds[0];
+        let side = bh.max(bw);
+        (
+            bounds[0] as isize - ((side - bw) / 2) as isize,
+            bounds[1] as isize - ((side - bh) / 2) as isize,
+            side,
+            side,
+        )
+    };
+    let side = (crop_h.max(crop_w) as f64 * 1.2) as usize;
+    let size = side
+        .checked_mul(side)
+        .and_then(|n| n.checked_mul(3))
+        .context("prepared image extent overflow")?;
+    let mut out = vec![255; size];
+    let dx = (side - crop_w) / 2;
+    let dy = (side - crop_h) / 2;
+    for y in 0..crop_h {
+        for x in 0..crop_w {
+            let sx = left + x as isize;
+            let sy = top + y as isize;
+            if sx < 0 || sy < 0 || sx >= w as isize || sy >= h as isize {
+                continue;
+            }
+            let p = source(sx as usize, sy as usize);
+            let a = u32::from(p[3]);
+            for c in 0..3 {
+                out[((y + dy) * side + x + dx) * 3 + c] =
+                    ((u32::from(p[c]) * a + 255 * (255 - a) + 127) / 255) as u8;
+            }
+        }
+    }
+    Ok((out, [side, side]))
+}
+
+/// HWC F32 input to CHW F32 output; half-pixel coordinates and clamped edges.
+pub fn resize_bilinear_chw_f32(
+    input: &[f32],
+    shape: [usize; 3],
+    output: [usize; 2],
+) -> Result<Vec<f32>> {
+    let [height, width, channels] = shape;
+    let [oh, ow] = output;
+    ensure!(
+        height > 0
+            && width > 0
+            && channels > 0
+            && oh > 0
+            && ow > 0
+            && height
+                .checked_mul(width)
+                .and_then(|n| n.checked_mul(channels))
+                == Some(input.len())
+            && input.iter().all(|v| v.is_finite()),
+        "bilinear F32 input extent/value"
+    );
+    let count = oh
+        .checked_mul(ow)
+        .and_then(|n| n.checked_mul(channels))
+        .context("bilinear F32 output overflow")?;
+    let mut out = vec![0.0; count];
+    for y in 0..oh {
+        let sy = ((y as f32 + 0.5) * (height as f32 / oh as f32) - 0.5).max(0.0);
+        let iy = (sy as usize).min(height - 1);
+        let fy = sy - iy as f32;
+        let jy = (iy + 1).min(height - 1);
+        for x in 0..ow {
+            let sx = ((x as f32 + 0.5) * (width as f32 / ow as f32) - 0.5).max(0.0);
+            let ix = (sx as usize).min(width - 1);
+            let fx = sx - ix as f32;
+            let jx = (ix + 1).min(width - 1);
+            for c in 0..channels {
+                let at = |yy, xx| input[(yy * width + xx) * channels + c];
+                let a = at(iy, ix) * (1.0 - fx) + at(iy, jx) * fx;
+                let b = at(jy, ix) * (1.0 - fx) + at(jy, jx) * fx;
+                out[(c * oh + y) * ow + x] = a * (1.0 - fy) + b * fy;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// HWC F32 bicubic resize with coefficient -0.75 and half-pixel coordinates.
+pub fn resize_bicubic_hwc_f32(
+    input: &[f32],
+    shape: [usize; 3],
+    output: [usize; 2],
+) -> Result<Vec<f32>> {
+    let [height, width, channels] = shape;
+    let [oh, ow] = output;
+    ensure!(
+        height > 0
+            && width > 0
+            && channels > 0
+            && oh > 0
+            && ow > 0
+            && height
+                .checked_mul(width)
+                .and_then(|n| n.checked_mul(channels))
+                == Some(input.len())
+            && input.iter().all(|v| v.is_finite()),
+        "bicubic F32 input extent/value"
+    );
+    let count = oh
+        .checked_mul(ow)
+        .and_then(|n| n.checked_mul(channels))
+        .context("bicubic F32 output overflow")?;
+    let coefficient = |v: f32| {
+        let x = v.abs();
+        if x <= 1.0 {
+            (1.25 * x - 2.25) * x * x + 1.0
+        } else if x < 2.0 {
+            ((-0.75 * x + 3.75) * x - 6.0) * x + 3.0
+        } else {
+            0.0
+        }
+    };
+    let mut out = vec![0.0; count];
+    for y in 0..oh {
+        let sy = (y as f32 + 0.5) * (height as f32 / oh as f32) - 0.5;
+        let iy = sy.floor() as isize;
+        let wy: [f32; 4] = std::array::from_fn(|i| coefficient(sy - (iy + i as isize - 1) as f32));
+        for x in 0..ow {
+            let sx = (x as f32 + 0.5) * (width as f32 / ow as f32) - 0.5;
+            let ix = sx.floor() as isize;
+            let wx: [f32; 4] =
+                std::array::from_fn(|i| coefficient(sx - (ix + i as isize - 1) as f32));
+            for c in 0..channels {
+                let mut value = 0.0;
+                for (j, &cy) in wy.iter().enumerate() {
+                    let yy = (iy + j as isize - 1).clamp(0, height as isize - 1) as usize;
+                    let mut row = 0.0;
+                    for (i, &cx) in wx.iter().enumerate() {
+                        let xx = (ix + i as isize - 1).clamp(0, width as isize - 1) as usize;
+                        row += input[(yy * width + xx) * channels + c] * cx;
+                    }
+                    value += row * cy;
+                }
+                out[(y * ow + x) * channels + c] = value;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Alpha>204 bounding box, 1.1 square crop, transparent padding and black composite.
 pub fn rgba_foreground_crop(
     input: &[u8],
