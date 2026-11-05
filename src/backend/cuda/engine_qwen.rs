@@ -4,7 +4,7 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    flash::{Flash, Score},
+    flash::{Flash, Query, Score},
     gdn::{
         CUDA_GRID_YZ_MAX, GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
         GdnPlan,
@@ -665,6 +665,7 @@ pub(super) struct Runtime {
     vision_bytes: usize,
     media_reserved_bytes: usize,
     audio: Option<super::audio_runtime::AudioRuntime>,
+    image_blocks: Option<CudaSlice<u32>>,
     #[cfg(test)]
     pub(super) audio_encode_calls: usize,
     #[cfg(test)]
@@ -2146,6 +2147,7 @@ impl Runtime {
             vision_bytes: 0,
             media_reserved_bytes: 0,
             audio: None,
+            image_blocks: None,
             #[cfg(test)]
             audio_encode_calls: 0,
             #[cfg(test)]
@@ -2608,6 +2610,7 @@ impl Engine {
 
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
+            q.image_blocks = None;
             #[cfg(test)]
             {
                 q.vision_encode_calls = 0;
@@ -2657,7 +2660,7 @@ impl Engine {
                             .model_spec
                             .audio
                             .as_ref()
-                            .is_some_and(|a| id == a.token)
+                            .is_some_and(|a| id == a.tokens()[0])
                     {
                         0
                     } else {
@@ -2711,7 +2714,7 @@ impl Engine {
         let audio_bytes = if input.audio.is_empty() {
             0
         } else {
-            super::audio_runtime::AudioRuntime::request_bytes(model, input, capacity)?
+            super::audio_runtime::AudioRuntime::request_bytes(model, input, &plan, capacity)?
         };
         let vision_bytes = if plan.slots().is_empty() {
             0
@@ -2730,7 +2733,20 @@ impl Engine {
                 .checked_add(feature_bytes)
                 .context("audio request bytes overflow")?
         };
-        let request_bytes = vision_bytes.max(audio_peak);
+        let block_bytes = if model.per_layer_input.is_none()
+            && model.architecture == crate::model_spec::Architecture::Gemma4
+            && !plan.slots().is_empty()
+        {
+            capacity
+                .checked_mul(8)
+                .context("image block bytes overflow")?
+        } else {
+            0
+        };
+        let request_bytes = vision_bytes
+            .max(audio_peak)
+            .checked_add(block_bytes)
+            .context("media request bytes overflow")?;
         Ok((audio_bytes, vision_bytes, request_bytes))
     }
 
@@ -2739,6 +2755,11 @@ impl Engine {
         input: &crate::vision_input::MultimodalInput<'_>,
         mut trace: Option<&mut Trace>,
     ) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        ensure!(
+            self.model_spec.architecture != crate::model_spec::Architecture::Gemma4,
+            "Gemma 4 media attention kernels are not built for HIP"
+        );
         ensure!(self.qwen.is_some(), "packed images require Qwen");
         ensure!(
             self.state.kv.iter().all(|kv| kv.compact.is_none()),
@@ -2777,8 +2798,14 @@ impl Engine {
         self.poisoned = true;
         let images = if vision_bytes != 0 {
             let vision = q.vision.as_ref().context("vision runtime missing")?;
-            let request =
-                vision.prepare(&self.device, &mut self.blas, input, self.capacity, reserve)?;
+            let request = vision.prepare(
+                &self.device,
+                &mut self.blas,
+                input,
+                self.capacity,
+                plan.clone(),
+                reserve,
+            )?;
             let images = vision.encode(
                 &self.device.stream,
                 &self.blas,
@@ -2808,8 +2835,27 @@ impl Engine {
             )?;
             #[cfg(test)]
             {
-                q.audio_encode_calls += input.audio.len();
+                q.audio_encode_calls += if matches!(
+                    self.model_spec.audio,
+                    Some(crate::model_spec::AudioConfig::Raw(_))
+                ) {
+                    1
+                } else {
+                    input.audio.len()
+                };
             }
+        }
+        if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
+            && self.model_spec.per_layer_input.is_none()
+            && !plan.slots().is_empty()
+        {
+            ensure!(
+                plan.slots()
+                    .iter()
+                    .all(|slot| slot.tokens.len() <= self.chunk),
+                "prefill workspace cannot fit a complete image block"
+            );
+            q.image_blocks = Some(self.device.stream.clone_htod(&plan.image_blocks()?)?);
         }
         if let Some(trace) = trace.as_mut() {
             let values = self.device.stream.clone_dtoh(&images.features)?;
@@ -3176,6 +3222,42 @@ impl Engine {
             settings.kv_format,
             s,
         )?;
+        let setup_kv = || -> Result<_> {
+            let kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
+                None
+            } else {
+                Some((
+                    s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
+                    s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
+                ))
+            };
+            let capture_checkpoint = if glm
+                || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2
+            {
+                None
+            } else {
+                Some(super::super::state::StateCheckpoint::new(
+                    &state,
+                    &model_spec,
+                    1,
+                    s,
+                )?)
+            };
+            Ok((kv_scratch, capture_checkpoint))
+        };
+        let early_kv = gemma.then(setup_kv).transpose()?;
+        let setup_blas = || -> Result<_> {
+            let ops = Ops::new(&device.ctx)?;
+            #[cfg(feature = "cuda")]
+            let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+            #[cfg(feature = "rocm")]
+            let mut blas = Blas::new(device.stream.clone())?;
+            if model_spec.linear_format.fp8_layout().is_some() {
+                blas.enable_fp8(&device.ctx)?;
+            }
+            Ok((ops, blas))
+        };
+        let early_blas = gemma.then(setup_blas).transpose()?;
         let prefix_cache = settings.prefix_cache;
         #[cfg(feature = "cuda")]
         let mut catalog =
@@ -3247,25 +3329,10 @@ impl Engine {
             identity.attention_kv_dtype = settings.kv_format.tag().into();
         }
         let weights = catalog.take_globals()?;
-        let mut kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
-            None
-        } else {
-            Some((
-                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
-                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
-            ))
+        let (mut kv_scratch, capture_checkpoint) = match early_kv {
+            Some(fixed) => fixed,
+            None => setup_kv()?,
         };
-        let capture_checkpoint =
-            if glm || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
-                None
-            } else {
-                Some(super::super::state::StateCheckpoint::new(
-                    &state,
-                    &model_spec,
-                    1,
-                    s,
-                )?)
-            };
         #[cfg(feature = "cuda")]
         let arena_bytes = (0..model_spec.layers.len())
             .map(|i| {
@@ -3283,14 +3350,10 @@ impl Engine {
         } else {
             Some(s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?)
         };
-        let ops = Ops::new(&device.ctx)?;
-        #[cfg(feature = "cuda")]
-        let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        #[cfg(feature = "rocm")]
-        let mut blas = Blas::new(device.stream.clone())?;
-        if model_spec.linear_format.fp8_layout().is_some() {
-            blas.enable_fp8(&device.ctx)?;
-        }
+        let (ops, mut blas) = match early_blas {
+            Some(fixed) => fixed,
+            None => setup_blas()?,
+        };
         let mut draft = if let Some(draft_config) = &draft_config {
             let path = settings
                 .draft_model
@@ -5469,7 +5532,24 @@ impl Engine {
                                 layout.sliding_window.map(|window| window as usize - 1)
                             },
                         };
-                        flash.run(&w.qkv, q_stride, stage_k, stage_v, &mut w.attn, shape)?;
+                        if !decode
+                            && layout.sliding_window.is_some()
+                            && let Some(blocks) = &q.image_blocks
+                        {
+                            flash.run_masked(Query {
+                                q: &w.qkv,
+                                q_row_stride: q_stride,
+                                k: stage_k,
+                                v: stage_v,
+                                out: &mut w.attn,
+                                shape,
+                                keys: shape.start + rows,
+                                prefix: None,
+                                image_blocks: Some((blocks, self.position - shape.start)),
+                            })?;
+                        } else {
+                            flash.run(&w.qkv, q_stride, stage_k, stage_v, &mut w.attn, shape)?;
+                        }
                     }
                 }
                 if overflow && !reader {
@@ -6005,7 +6085,171 @@ impl Engine {
         )
     }
 
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn gemma_media_prefix_scope(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+    ) -> Result<()> {
+        ensure!(
+            self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
+                && self.model_spec.hidden == 5376
+                && self.model_spec.per_layer_input.is_none()
+                && self.config.num_hidden_layers == 60
+                && self.position == 0
+                && self.graph.is_none(),
+            "invalid 31B six-layer control scope"
+        );
+        let (_, vision, request) =
+            Self::multimodal_request_bytes(&self.model_spec, input, self.capacity)?;
+        ensure!(vision != 0, "prefix scope requires image input");
+        self.prepare_vision_weights(request)?;
+        let runtime = self.qwen.as_mut().context("prefix runtime missing")?;
+        ensure!(
+            runtime.dense_graphs.len() == runtime.layers.len() + 2,
+            "prefix control requires the full streamed capture"
+        );
+        let head = runtime
+            .dense_graphs
+            .pop()
+            .context("prefix head graph missing")?;
+        runtime.dense_graphs.truncate(7);
+        runtime.dense_graphs.push(head);
+        runtime.layers.truncate(6);
+        self.model_spec.layers.truncate(6);
+        self.config.num_hidden_layers = 6;
+        self.reset()
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn gemma_graph_layers_probe(
+        &mut self,
+        token: u32,
+        input: &[bf16],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            self.config.num_hidden_layers == 6
+                && input.len() == width
+                && self.position < self.capacity
+                && self.dense_graph_ready(),
+            "invalid captured prefix probe"
+        );
+        self.set_token(token)?;
+        self.qwen
+            .as_ref()
+            .context("prefix graph runtime missing")?
+            .dense_graphs[0]
+            .launch()?;
+        self.device
+            .stream
+            .memcpy_htod(input, &mut self.work.x.slice_mut(..width))?;
+        let step = crate::backend::Step {
+            rows: 1,
+            input: crate::backend::Input::Token,
+            head: Head::Last,
+            mask: crate::backend::Mask::Causal,
+        };
+        for layer in 0..6 {
+            self.qwen_layer_begin(layer, step)?;
+            self.qwen
+                .as_ref()
+                .context("prefix graph runtime missing")?
+                .dense_graphs[layer + 1]
+                .launch()?;
+            let values = self.device.stream.clone_dtoh(&self.work.x.slice(..width))?;
+            trace.add(
+                format!(".{layer}"),
+                vec![1, width],
+                values.into_iter().map(bf16::to_f32).collect(),
+            )?;
+            self.dense_layer_end(layer)?;
+        }
+        self.qwen
+            .as_ref()
+            .context("prefix graph runtime missing")?
+            .dense_graphs[7]
+            .launch()?;
+        self.position += 1;
+        self.pending_token = Some(self.token()?);
+        Ok(())
+    }
+
     #[cfg(test)]
+    pub(crate) fn gemma_final_probe(
+        &mut self,
+        input: &[bf16],
+        trace: Option<&mut crate::trace::Trace>,
+    ) -> Result<Vec<bf16>> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            !input.is_empty() && input.len().is_multiple_of(width),
+            "Gemma final probe input extent"
+        );
+        let rows = input.len() / width;
+        let stream = &self.device.stream;
+        stream.memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
+        stream.memset_zeros(&mut self.work.n.slice_mut(..input.len()))?;
+        self.state
+            .set_sequence(stream, 0, u32::try_from(rows)?, self.workspace_rows as u32)?;
+        self.qwen
+            .as_ref()
+            .context("head probe runtime missing")?
+            .common
+            .norm
+            .rms_with(
+                stream,
+                RowDomain {
+                    meta: self.state.seq_ref(stream)?,
+                    row_base: 0,
+                    row_capacity: rows as u32,
+                },
+                heads(&self.work.x, stream, 0, rows, 1, width as u32)?,
+                vector(
+                    self.weights
+                        .norm
+                        .as_ref()
+                        .context("head probe norm missing")?,
+                    stream,
+                )?,
+                &mut TensorMut(heads(&self.work.n, stream, 0, rows, 1, width as u32)?),
+                RmsOptions {
+                    mode: norm_mode(&self.model_spec),
+                    eps: self.model_spec.rms_eps,
+                },
+            )?;
+        self.run_operator(
+            crate::backend::Operator::Head,
+            0,
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            &mut None,
+        )?;
+        trace_value(
+            &mut trace.map(|trace| Target {
+                trace,
+                prefix: "",
+                skip: 0,
+            }),
+            &self.device.stream,
+            "norm",
+            &self.work.n,
+            rows,
+            width,
+        )?;
+        let mut output = Vec::with_capacity(rows * self.model_spec.vocab as usize);
+        for row in 0..rows {
+            output.extend(self.gemma_all_logits(row)?);
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    /// Probe rows are packed as [rows, kv_heads, head_dim].
     pub(crate) fn gemma_kv_rows(
         &self,
         layer: usize,

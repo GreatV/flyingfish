@@ -899,6 +899,21 @@ impl Engine {
                 && spec.linear_format.fp8_layout().is_none(),
             "media-aware dense placement requires a BF16 dense Qwen-family runtime"
         );
+        #[cfg(feature = "rocm")]
+        ensure!(
+            spec.architecture != crate::model_spec::Architecture::Gemma4,
+            "Gemma 4 media attention kernels are not built for HIP"
+        );
+        let plan = input.validate(&spec, capacity)?;
+        if let Some(chunk) = requested_chunk
+            && spec.architecture == crate::model_spec::Architecture::Gemma4
+            && spec.per_layer_input.is_none()
+        {
+            ensure!(
+                plan.slots().iter().all(|s| s.tokens.len() <= chunk),
+                "requested prefill chunk cannot fit a complete image block"
+            );
+        }
         let (audio, vision, request) = Self::multimodal_request_bytes(&spec, input, capacity)?;
         let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
         let mut reserved_bytes = request;
@@ -2151,16 +2166,48 @@ impl Engine {
         input: &crate::vision_input::MultimodalInput<'_>,
         identities: &[u32],
         trace: &mut crate::trace::Trace,
+        features_only: bool,
     ) -> Result<()> {
         trace.set_device(&self.device.info.name)?;
-        self.prepare_multimodal(input, Some(trace))?;
-        self.gemma_prefill_trace(identities, trace)?;
-        let (images, clips) = self.gemma_encoder_calls()?;
+        if features_only {
+            self.gemma_media_features_trace(input, trace)?;
+            self.gemma_prefill_all(identities)?;
+        } else {
+            self.prepare_multimodal(input, Some(trace))?;
+            self.gemma_prefill_trace(identities, trace)?;
+        }
+        let q = self.qwen.as_ref().context("Gemma runtime missing")?;
         ensure!(
-            images == usize::from(!input.grids.is_empty()) && clips == input.audio.len(),
-            "media encoder call count differs: images={images} clips={clips}"
+            q.vision_encode_calls == usize::from(!input.grids.is_empty())
+                && q.audio_encode_calls
+                    == if matches!(
+                        self.model_spec.audio,
+                        Some(crate::model_spec::AudioConfig::Raw(_))
+                    ) {
+                        usize::from(!input.audio.is_empty())
+                    } else {
+                        input.audio.len()
+                    },
+            "media encoder call counts differ from the requested modalities"
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn gemma_media_features_trace(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        self.prepare_multimodal(input, None)?;
+        let images = self.images.as_ref().context("media features missing")?;
+        let values = self.device.stream.clone_dtoh(&images.features)?;
+        let width = self.model_spec.hidden as usize;
+        trace.add(
+            "media_features".into(),
+            vec![values.len() / width, width],
+            values.into_iter().map(bf16::to_f32).collect(),
+        )
     }
 
     #[cfg(test)]
@@ -2286,92 +2333,135 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn gemma_final_probe(&mut self, input: &[bf16]) -> Result<Vec<bf16>> {
-        let width = self.model_spec.hidden as usize;
-        ensure!(
-            !input.is_empty() && input.len().is_multiple_of(width),
-            "Gemma final probe input extent"
-        );
-        let rows = input.len() / width;
-        self.device
-            .stream
-            .memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
-        self.state.set_sequence(
-            &self.device.stream,
-            0,
-            u32::try_from(rows)?,
-            self.workspace_rows as u32,
-        )?;
-        self.run_operator(
-            crate::backend::Operator::Head,
-            0,
-            crate::backend::Step {
-                rows,
-                input: crate::backend::Input::Ids,
-                head: Head::All,
-                mask: crate::backend::Mask::Causal,
-            },
-            &mut None,
-        )?;
-        let mut output = Vec::with_capacity(rows * self.model_spec.vocab as usize);
-        for row in 0..rows {
-            output.extend(self.gemma_all_logits(row)?);
-        }
-        Ok(output)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn gemma_first_layer_probe(
+    pub(crate) fn gemma_layers_probe(
         &mut self,
         ids: &[u32],
         input: &[bf16],
+        layers: usize,
         trace: &mut crate::trace::Trace,
-    ) -> Result<Vec<bf16>> {
+    ) -> Result<()> {
         let width = self.model_spec.hidden as usize;
         ensure!(
-            !ids.is_empty() && input.len() == ids.len() * width,
-            "Gemma first-layer probe extent"
+            !ids.is_empty()
+                && input.len() == ids.len() * width
+                && layers > 0
+                && layers <= self.config.num_hidden_layers
+                && self.position + ids.len() <= self.capacity,
+            "Gemma layer probe extent"
         );
-        self.reset()?;
+        let token = self.position != 0;
+        if token {
+            ensure!(ids.len() == 1, "cached layer probe requires one token");
+            self.set_token(ids[0])?;
+            self.ensure_decode()?;
+        } else {
+            self.device
+                .stream
+                .memcpy_htod(ids, &mut self.work.ids.slice_mut(..ids.len()))?;
+        }
         self.device
             .stream
-            .memcpy_htod(ids, &mut self.work.ids.slice_mut(..ids.len()))?;
+            .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
         self.device
             .stream
-            .memcpy_htod(&[0i32], &mut self.work.position)?;
-        self.device
-            .stream
-            .memcpy_htod(&[1i32], &mut self.work.length)?;
+            .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
         self.state.set_sequence(
             &self.device.stream,
-            0,
+            self.position as u32,
             u32::try_from(ids.len())?,
             self.workspace_rows as u32,
         )?;
         let step = crate::backend::Step {
             rows: ids.len(),
-            input: crate::backend::Input::Ids,
+            input: if token {
+                crate::backend::Input::Token
+            } else {
+                crate::backend::Input::Ids
+            },
             head: Head::None,
             mask: crate::backend::Mask::Causal,
         };
-        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)?;
+        let prefix = if trace.all_layers { "" } else { "layer_rule_a" };
+        let boundaries_only = trace.all_layers;
+        let mut target = Some(Target {
+            trace,
+            prefix,
+            skip: 0,
+        });
+        if boundaries_only {
+            self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)?;
+            trace_value(
+                &mut target,
+                &self.device.stream,
+                "embed",
+                &self.work.x,
+                ids.len(),
+                width,
+            )?;
+        } else {
+            self.run_operator(crate::backend::Operator::Embed, 0, step, &mut target)?;
+        }
         self.device
             .stream
             .memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
-        self.run_layer(
-            0,
-            step,
-            &mut Some(Target {
-                trace,
-                prefix: "layer_rule_a",
-                skip: 0,
-            }),
-        )?;
-        let values = self
-            .device
+        for layer in 0..layers {
+            if boundaries_only {
+                self.run_layer(layer, step, &mut None)?;
+                trace_value(
+                    &mut target,
+                    &self.device.stream,
+                    &layer.to_string(),
+                    &self.work.x,
+                    ids.len(),
+                    width,
+                )?;
+            } else {
+                self.run_layer(layer, step, &mut target)?;
+            }
+        }
+        self.position += ids.len();
+        self.device
             .stream
-            .clone_dtoh(&self.work.x.slice(..input.len()))?;
-        Ok(values)
+            .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
+        if self.position < self.capacity {
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                1,
+                self.workspace_rows as u32,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn gemma_media_prefix_probe(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        fixed: &[bf16],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        ensure!(
+            self.config.num_hidden_layers == 6,
+            "media prefix depth differs"
+        );
+        trace.set_device(&self.device.info.name)?;
+        self.gemma_media_features_trace(input, trace)?;
+        let identities: Vec<_> = input
+            .input_ids
+            .iter()
+            .zip(input.modality_ids)
+            .map(|(id, modality)| if matches!(modality, 1 | 3) { 0 } else { *id })
+            .collect();
+        self.gemma_layers_probe(&identities, fixed, 6, trace)?;
+        ensure!(
+            self.gemma_encoder_calls()? == (1, 0),
+            "prefix media call count differs"
+        );
+        Ok(())
     }
 
     pub fn verification_logits(&self, row: usize) -> Result<Vec<f32>> {
@@ -3709,7 +3799,18 @@ impl Engine {
         let trace_start = self.position + ids.len() - keep;
         let end = self.position + ids.len();
         let mut part = 0usize;
-        for chunk in ids.chunks(self.chunk) {
+        let mut consumed = 0;
+        while consumed < ids.len() {
+            let rows = self.chunk.min(ids.len() - consumed);
+            let count = if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
+                && self.model_spec.per_layer_input.is_none()
+                && let Some(images) = &self.images
+            {
+                images.positions.chunk_end(self.position, rows, end)? - self.position
+            } else {
+                rows
+            };
+            let chunk = &ids[consumed..consumed + count];
             self.prepare_deepseek_engram(chunk, None)?;
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
@@ -3758,6 +3859,7 @@ impl Engine {
             }
             self.committed_prefix_ids.extend_from_slice(chunk);
             self.position += chunk.len();
+            consumed += count;
         }
         self.device
             .stream

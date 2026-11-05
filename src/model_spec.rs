@@ -502,7 +502,30 @@ pub struct ModelSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AudioConfig {
+pub enum AudioConfig {
+    Encoder(AudioEncoderConfig),
+    Raw(RawAudioConfig),
+}
+
+impl AudioConfig {
+    fn from_root(root: &Value) -> Result<Option<Self>> {
+        if root.get("model_type").and_then(Value::as_str) == Some("gemma4_unified") {
+            Ok(RawAudioConfig::from_root(root)?.map(Self::Raw))
+        } else {
+            Ok(AudioEncoderConfig::from_root(root)?.map(Self::Encoder))
+        }
+    }
+
+    pub fn tokens(&self) -> [u32; 3] {
+        match self {
+            Self::Encoder(a) => [a.token, a.start_token, a.end_token],
+            Self::Raw(a) => [a.token, a.start_token, a.end_token],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AudioEncoderConfig {
     pub hidden: u32,
     pub layers: u32,
     pub heads: u32,
@@ -522,7 +545,7 @@ pub struct AudioConfig {
     pub end_token: u32,
 }
 
-impl AudioConfig {
+impl AudioEncoderConfig {
     fn from_root(root: &Value) -> Result<Option<Self>> {
         let Some(a) = root.get("audio_config").filter(|a| !a.is_null()) else {
             return Ok(None);
@@ -629,6 +652,48 @@ impl AudioConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawAudioConfig {
+    pub frame: u32,
+    pub output: u32,
+    pub rms_eps: f32,
+    pub token: u32,
+    pub start_token: u32,
+    pub end_token: u32,
+}
+
+impl RawAudioConfig {
+    fn from_root(root: &Value) -> Result<Option<Self>> {
+        if root.get("model_type").and_then(Value::as_str) != Some("gemma4_unified") {
+            return Ok(None);
+        }
+        let a = root
+            .get("audio_config")
+            .context("raw audio config missing")?;
+        for (key, value) in [
+            ("model_type", "gemma4_unified_audio".into()),
+            ("audio_embed_dim", 640.into()),
+            ("audio_samples_per_token", 640.into()),
+            ("hidden_size", 640.into()),
+            ("output_proj_dims", 640.into()),
+            ("rms_norm_eps", 1e-6.into()),
+        ] {
+            equal(a, key, value)?;
+        }
+        Ok(Some(Self {
+            frame: positive(a, "audio_samples_per_token")?,
+            output: positive(
+                root.get("text_config").context("text config missing")?,
+                "hidden_size",
+            )?,
+            rms_eps: 1e-6,
+            token: integer(root, "audio_token_id")?,
+            start_token: integer(root, "boa_token_id")?,
+            end_token: integer(root, "eoa_token_index")?,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MiniCpmVision {
     pub image_size: u32,
     pub insert_layer: u32,
@@ -645,6 +710,12 @@ pub struct AxialVision {
     pub rope_theta: f32,
     pub standardize: bool,
     pub clipped_linears: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnifiedVision {
+    pub soft_tokens: u32,
+    pub rms_eps: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -674,6 +745,8 @@ pub struct VisionConfig {
     /// is checked in its text geometry and not stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mrope_section: Option<[u32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unified: Option<UnifiedVision>,
 }
 
 impl VisionConfig {
@@ -810,6 +883,29 @@ impl VisionConfig {
                 );
             }
             Architecture::Gemma4 | Architecture::EmbeddingGemma2 => {
+                if let Some(unified) = &self.unified {
+                    ensure!(
+                        architecture == Architecture::Gemma4
+                            && self.depth == 0
+                            && self.heads == 0
+                            && self.intermediate == 0
+                            && self.hidden == 3840
+                            && self.output == self.hidden
+                            && self.channels == 3
+                            && self.patch == 48
+                            && self.merge == 1
+                            && self.temporal_patch == 1
+                            && self.position_side == 1120
+                            && unified.soft_tokens == 280
+                            && unified.rms_eps == 1e-6
+                            && self.axial.is_none()
+                            && self.minicpm.is_none()
+                            && [self.image_token, self.start_token, self.end_token]
+                                == [258880, 255999, 258882],
+                        "unsupported unified vision geometry"
+                    );
+                    return Ok(());
+                }
                 let axial = self
                     .axial
                     .as_ref()
@@ -873,8 +969,53 @@ impl VisionConfig {
             Some("qwen3_vl") => Self::qwen_from_root(root, v, Architecture::Qwen3Vl).map(Some),
             Some("minicpmv4_7_vision") => Self::minicpm_from_root(root, v).map(Some),
             Some("gemma4_vision") => Self::axial_from_root(root, v).map(Some),
+            Some("gemma4_unified_vision") => Self::unified_from_root(root, v).map(Some),
             other => bail!("unsupported vision_config model_type: {other:?}"),
         }
+    }
+
+    fn unified_from_root(root: &Value, v: &Value) -> Result<Self> {
+        for (key, value) in [
+            ("mm_embed_dim", 3840.into()),
+            ("mm_posemb_size", 1120.into()),
+            ("model_patch_size", 48.into()),
+            ("num_soft_tokens", 280.into()),
+            ("output_proj_dims", 3840.into()),
+            ("patch_size", 16.into()),
+            ("pooling_kernel_size", 3.into()),
+            ("rms_norm_eps", 1e-6.into()),
+        ] {
+            equal(v, key, value)?;
+        }
+        let spec = Self {
+            depth: 0,
+            hidden: positive(v, "mm_embed_dim")?,
+            heads: 0,
+            intermediate: 0,
+            channels: 3,
+            patch: positive(v, "model_patch_size")?,
+            temporal_patch: 1,
+            merge: 1,
+            output: positive(
+                root.get("text_config").context("text_config missing")?,
+                "hidden_size",
+            )?,
+            position_side: positive(v, "mm_posemb_size")?,
+            image_token: integer(root, "image_token_id")?,
+            video_token: integer(root, "video_token_id")?,
+            start_token: integer(root, "boi_token_id")?,
+            end_token: integer(root, "eoi_token_id")?,
+            minicpm: None,
+            axial: None,
+            unified: Some(UnifiedVision {
+                soft_tokens: positive(v, "num_soft_tokens")?,
+                rms_eps: 1e-6,
+            }),
+            deepstack: Vec::new(),
+            mrope_section: None,
+        };
+        spec.validate(Architecture::Gemma4)?;
+        Ok(spec)
     }
 
     fn axial_from_root(root: &Value, v: &Value) -> Result<Self> {
@@ -953,6 +1094,7 @@ impl VisionConfig {
             }),
             deepstack: Vec::new(),
             mrope_section: None,
+            unified: None,
         };
         spec.validate(Architecture::Gemma4)?;
         Ok(spec)
@@ -999,6 +1141,7 @@ impl VisionConfig {
             axial: None,
             deepstack,
             mrope_section,
+            unified: None,
         };
         spec.validate(architecture)?;
         Ok(spec)
@@ -1066,6 +1209,7 @@ impl VisionConfig {
             axial: None,
             deepstack: Vec::new(),
             mrope_section: None,
+            unified: None,
         };
         spec.validate(Architecture::MiniCpmV47)?;
         Ok(spec)
@@ -2948,16 +3092,8 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: Some(30.0),
             per_layer_input: (ple != 0).then_some(ple),
-            audio: if ple != 0 {
-                AudioConfig::from_root(root)?
-            } else {
-                None
-            },
-            vision: if ple != 0 {
-                VisionConfig::from_root(root)?
-            } else {
-                None
-            },
+            audio: AudioConfig::from_root(root)?,
+            vision: VisionConfig::from_root(root)?,
             canvas_length: None,
             diffusion: None,
         })

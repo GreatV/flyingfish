@@ -1149,6 +1149,7 @@ fn diffusion_canvas_ring_gpu() -> Result<()> {
                 },
                 keys,
                 prefix: None,
+                image_blocks: None,
             })
         };
         let mut flash = Flash::new_with_score(

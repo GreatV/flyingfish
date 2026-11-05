@@ -60,6 +60,7 @@ pub struct Query<'a> {
     pub shape: Shape,
     pub keys: usize,
     pub prefix: Option<usize>,
+    pub image_blocks: Option<(&'a CudaSlice<u32>, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -320,8 +321,8 @@ impl Flash {
     /// Query tile rows for the bound prefill family.
     pub fn tile(head_dim: usize) -> Result<usize> {
         ensure!(
-            matches!(head_dim, 64 | 128 | 256 | 512),
-            "prefill binds head dims 64, 128, 256 and 512 (asked for {head_dim})"
+            matches!(head_dim, 64 | 72 | 128 | 256 | 512),
+            "prefill binds head dims 64, 72, 128, 256 and 512 (asked for {head_dim})"
         );
         #[cfg(feature = "cuda")]
         {
@@ -343,8 +344,8 @@ impl Flash {
         head_dim: usize,
     ) -> Result<Self> {
         ensure!(
-            !matches!(head_dim, 64 | 512),
-            "D64 and D512 require an explicit score binding"
+            !matches!(head_dim, 64 | 72 | 512),
+            "D64, D72 and D512 require an explicit score binding"
         );
         let scale = if head_dim == 256 {
             0.0625
@@ -372,8 +373,8 @@ impl Flash {
         capacity: usize,
     ) -> Result<Self> {
         ensure!(
-            matches!(head_dim, 64 | 128 | 256 | 512),
-            "score binding requires D64, D128, D256 or D512"
+            matches!(head_dim, 64 | 72 | 128 | 256 | 512),
+            "score binding requires D64, D72, D128, D256 or D512"
         );
         ensure!(
             score.scale.is_finite() && score.scale > 0.0,
@@ -388,15 +389,15 @@ impl Flash {
             "D512 binds full causal attention"
         );
         ensure!(
-            head_dim != 64 || (score.window_left.is_none() && heads == kv_heads),
-            "D64 binds full bidirectional multi-head attention"
+            !matches!(head_dim, 64 | 72) || (score.window_left.is_none() && heads == kv_heads),
+            "D64/D72 bind full bidirectional multi-head attention"
         );
         let legacy_scale = if head_dim == 256 {
             0.0625
         } else {
             std::f32::consts::FRAC_1_SQRT_2 / 8.0
         };
-        let explicit = matches!(head_dim, 64 | 512)
+        let explicit = matches!(head_dim, 64 | 72 | 512)
             || score.scale != legacy_scale
             || score.window_left.is_some();
         ensure!(
@@ -428,14 +429,14 @@ impl Flash {
         let dynamic_shared = if head_dim == 512 {
             90112
         } else {
-            (384 * head_dim) as u32
+            (384 * if head_dim == 72 { 128 } else { head_dim }) as u32
         };
         ensure!(
             rows > 0 && heads > 0 && kv_heads > 0 && heads.is_multiple_of(kv_heads),
             "invalid prefill attention geometry"
         );
         ensure!(
-            matches!(head_dim, 64 | 128 | 256 | 512),
+            matches!(head_dim, 64 | 72 | 128 | 256 | 512),
             "unsupported prefill attention head dimension {head_dim}"
         );
         #[cfg(feature = "rocm")]
@@ -453,7 +454,13 @@ impl Flash {
             "prefill LSE indexing exceeds u32"
         );
         #[cfg(feature = "cuda")]
-        let native = if matches!(head_dim, 64 | 256 | 512)
+        let bidirectional_256 = if score.as_ref().is_some_and(|score| score.scale != 0.0625) {
+            "attention_prefill_d256_bidirectional_scored"
+        } else {
+            "attention_prefill_d256_bidirectional"
+        };
+        #[cfg(feature = "cuda")]
+        let native = if matches!(head_dim, 64 | 72 | 256 | 512)
             || matches!(
                 (heads, kv_heads, head_dim),
                 (16, 2, 128)
@@ -470,8 +477,12 @@ impl Flash {
                 heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
                 "prefill heads exceed grid limit"
             );
-            let names: &[&str] = if head_dim == 64 {
-                &["attention_prefill_d64_bidirectional"]
+            let names: &[&str] = if matches!(head_dim, 64 | 72) {
+                if head_dim == 72 {
+                    &["attention_prefill_d72_bidirectional"]
+                } else {
+                    &["attention_prefill_d64_bidirectional"]
+                }
             } else if head_dim == 512 {
                 &[
                     "attention_prefill_d512",
@@ -481,21 +492,24 @@ impl Flash {
                 if score.window_left.is_some() {
                     &[
                         "attention_prefill_d256_window",
-                        "attention_prefill_d256_bidirectional",
+                        bidirectional_256,
                         "attention_prefill_d256_symmetric",
+                        "attention_prefill_d256_blocks",
                     ]
                 } else {
                     &[
                         "attention_prefill_d256_scored",
-                        "attention_prefill_d256_bidirectional_scored",
+                        bidirectional_256,
                         "attention_prefill_d256_symmetric",
+                        "attention_prefill_d256_blocks",
                     ]
                 }
             } else if head_dim == 256 {
                 &[
                     "attention_prefill_d256",
-                    "attention_prefill_d256_bidirectional",
+                    bidirectional_256,
                     "attention_prefill_d256_symmetric",
+                    "attention_prefill_d256_blocks",
                 ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
@@ -824,6 +838,7 @@ impl Flash {
             shape,
             keys,
             prefix: None,
+            image_blocks: None,
         })
     }
 
@@ -838,6 +853,7 @@ impl Flash {
             shape,
             keys,
             prefix,
+            image_blocks,
         } = query;
         ensure!(
             [shape.q_heads, shape.kv_heads, shape.head_dim] == self.geometry,
@@ -847,6 +863,20 @@ impl Flash {
             .start
             .checked_add(shape.rows)
             .context("prefill query extent overflow")?;
+        if let Some((blocks, origin)) = image_blocks {
+            ensure!(
+                shape.causal
+                    && prefix.is_none()
+                    && shape.head_dim == 256
+                    && shape.window_left.is_some()
+                    && self.score.is_some()
+                    && origin
+                        .checked_add(end)
+                        .and_then(|n| n.checked_mul(2))
+                        .is_some_and(|n| n <= blocks.len()),
+                "image-block prefill requires complete bounds, a sliding D256 score and no prefix mask"
+            );
+        }
         ensure!(
             end <= keys && keys <= shape.capacity && keys <= i32::MAX as usize,
             "prefill populated key extent does not cover queries or exceeds capacity"
@@ -859,7 +889,13 @@ impl Flash {
             prefix.is_none() || !shape.causal,
             "prefix-LM uses its own causal suffix mask"
         );
-        let mode = if prefix.is_some() {
+        ensure!(
+            prefix.is_none() || shape.head_dim == 128,
+            "prefix-LM requires D128"
+        );
+        let mode = if image_blocks.is_some() {
+            5
+        } else if prefix.is_some() {
             2
         } else if shape.window_left.is_some() && !shape.causal {
             6
@@ -868,16 +904,19 @@ impl Flash {
         } else {
             1
         };
-        let bidirectional_only = self.geometry[2] == 64;
+        let bidirectional_only = matches!(self.geometry[2], 64 | 72);
         ensure!(
             !bidirectional_only || mode == 1,
-            "D64 requires bidirectional attention"
+            "D64/D72 require bidirectional attention"
         );
         ensure!(
             mode == 0
                 || mode == 6
+                || image_blocks.is_some()
                 || (shape.window_left.is_none()
-                    && (self.native.len() > mode || bidirectional_only)),
+                    && (self.native.len() >= 3
+                        || bidirectional_only
+                        || (shape.head_dim == 512 && mode == 1))),
             "prefill mask is not bound for this geometry/window"
         );
         ensure!(
@@ -899,8 +938,8 @@ impl Flash {
             "prefill window exceeds i32"
         );
         ensure!(
-            matches!(shape.head_dim, 64 | 128 | 256 | 512),
-            "prefill binds head dims 64, 128, 256 and 512 (got {})",
+            matches!(shape.head_dim, 64 | 72 | 128 | 256 | 512),
+            "prefill binds head dims 64, 72, 128, 256 and 512 (got {})",
             shape.head_dim
         );
         ensure!(shape.rows > 0, "prefill needs at least one query row");
@@ -961,7 +1000,9 @@ impl Flash {
             let window = shape.window_left.is_some();
             let native = self
                 .native
-                .get(if bidirectional_only {
+                .get(if image_blocks.is_some() {
+                    3
+                } else if bidirectional_only {
                     0
                 } else if mode == 6 {
                     2
@@ -1038,6 +1079,26 @@ impl Flash {
             unsafe {
                 let mut launch = self.stream.launch_builder(native);
                 launch.arg(&args);
+                if let Some((blocks, origin)) = image_blocks {
+                    let score = self.score.context("image-block score is not bound")?;
+                    let (bounds, _bounds) = blocks.device_ptr(&self.stream);
+                    let keys = keys as u32;
+                    let origin = u32::try_from(origin)?;
+                    launch.arg(&keys);
+                    let window = score.window_left.map_or(u32::MAX, |w| w as u32);
+                    launch.arg(&window);
+                    launch.arg(&score.scale).arg(&bounds).arg(&origin);
+                    launch.launch(LaunchConfig {
+                        grid_dim: (
+                            shape.rows.div_ceil(self.tile) as u32,
+                            shape.q_heads as u32,
+                            1,
+                        ),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: self.shared,
+                    })?;
+                    return Ok(());
+                }
                 if let Some(score) = &self.score {
                     let window = score.window_left.map_or(u32::MAX, |w| w as u32);
                     let key_extent = keys as u32;
@@ -1075,9 +1136,6 @@ impl Flash {
                 } else {
                     if mode != 0 || window {
                         launch.arg(&extent);
-                    }
-                    if mode == 1 && shape.head_dim == 256 {
-                        launch.arg(&0.0625f32);
                     }
                 }
                 launch.launch(LaunchConfig {
@@ -1520,6 +1578,18 @@ mod tests {
                     );
                 }
             }
+            if d == 128 {
+                for mode in ["bidirectional", "prefix"] {
+                    let mut unbound = case.clone();
+                    unbound.mode = mode.into();
+                    unbound.extent = 16;
+                    ensure!(
+                        unbound.run(&mut op, &mut b).is_err(),
+                        "unbound D128 Q32/KV4 {mode} mask was accepted"
+                    );
+                }
+                println!("PASS unbound_prefill_masks D=128 heads=32 kv_heads=4 rejected=2");
+            }
             let mut position = stream.clone_htod(&[3i32])?;
             for limit in [case.capacity - case.rows, 512] {
                 op.bind_position(&position, limit)?;
@@ -1575,6 +1645,68 @@ mod tests {
             println!(
                 "PASS score_window_binding D={d} heads={hq} kv_heads={hkv} window={window:?} rows=3 device_positions=3,109,511,512,513,519,701 limits=637,512 graph_eager=true stale_position_rejected=true"
             );
+        }
+        for (mode, rows, keys) in [
+            ("bidirectional", 1usize, 2usize),
+            ("bidirectional", 1536, 1536),
+            ("causal", 1, 2),
+        ] {
+            for scale in [0.0625f32, 1.0] {
+                let case = Case {
+                    name: format!("{mode}-score-binding"),
+                    d: 256,
+                    hq: 24,
+                    hkv: 4,
+                    mode: mode.into(),
+                    seed: 47,
+                    rows,
+                    start: if mode == "causal" { keys - rows } else { 0 },
+                    keys,
+                    extent: keys,
+                    capacity: keys + 23,
+                    pitch: 24 * 256 + 128,
+                    scale: Some(scale),
+                };
+                let mut q = vec![bf16::ZERO; rows * case.pitch];
+                for row in 0..rows {
+                    for head in 0..case.hq {
+                        q[row * case.pitch + head * case.d] = bf16::ONE;
+                    }
+                }
+                let mut k = vec![bf16::ZERO; case.hkv * case.capacity * case.d];
+                let mut v = k.clone();
+                for head in 0..case.hkv {
+                    let last = (head * case.capacity + keys - 1) * case.d;
+                    k[last] = bf16::ONE;
+                    v[last..last + case.d].fill(bf16::ONE);
+                }
+                let mut buffers = Buffers {
+                    q: stream.clone_htod(&q)?,
+                    k: stream.clone_htod(&k)?,
+                    v: stream.clone_htod(&v)?,
+                    out: stream.alloc_zeros(rows * case.hq * case.d)?,
+                };
+                let probability = 1.0f64 / (1.0 + (keys - 1) as f64 * (-f64::from(scale)).exp());
+                let expected = bf16::from_f64(probability);
+                for relative in [-0.0001, 0.0001] {
+                    ensure!(
+                        bf16::from_f64(probability * (1.0 + relative)) == expected,
+                        "score fixture is too close to a BF16 rounding boundary"
+                    );
+                }
+                let mut op = case.binding(&stream)?;
+                case.run(&mut op, &mut buffers)?;
+                let actual = stream.clone_dtoh(&buffers.out)?;
+                ensure!(
+                    actual.iter().all(|&value| value == expected),
+                    "{mode} score binding differs rows={rows} keys={keys} scale={scale}"
+                );
+                println!(
+                    "PASS {mode}_score_binding D=256 heads=24 kv_heads=4 rows={rows} keys={keys} scale={scale} output_bits={} expected_bits={} relative_rounding_margin=0.0001",
+                    actual[0].to_bits(),
+                    expected.to_bits()
+                );
+            }
         }
         ring_decode_cases(&ctx, &stream)?;
         Ok(())
@@ -1920,6 +2052,7 @@ mod tests {
                 },
                 keys: self.keys,
                 prefix: (self.mode == "prefix").then_some(self.extent),
+                image_blocks: None,
             })
         }
     }
@@ -2603,6 +2736,8 @@ mod tests {
             (128, 16, 8, "bidirectional", 17, 0, 33, 0),
             (256, 16, 8, "bidirectional", 17, 0, 33, 0),
             (512, 16, 2, "bidirectional", 17, 0, 33, 0),
+            (512, 16, 2, "bidirectional", 1, 0, 33, 0),
+            (256, 16, 8, "bidirectional", 1, 0, 33, 0),
             (256, 16, 8, "bidirectional", 17, 33, 50, 0),
             (256, 16, 8, "symmetric", 17, 0, 600, 512),
             (256, 16, 8, "symmetric", 17, 513, 1100, 512),
