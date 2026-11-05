@@ -1059,6 +1059,21 @@ impl DecoderGate {
         let bytes = std::fs::read(env_path("FF_PIXAL_FREEZE")?)?;
         ensure!(
             format!("{:x}", Sha256::digest(&bytes))
+                == "4382f7d999e51118220fcc32710a10a533b0d4b8ea294b332f272af4d43ac3ca",
+            "M4 forced-stage freeze integrity mismatch"
+        );
+        let sibling: Value = serde_json::from_slice(&bytes)?;
+        ensure!(
+            sibling["reference_valid"] == true,
+            "invalid stage reference"
+        );
+        let bytes = std::fs::read(
+            sibling["prior_freeze"]["path"]
+                .as_str()
+                .context("prior freeze missing")?,
+        )?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes))
                 == "bc06c2394b677124a2041bacd29167d93a9a679e0205c4e229fd0afcefc0a3db",
             "M4 freeze integrity mismatch"
         );
@@ -1106,6 +1121,38 @@ impl DecoderGate {
                     anchors.insert(key.clone(), anchor);
                 }
                 ensure!(cells.insert(key, c.clone()).is_none(), "duplicate M4 cell");
+            }
+        }
+        if !geometry_only {
+            for table in sibling["tables"]
+                .as_array()
+                .context("stage tables missing")?
+            {
+                let table_name = table["source_table"]
+                    .as_str()
+                    .context("stage table missing")?;
+                for cell in table["cells"].as_array().context("stage cells missing")? {
+                    let name = cell["name"].as_str().context("stage cell missing")?;
+                    let key = id(table_name, name, None);
+                    ensure!(cells.contains_key(&key), "unknown stable stage");
+                    cells.insert(key, cell.clone());
+                    let key = id(table_name, &format!("{name}-logits"), None);
+                    cells.insert(
+                        key.clone(),
+                        serde_json::json!({
+                            "tau":cell["numeric_tau"],
+                            "frozen_gating_metrics":cell["numeric_gating_metrics"]
+                        }),
+                    );
+                    anchors.insert(
+                        key,
+                        serde_json::json!({"path":cell["sources"]["fp16"],"key":"logits"}),
+                    );
+                    cells.insert(
+                        id(table_name, &format!("{name}-own-mask-compaction"), None),
+                        serde_json::json!({"tau":0}),
+                    );
+                }
             }
         }
         println!(
@@ -2407,6 +2454,7 @@ fn surface_stable(
     level: usize,
     parents: &SparseSites,
     logits: &[f32],
+    gating: bool,
 ) -> Result<()> {
     let key = id(
         &format!("m4-stable-decisions-{case}"),
@@ -2440,12 +2488,19 @@ fn surface_stable(
         "P1_M4A_STABLE_SUPPORT case={case} phase={phase} level={level} parents={} missing={missing}",
         coordinates.len()
     );
-    g.exact_count(key, tested, mismatches)
+    if gating {
+        g.exact_count(key, tested, mismatches)
+    } else {
+        println!(
+            "P1_M4A_GENERATED_STABLE_MEASUREMENT case={case} phase={phase} level={level} tested={tested} mismatches={mismatches} gating=false"
+        );
+        Ok(())
+    }
 }
 
 fn surface_own(
     g: &mut DecoderGate,
-    core: &str,
+    table: &str,
     phase: &str,
     level: usize,
     parents: &SparseSites,
@@ -2471,7 +2526,7 @@ fn surface_own(
     mismatches += children.coordinates().len().abs_diff(row);
     g.exact_count(
         id(
-            &format!("m4-own-branch-contract-{core}"),
+            table,
             &format!("{phase}-stage{level}-own-mask-compaction"),
             None,
         ),
@@ -2523,6 +2578,68 @@ fn surface_divergence(
     Ok(())
 }
 
+fn surface_forced(g: &mut DecoderGate, decoder: &PixalDecoder, case: &str) -> Result<()> {
+    let table = format!("m4-stable-decisions-{case}");
+    let d = &decoder.device;
+    for phase in ["LR", "HR"] {
+        for (level, blocks) in [4, 16, 8, 4].into_iter().enumerate() {
+            let name = format!("{phase}-stage{level}");
+            let cell = &g.cells[&id(&table, &name, None)];
+            let path = Path::new(
+                cell["forced_common_input"]["path"]
+                    .as_str()
+                    .context("stage input missing")?,
+            );
+            let parents = SparseSites::new(decoder_coordinates(path, "coords")?)?;
+            let anchor_path = Path::new(
+                cell["sources"]["fp16"]
+                    .as_str()
+                    .context("stage anchor missing")?,
+            );
+            ensure!(
+                decoder_coordinates(anchor_path, "coords")? == parents.coordinates(),
+                "stage anchor row identity mismatch"
+            );
+            let host = tensor(path, "features")?;
+            let n = parents.coordinates().len();
+            let channels = 1024 >> level;
+            ensure!(
+                host.shape == [n, channels] && host.values.iter().all(|x| x.is_finite()),
+                "stage input layout or finite check failed"
+            );
+            let input: Vec<_> = host.values.iter().map(|&x| f16::from_f64(x)).collect();
+            drop(host);
+            let x = d.stream.clone_htod(&input)?;
+            drop(input);
+            let budget = d.workspace_budget(
+                decoder.initial_free,
+                decoder.device_budget,
+                n * channels * 14,
+            )?;
+            let conv = SparseConv::new(d, &parents, channels, budget)?;
+            let parent_bytes = conv.workspace_bytes();
+            let x = decoder.next_blocks(level, &conv, x, channels, blocks)?;
+            let (children, features, logits, child_conv) =
+                decoder.up_stage(level, &parents, x, conv, None)?;
+            surface_count(
+                case,
+                &format!("forced-{phase}"),
+                [level, parent_bytes, child_conv.workspace_bytes()],
+                [n, children.coordinates().len()],
+            )?;
+            g.score_f32(
+                id(&table, &format!("{name}-logits"), None),
+                &[n, 8],
+                &logits,
+            )?;
+            surface_stable(g, case, phase, level, &parents, &logits, true)?;
+            surface_own(g, &table, phase, level, &parents, &logits, &children)?;
+            drop(features);
+        }
+    }
+    Ok(())
+}
+
 fn surface_generated(
     g: &mut DecoderGate,
     decoder: &PixalDecoder,
@@ -2569,8 +2686,8 @@ fn surface_generated(
         drop(latent);
         let (sites, features) = decoder.sparse_decode(coords, &physical, &[], |plan @ [level, _, _], (parents, logits), (next, _)| {
             surface_count(case, phase, plan, [parents.coordinates().len(), next.coordinates().len()])?;
-            surface_stable(g, case, phase, level, parents, logits)?;
-            surface_own(g, core, phase, level, parents, logits, next)?;
+            surface_stable(g, case, phase, level, parents, logits, false)?;
+            surface_own(g, &format!("m4-own-branch-contract-{core}"), phase, level, parents, logits, next)?;
             let reference = base.join(format!("shape_slat_decoder.blocks.{level}.{}-call{call}-topology.safetensors", [4,16,8,4][level]));
             surface_divergence([case, phase], level, parents, logits, &reference)?;
             let reference = decoder_coordinates(&reference, "child_coords")?;
@@ -2833,14 +2950,14 @@ const SURFACE_CASES: [(&str, &str, &str, &str, u32); 5] = [
 #[test]
 #[ignore = "requires frozen surface captures; CPU only"]
 fn pixal3d_surface_freeze_cpu() -> Result<()> {
-    for (geometry, expected) in [(true, 85), (false, 156)] {
+    for (geometry, expected) in [(true, 85), (false, 236)] {
         let gate = DecoderGate::surface(geometry)?;
         ensure!(
             gate.cells.len() == expected,
             "surface cell coverage mismatch"
         );
         for (key, cell) in &gate.cells {
-            if key.0.starts_with("m4-stable-decisions-") {
+            if cell["selection_fixture"].is_string() {
                 ensure!(
                     !gate.anchors.contains_key(key)
                         && cell["selection_fixture"].is_string()
@@ -2848,6 +2965,21 @@ fn pixal3d_surface_freeze_cpu() -> Result<()> {
                     "invalid stable-decision support"
                 );
                 surface_selection(cell)?;
+                for fixture in cell["reference_fixtures"]
+                    .as_object()
+                    .context("stage fixtures missing")?
+                    .values()
+                {
+                    let bytes =
+                        std::fs::read(fixture["path"].as_str().context("fixture path missing")?)?;
+                    ensure!(
+                        format!("{:x}", Sha256::digest(&bytes))
+                            == fixture["sha256"]
+                                .as_str()
+                                .context("fixture digest missing")?,
+                        "stage fixture integrity mismatch"
+                    );
+                }
             }
         }
     }
@@ -2971,7 +3103,7 @@ fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
                     "P1_M4A_TOPOLOGY_ISOLATION_STAGE forced_prefix={forced_prefix} level={level} parents={} children={} reference_children={} gating=false",
                     parents.coordinates().len(), next.coordinates().len(), reference_children.len()
                 );
-                surface_stable(&mut gate, "cottage1024", "LR", level, parents, logits)?;
+                surface_stable(&mut gate, "cottage1024", "LR", level, parents, logits, false)?;
                 surface_divergence(["cottage1024", "LR"], level, parents, logits, &paths[level])?;
                 let point = [0, 38, 27, 60];
                 if level == 2 {
@@ -3007,6 +3139,7 @@ fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
     surface_mesh(&mut g, &root)?;
     let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
     for (case, capture, table, core, requested) in SURFACE_CASES {
+        surface_forced(&mut g, &decoder, case)?;
         surface_fixed(&mut g, &decoder, &root, (case, capture, table))?;
         surface_generated(&mut g, &decoder, &root, &model, (case, core, requested))?;
     }
