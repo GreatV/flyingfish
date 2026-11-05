@@ -3683,7 +3683,7 @@ impl VisionEncoderConfig {
             );
         } else {
             ensure!(
-                c["qkv_bias"] == true && c["use_swiglu_ffn"] == false,
+                c["qkv_bias"] == true && c["use_swiglu_ffn"] == false && c["num_channels"] == 3,
                 "unsupported DINOv2 projection/activation contract"
             );
         }
@@ -3757,7 +3757,7 @@ impl VisionEncoderConfig {
             + (if self.position_size > 0 { 3 } else { 5 }) * rows * hu * scalar_bytes
             + 3 * rows * self.intermediate_size as usize * scalar_bytes
             + usize::from(self.position_size == 0) * rows * self.head_dim() as usize * scalar_bytes
-            + rows * hu * size_of::<f32>())
+            + (if self.model_type == "clip" { 1 } else { rows }) * hu * size_of::<f32>())
     }
 }
 
@@ -4416,6 +4416,10 @@ fn load_affine_weights<T: DinoScalar>(
     })
 }
 
+type VisionLayerTap<'a, T> = dyn FnMut(usize, &CudaSlice<T>) -> Result<()> + 'a;
+#[cfg(feature = "cuda")]
+type VisionEncoderTap<'a> = dyn FnMut(usize, usize, &CudaSlice<f32>) -> Result<()> + 'a;
+
 struct VisionEncoderLayer<T: DinoScalar> {
     norm1: AffineWeights<T>,
     q: BiasedWeight<T>,
@@ -4551,6 +4555,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 vec![1, 1370, hu]
             };
             let source = loader.take_f32_host(name, &shape)?;
+            let source_bytes = source.len() * size_of::<f32>();
             let host = if cfg.position_size == image_side {
                 source
             } else {
@@ -4562,6 +4567,8 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 )?);
                 host
             };
+            loader.runtime_bytes =
+                loader.runtime_bytes - source_bytes + host.len() * size_of::<T>();
             s.clone_htod(&host.into_iter().map(T::from_float).collect::<Vec<_>>())?
         } else {
             s.alloc_zeros(0)?
@@ -5038,7 +5045,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 &ws.x_b,
                 self.cfg.total_rows(self.image_side)?,
             )?;
-            s.memcpy_dtod(&ws.x_b, &mut ws.x_a)?;
+            std::mem::swap(&mut ws.x_a, &mut ws.x_b);
         }
         Ok(())
     }
@@ -5050,7 +5057,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
         ws: &mut DinoWorkspace<T>,
         rope_override: Option<&CudaSlice<T>>,
         capture_layers: bool,
-        mut tap: Option<&mut dyn FnMut(usize, &CudaSlice<T>) -> Result<()>>,
+        mut tap: Option<&mut VisionLayerTap<'_, T>>,
     ) -> Result<[Option<Vec<f32>>; 2]> {
         let rows = self.cfg.total_rows(self.image_side)?;
         let h = self.cfg.hidden_size;
@@ -5058,6 +5065,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
         let head_dim = self.cfg.head_dim();
         let inter = self.cfg.intermediate_size;
         let rope_slice = rope_override.unwrap_or(&ws.rope_table);
+        let absolute = self.cfg.position_size > 0;
         let mut layer0 = None;
         let mut layer15 = None;
         for (idx, layer) in self.layers.iter().enumerate() {
@@ -5100,7 +5108,6 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 dense(&ws.x_b, s, [rows, h])?,
                 &mut TensorMut(stage_view(&ws.mlp_b, s, [rows, h])?),
             )?;
-            let absolute = self.cfg.position_size > 0;
             if !absolute {
                 unsafe {
                     s.launch_builder(&self.rotary_prefix)
@@ -6986,7 +6993,7 @@ impl Hi3DImageConditioner {
         rgba: &[u8],
         dimensions: [usize; 2],
         orientation: u8,
-        mut tap: Option<&mut dyn FnMut(usize, usize, &CudaSlice<f32>) -> Result<()>>,
+        mut tap: Option<&mut VisionEncoderTap<'_>>,
     ) -> Result<&CudaSlice<f32>> {
         self.encoded = false;
         let (rgb, shape) = crate::vision_input::prepare_rgba_white(rgba, dimensions, orientation)?;
@@ -7006,7 +7013,12 @@ impl Hi3DImageConditioner {
             crate::serve::image::ResizeRounding::Fixed22,
         )?;
         let clip = (0..3)
-            .flat_map(|c| clip.chunks_exact(3).map(move |p| f32::from(p[c]) / 255.0))
+            .flat_map(|c| {
+                clip.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(move |p| f32::from(p[c]) / 255.0)
+            })
             .collect::<Vec<_>>();
         let stream = &self.device.stream;
         for (family, ((encoder, workspace), pixels)) in
@@ -10657,6 +10669,17 @@ mod tests {
                 "published vision inventory count mismatch"
             );
             loader.validate_absolute_vision(&cfg)?;
+            let elements = loader
+                .remaining
+                .iter()
+                .filter(|name| name.as_str() != "embeddings.mask_token")
+                .try_fold(0usize, |sum, name| -> Result<usize> {
+                    Ok(sum + loader.st.tensor(name)?.shape().iter().product::<usize>())
+                })?;
+            ensure!(
+                elements == cfg.expected_loaded_elements(),
+                "vision parameter element accounting mismatch"
+            );
             if cfg.model_type == "dinov2" {
                 let name = "embeddings.patch_embeddings.projection.weight";
                 let tensor = loader.st.tensor(name)?;

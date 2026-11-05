@@ -1975,10 +1975,10 @@ mod resampling_tests {
             serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
         let source_bytes = std::fs::read(root.join("cpu-r2/inputs.safetensors"))?;
         let source = safetensors::SafeTensors::deserialize(&source_bytes)?;
-        let anchor_bytes = std::fs::read(root.join("cpu-r2/preparation-anchor.safetensors"))?;
+        let anchor_bytes = std::fs::read(root.join("preparation-anchor.safetensors"))?;
         let anchor = safetensors::SafeTensors::deserialize(&anchor_bytes)?;
         let rows: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("cpu-r2/selected-rows.json"))?)?;
+            serde_json::from_slice(&std::fs::read(root.join("selected-rows.json"))?)?;
         let read_f32 = |t: safetensors::tensor::TensorView<'_>| -> Result<Vec<f32>> {
             ensure!(
                 t.dtype() == safetensors::Dtype::F32,

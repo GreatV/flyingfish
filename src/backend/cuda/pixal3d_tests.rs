@@ -961,7 +961,7 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
         "device conditioning coordinate control accepted"
     );
     println!(
-        "N5_M2A_HANDOFF PASS rows=2917 channels=2048 exact_f16=true coordinate_control=rejected context_D2H_H2D=0"
+        "N5_M2A_HANDOFF PASS rows=2917 channels=2048 exact_f16=true coordinate_control=rejected production_context_D2H_H2D=0 inspection_D2H=true"
     );
     let negative = flow.conditioning(&vec![0.0; context.len()], &[], &coordinates)?;
     let result = flow.sample_heun(&noise, &positive, &negative)?;
