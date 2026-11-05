@@ -981,6 +981,9 @@ fn glm_graph_expert_tier_gpu() -> Result<()> {
             .context("native FFN missing")?;
         let s = &engine.device.stream;
         let slots = engine.moe_slots.as_mut().context("tiers missing")?;
+        if !slots.request_open {
+            slots.begin_staging_request()?;
+        }
         slots.begin_token()?;
         let x = matrix(&engine.work.n, s, 0, 1, 4096)?;
         if let Some(pair) = graphs {
