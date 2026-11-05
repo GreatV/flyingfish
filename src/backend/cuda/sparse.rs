@@ -25,6 +25,7 @@ pub struct SparseConv {
     tile: usize,
 }
 impl SparseConv {
+    #[cfg(test)]
     pub fn new(
         device: &Device,
         sites: &SparseSites,

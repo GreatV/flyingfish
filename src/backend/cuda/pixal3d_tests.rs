@@ -593,6 +593,148 @@ fn hi3d_flow_pool_inverse_gpu() -> Result<()> {
             true,
         )?;
     }
+    let mut exact_cases = 0;
+    for rows in [17, 11295] {
+        for width in [256, 2112] {
+            let first: Vec<_> = (0..rows * width)
+                .map(|i| f16::from_f32(((i * 127 % 251) as f32 - 125.0) / 128.0))
+                .collect();
+            let second: Vec<_> = first
+                .iter()
+                .map(|x| f16::from_f32(x.to_f32() + 4.0))
+                .collect();
+            let a = flow.device.stream.clone_htod(&first)?;
+            let b = flow.device.stream.clone_htod(&second)?;
+            let output = flow.device.stream.alloc_zeros::<f16>(2 * rows * width)?;
+            for control in [false, true] {
+                let (left, right) = if control { (&b, &a) } else { (&a, &b) };
+                io.concat(
+                    &flow.device,
+                    ptr(left, &flow.device),
+                    ptr(right, &flow.device),
+                    ptr(&output, &flow.device),
+                    rows,
+                    width,
+                )?;
+                let actual = flow.device.stream.clone_dtoh(&output)?;
+                let mismatches = actual
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, value)| {
+                        let row = i / (2 * width);
+                        let col = i % (2 * width);
+                        let expected = if col < width {
+                            first[row * width + col]
+                        } else {
+                            second[row * width + col - width]
+                        };
+                        value.to_bits() != expected.to_bits()
+                    })
+                    .count();
+                ensure!(
+                    mismatches == if control { actual.len() } else { 0 },
+                    "concat source/column indexing mismatch"
+                );
+            }
+            let copied = flow.device.stream.alloc_zeros::<f16>(rows * width)?;
+            io.copy(
+                &flow.device,
+                ptr(&a, &flow.device),
+                0,
+                ptr(&copied, &flow.device),
+                rows,
+                width,
+            )?;
+            ensure!(
+                flow.device
+                    .stream
+                    .clone_dtoh(&copied)?
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(first.iter().map(|x| x.to_bits())),
+                "identity copy changed stored bits"
+            );
+            let indices: Vec<_> = (0..rows).map(|r| (r * 127 % rows) as u32).collect();
+            let index = flow.device.stream.clone_htod(&indices)?;
+            io.copy(
+                &flow.device,
+                ptr(&a, &flow.device),
+                ptr(&index, &flow.device),
+                ptr(&copied, &flow.device),
+                rows,
+                width,
+            )?;
+            let expected = indices.iter().flat_map(|&r| {
+                first[r as usize * width..(r as usize + 1) * width]
+                    .iter()
+                    .map(|x| x.to_bits())
+            });
+            ensure!(
+                flow.device
+                    .stream
+                    .clone_dtoh(&copied)?
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(expected),
+                "indexed copy changed row/column order"
+            );
+            exact_cases += 1;
+            println!(
+                "N5_M1_SPARSE_ROWS PASS rows={rows} width={width} identity=true indexed=true concat=true wrong_source_control_mismatches={} byte_exact=true",
+                rows * width * 2
+            );
+        }
+    }
+    ensure!(exact_cases == 4, "sparse row coverage missing");
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires frozen SiLU reference cells; CUDA"]
+fn hi3d_flow_silu_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("silu", 12)?;
+    let device = Device::new(0)?;
+    let kernel = cubin::module(&device.ctx, "vision_ops")?.load_function("vision_silu_f16")?;
+    for (name, cell) in gate.cells.clone() {
+        let rows = cell["shape"][0].as_u64().context("SiLU rows missing")? as usize;
+        let width = cell["shape"][1].as_u64().context("SiLU width missing")? as usize;
+        let count = rows.min(47);
+        let selected: Vec<_> = (0..count)
+            .map(|r| (0..count).find(|&i| i * 127 % count == r).unwrap())
+            .collect();
+        for control in [false, true] {
+            let input: Vec<_> = (0..rows)
+                .flat_map(|row| {
+                    (0..width).map(move |col| {
+                        let c = if control {
+                            (col + width - 127 % width) % width
+                        } else {
+                            col
+                        };
+                        f16::from_f32(
+                            ((((row * 127 % count) * 61 + c * 127) % 251) as f32 - 125.0) / 16.0,
+                        )
+                    })
+                })
+                .collect();
+            let input = device.stream.clone_htod(&input)?;
+            let output = device.stream.alloc_zeros::<f16>(rows * width)?;
+            unsafe {
+                device
+                    .stream
+                    .launch_builder(&kernel)
+                    .arg(&input)
+                    .arg(&output)
+                    .arg(&u32::try_from(rows * width)?)
+                    .launch(flat(rows * width))?;
+            }
+            gate.score(
+                &name,
+                &selected_half(&device, &output, &selected, width)?,
+                control,
+            )?;
+        }
+    }
     gate.finish()
 }
 
@@ -606,7 +748,7 @@ fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
     let inputs = gate.root.join("io-inputs.safetensors");
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
         for (name, cell) in gate.cells.clone() {
             let Some(op) = name.strip_prefix(&format!("{component}.")) else {
                 continue;
@@ -620,7 +762,23 @@ fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
                 .context("conv output width missing")? as usize;
             let data: Vec<_> = data.values.into_iter().map(f16::from_f64).collect();
             let data = flow.device.stream.clone_htod(&data)?;
-            let mut convolution = SparseConv::new(&flow.device, &sites, width, 128 << 20)?;
+            let (block, conv) = op
+                .rsplit_once('.')
+                .context("convolution component missing")?;
+            let block = match block {
+                "input_blocks.0" => 0,
+                "input_blocks.1" => 1,
+                "out_blocks.0" => 2,
+                "out_blocks.1" => 3,
+                _ => anyhow::bail!("unknown IO block"),
+            };
+            let conv = match conv {
+                "conv1" => 0,
+                "conv2" => 1,
+                _ => anyhow::bail!("unknown IO convolution"),
+            };
+            let convolution =
+                &mut flow.io.as_mut().context("sparse IO missing")?.blocks[block].conv[conv];
             let weight = dense(
                 &flow._inner_weights[&format!("{op}.conv.weight")],
                 &flow.device,
