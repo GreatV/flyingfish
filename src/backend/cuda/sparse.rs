@@ -12,11 +12,12 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use half::f16;
+use std::rc::Rc;
 
 pub struct SparseConv {
     device: Device,
     neighbours: CudaSlice<i32>,
-    columns: CudaSlice<f16>,
+    columns: Rc<CudaSlice<f16>>,
     gather: CudaFunction,
     bias: CudaFunction,
     rows: usize,
@@ -50,9 +51,26 @@ impl SparseConv {
             .min(rows)
             .min(i32::MAX as usize / (27 * channels));
         ensure!(tile > 0, "sparse gather cannot fit one row");
+        let columns = Rc::new(device.stream.alloc_zeros(tile * 27 * channels)?);
+        Self::shared(device, sites, channels, columns)
+    }
+    pub(crate) fn shared(
+        device: &Device,
+        sites: &SparseSites,
+        channels: usize,
+        columns: Rc<CudaSlice<f16>>,
+    ) -> Result<Self> {
+        let rows = sites.coordinates().len();
+        ensure!(
+            channels > 0 && channels <= i32::MAX as usize / 27,
+            "invalid sparse gather width"
+        );
+        let tile = (columns.len() / (27 * channels))
+            .min(rows)
+            .min(i32::MAX as usize / (27 * channels));
+        ensure!(tile > 0, "sparse gather cannot fit one row");
         let maps = sites.neighbours_3x3()?;
         let neighbours = device.stream.clone_htod(maps.as_flattened())?;
-        let columns = device.stream.alloc_zeros(tile * 27 * channels)?;
         Ok(Self {
             device: device.clone(),
             neighbours,
@@ -64,6 +82,7 @@ impl SparseConv {
             tile,
         })
     }
+    #[cfg(test)]
     pub(crate) fn workspace_bytes(&self) -> usize {
         self.neighbours.len() * size_of::<i32>() + self.columns.len() * size_of::<f16>()
     }
@@ -128,7 +147,7 @@ impl SparseConv {
                     .launch_builder(&self.gather)
                     .arg(input)
                     .arg(&self.neighbours)
-                    .arg(&self.columns)
+                    .arg(self.columns.as_ref())
                     .arg(&(self.rows as u32))
                     .arg(&(self.channels as u32))
                     .arg(&(first as u32))

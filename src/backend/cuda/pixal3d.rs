@@ -26,6 +26,8 @@ use half::{bf16, f16};
 use safetensors::Dtype;
 use std::{collections::BTreeMap, mem::size_of, path::Path, rc::Rc};
 
+type Weights<T> = BTreeMap<String, CudaSlice<T>>;
+
 fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
     x.device_ptr(&d.stream).0
 }
@@ -108,12 +110,7 @@ struct Linear<T> {
     bias: Tensor<T, 1>,
 }
 impl<T: DeviceRepr + Copy> Linear<T> {
-    fn bind(
-        weights: &BTreeMap<String, CudaSlice<T>>,
-        d: &Device,
-        name: &str,
-        shape: [usize; 2],
-    ) -> Result<Self> {
+    fn bind(weights: &Weights<T>, d: &Device, name: &str, shape: [usize; 2]) -> Result<Self> {
         let weight = weights
             .get(&format!("{name}.weight"))
             .with_context(|| format!("linear weight missing: {name}"))?;
@@ -320,13 +317,10 @@ impl ResidualIo {
     fn new(
         d: &Device,
         sites: &SparseSites,
-        weights: (
-            &BTreeMap<String, CudaSlice<f16>>,
-            &BTreeMap<String, CudaSlice<f32>>,
-        ),
+        weights: (&Weights<f16>, &Weights<f32>),
         name: &str,
         widths: [usize; 3],
-        budget: usize,
+        columns: Rc<CudaSlice<f16>>,
     ) -> Result<Self> {
         let [input, output, embedding] = widths;
         let hidden = output / 2;
@@ -355,8 +349,8 @@ impl ResidualIo {
                 ptr(&float[&format!("{name}.norm1.bias")], d),
             ],
             conv: [
-                SparseConv::new(d, sites, input, budget / 2)?,
-                SparseConv::new(d, sites, hidden, budget / 2)?,
+                SparseConv::shared(d, sites, input, columns.clone())?,
+                SparseConv::shared(d, sites, hidden, columns)?,
             ],
             conv_weights: [conv_weight("conv1", input)?, conv_weight("conv2", hidden)?],
             embedding: bind("emb_layers.1", 2 * hidden, embedding)?,
@@ -370,7 +364,9 @@ impl ResidualIo {
             first: d.stream.alloc_zeros(rows * hidden)?,
             second: d.stream.alloc_zeros(rows * hidden)?,
             result: d.stream.alloc_zeros(rows * output)?,
-            residual: d.stream.alloc_zeros(rows * output)?,
+            residual: d
+                .stream
+                .alloc_zeros(if input == output { 0 } else { rows * output })?,
             parameters: d.stream.alloc_zeros(2 * hidden)?,
             silu: cubin::module(&d.ctx, "vision_ops")?.load_function("vision_silu_f16")?,
             modulate: cubin::module(&d.ctx, "modulate")?.load_function("row_modulate_f16")?,
@@ -501,12 +497,11 @@ impl SparseFlowIo {
         sites: &SparseSites,
         parent: &SparseSites,
         inverse: &[u32],
-        weights: (
-            &BTreeMap<String, CudaSlice<f16>>,
-            &BTreeMap<String, CudaSlice<f32>>,
-        ),
+        weights: (&Weights<f16>, &Weights<f32>),
         budget: usize,
     ) -> Result<Self> {
+        let h = weights.1["t_embedder.mlp.2.bias"].len();
+        let c = weights.1["input_layer.bias"].len();
         let rows = sites.coordinates().len();
         let parents = parent.coordinates().len();
         let mut lists = vec![Vec::new(); parents];
@@ -519,6 +514,13 @@ impl SparseFlowIo {
             children.extend(list);
             offsets.push(children.len() as u32);
         }
+        let full = rows
+            .checked_mul(27 * (2 * h).max(2 * c))
+            .context("shared sparse gather extent overflow")?;
+        let columns = Rc::new(
+            d.stream
+                .alloc_zeros::<f16>(full.min(budget / size_of::<f16>()))?,
+        );
         let v = cubin::module(&d.ctx, "vision_ops")?;
         Ok(Self {
             rows,
@@ -531,43 +533,43 @@ impl SparseFlowIo {
                     sites,
                     weights,
                     "input_blocks.0",
-                    [256, 256, 2112],
-                    budget / 4,
+                    [c, c, h],
+                    columns.clone(),
                 )?,
                 ResidualIo::new(
                     d,
                     parent,
                     weights,
                     "input_blocks.1",
-                    [256, 2112, 2112],
-                    budget / 4,
+                    [c, h, h],
+                    columns.clone(),
                 )?,
                 ResidualIo::new(
                     d,
                     sites,
                     weights,
                     "out_blocks.0",
-                    [4224, 256, 2112],
-                    budget / 4,
+                    [(2 * h), c, h],
+                    columns.clone(),
                 )?,
                 ResidualIo::new(
                     d,
                     sites,
                     weights,
                     "out_blocks.1",
-                    [512, 256, 2112],
-                    budget / 4,
+                    [(2 * c), c, h],
+                    columns.clone(),
                 )?,
             ],
-            projected: d.stream.alloc_zeros(rows * 256)?,
-            input: d.stream.alloc_zeros(rows * 256)?,
-            pooled: d.stream.alloc_zeros(parents * 256)?,
-            concat: d.stream.alloc_zeros(parents * 4224)?,
-            expanded: d.stream.alloc_zeros(rows * 4224)?,
-            last_concat: d.stream.alloc_zeros(rows * 512)?,
-            normalized: d.stream.alloc_zeros(rows * 256)?,
-            output_float: d.stream.alloc_zeros(rows * 256)?,
-            embedding: d.stream.alloc_zeros(2112)?,
+            projected: d.stream.alloc_zeros(rows * c)?,
+            input: d.stream.alloc_zeros(rows * c)?,
+            pooled: d.stream.alloc_zeros(parents * c)?,
+            concat: d.stream.alloc_zeros(parents * (2 * h))?,
+            expanded: d.stream.alloc_zeros(rows * (2 * h))?,
+            last_concat: d.stream.alloc_zeros(rows * (2 * c))?,
+            normalized: d.stream.alloc_zeros(rows * c)?,
+            output_float: d.stream.alloc_zeros(rows * c)?,
+            embedding: d.stream.alloc_zeros(h)?,
             pool: v.load_function("sparse_mean_seeded_f16")?,
             index: v.load_function("sparse_index_rows_f16")?,
             concatenate: v.load_function("concat_rows_f16")?,
@@ -626,6 +628,8 @@ impl SparseFlowIo {
         buffers: [u64; 3],
     ) -> Result<()> {
         let [values, embedding, hidden] = buffers;
+        let c = self.blocks[0].output_width;
+        let h = self.blocks[1].output_width;
         run_linear_f32(
             d,
             blas,
@@ -646,8 +650,8 @@ impl SparseFlowIo {
                 .launch_builder(&self.silu)
                 .arg(&embedding)
                 .arg(&self.embedding)
-                .arg(&2112u32)
-                .launch(flat(2112))?;
+                .arg(&(h as u32))
+                .launch(flat(h))?;
         }
         self.blocks[0].run(d, blas, k, &self.input, ptr(&self.embedding, d))?;
         unsafe {
@@ -658,7 +662,7 @@ impl SparseFlowIo {
                 .arg(&self.children)
                 .arg(&self.pooled)
                 .arg(&((self.offsets.len() - 1) as u32))
-                .arg(&256u32)
+                .arg(&(c as u32))
                 .launch(flat(self.pooled.len()))?;
         }
         self.blocks[1].run(d, blas, k, &self.pooled, ptr(&self.embedding, d))?;
@@ -668,7 +672,7 @@ impl SparseFlowIo {
             0,
             hidden,
             self.offsets.len() - 1,
-            2112,
+            h,
         )
     }
     fn decode(
@@ -680,13 +684,15 @@ impl SparseFlowIo {
         hidden: u64,
         values: u64,
     ) -> Result<()> {
+        let c = self.blocks[3].output_width;
+        let h = self.blocks[1].output_width;
         self.concat(
             d,
             hidden,
             ptr(&self.blocks[1].result, d),
             ptr(&self.concat, d),
             self.offsets.len() - 1,
-            2112,
+            h,
         )?;
         self.copy(
             d,
@@ -694,7 +700,7 @@ impl SparseFlowIo {
             ptr(&self.inverse, d),
             ptr(&self.expanded, d),
             self.rows,
-            4224,
+            2 * h,
         )?;
         self.blocks[2].run(d, blas, k, &self.expanded, ptr(&self.embedding, d))?;
         self.concat(
@@ -703,14 +709,14 @@ impl SparseFlowIo {
             ptr(&self.blocks[0].result, d),
             ptr(&self.last_concat, d),
             self.rows,
-            256,
+            c,
         )?;
         self.blocks[3].run(d, blas, k, &self.last_concat, ptr(&self.embedding, d))?;
         k.norm(
             d,
             ptr(&self.blocks[3].result, d),
             ptr(&self.normalized, d),
-            [self.rows, 256],
+            [self.rows, c],
             [0, 0],
             (1e-5, false),
         )?;
@@ -1019,7 +1025,7 @@ impl<T: FlowElement> Work<T> {
             attention: s.alloc_zeros(n * h)?,
             ff: s.alloc_zeros(n * spec.feed_forward_width())?,
             cross_kv: s.alloc_zeros(2 * context_rows * h)?,
-            cross_k: s.alloc_zeros(context_rows * h)?,
+            cross_k: s.alloc_zeros(if T::HALF { 0 } else { context_rows * h })?,
             cross_kn: s.alloc_zeros(context_rows * h)?,
             cross_v: s.alloc_zeros(context_rows * h)?,
             cross_q32: s.alloc_zeros(if T::HALF { 0 } else { n * h })?,
@@ -1054,8 +1060,8 @@ pub struct Flow<T: FlowElement = bf16> {
     rows: usize,
     coordinates: Vec<[i32; 3]>,
     steps: usize,
-    _inner_weights: BTreeMap<String, CudaSlice<T>>,
-    _f32: BTreeMap<String, CudaSlice<f32>>,
+    _inner_weights: Weights<T>,
+    _f32: Weights<f32>,
     blocks: Vec<Block<T>>,
     input: Linear<f32>,
     output: Linear<f32>,
@@ -1413,6 +1419,20 @@ impl Flow<f16> {
                 }
             }
         }
+        let affine =
+            cubin::module(&self.device.ctx, "q38_common")?.load_function("channel_affine_f32")?;
+        unsafe {
+            self.device
+                .stream
+                .launch_builder(&affine)
+                .arg(&state.state)
+                .arg(&self._f32["output_scale"])
+                .arg(&self._f32["output_shift"])
+                .arg(&state.state)
+                .arg(&(rows as u32))
+                .arg(&(self.spec.out_channels as u32))
+                .launch(flat(noise.len()))?;
+        }
         let values = self.device.stream.clone_dtoh(&state.state)?;
         ensure!(
             values.iter().all(|x| x.is_finite()),
@@ -1430,6 +1450,13 @@ impl Flow<f16> {
     ) -> Result<Self> {
         let checkpoint = Hi3DFlowCheckpoint::open(root, component)?;
         let spec = checkpoint.spec.flow_spec();
+        ensure!(
+            coordinates
+                .iter()
+                .flatten()
+                .all(|&v| v >= 0 && (v as usize) < spec.resolution),
+            "flow coordinates outside configured grid"
+        );
         let sites = SparseSites::new(coordinates.iter().map(|p| [0, p[0], p[1], p[2]]).collect())?;
         let (parent, inverse) = sites.downsample(2)?;
         let rows = parent.coordinates().len();
@@ -1450,7 +1477,7 @@ impl Flow<f16> {
             })
         };
         let work_bytes = count(&[rows, h, 15, 2])?
-            .checked_add(count(&[context_rows, h, 5, 2])?)
+            .checked_add(count(&[context_rows, h, 4, 2])?)
             .and_then(|n| {
                 n.checked_add(
                     rows * 4 + 6 * h * 4 + rows * 96 * 4 + 2 * rows * 22 * 4 + steps * 7 * h * 2,
@@ -1465,7 +1492,7 @@ impl Flow<f16> {
         ]
         .into_iter()
         .try_fold(0usize, |sum, (n, input, output)| -> Result<usize> {
-            let features = count(&[n, input + 3 * output, 2])?;
+            let features = count(&[n, input + (2 + usize::from(input != output)) * output, 2])?;
             let maps = count(&[n, 2, 27, 4])?;
             sum.checked_add(features)
                 .and_then(|s| s.checked_add(maps + 2 * output))
@@ -1531,6 +1558,14 @@ impl Flow<f16> {
                 float.insert(name, device.stream.clone_htod(&values)?);
             }
         }
+        float.insert(
+            "output_scale".into(),
+            device.stream.clone_htod(&checkpoint.spec.latent_std)?,
+        );
+        float.insert(
+            "output_shift".into(),
+            device.stream.clone_htod(&checkpoint.spec.latent_mean)?,
+        );
         let mut blocks = Vec::with_capacity(spec.num_blocks);
         for i in 0..spec.num_blocks {
             let p = format!("blocks.{i}");
@@ -1591,25 +1626,37 @@ impl Flow<f16> {
         )?;
         let mods = device.stream.alloc_zeros(steps * 6 * h)?;
         let time_embeddings = device.stream.alloc_zeros(steps * h)?;
-        let remaining = device.workspace_budget(free, budget, io_bytes)?;
+        let sampler_bytes = count(&[io_rows, spec.in_channels, 6, 4])?
+            .checked_add(8)
+            .context("sampler bytes overflow")?;
+        let conditioning_bytes = count(&[2, context_rows, spec.cond_channels, 2])?;
+        let time_bytes = count(&[steps, 256 + 8 * h + 1, 4])?
+            .checked_add((h + 128) * 4)
+            .context("time workspace overflow")?;
+        let live_bytes = io_bytes
+            .checked_add(sampler_bytes)
+            .and_then(|n| n.checked_add(conditioning_bytes))
+            .and_then(|n| n.checked_add(time_bytes))
+            .context("flow live bytes overflow")?;
+        let remaining = device.workspace_budget(free, budget, live_bytes)?;
         let io = SparseFlowIo::new(
             &device,
             &sites,
             &parent,
             &inverse,
             (&half, &float),
-            remaining / 2,
+            remaining,
         )?;
-        let sampler_bytes = count(&[io_rows, spec.in_channels, 6, 4])?
-            .checked_add(8)
-            .context("sampler bytes overflow")?;
-        let conditioning_bytes = count(&[2, context_rows, spec.cond_channels, 2])?;
         device.workspace_budget(free, budget, sampler_bytes + conditioning_bytes)?;
         #[cfg(test)]
-        println!(
-            "SPARSE_FLOW_PLACEMENT published_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes}",
-            checkpoint.runtime_bytes
-        );
+        {
+            let gather_bytes = io.blocks[2].conv[0].workspace_bytes() - io.rows * 27 * 4;
+            println!(
+                "SPARSE_FLOW_PLACEMENT published_bytes={} config_affine_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} shared_gather_bytes={gather_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes}",
+                checkpoint.runtime_bytes,
+                2 * spec.out_channels * 4
+            );
+        }
         Ok(Self {
             origin: Rc::new(()),
             device,
@@ -2403,8 +2450,8 @@ fn denormalize_shape(
 }
 
 struct Weights {
-    half: BTreeMap<String, CudaSlice<f16>>,
-    float: BTreeMap<String, CudaSlice<f32>>,
+    half: Weights<f16>,
+    float: Weights<f32>,
 }
 impl Weights {
     fn load(d: &Device, checkpoint: &DecoderCheckpoint) -> Result<Self> {

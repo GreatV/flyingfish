@@ -209,11 +209,15 @@ fn frozen_rows(cell: &Value) -> Result<Vec<usize>> {
 fn lattice(path: &Path, key: &str) -> Result<Vec<[i32; 3]>> {
     let t = tensor(path, key)?;
     ensure!(
-        t.shape.len() == 2 && t.shape[1] == 4 && t.values.chunks_exact(4).all(|p| p[0] == 0.0),
+        t.shape.len() == 2
+            && t.shape[1] == 4
+            && t.values.as_chunks::<4>().0.iter().all(|p| p[0] == 0.0),
         "single-sample lattice required"
     );
     Ok(t.values
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| [p[1] as i32, p[2] as i32, p[3] as i32])
         .collect())
 }
@@ -393,7 +397,9 @@ fn hi3d_flow_qk_rope_gpu() -> Result<()> {
                     let sites = SparseSites::new(
                         coords
                             .values
-                            .chunks_exact(3)
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
                             .map(|p| {
                                 if control {
                                     [0, p[2] as i32, p[1] as i32, p[0] as i32]
