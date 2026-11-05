@@ -2743,7 +2743,10 @@ fn surface_mesh(g: &mut DecoderGate, root: &Path) -> Result<()> {
 fn pixal3d_surface_freeze_cpu() -> Result<()> {
     for (geometry, expected) in [(true, 85), (false, 156)] {
         let gate = DecoderGate::surface(geometry)?;
-        ensure!(gate.cells.len() == expected, "surface cell coverage mismatch");
+        ensure!(
+            gate.cells.len() == expected,
+            "surface cell coverage mismatch"
+        );
         for (key, cell) in &gate.cells {
             if key.0.starts_with("m4-stable-decisions-") {
                 ensure!(
