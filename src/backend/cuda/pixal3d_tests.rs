@@ -2910,7 +2910,7 @@ fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
     };
     let mean = channels("mean")?;
     let std = channels("std")?;
-    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
+    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 12_000_000_000)?;
     let d = &decoder.device;
     let mut latent = d
         .stream
