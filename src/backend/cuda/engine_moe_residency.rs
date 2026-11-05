@@ -1429,8 +1429,26 @@ impl Slots {
             leased.len(),
             self.pool.len()
         );
-        self.leased.clear();
-        for (index, lease) in leased.iter().enumerate() {
+        let same_layer = self.leased_layer == layer;
+        let mut new_leased = Vec::with_capacity(leased.len());
+        let mut available_slots: Vec<usize> = (0..self.pool.len()).collect();
+        let mut refills = 0usize;
+        if same_layer {
+            for lease in &leased {
+                if let Some(&(expert, slot)) = self.leased.iter().find(|&&(e, _)| e == lease.expert)
+                {
+                    new_leased.push((expert, slot));
+                    available_slots.retain(|&s| s != slot);
+                }
+            }
+        }
+        for lease in leased {
+            if same_layer && new_leased.iter().any(|&(e, _)| e == lease.expert) {
+                continue;
+            }
+            let index = available_slots
+                .pop()
+                .context("insufficient available pool slots")?;
             let reader = self.pool[index].reader.take();
             #[cfg(test)]
             let reader = reader.filter(|_| self.pool_control != PoolControl::SkipReaderWait);
@@ -1448,11 +1466,15 @@ impl Slots {
                 self.transfers.copied_host(block, staging, &copy);
             }
             self.pool[index].copy = Some(copy);
-            self.leased.push((lease.expert, index));
+            new_leased.push((lease.expert, index));
+            refills += 1;
         }
+        self.leased = new_leased;
         self.leased_layer = layer;
-        self.refill.record(&self.transfers.h2d)?;
-        Ok(leased.len())
+        if refills > 0 {
+            self.refill.record(&self.transfers.h2d)?;
+        }
+        Ok(refills)
     }
 
     pub fn resolve_native(&mut self, layer: u32, ids: &[i32], weights: &[f32]) -> Result<usize> {
@@ -1611,6 +1633,20 @@ impl Slots {
         let geometry = self.catalogue.geometry();
         let experts = geometry.experts;
         let top_k = geometry.top_k as usize;
+        if self.streamed[layer as usize] {
+            if !self.request_open {
+                self.begin_staging_request()?;
+            }
+            let incoming = (0..experts)
+                .find(|&expert| expert != target)
+                .context("no incoming expert")?;
+            self.force_routes(layer, &[incoming as i32])?;
+            ensure!(
+                !self.leased.iter().any(|&(leased, _)| leased == target),
+                "target {target} remained leased in pool"
+            );
+            return Ok(incoming);
+        }
         self.force_routes(layer, &[target as i32])?;
         let mut resident_ids = Vec::new();
         for expert in 0..experts {
@@ -1650,6 +1686,9 @@ impl Slots {
         layer: u32,
         ids: &[i32],
     ) -> Result<usize> {
+        if !self.request_open {
+            self.begin_staging_request()?;
+        }
         self.begin_token()?;
         let weights = vec![1.0 / self.catalogue.geometry().top_k as f32; ids.len()];
         let misses = self.resolve_native(layer, ids, &weights)?;
