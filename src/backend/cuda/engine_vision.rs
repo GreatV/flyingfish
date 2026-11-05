@@ -7425,11 +7425,12 @@ impl IdolDenoiser {
             mlp_fc2_f16: s.alloc_zeros(b * l_mm * c)?,
             v_latent_out_f32: s.alloc_zeros(b * l_lat * 16)?,
             v_camera_out_f32: s.alloc_zeros(b * l_cam * 5)?,
-            prefill_f16: Flash::new_f16_d64(
+            prefill_f16: Flash::new_f16(
                 s.clone(),
                 l_mm,
                 h,
                 h,
+                d,
                 Score::from_tokens((d as f32).sqrt().recip(), None)?,
             )?,
         };
@@ -7676,7 +7677,7 @@ impl IdolDenoiser {
             let k_view = ws.k_hm_f16.slice(start..end);
             let v_view = ws.v_hm_f16.slice(start..end);
             let mut o_view = ws.attn_out_f16.slice_mut(start..end);
-            ws.prefill_f16.run_f16_d64(
+            ws.prefill_f16.run_f16(
                 &q_view,
                 c as usize,
                 &k_view,
@@ -8481,11 +8482,12 @@ impl IdolOctreeDecoder {
             mlp_fc1_f16: s.alloc_zeros(n_max * m)?,
             mlp_fc2_f16: s.alloc_zeros(n_max * c)?,
             logits_f32: s.alloc_zeros(n_max * 8)?,
-            prefill_f16: Flash::new_f16_d64(
+            prefill_f16: Flash::new_f16(
                 s.clone(),
                 n_max,
                 h,
                 h,
+                d,
                 Score::from_tokens((d as f32).sqrt().recip(), None)?,
             )?,
         };
@@ -8724,7 +8726,7 @@ impl IdolOctreeDecoder {
             let k_view = ws.k_hm_f16.slice(0..(n_ctx as usize) * (c as usize));
             let v_view = ws.v_hm_f16.slice(0..(n_ctx as usize) * (c as usize));
             let mut o_view = ws.attn_out_f16.slice_mut(0..(rows as usize) * (c as usize));
-            ws.prefill_f16.run_f16_d64(
+            ws.prefill_f16.run_f16(
                 &q_view,
                 c as usize,
                 &k_view,
@@ -9286,11 +9288,12 @@ impl IdolGaussianDecoder {
             mlp_fc1_f16: s.alloc_zeros(n * m)?,
             mlp_fc2_f16: s.alloc_zeros(n * c)?,
             gs_features_f32: s.alloc_zeros(n * 480)?,
-            prefill_f16: Flash::new_f16_d64(
+            prefill_f16: Flash::new_f16(
                 s.clone(),
                 n,
                 h,
                 h,
+                d,
                 Score::from_tokens((d as f32).sqrt().recip(), None)?,
             )?,
         };
@@ -9437,7 +9440,7 @@ impl IdolGaussianDecoder {
                 let k_view = ws.k_hm_f16.slice(0..(rows as usize) * (c as usize));
                 let v_view = ws.v_hm_f16.slice(0..(rows as usize) * (c as usize));
                 let mut o_view = ws.attn_out_f16.slice_mut(0..(rows as usize) * (c as usize));
-                ws.prefill_f16.run_f16_d64(
+                ws.prefill_f16.run_f16(
                     &q_view,
                     c as usize,
                     &k_view,
@@ -9523,7 +9526,7 @@ impl IdolGaussianDecoder {
                 let k_view = ws.k_hm_f16.slice(0..(rows as usize) * (c as usize));
                 let v_view = ws.v_hm_f16.slice(0..(rows as usize) * (c as usize));
                 let mut o_view = ws.attn_out_f16.slice_mut(0..(rows as usize) * (c as usize));
-                ws.prefill_f16.run_f16_d64(
+                ws.prefill_f16.run_f16(
                     &q_view,
                     c as usize,
                     &k_view,
