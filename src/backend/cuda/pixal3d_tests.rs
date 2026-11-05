@@ -946,6 +946,23 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
     let mut flow =
         Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
     let positive = flow.conditioning(&context, &[], &coordinates)?;
+    let context_device = flow.device.stream.clone_htod(&context)?;
+    let device_positive = flow.conditioning_device(&context_device, &coordinates)?;
+    ensure!(
+        flow.device.stream.clone_dtoh(&device_positive.global)?
+            == flow.device.stream.clone_dtoh(&positive.global)?,
+        "device conditioning conversion mismatch"
+    );
+    let mut wrong_coordinates = coordinates.clone();
+    wrong_coordinates[0][0] += 1;
+    ensure!(
+        flow.conditioning_device(&context_device, &wrong_coordinates)
+            .is_err(),
+        "device conditioning coordinate control accepted"
+    );
+    println!(
+        "N5_M2A_HANDOFF PASS rows=2917 channels=2048 exact_f16=true coordinate_control=rejected context_D2H_H2D=0"
+    );
     let negative = flow.conditioning(&vec![0.0; context.len()], &[], &coordinates)?;
     let result = flow.sample_heun(&noise, &positive, &negative)?;
     let reference = tensor(&source, "final_latents")?;

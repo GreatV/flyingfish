@@ -1083,12 +1083,28 @@ extern "C" __global__ void pcd_pos_embed_f32(
     }
 }
 
-extern "C" __global__ void vision_downcast_f32_to_f16(
+template<bool CHECKED>
+__device__ __forceinline__ void downcast_f32_to_f16(
     const float* input, __half* output, uint32_t count) {
     if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
     for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        output[i] = __float2half_rn(input[i]);
+        float value = input[i];
+        __half rounded = __float2half_rn(value);
+        if constexpr (CHECKED) {
+            if (!isfinite(value) || !isfinite(__half2float(rounded))) { __trap(); return; }
+        }
+        output[i] = rounded;
     }
+}
+
+extern "C" __global__ void vision_downcast_f32_to_f16(
+    const float* input, __half* output, uint32_t count) {
+    downcast_f32_to_f16<false>(input, output, count);
+}
+
+extern "C" __global__ void vision_downcast_f32_to_f16_checked(
+    const float* input, __half* output, uint32_t count) {
+    downcast_f32_to_f16<true>(input, output, count);
 }
 
 extern "C" __global__ void vision_silu_f16(const __half* input, __half* output, uint32_t count) {
@@ -1142,6 +1158,20 @@ extern "C" __global__ void concat_rows_f16(const __half* first, const __half* se
         uint64_t r = i / width, c = i % width;
         output[i] = c < first_width ? first[r * first_width + c]
                                    : second[r * second_width + c - first_width];
+    }
+}
+
+extern "C" __global__ void concat_rows_broadcast_f32(const float* first, const float* second,
+    float* output, uint32_t rows, uint32_t first_width, uint32_t second_width) {
+    if (!vision_flat_launch() || !first || !second || !output || !rows ||
+        !first_width || !second_width) { __trap(); return; }
+    uint64_t width = uint64_t(first_width) + second_width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * width;
+         i += uint64_t(gridDim.x) * 256) {
+        uint64_t r = i / width, c = i % width;
+        float value = c < first_width ? first[r * first_width + c] : second[c - first_width];
+        if (!isfinite(value)) { __trap(); return; }
+        output[i] = value;
     }
 }
 

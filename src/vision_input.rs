@@ -1964,6 +1964,146 @@ pub fn rgba_foreground_crop(
 #[cfg(test)]
 mod resampling_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "CPU definition fixtures; set FF_HI3D_IMAGE_FIXTURES"]
+    fn hi3d_preparation_matches_definition() -> Result<()> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("FF_HI3D_IMAGE_FIXTURES").context("FF_HI3D_IMAGE_FIXTURES")?,
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        let source_bytes = std::fs::read(root.join("cpu-r2/inputs.safetensors"))?;
+        let source = safetensors::SafeTensors::deserialize(&source_bytes)?;
+        let anchor_bytes = std::fs::read(root.join("cpu-r2/preparation-anchor.safetensors"))?;
+        let anchor = safetensors::SafeTensors::deserialize(&anchor_bytes)?;
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("cpu-r2/selected-rows.json"))?)?;
+        let read_f32 = |t: safetensors::tensor::TensorView<'_>| -> Result<Vec<f32>> {
+            ensure!(
+                t.dtype() == safetensors::Dtype::F32,
+                "preparation tensor dtype"
+            );
+            Ok(t.data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect())
+        };
+        let score = |name: &str, actual: &[f32], control: bool| -> Result<()> {
+            let expected = read_f32(anchor.tensor(name)?)?;
+            ensure!(
+                expected.len() == actual.len() && actual.iter().all(|v| v.is_finite()),
+                "preparation numeric extent/value"
+            );
+            let (max, sum) =
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .fold((0f64, 0f64), |(max, sum), (&a, &b)| {
+                        let d = f64::from(a) - f64::from(b);
+                        (max.max(d.abs()), sum + d * d)
+                    });
+            for (metric, value) in [
+                ("max_abs", max),
+                ("rmse", (sum / actual.len() as f64).sqrt()),
+            ] {
+                let bound = frozen["preparation"][name]["bounds"][metric]
+                    .as_f64()
+                    .context("preparation frozen bound missing")?;
+                println!(
+                    "N5_M2A_PREPARATION cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control}"
+                );
+                ensure!(
+                    if control {
+                        value > 10.0 * bound
+                    } else {
+                        value <= bound
+                    },
+                    "preparation metric outside frozen contract {name} {metric}"
+                );
+            }
+            Ok(())
+        };
+        let mut cases = 0;
+        for name in anchor
+            .names()
+            .into_iter()
+            .filter_map(|s| s.strip_suffix(".prepared"))
+        {
+            let rgba = source.tensor(&format!("{name}.rgba"))?;
+            let orientation = source.tensor(&format!("{name}.orientation"))?;
+            let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
+            let (rgb, shape) =
+                prepare_rgba_white(rgba.data(), [rgba.shape()[0], rgba.shape()[1]], orientation)?;
+            let expected = anchor.tensor(&format!("{name}.prepared"))?;
+            ensure!(
+                shape == expected.shape()[..2] && rgb == expected.data(),
+                "definition prepared bytes mismatch {name}"
+            );
+            let lanczos = crate::serve::image::resize_lanczos(
+                &rgb,
+                [shape[0], shape[1], 3],
+                [224, 224],
+                crate::serve::image::ResizeRounding::Fixed22,
+            )?;
+            ensure!(
+                lanczos == anchor.tensor(&format!("{name}.lanczos"))?.data(),
+                "definition Lanczos bytes mismatch {name}"
+            );
+            let values = rgb
+                .iter()
+                .map(|&x| f32::from(x) / 255.0)
+                .collect::<Vec<_>>();
+            let values = resize_bilinear_chw_f32(&values, [shape[0], shape[1], 3], [756, 756])?;
+            let key = format!("{name}.bilinear");
+            let ids = rows[&key]
+                .as_array()
+                .context("bilinear sample rows missing")?;
+            let selected = |swap: bool| -> Result<Vec<f32>> {
+                let mut out = Vec::with_capacity(ids.len() * 3);
+                for id in ids {
+                    let id = usize::try_from(id.as_u64().context("bilinear sample row")?)?;
+                    let index = if swap { id % 756 * 756 + id / 756 } else { id };
+                    for c in 0..3 {
+                        out.push(values[c * 756 * 756 + index]);
+                    }
+                }
+                Ok(out)
+            };
+            score(&key, &selected(false)?, false)?;
+            if frozen["preparation"][&key]["control"]["affected"] == true {
+                score(&key, &selected(true)?, true)?;
+            }
+            cases += 1;
+        }
+        let position = read_f32(source.tensor("position.source")?)?;
+        let resized = resize_bicubic_hwc_f32(&position[1024..], [37, 37, 1024], [54, 54])?;
+        let mut selected = [Vec::new(), Vec::new()];
+        for id in rows["position.bicubic"]
+            .as_array()
+            .context("position sample rows missing")?
+        {
+            let id = usize::try_from(id.as_u64().context("position sample row")?)?;
+            for (swap, out) in selected.iter_mut().enumerate() {
+                let index = if swap == 0 {
+                    id
+                } else {
+                    id % 54 * 54 + id / 54
+                };
+                out.extend_from_slice(&resized[index * 1024..(index + 1) * 1024]);
+            }
+        }
+        score("position.bicubic", &selected[0], false)?;
+        score("position.bicubic", &selected[1], true)?;
+        ensure!(cases == 12, "preparation cases unexecuted");
+        println!(
+            "N5_M2A_PREPARATION PASS cases={cases} exact_prepared=true exact_lanczos=true spatial_lookup_control=true"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "CPU publisher RGBA/Lanczos fixtures; set FF_P1_M2_ROOT"]
     fn pixal_preprocessing_matches_publisher_bytes() -> Result<()> {

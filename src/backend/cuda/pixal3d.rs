@@ -1820,6 +1820,42 @@ impl<T: FlowElement> Flow<T> {
             projected: cast(projected)?,
         })
     }
+    pub fn conditioning_device(
+        &self,
+        global: &CudaSlice<f32>,
+        coordinates: &[[i32; 3]],
+    ) -> Result<Conditioning<T>> {
+        ensure!(T::HALF, "device image conditioning requires F16 flow");
+        ensure!(
+            coordinates == self.coordinates,
+            "conditioning coordinate rows differ from flow setup"
+        );
+        ensure!(
+            global.context() == &self.device.ctx,
+            "conditioning device context differs from flow setup"
+        );
+        ensure!(
+            global.len() == 2917 * self.spec.cond_channels,
+            "device conditioning shape mismatch"
+        );
+        let output = self.device.stream.alloc_zeros(global.len())?;
+        let cast = cubin::module(&self.device.ctx, "vision_ops")?
+            .load_function("vision_downcast_f32_to_f16_checked")?;
+        unsafe {
+            self.device
+                .stream
+                .launch_builder(&cast)
+                .arg(global)
+                .arg(&output)
+                .arg(&u32::try_from(global.len())?)
+                .launch(flat(global.len()))?;
+        }
+        Ok(Conditioning {
+            origin: self.origin.clone(),
+            global: output,
+            projected: self.device.stream.alloc_zeros(0)?,
+        })
+    }
     fn block<const CONTROL: bool>(
         &mut self,
         index: usize,

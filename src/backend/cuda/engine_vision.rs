@@ -4445,6 +4445,7 @@ struct DinoWorkspace<T: DinoScalar> {
     rope_table: CudaSlice<T>,
     feature1: CudaSlice<f32>,
     flash_d64: T::Attention,
+    completed_encodes: u64,
 }
 
 struct DinoEncoder<T: DinoScalar> {
@@ -4792,6 +4793,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 let budget = free.min(22_000_000_000).saturating_sub(total / 16);
                 T::attention_setup(s, [rows, heads, head_dim], budget)?
             },
+            completed_encodes: 0,
         };
         let q38_mod = cubin::module(&device.ctx, "q38_common")?;
         let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
@@ -4941,7 +4943,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
         let (mean, std) = if self.cfg.model_type == "clip" {
             (
                 [0.48145466, 0.4578275, 0.40821073],
-                [0.26862954, 0.26130258, 0.27577711],
+                [0.26862954, 0.261_302_6, 0.275_777_1],
             )
         } else {
             ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -5048,6 +5050,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
         ws: &mut DinoWorkspace<T>,
         rope_override: Option<&CudaSlice<T>>,
         capture_layers: bool,
+        mut tap: Option<&mut dyn FnMut(usize, &CudaSlice<T>) -> Result<()>>,
     ) -> Result<[Option<Vec<f32>>; 2]> {
         let rows = self.cfg.total_rows(self.image_side)?;
         let h = self.cfg.hidden_size;
@@ -5201,6 +5204,9 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 &mut TensorMut(dense(&ws.x_c, s, [rows, h])?),
             )?;
             self.scale_residual(s, &ws.x_a, &ws.x_c, &layer.scale2, rows)?;
+            if let Some(tap) = &mut tap {
+                tap(idx, &ws.x_a)?;
+            }
             if capture_layers && idx == 0 {
                 layer0 = Some(
                     s.clone_dtoh(&ws.x_a)?
@@ -5239,6 +5245,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
                     .arg(&0i32)
                     .launch(grid(output_rows as usize, 256))?;
             }
+            ws.completed_encodes += 1;
             return Ok([layer0, layer15]);
         }
         let total_elems = rows * h;
@@ -5273,6 +5280,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 .arg(&self.cfg.layer_norm_eps)
                 .launch(grid(rows as usize, 256))?;
         }
+        ws.completed_encodes += 1;
         Ok([layer0, layer15])
     }
 
@@ -5287,7 +5295,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
     ) -> Result<DinoV3Output> {
         self.stage_input(s, ws, chw_f32)?;
         self.embed(s, blas, ws)?;
-        let [layer0, layer15] = self.transform(s, blas, ws, rope_override, capture_layers)?;
+        let [layer0, layer15] = self.transform(s, blas, ws, rope_override, capture_layers, None)?;
         Ok(DinoV3Output {
             layer0,
             layer15,
@@ -6894,6 +6902,157 @@ impl NafEncoder {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct Hi3DImageConditioner {
+    device: Device,
+    encoders: [(DinoEncoder<f32>, DinoWorkspace<f32>); 2],
+    context: CudaSlice<f32>,
+    concatenate: CudaFunction,
+    encoded: bool,
+    pub allocated_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl Hi3DImageConditioner {
+    pub fn load(
+        device: &Device,
+        blas: &mut Blas,
+        dino_dir: &std::path::Path,
+        clip_dir: &std::path::Path,
+    ) -> Result<Self> {
+        device.finish_upload()?;
+        let (free_before, total) = device.ctx.mem_get_info()?;
+        let capacity = 22_000_000_000usize.min(total.saturating_sub(total / 16));
+        let mut encoders = Vec::with_capacity(2);
+        for (dir, family, side) in [(dino_dir, "dinov2", 756), (clip_dir, "clip", 224)] {
+            let cfg = VisionEncoderConfig::from_dir(dir)?;
+            ensure!(
+                cfg.model_type == family,
+                "image conditioner encoder family mismatch"
+            );
+            let (free, _) = device.ctx.mem_get_info()?;
+            let live = cfg.expected_loaded_elements() * 4
+                + cfg.workspace_bytes(side)?
+                + cfg.total_rows(side)? as usize * cfg.hidden_size as usize * 4;
+            ensure!(
+                live <= capacity.saturating_sub(total - free),
+                "image encoder exceeds derived device budget"
+            );
+            let file = std::fs::File::open(dir.join("model.safetensors"))?;
+            let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            encoders.push(DinoEncoder::<f32>::load(
+                device,
+                blas,
+                CommonOpsRef::new(&device.ctx)?,
+                cfg,
+                side,
+                &map,
+                true,
+            )?);
+        }
+        let encoders = encoders
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("image encoder count mismatch"))?;
+        let context = device.stream.alloc_zeros(2917 * 2048)?;
+        let (free_after, _) = device.ctx.mem_get_info()?;
+        ensure!(
+            total - free_after <= capacity,
+            "image conditioner exceeded derived device capacity"
+        );
+        Ok(Self {
+            device: device.clone(),
+            encoders,
+            context,
+            concatenate: cubin::module(&device.ctx, "vision_ops")?
+                .load_function("concat_rows_broadcast_f32")?,
+            encoded: false,
+            allocated_bytes: free_before.saturating_sub(free_after),
+        })
+    }
+
+    pub fn encode_rgba(
+        &mut self,
+        blas: &Blas,
+        rgba: &[u8],
+        dimensions: [usize; 2],
+        orientation: u8,
+    ) -> Result<&CudaSlice<f32>> {
+        self.encode_rgba_tapped(blas, rgba, dimensions, orientation, None)
+    }
+
+    fn encode_rgba_tapped(
+        &mut self,
+        blas: &Blas,
+        rgba: &[u8],
+        dimensions: [usize; 2],
+        orientation: u8,
+        mut tap: Option<&mut dyn FnMut(usize, usize, &CudaSlice<f32>) -> Result<()>>,
+    ) -> Result<&CudaSlice<f32>> {
+        self.encoded = false;
+        let (rgb, shape) = crate::vision_input::prepare_rgba_white(rgba, dimensions, orientation)?;
+        let pixels = rgb
+            .iter()
+            .map(|&v| f32::from(v) / 255.0)
+            .collect::<Vec<_>>();
+        let dino = crate::vision_input::resize_bilinear_chw_f32(
+            &pixels,
+            [shape[0], shape[1], 3],
+            [756, 756],
+        )?;
+        let clip = crate::serve::image::resize_lanczos(
+            &rgb,
+            [shape[0], shape[1], 3],
+            [224, 224],
+            crate::serve::image::ResizeRounding::Fixed22,
+        )?;
+        let clip = (0..3)
+            .flat_map(|c| clip.chunks_exact(3).map(move |p| f32::from(p[c]) / 255.0))
+            .collect::<Vec<_>>();
+        let stream = &self.device.stream;
+        for (family, ((encoder, workspace), pixels)) in
+            self.encoders.iter_mut().zip([dino, clip]).enumerate()
+        {
+            encoder.stage_input(stream, workspace, &pixels)?;
+            encoder.embed(stream, blas, workspace)?;
+            if let Some(tap) = tap.as_deref_mut() {
+                let mut layer_tap = |index, values: &CudaSlice<f32>| tap(family, index, values);
+                encoder.transform(stream, blas, workspace, None, false, Some(&mut layer_tap))?;
+            } else {
+                encoder.transform(stream, blas, workspace, None, false, None)?;
+            }
+        }
+        unsafe {
+            stream
+                .launch_builder(&self.concatenate)
+                .arg(&self.encoders[0].1.feature1)
+                .arg(&self.encoders[1].1.feature1)
+                .arg(&self.context)
+                .arg(&2917u32)
+                .arg(&1024u32)
+                .arg(&1024u32)
+                .launch(grid((2917usize * 2048).div_ceil(256), 256))?;
+        }
+        self.encoded = true;
+        self.context()
+    }
+
+    pub fn context(&self) -> Result<&CudaSlice<f32>> {
+        ensure!(self.encoded, "image conditioning has not completed");
+        Ok(&self.context)
+    }
+
+    pub fn encoder_calls(&self) -> [u64; 2] {
+        self.encoders
+            .each_ref()
+            .map(|(_, workspace)| workspace.completed_encodes)
+    }
+
+    pub fn into_context(self) -> Result<CudaSlice<f32>> {
+        ensure!(self.encoded, "image conditioning has not completed");
+        Ok(self.context)
+    }
+}
+
 #[derive(Clone, Copy)]
 #[cfg(feature = "cuda")]
 pub struct PixalConditioningShape {
@@ -7226,7 +7385,7 @@ impl PixalConditioningRuntime {
     ) -> Result<()> {
         self.dino.embed(s, blas, &mut self.dino_ws)?;
         self.dino
-            .transform(s, blas, &mut self.dino_ws, None, false)?;
+            .transform(s, blas, &mut self.dino_ws, None, false, None)?;
         let side = self.shape.image_side / 16;
         let features = dense_at(&self.dino_ws.feature1, s, [side * side, 1024], 5 * 1024)?;
         let divisor = if view_index + 1 == view_count {
@@ -10479,6 +10638,260 @@ mod tests {
             let _ = (output, closure);
             Blas::new(device.stream.clone())
         }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "CPU checkpoint headers; set FF_DINOV2_MODEL and FF_CLIP_MODEL"]
+    fn hi3d_image_inventory_cpu() -> Result<()> {
+        for (env, expected) in [("FF_DINOV2_MODEL", 439), ("FF_CLIP_MODEL", 592)] {
+            let dir = std::path::PathBuf::from(
+                std::env::var_os(env).context("vision model directory missing")?,
+            );
+            let cfg = VisionEncoderConfig::from_dir(&dir)?;
+            let file = std::fs::File::open(dir.join("model.safetensors"))?;
+            let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            let mut loader = SafetensorsLoader::new(&map)?;
+            ensure!(
+                loader.remaining.len() == expected,
+                "published vision inventory count mismatch"
+            );
+            loader.validate_absolute_vision(&cfg)?;
+            if cfg.model_type == "dinov2" {
+                let name = "embeddings.patch_embeddings.projection.weight";
+                let tensor = loader.st.tensor(name)?;
+                let wrong = safetensors::tensor::TensorView::new(
+                    tensor.dtype(),
+                    vec![1024, 14, 14, 3],
+                    tensor.data(),
+                )?;
+                let mut tensors = loader
+                    .st
+                    .tensors()
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                tensors.insert(name.into(), wrong);
+                let mutant = safetensors::tensor::serialize(tensors, None)?;
+                let mut mutant = SafetensorsLoader::new(&mutant)?;
+                ensure!(
+                    mutant.validate_absolute_vision(&cfg).is_err(),
+                    "physical kernel input extent control accepted"
+                );
+            }
+        }
+        println!(
+            "N5_M2A_INVENTORY PASS dino_tensors=439 clip_tensors=592 clip_vision_tensors=392 integer_positions=true physical_extent_control=rejected GPU_allocations=0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires image definition fixtures, DINOv2 and CLIP checkpoints"]
+    fn hi3d_image_conditioning_definition_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use std::{collections::BTreeMap, path::PathBuf, rc::Rc};
+        let path = |name: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(name).with_context(|| format!("{name} missing"))?,
+            ))
+        };
+        let root = path("FF_HI3D_IMAGE_FIXTURES")?;
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        let cells = frozen["cells"]
+            .as_object()
+            .context("image frozen cells missing")?;
+        ensure!(cells.len() == 62, "image frozen cell scope differs");
+        let input_bytes = std::fs::read(root.join("cpu-r2/inputs.safetensors"))?;
+        let inputs = safetensors::SafeTensors::deserialize(&input_bytes)?;
+        let anchor_bytes = std::fs::read(root.join("cpu-r2/anchor.safetensors"))?;
+        let anchor = safetensors::SafeTensors::deserialize(&anchor_bytes)?;
+        let operator_bytes = std::fs::read(root.join("cpu-r2/operator-inputs.safetensors"))?;
+        let operator_inputs = safetensors::SafeTensors::deserialize(&operator_bytes)?;
+        let selected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("cpu-r2/selected-rows.json"))?)?;
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let output = path("FF_HI3D_IMAGE_OUTPUT")?;
+        std::fs::create_dir_all(&output)?;
+        let mut blas = test_blas(
+            &device,
+            &output,
+            Rc::new(Closure::new(false, "image definition gate".into())),
+        )?;
+        let mut runtime = Hi3DImageConditioner::load(
+            &device,
+            &mut blas,
+            &path("FF_DINOV2_MODEL")?,
+            &path("FF_CLIP_MODEL")?,
+        )?;
+        let mut actual = BTreeMap::new();
+        for name in ["cottage", "robot_crab", "cottage"] {
+            let rgba = inputs.tensor(&format!("{name}.rgba"))?;
+            let orientation = inputs.tensor(&format!("{name}.orientation"))?;
+            let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
+            let mut taps = BTreeMap::new();
+            let mut tap = |family: usize, index: usize, values: &CudaSlice<f32>| -> Result<()> {
+                if ![0, 11, 23].contains(&index) {
+                    return Ok(());
+                }
+                let family = if family == 0 { "dino" } else { "clip" };
+                let key = format!("{family}.block{index}");
+                let ids = selected[&key]
+                    .as_array()
+                    .context("encoder selected rows missing")?;
+                let host = stream.clone_dtoh(values)?;
+                let mut rows = Vec::with_capacity(ids.len() * 1024);
+                for id in ids {
+                    let start =
+                        usize::try_from(id.as_u64().context("encoder selected row")?)? * 1024;
+                    rows.extend_from_slice(&host[start..start + 1024]);
+                }
+                taps.insert(format!("{name}.{key}"), rows);
+                Ok(())
+            };
+            let context = runtime.encode_rgba_tapped(
+                &blas,
+                rgba.data(),
+                [rgba.shape()[0], rgba.shape()[1]],
+                orientation,
+                Some(&mut tap),
+            )?;
+            let context = stream.clone_dtoh(context)?;
+            taps.insert(format!("{name}.context"), context);
+            if actual.contains_key(&format!("{name}.context")) {
+                ensure!(
+                    taps.iter()
+                        .all(|(key, value)| actual.get(key) == Some(value)),
+                    "A-B-A encoder invariance mismatch"
+                );
+            } else {
+                actual.extend(taps);
+            }
+        }
+        ensure!(
+            runtime.encoder_calls() == [3, 3],
+            "native encoder call count mismatch"
+        );
+        for image in ["cottage", "robot_crab"] {
+            for (family, (encoder, _)) in runtime.encoders.iter().enumerate() {
+                let family = if family == 0 { "dino" } else { "clip" };
+                for index in [0, 11, 23] {
+                    let layer = &encoder.layers[index];
+                    let suffixes: &[&str] = if family == "dino" {
+                        &["norm1", "norm2", "scale1", "scale2", "activation"]
+                    } else {
+                        &["norm1", "norm2", "activation"]
+                    };
+                    for &suffix in suffixes {
+                        let key = format!("{image}.{family}.block{index}.{suffix}");
+                        let tensor = operator_inputs.tensor(&format!("{key}.input"))?;
+                        let width = u32::try_from(
+                            *tensor
+                                .shape()
+                                .last()
+                                .context("operator input width missing")?,
+                        )?;
+                        let host = read_f32_tensor(&operator_inputs, &format!("{key}.input"))?;
+                        let rows = u32::try_from(host.len() / width as usize)?;
+                        let input = stream.clone_htod(&host)?;
+                        let result = stream.alloc_zeros::<f32>(host.len())?;
+                        match suffix {
+                            "norm1" | "norm2" => encoder.layer_norm(
+                                stream,
+                                if suffix == "norm1" {
+                                    &layer.norm1
+                                } else {
+                                    &layer.norm2
+                                },
+                                &input,
+                                &result,
+                                rows,
+                            )?,
+                            "scale1" | "scale2" => encoder.scale_residual(
+                                stream,
+                                &result,
+                                &input,
+                                if suffix == "scale1" {
+                                    &layer.scale1
+                                } else {
+                                    &layer.scale2
+                                },
+                                rows,
+                            )?,
+                            "activation" => unsafe {
+                                stream
+                                    .launch_builder(&encoder.gelu)
+                                    .arg(&input)
+                                    .arg(&0u64)
+                                    .arg(&result)
+                                    .arg(&rows)
+                                    .arg(&width)
+                                    .launch(grid(host.len().div_ceil(256).min(65535), 256))?;
+                            },
+                            _ => unreachable!(),
+                        }
+                        actual.insert(key, stream.clone_dtoh(&result)?);
+                    }
+                }
+            }
+        }
+        ensure!(actual.len() == cells.len(), "native image cells unexecuted");
+        let mut defects = 0;
+        for (name, cell) in cells {
+            let reference = read_f32_tensor(&anchor, name)?;
+            let (image, suffix) = name.split_once('.').context("image cell key")?;
+            let other = if image == "cottage" {
+                "robot_crab"
+            } else {
+                "cottage"
+            };
+            for (control, candidate) in [
+                (false, &actual[name]),
+                (true, &actual[&format!("{other}.{suffix}")]),
+            ] {
+                ensure!(
+                    candidate.len() == reference.len() && candidate.iter().all(|x| x.is_finite()),
+                    "image candidate extent/value failure"
+                );
+                let (max, sum) =
+                    candidate
+                        .iter()
+                        .zip(&reference)
+                        .fold((0f64, 0f64), |(max, sum), (&a, &b)| {
+                            let d = f64::from(a) - f64::from(b);
+                            (max.max(d.abs()), sum + d * d)
+                        });
+                for (metric, value) in [
+                    ("max_abs", max),
+                    ("rmse", (sum / candidate.len() as f64).sqrt()),
+                ] {
+                    let bound = cell["bounds"][metric]
+                        .as_f64()
+                        .context("image bound missing")?;
+                    let defect = if control {
+                        value <= 10.0 * bound
+                    } else {
+                        value > bound
+                    };
+                    defects += usize::from(defect);
+                    println!(
+                        "N5_M2A_IMAGE_METRIC cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                        if defect { "DEFECT" } else { "PASS" }
+                    );
+                }
+            }
+        }
+        println!(
+            "N5_M2A_IMAGE_GATE {} cells={} defects={defects} calls={:?} A_B_A=true allocated_bytes={} no_timing=true",
+            if defects == 0 { "PASS" } else { "DEFECT" },
+            cells.len(),
+            runtime.encoder_calls(),
+            runtime.allocated_bytes
+        );
+        ensure!(defects == 0, "finite image candidate defects");
+        Ok(())
     }
 
     fn q38_geometry() -> VisionGeometry {
