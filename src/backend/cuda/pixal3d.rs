@@ -26,7 +26,7 @@ use half::{bf16, f16};
 use safetensors::Dtype;
 use std::{collections::BTreeMap, mem::size_of, path::Path, rc::Rc};
 
-type Weights<T> = BTreeMap<String, CudaSlice<T>>;
+type FlowWeights<T> = BTreeMap<String, CudaSlice<T>>;
 
 fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
     x.device_ptr(&d.stream).0
@@ -110,7 +110,7 @@ struct Linear<T> {
     bias: Tensor<T, 1>,
 }
 impl<T: DeviceRepr + Copy> Linear<T> {
-    fn bind(weights: &Weights<T>, d: &Device, name: &str, shape: [usize; 2]) -> Result<Self> {
+    fn bind(weights: &FlowWeights<T>, d: &Device, name: &str, shape: [usize; 2]) -> Result<Self> {
         let weight = weights
             .get(&format!("{name}.weight"))
             .with_context(|| format!("linear weight missing: {name}"))?;
@@ -317,7 +317,7 @@ impl ResidualIo {
     fn new(
         d: &Device,
         sites: &SparseSites,
-        weights: (&Weights<f16>, &Weights<f32>),
+        weights: (&FlowWeights<f16>, &FlowWeights<f32>),
         name: &str,
         widths: [usize; 3],
         columns: Rc<CudaSlice<f16>>,
@@ -497,7 +497,7 @@ impl SparseFlowIo {
         sites: &SparseSites,
         parent: &SparseSites,
         inverse: &[u32],
-        weights: (&Weights<f16>, &Weights<f32>),
+        weights: (&FlowWeights<f16>, &FlowWeights<f32>),
         budget: usize,
     ) -> Result<Self> {
         let h = weights.1["t_embedder.mlp.2.bias"].len();
@@ -1060,8 +1060,8 @@ pub struct Flow<T: FlowElement = bf16> {
     rows: usize,
     coordinates: Vec<[i32; 3]>,
     steps: usize,
-    _inner_weights: Weights<T>,
-    _f32: Weights<f32>,
+    _inner_weights: FlowWeights<T>,
+    _f32: FlowWeights<f32>,
     blocks: Vec<Block<T>>,
     input: Linear<f32>,
     output: Linear<f32>,
@@ -2450,8 +2450,8 @@ fn denormalize_shape(
 }
 
 struct Weights {
-    half: Weights<f16>,
-    float: Weights<f32>,
+    half: BTreeMap<String, CudaSlice<f16>>,
+    float: BTreeMap<String, CudaSlice<f32>>,
 }
 impl Weights {
     fn load(d: &Device, checkpoint: &DecoderCheckpoint) -> Result<Self> {
