@@ -1270,6 +1270,9 @@ pub(crate) struct F32Attention {
 
 #[cfg(feature = "cuda")]
 impl F32Attention {
+    pub(crate) fn workspace_bytes(&self) -> usize {
+        (self.partials.len() + self.scores.len() + self.probabilities.len()) * size_of::<f32>()
+    }
     pub(crate) fn new(
         stream: Arc<CudaStream>,
         geometry: [u32; 5],

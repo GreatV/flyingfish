@@ -1023,6 +1023,7 @@ fn metrics(x: &[f64], y: &[f64]) -> Result<BTreeMap<&'static str, f64>> {
     ]))
 }
 struct Gate {
+    package: &'static str,
     cells: BTreeMap<CellId, Value>,
     anchors: BTreeMap<CellId, Value>,
     seen: BTreeSet<CellId>,
@@ -1102,6 +1103,7 @@ impl Gate {
             "P1_M3A_FROZEN cells=764 minimum_control_ratio={minimum:.15} thresholds_unchanged=true"
         );
         Ok(Self {
+            package: "P1_M3A",
             cells,
             anchors,
             seen: BTreeSet::new(),
@@ -1136,7 +1138,8 @@ impl Gate {
                 let defect = gating && value > tau;
                 self.defects += usize::from(defect);
                 println!(
-                    "P1_M3A_METRIC {}",
+                    "{}_METRIC {}",
+                    self.package,
                     serde_json::json!({"table":key.0,"name":key.1,"key":key.2,"metric":name,"value":value,"tau":tau,"gating":gating,"result":if defect {"DEFECT"} else {"PASS"}})
                 );
             }
@@ -1153,7 +1156,8 @@ impl Gate {
             let gating = cell["frozen_gating_metrics"]["exact"] == true;
             self.defects += usize::from(gating && mismatches > 0);
             println!(
-                "P1_M3A_EXACT {}",
+                "{}_EXACT {}",
+                self.package,
                 serde_json::json!({"table":key.0,"name":key.1,"mismatches":mismatches,"gating":gating})
             );
         }
@@ -1174,7 +1178,8 @@ impl Gate {
             .collect();
         ensure!(missing.is_empty(), "unscored frozen cells: {missing:?}");
         println!(
-            "P1_M3A_GATE {} cells={} defects={} timing=false eager=true",
+            "{}_GATE {} cells={} defects={} timing=false eager=true",
+            self.package,
             if self.defects == 0 { "PASS" } else { "DEFECT" },
             self.seen.len(),
             self.defects
@@ -1267,9 +1272,12 @@ fn sampler_cells(gate: &mut Gate) -> Result<()> {
             .collect();
         for text in ["1.0", "0.9", "0.6", "0.599"] {
             let t: f64 = text.parse()?;
-            let mut sampler = Sampler::new(&d, &noise)?;
+            let mut sampler = Sampler::new(&d, &noise, true)?;
             d.stream.memcpy_htod(&positive, &mut sampler.positive)?;
-            d.stream.memcpy_htod(&negative, &mut sampler.negative)?;
+            d.stream.memcpy_htod(
+                &negative,
+                sampler.negative.as_mut().context("CFG buffer missing")?,
+            )?;
             sampler.step(&d, t, t - 0.037, sparse)?;
             gate.score_f32(
                 id(
@@ -1303,7 +1311,7 @@ fn flow_cells(
     case: FlowCase<'_>,
     noise: &[f32],
     positive: &Conditioning,
-    negative: &Conditioning,
+    negative: Option<&Conditioning>,
 ) -> Result<()> {
     let sparse = flow.spec.sparse();
     let steps = flow.steps;
@@ -1314,17 +1322,19 @@ fn flow_cells(
             .map(|t| (1000.0 * t) as f32)
             .collect::<Vec<_>>(),
     )?;
-    let mut sampler = Sampler::new(&flow.device, noise)?;
+    let mut sampler = Sampler::new(&flow.device, noise, !flow.spec.texture())?;
     let mut call = 0;
+    let mut forwards = [0usize; 2];
     for step in 0..steps {
-        for (index, condition) in [positive, negative].into_iter().enumerate() {
+        for (index, condition) in [Some(positive), negative].into_iter().enumerate() {
+            let Some(condition) = condition else { continue };
             if index == 1 && !(0.6..=1.0).contains(&times[step]) {
                 continue;
             }
             let output = if index == 0 {
                 &mut sampler.positive
             } else {
-                &mut sampler.negative
+                sampler.negative.as_mut().context("CFG buffer missing")?
             };
             flow.forward_observe(&sampler.state, step, condition, output, |f, block| {
                 if sparse && [0, 1, 10, 11, 20].contains(&call) && [0, 15, 29].contains(&block) {
@@ -1342,6 +1352,7 @@ fn flow_cells(
                 &flow.device.stream.clone_dtoh(output)?,
             )?;
             call += 1;
+            forwards[index] += 1;
         }
         sampler.step(&flow.device, times[step], times[step + 1], sparse)?;
         gate.score_f32(
@@ -1351,17 +1362,34 @@ fn flow_cells(
         )?;
     }
     ensure!(
-        call == if sparse { 21 } else { 22 },
+        call == if flow.spec.texture() {
+            12
+        } else if sparse {
+            21
+        } else {
+            22
+        },
         "CFG branch call count mismatch"
     );
+    if flow.spec.texture() {
+        texture_launch_contract(forwards[0], forwards[1], 0)?;
+        ensure!(
+            texture_launch_contract(forwards[0], forwards[1] + 1, 0).is_err(),
+            "negative branch mutant survived"
+        );
+        println!(
+            "P1_M4B_BRANCHES positive={} negative={} mutant=rejected",
+            forwards[0], forwards[1]
+        );
+    }
     gate.score_f32(
         case.cell("final"),
         &case.shape,
         &flow.device.stream.clone_dtoh(&sampler.state)?,
     )?;
     println!(
-        "P1_M3A_FLOW_COMPLETE table={} fixture={:?} forwards={call} steps={steps}",
-        case.table, case.fixture
+        "{}_FLOW_COMPLETE table={} fixture={:?} forwards={call} steps={steps}",
+        gate.package, case.table, case.fixture
     );
     Ok(())
 }
@@ -1460,7 +1488,7 @@ fn ss_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Resul
                 },
                 &noise,
                 &positive,
-                &negative,
+                Some(&negative),
             )?;
         }
         let input = conditioning.join("cottage.safetensors");
@@ -1570,7 +1598,7 @@ fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Re
                 },
                 &f32_tensor(&input, "noise.features")?,
                 &positive,
-                &negative,
+                Some(&negative),
             )?;
         }
     }
@@ -1894,6 +1922,10 @@ fn transitions(gate: &mut Gate, model: &Path, root: &Path) -> Result<()> {
     .out_channels;
     let mean = coefficients("mean")?;
     let std = coefficients("std")?;
+    ensure!(
+        mean.len() == channels && std.len() == channels,
+        "normalization width differs from flow"
+    );
     let d = Device::new(0)?;
     for (variant, resolution, fixture) in [
         ("single", 1536, "cottage"),
@@ -1905,7 +1937,7 @@ fn transitions(gate: &mut Gate, model: &Path, root: &Path) -> Result<()> {
         let mut values = d
             .stream
             .clone_htod(&host.values.iter().map(|&x| x as f32).collect::<Vec<_>>())?;
-        denormalize_shape(&d, &mut values, &mean, &std, channels)?;
+        channel_transform(&d, &mut values, [&mean, &std], false)?;
         gate.score_f32(
             id(
                 "floors-transition-published.json",
@@ -2790,7 +2822,7 @@ fn linked_lr(root: &Path, model: &Path, runtime: &Path) -> Result<Vec<f32>> {
         &coordinates(&tensor(&input, "neg_cond.proj.coords")?)?,
     )?;
     let noise = f32_tensor(&input, "noise.features")?;
-    let latent = flow.sample(&noise, &positive, &negative)?;
+    let latent = flow.sample(&noise, &positive, Some(&negative))?;
     let times = schedule(true, flow.steps);
     let forwards = flow.steps
         + times[..flow.steps]
@@ -3210,9 +3242,11 @@ fn surface_count(case: &str, phase: &str, plan: [usize; 3], rows: [usize; 2]) ->
     ensure!(parent_tile > 0 && child_tile > 0, "empty gather tile");
     let calls =
         ([4, 16, 8, 4][stage] + 1) * parent.div_ceil(parent_tile) + child.div_ceil(child_tile);
+    let texture = phase.starts_with("texture-");
     println!(
-        "P1_M4A_COUNT {}",
-        serde_json::json!({"case":case,"phase":phase,"stage":stage,"parent_rows":parent,"child_rows":child,"channels":channels,"parent_map_bytes":parent_map,"child_map_bytes":child_map,"parent_columns_bytes":parent_columns,"child_columns_bytes":child_columns,"parent_tile_rows":parent_tile,"child_tile_rows":child_tile,"gather_launches":calls,"bias_launches":calls,"gemm_dispatches":calls,"subdivision_d2h_bytes":parent*8*size_of::<f16>(),"child_pair_h2d_bytes":child*2*size_of::<u32>()})
+        "{}_COUNT {}",
+        if texture { "P1_M4B" } else { "P1_M4A" },
+        serde_json::json!({"case":case,"phase":phase,"stage":stage,"parent_rows":parent,"child_rows":child,"channels":channels,"parent_map_bytes":parent_map,"child_map_bytes":child_map,"parent_columns_bytes":parent_columns,"child_columns_bytes":child_columns,"parent_tile_rows":parent_tile,"child_tile_rows":child_tile,"gather_launches":calls,"bias_launches":calls,"gemm_dispatches":calls,"subdivision_d2h_bytes":if texture{0}else{parent*8*size_of::<f16>()},"child_pair_h2d_bytes":child*2*size_of::<u32>()})
     );
     Ok(())
 }
@@ -3276,7 +3310,7 @@ fn surface_fixed(
             Ok(())
         },
     )?;
-    let output = decoder.shape_head(&sites, features)?;
+    let output = decoder.output_head(&sites, features)?;
     let fields = decoder.device.stream.clone_dtoh(&output)?;
     let expected = decoder_coordinates(
         &base.join("shape_slat_decoder-fields.safetensors"),
@@ -3585,7 +3619,7 @@ fn surface_generated(
         let mut latent = d
             .stream
             .clone_htod(&f32_tensor(&input, "samples.features")?)?;
-        denormalize_shape(d, &mut latent, &mean, &std, mean.len())?;
+        channel_transform(d, &mut latent, [&mean, &std], false)?;
         let physical = d.stream.clone_dtoh(&latent)?;
         drop(latent);
         let (sites, features) = decoder.sparse_decode(coords, &physical, &[], |plan @ [level, _, _], (parents, logits), (next, _)| {
@@ -3609,7 +3643,7 @@ fn surface_generated(
                 quantized.coordinates().len()
             );
         } else {
-            let fields = decoder.shape_head(&sites, features)?;
+            let fields = decoder.output_head(&sites, features)?;
             let mesh = super::super::sparse::dual_grid_mesh(
                 d,
                 sites,
@@ -3667,7 +3701,7 @@ fn surface_normalization(g: &mut DecoderGate, model: &Path, root: &Path) -> Resu
             let mut values = d
                 .stream
                 .clone_htod(&host.values.iter().map(|&x| x as f32).collect::<Vec<_>>())?;
-            denormalize_shape(&d, &mut values, &mean, &std, mean.len())?;
+            channel_transform(&d, &mut values, [&mean, &std], false)?;
             g.score_f32(
                 id(
                     "floors-transition-published.json",
@@ -3951,7 +3985,7 @@ fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
     let mut latent = d
         .stream
         .clone_htod(&f32_tensor(&input, "samples.features")?)?;
-    denormalize_shape(d, &mut latent, &mean, &std, mean.len())?;
+    channel_transform(d, &mut latent, [&mean, &std], false)?;
     let physical = d.stream.clone_dtoh(&latent)?;
     drop(latent);
     let mut guide_coords = Vec::new();
@@ -4046,6 +4080,563 @@ fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
         surface_forced(&mut g, &decoder, case)?;
         surface_fixed(&mut g, &decoder, &root, (case, capture, table))?;
         surface_generated(&mut g, &decoder, &root, &model, (case, core, requested))?;
+    }
+    g.finish()
+}
+
+impl DecoderGate {
+    fn texture(flow: bool) -> Result<Self> {
+        let bytes = std::fs::read(env_path("FF_PIXAL_FREEZE")?)?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes))
+                == "bc06c2394b677124a2041bacd29167d93a9a679e0205c4e229fd0afcefc0a3db",
+            "texture freeze integrity mismatch"
+        );
+        let freeze: Value = serde_json::from_slice(&bytes)?;
+        ensure!(
+            freeze["reference_valid"] == true,
+            "invalid texture reference"
+        );
+        let mut cells = BTreeMap::new();
+        let mut anchors = BTreeMap::new();
+        for table in freeze["tables"]
+            .as_array()
+            .context("texture tables missing")?
+        {
+            let family = table["family"].as_str().context("family missing")?;
+            let table_name = table["source_table"].as_str().context("table missing")?;
+            for cell in table["cells"].as_array().context("cells missing")? {
+                let name = cell["name"].as_str().context("name missing")?;
+                let selected = if flow {
+                    family == "slat"
+                } else {
+                    (family == "decoder-fixed" && name == "tex-fields")
+                        || name == "guided-texture-coordinate-identity"
+                        || name.starts_with("normalization-")
+                        || (family == "transition" && name.ends_with("-tex"))
+                };
+                if !selected {
+                    continue;
+                }
+                let key = id(table_name, name, cell["key"].as_str());
+                let mut anchor = cell["anchor"].clone();
+                if anchor.is_null() && cell["sources"].is_object() {
+                    anchor = cell["sources"][cell["comparison_anchor"]
+                        .as_str()
+                        .context("texture anchor missing")?]
+                    .clone();
+                }
+                if !anchor.is_null() {
+                    anchors.insert(key.clone(), anchor);
+                }
+                for (metric, ratio) in cell["ratios"].as_object().into_iter().flatten() {
+                    if cell["frozen_gating_metrics"][metric] == true {
+                        ensure!(
+                            ratio.as_f64().context("control ratio missing")? >= 10.0,
+                            "weak frozen texture control"
+                        );
+                    }
+                }
+                ensure!(
+                    cells.insert(key, cell.clone()).is_none(),
+                    "duplicate texture cell"
+                );
+            }
+        }
+        println!(
+            "P1_M4B_FREEZE flow={flow} cells={} minimum_control_ratio={}",
+            cells.len(),
+            freeze["minimum_gated_control_ratio"]
+        );
+        Ok(Self {
+            package: if flow {
+                "P1_M4B_FLOW"
+            } else {
+                "P1_M4B_MATERIAL"
+            },
+            cells,
+            anchors,
+            seen: BTreeSet::new(),
+            defects: 0,
+        })
+    }
+}
+
+fn texture_launch_contract(positive: usize, negative: usize, subdivision: usize) -> Result<()> {
+    ensure!(
+        positive == 12 && negative == 0 && subdivision == 0,
+        "texture launch contract defect"
+    );
+    Ok(())
+}
+
+#[test]
+fn guided_material_contract_rejects_mutants() -> Result<()> {
+    let coordinates = [[0, 1, 3, 5], [0, 7, 11, 13]];
+    let logits: Vec<_> = (0..16).map(|i| (i as f32 - 7.0) / 3.0).collect();
+    let guide = SubdivisionGuide {
+        coordinates: &coordinates,
+        logits: &logits,
+    };
+    guide.validate(&coordinates)?;
+    let mut foreign = coordinates;
+    foreign.swap(0, 1);
+    ensure!(
+        guide.validate(&foreign).is_err(),
+        "foreign guide mutant survived"
+    );
+    validate_guide_count(DecoderKind::Texture, 4)?;
+    ensure!(
+        validate_guide_count(DecoderKind::Texture, 3).is_err(),
+        "missing guide mutant survived"
+    );
+    texture_launch_contract(12, 0, 0)?;
+    for mutant in [(11, 0, 0), (12, 1, 0), (12, 0, 1)] {
+        ensure!(
+            texture_launch_contract(mutant.0, mutant.1, mutant.2).is_err(),
+            "launch mutant survived"
+        );
+    }
+    ensure!(
+        !DecoderKind::Texture
+            .inventory()
+            .keys()
+            .any(|k| k.contains("to_subdiv")),
+        "texture predictor weights present"
+    );
+    println!(
+        "P1_M4B_CONTRACT_CPU PASS foreign_guide=rejected missing_guide=rejected positive_count_mutant=rejected negative_count_mutant=rejected subdivision_launch_mutant=rejected"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires frozen texture captures; CPU only"]
+fn pixal3d_texture_freeze_cpu() -> Result<()> {
+    for flow in [true, false] {
+        let gate = DecoderGate::texture(flow)?;
+        ensure!(
+            gate.cells.len() == if flow { 190 } else { 16 },
+            "texture subset mismatch"
+        );
+        for anchor in gate.anchors.values() {
+            let path = Path::new(anchor["path"].as_str().context("anchor path missing")?);
+            ensure!(path.is_file(), "texture anchor absent: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, published texture checkpoints and frozen captures"]
+fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
+    let selected = DecoderGate::texture(true)?;
+    let mut gate = Gate {
+        package: selected.package,
+        cells: selected.cells,
+        anchors: selected.anchors,
+        seen: BTreeSet::new(),
+        defects: 0,
+    };
+    let root = env_path("FF_PIXAL_REFERENCE")?;
+    let model = env_path("FF_PIXAL_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    for (case, capture, _, core, _) in SURFACE_CASES {
+        let base = root.join("evidence/P1-M1-r1").join(capture);
+        let input = base.join("tex_slat-0-inputs.safetensors");
+        let points = coordinates(&tensor(&input, "noise.coords")?)?;
+        let stem = format!(
+            "slat_flow_imgshape2tex_dit_1_3B_1024_bf16{}",
+            if core.starts_with("mv-") { "_mv" } else { "" }
+        );
+        let mut flow = Flow::open(
+            &model.join("ckpts"),
+            &stem,
+            &runtime,
+            &points,
+            12_000_000_000,
+        )?;
+        let mut positive = flow.conditioning(
+            &f32_tensor(&input, "cond.global")?,
+            &f32_tensor(&input, "cond.proj.features")?,
+            &coordinates(&tensor(&input, "cond.proj.coords")?)?,
+        )?;
+        let physical_base = if case == "crab1408" {
+            root.join("evidence/P1-M1-r1")
+                .join(format!("{capture}-decoder-r2"))
+        } else {
+            base.clone()
+        };
+        let physical_path = physical_base.join("result.safetensors");
+        let physical = f32_tensor(&physical_path, "result.1.0.features")?;
+        let shape_coords = coordinates(&tensor(&physical_path, "result.1.0.coords")?)?;
+        flow.condition_shape(&mut positive, &physical, &shape_coords)?;
+        let mut wrong = shape_coords.clone();
+        wrong.rotate_left(1);
+        ensure!(
+            flow.condition_shape(&mut positive, &physical, &wrong)
+                .is_err(),
+            "foreign concat mutant survived"
+        );
+        let actual_core = if case == "crab1408" {
+            "single-1408-robot_crab"
+        } else {
+            core
+        };
+        let table = format!("floors-slat-{actual_core}-tex-angular-r1.json");
+        let coords = tensor(&input, "noise.coords")?;
+        gate.score(
+            id(&table, "coordinate_alignment", None),
+            &coords.shape,
+            &flow
+                .coordinates
+                .iter()
+                .flat_map(|p| [0.0, p[0] as f64, p[1] as f64, p[2] as f64])
+                .collect::<Vec<_>>(),
+        )?;
+        println!(
+            "P1_M4B_ATTENTION case={case} rows={} heads={} lse_bytes={} quadratic_workspace_bytes=0 route=online_softmax",
+            flow.rows,
+            flow.spec.num_heads,
+            flow.flash.lse.len() * size_of::<f32>()
+        );
+        flow_cells(
+            &mut flow,
+            &mut gate,
+            FlowCase {
+                table: &table,
+                fixture: None,
+                shape: vec![points.len(), 32],
+            },
+            &f32_tensor(&input, "noise.features")?,
+            &positive,
+            None,
+        )?;
+    }
+    gate.finish()
+}
+
+fn material_pointwise(g: &mut DecoderGate, model: &Path, root: &Path) -> Result<()> {
+    let d = Device::new(0)?;
+    let path = env_path("FF_PIXAL_NORMALIZATION")?;
+    let shape = tensor(&path, "physical_shape")?;
+    let noise = f32_tensor(&path, "noise")?;
+    let mut normalized = d
+        .stream
+        .clone_htod(&shape.values.iter().map(|&x| x as f32).collect::<Vec<_>>())?;
+    let mean = f32_tensor(&path, "shape_mean")?;
+    let std = f32_tensor(&path, "shape_std")?;
+    channel_transform(&d, &mut normalized, [&mean, &std], true)?;
+    g.score_f32(
+        id("m4-geometry-pointwise", "normalization-shape_inverse", None),
+        &shape.shape,
+        &d.stream.clone_dtoh(&normalized)?,
+    )?;
+    let mut denorm = d.stream.clone_htod(&noise)?;
+    channel_transform(
+        &d,
+        &mut denorm,
+        [
+            &f32_tensor(&path, "tex_mean")?,
+            &f32_tensor(&path, "tex_std")?,
+        ],
+        false,
+    )?;
+    g.score_f32(
+        id("m4-geometry-pointwise", "normalization-tex_denorm", None),
+        &shape.shape,
+        &d.stream.clone_dtoh(&denorm)?,
+    )?;
+    drop(denorm);
+    let noise_device = d.stream.clone_htod(&noise)?;
+    let concat = d.stream.alloc_zeros::<f32>(noise.len() * 2)?;
+    let kernel = cubin::module(&d.ctx, "q38_common")?.load_function("concat_rows_f32")?;
+    unsafe {
+        d.stream
+            .launch_builder(&kernel)
+            .arg(&noise_device)
+            .arg(&normalized)
+            .arg(&concat)
+            .arg(&(shape.shape[0] as i64))
+            .arg(&32i32)
+            .arg(&32i32)
+            .launch(flat(noise.len() * 2))?;
+    }
+    let actual = d.stream.clone_dtoh(&concat)?;
+    let normalized_host = d.stream.clone_dtoh(&normalized)?;
+    let cpu: Vec<f32> = noise
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(normalized_host.as_chunks::<32>().0.iter())
+        .flat_map(|(a, b)| a.iter().chain(b).copied())
+        .collect();
+    let valid_concat = |values: &[f32]| -> Result<()> {
+        ensure!(values == cpu, "row concat defect");
+        Ok(())
+    };
+    valid_concat(&actual)?;
+    let reversed: Vec<f32> = normalized_host
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(noise.as_chunks::<32>().0.iter())
+        .flat_map(|(a, b)| a.iter().chain(b).copied())
+        .collect();
+    ensure!(
+        valid_concat(&reversed).is_err(),
+        "reversed halves mutant survived"
+    );
+    g.score_f32(
+        id("m4-geometry-pointwise", "normalization-concat", None),
+        &[shape.shape[0], 64],
+        &actual,
+    )?;
+    drop((concat, noise_device, normalized));
+    let raw: Vec<f32> = (0..257 * 6)
+        .map(|i| ((i * 37 % 103) - 51) as f32 / 13.0)
+        .collect();
+    let mut material = d.stream.clone_htod(&raw)?;
+    channel_transform(&d, &mut material, [&[0.5; 6], &[0.5; 6]], false)?;
+    let expected: Vec<f32> = raw.iter().map(|&v| v * 0.5 + 0.5).collect();
+    let validate = |values: &[f32]| -> Result<()> {
+        ensure!(values == expected, "material channel/affine defect");
+        Ok(())
+    };
+    validate(&d.stream.clone_dtoh(&material)?)?;
+    let mut swapped = expected.clone();
+    for row in swapped.as_chunks_mut::<6>().0 {
+        row.swap(3, 4);
+    }
+    ensure!(validate(&swapped).is_err(), "PBR channel mutant survived");
+    let clipped: Vec<_> = expected.iter().map(|&x| x.clamp(0.0, 1.0)).collect();
+    ensure!(
+        validate(&clipped).is_err(),
+        "material clamp mutant survived"
+    );
+    println!(
+        "P1_M4B_POINTWISE_CONTRACT PASS reversed_halves=rejected channel_order=rejected clamp=rejected"
+    );
+    let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
+    let norm = &config["args"]["tex_slat_normalization"];
+    let mean: Vec<f32> = serde_json::from_value(norm["mean"].clone())?;
+    let std: Vec<f32> = serde_json::from_value(norm["std"].clone())?;
+    for (fixture, capture) in [
+        ("cottage", "pipeline-single-1536-cottage-r0a"),
+        ("robot_crab", "pipeline-single-1536-robot_crab-r0a"),
+        ("mv4", "pipeline-mv-1024-mv4-r0a"),
+    ] {
+        let input = root
+            .join("evidence/P1-M1-r1")
+            .join(capture)
+            .join("tex_slat-0-outputs.safetensors");
+        let host = tensor(&input, "samples.features")?;
+        let mut values = d
+            .stream
+            .clone_htod(&host.values.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+        channel_transform(&d, &mut values, [&mean, &std], false)?;
+        g.score_f32(
+            id(
+                "floors-transition-published.json",
+                &format!("{fixture}-tex"),
+                None,
+            ),
+            &host.shape,
+            &d.stream.clone_dtoh(&values)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn material_fixed(
+    g: &mut DecoderGate,
+    decoder: &PixalDecoder,
+    root: &Path,
+    case: (&str, &str, &str),
+) -> Result<()> {
+    let (case, capture, table) = case;
+    let capture = if case == "crab1408" {
+        format!("{capture}-decoder-r2")
+    } else {
+        capture.to_owned()
+    };
+    let base = root.join("evidence/P1-M1-r1").join(capture);
+    let input = base.join("result.safetensors");
+    let coords = decoder_coordinates(&input, "result.1.1.coords")?;
+    let latent = f32_tensor(&input, "result.1.1.features")?;
+    let topology = base.join("raw-geometry-material.safetensors");
+    let mut stored = Vec::new();
+    for stage in 0..4 {
+        stored.push(SparseDecoderOutput {
+            coordinates: decoder_coordinates(&topology, &format!("subdivisions.{stage}.coords"))?,
+            features: f32_tensor(&topology, &format!("subdivisions.{stage}.features"))?,
+            channels: 8,
+        });
+    }
+    let guides: Vec<_> = stored
+        .iter()
+        .map(|s| SubdivisionGuide {
+            coordinates: &s.coordinates,
+            logits: &s.features,
+        })
+        .collect();
+    let before = decoder.subdivision_launches.get();
+    let (sites, features) = decoder.sparse_decode(
+        coords,
+        &latent,
+        &guides,
+        |plan, (parents, predicted), (next, _)| {
+            ensure!(predicted.is_empty(), "texture computed subdivision logits");
+            surface_count(
+                case,
+                "texture-fixed",
+                plan,
+                [parents.coordinates().len(), next.coordinates().len()],
+            )?;
+            Ok(())
+        },
+    )?;
+    let output = decoder.output_head(&sites, features)?;
+    let actual = decoder.device.stream.clone_dtoh(&output)?;
+    let expected_coords = decoder_coordinates(
+        &base.join("tex_slat_decoder-fields.safetensors"),
+        "output.coords",
+    )?;
+    ensure!(
+        sites.coordinates() == expected_coords,
+        "fixed texture coordinate mismatch"
+    );
+    g.score_f32(
+        id(table, "tex-fields", None),
+        &[sites.coordinates().len(), 6],
+        &actual,
+    )?;
+    texture_launch_contract(12, 0, decoder.subdivision_launches.get() - before)?;
+    ensure!(
+        texture_launch_contract(12, 0, 1).is_err(),
+        "texture subdivision mutant survived"
+    );
+    println!(
+        "P1_M4B_MATERIAL_FIXED case={case} rows={} subdivision_launches=0",
+        sites.coordinates().len()
+    );
+    Ok(())
+}
+
+fn material_generated(
+    g: &mut DecoderGate,
+    shape: &PixalDecoder,
+    texture: &PixalDecoder,
+    root: &Path,
+    case: (&str, &str),
+) -> Result<()> {
+    let (case, capture) = case;
+    let capture = if case == "crab1408" {
+        format!("{capture}-decoder-r2")
+    } else {
+        capture.to_owned()
+    };
+    let input = root
+        .join("evidence/P1-M1-r1")
+        .join(capture)
+        .join("result.safetensors");
+    let coords = decoder_coordinates(&input, "result.1.0.coords")?;
+    let latent = f32_tensor(&input, "result.1.0.features")?;
+    let (shape_output, guides) = shape.decode(coords.clone(), &latent, &[])?;
+    let expected = shape_output.coordinates;
+    drop(shape_output.features);
+    let latent = f32_tensor(&input, "result.1.1.features")?;
+    ensure!(
+        decoder_coordinates(&input, "result.1.1.coords")? == coords,
+        "shape/texture latent identity mismatch"
+    );
+    let borrowed: Vec<_> = guides
+        .iter()
+        .map(|s| SubdivisionGuide {
+            coordinates: &s.coordinates,
+            logits: &s.features,
+        })
+        .collect();
+    let mut tested = 0;
+    let mut mismatches = 0;
+    let before = texture.subdivision_launches.get();
+    let (sites, features) = texture.sparse_decode(
+        coords,
+        &latent,
+        &borrowed,
+        |plan @ [stage, _, _], (parents, predicted), (next, _)| {
+            ensure!(predicted.is_empty(), "texture predicted subdivision");
+            let guide = &guides[stage];
+            ensure!(
+                parents.coordinates() == guide.coordinates,
+                "generated parent identity mismatch"
+            );
+            let mask: Vec<[bool; 8]> = guide
+                .features
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|r| r.map(|x| x > 0.0))
+                .collect();
+            let (expected, _) = parents.subdivide(&mask, usize::MAX)?;
+            tested += expected.coordinates().len();
+            mismatches += expected
+                .coordinates()
+                .iter()
+                .zip(next.coordinates())
+                .filter(|(a, b)| a != b)
+                .count()
+                + expected
+                    .coordinates()
+                    .len()
+                    .abs_diff(next.coordinates().len());
+            surface_count(
+                case,
+                "texture-generated",
+                plan,
+                [parents.coordinates().len(), next.coordinates().len()],
+            )?;
+            Ok(())
+        },
+    )?;
+    drop(features);
+    tested += expected.len();
+    mismatches += expected
+        .iter()
+        .zip(sites.coordinates())
+        .filter(|(a, b)| a != b)
+        .count()
+        + expected.len().abs_diff(sites.coordinates().len());
+    texture_launch_contract(12, 0, texture.subdivision_launches.get() - before)?;
+    let core = SURFACE_CASES
+        .iter()
+        .find(|c| c.0 == case)
+        .context("unknown material case")?
+        .3;
+    g.exact_count(
+        id(
+            &format!("m4-own-branch-contract-{core}"),
+            "guided-texture-coordinate-identity",
+            None,
+        ),
+        tested,
+        mismatches,
+    )
+}
+
+#[test]
+#[ignore = "requires CUDA, published material checkpoints and frozen captures"]
+fn pixal3d_material_matches_frozen_definition_gpu() -> Result<()> {
+    let mut g = DecoderGate::texture(false)?;
+    let model = env_path("FF_PIXAL_MODEL")?;
+    let root = env_path("FF_PIXAL_REFERENCE")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    material_pointwise(&mut g, &model, &root)?;
+    let shape = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
+    let texture = PixalDecoder::open(&model, DecoderKind::Texture, &runtime, 22_000_000_000)?;
+    for (case, capture, table, _, _) in SURFACE_CASES {
+        material_fixed(&mut g, &texture, &root, (case, capture, table))?;
+        material_generated(&mut g, &shape, &texture, &root, (case, capture))?;
     }
     g.finish()
 }
