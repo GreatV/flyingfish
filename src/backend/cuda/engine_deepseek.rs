@@ -6927,12 +6927,12 @@ mod tests {
             "FF_DS41_ENGRAM_HASH missing: the accepted engram-hash-v1 record is required",
         )?);
         std::fs::copy(&hash_record, runtime_dir.join("engram-hash-v1.json"))?;
-        let load = |forced: Option<u64>| -> Result<Engine> {
+        let load = |forced: Option<u64>, capacity: usize| -> Result<Engine> {
             crate::experts::plan::FORCED_WAVES.set(forced);
             let loaded = Engine::load(
                 &model_dir,
                 0,
-                130,
+                capacity,
                 None,
                 Settings {
                     tree_builder: TreeBuilder::Waves,
@@ -6956,7 +6956,7 @@ mod tests {
                 .count()
         }
 
-        let mut derived = load(None)?;
+        let mut derived = load(None, 130)?;
         ensure!(
             derived
                 .moe_slots
@@ -6968,7 +6968,7 @@ mod tests {
         let expected = outputs(&mut derived)?;
         drop(derived);
 
-        let mut middle = load(Some(7))?;
+        let mut middle = load(Some(7), 130)?;
         let seven = outputs(&mut middle)?;
         drop(middle);
         ensure!(
@@ -6976,7 +6976,7 @@ mod tests {
             "forced seven waves differ from the derived plan"
         );
 
-        let mut waved = load(Some(1))?;
+        let mut waved = load(Some(1), 130)?;
         ensure!(
             waved
                 .moe_slots
@@ -7053,6 +7053,29 @@ mod tests {
         ensure!(
             !planted,
             "the reader-wait control did not change the consumer's bytes"
+        );
+        drop(waved);
+
+        let mut whole = load(None, 2)?;
+        ensure!(
+            !whole
+                .moe_slots
+                .as_ref()
+                .context("tiers missing")?
+                .has_pool(),
+            "the capacity-2 derivation did not select the all-layers layout"
+        );
+        let all_layers = outputs(&mut whole)?;
+        let differences = differing(&actual, &all_layers);
+        ensure!(
+            differences == 0,
+            "the all-layers layout differs from the forced one wave in {differences} of {} layers",
+            actual.len()
+        );
+        println!(
+            "DS41_WAVES_ALL_LAYERS PASS layers={} values={} all_layers_vs_forced_one_wave_bitwise_equal=true",
+            actual.len(),
+            actual.len() * 5120
         );
         println!("DS41_WAVES_GATE PASS");
         Ok(())

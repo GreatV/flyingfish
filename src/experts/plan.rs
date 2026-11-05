@@ -612,7 +612,7 @@ fn native_staging_capacity(
 
 /// Layer waves of `live` slots staged at once: every layer when the budget holds them, else the
 /// budget's whole waves, of which one is the pool shared by the layers without resident slots.
-pub fn staged_waves(geometry: ExpertGeometry, live: u32, budget_slots: u64) -> Result<u32> {
+fn staged_waves(geometry: ExpertGeometry, live: u32, budget_slots: u64) -> Result<u32> {
     ensure!(live > 0, "zero live routes per layer");
     let fit = budget_slots / u64::from(live);
     #[cfg(test)]
