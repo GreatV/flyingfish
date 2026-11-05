@@ -3792,7 +3792,7 @@ impl BiasedWeight<half::f16> {
         input: Tensor<half::f16, 2>,
         output: &mut TensorMut<half::f16, 2>,
     ) -> Result<()> {
-        blas.linear_f16(dense(&self.weight, s, self.shape)?, input, output)?;
+        blas.linear_f16(dense(&self.weight, s, self.shape)?, input, output, false)?;
         let rows = output.0.shape[0];
         let cols = self.shape[0];
         let count = u64::from(rows) * u64::from(cols);

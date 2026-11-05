@@ -329,6 +329,9 @@ pub struct TreeMetadata {
     pub prefix: i32,
 }
 
+#[cfg(feature = "cuda")]
+pub use cuda::pixal3d::PixalDecoder;
+
 #[cfg(test)]
 mod tests {
     use super::*;

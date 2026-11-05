@@ -23,9 +23,16 @@ extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bi
         y[i]=__hadd(y[i],bias[i%width]);
 }
 #endif
-extern "C" __global__ void q38_bias_add_f16(__half* y,const __half* bias,uint64_t count,uint32_t width) {
+template <bool overwrite>
+__device__ __forceinline__ void q38_bias_f16_impl(__half* y,const __half* bias,uint64_t count,uint32_t width) {
     for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)
-        y[i]=__float2half_rn(__fadd_rn(__half2float(y[i]),__half2float(bias[i%width])));
+        y[i]=overwrite ? bias[i%width] : __float2half_rn(__fadd_rn(__half2float(y[i]),__half2float(bias[i%width])));
+}
+extern "C" __global__ void q38_bias_add_f16(__half* y,const __half* bias,uint64_t count,uint32_t width) {
+    q38_bias_f16_impl<false>(y,bias,count,width);
+}
+extern "C" __global__ void q38_bias_fill_f16(__half* y,const __half* bias,uint64_t count,uint32_t width) {
+    q38_bias_f16_impl<true>(y,bias,count,width);
 }
 extern "C" __global__ void q38_advance(Q38SequenceMeta* meta, int32_t* position, int32_t* length) {
     q38_meta_guard(meta);
@@ -1251,4 +1258,10 @@ extern "C" __global__ void channel_affine_f32(
     const float* x, const float* scale, const float* bias, float* y,
     uint32_t rows, uint32_t width) {
     channel_scale_residual(bias, x, scale, y, rows, width, true);
+}
+
+extern "C" __global__ void channel_scale_residual_f16(
+    const __half* residual, const __half* branch, const __half* scale, __half* y,
+    uint32_t rows, uint32_t width) {
+    channel_scale_residual(residual, branch, scale, y, rows, width);
 }
