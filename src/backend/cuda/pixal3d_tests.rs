@@ -1084,7 +1084,7 @@ impl DecoderGate {
                 }
                 let key = id(table_name, name, c["key"].as_str());
                 let mut anchor = c["anchor"].clone();
-                if anchor.is_null() && c["sources"].is_object() {
+                if anchor.is_null() && c["sources"].is_object() && family != "stable-decisions" {
                     anchor = c["sources"][c["comparison_anchor"]
                         .as_str()
                         .context("comparison arm missing")?]
@@ -2735,6 +2735,26 @@ fn surface_mesh(g: &mut DecoderGate, root: &Path) -> Result<()> {
         expected.len(),
         reference.len() / 6 - expected.len()
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires frozen surface captures; CPU only"]
+fn pixal3d_surface_freeze_cpu() -> Result<()> {
+    for (geometry, expected) in [(true, 85), (false, 156)] {
+        let gate = DecoderGate::surface(geometry)?;
+        ensure!(gate.cells.len() == expected, "surface cell coverage mismatch");
+        for (key, cell) in &gate.cells {
+            if key.0.starts_with("m4-stable-decisions-") {
+                ensure!(
+                    !gate.anchors.contains_key(key)
+                        && cell["selection_fixture"].is_string()
+                        && cell["selected_decisions"].as_u64().is_some_and(|n| n > 0),
+                    "invalid stable-decision support"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
