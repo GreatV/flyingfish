@@ -3551,7 +3551,7 @@ impl EncodedImages {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
-pub struct DinoV3Config {
+pub struct VisionEncoderConfig {
     pub hidden_act: String,
     pub hidden_size: u32,
     pub intermediate_size: u32,
@@ -3569,11 +3569,18 @@ pub struct DinoV3Config {
     pub rope_theta: f32,
     pub use_gated_mlp: bool,
     pub value_bias: bool,
+    #[serde(skip)]
+    pub position_size: u32,
 }
 
-impl DinoV3Config {
+impl VisionEncoderConfig {
     pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
-        let cfg: Self = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        let definition: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        if definition["model_type"] != "dinov3_vit" {
+            return Self::from_absolute_definition(&definition);
+        }
+        let cfg: Self = serde_json::from_value(definition)?;
         ensure!(
             cfg.model_type == "dinov3_vit"
                 && ((cfg.hidden_act == "silu" && cfg.use_gated_mlp)
@@ -3593,6 +3600,93 @@ impl DinoV3Config {
                 && cfg.layer_norm_eps > 0.0,
             "unsupported DINOv3 configuration"
         );
+        Ok(cfg)
+    }
+
+    fn from_absolute_definition(d: &serde_json::Value) -> Result<Self> {
+        let clip = d["model_type"] == "clip";
+        ensure!(
+            (clip && d["architectures"] == serde_json::json!(["CLIPModel"]))
+                || (d["model_type"] == "dinov2"
+                    && d["architectures"] == serde_json::json!(["Dinov2Model"])),
+            "unsupported absolute-position vision definition"
+        );
+        let c = if clip { &d["vision_config"] } else { d };
+        let integer = |key: &str| -> Result<u32> {
+            u32::try_from(
+                c[key]
+                    .as_u64()
+                    .with_context(|| format!("missing vision {key}"))?,
+            )
+            .context("vision integer extent overflow")
+        };
+        let cfg = Self {
+            hidden_act: c["hidden_act"]
+                .as_str()
+                .context("vision activation missing")?
+                .into(),
+            hidden_size: integer("hidden_size")?,
+            intermediate_size: if clip {
+                integer("intermediate_size")?
+            } else {
+                ensure!(
+                    c["mlp_ratio"].as_f64() == Some(4.0),
+                    "unsupported vision MLP ratio"
+                );
+                integer("hidden_size")?
+                    .checked_mul(4)
+                    .context("vision MLP overflow")?
+            },
+            key_bias: true,
+            layer_norm_eps: c["layer_norm_eps"]
+                .as_f64()
+                .context("vision norm epsilon missing")? as f32,
+            mlp_bias: true,
+            model_type: d["model_type"]
+                .as_str()
+                .context("vision model_type missing")?
+                .into(),
+            num_attention_heads: integer("num_attention_heads")?,
+            num_channels: 3,
+            num_hidden_layers: integer("num_hidden_layers")? as usize,
+            num_register_tokens: 0,
+            patch_size: integer("patch_size")?,
+            proj_bias: true,
+            query_bias: true,
+            rope_theta: 0.0,
+            use_gated_mlp: false,
+            value_bias: true,
+            position_size: integer("image_size")?,
+        };
+        ensure!(
+            cfg.hidden_size == 1024
+                && cfg.intermediate_size == 4096
+                && cfg.num_attention_heads == 16
+                && cfg.num_hidden_layers == 24
+                && cfg.patch_size == 14
+                && cfg.position_size == if clip { 224 } else { 518 }
+                && cfg.hidden_act == if clip { "quick_gelu" } else { "gelu" }
+                && cfg.layer_norm_eps == if clip { 1e-5 } else { 1e-6 },
+            "unsupported absolute-position vision geometry"
+        );
+        if clip {
+            let t = &d["text_config"];
+            ensure!(
+                d["projection_dim"] == 768
+                    && t["hidden_size"] == 768
+                    && t["intermediate_size"] == 3072
+                    && t["num_hidden_layers"] == 12
+                    && t["num_attention_heads"] == 12
+                    && t["max_position_embeddings"] == 77
+                    && t["vocab_size"] == 49408,
+                "unsupported full CLIP catalogue geometry"
+            );
+        } else {
+            ensure!(
+                c["qkv_bias"] == true && c["use_swiglu_ffn"] == false,
+                "unsupported DINOv2 projection/activation contract"
+            );
+        }
         Ok(cfg)
     }
 
@@ -3629,28 +3723,40 @@ impl DinoV3Config {
         let inter = self.intermediate_size as usize;
         let patch_dim = self.patch_dim() as usize;
         let prefix = self.prefix_rows() * h;
-        let patch_embed = h * patch_dim + h;
+        let clip = self.model_type == "clip";
+        let patch_embed = h * patch_dim + if clip { 0 } else { h };
         let mlp_projections = if self.use_gated_mlp { 3 } else { 2 };
         let per_layer = 2 * (2 * h)
             + 4 * (h * h)
-            + 3 * h
-            + 2 * h
+            + (3 + usize::from(self.key_bias)) * h
+            + if clip { 0 } else { 2 * h }
             + mlp_projections * (inter * h)
             + (mlp_projections - 1) * inter
             + h;
         let final_norm = 2 * h;
-        prefix + patch_embed + self.num_hidden_layers * per_layer + final_norm
+        let positions = if self.position_size > 0 {
+            ((self.position_size / self.patch_size).pow(2) as usize + 1) * h
+        } else {
+            0
+        };
+        prefix
+            + patch_embed
+            + self.num_hidden_layers * per_layer
+            + final_norm
+            + positions
+            + if clip { 2 * h } else { 0 }
     }
 
     pub fn workspace_bytes(&self, image_side: u32) -> Result<usize> {
         let rows = self.total_rows(image_side)? as usize;
         let hu = self.hidden_size as usize;
         let patch_elems = self.patch_rows(image_side)? as usize * self.patch_dim() as usize;
+        let scalar_bytes = if self.use_gated_mlp { 2 } else { 4 };
         Ok(patch_elems * size_of::<f32>()
-            + patch_elems * size_of::<bf16>()
-            + 5 * rows * hu * size_of::<bf16>()
-            + 3 * rows * self.intermediate_size as usize * size_of::<bf16>()
-            + rows * self.head_dim() as usize * size_of::<bf16>()
+            + patch_elems * scalar_bytes
+            + (if self.position_size > 0 { 3 } else { 5 }) * rows * hu * scalar_bytes
+            + 3 * rows * self.intermediate_size as usize * scalar_bytes
+            + usize::from(self.position_size == 0) * rows * self.head_dim() as usize * scalar_bytes
             + rows * hu * size_of::<f32>())
     }
 }
@@ -3839,6 +3945,147 @@ impl<'a> SafetensorsLoader<'a> {
         })
     }
 
+    fn validate_absolute_vision(&mut self, cfg: &VisionEncoderConfig) -> Result<()> {
+        let clip = cfg.model_type == "clip";
+        let h = cfg.hidden_size as usize;
+        let inter = cfg.intermediate_size as usize;
+        let mut shapes = std::collections::BTreeMap::new();
+        let mut add = |name: String, shape: Vec<usize>| {
+            shapes.insert(name, shape);
+        };
+        if clip {
+            let p = "vision_model.embeddings";
+            add(format!("{p}.class_embedding"), vec![h]);
+            add(format!("{p}.patch_embedding.weight"), vec![h, 3, 14, 14]);
+            add(format!("{p}.position_embedding.weight"), vec![257, h]);
+            add(format!("{p}.position_ids"), vec![1, 257]);
+            for norm in ["pre_layrnorm", "post_layernorm"] {
+                for suffix in ["weight", "bias"] {
+                    add(format!("vision_model.{norm}.{suffix}"), vec![h]);
+                }
+            }
+        } else {
+            add("embeddings.cls_token".into(), vec![1, 1, h]);
+            add("embeddings.mask_token".into(), vec![1, h]);
+            add(
+                "embeddings.patch_embeddings.projection.weight".into(),
+                vec![h, 3, 14, 14],
+            );
+            add(
+                "embeddings.patch_embeddings.projection.bias".into(),
+                vec![h],
+            );
+            add("embeddings.position_embeddings".into(), vec![1, 1370, h]);
+            for suffix in ["weight", "bias"] {
+                add(format!("layernorm.{suffix}"), vec![h]);
+            }
+        }
+        for (prefix, width, mlp, layers, is_clip) in if clip {
+            vec![
+                ("vision_model.encoder.layers", h, inter, 24, true),
+                ("text_model.encoder.layers", 768, 3072, 12, true),
+            ]
+        } else {
+            vec![("encoder.layer", h, inter, 24, false)]
+        } {
+            for i in 0..layers {
+                let p = format!("{prefix}.{i}");
+                for projection in if is_clip {
+                    [
+                        "self_attn.q_proj",
+                        "self_attn.k_proj",
+                        "self_attn.v_proj",
+                        "self_attn.out_proj",
+                    ]
+                } else {
+                    [
+                        "attention.attention.query",
+                        "attention.attention.key",
+                        "attention.attention.value",
+                        "attention.output.dense",
+                    ]
+                } {
+                    add(format!("{p}.{projection}.weight"), vec![width, width]);
+                    add(format!("{p}.{projection}.bias"), vec![width]);
+                }
+                for norm in if is_clip {
+                    ["layer_norm1", "layer_norm2"]
+                } else {
+                    ["norm1", "norm2"]
+                } {
+                    for suffix in ["weight", "bias"] {
+                        add(format!("{p}.{norm}.{suffix}"), vec![width]);
+                    }
+                }
+                for (name, out, input) in [("fc1", mlp, width), ("fc2", width, mlp)] {
+                    add(format!("{p}.mlp.{name}.weight"), vec![out, input]);
+                    add(format!("{p}.mlp.{name}.bias"), vec![out]);
+                }
+                if !is_clip {
+                    for scale in ["layer_scale1", "layer_scale2"] {
+                        add(format!("{p}.{scale}.lambda1"), vec![width]);
+                    }
+                }
+            }
+        }
+        if clip {
+            add(
+                "text_model.embeddings.token_embedding.weight".into(),
+                vec![49408, 768],
+            );
+            add(
+                "text_model.embeddings.position_embedding.weight".into(),
+                vec![77, 768],
+            );
+            add("text_model.embeddings.position_ids".into(), vec![1, 77]);
+            for suffix in ["weight", "bias"] {
+                add(format!("text_model.final_layer_norm.{suffix}"), vec![768]);
+            }
+            add("text_projection.weight".into(), vec![768, 768]);
+            add("visual_projection.weight".into(), vec![768, h]);
+            add("logit_scale".into(), vec![]);
+        }
+        ensure!(
+            self.remaining.len() == shapes.len(),
+            "vision catalogue key count mismatch"
+        );
+        for (name, shape) in shapes {
+            let tensor = self.st.tensor(&name)?;
+            ensure!(
+                tensor.shape() == shape,
+                "vision catalogue shape mismatch for {name}"
+            );
+            if name.ends_with(".position_ids") {
+                ensure!(
+                    tensor.dtype() == safetensors::Dtype::I64,
+                    "integer positions dtype mismatch"
+                );
+                ensure!(
+                    tensor
+                        .data()
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .enumerate()
+                        .all(|(i, v)| i64::from_le_bytes(*v) == i as i64),
+                    "integer positions value mismatch"
+                );
+            } else {
+                ensure!(
+                    tensor.dtype() == safetensors::Dtype::F32,
+                    "vision catalogue requires F32 for {name}"
+                );
+            }
+            if clip && (!name.starts_with("vision_model.") || name.ends_with(".position_ids")) {
+                ensure!(
+                    self.remaining.remove(&name),
+                    "vision catalogue duplicate {name}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn take_bf16(
         &mut self,
         s: &Arc<CudaStream>,
@@ -3882,7 +4129,7 @@ impl<'a> SafetensorsLoader<'a> {
         };
         self.loaded_tensors += 1;
         self.loaded_elements += host.len();
-        self.runtime_bytes += host.len() * size_of::<bf16>();
+        self.runtime_bytes += host.len() * size_of::<T>();
         Ok(s.clone_htod(&host)?)
     }
 
@@ -4169,10 +4416,11 @@ fn load_affine_weights<T: DinoScalar>(
     })
 }
 
-struct DinoV3Layer<T: DinoScalar> {
+struct VisionEncoderLayer<T: DinoScalar> {
     norm1: AffineWeights<T>,
     q: BiasedWeight<T>,
     k: UnbiasedWeight<T>,
+    k_bias: Option<CudaSlice<T>>,
     v: BiasedWeight<T>,
     o: BiasedWeight<T>,
     scale1: CudaSlice<T>,
@@ -4200,12 +4448,17 @@ struct DinoWorkspace<T: DinoScalar> {
 }
 
 struct DinoEncoder<T: DinoScalar> {
-    cfg: DinoV3Config,
+    cfg: VisionEncoderConfig,
     image_side: u32,
     prefix_tokens: CudaSlice<T>,
+    positions: CudaSlice<T>,
+    pre_norm: Option<AffineWeights<T>>,
+    unit_gamma: CudaSlice<f32>,
+    add: CudaFunction,
+    unit_norm: CudaFunction,
     patch_embed: BiasedWeight<T>,
     ordered_linear: CudaFunction,
-    layers: Vec<DinoV3Layer<T>>,
+    layers: Vec<VisionEncoderLayer<T>>,
     final_norm: AffineWeights<T>,
     common: CommonOpsRef,
     rotary_prefix: CudaFunction,
@@ -4229,7 +4482,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
         device: &Device,
         blas: &mut Blas,
         common: CommonOpsRef,
-        cfg: DinoV3Config,
+        cfg: VisionEncoderConfig,
         image_side: u32,
         safetensors_bytes: &[u8],
         final_affine: bool,
@@ -4253,43 +4506,158 @@ impl<T: DinoScalar> DinoEncoder<T> {
         let head_dim = cfg.head_dim();
         let patches_side = image_side / patch;
 
+        let absolute = cfg.position_size > 0;
+        let clip = cfg.model_type == "clip";
+        ensure!(
+            !absolute || (T::F32 && final_affine),
+            "absolute positions require F32 and learned output norm"
+        );
+        ensure!(
+            !absolute || image_side == if clip { 224 } else { 756 },
+            "unsupported absolute vision input size"
+        );
         let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
-        let cls = loader.take_scalar::<T>(s, "embeddings.cls_token", &[1, 1, hu])?;
-        let reg = loader.take_scalar::<T>(
-            s,
-            "embeddings.register_tokens",
-            &[1, cfg.num_register_tokens, hu],
-        )?;
-        loader.remove_unused("embeddings.mask_token", &[1, 1, hu])?;
-        let mut prefix_host = s.clone_dtoh(&cls)?;
-        prefix_host.extend(s.clone_dtoh(&reg)?);
-        let prefix_tokens = s.clone_htod(&prefix_host)?;
-        let patch_embed = load_biased_weight(
-            &mut loader,
-            s,
-            "embeddings.patch_embeddings",
-            [h, patch_dim],
-            &[hu, cfg.num_channels as usize, patch_u, patch_u],
-            LinearBiasMode::AfterOutputRound,
-        )?;
+        if absolute {
+            loader.validate_absolute_vision(&cfg)?;
+        }
+        let prefix_tokens = if clip {
+            loader.take_scalar::<T>(s, "vision_model.embeddings.class_embedding", &[hu])?
+        } else if absolute {
+            loader.remove_unused("embeddings.mask_token", &[1, hu])?;
+            loader.take_scalar::<T>(s, "embeddings.cls_token", &[1, 1, hu])?
+        } else {
+            let cls = loader.take_scalar::<T>(s, "embeddings.cls_token", &[1, 1, hu])?;
+            let reg = loader.take_scalar::<T>(
+                s,
+                "embeddings.register_tokens",
+                &[1, cfg.num_register_tokens, hu],
+            )?;
+            loader.remove_unused("embeddings.mask_token", &[1, 1, hu])?;
+            let mut host = s.clone_dtoh(&cls)?;
+            host.extend(s.clone_dtoh(&reg)?);
+            s.clone_htod(&host)?
+        };
+        let positions = if absolute {
+            let source_side = (cfg.position_size / patch) as usize;
+            let name = if clip {
+                "vision_model.embeddings.position_embedding.weight"
+            } else {
+                "embeddings.position_embeddings"
+            };
+            let shape = if clip {
+                vec![257, hu]
+            } else {
+                vec![1, 1370, hu]
+            };
+            let source = loader.take_f32_host(name, &shape)?;
+            let host = if cfg.position_size == image_side {
+                source
+            } else {
+                let mut host = source[..hu].to_vec();
+                host.extend(crate::vision_input::resize_bicubic_hwc_f32(
+                    &source[hu..],
+                    [source_side, source_side, hu],
+                    [patches_side as usize, patches_side as usize],
+                )?);
+                host
+            };
+            s.clone_htod(&host.into_iter().map(T::from_float).collect::<Vec<_>>())?
+        } else {
+            s.alloc_zeros(0)?
+        };
+        let pre_norm = if clip {
+            Some(load_affine_weights(
+                &mut loader,
+                s,
+                "vision_model.pre_layrnorm",
+                h,
+            )?)
+        } else {
+            None
+        };
+        let patch_name = if clip {
+            "vision_model.embeddings.patch_embedding"
+        } else if absolute {
+            "embeddings.patch_embeddings.projection"
+        } else {
+            "embeddings.patch_embeddings"
+        };
+        let patch_embed = if clip {
+            BiasedWeight {
+                weight: loader.take_scalar(
+                    s,
+                    &format!("{patch_name}.weight"),
+                    &[hu, 3, patch_u, patch_u],
+                )?,
+                bias: s.alloc_zeros(0)?,
+                f32_bias: None,
+                shape: [h, patch_dim],
+                bias_mode: LinearBiasMode::AfterOutputRound,
+            }
+        } else {
+            load_biased_weight(
+                &mut loader,
+                s,
+                patch_name,
+                [h, patch_dim],
+                &[hu, cfg.num_channels as usize, patch_u, patch_u],
+                LinearBiasMode::AfterOutputRound,
+            )?
+        };
         patch_embed.prepare(s, blas, patch_rows)?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            let p = format!("layer.{i}");
-            let norm1 = load_affine_weights(&mut loader, s, &format!("{p}.norm1"), h)?;
+            let p = if clip {
+                format!("vision_model.encoder.layers.{i}")
+            } else if absolute {
+                format!("encoder.layer.{i}")
+            } else {
+                format!("layer.{i}")
+            };
+            let attention = |name: &str| -> String {
+                if clip {
+                    format!(
+                        "{p}.self_attn.{}_proj",
+                        if name == "o" { "out" } else { name }
+                    )
+                } else if absolute {
+                    format!(
+                        "{p}.attention.{}",
+                        match name {
+                            "q" => "attention.query",
+                            "k" => "attention.key",
+                            "v" => "attention.value",
+                            _ => "output.dense",
+                        }
+                    )
+                } else {
+                    format!("{p}.attention.{name}_proj")
+                }
+            };
+            let norm1 = load_affine_weights(
+                &mut loader,
+                s,
+                &format!("{p}.{}", if clip { "layer_norm1" } else { "norm1" }),
+                h,
+            )?;
             let q = load_biased_weight(
                 &mut loader,
                 s,
-                &format!("{p}.attention.q_proj"),
+                &attention("q"),
                 [h, h],
                 &[hu, hu],
                 LinearBiasMode::BeforeOutputRound,
             )?;
-            let k = UnbiasedWeight::load(&mut loader, s, &format!("{p}.attention.k_proj"), [h, h])?;
+            let k = UnbiasedWeight::load(&mut loader, s, &attention("k"), [h, h])?;
+            let k_bias = if cfg.key_bias {
+                Some(loader.take_scalar(s, &format!("{}.bias", attention("k")), &[hu])?)
+            } else {
+                None
+            };
             let v = load_biased_weight(
                 &mut loader,
                 s,
-                &format!("{p}.attention.v_proj"),
+                &attention("v"),
                 [h, h],
                 &[hu, hu],
                 LinearBiasMode::BeforeOutputRound,
@@ -4297,13 +4665,22 @@ impl<T: DinoScalar> DinoEncoder<T> {
             let o = load_biased_weight(
                 &mut loader,
                 s,
-                &format!("{p}.attention.o_proj"),
+                &attention("o"),
                 [h, h],
                 &[hu, hu],
                 LinearBiasMode::BeforeOutputRound,
             )?;
-            let scale1 = loader.take_scalar::<T>(s, &format!("{p}.layer_scale1.lambda1"), &[hu])?;
-            let norm2 = load_affine_weights(&mut loader, s, &format!("{p}.norm2"), h)?;
+            let scale1 = if clip {
+                s.alloc_zeros(0)?
+            } else {
+                loader.take_scalar::<T>(s, &format!("{p}.layer_scale1.lambda1"), &[hu])?
+            };
+            let norm2 = load_affine_weights(
+                &mut loader,
+                s,
+                &format!("{p}.{}", if clip { "layer_norm2" } else { "norm2" }),
+                h,
+            )?;
             let gate = if cfg.use_gated_mlp {
                 Some(load_biased_weight(
                     &mut loader,
@@ -4319,7 +4696,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
             let up = load_biased_weight(
                 &mut loader,
                 s,
-                &format!("{p}.mlp.up_proj"),
+                &format!("{p}.mlp.{}", if absolute { "fc1" } else { "up_proj" }),
                 [inter, h],
                 &[inter_u, hu],
                 LinearBiasMode::BeforeOutputRound,
@@ -4327,12 +4704,16 @@ impl<T: DinoScalar> DinoEncoder<T> {
             let down = load_biased_weight(
                 &mut loader,
                 s,
-                &format!("{p}.mlp.down_proj"),
+                &format!("{p}.mlp.{}", if absolute { "fc2" } else { "down_proj" }),
                 [h, inter],
                 &[hu, inter_u],
                 LinearBiasMode::BeforeOutputRound,
             )?;
-            let scale2 = loader.take_scalar::<T>(s, &format!("{p}.layer_scale2.lambda1"), &[hu])?;
+            let scale2 = if clip {
+                s.alloc_zeros(0)?
+            } else {
+                loader.take_scalar::<T>(s, &format!("{p}.layer_scale2.lambda1"), &[hu])?
+            };
             for w in [&q, &v, &o, &up, &down] {
                 w.prepare(s, blas, rows)?;
             }
@@ -4340,10 +4721,11 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 gate.prepare(s, blas, rows)?;
             }
             k.prepare(blas, rows)?;
-            layers.push(DinoV3Layer {
+            layers.push(VisionEncoderLayer {
                 norm1,
                 q,
                 k,
+                k_bias,
                 v,
                 o,
                 scale1,
@@ -4354,7 +4736,18 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 scale2,
             });
         }
-        let final_norm = load_affine_weights(&mut loader, s, "norm", h)?;
+        let final_norm = load_affine_weights(
+            &mut loader,
+            s,
+            if clip {
+                "vision_model.post_layernorm"
+            } else if absolute {
+                "layernorm"
+            } else {
+                "norm"
+            },
+            h,
+        )?;
         ensure!(
             loader.remaining.is_empty(),
             "unconsumed DINOv3 safetensors keys: {:?}",
@@ -4366,16 +4759,20 @@ impl<T: DinoScalar> DinoEncoder<T> {
             "DINOv3 loaded element count {} != {expected_elems}",
             loader.loaded_elements
         );
-        let rope_host = crate::vision_input::dinov3_rope_table_f32(
-            cfg.prefix_rows(),
-            patches_side,
-            patches_side,
-            head_dim,
-            cfg.rope_theta,
-        )?
-        .into_iter()
-        .map(T::from_float)
-        .collect::<Vec<_>>();
+        let rope_host = if absolute {
+            Vec::new()
+        } else {
+            crate::vision_input::dinov3_rope_table_f32(
+                cfg.prefix_rows(),
+                patches_side,
+                patches_side,
+                head_dim,
+                cfg.rope_theta,
+            )?
+            .into_iter()
+            .map(T::from_float)
+            .collect::<Vec<_>>()
+        };
         let patch_elems = (patch_rows as usize) * (patch_dim as usize);
         let ws = DinoWorkspace {
             pixel_packed: s.alloc_zeros(patch_elems)?,
@@ -4383,13 +4780,13 @@ impl<T: DinoScalar> DinoEncoder<T> {
             x_a: s.alloc_zeros(rows_u * hu)?,
             x_b: s.alloc_zeros(rows_u * hu)?,
             x_c: s.alloc_zeros(rows_u * hu)?,
-            k_cache: s.alloc_zeros(rows_u * hu)?,
-            v_cache: s.alloc_zeros(rows_u * hu)?,
+            k_cache: s.alloc_zeros(if absolute { 0 } else { rows_u * hu })?,
+            v_cache: s.alloc_zeros(if absolute { 0 } else { rows_u * hu })?,
             mlp_a: s.alloc_zeros(rows_u * inter_u)?,
             mlp_b: s.alloc_zeros(rows_u * inter_u)?,
             mlp_c: s.alloc_zeros(rows_u * inter_u)?,
             rope_table: s.clone_htod(&rope_host)?,
-            feature1: s.alloc_zeros(rows_u * hu)?,
+            feature1: s.alloc_zeros(if clip { hu } else { rows_u * hu })?,
             flash_d64: {
                 let (free, total) = device.ctx.mem_get_info()?;
                 let budget = free.min(22_000_000_000).saturating_sub(total / 16);
@@ -4400,7 +4797,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
         let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
         let act_mod = cubin::module(&device.ctx, "act")?;
         ensure!(
-            rope_host.len() == rows_u * (head_dim as usize),
+            absolute || rope_host.len() == rows_u * (head_dim as usize),
             "DINOv3 RoPE table length {} != rows x head_dim",
             rope_host.len()
         );
@@ -4414,6 +4811,16 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 cfg,
                 image_side,
                 prefix_tokens,
+                positions,
+                pre_norm,
+                unit_gamma: s.clone_htod(&if absolute {
+                    vec![1.0f32; hu]
+                } else {
+                    Vec::new()
+                })?,
+                add: q38_mod.load_function("add_scale_f32")?,
+                unit_norm: cubin::module(&device.ctx, "norm")?
+                    .load_function("l2_norm_scale_f32")?,
                 patch_embed,
                 ordered_linear: vis_mod.load_function("linear_ordered_f32")?,
                 layers,
@@ -4429,7 +4836,11 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 } else {
                     "vision_patch_rows"
                 })?,
-                gelu: vis_mod.load_function("vision_bias_gelu_f32")?,
+                gelu: vis_mod.load_function(if clip {
+                    "vision_bias_quick_gelu_f32"
+                } else {
+                    "vision_bias_gelu_f32"
+                })?,
                 final_affine,
                 channel_scale_residual: q38_mod.load_function(if T::F32 {
                     "channel_scale_residual_f32"
@@ -4494,6 +4905,18 @@ impl<T: DinoScalar> DinoEncoder<T> {
     ) -> Result<()> {
         let h = self.cfg.hidden_size;
         let count = u64::from(rows) * u64::from(h);
+        if scale.is_empty() {
+            ensure!(T::F32, "unscaled residual requires F32");
+            unsafe {
+                s.launch_builder(&self.add)
+                    .arg(residual)
+                    .arg(branch)
+                    .arg(&i64::try_from(count)?)
+                    .arg(&1.0f32)
+                    .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+            }
+            return Ok(());
+        }
         unsafe {
             s.launch_builder(&self.channel_scale_residual)
                 .arg(residual)
@@ -4515,13 +4938,21 @@ impl<T: DinoScalar> DinoEncoder<T> {
     ) -> Result<()> {
         let side = self.image_side as usize;
         let patch = self.cfg.patch_size;
+        let (mean, std) = if self.cfg.model_type == "clip" {
+            (
+                [0.48145466, 0.4578275, 0.40821073],
+                [0.26862954, 0.26130258, 0.27577711],
+            )
+        } else {
+            ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        };
         let packed_host = crate::vision_input::dinov3_pack_normalized_chw(
             chw_f32,
             side,
             side,
             patch as usize,
-            [0.485, 0.456, 0.406],
-            [0.229, 0.224, 0.225],
+            mean,
+            std,
         )?;
         s.memcpy_htod(&packed_host, &mut ws.pixel_packed)?;
         Ok(())
@@ -4553,11 +4984,16 @@ impl<T: DinoScalar> DinoEncoder<T> {
         )?;
         if T::F32 {
             let output = dense_at(&ws.x_a, s, [patch_rows, h], prefix_rows * h as usize)?;
+            let bias = if self.patch_embed.bias.is_empty() {
+                0
+            } else {
+                self.patch_embed.bias.device_ptr(s).0
+            };
             unsafe {
                 s.launch_builder(&self.ordered_linear)
                     .arg(&ws.patches)
                     .arg(&self.patch_embed.weight)
-                    .arg(&self.patch_embed.bias)
+                    .arg(&bias)
                     .arg(&output.ptr)
                     .arg(&patch_rows)
                     .arg(&h)
@@ -4568,19 +5004,40 @@ impl<T: DinoScalar> DinoEncoder<T> {
                         shared_mem_bytes: 0,
                     })?;
             }
-            return Ok(());
-        }
-        self.patch_embed.run(
-            s,
-            blas,
-            dense(&ws.patches, s, [patch_rows, patch_dim])?,
-            &mut TensorMut(dense_at(
-                &ws.x_a,
+        } else {
+            self.patch_embed.run(
                 s,
-                [patch_rows, h],
-                prefix_rows * h as usize,
-            )?),
-        )?;
+                blas,
+                dense(&ws.patches, s, [patch_rows, patch_dim])?,
+                &mut TensorMut(dense_at(
+                    &ws.x_a,
+                    s,
+                    [patch_rows, h],
+                    prefix_rows * h as usize,
+                )?),
+            )?;
+        }
+        if !self.positions.is_empty() {
+            let count = i64::from(self.cfg.total_rows(self.image_side)?) * i64::from(h);
+            unsafe {
+                s.launch_builder(&self.add)
+                    .arg(&ws.x_a)
+                    .arg(&self.positions)
+                    .arg(&count)
+                    .arg(&1.0f32)
+                    .launch(grid((count as usize).div_ceil(256).min(65535), 256))?;
+            }
+        }
+        if let Some(norm) = &self.pre_norm {
+            self.layer_norm(
+                s,
+                norm,
+                &ws.x_a,
+                &ws.x_b,
+                self.cfg.total_rows(self.image_side)?,
+            )?;
+            s.memcpy_dtod(&ws.x_b, &mut ws.x_a)?;
+        }
         Ok(())
     }
 
@@ -4614,32 +5071,55 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 dense(&ws.x_b, s, [rows, h])?,
                 &mut TensorMut(stage_view(&ws.mlp_a, s, [rows, h])?),
             )?;
+            if let Some(bias) = &layer.k_bias {
+                unsafe {
+                    s.launch_builder(
+                        layer
+                            .q
+                            .f32_bias
+                            .as_ref()
+                            .context("F32 key bias binding missing")?,
+                    )
+                    .arg(&ws.mlp_a)
+                    .arg(bias)
+                    .arg(&ws.mlp_a)
+                    .arg(&rows)
+                    .arg(&h)
+                    .launch(grid(
+                        (rows as usize * h as usize).div_ceil(256).min(65535),
+                        256,
+                    ))?;
+                }
+            }
             layer.v.run(
                 s,
                 blas,
                 dense(&ws.x_b, s, [rows, h])?,
                 &mut TensorMut(stage_view(&ws.mlp_b, s, [rows, h])?),
             )?;
-            unsafe {
-                s.launch_builder(&self.rotary_prefix)
-                    .arg(&ws.x_c)
-                    .arg(&ws.mlp_a)
-                    .arg(&ws.mlp_b)
-                    .arg(&ws.k_cache)
-                    .arg(&ws.v_cache)
-                    .arg(rope_slice)
-                    .arg(&0i32)
-                    .arg(&i32::try_from(rows)?)
-                    .arg(&i32::try_from(heads)?)
-                    .arg(&i32::try_from(heads)?)
-                    .arg(&i32::try_from(head_dim)?)
-                    .arg(&i32::try_from(head_dim)?)
-                    .arg(&i32::try_from(rows)?)
-                    .launch(grid(
-                        (u64::from(rows) * u64::from(2 * heads) * u64::from(head_dim)).div_ceil(256)
-                            as usize,
-                        256,
-                    ))?;
+            let absolute = self.cfg.position_size > 0;
+            if !absolute {
+                unsafe {
+                    s.launch_builder(&self.rotary_prefix)
+                        .arg(&ws.x_c)
+                        .arg(&ws.mlp_a)
+                        .arg(&ws.mlp_b)
+                        .arg(&ws.k_cache)
+                        .arg(&ws.v_cache)
+                        .arg(rope_slice)
+                        .arg(&0i32)
+                        .arg(&i32::try_from(rows)?)
+                        .arg(&i32::try_from(heads)?)
+                        .arg(&i32::try_from(heads)?)
+                        .arg(&i32::try_from(head_dim)?)
+                        .arg(&i32::try_from(head_dim)?)
+                        .arg(&i32::try_from(rows)?)
+                        .launch(grid(
+                            (u64::from(rows) * u64::from(2 * heads) * u64::from(head_dim))
+                                .div_ceil(256) as usize,
+                            256,
+                        ))?;
+                }
             }
             T::attention_run(
                 &mut ws.flash_d64,
@@ -4647,9 +5127,10 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 blas,
                 DinoAttentionBuffers {
                     q: &ws.x_c,
-                    k: &ws.k_cache,
-                    v: &ws.v_cache,
+                    k: if absolute { &ws.mlp_a } else { &ws.k_cache },
+                    v: if absolute { &ws.mlp_b } else { &ws.v_cache },
                     output: &mut ws.x_b,
+                    token_major_kv: absolute,
                 },
                 [rows, heads, head_dim],
             )?;
@@ -4736,8 +5217,29 @@ impl<T: DinoScalar> DinoEncoder<T> {
                 );
             }
         }
+        let output_rows = if self.cfg.model_type == "clip" {
+            1
+        } else {
+            rows
+        };
         if self.final_affine {
-            self.layer_norm(s, &self.final_norm, &ws.x_a, &ws.x_b, rows)?;
+            self.layer_norm(s, &self.final_norm, &ws.x_a, &ws.x_b, output_rows)?;
+        }
+        if self.cfg.position_size > 0 {
+            unsafe {
+                s.launch_builder(&self.unit_norm)
+                    .arg(&ws.x_b)
+                    .arg(&self.unit_gamma)
+                    .arg(&ws.feature1)
+                    .arg(&i32::try_from(output_rows)?)
+                    .arg(&1i32)
+                    .arg(&i32::try_from(h)?)
+                    .arg(&1.0f32)
+                    .arg(&1e-12f32)
+                    .arg(&0i32)
+                    .launch(grid(output_rows as usize, 256))?;
+            }
+            return Ok([layer0, layer15]);
         }
         let total_elems = rows * h;
         let last = if self.final_affine { &ws.x_b } else { &ws.x_a };
@@ -5667,7 +6169,7 @@ impl IdolVisionEncoderRuntime {
         dinov3_dir: &std::path::Path,
         vae_dir: &std::path::Path,
     ) -> Result<usize> {
-        let dinov3_cfg = DinoV3Config::from_dir(dinov3_dir)?;
+        let dinov3_cfg = VisionEncoderConfig::from_dir(dinov3_dir)?;
         let vae_cfg = Flux2VaeConfig::from_dir(vae_dir)?;
         Ok(
             (dinov3_cfg.expected_loaded_elements() + vae_cfg.expected_loaded_elements())
@@ -5685,7 +6187,7 @@ impl IdolVisionEncoderRuntime {
         vae_dir: &std::path::Path,
         reserve_bytes: usize,
     ) -> Result<Self> {
-        let dinov3_cfg = DinoV3Config::from_dir(dinov3_dir)?;
+        let dinov3_cfg = VisionEncoderConfig::from_dir(dinov3_dir)?;
         let vae_cfg = Flux2VaeConfig::from_dir(vae_dir)?;
         let prefix_rows = dinov3_cfg.prefix_rows();
         ensure!(
@@ -5768,6 +6270,7 @@ struct DinoAttentionBuffers<'a, T> {
     k: &'a CudaSlice<T>,
     v: &'a CudaSlice<T>,
     output: &'a mut CudaSlice<T>,
+    token_major_kv: bool,
 }
 
 impl DinoScalar for bf16 {
@@ -5801,6 +6304,7 @@ impl DinoScalar for bf16 {
         b: DinoAttentionBuffers<'_, Self>,
         [rows, heads, dim]: [u32; 3],
     ) -> Result<()> {
+        ensure!(!b.token_major_kv, "BF16 attention requires head-major KV");
         attention.run(
             b.q,
             (heads * dim) as usize,
@@ -5862,8 +6366,16 @@ impl DinoScalar for f32 {
         attention.run(
             blas,
             token_major(b.q)?,
-            dense(b.k, stream, [heads, rows, dim])?,
-            dense(b.v, stream, [heads, rows, dim])?,
+            if b.token_major_kv {
+                token_major(b.k)?
+            } else {
+                dense(b.k, stream, [heads, rows, dim])?
+            },
+            if b.token_major_kv {
+                token_major(b.v)?
+            } else {
+                dense(b.v, stream, [heads, rows, dim])?
+            },
             &mut TensorMut(token_major(b.output)?),
         )
     }
@@ -5911,7 +6423,7 @@ impl DinoV3Encoder {
         device: &Device,
         blas: &mut Blas,
         common: CommonOpsRef,
-        cfg: DinoV3Config,
+        cfg: VisionEncoderConfig,
         image_side: u32,
         bytes: &[u8],
     ) -> Result<(Self, DinoV3Workspace)> {
@@ -5931,7 +6443,7 @@ impl DinoV3Encoder {
         device: &Device,
         blas: &mut Blas,
         common: CommonOpsRef,
-        cfg: DinoV3Config,
+        cfg: VisionEncoderConfig,
         image_side: u32,
         bytes: &[u8],
         output: DinoV3OutputNormalization,
@@ -6441,7 +6953,7 @@ impl PixalConditioningRuntime {
             "unsupported NAF output size"
         );
         device.finish_upload()?;
-        let cfg = DinoV3Config::from_dir(dino_dir)?;
+        let cfg = VisionEncoderConfig::from_dir(dino_dir)?;
         ensure!(
             cfg.hidden_size == 1024
                 && cfg.prefix_rows() == 5

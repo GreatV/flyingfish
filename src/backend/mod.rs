@@ -24,10 +24,11 @@ pub use cuda::engine::Engine as Backend;
 pub use cuda::engine::TextPrefixSaveOutput;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use cuda::engine::vision_runtime::{
-    DinoV3Config, DinoV3Encoder, DinoV3Output, DinoV3Workspace, Flux2VaeConfig, Flux2VaeEncoder,
-    Flux2VaeOutput, Flux2VaeWorkspace, IdolCamera, IdolConfig, IdolDenoiser, IdolDenoiserWorkspace,
+    DinoV3Encoder, DinoV3Output, DinoV3Workspace, Flux2VaeConfig, Flux2VaeEncoder, Flux2VaeOutput,
+    Flux2VaeWorkspace, IdolCamera, IdolConfig, IdolDenoiser, IdolDenoiserWorkspace,
     IdolFlowTrajectory, IdolGaussianDecoder, IdolGaussianSplat, IdolGaussianWorkspace,
     IdolOctreeDecoder, IdolOctreeWorkspace, IdolPipelineRuntime, IdolVisionEncoderRuntime,
+    VisionEncoderConfig,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::engine::vision_runtime::{

@@ -288,6 +288,17 @@ extern "C" __global__ void vision_bias_gelu_f32(
     }
 }
 
+extern "C" __global__ void vision_bias_quick_gelu_f32(
+    const float* input, const float* bias, float* output, uint32_t rows, uint32_t width) {
+    if (!vision_flat_launch() || !input || !output || !rows || !width) { __trap(); return; }
+    uint32_t count = rows * width;
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        float x = bias ? __fadd_rn(input[i], bias[i % width]) : input[i];
+        float sigmoid = __fdividef(1.0f, __fadd_rn(1.0f, expf(-__fmul_rn(1.702f, x))));
+        output[i] = __fmul_rn(x, sigmoid);
+    }
+}
+
 // One FP32 RMS normalization per row times scale[i * scale_stride] (stride 0: one scalar, 1: per element), with a
 // BF16 output and an optional (null-skipped) FP32 output.
 extern "C" __global__ void vision_rms_scale_f32(
