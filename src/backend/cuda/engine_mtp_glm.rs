@@ -275,7 +275,6 @@ pub(crate) struct GlmMtpRuntime {
 
     head_norm_w: CudaSlice<bf16>,
 
-    #[cfg(test)]
     pub(crate) standalone_embed: Option<CudaSlice<bf16>>,
     pub(crate) standalone_head: Option<CudaSlice<bf16>>,
 
@@ -300,7 +299,6 @@ pub(crate) struct GlmMtpRuntime {
 
     pub(crate) last_route: Option<(Vec<i32>, Vec<f32>)>,
 
-    #[cfg(test)]
     pub(crate) standalone_dsa: Option<DsaState>,
 }
 
@@ -408,7 +406,6 @@ impl GlmMtpRuntime {
         let fp8 = Fp8Ops::new(&device.ctx)?;
         let dsa_spec = DsaSpec::glm53();
         let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, 2048, 1)?;
-        #[cfg(test)]
         let standalone_dsa = if standalone_weights {
             Some(DsaState::new(dsa_spec, 2048, stream)?)
         } else {
@@ -673,7 +670,6 @@ impl GlmMtpRuntime {
             "model.language_model.layers.45.shared_head.norm.weight",
         )?)?;
 
-        #[cfg(test)]
         let standalone_embed = if standalone_weights {
             match get_st_bf16("model.language_model.embed_tokens.weight") {
                 Ok(v) => Some(stream.clone_htod(&v)?),
@@ -682,7 +678,6 @@ impl GlmMtpRuntime {
         } else {
             None
         };
-        #[cfg(test)]
         let standalone_head = if standalone_weights {
             match get_st_bf16("lm_head.weight") {
                 Ok(v) => Some(stream.clone_htod(&v)?),
@@ -764,7 +759,6 @@ impl GlmMtpRuntime {
             _mmap1: mmap1,
             _mmap2: mmap2,
             head_norm_w,
-            #[cfg(test)]
             standalone_embed,
             standalone_head,
             token_embed_buf: stream.alloc_zeros::<bf16>(4096)?,
@@ -786,7 +780,6 @@ impl GlmMtpRuntime {
             logits_buf: stream.alloc_zeros::<f32>(154880)?,
             dsa_indices_buf: stream.alloc_zeros::<i32>(2051)?,
             last_route: None,
-            #[cfg(test)]
             standalone_dsa,
         })
     }
