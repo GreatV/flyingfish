@@ -6993,6 +6993,19 @@ fn generation_rejects_extra_decoder_passes_and_forward_branches() -> Result<()> 
         assert!(flow_call_contract(&spec, [11, negative]).is_err());
         assert!(flow_call_contract(&spec, [12, negative + 1]).is_err());
     }
+    spec.out_channels = 32;
+    ensure!(
+        Work::<bf16>::planned_bytes(43632, &spec, 5)? == 3_010_590_144,
+        "published texture work count"
+    );
+    ensure!(
+        Work::<bf16>::planned_bytes(usize::MAX, &spec, 5).is_err(),
+        "work count overflow accepted"
+    );
+    ensure!(
+        F32Attention::required_bytes([12, 43632, 5, 128, 128])? == 847_872,
+        "cross attention tile count"
+    );
     decoder_pass_contract(1)?;
     assert!(decoder_pass_contract(0).is_err());
     assert!(decoder_pass_contract(2).is_err());

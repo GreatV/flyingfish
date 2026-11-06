@@ -1369,12 +1369,14 @@ impl F32Attention {
     pub(crate) fn workspace_bytes(&self) -> usize {
         (self.partials.len() + self.scores.len() + self.probabilities.len()) * size_of::<f32>()
     }
-    pub(crate) fn new(
-        stream: Arc<CudaStream>,
-        geometry: [u32; 5],
-        workspace_bytes: usize,
-    ) -> Result<Self> {
-        let [heads, queries, keys, dim, value_dim] = geometry;
+    pub(crate) fn required_bytes(geometry: [u32; 5]) -> Result<usize> {
+        let (bytes, _, _) = Self::row_bytes(geometry)?;
+        bytes
+            .checked_mul((geometry[1] as usize).min(128))
+            .context("F32 attention full tile overflow")
+    }
+    fn row_bytes(geometry: [u32; 5]) -> Result<(usize, u32, u32)> {
+        let [heads, _, keys, dim, value_dim] = geometry;
         ensure!(
             geometry.iter().all(|&d| d > 0) && dim.is_multiple_of(4) && value_dim.is_multiple_of(4),
             "F32 attention dimensions"
@@ -1384,6 +1386,15 @@ impl F32Attention {
         let row_bytes = usize::try_from(heads)?
             .checked_mul((keys as usize) * 8 + (parts as usize) * (value_dim as usize) * 4)
             .context("F32 attention workspace overflow")?;
+        Ok((row_bytes, key_chunk, parts))
+    }
+    pub(crate) fn new(
+        stream: Arc<CudaStream>,
+        geometry: [u32; 5],
+        workspace_bytes: usize,
+    ) -> Result<Self> {
+        let [heads, queries, keys, _, value_dim] = geometry;
+        let (row_bytes, key_chunk, parts) = Self::row_bytes(geometry)?;
         let tile = u32::try_from((workspace_bytes / row_bytes).min(queries as usize).min(128))?;
         ensure!(
             tile > 0,

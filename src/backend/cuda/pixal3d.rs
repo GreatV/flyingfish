@@ -1044,6 +1044,35 @@ struct Work<T: FlowElement> {
     block_mod: CudaSlice<T::Parameters>,
 }
 impl<T: FlowElement> Work<T> {
+    fn planned_bytes(n: usize, spec: &FlowSpec, context: usize) -> Result<usize> {
+        let h = spec.model_channels;
+        let row = 4usize
+            .checked_add(
+                size_of::<T>()
+                    .checked_mul(11 * h + spec.feed_forward_width())
+                    .context("work row overflow")?,
+            )
+            .and_then(|v| {
+                v.checked_add(if T::HALF {
+                    0
+                } else {
+                    4 * (3 * h + spec.in_channels + spec.out_channels)
+                })
+            })
+            .context("work row bytes overflow")?;
+        let fixed = context
+            .checked_mul(h)
+            .and_then(|n| {
+                n.checked_mul(
+                    size_of::<T>() * (if T::HALF { 4 } else { 5 }) + if T::HALF { 0 } else { 8 },
+                )
+            })
+            .and_then(|n| n.checked_add(6 * h * size_of::<T::Parameters>()))
+            .context("work fixed bytes overflow")?;
+        n.checked_mul(row)
+            .and_then(|n| n.checked_add(fixed))
+            .context("work bytes overflow")
+    }
     fn bytes(&self) -> usize {
         [
             self.row_index.num_bytes(),
@@ -1076,7 +1105,8 @@ impl<T: FlowElement> Work<T> {
     fn new(d: &Device, n: usize, spec: &FlowSpec, context_rows: usize) -> Result<Self> {
         let s = &d.stream;
         let h = spec.model_channels;
-        Ok(Self {
+        let planned = Self::planned_bytes(n, spec, context_rows)?;
+        let output = Self {
             row_index: s.alloc_zeros(n)?,
             hidden: s.alloc_zeros(n * h)?,
             norm: s.alloc_zeros(n * h)?,
@@ -1100,7 +1130,12 @@ impl<T: FlowElement> Work<T> {
             input_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.in_channels })?,
             output_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.out_channels })?,
             block_mod: s.alloc_zeros(6 * h)?,
-        })
+        };
+        ensure!(
+            output.bytes() == planned,
+            "flow work allocation plan mismatch"
+        );
+        Ok(output)
     }
 }
 
@@ -1166,6 +1201,61 @@ pub struct Flow<T: FlowElement = bf16> {
 }
 
 impl Flow<bf16> {
+    fn live_bytes(
+        spec: &FlowSpec,
+        rows: usize,
+        steps: usize,
+        time_width: usize,
+    ) -> Result<[usize; 3]> {
+        let h = spec.model_channels;
+        let condition_bytes = (if spec.texture() { 2usize } else { 4usize })
+            .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
+            .and_then(|n| {
+                n.checked_add(if spec.texture() {
+                    4 * (rows + 2) * spec.out_channels
+                } else {
+                    0
+                })
+            })
+            .context("flow conditioning bytes overflow")?;
+        let sampler_bytes = rows
+            .checked_mul(spec.out_channels)
+            .and_then(|n| n.checked_mul((if spec.texture() { 3 } else { 8 }) * size_of::<f32>()))
+            .and_then(|n| n.checked_add(8))
+            .context("flow sampler bytes overflow")?;
+        let time_bytes = size_of::<f32>() * (steps * (time_width + 8 * h + 1) + h + time_width / 2);
+        Ok([condition_bytes, sampler_bytes, time_bytes])
+    }
+    fn planned_bytes(checkpoint: &FlowCheckpoint, rows: usize, steps: usize) -> Result<usize> {
+        let spec = &checkpoint.spec;
+        let h = spec.model_channels;
+        let dim = h / spec.num_heads;
+        let tensors = checkpoint.mapped.component_tensors()?;
+        let time_width = tensors["t_embedder.mlp.0.weight"].shape[1];
+        let live = Self::live_bytes(spec, rows, steps, time_width)?;
+        [
+            checkpoint.runtime_bytes,
+            Work::<bf16>::planned_bytes(rows, spec, 5)?,
+            if spec.sparse() { rows * dim * 4 } else { 0 },
+            steps * 6 * h * size_of::<bf16>(),
+            rows * spec.num_heads * 4,
+            F32Attention::required_bytes([
+                spec.num_heads as u32,
+                u32::try_from(rows)?,
+                5,
+                dim as u32,
+                dim as u32,
+            ])?,
+            live[0],
+            live[1],
+            live[2],
+            (5 * spec.cond_channels + rows * spec.projection_width()) * 4,
+        ]
+        .into_iter()
+        .try_fold(0usize, |n, v| {
+            n.checked_add(v).context("flow peak bytes overflow")
+        })
+    }
     pub fn open(
         device: &Device,
         dir: &Path,
@@ -1416,23 +1506,8 @@ impl Flow<bf16> {
         let work = Work::new(&device, rows, &spec, 5)?;
         let flash = Flash::new(device.stream.clone(), rows, heads, heads, dim)?;
         let mods = device.stream.alloc_zeros(steps * 6 * h)?;
-        let condition_bytes = (if spec.texture() { 2usize } else { 4usize })
-            .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
-            .and_then(|n| {
-                n.checked_add(if spec.texture() {
-                    4 * (rows + 2) * spec.out_channels
-                } else {
-                    0
-                })
-            })
-            .context("flow conditioning bytes overflow")?;
-        let sampler_bytes = rows
-            .checked_mul(spec.out_channels)
-            .and_then(|n| n.checked_mul((if spec.texture() { 3 } else { 8 }) * size_of::<f32>()))
-            .and_then(|n| n.checked_add(8))
-            .context("flow sampler bytes overflow")?;
-        let time_width = time[0].weight.shape[1] as usize;
-        let time_bytes = size_of::<f32>() * (steps * (time_width + 8 * h + 1) + h + time_width / 2);
+        let [condition_bytes, sampler_bytes, time_bytes] =
+            Self::live_bytes(&spec, rows, steps, time[0].weight.shape[1] as usize)?;
         let live_bytes = condition_bytes
             .checked_add(sampler_bytes)
             .and_then(|n| n.checked_add(time_bytes))
@@ -3341,7 +3416,34 @@ impl PixalGeneration<'_> {
         drop(low);
         #[cfg(test)]
         decoder_pass_contract(decoder.decode_passes.get())?;
-        drop(decoder);
+        let required = self.following_peak(&pipeline, high.coordinates().len(), resolution / 16)?;
+        let available = self.budget(device)?;
+        let keep = required <= available;
+        #[cfg(test)]
+        {
+            let weight_bytes = decoder
+                .weights
+                .half
+                .values()
+                .map(CudaSlice::num_bytes)
+                .sum::<usize>()
+                + decoder
+                    .weights
+                    .float
+                    .values()
+                    .map(CudaSlice::num_bytes)
+                    .sum::<usize>();
+            println!(
+                "P1_M4C_STAGING required_bytes={required} available_bytes={available} retained_shape_decoder={keep} avoided_weight_upload_bytes={}",
+                if keep { weight_bytes } else { 0 }
+            );
+        }
+        let decoder = if keep {
+            Some(decoder)
+        } else {
+            drop(decoder);
+            None
+        };
         let high_xyz: Vec<_> = high
             .coordinates()
             .iter()
@@ -3364,11 +3466,16 @@ impl PixalGeneration<'_> {
             &mut observe,
         )?;
         drop(high_xyz);
-        let decoder = self.decoder(device, DecoderKind::Shape)?;
+        let decoder = match decoder {
+            Some(decoder) => decoder,
+            None => self.decoder(device, DecoderKind::Shape)?,
+        };
+        #[cfg(test)]
+        let previous_passes = decoder.decode_passes.get();
         let (mesh, guides) =
             decoder.shape_mesh_device(high.coordinates().to_vec(), shape, resolution)?;
         #[cfg(test)]
-        decoder_pass_contract(decoder.decode_passes.get())?;
+        decoder_pass_contract(decoder.decode_passes.get() - previous_passes)?;
         drop(decoder);
         let decoder = self.decoder(device, DecoderKind::Texture)?;
         let (material, predicted) =
@@ -3394,20 +3501,12 @@ impl PixalGeneration<'_> {
     fn decoder(&self, device: &Device, kind: DecoderKind) -> Result<PixalDecoder> {
         PixalDecoder::open(device, self.model, kind, self.runtime, self.budget(device)?)
     }
-    fn flow_stage<F>(
+    fn flow_geometry<'a>(
         &self,
-        device: &Device,
-        pipeline: &serde_json::Value,
-        stage: (usize, u32),
-        coordinates: &[[i32; 3]],
-        input: (&Rc<()>, Option<&CudaSlice<f32>>),
-        observe: &mut F,
-    ) -> Result<CudaSlice<f32>>
-    where
-        F: FnMut(usize, u32, &[[i32; 3]], &CudaSlice<f32>) -> Result<()>,
-    {
-        let (request, physical_shape) = input;
-        let (stage, grid_side) = stage;
+        pipeline: &'a serde_json::Value,
+        stage: usize,
+        grid_side: u32,
+    ) -> Result<(&'a str, FlowSpec, crate::backend::PixalConditioningShape)> {
         let key = [
             "sparse_structure_flow_model",
             "shape_slat_flow_model_512",
@@ -3436,6 +3535,62 @@ impl PixalGeneration<'_> {
             grid_side,
             naf_side: (stage > 0).then_some(if stage == 3 { 1024 } else { 512 }),
         };
+        Ok((stem, spec, shape))
+    }
+    fn following_peak(
+        &self,
+        pipeline: &serde_json::Value,
+        rows: usize,
+        grid_side: u32,
+    ) -> Result<usize> {
+        let mut peak = 0;
+        for stage in [2, 3] {
+            let (stem, spec, shape) = self.flow_geometry(pipeline, stage, grid_side)?;
+            let conditioning = crate::backend::PixalConditioningRuntime::planned_bytes(
+                self.dino,
+                shape.naf_side.map(|_| self.naf),
+                shape,
+                rows,
+            )?;
+            let checkpoint = FlowCheckpoint::open(&self.model.join("ckpts"), stem)?;
+            let sampler = if spec.texture() {
+                "tex_slat_sampler"
+            } else {
+                "shape_slat_sampler"
+            };
+            let steps = usize::try_from(
+                pipeline["args"][sampler]["params"]["steps"]
+                    .as_u64()
+                    .context("sampler steps missing")?,
+            )?;
+            let flow = Flow::<bf16>::planned_bytes(&checkpoint, rows, steps)?;
+            let retained = rows
+                .checked_mul(spec.out_channels * 4)
+                .context("retained latent bytes overflow")?;
+            peak = peak.max(
+                conditioning
+                    .max(flow)
+                    .checked_add(retained)
+                    .context("stage peak overflow")?,
+            );
+        }
+        Ok(peak)
+    }
+    fn flow_stage<F>(
+        &self,
+        device: &Device,
+        pipeline: &serde_json::Value,
+        stage: (usize, u32),
+        coordinates: &[[i32; 3]],
+        input: (&Rc<()>, Option<&CudaSlice<f32>>),
+        observe: &mut F,
+    ) -> Result<CudaSlice<f32>>
+    where
+        F: FnMut(usize, u32, &[[i32; 3]], &CudaSlice<f32>) -> Result<()>,
+    {
+        let (request, physical_shape) = input;
+        let (stage, grid_side) = stage;
+        let (stem, spec, shape) = self.flow_geometry(pipeline, stage, grid_side)?;
         let ops = Ops::new(&device.ctx)?;
         let mut blas = Blas::new(
             device,

@@ -6561,6 +6561,34 @@ struct NafWorkspace {
 }
 
 #[cfg(feature = "cuda")]
+impl NafWorkspace {
+    fn plan(dimensions: [u32; 3], free_budget: usize) -> Result<(usize, u32)> {
+        let [image_side, output_side, source_side] = dimensions;
+        ensure!(
+            image_side >= 2
+                && output_side > 0
+                && source_side >= 9
+                && output_side.is_multiple_of(source_side)
+                && image_side <= 4 * output_side,
+            "NAF unsupported image/output/source geometry"
+        );
+        let pixels = image_side as usize * image_side as usize;
+        let target = output_side as usize * output_side as usize;
+        let source = source_side as usize * source_side as usize;
+        let fixed = 4 * (pixels * 256 + target * (256 + 1024 + 64) + source * 256);
+        let available = free_budget
+            .checked_sub(fixed)
+            .context("NAF fixed workspace exceeds remaining device budget")?;
+        let conv_rows = ((available / (128 * 9 * 4)).min(pixels).min(32768) / 4 * 4) as u32;
+        ensure!(
+            conv_rows > 0,
+            "NAF convolution workspace has no row capacity"
+        );
+        Ok((fixed + conv_rows as usize * 128 * 9 * 4, conv_rows))
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl NafEncoder {
     fn load(device: &Device, dir: &std::path::Path) -> Result<Self> {
         let checkpoint =
@@ -6657,26 +6685,10 @@ impl NafEncoder {
         free_budget: usize,
     ) -> Result<NafWorkspace> {
         let [image_side, output_side, source_side] = dimensions;
-        ensure!(
-            image_side >= 2
-                && output_side > 0
-                && source_side >= 9
-                && output_side.is_multiple_of(source_side)
-                && image_side <= 4 * output_side,
-            "NAF unsupported image/output/source geometry"
-        );
         let pixels = image_side as usize * image_side as usize;
         let target = output_side as usize * output_side as usize;
         let source = source_side as usize * source_side as usize;
-        let fixed = 4 * (pixels * 256 + target * (256 + 1024 + 64) + source * 256);
-        let available = free_budget
-            .checked_sub(fixed)
-            .context("NAF fixed workspace exceeds remaining device budget")?;
-        let conv_rows = ((available / (128 * 9 * 4)).min(pixels).min(32768) / 4 * 4) as u32;
-        ensure!(
-            conv_rows > 0,
-            "NAF convolution workspace has no row capacity"
-        );
+        let (planned, conv_rows) = NafWorkspace::plan(dimensions, free_budget)?;
         let mut table = Vec::with_capacity(target * 64);
         for y in 0..output_side {
             for x in 0..output_side {
@@ -6695,7 +6707,7 @@ impl NafEncoder {
             }
         }
         let s = &device.stream;
-        Ok(NafWorkspace {
+        let workspace = NafWorkspace {
             image_side,
             output_side,
             source_side,
@@ -6708,7 +6720,21 @@ impl NafEncoder {
             keys: s.alloc_zeros(source * 256)?,
             output: s.alloc_zeros(target * 1024)?,
             rope_table: s.clone_htod(&table)?,
-        })
+        };
+        let allocated = [
+            workspace.columns.len(),
+            workspace.a.len(),
+            workspace.b.len(),
+            workspace.guide.len(),
+            workspace.keys.len(),
+            workspace.output.len(),
+            workspace.rope_table.len(),
+        ]
+        .into_iter()
+        .sum::<usize>()
+            * size_of::<f32>();
+        ensure!(allocated == planned, "NAF workspace plan mismatch");
+        Ok(workspace)
     }
 
     fn convolve(
@@ -7175,6 +7201,63 @@ pub struct PixalConditioningRuntime {
 
 #[cfg(feature = "cuda")]
 impl PixalConditioningRuntime {
+    pub(crate) fn planned_bytes(
+        dino_dir: &std::path::Path,
+        naf_dir: Option<&std::path::Path>,
+        shape: PixalConditioningShape,
+        projection_rows: usize,
+    ) -> Result<usize> {
+        let cfg = VisionEncoderConfig::from_dir(dino_dir)?;
+        let rows = cfg.total_rows(shape.image_side)?;
+        let attention = F32Attention::required_bytes([
+            cfg.num_attention_heads,
+            rows,
+            rows,
+            cfg.head_dim(),
+            cfg.head_dim(),
+        ])?;
+        let naf = if let (Some(side), Some(dir)) = (shape.naf_side, naf_dir) {
+            let mapped =
+                crate::checkpoint::MappedCheckpoint::open_component(dir, "naf_release.pth")?;
+            let weights = mapped.index.weight_map.keys().try_fold(0usize, |n, name| {
+                n.checked_add(mapped.tensor(name)?.data().len())
+                    .context("NAF weight bytes overflow")
+            })?;
+            weights
+                .checked_add(
+                    NafWorkspace::plan(
+                        [shape.image_side, side, shape.image_side / 16],
+                        usize::MAX,
+                    )?
+                    .0,
+                )
+                .context("NAF planned bytes overflow")?
+        } else {
+            ensure!(
+                shape.naf_side.is_none() && naf_dir.is_none(),
+                "NAF plan geometry/checkpoint mismatch"
+            );
+            0
+        };
+        let channels = if shape.naf_side.is_some() { 2048 } else { 1024 };
+        [
+            cfg.expected_loaded_elements()
+                .checked_mul(4)
+                .context("encoder weight size overflow")?,
+            cfg.workspace_bytes(shape.image_side)?,
+            attention,
+            naf,
+            shape.image_side as usize * shape.image_side as usize * 3 * 4,
+            15 * 4 + 5 * 1024 * 4,
+            projection_rows
+                .checked_mul(channels * 4 + 3 * 4)
+                .context("projection plan overflow")?,
+        ]
+        .into_iter()
+        .try_fold(0usize, |n, v| {
+            n.checked_add(v).context("conditioning plan overflow")
+        })
+    }
     pub fn load(
         device: &Device,
         blas: &mut Blas,
