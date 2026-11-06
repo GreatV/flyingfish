@@ -13547,6 +13547,128 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA, DINOv3, NAF and frozen single-view fusion captures"]
+    #[cfg(feature = "cuda")]
+    fn pixal_multiview_one_hr_texture_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use sha2::{Digest, Sha256};
+        use std::{path::PathBuf, rc::Rc};
+        let freeze_path =
+            PathBuf::from(std::env::var_os("FF_PIXAL_M4C_FREEZE").context("FF_PIXAL_M4C_FREEZE")?);
+        let bytes = std::fs::read(&freeze_path)?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes))
+                == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
+            "M4c freeze integrity"
+        );
+        let freeze: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let cells = freeze["mv1_conditioning"]["cells"]
+            .as_array()
+            .context("MV1 cells")?;
+        ensure!(cells.len() == 4, "MV1 coverage");
+        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
+        let naf = PathBuf::from(std::env::var_os("FF_NAF_MODEL").context("FF_NAF_MODEL")?);
+        let runtime_dir = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
+        );
+        let input_file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
+        let input_map = unsafe { memmap2::MmapOptions::new().map(&input_file)? };
+        let inputs = safetensors::SafeTensors::deserialize(&input_map)?;
+        let matrices = read_f32_tensor(&inputs, "mv-world-to-camera")?;
+        let angles = read_f32_tensor(&inputs, "mv-angle")?;
+        let camera = ProjectionCamera {
+            world_to_camera: matrices[..12].try_into()?,
+            horizontal_fov: angles[0],
+            mesh_scale: read_f32_tensor(&inputs, "mv-mesh-scale")?[0],
+        };
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let mut blas = test_blas(
+            &device,
+            &runtime_dir,
+            Rc::new(Closure::new(false, "Pixal single-view fusion".into())),
+        )?;
+        let coordinates: Vec<_> = (0..64usize.pow(3))
+            .map(|i| [(i / 4096) as i32, ((i / 64) % 64) as i32, (i % 64) as i32])
+            .collect();
+        let mut defects = 0;
+        let mut scored = 0;
+        for (stage, naf_side) in [("shape1024", 512), ("tex1024", 1024)] {
+            let shape = PixalConditioningShape {
+                image_side: 1024,
+                grid_side: 64,
+                naf_side: Some(naf_side),
+            };
+            let request = Rc::new(());
+            let mut native = PixalConditioningRuntime::load(
+                &device,
+                &mut blas,
+                &dino,
+                Some(&naf),
+                shape,
+                Some(&coordinates),
+                &request,
+            )?;
+            for control in [false, true] {
+                let rgba = inputs.tensor(if control {
+                    "robot_crab-rgba"
+                } else {
+                    "mv-0-rgba"
+                })?;
+                native.stage_view_rgba(
+                    s,
+                    rgba.data(),
+                    [rgba.shape()[0], rgba.shape()[1]],
+                    camera,
+                )?;
+                native.run_view(s, &blas, 0, 1)?;
+                for (key, output) in [
+                    ("global", &native.global),
+                    ("projection", &native.projection),
+                ] {
+                    let name = format!("MV1-{stage}-{key}");
+                    let cell = cells
+                        .iter()
+                        .find(|cell| cell["name"] == name)
+                        .context("MV1 frozen cell")?;
+                    let file = std::fs::File::open(
+                        cell["anchor"]["path"].as_str().context("MV1 anchor path")?,
+                    )?;
+                    let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                    let reference = safetensors::SafeTensors::deserialize(&map)?;
+                    let score_cell =
+                        serde_json::json!({"tau":cell["tau"], "control":"wrong_media_same_camera"});
+                    let pass = pixal_score(
+                        s,
+                        output,
+                        reference.tensor(key)?,
+                        &score_cell,
+                        &format!("M4C {name} control={control}"),
+                        false,
+                        control,
+                    )?;
+                    if control {
+                        ensure!(pass, "MV1 media control under 10 tau {name}");
+                    } else {
+                        scored += 1;
+                        defects += usize::from(!pass);
+                    }
+                }
+            }
+            let owned = native.finish()?;
+            owned.binding(&coordinates, shape, &request, &[camera])?;
+        }
+        println!(
+            "P1_M4C_MV1 {} cells={scored} metrics={} controls={scored} defects={defects} eager=true",
+            if defects == 0 { "PASS" } else { "DEFECT" },
+            scored * 2
+        );
+        ensure!(scored == 4 && defects == 0, "MV1 conditioning defect");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires CUDA, published DINOv3 and supplied RGBA fixtures"]
     #[cfg(feature = "cuda")]
     fn pixal_conditioning_owned_projection_gpu() -> Result<()> {

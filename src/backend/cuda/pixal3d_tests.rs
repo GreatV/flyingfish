@@ -6802,3 +6802,179 @@ fn pixal3d_device_handoff_gpu() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA and frozen normalization captures"]
+fn pixal3d_composed_normalization_gpu() -> Result<()> {
+    let path = env_path("FF_PIXAL_M4C_FREEZE")?;
+    let bytes = std::fs::read(path)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes))
+            == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
+        "M4c freeze integrity"
+    );
+    let freeze: Value = serde_json::from_slice(&bytes)?;
+    let cells = freeze["normalization"]
+        .as_array()
+        .context("normalization cells")?;
+    ensure!(cells.len() == 18, "normalization coverage");
+    let device = Device::new(0)?;
+    let mut defects = 0;
+    for cell in cells {
+        let name = cell["name"].as_str().context("normalization name")?;
+        let path = Path::new(cell["path"].as_str().context("normalization path")?);
+        let input = f32_tensor(path, "normalized")?;
+        let mean = f32_tensor(path, "mean")?;
+        let std = f32_tensor(path, "std")?;
+        let reference = tensor(path, "physical")?;
+        let mut output = device.stream.clone_htod(&input)?;
+        channel_transform(&device, &mut output, [&mean, &std], false)?;
+        let observed: Vec<_> = device
+            .stream
+            .clone_dtoh(&output)?
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let distance = metrics(&observed, &reference.values)?;
+        for metric in ["max_abs", "rmse"] {
+            let tau = cell["tau"][metric].as_f64().context("normalization tau")?;
+            let pass = distance[metric] <= tau;
+            defects += usize::from(!pass);
+            println!(
+                "P1_M4C_NORMALIZATION_CELL {} name={name} metric={metric} value={} tau={tau}",
+                if pass { "PASS" } else { "DEFECT" },
+                distance[metric]
+            );
+        }
+        channel_transform(&device, &mut output, [&mean, &std], false)?;
+        let doubled: Vec<_> = device
+            .stream
+            .clone_dtoh(&output)?
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        for (control, values) in [
+            (
+                "omitted",
+                input.into_iter().map(f64::from).collect::<Vec<_>>(),
+            ),
+            ("doubled", doubled),
+        ] {
+            let distance = metrics(&values, &reference.values)?;
+            for metric in ["max_abs", "rmse"] {
+                let ratio = distance[metric]
+                    / cell["tau"][metric]
+                        .as_f64()
+                        .context("normalization control tau")?;
+                ensure!(
+                    ratio >= 10.0,
+                    "normalization control weak {name} {control} {metric}"
+                );
+                println!(
+                    "P1_M4C_NORMALIZATION_CONTROL PASS name={name} control={control} metric={metric} ratio={ratio}"
+                );
+            }
+        }
+    }
+    println!(
+        "P1_M4C_NORMALIZATION {} cells=18 metrics=36 controls=36 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "normalization defects");
+    Ok(())
+}
+
+#[test]
+fn coordinate_noise_preserves_batch_axes_and_channel_layout() -> Result<()> {
+    let shape = [2usize, 3, 5, 7, 11];
+    let values: Vec<_> = (0..shape.iter().product()).map(|i| i as f32).collect();
+    let field = CoordinateNoise {
+        values: &values,
+        shape,
+        batch: 1,
+    };
+    let coordinates = [[2, 1, 6], [0, 4, 1], [1, 3, 0]];
+    let rows = field.gather(&coordinates, 11, false)?;
+    let columns = field.gather(&coordinates, 11, true)?;
+    for (row, [x, y, z]) in coordinates.into_iter().enumerate() {
+        for channel in 0..11 {
+            let expected =
+                ((((3 + x as usize) * 5 + y as usize) * 7 + z as usize) * 11 + channel) as f32;
+            assert_eq!(rows[row * 11 + channel], expected);
+            assert_eq!(columns[channel * coordinates.len() + row], expected);
+        }
+    }
+    let wrong_batch = CoordinateNoise { batch: 0, ..field };
+    assert_ne!(wrong_batch.gather(&coordinates, 11, false)?, rows);
+    assert_ne!(columns, rows);
+    assert!(field.gather(&[[3, 0, 0]], 11, false).is_err());
+    assert!(field.gather(&[[-1, 0, 0]], 11, false).is_err());
+    assert!(field.gather(&coordinates, 10, false).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires frozen coordinate noise fixtures; CPU only"]
+fn pixal3d_coordinate_noise_fixture_cpu() -> Result<()> {
+    let bytes = std::fs::read(env_path("FF_PIXAL_M4C_FREEZE")?)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes))
+            == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
+        "M4c freeze integrity"
+    );
+    let freeze: Value = serde_json::from_slice(&bytes)?;
+    let cells = freeze["noise"].as_array().context("noise cells")?;
+    let root = env_path("FF_PIXAL_M4C_NOISE")?;
+    let mut scored = 0;
+    for stage in ["ss", "lr", "hr", "tex"] {
+        let data = tensor(&root.join(format!("{stage}.safetensors")), "noise")?;
+        let shape: [usize; 5] = data
+            .shape
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("noise field rank"))?;
+        let values: Vec<_> = data.values.into_iter().map(|v| v as f32).collect();
+        let field = CoordinateNoise {
+            values: &values,
+            shape,
+            batch: 0,
+        };
+        for cell in cells.iter().filter(|cell| cell["stage"] == stage) {
+            let source = Path::new(cell["source"].as_str().context("noise source")?);
+            let dense = stage == "ss";
+            let coordinates = if dense {
+                (0..16usize.pow(3))
+                    .map(|i| [(i / 256) as i32, ((i / 16) % 16) as i32, (i % 16) as i32])
+                    .collect::<Vec<_>>()
+            } else {
+                coordinates(&tensor(source, "noise.coords")?)?
+            };
+            let expected = f32_tensor(source, if dense { "noise" } else { "noise.features" })?;
+            let actual = field.gather(&coordinates, shape[4], dense)?;
+            ensure!(
+                actual == expected,
+                "coordinate noise mismatch {} {stage}",
+                cell["case"]
+            );
+            let swapped: Vec<_> = coordinates.iter().map(|p| [p[2], p[1], p[0]]).collect();
+            let wrong = field.gather(&swapped, shape[4], dense)?;
+            let flips = wrong.iter().zip(&expected).filter(|(a, b)| a != b).count();
+            ensure!(
+                flips > 0
+                    && flips as u64
+                        == cell["axis_swap_control_changed_components"]
+                            .as_u64()
+                            .context("noise control count")?,
+                "noise axis control mismatch"
+            );
+            println!(
+                "P1_M4C_NOISE_CELL PASS case={} stage={stage} values={} axis_control_flips={flips}",
+                cell["case"],
+                actual.len()
+            );
+            scored += 1;
+        }
+    }
+    ensure!(scored == 24, "noise fixture coverage");
+    println!("P1_M4C_NOISE PASS cells={scored} axis_controls={scored} exact=true CPU_only=true");
+    Ok(())
+}

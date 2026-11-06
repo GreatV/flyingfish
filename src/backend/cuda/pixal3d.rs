@@ -3096,6 +3096,318 @@ impl DecoderKernels {
     }
 }
 
+/// Published [batch,x,y,z,channel] noise values; the request selects one batch.
+pub struct CoordinateNoise<'a> {
+    pub values: &'a [f32],
+    pub shape: [usize; 5],
+    pub batch: usize,
+}
+impl CoordinateNoise<'_> {
+    fn gather(
+        &self,
+        coordinates: &[[i32; 3]],
+        channels: usize,
+        channels_first: bool,
+    ) -> Result<Vec<f32>> {
+        let count = self
+            .shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .context("noise extent overflow")?;
+        ensure!(
+            self.shape.iter().all(|&n| n > 0)
+                && count == self.values.len()
+                && self.batch < self.shape[0]
+                && channels == self.shape[4],
+            "noise domain extent mismatch"
+        );
+        let count = coordinates
+            .len()
+            .checked_mul(channels)
+            .context("selected noise extent overflow")?;
+        let mut output = vec![0.0; count];
+        for (row, point) in coordinates.iter().enumerate() {
+            let mut index = self.batch;
+            for (axis, &coordinate) in point.iter().enumerate() {
+                let coordinate =
+                    usize::try_from(coordinate).context("negative noise coordinate")?;
+                ensure!(
+                    coordinate < self.shape[axis + 1],
+                    "noise coordinate outside supplied domain"
+                );
+                index = index * self.shape[axis + 1] + coordinate;
+            }
+            for channel in 0..channels {
+                let value = self.values[index * channels + channel];
+                ensure!(value.is_finite(), "nonfinite selected noise");
+                output[if channels_first {
+                    channel * coordinates.len() + row
+                } else {
+                    row * channels + channel
+                }] = value;
+            }
+        }
+        Ok(output)
+    }
+}
+
+pub struct PixalView<'a> {
+    pub rgba: &'a [u8],
+    /// [height,width].
+    pub dimensions: [usize; 2],
+    pub camera: crate::backend::ProjectionCamera,
+}
+
+pub struct PixalGeneration<'a> {
+    pub model: &'a Path,
+    pub dino: &'a Path,
+    pub naf: &'a Path,
+    pub runtime: &'a Path,
+    pub views: &'a [PixalView<'a>],
+    pub multiview: bool,
+    pub requested_resolution: u32,
+    /// Structure, low-resolution shape, high-resolution shape, texture.
+    pub noise: [CoordinateNoise<'a>; 4],
+}
+
+pub struct PixalOutput {
+    pub mesh: crate::sparse::SparseMesh,
+    /// RGB, metallic, roughness, alpha at the final voxel coordinates.
+    pub material: SparseDecoderOutput,
+    pub resolution: u32,
+    pub origin: [f32; 3],
+    pub voxel_size: f32,
+}
+
+impl PixalGeneration<'_> {
+    pub fn run(&self, device: &Device) -> Result<PixalOutput> {
+        ensure!(
+            matches!(self.requested_resolution, 1024 | 1536),
+            "unsupported requested resolution"
+        );
+        ensure!(
+            !self.views.is_empty() && (self.multiview || self.views.len() == 1),
+            "invalid single/multi-view request"
+        );
+        for view in self.views {
+            let count = view
+                .dimensions
+                .iter()
+                .try_fold(4usize, |n, &d| n.checked_mul(d))
+                .context("RGBA size overflow")?;
+            ensure!(
+                view.dimensions.iter().all(|&n| n > 0)
+                    && view.rgba.len() == count
+                    && view.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0)
+                    && view.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255),
+                "request requires nonempty supplied RGBA foreground"
+            );
+        }
+        let pipeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.model.join(if self.multiview {
+                "pipeline_mv.json"
+            } else {
+                "pipeline.json"
+            }))?)?;
+        for (key, kind) in [
+            ("sparse_structure_decoder", DecoderKind::Structure),
+            ("shape_slat_decoder", DecoderKind::Shape),
+            ("tex_slat_decoder", DecoderKind::Texture),
+        ] {
+            ensure!(
+                pipeline["args"]["models"][key] == format!("ckpts/{}", kind.stem()),
+                "decoder component differs from published geometry"
+            );
+        }
+        let request = Rc::new(());
+        let ss: Vec<_> = (0..16usize.pow(3))
+            .map(|i| [(i / 256) as i32, ((i / 16) % 16) as i32, (i % 16) as i32])
+            .collect();
+        let structure = self.flow_stage(device, &pipeline, (0, 16), &ss, None, &request)?;
+        let decoder = self.decoder(device, DecoderKind::Structure)?;
+        let logits = decoder.structure_device(structure)?;
+        let low = PixalDecoder::structure_sites(&logits, 64, 32)?;
+        drop(logits);
+        drop(decoder);
+        let low_xyz: Vec<_> = low
+            .coordinates()
+            .iter()
+            .map(|p| [p[1], p[2], p[3]])
+            .collect();
+        let low_latent = self.flow_stage(device, &pipeline, (1, 32), &low_xyz, None, &request)?;
+        drop(low_xyz);
+        let decoder = self.decoder(device, DecoderKind::Shape)?;
+        let (resolution, high) = decoder.cascade_coordinates_device(
+            low.coordinates().to_vec(),
+            low_latent,
+            self.requested_resolution,
+            49152,
+        )?;
+        drop(low);
+        drop(decoder);
+        let high_xyz: Vec<_> = high
+            .coordinates()
+            .iter()
+            .map(|p| [p[1], p[2], p[3]])
+            .collect();
+        let shape = self.flow_stage(
+            device,
+            &pipeline,
+            (2, resolution / 16),
+            &high_xyz,
+            None,
+            &request,
+        )?;
+        let texture = self.flow_stage(
+            device,
+            &pipeline,
+            (3, resolution / 16),
+            &high_xyz,
+            Some(&shape),
+            &request,
+        )?;
+        drop(high_xyz);
+        let decoder = self.decoder(device, DecoderKind::Shape)?;
+        let (mesh, guides) =
+            decoder.shape_mesh_device(high.coordinates().to_vec(), shape, resolution)?;
+        drop(decoder);
+        let decoder = self.decoder(device, DecoderKind::Texture)?;
+        let (material, predicted) =
+            decoder.decode_device(high.coordinates().to_vec(), texture, &guides)?;
+        ensure!(
+            predicted.is_empty(),
+            "texture decoder predicted subdivision"
+        );
+        Ok(PixalOutput {
+            mesh,
+            material,
+            resolution,
+            origin: [-0.5; 3],
+            voxel_size: 1.0 / resolution as f32,
+        })
+    }
+    fn budget(&self, device: &Device) -> Result<usize> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        device.workspace_budget(free, total, total / 16)
+    }
+    fn decoder(&self, device: &Device, kind: DecoderKind) -> Result<PixalDecoder> {
+        PixalDecoder::open(device, self.model, kind, self.runtime, self.budget(device)?)
+    }
+    fn flow_stage(
+        &self,
+        device: &Device,
+        pipeline: &serde_json::Value,
+        stage: (usize, u32),
+        coordinates: &[[i32; 3]],
+        physical_shape: Option<&CudaSlice<f32>>,
+        request: &Rc<()>,
+    ) -> Result<CudaSlice<f32>> {
+        let (stage, grid_side) = stage;
+        let key = [
+            "sparse_structure_flow_model",
+            "shape_slat_flow_model_512",
+            "shape_slat_flow_model_1024",
+            "tex_slat_flow_model_1024",
+        ][stage];
+        let stem = pipeline["args"]["models"][key]
+            .as_str()
+            .context("flow component missing")?
+            .strip_prefix("ckpts/")
+            .context("flow checkpoint component path")?;
+        ensure!(
+            !stem.is_empty()
+                && !stem.contains('/')
+                && !stem.contains('\\')
+                && stem.ends_with("_mv") == self.multiview,
+            "invalid flow component variant"
+        );
+        let spec = FlowSpec::read(&self.model.join("ckpts"), stem)?;
+        ensure!(
+            spec.sparse() == (stage > 0) && spec.texture() == (stage == 3),
+            "flow component stage mismatch"
+        );
+        let shape = crate::backend::PixalConditioningShape {
+            image_side: if stage < 2 { 512 } else { 1024 },
+            grid_side,
+            naf_side: (stage > 0).then_some(if stage == 3 { 1024 } else { 512 }),
+        };
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            device,
+            &ops,
+            self.runtime,
+            Rc::new(Closure::new(false, "Pixal conditioning".into())),
+        )?;
+        let mut encoder = crate::backend::PixalConditioningRuntime::load(
+            device,
+            &mut blas,
+            self.dino,
+            shape.naf_side.map(|_| self.naf),
+            shape,
+            Some(coordinates),
+            request,
+        )?;
+        for (index, view) in self.views.iter().enumerate() {
+            if self.multiview {
+                encoder.stage_view_rgba(&device.stream, view.rgba, view.dimensions, view.camera)?;
+            } else {
+                encoder.stage_rgba(&device.stream, view.rgba, view.dimensions, view.camera)?;
+            }
+            encoder.run_view(
+                &device.stream,
+                &blas,
+                u32::try_from(index)?,
+                u32::try_from(self.views.len())?,
+            )?;
+        }
+        let projected = encoder.finish()?;
+        drop(blas);
+        let mut flow = Flow::open(
+            device,
+            &self.model.join("ckpts"),
+            stem,
+            self.runtime,
+            (coordinates, grid_side),
+            request,
+            self.budget(device)?,
+        )?;
+        let cameras: Vec<_> = self.views.iter().map(|v| v.camera).collect();
+        let mut positive = flow.conditioning_projected(&projected, &cameras)?;
+        drop(projected);
+        ensure!(
+            physical_shape.is_some() == spec.texture(),
+            "shape conditioning stage mismatch"
+        );
+        if let Some(shape) = physical_shape {
+            flow.condition_shape_device(&mut positive, shape, coordinates)?;
+        }
+        let negative = if spec.texture() {
+            None
+        } else {
+            Some(Conditioning {
+                origin: flow.origin.clone(),
+                global: device.stream.alloc_zeros(positive.global.len())?,
+                projected: device.stream.alloc_zeros(positive.projected.len())?,
+                concat: None,
+            })
+        };
+        let noise = self.noise[stage].gather(coordinates, spec.out_channels, !spec.sparse())?;
+        let noise = device.stream.clone_htod(&noise)?;
+        let mut output = flow.sample_device(noise, &positive, negative.as_ref())?;
+        if matches!(stage, 1 | 2) {
+            let normalization = &pipeline["args"]["shape_slat_normalization"];
+            let mean: Vec<f32> = serde_json::from_value(normalization["mean"].clone())?;
+            let std: Vec<f32> = serde_json::from_value(normalization["std"].clone())?;
+            ensure!(
+                mean.len() == spec.out_channels && std.len() == spec.out_channels,
+                "shape normalization channel count"
+            );
+            channel_transform(device, &mut output, [&mean, &std], false)?;
+        }
+        Ok(output)
+    }
+}
+
 pub struct PixalDecoder {
     device: Device,
     blas: Blas,
