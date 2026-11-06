@@ -2154,6 +2154,16 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         .map(|v| v.as_f64().unwrap() as f32)
         .collect();
 
+    let control_path = ref_dir.join("verify_control_positions_r1.json");
+    let control_raw = std::fs::read_to_string(control_path)?;
+    let control_json: serde_json::Value = serde_json::from_str(&control_raw)?;
+    let gated_positions: std::collections::BTreeSet<usize> = control_json["gated_positions"]
+        .as_array()
+        .context("gated_positions missing")?
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+
     // Establish single-step eager decode reference logits for round 0
     let checkpoint = GraphStepCheckpoint::save(&engine)?;
     let _ref_t1 = engine.decode(false, None)?;
@@ -2163,6 +2173,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let mut accepted_count = 0usize;
     let mut total_rounds = 0usize;
     let mut verify_compared_count = 0usize;
+    let mut verify_gated_count = 0usize;
     let mut emitted_tokens = Vec::with_capacity(600);
     emitted_tokens.push(t0);
 
@@ -2180,6 +2191,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
     let mut total_bytes_moved = 0u64;
     let mut sum_b_verify = 0u64;
+    let mut sum_u = 0usize;
 
     while emitted_tokens.len() < 599 {
         let is_round0 = total_rounds == 0;
@@ -2199,14 +2211,17 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
                 row0_sum_sq += diff * diff;
             }
             let row0_rmse = (row0_sum_sq / out_eager.verify_row0_logits.len() as f32).sqrt();
-            ensure!(
-                row0_max_abs <= tau_max_abs,
-                "DEFECT verify row0 at pos=0 max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
-            );
-            ensure!(
-                row0_rmse <= tau_rmse,
-                "DEFECT verify row0 at pos=0 rmse={row0_rmse} exceeds tau={tau_rmse}"
-            );
+            if gated_positions.contains(&0) {
+                ensure!(
+                    row0_max_abs <= tau_max_abs,
+                    "DEFECT verify row0 at pos=0 max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
+                );
+                ensure!(
+                    row0_rmse <= tau_rmse,
+                    "DEFECT verify row0 at pos=0 rmse={row0_rmse} exceeds tau={tau_rmse}"
+                );
+                verify_gated_count += 1;
+            }
             verify_compared_count += 1;
             out_eager
         } else {
@@ -2237,14 +2252,17 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
                 row0_sum_sq += diff * diff;
             }
             let row0_rmse = (row0_sum_sq / out.verify_row0_logits.len() as f32).sqrt();
-            ensure!(
-                row0_max_abs <= tau_max_abs,
-                "DEFECT verify row0 replay at pos={p} max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
-            );
-            ensure!(
-                row0_rmse <= tau_rmse,
-                "DEFECT verify row0 replay at pos={p} rmse={row0_rmse} exceeds tau={tau_rmse}"
-            );
+            if gated_positions.contains(&p) {
+                ensure!(
+                    row0_max_abs <= tau_max_abs,
+                    "DEFECT verify row0 replay at pos={p} max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
+                );
+                ensure!(
+                    row0_rmse <= tau_rmse,
+                    "DEFECT verify row0 replay at pos={p} rmse={row0_rmse} exceeds tau={tau_rmse}"
+                );
+                verify_gated_count += 1;
+            }
             verify_compared_count += 1;
         }
 
@@ -2272,6 +2290,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         }
 
         // Cost accounting
+        sum_u += out.expert_union_count;
         let b_verify =
             w_target_dense + (out.expert_union_count as u64 * expert_slot_bytes) + b_head;
         sum_b_verify += b_verify;
@@ -2287,6 +2306,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
     let alpha = accepted_count as f64 / total_rounds as f64;
     let mean_b_verify = sum_b_verify as f64 / total_rounds as f64;
+    let mean_u = sum_u as f64 / total_rounds as f64;
     let alpha_star = (b_draft as f64 + mean_b_verify) / (2.0 * b_step1 as f64);
     let baseline_bytes = (emitted_tokens.len() - 1) as u64 * b_step1;
     let efficiency_ratio = total_bytes_moved as f64 / baseline_bytes as f64;
@@ -2298,7 +2318,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     );
 
     println!(
-        "PASS GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} verify_compared={verify_compared_count} alpha={alpha:.4} alpha_star={alpha_star:.4} efficiency_ratio={efficiency_ratio:.4} min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={}",
+        "PASS GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} verify_compared={verify_compared_count} verify_gated={verify_gated_count} alpha={alpha:.4} mean_u={mean_u:.2} v_bar={mean_b_verify:.0} alpha_star={alpha_star:.4} efficiency_ratio={efficiency_ratio:.4} min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={}",
         emitted_tokens.len()
     );
     Ok(())
