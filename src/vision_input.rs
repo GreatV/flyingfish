@@ -1691,6 +1691,199 @@ mod loopvl_tests {
     }
 }
 
+/// EXIF-oriented alpha bounding square, white composite and centered 1.2 padding.
+pub fn prepare_rgba_white(
+    input: &[u8],
+    shape: [usize; 2],
+    orientation: u8,
+) -> Result<(Vec<u8>, [usize; 2])> {
+    let [height, width] = shape;
+    ensure!(
+        height > 0
+            && width > 0
+            && height.checked_mul(width).and_then(|n| n.checked_mul(4)) == Some(input.len())
+            && (1..=8).contains(&orientation),
+        "RGBA extent/orientation"
+    );
+    let [h, w] = if orientation >= 5 {
+        [width, height]
+    } else {
+        shape
+    };
+    let source = |x: usize, y: usize| {
+        let (sx, sy) = match orientation {
+            1 => (x, y),
+            2 => (width - 1 - x, y),
+            3 => (width - 1 - x, height - 1 - y),
+            4 => (x, height - 1 - y),
+            5 => (y, x),
+            6 => (y, height - 1 - x),
+            7 => (width - 1 - y, height - 1 - x),
+            8 => (width - 1 - y, x),
+            _ => unreachable!(),
+        };
+        &input[(sy * width + sx) * 4..][..4]
+    };
+    let mut bounds = [w, h, 0, 0];
+    for y in 0..h {
+        for x in 0..w {
+            if source(x, y)[3] != 0 {
+                bounds[0] = bounds[0].min(x);
+                bounds[1] = bounds[1].min(y);
+                bounds[2] = bounds[2].max(x + 1);
+                bounds[3] = bounds[3].max(y + 1);
+            }
+        }
+    }
+    let (left, top, crop_h, crop_w) = if bounds[2] == 0 {
+        (0, 0, h, w)
+    } else {
+        let bh = bounds[3] - bounds[1];
+        let bw = bounds[2] - bounds[0];
+        let side = bh.max(bw);
+        (
+            bounds[0] as isize - ((side - bw) / 2) as isize,
+            bounds[1] as isize - ((side - bh) / 2) as isize,
+            side,
+            side,
+        )
+    };
+    let side = (crop_h.max(crop_w) as f64 * 1.2) as usize;
+    let size = side
+        .checked_mul(side)
+        .and_then(|n| n.checked_mul(3))
+        .context("prepared image extent overflow")?;
+    let mut out = vec![255; size];
+    let dx = (side - crop_w) / 2;
+    let dy = (side - crop_h) / 2;
+    for y in 0..crop_h {
+        for x in 0..crop_w {
+            let sx = left + x as isize;
+            let sy = top + y as isize;
+            if sx < 0 || sy < 0 || sx >= w as isize || sy >= h as isize {
+                continue;
+            }
+            let p = source(sx as usize, sy as usize);
+            let a = u32::from(p[3]);
+            for c in 0..3 {
+                out[((y + dy) * side + x + dx) * 3 + c] =
+                    ((u32::from(p[c]) * a + 255 * (255 - a) + 127) / 255) as u8;
+            }
+        }
+    }
+    Ok((out, [side, side]))
+}
+
+/// HWC F32 input to CHW F32 output; half-pixel coordinates and clamped edges.
+pub fn resize_bilinear_chw_f32(
+    input: &[f32],
+    shape: [usize; 3],
+    output: [usize; 2],
+) -> Result<Vec<f32>> {
+    let [height, width, channels] = shape;
+    let [oh, ow] = output;
+    ensure!(
+        height > 0
+            && width > 0
+            && channels > 0
+            && oh > 0
+            && ow > 0
+            && height
+                .checked_mul(width)
+                .and_then(|n| n.checked_mul(channels))
+                == Some(input.len())
+            && input.iter().all(|v| v.is_finite()),
+        "bilinear F32 input extent/value"
+    );
+    let count = oh
+        .checked_mul(ow)
+        .and_then(|n| n.checked_mul(channels))
+        .context("bilinear F32 output overflow")?;
+    let mut out = vec![0.0; count];
+    for y in 0..oh {
+        let sy = ((y as f32 + 0.5) * (height as f32 / oh as f32) - 0.5).max(0.0);
+        let iy = (sy as usize).min(height - 1);
+        let fy = sy - iy as f32;
+        let jy = (iy + 1).min(height - 1);
+        for x in 0..ow {
+            let sx = ((x as f32 + 0.5) * (width as f32 / ow as f32) - 0.5).max(0.0);
+            let ix = (sx as usize).min(width - 1);
+            let fx = sx - ix as f32;
+            let jx = (ix + 1).min(width - 1);
+            for c in 0..channels {
+                let at = |yy, xx| input[(yy * width + xx) * channels + c];
+                let a = at(iy, ix) * (1.0 - fx) + at(iy, jx) * fx;
+                let b = at(jy, ix) * (1.0 - fx) + at(jy, jx) * fx;
+                out[(c * oh + y) * ow + x] = a * (1.0 - fy) + b * fy;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// HWC F32 bicubic resize with coefficient -0.75 and half-pixel coordinates.
+pub fn resize_bicubic_hwc_f32(
+    input: &[f32],
+    shape: [usize; 3],
+    output: [usize; 2],
+) -> Result<Vec<f32>> {
+    let [height, width, channels] = shape;
+    let [oh, ow] = output;
+    ensure!(
+        height > 0
+            && width > 0
+            && channels > 0
+            && oh > 0
+            && ow > 0
+            && height
+                .checked_mul(width)
+                .and_then(|n| n.checked_mul(channels))
+                == Some(input.len())
+            && input.iter().all(|v| v.is_finite()),
+        "bicubic F32 input extent/value"
+    );
+    let count = oh
+        .checked_mul(ow)
+        .and_then(|n| n.checked_mul(channels))
+        .context("bicubic F32 output overflow")?;
+    let coefficient = |v: f32| {
+        let x = v.abs();
+        if x <= 1.0 {
+            (1.25 * x - 2.25) * x * x + 1.0
+        } else if x < 2.0 {
+            ((-0.75 * x + 3.75) * x - 6.0) * x + 3.0
+        } else {
+            0.0
+        }
+    };
+    let mut out = vec![0.0; count];
+    for y in 0..oh {
+        let sy = (y as f32 + 0.5) * (height as f32 / oh as f32) - 0.5;
+        let iy = sy.floor() as isize;
+        let wy: [f32; 4] = std::array::from_fn(|i| coefficient(sy - (iy + i as isize - 1) as f32));
+        for x in 0..ow {
+            let sx = (x as f32 + 0.5) * (width as f32 / ow as f32) - 0.5;
+            let ix = sx.floor() as isize;
+            let wx: [f32; 4] =
+                std::array::from_fn(|i| coefficient(sx - (ix + i as isize - 1) as f32));
+            for c in 0..channels {
+                let mut value = 0.0;
+                for (j, &cy) in wy.iter().enumerate() {
+                    let yy = (iy + j as isize - 1).clamp(0, height as isize - 1) as usize;
+                    let mut row = 0.0;
+                    for (i, &cx) in wx.iter().enumerate() {
+                        let xx = (ix + i as isize - 1).clamp(0, width as isize - 1) as usize;
+                        row += input[(yy * width + xx) * channels + c] * cx;
+                    }
+                    value += row * cy;
+                }
+                out[(y * ow + x) * channels + c] = value;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Alpha>204 bounding box, 1.1 square crop, transparent padding and black composite.
 pub fn rgba_foreground_crop(
     input: &[u8],
@@ -1771,6 +1964,171 @@ pub fn rgba_foreground_crop(
 #[cfg(test)]
 mod resampling_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "CPU definition fixtures; set FF_HI3D_IMAGE_FIXTURES"]
+    fn hi3d_preparation_matches_definition() -> Result<()> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("FF_HI3D_IMAGE_FIXTURES").context("FF_HI3D_IMAGE_FIXTURES")?,
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        ensure!(
+            frozen["scope"] == "encoder62_preparation37"
+                && frozen["preparation"]
+                    .as_object()
+                    .is_some_and(|v| v.len() == 37),
+            "complete preparation freeze required before candidate"
+        );
+        let source_bytes = std::fs::read(root.join("cpu-r2/inputs.safetensors"))?;
+        let source = safetensors::SafeTensors::deserialize(&source_bytes)?;
+        let anchor_bytes = std::fs::read(root.join("preparation-anchor.safetensors"))?;
+        let anchor = safetensors::SafeTensors::deserialize(&anchor_bytes)?;
+        let rows: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("selected-rows.json"))?)?;
+        let read_f32 = |t: safetensors::tensor::TensorView<'_>| -> Result<Vec<f32>> {
+            ensure!(
+                t.dtype() == safetensors::Dtype::F32,
+                "preparation tensor dtype"
+            );
+            Ok(t.data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect())
+        };
+        let score = |name: &str, actual: &[f32], control: bool| -> Result<usize> {
+            let mut defects = 0;
+            let expected = read_f32(anchor.tensor(name)?)?;
+            ensure!(
+                expected.len() == actual.len() && actual.iter().all(|v| v.is_finite()),
+                "preparation numeric extent/value"
+            );
+            let (max, sum) =
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .fold((0f64, 0f64), |(max, sum), (&a, &b)| {
+                        let d = f64::from(a) - f64::from(b);
+                        (max.max(d.abs()), sum + d * d)
+                    });
+            for (metric, value) in [
+                ("max_abs", max),
+                ("rmse", (sum / actual.len() as f64).sqrt()),
+            ] {
+                let bound = frozen["preparation"][name]["bounds"][metric]
+                    .as_f64()
+                    .context("preparation frozen bound missing")?;
+                let defect = if control {
+                    value <= 10.0 * bound
+                } else {
+                    value > bound
+                };
+                defects += usize::from(defect);
+                println!(
+                    "N5_M2A_PREPARATION cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                    if defect { "DEFECT" } else { "PASS" }
+                );
+            }
+            Ok(defects)
+        };
+        let mut defects = 0;
+        let mut cases = 0;
+        for name in anchor
+            .names()
+            .into_iter()
+            .filter_map(|s| s.strip_suffix(".prepared"))
+        {
+            let rgba = source.tensor(&format!("{name}.rgba"))?;
+            let orientation = source.tensor(&format!("{name}.orientation"))?;
+            let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
+            let (rgb, shape) =
+                prepare_rgba_white(rgba.data(), [rgba.shape()[0], rgba.shape()[1]], orientation)?;
+            let expected = anchor.tensor(&format!("{name}.prepared"))?;
+            ensure!(
+                shape == expected.shape()[..2] && rgb.len() == expected.data().len(),
+                "definition prepared extent mismatch {name}"
+            );
+            let mismatches = rgb
+                .iter()
+                .zip(expected.data())
+                .filter(|(a, b)| a != b)
+                .count();
+            defects += usize::from(mismatches > 0);
+            println!("N5_M2A_PREPARATION_EXACT cell={name}.prepared mismatches={mismatches}");
+            let lanczos = crate::serve::image::resize_lanczos(
+                &rgb,
+                [shape[0], shape[1], 3],
+                [224, 224],
+                crate::serve::image::ResizeRounding::Fixed22,
+            )?;
+            let expected = anchor.tensor(&format!("{name}.lanczos"))?;
+            ensure!(
+                lanczos.len() == expected.data().len(),
+                "definition Lanczos extent mismatch"
+            );
+            let mismatches = lanczos
+                .iter()
+                .zip(expected.data())
+                .filter(|(a, b)| a != b)
+                .count();
+            defects += usize::from(mismatches > 0);
+            println!("N5_M2A_PREPARATION_EXACT cell={name}.lanczos mismatches={mismatches}");
+            let values = rgb
+                .iter()
+                .map(|&x| f32::from(x) / 255.0)
+                .collect::<Vec<_>>();
+            let values = resize_bilinear_chw_f32(&values, [shape[0], shape[1], 3], [756, 756])?;
+            let key = format!("{name}.bilinear");
+            let ids = rows[&key]
+                .as_array()
+                .context("bilinear sample rows missing")?;
+            let selected = |swap: bool| -> Result<Vec<f32>> {
+                let mut out = Vec::with_capacity(ids.len() * 3);
+                for id in ids {
+                    let id = usize::try_from(id.as_u64().context("bilinear sample row")?)?;
+                    let index = if swap { id % 756 * 756 + id / 756 } else { id };
+                    for c in 0..3 {
+                        out.push(values[c * 756 * 756 + index]);
+                    }
+                }
+                Ok(out)
+            };
+            defects += score(&key, &selected(false)?, false)?;
+            if frozen["preparation"][&key]["control"]["affected"] == true {
+                defects += score(&key, &selected(true)?, true)?;
+            }
+            cases += 1;
+        }
+        let position = read_f32(source.tensor("position.source")?)?;
+        let resized = resize_bicubic_hwc_f32(&position[1024..], [37, 37, 1024], [54, 54])?;
+        let mut selected = [Vec::new(), Vec::new()];
+        for id in rows["position.bicubic"]
+            .as_array()
+            .context("position sample rows missing")?
+        {
+            let id = usize::try_from(id.as_u64().context("position sample row")?)?;
+            for (swap, out) in selected.iter_mut().enumerate() {
+                let index = if swap == 0 {
+                    id
+                } else {
+                    id % 54 * 54 + id / 54
+                };
+                out.extend_from_slice(&resized[index * 1024..(index + 1) * 1024]);
+            }
+        }
+        defects += score("position.bicubic", &selected[0], false)?;
+        defects += score("position.bicubic", &selected[1], true)?;
+        ensure!(cases == 12, "preparation cases unexecuted");
+        println!(
+            "N5_M2A_PREPARATION {} cases={cases} defects={defects} prepared_and_lanczos=exact_comparison spatial_lookup_control=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "finite preparation candidate defects");
+        Ok(())
+    }
+
     #[test]
     #[ignore = "CPU publisher RGBA/Lanczos fixtures; set FF_P1_M2_ROOT"]
     fn pixal_preprocessing_matches_publisher_bytes() -> Result<()> {
