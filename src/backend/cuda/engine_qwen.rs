@@ -3352,8 +3352,9 @@ impl Engine {
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
             "HIP hybrid setup requires MiniCPM-V-4.7, Qwen3.8, Flint, Gemma 4 or GLM-5.3 with BF16 KV and no persistent prefix cache"
         );
+        let glm = model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
         ensure!(
-            model_spec.moe.is_none() || !reserve_mtp,
+            model_spec.moe.is_none() || !reserve_mtp || glm,
             "MoE MTP attachment is not bound: architecture={:?}",
             model_spec.architecture
         );
@@ -3363,7 +3364,6 @@ impl Engine {
         );
         let started = Instant::now();
         let flint = model_spec.architecture == crate::model_spec::Architecture::Flint;
-        let glm = model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
         let gemma = matches!(
             model_spec.architecture,
             crate::model_spec::Architecture::Gemma4
@@ -3570,6 +3570,13 @@ impl Engine {
                 )?
             } else if prefix_cache {
                 WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
+            } else if reserve_mtp && glm {
+                WeightCatalog::load_with_policy(
+                    dir,
+                    &model_spec,
+                    &device,
+                    crate::checkpoint::LoadPolicy::TextWithMtp,
+                )?
             } else {
                 WeightCatalog::load(dir, &model_spec, &device)?
             };
@@ -3702,7 +3709,11 @@ impl Engine {
         let native_budget = if glm {
             let route_handle_bytes =
                 crate::backend::cuda::moe::route::blas_handle_bytes(&device.ctx, s)?;
-            let layers = crate::experts::catalogue::ExpertGeometry::from_model(&model_spec)?.layers;
+            let layers = crate::experts::catalogue::ExpertGeometry::from_model_and_manifest(
+                &model_spec,
+                &catalog.manifest,
+            )?
+            .layers;
             let native_request = crate::prefill::WorkspaceRequest {
                 capacity: capacity.min(crate::linear_plan::MAX_SKINNY_ROWS),
                 alignment: 1,

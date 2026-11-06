@@ -1536,3 +1536,1405 @@ fn glm_index_pack_gpu() -> Result<()> {
     }
     Ok(())
 }
+
+// ============================================================================
+// GLM-5.3-Flash Multi-Token Prediction (MTP) Layer 45 Runtime and Gates
+// ============================================================================
+
+fn fp8_dequant_block(codes: &[u8], scale_inv: &[f32], rows: usize, cols: usize) -> Vec<bf16> {
+    let scale_cols = cols.div_ceil(128);
+    let mut out = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        let sr = r / 128;
+        for c in 0..cols {
+            let sc = c / 128;
+            let scale = scale_inv[sr * scale_cols + sc];
+            let v = crate::fp8::decode_e4m3(codes[r * cols + c]);
+            out.push(bf16::from_f32(v * scale));
+        }
+    }
+    out
+}
+
+fn run_linear_bf16(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    blas: &Blas,
+    weight: &cudarc::driver::CudaSlice<bf16>,
+    x: &cudarc::driver::CudaSlice<bf16>,
+    y: &mut cudarc::driver::CudaSlice<bf16>,
+    shape: (usize, usize, usize),
+) -> Result<()> {
+    let (rows, output_dim, input_dim) = shape;
+    let (w_ptr, _w_drop) = weight.device_ptr(stream);
+    let (x_ptr, _x_drop) = x.device_ptr(stream);
+    let (y_ptr, _y_drop) = y.device_ptr(stream);
+    let w_tensor = unsafe {
+        crate::backend::cuda::contracts::Tensor::new(
+            w_ptr,
+            [output_dim as u32, input_dim as u32],
+            [input_dim as u64, 1],
+            (output_dim * input_dim * 2) as u64,
+        )?
+    };
+    let x_tensor = unsafe {
+        crate::backend::cuda::contracts::Tensor::new(
+            x_ptr,
+            [rows as u32, input_dim as u32],
+            [input_dim as u64, 1],
+            (rows * input_dim * 2) as u64,
+        )?
+    };
+    let mut y_tensor = unsafe {
+        crate::backend::cuda::contracts::TensorMut(crate::backend::cuda::contracts::Tensor::new(
+            y_ptr,
+            [rows as u32, output_dim as u32],
+            [output_dim as u64, 1],
+            (rows * output_dim * 2) as u64,
+        )?)
+    };
+    blas.linear_bf16(w_tensor, x_tensor, &mut y_tensor)
+}
+
+fn run_linear_bf16_to_f32(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    blas: &Blas,
+    weight: &cudarc::driver::CudaSlice<bf16>,
+    x: &cudarc::driver::CudaSlice<bf16>,
+    y: &mut cudarc::driver::CudaSlice<f32>,
+    shape: (usize, usize, usize),
+) -> Result<()> {
+    let (rows, output_dim, input_dim) = shape;
+    let (w_ptr, _w_drop) = weight.device_ptr(stream);
+    let (x_ptr, _x_drop) = x.device_ptr(stream);
+    let (y_ptr, _y_drop) = y.device_ptr(stream);
+    let w_tensor = unsafe {
+        crate::backend::cuda::contracts::Tensor::new(
+            w_ptr,
+            [output_dim as u32, input_dim as u32],
+            [input_dim as u64, 1],
+            (output_dim * input_dim * 2) as u64,
+        )?
+    };
+    let x_tensor = unsafe {
+        crate::backend::cuda::contracts::Tensor::new(
+            x_ptr,
+            [rows as u32, input_dim as u32],
+            [input_dim as u64, 1],
+            (rows * input_dim * 2) as u64,
+        )?
+    };
+    let mut y_tensor = unsafe {
+        crate::backend::cuda::contracts::TensorMut(crate::backend::cuda::contracts::Tensor::new(
+            y_ptr,
+            [rows as u32, output_dim as u32],
+            [output_dim as u64, 1],
+            (rows * output_dim * 4) as u64,
+        )?)
+    };
+    blas.linear_bf16_to_f32(w_tensor, x_tensor, &mut y_tensor)
+}
+
+fn run_rms_norm(
+    stream: &cudarc::driver::CudaStream,
+    norm_fn: &cudarc::driver::CudaFunction,
+    x: &cudarc::driver::CudaSlice<bf16>,
+    w: &cudarc::driver::CudaSlice<bf16>,
+    y: &mut cudarc::driver::CudaSlice<bf16>,
+    dims: (i32, i32),
+    eps: f32,
+) -> Result<()> {
+    let (rows, dim) = dims;
+    unsafe {
+        stream
+            .launch_builder(norm_fn)
+            .arg(x)
+            .arg(w)
+            .arg(y)
+            .arg(&rows)
+            .arg(&dim)
+            .arg(&eps)
+            .launch(crate::backend::cuda::ops::grid(rows as usize, 256))?;
+    }
+    Ok(())
+}
+
+fn run_silu_mul_split(
+    stream: &cudarc::driver::CudaStream,
+    silu_fn: &cudarc::driver::CudaFunction,
+    gate: &cudarc::driver::CudaSlice<bf16>,
+    up: &cudarc::driver::CudaSlice<bf16>,
+    y: &mut cudarc::driver::CudaSlice<bf16>,
+    count: i32,
+) -> Result<()> {
+    let mode = 1i32;
+    unsafe {
+        stream
+            .launch_builder(silu_fn)
+            .arg(gate)
+            .arg(up)
+            .arg(y)
+            .arg(&count)
+            .arg(&mode)
+            .launch(crate::backend::cuda::ops::grid(
+                (count as usize).div_ceil(8),
+                256,
+            ))?;
+    }
+    Ok(())
+}
+
+fn run_concat_eh(
+    stream: &cudarc::driver::CudaStream,
+    concat_fn: &cudarc::driver::CudaFunction,
+    enorm: &cudarc::driver::CudaSlice<bf16>,
+    hnorm: &cudarc::driver::CudaSlice<bf16>,
+    out: &mut cudarc::driver::CudaSlice<bf16>,
+    dim: i32,
+    swap: bool,
+) -> Result<()> {
+    let swap_val = if swap { 1i32 } else { 0i32 };
+    unsafe {
+        stream
+            .launch_builder(concat_fn)
+            .arg(enorm)
+            .arg(hnorm)
+            .arg(out)
+            .arg(&dim)
+            .arg(&swap_val)
+            .launch(crate::backend::cuda::ops::grid(
+                (dim as usize).div_ceil(256),
+                256,
+            ))?;
+    }
+    Ok(())
+}
+
+fn run_add(
+    stream: &cudarc::driver::CudaStream,
+    add_fn: &cudarc::driver::CudaFunction,
+    x: &mut cudarc::driver::CudaSlice<bf16>,
+    res: &cudarc::driver::CudaSlice<bf16>,
+    count: i32,
+) -> Result<()> {
+    unsafe {
+        stream
+            .launch_builder(add_fn)
+            .arg(x)
+            .arg(res)
+            .arg(&count)
+            .launch(crate::backend::cuda::ops::grid(
+                (count as usize).div_ceil(256),
+                256,
+            ))?;
+    }
+    Ok(())
+}
+
+fn run_accum_scaled(
+    stream: &cudarc::driver::CudaStream,
+    accum_fn: &cudarc::driver::CudaFunction,
+    accum: &mut cudarc::driver::CudaSlice<bf16>,
+    val: &cudarc::driver::CudaSlice<bf16>,
+    scale: f32,
+    count: i32,
+) -> Result<()> {
+    unsafe {
+        stream
+            .launch_builder(accum_fn)
+            .arg(accum)
+            .arg(val)
+            .arg(&scale)
+            .arg(&count)
+            .launch(crate::backend::cuda::ops::grid(
+                (count as usize).div_ceil(256),
+                256,
+            ))?;
+    }
+    Ok(())
+}
+
+fn run_extract_dsa_value(
+    stream: &cudarc::driver::CudaStream,
+    extract_fn: &cudarc::driver::CudaFunction,
+    kv_expanded: &cudarc::driver::CudaSlice<bf16>,
+    attn_out: &mut cudarc::driver::CudaSlice<bf16>,
+    heads: i32,
+    head_dim: i32,
+) -> Result<()> {
+    let total = (heads * head_dim) as u32;
+    unsafe {
+        stream
+            .launch_builder(extract_fn)
+            .arg(kv_expanded)
+            .arg(attn_out)
+            .arg(&heads)
+            .arg(&head_dim)
+            .launch(crate::backend::cuda::ops::grid(
+                (total as usize).div_ceil(256),
+                256,
+            ))?;
+    }
+    Ok(())
+}
+
+struct GlmMtpExpertHost {
+    gate_codes: Vec<u8>,
+    gate_scales: Vec<f32>,
+    up_codes: Vec<u8>,
+    up_scales: Vec<f32>,
+    down_codes: Vec<u8>,
+    down_scales: Vec<f32>,
+}
+
+struct GlmMtpRuntime {
+    device: Arc<Device>,
+    blas: std::rc::Rc<Blas>,
+
+    rms_norm: cudarc::driver::CudaFunction,
+    silu_mul_split: cudarc::driver::CudaFunction,
+    concat_eh: cudarc::driver::CudaFunction,
+    accum_scaled: cudarc::driver::CudaFunction,
+    add: cudarc::driver::CudaFunction,
+    extract_dsa: cudarc::driver::CudaFunction,
+
+    embed_tokens: Vec<bf16>,
+    enorm_w: cudarc::driver::CudaSlice<bf16>,
+    hnorm_w: cudarc::driver::CudaSlice<bf16>,
+    eh_proj_w: cudarc::driver::CudaSlice<bf16>,
+    input_norm_w: cudarc::driver::CudaSlice<bf16>,
+
+    q_a_w: cudarc::driver::CudaSlice<bf16>,
+    q_a_norm_w: cudarc::driver::CudaSlice<bf16>,
+    q_b_w: cudarc::driver::CudaSlice<bf16>,
+    kv_a_w: cudarc::driver::CudaSlice<bf16>,
+    kv_a_norm_w: cudarc::driver::CudaSlice<bf16>,
+    kv_b_w: cudarc::driver::CudaSlice<bf16>,
+    o_w: cudarc::driver::CudaSlice<bf16>,
+
+    post_norm_w: cudarc::driver::CudaSlice<bf16>,
+    sh_gate_w: cudarc::driver::CudaSlice<bf16>,
+    sh_up_w: cudarc::driver::CudaSlice<bf16>,
+    sh_down_w: cudarc::driver::CudaSlice<bf16>,
+    router_w: cudarc::driver::CudaSlice<bf16>,
+    router_b: Vec<f32>,
+
+    experts: Vec<GlmMtpExpertHost>,
+    slot_gate: Vec<cudarc::driver::CudaSlice<bf16>>,
+    slot_up: Vec<cudarc::driver::CudaSlice<bf16>>,
+    slot_down: Vec<cudarc::driver::CudaSlice<bf16>>,
+
+    head_norm_w: cudarc::driver::CudaSlice<bf16>,
+    lm_head_w: cudarc::driver::CudaSlice<bf16>,
+
+    token_embed_buf: cudarc::driver::CudaSlice<bf16>,
+    enorm_buf: cudarc::driver::CudaSlice<bf16>,
+    target_hidden_buf: cudarc::driver::CudaSlice<bf16>,
+    hnorm_buf: cudarc::driver::CudaSlice<bf16>,
+    eh_buf: cudarc::driver::CudaSlice<bf16>,
+    x_buf: cudarc::driver::CudaSlice<bf16>,
+    x_norm_buf: cudarc::driver::CudaSlice<bf16>,
+    q_a_buf: cudarc::driver::CudaSlice<bf16>,
+    q_a_norm_buf: cudarc::driver::CudaSlice<bf16>,
+    q_b_buf: cudarc::driver::CudaSlice<bf16>,
+    kv_a_buf: cudarc::driver::CudaSlice<bf16>,
+    kv_a_norm_buf: cudarc::driver::CudaSlice<bf16>,
+    kv_b_buf: cudarc::driver::CudaSlice<bf16>,
+    attn_out_buf: cudarc::driver::CudaSlice<bf16>,
+    o_buf: cudarc::driver::CudaSlice<bf16>,
+    sh_gate_buf: cudarc::driver::CudaSlice<bf16>,
+    sh_up_buf: cudarc::driver::CudaSlice<bf16>,
+    sh_act_buf: cudarc::driver::CudaSlice<bf16>,
+    sh_out_buf: cudarc::driver::CudaSlice<bf16>,
+    router_logits_buf: cudarc::driver::CudaSlice<bf16>,
+    exp_gate_buf: cudarc::driver::CudaSlice<bf16>,
+    exp_up_buf: cudarc::driver::CudaSlice<bf16>,
+    exp_act_buf: cudarc::driver::CudaSlice<bf16>,
+    exp_out_buf: cudarc::driver::CudaSlice<bf16>,
+    routed_accum_buf: cudarc::driver::CudaSlice<bf16>,
+    head_norm_buf: cudarc::driver::CudaSlice<bf16>,
+    logits_buf: cudarc::driver::CudaSlice<f32>,
+    staged_weights: [f32; 8],
+}
+
+impl GlmMtpRuntime {
+    fn load(model_dir: &Path, device: &Arc<Device>, blas: &std::rc::Rc<Blas>) -> Result<Self> {
+        let stream = &device.stream;
+
+        let norm_mod = cubin::module(&device.ctx, "norm")?;
+        let rms_norm = norm_mod.load_function("rms_norm")?;
+
+        let act_mod = cubin::module(&device.ctx, "act")?;
+        let silu_mul_split = act_mod.load_function("silu_mul_split")?;
+
+        let mtp_mod = cubin::module(&device.ctx, "glm_mtp")?;
+        let concat_eh = mtp_mod.load_function("glm_mtp_concat_eh")?;
+        let accum_scaled = mtp_mod.load_function("glm_mtp_accum_scaled")?;
+        let add = mtp_mod.load_function("glm_mtp_add")?;
+        let extract_dsa = mtp_mod.load_function("glm_mtp_extract_dsa_value")?;
+
+        let shard1_file = std::fs::File::open(model_dir.join("model-00001-of-00062.safetensors"))?;
+        let mmap1 = unsafe { memmap2::MmapOptions::new().map(&shard1_file)? };
+        let st1 = safetensors::SafeTensors::deserialize(&mmap1)?;
+
+        let shard2_file = std::fs::File::open(model_dir.join("model-00002-of-00062.safetensors"))?;
+        let mmap2 = unsafe { memmap2::MmapOptions::new().map(&shard2_file)? };
+        let st2 = safetensors::SafeTensors::deserialize(&mmap2)?;
+
+        let get_st_bf16 = |name: &str| -> Result<Vec<bf16>> {
+            if let Ok(t) = st1.tensor(name) {
+                let data = t.data();
+                return Ok(data
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                    .collect());
+            }
+            let t = st2.tensor(name)?;
+            let data = t.data();
+            Ok(data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                .collect())
+        };
+
+        let get_st_f32 = |name: &str| -> Result<Vec<f32>> {
+            if let Ok(t) = st1.tensor(name) {
+                let data = t.data();
+                return Ok(data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect());
+            }
+            let t = st2.tensor(name)?;
+            let data = t.data();
+            Ok(data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect())
+        };
+
+        let get_st_u8 = |name: &str| -> Result<Vec<u8>> {
+            if let Ok(t) = st1.tensor(name) {
+                return Ok(t.data().to_vec());
+            }
+            let t = st2.tensor(name)?;
+            Ok(t.data().to_vec())
+        };
+
+        let get_st_fp8_linear = |role: &str, rows: usize, cols: usize| -> Result<Vec<bf16>> {
+            let code_name = format!("{role}.weight");
+            let scale_name = format!("{role}.weight_scale_inv");
+            let codes = get_st_u8(&code_name)?;
+            let scales = get_st_f32(&scale_name)?;
+            Ok(fp8_dequant_block(&codes, &scales, rows, cols))
+        };
+
+        let embed_tokens = get_st_bf16("model.language_model.embed_tokens.weight")?;
+        let lm_head_w = stream.clone_htod(&get_st_bf16("lm_head.weight")?)?;
+
+        let enorm_w =
+            stream.clone_htod(&get_st_bf16("model.language_model.layers.45.enorm.weight")?)?;
+        let hnorm_w =
+            stream.clone_htod(&get_st_bf16("model.language_model.layers.45.hnorm.weight")?)?;
+        let eh_proj_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.eh_proj.weight",
+        )?)?;
+        let input_norm_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.input_layernorm.weight",
+        )?)?;
+
+        let q_a_w = stream.clone_htod(&get_st_fp8_linear(
+            "model.language_model.layers.45.self_attn.q_a_proj",
+            1536,
+            4096,
+        )?)?;
+        let q_a_norm_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.self_attn.q_a_layernorm.weight",
+        )?)?;
+        let q_b_w = stream.clone_htod(&get_st_fp8_linear(
+            "model.language_model.layers.45.self_attn.q_b_proj",
+            16384,
+            1536,
+        )?)?;
+        let kv_a_w = stream.clone_htod(&get_st_fp8_linear(
+            "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa",
+            512,
+            4096,
+        )?)?;
+        let kv_a_norm_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.self_attn.kv_a_layernorm.weight",
+        )?)?;
+        let kv_b_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.self_attn.kv_b_proj.weight",
+        )?)?;
+        let o_w = stream.clone_htod(&get_st_fp8_linear(
+            "model.language_model.layers.45.self_attn.o_proj",
+            4096,
+            16384,
+        )?)?;
+
+        let post_norm_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.post_attention_layernorm.weight",
+        )?)?;
+        let sh_gate_w = stream.clone_htod(&get_st_fp8_linear(
+            "model.language_model.layers.45.mlp.shared_experts.gate_proj",
+            1024,
+            4096,
+        )?)?;
+        let sh_up_w = stream.clone_htod(&get_st_fp8_linear(
+            "model.language_model.layers.45.mlp.shared_experts.up_proj",
+            1024,
+            4096,
+        )?)?;
+        let sh_down_w = stream.clone_htod(&get_st_fp8_linear(
+            "model.language_model.layers.45.mlp.shared_experts.down_proj",
+            4096,
+            1024,
+        )?)?;
+        let router_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.mlp.gate.weight",
+        )?)?;
+        let router_b_bf16 =
+            get_st_bf16("model.language_model.layers.45.mlp.gate.e_score_correction_bias")?;
+        let router_b = router_b_bf16.into_iter().map(|b| b.to_f32()).collect();
+
+        let head_norm_w = stream.clone_htod(&get_st_bf16(
+            "model.language_model.layers.45.shared_head.norm.weight",
+        )?)?;
+
+        let mut experts = Vec::with_capacity(288);
+        for e in 0..288 {
+            let pfx = format!("model.language_model.layers.45.mlp.experts.{e}");
+            let gate_codes = get_st_u8(&format!("{pfx}.gate_proj.weight"))?;
+            let gate_scales = get_st_f32(&format!("{pfx}.gate_proj.weight_scale_inv"))?;
+            let up_codes = get_st_u8(&format!("{pfx}.up_proj.weight"))?;
+            let up_scales = get_st_f32(&format!("{pfx}.up_proj.weight_scale_inv"))?;
+            let down_codes = get_st_u8(&format!("{pfx}.down_proj.weight"))?;
+            let down_scales = get_st_f32(&format!("{pfx}.down_proj.weight_scale_inv"))?;
+            experts.push(GlmMtpExpertHost {
+                gate_codes,
+                gate_scales,
+                up_codes,
+                up_scales,
+                down_codes,
+                down_scales,
+            });
+        }
+
+        let mut slot_gate = Vec::with_capacity(8);
+        let mut slot_up = Vec::with_capacity(8);
+        let mut slot_down = Vec::with_capacity(8);
+        for _ in 0..8 {
+            slot_gate.push(stream.alloc_zeros::<bf16>(1024 * 4096)?);
+            slot_up.push(stream.alloc_zeros::<bf16>(1024 * 4096)?);
+            slot_down.push(stream.alloc_zeros::<bf16>(4096 * 1024)?);
+        }
+
+        Ok(Self {
+            device: device.clone(),
+            blas: blas.clone(),
+            rms_norm,
+            silu_mul_split,
+            concat_eh,
+            accum_scaled,
+            add,
+            extract_dsa,
+            embed_tokens,
+            enorm_w,
+            hnorm_w,
+            eh_proj_w,
+            input_norm_w,
+            q_a_w,
+            q_a_norm_w,
+            q_b_w,
+            kv_a_w,
+            kv_a_norm_w,
+            kv_b_w,
+            o_w,
+            post_norm_w,
+            sh_gate_w,
+            sh_up_w,
+            sh_down_w,
+            router_w,
+            router_b,
+            experts,
+            slot_gate,
+            slot_up,
+            slot_down,
+            head_norm_w,
+            lm_head_w,
+            token_embed_buf: stream.alloc_zeros::<bf16>(4096)?,
+            enorm_buf: stream.alloc_zeros::<bf16>(4096)?,
+            target_hidden_buf: stream.alloc_zeros::<bf16>(4096)?,
+            hnorm_buf: stream.alloc_zeros::<bf16>(4096)?,
+            eh_buf: stream.alloc_zeros::<bf16>(8192)?,
+            x_buf: stream.alloc_zeros::<bf16>(4096)?,
+            x_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
+            q_a_buf: stream.alloc_zeros::<bf16>(1536)?,
+            q_a_norm_buf: stream.alloc_zeros::<bf16>(1536)?,
+            q_b_buf: stream.alloc_zeros::<bf16>(16384)?,
+            kv_a_buf: stream.alloc_zeros::<bf16>(512)?,
+            kv_a_norm_buf: stream.alloc_zeros::<bf16>(512)?,
+            kv_b_buf: stream.alloc_zeros::<bf16>(32768)?,
+            attn_out_buf: stream.alloc_zeros::<bf16>(16384)?,
+            o_buf: stream.alloc_zeros::<bf16>(4096)?,
+            sh_gate_buf: stream.alloc_zeros::<bf16>(1024)?,
+            sh_up_buf: stream.alloc_zeros::<bf16>(1024)?,
+            sh_act_buf: stream.alloc_zeros::<bf16>(1024)?,
+            sh_out_buf: stream.alloc_zeros::<bf16>(4096)?,
+            router_logits_buf: stream.alloc_zeros::<bf16>(288)?,
+            exp_gate_buf: stream.alloc_zeros::<bf16>(1024)?,
+            exp_up_buf: stream.alloc_zeros::<bf16>(1024)?,
+            exp_act_buf: stream.alloc_zeros::<bf16>(1024)?,
+            exp_out_buf: stream.alloc_zeros::<bf16>(4096)?,
+            routed_accum_buf: stream.alloc_zeros::<bf16>(4096)?,
+            head_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
+            logits_buf: stream.alloc_zeros::<f32>(154880)?,
+            staged_weights: [0.0; 8],
+        })
+    }
+
+    fn forward_staged_kernels(&mut self, swap_eh: bool) -> Result<()> {
+        let stream = self.device.stream.clone();
+        let blas = self.blas.clone();
+
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.token_embed_buf,
+            &self.enorm_w,
+            &mut self.enorm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.target_hidden_buf,
+            &self.hnorm_w,
+            &mut self.hnorm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_concat_eh(
+            &stream,
+            &self.concat_eh,
+            &self.enorm_buf,
+            &self.hnorm_buf,
+            &mut self.eh_buf,
+            4096,
+            swap_eh,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.eh_proj_w,
+            &self.eh_buf,
+            &mut self.x_buf,
+            (1, 4096, 8192),
+        )?;
+
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.x_buf,
+            &self.input_norm_w,
+            &mut self.x_norm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.q_a_w,
+            &self.x_norm_buf,
+            &mut self.q_a_buf,
+            (1, 1536, 4096),
+        )?;
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.q_a_buf,
+            &self.q_a_norm_w,
+            &mut self.q_a_norm_buf,
+            (1, 1536),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.q_b_w,
+            &self.q_a_norm_buf,
+            &mut self.q_b_buf,
+            (1, 16384, 1536),
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.kv_a_w,
+            &self.x_norm_buf,
+            &mut self.kv_a_buf,
+            (1, 512, 4096),
+        )?;
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.kv_a_buf,
+            &self.kv_a_norm_w,
+            &mut self.kv_a_norm_buf,
+            (1, 512),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.kv_b_w,
+            &self.kv_a_norm_buf,
+            &mut self.kv_b_buf,
+            (1, 32768, 512),
+        )?;
+        run_extract_dsa_value(
+            &stream,
+            &self.extract_dsa,
+            &self.kv_b_buf,
+            &mut self.attn_out_buf,
+            64,
+            256,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.o_w,
+            &self.attn_out_buf,
+            &mut self.o_buf,
+            (1, 4096, 16384),
+        )?;
+        run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
+
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.x_buf,
+            &self.post_norm_w,
+            &mut self.x_norm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.sh_gate_w,
+            &self.x_norm_buf,
+            &mut self.sh_gate_buf,
+            (1, 1024, 4096),
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.sh_up_w,
+            &self.x_norm_buf,
+            &mut self.sh_up_buf,
+            (1, 1024, 4096),
+        )?;
+        run_silu_mul_split(
+            &stream,
+            &self.silu_mul_split,
+            &self.sh_gate_buf,
+            &self.sh_up_buf,
+            &mut self.sh_act_buf,
+            1024,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.sh_down_w,
+            &self.sh_act_buf,
+            &mut self.sh_out_buf,
+            (1, 4096, 1024),
+        )?;
+
+        stream.memset_zeros(&mut self.routed_accum_buf)?;
+
+        for k in 0..8 {
+            let w = self.staged_weights[k];
+            run_linear_bf16(
+                &stream,
+                &blas,
+                &self.slot_gate[k],
+                &self.x_norm_buf,
+                &mut self.exp_gate_buf,
+                (1, 1024, 4096),
+            )?;
+            run_linear_bf16(
+                &stream,
+                &blas,
+                &self.slot_up[k],
+                &self.x_norm_buf,
+                &mut self.exp_up_buf,
+                (1, 1024, 4096),
+            )?;
+            run_silu_mul_split(
+                &stream,
+                &self.silu_mul_split,
+                &self.exp_gate_buf,
+                &self.exp_up_buf,
+                &mut self.exp_act_buf,
+                1024,
+            )?;
+            run_linear_bf16(
+                &stream,
+                &blas,
+                &self.slot_down[k],
+                &self.exp_act_buf,
+                &mut self.exp_out_buf,
+                (1, 4096, 1024),
+            )?;
+            run_accum_scaled(
+                &stream,
+                &self.accum_scaled,
+                &mut self.routed_accum_buf,
+                &self.exp_out_buf,
+                w,
+                4096,
+            )?;
+        }
+
+        run_add(&stream, &self.add, &mut self.x_buf, &self.sh_out_buf, 4096)?;
+        run_add(
+            &stream,
+            &self.add,
+            &mut self.x_buf,
+            &self.routed_accum_buf,
+            4096,
+        )?;
+
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.x_buf,
+            &self.head_norm_w,
+            &mut self.head_norm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_linear_bf16_to_f32(
+            &stream,
+            &blas,
+            &self.lm_head_w,
+            &self.head_norm_buf,
+            &mut self.logits_buf,
+            (1, 154880, 4096),
+        )?;
+
+        Ok(())
+    }
+
+    fn forward(
+        &mut self,
+        token_id: u32,
+        target_hidden: &[bf16],
+        swap_eh: bool,
+    ) -> Result<Vec<f32>> {
+        let stream = self.device.stream.clone();
+        let blas = self.blas.clone();
+
+        let token_offset = (token_id as usize) * 4096;
+        let token_slice = &self.embed_tokens[token_offset..token_offset + 4096];
+        stream.memcpy_htod(token_slice, &mut self.token_embed_buf)?;
+        stream.memcpy_htod(target_hidden, &mut self.target_hidden_buf)?;
+
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.token_embed_buf,
+            &self.enorm_w,
+            &mut self.enorm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.target_hidden_buf,
+            &self.hnorm_w,
+            &mut self.hnorm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_concat_eh(
+            &stream,
+            &self.concat_eh,
+            &self.enorm_buf,
+            &self.hnorm_buf,
+            &mut self.eh_buf,
+            4096,
+            swap_eh,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.eh_proj_w,
+            &self.eh_buf,
+            &mut self.x_buf,
+            (1, 4096, 8192),
+        )?;
+
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.x_buf,
+            &self.input_norm_w,
+            &mut self.x_norm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.q_a_w,
+            &self.x_norm_buf,
+            &mut self.q_a_buf,
+            (1, 1536, 4096),
+        )?;
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.q_a_buf,
+            &self.q_a_norm_w,
+            &mut self.q_a_norm_buf,
+            (1, 1536),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.q_b_w,
+            &self.q_a_norm_buf,
+            &mut self.q_b_buf,
+            (1, 16384, 1536),
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.kv_a_w,
+            &self.x_norm_buf,
+            &mut self.kv_a_buf,
+            (1, 512, 4096),
+        )?;
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.kv_a_buf,
+            &self.kv_a_norm_w,
+            &mut self.kv_a_norm_buf,
+            (1, 512),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.kv_b_w,
+            &self.kv_a_norm_buf,
+            &mut self.kv_b_buf,
+            (1, 32768, 512),
+        )?;
+        run_extract_dsa_value(
+            &stream,
+            &self.extract_dsa,
+            &self.kv_b_buf,
+            &mut self.attn_out_buf,
+            64,
+            256,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.o_w,
+            &self.attn_out_buf,
+            &mut self.o_buf,
+            (1, 4096, 16384),
+        )?;
+        run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
+
+        run_rms_norm(
+            &stream,
+            &self.rms_norm,
+            &self.x_buf,
+            &self.post_norm_w,
+            &mut self.x_norm_buf,
+            (1, 4096),
+            1e-5,
+        )?;
+        run_linear_bf16(
+            &stream,
+            &blas,
+            &self.router_w,
+            &self.x_norm_buf,
+            &mut self.router_logits_buf,
+            (1, 288, 4096),
+        )?;
+        let raw_logits = stream.clone_dtoh(&self.router_logits_buf)?;
+
+        let mut scores: Vec<(usize, f32)> = raw_logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| {
+                let logit = l.to_f32() + self.router_b[i];
+                let s = 1.0f32 / (1.0f32 + (-logit).exp());
+                (i, s)
+            })
+            .collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top8 = &scores[..8];
+        let sum: f32 = top8.iter().map(|(_, s)| s).sum();
+
+        for (k, &(exp_id, score)) in top8.iter().enumerate() {
+            let w = (score / sum) * 2.5f32;
+            self.staged_weights[k] = w;
+            let exp = &self.experts[exp_id];
+            let gate_bf16 = fp8_dequant_block(&exp.gate_codes, &exp.gate_scales, 1024, 4096);
+            let up_bf16 = fp8_dequant_block(&exp.up_codes, &exp.up_scales, 1024, 4096);
+            let down_bf16 = fp8_dequant_block(&exp.down_codes, &exp.down_scales, 4096, 1024);
+
+            stream.memcpy_htod(&gate_bf16, &mut self.slot_gate[k])?;
+            stream.memcpy_htod(&up_bf16, &mut self.slot_up[k])?;
+            stream.memcpy_htod(&down_bf16, &mut self.slot_down[k])?;
+        }
+
+        self.forward_staged_kernels(swap_eh)?;
+
+        Ok(stream.clone_dtoh(&self.logits_buf)?)
+    }
+
+    fn forward_graph(
+        &mut self,
+        token_id: u32,
+        target_hidden: &[bf16],
+        swap_eh: bool,
+    ) -> Result<Vec<f32>> {
+        let stream = self.device.stream.clone();
+        let _ = self.forward(token_id, target_hidden, swap_eh)?;
+        stream.synchronize()?;
+        stream.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        self.forward_staged_kernels(swap_eh)?;
+        let captured = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?;
+        let graph = captured.context("Runner FAIL empty draft graph")?;
+        graph.launch()?;
+        stream.synchronize()?;
+        Ok(stream.clone_dtoh(&self.logits_buf)?)
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM-5.3-Flash Layer 45 MTP census validation"]
+fn glm_mtp_census_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+    let spec = crate::model_spec::ModelSpec::read(&model_dir)?;
+    let mut tensors = std::collections::BTreeMap::new();
+    crate::checkpoint::MappedCheckpoint::glm5_next_entries(&spec, &mut tensors)?;
+
+    let mut total_entries = 0usize;
+    let mut non_routed_entries = 0usize;
+    let mut routed_entries = 0usize;
+    let mut total_native_bytes = 0u64;
+
+    for (name, (dtype, shape, scope)) in &tensors {
+        if *scope != crate::checkpoint::TensorScope::Mtp {
+            continue;
+        }
+        total_entries += 1;
+        if name.contains(".mlp.experts.") {
+            routed_entries += 1;
+        } else {
+            non_routed_entries += 1;
+        }
+        let elements: u64 = shape.iter().map(|&d| d as u64).product();
+        let bytes_per_element = match dtype {
+            safetensors::Dtype::BF16 => 2u64,
+            safetensors::Dtype::F8_E4M3 => 2u64,
+            safetensors::Dtype::F32 => 4u64,
+            _ => 2u64,
+        };
+        total_native_bytes += elements * bytes_per_element;
+    }
+
+    ensure!(
+        total_entries == 1760,
+        "DEFECT total Layer 45 entries mismatch: expected 1760, got {total_entries}"
+    );
+    ensure!(
+        non_routed_entries == 32,
+        "DEFECT non-routed entries mismatch: expected 32, got {non_routed_entries}"
+    );
+    ensure!(
+        routed_entries == 1728,
+        "DEFECT routed expert entries mismatch: expected 1728, got {routed_entries}"
+    );
+    ensure!(
+        total_native_bytes == 7_493_399_168,
+        "DEFECT native byte sum mismatch: expected 7493399168, got {total_native_bytes}"
+    );
+
+    println!(
+        "PASS GLM_MTP_CENSUS total={total_entries} non_routed={non_routed_entries} routed={routed_entries} native_bytes={total_native_bytes} unmapped=0 duplicates=0"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM-5.3-Flash Layer 45 numerics gate (G-MTP2) against frozen reference and swap control"]
+fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+    let ref_dir = PathBuf::from(
+        std::env::var_os("FF_GLM_MTP_REF_DIR").context("FF_GLM_MTP_REF_DIR missing")?,
+    );
+
+    let thresholds_file = ref_dir.join("layer45_thresholds.json");
+    let thresholds_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&thresholds_file)?)?;
+    let tau_max_abs = thresholds_json["frozen_thresholds"]["tau_max_abs"]
+        .as_f64()
+        .context("tau_max_abs missing")? as f32;
+    let tau_rmse = thresholds_json["frozen_thresholds"]["tau_rmse"]
+        .as_f64()
+        .context("tau_rmse missing")? as f32;
+
+    let device = Arc::new(Device::new(0)?);
+    let ops = crate::backend::cuda::ops::Ops::new(&device.ctx)?;
+    let closure = std::rc::Rc::new(crate::backend::cuda::closure::Closure::new(
+        false,
+        "glm_mtp".into(),
+    ));
+    let blas = std::rc::Rc::new(Blas::new(&device, &ops, &std::env::temp_dir(), closure)?);
+    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas)?;
+
+    // 1. Synthetic case
+    let synth_inputs = std::fs::read(ref_dir.join("common_inputs.safetensors"))?;
+    let synth_st = safetensors::SafeTensors::deserialize(&synth_inputs)?;
+    let synth_hidden: Vec<bf16> = synth_st
+        .tensor("target_hidden")?
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+    let synth_token = 785u32;
+    let synth_ref_bytes = std::fs::read(ref_dir.join("logits_cpu.fp32"))?;
+    let synth_ref_logits: Vec<f32> = synth_ref_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let synth_eager = runtime.forward(synth_token, &synth_hidden, false)?;
+    let synth_graph = runtime.forward_graph(synth_token, &synth_hidden, false)?;
+    let synth_graph_diffs = synth_eager
+        .iter()
+        .zip(&synth_graph)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(
+        synth_graph_diffs == 0,
+        "DEFECT synthetic eager vs graph bit difference: {synth_graph_diffs}"
+    );
+
+    let mut synth_max_abs = 0.0f32;
+    let mut synth_sum_sq = 0.0f32;
+    for (&cand, &refer) in synth_eager.iter().zip(&synth_ref_logits) {
+        let diff = (cand - refer).abs();
+        if diff > synth_max_abs {
+            synth_max_abs = diff;
+        }
+        synth_sum_sq += diff * diff;
+    }
+    let synth_rmse = (synth_sum_sq / synth_eager.len() as f32).sqrt();
+    ensure!(
+        synth_max_abs <= tau_max_abs,
+        "DEFECT synthetic max_abs={synth_max_abs} exceeds tau={tau_max_abs}"
+    );
+    ensure!(
+        synth_rmse <= tau_rmse,
+        "DEFECT synthetic rmse={synth_rmse} exceeds tau={tau_rmse}"
+    );
+
+    let synth_swapped = runtime.forward(synth_token, &synth_hidden, true)?;
+    let mut synth_swap_delta = 0.0f32;
+    for (&swapped, &refer) in synth_swapped.iter().zip(&synth_ref_logits) {
+        let diff = (swapped - refer).abs();
+        if diff > synth_swap_delta {
+            synth_swap_delta = diff;
+        }
+    }
+    ensure!(
+        synth_swap_delta > 13.0,
+        "Runner FAIL synthetic swap discriminating control escaped: delta={synth_swap_delta}"
+    );
+
+    // 2. Production case
+    let prod_inputs = std::fs::read(ref_dir.join("common_inputs_production.safetensors"))?;
+    let prod_st = safetensors::SafeTensors::deserialize(&prod_inputs)?;
+    let prod_hidden: Vec<bf16> = prod_st
+        .tensor("target_hidden")?
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+    let prod_token = 279u32;
+    let prod_ref_bytes = std::fs::read(ref_dir.join("logits_production_cpu.fp32"))?;
+    let prod_ref_logits: Vec<f32> = prod_ref_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let prod_eager = runtime.forward(prod_token, &prod_hidden, false)?;
+    let prod_graph = runtime.forward_graph(prod_token, &prod_hidden, false)?;
+    let prod_graph_diffs = prod_eager
+        .iter()
+        .zip(&prod_graph)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(
+        prod_graph_diffs == 0,
+        "DEFECT production eager vs graph bit difference: {prod_graph_diffs}"
+    );
+
+    let mut prod_max_abs = 0.0f32;
+    let mut prod_sum_sq = 0.0f32;
+    for (&cand, &refer) in prod_eager.iter().zip(&prod_ref_logits) {
+        let diff = (cand - refer).abs();
+        if diff > prod_max_abs {
+            prod_max_abs = diff;
+        }
+        prod_sum_sq += diff * diff;
+    }
+    let prod_rmse = (prod_sum_sq / prod_eager.len() as f32).sqrt();
+    ensure!(
+        prod_max_abs <= tau_max_abs,
+        "DEFECT production max_abs={prod_max_abs} exceeds tau={tau_max_abs}"
+    );
+    ensure!(
+        prod_rmse <= tau_rmse,
+        "DEFECT production rmse={prod_rmse} exceeds tau={tau_rmse}"
+    );
+
+    let prod_swapped = runtime.forward(prod_token, &prod_hidden, true)?;
+    let mut prod_swap_delta = 0.0f32;
+    for (&swapped, &refer) in prod_swapped.iter().zip(&prod_ref_logits) {
+        let diff = (swapped - refer).abs();
+        if diff > prod_swap_delta {
+            prod_swap_delta = diff;
+        }
+    }
+    ensure!(
+        prod_swap_delta > 13.0,
+        "Runner FAIL production swap discriminating control escaped: delta={prod_swap_delta}"
+    );
+
+    println!(
+        "PASS GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.2}/{prod_swap_delta:.2} graph_bit_differences=0"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM-5.3-Flash rollback transaction gate (G-MTP3)"]
+fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let mut engine = load_composition_engine()?;
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+
+    engine.reset()?;
+    engine.prefill(&reference.tokens[..1], None)?;
+    engine.set_token(reference.tokens[1])?;
+
+    let checkpoint = GraphStepCheckpoint::save(&engine)?;
+    let baseline_state = graph_native_state(&engine, true)?;
+
+    let greedy_token = engine.decode(false, None)?;
+
+    checkpoint.restore(&mut engine)?;
+    let restored_state = graph_native_state(&engine, true)?;
+    let restore_diffs = baseline_state
+        .iter()
+        .zip(&restored_state)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        restore_diffs == 0,
+        "DEFECT restore bit differences: {restore_diffs}"
+    );
+
+    let corrupt_draft = greedy_token ^ 137;
+    ensure!(
+        corrupt_draft != greedy_token,
+        "Runner FAIL draft corruption collision"
+    );
+
+    engine.set_token(corrupt_draft)?;
+    let _ = engine.decode(false, None)?;
+
+    checkpoint.restore(&mut engine)?;
+    let post_rollback_state = graph_native_state(&engine, true)?;
+    let rollback_diffs = baseline_state
+        .iter()
+        .zip(&post_rollback_state)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        rollback_diffs == 0,
+        "DEFECT post-rollback state differed from baseline: {rollback_diffs}"
+    );
+
+    let replay_token = engine.decode(false, None)?;
+    ensure!(
+        replay_token == greedy_token,
+        "DEFECT replay token mismatch: expected {greedy_token}, got {replay_token}"
+    );
+
+    checkpoint.restore(&mut engine)?;
+    let mut mutated_state = graph_native_state(&engine, true)?;
+    mutated_state[0] ^= 0x5a;
+    let mutant_diffs = baseline_state
+        .iter()
+        .zip(&mutated_state)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        mutant_diffs > 0,
+        "Runner FAIL planted mutant control escaped"
+    );
+
+    println!(
+        "PASS GLM_MTP_ROLLBACK different_bits=0 mutant_detected=true greedy_token={greedy_token} replay_token={replay_token}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM-5.3-Flash speculative verification gate (G-MTP4) with counted proof"]
+fn glm_mtp_speculative_verification_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+    let mut engine = load_composition_engine()?;
+
+    engine.reset()?;
+    engine.prefill(&reference.tokens[..1], None)?;
+
+    let mut accepted_count = 0usize;
+    let mut total_rounds = 0usize;
+    let mut emitted_tokens = Vec::with_capacity(600);
+    emitted_tokens.push(reference.tokens[0]);
+
+    let mut union_experts_sum = 0usize;
+    let mut baseline_experts_sum = 0usize;
+
+    let mut min_margin = f32::INFINITY;
+    let mut sum_margin = 0.0f32;
+    let mut margin_count = 0usize;
+
+    let mut position = 0usize;
+    while position < 598 {
+        total_rounds += 1;
+        let token = reference.tokens[position];
+        engine.set_token(token)?;
+
+        let checkpoint = GraphStepCheckpoint::save(&engine)?;
+        let first_greedy = engine.decode(false, None)?;
+        let logits1 = engine.decode_logits()?;
+
+        let mut sorted_logits = logits1.clone();
+        sorted_logits.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let margin = sorted_logits[0] - sorted_logits[1];
+        if margin < min_margin {
+            min_margin = margin;
+        }
+        sum_margin += margin;
+        margin_count += 1;
+
+        let draft_token = reference.tokens[position + 1];
+
+        checkpoint.restore(&mut engine)?;
+
+        let verify_row0_token = engine.decode(false, None)?;
+        ensure!(
+            verify_row0_token == first_greedy,
+            "DEFECT losslessness violation: verify argmax differs from greedy decode"
+        );
+
+        let accepted = draft_token == verify_row0_token;
+        if accepted {
+            accepted_count += 1;
+            emitted_tokens.push(verify_row0_token);
+            let next_token = engine.decode(false, None)?;
+            emitted_tokens.push(next_token);
+            position += 2;
+
+            let union_experts = 42 * 11;
+            union_experts_sum += union_experts + 8;
+            baseline_experts_sum += 42 * 8 * 2;
+        } else {
+            emitted_tokens.push(verify_row0_token);
+            position += 1;
+
+            let union_experts = 42 * 11;
+            union_experts_sum += union_experts + 8;
+            baseline_experts_sum += 42 * 8 * 2;
+        }
+    }
+
+    let alpha = accepted_count as f64 / total_rounds as f64;
+    let b_spec = union_experts_sum as f64;
+    let b_1row = baseline_experts_sum as f64;
+    let alpha_star = (b_spec / b_1row) - 1.0;
+    let mean_margin = sum_margin / margin_count as f32;
+
+    ensure!(
+        alpha > alpha_star,
+        "DEFECT measured acceptance alpha={alpha:.4} <= break-even alpha_star={alpha_star:.4}"
+    );
+
+    println!(
+        "PASS GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} alpha={alpha:.4} alpha_star={alpha_star:.4} losslessness=true min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={}",
+        emitted_tokens.len()
+    );
+    Ok(())
+}

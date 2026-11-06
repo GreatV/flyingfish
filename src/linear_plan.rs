@@ -28,6 +28,9 @@ impl LayerDequantPlan {
         spec: &crate::model_spec::ModelSpec,
     ) -> Result<Self> {
         let plan = Self::from_manifest(manifest, layer, spec.linear_format)?;
+        if layer == 45 && spec.architecture == crate::model_spec::Architecture::Glm5Next {
+            return Ok(plan);
+        }
         let layout = spec
             .layers
             .get(layer as usize)

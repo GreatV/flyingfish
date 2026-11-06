@@ -132,7 +132,10 @@ pub fn has_mtp_component(dir: &Path) -> Result<bool> {
     } else {
         MappedCheckpoint::open(dir)?.index
     };
-    if !index.weight_map.keys().any(|name| name.starts_with("mtp.")) {
+    if !index.weight_map.keys().any(|name| {
+        name.starts_with("mtp.")
+            || (name.starts_with("model.language_model.layers.") && name.contains(".eh_proj."))
+    }) {
         return Ok(false);
     }
     Ok(crate::model_spec::ModelSpec::read(dir)?
@@ -1977,7 +1980,7 @@ impl MappedCheckpoint {
         Ok(())
     }
 
-    fn glm5_next_entries(
+    pub(crate) fn glm5_next_entries(
         spec: &crate::model_spec::ModelSpec,
         expected: &mut BTreeMap<String, ExpectedTensor>,
     ) -> Result<()> {

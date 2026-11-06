@@ -689,4 +689,60 @@ mod tests {
         );
         Ok(())
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "loads official GLM-5.3-Flash MTP; set FF_GLM_MODEL and FLYINGFISH_RUNTIME_DIR"]
+    fn glm_mtp_serving_decodes_and_matches_mtp_engine() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model_dir =
+            PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let settings = crate::backend::Settings {
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            device_budget_gib: None,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: Some(runtime),
+        };
+        let options = SpecOptions {
+            device: 0,
+            capacity: 64,
+            chunk: None,
+            backend: settings.clone(),
+            count: 4,
+            ignore_eos: true,
+        };
+        let mut model = Model::load(&model_dir, 0, 64, None, settings)?;
+        let prompt = [785, 10567, 1087];
+        let mut mtp_path_ids = Vec::with_capacity(4);
+        model.reset()?;
+        let first = model.prefill(&prompt, None)?;
+        mtp_path_ids.push(first);
+        for _ in 0..3 {
+            let next = model.decode(false, None)?;
+            mtp_path_ids.push(next);
+        }
+        ensure!(mtp_path_ids.len() == 4, "expected 4 MTP path tokens");
+        let output = produce_plain_events(&mut model, &prompt, None, &options, &mut |_| true)?;
+        ensure!(
+            output.ids == mtp_path_ids,
+            "serving ids {:?} differ from engine MTP path ids {:?}",
+            output.ids,
+            mtp_path_ids
+        );
+        println!(
+            "PASS glm_mtp_serving tokens=4 ids_match_mtp_engine=true ids={:?}",
+            output.ids
+        );
+        Ok(())
+    }
 }
