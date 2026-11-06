@@ -2004,9 +2004,8 @@ impl GlmMtpRuntime {
         let router_w = stream.clone_htod(&get_st_bf16(
             "model.language_model.layers.45.mlp.gate.weight",
         )?)?;
-        let router_b_bf16 =
-            get_st_bf16("model.language_model.layers.45.mlp.gate.e_score_correction_bias")?;
-        let router_b = router_b_bf16.into_iter().map(|b| b.to_f32()).collect();
+        let router_b =
+            get_st_f32("model.language_model.layers.45.mlp.gate.e_score_correction_bias")?;
 
         let head_norm_w = stream.clone_htod(&get_st_bf16(
             "model.language_model.layers.45.shared_head.norm.weight",
