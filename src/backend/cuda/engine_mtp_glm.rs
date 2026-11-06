@@ -107,14 +107,14 @@ pub(crate) fn run_rms_norm(
         stream
             .launch_builder(norm_fn)
             .arg(x)
-            .arg(y)
             .arg(w)
-            .arg(&eps)
-            .arg(&dim)
+            .arg(y)
             .arg(&rows)
+            .arg(&dim)
+            .arg(&eps)
             .launch(crate::backend::cuda::ops::grid(
-                (rows as usize).div_ceil(32) * 32,
-                dim as u32,
+                rows as usize,
+                256,
             ))?;
     }
     Ok(())
