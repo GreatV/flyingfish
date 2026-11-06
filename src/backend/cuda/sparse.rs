@@ -10,9 +10,7 @@ use crate::{
     backend::gpu::{CudaFunction, CudaSlice, PushKernelArg},
     sparse::{SparseMesh, SparseSites},
 };
-#[cfg(test)]
-use anyhow::Context;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use half::f16;
 use std::rc::Rc;
 
@@ -218,7 +216,6 @@ pub struct SparseConv {
     tile: usize,
 }
 impl SparseConv {
-    #[cfg(test)]
     pub fn new(
         device: &Device,
         sites: &SparseSites,
@@ -276,7 +273,6 @@ impl SparseConv {
             tile,
         })
     }
-    #[cfg(test)]
     pub(crate) fn workspace_bytes(&self) -> usize {
         self.neighbours.len() * size_of::<i32>() + self.columns.len() * size_of::<f16>()
     }
