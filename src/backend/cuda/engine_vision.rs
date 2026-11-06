@@ -7209,7 +7209,7 @@ impl PixalConditioningRuntime {
     ) -> Result<usize> {
         let cfg = VisionEncoderConfig::from_dir(dino_dir)?;
         let rows = cfg.total_rows(shape.image_side)?;
-        let attention = F32Attention::required_bytes([
+        let attention = crate::backend::cuda::flash::F32Attention::required_bytes([
             cfg.num_attention_heads,
             rows,
             rows,
@@ -7609,7 +7609,22 @@ impl PixalConditioningRuntime {
                     || (self.views_accumulated == view_index && self.view_count == view_count)),
             "conditioning view order/input staging"
         );
+        #[cfg(test)]
+        let previous_encodes = self.dino_ws.completed_encodes;
         self.run_device(s, blas, view_index, view_count, self.projection_rows)?;
+        #[cfg(test)]
+        {
+            ensure!(
+                self.dino_ws.completed_encodes == previous_encodes + 1,
+                "media encoder call count"
+            );
+            println!(
+                "P1_M4C_MEDIA PASS grid={} image_side={} view={view_index} views={view_count} encoder_calls=1 naf={}",
+                self.shape.grid_side,
+                self.shape.image_side,
+                self.naf.is_some()
+            );
+        }
         if view_index == 0 {
             self.views.clear();
         }

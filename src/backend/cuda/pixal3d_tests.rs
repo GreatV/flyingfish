@@ -7111,7 +7111,6 @@ fn generation_measurement(
 #[test]
 #[ignore = "requires CUDA, published Pixal3D components, RGBA/cameras and coordinate noise"]
 fn pixal3d_generated_request_gpu() -> Result<()> {
-    use safetensors::tensor::TensorView;
     let bytes = std::fs::read(env_path("FF_PIXAL_M4C_FREEZE")?)?;
     ensure!(
         format!("{:x}", Sha256::digest(&bytes))
@@ -7213,9 +7212,89 @@ fn pixal3d_generated_request_gpu() -> Result<()> {
     let output_dir = env_path("FF_PIXAL_M4C_OUTPUT")?;
     std::fs::create_dir(&output_dir)?;
     let device = Device::new(0)?;
+    if fixture == "mv4" {
+        for (label, changed) in [("A0", false), ("B", true), ("A1", false)] {
+            let mut current: Vec<_> = views
+                .iter()
+                .map(|v| PixalView {
+                    rgba: v.rgba,
+                    dimensions: v.dimensions,
+                    camera: v.camera,
+                })
+                .collect();
+            if changed {
+                let rgba = archive.tensor("robot_crab-rgba")?;
+                current[1].rgba = rgba.data();
+                current[1].dimensions = [rgba.shape()[0], rgba.shape()[1]];
+            }
+            let current_generation = PixalGeneration {
+                views: &current,
+                noise: std::array::from_fn(|i| CoordinateNoise {
+                    values: generation.noise[i].values,
+                    shape: generation.noise[i].shape,
+                    batch: generation.noise[i].batch,
+                }),
+                ..generation
+            };
+            let destination = output_dir.join(label);
+            std::fs::create_dir(&destination)?;
+            generation_run(&current_generation, &device, case, &freeze, &destination)?;
+        }
+        for file in ["stage0", "stage1", "stage2", "stage3", "mesh", "material"] {
+            let suffix = format!("{file}.safetensors");
+            let equal = generation_equal(
+                &output_dir.join("A0").join(&suffix),
+                &output_dir.join("A1").join(&suffix),
+            )?;
+            ensure!(equal, "A->B->A changed {file}");
+        }
+        let different = !generation_equal(
+            &output_dir.join("A0/stage0.safetensors"),
+            &output_dir.join("B/stage0.safetensors"),
+        )?;
+        ensure!(different, "non-anchor media input did not reach generation");
+        println!(
+            "P1_M4C_ISOLATION PASS requests=3 exact_A_files=6 changed_non_anchor=1 different_B=true"
+        );
+    } else {
+        generation_run(&generation, &device, case, &freeze, &output_dir)?;
+    }
+    Ok(())
+}
+
+fn generation_equal(left: &Path, right: &Path) -> Result<bool> {
+    let a = std::fs::File::open(left)?;
+    let b = std::fs::File::open(right)?;
+    let a = unsafe { memmap2::MmapOptions::new().map(&a)? };
+    let b = unsafe { memmap2::MmapOptions::new().map(&b)? };
+    let a = safetensors::SafeTensors::deserialize(&a)?;
+    let b = safetensors::SafeTensors::deserialize(&b)?;
+    let names: BTreeSet<_> = a.names().into_iter().collect();
+    if names != b.names().into_iter().collect() {
+        return Ok(false);
+    }
+    for name in names {
+        let x = a.tensor(name)?;
+        let y = b.tensor(name)?;
+        if x.dtype() != y.dtype() || x.shape() != y.shape() || x.data() != y.data() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn generation_run(
+    generation: &PixalGeneration<'_>,
+    device: &Device,
+    case: &Value,
+    freeze: &Value,
+    output_dir: &Path,
+) -> Result<()> {
+    use safetensors::tensor::TensorView;
+    let name = case["case"].as_str().context("case name")?;
     let mut seen = Vec::new();
     let mut grids = Vec::new();
-    let result = generation.run_observed(&device, |stage, grid, coordinates, data| {
+    let result = generation.run_observed(device, |stage, grid, coordinates, data| {
         ensure!(stage == seen.len(), "missing or repeated flow stage");
         seen.push(stage);
         grids.push(grid);
@@ -7235,7 +7314,7 @@ fn pixal3d_generated_request_gpu() -> Result<()> {
             &actual,
             shape,
         )?;
-        generation_measurement(case, stage, coordinates, &actual, &freeze)?;
+        generation_measurement(case, stage, coordinates, &actual, freeze)?;
         println!(
             "P1_M4C_STAGE PASS case={name} stage={stage} grid={grid} rows={} values={}",
             coordinates.len(),
@@ -7296,8 +7375,18 @@ fn pixal3d_generated_request_gpu() -> Result<()> {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
+    let world: Vec<u8> = [
+        result.origin[0],
+        result.origin[1],
+        result.origin[2],
+        result.voxel_size,
+    ]
+    .into_iter()
+    .flat_map(f32::to_le_bytes)
+    .collect();
     safetensors::serialize_to_file(
         [
+            ("world_grid", TensorView::new(Dtype::F32, vec![4], &world)?),
             (
                 "vertices",
                 TensorView::new(
