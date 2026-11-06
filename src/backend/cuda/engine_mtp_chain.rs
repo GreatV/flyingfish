@@ -780,7 +780,6 @@ impl Engine {
         )?;
         self.state
             .set_sequence(&stream, start_pos as u32, 2, self.workspace_rows as u32)?;
-        self.qwen_device_prefix = true;
         let step_res = self.run_step(
             crate::backend::Step {
                 rows: 2,
@@ -790,7 +789,6 @@ impl Engine {
             },
             None,
         );
-        self.qwen_device_prefix = false;
         step_res?;
 
         // 5. Final norm & lm_head projection for 2 rows
