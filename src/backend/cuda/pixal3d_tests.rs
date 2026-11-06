@@ -855,7 +855,7 @@ fn hi3d_decoder_field_affine_gpu() -> Result<()> {
     let d = &decoder.device;
     let mut field = OperationGate::decoder("corner-attributes", "fields-freeze-r1", "sm89-r1", 1)?;
     let raw = f32_tensor(
-        &root.join("sm89-r1/additional-common-inputs.safetensors"),
+        &root.join("CPU-r3/common-inputs.safetensors"),
         "fields.raw40",
     )?;
     ensure!(raw.len() == 97 * 40, "corner field fixture shape mismatch");
