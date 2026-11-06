@@ -1217,6 +1217,24 @@ extern "C" __global__ void qkv_unpack_hm_f16(
     qkv_unpack_hm_impl(packed, q_out, k_out, v_hm_out, batch, seq_len, heads, dim, parts);
 }
 
+extern "C" __global__ void qkv_gather_head_major_f16(
+    const __half* input, const uint32_t* source, __half* q, __half* k, __half* v,
+    uint32_t input_rows, uint32_t rows, uint32_t heads, uint32_t dim) {
+    if (!vision_flat_launch() || !input || !source || !q || !k || !v ||
+        !input_rows || !rows || !heads || !dim) { __trap(); return; }
+    const uint64_t width = uint64_t(heads) * dim, count = uint64_t(rows) * width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t row = i / width, channel = i % width, original = source[row];
+        if (original >= input_rows) { __trap(); return; }
+        const uint64_t base = uint64_t(original) * 3 * width;
+        const uint64_t target = (uint64_t(channel / dim) * rows + row) * dim + channel % dim;
+        q[i] = input[base + channel];
+        k[target] = input[base + width + channel];
+        v[target] = input[base + 2 * width + channel];
+    }
+}
+
 extern "C" __global__ void qkv_unpack_hm_bf16(
     const __nv_bfloat16* packed, __nv_bfloat16* q_out, __nv_bfloat16* k_out, __nv_bfloat16* v_hm_out,
     uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
@@ -1310,7 +1328,7 @@ __device__ __forceinline__ void batch_group_moments_partial(
     uint32_t batches, uint32_t channels, uint32_t groups, uint32_t parts) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.x != parts || gridDim.y != groups || gridDim.z != batches ||
-        !input || !offsets || !partial || !groups || channels % groups) { __trap(); return; }
+        !input || !offsets || !partial || !channels || !groups || channels % groups) { __trap(); return; }
     const uint32_t first = offsets[blockIdx.z], end = offsets[blockIdx.z + 1];
     if (first >= end) { __trap(); return; }
     const uint32_t width = channels / groups;
@@ -1360,7 +1378,7 @@ extern "C" __global__ void batch_group_moments_partial_f16(
 extern "C" __global__ void batch_group_moments_finish_f32(
     const float* partial, const uint32_t* offsets, float* moments,
     uint32_t batches, uint32_t channels, uint32_t groups, uint32_t parts, float eps) {
-    if (!vision_flat_launch() || !partial || !offsets || !moments || !groups ||
+    if (!vision_flat_launch() || !partial || !offsets || !moments || !channels || !groups ||
         !parts || channels % groups || !(eps > 0.0f)) { __trap(); return; }
     for (uint64_t bg = uint64_t(blockIdx.x) * 256 + threadIdx.x; bg < uint64_t(batches) * groups;
          bg += uint64_t(gridDim.x) * 256) {
@@ -1386,7 +1404,7 @@ __device__ __forceinline__ void batch_group_norm(
     uint32_t batches, uint32_t channels, uint32_t groups) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.y != batches || gridDim.z != 1 || !input || !offsets || !moments ||
-        !weight || !bias || !output || !groups || channels % groups) { __trap(); return; }
+        !weight || !bias || !output || !channels || !groups || channels % groups) { __trap(); return; }
     const uint32_t batch = blockIdx.y, first = offsets[batch], end = offsets[batch + 1];
     const uint64_t count = uint64_t(end - first) * channels;
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;

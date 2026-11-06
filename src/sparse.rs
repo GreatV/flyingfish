@@ -14,12 +14,12 @@ pub struct SparseSites {
 }
 
 pub struct SerializedWindows {
-    pub keys: [Vec<u64>; 2],
-    pub order: [Vec<u32>; 2],
-    pub inverse: [Vec<u32>; 2],
-    pub pad: Vec<u32>,
-    pub unpad: Vec<u32>,
-    pub offsets: Vec<u32>,
+    pub(crate) keys: [Vec<u64>; 2],
+    pub(crate) order: [Vec<u32>; 2],
+    pub(crate) inverse: [Vec<u32>; 2],
+    pub(crate) pad: Vec<u32>,
+    pub(crate) unpad: Vec<u32>,
+    pub(crate) offsets: Vec<u32>,
 }
 impl SparseSites {
     /// Lexicographic unique coordinates and input-row to unique-row indices.

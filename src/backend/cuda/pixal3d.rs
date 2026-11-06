@@ -19,7 +19,7 @@ use crate::{
         CudaFunction, CudaSlice, DevicePtr, DeviceRepr, PushKernelArg, ValidAsZeroBits,
     },
     pixal3d::{DecoderCheckpoint, DecoderKind, FlowCheckpoint, FlowSpec, Hi3DFlowCheckpoint},
-    sparse::SparseSites,
+    sparse::{SerializedWindows, SparseSites},
 };
 use anyhow::{Context, Result, ensure};
 use half::{bf16, f16};
@@ -2668,6 +2668,9 @@ impl Weights {
         let mut float = BTreeMap::new();
         for (name, (_, _, f32_runtime)) in checkpoint.kind.inventory() {
             let t = checkpoint.mapped.tensor(&name)?;
+            if t.dtype() == Dtype::I64 {
+                continue;
+            }
             if f32_runtime {
                 let values: Vec<f32> = if t.dtype() == Dtype::F32 {
                     t.data()
@@ -2933,7 +2936,12 @@ impl PixalDecoder {
         runtime: &Path,
         device_budget: usize,
     ) -> Result<Self> {
-        let checkpoint = DecoderCheckpoint::open(&dir.join("ckpts"), kind)?;
+        let component = if matches!(kind, DecoderKind::PointTransformer) {
+            "vae"
+        } else {
+            "ckpts"
+        };
+        let checkpoint = DecoderCheckpoint::open(&dir.join(component), kind)?;
         let device = Device::new(0)?;
         let (free, _) = device.ctx.mem_get_info()?;
         let ops = Ops::new(&device.ctx)?;
@@ -2973,6 +2981,126 @@ impl PixalDecoder {
             ones,
             columns,
         })
+    }
+    pub fn serialized_qkv(
+        &self,
+        maps: &SerializedWindows,
+        qkv: &CudaSlice<f16>,
+        order: usize,
+    ) -> Result<CudaSlice<f16>> {
+        ensure!(
+            matches!(self.kind, DecoderKind::PointTransformer) && order < 2,
+            "invalid serialized decoder attention configuration"
+        );
+        let rows = maps.order[order].len();
+        let packed_rows = maps.pad.len();
+        ensure!(
+            maps.offsets.first() == Some(&0)
+                && maps
+                    .offsets
+                    .last()
+                    .is_some_and(|&n| n as usize == packed_rows),
+            "serialized window offsets do not cover packed rows"
+        );
+        ensure!(
+            rows > 0
+                && qkv.len()
+                    == rows
+                        .checked_mul(1536)
+                        .context("serialized QKV extent overflow")?
+                && maps.inverse[order].len() == rows
+                && maps.unpad.len() == rows,
+            "serialized QKV/map extent mismatch"
+        );
+        let gather: Vec<_> = maps
+            .pad
+            .iter()
+            .map(|&row| {
+                maps.order[order]
+                    .get(row as usize)
+                    .copied()
+                    .context("serialized pad row outside order")
+            })
+            .collect::<Result<_>>()?;
+        let inverse: Vec<_> = maps.inverse[order]
+            .iter()
+            .map(|&row| {
+                maps.unpad
+                    .get(row as usize)
+                    .copied()
+                    .context("serialized inverse row outside unpad")
+            })
+            .collect::<Result<_>>()?;
+        ensure!(
+            gather.iter().all(|&row| (row as usize) < rows)
+                && inverse.iter().all(|&row| (row as usize) < packed_rows),
+            "serialized physical row outside features"
+        );
+        let live = packed_rows
+            .checked_mul(4 * 512 * size_of::<f16>())
+            .and_then(|n| n.checked_add(rows * 512 * size_of::<f16>()))
+            .and_then(|n| {
+                n.checked_add(
+                    (gather.len() + inverse.len() + maps.offsets.len()) * size_of::<u32>(),
+                )
+            })
+            .and_then(|n| n.checked_add(packed_rows * 32 * size_of::<f32>()))
+            .context("serialized attention workspace overflow")?;
+        let d = &self.device;
+        d.workspace_budget(self.initial_free, self.device_budget, live)?;
+        let gather = d.stream.clone_htod(&gather)?;
+        let inverse = d.stream.clone_htod(&inverse)?;
+        let q = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let k = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let v = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let mut packed = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let output = d.stream.alloc_zeros::<f16>(rows * 512)?;
+        let module = cubin::module(&d.ctx, "vision_ops")?;
+        let mut attention = Flash::new_f16(
+            d.stream.clone(),
+            packed_rows,
+            32,
+            32,
+            16,
+            Score {
+                scale: 0.25,
+                window_left: None,
+            },
+        )?;
+        attention.bind_f16_windows(&maps.offsets)?;
+        unsafe {
+            d.stream
+                .launch_builder(&module.load_function("qkv_gather_head_major_f16")?)
+                .arg(qkv)
+                .arg(&gather)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&u32::try_from(rows)?)
+                .arg(&u32::try_from(packed_rows)?)
+                .arg(&32u32)
+                .arg(&16u32)
+                .launch(flat(packed_rows * 512))?;
+        }
+        attention.run_f16(
+            &q.slice(..),
+            512,
+            &k.slice(..),
+            &v.slice(..),
+            &mut packed.slice_mut(..),
+            (packed_rows, packed_rows, packed_rows),
+        )?;
+        unsafe {
+            d.stream
+                .launch_builder(&module.load_function("sparse_index_rows_f16")?)
+                .arg(&packed)
+                .arg(&inverse)
+                .arg(&output)
+                .arg(&u32::try_from(rows)?)
+                .arg(&512u32)
+                .launch(flat(rows * 512))?;
+        }
+        Ok(output)
     }
     fn linear16(
         &self,

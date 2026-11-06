@@ -173,6 +173,14 @@ impl OperationGate {
         if !control {
             ensure!(self.seen.insert(name.into()), "duplicate operation score");
         }
+        self.measure(name, values, control)
+    }
+    fn replay(&mut self, name: &str, values: &[f64], mode: &str) -> Result<()> {
+        ensure!(self.seen.contains(name), "unscored operation replay");
+        println!("N5_M2B_MODE cell={name} mode={mode}");
+        self.measure(name, values, false)
+    }
+    fn measure(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
         let cell = self.cells.get(name).context("cell outside frozen scope")?;
         let anchor = if let Some(path) = &self.decoder_anchor {
             tensor(path, name)?
@@ -193,7 +201,11 @@ impl OperationGate {
                 .context("bound missing")?;
             let value = errors[metric];
             let defect = if control {
-                value < 10.0 * bound
+                if self.decoder_anchor.is_some() {
+                    value <= 10.0 * bound
+                } else {
+                    value < 10.0 * bound
+                }
             } else {
                 value > bound
             };
@@ -581,6 +593,269 @@ fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
     let activation_result = gate.finish();
     norm_result?;
     activation_result
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_serialized_attention_definition_gpu() -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let decoder = PixalDecoder::open(&model, DecoderKind::PointTransformer, &runtime, 6 << 30)?;
+    let d = &decoder.device;
+    let mut gate = OperationGate::decoder(
+        "serialized-window-attention",
+        "attention-freeze-r2",
+        "sm89-r1",
+        20,
+    )?;
+    let common = gate
+        .root
+        .join("sm89-r1/additional-common-inputs.safetensors");
+    let map_file = gate.root.join("CPU-r3/maps.safetensors");
+    let freeze: Value = serde_json::from_slice(&std::fs::read(gate.root.join("FROZEN.json"))?)?;
+    let cases = freeze["exact_serialization_maps"]
+        .as_object()
+        .context("serialization cases missing")?;
+    ensure!(cases.len() == 9, "serialization case count mismatch");
+    for name in cases.keys() {
+        let name = name
+            .strip_prefix("serialization.")
+            .context("serialization prefix missing")?;
+        let grid = tensor(&map_file, &format!("{name}.grid"))?;
+        let batch = tensor(&map_file, &format!("{name}.batch"))?;
+        let coordinates = grid
+            .values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(batch.values)
+            .map(|(p, b)| [b as i32, p[0] as i32, p[1] as i32, p[2] as i32])
+            .collect();
+        let sites = SparseSites::new(coordinates)?;
+        let mut maps = sites.serialized_windows(48)?;
+        let original_pad = maps.pad.clone();
+        let frozen_unpad = tensor(&map_file, &format!("{name}.unpad"))?;
+        let frozen_inverse = tensor(&map_file, &format!("{name}.inverse"))?;
+        let control_pad = tensor(&map_file, &format!("{name}.control_pad"))?;
+        let n = sites.coordinates().len();
+        for order in 0..2 {
+            let key = format!("attention.{name}.order{order}");
+            let packed = tensor(&common, &format!("{key}.qkv"))?;
+            let mut original = Vec::with_capacity(n * 1536);
+            for row in 0..n {
+                let rank = frozen_inverse.values[order * n + row] as usize;
+                let packed_row = frozen_unpad.values[rank] as usize;
+                original.extend(
+                    packed.values[packed_row * 1536..(packed_row + 1) * 1536]
+                        .iter()
+                        .map(|&x| f16::from_f64(x)),
+                );
+            }
+            let qkv = d.stream.clone_htod(&original)?;
+            let selector = format!("{key}.final_window");
+            let selector_rows: Option<Vec<usize>> = gate
+                .cells
+                .get(&selector)
+                .map(|cell| {
+                    cell["selector"]["rows"]
+                        .as_array()
+                        .context("attention selector rows missing")
+                        .and_then(|rows| {
+                            rows.iter()
+                                .map(|row| {
+                                    row.as_u64()
+                                        .context("invalid selector row")
+                                        .map(|row| row as usize)
+                                })
+                                .collect()
+                        })
+                })
+                .transpose()?;
+            for control in [false, true] {
+                if control {
+                    maps.pad = control_pad.values.iter().map(|&v| v as u32).collect();
+                }
+                let output = decoder.serialized_qkv(&maps, &qkv, order)?;
+                let values: Vec<_> = d
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f16::to_f64)
+                    .collect();
+                let has_full_control =
+                    !gate.cells[&key]["control_margin"].is_null() && selector_rows.is_none();
+                if !control || has_full_control {
+                    gate.score(&key, &values, control)?;
+                }
+                if let Some(rows) = &selector_rows {
+                    let selected: Vec<_> = rows
+                        .iter()
+                        .flat_map(|&row| values[row * 512..(row + 1) * 512].iter().copied())
+                        .collect();
+                    gate.score(&selector, &selected, control)?;
+                }
+                maps.pad.clone_from(&original_pad);
+            }
+        }
+    }
+    serialized_attention_modes(&decoder, &mut gate, &common, &map_file)?;
+    gate.finish()
+}
+
+fn serialized_attention_modes(
+    decoder: &PixalDecoder,
+    gate: &mut OperationGate,
+    common: &Path,
+    maps: &Path,
+) -> Result<()> {
+    let d = &decoder.device;
+    let first = tensor(common, "attention.17.order0.qkv")?;
+    let second = tensor(common, "attention.49.order0.qkv")?;
+    let combined: Vec<_> = first
+        .values
+        .into_iter()
+        .chain(second.values)
+        .map(f16::from_f64)
+        .collect();
+    let input_rows = combined.len() / 1536;
+    ensure!(input_rows == 113, "mixed serialized packet extent mismatch");
+    let input = d.stream.clone_htod(&combined)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    for grouped in [false, true] {
+        let rows = if grouped { 113usize } else { 17usize };
+        let count = rows * 512;
+        let source = d.stream.clone_htod(&(0..rows as u32).collect::<Vec<_>>())?;
+        let q = d.stream.alloc_zeros::<f16>(count)?;
+        let k = d.stream.alloc_zeros::<f16>(count)?;
+        let v = d.stream.alloc_zeros::<f16>(count)?;
+        let sentinel = f16::from_f32(-123.0);
+        let mut output = d.stream.clone_htod(&vec![sentinel; count + 8])?;
+        unsafe {
+            d.stream
+                .launch_builder(&module.load_function("qkv_gather_head_major_f16")?)
+                .arg(&input)
+                .arg(&source)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&(input_rows as u32))
+                .arg(&(rows as u32))
+                .arg(&32u32)
+                .arg(&16u32)
+                .launch(flat(count))?;
+        }
+        let mut attention = Flash::new_f16(
+            d.stream.clone(),
+            rows,
+            32,
+            32,
+            16,
+            Score {
+                scale: 0.25,
+                window_left: None,
+            },
+        )?;
+        if grouped {
+            attention.bind_f16_windows(&[0, 17, 65, 113])?;
+        }
+        let graph_equal;
+        let guard_unchanged;
+        {
+            let mut run = || {
+                attention.run_f16(
+                    &q.slice(..),
+                    512,
+                    &k.slice(..),
+                    &v.slice(..),
+                    &mut output.slice_mut(..count),
+                    (rows, rows, rows),
+                )
+            };
+            run()?;
+            d.stream.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            run()?;
+            let graph = d
+                .stream
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("serialized attention graph missing")?;
+            let eager = d.stream.clone_dtoh(&output)?;
+            graph.launch()?;
+            let captured = d.stream.clone_dtoh(&output)?;
+            ensure!(
+                eager[..count]
+                    .iter()
+                    .chain(&captured[..count])
+                    .all(|v| v.is_finite()),
+                "serialized F16 output is nonfinite"
+            );
+            graph_equal = eager == captured;
+            guard_unchanged = eager[count..]
+                .iter()
+                .chain(&captured[count..])
+                .all(|&v| v == sentinel);
+            gate.defects += usize::from(!graph_equal) + usize::from(!guard_unchanged);
+            for (case, base) in [("17", 0usize), ("49", 17usize)] {
+                if !grouped && case == "49" {
+                    continue;
+                }
+                let inverse = tensor(maps, &format!("{case}.inverse"))?;
+                let unpad = tensor(maps, &format!("{case}.unpad"))?;
+                let n = unpad.values.len();
+                let values: Vec<_> = inverse.values[..n]
+                    .iter()
+                    .flat_map(|&rank| {
+                        let row = base + unpad.values[rank as usize] as usize;
+                        captured[row * 512..(row + 1) * 512]
+                            .iter()
+                            .map(|v| v.to_f64())
+                    })
+                    .collect();
+                gate.replay(
+                    &format!("attention.{case}.order0"),
+                    &values,
+                    if grouped {
+                        "mixed17_49_grouped_graph_and_eager"
+                    } else {
+                        "scalar_graph_and_eager"
+                    },
+                )?;
+            }
+        }
+        let isolation = if grouped {
+            let expected = d.stream.clone_dtoh(&output)?;
+            attention.bind_f16_windows(&[0, 48, 96, 113])?;
+            attention.run_f16(
+                &q.slice(..),
+                512,
+                &k.slice(..),
+                &v.slice(..),
+                &mut output.slice_mut(..count),
+                (rows, rows, rows),
+            )?;
+            attention.bind_f16_windows(&[0, 17, 65, 113])?;
+            attention.run_f16(
+                &q.slice(..),
+                512,
+                &k.slice(..),
+                &v.slice(..),
+                &mut output.slice_mut(..count),
+                (rows, rows, rows),
+            )?;
+            let restored = expected == d.stream.clone_dtoh(&output)?;
+            gate.defects += usize::from(!restored);
+            Some(restored)
+        } else {
+            None
+        };
+        let valid = graph_equal && guard_unchanged && isolation != Some(false);
+        println!(
+            "{} N5_M2B_ATTENTION_MODE grouped={grouped} graph_eager_bit_identical={graph_equal} guard_unchanged={guard_unchanged} rows={rows} metadata_rebind={grouped} isolation_bit_identical={isolation:?} timing=false",
+            if valid { "PASS" } else { "DEFECT" }
+        );
+    }
+    Ok(())
 }
 
 #[test]
