@@ -3113,7 +3113,7 @@ impl PixalDecoder {
             columns,
         })
     }
-    pub fn serialized_qkv(
+    fn serialized_qkv(
         &self,
         maps: &SerializedWindows,
         qkv: Tensor<f16, 2>,
@@ -3824,7 +3824,7 @@ impl PixalDecoder {
         );
         let mut sign_logits = Vec::with_capacity(rows * 8);
         let mut features = Vec::with_capacity(rows * 32);
-        for row in values.chunks_exact(40) {
+        for row in values.as_chunks::<40>().0 {
             sign_logits.extend_from_slice(&row[..8]);
             features.extend_from_slice(&row[8..]);
         }

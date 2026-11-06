@@ -145,7 +145,9 @@ fn bank_sites(path: &Path) -> Result<SparseSites> {
     );
     SparseSites::new(
         grid.values
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .zip(batch.values)
             .map(|(p, b)| [b as i32, p[0] as i32, p[1] as i32, p[2] as i32])
             .collect(),
@@ -696,7 +698,9 @@ fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
     gate.score(&format!("{case}.{name}.logits"), &scores, false)?;
     let permutation = [0, 4, 2, 6, 1, 5, 3, 7];
     let wrong: Vec<_> = values
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .flat_map(|row| permutation.map(|i| f64::from(row[i])))
         .collect();
     gate.score(&format!("{case}.{name}.logits"), &wrong, true)?;
@@ -716,7 +720,9 @@ fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
         .count();
     gate.defects += decision_defects;
     let active: Vec<_> = values
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|row| std::array::from_fn(|i| row[i] > 0.0))
         .collect();
     let offsets =
@@ -869,19 +875,25 @@ fn hi3d_decoder_field_affine_gpu() -> Result<()> {
     }
     let actual = d.stream.clone_dtoh(&values)?;
     let selected: Vec<_> = actual
-        .chunks_exact(40)
+        .as_chunks::<40>()
+        .0
+        .iter()
         .flat_map(|row| row[8..].iter().map(|&v| f64::from(v)))
         .collect();
     ensure!(
         actual
-            .chunks_exact(40)
-            .zip(raw.chunks_exact(40))
+            .as_chunks::<40>()
+            .0
+            .iter()
+            .zip(raw.as_chunks::<40>().0.iter())
             .all(|(a, b)| a[..8] == b[..8]),
         "sign logits changed during corner activation"
     );
     field.score("fields.activated32", &selected, false)?;
     let wrong: Vec<_> = raw
-        .chunks_exact(40)
+        .as_chunks::<40>()
+        .0
+        .iter()
         .flat_map(|row| row[..32].iter().map(|v| f64::from(v.tanh())))
         .collect();
     field.score("fields.activated32", &wrong, true)?;
@@ -1045,7 +1057,9 @@ where
             }
             let values = selected_values(d, &output, &rows, co, &convert)?;
             let activated: Vec<_> = values
-                .chunks_exact(40)
+                .as_chunks::<40>()
+                .0
+                .iter()
                 .flat_map(|r| r[8..].iter().copied())
                 .collect();
             gate.score(&format!("{name}.activated"), &activated, control)?;
