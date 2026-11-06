@@ -3062,6 +3062,295 @@ fn hi3d_sparse_extraction_definition_gpu() -> Result<()> {
     Ok(())
 }
 
+fn linked_mesh_save(
+    path: &Path,
+    mesh: &crate::sparse::SparseMesh,
+    coordinates: &[[i32; 4]],
+    latent: &[f32],
+    frame: [[f32; 4]; 4],
+) -> Result<()> {
+    use std::io::Write;
+    let vertices: Vec<_> = mesh.vertices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let faces: Vec<_> = mesh.faces.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let coordinates_data: Vec<_> = coordinates
+        .as_flattened()
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let latent_data: Vec<_> = latent.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let matrix: Vec<_> = frame
+        .as_flattened()
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let tensors = BTreeMap::from([
+        (
+            "vertices",
+            safetensors::tensor::TensorView::new(
+                Dtype::F32,
+                vec![mesh.vertices.len() / 3, 3],
+                &vertices,
+            )?,
+        ),
+        (
+            "faces",
+            safetensors::tensor::TensorView::new(
+                Dtype::I32,
+                vec![mesh.faces.len() / 3, 3],
+                &faces,
+            )?,
+        ),
+        (
+            "coordinates",
+            safetensors::tensor::TensorView::new(
+                Dtype::I32,
+                vec![coordinates.len(), 4],
+                &coordinates_data,
+            )?,
+        ),
+        (
+            "final_latents",
+            safetensors::tensor::TensorView::new(
+                Dtype::F32,
+                vec![coordinates.len(), 32],
+                &latent_data,
+            )?,
+        ),
+        (
+            "matrix",
+            safetensors::tensor::TensorView::new(Dtype::F32, vec![4, 4], &matrix)?,
+        ),
+    ]);
+    let bytes = safetensors::tensor::serialize(tensors, None)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(&bytes)?;
+    Ok(())
+}
+
+fn linked_mesh_case(
+    model: &Path,
+    root: &Path,
+    runtime: &Path,
+    output: &Path,
+    context: &CudaSlice<f32>,
+    support: &str,
+    label: &str,
+) -> Result<crate::sparse::SparseMesh> {
+    let source = root.join(format!("linked-sm89-{support}-r1"));
+    let handoff = source.join("handoff.safetensors");
+    let coordinates = decoder_coordinates(&handoff, "coordinates")?;
+    ensure!(
+        coordinates.iter().all(|p| p[0] == 0),
+        "linked source support has multiple batches"
+    );
+    let grid: Vec<_> = coordinates.iter().map(|p| [p[1], p[2], p[3]]).collect();
+    let noise = f32_tensor(&handoff, "noise")?;
+    ensure!(
+        noise.len() == grid.len() * 32,
+        "linked source noise extent mismatch"
+    );
+    let observations: Value =
+        serde_json::from_slice(&std::fs::read(source.join("observations.json"))?)?;
+    let frame: [[f32; 4]; 4] = serde_json::from_value(observations["matrix"].clone())?;
+    let device = Device::new(0)?;
+    let budget = || -> Result<usize> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        let envelope = total.saturating_sub(total / 4);
+        envelope
+            .checked_sub(total - free)
+            .context("linked resident data exceeds derived device envelope")
+    };
+    let mut flow = Flow::<f16>::open_hi3d(model, "transformer_512", runtime, &grid, budget()?)?;
+    ensure!(
+        flow.coordinates == grid
+            && flow.io.as_ref().context("linked sparse IO missing")?.rows == grid.len(),
+        "linked support did not reach flow setup"
+    );
+    let positive = flow.conditioning_device(context, &grid)?;
+    let zero = flow.device.stream.alloc_zeros::<f32>(2917 * 2048)?;
+    let negative = flow.conditioning_device(&zero, &grid)?;
+    let latent = flow.sample_heun(&noise, &positive, &negative)?;
+    ensure!(
+        latent.len() == coordinates.len() * 32 && latent.iter().all(|v| v.is_finite()),
+        "linked latent handoff is invalid"
+    );
+    drop(positive);
+    drop(negative);
+    drop(zero);
+    drop(flow);
+    let decoder = PixalDecoder::open(model, DecoderKind::PointTransformer, runtime, budget()?)?;
+    let mesh = decoder.points_mesh(coordinates.clone(), &latent, frame, 64)?;
+    ensure!(
+        mesh.vertices.len().is_multiple_of(3)
+            && mesh.vertices.iter().all(|v| v.is_finite())
+            && mesh.faces.len().is_multiple_of(3),
+        "linked mesh has invalid buffers"
+    );
+    ensure!(
+        mesh.faces
+            .iter()
+            .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+        "linked mesh face exceeds capacity"
+    );
+    let path = output.join(label);
+    std::fs::create_dir(&path)?;
+    linked_mesh_save(
+        &path.join("native.safetensors"),
+        &mesh,
+        &coordinates,
+        &latent,
+        frame,
+    )?;
+    let repeat: Value = serde_json::from_slice(&std::fs::read(
+        root.join(format!("linked-sm89-{support}-r2/observations.json")),
+    )?)?;
+    println!(
+        "N5_M3_LINKED_MEASUREMENT label={label} support={support} input_rows={} latent_channels=32 updates=25 vertices={} faces={} source_r1_vertices={} source_r1_faces={} source_r2_vertices={} source_r2_faces={} equivalence_gate=false hole_fill=false timing=false",
+        grid.len(),
+        mesh.vertices.len() / 3,
+        mesh.faces.len() / 3,
+        observations["vertices"],
+        observations["triangles"],
+        repeat["vertices"],
+        repeat["triangles"]
+    );
+    Ok(mesh)
+}
+
+#[test]
+#[ignore = "requires admitted CUDA, published image/flow/decoder checkpoints and frozen media"]
+fn hi3d_linked_image_mesh_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let image_root = env_path("FF_HI3D_IMAGE_FIXTURES")?;
+    let model = env_path("FF_HI3D_MODEL")?;
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?;
+    let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    std::fs::create_dir_all(&output)?;
+    let image_bytes = std::fs::read(image_root.join("cpu-r2/inputs.safetensors"))?;
+    let images = safetensors::SafeTensors::deserialize(&image_bytes)?;
+    let image_freeze: Value =
+        serde_json::from_slice(&std::fs::read(image_root.join("FROZEN.json"))?)?;
+    let device = Device::new(0)?;
+    let ops = Ops::new(&device.ctx)?;
+    let mut blas = Blas::new(
+        &device,
+        &ops,
+        &runtime_path,
+        Rc::new(Closure::new(false, "linked image mesh gate".into())),
+    )?;
+    let mut conditioner = crate::backend::Hi3DImageConditioner::load(
+        &device,
+        &mut blas,
+        &env_path("FF_DINOV2_MODEL")?,
+        &env_path("FF_CLIP_MODEL")?,
+    )?;
+    let mut contexts = Vec::new();
+    let mut hosts = Vec::new();
+    for (index, name) in ["cottage", "robot_crab", "cottage"].into_iter().enumerate() {
+        let rgba = images.tensor(&format!("{name}.rgba"))?;
+        let orientation = images.tensor(&format!("{name}.orientation"))?;
+        ensure!(
+            rgba.dtype() == Dtype::U8 && rgba.shape().len() == 3 && rgba.shape()[2] == 4,
+            "linked RGBA input layout mismatch"
+        );
+        let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
+        let context = conditioner.encode_rgba(
+            &blas,
+            rgba.data(),
+            [rgba.shape()[0], rgba.shape()[1]],
+            orientation,
+        )?;
+        let mut owned = device.stream.alloc_zeros::<f32>(context.len())?;
+        device.stream.memcpy_dtod(context, &mut owned)?;
+        hosts.push(device.stream.clone_dtoh(&owned)?);
+        contexts.push(owned);
+        ensure!(
+            conditioner.encoder_calls() == [(index + 1) as u64; 2],
+            "linked image encoder call count differs"
+        );
+        println!(
+            "PASS N5_M3_LINKED_MEDIA image={name} invocation={} encoder_calls={:?}",
+            index + 1,
+            conditioner.encoder_calls()
+        );
+    }
+    drop(conditioner.into_context()?);
+    drop(blas);
+    let bounds = &image_freeze["cells"]["cottage.context"]["bounds"];
+    let first: Vec<_> = hosts[0].iter().map(|&v| v as f64).collect();
+    let swapped: Vec<_> = hosts[1].iter().map(|&v| v as f64).collect();
+    let replay: Vec<_> = hosts[2].iter().map(|&v| v as f64).collect();
+    let isolated = metrics(&replay, &first)?;
+    let image_control = metrics(&swapped, &first)?;
+    let mut defects = 0;
+    for metric in ["max_abs", "rmse"] {
+        let bound = bounds[metric]
+            .as_f64()
+            .context("frozen image context bound missing")?;
+        let bad = isolated[metric] > bound || image_control[metric] <= 10.0 * bound;
+        defects += usize::from(bad);
+        println!(
+            "{} N5_M3_LINKED_CONTEXT metric={metric} replay={} bound={bound} image_control={} control_multiple={}",
+            if bad { "DEFECT" } else { "PASS" },
+            isolated[metric],
+            image_control[metric],
+            image_control[metric] / bound
+        );
+    }
+    drop(hosts);
+    drop(first);
+    drop(swapped);
+    drop(replay);
+    let mut meshes = Vec::new();
+    for (index, support, label) in [
+        (0, "cottage", "cottage-A1"),
+        (1, "robot_crab", "robot-B1"),
+        (2, "cottage", "cottage-A2"),
+        (0, "robot_crab", "cottage-image-robot-support-control"),
+    ] {
+        let mesh = linked_mesh_case(
+            &model,
+            &root,
+            &runtime_path,
+            &output,
+            &contexts[index],
+            support,
+            label,
+        )?;
+        let empty = mesh.vertices.is_empty() || mesh.faces.is_empty();
+        defects += usize::from(empty);
+        println!(
+            "{} N5_M3_LINKED_NONEMPTY label={label} vertices={} triangles={}",
+            if empty { "DEFECT" } else { "PASS" },
+            mesh.vertices.len() / 3,
+            mesh.faces.len() / 3
+        );
+        meshes.push(mesh);
+    }
+    let distinct_media =
+        meshes[0].vertices != meshes[1].vertices || meshes[0].faces != meshes[1].faces;
+    let distinct_support =
+        meshes[0].vertices != meshes[3].vertices || meshes[0].faces != meshes[3].faces;
+    defects += usize::from(!distinct_media) + usize::from(!distinct_support);
+    println!(
+        "{} N5_M3_LINKED_ASSOCIATION image_outputs_differ={distinct_media} held_image_support_swap_differs={distinct_support}",
+        if distinct_media && distinct_support {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
+    );
+    println!(
+        "{} N5_M3_LINKED_GATE image_inputs=2 main_runs=3 support_controls=1 encoder_calls=3,3 raw_meshes=4 defects={defects} unforced_equivalence=false hole_fill=false timing=false",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "finite linked pipeline candidate defects");
+    Ok(())
+}
+
 struct Gate {
     package: &'static str,
     cells: BTreeMap<CellId, Value>,
