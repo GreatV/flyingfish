@@ -735,12 +735,25 @@ impl Engine {
             None => self.token()?,
         };
 
-        // 1. Run draft step with Layer 45
+        // 1. Save pre-round snapshot (both target model and Layer 45) before drafting
+        chain.target_checkpoint.save_rows(
+            &self.state,
+            &self.work.token,
+            start_pos,
+            2,
+            &stream,
+            None,
+        )?;
+        let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
+        chain
+            .mtp_checkpoint
+            .save_rows(mtp_state, &self.work.token, start_pos, 2, &stream, None)?;
+
+        // 2. Run draft step with Layer 45
         let glm_runtime = chain
             .glm_runtime
             .as_mut()
             .context("GLM MTP runtime missing")?;
-        let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
         let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
 
         let (draft_token, _draft_logits) = glm_runtime.step_draft_device(
@@ -760,20 +773,7 @@ impl Engine {
             draft_token
         };
 
-        // 2. Save pre-verify snapshot (both target model and Layer 45)
-        chain.target_checkpoint.save_rows(
-            &self.state,
-            &self.work.token,
-            start_pos,
-            2,
-            &stream,
-            None,
-        )?;
-        chain
-            .mtp_checkpoint
-            .save_rows(mtp_state, &self.work.token, start_pos, 2, &stream, None)?;
-
-        // 4. Run eager 2-row causal verify pass
+        // 3. Run eager 2-row causal verify pass
         stream.memcpy_htod(
             &[anchor_token, draft_token],
             &mut self.work.ids.slice_mut(..2),
@@ -861,6 +861,11 @@ impl Engine {
             unsafe {
                 super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;
             }
+            stream.memcpy_dtod(
+                &verify_logits_buf.slice(vocab..2 * vocab),
+                &mut self.work.logits,
+            )?;
+            self.logits_cache.mark_valid();
             Round {
                 tokens: vec![v0, v1],
                 proposals: vec![draft_token],
