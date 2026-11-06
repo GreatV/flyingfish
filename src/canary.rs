@@ -1,4 +1,7 @@
 //! Canary published configuration and 1507-tensor contract.
+#[cfg(feature = "cuda")]
+pub use crate::backend::cuda::engine_canary::Canary;
+
 use crate::{
     audio::LogMelConfig,
     checkpoint::MappedCheckpoint,

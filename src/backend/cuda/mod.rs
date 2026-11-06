@@ -15,6 +15,10 @@ pub mod draft;
 pub mod dsa;
 pub mod engine;
 #[cfg(feature = "cuda")]
+pub mod engine_canary;
+#[cfg(all(test, feature = "cuda"))]
+mod engine_canary_tests;
+#[cfg(feature = "cuda")]
 pub(crate) mod engine_music3_syn;
 #[cfg(feature = "cuda")]
 pub mod engine_parakeet;

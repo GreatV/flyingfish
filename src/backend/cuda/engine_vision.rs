@@ -6397,6 +6397,10 @@ impl DinoScalar for f32 {
                 dense(b.v, stream, [heads, rows, dim])?
             },
             &mut TensorMut(token_major(b.output)?),
+            crate::backend::cuda::flash::F32Mask {
+                causal: false,
+                valid_keys: rows,
+            },
         )
     }
 }
