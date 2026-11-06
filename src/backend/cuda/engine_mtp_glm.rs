@@ -196,13 +196,20 @@ fn make_fp8_weight(
     })
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct GlmMtpSliceInfo {
+    pub(crate) shard: u8,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct GlmMtpExpertHost {
-    pub(crate) gate_codes: Vec<u8>,
+    pub(crate) gate_codes: GlmMtpSliceInfo,
     pub(crate) gate_scales: Vec<f32>,
-    pub(crate) up_codes: Vec<u8>,
+    pub(crate) up_codes: GlmMtpSliceInfo,
     pub(crate) up_scales: Vec<f32>,
-    pub(crate) down_codes: Vec<u8>,
+    pub(crate) down_codes: GlmMtpSliceInfo,
     pub(crate) down_scales: Vec<f32>,
 }
 
@@ -263,6 +270,8 @@ pub(crate) struct GlmMtpRuntime {
     slot_down_scales: Vec<CudaSlice<f32>>,
     staged_slots: [Option<usize>; 8],
     experts: Vec<GlmMtpExpertHost>,
+    _mmap1: Arc<memmap2::Mmap>,
+    _mmap2: Arc<memmap2::Mmap>,
 
     head_norm_w: CudaSlice<bf16>,
 
@@ -310,11 +319,11 @@ impl GlmMtpRuntime {
         let add = mtp_mod.load_function("glm_mtp_add")?;
 
         let shard1_file = std::fs::File::open(model_dir.join("model-00001-of-00062.safetensors"))?;
-        let mmap1 = unsafe { memmap2::MmapOptions::new().map(&shard1_file)? };
+        let mmap1 = Arc::new(unsafe { memmap2::MmapOptions::new().map(&shard1_file)? });
         let st1 = safetensors::SafeTensors::deserialize(&mmap1)?;
 
         let shard2_file = std::fs::File::open(model_dir.join("model-00002-of-00062.safetensors"))?;
-        let mmap2 = unsafe { memmap2::MmapOptions::new().map(&shard2_file)? };
+        let mmap2 = Arc::new(unsafe { memmap2::MmapOptions::new().map(&shard2_file)? });
         let st2 = safetensors::SafeTensors::deserialize(&mmap2)?;
 
         let get_st_bf16 = |name: &str| -> Result<Vec<bf16>> {
@@ -357,12 +366,27 @@ impl GlmMtpRuntime {
                 .collect())
         };
 
-        let get_st_u8 = |name: &str| -> Result<Vec<u8>> {
+        let get_st_slice_info = |name: &str| -> Result<GlmMtpSliceInfo> {
             if let Ok(t) = st1.tensor(name) {
-                return Ok(t.data().to_vec());
+                let offset = unsafe { t.data().as_ptr().offset_from(mmap1.as_ptr()) as usize };
+                return Ok(GlmMtpSliceInfo {
+                    shard: 1,
+                    offset,
+                    len: t.data().len(),
+                });
             }
             let t = st2.tensor(name)?;
-            Ok(t.data().to_vec())
+            let offset = unsafe { t.data().as_ptr().offset_from(mmap2.as_ptr()) as usize };
+            Ok(GlmMtpSliceInfo {
+                shard: 2,
+                offset,
+                len: t.data().len(),
+            })
+        };
+
+        let slice_u8_init = |info: GlmMtpSliceInfo| -> &[u8] {
+            let mmap = if info.shard == 1 { &mmap1 } else { &mmap2 };
+            &mmap[info.offset..info.offset + info.len]
         };
 
         let config_str = std::fs::read_to_string(model_dir.join("config.json"))?;
@@ -393,25 +417,25 @@ impl GlmMtpRuntime {
             "model.language_model.layers.45.input_layernorm.weight",
         )?)?;
 
-        let q_a_codes = stream.clone_htod(&get_st_u8(
+        let q_a_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
             "model.language_model.layers.45.self_attn.q_a_proj.weight",
-        )?)?;
+        )?))?;
         let q_a_scales = stream.clone_htod(&get_st_f32(
             "model.language_model.layers.45.self_attn.q_a_proj.weight_scale_inv",
         )?)?;
         let q_a_norm_w = stream.clone_htod(&get_st_bf16(
             "model.language_model.layers.45.self_attn.q_a_layernorm.weight",
         )?)?;
-        let q_b_codes = stream.clone_htod(&get_st_u8(
+        let q_b_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
             "model.language_model.layers.45.self_attn.q_b_proj.weight",
-        )?)?;
+        )?))?;
         let q_b_scales = stream.clone_htod(&get_st_f32(
             "model.language_model.layers.45.self_attn.q_b_proj.weight_scale_inv",
         )?)?;
 
-        let kv_a_codes = stream.clone_htod(&get_st_u8(
+        let kv_a_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
             "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight",
-        )?)?;
+        )?))?;
         let kv_a_scales = stream.clone_htod(&get_st_f32(
             "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
         )?)?;
@@ -422,9 +446,9 @@ impl GlmMtpRuntime {
             "model.language_model.layers.45.self_attn.kv_b_proj.weight",
         )?)?;
 
-        let o_codes = stream.clone_htod(&get_st_u8(
+        let o_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
             "model.language_model.layers.45.self_attn.o_proj.weight",
-        )?)?;
+        )?))?;
         let o_scales = stream.clone_htod(&get_st_f32(
             "model.language_model.layers.45.self_attn.o_proj.weight_scale_inv",
         )?)?;
@@ -439,40 +463,40 @@ impl GlmMtpRuntime {
             "model.language_model.layers.45.mlp.gate.e_score_correction_bias",
         )?)?;
 
-        let sh_gate_codes = stream.clone_htod(&get_st_u8(
+        let sh_gate_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
             "model.language_model.layers.45.mlp.shared_experts.gate_proj.weight",
-        )?)?;
+        )?))?;
         let sh_gate_scales = stream.clone_htod(&get_st_f32(
             "model.language_model.layers.45.mlp.shared_experts.gate_proj.weight_scale_inv",
         )?)?;
-        let sh_up_codes = stream.clone_htod(&get_st_u8(
+        let sh_up_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
             "model.language_model.layers.45.mlp.shared_experts.up_proj.weight",
-        )?)?;
+        )?))?;
         let sh_up_scales = stream.clone_htod(&get_st_f32(
             "model.language_model.layers.45.mlp.shared_experts.up_proj.weight_scale_inv",
         )?)?;
-        let sh_down_codes = stream.clone_htod(&get_st_u8(
+        let sh_down_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
             "model.language_model.layers.45.mlp.shared_experts.down_proj.weight",
-        )?)?;
+        )?))?;
         let sh_down_scales = stream.clone_htod(&get_st_f32(
             "model.language_model.layers.45.mlp.shared_experts.down_proj.weight_scale_inv",
         )?)?;
 
         let mut experts = Vec::with_capacity(288);
         for i in 0..288 {
-            let gate_codes = get_st_u8(&format!(
+            let gate_codes = get_st_slice_info(&format!(
                 "model.language_model.layers.45.mlp.experts.{i}.gate_proj.weight"
             ))?;
             let gate_scales = get_st_f32(&format!(
                 "model.language_model.layers.45.mlp.experts.{i}.gate_proj.weight_scale_inv"
             ))?;
-            let up_codes = get_st_u8(&format!(
+            let up_codes = get_st_slice_info(&format!(
                 "model.language_model.layers.45.mlp.experts.{i}.up_proj.weight"
             ))?;
             let up_scales = get_st_f32(&format!(
                 "model.language_model.layers.45.mlp.experts.{i}.up_proj.weight_scale_inv"
             ))?;
-            let down_codes = get_st_u8(&format!(
+            let down_codes = get_st_slice_info(&format!(
                 "model.language_model.layers.45.mlp.experts.{i}.down_proj.weight"
             ))?;
             let down_scales = get_st_f32(&format!(
@@ -508,11 +532,11 @@ impl GlmMtpRuntime {
 
         for k in 0..8 {
             let exp = &experts[k];
-            stream.memcpy_htod(&exp.gate_codes, &mut slot_gate_codes[k])?;
+            stream.memcpy_htod(slice_u8_init(exp.gate_codes), &mut slot_gate_codes[k])?;
             stream.memcpy_htod(&exp.gate_scales, &mut slot_gate_scales[k])?;
-            stream.memcpy_htod(&exp.up_codes, &mut slot_up_codes[k])?;
+            stream.memcpy_htod(slice_u8_init(exp.up_codes), &mut slot_up_codes[k])?;
             stream.memcpy_htod(&exp.up_scales, &mut slot_up_scales[k])?;
-            stream.memcpy_htod(&exp.down_codes, &mut slot_down_codes[k])?;
+            stream.memcpy_htod(slice_u8_init(exp.down_codes), &mut slot_down_codes[k])?;
             stream.memcpy_htod(&exp.down_scales, &mut slot_down_scales[k])?;
 
             let (gc_ptr, _) = slot_gate_codes[k].device_ptr(stream);
@@ -719,6 +743,8 @@ impl GlmMtpRuntime {
                 Some(7),
             ],
             experts,
+            _mmap1: mmap1,
+            _mmap2: mmap2,
             head_norm_w,
             #[cfg(test)]
             standalone_embed,
@@ -749,6 +775,12 @@ impl GlmMtpRuntime {
 
     fn stage_routed_experts(&mut self, ids: &[i32]) -> Result<()> {
         let stream = self.stream.clone();
+        let mmap1 = &self._mmap1;
+        let mmap2 = &self._mmap2;
+        let slice_u8 = |info: GlmMtpSliceInfo| -> &[u8] {
+            let mmap = if info.shard == 1 { mmap1 } else { mmap2 };
+            &mmap[info.offset..info.offset + info.len]
+        };
         let target_experts: Vec<usize> = ids.iter().take(8).map(|&id| id as usize).collect();
 
         let mut needed_experts = Vec::new();
@@ -773,11 +805,11 @@ impl GlmMtpRuntime {
 
             for (&exp_id, &k) in needed_experts.iter().zip(&victim_slots) {
                 let exp = &self.experts[exp_id];
-                stream.memcpy_htod(&exp.gate_codes, &mut self.slot_gate_codes[k])?;
+                stream.memcpy_htod(slice_u8(exp.gate_codes), &mut self.slot_gate_codes[k])?;
                 stream.memcpy_htod(&exp.gate_scales, &mut self.slot_gate_scales[k])?;
-                stream.memcpy_htod(&exp.up_codes, &mut self.slot_up_codes[k])?;
+                stream.memcpy_htod(slice_u8(exp.up_codes), &mut self.slot_up_codes[k])?;
                 stream.memcpy_htod(&exp.up_scales, &mut self.slot_up_scales[k])?;
-                stream.memcpy_htod(&exp.down_codes, &mut self.slot_down_codes[k])?;
+                stream.memcpy_htod(slice_u8(exp.down_codes), &mut self.slot_down_codes[k])?;
                 stream.memcpy_htod(&exp.down_scales, &mut self.slot_down_scales[k])?;
 
                 let (gc_ptr, _) = self.slot_gate_codes[k].device_ptr(&stream);

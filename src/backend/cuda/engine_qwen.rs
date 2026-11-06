@@ -3682,7 +3682,7 @@ impl Engine {
         };
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
-        let mtp_budget = reserve_mtp
+        let mtp_budget = (reserve_mtp && !glm)
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
         let request = crate::prefill::WorkspaceRequest {
@@ -3980,7 +3980,7 @@ impl Engine {
             "{}",
             serde_json::json!({
                 "q38_memory_plan": budget,
-                "mtp_attachment_planned_bytes": if reserve_mtp { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { 0 },
+                "mtp_attachment_planned_bytes": if reserve_mtp && !glm { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { 0 },
                 "resident_weights_bytes": weights.bytes,
                 "prefix_cache": {
                     "enabled": prefix_cache,
