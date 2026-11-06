@@ -856,7 +856,7 @@ impl Engine {
             stream.memcpy_htod(&[v1], &mut self.work.token)?;
             self.committed_prefix_ids.push(anchor_token);
             self.committed_prefix_ids.push(v0);
-            self.pending_token = None;
+            self.pending_token = Some(v1);
             let (x_ptr, _) = self.work.x.device_ptr(&stream);
             unsafe {
                 super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;

@@ -134,7 +134,16 @@ impl Engine {
                 let remaining = count - generated.len();
                 let round =
                     if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
-                        self.glm_mtp_round(false)?.round
+                        if remaining == 1 {
+                            let token = self.decode(false, None)?;
+                            crate::mtp::transaction::Round {
+                                tokens: vec![token],
+                                consumed: 1,
+                                ..Default::default()
+                            }
+                        } else {
+                            self.glm_mtp_round(false)?.round
+                        }
                     } else {
                         match policy {
                             #[cfg(test)]
