@@ -844,6 +844,8 @@ impl Engine {
 
         // 7. Verification decision: accept vs reject
         let accepted = draft_token == v0;
+        #[cfg(test)]
+        let mut replay_row0_logits = None;
         let round = if accepted {
             self.position = start_pos + 2;
             self.set_token(v1)?;
@@ -885,7 +887,9 @@ impl Engine {
                 "DEFECT replayed token {replayed} differs from verify argmax {v0}"
             );
             #[cfg(test)]
-            let replay_row0_logits = Some(self.decode_logits()?);
+            {
+                replay_row0_logits = Some(self.decode_logits()?);
+            }
             Round {
                 tokens: vec![v0],
                 proposals: vec![draft_token],
@@ -894,9 +898,6 @@ impl Engine {
                 consumed: 1,
             }
         };
-
-        #[cfg(test)]
-        let replay_row0_logits = if accepted { None } else { replay_row0_logits };
 
         Ok(GlmMtpRoundOutput {
             round,
