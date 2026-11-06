@@ -59,33 +59,20 @@ struct Block {
     output_norm: Norm,
 }
 
-struct HostConvSpec {
-    time: usize,
-    frequency: usize,
-    in_channels: usize,
-    out_channels: usize,
-    groups: usize,
-    valid_time: usize,
+struct SubsampleConv {
+    weight: CudaSlice<f32>,
+    bias: CudaSlice<f32>,
 }
 
-struct HostConv {
-    weight: Vec<f32>,
-    bias: Vec<f32>,
-}
-
-struct HostLinear {
-    weight: Vec<f32>,
-    bias: Vec<f32>,
-    output: usize,
-    input: usize,
-}
-
-struct HostSubsample {
-    conv: [HostConv; 3],
-    pointwise: [HostLinear; 2],
+struct Subsample {
+    conv: [SubsampleConv; 3],
+    pointwise: [Linear; 2],
 }
 
 struct Ops {
+    conv2d: CudaFunction,
+    mask_time: CudaFunction,
+    pack: CudaFunction,
     depthwise: CudaFunction,
     batch_norm: CudaFunction,
     residual: CudaFunction,
@@ -98,7 +85,7 @@ struct Ops {
 pub struct ParakeetEncoder {
     spec: ParakeetSpec,
     stream: Arc<CudaStream>,
-    host_subsample: HostSubsample,
+    subsample: Subsample,
     subsample_linear: Linear,
     blas: CudaBlas,
     blocks: Vec<Block>,
@@ -201,21 +188,6 @@ fn relative_positions(rows: usize, hidden: usize) -> Result<Vec<f32>> {
     Ok(positions)
 }
 
-fn host_linear(
-    checkpoint: &MappedCheckpoint,
-    name: &str,
-    output: usize,
-    input: usize,
-    stored_shape: &[usize],
-) -> Result<HostLinear> {
-    Ok(HostLinear {
-        weight: checkpoint.f32_tensor(&format!("{name}.weight"), stored_shape)?,
-        bias: checkpoint.f32_tensor(&format!("{name}.bias"), &[output])?,
-        output,
-        input,
-    })
-}
-
 impl ParakeetEncoder {
     pub fn load(directory: &Path, device: &Device) -> Result<Self> {
         let spec = ParakeetSpec::read(directory)?;
@@ -233,6 +205,9 @@ impl ParakeetEncoder {
         let vision = cubin::module(&device.ctx, "vision_ops")?;
         let common = cubin::module(&device.ctx, "q38_common")?;
         let ops = Ops {
+            conv2d: speech.load_function("speech_conv2d_f32")?,
+            mask_time: speech.load_function("speech_mask_time_f32")?,
+            pack: speech.load_function("speech_pack_subsample_f32")?,
             depthwise: speech.load_function("speech_depthwise_conv_f32")?,
             batch_norm: speech.load_function("speech_batch_norm_f32")?,
             residual: speech.load_function("speech_residual_f32")?,
@@ -243,22 +218,30 @@ impl ParakeetEncoder {
         };
         let mut subsample_conv = Vec::new();
         for index in [0, 2, 5] {
-            subsample_conv.push(HostConv {
-                weight: checkpoint.f32_tensor(
+            subsample_conv.push(SubsampleConv {
+                weight: tensor(
+                    &checkpoint,
+                    &stream,
                     &format!("encoder.subsampling.layers.{index}.weight"),
                     &[256, 1, 3, 3],
                 )?,
-                bias: checkpoint
-                    .f32_tensor(&format!("encoder.subsampling.layers.{index}.bias"), &[256])?,
+                bias: tensor(
+                    &checkpoint,
+                    &stream,
+                    &format!("encoder.subsampling.layers.{index}.bias"),
+                    &[256],
+                )?,
             });
         }
         let mut subsample_pointwise = Vec::new();
         for index in [3, 6] {
-            subsample_pointwise.push(host_linear(
+            subsample_pointwise.push(linear_shaped(
                 &checkpoint,
+                &stream,
                 &format!("encoder.subsampling.layers.{index}"),
                 256,
                 256,
+                true,
                 &[256, 256, 1, 1],
             )?);
         }
@@ -270,7 +253,7 @@ impl ParakeetEncoder {
             4096,
             true,
         )?;
-        let host_subsample = HostSubsample {
+        let subsample = Subsample {
             conv: subsample_conv
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("subsample convolution count"))?,
@@ -393,7 +376,7 @@ impl ParakeetEncoder {
         Ok(Self {
             spec,
             stream,
-            host_subsample,
+            subsample,
             subsample_linear,
             blas,
             blocks,
@@ -523,65 +506,6 @@ impl ParakeetEncoder {
         Ok(())
     }
 
-    fn host_conv2d(input: &[f32], spec: HostConvSpec, conv: &HostConv) -> Vec<f32> {
-        let HostConvSpec {
-            time,
-            frequency,
-            in_channels,
-            out_channels,
-            groups,
-            valid_time,
-        } = spec;
-        let out_time = (time + 2 - 3) / 2 + 1;
-        let out_frequency = (frequency + 2 - 3) / 2 + 1;
-        let group_width = in_channels / groups;
-        let group_count = out_channels / groups;
-        let mut output = vec![0.0; out_time * out_frequency * out_channels];
-        for ot in 0..out_time {
-            for of in 0..out_frequency {
-                for channel in 0..out_channels {
-                    let mut sum = 0.0f32;
-                    if ot < valid_time {
-                        let first = channel / group_count * group_width;
-                        for ic in 0..group_width {
-                            for ky in 0..3 {
-                                for kx in 0..3 {
-                                    let it = ot * 2 + ky;
-                                    let iff = of * 2 + kx;
-                                    if it >= 1 && it <= time && iff >= 1 && iff <= frequency {
-                                        let source = (it - 1) * frequency + iff - 1;
-                                        let tap = ((channel * group_width + ic) * 3 + ky) * 3 + kx;
-                                        sum += input[source * in_channels + first + ic]
-                                            * conv.weight[tap];
-                                    }
-                                }
-                            }
-                        }
-                        sum += conv.bias[channel];
-                    }
-                    output[(ot * out_frequency + of) * out_channels + channel] = sum;
-                }
-            }
-        }
-        output
-    }
-
-    fn host_linear(input: &[f32], linear: &HostLinear) -> Vec<f32> {
-        let rows = input.len() / linear.input;
-        let mut output = vec![0.0; rows * linear.output];
-        for row in 0..rows {
-            for column in 0..linear.output {
-                let mut sum = linear.bias[column];
-                for inner in 0..linear.input {
-                    sum += input[row * linear.input + inner]
-                        * linear.weight[column * linear.input + inner];
-                }
-                output[row * linear.output + column] = sum;
-            }
-        }
-        output
-    }
-
     fn subsample_device(&self, input: &[f32], valid: usize) -> Result<SubsampleOutput> {
         ensure!(
             valid > 0
@@ -590,50 +514,65 @@ impl ParakeetEncoder {
                 && input.iter().all(|value| value.is_finite()),
             "invalid mel extent or non-finite input"
         );
-        let mut hidden = input.to_vec();
-        let mut time = hidden.len() / 128;
+        let mut hidden = self.stream.clone_htod(input)?;
+        let mut time = input.len() / 128;
         let mut frequency = 128usize;
         let mut current_valid = valid;
-        for (index, conv) in self.host_subsample.conv.iter().enumerate() {
+        for (index, conv) in self.subsample.conv.iter().enumerate() {
             let next_time = time.div_ceil(2);
             let next_frequency = frequency / 2;
             let next_valid = current_valid.div_ceil(2);
-            let groups = if index == 0 { 1 } else { 256 };
-            let in_channels = if index == 0 { 1 } else { 256 };
-            hidden = Self::host_conv2d(
-                &hidden,
-                HostConvSpec {
-                    time,
-                    frequency,
-                    in_channels,
-                    out_channels: 256,
-                    groups,
-                    valid_time: next_valid,
-                },
-                conv,
-            );
+            let output = self.stream.alloc_zeros(next_time * next_frequency * 256)?;
+            let in_channels = if index == 0 { 1u32 } else { 256 };
+            let groups = if index == 0 { 1u32 } else { 256 };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.ops.conv2d)
+                    .arg(&hidden)
+                    .arg(&conv.weight)
+                    .arg(&conv.bias)
+                    .arg(&output)
+                    .arg(&u32::try_from(time)?)
+                    .arg(&u32::try_from(frequency)?)
+                    .arg(&in_channels)
+                    .arg(&256u32)
+                    .arg(&groups)
+                    .arg(&u32::try_from(next_valid)?)
+                    .launch(flat(output.len()))?;
+            }
+            hidden = output;
             time = next_time;
             frequency = next_frequency;
             current_valid = next_valid;
+            let spatial = u32::try_from(time * frequency)?;
             if index > 0 {
-                hidden = Self::host_linear(&hidden, &self.host_subsample.pointwise[index - 1]);
-                hidden[current_valid * frequency * 256..].fill(0.0);
-            }
-            for value in &mut hidden {
-                *value = value.max(0.0);
-            }
-        }
-        let mut packed = vec![0.0; hidden.len()];
-        for t in 0..time {
-            for f in 0..frequency {
-                for channel in 0..256 {
-                    packed[(t * 256 + channel) * frequency + f] =
-                        hidden[(t * frequency + f) * 256 + channel];
+                hidden = self.linear(&hidden, spatial, &self.subsample.pointwise[index - 1])?;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.ops.mask_time)
+                        .arg(&hidden)
+                        .arg(&spatial)
+                        .arg(&u32::try_from(time)?)
+                        .arg(&u32::try_from(frequency)?)
+                        .arg(&256u32)
+                        .arg(&u32::try_from(current_valid)?)
+                        .launch(flat(hidden.len()))?;
                 }
             }
+            hidden = self.activate(&hidden, spatial, 256, 0)?;
         }
-        let packed = self.stream.clone_htod(&packed)?;
-        let hidden = self.linear(&packed, time as u32, &self.subsample_linear)?;
+        let packed = self.stream.alloc_zeros(hidden.len())?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.pack)
+                .arg(&hidden)
+                .arg(&packed)
+                .arg(&u32::try_from(time)?)
+                .arg(&u32::try_from(frequency)?)
+                .arg(&256u32)
+                .launch(flat(packed.len()))?;
+        }
+        let hidden = self.linear(&packed, u32::try_from(time)?, &self.subsample_linear)?;
         let mask = (0..time)
             .map(|index| u8::from(index < current_valid))
             .collect();
