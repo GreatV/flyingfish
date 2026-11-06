@@ -6978,3 +6978,335 @@ fn pixal3d_coordinate_noise_fixture_cpu() -> Result<()> {
     println!("P1_M4C_NOISE PASS cells={scored} axis_controls={scored} exact=true CPU_only=true");
     Ok(())
 }
+
+#[test]
+fn generation_rejects_extra_decoder_passes_and_forward_branches() -> Result<()> {
+    let mut spec: FlowSpec = serde_json::from_value(serde_json::json!({
+        "resolution":16,"in_channels":8,"out_channels":8,"model_channels":1536,
+        "cond_channels":1024,"num_blocks":30,"num_heads":12,"mlp_ratio":5.333333333333333,
+        "pe_mode":"rope","share_mod":true,"qk_rms_norm":true,"qk_rms_norm_cross":true,
+        "image_attn_mode":"proj","dtype":"bfloat16","proj_in_channels":null
+    }))?;
+    for (channels, negative) in [(8, 10), (32, 9), (64, 0)] {
+        spec.in_channels = channels;
+        flow_call_contract(&spec, [12, negative])?;
+        assert!(flow_call_contract(&spec, [11, negative]).is_err());
+        assert!(flow_call_contract(&spec, [12, negative + 1]).is_err());
+    }
+    decoder_pass_contract(1)?;
+    assert!(decoder_pass_contract(0).is_err());
+    assert!(decoder_pass_contract(2).is_err());
+    Ok(())
+}
+
+fn generation_capture(
+    path: &Path,
+    coordinates: &[[i32; 3]],
+    values: &[f32],
+    shape: Vec<usize>,
+) -> Result<()> {
+    use safetensors::tensor::TensorView;
+    ensure!(!path.exists(), "generation capture already exists");
+    let points: Vec<u8> = coordinates
+        .iter()
+        .flat_map(|p| [0, p[0], p[1], p[2]])
+        .flat_map(i32::to_le_bytes)
+        .collect();
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    safetensors::serialize_to_file(
+        [
+            (
+                "coordinates",
+                TensorView::new(Dtype::I32, vec![coordinates.len(), 4], &points)?,
+            ),
+            ("features", TensorView::new(Dtype::F32, shape, &bytes)?),
+        ],
+        None,
+        path,
+    )?;
+    Ok(())
+}
+
+fn generation_measurement(
+    case: &Value,
+    stage: usize,
+    coordinates: &[[i32; 3]],
+    actual: &[f32],
+    freeze: &Value,
+) -> Result<()> {
+    if stage == 0 {
+        let source = Path::new(case["capture"].as_str().context("chain capture")?)
+            .join("sparse_structure-0-outputs.safetensors");
+        let expected = tensor(&source, "samples")?;
+        let distance = metrics(
+            &actual.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+            &expected.values,
+        )?;
+        println!(
+            "P1_M4C_CHAIN_MEASUREMENT case={} stage=SS rows={} max_abs={} rmse={} gating=false",
+            case["case"],
+            coordinates.len(),
+            distance["max_abs"],
+            distance["rmse"]
+        );
+        return Ok(());
+    }
+    let name = format!(
+        "{}-{}",
+        case["case"].as_str().context("case name")?,
+        ["SS", "LR", "HR", "texture"][stage]
+    );
+    let cell = freeze["normalization"]
+        .as_array()
+        .context("normalization cells")?
+        .iter()
+        .find(|c| c["name"] == name)
+        .context("chain normalization capture")?;
+    let path = Path::new(cell["path"].as_str().context("normalization path")?);
+    let expected_coordinates = decoder_coordinates(path, "coords")?;
+    let expected = f32_tensor(path, "physical")?;
+    let sites = SparseSites::new(expected_coordinates)?;
+    let mut common = 0;
+    let mut maximum = 0.0f64;
+    let mut squares = 0.0f64;
+    for (row, p) in coordinates.iter().enumerate() {
+        if let Some(index) = sites.row([0, p[0], p[1], p[2]]) {
+            common += 1;
+            for channel in 0..32 {
+                let delta = f64::from(actual[row * 32 + channel])
+                    - f64::from(expected[index as usize * 32 + channel]);
+                maximum = maximum.max(delta.abs());
+                squares += delta * delta;
+            }
+        }
+    }
+    let union = coordinates.len() + sites.coordinates().len() - common;
+    println!(
+        "P1_M4C_CHAIN_MEASUREMENT name={name} native_rows={} reference_rows={} common={common} jaccard_disagreement={} reference_pair_jaccard_disagreement=0.5926020937353391 common_max_abs={maximum} common_rmse={} gating=false",
+        coordinates.len(),
+        sites.coordinates().len(),
+        1.0 - common as f64 / union as f64,
+        if common > 0 {
+            (squares / (common * 32) as f64).sqrt()
+        } else {
+            f64::NAN
+        }
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, published Pixal3D components, RGBA/cameras and coordinate noise"]
+fn pixal3d_generated_request_gpu() -> Result<()> {
+    use safetensors::tensor::TensorView;
+    let bytes = std::fs::read(env_path("FF_PIXAL_M4C_FREEZE")?)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes))
+            == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
+        "M4c freeze integrity"
+    );
+    let freeze: Value = serde_json::from_slice(&bytes)?;
+    let name = std::env::var("FF_PIXAL_M4C_CASE").context("FF_PIXAL_M4C_CASE")?;
+    let case = freeze["cases"]
+        .as_array()
+        .context("chain cases")?
+        .iter()
+        .find(|case| case["case"] == name)
+        .context("unfrozen generation case")?;
+    let (fixture, resolution) = name.rsplit_once('-').context("case resolution")?;
+    let resolution: u32 = resolution.parse()?;
+    let view_count = match fixture {
+        "mv4" => 4,
+        "mv1" => 1,
+        "cottage" | "robot_crab" => 1,
+        _ => anyhow::bail!("case fixture"),
+    };
+    let multiview = fixture.starts_with("mv");
+    let inputs = env_path("FF_P1_M2_ROOT")?.join("gate-inputs.safetensors");
+    let input_file = std::fs::File::open(&inputs)?;
+    let input_map = unsafe { memmap2::MmapOptions::new().map(&input_file)? };
+    let archive = safetensors::SafeTensors::deserialize(&input_map)?;
+    let root = env_path("FF_PIXAL_REFERENCE")?;
+    let mut views = Vec::new();
+    for index in 0..view_count {
+        let prefix = if multiview {
+            format!("mv-{index}")
+        } else {
+            fixture.to_owned()
+        };
+        let rgba = archive.tensor(&format!("{prefix}-rgba"))?;
+        let camera = if multiview {
+            let matrices = f32_tensor(&inputs, "mv-world-to-camera")?;
+            crate::backend::ProjectionCamera {
+                world_to_camera: matrices[index * 12..(index + 1) * 12].try_into()?,
+                horizontal_fov: f32_tensor(&inputs, "mv-angle")?[index],
+                mesh_scale: f32_tensor(&inputs, "mv-mesh-scale")?[0],
+            }
+        } else {
+            let meta: Value = serde_json::from_slice(&std::fs::read(
+                root.join("fixtures/pixal3d")
+                    .join(format!("{fixture}-camera.json")),
+            )?)?;
+            crate::backend::ProjectionCamera {
+                world_to_camera: f32_tensor(&inputs, &format!("{fixture}-world-to-camera"))?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("camera extent"))?,
+                horizontal_fov: meta["camera_angle_x"].as_f64().context("camera FOV")? as f32,
+                mesh_scale: meta["mesh_scale"].as_f64().context("camera scale")? as f32,
+            }
+        };
+        views.push(PixalView {
+            rgba: rgba.data(),
+            dimensions: [rgba.shape()[0], rgba.shape()[1]],
+            camera,
+        });
+    }
+    let noise_root = env_path("FF_PIXAL_M4C_NOISE")?;
+    let noise = ["ss", "lr", "hr", "tex"]
+        .map(|stage| -> Result<_> {
+            let data = tensor(&noise_root.join(format!("{stage}.safetensors")), "noise")?;
+            let shape: [usize; 5] = data
+                .shape
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("noise rank"))?;
+            Ok((
+                data.values
+                    .into_iter()
+                    .map(|v| v as f32)
+                    .collect::<Vec<_>>(),
+                shape,
+            ))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let model = env_path("FF_PIXAL_MODEL")?;
+    let dino = env_path("FF_DINOV3_MODEL")?;
+    let naf = env_path("FF_NAF_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let generation = PixalGeneration {
+        model: &model,
+        dino: &dino,
+        naf: &naf,
+        runtime: &runtime,
+        views: &views,
+        multiview,
+        requested_resolution: resolution,
+        noise: std::array::from_fn(|index| CoordinateNoise {
+            values: &noise[index].0,
+            shape: noise[index].1,
+            batch: 0,
+        }),
+    };
+    let output_dir = env_path("FF_PIXAL_M4C_OUTPUT")?;
+    std::fs::create_dir(&output_dir)?;
+    let device = Device::new(0)?;
+    let mut seen = Vec::new();
+    let mut grids = Vec::new();
+    let result = generation.run_observed(&device, |stage, grid, coordinates, data| {
+        ensure!(stage == seen.len(), "missing or repeated flow stage");
+        seen.push(stage);
+        grids.push(grid);
+        let actual = device.stream.clone_dtoh(data)?;
+        ensure!(
+            actual.iter().all(|v| v.is_finite()),
+            "nonfinite stage output"
+        );
+        let shape = if stage == 0 {
+            vec![1, 8, 16, 16, 16]
+        } else {
+            vec![coordinates.len(), 32]
+        };
+        generation_capture(
+            &output_dir.join(format!("stage{stage}.safetensors")),
+            coordinates,
+            &actual,
+            shape,
+        )?;
+        generation_measurement(case, stage, coordinates, &actual, &freeze)?;
+        println!(
+            "P1_M4C_STAGE PASS case={name} stage={stage} grid={grid} rows={} values={}",
+            coordinates.len(),
+            actual.len()
+        );
+        Ok(())
+    })?;
+    ensure!(
+        seen == [0, 1, 2, 3] && grids == [16, 32, result.resolution / 16, result.resolution / 16],
+        "stage/grid integration mismatch"
+    );
+    ensure!(
+        result.origin == [-0.5; 3] && result.voxel_size == 1.0 / result.resolution as f32,
+        "output world grid mismatch"
+    );
+    ensure!(
+        result.mesh.vertices.len().is_multiple_of(3)
+            && result.mesh.vertices.iter().all(|x| x.is_finite())
+            && result.mesh.faces.len().is_multiple_of(3)
+            && result
+                .mesh
+                .faces
+                .iter()
+                .all(|&i| i >= 0 && (i as usize) < result.mesh.vertices.len() / 3),
+        "invalid raw mesh"
+    );
+    ensure!(
+        result.material.channels == 6
+            && result.material.features.len() == result.material.coordinates.len() * 6
+            && result.material.features.iter().all(|x| x.is_finite())
+            && result.material.coordinates.iter().all(|p| p[0] == 0
+                && p[1..]
+                    .iter()
+                    .all(|&v| v >= 0 && v < result.resolution as i32)),
+        "invalid material voxel fields"
+    );
+    let coordinates: Vec<_> = result
+        .material
+        .coordinates
+        .iter()
+        .map(|p| [p[1], p[2], p[3]])
+        .collect();
+    generation_capture(
+        &output_dir.join("material.safetensors"),
+        &coordinates,
+        &result.material.features,
+        vec![coordinates.len(), 6],
+    )?;
+    let vertices: Vec<u8> = result
+        .mesh
+        .vertices
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let faces: Vec<u8> = result
+        .mesh
+        .faces
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    safetensors::serialize_to_file(
+        [
+            (
+                "vertices",
+                TensorView::new(
+                    Dtype::F32,
+                    vec![result.mesh.vertices.len() / 3, 3],
+                    &vertices,
+                )?,
+            ),
+            (
+                "faces",
+                TensorView::new(Dtype::I32, vec![result.mesh.faces.len() / 3, 3], &faces)?,
+            ),
+        ],
+        None,
+        &output_dir.join("mesh.safetensors"),
+    )?;
+    println!(
+        "P1_M4C_GENERATED_REQUEST PASS case={name} actual_resolution={} vertices={} faces={} material_rows={} generated_reference_comparisons=measurements timing=false",
+        result.resolution,
+        result.mesh.vertices.len() / 3,
+        result.mesh.faces.len() / 3,
+        result.material.coordinates.len()
+    );
+    Ok(())
+}

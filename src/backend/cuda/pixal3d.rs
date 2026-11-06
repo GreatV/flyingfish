@@ -2755,8 +2755,14 @@ impl Flow<bf16> {
             .collect();
         self.set_times(&model_times)?;
         let mut sampler = Sampler::from_state(&self.device, noise, !self.spec.texture())?;
+        #[cfg(test)]
+        let mut calls = [0usize; 2];
         for step in 0..self.steps {
             self.forward(&sampler.state, step, positive, &mut sampler.positive)?;
+            #[cfg(test)]
+            {
+                calls[0] += 1;
+            }
             if let Some(negative) = negative.filter(|_| (0.6..=1.0).contains(&times[step])) {
                 self.forward(
                     &sampler.state,
@@ -2764,6 +2770,10 @@ impl Flow<bf16> {
                     negative,
                     sampler.negative.as_mut().context("CFG buffer missing")?,
                 )?;
+                #[cfg(test)]
+                {
+                    calls[1] += 1;
+                }
             }
             sampler.step(
                 &self.device,
@@ -2772,16 +2782,79 @@ impl Flow<bf16> {
                 self.spec.sparse(),
             )?;
         }
+        #[cfg(test)]
+        flow_call_contract(&self.spec, calls)?;
         if let Some(normalization) = &self.normalization {
+            #[cfg(test)]
+            let normalized = self.device.stream.clone_dtoh(&sampler.state)?;
             channel_transform(
                 &self.device,
                 &mut sampler.state,
                 [&normalization[1][0], &normalization[1][1]],
                 false,
             )?;
+            #[cfg(test)]
+            transform_contract(
+                &self.device,
+                &normalized,
+                &sampler.state,
+                [&normalization[1][0], &normalization[1][1]],
+            )?;
         }
         Ok(sampler.state)
     }
+}
+
+#[cfg(test)]
+fn flow_call_contract(spec: &FlowSpec, calls: [usize; 2]) -> Result<()> {
+    let expected = if spec.texture() {
+        [12, 0]
+    } else if spec.sparse() {
+        [12, 9]
+    } else {
+        [12, 10]
+    };
+    ensure!(
+        calls == expected,
+        "flow forward branch count mismatch: {calls:?} expected {expected:?}"
+    );
+    println!(
+        "P1_M4C_FORWARD PASS sparse={} texture={} positive={} negative={}",
+        spec.sparse(),
+        spec.texture(),
+        calls[0],
+        calls[1]
+    );
+    Ok(())
+}
+#[cfg(test)]
+fn decoder_pass_contract(passes: usize) -> Result<()> {
+    ensure!(passes == 1, "decoder executed {passes} complete passes");
+    println!("P1_M4C_DECODE_PASS PASS count={passes}");
+    Ok(())
+}
+#[cfg(test)]
+fn transform_contract(
+    device: &Device,
+    before: &[f32],
+    after: &CudaSlice<f32>,
+    statistics: [&[f32]; 2],
+) -> Result<()> {
+    let [mean, std] = statistics;
+    let expected: Vec<_> = before
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * std[i % std.len()] + mean[i % mean.len()])
+        .collect();
+    ensure!(
+        device.stream.clone_dtoh(after)? == expected,
+        "latent transform was omitted, repeated or used different coefficients"
+    );
+    println!(
+        "P1_M4C_TRANSFORM PASS values={} applications=1 exact=true",
+        expected.len()
+    );
+    Ok(())
 }
 
 fn channel_transform(
@@ -3181,6 +3254,12 @@ pub struct PixalOutput {
 
 impl PixalGeneration<'_> {
     pub fn run(&self, device: &Device) -> Result<PixalOutput> {
+        self.run_observed(device, |_, _, _, _| Ok(()))
+    }
+    fn run_observed<F>(&self, device: &Device, mut observe: F) -> Result<PixalOutput>
+    where
+        F: FnMut(usize, u32, &[[i32; 3]], &CudaSlice<f32>) -> Result<()>,
+    {
         ensure!(
             matches!(self.requested_resolution, 1024 | 1536),
             "unsupported requested resolution"
@@ -3223,18 +3302,34 @@ impl PixalGeneration<'_> {
         let ss: Vec<_> = (0..16usize.pow(3))
             .map(|i| [(i / 256) as i32, ((i / 16) % 16) as i32, (i % 16) as i32])
             .collect();
-        let structure = self.flow_stage(device, &pipeline, (0, 16), &ss, None, &request)?;
+        let structure = self.flow_stage(
+            device,
+            &pipeline,
+            (0, 16),
+            &ss,
+            (&request, None),
+            &mut observe,
+        )?;
         let decoder = self.decoder(device, DecoderKind::Structure)?;
         let logits = decoder.structure_device(structure)?;
         let low = PixalDecoder::structure_sites(&logits, 64, 32)?;
         drop(logits);
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get())?;
         drop(decoder);
         let low_xyz: Vec<_> = low
             .coordinates()
             .iter()
             .map(|p| [p[1], p[2], p[3]])
             .collect();
-        let low_latent = self.flow_stage(device, &pipeline, (1, 32), &low_xyz, None, &request)?;
+        let low_latent = self.flow_stage(
+            device,
+            &pipeline,
+            (1, 32),
+            &low_xyz,
+            (&request, None),
+            &mut observe,
+        )?;
         drop(low_xyz);
         let decoder = self.decoder(device, DecoderKind::Shape)?;
         let (resolution, high) = decoder.cascade_coordinates_device(
@@ -3244,6 +3339,8 @@ impl PixalGeneration<'_> {
             49152,
         )?;
         drop(low);
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get())?;
         drop(decoder);
         let high_xyz: Vec<_> = high
             .coordinates()
@@ -3255,25 +3352,29 @@ impl PixalGeneration<'_> {
             &pipeline,
             (2, resolution / 16),
             &high_xyz,
-            None,
-            &request,
+            (&request, None),
+            &mut observe,
         )?;
         let texture = self.flow_stage(
             device,
             &pipeline,
             (3, resolution / 16),
             &high_xyz,
-            Some(&shape),
-            &request,
+            (&request, Some(&shape)),
+            &mut observe,
         )?;
         drop(high_xyz);
         let decoder = self.decoder(device, DecoderKind::Shape)?;
         let (mesh, guides) =
             decoder.shape_mesh_device(high.coordinates().to_vec(), shape, resolution)?;
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get())?;
         drop(decoder);
         let decoder = self.decoder(device, DecoderKind::Texture)?;
         let (material, predicted) =
             decoder.decode_device(high.coordinates().to_vec(), texture, &guides)?;
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get())?;
         ensure!(
             predicted.is_empty(),
             "texture decoder predicted subdivision"
@@ -3293,15 +3394,19 @@ impl PixalGeneration<'_> {
     fn decoder(&self, device: &Device, kind: DecoderKind) -> Result<PixalDecoder> {
         PixalDecoder::open(device, self.model, kind, self.runtime, self.budget(device)?)
     }
-    fn flow_stage(
+    fn flow_stage<F>(
         &self,
         device: &Device,
         pipeline: &serde_json::Value,
         stage: (usize, u32),
         coordinates: &[[i32; 3]],
-        physical_shape: Option<&CudaSlice<f32>>,
-        request: &Rc<()>,
-    ) -> Result<CudaSlice<f32>> {
+        input: (&Rc<()>, Option<&CudaSlice<f32>>),
+        observe: &mut F,
+    ) -> Result<CudaSlice<f32>>
+    where
+        F: FnMut(usize, u32, &[[i32; 3]], &CudaSlice<f32>) -> Result<()>,
+    {
+        let (request, physical_shape) = input;
         let (stage, grid_side) = stage;
         let key = [
             "sparse_structure_flow_model",
@@ -3394,6 +3499,8 @@ impl PixalGeneration<'_> {
         let noise = self.noise[stage].gather(coordinates, spec.out_channels, !spec.sparse())?;
         let noise = device.stream.clone_htod(&noise)?;
         let mut output = flow.sample_device(noise, &positive, negative.as_ref())?;
+        #[cfg(test)]
+        let before_transform = device.stream.clone_dtoh(&output)?;
         if matches!(stage, 1 | 2) {
             let normalization = &pipeline["args"]["shape_slat_normalization"];
             let mean: Vec<f32> = serde_json::from_value(normalization["mean"].clone())?;
@@ -3403,7 +3510,17 @@ impl PixalGeneration<'_> {
                 "shape normalization channel count"
             );
             channel_transform(device, &mut output, [&mean, &std], false)?;
+            #[cfg(test)]
+            transform_contract(device, &before_transform, &output, [&mean, &std])?;
         }
+        #[cfg(test)]
+        if stage == 0 || stage == 3 {
+            ensure!(
+                device.stream.clone_dtoh(&output)? == before_transform,
+                "unchanged latent boundary differs"
+            );
+        }
+        observe(stage, grid_side, coordinates, &output)?;
         Ok(output)
     }
 }
@@ -3420,6 +3537,8 @@ pub struct PixalDecoder {
     columns: Option<CudaSlice<u8>>,
     #[cfg(test)]
     subdivision_launches: std::cell::Cell<usize>,
+    #[cfg(test)]
+    decode_passes: std::cell::Cell<usize>,
 }
 pub struct SparseDecoderOutput {
     pub coordinates: Vec<[i32; 4]>,
@@ -3586,6 +3705,8 @@ impl PixalDecoder {
             kind,
             #[cfg(test)]
             subdivision_launches: std::cell::Cell::new(0),
+            #[cfg(test)]
+            decode_passes: std::cell::Cell::new(0),
             initial_free: free,
             device_budget,
             ones,
@@ -4619,6 +4740,8 @@ impl PixalDecoder {
             "sparse decoder required"
         );
         validate_guide_count(self.kind, guides.len())?;
+        #[cfg(test)]
+        self.decode_passes.set(self.decode_passes.get() + 1);
         let mut sites = SparseSites::new(coordinates)?;
         let n = sites.coordinates().len();
         ensure!(
@@ -5069,6 +5192,8 @@ impl PixalDecoder {
         self.structure_rows(input)
     }
     fn structure_rows(&self, input: CudaSlice<f32>) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        self.decode_passes.set(self.decode_passes.get() + 1);
         let d = &self.device;
         let rows = 16usize.pow(3);
         let float = d.stream.alloc_zeros::<f32>(rows * 512)?;
