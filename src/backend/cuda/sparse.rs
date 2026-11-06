@@ -7,12 +7,12 @@ use super::{
     ops::{flat, grid},
 };
 use crate::{
-    backend::gpu::{CudaFunction, CudaSlice, DeviceRepr, PushKernelArg},
+    backend::gpu::{CudaFunction, CudaModule, CudaSlice, DeviceRepr, PushKernelArg},
     sparse::{SparseCorners, SparseMesh, SparseSites},
 };
 use anyhow::{Context, Result, ensure};
 use half::f16;
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 pub(crate) struct CornerFields {
     pub layout: SparseCorners,
@@ -497,6 +497,7 @@ pub(crate) fn cube_mesh(
     );
     compact_quads(
         d,
+        &module,
         vertices,
         quads,
         face_counts,
@@ -617,6 +618,7 @@ pub(crate) fn mesh_from_dual(
     drop(sites);
     compact_quads(
         d,
+        &module,
         vertices,
         quads,
         counts,
@@ -627,6 +629,7 @@ pub(crate) fn mesh_from_dual(
 
 fn compact_quads(
     d: &Device,
+    module: &Arc<CudaModule>,
     vertices: CudaSlice<f32>,
     quads: CudaSlice<i32>,
     counts: CudaSlice<u64>,
@@ -661,7 +664,6 @@ fn compact_quads(
         .and_then(|v| v.checked_add(edges))
         .context("face workspace overflow")?;
     d.workspace_budget(budget[0], budget[1], additional)?;
-    let module = cubin::module(&d.ctx, "vision_ops")?;
     let diagonal = match split {
         QuadSplit::Fixed(diagonal) => {
             ensure!(diagonal.len() == edges, "quad diagonal extent mismatch");
