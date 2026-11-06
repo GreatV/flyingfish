@@ -1721,7 +1721,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "glm_mtp".into(),
     ));
     let blas = Blas::new(&device, &ops, &std::env::temp_dir(), closure)?;
-    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true)?;
+    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true, 2048)?;
 
     // 1. Synthetic case
     let synth_inputs = std::fs::read(ref_dir.join("common_inputs.safetensors"))?;

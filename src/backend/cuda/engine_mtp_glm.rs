@@ -308,6 +308,7 @@ impl GlmMtpRuntime {
         device: &Device,
         _blas: &Blas,
         standalone_weights: bool,
+        capacity: usize,
     ) -> Result<Self> {
         unsafe {
             device.ctx.disable_event_tracking();
@@ -405,9 +406,9 @@ impl GlmMtpRuntime {
 
         let fp8 = Fp8Ops::new(&device.ctx)?;
         let dsa_spec = DsaSpec::glm53();
-        let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, 2048, 1)?;
+        let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, capacity as u32, 1)?;
         let _standalone_dsa = if standalone_weights {
-            Some(DsaState::new(dsa_spec, 2048, stream)?)
+            Some(DsaState::new(dsa_spec, capacity as u32, stream)?)
         } else {
             None
         };

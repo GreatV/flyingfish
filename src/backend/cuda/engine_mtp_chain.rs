@@ -428,6 +428,9 @@ impl Engine {
     pub(crate) fn mtp_enable(&mut self, options: MtpOptions) -> Result<()> {
         self.mtp_enable_bound(options)
     }
+    pub fn mtp_graph_mode(&self) -> bool {
+        self.mtp.as_ref().map(|m| m.options.graph).unwrap_or(false)
+    }
     pub(in crate::backend::cuda::engine) fn check_mtp_mode(&self, graph: bool) -> Result<()> {
         ensure!(
             self.mtp
@@ -489,7 +492,8 @@ impl Engine {
                 .as_ref()
                 .context("GLM runtime missing")?
                 .checkpoint_path();
-            let glm_runtime = GlmMtpRuntime::load(dir, &self.device, &self.blas, false)?;
+            let glm_runtime =
+                GlmMtpRuntime::load(dir, &self.device, &self.blas, false, self.capacity)?;
             let spec = crate::mtp::component_spec(&self.model_spec)?;
             let state = StateStore::new(&spec, self.capacity, &self.device.stream)?;
             let target_checkpoint =
