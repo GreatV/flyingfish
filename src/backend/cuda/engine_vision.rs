@@ -7227,13 +7227,28 @@ impl PixalConditioningRuntime {
         } else {
             shape.grid_side.pow(3)
         };
+        let side = shape.grid_side as usize;
+        let indexed = coordinates.is_some_and(|rows| {
+            rows.len() != side.pow(3)
+                || rows.iter().enumerate().any(|(i, p)| {
+                    *p != [
+                        (i / (side * side)) as i32,
+                        ((i / side) % side) as i32,
+                        (i % side) as i32,
+                    ]
+                })
+        });
         let projection_bytes = (projection_rows as usize)
             .checked_mul(channels as usize * size_of::<f32>())
             .context("projection size overflow")?;
         let reserve = shape.image_side as usize * shape.image_side as usize * 3 * 4
             + 15 * 4
             + 5 * 1024 * 4
-            + coordinates.map_or(0, std::mem::size_of_val);
+            + if indexed {
+                coordinates.map_or(0, std::mem::size_of_val)
+            } else {
+                0
+            };
         let live = projection_bytes
             .checked_add(reserve)
             .context("conditioning workspace size overflow")?;
@@ -7266,7 +7281,16 @@ impl PixalConditioningRuntime {
         let camera = s.alloc_zeros(15)?;
         let global = s.alloc_zeros(5 * 1024)?;
         let coordinates = coordinates
-            .map(|rows| -> Result<_> { Ok((rows.to_vec(), s.clone_htod(rows.as_flattened())?)) })
+            .map(|rows| -> Result<_> {
+                Ok((
+                    rows.to_vec(),
+                    if indexed {
+                        s.clone_htod(rows.as_flattened())?
+                    } else {
+                        s.alloc_zeros(0)?
+                    },
+                ))
+            })
             .transpose()?;
         let naf = if let (Some(side), Some(dir)) = (shape.naf_side, naf_dir) {
             let encoder = NafEncoder::load(device, dir)?;
@@ -7282,7 +7306,7 @@ impl PixalConditioningRuntime {
         let module = cubin::module(&device.ctx, "vision_ops")?;
         device.workspace_budget(free_before, capacity, 0)?;
         let (free_after, _) = device.ctx.mem_get_info()?;
-        let project = module.load_function(if coordinates.is_some() {
+        let project = module.load_function(if indexed {
             "project_bilinear_indexed_f32"
         } else {
             "project_bilinear_f32"
@@ -7458,7 +7482,11 @@ impl PixalConditioningRuntime {
                     .arg(&input.ptr)
                     .arg(&self.projection)
                     .arg(&self.camera);
-                if let Some((_, coordinates)) = &self.coordinates {
+                if let Some((_, coordinates)) = self
+                    .coordinates
+                    .as_ref()
+                    .filter(|(_, data)| !data.is_empty())
+                {
                     launch.arg(coordinates);
                 }
                 launch
@@ -13516,6 +13544,145 @@ mod tests {
                 .as_f64()
                 .context("camera mesh scale")? as f32,
         })
+    }
+
+    #[test]
+    #[ignore = "requires CUDA, published DINOv3 and supplied RGBA fixtures"]
+    #[cfg(feature = "cuda")]
+    fn pixal_conditioning_owned_projection_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use std::{path::PathBuf, rc::Rc};
+        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
+        let project = root
+            .parent()
+            .and_then(|p| p.parent())
+            .context("project root")?;
+        let file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let inputs = safetensors::SafeTensors::deserialize(&map)?;
+        let rgba = inputs.tensor("cottage-rgba")?;
+        let camera = pixal_camera(&inputs, project, "cottage")?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
+        );
+        let mut blas = test_blas(
+            &device,
+            &runtime,
+            Rc::new(Closure::new(false, "projected conditioning".into())),
+        )?;
+        let request = Rc::new(());
+        let shape = PixalConditioningShape {
+            image_side: 512,
+            grid_side: 32,
+            naf_side: None,
+        };
+        let mut dense =
+            PixalConditioningRuntime::load(&device, &mut blas, &dino, None, shape, None, &request)?;
+        dense.stage_rgba(s, rgba.data(), [rgba.shape()[0], rgba.shape()[1]], camera)?;
+        dense.run_view(s, &blas, 0, 1)?;
+        ensure!(
+            dense.dino_ws.completed_encodes == 1,
+            "dense media encoder count"
+        );
+        let expected = s.clone_dtoh(&dense.projection)?;
+        let global = s.clone_dtoh(&dense.global)?;
+        let attention_bytes = dense.dino_ws.flash_d64.workspace_bytes();
+        drop(dense);
+        for canonical in [false, true] {
+            let points: Vec<[i32; 3]> = (0..if canonical { 32768 } else { 4099 })
+                .map(|i| {
+                    let index = if canonical { i } else { (i * 37 + 11) % 32768 };
+                    [index / 1024, (index / 32) % 32, index % 32]
+                })
+                .collect();
+            let mut encoder = PixalConditioningRuntime::load(
+                &device,
+                &mut blas,
+                &dino,
+                None,
+                shape,
+                Some(&points),
+                &request,
+            )?;
+            let coordinate_bytes = encoder
+                .coordinates
+                .as_ref()
+                .context("coordinate binding")?
+                .1
+                .num_bytes();
+            ensure!(
+                coordinate_bytes == if canonical { 0 } else { points.len() * 12 },
+                "projection route coordinate allocation"
+            );
+            ensure!(
+                encoder.dino_ws.flash_d64.workspace_bytes() == attention_bytes,
+                "attention tile changed"
+            );
+            encoder.stage_rgba(s, rgba.data(), [rgba.shape()[0], rgba.shape()[1]], camera)?;
+            encoder.run_view(s, &blas, 0, 1)?;
+            ensure!(
+                encoder.dino_ws.completed_encodes == 1,
+                "indexed media encoder count"
+            );
+            s.synchronize()?;
+            let before = device.ctx.mem_get_info()?.0;
+            let encoded = encoder.finish()?;
+            s.synchronize()?;
+            let after = device.ctx.mem_get_info()?.0;
+            ensure!(
+                after > before,
+                "encoder workspace remained resident after finish"
+            );
+            let (actual_global, actual) = encoded.binding(&points, shape, &request, &[camera])?;
+            ensure!(
+                s.clone_dtoh(actual_global)? == global,
+                "global handoff differs"
+            );
+            let selected: Vec<f32> = points
+                .iter()
+                .flat_map(|p| {
+                    let i = (p[0] as usize * 32 + p[1] as usize) * 32 + p[2] as usize;
+                    expected[i * 1024..(i + 1) * 1024].iter().copied()
+                })
+                .collect();
+            ensure!(
+                s.clone_dtoh(actual)? == selected,
+                "indexed projection differs from dense selection"
+            );
+            ensure!(
+                encoded
+                    .binding(&points, shape, &Rc::new(()), &[camera])
+                    .is_err(),
+                "foreign request accepted"
+            );
+            let mut wrong_camera = camera;
+            wrong_camera.world_to_camera[3] += 0.25;
+            ensure!(
+                encoded
+                    .binding(&points, shape, &request, &[wrong_camera])
+                    .is_err(),
+                "foreign camera accepted"
+            );
+            let mut wrong_points = points.clone();
+            wrong_points.rotate_left(1);
+            ensure!(
+                encoded
+                    .binding(&wrong_points, shape, &request, &[camera])
+                    .is_err(),
+                "foreign row order accepted"
+            );
+            println!(
+                "P1_M4C_RUNTIME PASS canonical={canonical} rows={} global_values={} projection_values={} coordinate_bytes={coordinate_bytes} attention_workspace_bytes={attention_bytes} released_encoder_bytes={} bit_exact=true binding_controls=3",
+                points.len(),
+                actual_global.len(),
+                actual.len(),
+                after - before
+            );
+        }
+        Ok(())
     }
 
     #[test]
