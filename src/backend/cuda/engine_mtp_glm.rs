@@ -275,7 +275,7 @@ pub(crate) struct GlmMtpRuntime {
 
     head_norm_w: CudaSlice<bf16>,
 
-    pub(crate) standalone_embed: Option<CudaSlice<bf16>>,
+    pub(crate) _standalone_embed: Option<CudaSlice<bf16>>,
     pub(crate) standalone_head: Option<CudaSlice<bf16>>,
 
     pub(crate) token_embed_buf: CudaSlice<bf16>,
@@ -299,7 +299,7 @@ pub(crate) struct GlmMtpRuntime {
 
     pub(crate) last_route: Option<(Vec<i32>, Vec<f32>)>,
 
-    pub(crate) standalone_dsa: Option<DsaState>,
+    pub(crate) _standalone_dsa: Option<DsaState>,
 }
 
 impl GlmMtpRuntime {
@@ -406,7 +406,7 @@ impl GlmMtpRuntime {
         let fp8 = Fp8Ops::new(&device.ctx)?;
         let dsa_spec = DsaSpec::glm53();
         let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, 2048, 1)?;
-        let standalone_dsa = if standalone_weights {
+        let _standalone_dsa = if standalone_weights {
             Some(DsaState::new(dsa_spec, 2048, stream)?)
         } else {
             None
@@ -670,7 +670,7 @@ impl GlmMtpRuntime {
             "model.language_model.layers.45.shared_head.norm.weight",
         )?)?;
 
-        let standalone_embed = if standalone_weights {
+        let _standalone_embed = if standalone_weights {
             match get_st_bf16("model.language_model.embed_tokens.weight") {
                 Ok(v) => Some(stream.clone_htod(&v)?),
                 Err(_) => None,
@@ -759,7 +759,7 @@ impl GlmMtpRuntime {
             _mmap1: mmap1,
             _mmap2: mmap2,
             head_norm_w,
-            standalone_embed,
+            _standalone_embed,
             standalone_head,
             token_embed_buf: stream.alloc_zeros::<bf16>(4096)?,
             enorm_buf: stream.alloc_zeros::<bf16>(4096)?,
@@ -780,7 +780,7 @@ impl GlmMtpRuntime {
             logits_buf: stream.alloc_zeros::<f32>(154880)?,
             dsa_indices_buf: stream.alloc_zeros::<i32>(2051)?,
             last_route: None,
-            standalone_dsa,
+            _standalone_dsa,
         })
     }
 
@@ -1102,7 +1102,7 @@ impl GlmMtpRuntime {
         for t in 0..p.saturating_sub(1) {
             let tok = history_tokens[t] as usize;
             let tok_slice = self
-                .standalone_embed
+                ._standalone_embed
                 .as_ref()
                 .context("standalone embed missing")?
                 .slice(tok * 4096..(tok + 1) * 4096);
@@ -1204,13 +1204,13 @@ impl GlmMtpRuntime {
 
         let stream = self.stream.clone();
         let mut dsa = self
-            .standalone_dsa
+            ._standalone_dsa
             .take()
             .context("standalone DSA state missing")?;
         self.populate_history(history_tokens, history_hidden, &mut dsa, blas)?;
 
         let tok_slice = self
-            .standalone_embed
+            ._standalone_embed
             .as_ref()
             .context("standalone embed missing")?
             .slice(last_token * 4096..(last_token + 1) * 4096);
@@ -1219,7 +1219,7 @@ impl GlmMtpRuntime {
 
         self.forward_layer45_core(&mut dsa, p - 1, swap_eh, router_bias_control, blas, None)?;
 
-        self.standalone_dsa = Some(dsa);
+        self._standalone_dsa = Some(dsa);
         Ok(self.stream.clone_dtoh(&self.logits_buf)?)
     }
 
