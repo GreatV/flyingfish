@@ -3331,12 +3331,12 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
         meshes.push(mesh);
     }
     let distinct_media =
-        meshes[0].vertices != meshes[1].vertices || meshes[0].faces != meshes[1].faces;
+        meshes[1].vertices != meshes[3].vertices || meshes[1].faces != meshes[3].faces;
     let distinct_support =
         meshes[0].vertices != meshes[3].vertices || meshes[0].faces != meshes[3].faces;
     defects += usize::from(!distinct_media) + usize::from(!distinct_support);
     println!(
-        "{} N5_M3_LINKED_ASSOCIATION image_outputs_differ={distinct_media} held_image_support_swap_differs={distinct_support}",
+        "{} N5_M3_LINKED_ASSOCIATION image_outputs_differ_at_fixed_support_and_noise={distinct_media} held_image_support_swap_differs={distinct_support}",
         if distinct_media && distinct_support {
             "PASS"
         } else {
