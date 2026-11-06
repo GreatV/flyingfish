@@ -716,17 +716,17 @@ fn hi3d_serialized_attention_definition_gpu() -> Result<()> {
             }
         }
     }
-    serialized_attention_modes(&decoder, &mut gate, &common, &map_file)?;
+    serialized_attention_modes(&mut gate, &common, &map_file)?;
     gate.finish()
 }
 
-fn serialized_attention_modes(
-    decoder: &PixalDecoder,
-    gate: &mut OperationGate,
-    common: &Path,
-    maps: &Path,
-) -> Result<()> {
-    let d = &decoder.device;
+fn serialized_attention_modes(gate: &mut OperationGate, common: &Path, maps: &Path) -> Result<()> {
+    let context = crate::backend::gpu::CudaContext::new(0)?;
+    // Replay buffers and metadata belong to this isolated stream.
+    unsafe {
+        context.disable_event_tracking();
+    }
+    let stream = context.new_stream()?;
     let first = tensor(common, "attention.17.order0.qkv")?;
     let second = tensor(common, "attention.49.order0.qkv")?;
     let combined: Vec<_> = first
@@ -737,19 +737,19 @@ fn serialized_attention_modes(
         .collect();
     let input_rows = combined.len() / 1536;
     ensure!(input_rows == 113, "mixed serialized packet extent mismatch");
-    let input = d.stream.clone_htod(&combined)?;
-    let module = cubin::module(&d.ctx, "vision_ops")?;
+    let input = stream.clone_htod(&combined)?;
+    let module = cubin::module(&context, "vision_ops")?;
     for grouped in [false, true] {
         let rows = if grouped { 113usize } else { 17usize };
         let count = rows * 512;
-        let source = d.stream.clone_htod(&(0..rows as u32).collect::<Vec<_>>())?;
-        let q = d.stream.alloc_zeros::<f16>(count)?;
-        let k = d.stream.alloc_zeros::<f16>(count)?;
-        let v = d.stream.alloc_zeros::<f16>(count)?;
+        let source = stream.clone_htod(&(0..rows as u32).collect::<Vec<_>>())?;
+        let q = stream.alloc_zeros::<f16>(count)?;
+        let k = stream.alloc_zeros::<f16>(count)?;
+        let v = stream.alloc_zeros::<f16>(count)?;
         let sentinel = f16::from_f32(-123.0);
-        let mut output = d.stream.clone_htod(&vec![sentinel; count + 8])?;
+        let mut output = stream.clone_htod(&vec![sentinel; count + 8])?;
         unsafe {
-            d.stream
+            stream
                 .launch_builder(&module.load_function("qkv_gather_head_major_f16")?)
                 .arg(&input)
                 .arg(&source)
@@ -763,7 +763,7 @@ fn serialized_attention_modes(
                 .launch(flat(count))?;
         }
         let mut attention = Flash::new_f16(
-            d.stream.clone(),
+            stream.clone(),
             rows,
             32,
             32,
@@ -790,7 +790,7 @@ fn serialized_attention_modes(
                 )
             };
             run()?;
-            d.stream.begin_capture(
+            stream.begin_capture(
                 cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )?;
             run()?;
@@ -798,9 +798,9 @@ fn serialized_attention_modes(
                 .stream
                 .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
                 .context("serialized attention graph missing")?;
-            let eager = d.stream.clone_dtoh(&output)?;
+            let eager = stream.clone_dtoh(&output)?;
             graph.launch()?;
-            let captured = d.stream.clone_dtoh(&output)?;
+            let captured = stream.clone_dtoh(&output)?;
             ensure!(
                 eager[..count]
                     .iter()
@@ -842,7 +842,7 @@ fn serialized_attention_modes(
             }
         }
         let isolation = if grouped {
-            let expected = d.stream.clone_dtoh(&output)?;
+            let expected = stream.clone_dtoh(&output)?;
             attention.bind_f16_windows(&[0, 48, 96, 113])?;
             attention.run_f16(
                 &q.slice(..),
@@ -861,7 +861,7 @@ fn serialized_attention_modes(
                 &mut output.slice_mut(..count),
                 (rows, rows, rows),
             )?;
-            let restored = expected == d.stream.clone_dtoh(&output)?;
+            let restored = expected == stream.clone_dtoh(&output)?;
             gate.defects += usize::from(!restored);
             Some(restored)
         } else {
