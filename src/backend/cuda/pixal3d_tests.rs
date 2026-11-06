@@ -1129,13 +1129,7 @@ fn hi3d_decoder_stages_gpu() -> Result<()> {
         let directory = root.join(format!("{case}-decode-sm86-r1"));
         let bank = directory.join("decoder.mid.input.safetensors");
         let n = bank_sites(&bank)?.coordinates().len();
-        let latents = if case == "cottage" {
-            root.parent()
-                .context("reference root parent missing")?
-                .join("N5-M1-flow-fixtures-r1/trajectory.safetensors")
-        } else {
-            root.join("robot-latents-sm86-r1/trajectory.safetensors")
-        };
+        let latents = root.join(format!("{case}-latents-sm86-r1/trajectory.safetensors"));
         stage_case(
             &decoder,
             &mut gate,
@@ -1244,13 +1238,7 @@ fn hi3d_decoder_complete_gpu() -> Result<()> {
         6 << 30,
     )?;
     for case in ["cottage", "robot"] {
-        let trajectory = if case == "cottage" {
-            root.parent()
-                .context("reference parent missing")?
-                .join("N5-M1-flow-fixtures-r1/trajectory.safetensors")
-        } else {
-            root.join("robot-latents-sm86-r1/trajectory.safetensors")
-        };
+        let trajectory = root.join(format!("{case}-latents-sm86-r1/trajectory.safetensors"));
         let coordinates = decoder_coordinates(&trajectory, "coordinates")?;
         let latent = f32_tensor(&trajectory, "final_latents")?;
         let bank = root.join(format!(

@@ -26,7 +26,8 @@ pub struct BatchGroupNorm {
     channels: u32,
     groups: u32,
     batches: u32,
-    parts: u32,
+    reduce_blocks: u32,
+    group_tile: u32,
     apply_blocks: u32,
     eps: f32,
 }
@@ -63,8 +64,8 @@ impl BatchGroupNorm {
             .context("empty batch offsets")?;
         let module = cubin::module(&device.ctx, "vision_ops")?;
         let reduce = [
-            module.load_function("batch_group_moments_partial_f32")?,
-            module.load_function("batch_group_moments_partial_f16")?,
+            module.load_function("batch_group_moments_scatter_f32")?,
+            module.load_function("batch_group_moments_scatter_f16")?,
         ];
         let apply = [
             module.load_function("batch_group_norm_f32")?,
@@ -103,21 +104,17 @@ impl BatchGroupNorm {
                         as usize,
             "group norm grid or occupancy exceeds device limits"
         );
-        let group_elements = maximum
-            .checked_mul(channels / groups)
-            .context("group norm element count overflow")?;
-        let parts = sms
-            .checked_mul(resident)
-            .context("group norm resident grid overflow")?
-            .div_ceil(bg)
-            .min(group_elements.div_ceil(256))
-            .max(1);
+        let group_tile = groups.min(8);
+        let reduce_blocks = maximum
+            .checked_mul(group_tile)
+            .context("group norm reduction extent overflow")?
+            .div_ceil(256);
         let max_grid = device
             .ctx
             .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as usize;
         ensure!(
-            parts <= max_grid,
-            "group norm partition grid exceeds device limit"
+            reduce_blocks <= max_grid,
+            "group norm reduction grid exceeds device limit"
         );
         let apply_blocks = maximum
             .checked_mul(channels)
@@ -127,8 +124,7 @@ impl BatchGroupNorm {
             .min(max_grid)
             .max(1);
         let partial_elements = bg
-            .checked_mul(parts)
-            .and_then(|n| n.checked_mul(2))
+            .checked_mul(2)
             .context("group norm partial extent overflow")?;
         let moment_elements = bg.checked_mul(2).context("group norm moments overflow")?;
         let bytes = partial_elements
@@ -142,7 +138,7 @@ impl BatchGroupNorm {
             "batch group norm workspace needs {bytes} bytes"
         );
         eprintln!(
-            "BATCH_GROUP_NORM_PLAN batches={batches} rows={rows} channels={channels} groups={groups} parts={parts} apply_blocks={apply_blocks} workspace_bytes={bytes}"
+            "BATCH_GROUP_NORM_PLAN batches={batches} rows={rows} channels={channels} groups={groups} reduce_blocks={reduce_blocks} group_tile={group_tile} apply_blocks={apply_blocks} workspace_bytes={bytes}"
         );
         Ok(Self {
             device: device.clone(),
@@ -156,7 +152,8 @@ impl BatchGroupNorm {
             channels: u32::try_from(channels)?,
             groups: u32::try_from(groups)?,
             batches: u32::try_from(batches)?,
-            parts: u32::try_from(parts)?,
+            reduce_blocks: u32::try_from(reduce_blocks)?,
+            group_tile: u32::try_from(group_tile)?,
             apply_blocks: u32::try_from(apply_blocks)?,
             eps,
         })
@@ -197,20 +194,37 @@ impl BatchGroupNorm {
         }
         let stream = &self.device.stream;
         unsafe {
-            stream
-                .launch_builder(&self.reduce[usize::from(half)])
-                .arg(&input.ptr)
-                .arg(&self.offsets)
-                .arg(&self.partial)
-                .arg(&self.batches)
-                .arg(&self.channels)
-                .arg(&self.groups)
-                .arg(&self.parts)
-                .launch(crate::backend::gpu::LaunchConfig {
-                    grid_dim: (self.parts, self.groups, self.batches),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+            super::copy::memset_words(
+                view(
+                    &self.partial,
+                    stream,
+                    0,
+                    [u32::try_from(self.partial.len())?],
+                    [1],
+                )?
+                .ptr,
+                0,
+                self.partial.len(),
+                stream,
+            )?;
+            for group_first in (0..self.groups).step_by(self.group_tile as usize) {
+                let group_count = self.group_tile.min(self.groups - group_first);
+                stream
+                    .launch_builder(&self.reduce[usize::from(half)])
+                    .arg(&input.ptr)
+                    .arg(&self.offsets)
+                    .arg(&self.partial)
+                    .arg(&self.batches)
+                    .arg(&self.channels)
+                    .arg(&self.groups)
+                    .arg(&group_first)
+                    .arg(&group_count)
+                    .launch(crate::backend::gpu::LaunchConfig {
+                        grid_dim: (self.reduce_blocks, self.batches, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
             stream
                 .launch_builder(&self.finish)
                 .arg(&self.partial)
@@ -219,7 +233,6 @@ impl BatchGroupNorm {
                 .arg(&self.batches)
                 .arg(&self.channels)
                 .arg(&self.groups)
-                .arg(&self.parts)
                 .arg(&self.eps)
                 .launch(flat(self.batches as usize * self.groups as usize))?;
             stream
