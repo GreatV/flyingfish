@@ -7134,7 +7134,9 @@ fn pixal3d_generated_request_gpu() -> Result<()> {
         _ => anyhow::bail!("case fixture"),
     };
     let multiview = fixture.starts_with("mv");
-    let inputs = env_path("FF_P1_M2_ROOT")?.join("gate-inputs.safetensors");
+    let inputs = env_path("FF_P1_M2_ROOT")?
+        .join("gate-inputs.safetensors")
+        .canonicalize()?;
     let input_file = std::fs::File::open(&inputs)?;
     let input_map = unsafe { memmap2::MmapOptions::new().map(&input_file)? };
     let archive = safetensors::SafeTensors::deserialize(&input_map)?;
