@@ -963,6 +963,8 @@ impl Engine {
                 head: s.alloc_zeros::<bf16>(0)?,
                 bytes: 0,
             },
+            catalog: None,
+            dense_graphs: Vec::new(),
             state,
             capture_checkpoint: None,
             work,

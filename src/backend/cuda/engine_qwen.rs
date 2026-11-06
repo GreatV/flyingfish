@@ -4064,6 +4064,8 @@ impl Engine {
             spec: None,
             hidden_capture,
             weights,
+            catalog: None,
+            dense_graphs: Vec::new(),
             state,
             capture_checkpoint,
             work,
@@ -4770,13 +4772,18 @@ impl Engine {
         if let Some(dense) = self.qwen.as_mut().and_then(|q| q.catalog.dense.as_mut()) {
             dense.begin(i, &self.device.stream)?;
         }
+        #[cfg(feature = "cuda")]
+        if let Some(dense) = self.catalog.as_mut().and_then(|c| c.dense.as_mut()) {
+            dense.begin(i, &self.device.stream)?;
+        }
         #[cfg(feature = "rocm")]
         ensure!(
             i < self.model_spec.layers.len() && step.rows > 0,
             "HIP layer begin has invalid layer/rows"
         );
         #[cfg(feature = "cuda")]
-        if step.input == crate::backend::Input::Ids
+        if self.qwen.is_some()
+            && step.input == crate::backend::Input::Ids
             && !self.blas.direct_fp8_rows().contains(&step.rows)
         {
             self.qwen.as_mut().context("Q38 runtime missing")?.layers[i]
@@ -4791,18 +4798,29 @@ impl Engine {
         return self
             .qwen
             .as_ref()
-            .is_some_and(|q| q.catalog.dense.is_some());
+            .is_some_and(|q| q.catalog.dense.is_some())
+            || self
+                .catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.dense.is_some());
         #[cfg(feature = "rocm")]
         false
     }
 
     #[cfg(feature = "cuda")]
     pub(super) fn dense_checkpoint_bytes(&self) -> Option<usize> {
-        self.qwen.as_ref().and_then(|q| {
-            q.catalog
+        if let Some(q) = &self.qwen {
+            return q
+                .catalog
                 .dense
                 .as_ref()
-                .map(|_| q.catalog.manifest.resident_bytes)
+                .map(|_| q.catalog.manifest.resident_bytes);
+        }
+        self.catalog.as_ref().and_then(|catalog| {
+            catalog
+                .dense
+                .as_ref()
+                .map(|_| catalog.manifest.resident_bytes)
         })
     }
 
@@ -4826,7 +4844,11 @@ impl Engine {
         #[cfg(feature = "cuda")]
         return self.qwen.as_ref().is_some_and(|q| {
             q.catalog.dense.is_some() && q.dense_graphs.len() == self.model_spec.layers.len() + 2
-        });
+        }) || (self
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.dense.is_some())
+            && self.dense_graphs.len() == self.model_spec.layers.len() + 2);
         #[cfg(feature = "rocm")]
         false
     }
@@ -4834,6 +4856,10 @@ impl Engine {
     pub(super) fn dense_layer_end(&mut self, layer: usize) -> Result<()> {
         #[cfg(feature = "cuda")]
         if let Some(dense) = self.qwen.as_mut().and_then(|q| q.catalog.dense.as_mut()) {
+            dense.end(layer, &self.device.stream)?;
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(dense) = self.catalog.as_mut().and_then(|c| c.dense.as_mut()) {
             dense.end(layer, &self.device.stream)?;
         }
         #[cfg(feature = "rocm")]
@@ -4856,6 +4882,19 @@ impl Engine {
                 head: Head::Last,
                 mask: crate::backend::Mask::Causal,
             };
+            if self.qwen.is_none() {
+                self.dense_graphs[0].launch()?;
+                for layer in 0..self.model_spec.layers.len() {
+                    self.qwen_layer_begin(layer, step)?;
+                    self.dense_graphs[layer + 1].launch()?;
+                    self.dense_layer_end(layer)?;
+                }
+                self.dense_graphs
+                    .last()
+                    .context("dense head graph missing")?
+                    .launch()?;
+                return Ok(());
+            }
             self.qwen
                 .as_ref()
                 .context("dense runtime missing")?
@@ -4928,8 +4967,13 @@ impl Engine {
                     let launched = if segment == 0 {
                         self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)
                     } else if segment == count + 1 {
-                        self.run_operator(crate::backend::Operator::Head, 0, step, &mut None)
-                            .and_then(|()| self.qwen_advance())
+                        let head =
+                            self.run_operator(crate::backend::Operator::Head, 0, step, &mut None);
+                        if self.qwen.is_some() {
+                            head.and_then(|()| self.qwen_advance())
+                        } else {
+                            head.and_then(|()| self.work.advance(&self.ops, &self.device.stream))
+                        }
                     } else {
                         self.run_layer_program(segment - 1, step, &mut None)
                     };
@@ -4956,10 +5000,11 @@ impl Engine {
             }
             match result {
                 Ok(graphs) => {
-                    self.qwen
-                        .as_mut()
-                        .context("dense runtime missing")?
-                        .dense_graphs = graphs
+                    if let Some(q) = self.qwen.as_mut() {
+                        q.dense_graphs = graphs;
+                    } else {
+                        self.dense_graphs = graphs;
+                    }
                 }
                 Err(error) => {
                     self.poisoned = true;
@@ -7719,6 +7764,7 @@ mod tests {
             upload_content_sha256: None,
             upload_hashed_bytes: None,
             load_wall_ms: 0.0,
+            classic: None,
         };
         let dequant = LayerDequantPlan::from_manifest(&catalog.manifest, 2, catalog.linear_format)?;
         let linear = LayerLinearPlan::bind(&dequant, &catalog, None, s)?;

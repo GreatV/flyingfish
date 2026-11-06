@@ -1444,7 +1444,7 @@ fn place_layers(
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
         let mut dense =
-            crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d)?;
+            crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
             let (layout, _) = matrix_layout(base.manifest, &name, roles)?;

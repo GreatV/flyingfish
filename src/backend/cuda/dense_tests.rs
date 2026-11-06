@@ -565,6 +565,109 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
     Ok(())
 }
 
+// Hidden 7168 and 56/8/128 are the published Nanbeige4.3-33B widths. The old
+// width guards pinned 2048/5120 and 16/2/128 and would __trap() on these launches.
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires GPU lease and FF_DENSE_GPU_WINDOW=granted"]
+fn spec_derived_kernel_widths_launch_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let ctx = CudaContext::new(0)?;
+    let s = ctx.new_stream()?;
+    let ops = ops::Ops::new(&ctx)?;
+    let rows = 2usize;
+    let hidden = 7168usize;
+    let vocab = 4usize;
+    let eps = 1e-5f32;
+
+    let table = pattern(vocab * hidden, 5);
+    let w = pattern(hidden, 11);
+    let ids = s.clone_htod(&[1u32, 3u32])?;
+    let table_d = s.clone_htod(&table)?;
+    let w_d = s.clone_htod(&w)?;
+    let mut x = s.alloc_zeros::<bf16>(rows * hidden)?;
+    let mut y = s.alloc_zeros::<bf16>(rows * hidden)?;
+    unsafe {
+        s.launch_builder(&ops.embed_rmsnorm)
+            .arg(&table_d)
+            .arg(&ids)
+            .arg(&mut x)
+            .arg(&w_d)
+            .arg(&mut y)
+            .arg(&(rows as i32))
+            .arg(&(hidden as i32))
+            .arg(&eps)
+            .launch(ops::grid(rows, 256))?;
+    }
+    s.synchronize()?;
+    ensure!(
+        s.clone_dtoh(&y)?.iter().all(|v| v.to_f32().is_finite()),
+        "embed_rmsnorm nonfinite"
+    );
+
+    let q_heads = 56i32;
+    let kv_heads = 8i32;
+    let dim = 128i32;
+    let half = (dim / 2) as usize;
+    let heads = (q_heads + 2 * kv_heads) as usize;
+    let capacity = 64i32;
+    let qkv_len = rows * heads * dim as usize;
+    let mut qkv = s.clone_htod(&pattern(qkv_len, 19))?;
+    let mut k = s.alloc_zeros::<bf16>(kv_heads as usize * capacity as usize * dim as usize)?;
+    let mut v = s.alloc_zeros::<bf16>(kv_heads as usize * capacity as usize * dim as usize)?;
+    let pos = s.clone_htod(&[0i32])?;
+    unsafe {
+        s.launch_builder(&ops.rope_kv)
+            .arg(&mut qkv)
+            .arg(&mut k)
+            .arg(&mut v)
+            .arg(&pos)
+            .arg(&(rows as i32))
+            .arg(&q_heads)
+            .arg(&kv_heads)
+            .arg(&dim)
+            .arg(&120000000f32)
+            .arg(&capacity)
+            .launch(ops::flat(rows * heads * half))?;
+    }
+    s.synchronize()?;
+    ensure!(
+        s.clone_dtoh(&qkv)?.iter().all(|t| t.to_f32().is_finite()),
+        "rope_kv nonfinite"
+    );
+
+    let mut res = s.clone_htod(&pattern(rows * hidden, 7))?;
+    let mut res_out = s.alloc_zeros::<bf16>(rows * hidden)?;
+    let mut capture = s.alloc_zeros::<bf16>(rows * hidden)?;
+    unsafe {
+        s.launch_builder(&ops.add_norm_capture)
+            .arg(&mut res)
+            .arg(&mut x)
+            .arg(&w_d)
+            .arg(&mut y)
+            .arg(&mut res_out)
+            .arg(&mut capture)
+            .arg(&(rows as i32))
+            .arg(&(hidden as i32))
+            .arg(&eps)
+            .arg(&(hidden as i32))
+            .arg(&0i32)
+            .arg(&0i32)
+            .arg(&0u64)
+            .arg(&0i32)
+            .launch(ops::grid(rows, 256))?;
+    }
+    s.synchronize()?;
+    ensure!(
+        s.clone_dtoh(&y)?.iter().all(|t| t.to_f32().is_finite()),
+        "add_rmsnorm_capture nonfinite"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires GPU lease and FF_DENSE_GPU_WINDOW=granted"]
 fn dense_runtime_gpu() -> Result<()> {

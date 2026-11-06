@@ -15,7 +15,7 @@ use crate::prefix_state::{PrefixLastInputKind, PrefixLogitsCache};
 #[cfg(feature = "cuda")]
 use crate::vision_input::PositionPlan;
 use crate::{
-    backend::cuda::weights::Weights,
+    backend::cuda::weights::{WeightCatalog, Weights},
     backend::cuda::{
         Device,
         blas::Blas,
@@ -111,6 +111,30 @@ pub(super) fn spec_workspace_rows(
     budget
         .map_or(chunk, |budget| budget.workspace_rows(chunk))
         .max(verify_rows)
+}
+
+#[cfg(feature = "cuda")]
+fn classic_linear(
+    blas: &Blas,
+    stream: &Arc<CudaStream>,
+    resident: Option<&CudaSlice<bf16>>,
+    streamed: Option<super::linear::LinearWeightRef>,
+    x: &crate::backend::gpu::CudaView<'_, bf16>,
+    y: &mut crate::backend::gpu::CudaViewMut<'_, bf16>,
+    shape: crate::backend::setup::LinearShape,
+) -> Result<()> {
+    let crate::backend::setup::LinearShape {
+        rows,
+        output,
+        input,
+    } = shape;
+    if let Some(weight) = streamed {
+        let weight = super::weights::SlotWeight::new(weight, stream)?;
+        blas.linear(&weight, x, y, rows, output, input)
+    } else {
+        let weight = resident.context("classic layer weight missing")?;
+        blas.linear(weight, x, y, rows, output, input)
+    }
 }
 
 pub(crate) use super::state::Kv;
@@ -333,6 +357,7 @@ pub(crate) struct Views<'a> {
     pub device: &'a Device,
     pub config: &'a Config,
     pub weights: &'a Weights,
+    pub catalog: Option<&'a WeightCatalog>,
     pub kv: &'a mut [Kv],
     pub work: &'a mut Work,
     pub capacity: usize,
@@ -351,8 +376,11 @@ impl Views<'_> {
             self.head_stride == self.capacity * c.head_dim && self.pos_stride == c.head_dim,
             "KV view strides do not match capacity/head dimension"
         );
+        let layers = self
+            .catalog
+            .map_or(self.weights.layers.len(), WeightCatalog::classic_layers);
         ensure!(
-            self.weights.layers.len() == c.num_hidden_layers
+            layers == c.num_hidden_layers
                 && self.weights.head.len() == c.vocab_size * c.hidden_size,
             "weight view does not match configured layers/head"
         );
@@ -708,6 +736,8 @@ pub struct Engine {
     mtp_epoch: u64,
     images: Option<vision_runtime::EncodedImages>,
     weights: Weights,
+    catalog: Option<WeightCatalog>,
+    dense_graphs: Vec<CudaGraph>,
     state: super::state::StateStore,
     capture_checkpoint: Option<super::state::StateCheckpoint>,
     work: Work,
@@ -1199,7 +1229,50 @@ impl Engine {
             write,
         )?;
         let device = Device::new(ordinal)?;
-        let weights = Weights::load(dir, &config, &device).context("load target weights")?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let plan = crate::prefill::Plan::new(
+            &config,
+            capacity,
+            requested_chunk,
+            free,
+            total,
+            Flash::tile(config.head_dim)?,
+            draft_config
+                .as_ref()
+                .map(|draft| draft.workspace_row_bytes())
+                .transpose()?
+                .unwrap_or(0),
+        )?;
+        let verify_rows = draft_config
+            .as_ref()
+            .map(|draft| draft.verify_rows())
+            .transpose()?
+            .unwrap_or(1);
+        let rows = spec_workspace_rows(plan.chunk, Some(settings.spec_budget), verify_rows);
+        let transient_bytes = plan
+            .row_bytes
+            .checked_mul(rows)
+            .and_then(|n| {
+                capacity
+                    .checked_mul(config.num_hidden_layers * config.kv_dim() * 4)
+                    .and_then(|kv| n.checked_add(kv))
+            })
+            .context("classic dense transient reservation overflow")?;
+        let mut catalog = WeightCatalog::load_dense(
+            dir,
+            &model_spec,
+            &device,
+            transient_bytes,
+            0,
+            settings.prefix_cache,
+            0,
+        )
+        .context("load streamed target weights")?;
+        ensure!(
+            !(catalog.dense.is_some() && draft_path.is_some()),
+            "streamed dense decode graphs are not bound for draft-enabled engines"
+        );
+        let weights = catalog.take_globals()?;
         let s = &device.stream;
         let state = super::state::StateStore::new(&model_spec, capacity, s)?;
         let capture_checkpoint = Some(super::state::StateCheckpoint::new(
@@ -1291,6 +1364,8 @@ impl Engine {
             #[cfg(feature = "cuda")]
             graph: None,
             weights,
+            catalog: Some(catalog),
+            dense_graphs: Vec::new(),
             state,
             #[cfg(feature = "cuda")]
             capture_checkpoint,
@@ -1558,8 +1633,15 @@ impl Engine {
         if self.decode.is_some() {
             return Ok(());
         }
-        let calibrated =
-            super::calibrate::load_recorded(&self.device, &self.runtime, self.capacity)?;
+        let gqa = self.config.num_attention_heads / self.config.num_key_value_heads;
+        let q_heads = self.config.num_attention_heads;
+        let calibrated = super::calibrate::load_recorded(
+            &self.device,
+            &self.runtime,
+            self.capacity,
+            gqa,
+            q_heads,
+        )?;
         let setup = crate::backend::setup::Setup::select(
             self.device.info.clone(),
             &self.config,
@@ -1581,6 +1663,7 @@ impl Engine {
             device: &self.device,
             config: &self.config,
             weights: &self.weights,
+            catalog: self.catalog.as_ref(),
             kv: &mut self.state.kv,
             work: &mut self.work,
             capacity: self.capacity,
@@ -2492,7 +2575,7 @@ impl Engine {
             layer < self.config.num_hidden_layers,
             "backend layer {layer} is outside model"
         );
-        if self.qwen.is_some() {
+        if self.qwen.is_some() || self.dense_streaming() {
             self.qwen_layer_begin(layer, step)?;
         }
         self.run_layer_program(layer, step, trace)?;
@@ -2698,9 +2781,23 @@ impl Engine {
         let kh = c.num_key_value_heads as i32;
         let dim = c.head_dim as i32;
         let cap = self.capacity as i32;
-        let layer = &self.weights.layers[i];
+        let resident = self.weights.layers.get(i);
         match op {
             crate::backend::Operator::Embed => {
+                #[cfg(feature = "cuda")]
+                let refs = match self.catalog.as_ref() {
+                    Some(catalog) if catalog.classic_layers() > 0 => {
+                        Some(catalog.classic_fused_ref(i)?)
+                    }
+                    _ => None,
+                };
+                #[cfg(feature = "cuda")]
+                let input_norm = match &refs {
+                    Some(refs) => Some(refs.input_norm),
+                    None => resident.and_then(|layer| layer.input_norm.as_ref()),
+                };
+                #[cfg(not(feature = "cuda"))]
+                let input_norm = resident.and_then(|layer| layer.input_norm.as_ref());
                 // Fused gather + layer-0 RMSNorm; Embed immediately precedes layer 0's Norm.
                 if is_tree {
                     {
@@ -2714,10 +2811,7 @@ impl Engine {
                         tree.prepare_embed_norm(
                             &w.position,
                             self.weights.embedding(),
-                            layer
-                                .input_norm
-                                .as_ref()
-                                .context("weighted input norm missing")?,
+                            input_norm.context("weighted input norm missing")?,
                             super::tree::EmbedOut {
                                 ids: &mut w.ids,
                                 x: &mut w.x,
@@ -2733,12 +2827,7 @@ impl Engine {
                             .arg(self.weights.embedding())
                             .arg(ids)
                             .arg(&mut w.x)
-                            .arg(
-                                layer
-                                    .input_norm
-                                    .as_ref()
-                                    .context("weighted input norm missing")?,
-                            )
+                            .arg(input_norm.context("weighted input norm missing")?)
                             .arg(&mut w.n)
                             .arg(&nr)
                             .arg(&hd)
@@ -2752,9 +2841,32 @@ impl Engine {
                 // The layer-0 norm runs in Embed; Norm has no work on other layers.
             }
             crate::backend::Operator::Qkv => {
+                #[cfg(feature = "cuda")]
+                let refs = match self.catalog.as_ref() {
+                    Some(catalog) if catalog.classic_layers() > 0 => {
+                        Some(catalog.classic_fused_ref(i)?)
+                    }
+                    _ => None,
+                };
+                #[cfg(feature = "cuda")]
+                classic_linear(
+                    &self.blas,
+                    s,
+                    resident.map(|layer| &layer.qkv),
+                    refs.as_ref().map(|refs| refs.qkv),
+                    &w.n.slice(..linear_rows * h),
+                    &mut w.qkv.slice_mut(..linear_rows * c.qkv_dim()),
+                    crate::backend::setup::LinearShape {
+                        rows: linear_rows,
+                        output: c.qkv_dim(),
+                        input: h,
+                    },
+                )
+                .with_context(|| format!("layer {i} qkv"))?;
+                #[cfg(not(feature = "cuda"))]
                 self.blas
                     .linear(
-                        &layer.qkv,
+                        &resident.context("classic layer weight missing")?.qkv,
                         &w.n.slice(..linear_rows * h),
                         &mut w.qkv.slice_mut(..linear_rows * c.qkv_dim()),
                         linear_rows,
@@ -2792,9 +2904,32 @@ impl Engine {
                 self.run_attention(i, step)?;
             }
             crate::backend::Operator::Output => {
+                #[cfg(feature = "cuda")]
+                let refs = match self.catalog.as_ref() {
+                    Some(catalog) if catalog.classic_layers() > 0 => {
+                        Some(catalog.classic_fused_ref(i)?)
+                    }
+                    _ => None,
+                };
+                #[cfg(feature = "cuda")]
+                classic_linear(
+                    &self.blas,
+                    s,
+                    resident.map(|layer| &layer.o),
+                    refs.as_ref().map(|refs| refs.o),
+                    &w.attn.slice(..linear_rows * h),
+                    &mut w.out.slice_mut(..linear_rows * h),
+                    crate::backend::setup::LinearShape {
+                        rows: linear_rows,
+                        output: h,
+                        input: h,
+                    },
+                )
+                .with_context(|| format!("layer {i} output projection"))?;
+                #[cfg(not(feature = "cuda"))]
                 self.blas
                     .linear(
-                        &layer.o,
+                        &resident.context("classic layer weight missing")?.o,
                         &w.attn.slice(..linear_rows * h),
                         &mut w.out.slice_mut(..linear_rows * h),
                         linear_rows,
@@ -2809,21 +2944,55 @@ impl Engine {
                 }
             }
             crate::backend::Operator::PostNorm => {
+                #[cfg(feature = "cuda")]
+                let refs = match self.catalog.as_ref() {
+                    Some(catalog) if catalog.classic_layers() > 0 => {
+                        Some(catalog.classic_fused_ref(i)?)
+                    }
+                    _ => None,
+                };
+                #[cfg(feature = "cuda")]
+                let post_norm = match &refs {
+                    Some(refs) => Some(refs.post_norm),
+                    None => resident.and_then(|layer| layer.post_norm.as_ref()),
+                };
+                #[cfg(not(feature = "cuda"))]
+                let post_norm = resident.and_then(|layer| layer.post_norm.as_ref());
                 w.add_norm(
                     &self.ops,
                     s,
-                    layer
-                        .post_norm
-                        .as_ref()
-                        .context("weighted post norm missing")?,
+                    post_norm.context("weighted post norm missing")?,
                     rows,
                     c,
                 )?;
             }
             crate::backend::Operator::GateUp => {
+                #[cfg(feature = "cuda")]
+                let refs = match self.catalog.as_ref() {
+                    Some(catalog) if catalog.classic_layers() > 0 => {
+                        Some(catalog.classic_fused_ref(i)?)
+                    }
+                    _ => None,
+                };
+                #[cfg(feature = "cuda")]
+                classic_linear(
+                    &self.blas,
+                    s,
+                    resident.map(|layer| &layer.gu),
+                    refs.as_ref().map(|refs| refs.gu),
+                    &w.n.slice(..linear_rows * h),
+                    &mut w.gu.slice_mut(..linear_rows * 2 * f),
+                    crate::backend::setup::LinearShape {
+                        rows: linear_rows,
+                        output: 2 * f,
+                        input: h,
+                    },
+                )
+                .with_context(|| format!("layer {i} gate/up"))?;
+                #[cfg(not(feature = "cuda"))]
                 self.blas
                     .linear(
-                        &layer.gu,
+                        &resident.context("classic layer weight missing")?.gu,
                         &w.n.slice(..linear_rows * h),
                         &mut w.gu.slice_mut(..linear_rows * 2 * f),
                         linear_rows,
@@ -2854,9 +3023,32 @@ impl Engine {
                 }
             }
             crate::backend::Operator::Down => {
+                #[cfg(feature = "cuda")]
+                let refs = match self.catalog.as_ref() {
+                    Some(catalog) if catalog.classic_layers() > 0 => {
+                        Some(catalog.classic_fused_ref(i)?)
+                    }
+                    _ => None,
+                };
+                #[cfg(feature = "cuda")]
+                classic_linear(
+                    &self.blas,
+                    s,
+                    resident.map(|layer| &layer.down),
+                    refs.as_ref().map(|refs| refs.down),
+                    &w.act.slice(..linear_rows * f),
+                    &mut w.out.slice_mut(..linear_rows * h),
+                    crate::backend::setup::LinearShape {
+                        rows: linear_rows,
+                        output: h,
+                        input: f,
+                    },
+                )
+                .with_context(|| format!("layer {i} down"))?;
+                #[cfg(not(feature = "cuda"))]
                 self.blas
                     .linear(
-                        &layer.down,
+                        &resident.context("classic layer weight missing")?.down,
                         &w.act.slice(..linear_rows * f),
                         &mut w.out.slice_mut(..linear_rows * h),
                         linear_rows,
@@ -2870,15 +3062,32 @@ impl Engine {
                 }
             }
             crate::backend::Operator::NextNorm => {
-                let weight = if let Some(next) = self.weights.layers.get(i + 1) {
-                    next.input_norm
-                        .as_ref()
-                        .context("weighted input norm missing")?
-                } else {
-                    self.weights
+                #[cfg(feature = "cuda")]
+                let next_norm = self
+                    .catalog
+                    .as_ref()
+                    .filter(|catalog| i + 1 < catalog.classic_layers())
+                    .map(|catalog| catalog.classic_norm(i + 1, "input_layernorm"))
+                    .transpose()?
+                    .or_else(|| {
+                        self.weights
+                            .layers
+                            .get(i + 1)
+                            .and_then(|layer| layer.input_norm.as_ref())
+                    });
+                #[cfg(not(feature = "cuda"))]
+                let next_norm = self
+                    .weights
+                    .layers
+                    .get(i + 1)
+                    .and_then(|layer| layer.input_norm.as_ref());
+                let weight = match next_norm {
+                    Some(weight) => weight,
+                    None => self
+                        .weights
                         .norm
                         .as_ref()
-                        .context("weighted final norm missing")?
+                        .context("weighted final norm missing")?,
                 };
                 {
                     if let Some(binding) = self.hidden_capture.as_mut()
@@ -4100,6 +4309,10 @@ impl Engine {
             return self.capture_moe();
         }
         if self.dense_streaming() {
+            ensure!(
+                self.spec.is_none(),
+                "streamed dense decode graphs are not bound for draft-enabled engines"
+            );
             return self.capture_dense_graph();
         }
         ensure!(
@@ -6024,23 +6237,63 @@ impl Engine {
         self.closure.preflight(&paths)?;
         if write {
             let c = &self.config;
+            if let Some(dense) = self
+                .catalog
+                .as_mut()
+                .and_then(|catalog| catalog.dense.as_mut())
+            {
+                dense.begin(0, &self.device.stream)?;
+            }
+            let refs = self
+                .catalog
+                .as_ref()
+                .filter(|catalog| catalog.classic_layers() > 0)
+                .map(|catalog| catalog.classic_fused_ref(0))
+                .transpose()?;
             for &shape in &profile.linear {
                 let values = super::random(shape.rows * shape.input, 1);
                 let input = self.device.stream.clone_htod(&values)?;
-                let layer = &self.weights.layers[0];
-                let weight = if shape.output == c.vocab_size && shape.input == c.hidden_size {
-                    Some(&self.weights.head)
-                } else {
-                    [
-                        (&layer.qkv, c.qkv_dim(), c.hidden_size),
-                        (&layer.o, c.hidden_size, c.hidden_size),
-                        (&layer.gu, 2 * c.intermediate_size, c.hidden_size),
-                        (&layer.down, c.hidden_size, c.intermediate_size),
+                if shape.output == c.vocab_size && shape.input == c.hidden_size {
+                    self.blas
+                        .calibrate_shape(&self.weights.head, &input.slice(..), shape)?;
+                    continue;
+                }
+                if let Some(refs) = &refs {
+                    let found = [
+                        (refs.qkv, c.qkv_dim(), c.hidden_size),
+                        (refs.o, c.hidden_size, c.hidden_size),
+                        (refs.gu, 2 * c.intermediate_size, c.hidden_size),
+                        (refs.down, c.hidden_size, c.intermediate_size),
                     ]
                     .into_iter()
-                    .find(|(_, o, i)| *o == shape.output && *i == shape.input)
-                    .map(|(w, _, _)| w)
-                };
+                    .find(|(_, o, i)| *o == shape.output && *i == shape.input);
+                    if let Some((weight, _, _)) = found {
+                        let weight = super::weights::SlotWeight::new(weight, &self.device.stream)?;
+                        self.blas
+                            .calibrate_shape(&weight, &input.slice(..), shape)?;
+                    } else {
+                        self.spec
+                            .as_ref()
+                            .context("draft shape without draft")?
+                            .draft
+                            .calibrate_shape(&mut self.blas, &input.slice(..), shape)?;
+                    }
+                    continue;
+                }
+                let layer = self
+                    .weights
+                    .layers
+                    .first()
+                    .context("classic layer weights missing")?;
+                let weight = [
+                    (&layer.qkv, c.qkv_dim(), c.hidden_size),
+                    (&layer.o, c.hidden_size, c.hidden_size),
+                    (&layer.gu, 2 * c.intermediate_size, c.hidden_size),
+                    (&layer.down, c.hidden_size, c.intermediate_size),
+                ]
+                .into_iter()
+                .find(|(_, o, i)| *o == shape.output && *i == shape.input)
+                .map(|(w, _, _)| w);
                 if let Some(weight) = weight {
                     self.blas.calibrate_shape(weight, &input.slice(..), shape)?;
                 } else {
@@ -6343,6 +6596,10 @@ fn glm_dispatch_selects_the_hybrid_runtime() -> Result<()> {
 #[cfg(all(test, feature = "cuda"))]
 #[path = "engine_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "n1_layer_cells_tests.rs"]
+mod n1_layer_cells_tests;
 
 impl Engine {
     fn run_ffn(
@@ -6701,6 +6958,8 @@ impl Engine {
             spec_budget: settings.spec_budget,
             runtime,
             weights,
+            catalog: None,
+            dense_graphs: Vec::new(),
             state,
             work,
             ops,
