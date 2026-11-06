@@ -1988,18 +1988,18 @@ impl GlmMtpRuntime {
         )?)?;
         let sh_gate_w = stream.clone_htod(&get_st_fp8_linear(
             "model.language_model.layers.45.mlp.shared_experts.gate_proj",
-            1024,
+            2048,
             4096,
         )?)?;
         let sh_up_w = stream.clone_htod(&get_st_fp8_linear(
             "model.language_model.layers.45.mlp.shared_experts.up_proj",
-            1024,
+            2048,
             4096,
         )?)?;
         let sh_down_w = stream.clone_htod(&get_st_fp8_linear(
             "model.language_model.layers.45.mlp.shared_experts.down_proj",
             4096,
-            1024,
+            2048,
         )?)?;
         let router_w = stream.clone_htod(&get_st_bf16(
             "model.language_model.layers.45.mlp.gate.weight",
@@ -2035,9 +2035,9 @@ impl GlmMtpRuntime {
         let mut slot_up = Vec::with_capacity(8);
         let mut slot_down = Vec::with_capacity(8);
         for _ in 0..8 {
-            slot_gate.push(stream.alloc_zeros::<bf16>(1024 * 4096)?);
-            slot_up.push(stream.alloc_zeros::<bf16>(1024 * 4096)?);
-            slot_down.push(stream.alloc_zeros::<bf16>(4096 * 1024)?);
+            slot_gate.push(stream.alloc_zeros::<bf16>(2048 * 4096)?);
+            slot_up.push(stream.alloc_zeros::<bf16>(2048 * 4096)?);
+            slot_down.push(stream.alloc_zeros::<bf16>(4096 * 2048)?);
         }
 
         Ok(Self {
@@ -2088,14 +2088,14 @@ impl GlmMtpRuntime {
             kv_b_buf: stream.alloc_zeros::<bf16>(32768)?,
             attn_out_buf: stream.alloc_zeros::<bf16>(16384)?,
             o_buf: stream.alloc_zeros::<bf16>(4096)?,
-            sh_gate_buf: stream.alloc_zeros::<bf16>(1024)?,
-            sh_up_buf: stream.alloc_zeros::<bf16>(1024)?,
-            sh_act_buf: stream.alloc_zeros::<bf16>(1024)?,
+            sh_gate_buf: stream.alloc_zeros::<bf16>(2048)?,
+            sh_up_buf: stream.alloc_zeros::<bf16>(2048)?,
+            sh_act_buf: stream.alloc_zeros::<bf16>(2048)?,
             sh_out_buf: stream.alloc_zeros::<bf16>(4096)?,
             router_logits_buf: stream.alloc_zeros::<bf16>(288)?,
-            exp_gate_buf: stream.alloc_zeros::<bf16>(1024)?,
-            exp_up_buf: stream.alloc_zeros::<bf16>(1024)?,
-            exp_act_buf: stream.alloc_zeros::<bf16>(1024)?,
+            exp_gate_buf: stream.alloc_zeros::<bf16>(2048)?,
+            exp_up_buf: stream.alloc_zeros::<bf16>(2048)?,
+            exp_act_buf: stream.alloc_zeros::<bf16>(2048)?,
             exp_out_buf: stream.alloc_zeros::<bf16>(4096)?,
             routed_accum_buf: stream.alloc_zeros::<bf16>(4096)?,
             head_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
@@ -2236,7 +2236,7 @@ impl GlmMtpRuntime {
             &self.sh_gate_w,
             &self.x_norm_buf,
             &mut self.sh_gate_buf,
-            (1, 1024, 4096),
+            (1, 2048, 4096),
         )?;
         run_linear_bf16(
             &stream,
@@ -2244,7 +2244,7 @@ impl GlmMtpRuntime {
             &self.sh_up_w,
             &self.x_norm_buf,
             &mut self.sh_up_buf,
-            (1, 1024, 4096),
+            (1, 2048, 4096),
         )?;
         run_silu_mul_split(
             &stream,
@@ -2252,7 +2252,7 @@ impl GlmMtpRuntime {
             &self.sh_gate_buf,
             &self.sh_up_buf,
             &mut self.sh_act_buf,
-            1024,
+            2048,
         )?;
         run_linear_bf16(
             &stream,
@@ -2260,7 +2260,7 @@ impl GlmMtpRuntime {
             &self.sh_down_w,
             &self.sh_act_buf,
             &mut self.sh_out_buf,
-            (1, 4096, 1024),
+            (1, 4096, 2048),
         )?;
 
         stream.memset_zeros(&mut self.routed_accum_buf)?;
@@ -2273,7 +2273,7 @@ impl GlmMtpRuntime {
                 &self.slot_gate[k],
                 &self.x_norm_buf,
                 &mut self.exp_gate_buf,
-                (1, 1024, 4096),
+                (1, 2048, 4096),
             )?;
             run_linear_bf16(
                 &stream,
@@ -2281,7 +2281,7 @@ impl GlmMtpRuntime {
                 &self.slot_up[k],
                 &self.x_norm_buf,
                 &mut self.exp_up_buf,
-                (1, 1024, 4096),
+                (1, 2048, 4096),
             )?;
             run_silu_mul_split(
                 &stream,
@@ -2289,7 +2289,7 @@ impl GlmMtpRuntime {
                 &self.exp_gate_buf,
                 &self.exp_up_buf,
                 &mut self.exp_act_buf,
-                1024,
+                2048,
             )?;
             run_linear_bf16(
                 &stream,
@@ -2297,7 +2297,7 @@ impl GlmMtpRuntime {
                 &self.slot_down[k],
                 &self.exp_act_buf,
                 &mut self.exp_out_buf,
-                (1, 4096, 1024),
+                (1, 4096, 2048),
             )?;
             run_accum_scaled(
                 &stream,
@@ -2502,9 +2502,9 @@ impl GlmMtpRuntime {
             let w = (score / sum) * 2.5f32;
             self.staged_weights[k] = w;
             let exp = &self.experts[exp_id];
-            let gate_bf16 = fp8_dequant_block(&exp.gate_codes, &exp.gate_scales, 1024, 4096);
-            let up_bf16 = fp8_dequant_block(&exp.up_codes, &exp.up_scales, 1024, 4096);
-            let down_bf16 = fp8_dequant_block(&exp.down_codes, &exp.down_scales, 4096, 1024);
+            let gate_bf16 = fp8_dequant_block(&exp.gate_codes, &exp.gate_scales, 2048, 4096);
+            let up_bf16 = fp8_dequant_block(&exp.up_codes, &exp.up_scales, 2048, 4096);
+            let down_bf16 = fp8_dequant_block(&exp.down_codes, &exp.down_scales, 4096, 2048);
 
             stream.memcpy_htod(&gate_bf16, &mut self.slot_gate[k])?;
             stream.memcpy_htod(&up_bf16, &mut self.slot_up[k])?;
