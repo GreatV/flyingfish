@@ -4,7 +4,7 @@ use crate::backend::cuda::blas::Blas;
 use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::dsa::{DsaAttentionInput, DsaPlan, DsaState};
-use crate::backend::cuda::linear::{Fp8Ops, Fp8ScaleRef, LinearWeightRef};
+use crate::backend::cuda::linear::{Fp8Ops, Fp8ScaleRef, LinearWeightRef, NativeProjection};
 use crate::backend::cuda::moe::decode::{NativeMoe, NativeMoeGeometry, NativeMoeWeights};
 use crate::backend::gpu::DevicePtr;
 use crate::fp8::{Fp8BlockScale, Fp8ScaleLayout};
@@ -167,65 +167,36 @@ pub(crate) fn run_add(
     Ok(())
 }
 
-pub(crate) fn run_fp8_linear(
-    stream: &Arc<CudaStream>,
-    fp8: &Fp8Ops,
+fn make_fp8_weight(
     codes: &CudaSlice<u8>,
     scales: &CudaSlice<f32>,
-    x: &CudaSlice<bf16>,
-    y: &mut CudaSlice<bf16>,
-    shape: (usize, usize, usize),
-) -> Result<()> {
-    let (rows, output_dim, input_dim) = shape;
+    stream: &Arc<CudaStream>,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<LinearWeightRef> {
     let (c_ptr, _) = codes.device_ptr(stream);
     let (s_ptr, _) = scales.device_ptr(stream);
-    let (x_ptr, _) = x.device_ptr(stream);
-    let (y_ptr, _) = y.device_ptr(stream);
-
     let codes_tensor = unsafe {
         Tensor::new(
             c_ptr,
-            [output_dim as u32, input_dim as u32],
-            [input_dim as u64, 1],
-            (output_dim * input_dim) as u64,
+            [out_dim as u32, in_dim as u32],
+            [in_dim as u64, 1],
+            (out_dim * in_dim) as u64,
         )?
     };
     let scale_tensor = unsafe {
         Tensor::new(
             s_ptr,
-            [
-                output_dim.div_ceil(128) as u32,
-                input_dim.div_ceil(128) as u32,
-            ],
-            [input_dim.div_ceil(128) as u64, 1],
-            (output_dim.div_ceil(128) * input_dim.div_ceil(128) * 4) as u64,
+            [out_dim.div_ceil(128) as u32, in_dim.div_ceil(128) as u32],
+            [in_dim.div_ceil(128) as u64, 1],
+            (out_dim.div_ceil(128) * in_dim.div_ceil(128) * 4) as u64,
         )?
     };
-    let x_tensor = unsafe {
-        Tensor::new(
-            x_ptr,
-            [rows as u32, input_dim as u32],
-            [input_dim as u64, 1],
-            (rows * input_dim * 2) as u64,
-        )?
-    };
-    let mut y_tensor = unsafe {
-        TensorMut(Tensor::new(
-            y_ptr,
-            [rows as u32, output_dim as u32],
-            [output_dim as u64, 1],
-            (rows * output_dim * 2) as u64,
-        )?)
-    };
-
-    fp8.small_gemm(
-        stream,
-        codes_tensor,
-        Fp8ScaleRef::F32(scale_tensor),
-        Fp8ScaleLayout::Block(Fp8BlockScale::new([128, 128], safetensors::Dtype::F32).unwrap()),
-        x_tensor,
-        &mut y_tensor,
-    )
+    Ok(LinearWeightRef::Fp8 {
+        codes: codes_tensor,
+        scale: Fp8ScaleRef::F32(scale_tensor),
+        layout: Fp8ScaleLayout::Block(Fp8BlockScale::new([128, 128], safetensors::Dtype::F32)?),
+    })
 }
 
 #[derive(Clone)]
@@ -267,6 +238,11 @@ pub(crate) struct GlmMtpRuntime {
     o_codes: CudaSlice<u8>,
     o_scales: CudaSlice<f32>,
     post_norm_w: CudaSlice<bf16>,
+
+    kv_a_proj: NativeProjection,
+    q_a_proj: NativeProjection,
+    q_b_proj: NativeProjection,
+    o_proj: NativeProjection,
 
     _router_w: CudaSlice<bf16>,
     _router_b: CudaSlice<f32>,
@@ -677,6 +653,18 @@ impl GlmMtpRuntime {
             Err(_) => None,
         };
 
+        let kv_a_w = make_fp8_weight(&kv_a_codes, &kv_a_scales, stream, 512, 4096)?;
+        let kv_a_proj = NativeProjection::new(&fp8, stream, kv_a_w, 1)?;
+
+        let q_a_w = make_fp8_weight(&q_a_codes, &q_a_scales, stream, 1536, 4096)?;
+        let q_a_proj = NativeProjection::new(&fp8, stream, q_a_w, 1)?;
+
+        let q_b_w = make_fp8_weight(&q_b_codes, &q_b_scales, stream, 16384, 1536)?;
+        let q_b_proj = NativeProjection::new(&fp8, stream, q_b_w, 1)?;
+
+        let o_w = make_fp8_weight(&o_codes, &o_scales, stream, 4096, 16384)?;
+        let o_proj = NativeProjection::new(&fp8, stream, o_w, 1)?;
+
         Ok(Self {
             stream: stream.clone(),
             rms_norm,
@@ -701,6 +689,10 @@ impl GlmMtpRuntime {
             o_codes,
             o_scales,
             post_norm_w,
+            kv_a_proj,
+            q_a_proj,
+            q_b_proj,
+            o_proj,
             _router_w: router_w,
             _router_b: router_b,
             _sh_gate_codes: sh_gate_codes,
@@ -859,15 +851,13 @@ impl GlmMtpRuntime {
             1e-5,
         )?;
 
-        run_fp8_linear(
-            &stream,
-            &self.fp8,
-            &self.kv_a_codes,
-            &self.kv_a_scales,
-            &self.x_norm_buf,
-            &mut self.kv_a_buf,
-            (1, 512, 4096),
-        )?;
+        let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
+        let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
+        let (kv_a_ptr, _) = self.kv_a_buf.device_ptr(&stream);
+        let mut kv_a_tensor =
+            unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };
+        self.kv_a_proj
+            .run(&self.fp8, &stream, x_norm_tensor, &mut kv_a_tensor)?;
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -902,15 +892,13 @@ impl GlmMtpRuntime {
             },
         )?;
 
-        run_fp8_linear(
-            &stream,
-            &self.fp8,
-            &self.q_a_codes,
-            &self.q_a_scales,
-            &self.x_norm_buf,
-            &mut self.q_a_buf,
-            (1, 1536, 4096),
-        )?;
+        let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
+        let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
+        let (q_a_ptr, _) = self.q_a_buf.device_ptr(&stream);
+        let mut q_a_tensor =
+            unsafe { TensorMut(Tensor::new(q_a_ptr, [1, 1536], [1536, 1], 1536 * 2)?) };
+        self.q_a_proj
+            .run(&self.fp8, &stream, x_norm_tensor, &mut q_a_tensor)?;
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -920,15 +908,14 @@ impl GlmMtpRuntime {
             (1, 1536),
             1e-5,
         )?;
-        run_fp8_linear(
-            &stream,
-            &self.fp8,
-            &self.q_b_codes,
-            &self.q_b_scales,
-            &self.q_a_norm_buf,
-            &mut self.q_b_buf,
-            (1, 16384, 1536),
-        )?;
+        let (q_a_norm_ptr, _) = self.q_a_norm_buf.device_ptr(&stream);
+        let q_a_norm_tensor =
+            unsafe { Tensor::new(q_a_norm_ptr, [1, 1536], [1536, 1], 1536 * 2)? };
+        let (q_b_ptr, _) = self.q_b_buf.device_ptr(&stream);
+        let mut q_b_tensor =
+            unsafe { TensorMut(Tensor::new(q_b_ptr, [1, 16384], [16384, 1], 16384 * 2)?) };
+        self.q_b_proj
+            .run(&self.fp8, &stream, q_a_norm_tensor, &mut q_b_tensor)?;
 
         let mut indices = vec![-1i32; 2051];
         for (i, item) in indices.iter_mut().take(pos.min(2050) + 1).enumerate() {
@@ -966,15 +953,14 @@ impl GlmMtpRuntime {
             &stream,
         )?;
 
-        run_fp8_linear(
-            &stream,
-            &self.fp8,
-            &self.o_codes,
-            &self.o_scales,
-            &self.attn_out_buf,
-            &mut self.o_buf,
-            (1, 4096, 16384),
-        )?;
+        let (attn_out_ptr, _) = self.attn_out_buf.device_ptr(&stream);
+        let attn_out_tensor =
+            unsafe { Tensor::new(attn_out_ptr, [1, 16384], [16384, 1], 16384 * 2)? };
+        let (o_ptr, _) = self.o_buf.device_ptr(&stream);
+        let mut o_tensor =
+            unsafe { TensorMut(Tensor::new(o_ptr, [1, 4096], [4096, 1], 4096 * 2)?) };
+        self.o_proj
+            .run(&self.fp8, &stream, attn_out_tensor, &mut o_tensor)?;
         run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
 
         run_rms_norm(
@@ -1105,15 +1091,14 @@ impl GlmMtpRuntime {
                 (1, 4096),
                 1e-5,
             )?;
-            run_fp8_linear(
-                &stream,
-                &self.fp8,
-                &self.kv_a_codes,
-                &self.kv_a_scales,
-                &self.x_norm_buf,
-                &mut self.kv_a_buf,
-                (1, 512, 4096),
-            )?;
+            let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
+            let x_norm_tensor =
+                unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
+            let (kv_a_ptr, _) = self.kv_a_buf.device_ptr(&stream);
+            let mut kv_a_tensor =
+                unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };
+            self.kv_a_proj
+                .run(&self.fp8, &stream, x_norm_tensor, &mut kv_a_tensor)?;
             run_rms_norm(
                 &stream,
                 &self.rms_norm,
