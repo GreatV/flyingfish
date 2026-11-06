@@ -634,19 +634,24 @@ impl Flash {
         })
     }
 
-    pub fn new_f16_d64(
+    pub fn new_f16(
         stream: Arc<CudaStream>,
         rows: usize,
         heads: usize,
         kv_heads: usize,
+        head_dim: usize,
         score: Score,
     ) -> Result<Self> {
-        let head_dim = 64usize;
         let tile = 64usize;
-        let dynamic_shared = (384 * head_dim) as u32;
+        let physical_dim = match head_dim {
+            64 => 64usize,
+            96 => 128usize,
+            _ => anyhow::bail!("unsupported F16 prefill head dimension {head_dim}"),
+        };
+        let dynamic_shared = (384 * physical_dim) as u32;
         ensure!(
             rows > 0 && heads > 0 && kv_heads > 0 && heads.is_multiple_of(kv_heads),
-            "invalid F16 D64 prefill geometry"
+            "invalid F16 prefill geometry"
         );
         let elements = rows
             .checked_mul(heads)
@@ -664,7 +669,11 @@ impl Flash {
                 "prefill heads exceed grid limit"
             );
             let module = super::cubin::module(ctx, "attention_native")?;
-            let name = "attention_prefill_d64_bidirectional_f16";
+            let name = match head_dim {
+                64 => "attention_prefill_d64_bidirectional_f16",
+                96 => "attention_prefill_d96_bidirectional_f16",
+                _ => unreachable!(),
+            };
             let function = module.load_function(name)?;
             let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
             let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
@@ -690,7 +699,7 @@ impl Flash {
         };
         #[cfg(feature = "rocm")]
         let native = {
-            anyhow::bail!("HIP native F16 D64 prefill geometry is not bound");
+            anyhow::bail!("HIP native F16 prefill geometry is not bound");
         };
         let lse = stream.alloc_zeros(elements)?;
         let sink_rescale = super::cubin::module(stream.context(), "attention")?
@@ -710,7 +719,7 @@ impl Flash {
         })
     }
 
-    pub fn run_f16_d64(
+    pub fn run_f16(
         &mut self,
         q: &crate::backend::gpu::CudaView<'_, half::f16>,
         q_row_stride: usize,
@@ -720,14 +729,13 @@ impl Flash {
         (rows, keys, capacity): (usize, usize, usize),
     ) -> Result<()> {
         let [q_heads, kv_heads, head_dim] = self.geometry;
-        ensure!(head_dim == 64, "run_f16_d64 requires D=64");
         ensure!(
-            rows > 0
-                && keys > 0
-                && rows <= keys
-                && keys <= capacity
-                && capacity <= i32::MAX as usize,
-            "invalid F16 D64 prefill row/key/capacity extents"
+            matches!(head_dim, 64 | 96),
+            "invalid F16 prefill head dimension"
+        );
+        ensure!(
+            rows > 0 && keys > 0 && keys <= capacity && capacity <= i32::MAX as usize,
+            "invalid F16 prefill row/key/capacity extents"
         );
         ensure!(
             q_row_stride >= q_heads * head_dim
@@ -763,11 +771,8 @@ impl Flash {
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
-        let native = self
-            .native
-            .first()
-            .context("F16 D64 native function missing")?;
-        let score = self.score.as_ref().context("F16 D64 score missing")?;
+        let native = self.native.first().context("F16 native function missing")?;
+        let score = self.score.as_ref().context("F16 score missing")?;
         let args = Attention {
             q,
             k,
@@ -2097,6 +2102,286 @@ mod tests {
                 },
         ))
     }
+    fn f16_values(
+        tensors: &safetensors::SafeTensors<'_>,
+        name: &str,
+        shape: [usize; 3],
+    ) -> Result<Vec<half::f16>> {
+        let tensor = tensors.tensor(name)?;
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::F16 && tensor.shape() == shape,
+            "F16 attention fixture shape/dtype mismatch: {name}"
+        );
+        Ok(tensor
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&bits| half::f16::from_le_bytes(bits))
+            .collect())
+    }
+
+    fn f16_attention_cell(
+        stream: &Arc<CudaStream>,
+        inputs: &[Vec<half::f16>; 3],
+        [rows, keys, heads, dim]: [usize; 4],
+        pitch: usize,
+    ) -> Result<Vec<half::f16>> {
+        use half::f16;
+        ensure!(
+            inputs[0].len() == rows * heads * dim
+                && inputs[1].len() == keys * heads * dim
+                && inputs[2].len() == inputs[1].len(),
+            "F16 attention fixture operand extent"
+        );
+        let capacity = keys + 3;
+        let mut query = vec![f16::NAN; rows * pitch];
+        for (row, values) in inputs[0].chunks_exact(heads * dim).enumerate() {
+            query[row * pitch..row * pitch + heads * dim].copy_from_slice(values);
+        }
+        let mut caches = [
+            vec![f16::NAN; heads * capacity * dim],
+            vec![f16::NAN; heads * capacity * dim],
+        ];
+        for (cache, input) in caches.iter_mut().zip(&inputs[1..]) {
+            for head in 0..heads {
+                for key in 0..keys {
+                    cache[(head * capacity + key) * dim..(head * capacity + key + 1) * dim]
+                        .copy_from_slice(
+                            &input[(key * heads + head) * dim..(key * heads + head + 1) * dim],
+                        );
+                }
+            }
+        }
+        let q = stream.clone_htod(&query)?;
+        let k = stream.clone_htod(&caches[0])?;
+        let v = stream.clone_htod(&caches[1])?;
+        let sentinel = f16::from_f32(-123.0);
+        let count = rows * heads * dim;
+        let mut output = stream.clone_htod(&vec![sentinel; count + 8])?;
+        let mut attention = Flash::new_f16(
+            stream.clone(),
+            rows,
+            heads,
+            heads,
+            dim,
+            Score::from_tokens((dim as f32).sqrt().recip(), None)?,
+        )?;
+        let mut run = || {
+            attention.run_f16(
+                &q.slice(..),
+                pitch,
+                &k.slice(..),
+                &v.slice(..),
+                &mut output.slice_mut(..count),
+                (rows, keys, capacity),
+            )
+        };
+        run()?;
+        #[cfg(feature = "cuda")]
+        stream.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        #[cfg(feature = "rocm")]
+        let capture = stream.begin_capture()?;
+        run()?;
+        #[cfg(feature = "cuda")]
+        let graph = stream
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+            .context("F16 attention graph missing")?;
+        #[cfg(feature = "rocm")]
+        let graph = capture.finish()?;
+        let eager = stream.clone_dtoh(&output)?;
+        graph.launch()?;
+        let captured = stream.clone_dtoh(&output)?;
+        ensure!(eager == captured, "F16 attention graph/eager differs");
+        ensure!(
+            eager[..count].iter().all(|value| value.is_finite())
+                && eager[count..].iter().all(|&value| value == sentinel)
+                && stream
+                    .clone_dtoh(&attention.lse)?
+                    .iter()
+                    .all(|value| value.is_finite()),
+            "F16 attention output/LSE/guard invalid"
+        );
+        Ok(eager[..count].to_vec())
+    }
+
+    #[test]
+    #[ignore = "GPU lease and FF_F16_ATTENTION_FIXTURES"]
+    fn f16_prefill_reference_gpu() -> Result<()> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("FF_F16_ATTENTION_FIXTURES")
+                .context("FF_F16_ATTENTION_FIXTURES missing")?,
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        ensure!(
+            frozen["all_declared_arms_present"] == true,
+            "F16 attention reference arms incomplete"
+        );
+        let cells = frozen["cells"]
+            .as_object()
+            .context("attention cells missing")?;
+        ensure!(cells.len() == 4, "F16 attention reference cell count");
+        let inputs_bytes = std::fs::read(root.join("inputs.safetensors"))?;
+        let reference_bytes = std::fs::read(root.join("reference.safetensors"))?;
+        let inputs_file = safetensors::SafeTensors::deserialize(&inputs_bytes)?;
+        let reference_file = safetensors::SafeTensors::deserialize(&reference_bytes)?;
+        let context = crate::backend::gpu::CudaContext::new(0)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            context.disable_event_tracking();
+        }
+        let stream = context.new_stream()?;
+        let mut defects = 0;
+        let mut scored = 0;
+        for (name, cell) in cells {
+            let shape = cell["shape"]
+                .as_array()
+                .context("attention shape missing")?;
+            let [rows, heads, dim]: [usize; 3] = shape
+                .iter()
+                .map(|n| {
+                    Ok(usize::try_from(
+                        n.as_u64().context("invalid attention dimension")?,
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("attention shape rank"))?;
+            ensure!(heads == 22 && dim == 96, "F16 attention reference geometry");
+            let keys = usize::try_from(cell["key_rows"].as_u64().context("key rows missing")?)?;
+            let inputs = [
+                f16_values(&inputs_file, &format!("{name}.input_q"), [rows, heads, dim])?,
+                f16_values(&inputs_file, &format!("{name}.input_k"), [keys, heads, dim])?,
+                f16_values(&inputs_file, &format!("{name}.input_v"), [keys, heads, dim])?,
+            ];
+            let selected = cell["compared_rows"]
+                .as_array()
+                .context("attention selected rows missing")?
+                .iter()
+                .map(|n| {
+                    Ok(usize::try_from(
+                        n.as_u64().context("invalid selected row")?,
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                selected.iter().all(|&r| r < rows),
+                "attention selected row extent"
+            );
+            let expected = f16_values(
+                &reference_file,
+                &format!("{name}.anchor"),
+                [selected.len(), heads, dim],
+            )?
+            .iter()
+            .map(|value| value.to_f64())
+            .collect::<Vec<_>>();
+            let maximum = cell["bounds"]["max_abs"]
+                .as_f64()
+                .context("max bound missing")?;
+            let rms = cell["bounds"]["rmse"]
+                .as_f64()
+                .context("rms bound missing")?;
+            ensure!(maximum > 0.0 && rms > 0.0, "invalid attention bounds");
+            for padding in [0, 8] {
+                let actual = f16_attention_cell(
+                    &stream,
+                    &inputs,
+                    [rows, keys, heads, dim],
+                    heads * dim + padding,
+                )?;
+                let selected_values = selected
+                    .iter()
+                    .flat_map(|&row| {
+                        actual[row * heads * dim..(row + 1) * heads * dim]
+                            .iter()
+                            .map(|v| v.to_f64())
+                    })
+                    .collect::<Vec<_>>();
+                let (max_error, rms_error) = errors(&selected_values, &expected, false)?;
+                let passed = max_error <= maximum && rms_error <= rms;
+                defects += usize::from(!passed);
+                scored += 1;
+                println!(
+                    "F16_ATTENTION {} {name} padding={padding} max_abs={max_error:e} rmse={rms_error:e} graph_eager=identical",
+                    if passed { "PASS" } else { "DEFECT" }
+                );
+            }
+            let mut wrong = inputs.clone();
+            for input in &mut wrong {
+                for head in input.chunks_exact_mut(dim) {
+                    head[64..].fill(half::f16::ZERO);
+                }
+            }
+            let control =
+                f16_attention_cell(&stream, &wrong, [rows, keys, heads, dim], heads * dim)?;
+            let control = selected
+                .iter()
+                .flat_map(|&row| {
+                    control[row * heads * dim..(row + 1) * heads * dim]
+                        .iter()
+                        .map(|v| v.to_f64())
+                })
+                .collect::<Vec<_>>();
+            let (max_error, rms_error) = errors(&control, &expected, false)?;
+            ensure!(
+                max_error > 10.0 * maximum && rms_error > 10.0 * rms,
+                "F16 attention D96-tail control below detection floor"
+            );
+            println!(
+                "F16_ATTENTION_CONTROL PASS {name} max_ratio={} rms_ratio={}",
+                max_error / maximum,
+                rms_error / rms
+            );
+            if name == "self.tiny17" {
+                ensure!(
+                    selected == (0..rows).collect::<Vec<_>>(),
+                    "query-repeat reference rows"
+                );
+                let repeated_rows = 4 * rows + 1;
+                let mut repeated = inputs.clone();
+                repeated[0] = (0..repeated_rows)
+                    .flat_map(|row| {
+                        inputs[0][row % rows * heads * dim..(row % rows + 1) * heads * dim]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                let actual = f16_attention_cell(
+                    &stream,
+                    &repeated,
+                    [repeated_rows, keys, heads, dim],
+                    heads * dim,
+                )?;
+                let expected = (0..repeated_rows)
+                    .flat_map(|row| {
+                        expected[row % rows * heads * dim..(row % rows + 1) * heads * dim]
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                let actual = actual
+                    .iter()
+                    .map(|value| value.to_f64())
+                    .collect::<Vec<_>>();
+                let (max_error, rms_error) = errors(&actual, &expected, false)?;
+                let passed = max_error <= maximum && rms_error <= rms;
+                defects += usize::from(!passed);
+                scored += 1;
+                println!(
+                    "F16_ATTENTION_QUERY_REPEAT {} rows={repeated_rows} keys={keys} max_abs={max_error:e} rmse={rms_error:e}",
+                    if passed { "PASS" } else { "DEFECT" }
+                );
+            }
+        }
+        println!("F16_ATTENTION_RESULT cells={scored} controls=4 defects={defects}");
+        ensure!(defects == 0, "F16 attention candidate DEFECT");
+        Ok(())
+    }
+
     fn ring_reference_cell(
         s: &Arc<CudaStream>,
         case: &Case,

@@ -422,6 +422,26 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_f16(
 }
 
 /// # Safety
+/// Heads have 96 F16 columns; launch uses 128 threads and 49152 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d96_bidirectional_f16(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        attention::<128, 16, 1, 96, true>(
+            resolve_position(p),
+            keys,
+            0,
+            scale,
+            core::ptr::null(),
+            0,
+        );
+    }
+}
+
+/// # Safety
 /// Global heads have 72 BF16 columns; launch uses 128 threads and 49152 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d72_bidirectional(

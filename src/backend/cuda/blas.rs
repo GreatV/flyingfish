@@ -457,6 +457,7 @@ pub struct Blas {
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
     bias_add: Option<CudaFunction>,
+    bias_fill_f16: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
     decode: CudaBlas,
     workspace: CudaSlice<u8>,
@@ -662,6 +663,7 @@ impl Blas {
             plans: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
             bias_add: None,
+            bias_fill_f16: None,
             handle,
             decode,
             workspace,
@@ -1287,6 +1289,57 @@ impl Blas {
             .result()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn prepare_f16_biased(&mut self) -> Result<()> {
+        if self.bias_fill_f16.is_none() {
+            self.bias_fill_f16 = Some(
+                cubin::module(self.stream.context(), "q38_common")?
+                    .load_function("q38_bias_fill_f16")?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn linear_f16_biased(
+        &self,
+        weight: super::contracts::Tensor<half::f16, 2>,
+        bias: super::contracts::Tensor<half::f16, 1>,
+        x: super::contracts::Tensor<half::f16, 2>,
+        y: &mut super::contracts::TensorMut<half::f16, 2>,
+    ) -> Result<()> {
+        bias.validate()?;
+        super::linear::validate_call(weight.shape, x, &y.0)?;
+        ensure!(
+            bias.shape == [weight.shape[0]] && bias.stride == [1],
+            "F16 bias extent"
+        );
+        super::linear::disjoint(&bias, &y.0)?;
+        super::linear::disjoint(&weight, &y.0)?;
+        let kernel = self
+            .bias_fill_f16
+            .as_ref()
+            .context("F16 bias fill not prepared")?;
+        unsafe {
+            self.stream
+                .launch_builder(kernel)
+                .arg(&y.0.ptr)
+                .arg(&bias.ptr)
+                .arg(&(u64::from(y.0.shape[0]) * u64::from(y.0.shape[1])))
+                .arg(&y.0.shape[1])
+                .launch(LaunchConfig {
+                    grid_dim: (
+                        (u64::from(y.0.shape[0]) * u64::from(y.0.shape[1]))
+                            .div_ceil(256)
+                            .min(65535) as u32,
+                        1,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        self.linear_f16(weight, x, y, true)
     }
 
     /// `y = bf16(y + alpha * x * weight^T)` with BF16 operands and FP32 compute. `weight` is dense

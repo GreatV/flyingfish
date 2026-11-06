@@ -164,6 +164,200 @@ pub struct FlowCheckpoint {
     pub mapped: MappedCheckpoint,
     pub runtime_bytes: usize,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hi3DFlowSpec {
+    pub resolution: usize,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub model_channels: usize,
+    pub cond_channels: usize,
+    pub num_blocks: usize,
+    pub num_heads: usize,
+    pub mlp_ratio: f64,
+    pub patch_size: usize,
+    pub num_io_res_blocks: usize,
+    pub io_block_channels: Vec<usize>,
+    pub use_fp16: bool,
+    pub latent_mean: Vec<f32>,
+    pub latent_std: Vec<f32>,
+}
+
+impl Hi3DFlowSpec {
+    pub fn read(root: &Path, component: &str) -> Result<Self> {
+        let resolution = match component {
+            "transformer_512" => 64,
+            "transformer_1024" => 128,
+            _ => anyhow::bail!("unsupported Hi3D flow component {component}"),
+        };
+        let spec: Self =
+            serde_json::from_slice(&std::fs::read(root.join(component).join("config.json"))?)?;
+        ensure!(
+            spec.resolution == resolution
+                && spec.in_channels == 32
+                && spec.out_channels == 32
+                && spec.model_channels == 2112
+                && spec.cond_channels == 2048
+                && spec.num_blocks == 24
+                && spec.num_heads == 22
+                && spec.mlp_ratio == 4.0
+                && spec.patch_size == 2
+                && spec.num_io_res_blocks == 2
+                && spec.io_block_channels == [256]
+                && spec.use_fp16,
+            "unsupported Hi3D flow geometry/arithmetic"
+        );
+        ensure!(
+            spec.latent_mean.len() == spec.in_channels
+                && spec.latent_std.len() == spec.in_channels
+                && spec.latent_mean.iter().all(|x| x.is_finite())
+                && spec.latent_std.iter().all(|x| x.is_finite() && *x > 0.0),
+            "invalid Hi3D latent normalization"
+        );
+        Ok(spec)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn flow_spec(&self) -> FlowSpec {
+        FlowSpec {
+            resolution: self.resolution,
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            model_channels: self.model_channels,
+            cond_channels: self.cond_channels,
+            num_blocks: self.num_blocks,
+            num_heads: self.num_heads,
+            mlp_ratio: self.mlp_ratio,
+            pe_mode: "rope".into(),
+            share_mod: true,
+            qk_rms_norm: true,
+            qk_rms_norm_cross: false,
+            image_attn_mode: "full".into(),
+            dtype: "float16".into(),
+            proj_in_channels: None,
+        }
+    }
+
+    pub(crate) fn inventory(&self) -> BTreeMap<String, (Vec<usize>, &'static str)> {
+        let mut out = BTreeMap::new();
+        let h = self.model_channels;
+        let mut linear = |name: String, output: usize, input: usize, dtype| {
+            out.insert(format!("{name}.weight"), (vec![output, input], dtype));
+            out.insert(format!("{name}.bias"), (vec![output], dtype));
+        };
+        for (name, output, input) in [
+            ("input_layer", 256, self.in_channels),
+            ("out_layer", self.out_channels, 256),
+            ("t_embedder.mlp.0", h, 256),
+            ("t_embedder.mlp.2", h, h),
+            ("adaLN_modulation.1", 6 * h, h),
+        ] {
+            linear(name.into(), output, input, "F32");
+        }
+        for block in 0..self.num_blocks {
+            for (name, output, input) in [
+                ("self_attn.to_qkv", 3 * h, h),
+                ("self_attn.to_out", h, h),
+                ("cross_attn.to_q", h, h),
+                ("cross_attn.to_kv", 2 * h, self.cond_channels),
+                ("cross_attn.to_out", h, h),
+                ("mlp.mlp.0", 4 * h, h),
+                ("mlp.mlp.2", h, 4 * h),
+            ] {
+                linear(format!("blocks.{block}.{name}"), output, input, "F16");
+            }
+        }
+        for (name, input, output) in [
+            ("input_blocks.0", 256, 256),
+            ("input_blocks.1", 256, h),
+            ("out_blocks.0", 2 * h, 256),
+            ("out_blocks.1", 512, 256),
+        ] {
+            let hidden = output / 2;
+            linear(format!("{name}.emb_layers.1"), 2 * hidden, h, "F16");
+            linear(format!("{name}.linear"), output, hidden, "F16");
+            if input != output {
+                linear(format!("{name}.skip_connection"), output, input, "F16");
+            }
+        }
+        for block in 0..self.num_blocks {
+            let prefix = format!("blocks.{block}");
+            out.insert(format!("{prefix}.modulation"), (vec![1, 6 * h], "F32"));
+            for name in ["norm2.weight", "norm2.bias"] {
+                out.insert(format!("{prefix}.{name}"), (vec![h], "F32"));
+            }
+            for role in ["q", "k"] {
+                out.insert(
+                    format!("{prefix}.self_attn.{role}_rms_norm.gamma"),
+                    (vec![self.num_heads, h / self.num_heads], "F32"),
+                );
+            }
+        }
+        for (name, input, output) in [
+            ("input_blocks.0", 256, 256),
+            ("input_blocks.1", 256, h),
+            ("out_blocks.0", 2 * h, 256),
+            ("out_blocks.1", 512, 256),
+        ] {
+            let hidden = output / 2;
+            for (conv, channels) in [("conv1", input), ("conv2", hidden)] {
+                out.insert(
+                    format!("{name}.{conv}.conv.weight"),
+                    (vec![hidden, 3, 3, 3, channels], "F16"),
+                );
+                out.insert(format!("{name}.{conv}.conv.bias"), (vec![hidden], "F16"));
+            }
+            for parameter in ["weight", "bias"] {
+                out.insert(format!("{name}.norm1.{parameter}"), (vec![input], "F32"));
+            }
+        }
+        out
+    }
+
+    pub(crate) fn validate_tensors(
+        &self,
+        tensors: &BTreeMap<String, PublishedTensor<'_>>,
+    ) -> Result<usize> {
+        let inventory = self.inventory();
+        ensure!(
+            tensors.keys().eq(inventory.keys()),
+            "Hi3D checkpoint missing/unexpected keys"
+        );
+        let mut bytes = 0usize;
+        for (name, (shape, dtype)) in inventory {
+            let tensor = &tensors[&name];
+            ensure!(
+                tensor.shape == shape && tensor.dtype == dtype,
+                "{name}: stored {} {:?}, expected {dtype} {shape:?}",
+                tensor.dtype,
+                tensor.shape
+            );
+            bytes = bytes
+                .checked_add(tensor.data.len())
+                .context("flow weight bytes overflow")?;
+        }
+        Ok(bytes)
+    }
+}
+
+pub struct Hi3DFlowCheckpoint {
+    pub spec: Hi3DFlowSpec,
+    pub mapped: MappedCheckpoint,
+    pub runtime_bytes: usize,
+}
+impl Hi3DFlowCheckpoint {
+    pub fn open(root: &Path, component: &str) -> Result<Self> {
+        let spec = Hi3DFlowSpec::read(root, component)?;
+        let mapped = MappedCheckpoint::open_component(&root.join(component), "model")?;
+        let runtime_bytes = spec.validate_tensors(&mapped.component_tensors()?)?;
+        Ok(Self {
+            spec,
+            mapped,
+            runtime_bytes,
+        })
+    }
+}
 impl FlowCheckpoint {
     pub fn open(dir: &Path, stem: &str) -> Result<Self> {
         let mapped = MappedCheckpoint::open_component(dir, stem)?;
@@ -382,6 +576,32 @@ impl DecoderCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires FF_HI3D_MODEL; CPU only"]
+    fn hi3d_flow_checkpoint_cpu() -> Result<()> {
+        let root = std::env::var_os("FF_HI3D_MODEL").context("FF_HI3D_MODEL required")?;
+        for component in ["transformer_512", "transformer_1024"] {
+            let checkpoint = Hi3DFlowCheckpoint::open(Path::new(&root), component)?;
+            ensure!(
+                checkpoint.runtime_bytes == 3_675_626_624,
+                "published flow byte count"
+            );
+            let mut tensors = checkpoint.mapped.component_tensors()?;
+            ensure!(tensors.len() == 512, "published flow tensor count");
+            tensors
+                .get_mut("blocks.0.self_attn.q_rms_norm.gamma")
+                .context("gain missing")?
+                .dtype = "F16".into();
+            ensure!(
+                checkpoint.spec.validate_tensors(&tensors).is_err(),
+                "cast gain control accepted"
+            );
+            println!(
+                "HI3D_FLOW_LOAD PASS component={component} tensors=512 published_bytes=3675626624 missing=0 unexpected=0 initialized=0 gain_dtype_control=rejected"
+            );
+        }
+        Ok(())
+    }
     #[test]
     #[ignore = "requires the published Pixal3D checkpoint; CPU only"]
     fn pixal3d_flow_checkpoint_cpu() -> Result<()> {

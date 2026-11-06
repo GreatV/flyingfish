@@ -93,6 +93,892 @@ fn env_path(name: &str) -> Result<PathBuf> {
         std::env::var_os(name).with_context(|| format!("{name} required"))?,
     ))
 }
+
+struct OperationGate {
+    root: PathBuf,
+    kind: String,
+    cells: BTreeMap<String, Value>,
+    seen: BTreeSet<String>,
+    defects: usize,
+}
+impl OperationGate {
+    fn new(kind: &str, count: usize) -> Result<Self> {
+        let root = env_path("FF_HI3D_FIXTURES")?;
+        let freeze: Value =
+            serde_json::from_slice(&std::fs::read(root.join(kind).join("FROZEN.json"))?)?;
+        ensure!(
+            freeze["all_declared_arms_present"] == true,
+            "missing reference arm"
+        );
+        let cells: BTreeMap<String, Value> = serde_json::from_value(freeze["cells"].clone())?;
+        ensure!(cells.len() == count, "frozen operation coverage mismatch");
+        for cell in cells.values() {
+            ensure!(
+                cell["score_anchor"] == "sm89/anchor",
+                "candidate anchor is not released F16"
+            );
+            for control in cell["controls"]
+                .as_object()
+                .context("frozen controls missing")?
+                .values()
+            {
+                for metric in ["max_abs", "rmse"] {
+                    ensure!(
+                        control["ratios"][metric]
+                            .as_f64()
+                            .context("control ratio missing")?
+                            >= 10.0,
+                        "weak frozen control"
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            root,
+            kind: kind.into(),
+            cells,
+            seen: BTreeSet::new(),
+            defects: 0,
+        })
+    }
+    fn score(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
+        if !control {
+            ensure!(self.seen.insert(name.into()), "duplicate operation score");
+        }
+        let cell = self.cells.get(name).context("cell outside frozen scope")?;
+        let anchor = tensor(
+            &self.root.join(&self.kind).join("anchor.safetensors"),
+            &format!("{name}.anchor"),
+        )?;
+        let errors = metrics(values, &anchor.values)?;
+        for metric in ["max_abs", "rmse"] {
+            let bound = cell["bounds"][metric].as_f64().context("bound missing")?;
+            let value = errors[metric];
+            let defect = if control {
+                value < 10.0 * bound
+            } else {
+                value > bound
+            };
+            self.defects += usize::from(defect);
+            println!(
+                "N5_M1_METRIC kind={} cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                self.kind,
+                if defect { "DEFECT" } else { "PASS" }
+            );
+        }
+        Ok(())
+    }
+    fn finish(self) -> Result<()> {
+        ensure!(
+            self.seen.len() == self.cells.len(),
+            "operation cells unexecuted"
+        );
+        println!(
+            "N5_M1_GATE {} kind={} cells={} defects={} timing=false",
+            if self.defects == 0 { "PASS" } else { "DEFECT" },
+            self.kind,
+            self.seen.len(),
+            self.defects
+        );
+        ensure!(self.defects == 0, "finite operation candidate defects");
+        Ok(())
+    }
+}
+
+fn selected_half(
+    d: &Device,
+    values: &CudaSlice<f16>,
+    rows: &[usize],
+    width: usize,
+) -> Result<Vec<f64>> {
+    let values = d.stream.clone_dtoh(values)?;
+    ensure!(
+        rows.iter().all(|&r| r < values.len() / width),
+        "selected row outside output"
+    );
+    Ok(rows
+        .iter()
+        .flat_map(|&r| {
+            values[r * width..(r + 1) * width]
+                .iter()
+                .map(|x| x.to_f64())
+        })
+        .collect())
+}
+fn frozen_rows(cell: &Value) -> Result<Vec<usize>> {
+    cell["compared_rows"]
+        .as_array()
+        .context("compared rows missing")?
+        .iter()
+        .map(|v| usize::try_from(v.as_u64().context("invalid compared row")?).map_err(Into::into))
+        .collect()
+}
+fn lattice(path: &Path, key: &str) -> Result<Vec<[i32; 3]>> {
+    let t = tensor(path, key)?;
+    ensure!(
+        t.shape.len() == 2
+            && t.shape[1] == 4
+            && t.values.as_chunks::<4>().0.iter().all(|p| p[0] == 0.0),
+        "single-sample lattice required"
+    );
+    Ok(t.values
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| [p[1] as i32, p[2] as i32, p[3] as i32])
+        .collect())
+}
+
+#[test]
+#[ignore = "requires published flow and frozen fixtures; CUDA"]
+fn hi3d_flow_components_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("components", 66)?;
+    let root = env_path("FF_HI3D_MODEL")?;
+    let common = gate.root.join("common.safetensors");
+    let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
+    let input_path = gate.root.join("component-inputs.safetensors");
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    for component in ["transformer_512", "transformer_1024"] {
+        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        for (name, cell) in gate.cells.clone() {
+            if !name.starts_with(component) {
+                continue;
+            }
+            let (_, rest) = name.split_once('.').context("component cell malformed")?;
+            let (block, op) = rest
+                .split_once('.')
+                .context("component operation missing")?;
+            let block = block
+                .strip_prefix("block")
+                .context("block prefix missing")?
+                .parse::<usize>()?;
+            let b = &flow.blocks[block];
+            let input = tensor(&input_path, &format!("{name}.input"))?;
+            let width = input.shape[1];
+            let n = cell["input_shape"][0]
+                .as_u64()
+                .context("input rows missing")? as usize;
+            let count = input.shape[0];
+            let out = cell["shape"][1].as_u64().context("output width missing")? as usize;
+            let selected: Vec<_> = (0..count)
+                .map(|row| {
+                    (0..count)
+                        .find(|&i| (i * 127) % count == row)
+                        .context("motif inverse missing")
+                })
+                .collect::<Result<_>>()?;
+            for control in [false, true] {
+                let values: Vec<_> = (0..n)
+                    .flat_map(|r| {
+                        let source = (r * 127) % count;
+                        let values = &input.values;
+                        (0..width).map(move |c| {
+                            f16::from_f64(
+                                values[source * width
+                                    + if control {
+                                        (c + width - 127 % width) % width
+                                    } else {
+                                        c
+                                    }],
+                            )
+                        })
+                    })
+                    .collect();
+                let x = flow.device.stream.clone_htod(&values)?;
+                let y = flow.device.stream.alloc_zeros::<f16>(n * out)?;
+                if op.starts_with("norm") {
+                    flow.kernels.norm(
+                        &flow.device,
+                        ptr(&x, &flow.device),
+                        ptr(&y, &flow.device),
+                        [n, width],
+                        if op == "norm2" {
+                            [b.norm_weight, b.norm_bias]
+                        } else {
+                            [0, 0]
+                        },
+                        (1e-6, false),
+                    )?;
+                } else if op == "mlp.mlp.1" {
+                    unsafe {
+                        flow.device
+                            .stream
+                            .launch_builder(&flow.kernels.gelu)
+                            .arg(&x)
+                            .arg(&y)
+                            .arg(&(n as u32))
+                            .arg(&1u32)
+                            .arg(&(width as u32))
+                            .arg(&(width as u64))
+                            .arg(&0u64)
+                            .arg(&1u64)
+                            .arg(&(width as u64))
+                            .arg(&0u64)
+                            .arg(&1u64)
+                            .arg(&1i32)
+                            .launch(grid((n * width).div_ceil(256).min(65535), 256))?;
+                    }
+                } else {
+                    let linear = match op {
+                        "self_attn.to_qkv" => b.qkv,
+                        "self_attn.to_out" => b.self_out,
+                        "cross_attn.to_q" => b.cross_q,
+                        "cross_attn.to_kv" => b.cross_kv,
+                        "cross_attn.to_out" => b.cross_out,
+                        "mlp.mlp.0" => b.fc1,
+                        "mlp.mlp.2" => b.fc2,
+                        _ => anyhow::bail!("unsupported component operation {op}"),
+                    };
+                    linear.run(&flow.blas, n, ptr(&x, &flow.device), ptr(&y, &flow.device))?;
+                }
+                gate.score(
+                    &name,
+                    &selected_half(&flow.device, &y, &selected, out)?,
+                    control,
+                )?;
+            }
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires published flow and frozen fixtures; CUDA"]
+fn hi3d_flow_qk_rope_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("qk", 72)?;
+    let root = env_path("FF_HI3D_MODEL")?;
+    let common = gate.root.join("common.safetensors");
+    let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
+    let anchor = gate.root.join("qk/anchor.safetensors");
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    for component in ["transformer_512", "transformer_1024"] {
+        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        for (name, cell) in gate.cells.clone() {
+            if !name.starts_with(component) {
+                continue;
+            }
+            let fields: Vec<_> = name.split('.').collect();
+            ensure!(fields.len() == 5, "QK cell malformed");
+            let tag = fields[2];
+            let role = fields[3];
+            let mode = fields[4];
+            let coords = tensor(&anchor, &format!("{tag}.coordinates"))?;
+            ensure!(
+                coords.shape.len() == 2 && coords.shape[1] == 3,
+                "QK coordinate shape"
+            );
+            let n = coords.shape[0];
+            let gain = cell["gamma_checkpoint_key"]
+                .as_str()
+                .context("gain key missing")?;
+            let gamma = &flow._f32[gain];
+            let values: Vec<_> = (0..n * 2112)
+                .map(|i| {
+                    f16::from_f32(
+                        ((i * if role == "q" { 127 } else { 61 }) % 251) as f32 / 128.0
+                            - 125.0 / 128.0,
+                    )
+                })
+                .collect();
+            let selected = frozen_rows(&cell)?;
+            for control in [false, true] {
+                let input = flow.device.stream.clone_htod(&values)?;
+                let output = flow.device.stream.alloc_zeros::<f16>(values.len())?;
+                let mut gamma_ptr = ptr(gamma, &flow.device);
+                let modified = if control && mode == "norm" {
+                    let values: Vec<_> = flow
+                        .device
+                        .stream
+                        .clone_dtoh(gamma)?
+                        .into_iter()
+                        .map(|x| x + 1.0)
+                        .collect();
+                    Some(flow.device.stream.clone_htod(&values)?)
+                } else {
+                    None
+                };
+                if let Some(gain) = &modified {
+                    gamma_ptr = ptr(gain, &flow.device);
+                }
+                if mode == "rope_norm" {
+                    let sites = SparseSites::new(
+                        coords
+                            .values
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
+                            .map(|p| {
+                                if control {
+                                    [0, p[2] as i32, p[1] as i32, p[0] as i32]
+                                } else {
+                                    [0, p[0] as i32, p[1] as i32, p[2] as i32]
+                                }
+                            })
+                            .collect(),
+                    )?;
+                    let phases = spatial_phases(&flow.device, &flow.kernels, &sites)?;
+                    unsafe {
+                        flow.device
+                            .stream
+                            .launch_builder(&flow.kernels.rope)
+                            .arg(&input)
+                            .arg(&phases)
+                            .arg(&(n as i32))
+                            .arg(&22i32)
+                            .arg(&96i32)
+                            .arg(&96i32)
+                            .arg(&1i32)
+                            .launch(flat(n * 22 * 48))?;
+                    }
+                }
+                flow.kernels.l2(
+                    &flow.device,
+                    ptr(&input, &flow.device),
+                    ptr(&output, &flow.device),
+                    gamma_ptr,
+                    n,
+                    role == "k",
+                )?;
+                let values = flow.device.stream.clone_dtoh(&output)?;
+                let mut compared = Vec::with_capacity(selected.len() * 2112);
+                for &row in &selected {
+                    for head in 0..22 {
+                        for dim in 0..96 {
+                            let at = if role == "k" {
+                                (head * n + row) * 96 + dim
+                            } else {
+                                (row * 22 + head) * 96 + dim
+                            };
+                            compared.push(values[at].to_f64());
+                        }
+                    }
+                }
+                gate.score(&name, &compared, control)?;
+            }
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires published flow and frozen fixtures; CUDA"]
+fn hi3d_flow_blocks_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("blocks", 6)?;
+    let root = env_path("FF_HI3D_MODEL")?;
+    let common = gate.root.join("common.safetensors");
+    let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
+    let context = f32_tensor(&common, "context")?;
+    let modulation: Vec<_> = f32_tensor(&common, "modulation")?
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    for component in ["transformer_512", "transformer_1024"] {
+        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let conditioning = flow.conditioning(&context, &[], &coordinates)?;
+        let modulation = flow.device.stream.clone_htod(&modulation)?;
+        for index in [0, 12, 23] {
+            let name = format!("{component}.block{index}");
+            let rows = frozen_rows(&gate.cells[&name])?;
+            let values: Vec<_> = f32_tensor(&common, &format!("blocks.{index}.features"))?
+                .into_iter()
+                .map(f16::from_f32)
+                .collect();
+            ensure!(
+                values.len() == flow.work.hidden.len(),
+                "block input shape mismatch"
+            );
+            for control in [false, true] {
+                flow.work.hidden = flow.device.stream.clone_htod(&values)?;
+                if control {
+                    flow.block::<true>(index, ptr(&modulation, &flow.device), &conditioning)?;
+                } else {
+                    flow.block::<false>(index, ptr(&modulation, &flow.device), &conditioning)?;
+                }
+                gate.score(
+                    &name,
+                    &selected_half(&flow.device, &flow.work.hidden, &rows, 2112)?,
+                    control,
+                )?;
+            }
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires published flow and frozen fixtures; CUDA"]
+fn hi3d_flow_pool_inverse_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("pool", 2)?;
+    let common = gate.root.join("common.safetensors");
+    let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
+    let root = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let flow = Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
+    let io = flow.io.as_ref().context("pool IO missing")?;
+    let input: Vec<_> = f32_tensor(&common, "input_blocks.1.updown.features")?
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+    let input = flow.device.stream.clone_htod(&input)?;
+    let pooled = flow.device.stream.alloc_zeros::<f16>(2548 * 256)?;
+    unsafe {
+        flow.device
+            .stream
+            .launch_builder(&io.pool)
+            .arg(&input)
+            .arg(&io.offsets)
+            .arg(&io.children)
+            .arg(&pooled)
+            .arg(&2548u32)
+            .arg(&256u32)
+            .launch(flat(pooled.len()))?;
+    }
+    let inverse = flow.device.stream.clone_dtoh(&io.inverse)?;
+    let anchor_path = gate.root.join("pool/anchor.safetensors");
+    ensure!(
+        inverse
+            .iter()
+            .map(|&x| x as f64)
+            .eq(tensor(&anchor_path, "unpool_inverse")?.values),
+        "paired inverse differs from published row order"
+    );
+    let unpooled = flow.device.stream.alloc_zeros::<f16>(11295 * 256)?;
+    io.copy(
+        &flow.device,
+        ptr(&pooled, &flow.device),
+        ptr(&io.inverse, &flow.device),
+        ptr(&unpooled, &flow.device),
+        11295,
+        256,
+    )?;
+    gate.score(
+        "pool",
+        &selected_half(&flow.device, &pooled, &(0..2548).collect::<Vec<_>>(), 256)?,
+        false,
+    )?;
+    gate.score(
+        "unpool",
+        &selected_half(
+            &flow.device,
+            &unpooled,
+            &(0..11295).collect::<Vec<_>>(),
+            256,
+        )?,
+        false,
+    )?;
+    let rank: Vec<_> = tensor(&anchor_path, "wrong_xz_rank")?
+        .values
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    for (name, index) in [
+        ("pool", rank.clone()),
+        (
+            "unpool",
+            inverse.iter().map(|&i| rank[i as usize]).collect(),
+        ),
+    ] {
+        let index = flow.device.stream.clone_htod(&index)?;
+        let output = flow.device.stream.alloc_zeros::<f16>(index.len() * 256)?;
+        io.copy(
+            &flow.device,
+            ptr(&pooled, &flow.device),
+            ptr(&index, &flow.device),
+            ptr(&output, &flow.device),
+            index.len(),
+            256,
+        )?;
+        gate.score(
+            name,
+            &selected_half(
+                &flow.device,
+                &output,
+                &(0..index.len()).collect::<Vec<_>>(),
+                256,
+            )?,
+            true,
+        )?;
+    }
+    let mut exact_cases = 0;
+    for rows in [17, 11295] {
+        for width in [256, 2112] {
+            let first: Vec<_> = (0..rows * width)
+                .map(|i| f16::from_f32(((i * 127 % 251) as f32 - 125.0) / 128.0))
+                .collect();
+            let second: Vec<_> = first
+                .iter()
+                .map(|x| f16::from_f32(x.to_f32() + 4.0))
+                .collect();
+            let a = flow.device.stream.clone_htod(&first)?;
+            let b = flow.device.stream.clone_htod(&second)?;
+            let output = flow.device.stream.alloc_zeros::<f16>(2 * rows * width)?;
+            for control in [false, true] {
+                let (left, right) = if control { (&b, &a) } else { (&a, &b) };
+                io.concat(
+                    &flow.device,
+                    ptr(left, &flow.device),
+                    ptr(right, &flow.device),
+                    ptr(&output, &flow.device),
+                    rows,
+                    width,
+                )?;
+                let actual = flow.device.stream.clone_dtoh(&output)?;
+                let mismatches = actual
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, value)| {
+                        let row = i / (2 * width);
+                        let col = i % (2 * width);
+                        let expected = if col < width {
+                            first[row * width + col]
+                        } else {
+                            second[row * width + col - width]
+                        };
+                        value.to_bits() != expected.to_bits()
+                    })
+                    .count();
+                ensure!(
+                    mismatches == if control { actual.len() } else { 0 },
+                    "concat source/column indexing mismatch"
+                );
+            }
+            let copied = flow.device.stream.alloc_zeros::<f16>(rows * width)?;
+            io.copy(
+                &flow.device,
+                ptr(&a, &flow.device),
+                0,
+                ptr(&copied, &flow.device),
+                rows,
+                width,
+            )?;
+            ensure!(
+                flow.device
+                    .stream
+                    .clone_dtoh(&copied)?
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(first.iter().map(|x| x.to_bits())),
+                "identity copy changed stored bits"
+            );
+            let indices: Vec<_> = (0..rows).map(|r| (r * 127 % rows) as u32).collect();
+            let index = flow.device.stream.clone_htod(&indices)?;
+            io.copy(
+                &flow.device,
+                ptr(&a, &flow.device),
+                ptr(&index, &flow.device),
+                ptr(&copied, &flow.device),
+                rows,
+                width,
+            )?;
+            let expected = indices.iter().flat_map(|&r| {
+                first[r as usize * width..(r as usize + 1) * width]
+                    .iter()
+                    .map(|x| x.to_bits())
+            });
+            ensure!(
+                flow.device
+                    .stream
+                    .clone_dtoh(&copied)?
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(expected),
+                "indexed copy changed row/column order"
+            );
+            exact_cases += 1;
+            println!(
+                "N5_M1_SPARSE_ROWS PASS rows={rows} width={width} identity=true indexed=true concat=true wrong_source_control_mismatches={} byte_exact=true",
+                rows * width * 2
+            );
+        }
+    }
+    ensure!(exact_cases == 4, "sparse row coverage missing");
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires frozen SiLU reference cells; CUDA"]
+fn hi3d_flow_silu_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("silu", 12)?;
+    let device = Device::new(0)?;
+    let kernel = cubin::module(&device.ctx, "vision_ops")?.load_function("vision_silu_f16")?;
+    for (name, cell) in gate.cells.clone() {
+        let rows = cell["shape"][0].as_u64().context("SiLU rows missing")? as usize;
+        let width = cell["shape"][1].as_u64().context("SiLU width missing")? as usize;
+        let count = rows.min(47);
+        let selected: Vec<_> = (0..count)
+            .map(|r| (0..count).find(|&i| i * 127 % count == r).unwrap())
+            .collect();
+        for control in [false, true] {
+            let input: Vec<_> = (0..rows)
+                .flat_map(|row| {
+                    (0..width).map(move |col| {
+                        let c = if control {
+                            (col + width - 127 % width) % width
+                        } else {
+                            col
+                        };
+                        f16::from_f32(
+                            ((((row * 127 % count) * 61 + c * 127) % 251) as f32 - 125.0) / 16.0,
+                        )
+                    })
+                })
+                .collect();
+            let input = device.stream.clone_htod(&input)?;
+            let output = device.stream.alloc_zeros::<f16>(rows * width)?;
+            unsafe {
+                device
+                    .stream
+                    .launch_builder(&kernel)
+                    .arg(&input)
+                    .arg(&output)
+                    .arg(&u32::try_from(rows * width)?)
+                    .launch(flat(rows * width))?;
+            }
+            gate.score(
+                &name,
+                &selected_half(&device, &output, &selected, width)?,
+                control,
+            )?;
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires published flow and frozen fixtures; CUDA"]
+fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("io-conv", 16)?;
+    let root = env_path("FF_HI3D_MODEL")?;
+    let common = gate.root.join("common.safetensors");
+    let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
+    let inputs = gate.root.join("io-inputs.safetensors");
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    for component in ["transformer_512", "transformer_1024"] {
+        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        for (name, cell) in gate.cells.clone() {
+            let Some(op) = name.strip_prefix(&format!("{component}.")) else {
+                continue;
+            };
+            let coords = lattice(&inputs, &format!("{op}.coordinates"))?;
+            let sites = SparseSites::new(coords.iter().map(|p| [0, p[0], p[1], p[2]]).collect())?;
+            let data = tensor(&inputs, &format!("{op}.features"))?;
+            let width = data.shape[1];
+            let output_width = cell["shape"][1]
+                .as_u64()
+                .context("conv output width missing")? as usize;
+            let data: Vec<_> = data.values.into_iter().map(f16::from_f64).collect();
+            let data = flow.device.stream.clone_htod(&data)?;
+            let (block, conv) = op
+                .rsplit_once('.')
+                .context("convolution component missing")?;
+            let block = match block {
+                "input_blocks.0" => 0,
+                "input_blocks.1" => 1,
+                "out_blocks.0" => 2,
+                "out_blocks.1" => 3,
+                _ => anyhow::bail!("unknown IO block"),
+            };
+            let conv = match conv {
+                "conv1" => 0,
+                "conv2" => 1,
+                _ => anyhow::bail!("unknown IO convolution"),
+            };
+            let convolution =
+                &mut flow.io.as_mut().context("sparse IO missing")?.blocks[block].conv[conv];
+            let weight = dense(
+                &flow._inner_weights[&format!("{op}.conv.weight")],
+                &flow.device,
+                [output_width as u32, (27 * width) as u32],
+            )?;
+            let bias = dense(
+                &flow._inner_weights[&format!("{op}.conv.bias")],
+                &flow.device,
+                [output_width as u32],
+            )?;
+            let mut output = flow
+                .device
+                .stream
+                .alloc_zeros::<f16>(coords.len() * output_width)?;
+            let selected = frozen_rows(&cell)?;
+            convolution.run(&flow.blas, &data, weight, bias, &mut output)?;
+            gate.score(
+                &name,
+                &selected_half(&flow.device, &output, &selected, output_width)?,
+                false,
+            )?;
+            let maps: Vec<[i32; 27]> = sites
+                .coordinates()
+                .iter()
+                .map(|p| {
+                    std::array::from_fn(|tap| {
+                        sites
+                            .row([
+                                p[0],
+                                p[3] + (tap / 9) as i32 - 1,
+                                p[2] + ((tap / 3) % 3) as i32 - 1,
+                                p[1] + (tap % 3) as i32 - 1,
+                            ])
+                            .unwrap_or(-1)
+                    })
+                })
+                .collect();
+            convolution.replace_neighbours(&maps)?;
+            convolution.run(&flow.blas, &data, weight, bias, &mut output)?;
+            gate.score(
+                &name,
+                &selected_half(&flow.device, &output, &selected, output_width)?,
+                true,
+            )?;
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires frozen Heun common inputs; CUDA"]
+fn hi3d_heun_updates_gpu() -> Result<()> {
+    let mut gate = OperationGate::new("heun", 50)?;
+    let source = gate.root.join("trajectory.safetensors");
+    let metadata: Value =
+        serde_json::from_slice(&std::fs::read(gate.root.join("trajectory.json"))?)?;
+    let schedule = heun_schedule(11295, 25)?;
+    let device = Device::new(0)?;
+    let kernel = cubin::module(&device.ctx, "flow")?.load_function("heun_update_f32")?;
+    let selected: Vec<_> = tensor(&source, "selected_rows")?
+        .values
+        .into_iter()
+        .map(|v| v as usize)
+        .collect();
+    ensure!(selected.len() == 31, "Heun recorded rows mismatch");
+    for (step, &(time, next)) in schedule.iter().enumerate() {
+        let first_time = metadata["steps"][step]["first_time"]
+            .as_f64()
+            .context("first time missing")? as f32;
+        let next_time = metadata["steps"][step]["next_time"]
+            .as_f64()
+            .context("next time missing")? as f32;
+        ensure!(
+            time == first_time && next == next_time,
+            "published schedule mismatch at {step}: {time}/{first_time} {next}/{next_time}"
+        );
+        let state = if step == 0 {
+            let noise = f32_tensor(&source, "noise")?;
+            selected
+                .iter()
+                .flat_map(|&r| noise[r * 32..(r + 1) * 32].iter().copied())
+                .collect()
+        } else {
+            f32_tensor(&source, &format!("step{}.updated", step - 1))?
+        };
+        let first = f32_tensor(&source, &format!("step{step}.first_velocity"))?;
+        let second = f32_tensor(&source, &format!("step{step}.second_velocity"))?;
+        let expand = |x: &[f32]| -> Result<_> {
+            ensure!(x.len() == 31 * 32, "Heun recorded extent mismatch");
+            let values: Vec<_> = (0..11295)
+                .flat_map(|i| {
+                    x[(i * 127 % 31) * 32..(i * 127 % 31 + 1) * 32]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            Ok(device.stream.clone_htod(&values)?)
+        };
+        let state = expand(&state)?;
+        let first = expand(&first)?;
+        let second = expand(&second)?;
+        let output = device.stream.alloc_zeros::<f32>(11295 * 32)?;
+        for (kind, second_ptr, control) in [
+            ("predictor", 0, false),
+            ("updated", ptr(&second, &device), false),
+            ("updated", ptr(&first, &device), true),
+        ] {
+            if control && step != 12 {
+                continue;
+            }
+            unsafe {
+                device
+                    .stream
+                    .launch_builder(&kernel)
+                    .arg(&state)
+                    .arg(&first)
+                    .arg(&second_ptr)
+                    .arg(&output)
+                    .arg(&((11295 * 32) as u64))
+                    .arg(&(time - next))
+                    .launch(flat(11295 * 32))?;
+            }
+            let values = device.stream.clone_dtoh(&output)?;
+            let rows: Vec<_> = (0..31)
+                .map(|r| (0..31).find(|&i| i * 127 % 31 == r).unwrap())
+                .collect();
+            let compact: Vec<_> = rows
+                .iter()
+                .flat_map(|&r| values[r * 32..(r + 1) * 32].iter().map(|&v| v as f64))
+                .collect();
+            ensure!(
+                (0..11295).all(
+                    |i| values[i * 32..(i + 1) * 32]
+                        .iter()
+                        .map(|&v| v as f64)
+                        .eq(compact[(i * 127 % 31) * 32..(i * 127 % 31 + 1) * 32]
+                            .iter()
+                            .copied())
+                ),
+                "pointwise production compression differs"
+            );
+            gate.score(&format!("step{step}.{kind}"), &compact, control)?;
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires published flow and recorded conditioning/noise; CUDA"]
+fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
+    let fixtures = env_path("FF_HI3D_FIXTURES")?;
+    let root = env_path("FF_HI3D_MODEL")?;
+    let source = fixtures.join("trajectory.safetensors");
+    let coordinates = lattice(&source, "coordinates")?;
+    let noise = f32_tensor(&source, "noise")?;
+    let context = f32_tensor(&fixtures.join("common.safetensors"), "context")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let mut flow =
+        Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
+    let positive = flow.conditioning(&context, &[], &coordinates)?;
+    let negative = flow.conditioning(&vec![0.0; context.len()], &[], &coordinates)?;
+    let result = flow.sample_heun(&noise, &positive, &negative)?;
+    let reference = tensor(&source, "final_latents")?;
+    let repeat = tensor(
+        &fixtures.join("trajectory-repeat.safetensors"),
+        "final_latents",
+    )?;
+    let candidate: Vec<f64> = if reference.values.len() == result.len() {
+        result.iter().map(|&v| v as f64).collect()
+    } else {
+        let selected = tensor(&source, "selected_rows")?;
+        selected
+            .values
+            .iter()
+            .flat_map(|&r| {
+                result[(r as usize) * 32..(r as usize + 1) * 32]
+                    .iter()
+                    .map(|&v| v as f64)
+            })
+            .collect()
+    };
+    let errors = metrics(&candidate, &reference.values)?;
+    let variation = metrics(&repeat.values, &reference.values)?;
+    println!(
+        "N5_M1_TRAJECTORY MEASUREMENT updates=25 coordinates={} channels=32 native_max_abs={:.15e} native_rmse={:.15e} source_repeat_max_abs={:.15e} source_repeat_rmse={:.15e} equivalence_gate=false timing=false",
+        coordinates.len(),
+        errors["max_abs"],
+        errors["rmse"],
+        variation["max_abs"],
+        variation["rmse"]
+    );
+    Ok(())
+}
 fn metrics(x: &[f64], y: &[f64]) -> Result<BTreeMap<&'static str, f64>> {
     ensure!(!x.is_empty() && x.len() == y.len(), "metric shape mismatch");
     let (mut max, mut square, mut dot, mut xx, mut yy) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -394,7 +1280,7 @@ impl FlowCase<'_> {
     }
 }
 fn flow_cells(
-    flow: &mut PixalFlow,
+    flow: &mut Flow,
     gate: &mut Gate,
     case: FlowCase<'_>,
     noise: &[f32],
@@ -461,7 +1347,7 @@ fn flow_cells(
     );
     Ok(())
 }
-fn fixed_ss(flow: &mut PixalFlow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
+fn fixed_ss(flow: &mut Flow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
     let base = root.join(format!("evidence/P1-M1-r1/ss-operators-{variant}"));
     let table = format!("floors-ss-fixed-{variant}-angular-r1.json");
     for fixture in ["cottage", "robot_crab"] {
@@ -480,7 +1366,7 @@ fn fixed_ss(flow: &mut PixalFlow, gate: &mut Gate, root: &Path, variant: &str) -
                     &f32_tensor(&input, "proj_cond")?,
                     &flow.coordinates,
                 )?;
-                flow.block(block, ptr(&modulation, &flow.device), &condition)?;
+                flow.block::<false>(block, ptr(&modulation, &flow.device), &condition)?;
                 gate.score_f32(
                     id(&table, &name, None),
                     &[1, 4096, 1536],
@@ -521,7 +1407,7 @@ fn ss_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Resul
             "ss_flow_img_dit_1_3B_64_bf16{}",
             if variant == "mv" { "_mv" } else { "" }
         );
-        let mut flow = PixalFlow::open(
+        let mut flow = Flow::open(
             &model.join("ckpts"),
             &stem,
             runtime,
@@ -614,7 +1500,7 @@ fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Re
                 if stage == 0 { 512 } else { 1024 },
                 if variant == "mv" { "_mv" } else { "" }
             );
-            let mut flow = PixalFlow::open(
+            let mut flow = Flow::open(
                 &model.join("ckpts"),
                 &stem,
                 runtime,
@@ -692,7 +1578,7 @@ fn row_major(values: &[f32], rows: usize) -> Vec<f32> {
         .collect()
 }
 fn rotate(
-    flow: &PixalFlow,
+    flow: &Flow,
     values: &CudaSlice<bf16>,
     phases: &CudaSlice<f32>,
     head_major: bool,
@@ -754,7 +1640,7 @@ impl Gate {
         Ok(())
     }
 }
-fn attention_ss(flow: &mut PixalFlow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
+fn attention_ss(flow: &mut Flow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
     let table = "floors-attention-index-published.json";
     let n = 4096;
     let base = root.join(format!("evidence/P1-M1-r1/ss-operators-{variant}"));
@@ -868,7 +1754,7 @@ fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) 
         let input=root.join(format!("evidence/P1-M1-r1/pipeline-single-{resolution}-{fixture}-{arm}/shape_slat-{stage}-inputs.safetensors"));
         let coordinates = coordinates(&tensor(&input, "noise.coords")?)?;
         let n = coordinates.len();
-        let mut flow = PixalFlow::open(
+        let mut flow = Flow::open(
             &model.join("ckpts"),
             "slat_flow_img2shape_dit_1_3B_1024_bf16",
             runtime,
@@ -1868,7 +2754,7 @@ fn linked_lr(root: &Path, model: &Path, runtime: &Path) -> Result<Vec<f32>> {
     let input = root
         .join("evidence/P1-M1-r1/pipeline-single-1024-cottage-r2/shape_slat-0-inputs.safetensors");
     let points = coordinates(&tensor(&input, "noise.coords")?)?;
-    let mut flow = PixalFlow::open(
+    let mut flow = Flow::open(
         &model.join("ckpts"),
         "slat_flow_img2shape_dit_1_3B_512_bf16",
         runtime,

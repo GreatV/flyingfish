@@ -73,6 +73,28 @@ impl SparseSites {
             .ok()
             .map(|i| self.sorted[i].1)
     }
+    pub fn downsample(&self, factor: i32) -> Result<(Self, Vec<u32>)> {
+        ensure!(factor > 0, "invalid sparse downsample factor");
+        let parents: Vec<_> = self
+            .coordinates
+            .iter()
+            .map(|p| [p[0], p[1] / factor, p[2] / factor, p[3] / factor])
+            .collect();
+        let mut coordinates = parents.clone();
+        coordinates.sort_unstable();
+        coordinates.dedup();
+        let inverse = parents
+            .iter()
+            .map(|p| {
+                coordinates
+                    .binary_search(p)
+                    .ok()
+                    .map(|i| i as u32)
+                    .context("sparse parent not found")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((Self::new(coordinates)?, inverse))
+    }
     /// Published [kx,ky,kz] order; the missing-neighbour sentinel is -1.
     pub fn neighbours_3x3(&self) -> Result<Vec<[i32; 27]>> {
         self.coordinates
@@ -193,6 +215,13 @@ mod tests {
         assert_eq!(maps[3][13], 3);
         assert_eq!(maps[3].iter().filter(|&&r| r >= 0).count(), 1);
         assert_ne!(maps[0][22], maps[0][14]);
+        let (parents, inverse) = sites.downsample(2)?;
+        assert_eq!(
+            parents.coordinates(),
+            &[[0, 1, 1, 2], [0, 1, 1, 3], [1, 1, 1, 2]]
+        );
+        assert_eq!(inverse, [0, 0, 1, 2]);
+        assert!(sites.downsample(0).is_err());
         let (corners, inverse) =
             SparseSites::deduplicate(vec![[1, 0, 2, 3], [0, 4, 5, 6], [0, 4, 5, 6], [0, 1, 2, 3]])?;
         assert_eq!(
