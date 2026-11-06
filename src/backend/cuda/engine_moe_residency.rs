@@ -711,7 +711,7 @@ impl Slots {
         directory: &Path,
         rows: u32,
     ) -> Result<(Self, u32)> {
-        let geometry = ExpertGeometry::from_model_and_manifest(model, manifest)?;
+        let geometry = ExpertGeometry::from_model(model)?;
         let catalogue = Arc::new(ExpertCatalogue::from_manifest(
             manifest,
             geometry,

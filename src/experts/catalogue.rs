@@ -372,30 +372,6 @@ impl ExpertGeometry {
             top_k: moe.experts_per_tok,
         })
     }
-
-    pub fn from_model_and_manifest(
-        model: &ModelSpec,
-        manifest: &crate::checkpoint::TensorManifest,
-    ) -> Result<Self> {
-        let mut geom = Self::from_model(model)?;
-        let prefix = match model.architecture {
-            crate::model_spec::Architecture::Glm5Next => "model.language_model.layers.",
-            _ => "model.layers.",
-        };
-        let end_layer = geom.first_layer + geom.layers;
-        let mtp_layer_key = format!("{prefix}{end_layer}.mlp.experts.");
-        if manifest
-            .entries
-            .keys()
-            .any(|k| k.starts_with(&mtp_layer_key))
-        {
-            geom.layers = geom
-                .layers
-                .checked_add(1)
-                .context("expert geometry layer count overflow")?;
-        }
-        Ok(geom)
-    }
 }
 
 /// Native ranges of every routable expert, in manifest order.

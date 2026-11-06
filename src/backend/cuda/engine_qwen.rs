@@ -3709,11 +3709,7 @@ impl Engine {
         let native_budget = if glm {
             let route_handle_bytes =
                 crate::backend::cuda::moe::route::blas_handle_bytes(&device.ctx, s)?;
-            let layers = crate::experts::catalogue::ExpertGeometry::from_model_and_manifest(
-                &model_spec,
-                &catalog.manifest,
-            )?
-            .layers;
+            let layers = crate::experts::catalogue::ExpertGeometry::from_model(&model_spec)?.layers;
             let native_request = crate::prefill::WorkspaceRequest {
                 capacity: capacity.min(crate::linear_plan::MAX_SKINNY_ROWS),
                 alignment: 1,
