@@ -674,7 +674,7 @@ impl DecoderKind {
                     let axis = index % 3;
                     let expected = ((child >> (2 - axis)) & 1) as i64;
                     ensure!(
-                        element == expected.to_le_bytes(),
+                        *element == expected.to_le_bytes(),
                         "decoder child offset {name} differs at {index}"
                     );
                 }

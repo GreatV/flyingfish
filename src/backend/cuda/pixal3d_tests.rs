@@ -397,6 +397,192 @@ fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
     Ok(())
 }
 
+fn normalized_features<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
+    d: &Device,
+    plan: &crate::backend::cuda::sparse::BatchGroupNorm,
+    input: Vec<T>,
+    affine: [&CudaSlice<f32>; 2],
+    shape: [usize; 2],
+    selected: &[usize],
+    convert: impl Fn(T) -> f64,
+) -> Result<Vec<f64>> {
+    let [n, c] = shape;
+    let x = d.stream.clone_htod(&input)?;
+    drop(input);
+    let output = d.stream.alloc_zeros::<T>(n * c)?;
+    plan.run(
+        matrix(ptr(&x, d), n, c)?,
+        [
+            view(affine[0], &d.stream, 0, [c as u32], [1])?,
+            view(affine[1], &d.stream, 0, [c as u32], [1])?,
+        ],
+        &mut TensorMut(matrix(ptr(&output, d), n, c)?),
+    )?;
+    let values = d.stream.clone_dtoh(&output)?;
+    ensure!(
+        selected.iter().all(|&row| row < n),
+        "norm selected row exceeds support"
+    );
+    Ok(selected
+        .iter()
+        .flat_map(|&row| values[row * c..(row + 1) * c].iter().copied().map(&convert))
+        .collect())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
+    use crate::backend::cuda::sparse::BatchGroupNorm;
+    let reference = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let model = env_path("FF_HI3D_MODEL")?.join("vae/model.safetensors");
+    let d = Device::new(0)?;
+    let mut gate = OperationGate::decoder("batch-group-norm", "norm-freeze-r1", "sm89-r1", 12)?;
+    for (name, cell) in gate.cells.clone() {
+        let definition = &cell["definition"];
+        let input = tensor(
+            &reference.join("CPU-r3/common-inputs.safetensors"),
+            &format!("{name}.input"),
+        )?;
+        let [n, c] = <[usize; 2]>::try_from(input.shape)
+            .map_err(|_| anyhow::anyhow!("invalid group norm shape"))?;
+        let module = definition["parameter_module"]
+            .as_str()
+            .context("norm parameter module missing")?;
+        let weight = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.weights"))?)?;
+        let bias = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.bias"))?)?;
+        let counts: Vec<u32> = definition["batch_counts"]
+            .as_array()
+            .context("batch counts missing")?
+            .iter()
+            .map(|n| u32::try_from(n.as_u64().context("batch count invalid")?).map_err(Into::into))
+            .collect::<Result<_>>()?;
+        let groups = definition["groups"]
+            .as_u64()
+            .context("group count missing")? as usize;
+        let eps = definition["eps"].as_f64().context("norm epsilon missing")? as f32;
+        let selected: Vec<_> = (0..n).collect();
+        for control in [false, true] {
+            let mut offsets = vec![0u32];
+            for &count in &counts {
+                let first = *offsets.last().context("empty norm offsets")?;
+                if control {
+                    for row in (0..count).step_by(47) {
+                        offsets.push(first + (row + 47).min(count));
+                    }
+                } else {
+                    offsets.push(first + count);
+                }
+            }
+            let plan = BatchGroupNorm::new(&d, &offsets, c, groups, eps, 16 << 20)?;
+            let values = if name.ends_with(".float16") {
+                normalized_features(
+                    &d,
+                    &plan,
+                    input.values.iter().map(|&x| f16::from_f64(x)).collect(),
+                    [&weight, &bias],
+                    [n, c],
+                    &selected,
+                    f16::to_f64,
+                )?
+            } else {
+                normalized_features(
+                    &d,
+                    &plan,
+                    input.values.iter().map(|&x| x as f32).collect(),
+                    [&weight, &bias],
+                    [n, c],
+                    &selected,
+                    f64::from,
+                )?
+            };
+            gate.score(&name, &values, control)?;
+        }
+    }
+    let norm_result = gate.finish();
+    let mut gate =
+        OperationGate::decoder("rounded-sigmoid-swish", "swish-freeze-r2", "sm89-r1", 4)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    for (name, cell) in gate.cells.clone() {
+        let input = tensor(
+            &reference.join("CPU-r3/common-inputs.safetensors"),
+            &format!("{name}.input"),
+        )?;
+        let n = input.shape[0];
+        let c = input.shape[1];
+        let half = cell["dtype"] == "torch.float16";
+        let rows_arg = n as u32;
+        let width_arg = c as u32;
+        let count_arg = (n * c) as u64;
+        let control_mode = if half { 1i32 } else { 0i32 };
+        for control in [false, true] {
+            let function = module.load_function(if control {
+                if half {
+                    "activation_f16"
+                } else {
+                    "activation_f32"
+                }
+            } else if half {
+                "swish_rounded_f16"
+            } else {
+                "swish_rounded_f32"
+            })?;
+            let output = if half {
+                let input = d.stream.clone_htod(
+                    &input
+                        .values
+                        .iter()
+                        .map(|&x| f16::from_f64(x))
+                        .collect::<Vec<_>>(),
+                )?;
+                let output = d.stream.alloc_zeros::<f16>(n * c)?;
+                let mut launch = d.stream.launch_builder(&function);
+                launch.arg(&input).arg(&output);
+                if control {
+                    launch.arg(&rows_arg).arg(&width_arg).arg(&control_mode);
+                } else {
+                    launch.arg(&count_arg);
+                }
+                unsafe {
+                    launch.launch(flat(n * c))?;
+                }
+                d.stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f16::to_f64)
+                    .collect::<Vec<_>>()
+            } else {
+                let input = d
+                    .stream
+                    .clone_htod(&input.values.iter().map(|&x| x as f32).collect::<Vec<_>>())?;
+                let output = d.stream.alloc_zeros::<f32>(n * c)?;
+                let mut launch = d.stream.launch_builder(&function);
+                launch.arg(&input).arg(&output);
+                if control {
+                    launch.arg(&rows_arg).arg(&width_arg).arg(&control_mode);
+                } else {
+                    launch.arg(&count_arg);
+                }
+                unsafe {
+                    launch.launch(flat(n * c))?;
+                }
+                d.stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>()
+            };
+            gate.score(&name, &output, control)?;
+        }
+    }
+    let activation_result = gate.finish();
+    norm_result?;
+    activation_result
+}
+
 #[test]
 #[ignore = "requires published flow and frozen fixtures; CUDA"]
 fn hi3d_flow_components_gpu() -> Result<()> {

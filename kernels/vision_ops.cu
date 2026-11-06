@@ -1304,6 +1304,135 @@ extern "C" __global__ void sparse_conv_store_f16(
     sparse_conv_store(product, bias, output, first, rows, channels);
 }
 
+template<class T>
+__device__ __forceinline__ void batch_group_moments_partial(
+    const T* input, const uint32_t* offsets, float* partial,
+    uint32_t batches, uint32_t channels, uint32_t groups, uint32_t parts) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != parts || gridDim.y != groups || gridDim.z != batches ||
+        !input || !offsets || !partial || !groups || channels % groups) { __trap(); return; }
+    const uint32_t first = offsets[blockIdx.z], end = offsets[blockIdx.z + 1];
+    if (first >= end) { __trap(); return; }
+    const uint32_t width = channels / groups;
+    const uint64_t count = uint64_t(end - first) * width;
+    float sum = 0.0f, squares = 0.0f;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(parts) * 256) {
+        const uint64_t at = uint64_t(first + i / width) * channels + blockIdx.y * width + i % width;
+        const float x = float(input[at]);
+        sum = __fadd_rn(sum, x);
+        squares = __fadd_rn(squares, __fmul_rn(x, x));
+    }
+    for (int delta = 16; delta; delta /= 2) {
+        sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
+        squares = __fadd_rn(squares, __shfl_down_sync(FF_WARP_MASK, squares, delta));
+    }
+    __shared__ float sums[8], moments[8];
+    if (threadIdx.x % 32 == 0) { sums[threadIdx.x / 32] = sum; moments[threadIdx.x / 32] = squares; }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sum = threadIdx.x < 8 ? sums[threadIdx.x] : 0.0f;
+        squares = threadIdx.x < 8 ? moments[threadIdx.x] : 0.0f;
+        for (int delta = 16; delta; delta /= 2) {
+            sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
+            squares = __fadd_rn(squares, __shfl_down_sync(FF_WARP_MASK, squares, delta));
+        }
+        if (threadIdx.x == 0) {
+            const uint64_t at = (uint64_t(blockIdx.z) * groups + blockIdx.y) * parts + blockIdx.x;
+            partial[2 * at] = sum;
+            partial[2 * at + 1] = squares;
+        }
+    }
+}
+
+extern "C" __global__ void batch_group_moments_partial_f32(
+    const float* input, const uint32_t* offsets, float* partial,
+    uint32_t batches, uint32_t channels, uint32_t groups, uint32_t parts) {
+    batch_group_moments_partial(input, offsets, partial, batches, channels, groups, parts);
+}
+
+extern "C" __global__ void batch_group_moments_partial_f16(
+    const __half* input, const uint32_t* offsets, float* partial,
+    uint32_t batches, uint32_t channels, uint32_t groups, uint32_t parts) {
+    batch_group_moments_partial(input, offsets, partial, batches, channels, groups, parts);
+}
+
+extern "C" __global__ void batch_group_moments_finish_f32(
+    const float* partial, const uint32_t* offsets, float* moments,
+    uint32_t batches, uint32_t channels, uint32_t groups, uint32_t parts, float eps) {
+    if (!vision_flat_launch() || !partial || !offsets || !moments || !groups ||
+        !parts || channels % groups || !(eps > 0.0f)) { __trap(); return; }
+    for (uint64_t bg = uint64_t(blockIdx.x) * 256 + threadIdx.x; bg < uint64_t(batches) * groups;
+         bg += uint64_t(gridDim.x) * 256) {
+        float sum = 0.0f, squares = 0.0f;
+        for (uint32_t p = 0; p < parts; ++p) {
+            sum = __fadd_rn(sum, partial[2 * (bg * parts + p)]);
+            squares = __fadd_rn(squares, partial[2 * (bg * parts + p) + 1]);
+        }
+        const uint32_t batch = bg / groups;
+        const uint64_t count = uint64_t(offsets[batch + 1] - offsets[batch]) * (channels / groups);
+        const float denominator = __fadd_rn(float(count), eps);
+        const float mean = __fdiv_rn(sum, denominator);
+        const float variance = __fsub_rn(__fdiv_rn(squares, denominator), __fmul_rn(mean, mean));
+        moments[2 * bg] = mean;
+        moments[2 * bg + 1] = rsqrtf(__fadd_rn(variance, eps));
+    }
+}
+
+template<class T>
+__device__ __forceinline__ void batch_group_norm(
+    const T* input, const uint32_t* offsets, const float* moments,
+    const float* weight, const float* bias, T* output,
+    uint32_t batches, uint32_t channels, uint32_t groups) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != batches || gridDim.z != 1 || !input || !offsets || !moments ||
+        !weight || !bias || !output || !groups || channels % groups) { __trap(); return; }
+    const uint32_t batch = blockIdx.y, first = offsets[batch], end = offsets[batch + 1];
+    const uint64_t count = uint64_t(end - first) * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t channel = i % channels, group = channel / (channels / groups);
+        const uint64_t bg = uint64_t(batch) * groups + group;
+        const uint64_t at = uint64_t(first) * channels + i;
+        const float centered = __fsub_rn(float(input[at]), moments[2 * bg]);
+        const float normalized = __fmul_rn(centered, moments[2 * bg + 1]);
+        output[at] = T(__fadd_rn(__fmul_rn(normalized, weight[channel]), bias[channel]));
+    }
+}
+
+extern "C" __global__ void batch_group_norm_f32(
+    const float* input, const uint32_t* offsets, const float* moments,
+    const float* weight, const float* bias, float* output,
+    uint32_t batches, uint32_t channels, uint32_t groups) {
+    batch_group_norm(input, offsets, moments, weight, bias, output, batches, channels, groups);
+}
+
+extern "C" __global__ void batch_group_norm_f16(
+    const __half* input, const uint32_t* offsets, const float* moments,
+    const float* weight, const float* bias, __half* output,
+    uint32_t batches, uint32_t channels, uint32_t groups) {
+    batch_group_norm(input, offsets, moments, weight, bias, output, batches, channels, groups);
+}
+
+template<class T>
+__device__ __forceinline__ void swish_rounded(const T* input, T* output, uint64_t count) {
+    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const float x = float(input[i]);
+        const T sigmoid = T(__fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-x))));
+        output[i] = T(__fmul_rn(x, float(sigmoid)));
+    }
+}
+
+extern "C" __global__ void swish_rounded_f16(const __half* input, __half* output, uint64_t count) {
+    swish_rounded(input, output, count);
+}
+
+extern "C" __global__ void swish_rounded_f32(const float* input, float* output, uint64_t count) {
+    swish_rounded(input, output, count);
+}
+
 extern "C" __global__ void channel_to_spatial_f16(
     const __half* x, const uint32_t* source, __half* y,
     uint32_t parents, uint32_t rows, uint32_t input_channels, uint32_t channels, int add) {

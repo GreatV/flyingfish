@@ -14,6 +14,232 @@ use anyhow::{Context, Result, ensure};
 use half::f16;
 use std::rc::Rc;
 
+pub struct BatchGroupNorm {
+    device: Device,
+    offsets: CudaSlice<u32>,
+    partial: CudaSlice<f32>,
+    moments: CudaSlice<f32>,
+    reduce: [CudaFunction; 2],
+    finish: CudaFunction,
+    apply: [CudaFunction; 2],
+    rows: u32,
+    channels: u32,
+    groups: u32,
+    batches: u32,
+    parts: u32,
+    apply_blocks: u32,
+    eps: f32,
+}
+
+impl BatchGroupNorm {
+    pub fn new(
+        device: &Device,
+        offsets: &[u32],
+        channels: usize,
+        groups: usize,
+        eps: f32,
+        workspace_budget: usize,
+    ) -> Result<Self> {
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        ensure!(
+            offsets.len() >= 2 && offsets[0] == 0 && offsets.windows(2).all(|v| v[0] < v[1]),
+            "invalid group norm batch offsets"
+        );
+        ensure!(
+            groups > 0
+                && channels > 0
+                && channels.is_multiple_of(groups)
+                && channels <= u32::MAX as usize
+                && eps.is_finite()
+                && eps > 0.0,
+            "invalid batch group norm geometry"
+        );
+        let batches = offsets.len() - 1;
+        let rows = *offsets.last().context("empty batch offsets")?;
+        let maximum = offsets
+            .windows(2)
+            .map(|v| (v[1] - v[0]) as usize)
+            .max()
+            .context("empty batch offsets")?;
+        let module = cubin::module(&device.ctx, "vision_ops")?;
+        let reduce = [
+            module.load_function("batch_group_moments_partial_f32")?,
+            module.load_function("batch_group_moments_partial_f16")?,
+        ];
+        let apply = [
+            module.load_function("batch_group_norm_f32")?,
+            module.load_function("batch_group_norm_f16")?,
+        ];
+        let resident = reduce
+            .iter()
+            .map(|function| {
+                function
+                    .occupancy_max_active_blocks_per_multiprocessor(256, 0, None)
+                    .map(|v| v as usize)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .min()
+            .context("group norm occupancy missing")?;
+        let sms = device
+            .ctx
+            .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+        let bg = batches
+            .checked_mul(groups)
+            .context("group norm group count overflow")?;
+        ensure!(
+            resident > 0
+                && sms > 0
+                && batches
+                    <= device
+                        .ctx
+                        .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)?
+                        as usize
+                && groups
+                    <= device
+                        .ctx
+                        .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?
+                        as usize,
+            "group norm grid or occupancy exceeds device limits"
+        );
+        let group_elements = maximum
+            .checked_mul(channels / groups)
+            .context("group norm element count overflow")?;
+        let parts = sms
+            .checked_mul(resident)
+            .context("group norm resident grid overflow")?
+            .div_ceil(bg)
+            .min(group_elements.div_ceil(256))
+            .max(1);
+        let max_grid = device
+            .ctx
+            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as usize;
+        ensure!(
+            parts <= max_grid,
+            "group norm partition grid exceeds device limit"
+        );
+        let apply_blocks = maximum
+            .checked_mul(channels)
+            .context("group norm apply extent overflow")?
+            .div_ceil(256)
+            .min(sms * resident)
+            .min(max_grid)
+            .max(1);
+        let partial_elements = bg
+            .checked_mul(parts)
+            .and_then(|n| n.checked_mul(2))
+            .context("group norm partial extent overflow")?;
+        let moment_elements = bg.checked_mul(2).context("group norm moments overflow")?;
+        let bytes = partial_elements
+            .checked_add(moment_elements)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .and_then(|n| n.checked_add(size_of_val(offsets)))
+            .context("group norm workspace overflow")?;
+        let (free, _) = device.ctx.mem_get_info()?;
+        ensure!(
+            bytes <= workspace_budget.min(free),
+            "batch group norm workspace needs {bytes} bytes"
+        );
+        eprintln!(
+            "BATCH_GROUP_NORM_PLAN batches={batches} rows={rows} channels={channels} groups={groups} parts={parts} apply_blocks={apply_blocks} workspace_bytes={bytes}"
+        );
+        Ok(Self {
+            device: device.clone(),
+            offsets: device.stream.clone_htod(offsets)?,
+            partial: device.stream.alloc_zeros(partial_elements)?,
+            moments: device.stream.alloc_zeros(moment_elements)?,
+            reduce,
+            finish: module.load_function("batch_group_moments_finish_f32")?,
+            apply,
+            rows,
+            channels: u32::try_from(channels)?,
+            groups: u32::try_from(groups)?,
+            batches: u32::try_from(batches)?,
+            parts: u32::try_from(parts)?,
+            apply_blocks: u32::try_from(apply_blocks)?,
+            eps,
+        })
+    }
+    pub fn run<T: DeviceRepr + Copy + 'static>(
+        &self,
+        input: Tensor<T, 2>,
+        affine: [Tensor<f32, 1>; 2],
+        output: &mut TensorMut<T, 2>,
+    ) -> Result<()> {
+        use std::any::TypeId;
+        let half = TypeId::of::<T>() == TypeId::of::<f16>();
+        ensure!(
+            half || TypeId::of::<T>() == TypeId::of::<f32>(),
+            "batch group norm requires F16 or F32 features"
+        );
+        input.validate()?;
+        output.0.validate()?;
+        ensure!(
+            input.shape == [self.rows, self.channels]
+                && input.stride == [self.channels as u64, 1]
+                && output.0.shape == input.shape
+                && output.0.stride == input.stride,
+            "batch group norm feature extent mismatch"
+        );
+        if input.ptr != output.0.ptr {
+            no_overlap(&input, &output.0, "group norm input", "group norm output")?;
+        }
+        for tensor in &affine {
+            tensor.validate()?;
+            ensure!(
+                tensor.shape == [self.channels] && tensor.stride == [1],
+                "batch group norm affine extent mismatch"
+            );
+            no_overlap(tensor, &output.0, "group norm affine", "group norm output")?;
+        }
+        let stream = &self.device.stream;
+        unsafe {
+            stream
+                .launch_builder(&self.reduce[usize::from(half)])
+                .arg(&input.ptr)
+                .arg(&self.offsets)
+                .arg(&self.partial)
+                .arg(&self.batches)
+                .arg(&self.channels)
+                .arg(&self.groups)
+                .arg(&self.parts)
+                .launch(crate::backend::gpu::LaunchConfig {
+                    grid_dim: (self.parts, self.groups, self.batches),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            stream
+                .launch_builder(&self.finish)
+                .arg(&self.partial)
+                .arg(&self.offsets)
+                .arg(&self.moments)
+                .arg(&self.batches)
+                .arg(&self.channels)
+                .arg(&self.groups)
+                .arg(&self.parts)
+                .arg(&self.eps)
+                .launch(flat(self.batches as usize * self.groups as usize))?;
+            stream
+                .launch_builder(&self.apply[usize::from(half)])
+                .arg(&input.ptr)
+                .arg(&self.offsets)
+                .arg(&self.moments)
+                .arg(&affine[0].ptr)
+                .arg(&affine[1].ptr)
+                .arg(&output.0.ptr)
+                .arg(&self.batches)
+                .arg(&self.channels)
+                .arg(&self.groups)
+                .launch(crate::backend::gpu::LaunchConfig {
+                    grid_dim: (self.apply_blocks, self.batches, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn exclusive_scan(d: &Device, counts: &CudaSlice<u64>) -> Result<CudaSlice<u64>> {
     let count = u32::try_from(counts.len())?;
     ensure!(count > 0, "empty sparse prefix scan");
@@ -537,7 +763,7 @@ impl SparseConv<f32> {
                     .launch_builder(store)
                     .arg(&product.ptr)
                     .arg(&bias.ptr)
-                    .arg(output)
+                    .arg(&*output)
                     .arg(&(first as u64))
                     .arg(&(rows as u32))
                     .arg(&(out as u32))
