@@ -4,6 +4,7 @@ compile_error!("features `cuda` and `rocm` are mutually exclusive");
 pub mod audio;
 pub mod backend;
 pub mod bench;
+pub mod canary;
 pub mod checkpoint;
 pub mod config;
 pub mod cpu;

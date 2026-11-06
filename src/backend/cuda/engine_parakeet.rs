@@ -5,7 +5,7 @@ use crate::{
         gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg},
     },
     checkpoint::MappedCheckpoint,
-    parakeet::ParakeetSpec,
+    parakeet::{FastConformer, ParakeetSpec},
 };
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
@@ -43,6 +43,7 @@ struct Convolution {
     norm: Norm,
     pointwise1: Linear,
     depthwise: CudaSlice<f32>,
+    depthwise_bias: Option<CudaSlice<f32>>,
     batch_weight: CudaSlice<f32>,
     batch_bias: CudaSlice<f32>,
     running_mean: CudaSlice<f32>,
@@ -83,7 +84,7 @@ struct Ops {
 }
 
 pub struct ParakeetEncoder {
-    spec: ParakeetSpec,
+    conformer: FastConformer,
     stream: Arc<CudaStream>,
     subsample: Subsample,
     subsample_linear: Linear,
@@ -191,7 +192,21 @@ fn relative_positions(rows: usize, hidden: usize) -> Result<Vec<f32>> {
 impl ParakeetEncoder {
     pub fn load(directory: &Path, device: &Device) -> Result<Self> {
         let spec = ParakeetSpec::read(directory)?;
+        Self::load_conformer(directory, device, &spec.conformer())
+    }
+
+    pub fn load_canary(directory: &Path, device: &Device) -> Result<Self> {
+        let spec = crate::canary::CanarySpec::read(directory)?;
+        Self::load_conformer(directory, device, &spec.conformer())
+    }
+
+    pub fn load_conformer(
+        directory: &Path,
+        device: &Device,
+        conformer: &FastConformer,
+    ) -> Result<Self> {
         let checkpoint = MappedCheckpoint::open(directory)?;
+        let root = conformer.prefix;
         let stream = Arc::clone(&device.stream);
         let blas = CudaBlas::new(Arc::clone(&stream))?;
         unsafe {
@@ -222,13 +237,13 @@ impl ParakeetEncoder {
                 weight: tensor(
                     &checkpoint,
                     &stream,
-                    &format!("encoder.subsampling.layers.{index}.weight"),
+                    &format!("{root}.subsampling.layers.{index}.weight"),
                     &[256, 1, 3, 3],
                 )?,
                 bias: tensor(
                     &checkpoint,
                     &stream,
-                    &format!("encoder.subsampling.layers.{index}.bias"),
+                    &format!("{root}.subsampling.layers.{index}.bias"),
                     &[256],
                 )?,
             });
@@ -238,7 +253,7 @@ impl ParakeetEncoder {
             subsample_pointwise.push(linear_shaped(
                 &checkpoint,
                 &stream,
-                &format!("encoder.subsampling.layers.{index}"),
+                &format!("{root}.subsampling.layers.{index}"),
                 256,
                 256,
                 true,
@@ -248,7 +263,7 @@ impl ParakeetEncoder {
         let subsample_linear = linear(
             &checkpoint,
             &stream,
-            "encoder.subsampling.linear",
+            &format!("{root}.subsampling.linear"),
             1024,
             4096,
             true,
@@ -262,8 +277,10 @@ impl ParakeetEncoder {
                 .map_err(|_| anyhow::anyhow!("subsample pointwise count"))?,
         };
         let mut blocks = Vec::new();
-        for index in 0..spec.layers {
-            let prefix = format!("encoder.layers.{index}");
+        for index in 0..conformer.layers {
+            let prefix = format!("{root}.layers.{index}");
+            let attention_bias = conformer.attention_bias;
+            let convolution_bias = conformer.convolution_bias;
             let feed_forward = |branch: &str| -> Result<FeedForward> {
                 Ok(FeedForward {
                     norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_{branch}"))?,
@@ -273,7 +290,7 @@ impl ParakeetEncoder {
                         &format!("{prefix}.{branch}.linear1"),
                         4096,
                         1024,
-                        false,
+                        attention_bias,
                     )?,
                     down: linear(
                         &checkpoint,
@@ -281,29 +298,29 @@ impl ParakeetEncoder {
                         &format!("{prefix}.{branch}.linear2"),
                         1024,
                         4096,
-                        false,
+                        attention_bias,
                     )?,
                 })
             };
-            let attention = |name: &str| -> Result<Linear> {
+            let attention = |name: &str, bias: bool| -> Result<Linear> {
                 linear(
                     &checkpoint,
                     &stream,
                     &format!("{prefix}.self_attn.{name}"),
                     1024,
                     1024,
-                    false,
+                    bias,
                 )
             };
             blocks.push(Block {
                 ff1: feed_forward("feed_forward1")?,
                 ff2: feed_forward("feed_forward2")?,
                 attention: Attention {
-                    q: attention("q_proj")?,
-                    k: attention("k_proj")?,
-                    v: attention("v_proj")?,
-                    o: attention("o_proj")?,
-                    relative: attention("relative_k_proj")?,
+                    q: attention("q_proj", attention_bias)?,
+                    k: attention("k_proj", attention_bias)?,
+                    v: attention("v_proj", attention_bias)?,
+                    o: attention("o_proj", attention_bias)?,
+                    relative: attention("relative_k_proj", false)?,
                     bias_u: tensor(
                         &checkpoint,
                         &stream,
@@ -325,15 +342,25 @@ impl ParakeetEncoder {
                         &format!("{prefix}.conv.pointwise_conv1"),
                         2048,
                         1024,
-                        false,
+                        convolution_bias,
                         &[2048, 1024, 1],
                     )?,
                     depthwise: tensor(
                         &checkpoint,
                         &stream,
                         &format!("{prefix}.conv.depthwise_conv.weight"),
-                        &[1024, 1, 9],
+                        &[1024, 1, conformer.conv_kernel as usize],
                     )?,
+                    depthwise_bias: if convolution_bias {
+                        Some(tensor(
+                            &checkpoint,
+                            &stream,
+                            &format!("{prefix}.conv.depthwise_conv.bias"),
+                            &[1024],
+                        )?)
+                    } else {
+                        None
+                    },
                     batch_weight: tensor(
                         &checkpoint,
                         &stream,
@@ -364,7 +391,7 @@ impl ParakeetEncoder {
                         &format!("{prefix}.conv.pointwise_conv2"),
                         1024,
                         1024,
-                        false,
+                        convolution_bias,
                         &[1024, 1024, 1],
                     )?,
                 },
@@ -374,7 +401,7 @@ impl ParakeetEncoder {
         }
         stream.synchronize()?;
         Ok(Self {
-            spec,
+            conformer: *conformer,
             stream,
             subsample,
             subsample_linear,
@@ -463,7 +490,7 @@ impl ParakeetEncoder {
 
     fn normalize(&self, input: &CudaSlice<f32>, rows: u32, norm: &Norm) -> Result<CudaSlice<f32>> {
         let output = self.stream.alloc_zeros(input.len())?;
-        let width = self.spec.hidden;
+        let width = self.conformer.hidden;
         unsafe {
             self.stream
                 .launch_builder(&self.ops.layer_norm)
@@ -590,7 +617,7 @@ impl ParakeetEncoder {
     }
 
     fn positions(&self, rows: usize) -> Result<Vec<f32>> {
-        relative_positions(rows, self.spec.hidden as usize)
+        relative_positions(rows, self.conformer.hidden as usize)
     }
 
     fn layer_device(
@@ -607,9 +634,9 @@ impl ParakeetEncoder {
         let rows = u32::try_from(mask.len())?;
         ensure!(
             rows > 0
-                && input.len() == rows as usize * self.spec.hidden as usize
+                && input.len() == rows as usize * self.conformer.hidden as usize
                 && mask.iter().all(|value| *value <= 1)
-                && positions.len() == (2 * rows - 1) as usize * self.spec.hidden as usize,
+                && positions.len() == (2 * rows - 1) as usize * self.conformer.hidden as usize,
             "encoder layer input, mask or position shape mismatch"
         );
         let mask = self.stream.clone_htod(mask)?;
@@ -641,10 +668,10 @@ impl ParakeetEncoder {
                 .arg(&mask)
                 .arg(&core)
                 .arg(&rows)
-                .arg(&self.spec.heads)
+                .arg(&self.conformer.heads)
                 .arg(&(1.0f32 / 128f32.sqrt()))
                 .launch(LaunchConfig {
-                    grid_dim: (rows, self.spec.heads, 1),
+                    grid_dim: (rows, self.conformer.heads, 1),
                     block_dim: (128, 1, 1),
                     shared_mem_bytes: (8 + rows) * 4,
                 })?;
@@ -653,7 +680,7 @@ impl ParakeetEncoder {
         self.residual(&mut hidden, &delta, 1.0)?;
         let normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
         let expanded = self.linear(&normalized, rows, &block.convolution.pointwise1)?;
-        let activated = self.activate(&expanded, rows, self.spec.hidden, 2)?;
+        let activated = self.activate(&expanded, rows, self.conformer.hidden, 2)?;
         let convolved: CudaSlice<f32> = self.stream.alloc_zeros(hidden.len())?;
         unsafe {
             self.stream
@@ -663,9 +690,21 @@ impl ParakeetEncoder {
                 .arg(&mask)
                 .arg(&convolved)
                 .arg(&rows)
-                .arg(&self.spec.hidden)
-                .arg(&self.spec.conv_kernel)
+                .arg(&self.conformer.hidden)
+                .arg(&self.conformer.conv_kernel)
                 .launch(flat(convolved.len()))?;
+        }
+        if let Some(bias) = &block.convolution.depthwise_bias {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.ops.bias)
+                    .arg(&convolved)
+                    .arg(bias)
+                    .arg(&convolved)
+                    .arg(&rows)
+                    .arg(&self.conformer.hidden)
+                    .launch(flat(convolved.len()))?;
+            }
         }
         let normalized: CudaSlice<f32> = self.stream.alloc_zeros(hidden.len())?;
         unsafe {
@@ -678,11 +717,11 @@ impl ParakeetEncoder {
                 .arg(&block.convolution.running_var)
                 .arg(&normalized)
                 .arg(&rows)
-                .arg(&self.spec.hidden)
+                .arg(&self.conformer.hidden)
                 .arg(&1e-5f32)
                 .launch(flat(normalized.len()))?;
         }
-        let activated = self.activate(&normalized, rows, self.spec.hidden, 1)?;
+        let activated = self.activate(&normalized, rows, self.conformer.hidden, 1)?;
         let delta = self.linear(&activated, rows, &block.convolution.pointwise2)?;
         self.residual(&mut hidden, &delta, 1.0)?;
         feed_forward(&mut hidden, &block.ff2, 0.5)?;
