@@ -3965,7 +3965,13 @@ fn dense_decoder_cells(
     model: &Path,
     runtime: &Path,
 ) -> Result<()> {
-    let decoder = PixalDecoder::open(model, DecoderKind::Structure, runtime, 4_000_000_000)?;
+    let decoder = PixalDecoder::open(
+        &Device::new(0)?,
+        model,
+        DecoderKind::Structure,
+        runtime,
+        4_000_000_000,
+    )?;
     let mut first = None;
     for variant in ["single", "mv"] {
         for fixture in ["cottage", "robot_crab"] {
@@ -4031,6 +4037,11 @@ fn dense_decoder_cells(
         }
     }
     let (input, expected) = first.context("dense fixture missing")?;
+    let device_input = decoder.device.stream.clone_htod(&input)?;
+    ensure!(
+        decoder.structure_device(device_input)? == expected,
+        "device CHW decoder handoff differs from host entry"
+    );
     ensure!(
         decoder.structure(&input)? == expected,
         "dense A-B-A isolation defect"
@@ -4428,14 +4439,26 @@ fn pixal3d_decoders_match_frozen_definition_gpu() -> Result<()> {
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     let mut g = DecoderGate::new()?;
     dense_decoder_cells(&mut g, &root, &model, &runtime)?;
-    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 10_000_000_000)?;
+    let decoder = PixalDecoder::open(
+        &Device::new(0)?,
+        &model,
+        DecoderKind::Shape,
+        &runtime,
+        10_000_000_000,
+    )?;
     pointwise(&mut g, &decoder)?;
     sparse_ops(&mut g, &decoder, &root)?;
     decoder_transitions(&mut g, &root)?;
     prefix(&mut g, &decoder, &root, &model, None)?;
     drop(decoder);
     let latent = linked_lr(&root, &model, &runtime)?;
-    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 10_000_000_000)?;
+    let decoder = PixalDecoder::open(
+        &Device::new(0)?,
+        &model,
+        DecoderKind::Shape,
+        &runtime,
+        10_000_000_000,
+    )?;
     prefix(&mut g, &decoder, &root, &model, Some(&latent))?;
     g.finish()
 }
@@ -5562,7 +5585,13 @@ fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
     };
     let mean = channels("mean")?;
     let std = channels("std")?;
-    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 12_000_000_000)?;
+    let decoder = PixalDecoder::open(
+        &Device::new(0)?,
+        &model,
+        DecoderKind::Shape,
+        &runtime,
+        12_000_000_000,
+    )?;
     let d = &decoder.device;
     let mut latent = d
         .stream
@@ -5657,7 +5686,13 @@ fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
     decoder_transitions(&mut g, &root)?;
     surface_normalization(&mut g, &model, &root)?;
     surface_mesh(&mut g, &root)?;
-    let decoder = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
+    let decoder = PixalDecoder::open(
+        &Device::new(0)?,
+        &model,
+        DecoderKind::Shape,
+        &runtime,
+        22_000_000_000,
+    )?;
     for (case, capture, table, core, requested) in SURFACE_CASES {
         surface_forced(&mut g, &decoder, case)?;
         surface_fixed(&mut g, &decoder, &root, (case, capture, table))?;
@@ -6223,8 +6258,20 @@ fn pixal3d_material_matches_frozen_definition_gpu() -> Result<()> {
     let root = env_path("FF_PIXAL_REFERENCE")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     material_pointwise(&mut g, &model, &root)?;
-    let shape = PixalDecoder::open(&model, DecoderKind::Shape, &runtime, 22_000_000_000)?;
-    let texture = PixalDecoder::open(&model, DecoderKind::Texture, &runtime, 22_000_000_000)?;
+    let shape = PixalDecoder::open(
+        &Device::new(0)?,
+        &model,
+        DecoderKind::Shape,
+        &runtime,
+        22_000_000_000,
+    )?;
+    let texture = PixalDecoder::open(
+        &Device::new(0)?,
+        &model,
+        DecoderKind::Texture,
+        &runtime,
+        22_000_000_000,
+    )?;
     for (case, capture, table, _, _) in SURFACE_CASES {
         material_fixed(&mut g, &texture, &root, (case, capture, table))?;
         material_generated(&mut g, &shape, &texture, &root, (case, capture))?;
@@ -6575,13 +6622,88 @@ fn pixal3d_indexed_projection_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires CUDA; conditioning stream, context and capacity controls"]
 fn pixal3d_device_handoff_gpu() -> Result<()> {
+    use std::io::Write;
+    if let Ok(case) = std::env::var("FF_PIXAL_HANDOFF_CHILD") {
+        ensure!(
+            matches!(case.as_str(), "copy_nan" | "cast_nan" | "cast_overflow"),
+            "invalid handoff control"
+        );
+        let device = Device::new(0)?;
+        let mut values = vec![1.0f32; 257];
+        values[128] = if case == "cast_overflow" {
+            f32::MAX
+        } else {
+            f32::NAN
+        };
+        let input = device.stream.clone_htod(&values)?;
+        if case == "copy_nan" {
+            let output = device.stream.alloc_zeros::<f32>(257)?;
+            finite_copy(&device, &input, &output)?;
+            std::mem::forget(output);
+        } else {
+            let output = device.stream.alloc_zeros::<bf16>(257)?;
+            let kernel = cubin::module(&device.ctx, "vision_ops")?
+                .load_function("vision_downcast_f32_to_bf16_checked")?;
+            unsafe {
+                device
+                    .stream
+                    .launch_builder(&kernel)
+                    .arg(&input)
+                    .arg(&output)
+                    .arg(&257u32)
+                    .launch(flat(257))?;
+            }
+            std::mem::forget(output);
+        }
+        let error = device
+            .stream
+            .synchronize()
+            .expect_err("invalid handoff value did not trap");
+        ensure!(
+            matches!(
+                error.0,
+                cudarc::driver::sys::CUresult::CUDA_ERROR_ILLEGAL_INSTRUCTION
+                    | cudarc::driver::sys::CUresult::CUDA_ERROR_LAUNCH_FAILED
+            ),
+            "unexpected handoff failure: {error:?}"
+        );
+        println!("P1_M4C_HANDOFF_TRAP PASS case={case}");
+        std::io::stdout().flush()?;
+        std::process::exit(0);
+    }
+    for case in ["copy_nan", "cast_nan", "cast_overflow"] {
+        let result = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "backend::cuda::pixal3d::tests::pixal3d_device_handoff_gpu",
+                "--exact",
+                "--include-ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("FF_PIXAL_HANDOFF_CHILD", case)
+            .output()?;
+        let output = String::from_utf8_lossy(&result.stdout);
+        ensure!(
+            result.status.success()
+                && output.contains(&format!("P1_M4C_HANDOFF_TRAP PASS case={case}")),
+            "handoff control {case} failed: {output} {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        print!("{output}");
+    }
     let device = Device::new(0)?;
     let producer = device.ctx.new_stream()?;
     let mut source = producer.alloc_zeros::<f32>(257)?;
     producer.synchronize()?;
-    let values: Vec<f32> = (0..257)
-        .map(|i| ((i * 37 % 97) + 1) as f32 / 64.0)
+    let mut values: Vec<f32> = (0..257)
+        .map(|i| ((i * 37 % 97) + 1) as f32 / 97.0)
         .collect();
+    values[..6].copy_from_slice(
+        &[
+            0x3f807fff, 0x3f808000, 0x3f808001, 0x3f817fff, 0x3f818000, 0x3f818001,
+        ]
+        .map(f32::from_bits),
+    );
     let stale = device.stream.alloc_zeros::<f32>(257)?;
     let copy = cubin::module(&device.ctx, "q38_common")?.load_function("copy_finite_f32")?;
     let source_ptr = source.device_ptr(&producer).0;
@@ -6633,6 +6755,12 @@ fn pixal3d_device_handoff_gpu() -> Result<()> {
                 .map(bf16::from_f32)
                 .collect::<Vec<_>>(),
         "device conditioning BF16 rounding differs"
+    );
+    ensure!(
+        values
+            .iter()
+            .any(|&value| bf16::from_f32(value) != bf16::from_bits((value.to_bits() >> 16) as u16)),
+        "truncation control did not discriminate"
     );
     let ordinal = cudarc::driver::result::device::get(0)?;
     let mut context = std::ptr::null_mut();

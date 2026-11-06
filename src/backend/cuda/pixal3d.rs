@@ -3228,6 +3228,7 @@ fn validate_guide_count(kind: DecoderKind, count: usize) -> Result<()> {
 }
 impl PixalDecoder {
     pub fn open(
+        device: &Device,
         dir: &Path,
         kind: DecoderKind,
         runtime: &Path,
@@ -3239,7 +3240,7 @@ impl PixalDecoder {
             "ckpts"
         };
         let checkpoint = DecoderCheckpoint::open(&dir.join(component), kind)?;
-        let device = Device::new(0)?;
+        let device = device.clone();
         let (free, _) = device.ctx.mem_get_info()?;
         let ops = Ops::new(&device.ctx)?;
         let blas = Blas::new(
@@ -4271,6 +4272,31 @@ impl PixalDecoder {
         coordinates: Vec<[i32; 4]>,
         latent: &[f32],
         guides: &[SubdivisionGuide<'_>],
+        observe: F,
+    ) -> Result<(SparseSites, CudaSlice<f16>)>
+    where
+        F: FnMut([usize; 3], (&SparseSites, &[f32]), (&SparseSites, &CudaSlice<f16>)) -> Result<()>,
+    {
+        ensure!(
+            latent.len() == coordinates.len() * 32 && latent.iter().all(|x| x.is_finite()),
+            "invalid denormalized sparse latent"
+        );
+        self.device.workspace_budget(
+            self.initial_free,
+            self.device_budget,
+            latent
+                .len()
+                .checked_mul(size_of::<f32>())
+                .context("latent bytes overflow")?,
+        )?;
+        let input = self.device.stream.clone_htod(latent)?;
+        self.sparse_decode_rows(coordinates, input, guides, observe)
+    }
+    fn sparse_decode_rows<F>(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        input: CudaSlice<f32>,
+        guides: &[SubdivisionGuide<'_>],
         mut observe: F,
     ) -> Result<(SparseSites, CudaSlice<f16>)>
     where
@@ -4284,15 +4310,15 @@ impl PixalDecoder {
         let mut sites = SparseSites::new(coordinates)?;
         let n = sites.coordinates().len();
         ensure!(
-            latent.len() == n * 32 && latent.iter().all(|x| x.is_finite()),
-            "invalid denormalized sparse latent"
+            input.len() == n * 32,
+            "invalid denormalized sparse latent extent"
         );
         let d = &self.device;
+        wait_input(d, &input)?;
         let live = n
-            .checked_mul(32 * size_of::<f32>() + 1024 * 6)
+            .checked_mul(1024 * 6)
             .context("sparse input live bytes overflow")?;
         d.workspace_budget(self.initial_free, self.device_budget, live)?;
-        let input = d.stream.clone_htod(latent)?;
         let mut float = d.stream.alloc_zeros::<f32>(n * 1024)?;
         self.linear32("from_latent", &input, &mut float, [n, 32, 1024])?;
         drop(input);
@@ -4373,6 +4399,49 @@ impl PixalDecoder {
         guides: &[SparseDecoderOutput],
     ) -> Result<(SparseDecoderOutput, Vec<SparseDecoderOutput>)> {
         ensure!(
+            latent.len() == coordinates.len() * 32 && latent.iter().all(|x| x.is_finite()),
+            "invalid denormalized sparse latent"
+        );
+        let input = self.device.stream.clone_htod(latent)?;
+        self.decode_output(coordinates, input, guides)
+    }
+    pub fn decode_device(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        guides: &[SparseDecoderOutput],
+    ) -> Result<(SparseDecoderOutput, Vec<SparseDecoderOutput>)> {
+        finite_copy(&self.device, &latent, &latent)?;
+        self.decode_output(coordinates, latent, guides)
+    }
+    fn decode_output(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        guides: &[SparseDecoderOutput],
+    ) -> Result<(SparseDecoderOutput, Vec<SparseDecoderOutput>)> {
+        let (sites, output, generated) = self.decode_fields(coordinates, latent, guides)?;
+        let features = self.device.stream.clone_dtoh(&output)?;
+        ensure!(
+            features.iter().all(|x| x.is_finite()),
+            "nonfinite decoder output"
+        );
+        Ok((
+            SparseDecoderOutput {
+                coordinates: sites.coordinates().to_vec(),
+                features,
+                channels: output.len() / sites.coordinates().len(),
+            },
+            generated,
+        ))
+    }
+    fn decode_fields(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        guides: &[SparseDecoderOutput],
+    ) -> Result<(SparseSites, CudaSlice<f32>, Vec<SparseDecoderOutput>)> {
+        ensure!(
             guides.iter().all(|g| g.channels == 8),
             "subdivision guide width mismatch"
         );
@@ -4389,7 +4458,7 @@ impl PixalDecoder {
             .collect();
         let mut generated = Vec::new();
         let (sites, features) =
-            self.sparse_decode(coordinates, latent, &borrowed, |_, (parents, logits), _| {
+            self.sparse_decode_rows(coordinates, latent, &borrowed, |_, (parents, logits), _| {
                 if matches!(self.kind, DecoderKind::Shape) {
                     generated.push(SparseDecoderOutput {
                         coordinates: parents.coordinates().to_vec(),
@@ -4403,19 +4472,28 @@ impl PixalDecoder {
         if matches!(self.kind, DecoderKind::Texture) {
             channel_transform(&self.device, &mut output, [&[0.5; 6], &[0.5; 6]], false)?;
         }
-        let features = self.device.stream.clone_dtoh(&output)?;
+        Ok((sites, output, generated))
+    }
+    pub fn shape_mesh_device(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        resolution: u32,
+    ) -> Result<(crate::sparse::SparseMesh, Vec<SparseDecoderOutput>)> {
         ensure!(
-            features.iter().all(|x| x.is_finite()),
-            "nonfinite shape output"
+            matches!(self.kind, DecoderKind::Shape),
+            "shape decoder required for mesh"
         );
-        Ok((
-            SparseDecoderOutput {
-                coordinates: sites.coordinates().to_vec(),
-                features,
-                channels: output.len() / sites.coordinates().len(),
-            },
-            generated,
-        ))
+        finite_copy(&self.device, &latent, &latent)?;
+        let (sites, fields, guides) = self.decode_fields(coordinates, latent, &[])?;
+        let mesh = super::sparse::dual_grid_mesh(
+            &self.device,
+            sites,
+            fields,
+            resolution,
+            [self.initial_free, self.device_budget],
+        )?;
+        Ok((mesh, guides))
     }
     pub fn shape_mesh(
         &self,
@@ -4456,11 +4534,32 @@ impl PixalDecoder {
         drop(features);
         Self::cascade_grid(&sites, requested_resolution, token_limit)
     }
+    pub fn cascade_coordinates_device(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        requested_resolution: u32,
+        token_limit: usize,
+    ) -> Result<(u32, SparseSites)> {
+        ensure!(
+            matches!(self.kind, DecoderKind::Shape),
+            "shape decoder required for cascade"
+        );
+        finite_copy(&self.device, &latent, &latent)?;
+        let (sites, features) =
+            self.sparse_decode_rows(coordinates, latent, &[], |_, _, _| Ok(()))?;
+        drop(features);
+        Self::cascade_grid(&sites, requested_resolution, token_limit)
+    }
     fn cascade_grid(
         sites: &SparseSites,
         requested_resolution: u32,
         token_limit: usize,
     ) -> Result<(u32, SparseSites)> {
+        ensure!(
+            matches!(requested_resolution, 1024 | 1536) && token_limit > 0,
+            "invalid cascade resolution or token limit"
+        );
         let mut resolution = requested_resolution;
         loop {
             let quantized = sites.round_unique(512, resolution / 16)?;
@@ -4628,6 +4727,38 @@ impl PixalDecoder {
             .collect();
         let d = &self.device;
         let input = d.stream.clone_htod(&input)?;
+        self.structure_rows(input)
+    }
+    pub fn structure_device(&self, latent_chw: CudaSlice<f32>) -> Result<Vec<f32>> {
+        ensure!(
+            matches!(self.kind, DecoderKind::Structure) && latent_chw.len() == 8 * 16usize.pow(3),
+            "structure latent must be [8,16,16,16]"
+        );
+        let d = &self.device;
+        finite_copy(d, &latent_chw, &latent_chw)?;
+        d.workspace_budget(
+            self.initial_free,
+            self.device_budget,
+            64usize.pow(3) * 32 * 8,
+        )?;
+        let rows = 16usize.pow(3);
+        let input = d.stream.alloc_zeros::<f32>(latent_chw.len())?;
+        let transpose = cubin::module(&d.ctx, "q38_common")?.load_function("transpose_f32")?;
+        unsafe {
+            d.stream
+                .launch_builder(&transpose)
+                .arg(&latent_chw)
+                .arg(&input)
+                .arg(&8i64)
+                .arg(&(rows as i64))
+                .launch(flat(input.len()))?;
+        }
+        drop(latent_chw);
+        self.structure_rows(input)
+    }
+    fn structure_rows(&self, input: CudaSlice<f32>) -> Result<Vec<f32>> {
+        let d = &self.device;
+        let rows = 16usize.pow(3);
         let float = d.stream.alloc_zeros::<f32>(rows * 512)?;
         self.dense_conv(
             "input_layer",
