@@ -289,6 +289,12 @@ impl OperationGate {
                 .as_f64()
                 .context("bound missing")?;
             let value = errors[metric];
+            if !control && let Some(bound) = cell["original_tau"][metric].as_f64() {
+                println!(
+                    "N5_M2B_ORIGINAL_FIELD_METRIC cell={name} metric={metric} value={value:.15e} bound={bound:.15e} result={}",
+                    if value > bound { "DEFECT" } else { "PASS" }
+                );
+            }
             let defect = if control {
                 if self.decoder_anchor.is_some() {
                     value <= 10.0 * bound
@@ -996,7 +1002,7 @@ where
             ci.max(co),
             co.max(if name.ends_with(".field") { 128 } else { co }),
         ],
-        name.ends_with(".field"),
+        name.ends_with(".field") || name.ends_with(".dec0"),
     )?;
     let max_width = ci.max(co);
     let wrong_budget = n * 108 + 127 * (27 * max_width + max_width) * 4;
@@ -1085,6 +1091,40 @@ fn hi3d_decoder_stages_gpu() -> Result<()> {
         "stages-sm89-r1",
         16,
     )?;
+    let supplement: Value = serde_json::from_slice(&std::fs::read(
+        root.join("stages-field-supplement-20261106-r1/FROZEN.json"),
+    )?)?;
+    ensure!(
+        supplement["reference_protocol"] == "PASS"
+            && supplement["formula"] == "tau=max(2*max(all declared pair errors),epsilon)",
+        "invalid field supplement protocol"
+    );
+    let cells = supplement["cells"]
+        .as_object()
+        .context("field supplement cells missing")?;
+    ensure!(cells.len() == 4, "field supplement coverage mismatch");
+    for (name, cell) in cells {
+        ensure!(
+            [
+                "stage.cottage.field",
+                "stage.cottage.field.activated",
+                "stage.robot.field",
+                "stage.robot.field.activated"
+            ]
+            .contains(&name.as_str())
+                && cell["reference_protocol"] == "PASS",
+            "supplement outside field scope"
+        );
+        let original = gate
+            .cells
+            .get_mut(name)
+            .context("supplement cell outside original freeze")?;
+        original["original_tau"] = original["tau"].clone();
+        original["tau"] = cell["tau"].clone();
+        println!(
+            "N5_M2B_FIELD_SUPPLEMENT cell={name} original_floor_retained=true dated=2026-11-06"
+        );
+    }
     for case in ["cottage", "robot"] {
         let directory = root.join(format!("{case}-decode-sm86-r1"));
         let bank = directory.join("decoder.mid.input.safetensors");
