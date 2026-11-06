@@ -6634,7 +6634,19 @@ fn pixal3d_device_handoff_gpu() -> Result<()> {
                 .collect::<Vec<_>>(),
         "device conditioning BF16 rounding differs"
     );
-    let foreign = cudarc::driver::CudaContext::new_non_primary(0, 0)?;
+    let ordinal = cudarc::driver::result::device::get(0)?;
+    let mut context = std::ptr::null_mut();
+    let foreign = unsafe {
+        cudarc::driver::sys::cuCtxCreate_v4(&mut context, std::ptr::null_mut(), 0, ordinal)
+            .result()?;
+        match cudarc::driver::CudaContext::from_raw_context(0, ordinal, context) {
+            Ok(context) => context,
+            Err(error) => {
+                cudarc::driver::sys::cuCtxDestroy_v2(context).result()?;
+                return Err(error.into());
+            }
+        }
+    };
     let other_stream = foreign.new_stream()?;
     let other = other_stream.alloc_zeros::<f32>(257)?;
     ensure!(
