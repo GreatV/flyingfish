@@ -1014,6 +1014,9 @@ impl StateCheckpoint {
         let mut kv_dims = Vec::new();
         let mut gdn = Vec::new();
         for layer in &spec.layers {
+            if spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                continue;
+            }
             if layer.mixer != Mixer::FullAttention {
                 continue;
             }

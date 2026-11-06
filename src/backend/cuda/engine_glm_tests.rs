@@ -1416,8 +1416,8 @@ fn glm_dsa_publication_gpu() -> Result<()> {
     let s = &device.stream;
     let mut state = StateStore::new(&model, 37, s)?;
     ensure!(
-        crate::backend::cuda::state::StateCheckpoint::new(&state, &model, 1, s).is_err(),
-        "DEFECT incomplete DSA checkpoint admitted"
+        crate::backend::cuda::state::StateCheckpoint::new(&state, &model, 1, s).is_ok(),
+        "DEFECT DSA checkpoint failed"
     );
     let advance = cubin::module(&device.ctx, "q38_common")?.load_function("q38_advance")?;
     state.set_sequence(s, 7, 1, 16)?;
