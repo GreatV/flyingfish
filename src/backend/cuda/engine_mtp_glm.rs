@@ -221,19 +221,19 @@ pub(crate) struct GlmMtpRuntime {
     eh_proj_w: CudaSlice<bf16>,
     input_norm_w: CudaSlice<bf16>,
 
-    q_a_codes: CudaSlice<u8>,
-    q_a_scales: CudaSlice<f32>,
+    _q_a_codes: CudaSlice<u8>,
+    _q_a_scales: CudaSlice<f32>,
     q_a_norm_w: CudaSlice<bf16>,
-    q_b_codes: CudaSlice<u8>,
-    q_b_scales: CudaSlice<f32>,
+    _q_b_codes: CudaSlice<u8>,
+    _q_b_scales: CudaSlice<f32>,
 
-    kv_a_codes: CudaSlice<u8>,
-    kv_a_scales: CudaSlice<f32>,
+    _kv_a_codes: CudaSlice<u8>,
+    _kv_a_scales: CudaSlice<f32>,
     kv_a_norm_w: CudaSlice<bf16>,
     kv_b_w: CudaSlice<bf16>,
 
-    o_codes: CudaSlice<u8>,
-    o_scales: CudaSlice<f32>,
+    _o_codes: CudaSlice<u8>,
+    _o_scales: CudaSlice<f32>,
     post_norm_w: CudaSlice<bf16>,
 
     kv_a_proj: NativeProjection,
@@ -674,17 +674,17 @@ impl GlmMtpRuntime {
             hnorm_w,
             eh_proj_w,
             input_norm_w,
-            q_a_codes,
-            q_a_scales,
+            _q_a_codes: q_a_codes,
+            _q_a_scales: q_a_scales,
             q_a_norm_w,
-            q_b_codes,
-            q_b_scales,
-            kv_a_codes,
-            kv_a_scales,
+            _q_b_codes: q_b_codes,
+            _q_b_scales: q_b_scales,
+            _kv_a_codes: kv_a_codes,
+            _kv_a_scales: kv_a_scales,
             kv_a_norm_w,
             kv_b_w,
-            o_codes,
-            o_scales,
+            _o_codes: o_codes,
+            _o_scales: o_scales,
             post_norm_w,
             kv_a_proj,
             q_a_proj,
@@ -749,14 +749,30 @@ impl GlmMtpRuntime {
 
     fn stage_routed_experts(&mut self, ids: &[i32]) -> Result<()> {
         let stream = self.stream.clone();
+        let target_experts: Vec<usize> = ids.iter().take(8).map(|&id| id as usize).collect();
+
+        let mut needed_experts = Vec::new();
+        for &exp_id in &target_experts {
+            if !self.staged_slots.contains(&Some(exp_id)) {
+                needed_experts.push(exp_id);
+            }
+        }
+
         let mut updated = false;
-        for (k, &expert_id_i32) in ids.iter().take(8).enumerate() {
-            let expert_id = expert_id_i32 as usize;
-            if self.staged_slots[k] != Some(expert_id) {
-                if let Some(old_id) = self.staged_slots[k] {
-                    self.valid_host[old_id] = 0;
+        if !needed_experts.is_empty() {
+            let mut victim_slots = Vec::new();
+            for (k, slot) in self.staged_slots.iter().enumerate() {
+                if let Some(old_id) = *slot {
+                    if !target_experts.contains(&old_id) {
+                        victim_slots.push(k);
+                    }
+                } else {
+                    victim_slots.push(k);
                 }
-                let exp = &self.experts[expert_id];
+            }
+
+            for (&exp_id, &k) in needed_experts.iter().zip(&victim_slots) {
+                let exp = &self.experts[exp_id];
                 stream.memcpy_htod(&exp.gate_codes, &mut self.slot_gate_codes[k])?;
                 stream.memcpy_htod(&exp.gate_scales, &mut self.slot_gate_scales[k])?;
                 stream.memcpy_htod(&exp.up_codes, &mut self.slot_up_codes[k])?;
@@ -771,20 +787,31 @@ impl GlmMtpRuntime {
                 let (dc_ptr, _) = self.slot_down_codes[k].device_ptr(&stream);
                 let (ds_ptr, _) = self.slot_down_scales[k].device_ptr(&stream);
 
-                self.slots_host[expert_id * 6] = gc_ptr;
-                self.slots_host[expert_id * 6 + 1] = gs_ptr;
-                self.slots_host[expert_id * 6 + 2] = uc_ptr;
-                self.slots_host[expert_id * 6 + 3] = us_ptr;
-                self.slots_host[expert_id * 6 + 4] = dc_ptr;
-                self.slots_host[expert_id * 6 + 5] = ds_ptr;
-                self.valid_host[expert_id] = 1;
+                self.slots_host[exp_id * 6] = gc_ptr;
+                self.slots_host[exp_id * 6 + 1] = gs_ptr;
+                self.slots_host[exp_id * 6 + 2] = uc_ptr;
+                self.slots_host[exp_id * 6 + 3] = us_ptr;
+                self.slots_host[exp_id * 6 + 4] = dc_ptr;
+                self.slots_host[exp_id * 6 + 5] = ds_ptr;
 
-                self.staged_slots[k] = Some(expert_id);
+                self.staged_slots[k] = Some(exp_id);
                 updated = true;
             }
         }
+
+        let mut valid_changed = false;
+        for (i, val) in self.valid_host.iter_mut().enumerate() {
+            let expected = if target_experts.contains(&i) { 1 } else { 0 };
+            if *val != expected {
+                *val = expected;
+                valid_changed = true;
+            }
+        }
+
         if updated {
             stream.memcpy_htod(&self.slots_host, &mut self.slots_buf)?;
+        }
+        if updated || valid_changed {
             stream.memcpy_htod(&self.valid_host, &mut self.valid_buf)?;
         }
         Ok(())
@@ -851,10 +878,9 @@ impl GlmMtpRuntime {
         let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
         let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
         let (kv_a_ptr, _) = self.kv_a_buf.device_ptr(&stream);
-        let mut kv_a_tensor =
-            unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };
+        let kv_a_tensor = unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };
         self.kv_a_proj
-            .run(&self.fp8, &stream, x_norm_tensor, &mut kv_a_tensor)?;
+            .run(&self.fp8, &stream, x_norm_tensor, &kv_a_tensor)?;
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -892,10 +918,10 @@ impl GlmMtpRuntime {
         let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
         let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
         let (q_a_ptr, _) = self.q_a_buf.device_ptr(&stream);
-        let mut q_a_tensor =
+        let q_a_tensor =
             unsafe { TensorMut(Tensor::new(q_a_ptr, [1, 1536], [1536, 1], 1536 * 2)?) };
         self.q_a_proj
-            .run(&self.fp8, &stream, x_norm_tensor, &mut q_a_tensor)?;
+            .run(&self.fp8, &stream, x_norm_tensor, &q_a_tensor)?;
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -908,10 +934,10 @@ impl GlmMtpRuntime {
         let (q_a_norm_ptr, _) = self.q_a_norm_buf.device_ptr(&stream);
         let q_a_norm_tensor = unsafe { Tensor::new(q_a_norm_ptr, [1, 1536], [1536, 1], 1536 * 2)? };
         let (q_b_ptr, _) = self.q_b_buf.device_ptr(&stream);
-        let mut q_b_tensor =
+        let q_b_tensor =
             unsafe { TensorMut(Tensor::new(q_b_ptr, [1, 16384], [16384, 1], 16384 * 2)?) };
         self.q_b_proj
-            .run(&self.fp8, &stream, q_a_norm_tensor, &mut q_b_tensor)?;
+            .run(&self.fp8, &stream, q_a_norm_tensor, &q_b_tensor)?;
 
         let mut indices = vec![-1i32; 2051];
         for (i, item) in indices.iter_mut().take(pos.min(2050) + 1).enumerate() {
@@ -953,10 +979,9 @@ impl GlmMtpRuntime {
         let attn_out_tensor =
             unsafe { Tensor::new(attn_out_ptr, [1, 16384], [16384, 1], 16384 * 2)? };
         let (o_ptr, _) = self.o_buf.device_ptr(&stream);
-        let mut o_tensor =
-            unsafe { TensorMut(Tensor::new(o_ptr, [1, 4096], [4096, 1], 4096 * 2)?) };
+        let o_tensor = unsafe { TensorMut(Tensor::new(o_ptr, [1, 4096], [4096, 1], 4096 * 2)?) };
         self.o_proj
-            .run(&self.fp8, &stream, attn_out_tensor, &mut o_tensor)?;
+            .run(&self.fp8, &stream, attn_out_tensor, &o_tensor)?;
         run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
 
         run_rms_norm(
@@ -1090,10 +1115,10 @@ impl GlmMtpRuntime {
             let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
             let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
             let (kv_a_ptr, _) = self.kv_a_buf.device_ptr(&stream);
-            let mut kv_a_tensor =
+            let kv_a_tensor =
                 unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };
             self.kv_a_proj
-                .run(&self.fp8, &stream, x_norm_tensor, &mut kv_a_tensor)?;
+                .run(&self.fp8, &stream, x_norm_tensor, &kv_a_tensor)?;
             run_rms_norm(
                 &stream,
                 &self.rms_norm,

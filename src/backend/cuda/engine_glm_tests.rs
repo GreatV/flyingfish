@@ -1791,12 +1791,10 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .pointer("/router_tap/synthetic/cross_arm_selection_scores_max_abs")
         .map(|v| v.as_f64().unwrap() as f32)
         .unwrap_or(0.005793);
-    if synth_min_margin > synth_spread {
-        if synth_cand_ids != synth_expected_ids {
-            defects.push(format!(
-                "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {synth_expected_ids:?}"
-            ));
-        }
+    if synth_min_margin > synth_spread && synth_cand_ids != synth_expected_ids {
+        defects.push(format!(
+            "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {synth_expected_ids:?}"
+        ));
     }
     let mut synth_exp_map = std::collections::BTreeMap::new();
     for (&id, &w) in synth_expected_ids.iter().zip(&synth_expected_weights) {
