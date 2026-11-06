@@ -85,6 +85,72 @@ fn f32_tensor(path: &Path, key: &str) -> Result<Vec<f32>> {
         .map(|x| x as f32)
         .collect())
 }
+fn half_tensor(path: &Path, key: &str) -> Result<Vec<f16>> {
+    let checkpoint = MappedCheckpoint::open_component(
+        path.parent().context("feature bank parent missing")?,
+        path.file_stem()
+            .and_then(|v| v.to_str())
+            .context("feature bank stem missing")?,
+    )?;
+    let t = checkpoint.tensor(key)?;
+    ensure!(
+        t.dtype() == Dtype::F16,
+        "feature bank must retain F16 storage"
+    );
+    Ok(t.data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| f16::from_le_bytes(*v))
+        .collect())
+}
+fn indices(value: &Value) -> Result<Vec<usize>> {
+    value
+        .as_array()
+        .context("selected rows missing")?
+        .iter()
+        .map(|v| usize::try_from(v.as_u64().context("invalid selected row")?).map_err(Into::into))
+        .collect()
+}
+fn selected_values<T: DeviceRepr + Copy>(
+    d: &Device,
+    values: &CudaSlice<T>,
+    rows: &[usize],
+    width: usize,
+    convert: impl Fn(T) -> f64,
+) -> Result<Vec<f64>> {
+    ensure!(
+        width > 0
+            && values.len().is_multiple_of(width)
+            && rows.iter().all(|&r| r < values.len() / width),
+        "selected rows outside feature bank"
+    );
+    let mut output = Vec::with_capacity(rows.len() * width);
+    for &row in rows {
+        output.extend(
+            d.stream
+                .clone_dtoh(&values.slice(row * width..(row + 1) * width))?
+                .into_iter()
+                .map(&convert),
+        );
+    }
+    Ok(output)
+}
+fn bank_sites(path: &Path) -> Result<SparseSites> {
+    let grid = tensor(path, "grid_coord")?;
+    let batch = tensor(path, "batch")?;
+    ensure!(
+        grid.shape == [batch.values.len(), 3],
+        "feature bank grid/batch extent mismatch"
+    );
+    SparseSites::new(
+        grid.values
+            .chunks_exact(3)
+            .zip(batch.values)
+            .map(|(p, b)| [b as i32, p[0] as i32, p[1] as i32, p[2] as i32])
+            .collect(),
+    )
+}
 fn id(table: &str, name: &str, key: Option<&str>) -> CellId {
     (table.into(), name.into(), key.map(str::to_owned))
 }
@@ -101,6 +167,7 @@ struct OperationGate {
     seen: BTreeSet<String>,
     defects: usize,
     decoder_anchor: Option<PathBuf>,
+    decoder_key: Option<String>,
 }
 impl OperationGate {
     fn new(kind: &str, count: usize) -> Result<Self> {
@@ -141,6 +208,7 @@ impl OperationGate {
             seen: BTreeSet::new(),
             defects: 0,
             decoder_anchor: None,
+            decoder_key: None,
         })
     }
     fn decoder(kind: &str, freeze_dir: &str, anchor_dir: &str, count: usize) -> Result<Self> {
@@ -167,6 +235,7 @@ impl OperationGate {
             seen: BTreeSet::new(),
             defects: 0,
             decoder_anchor,
+            decoder_key: None,
         })
     }
     fn score(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
@@ -200,7 +269,7 @@ impl OperationGate {
                     values,
                 }
             } else {
-                tensor(path, name)?
+                tensor(path, self.decoder_key.as_deref().unwrap_or(name))?
             }
         } else {
             tensor(
@@ -395,7 +464,7 @@ fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
                 let values = if name.ends_with(".float16") {
                     let input: Vec<_> = input.iter().map(|&x| f16::from_f32(x)).collect();
                     let input = d.stream.clone_htod(&input)?;
-                    let mut output = d.stream.alloc_zeros::<f16>(n * co)?;
+                    let output = d.stream.alloc_zeros::<f16>(n * co)?;
                     conv.run_promoted(
                         &blas,
                         matrix::<f16>(ptr(&input, &d), n, ci)?,
@@ -406,7 +475,7 @@ fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
                     selected_half(&d, &output, &rows, co)?
                 } else {
                     let input = d.stream.clone_htod(&input)?;
-                    let mut output = d.stream.alloc_zeros::<f32>(n * co)?;
+                    let output = d.stream.alloc_zeros::<f32>(n * co)?;
                     conv.run_promoted(
                         &blas,
                         matrix::<f32>(ptr(&input, &d), n, ci)?,
@@ -439,20 +508,23 @@ fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
     Ok(())
 }
 
-fn normalized_features<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
+fn normalized_features<
+    I: DeviceRepr + Copy + 'static,
+    O: DeviceRepr + Copy + ValidAsZeroBits + 'static,
+>(
     d: &Device,
     plan: &crate::backend::cuda::sparse::BatchGroupNorm,
-    input: Vec<T>,
+    input: Vec<I>,
     affine: [&CudaSlice<f32>; 2],
     shape: [usize; 2],
     selected: &[usize],
-    convert: impl Fn(T) -> f64,
+    convert: impl Fn(O) -> f64,
 ) -> Result<Vec<f64>> {
     let [n, c] = shape;
     let x = d.stream.clone_htod(&input)?;
     drop(input);
-    let output = d.stream.alloc_zeros::<T>(n * c)?;
-    plan.run::<T, T>(
+    let output = d.stream.alloc_zeros::<O>(n * c)?;
+    plan.run::<I, O>(
         matrix(ptr(&x, d), n, c)?,
         [
             view(affine[0], &d.stream, 0, [c as u32], [1])?,
@@ -460,15 +532,719 @@ fn normalized_features<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
         ],
         &mut TensorMut(matrix(ptr(&output, d), n, c)?),
     )?;
-    let values = d.stream.clone_dtoh(&output)?;
     ensure!(
         selected.iter().all(|&row| row < n),
         "norm selected row exceeds support"
     );
-    Ok(selected
+    selected_values(d, &output, selected, c, convert)
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_production_norm_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let model = env_path("FF_HI3D_MODEL")?.join("vae/model.safetensors");
+    let d = Device::new(0)?;
+    let mut gate = OperationGate::decoder(
+        "actual-support-group-norm",
+        "production-norm-freeze-r1",
+        "production-norm-sm89-r1",
+        4,
+    )?;
+    for (name, cell) in gate.cells.clone() {
+        let definition = &cell["definition"];
+        let n = definition["full_input_shape"][0]
+            .as_u64()
+            .context("norm extent missing")? as usize;
+        let c = definition["full_input_shape"][1]
+            .as_u64()
+            .context("norm width missing")? as usize;
+        let rows = indices(&definition["selected_output_rows"])?;
+        let bank_name = Path::new(
+            definition["common_input_bank"]
+                .as_str()
+                .context("norm bank missing")?,
+        )
+        .file_name()
+        .context("norm bank filename missing")?;
+        let case = name.split('.').nth(1).context("norm case missing")?;
+        let bank = root.join(format!("{case}-decode-sm86-r1")).join(bank_name);
+        let module = definition["module"]
+            .as_str()
+            .context("norm module missing")?;
+        let weight = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.weights"))?)?;
+        let bias = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.bias"))?)?;
+        for control in [false, true] {
+            let offsets = if control {
+                (0..n)
+                    .step_by(47)
+                    .chain(std::iter::once(n))
+                    .map(|v| v as u32)
+                    .collect()
+            } else {
+                vec![0, n as u32]
+            };
+            let plan = BatchGroupNorm::new(&d, &offsets, c, 32, 1e-6, 64 << 20)?;
+            let x = half_tensor(&bank, "feat")?;
+            ensure!(x.len() == n * c, "actual support feature count mismatch");
+            let values = if name.ends_with(".field") {
+                normalized_features::<f16, f32>(
+                    &d,
+                    &plan,
+                    x,
+                    [&weight, &bias],
+                    [n, c],
+                    &rows,
+                    f64::from,
+                )?
+            } else {
+                normalized_features::<f16, f16>(
+                    &d,
+                    &plan,
+                    x,
+                    [&weight, &bias],
+                    [n, c],
+                    &rows,
+                    f16::to_f64,
+                )?
+            };
+            gate.score(&name, &values, control)?;
+        }
+    }
+    gate.finish()
+}
+
+fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
+    decoder: &PixalDecoder,
+    gate: &mut OperationGate,
+    case: &str,
+    stage: usize,
+    input: Vec<T>,
+) -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let name = format!("decoder.dec.dec{stage}.up.upsample");
+    let bank = root.join(format!("{case}-decode-sm86-r1/{name}.input.safetensors"));
+    let sites = bank_sites(&bank)?;
+    let n = sites.coordinates().len();
+    ensure!(input.len().is_multiple_of(n), "head input extent mismatch");
+    let c = input.len() / n;
+    let d = &decoder.device;
+    let input = d.stream.clone_htod(&input)?;
+    let x = matrix::<T>(ptr(&input, d), n, c)?;
+    let workspace = PointWorkspace::new(decoder, &sites, [c, c], false)?;
+    let maps = root.join(format!("{case}-heads-sm89-r1/maps.safetensors"));
+    let rows: Vec<_> = tensor(&maps, &format!("{name}.selected_parents"))?
+        .values
+        .into_iter()
+        .map(|v| v as usize)
+        .collect();
+    gate.decoder_anchor = Some(root.join(format!("{case}-heads-sm89-r1/anchor.safetensors")));
+    let w = decoder
+        .weights
+        .float
+        .get(&format!("{name}.cls_head.fc.0.weights"))
+        .context("head norm weight missing")?;
+    let b = decoder
+        .weights
+        .float
+        .get(&format!("{name}.cls_head.fc.0.bias"))
+        .context("head norm bias missing")?;
+    let normalized = d.stream.alloc_zeros::<f32>(n * c)?;
+    decoder.point_norm(
+        &workspace.norms,
+        &format!("{name}.cls_head.fc.0"),
+        x,
+        &mut TensorMut(matrix::<f32>(ptr(&normalized, d), n, c)?),
+    )?;
+    gate.decoder_key = Some(format!("{name}.normalized"));
+    gate.score(
+        &format!("{case}.{name}.normalized"),
+        &selected_values(d, &normalized, &rows, c, f64::from)?,
+        false,
+    )?;
+    drop(normalized);
+    let offsets: Vec<_> = (0..n)
+        .step_by(47)
+        .chain(std::iter::once(n))
+        .map(|v| v as u32)
+        .collect();
+    let plan = BatchGroupNorm::new(d, &offsets, c, 32, 1e-6, 64 << 20)?;
+    let wrong = d.stream.alloc_zeros::<f32>(n * c)?;
+    plan.run::<T, f32>(
+        x,
+        [
+            view(w, &d.stream, 0, [c as u32], [1])?,
+            view(b, &d.stream, 0, [c as u32], [1])?,
+        ],
+        &mut TensorMut(matrix(ptr(&wrong, d), n, c)?),
+    )?;
+    gate.score(
+        &format!("{case}.{name}.normalized"),
+        &selected_values(d, &wrong, &rows, c, f64::from)?,
+        true,
+    )?;
+    drop(wrong);
+    let logits = decoder.point_head(&workspace, x, stage)?;
+    let values = d.stream.clone_dtoh(&logits)?;
+    drop(logits);
+    let scores: Vec<_> = values.iter().map(|&v| f64::from(v)).collect();
+    gate.decoder_key = Some(format!("{name}.logits"));
+    gate.score(&format!("{case}.{name}.logits"), &scores, false)?;
+    let permutation = [0, 4, 2, 6, 1, 5, 3, 7];
+    let wrong: Vec<_> = values
+        .chunks_exact(8)
+        .flat_map(|row| permutation.map(|i| f64::from(row[i])))
+        .collect();
+    gate.score(&format!("{case}.{name}.logits"), &wrong, true)?;
+    let selectors = root.join("heads-freeze-r1/selectors.safetensors");
+    let key = format!("{case}.stage{stage}");
+    let stable = tensor(&selectors, &format!("{key}.stable"))?.values;
+    let expected = tensor(&selectors, &format!("{key}.expected_occupied"))?.values;
+    ensure!(
+        stable.len() == values.len() && expected.len() == values.len(),
+        "stable selector extent mismatch"
+    );
+    let decision_defects = values
         .iter()
-        .flat_map(|&row| values[row * c..(row + 1) * c].iter().copied().map(&convert))
-        .collect())
+        .zip(&stable)
+        .zip(&expected)
+        .filter(|((v, s), e)| **s != 0.0 && ((**v > 0.0) != (**e != 0.0)))
+        .count();
+    gate.defects += decision_defects;
+    let active: Vec<_> = values
+        .chunks_exact(8)
+        .map(|row| std::array::from_fn(|i| row[i] > 0.0))
+        .collect();
+    let offsets =
+        std::array::from_fn(|i| [((i >> 2) & 1) as i32, ((i >> 1) & 1) as i32, (i & 1) as i32]);
+    let (children, source) = sites.subdivide_with_offsets(&active, 12_000_000, &offsets)?;
+    let source_map: BTreeMap<_, _> = source
+        .iter()
+        .enumerate()
+        .map(|(r, p)| ((p[0] as usize, p[1] as usize), r))
+        .collect();
+    let mut associations = 0;
+    for (i, (&s, &e)) in stable.iter().zip(&expected).enumerate() {
+        if s == 0.0 || e == 0.0 {
+            continue;
+        }
+        let parent = i / 8;
+        let child = i % 8;
+        if let Some(&row) = source_map.get(&(parent, child)) {
+            let p = sites.coordinates()[parent];
+            ensure!(
+                children.coordinates()[row]
+                    == [
+                        p[0],
+                        2 * p[1] + offsets[child][0],
+                        2 * p[2] + offsets[child][1],
+                        2 * p[3] + offsets[child][2]
+                    ],
+                "stable child coordinate/source mismatch"
+            );
+            associations += 1;
+        }
+    }
+    println!(
+        "N5_M2B_STABLE {} selector={key} decision_defects={decision_defects} physical_associations={associations} near_zero_propagated=true",
+        if decision_defects == 0 {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
+    );
+    drop(workspace);
+    let projection = decoder.point_project(x, stage)?;
+    let projected = selected_values(d, &projection, &rows, 8 * c, f16::to_f64)?;
+    gate.decoder_key = Some(format!("{name}.projection"));
+    gate.score(&format!("{case}.{name}.projection"), &projected, false)?;
+    let wrong: Vec<_> = projected
+        .chunks_exact(8 * c)
+        .flat_map(|row| {
+            permutation
+                .iter()
+                .flat_map(move |&i| row[i * c..(i + 1) * c].iter().copied())
+        })
+        .collect();
+    gate.score(&format!("{case}.{name}.projection"), &wrong, true)?;
+    let pairs = d.stream.clone_htod(source.as_flattened())?;
+    let features = d.stream.alloc_zeros::<f16>(source.len() * c)?;
+    decoder.c2s(
+        &projection,
+        &pairs,
+        &features,
+        [n, source.len(), c, c],
+        false,
+    )?;
+    for &parent in &rows {
+        for child in 0..8 {
+            if let Some(&row) = source_map.get(&(parent, child)) {
+                let actual = d
+                    .stream
+                    .clone_dtoh(&features.slice(row * c..(row + 1) * c))?;
+                let wanted = d.stream.clone_dtoh(
+                    &projection.slice((parent * 8 + child) * c..(parent * 8 + child + 1) * c),
+                )?;
+                ensure!(
+                    actual == wanted,
+                    "physical child feature association mismatch"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_heads_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    let mut gate = OperationGate::decoder(
+        "occupancy-heads",
+        "heads-freeze-r1",
+        "cottage-heads-sm89-r1",
+        18,
+    )?;
+    for case in ["cottage", "robot"] {
+        for stage in [3, 2, 1] {
+            let bank = root.join(format!(
+                "{case}-decode-sm86-r1/decoder.dec.dec{stage}.up.upsample.input.safetensors"
+            ));
+            if stage == 3 {
+                head_case(&decoder, &mut gate, case, stage, f32_tensor(&bank, "feat")?)?;
+            } else {
+                head_case(
+                    &decoder,
+                    &mut gate,
+                    case,
+                    stage,
+                    half_tensor(&bank, "feat")?,
+                )?;
+            }
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_field_affine_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let mut decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    let d = &decoder.device;
+    let mut field = OperationGate::decoder("corner-attributes", "fields-freeze-r1", "sm89-r1", 1)?;
+    let raw = f32_tensor(
+        &root.join("sm89-r1/additional-common-inputs.safetensors"),
+        "fields.raw40",
+    )?;
+    ensure!(raw.len() == 97 * 40, "corner field fixture shape mismatch");
+    let values = d.stream.clone_htod(&raw)?;
+    unsafe {
+        d.stream
+            .launch_builder(
+                decoder
+                    .k
+                    .corner_fields
+                    .as_ref()
+                    .context("corner activation not loaded")?,
+            )
+            .arg(&values)
+            .arg(&97u32)
+            .launch(flat(97 * 32))?;
+    }
+    let actual = d.stream.clone_dtoh(&values)?;
+    let selected: Vec<_> = actual
+        .chunks_exact(40)
+        .flat_map(|row| row[8..].iter().map(|&v| f64::from(v)))
+        .collect();
+    ensure!(
+        actual
+            .chunks_exact(40)
+            .zip(raw.chunks_exact(40))
+            .all(|(a, b)| a[..8] == b[..8]),
+        "sign logits changed during corner activation"
+    );
+    field.score("fields.activated32", &selected, false)?;
+    let wrong: Vec<_> = raw
+        .chunks_exact(40)
+        .flat_map(|row| row[..32].iter().map(|v| f64::from(v.tanh())))
+        .collect();
+    field.score("fields.activated32", &wrong, true)?;
+    let field_result = field.finish();
+    let mut gate = OperationGate::decoder(
+        "single-round-affine",
+        "affine-freeze-r1",
+        "affine-rounding-sm89-r1",
+        1,
+    )?;
+    gate.decoder_anchor = Some(root.join("affine-rounding-sm89-r1/outputs.safetensors"));
+    gate.decoder_key = Some("anchor".into());
+    let rows = indices(&gate.cells["affine.production_qkv"]["definition"]["selected_rows"])?;
+    let (n, ci, co) = (11295usize, 512usize, 1536usize);
+    let unit = 2f32.powi(-10);
+    let input: Vec<_> = (0..n * ci)
+        .map(|i| {
+            f16::from_f32(1.0 + unit * (1 + (((i / ci) * 127 + (i % ci) * 61) % 251) % 2) as f32)
+        })
+        .collect();
+    let mut weight = vec![f16::ZERO; ci * co];
+    let mut bias = vec![f16::ZERO; co];
+    for column in 0..co {
+        let sign = if (column * 61 % 127).is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
+        weight[column * ci + column * 127 % ci] = f16::from_f32(sign * (1.0 + unit));
+        bias[column] = f16::from_f32(sign * unit / 2.0);
+    }
+    let name = "decoder.mid.block0.attn.qkv";
+    decoder
+        .weights
+        .half
+        .insert(format!("{name}.weight"), d.stream.clone_htod(&weight)?);
+    decoder
+        .weights
+        .half
+        .insert(format!("{name}.bias"), d.stream.clone_htod(&bias)?);
+    let input = d.stream.clone_htod(&input)?;
+    let output = d.stream.alloc_zeros::<f16>(n * co)?;
+    decoder.point_linear(
+        name,
+        matrix(ptr(&input, d), n, ci)?,
+        &mut TensorMut(matrix(ptr(&output, d), n, co)?),
+        true,
+    )?;
+    gate.score(
+        "affine.production_qkv",
+        &selected_values(d, &output, &rows, co, f16::to_f64)?,
+        false,
+    )?;
+    decoder.point_linear(
+        name,
+        matrix(ptr(&input, d), n, ci)?,
+        &mut TensorMut(matrix(ptr(&output, d), n, co)?),
+        false,
+    )?;
+    let early = selected_values(d, &output, &rows, co, f16::to_f64)?;
+    let wrong: Vec<_> = early
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| f16::from_f32(v as f32 + bias[i % co].to_f32()).to_f64())
+        .collect();
+    gate.score("affine.production_qkv", &wrong, true)?;
+    field_result?;
+    gate.finish()
+}
+
+fn stage_case<I, O>(
+    decoder: &PixalDecoder,
+    gate: &mut OperationGate,
+    name: &str,
+    bank: &Path,
+    input: Vec<I>,
+    execute: impl Fn(&PointWorkspace<I>, &SparseConv<f32>, CudaSlice<I>) -> Result<CudaSlice<O>>,
+    convert: impl Fn(O) -> f64,
+) -> Result<()>
+where
+    I: DeviceRepr + Copy + ValidAsZeroBits + 'static,
+    O: DeviceRepr + Copy + 'static,
+{
+    let cell = &gate.cells[name];
+    let rows = indices(&cell["definition"]["selected_rows"])?;
+    let ci = cell["definition"]["full_input_shape"][1]
+        .as_u64()
+        .context("stage input width missing")? as usize;
+    let co = cell["definition"]["output_shape"][1]
+        .as_u64()
+        .context("stage output width missing")? as usize;
+    let sites = bank_sites(bank)?;
+    let n = sites.coordinates().len();
+    ensure!(input.len() == n * ci, "stage input extent mismatch");
+    let d = &decoder.device;
+    let workspace = PointWorkspace::new(
+        decoder,
+        &sites,
+        [
+            ci.max(co),
+            co.max(if name.ends_with(".field") { 128 } else { co }),
+        ],
+        name.ends_with(".field"),
+    )?;
+    let max_width = ci.max(co);
+    let wrong_budget = n * 108 + 127 * (27 * max_width + max_width) * 4;
+    let mut wrong_conv =
+        SparseConv::<f32>::promoted(d, &sites, [max_width, max_width], wrong_budget)?;
+    let maps: Vec<[i32; 27]> = sites
+        .coordinates()
+        .iter()
+        .map(|p| {
+            std::array::from_fn(|tap| {
+                sites
+                    .row([
+                        p[0],
+                        p[3] + (tap / 9) as i32 - 1,
+                        p[2] + ((tap / 3) % 3) as i32 - 1,
+                        p[1] + (tap % 3) as i32 - 1,
+                    ])
+                    .unwrap_or(-1)
+            })
+        })
+        .collect();
+    wrong_conv.replace_neighbours(&maps)?;
+    drop(maps);
+    for control in [false, true] {
+        let x = d.stream.clone_htod(&input)?;
+        let output = execute(
+            &workspace,
+            if control {
+                &wrong_conv
+            } else {
+                &workspace.conv
+            },
+            x,
+        )?;
+        ensure!(output.len() == n * co, "stage output extent mismatch");
+        gate.score(
+            name,
+            &selected_values(d, &output, &rows, co, &convert)?,
+            control,
+        )?;
+        if name.ends_with(".field") {
+            ensure!(
+                std::any::TypeId::of::<O>() == std::any::TypeId::of::<f32>(),
+                "raw corner field dtype mismatch"
+            );
+            unsafe {
+                d.stream
+                    .launch_builder(
+                        decoder
+                            .k
+                            .corner_fields
+                            .as_ref()
+                            .context("corner activation missing")?,
+                    )
+                    .arg(&output)
+                    .arg(&u32::try_from(n)?)
+                    .launch(flat(n * 32))?;
+            }
+            let values = selected_values(d, &output, &rows, co, &convert)?;
+            let activated: Vec<_> = values
+                .chunks_exact(40)
+                .flat_map(|r| r[8..].iter().copied())
+                .collect();
+            gate.score(&format!("{name}.activated"), &activated, control)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_stages_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    let d = &decoder.device;
+    let mut gate = OperationGate::decoder(
+        "whole-decoder-stages",
+        "stages-freeze-r1",
+        "stages-sm89-r1",
+        16,
+    )?;
+    for case in ["cottage", "robot"] {
+        let directory = root.join(format!("{case}-decode-sm86-r1"));
+        let bank = directory.join("decoder.mid.input.safetensors");
+        let n = bank_sites(&bank)?.coordinates().len();
+        let latents = if case == "cottage" {
+            root.parent()
+                .context("reference root parent missing")?
+                .join("N5-M1-flow-fixtures-r1/trajectory.safetensors")
+        } else {
+            root.join("robot-latents-sm86-r1/trajectory.safetensors")
+        };
+        stage_case(
+            &decoder,
+            &mut gate,
+            &format!("stage.{case}.latent"),
+            &bank,
+            f32_tensor(&latents, "final_latents")?,
+            |_, conv, input| {
+                let output = d.stream.alloc_zeros::<f32>(n * 512)?;
+                decoder.point_conv(
+                    conv,
+                    "decoder.z_to_f.conv.0",
+                    matrix::<f32>(ptr(&input, d), n, 32)?,
+                    &mut TensorMut(matrix::<f32>(ptr(&output, d), n, 512)?),
+                )?;
+                Ok(output)
+            },
+            f64::from,
+        )?;
+        let maps = bank_sites(&bank)?.serialized_windows(48)?;
+        stage_case(
+            &decoder,
+            &mut gate,
+            &format!("stage.{case}.mid"),
+            &bank,
+            f32_tensor(&bank, "feat")?,
+            |workspace, conv, input| decoder.point_mid(workspace, &maps, input, conv),
+            f64::from,
+        )?;
+        for (stage, ci, co) in [(3, 512, 512), (2, 512, 256), (1, 256, 128), (0, 128, 128)] {
+            let bank = directory.join(format!("decoder.dec.dec{stage}.input.safetensors"));
+            let name = format!("stage.{case}.dec{stage}");
+            if stage == 3 {
+                stage_case(
+                    &decoder,
+                    &mut gate,
+                    &name,
+                    &bank,
+                    f32_tensor(&bank, "feat")?,
+                    |workspace, conv, input| {
+                        let x = decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block0"),
+                            input,
+                            [ci, co],
+                            &workspace.conv,
+                        )?;
+                        decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block1"),
+                            x,
+                            [co, co],
+                            conv,
+                        )
+                    },
+                    f64::from,
+                )?;
+            } else {
+                stage_case(
+                    &decoder,
+                    &mut gate,
+                    &name,
+                    &bank,
+                    half_tensor(&bank, "feat")?,
+                    |workspace, conv, input| {
+                        let x = decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block0"),
+                            input,
+                            [ci, co],
+                            &workspace.conv,
+                        )?;
+                        decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block1"),
+                            x,
+                            [co, co],
+                            conv,
+                        )
+                    },
+                    f16::to_f64,
+                )?;
+            }
+        }
+        let bank = directory.join("decoder.conv_out.input.safetensors");
+        stage_case(
+            &decoder,
+            &mut gate,
+            &format!("stage.{case}.field"),
+            &bank,
+            half_tensor(&bank, "feat")?,
+            |workspace, conv, input| decoder.point_field(workspace, &input, conv),
+            f64::from,
+        )?;
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_complete_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    for case in ["cottage", "robot"] {
+        let trajectory = if case == "cottage" {
+            root.parent()
+                .context("reference parent missing")?
+                .join("N5-M1-flow-fixtures-r1/trajectory.safetensors")
+        } else {
+            root.join("robot-latents-sm86-r1/trajectory.safetensors")
+        };
+        let coordinates = decoder_coordinates(&trajectory, "coordinates")?;
+        let latent = f32_tensor(&trajectory, "final_latents")?;
+        let bank = root.join(format!(
+            "{case}-decode-sm86-r1/decoder.mid.input.safetensors"
+        ));
+        let matrix = tensor(&bank, "matrix")?;
+        ensure!(
+            matrix.values.len() == 16,
+            "inherited matrix extent mismatch"
+        );
+        let frame =
+            std::array::from_fn(|r| std::array::from_fn(|c| matrix.values[r * 4 + c] as f32));
+        let output = decoder.points(coordinates, &latent, frame, 64)?;
+        let n = output.fields.coordinates.len();
+        ensure!(
+            n > 0
+                && n <= 12_000_000
+                && output.fields.channels == 32
+                && output.fields.features.len() == n * 32
+                && output.sign_logits.len() == n * 8,
+            "complete decoder output extent mismatch"
+        );
+        ensure!(
+            output.matrix == frame && output.resolution == 512,
+            "complete decoder changed inherited frame"
+        );
+        ensure!(
+            output
+                .fields
+                .coordinates
+                .iter()
+                .all(|p| p[0] == 0 && p[1..].iter().all(|&v| (0..512).contains(&v))),
+            "complete decoder coordinates outside output frame"
+        );
+        ensure!(
+            output.sign_logits.iter().all(|v| v.is_finite())
+                && output
+                    .fields
+                    .features
+                    .iter()
+                    .all(|v| v.is_finite() && (-1.0..=1.0).contains(v)),
+            "complete decoder nonfinite or unactivated output"
+        );
+        println!(
+            "PASS N5_M2B_COMPLETE case={case} rows={n} channels=32 signs=8 resolution=512 inherited_matrix_exact=true convolutions=27 residuals=10 unforced_support_measurement_only=true timing=false"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -521,7 +1297,7 @@ fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
             }
             let plan = BatchGroupNorm::new(&d, &offsets, c, groups, eps, 16 << 20)?;
             let values = if name.ends_with(".float16") {
-                normalized_features(
+                normalized_features::<f16, f16>(
                     &d,
                     &plan,
                     input.values.iter().map(|&x| f16::from_f64(x)).collect(),
@@ -531,7 +1307,7 @@ fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
                     f16::to_f64,
                 )?
             } else {
-                normalized_features(
+                normalized_features::<f32, f32>(
                     &d,
                     &plan,
                     input.values.iter().map(|&x| x as f32).collect(),

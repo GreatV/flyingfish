@@ -388,6 +388,7 @@ pub struct DecoderCheckpoint {
     pub runtime_bytes: usize,
 }
 impl DecoderKind {
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn validate_point_rows(rows: usize) -> Result<()> {
         ensure!(
             (1..=12_000_000).contains(&rows),

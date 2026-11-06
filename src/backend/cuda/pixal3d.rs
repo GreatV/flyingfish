@@ -3363,6 +3363,7 @@ impl PixalDecoder {
         name: &str,
         input: CudaSlice<T>,
         channels: [usize; 2],
+        last_conv: &SparseConv<f32>,
     ) -> Result<CudaSlice<T>> {
         use std::any::TypeId;
         let [ci, co] = channels;
@@ -3405,7 +3406,7 @@ impl PixalDecoder {
         self.point_swish(b)?;
         let branch = matrix::<T>(ptr(&workspace.scratch[0], d), n, co)?;
         self.point_conv(
-            &workspace.conv,
+            last_conv,
             &format!("{name}.block.5"),
             b,
             &mut TensorMut(branch),
@@ -3464,6 +3465,7 @@ impl PixalDecoder {
                 &format!("decoder.dec.dec{stage}.block{block}"),
                 input,
                 [if block == 0 { ci } else { co }, co],
+                &workspace.conv,
             )?;
         }
         Ok(input)
@@ -3473,13 +3475,20 @@ impl PixalDecoder {
         workspace: &PointWorkspace<f32>,
         maps: &SerializedWindows,
         mut input: CudaSlice<f32>,
+        last_conv: &SparseConv<f32>,
     ) -> Result<CudaSlice<f32>> {
         let d = &self.device;
         let n = input.len() / 512;
         let half_a = d.stream.alloc_zeros::<f16>(n * 512)?;
         let half_b = d.stream.alloc_zeros::<f16>(n * 512)?;
         let wide = d.stream.alloc_zeros::<f16>(n * 2048)?;
-        input = self.point_residual(workspace, "decoder.mid.block_in", input, [512, 512])?;
+        input = self.point_residual(
+            workspace,
+            "decoder.mid.block_in",
+            input,
+            [512, 512],
+            &workspace.conv,
+        )?;
         let a = matrix::<f32>(ptr(&workspace.scratch[0], d), n, 512)?;
         let ha = matrix::<f16>(ptr(&half_a, d), n, 512)?;
         let hb = matrix::<f16>(ptr(&half_b, d), n, 512)?;
@@ -3599,7 +3608,13 @@ impl PixalDecoder {
                     .launch(flat(n * 512))?;
             }
         }
-        self.point_residual(workspace, "decoder.mid.block_out", input, [512, 512])
+        self.point_residual(
+            workspace,
+            "decoder.mid.block_out",
+            input,
+            [512, 512],
+            last_conv,
+        )
     }
     fn point_head<T: DeviceRepr + Copy + 'static>(
         &self,
@@ -3624,7 +3639,7 @@ impl PixalDecoder {
             &workspace.conv,
             &format!("{name}.2"),
             norm,
-            &mut TensorMut(matrix(ptr(&output, d), n, 8)?),
+            &mut TensorMut(matrix::<f32>(ptr(&output, d), n, 8)?),
         )?;
         Ok(output)
     }
@@ -3706,10 +3721,11 @@ impl PixalDecoder {
         self.c2s(&projection, &pairs, &output, [n, rows, c, c], false)?;
         Ok((children, output))
     }
-    fn point_field(
+    fn point_field<T: DeviceRepr + Copy + 'static>(
         &self,
-        workspace: &PointWorkspace<f16>,
-        input: &CudaSlice<f16>,
+        workspace: &PointWorkspace<T>,
+        input: &CudaSlice<T>,
+        last_conv: &SparseConv<f32>,
     ) -> Result<CudaSlice<f32>> {
         let d = &self.device;
         let n = input.len() / 128;
@@ -3718,16 +3734,16 @@ impl PixalDecoder {
         self.point_norm(
             &workspace.norms,
             "decoder.conv_out.conv.0",
-            matrix::<f16>(ptr(input, d), n, 128)?,
+            matrix::<T>(ptr(input, d), n, 128)?,
             &mut TensorMut(norm),
         )?;
         self.point_swish(norm)?;
         let output = d.stream.alloc_zeros::<f32>(n * 40)?;
         self.point_conv(
-            &workspace.conv,
+            last_conv,
             "decoder.conv_out.conv.2",
             norm,
-            &mut TensorMut(matrix(ptr(&output, d), n, 40)?),
+            &mut TensorMut(matrix::<f32>(ptr(&output, d), n, 40)?),
         )?;
         Ok(output)
     }
@@ -3735,7 +3751,7 @@ impl PixalDecoder {
         &self,
         coordinates: Vec<[i32; 4]>,
         latent: &[f32],
-        matrix: [[f32; 4]; 4],
+        frame: [[f32; 4]; 4],
         resolution: u32,
     ) -> Result<CornerDecoderOutput> {
         ensure!(
@@ -3746,7 +3762,7 @@ impl PixalDecoder {
         ensure!(
             latent.len() == coordinates.len() * 32
                 && latent.iter().all(|v| v.is_finite())
-                && matrix.iter().flatten().all(|v| v.is_finite()),
+                && frame.iter().flatten().all(|v| v.is_finite()),
             "invalid point decoder input extent or values"
         );
         let output_resolution = resolution
@@ -3770,11 +3786,11 @@ impl PixalDecoder {
             &workspace.conv,
             "decoder.z_to_f.conv.0",
             matrix::<f32>(ptr(&input, d), n, 32)?,
-            &mut TensorMut(matrix(ptr(&features, d), n, 512)?),
+            &mut TensorMut(matrix::<f32>(ptr(&features, d), n, 512)?),
         )?;
         drop(input);
         let maps = sites.serialized_windows(48)?;
-        features = self.point_mid(&workspace, &maps, features)?;
+        features = self.point_mid(&workspace, &maps, features, &workspace.conv)?;
         drop(maps);
         features = self.point_blocks(&workspace, features, 3, [512, 512])?;
         let (next, mut features) = self.point_up(workspace, sites, features, 3)?;
@@ -3786,7 +3802,7 @@ impl PixalDecoder {
         }
         let workspace = PointWorkspace::new(self, &sites, [128, 128], true)?;
         features = self.point_blocks(&workspace, features, 0, [128, 128])?;
-        let fields = self.point_field(&workspace, &features)?;
+        let fields = self.point_field(&workspace, &features, &workspace.conv)?;
         drop(features);
         let rows = sites.coordinates().len();
         unsafe {
@@ -3819,7 +3835,7 @@ impl PixalDecoder {
                 channels: 32,
             },
             sign_logits,
-            matrix,
+            matrix: frame,
             resolution: output_resolution,
         })
     }
