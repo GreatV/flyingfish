@@ -25,7 +25,7 @@ pub(in crate::backend::cuda) use residency::{Events, ReadAhead, Reader};
 pub(super) use residency::{PoolControl, delay_stream};
 pub(super) use residency::{Prefill, Slots};
 #[path = "engine_moe_graph.rs"]
-mod graphs;
+pub(super) mod graphs;
 
 pub(super) struct Setup {
     pub workspace: crate::prefill::ExpertWorkspaceBudget,

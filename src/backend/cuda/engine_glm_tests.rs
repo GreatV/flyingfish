@@ -14,9 +14,33 @@ impl Reference {
         let record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("composition.json"))?)?;
         let token_bytes = std::fs::read(root.join("tokens.json"))?;
+        let expected_round = match std::env::var_os("G1_COMPOSITION_ROUND") {
+            Some(value) => value
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("G1_COMPOSITION_ROUND is not UTF-8"))?,
+            None => "r2".to_owned(),
+        };
         ensure!(
-            format!("{:x}", Sha256::digest(&token_bytes))
-                == "9c5eb391cc756e43aee6bd95b0877f7f32e0f78c6afeb72dac7b9eb285f231c7",
+            expected_round == "r2" || expected_round == "s2",
+            "G1_COMPOSITION_ROUND must be r2 or s2"
+        );
+        let tokens_sha = format!("{:x}", Sha256::digest(&token_bytes));
+        let expected_token_sha = if expected_round == "r2" {
+            "9c5eb391cc756e43aee6bd95b0877f7f32e0f78c6afeb72dac7b9eb285f231c7".to_owned()
+        } else {
+            let value = std::env::var("G1_COMPOSITION_SEQUENCE_SHA256")
+                .context("s2 requires G1_COMPOSITION_SEQUENCE_SHA256")?;
+            ensure!(
+                value.len() == 64
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "G1_COMPOSITION_SEQUENCE_SHA256 must be 64 lowercase hex digits"
+            );
+            value
+        };
+        ensure!(
+            format!("{:x}", Sha256::digest(&token_bytes)) == expected_token_sha,
             "Runner FAIL frozen token integrity"
         );
         let tokens: serde_json::Value = serde_json::from_slice(&token_bytes)?;
@@ -24,15 +48,22 @@ impl Reference {
         let floor = record["publisher_path_floor"]["largest_pair_mean_position_max_abs"]
             .as_f64()
             .context("missing publisher path floor")?;
+        if expected_round == "s2" {
+            let domain = std::env::var("G1_COMPOSITION_SEQUENCE_DOMAIN")
+                .context("s2 requires G1_COMPOSITION_SEQUENCE_DOMAIN")?;
+            ensure!(
+                domain == "source_code_math" && record["sequence_domain"] == "source_code_math",
+                "Runner FAIL s2 sequence domain"
+            );
+        }
         ensure!(
-            record["round"] == "r2"
+            record["round"] == expected_round
                 && record["frozen"] == true
                 && record["candidate_run"] == false
                 && record["publisher_only"] == true
                 && record["model_definition"] == "50e35cc0ca18ec19b80653690de553e6decf74f5"
                 && record["native_backend"] == "0e5764aa5c27d0f005117a92645156481540950a"
-                && record["tokens"]["source_sha256"]
-                    == "9c5eb391cc756e43aee6bd95b0877f7f32e0f78c6afeb72dac7b9eb285f231c7"
+                && record["tokens"]["source_sha256"] == tokens_sha
                 && record["tokens"]["count"] == 600
                 && record["tokens"]["teacher_forced_logits"] == 599
                 && record["tokens"]["added_bos"] == false
@@ -110,12 +141,26 @@ impl Reference {
             *mean /= 599.0;
         }
         let limit = nll_limit(&means)?;
-        ensure!(
-            (limit - 0.04456232760365619).abs() < 1e-12,
-            "Runner FAIL frozen reference NLL limit {limit:.17}"
-        );
+        if expected_round == "r2" {
+            ensure!(
+                (limit - 0.04456232760365619).abs() < 1e-12,
+                "Runner FAIL frozen reference NLL limit {limit:.17}"
+            );
+        } else {
+            ensure!(
+                (limit - 0.01461872453804158).abs() < 1e-12,
+                "Runner FAIL frozen s2 reference NLL limit {limit:.17}"
+            );
+            let recorded = record["reference_nll_limit"]
+                .as_f64()
+                .context("s2 reference_nll_limit missing")?;
+            ensure!(
+                recorded.is_finite() && recorded > 0.0 && (limit - recorded).abs() <= 1.0e-5,
+                "Runner FAIL s2 reference NLL limit limit={limit:.17} recorded={recorded:.17}"
+            );
+        }
         println!(
-            "G1_REFERENCE_NLL means={means:?} limit={limit:.17} logit_spread_diagnostic={floor:.17}"
+            "G1_REFERENCE_NLL round={expected_round} means={means:?} limit={limit:.17} logit_spread_diagnostic={floor:.17}"
         );
         Ok(Self {
             record,
@@ -463,20 +508,12 @@ fn composition_controls(
     Ok(())
 }
 
-#[test]
-#[ignore = "official GLM model, frozen r2 composition reference and exclusive GPU lease"]
-fn glm_composition_gpu() -> Result<()> {
+fn load_composition_engine() -> Result<Engine> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window required"
     );
-    let root =
-        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
-    let reference = Reference::load(&root)?;
     let model = PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("GLM model missing")?);
-    let output =
-        PathBuf::from(std::env::var_os("G1_COMPOSITION_OUTPUT").context("output missing")?);
-    std::fs::create_dir(&output)?;
     let settings = crate::backend::Settings {
         tree_builder: crate::backend::TreeBuilder::Waves,
         spec_budget: crate::backend::SpecBudget::Chain,
@@ -501,7 +538,7 @@ fn glm_composition_gpu() -> Result<()> {
     }
     let loaded = Engine::load(&model, 0, 640, None, settings);
     crate::experts::plan::FORCED_WAVES.set(None);
-    let mut engine = loaded?;
+    let engine = loaded?;
     ensure!(
         engine.workspace_rows
             == engine
@@ -517,6 +554,19 @@ fn glm_composition_gpu() -> Result<()> {
             && engine.config.num_hidden_layers == 45,
         "Runner FAIL GLM geometry"
     );
+    Ok(engine)
+}
+
+#[test]
+#[ignore = "official GLM model, frozen r2 composition reference and exclusive GPU lease"]
+fn glm_composition_gpu() -> Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+    let output =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_OUTPUT").context("output missing")?);
+    std::fs::create_dir(&output)?;
+    let mut engine = load_composition_engine()?;
     let mut score = Score::new(&root, &output.join("decode.fp32"), &reference)?;
     engine.prefill(&reference.tokens[..1], None)?;
     live_state(&engine, 1)?;
@@ -525,7 +575,32 @@ fn glm_composition_gpu() -> Result<()> {
     let mut second = None;
     for position in 1..599 {
         engine.set_token(reference.tokens[position])?;
-        engine.decode(false, None)?;
+        {
+            #[cfg(feature = "cuda")]
+            let _range = crate::backend::cuda::profile::Range::new(
+                matches!(
+                    position,
+                    1 | 3
+                        | 4
+                        | 5
+                        | 7
+                        | 8
+                        | 9
+                        | 31
+                        | 32
+                        | 33
+                        | 127
+                        | 128
+                        | 129
+                        | 511
+                        | 512
+                        | 513
+                        | 598
+                ),
+                c"glm_eager_decode",
+            );
+            engine.decode(false, None)?;
+        }
         live_state(&engine, position + 1)?;
         let logits = engine.decode_logits()?;
         score.row(position, &logits)?;
@@ -563,8 +638,19 @@ fn glm_composition_gpu() -> Result<()> {
         &first,
         &second.context("second candidate row missing")?,
     )?;
+    composition_chunks(&mut engine, &root, &output, &reference)?;
+    ensure!(accepted, "DEFECT GLM production composition");
+    Ok(())
+}
+
+fn composition_chunks(
+    engine: &mut Engine,
+    root: &Path,
+    output: &Path,
+    reference: &Reference,
+) -> Result<()> {
     engine.reset()?;
-    let mut chunks = Score::new(&root, &output.join("chunked.fp32"), &reference)?;
+    let mut chunks = Score::new(root, &output.join("chunked.fp32"), reference)?;
     engine.prefill_chunks(&reference.tokens[..599], None, 599, |e, ids| {
         live_state(e, e.position + ids.len())?;
         for row in 0..ids.len() {
@@ -591,7 +677,594 @@ fn glm_composition_gpu() -> Result<()> {
         Ok(())
     })?;
     chunks.finish(true)?;
-    ensure!(accepted, "DEFECT GLM production composition");
+    Ok(())
+}
+
+fn graph_native_state(engine: &Engine, full: bool) -> Result<Vec<u8>> {
+    let stream = &engine.device.stream;
+    let mut bytes = Vec::new();
+    macro_rules! floats {
+        ($items:expr) => {
+            for value in $items {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        };
+    }
+    macro_rules! integers {
+        ($items:expr) => {
+            for value in $items {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        };
+    }
+    for state in &engine.state.gdn {
+        floats!(stream.clone_dtoh(&state.s)?);
+        floats!(stream.clone_dtoh(&state.history)?);
+    }
+    for state in &engine.state.dsa {
+        for buffer in [&state.latent, &state.packed, &state.pool_keys] {
+            integers!(stream.clone_dtoh(buffer)?.into_iter().map(bf16::to_bits));
+        }
+        for buffer in [&state.token_ids, &state.pool_ids, &state.meta] {
+            integers!(stream.clone_dtoh(buffer)?);
+        }
+    }
+    integers!(
+        stream.clone_dtoh(
+            engine
+                .state
+                .sequence
+                .as_ref()
+                .context("sequence metadata missing")?
+        )?
+    );
+    for native in engine
+        .qwen
+        .as_ref()
+        .context("runtime missing")?
+        .layers
+        .iter()
+        .filter_map(|layer| layer.native.as_ref())
+    {
+        let (ids, weights) = native.plans[0].read_route(stream)?;
+        integers!(ids.iter().copied());
+        floats!(weights);
+        let valid = stream.clone_dtoh(&native.valid)?;
+        if full {
+            integers!(valid);
+        } else {
+            let pointers = stream.clone_dtoh(&native.pointers)?;
+            let slots = engine.moe_slots.as_ref().context("tier service missing")?;
+            if slots.can_native_dispatch(native.slot_layer) {
+                let (live_pointers, live_valid) = slots.native_dispatch(native.slot_layer)?;
+                for id in ids {
+                    let expert = usize::try_from(id).context("negative selected expert")?;
+                    ensure!(
+                        valid[expert] == 1
+                            && live_valid[expert] == 1
+                            && pointers[expert * 6..(expert + 1) * 6]
+                                == live_pointers[expert * 6..(expert + 1) * 6],
+                        "DEFECT stale native expert dispatch layer={} expert={expert}",
+                        native.slot_layer
+                    );
+                    integers!([valid[expert]]);
+                }
+            } else {
+                for id in ids {
+                    let expert = usize::try_from(id).context("negative selected expert")?;
+                    ensure!(
+                        valid[expert] == 1,
+                        "DEFECT unrouted native expert dispatch layer={} expert={expert}",
+                        native.slot_layer
+                    );
+                    integers!([valid[expert]]);
+                }
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "cuda")]
+struct DsaStateSnapshot {
+    buffers: [Vec<bf16>; 3],
+    indices: [Vec<i32>; 3],
+}
+
+#[cfg(feature = "cuda")]
+struct GraphStepCheckpoint {
+    gdn: Vec<[Vec<f32>; 2]>,
+    dsa: Vec<DsaStateSnapshot>,
+    sequence: Vec<i32>,
+    work_position: Vec<i32>,
+    work_length: Vec<i32>,
+    token: u32,
+    position: usize,
+    last_input: Option<PrefixLastInputKind>,
+    logits: PrefixLogitsCache,
+}
+
+#[cfg(feature = "cuda")]
+impl GraphStepCheckpoint {
+    fn save(engine: &Engine) -> Result<Self> {
+        let s = &engine.device.stream;
+        Ok(Self {
+            gdn: engine
+                .state
+                .gdn
+                .iter()
+                .map(|state| Ok([s.clone_dtoh(&state.s)?, s.clone_dtoh(&state.history)?]))
+                .collect::<Result<_>>()?,
+            dsa: engine
+                .state
+                .dsa
+                .iter()
+                .map(|state| {
+                    Ok(DsaStateSnapshot {
+                        buffers: [
+                            s.clone_dtoh(&state.latent)?,
+                            s.clone_dtoh(&state.packed)?,
+                            s.clone_dtoh(&state.pool_keys)?,
+                        ],
+                        indices: [
+                            s.clone_dtoh(&state.token_ids)?,
+                            s.clone_dtoh(&state.pool_ids)?,
+                            s.clone_dtoh(&state.meta)?,
+                        ],
+                    })
+                })
+                .collect::<Result<_>>()?,
+            sequence: s.clone_dtoh(engine.state.sequence.as_ref().context("sequence missing")?)?,
+            work_position: s.clone_dtoh(&engine.work.position)?,
+            work_length: s.clone_dtoh(&engine.work.length)?,
+            token: engine.token()?,
+            position: engine.position,
+            last_input: engine.last_input_kind,
+            logits: engine.logits_cache,
+        })
+    }
+
+    fn restore(&self, engine: &mut Engine) -> Result<()> {
+        let s = &engine.device.stream;
+        for (source, target) in self.gdn.iter().zip(&mut engine.state.gdn) {
+            s.memcpy_htod(&source[0], &mut target.s)?;
+            s.memcpy_htod(&source[1], &mut target.history)?;
+        }
+        for (source, target) in self.dsa.iter().zip(&mut engine.state.dsa) {
+            s.memcpy_htod(&source.buffers[0], &mut target.latent)?;
+            s.memcpy_htod(&source.buffers[1], &mut target.packed)?;
+            s.memcpy_htod(&source.buffers[2], &mut target.pool_keys)?;
+            s.memcpy_htod(&source.indices[0], &mut target.token_ids)?;
+            s.memcpy_htod(&source.indices[1], &mut target.pool_ids)?;
+            s.memcpy_htod(&source.indices[2], &mut target.meta)?;
+        }
+        s.memcpy_htod(
+            &self.sequence,
+            engine.state.sequence.as_mut().context("sequence missing")?,
+        )?;
+        s.memcpy_htod(&self.work_position, &mut engine.work.position)?;
+        s.memcpy_htod(&self.work_length, &mut engine.work.length)?;
+        engine.position = self.position;
+        engine.set_token(self.token)?;
+        engine.last_input_kind = self.last_input;
+        engine.logits_cache = self.logits;
+        Ok(())
+    }
+}
+
+fn graph_counts(engine: &Engine) -> Result<()> {
+    use cudarc::driver::sys::CUgraphNodeType;
+    ensure!(engine.glm_graph_count() == 84, "GLM graph segment count");
+    let mut total = [0usize; 3];
+    for (layer, native) in engine
+        .qwen
+        .as_ref()
+        .context("runtime missing")?
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, layer)| layer.native.as_ref().map(|native| (i, native)))
+    {
+        let pair = native.graphs.as_ref().context("graphs missing")?;
+        for (part, graph) in [("prefix", &pair.0), ("suffix", &pair.1)] {
+            let mut count = 0;
+            unsafe {
+                sys::cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut count)
+                    .result()?;
+            }
+            let mut nodes = vec![std::ptr::null_mut(); count];
+            unsafe {
+                sys::cuGraphGetNodes(graph.cu_graph(), nodes.as_mut_ptr(), &mut count).result()?;
+            }
+            let mut kinds = [0usize; 3];
+            for node in nodes.into_iter().take(count) {
+                let mut kind = CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+                unsafe {
+                    sys::cuGraphNodeGetType(node, &mut kind).result()?;
+                }
+                kinds[match kind {
+                    CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL => 0,
+                    CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY => 1,
+                    _ => 2,
+                }] += 1;
+            }
+            println!(
+                "GLM_GRAPH_NODES layer={layer} part={part} kernel={} copy={} other={}",
+                kinds[0], kinds[1], kinds[2]
+            );
+            for (sum, count) in total.iter_mut().zip(kinds) {
+                *sum += count;
+            }
+        }
+    }
+    println!(
+        "GLM_GRAPH_NODES_TOTAL kernel={} copy={} other={} submissions=84 route_d2h_bytes=2688 dispatch_h2d_bytes=628992",
+        total[0], total[1], total[2]
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "official GLM model graph capture and rollback controls"]
+fn glm_graph_capture_gpu() -> Result<()> {
+    let mut engine = load_composition_engine()?;
+    ensure!(engine.graph_decode(), "GLM graph capability missing");
+    graph_counts(&engine)?;
+    let graphs: Vec<_> = engine
+        .qwen
+        .as_mut()
+        .context("runtime missing")?
+        .layers
+        .iter_mut()
+        .filter_map(|layer| layer.native.as_mut())
+        .map(|native| native.graphs.take())
+        .collect();
+    let ready = engine.closure.clone();
+    for stage in [
+        Some(CaptureFault::Begin),
+        Some(CaptureFault::End),
+        Some(CaptureFault::Instantiate),
+        None,
+    ] {
+        engine.closure = Rc::new(crate::backend::cuda::closure::Closure::new(
+            false,
+            "GLM capture fault gate".into(),
+        ));
+        engine.closure.freeze_fixed()?;
+        engine.capture_fail_stage = stage;
+        engine.capture_fail_after_layer = if stage.is_none() { Some((4, 1)) } else { None };
+        let before = graph_native_state(&engine, true)?;
+        let result = engine.capture_glm();
+        ensure!(
+            result.is_err() && engine.poisoned && engine.glm_graph_count() == 0,
+            "DEFECT capture fault did not poison/dispose"
+        );
+        ensure!(
+            graph_native_state(&engine, true)? == before,
+            "DEFECT capture fault changed native state"
+        );
+        ensure!(
+            engine.advance(false, None).is_err(),
+            "DEFECT capture fault permitted decode"
+        );
+        println!(
+            "GLM_CAPTURE_CONTROL stage={stage:?} state_bits=0 unpublished=true poisoned=true PASS"
+        );
+        engine.capture_fail_stage = None;
+        engine.capture_fail_after_layer = None;
+        engine.reset()?;
+    }
+    for (native, graphs) in engine
+        .qwen
+        .as_mut()
+        .context("runtime missing")?
+        .layers
+        .iter_mut()
+        .filter_map(|layer| layer.native.as_mut())
+        .zip(graphs)
+    {
+        native.graphs = graphs;
+    }
+    engine.closure = ready;
+    let before = graph_native_state(&engine, true)?;
+    engine.capture()?;
+    ensure!(
+        graph_native_state(&engine, true)? == before,
+        "DEFECT ready capture changed state"
+    );
+    println!(
+        "PASS GLM_GRAPH_CAPTURE graphs=84 faults=4 native_state_bits=0 ready_capture_idempotent=true"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "official GLM native FP8 expert hit, eviction, refill and graph dispatch"]
+fn glm_graph_expert_tier_gpu() -> Result<()> {
+    fn output(
+        engine: &mut Engine,
+        graphs: Option<&(CudaGraph, CudaGraph)>,
+    ) -> Result<(Vec<u16>, usize)> {
+        let native = engine.qwen.as_mut().context("runtime missing")?.layers[3]
+            .native
+            .as_mut()
+            .context("native FFN missing")?;
+        let s = &engine.device.stream;
+        let slots = engine.moe_slots.as_mut().context("tiers missing")?;
+        if !slots.request_open {
+            slots.begin_staging_request()?;
+        }
+        slots.begin_token()?;
+        let x = matrix(&engine.work.n, s, 0, 1, 4096)?;
+        if let Some(pair) = graphs {
+            pair.0.launch()?;
+        } else {
+            native.plans[0].enqueue_route(s, x)?;
+        }
+        let refills = native.service_tier(s, 1, slots)?;
+        if let Some(pair) = graphs {
+            pair.1.launch()?;
+        } else {
+            native.plans[0].run(s, x, &TensorMut(matrix(&engine.work.out, s, 0, 1, 4096)?))?;
+        }
+        slots.record_all_readers(&engine.device.stream)?;
+        slots.finish_token()?;
+        let mut values: Vec<u16> = native.plans[0]
+            .read_contributions(s)?
+            .into_iter()
+            .map(bf16::to_bits)
+            .collect();
+        values.extend(
+            s.clone_dtoh(&engine.work.out.slice(..4096))?
+                .into_iter()
+                .map(bf16::to_bits),
+        );
+        Ok((values, refills))
+    }
+    let mut engine = load_composition_engine()?;
+    let values: Vec<_> = (0..4096)
+        .map(|i| bf16::from_f32(((i * 37) % 251) as f32 / 64.0 - 2.0))
+        .collect();
+    engine
+        .device
+        .stream
+        .memcpy_htod(&values, &mut engine.work.n.slice_mut(..4096))?;
+    let graphs = {
+        let s = &engine.device.stream;
+        let native = engine.qwen.as_ref().context("runtime missing")?.layers[3]
+            .native
+            .as_ref()
+            .context("native FFN missing")?;
+        ensure!(native.slot_layer == 0, "GLM first native layer mapping");
+        let plan = &native.plans[0];
+        let x = matrix(&engine.work.n, s, 0, 1, 4096)?;
+        let y = TensorMut(matrix(&engine.work.out, s, 0, 1, 4096)?);
+        (
+            crate::backend::cuda::moe::testing::capture(s, || plan.enqueue_route(s, x))?,
+            crate::backend::cuda::moe::testing::capture(s, || plan.run(s, x, &y))?,
+        )
+    };
+    let (baseline, initial) = output(&mut engine, None)?;
+    let ids = engine.qwen.as_ref().context("runtime missing")?.layers[3]
+        .native
+        .as_ref()
+        .context("native FFN missing")?
+        .plans[0]
+        .read_route(&engine.device.stream)?
+        .0;
+    ensure!(ids.len() == 8, "GLM top8 route extent");
+    let target = ids[0] as u32;
+    let incoming_eager = engine
+        .moe_slots
+        .as_mut()
+        .context("tiers missing")?
+        .evict_for_test(0, target)?;
+    let (refilled, eager_refills) = output(&mut engine, None)?;
+    ensure!(
+        eager_refills > 0 && baseline == refilled,
+        "DEFECT eager native refill identity"
+    );
+    let incoming_graph = engine
+        .moe_slots
+        .as_mut()
+        .context("tiers missing")?
+        .evict_for_test(0, target)?;
+    let (replay, graph_refills) = output(&mut engine, Some(&graphs))?;
+    let (hit, hit_refills) = output(&mut engine, Some(&graphs))?;
+    ensure!(
+        graph_refills > 0 && hit_refills == 0 && baseline == replay && baseline == hit,
+        "DEFECT graph native refill/hit identity"
+    );
+    engine.qwen.as_mut().context("runtime missing")?.layers[3]
+        .native
+        .as_mut()
+        .context("native FFN missing")?
+        .wrong_route = true;
+    let (wrong, _) = output(&mut engine, Some(&graphs))?;
+    engine.qwen.as_mut().context("runtime missing")?.layers[3]
+        .native
+        .as_mut()
+        .context("native FFN missing")?
+        .wrong_route = false;
+    let differences = baseline.iter().zip(&wrong).filter(|(a, b)| a != b).count();
+    ensure!(differences > 0, "Runner FAIL wrong-slot control escaped");
+    println!(
+        "PASS GLM_GRAPH_EXPERT_TIER experts=288 top_k=8 input=[1,4096] contributions=[1,8,4096] output=[1,4096] target={target} incoming={incoming_eager}/{incoming_graph} initial_refills={initial} eager_refills={eager_refills} graph_refills={graph_refills} hit_refills={hit_refills} different_bits=0 wrong_slot_differences={differences}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "official GLM graph/eager composition, frozen reference and pre-graph eager logits"]
+fn glm_graph_composition_gpu() -> Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+    let output =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_OUTPUT").context("output missing")?);
+    std::fs::create_dir(&output)?;
+    let old_logits = PathBuf::from(
+        std::env::var_os("G1_GRAPH_EAGER_LOGITS").context("pre-graph eager logits missing")?,
+    );
+    ensure!(
+        std::fs::metadata(&old_logits)?.len() == 599 * 154880 * 4,
+        "Runner FAIL pre-graph eager extent"
+    );
+    let mut engine = load_composition_engine()?;
+    ensure!(
+        engine.graph_decode() && engine.glm_graph_count() == 84,
+        "GLM graph capability missing"
+    );
+    graph_counts(&engine)?;
+    let mut accepted = true;
+    for round in 1..=2 {
+        engine.reset()?;
+        if round == 2 {
+            engine.set_token(reference.tokens[17])?;
+            engine.step(true)?;
+            engine.reset()?;
+        }
+        let mut old = BufReader::new(std::fs::File::open(&old_logits)?);
+        let mut eager = Score::new(
+            &root,
+            &output.join(format!("eager-{round}.fp32")),
+            &reference,
+        )?;
+        let mut graph = Score::new(
+            &root,
+            &output.join(format!("graph-{round}.fp32")),
+            &reference,
+        )?;
+        engine.prefill(&reference.tokens[..1], None)?;
+        let first = engine.decode_logits()?;
+        let mut second = None;
+        let mut bit_differences = 0usize;
+        let mut state_differences = 0usize;
+        let mut old_differences = 0usize;
+        let mut stale_detected = false;
+        for position in 0..599 {
+            let (expected, actual) = if position == 0 {
+                (first.clone(), first.clone())
+            } else {
+                engine.set_token(reference.tokens[position])?;
+                let checkpoint = GraphStepCheckpoint::save(&engine)?;
+                let marked = matches!(
+                    position,
+                    1 | 3
+                        | 4
+                        | 5
+                        | 7
+                        | 8
+                        | 9
+                        | 31
+                        | 32
+                        | 33
+                        | 127
+                        | 128
+                        | 129
+                        | 511
+                        | 512
+                        | 513
+                        | 598
+                );
+                {
+                    let _range =
+                        crate::backend::cuda::profile::Range::new(marked, c"glm_eager_decode");
+                    engine.decode(false, None)?;
+                }
+                let expected = engine.decode_logits()?;
+                let expected_state = graph_native_state(&engine, false)?;
+                checkpoint.restore(&mut engine)?;
+                if position == 3 {
+                    engine.state.set_sequence(
+                        &engine.device.stream,
+                        2,
+                        1,
+                        engine.workspace_rows as u32,
+                    )?;
+                    engine.decode(true, None)?;
+                    stale_detected = graph_native_state(&engine, false)? != expected_state;
+                    ensure!(
+                        stale_detected,
+                        "Runner FAIL stale sequence control was not detected at first completed pool"
+                    );
+                    checkpoint.restore(&mut engine)?;
+                }
+                {
+                    let _range =
+                        crate::backend::cuda::profile::Range::new(marked, c"glm_graph_decode");
+                    engine.decode(true, None)?;
+                }
+                let actual = engine.decode_logits()?;
+                let actual_state = graph_native_state(&engine, false)?;
+                ensure!(
+                    expected_state.len() == actual_state.len(),
+                    "Runner FAIL graph state extent"
+                );
+                let different = expected_state
+                    .iter()
+                    .zip(&actual_state)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                state_differences += different;
+                println!(
+                    "GLM_GRAPH_STATE round={round} position={position} bytes={} different_bytes={different}",
+                    actual_state.len()
+                );
+                (expected, actual)
+            };
+            let previous = read_logits(&mut old, 154880)?;
+            old_differences += previous
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            bit_differences += actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            eager.row(position, &expected)?;
+            graph.row(position, &actual)?;
+            live_state(&engine, position + 1)?;
+            if position == 1 {
+                second = Some(expected);
+            }
+        }
+        accepted &= eager.finish(false)?;
+        accepted &= graph.finish(false)?;
+        let identity = bit_differences == 0
+            && state_differences == 0
+            && old_differences == 0
+            && stale_detected;
+        accepted &= identity;
+        println!(
+            "{} GLM_GRAPH_COMPOSITION round={round} rows=599 vocab=154880 logit_bit_differences={bit_differences} native_state_different_bytes={state_differences} pre_graph_eager_bit_differences={old_differences} stale_sequence_detected={stale_detected} graph_submissions_per_decode=84",
+            if identity { "PASS" } else { "DEFECT" }
+        );
+        engine.reset()?;
+        engine.prefill(&reference.tokens[..1], None)?;
+        ensure!(
+            engine
+                .decode_logits()?
+                .iter()
+                .zip(&first)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "DEFECT graph reset first-token identity"
+        );
+        println!("PASS GLM_GRAPH_RESET round={round} first_token_bits=0");
+        composition_controls(
+            &mut engine,
+            &reference.tokens,
+            &first,
+            &second.context("second row missing")?,
+        )?;
+    }
+    composition_chunks(&mut engine, &root, &output, &reference)?;
+    ensure!(accepted, "DEFECT GLM graph composition");
     Ok(())
 }
 

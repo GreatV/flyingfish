@@ -7,7 +7,7 @@ pub(super) struct Segments {
     pub join: CudaGraph,
 }
 
-fn record(
+pub(in crate::backend::cuda::engine) fn record(
     engine: &mut Engine,
     launch: impl FnOnce(&mut Engine) -> Result<()>,
 ) -> Result<CudaGraph> {
