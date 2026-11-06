@@ -2,7 +2,9 @@
 #[cfg(all(feature = "cuda", test))]
 pub use crate::backend::cuda::engine_parakeet::StreamOmit;
 #[cfg(feature = "cuda")]
-pub use crate::backend::cuda::engine_parakeet::{NemotronStream, ParakeetEncoder, StreamChunk};
+pub use crate::backend::cuda::engine_parakeet::{
+    NemotronStream, ParakeetEncoder, ParakeetTdt, StreamChunk,
+};
 
 use crate::{
     audio::LogMelConfig,
