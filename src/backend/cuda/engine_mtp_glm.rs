@@ -1266,7 +1266,8 @@ impl GlmMtpRuntime {
         let tok = anchor_token as usize;
         let tok_slice = embedding.slice(tok * 4096..(tok + 1) * 4096);
         stream.memcpy_dtod(&tok_slice, &mut self.token_embed_buf)?;
-        stream.memcpy_dtod(target_hidden, &mut self.target_hidden_buf)?;
+        let hidden_slice = target_hidden.slice(..4096);
+        stream.memcpy_dtod(&hidden_slice, &mut self.target_hidden_buf)?;
 
         self.forward_layer45_core(dsa_state, start_pos, false, false, blas, Some(head))?;
 

@@ -519,7 +519,8 @@ fn produce_mtp_events(
 ) -> Result<spec::Output> {
     model.reset_mtp()?;
     let mut first = true;
-    let result = model.generate_mtp_reuse(ids, options, true, &mut |token_ids, accepted| {
+    let graph = model.graph_decode();
+    let result = model.generate_mtp_reuse(ids, options, graph, &mut |token_ids, accepted| {
         if first {
             first = false;
         } else {
