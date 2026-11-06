@@ -2931,10 +2931,12 @@ fn ss_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Resul
             if variant == "mv" { "_mv" } else { "" }
         );
         let mut flow = Flow::open(
+            &Device::new(0)?,
             &model.join("ckpts"),
             &stem,
             runtime,
-            &ss_coordinates(),
+            (&ss_coordinates(), 16),
+            &Rc::new(()),
             10_000_000_000,
         )?;
         fixed_ss(&mut flow, gate, root, variant)?;
@@ -3024,10 +3026,21 @@ fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Re
                 if variant == "mv" { "_mv" } else { "" }
             );
             let mut flow = Flow::open(
+                &Device::new(0)?,
                 &model.join("ckpts"),
                 &stem,
                 runtime,
-                &points,
+                (
+                    &points,
+                    if stage == 0 {
+                        32
+                    } else if resolution == 1536 && fixture == "robot_crab" {
+                        88
+                    } else {
+                        resolution / 16
+                    },
+                ),
+                &Rc::new(()),
                 10_000_000_000,
             )?;
             let global = f32_tensor(&input, "cond.global")?;
@@ -3278,10 +3291,21 @@ fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) 
         let coordinates = coordinates(&tensor(&input, "noise.coords")?)?;
         let n = coordinates.len();
         let mut flow = Flow::open(
+            &Device::new(0)?,
             &model.join("ckpts"),
             "slat_flow_img2shape_dit_1_3B_1024_bf16",
             runtime,
-            &coordinates,
+            (
+                &coordinates,
+                if stage == 0 {
+                    32
+                } else if resolution == 1536 {
+                    88
+                } else {
+                    64
+                },
+            ),
+            &Rc::new(()),
             10_000_000_000,
         )?;
         for (part, kind) in ["q", "k"].into_iter().enumerate() {
@@ -3457,6 +3481,85 @@ fn conditioning_rejects_another_flow_with_the_same_row_count() -> Result<()> {
         let other_flow = Rc::new(());
         assert!(validate_conditioning_origin(&other_flow, &origin).is_err());
     }
+    let mut camera = crate::backend::ProjectionCamera {
+        world_to_camera: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, -2.0],
+        horizontal_fov: 0.7,
+        mesh_scale: 1.0,
+    };
+    let first = camera;
+    camera.world_to_camera[3] = 0.25;
+    let views = [first, camera];
+    let shape = crate::backend::PixalConditioningShape {
+        image_side: 1024,
+        grid_side: 88,
+        naf_side: Some(512),
+    };
+    validate_projection_binding(
+        [&origin, &origin],
+        [&coordinates, &coordinates],
+        [shape, shape],
+        [&views, &views],
+    )?;
+    let foreign = Rc::new(());
+    let reordered = [coordinates[2], coordinates[0], coordinates[1]];
+    assert!(
+        validate_projection_binding(
+            [&origin, &foreign],
+            [&coordinates, &coordinates],
+            [shape, shape],
+            [&views, &views]
+        )
+        .is_err()
+    );
+    assert!(
+        validate_projection_binding(
+            [&origin, &origin],
+            [&coordinates, &reordered],
+            [shape, shape],
+            [&views, &views]
+        )
+        .is_err()
+    );
+    assert!(
+        validate_projection_binding(
+            [&origin, &origin],
+            [&coordinates, &coordinates],
+            [
+                shape,
+                crate::backend::PixalConditioningShape {
+                    grid_side: 96,
+                    ..shape
+                }
+            ],
+            [&views, &views]
+        )
+        .is_err()
+    );
+    assert!(
+        validate_projection_binding(
+            [&origin, &origin],
+            [&coordinates, &coordinates],
+            [shape, shape],
+            [&views, &[camera, first]]
+        )
+        .is_err()
+    );
+    assert!(
+        validate_projection_binding(
+            [&origin, &origin],
+            [&coordinates, &coordinates],
+            [
+                shape,
+                crate::backend::PixalConditioningShape {
+                    naf_side: Some(1024),
+                    ..shape
+                }
+            ],
+            [&views, &views]
+        )
+        .is_err()
+    );
+    assert_eq!(coordinates.len(), reordered.len());
     Ok(())
 }
 
@@ -4282,10 +4385,12 @@ fn linked_lr(root: &Path, model: &Path, runtime: &Path) -> Result<Vec<f32>> {
         .join("evidence/P1-M1-r1/pipeline-single-1024-cottage-r2/shape_slat-0-inputs.safetensors");
     let points = coordinates(&tensor(&input, "noise.coords")?)?;
     let mut flow = Flow::open(
+        &Device::new(0)?,
         &model.join("ckpts"),
         "slat_flow_img2shape_dit_1_3B_512_bf16",
         runtime,
-        &points,
+        (&points, 32),
+        &Rc::new(()),
         10_000_000_000,
     )?;
     let positive = flow.conditioning(
@@ -5718,7 +5823,7 @@ fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
     let root = env_path("FF_PIXAL_REFERENCE")?;
     let model = env_path("FF_PIXAL_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    for (case, capture, _, core, _) in SURFACE_CASES {
+    for (case, capture, _, core, requested) in SURFACE_CASES {
         let base = root.join("evidence/P1-M1-r1").join(capture);
         let input = base.join("tex_slat-0-inputs.safetensors");
         let points = coordinates(&tensor(&input, "noise.coords")?)?;
@@ -5727,10 +5832,19 @@ fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
             if core.starts_with("mv-") { "_mv" } else { "" }
         );
         let mut flow = Flow::open(
+            &Device::new(0)?,
             &model.join("ckpts"),
             &stem,
             &runtime,
-            &points,
+            (
+                &points,
+                if case == "crab1408" {
+                    88
+                } else {
+                    requested / 16
+                },
+            ),
+            &Rc::new(()),
             12_000_000_000,
         )?;
         let mut positive = flow.conditioning(
@@ -6116,4 +6230,435 @@ fn pixal3d_material_matches_frozen_definition_gpu() -> Result<()> {
         material_generated(&mut g, &shape, &texture, &root, (case, capture))?;
     }
     g.finish()
+}
+
+fn indexed_projection(
+    device: &Device,
+    input: u64,
+    output: &CudaSlice<f32>,
+    camera: &CudaSlice<f32>,
+    coordinates: &CudaSlice<i32>,
+    geometry: [u32; 6],
+) -> Result<()> {
+    let [side, height, width, channels, output_channels, offset] = geometry;
+    let rows = u32::try_from(coordinates.len() / 3)?;
+    let kernel =
+        cubin::module(&device.ctx, "vision_ops")?.load_function("project_bilinear_indexed_f32")?;
+    for first in (0..rows).step_by(8191) {
+        let count = (rows - first).min(8191);
+        unsafe {
+            device
+                .stream
+                .launch_builder(&kernel)
+                .arg(&input)
+                .arg(output)
+                .arg(camera)
+                .arg(coordinates)
+                .arg(&side)
+                .arg(&height)
+                .arg(&width)
+                .arg(&channels)
+                .arg(&output_channels)
+                .arg(&offset)
+                .arg(&u64::from(first))
+                .arg(&count)
+                .arg(&0u32)
+                .arg(&1.0f32)
+                .launch(grid(
+                    (u64::from(count) * u64::from(channels))
+                        .div_ceil(256)
+                        .min(65535) as usize,
+                    256,
+                ))?;
+        }
+    }
+    Ok(())
+}
+fn projection_features(
+    device: &Device,
+    source: &Path,
+    output: &CudaSlice<f32>,
+    camera: &CudaSlice<f32>,
+    coords: &CudaSlice<i32>,
+    side: u32,
+) -> Result<()> {
+    let s = &device.stream;
+    let hidden = f32_tensor(source, "dino_final_block")?;
+    ensure!(hidden.len() == 4101 * 1024, "projection DINO input shape");
+    let input = s.clone_htod(&hidden)?;
+    let normalized = s.alloc_zeros::<f32>(hidden.len())?;
+    let common = cubin::module(&device.ctx, "q38_common")?;
+    let norm = common.load_function("q38_layer_norm_f32")?;
+    unsafe {
+        s.launch_builder(&norm)
+            .arg(&input)
+            .arg(&0u64)
+            .arg(&0u64)
+            .arg(&normalized)
+            .arg(&4101u32)
+            .arg(&1u32)
+            .arg(&1024u32)
+            .arg(&1024u64)
+            .arg(&1024u64)
+            .arg(&1u64)
+            .arg(&1024u64)
+            .arg(&1024u64)
+            .arg(&1u64)
+            .arg(&1e-5f32)
+            .launch(grid(4101, 256))?;
+    }
+    indexed_projection(
+        device,
+        ptr(&normalized, device) + 5 * 1024 * 4,
+        output,
+        camera,
+        coords,
+        [side, 64, 64, 1024, 2048, 0],
+    )?;
+    let checkpoint = MappedCheckpoint::open_component(
+        source.parent().context("feature parent")?,
+        source
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .context("feature stem")?,
+    )?;
+    let tensors = checkpoint.component_tensors()?;
+    let naf = tensors.get("naf_output").context("NAF features missing")?;
+    ensure!(
+        naf.dtype == "F32"
+            && naf.shape.len() == 3
+            && naf.shape[0] == 1024
+            && naf.shape[1] == naf.shape[2],
+        "projection NAF input shape"
+    );
+    let extent = naf.shape[1];
+    let plane = extent * extent;
+    let transpose = common.load_function("transpose_f32")?;
+    for channel in (0..1024).step_by(32) {
+        let values: Vec<_> = naf.data[channel * plane * 4..(channel + 32) * plane * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect();
+        let chw = s.clone_htod(&values)?;
+        let hwc = s.alloc_zeros::<f32>(values.len())?;
+        unsafe {
+            s.launch_builder(&transpose)
+                .arg(&chw)
+                .arg(&hwc)
+                .arg(&32i64)
+                .arg(&(plane as i64))
+                .launch(flat(values.len()))?;
+        }
+        indexed_projection(
+            device,
+            ptr(&hwc, device),
+            output,
+            camera,
+            coords,
+            [
+                side,
+                extent as u32,
+                extent as u32,
+                32,
+                2048,
+                (1024 + channel) as u32,
+            ],
+        )?;
+        s.synchronize()?;
+    }
+    Ok(())
+}
+#[test]
+#[ignore = "requires CUDA and frozen projection captures"]
+fn pixal3d_indexed_projection_gpu() -> Result<()> {
+    let freeze_path = env_path("FF_PIXAL_M4C_FREEZE")?;
+    let bytes = std::fs::read(&freeze_path)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes))
+            == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
+        "projection freeze integrity"
+    );
+    let freeze: Value = serde_json::from_slice(&bytes)?;
+    let root = freeze_path.parent().context("freeze parent")?;
+    let project = env_path("FF_PIXAL_REFERENCE")?;
+    let synthetic: Value = serde_json::from_slice(&std::fs::read(
+        root.join("projection-synthetic-cpu/metadata.json"),
+    )?)?;
+    let real: Value = serde_json::from_slice(&std::fs::read(
+        root.join("projection-real-cpu/metadata.json"),
+    )?)?;
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let module = cubin::module(&device.ctx, "vision_ops")?;
+    let focal = module.load_function("perspective_focal_f32")?;
+    let cells = freeze["projection"]["cells"]
+        .as_array()
+        .context("projection cells")?;
+    ensure!(cells.len() == 33, "projection coverage");
+    let mut defects = 0;
+    let mut seen = BTreeSet::new();
+    for cell in cells {
+        let name = cell["name"].as_str().context("cell name")?;
+        ensure!(seen.insert(name), "duplicate projection cell");
+        let is_synthetic = cell["kind"] == "synthetic";
+        let metadata = if is_synthetic { &synthetic } else { &real };
+        let record = metadata["records"]
+            .as_array()
+            .context("projection metadata")?
+            .iter()
+            .find(|r| r["name"] == name)
+            .context("projection record")?;
+        let side = u32::try_from(record["grid"].as_u64().context("projection grid")?)?;
+        let fixture = record["fixture"].as_str().context("projection fixture")?;
+        let camera: Value = serde_json::from_slice(&std::fs::read(
+            project.join("fixtures/pixal3d").join(format!(
+                "{}-camera.json",
+                if fixture == "near" {
+                    "cottage"
+                } else {
+                    fixture
+                }
+            )),
+        )?)?;
+        let mut parameters: Vec<f32> =
+            serde_json::from_value::<Vec<Vec<f32>>>(camera["world_to_camera"].clone())?
+                .into_iter()
+                .take(3)
+                .flatten()
+                .collect();
+        if fixture == "near" {
+            parameters[11] = -0.125;
+        }
+        parameters.extend([
+            camera["camera_angle_x"].as_f64().context("fov")? as f32,
+            camera["mesh_scale"].as_f64().context("scale")? as f32,
+            1024.0,
+        ]);
+        ensure!(parameters.len() == 15, "camera extent");
+        let camera = s.clone_htod(&parameters)?;
+        unsafe {
+            s.launch_builder(&focal).arg(&camera).launch(grid(1, 1))?;
+        }
+        let path = Path::new(
+            cell["sources"]["cpu"]
+                .as_str()
+                .context("projection source")?,
+        );
+        let coordinates = coordinates(&tensor(path, "coords")?)?;
+        ensure!(
+            coordinates
+                .iter()
+                .flatten()
+                .all(|&v| v >= 0 && v < side as i32),
+            "projection coordinate bound"
+        );
+        let coords = s.clone_htod(coordinates.as_flattened())?;
+        let channels = if is_synthetic { 17 } else { 2048 };
+        let count = coordinates.len() * channels;
+        let mut output = s.alloc_zeros::<f32>(count + 64)?;
+        s.memcpy_htod(&[12345.25f32; 64], &mut output.slice_mut(count..))?;
+        let synthetic_input = if is_synthetic {
+            let mut data = Vec::with_capacity(31 * 37 * 17);
+            for y in 0..31 {
+                for x in 0..37 {
+                    for c in 0..17 {
+                        data.push(
+                            ((y * 7 + x * 11 + c * 3) % 19 - 9) as f32 / 16.0
+                                + ((y * 13 + x * 5 + c * 7) % 23 - 11) as f32 / 32.0,
+                        );
+                    }
+                }
+            }
+            let input = s.clone_htod(&data)?;
+            indexed_projection(
+                &device,
+                ptr(&input, &device),
+                &output,
+                &camera,
+                &coords,
+                [side, 31, 37, 17, 17, 0],
+            )?;
+            Some(input)
+        } else {
+            projection_features(
+                &device,
+                Path::new(
+                    record["sources"]["r0a"]
+                        .as_str()
+                        .context("feature source")?,
+                ),
+                &output,
+                &camera,
+                &coords,
+                side,
+            )?;
+            None
+        };
+        s.synchronize()?;
+        ensure!(
+            s.clone_dtoh(&output.slice(count..))? == [12345.25f32; 64],
+            "projection canary"
+        );
+        let actual: Vec<f64> = s
+            .clone_dtoh(&output.slice(..count))?
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let reference = tensor(path, if is_synthetic { "anchor" } else { "r0a" })?;
+        let measured = metrics(&actual, &reference.values)?;
+        let mut pass = true;
+        for metric in ["max_abs", "rmse"] {
+            let tau = cell["tau"][metric].as_f64().context("projection tau")?;
+            if measured[metric] > tau {
+                pass = false;
+                defects += 1;
+            }
+            println!(
+                "P1_M4C_PROJECTION_CELL {} name={name} metric={metric} value={} tau={tau}",
+                if measured[metric] <= tau {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                },
+                measured[metric]
+            );
+        }
+        let control = if let Some(input) = synthetic_input {
+            let swapped: Vec<_> = coordinates.iter().map(|p| [p[2], p[1], p[0]]).collect();
+            let coords = s.clone_htod(swapped.as_flattened())?;
+            indexed_projection(
+                &device,
+                ptr(&input, &device),
+                &output,
+                &camera,
+                &coords,
+                [side, 31, 37, 17, 17, 0],
+            )?;
+            s.clone_dtoh(&output.slice(..count))?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>()
+        } else {
+            let mut wrong = actual.clone();
+            wrong.rotate_right(channels);
+            wrong
+        };
+        let wrong = metrics(&control, &reference.values)?;
+        for metric in ["max_abs", "rmse"] {
+            let ratio = wrong[metric] / cell["tau"][metric].as_f64().context("control tau")?;
+            ensure!(
+                ratio >= 10.0,
+                "projection control weak: {name} {metric} {ratio}"
+            );
+            println!("P1_M4C_PROJECTION_CONTROL PASS name={name} metric={metric} ratio={ratio}");
+        }
+        println!(
+            "P1_M4C_PROJECTION_ROWS name={name} rows={} grid={side} indexed_output_bytes={} dense_output_bytes={} coordinate_bytes={} pass={pass}",
+            coordinates.len(),
+            count * 4,
+            u64::from(side).pow(3) * channels as u64 * 4,
+            coordinates.len() * 12
+        );
+    }
+    println!(
+        "P1_M4C_PROJECTION_GATE {} cells={} metrics={} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        seen.len(),
+        seen.len() * 2
+    );
+    ensure!(defects == 0, "indexed projection candidate defects");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA; conditioning stream, context and capacity controls"]
+fn pixal3d_device_handoff_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let producer = device.ctx.new_stream()?;
+    let mut source = producer.alloc_zeros::<f32>(257)?;
+    producer.synchronize()?;
+    let values: Vec<f32> = (0..257)
+        .map(|i| ((i * 37 % 97) + 1) as f32 / 64.0)
+        .collect();
+    let stale = device.stream.alloc_zeros::<f32>(257)?;
+    let copy = cubin::module(&device.ctx, "q38_common")?.load_function("copy_finite_f32")?;
+    let source_ptr = source.device_ptr(&producer).0;
+    let stale_ptr = ptr(&stale, &device);
+    unsafe {
+        device
+            .stream
+            .launch_builder(&copy)
+            .arg(&source_ptr)
+            .arg(&stale_ptr)
+            .arg(&257u64)
+            .launch(flat(257))?;
+    }
+    let release = device.stream.record_event(Some(
+        cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+    ))?;
+    producer.wait(&release)?;
+    producer.memcpy_htod(&values, &mut source)?;
+    let output = device.stream.alloc_zeros::<f32>(257)?;
+    finite_copy(&device, &source, &output)?;
+    drop(source);
+    drop(producer);
+    ensure!(
+        device.stream.clone_dtoh(&output)? == values,
+        "producer handoff differs"
+    );
+    let stale_values = device.stream.clone_dtoh(&stale)?;
+    ensure!(
+        stale_values.iter().all(|&v| v == 0.0) && stale_values != values,
+        "missing-dependency control did not expose stale contents"
+    );
+    let cast = cubin::module(&device.ctx, "vision_ops")?
+        .load_function("vision_downcast_f32_to_bf16_checked")?;
+    let cast_output = device.stream.alloc_zeros::<bf16>(257)?;
+    unsafe {
+        device
+            .stream
+            .launch_builder(&cast)
+            .arg(&output)
+            .arg(&cast_output)
+            .arg(&257u32)
+            .launch(flat(257))?;
+    }
+    ensure!(
+        device.stream.clone_dtoh(&cast_output)?
+            == values
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>(),
+        "device conditioning BF16 rounding differs"
+    );
+    let foreign = cudarc::driver::CudaContext::new_non_primary(0, 0)?;
+    let other_stream = foreign.new_stream()?;
+    let other = other_stream.alloc_zeros::<f32>(257)?;
+    ensure!(
+        wait_input(&device, &other).is_err(),
+        "foreign context accepted"
+    );
+    drop(other);
+    drop(other_stream);
+    drop(foreign);
+    device.ctx.bind_to_thread()?;
+    let (free, _) = device.ctx.mem_get_info()?;
+    let needed = 257 * size_of::<f32>();
+    ensure!(
+        device.workspace_budget(free, needed - 1, needed).is_err(),
+        "undersized live-set budget accepted"
+    );
+    ensure!(
+        device
+            .workspace_budget(free, needed - 1, needed - 4)
+            .is_ok(),
+        "one-word omission control did not discriminate"
+    );
+    println!(
+        "P1_M4C_HANDOFF PASS values=257 cast_bit_exact=true producer_lifetime=true foreign_context_rejected=true stale_read_mutant=257 capacity_omission_bytes=4 timing=false"
+    );
+    Ok(())
 }

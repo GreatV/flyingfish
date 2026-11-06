@@ -2,15 +2,22 @@
 #include "q38_contract.cuh"
 #include "gpu_compat.cuh"
 #include <math.h>
+template<typename T>
+__device__ __forceinline__ void copy_finite(const T* source, T* destination, uint64_t count) {
+    for (uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+         i<count; i+=uint64_t(gridDim.x)*blockDim.x) {
+        T value=source[i];
+        if (!isfinite(float(value))) { __trap(); return; }
+        destination[i]=value;
+    }
+}
 extern "C" __global__ void q38_copy_finite_bf16(const __nv_bfloat16* source,
                                                __nv_bfloat16* destination,
                                                uint64_t count) {
-    for (uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
-         i<count; i+=uint64_t(gridDim.x)*blockDim.x) {
-        __nv_bfloat16 value=source[i];
-        if (!isfinite(__bfloat162float(value))) { __trap(); return; }
-        destination[i]=value;
-    }
+    copy_finite(source, destination, count);
+}
+extern "C" __global__ void copy_finite_f32(const float* source, float* destination, uint64_t count) {
+    copy_finite(source, destination, count);
 }
 #if defined(__HIP__)
 extern "C" __global__ void q38_bias_add(const float* input,__nv_bfloat16* y,const __nv_bfloat16* bias,uint64_t count,uint32_t width) {

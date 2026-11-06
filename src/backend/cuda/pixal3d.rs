@@ -28,6 +28,39 @@ use std::{collections::BTreeMap, mem::size_of, path::Path, rc::Rc};
 
 type FlowWeights<T> = BTreeMap<String, CudaSlice<T>>;
 
+fn wait_input<T>(device: &Device, input: &CudaSlice<T>) -> Result<()> {
+    ensure!(
+        input.context() == &device.ctx,
+        "input device context differs from setup"
+    );
+    if device.stream.as_ref() != input.stream().as_ref() {
+        let ready = input.stream().record_event(Some(
+            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        ))?;
+        device.stream.wait(&ready)?;
+    }
+    Ok(())
+}
+
+fn finite_copy(device: &Device, input: &CudaSlice<f32>, output: &CudaSlice<f32>) -> Result<()> {
+    wait_input(device, input)?;
+    ensure!(
+        output.context() == &device.ctx && input.len() == output.len() && !input.is_empty(),
+        "finite copy extent/context mismatch"
+    );
+    let kernel = cubin::module(&device.ctx, "q38_common")?.load_function("copy_finite_f32")?;
+    unsafe {
+        device
+            .stream
+            .launch_builder(&kernel)
+            .arg(input)
+            .arg(output)
+            .arg(&(input.len() as u64))
+            .launch(flat(input.len()))?;
+    }
+    Ok(())
+}
+
 fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
     x.device_ptr(&d.stream).0
 }
@@ -1079,6 +1112,25 @@ fn validate_conditioning_origin(origin: &Rc<()>, flow: &Rc<()>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_projection_binding(
+    origins: [&Rc<()>; 2],
+    coordinates: [&[[i32; 3]]; 2],
+    shapes: [crate::backend::PixalConditioningShape; 2],
+    views: [&[crate::backend::ProjectionCamera]; 2],
+) -> Result<()> {
+    validate_conditioning_origin(origins[0], origins[1])?;
+    ensure!(
+        coordinates[0] == coordinates[1],
+        "projected coordinate order differs"
+    );
+    ensure!(shapes[0] == shapes[1], "projected stage/grid differs");
+    ensure!(
+        !views[0].is_empty() && views[0] == views[1],
+        "projected camera/view mapping differs"
+    );
+    Ok(())
+}
+
 pub struct Conditioning<T: FlowElement = bf16> {
     origin: Rc<()>,
     global: CudaSlice<T>,
@@ -1091,6 +1143,8 @@ pub struct Flow<T: FlowElement = bf16> {
     spec: FlowSpec,
     rows: usize,
     coordinates: Vec<[i32; 3]>,
+    projection_grid: Option<u32>,
+    request: Option<Rc<()>>,
     steps: usize,
     _inner_weights: FlowWeights<T>,
     _f32: FlowWeights<f32>,
@@ -1113,12 +1167,15 @@ pub struct Flow<T: FlowElement = bf16> {
 
 impl Flow<bf16> {
     pub fn open(
+        device: &Device,
         dir: &Path,
         stem: &str,
         runtime: &Path,
-        coordinates: &[[i32; 3]],
+        geometry: (&[[i32; 3]], u32),
+        request: &Rc<()>,
         budget: usize,
     ) -> Result<Self> {
+        let (coordinates, grid_side) = geometry;
         let checkpoint = FlowCheckpoint::open(dir, stem)?;
         let spec = checkpoint.spec.clone();
         let pipeline = dir
@@ -1188,8 +1245,12 @@ impl Flow<bf16> {
             "flow row extent overflow"
         );
         ensure!(
-            coordinates.iter().flatten().all(|&v| v >= 0),
-            "negative flow coordinates"
+            matches!(grid_side, 16 | 32 | 64 | 72 | 80 | 88 | 96)
+                && coordinates
+                    .iter()
+                    .flatten()
+                    .all(|&v| v >= 0 && v < grid_side as i32),
+            "flow coordinates outside projection grid"
         );
         ensure!(
             coordinates
@@ -1201,7 +1262,8 @@ impl Flow<bf16> {
         );
         if !spec.sparse() {
             ensure!(
-                rows == 4096
+                grid_side == 16
+                    && rows == 4096
                     && coordinates
                         .iter()
                         .enumerate()
@@ -1210,7 +1272,7 @@ impl Flow<bf16> {
                 "SS coordinates must be the published 16^3 grid order"
             );
         }
-        let device = Device::new(0)?;
+        let device = device.clone();
         let (free, total) = device.ctx.mem_get_info()?;
         ensure!(
             budget > 0 && budget <= total,
@@ -1394,6 +1456,8 @@ impl Flow<bf16> {
             spec,
             rows,
             coordinates: coordinates.to_vec(),
+            projection_grid: Some(grid_side),
+            request: Some(request.clone()),
             steps,
             _inner_weights: bf,
             _f32: fp,
@@ -1750,6 +1814,8 @@ impl Flow<f16> {
             spec,
             rows,
             coordinates: coordinates.to_vec(),
+            projection_grid: None,
+            request: None,
             steps,
             _inner_weights: half,
             _f32: float,
@@ -1927,30 +1993,70 @@ impl<T: FlowElement> Flow<T> {
             global.len() == 2917 * self.spec.cond_channels,
             "device conditioning shape mismatch"
         );
-        if self.device.stream.as_ref() != global.stream().as_ref() {
-            let ready = global.stream().record_event(Some(
-                cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
-            ))?;
-            self.device.stream.wait(&ready)?;
-        }
-        let mut output = self.device.stream.alloc_zeros(global.len())?;
-        let cast = cubin::module(&self.device.ctx, "vision_ops")?
-            .load_function("vision_downcast_f32_to_f16_checked")?;
+        Ok(Conditioning {
+            origin: self.origin.clone(),
+            global: self.cast_conditioning(global)?,
+            projected: self.device.stream.alloc_zeros(0)?,
+            concat: None,
+        })
+    }
+    pub fn conditioning_projected(
+        &self,
+        image: &crate::backend::ProjectedConditioning,
+        views: &[crate::backend::ProjectionCamera],
+    ) -> Result<Conditioning<T>> {
+        let (global, projected) = image.binding(
+            &self.coordinates,
+            crate::backend::PixalConditioningShape {
+                image_side: if self.spec.resolution <= 32 {
+                    512
+                } else {
+                    1024
+                },
+                grid_side: self
+                    .projection_grid
+                    .context("projected conditioning requires grid setup")?,
+                naf_side: self.spec.sparse().then_some(if self.spec.texture() {
+                    1024
+                } else {
+                    512
+                }),
+            },
+            self.request
+                .as_ref()
+                .context("projected conditioning requires request setup")?,
+            views,
+        )?;
+        ensure!(
+            global.len() == 5 * self.spec.cond_channels
+                && projected.len() == self.rows * self.spec.projection_width(),
+            "device projected conditioning shape mismatch"
+        );
+        Ok(Conditioning {
+            origin: self.origin.clone(),
+            global: self.cast_conditioning(global)?,
+            projected: self.cast_conditioning(projected)?,
+            concat: None,
+        })
+    }
+    fn cast_conditioning(&self, input: &CudaSlice<f32>) -> Result<CudaSlice<T>> {
+        wait_input(&self.device, input)?;
+        let mut output = self.device.stream.alloc_zeros(input.len())?;
+        let cast = cubin::module(&self.device.ctx, "vision_ops")?.load_function(if T::HALF {
+            "vision_downcast_f32_to_f16_checked"
+        } else {
+            "vision_downcast_f32_to_bf16_checked"
+        })?;
         unsafe {
             self.device
                 .stream
                 .launch_builder(&cast)
-                .arg(global)
+                .arg(input)
                 .arg(&mut output)
-                .arg(&u32::try_from(global.len())?)
-                .launch(flat(global.len()))?;
+                .arg(&u32::try_from(input.len())?)
+                .launch(flat(input.len()))?;
         }
-        Ok(Conditioning {
-            origin: self.origin.clone(),
-            global: output,
-            projected: self.device.stream.alloc_zeros(0)?,
-            concat: None,
-        })
+        Ok(output)
     }
     pub fn condition_shape(
         &self,
@@ -1968,11 +2074,34 @@ impl<T: FlowElement> Flow<T> {
                 && physical_shape.iter().all(|x| x.is_finite()),
             "invalid shape condition"
         );
+        let values = self.device.stream.clone_htod(physical_shape)?;
+        self.bind_shape(condition, values)
+    }
+    pub fn condition_shape_device(
+        &self,
+        condition: &mut Conditioning<T>,
+        physical_shape: &CudaSlice<f32>,
+        coordinates: &[[i32; 3]],
+    ) -> Result<()> {
+        validate_conditioning_origin(&condition.origin, &self.origin)?;
+        ensure!(
+            coordinates == self.coordinates
+                && physical_shape.len() == self.rows * self.spec.out_channels,
+            "shape condition extent/coordinate mismatch"
+        );
+        let values = self.device.stream.alloc_zeros(physical_shape.len())?;
+        finite_copy(&self.device, physical_shape, &values)?;
+        self.bind_shape(condition, values)
+    }
+    fn bind_shape(
+        &self,
+        condition: &mut Conditioning<T>,
+        mut values: CudaSlice<f32>,
+    ) -> Result<()> {
         let normalization = self
             .normalization
             .as_ref()
             .context("texture flow required")?;
-        let mut values = self.device.stream.clone_htod(physical_shape)?;
         channel_transform(
             &self.device,
             &mut values,
@@ -2449,6 +2578,12 @@ impl Sampler {
             noise.len() > 1 && noise.iter().all(|x| x.is_finite()),
             "invalid flow noise"
         );
+        Self::from_state(d, d.stream.clone_htod(noise)?, guided)
+    }
+    fn from_state(d: &Device, state: CudaSlice<f32>, guided: bool) -> Result<Self> {
+        let count = state.len();
+        ensure!(count > 1, "invalid flow state extent");
+        wait_input(d, &state)?;
         let common = cubin::module(&d.ctx, "q38_common")?;
         let flow = cubin::module(&d.ctx, "flow")?;
         let guided_buffer = |n| -> Result<Option<CudaSlice<f32>>> {
@@ -2459,12 +2594,12 @@ impl Sampler {
             }
         };
         Ok(Self {
-            state: d.stream.clone_htod(noise)?,
-            positive: d.stream.alloc_zeros(noise.len())?,
-            negative: guided_buffer(noise.len())?,
-            velocity: d.stream.alloc_zeros(noise.len())?,
-            x0: guided_buffer(noise.len())?,
-            positive_x0: guided_buffer(noise.len())?,
+            state,
+            positive: d.stream.alloc_zeros(count)?,
+            negative: guided_buffer(count)?,
+            velocity: d.stream.alloc_zeros(count)?,
+            x0: guided_buffer(count)?,
+            positive_x0: guided_buffer(count)?,
             std: guided_buffer(2)?,
             guided: common.load_function("guided_euler_f32")?,
             convert: flow.load_function("flow_x0_f32")?,
@@ -2581,6 +2716,26 @@ impl Flow<bf16> {
         positive: &Conditioning,
         negative: Option<&Conditioning>,
     ) -> Result<Vec<f32>> {
+        ensure!(noise.iter().all(|x| x.is_finite()), "non-finite flow noise");
+        let noise = self.device.stream.clone_htod(noise)?;
+        let state = self.sample_state(noise, positive, negative)?;
+        Ok(self.device.stream.clone_dtoh(&state)?)
+    }
+    pub fn sample_device(
+        &mut self,
+        noise: CudaSlice<f32>,
+        positive: &Conditioning,
+        negative: Option<&Conditioning>,
+    ) -> Result<CudaSlice<f32>> {
+        finite_copy(&self.device, &noise, &noise)?;
+        self.sample_state(noise, positive, negative)
+    }
+    fn sample_state(
+        &mut self,
+        noise: CudaSlice<f32>,
+        positive: &Conditioning,
+        negative: Option<&Conditioning>,
+    ) -> Result<CudaSlice<f32>> {
         validate_conditioning_origin(&positive.origin, &self.origin)?;
         ensure!(
             negative.is_none() == self.spec.texture(),
@@ -2599,7 +2754,7 @@ impl Flow<bf16> {
             .map(|t| (1000.0 * t) as f32)
             .collect();
         self.set_times(&model_times)?;
-        let mut sampler = Sampler::new(&self.device, noise, !self.spec.texture())?;
+        let mut sampler = Sampler::from_state(&self.device, noise, !self.spec.texture())?;
         for step in 0..self.steps {
             self.forward(&sampler.state, step, positive, &mut sampler.positive)?;
             if let Some(negative) = negative.filter(|_| (0.6..=1.0).contains(&times[step])) {
@@ -2625,7 +2780,7 @@ impl Flow<bf16> {
                 false,
             )?;
         }
-        Ok(self.device.stream.clone_dtoh(&sampler.state)?)
+        Ok(sampler.state)
     }
 }
 
