@@ -1690,12 +1690,26 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     let thresholds_file = ref_dir.join("layer45_thresholds.json");
     let thresholds_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&thresholds_file)?)?;
-    let tau_max_abs = thresholds_json["unified"]["tau_max_abs"]
+    let tau_max_abs = thresholds_json
+        .pointer("/logits/unified/tau_max_abs")
+        .or_else(|| thresholds_json.pointer("/unified/tau_max_abs"))
+        .context("tau_max_abs missing")?
         .as_f64()
-        .context("tau_max_abs missing")? as f32;
-    let tau_rmse = thresholds_json["unified"]["tau_rmse"]
+        .context("tau_max_abs not a number")? as f32;
+    let tau_rmse = thresholds_json
+        .pointer("/logits/unified/tau_rmse")
+        .or_else(|| thresholds_json.pointer("/unified/tau_rmse"))
+        .context("tau_rmse missing")?
         .as_f64()
-        .context("tau_rmse missing")? as f32;
+        .context("tau_rmse not a number")? as f32;
+    let tau_weights_max_abs = thresholds_json
+        .pointer("/router_tap/tau_weights_max_abs")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.0028);
+    let tau_weights_rmse = thresholds_json
+        .pointer("/router_tap/tau_weights_rmse")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.0016);
 
     let device = Device::new(0)?;
     unsafe {
@@ -1746,6 +1760,59 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     ensure!(
         synth_graph_diffs == 0,
         "DEFECT synthetic eager vs graph bit difference: {synth_graph_diffs}"
+    );
+
+    let (synth_cand_ids, synth_cand_weights) = runtime
+        .last_route()
+        .context("synthetic router tap missing")?
+        .clone();
+    let synth_expected_ids: Vec<i32> = thresholds_json
+        .pointer("/router_tap/synthetic/normal_ids")
+        .context("synthetic normal_ids missing")?
+        .as_array()
+        .context("normal_ids array missing")?
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
+    let synth_expected_weights: Vec<f32> = thresholds_json
+        .pointer("/router_tap/synthetic/normal_weights")
+        .context("synthetic normal_weights missing")?
+        .as_array()
+        .context("normal_weights array missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let synth_min_margin = thresholds_json
+        .pointer("/router_tap/synthetic/min_margin_8_vs_9")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.011381);
+    let synth_spread = thresholds_json
+        .pointer("/router_tap/synthetic/cross_arm_selection_scores_max_abs")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.005793);
+    if synth_min_margin > synth_spread {
+        ensure!(
+            synth_cand_ids == synth_expected_ids,
+            "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {synth_expected_ids:?}"
+        );
+    }
+    let mut synth_w_max_abs = 0.0f32;
+    let mut synth_w_sum_sq = 0.0f32;
+    for (&cw, &rw) in synth_cand_weights.iter().zip(&synth_expected_weights) {
+        let diff = (cw - rw).abs();
+        if diff > synth_w_max_abs {
+            synth_w_max_abs = diff;
+        }
+        synth_w_sum_sq += diff * diff;
+    }
+    let synth_w_rmse = (synth_w_sum_sq / synth_cand_weights.len() as f32).sqrt();
+    ensure!(
+        synth_w_max_abs <= tau_weights_max_abs,
+        "DEFECT synthetic router weights max_abs={synth_w_max_abs} exceeds tau={tau_weights_max_abs}"
+    );
+    ensure!(
+        synth_w_rmse <= tau_weights_rmse,
+        "DEFECT synthetic router weights rmse={synth_w_rmse} exceeds tau={tau_weights_rmse}"
     );
 
     let mut synth_max_abs = 0.0f32;
@@ -1816,6 +1883,77 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     ensure!(
         prod_graph_diffs == 0,
         "DEFECT production eager vs graph bit difference: {prod_graph_diffs}"
+    );
+
+    let (prod_cand_ids, prod_cand_weights) = runtime
+        .last_route()
+        .context("production router tap missing")?
+        .clone();
+    let prod_expected_ids: Vec<i32> = thresholds_json
+        .pointer("/router_tap/production/normal_ids")
+        .context("production normal_ids missing")?
+        .as_array()
+        .context("normal_ids array missing")?
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
+    let prod_expected_weights: Vec<f32> = thresholds_json
+        .pointer("/router_tap/production/normal_weights")
+        .context("production normal_weights missing")?
+        .as_array()
+        .context("normal_weights array missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let prod_expected_set: std::collections::BTreeSet<i32> = thresholds_json
+        .pointer("/router_tap/production/expected_expert_set")
+        .map(|v| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect()
+        })
+        .unwrap_or_else(|| prod_expected_ids.iter().copied().collect());
+    let prod_min_margin = thresholds_json
+        .pointer("/router_tap/production/min_margin_8_vs_9")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.017159);
+    let prod_spread = thresholds_json
+        .pointer("/router_tap/production/cross_arm_selection_scores_max_abs")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.003126);
+    if prod_min_margin > prod_spread {
+        let prod_cand_set: std::collections::BTreeSet<i32> =
+            prod_cand_ids.iter().copied().collect();
+        ensure!(
+            prod_cand_set == prod_expected_set,
+            "DEFECT production router expert set mismatch: got {prod_cand_set:?}, expected {prod_expected_set:?}"
+        );
+    }
+    let mut prod_exp_map = std::collections::BTreeMap::new();
+    for (&id, &w) in prod_expected_ids.iter().zip(&prod_expected_weights) {
+        prod_exp_map.insert(id, w);
+    }
+    let mut prod_w_max_abs = 0.0f32;
+    let mut prod_w_sum_sq = 0.0f32;
+    for (&id, &cw) in prod_cand_ids.iter().zip(&prod_cand_weights) {
+        if let Some(&rw) = prod_exp_map.get(&id) {
+            let diff = (cw - rw).abs();
+            if diff > prod_w_max_abs {
+                prod_w_max_abs = diff;
+            }
+            prod_w_sum_sq += diff * diff;
+        }
+    }
+    let prod_w_rmse = (prod_w_sum_sq / prod_cand_weights.len() as f32).sqrt();
+    ensure!(
+        prod_w_max_abs <= tau_weights_max_abs,
+        "DEFECT production router weights max_abs={prod_w_max_abs} exceeds tau={tau_weights_max_abs}"
+    );
+    ensure!(
+        prod_w_rmse <= tau_weights_rmse,
+        "DEFECT production router weights rmse={prod_w_rmse} exceeds tau={tau_weights_rmse}"
     );
 
     let mut prod_max_abs = 0.0f32;
@@ -2003,12 +2141,18 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let tau_path = ref_dir.join("verify_thresholds.json");
     let thresholds_raw = std::fs::read_to_string(tau_path)?;
     let thresholds: serde_json::Value = serde_json::from_str(&thresholds_raw)?;
-    let tau_max_abs = thresholds["tau_max_abs"]
-        .as_f64()
-        .context("tau_max_abs missing")? as f32;
-    let tau_rmse = thresholds["tau_rmse"]
-        .as_f64()
-        .context("tau_rmse missing")? as f32;
+    let tau_max_abs_per_pos: Vec<f32> = thresholds["tau_max_abs_per_position"]
+        .as_array()
+        .context("tau_max_abs_per_position missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let tau_rmse_per_pos: Vec<f32> = thresholds["tau_rmse_per_position"]
+        .as_array()
+        .context("tau_rmse_per_position missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
 
     // Establish single-step eager decode reference logits for round 0
     let checkpoint = GraphStepCheckpoint::save(&engine)?;
@@ -2018,6 +2162,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
     let mut accepted_count = 0usize;
     let mut total_rounds = 0usize;
+    let mut verify_compared_count = 0usize;
     let mut emitted_tokens = Vec::with_capacity(600);
     emitted_tokens.push(t0);
 
@@ -2042,6 +2187,8 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
             // Condition 5: run one forced eager draft pass and verify against single-step reference
             let out_eager = engine.glm_mtp_round(true)?;
 
+            let tau_max_abs = tau_max_abs_per_pos[0];
+            let tau_rmse = tau_rmse_per_pos[0];
             let mut row0_max_abs = 0.0f32;
             let mut row0_sum_sq = 0.0f32;
             for (&v, &r) in out_eager.verify_row0_logits.iter().zip(&ref_row0_logits) {
@@ -2054,12 +2201,13 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
             let row0_rmse = (row0_sum_sq / out_eager.verify_row0_logits.len() as f32).sqrt();
             ensure!(
                 row0_max_abs <= tau_max_abs,
-                "DEFECT verify row0 max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
+                "DEFECT verify row0 at pos=0 max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
             );
             ensure!(
                 row0_rmse <= tau_rmse,
-                "DEFECT verify row0 rmse={row0_rmse} exceeds tau={tau_rmse}"
+                "DEFECT verify row0 at pos=0 rmse={row0_rmse} exceeds tau={tau_rmse}"
             );
+            verify_compared_count += 1;
             out_eager
         } else {
             engine.glm_mtp_round(false)?
@@ -2069,6 +2217,35 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         let tokens_in_round = out.round.tokens.len();
         if out.round.accepted > 0 {
             accepted_count += 1;
+        } else if let Some(replay_logits) = &out.replay_row0_logits {
+            let p = out.start_pos;
+            let tau_max_abs = tau_max_abs_per_pos
+                .get(p)
+                .copied()
+                .unwrap_or(tau_max_abs_per_pos[0]);
+            let tau_rmse = tau_rmse_per_pos
+                .get(p)
+                .copied()
+                .unwrap_or(tau_rmse_per_pos[0]);
+            let mut row0_max_abs = 0.0f32;
+            let mut row0_sum_sq = 0.0f32;
+            for (&v, &r) in out.verify_row0_logits.iter().zip(replay_logits) {
+                let diff = (v - r).abs();
+                if diff > row0_max_abs {
+                    row0_max_abs = diff;
+                }
+                row0_sum_sq += diff * diff;
+            }
+            let row0_rmse = (row0_sum_sq / out.verify_row0_logits.len() as f32).sqrt();
+            ensure!(
+                row0_max_abs <= tau_max_abs,
+                "DEFECT verify row0 replay at pos={p} max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
+            );
+            ensure!(
+                row0_rmse <= tau_rmse,
+                "DEFECT verify row0 replay at pos={p} rmse={row0_rmse} exceeds tau={tau_rmse}"
+            );
+            verify_compared_count += 1;
         }
 
         // Verify emitted tokens match argmax of verify rows
@@ -2121,7 +2298,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     );
 
     println!(
-        "PASS GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} alpha={alpha:.4} alpha_star={alpha_star:.4} efficiency_ratio={efficiency_ratio:.4} min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={}",
+        "PASS GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} verify_compared={verify_compared_count} alpha={alpha:.4} alpha_star={alpha_star:.4} efficiency_ratio={efficiency_ratio:.4} min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={}",
         emitted_tokens.len()
     );
     Ok(())

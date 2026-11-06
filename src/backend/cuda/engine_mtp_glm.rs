@@ -316,6 +316,8 @@ pub(crate) struct GlmMtpRuntime {
     pub(crate) logits_buf: CudaSlice<f32>,
     pub(crate) dsa_indices_buf: CudaSlice<i32>,
 
+    pub(crate) last_route: Option<(Vec<i32>, Vec<f32>)>,
+
     #[cfg(test)]
     pub(crate) standalone_dsa: Option<DsaState>,
 }
@@ -750,6 +752,7 @@ impl GlmMtpRuntime {
             head_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
             logits_buf: stream.alloc_zeros::<f32>(154880)?,
             dsa_indices_buf: stream.alloc_zeros::<i32>(2051)?,
+            last_route: None,
             #[cfg(test)]
             standalone_dsa,
         })
@@ -991,7 +994,8 @@ impl GlmMtpRuntime {
             unsafe { TensorMut(Tensor::new(moe_out_ptr, [1, 4096], [4096, 1], 4096 * 2)?) };
 
         self.native_moe.enqueue_route(&stream, x_norm_tensor)?;
-        let (ids, _weights) = self.native_moe.read_route(&stream)?;
+        let (ids, weights) = self.native_moe.read_route(&stream)?;
+        self.last_route = Some((ids.clone(), weights));
         self.stage_routed_experts(&ids)?;
         self.native_moe
             .run(&stream, x_norm_tensor, &moe_out_tensor)?;
@@ -1169,6 +1173,11 @@ impl GlmMtpRuntime {
 
         self.standalone_dsa = Some(dsa);
         Ok(self.stream.clone_dtoh(&self.logits_buf)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_route(&self) -> Option<&(Vec<i32>, Vec<f32>)> {
+        self.last_route.as_ref()
     }
 
     #[cfg(test)]

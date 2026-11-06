@@ -22,6 +22,10 @@ pub(crate) struct GlmMtpRoundOutput {
     #[cfg(test)]
     pub(crate) verify_row1_logits: Vec<f32>,
     #[cfg(test)]
+    pub(crate) replay_row0_logits: Option<Vec<f32>>,
+    #[cfg(test)]
+    pub(crate) start_pos: usize,
+    #[cfg(test)]
     pub(crate) expert_union_count: usize,
     #[cfg(test)]
     pub(crate) v0_margin: f32,
@@ -880,6 +884,8 @@ impl Engine {
                 replayed == v0,
                 "DEFECT replayed token {replayed} differs from verify argmax {v0}"
             );
+            #[cfg(test)]
+            let replay_row0_logits = Some(self.decode_logits()?);
             Round {
                 tokens: vec![v0],
                 proposals: vec![draft_token],
@@ -889,12 +895,19 @@ impl Engine {
             }
         };
 
+        #[cfg(test)]
+        let replay_row0_logits = if accepted { None } else { replay_row0_logits };
+
         Ok(GlmMtpRoundOutput {
             round,
             #[cfg(test)]
             verify_row0_logits: row0_logits,
             #[cfg(test)]
             verify_row1_logits: row1_logits,
+            #[cfg(test)]
+            replay_row0_logits,
+            #[cfg(test)]
+            start_pos,
             #[cfg(test)]
             expert_union_count,
             #[cfg(test)]
