@@ -3329,9 +3329,14 @@ pub struct PixalOutput {
 
 impl PixalGeneration<'_> {
     pub fn run(&self, device: &Device) -> Result<PixalOutput> {
-        self.run_observed(device, |_, _, _, _| Ok(()))
+        self.run_observed(device, usize::MAX, |_, _, _, _| Ok(()))
     }
-    fn run_observed<F>(&self, device: &Device, mut observe: F) -> Result<PixalOutput>
+    fn run_observed<F>(
+        &self,
+        device: &Device,
+        retention_limit: usize,
+        mut observe: F,
+    ) -> Result<PixalOutput>
     where
         F: FnMut(usize, u32, &[[i32; 3]], &CudaSlice<f32>) -> Result<()>,
     {
@@ -3417,10 +3422,14 @@ impl PixalGeneration<'_> {
         #[cfg(test)]
         decoder_pass_contract(decoder.decode_passes.get())?;
         let required = self.following_peak(&pipeline, high.coordinates().len(), resolution / 16)?;
-        let available = self.budget(device)?;
+        let measured = self.budget(device)?;
+        let available = measured.min(retention_limit);
         let keep = required <= available;
         #[cfg(test)]
         {
+            if retention_limit == 0 {
+                ensure!(!keep, "test retention cap was ignored");
+            }
             let weight_bytes = decoder
                 .weights
                 .half
@@ -3434,7 +3443,7 @@ impl PixalGeneration<'_> {
                     .map(CudaSlice::num_bytes)
                     .sum::<usize>();
             println!(
-                "P1_M4C_STAGING required_bytes={required} available_bytes={available} retained_shape_decoder={keep} avoided_weight_upload_bytes={}",
+                "P1_M4C_STAGING required_bytes={required} measured_bytes={measured} available_bytes={available} retained_shape_decoder={keep} avoided_weight_upload_bytes={}",
                 if keep { weight_bytes } else { 0 }
             );
         }

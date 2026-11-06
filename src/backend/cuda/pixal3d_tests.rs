@@ -7095,7 +7095,7 @@ fn generation_measurement(
     }
     let union = coordinates.len() + sites.coordinates().len() - common;
     println!(
-        "P1_M4C_CHAIN_MEASUREMENT name={name} native_rows={} reference_rows={} common={common} jaccard_disagreement={} reference_pair_jaccard_disagreement=0.5926020937353391 common_max_abs={maximum} common_rmse={} gating=false",
+        "P1_M4C_CHAIN_MEASUREMENT name={name} native_rows={} reference_rows={} common={common} jaccard_disagreement={} prior_decoder_full_grid_reference_pair_jaccard_disagreement=0.5926020937353391 common_max_abs={maximum} common_rmse={} gating=false",
         coordinates.len(),
         sites.coordinates().len(),
         1.0 - common as f64 / union as f64,
@@ -7294,34 +7294,40 @@ fn generation_run(
     let name = case["case"].as_str().context("case name")?;
     let mut seen = Vec::new();
     let mut grids = Vec::new();
-    let result = generation.run_observed(device, |stage, grid, coordinates, data| {
-        ensure!(stage == seen.len(), "missing or repeated flow stage");
-        seen.push(stage);
-        grids.push(grid);
-        let actual = device.stream.clone_dtoh(data)?;
-        ensure!(
-            actual.iter().all(|v| v.is_finite()),
-            "nonfinite stage output"
-        );
-        let shape = if stage == 0 {
-            vec![1, 8, 16, 16, 16]
-        } else {
-            vec![coordinates.len(), 32]
-        };
-        generation_capture(
-            &output_dir.join(format!("stage{stage}.safetensors")),
-            coordinates,
-            &actual,
-            shape,
-        )?;
-        generation_measurement(case, stage, coordinates, &actual, freeze)?;
-        println!(
-            "P1_M4C_STAGE PASS case={name} stage={stage} grid={grid} rows={} values={}",
-            coordinates.len(),
-            actual.len()
-        );
-        Ok(())
-    })?;
+    let retention_limit = if name == "cottage-1024" {
+        0
+    } else {
+        usize::MAX
+    };
+    let result =
+        generation.run_observed(device, retention_limit, |stage, grid, coordinates, data| {
+            ensure!(stage == seen.len(), "missing or repeated flow stage");
+            seen.push(stage);
+            grids.push(grid);
+            let actual = device.stream.clone_dtoh(data)?;
+            ensure!(
+                actual.iter().all(|v| v.is_finite()),
+                "nonfinite stage output"
+            );
+            let shape = if stage == 0 {
+                vec![1, 8, 16, 16, 16]
+            } else {
+                vec![coordinates.len(), 32]
+            };
+            generation_capture(
+                &output_dir.join(format!("stage{stage}.safetensors")),
+                coordinates,
+                &actual,
+                shape,
+            )?;
+            generation_measurement(case, stage, coordinates, &actual, freeze)?;
+            println!(
+                "P1_M4C_STAGE PASS case={name} stage={stage} grid={grid} rows={} values={}",
+                coordinates.len(),
+                actual.len()
+            );
+            Ok(())
+        })?;
     ensure!(
         seen == [0, 1, 2, 3] && grids == [16, 32, result.resolution / 16, result.resolution / 16],
         "stage/grid integration mismatch"
