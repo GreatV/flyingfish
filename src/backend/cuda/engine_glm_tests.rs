@@ -2566,7 +2566,7 @@ fn glm_mtp_census_gpu() -> Result<()> {
         let elements: u64 = shape.iter().map(|&d| d as u64).product();
         let bytes_per_element = match dtype {
             safetensors::Dtype::BF16 => 2u64,
-            safetensors::Dtype::F8_E4M3 => 2u64,
+            safetensors::Dtype::F8_E4M3 => 1u64,
             safetensors::Dtype::F32 => 4u64,
             _ => 2u64,
         };
