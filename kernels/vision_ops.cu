@@ -1397,10 +1397,10 @@ extern "C" __global__ void batch_group_moments_finish_f32(
     }
 }
 
-template<class T>
+template<class T, class O>
 __device__ __forceinline__ void batch_group_norm(
     const T* input, const uint32_t* offsets, const float* moments,
-    const float* weight, const float* bias, T* output,
+    const float* weight, const float* bias, O* output,
     uint32_t batches, uint32_t channels, uint32_t groups) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.y != batches || gridDim.z != 1 || !input || !offsets || !moments ||
@@ -1414,7 +1414,7 @@ __device__ __forceinline__ void batch_group_norm(
         const uint64_t at = uint64_t(first) * channels + i;
         const float centered = __fsub_rn(float(input[at]), moments[2 * bg]);
         const float normalized = __fmul_rn(centered, moments[2 * bg + 1]);
-        output[at] = T(__fadd_rn(__fmul_rn(normalized, weight[channel]), bias[channel]));
+        output[at] = O(__fadd_rn(__fmul_rn(normalized, weight[channel]), bias[channel]));
     }
 }
 
@@ -1428,6 +1428,13 @@ extern "C" __global__ void batch_group_norm_f32(
 extern "C" __global__ void batch_group_norm_f16(
     const __half* input, const uint32_t* offsets, const float* moments,
     const float* weight, const float* bias, __half* output,
+    uint32_t batches, uint32_t channels, uint32_t groups) {
+    batch_group_norm(input, offsets, moments, weight, bias, output, batches, channels, groups);
+}
+
+extern "C" __global__ void batch_group_norm_f16_to_f32(
+    const __half* input, const uint32_t* offsets, const float* moments,
+    const float* weight, const float* bias, float* output,
     uint32_t batches, uint32_t channels, uint32_t groups) {
     batch_group_norm(input, offsets, moments, weight, bias, output, batches, channels, groups);
 }
@@ -1449,6 +1456,23 @@ extern "C" __global__ void swish_rounded_f16(const __half* input, __half* output
 
 extern "C" __global__ void swish_rounded_f32(const float* input, float* output, uint64_t count) {
     swish_rounded(input, output, count);
+}
+
+extern "C" __global__ void residual_add_f16_to_f32(
+    float* residual, const __half* branch, uint64_t count) {
+    if (!vision_flat_launch() || !residual || !branch || !count) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256)
+        residual[i] = __fadd_rn(residual[i], __half2float(branch[i]));
+}
+
+extern "C" __global__ void corner_attributes_f32(float* fields, uint32_t rows) {
+    if (!vision_flat_launch() || !fields || !rows) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * 32;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t at = (i / 32) * 40 + 8 + i % 32;
+        fields[at] = tanhf(fields[at]);
+    }
 }
 
 extern "C" __global__ void channel_to_spatial_f16(

@@ -331,7 +331,7 @@ pub struct TreeMetadata {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda::pixal3d::{PixalDecoder, SparseDecoderOutput};
+pub use cuda::pixal3d::{CornerDecoderOutput, PixalDecoder, SparseDecoderOutput};
 #[cfg(feature = "cuda")]
 pub use cuda::sparse::{BatchGroupNorm, SparseConv};
 

@@ -396,12 +396,24 @@ fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
                     let input: Vec<_> = input.iter().map(|&x| f16::from_f32(x)).collect();
                     let input = d.stream.clone_htod(&input)?;
                     let mut output = d.stream.alloc_zeros::<f16>(n * co)?;
-                    conv.run_promoted(&blas, &input, weight, bias, &mut output)?;
+                    conv.run_promoted(
+                        &blas,
+                        matrix::<f16>(ptr(&input, &d), n, ci)?,
+                        weight,
+                        bias,
+                        &mut TensorMut(matrix::<f16>(ptr(&output, &d), n, co)?),
+                    )?;
                     selected_half(&d, &output, &rows, co)?
                 } else {
                     let input = d.stream.clone_htod(&input)?;
                     let mut output = d.stream.alloc_zeros::<f32>(n * co)?;
-                    conv.run_promoted(&blas, &input, weight, bias, &mut output)?;
+                    conv.run_promoted(
+                        &blas,
+                        matrix::<f32>(ptr(&input, &d), n, ci)?,
+                        weight,
+                        bias,
+                        &mut TensorMut(matrix::<f32>(ptr(&output, &d), n, co)?),
+                    )?;
                     let output = d.stream.clone_dtoh(&output)?;
                     rows.iter()
                         .flat_map(|&r| output[r * co..(r + 1) * co].iter().map(|&x| x as f64))
@@ -440,7 +452,7 @@ fn normalized_features<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
     let x = d.stream.clone_htod(&input)?;
     drop(input);
     let output = d.stream.alloc_zeros::<T>(n * c)?;
-    plan.run::<T>(
+    plan.run::<T, T>(
         matrix(ptr(&x, d), n, c)?,
         [
             view(affine[0], &d.stream, 0, [c as u32], [1])?,
@@ -693,7 +705,8 @@ fn hi3d_serialized_attention_definition_gpu() -> Result<()> {
                 if control {
                     maps.pad = control_pad.values.iter().map(|&v| v as u32).collect();
                 }
-                let output = decoder.serialized_qkv(&maps, &qkv, order)?;
+                let output =
+                    decoder.serialized_qkv(&maps, matrix::<f16>(ptr(&qkv, d), n, 1536)?, order)?;
                 let values: Vec<_> = d
                     .stream
                     .clone_dtoh(&output)?

@@ -388,6 +388,13 @@ pub struct DecoderCheckpoint {
     pub runtime_bytes: usize,
 }
 impl DecoderKind {
+    pub(crate) fn validate_point_rows(rows: usize) -> Result<()> {
+        ensure!(
+            (1..=12_000_000).contains(&rows),
+            "point residual stage requires 1..=12000000 sites"
+        );
+        Ok(())
+    }
     pub fn stem(self) -> &'static str {
         match self {
             Self::Structure => "ss_dec_conv3d_16l8_fp16",
@@ -599,10 +606,10 @@ impl DecoderKind {
         for (name, input, output, bias) in linears {
             tensors.insert(
                 format!("{name}.weight"),
-                (vec![output, input], Dtype::F32, true),
+                (vec![output, input], Dtype::F32, false),
             );
             if bias {
-                tensors.insert(format!("{name}.bias"), (vec![output], Dtype::F32, true));
+                tensors.insert(format!("{name}.bias"), (vec![output], Dtype::F32, false));
             }
         }
         tensors
@@ -725,15 +732,24 @@ mod tests {
     #[test]
     #[ignore = "requires FF_HI3D_MODEL; CPU only"]
     fn hi3d_decoder_checkpoint_cpu() -> Result<()> {
+        DecoderKind::validate_point_rows(12_000_000)?;
+        ensure!(
+            DecoderKind::validate_point_rows(12_000_001).is_err(),
+            "unsupported residual branch accepted"
+        );
         let root = std::env::var_os("FF_HI3D_MODEL").context("FF_HI3D_MODEL required")?;
         let checkpoint =
             DecoderCheckpoint::open(&Path::new(&root).join("vae"), DecoderKind::PointTransformer)?;
         ensure!(
-            checkpoint.runtime_bytes == 376_614_208,
-            "published decoder byte count"
+            checkpoint.runtime_bytes == 357_128_768,
+            "decoder runtime byte count"
         );
         let mut tensors = checkpoint.mapped.component_tensors()?;
         ensure!(tensors.len() == 144, "published decoder tensor count");
+        ensure!(
+            tensors.values().map(|t| t.data.len()).sum::<usize>() == 376_614_208,
+            "published decoder byte count"
+        );
         let name = "decoder.z_to_f.conv.0.weight";
         let original = tensors[name].shape.clone();
         tensors.get_mut(name).context("convolution missing")?.shape = vec![512, 1, 9, 3, 32];
@@ -845,7 +861,7 @@ mod tests {
             );
         }
         println!(
-            "PASS HI3D_DECODER_LOAD tensors=144 published_bytes=376614208 convolutions=27 child_tables=3 missing=0 unexpected=0 initialized=0 physical_extent_control=rejected child_axis_control=rejected"
+            "PASS HI3D_DECODER_LOAD tensors=144 published_bytes=376614208 runtime_bytes=357128768 CPU_child_bytes=576 convolutions=27 child_tables=3 missing=0 unexpected=0 initialized=0 physical_extent_control=rejected child_axis_control=rejected"
         );
         Ok(())
     }

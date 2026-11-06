@@ -21,7 +21,7 @@ pub struct BatchGroupNorm {
     moments: CudaSlice<f32>,
     reduce: [CudaFunction; 2],
     finish: CudaFunction,
-    apply: [CudaFunction; 2],
+    apply: [CudaFunction; 3],
     rows: u32,
     channels: u32,
     groups: u32,
@@ -69,6 +69,7 @@ impl BatchGroupNorm {
         let apply = [
             module.load_function("batch_group_norm_f32")?,
             module.load_function("batch_group_norm_f16")?,
+            module.load_function("batch_group_norm_f16_to_f32")?,
         ];
         let resident = reduce
             .iter()
@@ -160,16 +161,18 @@ impl BatchGroupNorm {
             eps,
         })
     }
-    pub fn run<T: DeviceRepr + Copy + 'static>(
+    pub fn run<I: DeviceRepr + Copy + 'static, O: DeviceRepr + Copy + 'static>(
         &self,
-        input: Tensor<T, 2>,
+        input: Tensor<I, 2>,
         affine: [Tensor<f32, 1>; 2],
-        output: &mut TensorMut<T, 2>,
+        output: &mut TensorMut<O, 2>,
     ) -> Result<()> {
         use std::any::TypeId;
-        let half = TypeId::of::<T>() == TypeId::of::<f16>();
+        let half = TypeId::of::<I>() == TypeId::of::<f16>();
+        let output_half = TypeId::of::<O>() == TypeId::of::<f16>();
         ensure!(
-            half || TypeId::of::<T>() == TypeId::of::<f32>(),
+            (half || TypeId::of::<I>() == TypeId::of::<f32>())
+                && (TypeId::of::<O>() == TypeId::of::<f32>() || (half && output_half)),
             "batch group norm requires F16 or F32 features"
         );
         input.validate()?;
@@ -220,7 +223,13 @@ impl BatchGroupNorm {
                 .arg(&self.eps)
                 .launch(flat(self.batches as usize * self.groups as usize))?;
             stream
-                .launch_builder(&self.apply[usize::from(half)])
+                .launch_builder(
+                    &self.apply[if half && !output_half {
+                        2
+                    } else {
+                        usize::from(half)
+                    }],
+                )
                 .arg(&input.ptr)
                 .arg(&self.offsets)
                 .arg(&self.moments)
@@ -660,10 +669,10 @@ impl SparseConv<f32> {
     pub fn run_promoted<I: DeviceRepr + Copy + 'static, O: DeviceRepr + Copy + 'static>(
         &self,
         blas: &Blas,
-        input: &CudaSlice<I>,
+        input: Tensor<I, 2>,
         weight: Tensor<f32, 2>,
         bias: Tensor<f32, 1>,
-        output: &mut CudaSlice<O>,
+        output: &mut TensorMut<O, 2>,
     ) -> Result<()> {
         use std::any::TypeId;
         weight.validate()?;
@@ -688,8 +697,13 @@ impl SparseConv<f32> {
             "promoted sparse weights must retain published [Co,27Ci] layout"
         );
         let channels = width / 27;
+        input.validate()?;
+        output.0.validate()?;
         ensure!(
-            input.len() == self.rows * channels && output.len() == self.rows * out,
+            input.shape == [self.rows as u32, channels as u32]
+                && input.stride == [channels as u64, 1]
+                && output.0.shape == [self.rows as u32, out as u32]
+                && output.0.stride == [out as u64, 1],
             "promoted sparse feature extent mismatch"
         );
         let result_offset = self.tile * 27 * self.channels;
@@ -698,23 +712,9 @@ impl SparseConv<f32> {
             "promoted sparse result tile exceeds workspace"
         );
         let stream = &self.device.stream;
-        let input_view = view(
-            input,
-            stream,
-            0,
-            [self.rows as u32, channels as u32],
-            [channels as u64, 1],
-        )?;
-        let output_view = view(
-            output,
-            stream,
-            0,
-            [self.rows as u32, out as u32],
-            [out as u64, 1],
-        )?;
-        no_overlap(&input_view, &output_view, "sparse input", "sparse output")?;
-        no_overlap(&weight, &output_view, "sparse weight", "sparse output")?;
-        no_overlap(&bias, &output_view, "sparse bias", "sparse output")?;
+        no_overlap(&input, &output.0, "sparse input", "sparse output")?;
+        no_overlap(&weight, &output.0, "sparse weight", "sparse output")?;
+        no_overlap(&bias, &output.0, "sparse bias", "sparse output")?;
         let gather = if input_half {
             self.half_gather
                 .as_ref()
@@ -734,7 +734,7 @@ impl SparseConv<f32> {
             unsafe {
                 stream
                     .launch_builder(gather)
-                    .arg(input)
+                    .arg(&input.ptr)
                     .arg(&self.neighbours)
                     .arg(self.columns.as_ref())
                     .arg(&(self.rows as u32))
@@ -763,7 +763,7 @@ impl SparseConv<f32> {
                     .launch_builder(store)
                     .arg(&product.ptr)
                     .arg(&bias.ptr)
-                    .arg(&*output)
+                    .arg(&output.0.ptr)
                     .arg(&(first as u64))
                     .arg(&(rows as u32))
                     .arg(&(out as u32))
