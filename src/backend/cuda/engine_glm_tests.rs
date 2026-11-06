@@ -447,22 +447,22 @@ fn glm_mtp_router_bias_precision_discriminating_cpu() -> Result<()> {
         .collect();
 
     let route = |biases: &[f32]| -> Vec<(usize, f32)> {
-        let mut scores: Vec<(usize, f32)> = router_logits
+        let mut scores: Vec<(usize, f32, f32)> = router_logits
             .iter()
             .zip(biases.iter())
             .enumerate()
             .map(|(i, (&l, &b))| {
-                let logit = l + b;
-                let s = 1.0f32 / (1.0f32 + (-logit).exp());
-                (i, s)
+                let s = 1.0f32 / (1.0f32 + (-l).exp());
+                let select = s + b;
+                (i, s, select)
             })
             .collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(8);
-        let sum: f32 = scores.iter().map(|(_, s)| s).sum();
+        let sum: f32 = scores.iter().map(|(_, s, _)| s).sum();
         scores
             .into_iter()
-            .map(|(i, s)| (i, (s / sum) * 2.5))
+            .map(|(i, s, _)| (i, (s / sum) * 2.5))
             .collect()
     };
 
@@ -1690,10 +1690,10 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     let thresholds_file = ref_dir.join("layer45_thresholds.json");
     let thresholds_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&thresholds_file)?)?;
-    let tau_max_abs = thresholds_json["frozen_thresholds"]["tau_max_abs"]
+    let tau_max_abs = thresholds_json["unified"]["tau_max_abs"]
         .as_f64()
         .context("tau_max_abs missing")? as f32;
-    let tau_rmse = thresholds_json["frozen_thresholds"]["tau_rmse"]
+    let tau_rmse = thresholds_json["unified"]["tau_rmse"]
         .as_f64()
         .context("tau_rmse missing")? as f32;
 
@@ -1712,15 +1712,22 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     // 1. Synthetic case
     let synth_inputs = std::fs::read(ref_dir.join("common_inputs.safetensors"))?;
     let synth_st = safetensors::SafeTensors::deserialize(&synth_inputs)?;
+    let synth_tokens: Vec<u32> = synth_st
+        .tensor("history_tokens")?
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
     let synth_hidden: Vec<bf16> = synth_st
-        .tensor("target_hidden")?
+        .tensor("history_hidden")?
         .data()
         .as_chunks::<2>()
         .0
         .iter()
         .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
         .collect();
-    let synth_token = 785u32;
     let synth_ref_bytes = std::fs::read(ref_dir.join("logits_cpu.fp32"))?;
     let synth_ref_logits: Vec<f32> = synth_ref_bytes
         .as_chunks::<4>()
@@ -1729,8 +1736,8 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
-    let synth_eager = runtime.forward(synth_token, &synth_hidden, false, &blas)?;
-    let synth_graph = runtime.forward_graph(synth_token, &synth_hidden, false, &blas)?;
+    let synth_eager = runtime.forward(&synth_tokens, &synth_hidden, false, &blas)?;
+    let synth_graph = runtime.forward_graph(&synth_tokens, &synth_hidden, false, &blas)?;
     let synth_graph_diffs = synth_eager
         .iter()
         .zip(&synth_graph)
@@ -1760,7 +1767,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "DEFECT synthetic rmse={synth_rmse} exceeds tau={tau_rmse}"
     );
 
-    let synth_swapped = runtime.forward(synth_token, &synth_hidden, true, &blas)?;
+    let synth_swapped = runtime.forward(&synth_tokens, &synth_hidden, true, &blas)?;
     let mut synth_swap_delta = 0.0f32;
     let mut synth_swap_sum_sq = 0.0f32;
     for (&swapped, &refer) in synth_swapped.iter().zip(&synth_ref_logits) {
@@ -1775,15 +1782,22 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     // 2. Production case
     let prod_inputs = std::fs::read(ref_dir.join("common_inputs_production.safetensors"))?;
     let prod_st = safetensors::SafeTensors::deserialize(&prod_inputs)?;
+    let prod_tokens: Vec<u32> = prod_st
+        .tensor("history_tokens")?
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
     let prod_hidden: Vec<bf16> = prod_st
-        .tensor("target_hidden")?
+        .tensor("history_hidden")?
         .data()
         .as_chunks::<2>()
         .0
         .iter()
         .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
         .collect();
-    let prod_token = 279u32;
     let prod_ref_bytes = std::fs::read(ref_dir.join("logits_production_cpu.fp32"))?;
     let prod_ref_logits: Vec<f32> = prod_ref_bytes
         .as_chunks::<4>()
@@ -1792,8 +1806,8 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
-    let prod_eager = runtime.forward(prod_token, &prod_hidden, false, &blas)?;
-    let prod_graph = runtime.forward_graph(prod_token, &prod_hidden, false, &blas)?;
+    let prod_eager = runtime.forward(&prod_tokens, &prod_hidden, false, &blas)?;
+    let prod_graph = runtime.forward_graph(&prod_tokens, &prod_hidden, false, &blas)?;
     let prod_graph_diffs = prod_eager
         .iter()
         .zip(&prod_graph)
@@ -1823,7 +1837,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "DEFECT production rmse={prod_rmse} exceeds tau={tau_rmse}"
     );
 
-    let prod_swapped = runtime.forward(prod_token, &prod_hidden, true, &blas)?;
+    let prod_swapped = runtime.forward(&prod_tokens, &prod_hidden, true, &blas)?;
     let mut prod_swap_delta = 0.0f32;
     let mut prod_swap_sum_sq = 0.0f32;
     for (&swapped, &refer) in prod_swapped.iter().zip(&prod_ref_logits) {
@@ -1983,7 +1997,10 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let t0 = engine.prefill(&reference.tokens[..1], None)?;
 
     // Read frozen verify thresholds (tau)
-    let tau_path = "/home/greatx/ff-work/bigmodels/reference/layer45_ref/verify_thresholds.json";
+    let ref_dir = PathBuf::from(
+        std::env::var_os("FF_GLM_MTP_REF_DIR").context("FF_GLM_MTP_REF_DIR missing")?,
+    );
+    let tau_path = ref_dir.join("verify_thresholds.json");
     let thresholds_raw = std::fs::read_to_string(tau_path)?;
     let thresholds: serde_json::Value = serde_json::from_str(&thresholds_raw)?;
     let tau_max_abs = thresholds["tau_max_abs"]

@@ -732,11 +732,18 @@ impl Engine {
             .glm_runtime
             .as_mut()
             .context("GLM MTP runtime missing")?;
+        let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
+        let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
+
         let (draft_token, _draft_logits) = glm_runtime.step_draft_device(
             anchor_token,
             &self.work.x,
             force_eager_draft,
             &self.blas,
+            self.weights.embedding(),
+            &self.weights.head,
+            dsa_state,
+            start_pos,
         )?;
         #[cfg(test)]
         let draft_token = if let Some(forces) = &chain.force_proposals {
@@ -745,26 +752,7 @@ impl Engine {
             draft_token
         };
 
-        // 2. Write Layer 45 state into mtp_state.dsa[0]
-        let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
-        if let Some(dsa_state) = mtp_state.dsa.get_mut(0) {
-            let num_slots = dsa_state.latent.len() / 512;
-            let row_offset = (start_pos % num_slots) * 512;
-            stream.memcpy_dtod(
-                &glm_runtime.kv_a_buf,
-                &mut dsa_state.latent.slice_mut(row_offset..row_offset + 512),
-            )?;
-            let token_offset = start_pos % dsa_state.token_ids.len();
-            stream.memcpy_htod(
-                &[draft_token as i32],
-                &mut dsa_state
-                    .token_ids
-                    .slice_mut(token_offset..token_offset + 1),
-            )?;
-            stream.memcpy_htod(&[start_pos as i32, 1], &mut dsa_state.meta.slice_mut(..2))?;
-        }
-
-        // 3. Save pre-verify snapshot (both target model and Layer 45)
+        // 2. Save pre-verify snapshot (both target model and Layer 45)
         chain.target_checkpoint.save_rows(
             &self.state,
             &self.work.token,
