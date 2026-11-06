@@ -1251,6 +1251,59 @@ extern "C" __global__ void sparse_gather_f16(
     }
 }
 
+template<class T>
+__device__ __forceinline__ void sparse_gather_promoted(
+    const T* x, const int32_t* neighbours, float* columns,
+    uint32_t sites, uint32_t channels, uint32_t first, uint32_t rows) {
+    if (!vision_flat_launch() || !x || !neighbours || !columns || !sites || !channels ||
+        !rows || uint64_t(first) + rows > sites) { __trap(); return; }
+    const uint64_t width = uint64_t(27) * channels, count = uint64_t(rows) * width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t row = first + uint32_t(i / width);
+        const uint32_t tap = uint32_t((i % width) / channels), channel = uint32_t(i % channels);
+        const int32_t source = neighbours[uint64_t(row) * 27 + tap];
+        if (source < -1 || (source >= 0 && uint32_t(source) >= sites)) { __trap(); return; }
+        columns[i] = source < 0 ? 0.0f : float(x[uint64_t(source) * channels + channel]);
+    }
+}
+
+extern "C" __global__ void sparse_gather_f32(
+    const float* x, const int32_t* neighbours, float* columns,
+    uint32_t sites, uint32_t channels, uint32_t first, uint32_t rows) {
+    sparse_gather_promoted(x, neighbours, columns, sites, channels, first, rows);
+}
+
+extern "C" __global__ void sparse_gather_f16_to_f32(
+    const __half* x, const int32_t* neighbours, float* columns,
+    uint32_t sites, uint32_t channels, uint32_t first, uint32_t rows) {
+    sparse_gather_promoted(x, neighbours, columns, sites, channels, first, rows);
+}
+
+template<class T>
+__device__ __forceinline__ void sparse_conv_store(
+    const float* product, const float* bias, T* output,
+    uint64_t first, uint32_t rows, uint32_t channels) {
+    if (!vision_flat_launch() || !product || !bias || !output || !rows || !channels) { __trap(); return; }
+    const uint64_t count = uint64_t(rows) * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        output[first * channels + i] = T(__fadd_rn(product[i], bias[i % channels]));
+    }
+}
+
+extern "C" __global__ void sparse_conv_store_f32(
+    const float* product, const float* bias, float* output,
+    uint64_t first, uint32_t rows, uint32_t channels) {
+    sparse_conv_store(product, bias, output, first, rows, channels);
+}
+
+extern "C" __global__ void sparse_conv_store_f16(
+    const float* product, const float* bias, __half* output,
+    uint64_t first, uint32_t rows, uint32_t channels) {
+    sparse_conv_store(product, bias, output, first, rows, channels);
+}
+
 extern "C" __global__ void channel_to_spatial_f16(
     const __half* x, const uint32_t* source, __half* y,
     uint32_t parents, uint32_t rows, uint32_t input_channels, uint32_t channels, int add) {

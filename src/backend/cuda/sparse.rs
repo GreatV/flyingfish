@@ -7,7 +7,7 @@ use super::{
     ops::{flat, grid},
 };
 use crate::{
-    backend::gpu::{CudaFunction, CudaSlice, PushKernelArg},
+    backend::gpu::{CudaFunction, CudaSlice, DeviceRepr, PushKernelArg},
     sparse::{SparseMesh, SparseSites},
 };
 use anyhow::{Context, Result, ensure};
@@ -205,12 +205,14 @@ pub(crate) fn mesh_from_dual(
     })
 }
 
-pub struct SparseConv {
+pub struct SparseConv<T = f16> {
     device: Device,
     neighbours: CudaSlice<i32>,
-    columns: Rc<CudaSlice<f16>>,
+    columns: Rc<CudaSlice<T>>,
     gather: CudaFunction,
     bias: CudaFunction,
+    half_gather: Option<CudaFunction>,
+    half_store: Option<CudaFunction>,
     rows: usize,
     channels: usize,
     tile: usize,
@@ -268,26 +270,12 @@ impl SparseConv {
             columns,
             gather: cubin::module(&device.ctx, "vision_ops")?.load_function("sparse_gather_f16")?,
             bias: cubin::module(&device.ctx, "q38_common")?.load_function("q38_bias_fill_f16")?,
+            half_gather: None,
+            half_store: None,
             rows,
             channels,
             tile,
         })
-    }
-    pub(crate) fn workspace_bytes(&self) -> usize {
-        self.neighbours.len() * size_of::<i32>() + self.columns.len() * size_of::<f16>()
-    }
-    #[cfg(test)]
-    pub(crate) fn replace_neighbours(&mut self, maps: &[[i32; 27]]) -> Result<()> {
-        ensure!(
-            maps.len() == self.rows
-                && maps
-                    .iter()
-                    .flatten()
-                    .all(|&r| r >= -1 && r < self.rows as i32),
-            "invalid sparse neighbor map"
-        );
-        self.neighbours = self.device.stream.clone_htod(maps.as_flattened())?;
-        Ok(())
     }
     pub fn run(
         &self,
@@ -368,6 +356,193 @@ impl SparseConv {
                     .launch(flat(rows * out))?;
             }
             blas.linear_f16(weight, x, &mut TensorMut(y), true)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T> SparseConv<T> {
+    pub(crate) fn workspace_bytes(&self) -> usize {
+        self.neighbours.len() * size_of::<i32>() + self.columns.len() * size_of::<T>()
+    }
+    #[cfg(test)]
+    pub(crate) fn replace_neighbours(&mut self, maps: &[[i32; 27]]) -> Result<()> {
+        ensure!(
+            maps.len() == self.rows
+                && maps
+                    .iter()
+                    .flatten()
+                    .all(|&r| r >= -1 && r < self.rows as i32),
+            "invalid sparse neighbor map"
+        );
+        self.neighbours = self.device.stream.clone_htod(maps.as_flattened())?;
+        Ok(())
+    }
+}
+
+impl SparseConv<f32> {
+    pub fn promoted(
+        device: &Device,
+        sites: &SparseSites,
+        channels: [usize; 2],
+        workspace_budget: usize,
+    ) -> Result<Self> {
+        let rows = sites.coordinates().len();
+        let [input, output] = channels;
+        ensure!(
+            input > 0
+                && output > 0
+                && input <= i32::MAX as usize / 27
+                && output <= i32::MAX as usize,
+            "invalid promoted sparse channels"
+        );
+        let width = 27 * input;
+        let map_bytes = rows
+            .checked_mul(27 * size_of::<i32>())
+            .context("sparse map size overflow")?;
+        let row_bytes = width
+            .checked_add(output)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .context("sparse workspace width overflow")?;
+        let (free, _) = device.ctx.mem_get_info()?;
+        let available = workspace_budget
+            .min(free)
+            .checked_sub(map_bytes)
+            .context("sparse map exceeds workspace budget")?;
+        let tile = (available / row_bytes)
+            .min(rows)
+            .min(i32::MAX as usize / width)
+            .min(i32::MAX as usize / output);
+        ensure!(tile > 0, "promoted sparse workspace cannot fit one row");
+        let columns = Rc::new(device.stream.alloc_zeros::<f32>(tile * (width + output))?);
+        let maps = sites.neighbours_3x3()?;
+        let neighbours = device.stream.clone_htod(maps.as_flattened())?;
+        let module = cubin::module(&device.ctx, "vision_ops")?;
+        Ok(Self {
+            device: device.clone(),
+            neighbours,
+            columns,
+            gather: module.load_function("sparse_gather_f32")?,
+            bias: module.load_function("sparse_conv_store_f32")?,
+            half_gather: Some(module.load_function("sparse_gather_f16_to_f32")?),
+            half_store: Some(module.load_function("sparse_conv_store_f16")?),
+            rows,
+            channels: input,
+            tile,
+        })
+    }
+    pub fn run_promoted<I: DeviceRepr + Copy + 'static, O: DeviceRepr + Copy + 'static>(
+        &self,
+        blas: &Blas,
+        input: &CudaSlice<I>,
+        weight: Tensor<f32, 2>,
+        bias: Tensor<f32, 1>,
+        output: &mut CudaSlice<O>,
+    ) -> Result<()> {
+        use std::any::TypeId;
+        weight.validate()?;
+        bias.validate()?;
+        let input_half = TypeId::of::<I>() == TypeId::of::<f16>();
+        let output_half = TypeId::of::<O>() == TypeId::of::<f16>();
+        ensure!(
+            (input_half || TypeId::of::<I>() == TypeId::of::<f32>())
+                && (output_half || TypeId::of::<O>() == TypeId::of::<f32>()),
+            "promoted sparse features must be F16 or F32"
+        );
+        let width = weight.shape[1] as usize;
+        let out = weight.shape[0] as usize;
+        ensure!(
+            width > 0
+                && width.is_multiple_of(27)
+                && width / 27 <= self.channels
+                && out > 0
+                && weight.stride == [width as u64, 1]
+                && bias.shape == [out as u32]
+                && bias.stride == [1],
+            "promoted sparse weights must retain published [Co,27Ci] layout"
+        );
+        let channels = width / 27;
+        ensure!(
+            input.len() == self.rows * channels && output.len() == self.rows * out,
+            "promoted sparse feature extent mismatch"
+        );
+        let result_offset = self.tile * 27 * self.channels;
+        ensure!(
+            self.columns.len() - result_offset >= self.tile * out,
+            "promoted sparse result tile exceeds workspace"
+        );
+        let stream = &self.device.stream;
+        let input_view = view(
+            input,
+            stream,
+            0,
+            [self.rows as u32, channels as u32],
+            [channels as u64, 1],
+        )?;
+        let output_view = view(
+            output,
+            stream,
+            0,
+            [self.rows as u32, out as u32],
+            [out as u64, 1],
+        )?;
+        no_overlap(&input_view, &output_view, "sparse input", "sparse output")?;
+        no_overlap(&weight, &output_view, "sparse weight", "sparse output")?;
+        no_overlap(&bias, &output_view, "sparse bias", "sparse output")?;
+        let gather = if input_half {
+            self.half_gather
+                .as_ref()
+                .context("promoted half gather missing")?
+        } else {
+            &self.gather
+        };
+        let store = if output_half {
+            self.half_store
+                .as_ref()
+                .context("promoted half store missing")?
+        } else {
+            &self.bias
+        };
+        for first in (0..self.rows).step_by(self.tile) {
+            let rows = self.tile.min(self.rows - first);
+            unsafe {
+                stream
+                    .launch_builder(gather)
+                    .arg(input)
+                    .arg(&self.neighbours)
+                    .arg(self.columns.as_ref())
+                    .arg(&(self.rows as u32))
+                    .arg(&(channels as u32))
+                    .arg(&(first as u32))
+                    .arg(&(rows as u32))
+                    .launch(flat(rows * width))?;
+            }
+            let x = view(
+                &self.columns,
+                stream,
+                0,
+                [rows as u32, width as u32],
+                [width as u64, 1],
+            )?;
+            let product = view(
+                &self.columns,
+                stream,
+                result_offset,
+                [rows as u32, out as u32],
+                [out as u64, 1],
+            )?;
+            blas.linear_f32(weight, x, &mut TensorMut(product))?;
+            unsafe {
+                stream
+                    .launch_builder(store)
+                    .arg(&product.ptr)
+                    .arg(&bias.ptr)
+                    .arg(output)
+                    .arg(&(first as u64))
+                    .arg(&(rows as u32))
+                    .arg(&(out as u32))
+                    .launch(flat(rows * out))?;
+            }
         }
         Ok(())
     }

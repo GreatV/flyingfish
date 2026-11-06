@@ -669,7 +669,7 @@ impl DecoderKind {
                 "decoder tensor {name} has unexpected stored dtype/layout"
             );
             if dtype == Dtype::I64 {
-                for (index, element) in tensor.data.chunks_exact(8).enumerate() {
+                for (index, element) in tensor.data.as_chunks::<8>().0.iter().enumerate() {
                     let child = index / 3;
                     let axis = index % 3;
                     let expected = ((child >> (2 - axis)) & 1) as i64;
@@ -767,13 +767,17 @@ mod tests {
             match tensor.dtype() {
                 Dtype::I64 => Ok(tensor
                     .data()
-                    .chunks_exact(8)
-                    .map(|v| i64::from_le_bytes(v.try_into().expect("eight-byte chunk")))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|v| i64::from_le_bytes(*v))
                     .collect()),
                 Dtype::I32 => Ok(tensor
                     .data()
-                    .chunks_exact(4)
-                    .map(|v| i32::from_le_bytes(v.try_into().expect("four-byte chunk")) as i64)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| i32::from_le_bytes(*v) as i64)
                     .collect()),
                 _ => anyhow::bail!("invalid sparse map dtype"),
             }
@@ -789,7 +793,9 @@ mod tests {
             let grid = read(&format!("{name}.grid"))?;
             let batch = read(&format!("{name}.batch"))?;
             let coordinates = grid
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .zip(batch)
                 .map(|(p, b)| {
                     Ok([

@@ -50,7 +50,7 @@ pub mod quantize;
 pub mod sample;
 pub mod selection;
 #[cfg(feature = "cuda")]
-mod sparse;
+pub mod sparse;
 pub mod state;
 pub(crate) mod tree;
 pub mod verification;

@@ -100,6 +100,7 @@ struct OperationGate {
     cells: BTreeMap<String, Value>,
     seen: BTreeSet<String>,
     defects: usize,
+    decoder_anchor: Option<PathBuf>,
 }
 impl OperationGate {
     fn new(kind: &str, count: usize) -> Result<Self> {
@@ -139,6 +140,33 @@ impl OperationGate {
             cells,
             seen: BTreeSet::new(),
             defects: 0,
+            decoder_anchor: None,
+        })
+    }
+    fn decoder(kind: &str, freeze_dir: &str, anchor_dir: &str, count: usize) -> Result<Self> {
+        let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+        let freeze: Value =
+            serde_json::from_slice(&std::fs::read(root.join(freeze_dir).join("FROZEN.json"))?)?;
+        ensure!(
+            freeze["reference_protocol"] == "PASS",
+            "decoder reference protocol is invalid"
+        );
+        let cells: BTreeMap<String, Value> = serde_json::from_value(freeze["cells"].clone())?;
+        ensure!(
+            cells.len() == count
+                && cells
+                    .values()
+                    .all(|cell| cell["reference_protocol"] == "PASS"),
+            "decoder cell coverage or protocol mismatch"
+        );
+        let decoder_anchor = Some(root.join(anchor_dir).join("anchor.safetensors"));
+        Ok(Self {
+            root,
+            kind: kind.into(),
+            cells,
+            seen: BTreeSet::new(),
+            defects: 0,
+            decoder_anchor,
         })
     }
     fn score(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
@@ -146,13 +174,23 @@ impl OperationGate {
             ensure!(self.seen.insert(name.into()), "duplicate operation score");
         }
         let cell = self.cells.get(name).context("cell outside frozen scope")?;
-        let anchor = tensor(
-            &self.root.join(&self.kind).join("anchor.safetensors"),
-            &format!("{name}.anchor"),
-        )?;
+        let anchor = if let Some(path) = &self.decoder_anchor {
+            tensor(path, name)?
+        } else {
+            tensor(
+                &self.root.join(&self.kind).join("anchor.safetensors"),
+                &format!("{name}.anchor"),
+            )?
+        };
         let errors = metrics(values, &anchor.values)?;
         for metric in ["max_abs", "rmse"] {
-            let bound = cell["bounds"][metric].as_f64().context("bound missing")?;
+            let bound = cell[if self.decoder_anchor.is_some() {
+                "tau"
+            } else {
+                "bounds"
+            }][metric]
+                .as_f64()
+                .context("bound missing")?;
             let value = errors[metric];
             let defect = if control {
                 value < 10.0 * bound
@@ -161,7 +199,12 @@ impl OperationGate {
             };
             self.defects += usize::from(defect);
             println!(
-                "N5_M1_METRIC kind={} cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                "{}_METRIC kind={} cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                if self.decoder_anchor.is_some() {
+                    "N5_M2B"
+                } else {
+                    "N5_M1"
+                },
                 self.kind,
                 if defect { "DEFECT" } else { "PASS" }
             );
@@ -174,7 +217,12 @@ impl OperationGate {
             "operation cells unexecuted"
         );
         println!(
-            "N5_M1_GATE {} kind={} cells={} defects={} timing=false",
+            "{}_GATE {} kind={} cells={} defects={} timing=false",
+            if self.decoder_anchor.is_some() {
+                "N5_M2B"
+            } else {
+                "N5_M1"
+            },
             if self.defects == 0 { "PASS" } else { "DEFECT" },
             self.kind,
             self.seen.len(),
@@ -227,6 +275,126 @@ fn lattice(path: &Path, key: &str) -> Result<Vec<[i32; 3]>> {
         .iter()
         .map(|p| [p[1] as i32, p[2] as i32, p[3] as i32])
         .collect())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_MODEL")?;
+    let checkpoint = DecoderCheckpoint::open(&root.join("vae"), DecoderKind::PointTransformer)?;
+    let reference = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let common = reference.join("sm89-r1/additional-common-inputs.safetensors");
+    let sites = SparseSites::new(decoder_coordinates(&common, "conv.coordinates")?)?;
+    let wrong_maps = sites
+        .coordinates()
+        .iter()
+        .map(|&p| {
+            std::array::from_fn(|tap| {
+                let query = [
+                    p[0],
+                    p[3] + (tap / 9) as i32 - 1,
+                    p[2] + ((tap / 3) % 3) as i32 - 1,
+                    p[1] + (tap % 3) as i32 - 1,
+                ];
+                sites.row(query).unwrap_or(-1)
+            })
+        })
+        .collect::<Vec<[i32; 27]>>();
+    let d = Device::new(0)?;
+    let ops = Ops::new(&d.ctx)?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let blas = Blas::new(
+        &d,
+        &ops,
+        &runtime,
+        Rc::new(Closure::new(false, "sparse convolution".into())),
+    )?;
+    let n = sites.coordinates().len();
+    let mut defects = 0;
+    let mut results = Vec::new();
+    for tile in [127, 251] {
+        let mut gate =
+            OperationGate::decoder("sparse-convolution", "conv-freeze-r1", "sm89-r1", 54)?;
+        for (name, cell) in gate.cells.clone() {
+            let definition = &cell["definition"];
+            let ci = definition["input_shape"][1]
+                .as_u64()
+                .context("input width missing")? as usize;
+            let co = definition["stored_weight_shape"][0]
+                .as_u64()
+                .context("output width missing")? as usize;
+            let module = name
+                .strip_prefix("conv.")
+                .context("conv prefix missing")?
+                .rsplit_once('.')
+                .context("feature dtype missing")?
+                .0;
+            let weight = checkpoint.mapped.tensor(&format!("{module}.weight"))?;
+            let weight: Vec<_> = weight
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect();
+            let weight = d.stream.clone_htod(&weight)?;
+            let bias = checkpoint.mapped.tensor(&format!("{module}.bias"))?;
+            let bias: Vec<_> = bias
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect();
+            let bias = d.stream.clone_htod(&bias)?;
+            let rows: Vec<_> = definition["sampled_output_rows"]
+                .as_array()
+                .context("sample rows missing")?
+                .iter()
+                .map(|v| v.as_u64().context("invalid sample row").map(|v| v as usize))
+                .collect::<Result<_>>()?;
+            let input = f32_tensor(&common, &format!("conv.c{ci}.input"))?;
+            let workspace = n * 27 * size_of::<i32>() + tile * (27 * ci + co) * size_of::<f32>();
+            let mut conv = SparseConv::<f32>::promoted(&d, &sites, [ci, co], workspace)?;
+            for control in [false, true] {
+                if control {
+                    conv.replace_neighbours(&wrong_maps)?;
+                }
+                let weight = matrix(ptr(&weight, &d), co, 27 * ci)?;
+                let bias = view(&bias, &d.stream, 0, [co as u32], [1])?;
+                let values = if name.ends_with(".float16") {
+                    let input: Vec<_> = input.iter().map(|&x| f16::from_f32(x)).collect();
+                    let input = d.stream.clone_htod(&input)?;
+                    let mut output = d.stream.alloc_zeros::<f16>(n * co)?;
+                    conv.run_promoted(&blas, &input, weight, bias, &mut output)?;
+                    selected_half(&d, &output, &rows, co)?
+                } else {
+                    let input = d.stream.clone_htod(&input)?;
+                    let mut output = d.stream.alloc_zeros::<f32>(n * co)?;
+                    conv.run_promoted(&blas, &input, weight, bias, &mut output)?;
+                    let output = d.stream.clone_dtoh(&output)?;
+                    rows.iter()
+                        .flat_map(|&r| output[r * co..(r + 1) * co].iter().map(|&x| x as f64))
+                        .collect()
+                };
+                gate.score(&name, &values, control)?;
+            }
+        }
+        defects += gate.defects;
+        println!(
+            "N5_M2B_CONV_TILE tile={tile} cells={} defects={} bounded=true stored_layout=KRSC input_rows={n}",
+            gate.seen.len(),
+            gate.defects
+        );
+        results.push(gate.finish());
+    }
+    for result in results {
+        result?;
+    }
+    println!(
+        "PASS N5_M2B_SPARSE_CONV_GATE cells=54 tiles=2 executions=108 control_executions=108 defects={defects} eager=true timing=false"
+    );
+    Ok(())
 }
 
 #[test]
