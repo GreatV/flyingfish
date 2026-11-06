@@ -2192,6 +2192,7 @@ impl<T: FlowElement> Flow<T> {
                 F32Mask {
                     causal: false,
                     valid_keys: 5,
+                    query_base: 0,
                 },
             )?;
             k.cast(d, ptr(&self.work.cross_out32, d), attention, n * h)?;

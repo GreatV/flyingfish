@@ -1259,6 +1259,7 @@ impl Flash {
 pub(crate) struct F32Mask {
     pub(crate) causal: bool,
     pub(crate) valid_keys: u32,
+    pub(crate) query_base: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -1376,8 +1377,14 @@ impl F32Attention {
         mask: F32Mask,
     ) -> Result<()> {
         use super::contracts::{Tensor, TensorMut, no_overlap};
-        let [heads, queries, keys, dim, value_dim] = self.geometry;
-        let F32Mask { causal, valid_keys } = mask;
+        let [heads, cap_queries, cap_keys, dim, value_dim] = self.geometry;
+        let F32Mask {
+            causal,
+            valid_keys,
+            query_base,
+        } = mask;
+        let queries = q.shape[1];
+        let keys = k.shape[1];
         if valid_keys == 0 || valid_keys > keys {
             ensure!(
                 !(causal && valid_keys == 0),
@@ -1386,7 +1393,11 @@ impl F32Attention {
             anyhow::bail!("F32 attention valid_keys {valid_keys} keys {keys}");
         }
         ensure!(
-            q.shape == [heads, queries, dim]
+            queries > 0
+                && queries <= cap_queries
+                && keys > 0
+                && keys <= cap_keys
+                && q.shape == [heads, queries, dim]
                 && k.shape == [heads, keys, dim]
                 && v.shape == [heads, keys, value_dim]
                 && output.0.shape == [heads, queries, value_dim],
@@ -1459,6 +1470,9 @@ impl F32Attention {
                     blocks <= u32::MAX as usize,
                     "F32 attention exclude grid {blocks}"
                 );
+                let query_index = query_base
+                    .checked_add(start)
+                    .context("F32 attention query_base overflow")?;
                 unsafe {
                     self.stream
                         .launch_builder(&self.exclude)
@@ -1466,7 +1480,7 @@ impl F32Attention {
                         .arg(&heads)
                         .arg(&rows)
                         .arg(&keys)
-                        .arg(&start)
+                        .arg(&query_index)
                         .arg(&valid_keys)
                         .arg(&u32::from(causal))
                         .launch(super::ops::grid(blocks, 256))?;

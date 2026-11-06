@@ -541,3 +541,365 @@ fn canary_decoder_matches_reference() -> Result<()> {
     let engine = Canary::load(&model, &device)?;
     match_decoder(&engine, &fixtures, &floors)
 }
+
+const PREFILL: usize = 9;
+
+struct NumericItem {
+    encoder: Vec<f32>,
+    valid_rows: usize,
+    tokens: Vec<u32>,
+    logits: Vec<f32>,
+}
+
+struct Clip {
+    features: Vec<f32>,
+    valid_frames: usize,
+    encoder: Vec<f32>,
+    valid_rows: usize,
+    prompt: Vec<u32>,
+    scores: Vec<f32>,
+}
+
+fn prefix_valid(mask: &[u8]) -> Result<usize> {
+    let valid = mask.iter().filter(|&&value| value != 0).count();
+    ensure!(valid > 0, "encoder valid count is 0");
+    ensure!(
+        mask[..valid].iter().all(|&value| value != 0),
+        "encoder mask is not a prefix"
+    );
+    ensure!(
+        mask[valid..].iter().all(|&value| value == 0),
+        "encoder mask is not a right-padding prefix"
+    );
+    Ok(valid)
+}
+
+fn read_numeric(path: &Path) -> Result<Vec<NumericItem>> {
+    let bytes = std::fs::read(path)?;
+    let tensors = SafeTensors::deserialize(&bytes)?;
+    let shape = tensors.tensor("encoder")?.shape().to_vec();
+    ensure!(
+        shape.len() == 3 && shape[2] == HIDDEN,
+        "encoder fixture shape"
+    );
+    let (batch, rows) = (shape[0], shape[1]);
+    let mask = tensors.tensor("encoder_mask")?;
+    ensure!(
+        mask.dtype() == Dtype::U8 && mask.shape() == [batch, rows],
+        "encoder_mask fixture"
+    );
+    let tokens = i32_values(&tensors, "input_ids")?;
+    let logits = f32_values(&tensors, "logits")?;
+    let encoder = f32_values(&tensors, "encoder")?;
+    ensure!(tokens.len() == batch * SEQUENCE, "token fixture length");
+    ensure!(
+        logits.len() == batch * SEQUENCE * VOCAB,
+        "logit fixture length"
+    );
+    let mut items = Vec::with_capacity(batch);
+    for index in 0..batch {
+        let mask_row = &mask.data()[index * rows..(index + 1) * rows];
+        items.push(NumericItem {
+            encoder: encoder[index * rows * HIDDEN..(index + 1) * rows * HIDDEN].to_vec(),
+            valid_rows: prefix_valid(mask_row)?,
+            tokens: tokens[index * SEQUENCE..(index + 1) * SEQUENCE].to_vec(),
+            logits: logits[index * SEQUENCE * VOCAB..(index + 1) * SEQUENCE * VOCAB].to_vec(),
+        });
+    }
+    Ok(items)
+}
+
+fn read_clip(path: &Path) -> Result<Clip> {
+    let bytes = std::fs::read(path)?;
+    let tensors = SafeTensors::deserialize(&bytes)?;
+    let frames = tensors.tensor("input_features")?.shape().to_vec();
+    ensure!(frames.len() == 2 && frames[1] == 128, "mel fixture shape");
+    let frame_mask = tensors.tensor("attention_mask")?;
+    ensure!(
+        frame_mask.dtype() == Dtype::U8 && frame_mask.shape() == [frames[0]],
+        "attention_mask fixture"
+    );
+    let encoder_shape = tensors.tensor("encoder")?.shape().to_vec();
+    ensure!(
+        encoder_shape.len() == 2 && encoder_shape[1] == HIDDEN,
+        "clip encoder shape"
+    );
+    let encoder_mask = tensors.tensor("encoder_mask")?;
+    ensure!(
+        encoder_mask.dtype() == Dtype::U8 && encoder_mask.shape() == [encoder_shape[0]],
+        "clip encoder_mask"
+    );
+    let scores = f32_values(&tensors, "scores")?;
+    ensure!(
+        scores.len().is_multiple_of(VOCAB) && !scores.is_empty(),
+        "clip score length"
+    );
+    let ids = i32_values(&tensors, "ids")?;
+    let prompt = i32_values(&tensors, "prompt")?;
+    ensure!(prompt.len() == PREFILL, "clip prompt length");
+    ensure!(
+        ids.len() == PREFILL + scores.len() / VOCAB,
+        "clip id length"
+    );
+    ensure!(
+        ids[..PREFILL] == prompt,
+        "clip ids do not start with the prompt"
+    );
+    ensure!(ids[ids.len() - 1] == 3, "clip ids do not end on eos");
+    Ok(Clip {
+        features: f32_values(&tensors, "input_features")?,
+        valid_frames: prefix_valid(frame_mask.data())?,
+        encoder: f32_values(&tensors, "encoder")?,
+        valid_rows: prefix_valid(encoder_mask.data())?,
+        prompt,
+        scores,
+    })
+}
+
+fn cross_delta(engine: &Canary, before: u64) -> Result<u64> {
+    let writes = engine.cross_writes();
+    ensure!(writes >= before, "cross-write counter moved backwards");
+    Ok(writes - before)
+}
+
+fn check_generated(
+    defects: &mut Vec<String>,
+    label: &str,
+    actual: &[u32],
+    spec: &Value,
+) -> Result<()> {
+    ensure!(
+        spec["assert"].as_bool() == Some(true),
+        "{label} ids are not asserted"
+    );
+    let expected = spec["ids"]
+        .as_array()
+        .with_context(|| format!("missing {label} ids"))?;
+    let margin = spec["margin"]
+        .as_f64()
+        .with_context(|| format!("missing {label} margin"))?;
+    let mut expected_ids = Vec::with_capacity(expected.len());
+    for (row, value) in expected.iter().enumerate() {
+        let id = value
+            .as_u64()
+            .with_context(|| format!("{label} row {row} id is not an integer"))?;
+        expected_ids.push(u32::try_from(id).with_context(|| format!("{label} row {row} id"))?);
+    }
+    if actual == expected_ids {
+        println!("{label} ids margin={margin} PASS");
+    } else {
+        defects.push(format!(
+            "{label} ids DEFECT actual={actual:?} expected={expected_ids:?} margin={margin}"
+        ));
+    }
+    Ok(())
+}
+
+fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) -> Result<()> {
+    engine.reset_encode_calls();
+    engine.reset_cross_writes();
+    ensure!(
+        engine.encode_calls() == 0 && engine.cross_writes() == 0,
+        "counters did not reset"
+    );
+    let mut defects = Vec::new();
+    for case in ["short", "edges", "production"] {
+        let items = read_numeric(&fixtures.join("numeric").join(format!("{case}.safetensors")))?;
+        let (max_bound, rmse_bound) = (
+            floors["cases"][case]["max_abs"]
+                .as_f64()
+                .with_context(|| format!("missing {case} max_abs"))?,
+            floors["cases"][case]["rmse"]
+                .as_f64()
+                .with_context(|| format!("missing {case} rmse"))?,
+        );
+        for (index, item) in items.iter().enumerate() {
+            ensure!(
+                item.logits.iter().all(|value| value.is_finite()),
+                "{case}/{index} non-finite fixture"
+            );
+            let before = engine.cross_writes();
+            let logits =
+                engine.cached_logits(&item.encoder, item.valid_rows, &item.tokens, PREFILL)?;
+            ensure!(engine.encode_calls() == 0, "{case}/{index} encode calls");
+            ensure!(
+                cross_delta(engine, before)? == 16,
+                "{case}/{index} cross writes"
+            );
+            within(
+                &mut defects,
+                &format!("CANARY_GREEDY {case}/{index}"),
+                &logits,
+                &item.logits,
+                max_bound,
+                rmse_bound,
+            )?;
+            check_ids(
+                &mut defects,
+                &format!("CANARY_GREEDY {case}/{index}"),
+                &logits,
+                &floors["cases"][case]["items"][index],
+            )?;
+        }
+    }
+    let production = read_numeric(&fixtures.join("numeric/production.safetensors"))?;
+    ensure!(production.len() == 1, "production batch");
+    let shift_bytes = std::fs::read(fixtures.join("numeric/production_shift.safetensors"))?;
+    let shift_tensors = SafeTensors::deserialize(&shift_bytes)?;
+    let clean = f32_values(&shift_tensors, "logits_clean")?;
+    ensure!(
+        clean.len() == VOCAB && clean.iter().all(|value| value.is_finite()),
+        "shift clean logits"
+    );
+    let before = engine.cross_writes();
+    let shifted = engine.cached_step_with_shifted_cross_k(
+        &production[0].encoder,
+        production[0].valid_rows,
+        &production[0].tokens[..PREFILL + 1],
+        PREFILL,
+    )?;
+    ensure!(engine.encode_calls() == 0, "shift encode calls");
+    ensure!(cross_delta(engine, before)? == 16, "shift cross writes");
+    far(
+        &mut defects,
+        "CANARY_GREEDY production cross-k-shift",
+        &shifted,
+        &clean,
+        floors["cases"]["production"]["max_abs"]
+            .as_f64()
+            .context("production max_abs")?,
+        floors["cases"]["production"]["rmse"]
+            .as_f64()
+            .context("production rmse")?,
+    )?;
+    let clip0 = read_clip(&fixtures.join("clips/0.safetensors"))?;
+    let clip1 = read_clip(&fixtures.join("clips/1.safetensors"))?;
+    let clip_de = read_clip(&fixtures.join("clips/0_de.safetensors"))?;
+    let encodes = engine.encode_calls();
+    let cross = engine.cross_writes();
+    let (ids0, _) = engine.transcribe(&clip0.features, clip0.valid_frames, &clip0.prompt)?;
+    ensure!(cross_delta(engine, cross)? == 16, "clip 0 cross writes");
+    let cross = engine.cross_writes();
+    let (ids1, _) = engine.transcribe(&clip1.features, clip1.valid_frames, &clip1.prompt)?;
+    ensure!(engine.encode_calls() - encodes == 2, "clip encode delta");
+    ensure!(cross_delta(engine, cross)? == 16, "clip 1 cross writes");
+    check_generated(
+        &mut defects,
+        "CANARY_GREEDY clip0",
+        &ids0,
+        &floors["clips"]["0"],
+    )?;
+    check_generated(
+        &mut defects,
+        "CANARY_GREEDY clip1",
+        &ids1,
+        &floors["clips"]["1"],
+    )?;
+    let text0 = crate::tokenizer::decode(model, &ids0)?;
+    let text1 = crate::tokenizer::decode(model, &ids1)?;
+    println!("CANARY_GREEDY clip0 text={text0:?}");
+    println!("CANARY_GREEDY clip1 text={text1:?}");
+    if text0.as_bytes() == text1.as_bytes() {
+        defects.push("CANARY_GREEDY clip texts are byte-identical DEFECT".to_string());
+    }
+    if text0
+        != floors["clips"]["0"]["text"]
+            .as_str()
+            .context("clip 0 text")?
+    {
+        defects.push(format!("CANARY_GREEDY clip0 text DEFECT actual={text0:?}"));
+    }
+    if text1
+        != floors["clips"]["1"]["text"]
+            .as_str()
+            .context("clip 1 text")?
+    {
+        defects.push(format!("CANARY_GREEDY clip1 text DEFECT actual={text1:?}"));
+    }
+    let encodes = engine.encode_calls();
+    let cross = engine.cross_writes();
+    let (ids1_again, _) = engine.transcribe(&clip1.features, clip1.valid_frames, &clip1.prompt)?;
+    ensure!(
+        cross_delta(engine, cross)? == 16,
+        "swapped clip 1 cross writes"
+    );
+    let cross = engine.cross_writes();
+    let (ids0_again, _) = engine.transcribe(&clip0.features, clip0.valid_frames, &clip0.prompt)?;
+    ensure!(engine.encode_calls() - encodes == 2, "swapped encode delta");
+    ensure!(
+        cross_delta(engine, cross)? == 16,
+        "swapped clip 0 cross writes"
+    );
+    if ids0_again != ids0 || ids1_again != ids1 {
+        defects.push(format!(
+            "CANARY_GREEDY order DEFECT clip0={ids0_again:?} clip1={ids1_again:?}"
+        ));
+    } else {
+        println!("CANARY_GREEDY order PASS");
+    }
+    let encodes = engine.encode_calls();
+    let cross = engine.cross_writes();
+    let (de_ids, de_prefill) =
+        engine.greedy(&clip_de.encoder, clip_de.valid_rows, &clip_de.prompt)?;
+    ensure!(engine.encode_calls() == encodes, "de-prompt encode calls");
+    ensure!(cross_delta(engine, cross)? == 16, "de-prompt cross writes");
+    check_generated(
+        &mut defects,
+        "CANARY_GREEDY clip0_de",
+        &de_ids,
+        &floors["clips"]["de"],
+    )?;
+    if de_ids == ids0 {
+        defects.push("CANARY_GREEDY language ids are identical DEFECT".to_string());
+    }
+    let de_text = crate::tokenizer::decode(model, &de_ids)?;
+    println!("CANARY_GREEDY clip0_de text={de_text:?}");
+    far(
+        &mut defects,
+        "CANARY_GREEDY language prefill",
+        &de_prefill,
+        &clip0.scores[..VOCAB],
+        floors["clips"]["0"]["prefill_max_abs"]
+            .as_f64()
+            .context("prefill max_abs")?,
+        floors["clips"]["0"]["prefill_rmse"]
+            .as_f64()
+            .context("prefill rmse")?,
+    )?;
+    ensure!(engine.cross_writes() == 11 * 16, "cross-write total");
+    for defect in &defects {
+        println!("{defect}");
+    }
+    ensure!(
+        defects.is_empty(),
+        "CANARY_GREEDY defects={}",
+        defects.len()
+    );
+    println!("PASS CANARY_GREEDY cells=5 clips=2 controls=language+cross-k-shift+order");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires GPU lease, frozen floors, and external fixtures"]
+fn canary_greedy_matches_reference() -> Result<()> {
+    ensure!(
+        std::env::var("FF_CANARY_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model =
+        PathBuf::from(std::env::var_os("FF_CANARY_MODEL").context("FF_CANARY_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_CANARY_GREEDY_FIXTURES")
+            .context("FF_CANARY_GREEDY_FIXTURES missing")?,
+    );
+    let floors: Value = serde_json::from_slice(&std::fs::read(
+        std::env::var_os("FF_CANARY_GREEDY_FLOORS").context("FF_CANARY_GREEDY_FLOORS missing")?,
+    )?)?;
+    ensure!(
+        floors["schema"] == "n6c-m3-greedy-v1",
+        "greedy floor schema"
+    );
+    let device = Device::new(0)?;
+    let engine = Canary::load(&model, &device)?;
+    match_greedy(&engine, &fixtures, &floors, &model)
+}

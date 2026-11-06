@@ -6400,6 +6400,7 @@ impl DinoScalar for f32 {
             crate::backend::cuda::flash::F32Mask {
                 causal: false,
                 valid_keys: rows,
+                query_base: 0,
             },
         )
     }

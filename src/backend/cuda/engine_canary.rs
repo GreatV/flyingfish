@@ -14,6 +14,8 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{path::Path, sync::Arc};
 
 const HEADS: u32 = 8;
@@ -67,6 +69,37 @@ struct Pass<'a> {
     cross_attn: &'a F32Attention,
 }
 
+struct KvCache {
+    self_k: Vec<CudaSlice<f32>>,
+    self_v: Vec<CudaSlice<f32>>,
+    cross_k: Vec<CudaSlice<f32>>,
+    cross_v: Vec<CudaSlice<f32>>,
+    rows: u32,
+    valid: u32,
+    filled: u32,
+    self_attn: F32Attention,
+    cross_attn: F32Attention,
+}
+
+fn require_prompt_length(len: usize) -> Result<()> {
+    ensure!(len > 0, "decoder sequence length is 0");
+    ensure!(
+        len <= MAX_POSITIONS,
+        "decoder sequence length {len} exceeds {MAX_POSITIONS}"
+    );
+    Ok(())
+}
+
+fn require_step_position(filled: usize) -> Result<()> {
+    ensure!(filled < MAX_POSITIONS, "decoder position {MAX_POSITIONS}");
+    Ok(())
+}
+
+fn require_token_ids(tokens: &[u32], vocab: u32) -> Result<()> {
+    ensure!(tokens.iter().all(|&id| id < vocab), "token id >= {vocab}");
+    Ok(())
+}
+
 pub struct Canary {
     encoder: ParakeetEncoder,
     stream: Arc<CudaStream>,
@@ -80,6 +113,8 @@ pub struct Canary {
     ops: Ops,
     vocab: u32,
     hidden: u32,
+    #[cfg(test)]
+    cross_writes: AtomicU64,
 }
 
 fn tensor(
@@ -251,22 +286,42 @@ impl Canary {
             hidden: spec.hidden,
             blas,
             stream,
+            #[cfg(test)]
+            cross_writes: AtomicU64::new(0),
         };
         decoder.stream.synchronize()?;
         Ok(decoder)
     }
 
     fn linear(&self, input: &CudaSlice<f32>, rows: u32, weight: &Linear) -> Result<CudaSlice<f32>> {
+        let mut output = self
+            .stream
+            .alloc_zeros(rows as usize * weight.output as usize)?;
+        self.linear_into(input, rows, weight, &mut output, 0)?;
+        Ok(output)
+    }
+
+    fn linear_into(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        weight: &Linear,
+        output: &mut CudaSlice<f32>,
+        row0: u32,
+    ) -> Result<()> {
         ensure!(rows > 0, "linear requires rows");
         ensure!(
             input.len() == rows as usize * weight.input as usize,
             "linear input length"
         );
-        let output = self
-            .stream
-            .alloc_zeros(rows as usize * weight.output as usize)?;
+        let width = weight.output as usize;
+        let start = row0 as usize * width;
+        let count = rows as usize * width;
+        ensure!(start + count <= output.len(), "linear output length");
         let alpha = 1.0f32;
         let beta = 0.0f32;
+        let destination = output.slice(start..start + count);
+        let pointer = destination.device_ptr(&self.stream).0;
         unsafe {
             cublas_sys::cublasGemmEx(
                 *self.blas.handle(),
@@ -283,7 +338,7 @@ impl Canary {
                 cublas_sys::cudaDataType_t::CUDA_R_32F,
                 weight.input as i32,
                 (&beta as *const f32).cast(),
-                output.device_ptr(&self.stream).0 as *mut core::ffi::c_void,
+                pointer as *mut core::ffi::c_void,
                 cublas_sys::cudaDataType_t::CUDA_R_32F,
                 weight.output as i32,
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -292,14 +347,14 @@ impl Canary {
             .result()?;
             self.stream
                 .launch_builder(&self.ops.bias)
-                .arg(&output)
+                .arg(&destination)
                 .arg(&weight.bias)
-                .arg(&output)
+                .arg(&destination)
                 .arg(&rows)
                 .arg(&weight.output)
-                .launch(ops::flat(output.len()))?;
+                .launch(ops::flat(count))?;
         }
-        Ok(output)
+        Ok(())
     }
 
     fn normalize(&self, input: &CudaSlice<f32>, rows: u32, norm: &Norm) -> Result<CudaSlice<f32>> {
@@ -406,33 +461,26 @@ impl Canary {
         q: &CudaSlice<f32>,
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
-        causal: bool,
-        valid_keys: u32,
+        keys: u32,
+        mask: F32Mask,
     ) -> Result<CudaSlice<f32>> {
         let hidden = self.hidden as usize;
         ensure!(
-            hidden > 0
-                && q.len().is_multiple_of(hidden)
-                && k.len().is_multiple_of(hidden)
-                && v.len() == k.len(),
-            "attention buffer length"
+            hidden > 0 && q.len().is_multiple_of(hidden),
+            "attention query length"
         );
         let queries = u32::try_from(q.len() / hidden).context("attention queries")?;
-        let keys = u32::try_from(k.len() / hidden).context("attention keys")?;
+        ensure!(
+            k.len() >= keys as usize * hidden && v.len() >= keys as usize * hidden,
+            "attention buffer length"
+        );
         let output = self.stream.alloc_zeros(q.len())?;
         let stride = [u64::from(HEAD_DIM), u64::from(self.hidden), 1];
         let q = view(q, &self.stream, 0, [HEADS, queries, HEAD_DIM], stride)?;
         let k = view(k, &self.stream, 0, [HEADS, keys, HEAD_DIM], stride)?;
         let v = view(v, &self.stream, 0, [HEADS, keys, HEAD_DIM], stride)?;
         let seen = view(&output, &self.stream, 0, [HEADS, queries, HEAD_DIM], stride)?;
-        attention.run_cublas(
-            &self.blas,
-            q,
-            k,
-            v,
-            &mut TensorMut(seen),
-            F32Mask { causal, valid_keys },
-        )?;
+        attention.run_cublas(&self.blas, q, k, v, &mut TensorMut(seen), mask)?;
         Ok(output)
     }
 
@@ -441,14 +489,36 @@ impl Canary {
         let q = self.linear(&normed, pass.queries, &layer.self_attn.q)?;
         let k = self.linear(&normed, pass.queries, &layer.self_attn.k)?;
         let v = self.linear(&normed, pass.queries, &layer.self_attn.v)?;
-        let attended = self.attend(pass.self_attn, &q, &k, &v, true, pass.queries)?;
+        let attended = self.attend(
+            pass.self_attn,
+            &q,
+            &k,
+            &v,
+            pass.queries,
+            F32Mask {
+                causal: true,
+                valid_keys: pass.queries,
+                query_base: 0,
+            },
+        )?;
         let delta = self.linear(&attended, pass.queries, &layer.self_attn.o)?;
         self.residual(hidden, &delta, 1.0)?;
         let normed = self.normalize(hidden, pass.queries, &layer.post_norm)?;
         let q = self.linear(&normed, pass.queries, &layer.cross_attn.q)?;
         let k = self.linear(pass.encoder, pass.keys, &layer.cross_attn.k)?;
         let v = self.linear(pass.encoder, pass.keys, &layer.cross_attn.v)?;
-        let attended = self.attend(pass.cross_attn, &q, &k, &v, false, pass.valid)?;
+        let attended = self.attend(
+            pass.cross_attn,
+            &q,
+            &k,
+            &v,
+            pass.keys,
+            F32Mask {
+                causal: false,
+                valid_keys: pass.valid,
+                query_base: 0,
+            },
+        )?;
         let delta = self.linear(&attended, pass.queries, &layer.cross_attn.o)?;
         self.residual(hidden, &delta, 1.0)?;
         let normed = self.normalize(hidden, pass.queries, &layer.final_norm)?;
@@ -466,34 +536,10 @@ impl Canary {
         valid: usize,
         tokens: &[u32],
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        require_prompt_length(tokens.len())?;
+        require_token_ids(tokens, self.vocab)?;
         let queries = u32::try_from(tokens.len()).context("decoder sequence length")?;
-        ensure!(queries > 0, "decoder sequence length is 0");
-        ensure!(
-            queries as usize <= MAX_POSITIONS,
-            "decoder sequence length {queries} exceeds {MAX_POSITIONS}"
-        );
-        ensure!(
-            tokens.iter().all(|&id| id < self.vocab),
-            "token id >= {}",
-            self.vocab
-        );
-        let width = self.hidden as usize;
-        ensure!(
-            width > 0 && encoder.len().is_multiple_of(width),
-            "encoder length is not rows*{width}"
-        );
-        let rows = encoder.len() / width;
-        let keys = u32::try_from(rows).context("encoder rows")?;
-        let valid_keys = u32::try_from(valid).context("encoder valid count")?;
-        ensure!(valid_keys > 0, "encoder valid count is 0");
-        ensure!(
-            valid_keys <= keys,
-            "encoder valid count {valid_keys} exceeds rows {keys}"
-        );
-        ensure!(
-            encoder.iter().all(|value| value.is_finite()),
-            "non-finite encoder state"
-        );
+        let (keys, valid_keys) = self.encoder_rows(encoder, valid)?;
         let encoder_state = self.stream.clone_htod(encoder)?;
         let token_index: Vec<i32> = tokens.iter().map(|&id| id as i32).collect();
         let position_index: Vec<i32> = (0..queries as i32).collect();
@@ -546,6 +592,330 @@ impl Canary {
         let (hidden, _mask, valid) = self.encoder.encode(mel, valid_frames)?;
         self.decode(&hidden, valid, tokens)
     }
+
+    fn encoder_rows(&self, encoder: &[f32], valid: usize) -> Result<(u32, u32)> {
+        let width = self.hidden as usize;
+        ensure!(
+            width > 0 && encoder.len().is_multiple_of(width),
+            "encoder length is not rows*{width}"
+        );
+        let rows = u32::try_from(encoder.len() / width).context("encoder rows")?;
+        let valid_keys = u32::try_from(valid).context("encoder valid count")?;
+        ensure!(valid_keys > 0, "encoder valid count is 0");
+        ensure!(
+            valid_keys <= rows,
+            "encoder valid count {valid_keys} exceeds rows {rows}"
+        );
+        ensure!(
+            encoder.iter().all(|value| value.is_finite()),
+            "non-finite encoder state"
+        );
+        Ok((rows, valid_keys))
+    }
+
+    fn open_cache(&self, encoder: &[f32], valid: usize) -> Result<KvCache> {
+        let (rows, valid_keys) = self.encoder_rows(encoder, valid)?;
+        let mut self_k = Vec::with_capacity(self.layers.len());
+        let mut self_v = Vec::with_capacity(self.layers.len());
+        let mut cross_k = Vec::with_capacity(self.layers.len());
+        let mut cross_v = Vec::with_capacity(self.layers.len());
+        for _ in 0..self.layers.len() {
+            self_k.push(
+                self.stream
+                    .alloc_zeros(MAX_POSITIONS * self.hidden as usize)?,
+            );
+            self_v.push(
+                self.stream
+                    .alloc_zeros(MAX_POSITIONS * self.hidden as usize)?,
+            );
+            cross_k.push(
+                self.stream
+                    .alloc_zeros(rows as usize * self.hidden as usize)?,
+            );
+            cross_v.push(
+                self.stream
+                    .alloc_zeros(rows as usize * self.hidden as usize)?,
+            );
+        }
+        let mut cache = KvCache {
+            self_k,
+            self_v,
+            cross_k,
+            cross_v,
+            rows,
+            valid: valid_keys,
+            filled: 0,
+            self_attn: F32Attention::new(
+                Arc::clone(&self.stream),
+                [
+                    HEADS,
+                    MAX_POSITIONS as u32,
+                    MAX_POSITIONS as u32,
+                    HEAD_DIM,
+                    HEAD_DIM,
+                ],
+                attention_workspace(MAX_POSITIONS as u32, MAX_POSITIONS as u32)?,
+            )?,
+            cross_attn: F32Attention::new(
+                Arc::clone(&self.stream),
+                [HEADS, MAX_POSITIONS as u32, rows, HEAD_DIM, HEAD_DIM],
+                attention_workspace(MAX_POSITIONS as u32, rows)?,
+            )?,
+        };
+        let encoder_state = self.stream.clone_htod(encoder)?;
+        self.project_cross(&encoder_state, &mut cache)?;
+        Ok(cache)
+    }
+
+    fn project_cross(&self, encoder: &CudaSlice<f32>, cache: &mut KvCache) -> Result<()> {
+        ensure!(
+            encoder.len() == cache.rows as usize * self.hidden as usize,
+            "encoder length is not rows*{}",
+            self.hidden
+        );
+        for index in 0..self.layers.len() {
+            self.linear_into(
+                encoder,
+                cache.rows,
+                &self.layers[index].cross_attn.k,
+                &mut cache.cross_k[index],
+                0,
+            )?;
+            self.linear_into(
+                encoder,
+                cache.rows,
+                &self.layers[index].cross_attn.v,
+                &mut cache.cross_v[index],
+                0,
+            )?;
+            #[cfg(test)]
+            self.cross_writes.fetch_add(2, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn cached_block(&self, cache: &mut KvCache, tokens: &[u32]) -> Result<CudaSlice<f32>> {
+        require_prompt_length(tokens.len())?;
+        require_step_position(cache.filled as usize)?;
+        require_token_ids(tokens, self.vocab)?;
+        ensure!(
+            cache.filled as usize + tokens.len() <= MAX_POSITIONS,
+            "decoder position {MAX_POSITIONS}"
+        );
+        let queries = u32::try_from(tokens.len()).context("decoder sequence length")?;
+        let filled_before = cache.filled;
+        let token_index: Vec<i32> = tokens.iter().map(|&id| id as i32).collect();
+        let position_index: Vec<i32> = (filled_before..filled_before + queries)
+            .map(|position| position as i32)
+            .collect();
+        let mut hidden = self.gather(&self.embed, &token_index, self.vocab)?;
+        let positions = self.gather(&self.positions, &position_index, MAX_POSITIONS as u32)?;
+        self.residual(&mut hidden, &positions, 1.0)?;
+        hidden = self.normalize(&hidden, queries, &self.embedding_norm)?;
+        let filled_after = filled_before + queries;
+        for index in 0..self.layers.len() {
+            let normed = self.normalize(&hidden, queries, &self.layers[index].input_norm)?;
+            let q = self.linear(&normed, queries, &self.layers[index].self_attn.q)?;
+            self.linear_into(
+                &normed,
+                queries,
+                &self.layers[index].self_attn.k,
+                &mut cache.self_k[index],
+                filled_before,
+            )?;
+            self.linear_into(
+                &normed,
+                queries,
+                &self.layers[index].self_attn.v,
+                &mut cache.self_v[index],
+                filled_before,
+            )?;
+            let attended = self.attend(
+                &cache.self_attn,
+                &q,
+                &cache.self_k[index],
+                &cache.self_v[index],
+                filled_after,
+                F32Mask {
+                    causal: true,
+                    valid_keys: filled_after,
+                    query_base: filled_before,
+                },
+            )?;
+            let delta = self.linear(&attended, queries, &self.layers[index].self_attn.o)?;
+            self.residual(&mut hidden, &delta, 1.0)?;
+            let normed = self.normalize(&hidden, queries, &self.layers[index].post_norm)?;
+            let q = self.linear(&normed, queries, &self.layers[index].cross_attn.q)?;
+            let attended = self.attend(
+                &cache.cross_attn,
+                &q,
+                &cache.cross_k[index],
+                &cache.cross_v[index],
+                cache.rows,
+                F32Mask {
+                    causal: false,
+                    valid_keys: cache.valid,
+                    query_base: 0,
+                },
+            )?;
+            let delta = self.linear(&attended, queries, &self.layers[index].cross_attn.o)?;
+            self.residual(&mut hidden, &delta, 1.0)?;
+            let normed = self.normalize(&hidden, queries, &self.layers[index].final_norm)?;
+            let expanded = self.linear(&normed, queries, &self.layers[index].fc1)?;
+            let activated = self.activate(&expanded, queries, self.layers[index].fc1.output)?;
+            let delta = self.linear(&activated, queries, &self.layers[index].fc2)?;
+            self.residual(&mut hidden, &delta, 1.0)?;
+        }
+        hidden = self.normalize(&hidden, queries, &self.norm)?;
+        let logits = self.linear(&hidden, queries, &self.proj)?;
+        cache.filled = filled_after;
+        Ok(logits)
+    }
+
+    fn last_logit_row(&self, logits: &CudaSlice<f32>, rows: u32) -> Result<Vec<f32>> {
+        let width = self.vocab as usize;
+        ensure!(
+            rows > 0 && logits.len() == rows as usize * width,
+            "logit length"
+        );
+        let row = logits.slice((rows as usize - 1) * width..rows as usize * width);
+        let mut host = vec![0f32; width];
+        self.stream.memcpy_dtoh(&row, &mut host)?;
+        ensure!(
+            host.iter().all(|value| value.is_finite()),
+            "non-finite logits"
+        );
+        Ok(host)
+    }
+
+    fn argmax_row(row: &[f32]) -> Result<u32> {
+        ensure!(
+            row.iter().all(|value| value.is_finite()),
+            "non-finite logits"
+        );
+        let mut best = 0usize;
+        for (index, value) in row.iter().enumerate().skip(1) {
+            if *value > row[best] {
+                best = index;
+            }
+        }
+        u32::try_from(best).context("argmax index")
+    }
+
+    fn greedy_loop(&self, mut cache: KvCache, prompt: &[u32]) -> Result<(Vec<u32>, Vec<f32>)> {
+        require_prompt_length(prompt.len())?;
+        require_token_ids(prompt, self.vocab)?;
+        let mut ids = prompt.to_vec();
+        let logits = self.cached_block(&mut cache, prompt)?;
+        let prefill_logits = self.last_logit_row(&logits, u32::try_from(prompt.len())?)?;
+        let mut row = prefill_logits.clone();
+        loop {
+            let next = Self::argmax_row(&row)?;
+            ids.push(next);
+            if next == 3 {
+                break;
+            }
+            let step = self.cached_block(&mut cache, &[next])?;
+            row = self.last_logit_row(&step, 1)?;
+        }
+        Ok((ids, prefill_logits))
+    }
+
+    fn shift_cross_k(&self, cache: &mut KvCache) -> Result<()> {
+        let rows = cache.rows as usize;
+        let width = self.hidden as usize;
+        for keys in &mut cache.cross_k {
+            let host = self.stream.clone_dtoh(keys)?;
+            let mut shifted = vec![0f32; host.len()];
+            if rows >= 2 {
+                let count = (rows - 1) * width;
+                shifted[..count].copy_from_slice(&host[width..width + count]);
+            }
+            self.stream.memcpy_htod(&shifted, keys)?;
+        }
+        Ok(())
+    }
+
+    /// One encoder call, then greedy decode. Returns prompt ids, generated ids including eos, and the prefill's last logit row.
+    pub fn transcribe(
+        &self,
+        mel: &[f32],
+        valid_frames: usize,
+        prompt: &[u32],
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let (hidden, _mask, valid) = self.encoder.encode(mel, valid_frames)?;
+        self.greedy(&hidden, valid, prompt)
+    }
+
+    /// Greedy decode over a recorded encoder state. Does not call the encoder.
+    pub fn greedy(
+        &self,
+        encoder: &[f32],
+        valid: usize,
+        prompt: &[u32],
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let cache = self.open_cache(encoder, valid)?;
+        self.greedy_loop(cache, prompt)
+    }
+
+    /// Prefill `prefill` tokens, then one recorded id at a time. Returns `[tokens.len(), vocab]` logits.
+    pub fn cached_logits(
+        &self,
+        encoder: &[f32],
+        valid: usize,
+        tokens: &[u32],
+        prefill: usize,
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            prefill > 0 && prefill <= tokens.len(),
+            "decoder prefill length"
+        );
+        let mut cache = self.open_cache(encoder, valid)?;
+        let mut logits = Vec::with_capacity(tokens.len() * self.vocab as usize);
+        let first = self.cached_block(&mut cache, &tokens[..prefill])?;
+        logits.extend(self.stream.clone_dtoh(&first)?);
+        for id in &tokens[prefill..] {
+            let row = self.cached_block(&mut cache, &[*id])?;
+            logits.extend(self.stream.clone_dtoh(&row)?);
+        }
+        Ok(logits)
+    }
+
+    /// After the prefill stores cross K, move each K row one frame later and run one forced step.
+    pub fn cached_step_with_shifted_cross_k(
+        &self,
+        encoder: &[f32],
+        valid: usize,
+        tokens: &[u32],
+        prefill: usize,
+    ) -> Result<Vec<f32>> {
+        ensure!(tokens.len() == prefill + 1, "decoder shift length");
+        let mut cache = self.open_cache(encoder, valid)?;
+        self.cached_block(&mut cache, &tokens[..prefill])?;
+        self.shift_cross_k(&mut cache)?;
+        let row = self.cached_block(&mut cache, &tokens[prefill..])?;
+        self.last_logit_row(&row, 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encode_calls(&self) -> u64 {
+        self.encoder.encode_calls()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_encode_calls(&self) {
+        self.encoder.reset_encode_calls();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cross_writes(&self) -> u64 {
+        self.cross_writes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_cross_writes(&self) {
+        self.cross_writes.store(0, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -565,5 +935,16 @@ mod position_tests {
         assert_eq!(row[512], 1f32.cos() / 32.0);
         assert!(sinusoidal_rows(0, 1024).is_err());
         assert!(sinusoidal_rows(1025, 1024).is_err());
+    }
+
+    #[test]
+    fn next_position_stops_at_1024() {
+        assert!(super::require_prompt_length(0).is_err());
+        assert!(super::require_prompt_length(1025).is_err());
+        assert!(super::require_prompt_length(1).is_ok());
+        assert!(super::require_prompt_length(1023).is_ok());
+        assert!(super::require_prompt_length(1024).is_ok());
+        assert!(super::require_step_position(1023).is_ok());
+        assert!(super::require_step_position(1024).is_err());
     }
 }
