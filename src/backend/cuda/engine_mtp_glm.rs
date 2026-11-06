@@ -305,7 +305,12 @@ pub(crate) struct GlmMtpRuntime {
 }
 
 impl GlmMtpRuntime {
-    pub(crate) fn load(model_dir: &Path, device: &Device, _blas: &Blas) -> Result<Self> {
+    pub(crate) fn load(
+        model_dir: &Path,
+        device: &Device,
+        _blas: &Blas,
+        standalone_weights: bool,
+    ) -> Result<Self> {
         unsafe {
             device.ctx.disable_event_tracking();
         }
@@ -404,7 +409,11 @@ impl GlmMtpRuntime {
         let dsa_spec = DsaSpec::glm53();
         let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, 2048, 1)?;
         #[cfg(test)]
-        let standalone_dsa = Some(DsaState::new(dsa_spec, 2048, stream)?);
+        let standalone_dsa = if standalone_weights {
+            Some(DsaState::new(dsa_spec, 2048, stream)?)
+        } else {
+            None
+        };
 
         let enorm_w =
             stream.clone_htod(&get_st_bf16("model.language_model.layers.45.enorm.weight")?)?;
@@ -665,13 +674,22 @@ impl GlmMtpRuntime {
         )?)?;
 
         #[cfg(test)]
-        let standalone_embed = match get_st_bf16("model.language_model.embed_tokens.weight") {
-            Ok(v) => Some(stream.clone_htod(&v)?),
-            Err(_) => None,
+        let standalone_embed = if standalone_weights {
+            match get_st_bf16("model.language_model.embed_tokens.weight") {
+                Ok(v) => Some(stream.clone_htod(&v)?),
+                Err(_) => None,
+            }
+        } else {
+            None
         };
-        let standalone_head = match get_st_bf16("lm_head.weight") {
-            Ok(v) => Some(stream.clone_htod(&v)?),
-            Err(_) => None,
+        #[cfg(test)]
+        let standalone_head = if standalone_weights {
+            match get_st_bf16("lm_head.weight") {
+                Ok(v) => Some(stream.clone_htod(&v)?),
+                Err(_) => None,
+            }
+        } else {
+            None
         };
 
         let kv_a_w = make_fp8_weight(&kv_a_codes, &kv_a_scales, stream, 512, 4096)?;

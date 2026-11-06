@@ -489,7 +489,7 @@ impl Engine {
                 .as_ref()
                 .context("GLM runtime missing")?
                 .checkpoint_path();
-            let glm_runtime = GlmMtpRuntime::load(dir, &self.device, &self.blas)?;
+            let glm_runtime = GlmMtpRuntime::load(dir, &self.device, &self.blas, false)?;
             let spec = crate::mtp::component_spec(&self.model_spec)?;
             let state = StateStore::new(&spec, self.capacity, &self.device.stream)?;
             let target_checkpoint =
