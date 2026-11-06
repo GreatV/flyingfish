@@ -19,11 +19,34 @@ pub struct Config {
     pub hidden_act: String,
     pub tie_word_embeddings: bool,
     pub torch_dtype: String,
+    #[serde(deserialize_with = "eos_ids")]
     pub eos_token_id: Vec<u32>,
     #[serde(default)]
     pub attention_bias: bool,
     #[serde(default)]
     pub mlp_bias: bool,
+}
+
+fn eos_ids<'de, D>(d: D) -> std::result::Result<Vec<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(d)?;
+    let values = match value {
+        serde_json::Value::Array(a) => a,
+        v @ serde_json::Value::Number(_) => vec![v],
+        _ => return Err(D::Error::custom("EOS must be an integer or array")),
+    };
+    values
+        .iter()
+        .map(|v| {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| D::Error::custom("EOS must be an unsigned integer"))?;
+            u32::try_from(n).map_err(|_| D::Error::custom("EOS outside u32"))
+        })
+        .collect()
 }
 
 impl Config {

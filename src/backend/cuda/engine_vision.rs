@@ -12566,6 +12566,7 @@ mod tests {
                     upload_content_sha256: None,
                     upload_hashed_bytes: None,
                     load_wall_ms: 0.0,
+                    classic: None,
                 };
                 let patch =
                     BiasedWeight::patch(&mut catalog, prefix, [width, input], &stored_shape)?;

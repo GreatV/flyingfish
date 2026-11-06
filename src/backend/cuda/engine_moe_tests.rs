@@ -1162,6 +1162,7 @@ impl Engine {
             upload_content_sha256: None,
             upload_hashed_bytes: None,
             load_wall_ms: 0.0,
+            classic: None,
         };
         let plan = crate::linear_plan::LayerDequantPlan::from_manifest(
             &catalog.manifest,
@@ -1358,6 +1359,8 @@ impl Engine {
             spec: None,
             graph: None,
             weights,
+            catalog: None,
+            dense_graphs: Vec::new(),
             state,
             capture_checkpoint,
             work,

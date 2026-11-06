@@ -51,6 +51,214 @@ pub struct Layer {
     pub down: CudaSlice<bf16>,
 }
 
+/// Fused projection groups of one classic decoder layer, derived from Config. The
+/// classic forward consumes qkv as one `[qkv_dim, hidden]` matrix laid out
+/// `[q; k; v]`, and gu as one `[2 * intermediate, hidden]` matrix laid out
+/// `[gate; up]`. The order is load-bearing: swapping q/k/v or the gate/up halves
+/// silently reorders weights without changing byte counts, so `Weights::load`
+/// and the streamed catalogue binding both derive their layout from this spec.
+pub(crate) struct ClassicFused {
+    pub qkv: [(String, Vec<usize>); 3],
+    pub gu: [(String, Vec<usize>); 2],
+}
+
+impl ClassicFused {
+    pub(crate) fn new(c: &Config, layer: usize) -> Self {
+        let prefix = format!("model.layers.{layer}");
+        let h = c.hidden_size;
+        let kv = c.kv_dim();
+        let f = c.intermediate_size;
+        Self {
+            qkv: [
+                (format!("{prefix}.self_attn.q_proj.weight"), vec![h, h]),
+                (format!("{prefix}.self_attn.k_proj.weight"), vec![kv, h]),
+                (format!("{prefix}.self_attn.v_proj.weight"), vec![kv, h]),
+            ],
+            gu: [
+                (format!("{prefix}.mlp.gate_proj.weight"), vec![f, h]),
+                (format!("{prefix}.mlp.up_proj.weight"), vec![f, h]),
+            ],
+        }
+    }
+
+    /// Rejects any q/k/v or gate/up reorder. Call before binding the fused groups.
+    pub(crate) fn validate(&self, layer: usize) -> Result<()> {
+        let prefix = format!("model.layers.{layer}");
+        let want_qkv = [
+            format!("{prefix}.self_attn.q_proj.weight"),
+            format!("{prefix}.self_attn.k_proj.weight"),
+            format!("{prefix}.self_attn.v_proj.weight"),
+        ];
+        let want_gu = [
+            format!("{prefix}.mlp.gate_proj.weight"),
+            format!("{prefix}.mlp.up_proj.weight"),
+        ];
+        ensure!(
+            self.qkv.iter().map(|p| &p.0).eq(want_qkv.iter()),
+            "classic qkv binding out of order at layer {layer}"
+        );
+        ensure!(
+            self.gu.iter().map(|p| &p.0).eq(want_gu.iter()),
+            "classic gate/up binding out of order at layer {layer}"
+        );
+        Ok(())
+    }
+}
+
+fn classic_qkv_name(layer: usize) -> String {
+    format!("model.layers.{layer}.self_attn.qkv_proj.weight")
+}
+
+fn classic_gu_name(layer: usize) -> String {
+    format!("model.layers.{layer}.mlp.gu_proj.weight")
+}
+
+#[cfg(feature = "cuda")]
+fn slice_stream(s: &CudaSlice<bf16>) -> &Arc<CudaStream> {
+    s.stream()
+}
+
+#[cfg(feature = "rocm")]
+fn slice_stream(s: &CudaSlice<bf16>) -> &Arc<CudaStream> {
+    s.stream()
+}
+
+fn classic_order(
+    dir: &Path,
+    spec: &crate::model_spec::ModelSpec,
+) -> Result<Option<Vec<Vec<String>>>> {
+    if spec.architecture != crate::model_spec::Architecture::Llama {
+        return Ok(None);
+    }
+    let c = Config::read(dir)?;
+    let mut order = Vec::with_capacity(spec.layers.len());
+    for layer in 0..spec.layers.len() {
+        let fused = ClassicFused::new(&c, layer);
+        fused.validate(layer)?;
+        let p = format!("model.layers.{layer}");
+        let names = vec![
+            fused.qkv[0].0.clone(),
+            fused.qkv[1].0.clone(),
+            fused.qkv[2].0.clone(),
+            fused.gu[0].0.clone(),
+            fused.gu[1].0.clone(),
+            format!("{p}.self_attn.o_proj.weight"),
+            format!("{p}.mlp.down_proj.weight"),
+        ];
+        crate::checkpoint::validate_classic_order(layer, &names)?;
+        order.push(names);
+    }
+    Ok(Some(order))
+}
+
+fn classic_fused_specs(
+    manifest: &TensorManifest,
+    order: &[String],
+    layer: usize,
+) -> Result<ClassicFused> {
+    ensure!(
+        order.len() == 7,
+        "classic layer {layer} has {} projections",
+        order.len()
+    );
+    let shape = |index: usize| -> Result<Vec<usize>> {
+        Ok(manifest
+            .entries
+            .get(&order[index])
+            .with_context(|| format!("classic tensor {} missing", order[index]))?
+            .shape
+            .clone())
+    };
+    let fused = ClassicFused {
+        qkv: [
+            (order[0].clone(), shape(0)?),
+            (order[1].clone(), shape(1)?),
+            (order[2].clone(), shape(2)?),
+        ],
+        gu: [(order[3].clone(), shape(3)?), (order[4].clone(), shape(4)?)],
+    };
+    fused.validate(layer)?;
+    Ok(fused)
+}
+
+fn emit_classic_resident(
+    loader: &mut Loader<'_>,
+    tensors: &mut BTreeMap<String, StoredTensor>,
+    manifest: &TensorManifest,
+    order: &[String],
+    layer: usize,
+) -> Result<()> {
+    let fused = classic_fused_specs(manifest, order, layer)?;
+    let qkv = loader.load(&fused.qkv)?;
+    let gu = loader.load(&fused.gu)?;
+    tensors.insert(classic_qkv_name(layer), StoredTensor::Bf16(qkv));
+    tensors.insert(classic_gu_name(layer), StoredTensor::Bf16(gu));
+    for name in &order[5..] {
+        let entry = manifest
+            .entries
+            .get(name)
+            .with_context(|| format!("classic tensor {name} missing"))?;
+        tensors.insert(name.clone(), StoredTensor::load(loader, name, entry)?);
+    }
+    Ok(())
+}
+
+pub(crate) struct ClassicLayerRefs<'a> {
+    pub qkv: super::linear::LinearWeightRef,
+    pub o: super::linear::LinearWeightRef,
+    pub gu: super::linear::LinearWeightRef,
+    pub down: super::linear::LinearWeightRef,
+    pub input_norm: &'a CudaSlice<bf16>,
+    pub post_norm: &'a CudaSlice<bf16>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct SlotWeight<'a> {
+    ptr: u64,
+    len: usize,
+    stream: &'a Arc<CudaStream>,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> SlotWeight<'a> {
+    pub(crate) fn new(
+        weight: super::linear::LinearWeightRef,
+        stream: &'a Arc<CudaStream>,
+    ) -> Result<Self> {
+        let super::linear::LinearWeightRef::Bf16(tensor) = weight else {
+            bail!("classic streamed weight is not BF16");
+        };
+        let len = usize::try_from(tensor.shape[0])?
+            .checked_mul(usize::try_from(tensor.shape[1])?)
+            .context("classic slot element count overflow")?;
+        Ok(Self {
+            ptr: tensor.ptr,
+            len,
+            stream,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl cudarc::driver::DeviceSlice<bf16> for SlotWeight<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn stream(&self) -> &Arc<CudaStream> {
+        self.stream
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl cudarc::driver::DevicePtr<bf16> for SlotWeight<'_> {
+    fn device_ptr<'b>(
+        &'b self,
+        _stream: &'b CudaStream,
+    ) -> (sys::CUdeviceptr, cudarc::driver::SyncOnDrop<'b>) {
+        (self.ptr, cudarc::driver::SyncOnDrop::Record(None))
+    }
+}
+
 pub struct Weights {
     pub embed: Option<CudaSlice<bf16>>,
     pub layers: Vec<Layer>,
@@ -991,6 +1199,40 @@ fn decode_bf16(bytes: &[u8], values: &mut [bf16]) {
     }
 }
 
+#[cfg(test)]
+mod fused_order_tests {
+    use crate::checkpoint::classic_layer_names;
+
+    #[test]
+    fn fused_order_pins_qkv_and_gate_up_halves() {
+        let p = "model.layers.3";
+        let correct = classic_layer_names(3);
+        assert_eq!(
+            correct,
+            [
+                format!("{p}.self_attn.q_proj.weight"),
+                format!("{p}.self_attn.k_proj.weight"),
+                format!("{p}.self_attn.v_proj.weight"),
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+                format!("{p}.self_attn.o_proj.weight"),
+                format!("{p}.mlp.down_proj.weight"),
+            ]
+        );
+        assert_ne!(classic_layer_names(3), classic_layer_names(4));
+    }
+
+    #[test]
+    fn fused_order_swaps_change_the_binding() {
+        let correct = classic_layer_names(3);
+        for (x, y) in [(0, 1), (1, 2), (0, 2), (3, 4)] {
+            let mut swapped = correct.clone();
+            swapped.swap(x, y);
+            assert_ne!(swapped, correct, "swap {x}/{y} must change the binding");
+        }
+    }
+}
+
 impl Weights {
     pub fn embedding(&self) -> &CudaSlice<bf16> {
         self.embed.as_ref().unwrap_or(&self.head)
@@ -1055,6 +1297,7 @@ impl Weights {
         Ok(weights)
     }
 
+    #[cfg(feature = "rocm")]
     pub fn load(dir: &Path, c: &Config, d: &Device) -> Result<Self> {
         checkpoint(dir, d, |l| {
             let h = c.hidden_size;
@@ -1070,21 +1313,10 @@ impl Weights {
                 let post_norm = one("post_attention_layernorm", vec![h])?;
                 let o = one("self_attn.o_proj", vec![h, h])?;
                 let down = one("mlp.down_proj", vec![h, f])?;
-                let qkv = l.load(&[
-                    (format!("{prefix}.self_attn.q_proj.weight"), vec![h, h]),
-                    (
-                        format!("{prefix}.self_attn.k_proj.weight"),
-                        vec![c.kv_dim(), h],
-                    ),
-                    (
-                        format!("{prefix}.self_attn.v_proj.weight"),
-                        vec![c.kv_dim(), h],
-                    ),
-                ])?;
-                let gu = l.load(&[
-                    (format!("{prefix}.mlp.gate_proj.weight"), vec![f, h]),
-                    (format!("{prefix}.mlp.up_proj.weight"), vec![f, h]),
-                ])?;
+                let fused = ClassicFused::new(c, i);
+                fused.validate(i)?;
+                let qkv = l.load(&fused.qkv)?;
+                let gu = l.load(&fused.gu)?;
                 layers.push(Layer {
                     input_norm: Some(input_norm),
                     qkv,
@@ -1682,6 +1914,7 @@ impl DenseStreaming {
         manifest: &TensorManifest,
         plan: crate::prefill::DensePlacement,
         d: &Device,
+        order: Option<&[Vec<String>]>,
     ) -> Result<Self> {
         use crate::experts::{catalogue::NativeRange, disk::DiskReader};
         let mut layers: Vec<_> = plan
@@ -1699,15 +1932,10 @@ impl DenseStreaming {
             })
             .collect();
         let mut ranges = vec![Vec::new(); layers.len()];
-        for (name, entry) in manifest
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.is_linear_projection() && entry.layer.is_some())
-        {
-            let layer_index = entry.layer.context("dense layer missing")? as usize;
+        let mut add = |name: &String, layer_index: usize, entry: &TensorEntry| -> Result<()> {
             let layer = &mut layers[layer_index];
             if layer.slot.is_none() {
-                continue;
+                return Ok(());
             }
             let device_offset = layer.bytes;
             let source_offset = layer.source_bytes;
@@ -1739,6 +1967,31 @@ impl DenseStreaming {
                         len: entry.bytes as u64,
                     },
                 ));
+            }
+            Ok(())
+        };
+        if let Some(order) = order {
+            for (layer_index, names) in order.iter().enumerate() {
+                for name in names {
+                    let entry = manifest
+                        .entries
+                        .get(name)
+                        .with_context(|| format!("dense ordered tensor {name} missing"))?;
+                    ensure!(
+                        entry.is_linear_projection() && entry.layer == Some(layer_index as u32),
+                        "dense ordered tensor {name} is outside layer {layer_index}"
+                    );
+                    add(name, layer_index, entry)?;
+                }
+            }
+        } else {
+            for (name, entry) in manifest
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.is_linear_projection() && entry.layer.is_some())
+            {
+                let layer_index = entry.layer.context("dense layer missing")? as usize;
+                add(name, layer_index, entry)?;
             }
         }
         let staging_bytes = layers
@@ -2211,9 +2464,76 @@ impl StoredTensor {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn emit_classic_streamed(
+    loader: &mut Loader<'_>,
+    tensors: &mut BTreeMap<String, StoredTensor>,
+    dense: &mut DenseStreaming,
+    manifest: &TensorManifest,
+    order: &[String],
+    offsets: &mut [usize],
+    layer: usize,
+) -> Result<()> {
+    classic_fused_specs(manifest, order, layer)?;
+    let mut qkv: Option<(u64, usize)> = None;
+    let mut gu: Option<(u64, usize)> = None;
+    for (index, name) in order.iter().enumerate() {
+        let entry = manifest
+            .entries
+            .get(name)
+            .with_context(|| format!("classic tensor {name} missing"))?;
+        let offset = offsets[layer];
+        let pointer = dense.pointer(layer, offset, entry.bytes)?;
+        offsets[layer] = offset
+            .checked_add(entry.bytes)
+            .context("classic dense offset overflow")?;
+        dense.defer(loader, name, entry, layer, offset)?;
+        match index {
+            0 => qkv = Some((pointer, entry.bytes)),
+            1 | 2 => {
+                let (base, bytes) = qkv.context("classic qkv group missing")?;
+                qkv = Some((base, bytes + entry.bytes));
+            }
+            3 => gu = Some((pointer, entry.bytes)),
+            4 => {
+                let (base, bytes) = gu.context("classic gate/up group missing")?;
+                gu = Some((base, bytes + entry.bytes));
+            }
+            5 | 6 => {
+                tensors.insert(
+                    name.clone(),
+                    StoredTensor::Slot {
+                        pointer,
+                        bytes: entry.bytes,
+                    },
+                );
+            }
+            _ => unreachable!("classic layer has seven projections"),
+        }
+    }
+    let (qkv_pointer, qkv_bytes) = qkv.context("classic qkv group missing")?;
+    let (gu_pointer, gu_bytes) = gu.context("classic gate/up group missing")?;
+    tensors.insert(
+        classic_qkv_name(layer),
+        StoredTensor::Slot {
+            pointer: qkv_pointer,
+            bytes: qkv_bytes,
+        },
+    );
+    tensors.insert(
+        classic_gu_name(layer),
+        StoredTensor::Slot {
+            pointer: gu_pointer,
+            bytes: gu_bytes,
+        },
+    );
+    Ok(())
+}
+
 pub(crate) struct WeightCatalog {
     #[cfg(feature = "cuda")]
     pub dense: Option<DenseStreaming>,
+    pub classic: Option<Vec<Vec<String>>>,
     pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
@@ -2299,6 +2619,7 @@ impl WeightCatalog {
         );
         let mapped = MappedCheckpoint::open(dir)?;
         let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let order = classic_order(dir, spec)?;
         let mut layers = vec![0usize; spec.layers.len()];
         let mut shard_alignments = BTreeMap::new();
         let mut ranges = Vec::new();
@@ -2386,7 +2707,7 @@ impl WeightCatalog {
             serde_json::json!({"dense_placement": &plan, "fixed_bytes": fixed, "transient_bytes": transient_bytes, "host_available_bytes": available_host, "copy_engines": copy_engines, "memory_bus_bits": memory_bus_bits, "sms": d.info.sms, "pcie_link_width": link_width, "pcie_max_link_speed": link_speed.trim()})
         );
         let started = Instant::now();
-        let mut dense = DenseStreaming::new(dir, &manifest, plan, d)?;
+        let mut dense = DenseStreaming::new(dir, &manifest, plan, d, order.as_deref())?;
         let mut offsets = vec![0; layers.len()];
         let gemma = matches!(
             spec.architecture,
@@ -2396,9 +2717,38 @@ impl WeightCatalog {
         let ((tensors, uploaded), _) =
             checkpoint_mapped(&mapped, d, Some(&manifest), false, |loader| {
                 let mut tensors = BTreeMap::new();
+                let mut processed = BTreeSet::new();
                 let mut iter = manifest.entries.iter().peekable();
                 while let Some((name, entry)) = iter.next() {
                     if !entry.load {
+                        continue;
+                    }
+                    if let Some(order) = &order
+                        && entry.is_linear_projection()
+                        && let Some(layer) = entry.layer
+                    {
+                        let layer = layer as usize;
+                        if processed.insert(layer) {
+                            if dense.plan.slots[layer].is_some() {
+                                emit_classic_streamed(
+                                    loader,
+                                    &mut tensors,
+                                    &mut dense,
+                                    &manifest,
+                                    &order[layer],
+                                    &mut offsets,
+                                    layer,
+                                )?;
+                            } else {
+                                emit_classic_resident(
+                                    loader,
+                                    &mut tensors,
+                                    &manifest,
+                                    &order[layer],
+                                    layer,
+                                )?;
+                            }
+                        }
                         continue;
                     }
                     if entry.is_linear_projection()
@@ -2450,6 +2800,7 @@ impl WeightCatalog {
             .context("dense device extent overflow")?;
         Ok(Self {
             dense: Some(dense),
+            classic: order,
             linear_format: spec.linear_format,
             tensors,
             manifest,
@@ -2516,6 +2867,129 @@ impl WeightCatalog {
             bytes: self.bytes,
         })
     }
+
+    pub(crate) fn classic_layers(&self) -> usize {
+        self.classic.as_ref().map_or(0, Vec::len)
+    }
+
+    pub(crate) fn classic_norm(&self, layer: usize, kind: &str) -> Result<&CudaSlice<bf16>> {
+        self.bf16(&format!("model.layers.{layer}.{kind}.weight"))
+    }
+
+    fn classic_weight(
+        &self,
+        name: &str,
+        shape: [usize; 2],
+    ) -> Result<super::linear::LinearWeightRef> {
+        let rows = u32::try_from(shape[0])?;
+        let width = u32::try_from(shape[1])?;
+        let bytes = shape[0]
+            .checked_mul(shape[1])
+            .and_then(|n| n.checked_mul(2))
+            .context("classic fused group byte extent overflow")?;
+        match self
+            .tensors
+            .get(name)
+            .with_context(|| format!("classic fused group {name} missing"))?
+        {
+            #[cfg(feature = "cuda")]
+            StoredTensor::Slot {
+                pointer,
+                bytes: extent,
+            } => {
+                ensure!(
+                    *extent == bytes,
+                    "classic fused slot extent differs: {name}"
+                );
+                Ok(super::linear::LinearWeightRef::Bf16(unsafe {
+                    super::contracts::Tensor::new(
+                        *pointer,
+                        [rows, width],
+                        [u64::from(width), 1],
+                        *extent as u64,
+                    )?
+                }))
+            }
+            StoredTensor::Bf16(values) => {
+                ensure!(
+                    values.len() * 2 == bytes,
+                    "classic fused resident extent differs: {name}"
+                );
+                Ok(super::linear::LinearWeightRef::Bf16(
+                    super::contracts::view(
+                        values,
+                        slice_stream(values),
+                        0,
+                        [rows, width],
+                        [u64::from(width), 1],
+                    )?,
+                ))
+            }
+            _ => anyhow::bail!("classic fused group is not a BF16 tensor: {name}"),
+        }
+    }
+
+    pub(crate) fn classic_fused_ref(&self, layer: usize) -> Result<ClassicLayerRefs<'_>> {
+        let order = self
+            .classic
+            .as_ref()
+            .context("classic catalogue binding missing")?
+            .get(layer)
+            .with_context(|| format!("classic layer {layer} outside catalogue"))?;
+        crate::checkpoint::validate_classic_order(layer, order)?;
+        let shapes: Vec<Vec<usize>> = order
+            .iter()
+            .map(|name| {
+                Ok(self
+                    .manifest
+                    .entries
+                    .get(name)
+                    .with_context(|| format!("classic tensor {name} missing"))?
+                    .shape
+                    .clone())
+            })
+            .collect::<Result<_>>()?;
+        let h = *shapes[0]
+            .get(1)
+            .context("classic q_proj has no input width")?;
+        ensure!(
+            shapes[..6].iter().all(|s| s.len() == 2 && s[1] == h),
+            "classic layer {layer} projection widths differ"
+        );
+        ensure!(shapes[0][0] == h, "classic q_proj row width differs");
+        ensure!(
+            shapes[1] == shapes[2] && shapes[1][0] <= h,
+            "classic k/v widths differ"
+        );
+        ensure!(shapes[3] == shapes[4], "classic gate/up widths differ");
+        ensure!(shapes[5] == [h, h], "classic o_proj layout differs");
+        ensure!(
+            shapes[6] == [h, shapes[3][0]],
+            "classic down_proj layout differs"
+        );
+        let qkv_rows = shapes[0][0] + shapes[1][0] + shapes[2][0];
+        let gu_rows = shapes[3][0] + shapes[4][0];
+        let qkv = self.classic_weight(&classic_qkv_name(layer), [qkv_rows, h])?;
+        let gu = self.classic_weight(&classic_gu_name(layer), [gu_rows, h])?;
+        let input_norm = self.classic_norm(layer, "input_layernorm")?;
+        let post_norm = self.classic_norm(layer, "post_attention_layernorm")?;
+        let o = self.linear_ref(&order[5], slice_stream(input_norm))?;
+        let down = self.linear_ref(&order[6], slice_stream(input_norm))?;
+        ensure!(
+            matches!(o, super::linear::LinearWeightRef::Bf16(_))
+                && matches!(down, super::linear::LinearWeightRef::Bf16(_)),
+            "classic layer {layer} has non-BF16 o/down projections"
+        );
+        Ok(ClassicLayerRefs {
+            qkv,
+            o,
+            gu,
+            down,
+            input_norm,
+            post_norm,
+        })
+    }
+
     pub fn load(dir: &Path, spec: &crate::model_spec::ModelSpec, d: &Device) -> Result<Self> {
         Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, false)
     }
@@ -2569,10 +3043,12 @@ impl WeightCatalog {
             crate::model_spec::Architecture::Gemma4
                 | crate::model_spec::Architecture::EmbeddingGemma2
         );
+        let classic = classic_order(dir, spec)?;
         let phase = Instant::now();
         let ((tensors, bytes, upload_timings), upload_digest) =
             checkpoint_mapped(&mapped, d, Some(&manifest), hash_uploads, |loader| {
                 let mut tensors = BTreeMap::new();
+                let mut processed = BTreeSet::new();
                 let mut iter = manifest.entries.iter().peekable();
                 while let Some((name, entry)) = iter.next() {
                     if !entry.load {
@@ -2583,6 +3059,22 @@ impl WeightCatalog {
                             loader.seen.insert(name.clone()),
                             "expert tensor delegated twice: name={name}"
                         );
+                        continue;
+                    }
+                    if let Some(order) = &classic
+                        && entry.is_linear_projection()
+                        && let Some(layer) = entry.layer
+                    {
+                        let layer = layer as usize;
+                        if processed.insert(layer) {
+                            emit_classic_resident(
+                                loader,
+                                &mut tensors,
+                                &manifest,
+                                &order[layer],
+                                layer,
+                            )?;
+                        }
                         continue;
                     }
                     if gemma
@@ -2627,6 +3119,7 @@ impl WeightCatalog {
         Ok(Self {
             #[cfg(feature = "cuda")]
             dense: None,
+            classic,
             linear_format: spec.linear_format,
             tensors,
             manifest,
@@ -2717,6 +3210,138 @@ mod tests {
     use super::*;
     use half::bf16;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn classic_streamed_slots_bind_fused_order_per_layer() -> Result<()> {
+        use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope, classic_layer_names};
+        let h = 64usize;
+        let kv = 32usize;
+        let f = 96usize;
+        let rows = [h, kv, kv, f, f, h, h];
+        let widths = [h, h, h, h, h, h, f];
+        let mut entries = BTreeMap::new();
+        let mut tensors = BTreeMap::new();
+        let mut order = Vec::new();
+        for layer in 0..2usize {
+            let names = classic_layer_names(layer).to_vec();
+            let base = 0x1000u64 + (layer as u64) * 0x10000;
+            let mut offset = 0usize;
+            for (index, name) in names.iter().enumerate() {
+                let shape = vec![rows[index], widths[index]];
+                let bytes = rows[index] * widths[index] * 2;
+                entries.insert(
+                    name.clone(),
+                    TensorEntry {
+                        dtype: Dtype::BF16,
+                        shape,
+                        shard: String::new(),
+                        bytes,
+                        load: true,
+                        data_start: 0,
+                        data_offsets: [0, bytes as u64],
+                        scope: TensorScope::Text,
+                        layer: Some(layer as u32),
+                        role: name.clone(),
+                        scale_name: None,
+                        quant: None,
+                        swap_halves: false,
+                    },
+                );
+                tensors.insert(
+                    name.clone(),
+                    StoredTensor::Slot {
+                        pointer: base + offset as u64,
+                        bytes,
+                    },
+                );
+                offset += bytes;
+            }
+            let qkv_bytes = (0..3).map(|i| rows[i] * widths[i] * 2).sum::<usize>();
+            let gu_bytes = (3..5).map(|i| rows[i] * widths[i] * 2).sum::<usize>();
+            tensors.insert(
+                classic_qkv_name(layer),
+                StoredTensor::Slot {
+                    pointer: base,
+                    bytes: qkv_bytes,
+                },
+            );
+            tensors.insert(
+                classic_gu_name(layer),
+                StoredTensor::Slot {
+                    pointer: base + qkv_bytes as u64,
+                    bytes: gu_bytes,
+                },
+            );
+            order.push(names);
+        }
+        let catalog = WeightCatalog {
+            dense: None,
+            classic: Some(order.clone()),
+            linear_format: crate::model_spec::LinearFormat::Bf16,
+            tensors,
+            manifest: TensorManifest {
+                entries,
+                resident_bytes: 0,
+            },
+            bytes: 0,
+            upload_content_sha256: None,
+            upload_hashed_bytes: None,
+            load_wall_ms: 0.0,
+        };
+        let mut pointers = Vec::new();
+        for (layer, names) in order.iter().enumerate() {
+            let fused = classic_fused_specs(&catalog.manifest, names, layer)?;
+            let qkv_rows: usize = fused.qkv.iter().map(|(_, s)| s[0]).sum();
+            let gu_rows: usize = fused.gu.iter().map(|(_, s)| s[0]).sum();
+            let base = 0x1000u64 + (layer as u64) * 0x10000;
+            let qkv_bytes = (0..3).map(|i| rows[i] * widths[i] * 2).sum::<usize>();
+            let gu_bytes = (3..5).map(|i| rows[i] * widths[i] * 2).sum::<usize>();
+            let o_bytes = h * h * 2;
+            let expected = [
+                (classic_qkv_name(layer), [qkv_rows, h], base),
+                (
+                    classic_gu_name(layer),
+                    [gu_rows, h],
+                    base + qkv_bytes as u64,
+                ),
+                (
+                    names[5].clone(),
+                    [h, h],
+                    base + (qkv_bytes + gu_bytes) as u64,
+                ),
+                (
+                    names[6].clone(),
+                    [h, f],
+                    base + (qkv_bytes + gu_bytes + o_bytes) as u64,
+                ),
+            ];
+            for (name, shape, pointer) in expected {
+                let crate::backend::cuda::linear::LinearWeightRef::Bf16(weight) =
+                    catalog.classic_weight(&name, shape)?
+                else {
+                    bail!("classic slot binding is not BF16: {name}");
+                };
+                assert_eq!(weight.ptr, pointer, "slot pointer for {name}");
+                assert_eq!(
+                    weight.shape,
+                    [shape[0] as u32, shape[1] as u32],
+                    "slot shape for {name}"
+                );
+                pointers.push(weight.ptr);
+            }
+        }
+        assert_ne!(
+            pointers[0], pointers[4],
+            "layer 0 and layer 1 must bind different slots"
+        );
+        let mut swapped = order[1].clone();
+        swapped.swap(0, 1);
+        assert!(
+            classic_fused_specs(&catalog.manifest, &swapped, 1).is_err(),
+            "q/k swap must be rejected"
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUDA and a dense streaming window"]
@@ -2931,7 +3556,7 @@ mod tests {
                     plan.slots.iter().all(Option::is_some),
                     "streaming gate has a resident layer"
                 );
-                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device)?;
+                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
                 if host_layers == 4 {
                     ensure!(
                         dense.disk.is_none() && dense.events.is_none(),
@@ -3019,7 +3644,7 @@ mod tests {
             for skip_reclaim in [false, true] {
                 let plan =
                     crate::prefill::DensePlacement::new(&[per_layer; 4], None, 2 * per_layer, 0)?;
-                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device)?;
+                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
                 populate(&mut dense)?;
                 dense.skip_reclaim = skip_reclaim;
                 let gate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3878,5 +4503,67 @@ impl DiffusionWeights {
             })
         })?;
         Ok(weights)
+    }
+}
+
+#[cfg(test)]
+mod classic_fused_tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            model_type: "llama".into(),
+            hidden_size: 7168,
+            intermediate_size: 22016,
+            num_hidden_layers: 52,
+            num_attention_heads: 56,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            vocab_size: 166912,
+            max_position_embeddings: 524288,
+            rms_norm_eps: 1e-5,
+            rope_theta: 120000000.0,
+            rope_scaling: None,
+            hidden_act: "silu".into(),
+            tie_word_embeddings: false,
+            torch_dtype: "bfloat16".into(),
+            eos_token_id: vec![166101],
+            attention_bias: false,
+            mlp_bias: false,
+        }
+    }
+
+    #[test]
+    fn classic_fused_binding_pins_qkv_and_gate_up_order() -> Result<()> {
+        let c = config();
+        let fused = ClassicFused::new(&c, 7);
+        fused.validate(7)?;
+        assert_eq!(fused.qkv[0].1, vec![c.hidden_size, c.hidden_size]);
+        assert_eq!(fused.qkv[1].1, vec![c.kv_dim(), c.hidden_size]);
+        assert_eq!(fused.qkv[2].1, vec![c.kv_dim(), c.hidden_size]);
+        assert_eq!(fused.gu[0].1, vec![c.intermediate_size, c.hidden_size]);
+        assert_eq!(fused.gu[1].1, vec![c.intermediate_size, c.hidden_size]);
+        Ok(())
+    }
+
+    #[test]
+    fn classic_fused_binding_rejects_swapped_orders() {
+        let c = config();
+        let mut swapped_qk = ClassicFused::new(&c, 3);
+        swapped_qk.qkv.swap(0, 1);
+        assert!(swapped_qk.validate(3).is_err(), "q/k swap must be rejected");
+        let mut swapped_kv = ClassicFused::new(&c, 3);
+        swapped_kv.qkv.swap(1, 2);
+        assert!(swapped_kv.validate(3).is_err(), "k/v swap must be rejected");
+        let mut swapped_gu = ClassicFused::new(&c, 3);
+        swapped_gu.gu.swap(0, 1);
+        assert!(
+            swapped_gu.validate(3).is_err(),
+            "gate/up swap must be rejected"
+        );
+        assert!(
+            ClassicFused::new(&c, 3).validate(4).is_err(),
+            "layer mismatch must be rejected"
+        );
     }
 }

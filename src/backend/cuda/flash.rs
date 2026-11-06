@@ -112,6 +112,12 @@ struct Split {
     chunk: u32,
 }
 
+// D128 native prefill requires head_dim 128 and q_heads a multiple of kv_heads.
+#[cfg(feature = "cuda")]
+fn native_d128(heads: usize, kv_heads: usize, head_dim: usize) -> bool {
+    head_dim == 128 && kv_heads > 0 && heads.is_multiple_of(kv_heads)
+}
+
 fn split_extent(capacity: usize, heads: usize, resident: usize) -> Result<(usize, usize)> {
     ensure!(
         capacity > 0 && capacity <= i32::MAX as usize,
@@ -468,16 +474,8 @@ impl Flash {
         };
         #[cfg(feature = "cuda")]
         let native = if matches!(head_dim, 64 | 72 | 256 | 512)
-            || matches!(
-                (heads, kv_heads, head_dim),
-                (16, 2, 128)
-                    | (16, 8, 128)
-                    | (12, 12, 128)
-                    | (32, 4, 128)
-                    | (56, 56, 128)
-                    | (32, 8, 128)
-                    | (64, 8, 128)
-            ) {
+            || native_d128(heads, kv_heads, head_dim)
+        {
             use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
             let ctx = stream.context();
             ensure!(
@@ -1691,6 +1689,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn native_d128_admits_integral_gqa() {
+        for (heads, kv_heads) in [
+            (16, 2),
+            (16, 8),
+            (12, 12),
+            (32, 4),
+            (56, 56),
+            (32, 8),
+            (64, 8),
+            (56, 8),
+        ] {
+            assert!(
+                native_d128(heads, kv_heads, 128),
+                "D128 GQA {heads}/{kv_heads} must be native"
+            );
+        }
+        assert!(!native_d128(56, 8, 256), "wrong head_dim");
+        assert!(!native_d128(56, 8, 72), "wrong head_dim");
+        assert!(!native_d128(10, 4, 128), "non-integral GQA");
+        assert!(!native_d128(56, 0, 128), "zero kv heads");
+        assert!(!native_d128(7, 8, 128), "more kv than q heads");
     }
 
     #[test]
