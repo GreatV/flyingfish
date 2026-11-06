@@ -1389,6 +1389,9 @@ impl StateCheckpoint {
                 stream.memcpy_dtod(&saved.pool_ids, &mut state.pool_ids)?;
                 stream.memcpy_dtod(&saved.meta, &mut state.meta)?;
             }
+            if let (Some(saved), Some(seq)) = (&self.sequence, &mut store.sequence) {
+                stream.memcpy_dtod(saved, seq)?;
+            }
         }
         self.restore_kv_rows(store, committed, verified_rows, stream)
     }

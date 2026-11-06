@@ -307,6 +307,7 @@ pub(crate) fn component_spec(spec: &ModelSpec) -> Result<ModelSpec> {
         sliding_window: None,
         ffn,
     }];
+    component.gdn = None;
     Ok(component)
 }
 
