@@ -2,6 +2,70 @@
 #include <stdint.h>
 #include <math.h>
 
+// Native weights[out,in/groups,3,3], NHWC input/output, stride 2 and padding 1.
+extern "C" __global__ void speech_conv2d_f32(
+    const float* input, const float* weight, const float* bias, float* output,
+    uint32_t time, uint32_t frequency, uint32_t in_channels, uint32_t out_channels,
+    uint32_t groups, uint32_t valid_time) {
+    if (blockDim.x != 256 || !input || !weight || !bias || !output || !time || !frequency ||
+        !in_channels || !out_channels || !groups || in_channels % groups || out_channels % groups) {
+        __trap(); return;
+    }
+    const uint32_t out_time = (time - 1) / 2 + 1, out_frequency = (frequency - 1) / 2 + 1;
+    if (valid_time > out_time) { __trap(); return; }
+    const uint32_t group_width = in_channels / groups, group_count = out_channels / groups;
+    const uint64_t count = uint64_t(out_time) * out_frequency * out_channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t ot = uint32_t(i / (uint64_t(out_frequency) * out_channels));
+        const uint32_t of = uint32_t((i / out_channels) % out_frequency), channel = uint32_t(i % out_channels);
+        if (ot >= valid_time) { output[i] = 0.0f; continue; }
+        const uint32_t first = channel / group_count * group_width;
+        float sum = 0.0f;
+        for (uint32_t ic = 0; ic < group_width; ++ic) {
+            for (uint32_t ky = 0; ky < 3; ++ky) {
+                for (uint32_t kx = 0; kx < 3; ++kx) {
+                    const uint32_t it = ot * 2 + ky, iff = of * 2 + kx;
+                    if (it >= 1 && it <= time && iff >= 1 && iff <= frequency) {
+                        const uint64_t source = (uint64_t(it - 1) * frequency + iff - 1) * in_channels + first + ic;
+                        const uint64_t tap = ((uint64_t(channel) * group_width + ic) * 3 + ky) * 3 + kx;
+                        sum = __fmaf_rn(input[source], weight[tap], sum);
+                    }
+                }
+            }
+        }
+        output[i] = __fadd_rn(sum, bias[channel]);
+    }
+}
+
+extern "C" __global__ void speech_mask_time_f32(
+    float* values, uint32_t spatial, uint32_t time, uint32_t frequency,
+    uint32_t channels, uint32_t valid_time) {
+    if (blockDim.x != 256 || !values || !spatial || !time || !frequency || !channels ||
+        spatial != time * frequency || valid_time > time) { __trap(); return; }
+    const uint64_t count = uint64_t(spatial) * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t row = uint32_t(i / (uint64_t(frequency) * channels));
+        if (row >= valid_time) values[i] = 0.0f;
+    }
+}
+
+// Input [time,frequency,channel] to output [time,channel,frequency].
+extern "C" __global__ void speech_pack_subsample_f32(
+    const float* input, float* output, uint32_t time, uint32_t frequency, uint32_t channels) {
+    if (blockDim.x != 256 || !input || !output || !time || !frequency || !channels) {
+        __trap(); return;
+    }
+    const uint64_t count = uint64_t(time) * frequency * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t t = uint32_t(i / (uint64_t(channels) * frequency));
+        const uint32_t channel = uint32_t((i / frequency) % channels), f = uint32_t(i % frequency);
+        output[i] = input[(uint64_t(t) * frequency + f) * channels + channel];
+    }
+}
+
 // Native weights[channel,1,kernel], symmetric time padding, [time,channel] input/output.
 extern "C" __global__ void speech_depthwise_conv_f32(
     const float* input, const float* weight, const uint8_t* mask, float* output,
