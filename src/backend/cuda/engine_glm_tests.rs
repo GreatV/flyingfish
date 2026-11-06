@@ -1858,6 +1858,9 @@ struct GlmMtpRuntime {
 
 impl GlmMtpRuntime {
     fn load(model_dir: &Path, device: &Arc<Device>, blas: &std::rc::Rc<Blas>) -> Result<Self> {
+        unsafe {
+            device.ctx.disable_event_tracking();
+        }
         let stream = &device.stream;
 
         let norm_mod = cubin::module(&device.ctx, "norm")?;
@@ -2522,12 +2525,14 @@ impl GlmMtpRuntime {
         let stream = self.device.stream.clone();
         let _ = self.forward(token_id, target_hidden, swap_eh)?;
         stream.synchronize()?;
+        stream.memset_zeros(&mut self.logits_buf)?;
         stream.begin_capture(
             cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
         )?;
         self.forward_staged_kernels(swap_eh)?;
         let captured = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?;
         let graph = captured.context("Runner FAIL empty draft graph")?;
+        graph.upload()?;
         graph.launch()?;
         stream.synchronize()?;
         Ok(stream.clone_dtoh(&self.logits_buf)?)
@@ -2621,6 +2626,9 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .context("tau_rmse missing")? as f32;
 
     let device = Arc::new(Device::new(0)?);
+    unsafe {
+        device.ctx.disable_event_tracking();
+    }
     let ops = crate::backend::cuda::ops::Ops::new(&device.ctx)?;
     let closure = std::rc::Rc::new(crate::backend::cuda::closure::Closure::new(
         false,
