@@ -131,9 +131,16 @@ fn canonical(e: &mut Engine, inputs: &[u32], rows: usize) -> Result<Vec<u32>> {
             .set_sequence(s, position as u32, 1, b.engine.workspace_rows as u32)?;
         b.engine.position = position;
         b.chain.cursor = b.chain.saved.cursor;
+        let token_buf = &mut b
+            .chain
+            .runtime
+            .as_mut()
+            .context("MTP runtime missing")?
+            .work
+            .token;
         b.chain.mtp_checkpoint.restore(
             b.engine.mtp_state.as_mut().context("MTP state missing")?,
-            &mut b.chain.runtime.work.token,
+            token_buf,
             s,
         )?;
         for (row, &token) in inputs[..rows].iter().enumerate() {
@@ -206,12 +213,17 @@ fn q38_mtp_batch_transaction_gpu() -> Result<()> {
                         let c = e.mtp.as_mut().context("MTP missing")?;
                         c.options.graph = graph;
                         c.force_proposals = Some(forced.clone());
-                        let head_runs = c.runtime.head_runs;
+                        let head_runs = c.qwen_runtime().head_runs;
                         let before = counts(&e)?;
                         let r = e.mtp_batch_round(64, None)?;
                         let after = counts(&e)?;
                         ensure!(
-                            e.mtp.as_ref().context("MTP missing")?.runtime.head_runs - head_runs
+                            e.mtp
+                                .as_ref()
+                                .context("MTP missing")?
+                                .qwen_runtime()
+                                .head_runs
+                                - head_runs
                                 == k,
                             "canonical repair evaluated an unused MTP head"
                         );

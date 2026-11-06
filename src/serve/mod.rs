@@ -343,25 +343,13 @@ fn generate_once(
     };
     let mut mtp_rounds = 0usize;
     let result = if mtp {
-        let mut first = true;
-        model
-            .generate_mtp_reuse(&request.ids, &run_options, true, &mut |ids, accepted| {
-                if first {
-                    first = false;
-                } else {
-                    mtp_rounds += 1;
-                }
-                on_event(EngineEvent::Tokens {
-                    ids: ids.to_vec(),
-                    accepted,
-                })
-            })
-            .map(|output| spec::Output {
-                ids: output.ids,
-                rounds: Vec::new(),
-                prefill_ms: output.prefill_ms,
-                decode_ms: output.decode_ms,
-            })
+        produce_mtp_events(
+            model,
+            &request.ids,
+            &run_options,
+            &mut on_event,
+            &mut mtp_rounds,
+        )
     } else if run_options.backend.draft_model.is_some() {
         spec::produce_events(
             model,
@@ -519,6 +507,37 @@ fn produce_plain_events(
         rounds: Vec::new(),
         decode_ms: output.decode_ms,
         prefill_ms: output.prefill_ms,
+    })
+}
+
+fn produce_mtp_events(
+    model: &mut Model,
+    ids: &[u32],
+    options: &SpecOptions,
+    on_event: &mut dyn FnMut(EngineEvent) -> bool,
+    mtp_rounds: &mut usize,
+) -> Result<spec::Output> {
+    model.reset_mtp()?;
+    let mut first = true;
+    let result = model.generate_mtp_reuse(ids, options, true, &mut |token_ids, accepted| {
+        if first {
+            first = false;
+        } else {
+            *mtp_rounds += 1;
+        }
+        on_event(EngineEvent::Tokens {
+            ids: token_ids.to_vec(),
+            accepted,
+        })
+    })?;
+    model.synchronize()?;
+    model.check_logits()?;
+    model.check_ready()?;
+    Ok(spec::Output {
+        ids: result.ids,
+        rounds: Vec::new(),
+        decode_ms: result.decode_ms,
+        prefill_ms: result.prefill_ms,
     })
 }
 
@@ -721,26 +740,36 @@ mod tests {
             count: 4,
             ignore_eos: true,
         };
-        let mut model = Model::load(&model_dir, 0, 64, None, settings)?;
+        let mut model = Model::load_mtp(&model_dir, &options, 1, false)?;
         let prompt = [785, 10567, 1087];
-        let mut mtp_path_ids = Vec::with_capacity(4);
+        let mut eager_greedy_ids = Vec::with_capacity(4);
         model.reset()?;
         let first = model.prefill(&prompt, None)?;
-        mtp_path_ids.push(first);
+        eager_greedy_ids.push(first);
         for _ in 0..3 {
             let next = model.decode(false, None)?;
-            mtp_path_ids.push(next);
+            eager_greedy_ids.push(next);
         }
-        ensure!(mtp_path_ids.len() == 4, "expected 4 MTP path tokens");
-        let output = produce_plain_events(&mut model, &prompt, None, &options, &mut |_| true)?;
         ensure!(
-            output.ids == mtp_path_ids,
-            "serving ids {:?} differ from engine MTP path ids {:?}",
+            eager_greedy_ids.len() == 4,
+            "expected 4 eager greedy tokens"
+        );
+        let mut mtp_rounds = 0;
+        let output = produce_mtp_events(
+            &mut model,
+            &prompt,
+            &options,
+            &mut |_| true,
+            &mut mtp_rounds,
+        )?;
+        ensure!(
+            output.ids == eager_greedy_ids,
+            "serving MTP ids {:?} differ from eager greedy ids {:?}",
             output.ids,
-            mtp_path_ids
+            eager_greedy_ids
         );
         println!(
-            "PASS glm_mtp_serving tokens=4 ids_match_mtp_engine=true ids={:?}",
+            "PASS glm_mtp_serving tokens=4 ids_match_eager_greedy=true ids={:?}",
             output.ids
         );
         Ok(())

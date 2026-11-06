@@ -3,32 +3,77 @@ use super::super::Engine;
 use super::*;
 use crate::{
     backend::cuda::state::StateCheckpoint,
-    mtp::{MtpOptions, transaction::Backend},
+    backend::gpu::DevicePtr,
+    model_spec::Architecture,
+    mtp::{
+        MtpOptions,
+        transaction::{Backend, Round},
+    },
 };
 
 #[cfg(test)]
-use crate::mtp::transaction::{self, Fault, Round};
+use crate::mtp::transaction::{self, Fault};
 
-pub(crate) struct Chain {
-    options: MtpOptions,
-    runtime: MtpRuntime,
-    catalog: WeightCatalog,
-    target_checkpoint: StateCheckpoint,
-    mtp_checkpoint: StateCheckpoint,
-    saved: Saved,
-    last_target: CudaSlice<bf16>,
-    recurrent: CudaSlice<bf16>,
-    pending: u32,
-    cursor: usize,
-    committed_position: usize,
-    epoch: u64,
+#[derive(Debug)]
+pub(crate) struct GlmMtpRoundOutput {
+    pub(crate) round: Round,
     #[cfg(test)]
-    force_proposals: Option<Vec<u32>>,
-    batch: Option<batched::Batch>,
-    bootstrap: Bootstrap,
+    pub(crate) verify_row0_logits: Vec<f32>,
+    #[cfg(test)]
+    pub(crate) verify_row1_logits: Vec<f32>,
+    #[cfg(test)]
+    pub(crate) expert_union_count: usize,
+    #[cfg(test)]
+    pub(crate) v0_margin: f32,
+    #[cfg(test)]
+    pub(crate) v1_margin: f32,
 }
 
-struct Bootstrap {
+pub(crate) fn top1_and_margin(logits: &[f32]) -> (u32, f32) {
+    let mut top1_id = 0u32;
+    let mut top1_val = f32::NEG_INFINITY;
+    let mut top2_val = f32::NEG_INFINITY;
+    for (i, &val) in logits.iter().enumerate() {
+        if val > top1_val {
+            top2_val = top1_val;
+            top1_val = val;
+            top1_id = i as u32;
+        } else if val > top2_val {
+            top2_val = val;
+        }
+    }
+    (top1_id, top1_val - top2_val)
+}
+
+pub(crate) struct Chain {
+    pub(crate) options: MtpOptions,
+    pub(crate) runtime: Option<MtpRuntime>,
+    pub(crate) glm_runtime: Option<GlmMtpRuntime>,
+    pub(crate) catalog: Option<WeightCatalog>,
+    pub(crate) target_checkpoint: StateCheckpoint,
+    pub(crate) mtp_checkpoint: StateCheckpoint,
+    pub(crate) saved: Saved,
+    pub(crate) last_target: CudaSlice<bf16>,
+    pub(crate) recurrent: CudaSlice<bf16>,
+    pub(crate) pending: u32,
+    pub(crate) cursor: usize,
+    pub(crate) committed_position: usize,
+    pub(crate) epoch: u64,
+    #[cfg(test)]
+    pub(crate) force_proposals: Option<Vec<u32>>,
+    pub(crate) batch: Option<batched::Batch>,
+    pub(crate) bootstrap: Option<Bootstrap>,
+    pub(crate) verify_logits: Option<CudaSlice<f32>>,
+}
+
+impl Chain {
+    #[cfg(test)]
+    pub(crate) fn qwen_runtime(&self) -> &MtpRuntime {
+        self.runtime.as_ref().expect("Qwen MTP runtime missing")
+    }
+}
+
+pub(crate) struct Bootstrap {
     target: CudaSlice<bf16>,
     pairs: CudaSlice<bf16>,
     carry: CudaSlice<bf16>,
@@ -56,13 +101,15 @@ impl Chain {
     fn bootstrap_chunk(&mut self, e: &mut Engine, ids: &[u32]) -> Result<()> {
         let rows = ids.len();
         let s = &e.device.stream;
-        let b = &mut self.bootstrap;
+        let b = self.bootstrap.as_mut().context("MTP bootstrap missing")?;
+        let runtime = self.runtime.as_mut().context("MTP runtime missing")?;
+        let catalog = self.catalog.as_ref().context("MTP catalog missing")?;
         match self.options.hidden_tap {
             MtpHiddenTap::PreFinalNorm => s.memcpy_dtod(
                 &e.work.x.slice(..rows * HIDDEN),
                 &mut b.target.slice_mut(..rows * HIDDEN),
             )?,
-            MtpHiddenTap::PostFinalNorm => self.runtime.common.norm.rms_with(
+            MtpHiddenTap::PostFinalNorm => runtime.common.norm.rms_with(
                 s,
                 RowDomain {
                     meta: e.state.seq_ref(s)?,
@@ -99,12 +146,12 @@ impl Chain {
                 )?;
             }
             let state = e.mtp_state.as_mut().context("MTP state missing")?;
-            self.runtime.run_prefill(
+            runtime.run_prefill(
                 Execution {
                     device: &e.device,
                     ops: &e.ops,
                     blas: &e.blas,
-                    catalog: &self.catalog,
+                    catalog,
                     embedding: e.weights.embedding(),
                     head: &e.weights.head,
                 },
@@ -125,7 +172,7 @@ impl Chain {
     }
 }
 
-struct Saved {
+pub(crate) struct Saved {
     position: Option<usize>,
     work_position: CudaSlice<i32>,
     work_length: CudaSlice<i32>,
@@ -152,16 +199,18 @@ impl Bound<'_> {
         let c = &mut self.chain;
         let state = e.mtp_state.as_mut().context("MTP state missing")?;
         let s = &e.device.stream;
-        s.memcpy_htod(&[input], &mut c.runtime.work.ids.slice_mut(..1))?;
-        let ids = view(&c.runtime.work.ids, s, 0, [1], [1])?;
-        s.memset_zeros(&mut c.runtime.prediction)?;
-        let flag = view(&c.runtime.prediction, s, 0, [2], [1])?;
-        c.runtime.run_device(
+        let runtime = c.runtime.as_mut().context("MTP runtime missing")?;
+        let catalog = c.catalog.as_ref().context("MTP catalog missing")?;
+        s.memcpy_htod(&[input], &mut runtime.work.ids.slice_mut(..1))?;
+        let ids = view(&runtime.work.ids, s, 0, [1], [1])?;
+        s.memset_zeros(&mut runtime.prediction)?;
+        let flag = view(&runtime.prediction, s, 0, [2], [1])?;
+        runtime.run_device(
             Execution {
                 device: &e.device,
                 ops: &e.ops,
                 blas: &e.blas,
-                catalog: &c.catalog,
+                catalog,
                 embedding: e.weights.embedding(),
                 head: &e.weights.head,
             },
@@ -176,19 +225,19 @@ impl Bound<'_> {
             },
         )?;
         let output = match c.options.recurrent_tap {
-            MtpRecurrentTap::PreMtpNorm => &c.runtime.work.x,
-            MtpRecurrentTap::PostMtpNorm => &c.runtime.work.n,
+            MtpRecurrentTap::PreMtpNorm => &runtime.work.x,
+            MtpRecurrentTap::PostMtpNorm => &runtime.work.n,
         };
-        let flag = view(&c.runtime.prediction, s, 0, [2], [1])?;
+        let flag = view(&runtime.prediction, s, 0, [2], [1])?;
         e.ops
-            .finite(s, matrix(&c.runtime.work.n, s, 0, 1, HIDDEN)?, flag)?;
+            .finite(s, matrix(&runtime.work.n, s, 0, 1, HIDDEN)?, flag)?;
         e.ops.finite(s, matrix(output, s, 0, 1, HIDDEN)?, flag)?;
         if mode != OutputMode::StateOnly {
             e.ops
-                .finite(s, matrix(&c.runtime.logits, s, 0, 1, VOCAB)?, flag)?;
+                .finite(s, matrix(&runtime.logits, s, 0, 1, VOCAB)?, flag)?;
         }
         s.memcpy_dtod(&output.slice(..HIDDEN), &mut c.recurrent)?;
-        let status = s.clone_dtoh(&c.runtime.prediction)?;
+        let status = s.clone_dtoh(&runtime.prediction)?;
         ensure!(status[1] == 0, "nonfinite MTP recurrent hidden or logits");
         c.cursor += 1;
         state.set_sequence(&e.device.stream, c.cursor as u32, 1, 1)?;
@@ -231,11 +280,12 @@ impl Backend for Bound<'_> {
         } else {
             None
         };
+        let mtp_token = c.runtime.as_ref().map_or(&e.work.token, |r| &r.work.token);
         c.target_checkpoint
             .save(&e.state, &e.work.token, e.position, s, validation)?;
         c.mtp_checkpoint.save(
             e.mtp_state.as_ref().context("MTP state missing")?,
-            &c.runtime.work.token,
+            mtp_token,
             c.cursor,
             s,
             validation,
@@ -257,11 +307,18 @@ impl Backend for Bound<'_> {
         let s = &e.device.stream;
         let saved = &c.saved;
         let position = saved.position.context("MTP checkpoint not valid")?;
+        let mut dummy;
+        let mtp_token = if let Some(r) = c.runtime.as_mut() {
+            &mut r.work.token
+        } else {
+            dummy = s.alloc_zeros(1)?;
+            &mut dummy
+        };
         c.target_checkpoint
             .restore(&mut e.state, &mut e.work.token, s)?;
         c.mtp_checkpoint.restore(
             e.mtp_state.as_mut().context("MTP state missing")?,
-            &mut c.runtime.work.token,
+            mtp_token,
             s,
         )?;
         s.memcpy_dtod(&saved.work_position, &mut e.work.position)?;
@@ -364,10 +421,7 @@ fn mtp_bound_rows(chunk: usize) -> std::collections::BTreeSet<usize> {
 
 impl Engine {
     #[cfg(test)]
-    pub(in crate::backend::cuda::engine) fn mtp_enable(
-        &mut self,
-        options: MtpOptions,
-    ) -> Result<()> {
+    pub(crate) fn mtp_enable(&mut self, options: MtpOptions) -> Result<()> {
         self.mtp_enable_bound(options)
     }
     pub(in crate::backend::cuda::engine) fn check_mtp_mode(&self, graph: bool) -> Result<()> {
@@ -397,10 +451,10 @@ impl Engine {
             self.device.stream.memset_zeros(&mut chain.last_target)?;
             self.device.stream.memset_zeros(&mut chain.recurrent)?;
             chain.pending = 0;
-            chain.bootstrap.last_rows = 0;
-            self.device
-                .stream
-                .memset_zeros(&mut chain.bootstrap.carry)?;
+            if let Some(b) = chain.bootstrap.as_mut() {
+                b.last_rows = 0;
+                self.device.stream.memset_zeros(&mut b.carry)?;
+            }
             if let Some(batch) = chain.batch.as_mut() {
                 batch.invalidate_frame();
             }
@@ -413,10 +467,7 @@ impl Engine {
         }
         result
     }
-    pub(in crate::backend::cuda::engine) fn mtp_enable_resident(
-        &mut self,
-        options: MtpOptions,
-    ) -> Result<()> {
+    pub(crate) fn mtp_enable_resident(&mut self, options: MtpOptions) -> Result<()> {
         self.mtp_enable_bound(options)
     }
     fn mtp_enable_bound(&mut self, options: MtpOptions) -> Result<()> {
@@ -426,8 +477,55 @@ impl Engine {
                 && self.position == 0
                 && self.images.is_none()
                 && self.mtp.is_none(),
-            "MTP setup requires an empty Qwen text Engine"
+            "MTP setup requires an empty Qwen or GLM text Engine"
         );
+        if self.model_spec.architecture == Architecture::Glm5Next {
+            let dir = self
+                .qwen
+                .as_ref()
+                .context("GLM runtime missing")?
+                .checkpoint_path();
+            let glm_runtime = GlmMtpRuntime::load(dir, &self.device, &self.blas)?;
+            let spec = crate::mtp::component_spec(&self.model_spec)?;
+            let state = StateStore::new(&spec, self.capacity, &self.device.stream)?;
+            let target_checkpoint =
+                StateCheckpoint::new(&self.state, &self.model_spec, 5, &self.device.stream)?;
+            let mtp_checkpoint = StateCheckpoint::new(&state, &spec, 5, &self.device.stream)?;
+            let vocab = self.model_spec.vocab as usize;
+            let verify_logits = self.device.stream.alloc_zeros(2 * vocab)?;
+            self.device.stream.synchronize()?;
+            self.mtp_state = Some(state);
+            self.mtp = Some(Chain {
+                options,
+                runtime: None,
+                glm_runtime: Some(glm_runtime),
+                catalog: None,
+                target_checkpoint,
+                mtp_checkpoint,
+                saved: Saved {
+                    position: None,
+                    cursor: 0,
+                    pending: 0,
+                    work_position: self.device.stream.alloc_zeros(1)?,
+                    work_length: self.device.stream.alloc_zeros(1)?,
+                    logits: self.device.stream.alloc_zeros(vocab)?,
+                    last_target: self.device.stream.alloc_zeros(HIDDEN)?,
+                    recurrent: self.device.stream.alloc_zeros(HIDDEN)?,
+                },
+                last_target: self.device.stream.alloc_zeros(HIDDEN)?,
+                recurrent: self.device.stream.alloc_zeros(HIDDEN)?,
+                pending: 0,
+                cursor: 0,
+                committed_position: 0,
+                epoch: self.mtp_epoch,
+                #[cfg(test)]
+                force_proposals: None,
+                batch: None,
+                bootstrap: None,
+                verify_logits: Some(verify_logits),
+            });
+            return Ok(());
+        }
         let plan = MtpPlan {
             hidden_tap: options.hidden_tap,
             recurrent_tap: options.recurrent_tap,
@@ -491,8 +589,9 @@ impl Engine {
         self.mtp_state = Some(state);
         self.mtp = Some(Chain {
             options,
-            runtime,
-            catalog,
+            runtime: Some(runtime),
+            glm_runtime: None,
+            catalog: Some(catalog),
             target_checkpoint,
             mtp_checkpoint,
             saved: Saved {
@@ -514,7 +613,8 @@ impl Engine {
             #[cfg(test)]
             force_proposals: None,
             batch: None,
-            bootstrap,
+            bootstrap: Some(bootstrap),
+            verify_logits: None,
         });
         eprintln!(
             "MTP_M2A_MEMORY additional_device_bytes={needed} checkpoint_bytes={journal} shared_weights_duplicated=0"
@@ -530,10 +630,9 @@ impl Engine {
         let mut chain = self.mtp.take().context("MTP not enabled")?;
         let result = (|| -> Result<u32> {
             self.reset()?;
-            self.mtp_state
-                .as_mut()
-                .context("MTP state missing")?
-                .reset(&self.device.stream)?;
+            if let Some(mtp_state) = self.mtp_state.as_mut() {
+                mtp_state.reset(&self.device.stream)?;
+            }
             chain.cursor = 0;
             chain.committed_position = 0;
             chain.saved.position = None;
@@ -541,23 +640,37 @@ impl Engine {
             {
                 chain.force_proposals = None;
             }
+            if self.model_spec.architecture == Architecture::Glm5Next {
+                let token = self.prefill(ids, None)?;
+                self.pending_token = Some(token);
+                return Ok(token);
+            }
             self.device.stream.memset_zeros(&mut chain.last_target)?;
             self.device.stream.memset_zeros(&mut chain.recurrent)?;
-            chain.bootstrap.last_rows = 0;
+            chain
+                .bootstrap
+                .as_mut()
+                .context("MTP bootstrap missing")?
+                .last_rows = 0;
             if let Some(batch) = chain.batch.as_mut() {
                 batch.invalidate_frame();
             }
             let token = self.prefill_chunks(ids, None, ids.len(), |engine, chunk| {
                 chain.bootstrap_chunk(engine, chunk)
             })?;
+            let (carry_last_rows, carry_buf) = {
+                let b = chain.bootstrap.as_ref().context("MTP bootstrap missing")?;
+                (b.last_rows, b.carry.clone())
+            };
             self.device
                 .stream
-                .memcpy_dtod(&chain.bootstrap.carry, &mut chain.last_target)?;
-            if chain.bootstrap.last_rows > 0 {
-                let row = chain.bootstrap.last_rows - 1;
+                .memcpy_dtod(&carry_buf, &mut chain.last_target)?;
+            let runtime = chain.runtime.as_mut().context("MTP runtime missing")?;
+            if carry_last_rows > 0 {
+                let row = carry_last_rows - 1;
                 let hidden = match chain.options.recurrent_tap {
-                    MtpRecurrentTap::PreMtpNorm => &chain.runtime.work.x,
-                    MtpRecurrentTap::PostMtpNorm => &chain.runtime.work.n,
+                    MtpRecurrentTap::PreMtpNorm => &runtime.work.x,
+                    MtpRecurrentTap::PostMtpNorm => &runtime.work.n,
                 };
                 self.device.stream.memcpy_dtod(
                     &hidden.slice(row * HIDDEN..(row + 1) * HIDDEN),
@@ -565,13 +678,13 @@ impl Engine {
                 )?;
             }
             let s = &self.device.stream;
-            s.memset_zeros(&mut chain.runtime.prediction)?;
-            let flag = view(&chain.runtime.prediction, s, 0, [2], [1])?;
+            s.memset_zeros(&mut runtime.prediction)?;
+            let flag = view(&runtime.prediction, s, 0, [2], [1])?;
             for buffer in [&chain.last_target, &chain.recurrent] {
                 self.ops.finite(s, matrix(buffer, s, 0, 1, HIDDEN)?, flag)?;
             }
             ensure!(
-                s.clone_dtoh(&chain.runtime.prediction)?[1] == 0,
+                s.clone_dtoh(&runtime.prediction)?[1] == 0,
                 "nonfinite MTP bootstrap boundary"
             );
             chain.pending = token;
@@ -588,6 +701,219 @@ impl Engine {
         }
         self.mtp = Some(chain);
         result
+    }
+
+    pub(crate) fn glm_mtp_round(&mut self, force_eager_draft: bool) -> Result<GlmMtpRoundOutput> {
+        ensure!(
+            self.model_spec.architecture == Architecture::Glm5Next,
+            "GLM MTP round requires GLM architecture"
+        );
+        let mut chain = self.mtp.take().context("MTP not configured")?;
+        let result = self.glm_mtp_round_inner(&mut chain, force_eager_draft);
+        self.mtp = Some(chain);
+        result
+    }
+
+    fn glm_mtp_round_inner(
+        &mut self,
+        chain: &mut Chain,
+        force_eager_draft: bool,
+    ) -> Result<GlmMtpRoundOutput> {
+        let stream = self.device.stream.clone();
+        let vocab = self.model_spec.vocab as usize;
+        let start_pos = self.position;
+        let anchor_token = match self.pending_token {
+            Some(t) => t,
+            None => self.token()?,
+        };
+
+        // 1. Run draft step with Layer 45
+        let glm_runtime = chain
+            .glm_runtime
+            .as_mut()
+            .context("GLM MTP runtime missing")?;
+        let (draft_token, _draft_logits) = glm_runtime.step_draft_device(
+            anchor_token,
+            &self.work.x,
+            force_eager_draft,
+            &self.blas,
+        )?;
+        #[cfg(test)]
+        let draft_token = if let Some(forces) = &chain.force_proposals {
+            forces.first().copied().unwrap_or(draft_token)
+        } else {
+            draft_token
+        };
+
+        // 2. Write Layer 45 state into mtp_state.dsa[0]
+        let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
+        if let Some(dsa_state) = mtp_state.dsa.get_mut(0) {
+            let num_slots = dsa_state.latent.len() / 512;
+            let row_offset = (start_pos % num_slots) * 512;
+            stream.memcpy_dtod(
+                &glm_runtime.kv_a_buf,
+                &mut dsa_state.latent.slice_mut(row_offset..row_offset + 512),
+            )?;
+            let token_offset = start_pos % dsa_state.token_ids.len();
+            stream.memcpy_htod(
+                &[draft_token as i32],
+                &mut dsa_state
+                    .token_ids
+                    .slice_mut(token_offset..token_offset + 1),
+            )?;
+            stream.memcpy_htod(&[start_pos as i32, 1], &mut dsa_state.meta.slice_mut(..2))?;
+        }
+
+        // 3. Save pre-verify snapshot (both target model and Layer 45)
+        chain.target_checkpoint.save_rows(
+            &self.state,
+            &self.work.token,
+            start_pos,
+            2,
+            &stream,
+            None,
+        )?;
+        chain
+            .mtp_checkpoint
+            .save_rows(mtp_state, &self.work.token, start_pos, 2, &stream, None)?;
+
+        // 4. Run eager 2-row causal verify pass
+        stream.memcpy_htod(
+            &[anchor_token, draft_token],
+            &mut self.work.ids.slice_mut(..2),
+        )?;
+        self.state
+            .set_sequence(&stream, start_pos as u32, 2, self.workspace_rows as u32)?;
+        self.qwen_device_prefix = true;
+        let step_res = self.run_step(
+            crate::backend::Step {
+                rows: 2,
+                input: crate::backend::Input::Ids,
+                head: crate::backend::Head::None,
+                mask: crate::backend::Mask::Causal,
+            },
+            None,
+        );
+        self.qwen_device_prefix = false;
+        step_res?;
+
+        // 5. Final norm & lm_head projection for 2 rows
+        if let Some(hc) = self.hc.as_mut() {
+            hc.collapse_final(&stream, 2, &mut self.work.x)?;
+        }
+        let norm_w = self
+            .weights
+            .norm
+            .as_ref()
+            .context("final norm weights missing")?;
+        super::glm::run_rms_norm(
+            &stream,
+            &glm_runtime.rms_norm,
+            &self.work.x,
+            norm_w,
+            &mut self.work.n,
+            (2, 4096),
+            self.model_spec.rms_eps,
+        )?;
+
+        let verify_logits_buf = chain
+            .verify_logits
+            .as_mut()
+            .context("verify logits buffer missing")?;
+        super::glm::run_linear_bf16_to_f32(
+            &stream,
+            &self.blas,
+            &self.weights.head,
+            &self.work.n,
+            verify_logits_buf,
+            (2, vocab, 4096),
+        )?;
+
+        let verify_logits_raw = stream.clone_dtoh(verify_logits_buf)?;
+        let row0_logits = verify_logits_raw[..vocab].to_vec();
+        let row1_logits = verify_logits_raw[vocab..2 * vocab].to_vec();
+
+        #[cfg(test)]
+        let (v0, v0_margin) = top1_and_margin(&row0_logits);
+        #[cfg(test)]
+        let (v1, v1_margin) = top1_and_margin(&row1_logits);
+        #[cfg(not(test))]
+        let (v0, _) = top1_and_margin(&row0_logits);
+        #[cfg(not(test))]
+        let (v1, _) = top1_and_margin(&row1_logits);
+
+        // 6. Count expert unions across all routed MoE layers
+        #[cfg(test)]
+        let expert_union_count = self
+            .qwen
+            .as_ref()
+            .context("GLM runtime missing")?
+            .count_expert_unions_for_rows2(&stream)?;
+
+        // 7. Verification decision: accept vs reject
+        let accepted = draft_token == v0;
+        let round = if accepted {
+            self.position = start_pos + 2;
+            self.set_token(v1)?;
+            stream.memcpy_htod(&[(start_pos + 2) as i32], &mut self.work.position)?;
+            stream.memcpy_htod(&[(start_pos + 3) as i32], &mut self.work.length)?;
+            stream.memcpy_htod(&[v1], &mut self.work.token)?;
+            self.committed_prefix_ids.push(anchor_token);
+            self.committed_prefix_ids.push(v0);
+            self.pending_token = None;
+            let (x_ptr, _) = self.work.x.device_ptr(&stream);
+            unsafe {
+                super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;
+            }
+            Round {
+                tokens: vec![v0, v1],
+                proposals: vec![draft_token],
+                matched: 1,
+                accepted: 1,
+                consumed: 2,
+            }
+        } else {
+            chain
+                .target_checkpoint
+                .restore_for_replay(&mut self.state, 0, 2, &stream)?;
+            chain.mtp_checkpoint.restore_for_replay(
+                self.mtp_state.as_mut().unwrap(),
+                0,
+                2,
+                &stream,
+            )?;
+            self.position = start_pos;
+            self.set_token(anchor_token)?;
+            stream.memcpy_htod(&[start_pos as i32], &mut self.work.position)?;
+            stream.memcpy_htod(&[(start_pos + 1) as i32], &mut self.work.length)?;
+            stream.memcpy_htod(&[anchor_token], &mut self.work.token)?;
+            let replayed = self.decode(false, None)?;
+            ensure!(
+                replayed == v0,
+                "DEFECT replayed token {replayed} differs from verify argmax {v0}"
+            );
+            Round {
+                tokens: vec![v0],
+                proposals: vec![draft_token],
+                matched: 0,
+                accepted: 0,
+                consumed: 1,
+            }
+        };
+
+        Ok(GlmMtpRoundOutput {
+            round,
+            #[cfg(test)]
+            verify_row0_logits: row0_logits,
+            #[cfg(test)]
+            verify_row1_logits: row1_logits,
+            #[cfg(test)]
+            expert_union_count,
+            #[cfg(test)]
+            v0_margin,
+            #[cfg(test)]
+            v1_margin,
+        })
     }
 
     #[cfg(test)]
@@ -688,8 +1014,10 @@ pub(super) mod tests {
         if let Some(c) = e.mtp.as_mut() {
             o.validate()?;
             c.options = o;
-            c.runtime.plan.hidden_tap = o.hidden_tap;
-            c.runtime.plan.recurrent_tap = o.recurrent_tap;
+            if let Some(r) = c.runtime.as_mut() {
+                r.plan.hidden_tap = o.hidden_tap;
+                r.plan.recurrent_tap = o.recurrent_tap;
+            }
         } else {
             e.mtp_enable(o)?;
         }
@@ -774,20 +1102,30 @@ pub(super) mod tests {
             }
             if mtp {
                 let chain = e.mtp.as_ref().context("MTP missing")?;
-                for buffer in [&chain.last_target, &chain.recurrent, &chain.bootstrap.carry] {
-                    let values = e.device.stream.clone_dtoh(buffer)?;
-                    ensure!(
-                        values.iter().all(|v| v.to_f32().is_finite()),
-                        "Runner FAIL nonfinite bootstrap hidden"
-                    );
-                    bits.extend(values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()));
-                }
-                for value in [
-                    chain.cursor,
-                    chain.committed_position,
-                    chain.bootstrap.last_rows,
-                ] {
-                    bits.extend_from_slice(&value.to_le_bytes());
+                if let Some(b) = &chain.bootstrap {
+                    for buffer in [&chain.last_target, &chain.recurrent, &b.carry] {
+                        let values = e.device.stream.clone_dtoh(buffer)?;
+                        ensure!(
+                            values.iter().all(|v| v.to_f32().is_finite()),
+                            "Runner FAIL nonfinite bootstrap hidden"
+                        );
+                        bits.extend(values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()));
+                    }
+                    for value in [chain.cursor, chain.committed_position, b.last_rows] {
+                        bits.extend_from_slice(&value.to_le_bytes());
+                    }
+                } else {
+                    for buffer in [&chain.last_target, &chain.recurrent] {
+                        let values = e.device.stream.clone_dtoh(buffer)?;
+                        ensure!(
+                            values.iter().all(|v| v.to_f32().is_finite()),
+                            "Runner FAIL nonfinite bootstrap hidden"
+                        );
+                        bits.extend(values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()));
+                    }
+                    for value in [chain.cursor, chain.committed_position, 0usize] {
+                        bits.extend_from_slice(&value.to_le_bytes());
+                    }
                 }
                 bits.extend_from_slice(&chain.pending.to_le_bytes());
             }
@@ -1326,11 +1664,19 @@ pub(super) mod tests {
                             }
                             e.mtp.as_mut().context("MTP missing")?.force_proposals =
                                 Some(proposals);
-                            let head_runs =
-                                e.mtp.as_ref().context("MTP missing")?.runtime.head_runs;
+                            let head_runs = e
+                                .mtp
+                                .as_ref()
+                                .context("MTP missing")?
+                                .qwen_runtime()
+                                .head_runs;
                             let round = e.mtp_round(64, None)?;
                             ensure!(
-                                e.mtp.as_ref().context("MTP missing")?.runtime.head_runs
+                                e.mtp
+                                    .as_ref()
+                                    .context("MTP missing")?
+                                    .qwen_runtime()
+                                    .head_runs
                                     - head_runs
                                     == k,
                                 "M2a canonical repair evaluated an unused MTP head"

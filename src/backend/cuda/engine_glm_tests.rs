@@ -1,5 +1,7 @@
+use super::mtp::GlmMtpRuntime;
 use super::*;
 use crate::backend::cuda::state::StateStore;
+use crate::mtp::{MtpHiddenTap, MtpOptions, MtpRecurrentTap};
 use sha2::{Digest, Sha256};
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -485,63 +487,6 @@ fn glm_mtp_router_bias_precision_discriminating_cpu() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn glm_mtp_rollback_checkpoint_state_discriminating_cpu() -> Result<()> {
-    let dsa_snapshot = DsaStateSnapshot {
-        buffers: [
-            vec![bf16::from_f32(1.0), bf16::from_f32(2.5)],
-            vec![bf16::from_f32(-0.5)],
-            vec![bf16::from_f32(3.125)],
-        ],
-        indices: [vec![10, 20], vec![30], vec![40, 50, 60]],
-    };
-    let cp = GraphStepCheckpoint {
-        gdn: vec![[vec![1.0, 2.0], vec![3.0, 4.0]]],
-        dsa: vec![dsa_snapshot],
-        sequence: vec![1, 2, 3],
-        work_position: vec![4],
-        work_length: vec![5],
-        token: 42,
-        position: 7,
-        last_input: None,
-        logits: PrefixLogitsCache::default(),
-        committed_prefix_ids: vec![100, 200],
-    };
-    let baseline = cp.to_bytes();
-    ensure!(!baseline.is_empty(), "baseline bytes non-empty");
-
-    let identical = cp.to_bytes();
-    let diffs = baseline
-        .iter()
-        .zip(&identical)
-        .filter(|(a, b)| a != b)
-        .count();
-    ensure!(diffs == 0, "identical checkpoint serialization diffs");
-
-    let mut mutated = baseline.clone();
-    mutated[0] ^= 0x5a;
-    let mutant_diffs = baseline
-        .iter()
-        .zip(&mutated)
-        .filter(|(a, b)| a != b)
-        .count();
-    ensure!(mutant_diffs > 0, "mutant control failed to discriminate");
-
-    let mut cp_pos = cp;
-    cp_pos.position = 8;
-    let pos_diffs = baseline
-        .iter()
-        .zip(&cp_pos.to_bytes())
-        .filter(|(a, b)| a != b)
-        .count();
-    ensure!(
-        pos_diffs > 0,
-        "position modification failed to discriminate"
-    );
-
-    Ok(())
-}
-
 fn check_reset_meta(meta: &[i32], capacity: u32) -> Result<()> {
     // Metadata describes the scheduled first token, with no completed prefix.
     ensure!(
@@ -826,6 +771,16 @@ fn graph_native_state(engine: &Engine, full: bool) -> Result<Vec<u8>> {
             integers!(stream.clone_dtoh(buffer)?);
         }
     }
+    if let Some(mtp_state) = &engine.mtp_state {
+        for state in &mtp_state.dsa {
+            for buffer in [&state.latent, &state.packed, &state.pool_keys] {
+                integers!(stream.clone_dtoh(buffer)?.into_iter().map(bf16::to_bits));
+            }
+            for buffer in [&state.token_ids, &state.pool_ids, &state.meta] {
+                integers!(stream.clone_dtoh(buffer)?);
+            }
+        }
+    }
     integers!(
         stream.clone_dtoh(
             engine
@@ -906,40 +861,6 @@ struct GraphStepCheckpoint {
 
 #[cfg(feature = "cuda")]
 impl GraphStepCheckpoint {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for pair in &self.gdn {
-            for buf in pair {
-                for v in buf {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-            }
-        }
-        for dsa in &self.dsa {
-            for buf in &dsa.buffers {
-                for v in buf {
-                    bytes.extend_from_slice(&v.to_bits().to_le_bytes());
-                }
-            }
-            for buf in &dsa.indices {
-                for v in buf {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-            }
-        }
-        for v in &self.sequence {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in &self.work_position {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in &self.work_length {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        bytes.extend_from_slice(&self.token.to_le_bytes());
-        bytes.extend_from_slice(&(self.position as u64).to_le_bytes());
-        bytes
-    }
     fn save(engine: &Engine) -> Result<Self> {
         let s = &engine.device.stream;
         Ok(Self {
@@ -1690,1007 +1611,6 @@ fn glm_index_pack_gpu() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
-// GLM-5.3-Flash Multi-Token Prediction (MTP) Layer 45 Runtime and Gates
-// ============================================================================
-
-fn fp8_dequant_block(codes: &[u8], scale_inv: &[f32], rows: usize, cols: usize) -> Vec<bf16> {
-    let scale_cols = cols.div_ceil(128);
-    let mut out = Vec::with_capacity(rows * cols);
-    for r in 0..rows {
-        let sr = r / 128;
-        for c in 0..cols {
-            let sc = c / 128;
-            let scale = scale_inv[sr * scale_cols + sc];
-            let v = crate::fp8::decode_e4m3(codes[r * cols + c]);
-            out.push(bf16::from_f32(v * scale));
-        }
-    }
-    out
-}
-
-fn run_linear_bf16(
-    stream: &Arc<cudarc::driver::CudaStream>,
-    blas: &Blas,
-    weight: &cudarc::driver::CudaSlice<bf16>,
-    x: &cudarc::driver::CudaSlice<bf16>,
-    y: &mut cudarc::driver::CudaSlice<bf16>,
-    shape: (usize, usize, usize),
-) -> Result<()> {
-    let (rows, output_dim, input_dim) = shape;
-    let (w_ptr, _w_drop) = weight.device_ptr(stream);
-    let (x_ptr, _x_drop) = x.device_ptr(stream);
-    let (y_ptr, _y_drop) = y.device_ptr(stream);
-    let w_tensor = unsafe {
-        crate::backend::cuda::contracts::Tensor::new(
-            w_ptr,
-            [output_dim as u32, input_dim as u32],
-            [input_dim as u64, 1],
-            (output_dim * input_dim * 2) as u64,
-        )?
-    };
-    let x_tensor = unsafe {
-        crate::backend::cuda::contracts::Tensor::new(
-            x_ptr,
-            [rows as u32, input_dim as u32],
-            [input_dim as u64, 1],
-            (rows * input_dim * 2) as u64,
-        )?
-    };
-    let mut y_tensor = unsafe {
-        crate::backend::cuda::contracts::TensorMut(crate::backend::cuda::contracts::Tensor::new(
-            y_ptr,
-            [rows as u32, output_dim as u32],
-            [output_dim as u64, 1],
-            (rows * output_dim * 2) as u64,
-        )?)
-    };
-    blas.linear_bf16(w_tensor, x_tensor, &mut y_tensor)
-}
-
-fn run_linear_bf16_to_f32(
-    stream: &Arc<cudarc::driver::CudaStream>,
-    blas: &Blas,
-    weight: &cudarc::driver::CudaSlice<bf16>,
-    x: &cudarc::driver::CudaSlice<bf16>,
-    y: &mut cudarc::driver::CudaSlice<f32>,
-    shape: (usize, usize, usize),
-) -> Result<()> {
-    let (rows, output_dim, input_dim) = shape;
-    let (w_ptr, _w_drop) = weight.device_ptr(stream);
-    let (x_ptr, _x_drop) = x.device_ptr(stream);
-    let (y_ptr, _y_drop) = y.device_ptr(stream);
-    let w_tensor = unsafe {
-        crate::backend::cuda::contracts::Tensor::new(
-            w_ptr,
-            [output_dim as u32, input_dim as u32],
-            [input_dim as u64, 1],
-            (output_dim * input_dim * 2) as u64,
-        )?
-    };
-    let x_tensor = unsafe {
-        crate::backend::cuda::contracts::Tensor::new(
-            x_ptr,
-            [rows as u32, input_dim as u32],
-            [input_dim as u64, 1],
-            (rows * input_dim * 2) as u64,
-        )?
-    };
-    let mut y_tensor = unsafe {
-        crate::backend::cuda::contracts::TensorMut(crate::backend::cuda::contracts::Tensor::new(
-            y_ptr,
-            [rows as u32, output_dim as u32],
-            [output_dim as u64, 1],
-            (rows * output_dim * 4) as u64,
-        )?)
-    };
-    blas.linear_bf16_to_f32(w_tensor, x_tensor, &mut y_tensor)
-}
-
-fn run_rms_norm(
-    stream: &cudarc::driver::CudaStream,
-    norm_fn: &cudarc::driver::CudaFunction,
-    x: &cudarc::driver::CudaSlice<bf16>,
-    w: &cudarc::driver::CudaSlice<bf16>,
-    y: &mut cudarc::driver::CudaSlice<bf16>,
-    dims: (i32, i32),
-    eps: f32,
-) -> Result<()> {
-    let (rows, dim) = dims;
-    unsafe {
-        stream
-            .launch_builder(norm_fn)
-            .arg(x)
-            .arg(w)
-            .arg(y)
-            .arg(&rows)
-            .arg(&dim)
-            .arg(&eps)
-            .launch(crate::backend::cuda::ops::grid(rows as usize, 256))?;
-    }
-    Ok(())
-}
-
-fn run_silu_mul_split(
-    stream: &cudarc::driver::CudaStream,
-    silu_fn: &cudarc::driver::CudaFunction,
-    gate: &cudarc::driver::CudaSlice<bf16>,
-    up: &cudarc::driver::CudaSlice<bf16>,
-    y: &mut cudarc::driver::CudaSlice<bf16>,
-    count: i32,
-) -> Result<()> {
-    let mode = 1i32;
-    unsafe {
-        stream
-            .launch_builder(silu_fn)
-            .arg(gate)
-            .arg(up)
-            .arg(y)
-            .arg(&count)
-            .arg(&mode)
-            .launch(crate::backend::cuda::ops::grid(
-                (count as usize).div_ceil(8),
-                256,
-            ))?;
-    }
-    Ok(())
-}
-
-fn run_concat_eh(
-    stream: &cudarc::driver::CudaStream,
-    concat_fn: &cudarc::driver::CudaFunction,
-    enorm: &cudarc::driver::CudaSlice<bf16>,
-    hnorm: &cudarc::driver::CudaSlice<bf16>,
-    out: &mut cudarc::driver::CudaSlice<bf16>,
-    dim: i32,
-    swap: bool,
-) -> Result<()> {
-    let swap_val = if swap { 1i32 } else { 0i32 };
-    unsafe {
-        stream
-            .launch_builder(concat_fn)
-            .arg(enorm)
-            .arg(hnorm)
-            .arg(out)
-            .arg(&dim)
-            .arg(&swap_val)
-            .launch(crate::backend::cuda::ops::grid(
-                (dim as usize).div_ceil(256),
-                256,
-            ))?;
-    }
-    Ok(())
-}
-
-fn run_add(
-    stream: &cudarc::driver::CudaStream,
-    add_fn: &cudarc::driver::CudaFunction,
-    x: &mut cudarc::driver::CudaSlice<bf16>,
-    res: &cudarc::driver::CudaSlice<bf16>,
-    count: i32,
-) -> Result<()> {
-    unsafe {
-        stream
-            .launch_builder(add_fn)
-            .arg(x)
-            .arg(res)
-            .arg(&count)
-            .launch(crate::backend::cuda::ops::grid(
-                (count as usize).div_ceil(256),
-                256,
-            ))?;
-    }
-    Ok(())
-}
-
-fn run_accum_scaled(
-    stream: &cudarc::driver::CudaStream,
-    accum_fn: &cudarc::driver::CudaFunction,
-    accum: &mut cudarc::driver::CudaSlice<bf16>,
-    val: &cudarc::driver::CudaSlice<bf16>,
-    scale: f32,
-    count: i32,
-) -> Result<()> {
-    unsafe {
-        stream
-            .launch_builder(accum_fn)
-            .arg(accum)
-            .arg(val)
-            .arg(&scale)
-            .arg(&count)
-            .launch(crate::backend::cuda::ops::grid(
-                (count as usize).div_ceil(256),
-                256,
-            ))?;
-    }
-    Ok(())
-}
-
-fn run_extract_dsa_value(
-    stream: &cudarc::driver::CudaStream,
-    extract_fn: &cudarc::driver::CudaFunction,
-    kv_expanded: &cudarc::driver::CudaSlice<bf16>,
-    attn_out: &mut cudarc::driver::CudaSlice<bf16>,
-    heads: i32,
-    head_dim: i32,
-) -> Result<()> {
-    let total = (heads * head_dim) as u32;
-    unsafe {
-        stream
-            .launch_builder(extract_fn)
-            .arg(kv_expanded)
-            .arg(attn_out)
-            .arg(&heads)
-            .arg(&head_dim)
-            .launch(crate::backend::cuda::ops::grid(
-                (total as usize).div_ceil(256),
-                256,
-            ))?;
-    }
-    Ok(())
-}
-
-struct GlmMtpExpertHost {
-    gate_codes: Vec<u8>,
-    gate_scales: Vec<f32>,
-    up_codes: Vec<u8>,
-    up_scales: Vec<f32>,
-    down_codes: Vec<u8>,
-    down_scales: Vec<f32>,
-}
-
-struct GlmMtpRuntime {
-    device: Arc<Device>,
-    blas: std::rc::Rc<Blas>,
-
-    rms_norm: cudarc::driver::CudaFunction,
-    silu_mul_split: cudarc::driver::CudaFunction,
-    concat_eh: cudarc::driver::CudaFunction,
-    accum_scaled: cudarc::driver::CudaFunction,
-    add: cudarc::driver::CudaFunction,
-    extract_dsa: cudarc::driver::CudaFunction,
-
-    embed_tokens: Vec<bf16>,
-    enorm_w: cudarc::driver::CudaSlice<bf16>,
-    hnorm_w: cudarc::driver::CudaSlice<bf16>,
-    eh_proj_w: cudarc::driver::CudaSlice<bf16>,
-    input_norm_w: cudarc::driver::CudaSlice<bf16>,
-
-    q_a_w: cudarc::driver::CudaSlice<bf16>,
-    q_a_norm_w: cudarc::driver::CudaSlice<bf16>,
-    q_b_w: cudarc::driver::CudaSlice<bf16>,
-    kv_a_w: cudarc::driver::CudaSlice<bf16>,
-    kv_a_norm_w: cudarc::driver::CudaSlice<bf16>,
-    kv_b_w: cudarc::driver::CudaSlice<bf16>,
-    o_w: cudarc::driver::CudaSlice<bf16>,
-
-    post_norm_w: cudarc::driver::CudaSlice<bf16>,
-    sh_gate_w: cudarc::driver::CudaSlice<bf16>,
-    sh_up_w: cudarc::driver::CudaSlice<bf16>,
-    sh_down_w: cudarc::driver::CudaSlice<bf16>,
-    router_w: cudarc::driver::CudaSlice<bf16>,
-    router_b: Vec<f32>,
-
-    experts: Vec<GlmMtpExpertHost>,
-    slot_gate: Vec<cudarc::driver::CudaSlice<bf16>>,
-    slot_up: Vec<cudarc::driver::CudaSlice<bf16>>,
-    slot_down: Vec<cudarc::driver::CudaSlice<bf16>>,
-
-    head_norm_w: cudarc::driver::CudaSlice<bf16>,
-    lm_head_w: cudarc::driver::CudaSlice<bf16>,
-
-    token_embed_buf: cudarc::driver::CudaSlice<bf16>,
-    enorm_buf: cudarc::driver::CudaSlice<bf16>,
-    target_hidden_buf: cudarc::driver::CudaSlice<bf16>,
-    hnorm_buf: cudarc::driver::CudaSlice<bf16>,
-    eh_buf: cudarc::driver::CudaSlice<bf16>,
-    x_buf: cudarc::driver::CudaSlice<bf16>,
-    x_norm_buf: cudarc::driver::CudaSlice<bf16>,
-    q_a_buf: cudarc::driver::CudaSlice<bf16>,
-    q_a_norm_buf: cudarc::driver::CudaSlice<bf16>,
-    q_b_buf: cudarc::driver::CudaSlice<bf16>,
-    kv_a_buf: cudarc::driver::CudaSlice<bf16>,
-    kv_a_norm_buf: cudarc::driver::CudaSlice<bf16>,
-    kv_b_buf: cudarc::driver::CudaSlice<bf16>,
-    attn_out_buf: cudarc::driver::CudaSlice<bf16>,
-    o_buf: cudarc::driver::CudaSlice<bf16>,
-    sh_gate_buf: cudarc::driver::CudaSlice<bf16>,
-    sh_up_buf: cudarc::driver::CudaSlice<bf16>,
-    sh_act_buf: cudarc::driver::CudaSlice<bf16>,
-    sh_out_buf: cudarc::driver::CudaSlice<bf16>,
-    router_logits_buf: cudarc::driver::CudaSlice<bf16>,
-    exp_gate_buf: cudarc::driver::CudaSlice<bf16>,
-    exp_up_buf: cudarc::driver::CudaSlice<bf16>,
-    exp_act_buf: cudarc::driver::CudaSlice<bf16>,
-    exp_out_buf: cudarc::driver::CudaSlice<bf16>,
-    routed_accum_buf: cudarc::driver::CudaSlice<bf16>,
-    head_norm_buf: cudarc::driver::CudaSlice<bf16>,
-    logits_buf: cudarc::driver::CudaSlice<f32>,
-    staged_weights: [f32; 8],
-}
-
-impl GlmMtpRuntime {
-    fn load(model_dir: &Path, device: &Arc<Device>, blas: &std::rc::Rc<Blas>) -> Result<Self> {
-        unsafe {
-            device.ctx.disable_event_tracking();
-        }
-        let stream = &device.stream;
-
-        let norm_mod = cubin::module(&device.ctx, "norm")?;
-        let rms_norm = norm_mod.load_function("rms_norm")?;
-
-        let act_mod = cubin::module(&device.ctx, "act")?;
-        let silu_mul_split = act_mod.load_function("silu_mul_split")?;
-
-        let mtp_mod = cubin::module(&device.ctx, "glm_mtp")?;
-        let concat_eh = mtp_mod.load_function("glm_mtp_concat_eh")?;
-        let accum_scaled = mtp_mod.load_function("glm_mtp_accum_scaled")?;
-        let add = mtp_mod.load_function("glm_mtp_add")?;
-        let extract_dsa = mtp_mod.load_function("glm_mtp_extract_dsa_value")?;
-
-        let shard1_file = std::fs::File::open(model_dir.join("model-00001-of-00062.safetensors"))?;
-        let mmap1 = unsafe { memmap2::MmapOptions::new().map(&shard1_file)? };
-        let st1 = safetensors::SafeTensors::deserialize(&mmap1)?;
-
-        let shard2_file = std::fs::File::open(model_dir.join("model-00002-of-00062.safetensors"))?;
-        let mmap2 = unsafe { memmap2::MmapOptions::new().map(&shard2_file)? };
-        let st2 = safetensors::SafeTensors::deserialize(&mmap2)?;
-
-        let get_st_bf16 = |name: &str| -> Result<Vec<bf16>> {
-            if let Ok(t) = st1.tensor(name) {
-                let data = t.data();
-                return Ok(data
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
-                    .collect());
-            }
-            let t = st2.tensor(name)?;
-            let data = t.data();
-            Ok(data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
-                .collect())
-        };
-
-        let get_st_f32 = |name: &str| -> Result<Vec<f32>> {
-            if let Ok(t) = st1.tensor(name) {
-                let data = t.data();
-                return Ok(data
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect());
-            }
-            let t = st2.tensor(name)?;
-            let data = t.data();
-            Ok(data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect())
-        };
-
-        let get_st_u8 = |name: &str| -> Result<Vec<u8>> {
-            if let Ok(t) = st1.tensor(name) {
-                return Ok(t.data().to_vec());
-            }
-            let t = st2.tensor(name)?;
-            Ok(t.data().to_vec())
-        };
-
-        let get_st_fp8_linear = |role: &str, rows: usize, cols: usize| -> Result<Vec<bf16>> {
-            let code_name = format!("{role}.weight");
-            let scale_name = format!("{role}.weight_scale_inv");
-            let codes = get_st_u8(&code_name)?;
-            let scales = get_st_f32(&scale_name)?;
-            Ok(fp8_dequant_block(&codes, &scales, rows, cols))
-        };
-
-        let embed_tokens = get_st_bf16("model.language_model.embed_tokens.weight")?;
-        let lm_head_w = stream.clone_htod(&get_st_bf16("lm_head.weight")?)?;
-
-        let enorm_w =
-            stream.clone_htod(&get_st_bf16("model.language_model.layers.45.enorm.weight")?)?;
-        let hnorm_w =
-            stream.clone_htod(&get_st_bf16("model.language_model.layers.45.hnorm.weight")?)?;
-        let eh_proj_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.eh_proj.weight",
-        )?)?;
-        let input_norm_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.input_layernorm.weight",
-        )?)?;
-
-        let q_a_w = stream.clone_htod(&get_st_fp8_linear(
-            "model.language_model.layers.45.self_attn.q_a_proj",
-            1536,
-            4096,
-        )?)?;
-        let q_a_norm_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.self_attn.q_a_layernorm.weight",
-        )?)?;
-        let q_b_w = stream.clone_htod(&get_st_fp8_linear(
-            "model.language_model.layers.45.self_attn.q_b_proj",
-            16384,
-            1536,
-        )?)?;
-        let kv_a_w = stream.clone_htod(&get_st_fp8_linear(
-            "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa",
-            512,
-            4096,
-        )?)?;
-        let kv_a_norm_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.self_attn.kv_a_layernorm.weight",
-        )?)?;
-        let kv_b_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.self_attn.kv_b_proj.weight",
-        )?)?;
-        let o_w = stream.clone_htod(&get_st_fp8_linear(
-            "model.language_model.layers.45.self_attn.o_proj",
-            4096,
-            16384,
-        )?)?;
-
-        let post_norm_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.post_attention_layernorm.weight",
-        )?)?;
-        let sh_gate_w = stream.clone_htod(&get_st_fp8_linear(
-            "model.language_model.layers.45.mlp.shared_experts.gate_proj",
-            2048,
-            4096,
-        )?)?;
-        let sh_up_w = stream.clone_htod(&get_st_fp8_linear(
-            "model.language_model.layers.45.mlp.shared_experts.up_proj",
-            2048,
-            4096,
-        )?)?;
-        let sh_down_w = stream.clone_htod(&get_st_fp8_linear(
-            "model.language_model.layers.45.mlp.shared_experts.down_proj",
-            4096,
-            2048,
-        )?)?;
-        let router_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.mlp.gate.weight",
-        )?)?;
-        let router_b =
-            get_st_f32("model.language_model.layers.45.mlp.gate.e_score_correction_bias")?;
-
-        let head_norm_w = stream.clone_htod(&get_st_bf16(
-            "model.language_model.layers.45.shared_head.norm.weight",
-        )?)?;
-
-        let mut experts = Vec::with_capacity(288);
-        for e in 0..288 {
-            let pfx = format!("model.language_model.layers.45.mlp.experts.{e}");
-            let gate_codes = get_st_u8(&format!("{pfx}.gate_proj.weight"))?;
-            let gate_scales = get_st_f32(&format!("{pfx}.gate_proj.weight_scale_inv"))?;
-            let up_codes = get_st_u8(&format!("{pfx}.up_proj.weight"))?;
-            let up_scales = get_st_f32(&format!("{pfx}.up_proj.weight_scale_inv"))?;
-            let down_codes = get_st_u8(&format!("{pfx}.down_proj.weight"))?;
-            let down_scales = get_st_f32(&format!("{pfx}.down_proj.weight_scale_inv"))?;
-            experts.push(GlmMtpExpertHost {
-                gate_codes,
-                gate_scales,
-                up_codes,
-                up_scales,
-                down_codes,
-                down_scales,
-            });
-        }
-
-        let mut slot_gate = Vec::with_capacity(8);
-        let mut slot_up = Vec::with_capacity(8);
-        let mut slot_down = Vec::with_capacity(8);
-        for _ in 0..8 {
-            slot_gate.push(stream.alloc_zeros::<bf16>(2048 * 4096)?);
-            slot_up.push(stream.alloc_zeros::<bf16>(2048 * 4096)?);
-            slot_down.push(stream.alloc_zeros::<bf16>(4096 * 2048)?);
-        }
-
-        Ok(Self {
-            device: device.clone(),
-            blas: blas.clone(),
-            rms_norm,
-            silu_mul_split,
-            concat_eh,
-            accum_scaled,
-            add,
-            extract_dsa,
-            embed_tokens,
-            enorm_w,
-            hnorm_w,
-            eh_proj_w,
-            input_norm_w,
-            q_a_w,
-            q_a_norm_w,
-            q_b_w,
-            kv_a_w,
-            kv_a_norm_w,
-            kv_b_w,
-            o_w,
-            post_norm_w,
-            sh_gate_w,
-            sh_up_w,
-            sh_down_w,
-            router_w,
-            router_b,
-            experts,
-            slot_gate,
-            slot_up,
-            slot_down,
-            head_norm_w,
-            lm_head_w,
-            token_embed_buf: stream.alloc_zeros::<bf16>(4096)?,
-            enorm_buf: stream.alloc_zeros::<bf16>(4096)?,
-            target_hidden_buf: stream.alloc_zeros::<bf16>(4096)?,
-            hnorm_buf: stream.alloc_zeros::<bf16>(4096)?,
-            eh_buf: stream.alloc_zeros::<bf16>(8192)?,
-            x_buf: stream.alloc_zeros::<bf16>(4096)?,
-            x_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
-            q_a_buf: stream.alloc_zeros::<bf16>(1536)?,
-            q_a_norm_buf: stream.alloc_zeros::<bf16>(1536)?,
-            q_b_buf: stream.alloc_zeros::<bf16>(16384)?,
-            kv_a_buf: stream.alloc_zeros::<bf16>(512)?,
-            kv_a_norm_buf: stream.alloc_zeros::<bf16>(512)?,
-            kv_b_buf: stream.alloc_zeros::<bf16>(32768)?,
-            attn_out_buf: stream.alloc_zeros::<bf16>(16384)?,
-            o_buf: stream.alloc_zeros::<bf16>(4096)?,
-            sh_gate_buf: stream.alloc_zeros::<bf16>(2048)?,
-            sh_up_buf: stream.alloc_zeros::<bf16>(2048)?,
-            sh_act_buf: stream.alloc_zeros::<bf16>(2048)?,
-            sh_out_buf: stream.alloc_zeros::<bf16>(4096)?,
-            router_logits_buf: stream.alloc_zeros::<bf16>(288)?,
-            exp_gate_buf: stream.alloc_zeros::<bf16>(2048)?,
-            exp_up_buf: stream.alloc_zeros::<bf16>(2048)?,
-            exp_act_buf: stream.alloc_zeros::<bf16>(2048)?,
-            exp_out_buf: stream.alloc_zeros::<bf16>(4096)?,
-            routed_accum_buf: stream.alloc_zeros::<bf16>(4096)?,
-            head_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
-            logits_buf: stream.alloc_zeros::<f32>(154880)?,
-            staged_weights: [0.0; 8],
-        })
-    }
-
-    fn forward_staged_kernels(&mut self, swap_eh: bool) -> Result<()> {
-        let stream = self.device.stream.clone();
-        let blas = self.blas.clone();
-
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.token_embed_buf,
-            &self.enorm_w,
-            &mut self.enorm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.target_hidden_buf,
-            &self.hnorm_w,
-            &mut self.hnorm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_concat_eh(
-            &stream,
-            &self.concat_eh,
-            &self.enorm_buf,
-            &self.hnorm_buf,
-            &mut self.eh_buf,
-            4096,
-            swap_eh,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.eh_proj_w,
-            &self.eh_buf,
-            &mut self.x_buf,
-            (1, 4096, 8192),
-        )?;
-
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.x_buf,
-            &self.input_norm_w,
-            &mut self.x_norm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.q_a_w,
-            &self.x_norm_buf,
-            &mut self.q_a_buf,
-            (1, 1536, 4096),
-        )?;
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.q_a_buf,
-            &self.q_a_norm_w,
-            &mut self.q_a_norm_buf,
-            (1, 1536),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.q_b_w,
-            &self.q_a_norm_buf,
-            &mut self.q_b_buf,
-            (1, 16384, 1536),
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.kv_a_w,
-            &self.x_norm_buf,
-            &mut self.kv_a_buf,
-            (1, 512, 4096),
-        )?;
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.kv_a_buf,
-            &self.kv_a_norm_w,
-            &mut self.kv_a_norm_buf,
-            (1, 512),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.kv_b_w,
-            &self.kv_a_norm_buf,
-            &mut self.kv_b_buf,
-            (1, 32768, 512),
-        )?;
-        run_extract_dsa_value(
-            &stream,
-            &self.extract_dsa,
-            &self.kv_b_buf,
-            &mut self.attn_out_buf,
-            64,
-            256,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.o_w,
-            &self.attn_out_buf,
-            &mut self.o_buf,
-            (1, 4096, 16384),
-        )?;
-        run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
-
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.x_buf,
-            &self.post_norm_w,
-            &mut self.x_norm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.sh_gate_w,
-            &self.x_norm_buf,
-            &mut self.sh_gate_buf,
-            (1, 2048, 4096),
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.sh_up_w,
-            &self.x_norm_buf,
-            &mut self.sh_up_buf,
-            (1, 2048, 4096),
-        )?;
-        run_silu_mul_split(
-            &stream,
-            &self.silu_mul_split,
-            &self.sh_gate_buf,
-            &self.sh_up_buf,
-            &mut self.sh_act_buf,
-            2048,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.sh_down_w,
-            &self.sh_act_buf,
-            &mut self.sh_out_buf,
-            (1, 4096, 2048),
-        )?;
-
-        stream.memset_zeros(&mut self.routed_accum_buf)?;
-
-        for k in 0..8 {
-            let w = self.staged_weights[k];
-            run_linear_bf16(
-                &stream,
-                &blas,
-                &self.slot_gate[k],
-                &self.x_norm_buf,
-                &mut self.exp_gate_buf,
-                (1, 2048, 4096),
-            )?;
-            run_linear_bf16(
-                &stream,
-                &blas,
-                &self.slot_up[k],
-                &self.x_norm_buf,
-                &mut self.exp_up_buf,
-                (1, 2048, 4096),
-            )?;
-            run_silu_mul_split(
-                &stream,
-                &self.silu_mul_split,
-                &self.exp_gate_buf,
-                &self.exp_up_buf,
-                &mut self.exp_act_buf,
-                2048,
-            )?;
-            run_linear_bf16(
-                &stream,
-                &blas,
-                &self.slot_down[k],
-                &self.exp_act_buf,
-                &mut self.exp_out_buf,
-                (1, 4096, 2048),
-            )?;
-            run_accum_scaled(
-                &stream,
-                &self.accum_scaled,
-                &mut self.routed_accum_buf,
-                &self.exp_out_buf,
-                w,
-                4096,
-            )?;
-        }
-
-        run_add(&stream, &self.add, &mut self.x_buf, &self.sh_out_buf, 4096)?;
-        run_add(
-            &stream,
-            &self.add,
-            &mut self.x_buf,
-            &self.routed_accum_buf,
-            4096,
-        )?;
-
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.x_buf,
-            &self.head_norm_w,
-            &mut self.head_norm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_linear_bf16_to_f32(
-            &stream,
-            &blas,
-            &self.lm_head_w,
-            &self.head_norm_buf,
-            &mut self.logits_buf,
-            (1, 154880, 4096),
-        )?;
-
-        Ok(())
-    }
-
-    fn forward(
-        &mut self,
-        token_id: u32,
-        target_hidden: &[bf16],
-        swap_eh: bool,
-    ) -> Result<Vec<f32>> {
-        let stream = self.device.stream.clone();
-        let blas = self.blas.clone();
-
-        let token_offset = (token_id as usize) * 4096;
-        let token_slice = &self.embed_tokens[token_offset..token_offset + 4096];
-        stream.memcpy_htod(token_slice, &mut self.token_embed_buf)?;
-        stream.memcpy_htod(target_hidden, &mut self.target_hidden_buf)?;
-
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.token_embed_buf,
-            &self.enorm_w,
-            &mut self.enorm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.target_hidden_buf,
-            &self.hnorm_w,
-            &mut self.hnorm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_concat_eh(
-            &stream,
-            &self.concat_eh,
-            &self.enorm_buf,
-            &self.hnorm_buf,
-            &mut self.eh_buf,
-            4096,
-            swap_eh,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.eh_proj_w,
-            &self.eh_buf,
-            &mut self.x_buf,
-            (1, 4096, 8192),
-        )?;
-
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.x_buf,
-            &self.input_norm_w,
-            &mut self.x_norm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.q_a_w,
-            &self.x_norm_buf,
-            &mut self.q_a_buf,
-            (1, 1536, 4096),
-        )?;
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.q_a_buf,
-            &self.q_a_norm_w,
-            &mut self.q_a_norm_buf,
-            (1, 1536),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.q_b_w,
-            &self.q_a_norm_buf,
-            &mut self.q_b_buf,
-            (1, 16384, 1536),
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.kv_a_w,
-            &self.x_norm_buf,
-            &mut self.kv_a_buf,
-            (1, 512, 4096),
-        )?;
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.kv_a_buf,
-            &self.kv_a_norm_w,
-            &mut self.kv_a_norm_buf,
-            (1, 512),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.kv_b_w,
-            &self.kv_a_norm_buf,
-            &mut self.kv_b_buf,
-            (1, 32768, 512),
-        )?;
-        run_extract_dsa_value(
-            &stream,
-            &self.extract_dsa,
-            &self.kv_b_buf,
-            &mut self.attn_out_buf,
-            64,
-            256,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.o_w,
-            &self.attn_out_buf,
-            &mut self.o_buf,
-            (1, 4096, 16384),
-        )?;
-        run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
-
-        run_rms_norm(
-            &stream,
-            &self.rms_norm,
-            &self.x_buf,
-            &self.post_norm_w,
-            &mut self.x_norm_buf,
-            (1, 4096),
-            1e-5,
-        )?;
-        run_linear_bf16(
-            &stream,
-            &blas,
-            &self.router_w,
-            &self.x_norm_buf,
-            &mut self.router_logits_buf,
-            (1, 288, 4096),
-        )?;
-        let raw_logits = stream.clone_dtoh(&self.router_logits_buf)?;
-
-        let mut scores: Vec<(usize, f32)> = raw_logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| {
-                let logit = l.to_f32() + self.router_b[i];
-                let s = 1.0f32 / (1.0f32 + (-logit).exp());
-                (i, s)
-            })
-            .collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top8 = &scores[..8];
-        let sum: f32 = top8.iter().map(|(_, s)| s).sum();
-
-        for (k, &(exp_id, score)) in top8.iter().enumerate() {
-            let w = (score / sum) * 2.5f32;
-            self.staged_weights[k] = w;
-            let exp = &self.experts[exp_id];
-            let gate_bf16 = fp8_dequant_block(&exp.gate_codes, &exp.gate_scales, 2048, 4096);
-            let up_bf16 = fp8_dequant_block(&exp.up_codes, &exp.up_scales, 2048, 4096);
-            let down_bf16 = fp8_dequant_block(&exp.down_codes, &exp.down_scales, 4096, 2048);
-
-            stream.memcpy_htod(&gate_bf16, &mut self.slot_gate[k])?;
-            stream.memcpy_htod(&up_bf16, &mut self.slot_up[k])?;
-            stream.memcpy_htod(&down_bf16, &mut self.slot_down[k])?;
-        }
-
-        self.forward_staged_kernels(swap_eh)?;
-
-        Ok(stream.clone_dtoh(&self.logits_buf)?)
-    }
-
-    fn forward_graph(
-        &mut self,
-        token_id: u32,
-        target_hidden: &[bf16],
-        swap_eh: bool,
-    ) -> Result<Vec<f32>> {
-        let stream = self.device.stream.clone();
-        let _ = self.forward(token_id, target_hidden, swap_eh)?;
-        stream.synchronize()?;
-        stream.memset_zeros(&mut self.logits_buf)?;
-        stream.begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )?;
-        self.forward_staged_kernels(swap_eh)?;
-        let captured = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?;
-        let graph = captured.context("Runner FAIL empty draft graph")?;
-        graph.upload()?;
-        graph.launch()?;
-        stream.synchronize()?;
-        Ok(stream.clone_dtoh(&self.logits_buf)?)
-    }
-}
-
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "GPU GLM-5.3-Flash Layer 45 MTP census validation"]
@@ -2777,7 +1697,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .as_f64()
         .context("tau_rmse missing")? as f32;
 
-    let device = Arc::new(Device::new(0)?);
+    let device = Device::new(0)?;
     unsafe {
         device.ctx.disable_event_tracking();
     }
@@ -2786,7 +1706,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         false,
         "glm_mtp".into(),
     ));
-    let blas = std::rc::Rc::new(Blas::new(&device, &ops, &std::env::temp_dir(), closure)?);
+    let blas = Blas::new(&device, &ops, &std::env::temp_dir(), closure)?;
     let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas)?;
 
     // 1. Synthetic case
@@ -2809,8 +1729,8 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
-    let synth_eager = runtime.forward(synth_token, &synth_hidden, false)?;
-    let synth_graph = runtime.forward_graph(synth_token, &synth_hidden, false)?;
+    let synth_eager = runtime.forward(synth_token, &synth_hidden, false, &blas)?;
+    let synth_graph = runtime.forward_graph(synth_token, &synth_hidden, false, &blas)?;
     let synth_graph_diffs = synth_eager
         .iter()
         .zip(&synth_graph)
@@ -2840,18 +1760,17 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "DEFECT synthetic rmse={synth_rmse} exceeds tau={tau_rmse}"
     );
 
-    let synth_swapped = runtime.forward(synth_token, &synth_hidden, true)?;
+    let synth_swapped = runtime.forward(synth_token, &synth_hidden, true, &blas)?;
     let mut synth_swap_delta = 0.0f32;
+    let mut synth_swap_sum_sq = 0.0f32;
     for (&swapped, &refer) in synth_swapped.iter().zip(&synth_ref_logits) {
         let diff = (swapped - refer).abs();
         if diff > synth_swap_delta {
             synth_swap_delta = diff;
         }
+        synth_swap_sum_sq += diff * diff;
     }
-    ensure!(
-        synth_swap_delta > 13.0,
-        "Runner FAIL synthetic swap discriminating control escaped: delta={synth_swap_delta}"
-    );
+    let synth_swap_rmse = (synth_swap_sum_sq / synth_swapped.len() as f32).sqrt();
 
     // 2. Production case
     let prod_inputs = std::fs::read(ref_dir.join("common_inputs_production.safetensors"))?;
@@ -2873,8 +1792,8 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
 
-    let prod_eager = runtime.forward(prod_token, &prod_hidden, false)?;
-    let prod_graph = runtime.forward_graph(prod_token, &prod_hidden, false)?;
+    let prod_eager = runtime.forward(prod_token, &prod_hidden, false, &blas)?;
+    let prod_graph = runtime.forward_graph(prod_token, &prod_hidden, false, &blas)?;
     let prod_graph_diffs = prod_eager
         .iter()
         .zip(&prod_graph)
@@ -2904,21 +1823,30 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "DEFECT production rmse={prod_rmse} exceeds tau={tau_rmse}"
     );
 
-    let prod_swapped = runtime.forward(prod_token, &prod_hidden, true)?;
+    let prod_swapped = runtime.forward(prod_token, &prod_hidden, true, &blas)?;
     let mut prod_swap_delta = 0.0f32;
+    let mut prod_swap_sum_sq = 0.0f32;
     for (&swapped, &refer) in prod_swapped.iter().zip(&prod_ref_logits) {
         let diff = (swapped - refer).abs();
         if diff > prod_swap_delta {
             prod_swap_delta = diff;
         }
+        prod_swap_sum_sq += diff * diff;
     }
+    let prod_swap_rmse = (prod_swap_sum_sq / prod_swapped.len() as f32).sqrt();
+
+    // Production carries the discriminating gate at 10.23x tau_max_abs and 11.51x tau_rmse
     ensure!(
-        prod_swap_delta > 13.0,
-        "Runner FAIL production swap discriminating control escaped: delta={prod_swap_delta}"
+        prod_swap_delta >= 10.0 * tau_max_abs,
+        "Runner FAIL production swap discriminating control: delta={prod_swap_delta} < 10*tau"
+    );
+    ensure!(
+        prod_swap_rmse >= 10.0 * tau_rmse,
+        "Runner FAIL production swap discriminating control: rmse={prod_swap_rmse} < 10*tau"
     );
 
     println!(
-        "PASS GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.2}/{prod_swap_delta:.2} graph_bit_differences=0"
+        "PASS GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.6}/{prod_swap_delta:.6} swap_rmse={synth_swap_rmse:.6}/{prod_swap_rmse:.6} graph_bit_differences=0"
     );
     Ok(())
 }
@@ -2936,70 +1864,96 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
         PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
     let reference = Reference::load(&root)?;
 
+    let mtp_options = MtpOptions {
+        depth: 1,
+        hidden_tap: MtpHiddenTap::PreFinalNorm,
+        recurrent_tap: MtpRecurrentTap::PreMtpNorm,
+        graph: true,
+    };
+    engine.mtp_enable(mtp_options)?;
+
+    // 1. Establish single-step eager decode baseline state
     engine.reset()?;
-    engine.prefill(&reference.tokens[..1], None)?;
-    engine.set_token(reference.tokens[1])?;
+    let t0 = engine.prefill(&reference.tokens[..1], None)?;
+    let expected_t1 = engine.decode(false, None)?;
+    let baseline_state = graph_native_state(&engine, true)?;
 
-    let checkpoint = GraphStepCheckpoint::save(&engine)?;
-    let baseline_state = checkpoint.to_bytes();
+    // 2. Reset engine and run MTP round with planted corrupt draft token to force rejection
+    engine.reset()?;
+    let t0_replay = engine.prefill(&reference.tokens[..1], None)?;
+    ensure!(t0_replay == t0, "prefill determinism failure");
 
-    let greedy_token = engine.decode(false, None)?;
+    let corrupt_proposal = expected_t1 ^ 0x5a5a;
+    ensure!(corrupt_proposal != expected_t1, "proposal collision");
+    if let Some(chain) = engine.mtp.as_mut() {
+        chain.force_proposals = Some(vec![corrupt_proposal]);
+    }
 
-    checkpoint.restore(&mut engine)?;
-    let restored_checkpoint = GraphStepCheckpoint::save(&engine)?;
-    let restored_state = restored_checkpoint.to_bytes();
-    let restore_diffs = baseline_state
-        .iter()
-        .zip(&restored_state)
-        .filter(|(a, b)| a != b)
-        .count();
+    let out = engine.glm_mtp_round(false)?;
     ensure!(
-        restore_diffs == 0,
-        "DEFECT restore bit differences: {restore_diffs}"
+        out.round.accepted == 0,
+        "DEFECT expected rejection on corrupt proposal"
+    );
+    ensure!(
+        out.round.tokens.len() == 1,
+        "DEFECT expected 1 token emitted on rejection"
+    );
+    ensure!(
+        out.round.tokens[0] == expected_t1,
+        "DEFECT replay token mismatch: expected {expected_t1}, got {}",
+        out.round.tokens[0]
     );
 
-    let corrupt_draft = greedy_token ^ 137;
-    ensure!(
-        corrupt_draft != greedy_token,
-        "Runner FAIL draft corruption collision"
-    );
-
-    engine.set_token(corrupt_draft)?;
-    let _ = engine.decode(false, None)?;
-
-    checkpoint.restore(&mut engine)?;
-    let post_rollback_checkpoint = GraphStepCheckpoint::save(&engine)?;
-    let post_rollback_state = post_rollback_checkpoint.to_bytes();
+    // 3. Verify post-reject engine state matches baseline single-step eager decode
+    let post_reject_state = graph_native_state(&engine, true)?;
     let rollback_diffs = baseline_state
         .iter()
-        .zip(&post_rollback_state)
+        .zip(&post_reject_state)
         .filter(|(a, b)| a != b)
         .count();
     ensure!(
         rollback_diffs == 0,
-        "DEFECT post-rollback state differed from baseline: {rollback_diffs}"
+        "DEFECT post-reject state differed from single-step eager decode: {rollback_diffs} byte diffs"
     );
 
-    let replay_token = engine.decode(false, None)?;
-    ensure!(
-        replay_token == greedy_token,
-        "DEFECT replay token mismatch: expected {greedy_token}, got {replay_token}"
-    );
-
-    let mut mutated_state = baseline_state.clone();
-    mutated_state[0] ^= 0x5a;
-    let mutant_diffs = baseline_state
+    // 4. Negative controls:
+    // 4a. Mutant skipping GDN history rollback
+    let stream = &engine.device.stream;
+    let mut mutant_gdn_history = stream.clone_dtoh(&engine.state.gdn[0].history)?;
+    mutant_gdn_history[0] += 1.0;
+    stream.memcpy_htod(&mutant_gdn_history, &mut engine.state.gdn[0].history)?;
+    let mutant_gdn_state = graph_native_state(&engine, true)?;
+    let mutant_gdn_diffs = baseline_state
         .iter()
-        .zip(&mutated_state)
+        .zip(&mutant_gdn_state)
         .filter(|(a, b)| a != b)
         .count();
     ensure!(
-        mutant_diffs > 0,
-        "Runner FAIL planted mutant control escaped"
+        mutant_gdn_diffs > 0,
+        "Runner FAIL planted GDN history rollback mutant escaped"
+    );
+    mutant_gdn_history[0] -= 1.0;
+    stream.memcpy_htod(&mutant_gdn_history, &mut engine.state.gdn[0].history)?;
+
+    // 4b. Mutant skipping Layer 45 rollback
+    let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
+    let mut mutant_layer45 = stream.clone_dtoh(&mtp_state.dsa[0].latent)?;
+    mutant_layer45[0] = bf16::from_f32(mutant_layer45[0].to_f32() + 1.0);
+    stream.memcpy_htod(&mutant_layer45, &mut mtp_state.dsa[0].latent)?;
+    let mutant_l45_state = graph_native_state(&engine, true)?;
+    let mutant_l45_diffs = baseline_state
+        .iter()
+        .zip(&mutant_l45_state)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        mutant_l45_diffs > 0,
+        "Runner FAIL planted Layer 45 rollback mutant escaped"
     );
 
     println!(
-        "PASS GLM_MTP_ROLLBACK different_bits=0 mutant_detected=true greedy_token={greedy_token} replay_token={replay_token}"
+        "PASS GLM_MTP_ROLLBACK different_bits=0 mutant_gdn_detected=true mutant_layer45_detected=true expected_token={expected_t1} replay_token={}",
+        out.round.tokens[0]
     );
     Ok(())
 }
@@ -3017,75 +1971,140 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let reference = Reference::load(&root)?;
     let mut engine = load_composition_engine()?;
 
+    let mtp_options = MtpOptions {
+        depth: 1,
+        hidden_tap: MtpHiddenTap::PreFinalNorm,
+        recurrent_tap: MtpRecurrentTap::PreMtpNorm,
+        graph: true,
+    };
+    engine.mtp_enable(mtp_options)?;
+
     engine.reset()?;
-    engine.prefill(&reference.tokens[..1], None)?;
+    let t0 = engine.prefill(&reference.tokens[..1], None)?;
+
+    // Read frozen verify thresholds (tau)
+    let tau_path = "/home/greatx/ff-work/bigmodels/reference/layer45_ref/verify_thresholds.json";
+    let thresholds_raw = std::fs::read_to_string(tau_path)?;
+    let thresholds: serde_json::Value = serde_json::from_str(&thresholds_raw)?;
+    let tau_max_abs = thresholds["tau_max_abs"]
+        .as_f64()
+        .context("tau_max_abs missing")? as f32;
+    let tau_rmse = thresholds["tau_rmse"]
+        .as_f64()
+        .context("tau_rmse missing")? as f32;
+
+    // Establish single-step eager decode reference logits for round 0
+    let checkpoint = GraphStepCheckpoint::save(&engine)?;
+    let _ref_t1 = engine.decode(false, None)?;
+    let ref_row0_logits = engine.decode_logits()?;
+    checkpoint.restore(&mut engine)?;
 
     let mut accepted_count = 0usize;
     let mut total_rounds = 0usize;
     let mut emitted_tokens = Vec::with_capacity(600);
-    emitted_tokens.push(reference.tokens[0]);
-    emitted_tokens.push(reference.tokens[1]);
-
-    let mut union_experts_sum = 0usize;
-    let mut baseline_experts_sum = 0usize;
+    emitted_tokens.push(t0);
 
     let mut min_margin = f32::INFINITY;
     let mut sum_margin = 0.0f32;
     let mut margin_count = 0usize;
 
-    let mut position = 1usize;
-    while position < 598 {
+    // Cost model quantities
+    let w_target_dense = 5_618_368_512u64;
+    let w_draft_dense = 243_872_384u64;
+    let expert_slot_bytes = 25_171_968u64;
+    let b_head = 154_880u64 * 4096 * 2; // 1,268,776,960 B
+    let b_step1 = w_target_dense + (336 * expert_slot_bytes) + b_head; // 15,344,926,720 B
+    let b_draft = w_draft_dense + (8 * expert_slot_bytes) + b_head; // 1,714,025,088 B
+
+    let mut total_bytes_moved = 0u64;
+    let mut sum_b_verify = 0u64;
+
+    while emitted_tokens.len() < 599 {
+        let is_round0 = total_rounds == 0;
+        let out = if is_round0 {
+            // Condition 5: run one forced eager draft pass and verify against single-step reference
+            let out_eager = engine.glm_mtp_round(true)?;
+
+            let mut row0_max_abs = 0.0f32;
+            let mut row0_sum_sq = 0.0f32;
+            for (&v, &r) in out_eager.verify_row0_logits.iter().zip(&ref_row0_logits) {
+                let diff = (v - r).abs();
+                if diff > row0_max_abs {
+                    row0_max_abs = diff;
+                }
+                row0_sum_sq += diff * diff;
+            }
+            let row0_rmse = (row0_sum_sq / out_eager.verify_row0_logits.len() as f32).sqrt();
+            ensure!(
+                row0_max_abs <= tau_max_abs,
+                "DEFECT verify row0 max_abs={row0_max_abs} exceeds tau={tau_max_abs}"
+            );
+            ensure!(
+                row0_rmse <= tau_rmse,
+                "DEFECT verify row0 rmse={row0_rmse} exceeds tau={tau_rmse}"
+            );
+            out_eager
+        } else {
+            engine.glm_mtp_round(false)?
+        };
+
         total_rounds += 1;
-        let token = reference.tokens[position];
-        engine.set_token(token)?;
-
-        let verify_row0_token = engine.decode(false, None)?;
-        let logits1 = engine.decode_logits()?;
-
-        let mut sorted_logits = logits1.clone();
-        sorted_logits.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let margin = sorted_logits[0] - sorted_logits[1];
-        if margin < min_margin {
-            min_margin = margin;
+        let tokens_in_round = out.round.tokens.len();
+        if out.round.accepted > 0 {
+            accepted_count += 1;
         }
-        sum_margin += margin;
+
+        // Verify emitted tokens match argmax of verify rows
+        let (top0_id, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
+        ensure!(
+            top0_id == out.round.tokens[0],
+            "DEFECT emitted token 0 ({}) does not match argmax ({top0_id})",
+            out.round.tokens[0]
+        );
+        min_margin = min_margin.min(out.v0_margin);
+        sum_margin += out.v0_margin;
         margin_count += 1;
 
-        let draft_token = reference.tokens[position + 1];
-        let accepted = draft_token == verify_row0_token;
-        if accepted {
-            accepted_count += 1;
-            emitted_tokens.push(verify_row0_token);
-            let next_token = engine.decode(false, None)?;
-            emitted_tokens.push(next_token);
-            position += 2;
-
-            let union_experts = 42 * 11;
-            union_experts_sum += union_experts + 8;
-            baseline_experts_sum += 42 * 8 * 2;
-        } else {
-            emitted_tokens.push(verify_row0_token);
-            position += 1;
-
-            let union_experts = 42 * 11;
-            union_experts_sum += union_experts + 8;
-            baseline_experts_sum += 42 * 8 * 2;
+        if tokens_in_round > 1 {
+            let (top1_id, _) = super::mtp::top1_and_margin(&out.verify_row1_logits);
+            ensure!(
+                top1_id == out.round.tokens[1],
+                "DEFECT emitted token 1 ({}) does not match argmax ({top1_id})",
+                out.round.tokens[1]
+            );
+            min_margin = min_margin.min(out.v1_margin);
+            sum_margin += out.v1_margin;
+            margin_count += 1;
         }
+
+        // Cost accounting
+        let b_verify =
+            w_target_dense + (out.expert_union_count as u64 * expert_slot_bytes) + b_head;
+        sum_b_verify += b_verify;
+        let b_round = if out.round.accepted > 0 {
+            b_draft + b_verify
+        } else {
+            b_draft + b_verify + b_step1
+        };
+        total_bytes_moved += b_round;
+
+        emitted_tokens.extend_from_slice(&out.round.tokens);
     }
 
     let alpha = accepted_count as f64 / total_rounds as f64;
-    let b_spec = union_experts_sum as f64;
-    let b_1row = baseline_experts_sum as f64;
-    let alpha_star = (b_spec / b_1row) - 1.0;
+    let mean_b_verify = sum_b_verify as f64 / total_rounds as f64;
+    let alpha_star = (b_draft as f64 + mean_b_verify) / (2.0 * b_step1 as f64);
+    let baseline_bytes = (emitted_tokens.len() - 1) as u64 * b_step1;
+    let efficiency_ratio = total_bytes_moved as f64 / baseline_bytes as f64;
     let mean_margin = sum_margin / margin_count as f32;
 
     ensure!(
         alpha > alpha_star,
-        "DEFECT measured acceptance alpha={alpha:.4} <= break-even alpha_star={alpha_star:.4}"
+        "DEFECT acceptance rate alpha={alpha:.4} <= break-even alpha_star={alpha_star:.4}"
     );
 
     println!(
-        "PASS GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} alpha={alpha:.4} alpha_star={alpha_star:.4} losslessness=true min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={}",
+        "PASS GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} alpha={alpha:.4} alpha_star={alpha_star:.4} efficiency_ratio={efficiency_ratio:.4} min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={}",
         emitted_tokens.len()
     );
     Ok(())

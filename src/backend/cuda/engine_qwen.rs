@@ -2493,6 +2493,24 @@ impl Runtime {
         );
         Ok(())
     }
+
+    #[cfg(all(feature = "cuda", test))]
+    pub(crate) fn count_expert_unions_for_rows2(&self, stream: &Arc<CudaStream>) -> Result<usize> {
+        let mut count = 0;
+        for layer in &self.layers {
+            if let Some(native) = &layer.native {
+                let plan = native.plans.get(1).context("2-row native plan missing")?;
+                let (ids, _) = plan.read_route(stream)?;
+                let mut layer_set = std::collections::BTreeSet::<i32>::new();
+                if ids.len() >= 16 {
+                    layer_set.extend(&ids[..8]);
+                    layer_set.extend(&ids[8..16]);
+                }
+                count += layer_set.len();
+            }
+        }
+        Ok(count)
+    }
 }
 impl Engine {
     #[cfg(feature = "cuda")]

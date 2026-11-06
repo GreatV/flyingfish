@@ -976,9 +976,19 @@ impl GdnVerifyInput {
 
 /// Preallocated snapshot for capture/warmup. Only the KV slots that can be written
 /// are copied; every recurrent state/history element is copied.
+pub struct DsaCheckpointState {
+    pub latent: CudaSlice<bf16>,
+    pub packed: CudaSlice<bf16>,
+    pub pool_keys: CudaSlice<bf16>,
+    pub token_ids: CudaSlice<i32>,
+    pub pool_ids: CudaSlice<i32>,
+    pub meta: CudaSlice<i32>,
+}
+
 pub struct StateCheckpoint {
     kv: Vec<Kv>,
     gdn: Vec<GdnState>,
+    dsa: Vec<DsaCheckpointState>,
     sequence: Option<CudaSlice<i32>>,
     token: CudaSlice<u32>,
     prefix: usize,
@@ -996,10 +1006,6 @@ impl StateCheckpoint {
         rows: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
-        ensure!(
-            store.dsa.is_empty(),
-            "DSA checkpoint persistence is not bound"
-        );
         ensure!(
             rows > 0 && rows <= store.capacity as usize,
             "invalid checkpoint window"
@@ -1037,9 +1043,21 @@ impl StateCheckpoint {
                 history: stream.alloc_zeros(state.history.len())?,
             });
         }
+        let mut dsa = Vec::new();
+        for state in &store.dsa {
+            dsa.push(DsaCheckpointState {
+                latent: stream.alloc_zeros(state.latent.len())?,
+                packed: stream.alloc_zeros(state.packed.len())?,
+                pool_keys: stream.alloc_zeros(state.pool_keys.len())?,
+                token_ids: stream.alloc_zeros(state.token_ids.len())?,
+                pool_ids: stream.alloc_zeros(state.pool_ids.len())?,
+                meta: stream.alloc_zeros(state.meta.len())?,
+            });
+        }
         Ok(Self {
             kv,
             gdn,
+            dsa,
             sequence: store
                 .sequence
                 .as_ref()
@@ -1057,12 +1075,9 @@ impl StateCheckpoint {
     }
     fn check(&self, store: &StateStore) -> Result<()> {
         ensure!(
-            store.dsa.is_empty(),
-            "DSA checkpoint persistence is not bound"
-        );
-        ensure!(
             self.kv.len() == store.kv.len()
                 && self.gdn.len() == store.gdn.len()
+                && self.dsa.len() == store.dsa.len()
                 && self.sequence.is_some() == store.sequence.is_some()
                 && self.capacity == store.capacity as usize
                 && self.kv_rings == store.kv_rings,
@@ -1072,6 +1087,17 @@ impl StateCheckpoint {
             ensure!(
                 a.s.len() == b.s.len() && a.history.len() == b.history.len(),
                 "checkpoint GDN extent mismatch"
+            );
+        }
+        for (a, b) in self.dsa.iter().zip(&store.dsa) {
+            ensure!(
+                a.latent.len() == b.latent.len()
+                    && a.packed.len() == b.packed.len()
+                    && a.pool_keys.len() == b.pool_keys.len()
+                    && a.token_ids.len() == b.token_ids.len()
+                    && a.pool_ids.len() == b.pool_ids.len()
+                    && a.meta.len() == b.meta.len(),
+                "checkpoint DSA extent mismatch"
             );
         }
         for ((kv, saved), cap, (heads, dim)) in store
@@ -1171,6 +1197,14 @@ impl StateCheckpoint {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
         }
+        for (src, dst) in store.dsa.iter().zip(&mut self.dsa) {
+            stream.memcpy_dtod(&src.latent, &mut dst.latent)?;
+            stream.memcpy_dtod(&src.packed, &mut dst.packed)?;
+            stream.memcpy_dtod(&src.pool_keys, &mut dst.pool_keys)?;
+            stream.memcpy_dtod(&src.token_ids, &mut dst.token_ids)?;
+            stream.memcpy_dtod(&src.pool_ids, &mut dst.pool_ids)?;
+            stream.memcpy_dtod(&src.meta, &mut dst.meta)?;
+        }
         for (((src, dst), cap), (heads, dim)) in store
             .kv
             .iter()
@@ -1250,6 +1284,14 @@ impl StateCheckpoint {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
         }
+        for (src, dst) in self.dsa.iter().zip(&mut store.dsa) {
+            stream.memcpy_dtod(&src.latent, &mut dst.latent)?;
+            stream.memcpy_dtod(&src.packed, &mut dst.packed)?;
+            stream.memcpy_dtod(&src.pool_keys, &mut dst.pool_keys)?;
+            stream.memcpy_dtod(&src.token_ids, &mut dst.token_ids)?;
+            stream.memcpy_dtod(&src.pool_ids, &mut dst.pool_ids)?;
+            stream.memcpy_dtod(&src.meta, &mut dst.meta)?;
+        }
         self.restore_kv_rows(store, 0, self.active_rows, stream)?;
         if let (Some(saved), Some(seq)) = (&self.sequence, &mut store.sequence) {
             stream.memcpy_dtod(saved, seq)?;
@@ -1317,7 +1359,7 @@ impl StateCheckpoint {
         }
         self.restore_kv_rows(store, accepted, self.active_rows, stream)
     }
-    pub(super) fn restore_for_replay(
+    pub(crate) fn restore_for_replay(
         &self,
         store: &mut StateStore,
         committed: usize,
@@ -1335,6 +1377,14 @@ impl StateCheckpoint {
             for (saved, state) in self.gdn.iter().zip(&mut store.gdn) {
                 stream.memcpy_dtod(&saved.s, &mut state.s)?;
                 stream.memcpy_dtod(&saved.history, &mut state.history)?;
+            }
+            for (saved, state) in self.dsa.iter().zip(&mut store.dsa) {
+                stream.memcpy_dtod(&saved.latent, &mut state.latent)?;
+                stream.memcpy_dtod(&saved.packed, &mut state.packed)?;
+                stream.memcpy_dtod(&saved.pool_keys, &mut state.pool_keys)?;
+                stream.memcpy_dtod(&saved.token_ids, &mut state.token_ids)?;
+                stream.memcpy_dtod(&saved.pool_ids, &mut state.pool_ids)?;
+                stream.memcpy_dtod(&saved.meta, &mut state.meta)?;
             }
         }
         self.restore_kv_rows(store, committed, verified_rows, stream)
@@ -1415,6 +1465,14 @@ impl StateCheckpoint {
                 .gdn
                 .iter()
                 .map(|v| (v.s.len() + v.history.len()) * 4)
+                .sum::<usize>()
+            + self
+                .dsa
+                .iter()
+                .map(|d| {
+                    (d.latent.len() + d.packed.len() + d.pool_keys.len()) * 2
+                        + (d.token_ids.len() + d.pool_ids.len() + d.meta.len()) * 4
+                })
                 .sum::<usize>()
             + 4
             + self.sequence.as_ref().map_or(0, |s| s.len() * 4)

@@ -15,7 +15,7 @@ fn optional_verify_graphs<G>(
     if graph { capture() } else { Ok(Vec::new()) }
 }
 
-pub(super) struct Batch {
+pub(crate) struct Batch {
     snapshots: Vec<crate::backend::cuda::state::GdnState>,
     frame_epoch: Option<u64>,
     logits: CudaSlice<bf16>,
@@ -373,10 +373,13 @@ impl Bound<'_> {
             c.saved.position == Some(e.position) && c.cursor == c.saved.cursor + depth,
             "stale M2b draft checkpoint/cursor"
         );
+        let runtime = c.runtime.as_mut().context("Qwen MtpRuntime missing")?;
+        let catalog = c.catalog.as_ref().context("Qwen catalog missing")?;
+        let batch = c.batch.as_mut().context("M2b not bound")?;
         let ids = if depth == 0 {
             view(&e.work.token, s, 0, [1], [1])?
         } else {
-            view(&c.runtime.prediction, s, 0, [1], [1])?
+            view(&runtime.prediction, s, 0, [1], [1])?
         };
         let hidden = matrix(
             if depth == 0 {
@@ -389,19 +392,13 @@ impl Bound<'_> {
             1,
             HIDDEN,
         )?;
-        let flag = view(
-            &c.batch.as_ref().context("M2b not bound")?.status,
-            s,
-            0,
-            [10],
-            [1],
-        )?;
-        c.runtime.run_device(
+        let flag = view(&batch.status, s, 0, [10], [1])?;
+        runtime.run_device(
             Execution {
                 device: &e.device,
                 ops: &e.ops,
                 blas: &e.blas,
-                catalog: &c.catalog,
+                catalog,
                 embedding: e.weights.embedding(),
                 head: &e.weights.head,
             },
@@ -412,17 +409,16 @@ impl Bound<'_> {
             OutputMode::Queued,
         )?;
         let output = match c.options.recurrent_tap {
-            MtpRecurrentTap::PreMtpNorm => &c.runtime.work.x,
-            MtpRecurrentTap::PostMtpNorm => &c.runtime.work.n,
+            MtpRecurrentTap::PreMtpNorm => &runtime.work.x,
+            MtpRecurrentTap::PostMtpNorm => &runtime.work.n,
         };
-        let batch = c.batch.as_mut().context("M2b not bound")?;
         let flag = view(&batch.status, s, 0, [10], [1])?;
         e.ops
-            .finite(s, matrix(&c.runtime.logits, s, 0, 1, VOCAB)?, flag)?;
+            .finite(s, matrix(&runtime.logits, s, 0, 1, VOCAB)?, flag)?;
         e.ops
-            .finite(s, matrix(&c.runtime.hidden, s, 0, 1, HIDDEN)?, flag)?;
+            .finite(s, matrix(&runtime.hidden, s, 0, 1, HIDDEN)?, flag)?;
         e.ops
-            .finite(s, matrix(&c.runtime.work.n, s, 0, 1, HIDDEN)?, flag)?;
+            .finite(s, matrix(&runtime.work.n, s, 0, 1, HIDDEN)?, flag)?;
         if c.options.recurrent_tap == MtpRecurrentTap::PreMtpNorm {
             e.ops.finite(s, matrix(output, s, 0, 1, HIDDEN)?, flag)?;
         }
@@ -433,10 +429,10 @@ impl Bound<'_> {
         }
         #[cfg(test)]
         if let Some(&token) = c.force_proposals.as_ref().and_then(|v| v.get(depth)) {
-            s.memcpy_htod(&[token], &mut c.runtime.prediction.slice_mut(..1))?;
+            s.memcpy_htod(&[token], &mut runtime.prediction.slice_mut(..1))?;
         }
         s.memcpy_dtod(
-            &c.runtime.prediction.slice(..1),
+            &runtime.prediction.slice(..1),
             &mut batch.status.slice_mut(depth..depth + 1),
         )?;
         c.cursor += 1;
@@ -457,19 +453,21 @@ impl Bound<'_> {
             "invalid M2b batch extent"
         );
         let s = e.device.stream.clone();
+        let runtime = c.runtime.as_mut().context("Qwen MtpRuntime missing")?;
+        let catalog = c.catalog.as_ref().context("Qwen catalog missing")?;
         let batch = c.batch.as_mut().context("M2b not bound")?;
         batch.invalidate_frame();
         ensure!(
-            c.runtime.positions.len() >= 3 * rows,
+            runtime.positions.len() >= 3 * rows,
             "M2b input-staging workspace too small"
         );
         let flag = view(&batch.status, &s, 0, [10], [1])?;
         let flag_ptr = flag.element_ptr(9)?;
         unsafe {
-            s.launch_builder(&c.runtime.stage_inputs)
+            s.launch_builder(&runtime.stage_inputs)
                 .arg(&e.work.ids)
                 .arg(&e.work.ids)
-                .arg(&mut c.runtime.positions)
+                .arg(&mut runtime.positions)
                 .arg(
                     e.state
                         .sequence
@@ -507,12 +505,12 @@ impl Bound<'_> {
         let flag = view(&batch.status, &s, 0, [10], [1])?;
         e.ops
             .finite(&s, matrix(&batch.frame, &s, 0, rows, HIDDEN)?, flag)?;
-        c.runtime.run_device(
+        runtime.run_device(
             Execution {
                 device: &e.device,
                 ops: &e.ops,
                 blas: &e.blas,
-                catalog: &c.catalog,
+                catalog,
                 embedding: e.weights.embedding(),
                 head: &e.weights.head,
             },
@@ -526,17 +524,11 @@ impl Bound<'_> {
             ExecutionPhase::Prefill,
             OutputMode::Repair,
         )?;
-        e.ops.finite(
-            &s,
-            matrix(&c.runtime.work.n, &s, 0, rows - 1, HIDDEN)?,
-            flag,
-        )?;
+        e.ops
+            .finite(&s, matrix(&runtime.work.n, &s, 0, rows - 1, HIDDEN)?, flag)?;
         if c.options.recurrent_tap == MtpRecurrentTap::PreMtpNorm {
-            e.ops.finite(
-                &s,
-                matrix(&c.runtime.work.x, &s, 0, rows - 1, HIDDEN)?,
-                flag,
-            )?;
+            e.ops
+                .finite(&s, matrix(&runtime.work.x, &s, 0, rows - 1, HIDDEN)?, flag)?;
         }
         let status = s.clone_dtoh(&batch.status)?;
         ensure!(
@@ -577,6 +569,8 @@ impl Bound<'_> {
         let e = &mut self.engine;
         let c = &mut self.chain;
         let s = &e.device.stream;
+        let runtime = c.runtime.as_mut().context("Qwen MtpRuntime missing")?;
+        let catalog = c.catalog.as_ref().context("Qwen catalog missing")?;
         let batch = c.batch.as_mut().context("M2b not bound")?;
         s.memset_zeros(&mut batch.status)?;
         s.memcpy_htod(inputs, &mut e.work.ids.slice_mut(..inputs.len()))?;
@@ -585,12 +579,12 @@ impl Bound<'_> {
             &mut batch.status.slice_mut(..inputs.len() - 1),
         )?;
         let flag = view(&batch.status, s, 0, [10], [1])?;
-        c.runtime.run_device(
+        runtime.run_device(
             Execution {
                 device: &e.device,
                 ops: &e.ops,
                 blas: &e.blas,
-                catalog: &c.catalog,
+                catalog,
                 embedding: e.weights.embedding(),
                 head: &e.weights.head,
             },
@@ -605,15 +599,15 @@ impl Bound<'_> {
             OutputMode::Repair,
         )?;
         let source = if c.options.recurrent_tap == MtpRecurrentTap::PreMtpNorm {
-            &c.runtime.work.x
+            &runtime.work.x
         } else {
-            &c.runtime.work.n
+            &runtime.work.n
         };
         s.memcpy_dtod(&source.slice(..HIDDEN), &mut batch.anchor)?;
         batch.anchor_token = inputs[0];
         let flag = view(&batch.status, s, 0, [10], [1])?;
         e.ops
-            .finite(s, matrix(&c.runtime.work.n, s, 0, 1, HIDDEN)?, flag)?;
+            .finite(s, matrix(&runtime.work.n, s, 0, 1, HIDDEN)?, flag)?;
         e.ops.finite(s, matrix(source, s, 0, 1, HIDDEN)?, flag)?;
         Ok(self.verify_device(inputs.len())?.1)
     }
@@ -740,9 +734,14 @@ impl BatchedBackend for Bound<'_> {
         );
         let s = &self.engine.device.stream;
         if inputs.len() > 1 {
+            let runtime = self
+                .chain
+                .runtime
+                .as_ref()
+                .context("Qwen MtpRuntime missing")?;
             let source = match self.chain.options.recurrent_tap {
-                MtpRecurrentTap::PreMtpNorm => &self.chain.runtime.work.x,
-                MtpRecurrentTap::PostMtpNorm => &self.chain.runtime.work.n,
+                MtpRecurrentTap::PreMtpNorm => &runtime.work.x,
+                MtpRecurrentTap::PostMtpNorm => &runtime.work.n,
             };
             let row = inputs.len() - 2;
             s.memcpy_dtod(

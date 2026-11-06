@@ -1400,7 +1400,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn linear_bf16(
         &self,
         weight: super::contracts::Tensor<bf16, 2>,
@@ -1456,7 +1455,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn linear_bf16_to_f32(
         &self,
         weight: super::contracts::Tensor<bf16, 2>,
