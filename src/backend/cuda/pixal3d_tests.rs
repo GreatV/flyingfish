@@ -410,7 +410,7 @@ fn normalized_features<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
     let x = d.stream.clone_htod(&input)?;
     drop(input);
     let output = d.stream.alloc_zeros::<T>(n * c)?;
-    plan.run(
+    plan.run::<T>(
         matrix(ptr(&x, d), n, c)?,
         [
             view(affine[0], &d.stream, 0, [c as u32], [1])?,

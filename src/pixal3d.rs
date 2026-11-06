@@ -655,14 +655,13 @@ impl DecoderKind {
     pub(crate) fn validate_tensors(
         self,
         tensors: &BTreeMap<String, PublishedTensor<'_>>,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         let inventory = self.inventory();
         ensure!(
             tensors.keys().eq(inventory.keys()),
             "decoder checkpoint missing/unexpected keys"
         );
-        let mut bytes = 0usize;
-        for (name, (shape, dtype, float_runtime)) in inventory {
+        for (name, (shape, dtype, _)) in inventory {
             let tensor = &tensors[&name];
             ensure!(
                 tensor.shape == shape && tensor.dtype == format!("{dtype:?}"),
@@ -679,25 +678,8 @@ impl DecoderKind {
                     );
                 }
             }
-            let count = shape.iter().try_fold(1usize, |n, &d| {
-                n.checked_mul(d).context("decoder shape overflow")
-            })?;
-            let element_bytes = if dtype == Dtype::I64 {
-                8
-            } else if float_runtime {
-                4
-            } else {
-                2
-            };
-            bytes = bytes
-                .checked_add(
-                    count
-                        .checked_mul(element_bytes)
-                        .context("decoder bytes overflow")?,
-                )
-                .context("decoder bytes overflow")?;
         }
-        Ok(bytes)
+        Ok(())
     }
 }
 impl DecoderCheckpoint {
@@ -711,7 +693,24 @@ impl DecoderCheckpoint {
             serde_json::from_slice(&std::fs::read(dir.join(format!("{config_name}.json")))?)?;
         kind.validate(&config)?;
         let mapped = MappedCheckpoint::open_component(dir, kind.stem())?;
-        let runtime_bytes = kind.validate_tensors(&mapped.component_tensors()?)?;
+        kind.validate_tensors(&mapped.component_tensors()?)?;
+        let mut runtime_bytes = 0usize;
+        for (name, (_, dtype, float_runtime)) in kind.inventory() {
+            let tensor = mapped.tensor(&name)?;
+            let count = tensor.shape().iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d).context("decoder shape overflow")
+            })?;
+            let width = if dtype == Dtype::I64 {
+                8
+            } else if float_runtime {
+                4
+            } else {
+                2
+            };
+            runtime_bytes = runtime_bytes
+                .checked_add(count.checked_mul(width).context("decoder bytes overflow")?)
+                .context("decoder bytes overflow")?;
+        }
         Ok(Self {
             kind,
             mapped,
