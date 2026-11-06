@@ -112,10 +112,7 @@ pub(crate) fn run_rms_norm(
             .arg(&rows)
             .arg(&dim)
             .arg(&eps)
-            .launch(crate::backend::cuda::ops::grid(
-                rows as usize,
-                256,
-            ))?;
+            .launch(crate::backend::cuda::ops::grid(rows as usize, 256))?;
     }
     Ok(())
 }
@@ -909,8 +906,7 @@ impl GlmMtpRuntime {
             1e-5,
         )?;
         let (q_a_norm_ptr, _) = self.q_a_norm_buf.device_ptr(&stream);
-        let q_a_norm_tensor =
-            unsafe { Tensor::new(q_a_norm_ptr, [1, 1536], [1536, 1], 1536 * 2)? };
+        let q_a_norm_tensor = unsafe { Tensor::new(q_a_norm_ptr, [1, 1536], [1536, 1], 1536 * 2)? };
         let (q_b_ptr, _) = self.q_b_buf.device_ptr(&stream);
         let mut q_b_tensor =
             unsafe { TensorMut(Tensor::new(q_b_ptr, [1, 16384], [16384, 1], 16384 * 2)?) };
@@ -1092,8 +1088,7 @@ impl GlmMtpRuntime {
                 1e-5,
             )?;
             let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
-            let x_norm_tensor =
-                unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
+            let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
             let (kv_a_ptr, _) = self.kv_a_buf.device_ptr(&stream);
             let mut kv_a_tensor =
                 unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };

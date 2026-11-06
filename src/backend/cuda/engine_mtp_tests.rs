@@ -394,7 +394,11 @@ fn q38_mtp_single_step_gpu() -> Result<()> {
     let epsilon = near_tie_epsilon(&probe.root, 1)?;
     let mut tested = 0;
     for case in ["math1", "code1", "gen1", "gen2", "math2"] {
-        if !probe.root.join(format!("fixtures-bf16/mtp-tf-{case}.safetensors")).exists() {
+        if !probe
+            .root
+            .join(format!("fixtures-bf16/mtp-tf-{case}.safetensors"))
+            .exists()
+        {
             continue;
         }
         tested += 1;
@@ -444,7 +448,11 @@ fn q38_mtp_cached_rows_gpu() -> Result<()> {
     let epsilon = near_tie_epsilon(&probe.root, 1)?;
     let mut tested = 0;
     for case in ["math1", "code1", "gen1", "gen2", "math2"] {
-        if !probe.root.join(format!("fixtures-bf16/mtp-tf-{case}.safetensors")).exists() {
+        if !probe
+            .root
+            .join(format!("fixtures-bf16/mtp-tf-{case}.safetensors"))
+            .exists()
+        {
             continue;
         }
         tested += 1;

@@ -1762,6 +1762,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "DEFECT synthetic eager vs graph bit difference: {synth_graph_diffs}"
     );
 
+    let mut defects = Vec::new();
     let (synth_cand_ids, synth_cand_weights) = runtime
         .last_route()
         .context("synthetic router tap missing")?
@@ -1791,29 +1792,44 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .map(|v| v.as_f64().unwrap() as f32)
         .unwrap_or(0.005793);
     if synth_min_margin > synth_spread {
-        ensure!(
-            synth_cand_ids == synth_expected_ids,
-            "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {synth_expected_ids:?}"
-        );
+        if synth_cand_ids != synth_expected_ids {
+            defects.push(format!(
+                "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {synth_expected_ids:?}"
+            ));
+        }
+    }
+    let mut synth_exp_map = std::collections::BTreeMap::new();
+    for (&id, &w) in synth_expected_ids.iter().zip(&synth_expected_weights) {
+        synth_exp_map.insert(id, w);
     }
     let mut synth_w_max_abs = 0.0f32;
     let mut synth_w_sum_sq = 0.0f32;
-    for (&cw, &rw) in synth_cand_weights.iter().zip(&synth_expected_weights) {
-        let diff = (cw - rw).abs();
-        if diff > synth_w_max_abs {
-            synth_w_max_abs = diff;
+    let mut synth_w_count = 0;
+    for (&id, &cw) in synth_cand_ids.iter().zip(&synth_cand_weights) {
+        if let Some(&rw) = synth_exp_map.get(&id) {
+            let diff = (cw - rw).abs();
+            if diff > synth_w_max_abs {
+                synth_w_max_abs = diff;
+            }
+            synth_w_sum_sq += diff * diff;
+            synth_w_count += 1;
         }
-        synth_w_sum_sq += diff * diff;
     }
-    let synth_w_rmse = (synth_w_sum_sq / synth_cand_weights.len() as f32).sqrt();
-    ensure!(
-        synth_w_max_abs <= tau_weights_max_abs,
-        "DEFECT synthetic router weights max_abs={synth_w_max_abs} exceeds tau={tau_weights_max_abs}"
-    );
-    ensure!(
-        synth_w_rmse <= tau_weights_rmse,
-        "DEFECT synthetic router weights rmse={synth_w_rmse} exceeds tau={tau_weights_rmse}"
-    );
+    let synth_w_rmse = if synth_w_count > 0 {
+        (synth_w_sum_sq / synth_w_count as f32).sqrt()
+    } else {
+        0.0
+    };
+    if synth_w_max_abs > tau_weights_max_abs {
+        defects.push(format!(
+            "DEFECT synthetic router weights max_abs={synth_w_max_abs} exceeds tau={tau_weights_max_abs}"
+        ));
+    }
+    if synth_w_rmse > tau_weights_rmse {
+        defects.push(format!(
+            "DEFECT synthetic router weights rmse={synth_w_rmse} exceeds tau={tau_weights_rmse}"
+        ));
+    }
 
     let mut synth_max_abs = 0.0f32;
     let mut synth_sum_sq = 0.0f32;
@@ -1825,14 +1841,16 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         synth_sum_sq += diff * diff;
     }
     let synth_rmse = (synth_sum_sq / synth_eager.len() as f32).sqrt();
-    ensure!(
-        synth_max_abs <= tau_max_abs,
-        "DEFECT synthetic max_abs={synth_max_abs} exceeds tau={tau_max_abs}"
-    );
-    ensure!(
-        synth_rmse <= tau_rmse,
-        "DEFECT synthetic rmse={synth_rmse} exceeds tau={tau_rmse}"
-    );
+    if synth_max_abs > tau_max_abs {
+        defects.push(format!(
+            "DEFECT synthetic max_abs={synth_max_abs} exceeds tau={tau_max_abs}"
+        ));
+    }
+    if synth_rmse > tau_rmse {
+        defects.push(format!(
+            "DEFECT synthetic rmse={synth_rmse} exceeds tau={tau_rmse}"
+        ));
+    }
 
     let synth_swapped = runtime.forward(&synth_tokens, &synth_hidden, true, &blas)?;
     let mut synth_swap_delta = 0.0f32;
@@ -1880,10 +1898,11 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .zip(&prod_graph)
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
-    ensure!(
-        prod_graph_diffs == 0,
-        "DEFECT production eager vs graph bit difference: {prod_graph_diffs}"
-    );
+    if prod_graph_diffs != 0 {
+        defects.push(format!(
+            "DEFECT production eager vs graph bit difference: {prod_graph_diffs}"
+        ));
+    }
 
     let (prod_cand_ids, prod_cand_weights) = runtime
         .last_route()
@@ -1926,10 +1945,11 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     if prod_min_margin > prod_spread {
         let prod_cand_set: std::collections::BTreeSet<i32> =
             prod_cand_ids.iter().copied().collect();
-        ensure!(
-            prod_cand_set == prod_expected_set,
-            "DEFECT production router expert set mismatch: got {prod_cand_set:?}, expected {prod_expected_set:?}"
-        );
+        if prod_cand_set != prod_expected_set {
+            defects.push(format!(
+                "DEFECT production router expert set mismatch: got {prod_cand_set:?}, expected {prod_expected_set:?}"
+            ));
+        }
     }
     let mut prod_exp_map = std::collections::BTreeMap::new();
     for (&id, &w) in prod_expected_ids.iter().zip(&prod_expected_weights) {
@@ -1947,14 +1967,16 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         }
     }
     let prod_w_rmse = (prod_w_sum_sq / prod_cand_weights.len() as f32).sqrt();
-    ensure!(
-        prod_w_max_abs <= tau_weights_max_abs,
-        "DEFECT production router weights max_abs={prod_w_max_abs} exceeds tau={tau_weights_max_abs}"
-    );
-    ensure!(
-        prod_w_rmse <= tau_weights_rmse,
-        "DEFECT production router weights rmse={prod_w_rmse} exceeds tau={tau_weights_rmse}"
-    );
+    if prod_w_max_abs > tau_weights_max_abs {
+        defects.push(format!(
+            "DEFECT production router weights max_abs={prod_w_max_abs} exceeds tau={tau_weights_max_abs}"
+        ));
+    }
+    if prod_w_rmse > tau_weights_rmse {
+        defects.push(format!(
+            "DEFECT production router weights rmse={prod_w_rmse} exceeds tau={tau_weights_rmse}"
+        ));
+    }
 
     let mut prod_max_abs = 0.0f32;
     let mut prod_sum_sq = 0.0f32;
@@ -1966,14 +1988,16 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         prod_sum_sq += diff * diff;
     }
     let prod_rmse = (prod_sum_sq / prod_eager.len() as f32).sqrt();
-    ensure!(
-        prod_max_abs <= tau_max_abs,
-        "DEFECT production max_abs={prod_max_abs} exceeds tau={tau_max_abs}"
-    );
-    ensure!(
-        prod_rmse <= tau_rmse,
-        "DEFECT production rmse={prod_rmse} exceeds tau={tau_rmse}"
-    );
+    if prod_max_abs > tau_max_abs {
+        defects.push(format!(
+            "DEFECT production max_abs={prod_max_abs} exceeds tau={tau_max_abs}"
+        ));
+    }
+    if prod_rmse > tau_rmse {
+        defects.push(format!(
+            "DEFECT production rmse={prod_rmse} exceeds tau={tau_rmse}"
+        ));
+    }
 
     let prod_swapped = runtime.forward(&prod_tokens, &prod_hidden, true, &blas)?;
     let mut prod_swap_delta = 0.0f32;
@@ -1997,8 +2021,18 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "Runner FAIL production swap discriminating control: rmse={prod_swap_rmse} < 10*tau"
     );
 
+    let status = if defects.is_empty() { "PASS" } else { "DEFECT" };
     println!(
-        "PASS GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.6}/{prod_swap_delta:.6} swap_rmse={synth_swap_rmse:.6}/{prod_swap_rmse:.6} graph_bit_differences=0"
+        "{status} GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.6}/{prod_swap_delta:.6} swap_rmse={synth_swap_rmse:.6}/{prod_swap_rmse:.6} graph_bit_differences=0 defects={}",
+        defects.len()
+    );
+    for d in &defects {
+        println!("{d}");
+    }
+    ensure!(
+        defects.is_empty(),
+        "GLM_MTP_NUMERICS defects: {}",
+        defects.join("; ")
     );
     Ok(())
 }
