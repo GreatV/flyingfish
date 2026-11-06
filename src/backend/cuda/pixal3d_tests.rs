@@ -794,8 +794,7 @@ fn serialized_attention_modes(gate: &mut OperationGate, common: &Path, maps: &Pa
                 cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )?;
             run()?;
-            let graph = d
-                .stream
+            let graph = stream
                 .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
                 .context("serialized attention graph missing")?;
             let eager = stream.clone_dtoh(&output)?;
