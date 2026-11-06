@@ -505,6 +505,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    struct ClosedCubeMesh {
+        components: Vec<[i8; 12]>,
+        quads: Vec<[usize; 4]>,
+        faces: Vec<[usize; 3]>,
+    }
+
     fn component_sets(row: &[i8; 14]) -> Vec<Vec<[usize; 2]>> {
         let mut groups = vec![Vec::new(); row[12] as usize];
         for (edge, &group) in row[..12].iter().enumerate() {
@@ -524,11 +530,7 @@ mod tests {
         std::array::from_fn(|i| face[(first + i) % N])
     }
 
-    fn closed_case(
-        table: &[[i8; 14]; 256],
-        mask: usize,
-        flip: bool,
-    ) -> Result<(Vec<[i8; 12]>, Vec<[usize; 4]>, Vec<[usize; 3]>)> {
+    fn closed_case(table: &[[i8; 14]; 256], mask: usize, flip: bool) -> Result<ClosedCubeMesh> {
         let coordinates: Vec<_> = (0..4)
             .flat_map(|x| (0..4).flat_map(move |y| (0..4).map(move |z| [0, x, y, z])))
             .collect();
@@ -568,7 +570,7 @@ mod tests {
             }
             resolved.push(if split { masks[row] ^ 255 } else { masks[row] });
         }
-        let mut owners: BTreeMap<([i32; 4], usize), Vec<(usize, usize)>> = BTreeMap::new();
+        let mut owners: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut labels = Vec::new();
         for (row, p) in sites.coordinates().iter().enumerate() {
             let components = table[resolved[row]];
@@ -618,7 +620,11 @@ mod tests {
                 [[a, b, c], [a, c, d]]
             });
         }
-        Ok((labels, quads, faces))
+        Ok(ClosedCubeMesh {
+            components: labels,
+            quads,
+            faces,
+        })
     }
 
     fn closed_winding(faces: &[[usize; 3]]) -> bool {
@@ -692,13 +698,14 @@ mod tests {
         assert_eq!(rotations, 24);
         let mut agree = 0;
         for mask in 0..256 {
-            let (a, qa, fa) = closed_case(&table, mask, false)?;
-            let (b, qb, fb) = closed_case(&table, mask, true)?;
-            assert!(closed_winding(&fa) && closed_winding(&fb));
-            if a == b {
+            let first = closed_case(&table, mask, false)?;
+            let second = closed_case(&table, mask, true)?;
+            assert!(closed_winding(&first.faces) && closed_winding(&second.faces));
+            if first.components == second.components {
                 agree += 1;
-                let mut forward: Vec<_> = qa.into_iter().map(oriented).collect();
-                let mut reverse: Vec<_> = qb
+                let mut forward: Vec<_> = first.quads.into_iter().map(oriented).collect();
+                let mut reverse: Vec<_> = second
+                    .quads
                     .into_iter()
                     .map(|mut q| {
                         q.reverse();
@@ -710,7 +717,7 @@ mod tests {
                 assert_eq!(forward, reverse);
             }
             if mask == 1 {
-                let mut control = fa;
+                let mut control = first.faces;
                 control[0].reverse();
                 assert!(!closed_winding(&control));
             }
