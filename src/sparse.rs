@@ -50,8 +50,8 @@ fn cube_components(mask: u8) -> Result<[i8; 12]> {
                 .filter(|&e| crossing & (1 << e) != 0)
                 .collect();
             let mut join = |a, b| {
-                adjacency[a] |= 1 << b;
-                adjacency[b] |= 1 << a;
+                adjacency[a] |= 1u16 << b;
+                adjacency[b] |= 1u16 << a;
             };
             if selected.len() == 2 {
                 join(selected[0], selected[1]);
@@ -135,6 +135,15 @@ pub struct SparseSites {
     sorted: Vec<([i32; 4], i32)>,
 }
 
+pub struct SparseCorners {
+    pub sites: SparseSites,
+    /// Row-major [cubes,8], with x-bit0 corners.
+    pub cube_to_corner: Vec<u32>,
+    pub contributor_offsets: Vec<u64>,
+    /// Flattened cube/corner IDs, grouped by unique corner.
+    pub contributors: Vec<u32>,
+}
+
 pub struct SerializedWindows {
     pub(crate) keys: [Vec<u64>; 2],
     pub(crate) order: [Vec<u32>; 2],
@@ -144,6 +153,54 @@ pub struct SerializedWindows {
     pub(crate) offsets: Vec<u32>,
 }
 impl SparseSites {
+    pub fn cube_corners(&self) -> Result<SparseCorners> {
+        let count = self
+            .coordinates
+            .len()
+            .checked_mul(8)
+            .filter(|&v| v <= i32::MAX as usize)
+            .context("expanded cube corner count exceeds indexing capacity")?;
+        ensure!(
+            self.coordinates
+                .iter()
+                .all(|p| p[1..].iter().all(|&v| v < i32::MAX)),
+            "cube corner coordinate overflow"
+        );
+        let mut expanded = Vec::with_capacity(count);
+        for p in &self.coordinates {
+            for corner in 0..8 {
+                expanded.push([
+                    p[0],
+                    p[1] + (corner & 1),
+                    p[2] + ((corner >> 1) & 1),
+                    p[3] + ((corner >> 2) & 1),
+                ]);
+            }
+        }
+        let (sites, cube_to_corner) = Self::deduplicate(expanded)?;
+        let unique = sites.coordinates.len();
+        let mut offsets = vec![0u64; unique + 1];
+        for &corner in &cube_to_corner {
+            offsets[corner as usize + 1] += 1;
+        }
+        for i in 1..offsets.len() {
+            offsets[i] += offsets[i - 1];
+        }
+        let mut cursor = offsets[..unique].to_vec();
+        let mut contributors = vec![0u32; count];
+        for (source, &corner) in cube_to_corner.iter().enumerate() {
+            let at = &mut cursor[corner as usize];
+            contributors[*at as usize] = source as u32;
+            *at += 1;
+        }
+        Ok(SparseCorners {
+            sites,
+            cube_to_corner,
+            contributor_offsets: offsets,
+            contributors,
+        })
+    }
+
     /// Lexicographic unique coordinates and input-row to unique-row indices.
     pub fn deduplicate(coordinates: Vec<[i32; 4]>) -> Result<(Self, Vec<u32>)> {
         ensure!(
@@ -686,6 +743,46 @@ mod tests {
             &[[0, 1, 2, 3], [0, 4, 5, 6], [1, 0, 2, 3]]
         );
         assert_eq!(inverse, [2, 1, 1, 0]);
+        let coordinates: Vec<_> = (0..3)
+            .flat_map(|x| (0..2).flat_map(move |y| (0..2).map(move |z| [0, x, y, z])))
+            .collect();
+        let cubes = SparseSites::new((0..12).map(|i| coordinates[i * 7 % 12]).collect())?;
+        let corners = cubes.cube_corners()?;
+        assert_eq!(corners.sites.coordinates().len(), 36);
+        assert_eq!(corners.cube_to_corner.len(), 96);
+        assert_eq!(corners.contributors.len(), 96);
+        assert_eq!(corners.contributor_offsets.last(), Some(&96));
+        let mut degrees = std::collections::BTreeSet::new();
+        let mut control_mismatches = 0;
+        for (unique, pair) in corners.contributor_offsets.windows(2).enumerate() {
+            degrees.insert(pair[1] - pair[0]);
+            for &source in &corners.contributors[pair[0] as usize..pair[1] as usize] {
+                assert_eq!(corners.cube_to_corner[source as usize] as usize, unique);
+                let p = cubes.coordinates()[source as usize / 8];
+                let c = source % 8;
+                assert_eq!(
+                    corners.sites.coordinates()[unique],
+                    [
+                        p[0],
+                        p[1] + (c & 1) as i32,
+                        p[2] + ((c >> 1) & 1) as i32,
+                        p[3] + ((c >> 2) & 1) as i32
+                    ]
+                );
+                let swapped = ((c & 1) << 2) | (c & 2) | ((c & 4) >> 2);
+                control_mismatches += usize::from(
+                    corners.cube_to_corner[source as usize]
+                        != corners.cube_to_corner[source as usize / 8 * 8 + swapped as usize],
+                );
+            }
+        }
+        assert_eq!(degrees, [1, 2, 4, 8].into_iter().collect());
+        assert_eq!(control_mismatches, 48);
+        assert!(
+            SparseSites::new(vec![[0, i32::MAX, 0, 0]])?
+                .cube_corners()
+                .is_err()
+        );
         let masks = [
             [false, true, false, false, false, false, false, false],
             [false; 8],
