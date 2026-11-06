@@ -183,7 +183,25 @@ impl OperationGate {
     fn measure(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
         let cell = self.cells.get(name).context("cell outside frozen scope")?;
         let anchor = if let Some(path) = &self.decoder_anchor {
-            tensor(path, name)?
+            if let Some(source) = cell["source_cell"].as_str() {
+                let source = tensor(path, source)?;
+                let width = source.shape[1];
+                let rows = cell["selector"]["rows"]
+                    .as_array()
+                    .context("selector rows missing")?;
+                let mut values = Vec::with_capacity(rows.len() * width);
+                for row in rows {
+                    let row = usize::try_from(row.as_u64().context("invalid selector row")?)?;
+                    ensure!(row < source.shape[0], "selector exceeds anchor rows");
+                    values.extend_from_slice(&source.values[row * width..(row + 1) * width]);
+                }
+                HostTensor {
+                    shape: vec![rows.len(), width],
+                    values,
+                }
+            } else {
+                tensor(path, name)?
+            }
         } else {
             tensor(
                 &self.root.join(&self.kind).join("anchor.safetensors"),
