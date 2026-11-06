@@ -425,6 +425,66 @@ fn composition_controls_reject_label_shift_and_skipped_layer() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn glm_mtp_router_bias_precision_discriminating_cpu() -> Result<()> {
+    let count = 288;
+    let bias_f32: Vec<f32> = (0..count)
+        .map(|i| ((i * 37 + 11) % 131) as f32 / 16.0 - 4.0)
+        .collect();
+    let raw_bytes: Vec<u8> = bias_f32.iter().flat_map(|&f| f.to_le_bytes()).collect();
+
+    let bias_bf16_mutant: Vec<f32> = (0..count)
+        .map(|i| {
+            let u = u16::from_le_bytes([raw_bytes[2 * i], raw_bytes[2 * i + 1]]);
+            bf16::from_bits(u).to_f32()
+        })
+        .collect();
+
+    let router_logits: Vec<f32> = (0..count)
+        .map(|i| ((i * 19 + 7) % 73) as f32 / 10.0 - 3.6)
+        .collect();
+
+    let route = |biases: &[f32]| -> Vec<(usize, f32)> {
+        let mut scores: Vec<(usize, f32)> = router_logits
+            .iter()
+            .zip(biases.iter())
+            .enumerate()
+            .map(|(i, (&l, &b))| {
+                let logit = l + b;
+                let s = 1.0f32 / (1.0f32 + (-logit).exp());
+                (i, s)
+            })
+            .collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(8);
+        let sum: f32 = scores.iter().map(|(_, s)| s).sum();
+        scores
+            .into_iter()
+            .map(|(i, s)| (i, (s / sum) * 2.5))
+            .collect()
+    };
+
+    let top8_f32 = route(&bias_f32);
+    let top8_mutant = route(&bias_bf16_mutant);
+
+    let matching_experts = top8_f32
+        .iter()
+        .filter(|(idx, _)| top8_mutant.iter().any(|(m_idx, _)| m_idx == idx))
+        .count();
+    ensure!(
+        matching_experts <= 2,
+        "DEFECT router precision mutant failed to discriminate: matching={matching_experts}"
+    );
+
+    ensure!(
+        raw_bytes.len() == 288 * 4,
+        "DEFECT expected 1152 bytes for 288 F32 bias values, got {}",
+        raw_bytes.len()
+    );
+
+    Ok(())
+}
+
 fn check_reset_meta(meta: &[i32], capacity: u32) -> Result<()> {
     // Metadata describes the scheduled first token, with no completed prefix.
     ensure!(
