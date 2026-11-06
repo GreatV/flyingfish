@@ -80,6 +80,7 @@ struct Ops {
     batch_norm: CudaFunction,
     residual: CudaFunction,
     relative_attention: CudaFunction,
+    lstm: CudaFunction,
     activation: CudaFunction,
     bias: CudaFunction,
     layer_norm: CudaFunction,
@@ -95,6 +96,28 @@ pub struct ParakeetEncoder {
     ops: Ops,
     #[cfg(test)]
     encode_calls: AtomicU64,
+}
+
+struct LstmLayer {
+    input: Linear,
+    recurrent: Linear,
+    bias_ih: CudaSlice<f32>,
+    bias_hh: CudaSlice<f32>,
+    hidden: CudaSlice<f32>,
+    cell: CudaSlice<f32>,
+}
+
+pub struct ParakeetTdt {
+    encoder: ParakeetEncoder,
+    embedding: CudaSlice<f32>,
+    lstm: [LstmLayer; 2],
+    decoder_projector: Linear,
+    encoder_projector: Linear,
+    joint: Linear,
+    cache: CudaSlice<f32>,
+    initialized: bool,
+    #[cfg(test)]
+    lstm_calls: std::cell::Cell<usize>,
 }
 
 struct SubsampleOutput {
@@ -231,6 +254,7 @@ impl ParakeetEncoder {
             batch_norm: speech.load_function("speech_batch_norm_f32")?,
             residual: speech.load_function("speech_residual_f32")?,
             relative_attention: speech.load_function("speech_relative_attention_f32")?,
+            lstm: speech.load_function("lstm_step_f32")?,
             activation: vision.load_function("activation_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             layer_norm: common.load_function("q38_layer_norm_f32")?,
@@ -770,6 +794,200 @@ impl ParakeetEncoder {
     #[cfg(test)]
     pub(crate) fn reset_encode_calls(&self) {
         self.encode_calls.store(0, Ordering::Relaxed);
+    }
+}
+
+impl ParakeetTdt {
+    pub fn load(directory: &Path, device: &Device) -> Result<Self> {
+        let encoder = ParakeetEncoder::load(directory, device)?;
+        let checkpoint = MappedCheckpoint::open(directory)?;
+        let stream = Arc::clone(&encoder.stream);
+        let embedding = tensor(
+            &checkpoint,
+            &stream,
+            "decoder.embedding.weight",
+            &[8193, 640],
+        )?;
+        let mut layers = Vec::new();
+        for index in 0..2 {
+            layers.push(LstmLayer {
+                input: Linear {
+                    weight: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("decoder.lstm.weight_ih_l{index}"),
+                        &[2560, 640],
+                    )?,
+                    bias: None,
+                    output: 2560,
+                    input: 640,
+                },
+                recurrent: Linear {
+                    weight: tensor(
+                        &checkpoint,
+                        &stream,
+                        &format!("decoder.lstm.weight_hh_l{index}"),
+                        &[2560, 640],
+                    )?,
+                    bias: None,
+                    output: 2560,
+                    input: 640,
+                },
+                bias_ih: tensor(
+                    &checkpoint,
+                    &stream,
+                    &format!("decoder.lstm.bias_ih_l{index}"),
+                    &[2560],
+                )?,
+                bias_hh: tensor(
+                    &checkpoint,
+                    &stream,
+                    &format!("decoder.lstm.bias_hh_l{index}"),
+                    &[2560],
+                )?,
+                hidden: stream.alloc_zeros(640)?,
+                cell: stream.alloc_zeros(640)?,
+            });
+        }
+        let decoder_projector = linear(
+            &checkpoint,
+            &stream,
+            "decoder.decoder_projector",
+            640,
+            640,
+            true,
+        )?;
+        let encoder_projector = linear(&checkpoint, &stream, "encoder_projector", 640, 1024, true)?;
+        let joint = linear(&checkpoint, &stream, "joint.head", 8198, 640, true)?;
+        stream.synchronize()?;
+        Ok(Self {
+            encoder,
+            embedding,
+            lstm: layers
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("prediction LSTM layer count"))?,
+            decoder_projector,
+            encoder_projector,
+            joint,
+            cache: stream.alloc_zeros(640)?,
+            initialized: false,
+            #[cfg(test)]
+            lstm_calls: std::cell::Cell::new(0),
+        })
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        for layer in &mut self.lstm {
+            self.encoder.stream.memset_zeros(&mut layer.hidden)?;
+            self.encoder.stream.memset_zeros(&mut layer.cell)?;
+        }
+        self.encoder.stream.memset_zeros(&mut self.cache)?;
+        self.initialized = false;
+        #[cfg(test)]
+        self.lstm_calls.set(0);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn set_prediction_state(&mut self, hidden: &[f32], cell: &[f32]) -> Result<()> {
+        ensure!(
+            hidden.len() == 1280 && cell.len() == 1280,
+            "prediction state must contain two 640-wide layers"
+        );
+        for (index, layer) in self.lstm.iter_mut().enumerate() {
+            layer.hidden = self
+                .encoder
+                .stream
+                .clone_htod(&hidden[index * 640..(index + 1) * 640])?;
+            layer.cell = self
+                .encoder
+                .stream
+                .clone_htod(&cell[index * 640..(index + 1) * 640])?;
+        }
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub fn predict(&mut self, token: u32) -> Result<Vec<f32>> {
+        ensure!(
+            token < self.encoder.spec.vocab,
+            "prediction token outside vocabulary"
+        );
+        if self.initialized && token == self.encoder.spec.blank {
+            return Ok(self.encoder.stream.clone_dtoh(&self.cache)?);
+        }
+        let start = token as usize * 640;
+        let mut input = self.encoder.stream.alloc_zeros::<f32>(640)?;
+        self.encoder
+            .stream
+            .memcpy_dtod(&self.embedding.slice(start..start + 640), &mut input)?;
+        for layer in &mut self.lstm {
+            let input_gates = self.encoder.linear(&input, 1, &layer.input)?;
+            let recurrent_gates = self.encoder.linear(&layer.hidden, 1, &layer.recurrent)?;
+            unsafe {
+                self.encoder
+                    .stream
+                    .launch_builder(&self.encoder.ops.lstm)
+                    .arg(&input_gates)
+                    .arg(&recurrent_gates)
+                    .arg(&layer.bias_ih)
+                    .arg(&layer.bias_hh)
+                    .arg(&layer.cell)
+                    .arg(&layer.hidden)
+                    .arg(&640u32)
+                    .launch(flat(640))?;
+            }
+            #[cfg(test)]
+            self.lstm_calls.set(self.lstm_calls.get() + 1);
+            input = layer.hidden.try_clone()?;
+        }
+        self.cache = self.encoder.linear(&input, 1, &self.decoder_projector)?;
+        self.initialized = true;
+        Ok(self.encoder.stream.clone_dtoh(&self.cache)?)
+    }
+
+    pub fn prediction_state(&self) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let mut hidden = Vec::with_capacity(1280);
+        let mut cell = Vec::with_capacity(1280);
+        for layer in &self.lstm {
+            hidden.extend(self.encoder.stream.clone_dtoh(&layer.hidden)?);
+            cell.extend(self.encoder.stream.clone_dtoh(&layer.cell)?);
+        }
+        Ok((self.encoder.stream.clone_dtoh(&self.cache)?, hidden, cell))
+    }
+
+    pub fn project_encoder(&self, input: &[f32]) -> Result<Vec<f32>> {
+        ensure!(
+            !input.is_empty()
+                && input.len().is_multiple_of(1024)
+                && input.iter().all(|value| value.is_finite()),
+            "invalid encoder projection input"
+        );
+        let input = self.encoder.stream.clone_htod(input)?;
+        let output = self.encoder.linear(
+            &input,
+            u32::try_from(input.len() / 1024)?,
+            &self.encoder_projector,
+        )?;
+        Ok(self.encoder.stream.clone_dtoh(&output)?)
+    }
+
+    pub fn joint(&self, encoder_frame: &[f32]) -> Result<Vec<f32>> {
+        ensure!(
+            encoder_frame.len() == 640 && encoder_frame.iter().all(|value| value.is_finite()),
+            "joint encoder frame must be 640-wide and finite"
+        );
+        let frame = self.encoder.stream.clone_htod(encoder_frame)?;
+        let mut sum = self.cache.try_clone()?;
+        self.encoder.residual(&mut sum, &frame, 1.0)?;
+        let activated = self.encoder.activate(&sum, 1, 640, 0)?;
+        let logits = self.encoder.linear(&activated, 1, &self.joint)?;
+        Ok(self.encoder.stream.clone_dtoh(&logits)?)
+    }
+
+    #[cfg(test)]
+    pub fn lstm_call_count(&self) -> usize {
+        self.lstm_calls.get()
     }
 }
 
