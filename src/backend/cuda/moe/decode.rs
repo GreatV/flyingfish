@@ -1120,11 +1120,11 @@ mod native {
             Ok(())
         }
 
-        pub(crate) fn route(
+        pub(crate) fn enqueue_route(
             &self,
             stream: &Arc<CudaStream>,
             x: Tensor<bf16, 2>,
-        ) -> Result<(Vec<i32>, Vec<f32>)> {
+        ) -> Result<()> {
             let g = &self.geometry;
             let logits = self.views.logits;
             let ids = self.views.ids;
@@ -1142,12 +1142,19 @@ mod native {
                 &mut TensorMut(weights),
                 crate::model_spec::RouterScore::Sigmoid,
                 g.scaling,
-            )?;
+            )
+        }
 
+        pub(crate) fn read_route(&self, stream: &Arc<CudaStream>) -> Result<(Vec<i32>, Vec<f32>)> {
             Ok((
                 stream.clone_dtoh(&self._buffers._ids)?,
                 stream.clone_dtoh(&self._buffers._route_weights)?,
             ))
+        }
+
+        #[cfg(all(test, feature = "cuda"))]
+        pub(crate) fn read_contributions(&self, stream: &Arc<CudaStream>) -> Result<Vec<bf16>> {
+            Ok(stream.clone_dtoh(&self._buffers._contributions)?)
         }
 
         pub(crate) fn run(

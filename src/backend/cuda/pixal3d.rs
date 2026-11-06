@@ -1,4 +1,4 @@
-//! Shared flow execution on recorded conditioning and fixed coordinates.
+//! Shared flow execution on recorded conditioning and fixed coordinates, and Pixal3D dense/sparse decoder execution.
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
 mod tests;
@@ -2520,6 +2520,7 @@ impl Weights {
 struct DecoderKernels {
     ln16: CudaFunction,
     ln32: CudaFunction,
+    ln16_to32: CudaFunction,
     act16: CudaFunction,
     act32: CudaFunction,
     cast: CudaFunction,
@@ -2529,7 +2530,6 @@ struct DecoderKernels {
     bias32: CudaFunction,
     residual: CudaFunction,
     shuffle: CudaFunction,
-    #[cfg(test)]
     c2s: CudaFunction,
     conv16: CudaFunction,
     conv32: CudaFunction,
@@ -2541,6 +2541,7 @@ impl DecoderKernels {
         Ok(Self {
             ln16: q.load_function("q38_layer_norm_f16")?,
             ln32: q.load_function("q38_layer_norm_f32")?,
+            ln16_to32: q.load_function("q38_layer_norm_f16_to_f32")?,
             act16: v.load_function("activation_f16")?,
             act32: v.load_function("activation_f32")?,
             cast: v.load_function("vision_downcast_f32_to_f16")?,
@@ -2550,7 +2551,6 @@ impl DecoderKernels {
             bias32: v.load_function("vision_bias_f32")?,
             residual: q.load_function("channel_scale_residual_f16")?,
             shuffle: v.load_function("pixel_shuffle_3d_f16")?,
-            #[cfg(test)]
             c2s: v.load_function("channel_to_spatial_f16")?,
             conv16: v.load_function("conv3d_im2col_f16")?,
             conv32: v.load_function("conv3d_im2col_f32")?,
@@ -2562,13 +2562,19 @@ impl DecoderKernels {
         io: [u64; 2],
         shape: [usize; 2],
         affine: [u64; 2],
-        f32_io: bool,
+        f32_io: [bool; 2],
         eps: f32,
     ) -> Result<()> {
         let [rows, width] = shape;
+        let kernel = match f32_io {
+            [false, false] => &self.ln16,
+            [true, true] => &self.ln32,
+            [false, true] => &self.ln16_to32,
+            [true, false] => anyhow::bail!("unsupported decoder normalization dtype pair"),
+        };
         unsafe {
             d.stream
-                .launch_builder(if f32_io { &self.ln32 } else { &self.ln16 })
+                .launch_builder(kernel)
                 .arg(&io[0])
                 .arg(&affine[0])
                 .arg(&affine[1])
@@ -2682,13 +2688,11 @@ pub struct PixalDecoder {
     ones: CudaSlice<f16>,
     columns: Option<CudaSlice<u8>>,
 }
-#[cfg(test)]
-pub(crate) struct SparseDecoderOutput {
+pub struct SparseDecoderOutput {
     pub coordinates: Vec<[i32; 4]>,
     pub features: Vec<f32>,
     pub channels: usize,
 }
-#[cfg(test)]
 pub(crate) struct SubdivisionGuide<'a> {
     pub coordinates: &'a [[i32; 4]],
     pub logits: &'a [f32],
@@ -2739,7 +2743,6 @@ impl PixalDecoder {
             columns,
         })
     }
-    #[cfg(test)]
     fn linear16(
         &self,
         name: &str,
@@ -2768,7 +2771,6 @@ impl PixalDecoder {
             true,
         )
     }
-    #[cfg(test)]
     fn linear32(
         &self,
         name: &str,
@@ -2796,7 +2798,6 @@ impl PixalDecoder {
         self.k
             .bias(d, ptr(output, d), ptr(b, d), [rows, co], false, true)
     }
-    #[cfg(test)]
     fn sparse_conv(
         &self,
         conv: &SparseConv,
@@ -2838,11 +2839,10 @@ impl PixalDecoder {
             [ptr(input, &self.device), ptr(output, &self.device)],
             [rows, c],
             self.weights.affine(&self.device, name)?,
-            false,
+            [false, false],
             eps,
         )
     }
-    #[cfg(test)]
     fn next_blocks(
         &self,
         stage: usize,
@@ -2872,7 +2872,6 @@ impl PixalDecoder {
         }
         Ok(x)
     }
-    #[cfg(test)]
     fn c2s(
         &self,
         x: &CudaSlice<f16>,
@@ -2898,40 +2897,32 @@ impl PixalDecoder {
         }
         Ok(())
     }
-    #[cfg(test)]
     fn up_stage(
         &self,
         stage: usize,
-        sites: SparseSites,
+        sites: &SparseSites,
         x: CudaSlice<f16>,
         conv: SparseConv,
-        guide: SubdivisionGuide<'_>,
+        guide: Option<&SubdivisionGuide<'_>>,
     ) -> Result<(SparseSites, CudaSlice<f16>, Vec<f32>, SparseConv)> {
         let c = 1024 >> stage;
         let co = c / 2;
         let n = sites.coordinates().len();
         let blocks = [4, 16, 8, 4][stage];
-        ensure!(
-            guide.coordinates == sites.coordinates()
-                && guide.logits.len() == n * 8
-                && guide.logits.iter().all(|x| x.is_finite()),
-            "subdivision guide does not match stage coordinates"
-        );
-        let active: Vec<[bool; 8]> = guide
-            .logits
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|row| row.map(|x| x > 0.0))
-            .collect();
+        if let Some(guide) = guide {
+            ensure!(
+                guide.coordinates == sites.coordinates()
+                    && guide.logits.len() == n * 8
+                    && guide.logits.iter().all(|x| x.is_finite()),
+                "subdivision guide does not match stage coordinates"
+            );
+        }
         let d = &self.device;
         let available = d
             .workspace_budget(self.initial_free, self.device_budget, 0)?
             .checked_add(conv.workspace_bytes())
             .context("released sparse workspace overflow")?;
         let capacity = available / (co * 16 + 27 * size_of::<i32>() + size_of::<[i32; 4]>());
-        let (children, source) = sites.subdivide(&active, capacity)?;
-        let child_n = children.coordinates().len();
         let name = format!("blocks.{stage}.{blocks}");
         let live = n
             .checked_mul(c * 10 + 16)
@@ -2944,13 +2935,26 @@ impl PixalDecoder {
             &mut subdivision,
             [n, c, 8],
         )?;
-        let predicted = d
+        let predicted: Vec<f32> = d
             .stream
             .clone_dtoh(&subdivision)?
             .into_iter()
             .map(f16::to_f32)
             .collect();
         drop(subdivision);
+        ensure!(
+            predicted.iter().all(|x| x.is_finite()),
+            "nonfinite subdivision logits"
+        );
+        let active: Vec<[bool; 8]> = guide
+            .map_or(predicted.as_slice(), |g| g.logits)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|row| row.map(|x| x > 0.0))
+            .collect();
+        let (children, source) = sites.subdivide(&active, capacity)?;
+        let child_n = children.coordinates().len();
         let normalized = d.stream.alloc_zeros::<f16>(n * c)?;
         self.norm16(Some(&format!("{name}.norm1")), &x, &normalized, n, c, 1e-6)?;
         self.k.act(d, ptr(&normalized, d), n, c, false)?;
@@ -2964,7 +2968,6 @@ impl PixalDecoder {
         )?;
         drop(conv);
         drop(normalized);
-        drop(sites);
         let live = child_n
             .checked_mul(co * 2 + size_of::<[u32; 2]>())
             .context("C2S child workspace overflow")?;
@@ -2978,9 +2981,13 @@ impl PixalDecoder {
         drop(child);
         self.k.act(d, ptr(&normalized, d), child_n, co, false)?;
         let mut output = d.stream.alloc_zeros::<f16>(child_n * co)?;
-        let additional = child_n
-            .checked_mul(co * 14)
-            .context("child workspace overflow")?;
+        let additional = if stage + 1 == 4 {
+            0
+        } else {
+            child_n
+                .checked_mul(co * 14)
+                .context("child workspace overflow")?
+        };
         let budget = d.workspace_budget(self.initial_free, self.device_budget, additional)?;
         let conv = SparseConv::new(d, &children, co, budget)?;
         self.sparse_conv(
@@ -2993,24 +3000,23 @@ impl PixalDecoder {
         self.c2s(&x, &pairs, &output, [n, child_n, c / 8, co], true)?;
         Ok((children, output, predicted, conv))
     }
-    #[cfg(test)]
-    pub(crate) fn shape_prefix<F>(
+    fn sparse_decode<F>(
         &self,
         coordinates: Vec<[i32; 4]>,
         latent: &[f32],
         guides: &[SubdivisionGuide<'_>],
         mut observe: F,
-    ) -> Result<SparseDecoderOutput>
+    ) -> Result<(SparseSites, CudaSlice<f16>)>
     where
-        F: FnMut(usize, &SparseDecoderOutput, &[f32]) -> Result<()>,
+        F: FnMut([usize; 3], (&SparseSites, &[f32]), (&SparseSites, &CudaSlice<f16>)) -> Result<()>,
     {
         ensure!(
             matches!(self.kind, DecoderKind::Shape),
             "shape decoder required"
         );
         ensure!(
-            guides.len() == 4,
-            "four recorded subdivision guides required"
+            guides.len() <= 4,
+            "expected at most four recorded subdivision guides"
         );
         let mut sites = SparseSites::new(coordinates)?;
         let n = sites.coordinates().len();
@@ -3036,38 +3042,56 @@ impl PixalDecoder {
             .context("initial sparse workspace overflow")?;
         let budget = d.workspace_budget(self.initial_free, self.device_budget, additional)?;
         let mut conv = SparseConv::new(d, &sites, 1024, budget)?;
-        for (stage, guide) in guides.iter().enumerate() {
+        for stage in 0..4 {
+            let parent_workspace = conv.workspace_bytes();
             x = self.next_blocks(stage, &conv, x, 1024 >> stage, [4, 16, 8, 4][stage])?;
-            let (next, features, predicted, next_conv) = self.up_stage(
-                stage,
-                sites,
-                x,
-                conv,
-                SubdivisionGuide {
-                    coordinates: guide.coordinates,
-                    logits: guide.logits,
-                },
+            let (next, features, predicted, next_conv) =
+                self.up_stage(stage, &sites, x, conv, guides.get(stage))?;
+            observe(
+                [stage, parent_workspace, next_conv.workspace_bytes()],
+                (&sites, &predicted),
+                (&next, &features),
             )?;
-            let host = SparseDecoderOutput {
-                coordinates: next.coordinates().to_vec(),
-                features: d
-                    .stream
-                    .clone_dtoh(&features)?
-                    .into_iter()
-                    .map(f16::to_f32)
-                    .collect(),
-                channels: 512 >> stage,
-            };
-            ensure!(
-                host.features.iter().all(|x| x.is_finite())
-                    && predicted.iter().all(|x| x.is_finite()),
-                "nonfinite sparse stage output"
-            );
-            observe(stage, &host, &predicted)?;
             sites = next;
             x = features;
             conv = next_conv;
         }
+        Ok((sites, x))
+    }
+    #[cfg(test)]
+    pub(crate) fn shape_prefix<F>(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        guides: &[SubdivisionGuide<'_>],
+        mut observe: F,
+    ) -> Result<SparseDecoderOutput>
+    where
+        F: FnMut(usize, &SparseDecoderOutput, &[f32]) -> Result<()>,
+    {
+        let d = &self.device;
+        let (sites, x) = self.sparse_decode(
+            coordinates,
+            latent,
+            guides,
+            |[stage, _, _], (_, predicted), (next, features)| {
+                let host = SparseDecoderOutput {
+                    coordinates: next.coordinates().to_vec(),
+                    features: d
+                        .stream
+                        .clone_dtoh(features)?
+                        .into_iter()
+                        .map(f16::to_f32)
+                        .collect(),
+                    channels: 512 >> stage,
+                };
+                ensure!(
+                    host.features.iter().all(|x| x.is_finite()),
+                    "nonfinite sparse stage output"
+                );
+                observe(stage, &host, predicted)
+            },
+        )?;
         Ok(SparseDecoderOutput {
             coordinates: sites.coordinates().to_vec(),
             features: d
@@ -3078,6 +3102,100 @@ impl PixalDecoder {
                 .collect(),
             channels: 64,
         })
+    }
+    pub fn shape(&self, coordinates: Vec<[i32; 4]>, latent: &[f32]) -> Result<SparseDecoderOutput> {
+        let (sites, features) = self.sparse_decode(coordinates, latent, &[], |_, _, _| Ok(()))?;
+        let output = self.shape_head(&sites, features)?;
+        let features = self.device.stream.clone_dtoh(&output)?;
+        ensure!(
+            features.iter().all(|x| x.is_finite()),
+            "nonfinite shape output"
+        );
+        Ok(SparseDecoderOutput {
+            coordinates: sites.coordinates().to_vec(),
+            features,
+            channels: output.len() / sites.coordinates().len(),
+        })
+    }
+    pub fn shape_mesh(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        resolution: u32,
+    ) -> Result<crate::sparse::SparseMesh> {
+        let (sites, features) = self.sparse_decode(coordinates, latent, &[], |_, _, _| Ok(()))?;
+        let fields = self.shape_head(&sites, features)?;
+        super::sparse::dual_grid_mesh(
+            &self.device,
+            sites,
+            fields,
+            resolution,
+            [self.initial_free, self.device_budget],
+        )
+    }
+    pub fn cascade_coordinates(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        requested_resolution: u32,
+        token_limit: usize,
+    ) -> Result<(u32, SparseSites)> {
+        ensure!(
+            matches!(requested_resolution, 1024 | 1536) && token_limit > 0,
+            "invalid cascade resolution or token limit"
+        );
+        let (sites, features) = self.sparse_decode(coordinates, latent, &[], |_, _, _| Ok(()))?;
+        drop(features);
+        Self::cascade_grid(&sites, requested_resolution, token_limit)
+    }
+    fn cascade_grid(
+        sites: &SparseSites,
+        requested_resolution: u32,
+        token_limit: usize,
+    ) -> Result<(u32, SparseSites)> {
+        let mut resolution = requested_resolution;
+        loop {
+            let quantized = sites.round_unique(512, resolution / 16)?;
+            if quantized.coordinates().len() < token_limit || resolution == 1024 {
+                return Ok((resolution, quantized));
+            }
+            resolution -= 128;
+        }
+    }
+    fn shape_head(&self, sites: &SparseSites, features: CudaSlice<f16>) -> Result<CudaSlice<f32>> {
+        let d = &self.device;
+        let rows = sites.coordinates().len();
+        let channels = features.len() / rows;
+        let output_channels = self
+            .weights
+            .float
+            .get("output_layer.bias")
+            .context("shape output bias missing")?
+            .len();
+        let bytes = rows
+            .checked_mul(channels + output_channels)
+            .and_then(|n| n.checked_mul(size_of::<f32>()))
+            .context("shape output workspace overflow")?;
+        d.workspace_budget(self.initial_free, self.device_budget, bytes)?;
+        let normalized = d.stream.alloc_zeros::<f32>(rows * channels)?;
+        self.k.norm(
+            d,
+            [ptr(&features, d), ptr(&normalized, d)],
+            [rows, channels],
+            [0, 0],
+            [false, true],
+            1e-5,
+        )?;
+        drop(features);
+        let mut output = d.stream.alloc_zeros::<f32>(rows * output_channels)?;
+        self.linear32(
+            "output_layer",
+            &normalized,
+            &mut output,
+            [rows, channels, output_channels],
+        )?;
+        drop(normalized);
+        Ok(output)
     }
     fn dense_conv(&self, name: &str, io: [u64; 2], shape: [usize; 3], half: bool) -> Result<()> {
         let [side, ci, co] = shape;
@@ -3258,7 +3376,7 @@ impl PixalDecoder {
             [ptr(&float, d), ptr(&normalized, d)],
             [rows, c],
             self.weights.affine(d, Some("out_layer.0"))?,
-            true,
+            [true, true],
             1e-5,
         )?;
         drop(float);

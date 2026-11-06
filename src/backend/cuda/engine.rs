@@ -2520,28 +2520,34 @@ impl Engine {
             crate::model::LayerProgram::PerLayerInput(stages) => &stages[..],
         };
         for (position, &stage) in stages.iter().enumerate() {
-            match stage {
-                crate::model::LayerStage::Common(op) => {
-                    self.run_operator(op, layer, step, trace)?
-                }
-                crate::model::LayerStage::Mixer(mixer) => {
-                    self.run_mixer(mixer, layer, step, trace)?
-                }
-                crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
-                crate::model::LayerStage::Hc(kind) => {
-                    self.run_hc_stage(position, kind, layer, step)?
-                }
-                crate::model::LayerStage::PerLayerInput => {
-                    self.qwen_per_layer_input(layer, step, trace)?
-                }
-            }
-            #[cfg(test)]
-            if let Some(calls) = self.qwen.as_ref().and_then(|q| q.glm_calls.as_ref()) {
-                calls.borrow_mut()[layer][position] += step.rows;
-            }
+            self.run_layer_stage(position, stage, layer, step, trace)?;
         }
         #[cfg(test)]
         self.check_capture_layer(layer)?;
+        Ok(())
+    }
+
+    fn run_layer_stage(
+        &mut self,
+        position: usize,
+        stage: crate::model::LayerStage,
+        layer: usize,
+        step: crate::backend::Step<'_>,
+        trace: &mut Option<Target<'_>>,
+    ) -> Result<()> {
+        match stage {
+            crate::model::LayerStage::Common(op) => self.run_operator(op, layer, step, trace)?,
+            crate::model::LayerStage::Mixer(mixer) => self.run_mixer(mixer, layer, step, trace)?,
+            crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
+            crate::model::LayerStage::Hc(kind) => self.run_hc_stage(position, kind, layer, step)?,
+            crate::model::LayerStage::PerLayerInput => {
+                self.qwen_per_layer_input(layer, step, trace)?
+            }
+        }
+        #[cfg(test)]
+        if let Some(calls) = self.qwen.as_ref().and_then(|q| q.glm_calls.as_ref()) {
+            calls.borrow_mut()[layer][position] += step.rows;
+        }
         Ok(())
     }
 
@@ -3907,19 +3913,26 @@ impl Engine {
         self.prepare_deepseek_engram(&[committed_token], None)?;
         if graph {
             {
-                let result = if self.moe.is_some() {
-                    self.run_moe_graph(1)
-                } else if let Some(graph) = &self.graph {
-                    #[cfg(feature = "cuda")]
-                    let launched = graph.launch().map_err(Into::into);
-                    #[cfg(feature = "rocm")]
-                    let launched = graph.launch();
-                    launched
-                } else if self.dense_streaming() {
-                    self.run_dense_graph()
-                } else {
-                    anyhow::bail!("decode graph is not captured");
-                };
+                let result =
+                    if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                        #[cfg(feature = "cuda")]
+                        let launched = self.run_glm_graph();
+                        #[cfg(feature = "rocm")]
+                        let launched = Err(anyhow::anyhow!("GLM HIP graph decode is not bound"));
+                        launched
+                    } else if self.moe.is_some() {
+                        self.run_moe_graph(1)
+                    } else if let Some(graph) = &self.graph {
+                        #[cfg(feature = "cuda")]
+                        let launched = graph.launch().map_err(Into::into);
+                        #[cfg(feature = "rocm")]
+                        let launched = graph.launch();
+                        launched
+                    } else if self.dense_streaming() {
+                        self.run_dense_graph()
+                    } else {
+                        anyhow::bail!("decode graph is not captured");
+                    };
                 if let Err(error) = result {
                     self.poisoned = true;
                     return Err(error);
@@ -4035,6 +4048,9 @@ impl Engine {
     /// DeepSeek-V4.1 and GLM-5.3 decode eagerly.
     pub fn graph_decode(&self) -> bool {
         if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+            #[cfg(feature = "cuda")]
+            return self.moe_slots.is_some() && self.glm_graph_count() > 0;
+            #[cfg(feature = "rocm")]
             return false;
         }
         if matches!(
@@ -4060,6 +4076,10 @@ impl Engine {
             ),
             "canvas graph execution is not bound"
         );
+        #[cfg(feature = "cuda")]
+        if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+            return self.capture_glm();
+        }
         ensure!(
             self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,
             "GLM storage-only expert graph segments are not bound"

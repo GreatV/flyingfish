@@ -1878,7 +1878,8 @@ fn glm_all_layers_match_model_definition_boundaries() -> Result<()> {
                             chunk_rows as u32,
                         )?
                     };
-                    ffn.route(s, x)?;
+                    ffn.enqueue_route(s, x)?;
+                    ffn.read_route(s)?;
                     ffn.run(
                         s,
                         x,

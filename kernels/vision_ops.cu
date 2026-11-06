@@ -1260,3 +1260,162 @@ extern "C" __global__ void kv_unpack_head_major_f16(
     if (parts != 2) { __trap(); return; }
     qkv_unpack_hm_impl<__half, true>(packed, q, k, v, batch, rows, heads, dim, parts);
 }
+
+// Sorted rows are [batch,x,y,z,input_row]; coordinates are nonnegative I32.
+__device__ __forceinline__ int sparse_coordinate_row(
+    const int32_t* sorted, uint32_t rows, const int32_t point[4]) {
+    uint32_t lo = 0, hi = rows;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        int comparison = 0;
+        for (int axis = 0; axis < 4 && comparison == 0; ++axis) {
+            const int32_t v = sorted[uint64_t(mid) * 5 + axis];
+            comparison = v < point[axis] ? -1 : v > point[axis] ? 1 : 0;
+        }
+        if (comparison == 0) return sorted[uint64_t(mid) * 5 + 4];
+        if (comparison < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return -1;
+}
+
+// Edge ID = 3*input_row+axis; quad order is [base,+second,+first,+both].
+extern "C" __global__ void sparse_cube_edge_ids(
+    const int32_t* coordinates, const int32_t* sorted, const uint8_t* flags,
+    uint32_t rows, int32_t* quads, uint64_t* face_counts) {
+    if (!vision_flat_launch() || !coordinates || !sorted || !flags || !rows || !quads || !face_counts) { __trap(); return; }
+    for (uint64_t edge = uint64_t(blockIdx.x) * 256 + threadIdx.x; edge < uint64_t(rows) * 3;
+         edge += uint64_t(gridDim.x) * 256) {
+        face_counts[edge] = 0;
+        if (!flags[edge]) continue;
+        const uint32_t row = edge / 3, axis = edge % 3;
+        const int a = (axis + 1) % 3 + 1, b = (axis + 2) % 3 + 1;
+        int32_t p[4];
+        for (int j = 0; j < 4; ++j) p[j] = coordinates[uint64_t(row) * 4 + j];
+        if (p[a] == INT32_MAX || p[b] == INT32_MAX) { __trap(); return; }
+        int32_t q[4] = {int32_t(row), -1, -1, -1};
+        ++p[b]; q[1] = sparse_coordinate_row(sorted, rows, p);
+        --p[b]; ++p[a]; q[2] = sparse_coordinate_row(sorted, rows, p);
+        ++p[b]; q[3] = sparse_coordinate_row(sorted, rows, p);
+        if (q[1] < 0 || q[2] < 0 || q[3] < 0) continue;
+        for (int j = 0; j < 4; ++j) quads[edge * 4 + j] = q[j];
+        face_counts[edge] = 2;
+    }
+}
+
+// 1024-element exclusive scan per CTA; output[count] is set for a single tile.
+extern "C" __global__ void exclusive_scan_u64(
+    const uint64_t* input, uint64_t* output, uint64_t* totals, uint32_t count) {
+    if (!vision_flat_launch() || !input || !output || !totals || !count || gridDim.x != (uint64_t(count) + 1023) / 1024) { __trap(); return; }
+    __shared__ uint64_t values[1024];
+    const uint32_t tid = threadIdx.x;
+    const uint64_t first = uint64_t(blockIdx.x) * 1024;
+    for (uint32_t j = tid; j < 1024; j += 256) values[j] = first + j < count ? input[first + j] : 0;
+    __syncthreads();
+    for (uint32_t stride = 1; stride < 1024; stride *= 2) {
+        for (uint32_t j = (tid + 1) * stride * 2 - 1; j < 1024; j += 256 * stride * 2) {
+            const uint64_t sum = values[j] + values[j - stride];
+            if (sum < values[j]) { __trap(); return; }
+            values[j] = sum;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        totals[blockIdx.x] = values[1023];
+        if (gridDim.x == 1) output[count] = values[1023];
+        values[1023] = 0;
+    }
+    __syncthreads();
+    for (uint32_t stride = 512; stride > 0; stride /= 2) {
+        for (uint32_t j = (tid + 1) * stride * 2 - 1; j < 1024; j += 256 * stride * 2) {
+            const uint64_t left = values[j - stride];
+            values[j - stride] = values[j];
+            values[j] += left;
+        }
+        __syncthreads();
+    }
+    for (uint32_t j = tid; j < 1024; j += 256) if (first + j < count) output[first + j] = values[j];
+}
+
+extern "C" __global__ void add_scan_offsets_u64(
+    uint64_t* output, const uint64_t* tile_offsets, uint32_t count) {
+    if (!vision_flat_launch() || !output || !tile_offsets || !count) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i <= count;
+         i += uint64_t(gridDim.x) * 256) {
+        if (i == count) output[i] = tile_offsets[(uint64_t(count) + 1023) / 1024];
+        else {
+            const uint64_t value = output[i] + tile_offsets[i / 1024];
+            if (value < output[i]) { __trap(); return; }
+            output[i] = value;
+        }
+    }
+}
+
+// Strict diagonal product comparison; ties use the 1--2 diagonal.
+extern "C" __global__ void quad_diagonal_f32(
+    const int32_t* quads, const uint64_t* offsets, const float* weight,
+    uint32_t edges, uint32_t vertices, uint8_t* diagonal) {
+    if (!vision_flat_launch() || !quads || !offsets || !weight || !edges || !vertices || !diagonal) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < edges;
+         i += uint64_t(gridDim.x) * 256) {
+        if (offsets[i] == offsets[i + 1]) continue;
+        float w[4];
+        for (int j = 0; j < 4; ++j) {
+            const int32_t v = quads[i * 4 + j];
+            if (v < 0 || uint32_t(v) >= vertices) { __trap(); return; }
+            w[j] = weight[v];
+            if (!isfinite(w[j]) || w[j] < 0) { __trap(); return; }
+        }
+        const float first = __fmul_rn(w[0], w[3]), second = __fmul_rn(w[1], w[2]);
+        if (!isfinite(first) || !isfinite(second)) { __trap(); return; }
+        diagonal[i] = first > second;
+    }
+}
+
+// Stable quad compaction; winding, duplicate and degenerate faces are retained.
+extern "C" __global__ void sparse_face_compact(
+    const int32_t* quads, const uint64_t* offsets, const uint8_t* diagonal,
+    uint32_t edges, uint64_t capacity, int32_t* faces) {
+    if (!vision_flat_launch() || !quads || !offsets || !diagonal || !edges || (!faces && capacity)) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < edges;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t first = offsets[i], end = offsets[i + 1];
+        if (first == end) continue;
+        if (end < first || end - first != 2 || end > capacity) { __trap(); return; }
+        const int32_t* q = quads + i * 4;
+        int32_t* f = faces + first * 3;
+        if (diagonal[i]) {
+            f[0] = q[0]; f[1] = q[1]; f[2] = q[3];
+            f[3] = q[0]; f[4] = q[3]; f[5] = q[2];
+        } else {
+            f[0] = q[0]; f[1] = q[1]; f[2] = q[2];
+            f[3] = q[2]; f[4] = q[1]; f[5] = q[3];
+        }
+    }
+}
+
+// Fields = [dual_logits(3),edge_logits(3),split_logit].
+extern "C" __global__ void dual_grid_head_f32(
+    const float* fields, uint32_t rows, float* dual, uint8_t* flags, float* split_logits) {
+    if (!vision_flat_launch() || !fields || !rows || !dual || !flags || !split_logits) { __trap(); return; }
+    for (uint64_t row = uint64_t(blockIdx.x) * 256 + threadIdx.x; row < rows;
+         row += uint64_t(gridDim.x) * 256) {
+        for (int j = 0; j < 7; ++j) if (!isfinite(fields[row * 7 + j])) { __trap(); return; }
+        for (int axis = 0; axis < 3; ++axis) {
+            dual[row * 3 + axis] = __fsub_rn(__fmul_rn(2.0f, 1.0f / (1.0f + expf(-fields[row * 7 + axis]))), 0.5f);
+            flags[row * 3 + axis] = fields[row * 7 + axis + 3] > 0.0f;
+        }
+        split_logits[row] = fields[row * 7 + 6];
+    }
+}
+
+extern "C" __global__ void sparse_grid_world_f32(
+    const int32_t* coordinates, float* vertices, uint32_t rows, uint32_t grid, float origin) {
+    if (!vision_flat_launch() || !coordinates || !vertices || !rows || !grid || !isfinite(origin)) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * 3;
+         i += uint64_t(gridDim.x) * 256) {
+        const int32_t c = coordinates[i / 3 * 4 + i % 3 + 1];
+        if (c < 0 || uint32_t(c) >= grid || !isfinite(vertices[i])) { __trap(); return; }
+        vertices[i] = __fadd_rn(__fadd_rn(float(c), vertices[i]) / float(grid), origin);
+    }
+}

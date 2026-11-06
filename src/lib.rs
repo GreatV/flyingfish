@@ -1,6 +1,7 @@
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("features `cuda` and `rocm` are mutually exclusive");
 
+pub mod audio;
 pub mod backend;
 pub mod bench;
 pub mod checkpoint;
@@ -20,6 +21,7 @@ pub mod model_spec;
 pub mod mtp;
 pub mod music3;
 pub mod op_contract;
+pub mod parakeet;
 pub mod pixal3d;
 pub mod prefill;
 pub mod prefix_state;

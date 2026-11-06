@@ -1429,8 +1429,26 @@ impl Slots {
             leased.len(),
             self.pool.len()
         );
-        self.leased.clear();
-        for (index, lease) in leased.iter().enumerate() {
+        let same_layer = self.leased_layer == layer;
+        let mut new_leased = Vec::with_capacity(leased.len());
+        let mut available_slots: Vec<usize> = (0..self.pool.len()).collect();
+        let mut refills = 0usize;
+        if same_layer {
+            for lease in &leased {
+                if let Some(&(expert, slot)) = self.leased.iter().find(|&&(e, _)| e == lease.expert)
+                {
+                    new_leased.push((expert, slot));
+                    available_slots.retain(|&s| s != slot);
+                }
+            }
+        }
+        for lease in leased {
+            if same_layer && new_leased.iter().any(|&(e, _)| e == lease.expert) {
+                continue;
+            }
+            let index = available_slots
+                .pop()
+                .context("insufficient available pool slots")?;
             let reader = self.pool[index].reader.take();
             #[cfg(test)]
             let reader = reader.filter(|_| self.pool_control != PoolControl::SkipReaderWait);
@@ -1448,11 +1466,15 @@ impl Slots {
                 self.transfers.copied_host(block, staging, &copy);
             }
             self.pool[index].copy = Some(copy);
-            self.leased.push((lease.expert, index));
+            new_leased.push((lease.expert, index));
+            refills += 1;
         }
+        self.leased = new_leased;
         self.leased_layer = layer;
-        self.refill.record(&self.transfers.h2d)?;
-        Ok(leased.len())
+        if refills > 0 {
+            self.refill.record(&self.transfers.h2d)?;
+        }
+        Ok(refills)
     }
 
     pub fn resolve_native(&mut self, layer: u32, ids: &[i32], weights: &[f32]) -> Result<usize> {
@@ -1512,6 +1534,11 @@ impl Slots {
         self.moves.clear();
         self.refill.record(&self.transfers.h2d)?;
         Ok(count)
+    }
+
+    #[cfg(test)]
+    pub fn can_native_dispatch(&self, layer: u32) -> bool {
+        !self.streamed.get(layer as usize).copied().unwrap_or(false) || self.leased_layer == layer
     }
 
     pub fn native_dispatch(&self, layer: u32) -> Result<(Vec<u64>, Vec<u32>)> {
@@ -1603,11 +1630,70 @@ impl Slots {
     }
 
     #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn evict_for_test(
+        &mut self,
+        layer: u32,
+        target: u32,
+    ) -> Result<u32> {
+        let geometry = self.catalogue.geometry();
+        let experts = geometry.experts;
+        let top_k = geometry.top_k as usize;
+        if self.streamed[layer as usize] {
+            if !self.request_open {
+                self.begin_staging_request()?;
+            }
+            let incoming = (0..experts)
+                .find(|&expert| expert != target)
+                .context("no incoming expert")?;
+            self.force_routes(layer, &[incoming as i32])?;
+            ensure!(
+                !self.leased.iter().any(|&(leased, _)| leased == target),
+                "target {target} remained leased in pool"
+            );
+            return Ok(incoming);
+        }
+        self.force_routes(layer, &[target as i32])?;
+        let mut resident_ids = Vec::new();
+        for expert in 0..experts {
+            if expert != target && self.tier(layer, expert)? == Tier::Gpu {
+                resident_ids.push(expert as i32);
+            }
+        }
+        let decay = crate::experts::plan::F_DECAY;
+        let chunks = resident_ids.len().div_ceil(top_k) as i32;
+        ensure!(chunks > 0, "no other resident to warm");
+        let minimum_warm_score = decay.powi(chunks - 1);
+        let mut target_upper = 1.0 / (1.0 - decay);
+        while target_upper >= minimum_warm_score {
+            for chunk in resident_ids.chunks(top_k) {
+                let misses = self.force_routes(layer, chunk)?;
+                ensure!(misses == 0, "resident warming unexpectedly missed");
+            }
+            target_upper *= decay.powi(chunks);
+        }
+        let incoming = (0..experts)
+            .find(|&expert| {
+                expert != target && self.tier(layer, expert).is_ok_and(|tier| tier != Tier::Gpu)
+            })
+            .context("no incoming expert for eviction")?;
+        let moves = self.force_routes(layer, &[incoming as i32])?;
+        ensure!(moves == 1, "target eviction resolved {moves} experts");
+        ensure!(
+            self.tier(layer, target)? != Tier::Gpu,
+            "target {target} remained resident"
+        );
+        Ok(incoming)
+    }
+
+    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn force_routes(
         &mut self,
         layer: u32,
         ids: &[i32],
     ) -> Result<usize> {
+        if !self.request_open {
+            self.begin_staging_request()?;
+        }
         self.begin_token()?;
         let weights = vec![1.0 / self.catalogue.geometry().top_k as f32; ids.len()];
         let misses = self.resolve_native(layer, ids, &weights)?;
