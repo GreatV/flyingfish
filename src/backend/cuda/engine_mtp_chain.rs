@@ -861,10 +861,8 @@ impl Engine {
             unsafe {
                 super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;
             }
-            stream.memcpy_dtod(
-                &verify_logits_buf.slice(vocab..2 * vocab),
-                &mut self.work.logits,
-            )?;
+            let row1_bf16: Vec<bf16> = row1_logits.iter().copied().map(bf16::from_f32).collect();
+            stream.memcpy_htod(&row1_bf16, &mut self.work.logits.slice_mut(..vocab))?;
             self.logits_cache.mark_valid();
             Round {
                 tokens: vec![v0, v1],
