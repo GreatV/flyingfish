@@ -782,6 +782,7 @@ struct GraphStepCheckpoint {
     position: usize,
     last_input: Option<PrefixLastInputKind>,
     logits: PrefixLogitsCache,
+    committed_prefix_ids: Vec<u32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -821,6 +822,7 @@ impl GraphStepCheckpoint {
             position: engine.position,
             last_input: engine.last_input_kind,
             logits: engine.logits_cache,
+            committed_prefix_ids: engine.committed_prefix_ids.clone(),
         })
     }
 
@@ -848,6 +850,7 @@ impl GraphStepCheckpoint {
         engine.set_token(self.token)?;
         engine.last_input_kind = self.last_input;
         engine.logits_cache = self.logits;
+        engine.committed_prefix_ids = self.committed_prefix_ids.clone();
         Ok(())
     }
 }
@@ -1056,6 +1059,7 @@ fn glm_graph_expert_tier_gpu() -> Result<()> {
         .0;
     ensure!(ids.len() == 8, "GLM top8 route extent");
     let target = ids[0] as u32;
+    let bit_differences = |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
     let incoming_eager = engine
         .moe_slots
         .as_mut()
@@ -1063,7 +1067,7 @@ fn glm_graph_expert_tier_gpu() -> Result<()> {
         .evict_for_test(0, target)?;
     let (refilled, eager_refills) = output(&mut engine, None)?;
     ensure!(
-        eager_refills > 0 && baseline == refilled,
+        eager_refills > 0 && bit_differences(&baseline, &refilled) == 0,
         "DEFECT eager native refill identity"
     );
     let incoming_graph = engine
@@ -1074,7 +1078,10 @@ fn glm_graph_expert_tier_gpu() -> Result<()> {
     let (replay, graph_refills) = output(&mut engine, Some(&graphs))?;
     let (hit, hit_refills) = output(&mut engine, Some(&graphs))?;
     ensure!(
-        graph_refills > 0 && hit_refills == 0 && baseline == replay && baseline == hit,
+        graph_refills > 0
+            && hit_refills == 0
+            && bit_differences(&baseline, &replay) == 0
+            && bit_differences(&baseline, &hit) == 0,
         "DEFECT graph native refill/hit identity"
     );
     engine.qwen.as_mut().context("runtime missing")?.layers[3]
@@ -1088,10 +1095,16 @@ fn glm_graph_expert_tier_gpu() -> Result<()> {
         .as_mut()
         .context("native FFN missing")?
         .wrong_route = false;
-    let differences = baseline.iter().zip(&wrong).filter(|(a, b)| a != b).count();
+    let differences = bit_differences(&baseline, &wrong);
     ensure!(differences > 0, "Runner FAIL wrong-slot control escaped");
+    let mut signed_zero = baseline.clone();
+    signed_zero[0] ^= 0x8000;
+    ensure!(
+        bit_differences(&baseline, &signed_zero) == 1,
+        "Runner FAIL signed-zero control escaped"
+    );
     println!(
-        "PASS GLM_GRAPH_EXPERT_TIER experts=288 top_k=8 input=[1,4096] contributions=[1,8,4096] output=[1,4096] target={target} incoming={incoming_eager}/{incoming_graph} initial_refills={initial} eager_refills={eager_refills} graph_refills={graph_refills} hit_refills={hit_refills} different_bits=0 wrong_slot_differences={differences}"
+        "PASS GLM_GRAPH_EXPERT_TIER experts=288 top_k=8 input=[1,4096] contributions=[1,8,4096] output=[1,4096] target={target} incoming={incoming_eager}/{incoming_graph} initial_refills={initial} eager_refills={eager_refills} graph_refills={graph_refills} hit_refills={hit_refills} different_bits=0 signed_zero_control=1 wrong_slot_differences={differences}"
     );
     Ok(())
 }
@@ -1138,6 +1151,32 @@ fn glm_graph_composition_gpu() -> Result<()> {
             &output.join(format!("graph-{round}.fp32")),
             &reference,
         )?;
+        let pos0_checkpoint = GraphStepCheckpoint::save(&engine)?;
+        engine.set_token(reference.tokens[0])?;
+        engine.decode(false, None)?;
+        let expected_pos0 = engine.decode_logits()?;
+        let expected_state_pos0 = graph_native_state(&engine, false)?;
+        pos0_checkpoint.restore(&mut engine)?;
+        engine.set_token(reference.tokens[0])?;
+        engine.decode(true, None)?;
+        let actual_pos0 = engine.decode_logits()?;
+        let actual_state_pos0 = graph_native_state(&engine, false)?;
+        let pos0_bit_diffs = expected_pos0
+            .iter()
+            .zip(&actual_pos0)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let pos0_state_diffs = expected_state_pos0
+            .iter()
+            .zip(&actual_state_pos0)
+            .filter(|(a, b)| a != b)
+            .count();
+        ensure!(
+            pos0_bit_diffs == 0 && pos0_state_diffs == 0,
+            "DEFECT GLM position-0 graph decode replay identity"
+        );
+        pos0_checkpoint.restore(&mut engine)?;
+        engine.reset()?;
         engine.prefill(&reference.tokens[..1], None)?;
         let first = engine.decode_logits()?;
         let mut second = None;
@@ -1239,12 +1278,31 @@ fn glm_graph_composition_gpu() -> Result<()> {
         let identity = bit_differences == 0
             && state_differences == 0
             && old_differences == 0
-            && stale_detected;
+            && stale_detected
+            && pos0_bit_diffs == 0
+            && pos0_state_diffs == 0;
         accepted &= identity;
         println!(
-            "{} GLM_GRAPH_COMPOSITION round={round} rows=599 vocab=154880 logit_bit_differences={bit_differences} native_state_different_bytes={state_differences} pre_graph_eager_bit_differences={old_differences} stale_sequence_detected={stale_detected} graph_submissions_per_decode=84",
+            "{} GLM_GRAPH_COMPOSITION round={round} rows=599 vocab=154880 logit_bit_differences={bit_differences} native_state_different_bytes={state_differences} pre_graph_eager_bit_differences={old_differences} stale_sequence_detected={stale_detected} pos0_bit_differences={pos0_bit_diffs} graph_submissions_per_decode=84",
             if identity { "PASS" } else { "DEFECT" }
         );
+        engine.reset()?;
+        let reset_pos0_checkpoint = GraphStepCheckpoint::save(&engine)?;
+        engine.set_token(reference.tokens[0])?;
+        engine.decode(false, None)?;
+        let reset_expected_pos0 = engine.decode_logits()?;
+        reset_pos0_checkpoint.restore(&mut engine)?;
+        engine.set_token(reference.tokens[0])?;
+        engine.decode(true, None)?;
+        let reset_actual_pos0 = engine.decode_logits()?;
+        ensure!(
+            reset_expected_pos0
+                .iter()
+                .zip(&reset_actual_pos0)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "DEFECT graph reset position-0 identity"
+        );
+        reset_pos0_checkpoint.restore(&mut engine)?;
         engine.reset()?;
         engine.prefill(&reference.tokens[..1], None)?;
         ensure!(
@@ -1255,7 +1313,7 @@ fn glm_graph_composition_gpu() -> Result<()> {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "DEFECT graph reset first-token identity"
         );
-        println!("PASS GLM_GRAPH_RESET round={round} first_token_bits=0");
+        println!("PASS GLM_GRAPH_RESET round={round} first_token_bits=0 pos0_replay_bits=0");
         composition_controls(
             &mut engine,
             &reference.tokens,
