@@ -307,12 +307,18 @@ pub(crate) fn component_spec(spec: &ModelSpec) -> Result<ModelSpec> {
         sliding_window: None,
         ffn,
     }];
-    component.gdn = None;
+    if spec.architecture == crate::model_spec::Architecture::Glm5Next {
+        component.gdn = None;
+    }
     Ok(component)
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm", test))]
-pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
+pub(crate) fn snapshot_bytes_for_rows(spec: &ModelSpec, verify_rows: usize) -> Result<usize> {
+    ensure!(
+        (2..=MAX_VERIFY_ROWS).contains(&verify_rows),
+        "invalid MTP snapshot verify_rows={verify_rows}"
+    );
     let layers = spec
         .layers
         .iter()
@@ -324,11 +330,208 @@ pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
     let g = crate::op_contract::GdnSpec::from_model(spec)?;
     usize::try_from(
         g.image_bytes()?
-            .checked_mul(4)
+            .checked_mul((verify_rows - 1) as u64)
             .context("snapshot byte overflow")?,
     )?
     .checked_mul(layers)
     .context("snapshot layer byte overflow")
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
+    snapshot_bytes_for_rows(spec, MAX_VERIFY_ROWS)
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GlmMtpCommitPlan {
+    pub accepted: usize,
+    pub consumed: usize,
+    pub next_position: usize,
+    pub dsa_committed_keys: usize,
+    pub select_prefix_rows: Option<usize>,
+    pub replay_target_passes: usize,
+    pub commit_mtp_row0: bool,
+    pub carry_verify_row1_hidden: bool,
+    pub next_pending_token: u32,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) fn glm_mtp_commit_plan(
+    start_pos: usize,
+    draft_token: u32,
+    v0: u32,
+    v1: u32,
+) -> GlmMtpCommitPlan {
+    if draft_token == v0 {
+        GlmMtpCommitPlan {
+            accepted: 1,
+            consumed: 2,
+            next_position: start_pos + 2,
+            dsa_committed_keys: start_pos + 2,
+            select_prefix_rows: None,
+            replay_target_passes: 0,
+            commit_mtp_row0: true,
+            carry_verify_row1_hidden: true,
+            next_pending_token: v1,
+        }
+    } else {
+        GlmMtpCommitPlan {
+            accepted: 0,
+            consumed: 1,
+            next_position: start_pos + 1,
+            dsa_committed_keys: start_pos + 1,
+            select_prefix_rows: Some(1),
+            replay_target_passes: 0,
+            commit_mtp_row0: false,
+            carry_verify_row1_hidden: false,
+            next_pending_token: v0,
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GlmMtpDsaTruncation {
+    pub restore_slots: Vec<usize>,
+    pub incomplete_pool: Option<usize>,
+    pub restore_pools: Vec<usize>,
+    pub meta: crate::op_contract::DsaMeta,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) fn glm_mtp_dsa_truncation(
+    spec: crate::op_contract::DsaSpec,
+    capacity: usize,
+    prefix: usize,
+    active_rows: usize,
+    accepted: usize,
+) -> Result<GlmMtpDsaTruncation> {
+    let cap_u32 = u32::try_from(capacity)?;
+    ensure!(
+        accepted > 0 && accepted < active_rows && prefix + active_rows <= capacity,
+        "invalid DSA prefix truncation prefix={prefix} active_rows={active_rows} accepted={accepted} capacity={capacity}"
+    );
+    let pool_size = spec.pool as usize;
+    let pool_cap = spec.pool_capacity(cap_u32) as usize;
+    let restore_slots = (accepted..active_rows)
+        .map(|row| (prefix + row) % capacity)
+        .collect();
+    let new_keys = prefix + accepted;
+    let verified_keys = prefix + active_rows;
+    let incomplete_pool =
+        (!new_keys.is_multiple_of(pool_size)).then_some((new_keys / pool_size) % pool_cap);
+    let restore_pools = (new_keys.div_ceil(pool_size)..verified_keys.div_ceil(pool_size))
+        .map(|p| p % pool_cap)
+        .collect();
+    let meta = crate::op_contract::DsaMeta {
+        prefix: i32::try_from(prefix)?,
+        valid_rows: i32::try_from(accepted)?,
+        key_count: i32::try_from(new_keys)?,
+        capacity: i32::try_from(capacity)?,
+        first_key: 0,
+        reserved: [0; 3],
+    };
+    meta.validate(cap_u32)?;
+    Ok(GlmMtpDsaTruncation {
+        restore_slots,
+        incomplete_pool,
+        restore_pools,
+        meta,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn glm_mtp_break_even_alpha(
+    b_draft: u64,
+    mean_b_verify: f64,
+    b_step1: u64,
+    replay_on_reject: bool,
+) -> f64 {
+    if replay_on_reject {
+        (b_draft as f64 + mean_b_verify) / (2.0 * b_step1 as f64)
+    } else {
+        (b_draft as f64 + mean_b_verify) / b_step1 as f64 - 1.0
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) fn glm_attachment_bytes(
+    spec: &ModelSpec,
+    capacity: usize,
+    verify_rows: usize,
+) -> Result<usize> {
+    ensure!(
+        spec.architecture == Architecture::Glm5Next,
+        "GLM MTP attachment requires Glm5Next"
+    );
+    let dsa = crate::op_contract::DsaSpec::from_model(spec)?;
+    let gdn = crate::op_contract::GdnSpec::from_model(spec)?;
+    let moe = spec.moe.context("GLM MoE specification missing")?;
+    let h = spec.hidden as usize;
+    let vocab = spec.vocab as usize;
+    let inter = moe.expert_intermediate as usize;
+    let experts = moe.experts as usize;
+    let top_k = moe.experts_per_tok as usize;
+    let dsa_bytes = usize::try_from(dsa.state_bytes(u32::try_from(capacity)?)?)?;
+    let gdn_bytes = usize::try_from(gdn.image_bytes()?)?;
+    let gdn_layers = spec
+        .layers
+        .iter()
+        .filter(|l| l.mixer == crate::model_spec::Mixer::Gdn)
+        .count();
+    let dsa_layers = spec.layers.len() - gdn_layers;
+    let expert_proj_bytes = inter * h + (inter / 128) * (h / 128) * 4;
+    let runtime_weights = (5 * h
+        + h * 2 * h
+        + 512 * h
+        + 512
+        + 32768 * 512
+        + 1536 * h
+        + 1536
+        + 16384 * 1536
+        + h * 16384
+        + experts * h)
+        * 2
+        + experts * 4
+        + 3 * expert_proj_bytes
+        + experts * 6 * 8
+        + experts * 4
+        + top_k * 3 * expert_proj_bytes;
+    let native_moe_shared = 2 * (h + (h / 128) * 4) + (inter + (inter / 128) * 4);
+    let native_moe_buffers = experts * 4
+        + 2 * top_k * 4
+        + h
+        + (h / 128) * 4
+        + 3 * top_k * inter * 2
+        + top_k * inter
+        + top_k * (inter / 128) * 4
+        + 2 * top_k * h * 2
+        + 3 * inter * 2
+        + h * 2
+        + 2 * top_k * 4
+        + 2 * 8 * 4
+        + 4
+        + 4 * 1024 * 1024;
+    let runtime_scratch =
+        (12 * h + 2 * h + 2 * 512 + 2 * 1536 + 2 * 16384) * 2 + vocab * 4 + 2051 * 4;
+    [
+        runtime_weights,
+        native_moe_shared,
+        native_moe_buffers,
+        runtime_scratch,
+        dsa_bytes,
+        gdn_layers * gdn_bytes + dsa_layers * dsa_bytes + 36,
+        dsa_bytes + 4,
+        snapshot_bytes_for_rows(spec, verify_rows)?,
+        verify_rows * vocab * 4,
+        (4 * HIDDEN + vocab) * 2 + 8,
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, n| {
+        sum.checked_add(n)
+            .context("GLM MTP attachment byte overflow")
+    })
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm", test))]
@@ -447,6 +650,14 @@ mod tests {
         .unwrap()
     }
 
+    fn glm_spec() -> ModelSpec {
+        ModelSpec::glm5_next(
+            &serde_json::from_str(include_str!("../tests/data/glm53-flash-config.json")).unwrap(),
+            &serde_json::json!({"eos_token_id": [154820, 154827, 154829]}),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn mtp_component_uses_full_attention() {
         let component = component_spec(&spec()).unwrap();
@@ -457,6 +668,65 @@ mod tests {
         assert!(layer.rope);
         assert_eq!(layer.sliding_window, None);
         assert_eq!(layer.ffn, crate::model_spec::FfnKind::Dense);
+        assert!(component.gdn.is_some());
+
+        let glm_component = component_spec(&glm_spec()).unwrap();
+        assert!(glm_component.gdn.is_none());
+    }
+
+    #[test]
+    fn glm_mtp_rejection_commits_prefix_one_without_target_replay() -> Result<()> {
+        let reject = glm_mtp_commit_plan(33, 9001, 42, 77);
+        assert_eq!(reject.accepted, 0);
+        assert_eq!(reject.consumed, 1);
+        assert_eq!(reject.next_position, 34);
+        assert_eq!(reject.dsa_committed_keys, 34);
+        assert_eq!(reject.select_prefix_rows, Some(1));
+        assert_eq!(reject.replay_target_passes, 0);
+        assert!(!reject.commit_mtp_row0);
+        assert!(!reject.carry_verify_row1_hidden);
+        assert_eq!(reject.next_pending_token, 42);
+
+        let accept = glm_mtp_commit_plan(33, 42, 42, 77);
+        assert_eq!(accept.accepted, 1);
+        assert_eq!(accept.consumed, 2);
+        assert_eq!(accept.next_position, 35);
+        assert_eq!(accept.dsa_committed_keys, 35);
+        assert_eq!(accept.select_prefix_rows, None);
+        assert_eq!(accept.replay_target_passes, 0);
+        assert!(accept.commit_mtp_row0);
+        assert!(accept.carry_verify_row1_hidden);
+        assert_eq!(accept.next_pending_token, 77);
+
+        let dsa = crate::op_contract::DsaSpec::glm53();
+        let incomplete = glm_mtp_dsa_truncation(dsa, 64, 2, 2, 1)?;
+        assert_eq!(incomplete.restore_slots, vec![3]);
+        assert_eq!(incomplete.incomplete_pool, Some(0));
+        assert!(incomplete.restore_pools.is_empty());
+        assert_eq!(incomplete.meta.prefix, 2);
+        assert_eq!(incomplete.meta.valid_rows, 1);
+        assert_eq!(incomplete.meta.key_count, 3);
+
+        let completed = glm_mtp_dsa_truncation(dsa, 64, 3, 2, 1)?;
+        assert_eq!(completed.restore_slots, vec![4]);
+        assert_eq!(completed.incomplete_pool, None);
+        assert_eq!(completed.restore_pools, vec![1]);
+        assert_eq!(completed.meta.prefix, 3);
+        assert_eq!(completed.meta.valid_rows, 1);
+        assert_eq!(completed.meta.key_count, 4);
+
+        let glm = glm_spec();
+        assert_eq!(snapshot_bytes_for_rows(&glm, 2)?, 152_633_344);
+        assert!(glm_attachment_bytes(&glm, 64, 2)? > 152_633_344);
+
+        let b_step1 = 15_344_926_720u64;
+        let b_draft = 1_714_025_088u64;
+        let mean_b_verify = 21_072_128_530.0;
+        let alpha_star_no_replay = glm_mtp_break_even_alpha(b_draft, mean_b_verify, b_step1, false);
+        let alpha_star_replay = glm_mtp_break_even_alpha(b_draft, mean_b_verify, b_step1, true);
+        assert!(alpha_star_no_replay < 0.50);
+        assert!(alpha_star_replay > 0.74);
+        Ok(())
     }
 
     fn plan() -> MtpPlan {

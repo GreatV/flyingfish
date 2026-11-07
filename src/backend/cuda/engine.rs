@@ -3457,7 +3457,9 @@ impl Engine {
         }
         self.state.reset(&self.device.stream)?;
         #[cfg(feature = "cuda")]
-        if let Some(state) = self.mtp_state.as_mut() {
+        if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
+            && let Some(state) = self.mtp_state.as_mut()
+        {
             state.reset(&self.device.stream)?;
             state.clear_dsa(&self.device.stream)?;
         }

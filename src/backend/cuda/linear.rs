@@ -962,6 +962,10 @@ impl NativeProjection {
         })
     }
 
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        self._keepalive.0.len() + self._keepalive.1.len() * std::mem::size_of::<f32>()
+    }
+
     pub(crate) fn run(
         &self,
         ops: &Fp8Ops,

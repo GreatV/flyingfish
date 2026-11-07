@@ -1318,8 +1318,7 @@ impl StateCheckpoint {
         stream.memcpy_dtod(&self.token, token)?;
         Ok(())
     }
-    #[cfg(test)]
-    pub(super) fn select_prefix(
+    pub(crate) fn select_prefix(
         &self,
         store: &mut StateStore,
         prefixes: &[GdnState],
@@ -1365,6 +1364,74 @@ impl StateCheckpoint {
                     }
                 }
             }
+            for (saved, state) in self.dsa.iter().zip(&mut store.dsa) {
+                if accepted == 0 {
+                    stream.memcpy_dtod(&saved.latent, &mut state.latent)?;
+                    stream.memcpy_dtod(&saved.packed, &mut state.packed)?;
+                    stream.memcpy_dtod(&saved.pool_keys, &mut state.pool_keys)?;
+                    stream.memcpy_dtod(&saved.token_ids, &mut state.token_ids)?;
+                    stream.memcpy_dtod(&saved.pool_ids, &mut state.pool_ids)?;
+                    stream.memcpy_dtod(&saved.meta, &mut state.meta)?;
+                } else {
+                    let spec = state.spec();
+                    let trunc = crate::mtp::glm_mtp_dsa_truncation(
+                        spec,
+                        self.capacity,
+                        self.prefix,
+                        self.active_rows,
+                        accepted,
+                    )?;
+                    let latent_dim = spec.latent_dim as usize;
+                    let packed_width = spec.packed_width() as usize;
+                    let index_dim = spec.index_dim as usize;
+                    for &slot in &trunc.restore_slots {
+                        stream.memcpy_dtod(
+                            &saved
+                                .latent
+                                .slice(slot * latent_dim..(slot + 1) * latent_dim),
+                            &mut state
+                                .latent
+                                .slice_mut(slot * latent_dim..(slot + 1) * latent_dim),
+                        )?;
+                        stream.memcpy_dtod(
+                            &saved
+                                .packed
+                                .slice(slot * packed_width..(slot + 1) * packed_width),
+                            &mut state
+                                .packed
+                                .slice_mut(slot * packed_width..(slot + 1) * packed_width),
+                        )?;
+                        stream.memcpy_dtod(
+                            &saved.token_ids.slice(slot..slot + 1),
+                            &mut state.token_ids.slice_mut(slot..slot + 1),
+                        )?;
+                    }
+                    if let Some(out) = trunc.incomplete_pool {
+                        stream
+                            .memcpy_htod(&[-1i32], &mut state.pool_ids.slice_mut(out..out + 1))?;
+                        stream.memset_zeros(
+                            &mut state
+                                .pool_keys
+                                .slice_mut(out * index_dim..(out + 1) * index_dim),
+                        )?;
+                    }
+                    for &out in &trunc.restore_pools {
+                        stream.memcpy_dtod(
+                            &saved.pool_ids.slice(out..out + 1),
+                            &mut state.pool_ids.slice_mut(out..out + 1),
+                        )?;
+                        stream.memcpy_dtod(
+                            &saved
+                                .pool_keys
+                                .slice(out * index_dim..(out + 1) * index_dim),
+                            &mut state
+                                .pool_keys
+                                .slice_mut(out * index_dim..(out + 1) * index_dim),
+                        )?;
+                    }
+                    state.set_meta(stream, trunc.meta)?;
+                }
+            }
         }
         self.restore_kv_rows(store, accepted, self.active_rows, stream)
     }
@@ -1394,9 +1461,6 @@ impl StateCheckpoint {
                 stream.memcpy_dtod(&saved.token_ids, &mut state.token_ids)?;
                 stream.memcpy_dtod(&saved.pool_ids, &mut state.pool_ids)?;
                 stream.memcpy_dtod(&saved.meta, &mut state.meta)?;
-            }
-            if let (Some(saved), Some(seq)) = (&self.sequence, &mut store.sequence) {
-                stream.memcpy_dtod(saved, seq)?;
             }
         }
         self.restore_kv_rows(store, committed, verified_rows, stream)

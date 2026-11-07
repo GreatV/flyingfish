@@ -65,6 +65,9 @@ impl DsaState {
             capacity,
         })
     }
+    pub(super) fn spec(&self) -> DsaSpec {
+        self.spec
+    }
     pub fn bytes(&self) -> usize {
         (self.latent.len() + self.packed.len() + self.pool_keys.len()) * 2
             + (self.token_ids.len() + self.pool_ids.len() + self.meta.len()) * 4

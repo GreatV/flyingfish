@@ -3588,13 +3588,6 @@ impl Engine {
                 )?
             } else if prefix_cache {
                 WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
-            } else if reserve_mtp && glm {
-                WeightCatalog::load_with_policy(
-                    dir,
-                    &model_spec,
-                    &device,
-                    crate::checkpoint::LoadPolicy::TextWithMtp,
-                )?
             } else {
                 WeightCatalog::load(dir, &model_spec, &device)?
             };
@@ -3682,6 +3675,21 @@ impl Engine {
         };
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
+        let route_handle_bytes = if glm {
+            crate::backend::cuda::moe::route::blas_handle_bytes(&device.ctx, s)?
+        } else {
+            0
+        };
+        #[cfg(feature = "cuda")]
+        let glm_mtp_bytes = if reserve_mtp && glm {
+            crate::mtp::glm_attachment_bytes(&model_spec, capacity, verify_rows)?
+                .checked_add(route_handle_bytes)
+                .context("GLM MTP handle reservation overflow")?
+        } else {
+            0
+        };
+        #[cfg(feature = "rocm")]
+        let glm_mtp_bytes = 0usize;
         let mtp_budget = (reserve_mtp && !glm)
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
@@ -3698,6 +3706,7 @@ impl Engine {
                 .context("combined row bytes overflow")?,
             fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                .and_then(|bytes| bytes.checked_add(glm_mtp_bytes))
                 .and_then(|bytes| bytes.checked_add(target_transaction_bytes))
                 .and_then(|bytes| bytes.checked_add(target_head_bytes))
                 .and_then(|bytes| bytes.checked_add(media_bytes))
@@ -3725,8 +3734,6 @@ impl Engine {
             None
         };
         let native_budget = if glm {
-            let route_handle_bytes =
-                crate::backend::cuda::moe::route::blas_handle_bytes(&device.ctx, s)?;
             let layers = crate::experts::catalogue::ExpertGeometry::from_model(&model_spec)?.layers;
             let native_request = crate::prefill::WorkspaceRequest {
                 capacity: capacity.min(crate::linear_plan::MAX_SKINNY_ROWS),
@@ -3980,7 +3987,7 @@ impl Engine {
             "{}",
             serde_json::json!({
                 "q38_memory_plan": budget,
-                "mtp_attachment_planned_bytes": if reserve_mtp && !glm { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { 0 },
+                "mtp_attachment_planned_bytes": if reserve_mtp && !glm { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { glm_mtp_bytes },
                 "resident_weights_bytes": weights.bytes,
                 "prefix_cache": {
                     "enabled": prefix_cache,
@@ -4209,6 +4216,7 @@ impl Engine {
                 manifest,
                 dir,
                 rows as u32,
+                glm_mtp_bytes,
             )?;
             engine.moe_slots = Some(slots);
             engine.chunk = engine.chunk.min(admitted_rows as usize);

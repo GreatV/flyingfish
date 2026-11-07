@@ -2184,6 +2184,382 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
+fn state_store_bytes(
+    store: &StateStore,
+    stream: &Arc<crate::backend::gpu::CudaStream>,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for state in &store.gdn {
+        for v in stream.clone_dtoh(&state.s)? {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in stream.clone_dtoh(&state.history)? {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for state in &store.dsa {
+        for buffer in [&state.latent, &state.packed, &state.pool_keys] {
+            for v in stream.clone_dtoh(buffer)? {
+                bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+        for buffer in [&state.token_ids, &state.pool_ids, &state.meta] {
+            for v in stream.clone_dtoh(buffer)? {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    if let Some(seq) = &store.sequence {
+        for v in stream.clone_dtoh(seq)? {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "cuda")]
+fn mtp_persistent_state_bytes(engine: &Engine) -> Result<Vec<u8>> {
+    let stream = &engine.device.stream;
+    let mut bytes = state_store_bytes(&engine.state, stream)?;
+    if let Some(mtp_state) = &engine.mtp_state {
+        bytes.extend_from_slice(&state_store_bytes(mtp_state, stream)?);
+    }
+    bytes.extend_from_slice(&(engine.position as u64).to_le_bytes());
+    bytes.extend_from_slice(&engine.pending_token.unwrap_or(u32::MAX).to_le_bytes());
+    bytes.extend_from_slice(&(engine.resident_ids_len as u64).to_le_bytes());
+    for &id in &engine.committed_prefix_ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    for v in stream.clone_dtoh(&engine.work.position)? {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in stream.clone_dtoh(&engine.work.length)? {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in stream.clone_dtoh(&engine.work.token)? {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let vocab = engine.model_spec.vocab as usize;
+    for v in &stream.clone_dtoh(&engine.work.x)?[..4096] {
+        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for v in &stream.clone_dtoh(&engine.work.n)?[..4096] {
+        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for v in &stream.clone_dtoh(&engine.work.logits)?[..vocab] {
+        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "cuda")]
+fn verify_select_prefix_kernel_oracle() -> Result<()> {
+    use crate::backend::cuda::contracts::{Scratch, TensorMut, view};
+    use crate::backend::cuda::dsa::{DsaAppendInput, DsaIndexInput, DsaPlan};
+    use crate::backend::cuda::gdn::{
+        GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
+    };
+    use crate::backend::cuda::state::{GdnState, StateCheckpoint};
+    use crate::backend::gpu::DevicePtr;
+    use crate::gdn_plan::GdnPolicy;
+    use crate::op_contract::{DsaSpec, GdnSpec};
+
+    let device = Device::new(0)?;
+    let stream = &device.stream;
+    let root_cfg: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/glm53-flash-config.json"
+    )))?;
+    let mut mini_spec = crate::model_spec::ModelSpec::glm5_next(
+        &root_cfg,
+        &serde_json::json!({"eos_token_id": [154820, 154827, 154829]}),
+    )?;
+    mini_spec.layers = vec![mini_spec.layers[0].clone(), mini_spec.layers[3].clone()];
+    mini_spec.layers[0].state_index = 0;
+    mini_spec.layers[1].state_index = 0;
+
+    let cap = 64usize;
+    let gdn_spec = GdnSpec::from_model(&mini_spec)?;
+    let dsa_spec = DsaSpec::from_model(&mini_spec)?;
+    let cd = gdn_spec.conv_dim()? as usize;
+    let mut store_1row = StateStore::new(&mini_spec, cap, stream)?;
+    let mut store_2row = StateStore::new(&mini_spec, cap, stream)?;
+    let mut ckpt = StateCheckpoint::new(&store_2row, &mini_spec, 2, stream)?;
+    let tok_buf = stream.alloc_zeros::<u32>(1)?;
+    let snap = vec![GdnState {
+        s: stream.alloc_zeros(store_2row.gdn[0].s.len())?,
+        history: stream.alloc_zeros(store_2row.gdn[0].history.len())?,
+    }];
+
+    let pat_bf16 = |n: usize, period: usize, mul: usize, div: f32| -> Vec<bf16> {
+        (0..n)
+            .map(|i| {
+                bf16::from_f32(
+                    ((i * mul + 17) % period) as f32 / div - (period / 2) as f32 / (2.0 * div),
+                )
+            })
+            .collect()
+    };
+    let qkv_all = pat_bf16(5 * cd, 1009, 37, 256.0);
+    let a_all = pat_bf16(5 * (gdn_spec.hv * gdn_spec.dk) as usize, 509, 19, 128.0);
+    let b_all = pat_bf16(5 * gdn_spec.hv as usize, 251, 13, 128.0);
+    let q_conv_w =
+        stream.clone_htod(&pat_bf16((gdn_spec.hk * 128 * 4) as usize, 127, 11, 256.0))?;
+    let k_conv_w =
+        stream.clone_htod(&pat_bf16((gdn_spec.hk * 128 * 4) as usize, 131, 17, 256.0))?;
+    let v_conv_w =
+        stream.clone_htod(&pat_bf16((gdn_spec.hv * 128 * 4) as usize, 137, 23, 256.0))?;
+    let a_log = stream.clone_htod(
+        &(0..gdn_spec.hv as usize)
+            .map(|i| 0.25f32 + (i % 11) as f32 * 0.05)
+            .collect::<Vec<_>>(),
+    )?;
+    let dt_bias = stream.clone_htod(
+        &(0..(gdn_spec.hv * gdn_spec.dk) as usize)
+            .map(|i| ((i * 7 + 3) % 29) as f32 * 0.01 - 0.14)
+            .collect::<Vec<_>>(),
+    )?;
+    let ws_bytes = GdnOps::workspace(&gdn_spec, 2, GdnPolicy::P2)?.bytes;
+    let gdn_scratch = stream.alloc_zeros::<u8>(usize::try_from(ws_bytes)?)?;
+    let qkv_buf = stream.alloc_zeros::<bf16>(2 * cd)?;
+    let a_buf = stream.alloc_zeros::<bf16>(2 * (gdn_spec.hv * gdn_spec.dk) as usize)?;
+    let b_buf = stream.alloc_zeros::<bf16>(2 * gdn_spec.hv as usize)?;
+    let out_buf = stream.alloc_zeros::<bf16>(2 * (gdn_spec.hv * gdn_spec.dv) as usize)?;
+
+    let make_gdn_plan = |store: &StateStore,
+                         qkv_in: &cudarc::driver::CudaSlice<bf16>,
+                         a_in: &cudarc::driver::CudaSlice<bf16>,
+                         b_in: &cudarc::driver::CudaSlice<bf16>,
+                         rows: u32,
+                         with_snap: bool|
+     -> Result<_> {
+        let base = GdnOps::prepare(
+            &device.ctx,
+            &gdn_spec,
+            2,
+            GdnBindings {
+                qkv: view(qkv_in, stream, 0, [2, cd as u32], [cd as u64, 1])?,
+                a: GdnGateInput::PerChannel(view(
+                    a_in,
+                    stream,
+                    0,
+                    [2, gdn_spec.hv, 128],
+                    [u64::from(gdn_spec.hv * 128), 128, 1],
+                )?),
+                b: view(
+                    b_in,
+                    stream,
+                    0,
+                    [2, gdn_spec.hv],
+                    [u64::from(gdn_spec.hv), 1],
+                )?,
+                conv_weight: GdnConvWeights::Separate([
+                    view(&q_conv_w, stream, 0, [gdn_spec.hk * 128, 4], [4, 1])?,
+                    view(&k_conv_w, stream, 0, [gdn_spec.hk * 128, 4], [4, 1])?,
+                    view(&v_conv_w, stream, 0, [gdn_spec.hv * 128, 4], [4, 1])?,
+                ]),
+                decay: GdnDecayWeights::F32 {
+                    a_log: view(&a_log, stream, 0, [gdn_spec.hv], [1])?,
+                    dt_bias: view(&dt_bias, stream, 0, [gdn_spec.hv * 128], [1])?,
+                },
+                core_out: TensorMut(view(
+                    &out_buf,
+                    stream,
+                    0,
+                    [2, gdn_spec.hv, 128],
+                    [u64::from(gdn_spec.hv * 128), 128, 1],
+                )?),
+                s: TensorMut(view(
+                    &store.gdn[0].s,
+                    stream,
+                    0,
+                    [gdn_spec.hv, 128, 128],
+                    [128 * 128, 128, 1],
+                )?),
+                history: TensorMut(view(
+                    &store.gdn[0].history,
+                    stream,
+                    0,
+                    [cd as u32, 3],
+                    [3, 1],
+                )?),
+            },
+            false,
+        )?;
+        let snap_views = if with_snap {
+            Some((
+                view(
+                    &snap[0].s,
+                    stream,
+                    0,
+                    [1, gdn_spec.hv, 128, 128],
+                    [u64::from(gdn_spec.hv * 128 * 128), 128 * 128, 128, 1],
+                )?,
+                view(
+                    &snap[0].history,
+                    stream,
+                    0,
+                    [1, cd as u32, 3],
+                    [cd as u64 * 3, 3, 1],
+                )?,
+            ))
+        } else {
+            None
+        };
+        base.for_rows(rows, snap_views)
+    };
+
+    let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, cap as u32, 2)?;
+    let dsa_1 = dsa_plan.for_rows(1)?;
+    let dsa_2 = dsa_plan.for_rows(2)?;
+    let latent_all = pat_bf16(5 * 512, 509, 29, 256.0);
+    let mut packed_all = pat_bf16(5 * 257, 251, 17, 128.0);
+    for t in 0..5 {
+        packed_all[t * 257 + 256] = bf16::from_f32(1.0);
+    }
+    let latent_buf = stream.alloc_zeros::<bf16>(2 * 512)?;
+    let packed_buf = stream.alloc_zeros::<bf16>(2 * 257)?;
+    let dsa_q = stream.clone_htod(&pat_bf16(2 * 32 * 128, 1031, 23, 512.0))?;
+    let dsa_w = stream.clone_htod(&pat_bf16(2 * 32, 127, 19, 128.0))?;
+    let dsa_ape = stream.clone_htod(&pat_bf16(4 * 128, 509, 17, 256.0))?;
+
+    struct OracleInputBufs {
+        qkv: cudarc::driver::CudaSlice<bf16>,
+        a: cudarc::driver::CudaSlice<bf16>,
+        b: cudarc::driver::CudaSlice<bf16>,
+        latent: cudarc::driver::CudaSlice<bf16>,
+        packed: cudarc::driver::CudaSlice<bf16>,
+    }
+    let mut bufs = OracleInputBufs {
+        qkv: qkv_buf,
+        a: a_buf,
+        b: b_buf,
+        latent: latent_buf,
+        packed: packed_buf,
+    };
+
+    let load_rows = |start: usize, rows: usize, dst: &mut OracleInputBufs| -> Result<()> {
+        let a_w = (gdn_spec.hv * gdn_spec.dk) as usize;
+        let b_w = gdn_spec.hv as usize;
+        stream.memcpy_htod(
+            &qkv_all[start * cd..(start + rows) * cd],
+            &mut dst.qkv.slice_mut(..rows * cd),
+        )?;
+        stream.memcpy_htod(
+            &a_all[start * a_w..(start + rows) * a_w],
+            &mut dst.a.slice_mut(..rows * a_w),
+        )?;
+        stream.memcpy_htod(
+            &b_all[start * b_w..(start + rows) * b_w],
+            &mut dst.b.slice_mut(..rows * b_w),
+        )?;
+        stream.memcpy_htod(
+            &latent_all[start * 512..(start + rows) * 512],
+            &mut dst.latent.slice_mut(..rows * 512),
+        )?;
+        stream.memcpy_htod(
+            &packed_all[start * 257..(start + rows) * 257],
+            &mut dst.packed.slice_mut(..rows * 257),
+        )?;
+        Ok(())
+    };
+    let scratch_view = || Scratch {
+        ptr: gdn_scratch.device_ptr(stream).0,
+        bytes: ws_bytes,
+    };
+
+    // Seed prefix = 2 identically on both stores.
+    load_rows(0, 2, &mut bufs)?;
+    for store in [&mut store_1row, &mut store_2row] {
+        store.set_sequence(stream, 0, 2, 8)?;
+        let gdn_seed = make_gdn_plan(store, &bufs.qkv, &bufs.a, &bufs.b, 2, false)?;
+        let meta = store.seq_ref(stream)?;
+        GdnOps::run_verify(&gdn_seed, stream, meta, scratch_view())?;
+        dsa_2.append(
+            &store.dsa[0],
+            &DsaAppendInput {
+                latent: view(&bufs.latent, stream, 0, [2, 512], [512, 1])?,
+                packed: view(&bufs.packed, stream, 0, [2, 257], [257, 1])?,
+            },
+            stream,
+        )?;
+        dsa_2.pool(
+            &store.dsa[0],
+            &DsaIndexInput {
+                q: view(&dsa_q, stream, 0, [2, 32, 128], [32 * 128, 128, 1])?,
+                weights: view(&dsa_w, stream, 0, [2, 32], [32, 1])?,
+                ape: view(&dsa_ape, stream, 0, [4, 128], [128, 1])?,
+            },
+            stream,
+        )?;
+        store.set_sequence(stream, 2, 1, 8)?;
+    }
+
+    // Test both prefix = 2 (incomplete pool 0) and prefix = 3 (completed pool 0 + overrun pool 1).
+    for prefix in [2usize, 3usize] {
+        load_rows(prefix, 1, &mut bufs)?;
+        store_1row.set_sequence(stream, prefix as u32, 1, 8)?;
+        let gdn_1 = make_gdn_plan(&store_1row, &bufs.qkv, &bufs.a, &bufs.b, 1, false)?;
+        let meta_1 = store_1row.seq_ref(stream)?;
+        GdnOps::run_verify(&gdn_1, stream, meta_1, scratch_view())?;
+        dsa_1.append(
+            &store_1row.dsa[0],
+            &DsaAppendInput {
+                latent: view(&bufs.latent, stream, 0, [1, 512], [512, 1])?,
+                packed: view(&bufs.packed, stream, 0, [1, 257], [257, 1])?,
+            },
+            stream,
+        )?;
+        dsa_1.pool(
+            &store_1row.dsa[0],
+            &DsaIndexInput {
+                q: view(&dsa_q, stream, 0, [1, 32, 128], [32 * 128, 128, 1])?,
+                weights: view(&dsa_w, stream, 0, [1, 32], [32, 1])?,
+                ape: view(&dsa_ape, stream, 0, [4, 128], [128, 1])?,
+            },
+            stream,
+        )?;
+        store_1row.set_sequence(stream, (prefix + 1) as u32, 1, 8)?;
+
+        ckpt.save_rows(&store_2row, &tok_buf, prefix, 2, stream, None)?;
+        load_rows(prefix, 2, &mut bufs)?;
+        store_2row.set_sequence(stream, prefix as u32, 2, 8)?;
+        let gdn_2 = make_gdn_plan(&store_2row, &bufs.qkv, &bufs.a, &bufs.b, 2, true)?;
+        let meta_2 = store_2row.seq_ref(stream)?;
+        GdnOps::run_verify(&gdn_2, stream, meta_2, scratch_view())?;
+        dsa_2.append(
+            &store_2row.dsa[0],
+            &DsaAppendInput {
+                latent: view(&bufs.latent, stream, 0, [2, 512], [512, 1])?,
+                packed: view(&bufs.packed, stream, 0, [2, 257], [257, 1])?,
+            },
+            stream,
+        )?;
+        dsa_2.pool(
+            &store_2row.dsa[0],
+            &DsaIndexInput {
+                q: view(&dsa_q, stream, 0, [2, 32, 128], [32 * 128, 128, 1])?,
+                weights: view(&dsa_w, stream, 0, [2, 32], [32, 1])?,
+                ape: view(&dsa_ape, stream, 0, [4, 128], [128, 1])?,
+            },
+            stream,
+        )?;
+        ckpt.select_prefix(&mut store_2row, &snap, 1, stream)?;
+        store_2row.set_sequence(stream, (prefix + 1) as u32, 1, 8)?;
+
+        let expected = state_store_bytes(&store_1row, stream)?;
+        let actual = state_store_bytes(&store_2row, stream)?;
+        let diffs = expected.iter().zip(&actual).filter(|(a, b)| a != b).count();
+        ensure!(
+            diffs == 0,
+            "DEFECT select_prefix(1) kernel oracle differed from 1-row execution at prefix={prefix}: {diffs} byte diffs"
+        );
+    }
+    stream.synchronize()?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "GPU GLM-5.3-Flash rollback transaction gate (G-MTP3)"]
 fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
@@ -2191,6 +2567,10 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window required"
     );
+    // 1. Direct 1-row vs 2-row + select_prefix(1) bitwise oracle across incomplete & completed DSA pools.
+    verify_select_prefix_kernel_oracle()?;
+
+    // 2. End-to-end 45-layer + Layer-45 prefix-1 rejection commit invariance across start_pos = 2 and 3.
     let mut engine = load_composition_engine()?;
     let root =
         PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
@@ -2203,77 +2583,99 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
         graph: true,
     };
     engine.mtp_enable(mtp_options)?;
+    let vocab = engine.model_spec.vocab;
 
-    // 1. Single-step eager decode baseline with committed pos=0 Layer-45 entry
-    engine.reset()?;
-    let t0 = engine.prefill(&reference.tokens[..1], None)?;
-    {
-        let mut chain = engine.mtp.take().context("MTP missing")?;
-        let glm_runtime = chain
-            .glm_runtime
-            .as_mut()
-            .context("GLM MTP runtime missing")?;
-        let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
-        let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
-        let shared = GlmMtpShared {
-            blas: &engine.blas,
-            embedding: engine.weights.embedding(),
-            head: &engine.weights.head,
-        };
-        glm_runtime.commit_kv_device(t0, &engine.work.n, 0, shared, dsa_state, 0)?;
-        engine.mtp = Some(chain);
-    }
-    let expected_t1 = engine.decode(false, None)?;
-    let baseline_state = graph_native_state(&engine, true)?;
+    let run_two_rejected_rounds = |engine: &mut Engine,
+                                   xor_mask: u32,
+                                   add_off: u32|
+     -> Result<(u32, u32, Vec<u8>, Vec<u8>)> {
+        let first = engine.mtp_prefill(&reference.tokens[..2])?;
+        let p1 = (first.wrapping_add(add_off) ^ xor_mask) % vocab;
+        if let Some(chain) = engine.mtp.as_mut() {
+            chain.force_proposals = Some(vec![p1]);
+        }
+        let out1 = engine.glm_mtp_round(false)?;
+        ensure!(
+            out1.round.accepted == 0 && out1.replay_row0_logits.is_none(),
+            "DEFECT round 1 expected prefix-1 rejection without replay"
+        );
+        let pool_ids_1 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].pool_ids)?;
+        let tok_ids_1 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].token_ids)?;
+        ensure!(
+            pool_ids_1[0] == -1 && tok_ids_1[3] == 0,
+            "DEFECT round 1 incomplete pool rollback mismatch: pool_ids[0]={} token_ids[3]={}",
+            pool_ids_1[0],
+            tok_ids_1[3]
+        );
+        let snap1 = mtp_persistent_state_bytes(engine)?;
+        let t1 = out1.round.tokens[0];
 
-    // 2. Reset engine and run MTP round with planted corrupt draft token to force rejection
-    engine.reset()?;
-    let t0_replay = engine.prefill(&reference.tokens[..1], None)?;
-    ensure!(t0_replay == t0, "prefill determinism failure");
+        let mut p2 = (t1.wrapping_add(add_off) ^ xor_mask) % vocab;
+        if p2 == 0 {
+            p2 = 7;
+        }
+        if let Some(chain) = engine.mtp.as_mut() {
+            chain.force_proposals = Some(vec![p2]);
+        }
+        let out2 = engine.glm_mtp_round(false)?;
+        ensure!(
+            out2.round.accepted == 0 && out2.replay_row0_logits.is_none(),
+            "DEFECT round 2 expected prefix-1 rejection without replay"
+        );
+        let pool_ids_2 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].pool_ids)?;
+        let tok_ids_2 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].token_ids)?;
+        ensure!(
+            pool_ids_2[0] == 3 && pool_ids_2[1] == 0 && tok_ids_2[4] == 0,
+            "DEFECT round 2 completed-pool boundary rollback mismatch: pool_ids[0]={} pool_ids[1]={} token_ids[4]={}",
+            pool_ids_2[0],
+            pool_ids_2[1],
+            tok_ids_2[4]
+        );
+        let snap2 = mtp_persistent_state_bytes(engine)?;
+        Ok((t1, out2.round.tokens[0], snap1, snap2))
+    };
 
-    let corrupt_proposal = expected_t1 ^ 0x5a5a;
-    ensure!(corrupt_proposal != expected_t1, "proposal collision");
-    if let Some(chain) = engine.mtp.as_mut() {
-        chain.force_proposals = Some(vec![corrupt_proposal]);
-    }
-
-    let out = engine.glm_mtp_round(false)?;
+    let (t1_a, t2_a, state_a1, state_a2) = run_two_rejected_rounds(&mut engine, 0x5a5a, 17)?;
+    let (t1_b, t2_b, state_b1, state_b2) = run_two_rejected_rounds(&mut engine, 0x33cc, 1337)?;
     ensure!(
-        out.round.accepted == 0,
-        "DEFECT expected rejection on corrupt proposal"
+        t1_a == t1_b && t2_a == t2_b,
+        "DEFECT prefix-1 committed tokens differed across rejected proposals: ({t1_a},{t2_a}) vs ({t1_b},{t2_b})"
     );
-    ensure!(
-        out.round.tokens.len() == 1,
-        "DEFECT expected 1 token emitted on rejection"
-    );
-    ensure!(
-        out.round.tokens[0] == expected_t1,
-        "DEFECT replay token mismatch: expected {expected_t1}, got {}",
-        out.round.tokens[0]
-    );
-
-    // 3. Verify post-reject engine state matches baseline single-step eager decode
-    let post_reject_state = graph_native_state(&engine, true)?;
-    let rollback_diffs = baseline_state
+    let diffs_r1 = state_a1
         .iter()
-        .zip(&post_reject_state)
+        .zip(&state_b1)
+        .filter(|(a, b)| a != b)
+        .count();
+    let diffs_r2 = state_a2
+        .iter()
+        .zip(&state_b2)
         .filter(|(a, b)| a != b)
         .count();
     ensure!(
-        rollback_diffs == 0,
-        "DEFECT post-reject state differed from single-step eager decode: {rollback_diffs} byte diffs"
+        diffs_r1 == 0 && diffs_r2 == 0,
+        "DEFECT post-reject persistent state differed across proposals: r1={diffs_r1} r2={diffs_r2}"
     );
 
-    // 4. Negative controls:
-    // 4a. Mutant skipping GDN history rollback
-    let stream = &engine.device.stream;
+    // 3. Negative controls:
+    let stream = engine.device.stream.clone();
     let mut mutant_gdn_history = stream.clone_dtoh(&engine.state.gdn[0].history)?;
     mutant_gdn_history[0] += 1.0;
     stream.memcpy_htod(&mutant_gdn_history, &mut engine.state.gdn[0].history)?;
-    let mutant_gdn_state = graph_native_state(&engine, true)?;
-    let mutant_gdn_diffs = baseline_state
+    let mutant_gdn_diffs = state_a2
         .iter()
-        .zip(&mutant_gdn_state)
+        .zip(&mtp_persistent_state_bytes(&engine)?)
         .filter(|(a, b)| a != b)
         .count();
     ensure!(
@@ -2283,15 +2685,30 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
     mutant_gdn_history[0] -= 1.0;
     stream.memcpy_htod(&mutant_gdn_history, &mut engine.state.gdn[0].history)?;
 
-    // 4b. Mutant skipping Layer 45 speculative-slot rollback
-    let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
-    let mut mutant_layer45 = stream.clone_dtoh(&mtp_state.dsa[0].latent)?;
-    mutant_layer45[512] = bf16::from_f32(mutant_layer45[512].to_f32() + 1.0);
-    stream.memcpy_htod(&mutant_layer45, &mut mtp_state.dsa[0].latent)?;
-    let mutant_l45_state = graph_native_state(&engine, true)?;
-    let mutant_l45_diffs = baseline_state
+    let mut mutant_dsa_pools = stream.clone_dtoh(&engine.state.dsa[0].pool_ids)?;
+    mutant_dsa_pools[1] = -1;
+    stream.memcpy_htod(&mutant_dsa_pools, &mut engine.state.dsa[0].pool_ids)?;
+    let mutant_dsa_diffs = state_a2
         .iter()
-        .zip(&mutant_l45_state)
+        .zip(&mtp_persistent_state_bytes(&engine)?)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        mutant_dsa_diffs > 0,
+        "Runner FAIL planted target DSA pool rollback mutant escaped"
+    );
+    mutant_dsa_pools[1] = 0;
+    stream.memcpy_htod(&mutant_dsa_pools, &mut engine.state.dsa[0].pool_ids)?;
+
+    {
+        let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
+        let mut mutant_layer45 = stream.clone_dtoh(&mtp_state.dsa[0].latent)?;
+        mutant_layer45[4 * 512] = bf16::from_f32(mutant_layer45[4 * 512].to_f32() + 1.0);
+        stream.memcpy_htod(&mutant_layer45, &mut mtp_state.dsa[0].latent)?;
+    }
+    let mutant_l45_diffs = state_a2
+        .iter()
+        .zip(&mtp_persistent_state_bytes(&engine)?)
         .filter(|(a, b)| a != b)
         .count();
     ensure!(
@@ -2300,8 +2717,7 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
     );
 
     println!(
-        "PASS GLM_MTP_ROLLBACK different_bits=0 mutant_gdn_detected=true mutant_layer45_detected=true expected_token={expected_t1} replay_token={}",
-        out.round.tokens[0]
+        "PASS GLM_MTP_ROLLBACK different_bits=0 kernel_oracle_bits=0 replay_passes=0 mutant_gdn_detected=true mutant_dsa_detected=true mutant_layer45_detected=true committed_tokens=[{t1_a},{t2_a}]"
     );
     Ok(())
 }
@@ -2426,8 +2842,27 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         &mut verify_compared_count,
         &mut verify_gated_count,
     );
+    let mut pos1_max_idx = 0usize;
+    let mut pos1_best_diff = -1.0f32;
+    for (idx, (&v, &r)) in out_pos1
+        .verify_row0_logits
+        .iter()
+        .zip(&ref_pos1_logits)
+        .enumerate()
+    {
+        let diff = (v - r).abs();
+        if diff > pos1_best_diff {
+            pos1_best_diff = diff;
+            pos1_max_idx = idx;
+        }
+    }
+    let pos1_verify_logit = out_pos1.verify_row0_logits[pos1_max_idx];
+    let pos1_ref_logit = ref_pos1_logits[pos1_max_idx];
+    let (pos1_verify_top1, pos1_verify_margin) =
+        super::mtp::top1_and_margin(&out_pos1.verify_row0_logits);
+    let (pos1_ref_top1, pos1_ref_margin) = super::mtp::top1_and_margin(&ref_pos1_logits);
     println!(
-        "GLM_MTP_GATED_POS pos={} max_abs={pos1_max_abs:.6} tau_max_abs={:.6} rmse={pos1_rmse:.6} tau_rmse={:.6}",
+        "GLM_MTP_GATED_POS pos={} max_abs={pos1_max_abs:.6} tau_max_abs={:.6} rmse={pos1_rmse:.6} tau_rmse={:.6} vocab_idx={pos1_max_idx} verify_logit={pos1_verify_logit:.6} ref_logit={pos1_ref_logit:.6} verify_top1={pos1_verify_top1} verify_margin={pos1_verify_margin:.6} ref_top1={pos1_ref_top1} ref_margin={pos1_ref_margin:.6}",
         out_pos1.start_pos,
         tau_max_abs_per_pos[out_pos1.start_pos],
         tau_rmse_per_pos[out_pos1.start_pos],
@@ -2463,6 +2898,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let mut sum_u = 0usize;
     let mut draft_staged_experts_sum = 0usize;
     let mut replay_1row_passes = 0usize;
+    let mut prefix1_commits = 0usize;
     let loop_start = std::time::Instant::now();
 
     while emitted_tokens.len() < 599
@@ -2497,26 +2933,14 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
             );
             std::io::Write::flush(&mut std::io::stdout())?;
         }
+        let did_replay = out.replay_row0_logits.is_some();
+        ensure!(
+            !did_replay,
+            "Runner FAIL unexpected target replay on rejection at pos={}",
+            out.start_pos
+        );
         if out.round.accepted > 0 {
             accepted_count += 1;
-        } else if let Some(replay_logits) = &out.replay_row0_logits {
-            let p = out.start_pos;
-            let (replay_top0, _) = super::mtp::top1_and_margin(replay_logits);
-            let (v0_top, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
-            if replay_top0 != v0_top {
-                defects.push(format!(
-                    "DEFECT replayed token {replay_top0} differs from verify argmax {v0_top} at pos={p}"
-                ));
-            }
-            check_verify_row0(
-                p,
-                &out.verify_row0_logits,
-                replay_logits,
-                "verify row0 replay",
-                &mut defects,
-                &mut verify_compared_count,
-                &mut verify_gated_count,
-            );
         }
 
         // Verify emitted tokens match argmax of verify rows
@@ -2546,15 +2970,19 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         sum_u += out.expert_union_count;
         draft_staged_experts_sum += out.draft_staged_experts;
         if out.round.accepted == 0 {
-            replay_1row_passes += 1;
+            if did_replay {
+                replay_1row_passes += 1;
+            } else {
+                prefix1_commits += 1;
+            }
         }
         let b_verify =
             w_target_dense + (out.expert_union_count as u64 * expert_slot_bytes) + b_head;
         sum_b_verify += b_verify;
-        let b_round = if out.round.accepted > 0 {
-            b_draft + b_verify
-        } else {
+        let b_round = if did_replay {
             b_draft + b_verify + b_step1
+        } else {
+            b_draft + b_verify
         };
         total_bytes_moved += b_round;
 
@@ -2581,7 +3009,12 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let alpha = accepted_count as f64 / total_rounds as f64;
     let mean_b_verify = sum_b_verify as f64 / total_rounds as f64;
     let mean_u = sum_u as f64 / total_rounds as f64;
-    let alpha_star = (b_draft as f64 + mean_b_verify) / (2.0 * b_step1 as f64);
+    let alpha_star = crate::mtp::glm_mtp_break_even_alpha(
+        b_draft,
+        mean_b_verify,
+        b_step1,
+        replay_1row_passes > 0,
+    );
     let baseline_bytes = (emitted_tokens.len() - 1) as u64 * b_step1;
     let efficiency_ratio = total_bytes_moved as f64 / baseline_bytes as f64;
     let mean_margin = sum_margin / margin_count as f32;
@@ -2595,8 +3028,9 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let replay_experts_sum = replay_1row_passes * 336;
     let target_layer_passes = (total_rounds + replay_1row_passes) * 45;
     let head_rows_projected = total_rounds * 3 + replay_1row_passes;
+    let checkpoint_restores = total_rounds - accepted_count;
     println!(
-        "GLM_MTP_OP_COUNTS draft_passes={total_rounds} draft_htod_experts={draft_staged_experts_sum} accept_kv_commits={accepted_count} verify_2row_passes={total_rounds} verify_union_experts={sum_u} replay_1row_passes={replay_1row_passes} replay_htod_experts={replay_experts_sum} target_layer_passes={target_layer_passes} head_rows={head_rows_projected} checkpoint_saves={total_rounds} checkpoint_restores={replay_1row_passes}"
+        "GLM_MTP_OP_COUNTS draft_passes={total_rounds} draft_htod_experts={draft_staged_experts_sum} accept_kv_commits={accepted_count} verify_2row_passes={total_rounds} verify_union_experts={sum_u} replay_1row_passes={replay_1row_passes} replay_htod_experts={replay_experts_sum} prefix1_commits={prefix1_commits} target_layer_passes={target_layer_passes} head_rows={head_rows_projected} checkpoint_saves={total_rounds} checkpoint_restores={checkpoint_restores}"
     );
     let status = if defects.is_empty() { "PASS" } else { "DEFECT" };
     println!(

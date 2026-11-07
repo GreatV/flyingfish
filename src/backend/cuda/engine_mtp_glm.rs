@@ -785,6 +785,86 @@ impl GlmMtpRuntime {
         })
     }
 
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        let bf16_elems = self.enorm_w.len()
+            + self.hnorm_w.len()
+            + self.eh_proj_w.len()
+            + self.input_norm_w.len()
+            + self.kv_a_w.len()
+            + self.kv_a_norm_w.len()
+            + self.kv_b_w.len()
+            + self.q_a_w.len()
+            + self.q_a_norm_w.len()
+            + self.q_b_w.len()
+            + self.o_w.len()
+            + self.post_norm_w.len()
+            + self._router_w.len()
+            + self.head_norm_w.len()
+            + self._standalone_embed.as_ref().map_or(0, CudaSlice::len)
+            + self.standalone_head.as_ref().map_or(0, CudaSlice::len)
+            + self.token_embed_buf.len()
+            + self.enorm_buf.len()
+            + self.target_hidden_buf.len()
+            + self.hnorm_buf.len()
+            + self.eh_buf.len()
+            + self.x_buf.len()
+            + self.x_init_buf.len()
+            + self.x_norm_buf.len()
+            + self.x_norm1_buf.len()
+            + self.x_curr_buf.len()
+            + self.kv_a_buf.len()
+            + self.kv_latent_buf.len()
+            + self.q_a_buf.len()
+            + self.q_a_norm_buf.len()
+            + self.q_b_buf.len()
+            + self.attn_out_buf.len()
+            + self.o_buf.len()
+            + self.moe_out_buf.len()
+            + self.head_norm_buf.len();
+        let u8_elems = self._sh_gate_codes.len()
+            + self._sh_up_codes.len()
+            + self._sh_down_codes.len()
+            + self
+                .slot_gate_codes
+                .iter()
+                .map(CudaSlice::len)
+                .sum::<usize>()
+            + self.slot_up_codes.iter().map(CudaSlice::len).sum::<usize>()
+            + self
+                .slot_down_codes
+                .iter()
+                .map(CudaSlice::len)
+                .sum::<usize>();
+        let f32_elems = self._router_b.len()
+            + self._sh_gate_scales.len()
+            + self._sh_up_scales.len()
+            + self._sh_down_scales.len()
+            + self
+                .slot_gate_scales
+                .iter()
+                .map(CudaSlice::len)
+                .sum::<usize>()
+            + self
+                .slot_up_scales
+                .iter()
+                .map(CudaSlice::len)
+                .sum::<usize>()
+            + self
+                .slot_down_scales
+                .iter()
+                .map(CudaSlice::len)
+                .sum::<usize>()
+            + self.logits_buf.len();
+        self.native_moe.allocation_bytes()
+            + bf16_elems * std::mem::size_of::<bf16>()
+            + u8_elems
+            + f32_elems * std::mem::size_of::<f32>()
+            + self.slots_buf.len() * std::mem::size_of::<u64>()
+            + self.valid_buf.len() * std::mem::size_of::<u32>()
+            + self.dsa_indices_buf.len() * std::mem::size_of::<i32>()
+            + self._standalone_dsa.as_ref().map_or(0, DsaState::bytes)
+    }
+
     fn stage_routed_experts(&mut self, ids: &[i32]) -> Result<usize> {
         let stream = self.stream.clone();
         let mmap1 = &self._mmap1;
@@ -1234,7 +1314,7 @@ impl GlmMtpRuntime {
         Ok((logits, ids, weights))
     }
 
-    // Commits one validated (token, post_norm_hidden) pair at 0-based MTP cache index `pos` (candidate_generator.py:1430, 1468-1478; modeling_layers.py:345).
+    // Commits one validated (token, post_norm_hidden) pair at 0-based MTP cache index `pos` (model definition).
     pub(crate) fn commit_kv_device(
         &mut self,
         token: u32,

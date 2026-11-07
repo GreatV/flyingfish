@@ -1042,6 +1042,36 @@ mod native {
             })
         }
 
+        pub(crate) fn allocation_bytes(&self) -> usize {
+            let b = &self._buffers;
+            self.route.allocation_bytes()
+                + self
+                    .shared
+                    .iter()
+                    .map(super::super::super::linear::NativeProjection::allocation_bytes)
+                    .sum::<usize>()
+                + (b._logits.len()
+                    + b._route_weights.len()
+                    + b._scales.len()
+                    + b._down_scales.len())
+                    * std::mem::size_of::<f32>()
+                + (b._ids.len() + b._routed_meta.len() + b._shared_meta.len())
+                    * std::mem::size_of::<i32>()
+                + (b._done.len() + b._active.len()) * std::mem::size_of::<u32>()
+                + b._codes.len()
+                + b._down_codes.len()
+                + (b._gate.len()
+                    + b._up.len()
+                    + b._activation.len()
+                    + b._down.len()
+                    + b._contributions.len()
+                    + b._shared_gate.len()
+                    + b._shared_up.len()
+                    + b._shared_activation.len()
+                    + b._shared_out.len())
+                    * std::mem::size_of::<bf16>()
+        }
+
         fn project(&self, stream: &Arc<CudaStream>, projection: i32) -> Result<()> {
             let g = &self.geometry;
             let (n, k) = if projection == 2 {

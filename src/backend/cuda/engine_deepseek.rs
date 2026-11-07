@@ -3423,6 +3423,7 @@ impl Engine {
                 &manifest,
                 dir,
                 u32::try_from(workspace_rows)?,
+                0,
             )?;
             engine.moe_slots = Some(slots);
             engine.chunk = admitted_rows as usize;

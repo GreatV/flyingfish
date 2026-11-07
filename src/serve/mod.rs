@@ -517,29 +517,26 @@ fn produce_mtp_events(
     on_event: &mut dyn FnMut(EngineEvent) -> bool,
     mtp_rounds: &mut usize,
 ) -> Result<spec::Output> {
-    model.reset_mtp()?;
     let mut first = true;
     let graph = model.mtp_graph_mode();
-    let result = model.generate_mtp_reuse(ids, options, graph, &mut |token_ids, accepted| {
-        if first {
-            first = false;
-        } else {
-            *mtp_rounds += 1;
-        }
-        on_event(EngineEvent::Tokens {
-            ids: token_ids.to_vec(),
-            accepted,
+    model
+        .generate_mtp_reuse(ids, options, graph, &mut |token_ids, accepted| {
+            if first {
+                first = false;
+            } else {
+                *mtp_rounds += 1;
+            }
+            on_event(EngineEvent::Tokens {
+                ids: token_ids.to_vec(),
+                accepted,
+            })
         })
-    })?;
-    model.synchronize()?;
-    model.check_logits()?;
-    model.check_ready()?;
-    Ok(spec::Output {
-        ids: result.ids,
-        rounds: Vec::new(),
-        decode_ms: result.decode_ms,
-        prefill_ms: result.prefill_ms,
-    })
+        .map(|output| spec::Output {
+            ids: output.ids,
+            rounds: Vec::new(),
+            prefill_ms: output.prefill_ms,
+            decode_ms: output.decode_ms,
+        })
 }
 
 #[cfg(test)]

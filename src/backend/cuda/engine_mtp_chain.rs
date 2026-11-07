@@ -48,9 +48,9 @@ pub(crate) fn glm_mtp_draft_step_config(
     last_input_kind: Option<crate::prefix_state::PrefixLastInputKind>,
     resident_ids_len: usize,
 ) -> Result<GlmMtpDraftStepConfig> {
-    // 0-based MTP cache index p = start_pos - 1: MtpTokenCandidateGenerator.get_candidates (candidate_generator.py:1423-1435, 1468-1478).
+    // 0-based MTP cache index p = start_pos - 1 (model definition).
     ensure!(start_pos >= 1, "GLM MTP round requires committed prefix");
-    // Final-norm output of last committed row: Glm5NextTextModel.forward (modeling_glm5_next.py:1446, 1510-1511), output_capturing.py:305, MtpLayer.forward (modeling_layers.py:345).
+    // Final-norm output of last committed row (model definition).
     let committed_row = match last_input_kind {
         Some(crate::prefix_state::PrefixLastInputKind::PrefillChunk) => {
             resident_ids_len.saturating_sub(1)
@@ -61,7 +61,7 @@ pub(crate) fn glm_mtp_draft_step_config(
         draft_pos: start_pos - 1,
         committed_row,
         hidden_tap: MtpHiddenTap::PostFinalNorm,
-        // Validated (anchor_token, h_post(p)) remains in mtp_state on 1-layer reject (candidate_generator.py:1448-1450).
+        // Validated (anchor_token, h_post(p)) remains in mtp_state on 1-layer reject (model definition).
         retain_committed_on_reject: true,
     })
 }
@@ -89,6 +89,7 @@ pub(crate) struct Chain {
     pub(crate) catalog: Option<WeightCatalog>,
     pub(crate) target_checkpoint: StateCheckpoint,
     pub(crate) mtp_checkpoint: StateCheckpoint,
+    pub(crate) gdn_snapshots: Option<Vec<crate::backend::cuda::state::GdnState>>,
     pub(crate) saved: Saved,
     pub(crate) last_target: CudaSlice<bf16>,
     pub(crate) recurrent: CudaSlice<bf16>,
@@ -495,6 +496,12 @@ impl Engine {
                 b.last_rows = 0;
                 self.device.stream.memset_zeros(&mut b.carry)?;
             }
+            if let Some(snapshots) = chain.gdn_snapshots.as_mut() {
+                for snap in snapshots {
+                    self.device.stream.memset_zeros(&mut snap.s)?;
+                    self.device.stream.memset_zeros(&mut snap.history)?;
+                }
+            }
             if let Some(batch) = chain.batch.as_mut() {
                 batch.invalidate_frame();
             }
@@ -520,6 +527,22 @@ impl Engine {
             "MTP setup requires an empty Qwen or GLM text Engine"
         );
         if self.model_spec.architecture == Architecture::Glm5Next {
+            let verify_rows = options.verify_rows(Some(self.chunk))?;
+            let needed =
+                crate::mtp::glm_attachment_bytes(&self.model_spec, self.capacity, verify_rows)?;
+            let handle_bytes = crate::backend::cuda::moe::route::blas_handle_bytes(
+                &self.device.ctx,
+                &self.device.stream,
+            )?;
+            let total_needed = needed
+                .checked_add(handle_bytes)
+                .context("GLM MTP handle reservation overflow")?;
+            let (free, total) = self.device.ctx.mem_get_info()?;
+            ensure!(
+                free.checked_sub(total / 16)
+                    .is_some_and(|n| total_needed <= n),
+                "GLM MTP attachment exceeds memory budget: required={total_needed} free={free}"
+            );
             let dir = self
                 .qwen
                 .as_ref()
@@ -529,11 +552,50 @@ impl Engine {
                 GlmMtpRuntime::load(dir, &self.device, &self.blas, false, self.capacity)?;
             let spec = crate::mtp::component_spec(&self.model_spec)?;
             let state = StateStore::new(&spec, self.capacity, &self.device.stream)?;
-            let target_checkpoint =
-                StateCheckpoint::new(&self.state, &self.model_spec, 5, &self.device.stream)?;
-            let mtp_checkpoint = StateCheckpoint::new(&state, &spec, 5, &self.device.stream)?;
+            let target_checkpoint = StateCheckpoint::new(
+                &self.state,
+                &self.model_spec,
+                verify_rows,
+                &self.device.stream,
+            )?;
+            let mtp_checkpoint =
+                StateCheckpoint::new(&state, &spec, verify_rows, &self.device.stream)?;
+            let slots = verify_rows - 1;
+            let gdn_snapshots = self
+                .state
+                .gdn
+                .iter()
+                .map(|live| {
+                    Ok(crate::backend::cuda::state::GdnState {
+                        s: self.device.stream.alloc_zeros(slots * live.s.len())?,
+                        history: self.device.stream.alloc_zeros(slots * live.history.len())?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let snapshot_bytes = gdn_snapshots
+                .iter()
+                .map(|v| (v.s.len() + v.history.len()) * size_of::<f32>())
+                .sum::<usize>();
+            ensure!(
+                snapshot_bytes
+                    == crate::mtp::snapshot_bytes_for_rows(&self.model_spec, verify_rows)?,
+                "GLM MTP GDN snapshot byte mismatch"
+            );
+            self.bind_gdn_snapshots(&gdn_snapshots, verify_rows)?;
             let vocab = self.model_spec.vocab as usize;
-            let verify_logits = self.device.stream.alloc_zeros(2 * vocab)?;
+            let verify_logits = self.device.stream.alloc_zeros(verify_rows * vocab)?;
+            let journal = target_checkpoint.bytes() + mtp_checkpoint.bytes();
+            ensure!(
+                glm_runtime.allocation_bytes()
+                    + state.bytes()
+                    + journal
+                    + snapshot_bytes
+                    + verify_logits.len() * size_of::<f32>()
+                    + (4 * HIDDEN + vocab) * size_of::<bf16>()
+                    + 8
+                    == needed,
+                "GLM MTP attachment allocation/budget mismatch"
+            );
             self.device.stream.synchronize()?;
             self.mtp_state = Some(state);
             self.mtp = Some(Chain {
@@ -543,6 +605,7 @@ impl Engine {
                 catalog: None,
                 target_checkpoint,
                 mtp_checkpoint,
+                gdn_snapshots: Some(gdn_snapshots),
                 saved: Saved {
                     position: None,
                     cursor: 0,
@@ -565,6 +628,9 @@ impl Engine {
                 bootstrap: None,
                 verify_logits: Some(verify_logits),
             });
+            eprintln!(
+                "GLM_MTP_MEMORY additional_device_bytes={total_needed} snapshot_bytes={snapshot_bytes} checkpoint_bytes={journal}"
+            );
             return Ok(());
         }
         let plan = MtpPlan {
@@ -635,6 +701,7 @@ impl Engine {
             catalog: Some(catalog),
             target_checkpoint,
             mtp_checkpoint,
+            gdn_snapshots: None,
             saved: Saved {
                 position: None,
                 cursor: 0,
@@ -688,7 +755,7 @@ impl Engine {
                     .as_mut()
                     .context("GLM MTP runtime missing")?;
                 let total_ids = ids.len();
-                // Bootstrap 0-based MTP cache slots 0..total_ids-1 from (ids[pos+1], h_post(pos)) (candidate_generator.py:1423-1435, 1468-1478).
+                // Bootstrap 0-based MTP cache slots 0..total_ids-1 from (ids[pos+1], h_post(pos)) (model definition).
                 let token = self.prefill_chunks(ids, None, total_ids, |engine, chunk| {
                     let chunk_start = engine.position;
                     let stream = engine.device.stream.clone();
@@ -813,6 +880,10 @@ impl Engine {
         let stream = self.device.stream.clone();
         let vocab = self.model_spec.vocab as usize;
         let start_pos = self.position;
+        ensure!(
+            start_pos + 2 <= self.capacity,
+            "GLM MTP 2-row verify exceeds KV capacity"
+        );
         let step_cfg =
             glm_mtp_draft_step_config(start_pos, self.last_input_kind, self.resident_ids_len)?;
         let anchor_token = match self.pending_token {
@@ -866,7 +937,7 @@ impl Engine {
         #[cfg(not(test))]
         let _ = draft_staged_experts;
         if step_cfg.retain_committed_on_reject {
-            // Snapshot mtp_state after committing validated draft_pos = start_pos - 1 so reject rolls back only speculative rows >= start_pos (candidate_generator.py:1448-1450).
+            // Snapshot mtp_state after committing validated draft_pos = start_pos - 1 (model definition).
             chain.mtp_checkpoint.save_rows(
                 mtp_state,
                 &self.work.token,
@@ -890,6 +961,8 @@ impl Engine {
         )?;
         self.state
             .set_sequence(&stream, start_pos as u32, 2, self.workspace_rows as u32)?;
+        let prev_device_prefix = self.qwen_device_prefix;
+        self.qwen_device_prefix = true;
         let step_res = self.run_step(
             crate::backend::Step {
                 rows: 2,
@@ -899,6 +972,7 @@ impl Engine {
             },
             None,
         );
+        self.qwen_device_prefix = prev_device_prefix;
         step_res?;
 
         if let Some(hc) = self.hc.as_mut() {
@@ -956,86 +1030,89 @@ impl Engine {
             .context("GLM runtime missing")?
             .count_expert_unions_for_rows2(&stream)?;
 
-        let accepted = draft_token == v0;
-        #[cfg(test)]
-        let mut replay_row0_logits = None;
-        let round = if accepted {
-            // Commit verify row 0 (v0, h_post(start_pos)) at pos = start_pos alongside pos = start_pos - 1 (candidate_generator.py:1430, 1468-1478).
-            let shared = GlmMtpShared {
-                blas: &self.blas,
-                embedding: self.weights.embedding(),
-                head: &self.weights.head,
-            };
-            let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
-            let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
-            glm_runtime.commit_kv_device(v0, &self.work.n, 0, shared, dsa_state, start_pos)?;
-
-            self.position = start_pos + 2;
-            self.set_token(v1)?;
-            stream.memcpy_htod(&[(start_pos + 2) as i32], &mut self.work.position)?;
-            stream.memcpy_htod(&[(start_pos + 3) as i32], &mut self.work.length)?;
-            stream.memcpy_htod(&[v1], &mut self.work.token)?;
+        let plan = crate::mtp::glm_mtp_commit_plan(start_pos, draft_token, v0, v1);
+        debug_assert_eq!(plan.replay_target_passes, 0);
+        if let Some(prefix_rows) = plan.select_prefix_rows {
+            let snapshots = chain
+                .gdn_snapshots
+                .as_ref()
+                .context("GLM MTP GDN snapshots missing")?;
+            chain.target_checkpoint.select_prefix(
+                &mut self.state,
+                snapshots,
+                prefix_rows,
+                &stream,
+            )?;
+            chain.mtp_checkpoint.select_prefix(
+                self.mtp_state.as_mut().context("MTP state missing")?,
+                &[],
+                0,
+                &stream,
+            )?;
+            self.committed_prefix_ids.push(anchor_token);
+        } else {
+            if plan.commit_mtp_row0 {
+                // Commit verify row 0 (v0, h_post(start_pos)) at pos = start_pos alongside pos = start_pos - 1 (model definition).
+                let shared = GlmMtpShared {
+                    blas: &self.blas,
+                    embedding: self.weights.embedding(),
+                    head: &self.weights.head,
+                };
+                let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
+                let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
+                glm_runtime.commit_kv_device(v0, &self.work.n, 0, shared, dsa_state, start_pos)?;
+            }
             self.committed_prefix_ids.push(anchor_token);
             self.committed_prefix_ids.push(v0);
-            self.pending_token = Some(v1);
+            if plan.carry_verify_row1_hidden {
+                // Carry both pre-norm (work.x) and final-norm (work.n) verify row 1 into row 0 for next round (model definition).
+                let (x_ptr, _) = self.work.x.device_ptr(&stream);
+                let (n_ptr, _) = self.work.n.device_ptr(&stream);
+                unsafe {
+                    super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;
+                    super::super::copy::dtod_raw(n_ptr, n_ptr + (4096 * 2), 4096 * 2, &stream)?;
+                }
+            }
+        }
+        self.position = plan.next_position;
+        self.set_token(plan.next_pending_token)?;
+        stream.memcpy_htod(&[plan.next_position as i32], &mut self.work.position)?;
+        stream.memcpy_htod(&[(plan.next_position + 1) as i32], &mut self.work.length)?;
+        stream.memcpy_htod(&[plan.next_pending_token], &mut self.work.token)?;
+        self.pending_token = Some(plan.next_pending_token);
+        if self.position < self.capacity {
             self.state.set_sequence(
                 &stream,
-                (start_pos + 2) as u32,
+                self.position as u32,
                 1,
                 self.workspace_rows as u32,
             )?;
-            // Carry both pre-norm (work.x) and final-norm (work.n) verify row 1 into row 0 for next round (modeling_glm5_next.py:1510-1511; candidate_generator.py:1430).
-            let (x_ptr, _) = self.work.x.device_ptr(&stream);
-            let (n_ptr, _) = self.work.n.device_ptr(&stream);
-            unsafe {
-                super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;
-                super::super::copy::dtod_raw(n_ptr, n_ptr + (4096 * 2), 4096 * 2, &stream)?;
-            }
-            self.resident_ids_len = 1;
-            self.last_input_kind = Some(crate::prefix_state::PrefixLastInputKind::DecodeToken);
-            let row1_bf16: Vec<bf16> = row1_logits.iter().copied().map(bf16::from_f32).collect();
-            stream.memcpy_htod(&row1_bf16, &mut self.work.logits.slice_mut(..vocab))?;
-            self.logits_cache.mark_valid();
-            Round {
-                tokens: vec![v0, v1],
-                proposals: vec![draft_token],
-                matched: 1,
-                accepted: 1,
-                consumed: 2,
-            }
+        }
+        self.resident_ids_len = 1;
+        self.last_input_kind = Some(crate::prefix_state::PrefixLastInputKind::DecodeToken);
+        let committed_logits = if plan.accepted > 0 {
+            &row1_logits
         } else {
-            chain
-                .target_checkpoint
-                .restore_for_replay(&mut self.state, 0, 2, &stream)?;
-            chain.mtp_checkpoint.restore_for_replay(
-                self.mtp_state.as_mut().context("MTP state missing")?,
-                0,
-                2,
-                &stream,
-            )?;
-            self.position = start_pos;
-            self.set_token(anchor_token)?;
-            stream.memcpy_htod(&[start_pos as i32], &mut self.work.position)?;
-            stream.memcpy_htod(&[(start_pos + 1) as i32], &mut self.work.length)?;
-            stream.memcpy_htod(&[anchor_token], &mut self.work.token)?;
-            self.state
-                .set_sequence(&stream, start_pos as u32, 1, self.workspace_rows as u32)?;
-            let replayed = self.decode(false, None)?;
-            if replayed != v0 {
-                self.set_token(v0)?;
-                self.pending_token = Some(v0);
-            }
-            #[cfg(test)]
-            {
-                replay_row0_logits = Some(self.decode_logits()?);
-            }
-            Round {
-                tokens: vec![v0],
-                proposals: vec![draft_token],
-                matched: 0,
-                accepted: 0,
-                consumed: 1,
-            }
+            &row0_logits
+        };
+        let logits_bf16: Vec<bf16> = committed_logits
+            .iter()
+            .copied()
+            .map(bf16::from_f32)
+            .collect();
+        stream.memcpy_htod(&logits_bf16, &mut self.work.logits.slice_mut(..vocab))?;
+        self.logits_cache.mark_valid();
+        let tokens = if plan.accepted > 0 {
+            vec![v0, v1]
+        } else {
+            vec![v0]
+        };
+        let round = Round {
+            tokens,
+            proposals: vec![draft_token],
+            matched: plan.accepted,
+            accepted: plan.accepted,
+            consumed: plan.consumed,
         };
 
         Ok(GlmMtpRoundOutput {
@@ -1045,7 +1122,7 @@ impl Engine {
             #[cfg(test)]
             verify_row1_logits: row1_logits,
             #[cfg(test)]
-            replay_row0_logits,
+            replay_row0_logits: None,
             #[cfg(test)]
             start_pos,
             #[cfg(test)]
