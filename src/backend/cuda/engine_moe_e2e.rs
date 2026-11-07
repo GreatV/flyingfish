@@ -3234,7 +3234,28 @@ fn decode_combine_probe(engine: &mut Engine, ids: &[u32], graph: bool) -> Result
         Vec::new()
     };
     let prefill_state = if flint {
-        chain_state(engine)?
+        let mut snapshot = Vec::new();
+        let dim = engine.model_spec.head_dim as usize;
+        let heads = engine.model_spec.kv_heads as usize;
+        for (layer, cache) in engine.state.kv.iter().enumerate() {
+            let ring = engine.state.kv_ring(layer)?;
+            ensure!(prefill_position <= ring, "Flint prefill exceeds KV ring");
+            for buffer in [&cache.k, &cache.v] {
+                let values = engine.device.stream.clone_dtoh(buffer)?;
+                ensure!(
+                    values.len() == heads * ring * dim,
+                    "Flint KV layout differs"
+                );
+                for head in 0..heads {
+                    let start = head * ring * dim;
+                    for value in &values[start..start + prefill_position * dim] {
+                        ensure!(value.is_finite(), "Runner FAIL nonfinite prefill KV");
+                        snapshot.extend_from_slice(&value.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
+        snapshot
     } else {
         Vec::new()
     };
@@ -3243,13 +3264,20 @@ fn decode_combine_probe(engine: &mut Engine, ids: &[u32], graph: bool) -> Result
         let completed_layers = engine.moe.as_ref().context("Flint executor missing")?.stats[4];
         trace.save(&directory.join(format!("prefill-{completed_layers}.safetensors")))?;
         println!(
-            "T43_FLINT_PREFILL_CAPTURE completed_decode_layers={} position={} cpu_choices={}",
+            "T43_FLINT_PREFILL_CAPTURE completed_decode_layers={} position={} cpu_choices={} source_state_bytes={} live_state_bytes={}",
             completed_layers,
             prefill_position,
             engine
                 .moe_prefill
                 .as_ref()
-                .map_or(0, |prefill| prefill.stats[3])
+                .map_or(0, |prefill| prefill.stats[3]),
+            engine
+                .state
+                .kv
+                .iter()
+                .map(|cache| (cache.k.len() + cache.v.len()) * 2)
+                .sum::<usize>(),
+            prefill_state.len()
         );
     }
     let mut logits = Vec::with_capacity(8 * engine.model_spec.vocab as usize);
@@ -3857,8 +3885,16 @@ fn flint_order_difference(
         first.tokens.len() == second.tokens.len() && first_logits.len() == second_logits.len(),
         "Runner FAIL Flint order-control logit extents differ"
     );
-    let first_state = flint_live_state(engine, first_bytes, live)?;
-    let second_state = flint_live_state(engine, second_bytes, live)?;
+    let first_state = if prefill {
+        first_bytes.to_vec()
+    } else {
+        flint_live_state(engine, first_bytes, live)?
+    };
+    let second_state = if prefill {
+        second_bytes.to_vec()
+    } else {
+        flint_live_state(engine, second_bytes, live)?
+    };
     ensure!(
         first_state.len() == second_state.len(),
         "Runner FAIL Flint order-control state extents differ"
@@ -3877,6 +3913,11 @@ fn flint_order_difference(
     let mut first_state_location = None;
     let mut offset = 0;
     let dim = engine.model_spec.head_dim as usize;
+    ensure!(
+        first_state.len()
+            == engine.state.kv.len() * 2 * engine.model_spec.kv_heads as usize * live * dim * 2,
+        "Runner FAIL Flint live KV extent differs"
+    );
     for layer in 0..engine.state.kv.len() {
         for tensor in ["k", "v"] {
             for head in 0..engine.model_spec.kv_heads {
