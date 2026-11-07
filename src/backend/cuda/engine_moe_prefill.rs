@@ -3332,24 +3332,16 @@ mod tests {
                 let routing_device = stream.clone_htod(&routing)?;
                 let active = stream.clone_htod(&vec![1u32; rows])?;
                 let generation = stream.clone_htod(&vec![1u64; rows])?;
-                let layout = crate::backend::cuda::moe::prefill::prefill_layout(
+                let layout = crate::backend::cuda::moe::prefill::prefill_layout_mixed(
                     rows,
                     rows,
                     1,
                     geometry.experts as usize,
                     hidden,
-                    intermediate,
-                    None,
+                    (intermediate, intermediate),
+                    (None, routed_weight),
                 )?;
-                let scratch = stream.alloc_zeros::<u8>(usize::try_from(prefill_scratch_bytes(
-                    rows,
-                    rows,
-                    1,
-                    geometry.experts as usize,
-                    hidden,
-                    intermediate,
-                    None,
-                )?)?)?;
+                let scratch = stream.alloc_zeros::<u8>(usize::try_from(layout.bytes)?)?;
                 let boundary = rows == LANE16_ROWS as usize || rows == LANE16_ROWS as usize + 1;
                 let mut arithmetic = vec![true; geometry.experts as usize];
                 if boundary {
