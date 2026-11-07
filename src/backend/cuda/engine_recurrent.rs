@@ -798,6 +798,8 @@ impl Engine {
             mtp_epoch: 0,
             images: None,
             weights,
+            catalog: None,
+            dense_graphs: Vec::new(),
             state,
             capture_checkpoint: Some(checkpoint),
             work,

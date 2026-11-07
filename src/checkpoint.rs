@@ -436,8 +436,8 @@ impl MappedCheckpoint {
             Architecture::Flint => "Flint",
             Architecture::Clover => "Clover",
             Architecture::Qwen3Vl => "Qwen3-VL",
-            Architecture::Llama
-            | Architecture::Glm5Next
+            Architecture::Llama => "Llama",
+            Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2 => {
@@ -517,9 +517,11 @@ impl MappedCheckpoint {
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
             Architecture::Qwen3Vl => Self::qwen3_vl_vision_entries(spec, &mut expected)?,
-            Architecture::Flint | Architecture::Clover | Architecture::Qwen3 => {}
-            Architecture::Llama
-            | Architecture::Glm5Next
+            Architecture::Flint
+            | Architecture::Clover
+            | Architecture::Qwen3
+            | Architecture::Llama => {}
+            Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
@@ -1206,11 +1208,13 @@ impl MappedCheckpoint {
         let fp8 = spec.linear_format.fp8_layout();
         let dense_fp8 = fp8.filter(|layout| layout.block_scale().is_some());
         let global_prefix = match spec.architecture {
-            Architecture::Flint | Architecture::Clover | Architecture::Qwen3 => "model",
-            Architecture::Qwen35Text
-            | Architecture::MiniCpmV47
-            | Architecture::Llama
-            | Architecture::Qwen3Vl => "model.language_model",
+            Architecture::Flint
+            | Architecture::Clover
+            | Architecture::Qwen3
+            | Architecture::Llama => "model",
+            Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Qwen3Vl => {
+                "model.language_model"
+            }
             Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::DeepseekV41
@@ -1375,13 +1379,13 @@ impl MappedCheckpoint {
             match layer.mixer {
                 Mixer::FullAttention => {
                     let q_out = match spec.architecture {
-                        Architecture::Flint | Architecture::Qwen3 | Architecture::Qwen3Vl => {
-                            q_width
-                        }
+                        Architecture::Flint
+                        | Architecture::Qwen3
+                        | Architecture::Qwen3Vl
+                        | Architecture::Llama => q_width,
                         Architecture::Qwen35Text
                         | Architecture::Clover
-                        | Architecture::MiniCpmV47
-                        | Architecture::Llama => 2 * q_width,
+                        | Architecture::MiniCpmV47 => 2 * q_width,
                         Architecture::Glm5Next
                         | Architecture::LoopVl
                         | Architecture::Gemma4
@@ -1421,14 +1425,16 @@ impl MappedCheckpoint {
                         q_width,
                         fp8,
                     );
-                    for name in ["q_norm", "k_norm"] {
-                        put(
-                            expected,
-                            format!("{p}.self_attn.{name}.weight"),
-                            Dtype::BF16,
-                            vec![head_dim],
-                            TensorScope::Text,
-                        );
+                    if spec.architecture != Architecture::Llama {
+                        for name in ["q_norm", "k_norm"] {
+                            put(
+                                expected,
+                                format!("{p}.self_attn.{name}.weight"),
+                                Dtype::BF16,
+                                vec![head_dim],
+                                TensorScope::Text,
+                            );
+                        }
                     }
                     if spec.architecture == Architecture::Flint {
                         put(
@@ -3719,6 +3725,31 @@ fn is_embed_tokens_role(name: &str) -> bool {
     name == "embed_tokens.weight" || name.ends_with(".embed_tokens.weight")
 }
 
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+/// Classic fused projection order `[q, k, v, gate, up, o, down]`; q/k/v and gate/up are contiguous.
+pub(crate) fn classic_layer_names(layer: usize) -> [String; 7] {
+    let p = format!("model.layers.{layer}");
+    [
+        format!("{p}.self_attn.q_proj.weight"),
+        format!("{p}.self_attn.k_proj.weight"),
+        format!("{p}.self_attn.v_proj.weight"),
+        format!("{p}.mlp.gate_proj.weight"),
+        format!("{p}.mlp.up_proj.weight"),
+        format!("{p}.self_attn.o_proj.weight"),
+        format!("{p}.mlp.down_proj.weight"),
+    ]
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn validate_classic_order(layer: usize, order: &[String]) -> Result<()> {
+    let want = classic_layer_names(layer);
+    ensure!(
+        order.len() == want.len() && order.iter().eq(want.iter()),
+        "classic layer {layer} fused projection order differs"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct TensorManifest {
     pub entries: BTreeMap<String, TensorEntry>,
@@ -3828,6 +3859,99 @@ impl MappedCheckpoint {
 #[cfg(test)]
 mod component_tests {
     use super::*;
+
+    #[test]
+    fn flat_llama_manifest_census_is_derived_from_config() -> Result<()> {
+        let c = crate::config::Config {
+            model_type: "llama".into(),
+            hidden_size: 7168,
+            intermediate_size: 22016,
+            num_hidden_layers: 52,
+            num_attention_heads: 56,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            vocab_size: 166912,
+            max_position_embeddings: 524288,
+            rms_norm_eps: 1e-5,
+            rope_theta: 120000000.0,
+            rope_scaling: None,
+            hidden_act: "silu".into(),
+            tie_word_embeddings: false,
+            torch_dtype: "bfloat16".into(),
+            eos_token_id: vec![166101],
+            attention_bias: false,
+            mlp_bias: false,
+        };
+        let spec = crate::model_spec::ModelSpec::from_llama(&c)?;
+        let mut expected = BTreeMap::new();
+        MappedCheckpoint::text_entries(&spec, &mut expected)?;
+        ensure!(
+            expected.len() == 471,
+            "flat Llama census: {} tensors",
+            expected.len()
+        );
+        ensure!(
+            expected["model.embed_tokens.weight"].1 == [166912, 7168]
+                && expected["lm_head.weight"].1 == [166912, 7168],
+            "untied embed and lm_head"
+        );
+        ensure!(
+            expected["model.layers.0.self_attn.q_proj.weight"].1 == [7168, 7168],
+            "q_proj out width is q_width, not 2*q_width"
+        );
+        ensure!(
+            expected["model.layers.0.mlp.down_proj.weight"].1 == [7168, 22016],
+            "down_proj stored layout"
+        );
+        ensure!(
+            !expected.keys().any(|k| k.contains("language_model")
+                || k.contains("q_norm")
+                || k.contains("k_norm")),
+            "flat Llama has no language_model prefix or q/k norms"
+        );
+        ensure!(
+            planned_bytes(&expected, LoadPolicy::TextOnly)? == 66237954048,
+            "flat Llama published BF16 payload"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    fn classic_fused_order_rejects_swapped_groups() -> Result<()> {
+        let layer = 3;
+        let correct = classic_layer_names(layer).to_vec();
+        validate_classic_order(layer, &correct)?;
+        let mut qk = correct.clone();
+        qk.swap(0, 1);
+        assert!(
+            validate_classic_order(layer, &qk).is_err(),
+            "q/k swap must be rejected"
+        );
+        let mut kv = correct.clone();
+        kv.swap(1, 2);
+        assert!(
+            validate_classic_order(layer, &kv).is_err(),
+            "k/v swap must be rejected"
+        );
+        let mut gu = correct.clone();
+        gu.swap(3, 4);
+        assert!(
+            validate_classic_order(layer, &gu).is_err(),
+            "gate/up swap must be rejected"
+        );
+        let mut qv = correct.clone();
+        qv.swap(0, 2);
+        assert!(
+            validate_classic_order(layer, &qv).is_err(),
+            "q/v swap must be rejected"
+        );
+        assert!(
+            validate_classic_order(layer + 1, &correct).is_err(),
+            "layer mismatch must be rejected"
+        );
+        Ok(())
+    }
 
     #[test]
     fn music3_qwen3_manifest_geometry() -> Result<()> {

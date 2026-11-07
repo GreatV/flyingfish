@@ -44,6 +44,7 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
     let sentinel = |n: usize| -> Vec<bf16> { vec![bf16::from_bits(0x3f80); n] };
     let d_table = s.clone_htod(&pattern(64 * hidden, 7))?;
     let d_weight = s.clone_htod(&pattern(hidden, 3))?;
+    let d_weight = crate::backend::cuda::contracts::view(&d_weight, s, 0, [hidden as u32], [1])?;
     let mut x = s.alloc_zeros(budget * hidden)?;
     let mut y = s.alloc_zeros(budget * hidden)?;
     let mut ids = s.alloc_zeros::<u32>(budget)?;
