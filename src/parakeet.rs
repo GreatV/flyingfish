@@ -1,6 +1,8 @@
 //! Parakeet TDT published configuration and tensor contract.
+#[cfg(all(feature = "cuda", test))]
+pub use crate::backend::cuda::engine_parakeet::StreamOmit;
 #[cfg(feature = "cuda")]
-pub use crate::backend::cuda::engine_parakeet::ParakeetEncoder;
+pub use crate::backend::cuda::engine_parakeet::{NemotronStream, ParakeetEncoder, StreamChunk};
 
 use crate::{
     audio::LogMelConfig,
@@ -21,6 +23,37 @@ pub struct FastConformer {
     pub attention_bias: bool,
     pub convolution_bias: bool,
     pub prefix: &'static str,
+    pub max_position: u32,
+    pub conv_batch_norm: bool,
+    pub pad_left: u32,
+    pub pad_right: u32,
+    pub depthwise_left: u32,
+    pub linear_in: u32,
+    pub chunk_size: u32,
+    pub left_chunks: u32,
+    pub conv_names: [&'static str; 3],
+    pub pointwise_names: [&'static str; 2],
+}
+
+/// Stride-2 kernel-3 output length for the given left and right pads.
+pub fn conv_out(n: usize, left: u32, right: u32) -> Result<usize> {
+    let span = n
+        .checked_add(left as usize)
+        .and_then(|value| value.checked_add(right as usize))
+        .context("convolution span overflow")?;
+    ensure!(
+        span >= 3,
+        "convolution span {span} is shorter than the kernel"
+    );
+    Ok((span - 3) / 2 + 1)
+}
+
+pub fn position_rows_fit(rows: usize, max_position: u32) -> Result<()> {
+    ensure!(
+        rows > 0 && rows <= max_position as usize,
+        "position rows {rows} exceed max_position_embeddings {max_position}"
+    );
+    Ok(())
 }
 
 impl FastConformer {
@@ -128,35 +161,40 @@ impl FastConformer {
                     &[hidden],
                 );
             }
-            for name in ["weight", "bias", "running_mean", "running_var"] {
-                put(format!("{prefix}.conv.norm.{name}"), Dtype::F32, &[hidden]);
+            if self.conv_batch_norm {
+                for name in ["weight", "bias", "running_mean", "running_var"] {
+                    put(format!("{prefix}.conv.norm.{name}"), Dtype::F32, &[hidden]);
+                }
+                put(
+                    format!("{prefix}.conv.norm.num_batches_tracked"),
+                    Dtype::I64,
+                    &[],
+                );
+            } else {
+                put(format!("{prefix}.conv.norm.weight"), Dtype::F32, &[hidden]);
+                put(format!("{prefix}.conv.norm.bias"), Dtype::F32, &[hidden]);
             }
-            put(
-                format!("{prefix}.conv.norm.num_batches_tracked"),
-                Dtype::I64,
-                &[],
-            );
         }
-        for layer in [0, 2, 5] {
+        for name in self.conv_names {
             put(
-                format!("{}.subsampling.layers.{layer}.weight", self.prefix),
+                format!("{}.{name}.weight", self.prefix),
                 Dtype::F32,
                 &[channels, 1, 3, 3],
             );
             put(
-                format!("{}.subsampling.layers.{layer}.bias", self.prefix),
+                format!("{}.{name}.bias", self.prefix),
                 Dtype::F32,
                 &[channels],
             );
         }
-        for layer in [3, 6] {
+        for name in self.pointwise_names {
             put(
-                format!("{}.subsampling.layers.{layer}.weight", self.prefix),
+                format!("{}.{name}.weight", self.prefix),
                 Dtype::F32,
                 &[channels, channels, 1, 1],
             );
             put(
-                format!("{}.subsampling.layers.{layer}.bias", self.prefix),
+                format!("{}.{name}.bias", self.prefix),
                 Dtype::F32,
                 &[channels],
             );
@@ -164,7 +202,7 @@ impl FastConformer {
         put(
             format!("{}.subsampling.linear.weight", self.prefix),
             Dtype::F32,
-            &[hidden, intermediate],
+            &[hidden, self.linear_in as usize],
         );
         put(
             format!("{}.subsampling.linear.bias", self.prefix),
@@ -174,7 +212,7 @@ impl FastConformer {
     }
 }
 
-pub fn feature_log_mel(features: &Value) -> Result<LogMelConfig> {
+pub fn feature_log_mel(features: &Value, extractor_type: &str) -> Result<LogMelConfig> {
     exact_keys(
         features,
         &[
@@ -192,7 +230,7 @@ pub fn feature_log_mel(features: &Value) -> Result<LogMelConfig> {
         "Parakeet feature extractor",
     )?;
     for (key, value) in [
-        ("feature_extractor_type", "ParakeetFeatureExtractor".into()),
+        ("feature_extractor_type", extractor_type.into()),
         ("padding_side", "right".into()),
         ("padding_value", 0.0.into()),
         ("return_attention_mask", true.into()),
@@ -405,7 +443,7 @@ impl ParakeetSpec {
         let features = processor
             .get("feature_extractor")
             .context("Parakeet feature_extractor missing")?;
-        let mel = feature_log_mel(features)?;
+        let mel = feature_log_mel(features, "ParakeetFeatureExtractor")?;
         exact_keys(
             generation,
             &[
@@ -463,6 +501,20 @@ impl ParakeetSpec {
             attention_bias: self.attention_bias,
             convolution_bias: self.convolution_bias,
             prefix: "encoder",
+            max_position: self.max_position,
+            conv_batch_norm: true,
+            pad_left: 1,
+            pad_right: 1,
+            depthwise_left: self.conv_kernel / 2,
+            linear_in: self.intermediate,
+            chunk_size: 0,
+            left_chunks: 0,
+            conv_names: [
+                "subsampling.layers.0",
+                "subsampling.layers.2",
+                "subsampling.layers.5",
+            ],
+            pointwise_names: ["subsampling.layers.3", "subsampling.layers.6"],
         }
     }
 
