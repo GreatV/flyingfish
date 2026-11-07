@@ -4,7 +4,7 @@ use crate::backend::cuda::blas::Blas;
 use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::dsa::{DsaAttentionInput, DsaPlan, DsaState};
-use crate::backend::cuda::linear::{Fp8Ops, Fp8ScaleRef, LinearWeightRef, NativeProjection};
+use crate::backend::cuda::linear::{Fp8ScaleRef, LinearWeightRef};
 use crate::backend::cuda::moe::decode::{NativeMoe, NativeMoeGeometry, NativeMoeWeights};
 use crate::backend::gpu::DevicePtr;
 use crate::fp8::{Fp8BlockScale, Fp8ScaleLayout};
@@ -164,36 +164,22 @@ pub(crate) fn run_add(
     Ok(())
 }
 
-fn make_fp8_weight(
-    codes: &CudaSlice<u8>,
-    scales: &CudaSlice<f32>,
-    stream: &Arc<CudaStream>,
-    out_dim: usize,
-    in_dim: usize,
-) -> Result<LinearWeightRef> {
-    let (c_ptr, _) = codes.device_ptr(stream);
-    let (s_ptr, _) = scales.device_ptr(stream);
-    let codes_tensor = unsafe {
-        Tensor::new(
-            c_ptr,
-            [out_dim as u32, in_dim as u32],
-            [in_dim as u64, 1],
-            (out_dim * in_dim) as u64,
-        )?
-    };
-    let scale_tensor = unsafe {
-        Tensor::new(
-            s_ptr,
-            [out_dim.div_ceil(128) as u32, in_dim.div_ceil(128) as u32],
-            [in_dim.div_ceil(128) as u64, 1],
-            (out_dim.div_ceil(128) * in_dim.div_ceil(128) * 4) as u64,
-        )?
-    };
-    Ok(LinearWeightRef::Fp8 {
-        codes: codes_tensor,
-        scale: Fp8ScaleRef::F32(scale_tensor),
-        layout: Fp8ScaleLayout::Block(Fp8BlockScale::new([128, 128], safetensors::Dtype::F32)?),
-    })
+fn dequant_fp8_block_f32_host(codes: &[u8], scales: &[f32], rows: usize, cols: usize) -> Vec<bf16> {
+    let scale_cols = cols.div_ceil(128);
+    let mut out = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        let sr = r / 128;
+        let row_offset = r * cols;
+        let scale_row_offset = sr * scale_cols;
+        for c in 0..cols {
+            let sc = c / 128;
+            let scale = scales[scale_row_offset + sc];
+            let code = codes[row_offset + c];
+            let val = crate::fp8::decode_e4m3(code) * scale;
+            out.push(bf16::from_f32(val));
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -240,7 +226,6 @@ pub(crate) struct GlmMtpRuntime {
     pub(crate) concat_eh: CudaFunction,
     pub(crate) add: CudaFunction,
 
-    pub(crate) fp8: Fp8Ops,
     pub(crate) dsa_plan: DsaPlan,
     pub(crate) native_moe: NativeMoe,
 
@@ -249,25 +234,16 @@ pub(crate) struct GlmMtpRuntime {
     eh_proj_w: CudaSlice<bf16>,
     input_norm_w: CudaSlice<bf16>,
 
-    _q_a_codes: CudaSlice<u8>,
-    _q_a_scales: CudaSlice<f32>,
-    q_a_norm_w: CudaSlice<bf16>,
-    _q_b_codes: CudaSlice<u8>,
-    _q_b_scales: CudaSlice<f32>,
-
-    _kv_a_codes: CudaSlice<u8>,
-    _kv_a_scales: CudaSlice<f32>,
+    kv_a_w: CudaSlice<bf16>,
     kv_a_norm_w: CudaSlice<bf16>,
     kv_b_w: CudaSlice<bf16>,
 
-    _o_codes: CudaSlice<u8>,
-    _o_scales: CudaSlice<f32>,
-    post_norm_w: CudaSlice<bf16>,
+    q_a_w: CudaSlice<bf16>,
+    q_a_norm_w: CudaSlice<bf16>,
+    q_b_w: CudaSlice<bf16>,
 
-    kv_a_proj: NativeProjection,
-    q_a_proj: NativeProjection,
-    q_b_proj: NativeProjection,
-    o_proj: NativeProjection,
+    o_w: CudaSlice<bf16>,
+    post_norm_w: CudaSlice<bf16>,
 
     _router_w: CudaSlice<bf16>,
     _router_b: CudaSlice<f32>,
@@ -428,7 +404,6 @@ impl GlmMtpRuntime {
             .and_then(|v| v.as_f64())
             .unwrap_or(10.0) as f32;
 
-        let fp8 = Fp8Ops::new(&device.ctx)?;
         let dsa_spec = DsaSpec::glm53();
         let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, capacity as u32, 1)?;
         let _standalone_dsa = if standalone_weights {
@@ -448,28 +423,36 @@ impl GlmMtpRuntime {
             "model.language_model.layers.45.input_layernorm.weight",
         )?)?;
 
-        let q_a_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
-            "model.language_model.layers.45.self_attn.q_a_proj.weight",
-        )?))?;
-        let q_a_scales = stream.clone_htod(&get_st_f32(
-            "model.language_model.layers.45.self_attn.q_a_proj.weight_scale_inv",
-        )?)?;
+        let q_a_w = stream.clone_htod(&dequant_fp8_block_f32_host(
+            slice_u8_init(get_st_slice_info(
+                "model.language_model.layers.45.self_attn.q_a_proj.weight",
+            )?),
+            &get_st_f32("model.language_model.layers.45.self_attn.q_a_proj.weight_scale_inv")?,
+            1536,
+            4096,
+        ))?;
         let q_a_norm_w = stream.clone_htod(&get_st_bf16(
             "model.language_model.layers.45.self_attn.q_a_layernorm.weight",
         )?)?;
-        let q_b_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
-            "model.language_model.layers.45.self_attn.q_b_proj.weight",
-        )?))?;
-        let q_b_scales = stream.clone_htod(&get_st_f32(
-            "model.language_model.layers.45.self_attn.q_b_proj.weight_scale_inv",
-        )?)?;
+        let q_b_w = stream.clone_htod(&dequant_fp8_block_f32_host(
+            slice_u8_init(get_st_slice_info(
+                "model.language_model.layers.45.self_attn.q_b_proj.weight",
+            )?),
+            &get_st_f32("model.language_model.layers.45.self_attn.q_b_proj.weight_scale_inv")?,
+            16384,
+            1536,
+        ))?;
 
-        let kv_a_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
-            "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight",
-        )?))?;
-        let kv_a_scales = stream.clone_htod(&get_st_f32(
-            "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
-        )?)?;
+        let kv_a_w = stream.clone_htod(&dequant_fp8_block_f32_host(
+            slice_u8_init(get_st_slice_info(
+                "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight",
+            )?),
+            &get_st_f32(
+                "model.language_model.layers.45.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
+            )?,
+            512,
+            4096,
+        ))?;
         let kv_a_norm_w = stream.clone_htod(&get_st_bf16(
             "model.language_model.layers.45.self_attn.kv_a_layernorm.weight",
         )?)?;
@@ -477,12 +460,14 @@ impl GlmMtpRuntime {
             "model.language_model.layers.45.self_attn.kv_b_proj.weight",
         )?)?;
 
-        let o_codes = stream.clone_htod(slice_u8_init(get_st_slice_info(
-            "model.language_model.layers.45.self_attn.o_proj.weight",
-        )?))?;
-        let o_scales = stream.clone_htod(&get_st_f32(
-            "model.language_model.layers.45.self_attn.o_proj.weight_scale_inv",
-        )?)?;
+        let o_w = stream.clone_htod(&dequant_fp8_block_f32_host(
+            slice_u8_init(get_st_slice_info(
+                "model.language_model.layers.45.self_attn.o_proj.weight",
+            )?),
+            &get_st_f32("model.language_model.layers.45.self_attn.o_proj.weight_scale_inv")?,
+            4096,
+            16384,
+        ))?;
         let post_norm_w = stream.clone_htod(&get_st_bf16(
             "model.language_model.layers.45.post_attention_layernorm.weight",
         )?)?;
@@ -712,46 +697,25 @@ impl GlmMtpRuntime {
             None
         };
 
-        let kv_a_w = make_fp8_weight(&kv_a_codes, &kv_a_scales, stream, 512, 4096)?;
-        let kv_a_proj = NativeProjection::new(&fp8, stream, kv_a_w, 1)?;
-
-        let q_a_w = make_fp8_weight(&q_a_codes, &q_a_scales, stream, 1536, 4096)?;
-        let q_a_proj = NativeProjection::new(&fp8, stream, q_a_w, 1)?;
-
-        let q_b_w = make_fp8_weight(&q_b_codes, &q_b_scales, stream, 16384, 1536)?;
-        let q_b_proj = NativeProjection::new(&fp8, stream, q_b_w, 1)?;
-
-        let o_w = make_fp8_weight(&o_codes, &o_scales, stream, 4096, 16384)?;
-        let o_proj = NativeProjection::new(&fp8, stream, o_w, 1)?;
-
         Ok(Self {
             stream: stream.clone(),
             rms_norm,
             concat_eh,
             add,
-            fp8,
             dsa_plan,
             native_moe,
             enorm_w,
             hnorm_w,
             eh_proj_w,
             input_norm_w,
-            _q_a_codes: q_a_codes,
-            _q_a_scales: q_a_scales,
-            q_a_norm_w,
-            _q_b_codes: q_b_codes,
-            _q_b_scales: q_b_scales,
-            _kv_a_codes: kv_a_codes,
-            _kv_a_scales: kv_a_scales,
+            kv_a_w,
             kv_a_norm_w,
             kv_b_w,
-            _o_codes: o_codes,
-            _o_scales: o_scales,
+            q_a_w,
+            q_a_norm_w,
+            q_b_w,
+            o_w,
             post_norm_w,
-            kv_a_proj,
-            q_a_proj,
-            q_b_proj,
-            o_proj,
             _router_w: router_w,
             _router_b: router_b,
             _sh_gate_codes: sh_gate_codes,
@@ -948,12 +912,14 @@ impl GlmMtpRuntime {
         )?;
         stream.memcpy_dtod(&self.x_norm_buf, &mut self.x_norm1_buf)?;
 
-        let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
-        let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
-        let (kv_a_ptr, _) = self.kv_a_buf.device_ptr(&stream);
-        let kv_a_tensor = unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };
-        self.kv_a_proj
-            .run(&self.fp8, &stream, x_norm_tensor, &kv_a_tensor)?;
+        run_linear_bf16(
+            &stream,
+            blas,
+            &self.kv_a_w,
+            &self.x_norm_buf,
+            &mut self.kv_a_buf,
+            (1, 512, 4096),
+        )?;
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -988,13 +954,14 @@ impl GlmMtpRuntime {
             },
         )?;
 
-        let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
-        let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
-        let (q_a_ptr, _) = self.q_a_buf.device_ptr(&stream);
-        let q_a_tensor =
-            unsafe { TensorMut(Tensor::new(q_a_ptr, [1, 1536], [1536, 1], 1536 * 2)?) };
-        self.q_a_proj
-            .run(&self.fp8, &stream, x_norm_tensor, &q_a_tensor)?;
+        run_linear_bf16(
+            &stream,
+            blas,
+            &self.q_a_w,
+            &self.x_norm_buf,
+            &mut self.q_a_buf,
+            (1, 1536, 4096),
+        )?;
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -1004,13 +971,14 @@ impl GlmMtpRuntime {
             (1, 1536),
             1e-5,
         )?;
-        let (q_a_norm_ptr, _) = self.q_a_norm_buf.device_ptr(&stream);
-        let q_a_norm_tensor = unsafe { Tensor::new(q_a_norm_ptr, [1, 1536], [1536, 1], 1536 * 2)? };
-        let (q_b_ptr, _) = self.q_b_buf.device_ptr(&stream);
-        let q_b_tensor =
-            unsafe { TensorMut(Tensor::new(q_b_ptr, [1, 16384], [16384, 1], 16384 * 2)?) };
-        self.q_b_proj
-            .run(&self.fp8, &stream, q_a_norm_tensor, &q_b_tensor)?;
+        run_linear_bf16(
+            &stream,
+            blas,
+            &self.q_b_w,
+            &self.q_a_norm_buf,
+            &mut self.q_b_buf,
+            (1, 16384, 1536),
+        )?;
 
         let mut indices = vec![-1i32; 2051];
         for (i, item) in indices.iter_mut().take(pos.min(2050) + 1).enumerate() {
@@ -1048,13 +1016,14 @@ impl GlmMtpRuntime {
             &stream,
         )?;
 
-        let (attn_out_ptr, _) = self.attn_out_buf.device_ptr(&stream);
-        let attn_out_tensor =
-            unsafe { Tensor::new(attn_out_ptr, [1, 16384], [16384, 1], 16384 * 2)? };
-        let (o_ptr, _) = self.o_buf.device_ptr(&stream);
-        let o_tensor = unsafe { TensorMut(Tensor::new(o_ptr, [1, 4096], [4096, 1], 4096 * 2)?) };
-        self.o_proj
-            .run(&self.fp8, &stream, attn_out_tensor, &o_tensor)?;
+        run_linear_bf16(
+            &stream,
+            blas,
+            &self.o_w,
+            &self.attn_out_buf,
+            &mut self.o_buf,
+            (1, 4096, 16384),
+        )?;
         run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
         stream.memcpy_dtod(&self.x_buf, &mut self.x_curr_buf)?;
 
@@ -1186,13 +1155,14 @@ impl GlmMtpRuntime {
                 (1, 4096),
                 1e-5,
             )?;
-            let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
-            let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
-            let (kv_a_ptr, _) = self.kv_a_buf.device_ptr(&stream);
-            let kv_a_tensor =
-                unsafe { TensorMut(Tensor::new(kv_a_ptr, [1, 512], [512, 1], 512 * 2)?) };
-            self.kv_a_proj
-                .run(&self.fp8, &stream, x_norm_tensor, &kv_a_tensor)?;
+            run_linear_bf16(
+                &stream,
+                blas,
+                &self.kv_a_w,
+                &self.x_norm_buf,
+                &mut self.kv_a_buf,
+                (1, 512, 4096),
+            )?;
             run_rms_norm(
                 &stream,
                 &self.rms_norm,
@@ -1293,7 +1263,7 @@ impl GlmMtpRuntime {
             x_init: stream.clone_dtoh(&self.x_init_buf)?,
             x_norm1: stream.clone_dtoh(&self.x_norm1_buf)?,
             kv_latent: stream.clone_dtoh(&self.kv_latent_buf)?,
-            q_a: stream.clone_dtoh(&self.q_a_buf)?,
+            q_a: stream.clone_dtoh(&self.q_a_norm_buf)?,
             q_out: stream.clone_dtoh(&self.q_b_buf)?,
             attn_out: stream.clone_dtoh(&self.attn_out_buf)?,
             o_out: stream.clone_dtoh(&self.o_buf)?,
