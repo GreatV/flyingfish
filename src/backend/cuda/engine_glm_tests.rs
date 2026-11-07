@@ -2589,6 +2589,7 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
                                    xor_mask: u32,
                                    add_off: u32|
      -> Result<(u32, u32, Vec<u8>, Vec<u8>)> {
+        engine.state.clear_dsa(&engine.device.stream)?;
         let first = engine.mtp_prefill(&reference.tokens[..2])?;
         let p1 = (first.wrapping_add(add_off) ^ xor_mask) % vocab;
         if let Some(chain) = engine.mtp.as_mut() {
@@ -2637,10 +2638,11 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
             .stream
             .clone_dtoh(&engine.state.dsa[0].token_ids)?;
         ensure!(
-            pool_ids_2[0] == 3 && pool_ids_2[1] == 0 && tok_ids_2[4] == 0,
-            "DEFECT round 2 completed-pool boundary rollback mismatch: pool_ids[0]={} pool_ids[1]={} token_ids[4]={}",
+            pool_ids_2[0] == 0 && pool_ids_2[1] == 0 && tok_ids_2[3] == 3 && tok_ids_2[4] == 0,
+            "DEFECT round 2 completed-pool boundary rollback mismatch: pool_ids[0]={} pool_ids[1]={} token_ids[3]={} token_ids[4]={}",
             pool_ids_2[0],
             pool_ids_2[1],
+            tok_ids_2[3],
             tok_ids_2[4]
         );
         let snap2 = mtp_persistent_state_bytes(engine)?;
