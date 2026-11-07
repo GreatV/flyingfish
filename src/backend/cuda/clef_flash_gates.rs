@@ -395,6 +395,10 @@ mod gates {
             let cell = format!("decode_logits_s{step}");
             let logits = engine.decode_logits()?;
             decode_cell(&refs, &bounds, &cell, &logits)?;
+            if step + 1 < 8 {
+                engine.set_token(*token)?;
+                engine.decode(false, None)?;
+            }
             let (state_step, _) = engine.decode_gdn_state(0)?;
             let head = |h: usize| state_step[h * 128 * 128..(h + 1) * 128 * 128].to_vec();
             let absmax = |v: &[f32]| v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
@@ -409,11 +413,6 @@ mod gates {
                 let ref_head4 = &step_ref[4 * 128 * 128..(4 + 1) * 128 * 128];
                 let (max, rmse) = max_rmse(&head(4), ref_head4)?;
                 println!("CLEF_D2_STEPREF {step} h4_vs_ref max={max:.6e} rmse={rmse:.6e}");
-            }
-            if step + 1 < 8 {
-                engine.set_token(*token)?;
-                engine.decode(false, None)?;
-                break;
             }
         }
         for layer in [0usize, 1, 2] {
