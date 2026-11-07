@@ -382,6 +382,50 @@ mod gates {
         }
         for layer in [0usize, 1, 2] {
             let (state, history) = engine.decode_gdn_state(layer)?;
+            if layer == 0 {
+                // Localization: per-head breakdown of the recurrent state
+                // against the reference [hv, dk, dv] layout.
+                let want = refs.get("l0_recurrent_states").context("ref missing")?;
+                let hv = 32usize;
+                for h in 0..hv {
+                    let got_h = &state[h * 128 * 128..(h + 1) * 128 * 128];
+                    let want_h = &want[h * 128 * 128..(h + 1) * 128 * 128];
+                    let (max, rmse) = max_rmse(got_h, want_h)?;
+                    println!("CLEF_D2_DEBUG l0 head={h} max={max:.6e} rmse={rmse:.6e}");
+                }
+                let transposed_max = (0..128usize)
+                    .filter_map(|d| {
+                        max_rmse(
+                            &state[d..].iter().step_by(128).copied().collect::<Vec<_>>(),
+                            &want[d..].iter().step_by(128).copied().collect::<Vec<_>>(),
+                        )
+                        .ok()
+                        .map(|(m, _)| m)
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max);
+                println!("CLEF_D2_DEBUG l0 transposed_probe max={transposed_max:.6e}");
+            }
+            let want_conv = refs
+                .get(&format!("l{layer}_conv_states_history"))
+                .with_context(|| format!("l{layer}_conv_states_history missing"))?;
+            ensure!(
+                history.len() == want_conv.len(),
+                "history extent layer {layer}: got {} want {}",
+                history.len(),
+                want_conv.len()
+            );
+            let (max, rmse) = max_rmse(&history, want_conv)?;
+            let bound = bounds
+                .get(&format!("l{layer}_conv_states_history"))
+                .context("history bound missing")?;
+            println!(
+                "CLEF_DECODE l{layer}_conv_states_history max={max:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+                bound.0, bound.1
+            );
+            ensure!(
+                max <= bound.0 && rmse <= bound.1,
+                "decode cell l{layer}_conv_states_history exceeds the frozen bound"
+            );
             decode_cell(
                 &refs,
                 &bounds,
