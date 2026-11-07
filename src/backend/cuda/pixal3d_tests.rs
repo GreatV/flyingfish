@@ -3191,7 +3191,13 @@ fn linked_mesh_case(
     drop(negative);
     drop(zero);
     drop(flow);
-    let decoder = PixalDecoder::open(model, DecoderKind::PointTransformer, runtime, budget()?)?;
+    let decoder = PixalDecoder::open(
+        &device,
+        model,
+        DecoderKind::PointTransformer,
+        runtime,
+        budget()?,
+    )?;
     let mesh = decoder.points_mesh(coordinates.clone(), &latent, frame, 64)?;
     ensure!(
         mesh.vertices.len().is_multiple_of(3)
