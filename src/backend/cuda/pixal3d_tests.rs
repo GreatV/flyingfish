@@ -816,6 +816,7 @@ fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
 fn hi3d_decoder_heads_gpu() -> Result<()> {
     let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let decoder = PixalDecoder::open(
+        &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
         DecoderKind::PointTransformer,
         &env_path("FLYINGFISH_RUNTIME_DIR")?,
@@ -853,6 +854,7 @@ fn hi3d_decoder_heads_gpu() -> Result<()> {
 fn hi3d_decoder_field_affine_gpu() -> Result<()> {
     let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let mut decoder = PixalDecoder::open(
+        &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
         DecoderKind::PointTransformer,
         &env_path("FLYINGFISH_RUNTIME_DIR")?,
@@ -1079,6 +1081,7 @@ where
 fn hi3d_decoder_stages_gpu() -> Result<()> {
     let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let decoder = PixalDecoder::open(
+        &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
         DecoderKind::PointTransformer,
         &env_path("FLYINGFISH_RUNTIME_DIR")?,
@@ -1232,6 +1235,7 @@ fn hi3d_decoder_stages_gpu() -> Result<()> {
 fn hi3d_decoder_complete_gpu() -> Result<()> {
     let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let decoder = PixalDecoder::open(
+        &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
         DecoderKind::PointTransformer,
         &env_path("FLYINGFISH_RUNTIME_DIR")?,
@@ -1448,7 +1452,13 @@ fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
 fn hi3d_serialized_attention_definition_gpu() -> Result<()> {
     let model = env_path("FF_HI3D_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let decoder = PixalDecoder::open(&model, DecoderKind::PointTransformer, &runtime, 6 << 30)?;
+    let decoder = PixalDecoder::open(
+        &Device::new(0)?,
+        &model,
+        DecoderKind::PointTransformer,
+        &runtime,
+        6 << 30,
+    )?;
     let d = &decoder.device;
     let mut gate = OperationGate::decoder(
         "serialized-window-attention",
