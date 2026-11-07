@@ -1,5 +1,5 @@
 //! N1-M1 engine-cell gates. GPU gates are `#[ignore]`d and read every fixture
-//! path from `FF_N1_*` environment variables under a coordinator-granted window.
+//! path from `FF_N1_*` environment variables under an admitted window.
 
 #[cfg(feature = "cuda")]
 mod gates {
@@ -249,10 +249,10 @@ mod gates {
                 .catalog
                 .as_ref()
                 .context("classic streamed catalog missing")?;
-            let input_norm = catalog.classic_norm(layer, "input_layernorm")?;
+            let input_norm = catalog.classic_layer(layer)?.input_norm;
             engine
                 .work
-                .add_norm(&engine.ops, &s, input_norm, rows, &engine.config)?;
+                .add_norm(&engine.ops, &s, &input_norm, rows, &engine.config)?;
         }
         s.memcpy_htod(&[0i32], &mut engine.work.position)?;
         s.memcpy_htod(&[rows as i32], &mut engine.work.length)?;
@@ -416,7 +416,7 @@ mod gates {
     }
 
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_N1_MODEL, FF_N1_INPUTS, FF_N1_LAYER_FREEZE, FF_N1_WHOLE_FREEZE, FF_N1_REFERENCE_ARMS, FF_N1_EVIDENCE, FLYINGFISH_RUNTIME_DIR"]
+    #[ignore = "requires admitted GPU window; FF_N1_MODEL, FF_N1_INPUTS, FF_N1_LAYER_FREEZE, FF_N1_WHOLE_FREEZE, FF_N1_REFERENCE_ARMS, FF_N1_EVIDENCE, FLYINGFISH_RUNTIME_DIR"]
     fn n1_streamed_classic_layer_cells_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),

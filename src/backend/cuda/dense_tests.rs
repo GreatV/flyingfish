@@ -565,8 +565,7 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
     Ok(())
 }
 
-// Hidden 7168 and 56/8/128 are the published Nanbeige4.3-33B widths. The old
-// width guards pinned 2048/5120 and 16/2/128 and would __trap() on these launches.
+// Hidden 7168 and 56/8/128 are the published Nanbeige4.3-33B widths.
 #[test]
 #[cfg(feature = "cuda")]
 #[ignore = "requires GPU lease and FF_DENSE_GPU_WINDOW=granted"]

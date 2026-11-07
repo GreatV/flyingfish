@@ -308,7 +308,7 @@ impl State {
         &self,
         prefix: &CudaSlice<i32>,
         table: &CudaSlice<bf16>,
-        weight: &CudaSlice<bf16>,
+        weight: &super::contracts::Tensor<bf16, 1>,
         out: EmbedOut<'_>,
         c: &Config,
     ) -> Result<()> {
@@ -335,7 +335,7 @@ impl State {
                 .arg(ids)
                 .arg(&self.positions)
                 .arg(&self.slots)
-                .arg(weight)
+                .arg(&weight.ptr)
                 .arg(x)
                 .arg(y)
                 .arg(&budget)
