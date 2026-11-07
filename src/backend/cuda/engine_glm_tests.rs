@@ -2345,6 +2345,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let mut total_bytes_moved = 0u64;
     let mut sum_b_verify = 0u64;
     let mut sum_u = 0usize;
+    let loop_start = std::time::Instant::now();
 
     while emitted_tokens.len() < 599 {
         let is_round0 = total_rounds == 0;
@@ -2466,6 +2467,14 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         total_bytes_moved += b_round;
 
         emitted_tokens.extend_from_slice(&out.round.tokens);
+        if total_rounds.is_multiple_of(50) {
+            let elapsed_s = loop_start.elapsed().as_secs_f64();
+            println!(
+                "GLM_MTP_PROGRESS rounds={total_rounds} emitted={} accepted={accepted_count} elapsed_s={elapsed_s:.2}",
+                emitted_tokens.len()
+            );
+            std::io::Write::flush(&mut std::io::stdout())?;
+        }
     }
 
     let alpha = accepted_count as f64 / total_rounds as f64;
