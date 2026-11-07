@@ -1242,6 +1242,63 @@ impl GdnOps {
                     shared_mem_bytes: 0,
                 })?;
         }
+        #[cfg(test)]
+        {
+            if let Some(dir) = take_intermediate_capture() {
+                stream.synchronize()?;
+                let mut files = std::collections::BTreeMap::new();
+                let mut grab = |name: &str, ptr: u64, bytes: usize| -> Result<()> {
+                    let mut host = vec![0u8; bytes];
+                    unsafe {
+                        crate::backend::cuda::copy::dtoh_raw(
+                            host.as_mut_ptr() as *mut _,
+                            ptr,
+                            bytes,
+                            stream,
+                        )?;
+                    }
+                    files.insert(format!("{name}.bin"), host);
+                    Ok(())
+                };
+                let el = size_of::<bf16>();
+                let fl = size_of::<f32>();
+                let rows = plan.max_rows as usize;
+                let cd = plan.conv_dim as usize;
+                let conv_view = scratch.ptr + plan.ws.conv_out.offset;
+                grab("conv_out", conv_view, rows * cd * el)?;
+                grab(
+                    "q_fp32",
+                    scratch.ptr + plan.ws.q_fp32.offset,
+                    rows * plan.ws.qk_heads as usize * DK as usize * fl,
+                )?;
+                grab(
+                    "k_fp32",
+                    scratch.ptr + plan.ws.k_fp32.offset,
+                    rows * plan.ws.qk_heads as usize * DK as usize * fl,
+                )?;
+                grab(
+                    "v_fp32",
+                    scratch.ptr + plan.ws.v_fp32.offset,
+                    rows * plan.spec.hv as usize * DV as usize * fl,
+                )?;
+                grab(
+                    "beta",
+                    scratch.ptr + plan.ws.beta.offset,
+                    rows * plan.spec.hv as usize * el,
+                )?;
+                grab(
+                    "g",
+                    scratch.ptr + plan.ws.g.offset,
+                    rows * plan.spec.hv as usize * fl,
+                )?;
+                grab("state", b.s.0.ptr, b.s.0.span_bytes as usize)?;
+                grab("history", b.history.0.ptr, b.history.0.span_bytes as usize)?;
+                for (name, bytes) in files {
+                    std::fs::write(dir.join(name), bytes)?;
+                }
+                println!("CLEF_INTERMEDIATES dumped to {}", dir.display());
+            }
+        }
         Ok(gated.is_some())
     }
 
@@ -1574,58 +1631,6 @@ impl GdnOps {
                     .launch(plan.recurrent_cfg)
                     .map(|_| ())?,
             };
-        }
-        #[cfg(test)]
-        {
-            if let Some(dir) = take_intermediate_capture() {
-                stream.synchronize()?;
-                let mut files = std::collections::BTreeMap::new();
-                let mut grab = |name: &str, ptr: u64, bytes: usize| -> Result<()> {
-                    let mut host = vec![0u8; bytes];
-                    unsafe {
-                        crate::backend::cuda::copy::dtoh_raw(
-                            host.as_mut_ptr() as *mut _,
-                            ptr,
-                            bytes,
-                            stream,
-                        )?;
-                    }
-                    files.insert(format!("{name}.bin"), host);
-                    Ok(())
-                };
-                let el = size_of::<bf16>();
-                let fl = size_of::<f32>();
-                grab("conv_out", conv_out.0.ptr, rows as usize * cd as usize * el)?;
-                grab(
-                    "q_fp32",
-                    q_fp32.0.ptr,
-                    rows as usize * plan.ws.qk_heads as usize * DK as usize * fl,
-                )?;
-                grab(
-                    "k_fp32",
-                    k_fp32.0.ptr,
-                    rows as usize * plan.ws.qk_heads as usize * DK as usize * fl,
-                )?;
-                grab(
-                    "v_fp32",
-                    v_fp32.0.ptr,
-                    rows as usize * plan.spec.hv as usize * DV as usize * fl,
-                )?;
-                grab(
-                    "beta",
-                    beta.0.ptr,
-                    rows as usize * plan.spec.hv as usize * el,
-                )?;
-                if let GdnGateOutput::PerHead(view) = &g {
-                    grab("g", view.0.ptr, rows as usize * plan.spec.hv as usize * fl)?;
-                }
-                grab("state", b.s.0.ptr, b.s.0.span_bytes as usize)?;
-                grab("history", b.history.0.ptr, b.history.0.span_bytes as usize)?;
-                for (name, bytes) in files {
-                    std::fs::write(dir.join(name), bytes)?;
-                }
-                println!("CLEF_INTERMEDIATES dumped to {}", dir.display());
-            }
         }
         Ok(())
     }
