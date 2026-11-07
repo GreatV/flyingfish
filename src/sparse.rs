@@ -8,9 +8,140 @@ pub struct SparseMesh {
     pub faces: Vec<i32>,
 }
 
+fn cube_edge_corners(edge: usize) -> [usize; 2] {
+    let axis = edge / 4;
+    let compressed = edge % 4;
+    let lower = (compressed & ((1 << axis) - 1)) | ((compressed >> axis) << (axis + 1));
+    [lower, lower | (1 << axis)]
+}
+
+fn cube_face_edges(axis: usize, side: usize) -> [usize; 4] {
+    let others: Vec<_> = (0..3).filter(|&a| a != axis).collect();
+    let base = side << axis;
+    let corners = [
+        base,
+        base | (1 << others[0]),
+        base | (1 << others[0]) | (1 << others[1]),
+        base | (1 << others[1]),
+    ];
+    std::array::from_fn(|i| {
+        let a = corners[i];
+        let b = corners[(i + 1) % 4];
+        let direction = (a ^ b).trailing_zeros() as usize;
+        let lower = a.min(b);
+        4 * direction + (lower & ((1 << direction) - 1)) + ((lower >> (direction + 1)) << direction)
+    })
+}
+
+fn cube_components(mask: u8) -> Result<[i8; 12]> {
+    let mut adjacency = [0u16; 12];
+    let mut crossing = 0u16;
+    for edge in 0..12 {
+        let [a, b] = cube_edge_corners(edge);
+        if ((mask >> a) ^ (mask >> b)) & 1 != 0 {
+            crossing |= 1 << edge;
+        }
+    }
+    for axis in 0..3 {
+        for side in 0..2 {
+            let rim = cube_face_edges(axis, side);
+            let selected: Vec<_> = rim
+                .into_iter()
+                .filter(|&e| crossing & (1 << e) != 0)
+                .collect();
+            let mut join = |a, b| {
+                adjacency[a] |= 1u16 << b;
+                adjacency[b] |= 1u16 << a;
+            };
+            if selected.len() == 2 {
+                join(selected[0], selected[1]);
+            } else if selected.len() == 4 {
+                for i in 0..4 {
+                    let previous = cube_edge_corners(rim[(i + 3) % 4]);
+                    let current = cube_edge_corners(rim[i]);
+                    let corner = *current
+                        .iter()
+                        .find(|c| previous.contains(c))
+                        .context("cube face edges do not meet")?;
+                    if mask & (1 << corner) != 0 {
+                        join(rim[(i + 3) % 4], rim[i]);
+                    }
+                }
+            } else {
+                ensure!(selected.is_empty(), "invalid cube face crossing parity");
+            }
+        }
+    }
+    for (edge, neighbours) in adjacency.iter().enumerate() {
+        ensure!(
+            neighbours.count_ones() == if crossing & (1 << edge) != 0 { 2 } else { 0 },
+            "cube face graph is not a disjoint union of cycles"
+        );
+    }
+    let mut order: Vec<_> = (0..12).collect();
+    order.sort_unstable_by_key(|&edge| cube_edge_corners(edge));
+    let mut labels = [-1i8; 12];
+    let mut component = 0;
+    for edge in order {
+        if crossing & (1 << edge) == 0 || labels[edge] >= 0 {
+            continue;
+        }
+        let mut pending = 1u16 << edge;
+        while pending != 0 {
+            let next = pending.trailing_zeros() as usize;
+            pending &= !(1 << next);
+            if labels[next] < 0 {
+                labels[next] = component;
+                pending |= adjacency[next];
+            }
+        }
+        component += 1;
+    }
+    ensure!(component <= 4, "cube dual vertex count exceeds four");
+    Ok(labels)
+}
+
+/// Rows contain 12 edge-component IDs, component count, and six alternating-face split bits.
+/// Corners use x-bit0; edge = 4*axis + compressed lower corner; face = 2*axis + side.
+pub fn cube_topology() -> Result<[[i8; 14]; 256]> {
+    let mut table = [[-1i8; 14]; 256];
+    for (mask, row) in table.iter_mut().enumerate() {
+        let labels = cube_components(mask as u8)?;
+        row[..12].copy_from_slice(&labels);
+        row[12] = labels.into_iter().max().context("empty cube edge labels")? + 1;
+        row[13] = 0;
+    }
+    for mask in 0..256 {
+        for axis in 0..3 {
+            for side in 0..2 {
+                let rim = cube_face_edges(axis, side);
+                if rim.iter().all(|&edge| table[mask][edge] >= 0) {
+                    let own = table[mask][rim[0]];
+                    let opposite = table[mask ^ 255][rim[0]];
+                    if rim.iter().all(|&edge| table[mask][edge] == own)
+                        && rim.iter().any(|&edge| table[mask ^ 255][edge] != opposite)
+                    {
+                        table[mask][13] |= 1 << (2 * axis + side);
+                    }
+                }
+            }
+        }
+    }
+    Ok(table)
+}
+
 pub struct SparseSites {
     coordinates: Vec<[i32; 4]>,
     sorted: Vec<([i32; 4], i32)>,
+}
+
+pub struct SparseCorners {
+    pub sites: SparseSites,
+    /// Row-major [cubes,8], with x-bit0 corners.
+    pub cube_to_corner: Vec<u32>,
+    pub contributor_offsets: Vec<u64>,
+    /// Flattened cube/corner IDs, grouped by unique corner.
+    pub contributors: Vec<u32>,
 }
 
 pub struct SerializedWindows {
@@ -22,6 +153,54 @@ pub struct SerializedWindows {
     pub(crate) offsets: Vec<u32>,
 }
 impl SparseSites {
+    pub fn cube_corners(&self) -> Result<SparseCorners> {
+        let count = self
+            .coordinates
+            .len()
+            .checked_mul(8)
+            .filter(|&v| v <= i32::MAX as usize)
+            .context("expanded cube corner count exceeds indexing capacity")?;
+        ensure!(
+            self.coordinates
+                .iter()
+                .all(|p| p[1..].iter().all(|&v| v < i32::MAX)),
+            "cube corner coordinate overflow"
+        );
+        let mut expanded = Vec::with_capacity(count);
+        for p in &self.coordinates {
+            for corner in 0..8 {
+                expanded.push([
+                    p[0],
+                    p[1] + (corner & 1),
+                    p[2] + ((corner >> 1) & 1),
+                    p[3] + ((corner >> 2) & 1),
+                ]);
+            }
+        }
+        let (sites, cube_to_corner) = Self::deduplicate(expanded)?;
+        let unique = sites.coordinates.len();
+        let mut offsets = vec![0u64; unique + 1];
+        for &corner in &cube_to_corner {
+            offsets[corner as usize + 1] += 1;
+        }
+        for i in 1..offsets.len() {
+            offsets[i] += offsets[i - 1];
+        }
+        let mut cursor = offsets[..unique].to_vec();
+        let mut contributors = vec![0u32; count];
+        for (source, &corner) in cube_to_corner.iter().enumerate() {
+            let at = &mut cursor[corner as usize];
+            contributors[*at as usize] = source as u32;
+            *at += 1;
+        }
+        Ok(SparseCorners {
+            sites,
+            cube_to_corner,
+            contributor_offsets: offsets,
+            contributors,
+        })
+    }
+
     /// Lexicographic unique coordinates and input-row to unique-row indices.
     pub fn deduplicate(coordinates: Vec<[i32; 4]>) -> Result<(Self, Vec<u32>)> {
         ensure!(
@@ -324,6 +503,229 @@ impl SparseSites {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    struct ClosedCubeMesh {
+        components: Vec<[i8; 12]>,
+        quads: Vec<[usize; 4]>,
+        faces: Vec<[usize; 3]>,
+    }
+
+    fn component_sets(row: &[i8; 14]) -> Vec<Vec<[usize; 2]>> {
+        let mut groups = vec![Vec::new(); row[12] as usize];
+        for (edge, &group) in row[..12].iter().enumerate() {
+            if group >= 0 {
+                groups[group as usize].push(cube_edge_corners(edge));
+            }
+        }
+        for group in &mut groups {
+            group.sort_unstable();
+        }
+        groups.sort_unstable();
+        groups
+    }
+
+    fn oriented<const N: usize>(face: [usize; N]) -> [usize; N] {
+        let first = face.iter().enumerate().min_by_key(|&(_, v)| v).unwrap().0;
+        std::array::from_fn(|i| face[(first + i) % N])
+    }
+
+    fn closed_case(table: &[[i8; 14]; 256], mask: usize, flip: bool) -> Result<ClosedCubeMesh> {
+        let coordinates: Vec<_> = (0..4)
+            .flat_map(|x| (0..4).flat_map(move |y| (0..4).map(move |z| [0, x, y, z])))
+            .collect();
+        let sites = SparseSites::new(coordinates)?;
+        let negative = |p: [i32; 4]| {
+            let inside = p[1..].iter().all(|&v| (1..=2).contains(&v));
+            let sign = inside && mask & (1 << ((p[1] - 1) + 2 * (p[2] - 1) + 4 * (p[3] - 1))) != 0;
+            sign ^ flip
+        };
+        let masks: Vec<usize> = sites
+            .coordinates()
+            .iter()
+            .map(|p| {
+                (0..8).fold(0, |mask, i| {
+                    let corner = [
+                        0,
+                        p[1] + (i & 1),
+                        p[2] + ((i >> 1) & 1),
+                        p[3] + ((i >> 2) & 1),
+                    ];
+                    mask | (usize::from(negative(corner)) << i)
+                })
+            })
+            .collect();
+        let mut resolved = Vec::new();
+        for (row, p) in sites.coordinates().iter().enumerate() {
+            let mut split = false;
+            for axis in 0..3 {
+                for side in 0..2 {
+                    let mut q = *p;
+                    q[axis + 1] += if side == 0 { -1 } else { 1 };
+                    if let Some(other) = sites.row(q) {
+                        split |= table[masks[row]][13] & (1 << (2 * axis + side)) != 0
+                            && table[masks[other as usize]][13] & (1 << (2 * axis + 1 - side)) != 0;
+                    }
+                }
+            }
+            resolved.push(if split { masks[row] ^ 255 } else { masks[row] });
+        }
+        let mut owners: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut labels = Vec::new();
+        for (row, p) in sites.coordinates().iter().enumerate() {
+            let components = table[resolved[row]];
+            labels.push(std::array::from_fn(|e| components[e]));
+            for (edge, &component) in components[..12].iter().enumerate() {
+                if component < 0 {
+                    continue;
+                }
+                let lower = cube_edge_corners(edge)[0];
+                let point = [
+                    0,
+                    p[1] + (lower & 1) as i32,
+                    p[2] + ((lower >> 1) & 1) as i32,
+                    p[3] + ((lower >> 2) & 1) as i32,
+                ];
+                owners
+                    .entry((point, edge / 4))
+                    .or_default()
+                    .push((row, row * 4 + component as usize));
+            }
+        }
+        let mut quads = Vec::new();
+        let mut faces = Vec::new();
+        for ((point, axis), rows) in owners {
+            assert_eq!(rows.len(), 4);
+            let b = (axis + 1) % 3 + 1;
+            let c = (axis + 2) % 3 + 1;
+            let mut quad = [0; 4];
+            for (i, (db, dc)) in [(-1, -1), (0, -1), (0, 0), (-1, 0)].into_iter().enumerate() {
+                quad[i] = rows
+                    .iter()
+                    .find(|&&(row, _)| {
+                        let p = sites.coordinates()[row];
+                        p[b] - point[b] == db && p[c] - point[c] == dc
+                    })
+                    .unwrap()
+                    .1;
+            }
+            if !negative(point) {
+                quad.reverse();
+            }
+            let [a, b, c, d] = quad;
+            quads.push(quad);
+            faces.extend(if axis == 1 {
+                [[a, b, d], [b, c, d]]
+            } else {
+                [[a, b, c], [a, c, d]]
+            });
+        }
+        Ok(ClosedCubeMesh {
+            components: labels,
+            quads,
+            faces,
+        })
+    }
+
+    fn closed_winding(faces: &[[usize; 3]]) -> bool {
+        let mut incidence: BTreeMap<[usize; 2], (usize, i32)> = BTreeMap::new();
+        for face in faces {
+            for i in 0..3 {
+                let a = face[i];
+                let b = face[(i + 1) % 3];
+                let value = incidence.entry([a.min(b), a.max(b)]).or_default();
+                value.0 += 1;
+                value.1 += if a < b { 1 } else { -1 };
+            }
+        }
+        incidence
+            .values()
+            .all(|&(count, direction)| count == 2 && direction == 0)
+    }
+
+    #[test]
+    fn cube_face_graph_rotations_complements_and_closed_winding() -> Result<()> {
+        let table = cube_topology()?;
+        assert_eq!(table[6][12], 2);
+        assert_eq!(table[249][12], 1);
+        assert_eq!(table.iter().map(|row| row[12]).max(), Some(4));
+        assert_eq!(table.iter().filter(|row| row[12] == 0).count(), 2);
+        assert_eq!(
+            (0..256)
+                .filter(|&m| component_sets(&table[m]) != component_sets(&table[m ^ 255]))
+                .count(),
+            120
+        );
+        let mut rotations = 0;
+        for axes in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let parity = (usize::from(axes[0] > axes[1])
+                + usize::from(axes[0] > axes[2])
+                + usize::from(axes[1] > axes[2]))
+                % 2;
+            for reflection in 0u8..8 {
+                if reflection.count_ones() as usize % 2 != parity {
+                    continue;
+                }
+                rotations += 1;
+                let map = |corner: usize| {
+                    axes.iter().enumerate().fold(0, |result, (a, &b)| {
+                        result | ((((corner >> b) & 1) ^ usize::from((reflection >> a) & 1)) << a)
+                    })
+                };
+                for mask in 0..256 {
+                    let rotated =
+                        (0..8).fold(0, |result, c| result | (((mask >> c) & 1) << map(c)));
+                    let mut expected = component_sets(&table[mask]);
+                    for group in &mut expected {
+                        for edge in group.iter_mut() {
+                            *edge = edge.map(map);
+                            edge.sort_unstable();
+                        }
+                        group.sort_unstable();
+                    }
+                    expected.sort_unstable();
+                    assert_eq!(component_sets(&table[rotated]), expected);
+                }
+            }
+        }
+        assert_eq!(rotations, 24);
+        let mut agree = 0;
+        for mask in 0..256 {
+            let first = closed_case(&table, mask, false)?;
+            let second = closed_case(&table, mask, true)?;
+            assert!(closed_winding(&first.faces) && closed_winding(&second.faces));
+            if first.components == second.components {
+                agree += 1;
+                let mut forward: Vec<_> = first.quads.into_iter().map(oriented).collect();
+                let mut reverse: Vec<_> = second
+                    .quads
+                    .into_iter()
+                    .map(|mut q| {
+                        q.reverse();
+                        oriented(q)
+                    })
+                    .collect();
+                forward.sort_unstable();
+                reverse.sort_unstable();
+                assert_eq!(forward, reverse);
+            }
+            if mask == 1 {
+                let mut control = first.faces;
+                control[0].reverse();
+                assert!(!closed_winding(&control));
+            }
+        }
+        assert_eq!(agree, 172);
+        Ok(())
+    }
+
     #[test]
     fn sparse_maps_preserve_batches_axes_children_and_half_even() -> Result<()> {
         let sites = SparseSites::new(vec![[0, 2, 3, 5], [0, 3, 3, 5], [0, 2, 3, 6], [1, 2, 3, 5]])?;
@@ -348,6 +750,46 @@ mod tests {
             &[[0, 1, 2, 3], [0, 4, 5, 6], [1, 0, 2, 3]]
         );
         assert_eq!(inverse, [2, 1, 1, 0]);
+        let coordinates: Vec<_> = (0..3)
+            .flat_map(|x| (0..2).flat_map(move |y| (0..2).map(move |z| [0, x, y, z])))
+            .collect();
+        let cubes = SparseSites::new((0..12).map(|i| coordinates[i * 7 % 12]).collect())?;
+        let corners = cubes.cube_corners()?;
+        assert_eq!(corners.sites.coordinates().len(), 36);
+        assert_eq!(corners.cube_to_corner.len(), 96);
+        assert_eq!(corners.contributors.len(), 96);
+        assert_eq!(corners.contributor_offsets.last(), Some(&96));
+        let mut degrees = std::collections::BTreeSet::new();
+        let mut control_mismatches = 0;
+        for (unique, pair) in corners.contributor_offsets.windows(2).enumerate() {
+            degrees.insert(pair[1] - pair[0]);
+            for &source in &corners.contributors[pair[0] as usize..pair[1] as usize] {
+                assert_eq!(corners.cube_to_corner[source as usize] as usize, unique);
+                let p = cubes.coordinates()[source as usize / 8];
+                let c = source % 8;
+                assert_eq!(
+                    corners.sites.coordinates()[unique],
+                    [
+                        p[0],
+                        p[1] + (c & 1) as i32,
+                        p[2] + ((c >> 1) & 1) as i32,
+                        p[3] + ((c >> 2) & 1) as i32
+                    ]
+                );
+                let swapped = ((c & 1) << 2) | (c & 2) | ((c & 4) >> 2);
+                control_mismatches += usize::from(
+                    corners.cube_to_corner[source as usize]
+                        != corners.cube_to_corner[source as usize / 8 * 8 + swapped as usize],
+                );
+            }
+        }
+        assert_eq!(degrees, [1, 2, 4, 8].into_iter().collect());
+        assert_eq!(control_mismatches, 48);
+        assert!(
+            SparseSites::new(vec![[0, i32::MAX, 0, 0]])?
+                .cube_corners()
+                .is_err()
+        );
         let masks = [
             [false, true, false, false, false, false, false, false],
             [false; 8],

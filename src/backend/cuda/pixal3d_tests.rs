@@ -165,6 +165,7 @@ fn env_path(name: &str) -> Result<PathBuf> {
 struct OperationGate {
     root: PathBuf,
     kind: String,
+    prefix: &'static str,
     cells: BTreeMap<String, Value>,
     seen: BTreeSet<String>,
     defects: usize,
@@ -206,6 +207,7 @@ impl OperationGate {
         Ok(Self {
             root,
             kind: kind.into(),
+            prefix: "N5_M1",
             cells,
             seen: BTreeSet::new(),
             defects: 0,
@@ -233,10 +235,56 @@ impl OperationGate {
         Ok(Self {
             root,
             kind: kind.into(),
+            prefix: "N5_M2B",
             cells,
             seen: BTreeSet::new(),
             defects: 0,
             decoder_anchor,
+            decoder_key: None,
+        })
+    }
+    fn extraction() -> Result<Self> {
+        let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+        let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        let source = freeze["continuous_cells"]
+            .as_array()
+            .context("extraction cells missing")?;
+        ensure!(
+            source.len() == 12 && freeze["native_candidates"] == 0,
+            "invalid extraction freeze coverage"
+        );
+        let mut cells = BTreeMap::new();
+        for cell in source {
+            ensure!(
+                cell["pairs"].as_array().is_some_and(|p| p.len() == 45),
+                "extraction reference pairs missing"
+            );
+            for metric in ["max_abs", "rmse"] {
+                ensure!(
+                    cell["control"]["tau_multiple"][metric]
+                        .as_f64()
+                        .is_some_and(|v| v > 10.0),
+                    "weak extraction reference control"
+                );
+            }
+            let name = cell["name"]
+                .as_str()
+                .context("extraction cell name missing")?;
+            let mut cell = cell.clone();
+            cell["bounds"] = cell["tau"].clone();
+            ensure!(
+                cells.insert(name.to_owned(), cell).is_none(),
+                "duplicate extraction cell"
+            );
+        }
+        Ok(Self {
+            root,
+            kind: "extraction".into(),
+            prefix: "N5_M3",
+            cells,
+            seen: BTreeSet::new(),
+            defects: 0,
+            decoder_anchor: None,
             decoder_key: None,
         })
     }
@@ -296,7 +344,7 @@ impl OperationGate {
                 );
             }
             let defect = if control {
-                if self.decoder_anchor.is_some() {
+                if self.decoder_anchor.is_some() || self.prefix == "N5_M3" {
                     value <= 10.0 * bound
                 } else {
                     value < 10.0 * bound
@@ -307,11 +355,7 @@ impl OperationGate {
             self.defects += usize::from(defect);
             println!(
                 "{}_METRIC kind={} cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
-                if self.decoder_anchor.is_some() {
-                    "N5_M2B"
-                } else {
-                    "N5_M1"
-                },
+                self.prefix,
                 self.kind,
                 if defect { "DEFECT" } else { "PASS" }
             );
@@ -325,11 +369,7 @@ impl OperationGate {
         );
         println!(
             "{}_GATE {} kind={} cells={} defects={} timing=false",
-            if self.decoder_anchor.is_some() {
-                "N5_M2B"
-            } else {
-                "N5_M1"
-            },
+            self.prefix,
             if self.defects == 0 { "PASS" } else { "DEFECT" },
             self.kind,
             self.seen.len(),
@@ -2509,6 +2549,818 @@ fn metrics(x: &[f64], y: &[f64]) -> Result<BTreeMap<&'static str, f64>> {
         ("cosine_error", cosine),
     ]))
 }
+struct ExtractionInput {
+    coordinates: Vec<[i32; 4]>,
+    cubes: Vec<u32>,
+    positions: Vec<f32>,
+    scalar: Vec<f32>,
+}
+impl ExtractionInput {
+    fn run(&self, d: &Device, positions: &[f32]) -> Result<crate::sparse::SparseMesh> {
+        let initial = d.ctx.mem_get_info()?.0;
+        super::super::sparse::cube_mesh(
+            d,
+            SparseSites::new(self.coordinates.clone())?,
+            d.stream.clone_htod(&self.cubes)?,
+            d.stream.clone_htod(positions)?,
+            d.stream.clone_htod(&self.scalar)?,
+            [initial, 6 << 30],
+        )
+    }
+}
+fn extraction_sites(path: &Path, key: &str) -> Result<Vec<[i32; 4]>> {
+    let coordinates = tensor(path, key)?;
+    ensure!(
+        coordinates.shape.len() == 2 && coordinates.shape[1] == 3,
+        "cube coordinates must be [rows,3]"
+    );
+    coordinates
+        .values
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|p| {
+            let mut row = [0; 4];
+            for i in 0..3 {
+                ensure!(
+                    p[i] >= 0.0 && p[i] <= i32::MAX as f64 && p[i].fract() == 0.0,
+                    "invalid cube coordinate"
+                );
+                row[i + 1] = p[i] as i32;
+            }
+            Ok(row)
+        })
+        .collect()
+}
+fn extraction_indices(path: &Path, key: &str) -> Result<Vec<usize>> {
+    tensor(path, key)?
+        .values
+        .into_iter()
+        .map(|v| {
+            ensure!(
+                v >= 0.0 && v <= u32::MAX as f64 && v.fract() == 0.0,
+                "invalid extraction index"
+            );
+            Ok(v as usize)
+        })
+        .collect()
+}
+fn extraction_exact(g: &mut OperationGate, name: &str, mismatches: usize) {
+    g.defects += usize::from(mismatches != 0);
+    println!(
+        "{} N5_M3_EXACT cell={name} mismatches={mismatches}",
+        if mismatches == 0 { "PASS" } else { "DEFECT" }
+    );
+}
+fn extraction_faces(
+    faces: &[i32],
+    relabel: Option<&[usize]>,
+) -> Result<BTreeMap<[usize; 3], usize>> {
+    ensure!(faces.len().is_multiple_of(3), "triangle extent mismatch");
+    let mut output = BTreeMap::new();
+    for face in faces.as_chunks::<3>().0 {
+        let mut f = [0; 3];
+        for i in 0..3 {
+            let index = usize::try_from(face[i])?;
+            f[i] = if let Some(map) = relabel {
+                *map.get(index).context("face exceeds relabelling")?
+            } else {
+                index
+            };
+        }
+        let first = f
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, v)| v)
+            .context("empty triangle")?
+            .0;
+        let canonical = std::array::from_fn(|i| f[(first + i) % 3]);
+        *output.entry(canonical).or_insert(0) += 1;
+    }
+    Ok(output)
+}
+fn extraction_inverse(mapping: &[usize]) -> Result<Vec<usize>> {
+    let mut inverse = vec![usize::MAX; mapping.len()];
+    for (physical, &source) in mapping.iter().enumerate() {
+        ensure!(
+            source < mapping.len() && inverse[source] == usize::MAX,
+            "reference correspondence is not a bijection"
+        );
+        inverse[source] = physical;
+    }
+    Ok(inverse)
+}
+fn extraction_mesh_check(
+    g: &mut OperationGate,
+    name: &str,
+    mesh: &crate::sparse::SparseMesh,
+    mapping: &[usize],
+    source_faces: &[f64],
+) -> Result<bool> {
+    ensure!(
+        mesh.vertices.len().is_multiple_of(3) && mesh.vertices.iter().all(|v| v.is_finite()),
+        "invalid extraction vertex buffer"
+    );
+    ensure!(
+        mesh.faces
+            .iter()
+            .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+        "extraction face exceeds capacity"
+    );
+    let complete = mesh.vertices.len() / 3 == mapping.len();
+    extraction_exact(
+        g,
+        &format!("{name}.vertex_count"),
+        (mesh.vertices.len() / 3).abs_diff(mapping.len()),
+    );
+    if complete {
+        let inverse = extraction_inverse(mapping)?;
+        let reference: Vec<_> = source_faces.iter().map(|&v| v as i32).collect();
+        let expected = extraction_faces(&reference, Some(&inverse))?;
+        let actual = extraction_faces(&mesh.faces, None)?;
+        let mismatches = expected
+            .iter()
+            .filter(|(k, v)| actual.get(*k) != Some(*v))
+            .count()
+            + actual.keys().filter(|k| !expected.contains_key(*k)).count();
+        extraction_exact(g, &format!("{name}.oriented_faces"), mismatches);
+    }
+    Ok(complete)
+}
+fn extraction_select(values: &[f32], selected: &[usize], width: usize) -> Result<Vec<f64>> {
+    ensure!(
+        width > 0
+            && values.len().is_multiple_of(width)
+            && selected.iter().all(|&r| r < values.len() / width),
+        "extraction selector exceeds output"
+    );
+    Ok(selected
+        .iter()
+        .flat_map(|&r| values[r * width..(r + 1) * width].iter().map(|&v| v as f64))
+        .collect())
+}
+
+fn extraction_real(g: &mut OperationGate, d: &Device, case: &str) -> Result<()> {
+    let root = g.root.clone();
+    let bank = env_path("FF_HI3D_DECODER_REFERENCE")?
+        .join(format!("{case}-decode-sm86-r1/decoded.safetensors"));
+    let original = bank_sites(&bank)?;
+    let signs = f32_tensor(&bank, "sdf_sign")?;
+    let features = f32_tensor(&bank, "feat")?;
+    let matrix = f32_tensor(&bank, "matrix")?;
+    ensure!(
+        matrix.len() == 16
+            && signs.len() == original.coordinates().len() * 8
+            && features.len() == original.coordinates().len() * 32,
+        "decoded corner bank extent mismatch"
+    );
+    let frame = std::array::from_fn(|r| std::array::from_fn(|c| matrix[r * 4 + c]));
+    let mut order: Vec<_> = (0..original.coordinates().len()).collect();
+    order.sort_unstable_by_key(|&i| original.coordinates()[i]);
+    let sites = SparseSites::new(order.iter().map(|&i| original.coordinates()[i]).collect())?;
+    let mut fields = Vec::with_capacity(order.len() * 40);
+    for &i in &order {
+        fields.extend_from_slice(&signs[i * 8..(i + 1) * 8]);
+        fields.extend_from_slice(&features[i * 32..(i + 1) * 32]);
+    }
+    drop(original);
+    drop(signs);
+    drop(features);
+    drop(order);
+    let selected = extraction_indices(
+        &root.join("selectors.safetensors"),
+        &format!("{case}.corner_indices"),
+    )?;
+    let stable = extraction_indices(
+        &root.join("selectors.safetensors"),
+        &format!("{case}.stable_sign_rows"),
+    )?;
+    let initial = d.ctx.mem_get_info()?.0;
+    let values = d.stream.clone_htod(&fields)?;
+    let aggregate =
+        super::super::sparse::corner_fields(d, &sites, &values, frame, [initial, 6 << 30])?;
+    let canonical = root.join(format!(
+        "full-definition-CPU-sm86-r1/{case}/canonical-corners.safetensors"
+    ));
+    let inverse = extraction_indices(&canonical, "cubes")?;
+    extraction_exact(
+        g,
+        &format!("{case}.cube_to_corner"),
+        aggregate
+            .layout
+            .cube_to_corner
+            .iter()
+            .map(|&i| i as usize)
+            .zip(&inverse)
+            .filter(|(a, b)| a != *b)
+            .count()
+            + aggregate
+                .layout
+                .cube_to_corner
+                .len()
+                .abs_diff(inverse.len()),
+    );
+    let unique = tensor(&canonical, "unique_grid")?;
+    let actual_grid: Vec<_> = aggregate
+        .layout
+        .sites
+        .coordinates()
+        .iter()
+        .flat_map(|p| p[1..].iter().map(|&v| v as f64))
+        .collect();
+    extraction_exact(
+        g,
+        &format!("{case}.unique_grid"),
+        actual_grid
+            .iter()
+            .zip(&unique.values)
+            .filter(|(a, b)| a != b)
+            .count()
+            + actual_grid.len().abs_diff(unique.values.len()),
+    );
+    let means = selected_values(d, &aggregate.means, &selected, 5, f64::from)?;
+    let positions = selected_values(d, &aggregate.positions, &selected, 3, f64::from)?;
+    let scalar = selected_values(d, &aggregate.scalar, &selected, 1, f64::from)?;
+    g.score(&format!("{case}.corner_means"), &means, false)?;
+    g.score(&format!("{case}.world_positions"), &positions, false)?;
+    g.score(
+        &format!("{case}.signed_sdf"),
+        &stable.iter().map(|&r| scalar[r]).collect::<Vec<_>>(),
+        false,
+    )?;
+    drop(aggregate);
+    drop(values);
+    let mut associated = fields.clone();
+    for (source, target) in fields
+        .as_chunks::<40>()
+        .0
+        .iter()
+        .zip(associated.as_chunks_mut::<40>().0)
+    {
+        for corner in 0..8 {
+            let previous = (corner + 7) % 8;
+            target[corner] = source[previous];
+            target[8 + corner] = source[8 + previous];
+            target[16 + corner * 3..19 + corner * 3]
+                .copy_from_slice(&source[16 + previous * 3..19 + previous * 3]);
+        }
+    }
+    let control = d.stream.clone_htod(&associated)?;
+    let aggregate =
+        super::super::sparse::corner_fields(d, &sites, &control, frame, [initial, 6 << 30])?;
+    g.score(
+        &format!("{case}.corner_means"),
+        &selected_values(d, &aggregate.means, &selected, 5, f64::from)?,
+        true,
+    )?;
+    g.score(
+        &format!("{case}.world_positions"),
+        &selected_values(d, &aggregate.positions, &selected, 3, f64::from)?,
+        true,
+    )?;
+    let scalar = selected_values(d, &aggregate.scalar, &selected, 1, f64::from)?;
+    g.score(
+        &format!("{case}.signed_sdf"),
+        &stable.iter().map(|&r| scalar[r]).collect::<Vec<_>>(),
+        true,
+    )?;
+    drop(aggregate);
+    drop(control);
+    for (source, target) in fields
+        .as_chunks::<40>()
+        .0
+        .iter()
+        .zip(associated.as_chunks_mut::<40>().0)
+    {
+        target[..16].copy_from_slice(&source[..16]);
+    }
+    let control = d.stream.clone_htod(&associated)?;
+    let aggregate =
+        super::super::sparse::corner_fields(d, &sites, &control, frame, [initial, 6 << 30])?;
+    let control_positions = d.stream.clone_dtoh(&aggregate.positions)?;
+    drop(aggregate);
+    drop(control);
+    drop(fields);
+    drop(associated);
+    let fixed = root.join(format!(
+        "full-definition-CPU-sm86-r1/{case}/canonical-extractor-input.safetensors"
+    ));
+    let fixture = ExtractionInput {
+        coordinates: sites.coordinates().to_vec(),
+        cubes: inverse.iter().map(|&i| i as u32).collect(),
+        positions: f32_tensor(&fixed, "positions")?,
+        scalar: f32_tensor(&fixed, "signed_sdf")?,
+    };
+    let correspondence = root.join(format!(
+        "vertex-CPU-math-r2/{case}.correspondence.safetensors"
+    ));
+    let mapping = extraction_indices(&correspondence, "oracle_indices")?;
+    let selection = extraction_indices(
+        &root.join("selectors.safetensors"),
+        &format!("{case}.vertex_indices"),
+    )?;
+    let source_faces = tensor(
+        &root.join(format!("vertex-sm89-definition-r1/{case}.safetensors")),
+        "faces",
+    )?;
+    let mesh = fixture.run(d, &fixture.positions)?;
+    let name = format!("{case}.fixed_topology_vertices");
+    if extraction_mesh_check(g, &name, &mesh, &mapping, &source_faces.values)? {
+        g.score(
+            &name,
+            &extraction_select(&mesh.vertices, &selection, 3)?,
+            false,
+        )?;
+        let control = fixture.run(d, &control_positions)?;
+        if control.vertices.len() == mesh.vertices.len() {
+            g.score(
+                &name,
+                &extraction_select(&control.vertices, &selection, 3)?,
+                true,
+            )?;
+        } else {
+            extraction_exact(
+                g,
+                &format!("{name}.control_vertex_count"),
+                control.vertices.len().abs_diff(mesh.vertices.len()),
+            );
+        }
+    } else {
+        g.seen.insert(name);
+    }
+    Ok(())
+}
+
+fn extraction_analytic(g: &mut OperationGate, d: &Device) -> Result<()> {
+    let root = g.root.clone();
+    let proof: Value = serde_json::from_slice(&std::fs::read(
+        root.join("analytic-descriptor-r1/proof.json"),
+    )?)?;
+    let records = proof["records"]
+        .as_array()
+        .context("analytic records missing")?;
+    ensure!(
+        records.len() == 775 && proof["reference_proof"] == "PASS",
+        "invalid analytic coverage"
+    );
+    let descriptor = root.join("analytic-descriptor-r1/descriptor.safetensors");
+    let all_positions = f32_tensor(&descriptor, "positions")?;
+    let all_control = f32_tensor(&descriptor, "control_positions")?;
+    let all_scalar = f32_tensor(&descriptor, "scalar")?;
+    let local = root.join("case-oracle-CPU-sm86-r1/cases.safetensors");
+    let closed = root.join("closed-oracle-CPU-sm86-r1/closed.safetensors");
+    let source = root.join("analytic-sm89-r1/outputs.safetensors");
+    let mut values = Vec::new();
+    let mut controls = Vec::new();
+    let mut comparable = true;
+    let mut winding_control = false;
+    for record in records {
+        let name = record["name"].as_str().context("analytic name missing")?;
+        let first = record["point_offset"]
+            .as_u64()
+            .context("analytic point offset missing")? as usize;
+        let points = record["points"]
+            .as_u64()
+            .context("analytic point count missing")? as usize;
+        ensure!(
+            first + points <= all_scalar.len()
+                && (first + points) * 3 <= all_positions.len()
+                && all_positions.len() == all_control.len(),
+            "analytic descriptor extent mismatch"
+        );
+        let base = if name.starts_with("closed.") {
+            &closed
+        } else {
+            &local
+        };
+        let fixture = ExtractionInput {
+            coordinates: extraction_sites(base, "cube_map")?,
+            cubes: extraction_indices(base, "cube_idx")?
+                .into_iter()
+                .map(|i| i as u32)
+                .collect(),
+            positions: all_positions[first * 3..(first + points) * 3].to_vec(),
+            scalar: all_scalar[first..first + points].to_vec(),
+        };
+        let mapping = indices(&record["oracle_indices"])?;
+        let faces = tensor(&source, &format!("{name}.faces"))?;
+        let mesh = fixture.run(d, &fixture.positions)?;
+        let complete = extraction_mesh_check(g, name, &mesh, &mapping, &faces.values)?;
+        comparable &= complete;
+        if complete {
+            values.extend(mesh.vertices.iter().map(|&v| v as f64));
+        }
+        let control = fixture.run(d, &all_control[first * 3..(first + points) * 3])?;
+        comparable &= control.vertices.len() == mapping.len() * 3;
+        extraction_exact(
+            g,
+            &format!("{name}.control_vertex_count"),
+            control.vertices.len().abs_diff(mapping.len() * 3),
+        );
+        if control.vertices.len() == mapping.len() * 3 {
+            controls.extend(control.vertices.iter().map(|&v| v as f64));
+        }
+        if !winding_control && !mesh.faces.is_empty() {
+            let actual = extraction_faces(&mesh.faces, None)?;
+            let mut reversed = mesh.faces.clone();
+            reversed[..3].reverse();
+            let wrong = extraction_faces(&reversed, None)?;
+            extraction_exact(
+                g,
+                "reverse_one_triangle_control",
+                usize::from(actual == wrong),
+            );
+            println!(
+                "N5_M3_WINDING_CONTROL case={name} oriented_counter_changed={} undirected_geometry_unchanged=true",
+                actual != wrong
+            );
+            winding_control = true;
+        }
+    }
+    ensure!(winding_control, "winding control was not executed");
+    let name = "analytic.all775.fixed_topology_vertices";
+    if comparable {
+        g.score(name, &values, false)?;
+        g.score(name, &controls, true)?;
+    } else {
+        g.seen.insert(name.into());
+        println!("DEFECT N5_M3_METRIC cell={name} result=not_comparable_due_to_vertex_count");
+    }
+    println!(
+        "N5_M3_ANALYTIC_COVERAGE records=775 local_cases=256 closed_sign_arms=512 tie_cases=7"
+    );
+    Ok(())
+}
+
+fn extraction_geometry(g: &mut OperationGate, d: &Device) -> Result<()> {
+    let source = g.root.join("geometry-sm89-r1/outputs.safetensors");
+    let cpu = g.root.join("geometry-CPU-r1/outputs.safetensors");
+    for case in ["open_plane", "closed_sphere", "disconnected_spheres"] {
+        let fixture = ExtractionInput {
+            coordinates: extraction_sites(&source, "cube_map")?,
+            cubes: extraction_indices(&source, "cube_idx")?
+                .into_iter()
+                .map(|i| i as u32)
+                .collect(),
+            positions: f32_tensor(&source, "positions")?,
+            scalar: f32_tensor(&source, &format!("{case}.field"))?,
+        };
+        let mapping = extraction_indices(&source, &format!("{case}.oracle_indices"))?;
+        let faces = tensor(&source, &format!("{case}.definition.faces"))?;
+        let mesh = fixture.run(d, &fixture.positions)?;
+        let name = format!("geometry.{case}.fixed_topology_vertices");
+        if extraction_mesh_check(g, &name, &mesh, &mapping, &faces.values)? {
+            g.score(
+                &name,
+                &mesh.vertices.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                false,
+            )?;
+            let points = fixture.positions.len() / 3;
+            let control_positions: Vec<_> = (0..points)
+                .flat_map(|i| {
+                    let previous = (i + points - 1) % points;
+                    fixture.positions[previous * 3..(previous + 1) * 3]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            let control = fixture.run(d, &control_positions)?;
+            extraction_exact(
+                g,
+                &format!("{name}.control_vertex_count"),
+                control.vertices.len().abs_diff(mapping.len() * 3),
+            );
+            if control.vertices.len() == mapping.len() * 3 {
+                g.score(
+                    &name,
+                    &control
+                        .vertices
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect::<Vec<_>>(),
+                    true,
+                )?;
+            }
+        } else {
+            g.seen.insert(name);
+        }
+        let expected = tensor(&cpu, &format!("{case}.definition.vertices"))?;
+        println!(
+            "N5_M3_GEOMETRY_COVERAGE case={case} vertices={} reference_vertices={} faces={}",
+            mesh.vertices.len() / 3,
+            expected.values.len() / 3,
+            mesh.faces.len() / 3
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen corner/extraction inputs"]
+fn hi3d_sparse_extraction_definition_gpu() -> Result<()> {
+    let mut gate = OperationGate::extraction()?;
+    let d = Device::new(0)?;
+    for case in ["cottage", "robot"] {
+        extraction_real(&mut gate, &d, case)?;
+    }
+    extraction_analytic(&mut gate, &d)?;
+    extraction_geometry(&mut gate, &d)?;
+    gate.finish()?;
+    println!(
+        "PASS N5_M3_EXTRACTION_GATE continuous_cells=12 analytic_records=775 geometry_cases=3 real_cases=2 controls=true eager=true timing=false"
+    );
+    Ok(())
+}
+
+fn linked_mesh_save(
+    path: &Path,
+    mesh: &crate::sparse::SparseMesh,
+    coordinates: &[[i32; 4]],
+    latent: &[f32],
+    frame: [[f32; 4]; 4],
+) -> Result<()> {
+    use std::io::Write;
+    let vertices: Vec<_> = mesh.vertices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let faces: Vec<_> = mesh.faces.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let coordinates_data: Vec<_> = coordinates
+        .as_flattened()
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let latent_data: Vec<_> = latent.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let matrix: Vec<_> = frame
+        .as_flattened()
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let tensors = BTreeMap::from([
+        (
+            "vertices",
+            safetensors::tensor::TensorView::new(
+                Dtype::F32,
+                vec![mesh.vertices.len() / 3, 3],
+                &vertices,
+            )?,
+        ),
+        (
+            "faces",
+            safetensors::tensor::TensorView::new(
+                Dtype::I32,
+                vec![mesh.faces.len() / 3, 3],
+                &faces,
+            )?,
+        ),
+        (
+            "coordinates",
+            safetensors::tensor::TensorView::new(
+                Dtype::I32,
+                vec![coordinates.len(), 4],
+                &coordinates_data,
+            )?,
+        ),
+        (
+            "final_latents",
+            safetensors::tensor::TensorView::new(
+                Dtype::F32,
+                vec![coordinates.len(), 32],
+                &latent_data,
+            )?,
+        ),
+        (
+            "matrix",
+            safetensors::tensor::TensorView::new(Dtype::F32, vec![4, 4], &matrix)?,
+        ),
+    ]);
+    let bytes = safetensors::tensor::serialize(tensors, None)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(&bytes)?;
+    Ok(())
+}
+
+fn linked_mesh_case(
+    model: &Path,
+    root: &Path,
+    runtime: &Path,
+    output: &Path,
+    context: &CudaSlice<f32>,
+    support: &str,
+    label: &str,
+) -> Result<crate::sparse::SparseMesh> {
+    let source = root.join(format!("linked-sm89-{support}-r1"));
+    let handoff = source.join("handoff.safetensors");
+    let coordinates = decoder_coordinates(&handoff, "coordinates")?;
+    ensure!(
+        coordinates.iter().all(|p| p[0] == 0),
+        "linked source support has multiple batches"
+    );
+    let grid: Vec<_> = coordinates.iter().map(|p| [p[1], p[2], p[3]]).collect();
+    let noise = f32_tensor(&handoff, "noise")?;
+    ensure!(
+        noise.len() == grid.len() * 32,
+        "linked source noise extent mismatch"
+    );
+    let observations: Value =
+        serde_json::from_slice(&std::fs::read(source.join("observations.json"))?)?;
+    let frame: [[f32; 4]; 4] = serde_json::from_value(observations["matrix"].clone())?;
+    let device = Device::new(0)?;
+    let budget = || -> Result<usize> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        let envelope = total.saturating_sub(total / 4);
+        envelope
+            .checked_sub(total - free)
+            .context("linked resident data exceeds derived device envelope")
+    };
+    let mut flow = Flow::<f16>::open_hi3d(model, "transformer_512", runtime, &grid, budget()?)?;
+    ensure!(
+        flow.coordinates == grid
+            && flow.io.as_ref().context("linked sparse IO missing")?.rows == grid.len(),
+        "linked support did not reach flow setup"
+    );
+    let positive = flow.conditioning_device(context, &grid)?;
+    let zero = flow.device.stream.alloc_zeros::<f32>(2917 * 2048)?;
+    let negative = flow.conditioning_device(&zero, &grid)?;
+    let latent = flow.sample_heun(&noise, &positive, &negative)?;
+    ensure!(
+        latent.len() == coordinates.len() * 32 && latent.iter().all(|v| v.is_finite()),
+        "linked latent handoff is invalid"
+    );
+    drop(positive);
+    drop(negative);
+    drop(zero);
+    drop(flow);
+    let decoder = PixalDecoder::open(model, DecoderKind::PointTransformer, runtime, budget()?)?;
+    let mesh = decoder.points_mesh(coordinates.clone(), &latent, frame, 64)?;
+    ensure!(
+        mesh.vertices.len().is_multiple_of(3)
+            && mesh.vertices.iter().all(|v| v.is_finite())
+            && mesh.faces.len().is_multiple_of(3),
+        "linked mesh has invalid buffers"
+    );
+    ensure!(
+        mesh.faces
+            .iter()
+            .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+        "linked mesh face exceeds capacity"
+    );
+    let path = output.join(label);
+    std::fs::create_dir(&path)?;
+    linked_mesh_save(
+        &path.join("native.safetensors"),
+        &mesh,
+        &coordinates,
+        &latent,
+        frame,
+    )?;
+    let repeat: Value = serde_json::from_slice(&std::fs::read(
+        root.join(format!("linked-sm89-{support}-r2/observations.json")),
+    )?)?;
+    println!(
+        "N5_M3_LINKED_MEASUREMENT label={label} support={support} input_rows={} latent_channels=32 updates=25 vertices={} faces={} source_r1_vertices={} source_r1_faces={} source_r2_vertices={} source_r2_faces={} equivalence_gate=false hole_fill=false timing=false",
+        grid.len(),
+        mesh.vertices.len() / 3,
+        mesh.faces.len() / 3,
+        observations["vertices"],
+        observations["triangles"],
+        repeat["vertices"],
+        repeat["triangles"]
+    );
+    Ok(mesh)
+}
+
+#[test]
+#[ignore = "requires admitted CUDA, published image/flow/decoder checkpoints and frozen media"]
+fn hi3d_linked_image_mesh_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let image_root = env_path("FF_HI3D_IMAGE_FIXTURES")?;
+    let model = env_path("FF_HI3D_MODEL")?;
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?;
+    let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    std::fs::create_dir_all(&output)?;
+    let image_bytes = std::fs::read(image_root.join("cpu-r2/inputs.safetensors"))?;
+    let images = safetensors::SafeTensors::deserialize(&image_bytes)?;
+    let image_freeze: Value =
+        serde_json::from_slice(&std::fs::read(image_root.join("FROZEN.json"))?)?;
+    let device = Device::new(0)?;
+    let ops = Ops::new(&device.ctx)?;
+    let mut blas = Blas::new(
+        &device,
+        &ops,
+        &runtime_path,
+        Rc::new(Closure::new(false, "linked image mesh gate".into())),
+    )?;
+    let mut conditioner = crate::backend::Hi3DImageConditioner::load(
+        &device,
+        &mut blas,
+        &env_path("FF_DINOV2_MODEL")?,
+        &env_path("FF_CLIP_MODEL")?,
+    )?;
+    let mut contexts = Vec::new();
+    let mut hosts = Vec::new();
+    for (index, name) in ["cottage", "robot_crab", "cottage"].into_iter().enumerate() {
+        let rgba = images.tensor(&format!("{name}.rgba"))?;
+        let orientation = images.tensor(&format!("{name}.orientation"))?;
+        ensure!(
+            rgba.dtype() == Dtype::U8 && rgba.shape().len() == 3 && rgba.shape()[2] == 4,
+            "linked RGBA input layout mismatch"
+        );
+        let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
+        let context = conditioner.encode_rgba(
+            &blas,
+            rgba.data(),
+            [rgba.shape()[0], rgba.shape()[1]],
+            orientation,
+        )?;
+        let mut owned = device.stream.alloc_zeros::<f32>(context.len())?;
+        device.stream.memcpy_dtod(context, &mut owned)?;
+        hosts.push(device.stream.clone_dtoh(&owned)?);
+        contexts.push(owned);
+        ensure!(
+            conditioner.encoder_calls() == [(index + 1) as u64; 2],
+            "linked image encoder call count differs"
+        );
+        println!(
+            "PASS N5_M3_LINKED_MEDIA image={name} invocation={} encoder_calls={:?}",
+            index + 1,
+            conditioner.encoder_calls()
+        );
+    }
+    drop(conditioner.into_context()?);
+    drop(blas);
+    let bounds = &image_freeze["cells"]["cottage.context"]["bounds"];
+    let first: Vec<_> = hosts[0].iter().map(|&v| v as f64).collect();
+    let swapped: Vec<_> = hosts[1].iter().map(|&v| v as f64).collect();
+    let replay: Vec<_> = hosts[2].iter().map(|&v| v as f64).collect();
+    let isolated = metrics(&replay, &first)?;
+    let image_control = metrics(&swapped, &first)?;
+    let mut defects = 0;
+    for metric in ["max_abs", "rmse"] {
+        let bound = bounds[metric]
+            .as_f64()
+            .context("frozen image context bound missing")?;
+        let bad = isolated[metric] > bound || image_control[metric] <= 10.0 * bound;
+        defects += usize::from(bad);
+        println!(
+            "{} N5_M3_LINKED_CONTEXT metric={metric} replay={} bound={bound} image_control={} control_multiple={}",
+            if bad { "DEFECT" } else { "PASS" },
+            isolated[metric],
+            image_control[metric],
+            image_control[metric] / bound
+        );
+    }
+    drop(hosts);
+    drop(first);
+    drop(swapped);
+    drop(replay);
+    let mut meshes = Vec::new();
+    for (index, support, label) in [
+        (0, "cottage", "cottage-A1"),
+        (1, "robot_crab", "robot-B1"),
+        (2, "cottage", "cottage-A2"),
+        (0, "robot_crab", "cottage-image-robot-support-control"),
+    ] {
+        let mesh = linked_mesh_case(
+            &model,
+            &root,
+            &runtime_path,
+            &output,
+            &contexts[index],
+            support,
+            label,
+        )?;
+        let empty = mesh.vertices.is_empty() || mesh.faces.is_empty();
+        defects += usize::from(empty);
+        println!(
+            "{} N5_M3_LINKED_NONEMPTY label={label} vertices={} triangles={}",
+            if empty { "DEFECT" } else { "PASS" },
+            mesh.vertices.len() / 3,
+            mesh.faces.len() / 3
+        );
+        meshes.push(mesh);
+    }
+    let distinct_media =
+        meshes[1].vertices != meshes[3].vertices || meshes[1].faces != meshes[3].faces;
+    let distinct_support =
+        meshes[0].vertices != meshes[3].vertices || meshes[0].faces != meshes[3].faces;
+    defects += usize::from(!distinct_media) + usize::from(!distinct_support);
+    println!(
+        "{} N5_M3_LINKED_ASSOCIATION image_outputs_differ_at_fixed_support_and_noise={distinct_media} held_image_support_swap_differs={distinct_support}",
+        if distinct_media && distinct_support {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
+    );
+    println!(
+        "{} N5_M3_LINKED_GATE image_inputs=2 main_runs=3 support_controls=1 encoder_calls=3,3 raw_meshes=4 defects={defects} unforced_equivalence=false hole_fill=false timing=false",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "finite linked pipeline candidate defects");
+    Ok(())
+}
+
 struct Gate {
     package: &'static str,
     cells: BTreeMap<CellId, Value>,

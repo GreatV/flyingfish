@@ -3716,6 +3716,11 @@ pub struct CornerDecoderOutput {
     pub matrix: [[f32; 4]; 4],
     pub resolution: u32,
 }
+struct PointFields {
+    sites: SparseSites,
+    attributes: CudaSlice<f32>,
+    resolution: u32,
+}
 struct PointWorkspace<T> {
     conv: SparseConv<f32>,
     norms: BTreeMap<usize, BatchGroupNorm>,
@@ -4511,13 +4516,13 @@ impl PixalDecoder {
         )?;
         Ok(output)
     }
-    pub fn points(
+    fn points_device(
         &self,
         coordinates: Vec<[i32; 4]>,
         latent: &[f32],
         frame: [[f32; 4]; 4],
         resolution: u32,
-    ) -> Result<CornerDecoderOutput> {
+    ) -> Result<PointFields> {
         ensure!(
             matches!(self.kind, DecoderKind::PointTransformer),
             "point decoder requires point transformer weights"
@@ -4581,7 +4586,22 @@ impl PixalDecoder {
                 .arg(&u32::try_from(rows)?)
                 .launch(flat(rows * 32))?;
         }
-        let values = d.stream.clone_dtoh(&fields)?;
+        Ok(PointFields {
+            sites,
+            attributes: fields,
+            resolution: output_resolution,
+        })
+    }
+    pub fn points(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        frame: [[f32; 4]; 4],
+        resolution: u32,
+    ) -> Result<CornerDecoderOutput> {
+        let output = self.points_device(coordinates, latent, frame, resolution)?;
+        let rows = output.sites.coordinates().len();
+        let values = self.device.stream.clone_dtoh(&output.attributes)?;
         ensure!(
             values.iter().all(|v| v.is_finite()),
             "nonfinite point decoder fields"
@@ -4594,14 +4614,42 @@ impl PixalDecoder {
         }
         Ok(CornerDecoderOutput {
             fields: SparseDecoderOutput {
-                coordinates: sites.coordinates().to_vec(),
+                coordinates: output.sites.coordinates().to_vec(),
                 features,
                 channels: 32,
             },
             sign_logits,
             matrix: frame,
-            resolution: output_resolution,
+            resolution: output.resolution,
         })
+    }
+    pub fn points_mesh(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        frame: [[f32; 4]; 4],
+        resolution: u32,
+    ) -> Result<crate::sparse::SparseMesh> {
+        ensure!(
+            coordinates.iter().all(|p| p[0] == 0),
+            "corner mesh requires one batch"
+        );
+        let output = self.points_device(coordinates, latent, frame, resolution)?;
+        let d = &self.device;
+        let budget = [self.initial_free, self.device_budget];
+        let fields =
+            super::sparse::corner_fields(d, &output.sites, &output.attributes, frame, budget)?;
+        drop(output.attributes);
+        drop(fields.layout);
+        drop(fields.means);
+        super::sparse::cube_mesh(
+            d,
+            output.sites,
+            fields.cube_to_corner,
+            fields.positions,
+            fields.scalar,
+            budget,
+        )
     }
     fn linear16(
         &self,
