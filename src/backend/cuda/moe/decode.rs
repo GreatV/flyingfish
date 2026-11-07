@@ -339,15 +339,6 @@ impl DecodeOps {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_invariant(ctx: &Arc<CudaContext>) -> Result<Self> {
-        Self::new_invariant_with_boundaries(
-            ctx,
-            crate::model_spec::SwigluRounding::Twice,
-            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-        )
-    }
-
     pub(crate) fn new_invariant_with_boundaries(
         ctx: &Arc<CudaContext>,
         swiglu_rounding: crate::model_spec::SwigluRounding,

@@ -218,10 +218,14 @@ fn row<T: Copy>(tensor: Tensor<T, 2>, index: usize) -> Result<Tensor<T, 2>> {
     }
 }
 
-fn invariant_decode(device: &Device) -> Result<()> {
+fn invariant_decode(
+    device: &Device,
+    rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
+) -> Result<()> {
     use crate::cpu::expert_ffn as cpu;
     let max_rows = crate::linear_plan::MAX_SKINNY_ROWS;
-    let fx = reference::fixture(
+    let mut fx = reference::fixture(
         MoeDims {
             experts: 17,
             ..MoeDims::minicpm47(max_rows)
@@ -234,7 +238,30 @@ fn invariant_decode(device: &Device) -> Result<()> {
         fx.dims.hidden,
         fx.dims.inter,
     );
+    let once = rounding == crate::model_spec::SwigluRounding::Once;
+    if once {
+        fx.x[h] = bf16::ONE;
+        fx.x[h + 1] = bf16::ZERO;
+        let base = 5 * 2 * i * h;
+        fx.gate_up[base..base + 2 * i * h].fill(bf16::ZERO);
+        fx.gate_up[base] = bf16::from_bits(0x3f49);
+        fx.gate_up[base + 1] = bf16::from_f32(352.0);
+        fx.gate_up[base + i * h] = bf16::from_bits(0x3e5f);
+        fx.gate_up[base + i * h + 1] = bf16::from_f32(97.5);
+        fx.down[5 * h * i..6 * h * i].fill(bf16::ZERO);
+        for column in 0..h {
+            fx.down[5 * h * i + column * i] = bf16::ONE;
+        }
+    }
     let world = w8a16_world(&fx)?;
+    if once {
+        ensure!(
+            world.effective_gate_up[5 * 2 * i * h].to_bits() == 0x3f49
+                && world.effective_gate_up[(5 * 2 * i + i) * h].to_bits() == 0x3e5f
+                && world.effective_down[5 * h * i].to_bits() == bf16::ONE.to_bits(),
+            "Once control effective FP8 weights differ"
+        );
+    }
     let mut arena = fx.gate_up.clone();
     arena.extend_from_slice(&fx.down);
     let s = &device.stream;
@@ -249,16 +276,19 @@ fn invariant_decode(device: &Device) -> Result<()> {
     let ids: Vec<_> = (0..max_rows * k)
         .map(|a| ((a / k * 5 + a % k * 3) % e) as i32)
         .collect();
-    let weights: Vec<_> = (0..max_rows * k)
+    let mut weights: Vec<_> = (0..max_rows * k)
         .map(|a| bf16::from_f32(1.0 / (2 + (a * 7) % 19) as f32))
         .collect();
+    if once {
+        weights[k] = bf16::from_f32(0.5);
+    }
     let ids_device = s.clone_htod(&ids)?;
     let weights_device = s.clone_htod(&weights)?;
     let active = s.clone_htod(&vec![1u32; max_rows * k])?;
     let assigned = s.clone_htod(&vec![1u64; max_rows * k])?;
     let scratch = s.alloc_zeros::<u8>(decode_scratch_bytes(max_rows, k, i) as usize)?;
-    let ops = DecodeOps::new_invariant(&device.ctx)?;
-    let legacy = DecodeOps::new(&device.ctx)?;
+    let ops = DecodeOps::new_invariant_with_boundaries(&device.ctx, rounding, routed_weight)?;
+    let legacy = DecodeOps::new_with_boundaries(&device.ctx, rounding, routed_weight)?;
     let combine = CombineOps::new(&device.ctx)?;
     let geometry = ExpertGeometry {
         first_layer: 0,
@@ -355,6 +385,17 @@ fn invariant_decode(device: &Device) -> Result<()> {
                 all.extend(values);
             }
         }
+        if once {
+            let mismatches = serial[0][k * h..(k + 1) * h]
+                .iter()
+                .filter(|value| value.to_bits() != 0x3d71)
+                .count();
+            defects += usize::from(mismatches != 0);
+            println!(
+                "{} INVARIANT_MOE_ONCE_CONTROL format={format:?} row=1 expert=5 expected_bits=3d71 old_reciprocal_bits=3d70 bit_mismatches={mismatches}",
+                if mismatches == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
         for rows in 1..=max_rows {
             for graph in [false, true] {
                 let got = gate.stages(rows as u32, &routing, slot, graph)?;
@@ -395,10 +436,9 @@ fn invariant_decode(device: &Device) -> Result<()> {
                                     hidden: &fx.x[r * h..(r + 1) * h],
                                     routing: weights[a].to_f32(),
 
-                                    rounding: crate::model_spec::SwigluRounding::Twice,
+                                    rounding,
                                     limit: 0.0,
-                                    routed_weight:
-                                        crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                                    routed_weight,
                                 },
                                 output,
                                 &mut cpu_scratch,
@@ -420,10 +460,9 @@ fn invariant_decode(device: &Device) -> Result<()> {
                                     hidden: &fx.x[r * h..(r + 1) * h],
                                     routing: weights[a].to_f32(),
 
-                                    rounding: crate::model_spec::SwigluRounding::Twice,
+                                    rounding,
                                     limit: 0.0,
-                                    routed_weight:
-                                        crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                                    routed_weight,
                                 },
                                 output,
                                 &mut cpu_scratch,
@@ -460,12 +499,15 @@ fn invariant_decode(device: &Device) -> Result<()> {
             .zip(&cpu_output)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        ensure!(
-            mismatches > 0,
-            "legacy lane8 control did not distinguish lane16"
-        );
+        if !once {
+            ensure!(
+                mismatches > 0,
+                "legacy lane8 control did not distinguish lane16"
+            );
+        }
         println!(
-            "PASS INVARIANT_MOE_CONTROL format={format:?} legacy_lane8=true bit_mismatches={mismatches}"
+            "{} INVARIANT_MOE_CONTROL format={format:?} legacy_lane8=true bit_mismatches={mismatches}",
+            if once { "MEASURE" } else { "PASS" }
         );
         // Lane8 arm: the CPU must reproduce the production kernel's 8-lane 4/2/1 tree, not just
         // the lane16 one. The legacy kernel traps above eight rows, so the arm stops there.
@@ -594,7 +636,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
         );
     }
     println!(
-        "INVARIANT_MOE_SUMMARY formats=2 rows=1..16 stages=3 eager_graph=true weighted_CPU=true defects={defects}"
+        "INVARIANT_MOE_SUMMARY rounding={rounding:?} routed_weight={routed_weight:?} formats=2 rows=1..16 stages=3 eager_graph=true weighted_CPU=true defects={defects}"
     );
     ensure!(defects == 0, "invariant MoE DEFECT cells={defects}");
     Ok(())
@@ -882,7 +924,18 @@ fn decode_expert_ffn_gpu() -> Result<()> {
     );
     let device = Device::new(0)?;
     if std::env::var_os("FF_MOE_CHILD").is_none() {
-        invariant_decode(&device)?;
+        for (rounding, routed_weight) in [
+            (
+                crate::model_spec::SwigluRounding::Twice,
+                crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+            ),
+            (
+                crate::model_spec::SwigluRounding::Once,
+                crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+            ),
+        ] {
+            invariant_decode(&device, rounding, routed_weight)?;
+        }
     }
     let ops = DecodeOps::new(&device.ctx)?;
     let combine_ops = CombineOps::new(&device.ctx)?;
