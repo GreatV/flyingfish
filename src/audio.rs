@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 pub struct Radix2Fft {
     size: usize,
     reverse: Vec<usize>,
-    twiddles: Vec<[f32; 2]>,
+    twiddles: Vec<[f64; 2]>,
 }
 
 impl Radix2Fft {
@@ -20,7 +20,7 @@ impl Radix2Fft {
         let twiddles = (0..size / 2)
             .map(|index| {
                 let angle = -2.0 * std::f64::consts::PI * index as f64 / size as f64;
-                [angle.cos() as f32, angle.sin() as f32]
+                [angle.cos(), angle.sin()]
             })
             .collect();
         Ok(Self {
@@ -38,9 +38,9 @@ impl Radix2Fft {
                 && input.iter().all(|value| value.is_finite()),
             "FFT input/output shape or finite-value mismatch"
         );
+        let mut spectrum = vec![[0.0f64; 2]; self.size];
         for (index, &source) in self.reverse.iter().enumerate() {
-            output[2 * index] = input[source];
-            output[2 * index + 1] = 0.0;
+            spectrum[index] = [f64::from(input[source]), 0.0];
         }
         let mut span = 2;
         while span <= self.size {
@@ -48,22 +48,22 @@ impl Radix2Fft {
             let stride = self.size / span;
             for base in (0..self.size).step_by(span) {
                 for offset in 0..half {
-                    let even = 2 * (base + offset);
-                    let odd = even + 2 * half;
+                    let even = base + offset;
+                    let odd = even + half;
                     let [wr, wi] = self.twiddles[offset * stride];
-                    let xr = output[odd];
-                    let xi = output[odd + 1];
+                    let [xr, xi] = spectrum[odd];
                     let vr = wr.mul_add(xr, -wi * xi);
                     let vi = wr.mul_add(xi, wi * xr);
-                    let ur = output[even];
-                    let ui = output[even + 1];
-                    output[even] = ur + vr;
-                    output[even + 1] = ui + vi;
-                    output[odd] = ur - vr;
-                    output[odd + 1] = ui - vi;
+                    let [ur, ui] = spectrum[even];
+                    spectrum[even] = [ur + vr, ui + vi];
+                    spectrum[odd] = [ur - vr, ui - vi];
                 }
             }
             span *= 2;
+        }
+        for (index, value) in spectrum.iter().enumerate() {
+            output[2 * index] = value[0] as f32;
+            output[2 * index + 1] = value[1] as f32;
         }
         ensure!(
             output.iter().all(|value| value.is_finite()),
@@ -121,9 +121,10 @@ impl LogMel {
         let fft = Radix2Fft::new(n_fft)?;
         let mut window = vec![0.0; n_fft];
         let first = (n_fft - win_length) / 2;
+        let step = ((std::f64::consts::PI * 2.0) / (win_length - 1) as f64) as f32;
         for index in 0..win_length {
-            let phase = 2.0 * std::f64::consts::PI * index as f64 / (win_length - 1) as f64;
-            window[first + index] = (0.5 - 0.5 * phase.cos()) as f32;
+            let angle = index as f32 * step;
+            window[first + index] = -0.5 * angle.cos() + 0.5;
         }
         let bins = n_fft / 2 + 1;
         let mel_bins = config.mel_bins as usize;
@@ -167,7 +168,17 @@ impl LogMel {
         })
     }
 
-    pub fn extract(&self, waveforms: &[&[f32]], normalize: bool) -> Result<LogMelBatch> {
+    pub fn extract(
+        &self,
+        waveforms: &[&[f32]],
+        normalize: bool,
+        center: bool,
+        last: bool,
+    ) -> Result<LogMelBatch> {
+        ensure!(!last || !center, "last-chunk pad requires center false");
+        if !center {
+            return self.extract_edge(waveforms, normalize, last);
+        }
         ensure!(!waveforms.is_empty(), "empty audio batch");
         for waveform in waveforms {
             ensure!(
@@ -269,6 +280,120 @@ impl LogMel {
             mask,
         })
     }
+
+    fn extract_edge(
+        &self,
+        waveforms: &[&[f32]],
+        normalize: bool,
+        last: bool,
+    ) -> Result<LogMelBatch> {
+        ensure!(!waveforms.is_empty(), "empty audio batch");
+        let n_fft = self.config.n_fft as usize;
+        let hop = self.config.hop_length as usize;
+        ensure!(hop < n_fft / 2, "last-chunk pad is empty");
+        let mut prepared = Vec::with_capacity(waveforms.len());
+        for waveform in waveforms {
+            ensure!(
+                waveform.len() >= n_fft && waveform.iter().all(|value| value.is_finite()),
+                "center-false waveform length {} is shorter than n_fft {n_fft}",
+                waveform.len()
+            );
+            let mut samples = Vec::with_capacity(waveform.len() + n_fft / 2);
+            samples.push(waveform[0]);
+            for index in 1..waveform.len() {
+                samples.push(waveform[index] - self.config.preemphasis * waveform[index - 1]);
+            }
+            if last {
+                samples.resize(samples.len() + n_fft / 2 - hop, 0.0);
+            }
+            let valid = (samples.len() - n_fft) / hop + 1;
+            ensure!(valid > 0, "center-false waveform produced no frames");
+            prepared.push((samples, valid));
+        }
+        let frames = prepared
+            .iter()
+            .map(|(_, valid)| *valid)
+            .max()
+            .context("audio batch has no maximum length")?;
+        let mel_bins = self.config.mel_bins as usize;
+        let bins = n_fft / 2 + 1;
+        let feature_count = waveforms
+            .len()
+            .checked_mul(frames)
+            .and_then(|count| count.checked_mul(mel_bins))
+            .context("log-mel output size overflow")?;
+        let mut features = vec![0.0; feature_count];
+        let mut mask = vec![false; waveforms.len() * frames];
+        let mut frame = vec![0.0; n_fft];
+        let mut spectrum = vec![0.0; n_fft * 2];
+        let mut power = vec![0.0; bins];
+        for (batch, (samples, valid)) in prepared.iter().enumerate() {
+            for time in 0..*valid {
+                for (index, value) in frame.iter_mut().enumerate() {
+                    let sample = time * hop + index;
+                    let emphasized = samples.get(sample).copied().unwrap_or(0.0);
+                    *value = emphasized * self.window[index];
+                }
+                self.fft.run(&frame, &mut spectrum)?;
+                for (bin, power) in power.iter_mut().enumerate() {
+                    let re = spectrum[2 * bin];
+                    let im = spectrum[2 * bin + 1];
+                    let magnitude = (re * re + im * im).sqrt();
+                    *power = magnitude * magnitude;
+                }
+                for mel in 0..mel_bins {
+                    let mut value = 0.0f32;
+                    for (&weight, &power) in self.filters[mel * bins..(mel + 1) * bins]
+                        .iter()
+                        .zip(power.iter())
+                    {
+                        value = weight.mul_add(power, value);
+                    }
+                    features[(batch * frames + time) * mel_bins + mel] =
+                        (value + self.config.log_guard).ln();
+                }
+            }
+            for mel in 0..mel_bins {
+                if normalize {
+                    ensure!(
+                        *valid >= 2,
+                        "normalized center-false audio needs two frames"
+                    );
+                    let mut mean = 0.0;
+                    for time in 0..*valid {
+                        mean += features[(batch * frames + time) * mel_bins + mel];
+                    }
+                    mean /= *valid as f32;
+                    let mut variance = 0.0;
+                    for time in 0..*valid {
+                        let delta = features[(batch * frames + time) * mel_bins + mel] - mean;
+                        variance = delta.mul_add(delta, variance);
+                    }
+                    let std = (variance / (*valid - 1) as f32).sqrt();
+                    for time in 0..*valid {
+                        let index = (batch * frames + time) * mel_bins + mel;
+                        features[index] = (features[index] - mean) / (std + self.config.norm_eps);
+                    }
+                }
+                for time in *valid..frames {
+                    features[(batch * frames + time) * mel_bins + mel] = 0.0;
+                }
+            }
+            for time in 0..*valid {
+                mask[batch * frames + time] = true;
+            }
+        }
+        ensure!(
+            features.iter().all(|value| value.is_finite()),
+            "log-mel produced a non-finite value"
+        );
+        Ok(LogMelBatch {
+            frames,
+            mel_bins,
+            features,
+            mask,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -324,8 +449,8 @@ mod tests {
                 integer + tone
             })
             .collect();
-        let normalized = mel.extract(&[&wave], true)?;
-        let logged = mel.extract(&[&wave], false)?;
+        let normalized = mel.extract(&[&wave], true, true, false)?;
+        let logged = mel.extract(&[&wave], false, true, false)?;
         ensure!(
             normalized.frames == 17 && logged.frames == 17,
             "frame count"
@@ -346,6 +471,22 @@ mod tests {
         }
         logged_mean /= 16.0;
         normalized_mean /= 16.0;
+        let edge = mel.extract(&[&vec![0.1; 5520]], false, false, false)?;
+        let tail = mel.extract(&[&vec![0.1; 2000]], false, false, true)?;
+        let first = mel.extract(&[&vec![0.1; 4040]], false, true, false)?;
+        ensure!(
+            edge.frames == 32
+                && edge.mask.iter().all(|value| *value)
+                && tail.frames == 10
+                && tail.mask.iter().all(|value| *value)
+                && first.frames == 26
+                && first.mask.iter().filter(|value| **value).count() == 25
+                && mel
+                    .extract(&[&vec![0.1; 100]], false, false, false)
+                    .is_err()
+                && mel.extract(&[&vec![0.1; 4040]], false, true, true).is_err(),
+            "streaming log-mel frame counts changed"
+        );
         ensure!(
             logged_mean.abs() > 1e-3 && normalized_mean.abs() < 1e-5,
             "normalize flag did not change the frame mean: log={logged_mean} normalized={normalized_mean}"

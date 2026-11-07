@@ -1,6 +1,8 @@
 //! Parakeet TDT published configuration and tensor contract.
 #[cfg(feature = "cuda")]
-pub use crate::backend::cuda::engine_parakeet::ParakeetEncoder;
+pub use crate::backend::cuda::engine_parakeet::{
+    NemotronStream, ParakeetEncoder, StreamChunk, StreamOmit,
+};
 
 use crate::{
     audio::LogMelConfig,

@@ -17,6 +17,10 @@ use std::{path::Path, sync::Arc};
 static ENCODE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 static ENCODE_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static POSITION_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static ATTENTION_QUERY_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 macro_rules! note_launch {
     () => {
@@ -207,6 +211,128 @@ fn relative_positions(rows: usize, hidden: usize) -> Result<Vec<f32>> {
     Ok(positions)
 }
 
+struct AttentionLaunch<'a> {
+    q: &'a CudaSlice<f32>,
+    k: &'a CudaSlice<f32>,
+    v: &'a CudaSlice<f32>,
+    relative: &'a CudaSlice<f32>,
+    bias_u: &'a CudaSlice<f32>,
+    bias_v: &'a CudaSlice<f32>,
+    mask: &'a CudaSlice<u8>,
+    output: &'a CudaSlice<f32>,
+    rows: u32,
+    key_rows: u32,
+    query_offset: u32,
+    kv_offset: u32,
+    right_chunks: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamOmit {
+    None,
+    Keys,
+    Conv,
+}
+
+pub struct StreamChunk {
+    pub subsample: Vec<f32>,
+    pub layer0: Vec<f32>,
+    pub encoder: Vec<f32>,
+}
+
+struct ChunkCaches {
+    conv: [CudaSlice<f32>; 3],
+    keys: Vec<CudaSlice<f32>>,
+    values: Vec<CudaSlice<f32>>,
+    depthwise: Vec<CudaSlice<f32>>,
+}
+
+struct StreamWindow {
+    key_rows: u32,
+    query_offset: u32,
+    kv_offset: u32,
+    cached: u32,
+    omit: StreamOmit,
+}
+
+struct LayerStep {
+    hidden: CudaSlice<f32>,
+    key: CudaSlice<f32>,
+    value: CudaSlice<f32>,
+    depthwise: CudaSlice<f32>,
+}
+
+pub struct NemotronStream {
+    tables: Vec<CudaSlice<f32>>,
+    keys: Vec<CudaSlice<f32>>,
+    values: Vec<CudaSlice<f32>>,
+    depthwise: Vec<CudaSlice<f32>>,
+    conv: [Option<CudaSlice<f32>>; 3],
+    mask: CudaSlice<u8>,
+    key_frames: usize,
+    cumulative: u32,
+    chunks: u32,
+}
+
+impl NemotronStream {
+    pub fn key_frames(&self) -> usize {
+        self.key_frames
+    }
+
+    pub fn cumulative(&self) -> u32 {
+        self.cumulative
+    }
+
+    pub fn chunks(&self) -> u32 {
+        self.chunks
+    }
+}
+
+fn table_index(key_rows: u32) -> Result<usize> {
+    ensure!(
+        key_rows.is_multiple_of(4) && (4..=60).contains(&key_rows),
+        "streaming key rows {key_rows}"
+    );
+    Ok((key_rows / 4 - 1) as usize)
+}
+
+fn stream_window(cumulative_before: u32, query_rows: u32) -> Result<StreamWindow> {
+    ensure!(query_rows == 4, "streaming query rows {query_rows}");
+    let cached = if cumulative_before >= 57 {
+        56
+    } else {
+        cumulative_before
+    };
+    let kv_offset = if cumulative_before >= 57 {
+        cumulative_before - 56
+    } else {
+        0
+    };
+    let key_rows = cached + query_rows;
+    table_index(key_rows)?;
+    Ok(StreamWindow {
+        key_rows,
+        query_offset: cumulative_before,
+        kv_offset,
+        cached,
+        omit: StreamOmit::None,
+    })
+}
+
+#[cfg(test)]
+fn absolute_key_kept(
+    q_abs: u32,
+    k_abs: u32,
+    chunk_size: u32,
+    left_chunks: u32,
+    right_chunks: u32,
+) -> bool {
+    let q_chunk = q_abs / chunk_size;
+    let k_chunk = k_abs / chunk_size;
+    let start = q_chunk.saturating_sub(left_chunks);
+    (start..q_chunk + 1 + right_chunks).contains(&k_chunk)
+}
+
 impl ParakeetEncoder {
     pub fn load(directory: &Path, device: &Device) -> Result<Self> {
         let spec = ParakeetSpec::read(directory)?;
@@ -237,6 +363,21 @@ impl ParakeetEncoder {
     #[cfg(test)]
     pub(crate) fn encode_launches() -> u64 {
         ENCODE_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_position_uploads() {
+        POSITION_UPLOADS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn position_uploads() -> u64 {
+        POSITION_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attention_query_rows() -> u64 {
+        ATTENTION_QUERY_ROWS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn load_conformer(
@@ -739,30 +880,21 @@ impl ParakeetEncoder {
         let v = self.linear(&normalized, rows, &block.attention.v)?;
         let relative = self.linear(positions, 2 * rows - 1, &block.attention.relative)?;
         let core = self.stream.alloc_zeros(hidden.len())?;
-        unsafe {
-            self.stream
-                .launch_builder(&self.ops.relative_attention)
-                .arg(&q)
-                .arg(&k)
-                .arg(&v)
-                .arg(&relative)
-                .arg(&block.attention.bias_u)
-                .arg(&block.attention.bias_v)
-                .arg(&mask)
-                .arg(&core)
-                .arg(&rows)
-                .arg(&self.conformer.heads)
-                .arg(&(1.0f32 / 128f32.sqrt()))
-                .arg(&self.conformer.chunk_size)
-                .arg(&self.conformer.left_chunks)
-                .arg(&right_chunks)
-                .launch(LaunchConfig {
-                    grid_dim: (rows, self.conformer.heads, 1),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: (8 + rows) * 4,
-                })?;
-        }
-        note_launch!();
+        self.attend(AttentionLaunch {
+            q: &q,
+            k: &k,
+            v: &v,
+            relative: &relative,
+            bias_u: &block.attention.bias_u,
+            bias_v: &block.attention.bias_v,
+            mask: &mask,
+            output: &core,
+            rows,
+            key_rows: rows,
+            query_offset: 0,
+            kv_offset: 0,
+            right_chunks,
+        })?;
         let delta = self.linear(&core, rows, &block.attention.o)?;
         self.residual(&mut hidden, &delta, 1.0)?;
         let normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
@@ -904,6 +1036,668 @@ impl ParakeetEncoder {
     pub(crate) fn reset_encode_calls(&self) {
         self.encode_calls.store(0, Ordering::Relaxed);
     }
+
+    fn attend(&self, launch: AttentionLaunch<'_>) -> Result<()> {
+        let hidden = self.conformer.hidden as usize;
+        let rows = launch.rows as usize;
+        let key_rows = launch.key_rows as usize;
+        self.check_right(launch.right_chunks)?;
+        ensure!(
+            key_rows >= rows
+                && launch.k.len() == key_rows * hidden
+                && launch.v.len() == key_rows * hidden
+                && launch.q.len() == rows * hidden
+                && launch.output.len() == rows * hidden
+                && launch.relative.len() >= (rows + key_rows - 1) * hidden
+                && launch.mask.len() >= key_rows
+                && (self.conformer.chunk_size != 0
+                    || (launch.query_offset == 0
+                        && launch.kv_offset == 0
+                        && launch.key_rows == launch.rows)),
+            "attention launch shape rows={rows} key_rows={key_rows}"
+        );
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.relative_attention)
+                .arg(launch.q)
+                .arg(launch.k)
+                .arg(launch.v)
+                .arg(launch.relative)
+                .arg(launch.bias_u)
+                .arg(launch.bias_v)
+                .arg(launch.mask)
+                .arg(launch.output)
+                .arg(&launch.rows)
+                .arg(&self.conformer.heads)
+                .arg(&(1.0f32 / 128f32.sqrt()))
+                .arg(&self.conformer.chunk_size)
+                .arg(&self.conformer.left_chunks)
+                .arg(&launch.right_chunks)
+                .arg(&launch.key_rows)
+                .arg(&launch.query_offset)
+                .arg(&launch.kv_offset)
+                .launch(LaunchConfig {
+                    grid_dim: (launch.rows, self.conformer.heads, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: (8 + launch.key_rows) * 4,
+                })?;
+        }
+        note_launch!();
+        #[cfg(test)]
+        ATTENTION_QUERY_ROWS.store(u64::from(launch.rows), std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn copy_device(
+        &self,
+        source: &CudaSlice<f32>,
+        source_at: usize,
+        dest: &mut CudaSlice<f32>,
+        dest_at: usize,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        ensure!(
+            source_at
+                .checked_add(count)
+                .is_some_and(|end| end <= source.len())
+                && dest_at
+                    .checked_add(count)
+                    .is_some_and(|end| end <= dest.len()),
+            "device copy exceeds allocation"
+        );
+        self.stream.memcpy_dtod(
+            &source.slice(source_at..source_at + count),
+            &mut dest.slice_mut(dest_at..dest_at + count),
+        )?;
+        Ok(())
+    }
+
+    fn freq_pad(
+        &self,
+        input: &CudaSlice<f32>,
+        time: usize,
+        frequency: usize,
+        channels: usize,
+    ) -> Result<CudaSlice<f32>> {
+        let left = self.conformer.pad_left as usize;
+        let right = self.conformer.pad_right as usize;
+        let padded_freq = frequency + left + right;
+        let mut padded = self.stream.alloc_zeros(time * padded_freq * channels)?;
+        let row = frequency * channels;
+        let dest_row = padded_freq * channels;
+        for frame in 0..time {
+            self.copy_device(
+                input,
+                frame * row,
+                &mut padded,
+                frame * dest_row + left * channels,
+                row,
+            )?;
+        }
+        Ok(padded)
+    }
+
+    fn time_prepend(
+        &self,
+        input: &CudaSlice<f32>,
+        frequency: usize,
+        channels: usize,
+        cache: Option<&CudaSlice<f32>>,
+        zero_frames: usize,
+    ) -> Result<CudaSlice<f32>> {
+        let frame = frequency * channels;
+        let extra = if let Some(cache) = cache {
+            ensure!(
+                cache.len() == frame && zero_frames == 0,
+                "streaming conv prepend frame {frame}"
+            );
+            1
+        } else {
+            ensure!(zero_frames > 0, "streaming conv prepend is empty");
+            zero_frames
+        };
+        let mut output = self.stream.alloc_zeros(input.len() + extra * frame)?;
+        if let Some(cache) = cache {
+            self.copy_device(cache, 0, &mut output, 0, frame)?;
+        }
+        self.copy_device(input, 0, &mut output, extra * frame, input.len())?;
+        Ok(output)
+    }
+
+    /// Fifteen relative tables, L = 4, 8, ..., 60. `945 * 1024 * 4 = 3_870_720` bytes, uploaded once.
+    pub fn stream(&self) -> Result<NemotronStream> {
+        let conformer = &self.conformer;
+        ensure!(
+            conformer.chunk_size == 4
+                && conformer.left_chunks == 14
+                && conformer.pad_left == 2
+                && conformer.pad_right == 1
+                && conformer.depthwise_left == 8
+                && conformer.hidden == 1024
+                && conformer.heads == 8
+                && conformer.layers == 24
+                && conformer.conv_kernel == 9
+                && !conformer.conv_batch_norm
+                && !conformer.convolution_bias
+                && self.blocks.len() == 24,
+            "streaming session requires the published Nemotron encoder"
+        );
+        let mut tables = Vec::with_capacity(15);
+        let mut bytes = 0usize;
+        for step in 1..=15 {
+            let values = self.positions(4 * step)?;
+            bytes += values.len() * 4;
+            tables.push(self.stream.clone_htod(&values)?);
+        }
+        ensure!(
+            bytes == 3_870_720 && tables.len() == 15,
+            "resident position tables are {bytes} bytes across {} lengths",
+            tables.len()
+        );
+        let mut keys = Vec::with_capacity(24);
+        let mut values = Vec::with_capacity(24);
+        let mut depthwise = Vec::with_capacity(24);
+        for _ in 0..24 {
+            keys.push(self.stream.null()?);
+            values.push(self.stream.null()?);
+            depthwise.push(self.stream.alloc_zeros(8 * 1024)?);
+        }
+        #[cfg(test)]
+        POSITION_UPLOADS.fetch_add(15, std::sync::atomic::Ordering::Relaxed);
+        Ok(NemotronStream {
+            tables,
+            keys,
+            values,
+            depthwise,
+            conv: [None, None, None],
+            mask: self.stream.clone_htod(&vec![1u8; 60])?,
+            key_frames: 0,
+            cumulative: 0,
+            chunks: 0,
+        })
+    }
+
+    pub fn encode_chunk(&self, session: &mut NemotronStream, mel: &[f32]) -> Result<StreamChunk> {
+        self.encode_chunk_omitting(session, mel, StreamOmit::None)
+    }
+
+    pub fn encode_chunk_omitting(
+        &self,
+        session: &mut NemotronStream,
+        mel: &[f32],
+        omit: StreamOmit,
+    ) -> Result<StreamChunk> {
+        #[cfg(test)]
+        {
+            ENCODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ATTENTION_QUERY_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (output, caches) = self.run_chunk(session, mel, omit)?;
+        if omit == StreamOmit::None {
+            self.commit_chunk(session, caches)?;
+        }
+        Ok(output)
+    }
+
+    fn commit_chunk(&self, session: &mut NemotronStream, caches: ChunkCaches) -> Result<()> {
+        let next_frames = (session.key_frames + 4).min(56);
+        let width = self.conformer.hidden as usize;
+        ensure!(
+            caches.keys.len() == 24
+                && caches.values.len() == 24
+                && caches.depthwise.len() == 24
+                && caches
+                    .keys
+                    .iter()
+                    .zip(caches.values.iter())
+                    .all(
+                        |(key, value)| key.len() == next_frames * width && value.len() == key.len()
+                    )
+                && caches
+                    .depthwise
+                    .iter()
+                    .all(|cache| cache.len() == 8 * width)
+                && caches.conv[0].len() == 131
+                && caches.conv[1].len() == 256 * 68
+                && caches.conv[2].len() == 256 * 36,
+            "streaming cache commit shape"
+        );
+        session.keys = caches.keys;
+        session.values = caches.values;
+        session.depthwise = caches.depthwise;
+        let [first, second, third] = caches.conv;
+        session.conv = [Some(first), Some(second), Some(third)];
+        session.key_frames = next_frames;
+        session.cumulative += 4;
+        session.chunks += 1;
+        Ok(())
+    }
+
+    fn run_chunk(
+        &self,
+        session: &NemotronStream,
+        mel: &[f32],
+        omit: StreamOmit,
+    ) -> Result<(StreamChunk, ChunkCaches)> {
+        ensure!(
+            mel.len().is_multiple_of(128) && mel.iter().all(|value| value.is_finite()),
+            "streaming mel is misaligned or non-finite"
+        );
+        let frames = mel.len() / 128;
+        let expected = if session.chunks == 0 { 25 } else { 32 };
+        ensure!(
+            frames == expected,
+            "streaming mel frames {frames} require {expected}"
+        );
+        let mut window = stream_window(session.cumulative, 4)?;
+        window.omit = omit;
+        ensure!(
+            session.key_frames == window.cached as usize
+                && session.cumulative == session.chunks * 4
+                && session.keys.len() == 24
+                && session.values.len() == 24
+                && session.depthwise.len() == 24
+                && session.tables.len() == 15,
+            "torn streaming cache: stored {} cumulative {} chunks {}",
+            session.key_frames,
+            session.cumulative,
+            session.chunks
+        );
+        if omit == StreamOmit::Keys {
+            ensure!(session.key_frames > 0, "omit keys requires stored keys");
+        }
+        if omit == StreamOmit::Conv {
+            ensure!(
+                session.conv.iter().all(|frame| frame.is_some()),
+                "omit conv requires a stored frame"
+            );
+        }
+        let (mut hidden, conv) = self.subsample_stream(mel, session, omit)?;
+        let subsample = self.stream.clone_dtoh(&hidden)?;
+        let mut keys = Vec::with_capacity(24);
+        let mut values = Vec::with_capacity(24);
+        let mut depthwise = Vec::with_capacity(24);
+        let mut layer0 = None;
+        for index in 0..self.blocks.len() {
+            let step = self.layer_stream(index, &hidden, session, &window)?;
+            hidden = step.hidden;
+            if index == 0 {
+                layer0 = Some(self.stream.clone_dtoh(&hidden)?);
+            }
+            keys.push(step.key);
+            values.push(step.value);
+            depthwise.push(step.depthwise);
+        }
+        let layer0 = layer0.context("streaming layer 0 missing")?;
+        ensure!(
+            subsample.len() == 4 * 1024 && layer0.len() == subsample.len(),
+            "streaming chunk rows"
+        );
+        let encoder = self.stream.clone_dtoh(&hidden)?;
+        ensure!(encoder.len() == subsample.len(), "streaming encoder rows");
+        Ok((
+            StreamChunk {
+                subsample,
+                layer0,
+                encoder,
+            },
+            ChunkCaches {
+                conv,
+                keys,
+                values,
+                depthwise,
+            },
+        ))
+    }
+
+    fn subsample_stream(
+        &self,
+        input: &[f32],
+        session: &NemotronStream,
+        omit: StreamOmit,
+    ) -> Result<(CudaSlice<f32>, [CudaSlice<f32>; 3])> {
+        let mut hidden = self.stream.clone_htod(input)?;
+        let mut time = input.len() / 128;
+        let mut frequency = 128usize;
+        let mut channels = 1usize;
+        let mut caches = Vec::with_capacity(3);
+        for (index, conv) in self.subsample.conv.iter().enumerate() {
+            ensure!(
+                hidden.len() == time * frequency * channels,
+                "subsampling stage {index} shape"
+            );
+            let padded = self.freq_pad(&hidden, time, frequency, channels)?;
+            let padded_freq =
+                frequency + self.conformer.pad_left as usize + self.conformer.pad_right as usize;
+            let frame = padded_freq * channels;
+            let mut cache = self.stream.alloc_zeros(frame)?;
+            self.copy_device(&padded, (time - 1) * frame, &mut cache, 0, frame)?;
+            caches.push(cache);
+            let zero_frames = if session.chunks == 0 {
+                2
+            } else if omit == StreamOmit::Conv {
+                1
+            } else {
+                0
+            };
+            let stored = if zero_frames == 0 {
+                Some(
+                    session.conv[index]
+                        .as_ref()
+                        .context("streaming conv cache is missing")?,
+                )
+            } else {
+                None
+            };
+            let conv_input =
+                self.time_prepend(&padded, padded_freq, channels, stored, zero_frames)?;
+            let conv_time = time + if stored.is_some() { 1 } else { zero_frames };
+            let next_time = conv_out(conv_time, 0, 0)?;
+            let next_frequency = conv_out(padded_freq, 0, 0)?;
+            let expect_time = if session.chunks == 0 {
+                [13, 7, 4][index]
+            } else {
+                [16, 8, 4][index]
+            };
+            let expect_frequency = [65, 33, 17][index];
+            ensure!(
+                next_time == expect_time && next_frequency == expect_frequency,
+                "streaming conv stage {index} produced {next_time}x{next_frequency}"
+            );
+            let output = self.stream.alloc_zeros(next_time * next_frequency * 256)?;
+            let in_channels = if index == 0 { 1u32 } else { 256 };
+            let conv_time_u = u32::try_from(conv_time)?;
+            let padded_freq_u = u32::try_from(padded_freq)?;
+            let next_time_u = u32::try_from(next_time)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.ops.conv2d)
+                    .arg(&conv_input)
+                    .arg(&conv.weight)
+                    .arg(&conv.bias)
+                    .arg(&output)
+                    .arg(&conv_time_u)
+                    .arg(&padded_freq_u)
+                    .arg(&in_channels)
+                    .arg(&256u32)
+                    .arg(&in_channels)
+                    .arg(&next_time_u)
+                    .arg(&0u32)
+                    .arg(&0u32)
+                    .launch(flat(output.len()))?;
+            }
+            note_launch!();
+            hidden = output;
+            time = next_time;
+            frequency = next_frequency;
+            channels = 256;
+            let spatial = u32::try_from(time * frequency)?;
+            if index > 0 {
+                hidden = self.linear(&hidden, spatial, &self.subsample.pointwise[index - 1])?;
+                let time_u = u32::try_from(time)?;
+                let frequency_u = u32::try_from(frequency)?;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.ops.mask_time)
+                        .arg(&hidden)
+                        .arg(&spatial)
+                        .arg(&time_u)
+                        .arg(&frequency_u)
+                        .arg(&256u32)
+                        .arg(&time_u)
+                        .launch(flat(hidden.len()))?;
+                }
+                note_launch!();
+            }
+            hidden = self.activate(&hidden, spatial, 256, 0)?;
+        }
+        ensure!(
+            time == 4 && frequency == 17,
+            "streaming subsample rows {time} frequency {frequency}"
+        );
+        let packed = self.stream.alloc_zeros(hidden.len())?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.pack)
+                .arg(&hidden)
+                .arg(&packed)
+                .arg(&u32::try_from(time)?)
+                .arg(&u32::try_from(frequency)?)
+                .arg(&256u32)
+                .launch(flat(packed.len()))?;
+        }
+        note_launch!();
+        let hidden = self.linear(&packed, u32::try_from(time)?, &self.subsample_linear)?;
+        let caches: [CudaSlice<f32>; 3] = caches
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("streaming conv cache count"))?;
+        Ok((hidden, caches))
+    }
+
+    fn layer_stream(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        session: &NemotronStream,
+        window: &StreamWindow,
+    ) -> Result<LayerStep> {
+        let block = self
+            .blocks
+            .get(index)
+            .context("encoder layer outside range")?;
+        let rows = 4u32;
+        let width = self.conformer.hidden as usize;
+        ensure!(
+            input.len() == rows as usize * width && block.convolution.depthwise_bias.is_none(),
+            "streaming layer input"
+        );
+        let feed_forward =
+            |hidden: &mut CudaSlice<f32>, ff: &FeedForward, scale: f32| -> Result<()> {
+                let normalized = self.normalize(hidden, rows, &ff.norm)?;
+                let expanded = self.linear(&normalized, rows, &ff.up)?;
+                let activated = self.activate(&expanded, rows, 4096, 1)?;
+                let delta = self.linear(&activated, rows, &ff.down)?;
+                self.residual(hidden, &delta, scale)
+            };
+        let mut hidden = input.try_clone()?;
+        feed_forward(&mut hidden, &block.ff1, 0.5)?;
+        let normalized = self.normalize(&hidden, rows, &block.attention_norm)?;
+        let q = self.linear(&normalized, rows, &block.attention.q)?;
+        let k = self.linear(&normalized, rows, &block.attention.k)?;
+        let v = self.linear(&normalized, rows, &block.attention.v)?;
+        let table = session
+            .tables
+            .get(table_index(window.key_rows)?)
+            .context("streaming position table")?;
+        let relative_rows = 2 * window.key_rows - 1;
+        let relative = self.linear(table, relative_rows, &block.attention.relative)?;
+        let attend_rows = if window.omit == StreamOmit::Keys {
+            rows
+        } else {
+            window.key_rows
+        };
+        let attend_offset = if window.omit == StreamOmit::Keys {
+            window.query_offset
+        } else {
+            window.kv_offset
+        };
+        let cached = window.cached as usize;
+        ensure!(
+            session.keys[index].len() == cached * width
+                && session.values[index].len() == cached * width,
+            "layer {index} key cache length"
+        );
+        let mut cat_k = self.stream.alloc_zeros(attend_rows as usize * width)?;
+        let mut cat_v = self.stream.alloc_zeros(attend_rows as usize * width)?;
+        let dest = if window.omit == StreamOmit::Keys {
+            0
+        } else {
+            cached * width
+        };
+        if window.omit != StreamOmit::Keys {
+            self.copy_device(&session.keys[index], 0, &mut cat_k, 0, cached * width)?;
+            self.copy_device(&session.values[index], 0, &mut cat_v, 0, cached * width)?;
+        }
+        self.copy_device(&k, 0, &mut cat_k, dest, rows as usize * width)?;
+        self.copy_device(&v, 0, &mut cat_v, dest, rows as usize * width)?;
+        let core = self.stream.alloc_zeros(hidden.len())?;
+        self.attend(AttentionLaunch {
+            q: &q,
+            k: &cat_k,
+            v: &cat_v,
+            relative: &relative,
+            bias_u: &block.attention.bias_u,
+            bias_v: &block.attention.bias_v,
+            mask: &session.mask,
+            output: &core,
+            rows,
+            key_rows: attend_rows,
+            query_offset: window.query_offset,
+            kv_offset: attend_offset,
+            right_chunks: 0,
+        })?;
+        let delta = self.linear(&core, rows, &block.attention.o)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        let combined = cached + rows as usize;
+        let keep = combined.min(56);
+        let drop = combined - keep;
+        let carried = cached - drop;
+        let mut next_k = self.stream.alloc_zeros(keep * width)?;
+        let mut next_v = self.stream.alloc_zeros(keep * width)?;
+        self.copy_device(
+            &session.keys[index],
+            drop * width,
+            &mut next_k,
+            0,
+            carried * width,
+        )?;
+        self.copy_device(&k, 0, &mut next_k, carried * width, rows as usize * width)?;
+        self.copy_device(
+            &session.values[index],
+            drop * width,
+            &mut next_v,
+            0,
+            carried * width,
+        )?;
+        self.copy_device(&v, 0, &mut next_v, carried * width, rows as usize * width)?;
+        let normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
+        let expanded = self.linear(&normalized, rows, &block.convolution.pointwise1)?;
+        let activated = self.activate(&expanded, rows, self.conformer.hidden, 2)?;
+        let launch_rows = if session.chunks == 0 || window.omit == StreamOmit::Conv {
+            rows
+        } else {
+            12
+        };
+        ensure!(
+            session.depthwise[index].len() == 8 * width && activated.len() == rows as usize * width,
+            "layer {index} depthwise cache"
+        );
+        let convolved = self.stream.alloc_zeros(launch_rows as usize * width)?;
+        if launch_rows == 12 {
+            let mut joined = self.stream.alloc_zeros(12 * width)?;
+            self.copy_device(&session.depthwise[index], 0, &mut joined, 0, 8 * width)?;
+            self.copy_device(&activated, 0, &mut joined, 8 * width, rows as usize * width)?;
+            self.launch_depthwise(
+                &joined,
+                &block.convolution.depthwise,
+                &session.mask,
+                &convolved,
+                launch_rows,
+            )?;
+        } else {
+            self.launch_depthwise(
+                &activated,
+                &block.convolution.depthwise,
+                &session.mask,
+                &convolved,
+                launch_rows,
+            )?;
+        }
+        // Rows 8..11 are the 4 kernel-9 outputs of the 12-frame cache concatenation. Rows 0..7 are discarded.
+        let kept = if launch_rows == 12 {
+            let mut rows_kept = self.stream.alloc_zeros(rows as usize * width)?;
+            self.copy_device(
+                &convolved,
+                8 * width,
+                &mut rows_kept,
+                0,
+                rows as usize * width,
+            )?;
+            rows_kept
+        } else {
+            convolved
+        };
+        let mut next_depth = self.stream.alloc_zeros(8 * width)?;
+        self.copy_device(
+            &session.depthwise[index],
+            4 * width,
+            &mut next_depth,
+            0,
+            4 * width,
+        )?;
+        self.copy_device(
+            &activated,
+            0,
+            &mut next_depth,
+            4 * width,
+            rows as usize * width,
+        )?;
+        ensure!(
+            block.convolution.running_mean.is_none() && block.convolution.running_var.is_none(),
+            "streaming convolution has batch-norm statistics"
+        );
+        let normalized = self.normalize_pair(
+            &kept,
+            rows,
+            &block.convolution.conv_weight,
+            &block.convolution.conv_bias,
+        )?;
+        let activated = self.activate(&normalized, rows, self.conformer.hidden, 1)?;
+        let delta = self.linear(&activated, rows, &block.convolution.pointwise2)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        feed_forward(&mut hidden, &block.ff2, 0.5)?;
+        let output = self.normalize(&hidden, rows, &block.output_norm)?;
+        Ok(LayerStep {
+            hidden: output,
+            key: next_k,
+            value: next_v,
+            depthwise: next_depth,
+        })
+    }
+
+    fn launch_depthwise(
+        &self,
+        input: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        mask: &CudaSlice<u8>,
+        output: &CudaSlice<f32>,
+        rows: u32,
+    ) -> Result<()> {
+        ensure!(
+            input.len() == rows as usize * self.conformer.hidden as usize
+                && output.len() == input.len()
+                && mask.len() >= rows as usize,
+            "depthwise launch shape"
+        );
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.depthwise)
+                .arg(input)
+                .arg(weight)
+                .arg(mask)
+                .arg(output)
+                .arg(&rows)
+                .arg(&self.conformer.hidden)
+                .arg(&self.conformer.conv_kernel)
+                .arg(&self.conformer.depthwise_left)
+                .launch(flat(output.len()))?;
+        }
+        note_launch!();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -924,5 +1718,112 @@ mod position_tests {
         }
         assert!(relative_positions(0, 4).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn streaming_window_index_matches_absolute_chunks() -> Result<()> {
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        for step in 1..=15u32 {
+            let length = 4 * step;
+            ensure!(
+                table_index(length)? == (step - 1) as usize,
+                "table index {length}"
+            );
+            let table = relative_positions(length as usize, 1024)?;
+            rows += 2 * length as usize - 1;
+            bytes += table.len() * 4;
+        }
+        ensure!(
+            rows == 945 && bytes == 3_870_720,
+            "resident table bytes {bytes} rows {rows}"
+        );
+        ensure!(
+            table_index(0).is_err() && table_index(6).is_err() && table_index(64).is_err(),
+            "out-of-set key rows accepted"
+        );
+        let first = stream_window(0, 4)?;
+        ensure!(
+            first.key_rows == 4
+                && first.query_offset == 0
+                && first.kv_offset == 0
+                && first.cached == 0,
+            "first window"
+        );
+        let chunk14 = stream_window(56, 4)?;
+        ensure!(
+            chunk14.key_rows == 60
+                && chunk14.query_offset == 56
+                && chunk14.kv_offset == 0
+                && chunk14.cached == 56,
+            "chunk 14 window"
+        );
+        let chunk15 = stream_window(60, 4)?;
+        ensure!(
+            chunk15.key_rows == 60
+                && chunk15.query_offset == 60
+                && chunk15.kv_offset == 4
+                && chunk15.cached == 56,
+            "chunk 15 window"
+        );
+        let later = stream_window(5000, 4)?;
+        ensure!(
+            later.key_rows == 60 && later.cached == 56 && later.kv_offset == 5000 - 56,
+            "cumulative 5000 changed the resident length"
+        );
+        ensure!(
+            stream_window(0, 3).is_err(),
+            "query rows other than 4 accepted"
+        );
+        ensure!(
+            kept(8, 8, 0, 0, 8) == [4usize, 4, 4, 4, 8, 8, 8, 8],
+            "full 8-frame grid"
+        );
+        ensure!(
+            kept(8, 8, 0, 0, 5) == [4usize, 4, 4, 4, 5, 5, 5, 5],
+            "padded 8-frame grid"
+        );
+        ensure!(
+            kept(8, 8, 0, 0, 0) == [0usize, 0, 0, 0, 0, 0, 0, 0],
+            "masked 8-frame grid"
+        );
+        let offset = kept(4, 60, 60, 4, 60);
+        ensure!(
+            offset == [60usize, 60, 60, 60] && offset.iter().sum::<usize>() == 240,
+            "offset grid"
+        );
+        let dropped = kept(4, 60, 0, 0, 60);
+        ensure!(
+            dropped == [4usize, 4, 4, 4] && dropped.iter().sum::<usize>() == 16,
+            "dropped offsets"
+        );
+        for (query_offset, kv_offset) in [(56u32, 0u32), (60, 4)] {
+            for query in 0..4u32 {
+                for key in 0..60u32 {
+                    let index = 4 - 1 - query + key;
+                    let distance = 59 - i32::try_from(index)?;
+                    let q_abs = i32::try_from(query_offset + query)?;
+                    let k_abs = i32::try_from(kv_offset + key)?;
+                    ensure!(
+                        distance == q_abs - k_abs,
+                        "relative distance q={query} k={key}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn kept(rows: u32, keys: u32, query_offset: u32, kv_offset: u32, valid: u32) -> Vec<usize> {
+        (0..rows)
+            .map(|query| {
+                (0..keys)
+                    .filter(|&key| {
+                        key < valid
+                            && absolute_key_kept(query_offset + query, kv_offset + key, 4, 14, 0)
+                    })
+                    .count()
+            })
+            .collect()
     }
 }

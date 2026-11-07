@@ -115,33 +115,47 @@ extern "C" __global__ void speech_residual_f32(
         output[i] = __fadd_rn(residual[i], __fmul_rn(scale, delta[i]));
 }
 
-// Transformer-XL attention with interleaved relative positions and head_dim=128.
-// chunk_size 0 attends the full valid prefix. A positive chunk_size keeps keys in
-// [max(0, (q/chunk - left_chunks)*chunk), min(rows, (q/chunk + 1 + right_chunks)*chunk)).
+// head_dim 128. Relative row is rows-1-query+key into a table of length 2*key_rows-1.
+// chunk_size 0 attends every valid key. A positive chunk_size keeps an absolute key when
+// its chunk index is in [q_abs/chunk - left_chunks, q_abs/chunk + right_chunks].
 extern "C" __global__ void speech_relative_attention_f32(
     const float* q, const float* k, const float* v, const float* relative,
     const float* bias_u, const float* bias_v, const uint8_t* mask, float* output,
     uint32_t rows, uint32_t heads, float scaling, uint32_t chunk_size, uint32_t left_chunks,
-    uint32_t right_chunks) {
+    uint32_t right_chunks, uint32_t key_rows, uint32_t query_offset, uint32_t kv_offset) {
     extern __shared__ float shared[];
     float* reduction = shared;
     float* probabilities = shared + 8;
     if (blockDim.x != 128 || gridDim.x != rows || gridDim.y != heads || gridDim.z != 1 ||
         !q || !k || !v || !relative || !bias_u || !bias_v || !mask || !output ||
-        !rows || !heads || !(scaling > 0.0f) || right_chunks > 1 ||
-        (chunk_size == 0 && right_chunks != 0)) { __trap(); return; }
+        !rows || !key_rows || !heads || !(scaling > 0.0f) || right_chunks > 1 ||
+        key_rows < rows || (chunk_size == 0 && right_chunks != 0) ||
+        (chunk_size == 0 && (query_offset != 0 || kv_offset != 0 || key_rows != rows))) {
+        __trap(); return;
+    }
     const uint32_t query = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
     const uint32_t hidden = heads * 128;
-    const uint8_t query_valid = mask[query];
-    uint32_t key_begin = 0, key_end = rows;
+    const uint32_t query_mask = key_rows - rows + query;
+    const uint8_t query_valid = mask[query_mask];
+    uint32_t key_begin = 0, key_end = key_rows;
     if (chunk_size != 0) {
-        const uint32_t query_chunk = query / chunk_size;
+        const uint32_t q_abs = query_offset + query;
+        const uint32_t query_chunk = q_abs / chunk_size;
         const uint32_t start_chunk = query_chunk > left_chunks ? query_chunk - left_chunks : 0;
-        key_begin = start_chunk * chunk_size;
-        const uint64_t end = (uint64_t(query_chunk) + 1 + right_chunks) * chunk_size;
-        key_end = end > rows ? rows : uint32_t(end);
+        const uint64_t begin_abs = uint64_t(start_chunk) * chunk_size;
+        const uint64_t end_abs = (uint64_t(query_chunk) + 1 + right_chunks) * chunk_size;
+        if (begin_abs > kv_offset) {
+            const uint64_t local = begin_abs - kv_offset;
+            key_begin = local > key_rows ? key_rows : uint32_t(local);
+        }
+        if (end_abs > kv_offset) {
+            const uint64_t local = end_abs - kv_offset;
+            key_end = local > key_rows ? key_rows : uint32_t(local);
+        } else {
+            key_end = 0;
+        }
     }
-    for (uint32_t key = 0; key < rows; ++key) {
+    for (uint32_t key = 0; key < key_rows; ++key) {
         float content = 0.0f, position = 0.0f;
         const bool in_window = chunk_size == 0 || (key >= key_begin && key < key_end);
         if (query_valid && mask[key] && in_window) {
@@ -170,16 +184,16 @@ extern "C" __global__ void speech_relative_attention_f32(
     }
     if (d == 0) {
         float maximum = -INFINITY, sum = 0.0f;
-        for (uint32_t key = 0; key < rows; ++key) maximum = fmaxf(maximum, probabilities[key]);
-        for (uint32_t key = 0; key < rows; ++key) {
+        for (uint32_t key = 0; key < key_rows; ++key) maximum = fmaxf(maximum, probabilities[key]);
+        for (uint32_t key = 0; key < key_rows; ++key) {
             probabilities[key] = expf(probabilities[key] - maximum);
             sum += probabilities[key];
         }
-        for (uint32_t key = 0; key < rows; ++key) probabilities[key] /= sum;
+        for (uint32_t key = 0; key < key_rows; ++key) probabilities[key] /= sum;
     }
     __syncthreads();
     float result = 0.0f;
-    for (uint32_t key = 0; key < rows; ++key)
+    for (uint32_t key = 0; key < key_rows; ++key)
         result = __fmaf_rn(probabilities[key], v[uint64_t(key) * hidden + head * 128 + d], result);
     output[uint64_t(query) * hidden + head * 128 + d] = result;
 }

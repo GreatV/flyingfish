@@ -172,7 +172,7 @@ fn match_mel(
                 &pcm[batch * pcm_shape[1]..batch * pcm_shape[1] + length]
             })
             .collect();
-        let actual = frontend.extract(&waves, normalize)?;
+        let actual = frontend.extract(&waves, normalize, true, false)?;
         ensure!(
             actual.frames == shape[1]
                 && actual.mel_bins == shape[2]
