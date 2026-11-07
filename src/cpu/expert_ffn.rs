@@ -3589,6 +3589,20 @@ mod tests {
         )?;
         assert_ne!(after, before);
         println!("expert_routed_weight_boundary bit_mismatches>0");
+        let gate = bf16::from_bits(0x3f49);
+        let up = bf16::from_bits(0x3e5f);
+        let denominator = 1.0 + (-gate.to_f32()).exp();
+        let division = bf16::from_f32((gate.to_f32() / denominator) * up.to_f32());
+        let reciprocal = bf16::from_f32((gate.to_f32() * (1.0 / denominator)) * up.to_f32());
+        assert_eq!(division.to_bits(), 0x3df1);
+        assert_ne!(division.to_bits(), reciprocal.to_bits());
+        for form in [Form::Lane8, Form::Lane16] {
+            let actual = silu_mul(gate, up, crate::model_spec::SwigluRounding::Once, 0.0, form)?;
+            assert_eq!(actual.to_bits(), division.to_bits());
+            println!(
+                "expert_silu_once_form form={form:?} bit_mismatches=0 reciprocal_control=true"
+            );
+        }
         Ok(())
     }
 
