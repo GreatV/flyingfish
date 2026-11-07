@@ -2,7 +2,7 @@
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
 mod tests;
-use super::sparse::SparseConv;
+use super::sparse::{BatchGroupNorm, SparseConv};
 use super::{
     Device,
     blas::Blas,
@@ -19,7 +19,7 @@ use crate::{
         CudaFunction, CudaSlice, DevicePtr, DeviceRepr, PushKernelArg, ValidAsZeroBits,
     },
     pixal3d::{DecoderCheckpoint, DecoderKind, FlowCheckpoint, FlowSpec, Hi3DFlowCheckpoint},
-    sparse::SparseSites,
+    sparse::{SerializedWindows, SparseSites},
 };
 use anyhow::{Context, Result, ensure};
 use half::{bf16, f16};
@@ -2668,6 +2668,9 @@ impl Weights {
         let mut float = BTreeMap::new();
         for (name, (_, _, f32_runtime)) in checkpoint.kind.inventory() {
             let t = checkpoint.mapped.tensor(&name)?;
+            if t.dtype() == Dtype::I64 {
+                continue;
+            }
             if f32_runtime {
                 let values: Vec<f32> = if t.dtype() == Dtype::F32 {
                     t.data()
@@ -2690,13 +2693,21 @@ impl Weights {
                 );
                 float.insert(name, d.stream.clone_htod(&values)?);
             } else {
-                let values: Vec<f16> = t
-                    .data()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| f16::from_le_bytes(*b))
-                    .collect();
+                let values: Vec<f16> = if t.dtype() == Dtype::F32 {
+                    t.data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f16::from_f32(f32::from_le_bytes(*b)))
+                        .collect()
+                } else {
+                    t.data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| f16::from_le_bytes(*b))
+                        .collect()
+                };
                 ensure!(
                     values.iter().all(|x| x.is_finite()),
                     "nonfinite decoder weight {name}"
@@ -2742,9 +2753,14 @@ struct DecoderKernels {
     c2s: CudaFunction,
     conv16: CudaFunction,
     conv32: CudaFunction,
+    rounded_swish: Option<[CudaFunction; 2]>,
+    gelu16: Option<CudaFunction>,
+    add32: Option<CudaFunction>,
+    add16_to32: Option<CudaFunction>,
+    corner_fields: Option<CudaFunction>,
 }
 impl DecoderKernels {
-    fn load(d: &Device) -> Result<Self> {
+    fn load(d: &Device, point: bool) -> Result<Self> {
         let q = cubin::module(&d.ctx, "q38_common")?;
         let v = cubin::module(&d.ctx, "vision_ops")?;
         Ok(Self {
@@ -2763,6 +2779,34 @@ impl DecoderKernels {
             c2s: v.load_function("channel_to_spatial_f16")?,
             conv16: v.load_function("conv3d_im2col_f16")?,
             conv32: v.load_function("conv3d_im2col_f32")?,
+            rounded_swish: if point {
+                Some([
+                    v.load_function("swish_rounded_f32")?,
+                    v.load_function("swish_rounded_f16")?,
+                ])
+            } else {
+                None
+            },
+            gelu16: if point {
+                Some(q.load_function("q38_gelu_f16")?)
+            } else {
+                None
+            },
+            add32: if point {
+                Some(q.load_function("add_scale_f32")?)
+            } else {
+                None
+            },
+            add16_to32: if point {
+                Some(v.load_function("residual_add_f16_to_f32")?)
+            } else {
+                None
+            },
+            corner_fields: if point {
+                Some(v.load_function("corner_attributes_f32")?)
+            } else {
+                None
+            },
         })
     }
     fn norm(
@@ -2904,6 +2948,96 @@ pub struct SparseDecoderOutput {
     pub features: Vec<f32>,
     pub channels: usize,
 }
+pub struct CornerDecoderOutput {
+    pub fields: SparseDecoderOutput,
+    /// Row-major [sites,8] corner sign logits.
+    pub sign_logits: Vec<f32>,
+    pub matrix: [[f32; 4]; 4],
+    pub resolution: u32,
+}
+struct PointWorkspace<T> {
+    conv: SparseConv<f32>,
+    norms: BTreeMap<usize, BatchGroupNorm>,
+    scratch: [CudaSlice<T>; 2],
+}
+impl<T: DeviceRepr + Copy + ValidAsZeroBits + 'static> PointWorkspace<T> {
+    fn new(
+        decoder: &PixalDecoder,
+        sites: &SparseSites,
+        channels: [usize; 2],
+        final_stage: bool,
+    ) -> Result<Self> {
+        let n = sites.coordinates().len();
+        DecoderKind::validate_point_rows(n)?;
+        let [ci, co] = channels;
+        let count = n
+            .checked_mul(ci)
+            .context("point stage feature extent overflow")?;
+        let scratch_bytes = count
+            .checked_mul(2 * size_of::<T>())
+            .context("point stage scratch overflow")?;
+        let mut reserve = if final_stage {
+            n.checked_mul(4 * (co + 40))
+                .and_then(|v| v.checked_add(scratch_bytes))
+                .context("point field workspace overflow")?
+        } else {
+            let projection = n
+                .checked_mul(32 * co)
+                .context("point subdivision workspace overflow")?;
+            projection.max(
+                scratch_bytes
+                    .checked_add(n * co * size_of::<T>())
+                    .and_then(|v| v.checked_add(n * (4 * co + 32)))
+                    .context("point residual workspace overflow")?,
+            )
+        };
+        let d = &decoder.device;
+        let mut offsets = vec![0];
+        let mut first = 0;
+        while first < n {
+            let batch = sites.coordinates()[first][0];
+            first += sites.coordinates()[first..].partition_point(|p| p[0] == batch);
+            offsets.push(u32::try_from(first)?);
+        }
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let padded: usize = offsets
+                .windows(2)
+                .map(|v| {
+                    let count = (v[1] - v[0]) as usize;
+                    if count > 48 {
+                        count.div_ceil(48) * 48
+                    } else {
+                        count
+                    }
+                })
+                .sum();
+            let windows: usize = offsets
+                .windows(2)
+                .map(|v| ((v[1] - v[0]) as usize).div_ceil(48))
+                .sum();
+            let mid_bytes = n
+                .checked_mul((3 * 512 * 4) + ((2048 + 3 * 512) * 2) + 4)
+                .and_then(|v| v.checked_add(padded * ((4 * 512 * 2) + (32 * 4) + 4)))
+                .and_then(|v| v.checked_add((windows + 1) * 4))
+                .context("point mid workspace overflow")?;
+            reserve = reserve.max(mid_bytes);
+        }
+        let mut norms = BTreeMap::new();
+        for c in [ci, co] {
+            if let std::collections::btree_map::Entry::Vacant(entry) = norms.entry(c) {
+                entry.insert(BatchGroupNorm::new(d, &offsets, c, 32, 1e-6, 64 << 20)?);
+            }
+        }
+        let available = d.workspace_budget(decoder.initial_free, decoder.device_budget, reserve)?;
+        let conv = SparseConv::<f32>::promoted(d, sites, [ci, co], available)?;
+        let scratch = [d.stream.alloc_zeros(count)?, d.stream.alloc_zeros(count)?];
+        Ok(Self {
+            conv,
+            norms,
+            scratch,
+        })
+    }
+}
 pub(crate) struct SubdivisionGuide<'a> {
     pub coordinates: &'a [[i32; 4]],
     pub logits: &'a [f32],
@@ -2933,7 +3067,12 @@ impl PixalDecoder {
         runtime: &Path,
         device_budget: usize,
     ) -> Result<Self> {
-        let checkpoint = DecoderCheckpoint::open(&dir.join("ckpts"), kind)?;
+        let component = if matches!(kind, DecoderKind::PointTransformer) {
+            "vae"
+        } else {
+            "ckpts"
+        };
+        let checkpoint = DecoderCheckpoint::open(&dir.join(component), kind)?;
         let device = Device::new(0)?;
         let (free, _) = device.ctx.mem_get_info()?;
         let ops = Ops::new(&device.ctx)?;
@@ -2943,7 +3082,7 @@ impl PixalDecoder {
             runtime,
             Rc::new(Closure::new(false, "Pixal decoder".into())),
         )?;
-        let k = DecoderKernels::load(&device)?;
+        let k = DecoderKernels::load(&device, matches!(kind, DecoderKind::PointTransformer))?;
         let weights = Weights::load(&device, &checkpoint)?;
         let ones = device.stream.clone_htod(&vec![f16::ONE; 1024])?;
         device.workspace_budget(free, device_budget, 0)?;
@@ -2972,6 +3111,732 @@ impl PixalDecoder {
             device_budget,
             ones,
             columns,
+        })
+    }
+    fn serialized_qkv(
+        &self,
+        maps: &SerializedWindows,
+        qkv: Tensor<f16, 2>,
+        order: usize,
+    ) -> Result<CudaSlice<f16>> {
+        ensure!(
+            matches!(self.kind, DecoderKind::PointTransformer) && order < 2,
+            "invalid serialized decoder attention configuration"
+        );
+        let rows = maps.order[order].len();
+        let packed_rows = maps.pad.len();
+        ensure!(
+            maps.offsets.first() == Some(&0)
+                && maps
+                    .offsets
+                    .last()
+                    .is_some_and(|&n| n as usize == packed_rows),
+            "serialized window offsets do not cover packed rows"
+        );
+        ensure!(
+            rows > 0
+                && qkv.shape == [u32::try_from(rows)?, 1536]
+                && qkv.stride == [1536, 1]
+                && maps.inverse[order].len() == rows
+                && maps.unpad.len() == rows,
+            "serialized QKV/map extent mismatch"
+        );
+        qkv.validate()?;
+        let gather: Vec<_> = maps
+            .pad
+            .iter()
+            .map(|&row| {
+                maps.order[order]
+                    .get(row as usize)
+                    .copied()
+                    .context("serialized pad row outside order")
+            })
+            .collect::<Result<_>>()?;
+        let inverse: Vec<_> = maps.inverse[order]
+            .iter()
+            .map(|&row| {
+                maps.unpad
+                    .get(row as usize)
+                    .copied()
+                    .context("serialized inverse row outside unpad")
+            })
+            .collect::<Result<_>>()?;
+        ensure!(
+            gather.iter().all(|&row| (row as usize) < rows)
+                && inverse.iter().all(|&row| (row as usize) < packed_rows),
+            "serialized physical row outside features"
+        );
+        let live = packed_rows
+            .checked_mul(4 * 512 * size_of::<f16>())
+            .and_then(|n| n.checked_add(rows * 512 * size_of::<f16>()))
+            .and_then(|n| {
+                n.checked_add(
+                    (gather.len() + inverse.len() + maps.offsets.len()) * size_of::<u32>(),
+                )
+            })
+            .and_then(|n| n.checked_add(packed_rows * 32 * size_of::<f32>()))
+            .context("serialized attention workspace overflow")?;
+        let d = &self.device;
+        d.workspace_budget(self.initial_free, self.device_budget, live)?;
+        let gather = d.stream.clone_htod(&gather)?;
+        let inverse = d.stream.clone_htod(&inverse)?;
+        let q = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let k = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let v = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let mut packed = d.stream.alloc_zeros::<f16>(packed_rows * 512)?;
+        let output = d.stream.alloc_zeros::<f16>(rows * 512)?;
+        let module = cubin::module(&d.ctx, "vision_ops")?;
+        let mut attention = Flash::new_f16(
+            d.stream.clone(),
+            packed_rows,
+            32,
+            32,
+            16,
+            Score {
+                scale: 0.25,
+                window_left: None,
+            },
+        )?;
+        attention.bind_f16_windows(&maps.offsets)?;
+        unsafe {
+            d.stream
+                .launch_builder(&module.load_function("qkv_gather_head_major_f16")?)
+                .arg(&qkv.ptr)
+                .arg(&gather)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&u32::try_from(rows)?)
+                .arg(&u32::try_from(packed_rows)?)
+                .arg(&32u32)
+                .arg(&16u32)
+                .launch(flat(packed_rows * 512))?;
+        }
+        attention.run_f16(
+            &q.slice(..),
+            512,
+            &k.slice(..),
+            &v.slice(..),
+            &mut packed.slice_mut(..),
+            (packed_rows, packed_rows, packed_rows),
+        )?;
+        unsafe {
+            d.stream
+                .launch_builder(&module.load_function("sparse_index_rows_f16")?)
+                .arg(&packed)
+                .arg(&inverse)
+                .arg(&output)
+                .arg(&u32::try_from(rows)?)
+                .arg(&512u32)
+                .launch(flat(rows * 512))?;
+        }
+        Ok(output)
+    }
+    fn point_norm<I: DeviceRepr + Copy + 'static, O: DeviceRepr + Copy + 'static>(
+        &self,
+        norms: &BTreeMap<usize, BatchGroupNorm>,
+        name: &str,
+        input: Tensor<I, 2>,
+        output: &mut TensorMut<O, 2>,
+    ) -> Result<()> {
+        let c = input.shape[1] as usize;
+        let plan = norms.get(&c).context("point norm width not planned")?;
+        let w = self
+            .weights
+            .float
+            .get(&format!("{name}.weights"))
+            .context("point group norm weight missing")?;
+        let b = self
+            .weights
+            .float
+            .get(&format!("{name}.bias"))
+            .context("point group norm bias missing")?;
+        let stream = &self.device.stream;
+        plan.run::<I, O>(
+            input,
+            [
+                view(w, stream, 0, [c as u32], [1])?,
+                view(b, stream, 0, [c as u32], [1])?,
+            ],
+            output,
+        )
+    }
+    fn point_conv<I: DeviceRepr + Copy + 'static, O: DeviceRepr + Copy + 'static>(
+        &self,
+        conv: &SparseConv<f32>,
+        name: &str,
+        input: Tensor<I, 2>,
+        output: &mut TensorMut<O, 2>,
+    ) -> Result<()> {
+        let ci = input.shape[1] as usize;
+        let co = output.0.shape[1] as usize;
+        let w = self
+            .weights
+            .float
+            .get(&format!("{name}.weight"))
+            .context("point convolution weight missing")?;
+        let b = self
+            .weights
+            .float
+            .get(&format!("{name}.bias"))
+            .context("point convolution bias missing")?;
+        ensure!(
+            w.len() == 27 * ci * co && b.len() == co,
+            "point convolution parameter extent mismatch"
+        );
+        conv.run_promoted(
+            &self.blas,
+            input,
+            view(
+                w,
+                &self.device.stream,
+                0,
+                [co as u32, (27 * ci) as u32],
+                [(27 * ci) as u64, 1],
+            )?,
+            view(b, &self.device.stream, 0, [co as u32], [1])?,
+            output,
+        )
+    }
+    fn point_swish<T: DeviceRepr + Copy + 'static>(&self, x: Tensor<T, 2>) -> Result<()> {
+        use std::any::TypeId;
+        let half = TypeId::of::<T>() == TypeId::of::<f16>();
+        ensure!(
+            half || TypeId::of::<T>() == TypeId::of::<f32>(),
+            "point activation feature dtype"
+        );
+        x.validate()?;
+        let functions = self
+            .k
+            .rounded_swish
+            .as_ref()
+            .context("rounded activation not loaded")?;
+        let count = u64::from(x.shape[0]) * u64::from(x.shape[1]);
+        unsafe {
+            self.device
+                .stream
+                .launch_builder(&functions[usize::from(half)])
+                .arg(&x.ptr)
+                .arg(&x.ptr)
+                .arg(&count)
+                .launch(flat(count as usize))?;
+        }
+        Ok(())
+    }
+    fn point_linear(
+        &self,
+        name: &str,
+        input: Tensor<f16, 2>,
+        output: &mut TensorMut<f16, 2>,
+        biased: bool,
+    ) -> Result<()> {
+        let n = input.shape[0] as usize;
+        let ci = input.shape[1] as usize;
+        let co = output.0.shape[1] as usize;
+        let d = &self.device;
+        let w = self
+            .weights
+            .half
+            .get(&format!("{name}.weight"))
+            .context("point linear weight missing")?;
+        ensure!(w.len() == ci * co, "point linear parameter extent mismatch");
+        if biased {
+            let b = self
+                .weights
+                .half
+                .get(&format!("{name}.bias"))
+                .context("point linear bias missing")?;
+            ensure!(b.len() == co, "point linear bias extent mismatch");
+            self.k
+                .bias(d, output.0.ptr, ptr(b, d), [n, co], true, false)?;
+        }
+        self.blas.linear_f16(
+            view(w, &d.stream, 0, [co as u32, ci as u32], [ci as u64, 1])?,
+            input,
+            output,
+            biased,
+        )
+    }
+    fn point_residual<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
+        &self,
+        workspace: &PointWorkspace<T>,
+        name: &str,
+        input: CudaSlice<T>,
+        channels: [usize; 2],
+        last_conv: &SparseConv<f32>,
+    ) -> Result<CudaSlice<T>> {
+        use std::any::TypeId;
+        let [ci, co] = channels;
+        let half = TypeId::of::<T>() == TypeId::of::<f16>();
+        ensure!(
+            half || TypeId::of::<T>() == TypeId::of::<f32>(),
+            "point residual feature dtype"
+        );
+        ensure!(
+            ci == co || half,
+            "point channel transition requires F16 features"
+        );
+        let n = input.len() / ci;
+        ensure!(
+            n <= 12_000_000 && input.len() == n * ci,
+            "point residual capacity or extent mismatch"
+        );
+        let d = &self.device;
+        let a = matrix::<T>(ptr(&workspace.scratch[0], d), n, ci)?;
+        self.point_norm(
+            &workspace.norms,
+            &format!("{name}.block.0"),
+            matrix::<T>(ptr(&input, d), n, ci)?,
+            &mut TensorMut(a),
+        )?;
+        self.point_swish(a)?;
+        let b = matrix::<T>(ptr(&workspace.scratch[1], d), n, co)?;
+        self.point_conv(
+            &workspace.conv,
+            &format!("{name}.block.2"),
+            a,
+            &mut TensorMut(b),
+        )?;
+        self.point_norm(
+            &workspace.norms,
+            &format!("{name}.block.3"),
+            b,
+            &mut TensorMut(b),
+        )?;
+        self.point_swish(b)?;
+        let branch = matrix::<T>(ptr(&workspace.scratch[0], d), n, co)?;
+        self.point_conv(
+            last_conv,
+            &format!("{name}.block.5"),
+            b,
+            &mut TensorMut(branch),
+        )?;
+        let output = if ci == co {
+            input
+        } else {
+            let output = d.stream.alloc_zeros::<T>(n * co)?;
+            self.point_linear(
+                &format!("{name}.res_conv"),
+                matrix::<f16>(ptr(&input, d), n, ci)?,
+                &mut TensorMut(matrix::<f16>(ptr(&output, d), n, co)?),
+                true,
+            )?;
+            output
+        };
+        unsafe {
+            if half {
+                d.stream
+                    .launch_builder(&self.k.residual)
+                    .arg(&ptr(&output, d))
+                    .arg(&branch.ptr)
+                    .arg(&self.ones)
+                    .arg(&ptr(&output, d))
+                    .arg(&(n as u32))
+                    .arg(&(co as u32))
+                    .launch(flat(n * co))?;
+            } else {
+                d.stream
+                    .launch_builder(
+                        self.k
+                            .add32
+                            .as_ref()
+                            .context("point F32 residual not loaded")?,
+                    )
+                    .arg(&ptr(&output, d))
+                    .arg(&branch.ptr)
+                    .arg(&i64::try_from(n * co)?)
+                    .arg(&1f32)
+                    .launch(grid((n * co).div_ceil(256), 256))?;
+            }
+        }
+        Ok(output)
+    }
+    fn point_blocks<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
+        &self,
+        workspace: &PointWorkspace<T>,
+        mut input: CudaSlice<T>,
+        stage: usize,
+        channels: [usize; 2],
+    ) -> Result<CudaSlice<T>> {
+        let [ci, co] = channels;
+        for block in 0..2 {
+            input = self.point_residual(
+                workspace,
+                &format!("decoder.dec.dec{stage}.block{block}"),
+                input,
+                [if block == 0 { ci } else { co }, co],
+                &workspace.conv,
+            )?;
+        }
+        Ok(input)
+    }
+    fn point_mid(
+        &self,
+        workspace: &PointWorkspace<f32>,
+        maps: &SerializedWindows,
+        mut input: CudaSlice<f32>,
+        last_conv: &SparseConv<f32>,
+    ) -> Result<CudaSlice<f32>> {
+        let d = &self.device;
+        let n = input.len() / 512;
+        let half_a = d.stream.alloc_zeros::<f16>(n * 512)?;
+        let half_b = d.stream.alloc_zeros::<f16>(n * 512)?;
+        let wide = d.stream.alloc_zeros::<f16>(n * 2048)?;
+        input = self.point_residual(
+            workspace,
+            "decoder.mid.block_in",
+            input,
+            [512, 512],
+            &workspace.conv,
+        )?;
+        let a = matrix::<f32>(ptr(&workspace.scratch[0], d), n, 512)?;
+        let ha = matrix::<f16>(ptr(&half_a, d), n, 512)?;
+        let hb = matrix::<f16>(ptr(&half_b, d), n, 512)?;
+        for block in 0..2 {
+            let name = format!("decoder.mid.block{block}");
+            self.point_conv(
+                &workspace.conv,
+                &format!("{name}.cpe.0"),
+                matrix::<f32>(ptr(&input, d), n, 512)?,
+                &mut TensorMut(a),
+            )?;
+            self.k.cast(d, [a.ptr, ha.ptr], n * 512, false)?;
+            self.point_linear(&format!("{name}.cpe.1"), ha, &mut TensorMut(hb), true)?;
+            self.k.norm(
+                d,
+                [hb.ptr, hb.ptr],
+                [n, 512],
+                self.weights.affine(d, Some(&format!("{name}.cpe.2")))?,
+                [false, false],
+                1e-5,
+            )?;
+            unsafe {
+                d.stream
+                    .launch_builder(
+                        self.k
+                            .add16_to32
+                            .as_ref()
+                            .context("mixed residual not loaded")?,
+                    )
+                    .arg(&ptr(&input, d))
+                    .arg(&hb.ptr)
+                    .arg(&((n * 512) as u64))
+                    .launch(flat(n * 512))?;
+            }
+            self.k.norm(
+                d,
+                [ptr(&input, d), a.ptr],
+                [n, 512],
+                self.weights.affine(d, Some(&format!("{name}.norm1.0")))?,
+                [true, true],
+                1e-5,
+            )?;
+            self.k.cast(d, [a.ptr, ha.ptr], n * 512, false)?;
+            let qkv = matrix::<f16>(ptr(&wide, d), n, 1536)?;
+            self.point_linear(&format!("{name}.attn.qkv"), ha, &mut TensorMut(qkv), true)?;
+            let attended = self.serialized_qkv(maps, qkv, block)?;
+            self.point_linear(
+                &format!("{name}.attn.proj"),
+                matrix::<f16>(ptr(&attended, d), n, 512)?,
+                &mut TensorMut(hb),
+                true,
+            )?;
+            unsafe {
+                d.stream
+                    .launch_builder(
+                        self.k
+                            .add16_to32
+                            .as_ref()
+                            .context("mixed residual not loaded")?,
+                    )
+                    .arg(&ptr(&input, d))
+                    .arg(&hb.ptr)
+                    .arg(&((n * 512) as u64))
+                    .launch(flat(n * 512))?;
+            }
+            drop(attended);
+            self.k.norm(
+                d,
+                [ptr(&input, d), a.ptr],
+                [n, 512],
+                self.weights.affine(d, Some(&format!("{name}.norm2.0")))?,
+                [true, true],
+                1e-5,
+            )?;
+            self.k.cast(d, [a.ptr, ha.ptr], n * 512, false)?;
+            let hidden = matrix::<f16>(ptr(&wide, d), n, 2048)?;
+            self.point_linear(
+                &format!("{name}.mlp.0.fc1"),
+                ha,
+                &mut TensorMut(hidden),
+                true,
+            )?;
+            unsafe {
+                d.stream
+                    .launch_builder(self.k.gelu16.as_ref().context("point GELU not loaded")?)
+                    .arg(&hidden.ptr)
+                    .arg(&hidden.ptr)
+                    .arg(&(n as u32))
+                    .arg(&1u32)
+                    .arg(&2048u32)
+                    .arg(&2048u64)
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&2048u64)
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&0i32)
+                    .launch(flat(n * 2048))?;
+            }
+            self.point_linear(
+                &format!("{name}.mlp.0.fc2"),
+                hidden,
+                &mut TensorMut(hb),
+                true,
+            )?;
+            unsafe {
+                d.stream
+                    .launch_builder(
+                        self.k
+                            .add16_to32
+                            .as_ref()
+                            .context("mixed residual not loaded")?,
+                    )
+                    .arg(&ptr(&input, d))
+                    .arg(&hb.ptr)
+                    .arg(&((n * 512) as u64))
+                    .launch(flat(n * 512))?;
+            }
+        }
+        self.point_residual(
+            workspace,
+            "decoder.mid.block_out",
+            input,
+            [512, 512],
+            last_conv,
+        )
+    }
+    fn point_head<T: DeviceRepr + Copy + 'static>(
+        &self,
+        workspace: &PointWorkspace<T>,
+        input: Tensor<T, 2>,
+        stage: usize,
+    ) -> Result<CudaSlice<f32>> {
+        let d = &self.device;
+        let [n, c] = input.shape.map(|v| v as usize);
+        let normalized = d.stream.alloc_zeros::<f32>(n * c)?;
+        let norm = matrix::<f32>(ptr(&normalized, d), n, c)?;
+        let name = format!("decoder.dec.dec{stage}.up.upsample.cls_head.fc");
+        self.point_norm(
+            &workspace.norms,
+            &format!("{name}.0"),
+            input,
+            &mut TensorMut(norm),
+        )?;
+        self.point_swish(norm)?;
+        let output = d.stream.alloc_zeros::<f32>(n * 8)?;
+        self.point_conv(
+            &workspace.conv,
+            &format!("{name}.2"),
+            norm,
+            &mut TensorMut(matrix::<f32>(ptr(&output, d), n, 8)?),
+        )?;
+        Ok(output)
+    }
+    fn point_project<T: DeviceRepr + Copy + 'static>(
+        &self,
+        input: Tensor<T, 2>,
+        stage: usize,
+    ) -> Result<CudaSlice<f16>> {
+        use std::any::TypeId;
+        let d = &self.device;
+        let [n, c] = input.shape.map(|v| v as usize);
+        let half = TypeId::of::<T>() == TypeId::of::<f16>();
+        ensure!(
+            half || TypeId::of::<T>() == TypeId::of::<f32>(),
+            "point projection feature dtype"
+        );
+        let converted = if half {
+            None
+        } else {
+            Some(d.stream.alloc_zeros::<f16>(n * c)?)
+        };
+        let address = if let Some(x) = &converted {
+            self.k.cast(d, [input.ptr, ptr(x, d)], n * c, false)?;
+            ptr(x, d)
+        } else {
+            input.ptr
+        };
+        let output = d.stream.alloc_zeros::<f16>(n * 8 * c)?;
+        self.point_linear(
+            &format!("decoder.dec.dec{stage}.up.upsample.proj"),
+            matrix(address, n, c)?,
+            &mut TensorMut(matrix(ptr(&output, d), n, 8 * c)?),
+            false,
+        )?;
+        Ok(output)
+    }
+    fn point_up<T: DeviceRepr + Copy + 'static>(
+        &self,
+        workspace: PointWorkspace<T>,
+        sites: SparseSites,
+        input: CudaSlice<T>,
+        stage: usize,
+    ) -> Result<(SparseSites, CudaSlice<f16>)> {
+        let d = &self.device;
+        let n = sites.coordinates().len();
+        let c = input.len() / n;
+        let x = matrix::<T>(ptr(&input, d), n, c)?;
+        let logits = self.point_head(&workspace, x, stage)?;
+        let logits = d.stream.clone_dtoh(&logits)?;
+        ensure!(
+            logits.iter().all(|v| v.is_finite()),
+            "nonfinite point occupancy logits"
+        );
+        let active: Vec<[bool; 8]> = logits
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|row| row.map(|v| v > 0.0))
+            .collect();
+        let offsets = std::array::from_fn(|child| {
+            [
+                ((child >> 2) & 1) as i32,
+                ((child >> 1) & 1) as i32,
+                (child & 1) as i32,
+            ]
+        });
+        let (children, source) = sites.subdivide_with_offsets(&active, 12_000_000, &offsets)?;
+        drop(workspace);
+        let rows = children.coordinates().len();
+        let reserve = n
+            .checked_mul(18 * c)
+            .and_then(|v| v.checked_add(rows * (2 * c + 8)))
+            .context("point subdivision allocation overflow")?;
+        d.workspace_budget(self.initial_free, self.device_budget, reserve)?;
+        let projection = self.point_project(x, stage)?;
+        drop(input);
+        let pairs = d.stream.clone_htod(source.as_flattened())?;
+        let output = d.stream.alloc_zeros::<f16>(rows * c)?;
+        self.c2s(&projection, &pairs, &output, [n, rows, c, c], false)?;
+        Ok((children, output))
+    }
+    fn point_field<T: DeviceRepr + Copy + 'static>(
+        &self,
+        workspace: &PointWorkspace<T>,
+        input: &CudaSlice<T>,
+        last_conv: &SparseConv<f32>,
+    ) -> Result<CudaSlice<f32>> {
+        let d = &self.device;
+        let n = input.len() / 128;
+        let normalized = d.stream.alloc_zeros::<f32>(n * 128)?;
+        let norm = matrix::<f32>(ptr(&normalized, d), n, 128)?;
+        self.point_norm(
+            &workspace.norms,
+            "decoder.conv_out.conv.0",
+            matrix::<T>(ptr(input, d), n, 128)?,
+            &mut TensorMut(norm),
+        )?;
+        self.point_swish(norm)?;
+        let output = d.stream.alloc_zeros::<f32>(n * 40)?;
+        self.point_conv(
+            last_conv,
+            "decoder.conv_out.conv.2",
+            norm,
+            &mut TensorMut(matrix::<f32>(ptr(&output, d), n, 40)?),
+        )?;
+        Ok(output)
+    }
+    pub fn points(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        frame: [[f32; 4]; 4],
+        resolution: u32,
+    ) -> Result<CornerDecoderOutput> {
+        ensure!(
+            matches!(self.kind, DecoderKind::PointTransformer),
+            "point decoder requires point transformer weights"
+        );
+        DecoderKind::validate_point_rows(coordinates.len())?;
+        ensure!(
+            latent.len() == coordinates.len() * 32
+                && latent.iter().all(|v| v.is_finite())
+                && frame.iter().flatten().all(|v| v.is_finite()),
+            "invalid point decoder input extent or values"
+        );
+        let output_resolution = resolution
+            .checked_mul(8)
+            .filter(|_| resolution > 0)
+            .context("point decoder resolution overflow")?;
+        ensure!(
+            coordinates
+                .iter()
+                .all(|p| p[1..].iter().all(|&v| v >= 0 && (v as u32) < resolution)),
+            "point coordinate outside input resolution"
+        );
+        let mut sites = SparseSites::new(coordinates)?;
+        let n = sites.coordinates().len();
+        let d = &self.device;
+        d.workspace_budget(self.initial_free, self.device_budget, n * (32 + 512) * 4)?;
+        let input = d.stream.clone_htod(latent)?;
+        let mut features = d.stream.alloc_zeros::<f32>(n * 512)?;
+        let workspace = PointWorkspace::new(self, &sites, [512, 512], false)?;
+        self.point_conv(
+            &workspace.conv,
+            "decoder.z_to_f.conv.0",
+            matrix::<f32>(ptr(&input, d), n, 32)?,
+            &mut TensorMut(matrix::<f32>(ptr(&features, d), n, 512)?),
+        )?;
+        drop(input);
+        let maps = sites.serialized_windows(48)?;
+        features = self.point_mid(&workspace, &maps, features, &workspace.conv)?;
+        drop(maps);
+        features = self.point_blocks(&workspace, features, 3, [512, 512])?;
+        let (next, mut features) = self.point_up(workspace, sites, features, 3)?;
+        sites = next;
+        for (stage, ci, co) in [(2, 512, 256), (1, 256, 128)] {
+            let workspace = PointWorkspace::new(self, &sites, [ci, co], false)?;
+            features = self.point_blocks(&workspace, features, stage, [ci, co])?;
+            (sites, features) = self.point_up(workspace, sites, features, stage)?;
+        }
+        let workspace = PointWorkspace::new(self, &sites, [128, 128], true)?;
+        features = self.point_blocks(&workspace, features, 0, [128, 128])?;
+        let fields = self.point_field(&workspace, &features, &workspace.conv)?;
+        drop(features);
+        let rows = sites.coordinates().len();
+        unsafe {
+            d.stream
+                .launch_builder(
+                    self.k
+                        .corner_fields
+                        .as_ref()
+                        .context("corner activation not loaded")?,
+                )
+                .arg(&fields)
+                .arg(&u32::try_from(rows)?)
+                .launch(flat(rows * 32))?;
+        }
+        let values = d.stream.clone_dtoh(&fields)?;
+        ensure!(
+            values.iter().all(|v| v.is_finite()),
+            "nonfinite point decoder fields"
+        );
+        let mut sign_logits = Vec::with_capacity(rows * 8);
+        let mut features = Vec::with_capacity(rows * 32);
+        for row in values.as_chunks::<40>().0 {
+            sign_logits.extend_from_slice(&row[..8]);
+            features.extend_from_slice(&row[8..]);
+        }
+        Ok(CornerDecoderOutput {
+            fields: SparseDecoderOutput {
+                coordinates: sites.coordinates().to_vec(),
+                features,
+                channels: 32,
+            },
+            sign_logits,
+            matrix: frame,
+            resolution: output_resolution,
         })
     }
     fn linear16(

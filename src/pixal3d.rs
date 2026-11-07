@@ -380,6 +380,7 @@ pub enum DecoderKind {
     Structure,
     Shape,
     Texture,
+    PointTransformer,
 }
 pub struct DecoderCheckpoint {
     pub kind: DecoderKind,
@@ -387,11 +388,20 @@ pub struct DecoderCheckpoint {
     pub runtime_bytes: usize,
 }
 impl DecoderKind {
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn validate_point_rows(rows: usize) -> Result<()> {
+        ensure!(
+            (1..=12_000_000).contains(&rows),
+            "point residual stage requires 1..=12000000 sites"
+        );
+        Ok(())
+    }
     pub fn stem(self) -> &'static str {
         match self {
             Self::Structure => "ss_dec_conv3d_16l8_fp16",
             Self::Shape => "shape_dec_next_dc_f16c32_fp16",
             Self::Texture => "tex_dec_next_dc_f16c32_fp16",
+            Self::PointTransformer => "model",
         }
     }
     pub(crate) fn inventory(self) -> BTreeMap<String, (Vec<usize>, Dtype, bool)> {
@@ -402,6 +412,7 @@ impl DecoderKind {
                 tensors.insert(format!("{name}.bias"), (vec![width], dtype, f32_runtime));
             };
         match self {
+            Self::PointTransformer => return Self::point_transformer_inventory(),
             Self::Structure => {
                 pair(
                     "input_layer".into(),
@@ -519,7 +530,101 @@ impl DecoderKind {
         }
         tensors
     }
+    fn point_transformer_inventory() -> BTreeMap<String, (Vec<usize>, Dtype, bool)> {
+        let mut tensors = BTreeMap::new();
+        let mut norms = vec![("decoder.conv_out.conv.0".into(), 128)];
+        let mut convolutions = vec![
+            ("decoder.z_to_f.conv.0".into(), 32, 512),
+            ("decoder.conv_out.conv.2".into(), 128, 40),
+        ];
+        let mut linears = Vec::new();
+        let mut residuals = vec![
+            ("decoder.mid.block_in".into(), 512, 512),
+            ("decoder.mid.block_out".into(), 512, 512),
+        ];
+        for (stage, input, output) in [(3, 512, 512), (2, 512, 256), (1, 256, 128), (0, 128, 128)] {
+            for (block, ci) in [(0, input), (1, output)] {
+                residuals.push((format!("decoder.dec.dec{stage}.block{block}"), ci, output));
+            }
+            if stage > 0 {
+                let name = format!("decoder.dec.dec{stage}.up.upsample");
+                norms.push((format!("{name}.cls_head.fc.0"), output));
+                convolutions.push((format!("{name}.cls_head.fc.2"), output, 8));
+                linears.push((format!("{name}.proj"), output, 8 * output, false));
+                tensors.insert(
+                    format!("{name}.inv_grid_coord"),
+                    (vec![8, 3], Dtype::I64, false),
+                );
+            }
+        }
+        for (name, input, output) in residuals {
+            for (index, channels) in [(0, input), (3, output)] {
+                norms.push((format!("{name}.block.{index}"), channels));
+            }
+            for (index, channels) in [(2, input), (5, output)] {
+                convolutions.push((format!("{name}.block.{index}"), channels, output));
+            }
+            if input != output {
+                linears.push((format!("{name}.res_conv"), input, output, true));
+            }
+        }
+        for block in 0..2 {
+            let name = format!("decoder.mid.block{block}");
+            convolutions.push((format!("{name}.cpe.0"), 512, 512));
+            for (suffix, input, output) in [
+                ("cpe.1", 512, 512),
+                ("attn.qkv", 512, 1536),
+                ("attn.proj", 512, 512),
+                ("mlp.0.fc1", 512, 2048),
+                ("mlp.0.fc2", 2048, 512),
+            ] {
+                linears.push((format!("{name}.{suffix}"), input, output, true));
+            }
+            for suffix in ["cpe.2", "norm1.0", "norm2.0"] {
+                for parameter in ["weight", "bias"] {
+                    tensors.insert(
+                        format!("{name}.{suffix}.{parameter}"),
+                        (vec![512], Dtype::F32, true),
+                    );
+                }
+            }
+        }
+        for (name, channels) in norms {
+            for parameter in ["weights", "bias"] {
+                tensors.insert(
+                    format!("{name}.{parameter}"),
+                    (vec![1, channels], Dtype::F32, true),
+                );
+            }
+        }
+        for (name, input, output) in convolutions {
+            tensors.insert(
+                format!("{name}.weight"),
+                (vec![output, 3, 3, 3, input], Dtype::F32, true),
+            );
+            tensors.insert(format!("{name}.bias"), (vec![output], Dtype::F32, true));
+        }
+        for (name, input, output, bias) in linears {
+            tensors.insert(
+                format!("{name}.weight"),
+                (vec![output, input], Dtype::F32, false),
+            );
+            if bias {
+                tensors.insert(format!("{name}.bias"), (vec![output], Dtype::F32, false));
+            }
+        }
+        tensors
+    }
     fn validate(self, config: &Value) -> Result<()> {
+        if matches!(self, Self::PointTransformer) {
+            ensure!(
+                config["model"]["type"] == "SparconvVAE"
+                    && config["model"]["decoder_cfg"]["type"] == "PTv3MeshDecoder"
+                    && config["model"]["decoder_cfg"]["z_channels"] == 32,
+                "unsupported point transformer decoder definition"
+            );
+            return Ok(());
+        }
         let args = &config["args"];
         ensure!(
             args["use_fp16"] == true,
@@ -551,37 +656,67 @@ impl DecoderKind {
                     && args["block_args"] == serde_json::json!([{}, {}, {}, {}, {}]),
                 "unsupported sparse shape decoder"
             ),
+            Self::PointTransformer => unreachable!(),
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_tensors(
+        self,
+        tensors: &BTreeMap<String, PublishedTensor<'_>>,
+    ) -> Result<()> {
+        let inventory = self.inventory();
+        ensure!(
+            tensors.keys().eq(inventory.keys()),
+            "decoder checkpoint missing/unexpected keys"
+        );
+        for (name, (shape, dtype, _)) in inventory {
+            let tensor = &tensors[&name];
+            ensure!(
+                tensor.shape == shape && tensor.dtype == format!("{dtype:?}"),
+                "decoder tensor {name} has unexpected stored dtype/layout"
+            );
+            if dtype == Dtype::I64 {
+                for (index, element) in tensor.data.as_chunks::<8>().0.iter().enumerate() {
+                    let child = index / 3;
+                    let axis = index % 3;
+                    let expected = ((child >> (2 - axis)) & 1) as i64;
+                    ensure!(
+                        *element == expected.to_le_bytes(),
+                        "decoder child offset {name} differs at {index}"
+                    );
+                }
+            }
         }
         Ok(())
     }
 }
 impl DecoderCheckpoint {
     pub fn open(dir: &Path, kind: DecoderKind) -> Result<Self> {
+        let config_name = if matches!(kind, DecoderKind::PointTransformer) {
+            "config"
+        } else {
+            kind.stem()
+        };
         let config: Value =
-            serde_json::from_slice(&std::fs::read(dir.join(format!("{}.json", kind.stem())))?)?;
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{config_name}.json")))?)?;
         kind.validate(&config)?;
         let mapped = MappedCheckpoint::open_component(dir, kind.stem())?;
-        let inventory = kind.inventory();
-        ensure!(
-            mapped.index.weight_map.keys().eq(inventory.keys()),
-            "decoder checkpoint missing/unexpected keys"
-        );
+        kind.validate_tensors(&mapped.component_tensors()?)?;
         let mut runtime_bytes = 0usize;
-        for (name, (shape, dtype, f32_runtime)) in &inventory {
-            let tensor = mapped.tensor(name)?;
-            ensure!(
-                tensor.shape() == shape && tensor.dtype() == *dtype,
-                "decoder tensor {name} has unexpected stored dtype/layout"
-            );
-            let count = shape.iter().try_fold(1usize, |n, &d| {
+        for (name, (_, dtype, float_runtime)) in kind.inventory() {
+            let tensor = mapped.tensor(&name)?;
+            let count = tensor.shape().iter().try_fold(1usize, |n, &d| {
                 n.checked_mul(d).context("decoder shape overflow")
             })?;
+            let width = if dtype == Dtype::I64 {
+                8
+            } else if float_runtime {
+                4
+            } else {
+                2
+            };
             runtime_bytes = runtime_bytes
-                .checked_add(
-                    count
-                        .checked_mul(if *f32_runtime { 4 } else { 2 })
-                        .context("decoder bytes overflow")?,
-                )
+                .checked_add(count.checked_mul(width).context("decoder bytes overflow")?)
                 .context("decoder bytes overflow")?;
         }
         Ok(Self {
@@ -595,6 +730,142 @@ impl DecoderCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires FF_HI3D_MODEL; CPU only"]
+    fn hi3d_decoder_checkpoint_cpu() -> Result<()> {
+        DecoderKind::validate_point_rows(12_000_000)?;
+        ensure!(
+            DecoderKind::validate_point_rows(12_000_001).is_err(),
+            "unsupported residual branch accepted"
+        );
+        let root = std::env::var_os("FF_HI3D_MODEL").context("FF_HI3D_MODEL required")?;
+        let checkpoint =
+            DecoderCheckpoint::open(&Path::new(&root).join("vae"), DecoderKind::PointTransformer)?;
+        ensure!(
+            checkpoint.runtime_bytes == 357_128_768,
+            "decoder runtime byte count"
+        );
+        let mut tensors = checkpoint.mapped.component_tensors()?;
+        ensure!(tensors.len() == 144, "published decoder tensor count");
+        ensure!(
+            tensors.values().map(|t| t.data.len()).sum::<usize>() == 376_614_208,
+            "published decoder byte count"
+        );
+        let name = "decoder.z_to_f.conv.0.weight";
+        let original = tensors[name].shape.clone();
+        tensors.get_mut(name).context("convolution missing")?.shape = vec![512, 1, 9, 3, 32];
+        ensure!(
+            checkpoint.kind.validate_tensors(&tensors).is_err(),
+            "same-numel convolution extent control accepted"
+        );
+        tensors.get_mut(name).context("convolution missing")?.shape = original;
+        let name = "decoder.dec.dec1.up.upsample.inv_grid_coord";
+        let mut wrong = tensors[name].data.to_vec();
+        wrong[3 * 8] = 1;
+        wrong[5 * 8] = 0;
+        tensors.get_mut(name).context("child table missing")?.data = &wrong;
+        ensure!(
+            checkpoint.kind.validate_tensors(&tensors).is_err(),
+            "X/Z child offset control accepted"
+        );
+        let reference = std::env::var_os("FF_HI3D_DECODER_REFERENCE")
+            .context("FF_HI3D_DECODER_REFERENCE required")?;
+        let reference = Path::new(&reference);
+        let freeze: Value = serde_json::from_slice(&std::fs::read(reference.join("FROZEN.json"))?)?;
+        ensure!(
+            freeze["M0_complete"] == true && freeze["reference_protocol"] == "PASS",
+            "decoder reference freeze is incomplete"
+        );
+        let maps = std::fs::read(reference.join("CPU-r3/maps.safetensors"))?;
+        let maps = safetensors::SafeTensors::deserialize(&maps)?;
+        let read = |name: &str| -> Result<Vec<i64>> {
+            let tensor = maps.tensor(name)?;
+            match tensor.dtype() {
+                Dtype::I64 => Ok(tensor
+                    .data()
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|v| i64::from_le_bytes(*v))
+                    .collect()),
+                Dtype::I32 => Ok(tensor
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| i32::from_le_bytes(*v) as i64)
+                    .collect()),
+                _ => anyhow::bail!("invalid sparse map dtype"),
+            }
+        };
+        let cases = freeze["exact_serialization_maps"]
+            .as_object()
+            .context("serialization cells missing")?;
+        ensure!(cases.len() == 9, "serialization case count");
+        for (name, _) in cases {
+            let name = name
+                .strip_prefix("serialization.")
+                .context("serialization prefix missing")?;
+            let grid = read(&format!("{name}.grid"))?;
+            let batch = read(&format!("{name}.batch"))?;
+            let coordinates = grid
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(batch)
+                .map(|(p, b)| {
+                    Ok([
+                        i32::try_from(b)?,
+                        i32::try_from(p[0])?,
+                        i32::try_from(p[1])?,
+                        i32::try_from(p[2])?,
+                    ])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let sites = crate::sparse::SparseSites::new(coordinates)?;
+            let actual = sites.serialized_windows(48)?;
+            for (suffix, value) in [
+                (
+                    "keys",
+                    actual
+                        .keys
+                        .iter()
+                        .flatten()
+                        .map(|&x| x as i64)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "order",
+                    actual.order.iter().flatten().map(|&x| x as i64).collect(),
+                ),
+                (
+                    "inverse",
+                    actual.inverse.iter().flatten().map(|&x| x as i64).collect(),
+                ),
+                ("pad", actual.pad.iter().map(|&x| x as i64).collect()),
+                ("unpad", actual.unpad.iter().map(|&x| x as i64).collect()),
+                (
+                    "cu_seqlens",
+                    actual.offsets.iter().map(|&x| x as i64).collect(),
+                ),
+            ] {
+                ensure!(
+                    value == read(&format!("{name}.{suffix}"))?,
+                    "serialized map {name}.{suffix} differs"
+                );
+            }
+            println!(
+                "PASS HI3D_DECODER_MAP case={name} rows={} padded_rows={} windows={} exact=true",
+                sites.coordinates().len(),
+                actual.pad.len(),
+                actual.offsets.len() - 1
+            );
+        }
+        println!(
+            "PASS HI3D_DECODER_LOAD tensors=144 published_bytes=376614208 runtime_bytes=357128768 CPU_child_bytes=576 convolutions=27 child_tables=3 missing=0 unexpected=0 initialized=0 physical_extent_control=rejected child_axis_control=rejected"
+        );
+        Ok(())
+    }
     #[test]
     #[ignore = "requires FF_HI3D_MODEL; CPU only"]
     fn hi3d_flow_checkpoint_cpu() -> Result<()> {
@@ -664,21 +935,16 @@ mod tests {
     #[ignore = "requires published Pixal3D checkpoints; CPU only"]
     fn pixal3d_decoder_checkpoint_cpu() -> Result<()> {
         let root = std::env::var_os("FF_PIXAL_MODEL").context("FF_PIXAL_MODEL required")?;
-        for (kind, keys) in [
-            (DecoderKind::Structure, 74),
-            (DecoderKind::Shape, 292),
-            (DecoderKind::Texture, 284),
+        for (kind, keys, expected) in [
+            (DecoderKind::Structure, 74, 147_585_412),
+            (DecoderKind::Shape, 292, 948_598_492),
+            (DecoderKind::Texture, 284, 948_567_448),
         ] {
             let checkpoint = DecoderCheckpoint::open(&Path::new(&root).join("ckpts"), kind)?;
             ensure!(
                 checkpoint.mapped.index.weight_map.len() == keys,
                 "decoder key count differs"
             );
-            let expected = match kind {
-                DecoderKind::Structure => 147_585_412,
-                DecoderKind::Shape => 948_598_492,
-                DecoderKind::Texture => 948_567_448,
-            };
             ensure!(
                 checkpoint.runtime_bytes == expected,
                 "decoder runtime dtype inventory differs"

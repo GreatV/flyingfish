@@ -85,6 +85,74 @@ fn f32_tensor(path: &Path, key: &str) -> Result<Vec<f32>> {
         .map(|x| x as f32)
         .collect())
 }
+fn half_tensor(path: &Path, key: &str) -> Result<Vec<f16>> {
+    let checkpoint = MappedCheckpoint::open_component(
+        path.parent().context("feature bank parent missing")?,
+        path.file_stem()
+            .and_then(|v| v.to_str())
+            .context("feature bank stem missing")?,
+    )?;
+    let t = checkpoint.tensor(key)?;
+    ensure!(
+        t.dtype() == Dtype::F16,
+        "feature bank must retain F16 storage"
+    );
+    Ok(t.data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| f16::from_le_bytes(*v))
+        .collect())
+}
+fn indices(value: &Value) -> Result<Vec<usize>> {
+    value
+        .as_array()
+        .context("selected rows missing")?
+        .iter()
+        .map(|v| usize::try_from(v.as_u64().context("invalid selected row")?).map_err(Into::into))
+        .collect()
+}
+fn selected_values<T: DeviceRepr + Copy>(
+    d: &Device,
+    values: &CudaSlice<T>,
+    rows: &[usize],
+    width: usize,
+    convert: impl Fn(T) -> f64,
+) -> Result<Vec<f64>> {
+    ensure!(
+        width > 0
+            && values.len().is_multiple_of(width)
+            && rows.iter().all(|&r| r < values.len() / width),
+        "selected rows outside feature bank"
+    );
+    let mut output = Vec::with_capacity(rows.len() * width);
+    for &row in rows {
+        output.extend(
+            d.stream
+                .clone_dtoh(&values.slice(row * width..(row + 1) * width))?
+                .into_iter()
+                .map(&convert),
+        );
+    }
+    Ok(output)
+}
+fn bank_sites(path: &Path) -> Result<SparseSites> {
+    let grid = tensor(path, "grid_coord")?;
+    let batch = tensor(path, "batch")?;
+    ensure!(
+        grid.shape == [batch.values.len(), 3],
+        "feature bank grid/batch extent mismatch"
+    );
+    SparseSites::new(
+        grid.values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(batch.values)
+            .map(|(p, b)| [b as i32, p[0] as i32, p[1] as i32, p[2] as i32])
+            .collect(),
+    )
+}
 fn id(table: &str, name: &str, key: Option<&str>) -> CellId {
     (table.into(), name.into(), key.map(str::to_owned))
 }
@@ -100,6 +168,8 @@ struct OperationGate {
     cells: BTreeMap<String, Value>,
     seen: BTreeSet<String>,
     defects: usize,
+    decoder_anchor: Option<PathBuf>,
+    decoder_key: Option<String>,
 }
 impl OperationGate {
     fn new(kind: &str, count: usize) -> Result<Self> {
@@ -139,29 +209,109 @@ impl OperationGate {
             cells,
             seen: BTreeSet::new(),
             defects: 0,
+            decoder_anchor: None,
+            decoder_key: None,
+        })
+    }
+    fn decoder(kind: &str, freeze_dir: &str, anchor_dir: &str, count: usize) -> Result<Self> {
+        let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+        let freeze: Value =
+            serde_json::from_slice(&std::fs::read(root.join(freeze_dir).join("FROZEN.json"))?)?;
+        ensure!(
+            freeze["reference_protocol"] == "PASS",
+            "decoder reference protocol is invalid"
+        );
+        let cells: BTreeMap<String, Value> = serde_json::from_value(freeze["cells"].clone())?;
+        ensure!(
+            cells.len() == count
+                && cells
+                    .values()
+                    .all(|cell| cell["reference_protocol"] == "PASS"),
+            "decoder cell coverage or protocol mismatch"
+        );
+        let decoder_anchor = Some(root.join(anchor_dir).join("anchor.safetensors"));
+        Ok(Self {
+            root,
+            kind: kind.into(),
+            cells,
+            seen: BTreeSet::new(),
+            defects: 0,
+            decoder_anchor,
+            decoder_key: None,
         })
     }
     fn score(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
         if !control {
             ensure!(self.seen.insert(name.into()), "duplicate operation score");
         }
+        self.measure(name, values, control)
+    }
+    fn replay(&mut self, name: &str, values: &[f64], mode: &str) -> Result<()> {
+        ensure!(self.seen.contains(name), "unscored operation replay");
+        println!("N5_M2B_MODE cell={name} mode={mode}");
+        self.measure(name, values, false)
+    }
+    fn measure(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
         let cell = self.cells.get(name).context("cell outside frozen scope")?;
-        let anchor = tensor(
-            &self.root.join(&self.kind).join("anchor.safetensors"),
-            &format!("{name}.anchor"),
-        )?;
+        let anchor = if let Some(path) = &self.decoder_anchor {
+            if let Some(source) = cell["source_cell"].as_str() {
+                let source = tensor(path, source)?;
+                let width = source.shape[1];
+                let rows = cell["selector"]["rows"]
+                    .as_array()
+                    .context("selector rows missing")?;
+                let mut values = Vec::with_capacity(rows.len() * width);
+                for row in rows {
+                    let row = usize::try_from(row.as_u64().context("invalid selector row")?)?;
+                    ensure!(row < source.shape[0], "selector exceeds anchor rows");
+                    values.extend_from_slice(&source.values[row * width..(row + 1) * width]);
+                }
+                HostTensor {
+                    shape: vec![rows.len(), width],
+                    values,
+                }
+            } else {
+                tensor(path, self.decoder_key.as_deref().unwrap_or(name))?
+            }
+        } else {
+            tensor(
+                &self.root.join(&self.kind).join("anchor.safetensors"),
+                &format!("{name}.anchor"),
+            )?
+        };
         let errors = metrics(values, &anchor.values)?;
         for metric in ["max_abs", "rmse"] {
-            let bound = cell["bounds"][metric].as_f64().context("bound missing")?;
+            let bound = cell[if self.decoder_anchor.is_some() {
+                "tau"
+            } else {
+                "bounds"
+            }][metric]
+                .as_f64()
+                .context("bound missing")?;
             let value = errors[metric];
+            if !control && let Some(bound) = cell["original_tau"][metric].as_f64() {
+                println!(
+                    "N5_M2B_ORIGINAL_FIELD_METRIC cell={name} metric={metric} value={value:.15e} bound={bound:.15e} result={}",
+                    if value > bound { "DEFECT" } else { "PASS" }
+                );
+            }
             let defect = if control {
-                value < 10.0 * bound
+                if self.decoder_anchor.is_some() {
+                    value <= 10.0 * bound
+                } else {
+                    value < 10.0 * bound
+                }
             } else {
                 value > bound
             };
             self.defects += usize::from(defect);
             println!(
-                "N5_M1_METRIC kind={} cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                "{}_METRIC kind={} cell={name} metric={metric} value={value:.15e} bound={bound:.15e} control={control} result={}",
+                if self.decoder_anchor.is_some() {
+                    "N5_M2B"
+                } else {
+                    "N5_M1"
+                },
                 self.kind,
                 if defect { "DEFECT" } else { "PASS" }
             );
@@ -174,7 +324,12 @@ impl OperationGate {
             "operation cells unexecuted"
         );
         println!(
-            "N5_M1_GATE {} kind={} cells={} defects={} timing=false",
+            "{}_GATE {} kind={} cells={} defects={} timing=false",
+            if self.decoder_anchor.is_some() {
+                "N5_M2B"
+            } else {
+                "N5_M1"
+            },
             if self.defects == 0 { "PASS" } else { "DEFECT" },
             self.kind,
             self.seen.len(),
@@ -227,6 +382,1328 @@ fn lattice(path: &Path, key: &str) -> Result<Vec<[i32; 3]>> {
         .iter()
         .map(|p| [p[1] as i32, p[2] as i32, p[3] as i32])
         .collect())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_MODEL")?;
+    let checkpoint = DecoderCheckpoint::open(&root.join("vae"), DecoderKind::PointTransformer)?;
+    let reference = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let common = reference.join("sm89-r1/additional-common-inputs.safetensors");
+    let sites = SparseSites::new(decoder_coordinates(&common, "conv.coordinates")?)?;
+    let wrong_maps = sites
+        .coordinates()
+        .iter()
+        .map(|&p| {
+            std::array::from_fn(|tap| {
+                let query = [
+                    p[0],
+                    p[3] + (tap / 9) as i32 - 1,
+                    p[2] + ((tap / 3) % 3) as i32 - 1,
+                    p[1] + (tap % 3) as i32 - 1,
+                ];
+                sites.row(query).unwrap_or(-1)
+            })
+        })
+        .collect::<Vec<[i32; 27]>>();
+    let d = Device::new(0)?;
+    let ops = Ops::new(&d.ctx)?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let blas = Blas::new(
+        &d,
+        &ops,
+        &runtime,
+        Rc::new(Closure::new(false, "sparse convolution".into())),
+    )?;
+    let n = sites.coordinates().len();
+    let mut defects = 0;
+    let mut results = Vec::new();
+    for tile in [127, 251] {
+        let mut gate =
+            OperationGate::decoder("sparse-convolution", "conv-freeze-r1", "sm89-r1", 54)?;
+        for (name, cell) in gate.cells.clone() {
+            let definition = &cell["definition"];
+            let ci = definition["input_shape"][1]
+                .as_u64()
+                .context("input width missing")? as usize;
+            let co = definition["stored_weight_shape"][0]
+                .as_u64()
+                .context("output width missing")? as usize;
+            let module = name
+                .strip_prefix("conv.")
+                .context("conv prefix missing")?
+                .rsplit_once('.')
+                .context("feature dtype missing")?
+                .0;
+            let weight = checkpoint.mapped.tensor(&format!("{module}.weight"))?;
+            let weight: Vec<_> = weight
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect();
+            let weight = d.stream.clone_htod(&weight)?;
+            let bias = checkpoint.mapped.tensor(&format!("{module}.bias"))?;
+            let bias: Vec<_> = bias
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect();
+            let bias = d.stream.clone_htod(&bias)?;
+            let rows: Vec<_> = definition["sampled_output_rows"]
+                .as_array()
+                .context("sample rows missing")?
+                .iter()
+                .map(|v| v.as_u64().context("invalid sample row").map(|v| v as usize))
+                .collect::<Result<_>>()?;
+            let input = f32_tensor(&common, &format!("conv.c{ci}.input"))?;
+            let workspace = n * 27 * size_of::<i32>() + tile * (27 * ci + co) * size_of::<f32>();
+            let mut conv = SparseConv::<f32>::promoted(&d, &sites, [ci, co], workspace)?;
+            for control in [false, true] {
+                if control {
+                    conv.replace_neighbours(&wrong_maps)?;
+                }
+                let weight = matrix(ptr(&weight, &d), co, 27 * ci)?;
+                let bias = view(&bias, &d.stream, 0, [co as u32], [1])?;
+                let values = if name.ends_with(".float16") {
+                    let input: Vec<_> = input.iter().map(|&x| f16::from_f32(x)).collect();
+                    let input = d.stream.clone_htod(&input)?;
+                    let output = d.stream.alloc_zeros::<f16>(n * co)?;
+                    conv.run_promoted(
+                        &blas,
+                        matrix::<f16>(ptr(&input, &d), n, ci)?,
+                        weight,
+                        bias,
+                        &mut TensorMut(matrix::<f16>(ptr(&output, &d), n, co)?),
+                    )?;
+                    selected_half(&d, &output, &rows, co)?
+                } else {
+                    let input = d.stream.clone_htod(&input)?;
+                    let output = d.stream.alloc_zeros::<f32>(n * co)?;
+                    conv.run_promoted(
+                        &blas,
+                        matrix::<f32>(ptr(&input, &d), n, ci)?,
+                        weight,
+                        bias,
+                        &mut TensorMut(matrix::<f32>(ptr(&output, &d), n, co)?),
+                    )?;
+                    let output = d.stream.clone_dtoh(&output)?;
+                    rows.iter()
+                        .flat_map(|&r| output[r * co..(r + 1) * co].iter().map(|&x| x as f64))
+                        .collect()
+                };
+                gate.score(&name, &values, control)?;
+            }
+        }
+        defects += gate.defects;
+        println!(
+            "N5_M2B_CONV_TILE tile={tile} cells={} defects={} bounded=true stored_layout=KRSC input_rows={n}",
+            gate.seen.len(),
+            gate.defects
+        );
+        results.push(gate.finish());
+    }
+    for result in results {
+        result?;
+    }
+    println!(
+        "PASS N5_M2B_SPARSE_CONV_GATE cells=54 tiles=2 executions=108 control_executions=108 defects={defects} eager=true timing=false"
+    );
+    Ok(())
+}
+
+fn normalized_features<
+    I: DeviceRepr + Copy + 'static,
+    O: DeviceRepr + Copy + ValidAsZeroBits + 'static,
+>(
+    d: &Device,
+    plan: &crate::backend::cuda::sparse::BatchGroupNorm,
+    input: Vec<I>,
+    affine: [&CudaSlice<f32>; 2],
+    shape: [usize; 2],
+    selected: &[usize],
+    convert: impl Fn(O) -> f64,
+) -> Result<Vec<f64>> {
+    let [n, c] = shape;
+    let x = d.stream.clone_htod(&input)?;
+    drop(input);
+    let output = d.stream.alloc_zeros::<O>(n * c)?;
+    plan.run::<I, O>(
+        matrix(ptr(&x, d), n, c)?,
+        [
+            view(affine[0], &d.stream, 0, [c as u32], [1])?,
+            view(affine[1], &d.stream, 0, [c as u32], [1])?,
+        ],
+        &mut TensorMut(matrix(ptr(&output, d), n, c)?),
+    )?;
+    ensure!(
+        selected.iter().all(|&row| row < n),
+        "norm selected row exceeds support"
+    );
+    selected_values(d, &output, selected, c, convert)
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_production_norm_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let model = env_path("FF_HI3D_MODEL")?.join("vae/model.safetensors");
+    let d = Device::new(0)?;
+    let mut gate = OperationGate::decoder(
+        "actual-support-group-norm",
+        "production-norm-freeze-r1",
+        "production-norm-sm89-r1",
+        4,
+    )?;
+    for (name, cell) in gate.cells.clone() {
+        let definition = &cell["definition"];
+        let n = definition["full_input_shape"][0]
+            .as_u64()
+            .context("norm extent missing")? as usize;
+        let c = definition["full_input_shape"][1]
+            .as_u64()
+            .context("norm width missing")? as usize;
+        let rows = indices(&definition["selected_output_rows"])?;
+        let bank_name = Path::new(
+            definition["common_input_bank"]
+                .as_str()
+                .context("norm bank missing")?,
+        )
+        .file_name()
+        .context("norm bank filename missing")?;
+        let case = name.split('.').nth(1).context("norm case missing")?;
+        let bank = root.join(format!("{case}-decode-sm86-r1")).join(bank_name);
+        let module = definition["module"]
+            .as_str()
+            .context("norm module missing")?;
+        let weight = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.weights"))?)?;
+        let bias = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.bias"))?)?;
+        for control in [false, true] {
+            let offsets = if control {
+                (0..n)
+                    .step_by(47)
+                    .chain(std::iter::once(n))
+                    .map(|v| v as u32)
+                    .collect()
+            } else {
+                vec![0, n as u32]
+            };
+            let plan = BatchGroupNorm::new(&d, &offsets, c, 32, 1e-6, 64 << 20)?;
+            let x = half_tensor(&bank, "feat")?;
+            ensure!(x.len() == n * c, "actual support feature count mismatch");
+            let values = if name.ends_with(".field") {
+                normalized_features::<f16, f32>(
+                    &d,
+                    &plan,
+                    x,
+                    [&weight, &bias],
+                    [n, c],
+                    &rows,
+                    f64::from,
+                )?
+            } else {
+                normalized_features::<f16, f16>(
+                    &d,
+                    &plan,
+                    x,
+                    [&weight, &bias],
+                    [n, c],
+                    &rows,
+                    f16::to_f64,
+                )?
+            };
+            gate.score(&name, &values, control)?;
+        }
+    }
+    gate.finish()
+}
+
+fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
+    decoder: &PixalDecoder,
+    gate: &mut OperationGate,
+    case: &str,
+    stage: usize,
+    input: Vec<T>,
+) -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let name = format!("decoder.dec.dec{stage}.up.upsample");
+    let bank = root.join(format!("{case}-decode-sm86-r1/{name}.input.safetensors"));
+    let sites = bank_sites(&bank)?;
+    let n = sites.coordinates().len();
+    ensure!(input.len().is_multiple_of(n), "head input extent mismatch");
+    let c = input.len() / n;
+    let d = &decoder.device;
+    let input = d.stream.clone_htod(&input)?;
+    let x = matrix::<T>(ptr(&input, d), n, c)?;
+    let workspace = PointWorkspace::new(decoder, &sites, [c, c], false)?;
+    let maps = root.join(format!("{case}-heads-sm89-r1/maps.safetensors"));
+    let rows: Vec<_> = tensor(&maps, &format!("{name}.selected_parents"))?
+        .values
+        .into_iter()
+        .map(|v| v as usize)
+        .collect();
+    gate.decoder_anchor = Some(root.join(format!("{case}-heads-sm89-r1/anchor.safetensors")));
+    let w = decoder
+        .weights
+        .float
+        .get(&format!("{name}.cls_head.fc.0.weights"))
+        .context("head norm weight missing")?;
+    let b = decoder
+        .weights
+        .float
+        .get(&format!("{name}.cls_head.fc.0.bias"))
+        .context("head norm bias missing")?;
+    let normalized = d.stream.alloc_zeros::<f32>(n * c)?;
+    decoder.point_norm(
+        &workspace.norms,
+        &format!("{name}.cls_head.fc.0"),
+        x,
+        &mut TensorMut(matrix::<f32>(ptr(&normalized, d), n, c)?),
+    )?;
+    gate.decoder_key = Some(format!("{name}.normalized"));
+    gate.score(
+        &format!("{case}.{name}.normalized"),
+        &selected_values(d, &normalized, &rows, c, f64::from)?,
+        false,
+    )?;
+    drop(normalized);
+    let offsets: Vec<_> = (0..n)
+        .step_by(47)
+        .chain(std::iter::once(n))
+        .map(|v| v as u32)
+        .collect();
+    let plan = BatchGroupNorm::new(d, &offsets, c, 32, 1e-6, 64 << 20)?;
+    let wrong = d.stream.alloc_zeros::<f32>(n * c)?;
+    plan.run::<T, f32>(
+        x,
+        [
+            view(w, &d.stream, 0, [c as u32], [1])?,
+            view(b, &d.stream, 0, [c as u32], [1])?,
+        ],
+        &mut TensorMut(matrix(ptr(&wrong, d), n, c)?),
+    )?;
+    gate.score(
+        &format!("{case}.{name}.normalized"),
+        &selected_values(d, &wrong, &rows, c, f64::from)?,
+        true,
+    )?;
+    drop(wrong);
+    let logits = decoder.point_head(&workspace, x, stage)?;
+    let values = d.stream.clone_dtoh(&logits)?;
+    drop(logits);
+    let scores: Vec<_> = values.iter().map(|&v| f64::from(v)).collect();
+    gate.decoder_key = Some(format!("{name}.logits"));
+    gate.score(&format!("{case}.{name}.logits"), &scores, false)?;
+    let permutation = [0, 4, 2, 6, 1, 5, 3, 7];
+    let wrong: Vec<_> = values
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .flat_map(|row| permutation.map(|i| f64::from(row[i])))
+        .collect();
+    gate.score(&format!("{case}.{name}.logits"), &wrong, true)?;
+    let selectors = root.join("heads-freeze-r1/selectors.safetensors");
+    let key = format!("{case}.stage{stage}");
+    let stable = tensor(&selectors, &format!("{key}.stable"))?.values;
+    let expected = tensor(&selectors, &format!("{key}.expected_occupied"))?.values;
+    ensure!(
+        stable.len() == values.len() && expected.len() == values.len(),
+        "stable selector extent mismatch"
+    );
+    let decision_defects = values
+        .iter()
+        .zip(&stable)
+        .zip(&expected)
+        .filter(|((v, s), e)| **s != 0.0 && ((**v > 0.0) != (**e != 0.0)))
+        .count();
+    gate.defects += decision_defects;
+    let active: Vec<_> = values
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|row| std::array::from_fn(|i| row[i] > 0.0))
+        .collect();
+    let offsets =
+        std::array::from_fn(|i| [((i >> 2) & 1) as i32, ((i >> 1) & 1) as i32, (i & 1) as i32]);
+    let (children, source) = sites.subdivide_with_offsets(&active, 12_000_000, &offsets)?;
+    let source_map: BTreeMap<_, _> = source
+        .iter()
+        .enumerate()
+        .map(|(r, p)| ((p[0] as usize, p[1] as usize), r))
+        .collect();
+    let mut associations = 0;
+    for (i, (&s, &e)) in stable.iter().zip(&expected).enumerate() {
+        if s == 0.0 || e == 0.0 {
+            continue;
+        }
+        let parent = i / 8;
+        let child = i % 8;
+        if let Some(&row) = source_map.get(&(parent, child)) {
+            let p = sites.coordinates()[parent];
+            ensure!(
+                children.coordinates()[row]
+                    == [
+                        p[0],
+                        2 * p[1] + offsets[child][0],
+                        2 * p[2] + offsets[child][1],
+                        2 * p[3] + offsets[child][2]
+                    ],
+                "stable child coordinate/source mismatch"
+            );
+            associations += 1;
+        }
+    }
+    println!(
+        "N5_M2B_STABLE {} selector={key} decision_defects={decision_defects} physical_associations={associations} near_zero_propagated=true",
+        if decision_defects == 0 {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
+    );
+    drop(workspace);
+    let projection = decoder.point_project(x, stage)?;
+    let projected = selected_values(d, &projection, &rows, 8 * c, f16::to_f64)?;
+    gate.decoder_key = Some(format!("{name}.projection"));
+    gate.score(&format!("{case}.{name}.projection"), &projected, false)?;
+    let wrong: Vec<_> = projected
+        .chunks_exact(8 * c)
+        .flat_map(|row| {
+            permutation
+                .iter()
+                .flat_map(move |&i| row[i * c..(i + 1) * c].iter().copied())
+        })
+        .collect();
+    gate.score(&format!("{case}.{name}.projection"), &wrong, true)?;
+    let pairs = d.stream.clone_htod(source.as_flattened())?;
+    let features = d.stream.alloc_zeros::<f16>(source.len() * c)?;
+    decoder.c2s(
+        &projection,
+        &pairs,
+        &features,
+        [n, source.len(), c, c],
+        false,
+    )?;
+    for &parent in &rows {
+        for child in 0..8 {
+            if let Some(&row) = source_map.get(&(parent, child)) {
+                let actual = d
+                    .stream
+                    .clone_dtoh(&features.slice(row * c..(row + 1) * c))?;
+                let wanted = d.stream.clone_dtoh(
+                    &projection.slice((parent * 8 + child) * c..(parent * 8 + child + 1) * c),
+                )?;
+                ensure!(
+                    actual == wanted,
+                    "physical child feature association mismatch"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_heads_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    let mut gate = OperationGate::decoder(
+        "occupancy-heads",
+        "heads-freeze-r1",
+        "cottage-heads-sm89-r1",
+        18,
+    )?;
+    for case in ["cottage", "robot"] {
+        for stage in [3, 2, 1] {
+            let bank = root.join(format!(
+                "{case}-decode-sm86-r1/decoder.dec.dec{stage}.up.upsample.input.safetensors"
+            ));
+            if stage == 3 {
+                head_case(&decoder, &mut gate, case, stage, f32_tensor(&bank, "feat")?)?;
+            } else {
+                head_case(
+                    &decoder,
+                    &mut gate,
+                    case,
+                    stage,
+                    half_tensor(&bank, "feat")?,
+                )?;
+            }
+        }
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_field_affine_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let mut decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    let d = &decoder.device;
+    let mut field = OperationGate::decoder("corner-attributes", "fields-freeze-r1", "sm89-r1", 1)?;
+    let raw = f32_tensor(
+        &root.join("CPU-r3/common-inputs.safetensors"),
+        "fields.raw40",
+    )?;
+    ensure!(raw.len() == 97 * 40, "corner field fixture shape mismatch");
+    let values = d.stream.clone_htod(&raw)?;
+    unsafe {
+        d.stream
+            .launch_builder(
+                decoder
+                    .k
+                    .corner_fields
+                    .as_ref()
+                    .context("corner activation not loaded")?,
+            )
+            .arg(&values)
+            .arg(&97u32)
+            .launch(flat(97 * 32))?;
+    }
+    let actual = d.stream.clone_dtoh(&values)?;
+    let selected: Vec<_> = actual
+        .as_chunks::<40>()
+        .0
+        .iter()
+        .flat_map(|row| row[8..].iter().map(|&v| f64::from(v)))
+        .collect();
+    ensure!(
+        actual
+            .as_chunks::<40>()
+            .0
+            .iter()
+            .zip(raw.as_chunks::<40>().0.iter())
+            .all(|(a, b)| a[..8] == b[..8]),
+        "sign logits changed during corner activation"
+    );
+    field.score("fields.activated32", &selected, false)?;
+    let wrong: Vec<_> = raw
+        .as_chunks::<40>()
+        .0
+        .iter()
+        .flat_map(|row| row[..32].iter().map(|v| f64::from(v.tanh())))
+        .collect();
+    field.score("fields.activated32", &wrong, true)?;
+    let field_result = field.finish();
+    let mut gate = OperationGate::decoder(
+        "single-round-affine",
+        "affine-freeze-r1",
+        "affine-rounding-sm89-r1",
+        1,
+    )?;
+    gate.decoder_anchor = Some(root.join("affine-rounding-sm89-r1/outputs.safetensors"));
+    gate.decoder_key = Some("anchor".into());
+    let rows = indices(&gate.cells["affine.production_qkv"]["definition"]["selected_rows"])?;
+    let (n, ci, co) = (11295usize, 512usize, 1536usize);
+    let unit = 2f32.powi(-10);
+    let input: Vec<_> = (0..n * ci)
+        .map(|i| {
+            f16::from_f32(1.0 + unit * (1 + (((i / ci) * 127 + (i % ci) * 61) % 251) % 2) as f32)
+        })
+        .collect();
+    let mut weight = vec![f16::ZERO; ci * co];
+    let mut bias = vec![f16::ZERO; co];
+    for column in 0..co {
+        let sign = if (column * 61 % 127).is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
+        weight[column * ci + column * 127 % ci] = f16::from_f32(sign * (1.0 + unit));
+        bias[column] = f16::from_f32(sign * unit / 2.0);
+    }
+    let name = "decoder.mid.block0.attn.qkv";
+    decoder
+        .weights
+        .half
+        .insert(format!("{name}.weight"), d.stream.clone_htod(&weight)?);
+    decoder
+        .weights
+        .half
+        .insert(format!("{name}.bias"), d.stream.clone_htod(&bias)?);
+    let input = d.stream.clone_htod(&input)?;
+    let output = d.stream.alloc_zeros::<f16>(n * co)?;
+    decoder.point_linear(
+        name,
+        matrix(ptr(&input, d), n, ci)?,
+        &mut TensorMut(matrix(ptr(&output, d), n, co)?),
+        true,
+    )?;
+    gate.score(
+        "affine.production_qkv",
+        &selected_values(d, &output, &rows, co, f16::to_f64)?,
+        false,
+    )?;
+    decoder.point_linear(
+        name,
+        matrix(ptr(&input, d), n, ci)?,
+        &mut TensorMut(matrix(ptr(&output, d), n, co)?),
+        false,
+    )?;
+    let early = selected_values(d, &output, &rows, co, f16::to_f64)?;
+    let wrong: Vec<_> = early
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| f16::from_f32(v as f32 + bias[i % co].to_f32()).to_f64())
+        .collect();
+    gate.score("affine.production_qkv", &wrong, true)?;
+    field_result?;
+    gate.finish()
+}
+
+fn stage_case<I, O>(
+    decoder: &PixalDecoder,
+    gate: &mut OperationGate,
+    name: &str,
+    bank: &Path,
+    input: Vec<I>,
+    execute: impl Fn(&PointWorkspace<I>, &SparseConv<f32>, CudaSlice<I>) -> Result<CudaSlice<O>>,
+    convert: impl Fn(O) -> f64,
+) -> Result<()>
+where
+    I: DeviceRepr + Copy + ValidAsZeroBits + 'static,
+    O: DeviceRepr + Copy + 'static,
+{
+    let cell = &gate.cells[name];
+    let rows = indices(&cell["definition"]["selected_rows"])?;
+    let ci = cell["definition"]["full_input_shape"][1]
+        .as_u64()
+        .context("stage input width missing")? as usize;
+    let co = cell["definition"]["output_shape"][1]
+        .as_u64()
+        .context("stage output width missing")? as usize;
+    let sites = bank_sites(bank)?;
+    let n = sites.coordinates().len();
+    ensure!(input.len() == n * ci, "stage input extent mismatch");
+    let d = &decoder.device;
+    let workspace = PointWorkspace::new(
+        decoder,
+        &sites,
+        [
+            ci.max(co),
+            co.max(if name.ends_with(".field") { 128 } else { co }),
+        ],
+        name.ends_with(".field") || name.ends_with(".dec0"),
+    )?;
+    let max_width = ci.max(co);
+    let wrong_budget = n * 108 + 127 * (27 * max_width + max_width) * 4;
+    let mut wrong_conv =
+        SparseConv::<f32>::promoted(d, &sites, [max_width, max_width], wrong_budget)?;
+    let maps: Vec<[i32; 27]> = sites
+        .coordinates()
+        .iter()
+        .map(|p| {
+            std::array::from_fn(|tap| {
+                sites
+                    .row([
+                        p[0],
+                        p[3] + (tap / 9) as i32 - 1,
+                        p[2] + ((tap / 3) % 3) as i32 - 1,
+                        p[1] + (tap % 3) as i32 - 1,
+                    ])
+                    .unwrap_or(-1)
+            })
+        })
+        .collect();
+    wrong_conv.replace_neighbours(&maps)?;
+    drop(maps);
+    for control in [false, true] {
+        let x = d.stream.clone_htod(&input)?;
+        let output = execute(
+            &workspace,
+            if control {
+                &wrong_conv
+            } else {
+                &workspace.conv
+            },
+            x,
+        )?;
+        ensure!(output.len() == n * co, "stage output extent mismatch");
+        gate.score(
+            name,
+            &selected_values(d, &output, &rows, co, &convert)?,
+            control,
+        )?;
+        if name.ends_with(".field") {
+            ensure!(
+                std::any::TypeId::of::<O>() == std::any::TypeId::of::<f32>(),
+                "raw corner field dtype mismatch"
+            );
+            unsafe {
+                d.stream
+                    .launch_builder(
+                        decoder
+                            .k
+                            .corner_fields
+                            .as_ref()
+                            .context("corner activation missing")?,
+                    )
+                    .arg(&output)
+                    .arg(&u32::try_from(n)?)
+                    .launch(flat(n * 32))?;
+            }
+            let values = selected_values(d, &output, &rows, co, &convert)?;
+            let activated: Vec<_> = values
+                .as_chunks::<40>()
+                .0
+                .iter()
+                .flat_map(|r| r[8..].iter().copied())
+                .collect();
+            gate.score(&format!("{name}.activated"), &activated, control)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_stages_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    let d = &decoder.device;
+    let mut gate = OperationGate::decoder(
+        "whole-decoder-stages",
+        "stages-freeze-r1",
+        "stages-sm89-r1",
+        16,
+    )?;
+    let supplement: Value = serde_json::from_slice(&std::fs::read(
+        root.join("stages-field-supplement-20261106-r1/FROZEN.json"),
+    )?)?;
+    ensure!(
+        supplement["reference_protocol"] == "PASS"
+            && supplement["formula"] == "tau=max(2*max(all declared pair errors),epsilon)",
+        "invalid field supplement protocol"
+    );
+    let cells = supplement["cells"]
+        .as_object()
+        .context("field supplement cells missing")?;
+    ensure!(cells.len() == 4, "field supplement coverage mismatch");
+    for (name, cell) in cells {
+        ensure!(
+            [
+                "stage.cottage.field",
+                "stage.cottage.field.activated",
+                "stage.robot.field",
+                "stage.robot.field.activated"
+            ]
+            .contains(&name.as_str())
+                && cell["reference_protocol"] == "PASS",
+            "supplement outside field scope"
+        );
+        let original = gate
+            .cells
+            .get_mut(name)
+            .context("supplement cell outside original freeze")?;
+        original["original_tau"] = original["tau"].clone();
+        original["tau"] = cell["tau"].clone();
+        println!(
+            "N5_M2B_FIELD_SUPPLEMENT cell={name} original_floor_retained=true dated=2026-11-06"
+        );
+    }
+    for case in ["cottage", "robot"] {
+        let directory = root.join(format!("{case}-decode-sm86-r1"));
+        let bank = directory.join("decoder.mid.input.safetensors");
+        let n = bank_sites(&bank)?.coordinates().len();
+        let latents = root.join(format!("{case}-latents-sm86-r1/trajectory.safetensors"));
+        stage_case(
+            &decoder,
+            &mut gate,
+            &format!("stage.{case}.latent"),
+            &bank,
+            f32_tensor(&latents, "final_latents")?,
+            |_, conv, input| {
+                let output = d.stream.alloc_zeros::<f32>(n * 512)?;
+                decoder.point_conv(
+                    conv,
+                    "decoder.z_to_f.conv.0",
+                    matrix::<f32>(ptr(&input, d), n, 32)?,
+                    &mut TensorMut(matrix::<f32>(ptr(&output, d), n, 512)?),
+                )?;
+                Ok(output)
+            },
+            f64::from,
+        )?;
+        let maps = bank_sites(&bank)?.serialized_windows(48)?;
+        stage_case(
+            &decoder,
+            &mut gate,
+            &format!("stage.{case}.mid"),
+            &bank,
+            f32_tensor(&bank, "feat")?,
+            |workspace, conv, input| decoder.point_mid(workspace, &maps, input, conv),
+            f64::from,
+        )?;
+        for (stage, ci, co) in [(3, 512, 512), (2, 512, 256), (1, 256, 128), (0, 128, 128)] {
+            let bank = directory.join(format!("decoder.dec.dec{stage}.input.safetensors"));
+            let name = format!("stage.{case}.dec{stage}");
+            if stage == 3 {
+                stage_case(
+                    &decoder,
+                    &mut gate,
+                    &name,
+                    &bank,
+                    f32_tensor(&bank, "feat")?,
+                    |workspace, conv, input| {
+                        let x = decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block0"),
+                            input,
+                            [ci, co],
+                            &workspace.conv,
+                        )?;
+                        decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block1"),
+                            x,
+                            [co, co],
+                            conv,
+                        )
+                    },
+                    f64::from,
+                )?;
+            } else {
+                stage_case(
+                    &decoder,
+                    &mut gate,
+                    &name,
+                    &bank,
+                    half_tensor(&bank, "feat")?,
+                    |workspace, conv, input| {
+                        let x = decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block0"),
+                            input,
+                            [ci, co],
+                            &workspace.conv,
+                        )?;
+                        decoder.point_residual(
+                            workspace,
+                            &format!("decoder.dec.dec{stage}.block1"),
+                            x,
+                            [co, co],
+                            conv,
+                        )
+                    },
+                    f16::to_f64,
+                )?;
+            }
+        }
+        let bank = directory.join("decoder.conv_out.input.safetensors");
+        stage_case(
+            &decoder,
+            &mut gate,
+            &format!("stage.{case}.field"),
+            &bank,
+            half_tensor(&bank, "feat")?,
+            |workspace, conv, input| decoder.point_field(workspace, &input, conv),
+            f64::from,
+        )?;
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_complete_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let decoder = PixalDecoder::open(
+        &env_path("FF_HI3D_MODEL")?,
+        DecoderKind::PointTransformer,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        6 << 30,
+    )?;
+    for case in ["cottage", "robot"] {
+        let trajectory = root.join(format!("{case}-latents-sm86-r1/trajectory.safetensors"));
+        let coordinates = decoder_coordinates(&trajectory, "coordinates")?;
+        let latent = f32_tensor(&trajectory, "final_latents")?;
+        let bank = root.join(format!(
+            "{case}-decode-sm86-r1/decoder.mid.input.safetensors"
+        ));
+        let matrix = tensor(&bank, "matrix")?;
+        ensure!(
+            matrix.values.len() == 16,
+            "inherited matrix extent mismatch"
+        );
+        let frame =
+            std::array::from_fn(|r| std::array::from_fn(|c| matrix.values[r * 4 + c] as f32));
+        let output = decoder.points(coordinates, &latent, frame, 64)?;
+        let n = output.fields.coordinates.len();
+        ensure!(
+            n > 0
+                && n <= 12_000_000
+                && output.fields.channels == 32
+                && output.fields.features.len() == n * 32
+                && output.sign_logits.len() == n * 8,
+            "complete decoder output extent mismatch"
+        );
+        ensure!(
+            output.matrix == frame && output.resolution == 512,
+            "complete decoder changed inherited frame"
+        );
+        ensure!(
+            output
+                .fields
+                .coordinates
+                .iter()
+                .all(|p| p[0] == 0 && p[1..].iter().all(|&v| (0..512).contains(&v))),
+            "complete decoder coordinates outside output frame"
+        );
+        ensure!(
+            output.sign_logits.iter().all(|v| v.is_finite())
+                && output
+                    .fields
+                    .features
+                    .iter()
+                    .all(|v| v.is_finite() && (-1.0..=1.0).contains(v)),
+            "complete decoder nonfinite or unactivated output"
+        );
+        println!(
+            "PASS N5_M2B_COMPLETE case={case} rows={n} channels=32 signs=8 resolution=512 inherited_matrix_exact=true convolutions=27 residuals=10 unforced_support_measurement_only=true timing=false"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
+    use crate::backend::cuda::sparse::BatchGroupNorm;
+    let reference = env_path("FF_HI3D_DECODER_REFERENCE")?;
+    let model = env_path("FF_HI3D_MODEL")?.join("vae/model.safetensors");
+    let d = Device::new(0)?;
+    let mut gate = OperationGate::decoder("batch-group-norm", "norm-freeze-r1", "sm89-r1", 12)?;
+    for (name, cell) in gate.cells.clone() {
+        let definition = &cell["definition"];
+        let input = tensor(
+            &reference.join("CPU-r3/common-inputs.safetensors"),
+            &format!("{name}.input"),
+        )?;
+        let [n, c] = <[usize; 2]>::try_from(input.shape)
+            .map_err(|_| anyhow::anyhow!("invalid group norm shape"))?;
+        let module = definition["parameter_module"]
+            .as_str()
+            .context("norm parameter module missing")?;
+        let weight = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.weights"))?)?;
+        let bias = d
+            .stream
+            .clone_htod(&f32_tensor(&model, &format!("{module}.bias"))?)?;
+        let counts: Vec<u32> = definition["batch_counts"]
+            .as_array()
+            .context("batch counts missing")?
+            .iter()
+            .map(|n| u32::try_from(n.as_u64().context("batch count invalid")?).map_err(Into::into))
+            .collect::<Result<_>>()?;
+        let groups = definition["groups"]
+            .as_u64()
+            .context("group count missing")? as usize;
+        let eps = definition["eps"].as_f64().context("norm epsilon missing")? as f32;
+        let selected: Vec<_> = (0..n).collect();
+        for control in [false, true] {
+            let mut offsets = vec![0u32];
+            for &count in &counts {
+                let first = *offsets.last().context("empty norm offsets")?;
+                if control {
+                    for row in (0..count).step_by(47) {
+                        offsets.push(first + (row + 47).min(count));
+                    }
+                } else {
+                    offsets.push(first + count);
+                }
+            }
+            let plan = BatchGroupNorm::new(&d, &offsets, c, groups, eps, 16 << 20)?;
+            let values = if name.ends_with(".float16") {
+                normalized_features::<f16, f16>(
+                    &d,
+                    &plan,
+                    input.values.iter().map(|&x| f16::from_f64(x)).collect(),
+                    [&weight, &bias],
+                    [n, c],
+                    &selected,
+                    f16::to_f64,
+                )?
+            } else {
+                normalized_features::<f32, f32>(
+                    &d,
+                    &plan,
+                    input.values.iter().map(|&x| x as f32).collect(),
+                    [&weight, &bias],
+                    [n, c],
+                    &selected,
+                    f64::from,
+                )?
+            };
+            gate.score(&name, &values, control)?;
+        }
+    }
+    let norm_result = gate.finish();
+    let mut gate =
+        OperationGate::decoder("rounded-sigmoid-swish", "swish-freeze-r2", "sm89-r1", 4)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    for (name, cell) in gate.cells.clone() {
+        let input = tensor(
+            &reference.join("CPU-r3/common-inputs.safetensors"),
+            &format!("{name}.input"),
+        )?;
+        let n = input.shape[0];
+        let c = input.shape[1];
+        let half = cell["dtype"] == "torch.float16";
+        let rows_arg = n as u32;
+        let width_arg = c as u32;
+        let count_arg = (n * c) as u64;
+        let control_mode = if half { 1i32 } else { 0i32 };
+        for control in [false, true] {
+            let function = module.load_function(if control {
+                if half {
+                    "activation_f16"
+                } else {
+                    "activation_f32"
+                }
+            } else if half {
+                "swish_rounded_f16"
+            } else {
+                "swish_rounded_f32"
+            })?;
+            let output = if half {
+                let input = d.stream.clone_htod(
+                    &input
+                        .values
+                        .iter()
+                        .map(|&x| f16::from_f64(x))
+                        .collect::<Vec<_>>(),
+                )?;
+                let output = d.stream.alloc_zeros::<f16>(n * c)?;
+                let mut launch = d.stream.launch_builder(&function);
+                launch.arg(&input).arg(&output);
+                if control {
+                    launch.arg(&rows_arg).arg(&width_arg).arg(&control_mode);
+                } else {
+                    launch.arg(&count_arg);
+                }
+                unsafe {
+                    launch.launch(flat(n * c))?;
+                }
+                d.stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f16::to_f64)
+                    .collect::<Vec<_>>()
+            } else {
+                let input = d
+                    .stream
+                    .clone_htod(&input.values.iter().map(|&x| x as f32).collect::<Vec<_>>())?;
+                let output = d.stream.alloc_zeros::<f32>(n * c)?;
+                let mut launch = d.stream.launch_builder(&function);
+                launch.arg(&input).arg(&output);
+                if control {
+                    launch.arg(&rows_arg).arg(&width_arg).arg(&control_mode);
+                } else {
+                    launch.arg(&count_arg);
+                }
+                unsafe {
+                    launch.launch(flat(n * c))?;
+                }
+                d.stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>()
+            };
+            gate.score(&name, &output, control)?;
+        }
+    }
+    let activation_result = gate.finish();
+    norm_result?;
+    activation_result
+}
+
+#[test]
+#[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
+fn hi3d_serialized_attention_definition_gpu() -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let decoder = PixalDecoder::open(&model, DecoderKind::PointTransformer, &runtime, 6 << 30)?;
+    let d = &decoder.device;
+    let mut gate = OperationGate::decoder(
+        "serialized-window-attention",
+        "attention-freeze-r2",
+        "sm89-r1",
+        20,
+    )?;
+    let common = gate
+        .root
+        .join("sm89-r1/additional-common-inputs.safetensors");
+    let map_file = gate.root.join("CPU-r3/maps.safetensors");
+    let freeze: Value = serde_json::from_slice(&std::fs::read(gate.root.join("FROZEN.json"))?)?;
+    let cases = freeze["exact_serialization_maps"]
+        .as_object()
+        .context("serialization cases missing")?;
+    ensure!(cases.len() == 9, "serialization case count mismatch");
+    for name in cases.keys() {
+        let name = name
+            .strip_prefix("serialization.")
+            .context("serialization prefix missing")?;
+        let grid = tensor(&map_file, &format!("{name}.grid"))?;
+        let batch = tensor(&map_file, &format!("{name}.batch"))?;
+        let coordinates = grid
+            .values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(batch.values)
+            .map(|(p, b)| [b as i32, p[0] as i32, p[1] as i32, p[2] as i32])
+            .collect();
+        let sites = SparseSites::new(coordinates)?;
+        let mut maps = sites.serialized_windows(48)?;
+        let original_pad = maps.pad.clone();
+        let frozen_unpad = tensor(&map_file, &format!("{name}.unpad"))?;
+        let frozen_inverse = tensor(&map_file, &format!("{name}.inverse"))?;
+        let control_pad = tensor(&map_file, &format!("{name}.control_pad"))?;
+        let n = sites.coordinates().len();
+        for order in 0..2 {
+            let key = format!("attention.{name}.order{order}");
+            let packed = tensor(&common, &format!("{key}.qkv"))?;
+            let mut original = Vec::with_capacity(n * 1536);
+            for row in 0..n {
+                let rank = frozen_inverse.values[order * n + row] as usize;
+                let packed_row = frozen_unpad.values[rank] as usize;
+                original.extend(
+                    packed.values[packed_row * 1536..(packed_row + 1) * 1536]
+                        .iter()
+                        .map(|&x| f16::from_f64(x)),
+                );
+            }
+            let qkv = d.stream.clone_htod(&original)?;
+            let selector = format!("{key}.final_window");
+            let selector_rows: Option<Vec<usize>> = gate
+                .cells
+                .get(&selector)
+                .map(|cell| {
+                    cell["selector"]["rows"]
+                        .as_array()
+                        .context("attention selector rows missing")
+                        .and_then(|rows| {
+                            rows.iter()
+                                .map(|row| {
+                                    row.as_u64()
+                                        .context("invalid selector row")
+                                        .map(|row| row as usize)
+                                })
+                                .collect()
+                        })
+                })
+                .transpose()?;
+            for control in [false, true] {
+                if control {
+                    maps.pad = control_pad.values.iter().map(|&v| v as u32).collect();
+                }
+                let output =
+                    decoder.serialized_qkv(&maps, matrix::<f16>(ptr(&qkv, d), n, 1536)?, order)?;
+                let values: Vec<_> = d
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f16::to_f64)
+                    .collect();
+                let has_full_control =
+                    !gate.cells[&key]["control_margin"].is_null() && selector_rows.is_none();
+                if !control || has_full_control {
+                    gate.score(&key, &values, control)?;
+                }
+                if let Some(rows) = &selector_rows {
+                    let selected: Vec<_> = rows
+                        .iter()
+                        .flat_map(|&row| values[row * 512..(row + 1) * 512].iter().copied())
+                        .collect();
+                    gate.score(&selector, &selected, control)?;
+                }
+                maps.pad.clone_from(&original_pad);
+            }
+        }
+    }
+    serialized_attention_modes(&mut gate, &common, &map_file)?;
+    gate.finish()
+}
+
+fn serialized_attention_modes(gate: &mut OperationGate, common: &Path, maps: &Path) -> Result<()> {
+    let context = crate::backend::gpu::CudaContext::new(0)?;
+    // Replay buffers and metadata belong to this isolated stream.
+    unsafe {
+        context.disable_event_tracking();
+    }
+    let stream = context.new_stream()?;
+    let first = tensor(common, "attention.17.order0.qkv")?;
+    let second = tensor(common, "attention.49.order0.qkv")?;
+    let combined: Vec<_> = first
+        .values
+        .into_iter()
+        .chain(second.values)
+        .map(f16::from_f64)
+        .collect();
+    let input_rows = combined.len() / 1536;
+    ensure!(input_rows == 113, "mixed serialized packet extent mismatch");
+    let input = stream.clone_htod(&combined)?;
+    let module = cubin::module(&context, "vision_ops")?;
+    for grouped in [false, true] {
+        let rows = if grouped { 113usize } else { 17usize };
+        let count = rows * 512;
+        let source = stream.clone_htod(&(0..rows as u32).collect::<Vec<_>>())?;
+        let q = stream.alloc_zeros::<f16>(count)?;
+        let k = stream.alloc_zeros::<f16>(count)?;
+        let v = stream.alloc_zeros::<f16>(count)?;
+        let sentinel = f16::from_f32(-123.0);
+        let mut output = stream.clone_htod(&vec![sentinel; count + 8])?;
+        unsafe {
+            stream
+                .launch_builder(&module.load_function("qkv_gather_head_major_f16")?)
+                .arg(&input)
+                .arg(&source)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&(input_rows as u32))
+                .arg(&(rows as u32))
+                .arg(&32u32)
+                .arg(&16u32)
+                .launch(flat(count))?;
+        }
+        let mut attention = Flash::new_f16(
+            stream.clone(),
+            rows,
+            32,
+            32,
+            16,
+            Score {
+                scale: 0.25,
+                window_left: None,
+            },
+        )?;
+        if grouped {
+            attention.bind_f16_windows(&[0, 17, 65, 113])?;
+        }
+        let graph_equal;
+        let guard_unchanged;
+        {
+            let mut run = || {
+                attention.run_f16(
+                    &q.slice(..),
+                    512,
+                    &k.slice(..),
+                    &v.slice(..),
+                    &mut output.slice_mut(..count),
+                    (rows, rows, rows),
+                )
+            };
+            run()?;
+            stream.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            run()?;
+            let graph = stream
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("serialized attention graph missing")?;
+            let eager = stream.clone_dtoh(&output)?;
+            graph.launch()?;
+            let captured = stream.clone_dtoh(&output)?;
+            ensure!(
+                eager[..count]
+                    .iter()
+                    .chain(&captured[..count])
+                    .all(|v| v.is_finite()),
+                "serialized F16 output is nonfinite"
+            );
+            graph_equal = eager == captured;
+            guard_unchanged = eager[count..]
+                .iter()
+                .chain(&captured[count..])
+                .all(|&v| v == sentinel);
+            gate.defects += usize::from(!graph_equal) + usize::from(!guard_unchanged);
+            for (case, base) in [("17", 0usize), ("49", 17usize)] {
+                if !grouped && case == "49" {
+                    continue;
+                }
+                let inverse = tensor(maps, &format!("{case}.inverse"))?;
+                let unpad = tensor(maps, &format!("{case}.unpad"))?;
+                let n = unpad.values.len();
+                let values: Vec<_> = inverse.values[..n]
+                    .iter()
+                    .flat_map(|&rank| {
+                        let row = base + unpad.values[rank as usize] as usize;
+                        captured[row * 512..(row + 1) * 512]
+                            .iter()
+                            .map(|v| v.to_f64())
+                    })
+                    .collect();
+                gate.replay(
+                    &format!("attention.{case}.order0"),
+                    &values,
+                    if grouped {
+                        "mixed17_49_grouped_graph_and_eager"
+                    } else {
+                        "scalar_graph_and_eager"
+                    },
+                )?;
+            }
+        }
+        let isolation = if grouped {
+            let expected = stream.clone_dtoh(&output)?;
+            attention.bind_f16_windows(&[0, 48, 96, 113])?;
+            attention.run_f16(
+                &q.slice(..),
+                512,
+                &k.slice(..),
+                &v.slice(..),
+                &mut output.slice_mut(..count),
+                (rows, rows, rows),
+            )?;
+            attention.bind_f16_windows(&[0, 17, 65, 113])?;
+            attention.run_f16(
+                &q.slice(..),
+                512,
+                &k.slice(..),
+                &v.slice(..),
+                &mut output.slice_mut(..count),
+                (rows, rows, rows),
+            )?;
+            let restored = expected == stream.clone_dtoh(&output)?;
+            gate.defects += usize::from(!restored);
+            Some(restored)
+        } else {
+            None
+        };
+        let valid = graph_equal && guard_unchanged && isolation != Some(false);
+        println!(
+            "{} N5_M2B_ATTENTION_MODE grouped={grouped} graph_eager_bit_identical={graph_equal} guard_unchanged={guard_unchanged} rows={rows} metadata_rebind={grouped} isolation_bit_identical={isolation:?} timing=false",
+            if valid { "PASS" } else { "DEFECT" }
+        );
+    }
+    Ok(())
 }
 
 #[test]

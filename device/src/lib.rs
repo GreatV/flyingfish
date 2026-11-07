@@ -422,6 +422,47 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_f16(
 }
 
 /// # Safety
+/// Heads have 16 F16 columns; launch uses 128 threads and 24576 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        attention::<64, 8, 1, 16, true>(resolve_position(p), keys, 0, scale, core::ptr::null(), 0);
+    }
+}
+
+/// # Safety
+/// Offsets delimit disjoint windows of at most 48 rows; grid Z equals their count.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16_windows(
+    mut p: Attention,
+    keys: u32,
+    scale: f32,
+    offsets: *const u32,
+    windows: u32,
+) {
+    unsafe {
+        let window: u32;
+        asm!("mov.u32 {w}, %ctaid.z;", w=out(reg32) window);
+        assert!(!offsets.is_null() && window < windows && keys == p.rows);
+        let first = *offsets.add(window as usize);
+        let end = *offsets.add(window as usize + 1);
+        assert!(first < end && end <= p.rows && end - first <= 48);
+        p.q = p.q.add(first as usize * p.q_stride as usize);
+        p.k = p.k.add(first as usize * 16);
+        p.v = p.v.add(first as usize * 16);
+        p.out = p.out.add(first as usize * p.q_heads as usize * 16);
+        p.lse = p.lse.add(first as usize * p.q_heads as usize);
+        p.rows = end - first;
+        p.start = 0;
+        attention::<64, 8, 1, 16, true>(p, p.rows, 0, scale, core::ptr::null(), 0);
+    }
+}
+
+/// # Safety
 /// Heads have 96 F16 columns; launch uses 128 threads and 49152 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d96_bidirectional_f16(

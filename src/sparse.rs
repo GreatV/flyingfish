@@ -12,6 +12,15 @@ pub struct SparseSites {
     coordinates: Vec<[i32; 4]>,
     sorted: Vec<([i32; 4], i32)>,
 }
+
+pub struct SerializedWindows {
+    pub(crate) keys: [Vec<u64>; 2],
+    pub(crate) order: [Vec<u32>; 2],
+    pub(crate) inverse: [Vec<u32>; 2],
+    pub(crate) pad: Vec<u32>,
+    pub(crate) unpad: Vec<u32>,
+    pub(crate) offsets: Vec<u32>,
+}
 impl SparseSites {
     /// Lexicographic unique coordinates and input-row to unique-row indices.
     pub fn deduplicate(coordinates: Vec<[i32; 4]>) -> Result<(Self, Vec<u32>)> {
@@ -73,6 +82,99 @@ impl SparseSites {
             .ok()
             .map(|i| self.sorted[i].1)
     }
+    pub fn serialized_windows(&self, window: usize) -> Result<SerializedWindows> {
+        ensure!(
+            window > 0 && window <= i32::MAX as usize,
+            "invalid serialized window size"
+        );
+        let maximum = self
+            .coordinates
+            .iter()
+            .flat_map(|p| &p[1..])
+            .copied()
+            .max()
+            .context("empty sparse coordinates")? as u32;
+        let depth = u32::BITS - maximum.leading_zeros();
+        let batches = self
+            .coordinates
+            .last()
+            .context("empty sparse coordinates")?[0] as u64
+            + 1;
+        ensure!(
+            depth <= 16 && 3 * depth + u64::BITS - batches.leading_zeros() <= 63,
+            "serialized coordinate or batch exceeds Morton capacity"
+        );
+        let rows = self.coordinates.len();
+        let mut result = SerializedWindows {
+            keys: std::array::from_fn(|_| Vec::with_capacity(rows)),
+            order: std::array::from_fn(|_| Vec::with_capacity(rows)),
+            inverse: std::array::from_fn(|_| vec![0; rows]),
+            pad: Vec::new(),
+            unpad: Vec::with_capacity(rows),
+            offsets: vec![0],
+        };
+        for order in 0..2 {
+            for p in &self.coordinates {
+                let axes = if order == 0 {
+                    [p[1], p[2], p[3]]
+                } else {
+                    [p[2], p[1], p[3]]
+                };
+                let mut key = (p[0] as u64) << (3 * depth);
+                for bit in 0..depth {
+                    for (axis, value) in axes.into_iter().enumerate() {
+                        key |= (((value as u64) >> bit) & 1) << (3 * bit + 2 - axis as u32);
+                    }
+                }
+                result.keys[order].push(key);
+            }
+            result.order[order].extend(0..rows as u32);
+            result.order[order].sort_unstable_by_key(|&row| result.keys[order][row as usize]);
+            for (rank, &row) in result.order[order].iter().enumerate() {
+                result.inverse[order][row as usize] = rank as u32;
+            }
+        }
+        let mut first = 0;
+        while first < rows {
+            let count =
+                self.coordinates[first..].partition_point(|p| p[0] == self.coordinates[first][0]);
+            let padded = if count > window {
+                count
+                    .div_ceil(window)
+                    .checked_mul(window)
+                    .context("serialized padded count overflow")?
+            } else {
+                count
+            };
+            let base = result.pad.len();
+            let end = base
+                .checked_add(padded)
+                .context("serialized padded count overflow")?;
+            ensure!(
+                end <= i32::MAX as usize,
+                "serialized padded rows exceed indexing capacity"
+            );
+            result
+                .unpad
+                .extend((base..base + count).map(|row| row as u32));
+            result
+                .pad
+                .extend((first..first + count).map(|row| row as u32));
+            if padded > count {
+                let tail = count % window;
+                result
+                    .pad
+                    .extend((first + count - window..first + count - tail).map(|row| row as u32));
+            }
+            for start in (base..end).step_by(window) {
+                result
+                    .offsets
+                    .push((start + window.min(end - start)) as u32);
+            }
+            first += count;
+        }
+        Ok(result)
+    }
     pub fn downsample(&self, factor: i32) -> Result<(Self, Vec<u32>)> {
         ensure!(factor > 0, "invalid sparse downsample factor");
         let parents: Vec<_> = self
@@ -129,6 +231,23 @@ impl SparseSites {
         active: &[[bool; 8]],
         capacity: usize,
     ) -> Result<(Self, Vec<[u32; 2]>)> {
+        self.subdivide_with_offsets(
+            active,
+            capacity,
+            &std::array::from_fn(|child| std::array::from_fn(|axis| ((child >> axis) & 1) as i32)),
+        )
+    }
+    pub fn subdivide_with_offsets(
+        &self,
+        active: &[[bool; 8]],
+        capacity: usize,
+        offsets: &[[i32; 3]; 8],
+    ) -> Result<(Self, Vec<[u32; 2]>)> {
+        ensure!(
+            offsets.iter().flatten().all(|&x| matches!(x, 0 | 1))
+                && (0..8).all(|child| !offsets[..child].contains(&offsets[child])),
+            "invalid subdivision child offsets"
+        );
         ensure!(
             active.len() == self.coordinates.len(),
             "subdivision mask/site count mismatch"
@@ -149,7 +268,7 @@ impl SparseSites {
                 for axis in 0..3 {
                     point[axis + 1] = parent[axis + 1]
                         .checked_mul(2)
-                        .and_then(|x| x.checked_add(((child >> axis) & 1) as i32))
+                        .and_then(|x| x.checked_add(offsets[child][axis]))
                         .context("subdivision coordinate overflow")?;
                 }
                 coordinates.push(point);
@@ -239,6 +358,23 @@ mod tests {
         assert_eq!(children.coordinates(), &[[0, 5, 6, 10], [1, 4, 6, 11]]);
         assert_eq!(source, [[0, 1], [3, 4]]);
         assert!(sites.subdivide(&masks, 1).is_err());
+        let z_first = std::array::from_fn(|child| {
+            std::array::from_fn(|axis| ((child >> (2 - axis)) & 1) as i32)
+        });
+        let (children, source) = sites.subdivide_with_offsets(&masks, 2, &z_first)?;
+        assert_eq!(children.coordinates(), &[[0, 4, 6, 11], [1, 5, 6, 10]]);
+        assert_eq!(source, [[0, 1], [3, 4]]);
+        assert!(
+            sites
+                .subdivide_with_offsets(&masks, 2, &[[0; 3]; 8])
+                .is_err()
+        );
+        assert!(sites.serialized_windows(0).is_err());
+        assert!(
+            SparseSites::new(vec![[0, 65536, 0, 0]])?
+                .serialized_windows(48)
+                .is_err()
+        );
         let ties = SparseSites::new(vec![[0, 0, 1, 2], [0, 1, 1, 2], [1, 0, 1, 2]])?
             .round_unique(512, 513)?;
         assert_eq!(

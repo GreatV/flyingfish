@@ -92,8 +92,15 @@ pub struct Flash {
     tile: usize,
     shared: u32,
     split: Option<Split>,
+    f16_windows: Option<F16Windows>,
     position: u64,
     position_limit: u32,
+}
+
+struct F16Windows {
+    offsets: CudaSlice<u32>,
+    rows: usize,
+    count: u32,
 }
 
 struct Split {
@@ -629,6 +636,7 @@ impl Flash {
             tile,
             shared: dynamic_shared,
             split,
+            f16_windows: None,
             position: 0,
             position_limit: 0,
         })
@@ -644,7 +652,7 @@ impl Flash {
     ) -> Result<Self> {
         let tile = 64usize;
         let physical_dim = match head_dim {
-            64 => 64usize,
+            16 | 64 => 64usize,
             96 => 128usize,
             _ => anyhow::bail!("unsupported F16 prefill head dimension {head_dim}"),
         };
@@ -670,6 +678,7 @@ impl Flash {
             );
             let module = super::cubin::module(ctx, "attention_native")?;
             let name = match head_dim {
+                16 => "attention_prefill_d16_bidirectional_f16",
                 64 => "attention_prefill_d64_bidirectional_f16",
                 96 => "attention_prefill_d96_bidirectional_f16",
                 _ => unreachable!(),
@@ -714,9 +723,70 @@ impl Flash {
             tile,
             shared: dynamic_shared,
             split: None,
+            f16_windows: None,
             position: 0,
             position_limit: 0,
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn bind_f16_windows(&mut self, offsets: &[u32]) -> Result<()> {
+        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+        ensure!(
+            self.geometry[2] == 16,
+            "grouped F16 windows require logical D16"
+        );
+        ensure!(
+            offsets.len() >= 2
+                && offsets[0] == 0
+                && offsets.windows(2).all(|v| v[0] < v[1] && v[1] - v[0] <= 48),
+            "invalid F16 window offsets"
+        );
+        let rows = *offsets.last().context("F16 window offsets empty")? as usize;
+        ensure!(
+            rows.checked_mul(self.geometry[0])
+                .is_some_and(|n| n <= self.lse.len()),
+            "F16 windows exceed LSE capacity"
+        );
+        let ctx = self.stream.context();
+        let count = u32::try_from(offsets.len() - 1)?;
+        ensure!(
+            count <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as u32,
+            "F16 window count exceeds device grid limit"
+        );
+        let function = super::cubin::module(ctx, "attention_native")?
+            .load_function("attention_prefill_d16_bidirectional_f16_windows")?;
+        let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+        let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+        let static_shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)? as u32;
+        ensure!(
+            local == 0
+                && registers <= 255
+                && self.shared + static_shared
+                    <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?
+                        as u32,
+            "grouped F16 resource limit registers={registers} local={local}"
+        );
+        ensure!(
+            function.occupancy_max_active_blocks_per_multiprocessor(
+                128,
+                self.shared as usize,
+                None
+            )? > 0,
+            "grouped F16 has zero resident blocks"
+        );
+        let offsets = self.stream.clone_htod(offsets)?;
+        if self.native.len() == 1 {
+            self.native.push(function);
+        } else {
+            self.native[1] = function;
+        }
+        self.f16_windows = Some(F16Windows {
+            offsets,
+            rows,
+            count,
+        });
+        Ok(())
     }
 
     pub fn run_f16(
@@ -730,7 +800,7 @@ impl Flash {
     ) -> Result<()> {
         let [q_heads, kv_heads, head_dim] = self.geometry;
         ensure!(
-            matches!(head_dim, 64 | 96),
+            matches!(head_dim, 16 | 64 | 96),
             "invalid F16 prefill head dimension"
         );
         ensure!(
@@ -771,7 +841,17 @@ impl Flash {
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
-        let native = self.native.first().context("F16 native function missing")?;
+        let windows = self.f16_windows.as_ref();
+        if let Some(windows) = windows {
+            ensure!(
+                head_dim == 16 && rows == windows.rows && keys == rows && capacity == rows,
+                "F16 grouped rows/keys/capacity mismatch"
+            );
+        }
+        let native = self
+            .native
+            .get(usize::from(windows.is_some()))
+            .context("F16 native function missing")?;
         let score = self.score.as_ref().context("F16 score missing")?;
         let args = Attention {
             q,
@@ -789,16 +869,24 @@ impl Flash {
         };
         let key_extent = keys as u32;
         unsafe {
-            self.stream
-                .launch_builder(native)
-                .arg(&args)
-                .arg(&key_extent)
-                .arg(&score.scale)
-                .launch(LaunchConfig {
-                    grid_dim: (rows.div_ceil(self.tile) as u32, q_heads as u32, 1),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: self.shared,
-                })?;
+            let mut launch = self.stream.launch_builder(native);
+            launch.arg(&args).arg(&key_extent).arg(&score.scale);
+            if let Some(windows) = windows {
+                launch.arg(&windows.offsets).arg(&windows.count);
+            }
+            launch.launch(LaunchConfig {
+                grid_dim: (
+                    if windows.is_some() {
+                        1
+                    } else {
+                        rows.div_ceil(self.tile) as u32
+                    },
+                    q_heads as u32,
+                    windows.map_or(1, |v| v.count),
+                ),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: self.shared,
+            })?;
         }
         Ok(())
     }
