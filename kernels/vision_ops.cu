@@ -1471,6 +1471,60 @@ extern "C" __global__ void corner_attributes_f32(float* fields, uint32_t rows) {
     }
 }
 
+// Fields = [8 sign logits,8 activated distances,24 activated XYZ offsets].
+extern "C" __global__ void sparse_corner_mean_f32(
+    const float* fields, const uint64_t* offsets, const uint32_t* contributors,
+    uint32_t cubes, uint32_t corners, float* means) {
+    if (!vision_flat_launch() || !fields || !offsets || !contributors || !cubes || !corners || !means) { __trap(); return; }
+    for (uint64_t row = uint64_t(blockIdx.x) * 256 + threadIdx.x; row < corners;
+         row += uint64_t(gridDim.x) * 256) {
+        const uint64_t first = offsets[row], end = offsets[row + 1];
+        if (first >= end || end > uint64_t(cubes) * 8 || end - first > 8) { __trap(); return; }
+        float sums[5] = {0,0,0,0,0};
+        for (uint64_t i = first; i < end; ++i) {
+            const uint32_t source = contributors[i], cube = source / 8, corner = source % 8;
+            if (cube >= cubes) { __trap(); return; }
+            const float* f = fields + uint64_t(cube) * 40;
+            const float logit = f[corner], sdf = f[8 + corner];
+            float v[5] = {1.0f / (1.0f + expf(-logit)), sdf, 0,0,0};
+            if (!isfinite(logit) || !isfinite(sdf)) { __trap(); return; }
+            for (int a = 0; a < 3; ++a) {
+                const float offset = f[16 + corner * 3 + a];
+                if (!isfinite(offset)) { __trap(); return; }
+                v[2 + a] = __fmul_rn(offset, 0.5f);
+            }
+            for (int c = 0; c < 5; ++c) sums[c] = __fadd_rn(sums[c], v[c]);
+        }
+        for (int c = 0; c < 5; ++c) {
+            const float value = __fdiv_rn(sums[c], float(end - first));
+            if (!isfinite(value)) { __trap(); return; }
+            means[row * 5 + c] = value;
+        }
+    }
+}
+
+// Mean channels = [probability,distance,dx,dy,dz]; matrix is row-major [4,4].
+extern "C" __global__ void sparse_corner_world_f32(
+    const int32_t* grid, const float* means, const float* matrix, uint32_t corners,
+    float* positions, float* scalar) {
+    if (!vision_flat_launch() || !grid || !means || !matrix || !corners || !positions || !scalar) { __trap(); return; }
+    for (uint64_t row = uint64_t(blockIdx.x) * 256 + threadIdx.x; row < corners;
+         row += uint64_t(gridDim.x) * 256) {
+        float p[3];
+        for (int a = 0; a < 3; ++a) p[a] = __fadd_rn(float(grid[row * 4 + a + 1]), means[row * 5 + a + 2]);
+        for (int a = 0; a < 3; ++a) {
+            float value = __fmul_rn(matrix[a * 4], p[0]);
+            value = __fadd_rn(value, __fmul_rn(matrix[a * 4 + 1], p[1]));
+            value = __fadd_rn(value, __fmul_rn(matrix[a * 4 + 2], p[2]));
+            value = __fadd_rn(value, matrix[a * 4 + 3]);
+            if (!isfinite(value)) { __trap(); return; }
+            positions[row * 3 + a] = value;
+        }
+        const float distance = fabsf(means[row * 5 + 1]);
+        scalar[row] = means[row * 5] >= 0.5f ? distance : -distance;
+    }
+}
+
 extern "C" __global__ void channel_to_spatial_f16(
     const __half* x, const uint32_t* source, __half* y,
     uint32_t parents, uint32_t rows, uint32_t input_channels, uint32_t channels, int add) {
@@ -1560,6 +1614,134 @@ extern "C" __global__ void sparse_cube_edge_ids(
         ++p[b]; q[3] = sparse_coordinate_row(sorted, rows, p);
         if (q[1] < 0 || q[2] < 0 || q[3] < 0) continue;
         for (int j = 0; j < 4; ++j) quads[edge * 4 + j] = q[j];
+        face_counts[edge] = 2;
+    }
+}
+
+extern "C" __global__ void cube_sign_masks_f32(
+    const float* scalar, const uint32_t* cubes, uint32_t rows, uint32_t corners, uint8_t* masks) {
+    if (!vision_flat_launch() || !scalar || !cubes || !rows || !corners || !masks) { __trap(); return; }
+    for (uint64_t row = uint64_t(blockIdx.x) * 256 + threadIdx.x; row < rows;
+         row += uint64_t(gridDim.x) * 256) {
+        uint8_t mask = 0;
+        for (int c = 0; c < 8; ++c) {
+            const uint32_t corner = cubes[row * 8 + c];
+            if (corner >= corners || !isfinite(scalar[corner])) { __trap(); return; }
+            mask |= uint8_t(scalar[corner] < 0.0f) << c;
+        }
+        masks[row] = mask;
+    }
+}
+
+// Table rows = [12 edge-component IDs,component count,alternating-face bits].
+extern "C" __global__ void cube_resolved_components_u8(
+    const int32_t* coordinates, const int32_t* sorted, const uint8_t* masks,
+    const int8_t* table, uint32_t rows, uint8_t* resolved, uint64_t* counts) {
+    if (!vision_flat_launch() || !coordinates || !sorted || !masks || !table || !rows || !resolved || !counts) { __trap(); return; }
+    for (uint64_t row = uint64_t(blockIdx.x) * 256 + threadIdx.x; row < rows;
+         row += uint64_t(gridDim.x) * 256) {
+        const uint8_t mask = masks[row], critical = uint8_t(table[uint32_t(mask) * 14 + 13]);
+        bool split = false;
+        for (int a = 0; a < 3; ++a) {
+            for (int side = 0; side < 2; ++side) {
+                if (!(critical & (1 << (2 * a + side)))) continue;
+                int32_t p[4];
+                for (int j = 0; j < 4; ++j) p[j] = coordinates[row * 4 + j];
+                if (p[a + 1] == INT32_MAX && side) { __trap(); return; }
+                p[a + 1] += side ? 1 : -1;
+                const int other = sparse_coordinate_row(sorted, rows, p);
+                if (other >= 0 && (uint8_t(table[uint32_t(masks[other]) * 14 + 13]) & (1 << (2 * a + 1 - side)))) split = true;
+            }
+        }
+        const uint8_t result = split ? uint8_t(mask ^ 255) : mask;
+        const int count = table[uint32_t(result) * 14 + 12];
+        if (count < 0 || count > 4) { __trap(); return; }
+        resolved[row] = result;
+        counts[row] = uint64_t(count);
+    }
+}
+
+__device__ __forceinline__ uint32_t cube_edge_lower(uint32_t edge) {
+    const uint32_t axis = edge / 4, packed = edge % 4;
+    return (packed & ((1u << axis) - 1)) | ((packed >> axis) << (axis + 1));
+}
+
+extern "C" __global__ void cube_dual_vertices_f32(
+    const float* positions, const float* scalar, const uint32_t* cubes,
+    const uint8_t* resolved, const int8_t* table, const uint64_t* offsets,
+    uint32_t rows, uint32_t corners, uint64_t capacity, float* vertices) {
+    if (!vision_flat_launch() || !positions || !scalar || !cubes || !resolved || !table || !offsets || !rows || !corners || !capacity || !vertices) { __trap(); return; }
+    for (uint64_t row = uint64_t(blockIdx.x) * 256 + threadIdx.x; row < rows;
+         row += uint64_t(gridDim.x) * 256) {
+        const int8_t* components = table + uint32_t(resolved[row]) * 14;
+        const uint64_t first = offsets[row], end = offsets[row + 1];
+        if (end < first || end > capacity || end - first != uint32_t(components[12])) { __trap(); return; }
+        for (int group = 0; group < components[12]; ++group) {
+            float base[3] = {0,0,0}, sums[3] = {0,0,0};
+            uint32_t count = 0;
+            for (uint32_t edge = 0; edge < 12; ++edge) {
+                if (components[edge] != group) continue;
+                const uint32_t lower = cube_edge_lower(edge), upper = lower | (1u << (edge / 4));
+                const uint32_t a = cubes[row * 8 + lower], b = cubes[row * 8 + upper];
+                if (a >= corners || b >= corners) { __trap(); return; }
+                const float sa = scalar[a], sb = scalar[b], denominator = __fsub_rn(sa, sb);
+                if ((sa < 0.0f) == (sb < 0.0f) || denominator == 0.0f) { __trap(); return; }
+                const float t = __fdiv_rn(sa, denominator);
+                for (int j = 0; j < 3; ++j) {
+                    const float pa = positions[uint64_t(a) * 3 + j], pb = positions[uint64_t(b) * 3 + j];
+                    const float point = __fmaf_rn(t, __fsub_rn(pb, pa), pa);
+                    if (!isfinite(point)) { __trap(); return; }
+                    if (!count) base[j] = point;
+                    sums[j] = __fadd_rn(sums[j], __fsub_rn(point, base[j]));
+                }
+                ++count;
+            }
+            if (!count) { __trap(); return; }
+            for (int j = 0; j < 3; ++j) {
+                vertices[(first + group) * 3 + j] = __fadd_rn(base[j], __fdiv_rn(sums[j], float(count)));
+            }
+        }
+    }
+}
+
+extern "C" __global__ void sparse_cube_component_edge_ids(
+    const int32_t* coordinates, const int32_t* sorted, const uint32_t* cubes,
+    const float* scalar, const uint8_t* resolved, const int8_t* table,
+    const uint64_t* vertex_offsets, uint32_t rows, int32_t* quads,
+    uint64_t* face_counts, uint8_t* diagonal) {
+    if (!vision_flat_launch() || !coordinates || !sorted || !cubes || !scalar || !resolved || !table || !vertex_offsets || !rows || !quads || !face_counts || !diagonal) { __trap(); return; }
+    for (uint64_t edge = uint64_t(blockIdx.x) * 256 + threadIdx.x; edge < uint64_t(rows) * 3;
+         edge += uint64_t(gridDim.x) * 256) {
+        face_counts[edge] = 0;
+        const uint32_t row = edge / 3, axis = edge % 3;
+        const int b = (axis + 1) % 3, c = (axis + 2) % 3;
+        const uint32_t lower = (1u << b) | (1u << c), upper = lower | (1u << axis);
+        const float start = scalar[cubes[uint64_t(row) * 8 + lower]], stop = scalar[cubes[uint64_t(row) * 8 + upper]];
+        if ((start < 0.0f) == (stop < 0.0f)) continue;
+        int32_t p[4];
+        for (int j = 0; j < 4; ++j) p[j] = coordinates[uint64_t(row) * 4 + j];
+        if (p[b + 1] == INT32_MAX || p[c + 1] == INT32_MAX) { __trap(); return; }
+        int32_t adjacent[4] = {int32_t(row), -1, -1, -1};
+        ++p[b + 1]; adjacent[1] = sparse_coordinate_row(sorted, rows, p);
+        ++p[c + 1]; adjacent[2] = sparse_coordinate_row(sorted, rows, p);
+        --p[b + 1]; adjacent[3] = sparse_coordinate_row(sorted, rows, p);
+        if (adjacent[1] < 0 || adjacent[2] < 0 || adjacent[3] < 0) continue;
+        int32_t cyclic[4];
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t local = (j == 0 || j == 3 ? 1u << b : 0) | (j < 2 ? 1u << c : 0);
+            const uint32_t packed = (local & ((1u << axis) - 1)) | ((local >> (axis + 1)) << axis);
+            const uint32_t other = uint32_t(adjacent[j]);
+            const int component = table[uint32_t(resolved[other]) * 14 + axis * 4 + packed];
+            if (component < 0 || vertex_offsets[other] + component >= vertex_offsets[rows]) { __trap(); return; }
+            cyclic[j] = int32_t(vertex_offsets[other] + component);
+        }
+        if (start > 0.0f) {
+            const int32_t a = cyclic[0], b = cyclic[1];
+            cyclic[0] = cyclic[3]; cyclic[1] = cyclic[2]; cyclic[2] = b; cyclic[3] = a;
+        }
+        quads[edge * 4] = cyclic[0]; quads[edge * 4 + 1] = cyclic[1];
+        quads[edge * 4 + 2] = cyclic[3]; quads[edge * 4 + 3] = cyclic[2];
+        diagonal[edge] = axis != 1;
         face_counts[edge] = 2;
     }
 }

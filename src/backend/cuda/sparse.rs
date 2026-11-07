@@ -7,12 +7,86 @@ use super::{
     ops::{flat, grid},
 };
 use crate::{
-    backend::gpu::{CudaFunction, CudaSlice, DeviceRepr, PushKernelArg},
-    sparse::{SparseMesh, SparseSites},
+    backend::gpu::{CudaFunction, CudaModule, CudaSlice, DeviceRepr, PushKernelArg},
+    sparse::{SparseCorners, SparseMesh, SparseSites},
 };
 use anyhow::{Context, Result, ensure};
 use half::f16;
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
+
+pub(crate) struct CornerFields {
+    pub layout: SparseCorners,
+    pub cube_to_corner: CudaSlice<u32>,
+    pub means: CudaSlice<f32>,
+    pub positions: CudaSlice<f32>,
+    pub scalar: CudaSlice<f32>,
+}
+
+pub(crate) fn corner_fields(
+    d: &Device,
+    cubes: &SparseSites,
+    fields: &CudaSlice<f32>,
+    frame: [[f32; 4]; 4],
+    budget: [usize; 2],
+) -> Result<CornerFields> {
+    let rows = cubes.coordinates().len();
+    ensure!(
+        fields.len() == rows.checked_mul(40).context("cube field extent overflow")?
+            && frame.iter().flatten().all(|v| v.is_finite()),
+        "invalid cube corner fields or matrix"
+    );
+    let layout = cubes.cube_corners()?;
+    let corners = layout.sites.coordinates().len();
+    let live = rows
+        .checked_mul(64)
+        .and_then(|v| v.checked_add(corners.checked_mul(60)?))
+        .and_then(|v| v.checked_add(72))
+        .context("cube corner workspace overflow")?;
+    d.workspace_budget(budget[0], budget[1], live)?;
+    let n = u32::try_from(rows)?;
+    let u = u32::try_from(corners)?;
+    let cube_to_corner = d.stream.clone_htod(&layout.cube_to_corner)?;
+    let offsets = d.stream.clone_htod(&layout.contributor_offsets)?;
+    let contributors = d.stream.clone_htod(&layout.contributors)?;
+    let coordinates = d
+        .stream
+        .clone_htod(layout.sites.coordinates().as_flattened())?;
+    let matrix = d.stream.clone_htod(frame.as_flattened())?;
+    let means = d.stream.alloc_zeros::<f32>(corners * 5)?;
+    let positions = d.stream.alloc_zeros::<f32>(corners * 3)?;
+    let scalar = d.stream.alloc_zeros::<f32>(corners)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    unsafe {
+        d.stream
+            .launch_builder(&module.load_function("sparse_corner_mean_f32")?)
+            .arg(fields)
+            .arg(&offsets)
+            .arg(&contributors)
+            .arg(&n)
+            .arg(&u)
+            .arg(&means)
+            .launch(flat(corners))?;
+        d.stream
+            .launch_builder(&module.load_function("sparse_corner_world_f32")?)
+            .arg(&coordinates)
+            .arg(&means)
+            .arg(&matrix)
+            .arg(&u)
+            .arg(&positions)
+            .arg(&scalar)
+            .launch(flat(corners))?;
+    }
+    eprintln!(
+        "SPARSE_CORNER_PLAN cubes={rows} corners={corners} workspace_bytes={live} contributor_degree_max=8"
+    );
+    Ok(CornerFields {
+        layout,
+        cube_to_corner,
+        means,
+        positions,
+        scalar,
+    })
+}
 
 pub struct BatchGroupNorm {
     device: Device,
@@ -292,6 +366,151 @@ pub(crate) fn exclusive_scan(d: &Device, counts: &CudaSlice<u64>) -> Result<Cuda
     Ok(output)
 }
 
+fn upload_sites(d: &Device, sites: &SparseSites) -> Result<[CudaSlice<i32>; 2]> {
+    let coordinates = d.stream.clone_htod(sites.coordinates().as_flattened())?;
+    let sorted: Vec<_> = sites
+        .sorted_rows()
+        .iter()
+        .flat_map(|&(p, row)| [p[0], p[1], p[2], p[3], row])
+        .collect();
+    Ok([coordinates, d.stream.clone_htod(&sorted)?])
+}
+
+pub(crate) fn cube_mesh(
+    d: &Device,
+    sites: SparseSites,
+    cubes: CudaSlice<u32>,
+    positions: CudaSlice<f32>,
+    scalar: CudaSlice<f32>,
+    budget: [usize; 2],
+) -> Result<SparseMesh> {
+    let rows = sites.coordinates().len();
+    ensure!(
+        cubes.len()
+            == rows
+                .checked_mul(8)
+                .context("cube incidence extent overflow")?
+            && positions.len()
+                == scalar
+                    .len()
+                    .checked_mul(3)
+                    .context("corner position extent overflow")?
+            && !scalar.is_empty(),
+        "invalid cube extraction inputs"
+    );
+    let n = u32::try_from(rows)?;
+    let u = u32::try_from(scalar.len())?;
+    let edges = rows.checked_mul(3).context("cube edge count overflow")?;
+    u32::try_from(edges)?;
+    let live = rows
+        .checked_mul(216)
+        .and_then(|v| v.checked_add(4096))
+        .context("cube extraction workspace overflow")?;
+    d.workspace_budget(budget[0], budget[1], live)?;
+    let [coordinates, sorted] = upload_sites(d, &sites)?;
+    let table = crate::sparse::cube_topology()?;
+    let table = d.stream.clone_htod(table.as_flattened())?;
+    let masks = d.stream.alloc_zeros::<u8>(rows)?;
+    let resolved = d.stream.alloc_zeros::<u8>(rows)?;
+    let counts = d.stream.alloc_zeros::<u64>(rows)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    unsafe {
+        d.stream
+            .launch_builder(&module.load_function("cube_sign_masks_f32")?)
+            .arg(&scalar)
+            .arg(&cubes)
+            .arg(&n)
+            .arg(&u)
+            .arg(&masks)
+            .launch(flat(rows))?;
+        d.stream
+            .launch_builder(&module.load_function("cube_resolved_components_u8")?)
+            .arg(&coordinates)
+            .arg(&sorted)
+            .arg(&masks)
+            .arg(&table)
+            .arg(&n)
+            .arg(&resolved)
+            .arg(&counts)
+            .launch(flat(rows))?;
+    }
+    drop(masks);
+    let offsets = exclusive_scan(d, &counts)?;
+    drop(counts);
+    let vertices_count = d.stream.clone_dtoh(&offsets.slice(rows..rows + 1))?[0];
+    ensure!(
+        vertices_count <= rows as u64 * 4 && vertices_count <= i32::MAX as u64,
+        "cube vertex count exceeds indexing capacity"
+    );
+    if vertices_count == 0 {
+        return Ok(SparseMesh {
+            vertices: Vec::new(),
+            faces: Vec::new(),
+        });
+    }
+    let vertices = d
+        .stream
+        .alloc_zeros::<f32>(usize::try_from(vertices_count)? * 3)?;
+    let quads = d.stream.alloc_zeros::<i32>(edges * 4)?;
+    let face_counts = d.stream.alloc_zeros::<u64>(edges)?;
+    let diagonal = d.stream.alloc_zeros::<u8>(edges)?;
+    unsafe {
+        d.stream
+            .launch_builder(&module.load_function("cube_dual_vertices_f32")?)
+            .arg(&positions)
+            .arg(&scalar)
+            .arg(&cubes)
+            .arg(&resolved)
+            .arg(&table)
+            .arg(&offsets)
+            .arg(&n)
+            .arg(&u)
+            .arg(&vertices_count)
+            .arg(&vertices)
+            .launch(flat(rows))?;
+        d.stream
+            .launch_builder(&module.load_function("sparse_cube_component_edge_ids")?)
+            .arg(&coordinates)
+            .arg(&sorted)
+            .arg(&cubes)
+            .arg(&scalar)
+            .arg(&resolved)
+            .arg(&table)
+            .arg(&offsets)
+            .arg(&n)
+            .arg(&quads)
+            .arg(&face_counts)
+            .arg(&diagonal)
+            .launch(flat(edges))?;
+    }
+    drop(coordinates);
+    drop(sorted);
+    drop(cubes);
+    drop(positions);
+    drop(scalar);
+    drop(resolved);
+    drop(table);
+    drop(offsets);
+    drop(sites);
+    eprintln!(
+        "SPARSE_CUBE_PLAN cubes={rows} corners={u} vertices={vertices_count} edge_slots={edges} workspace_bound_bytes={live}"
+    );
+    compact_quads(
+        d,
+        &module,
+        vertices,
+        quads,
+        face_counts,
+        QuadSplit::Fixed(diagonal),
+        budget,
+    )
+}
+
+enum QuadSplit {
+    Product(CudaSlice<f32>),
+    Fixed(CudaSlice<u8>),
+}
+
 pub(crate) fn dual_grid_mesh(
     d: &Device,
     sites: SparseSites,
@@ -350,7 +569,7 @@ pub(crate) fn mesh_from_dual(
         "invalid dual grid attributes"
     );
     let edges = rows.checked_mul(3).context("edge count overflow")?;
-    let edge_count = u32::try_from(edges)?;
+    u32::try_from(edges)?;
     let n = u32::try_from(rows)?;
     let mut scan_bytes = 0usize;
     let mut blocks = edges;
@@ -370,14 +589,7 @@ pub(crate) fn mesh_from_dual(
         .and_then(|v| v.checked_add(scan_bytes + size_of::<u64>()))
         .context("mesh workspace overflow")?;
     d.workspace_budget(budget[0], budget[1], live)?;
-    let coordinates = d.stream.clone_htod(sites.coordinates().as_flattened())?;
-    let sorted_host: Vec<_> = sites
-        .sorted_rows()
-        .iter()
-        .flat_map(|&(p, row)| [p[0], p[1], p[2], p[3], row])
-        .collect();
-    let sorted = d.stream.clone_htod(&sorted_host)?;
-    drop(sorted_host);
+    let [coordinates, sorted] = upload_sites(d, &sites)?;
     let quads = d.stream.alloc_zeros::<i32>(edges * 4)?;
     let counts = d.stream.alloc_zeros::<u64>(edges)?;
     let module = cubin::module(&d.ctx, "vision_ops")?;
@@ -404,11 +616,38 @@ pub(crate) fn mesh_from_dual(
     drop(sorted);
     drop(flags);
     drop(sites);
+    compact_quads(
+        d,
+        &module,
+        vertices,
+        quads,
+        counts,
+        QuadSplit::Product(weights),
+        budget,
+    )
+}
+
+fn compact_quads(
+    d: &Device,
+    module: &Arc<CudaModule>,
+    vertices: CudaSlice<f32>,
+    quads: CudaSlice<i32>,
+    counts: CudaSlice<u64>,
+    split: QuadSplit,
+    budget: [usize; 2],
+) -> Result<SparseMesh> {
+    let edges = counts.len();
+    let edge_count = u32::try_from(edges)?;
+    let n = u32::try_from(vertices.len() / 3)?;
+    ensure!(
+        vertices.len().is_multiple_of(3) && quads.len() == edges * 4,
+        "invalid quad mesh extents"
+    );
     let offsets = exclusive_scan(d, &counts)?;
     drop(counts);
     let total = d.stream.clone_dtoh(&offsets.slice(edges..edges + 1))?[0];
     ensure!(
-        total <= rows as u64 * 6 && total.is_multiple_of(2),
+        total <= edges as u64 * 2 && total.is_multiple_of(2),
         "invalid mesh face count"
     );
     if total == 0 {
@@ -425,18 +664,30 @@ pub(crate) fn mesh_from_dual(
         .and_then(|v| v.checked_add(edges))
         .context("face workspace overflow")?;
     d.workspace_budget(budget[0], budget[1], additional)?;
-    let diagonal = d.stream.alloc_zeros::<u8>(edges)?;
+    let diagonal = match split {
+        QuadSplit::Fixed(diagonal) => {
+            ensure!(diagonal.len() == edges, "quad diagonal extent mismatch");
+            diagonal
+        }
+        QuadSplit::Product(weights) => {
+            ensure!(weights.len() == n as usize, "quad weight extent mismatch");
+            let diagonal = d.stream.alloc_zeros::<u8>(edges)?;
+            unsafe {
+                d.stream
+                    .launch_builder(&module.load_function("quad_diagonal_f32")?)
+                    .arg(&quads)
+                    .arg(&offsets)
+                    .arg(&weights)
+                    .arg(&edge_count)
+                    .arg(&n)
+                    .arg(&diagonal)
+                    .launch(flat(edges))?;
+            }
+            diagonal
+        }
+    };
     let faces = d.stream.alloc_zeros::<i32>(face_elements)?;
     unsafe {
-        d.stream
-            .launch_builder(&module.load_function("quad_diagonal_f32")?)
-            .arg(&quads)
-            .arg(&offsets)
-            .arg(&weights)
-            .arg(&edge_count)
-            .arg(&n)
-            .arg(&diagonal)
-            .launch(flat(edges))?;
         d.stream
             .launch_builder(&module.load_function("sparse_face_compact")?)
             .arg(&quads)
