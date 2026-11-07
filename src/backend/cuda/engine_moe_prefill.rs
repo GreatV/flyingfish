@@ -3172,6 +3172,60 @@ mod tests {
             "BF16 SiLU CPU/GPU map mismatches={silu_mismatches}"
         );
         println!("PASS expert_tier_silu_map finite_inputs=65280 bit_mismatches=0");
+        let mut defects = 0;
+        let gate = bf16::from_bits(0x3f49);
+        let up = bf16::from_bits(0x3e5f);
+        let mut joint = [bf16::ZERO; 16];
+        joint[0] = gate;
+        joint[8] = up;
+        let joint_device = stream.clone_htod(&joint)?;
+        let joint_output = stream.alloc_zeros::<bf16>(8)?;
+        let joint_ptr = joint_device.device_ptr(stream).0;
+        let joint_out_ptr = joint_output.device_ptr(stream).0;
+        // SAFETY: the dense [1,16] input and disjoint [1,8] output cover one vector.
+        unsafe {
+            stream
+                .launch_builder(&silu)
+                .arg(&joint_ptr)
+                .arg(&joint_out_ptr)
+                .arg(&1i32)
+                .arg(&8i32)
+                .arg(&1i32)
+                .launch(crate::backend::cuda::ops::silu_mul_grid(
+                    1,
+                    8,
+                    joint_ptr,
+                    joint_out_ptr,
+                )?)?;
+        }
+        let actual = stream.clone_dtoh(&joint_output)?[0];
+        let reciprocal =
+            bf16::from_f32((gate.to_f32() * (1.0 / (1.0 + (-gate.to_f32()).exp()))) * up.to_f32());
+        ensure!(
+            reciprocal.to_bits() == 0x3df0,
+            "Once control is not discriminating"
+        );
+        for form in [
+            crate::cpu::expert_ffn::Form::Lane8,
+            crate::cpu::expert_ffn::Form::Lane16,
+        ] {
+            let cpu = crate::cpu::expert_ffn::silu_mul(
+                gate,
+                up,
+                crate::model_spec::SwigluRounding::Once,
+                0.0,
+                form,
+            )?;
+            let pass = actual.to_bits() == 0x3df1 && cpu.to_bits() == actual.to_bits();
+            defects += usize::from(!pass);
+            println!(
+                "{} expert_tier_once_control form={form:?} gate=3f49 up=3e5f expected=3df1 gpu={:04x} cpu={:04x} reciprocal={:04x}",
+                if pass { "PASS" } else { "DEFECT" },
+                actual.to_bits(),
+                cpu.to_bits(),
+                reciprocal.to_bits()
+            );
+        }
         let native_device = stream.clone_htod(&native)?;
         let gate_up_pointer = native_device.device_ptr(stream).0;
         let down_pointer = gate_up_pointer + (cut * 2) as u64;
@@ -3188,463 +3242,506 @@ mod tests {
             generation: stream
                 .clone_htod(&valid.iter().copied().map(u64::from).collect::<Vec<_>>())?,
         };
-        let pool = ExpertPool::new(2, Shape::new(hidden, intermediate)?, 32, 32, None)?;
-        let mut disk = DiskExperts::new(catalogue, &directory, 1, 32)?;
-        let ops = PrefillOps::new(&device.ctx, stream, crate::model_spec::ExpertFormat::Bf16)?;
-        let mut defects = 0;
-        for (rows, weighted) in [
-            (1usize, false),
-            (32, false),
-            (32, true),
-            (LANE16_ROWS as usize, true),
-            (LANE16_ROWS as usize + 1, true),
+        for (rounding, routed_weight) in [
+            (
+                crate::model_spec::SwigluRounding::Twice,
+                crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+            ),
+            (
+                crate::model_spec::SwigluRounding::Once,
+                crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+            ),
         ] {
-            let x = &input[..rows * hidden];
-            let routing: Vec<_> = (0..rows)
-                .map(|row| {
-                    if weighted {
-                        routing[row * geometry.top_k as usize]
-                    } else {
-                        bf16::ONE
-                    }
-                })
-                .collect();
-            ensure!(
-                routing
-                    .iter()
-                    .all(|value| value.is_finite() && *value > bf16::ZERO)
-                    && (!weighted || routing.iter().all(|value| *value != bf16::ONE)),
-                "expert identity routing weights invalid"
+            println!(
+                "expert_tier_boundaries rounding={rounding:?} routed_weight={routed_weight:?}"
             );
-            let assignments: Vec<_> = routing
-                .iter()
-                .enumerate()
-                .map(|(row, &weight)| Assignment {
-                    row: row as u32,
-                    choice: row as u32,
-                    expert: 0,
-                    weight: weight.to_f32(),
-                })
-                .collect();
-            let routes: Vec<_> = assignments
-                .iter()
-                .map(|item| crate::experts::runtime::Route {
-                    row: item.row,
-                    choice: item.choice,
-                    expert,
-                    weight: item.weight,
-                })
-                .collect();
-            let x_device = stream.clone_htod(x)?;
-            let ids = stream.clone_htod(&vec![expert as i32; rows])?;
-            let routing_device = stream.clone_htod(&routing)?;
-            let active = stream.clone_htod(&vec![1u32; rows])?;
-            let generation = stream.clone_htod(&vec![1u64; rows])?;
-            let layout = crate::backend::cuda::moe::prefill::prefill_layout(
-                rows,
-                rows,
-                1,
-                geometry.experts as usize,
-                hidden,
-                intermediate,
+            let pool = ExpertPool::new_with_boundaries(
+                2,
+                Shape::new(hidden, intermediate)?,
+                32,
+                32,
                 None,
+                crate::cpu::expert_ffn::ExpertBoundaries {
+                    swiglu_rounding: rounding,
+                    swiglu_limit: 0.0,
+                    routed_weight,
+                },
+                crate::experts::plan::ParticipantTable::uniform(32, 32, 2)?,
             )?;
-            let scratch = stream.alloc_zeros::<u8>(usize::try_from(prefill_scratch_bytes(
-                rows,
-                rows,
+            let mut disk = DiskExperts::new_with_swiglu_rounding(
+                catalogue.clone(),
+                &directory,
                 1,
-                geometry.experts as usize,
-                hidden,
-                intermediate,
-                None,
-            )?)?)?;
-            let boundary = rows == LANE16_ROWS as usize || rows == LANE16_ROWS as usize + 1;
-            let mut arithmetic = vec![true; geometry.experts as usize];
-            if boundary {
-                let mut counts = vec![0; geometry.experts as usize];
-                counts[expert as usize] = rows as u32;
-                arithmetic_mask(&counts, &mut arithmetic)?;
+                32,
+                rounding,
+                routed_weight,
+                0.0,
+            )?;
+            let ops = PrefillOps::new_with_boundaries(
+                &device.ctx,
+                stream,
+                crate::model_spec::ExpertFormat::Bf16,
+                rounding,
+                routed_weight,
+            )?;
+            for (rows, weighted) in [
+                (1usize, false),
+                (32, false),
+                (32, true),
+                (LANE16_ROWS as usize, true),
+                (LANE16_ROWS as usize + 1, true),
+            ] {
+                let x = &input[..rows * hidden];
+                let routing: Vec<_> = (0..rows)
+                    .map(|row| {
+                        if weighted {
+                            routing[row * geometry.top_k as usize]
+                        } else {
+                            bf16::ONE
+                        }
+                    })
+                    .collect();
                 ensure!(
-                    arithmetic[expert as usize] == (rows <= LANE16_ROWS as usize),
-                    "expert arithmetic boundary rows={rows}"
+                    routing
+                        .iter()
+                        .all(|value| value.is_finite() && *value > bf16::ZERO)
+                        && (!weighted || routing.iter().all(|value| *value != bf16::ONE)),
+                    "expert identity routing weights invalid"
                 );
-            }
-            let run_gpu = |tables: &testing::SlotTable,
-                           host_gate_up: &[u64],
-                           host_down: &[u64]|
-             -> Result<Vec<bf16>> {
-                let contributions = stream.alloc_zeros::<bf16>(rows * hidden)?;
-                let done = stream.alloc_zeros::<u32>(rows)?;
-                {
-                    let _range = crate::backend::cuda::profile::Range::new(
-                        cfg!(feature = "cuda"),
-                        c"expert_tier_grouped",
+                let assignments: Vec<_> = routing
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &weight)| Assignment {
+                        row: row as u32,
+                        choice: row as u32,
+                        expert: 0,
+                        weight: weight.to_f32(),
+                    })
+                    .collect();
+                let routes: Vec<_> = assignments
+                    .iter()
+                    .map(|item| crate::experts::runtime::Route {
+                        row: item.row,
+                        choice: item.choice,
+                        expert,
+                        weight: item.weight,
+                    })
+                    .collect();
+                let x_device = stream.clone_htod(x)?;
+                let ids = stream.clone_htod(&vec![expert as i32; rows])?;
+                let routing_device = stream.clone_htod(&routing)?;
+                let active = stream.clone_htod(&vec![1u32; rows])?;
+                let generation = stream.clone_htod(&vec![1u64; rows])?;
+                let layout = crate::backend::cuda::moe::prefill::prefill_layout(
+                    rows,
+                    rows,
+                    1,
+                    geometry.experts as usize,
+                    hidden,
+                    intermediate,
+                    None,
+                )?;
+                let scratch = stream.alloc_zeros::<u8>(usize::try_from(prefill_scratch_bytes(
+                    rows,
+                    rows,
+                    1,
+                    geometry.experts as usize,
+                    hidden,
+                    intermediate,
+                    None,
+                )?)?)?;
+                let boundary = rows == LANE16_ROWS as usize || rows == LANE16_ROWS as usize + 1;
+                let mut arithmetic = vec![true; geometry.experts as usize];
+                if boundary {
+                    let mut counts = vec![0; geometry.experts as usize];
+                    counts[expert as usize] = rows as u32;
+                    arithmetic_mask(&counts, &mut arithmetic)?;
+                    ensure!(
+                        arithmetic[expert as usize] == (rows <= LANE16_ROWS as usize),
+                        "expert arithmetic boundary rows={rows}"
                     );
-                    ops.prefill_contribute(
-                        stream,
-                        MoePrefillContribute {
-                            mask_from_slots: false,
-                            expert_inter: geometry.intermediate,
-                            cpu_arithmetic: &arithmetic,
-                            fp8_slot: None,
-                            wave: None,
-                            wait_copy: None,
-                            reader_event: None,
-                            x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
-                            ids: testing::dense(&ids, stream, rows as u32, 1)?,
-                            weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
-                            active: testing::dense(&active, stream, rows as u32, 1)?,
-                            assignment_gen: Some(testing::dense(
-                                &generation,
-                                stream,
-                                rows as u32,
-                                1,
-                            )?),
-                            slots_gate_up: testing::view(
-                                &tables.gate_up,
-                                stream,
-                                [geometry.experts],
-                                [1],
-                            )?,
-                            slots_down: testing::view(
-                                &tables.down,
-                                stream,
-                                [geometry.experts],
-                                [1],
-                            )?,
-                            slot_valid: testing::view(
-                                &tables.valid,
-                                stream,
-                                [geometry.experts],
-                                [1],
-                            )?,
-                            slot_generation: testing::view(
-                                &tables.generation,
-                                stream,
-                                [geometry.experts],
-                                [1],
-                            )?,
-                            slots_gate_up_host: host_gate_up,
-                            slots_down_host: host_down,
-                            shared_gate: qwen::matrix(
-                                &native_device,
-                                stream,
-                                0,
-                                intermediate,
-                                hidden,
-                            )?,
-                            shared_up: qwen::matrix(
-                                &native_device,
-                                stream,
-                                intermediate * hidden,
-                                intermediate,
-                                hidden,
-                            )?,
-                            shared_down: qwen::matrix(
-                                &native_device,
-                                stream,
-                                cut,
-                                hidden,
-                                intermediate,
-                            )?,
-                            shared_expert_gate: Some(testing::view(
-                                &x_device,
-                                stream,
-                                [geometry.hidden],
-                                [1],
-                            )?),
-                            contributions: testing::view(
-                                &contributions,
-                                stream,
-                                [rows as u32, 1, geometry.hidden],
-                                [geometry.hidden as u64, geometry.hidden as u64, 1],
-                            )?,
-                            done: testing::mut_view(&done, stream, [rows as u32, 1], [1, 1])?,
-                        },
-                        &qwen::scratch(&scratch, stream),
-                    )?;
-                    stream.synchronize()?;
                 }
-                ensure!(
-                    stream.clone_dtoh(&done)?.iter().all(|&value| value == 1),
-                    "grouped expert did not complete every assignment"
-                );
-                let output = stream.clone_dtoh(&contributions)?;
-                Ok(output)
-            };
-            let gpu = run_gpu(&tables, &host_gate_up, &host_down)?;
-            let mut cpu = vec![bf16::ZERO; rows * hidden];
-            let pending = pool.submit(Job {
-                form: crate::cpu::expert_ffn::Form::Lane16,
-                arena: host.clone(),
-                hidden: x,
-                rows,
-                experts: &weights,
-                assignments: &assignments,
-                out: &mut cpu,
-            })?;
-            pool.finish(pending)?;
-            let mut from_disk = vec![bf16::ZERO; rows * hidden];
-            disk.start(crate::experts::disk::Job {
-                layer: 0,
-                hidden: x,
-                rows,
-                routes: &routes,
-                form: crate::cpu::expert_ffn::Form::Lane16,
-            })?;
-            disk.finish(&mut from_disk)?;
-            if boundary {
-                let staged = stream.clone_htod(&native)?;
-                let mut staged_gate_up = host_gate_up.clone();
-                let mut staged_down = host_down.clone();
-                staged_gate_up[expert as usize] = staged.device_ptr(stream).0;
-                staged_down[expert as usize] = staged.device_ptr(stream).0 + (cut * 2) as u64;
-                let staged_tables = testing::SlotTable {
-                    gate_up: stream.clone_htod(&staged_gate_up)?,
-                    down: stream.clone_htod(&staged_down)?,
-                    valid: stream.clone_htod(&valid)?,
-                    generation: stream
-                        .clone_htod(&valid.iter().copied().map(u64::from).collect::<Vec<_>>())?,
+                let run_gpu = |tables: &testing::SlotTable,
+                               host_gate_up: &[u64],
+                               host_down: &[u64]|
+                 -> Result<Vec<bf16>> {
+                    let contributions = stream.alloc_zeros::<bf16>(rows * hidden)?;
+                    let done = stream.alloc_zeros::<u32>(rows)?;
+                    {
+                        let _range = crate::backend::cuda::profile::Range::new(
+                            cfg!(feature = "cuda"),
+                            c"expert_tier_grouped",
+                        );
+                        ops.prefill_contribute(
+                            stream,
+                            MoePrefillContribute {
+                                mask_from_slots: false,
+                                expert_inter: geometry.intermediate,
+                                cpu_arithmetic: &arithmetic,
+                                fp8_slot: None,
+                                wave: None,
+                                wait_copy: None,
+                                reader_event: None,
+                                x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
+                                ids: testing::dense(&ids, stream, rows as u32, 1)?,
+                                weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
+                                active: testing::dense(&active, stream, rows as u32, 1)?,
+                                assignment_gen: Some(testing::dense(
+                                    &generation,
+                                    stream,
+                                    rows as u32,
+                                    1,
+                                )?),
+                                slots_gate_up: testing::view(
+                                    &tables.gate_up,
+                                    stream,
+                                    [geometry.experts],
+                                    [1],
+                                )?,
+                                slots_down: testing::view(
+                                    &tables.down,
+                                    stream,
+                                    [geometry.experts],
+                                    [1],
+                                )?,
+                                slot_valid: testing::view(
+                                    &tables.valid,
+                                    stream,
+                                    [geometry.experts],
+                                    [1],
+                                )?,
+                                slot_generation: testing::view(
+                                    &tables.generation,
+                                    stream,
+                                    [geometry.experts],
+                                    [1],
+                                )?,
+                                slots_gate_up_host: host_gate_up,
+                                slots_down_host: host_down,
+                                shared_gate: qwen::matrix(
+                                    &native_device,
+                                    stream,
+                                    0,
+                                    intermediate,
+                                    hidden,
+                                )?,
+                                shared_up: qwen::matrix(
+                                    &native_device,
+                                    stream,
+                                    intermediate * hidden,
+                                    intermediate,
+                                    hidden,
+                                )?,
+                                shared_down: qwen::matrix(
+                                    &native_device,
+                                    stream,
+                                    cut,
+                                    hidden,
+                                    intermediate,
+                                )?,
+                                shared_expert_gate: Some(testing::view(
+                                    &x_device,
+                                    stream,
+                                    [geometry.hidden],
+                                    [1],
+                                )?),
+                                contributions: testing::view(
+                                    &contributions,
+                                    stream,
+                                    [rows as u32, 1, geometry.hidden],
+                                    [geometry.hidden as u64, geometry.hidden as u64, 1],
+                                )?,
+                                done: testing::mut_view(&done, stream, [rows as u32, 1], [1, 1])?,
+                            },
+                            &qwen::scratch(&scratch, stream),
+                        )?;
+                        stream.synchronize()?;
+                    }
+                    ensure!(
+                        stream.clone_dtoh(&done)?.iter().all(|&value| value == 1),
+                        "grouped expert did not complete every assignment"
+                    );
+                    let output = stream.clone_dtoh(&contributions)?;
+                    Ok(output)
                 };
-                let streamed = run_gpu(&staged_tables, &staged_gate_up, &staged_down)?;
-                let mut comparisons = vec![
-                    ("gpu_resident_streamed", &gpu, &streamed),
-                    ("cpu_pool_disk", &cpu, &from_disk),
-                ];
-                if arithmetic[expert as usize] {
-                    comparisons
-                        .extend([("gpu_cpu_pool", &gpu, &cpu), ("gpu_disk", &gpu, &from_disk)]);
+                let gpu = run_gpu(&tables, &host_gate_up, &host_down)?;
+                let mut cpu = vec![bf16::ZERO; rows * hidden];
+                let pending = pool.submit(Job {
+                    form: crate::cpu::expert_ffn::Form::Lane16,
+                    arena: host.clone(),
+                    hidden: x,
+                    rows,
+                    experts: &weights,
+                    assignments: &assignments,
+                    out: &mut cpu,
+                })?;
+                pool.finish(pending)?;
+                let mut from_disk = vec![bf16::ZERO; rows * hidden];
+                disk.start(crate::experts::disk::Job {
+                    layer: 0,
+                    hidden: x,
+                    rows,
+                    routes: &routes,
+                    form: crate::cpu::expert_ffn::Form::Lane16,
+                })?;
+                disk.finish(&mut from_disk)?;
+                if boundary || rounding == crate::model_spec::SwigluRounding::Once {
+                    let staged = stream.clone_htod(&native)?;
+                    let mut staged_gate_up = host_gate_up.clone();
+                    let mut staged_down = host_down.clone();
+                    staged_gate_up[expert as usize] = staged.device_ptr(stream).0;
+                    staged_down[expert as usize] = staged.device_ptr(stream).0 + (cut * 2) as u64;
+                    let staged_tables = testing::SlotTable {
+                        gate_up: stream.clone_htod(&staged_gate_up)?,
+                        down: stream.clone_htod(&staged_down)?,
+                        valid: stream.clone_htod(&valid)?,
+                        generation: stream.clone_htod(
+                            &valid.iter().copied().map(u64::from).collect::<Vec<_>>(),
+                        )?,
+                    };
+                    let streamed = run_gpu(&staged_tables, &staged_gate_up, &staged_down)?;
+                    let mut comparisons = vec![
+                        ("gpu_resident_streamed", &gpu, &streamed),
+                        ("cpu_pool_disk", &cpu, &from_disk),
+                    ];
+                    if arithmetic[expert as usize] {
+                        comparisons
+                            .extend([("gpu_cpu_pool", &gpu, &cpu), ("gpu_disk", &gpu, &from_disk)]);
+                    }
+                    for (name, a, b) in comparisons {
+                        ensure!(
+                            a.iter().chain(b).all(|value| value.is_finite()),
+                            "nonfinite expert boundary contribution {name}"
+                        );
+                        let mismatches = a
+                            .iter()
+                            .zip(b)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        defects += usize::from(mismatches != 0);
+                        println!(
+                            "{} expert_arithmetic_boundary rows={rows} lane16={} rounding={rounding:?} routed_weight={routed_weight:?} comparison={name} weighted={weighted} bit_mismatches={mismatches} cpu_reference_only={}",
+                            if mismatches == 0 { "PASS" } else { "DEFECT" },
+                            arithmetic[expert as usize],
+                            !arithmetic[expert as usize]
+                        );
+                    }
+                    continue;
                 }
-                for (name, a, b) in comparisons {
+                if !weighted {
+                    let packed = stream.clone_dtoh(&scratch)?;
+                    let mut cpu_stages: [Vec<bf16>; 4] = std::array::from_fn(|_| Vec::new());
+                    let mut gpu_stages: [Vec<bf16>; 4] = std::array::from_fn(|_| Vec::new());
+                    let shape = Shape::new(hidden, intermediate)?;
+                    let mut cpu_scratch = Scratch::new(&shape);
+                    let mut cpu_row = vec![bf16::ZERO; hidden];
+                    let mut seen = vec![false; rows];
+                    let gpu_values = |offset: u64, count: usize| -> Result<Vec<bf16>> {
+                        let offset = usize::try_from(offset)?;
+                        Ok(packed
+                            .get(offset..offset + count * 2)
+                            .context("expert GPU stage exceeds scratch")?
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|value| bf16::from_bits(u16::from_le_bytes(*value)))
+                            .collect())
+                    };
+                    for row in 0..rows {
+                        contribution(
+                            Isa::detect(),
+                            Contribution {
+                                form: crate::cpu::expert_ffn::Form::Lane16,
+                                shape: &shape,
+                                arena: &native,
+                                weights: &weights[0],
+                                hidden: &x[row * hidden..(row + 1) * hidden],
+                                routing: 1.0,
+
+                                rounding: crate::model_spec::SwigluRounding::Twice,
+                                limit: 0.0,
+                                routed_weight:
+                                    crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                            },
+                            &mut cpu_row,
+                            &mut cpu_scratch,
+                        )?;
+                        let pool_mismatches = cpu_row
+                            .iter()
+                            .zip(&cpu[row * hidden..(row + 1) * hidden])
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        defects += usize::from(pool_mismatches != 0);
+                        println!(
+                            "expert_tier_cpu_stage_binding rows={rows} row={row} pool_bit_mismatches={pool_mismatches}"
+                        );
+                        for (target, values) in cpu_stages.iter_mut().zip(cpu_scratch.stages()) {
+                            target.extend_from_slice(values);
+                        }
+                        let position_at = usize::try_from(layout.pos_of)? + row * 4;
+                        let position = usize::try_from(u32::from_le_bytes(
+                            packed
+                                .get(position_at..position_at + 4)
+                                .context("expert position exceeds scratch")?
+                                .try_into()?,
+                        ))?;
+                        ensure!(
+                            position < rows && !seen[position],
+                            "expert row permutation invalid: row={row} position={position}"
+                        );
+                        seen[position] = true;
+                        for (target, (offset, width)) in gpu_stages.iter_mut().zip([
+                            (
+                                layout.h1 + (position * 2 * intermediate * 2) as u64,
+                                intermediate,
+                            ),
+                            (
+                                layout.h1 + ((position * 2 + 1) * intermediate * 2) as u64,
+                                intermediate,
+                            ),
+                            (
+                                layout.act + (position * intermediate * 2) as u64,
+                                intermediate,
+                            ),
+                            (layout.y_perm + (position * hidden * 2) as u64, hidden),
+                        ]) {
+                            target.extend(gpu_values(offset, width)?);
+                        }
+                    }
+                    for (stage, (name, width)) in [
+                        ("gate", intermediate),
+                        ("up", intermediate),
+                        ("activated", intermediate),
+                        ("down", hidden),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let batch =
+                            read(&reference, &format!("batch{rows}_{name}"), &[rows, width])?;
+                        let per_row = read(&reference, &format!("perrow32_{name}"), &[32, width])?;
+                        let fp64 = read(&reference, &format!("fp64_{name}"), &[32, width])?;
+                        let bound = reference_bound(&batch, &per_row[..rows * width]);
+                        let sources = [
+                            ("gpu_grouped", gpu_stages[stage].as_slice()),
+                            ("cpu", cpu_stages[stage].as_slice()),
+                            ("official_batch", batch.as_slice()),
+                            ("official_perrow", &per_row[..rows * width]),
+                            ("fp64", &fp64[..rows * width]),
+                        ];
+                        for a in 0..sources.len() {
+                            for b in a + 1..sources.len() {
+                                let (left, right) = (sources[a], sources[b]);
+                                ensure!(
+                                    left.1.iter().chain(right.1).all(|value| value.is_finite()),
+                                    "nonfinite expert stage={name}"
+                                );
+                                let mismatches = left
+                                    .1
+                                    .iter()
+                                    .zip(right.1)
+                                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                    .count();
+                                let maximum = left
+                                    .1
+                                    .iter()
+                                    .zip(right.1)
+                                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                                    .fold(0.0f32, f32::max);
+                                let first = left
+                                    .1
+                                    .iter()
+                                    .zip(right.1)
+                                    .enumerate()
+                                    .find(|(_, (a, b))| a.to_bits() != b.to_bits())
+                                    .map(|(index, (a, b))| {
+                                        (index, a.to_bits(), b.to_bits(), a.to_f32(), b.to_f32())
+                                    });
+                                println!(
+                                    "expert_tier_stage rows={rows} stage={name} left={} right={} stored=[{rows},{width}] bit_mismatches={mismatches} max_abs={maximum} first={first:?}",
+                                    left.0, right.0
+                                );
+                                if a < 2 && (b == 2 || b == 3) {
+                                    let pass =
+                                        maximum <= bound && (bound != 0.0 || mismatches == 0);
+                                    defects += usize::from(!pass);
+                                    println!(
+                                        "{} expert_tier_stage_reference rows={rows} stage={name} tier={} reference={} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
+                                        if pass { "PASS" } else { "DEFECT" },
+                                        left.0,
+                                        right.0
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                let weighted_reference = |name: &str, shape: &[usize]| -> Result<Vec<bf16>> {
+                    Ok(read(&reference, name, shape)?[..rows * hidden]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            bf16::from_f32(value.to_f32() * routing[index / hidden].to_f32())
+                        })
+                        .collect())
+                };
+                let batch = weighted_reference(&format!("batch{rows}_down"), &[rows, hidden])?;
+                let per_row = weighted_reference("perrow32_down", &[32, hidden])?;
+                let bound = reference_bound(&batch, &per_row);
+                for (tier, actual) in [("gpu", &gpu), ("cpu", &cpu), ("disk", &from_disk)] {
+                    for (name, expected) in [("batch", &batch), ("per_row", &per_row)] {
+                        let mismatches = actual
+                            .iter()
+                            .zip(expected)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        let maximum = actual
+                            .iter()
+                            .zip(expected)
+                            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+                            .fold(0.0f32, f32::max);
+                        let pass = maximum <= bound && (bound != 0.0 || mismatches == 0);
+                        defects += usize::from(!pass);
+                        println!(
+                            "{} expert_tier_weighted_reference rows={rows} weighted={weighted} tier={tier} reference={name} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
+                            if pass { "PASS" } else { "DEFECT" }
+                        );
+                    }
+                }
+                for (name, a, b) in [
+                    ("gpu_vs_cpu_pool", &gpu, &cpu),
+                    ("gpu_vs_disk", &gpu, &from_disk),
+                    ("cpu_pool_vs_disk", &cpu, &from_disk),
+                ] {
                     ensure!(
                         a.iter().chain(b).all(|value| value.is_finite()),
-                        "nonfinite expert boundary contribution {name}"
+                        "nonfinite expert tier contribution {name}"
                     );
                     let mismatches = a
                         .iter()
                         .zip(b)
                         .filter(|(a, b)| a.to_bits() != b.to_bits())
                         .count();
-                    defects += usize::from(mismatches != 0);
-                    println!(
-                        "{} expert_arithmetic_boundary rows={rows} lane16={} comparison={name} weighted=true bit_mismatches={mismatches} cpu_reference_only={}",
-                        if mismatches == 0 { "PASS" } else { "DEFECT" },
-                        arithmetic[expert as usize],
-                        !arithmetic[expert as usize]
-                    );
-                }
-                continue;
-            }
-            if !weighted {
-                let packed = stream.clone_dtoh(&scratch)?;
-                let mut cpu_stages: [Vec<bf16>; 4] = std::array::from_fn(|_| Vec::new());
-                let mut gpu_stages: [Vec<bf16>; 4] = std::array::from_fn(|_| Vec::new());
-                let shape = Shape::new(hidden, intermediate)?;
-                let mut cpu_scratch = Scratch::new(&shape);
-                let mut cpu_row = vec![bf16::ZERO; hidden];
-                let mut seen = vec![false; rows];
-                let gpu_values = |offset: u64, count: usize| -> Result<Vec<bf16>> {
-                    let offset = usize::try_from(offset)?;
-                    Ok(packed
-                        .get(offset..offset + count * 2)
-                        .context("expert GPU stage exceeds scratch")?
-                        .as_chunks::<2>()
-                        .0
+                    let maximum = a
                         .iter()
-                        .map(|value| bf16::from_bits(u16::from_le_bytes(*value)))
-                        .collect())
-                };
-                for row in 0..rows {
-                    contribution(
-                        Isa::detect(),
-                        Contribution {
-                            form: crate::cpu::expert_ffn::Form::Lane16,
-                            shape: &shape,
-                            arena: &native,
-                            weights: &weights[0],
-                            hidden: &x[row * hidden..(row + 1) * hidden],
-                            routing: 1.0,
-
-                            rounding: crate::model_spec::SwigluRounding::Twice,
-                            limit: 0.0,
-                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                        },
-                        &mut cpu_row,
-                        &mut cpu_scratch,
-                    )?;
-                    let pool_mismatches = cpu_row
-                        .iter()
-                        .zip(&cpu[row * hidden..(row + 1) * hidden])
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    defects += usize::from(pool_mismatches != 0);
-                    println!(
-                        "expert_tier_cpu_stage_binding rows={rows} row={row} pool_bit_mismatches={pool_mismatches}"
-                    );
-                    for (target, values) in cpu_stages.iter_mut().zip(cpu_scratch.stages()) {
-                        target.extend_from_slice(values);
-                    }
-                    let position_at = usize::try_from(layout.pos_of)? + row * 4;
-                    let position = usize::try_from(u32::from_le_bytes(
-                        packed
-                            .get(position_at..position_at + 4)
-                            .context("expert position exceeds scratch")?
-                            .try_into()?,
-                    ))?;
-                    ensure!(
-                        position < rows && !seen[position],
-                        "expert row permutation invalid: row={row} position={position}"
-                    );
-                    seen[position] = true;
-                    for (target, (offset, width)) in gpu_stages.iter_mut().zip([
-                        (
-                            layout.h1 + (position * 2 * intermediate * 2) as u64,
-                            intermediate,
-                        ),
-                        (
-                            layout.h1 + ((position * 2 + 1) * intermediate * 2) as u64,
-                            intermediate,
-                        ),
-                        (
-                            layout.act + (position * intermediate * 2) as u64,
-                            intermediate,
-                        ),
-                        (layout.y_perm + (position * hidden * 2) as u64, hidden),
-                    ]) {
-                        target.extend(gpu_values(offset, width)?);
-                    }
-                }
-                for (stage, (name, width)) in [
-                    ("gate", intermediate),
-                    ("up", intermediate),
-                    ("activated", intermediate),
-                    ("down", hidden),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let batch = read(&reference, &format!("batch{rows}_{name}"), &[rows, width])?;
-                    let per_row = read(&reference, &format!("perrow32_{name}"), &[32, width])?;
-                    let fp64 = read(&reference, &format!("fp64_{name}"), &[32, width])?;
-                    let bound = reference_bound(&batch, &per_row[..rows * width]);
-                    let sources = [
-                        ("gpu_grouped", gpu_stages[stage].as_slice()),
-                        ("cpu", cpu_stages[stage].as_slice()),
-                        ("official_batch", batch.as_slice()),
-                        ("official_perrow", &per_row[..rows * width]),
-                        ("fp64", &fp64[..rows * width]),
-                    ];
-                    for a in 0..sources.len() {
-                        for b in a + 1..sources.len() {
-                            let (left, right) = (sources[a], sources[b]);
-                            ensure!(
-                                left.1.iter().chain(right.1).all(|value| value.is_finite()),
-                                "nonfinite expert stage={name}"
-                            );
-                            let mismatches = left
-                                .1
-                                .iter()
-                                .zip(right.1)
-                                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                                .count();
-                            let maximum = left
-                                .1
-                                .iter()
-                                .zip(right.1)
-                                .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                                .fold(0.0f32, f32::max);
-                            let first = left
-                                .1
-                                .iter()
-                                .zip(right.1)
-                                .enumerate()
-                                .find(|(_, (a, b))| a.to_bits() != b.to_bits())
-                                .map(|(index, (a, b))| {
-                                    (index, a.to_bits(), b.to_bits(), a.to_f32(), b.to_f32())
-                                });
-                            println!(
-                                "expert_tier_stage rows={rows} stage={name} left={} right={} stored=[{rows},{width}] bit_mismatches={mismatches} max_abs={maximum} first={first:?}",
-                                left.0, right.0
-                            );
-                            if a < 2 && (b == 2 || b == 3) {
-                                let pass = maximum <= bound && (bound != 0.0 || mismatches == 0);
-                                defects += usize::from(!pass);
-                                println!(
-                                    "{} expert_tier_stage_reference rows={rows} stage={name} tier={} reference={} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
-                                    if pass { "PASS" } else { "DEFECT" },
-                                    left.0,
-                                    right.0
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            let weighted_reference = |name: &str, shape: &[usize]| -> Result<Vec<bf16>> {
-                Ok(read(&reference, name, shape)?[..rows * hidden]
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        bf16::from_f32(value.to_f32() * routing[index / hidden].to_f32())
-                    })
-                    .collect())
-            };
-            let batch = weighted_reference(&format!("batch{rows}_down"), &[rows, hidden])?;
-            let per_row = weighted_reference("perrow32_down", &[32, hidden])?;
-            let bound = reference_bound(&batch, &per_row);
-            for (tier, actual) in [("gpu", &gpu), ("cpu", &cpu), ("disk", &from_disk)] {
-                for (name, expected) in [("batch", &batch), ("per_row", &per_row)] {
-                    let mismatches = actual
-                        .iter()
-                        .zip(expected)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    let maximum = actual
-                        .iter()
-                        .zip(expected)
+                        .zip(b)
                         .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
                         .fold(0.0f32, f32::max);
-                    let pass = maximum <= bound && (bound != 0.0 || mismatches == 0);
-                    defects += usize::from(!pass);
+                    let first = a
+                        .iter()
+                        .zip(b)
+                        .enumerate()
+                        .find(|(_, (a, b))| a.to_bits() != b.to_bits())
+                        .map(|(index, (a, b))| {
+                            (index, a.to_bits(), b.to_bits(), a.to_f32(), b.to_f32())
+                        });
                     println!(
-                        "{} expert_tier_weighted_reference rows={rows} weighted={weighted} tier={tier} reference={name} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
-                        if pass { "PASS" } else { "DEFECT" }
+                        "{} expert_tier_identity layer=0 expert={expert} rows={rows} weighted={weighted} comparison={name} stored=[rows,2048] bit_mismatches={mismatches} max_abs={maximum} first={first:?} cpu_isa={}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" },
+                        pool.isa().name()
                     );
+                    defects += usize::from(mismatches != 0);
                 }
-            }
-            for (name, a, b) in [
-                ("gpu_vs_cpu_pool", &gpu, &cpu),
-                ("gpu_vs_disk", &gpu, &from_disk),
-                ("cpu_pool_vs_disk", &cpu, &from_disk),
-            ] {
-                ensure!(
-                    a.iter().chain(b).all(|value| value.is_finite()),
-                    "nonfinite expert tier contribution {name}"
-                );
-                let mismatches = a
-                    .iter()
-                    .zip(b)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                let maximum = a
-                    .iter()
-                    .zip(b)
-                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                    .fold(0.0f32, f32::max);
-                let first = a
-                    .iter()
-                    .zip(b)
-                    .enumerate()
-                    .find(|(_, (a, b))| a.to_bits() != b.to_bits())
-                    .map(|(index, (a, b))| {
-                        (index, a.to_bits(), b.to_bits(), a.to_f32(), b.to_f32())
-                    });
-                println!(
-                    "{} expert_tier_identity layer=0 expert={expert} rows={rows} weighted={weighted} comparison={name} stored=[rows,2048] bit_mismatches={mismatches} max_abs={maximum} first={first:?} cpu_isa={}",
-                    if mismatches == 0 { "PASS" } else { "DEFECT" },
-                    pool.isa().name()
-                );
-                defects += usize::from(mismatches != 0);
             }
         }
         ensure!(
