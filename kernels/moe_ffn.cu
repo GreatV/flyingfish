@@ -198,7 +198,7 @@ __device__ __forceinline__ void moe_gate_up(
   if (lane == 0 && j < out_inter && live_seg) {
     const float g = __bfloat162float(__float2bfloat16(accg));
     const float u = __bfloat162float(__float2bfloat16(accu));
-    const float activation = INVARIANT
+    const float activation = INVARIANT && !rounding_once
         ? __fmul_rn(g, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-g))))
         : moe_silu(g);
     bf16* out = seg == top_k ? h_shared + (size_t)r * shared_inter

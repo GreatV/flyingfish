@@ -72,16 +72,17 @@ fn silu_mul_value(
         | crate::model_spec::SwigluRounding::Once
         | crate::model_spec::SwigluRounding::GeluTwice => (gate.to_f32(), up.to_f32()),
     };
-    // The lane16 kernel computes `g * (1/(1+exp(-g)))`; the production kernel computes
-    // `g / (1+exp(-g))`. The two round differently, so the form selects the expression.
+    // Once uses division; the other lane16 SiLU forms use reciprocal multiplication.
     let activated = if gelu {
         let cube = gate * gate * gate;
         let inner = 0.797_884_6f32 * (gate + 0.044_715f32 * cube);
         0.5f32 * gate * (1.0f32 + inner.tanh())
     } else {
-        match form {
-            Form::Lane16 => gate * (1.0 / (1.0 + (-gate).exp())),
-            Form::Lane8 => gate / (1.0 + (-gate).exp()),
+        match (form, rounding) {
+            (Form::Lane16, crate::model_spec::SwigluRounding::Once) | (Form::Lane8, _) => {
+                gate / (1.0 + (-gate).exp())
+            }
+            (Form::Lane16, _) => gate * (1.0 / (1.0 + (-gate).exp())),
         }
     };
     match rounding {
