@@ -743,6 +743,7 @@ mod tests {
         };
         let mut model = Model::load_mtp(&model_dir, &options, 1, false)?;
         let prompt = [785, 10567, 1087];
+        // 2026-11-07: G-MTP5 gates serving MTP ids against engine MTP path ids; 1-row eager ids are informational.
         let mut eager_greedy_ids = Vec::with_capacity(4);
         model.reset()?;
         let first = model.prefill(&prompt, None)?;
@@ -755,23 +756,39 @@ mod tests {
             eager_greedy_ids.len() == 4,
             "expected 4 eager greedy tokens"
         );
-        let mut mtp_rounds = 0;
-        let output = produce_mtp_events(
-            &mut model,
-            &prompt,
-            &options,
-            &mut |_| true,
-            &mut mtp_rounds,
-        )?;
+        model.reset_mtp()?;
+        let engine_mtp = model.generate_mtp_reuse(&prompt, &options, false, &mut |_, _| true)?;
         ensure!(
-            output.ids == eager_greedy_ids,
-            "serving MTP ids {:?} differ from eager greedy ids {:?}",
-            output.ids,
-            eager_greedy_ids
+            engine_mtp.ids.len() == 4,
+            "expected 4 engine MTP tokens, got {:?}",
+            engine_mtp.ids
         );
+        for request in 0..2 {
+            let mut mtp_rounds = 0;
+            let mut streamed_ids = Vec::with_capacity(4);
+            let output = produce_mtp_events(
+                &mut model,
+                &prompt,
+                &options,
+                &mut |event| {
+                    if let EngineEvent::Tokens { ids, .. } = event {
+                        streamed_ids.extend_from_slice(&ids);
+                    }
+                    true
+                },
+                &mut mtp_rounds,
+            )?;
+            ensure!(
+                output.ids == engine_mtp.ids && streamed_ids == engine_mtp.ids,
+                "request {request} serving MTP ids {:?} (streamed {:?}) differ from engine MTP ids {:?}",
+                output.ids,
+                streamed_ids,
+                engine_mtp.ids
+            );
+        }
         println!(
-            "PASS glm_mtp_serving tokens=4 ids_match_eager_greedy=true ids={:?}",
-            output.ids
+            "PASS glm_mtp_serving requests=2 tokens=4 ids_match_mtp_engine=true ids={:?} eager_greedy_ids={:?}",
+            engine_mtp.ids, eager_greedy_ids
         );
         Ok(())
     }

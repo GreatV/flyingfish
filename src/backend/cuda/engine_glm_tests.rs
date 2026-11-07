@@ -2326,9 +2326,8 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         graph: true,
     };
     engine.mtp_enable(mtp_options)?;
-
-    engine.reset()?;
-    let t0 = engine.prefill(&reference.tokens[..1], None)?;
+    let eos_ids = engine.model_spec.eos.clone();
+    ensure!(!eos_ids.is_empty(), "Runner FAIL GLM EOS ids missing");
 
     // Read frozen verify thresholds (tau)
     let ref_dir = PathBuf::from(
@@ -2360,7 +2359,83 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
 
-    // Establish single-step eager decode reference logits for round 0
+    let mut verify_compared_count = 0usize;
+    let mut verify_gated_count = 0usize;
+    let mut defects: Vec<String> = Vec::new();
+    let check_verify_row0 = |p: usize,
+                             verify_logits: &[f32],
+                             ref_logits: &[f32],
+                             label: &str,
+                             defects_out: &mut Vec<String>,
+                             compared_out: &mut usize,
+                             gated_out: &mut usize|
+     -> (f32, f32) {
+        let tau_max_abs = tau_max_abs_per_pos
+            .get(p)
+            .copied()
+            .unwrap_or(tau_max_abs_per_pos[0]);
+        let tau_rmse = tau_rmse_per_pos
+            .get(p)
+            .copied()
+            .unwrap_or(tau_rmse_per_pos[0]);
+        let mut row0_max_abs = 0.0f32;
+        let mut row0_sum_sq = 0.0f32;
+        for (&v, &r) in verify_logits.iter().zip(ref_logits) {
+            let diff = (v - r).abs();
+            if diff > row0_max_abs {
+                row0_max_abs = diff;
+            }
+            row0_sum_sq += diff * diff;
+        }
+        let row0_rmse = (row0_sum_sq / verify_logits.len() as f32).sqrt();
+        if gated_positions.contains(&p) {
+            if row0_max_abs > tau_max_abs {
+                defects_out.push(format!(
+                    "DEFECT {label} at pos={p} max_abs={row0_max_abs:.6} exceeds tau={tau_max_abs:.6}"
+                ));
+            }
+            if row0_rmse > tau_rmse {
+                defects_out.push(format!(
+                    "DEFECT {label} at pos={p} rmse={row0_rmse:.6} exceeds tau={tau_rmse:.6}"
+                ));
+            }
+            *gated_out += 1;
+        }
+        *compared_out += 1;
+        (row0_max_abs, row0_rmse)
+    };
+
+    // Exercise gated control position 1 from verify_control_positions_r1.json before passage rollout.
+    engine.mtp_prefill(&reference.tokens[..1])?;
+    let pos1_ckpt = GraphStepCheckpoint::save(&engine)?;
+    let _ = engine.decode(false, None)?;
+    let ref_pos1_logits = engine.decode_logits()?;
+    pos1_ckpt.restore(&mut engine)?;
+    let out_pos1 = engine.glm_mtp_round(true)?;
+    ensure!(
+        gated_positions.contains(&out_pos1.start_pos),
+        "Runner FAIL expected pos={} in gated_positions",
+        out_pos1.start_pos
+    );
+    let (pos1_max_abs, pos1_rmse) = check_verify_row0(
+        out_pos1.start_pos,
+        &out_pos1.verify_row0_logits,
+        &ref_pos1_logits,
+        "verify row0",
+        &mut defects,
+        &mut verify_compared_count,
+        &mut verify_gated_count,
+    );
+    println!(
+        "GLM_MTP_GATED_POS pos={} max_abs={pos1_max_abs:.6} tau_max_abs={:.6} rmse={pos1_rmse:.6} tau_rmse={:.6}",
+        out_pos1.start_pos,
+        tau_max_abs_per_pos[out_pos1.start_pos],
+        tau_rmse_per_pos[out_pos1.start_pos],
+    );
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    // 2026-11-07: prefill loc32 33-token prefix via mtp_prefill with model EOS stop ids; frozen tau and alpha* unchanged.
+    let t0 = engine.mtp_prefill(&reference.tokens[..33])?;
     let checkpoint = GraphStepCheckpoint::save(&engine)?;
     let _ref_t1 = engine.decode(false, None)?;
     let ref_row0_logits = engine.decode_logits()?;
@@ -2368,15 +2443,12 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
     let mut accepted_count = 0usize;
     let mut total_rounds = 0usize;
-    let mut verify_compared_count = 0usize;
-    let mut verify_gated_count = 0usize;
     let mut emitted_tokens = Vec::with_capacity(600);
     emitted_tokens.push(t0);
 
     let mut min_margin = f32::INFINITY;
     let mut sum_margin = 0.0f32;
     let mut margin_count = 0usize;
-    let mut defects: Vec<String> = Vec::new();
 
     // Cost model quantities
     let w_target_dense = 5_618_368_512u64;
@@ -2393,38 +2465,21 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let mut replay_1row_passes = 0usize;
     let loop_start = std::time::Instant::now();
 
-    while emitted_tokens.len() < 599 {
+    while emitted_tokens.len() < 599
+        && !eos_ids.contains(emitted_tokens.last().context("emitted tokens empty")?)
+    {
         let is_round0 = total_rounds == 0;
         let out = if is_round0 {
-            // Condition 5: run one forced eager draft pass and verify against single-step reference
             let out_eager = engine.glm_mtp_round(true)?;
-
-            let tau_max_abs = tau_max_abs_per_pos[0];
-            let tau_rmse = tau_rmse_per_pos[0];
-            let mut row0_max_abs = 0.0f32;
-            let mut row0_sum_sq = 0.0f32;
-            for (&v, &r) in out_eager.verify_row0_logits.iter().zip(&ref_row0_logits) {
-                let diff = (v - r).abs();
-                if diff > row0_max_abs {
-                    row0_max_abs = diff;
-                }
-                row0_sum_sq += diff * diff;
-            }
-            let row0_rmse = (row0_sum_sq / out_eager.verify_row0_logits.len() as f32).sqrt();
-            if gated_positions.contains(&0) {
-                if row0_max_abs > tau_max_abs {
-                    defects.push(format!(
-                        "DEFECT verify row0 at pos=0 max_abs={row0_max_abs:.6} exceeds tau={tau_max_abs:.6}"
-                    ));
-                }
-                if row0_rmse > tau_rmse {
-                    defects.push(format!(
-                        "DEFECT verify row0 at pos=0 rmse={row0_rmse:.6} exceeds tau={tau_rmse:.6}"
-                    ));
-                }
-                verify_gated_count += 1;
-            }
-            verify_compared_count += 1;
+            check_verify_row0(
+                out_eager.start_pos,
+                &out_eager.verify_row0_logits,
+                &ref_row0_logits,
+                "verify row0",
+                &mut defects,
+                &mut verify_compared_count,
+                &mut verify_gated_count,
+            );
             out_eager
         } else {
             engine.glm_mtp_round(false)?
@@ -2432,6 +2487,16 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
         total_rounds += 1;
         let tokens_in_round = out.round.tokens.len();
+        if total_rounds <= 8 {
+            let draft_tok = out.round.proposals.first().copied().unwrap_or(0);
+            let (v0_id, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
+            let (v1_id, _) = super::mtp::top1_and_margin(&out.verify_row1_logits);
+            println!(
+                "GLM_MTP_ROUND8 round={total_rounds} pos={} draft={draft_tok} verify_argmax={v0_id} verify_margin={:.4} accepted={} v1={v1_id} v1_margin={:.4}",
+                out.start_pos, out.v0_margin, out.round.accepted, out.v1_margin
+            );
+            std::io::Write::flush(&mut std::io::stdout())?;
+        }
         if out.round.accepted > 0 {
             accepted_count += 1;
         } else if let Some(replay_logits) = &out.replay_row0_logits {
@@ -2443,38 +2508,15 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
                     "DEFECT replayed token {replay_top0} differs from verify argmax {v0_top} at pos={p}"
                 ));
             }
-            let tau_max_abs = tau_max_abs_per_pos
-                .get(p)
-                .copied()
-                .unwrap_or(tau_max_abs_per_pos[0]);
-            let tau_rmse = tau_rmse_per_pos
-                .get(p)
-                .copied()
-                .unwrap_or(tau_rmse_per_pos[0]);
-            let mut row0_max_abs = 0.0f32;
-            let mut row0_sum_sq = 0.0f32;
-            for (&v, &r) in out.verify_row0_logits.iter().zip(replay_logits) {
-                let diff = (v - r).abs();
-                if diff > row0_max_abs {
-                    row0_max_abs = diff;
-                }
-                row0_sum_sq += diff * diff;
-            }
-            let row0_rmse = (row0_sum_sq / out.verify_row0_logits.len() as f32).sqrt();
-            if gated_positions.contains(&p) {
-                if row0_max_abs > tau_max_abs {
-                    defects.push(format!(
-                        "DEFECT verify row0 replay at pos={p} max_abs={row0_max_abs:.6} exceeds tau={tau_max_abs:.6}"
-                    ));
-                }
-                if row0_rmse > tau_rmse {
-                    defects.push(format!(
-                        "DEFECT verify row0 replay at pos={p} rmse={row0_rmse:.6} exceeds tau={tau_rmse:.6}"
-                    ));
-                }
-                verify_gated_count += 1;
-            }
-            verify_compared_count += 1;
+            check_verify_row0(
+                p,
+                &out.verify_row0_logits,
+                replay_logits,
+                "verify row0 replay",
+                &mut defects,
+                &mut verify_compared_count,
+                &mut verify_gated_count,
+            );
         }
 
         // Verify emitted tokens match argmax of verify rows
@@ -2516,7 +2558,12 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         };
         total_bytes_moved += b_round;
 
-        emitted_tokens.extend_from_slice(&out.round.tokens);
+        for &tok in &out.round.tokens {
+            emitted_tokens.push(tok);
+            if eos_ids.contains(&tok) {
+                break;
+            }
+        }
         if total_rounds.is_multiple_of(50) {
             let elapsed_s = loop_start.elapsed().as_secs_f64();
             println!(
@@ -2526,6 +2573,10 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
             std::io::Write::flush(&mut std::io::stdout())?;
         }
     }
+    ensure!(
+        total_rounds > 0,
+        "Runner FAIL zero speculative rounds executed"
+    );
 
     let alpha = accepted_count as f64 / total_rounds as f64;
     let mean_b_verify = sum_b_verify as f64 / total_rounds as f64;
