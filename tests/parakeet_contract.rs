@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use flyingfish::{audio::LogMel, parakeet::ParakeetSpec};
+use flyingfish::{audio::LogMel, canary::CanarySpec, parakeet::ParakeetSpec};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,17 @@ fn parakeet_spec_rejects_changed_geometry() -> Result<()> {
             && spec.mel.n_fft == 512
             && spec.mel.hop_length == 160,
         "published Parakeet geometry changed"
+    );
+    let conformer = spec.conformer();
+    ensure!(
+        !conformer.attention_bias
+            && !conformer.convolution_bias
+            && conformer.prefix == "encoder"
+            && conformer.layers == 24
+            && conformer.hidden == 1024
+            && conformer.heads == 8
+            && conformer.conv_kernel == 9,
+        "Parakeet conformer bias or prefix changed"
     );
     let mut root: Value = serde_json::from_str(include_str!("data/parakeet-tdt-config.json"))?;
     let processor = serde_json::from_str(include_str!("data/parakeet-tdt-processor.json"))?;
@@ -119,18 +130,7 @@ fn read_features(path: &Path) -> Result<ReferenceFeatures> {
     })
 }
 
-#[test]
-#[ignore = "external CPU fixtures; set FF_PARAKEET_MODEL, FF_PARAKEET_FIXTURES and FF_PARAKEET_FLOORS"]
-fn parakeet_mel_matches_frozen_reference() -> Result<()> {
-    let model =
-        PathBuf::from(std::env::var_os("FF_PARAKEET_MODEL").context("FF_PARAKEET_MODEL missing")?);
-    let fixtures = PathBuf::from(
-        std::env::var_os("FF_PARAKEET_FIXTURES").context("FF_PARAKEET_FIXTURES missing")?,
-    );
-    let floors: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
-        std::env::var_os("FF_PARAKEET_FLOORS").context("FF_PARAKEET_FLOORS missing")?,
-    ))?)?;
-    let frontend = LogMel::new(ParakeetSpec::read(&model)?.mel)?;
+fn match_mel(frontend: &LogMel, fixtures: &Path, floors: &Value, label: &str) -> Result<()> {
     for case in ["short", "edges", "production"] {
         let path = fixtures.join(format!("{case}.safetensors"));
         let ReferenceFeatures {
@@ -186,7 +186,7 @@ fn parakeet_mel_matches_frozen_reference() -> Result<()> {
             &expected[..4]
         );
         println!(
-            "PARAKEET_MEL case={case} frames={} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound} PASS",
+            "{label}_MEL case={case} frames={} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound} PASS",
             actual.frames
         );
         if case == "short" {
@@ -197,10 +197,101 @@ fn parakeet_mel_matches_frozen_reference() -> Result<()> {
                 "periodic-window control is not discriminating: max_abs={control_max} rmse={control_rmse}"
             );
             println!(
-                "PARAKEET_MEL_CONTROL periodic_hann max_abs={control_max} rmse={control_rmse} PASS"
+                "{label}_MEL_CONTROL periodic_hann max_abs={control_max} rmse={control_rmse} PASS"
             );
         }
     }
-    println!("PASS PARAKEET_MEL cells=3 control=periodic_hann");
+    println!("PASS {label}_MEL cells=3 control=periodic_hann");
     Ok(())
+}
+
+#[test]
+#[ignore = "external CPU fixtures; set FF_PARAKEET_MODEL, FF_PARAKEET_FIXTURES and FF_PARAKEET_FLOORS"]
+fn parakeet_mel_matches_frozen_reference() -> Result<()> {
+    let model =
+        PathBuf::from(std::env::var_os("FF_PARAKEET_MODEL").context("FF_PARAKEET_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_PARAKEET_FIXTURES").context("FF_PARAKEET_FIXTURES missing")?,
+    );
+    let floors: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
+        std::env::var_os("FF_PARAKEET_FLOORS").context("FF_PARAKEET_FLOORS missing")?,
+    ))?)?;
+    let frontend = LogMel::new(ParakeetSpec::read(&model)?.mel)?;
+    match_mel(&frontend, &fixtures, &floors, "PARAKEET")
+}
+
+fn canary_spec_from_data() -> Result<CanarySpec> {
+    CanarySpec::from_json(
+        &serde_json::from_str(include_str!("data/canary-1b-v2-config.json"))?,
+        &serde_json::from_str(include_str!("data/canary-1b-v2-processor.json"))?,
+        &serde_json::from_str(include_str!("data/canary-1b-v2-generation.json"))?,
+    )
+}
+
+#[test]
+fn canary_spec_rejects_changed_geometry() -> Result<()> {
+    let spec = canary_spec_from_data()?;
+    let conformer = spec.conformer();
+    ensure!(
+        [
+            spec.hidden,
+            spec.layers,
+            spec.heads,
+            spec.vocab,
+            spec.decoder_layers
+        ] == [1024, 32, 8, 16384, 8]
+            && spec.mel.n_fft == 512
+            && spec.mel.hop_length == 160
+            && conformer.attention_bias
+            && conformer.convolution_bias
+            && conformer.prefix == "model.encoder"
+            && conformer.layers == 32
+            && conformer.conv_kernel == 9,
+        "published Canary geometry changed"
+    );
+    let mut root: Value = serde_json::from_str(include_str!("data/canary-1b-v2-config.json"))?;
+    let processor = serde_json::from_str(include_str!("data/canary-1b-v2-processor.json"))?;
+    let generation = serde_json::from_str(include_str!("data/canary-1b-v2-generation.json"))?;
+    root["encoder_config"]["num_hidden_layers"] = 24.into();
+    ensure!(
+        CanarySpec::from_json(&root, &processor, &generation).is_err(),
+        "changed encoder layer count accepted"
+    );
+    root["encoder_config"]["num_hidden_layers"] = 32.into();
+    root["architectures"] = serde_json::json!(["ParakeetForTDT"]);
+    ensure!(
+        CanarySpec::from_json(&root, &processor, &generation).is_err(),
+        "changed architecture accepted"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "published checkpoint; set FF_CANARY_MODEL"]
+fn canary_published_tensor_contract() -> Result<()> {
+    let directory =
+        PathBuf::from(std::env::var_os("FF_CANARY_MODEL").context("FF_CANARY_MODEL missing")?);
+    let spec = CanarySpec::read(&directory)?;
+    let tensors =
+        spec.validate_checkpoint(&flyingfish::checkpoint::MappedCheckpoint::open(&directory)?)?;
+    ensure!(tensors == 1507, "published tensor count changed");
+    println!(
+        "PASS CANARY_TENSOR_CONTRACT tensors=1507 dtypes=native shapes=exact tie=proj_out.weight==model.decoder.embed_tokens.weight kept=neither"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "external CPU fixtures; set FF_CANARY_MODEL, FF_CANARY_FIXTURES and FF_CANARY_FLOORS"]
+fn canary_mel_matches_frozen_reference() -> Result<()> {
+    let model =
+        PathBuf::from(std::env::var_os("FF_CANARY_MODEL").context("FF_CANARY_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_CANARY_FIXTURES").context("FF_CANARY_FIXTURES missing")?,
+    );
+    let floors: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
+        std::env::var_os("FF_CANARY_FLOORS").context("FF_CANARY_FLOORS missing")?,
+    ))?)?;
+    let frontend = LogMel::new(CanarySpec::read(&model)?.mel)?;
+    match_mel(&frontend, &fixtures, &floors, "CANARY")
 }
