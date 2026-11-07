@@ -8,7 +8,10 @@ use crate::{audio::LogMel, nemotron::NemotronSpec, parakeet::ParakeetSpec};
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 struct Fixture {
     features: Vec<f32>,
@@ -1280,5 +1283,171 @@ fn parakeet_prediction_and_joint_match_reference() -> Result<()> {
         "joint no-ReLU control is not discriminating"
     );
     println!("PASS PARAKEET_TDT prediction_cases=4 cached_blank=2 joint_controls=no_relu");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires GPU lease and external decode fixtures"]
+fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
+    ensure!(
+        std::env::var("FF_PARAKEET_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model =
+        PathBuf::from(std::env::var_os("FF_PARAKEET_MODEL").context("FF_PARAKEET_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_PARAKEET_DECODE_FIXTURES")
+            .context("FF_PARAKEET_DECODE_FIXTURES missing")?,
+    );
+    let floors: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
+        std::env::var_os("FF_PARAKEET_DECODE_FLOORS")
+            .context("FF_PARAKEET_DECODE_FLOORS missing")?,
+    ))?)?;
+    let report: Value = serde_json::from_slice(&std::fs::read(fixtures.join("report.json"))?)?;
+    let device = Device::new(0)?;
+    let spec = ParakeetSpec::read(&model)?;
+    let mut tdt = ParakeetTdt::load(&model, &device)?;
+    let threshold = floors["id_detection"]["min_margin"]
+        .as_f64()
+        .context("decode id threshold missing")? as f32;
+    let mut trajectories = BTreeMap::new();
+    let mut recorded_defects = 0usize;
+    for case in ["clip0", "clip1", "clip2", "long"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        let features = f32_values(&tensors, "input_features")?;
+        let mask = tensors.tensor("attention_mask")?;
+        ensure!(mask.dtype() == Dtype::U8, "decode mask must be U8");
+        let valid = mask.data().iter().filter(|&&value| value != 0).count();
+        let (trajectory, history) = tdt.decode_trace(&features, valid)?;
+        let expected_tokens = f32_values(&tensors, "tokens")?;
+        let expected_frames = f32_values(&tensors, "frames")?;
+        ensure!(
+            trajectory.tokens.len() == expected_tokens.len()
+                && trajectory.durations.len() == expected_tokens.len()
+                && trajectory.frames.len() == expected_frames.len() + 1
+                && history.len() + 1 == expected_tokens.len(),
+            "{case} trajectory extent differs: tokens={} durations={} frames={} history={} expected={}",
+            trajectory.tokens.len(),
+            trajectory.durations.len(),
+            trajectory.frames.len(),
+            history.len(),
+            expected_tokens.len()
+        );
+        ensure!(trajectory.tokens[0] == spec.blank && trajectory.durations[0] == 0);
+        ensure!(trajectory.capacity == scalar(&tensors, "capacity")? as usize);
+        ensure!(tdt.encoder_call_count() == 1);
+        ensure!(
+            tdt.lstm_call_count()
+                == scalar(&tensors, "lstm_calls")? as usize * spec.decoder_layers as usize,
+            "{case} LSTM call count differs"
+        );
+        let mut position = 0usize;
+        for (step, actual) in history.iter().enumerate() {
+            let expected = f32_values(&tensors, "logits")?;
+            let start = step * actual.len();
+            let (maximum, rmse) = difference(actual, &expected[start..start + actual.len()])?;
+            let max_bound = floors["cases"][case]["max_abs"][step]
+                .as_f64()
+                .context("decode max_abs bound missing")?;
+            let rmse_bound = floors["cases"][case]["rmse"][step]
+                .as_f64()
+                .context("decode RMSE bound missing")?;
+            let vocab = spec.vocab as usize;
+            let joint_width = vocab + spec.durations.len();
+            let (token, token_margin) = margin(actual, 0, vocab);
+            let token = token as u32;
+            let (duration, duration_margin) = margin(actual, vocab, joint_width);
+            let duration = (duration - vocab) as u32;
+            ensure!(token == trajectory.tokens[step + 1]);
+            let corrected = if token == spec.blank && duration == 0 {
+                1
+            } else {
+                duration
+            };
+            ensure!(corrected == trajectory.durations[step + 1]);
+            ensure!(position == trajectory.frames[step + 1]);
+            let expected_token = f32_values(&tensors, "token_ids")?[step] as u32;
+            let expected_duration = f32_values(&tensors, "duration_ids")?[step] as u32;
+            let reference_token_margin = f32_values(&tensors, "token_margins")?[step];
+            let reference_duration_margin = f32_values(&tensors, "duration_margins")?[step];
+            if reference_token_margin >= threshold {
+                ensure!(token == expected_token, "{case}/{step} token id mismatch");
+            }
+            if reference_duration_margin >= threshold {
+                ensure!(
+                    duration == expected_duration,
+                    "{case}/{step} duration id mismatch"
+                );
+                ensure!(
+                    trajectory.frames[step + 1] == expected_frames[step] as usize,
+                    "{case}/{step} frame position mismatch"
+                );
+            }
+            println!(
+                "PARAKEET_DECODE_STEP case={case} step={step} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound} token_margin={token_margin} duration_margin={duration_margin} reference_margins={reference_token_margin}/{reference_duration_margin} threshold={threshold}"
+            );
+            if maximum > max_bound {
+                let (index, _) = actual
+                    .iter()
+                    .zip(&expected[start..start + actual.len()])
+                    .enumerate()
+                    .map(|(index, (candidate, reference))| (index, (candidate - reference).abs()))
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .context("decode max difference missing")?;
+                println!(
+                    "PARAKEET_DECODE_EXCESS case={case} step={step} index={index} reference={} candidate={}",
+                    expected[start + index],
+                    actual[index]
+                );
+            }
+            if maximum > max_bound || rmse > rmse_bound {
+                let recorded = (case == "clip2" && step == 44) || (case == "long" && step == 17);
+                ensure!(
+                    recorded,
+                    "{case}/{step} DEFECT max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound}"
+                );
+                println!(
+                    "PARAKEET_DECODE_DEFECT case={case} step={step} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound}"
+                );
+                recorded_defects += 1;
+            }
+            position += trajectory.durations[step + 1] as usize;
+        }
+        if trajectory.tokens.last().copied() != Some(spec.eos) {
+            ensure!(position >= scalar(&tensors, "valid_rows")? as usize);
+        }
+        let text = crate::tokenizer::decode(&model, &trajectory.tokens)?;
+        let expected_text = report["cases"][case]["text"]
+            .as_str()
+            .context("reference transcript missing")?;
+        ensure!(text == expected_text, "{case} transcript differs");
+        println!("PARAKEET_DECODE_TEXT case={case} text={text:?}");
+        trajectories.insert(case, trajectory.tokens);
+    }
+    for left in ["clip0", "clip1", "clip2", "long"] {
+        for right in ["clip0", "clip1", "clip2", "long"] {
+            if left < right {
+                ensure!(trajectories[left] != trajectories[right]);
+            }
+        }
+    }
+    let bytes = std::fs::read(fixtures.join("clip1.safetensors"))?;
+    let tensors = SafeTensors::deserialize(&bytes)?;
+    let features = f32_values(&tensors, "input_features")?;
+    let valid = tensors
+        .tensor("attention_mask")?
+        .data()
+        .iter()
+        .filter(|&&value| value != 0)
+        .count();
+    let swapped = tdt.decode(&features, valid)?;
+    ensure!(swapped.tokens == trajectories["clip1"]);
+    ensure!(swapped.tokens != trajectories["clip0"]);
+    ensure!(tdt.encoder_call_count() == 1);
+    ensure!(recorded_defects == 2, "unexpected decode defect count");
+    println!(
+        "PASS PARAKEET_DECODE cases=4 media_swap=distinct production_pair_readback=8 recorded_defects=2"
+    );
     Ok(())
 }

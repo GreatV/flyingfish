@@ -304,6 +304,7 @@ pub struct ParakeetSpec {
     pub vocab: u32,
     pub blank: u32,
     pub max_symbols: u32,
+    pub eos: u32,
     pub durations: Vec<u32>,
     pub mel: LogMelConfig,
 }
@@ -428,12 +429,13 @@ impl ParakeetSpec {
         let durations = u32_list(root, "durations")?;
         let decoder_hidden = positive(root, "decoder_hidden_size")?;
         let decoder_layers = positive(root, "num_decoder_layers")?;
+        let max_symbols = positive(root, "max_symbols_per_step")?;
         ensure!(
             vocab == 8193
                 && blank == 8192
                 && decoder_hidden == 640
                 && decoder_layers == 2
-                && positive(root, "max_symbols_per_step")? == 10
+                && max_symbols == 10
                 && durations == [0, 1, 2, 3, 4],
             "unsupported Parakeet TDT decoder geometry"
         );
@@ -476,6 +478,7 @@ impl ParakeetSpec {
         ] {
             equal(generation, key, value)?;
         }
+        let eos = positive(generation, "eos_token_id")?;
         Ok(Self {
             hidden,
             intermediate: 4096,
@@ -490,7 +493,8 @@ impl ParakeetSpec {
             decoder_layers,
             vocab,
             blank,
-            max_symbols: 10,
+            max_symbols,
+            eos,
             durations,
             mel,
         })
