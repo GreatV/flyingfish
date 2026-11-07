@@ -3341,7 +3341,17 @@ mod tests {
                     (intermediate, intermediate),
                     (None, routed_weight),
                 )?;
-                let scratch = stream.alloc_zeros::<u8>(usize::try_from(layout.bytes)?)?;
+                let scratch = stream.alloc_zeros::<u8>(usize::try_from(
+                    crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed_with_boundary(
+                        rows,
+                        rows,
+                        1,
+                        geometry.experts as usize,
+                        hidden,
+                        (intermediate, intermediate),
+                        (None, routed_weight),
+                    )?,
+                )?)?;
                 let boundary = rows == LANE16_ROWS as usize || rows == LANE16_ROWS as usize + 1;
                 let mut arithmetic = vec![true; geometry.experts as usize];
                 if boundary {
