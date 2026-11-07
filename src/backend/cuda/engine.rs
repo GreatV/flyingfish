@@ -1230,19 +1230,29 @@ impl Engine {
         )?;
         let device = Device::new(ordinal)?;
         let (free, total) = device.ctx.mem_get_info()?;
-        let plan = crate::prefill::Plan::new(
-            &config,
+        let kv_bytes = capacity
+            .checked_mul(config.num_hidden_layers * config.kv_dim() * 4)
+            .context("classic dense KV reservation overflow")?;
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
+        let manifest = checkpoint.manifest(&model_spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let fixed_weight_bytes = WeightCatalog::dense_fixed_bytes(&manifest)?;
+        let fixed_transient_bytes = fixed_weight_bytes
+            .checked_add(kv_bytes)
+            .context("classic dense fixed reservation overflow")?;
+        let draft_row_bytes = draft_config
+            .as_ref()
+            .map(|draft| draft.workspace_row_bytes())
+            .transpose()?
+            .unwrap_or(0);
+        let plan = crate::prefill::Plan::new(crate::prefill::WorkspaceRequest {
             capacity,
-            requested_chunk,
-            free,
+            requested: requested_chunk,
+            free_after_resident: free,
             total,
-            Flash::tile(config.head_dim)?,
-            draft_config
-                .as_ref()
-                .map(|draft| draft.workspace_row_bytes())
-                .transpose()?
-                .unwrap_or(0),
-        )?;
+            alignment: Flash::tile(config.head_dim)?,
+            row_bytes: crate::prefill::Plan::classic_row_bytes(&config, draft_row_bytes),
+            fixed_transient_bytes,
+        })?;
         let verify_rows = draft_config
             .as_ref()
             .map(|draft| draft.verify_rows())
@@ -1252,11 +1262,7 @@ impl Engine {
         let transient_bytes = plan
             .row_bytes
             .checked_mul(rows)
-            .and_then(|n| {
-                capacity
-                    .checked_mul(config.num_hidden_layers * config.kv_dim() * 4)
-                    .and_then(|kv| n.checked_add(kv))
-            })
+            .and_then(|n| n.checked_add(kv_bytes))
             .context("classic dense transient reservation overflow")?;
         let mut catalog = WeightCatalog::load_dense(
             dir,
@@ -1507,23 +1513,25 @@ impl Engine {
         self.device.finish_upload()?;
         self.device.stream.synchronize()?;
         let (free, total) = self.device.ctx.mem_get_info()?;
-        let plan = crate::prefill::Plan::new(
-            &self.config,
-            self.capacity,
-            requested_chunk,
-            free,
-            total,
-            Flash::tile(self.config.head_dim)?,
-            self.hidden_capture
+        let draft_row_bytes = self
+            .hidden_capture
+            .as_ref()
+            .map_or(0, |capture| capture.width * 2)
+            + self
+                .spec
                 .as_ref()
-                .map_or(0, |capture| capture.width * 2)
-                + self
-                    .spec
-                    .as_ref()
-                    .map(|spec| spec.draft.config.workspace_row_bytes())
-                    .transpose()?
-                    .unwrap_or(0),
-        )?;
+                .map(|spec| spec.draft.config.workspace_row_bytes())
+                .transpose()?
+                .unwrap_or(0);
+        let plan = crate::prefill::Plan::new(crate::prefill::WorkspaceRequest {
+            capacity: self.capacity,
+            requested: requested_chunk,
+            free_after_resident: free,
+            total,
+            alignment: Flash::tile(self.config.head_dim)?,
+            row_bytes: crate::prefill::Plan::classic_row_bytes(&self.config, draft_row_bytes),
+            fixed_transient_bytes: 0,
+        })?;
         let rows = spec_workspace_rows(
             plan.chunk,
             if cfg!(feature = "cuda") || self.spec.is_some() {

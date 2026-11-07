@@ -2605,6 +2605,20 @@ impl WeightCatalog {
     }
 
     #[cfg(feature = "cuda")]
+    pub(crate) fn dense_fixed_bytes(manifest: &crate::checkpoint::TensorManifest) -> Result<usize> {
+        manifest
+            .entries
+            .values()
+            .filter(|entry| entry.load)
+            .filter(|entry| !(entry.is_linear_projection() && entry.layer.is_some()))
+            .try_fold(0usize, |bytes, entry| {
+                bytes
+                    .checked_add(entry.bytes)
+                    .context("dense fixed weights overflow")
+            })
+    }
+
+    #[cfg(feature = "cuda")]
     pub(crate) fn load_dense(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -2625,7 +2639,7 @@ impl WeightCatalog {
         let mut layers = vec![0usize; spec.layers.len()];
         let mut shard_alignments = BTreeMap::new();
         let mut ranges = Vec::new();
-        let mut fixed = 0usize;
+        let fixed = Self::dense_fixed_bytes(&manifest)?;
         for entry in manifest.entries.values().filter(|e| e.load) {
             if entry.is_linear_projection()
                 && let Some(layer) = entry.layer
@@ -2649,10 +2663,6 @@ impl WeightCatalog {
                     .checked_add(entry.data_offsets[0])
                     .context("dense source offset overflow")?;
                 ranges.push((layer, offset, entry.bytes as u64, alignment));
-            } else {
-                fixed = fixed
-                    .checked_add(entry.bytes)
-                    .context("dense fixed weights overflow")?;
             }
         }
         let (free, total) = d.ctx.mem_get_info()?;
