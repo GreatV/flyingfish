@@ -74,6 +74,10 @@ impl Trace {
         Ok(parts.len())
     }
 
+    /// The recorded tensor names, sorted.
+    pub fn names(&self) -> Vec<&str> {
+        self.tensors.keys().map(|s| s.as_str()).collect()
+    }
     pub fn values(&self, name: &str) -> Result<Vec<f32>> {
         let (_, bytes) = self
             .tensors

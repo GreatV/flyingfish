@@ -632,6 +632,8 @@ pub(crate) static DISABLE_PEER: std::sync::atomic::AtomicBool =
 #[cfg(feature = "cuda")]
 mod q38_tests;
 
+#[cfg(all(test, feature = "cuda"))]
+mod clef_flash_gates;
 #[cfg(test)]
 mod diffusion_ops_tests;
 #[cfg(test)]

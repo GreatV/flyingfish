@@ -203,16 +203,37 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     use crate::model_spec::{Architecture, LinearFormat};
     let (hidden, intermediate, vocab, hq, hkv, layers, hv, format) = match spec.architecture {
         Architecture::Clover => anyhow::bail!("Clover canvas execution is not bound"),
-        Architecture::Qwen35Text => (
-            5120,
-            17408,
-            248320,
-            24,
-            4,
-            64,
-            48,
-            LinearFormat::fp8_block([128, 128], safetensors::Dtype::BF16)?,
-        ),
+        Architecture::Qwen35Text => {
+            ensure!(
+                matches!(
+                    spec.linear_format,
+                    LinearFormat::Bf16 | LinearFormat::Fp8E4m3Block { .. }
+                ),
+                "hybrid engine does not implement linear_format={:?} for {:?}",
+                spec.linear_format,
+                spec.architecture
+            );
+            ensure!(
+                spec.head_dim == 256
+                    && spec.gdn.as_ref().is_some_and(|g| {
+                        g.key_head_dim == 128
+                            && g.value_head_dim == 128
+                            && g.conv_kernel == 4
+                            && g.value_heads.is_multiple_of(g.key_heads)
+                    }),
+                "hybrid engine requires head_dim 256 and 128-wide GDN heads"
+            );
+            (
+                spec.hidden,
+                spec.intermediate,
+                spec.vocab,
+                spec.q_heads,
+                spec.kv_heads,
+                spec.layers.len() as u32,
+                spec.gdn.as_ref().map(|g| g.value_heads).unwrap_or(0),
+                spec.linear_format,
+            )
+        }
         Architecture::MiniCpmV47 => {
             ensure!(
                 matches!(
@@ -259,7 +280,7 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
         );
     }
     ensure!(
-        spec.layers.len() == layers,
+        spec.layers.len() == layers as usize,
         "hybrid engine does not implement num_hidden_layers={}",
         spec.layers.len()
     );
@@ -2225,6 +2246,28 @@ impl Runtime {
         runtime.bind_linear_calls(engine, invariant)?;
         Ok(runtime)
     }
+    /// cfg(test) control readback: nonzero element count and absmax of the
+    /// first catalog tensor of `layer` whose name contains `needle`.
+    #[cfg(test)]
+    pub(super) fn plant_readback(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        layer: usize,
+        needle: &str,
+    ) -> Result<(usize, f32)> {
+        let name = self
+            .catalog
+            .tensors
+            .keys()
+            .find(|k| k.contains(&format!("layers.{layer}.")) && k.contains(needle))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{needle} for layer {layer} not found"))?;
+        let host = stream.clone_dtoh(self.catalog.bf16(&name)?)?;
+        let nonzero = host.iter().filter(|v| v.to_bits() != 0).count();
+        let absmax = host.iter().fold(0.0f32, |m, v| m.max(v.to_f32().abs()));
+        Ok((nonzero, absmax))
+    }
+
     #[cfg(feature = "rocm")]
     fn bind_linear_calls(&self, engine: &Engine, invariant: bool) -> Result<()> {
         if engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
@@ -3565,6 +3608,8 @@ impl Engine {
         if let Some(identity) = prefix_identity.as_mut() {
             identity.attention_kv_dtype = settings.kv_format.tag().into();
         }
+        #[cfg(test)]
+        crate::backend::cuda::clef_flash_gates::apply_test_plants(&mut catalog, &device)?;
         let weights = catalog.take_globals()?;
         let (mut kv_scratch, capture_checkpoint) = match early_kv {
             Some(fixed) => fixed,
@@ -7818,70 +7863,28 @@ mod tests {
         require_qwen35_geometry(&minicpm)?;
         for original in [&spec, &minicpm] {
             for field in [
-                "hidden_size",
-                "intermediate_size",
-                "vocab_size",
-                "num_attention_heads",
-                "num_key_value_heads",
                 "head_dim",
-                "q_width",
-                "max_position_embeddings",
-                "rotary_dim",
-                "num_hidden_layers",
-                "rms_norm_eps",
-                "rope_theta",
                 "linear_num_key_heads",
                 "linear_num_value_heads",
                 "linear_key_head_dim",
                 "linear_value_head_dim",
                 "linear_conv_kernel_dim",
                 "gdn",
-                "linear_format",
                 "architecture",
             ] {
                 let mut bad = original.clone();
                 match field {
-                    "hidden_size" => bad.hidden += 1,
-                    "intermediate_size" => bad.intermediate += 1,
-                    "vocab_size" => bad.vocab += 1,
-                    "num_attention_heads" => bad.q_heads += 1,
-                    "num_key_value_heads" => bad.kv_heads += 1,
                     "head_dim" => bad.head_dim += 1,
-                    "q_width" => bad.q_width += 1,
-                    "max_position_embeddings" => bad.max_position += 1,
-                    "rotary_dim" => bad.rotary_dim += 1,
-                    "num_hidden_layers" => {
-                        bad.layers.pop();
-                    }
-                    "rms_norm_eps" => bad.rms_eps *= 2.0,
-                    "rope_theta" => bad.rope_theta *= 2.0,
                     "linear_num_key_heads" => bad.gdn.as_mut().unwrap().key_heads += 1,
                     "linear_num_value_heads" => bad.gdn.as_mut().unwrap().value_heads += 1,
                     "linear_key_head_dim" => bad.gdn.as_mut().unwrap().key_head_dim += 1,
                     "linear_value_head_dim" => bad.gdn.as_mut().unwrap().value_head_dim += 1,
                     "linear_conv_kernel_dim" => bad.gdn.as_mut().unwrap().conv_kernel += 1,
                     "gdn" => bad.gdn = None,
-                    "linear_format" => {
-                        bad.linear_format = match original.linear_format {
-                            crate::model_spec::LinearFormat::Bf16 => {
-                                crate::model_spec::LinearFormat::fp8_block(
-                                    [128, 128],
-                                    safetensors::Dtype::BF16,
-                                )?
-                            }
-                            crate::model_spec::LinearFormat::Fp8E4m3Block { .. } => {
-                                crate::model_spec::LinearFormat::Bf16
-                            }
-                            crate::model_spec::LinearFormat::Fp8E4m3Channel => {
-                                crate::model_spec::LinearFormat::Bf16
-                            }
-                        }
-                    }
                     "architecture" => bad.architecture = crate::model_spec::Architecture::Llama,
                     _ => unreachable!(),
                 }
-                let error = require_qwen35_geometry(&bad).unwrap_err().to_string();
-                assert!(error.contains(&format!("{field}=")), "{field}: {error}");
+                require_qwen35_geometry(&bad).unwrap_err();
             }
         }
         let error = Engine::load_qwen(

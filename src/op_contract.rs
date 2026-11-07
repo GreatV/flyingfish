@@ -132,6 +132,7 @@ impl FullAttentionSpec {
         match (self.hq, self.hkv) {
             (24, 4) => Ok("tcmqa_d256"),
             (16, 2) => Ok("tcmqa_d256_q16_kv2"),
+            (16, 4) => Ok("tcmqa_d256_q16_kv4"),
             (8, 2) => Ok("tcmqa_d256_q8_kv2"),
             _ => anyhow::bail!("unsupported attention hq={} hkv={}", self.hq, self.hkv),
         }
@@ -152,7 +153,7 @@ impl FullAttentionSpec {
         ensure!(
             matches!(
                 (self.hq, self.hkv, self.rotary_dim),
-                (24, 4, 64) | (16, 2, 64) | (8, 2, 256)
+                (24, 4, 64) | (16, 2, 64) | (16, 4, 64) | (8, 2, 256)
             ) && self.d == 256
                 && self.scale == 0.0625
                 && self.rms_eps == 1e-6
@@ -585,7 +586,7 @@ mod tests {
         );
         let unsupported = FullAttentionSpec {
             hq: 16,
-            hkv: 4,
+            hkv: 8,
             ..attention
         };
         assert!(
@@ -593,7 +594,7 @@ mod tests {
                 .kernel_module()
                 .unwrap_err()
                 .to_string()
-                .contains("hq=16 hkv=4")
+                .contains("hq=16 hkv=8")
         );
         assert_eq!(
             (attention.hq, attention.hkv, changed.conv_dim()?),
@@ -629,7 +630,7 @@ mod tests {
             }
         }
         let unsupported = FullAttentionSpec {
-            hkv: 4,
+            hkv: 8,
             hq: 16,
             ..FullAttentionSpec::q38()
         };

@@ -308,6 +308,10 @@ fn build_rocm(out: &std::path::Path) {
                     &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],
                 ),
                 (
+                    "_q16_kv4",
+                    &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=4"],
+                ),
+                (
                     "_q8_kv2",
                     &[
                         "-DATTENTION_Q_HEADS=8",
@@ -583,6 +587,10 @@ fn main() {
                 (
                     "_q16_kv2",
                     &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],
+                ),
+                (
+                    "_q16_kv4",
+                    &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=4"],
                 ),
                 (
                     "_q8_kv2",

@@ -464,19 +464,55 @@ impl MappedCheckpoint {
                     shape: Vec<usize>,
                 }
                 // The closed-world skipped-tensor manifest is a required build input.
+                let declared_mtp_layers = spec.mtp_layers;
+                // The merger's output projection feeds the text hidden size:
+                // its shapes derive from the spec, not the frozen file.
+                put(
+                    &mut expected,
+                    "model.visual.merger.linear_fc2.weight".into(),
+                    Dtype::BF16,
+                    vec![spec.hidden as usize, 4608],
+                    TensorScope::Vision,
+                );
+                put(
+                    &mut expected,
+                    "model.visual.merger.linear_fc2.bias".into(),
+                    Dtype::BF16,
+                    vec![spec.hidden as usize],
+                    TensorScope::Vision,
+                );
                 for item in serde_json::from_str::<Vec<Skipped>>(include_str!(
                     "checkpoint/q38_skipped.json"
                 ))? {
-                    let scope = if item.name.starts_with("mtp.") {
-                        TensorScope::Mtp
+                    if item.name.starts_with("mtp.") {
+                        // The MTP skip set exists only when the publisher
+                        // declares the decoder. Undeclared entries are
+                        // omitted; the census still fails loudly if the
+                        // checkpoint ships them (unexpected) or omits
+                        // declared ones (missing).
+                        if declared_mtp_layers == 0 {
+                            continue;
+                        }
+                        put(
+                            &mut expected,
+                            item.name,
+                            item.dtype,
+                            item.shape,
+                            TensorScope::Mtp,
+                        );
                     } else {
                         ensure!(
                             item.name.starts_with("model.visual."),
                             "unknown non-text scope"
                         );
-                        TensorScope::Vision
-                    };
-                    put(&mut expected, item.name, item.dtype, item.shape, scope);
+                        put(
+                            &mut expected,
+                            item.name,
+                            item.dtype,
+                            item.shape,
+                            TensorScope::Vision,
+                        );
+                    }
                 }
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,

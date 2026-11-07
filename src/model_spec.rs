@@ -496,6 +496,8 @@ pub struct ModelSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion: Option<DiffusionConfig>,
     #[serde(default)]
+    /// Declared MTP decoder layers; 0 when the checkpoint ships none.
+    pub mtp_layers: u32,
     pub vision: Option<VisionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioConfig>,
@@ -809,9 +811,8 @@ impl VisionConfig {
                         self.patch,
                         self.temporal_patch,
                         self.merge,
-                        self.output,
                         self.position_side
-                    ] == [27, 1152, 16, 4304, 3, 16, 2, 2, 5120, 48],
+                    ] == [27, 1152, 16, 4304, 3, 16, 2, 2, 48],
                     "unsupported Q38 vision geometry"
                 );
                 ensure!(
@@ -965,7 +966,9 @@ impl VisionConfig {
             return Ok(None);
         };
         match v.get("model_type").and_then(Value::as_str) {
-            Some("qwen3_5") => Self::qwen_from_root(root, v, Architecture::Qwen35Text).map(Some),
+            Some("qwen3_5" | "qwen3_5_vision") => {
+                Self::qwen_from_root(root, v, Architecture::Qwen35Text).map(Some)
+            }
             Some("qwen3_vl") => Self::qwen_from_root(root, v, Architecture::Qwen3Vl).map(Some),
             Some("minicpmv4_7_vision") => Self::minicpm_from_root(root, v).map(Some),
             Some("gemma4_vision") => Self::axial_from_root(root, v).map(Some),
@@ -1102,6 +1105,15 @@ impl VisionConfig {
 
     fn qwen_from_root(root: &Value, v: &Value, architecture: Architecture) -> Result<Self> {
         equal(v, "hidden_act", "gelu_pytorch_tanh".into())?;
+        let text_hidden = integer(
+            root.get("text_config").context("missing text_config")?,
+            "hidden_size",
+        )?;
+        ensure!(
+            integer(v, "out_hidden_size")? == text_hidden,
+            "vision out_hidden_size does not feed the text hidden size: {} vs {text_hidden}",
+            integer(v, "out_hidden_size")?
+        );
         let (deepstack, mrope_section) = if architecture == Architecture::Qwen3Vl {
             let rope = root
                 .get("text_config")
@@ -2003,6 +2015,7 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
             layers: (0..u(c.num_hidden_layers)?)
@@ -2135,6 +2148,7 @@ impl ModelSpec {
             per_layer_input: None,
             audio: None,
             vision: None,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
         })
@@ -2272,6 +2286,7 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
             vision: None,
@@ -2535,6 +2550,7 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
             layers: (0..positive(t, "num_hidden_layers")?)
@@ -2776,6 +2792,7 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
             vision: None,
@@ -3094,6 +3111,7 @@ impl ModelSpec {
             per_layer_input: (ple != 0).then_some(ple),
             audio: AudioConfig::from_root(root)?,
             vision: VisionConfig::from_root(root)?,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
         })
@@ -3334,6 +3352,7 @@ impl ModelSpec {
         Ok(Self {
             abi_version: 1,
             architecture: Architecture::DiffusionGemma,
+            mtp_layers: 0,
             hidden,
             intermediate: base,
             vocab: 262_144,
@@ -3561,6 +3580,7 @@ impl ModelSpec {
             per_layer_input: Some(512),
             vision: VisionConfig::from_root(root)?,
             audio: AudioConfig::from_root(root)?,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
         })
@@ -3949,6 +3969,7 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
             vision: None,
@@ -4375,6 +4396,7 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            mtp_layers: 0,
             canvas_length: None,
             diffusion: None,
             vision: None,
@@ -4394,7 +4416,16 @@ impl ModelSpec {
             .filter(|x| !x.is_null())
             .or_else(|| t.get("eos_token_id"))
             .context("missing EOS")?;
+        let mtp_layers = match t.get("mtp_num_hidden_layers") {
+            Some(n) => {
+                let layers = n.as_u64().context("mtp_num_hidden_layers type")?;
+                ensure!(layers <= 1, "unsupported mtp_num_hidden_layers {layers}");
+                layers as u32
+            }
+            None => 0,
+        };
         Ok(Self {
+            mtp_layers,
             abi_version: 1,
             architecture,
             hidden: text.hidden,
@@ -4428,6 +4459,34 @@ impl ModelSpec {
 
 #[cfg(test)]
 mod diffusion_rope_tests {
+
+    /// The Qwen3.5 tower's out_hidden_size must equal the text hidden size
+    /// it feeds (derivation, not a pin): a mismatching tower is rejected,
+    /// a matching one is accepted alongside the Qwen3.8 tower.
+    #[test]
+    fn qwen35_vision_output_feeds_the_text_hidden() {
+        let tower = |out_hidden: u32| {
+            serde_json::json!({
+                "text_config": {"hidden_size": 4096u32, "head_dim": 256u32},
+                "image_token_id": 248056u32, "video_token_id": 248057u32,
+                "vision_start_token_id": 248053u32, "vision_end_token_id": 248054u32,
+                "vision_config": {
+                    "model_type": "qwen3_5_vision",
+                    "hidden_act": "gelu_pytorch_tanh",
+                    "num_position_embeddings": 2304u32,
+                    "depth": 27u32, "hidden_size": 1152u32, "num_heads": 16u32,
+                    "intermediate_size": 4304u32, "in_channels": 3u32,
+                    "patch_size": 16u32, "temporal_patch_size": 2u32,
+                    "spatial_merge_size": 2u32, "out_hidden_size": out_hidden,
+                    "deepstack_visual_indexes": []
+                }
+            })
+        };
+        let good = VisionConfig::from_root(&tower(4096)).expect("matching tower rejected");
+        assert_eq!(good.expect("vision missing").output, 4096);
+        let bad = VisionConfig::from_root(&tower(5120));
+        assert!(bad.is_err(), "mismatching tower accepted");
+    }
     use super::*;
 
     #[test]
