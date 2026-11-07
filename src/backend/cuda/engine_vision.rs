@@ -4797,7 +4797,7 @@ impl<T: DinoScalar> DinoEncoder<T> {
             feature1: s.alloc_zeros(if clip { hu } else { rows_u * hu })?,
             flash_d64: {
                 let (free, total) = device.ctx.mem_get_info()?;
-                let budget = free.min(22_000_000_000).saturating_sub(total / 16);
+                let budget = device.workspace_budget(free, total, total / 16)?;
                 T::attention_setup(s, [rows, heads, head_dim], budget)?
             },
             completed_encodes: 0,
@@ -6561,6 +6561,34 @@ struct NafWorkspace {
 }
 
 #[cfg(feature = "cuda")]
+impl NafWorkspace {
+    fn plan(dimensions: [u32; 3], free_budget: usize) -> Result<(usize, u32)> {
+        let [image_side, output_side, source_side] = dimensions;
+        ensure!(
+            image_side >= 2
+                && output_side > 0
+                && source_side >= 9
+                && output_side.is_multiple_of(source_side)
+                && image_side <= 4 * output_side,
+            "NAF unsupported image/output/source geometry"
+        );
+        let pixels = image_side as usize * image_side as usize;
+        let target = output_side as usize * output_side as usize;
+        let source = source_side as usize * source_side as usize;
+        let fixed = 4 * (pixels * 256 + target * (256 + 1024 + 64) + source * 256);
+        let available = free_budget
+            .checked_sub(fixed)
+            .context("NAF fixed workspace exceeds remaining device budget")?;
+        let conv_rows = ((available / (128 * 9 * 4)).min(pixels).min(32768) / 4 * 4) as u32;
+        ensure!(
+            conv_rows > 0,
+            "NAF convolution workspace has no row capacity"
+        );
+        Ok((fixed + conv_rows as usize * 128 * 9 * 4, conv_rows))
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl NafEncoder {
     fn load(device: &Device, dir: &std::path::Path) -> Result<Self> {
         let checkpoint =
@@ -6657,26 +6685,10 @@ impl NafEncoder {
         free_budget: usize,
     ) -> Result<NafWorkspace> {
         let [image_side, output_side, source_side] = dimensions;
-        ensure!(
-            image_side >= 2
-                && output_side > 0
-                && source_side >= 9
-                && output_side.is_multiple_of(source_side)
-                && image_side <= 4 * output_side,
-            "NAF unsupported image/output/source geometry"
-        );
         let pixels = image_side as usize * image_side as usize;
         let target = output_side as usize * output_side as usize;
         let source = source_side as usize * source_side as usize;
-        let fixed = 4 * (pixels * 256 + target * (256 + 1024 + 64) + source * 256);
-        let available = free_budget
-            .checked_sub(fixed)
-            .context("NAF fixed workspace exceeds remaining device budget")?;
-        let conv_rows = ((available / (128 * 9 * 4)).min(pixels).min(32768) / 4 * 4) as u32;
-        ensure!(
-            conv_rows > 0,
-            "NAF convolution workspace has no row capacity"
-        );
+        let (planned, conv_rows) = NafWorkspace::plan(dimensions, free_budget)?;
         let mut table = Vec::with_capacity(target * 64);
         for y in 0..output_side {
             for x in 0..output_side {
@@ -6695,7 +6707,7 @@ impl NafEncoder {
             }
         }
         let s = &device.stream;
-        Ok(NafWorkspace {
+        let workspace = NafWorkspace {
             image_side,
             output_side,
             source_side,
@@ -6708,7 +6720,21 @@ impl NafEncoder {
             keys: s.alloc_zeros(source * 256)?,
             output: s.alloc_zeros(target * 1024)?,
             rope_table: s.clone_htod(&table)?,
-        })
+        };
+        let allocated = [
+            workspace.columns.len(),
+            workspace.a.len(),
+            workspace.b.len(),
+            workspace.guide.len(),
+            workspace.keys.len(),
+            workspace.output.len(),
+            workspace.rope_table.len(),
+        ]
+        .into_iter()
+        .sum::<usize>()
+            * size_of::<f32>();
+        ensure!(allocated == planned, "NAF workspace plan mismatch");
+        Ok(workspace)
     }
 
     fn convolve(
@@ -7102,7 +7128,7 @@ impl Hi3DImageConditioner {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 #[cfg(feature = "cuda")]
 pub struct PixalConditioningShape {
     pub image_side: u32,
@@ -7111,7 +7137,7 @@ pub struct PixalConditioningShape {
 }
 
 /// World-to-camera matrix on the rotated XYZ grid, horizontal FOV in radians, and mesh scale.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 #[cfg(feature = "cuda")]
 pub struct ProjectionCamera {
     pub world_to_camera: [f32; 12],
@@ -7120,7 +7146,37 @@ pub struct ProjectionCamera {
 }
 
 #[cfg(feature = "cuda")]
+pub struct ProjectedConditioning {
+    request: std::rc::Rc<()>,
+    coordinates: Vec<[i32; 3]>,
+    shape: PixalConditioningShape,
+    views: Vec<ProjectionCamera>,
+    global: CudaSlice<f32>,
+    projection: CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl ProjectedConditioning {
+    pub(crate) fn binding(
+        &self,
+        coordinates: &[[i32; 3]],
+        shape: PixalConditioningShape,
+        request: &std::rc::Rc<()>,
+        views: &[ProjectionCamera],
+    ) -> Result<(&CudaSlice<f32>, &CudaSlice<f32>)> {
+        super::super::pixal3d::validate_projection_binding(
+            [&self.request, request],
+            [&self.coordinates, coordinates],
+            [self.shape, shape],
+            [&self.views, views],
+        )?;
+        Ok((&self.global, &self.projection))
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub struct PixalConditioningRuntime {
+    request: std::rc::Rc<()>,
     dino: DinoEncoder<f32>,
     dino_ws: DinoWorkspace<f32>,
     naf: Option<(NafEncoder, NafWorkspace)>,
@@ -7129,27 +7185,91 @@ pub struct PixalConditioningRuntime {
     camera: CudaSlice<f32>,
     global: CudaSlice<f32>,
     projection: CudaSlice<f32>,
+    coordinates: Option<(Vec<[i32; 3]>, CudaSlice<i32>)>,
     project: CudaFunction,
     focal: CudaFunction,
     accumulate: CudaFunction,
     projection_rows: u32,
     channels: u32,
-    staged: bool,
+    staged: Option<ProjectionCamera>,
+    views: Vec<ProjectionCamera>,
     views_accumulated: u32,
+    view_count: u32,
+    ready: bool,
     pub allocated_bytes: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl PixalConditioningRuntime {
+    pub(crate) fn planned_bytes(
+        dino_dir: &std::path::Path,
+        naf_dir: Option<&std::path::Path>,
+        shape: PixalConditioningShape,
+        projection_rows: usize,
+    ) -> Result<usize> {
+        let cfg = VisionEncoderConfig::from_dir(dino_dir)?;
+        let rows = cfg.total_rows(shape.image_side)?;
+        let attention = crate::backend::cuda::flash::F32Attention::required_bytes([
+            cfg.num_attention_heads,
+            rows,
+            rows,
+            cfg.head_dim(),
+            cfg.head_dim(),
+        ])?;
+        let naf = if let (Some(side), Some(dir)) = (shape.naf_side, naf_dir) {
+            let mapped =
+                crate::checkpoint::MappedCheckpoint::open_component(dir, "naf_release.pth")?;
+            let weights = mapped.index.weight_map.keys().try_fold(0usize, |n, name| {
+                n.checked_add(mapped.tensor(name)?.data().len())
+                    .context("NAF weight bytes overflow")
+            })?;
+            weights
+                .checked_add(
+                    NafWorkspace::plan(
+                        [shape.image_side, side, shape.image_side / 16],
+                        usize::MAX,
+                    )?
+                    .0,
+                )
+                .context("NAF planned bytes overflow")?
+        } else {
+            ensure!(
+                shape.naf_side.is_none() && naf_dir.is_none(),
+                "NAF plan geometry/checkpoint mismatch"
+            );
+            0
+        };
+        let channels = if shape.naf_side.is_some() { 2048 } else { 1024 };
+        [
+            cfg.expected_loaded_elements()
+                .checked_mul(4)
+                .context("encoder weight size overflow")?,
+            cfg.workspace_bytes(shape.image_side)?,
+            attention,
+            naf,
+            shape.image_side as usize * shape.image_side as usize * 3 * 4,
+            15 * 4 + 5 * 1024 * 4,
+            projection_rows
+                .checked_mul(channels * 4 + 3 * 4)
+                .context("projection plan overflow")?,
+        ]
+        .into_iter()
+        .try_fold(0usize, |n, v| {
+            n.checked_add(v).context("conditioning plan overflow")
+        })
+    }
     pub fn load(
         device: &Device,
         blas: &mut Blas,
         dino_dir: &std::path::Path,
         naf_dir: Option<&std::path::Path>,
         shape: PixalConditioningShape,
+        coordinates: Option<&[[i32; 3]]>,
+        request: &std::rc::Rc<()>,
     ) -> Result<Self> {
         ensure!(
-            matches!(shape.image_side, 512 | 1024) && matches!(shape.grid_side, 16 | 32 | 64 | 96),
+            matches!(shape.image_side, 512 | 1024)
+                && matches!(shape.grid_side, 16 | 32 | 64 | 72 | 80 | 88 | 96),
             "unsupported Pixal conditioning shape"
         );
         ensure!(
@@ -7170,12 +7290,62 @@ impl PixalConditioningRuntime {
             "Pixal conditioning requires ViT-L/16 with four registers and GELU"
         );
         let (free_before, total) = device.ctx.mem_get_info()?;
-        let resident = total - free_before;
-        let capacity = 22_000_000_000usize.min(total.saturating_sub(total / 16));
-        ensure!(
-            resident < capacity,
-            "Pixal setup device budget exhausted before load"
-        );
+        let capacity = device.workspace_budget(free_before, total, total / 16)?;
+        let channels = if shape.naf_side.is_some() { 2048 } else { 1024 };
+        let projection_rows = if let Some(coordinates) = coordinates {
+            ensure!(
+                !coordinates.is_empty()
+                    && coordinates
+                        .iter()
+                        .flatten()
+                        .all(|&v| v >= 0 && v < shape.grid_side as i32)
+                    && coordinates
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        == coordinates.len(),
+                "invalid indexed projection coordinates"
+            );
+            u32::try_from(coordinates.len())?
+        } else {
+            shape.grid_side.pow(3)
+        };
+        let side = shape.grid_side as usize;
+        let indexed = coordinates.is_some_and(|rows| {
+            rows.len() != side.pow(3)
+                || rows.iter().enumerate().any(|(i, p)| {
+                    *p != [
+                        (i / (side * side)) as i32,
+                        ((i / side) % side) as i32,
+                        (i % side) as i32,
+                    ]
+                })
+        });
+        let projection_bytes = (projection_rows as usize)
+            .checked_mul(channels as usize * size_of::<f32>())
+            .context("projection size overflow")?;
+        let reserve = shape.image_side as usize * shape.image_side as usize * 3 * 4
+            + 15 * 4
+            + 5 * 1024 * 4
+            + if indexed {
+                coordinates.map_or(0, std::mem::size_of_val)
+            } else {
+                0
+            };
+        let live = projection_bytes
+            .checked_add(reserve)
+            .context("conditioning workspace size overflow")?;
+        let encoder = cfg
+            .expected_loaded_elements()
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(cfg.workspace_bytes(shape.image_side).ok()?))
+            .context("conditioning encoder size overflow")?;
+        device.workspace_budget(
+            free_before,
+            capacity,
+            live.checked_add(encoder)
+                .context("conditioning setup size overflow")?,
+        )?;
         let file = std::fs::File::open(dino_dir.join("model.safetensors"))?;
         let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let (dino, dino_ws) = DinoEncoder::<f32>::load(
@@ -7188,39 +7358,44 @@ impl PixalConditioningRuntime {
             false,
         )?;
         let s = &device.stream;
-        let channels = if shape.naf_side.is_some() { 2048 } else { 1024 };
-        let projection_rows = shape.grid_side.pow(3);
-        let projection_bytes = projection_rows as usize * channels as usize * 4;
-        let (free, _) = device.ctx.mem_get_info()?;
-        let reserve =
-            shape.image_side as usize * shape.image_side as usize * 3 * 4 + 15 * 4 + 5 * 1024 * 4;
-        ensure!(
-            projection_bytes + reserve <= capacity.saturating_sub(total - free),
-            "Pixal projection workspace exceeds 22 GB device budget"
-        );
+        device.workspace_budget(free_before, capacity, live)?;
         let projection = s.alloc_zeros(projection_rows as usize * channels as usize)?;
         let image = s.alloc_zeros(shape.image_side as usize * shape.image_side as usize * 3)?;
         let camera = s.alloc_zeros(15)?;
         let global = s.alloc_zeros(5 * 1024)?;
+        let coordinates = coordinates
+            .map(|rows| -> Result<_> {
+                Ok((
+                    rows.to_vec(),
+                    if indexed {
+                        s.clone_htod(rows.as_flattened())?
+                    } else {
+                        s.alloc_zeros(0)?
+                    },
+                ))
+            })
+            .transpose()?;
         let naf = if let (Some(side), Some(dir)) = (shape.naf_side, naf_dir) {
             let encoder = NafEncoder::load(device, dir)?;
-            let (free, _) = device.ctx.mem_get_info()?;
             let ws = encoder.workspace(
                 device,
                 [shape.image_side, side, shape.image_side / 16],
-                capacity.saturating_sub(total - free),
+                device.workspace_budget(free_before, capacity, 0)?,
             )?;
             Some((encoder, ws))
         } else {
             None
         };
         let module = cubin::module(&device.ctx, "vision_ops")?;
+        device.workspace_budget(free_before, capacity, 0)?;
         let (free_after, _) = device.ctx.mem_get_info()?;
-        ensure!(
-            total - free_after <= capacity,
-            "Pixal setup exceeded derived device capacity"
-        );
+        let project = module.load_function(if indexed {
+            "project_bilinear_indexed_f32"
+        } else {
+            "project_bilinear_f32"
+        })?;
         Ok(Self {
+            request: request.clone(),
             dino,
             dino_ws,
             naf,
@@ -7229,13 +7404,17 @@ impl PixalConditioningRuntime {
             camera,
             global,
             projection,
-            project: module.load_function("project_bilinear_f32")?,
+            coordinates,
+            project,
             focal: module.load_function("perspective_focal_f32")?,
             accumulate: module.load_function("accumulate_mean_f32")?,
             projection_rows,
             channels,
-            staged: false,
+            staged: None,
+            views: Vec::new(),
             views_accumulated: 0,
+            view_count: 0,
+            ready: false,
             allocated_bytes: free_before.saturating_sub(free_after),
         })
     }
@@ -7324,6 +7503,10 @@ impl PixalConditioningRuntime {
         image: &[f32],
         camera: ProjectionCamera,
     ) -> Result<()> {
+        ensure!(
+            s.as_ref() == self.image.stream().as_ref(),
+            "conditioning staging stream differs from setup"
+        );
         let side = self.shape.image_side as usize;
         ensure!(
             image.len() == side * side * 3
@@ -7355,7 +7538,8 @@ impl PixalConditioningRuntime {
                 .arg(&self.camera)
                 .launch(grid(1, 1))?;
         }
-        self.staged = true;
+        self.staged = Some(camera);
+        self.ready = false;
         Ok(())
     }
 
@@ -7376,10 +7560,19 @@ impl PixalConditioningRuntime {
         for first in (0..self.projection_rows).step_by(chunk as usize) {
             let rows = chunk.min(self.projection_rows - first);
             unsafe {
-                s.launch_builder(&self.project)
+                let mut launch = s.launch_builder(&self.project);
+                launch
                     .arg(&input.ptr)
                     .arg(&self.projection)
-                    .arg(&self.camera)
+                    .arg(&self.camera);
+                if let Some((_, coordinates)) = self
+                    .coordinates
+                    .as_ref()
+                    .filter(|(_, data)| !data.is_empty())
+                {
+                    launch.arg(coordinates);
+                }
+                launch
                     .arg(&self.shape.grid_side)
                     .arg(&side)
                     .arg(&side)
@@ -7408,19 +7601,42 @@ impl PixalConditioningRuntime {
         view_count: u32,
     ) -> Result<()> {
         ensure!(
-            self.staged
+            s.as_ref() == self.image.stream().as_ref()
+                && self.staged.is_some()
                 && view_count > 0
                 && view_index < view_count
-                && (view_index == 0 || self.views_accumulated == view_index),
+                && (view_index == 0
+                    || (self.views_accumulated == view_index && self.view_count == view_count)),
             "conditioning view order/input staging"
         );
+        #[cfg(test)]
+        let previous_encodes = self.dino_ws.completed_encodes;
         self.run_device(s, blas, view_index, view_count, self.projection_rows)?;
+        #[cfg(test)]
+        {
+            ensure!(
+                self.dino_ws.completed_encodes == previous_encodes + 1,
+                "media encoder call count"
+            );
+            println!(
+                "P1_M4C_MEDIA PASS grid={} image_side={} view={view_index} views={view_count} encoder_calls=1 naf={}",
+                self.shape.grid_side,
+                self.shape.image_side,
+                self.naf.is_some()
+            );
+        }
+        if view_index == 0 {
+            self.views.clear();
+        }
+        self.views
+            .push(self.staged.take().context("conditioning camera missing")?);
+        self.view_count = view_count;
+        self.ready = view_index + 1 == view_count;
         self.views_accumulated = if view_index + 1 == view_count {
             0
         } else {
             view_index + 1
         };
-        self.staged = false;
         Ok(())
     }
 
@@ -7473,6 +7689,22 @@ impl PixalConditioningRuntime {
     }
     pub fn projection(&self, s: &Arc<CudaStream>) -> Result<Tensor<f32, 2>> {
         dense(&self.projection, s, [self.projection_rows, self.channels])
+    }
+
+    pub fn finish(self) -> Result<ProjectedConditioning> {
+        ensure!(
+            self.ready && self.staged.is_none() && self.views_accumulated == 0,
+            "conditioning views are incomplete"
+        );
+        let (coordinates, _) = self.coordinates.context("indexed conditioning required")?;
+        Ok(ProjectedConditioning {
+            request: self.request,
+            coordinates,
+            shape: self.shape,
+            views: self.views,
+            global: self.global,
+            projection: self.projection,
+        })
     }
 }
 
@@ -13413,6 +13645,267 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA, DINOv3, NAF and frozen single-view fusion captures"]
+    #[cfg(feature = "cuda")]
+    fn pixal_multiview_one_hr_texture_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use sha2::{Digest, Sha256};
+        use std::{path::PathBuf, rc::Rc};
+        let freeze_path =
+            PathBuf::from(std::env::var_os("FF_PIXAL_M4C_FREEZE").context("FF_PIXAL_M4C_FREEZE")?);
+        let bytes = std::fs::read(&freeze_path)?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes))
+                == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
+            "M4c freeze integrity"
+        );
+        let freeze: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let cells = freeze["mv1_conditioning"]["cells"]
+            .as_array()
+            .context("MV1 cells")?;
+        ensure!(cells.len() == 4, "MV1 coverage");
+        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
+        let naf = PathBuf::from(std::env::var_os("FF_NAF_MODEL").context("FF_NAF_MODEL")?);
+        let runtime_dir = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
+        );
+        let input_file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
+        let input_map = unsafe { memmap2::MmapOptions::new().map(&input_file)? };
+        let inputs = safetensors::SafeTensors::deserialize(&input_map)?;
+        let matrices = read_f32_tensor(&inputs, "mv-world-to-camera")?;
+        let angles = read_f32_tensor(&inputs, "mv-angle")?;
+        let camera = ProjectionCamera {
+            world_to_camera: matrices[..12].try_into()?,
+            horizontal_fov: angles[0],
+            mesh_scale: read_f32_tensor(&inputs, "mv-mesh-scale")?[0],
+        };
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let mut blas = test_blas(
+            &device,
+            &runtime_dir,
+            Rc::new(Closure::new(false, "Pixal single-view fusion".into())),
+        )?;
+        let coordinates: Vec<_> = (0..64usize.pow(3))
+            .map(|i| [(i / 4096) as i32, ((i / 64) % 64) as i32, (i % 64) as i32])
+            .collect();
+        let mut defects = 0;
+        let mut scored = 0;
+        for (stage, naf_side) in [("shape1024", 512), ("tex1024", 1024)] {
+            let shape = PixalConditioningShape {
+                image_side: 1024,
+                grid_side: 64,
+                naf_side: Some(naf_side),
+            };
+            let request = Rc::new(());
+            let mut native = PixalConditioningRuntime::load(
+                &device,
+                &mut blas,
+                &dino,
+                Some(&naf),
+                shape,
+                Some(&coordinates),
+                &request,
+            )?;
+            for control in [false, true] {
+                let rgba = inputs.tensor(if control {
+                    "robot_crab-rgba"
+                } else {
+                    "mv-0-rgba"
+                })?;
+                native.stage_view_rgba(
+                    s,
+                    rgba.data(),
+                    [rgba.shape()[0], rgba.shape()[1]],
+                    camera,
+                )?;
+                native.run_view(s, &blas, 0, 1)?;
+                for (key, output) in [
+                    ("global", &native.global),
+                    ("projection", &native.projection),
+                ] {
+                    let name = format!("MV1-{stage}-{key}");
+                    let cell = cells
+                        .iter()
+                        .find(|cell| cell["name"] == name)
+                        .context("MV1 frozen cell")?;
+                    let file = std::fs::File::open(
+                        cell["anchor"]["path"].as_str().context("MV1 anchor path")?,
+                    )?;
+                    let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                    let reference = safetensors::SafeTensors::deserialize(&map)?;
+                    let score_cell =
+                        serde_json::json!({"tau":cell["tau"], "control":"wrong_media_same_camera"});
+                    let pass = pixal_score(
+                        s,
+                        output,
+                        reference.tensor(key)?,
+                        &score_cell,
+                        &format!("M4C {name} control={control}"),
+                        false,
+                        control,
+                    )?;
+                    if control {
+                        ensure!(pass, "MV1 media control under 10 tau {name}");
+                    } else {
+                        scored += 1;
+                        defects += usize::from(!pass);
+                    }
+                }
+            }
+            let owned = native.finish()?;
+            owned.binding(&coordinates, shape, &request, &[camera])?;
+        }
+        println!(
+            "P1_M4C_MV1 {} cells={scored} metrics={} controls={scored} defects={defects} eager=true",
+            if defects == 0 { "PASS" } else { "DEFECT" },
+            scored * 2
+        );
+        ensure!(scored == 4 && defects == 0, "MV1 conditioning defect");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA, published DINOv3 and supplied RGBA fixtures"]
+    #[cfg(feature = "cuda")]
+    fn pixal_conditioning_owned_projection_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use std::{path::PathBuf, rc::Rc};
+        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
+        let project = root
+            .parent()
+            .and_then(|p| p.parent())
+            .context("project root")?;
+        let file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let inputs = safetensors::SafeTensors::deserialize(&map)?;
+        let rgba = inputs.tensor("cottage-rgba")?;
+        let camera = pixal_camera(&inputs, project, "cottage")?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
+        );
+        let mut blas = test_blas(
+            &device,
+            &runtime,
+            Rc::new(Closure::new(false, "projected conditioning".into())),
+        )?;
+        let request = Rc::new(());
+        let shape = PixalConditioningShape {
+            image_side: 512,
+            grid_side: 32,
+            naf_side: None,
+        };
+        let mut dense =
+            PixalConditioningRuntime::load(&device, &mut blas, &dino, None, shape, None, &request)?;
+        dense.stage_rgba(s, rgba.data(), [rgba.shape()[0], rgba.shape()[1]], camera)?;
+        dense.run_view(s, &blas, 0, 1)?;
+        ensure!(
+            dense.dino_ws.completed_encodes == 1,
+            "dense media encoder count"
+        );
+        let expected = s.clone_dtoh(&dense.projection)?;
+        let global = s.clone_dtoh(&dense.global)?;
+        let attention_bytes = dense.dino_ws.flash_d64.workspace_bytes();
+        drop(dense);
+        for canonical in [false, true] {
+            let points: Vec<[i32; 3]> = (0..if canonical { 32768 } else { 4099 })
+                .map(|i| {
+                    let index = if canonical { i } else { (i * 37 + 11) % 32768 };
+                    [index / 1024, (index / 32) % 32, index % 32]
+                })
+                .collect();
+            let mut encoder = PixalConditioningRuntime::load(
+                &device,
+                &mut blas,
+                &dino,
+                None,
+                shape,
+                Some(&points),
+                &request,
+            )?;
+            let coordinate_bytes = encoder
+                .coordinates
+                .as_ref()
+                .context("coordinate binding")?
+                .1
+                .num_bytes();
+            ensure!(
+                coordinate_bytes == if canonical { 0 } else { points.len() * 12 },
+                "projection route coordinate allocation"
+            );
+            ensure!(
+                encoder.dino_ws.flash_d64.workspace_bytes() == attention_bytes,
+                "attention tile changed"
+            );
+            encoder.stage_rgba(s, rgba.data(), [rgba.shape()[0], rgba.shape()[1]], camera)?;
+            encoder.run_view(s, &blas, 0, 1)?;
+            ensure!(
+                encoder.dino_ws.completed_encodes == 1,
+                "indexed media encoder count"
+            );
+            s.synchronize()?;
+            let before = device.ctx.mem_get_info()?.0;
+            let encoded = encoder.finish()?;
+            s.synchronize()?;
+            let after = device.ctx.mem_get_info()?.0;
+            ensure!(
+                after > before,
+                "encoder workspace remained resident after finish"
+            );
+            let (actual_global, actual) = encoded.binding(&points, shape, &request, &[camera])?;
+            ensure!(
+                s.clone_dtoh(actual_global)? == global,
+                "global handoff differs"
+            );
+            let selected: Vec<f32> = points
+                .iter()
+                .flat_map(|p| {
+                    let i = (p[0] as usize * 32 + p[1] as usize) * 32 + p[2] as usize;
+                    expected[i * 1024..(i + 1) * 1024].iter().copied()
+                })
+                .collect();
+            ensure!(
+                s.clone_dtoh(actual)? == selected,
+                "indexed projection differs from dense selection"
+            );
+            ensure!(
+                encoded
+                    .binding(&points, shape, &Rc::new(()), &[camera])
+                    .is_err(),
+                "foreign request accepted"
+            );
+            let mut wrong_camera = camera;
+            wrong_camera.world_to_camera[3] += 0.25;
+            ensure!(
+                encoded
+                    .binding(&points, shape, &request, &[wrong_camera])
+                    .is_err(),
+                "foreign camera accepted"
+            );
+            let mut wrong_points = points.clone();
+            wrong_points.rotate_left(1);
+            ensure!(
+                encoded
+                    .binding(&wrong_points, shape, &request, &[camera])
+                    .is_err(),
+                "foreign row order accepted"
+            );
+            println!(
+                "P1_M4C_RUNTIME PASS canonical={canonical} rows={} global_values={} projection_values={} coordinate_bytes={coordinate_bytes} attention_workspace_bytes={attention_bytes} released_encoder_bytes={} bit_exact=true binding_controls=3",
+                points.len(),
+                actual_global.len(),
+                actual.len(),
+                after - before
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "GPU published Pixal conditioning reference; FF_P1_M2_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
     #[cfg(feature = "cuda")]
     fn pixal_conditioning_definition_gpu() -> Result<()> {
@@ -13465,6 +13958,8 @@ mod tests {
                     grid_side,
                     naf_side,
                 },
+                None,
+                &std::rc::Rc::new(()),
             )?;
             println!(
                 "P1_M2_SETUP stage={stage} allocated_bytes={} projection_rows={} channels={} no_cache=true",
@@ -13714,6 +14209,8 @@ mod tests {
                     grid_side,
                     naf_side,
                 },
+                None,
+                &std::rc::Rc::new(()),
             )?;
             for count in [1u32, 2, 4, 9] {
                 let reference_file = std::fs::File::open(
