@@ -470,16 +470,20 @@ mod gates {
             )?;
             // The engine's history [conv_dim, 3] is the last three
             // columns of the reference window [conv_dim, 4].
-            let want = refs
-                .get(&format!("l{layer}_conv_states_history"))
-                .with_context(|| format!("l{layer}_conv_states_history missing"))?;
+            let wide = refs
+                .get(&format!("l{layer}_conv_states"))
+                .with_context(|| format!("l{layer}_conv_states missing"))?;
+            ensure!(wide.len() % 4 == 0, "conv window width mismatch");
+            let want: Vec<f32> = (0..wide.len() / 4)
+                .flat_map(|c| wide[c * 4 + 1..c * 4 + 4].iter().copied())
+                .collect();
             ensure!(
                 history.len() == want.len(),
                 "history extent layer {layer}: got {} want {}",
                 history.len(),
                 want.len()
             );
-            let (max, rmse) = max_rmse(&history, want)?;
+            let (max, rmse) = max_rmse(&history, &want)?;
             let bound = bounds
                 .get(&format!("l{layer}_conv_states_history"))
                 .context("history bound missing")?;
