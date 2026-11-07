@@ -932,17 +932,32 @@ extern "C" __global__ void perspective_focal_f32(float* camera) {
 
 // Inclusive XYZ grid, row-major camera inverse [3,4], border bilinear align_corners=false.
 // Camera parameters [12 matrix values, focal_pixels, mesh_scale, image_resolution].
-extern "C" __global__ void project_bilinear_f32(const float* input, float* output, const float* camera,
+template<bool INDEXED>
+__device__ __forceinline__ void project_bilinear(const float* input, float* output, const float* camera, const int32_t* coordinates,
     uint32_t grid_side, uint32_t height, uint32_t width, uint32_t channels,
     uint32_t output_channels, uint32_t offset, uint64_t first, uint32_t rows,
     uint32_t add, float divisor) {
     if (!vision_flat_launch() || !input || !output || !camera || grid_side < 2 || !height || !width ||
         !channels || channels > output_channels || offset > output_channels-channels || add > 1 ||
         !(divisor > 0.0f)) { __trap(); return; }
+    if constexpr (INDEXED) {
+        if (!coordinates) { __trap(); return; }
+    }
     const uint64_t count = uint64_t(rows)*channels;
     for (uint64_t i = uint64_t(blockIdx.x)*256+threadIdx.x; i < count; i += uint64_t(gridDim.x)*256) {
         const uint64_t row = first + i/channels;
-        const uint32_t c = i%channels, ix = row/(uint64_t(grid_side)*grid_side), iy = (row/grid_side)%grid_side, iz=row%grid_side;
+        const uint32_t c = i%channels;
+        uint32_t ix, iy, iz;
+        if constexpr (INDEXED) {
+            ix = uint32_t(coordinates[row*3]);
+            iy = uint32_t(coordinates[row*3+1]);
+            iz = uint32_t(coordinates[row*3+2]);
+            if (ix >= grid_side || iy >= grid_side || iz >= grid_side) { __trap(); return; }
+        } else {
+            ix = row/(uint64_t(grid_side)*grid_side);
+            iy = (row/grid_side)%grid_side;
+            iz = row%grid_side;
+        }
         const auto coord = [&](uint32_t j) {
             const float step = __fdiv_rn(2.0f,float(grid_side-1));
             const float v = j < grid_side/2 ? __fmaf_rn(float(j),step,-1.0f) : __fmaf_rn(-float(grid_side-1-j),step,1.0f);
@@ -971,6 +986,23 @@ extern "C" __global__ void project_bilinear_f32(const float* input, float* outpu
         const uint64_t out=row*output_channels+offset+c;
         output[out]=__fdiv_rn(add ? __fadd_rn(output[out],val) : val,divisor);
     }
+}
+
+extern "C" __global__ void project_bilinear_f32(const float* input, float* output, const float* camera,
+    uint32_t grid_side, uint32_t height, uint32_t width, uint32_t channels,
+    uint32_t output_channels, uint32_t offset, uint64_t first, uint32_t rows,
+    uint32_t add, float divisor) {
+    project_bilinear<false>(input, output, camera, nullptr, grid_side, height, width, channels,
+        output_channels, offset, first, rows, add, divisor);
+}
+
+// Coordinates are ordered [rows,3] XYZ indices into the inclusive grid.
+extern "C" __global__ void project_bilinear_indexed_f32(const float* input, float* output,
+    const float* camera, const int32_t* coordinates, uint32_t grid_side, uint32_t height,
+    uint32_t width, uint32_t channels, uint32_t output_channels, uint32_t offset,
+    uint64_t first, uint32_t rows, uint32_t add, float divisor) {
+    project_bilinear<true>(input, output, camera, coordinates, grid_side, height, width, channels,
+        output_channels, offset, first, rows, add, divisor);
 }
 
 // Pairwise sum of at most 32 dense [heads, rows, columns] parts into a strided tensor.
@@ -1096,15 +1128,15 @@ extern "C" __global__ void pcd_pos_embed_f32(
     }
 }
 
-template<bool CHECKED>
-__device__ __forceinline__ void downcast_f32_to_f16(
-    const float* input, __half* output, uint32_t count) {
+template<typename T, bool CHECKED>
+__device__ __forceinline__ void downcast_f32(
+    const float* input, T* output, uint32_t count) {
     if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
     for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
         float value = input[i];
-        __half rounded = __float2half_rn(value);
+        T rounded = T(value);
         if constexpr (CHECKED) {
-            if (!isfinite(value) || !isfinite(__half2float(rounded))) { __trap(); return; }
+            if (!isfinite(value) || !isfinite(float(rounded))) { __trap(); return; }
         }
         output[i] = rounded;
     }
@@ -1112,12 +1144,17 @@ __device__ __forceinline__ void downcast_f32_to_f16(
 
 extern "C" __global__ void vision_downcast_f32_to_f16(
     const float* input, __half* output, uint32_t count) {
-    downcast_f32_to_f16<false>(input, output, count);
+    downcast_f32<__half, false>(input, output, count);
 }
 
 extern "C" __global__ void vision_downcast_f32_to_f16_checked(
     const float* input, __half* output, uint32_t count) {
-    downcast_f32_to_f16<true>(input, output, count);
+    downcast_f32<__half, true>(input, output, count);
+}
+
+extern "C" __global__ void vision_downcast_f32_to_bf16_checked(
+    const float* input, __nv_bfloat16* output, uint32_t count) {
+    downcast_f32<__nv_bfloat16, true>(input, output, count);
 }
 
 extern "C" __global__ void vision_silu_f16(const __half* input, __half* output, uint32_t count) {

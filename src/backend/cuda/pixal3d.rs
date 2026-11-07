@@ -28,6 +28,39 @@ use std::{collections::BTreeMap, mem::size_of, path::Path, rc::Rc};
 
 type FlowWeights<T> = BTreeMap<String, CudaSlice<T>>;
 
+fn wait_input<T>(device: &Device, input: &CudaSlice<T>) -> Result<()> {
+    ensure!(
+        input.context() == &device.ctx,
+        "input device context differs from setup"
+    );
+    if device.stream.as_ref() != input.stream().as_ref() {
+        let ready = input.stream().record_event(Some(
+            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        ))?;
+        device.stream.wait(&ready)?;
+    }
+    Ok(())
+}
+
+fn finite_copy(device: &Device, input: &CudaSlice<f32>, output: &CudaSlice<f32>) -> Result<()> {
+    wait_input(device, input)?;
+    ensure!(
+        output.context() == &device.ctx && input.len() == output.len() && !input.is_empty(),
+        "finite copy extent/context mismatch"
+    );
+    let kernel = cubin::module(&device.ctx, "q38_common")?.load_function("copy_finite_f32")?;
+    unsafe {
+        device
+            .stream
+            .launch_builder(&kernel)
+            .arg(input)
+            .arg(output)
+            .arg(&(input.len() as u64))
+            .launch(flat(input.len()))?;
+    }
+    Ok(())
+}
+
 fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
     x.device_ptr(&d.stream).0
 }
@@ -1011,6 +1044,35 @@ struct Work<T: FlowElement> {
     block_mod: CudaSlice<T::Parameters>,
 }
 impl<T: FlowElement> Work<T> {
+    fn planned_bytes(n: usize, spec: &FlowSpec, context: usize) -> Result<usize> {
+        let h = spec.model_channels;
+        let row = 4usize
+            .checked_add(
+                size_of::<T>()
+                    .checked_mul(11 * h + spec.feed_forward_width())
+                    .context("work row overflow")?,
+            )
+            .and_then(|v| {
+                v.checked_add(if T::HALF {
+                    0
+                } else {
+                    4 * (3 * h + spec.in_channels + spec.out_channels)
+                })
+            })
+            .context("work row bytes overflow")?;
+        let fixed = context
+            .checked_mul(h)
+            .and_then(|n| {
+                n.checked_mul(
+                    size_of::<T>() * (if T::HALF { 4 } else { 5 }) + if T::HALF { 0 } else { 8 },
+                )
+            })
+            .and_then(|n| n.checked_add(6 * h * size_of::<T::Parameters>()))
+            .context("work fixed bytes overflow")?;
+        n.checked_mul(row)
+            .and_then(|n| n.checked_add(fixed))
+            .context("work bytes overflow")
+    }
     fn bytes(&self) -> usize {
         [
             self.row_index.num_bytes(),
@@ -1043,7 +1105,8 @@ impl<T: FlowElement> Work<T> {
     fn new(d: &Device, n: usize, spec: &FlowSpec, context_rows: usize) -> Result<Self> {
         let s = &d.stream;
         let h = spec.model_channels;
-        Ok(Self {
+        let planned = Self::planned_bytes(n, spec, context_rows)?;
+        let output = Self {
             row_index: s.alloc_zeros(n)?,
             hidden: s.alloc_zeros(n * h)?,
             norm: s.alloc_zeros(n * h)?,
@@ -1067,7 +1130,12 @@ impl<T: FlowElement> Work<T> {
             input_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.in_channels })?,
             output_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.out_channels })?,
             block_mod: s.alloc_zeros(6 * h)?,
-        })
+        };
+        ensure!(
+            output.bytes() == planned,
+            "flow work allocation plan mismatch"
+        );
+        Ok(output)
     }
 }
 
@@ -1075,6 +1143,25 @@ fn validate_conditioning_origin(origin: &Rc<()>, flow: &Rc<()>) -> Result<()> {
     ensure!(
         Rc::ptr_eq(origin, flow),
         "conditioning originates from another flow"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_projection_binding(
+    origins: [&Rc<()>; 2],
+    coordinates: [&[[i32; 3]]; 2],
+    shapes: [crate::backend::PixalConditioningShape; 2],
+    views: [&[crate::backend::ProjectionCamera]; 2],
+) -> Result<()> {
+    validate_conditioning_origin(origins[0], origins[1])?;
+    ensure!(
+        coordinates[0] == coordinates[1],
+        "projected coordinate order differs"
+    );
+    ensure!(shapes[0] == shapes[1], "projected stage/grid differs");
+    ensure!(
+        !views[0].is_empty() && views[0] == views[1],
+        "projected camera/view mapping differs"
     );
     Ok(())
 }
@@ -1091,6 +1178,8 @@ pub struct Flow<T: FlowElement = bf16> {
     spec: FlowSpec,
     rows: usize,
     coordinates: Vec<[i32; 3]>,
+    projection_grid: Option<u32>,
+    request: Option<Rc<()>>,
     steps: usize,
     _inner_weights: FlowWeights<T>,
     _f32: FlowWeights<f32>,
@@ -1112,13 +1201,71 @@ pub struct Flow<T: FlowElement = bf16> {
 }
 
 impl Flow<bf16> {
+    fn live_bytes(
+        spec: &FlowSpec,
+        rows: usize,
+        steps: usize,
+        time_width: usize,
+    ) -> Result<[usize; 3]> {
+        let h = spec.model_channels;
+        let condition_bytes = (if spec.texture() { 2usize } else { 4usize })
+            .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
+            .and_then(|n| {
+                n.checked_add(if spec.texture() {
+                    4 * (rows + 2) * spec.out_channels
+                } else {
+                    0
+                })
+            })
+            .context("flow conditioning bytes overflow")?;
+        let sampler_bytes = rows
+            .checked_mul(spec.out_channels)
+            .and_then(|n| n.checked_mul((if spec.texture() { 3 } else { 8 }) * size_of::<f32>()))
+            .and_then(|n| n.checked_add(8))
+            .context("flow sampler bytes overflow")?;
+        let time_bytes = size_of::<f32>() * (steps * (time_width + 8 * h + 1) + h + time_width / 2);
+        Ok([condition_bytes, sampler_bytes, time_bytes])
+    }
+    fn planned_bytes(checkpoint: &FlowCheckpoint, rows: usize, steps: usize) -> Result<usize> {
+        let spec = &checkpoint.spec;
+        let h = spec.model_channels;
+        let dim = h / spec.num_heads;
+        let tensors = checkpoint.mapped.component_tensors()?;
+        let time_width = tensors["t_embedder.mlp.0.weight"].shape[1];
+        let live = Self::live_bytes(spec, rows, steps, time_width)?;
+        [
+            checkpoint.runtime_bytes,
+            Work::<bf16>::planned_bytes(rows, spec, 5)?,
+            if spec.sparse() { rows * dim * 4 } else { 0 },
+            steps * 6 * h * size_of::<bf16>(),
+            rows * spec.num_heads * 4,
+            F32Attention::required_bytes([
+                spec.num_heads as u32,
+                u32::try_from(rows)?,
+                5,
+                dim as u32,
+                dim as u32,
+            ])?,
+            live[0],
+            live[1],
+            live[2],
+            (5 * spec.cond_channels + rows * spec.projection_width()) * 4,
+        ]
+        .into_iter()
+        .try_fold(0usize, |n, v| {
+            n.checked_add(v).context("flow peak bytes overflow")
+        })
+    }
     pub fn open(
+        device: &Device,
         dir: &Path,
         stem: &str,
         runtime: &Path,
-        coordinates: &[[i32; 3]],
+        geometry: (&[[i32; 3]], u32),
+        request: &Rc<()>,
         budget: usize,
     ) -> Result<Self> {
+        let (coordinates, grid_side) = geometry;
         let checkpoint = FlowCheckpoint::open(dir, stem)?;
         let spec = checkpoint.spec.clone();
         let pipeline = dir
@@ -1188,8 +1335,12 @@ impl Flow<bf16> {
             "flow row extent overflow"
         );
         ensure!(
-            coordinates.iter().flatten().all(|&v| v >= 0),
-            "negative flow coordinates"
+            matches!(grid_side, 16 | 32 | 64 | 72 | 80 | 88 | 96)
+                && coordinates
+                    .iter()
+                    .flatten()
+                    .all(|&v| v >= 0 && v < grid_side as i32),
+            "flow coordinates outside projection grid"
         );
         ensure!(
             coordinates
@@ -1201,7 +1352,8 @@ impl Flow<bf16> {
         );
         if !spec.sparse() {
             ensure!(
-                rows == 4096
+                grid_side == 16
+                    && rows == 4096
                     && coordinates
                         .iter()
                         .enumerate()
@@ -1210,7 +1362,7 @@ impl Flow<bf16> {
                 "SS coordinates must be the published 16^3 grid order"
             );
         }
-        let device = Device::new(0)?;
+        let device = device.clone();
         let (free, total) = device.ctx.mem_get_info()?;
         ensure!(
             budget > 0 && budget <= total,
@@ -1354,23 +1506,8 @@ impl Flow<bf16> {
         let work = Work::new(&device, rows, &spec, 5)?;
         let flash = Flash::new(device.stream.clone(), rows, heads, heads, dim)?;
         let mods = device.stream.alloc_zeros(steps * 6 * h)?;
-        let condition_bytes = (if spec.texture() { 2usize } else { 4usize })
-            .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
-            .and_then(|n| {
-                n.checked_add(if spec.texture() {
-                    4 * (rows + 2) * spec.out_channels
-                } else {
-                    0
-                })
-            })
-            .context("flow conditioning bytes overflow")?;
-        let sampler_bytes = rows
-            .checked_mul(spec.out_channels)
-            .and_then(|n| n.checked_mul((if spec.texture() { 3 } else { 8 }) * size_of::<f32>()))
-            .and_then(|n| n.checked_add(8))
-            .context("flow sampler bytes overflow")?;
-        let time_width = time[0].weight.shape[1] as usize;
-        let time_bytes = size_of::<f32>() * (steps * (time_width + 8 * h + 1) + h + time_width / 2);
+        let [condition_bytes, sampler_bytes, time_bytes] =
+            Self::live_bytes(&spec, rows, steps, time[0].weight.shape[1] as usize)?;
         let live_bytes = condition_bytes
             .checked_add(sampler_bytes)
             .and_then(|n| n.checked_add(time_bytes))
@@ -1394,6 +1531,8 @@ impl Flow<bf16> {
             spec,
             rows,
             coordinates: coordinates.to_vec(),
+            projection_grid: Some(grid_side),
+            request: Some(request.clone()),
             steps,
             _inner_weights: bf,
             _f32: fp,
@@ -1750,6 +1889,8 @@ impl Flow<f16> {
             spec,
             rows,
             coordinates: coordinates.to_vec(),
+            projection_grid: None,
+            request: None,
             steps,
             _inner_weights: half,
             _f32: float,
@@ -1927,30 +2068,70 @@ impl<T: FlowElement> Flow<T> {
             global.len() == 2917 * self.spec.cond_channels,
             "device conditioning shape mismatch"
         );
-        if self.device.stream.as_ref() != global.stream().as_ref() {
-            let ready = global.stream().record_event(Some(
-                cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
-            ))?;
-            self.device.stream.wait(&ready)?;
-        }
-        let mut output = self.device.stream.alloc_zeros(global.len())?;
-        let cast = cubin::module(&self.device.ctx, "vision_ops")?
-            .load_function("vision_downcast_f32_to_f16_checked")?;
+        Ok(Conditioning {
+            origin: self.origin.clone(),
+            global: self.cast_conditioning(global)?,
+            projected: self.device.stream.alloc_zeros(0)?,
+            concat: None,
+        })
+    }
+    pub fn conditioning_projected(
+        &self,
+        image: &crate::backend::ProjectedConditioning,
+        views: &[crate::backend::ProjectionCamera],
+    ) -> Result<Conditioning<T>> {
+        let (global, projected) = image.binding(
+            &self.coordinates,
+            crate::backend::PixalConditioningShape {
+                image_side: if self.spec.resolution <= 32 {
+                    512
+                } else {
+                    1024
+                },
+                grid_side: self
+                    .projection_grid
+                    .context("projected conditioning requires grid setup")?,
+                naf_side: self.spec.sparse().then_some(if self.spec.texture() {
+                    1024
+                } else {
+                    512
+                }),
+            },
+            self.request
+                .as_ref()
+                .context("projected conditioning requires request setup")?,
+            views,
+        )?;
+        ensure!(
+            global.len() == 5 * self.spec.cond_channels
+                && projected.len() == self.rows * self.spec.projection_width(),
+            "device projected conditioning shape mismatch"
+        );
+        Ok(Conditioning {
+            origin: self.origin.clone(),
+            global: self.cast_conditioning(global)?,
+            projected: self.cast_conditioning(projected)?,
+            concat: None,
+        })
+    }
+    fn cast_conditioning(&self, input: &CudaSlice<f32>) -> Result<CudaSlice<T>> {
+        wait_input(&self.device, input)?;
+        let mut output = self.device.stream.alloc_zeros(input.len())?;
+        let cast = cubin::module(&self.device.ctx, "vision_ops")?.load_function(if T::HALF {
+            "vision_downcast_f32_to_f16_checked"
+        } else {
+            "vision_downcast_f32_to_bf16_checked"
+        })?;
         unsafe {
             self.device
                 .stream
                 .launch_builder(&cast)
-                .arg(global)
+                .arg(input)
                 .arg(&mut output)
-                .arg(&u32::try_from(global.len())?)
-                .launch(flat(global.len()))?;
+                .arg(&u32::try_from(input.len())?)
+                .launch(flat(input.len()))?;
         }
-        Ok(Conditioning {
-            origin: self.origin.clone(),
-            global: output,
-            projected: self.device.stream.alloc_zeros(0)?,
-            concat: None,
-        })
+        Ok(output)
     }
     pub fn condition_shape(
         &self,
@@ -1968,11 +2149,34 @@ impl<T: FlowElement> Flow<T> {
                 && physical_shape.iter().all(|x| x.is_finite()),
             "invalid shape condition"
         );
+        let values = self.device.stream.clone_htod(physical_shape)?;
+        self.bind_shape(condition, values)
+    }
+    pub fn condition_shape_device(
+        &self,
+        condition: &mut Conditioning<T>,
+        physical_shape: &CudaSlice<f32>,
+        coordinates: &[[i32; 3]],
+    ) -> Result<()> {
+        validate_conditioning_origin(&condition.origin, &self.origin)?;
+        ensure!(
+            coordinates == self.coordinates
+                && physical_shape.len() == self.rows * self.spec.out_channels,
+            "shape condition extent/coordinate mismatch"
+        );
+        let values = self.device.stream.alloc_zeros(physical_shape.len())?;
+        finite_copy(&self.device, physical_shape, &values)?;
+        self.bind_shape(condition, values)
+    }
+    fn bind_shape(
+        &self,
+        condition: &mut Conditioning<T>,
+        mut values: CudaSlice<f32>,
+    ) -> Result<()> {
         let normalization = self
             .normalization
             .as_ref()
             .context("texture flow required")?;
-        let mut values = self.device.stream.clone_htod(physical_shape)?;
         channel_transform(
             &self.device,
             &mut values,
@@ -2449,6 +2653,12 @@ impl Sampler {
             noise.len() > 1 && noise.iter().all(|x| x.is_finite()),
             "invalid flow noise"
         );
+        Self::from_state(d, d.stream.clone_htod(noise)?, guided)
+    }
+    fn from_state(d: &Device, state: CudaSlice<f32>, guided: bool) -> Result<Self> {
+        let count = state.len();
+        ensure!(count > 1, "invalid flow state extent");
+        wait_input(d, &state)?;
         let common = cubin::module(&d.ctx, "q38_common")?;
         let flow = cubin::module(&d.ctx, "flow")?;
         let guided_buffer = |n| -> Result<Option<CudaSlice<f32>>> {
@@ -2459,12 +2669,12 @@ impl Sampler {
             }
         };
         Ok(Self {
-            state: d.stream.clone_htod(noise)?,
-            positive: d.stream.alloc_zeros(noise.len())?,
-            negative: guided_buffer(noise.len())?,
-            velocity: d.stream.alloc_zeros(noise.len())?,
-            x0: guided_buffer(noise.len())?,
-            positive_x0: guided_buffer(noise.len())?,
+            state,
+            positive: d.stream.alloc_zeros(count)?,
+            negative: guided_buffer(count)?,
+            velocity: d.stream.alloc_zeros(count)?,
+            x0: guided_buffer(count)?,
+            positive_x0: guided_buffer(count)?,
             std: guided_buffer(2)?,
             guided: common.load_function("guided_euler_f32")?,
             convert: flow.load_function("flow_x0_f32")?,
@@ -2581,6 +2791,26 @@ impl Flow<bf16> {
         positive: &Conditioning,
         negative: Option<&Conditioning>,
     ) -> Result<Vec<f32>> {
+        ensure!(noise.iter().all(|x| x.is_finite()), "non-finite flow noise");
+        let noise = self.device.stream.clone_htod(noise)?;
+        let state = self.sample_state(noise, positive, negative)?;
+        Ok(self.device.stream.clone_dtoh(&state)?)
+    }
+    pub fn sample_device(
+        &mut self,
+        noise: CudaSlice<f32>,
+        positive: &Conditioning,
+        negative: Option<&Conditioning>,
+    ) -> Result<CudaSlice<f32>> {
+        finite_copy(&self.device, &noise, &noise)?;
+        self.sample_state(noise, positive, negative)
+    }
+    fn sample_state(
+        &mut self,
+        noise: CudaSlice<f32>,
+        positive: &Conditioning,
+        negative: Option<&Conditioning>,
+    ) -> Result<CudaSlice<f32>> {
         validate_conditioning_origin(&positive.origin, &self.origin)?;
         ensure!(
             negative.is_none() == self.spec.texture(),
@@ -2599,9 +2829,15 @@ impl Flow<bf16> {
             .map(|t| (1000.0 * t) as f32)
             .collect();
         self.set_times(&model_times)?;
-        let mut sampler = Sampler::new(&self.device, noise, !self.spec.texture())?;
+        let mut sampler = Sampler::from_state(&self.device, noise, !self.spec.texture())?;
+        #[cfg(test)]
+        let mut calls = [0usize; 2];
         for step in 0..self.steps {
             self.forward(&sampler.state, step, positive, &mut sampler.positive)?;
+            #[cfg(test)]
+            {
+                calls[0] += 1;
+            }
             if let Some(negative) = negative.filter(|_| (0.6..=1.0).contains(&times[step])) {
                 self.forward(
                     &sampler.state,
@@ -2609,6 +2845,10 @@ impl Flow<bf16> {
                     negative,
                     sampler.negative.as_mut().context("CFG buffer missing")?,
                 )?;
+                #[cfg(test)]
+                {
+                    calls[1] += 1;
+                }
             }
             sampler.step(
                 &self.device,
@@ -2617,16 +2857,79 @@ impl Flow<bf16> {
                 self.spec.sparse(),
             )?;
         }
+        #[cfg(test)]
+        flow_call_contract(&self.spec, calls)?;
         if let Some(normalization) = &self.normalization {
+            #[cfg(test)]
+            let normalized = self.device.stream.clone_dtoh(&sampler.state)?;
             channel_transform(
                 &self.device,
                 &mut sampler.state,
                 [&normalization[1][0], &normalization[1][1]],
                 false,
             )?;
+            #[cfg(test)]
+            transform_contract(
+                &self.device,
+                &normalized,
+                &sampler.state,
+                [&normalization[1][0], &normalization[1][1]],
+            )?;
         }
-        Ok(self.device.stream.clone_dtoh(&sampler.state)?)
+        Ok(sampler.state)
     }
+}
+
+#[cfg(test)]
+fn flow_call_contract(spec: &FlowSpec, calls: [usize; 2]) -> Result<()> {
+    let expected = if spec.texture() {
+        [12, 0]
+    } else if spec.sparse() {
+        [12, 9]
+    } else {
+        [12, 10]
+    };
+    ensure!(
+        calls == expected,
+        "flow forward branch count mismatch: {calls:?} expected {expected:?}"
+    );
+    println!(
+        "P1_M4C_FORWARD PASS sparse={} texture={} positive={} negative={}",
+        spec.sparse(),
+        spec.texture(),
+        calls[0],
+        calls[1]
+    );
+    Ok(())
+}
+#[cfg(test)]
+fn decoder_pass_contract(passes: usize) -> Result<()> {
+    ensure!(passes == 1, "decoder executed {passes} complete passes");
+    println!("P1_M4C_DECODE_PASS PASS count={passes}");
+    Ok(())
+}
+#[cfg(test)]
+fn transform_contract(
+    device: &Device,
+    before: &[f32],
+    after: &CudaSlice<f32>,
+    statistics: [&[f32]; 2],
+) -> Result<()> {
+    let [mean, std] = statistics;
+    let expected: Vec<_> = before
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * std[i % std.len()] + mean[i % mean.len()])
+        .collect();
+    ensure!(
+        device.stream.clone_dtoh(after)? == expected,
+        "latent transform was omitted, repeated or used different coefficients"
+    );
+    println!(
+        "P1_M4C_TRANSFORM PASS values={} applications=1 exact=true",
+        expected.len()
+    );
+    Ok(())
 }
 
 fn channel_transform(
@@ -2941,6 +3244,451 @@ impl DecoderKernels {
     }
 }
 
+/// Published [batch,x,y,z,channel] noise values; the request selects one batch.
+pub struct CoordinateNoise<'a> {
+    pub values: &'a [f32],
+    pub shape: [usize; 5],
+    pub batch: usize,
+}
+impl CoordinateNoise<'_> {
+    fn gather(
+        &self,
+        coordinates: &[[i32; 3]],
+        channels: usize,
+        channels_first: bool,
+    ) -> Result<Vec<f32>> {
+        let count = self
+            .shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .context("noise extent overflow")?;
+        ensure!(
+            self.shape.iter().all(|&n| n > 0)
+                && count == self.values.len()
+                && self.batch < self.shape[0]
+                && channels == self.shape[4],
+            "noise domain extent mismatch"
+        );
+        let count = coordinates
+            .len()
+            .checked_mul(channels)
+            .context("selected noise extent overflow")?;
+        let mut output = vec![0.0; count];
+        for (row, point) in coordinates.iter().enumerate() {
+            let mut index = self.batch;
+            for (axis, &coordinate) in point.iter().enumerate() {
+                let coordinate =
+                    usize::try_from(coordinate).context("negative noise coordinate")?;
+                ensure!(
+                    coordinate < self.shape[axis + 1],
+                    "noise coordinate outside supplied domain"
+                );
+                index = index * self.shape[axis + 1] + coordinate;
+            }
+            for channel in 0..channels {
+                let value = self.values[index * channels + channel];
+                ensure!(value.is_finite(), "nonfinite selected noise");
+                output[if channels_first {
+                    channel * coordinates.len() + row
+                } else {
+                    row * channels + channel
+                }] = value;
+            }
+        }
+        Ok(output)
+    }
+}
+
+pub struct PixalView<'a> {
+    pub rgba: &'a [u8],
+    /// [height,width].
+    pub dimensions: [usize; 2],
+    pub camera: crate::backend::ProjectionCamera,
+}
+
+pub struct PixalGeneration<'a> {
+    pub model: &'a Path,
+    pub dino: &'a Path,
+    pub naf: &'a Path,
+    pub runtime: &'a Path,
+    pub views: &'a [PixalView<'a>],
+    pub multiview: bool,
+    pub requested_resolution: u32,
+    /// Structure, low-resolution shape, high-resolution shape, texture.
+    pub noise: [CoordinateNoise<'a>; 4],
+}
+
+pub struct PixalOutput {
+    pub mesh: crate::sparse::SparseMesh,
+    /// RGB, metallic, roughness, alpha at the final voxel coordinates.
+    pub material: SparseDecoderOutput,
+    pub resolution: u32,
+    pub origin: [f32; 3],
+    pub voxel_size: f32,
+}
+
+impl PixalGeneration<'_> {
+    pub fn run(&self, device: &Device) -> Result<PixalOutput> {
+        self.run_observed(device, usize::MAX, |_, _, _, _| Ok(()))
+    }
+    fn run_observed<F>(
+        &self,
+        device: &Device,
+        retention_limit: usize,
+        mut observe: F,
+    ) -> Result<PixalOutput>
+    where
+        F: FnMut(usize, u32, &[[i32; 3]], &CudaSlice<f32>) -> Result<()>,
+    {
+        ensure!(
+            matches!(self.requested_resolution, 1024 | 1536),
+            "unsupported requested resolution"
+        );
+        ensure!(
+            !self.views.is_empty() && (self.multiview || self.views.len() == 1),
+            "invalid single/multi-view request"
+        );
+        for view in self.views {
+            let count = view
+                .dimensions
+                .iter()
+                .try_fold(4usize, |n, &d| n.checked_mul(d))
+                .context("RGBA size overflow")?;
+            ensure!(
+                view.dimensions.iter().all(|&n| n > 0)
+                    && view.rgba.len() == count
+                    && view.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0)
+                    && view.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255),
+                "request requires nonempty supplied RGBA foreground"
+            );
+        }
+        let pipeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.model.join(if self.multiview {
+                "pipeline_mv.json"
+            } else {
+                "pipeline.json"
+            }))?)?;
+        for (key, kind) in [
+            ("sparse_structure_decoder", DecoderKind::Structure),
+            ("shape_slat_decoder", DecoderKind::Shape),
+            ("tex_slat_decoder", DecoderKind::Texture),
+        ] {
+            ensure!(
+                pipeline["args"]["models"][key] == format!("ckpts/{}", kind.stem()),
+                "decoder component differs from published geometry"
+            );
+        }
+        let request = Rc::new(());
+        let ss: Vec<_> = (0..16usize.pow(3))
+            .map(|i| [(i / 256) as i32, ((i / 16) % 16) as i32, (i % 16) as i32])
+            .collect();
+        let structure = self.flow_stage(
+            device,
+            &pipeline,
+            (0, 16),
+            &ss,
+            (&request, None),
+            &mut observe,
+        )?;
+        let decoder = self.decoder(device, DecoderKind::Structure)?;
+        let logits = decoder.structure_device(structure)?;
+        let low = PixalDecoder::structure_sites(&logits, 64, 32)?;
+        drop(logits);
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get())?;
+        drop(decoder);
+        let low_xyz: Vec<_> = low
+            .coordinates()
+            .iter()
+            .map(|p| [p[1], p[2], p[3]])
+            .collect();
+        let low_latent = self.flow_stage(
+            device,
+            &pipeline,
+            (1, 32),
+            &low_xyz,
+            (&request, None),
+            &mut observe,
+        )?;
+        drop(low_xyz);
+        let decoder = self.decoder(device, DecoderKind::Shape)?;
+        let (resolution, high) = decoder.cascade_coordinates_device(
+            low.coordinates().to_vec(),
+            low_latent,
+            self.requested_resolution,
+            49152,
+        )?;
+        drop(low);
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get())?;
+        let required = self.following_peak(&pipeline, high.coordinates().len(), resolution / 16)?;
+        let measured = self.budget(device)?;
+        let available = measured.min(retention_limit);
+        let keep = required <= available;
+        #[cfg(test)]
+        {
+            if retention_limit == 0 {
+                ensure!(!keep, "test retention cap was ignored");
+            }
+            let weight_bytes = decoder
+                .weights
+                .half
+                .values()
+                .map(CudaSlice::num_bytes)
+                .sum::<usize>()
+                + decoder
+                    .weights
+                    .float
+                    .values()
+                    .map(CudaSlice::num_bytes)
+                    .sum::<usize>();
+            println!(
+                "P1_M4C_STAGING required_bytes={required} measured_bytes={measured} available_bytes={available} retained_shape_decoder={keep} avoided_weight_upload_bytes={}",
+                if keep { weight_bytes } else { 0 }
+            );
+        }
+        let decoder = if keep {
+            Some(decoder)
+        } else {
+            drop(decoder);
+            None
+        };
+        let high_xyz: Vec<_> = high
+            .coordinates()
+            .iter()
+            .map(|p| [p[1], p[2], p[3]])
+            .collect();
+        let shape = self.flow_stage(
+            device,
+            &pipeline,
+            (2, resolution / 16),
+            &high_xyz,
+            (&request, None),
+            &mut observe,
+        )?;
+        let texture = self.flow_stage(
+            device,
+            &pipeline,
+            (3, resolution / 16),
+            &high_xyz,
+            (&request, Some(&shape)),
+            &mut observe,
+        )?;
+        drop(high_xyz);
+        let decoder = match decoder {
+            Some(decoder) => decoder,
+            None => self.decoder(device, DecoderKind::Shape)?,
+        };
+        #[cfg(test)]
+        let previous_passes = decoder.decode_passes.get();
+        let (mesh, guides) =
+            decoder.shape_mesh_device(high.coordinates().to_vec(), shape, resolution)?;
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get() - previous_passes)?;
+        drop(decoder);
+        let decoder = self.decoder(device, DecoderKind::Texture)?;
+        let (material, predicted) =
+            decoder.decode_device(high.coordinates().to_vec(), texture, &guides)?;
+        #[cfg(test)]
+        decoder_pass_contract(decoder.decode_passes.get())?;
+        ensure!(
+            predicted.is_empty(),
+            "texture decoder predicted subdivision"
+        );
+        Ok(PixalOutput {
+            mesh,
+            material,
+            resolution,
+            origin: [-0.5; 3],
+            voxel_size: 1.0 / resolution as f32,
+        })
+    }
+    fn budget(&self, device: &Device) -> Result<usize> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        device.workspace_budget(free, total, total / 16)
+    }
+    fn decoder(&self, device: &Device, kind: DecoderKind) -> Result<PixalDecoder> {
+        PixalDecoder::open(device, self.model, kind, self.runtime, self.budget(device)?)
+    }
+    fn flow_geometry<'a>(
+        &self,
+        pipeline: &'a serde_json::Value,
+        stage: usize,
+        grid_side: u32,
+    ) -> Result<(&'a str, FlowSpec, crate::backend::PixalConditioningShape)> {
+        let key = [
+            "sparse_structure_flow_model",
+            "shape_slat_flow_model_512",
+            "shape_slat_flow_model_1024",
+            "tex_slat_flow_model_1024",
+        ][stage];
+        let stem = pipeline["args"]["models"][key]
+            .as_str()
+            .context("flow component missing")?
+            .strip_prefix("ckpts/")
+            .context("flow checkpoint component path")?;
+        ensure!(
+            !stem.is_empty()
+                && !stem.contains('/')
+                && !stem.contains('\\')
+                && stem.ends_with("_mv") == self.multiview,
+            "invalid flow component variant"
+        );
+        let spec = FlowSpec::read(&self.model.join("ckpts"), stem)?;
+        ensure!(
+            spec.sparse() == (stage > 0) && spec.texture() == (stage == 3),
+            "flow component stage mismatch"
+        );
+        let shape = crate::backend::PixalConditioningShape {
+            image_side: if stage < 2 { 512 } else { 1024 },
+            grid_side,
+            naf_side: (stage > 0).then_some(if stage == 3 { 1024 } else { 512 }),
+        };
+        Ok((stem, spec, shape))
+    }
+    fn following_peak(
+        &self,
+        pipeline: &serde_json::Value,
+        rows: usize,
+        grid_side: u32,
+    ) -> Result<usize> {
+        let mut peak = 0;
+        for stage in [2, 3] {
+            let (stem, spec, shape) = self.flow_geometry(pipeline, stage, grid_side)?;
+            let conditioning = crate::backend::PixalConditioningRuntime::planned_bytes(
+                self.dino,
+                shape.naf_side.map(|_| self.naf),
+                shape,
+                rows,
+            )?;
+            let checkpoint = FlowCheckpoint::open(&self.model.join("ckpts"), stem)?;
+            let sampler = if spec.texture() {
+                "tex_slat_sampler"
+            } else {
+                "shape_slat_sampler"
+            };
+            let steps = usize::try_from(
+                pipeline["args"][sampler]["params"]["steps"]
+                    .as_u64()
+                    .context("sampler steps missing")?,
+            )?;
+            let flow = Flow::<bf16>::planned_bytes(&checkpoint, rows, steps)?;
+            let retained = rows
+                .checked_mul(spec.out_channels * 4)
+                .context("retained latent bytes overflow")?;
+            peak = peak.max(
+                conditioning
+                    .max(flow)
+                    .checked_add(retained)
+                    .context("stage peak overflow")?,
+            );
+        }
+        Ok(peak)
+    }
+    fn flow_stage<F>(
+        &self,
+        device: &Device,
+        pipeline: &serde_json::Value,
+        stage: (usize, u32),
+        coordinates: &[[i32; 3]],
+        input: (&Rc<()>, Option<&CudaSlice<f32>>),
+        observe: &mut F,
+    ) -> Result<CudaSlice<f32>>
+    where
+        F: FnMut(usize, u32, &[[i32; 3]], &CudaSlice<f32>) -> Result<()>,
+    {
+        let (request, physical_shape) = input;
+        let (stage, grid_side) = stage;
+        let (stem, spec, shape) = self.flow_geometry(pipeline, stage, grid_side)?;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            device,
+            &ops,
+            self.runtime,
+            Rc::new(Closure::new(false, "Pixal conditioning".into())),
+        )?;
+        let mut encoder = crate::backend::PixalConditioningRuntime::load(
+            device,
+            &mut blas,
+            self.dino,
+            shape.naf_side.map(|_| self.naf),
+            shape,
+            Some(coordinates),
+            request,
+        )?;
+        for (index, view) in self.views.iter().enumerate() {
+            if self.multiview {
+                encoder.stage_view_rgba(&device.stream, view.rgba, view.dimensions, view.camera)?;
+            } else {
+                encoder.stage_rgba(&device.stream, view.rgba, view.dimensions, view.camera)?;
+            }
+            encoder.run_view(
+                &device.stream,
+                &blas,
+                u32::try_from(index)?,
+                u32::try_from(self.views.len())?,
+            )?;
+        }
+        let projected = encoder.finish()?;
+        drop(blas);
+        let mut flow = Flow::open(
+            device,
+            &self.model.join("ckpts"),
+            stem,
+            self.runtime,
+            (coordinates, grid_side),
+            request,
+            self.budget(device)?,
+        )?;
+        let cameras: Vec<_> = self.views.iter().map(|v| v.camera).collect();
+        let mut positive = flow.conditioning_projected(&projected, &cameras)?;
+        drop(projected);
+        ensure!(
+            physical_shape.is_some() == spec.texture(),
+            "shape conditioning stage mismatch"
+        );
+        if let Some(shape) = physical_shape {
+            flow.condition_shape_device(&mut positive, shape, coordinates)?;
+        }
+        let negative = if spec.texture() {
+            None
+        } else {
+            Some(Conditioning {
+                origin: flow.origin.clone(),
+                global: device.stream.alloc_zeros(positive.global.len())?,
+                projected: device.stream.alloc_zeros(positive.projected.len())?,
+                concat: None,
+            })
+        };
+        let noise = self.noise[stage].gather(coordinates, spec.out_channels, !spec.sparse())?;
+        let noise = device.stream.clone_htod(&noise)?;
+        let mut output = flow.sample_device(noise, &positive, negative.as_ref())?;
+        #[cfg(test)]
+        let before_transform = device.stream.clone_dtoh(&output)?;
+        if matches!(stage, 1 | 2) {
+            let normalization = &pipeline["args"]["shape_slat_normalization"];
+            let mean: Vec<f32> = serde_json::from_value(normalization["mean"].clone())?;
+            let std: Vec<f32> = serde_json::from_value(normalization["std"].clone())?;
+            ensure!(
+                mean.len() == spec.out_channels && std.len() == spec.out_channels,
+                "shape normalization channel count"
+            );
+            channel_transform(device, &mut output, [&mean, &std], false)?;
+            #[cfg(test)]
+            transform_contract(device, &before_transform, &output, [&mean, &std])?;
+        }
+        #[cfg(test)]
+        if stage == 0 || stage == 3 {
+            ensure!(
+                device.stream.clone_dtoh(&output)? == before_transform,
+                "unchanged latent boundary differs"
+            );
+        }
+        observe(stage, grid_side, coordinates, &output)?;
+        Ok(output)
+    }
+}
+
 pub struct PixalDecoder {
     device: Device,
     blas: Blas,
@@ -2953,6 +3701,8 @@ pub struct PixalDecoder {
     columns: Option<CudaSlice<u8>>,
     #[cfg(test)]
     subdivision_launches: std::cell::Cell<usize>,
+    #[cfg(test)]
+    decode_passes: std::cell::Cell<usize>,
 }
 pub struct SparseDecoderOutput {
     pub coordinates: Vec<[i32; 4]>,
@@ -3073,6 +3823,7 @@ fn validate_guide_count(kind: DecoderKind, count: usize) -> Result<()> {
 }
 impl PixalDecoder {
     pub fn open(
+        device: &Device,
         dir: &Path,
         kind: DecoderKind,
         runtime: &Path,
@@ -3084,7 +3835,7 @@ impl PixalDecoder {
             "ckpts"
         };
         let checkpoint = DecoderCheckpoint::open(&dir.join(component), kind)?;
-        let device = Device::new(0)?;
+        let device = device.clone();
         let (free, _) = device.ctx.mem_get_info()?;
         let ops = Ops::new(&device.ctx)?;
         let blas = Blas::new(
@@ -3118,6 +3869,8 @@ impl PixalDecoder {
             kind,
             #[cfg(test)]
             subdivision_launches: std::cell::Cell::new(0),
+            #[cfg(test)]
+            decode_passes: std::cell::Cell::new(0),
             initial_free: free,
             device_budget,
             ones,
@@ -4116,6 +4869,31 @@ impl PixalDecoder {
         coordinates: Vec<[i32; 4]>,
         latent: &[f32],
         guides: &[SubdivisionGuide<'_>],
+        observe: F,
+    ) -> Result<(SparseSites, CudaSlice<f16>)>
+    where
+        F: FnMut([usize; 3], (&SparseSites, &[f32]), (&SparseSites, &CudaSlice<f16>)) -> Result<()>,
+    {
+        ensure!(
+            latent.len() == coordinates.len() * 32 && latent.iter().all(|x| x.is_finite()),
+            "invalid denormalized sparse latent"
+        );
+        self.device.workspace_budget(
+            self.initial_free,
+            self.device_budget,
+            latent
+                .len()
+                .checked_mul(size_of::<f32>())
+                .context("latent bytes overflow")?,
+        )?;
+        let input = self.device.stream.clone_htod(latent)?;
+        self.sparse_decode_rows(coordinates, input, guides, observe)
+    }
+    fn sparse_decode_rows<F>(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        input: CudaSlice<f32>,
+        guides: &[SubdivisionGuide<'_>],
         mut observe: F,
     ) -> Result<(SparseSites, CudaSlice<f16>)>
     where
@@ -4126,18 +4904,20 @@ impl PixalDecoder {
             "sparse decoder required"
         );
         validate_guide_count(self.kind, guides.len())?;
+        #[cfg(test)]
+        self.decode_passes.set(self.decode_passes.get() + 1);
         let mut sites = SparseSites::new(coordinates)?;
         let n = sites.coordinates().len();
         ensure!(
-            latent.len() == n * 32 && latent.iter().all(|x| x.is_finite()),
-            "invalid denormalized sparse latent"
+            input.len() == n * 32,
+            "invalid denormalized sparse latent extent"
         );
         let d = &self.device;
+        wait_input(d, &input)?;
         let live = n
-            .checked_mul(32 * size_of::<f32>() + 1024 * 6)
+            .checked_mul(1024 * 6)
             .context("sparse input live bytes overflow")?;
         d.workspace_budget(self.initial_free, self.device_budget, live)?;
-        let input = d.stream.clone_htod(latent)?;
         let mut float = d.stream.alloc_zeros::<f32>(n * 1024)?;
         self.linear32("from_latent", &input, &mut float, [n, 32, 1024])?;
         drop(input);
@@ -4218,6 +4998,49 @@ impl PixalDecoder {
         guides: &[SparseDecoderOutput],
     ) -> Result<(SparseDecoderOutput, Vec<SparseDecoderOutput>)> {
         ensure!(
+            latent.len() == coordinates.len() * 32 && latent.iter().all(|x| x.is_finite()),
+            "invalid denormalized sparse latent"
+        );
+        let input = self.device.stream.clone_htod(latent)?;
+        self.decode_output(coordinates, input, guides)
+    }
+    pub fn decode_device(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        guides: &[SparseDecoderOutput],
+    ) -> Result<(SparseDecoderOutput, Vec<SparseDecoderOutput>)> {
+        finite_copy(&self.device, &latent, &latent)?;
+        self.decode_output(coordinates, latent, guides)
+    }
+    fn decode_output(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        guides: &[SparseDecoderOutput],
+    ) -> Result<(SparseDecoderOutput, Vec<SparseDecoderOutput>)> {
+        let (sites, output, generated) = self.decode_fields(coordinates, latent, guides)?;
+        let features = self.device.stream.clone_dtoh(&output)?;
+        ensure!(
+            features.iter().all(|x| x.is_finite()),
+            "nonfinite decoder output"
+        );
+        Ok((
+            SparseDecoderOutput {
+                coordinates: sites.coordinates().to_vec(),
+                features,
+                channels: output.len() / sites.coordinates().len(),
+            },
+            generated,
+        ))
+    }
+    fn decode_fields(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        guides: &[SparseDecoderOutput],
+    ) -> Result<(SparseSites, CudaSlice<f32>, Vec<SparseDecoderOutput>)> {
+        ensure!(
             guides.iter().all(|g| g.channels == 8),
             "subdivision guide width mismatch"
         );
@@ -4234,7 +5057,7 @@ impl PixalDecoder {
             .collect();
         let mut generated = Vec::new();
         let (sites, features) =
-            self.sparse_decode(coordinates, latent, &borrowed, |_, (parents, logits), _| {
+            self.sparse_decode_rows(coordinates, latent, &borrowed, |_, (parents, logits), _| {
                 if matches!(self.kind, DecoderKind::Shape) {
                     generated.push(SparseDecoderOutput {
                         coordinates: parents.coordinates().to_vec(),
@@ -4248,19 +5071,28 @@ impl PixalDecoder {
         if matches!(self.kind, DecoderKind::Texture) {
             channel_transform(&self.device, &mut output, [&[0.5; 6], &[0.5; 6]], false)?;
         }
-        let features = self.device.stream.clone_dtoh(&output)?;
+        Ok((sites, output, generated))
+    }
+    pub fn shape_mesh_device(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        resolution: u32,
+    ) -> Result<(crate::sparse::SparseMesh, Vec<SparseDecoderOutput>)> {
         ensure!(
-            features.iter().all(|x| x.is_finite()),
-            "nonfinite shape output"
+            matches!(self.kind, DecoderKind::Shape),
+            "shape decoder required for mesh"
         );
-        Ok((
-            SparseDecoderOutput {
-                coordinates: sites.coordinates().to_vec(),
-                features,
-                channels: output.len() / sites.coordinates().len(),
-            },
-            generated,
-        ))
+        finite_copy(&self.device, &latent, &latent)?;
+        let (sites, fields, guides) = self.decode_fields(coordinates, latent, &[])?;
+        let mesh = super::sparse::dual_grid_mesh(
+            &self.device,
+            sites,
+            fields,
+            resolution,
+            [self.initial_free, self.device_budget],
+        )?;
+        Ok((mesh, guides))
     }
     pub fn shape_mesh(
         &self,
@@ -4301,11 +5133,32 @@ impl PixalDecoder {
         drop(features);
         Self::cascade_grid(&sites, requested_resolution, token_limit)
     }
+    pub fn cascade_coordinates_device(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: CudaSlice<f32>,
+        requested_resolution: u32,
+        token_limit: usize,
+    ) -> Result<(u32, SparseSites)> {
+        ensure!(
+            matches!(self.kind, DecoderKind::Shape),
+            "shape decoder required for cascade"
+        );
+        finite_copy(&self.device, &latent, &latent)?;
+        let (sites, features) =
+            self.sparse_decode_rows(coordinates, latent, &[], |_, _, _| Ok(()))?;
+        drop(features);
+        Self::cascade_grid(&sites, requested_resolution, token_limit)
+    }
     fn cascade_grid(
         sites: &SparseSites,
         requested_resolution: u32,
         token_limit: usize,
     ) -> Result<(u32, SparseSites)> {
+        ensure!(
+            matches!(requested_resolution, 1024 | 1536) && token_limit > 0,
+            "invalid cascade resolution or token limit"
+        );
         let mut resolution = requested_resolution;
         loop {
             let quantized = sites.round_unique(512, resolution / 16)?;
@@ -4473,6 +5326,40 @@ impl PixalDecoder {
             .collect();
         let d = &self.device;
         let input = d.stream.clone_htod(&input)?;
+        self.structure_rows(input)
+    }
+    pub fn structure_device(&self, latent_chw: CudaSlice<f32>) -> Result<Vec<f32>> {
+        ensure!(
+            matches!(self.kind, DecoderKind::Structure) && latent_chw.len() == 8 * 16usize.pow(3),
+            "structure latent must be [8,16,16,16]"
+        );
+        let d = &self.device;
+        finite_copy(d, &latent_chw, &latent_chw)?;
+        d.workspace_budget(
+            self.initial_free,
+            self.device_budget,
+            64usize.pow(3) * 32 * 8,
+        )?;
+        let rows = 16usize.pow(3);
+        let input = d.stream.alloc_zeros::<f32>(latent_chw.len())?;
+        let transpose = cubin::module(&d.ctx, "q38_common")?.load_function("transpose_f32")?;
+        unsafe {
+            d.stream
+                .launch_builder(&transpose)
+                .arg(&latent_chw)
+                .arg(&input)
+                .arg(&8i64)
+                .arg(&(rows as i64))
+                .launch(flat(input.len()))?;
+        }
+        drop(latent_chw);
+        self.structure_rows(input)
+    }
+    fn structure_rows(&self, input: CudaSlice<f32>) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        self.decode_passes.set(self.decode_passes.get() + 1);
+        let d = &self.device;
+        let rows = 16usize.pow(3);
         let float = d.stream.alloc_zeros::<f32>(rows * 512)?;
         self.dense_conv(
             "input_layer",
