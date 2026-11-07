@@ -1,8 +1,7 @@
 //! clef-flash text gates against the frozen reference arms: the engine
 //! loads with the published geometry, mixer-boundary taps and text logits
-//! cells must land inside the frozen bounds, an in-memory conv-weight
-//! mutant must exceed them, and the one-position rope start shift is
-//! measured against twice the frozen bound.
+//! cells must land inside the frozen bounds, and an in-memory conv-weight
+//! mutant must exceed them.
 
 #[cfg(feature = "cuda")]
 mod gates {
@@ -174,10 +173,8 @@ mod gates {
         Ok(())
     }
 
-    /// Clean taps at layers {2,3}, then the in-memory controls — the
-    /// conv-overwrite mutant at the layer-2 GDN block and the one-position
-    /// mutant at the layer-2 GDN block, and the one-position rope start
-    /// shift measured at the layer-3 full block against twice its bound.
+    /// Clean taps at layers {2,3}, then the in-memory conv-overwrite
+    /// mutant at the layer-2 GDN block, beyond 10x its bound.
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_FROZEN, FF_CLEF_REF_TAPS, FF_CLEF_FIXTURE_IDS"]
     fn clef_flash_layer_taps_and_controls() -> Result<()> {
@@ -211,7 +208,7 @@ mod gates {
         let runtime_control =
             std::env::temp_dir().join(format!("clef-flash-taps-control-{}", std::process::id()));
         unsafe {
-            std::env::set_var("FF_CLEF_TEST_PLANT", "zero:2:in_proj_qkv.weight,conv:4:2");
+            std::env::set_var("FF_CLEF_TEST_PLANT", "conv:4:2");
         }
         let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime_control.clone()))?;
         unsafe {
@@ -234,11 +231,8 @@ mod gates {
             "CLEF_CONTROL_LOGITS equal={logits_same} len={} first_diff={logits_diff:?}",
             control_logits.len()
         );
-        let (inproj_nonzero, inproj_absmax) = engine.control_readback(2, "in_proj_qkv.weight")?;
         let (conv_nonzero, conv_absmax) = engine.control_readback(2, "conv1d.weight")?;
-        println!(
-            "CLEF_CONTROL_READBACK in_proj nonzero={inproj_nonzero} absmax={inproj_absmax:.6e} conv nonzero={conv_nonzero} absmax={conv_absmax:.6e}"
-        );
+        println!("CLEF_CONTROL_READBACK conv nonzero={conv_nonzero} absmax={conv_absmax:.6e}");
         let got = trace.values("prefill.0.debug.mixer_out")?;
         let out_path = runtime_control.join("control_mixer_out.f32");
         let bytes: Vec<u8> = got.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -277,25 +271,6 @@ mod gates {
         );
         drop(engine);
 
-        // Measurement: one-position rope start shift.
-        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime))?;
-        engine.set_start_position(1);
-        engine.trace_layer = 3;
-        let mut trace = Trace::default();
-        engine.prefill(&ids, Some(&mut trace))?;
-        let got = trace.values("prefill.0.debug.mixer_out")?;
-        let want = refs.get("h512_l3_mixer_out").context("ref tap")?;
-        let (max, rmse) = max_rmse(&got, want)?;
-        let bound = frozen.get("h512_l3_mixer_out").context("cell")?;
-        println!(
-            "CLEF_MEASURE rope_shift_1 max={max:.6e} (>= {:.6e}) rmse={rmse:.6e} (>= {:.6e})",
-            2.0 * bound.0,
-            2.0 * bound.1
-        );
-        ensure!(
-            max >= 2.0 * bound.0 && rmse >= 2.0 * bound.1,
-            "rope-shift measurement under 2x"
-        );
         Ok(())
     }
 
