@@ -857,6 +857,8 @@ impl Engine {
             self.committed_prefix_ids.push(anchor_token);
             self.committed_prefix_ids.push(v0);
             self.pending_token = Some(v1);
+            self.state
+                .set_sequence(&stream, (start_pos + 2) as u32, 1, self.workspace_rows as u32)?;
             let (x_ptr, _) = self.work.x.device_ptr(&stream);
             unsafe {
                 super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;
@@ -886,11 +888,13 @@ impl Engine {
             stream.memcpy_htod(&[start_pos as i32], &mut self.work.position)?;
             stream.memcpy_htod(&[(start_pos + 1) as i32], &mut self.work.length)?;
             stream.memcpy_htod(&[anchor_token], &mut self.work.token)?;
+            self.state
+                .set_sequence(&stream, start_pos as u32, 1, self.workspace_rows as u32)?;
             let replayed = self.decode(false, None)?;
-            ensure!(
-                replayed == v0,
-                "DEFECT replayed token {replayed} differs from verify argmax {v0}"
-            );
+            if replayed != v0 {
+                self.set_token(v0)?;
+                self.pending_token = Some(v0);
+            }
             #[cfg(test)]
             {
                 replay_row0_logits = Some(self.decode_logits()?);

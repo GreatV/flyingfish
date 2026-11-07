@@ -2273,6 +2273,13 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
             accepted_count += 1;
         } else if let Some(replay_logits) = &out.replay_row0_logits {
             let p = out.start_pos;
+            let (replay_top0, _) = super::mtp::top1_and_margin(replay_logits);
+            let (v0_top, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
+            if replay_top0 != v0_top {
+                defects.push(format!(
+                    "DEFECT replayed token {replay_top0} differs from verify argmax {v0_top} at pos={p}"
+                ));
+            }
             let tau_max_abs = tau_max_abs_per_pos
                 .get(p)
                 .copied()
