@@ -227,6 +227,7 @@ struct AttentionLaunch<'a> {
     right_chunks: u32,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StreamOmit {
     None,
@@ -252,6 +253,7 @@ struct StreamWindow {
     query_offset: u32,
     kv_offset: u32,
     cached: u32,
+    #[cfg(test)]
     omit: StreamOmit,
 }
 
@@ -296,7 +298,11 @@ fn table_index(key_rows: u32) -> Result<usize> {
     Ok((key_rows / 4 - 1) as usize)
 }
 
-fn stream_window(cumulative_before: u32, query_rows: u32) -> Result<StreamWindow> {
+fn stream_window(
+    cumulative_before: u32,
+    query_rows: u32,
+    #[cfg(test)] omit: StreamOmit,
+) -> Result<StreamWindow> {
     ensure!(query_rows == 4, "streaming query rows {query_rows}");
     let cached = if cumulative_before >= 57 {
         56
@@ -315,8 +321,53 @@ fn stream_window(cumulative_before: u32, query_rows: u32) -> Result<StreamWindow
         query_offset: cumulative_before,
         kv_offset,
         cached,
-        omit: StreamOmit::None,
+        #[cfg(test)]
+        omit,
     })
+}
+
+fn attend_span(window: &StreamWindow, query_rows: u32) -> (u32, u32) {
+    #[cfg(test)]
+    if window.omit == StreamOmit::Keys {
+        return (query_rows, window.query_offset);
+    }
+    #[cfg(not(test))]
+    let _ = query_rows;
+    (window.key_rows, window.kv_offset)
+}
+
+fn copy_cached_keys(window: &StreamWindow) -> bool {
+    #[cfg(test)]
+    {
+        window.omit != StreamOmit::Keys
+    }
+    #[cfg(not(test))]
+    {
+        let _ = window;
+        true
+    }
+}
+
+fn cached_key_dest(window: &StreamWindow, cached_elems: usize) -> usize {
+    #[cfg(test)]
+    if window.omit == StreamOmit::Keys {
+        return 0;
+    }
+    #[cfg(not(test))]
+    let _ = window;
+    cached_elems
+}
+
+fn conv_cache_omitted(window: &StreamWindow) -> bool {
+    #[cfg(test)]
+    {
+        window.omit == StreamOmit::Conv
+    }
+    #[cfg(not(test))]
+    {
+        let _ = window;
+        false
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +407,7 @@ impl ParakeetEncoder {
     }
 
     #[cfg(test)]
-    pub(crate) fn encode_calls() -> u64 {
+    pub(crate) fn encode_call_count() -> u64 {
         ENCODE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1221,20 +1272,27 @@ impl ParakeetEncoder {
     }
 
     pub fn encode_chunk(&self, session: &mut NemotronStream, mel: &[f32]) -> Result<StreamChunk> {
-        self.encode_chunk_omitting(session, mel, StreamOmit::None)
+        #[cfg(test)]
+        {
+            self.encode_chunk_omitting(session, mel, StreamOmit::None)
+        }
+        #[cfg(not(test))]
+        {
+            let (output, caches) = self.run_chunk(session, mel)?;
+            self.commit_chunk(session, caches)?;
+            Ok(output)
+        }
     }
 
+    #[cfg(test)]
     pub fn encode_chunk_omitting(
         &self,
         session: &mut NemotronStream,
         mel: &[f32],
         omit: StreamOmit,
     ) -> Result<StreamChunk> {
-        #[cfg(test)]
-        {
-            ENCODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            ATTENTION_QUERY_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
+        ENCODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ATTENTION_QUERY_ROWS.store(0, std::sync::atomic::Ordering::Relaxed);
         let (output, caches) = self.run_chunk(session, mel, omit)?;
         if omit == StreamOmit::None {
             self.commit_chunk(session, caches)?;
@@ -1280,7 +1338,7 @@ impl ParakeetEncoder {
         &self,
         session: &NemotronStream,
         mel: &[f32],
-        omit: StreamOmit,
+        #[cfg(test)] omit: StreamOmit,
     ) -> Result<(StreamChunk, ChunkCaches)> {
         ensure!(
             mel.len().is_multiple_of(128) && mel.iter().all(|value| value.is_finite()),
@@ -1292,8 +1350,10 @@ impl ParakeetEncoder {
             frames == expected,
             "streaming mel frames {frames} require {expected}"
         );
-        let mut window = stream_window(session.cumulative, 4)?;
-        window.omit = omit;
+        #[cfg(test)]
+        let window = stream_window(session.cumulative, 4, omit)?;
+        #[cfg(not(test))]
+        let window = stream_window(session.cumulative, 4)?;
         ensure!(
             session.key_frames == window.cached as usize
                 && session.cumulative == session.chunks * 4
@@ -1306,16 +1366,18 @@ impl ParakeetEncoder {
             session.cumulative,
             session.chunks
         );
+        #[cfg(test)]
         if omit == StreamOmit::Keys {
             ensure!(session.key_frames > 0, "omit keys requires stored keys");
         }
+        #[cfg(test)]
         if omit == StreamOmit::Conv {
             ensure!(
                 session.conv.iter().all(|frame| frame.is_some()),
                 "omit conv requires a stored frame"
             );
         }
-        let (mut hidden, conv) = self.subsample_stream(mel, session, omit)?;
+        let (mut hidden, conv) = self.subsample_stream(mel, session, &window)?;
         let subsample = self.stream.clone_dtoh(&hidden)?;
         let mut keys = Vec::with_capacity(24);
         let mut values = Vec::with_capacity(24);
@@ -1357,7 +1419,7 @@ impl ParakeetEncoder {
         &self,
         input: &[f32],
         session: &NemotronStream,
-        omit: StreamOmit,
+        window: &StreamWindow,
     ) -> Result<(CudaSlice<f32>, [CudaSlice<f32>; 3])> {
         let mut hidden = self.stream.clone_htod(input)?;
         let mut time = input.len() / 128;
@@ -1378,7 +1440,7 @@ impl ParakeetEncoder {
             caches.push(cache);
             let zero_frames = if session.chunks == 0 {
                 2
-            } else if omit == StreamOmit::Conv {
+            } else if conv_cache_omitted(window) {
                 1
             } else {
                 0
@@ -1508,22 +1570,13 @@ impl ParakeetEncoder {
         let q = self.linear(&normalized, rows, &block.attention.q)?;
         let k = self.linear(&normalized, rows, &block.attention.k)?;
         let v = self.linear(&normalized, rows, &block.attention.v)?;
+        let (attend_rows, attend_offset) = attend_span(window, rows);
         let table = session
             .tables
-            .get(table_index(window.key_rows)?)
+            .get(table_index(attend_rows)?)
             .context("streaming position table")?;
-        let relative_rows = 2 * window.key_rows - 1;
+        let relative_rows = 2 * attend_rows - 1;
         let relative = self.linear(table, relative_rows, &block.attention.relative)?;
-        let attend_rows = if window.omit == StreamOmit::Keys {
-            rows
-        } else {
-            window.key_rows
-        };
-        let attend_offset = if window.omit == StreamOmit::Keys {
-            window.query_offset
-        } else {
-            window.kv_offset
-        };
         let cached = window.cached as usize;
         ensure!(
             session.keys[index].len() == cached * width
@@ -1532,12 +1585,8 @@ impl ParakeetEncoder {
         );
         let mut cat_k = self.stream.alloc_zeros(attend_rows as usize * width)?;
         let mut cat_v = self.stream.alloc_zeros(attend_rows as usize * width)?;
-        let dest = if window.omit == StreamOmit::Keys {
-            0
-        } else {
-            cached * width
-        };
-        if window.omit != StreamOmit::Keys {
+        let dest = cached_key_dest(window, cached * width);
+        if copy_cached_keys(window) {
             self.copy_device(&session.keys[index], 0, &mut cat_k, 0, cached * width)?;
             self.copy_device(&session.values[index], 0, &mut cat_v, 0, cached * width)?;
         }
@@ -1586,7 +1635,7 @@ impl ParakeetEncoder {
         let normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
         let expanded = self.linear(&normalized, rows, &block.convolution.pointwise1)?;
         let activated = self.activate(&expanded, rows, self.conformer.hidden, 2)?;
-        let launch_rows = if session.chunks == 0 || window.omit == StreamOmit::Conv {
+        let launch_rows = if session.chunks == 0 || conv_cache_omitted(window) {
             rows
         } else {
             12
@@ -1742,7 +1791,7 @@ mod position_tests {
             table_index(0).is_err() && table_index(6).is_err() && table_index(64).is_err(),
             "out-of-set key rows accepted"
         );
-        let first = stream_window(0, 4)?;
+        let first = stream_window(0, 4, StreamOmit::None)?;
         ensure!(
             first.key_rows == 4
                 && first.query_offset == 0
@@ -1750,7 +1799,7 @@ mod position_tests {
                 && first.cached == 0,
             "first window"
         );
-        let chunk14 = stream_window(56, 4)?;
+        let chunk14 = stream_window(56, 4, StreamOmit::None)?;
         ensure!(
             chunk14.key_rows == 60
                 && chunk14.query_offset == 56
@@ -1758,7 +1807,7 @@ mod position_tests {
                 && chunk14.cached == 56,
             "chunk 14 window"
         );
-        let chunk15 = stream_window(60, 4)?;
+        let chunk15 = stream_window(60, 4, StreamOmit::None)?;
         ensure!(
             chunk15.key_rows == 60
                 && chunk15.query_offset == 60
@@ -1766,13 +1815,13 @@ mod position_tests {
                 && chunk15.cached == 56,
             "chunk 15 window"
         );
-        let later = stream_window(5000, 4)?;
+        let later = stream_window(5000, 4, StreamOmit::None)?;
         ensure!(
             later.key_rows == 60 && later.cached == 56 && later.kv_offset == 5000 - 56,
             "cumulative 5000 changed the resident length"
         );
         ensure!(
-            stream_window(0, 3).is_err(),
+            stream_window(0, 3, StreamOmit::None).is_err(),
             "query rows other than 4 accepted"
         );
         ensure!(
@@ -1811,6 +1860,27 @@ mod position_tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn omitted_keys_select_the_query_table() -> Result<()> {
+        let omitted = stream_window(60, 4, StreamOmit::Keys)?;
+        let (attend_rows, attend_offset) = attend_span(&omitted, 4);
+        let self_row = 3usize * 2;
+        let query_table = relative_positions(attend_rows as usize, 2)?;
+        let wide_table = relative_positions(omitted.key_rows as usize, 2)?;
+        ensure!(
+            omitted.key_rows == 60
+                && attend_rows == 4
+                && attend_offset == omitted.query_offset
+                && table_index(attend_rows)? == 0
+                && (query_table[self_row] - 0.0).abs() < 1e-6
+                && (query_table[self_row + 1] - 1.0).abs() < 1e-6
+                && (wide_table[self_row] - 56f32.sin()).abs() < 1e-6
+                && (wide_table[self_row + 1] - 56f32.cos()).abs() < 1e-6,
+            "omitted keys select the 4-row table"
+        );
         Ok(())
     }
 

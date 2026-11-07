@@ -293,10 +293,10 @@ fn match_nemotron(engine: &ParakeetEncoder, fixtures: &Path, floors_path: &Path)
         engine.encode(&short.features[..short.frames * 128], valid)?
     };
     ensure!(
-        ParakeetEncoder::encode_launches() == 663 && ParakeetEncoder::encode_calls() == 1,
+        ParakeetEncoder::encode_launches() == 663 && ParakeetEncoder::encode_call_count() == 1,
         "short clip 0 launches={} calls={}",
         ParakeetEncoder::encode_launches(),
-        ParakeetEncoder::encode_calls()
+        ParakeetEncoder::encode_call_count()
     );
     let (second, second_mask, second_valid) = {
         let valid = short.mask[short.frames..short.frames * 2]
@@ -307,10 +307,10 @@ fn match_nemotron(engine: &ParakeetEncoder, fixtures: &Path, floors_path: &Path)
         engine.encode(&short.features[start..start + short.frames * 128], valid)?
     };
     ensure!(
-        ParakeetEncoder::encode_launches() == 1326 && ParakeetEncoder::encode_calls() == 2,
+        ParakeetEncoder::encode_launches() == 1326 && ParakeetEncoder::encode_call_count() == 2,
         "short clip 1 launches={} calls={}",
         ParakeetEncoder::encode_launches(),
-        ParakeetEncoder::encode_calls()
+        ParakeetEncoder::encode_call_count()
     );
     ensure!(
         first_mask.len() == 3
@@ -418,10 +418,11 @@ fn match_nemotron(engine: &ParakeetEncoder, fixtures: &Path, floors_path: &Path)
             ParakeetEncoder::reset_encode_counters();
             let (encoded, encoded_mask, encoded_valid) = engine.encode(input, valid)?;
             ensure!(
-                ParakeetEncoder::encode_launches() == 663 && ParakeetEncoder::encode_calls() == 1,
+                ParakeetEncoder::encode_launches() == 663
+                    && ParakeetEncoder::encode_call_count() == 1,
                 "{case}/{batch} launches={} calls={}",
                 ParakeetEncoder::encode_launches(),
-                ParakeetEncoder::encode_calls()
+                ParakeetEncoder::encode_call_count()
             );
             ensure!(
                 encoded_mask == expected_mask && encoded_valid == rows,
@@ -640,11 +641,11 @@ fn encode_checked(
     let output = engine.encode_chunk(session, input)?;
     ensure!(
         ParakeetEncoder::encode_launches() == 663
-            && ParakeetEncoder::encode_calls() == 1
+            && ParakeetEncoder::encode_call_count() == 1
             && ParakeetEncoder::attention_query_rows() == 4,
         "chunk {chunk} launches={} calls={} grid={}",
         ParakeetEncoder::encode_launches(),
-        ParakeetEncoder::encode_calls(),
+        ParakeetEncoder::encode_call_count(),
         ParakeetEncoder::attention_query_rows()
     );
     let cumulative = (chunk as u32 + 1) * 4;
@@ -929,12 +930,12 @@ fn match_nemotron_stream(
         slice_f32(&first.features, 1, first.feature_frames, 128),
     )?;
     ensure!(
-        ParakeetEncoder::encode_calls() == 2
+        ParakeetEncoder::encode_call_count() == 2
             && ParakeetEncoder::encode_launches() == 1326
             && ParakeetEncoder::attention_query_rows() == 4
             && left_out.encoder != right_out.encoder,
         "short clips calls={} launches={} grid={}",
-        ParakeetEncoder::encode_calls(),
+        ParakeetEncoder::encode_call_count(),
         ParakeetEncoder::encode_launches(),
         ParakeetEncoder::attention_query_rows()
     );
