@@ -288,6 +288,7 @@ struct Kernels {
     sinusoid: CudaFunction,
     gelu: CudaFunction,
     transpose: CudaFunction,
+    concat: CudaFunction,
 }
 enum CrossAttention {
     F32(F32Attention),
@@ -807,6 +808,7 @@ impl Kernels {
             sinusoid: v.load_function("sinusoidal_embed_f32")?,
             gelu: q.load_function(if T::HALF { "q38_gelu_f16" } else { "q38_gelu" })?,
             transpose: q.load_function("transpose_f32")?,
+            concat: q.load_function("concat_rows_f32")?,
         })
     }
     fn norm(
@@ -1009,6 +1011,35 @@ struct Work<T: FlowElement> {
     block_mod: CudaSlice<T::Parameters>,
 }
 impl<T: FlowElement> Work<T> {
+    fn bytes(&self) -> usize {
+        [
+            self.row_index.num_bytes(),
+            self.hidden.num_bytes(),
+            self.norm.num_bytes(),
+            self.projected.num_bytes(),
+            self.qkv.num_bytes(),
+            self.q.num_bytes(),
+            self.k.num_bytes(),
+            self.v.num_bytes(),
+            self.kn.num_bytes(),
+            self.attention.num_bytes(),
+            self.ff.num_bytes(),
+            self.cross_kv.num_bytes(),
+            self.cross_k.num_bytes(),
+            self.cross_kn.num_bytes(),
+            self.cross_v.num_bytes(),
+            self.cross_q32.num_bytes(),
+            self.cross_k32.num_bytes(),
+            self.cross_v32.num_bytes(),
+            self.cross_out32.num_bytes(),
+            self.outer.num_bytes(),
+            self.input_rows.num_bytes(),
+            self.output_rows.num_bytes(),
+            self.block_mod.num_bytes(),
+        ]
+        .into_iter()
+        .sum()
+    }
     fn new(d: &Device, n: usize, spec: &FlowSpec, context_rows: usize) -> Result<Self> {
         let s = &d.stream;
         let h = spec.model_channels;
@@ -1034,7 +1065,7 @@ impl<T: FlowElement> Work<T> {
             cross_out32: s.alloc_zeros(if T::HALF { 0 } else { n * h })?,
             outer: s.alloc_zeros(if T::HALF { 0 } else { n * h })?,
             input_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.in_channels })?,
-            output_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.in_channels })?,
+            output_rows: s.alloc_zeros(if T::HALF { 0 } else { n * spec.out_channels })?,
             block_mod: s.alloc_zeros(6 * h)?,
         })
     }
@@ -1052,6 +1083,7 @@ pub struct Conditioning<T: FlowElement = bf16> {
     origin: Rc<()>,
     global: CudaSlice<T>,
     projected: CudaSlice<T>,
+    concat: Option<CudaSlice<f32>>,
 }
 pub struct Flow<T: FlowElement = bf16> {
     origin: Rc<()>,
@@ -1076,6 +1108,7 @@ pub struct Flow<T: FlowElement = bf16> {
     time_count: usize,
     io: Option<SparseFlowIo>,
     time_embeddings: CudaSlice<T>,
+    normalization: Option<[[Vec<f32>; 2]; 2]>,
 }
 
 impl Flow<bf16> {
@@ -1097,7 +1130,9 @@ impl Flow<bf16> {
                 "pipeline.json"
             });
         let pipeline: serde_json::Value = serde_json::from_slice(&std::fs::read(pipeline)?)?;
-        let sampler = &pipeline["args"][if spec.sparse() {
+        let sampler = &pipeline["args"][if spec.texture() {
+            "tex_slat_sampler"
+        } else if spec.sparse() {
             "shape_slat_sampler"
         } else {
             "sparse_structure_sampler"
@@ -1112,12 +1147,41 @@ impl Flow<bf16> {
             sampler["name"] == "FlowEulerGuidanceIntervalSampler"
                 && sampler["args"]["sigma_min"] == 1e-5
                 && steps == 12
-                && parameters["guidance_strength"] == 7.5
-                && parameters["guidance_interval"] == serde_json::json!([0.6, 1.0])
-                && parameters["guidance_rescale"] == if spec.sparse() { 0.5 } else { 0.7 }
+                && parameters["guidance_strength"] == if spec.texture() { 1.0 } else { 7.5 }
+                && parameters["guidance_interval"]
+                    == serde_json::json!([0.6, if spec.texture() { 0.9 } else { 1.0 }])
+                && parameters["guidance_rescale"]
+                    == if spec.texture() {
+                        0.0
+                    } else if spec.sparse() {
+                        0.5
+                    } else {
+                        0.7
+                    }
                 && parameters["rescale_t"] == if spec.sparse() { 3.0 } else { 5.0 },
             "unsupported published flow sampler contract"
         );
+        let normalization = if spec.texture() {
+            let read = |name: &str| -> Result<[Vec<f32>; 2]> {
+                let value = &pipeline["args"][name];
+                let mean: Vec<f32> = serde_json::from_value(value["mean"].clone())?;
+                let std: Vec<f32> = serde_json::from_value(value["std"].clone())?;
+                ensure!(
+                    mean.len() == spec.out_channels
+                        && std.len() == mean.len()
+                        && mean.iter().all(|x| x.is_finite())
+                        && std.iter().all(|x| x.is_finite() && *x > 0.0),
+                    "invalid latent normalization"
+                );
+                Ok([mean, std])
+            };
+            Some([
+                read("shape_slat_normalization")?,
+                read("tex_slat_normalization")?,
+            ])
+        } else {
+            None
+        };
         let rows = coordinates.len();
         ensure!(
             rows > 0 && rows <= i32::MAX as usize / (3 * spec.model_channels),
@@ -1290,12 +1354,19 @@ impl Flow<bf16> {
         let work = Work::new(&device, rows, &spec, 5)?;
         let flash = Flash::new(device.stream.clone(), rows, heads, heads, dim)?;
         let mods = device.stream.alloc_zeros(steps * 6 * h)?;
-        let condition_bytes = 4usize
+        let condition_bytes = (if spec.texture() { 2usize } else { 4usize })
             .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
+            .and_then(|n| {
+                n.checked_add(if spec.texture() {
+                    4 * (rows + 2) * spec.out_channels
+                } else {
+                    0
+                })
+            })
             .context("flow conditioning bytes overflow")?;
         let sampler_bytes = rows
-            .checked_mul(spec.in_channels)
-            .and_then(|n| n.checked_mul(8 * size_of::<f32>()))
+            .checked_mul(spec.out_channels)
+            .and_then(|n| n.checked_mul((if spec.texture() { 3 } else { 8 }) * size_of::<f32>()))
             .and_then(|n| n.checked_add(8))
             .context("flow sampler bytes overflow")?;
         let time_width = time[0].weight.shape[1] as usize;
@@ -1311,6 +1382,12 @@ impl Flow<bf16> {
             cross_budget,
         )?;
         device.workspace_budget(free, budget, live_bytes)?;
+        if spec.texture() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"texture_setup": {"rows":rows,"runtime_weight_bytes":checkpoint.runtime_bytes,"work_bytes":work.bytes(),"phase_bytes":phases.num_bytes(),"modulation_bytes":mods.num_bytes(),"self_attention_lse_bytes":flash.lse.len()*size_of::<f32>(),"cross_attention_workspace_bytes":cross.workspace_bytes(),"quadratic_score_bytes":0,"conditioning_bound_bytes":condition_bytes,"sampler_bound_bytes":sampler_bytes,"time_bound_bytes":time_bytes,"free_before_bytes":free,"free_after_bytes":device.ctx.mem_get_info()?.0}})
+            );
+        }
         Ok(Self {
             origin: Rc::new(()),
             device: device.clone(),
@@ -1334,6 +1411,7 @@ impl Flow<bf16> {
             time_count: 0,
             io: None,
             time_embeddings: device.stream.alloc_zeros(0)?,
+            normalization,
         })
     }
 }
@@ -1358,16 +1436,25 @@ impl Flow<f16> {
             .flat_map(|&(time, next)| [time * 1000.0, next * 1000.0])
             .collect();
         self.set_times(&model_times)?;
-        let mut state = Sampler::new(&self.device, noise)?;
+        let mut state = Sampler::new(&self.device, noise, true)?;
+        let negative_values = state
+            .negative
+            .as_mut()
+            .context("Heun negative buffer missing")?;
+        let x0 = state.x0.as_mut().context("Heun predictor buffer missing")?;
+        let positive_x0 = state
+            .positive_x0
+            .as_mut()
+            .context("Heun corrector buffer missing")?;
         let update = cubin::module(&self.device.ctx, "flow")?.load_function("heun_update_f32")?;
         for (step, &(time, next)) in times.iter().enumerate() {
             for (stage, t) in [time, next].into_iter().enumerate() {
-                let input = if stage == 0 { &state.state } else { &state.x0 };
+                let input = if stage == 0 { &state.state } else { &*x0 };
                 self.forward(input, 2 * step + stage, positive, &mut state.positive)?;
                 let output = if stage == 0 {
                     &mut state.velocity
                 } else {
-                    &mut state.positive_x0
+                    &mut *positive_x0
                 };
                 let scale = if t >= 1.0 {
                     4.0
@@ -1377,14 +1464,14 @@ impl Flow<f16> {
                     1.0
                 };
                 if scale != 1.0 {
-                    self.forward(input, 2 * step + stage, negative, &mut state.negative)?;
+                    self.forward(input, 2 * step + stage, negative, negative_values)?;
                     unsafe {
                         self.device
                             .stream
                             .launch_builder(&state.guided)
                             .arg(&0u64)
                             .arg(&state.positive)
-                            .arg(&state.negative)
+                            .arg(&*negative_values)
                             .arg(&scale)
                             .arg(&0f32)
                             .arg(&(noise.len() as i64))
@@ -1396,14 +1483,14 @@ impl Flow<f16> {
                     self.device.stream.memcpy_dtod(&state.positive, output)?;
                 }
                 let target = if stage == 0 {
-                    ptr(&state.x0, &self.device)
+                    ptr(x0, &self.device)
                 } else {
                     ptr(&state.state, &self.device)
                 };
                 let second = if stage == 0 {
                     0
                 } else {
-                    ptr(&state.positive_x0, &self.device)
+                    ptr(positive_x0, &self.device)
                 };
                 unsafe {
                     self.device
@@ -1680,6 +1767,7 @@ impl Flow<f16> {
             time_count: 0,
             io: Some(io),
             time_embeddings,
+            normalization: None,
         })
     }
 }
@@ -1818,6 +1906,7 @@ impl<T: FlowElement> Flow<T> {
             origin: self.origin.clone(),
             global: cast(global)?,
             projected: cast(projected)?,
+            concat: None,
         })
     }
     pub fn conditioning_device(
@@ -1860,7 +1949,38 @@ impl<T: FlowElement> Flow<T> {
             origin: self.origin.clone(),
             global: output,
             projected: self.device.stream.alloc_zeros(0)?,
+            concat: None,
         })
+    }
+    pub fn condition_shape(
+        &self,
+        condition: &mut Conditioning<T>,
+        physical_shape: &[f32],
+        coordinates: &[[i32; 3]],
+    ) -> Result<()> {
+        validate_conditioning_origin(&condition.origin, &self.origin)?;
+        ensure!(
+            coordinates == self.coordinates,
+            "shape condition coordinate rows differ"
+        );
+        ensure!(
+            physical_shape.len() == self.rows * self.spec.out_channels
+                && physical_shape.iter().all(|x| x.is_finite()),
+            "invalid shape condition"
+        );
+        let normalization = self
+            .normalization
+            .as_ref()
+            .context("texture flow required")?;
+        let mut values = self.device.stream.clone_htod(physical_shape)?;
+        channel_transform(
+            &self.device,
+            &mut values,
+            [&normalization[0][0], &normalization[0][1]],
+            true,
+        )?;
+        condition.concat = Some(values);
+        Ok(())
     }
     fn block<const CONTROL: bool>(
         &mut self,
@@ -2164,7 +2284,7 @@ impl<T: FlowElement> Flow<T> {
         ensure!(
             time < self.time_count
                 && input.len()
-                    == self.io.as_ref().map_or(self.rows, |io| io.rows) * self.spec.in_channels
+                    == self.io.as_ref().map_or(self.rows, |io| io.rows) * self.spec.out_channels
                 && output.len() == input.len(),
             "flow input/time extent differs from setup"
         );
@@ -2192,7 +2312,26 @@ impl<T: FlowElement> Flow<T> {
                 [ptr(input, d), embedding, ptr(&self.work.hidden, d)],
             )?;
         } else {
-            let input_ptr = if self.spec.sparse() {
+            let input_ptr = if self.spec.texture() {
+                let concat = conditioning
+                    .concat
+                    .as_ref()
+                    .context("texture shape condition missing")?;
+                ensure!(concat.len() == input.len(), "shape concat extent mismatch");
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(&self.kernels.concat)
+                        .arg(input)
+                        .arg(concat)
+                        .arg(&self.work.input_rows)
+                        .arg(&(n as i64))
+                        .arg(&(self.spec.out_channels as i32))
+                        .arg(&(self.spec.out_channels as i32))
+                        .launch(flat(n * self.spec.in_channels))?;
+                }
+                ptr(&self.work.input_rows, &self.device)
+            } else if self.spec.sparse() {
                 ptr(input, &self.device)
             } else {
                 unsafe {
@@ -2282,11 +2421,11 @@ impl<T: FlowElement> Flow<T> {
 struct Sampler {
     state: CudaSlice<f32>,
     positive: CudaSlice<f32>,
-    negative: CudaSlice<f32>,
+    negative: Option<CudaSlice<f32>>,
     velocity: CudaSlice<f32>,
-    x0: CudaSlice<f32>,
-    positive_x0: CudaSlice<f32>,
-    std: CudaSlice<f32>,
+    x0: Option<CudaSlice<f32>>,
+    positive_x0: Option<CudaSlice<f32>>,
+    std: Option<CudaSlice<f32>>,
     guided: CudaFunction,
     convert: CudaFunction,
     std_kernel: CudaFunction,
@@ -2294,21 +2433,28 @@ struct Sampler {
     euler: CudaFunction,
 }
 impl Sampler {
-    fn new(d: &Device, noise: &[f32]) -> Result<Self> {
+    fn new(d: &Device, noise: &[f32], guided: bool) -> Result<Self> {
         ensure!(
             noise.len() > 1 && noise.iter().all(|x| x.is_finite()),
             "invalid flow noise"
         );
         let common = cubin::module(&d.ctx, "q38_common")?;
         let flow = cubin::module(&d.ctx, "flow")?;
+        let guided_buffer = |n| -> Result<Option<CudaSlice<f32>>> {
+            if guided {
+                Ok(Some(d.stream.alloc_zeros(n)?))
+            } else {
+                Ok(None)
+            }
+        };
         Ok(Self {
             state: d.stream.clone_htod(noise)?,
             positive: d.stream.alloc_zeros(noise.len())?,
-            negative: d.stream.alloc_zeros(noise.len())?,
+            negative: guided_buffer(noise.len())?,
             velocity: d.stream.alloc_zeros(noise.len())?,
-            x0: d.stream.alloc_zeros(noise.len())?,
-            positive_x0: d.stream.alloc_zeros(noise.len())?,
-            std: d.stream.alloc_zeros(2)?,
+            x0: guided_buffer(noise.len())?,
+            positive_x0: guided_buffer(noise.len())?,
+            std: guided_buffer(2)?,
             guided: common.load_function("guided_euler_f32")?,
             convert: flow.load_function("flow_x0_f32")?,
             std_kernel: cubin::module(&d.ctx, "norm")?.load_function("sample_std_f32")?,
@@ -2339,13 +2485,19 @@ impl Sampler {
             "invalid Euler time pair"
         );
         let count = self.state.len();
-        if (0.6..=1.0).contains(&t) {
+        if let Some(negative) = self.negative.as_ref().filter(|_| (0.6..=1.0).contains(&t)) {
+            let x0 = self.x0.as_ref().context("CFG x0 buffer missing")?;
+            let positive_x0 = self
+                .positive_x0
+                .as_ref()
+                .context("CFG positive x0 buffer missing")?;
+            let std = self.std.as_ref().context("CFG std buffer missing")?;
             unsafe {
                 d.stream
                     .launch_builder(&self.guided)
                     .arg(&0u64)
                     .arg(&self.positive)
-                    .arg(&self.negative)
+                    .arg(negative)
                     .arg(&7.5f32)
                     .arg(&0f32)
                     .arg(&(count as i64))
@@ -2353,16 +2505,10 @@ impl Sampler {
                     .arg(&self.velocity)
                     .launch(flat(count))?;
             }
-            self.convert(
-                d,
-                ptr(&self.positive, d),
-                ptr(&self.positive_x0, d),
-                t,
-                false,
-            )?;
-            self.convert(d, ptr(&self.velocity, d), ptr(&self.x0, d), t, false)?;
-            for (i, input) in [&self.positive_x0, &self.x0].into_iter().enumerate() {
-                let output = ptr(&self.std, d) + (i * 4) as u64;
+            self.convert(d, ptr(&self.positive, d), ptr(positive_x0, d), t, false)?;
+            self.convert(d, ptr(&self.velocity, d), ptr(x0, d), t, false)?;
+            for (i, input) in [positive_x0, x0].into_iter().enumerate() {
+                let output = ptr(std, d) + (i * 4) as u64;
                 unsafe {
                     d.stream
                         .launch_builder(&self.std_kernel)
@@ -2373,19 +2519,19 @@ impl Sampler {
                         .launch(grid(1, 256))?;
                 }
             }
-            let std_pos = ptr(&self.std, d);
+            let std_pos = ptr(std, d);
             let std_cfg = std_pos + 4;
             unsafe {
                 d.stream
                     .launch_builder(&self.rescale)
-                    .arg(&self.x0)
+                    .arg(x0)
                     .arg(&std_pos)
                     .arg(&std_cfg)
                     .arg(&(count as u64))
                     .arg(&(if sparse { 0.5f32 } else { 0.7f32 }))
                     .launch(flat(count))?;
             }
-            self.convert(d, ptr(&self.x0, d), ptr(&self.velocity, d), t, true)?;
+            self.convert(d, ptr(x0, d), ptr(&self.velocity, d), t, true)?;
         } else {
             d.stream.memcpy_dtod(&self.positive, &mut self.velocity)?;
         }
@@ -2422,12 +2568,18 @@ impl Flow<bf16> {
         &mut self,
         noise: &[f32],
         positive: &Conditioning,
-        negative: &Conditioning,
+        negative: Option<&Conditioning>,
     ) -> Result<Vec<f32>> {
         validate_conditioning_origin(&positive.origin, &self.origin)?;
-        validate_conditioning_origin(&negative.origin, &self.origin)?;
         ensure!(
-            noise.len() == self.rows * self.spec.in_channels,
+            negative.is_none() == self.spec.texture(),
+            "sampler conditioning branch mismatch"
+        );
+        if let Some(negative) = negative {
+            validate_conditioning_origin(&negative.origin, &self.origin)?;
+        }
+        ensure!(
+            noise.len() == self.rows * self.spec.out_channels,
             "noise extent differs from flow geometry"
         );
         let times = schedule(self.spec.sparse(), self.steps);
@@ -2436,11 +2588,16 @@ impl Flow<bf16> {
             .map(|t| (1000.0 * t) as f32)
             .collect();
         self.set_times(&model_times)?;
-        let mut sampler = Sampler::new(&self.device, noise)?;
+        let mut sampler = Sampler::new(&self.device, noise, !self.spec.texture())?;
         for step in 0..self.steps {
             self.forward(&sampler.state, step, positive, &mut sampler.positive)?;
-            if (0.6..=1.0).contains(&times[step]) {
-                self.forward(&sampler.state, step, negative, &mut sampler.negative)?;
+            if let Some(negative) = negative.filter(|_| (0.6..=1.0).contains(&times[step])) {
+                self.forward(
+                    &sampler.state,
+                    step,
+                    negative,
+                    sampler.negative.as_mut().context("CFG buffer missing")?,
+                )?;
             }
             sampler.step(
                 &self.device,
@@ -2449,22 +2606,28 @@ impl Flow<bf16> {
                 self.spec.sparse(),
             )?;
         }
+        if let Some(normalization) = &self.normalization {
+            channel_transform(
+                &self.device,
+                &mut sampler.state,
+                [&normalization[1][0], &normalization[1][1]],
+                false,
+            )?;
+        }
         Ok(self.device.stream.clone_dtoh(&sampler.state)?)
     }
 }
 
-/// Published per-channel latent denormalization, F32 multiply then F32 add.
-#[cfg(test)]
-fn denormalize_shape(
+fn channel_transform(
     d: &Device,
     values: &mut CudaSlice<f32>,
-    mean: &[f32],
-    std: &[f32],
-    channels: usize,
+    normalization: [&[f32]; 2],
+    inverse: bool,
 ) -> Result<()> {
+    let [mean, std] = normalization;
+    let channels = mean.len();
     ensure!(
         channels > 0
-            && mean.len() == channels
             && std.len() == channels
             && !values.is_empty()
             && values.len().is_multiple_of(channels),
@@ -2476,7 +2639,11 @@ fn denormalize_shape(
     );
     let mean = d.stream.clone_htod(mean)?;
     let std = d.stream.clone_htod(std)?;
-    let kernel = cubin::module(&d.ctx, "q38_common")?.load_function("channel_affine_f32")?;
+    let kernel = cubin::module(&d.ctx, "q38_common")?.load_function(if inverse {
+        "channel_affine_inverse_f32"
+    } else {
+        "channel_affine_f32"
+    })?;
     unsafe {
         d.stream
             .launch_builder(&kernel)
@@ -2729,6 +2896,8 @@ pub struct PixalDecoder {
     device_budget: usize,
     ones: CudaSlice<f16>,
     columns: Option<CudaSlice<u8>>,
+    #[cfg(test)]
+    subdivision_launches: std::cell::Cell<usize>,
 }
 pub struct SparseDecoderOutput {
     pub coordinates: Vec<[i32; 4]>,
@@ -2738,6 +2907,24 @@ pub struct SparseDecoderOutput {
 pub(crate) struct SubdivisionGuide<'a> {
     pub coordinates: &'a [[i32; 4]],
     pub logits: &'a [f32],
+}
+impl SubdivisionGuide<'_> {
+    fn validate(&self, coordinates: &[[i32; 4]]) -> Result<()> {
+        ensure!(
+            self.coordinates == coordinates
+                && self.logits.len() == coordinates.len() * 8
+                && self.logits.iter().all(|x| x.is_finite()),
+            "subdivision guide does not match stage coordinates"
+        );
+        Ok(())
+    }
+}
+fn validate_guide_count(kind: DecoderKind, count: usize) -> Result<()> {
+    ensure!(
+        count <= 4 && (!matches!(kind, DecoderKind::Texture) || count == 4),
+        "sparse subdivision guide count mismatch"
+    );
+    Ok(())
 }
 impl PixalDecoder {
     pub fn open(
@@ -2779,6 +2966,8 @@ impl PixalDecoder {
             weights,
             k,
             kind,
+            #[cfg(test)]
+            subdivision_launches: std::cell::Cell::new(0),
             initial_free: free,
             device_budget,
             ones,
@@ -2952,12 +3141,7 @@ impl PixalDecoder {
         let n = sites.coordinates().len();
         let blocks = [4, 16, 8, 4][stage];
         if let Some(guide) = guide {
-            ensure!(
-                guide.coordinates == sites.coordinates()
-                    && guide.logits.len() == n * 8
-                    && guide.logits.iter().all(|x| x.is_finite()),
-                "subdivision guide does not match stage coordinates"
-            );
+            guide.validate(sites.coordinates())?;
         }
         let d = &self.device;
         let available = d
@@ -2970,20 +3154,29 @@ impl PixalDecoder {
             .checked_mul(c * 10 + 16)
             .context("C2S workspace overflow")?;
         d.workspace_budget(self.initial_free, self.device_budget, live)?;
-        let mut subdivision = d.stream.alloc_zeros::<f16>(n * 8)?;
-        self.linear16(
-            &format!("{name}.to_subdiv"),
-            &x,
-            &mut subdivision,
-            [n, c, 8],
-        )?;
-        let predicted: Vec<f32> = d
-            .stream
-            .clone_dtoh(&subdivision)?
-            .into_iter()
-            .map(f16::to_f32)
-            .collect();
-        drop(subdivision);
+        let predicted = if matches!(self.kind, DecoderKind::Shape) {
+            #[cfg(test)]
+            self.subdivision_launches
+                .set(self.subdivision_launches.get() + 1);
+            let mut subdivision = d.stream.alloc_zeros::<f16>(n * 8)?;
+            self.linear16(
+                &format!("{name}.to_subdiv"),
+                &x,
+                &mut subdivision,
+                [n, c, 8],
+            )?;
+            let predicted: Vec<f32> = d
+                .stream
+                .clone_dtoh(&subdivision)?
+                .into_iter()
+                .map(f16::to_f32)
+                .collect();
+            drop(subdivision);
+            predicted
+        } else {
+            ensure!(guide.is_some(), "texture subdivision guide missing");
+            Vec::new()
+        };
         ensure!(
             predicted.iter().all(|x| x.is_finite()),
             "nonfinite subdivision logits"
@@ -3053,13 +3246,10 @@ impl PixalDecoder {
         F: FnMut([usize; 3], (&SparseSites, &[f32]), (&SparseSites, &CudaSlice<f16>)) -> Result<()>,
     {
         ensure!(
-            matches!(self.kind, DecoderKind::Shape),
-            "shape decoder required"
+            matches!(self.kind, DecoderKind::Shape | DecoderKind::Texture),
+            "sparse decoder required"
         );
-        ensure!(
-            guides.len() <= 4,
-            "expected at most four recorded subdivision guides"
-        );
+        validate_guide_count(self.kind, guides.len())?;
         let mut sites = SparseSites::new(coordinates)?;
         let n = sites.coordinates().len();
         ensure!(
@@ -3145,19 +3335,56 @@ impl PixalDecoder {
             channels: 64,
         })
     }
-    pub fn shape(&self, coordinates: Vec<[i32; 4]>, latent: &[f32]) -> Result<SparseDecoderOutput> {
-        let (sites, features) = self.sparse_decode(coordinates, latent, &[], |_, _, _| Ok(()))?;
-        let output = self.shape_head(&sites, features)?;
+    pub fn decode(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        guides: &[SparseDecoderOutput],
+    ) -> Result<(SparseDecoderOutput, Vec<SparseDecoderOutput>)> {
+        ensure!(
+            guides.iter().all(|g| g.channels == 8),
+            "subdivision guide width mismatch"
+        );
+        ensure!(
+            !matches!(self.kind, DecoderKind::Shape) || guides.is_empty(),
+            "shape decoder predicts its own guides"
+        );
+        let borrowed: Vec<_> = guides
+            .iter()
+            .map(|g| SubdivisionGuide {
+                coordinates: &g.coordinates,
+                logits: &g.features,
+            })
+            .collect();
+        let mut generated = Vec::new();
+        let (sites, features) =
+            self.sparse_decode(coordinates, latent, &borrowed, |_, (parents, logits), _| {
+                if matches!(self.kind, DecoderKind::Shape) {
+                    generated.push(SparseDecoderOutput {
+                        coordinates: parents.coordinates().to_vec(),
+                        features: logits.to_vec(),
+                        channels: 8,
+                    });
+                }
+                Ok(())
+            })?;
+        let mut output = self.output_head(&sites, features)?;
+        if matches!(self.kind, DecoderKind::Texture) {
+            channel_transform(&self.device, &mut output, [&[0.5; 6], &[0.5; 6]], false)?;
+        }
         let features = self.device.stream.clone_dtoh(&output)?;
         ensure!(
             features.iter().all(|x| x.is_finite()),
             "nonfinite shape output"
         );
-        Ok(SparseDecoderOutput {
-            coordinates: sites.coordinates().to_vec(),
-            features,
-            channels: output.len() / sites.coordinates().len(),
-        })
+        Ok((
+            SparseDecoderOutput {
+                coordinates: sites.coordinates().to_vec(),
+                features,
+                channels: output.len() / sites.coordinates().len(),
+            },
+            generated,
+        ))
     }
     pub fn shape_mesh(
         &self,
@@ -3165,8 +3392,12 @@ impl PixalDecoder {
         latent: &[f32],
         resolution: u32,
     ) -> Result<crate::sparse::SparseMesh> {
+        ensure!(
+            matches!(self.kind, DecoderKind::Shape),
+            "shape decoder required for mesh"
+        );
         let (sites, features) = self.sparse_decode(coordinates, latent, &[], |_, _, _| Ok(()))?;
-        let fields = self.shape_head(&sites, features)?;
+        let fields = self.output_head(&sites, features)?;
         super::sparse::dual_grid_mesh(
             &self.device,
             sites,
@@ -3182,6 +3413,10 @@ impl PixalDecoder {
         requested_resolution: u32,
         token_limit: usize,
     ) -> Result<(u32, SparseSites)> {
+        ensure!(
+            matches!(self.kind, DecoderKind::Shape),
+            "shape decoder required for cascade"
+        );
         ensure!(
             matches!(requested_resolution, 1024 | 1536) && token_limit > 0,
             "invalid cascade resolution or token limit"
@@ -3204,7 +3439,7 @@ impl PixalDecoder {
             resolution -= 128;
         }
     }
-    fn shape_head(&self, sites: &SparseSites, features: CudaSlice<f16>) -> Result<CudaSlice<f32>> {
+    fn output_head(&self, sites: &SparseSites, features: CudaSlice<f16>) -> Result<CudaSlice<f32>> {
         let d = &self.device;
         let rows = sites.coordinates().len();
         let channels = features.len() / rows;

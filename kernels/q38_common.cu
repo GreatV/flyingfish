@@ -1086,19 +1086,34 @@ extern "C" __global__ void softmax_rows_f32(float* __restrict__ scores,
 
 // Flow input concat in F32: out[t, 0:in] = x[c, t] (channel-major latent),
 // out[t, in:2*in] = 0, out[t, 2*in:2*in+cond] = cond[t, c].
-extern "C" __global__ void concat_channels_f32(const float* __restrict__ x,
+template<bool RowMajor = false>
+__device__ __forceinline__ void concat_channels(const float* __restrict__ x,
     const float* __restrict__ cond, float* __restrict__ out,
     long long length, int channels, int cond_dim) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const int width = 2 * channels + cond_dim;
+    const int width = RowMajor ? channels + cond_dim : 2 * channels + cond_dim;
     const long long total = length * width;
     if (i >= total) return;
     const long long t = i / width;
     const int c = (int)(i - t * width);
     float v = 0.0f;
-    if (c < channels) v = x[(long long)c * length + t];
-    else if (c >= 2 * channels) v = cond[t * cond_dim + (c - 2 * channels)];
+    if constexpr (RowMajor) {
+        v = c < channels ? x[t * channels + c] : cond[t * cond_dim + c - channels];
+    } else {
+        if (c < channels) v = x[(long long)c * length + t];
+        else if (c >= 2 * channels) v = cond[t * cond_dim + (c - 2 * channels)];
+    }
     out[i] = v;
+}
+extern "C" __global__ void concat_channels_f32(const float* __restrict__ x,
+    const float* __restrict__ cond, float* __restrict__ out,
+    long long length, int channels, int cond_dim) {
+    concat_channels(x, cond, out, length, channels, cond_dim);
+}
+extern "C" __global__ void concat_rows_f32(const float* __restrict__ x,
+    const float* __restrict__ cond, float* __restrict__ out,
+    long long length, int channels, int cond_dim) {
+    concat_channels<true>(x, cond, out, length, channels, cond_dim);
 }
 
 // Flow tail: velocity[c, t] = post[t, c] + proj[t, c]; post and proj are
@@ -1164,7 +1179,7 @@ extern "C" __global__ __launch_bounds__(256) void group_norm_nhwc_bf16(
 }
 
 // y[r, c] = bf16(residual[r, c] + bf16(branch[r, c] * scale[c])).
-template<typename T>
+template<typename T, bool Inverse = false>
 __device__ __forceinline__ void channel_scale_residual(
     const T* residual, const T* branch,
     const T* scale, T* y,
@@ -1176,7 +1191,9 @@ __device__ __forceinline__ void channel_scale_residual(
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t c = uint32_t(i % width);
-        if constexpr (sizeof(T) == sizeof(float))
+        if constexpr (Inverse)
+            y[i] = __fdiv_rn(__fsub_rn(branch[i], residual[c]), scale[c]);
+        else if constexpr (sizeof(T) == sizeof(float))
             y[i] = __fadd_rn(residual[broadcast_residual ? c : i], __fmul_rn(branch[i], scale[c]));
         else
             y[i] = __hadd(residual[broadcast_residual ? c : i], __hmul(branch[i], scale[c]));
@@ -1262,6 +1279,11 @@ extern "C" __global__ void channel_affine_f32(
     const float* x, const float* scale, const float* bias, float* y,
     uint32_t rows, uint32_t width) {
     channel_scale_residual(bias, x, scale, y, rows, width, true);
+}
+extern "C" __global__ void channel_affine_inverse_f32(
+    const float* x, const float* scale, const float* bias, float* y,
+    uint32_t rows, uint32_t width) {
+    channel_scale_residual<float, true>(bias, x, scale, y, rows, width, true);
 }
 
 extern "C" __global__ void channel_scale_residual_f16(

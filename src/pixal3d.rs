@@ -27,7 +27,10 @@ pub struct FlowSpec {
 
 impl FlowSpec {
     pub fn sparse(&self) -> bool {
-        self.in_channels == 32
+        self.in_channels != 8
+    }
+    pub fn texture(&self) -> bool {
+        self.in_channels == 64
     }
     pub fn projection_width(&self) -> usize {
         self.proj_in_channels.unwrap_or(self.cond_channels)
@@ -48,12 +51,13 @@ impl FlowSpec {
         ensure!(
             (d.name == "SparseStructureFlowModel" && s.in_channels == 8 && s.resolution == 16)
                 || (d.name == "ElasticSLatFlowModel"
-                    && s.in_channels == 32
+                    && matches!((s.in_channels, s.out_channels), (32, 32) | (64, 32))
                     && matches!(s.resolution, 32 | 64)),
             "unsupported Pixal3D flow definition"
         );
         ensure!(
-            s.out_channels == s.in_channels
+            s.out_channels == if s.sparse() { 32 } else { 8 }
+                && (!s.texture() || s.resolution == 64)
                 && s.model_channels == 1536
                 && s.cond_channels == 1024
                 && s.num_blocks == 30
@@ -375,6 +379,7 @@ impl FlowCheckpoint {
 pub enum DecoderKind {
     Structure,
     Shape,
+    Texture,
 }
 pub struct DecoderCheckpoint {
     pub kind: DecoderKind,
@@ -386,6 +391,7 @@ impl DecoderKind {
         match self {
             Self::Structure => "ss_dec_conv3d_16l8_fp16",
             Self::Shape => "shape_dec_next_dc_f16c32_fp16",
+            Self::Texture => "tex_dec_next_dc_f16c32_fp16",
         }
     }
     pub(crate) fn inventory(self) -> BTreeMap<String, (Vec<usize>, Dtype, bool)> {
@@ -443,9 +449,16 @@ impl DecoderKind {
                     );
                 }
             }
-            Self::Shape => {
+            Self::Shape | Self::Texture => {
                 pair("from_latent".into(), vec![1024, 32], 1024, Dtype::F16, true);
-                pair("output_layer".into(), vec![7, 64], 7, Dtype::F16, true);
+                let output = if matches!(self, Self::Texture) { 6 } else { 7 };
+                pair(
+                    "output_layer".into(),
+                    vec![output, 64],
+                    output,
+                    Dtype::F16,
+                    true,
+                );
                 for (stage, (c, blocks, co)) in
                     [(1024, 4, 512), (512, 16, 256), (256, 8, 128), (128, 4, 64)]
                         .into_iter()
@@ -492,13 +505,15 @@ impl DecoderKind {
                         Dtype::F16,
                         false,
                     );
-                    pair(
-                        format!("{name}.to_subdiv"),
-                        vec![8, c],
-                        8,
-                        Dtype::F16,
-                        false,
-                    );
+                    if matches!(self, Self::Shape) {
+                        pair(
+                            format!("{name}.to_subdiv"),
+                            vec![8, c],
+                            8,
+                            Dtype::F16,
+                            false,
+                        );
+                    }
                 }
             }
         }
@@ -521,10 +536,14 @@ impl DecoderKind {
                     && args.get("norm_type").is_none_or(|v| v == "layer"),
                 "unsupported dense structure decoder"
             ),
-            Self::Shape => ensure!(
-                config["name"] == "FlexiDualGridVaeDecoder"
-                    && args["resolution"] == 256
-                    && args["latent_channels"] == 32
+            Self::Shape | Self::Texture => ensure!(
+                (if matches!(self, Self::Shape) {
+                    config["name"] == "FlexiDualGridVaeDecoder" && args["resolution"] == 256
+                } else {
+                    config["name"] == "SparseUnetVaeDecoder"
+                        && args["out_channels"] == 6
+                        && args["pred_subdiv"] == false
+                }) && args["latent_channels"] == 32
                     && args["model_channels"] == serde_json::json!([1024, 512, 256, 128, 64])
                     && args["num_blocks"] == serde_json::json!([4, 16, 8, 4, 0])
                     && args["block_type"] == serde_json::json!(vec!["SparseConvNeXtBlock3d"; 5])
@@ -614,9 +633,13 @@ mod tests {
             "slat_flow_img2shape_dit_1_3B_1024_bf16",
             "slat_flow_img2shape_dit_1_3B_512_bf16_mv",
             "slat_flow_img2shape_dit_1_3B_1024_bf16_mv",
+            "slat_flow_imgshape2tex_dit_1_3B_1024_bf16",
+            "slat_flow_imgshape2tex_dit_1_3B_1024_bf16_mv",
         ] {
             let checkpoint = FlowCheckpoint::open(&root, stem)?;
-            let expected = if checkpoint.spec.sparse() {
+            let expected = if checkpoint.spec.texture() {
+                2_808_686_720
+            } else if checkpoint.spec.sparse() {
                 2_808_490_112
             } else {
                 2_715_920_416
@@ -641,7 +664,11 @@ mod tests {
     #[ignore = "requires published Pixal3D checkpoints; CPU only"]
     fn pixal3d_decoder_checkpoint_cpu() -> Result<()> {
         let root = std::env::var_os("FF_PIXAL_MODEL").context("FF_PIXAL_MODEL required")?;
-        for (kind, keys) in [(DecoderKind::Structure, 74), (DecoderKind::Shape, 292)] {
+        for (kind, keys) in [
+            (DecoderKind::Structure, 74),
+            (DecoderKind::Shape, 292),
+            (DecoderKind::Texture, 284),
+        ] {
             let checkpoint = DecoderCheckpoint::open(&Path::new(&root).join("ckpts"), kind)?;
             ensure!(
                 checkpoint.mapped.index.weight_map.len() == keys,
@@ -650,6 +677,7 @@ mod tests {
             let expected = match kind {
                 DecoderKind::Structure => 147_585_412,
                 DecoderKind::Shape => 948_598_492,
+                DecoderKind::Texture => 948_567_448,
             };
             ensure!(
                 checkpoint.runtime_bytes == expected,
