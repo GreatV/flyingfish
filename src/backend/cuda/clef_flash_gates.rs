@@ -537,9 +537,16 @@ mod gates {
         let ids = fixture_ids(512)?;
         let runtime = std::env::temp_dir().join(format!("clef-dcontrol-{}", std::process::id()));
         Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        // The accepted control form: the mutant is applied at load time
+        // (before plan binding), so the whole context carries it.
+        unsafe {
+            std::env::set_var("FF_CLEF_TEST_PLANT", "conv:4:2");
+        }
         let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        unsafe {
+            std::env::remove_var("FF_CLEF_TEST_PLANT");
+        }
         engine.prefill(&ids, None)?;
-        engine.plant_conv_decode(4, 2)?;
         engine.set_token(emitted[0])?;
         engine.decode(false, None)?;
         let step1 = engine.decode_logits()?;

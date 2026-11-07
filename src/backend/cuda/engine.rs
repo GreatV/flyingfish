@@ -4219,14 +4219,6 @@ impl Engine {
         Ok((s, history))
     }
 
-    /// cfg(test) decode control: overwrite `dst_layer`'s conv weights with
-    /// `src_layer`'s after the prefill, before the decode steps.
-    #[cfg(test)]
-    pub(crate) fn plant_conv_decode(&mut self, src_layer: usize, dst_layer: usize) -> Result<()> {
-        let qwen = self.qwen.as_mut().context("qwen runtime missing")?;
-        qwen.plant_conv_overwrite(&self.device.stream, src_layer, dst_layer)
-    }
-
     pub fn rewind(&mut self, position: usize, token: u32) -> Result<()> {
         ensure!(
             self.recurrent.is_none(),
