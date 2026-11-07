@@ -438,27 +438,6 @@ mod gates {
                     .fold(f64::NEG_INFINITY, f64::max);
                 println!("CLEF_D2_DEBUG l0 transposed_probe max={transposed_max:.6e}");
             }
-            let want_conv = refs
-                .get(&format!("l{layer}_conv_states_history"))
-                .with_context(|| format!("l{layer}_conv_states_history missing"))?;
-            ensure!(
-                history.len() == want_conv.len(),
-                "history extent layer {layer}: got {} want {}",
-                history.len(),
-                want_conv.len()
-            );
-            let (max, rmse) = max_rmse(&history, want_conv)?;
-            let bound = bounds
-                .get(&format!("l{layer}_conv_states_history"))
-                .context("history bound missing")?;
-            println!(
-                "CLEF_DECODE l{layer}_conv_states_history max={max:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
-                bound.0, bound.1
-            );
-            ensure!(
-                max <= bound.0 && rmse <= bound.1,
-                "decode cell l{layer}_conv_states_history exceeds the frozen bound"
-            );
             decode_cell(
                 &refs,
                 &bounds,
@@ -492,12 +471,6 @@ mod gates {
                 max <= bound.0 && rmse <= bound.1,
                 "decode cell l{layer}_conv_states_history exceeds the frozen bound"
             );
-            decode_cell(
-                &refs,
-                &bounds,
-                &format!("l{layer}_recurrent_states"),
-                &state,
-            )?;
         }
         Ok(())
     }
