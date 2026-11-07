@@ -371,73 +371,15 @@ mod gates {
         Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
         let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
         engine.prefill(&ids, None)?;
-        let interp_dir = std::env::var("FF_N2_TRACE_OUT")
-            .map(std::path::PathBuf::from)
-            .ok();
-        if let Some(dir) = interp_dir {
-            crate::backend::cuda::gdn::INTERMEDIATE_CAPTURE.with(|c| {
-                *c.borrow_mut() = Some(dir.join("intermediates"));
-            });
-            let _ = std::fs::create_dir_all(dir.join("intermediates"));
-        }
-        if let (Ok((pre_state, _)), Some(want)) = (
-            engine.decode_gdn_state(0),
-            refs.get("prefill_l0_recurrent_states"),
-        ) {
-            for h in 0..32usize {
-                let got_h = &pre_state[h * 128 * 128..(h + 1) * 128 * 128];
-                let want_h = &want[h * 128 * 128..(h + 1) * 128 * 128];
-                let (max, rmse) = max_rmse(got_h, want_h)?;
-                println!("CLEF_D2_PREFILL l0 head={h} max={max:.6e} rmse={rmse:.6e}");
-            }
-        }
         for (step, token) in emitted.iter().enumerate() {
             let cell = format!("decode_logits_s{step}");
             let logits = engine.decode_logits()?;
             decode_cell(&refs, &bounds, &cell, &logits)?;
             engine.set_token(*token)?;
             engine.decode(false, None)?;
-            let (state_step, _) = engine.decode_gdn_state(0)?;
-            let head = |h: usize| state_step[h * 128 * 128..(h + 1) * 128 * 128].to_vec();
-            let absmax = |v: &[f32]| v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            println!(
-                "CLEF_D2_STEP {step} absmax={:.6e} h4={:.6e} h21={:.6e} h2={:.6e}",
-                absmax(&state_step),
-                absmax(&head(4)),
-                absmax(&head(21)),
-                absmax(&head(2)),
-            );
-            if let Some(step_ref) = refs.get(&format!("step{step}_l0_recurrent_states")) {
-                let ref_head4 = &step_ref[4 * 128 * 128..(4 + 1) * 128 * 128];
-                let (max, rmse) = max_rmse(&head(4), ref_head4)?;
-                println!("CLEF_D2_STEPREF {step} h4_vs_ref max={max:.6e} rmse={rmse:.6e}");
-            }
         }
         for layer in [0usize, 1, 2] {
             let (state, history) = engine.decode_gdn_state(layer)?;
-            if layer == 0 {
-                // Localization: per-head breakdown of the recurrent state
-                // against the reference [hv, dk, dv] layout.
-                let want = refs.get("l0_recurrent_states").context("ref missing")?;
-                let hv = 32usize;
-                for h in 0..hv {
-                    let got_h = &state[h * 128 * 128..(h + 1) * 128 * 128];
-                    let want_h = &want[h * 128 * 128..(h + 1) * 128 * 128];
-                    let (max, rmse) = max_rmse(got_h, want_h)?;
-                    println!("CLEF_D2_DEBUG l0 head={h} max={max:.6e} rmse={rmse:.6e}");
-                }
-                let transposed_max = (0..128usize)
-                    .filter_map(|d| {
-                        max_rmse(
-                            &state[d..].iter().step_by(128).copied().collect::<Vec<_>>(),
-                            &want[d..].iter().step_by(128).copied().collect::<Vec<_>>(),
-                        )
-                        .ok()
-                        .map(|(m, _)| m)
-                    })
-                    .fold(f64::NEG_INFINITY, f64::max);
-                println!("CLEF_D2_DEBUG l0 transposed_probe max={transposed_max:.6e}");
-            }
             decode_cell(
                 &refs,
                 &bounds,
@@ -619,138 +561,6 @@ mod gates {
                     "logits cell L{length}_p{i} exceeds the frozen cell"
                 );
             }
-        }
-        Ok(())
-    }
-
-    /// Engine layer-0 sub-stage trace: saves every recorded layer-0 point
-    /// (qkv_projected absent in the GDN path; mixer_out, o_proj, norm1/2,
-    /// post_attention, ffn, gdn_s, gdn_history) to the run dir for the
-    /// CPU localization table.
-    #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_N2_TRACE_OUT"]
-    fn clef_flash_layer0_trace_dump() -> Result<()> {
-        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
-        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
-        let out_dir = PathBuf::from(std::env::var("FF_N2_TRACE_OUT").context("FF_N2_TRACE_OUT")?);
-        std::fs::create_dir_all(&out_dir)?;
-        let ids = fixture_ids(512)?;
-        let runtime = std::env::temp_dir().join(format!("clef-tr0-{}", std::process::id()));
-        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
-        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime))?;
-        engine.trace_layer = 0;
-        let mut trace = Trace::all_layers();
-        engine.prefill(&ids, Some(&mut trace))?;
-        for name in trace.names() {
-            if !name.starts_with("layer.") {
-                continue;
-            }
-            let values = trace.values(name)?;
-            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let fname = name.replace('/', "_");
-            std::fs::write(out_dir.join(format!("{fname}.f32")), bytes)?;
-            println!("CLEF_TRACE0_DUMP {name} elements={}", values.len());
-        }
-        println!("CLEF_TRACE0_DUMP out={}", out_dir.display());
-        Ok(())
-    }
-    /// Engine layer-0 sub-stage trace against the reference localization
-    /// taps: the in-proj projection, the conv history, the gated output
-    /// and the block output, each compared with max/rmse. Localization
-    /// only — these tensors never enter a freeze.
-    #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_REF_TAPS, FF_CLEF_FIXTURE_IDS"]
-    fn clef_flash_layer0_substage_trace() -> Result<()> {
-        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
-        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
-        let refs = load_ref_taps()?;
-        let ids = fixture_ids(512)?;
-        let runtime = std::env::temp_dir().join(format!("clef-tr0-{}", std::process::id()));
-        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
-        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime))?;
-        engine.trace_layer = 0;
-        let mut trace = Trace::all_layers();
-        engine.prefill(&ids, Some(&mut trace))?;
-        let names = trace.names();
-        println!("CLEF_TRACE0 points={}", names.len());
-        for n in &names {
-            println!("CLEF_TRACE0 has {n}");
-        }
-
-        // Conv-history check: the engine's history is the exact widening
-        // of the pre-conv input's last three rows; compare against the
-        // reference in_proj output's rows 509..512 laid out [channel, 3].
-        if let Ok(hist) = trace.values("layer.0.debug.gdn_history.e2e") {
-            // The reference splits concatenate channel-wise into the
-            // 8192-wide pre-conv input; its last three rows, laid out
-            // [channel, 3], are the conv history.
-            let q = refs.get("sub_in_proj_q").context("sub_in_proj_q missing")?;
-            let k = refs.get("sub_in_proj_k").context("sub_in_proj_k missing")?;
-            let v = refs.get("sub_in_proj_v").context("sub_in_proj_v missing")?;
-            let mut tail = Vec::with_capacity(8192 * 3);
-            for c in 0..8192usize {
-                let (split, col, stride) = if c < 2048 {
-                    (q, c, 2048usize)
-                } else if c < 4096 {
-                    (k, c - 2048, 2048usize)
-                } else {
-                    (v, c - 4096, 4096usize)
-                };
-                for j in 0..3 {
-                    tail.push(split[(509 + j) * stride + col]);
-                }
-            }
-            println!(
-                "CLEF_TRACE0 gdn_history extent={} tail={}",
-                hist.len(),
-                tail.len()
-            );
-            if tail.len() == hist.len() {
-                let (max, rmse) = max_rmse(&hist, &tail)?;
-                println!(
-                    "CLEF_TRACE0 gdn_history vs ref_inproj_tail: max={max:.6e} rmse={rmse:.6e}"
-                );
-            }
-        }
-        if let Ok(s_state) = trace.values("layer.0.debug.gdn_s.e2e") {
-            let absmax = s_state.iter().fold(0.0f64, |m, v| m.max((*v as f64).abs()));
-            let finite = s_state.iter().all(|v| v.is_finite());
-            println!(
-                "CLEF_TRACE0 gdn_s absmax={absmax:.6e} finite={finite} extent={}",
-                s_state.len()
-            );
-        }
-        for (point, ref_name) in [
-            ("layer.0.debug.mixer_out", "sub_norm_out"),
-            ("layer.0.debug.o_proj", "sub_block_out"),
-        ] {
-            let got = match trace.values(point) {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("CLEF_TRACE0 {point} absent: {e}");
-                    continue;
-                }
-            };
-            let want = match refs.get(ref_name) {
-                Some(w) => w,
-                None => {
-                    println!("CLEF_TRACE0 {point}: reference {ref_name} absent");
-                    continue;
-                }
-            };
-            if got.len() != want.len() {
-                println!(
-                    "CLEF_TRACE0 {point} vs {ref_name}: EXTENT got {} want {}",
-                    got.len(),
-                    want.len()
-                );
-                continue;
-            }
-            let (max, rmse) = max_rmse(&got, want)?;
-            println!(
-                "CLEF_TRACE0 {point} vs {ref_name}: max={max:.6e} rmse={rmse:.6e} extent={}",
-                got.len()
-            );
         }
         Ok(())
     }
