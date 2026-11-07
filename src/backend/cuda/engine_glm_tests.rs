@@ -1858,6 +1858,17 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         if let Ok(ref_t) = read_f32("router_logits") {
             diff_stat("router_logits", &stage_taps.router_logits, &ref_t);
         }
+        println!("STAGE_DIAG cand_routing_ids: {:?}", stage_taps.routing_ids);
+        println!(
+            "STAGE_DIAG cand_routing_weights: {:?}",
+            stage_taps.routing_weights
+        );
+        let moe_norm = to_f32(&stage_taps.moe_out)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
+        println!("STAGE_DIAG cand_moe_out norm: {moe_norm:.6}");
 
         if let Ok(t) = inter_st.tensor("x_norm2") {
             let ref_norm2: Vec<bf16> = t
