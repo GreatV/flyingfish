@@ -4,6 +4,7 @@ use super::{
     Device,
     engine_parakeet::{ParakeetEncoder, ParakeetTdt},
 };
+use crate::parakeet::ParakeetSpec;
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
@@ -204,11 +205,19 @@ fn margin(logits: &[f32], start: usize, end: usize) -> (usize, f32) {
     (best, logits[best] - logits[second])
 }
 
-fn joint_check(actual: &[f32], tensors: &SafeTensors<'_>, floors: &Value, tap: &str) -> Result<()> {
+fn joint_check(
+    actual: &[f32],
+    tensors: &SafeTensors<'_>,
+    floors: &Value,
+    spec: &ParakeetSpec,
+    tap: &str,
+) -> Result<()> {
     tdt_check(actual, &f32_values(tensors, tap)?, floors, "short", tap)?;
-    let (token, token_margin) = margin(actual, 0, 8193);
-    let (duration, duration_margin) = margin(actual, 8193, 8198);
-    let duration = duration - 8193;
+    let vocab = spec.vocab as usize;
+    let joint_width = vocab + spec.durations.len();
+    let (token, token_margin) = margin(actual, 0, vocab);
+    let (duration, duration_margin) = margin(actual, vocab, joint_width);
+    let duration = duration - vocab;
     let expected_token = scalar(tensors, &format!("{tap}_token_id"))? as usize;
     let expected_duration = scalar(tensors, &format!("{tap}_duration_id"))? as usize;
     let threshold = floors["id_detection"]["min_margin"]
@@ -235,6 +244,7 @@ fn prediction_check(
     floors: &Value,
     prefix: &str,
     projected: &[f32],
+    spec: &ParakeetSpec,
 ) -> Result<()> {
     let output = tdt.predict(token)?;
     tdt_check(
@@ -260,8 +270,8 @@ fn prediction_check(
         &format!("{prefix}_cell"),
     )?;
     if prefix != "repeat0" {
-        let joint = tdt.joint(&projected[..640])?;
-        joint_check(&joint, tensors, floors, &format!("joint_{prefix}"))?;
+        let joint = tdt.joint(&projected[..spec.decoder_hidden as usize])?;
+        joint_check(&joint, tensors, floors, spec, &format!("joint_{prefix}"))?;
     }
     Ok(())
 }
@@ -329,6 +339,7 @@ fn parakeet_prediction_and_joint_match_reference() -> Result<()> {
         std::env::var_os("FF_PARAKEET_TDT_FLOORS").context("FF_PARAKEET_TDT_FLOORS missing")?,
     ))?)?;
     let device = Device::new(0)?;
+    let spec = ParakeetSpec::read(&model)?;
     let mut tdt = ParakeetTdt::load(&model, &device)?;
     let short_bytes = std::fs::read(fixtures.join("short.safetensors"))?;
     let short = SafeTensors::deserialize(&short_bytes)?;
@@ -355,30 +366,42 @@ fn parakeet_prediction_and_joint_match_reference() -> Result<()> {
         }
     }
     tdt.reset()?;
-    prediction_check(&mut tdt, 8192, &short, &floors, "initial", &projected)?;
+    prediction_check(
+        &mut tdt, spec.blank, &short, &floors, "initial", &projected, &spec,
+    )?;
     ensure!(
-        tdt.lstm_call_count() == 2,
-        "initial blank did not run both LSTM layers"
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
+        "initial blank did not run every decoder LSTM layer"
     );
     tdt.reset()?;
-    prediction_check(&mut tdt, 1, &short, &floors, "nonblank", &projected)?;
-    ensure!(tdt.lstm_call_count() == 2, "nonblank prediction call count");
+    prediction_check(&mut tdt, 1, &short, &floors, "nonblank", &projected, &spec)?;
+    ensure!(
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
+        "nonblank prediction call count"
+    );
     tdt.reset()?;
     tdt.set_prediction_state(
         &f32_values(&short, "signed_initial_hidden")?,
         &f32_values(&short, "signed_initial_cell")?,
     )?;
-    prediction_check(&mut tdt, 1, &short, &floors, "signed", &projected)?;
+    prediction_check(&mut tdt, 1, &short, &floors, "signed", &projected, &spec)?;
     ensure!(
-        tdt.lstm_call_count() == 2,
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
         "signed-state prediction call count"
     );
 
     tdt.reset()?;
-    prediction_check(&mut tdt, 1, &short, &floors, "repeat0", &projected)?;
-    prediction_check(&mut tdt, 8192, &short, &floors, "repeat1", &projected)?;
-    prediction_check(&mut tdt, 8192, &short, &floors, "repeat2", &projected)?;
-    ensure!(tdt.lstm_call_count() == 2, "cached blank launched LSTM");
+    prediction_check(&mut tdt, 1, &short, &floors, "repeat0", &projected, &spec)?;
+    prediction_check(
+        &mut tdt, spec.blank, &short, &floors, "repeat1", &projected, &spec,
+    )?;
+    prediction_check(
+        &mut tdt, spec.blank, &short, &floors, "repeat2", &projected, &spec,
+    )?;
+    ensure!(
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
+        "cached blank launched LSTM"
+    );
     let (_, hidden, cell) = tdt.prediction_state()?;
     let control_hidden = f32_values(&short, "control_repeat_hidden")?;
     let control_cell = f32_values(&short, "control_repeat_cell")?;
@@ -394,7 +417,7 @@ fn parakeet_prediction_and_joint_match_reference() -> Result<()> {
         cell_max > 10.0 * max_bound && cell_rmse > 10.0 * rmse_bound,
         "cached-cell control is not discriminating"
     );
-    let joint = tdt.joint(&projected[..640])?;
+    let joint = tdt.joint(&projected[..spec.decoder_hidden as usize])?;
     let control = f32_values(&short, "joint_nonblank_no_relu")?;
     let (maximum, rmse) = difference(&joint, &control)?;
     let (max_bound, rmse_bound) = bounds(&floors, "short", "joint_nonblank")?;

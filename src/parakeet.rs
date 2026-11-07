@@ -386,11 +386,13 @@ impl ParakeetSpec {
         let vocab = positive(root, "vocab_size")?;
         let blank = positive(root, "blank_token_id")?;
         let durations = u32_list(root, "durations")?;
+        let decoder_hidden = positive(root, "decoder_hidden_size")?;
+        let decoder_layers = positive(root, "num_decoder_layers")?;
         ensure!(
             vocab == 8193
                 && blank == 8192
-                && positive(root, "decoder_hidden_size")? == 640
-                && positive(root, "num_decoder_layers")? == 2
+                && decoder_hidden == 640
+                && decoder_layers == 2
                 && positive(root, "max_symbols_per_step")? == 10
                 && durations == [0, 1, 2, 3, 4],
             "unsupported Parakeet TDT decoder geometry"
@@ -444,8 +446,8 @@ impl ParakeetSpec {
             attention_bias,
             convolution_bias,
             subsampling_channels: 256,
-            decoder_hidden: 640,
-            decoder_layers: 2,
+            decoder_hidden,
+            decoder_layers,
             vocab,
             blank,
             max_symbols: 10,
@@ -473,29 +475,33 @@ impl ParakeetSpec {
             expected.insert(name, (dtype, shape.to_vec()));
         };
         let h = self.hidden as usize;
-        insert("encoder_projector.weight".into(), Dtype::F32, &[640, h]);
-        insert("encoder_projector.bias".into(), Dtype::F32, &[640]);
-        insert("decoder.embedding.weight".into(), Dtype::F32, &[8193, 640]);
+        let d = self.decoder_hidden as usize;
+        let gate = 4 * d;
+        let vocab = self.vocab as usize;
+        let joint = vocab + self.durations.len();
+        insert("encoder_projector.weight".into(), Dtype::F32, &[d, h]);
+        insert("encoder_projector.bias".into(), Dtype::F32, &[d]);
+        insert("decoder.embedding.weight".into(), Dtype::F32, &[vocab, d]);
         insert(
             "decoder.decoder_projector.weight".into(),
             Dtype::F32,
-            &[640, 640],
+            &[d, d],
         );
-        insert("decoder.decoder_projector.bias".into(), Dtype::F32, &[640]);
+        insert("decoder.decoder_projector.bias".into(), Dtype::F32, &[d]);
         for layer in 0..self.decoder_layers {
             for kind in ["weight_ih", "weight_hh"] {
                 insert(
                     format!("decoder.lstm.{kind}_l{layer}"),
                     Dtype::F32,
-                    &[2560, 640],
+                    &[gate, d],
                 );
             }
             for kind in ["bias_ih", "bias_hh"] {
-                insert(format!("decoder.lstm.{kind}_l{layer}"), Dtype::F32, &[2560]);
+                insert(format!("decoder.lstm.{kind}_l{layer}"), Dtype::F32, &[gate]);
             }
         }
-        insert("joint.head.weight".into(), Dtype::F32, &[8198, 640]);
-        insert("joint.head.bias".into(), Dtype::F32, &[8198]);
+        insert("joint.head.weight".into(), Dtype::F32, &[joint, d]);
+        insert("joint.head.bias".into(), Dtype::F32, &[joint]);
         require_checkpoint(checkpoint, &expected, "Parakeet")
     }
 }
