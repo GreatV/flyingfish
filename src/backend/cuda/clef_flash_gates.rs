@@ -371,6 +371,15 @@ mod gates {
         Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
         let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
         engine.prefill(&ids, None)?;
+        let interp_dir = std::env::var("FF_N2_TRACE_OUT")
+            .map(std::path::PathBuf::from)
+            .ok();
+        if let Some(dir) = interp_dir {
+            crate::backend::cuda::gdn::INTERMEDIATE_CAPTURE.with(|c| {
+                *c.borrow_mut() = Some(dir.join("intermediates"));
+            });
+            let _ = std::fs::create_dir_all(dir.join("intermediates"));
+        }
         if let (Ok((pre_state, _)), Some(want)) = (
             engine.decode_gdn_state(0),
             refs.get("prefill_l0_recurrent_states"),
@@ -404,6 +413,7 @@ mod gates {
             if step + 1 < 8 {
                 engine.set_token(*token)?;
                 engine.decode(false, None)?;
+                break;
             }
         }
         for layer in [0usize, 1, 2] {
