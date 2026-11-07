@@ -1,3 +1,4 @@
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use crate::config::Config;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -183,20 +184,24 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn new(
-        c: &Config,
-        capacity: usize,
-        requested: Option<usize>,
-        free: usize,
-        total: usize,
-        alignment: usize,
-        draft_row_bytes: usize,
-    ) -> Result<Self> {
-        let row_bytes = (4 * c.hidden_size + c.qkv_dim() + 3 * c.intermediate_size) * 2
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn classic_row_bytes(c: &Config, draft_row_bytes: usize) -> usize {
+        (4 * c.hidden_size + c.qkv_dim() + 3 * c.intermediate_size) * 2
             + 4
             + c.num_attention_heads * 4
-            + draft_row_bytes;
-        Self::budget(capacity, requested, free, total, alignment, row_bytes)
+            + draft_row_bytes
+    }
+
+    pub fn new(request: WorkspaceRequest) -> Result<Self> {
+        Self::budget(
+            request.capacity,
+            request.requested,
+            request.free_after_resident,
+            request.total,
+            request.alignment,
+            request.row_bytes,
+            request.fixed_transient_bytes,
+        )
     }
 
     fn budget(
@@ -206,6 +211,7 @@ impl Plan {
         total: usize,
         alignment: usize,
         row_bytes: usize,
+        fixed_transient_bytes: usize,
     ) -> Result<Self> {
         ensure!(
             alignment > 0 && row_bytes > 0,
@@ -213,15 +219,18 @@ impl Plan {
         );
         ensure!(free <= total, "free VRAM exceeds total VRAM");
         let reserve_bytes = total / 16;
-        let available = free.checked_sub(reserve_bytes).ok_or_else(|| {
-            anyhow::anyhow!(
-                "prefill VRAM budget: required reserve={reserve_bytes} available={free}"
-            )
-        })?;
+        let available = free
+            .checked_sub(reserve_bytes)
+            .and_then(|n| n.checked_sub(fixed_transient_bytes))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "prefill fixed reservations exceed VRAM: fixed={fixed_transient_bytes} reserve={reserve_bytes} available={free}"
+                )
+            })?;
         let row_limit = capacity.min(available / row_bytes);
         ensure!(
             row_limit > 0,
-            "prefill workspace cannot fit one row: required={row_bytes} available={available}"
+            "prefill workspace cannot fit one row: required={row_bytes} available={available} fixed_bytes={fixed_transient_bytes}"
         );
         let chunk = if let Some(chunk) = requested {
             ensure!(
@@ -467,34 +476,88 @@ mod tests {
 
     #[test]
     fn budget_bounds_and_override() {
-        let plan = Plan::budget(33024, None, 160000, 160000, 64, 4).unwrap();
+        let plan = Plan::budget(33024, None, 160000, 160000, 64, 4, 0).unwrap();
         assert_eq!(plan.chunk, 32768);
         assert!(plan.chunk * plan.row_bytes + plan.reserve_bytes <= plan.free_bytes);
-        assert!(Plan::budget(33024, Some(33025), 160000, 160000, 64, 4).is_err());
+        assert!(Plan::budget(33024, Some(33025), 160000, 160000, 64, 4, 0).is_err());
         assert_eq!(
-            Plan::budget(33024, Some(33024), 160000, 160000, 64, 4)
+            Plan::budget(33024, Some(33024), 160000, 160000, 64, 4, 0)
                 .unwrap()
                 .chunk,
             33024
         );
-        let exact = Plan::budget(16, Some(16), 72, 128, 1, 4).unwrap();
+        let exact = Plan::budget(16, Some(16), 72, 128, 1, 4, 0).unwrap();
         assert_eq!(exact.row_limit, 16);
-        assert!(Plan::budget(16, Some(16), 71, 128, 1, 4).is_err());
+        assert!(Plan::budget(16, Some(16), 71, 128, 1, 4, 0).is_err());
     }
 
     #[test]
     fn memory_limit_and_small_sequence() {
         assert_eq!(
-            Plan::budget(32768, None, 20000, 160000, 64, 4)
+            Plan::budget(32768, None, 20000, 160000, 64, 4, 0)
                 .unwrap()
                 .chunk,
             2048
         );
         assert_eq!(
-            Plan::budget(17, None, 160000, 160000, 64, 4).unwrap().chunk,
+            Plan::budget(17, None, 160000, 160000, 64, 4, 0)
+                .unwrap()
+                .chunk,
             17
         );
-        assert!(Plan::budget(32768, None, 10000, 160000, 64, 4).is_err());
+        assert!(Plan::budget(32768, None, 10000, 160000, 64, 4, 0).is_err());
+    }
+    #[test]
+    fn classic_fixed_budget_shrinks_automatic_chunk() -> anyhow::Result<()> {
+        let capacity = 131072usize;
+        let total = 48usize << 30;
+        let hidden = 7168usize;
+        let qkv = hidden + 2 * 1024;
+        let intermediate = 22016usize;
+        let row_bytes = (4 * hidden + qkv + 3 * intermediate) * 2 + 4 + 56 * 4;
+        let embedding = 166912 * hidden * 2;
+        let fixed_weights = 2 * embedding + 2 * hidden + 52 * 2 * 2 * hidden;
+        let kv = capacity * 52 * 1024 * 4;
+        let fixed = fixed_weights + kv;
+        let old = Plan::budget(capacity, None, total, total, 128, row_bytes, 0)?;
+        assert_eq!(old.chunk, capacity);
+        assert!(old.chunk * row_bytes + fixed > total - total / 16);
+        let plan = Plan::new(WorkspaceRequest {
+            capacity,
+            requested: None,
+            free_after_resident: total,
+            total,
+            alignment: 128,
+            row_bytes,
+            fixed_transient_bytes: fixed,
+        })?;
+        assert_eq!(plan.chunk, 65536);
+        assert!(plan.chunk * row_bytes + fixed <= total - total / 16);
+        assert!(
+            Plan::budget(
+                capacity,
+                Some(capacity),
+                total,
+                total,
+                128,
+                row_bytes,
+                fixed
+            )
+            .is_err()
+        );
+        let below_minimum = total - total / 16 - row_bytes + 1;
+        let error =
+            Plan::budget(capacity, None, total, total, 128, row_bytes, below_minimum).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prefill workspace cannot fit one row")
+        );
+        println!(
+            "PASS classic_fixed_budget capacity={capacity} total_gib=48 old_chunk={} chunk={} row_bytes={row_bytes} fixed_weights={fixed_weights} kv_bytes={kv} minimum_error_named=true",
+            old.chunk, plan.chunk
+        );
+        Ok(())
     }
 }
 
