@@ -722,7 +722,7 @@ pub struct Engine {
     capacity: usize,
     chunk: usize,
     workspace_rows: usize,
-    trace_layer: usize,
+    pub(crate) trace_layer: usize,
     position: usize,
     #[cfg(feature = "cuda")]
     prefix_identity: Option<PrefixIdentity>,
@@ -3966,6 +3966,14 @@ impl Engine {
 
     pub fn step(&mut self, graph: bool) -> Result<()> {
         self.advance(graph, None)
+    }
+
+    /// cfg(test) control: the in-memory conv-weight mutant of the gate
+    /// module (no file is written).
+    #[cfg(test)]
+    pub(crate) fn control_readback(&self, layer: usize, needle: &str) -> Result<(usize, f32)> {
+        let qwen = self.qwen.as_ref().context("qwen runtime missing")?;
+        qwen.plant_readback(&self.device.stream, layer, needle)
     }
 
     pub fn rewind(&mut self, position: usize, token: u32) -> Result<()> {

@@ -2637,6 +2637,14 @@ impl WeightCatalog {
             load_wall_ms,
         })
     }
+    #[cfg(test)]
+    pub(crate) fn bf16_mut(&mut self, name: &str) -> Result<&mut CudaSlice<bf16>> {
+        match self.tensors.get_mut(name) {
+            Some(StoredTensor::Bf16(v)) => Ok(v),
+            _ => anyhow::bail!("missing/non-BF16 tensor {name}"),
+        }
+    }
+
     pub fn bf16(&self, name: &str) -> Result<&CudaSlice<bf16>> {
         match self.tensors.get(name) {
             Some(StoredTensor::Bf16(v)) => Ok(v),

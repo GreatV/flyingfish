@@ -1081,6 +1081,7 @@ mod tests {
             abi_version: 1,
             architecture: Architecture::Qwen35Text,
             expert_format: None,
+            mtp_layers: 1,
             hidden: 5120,
             intermediate: 17408,
             vocab: 248320,
