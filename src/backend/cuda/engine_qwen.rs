@@ -2246,6 +2246,35 @@ impl Runtime {
         runtime.bind_linear_calls(engine, invariant)?;
         Ok(runtime)
     }
+    /// cfg(test) decode control: copy the conv weights of `src_layer`
+    /// into `dst_layer`'s catalog buffer (direct write, no clone).
+    #[cfg(test)]
+    pub(super) fn plant_conv_overwrite(
+        &mut self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        src_layer: usize,
+        dst_layer: usize,
+    ) -> Result<()> {
+        let pick = |layer: usize| -> Result<String> {
+            self.catalog
+                .tensors
+                .keys()
+                .find(|k| k.contains(&format!("layers.{layer}.")) && k.contains("conv1d.weight"))
+                .cloned()
+                .with_context(|| format!("conv1d weight for layer {layer} not found"))
+        };
+        let src = pick(src_layer)?;
+        let dst = pick(dst_layer)?;
+        let src_host = stream.clone_dtoh(self.catalog.bf16(&src)?)?;
+        {
+            let dst_ref = self.catalog.bf16_mut(&dst)?;
+            stream.memcpy_htod(&src_host, dst_ref)?;
+        }
+        let readback = stream.clone_dtoh(self.catalog.bf16(&dst)?)?;
+        let absmax = readback.iter().fold(0.0f32, |m, v| m.max(v.to_f32().abs()));
+        println!("CLEF_DECODE_PLANT_CONV {src} -> {dst} absmax_after={absmax:.6e}");
+        Ok(())
+    }
     /// cfg(test) control readback: nonzero element count and absmax of the
     /// first catalog tensor of `layer` whose name contains `needle`.
     #[cfg(test)]

@@ -274,6 +274,248 @@ mod gates {
         Ok(())
     }
 
+    type DecodeRefs = (BTreeMap<String, Vec<f32>>, BTreeMap<String, (f64, f64)>);
+
+    fn load_decode_refs() -> Result<DecodeRefs> {
+        let path = PathBuf::from(
+            std::env::var("FF_CLEF_DECODE_REF").context("FF_CLEF_DECODE_REF missing")?,
+        );
+        let bytes = std::fs::read(&path)?;
+        let view = SafeTensors::deserialize(&bytes)?;
+        let mut refs = BTreeMap::new();
+        for name in view.names() {
+            if view.tensor(name)?.dtype() == safetensors::Dtype::I32 {
+                continue;
+            }
+            refs.insert(name.to_owned(), tensor_f32(&view, name)?);
+        }
+        let tau_path = PathBuf::from(
+            std::env::var("FF_CLEF_DECODE_TAUS").context("FF_CLEF_DECODE_TAUS missing")?,
+        );
+        let taus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&tau_path)
+                .with_context(|| format!("decode tau file {} missing", tau_path.display()))?,
+        )?;
+        let mut bounds = BTreeMap::new();
+        for (name, cell) in taus.as_object().context("tau cells")? {
+            bounds.insert(
+                name.clone(),
+                (
+                    cell["tau"].as_f64().context("tau max")?,
+                    cell["tau_rmse"].as_f64().context("tau rmse")?,
+                ),
+            );
+        }
+        Ok((refs, bounds))
+    }
+
+    fn decode_cell(
+        refs: &BTreeMap<String, Vec<f32>>,
+
+        bounds: &BTreeMap<String, (f64, f64)>,
+        cell: &str,
+        got: &[f32],
+    ) -> Result<()> {
+        let want = refs
+            .get(cell)
+            .with_context(|| format!("decode reference {cell} missing"))?;
+        ensure!(
+            got.len() == want.len(),
+            "decode extent {cell}: got {} want {}",
+            got.len(),
+            want.len()
+        );
+        let (max, rmse) = max_rmse(got, want)?;
+        let bound = bounds
+            .get(cell)
+            .with_context(|| format!("frozen decode bound {cell} missing"))?;
+        println!(
+            "CLEF_DECODE {cell} max={max:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+            bound.0, bound.1
+        );
+        ensure!(
+            max <= bound.0 && rmse <= bound.1,
+            "decode cell {cell} exceeds the frozen bound"
+        );
+        Ok(())
+    }
+
+    fn emitted_ids(refs: &BTreeMap<String, Vec<f32>>) -> Result<Vec<u32>> {
+        (0..8)
+            .map(|step| {
+                let logits = refs
+                    .get(&format!("decode_logits_s{step}"))
+                    .context("decode logits cell missing")?;
+                let argmax = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .context("empty logits")?;
+                Ok(argmax.0 as u32)
+            })
+            .collect()
+    }
+
+    /// Decode cells D1+D2: teacher-forced K=8 steps after the 512-token
+    /// prefill. Per-step logits and the post-step GDN state/conv history
+    /// are gated against the frozen decode references.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_DECODE_REF, FF_CLEF_DECODE_TAUS, FF_CLEF_FIXTURE_IDS"]
+    fn clef_flash_decode_cells() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let (refs, bounds) = load_decode_refs()?;
+        let emitted = emitted_ids(&refs)?;
+        let ids = fixture_ids(512)?;
+        let runtime = std::env::temp_dir().join(format!("clef-decode-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        engine.prefill(&ids, None)?;
+        for (step, token) in emitted.iter().enumerate() {
+            let cell = format!("decode_logits_s{step}");
+            let logits = engine.decode_logits()?;
+            decode_cell(&refs, &bounds, &cell, &logits)?;
+            if step + 1 < 8 {
+                engine.set_token(*token)?;
+                engine.decode(false, None)?;
+            }
+        }
+        for layer in [0usize, 1, 2] {
+            let (state, history) = engine.decode_gdn_state(layer)?;
+            decode_cell(
+                &refs,
+                &bounds,
+                &format!("l{layer}_recurrent_states"),
+                &state,
+            )?;
+            // The engine's history [conv_dim, 3] is the last three
+            // columns of the reference window [conv_dim, 4].
+            let want = refs
+                .get(&format!("l{layer}_conv_states_history"))
+                .with_context(|| format!("l{layer}_conv_states_history missing"))?;
+            ensure!(
+                history.len() == want.len(),
+                "history extent layer {layer}: got {} want {}",
+                history.len(),
+                want.len()
+            );
+            let (max, rmse) = max_rmse(&history, want)?;
+            let bound = bounds
+                .get(&format!("l{layer}_conv_states_history"))
+                .context("history bound missing")?;
+            println!(
+                "CLEF_DECODE l{layer}_conv_states_history max={max:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+                bound.0, bound.1
+            );
+            ensure!(
+                max <= bound.0 && rmse <= bound.1,
+                "decode cell l{layer}_conv_states_history exceeds the frozen bound"
+            );
+            decode_cell(
+                &refs,
+                &bounds,
+                &format!("l{layer}_recurrent_states"),
+                &state,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Decode D3: eager and CUDA-graph decode over teacher-forced steps
+    /// must be bit-identical, and the decode reset must preserve the
+    /// identity across all four mode pairs.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_DECODE_REF, FF_CLEF_DECODE_TAUS, FF_CLEF_FIXTURE_IDS"]
+    fn clef_flash_decode_identity() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let (refs, _) = load_decode_refs()?;
+        let emitted = emitted_ids(&refs)?;
+        let ids = fixture_ids(512)?;
+        let runtime = std::env::temp_dir().join(format!("clef-dident-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        fn probe(
+            engine: &mut Engine,
+            emitted: &[u32],
+            ids: &[u32],
+            graph: bool,
+        ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
+            engine.reset()?;
+            engine.prefill(ids, None)?;
+            let mut tokens = Vec::new();
+            let mut logits = Vec::new();
+            for token in emitted {
+                let step_logits = engine.decode_logits()?;
+                logits.extend(step_logits);
+                tokens.push(*token);
+                engine.set_token(*token)?;
+                engine.decode(graph, None)?;
+            }
+            let (state, _) = engine.decode_gdn_state(1)?;
+            Ok((tokens, logits, state))
+        }
+        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime))?;
+        let mut defects = 0;
+        for (first_mode, second_mode) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let first = probe(&mut engine, &emitted, &ids, first_mode)?;
+            let second = probe(&mut engine, &emitted, &ids, second_mode)?;
+            let same = first.0 == second.0
+                && first.1.len() == second.1.len()
+                && first
+                    .1
+                    .iter()
+                    .zip(second.1.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                && first.2 == second.2;
+            println!(
+                "CLEF_DECODE_IDENTITY first={first_mode} second={second_mode} identical={same}"
+            );
+            defects += usize::from(!same);
+        }
+        ensure!(
+            defects == 0,
+            "DEFECT clef_flash_decode_identity pairs={defects}"
+        );
+        Ok(())
+    }
+
+    /// Decode D4: the conv-overwrite mutant applied after the prefill
+    /// moves the first decode-step logits far beyond the frozen bound.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_DECODE_REF, FF_CLEF_DECODE_TAUS, FF_CLEF_FIXTURE_IDS"]
+    fn clef_flash_decode_control() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let (refs, bounds) = load_decode_refs()?;
+        let emitted = emitted_ids(&refs)?;
+        let ids = fixture_ids(512)?;
+        let runtime = std::env::temp_dir().join(format!("clef-dcontrol-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        engine.prefill(&ids, None)?;
+        engine.plant_conv_decode(4, 2)?;
+        engine.set_token(emitted[0])?;
+        engine.decode(false, None)?;
+        let step1 = engine.decode_logits()?;
+        let want = refs
+            .get("decode_logits_s1")
+            .context("decode reference s1 missing")?;
+        let (max, rmse) = max_rmse(&step1, want)?;
+        let bound = bounds.get("decode_logits_s1").context("tau s1 missing")?;
+        println!(
+            "CLEF_DECODE_CONTROL decode_conv_overwrite max={max:.6e} (>= {:.6e}) rmse={rmse:.6e} (>= {:.6e})",
+            10.0 * bound.0,
+            10.0 * bound.1
+        );
+        ensure!(
+            max >= 10.0 * bound.0 && rmse >= 10.0 * bound.1,
+            "decode conv control under 10x"
+        );
+        Ok(())
+    }
+
     /// Text logits cells at 8 spread positions on both fixtures.
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_FROZEN, FF_CLEF_REF_TAPS, FF_CLEF_FIXTURE_IDS"]
