@@ -66,10 +66,10 @@ fn record_route_trace(
     trace: &mut Trace,
     route_prefix: &str,
     slice: (usize, usize, usize),
-    host: (&[i32], &[bf16], &[bool]),
+    host: (&[i32], &[bf16], &[bool], &[u32]),
 ) -> Result<()> {
     let (base, rows, top_k) = slice;
-    let (host_ids, host_weights, cpu_arithmetic) = host;
+    let (host_ids, host_weights, cpu_arithmetic, cpu_experts) = host;
     let route_ids = route_trace_choices(host_ids, base, rows, top_k)?;
     let route_weights = route_trace_choices(host_weights, base, rows, top_k)?;
     let route_cpu = route_ids
@@ -90,6 +90,14 @@ fn record_route_trace(
         format!("{route_prefix}.moe.cpu"),
         vec![rows, top_k],
         route_cpu,
+    )?;
+    trace.add(
+        format!("{route_prefix}.moe.cpu_selected"),
+        vec![rows, top_k],
+        route_ids
+            .iter()
+            .map(|expert| u8::from(cpu_experts.contains(&(*expert as u32))) as f32)
+            .collect(),
     )?;
     Ok(())
 }
@@ -2230,6 +2238,11 @@ impl Engine {
                                 prefill.gpu.host_ids.as_slice()?,
                                 prefill.gpu.host_weights.as_slice()?,
                                 &prefill.gpu.cpu_arithmetic,
+                                if *slot_layer < prefill.capacity.gpu0_layers {
+                                    prefill.plan.cpu()
+                                } else {
+                                    &[]
+                                },
                             ),
                         )?;
                         let span = prefill
@@ -2271,7 +2284,12 @@ impl Engine {
                                 trace,
                                 &route_prefix,
                                 (row_start, traced_rows, top_k),
-                                (host_ids, host_weights, &prefill.gpu.cpu_arithmetic),
+                                (
+                                    host_ids,
+                                    host_weights,
+                                    &prefill.gpu.cpu_arithmetic,
+                                    if on_peer { &[] } else { prefill.plan.cpu() },
+                                ),
                             )?;
                             record_span_moe_trace(
                                 trace,
@@ -2924,8 +2942,15 @@ mod tests {
                 &mut all_trace,
                 &route_prefix,
                 (base, rows, top_k),
-                (&host_ids, &host_weights, &cpu_arithmetic),
+                (&host_ids, &host_weights, &cpu_arithmetic, &[2]),
             )?;
+            assert_eq!(
+                all_trace.values(&format!("{route_prefix}.moe.cpu_selected"))?,
+                host_ids[base * top_k..(base + rows) * top_k]
+                    .iter()
+                    .map(|id| u8::from(*id == 2) as f32)
+                    .collect::<Vec<_>>()
+            );
         }
         record_wave_hidden_trace(
             &mut all_trace,
@@ -2975,7 +3000,7 @@ mod tests {
             &mut tail_trace,
             &route_trace_prefix(false, "prefill.0", 0, 12),
             (12, 20, top_k),
-            (&tail_ids, &tail_weights, &cpu_arithmetic),
+            (&tail_ids, &tail_weights, &cpu_arithmetic, &[2]),
         )?;
         record_wave_hidden_trace(
             &mut tail_trace,

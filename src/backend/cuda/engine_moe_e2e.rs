@@ -3213,7 +3213,45 @@ fn run_prefill_combine_case(
 
 fn decode_combine_probe(engine: &mut Engine, ids: &[u32], graph: bool) -> Result<DecodeProbe> {
     engine.reset()?;
-    let mut tokens = vec![engine.prefill(ids, None)?];
+    let flint = engine.model_spec.architecture == crate::model_spec::Architecture::Flint;
+    let directory = flint
+        .then(|| std::env::var_os("FF_Q38_PROBE_DIR"))
+        .flatten()
+        .map(PathBuf::from);
+    let mut trace = directory.as_ref().map(|_| Trace::all_layers());
+    let mut tokens = vec![engine.prefill(ids, trace.as_mut())?];
+    let prefill_position = engine.position;
+    let prefill_logits = if flint {
+        engine
+            .decode_logits()?
+            .into_iter()
+            .map(|value| {
+                ensure!(value.is_finite(), "Runner FAIL nonfinite prefill logits");
+                Ok(value.to_bits())
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let prefill_state = if flint {
+        chain_state(engine)?
+    } else {
+        Vec::new()
+    };
+    if let (Some(directory), Some(trace)) = (directory, trace) {
+        std::fs::create_dir_all(&directory)?;
+        let completed_layers = engine.moe.as_ref().context("Flint executor missing")?.stats[4];
+        trace.save(&directory.join(format!("prefill-{completed_layers}.safetensors")))?;
+        println!(
+            "T43_FLINT_PREFILL_CAPTURE completed_decode_layers={} position={} cpu_choices={}",
+            completed_layers,
+            prefill_position,
+            engine
+                .moe_prefill
+                .as_ref()
+                .map_or(0, |prefill| prefill.stats[3])
+        );
+    }
     let mut logits = Vec::with_capacity(8 * engine.model_spec.vocab as usize);
     for _ in 0..8 {
         let token = engine.decode(graph, None)?;
@@ -3237,6 +3275,9 @@ fn decode_combine_probe(engine: &mut Engine, ids: &[u32], graph: bool) -> Result
         tokens,
         logits,
         state,
+        prefill_position,
+        prefill_logits,
+        prefill_state,
     })
 }
 
@@ -3244,6 +3285,9 @@ struct DecodeProbe {
     tokens: Vec<u32>,
     logits: Vec<u32>,
     state: Vec<u8>,
+    prefill_position: usize,
+    prefill_logits: Vec<u32>,
+    prefill_state: Vec<u8>,
 }
 
 fn run_decode_combine_case(
@@ -3753,8 +3797,7 @@ fn minicpm_decode_combine_identity_gpu() -> Result<()> {
     Ok(())
 }
 
-fn flint_live_state(engine: &Engine, probe: &DecodeProbe) -> Result<Vec<u8>> {
-    let live = engine.position;
+fn flint_live_state(engine: &Engine, state: &[u8], live: usize) -> Result<Vec<u8>> {
     let dim = engine.model_spec.head_dim as usize;
     let mut values = Vec::new();
     let mut offset = 0usize;
@@ -3767,16 +3810,16 @@ fn flint_live_state(engine: &Engine, probe: &DecodeProbe) -> Result<Vec<u8>> {
                 let end = offset
                     .checked_add(ring_len)
                     .context("Flint state extent overflow")?;
-                ensure!(end <= probe.state.len(), "Flint state extent is short");
-                values.extend_from_slice(&probe.state[offset..offset + live_len]);
+                ensure!(end <= state.len(), "Flint state extent is short");
+                values.extend_from_slice(&state[offset..offset + live_len]);
                 offset = end;
             }
         }
     }
     ensure!(
-        offset == probe.state.len(),
+        offset == state.len(),
         "Flint state trailing bytes differ: consumed={offset} total={}",
-        probe.state.len()
+        state.len()
     );
     Ok(values)
 }
@@ -3785,33 +3828,54 @@ fn flint_order_difference(
     engine: &Engine,
     first: &DecodeProbe,
     second: &DecodeProbe,
+    prefill: bool,
 ) -> Result<serde_json::Value> {
+    let (first_logits, second_logits, first_bytes, second_bytes, live, tokens) = if prefill {
+        ensure!(
+            first.prefill_position == second.prefill_position,
+            "Runner FAIL Flint prefill positions differ"
+        );
+        (
+            &first.prefill_logits,
+            &second.prefill_logits,
+            &first.prefill_state,
+            &second.prefill_state,
+            first.prefill_position,
+            1,
+        )
+    } else {
+        (
+            &first.logits,
+            &second.logits,
+            &first.state,
+            &second.state,
+            engine.position,
+            first.tokens.len(),
+        )
+    };
     ensure!(
-        first.tokens.len() == second.tokens.len() && first.logits.len() == second.logits.len(),
+        first.tokens.len() == second.tokens.len() && first_logits.len() == second_logits.len(),
         "Runner FAIL Flint order-control logit extents differ"
     );
-    let first_state = flint_live_state(engine, first)?;
-    let second_state = flint_live_state(engine, second)?;
+    let first_state = flint_live_state(engine, first_bytes, live)?;
+    let second_state = flint_live_state(engine, second_bytes, live)?;
     ensure!(
         first_state.len() == second_state.len(),
         "Runner FAIL Flint order-control state extents differ"
     );
-    let token_mismatches = first
-        .tokens
+    let token_mismatches = first.tokens[..tokens]
         .iter()
-        .zip(&second.tokens)
+        .zip(&second.tokens[..tokens])
         .filter(|(a, b)| a != b)
         .count();
-    let logit_mismatches = first
-        .logits
+    let logit_mismatches = first_logits
         .iter()
-        .zip(&second.logits)
+        .zip(second_logits)
         .filter(|(a, b)| a != b)
         .count();
     let mut state_mismatches = 0;
     let mut first_state_location = None;
     let mut offset = 0;
-    let live = engine.position;
     let dim = engine.model_spec.head_dim as usize;
     for layer in 0..engine.state.kv.len() {
         for tensor in ["k", "v"] {
@@ -3842,7 +3906,7 @@ fn flint_order_difference(
     Ok(serde_json::json!({
         "token_mismatches": token_mismatches,
         "logit_mismatches": logit_mismatches,
-        "logit_elements": first.logits.len(),
+        "logit_elements": first_logits.len(),
         "state_mismatches": state_mismatches,
         "state_bytes": first_state.len(),
         "first_state": if first_state_location.is_some() {
@@ -3907,8 +3971,20 @@ fn flint_decode_combine_identity_gpu() -> Result<()> {
             "Runner FAIL Flint reset changed placement"
         );
         let second = decode_combine_probe(&mut engine, &ids, second_mode)?;
-        let difference = flint_order_difference(&engine, &first, &second)?;
-        let passed = difference["token_mismatches"] == 0
+        let prefill_difference = flint_order_difference(&engine, &first, &second, true)?;
+        let prefill_passed = prefill_difference["token_mismatches"] == 0
+            && prefill_difference["logit_mismatches"] == 0
+            && prefill_difference["state_mismatches"] == 0;
+        println!(
+            "{} T43_FLINT_PREFILL first={} second={} {}",
+            if prefill_passed { "PASS" } else { "DEFECT" },
+            first_mode,
+            second_mode,
+            prefill_difference
+        );
+        let difference = flint_order_difference(&engine, &first, &second, false)?;
+        let passed = prefill_passed
+            && difference["token_mismatches"] == 0
             && difference["logit_mismatches"] == 0
             && difference["state_mismatches"] == 0;
         order_defects += usize::from(!passed);
