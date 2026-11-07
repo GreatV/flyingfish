@@ -1148,6 +1148,11 @@ mod native {
             Ok(stream.clone_dtoh(&self._buffers._contributions)?)
         }
 
+        #[cfg(all(test, feature = "cuda"))]
+        pub(crate) fn read_logits(&self, stream: &Arc<CudaStream>) -> Result<Vec<f32>> {
+            Ok(stream.clone_dtoh(&self._buffers._logits)?)
+        }
+
         pub(crate) fn run(
             &self,
             stream: &Arc<CudaStream>,

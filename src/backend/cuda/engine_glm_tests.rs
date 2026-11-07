@@ -1772,6 +1772,111 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     );
 
     let mut defects = Vec::new();
+    let stage_taps = runtime.read_stage_taps()?;
+    let inter_file = ref_dir.join("ref_intermediates.safetensors");
+    if inter_file.exists() {
+        let inter_bytes = std::fs::read(&inter_file)?;
+        let inter_st = safetensors::SafeTensors::deserialize(&inter_bytes)?;
+
+        let read_bf16 = |name: &str| -> Result<Vec<f32>> {
+            let t = inter_st.tensor(name)?;
+            Ok(t.data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+                .collect())
+        };
+        let read_f32 = |name: &str| -> Result<Vec<f32>> {
+            let t = inter_st.tensor(name)?;
+            Ok(t.data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect())
+        };
+
+        let diff_stat = |name: &str, cand: &[f32], refer: &[f32]| {
+            let mut max_abs = 0.0f32;
+            let mut sum_sq = 0.0f32;
+            let mut worst_idx = 0;
+            for (i, (&c, &r)) in cand.iter().zip(refer).enumerate() {
+                let d = (c - r).abs();
+                if d > max_abs {
+                    max_abs = d;
+                    worst_idx = i;
+                }
+                sum_sq += d * d;
+            }
+            let rmse = (sum_sq / cand.len().max(1) as f32).sqrt();
+            println!(
+                "STAGE_DIAG {name:15}: max_abs={max_abs:.6} rmse={rmse:.6} worst_idx={worst_idx} (cand={} ref={})",
+                cand.get(worst_idx).unwrap_or(&0.0),
+                refer.get(worst_idx).unwrap_or(&0.0)
+            );
+        };
+
+        let to_f32 = |v: &[bf16]| -> Vec<f32> { v.iter().map(|x| x.to_f32()).collect() };
+
+        if let Ok(ref_t) = read_bf16("enorm_out") {
+            diff_stat("enorm_out", &to_f32(&stage_taps.enorm), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("hnorm_out") {
+            diff_stat("hnorm_out", &to_f32(&stage_taps.hnorm), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("eh_in") {
+            diff_stat("eh_in", &to_f32(&stage_taps.eh_in), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x") {
+            diff_stat("x", &to_f32(&stage_taps.x_init), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x_norm1") {
+            diff_stat("x_norm1", &to_f32(&stage_taps.x_norm1), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("kv_latent") {
+            diff_stat("kv_latent", &to_f32(&stage_taps.kv_latent), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("q_a") {
+            diff_stat("q_a", &to_f32(&stage_taps.q_a), &ref_t);
+        }
+        if let Ok(ref_t) = read_f32("q_out") {
+            diff_stat("q_out", &to_f32(&stage_taps.q_out), &ref_t);
+        }
+        if let Ok(ref_t) = read_f32("attn_out") {
+            diff_stat("attn_out", &to_f32(&stage_taps.attn_out), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("o_out") {
+            diff_stat("o_out", &to_f32(&stage_taps.o_out), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x_curr") {
+            diff_stat("x_curr", &to_f32(&stage_taps.x_curr), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x_norm2") {
+            diff_stat("x_norm2", &to_f32(&stage_taps.x_norm2), &ref_t);
+        }
+        if let Ok(ref_t) = read_f32("router_logits") {
+            diff_stat("router_logits", &stage_taps.router_logits, &ref_t);
+        }
+
+        if let Ok(t) = inter_st.tensor("x_norm2") {
+            let ref_norm2: Vec<bf16> = t
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                .collect();
+            let (ctrl_logits, ctrl_ids, ctrl_weights) =
+                runtime.test_route_custom_norm(&ref_norm2)?;
+            if let Ok(ref_t) = read_f32("router_logits") {
+                diff_stat("ctrl_router_logits", &ctrl_logits, &ref_t);
+            }
+            println!("STAGE_DIAG ctrl_router_ids (from ref x_norm2): got {ctrl_ids:?}");
+            println!("STAGE_DIAG ctrl_router_weights: {ctrl_weights:?}");
+        }
+    }
+
     let (synth_cand_ids, synth_cand_weights) = runtime
         .last_route()
         .context("synthetic router tap missing")?

@@ -213,6 +213,27 @@ pub(crate) struct GlmMtpExpertHost {
     pub(crate) down_scales: Vec<f32>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct GlmMtpStageTaps {
+    pub enorm: Vec<bf16>,
+    pub hnorm: Vec<bf16>,
+    pub eh_in: Vec<bf16>,
+    pub x_init: Vec<bf16>,
+    pub x_norm1: Vec<bf16>,
+    pub kv_latent: Vec<bf16>,
+    pub q_a: Vec<bf16>,
+    pub q_out: Vec<bf16>,
+    pub attn_out: Vec<bf16>,
+    pub o_out: Vec<bf16>,
+    pub x_curr: Vec<bf16>,
+    pub x_norm2: Vec<bf16>,
+    pub router_logits: Vec<f32>,
+    pub routing_ids: Vec<i32>,
+    pub routing_weights: Vec<f32>,
+    pub moe_out: Vec<bf16>,
+}
+
 pub(crate) struct GlmMtpRuntime {
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) rms_norm: CudaFunction,
@@ -284,7 +305,10 @@ pub(crate) struct GlmMtpRuntime {
     pub(crate) hnorm_buf: CudaSlice<bf16>,
     pub(crate) eh_buf: CudaSlice<bf16>,
     pub(crate) x_buf: CudaSlice<bf16>,
+    pub(crate) x_init_buf: CudaSlice<bf16>,
     pub(crate) x_norm_buf: CudaSlice<bf16>,
+    pub(crate) x_norm1_buf: CudaSlice<bf16>,
+    pub(crate) x_curr_buf: CudaSlice<bf16>,
     pub(crate) kv_a_buf: CudaSlice<bf16>,
     pub(crate) kv_latent_buf: CudaSlice<bf16>,
     pub(crate) q_a_buf: CudaSlice<bf16>,
@@ -768,7 +792,10 @@ impl GlmMtpRuntime {
             hnorm_buf: stream.alloc_zeros::<bf16>(4096)?,
             eh_buf: stream.alloc_zeros::<bf16>(8192)?,
             x_buf: stream.alloc_zeros::<bf16>(4096)?,
+            x_init_buf: stream.alloc_zeros::<bf16>(4096)?,
             x_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
+            x_norm1_buf: stream.alloc_zeros::<bf16>(4096)?,
+            x_curr_buf: stream.alloc_zeros::<bf16>(4096)?,
             kv_a_buf: stream.alloc_zeros::<bf16>(512)?,
             kv_latent_buf: stream.alloc_zeros::<bf16>(512)?,
             q_a_buf: stream.alloc_zeros::<bf16>(1536)?,
@@ -908,6 +935,7 @@ impl GlmMtpRuntime {
             &mut self.x_buf,
             (1, 4096, 8192),
         )?;
+        stream.memcpy_dtod(&self.x_buf, &mut self.x_init_buf)?;
 
         run_rms_norm(
             &stream,
@@ -918,6 +946,7 @@ impl GlmMtpRuntime {
             (1, 4096),
             1e-5,
         )?;
+        stream.memcpy_dtod(&self.x_norm_buf, &mut self.x_norm1_buf)?;
 
         let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
         let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
@@ -1027,6 +1056,7 @@ impl GlmMtpRuntime {
         self.o_proj
             .run(&self.fp8, &stream, attn_out_tensor, &o_tensor)?;
         run_add(&stream, &self.add, &mut self.x_buf, &self.o_buf, 4096)?;
+        stream.memcpy_dtod(&self.x_buf, &mut self.x_curr_buf)?;
 
         run_rms_norm(
             &stream,
@@ -1249,6 +1279,46 @@ impl GlmMtpRuntime {
         blas: &Blas,
     ) -> Result<Vec<f32>> {
         self.forward_with_history(history_tokens, history_hidden, swap_eh, false, blas)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_stage_taps(&self) -> Result<GlmMtpStageTaps> {
+        let stream = &self.stream;
+        let (ids, weights) = self.last_route.as_ref().cloned().unwrap_or_default();
+        let router_logits = self.native_moe.read_logits(stream)?;
+        Ok(GlmMtpStageTaps {
+            enorm: stream.clone_dtoh(&self.enorm_buf)?,
+            hnorm: stream.clone_dtoh(&self.hnorm_buf)?,
+            eh_in: stream.clone_dtoh(&self.eh_buf)?,
+            x_init: stream.clone_dtoh(&self.x_init_buf)?,
+            x_norm1: stream.clone_dtoh(&self.x_norm1_buf)?,
+            kv_latent: stream.clone_dtoh(&self.kv_latent_buf)?,
+            q_a: stream.clone_dtoh(&self.q_a_buf)?,
+            q_out: stream.clone_dtoh(&self.q_b_buf)?,
+            attn_out: stream.clone_dtoh(&self.attn_out_buf)?,
+            o_out: stream.clone_dtoh(&self.o_buf)?,
+            x_curr: stream.clone_dtoh(&self.x_curr_buf)?,
+            x_norm2: stream.clone_dtoh(&self.x_norm_buf)?,
+            router_logits,
+            routing_ids: ids,
+            routing_weights: weights,
+            moe_out: stream.clone_dtoh(&self.moe_out_buf)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_route_custom_norm(
+        &mut self,
+        norm: &[bf16],
+    ) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>)> {
+        let stream = self.stream.clone();
+        stream.memcpy_htod(norm, &mut self.x_norm_buf)?;
+        let (x_norm_ptr, _) = self.x_norm_buf.device_ptr(&stream);
+        let x_norm_tensor = unsafe { Tensor::new(x_norm_ptr, [1, 4096], [4096, 1], 4096 * 2)? };
+        self.native_moe.enqueue_route(&stream, x_norm_tensor)?;
+        let logits = self.native_moe.read_logits(&stream)?;
+        let (ids, weights) = self.native_moe.read_route(&stream)?;
+        Ok((logits, ids, weights))
     }
 
     #[allow(clippy::too_many_arguments)]
