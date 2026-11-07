@@ -21,6 +21,7 @@ pub mod model;
 pub mod model_spec;
 pub mod mtp;
 pub mod music3;
+pub mod nemotron;
 pub mod op_contract;
 pub mod parakeet;
 pub mod pixal3d;

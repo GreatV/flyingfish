@@ -210,7 +210,7 @@ impl CanarySpec {
         let features = processor
             .get("feature_extractor")
             .context("Canary feature_extractor missing")?;
-        let mel = parakeet::feature_log_mel(features)?;
+        let mel = parakeet::feature_log_mel(features, "ParakeetFeatureExtractor")?;
         exact_keys(
             generation,
             &[
@@ -260,6 +260,20 @@ impl CanarySpec {
             attention_bias: self.attention_bias,
             convolution_bias: self.convolution_bias,
             prefix: "model.encoder",
+            max_position: 5000,
+            conv_batch_norm: true,
+            pad_left: 1,
+            pad_right: 1,
+            depthwise_left: self.conv_kernel / 2,
+            linear_in: 4096,
+            chunk_size: 0,
+            left_chunks: 0,
+            conv_names: [
+                "subsampling.layers.0",
+                "subsampling.layers.2",
+                "subsampling.layers.5",
+            ],
+            pointwise_names: ["subsampling.layers.3", "subsampling.layers.6"],
         }
     }
 
