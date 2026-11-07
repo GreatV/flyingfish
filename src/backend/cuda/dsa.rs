@@ -100,6 +100,14 @@ impl DsaState {
         stream.memcpy_htod(&[0, 0, 0, self.capacity as i32, 0, 0, 0, 0], &mut self.meta)?;
         Ok(())
     }
+    pub fn clear(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        stream.memset_zeros(&mut self.latent)?;
+        stream.memset_zeros(&mut self.packed)?;
+        stream.memset_zeros(&mut self.pool_keys)?;
+        stream.memset_zeros(&mut self.token_ids)?;
+        stream.memset_zeros(&mut self.pool_ids)?;
+        self.reset(stream)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

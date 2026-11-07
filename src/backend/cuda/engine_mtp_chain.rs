@@ -28,9 +28,42 @@ pub(crate) struct GlmMtpRoundOutput {
     #[cfg(test)]
     pub(crate) expert_union_count: usize,
     #[cfg(test)]
+    pub(crate) draft_staged_experts: usize,
+    #[cfg(test)]
     pub(crate) v0_margin: f32,
     #[cfg(test)]
     pub(crate) v1_margin: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GlmMtpDraftStepConfig {
+    pub(crate) draft_pos: usize,
+    pub(crate) committed_row: usize,
+    pub(crate) hidden_tap: MtpHiddenTap,
+    pub(crate) retain_committed_on_reject: bool,
+}
+
+pub(crate) fn glm_mtp_draft_step_config(
+    start_pos: usize,
+    last_input_kind: Option<crate::prefix_state::PrefixLastInputKind>,
+    resident_ids_len: usize,
+) -> Result<GlmMtpDraftStepConfig> {
+    // 0-based MTP cache index p = start_pos - 1: MtpTokenCandidateGenerator.get_candidates (candidate_generator.py:1423-1435, 1468-1478).
+    ensure!(start_pos >= 1, "GLM MTP round requires committed prefix");
+    // Final-norm output of last committed row: Glm5NextTextModel.forward (modeling_glm5_next.py:1446, 1510-1511), output_capturing.py:305, MtpLayer.forward (modeling_layers.py:345).
+    let committed_row = match last_input_kind {
+        Some(crate::prefix_state::PrefixLastInputKind::PrefillChunk) => {
+            resident_ids_len.saturating_sub(1)
+        }
+        _ => 0,
+    };
+    Ok(GlmMtpDraftStepConfig {
+        draft_pos: start_pos - 1,
+        committed_row,
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
+        // Validated (anchor_token, h_post(p)) remains in mtp_state on 1-layer reject (candidate_generator.py:1448-1450).
+        retain_committed_on_reject: true,
+    })
 }
 
 pub(crate) fn top1_and_margin(logits: &[f32]) -> (u32, f32) {
@@ -640,6 +673,7 @@ impl Engine {
             self.reset()?;
             if let Some(mtp_state) = self.mtp_state.as_mut() {
                 mtp_state.reset(&self.device.stream)?;
+                mtp_state.clear_dsa(&self.device.stream)?;
             }
             chain.cursor = 0;
             chain.committed_position = 0;
@@ -649,7 +683,56 @@ impl Engine {
                 chain.force_proposals = None;
             }
             if self.model_spec.architecture == Architecture::Glm5Next {
-                let token = self.prefill(ids, None)?;
+                let glm_runtime = chain
+                    .glm_runtime
+                    .as_mut()
+                    .context("GLM MTP runtime missing")?;
+                let total_ids = ids.len();
+                // Bootstrap 0-based MTP cache slots 0..total_ids-1 from (ids[pos+1], h_post(pos)) (candidate_generator.py:1423-1435, 1468-1478).
+                let token = self.prefill_chunks(ids, None, total_ids, |engine, chunk| {
+                    let chunk_start = engine.position;
+                    let stream = engine.device.stream.clone();
+                    if chunk_start + chunk.len() < total_ids {
+                        if let Some(hc) = engine.hc.as_mut() {
+                            hc.collapse_final(&stream, chunk.len(), &mut engine.work.x)?;
+                        }
+                        let norm_w = engine
+                            .weights
+                            .norm
+                            .as_ref()
+                            .context("final norm weights missing")?;
+                        super::glm::run_rms_norm(
+                            &stream,
+                            &glm_runtime.rms_norm,
+                            &engine.work.x,
+                            norm_w,
+                            &mut engine.work.n,
+                            (chunk.len() as i32, 4096),
+                            engine.model_spec.rms_eps,
+                        )?;
+                    }
+                    let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
+                    let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
+                    let shared = GlmMtpShared {
+                        blas: &engine.blas,
+                        embedding: engine.weights.embedding(),
+                        head: &engine.weights.head,
+                    };
+                    for r in 0..chunk.len() {
+                        let pos = chunk_start + r;
+                        if pos + 1 < total_ids {
+                            glm_runtime.commit_kv_device(
+                                ids[pos + 1],
+                                &engine.work.n,
+                                r,
+                                shared,
+                                dsa_state,
+                                pos,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })?;
                 self.pending_token = Some(token);
                 return Ok(token);
             }
@@ -725,17 +808,18 @@ impl Engine {
     fn glm_mtp_round_inner(
         &mut self,
         chain: &mut Chain,
-        force_eager_draft: bool,
+        _force_eager_draft: bool,
     ) -> Result<GlmMtpRoundOutput> {
         let stream = self.device.stream.clone();
         let vocab = self.model_spec.vocab as usize;
         let start_pos = self.position;
+        let step_cfg =
+            glm_mtp_draft_step_config(start_pos, self.last_input_kind, self.resident_ids_len)?;
         let anchor_token = match self.pending_token {
             Some(t) => t,
             None => self.token()?,
         };
 
-        // 1. Save pre-round snapshot (both target model and Layer 45) before drafting
         chain.target_checkpoint.save_rows(
             &self.state,
             &self.work.token,
@@ -744,28 +828,55 @@ impl Engine {
             &stream,
             None,
         )?;
-        let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
-        chain
-            .mtp_checkpoint
-            .save_rows(mtp_state, &self.work.token, start_pos, 2, &stream, None)?;
 
-        // 2. Run draft step with Layer 45
         let glm_runtime = chain
             .glm_runtime
             .as_mut()
             .context("GLM MTP runtime missing")?;
+        let draft_hidden = match step_cfg.hidden_tap {
+            MtpHiddenTap::PostFinalNorm => &self.work.n,
+            MtpHiddenTap::PreFinalNorm => &self.work.x,
+        };
+        let shared = GlmMtpShared {
+            blas: &self.blas,
+            embedding: self.weights.embedding(),
+            head: &self.weights.head,
+        };
+        let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
+        if !step_cfg.retain_committed_on_reject {
+            chain.mtp_checkpoint.save_rows(
+                mtp_state,
+                &self.work.token,
+                start_pos,
+                2,
+                &stream,
+                None,
+            )?;
+        }
         let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
 
-        let (draft_token, _draft_logits) = glm_runtime.step_draft_device(
+        let (draft_token, _draft_logits, draft_staged_experts) = glm_runtime.step_draft_device(
             anchor_token,
-            &self.work.x,
-            force_eager_draft,
-            &self.blas,
-            self.weights.embedding(),
-            &self.weights.head,
+            draft_hidden,
+            step_cfg.committed_row,
+            shared,
             dsa_state,
-            start_pos,
+            step_cfg.draft_pos,
         )?;
+        #[cfg(not(test))]
+        let _ = draft_staged_experts;
+        if step_cfg.retain_committed_on_reject {
+            // Snapshot mtp_state after committing validated draft_pos = start_pos - 1 so reject rolls back only speculative rows >= start_pos (candidate_generator.py:1448-1450).
+            chain.mtp_checkpoint.save_rows(
+                mtp_state,
+                &self.work.token,
+                start_pos,
+                2,
+                &stream,
+                None,
+            )?;
+        }
+
         #[cfg(test)]
         let draft_token = if let Some(forces) = &chain.force_proposals {
             forces.first().copied().unwrap_or(draft_token)
@@ -773,7 +884,6 @@ impl Engine {
             draft_token
         };
 
-        // 3. Run eager 2-row causal verify pass
         stream.memcpy_htod(
             &[anchor_token, draft_token],
             &mut self.work.ids.slice_mut(..2),
@@ -791,7 +901,6 @@ impl Engine {
         );
         step_res?;
 
-        // 5. Final norm & lm_head projection for 2 rows
         if let Some(hc) = self.hc.as_mut() {
             hc.collapse_final(&stream, 2, &mut self.work.x)?;
         }
@@ -800,6 +909,10 @@ impl Engine {
             .norm
             .as_ref()
             .context("final norm weights missing")?;
+        let glm_runtime = chain
+            .glm_runtime
+            .as_mut()
+            .context("GLM MTP runtime missing")?;
         super::glm::run_rms_norm(
             &stream,
             &glm_runtime.rms_norm,
@@ -836,7 +949,6 @@ impl Engine {
         #[cfg(not(test))]
         let (v1, _) = top1_and_margin(&row1_logits);
 
-        // 6. Count expert unions across all routed MoE layers
         #[cfg(test)]
         let expert_union_count = self
             .qwen
@@ -844,11 +956,20 @@ impl Engine {
             .context("GLM runtime missing")?
             .count_expert_unions_for_rows2(&stream)?;
 
-        // 7. Verification decision: accept vs reject
         let accepted = draft_token == v0;
         #[cfg(test)]
         let mut replay_row0_logits = None;
         let round = if accepted {
+            // Commit verify row 0 (v0, h_post(start_pos)) at pos = start_pos alongside pos = start_pos - 1 (candidate_generator.py:1430, 1468-1478).
+            let shared = GlmMtpShared {
+                blas: &self.blas,
+                embedding: self.weights.embedding(),
+                head: &self.weights.head,
+            };
+            let mtp_state = self.mtp_state.as_mut().context("MTP state missing")?;
+            let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
+            glm_runtime.commit_kv_device(v0, &self.work.n, 0, shared, dsa_state, start_pos)?;
+
             self.position = start_pos + 2;
             self.set_token(v1)?;
             stream.memcpy_htod(&[(start_pos + 2) as i32], &mut self.work.position)?;
@@ -863,10 +984,15 @@ impl Engine {
                 1,
                 self.workspace_rows as u32,
             )?;
+            // Carry both pre-norm (work.x) and final-norm (work.n) verify row 1 into row 0 for next round (modeling_glm5_next.py:1510-1511; candidate_generator.py:1430).
             let (x_ptr, _) = self.work.x.device_ptr(&stream);
+            let (n_ptr, _) = self.work.n.device_ptr(&stream);
             unsafe {
                 super::super::copy::dtod_raw(x_ptr, x_ptr + (4096 * 2), 4096 * 2, &stream)?;
+                super::super::copy::dtod_raw(n_ptr, n_ptr + (4096 * 2), 4096 * 2, &stream)?;
             }
+            self.resident_ids_len = 1;
+            self.last_input_kind = Some(crate::prefix_state::PrefixLastInputKind::DecodeToken);
             let row1_bf16: Vec<bf16> = row1_logits.iter().copied().map(bf16::from_f32).collect();
             stream.memcpy_htod(&row1_bf16, &mut self.work.logits.slice_mut(..vocab))?;
             self.logits_cache.mark_valid();
@@ -882,7 +1008,7 @@ impl Engine {
                 .target_checkpoint
                 .restore_for_replay(&mut self.state, 0, 2, &stream)?;
             chain.mtp_checkpoint.restore_for_replay(
-                self.mtp_state.as_mut().unwrap(),
+                self.mtp_state.as_mut().context("MTP state missing")?,
                 0,
                 2,
                 &stream,
@@ -924,6 +1050,8 @@ impl Engine {
             start_pos,
             #[cfg(test)]
             expert_union_count,
+            #[cfg(test)]
+            draft_staged_experts,
             #[cfg(test)]
             v0_margin,
             #[cfg(test)]

@@ -1,4 +1,4 @@
-use super::mtp::GlmMtpRuntime;
+use super::mtp::{GlmMtpRuntime, GlmMtpShared, glm_mtp_draft_step_config};
 use super::*;
 use crate::backend::cuda::state::StateStore;
 use crate::mtp::{MtpHiddenTap, MtpOptions, MtpRecurrentTap};
@@ -487,6 +487,28 @@ fn glm_mtp_router_bias_precision_discriminating_cpu() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn glm_mtp_draft_step_config_discriminating_cpu() -> Result<()> {
+    assert!(glm_mtp_draft_step_config(0, None, 0).is_err());
+    let prefill3 = glm_mtp_draft_step_config(3, Some(PrefixLastInputKind::PrefillChunk), 3)?;
+    ensure!(
+        prefill3.draft_pos == 2
+            && prefill3.committed_row == 2
+            && prefill3.hidden_tap == MtpHiddenTap::PostFinalNorm
+            && prefill3.retain_committed_on_reject,
+        "DEFECT prefill3 MTP step config mismatch: {prefill3:?}"
+    );
+    let decode4 = glm_mtp_draft_step_config(4, Some(PrefixLastInputKind::DecodeToken), 1)?;
+    ensure!(
+        decode4.draft_pos == 3
+            && decode4.committed_row == 0
+            && decode4.hidden_tap == MtpHiddenTap::PostFinalNorm
+            && decode4.retain_committed_on_reject,
+        "DEFECT decode4 MTP step config mismatch: {decode4:?}"
+    );
+    Ok(())
+}
+
 fn check_reset_meta(meta: &[i32], capacity: u32) -> Result<()> {
     // Metadata describes the scheduled first token, with no completed prefix.
     ensure!(
@@ -854,9 +876,11 @@ struct GraphStepCheckpoint {
     work_length: Vec<i32>,
     work_token: Vec<u32>,
     work_x: Vec<bf16>,
+    work_n: Vec<bf16>,
     token: u32,
     position: usize,
     pending_token: Option<u32>,
+    resident_ids_len: usize,
     last_input: Option<PrefixLastInputKind>,
     logits: PrefixLogitsCache,
     committed_prefix_ids: Vec<u32>,
@@ -897,9 +921,11 @@ impl GraphStepCheckpoint {
             work_length: s.clone_dtoh(&engine.work.length)?,
             work_token: s.clone_dtoh(&engine.work.token)?,
             work_x: s.clone_dtoh(&engine.work.x)?,
+            work_n: s.clone_dtoh(&engine.work.n)?,
             token: engine.token()?,
             position: engine.position,
             pending_token: engine.pending_token,
+            resident_ids_len: engine.resident_ids_len,
             last_input: engine.last_input_kind,
             logits: engine.logits_cache,
             committed_prefix_ids: engine.committed_prefix_ids.clone(),
@@ -928,9 +954,11 @@ impl GraphStepCheckpoint {
         s.memcpy_htod(&self.work_length, &mut engine.work.length)?;
         s.memcpy_htod(&self.work_token, &mut engine.work.token)?;
         s.memcpy_htod(&self.work_x, &mut engine.work.x)?;
+        s.memcpy_htod(&self.work_n, &mut engine.work.n)?;
         engine.position = self.position;
         engine.set_token(self.token)?;
         engine.pending_token = self.pending_token;
+        engine.resident_ids_len = self.resident_ids_len;
         engine.last_input_kind = self.last_input;
         engine.logits_cache = self.logits;
         engine.committed_prefix_ids = self.committed_prefix_ids.clone();
@@ -2170,15 +2198,31 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
 
     let mtp_options = MtpOptions {
         depth: 1,
-        hidden_tap: MtpHiddenTap::PreFinalNorm,
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
         recurrent_tap: MtpRecurrentTap::PreMtpNorm,
         graph: true,
     };
     engine.mtp_enable(mtp_options)?;
 
-    // 1. Establish single-step eager decode baseline state
+    // 1. Single-step eager decode baseline with committed pos=0 Layer-45 entry
     engine.reset()?;
     let t0 = engine.prefill(&reference.tokens[..1], None)?;
+    {
+        let mut chain = engine.mtp.take().context("MTP missing")?;
+        let glm_runtime = chain
+            .glm_runtime
+            .as_mut()
+            .context("GLM MTP runtime missing")?;
+        let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
+        let dsa_state = mtp_state.dsa.get_mut(0).context("MTP DSA state missing")?;
+        let shared = GlmMtpShared {
+            blas: &engine.blas,
+            embedding: engine.weights.embedding(),
+            head: &engine.weights.head,
+        };
+        glm_runtime.commit_kv_device(t0, &engine.work.n, 0, shared, dsa_state, 0)?;
+        engine.mtp = Some(chain);
+    }
     let expected_t1 = engine.decode(false, None)?;
     let baseline_state = graph_native_state(&engine, true)?;
 
@@ -2239,10 +2283,10 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
     mutant_gdn_history[0] -= 1.0;
     stream.memcpy_htod(&mutant_gdn_history, &mut engine.state.gdn[0].history)?;
 
-    // 4b. Mutant skipping Layer 45 rollback
+    // 4b. Mutant skipping Layer 45 speculative-slot rollback
     let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
     let mut mutant_layer45 = stream.clone_dtoh(&mtp_state.dsa[0].latent)?;
-    mutant_layer45[0] = bf16::from_f32(mutant_layer45[0].to_f32() + 1.0);
+    mutant_layer45[512] = bf16::from_f32(mutant_layer45[512].to_f32() + 1.0);
     stream.memcpy_htod(&mutant_layer45, &mut mtp_state.dsa[0].latent)?;
     let mutant_l45_state = graph_native_state(&engine, true)?;
     let mutant_l45_diffs = baseline_state
@@ -2277,7 +2321,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
     let mtp_options = MtpOptions {
         depth: 1,
-        hidden_tap: MtpHiddenTap::PreFinalNorm,
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
         recurrent_tap: MtpRecurrentTap::PreMtpNorm,
         graph: true,
     };
@@ -2345,6 +2389,8 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let mut total_bytes_moved = 0u64;
     let mut sum_b_verify = 0u64;
     let mut sum_u = 0usize;
+    let mut draft_staged_experts_sum = 0usize;
+    let mut replay_1row_passes = 0usize;
     let loop_start = std::time::Instant::now();
 
     while emitted_tokens.len() < 599 {
@@ -2456,6 +2502,10 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
         // Cost accounting
         sum_u += out.expert_union_count;
+        draft_staged_experts_sum += out.draft_staged_experts;
+        if out.round.accepted == 0 {
+            replay_1row_passes += 1;
+        }
         let b_verify =
             w_target_dense + (out.expert_union_count as u64 * expert_slot_bytes) + b_head;
         sum_b_verify += b_verify;
@@ -2491,6 +2541,12 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         ));
     }
 
+    let replay_experts_sum = replay_1row_passes * 336;
+    let target_layer_passes = (total_rounds + replay_1row_passes) * 45;
+    let head_rows_projected = total_rounds * 3 + replay_1row_passes;
+    println!(
+        "GLM_MTP_OP_COUNTS draft_passes={total_rounds} draft_htod_experts={draft_staged_experts_sum} accept_kv_commits={accepted_count} verify_2row_passes={total_rounds} verify_union_experts={sum_u} replay_1row_passes={replay_1row_passes} replay_htod_experts={replay_experts_sum} target_layer_passes={target_layer_passes} head_rows={head_rows_projected} checkpoint_saves={total_rounds} checkpoint_restores={replay_1row_passes}"
+    );
     let status = if defects.is_empty() { "PASS" } else { "DEFECT" };
     println!(
         "{status} GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} verify_compared={verify_compared_count} verify_gated={verify_gated_count} alpha={alpha:.4} mean_u={mean_u:.2} v_bar={mean_b_verify:.0} alpha_star={alpha_star:.4} efficiency_ratio={efficiency_ratio:.4} min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={} defects={}",
@@ -2500,5 +2556,464 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     for d in &defects {
         println!("{d}");
     }
+    std::io::Write::flush(&mut std::io::stdout())?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+struct DraftLocalizationStep {
+    token: u32,
+    hidden_idx: usize,
+    use_post_norm: bool,
+    dsa_pos: usize,
+    t_p1: u32,
+    g_p1: u32,
+    t_p2: u32,
+    g_p2: u32,
+}
+
+#[cfg(feature = "cuda")]
+struct DraftLocalizationSummary {
+    agree_t_p2: usize,
+    agree_g_p2: usize,
+    agree_t_p1: usize,
+    agree_g_p1: usize,
+    agree_g_p2_when_g1_eq_t1: usize,
+    g1_eq_t1_total: usize,
+    min_margin: f32,
+    mean_margin: f32,
+    sample_preds: Vec<u32>,
+}
+
+#[cfg(feature = "cuda")]
+struct DraftLocalizationEnv<'a> {
+    device: &'a Device,
+    blas: &'a Blas,
+    embed: &'a cudarc::driver::CudaSlice<bf16>,
+    head: &'a cudarc::driver::CudaSlice<bf16>,
+    h_pre: &'a [cudarc::driver::CudaSlice<bf16>],
+    h_post: &'a [cudarc::driver::CudaSlice<bf16>],
+}
+
+#[cfg(feature = "cuda")]
+fn eval_draft_localization_cell(
+    runtime: &mut GlmMtpRuntime,
+    env: &DraftLocalizationEnv<'_>,
+    steps: &[DraftLocalizationStep],
+    rollback_on_reject: bool,
+) -> Result<DraftLocalizationSummary> {
+    let mut dsa = crate::backend::cuda::dsa::DsaState::new(
+        crate::op_contract::DsaSpec::glm53(),
+        2048,
+        &env.device.stream,
+    )?;
+    dsa.clear(&env.device.stream)?;
+
+    let mut agree_t_p2 = 0usize;
+    let mut agree_g_p2 = 0usize;
+    let mut agree_t_p1 = 0usize;
+    let mut agree_g_p1 = 0usize;
+    let mut agree_g_p2_when_g1_eq_t1 = 0usize;
+    let mut g1_eq_t1_total = 0usize;
+    let mut min_margin = f32::INFINITY;
+    let mut sum_margin = 0.0f32;
+    let mut sample_preds = Vec::with_capacity(8);
+
+    let shared = GlmMtpShared {
+        blas: env.blas,
+        embedding: env.embed,
+        head: env.head,
+    };
+
+    for step in steps {
+        let saved = if rollback_on_reject {
+            Some((
+                env.device.stream.clone_dtoh(&dsa.latent)?,
+                env.device.stream.clone_dtoh(&dsa.token_ids)?,
+                env.device.stream.clone_dtoh(&dsa.meta)?,
+            ))
+        } else {
+            None
+        };
+
+        let hidden = if step.use_post_norm {
+            &env.h_post[step.hidden_idx]
+        } else {
+            &env.h_pre[step.hidden_idx]
+        };
+        let (draft_id, draft_logits, _) =
+            runtime.step_draft_device(step.token, hidden, 0, shared, &mut dsa, step.dsa_pos)?;
+        let (top_id, margin) = super::mtp::top1_and_margin(&draft_logits);
+        ensure!(
+            top_id == draft_id,
+            "Runner FAIL draft argmax mismatch: {top_id} vs {draft_id}"
+        );
+        if sample_preds.len() < 8 {
+            sample_preds.push(draft_id);
+        }
+        if draft_id == step.t_p2 {
+            agree_t_p2 += 1;
+        }
+        if draft_id == step.g_p2 {
+            agree_g_p2 += 1;
+        }
+        if draft_id == step.t_p1 {
+            agree_t_p1 += 1;
+        }
+        if draft_id == step.g_p1 {
+            agree_g_p1 += 1;
+        }
+        if step.g_p1 == step.t_p1 {
+            g1_eq_t1_total += 1;
+            if draft_id == step.g_p2 {
+                agree_g_p2_when_g1_eq_t1 += 1;
+            }
+        }
+        min_margin = min_margin.min(margin);
+        sum_margin += margin;
+
+        if draft_id != step.g_p2
+            && let Some((lat, tids, meta)) = saved
+        {
+            env.device.stream.memcpy_htod(&lat, &mut dsa.latent)?;
+            env.device.stream.memcpy_htod(&tids, &mut dsa.token_ids)?;
+            env.device.stream.memcpy_htod(&meta, &mut dsa.meta)?;
+        }
+    }
+
+    Ok(DraftLocalizationSummary {
+        agree_t_p2,
+        agree_g_p2,
+        agree_t_p1,
+        agree_g_p1,
+        agree_g_p2_when_g1_eq_t1,
+        g1_eq_t1_total,
+        min_margin,
+        mean_margin: sum_margin / steps.len() as f32,
+        sample_preds,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU Phase-1 32-position draft-on-reference localization comparing definition vs engine-round pairing and hidden tap"]
+fn glm_mtp_draft_on_reference_32pos_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+    let comp_root = PathBuf::from(
+        std::env::var_os("G1_COMPOSITION_REFERENCE").context("G1_COMPOSITION_REFERENCE missing")?,
+    );
+    let layer44_path = PathBuf::from(
+        std::env::var_os("FF_GLM_LAYER44_TRACE").context("FF_GLM_LAYER44_TRACE missing")?,
+    );
+
+    let reference = Reference::load(&comp_root)?;
+    if let Some(parent) = layer44_path.parent() {
+        let trace_tokens_path = parent.join("tokens.json");
+        if trace_tokens_path.exists() {
+            let trace_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&trace_tokens_path)?)?;
+            let trace_ids: Vec<u32> = serde_json::from_value(trace_json["input_ids"].clone())?;
+            ensure!(
+                trace_ids.len() >= 85 && trace_ids[..85] == reference.tokens[..85],
+                "Runner FAIL layer44 trace tokens differ from composition reference"
+            );
+        }
+    }
+
+    let layer44_bytes = std::fs::read(&layer44_path)?;
+    let layer44_st = safetensors::SafeTensors::deserialize(&layer44_bytes)?;
+    let layer44_out = layer44_st.tensor("layer44.output")?;
+    ensure!(
+        layer44_out.dtype() == safetensors::Dtype::BF16 && layer44_out.shape() == [1, 85, 4, 4096],
+        "Runner FAIL unexpected layer44.output shape {:?} or dtype {:?}",
+        layer44_out.shape(),
+        layer44_out.dtype()
+    );
+    let raw_streams: Vec<bf16> = layer44_out
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+
+    let shard62_file = std::fs::File::open(model_dir.join("model-00062-of-00062.safetensors"))?;
+    let mmap62 = unsafe { memmap2::MmapOptions::new().map(&shard62_file)? };
+    let st62 = safetensors::SafeTensors::deserialize(&mmap62)?;
+    let norm_tensor = st62.tensor("model.language_model.norm.weight")?;
+    ensure!(
+        norm_tensor.dtype() == safetensors::Dtype::BF16 && norm_tensor.shape() == [4096],
+        "Runner FAIL unexpected final norm weight shape {:?}",
+        norm_tensor.shape()
+    );
+    let final_norm_host: Vec<bf16> = norm_tensor
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+
+    let device = Device::new(0)?;
+    unsafe {
+        device.ctx.disable_event_tracking();
+    }
+    let ops = crate::backend::cuda::ops::Ops::new(&device.ctx)?;
+    let closure = std::rc::Rc::new(crate::backend::cuda::closure::Closure::new(
+        false,
+        "glm_mtp_loc".into(),
+    ));
+    let blas = Blas::new(&device, &ops, &std::env::temp_dir(), closure)?;
+    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true, 2048)?;
+    let embed_gpu = runtime
+        ._standalone_embed
+        .take()
+        .context("standalone embed missing")?;
+    let head_gpu = runtime
+        .standalone_head
+        .take()
+        .context("standalone head missing")?;
+    let final_norm_gpu = device.stream.clone_htod(&final_norm_host)?;
+
+    let count = 32usize;
+    let mut h_pre_gpu = Vec::with_capacity(count);
+    let mut h_post_gpu = Vec::with_capacity(count);
+    for p in 0..count {
+        let base = p * 4 * 4096;
+        let mut collapsed = vec![bf16::ZERO; 4096];
+        for (h, out) in collapsed.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for j in 0..4 {
+                acc = (0.25f32).mul_add(raw_streams[base + j * 4096 + h].to_f32(), acc);
+            }
+            *out = bf16::from_f32(acc);
+        }
+        let pre_slice = device.stream.clone_htod(&collapsed)?;
+        let mut post_slice = device.stream.alloc_zeros::<bf16>(4096)?;
+        let rows_i32 = 1i32;
+        let dim_i32 = 4096i32;
+        let eps = 1e-5f32;
+        unsafe {
+            device
+                .stream
+                .launch_builder(&runtime.rms_norm)
+                .arg(&pre_slice)
+                .arg(&final_norm_gpu)
+                .arg(&mut post_slice)
+                .arg(&rows_i32)
+                .arg(&dim_i32)
+                .arg(&eps)
+                .launch(crate::backend::cuda::ops::grid(1, 256))?;
+        }
+        h_pre_gpu.push(pre_slice);
+        h_post_gpu.push(post_slice);
+    }
+
+    let positions = reference.record["positions"]
+        .as_array()
+        .context("positions array missing")?;
+    let mut target_g2_eq_t2 = 0usize;
+    let mut target_g1_eq_t1 = 0usize;
+    for p in 0..count {
+        let g_p1 = positions[p]["R1_id"].as_u64().unwrap() as u32;
+        let g_p2 = positions[p + 1]["R1_id"].as_u64().unwrap() as u32;
+        if g_p1 == reference.tokens[p + 1] {
+            target_g1_eq_t1 += 1;
+        }
+        if g_p2 == reference.tokens[p + 2] {
+            target_g2_eq_t2 += 1;
+        }
+    }
+    println!(
+        "TARGET_BASELINE_32POS target_g_p2_eq_t_p2={target_g2_eq_t2}/{count} target_g_p1_eq_t_p1={target_g1_eq_t1}/{count}"
+    );
+
+    let env = DraftLocalizationEnv {
+        device: &device,
+        blas: &blas,
+        embed: &embed_gpu,
+        head: &head_gpu,
+        h_pre: &h_pre_gpu,
+        h_post: &h_post_gpu,
+    };
+
+    let build_steps = |shifted_token: bool,
+                       greedy_pending: bool,
+                       use_post_norm: bool,
+                       pos_offset: usize|
+     -> Vec<DraftLocalizationStep> {
+        (0..count)
+            .map(|p| {
+                let t_p1 = reference.tokens[p + 1];
+                let t_p2 = reference.tokens[p + 2];
+                let g_p1 = positions[p]["R1_id"].as_u64().unwrap() as u32;
+                let g_p2 = positions[p + 1]["R1_id"].as_u64().unwrap() as u32;
+                let token = if greedy_pending {
+                    g_p1
+                } else if shifted_token {
+                    t_p1
+                } else {
+                    reference.tokens[p]
+                };
+                DraftLocalizationStep {
+                    token,
+                    hidden_idx: p,
+                    use_post_norm,
+                    dsa_pos: p + pos_offset,
+                    t_p1,
+                    g_p1,
+                    t_p2,
+                    g_p2,
+                }
+            })
+            .collect()
+    };
+
+    let build_engine_round_steps =
+        |greedy_pending: bool| -> Result<(Vec<DraftLocalizationStep>, bool)> {
+            let first_cfg =
+                glm_mtp_draft_step_config(1, Some(PrefixLastInputKind::DecodeToken), 1)?;
+            let mut out = Vec::with_capacity(count);
+            for p in 0..count {
+                let cfg =
+                    glm_mtp_draft_step_config(p + 1, Some(PrefixLastInputKind::DecodeToken), 1)?;
+                let t_p1 = reference.tokens[p + 1];
+                let t_p2 = reference.tokens[p + 2];
+                let g_p1 = positions[p]["R1_id"].as_u64().unwrap() as u32;
+                let g_p2 = positions[p + 1]["R1_id"].as_u64().unwrap() as u32;
+                out.push(DraftLocalizationStep {
+                    token: if greedy_pending { g_p1 } else { t_p1 },
+                    hidden_idx: p + cfg.committed_row,
+                    use_post_norm: cfg.hidden_tap == MtpHiddenTap::PostFinalNorm,
+                    dsa_pos: cfg.draft_pos,
+                    t_p1,
+                    g_p1,
+                    t_p2,
+                    g_p2,
+                });
+            }
+            Ok((out, !first_cfg.retain_committed_on_reject))
+        };
+
+    let (eng_trace_steps, eng_trace_rollback) = build_engine_round_steps(false)?;
+    let (eng_greedy_steps, eng_greedy_rollback) = build_engine_round_steps(true)?;
+
+    let cells: [(&str, Vec<DraftLocalizationStep>, bool); 12] = [
+        (
+            "def_shifted_post_norm",
+            build_steps(true, false, true, 0),
+            false,
+        ),
+        (
+            "def_shifted_pre_norm",
+            build_steps(true, false, false, 0),
+            false,
+        ),
+        (
+            "unshifted_tok_post_norm",
+            build_steps(false, false, true, 0),
+            false,
+        ),
+        (
+            "unshifted_tok_pre_norm",
+            build_steps(false, false, false, 0),
+            false,
+        ),
+        (
+            "engine_round_trace_tok",
+            eng_trace_steps,
+            eng_trace_rollback,
+        ),
+        (
+            "engine_round_greedy_pending",
+            eng_greedy_steps,
+            eng_greedy_rollback,
+        ),
+        (
+            "legacy_pre_fix_round_trace_tok",
+            build_steps(true, false, false, 1),
+            true,
+        ),
+        (
+            "iso_post_norm_pos1_rollback",
+            build_steps(true, false, true, 1),
+            true,
+        ),
+        (
+            "iso_post_norm_pos1_no_rollback",
+            build_steps(true, false, true, 1),
+            false,
+        ),
+        (
+            "iso_post_norm_pos0_rollback",
+            build_steps(true, false, true, 0),
+            true,
+        ),
+        (
+            "iso_pre_norm_pos1_no_rollback",
+            build_steps(true, false, false, 1),
+            false,
+        ),
+        (
+            "iso_pre_norm_pos0_rollback",
+            build_steps(true, false, false, 0),
+            true,
+        ),
+    ];
+
+    for p in 0..8 {
+        println!(
+            "TRACE_POS p={p} t_p={} t_p1={} g_p1={} t_p2={} g_p2={}",
+            reference.tokens[p],
+            reference.tokens[p + 1],
+            positions[p]["R1_id"].as_u64().unwrap(),
+            reference.tokens[p + 2],
+            positions[p + 1]["R1_id"].as_u64().unwrap(),
+        );
+    }
+
+    let mut results = std::collections::BTreeMap::new();
+    for (name, steps, rollback) in &cells {
+        let s = eval_draft_localization_cell(&mut runtime, &env, steps, *rollback)?;
+        println!(
+            "DRAFT_32POS cell={name} agree_t_p2={}/{count} agree_g_p2={}/{count} agree_t_p1={}/{count} agree_g_p1={}/{count} agree_g_p2_on_g1_eq_t1={}/{} min_margin={:.4} mean_margin={:.4} first8_preds={:?}",
+            s.agree_t_p2,
+            s.agree_g_p2,
+            s.agree_t_p1,
+            s.agree_g_p1,
+            s.agree_g_p2_when_g1_eq_t1,
+            s.g1_eq_t1_total,
+            s.min_margin,
+            s.mean_margin,
+            s.sample_preds,
+        );
+        results.insert(*name, s);
+    }
+
+    let def_res = &results["def_shifted_post_norm"];
+    let eng_res = &results["engine_round_trace_tok"];
+    let unshifted_res = &results["unshifted_tok_post_norm"];
+    let legacy_res = &results["legacy_pre_fix_round_trace_tok"];
+    ensure!(
+        eng_res.agree_g_p2 == def_res.agree_g_p2 && eng_res.agree_t_p2 == def_res.agree_t_p2,
+        "DEFECT engine_round_trace_tok ({}/32) failed to match def_shifted_post_norm ({}/32)",
+        eng_res.agree_g_p2,
+        def_res.agree_g_p2
+    );
+    ensure!(
+        unshifted_res.agree_g_p2 == 0,
+        "Runner FAIL unshifted control unexpectedly matched g_p2 ({}/32)",
+        unshifted_res.agree_g_p2
+    );
+    ensure!(
+        legacy_res.agree_g_p2 < eng_res.agree_g_p2,
+        "Runner FAIL legacy pre-fix control failed to separate from fixed engine round"
+    );
+
     Ok(())
 }

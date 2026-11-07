@@ -3459,6 +3459,7 @@ impl Engine {
         #[cfg(feature = "cuda")]
         if let Some(state) = self.mtp_state.as_mut() {
             state.reset(&self.device.stream)?;
+            state.clear_dsa(&self.device.stream)?;
         }
         if self.deepseek_ffn.is_some()
             && let Some(slots) = self.moe_slots.as_mut()

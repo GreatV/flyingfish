@@ -220,6 +220,13 @@ pub(crate) struct GlmMtpStageTaps {
     pub moe_out: Vec<bf16>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct GlmMtpShared<'a> {
+    pub(crate) blas: &'a Blas,
+    pub(crate) embedding: &'a CudaSlice<bf16>,
+    pub(crate) head: &'a CudaSlice<bf16>,
+}
+
 pub(crate) struct GlmMtpRuntime {
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) rms_norm: CudaFunction,
@@ -298,6 +305,7 @@ pub(crate) struct GlmMtpRuntime {
     pub(crate) dsa_indices_buf: CudaSlice<i32>,
 
     pub(crate) last_route: Option<(Vec<i32>, Vec<f32>)>,
+    pub(crate) last_staged_experts: usize,
 
     pub(crate) _standalone_dsa: Option<DsaState>,
 }
@@ -772,11 +780,12 @@ impl GlmMtpRuntime {
             logits_buf: stream.alloc_zeros::<f32>(154880)?,
             dsa_indices_buf: stream.alloc_zeros::<i32>(2051)?,
             last_route: None,
+            last_staged_experts: 0,
             _standalone_dsa,
         })
     }
 
-    fn stage_routed_experts(&mut self, ids: &[i32]) -> Result<()> {
+    fn stage_routed_experts(&mut self, ids: &[i32]) -> Result<usize> {
         let stream = self.stream.clone();
         let mmap1 = &self._mmap1;
         let mmap2 = &self._mmap2;
@@ -849,20 +858,17 @@ impl GlmMtpRuntime {
         if updated || valid_changed {
             stream.memcpy_htod(&self.valid_host, &mut self.valid_buf)?;
         }
-        Ok(())
+        Ok(needed_experts.len())
     }
 
-    fn forward_layer45_core(
+    fn write_kv_entry(
         &mut self,
         dsa_state: &mut DsaState,
         pos: usize,
         swap_eh: bool,
-        _router_bias_control: bool,
         blas: &Blas,
-        head_w: Option<&CudaSlice<bf16>>,
     ) -> Result<()> {
         let stream = self.stream.clone();
-
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -881,7 +887,6 @@ impl GlmMtpRuntime {
             (1, 4096),
             1e-5,
         )?;
-
         run_concat_eh(
             &stream,
             &self.concat_eh,
@@ -900,7 +905,6 @@ impl GlmMtpRuntime {
             (1, 4096, 8192),
         )?;
         stream.memcpy_dtod(&self.x_buf, &mut self.x_init_buf)?;
-
         run_rms_norm(
             &stream,
             &self.rms_norm,
@@ -911,7 +915,6 @@ impl GlmMtpRuntime {
             1e-5,
         )?;
         stream.memcpy_dtod(&self.x_norm_buf, &mut self.x_norm1_buf)?;
-
         run_linear_bf16(
             &stream,
             blas,
@@ -953,6 +956,20 @@ impl GlmMtpRuntime {
                 reserved: [0, 0, 0],
             },
         )?;
+        Ok(())
+    }
+
+    fn forward_layer45_core(
+        &mut self,
+        dsa_state: &mut DsaState,
+        pos: usize,
+        swap_eh: bool,
+        _router_bias_control: bool,
+        blas: &Blas,
+        head_w: Option<&CudaSlice<bf16>>,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        self.write_kv_entry(dsa_state, pos, swap_eh, blas)?;
 
         run_linear_bf16(
             &stream,
@@ -1046,7 +1063,7 @@ impl GlmMtpRuntime {
         self.native_moe.enqueue_route(&stream, x_norm_tensor)?;
         let (ids, weights) = self.native_moe.read_route(&stream)?;
         self.last_route = Some((ids.clone(), weights));
-        self.stage_routed_experts(&ids)?;
+        self.last_staged_experts = self.stage_routed_experts(&ids)?;
         self.native_moe
             .run(&stream, x_norm_tensor, &moe_out_tensor)?;
         run_add(&stream, &self.add, &mut self.x_buf, &self.moe_out_buf, 4096)?;
@@ -1097,7 +1114,7 @@ impl GlmMtpRuntime {
             history_hidden.len()
         );
 
-        dsa_state.reset(&stream)?;
+        dsa_state.clear(&stream)?;
 
         for t in 0..p.saturating_sub(1) {
             let tok = history_tokens[t] as usize;
@@ -1110,81 +1127,7 @@ impl GlmMtpRuntime {
 
             let h_slice = &history_hidden[t * 4096..(t + 1) * 4096];
             stream.memcpy_htod(h_slice, &mut self.target_hidden_buf)?;
-
-            run_rms_norm(
-                &stream,
-                &self.rms_norm,
-                &self.token_embed_buf,
-                &self.enorm_w,
-                &mut self.enorm_buf,
-                (1, 4096),
-                1e-5,
-            )?;
-            run_rms_norm(
-                &stream,
-                &self.rms_norm,
-                &self.target_hidden_buf,
-                &self.hnorm_w,
-                &mut self.hnorm_buf,
-                (1, 4096),
-                1e-5,
-            )?;
-            run_concat_eh(
-                &stream,
-                &self.concat_eh,
-                &self.enorm_buf,
-                &self.hnorm_buf,
-                &mut self.eh_buf,
-                4096,
-                false,
-            )?;
-            run_linear_bf16(
-                &stream,
-                blas,
-                &self.eh_proj_w,
-                &self.eh_buf,
-                &mut self.x_buf,
-                (1, 4096, 8192),
-            )?;
-            run_rms_norm(
-                &stream,
-                &self.rms_norm,
-                &self.x_buf,
-                &self.input_norm_w,
-                &mut self.x_norm_buf,
-                (1, 4096),
-                1e-5,
-            )?;
-            run_linear_bf16(
-                &stream,
-                blas,
-                &self.kv_a_w,
-                &self.x_norm_buf,
-                &mut self.kv_a_buf,
-                (1, 512, 4096),
-            )?;
-            run_rms_norm(
-                &stream,
-                &self.rms_norm,
-                &self.kv_a_buf,
-                &self.kv_a_norm_w,
-                &mut self.kv_latent_buf,
-                (1, 512),
-                1e-5,
-            )?;
-
-            let cap = dsa_state.token_ids.len();
-            let physical = t % cap;
-            stream.memcpy_dtod(
-                &self.kv_latent_buf,
-                &mut dsa_state
-                    .latent
-                    .slice_mut(physical * 512..(physical + 1) * 512),
-            )?;
-            stream.memcpy_htod(
-                &[t as i32],
-                &mut dsa_state.token_ids.slice_mut(physical..physical + 1),
-            )?;
+            self.write_kv_entry(dsa_state, t, false, blas)?;
         }
 
         Ok(())
@@ -1291,26 +1234,49 @@ impl GlmMtpRuntime {
         Ok((logits, ids, weights))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // Commits one validated (token, post_norm_hidden) pair at 0-based MTP cache index `pos` (candidate_generator.py:1430, 1468-1478; modeling_layers.py:345).
+    pub(crate) fn commit_kv_device(
+        &mut self,
+        token: u32,
+        target_hidden: &CudaSlice<bf16>,
+        hidden_row: usize,
+        shared: GlmMtpShared<'_>,
+        dsa_state: &mut DsaState,
+        pos: usize,
+    ) -> Result<()> {
+        let stream = self.stream.clone();
+        let tok = token as usize;
+        let tok_slice = shared.embedding.slice(tok * 4096..(tok + 1) * 4096);
+        stream.memcpy_dtod(&tok_slice, &mut self.token_embed_buf)?;
+        let hidden_slice = target_hidden.slice(hidden_row * 4096..(hidden_row + 1) * 4096);
+        stream.memcpy_dtod(&hidden_slice, &mut self.target_hidden_buf)?;
+        self.write_kv_entry(dsa_state, pos, false, shared.blas)
+    }
+
     pub(crate) fn step_draft_device(
         &mut self,
         anchor_token: u32,
         target_hidden: &CudaSlice<bf16>,
-        _force_eager_draft: bool,
-        blas: &Blas,
-        embedding: &CudaSlice<bf16>,
-        head: &CudaSlice<bf16>,
+        hidden_row: usize,
+        shared: GlmMtpShared<'_>,
         dsa_state: &mut DsaState,
-        start_pos: usize,
-    ) -> Result<(u32, Vec<f32>)> {
+        draft_pos: usize,
+    ) -> Result<(u32, Vec<f32>, usize)> {
         let stream = self.stream.clone();
         let tok = anchor_token as usize;
-        let tok_slice = embedding.slice(tok * 4096..(tok + 1) * 4096);
+        let tok_slice = shared.embedding.slice(tok * 4096..(tok + 1) * 4096);
         stream.memcpy_dtod(&tok_slice, &mut self.token_embed_buf)?;
-        let hidden_slice = target_hidden.slice(..4096);
+        let hidden_slice = target_hidden.slice(hidden_row * 4096..(hidden_row + 1) * 4096);
         stream.memcpy_dtod(&hidden_slice, &mut self.target_hidden_buf)?;
 
-        self.forward_layer45_core(dsa_state, start_pos, false, false, blas, Some(head))?;
+        self.forward_layer45_core(
+            dsa_state,
+            draft_pos,
+            false,
+            false,
+            shared.blas,
+            Some(shared.head),
+        )?;
 
         let logits: Vec<f32> = stream.clone_dtoh(&self.logits_buf)?;
         let mut best_id = 0u32;
@@ -1321,6 +1287,6 @@ impl GlmMtpRuntime {
                 best_id = i as u32;
             }
         }
-        Ok((best_id, logits))
+        Ok((best_id, logits, self.last_staged_experts))
     }
 }

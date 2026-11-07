@@ -983,10 +983,10 @@ mod tests;
 
 #[path = "engine_mtp_glm.rs"]
 mod glm;
-pub(super) use glm::GlmMtpRuntime;
+pub(super) use glm::{GlmMtpRuntime, GlmMtpShared};
 
 #[path = "engine_mtp_chain.rs"]
 mod chain;
 pub(super) use chain::Chain;
 #[cfg(test)]
-pub(super) use chain::top1_and_margin;
+pub(super) use chain::{glm_mtp_draft_step_config, top1_and_margin};

@@ -901,6 +901,12 @@ impl StateStore {
         // Invalid KV remains inaccessible through sequence bounds; no KV zeroing is required.
         Ok(())
     }
+    pub fn clear_dsa(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        for state in &mut self.dsa {
+            state.clear(stream)?;
+        }
+        Ok(())
+    }
     pub fn bytes(&self) -> usize {
         self.kv.iter().map(Kv::bytes).sum::<usize>()
             + self
