@@ -10,7 +10,7 @@ use super::{
     contracts::{Tensor, TensorMut, view},
     cubin,
     flash::Score,
-    flash::{F32Attention, Flash, Shape},
+    flash::{F32Attention, F32Mask, Flash, Shape},
     linear::LinearBiasMode,
     ops::{Ops, flat, grid},
 };
@@ -2183,7 +2183,18 @@ impl<T: FlowElement> Flow<T> {
             let CrossAttention::F32(cross) = &mut self.cross else {
                 anyhow::bail!("F32 cross binding missing");
             };
-            cross.run(&self.blas, q32, k32, v32, &mut TensorMut(out32))?;
+            cross.run(
+                &self.blas,
+                q32,
+                k32,
+                v32,
+                &mut TensorMut(out32),
+                F32Mask {
+                    causal: false,
+                    valid_keys: 5,
+                    query_base: 0,
+                },
+            )?;
             k.cast(d, ptr(&self.work.cross_out32, d), attention, n * h)?;
             b.cross_out.run(&self.blas, n, attention, projected)?;
             b.projection

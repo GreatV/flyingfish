@@ -213,9 +213,10 @@ extern "C" __global__ void vision_pack_split(
     }
 }
 
-// Row gather: gathered[r] = input[indices[r]] over `width`-wide BF16 rows.
-extern "C" __global__ void vision_row_gather(
-    const __nv_bfloat16* input, const int32_t* indices, __nv_bfloat16* gathered,
+// Row gather: gathered[r] = input[indices[r]] over `width`-wide rows.
+template <typename T>
+__device__ __forceinline__ void vision_row_gather_rows(
+    const T* input, const int32_t* indices, T* gathered,
     uint32_t rows, uint32_t in_rows, uint32_t width) {
     if (!vision_flat_launch() || !input || !indices || !gathered || !rows || !width) { __trap(); return; }
     uint64_t count = uint64_t(rows) * width;
@@ -225,6 +226,18 @@ extern "C" __global__ void vision_row_gather(
         if (source < 0 || uint32_t(source) >= in_rows) { __trap(); return; }
         gathered[i] = input[uint64_t(source) * width + i % width];
     }
+}
+
+extern "C" __global__ void vision_row_gather(
+    const __nv_bfloat16* input, const int32_t* indices, __nv_bfloat16* gathered,
+    uint32_t rows, uint32_t in_rows, uint32_t width) {
+    vision_row_gather_rows(input, indices, gathered, rows, in_rows, width);
+}
+
+extern "C" __global__ void vision_row_gather_f32(
+    const float* input, const int32_t* indices, float* gathered,
+    uint32_t rows, uint32_t in_rows, uint32_t width) {
+    vision_row_gather_rows(input, indices, gathered, rows, in_rows, width);
 }
 
 // Mean of each consecutive `k`-row group over `width` BF16 columns: f32 sum, one BF16 round.

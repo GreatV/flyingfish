@@ -9,6 +9,8 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{path::Path, sync::Arc};
 
 struct Linear {
@@ -91,6 +93,8 @@ pub struct ParakeetEncoder {
     blas: CudaBlas,
     blocks: Vec<Block>,
     ops: Ops,
+    #[cfg(test)]
+    encode_calls: AtomicU64,
 }
 
 struct SubsampleOutput {
@@ -408,6 +412,8 @@ impl ParakeetEncoder {
             blas,
             blocks,
             ops,
+            #[cfg(test)]
+            encode_calls: AtomicU64::new(0),
         })
     }
 
@@ -739,6 +745,8 @@ impl ParakeetEncoder {
 
     /// Input is `[frames,128]`; output is `[ceil(frames/8),1024]`, its mask and valid row count.
     pub fn encode(&self, input: &[f32], valid: usize) -> Result<(Vec<f32>, Vec<u8>, usize)> {
+        #[cfg(test)]
+        self.encode_calls.fetch_add(1, Ordering::Relaxed);
         let subsampled = self.subsample_device(input, valid)?;
         let positions = self
             .stream
@@ -752,6 +760,16 @@ impl ParakeetEncoder {
             subsampled.mask,
             subsampled.valid,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encode_calls(&self) -> u64 {
+        self.encode_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_encode_calls(&self) {
+        self.encode_calls.store(0, Ordering::Relaxed);
     }
 }
 

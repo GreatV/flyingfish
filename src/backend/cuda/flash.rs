@@ -1344,6 +1344,13 @@ impl Flash {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) struct F32Mask {
+    pub(crate) causal: bool,
+    pub(crate) valid_keys: u32,
+    pub(crate) query_base: u32,
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) struct F32Attention {
     stream: Arc<CudaStream>,
     geometry: [u32; 5],
@@ -1354,6 +1361,7 @@ pub(crate) struct F32Attention {
     scores: CudaSlice<f32>,
     probabilities: CudaSlice<f32>,
     softmax: CudaFunction,
+    exclude: CudaFunction,
 }
 
 #[cfg(feature = "cuda")]
@@ -1384,8 +1392,9 @@ impl F32Attention {
         let elements = (heads as usize) * (keys as usize) * (tile as usize);
         let partial_elements =
             (heads as usize) * (tile as usize) * (value_dim as usize) * (parts as usize);
-        let softmax =
-            super::cubin::module(stream.context(), "sample")?.load_function("softmax_rows_dual")?;
+        let sample = super::cubin::module(stream.context(), "sample")?;
+        let softmax = sample.load_function("softmax_rows_dual")?;
+        let exclude = sample.load_function("score_exclude_f32")?;
         Ok(Self {
             geometry,
             tile,
@@ -1396,6 +1405,7 @@ impl F32Attention {
             scores: stream.alloc_zeros(elements)?,
             probabilities: stream.alloc_zeros(elements)?,
             softmax,
+            exclude,
             stream,
         })
     }
@@ -1406,11 +1416,76 @@ impl F32Attention {
         k: super::contracts::Tensor<f32, 3>,
         v: super::contracts::Tensor<f32, 3>,
         output: &mut super::contracts::TensorMut<f32, 3>,
+        mask: F32Mask,
+    ) -> Result<()> {
+        self.execute(
+            |left, right, out, transpose, alpha| {
+                blas.batched_f32(left, right, out, transpose, alpha)
+            },
+            q,
+            k,
+            v,
+            output,
+            mask,
+        )
+    }
+    pub(crate) fn run_cublas(
+        &self,
+        blas: &cudarc::cublas::CudaBlas,
+        q: super::contracts::Tensor<f32, 3>,
+        k: super::contracts::Tensor<f32, 3>,
+        v: super::contracts::Tensor<f32, 3>,
+        output: &mut super::contracts::TensorMut<f32, 3>,
+        mask: F32Mask,
+    ) -> Result<()> {
+        self.execute(
+            |left, right, out, transpose, alpha| {
+                super::blas::batched_f32_on(blas, left, right, out, transpose, alpha)
+            },
+            q,
+            k,
+            v,
+            output,
+            mask,
+        )
+    }
+    fn execute(
+        &self,
+        mut gemm: impl FnMut(
+            super::contracts::Tensor<f32, 3>,
+            super::contracts::Tensor<f32, 3>,
+            &mut super::contracts::TensorMut<f32, 3>,
+            [bool; 2],
+            f32,
+        ) -> Result<()>,
+        q: super::contracts::Tensor<f32, 3>,
+        k: super::contracts::Tensor<f32, 3>,
+        v: super::contracts::Tensor<f32, 3>,
+        output: &mut super::contracts::TensorMut<f32, 3>,
+        mask: F32Mask,
     ) -> Result<()> {
         use super::contracts::{Tensor, TensorMut, no_overlap};
-        let [heads, queries, keys, dim, value_dim] = self.geometry;
+        let [heads, cap_queries, cap_keys, dim, value_dim] = self.geometry;
+        let F32Mask {
+            causal,
+            valid_keys,
+            query_base,
+        } = mask;
+        let queries = q.shape[1];
+        let keys = k.shape[1];
+        if valid_keys == 0 || valid_keys > keys {
+            ensure!(
+                !(causal && valid_keys == 0),
+                "F32 attention causal query has no finite key"
+            );
+            anyhow::bail!("F32 attention valid_keys {valid_keys} keys {keys}");
+        }
         ensure!(
-            q.shape == [heads, queries, dim]
+            queries > 0
+                && queries <= cap_queries
+                && keys > 0
+                && keys <= cap_keys
+                && q.shape == [heads, queries, dim]
                 && k.shape == [heads, keys, dim]
                 && v.shape == [heads, keys, value_dim]
                 && output.0.shape == [heads, queries, value_dim],
@@ -1466,13 +1541,39 @@ impl F32Attention {
                     self.probabilities.len() as u64 * 4,
                 )?
             };
-            blas.batched_f32(
+            gemm(
                 slice(q, start, rows)?,
                 k,
                 &mut TensorMut(scores),
                 [false, true],
                 (dim as f32).sqrt().recip(),
             )?;
+            if causal || valid_keys != keys {
+                let count = (heads as usize)
+                    .checked_mul(rows as usize)
+                    .and_then(|n| n.checked_mul(keys as usize))
+                    .context("F32 attention exclude count")?;
+                let blocks = count.div_ceil(256);
+                ensure!(
+                    blocks <= u32::MAX as usize,
+                    "F32 attention exclude grid {blocks}"
+                );
+                let query_index = query_base
+                    .checked_add(start)
+                    .context("F32 attention query_base overflow")?;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.exclude)
+                        .arg(&scores.ptr)
+                        .arg(&heads)
+                        .arg(&rows)
+                        .arg(&keys)
+                        .arg(&query_index)
+                        .arg(&valid_keys)
+                        .arg(&u32::from(causal))
+                        .launch(super::ops::grid(blocks, 256))?;
+                }
+            }
             let softmax_rows = heads
                 .checked_mul(rows)
                 .context("F32 attention softmax rows overflow")?;
@@ -1510,7 +1611,7 @@ impl F32Attention {
                         self.partials.len() as u64 * 4 - offset,
                     )?
                 };
-                blas.batched_f32(
+                gemm(
                     left,
                     slice(v, first, columns)?,
                     &mut TensorMut(partial),
