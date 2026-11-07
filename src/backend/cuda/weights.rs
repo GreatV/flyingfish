@@ -51,12 +51,9 @@ pub struct Layer {
     pub down: CudaSlice<bf16>,
 }
 
-/// Fused projection groups of one classic decoder layer, derived from Config. The
-/// classic forward consumes qkv as one `[qkv_dim, hidden]` matrix laid out
-/// `[q; k; v]`, and gu as one `[2 * intermediate, hidden]` matrix laid out
-/// `[gate; up]`. The order is load-bearing: swapping q/k/v or the gate/up halves
-/// silently reorders weights without changing byte counts, so `Weights::load`
-/// and the streamed catalogue binding both derive their layout from this spec.
+/// Fused projection groups of one classic decoder layer, derived from Config.
+/// qkv is `[qkv_dim, hidden]` in `[q; k; v]` order; gu is
+/// `[2 * intermediate, hidden]` in `[gate; up]` order.
 pub(crate) struct ClassicFused {
     pub qkv: [(String, Vec<usize>); 3],
     pub gu: [(String, Vec<usize>); 2],
@@ -203,13 +200,18 @@ fn emit_classic_resident(
     Ok(())
 }
 
-pub(crate) struct ClassicLayerRefs<'a> {
+pub(crate) struct ClassicCatalog {
+    order: Vec<Vec<String>>,
+    bindings: Vec<ClassicLayer>,
+}
+
+pub(crate) struct ClassicLayer {
     pub qkv: super::linear::LinearWeightRef,
     pub o: super::linear::LinearWeightRef,
     pub gu: super::linear::LinearWeightRef,
     pub down: super::linear::LinearWeightRef,
-    pub input_norm: &'a CudaSlice<bf16>,
-    pub post_norm: &'a CudaSlice<bf16>,
+    pub input_norm: super::contracts::Tensor<bf16, 1>,
+    pub post_norm: super::contracts::Tensor<bf16, 1>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2533,7 +2535,7 @@ fn emit_classic_streamed(
 pub(crate) struct WeightCatalog {
     #[cfg(feature = "cuda")]
     pub dense: Option<DenseStreaming>,
-    pub classic: Option<Vec<Vec<String>>>,
+    pub classic: Option<ClassicCatalog>,
     pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
@@ -2798,9 +2800,12 @@ impl WeightCatalog {
         let bytes = uploaded
             .checked_add(2 * dense.plan.slot_bytes)
             .context("dense device extent overflow")?;
-        Ok(Self {
+        Self {
             dense: Some(dense),
-            classic: order,
+            classic: order.map(|order| ClassicCatalog {
+                order,
+                bindings: Vec::new(),
+            }),
             linear_format: spec.linear_format,
             tensors,
             manifest,
@@ -2808,7 +2813,8 @@ impl WeightCatalog {
             upload_content_sha256: None,
             upload_hashed_bytes: None,
             load_wall_ms: elapsed_ms(started),
-        })
+        }
+        .bind_classic(&d.stream)
     }
 
     pub fn take_bf16(&mut self, name: &str, shape: &[usize]) -> Result<CudaSlice<bf16>> {
@@ -2869,11 +2875,37 @@ impl WeightCatalog {
     }
 
     pub(crate) fn classic_layers(&self) -> usize {
-        self.classic.as_ref().map_or(0, Vec::len)
+        self.classic
+            .as_ref()
+            .map_or(0, |classic| classic.order.len())
     }
 
-    pub(crate) fn classic_norm(&self, layer: usize, kind: &str) -> Result<&CudaSlice<bf16>> {
-        self.bf16(&format!("model.layers.{layer}.{kind}.weight"))
+    pub(crate) fn classic_layer(&self, layer: usize) -> Result<&ClassicLayer> {
+        self.classic
+            .as_ref()
+            .and_then(|classic| classic.bindings.get(layer))
+            .with_context(|| format!("classic layer {layer} binding missing"))
+    }
+
+    fn classic_norm_view(
+        &self,
+        layer: usize,
+        kind: &str,
+        stream: &Arc<CudaStream>,
+    ) -> Result<super::contracts::Tensor<bf16, 1>> {
+        let weight = self.bf16(&format!("model.layers.{layer}.{kind}.weight"))?;
+        let elements = u32::try_from(weight.len())?;
+        super::contracts::view(weight, stream, 0, [elements], [1])
+    }
+
+    fn bind_classic(mut self, stream: &Arc<CudaStream>) -> Result<Self> {
+        let bindings = (0..self.classic_layers())
+            .map(|layer| self.classic_binding(layer, stream))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(classic) = self.classic.as_mut() {
+            classic.bindings = bindings;
+        }
+        Ok(self)
     }
 
     fn classic_weight(
@@ -2929,11 +2961,12 @@ impl WeightCatalog {
         }
     }
 
-    pub(crate) fn classic_fused_ref(&self, layer: usize) -> Result<ClassicLayerRefs<'_>> {
+    fn classic_binding(&self, layer: usize, stream: &Arc<CudaStream>) -> Result<ClassicLayer> {
         let order = self
             .classic
             .as_ref()
             .context("classic catalogue binding missing")?
+            .order
             .get(layer)
             .with_context(|| format!("classic layer {layer} outside catalogue"))?;
         crate::checkpoint::validate_classic_order(layer, order)?;
@@ -2971,16 +3004,16 @@ impl WeightCatalog {
         let gu_rows = shapes[3][0] + shapes[4][0];
         let qkv = self.classic_weight(&classic_qkv_name(layer), [qkv_rows, h])?;
         let gu = self.classic_weight(&classic_gu_name(layer), [gu_rows, h])?;
-        let input_norm = self.classic_norm(layer, "input_layernorm")?;
-        let post_norm = self.classic_norm(layer, "post_attention_layernorm")?;
-        let o = self.linear_ref(&order[5], slice_stream(input_norm))?;
-        let down = self.linear_ref(&order[6], slice_stream(input_norm))?;
+        let input_norm = self.classic_norm_view(layer, "input_layernorm", stream)?;
+        let post_norm = self.classic_norm_view(layer, "post_attention_layernorm", stream)?;
+        let o = self.linear_ref(&order[5], stream)?;
+        let down = self.linear_ref(&order[6], stream)?;
         ensure!(
             matches!(o, super::linear::LinearWeightRef::Bf16(_))
                 && matches!(down, super::linear::LinearWeightRef::Bf16(_)),
             "classic layer {layer} has non-BF16 o/down projections"
         );
-        Ok(ClassicLayerRefs {
+        Ok(ClassicLayer {
             qkv,
             o,
             gu,
@@ -3116,10 +3149,13 @@ impl WeightCatalog {
                 "timings": upload_timings
             }})
         );
-        Ok(Self {
+        Self {
             #[cfg(feature = "cuda")]
             dense: None,
-            classic,
+            classic: classic.map(|order| ClassicCatalog {
+                order,
+                bindings: Vec::new(),
+            }),
             linear_format: spec.linear_format,
             tensors,
             manifest,
@@ -3128,7 +3164,8 @@ impl WeightCatalog {
             upload_content_sha256: upload_digest.as_ref().map(|x| x.1.clone()),
             upload_hashed_bytes: upload_digest.map(|x| x.0),
             load_wall_ms,
-        })
+        }
+        .bind_classic(&d.stream)
     }
     #[cfg(test)]
     pub(crate) fn bf16_mut(&mut self, name: &str) -> Result<&mut CudaSlice<bf16>> {
@@ -3276,7 +3313,10 @@ mod tests {
         }
         let catalog = WeightCatalog {
             dense: None,
-            classic: Some(order.clone()),
+            classic: Some(ClassicCatalog {
+                order: order.clone(),
+                bindings: Vec::new(),
+            }),
             linear_format: crate::model_spec::LinearFormat::Bf16,
             tensors,
             manifest: TensorManifest {

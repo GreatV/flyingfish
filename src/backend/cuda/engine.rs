@@ -317,7 +317,7 @@ impl Work {
         &mut self,
         ops: &Ops,
         stream: &Arc<CudaStream>,
-        weight: &CudaSlice<bf16>,
+        weight: &super::contracts::Tensor<bf16, 1>,
         rows: usize,
         c: &Config,
     ) -> Result<()> {
@@ -327,7 +327,7 @@ impl Work {
                 .launch_builder(&ops.add_norm)
                 .arg(&self.out)
                 .arg(&res)
-                .arg(weight)
+                .arg(&weight.ptr)
                 .arg(&mut self.n)
                 .arg(&res)
                 .arg(&(rows as i32))
@@ -2787,17 +2787,24 @@ impl Engine {
                 #[cfg(feature = "cuda")]
                 let refs = match self.catalog.as_ref() {
                     Some(catalog) if catalog.classic_layers() > 0 => {
-                        Some(catalog.classic_fused_ref(i)?)
+                        Some(catalog.classic_layer(i)?)
                     }
                     _ => None,
                 };
                 #[cfg(feature = "cuda")]
                 let input_norm = match &refs {
                     Some(refs) => Some(refs.input_norm),
-                    None => resident.and_then(|layer| layer.input_norm.as_ref()),
+                    None => resident
+                        .and_then(|layer| layer.input_norm.as_ref())
+                        .map(|weight| super::contracts::view(weight, s, 0, [h as u32], [1]))
+                        .transpose()?,
                 };
                 #[cfg(not(feature = "cuda"))]
-                let input_norm = resident.and_then(|layer| layer.input_norm.as_ref());
+                let input_norm = resident
+                    .and_then(|layer| layer.input_norm.as_ref())
+                    .map(|weight| super::contracts::view(weight, s, 0, [h as u32], [1]))
+                    .transpose()?;
+                let input_norm = input_norm.context("weighted input norm missing")?;
                 // Fused gather + layer-0 RMSNorm; Embed immediately precedes layer 0's Norm.
                 if is_tree {
                     {
@@ -2811,7 +2818,7 @@ impl Engine {
                         tree.prepare_embed_norm(
                             &w.position,
                             self.weights.embedding(),
-                            input_norm.context("weighted input norm missing")?,
+                            &input_norm,
                             super::tree::EmbedOut {
                                 ids: &mut w.ids,
                                 x: &mut w.x,
@@ -2827,7 +2834,7 @@ impl Engine {
                             .arg(self.weights.embedding())
                             .arg(ids)
                             .arg(&mut w.x)
-                            .arg(input_norm.context("weighted input norm missing")?)
+                            .arg(&input_norm.ptr)
                             .arg(&mut w.n)
                             .arg(&nr)
                             .arg(&hd)
@@ -2844,7 +2851,7 @@ impl Engine {
                 #[cfg(feature = "cuda")]
                 let refs = match self.catalog.as_ref() {
                     Some(catalog) if catalog.classic_layers() > 0 => {
-                        Some(catalog.classic_fused_ref(i)?)
+                        Some(catalog.classic_layer(i)?)
                     }
                     _ => None,
                 };
@@ -2907,7 +2914,7 @@ impl Engine {
                 #[cfg(feature = "cuda")]
                 let refs = match self.catalog.as_ref() {
                     Some(catalog) if catalog.classic_layers() > 0 => {
-                        Some(catalog.classic_fused_ref(i)?)
+                        Some(catalog.classic_layer(i)?)
                     }
                     _ => None,
                 };
@@ -2947,30 +2954,31 @@ impl Engine {
                 #[cfg(feature = "cuda")]
                 let refs = match self.catalog.as_ref() {
                     Some(catalog) if catalog.classic_layers() > 0 => {
-                        Some(catalog.classic_fused_ref(i)?)
+                        Some(catalog.classic_layer(i)?)
                     }
                     _ => None,
                 };
                 #[cfg(feature = "cuda")]
                 let post_norm = match &refs {
                     Some(refs) => Some(refs.post_norm),
-                    None => resident.and_then(|layer| layer.post_norm.as_ref()),
+                    None => resident
+                        .and_then(|layer| layer.post_norm.as_ref())
+                        .map(|weight| super::contracts::view(weight, s, 0, [h as u32], [1]))
+                        .transpose()?,
                 };
                 #[cfg(not(feature = "cuda"))]
-                let post_norm = resident.and_then(|layer| layer.post_norm.as_ref());
-                w.add_norm(
-                    &self.ops,
-                    s,
-                    post_norm.context("weighted post norm missing")?,
-                    rows,
-                    c,
-                )?;
+                let post_norm = resident
+                    .and_then(|layer| layer.post_norm.as_ref())
+                    .map(|weight| super::contracts::view(weight, s, 0, [h as u32], [1]))
+                    .transpose()?;
+                let post_norm = post_norm.context("weighted post norm missing")?;
+                w.add_norm(&self.ops, s, &post_norm, rows, c)?;
             }
             crate::backend::Operator::GateUp => {
                 #[cfg(feature = "cuda")]
                 let refs = match self.catalog.as_ref() {
                     Some(catalog) if catalog.classic_layers() > 0 => {
-                        Some(catalog.classic_fused_ref(i)?)
+                        Some(catalog.classic_layer(i)?)
                     }
                     _ => None,
                 };
@@ -3026,7 +3034,7 @@ impl Engine {
                 #[cfg(feature = "cuda")]
                 let refs = match self.catalog.as_ref() {
                     Some(catalog) if catalog.classic_layers() > 0 => {
-                        Some(catalog.classic_fused_ref(i)?)
+                        Some(catalog.classic_layer(i)?)
                     }
                     _ => None,
                 };
@@ -3063,31 +3071,38 @@ impl Engine {
             }
             crate::backend::Operator::NextNorm => {
                 #[cfg(feature = "cuda")]
-                let next_norm = self
-                    .catalog
-                    .as_ref()
-                    .filter(|catalog| i + 1 < catalog.classic_layers())
-                    .map(|catalog| catalog.classic_norm(i + 1, "input_layernorm"))
-                    .transpose()?
-                    .or_else(|| {
-                        self.weights
-                            .layers
-                            .get(i + 1)
-                            .and_then(|layer| layer.input_norm.as_ref())
-                    });
+                let next_norm = match self.catalog.as_ref() {
+                    Some(catalog) if i + 1 < catalog.classic_layers() => {
+                        Some(catalog.classic_layer(i + 1)?.input_norm)
+                    }
+                    _ => self
+                        .weights
+                        .layers
+                        .get(i + 1)
+                        .and_then(|layer| layer.input_norm.as_ref())
+                        .map(|weight| super::contracts::view(weight, s, 0, [h as u32], [1]))
+                        .transpose()?,
+                };
                 #[cfg(not(feature = "cuda"))]
                 let next_norm = self
                     .weights
                     .layers
                     .get(i + 1)
-                    .and_then(|layer| layer.input_norm.as_ref());
+                    .and_then(|layer| layer.input_norm.as_ref())
+                    .map(|weight| super::contracts::view(weight, s, 0, [h as u32], [1]))
+                    .transpose()?;
                 let weight = match next_norm {
                     Some(weight) => weight,
-                    None => self
-                        .weights
-                        .norm
-                        .as_ref()
-                        .context("weighted final norm missing")?,
+                    None => super::contracts::view(
+                        self.weights
+                            .norm
+                            .as_ref()
+                            .context("weighted final norm missing")?,
+                        s,
+                        0,
+                        [h as u32],
+                        [1],
+                    )?,
                 };
                 {
                     if let Some(binding) = self.hidden_capture.as_mut()
@@ -3132,7 +3147,7 @@ impl Engine {
                                         [rows as u32, 1, h as u32],
                                         [h as u64, h as u64, 1],
                                     )?,
-                                    weight: super::contracts::view(weight, s, 0, [h as u32], [1])?,
+                                    weight,
                                 },
                                 capture: &mut capture,
                                 slot,
@@ -3144,7 +3159,7 @@ impl Engine {
                             },
                         )?;
                     } else {
-                        w.add_norm(&self.ops, s, weight, rows, c)?;
+                        w.add_norm(&self.ops, s, &weight, rows, c)?;
                     }
                 }
                 trace_value(trace, s, &format!("layer.{i}"), &w.x, trace_rows, h)?;
@@ -6248,7 +6263,7 @@ impl Engine {
                 .catalog
                 .as_ref()
                 .filter(|catalog| catalog.classic_layers() > 0)
-                .map(|catalog| catalog.classic_fused_ref(0))
+                .map(|catalog| catalog.classic_layer(0))
                 .transpose()?;
             for &shape in &profile.linear {
                 let values = super::random(shape.rows * shape.input, 1);
