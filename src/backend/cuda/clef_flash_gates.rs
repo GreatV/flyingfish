@@ -371,6 +371,17 @@ mod gates {
         Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
         let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
         engine.prefill(&ids, None)?;
+        if let (Ok((pre_state, _)), Some(want)) = (
+            engine.decode_gdn_state(0),
+            refs.get("prefill_l0_recurrent_states"),
+        ) {
+            for h in 0..32usize {
+                let got_h = &pre_state[h * 128 * 128..(h + 1) * 128 * 128];
+                let want_h = &want[h * 128 * 128..(h + 1) * 128 * 128];
+                let (max, rmse) = max_rmse(got_h, want_h)?;
+                println!("CLEF_D2_PREFILL l0 head={h} max={max:.6e} rmse={rmse:.6e}");
+            }
+        }
         for (step, token) in emitted.iter().enumerate() {
             let cell = format!("decode_logits_s{step}");
             let logits = engine.decode_logits()?;
