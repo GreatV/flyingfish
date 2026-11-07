@@ -852,8 +852,11 @@ struct GraphStepCheckpoint {
     sequence: Vec<i32>,
     work_position: Vec<i32>,
     work_length: Vec<i32>,
+    work_token: Vec<u32>,
+    work_x: Vec<bf16>,
     token: u32,
     position: usize,
+    pending_token: Option<u32>,
     last_input: Option<PrefixLastInputKind>,
     logits: PrefixLogitsCache,
     committed_prefix_ids: Vec<u32>,
@@ -892,8 +895,11 @@ impl GraphStepCheckpoint {
             sequence: s.clone_dtoh(engine.state.sequence.as_ref().context("sequence missing")?)?,
             work_position: s.clone_dtoh(&engine.work.position)?,
             work_length: s.clone_dtoh(&engine.work.length)?,
+            work_token: s.clone_dtoh(&engine.work.token)?,
+            work_x: s.clone_dtoh(&engine.work.x)?,
             token: engine.token()?,
             position: engine.position,
+            pending_token: engine.pending_token,
             last_input: engine.last_input_kind,
             logits: engine.logits_cache,
             committed_prefix_ids: engine.committed_prefix_ids.clone(),
@@ -920,8 +926,11 @@ impl GraphStepCheckpoint {
         )?;
         s.memcpy_htod(&self.work_position, &mut engine.work.position)?;
         s.memcpy_htod(&self.work_length, &mut engine.work.length)?;
+        s.memcpy_htod(&self.work_token, &mut engine.work.token)?;
+        s.memcpy_htod(&self.work_x, &mut engine.work.x)?;
         engine.position = self.position;
         engine.set_token(self.token)?;
+        engine.pending_token = self.pending_token;
         engine.last_input_kind = self.last_input;
         engine.logits_cache = self.logits;
         engine.committed_prefix_ids = self.committed_prefix_ids.clone();
