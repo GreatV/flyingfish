@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, ensure};
-use flyingfish::{audio::LogMel, canary::CanarySpec, parakeet::ParakeetSpec};
+use flyingfish::{
+    audio::LogMel, canary::CanarySpec, nemotron::NemotronSpec, parakeet::ParakeetSpec,
+};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -36,7 +38,15 @@ fn parakeet_spec_rejects_changed_geometry() -> Result<()> {
             && conformer.layers == 24
             && conformer.hidden == 1024
             && conformer.heads == 8
-            && conformer.conv_kernel == 9,
+            && conformer.conv_kernel == 9
+            && conformer.conv_batch_norm
+            && conformer.pad_left == 1
+            && conformer.pad_right == 1
+            && conformer.depthwise_left == 4
+            && conformer.linear_in == 4096
+            && conformer.chunk_size == 0
+            && conformer.left_chunks == 0
+            && conformer.max_position == spec.max_position,
         "Parakeet conformer bias or prefix changed"
     );
     let mut root: Value = serde_json::from_str(include_str!("data/parakeet-tdt-config.json"))?;
@@ -130,7 +140,13 @@ fn read_features(path: &Path) -> Result<ReferenceFeatures> {
     })
 }
 
-fn match_mel(frontend: &LogMel, fixtures: &Path, floors: &Value, label: &str) -> Result<()> {
+fn match_mel(
+    frontend: &LogMel,
+    fixtures: &Path,
+    floors: &Value,
+    label: &str,
+    normalize: bool,
+) -> Result<()> {
     for case in ["short", "edges", "production"] {
         let path = fixtures.join(format!("{case}.safetensors"));
         let ReferenceFeatures {
@@ -156,7 +172,7 @@ fn match_mel(frontend: &LogMel, fixtures: &Path, floors: &Value, label: &str) ->
                 &pcm[batch * pcm_shape[1]..batch * pcm_shape[1] + length]
             })
             .collect();
-        let actual = frontend.extract(&waves)?;
+        let actual = frontend.extract(&waves, normalize)?;
         ensure!(
             actual.frames == shape[1]
                 && actual.mel_bins == shape[2]
@@ -217,7 +233,7 @@ fn parakeet_mel_matches_frozen_reference() -> Result<()> {
         std::env::var_os("FF_PARAKEET_FLOORS").context("FF_PARAKEET_FLOORS missing")?,
     ))?)?;
     let frontend = LogMel::new(ParakeetSpec::read(&model)?.mel)?;
-    match_mel(&frontend, &fixtures, &floors, "PARAKEET")
+    match_mel(&frontend, &fixtures, &floors, "PARAKEET", true)
 }
 
 fn canary_spec_from_data() -> Result<CanarySpec> {
@@ -246,7 +262,15 @@ fn canary_spec_rejects_changed_geometry() -> Result<()> {
             && conformer.convolution_bias
             && conformer.prefix == "model.encoder"
             && conformer.layers == 32
-            && conformer.conv_kernel == 9,
+            && conformer.conv_kernel == 9
+            && conformer.conv_batch_norm
+            && conformer.pad_left == 1
+            && conformer.pad_right == 1
+            && conformer.depthwise_left == 4
+            && conformer.linear_in == 4096
+            && conformer.chunk_size == 0
+            && conformer.left_chunks == 0
+            && conformer.max_position == 5000,
         "published Canary geometry changed"
     );
     let mut root: Value = serde_json::from_str(include_str!("data/canary-1b-v2-config.json"))?;
@@ -293,5 +317,20 @@ fn canary_mel_matches_frozen_reference() -> Result<()> {
         std::env::var_os("FF_CANARY_FLOORS").context("FF_CANARY_FLOORS missing")?,
     ))?)?;
     let frontend = LogMel::new(CanarySpec::read(&model)?.mel)?;
-    match_mel(&frontend, &fixtures, &floors, "CANARY")
+    match_mel(&frontend, &fixtures, &floors, "CANARY", true)
+}
+
+#[test]
+#[ignore = "external CPU fixtures; set FF_NEMOTRON_MODEL, FF_NEMOTRON_FIXTURES and FF_NEMOTRON_FLOORS"]
+fn nemotron_mel_matches_frozen_reference() -> Result<()> {
+    let model =
+        PathBuf::from(std::env::var_os("FF_NEMOTRON_MODEL").context("FF_NEMOTRON_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_NEMOTRON_FIXTURES").context("FF_NEMOTRON_FIXTURES missing")?,
+    );
+    let floors: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
+        std::env::var_os("FF_NEMOTRON_FLOORS").context("FF_NEMOTRON_FLOORS missing")?,
+    ))?)?;
+    let frontend = LogMel::new(NemotronSpec::read(&model)?.mel)?;
+    match_mel(&frontend, &fixtures, &floors, "NEMOTRON", false)
 }

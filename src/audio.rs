@@ -167,7 +167,7 @@ impl LogMel {
         })
     }
 
-    pub fn extract(&self, waveforms: &[&[f32]]) -> Result<LogMelBatch> {
+    pub fn extract(&self, waveforms: &[&[f32]], normalize: bool) -> Result<LogMelBatch> {
         ensure!(!waveforms.is_empty(), "empty audio batch");
         for waveform in waveforms {
             ensure!(
@@ -233,24 +233,25 @@ impl LogMel {
                 }
             }
             for mel in 0..mel_bins {
-                let mut mean = 0.0;
-                for time in 0..valid {
-                    mean += features[(batch * frames + time) * mel_bins + mel];
+                if normalize {
+                    let mut mean = 0.0;
+                    for time in 0..valid {
+                        mean += features[(batch * frames + time) * mel_bins + mel];
+                    }
+                    mean /= valid as f32;
+                    let mut variance = 0.0;
+                    for time in 0..valid {
+                        let delta = features[(batch * frames + time) * mel_bins + mel] - mean;
+                        variance = delta.mul_add(delta, variance);
+                    }
+                    let std = (variance / (valid - 1) as f32).sqrt();
+                    for time in 0..valid {
+                        let index = (batch * frames + time) * mel_bins + mel;
+                        features[index] = (features[index] - mean) / (std + self.config.norm_eps);
+                    }
                 }
-                mean /= valid as f32;
-                let mut variance = 0.0;
-                for time in 0..valid {
-                    let delta = features[(batch * frames + time) * mel_bins + mel] - mean;
-                    variance = delta.mul_add(delta, variance);
-                }
-                let std = (variance / (valid - 1) as f32).sqrt();
-                for time in 0..frames {
-                    let index = (batch * frames + time) * mel_bins + mel;
-                    features[index] = if time < valid {
-                        (features[index] - mean) / (std + self.config.norm_eps)
-                    } else {
-                        0.0
-                    };
+                for time in valid..frames {
+                    features[(batch * frames + time) * mel_bins + mel] = 0.0;
                 }
             }
             for time in 0..valid {
@@ -299,6 +300,61 @@ mod tests {
         ensure!(
             Radix2Fft::new(1).is_err() && Radix2Fft::new(15).is_err(),
             "invalid FFT size accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unnormalized_log_mel_keeps_the_frame_mean() -> Result<()> {
+        let mel = LogMel::new(LogMelConfig {
+            sampling_rate: 16000,
+            n_fft: 512,
+            win_length: 400,
+            hop_length: 160,
+            mel_bins: 128,
+            preemphasis: 0.97,
+            log_guard: 2.0f32.powi(-24),
+            norm_eps: 1e-5,
+        })?;
+        let wave: Vec<f32> = (0..2560)
+            .map(|index| {
+                let centered = ((index * 73 + 19) % 257) as f32;
+                let integer = (centered - 128.0) / 128.0;
+                let tone = (2.0 * std::f64::consts::PI * index as f64 / 251.0).sin() as f32 * 0.25;
+                integer + tone
+            })
+            .collect();
+        let normalized = mel.extract(&[&wave], true)?;
+        let logged = mel.extract(&[&wave], false)?;
+        ensure!(
+            normalized.frames == 17 && logged.frames == 17,
+            "frame count"
+        );
+        ensure!(
+            logged.mask.iter().filter(|flag| **flag).count() == 16,
+            "valid frame count"
+        );
+        let mut logged_mean = 0.0f32;
+        let mut normalized_mean = 0.0f32;
+        for time in 0..16 {
+            logged_mean += logged.features[time * 128];
+            normalized_mean += normalized.features[time * 128];
+            ensure!(
+                logged.features[time * 128].is_finite(),
+                "non-finite log mel"
+            );
+        }
+        logged_mean /= 16.0;
+        normalized_mean /= 16.0;
+        ensure!(
+            logged_mean.abs() > 1e-3 && normalized_mean.abs() < 1e-5,
+            "normalize flag did not change the frame mean: log={logged_mean} normalized={normalized_mean}"
+        );
+        ensure!(
+            logged.features[16 * 128..]
+                .iter()
+                .all(|value| *value == 0.0),
+            "masked log-mel frame was not zeroed"
         );
         Ok(())
     }

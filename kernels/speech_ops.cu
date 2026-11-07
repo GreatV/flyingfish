@@ -2,16 +2,21 @@
 #include <stdint.h>
 #include <math.h>
 
-// Native weights[out,in/groups,3,3], NHWC input/output, stride 2 and padding 1.
+// Native weights[out,in/groups,3,3], NHWC input/output, stride 2.
+// Output length is (n + left_pad + right_pad - 3) / 2 + 1. Source index is output * 2 - left_pad + tap.
 extern "C" __global__ void speech_conv2d_f32(
     const float* input, const float* weight, const float* bias, float* output,
     uint32_t time, uint32_t frequency, uint32_t in_channels, uint32_t out_channels,
-    uint32_t groups, uint32_t valid_time) {
+    uint32_t groups, uint32_t valid_time, uint32_t left_pad, uint32_t right_pad) {
     if (blockDim.x != 256 || !input || !weight || !bias || !output || !time || !frequency ||
         !in_channels || !out_channels || !groups || in_channels % groups || out_channels % groups) {
         __trap(); return;
     }
-    const uint32_t out_time = (time - 1) / 2 + 1, out_frequency = (frequency - 1) / 2 + 1;
+    const int time_span = int(time) + int(left_pad) + int(right_pad) - 3;
+    const int frequency_span = int(frequency) + int(left_pad) + int(right_pad) - 3;
+    if (time_span < 0 || frequency_span < 0) { __trap(); return; }
+    const uint32_t out_time = uint32_t(time_span) / 2 + 1;
+    const uint32_t out_frequency = uint32_t(frequency_span) / 2 + 1;
     if (valid_time > out_time) { __trap(); return; }
     const uint32_t group_width = in_channels / groups, group_count = out_channels / groups;
     const uint64_t count = uint64_t(out_time) * out_frequency * out_channels;
@@ -25,9 +30,10 @@ extern "C" __global__ void speech_conv2d_f32(
         for (uint32_t ic = 0; ic < group_width; ++ic) {
             for (uint32_t ky = 0; ky < 3; ++ky) {
                 for (uint32_t kx = 0; kx < 3; ++kx) {
-                    const uint32_t it = ot * 2 + ky, iff = of * 2 + kx;
-                    if (it >= 1 && it <= time && iff >= 1 && iff <= frequency) {
-                        const uint64_t source = (uint64_t(it - 1) * frequency + iff - 1) * in_channels + first + ic;
+                    const int it = int(ot) * 2 - int(left_pad) + int(ky);
+                    const int iff = int(of) * 2 - int(left_pad) + int(kx);
+                    if (it >= 0 && it < int(time) && iff >= 0 && iff < int(frequency)) {
+                        const uint64_t source = (uint64_t(it) * frequency + uint32_t(iff)) * in_channels + first + ic;
                         const uint64_t tap = ((uint64_t(channel) * group_width + ic) * 3 + ky) * 3 + kx;
                         sum = __fmaf_rn(input[source], weight[tap], sum);
                     }
@@ -66,10 +72,10 @@ extern "C" __global__ void speech_pack_subsample_f32(
     }
 }
 
-// Native weights[channel,1,kernel], symmetric time padding, [time,channel] input/output.
+// Native weights[channel,1,kernel], [time,channel] input/output. Tap index is row + k - left.
 extern "C" __global__ void speech_depthwise_conv_f32(
     const float* input, const float* weight, const uint8_t* mask, float* output,
-    uint32_t rows, uint32_t channels, uint32_t kernel) {
+    uint32_t rows, uint32_t channels, uint32_t kernel, uint32_t left) {
     if (blockDim.x != 256 || !input || !weight || !mask || !output || !rows || !channels ||
         !kernel || !(kernel & 1)) { __trap(); return; }
     const uint64_t count = uint64_t(rows) * channels;
@@ -78,7 +84,7 @@ extern "C" __global__ void speech_depthwise_conv_f32(
         const uint32_t row = uint32_t(i / channels), channel = uint32_t(i % channels);
         float sum = 0.0f;
         for (uint32_t k = 0; k < kernel; ++k) {
-            const int t = int(row) + int(k) - int(kernel / 2);
+            const int t = int(row) + int(k) - int(left);
             if (t >= 0 && t < int(rows) && mask[t])
                 sum = __fmaf_rn(input[uint64_t(t) * channels + channel], weight[channel * kernel + k], sum);
         }
@@ -109,23 +115,36 @@ extern "C" __global__ void speech_residual_f32(
         output[i] = __fadd_rn(residual[i], __fmul_rn(scale, delta[i]));
 }
 
-// Full bidirectional Transformer-XL attention with interleaved relative positions and head_dim=128.
+// Transformer-XL attention with interleaved relative positions and head_dim=128.
+// chunk_size 0 attends the full valid prefix. A positive chunk_size keeps keys in
+// [max(0, (q/chunk - left_chunks)*chunk), min(rows, (q/chunk + 1 + right_chunks)*chunk)).
 extern "C" __global__ void speech_relative_attention_f32(
     const float* q, const float* k, const float* v, const float* relative,
     const float* bias_u, const float* bias_v, const uint8_t* mask, float* output,
-    uint32_t rows, uint32_t heads, float scaling) {
+    uint32_t rows, uint32_t heads, float scaling, uint32_t chunk_size, uint32_t left_chunks,
+    uint32_t right_chunks) {
     extern __shared__ float shared[];
     float* reduction = shared;
     float* probabilities = shared + 8;
     if (blockDim.x != 128 || gridDim.x != rows || gridDim.y != heads || gridDim.z != 1 ||
         !q || !k || !v || !relative || !bias_u || !bias_v || !mask || !output ||
-        !rows || !heads || !(scaling > 0.0f)) { __trap(); return; }
+        !rows || !heads || !(scaling > 0.0f) || right_chunks > 1 ||
+        (chunk_size == 0 && right_chunks != 0)) { __trap(); return; }
     const uint32_t query = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
     const uint32_t hidden = heads * 128;
     const uint8_t query_valid = mask[query];
+    uint32_t key_begin = 0, key_end = rows;
+    if (chunk_size != 0) {
+        const uint32_t query_chunk = query / chunk_size;
+        const uint32_t start_chunk = query_chunk > left_chunks ? query_chunk - left_chunks : 0;
+        key_begin = start_chunk * chunk_size;
+        const uint64_t end = (uint64_t(query_chunk) + 1 + right_chunks) * chunk_size;
+        key_end = end > rows ? rows : uint32_t(end);
+    }
     for (uint32_t key = 0; key < rows; ++key) {
         float content = 0.0f, position = 0.0f;
-        if (query_valid && mask[key]) {
+        const bool in_window = chunk_size == 0 || (key >= key_begin && key < key_end);
+        if (query_valid && mask[key] && in_window) {
             const uint32_t relative_row = rows - 1 - query + key;
             const float qu = __fadd_rn(q[uint64_t(query) * hidden + head * 128 + d], bias_u[head * 128 + d]);
             const float qv = __fadd_rn(q[uint64_t(query) * hidden + head * 128 + d], bias_v[head * 128 + d]);
@@ -144,7 +163,8 @@ extern "C" __global__ void speech_relative_attention_f32(
         if (d == 0) {
             const float ac = (reduction[0] + reduction[1]) + (reduction[2] + reduction[3]);
             const float bd = (reduction[4] + reduction[5]) + (reduction[6] + reduction[7]);
-            probabilities[key] = !query_valid ? 0.0f : mask[key] ? __fmul_rn(ac + bd, scaling) : -INFINITY;
+            probabilities[key] = !query_valid ? 0.0f
+                : (mask[key] && in_window) ? __fmul_rn(ac + bd, scaling) : -INFINITY;
         }
         __syncthreads();
     }
