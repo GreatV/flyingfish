@@ -347,6 +347,246 @@ pub fn load_joint_weights(
     })
 }
 
+/// One question of a scored record: type id, question span and option spans
+/// over the record token sequence.
+pub struct JointQuestion {
+    pub type_id: i32,
+    pub qspan: [i32; 2],
+    pub option_spans: Vec<[i32; 2]>,
+}
+
+/// A scored record fixture: token ids and the question/option spans.
+pub struct JointFixture {
+    pub ids: Vec<u32>,
+    pub questions: Vec<JointQuestion>,
+}
+
+impl JointFixture {
+    /// Parses the fixture JSON: `{"input_ids": [...], "spans": [{"type",
+    /// "qspan", "option_spans"}, ...]}`.
+    pub fn parse(text: &str) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        let ids = value["input_ids"]
+            .as_array()
+            .context("input_ids missing")?
+            .iter()
+            .map(|v| {
+                u32::try_from(v.as_i64().context("input id not integer")?)
+                    .context("input id outside u32")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut questions = Vec::new();
+        for span in value["spans"].as_array().context("spans missing")? {
+            let pair = |v: &serde_json::Value| -> Result<[i32; 2]> {
+                let a = v.as_array().context("span not a pair")?;
+                ensure!(a.len() == 2, "span pair extent");
+                Ok([
+                    i32::try_from(a[0].as_i64().context("span bound not integer")?)?,
+                    i32::try_from(a[1].as_i64().context("span bound not integer")?)?,
+                ])
+            };
+            let option_spans = span["option_spans"]
+                .as_array()
+                .context("option_spans missing")?
+                .iter()
+                .map(pair)
+                .collect::<Result<Vec<_>>>()?;
+            questions.push(JointQuestion {
+                type_id: i32::try_from(span["type"].as_i64().context("type missing")?)?,
+                qspan: pair(&span["qspan"])?,
+                option_spans,
+            });
+        }
+        ensure!(!ids.is_empty() && !questions.is_empty(), "empty fixture");
+        for q in &questions {
+            ensure!(
+                q.type_id >= 0 && (q.type_id as usize) < 3 && !q.option_spans.is_empty(),
+                "question type/options out of range"
+            );
+            for span in [q.qspan].into_iter().chain(q.option_spans.iter().copied()) {
+                ensure!(
+                    span[0] >= 0 && span[0] < span[1] && (span[1] as usize) <= ids.len(),
+                    "span outside the token sequence"
+                );
+            }
+        }
+        Ok(Self { ids, questions })
+    }
+
+    /// Total option rows across all questions.
+    pub fn total_options(&self) -> usize {
+        self.questions.iter().map(|q| q.option_spans.len()).sum()
+    }
+}
+
+/// The head-width, head-count, head-dimension and feed-forward constants the
+/// loader's shape checks already pin.
+const WIDTH: usize = 1024;
+const HEADS: usize = 16;
+const HEAD_DIM: usize = 64;
+const FF: usize = 4096;
+
+/// Per-fixture bindings: the three attention problems and the stage scratch.
+pub struct JointPlan {
+    flash_routing: crate::backend::cuda::flash::Flash,
+    flash_cross: crate::backend::cuda::flash::Flash,
+    flash_self: crate::backend::cuda::flash::Flash,
+    /// Captured post-backbone hidden rows `[seq, 4096]` (hidden_norm input).
+    pub hidden_src: CudaSlice<bf16>,
+    normed: CudaSlice<bf16>,
+    memory: CudaSlice<bf16>,
+    memory_normed: CudaSlice<bf16>,
+    kv_k: CudaSlice<bf16>,
+    kv_v: CudaSlice<bf16>,
+    k_hm: CudaSlice<bf16>,
+    v_hm: CudaSlice<bf16>,
+    dummy_q: CudaSlice<bf16>,
+    q_proj: CudaSlice<bf16>,
+    attn_out: CudaSlice<bf16>,
+    proj_out: CudaSlice<bf16>,
+    ff_hidden: CudaSlice<bf16>,
+    small: CudaSlice<bf16>,
+    small2: CudaSlice<bf16>,
+    fields: CudaSlice<bf16>,
+    routing: [CudaSlice<bf16>; 2],
+    oq: CudaSlice<bf16>,
+    global_row: CudaSlice<bf16>,
+    features: CudaSlice<bf16>,
+    scorer_h: CudaSlice<bf16>,
+    scorer_out: CudaSlice<bf16>,
+    qvecs: CudaSlice<bf16>,
+    ctx: CudaSlice<bf16>,
+    lex: CudaSlice<bf16>,
+    gathered: CudaSlice<bf16>,
+    begins: CudaSlice<i32>,
+    ends: CudaSlice<i32>,
+    lex_idx: CudaSlice<i32>,
+    pub seq: usize,
+    pub questions: usize,
+    pub options: usize,
+    gather_rows: usize,
+}
+
+impl JointPlan {
+    /// Binds the attention problems and scratch for one fixture geometry.
+    pub fn bind(
+        stream: &Arc<CudaStream>,
+        seq: usize,
+        questions: usize,
+        options: usize,
+        gather_rows: usize,
+    ) -> Result<Self> {
+        ensure!(
+            seq > 0 && questions > 0 && options >= questions && gather_rows > 0,
+            "joint plan geometry: seq={seq} questions={questions} options={options} gather_rows={gather_rows}"
+        );
+        let score = crate::backend::cuda::flash::Score {
+            scale: (HEAD_DIM as f32).sqrt().recip(),
+            window_left: None,
+        };
+        let flash = |rows: usize, capacity: usize| {
+            crate::backend::cuda::flash::Flash::new_with_score(
+                stream.clone(),
+                rows,
+                HEADS,
+                HEADS,
+                HEAD_DIM,
+                score,
+                capacity,
+            )
+        };
+        let alloc = |n: usize| stream.alloc_zeros::<bf16>(n);
+        let big = seq * WIDTH;
+        Ok(Self {
+            flash_routing: flash(options, seq)?,
+            flash_cross: flash(questions, seq)?,
+            flash_self: flash(questions, questions)?,
+            hidden_src: alloc(seq * 4096)?,
+            normed: alloc(seq * 4096)?,
+            memory: alloc(big)?,
+            memory_normed: alloc(big)?,
+            kv_k: alloc(big)?,
+            kv_v: alloc(big)?,
+            k_hm: alloc(HEADS * seq * HEAD_DIM)?,
+            v_hm: alloc(HEADS * seq * HEAD_DIM)?,
+            dummy_q: alloc(big)?,
+            q_proj: alloc(options * WIDTH)?,
+            attn_out: alloc(options * WIDTH)?,
+            proj_out: alloc(options * WIDTH)?,
+            ff_hidden: alloc(options * FF)?,
+            small: alloc(options * WIDTH)?,
+            small2: alloc(options * WIDTH)?,
+            fields: alloc(questions * WIDTH)?,
+            routing: [alloc(options * WIDTH)?, alloc(options * WIDTH)?],
+            oq: alloc(questions * WIDTH)?,
+            global_row: alloc(4096)?,
+            features: alloc(options * 4 * WIDTH)?,
+            scorer_h: alloc(options * WIDTH)?,
+            scorer_out: alloc(options)?,
+            qvecs: alloc(questions * 4096)?,
+            ctx: alloc(options * 4096)?,
+            lex: alloc(options * 4096)?,
+            gathered: alloc(gather_rows * 4096)?,
+            begins: stream.alloc_zeros::<i32>(options.max(questions))?,
+            ends: stream.alloc_zeros::<i32>(options.max(questions))?,
+            lex_idx: stream.alloc_zeros::<i32>(gather_rows)?,
+            seq,
+            questions,
+            options,
+            gather_rows,
+        })
+    }
+}
+
+/// The scored-stage outputs at the frozen cell extents.
+pub struct JointStages {
+    /// memory_projection row 0.
+    pub memory_row0: Vec<f32>,
+    /// question_projection row 0.
+    pub question_proj_row0: Vec<f32>,
+    /// option_question_projection row 0 of the last question's call.
+    pub option_question_last_row0: Vec<f32>,
+    /// option_context_projection row 0 of the last question's call.
+    pub option_context_last_row0: Vec<f32>,
+    /// option_lexical_projection row 0 of the last question's call.
+    pub option_lexical_last_row0: Vec<f32>,
+    /// global_projection row.
+    pub global: Vec<f32>,
+    /// routing layer outputs `[options * 1024]`.
+    pub routing: [Vec<f32>; 2],
+    /// decoder layer outputs `[questions * 1024]`.
+    pub decoder: [Vec<f32>; 4],
+    /// field_norm row 0.
+    pub fields_row0: Vec<f32>,
+    /// per-question option logits.
+    pub logits: Vec<Vec<f32>>,
+    /// hidden_norm over the full sequence (disclosed measurement).
+    pub hidden_norm_full: Vec<f32>,
+}
+
+/// The shared op kernels the head launches directly.
+pub(crate) struct JointOps {
+    bias_add: cudarc::driver::CudaFunction,
+    gelu: cudarc::driver::CudaFunction,
+    pack_split: cudarc::driver::CudaFunction,
+    gather: cudarc::driver::CudaFunction,
+    mean_span: cudarc::driver::CudaFunction,
+}
+
+impl JointOps {
+    pub(crate) fn new(ctx: &Arc<cudarc::driver::CudaContext>) -> Result<Self> {
+        let common = crate::backend::cuda::cubin::module(ctx, "q38_common")?;
+        let vision = crate::backend::cuda::cubin::module(ctx, "vision_ops")?;
+        Ok(Self {
+            bias_add: common.load_function("q38_bias_add")?,
+            gelu: common.load_function("q38_gelu")?,
+            pack_split: vision.load_function("vision_pack_split")?,
+            gather: vision.load_function("vision_row_gather")?,
+            mean_span: common.load_function("mean_span_rows")?,
+        })
+    }
+}
+
 /// Span-mean operands: the source rows, the device span bounds and the
 /// destination, with the derived widths.
 pub struct SpanMean<'a> {
@@ -356,6 +596,1082 @@ pub struct SpanMean<'a> {
     pub out: &'a mut CudaSlice<bf16>,
     pub spans: usize,
     pub width: usize,
+}
+
+fn flat(n: usize) -> crate::backend::gpu::LaunchConfig {
+    crate::backend::gpu::LaunchConfig {
+        grid_dim: (n.div_ceil(256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Affine LayerNorm over `[rows, width]` BF16 rows, eps 1e-5.
+impl JointRun<'_> {
+    fn layer_norm(
+        &self,
+        x: &CudaSlice<bf16>,
+        y: &mut CudaSlice<bf16>,
+        rows: usize,
+        width: usize,
+        weight: &Arc<CudaSlice<bf16>>,
+        bias: &Arc<CudaSlice<bf16>>,
+    ) -> Result<()> {
+        let stream = self.stream;
+        let common = self.common;
+        use crate::backend::cuda::contracts::{TensorMut, view};
+        let span = (rows * width) as u64;
+        let xv = view(
+            x,
+            stream,
+            0,
+            [1, u32::try_from(rows)?, width as u32],
+            [span, width as u64, 1],
+        )?;
+        let yv = view(
+            y,
+            stream,
+            0,
+            [1, u32::try_from(rows)?, width as u32],
+            [span, width as u64, 1],
+        )?;
+        let wv = view(weight, stream, 0, [width as u32], [1])?;
+        let bv = view(bias, stream, 0, [width as u32], [1])?;
+        common
+            .norm
+            .layer_norm(stream, xv, wv, bv, &mut TensorMut(yv), 1e-5)
+    }
+
+    /// In-place affine LayerNorm; the shared kernel reads each row before it
+    /// writes it.
+    fn layer_norm_inplace(
+        &self,
+        buf: &mut CudaSlice<bf16>,
+        rows: usize,
+        width: usize,
+        weight: &Arc<CudaSlice<bf16>>,
+        bias: &Arc<CudaSlice<bf16>>,
+    ) -> Result<()> {
+        let stream = self.stream;
+        let common = self.common;
+        use crate::backend::cuda::contracts::{Tensor, TensorMut, view};
+        let span = (rows * width) as u64;
+        let xv = view(
+            &*buf,
+            stream,
+            0,
+            [1, u32::try_from(rows)?, width as u32],
+            [span, width as u64, 1],
+        )?;
+        let wv = view(weight, stream, 0, [width as u32], [1])?;
+        let bv = view(bias, stream, 0, [width as u32], [1])?;
+        let yv = unsafe { Tensor::new(xv.ptr, xv.shape, xv.stride, xv.span_bytes)? };
+        common
+            .norm
+            .layer_norm(stream, xv, wv, bv, &mut TensorMut(yv), 1e-5)
+    }
+
+    /// In-place bias add over a flat BF16 buffer: `y[i] += bias[i % width]`.
+    fn bias_add(
+        &self,
+        y: &mut CudaSlice<bf16>,
+        bias: &Arc<CudaSlice<bf16>>,
+        bias_offset: usize,
+        width: usize,
+    ) -> Result<()> {
+        let stream = self.stream;
+        let ops = self.ops;
+        use crate::backend::gpu::{DevicePtr, DevicePtrMut, PushKernelArg};
+        ensure!(
+            y.len().is_multiple_of(width) && bias.len() >= bias_offset + width,
+            "bias add extent: y={} width={width}",
+            y.len()
+        );
+        let count = y.len();
+        let (y_ptr, _guard) = y.device_ptr_mut(stream);
+        let b_ptr = bias.device_ptr(stream).0 + (bias_offset * 2) as u64;
+        unsafe {
+            stream
+                .launch_builder(&ops.bias_add)
+                .arg(&y_ptr)
+                .arg(&b_ptr)
+                .arg(&(count as u64))
+                .arg(&(width as u32))
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// Erf GELU over a `[rows, width]` BF16 buffer, F32 compute, BF16 round.
+    fn gelu(&self, x: &mut CudaSlice<bf16>, rows: usize, width: usize) -> Result<()> {
+        let stream = self.stream;
+        let ops = self.ops;
+        use crate::backend::gpu::{DevicePtrMut, PushKernelArg};
+        let count = rows * width;
+        ensure!(x.len() == count, "gelu extent");
+        let stride = width as u64;
+        let (x_ptr, _guard) = x.device_ptr_mut(stream);
+        unsafe {
+            stream
+                .launch_builder(&ops.gelu)
+                .arg(&x_ptr)
+                .arg(&x_ptr)
+                .arg(&(rows as u32))
+                .arg(&1u32)
+                .arg(&(width as u32))
+                .arg(&stride)
+                .arg(&stride)
+                .arg(&1u64)
+                .arg(&stride)
+                .arg(&stride)
+                .arg(&1u64)
+                .arg(&0i32)
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// Row gather over `width`-wide BF16 rows: `gathered[r] = src[indices[r]]`.
+    fn row_gather(
+        &self,
+        src: &CudaSlice<bf16>,
+        indices: &CudaSlice<i32>,
+        gathered: &mut CudaSlice<bf16>,
+        rows: usize,
+        in_rows: usize,
+        width: usize,
+    ) -> Result<()> {
+        let stream = self.stream;
+        let ops = self.ops;
+        use crate::backend::gpu::{DevicePtr, DevicePtrMut, PushKernelArg};
+        ensure!(
+            indices.len() == rows && gathered.len() == rows * width && src.len() == in_rows * width,
+            "row gather extent"
+        );
+        unsafe {
+            stream
+                .launch_builder(&ops.gather)
+                .arg(&src.device_ptr(stream).0)
+                .arg(&indices.device_ptr(stream).0)
+                .arg(&gathered.device_ptr_mut(stream).0)
+                .arg(&(rows as u32))
+                .arg(&(in_rows as u32))
+                .arg(&(width as u32))
+                .launch(flat(rows * width))?;
+        }
+        Ok(())
+    }
+
+    /// Per-span row means over `x` with device bounds `begins`/`ends`.
+    fn span_means(
+        &self,
+        x: &CudaSlice<bf16>,
+        begins: &CudaSlice<i32>,
+        ends: &CudaSlice<i32>,
+        out: &mut CudaSlice<bf16>,
+        spans: usize,
+        width: usize,
+    ) -> Result<()> {
+        mean_span_rows(
+            self.stream,
+            &self.ops.mean_span,
+            SpanMean {
+                x,
+                begins,
+                ends,
+                out,
+                spans,
+                width,
+            },
+        )
+    }
+}
+
+/// Elementwise BF16 add: F32 compute, one BF16 round per element.
+fn add_round(a: &[bf16], b: &[bf16]) -> Result<Vec<bf16>> {
+    ensure!(a.len() == b.len(), "add extent");
+    Ok(a.iter()
+        .zip(b)
+        .map(|(x, y)| bf16::from_f32(x.to_f32() + y.to_f32()))
+        .collect())
+}
+
+/// F32 dot of BF16 vectors.
+fn dot_f32(a: &[bf16], b: &[bf16]) -> Result<f32> {
+    ensure!(a.len() == b.len(), "dot extent");
+    Ok(a.iter().zip(b).map(|(x, y)| x.to_f32() * y.to_f32()).sum())
+}
+
+/// L2-normalizes one BF16 row: F32 norm and division, BF16 round per element.
+fn normalize_row(row: &[bf16]) -> Vec<bf16> {
+    let norm = row
+        .iter()
+        .map(|v| {
+            let f = v.to_f32();
+            f * f
+        })
+        .sum::<f32>()
+        .sqrt()
+        .max(1e-12);
+    row.iter()
+        .map(|v| bf16::from_f32(v.to_f32() / norm))
+        .collect()
+}
+
+/// Softmax over BF16 scores: F32 max-subtracted exponential, BF16 weights.
+fn softmax_bf16(scores: &[bf16]) -> Vec<bf16> {
+    let m = scores
+        .iter()
+        .map(|v| v.to_f32())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = scores.iter().map(|v| (v.to_f32() - m).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    exps.iter().map(|e| bf16::from_f32(e / sum)).collect()
+}
+
+/// The two attention operands of one projection.
+struct AttnSides<'a> {
+    queries: &'a CudaSlice<bf16>,
+    rows: usize,
+    keys_values: &'a CudaSlice<bf16>,
+    keys: usize,
+}
+
+/// The attention projection weights of one routing or decoder sub-layer.
+struct AttnWeights {
+    in_proj: Arc<CudaSlice<bf16>>,
+    in_bias: Arc<CudaSlice<bf16>>,
+    out_w: Arc<CudaSlice<bf16>>,
+    out_b: Arc<CudaSlice<bf16>>,
+}
+
+/// The mutable scratch lanes one attention projection writes.
+struct AttnLane<'a> {
+    q_proj: &'a mut CudaSlice<bf16>,
+    kv_k: &'a mut CudaSlice<bf16>,
+    kv_v: &'a mut CudaSlice<bf16>,
+    dummy_q: &'a mut CudaSlice<bf16>,
+    k_hm: &'a mut CudaSlice<bf16>,
+    v_hm: &'a mut CudaSlice<bf16>,
+    attn_out: &'a mut CudaSlice<bf16>,
+    out: &'a mut CudaSlice<bf16>,
+}
+
+/// One bound head execution over the shared ops; the caller owns the plan.
+pub struct JointRun<'a> {
+    stream: &'a Arc<CudaStream>,
+    blas: &'a crate::backend::cuda::blas::Blas,
+    common: &'a crate::backend::cuda::ops::CommonOpsRef,
+    ops: &'a JointOps,
+    w: &'a JointWeights,
+}
+
+impl<'a> JointRun<'a> {
+    pub(crate) fn new(
+        stream: &'a Arc<CudaStream>,
+        blas: &'a crate::backend::cuda::blas::Blas,
+        common: &'a crate::backend::cuda::ops::CommonOpsRef,
+        ops: &'a JointOps,
+        w: &'a JointWeights,
+    ) -> Self {
+        Self {
+            stream,
+            blas,
+            common,
+            ops,
+            w,
+        }
+    }
+}
+
+impl JointRun<'_> {
+    fn read(&self, x: &CudaSlice<bf16>) -> Result<Vec<bf16>> {
+        Ok(self.stream.clone_dtoh(x)?)
+    }
+
+    fn upload(&self, host: &[bf16], dst: &mut CudaSlice<bf16>) -> Result<()> {
+        ensure!(host.len() == dst.len(), "upload extent");
+        self.stream.memcpy_htod(host, dst)?;
+        Ok(())
+    }
+
+    fn upload_spans(
+        &self,
+        spans: &[[i32; 2]],
+        begins: &mut CudaSlice<i32>,
+        ends: &mut CudaSlice<i32>,
+    ) -> Result<()> {
+        ensure!(
+            spans.len() <= begins.len() && spans.len() <= ends.len(),
+            "span buffer extent"
+        );
+        let b: Vec<i32> = spans.iter().map(|s| s[0]).collect();
+        let e: Vec<i32> = spans.iter().map(|s| s[1]).collect();
+        self.stream
+            .memcpy_htod(&b, &mut begins.slice_mut(..spans.len()))?;
+        self.stream
+            .memcpy_htod(&e, &mut ends.slice_mut(..spans.len()))?;
+        Ok(())
+    }
+
+    /// Multi-head attention: in-projection of `queries` `[rows, WIDTH]` and
+    /// `keys_values` `[keys, WIDTH]` through the weight row ranges of one
+    /// in_proj tensor, the bidirectional D64 kernel, and the output
+    /// projection into `lane.out` `[rows, WIDTH]`.
+    fn mha(
+        &self,
+        weights: &AttnWeights,
+        lane: AttnLane<'_>,
+        sides: AttnSides<'_>,
+        flash: &mut crate::backend::cuda::flash::Flash,
+    ) -> Result<()> {
+        use crate::backend::gpu::{DevicePtr, PushKernelArg};
+        let AttnSides {
+            queries,
+            rows,
+            keys_values,
+            keys,
+        } = sides;
+        let AttnLane {
+            q_proj,
+            kv_k,
+            kv_v,
+            dummy_q,
+            k_hm,
+            v_hm,
+            attn_out,
+            out,
+        } = lane;
+        self.blas
+            .gemm_bf16(&weights.in_proj, 0..WIDTH, queries, q_proj, rows, WIDTH)?;
+        self.bias_add(q_proj, &weights.in_bias, 0, WIDTH)?;
+        self.blas.gemm_bf16(
+            &weights.in_proj,
+            WIDTH..2 * WIDTH,
+            keys_values,
+            kv_k,
+            keys,
+            WIDTH,
+        )?;
+        self.bias_add(kv_k, &weights.in_bias, WIDTH, WIDTH)?;
+        self.blas.gemm_bf16(
+            &weights.in_proj,
+            2 * WIDTH..3 * WIDTH,
+            keys_values,
+            kv_v,
+            keys,
+            WIDTH,
+        )?;
+        self.bias_add(kv_v, &weights.in_bias, 2 * WIDTH, WIDTH)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.pack_split)
+                .arg(&kv_k.device_ptr(self.stream).0)
+                .arg(&kv_k.device_ptr(self.stream).0)
+                .arg(&kv_v.device_ptr(self.stream).0)
+                .arg(&dummy_q.device_ptr(self.stream).0)
+                .arg(&k_hm.device_ptr(self.stream).0)
+                .arg(&v_hm.device_ptr(self.stream).0)
+                .arg(&(keys as u32))
+                .arg(&(keys as u32))
+                .arg(&0u32)
+                .arg(&0u32)
+                .arg(&(keys as u32))
+                .arg(&(WIDTH as u32))
+                .arg(&(HEADS as u32))
+                .arg(&(HEAD_DIM as u32))
+                .launch(flat(keys * WIDTH))?;
+        }
+        flash.run(
+            q_proj,
+            WIDTH,
+            k_hm,
+            v_hm,
+            attn_out,
+            crate::backend::cuda::flash::Shape {
+                rows,
+                start: 0,
+                q_heads: HEADS,
+                kv_heads: HEADS,
+                capacity: keys,
+                head_dim: HEAD_DIM,
+                causal: false,
+                window_left: None,
+            },
+        )?;
+        self.blas
+            .gemm_bf16(&weights.out_w, 0..WIDTH, attn_out, out, rows, WIDTH)?;
+        self.bias_add(out, &weights.out_b, 0, WIDTH)?;
+        Ok(())
+    }
+
+    /// One evidence routing layer: `out = queries + FF(ff_norm(queries +
+    /// attention(q_norm(queries), m_norm(memory))))`, reading
+    /// `plan.routing[in_slot]` and writing `plan.routing[1 - in_slot]` over
+    /// the raw projected memory in `plan.memory`.
+    fn routing_layer(&self, plan: &mut JointPlan, layer: usize, in_slot: usize) -> Result<()> {
+        let options = plan.options;
+        let seq = plan.seq;
+        ensure!(in_slot < 2, "routing slot");
+        let w = &self.w.routing[layer];
+        self.layer_norm(
+            &plan.memory,
+            &mut plan.memory_normed,
+            seq,
+            WIDTH,
+            &w.memory_norm_w,
+            &w.memory_norm_b,
+        )?;
+        let queries = self.read(&plan.routing[in_slot])?;
+        self.layer_norm(
+            &plan.routing[in_slot],
+            &mut plan.small,
+            options,
+            WIDTH,
+            &w.query_norm_w,
+            &w.query_norm_b,
+        )?;
+        {
+            let weights = self.routing_attn(w);
+            let lane = AttnLane {
+                q_proj: &mut plan.q_proj,
+                kv_k: &mut plan.kv_k,
+                kv_v: &mut plan.kv_v,
+                dummy_q: &mut plan.dummy_q,
+                k_hm: &mut plan.k_hm,
+                v_hm: &mut plan.v_hm,
+                attn_out: &mut plan.attn_out,
+                out: &mut plan.proj_out,
+            };
+            self.mha(
+                &weights,
+                lane,
+                AttnSides {
+                    queries: &plan.small,
+                    rows: options,
+                    keys_values: &plan.memory_normed,
+                    keys: seq,
+                },
+                &mut plan.flash_routing,
+            )?;
+        }
+        let attn = self.read(&plan.proj_out)?;
+        let residual = add_round(&queries, &attn)?;
+        self.upload(&residual, &mut plan.small)?;
+        self.layer_norm_inplace(&mut plan.small, options, WIDTH, &w.ff_norm_w, &w.ff_norm_b)?;
+        self.blas.gemm_bf16(
+            &w.ff0_w,
+            0..FF,
+            &plan.small,
+            &mut plan.ff_hidden,
+            options,
+            WIDTH,
+        )?;
+        self.bias_add(&mut plan.ff_hidden, &w.ff0_b, 0, FF)?;
+        self.gelu(&mut plan.ff_hidden, options, FF)?;
+        self.blas.gemm_bf16(
+            &w.ff3_w,
+            0..WIDTH,
+            &plan.ff_hidden,
+            &mut plan.small2,
+            options,
+            FF,
+        )?;
+        self.bias_add(&mut plan.small2, &w.ff3_b, 0, WIDTH)?;
+        let ff = self.read(&plan.small2)?;
+        let result = add_round(&residual, &ff)?;
+        self.upload(&result, &mut plan.routing[1 - in_slot])?;
+        Ok(())
+    }
+
+    /// One norm-first decoder layer over `plan.fields` `[questions, WIDTH]`,
+    /// updating it in place against the raw projected memory in
+    /// `plan.memory`.
+    fn decoder_layer(&self, plan: &mut JointPlan, layer: usize) -> Result<()> {
+        let nq = plan.questions;
+        let seq = plan.seq;
+        let w = &self.w.decoder[layer];
+        ensure!(plan.fields.len() == nq * WIDTH, "decoder extent");
+        {
+            let weights = self.decoder_attn(w, false);
+            let lane = AttnLane {
+                q_proj: &mut plan.q_proj,
+                kv_k: &mut plan.kv_k,
+                kv_v: &mut plan.kv_v,
+                dummy_q: &mut plan.dummy_q,
+                k_hm: &mut plan.k_hm,
+                v_hm: &mut plan.v_hm,
+                attn_out: &mut plan.attn_out,
+                out: &mut plan.proj_out,
+            };
+            self.mha(
+                &weights,
+                lane,
+                AttnSides {
+                    queries: &plan.fields,
+                    rows: nq,
+                    keys_values: &plan.fields,
+                    keys: nq,
+                },
+                &mut plan.flash_self,
+            )?;
+        }
+        let attn = self.read(&plan.proj_out)?;
+        let input = self.read(&plan.fields)?;
+        let t = add_round(&input, &attn)?;
+        self.upload(&t, &mut plan.small)?;
+        self.layer_norm(
+            &plan.small,
+            &mut plan.fields,
+            nq,
+            WIDTH,
+            &w.norm1_w,
+            &w.norm1_b,
+        )?;
+        {
+            let weights = self.decoder_attn(w, true);
+            let lane = AttnLane {
+                q_proj: &mut plan.q_proj,
+                kv_k: &mut plan.kv_k,
+                kv_v: &mut plan.kv_v,
+                dummy_q: &mut plan.dummy_q,
+                k_hm: &mut plan.k_hm,
+                v_hm: &mut plan.v_hm,
+                attn_out: &mut plan.attn_out,
+                out: &mut plan.proj_out,
+            };
+            self.mha(
+                &weights,
+                lane,
+                AttnSides {
+                    queries: &plan.fields,
+                    rows: nq,
+                    keys_values: &plan.memory,
+                    keys: seq,
+                },
+                &mut plan.flash_cross,
+            )?;
+        }
+        let attn = self.read(&plan.proj_out)?;
+        let input = self.read(&plan.fields)?;
+        let t = add_round(&input, &attn)?;
+        self.upload(&t, &mut plan.small)?;
+        self.layer_norm(
+            &plan.small,
+            &mut plan.fields,
+            nq,
+            WIDTH,
+            &w.norm2_w,
+            &w.norm2_b,
+        )?;
+        self.blas.gemm_bf16(
+            &w.linear1_w,
+            0..FF,
+            &plan.fields,
+            &mut plan.ff_hidden,
+            nq,
+            WIDTH,
+        )?;
+        self.bias_add(&mut plan.ff_hidden, &w.linear1_b, 0, FF)?;
+        self.gelu(&mut plan.ff_hidden, nq, FF)?;
+        self.blas.gemm_bf16(
+            &w.linear2_w,
+            0..WIDTH,
+            &plan.ff_hidden,
+            &mut plan.small2,
+            nq,
+            FF,
+        )?;
+        self.bias_add(&mut plan.small2, &w.linear2_b, 0, WIDTH)?;
+        let ff = self.read(&plan.small2)?;
+        let input = self.read(&plan.fields)?;
+        let t = add_round(&input, &ff)?;
+        self.upload(&t, &mut plan.small)?;
+        self.layer_norm(
+            &plan.small,
+            &mut plan.fields,
+            nq,
+            WIDTH,
+            &w.norm3_w,
+            &w.norm3_b,
+        )?;
+        Ok(())
+    }
+
+    fn routing_attn(&self, w: &RoutingWeights) -> AttnWeights {
+        AttnWeights {
+            in_proj: w.attn_in_proj.clone(),
+            in_bias: w.attn_in_proj_b.clone(),
+            out_w: w.attn_out_proj.clone(),
+            out_b: w.attn_out_proj_b.clone(),
+        }
+    }
+
+    fn decoder_attn(&self, w: &DecoderWeights, cross: bool) -> AttnWeights {
+        AttnWeights {
+            in_proj: if cross {
+                w.cross_in_proj.clone()
+            } else {
+                w.self_in_proj.clone()
+            },
+            in_bias: if cross {
+                w.cross_in_proj_b.clone()
+            } else {
+                w.self_in_proj_b.clone()
+            },
+            out_w: if cross {
+                w.cross_out_proj.clone()
+            } else {
+                w.self_out_proj.clone()
+            },
+            out_b: if cross {
+                w.cross_out_proj_b.clone()
+            } else {
+                w.self_out_proj_b.clone()
+            },
+        }
+    }
+
+    /// The staged head forward over the captured hidden rows: every frozen
+    /// cell extent plus the disclosed end-to-end stages. `head_rows` is the
+    /// output embedding `[vocab, 4096]`.
+    pub fn forward(
+        &self,
+        plan: &mut JointPlan,
+        fixture: &JointFixture,
+        head_rows: &CudaSlice<bf16>,
+        vocab: usize,
+    ) -> Result<JointStages> {
+        let seq = plan.seq;
+        let nq = plan.questions;
+        let no = plan.options;
+        let w = &self.w;
+        self.layer_norm(
+            &plan.hidden_src,
+            &mut plan.normed,
+            seq,
+            4096,
+            &w.hidden_norm_w,
+            &w.hidden_norm_b,
+        )?;
+        let hidden_norm_full: Vec<f32> = self
+            .read(&plan.normed)?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        self.blas.gemm_bf16(
+            &w.memory_proj,
+            0..WIDTH,
+            &plan.normed,
+            &mut plan.memory,
+            seq,
+            4096,
+        )?;
+        let memory_all = self.read(&plan.memory)?;
+        self.stream.memcpy_dtod(
+            &plan.normed.slice((seq - 1) * 4096..seq * 4096),
+            &mut plan.global_row.slice_mut(..4096),
+        )?;
+        self.blas.gemm_bf16(
+            &w.global_proj,
+            0..WIDTH,
+            &plan.global_row,
+            &mut plan.small,
+            1,
+            4096,
+        )?;
+        let global: Vec<bf16> = self.read(&plan.small)?[..WIDTH].to_vec();
+
+        let qspans: Vec<[i32; 2]> = fixture.questions.iter().map(|q| q.qspan).collect();
+        let ospans: Vec<[i32; 2]> = fixture
+            .questions
+            .iter()
+            .flat_map(|q| q.option_spans.iter().copied())
+            .collect();
+        self.upload_spans(&qspans, &mut plan.begins, &mut plan.ends)?;
+        self.span_means(
+            &plan.normed,
+            &plan.begins,
+            &plan.ends,
+            &mut plan.qvecs,
+            nq,
+            4096,
+        )?;
+        self.upload_spans(&ospans, &mut plan.begins, &mut plan.ends)?;
+        self.span_means(
+            &plan.normed,
+            &plan.begins,
+            &plan.ends,
+            &mut plan.ctx,
+            no,
+            4096,
+        )?;
+        let indices: Vec<i32> = ospans
+            .iter()
+            .flat_map(|s| {
+                fixture.ids[s[0] as usize..s[1] as usize]
+                    .iter()
+                    .map(|&t| t as i32)
+            })
+            .collect();
+        ensure!(indices.len() == plan.gather_rows, "lexical index extent");
+        self.stream.memcpy_htod(&indices, &mut plan.lex_idx)?;
+        self.row_gather(
+            head_rows,
+            &plan.lex_idx,
+            &mut plan.gathered,
+            plan.gather_rows,
+            vocab,
+            4096,
+        )?;
+        let mut bounds: Vec<[i32; 2]> = Vec::with_capacity(no);
+        let mut offset = 0i32;
+        for s in &ospans {
+            bounds.push([offset, offset + (s[1] - s[0])]);
+            offset += s[1] - s[0];
+        }
+        self.upload_spans(&bounds, &mut plan.begins, &mut plan.ends)?;
+        self.span_means(
+            &plan.gathered,
+            &plan.begins,
+            &plan.ends,
+            &mut plan.lex,
+            no,
+            4096,
+        )?;
+
+        self.blas.gemm_bf16(
+            &w.option_context_proj,
+            0..WIDTH,
+            &plan.ctx,
+            &mut plan.small,
+            no,
+            4096,
+        )?;
+        let ctx_proj = self.read(&plan.small)?;
+        self.blas.gemm_bf16(
+            &w.option_lexical_proj,
+            0..WIDTH,
+            &plan.lex,
+            &mut plan.small2,
+            no,
+            4096,
+        )?;
+        let lex_proj = self.read(&plan.small2)?;
+        self.blas.gemm_bf16(
+            &w.option_question_proj,
+            0..WIDTH,
+            &plan.qvecs,
+            &mut plan.oq,
+            nq,
+            4096,
+        )?;
+        let oq_proj = self.read(&plan.oq)?;
+        self.blas.gemm_bf16(
+            &w.question_proj,
+            0..WIDTH,
+            &plan.qvecs,
+            &mut plan.scorer_h,
+            nq,
+            4096,
+        )?;
+        let base_fields = self.read(&plan.scorer_h)?;
+
+        let mut option_queries = Vec::with_capacity(no * WIDTH);
+        let mut q_base = 0usize;
+        for (qi, q) in fixture.questions.iter().enumerate() {
+            let count = q.option_spans.len();
+            for oi in 0..count {
+                let i = q_base + oi;
+                let t = add_round(
+                    &ctx_proj[i * WIDTH..(i + 1) * WIDTH],
+                    &lex_proj[i * WIDTH..(i + 1) * WIDTH],
+                )?;
+                let row = add_round(&t, &oq_proj[qi * WIDTH..(qi + 1) * WIDTH])?;
+                option_queries.extend_from_slice(&row);
+            }
+            q_base += count;
+        }
+        self.upload(&option_queries, &mut plan.routing[0])?;
+
+        self.routing_layer(plan, 0, 0)?;
+        let routing0: Vec<f32> = self
+            .read(&plan.routing[1])?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        self.routing_layer(plan, 1, 1)?;
+        let routed = self.read(&plan.routing[0])?;
+        let routing1: Vec<f32> = routed.iter().map(|v| v.to_f32()).collect();
+
+        let mut summaries: Vec<bf16> = Vec::with_capacity(nq * WIDTH);
+        let mut q_base = 0usize;
+        for (qi, q) in fixture.questions.iter().enumerate() {
+            let count = q.option_spans.len();
+            let field = &base_fields[qi * WIDTH..(qi + 1) * WIDTH];
+            let scores: Vec<bf16> = (q_base..q_base + count)
+                .map(|i| {
+                    let dot = dot_f32(&routed[i * WIDTH..(i + 1) * WIDTH], field)?;
+                    Ok(bf16::from_f32(dot / (WIDTH as f32).sqrt()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let weights = softmax_bf16(&scores);
+            let mut acc = vec![bf16::ZERO; WIDTH];
+            for (wi, w) in weights.iter().enumerate() {
+                let row = &routed[(q_base + wi) * WIDTH..(q_base + wi + 1) * WIDTH];
+                for c in 0..WIDTH {
+                    let product = bf16::from_f32(w.to_f32() * row[c].to_f32());
+                    acc[c] = bf16::from_f32(acc[c].to_f32() + product.to_f32());
+                }
+            }
+            summaries.extend_from_slice(&acc);
+            q_base += count;
+        }
+        self.upload(&summaries, &mut plan.small)?;
+        self.layer_norm(
+            &plan.small,
+            &mut plan.small2,
+            nq,
+            WIDTH,
+            &w.option_summary_norm_w,
+            &w.option_summary_norm_b,
+        )?;
+        let normed_summaries = self.read(&plan.small2)?;
+        let type_embedding = self.read(&w.type_embedding)?;
+        let mut fields_host: Vec<bf16> = Vec::with_capacity(nq * WIDTH);
+        for qi in 0..nq {
+            let t = add_round(
+                &base_fields[qi * WIDTH..(qi + 1) * WIDTH],
+                &normed_summaries[qi * WIDTH..(qi + 1) * WIDTH],
+            )?;
+            let t = add_round(&t, &global)?;
+            let row = add_round(
+                &t,
+                &type_embedding[fixture.questions[qi].type_id as usize * WIDTH
+                    ..(fixture.questions[qi].type_id as usize + 1) * WIDTH],
+            )?;
+            fields_host.extend_from_slice(&row);
+        }
+        self.upload(&fields_host, &mut plan.fields)?;
+
+        let mut decoder: [Vec<f32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for (layer, cell) in decoder.iter_mut().enumerate() {
+            self.decoder_layer(plan, layer)?;
+            *cell = self
+                .read(&plan.fields)?
+                .iter()
+                .map(|v| v.to_f32())
+                .collect();
+        }
+        self.layer_norm(
+            &plan.fields,
+            &mut plan.small,
+            nq,
+            WIDTH,
+            &w.field_norm_w,
+            &w.field_norm_b,
+        )?;
+        let fields_all = self.read(&plan.small)?;
+        self.layer_norm(
+            &plan.routing[0],
+            &mut plan.small2,
+            no,
+            WIDTH,
+            &w.option_norm_w,
+            &w.option_norm_b,
+        )?;
+        let options_normed = self.read(&plan.small2)?;
+
+        let qvecs = self.read(&plan.qvecs)?;
+        let global_hidden: Vec<bf16> =
+            self.read(&plan.normed)?[(seq - 1) * 4096..seq * 4096].to_vec();
+        let lexical_all = self.read(&plan.lex)?;
+
+        let mut features: Vec<bf16> = Vec::with_capacity(no * 4 * WIDTH);
+        let mut priors: Vec<bf16> = Vec::with_capacity(no);
+        let mut cosines: Vec<bf16> = Vec::with_capacity(no);
+        let mut q_base = 0usize;
+        for (qi, q) in fixture.questions.iter().enumerate() {
+            let count = q.option_spans.len();
+            let field = &fields_all[qi * WIDTH..(qi + 1) * WIDTH];
+            let anchor = normalize_row(&add_round(
+                &qvecs[qi * 4096..(qi + 1) * 4096],
+                &global_hidden,
+            )?);
+            let field_norm = field
+                .iter()
+                .map(|v| {
+                    let f = v.to_f32();
+                    f * f
+                })
+                .sum::<f32>()
+                .sqrt();
+            for oi in 0..count {
+                let i = q_base + oi;
+                let option = &options_normed[i * WIDTH..(i + 1) * WIDTH];
+                let lexical_anchor = normalize_row(&lexical_all[i * 4096..(i + 1) * 4096]);
+                priors.push(bf16::from_f32(dot_f32(&lexical_anchor, &anchor)?));
+                let option_norm = option
+                    .iter()
+                    .map(|v| {
+                        let f = v.to_f32();
+                        f * f
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                cosines.push(bf16::from_f32(
+                    dot_f32(field, option)? / (field_norm * option_norm).max(1e-12),
+                ));
+                features.extend_from_slice(field);
+                features.extend_from_slice(option);
+                for c in 0..WIDTH {
+                    features.push(bf16::from_f32(field[c].to_f32() * option[c].to_f32()));
+                }
+                for c in 0..WIDTH {
+                    features.push(bf16::from_f32(
+                        (field[c].to_f32() - option[c].to_f32()).abs(),
+                    ));
+                }
+            }
+            q_base += count;
+        }
+        self.upload(&features, &mut plan.features)?;
+        self.blas.gemm_bf16(
+            &w.scorer0_w,
+            0..WIDTH,
+            &plan.features,
+            &mut plan.scorer_h,
+            no,
+            4 * WIDTH,
+        )?;
+        self.bias_add(&mut plan.scorer_h, &w.scorer0_b, 0, WIDTH)?;
+        self.gelu(&mut plan.scorer_h, no, WIDTH)?;
+        self.blas.gemm_bf16(
+            &w.scorer3_w,
+            0..1,
+            &plan.scorer_h,
+            &mut plan.scorer_out,
+            no,
+            WIDTH,
+        )?;
+        self.bias_add(&mut plan.scorer_out, &w.scorer3_b, 0, 1)?;
+        let residual = self.read(&plan.scorer_out)?;
+
+        let prior_scale = bf16::from_f32(w.prior_logit_scale.min((100.0f32).ln()).exp()).to_f32();
+        let joint_scale = bf16::from_f32(w.joint_logit_scale.min((100.0f32).ln()).exp()).to_f32();
+        let gate = bf16::from_f32(1.0 / (1.0 + (-w.residual_gate).exp())).to_f32();
+        let mut logits: Vec<Vec<f32>> = Vec::with_capacity(nq);
+        let mut i = 0usize;
+        for q in &fixture.questions {
+            let count = q.option_spans.len();
+            let mut q_logits = Vec::with_capacity(count);
+            for oi in 0..count {
+                let prior = bf16::from_f32(prior_scale * priors[i + oi].to_f32());
+                let joint = bf16::from_f32(joint_scale * cosines[i + oi].to_f32());
+                let joint = bf16::from_f32(joint.to_f32() + residual[i + oi].to_f32());
+                let gated = bf16::from_f32(gate * joint.to_f32());
+                q_logits.push(bf16::from_f32(prior.to_f32() + gated.to_f32()).to_f32());
+            }
+            logits.push(q_logits);
+            i += count;
+        }
+
+        let count_last = fixture.questions[nq - 1].option_spans.len();
+        Ok(JointStages {
+            memory_row0: memory_all[..WIDTH].iter().map(|v| v.to_f32()).collect(),
+            question_proj_row0: base_fields[..WIDTH].iter().map(|v| v.to_f32()).collect(),
+            option_question_last_row0: oq_proj[(nq - 1) * WIDTH..nq * WIDTH]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            option_context_last_row0: ctx_proj
+                [(no - count_last) * WIDTH..(no - count_last + 1) * WIDTH]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            option_lexical_last_row0: lex_proj
+                [(no - count_last) * WIDTH..(no - count_last + 1) * WIDTH]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            global: global.iter().map(|v| v.to_f32()).collect(),
+            routing: [routing0, routing1],
+            decoder,
+            fields_row0: fields_all[..WIDTH].iter().map(|v| v.to_f32()).collect(),
+            logits,
+            hidden_norm_full,
+        })
+    }
+
+    /// The hidden_norm stage on caller rows (forced common-input cell).
+    pub fn hidden_norm(&self, plan: &mut JointPlan, rows: &[bf16]) -> Result<Vec<f32>> {
+        ensure!(rows.len() == plan.seq * 4096, "hidden_norm extent");
+        self.upload(rows, &mut plan.hidden_src)?;
+        self.layer_norm(
+            &plan.hidden_src,
+            &mut plan.normed,
+            plan.seq,
+            4096,
+            &self.w.hidden_norm_w,
+            &self.w.hidden_norm_b,
+        )?;
+        Ok(self
+            .read(&plan.normed)?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect())
+    }
+
+    /// The routing pair on caller-supplied rows (forced common-input cells):
+    /// both layers over the raw projected memory.
+    pub fn forced_routing(
+        &self,
+        plan: &mut JointPlan,
+        queries: &[bf16],
+        memory: &[bf16],
+    ) -> Result<[Vec<f32>; 2]> {
+        ensure!(
+            queries.len() == plan.options * WIDTH && memory.len() == plan.seq * WIDTH,
+            "forced routing extent"
+        );
+        self.upload(memory, &mut plan.memory)?;
+        self.upload(queries, &mut plan.routing[0])?;
+        self.routing_layer(plan, 0, 0)?;
+        let r0: Vec<f32> = self
+            .read(&plan.routing[1])?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        self.routing_layer(plan, 1, 1)?;
+        let r1: Vec<f32> = self
+            .read(&plan.routing[0])?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        Ok([r0, r1])
+    }
+
+    /// One decoder layer on caller-supplied rows (forced common-input cells).
+    pub fn forced_decoder(
+        &self,
+        plan: &mut JointPlan,
+        layer: usize,
+        fields: &[bf16],
+        memory: &[bf16],
+    ) -> Result<Vec<f32>> {
+        ensure!(
+            fields.len() == plan.questions * WIDTH && memory.len() == plan.seq * WIDTH,
+            "forced decoder extent"
+        );
+        self.upload(memory, &mut plan.memory)?;
+        self.upload(fields, &mut plan.fields)?;
+        self.decoder_layer(plan, layer)?;
+        Ok(self
+            .read(&plan.fields)?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect())
+    }
 }
 
 /// Per-span row means of a BF16 [rows, width] slice: F32 accumulation over

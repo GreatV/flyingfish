@@ -707,6 +707,7 @@ pub(super) struct Runtime {
     mask: CudaSlice<u64>,
     layers: Vec<Layer>,
     common: CommonOpsRef,
+    joint: Option<crate::backend::cuda::joint_schema::JointWeights>,
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
     workspace_rows: u32,
@@ -2237,6 +2238,16 @@ impl Runtime {
             mask,
             layers,
             common,
+            joint: checkpoint_dir
+                .join("joint_head.safetensors")
+                .is_file()
+                .then(|| {
+                    crate::backend::cuda::joint_schema::load_joint_weights(
+                        checkpoint_dir,
+                        &engine.device.stream,
+                    )
+                })
+                .transpose()?,
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
             workspace_rows: u32::try_from(rows)?,
@@ -7709,6 +7720,175 @@ impl Engine {
                 .launch(flat(vocab))?;
         }
         Ok((raw, s.clone_dtoh(&staged)?))
+    }
+}
+
+impl Engine {
+    /// Binds the joint schema head plan for one scored-record fixture.
+    pub fn joint_plan(
+        &self,
+        fixture: &crate::backend::cuda::joint_schema::JointFixture,
+    ) -> Result<crate::backend::cuda::joint_schema::JointPlan> {
+        ensure!(
+            self.qwen.as_ref().is_some_and(|q| q.joint.is_some()),
+            "joint head weights not loaded"
+        );
+        let gather_rows: usize = fixture
+            .questions
+            .iter()
+            .flat_map(|q| q.option_spans.iter())
+            .map(|s| (s[1] - s[0]) as usize)
+            .sum();
+        crate::backend::cuda::joint_schema::JointPlan::bind(
+            &self.device.stream,
+            fixture.ids.len(),
+            fixture.questions.len(),
+            fixture.total_options(),
+            gather_rows,
+        )
+    }
+
+    /// One complete prefill of the fixture ids, capturing the post-backbone
+    /// hidden rows (the hidden_norm input) into the plan.
+    pub fn joint_capture(
+        &mut self,
+        plan: &mut crate::backend::cuda::joint_schema::JointPlan,
+        fixture: &crate::backend::cuda::joint_schema::JointFixture,
+    ) -> Result<()> {
+        let hidden = self.model_spec.hidden as usize;
+        let ids = &fixture.ids;
+        ensure!(
+            plan.hidden_src.len() == ids.len() * hidden,
+            "joint capture extent: plan={} ids={} hidden={hidden}",
+            plan.hidden_src.len(),
+            ids.len()
+        );
+        let mut offset = 0usize;
+        let dst = &mut plan.hidden_src;
+        self.prefill_chunks(ids, None, ids.len(), |engine, chunk| {
+            let rows = chunk.len();
+            let stream = &engine.device.stream;
+            stream.memcpy_dtod(
+                &engine.work.n.slice(..rows * hidden),
+                &mut dst.slice_mut(offset..offset + rows * hidden),
+            )?;
+            offset += rows * hidden;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// The staged joint head forward from the captured hidden rows.
+    pub fn joint_forward(
+        &self,
+        plan: &mut crate::backend::cuda::joint_schema::JointPlan,
+        fixture: &crate::backend::cuda::joint_schema::JointFixture,
+    ) -> Result<crate::backend::cuda::joint_schema::JointStages> {
+        let q = self.qwen.as_ref().context("qwen runtime missing")?;
+        let weights = q.joint.as_ref().context("joint head weights not loaded")?;
+        let ops = crate::backend::cuda::joint_schema::JointOps::new(&self.device.ctx)?;
+        let run = crate::backend::cuda::joint_schema::JointRun::new(
+            &self.device.stream,
+            &self.blas,
+            &q.common,
+            &ops,
+            weights,
+        );
+        run.forward(
+            plan,
+            fixture,
+            &self.weights.head,
+            self.model_spec.vocab as usize,
+        )
+    }
+
+    /// The hidden_norm stage on caller rows (forced common-input cell).
+    pub fn joint_hidden_norm(
+        &self,
+        plan: &mut crate::backend::cuda::joint_schema::JointPlan,
+        rows: &[bf16],
+    ) -> Result<Vec<f32>> {
+        let q = self.qwen.as_ref().context("qwen runtime missing")?;
+        let weights = q.joint.as_ref().context("joint head weights not loaded")?;
+        let ops = crate::backend::cuda::joint_schema::JointOps::new(&self.device.ctx)?;
+        let run = crate::backend::cuda::joint_schema::JointRun::new(
+            &self.device.stream,
+            &self.blas,
+            &q.common,
+            &ops,
+            weights,
+        );
+        run.hidden_norm(plan, rows)
+    }
+
+    /// The routing pair on caller rows (forced common-input cell).
+    pub fn joint_forced_routing(
+        &self,
+        plan: &mut crate::backend::cuda::joint_schema::JointPlan,
+        queries: &[bf16],
+        memory: &[bf16],
+    ) -> Result<[Vec<f32>; 2]> {
+        let q = self.qwen.as_ref().context("qwen runtime missing")?;
+        let weights = q.joint.as_ref().context("joint head weights not loaded")?;
+        let ops = crate::backend::cuda::joint_schema::JointOps::new(&self.device.ctx)?;
+        let run = crate::backend::cuda::joint_schema::JointRun::new(
+            &self.device.stream,
+            &self.blas,
+            &q.common,
+            &ops,
+            weights,
+        );
+        run.forced_routing(plan, queries, memory)
+    }
+
+    /// One decoder layer on caller rows (forced common-input cell).
+    pub fn joint_forced_decoder(
+        &self,
+        plan: &mut crate::backend::cuda::joint_schema::JointPlan,
+        layer: usize,
+        fields: &[bf16],
+        memory: &[bf16],
+    ) -> Result<Vec<f32>> {
+        let q = self.qwen.as_ref().context("qwen runtime missing")?;
+        let weights = q.joint.as_ref().context("joint head weights not loaded")?;
+        let ops = crate::backend::cuda::joint_schema::JointOps::new(&self.device.ctx)?;
+        let run = crate::backend::cuda::joint_schema::JointRun::new(
+            &self.device.stream,
+            &self.blas,
+            &q.common,
+            &ops,
+            weights,
+        );
+        run.forced_decoder(plan, layer, fields, memory)
+    }
+
+    /// The joint weights for test plants.
+    #[cfg(test)]
+    pub fn joint_plant_handles(
+        &mut self,
+    ) -> Result<&mut crate::backend::cuda::joint_schema::JointWeights> {
+        let q = self.qwen.as_mut().context("qwen runtime missing")?;
+        q.joint.as_mut().context("joint head weights not loaded")
+    }
+
+    /// The backbone final norm rows (test plants).
+    #[cfg(test)]
+    pub fn joint_backbone_norm_rows(&self) -> Result<Vec<bf16>> {
+        let norm = self
+            .weights
+            .norm
+            .as_ref()
+            .context("backbone final norm missing")?;
+        Ok(self.device.stream.clone_dtoh(norm)?)
+    }
+
+    /// Uploads BF16 rows as one owned device tensor (test plants).
+    #[cfg(test)]
+    pub fn joint_upload_bf16(&self, host: &[bf16]) -> Result<std::sync::Arc<CudaSlice<bf16>>> {
+        let stream = &self.device.stream;
+        let mut dev = stream.alloc_zeros::<bf16>(host.len())?;
+        stream.memcpy_htod(host, &mut dev)?;
+        Ok(std::sync::Arc::new(dev))
     }
 }
 

@@ -9,6 +9,7 @@ mod gates {
     use crate::backend::cuda::engine::Engine;
     use crate::trace::Trace;
     use anyhow::{Context, Result, ensure};
+    use half::bf16;
     use safetensors::SafeTensors;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -562,6 +563,461 @@ mod gates {
                 );
             }
         }
+        Ok(())
+    }
+    fn joint_fixture() -> Result<crate::backend::cuda::joint_schema::JointFixture> {
+        let path = std::env::var("FF_CLEF_JOINT_FIXTURE").context("FF_CLEF_JOINT_FIXTURE")?;
+        crate::backend::cuda::joint_schema::JointFixture::parse(&std::fs::read_to_string(path)?)
+    }
+
+    fn joint_taus() -> Result<BTreeMap<String, serde_json::Value>> {
+        let path = std::env::var("FF_CLEF_JOINT_TAUS").context("FF_CLEF_JOINT_TAUS")?;
+        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    }
+
+    fn joint_tau(taus: &BTreeMap<String, serde_json::Value>, cell: &str) -> Result<(f64, f64)> {
+        let v = taus
+            .get(cell)
+            .with_context(|| format!("tau cell {cell} missing"))?;
+        Ok((
+            v["tau_max"].as_f64().context("tau_max")?,
+            v["tau_rmse"].as_f64().context("tau_rmse")?,
+        ))
+    }
+
+    fn joint_cell(
+        label: &str,
+        got: &[f32],
+        want: &[f32],
+        tau: (f64, f64),
+        gated: bool,
+    ) -> Result<()> {
+        let (max, rmse) = max_rmse(got, want)?;
+        println!(
+            "CLEF_JOINT {label} max={max:.6e} (tau {:.6e}) rmse={rmse:.6e} (tau {:.6e}) gated={gated}",
+            tau.0, tau.1
+        );
+        if gated {
+            ensure!(
+                max <= tau.0 && rmse <= tau.1,
+                "joint cell {label} exceeds the frozen tau"
+            );
+        }
+        Ok(())
+    }
+
+    fn joint_bf16_file(dir: &std::path::Path, file: &str, name: &str) -> Result<Vec<bf16>> {
+        let bytes = std::fs::read(dir.join(format!("{file}.safetensors")))?;
+        let view = SafeTensors::deserialize(&bytes)?;
+        let t = view
+            .tensor(name)
+            .with_context(|| format!("tensor {name}"))?;
+        ensure!(
+            t.dtype() == safetensors::Dtype::BF16,
+            "tensor {name} not BF16"
+        );
+        Ok(t.data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+            .collect())
+    }
+
+    fn joint_f32_file(dir: &std::path::Path, file: &str, name: &str) -> Result<Vec<f32>> {
+        let bytes = std::fs::read(dir.join(format!("{file}.safetensors")))?;
+        let view = SafeTensors::deserialize(&bytes)?;
+        tensor_f32(&view, name)
+    }
+
+    fn joint_bf16_from_f32_file(
+        dir: &std::path::Path,
+        file: &str,
+        name: &str,
+    ) -> Result<Vec<bf16>> {
+        Ok(joint_f32_file(dir, file, name)?
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect())
+    }
+
+    fn control_ratio(
+        label: &str,
+        delta: (f64, f64),
+        tau: (f64, f64),
+        rmse_only: bool,
+    ) -> Result<()> {
+        println!(
+            "CLEF_JOINT_CONTROL {label} max={:.3e} (tau {:.3e}, {:.1}x) rmse={:.3e} (tau {:.3e}, {:.1}x)",
+            delta.0,
+            tau.0,
+            delta.0 / tau.0,
+            delta.1,
+            tau.1,
+            delta.1 / tau.1
+        );
+        if rmse_only {
+            ensure!(
+                delta.1 >= 10.0 * tau.1,
+                "control {label} below 10x tau_rmse"
+            );
+        } else {
+            ensure!(
+                delta.0 >= 10.0 * tau.0 && delta.1 >= 10.0 * tau.1,
+                "control {label} below 10x tau on max and rmse"
+            );
+        }
+        Ok(())
+    }
+
+    /// The joint-head cells against joint-ref-taus-v3: gated end-to-end stages
+    /// (projections, fields, decoder0, per-question logits), forced common-input
+    /// stages on the saved reference rows (hidden_norm, routing0/1, decoder1-3),
+    /// the disclosed end-to-end routing/decoder/hidden_norm measurements, and the
+    /// ruled neighbour-substitution controls per family.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_JOINT_TAUS, FF_CLEF_JOINT_REF, FF_CLEF_JOINT_FIXTURE, FF_CLEF_JOINT_FORCED"]
+    fn clef_flash_joint_cells() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let forced_dir =
+            PathBuf::from(std::env::var("FF_CLEF_JOINT_FORCED").context("FF_CLEF_JOINT_FORCED")?);
+        let taus = joint_taus()?;
+        let fixture = joint_fixture()?;
+        let ref_path =
+            PathBuf::from(std::env::var("FF_CLEF_JOINT_REF").context("FF_CLEF_JOINT_REF")?);
+        let ref_bytes = std::fs::read(ref_path)?;
+        let refs = SafeTensors::deserialize(&ref_bytes)?;
+        let ref_f32 = |name: &str| tensor_f32(&refs, name);
+
+        let runtime = std::env::temp_dir().join(format!("clef-joint-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 8192, None, settings(runtime.clone()))?;
+        let mut engine = Engine::load(&dir, 0, 8192, None, settings(runtime))?;
+        let mut plan = engine.joint_plan(&fixture)?;
+        engine.joint_capture(&mut plan, &fixture)?;
+        let stages = engine.joint_forward(&mut plan, &fixture)?;
+
+        joint_cell(
+            "proj_memory_projection",
+            &stages.memory_row0,
+            &ref_f32("proj_memory_projection")?,
+            joint_tau(&taus, "proj_memory_projection")?,
+            true,
+        )?;
+        joint_cell(
+            "proj_question_projection",
+            &stages.question_proj_row0,
+            &ref_f32("proj_question_projection")?,
+            joint_tau(&taus, "proj_question_projection")?,
+            true,
+        )?;
+        joint_cell(
+            "proj_option_question_projection",
+            &stages.option_question_last_row0,
+            &ref_f32("proj_option_question_projection")?,
+            joint_tau(&taus, "proj_option_question_projection")?,
+            true,
+        )?;
+        joint_cell(
+            "proj_option_context_projection",
+            &stages.option_context_last_row0,
+            &ref_f32("proj_option_context_projection")?,
+            joint_tau(&taus, "proj_option_context_projection")?,
+            true,
+        )?;
+        joint_cell(
+            "proj_option_lexical_projection",
+            &stages.option_lexical_last_row0,
+            &ref_f32("proj_option_lexical_projection")?,
+            joint_tau(&taus, "proj_option_lexical_projection")?,
+            true,
+        )?;
+        joint_cell(
+            "proj_global_projection",
+            &stages.global,
+            &ref_f32("proj_global_projection")?,
+            joint_tau(&taus, "proj_global_projection")?,
+            true,
+        )?;
+        joint_cell(
+            "fields",
+            &stages.fields_row0,
+            &ref_f32("fields")?,
+            joint_tau(&taus, "fields")?,
+            true,
+        )?;
+        joint_cell(
+            "decoder0",
+            &stages.decoder[0],
+            &ref_f32("decoder0")?,
+            joint_tau(&taus, "decoder0")?,
+            true,
+        )?;
+        joint_cell(
+            "routing0",
+            &stages.routing[0],
+            &ref_f32("routing0")?,
+            joint_tau(&taus, "routing0")?,
+            false,
+        )?;
+        joint_cell(
+            "routing1",
+            &stages.routing[1],
+            &ref_f32("routing1")?,
+            joint_tau(&taus, "routing1")?,
+            false,
+        )?;
+        for layer in 1..4 {
+            joint_cell(
+                &format!("decoder{layer}"),
+                &stages.decoder[layer],
+                &ref_f32(&format!("decoder{layer}"))?,
+                joint_tau(&taus, &format!("decoder{layer}"))?,
+                false,
+            )?;
+        }
+        joint_cell(
+            "hidden_norm",
+            &stages.hidden_norm_full,
+            &ref_f32("hidden_norm")?,
+            joint_tau(&taus, "hidden_norm")?,
+            false,
+        )?;
+        for (index, question) in stages.logits.iter().enumerate() {
+            joint_cell(
+                &format!("logits_q{index}"),
+                question,
+                &ref_f32(&format!("logits_q{index}"))?,
+                joint_tau(&taus, &format!("logits_q{index}"))?,
+                true,
+            )?;
+        }
+
+        // Forced common-input cells on the saved reference rows.
+        let hidden_in = joint_bf16_file(&forced_dir, "hidden_input", "rows")?;
+        let hidden_ref = joint_f32_file(&forced_dir, "hidden_norm_out", "rows")?;
+        let clean_hidden = engine.joint_hidden_norm(&mut plan, &hidden_in)?;
+        joint_cell(
+            "hidden_norm_forced",
+            &clean_hidden,
+            &hidden_ref,
+            joint_tau(&taus, "hidden_norm_forced")?,
+            true,
+        )?;
+
+        let queries = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "routing_queries")?;
+        let memory = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "memory")?;
+        let clean_routing = engine.joint_forced_routing(&mut plan, &queries, &memory)?;
+        for (index, cell) in [(0usize, "routing0_forced"), (1usize, "routing1_forced")] {
+            joint_cell(
+                cell,
+                &clean_routing[index],
+                &joint_f32_file(&forced_dir, "forced_out_cuda", cell)?,
+                joint_tau(&taus, cell)?,
+                true,
+            )?;
+        }
+        let d1_in = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "decoder1_in")?;
+        let mut clean_chain: Vec<Vec<f32>> = Vec::with_capacity(3);
+        let mut fields_now = engine.joint_forced_decoder(&mut plan, 1, &d1_in, &memory)?;
+        clean_chain.push(fields_now.clone());
+        joint_cell(
+            "decoder1_forced",
+            &fields_now,
+            &joint_f32_file(&forced_dir, "forced_out_cuda", "decoder1_forced")?,
+            joint_tau(&taus, "decoder1_forced")?,
+            true,
+        )?;
+        for layer in 2..4 {
+            let rows: Vec<bf16> = fields_now.iter().map(|v| bf16::from_f32(*v)).collect();
+            fields_now = engine.joint_forced_decoder(&mut plan, layer, &rows, &memory)?;
+            clean_chain.push(fields_now.clone());
+            joint_cell(
+                &format!("decoder{layer}_forced"),
+                &fields_now,
+                &joint_f32_file(
+                    &forced_dir,
+                    "forced_out_cuda",
+                    &format!("decoder{layer}_forced"),
+                )?,
+                joint_tau(&taus, &format!("decoder{layer}_forced"))?,
+                true,
+            )?;
+        }
+
+        // Controls: one same-shape neighbour substitution per family, applied to
+        // the loaded weights and restored after each planted run.
+
+        // logits family: residual_scorer.0 <- option_question_projection.
+        {
+            let saved = {
+                let w = engine.joint_plant_handles()?;
+                let saved = w.scorer0_w.clone();
+                w.scorer0_w = w.option_question_proj.clone();
+                saved
+            };
+            let planted = engine.joint_forward(&mut plan, &fixture)?;
+            {
+                let w = engine.joint_plant_handles()?;
+                w.scorer0_w = saved;
+            }
+            for (index, question) in stages.logits.iter().enumerate() {
+                let delta = max_rmse(&planted.logits[index], question)?;
+                control_ratio(
+                    &format!("logits_q{index}"),
+                    delta,
+                    joint_tau(&taus, &format!("logits_q{index}"))?,
+                    false,
+                )?;
+            }
+        }
+
+        // fields family: question_projection <- global_projection.
+        {
+            let saved = {
+                let w = engine.joint_plant_handles()?;
+                let saved = w.question_proj.clone();
+                w.question_proj = w.global_proj.clone();
+                saved
+            };
+            let planted = engine.joint_forward(&mut plan, &fixture)?;
+            {
+                let w = engine.joint_plant_handles()?;
+                w.question_proj = saved;
+            }
+            control_ratio(
+                "fields",
+                max_rmse(&planted.fields_row0, &stages.fields_row0)?,
+                joint_tau(&taus, "fields")?,
+                false,
+            )?;
+        }
+
+        // decoder0 family (end-to-end cell): self_attn.in_proj <- layer 1.
+        {
+            let saved = {
+                let w = engine.joint_plant_handles()?;
+                let saved = w.decoder[0].self_in_proj.clone();
+                w.decoder[0].self_in_proj = w.decoder[1].self_in_proj.clone();
+                saved
+            };
+            let planted = engine.joint_forward(&mut plan, &fixture)?;
+            {
+                let w = engine.joint_plant_handles()?;
+                w.decoder[0].self_in_proj = saved;
+            }
+            control_ratio(
+                "decoder0",
+                max_rmse(&planted.decoder[0], &stages.decoder[0])?,
+                joint_tau(&taus, "decoder0")?,
+                false,
+            )?;
+        }
+
+        // projmem family: memory_projection <- question_projection.
+        {
+            let saved = {
+                let w = engine.joint_plant_handles()?;
+                let saved = w.memory_proj.clone();
+                w.memory_proj = w.question_proj.clone();
+                saved
+            };
+            let planted = engine.joint_forward(&mut plan, &fixture)?;
+            {
+                let w = engine.joint_plant_handles()?;
+                w.memory_proj = saved;
+            }
+            control_ratio(
+                "projmem",
+                max_rmse(&planted.memory_row0, &stages.memory_row0)?,
+                joint_tau(&taus, "proj_memory_projection")?,
+                false,
+            )?;
+        }
+
+        // hidden family (forced cell): hidden_norm <- the backbone final norm.
+        {
+            let norm_rows = engine.joint_backbone_norm_rows()?;
+            let saved = {
+                let planted = engine.joint_upload_bf16(&norm_rows)?;
+                let w = engine.joint_plant_handles()?;
+                std::mem::replace(&mut w.hidden_norm_w, planted)
+            };
+            let planted = engine.joint_hidden_norm(&mut plan, &hidden_in)?;
+            {
+                let w = engine.joint_plant_handles()?;
+                w.hidden_norm_w = saved;
+            }
+            control_ratio(
+                "hidden",
+                max_rmse(&planted, &clean_hidden)?,
+                joint_tau(&taus, "hidden_norm_forced")?,
+                false,
+            )?;
+        }
+
+        // routing families (forced cells): the two attention in_proj tensors swap.
+        for (index, name) in [(0usize, "routing0"), (1usize, "routing1")] {
+            let saved = {
+                let w = engine.joint_plant_handles()?;
+                let saved = w.routing[index].attn_in_proj.clone();
+                w.routing[index].attn_in_proj = w.routing[1 - index].attn_in_proj.clone();
+                saved
+            };
+            let planted = engine.joint_forced_routing(&mut plan, &queries, &memory)?;
+            {
+                let w = engine.joint_plant_handles()?;
+                w.routing[index].attn_in_proj = saved;
+            }
+            control_ratio(
+                name,
+                max_rmse(&planted[index], &clean_routing[index])?,
+                joint_tau(&taus, &format!("{name}_forced"))?,
+                true,
+            )?;
+        }
+
+        // decoder1-3 families (forced cells): self_attn.in_proj <- the next layer
+        // (cyclic). decoder3 is the recorded failed control: printed, not gated.
+        for layer in 1..4 {
+            let source = (layer + 1) % 4;
+            let saved = {
+                let w = engine.joint_plant_handles()?;
+                let saved = w.decoder[layer].self_in_proj.clone();
+                w.decoder[layer].self_in_proj = w.decoder[source].self_in_proj.clone();
+                saved
+            };
+            let input_rows: Vec<bf16> = if layer == 1 {
+                d1_in.clone()
+            } else {
+                clean_chain[layer - 2]
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect()
+            };
+            let planted = engine.joint_forced_decoder(&mut plan, layer, &input_rows, &memory)?;
+            {
+                let w = engine.joint_plant_handles()?;
+                w.decoder[layer].self_in_proj = saved;
+            }
+            let delta = max_rmse(&planted, &clean_chain[layer - 1])?;
+            let tau = joint_tau(&taus, &format!("decoder{layer}_forced"))?;
+            println!(
+                "CLEF_JOINT_CONTROL decoder{layer} max={:.3e} ({:.1}x) rmse={:.3e} ({:.1}x)",
+                delta.0,
+                delta.0 / tau.0,
+                delta.1,
+                delta.1 / tau.1
+            );
+            if layer != 3 {
+                ensure!(
+                    delta.1 >= 10.0 * tau.1,
+                    "decoder{layer} control below 10x tau_rmse"
+                );
+            }
+        }
+
+        println!("CLEF_JOINT_CELLS ok");
         Ok(())
     }
 }

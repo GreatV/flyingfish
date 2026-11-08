@@ -1178,6 +1178,60 @@ impl Blas {
     }
 
     #[inline(always)]
+    /// Plain cuBLAS BF16 GEMM: `y = x @ w[w_rows]`^T over row-major `x`
+    /// `[rows, input]` and the weight row range `w_rows` of `w`
+    /// `[total_rows, input]`, F32 compute, BF16 `y` `[rows, w_rows.len()]`.
+    /// No Lt plans, calibration or row binding.
+    pub(crate) fn gemm_bf16(
+        &self,
+        w: &CudaSlice<bf16>,
+        w_rows: std::ops::Range<usize>,
+        x: &CudaSlice<bf16>,
+        y: &mut CudaSlice<bf16>,
+        rows: usize,
+        input: usize,
+    ) -> Result<()> {
+        let (w_row0, w_rows) = (w_rows.start, w_rows.len());
+        checked_dims(rows, w_rows, input)?;
+        ensure!(
+            w.len() >= (w_row0 + w_rows) * input
+                && x.len() == rows * input
+                && y.len() == rows * w_rows,
+            "BF16 GEMM extent mismatch: rows={rows} w_rows={w_rows} input={input} w={} x={} y={}",
+            w.len(),
+            x.len(),
+            y.len()
+        );
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        unsafe {
+            bs::cublasGemmEx(
+                *self.decode.handle(),
+                bs::cublasOperation_t::CUBLAS_OP_T,
+                bs::cublasOperation_t::CUBLAS_OP_N,
+                i32::try_from(w_rows)?,
+                i32::try_from(rows)?,
+                i32::try_from(input)?,
+                (&alpha as *const f32).cast(),
+                (w.device_ptr(&self.stream).0 + ((w_row0 * input) * size_of::<bf16>()) as u64)
+                    as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                i32::try_from(input)?,
+                x.device_ptr(&self.stream).0 as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                i32::try_from(input)?,
+                (&beta as *const f32).cast(),
+                y.device_ptr_mut(&self.stream).0 as *mut core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                i32::try_from(w_rows)?,
+                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn linear_f32(
         &self,
         weight: super::contracts::Tensor<f32, 2>,
