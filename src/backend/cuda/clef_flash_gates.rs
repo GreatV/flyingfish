@@ -806,63 +806,6 @@ mod gates {
             )?;
         }
 
-        // Forced common-input cells on the saved reference rows.
-        let hidden_in = joint_bf16_file(&forced_dir, "hidden_input", "rows")?;
-        let hidden_ref = joint_f32_file(&forced_dir, "hidden_norm_out", "rows")?;
-        let clean_hidden = engine.joint_hidden_norm(&mut plan, &hidden_in)?;
-        joint_cell(
-            &mut failures,
-            "hidden_norm_forced",
-            &clean_hidden,
-            &hidden_ref,
-            joint_tau(&taus, "hidden_norm_forced")?,
-            true,
-        )?;
-
-        let queries = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "routing_queries")?;
-        let memory = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "memory")?;
-        let clean_routing = engine.joint_forced_routing(&mut plan, &queries, &memory)?;
-        for (index, cell) in [(0usize, "routing0_forced"), (1usize, "routing1_forced")] {
-            joint_cell(
-                &mut failures,
-                cell,
-                &clean_routing[index],
-                &joint_f32_file(&forced_dir, "forced_out_cuda", cell)?,
-                joint_tau(&taus, cell)?,
-                true,
-            )?;
-        }
-        let d1_in = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "decoder1_in")?;
-        let mut clean_chain: Vec<Vec<f32>> = Vec::with_capacity(3);
-        let mut fields_now = engine.joint_forced_decoder(&mut plan, 1, &d1_in, &memory)?;
-        clean_chain.push(fields_now.clone());
-        joint_cell(
-            &mut failures,
-            "decoder1_forced",
-            &fields_now,
-            &joint_f32_file(&forced_dir, "forced_out_cuda", "decoder1_forced")?,
-            joint_tau(&taus, "decoder1_forced")?,
-            true,
-        )?;
-        for layer in 2..4 {
-            let rows: Vec<bf16> = fields_now.iter().map(|v| bf16::from_f32(*v)).collect();
-            fields_now = engine.joint_forced_decoder(&mut plan, layer, &rows, &memory)?;
-            clean_chain.push(fields_now.clone());
-            joint_cell(
-                &mut failures,
-                &format!("decoder{layer}_forced"),
-                &fields_now,
-                &joint_f32_file(
-                    &forced_dir,
-                    "forced_out_cuda",
-                    &format!("decoder{layer}_forced"),
-                )?,
-                joint_tau(&taus, &format!("decoder{layer}_forced"))?,
-                true,
-            )?;
-        }
-
-        // Controls: one same-shape neighbour substitution per family, applied to
         // the loaded weights and restored after each planted run.
 
         // logits family: residual_scorer.0 <- option_question_projection.
@@ -953,6 +896,62 @@ mod gates {
                 max_rmse(&planted.memory_row0, &stages.memory_row0)?,
                 joint_tau(&taus, "proj_memory_projection")?,
                 false,
+            )?;
+        }
+
+        // Forced common-input cells on the saved reference rows.
+        let hidden_in = joint_bf16_file(&forced_dir, "hidden_input", "rows")?;
+        let hidden_ref = joint_f32_file(&forced_dir, "hidden_norm_out", "rows")?;
+        let clean_hidden = engine.joint_hidden_norm(&mut plan, &hidden_in)?;
+        joint_cell(
+            &mut failures,
+            "hidden_norm_forced",
+            &clean_hidden,
+            &hidden_ref,
+            joint_tau(&taus, "hidden_norm_forced")?,
+            true,
+        )?;
+
+        let queries = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "routing_queries")?;
+        let memory = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "memory")?;
+        let clean_routing = engine.joint_forced_routing(&mut plan, &queries, &memory)?;
+        for (index, cell) in [(0usize, "routing0_forced"), (1usize, "routing1_forced")] {
+            joint_cell(
+                &mut failures,
+                cell,
+                &clean_routing[index],
+                &joint_f32_file(&forced_dir, "forced_out_cuda", cell)?,
+                joint_tau(&taus, cell)?,
+                true,
+            )?;
+        }
+        let d1_in = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "decoder1_in")?;
+        let mut clean_chain: Vec<Vec<f32>> = Vec::with_capacity(3);
+        let mut fields_now = engine.joint_forced_decoder(&mut plan, 1, &d1_in, &memory)?;
+        clean_chain.push(fields_now.clone());
+        joint_cell(
+            &mut failures,
+            "decoder1_forced",
+            &fields_now,
+            &joint_f32_file(&forced_dir, "forced_out_cuda", "decoder1_forced")?,
+            joint_tau(&taus, "decoder1_forced")?,
+            true,
+        )?;
+        for layer in 2..4 {
+            let rows: Vec<bf16> = fields_now.iter().map(|v| bf16::from_f32(*v)).collect();
+            fields_now = engine.joint_forced_decoder(&mut plan, layer, &rows, &memory)?;
+            clean_chain.push(fields_now.clone());
+            joint_cell(
+                &mut failures,
+                &format!("decoder{layer}_forced"),
+                &fields_now,
+                &joint_f32_file(
+                    &forced_dir,
+                    "forced_out_cuda",
+                    &format!("decoder{layer}_forced"),
+                )?,
+                joint_tau(&taus, &format!("decoder{layer}_forced"))?,
+                true,
             )?;
         }
 
