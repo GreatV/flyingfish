@@ -362,8 +362,9 @@ pub(crate) fn glm_mtp_commit_plan(
     draft_token: u32,
     v0: u32,
     v1: u32,
+    terminal_v0: bool,
 ) -> GlmMtpCommitPlan {
-    if draft_token == v0 {
+    if draft_token == v0 && !terminal_v0 {
         GlmMtpCommitPlan {
             accepted: 1,
             consumed: 2,
@@ -397,6 +398,19 @@ pub(crate) struct GlmMtpDsaTruncation {
     pub incomplete_pool: Option<usize>,
     pub restore_pools: Vec<usize>,
     pub meta: crate::op_contract::DsaMeta,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) fn glm_mtp_dense_indices(position: usize) -> Option<Vec<i32>> {
+    let width = crate::op_contract::DsaSpec::glm53().selected_width() as usize;
+    if position >= width {
+        return None;
+    }
+    let mut indices = vec![-1; width];
+    for (i, item) in indices.iter_mut().take(position + 1).enumerate() {
+        *item = i as i32;
+    }
+    Some(indices)
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm", test))]
@@ -491,7 +505,12 @@ pub(crate) fn glm_attachment_bytes(
         + 1536
         + 16384 * 1536
         + h * 16384
-        + experts * h)
+        + experts * h
+        + 4096 * 1536
+        + 2 * 128 * h
+        + 32 * h
+        + 2 * 128
+        + 4 * 128)
         * 2
         + experts * 4
         + 3 * expert_proj_bytes
@@ -513,8 +532,11 @@ pub(crate) fn glm_attachment_bytes(
         + 2 * 8 * 4
         + 4
         + 4 * 1024 * 1024;
-    let runtime_scratch =
-        (12 * h + 2 * h + 2 * 512 + 2 * 1536 + 2 * 16384) * 2 + vocab * 4 + 2051 * 4;
+    let runtime_scratch = (12 * h + 2 * h + 2 * 512 + 2 * 1536 + 2 * 16384) * 2
+        + vocab * 4
+        + 2051 * 4
+        + (4096 + 2 * 128 + 32 + 257) * 2
+        + (2 * 512 + 1) * 4;
     [
         runtime_weights,
         native_moe_shared,
@@ -676,7 +698,7 @@ mod tests {
 
     #[test]
     fn glm_mtp_rejection_commits_prefix_one_without_target_replay() -> Result<()> {
-        let reject = glm_mtp_commit_plan(33, 9001, 42, 77);
+        let reject = glm_mtp_commit_plan(33, 9001, 42, 77, false);
         assert_eq!(reject.accepted, 0);
         assert_eq!(reject.consumed, 1);
         assert_eq!(reject.next_position, 34);
@@ -687,7 +709,7 @@ mod tests {
         assert!(!reject.carry_verify_row1_hidden);
         assert_eq!(reject.next_pending_token, 42);
 
-        let accept = glm_mtp_commit_plan(33, 42, 42, 77);
+        let accept = glm_mtp_commit_plan(33, 42, 42, 77, false);
         assert_eq!(accept.accepted, 1);
         assert_eq!(accept.consumed, 2);
         assert_eq!(accept.next_position, 35);
@@ -697,6 +719,14 @@ mod tests {
         assert!(accept.commit_mtp_row0);
         assert!(accept.carry_verify_row1_hidden);
         assert_eq!(accept.next_pending_token, 77);
+
+        let short = glm_mtp_dense_indices(2050).unwrap();
+        assert_eq!(short, (0..2051).collect::<Vec<i32>>());
+        assert!(glm_mtp_dense_indices(2051).is_none());
+        assert!(glm_mtp_dense_indices(8192).is_none());
+
+        let accepted_eos = glm_mtp_commit_plan(33, 42, 42, 77, true);
+        assert_eq!(accepted_eos, reject);
 
         let dsa = crate::op_contract::DsaSpec::glm53();
         let incomplete = glm_mtp_dsa_truncation(dsa, 64, 2, 2, 1)?;

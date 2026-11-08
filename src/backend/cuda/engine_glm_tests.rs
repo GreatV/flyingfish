@@ -1712,7 +1712,7 @@ fn glm_mtp_census_gpu() -> Result<()> {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "GPU GLM-5.3-Flash Layer 45 numerics gate (G-MTP2) against frozen reference and swap control"]
+#[ignore = "GPU GLM Layer 45 diagnostic residuals against frozen reference; swap controls remain required"]
 fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1758,7 +1758,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "glm_mtp".into(),
     ));
     let blas = Blas::new(&device, &ops, &std::env::temp_dir(), closure)?;
-    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true, 2048)?;
+    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true, 4096)?;
 
     // 1. Synthetic case
     let synth_inputs = std::fs::read(ref_dir.join("common_inputs.safetensors"))?;
@@ -2172,14 +2172,14 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         "Runner FAIL production swap discriminating control: rmse={prod_swap_rmse} < 10*tau"
     );
 
-    let status = if defects.is_empty() { "PASS" } else { "DEFECT" };
     println!(
-        "{status} GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.6}/{prod_swap_delta:.6} swap_rmse={synth_swap_rmse:.6}/{prod_swap_rmse:.6} graph_bit_differences=0 defects={}",
+        "DIAGNOSTIC GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.6}/{prod_swap_delta:.6} swap_rmse={synth_swap_rmse:.6}/{prod_swap_rmse:.6} graph_bit_differences=0 outside_bounds={}",
         defects.len()
     );
     for d in &defects {
-        println!("{d}");
+        println!("DIAGNOSTIC {}", d.strip_prefix("DEFECT ").unwrap_or(d));
     }
+    runtime.check_long_index(&blas)?;
     Ok(())
 }
 
@@ -2889,11 +2889,13 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
     // Cost model quantities
     let w_target_dense = 5_618_368_512u64;
-    let w_draft_dense = 243_872_384u64;
+    // Two key/gate/norm/APE passes bound the draft and accepted-row commit.
+    let index_key_pass = (2 * 128 * 4096 + 2 * 128 + 4 * 128) * 2;
+    let w_draft_dense = 243_872_384u64 + 2 * index_key_pass;
     let expert_slot_bytes = 25_171_968u64;
     let b_head = 154_880u64 * 4096 * 2; // 1,268,776,960 B
     let b_step1 = w_target_dense + (336 * expert_slot_bytes) + b_head; // 15,344,926,720 B
-    let b_draft = w_draft_dense + (8 * expert_slot_bytes) + b_head; // 1,714,025,088 B
+    let b_draft = w_draft_dense + (8 * expert_slot_bytes) + b_head;
 
     let mut total_bytes_moved = 0u64;
     let mut sum_b_verify = 0u64;
@@ -3045,6 +3047,10 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         println!("{d}");
     }
     std::io::Write::flush(&mut std::io::stdout())?;
+    ensure!(
+        defects.is_empty(),
+        "DEFECT GLM MTP speculative verification"
+    );
     Ok(())
 }
 

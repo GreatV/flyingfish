@@ -1030,7 +1030,13 @@ impl Engine {
             .context("GLM runtime missing")?
             .count_expert_unions_for_rows2(&stream)?;
 
-        let plan = crate::mtp::glm_mtp_commit_plan(start_pos, draft_token, v0, v1);
+        let plan = crate::mtp::glm_mtp_commit_plan(
+            start_pos,
+            draft_token,
+            v0,
+            v1,
+            self.model_spec.eos.contains(&v0),
+        );
         debug_assert_eq!(plan.replay_target_passes, 0);
         if let Some(prefix_rows) = plan.select_prefix_rows {
             let snapshots = chain

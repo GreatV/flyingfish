@@ -1,11 +1,15 @@
+use super::super::qwen::{GlmDsaOutputs, heads, matrix};
 use super::*;
 use crate::backend::cuda::Device;
 use crate::backend::cuda::blas::Blas;
-use crate::backend::cuda::contracts::{Tensor, TensorMut};
+use crate::backend::cuda::contracts::{Tensor, TensorMut, view};
 use crate::backend::cuda::cubin;
-use crate::backend::cuda::dsa::{DsaAttentionInput, DsaPlan, DsaState};
+use crate::backend::cuda::dsa::{
+    DsaAppendInput, DsaAttentionInput, DsaIndexInput, DsaIndexOutput, DsaPlan, DsaState,
+};
 use crate::backend::cuda::linear::{Fp8ScaleRef, LinearWeightRef};
 use crate::backend::cuda::moe::decode::{NativeMoe, NativeMoeGeometry, NativeMoeWeights};
+use crate::backend::cuda::ops::{CommonOpsRef, NormOps};
 use crate::backend::gpu::DevicePtr;
 use crate::fp8::{Fp8BlockScale, Fp8ScaleLayout};
 use crate::op_contract::{DsaMeta, DsaSpec};
@@ -184,8 +188,7 @@ fn dequant_fp8_block_f32_host(codes: &[u8], scales: &[f32], rows: usize, cols: u
 
 #[derive(Clone, Copy)]
 pub(crate) struct GlmMtpSliceInfo {
-    pub(crate) shard: u8,
-    pub(crate) offset: usize,
+    pub(crate) address: usize,
     pub(crate) len: usize,
 }
 
@@ -274,8 +277,7 @@ pub(crate) struct GlmMtpRuntime {
     slot_down_scales: Vec<CudaSlice<f32>>,
     staged_slots: [Option<usize>; 8],
     experts: Vec<GlmMtpExpertHost>,
-    _mmap1: Arc<memmap2::Mmap>,
-    _mmap2: Arc<memmap2::Mmap>,
+    _checkpoint: crate::checkpoint::MappedCheckpoint,
 
     head_norm_w: CudaSlice<bf16>,
 
@@ -302,7 +304,19 @@ pub(crate) struct GlmMtpRuntime {
     pub(crate) moe_out_buf: CudaSlice<bf16>,
     pub(crate) head_norm_buf: CudaSlice<bf16>,
     pub(crate) logits_buf: CudaSlice<f32>,
-    pub(crate) dsa_indices_buf: CudaSlice<i32>,
+    index_norm: Arc<NormOps>,
+    index_wq: CudaSlice<bf16>,
+    index_wk: CudaSlice<bf16>,
+    index_gate: CudaSlice<bf16>,
+    index_weights: CudaSlice<bf16>,
+    index_norm_w: CudaSlice<bf16>,
+    index_norm_b: CudaSlice<bf16>,
+    index_ape: CudaSlice<bf16>,
+    index_q: CudaSlice<bf16>,
+    index_k: CudaSlice<bf16>,
+    index_g: CudaSlice<bf16>,
+    index_head_weights: CudaSlice<bf16>,
+    index_outputs: GlmDsaOutputs,
 
     pub(crate) last_route: Option<(Vec<i32>, Vec<f32>)>,
     pub(crate) last_staged_experts: usize,
@@ -330,75 +344,52 @@ impl GlmMtpRuntime {
         let concat_eh = mtp_mod.load_function("glm_mtp_concat_eh")?;
         let add = mtp_mod.load_function("glm_mtp_add")?;
 
-        let shard1_file = std::fs::File::open(model_dir.join("model-00001-of-00062.safetensors"))?;
-        let mmap1 = Arc::new(unsafe { memmap2::MmapOptions::new().map(&shard1_file)? });
-        let st1 = safetensors::SafeTensors::deserialize(&mmap1)?;
-
-        let shard2_file = std::fs::File::open(model_dir.join("model-00002-of-00062.safetensors"))?;
-        let mmap2 = Arc::new(unsafe { memmap2::MmapOptions::new().map(&shard2_file)? });
-        let st2 = safetensors::SafeTensors::deserialize(&mmap2)?;
-
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open_component(model_dir, "model")?;
+        let views = checkpoint.views()?;
+        let tensor = |name: &str| -> Result<safetensors::tensor::TensorView<'_>> {
+            let shard = checkpoint
+                .index
+                .weight_map
+                .get(name)
+                .with_context(|| format!("GLM MTP tensor missing from index: {name}"))?;
+            Ok(views
+                .get(shard)
+                .context("indexed shard missing")?
+                .tensor(name)?)
+        };
         let get_st_bf16 = |name: &str| -> Result<Vec<bf16>> {
-            if let Ok(t) = st1.tensor(name) {
-                let data = t.data();
-                return Ok(data
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
-                    .collect());
-            }
-            let t = st2.tensor(name)?;
-            let data = t.data();
-            Ok(data
+            let t = tensor(name)?;
+            ensure!(
+                t.dtype() == safetensors::Dtype::BF16,
+                "{name}: expected BF16"
+            );
+            Ok(t.data()
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
                 .collect())
         };
-
         let get_st_f32 = |name: &str| -> Result<Vec<f32>> {
-            if let Ok(t) = st1.tensor(name) {
-                let data = t.data();
-                return Ok(data
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect());
-            }
-            let t = st2.tensor(name)?;
-            let data = t.data();
-            Ok(data
+            let t = tensor(name)?;
+            ensure!(t.dtype() == safetensors::Dtype::F32, "{name}: expected F32");
+            Ok(t.data()
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .map(|b| f32::from_le_bytes(*b))
                 .collect())
         };
-
         let get_st_slice_info = |name: &str| -> Result<GlmMtpSliceInfo> {
-            if let Ok(t) = st1.tensor(name) {
-                let offset = unsafe { t.data().as_ptr().offset_from(mmap1.as_ptr()) as usize };
-                return Ok(GlmMtpSliceInfo {
-                    shard: 1,
-                    offset,
-                    len: t.data().len(),
-                });
-            }
-            let t = st2.tensor(name)?;
-            let offset = unsafe { t.data().as_ptr().offset_from(mmap2.as_ptr()) as usize };
+            let t = tensor(name)?;
             Ok(GlmMtpSliceInfo {
-                shard: 2,
-                offset,
+                address: t.data().as_ptr() as usize,
                 len: t.data().len(),
             })
         };
-
         let slice_u8_init = |info: GlmMtpSliceInfo| -> &[u8] {
-            let mmap = if info.shard == 1 { &mmap1 } else { &mmap2 };
-            &mmap[info.offset..info.offset + info.len]
+            // The immutable mapped range is owned by checkpoint.
+            unsafe { std::slice::from_raw_parts(info.address as *const u8, info.len) }
         };
 
         let config_str = std::fs::read_to_string(model_dir.join("config.json"))?;
@@ -705,6 +696,19 @@ impl GlmMtpRuntime {
             None
         };
 
+        let load_index = |suffix: &str| -> Result<CudaSlice<bf16>> {
+            Ok(stream.clone_htod(&get_st_bf16(&format!(
+                "model.language_model.layers.45.self_attn.indexer.{suffix}"
+            ))?)?)
+        };
+        let index_wq = load_index("wq_b.weight")?;
+        let index_wk = load_index("wk.weight")?;
+        let index_gate = load_index("index_kpool_compress_gate")?;
+        let index_weights = load_index("weights_proj.weight")?;
+        let index_norm_w = load_index("k_norm.weight")?;
+        let index_norm_b = load_index("k_norm.bias")?;
+        let index_ape = load_index("index_kpool_compress_ape")?;
+        drop(views);
         Ok(Self {
             stream: stream.clone(),
             rms_norm,
@@ -753,8 +757,7 @@ impl GlmMtpRuntime {
                 Some(7),
             ],
             experts,
-            _mmap1: mmap1,
-            _mmap2: mmap2,
+            _checkpoint: checkpoint,
             head_norm_w,
             _standalone_embed,
             standalone_head,
@@ -778,7 +781,19 @@ impl GlmMtpRuntime {
             moe_out_buf: stream.alloc_zeros::<bf16>(4096)?,
             head_norm_buf: stream.alloc_zeros::<bf16>(4096)?,
             logits_buf: stream.alloc_zeros::<f32>(154880)?,
-            dsa_indices_buf: stream.alloc_zeros::<i32>(2051)?,
+            index_norm: CommonOpsRef::new(&device.ctx)?.norm,
+            index_wq,
+            index_wk,
+            index_gate,
+            index_weights,
+            index_norm_w,
+            index_norm_b,
+            index_ape,
+            index_q: stream.alloc_zeros(32 * 128)?,
+            index_k: stream.alloc_zeros(128)?,
+            index_g: stream.alloc_zeros(128)?,
+            index_head_weights: stream.alloc_zeros(32)?,
+            index_outputs: GlmDsaOutputs::new(1, stream)?,
             last_route: None,
             last_staged_experts: 0,
             _standalone_dsa,
@@ -820,7 +835,19 @@ impl GlmMtpRuntime {
             + self.attn_out_buf.len()
             + self.o_buf.len()
             + self.moe_out_buf.len()
-            + self.head_norm_buf.len();
+            + self.head_norm_buf.len()
+            + self.index_wq.len()
+            + self.index_wk.len()
+            + self.index_gate.len()
+            + self.index_weights.len()
+            + self.index_norm_w.len()
+            + self.index_norm_b.len()
+            + self.index_ape.len()
+            + self.index_q.len()
+            + self.index_k.len()
+            + self.index_g.len()
+            + self.index_head_weights.len()
+            + self.index_outputs.packed.len();
         let u8_elems = self._sh_gate_codes.len()
             + self._sh_up_codes.len()
             + self._sh_down_codes.len()
@@ -861,17 +888,19 @@ impl GlmMtpRuntime {
             + f32_elems * std::mem::size_of::<f32>()
             + self.slots_buf.len() * std::mem::size_of::<u64>()
             + self.valid_buf.len() * std::mem::size_of::<u32>()
-            + self.dsa_indices_buf.len() * std::mem::size_of::<i32>()
+            + (self.index_outputs.indices.len()
+                + self.index_outputs.selected.len()
+                + self.index_outputs.scores.len()
+                + self.index_outputs.margins.len())
+                * 4
             + self._standalone_dsa.as_ref().map_or(0, DsaState::bytes)
     }
 
     fn stage_routed_experts(&mut self, ids: &[i32]) -> Result<usize> {
         let stream = self.stream.clone();
-        let mmap1 = &self._mmap1;
-        let mmap2 = &self._mmap2;
         let slice_u8 = |info: GlmMtpSliceInfo| -> &[u8] {
-            let mmap = if info.shard == 1 { mmap1 } else { mmap2 };
-            &mmap[info.offset..info.offset + info.len]
+            // The immutable mapped range is owned by self._checkpoint.
+            unsafe { std::slice::from_raw_parts(info.address as *const u8, info.len) }
         };
         let target_experts: Vec<usize> = ids.iter().take(8).map(|&id| id as usize).collect();
 
@@ -939,6 +968,14 @@ impl GlmMtpRuntime {
             stream.memcpy_htod(&self.valid_host, &mut self.valid_buf)?;
         }
         Ok(needed_experts.len())
+    }
+
+    fn index_input(&self) -> Result<DsaIndexInput> {
+        Ok(DsaIndexInput {
+            q: heads(&self.index_q, &self.stream, 0, 1, 32, 128)?,
+            weights: matrix(&self.index_head_weights, &self.stream, 0, 1, 32)?,
+            ape: matrix(&self.index_ape, &self.stream, 0, 4, 128)?,
+        })
     }
 
     fn write_kv_entry(
@@ -1014,17 +1051,6 @@ impl GlmMtpRuntime {
         )?;
 
         let cap = dsa_state.token_ids.len();
-        let physical = pos % cap;
-        stream.memcpy_dtod(
-            &self.kv_latent_buf,
-            &mut dsa_state
-                .latent
-                .slice_mut(physical * 512..(physical + 1) * 512),
-        )?;
-        stream.memcpy_htod(
-            &[pos as i32],
-            &mut dsa_state.token_ids.slice_mut(physical..physical + 1),
-        )?;
         dsa_state.set_meta(
             &stream,
             DsaMeta {
@@ -1036,6 +1062,48 @@ impl GlmMtpRuntime {
                 reserved: [0, 0, 0],
             },
         )?;
+        run_linear_bf16(
+            &stream,
+            blas,
+            &self.index_wk,
+            &self.x_norm_buf,
+            &mut self.index_k,
+            (1, 128, 4096),
+        )?;
+        run_linear_bf16(
+            &stream,
+            blas,
+            &self.index_gate,
+            &self.x_norm_buf,
+            &mut self.index_g,
+            (1, 128, 4096),
+        )?;
+        self.index_norm.layer_norm(
+            &stream,
+            heads(&self.index_k, &stream, 0, 1, 1, 128)?,
+            view(&self.index_norm_w, &stream, 0, [128], [1])?,
+            view(&self.index_norm_b, &stream, 0, [128], [1])?,
+            &mut TensorMut(heads(&self.index_k, &stream, 0, 1, 1, 128)?),
+            1e-6,
+        )?;
+        stream.memcpy_dtod(
+            &self.index_k,
+            &mut self.index_outputs.packed.slice_mut(..128),
+        )?;
+        stream.memcpy_dtod(
+            &self.index_g,
+            &mut self.index_outputs.packed.slice_mut(128..256),
+        )?;
+        self.dsa_plan.append(
+            dsa_state,
+            &DsaAppendInput {
+                latent: matrix(&self.kv_latent_buf, &stream, 0, 1, 512)?,
+                packed: matrix(&self.index_outputs.packed, &stream, 0, 1, 257)?,
+            },
+            &stream,
+        )?;
+        self.dsa_plan
+            .pool(dsa_state, &self.index_input()?, &stream)?;
         Ok(())
     }
 
@@ -1077,15 +1145,59 @@ impl GlmMtpRuntime {
             (1, 16384, 1536),
         )?;
 
-        let mut indices = vec![-1i32; 2051];
-        for (i, item) in indices.iter_mut().take(pos.min(2050) + 1).enumerate() {
-            *item = i as i32;
+        if let Some(indices) = crate::mtp::glm_mtp_dense_indices(pos) {
+            stream.memcpy_htod(&indices, &mut self.index_outputs.indices)?;
+        } else {
+            run_linear_bf16(
+                &stream,
+                blas,
+                &self.index_wq,
+                &self.q_a_norm_buf,
+                &mut self.index_q,
+                (1, 4096, 1536),
+            )?;
+            run_linear_bf16(
+                &stream,
+                blas,
+                &self.index_weights,
+                &self.x_norm_buf,
+                &mut self.index_head_weights,
+                (1, 32, 4096),
+            )?;
+            self.dsa_plan.index(
+                dsa_state,
+                &self.index_input()?,
+                &DsaIndexOutput {
+                    selected: TensorMut(view(
+                        &self.index_outputs.selected,
+                        &stream,
+                        0,
+                        [1, 512],
+                        [512, 1],
+                    )?),
+                    scores: TensorMut(view(
+                        &self.index_outputs.scores,
+                        &stream,
+                        0,
+                        [1, 512],
+                        [512, 1],
+                    )?),
+                    margins: TensorMut(view(&self.index_outputs.margins, &stream, 0, [1], [1])?),
+                    indices: TensorMut(view(
+                        &self.index_outputs.indices,
+                        &stream,
+                        0,
+                        [1, 2051],
+                        [2051, 1],
+                    )?),
+                },
+                &stream,
+            )?;
         }
-        stream.memcpy_htod(&indices, &mut self.dsa_indices_buf)?;
 
         let (q_ptr, _) = self.q_b_buf.device_ptr(&stream);
         let (kv_b_ptr, _) = self.kv_b_w.device_ptr(&stream);
-        let (idx_ptr, _) = self.dsa_indices_buf.device_ptr(&stream);
+        let (idx_ptr, _) = self.index_outputs.indices.device_ptr(&stream);
         let (out_ptr, _) = self.attn_out_buf.device_ptr(&stream);
 
         let q_tensor = unsafe { Tensor::new(q_ptr, [1, 64, 256], [16384, 256, 1], 16384 * 2)? };
@@ -1174,6 +1286,63 @@ impl GlmMtpRuntime {
             (1, 154880, 4096),
         )?;
 
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn check_long_index(&mut self, blas: &Blas) -> Result<()> {
+        let stream = self.stream.clone();
+        let mut state = self
+            ._standalone_dsa
+            .take()
+            .context("standalone DSA missing")?;
+        let pos = 2052usize;
+        ensure!(state.token_ids.len() > pos, "long-index fixture capacity");
+        state.clear(&stream)?;
+        let token_ids: Vec<i32> = (0..pos as i32).collect();
+        let pool_ids: Vec<i32> = (0..(pos / 4) as i32).collect();
+        stream.memcpy_htod(&token_ids, &mut state.token_ids.slice_mut(..pos))?;
+        stream.memcpy_htod(&pool_ids, &mut state.pool_ids.slice_mut(..pool_ids.len()))?;
+        let mut packed = vec![bf16::ZERO; pos * 257];
+        for row in packed.as_chunks_mut::<257>().0 {
+            row[256] = bf16::ONE;
+        }
+        stream.memcpy_htod(&packed, &mut state.packed.slice_mut(..packed.len()))?;
+        let keys: Vec<bf16> = (0..pool_ids.len() * 128)
+            .map(|i| bf16::from_f32(((i * 37 + 13) % 1009) as f32 / 512.0 - 1.0))
+            .collect();
+        stream.memcpy_htod(&keys, &mut state.pool_keys.slice_mut(..keys.len()))?;
+        self.forward_layer45_core(&mut state, pos, false, false, blas, None)?;
+        let indices = stream.clone_dtoh(&self.index_outputs.indices)?;
+        let selected = stream.clone_dtoh(&self.index_outputs.selected)?;
+        let mut expected: Vec<i32> = selected
+            .iter()
+            .flat_map(|pool| (0..4).map(move |i| pool * 4 + i))
+            .collect();
+        expected.push(pos as i32);
+        expected.resize(2051, -1);
+        ensure!(indices == expected, "DEFECT MTP top-k plus tail expansion");
+        ensure!(
+            indices.contains(&(pos as i32)),
+            "DEFECT MTP current tail excluded"
+        );
+        let unique: std::collections::BTreeSet<_> =
+            indices.iter().copied().filter(|i| *i >= 0).collect();
+        ensure!(
+            unique.len() == 2049 && unique.iter().all(|i| *i <= pos as i32),
+            "DEFECT MTP selected index bounds or duplicates"
+        );
+        let truncated: Vec<i32> = (0..2051).collect();
+        ensure!(
+            indices != truncated && !truncated.contains(&(pos as i32)),
+            "Runner FAIL truncated-index control"
+        );
+        println!(
+            "PASS GLM_MTP_LONG_INDEX position={pos} selected_pools={} unique_keys={} current_tail=true truncated_control=true",
+            selected.len(),
+            unique.len()
+        );
+        self._standalone_dsa = Some(state);
         Ok(())
     }
 

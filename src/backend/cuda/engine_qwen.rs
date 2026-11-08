@@ -519,7 +519,7 @@ fn take_glm_hc_weights(
 }
 
 pub(super) struct GlmDsaOutputs {
-    packed: CudaSlice<bf16>,
+    pub(super) packed: CudaSlice<bf16>,
     pub(super) selected: CudaSlice<i32>,
     pub(super) scores: CudaSlice<f32>,
     pub(super) margins: CudaSlice<f32>,
@@ -527,7 +527,7 @@ pub(super) struct GlmDsaOutputs {
 }
 
 impl GlmDsaOutputs {
-    fn new(rows: usize, s: &Arc<CudaStream>) -> Result<Self> {
+    pub(super) fn new(rows: usize, s: &Arc<CudaStream>) -> Result<Self> {
         Ok(Self {
             packed: s.alloc_zeros(rows * 257)?,
             selected: s.alloc_zeros(rows * 512)?,
