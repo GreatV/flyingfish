@@ -154,10 +154,30 @@ fn rope_table(positions: usize, dim: usize, law: RopeLaw) -> Result<Vec<bf16>> {
     Ok(table)
 }
 
+fn planted_rope_theta(theta: f32) -> f32 {
+    if theta == 10_000.0 {
+        20_000.0
+    } else {
+        10_000.0
+    }
+}
+
+fn text_rope_law(full: bool, plant: bool) -> RopeLaw {
+    let configured = if full { 1_000_000.0 } else { 10_000.0 };
+    RopeLaw::Plain {
+        theta: if plant {
+            planted_rope_theta(configured)
+        } else {
+            configured
+        },
+        divisor: if full { 8.0 } else { 1.0 },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextPlant {
     Nominal,
-    RopePosition,
+    RopeBase,
     SlidingWindow,
 }
 
@@ -225,6 +245,8 @@ struct Kern {
     residual_scale: CudaFunction,
     table_slide: CudaSlice<bf16>,
     table_full: CudaSlice<bf16>,
+    table_slide_plant: CudaSlice<bf16>,
+    table_full_plant: CudaSlice<bf16>,
     table_backbone: CudaSlice<bf16>,
     table_depth: CudaSlice<bf16>,
 }
@@ -1310,16 +1332,19 @@ fn text_layer(
             eps: TEXT_EPS,
         },
     )?;
+    let planted = step.plant == TextPlant::RopeBase;
     let table = if layer.full {
-        &k.table_full
+        if planted {
+            &k.table_full_plant
+        } else {
+            &k.table_full
+        }
+    } else if planted {
+        &k.table_slide_plant
     } else {
         &k.table_slide
     };
-    let start = if step.plant == TextPlant::RopePosition && step.index == 0 {
-        1
-    } else {
-        0
-    };
+    let start = 0;
     attend(
         k,
         buf,
@@ -1757,20 +1782,22 @@ impl Breeze {
             &stream,
             TEXT_POSITIONS,
             TEXT_DIM,
-            RopeLaw::Plain {
-                theta: 10_000.0,
-                divisor: 1.0,
-            },
+            text_rope_law(false, false),
         )?;
         let table_full = upload_table(
             &stream,
             TEXT_POSITIONS,
             TEXT_DIM,
-            RopeLaw::Plain {
-                theta: 1_000_000.0,
-                divisor: 8.0,
-            },
+            text_rope_law(true, false),
         )?;
+        let table_slide_plant = upload_table(
+            &stream,
+            TEXT_POSITIONS,
+            TEXT_DIM,
+            text_rope_law(false, true),
+        )?;
+        let table_full_plant =
+            upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(true, true))?;
         let table_backbone = upload_table(
             &stream,
             BB_MAX,
@@ -1844,6 +1871,8 @@ impl Breeze {
                 residual_scale,
                 table_slide,
                 table_full,
+                table_slide_plant,
+                table_full_plant,
                 table_backbone,
                 table_depth,
             },
@@ -1871,9 +1900,6 @@ impl Breeze {
                 .all(|&id| id != TEXT_EOI && id < TEXT_VOCAB),
             "text token id"
         );
-        if plant == TextPlant::RopePosition {
-            ensure!(rows < TEXT_POSITIONS, "rope plant position");
-        }
         let Breeze {
             ref w,
             ref k,
@@ -2172,7 +2198,7 @@ mod tests {
     };
     const SHORT_ROPE: GateBar = GateBar {
         tensor: "projected_text",
-        plant: "text_encoder_rope_position",
+        plant: "text_encoder_rope_base",
         source: "short_floors.projected_text",
         tau_max: SHORT_MAX,
         tau_rmse: SHORT_RMSE,
@@ -2450,6 +2476,47 @@ mod tests {
                 ("depth_logits", "depth_head_codebook"),
             ],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn rope_plant_uses_the_wrong_base() -> Result<()> {
+        ensure!(
+            super::planted_rope_theta(10_000.0) == 20_000.0,
+            "sliding plant base"
+        );
+        ensure!(
+            super::planted_rope_theta(1_000_000.0) == 10_000.0,
+            "full plant base"
+        );
+        let nominal = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(false, false))?;
+        let planted = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(false, true))?;
+        let full = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(true, false))?;
+        let full_plant = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(true, true))?;
+        position_zero(&nominal, super::TEXT_DIM)?;
+        position_zero(&planted, super::TEXT_DIM)?;
+        position_zero(&full, super::TEXT_DIM)?;
+        position_zero(&full_plant, super::TEXT_DIM)?;
+        ensure!(
+            nominal != planted,
+            "sliding plant matches the configured table"
+        );
+        ensure!(
+            full != full_plant,
+            "full plant matches the configured table"
+        );
+        let kernel = include_str!("../../../kernels/rope.cu");
+        ensure!(
+            !kernel.contains("KEY_CACHE_TABLE"),
+            "rope kernel indexes keys by a cache table"
+        );
+        ensure!(
+            kernel
+                .matches("qknorm_rope_kv_impl<true, true, true, false, false, true, false, true>(")
+                .count()
+                == 1,
+            "one_plus instantiation"
+        );
         Ok(())
     }
 
@@ -2830,7 +2897,7 @@ mod tests {
             &SHORT_NOMINAL,
         )?;
         protocol |= arm(
-            &model.text(&short_text, super::TextPlant::RopePosition)?,
+            &model.text(&short_text, super::TextPlant::RopeBase)?,
             &short_projected,
             &SHORT_ROPE,
         )?;
