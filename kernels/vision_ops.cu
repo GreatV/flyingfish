@@ -2,6 +2,89 @@
 #include <stdint.h>
 #include <math.h>
 
+__device__ static float triangle_dot(const float* a, const float* b) {
+    return __fadd_rn(__fadd_rn(__fmul_rn(a[0], b[0]), __fmul_rn(a[1], b[1])), __fmul_rn(a[2], b[2]));
+}
+
+__device__ static bool triangle_axis_overlap(const float p[3][3], const float* axis) {
+    float lo = triangle_dot(p[0], axis), hi = lo;
+    for (int vertex = 1; vertex < 3; ++vertex) {
+        const float value = triangle_dot(p[vertex], axis);
+        lo = fminf(lo, value); hi = fmaxf(hi, value);
+    }
+    const float radius = __fmul_rn(0.5f, __fadd_rn(__fadd_rn(fabsf(axis[0]), fabsf(axis[1])), fabsf(axis[2])));
+    return lo <= radius && hi >= -radius;
+}
+
+__device__ static bool triangle_box_overlap(const float vertices[3][3], int x, int y, int z) {
+    const float center[3] = {float(x) + 0.5f, float(y) + 0.5f, float(z) + 0.5f};
+    float p[3][3], edges[3][3];
+    for (int i = 0; i < 3; ++i) for (int a = 0; a < 3; ++a) {
+        p[i][a] = __fsub_rn(vertices[i][a], center[a]);
+        edges[i][a] = __fsub_rn(vertices[(i + 1) % 3][a], vertices[i][a]);
+    }
+    for (int a = 0; a < 3; ++a) {
+        const float lo = fminf(p[0][a], fminf(p[1][a], p[2][a]));
+        const float hi = fmaxf(p[0][a], fmaxf(p[1][a], p[2][a]));
+        if (lo > 0.5f || hi < -0.5f) return false;
+    }
+    for (int edge = 0; edge < 3; ++edge) for (int a = 0; a < 3; ++a) {
+        float axis[3] = {0, 0, 0};
+        axis[(a + 1) % 3] = edges[edge][(a + 2) % 3];
+        axis[(a + 2) % 3] = -edges[edge][(a + 1) % 3];
+        if (!triangle_axis_overlap(p, axis)) return false;
+    }
+    float normal[3];
+    for (int a = 0; a < 3; ++a) normal[a] = __fsub_rn(
+        __fmul_rn(edges[0][(a + 1) % 3], edges[1][(a + 2) % 3]),
+        __fmul_rn(edges[0][(a + 2) % 3], edges[1][(a + 1) % 3]));
+    return triangle_axis_overlap(p, normal);
+}
+
+template<bool EMIT>
+__device__ static void triangle_box_list(const float* vertices, const int* faces,
+    unsigned first, unsigned count, unsigned resolution, unsigned long long* counts,
+    const unsigned long long* offsets, unsigned long long base, unsigned long long capacity,
+    unsigned long long* keys, unsigned* owners) {
+    const unsigned local = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local >= count) return;
+    const unsigned face = first + local;
+    float points[3][3]; int lower[3], upper[3];
+    for (int vertex = 0; vertex < 3; ++vertex) for (int axis = 0; axis < 3; ++axis)
+        points[vertex][axis] = vertices[(unsigned long long)faces[3ull * face + vertex] * 3 + axis];
+    for (int axis = 0; axis < 3; ++axis) {
+        lower[axis] = max(0, (int)floorf(fminf(points[0][axis], fminf(points[1][axis], points[2][axis]))));
+        upper[axis] = min(int(resolution) - 1, (int)floorf(fmaxf(points[0][axis], fmaxf(points[1][axis], points[2][axis]))));
+    }
+    unsigned long long found = 0;
+    for (int x = lower[0]; x <= upper[0]; ++x)
+        for (int y = lower[1]; y <= upper[1]; ++y)
+            for (int z = lower[2]; z <= upper[2]; ++z) {
+                if (!triangle_box_overlap(points, x, y, z)) continue;
+                if (EMIT) {
+                    const unsigned long long at = offsets[face] - base + found;
+                    if (at >= capacity) { __trap(); return; }
+                    keys[at] = (uint64_t(x) << 42) | (uint64_t(y) << 21) | unsigned(z);
+                    owners[at] = face;
+                }
+                ++found;
+            }
+    if (!EMIT) counts[face] = found;
+    else if (found != counts[face]) { __trap(); }
+}
+
+extern "C" __global__ void triangle_box_count(const float* vertices, const int* faces,
+    unsigned count, unsigned resolution, unsigned long long* counts) {
+    triangle_box_list<false>(vertices, faces, 0, count, resolution, counts, nullptr, 0, 0, nullptr, nullptr);
+}
+
+extern "C" __global__ void triangle_box_emit(const float* vertices, const int* faces,
+    unsigned first, unsigned count, unsigned resolution, unsigned long long* counts,
+    const unsigned long long* offsets, unsigned long long base, unsigned long long capacity,
+    unsigned long long* keys, unsigned* owners) {
+    triangle_box_list<true>(vertices, faces, first, count, resolution, counts, offsets, base, capacity, keys, owners);
+}
+
 // NHWC 2D im2col: [height, width, channels] -> [out_y_count * out_w, channels * kh * kw] in (c, ky, kx) order.
 // `mask` may be null; when non-null, rows with mask[in_y] == 0 read zero.
 extern "C" __global__ void masked_strided_patch_bf16(

@@ -2672,6 +2672,204 @@ fn cascade_rope(
     Ok(())
 }
 
+fn cascade_mesh(
+    root: &Path,
+    prefix: &Path,
+    high: bool,
+    case: &str,
+) -> Result<crate::sparse::SparseMesh> {
+    let anchor = root.join(if high {
+        "transition1024-sm86-released-r1"
+    } else {
+        "transition-sm86-full-r1"
+    });
+    let (vertices, mut faces) = if case == "open_loop" {
+        (
+            f32_tensor(&anchor.join("open_loop-fill.safetensors"), "input_vertices")?,
+            (0..7).flat_map(|i| [7, (i + 1) % 7, i]).collect(),
+        )
+    } else {
+        let path = if high {
+            root.join(format!(
+                "continued1024-{}-sm86-r1/mesh.safetensors",
+                case.replace('_', "-")
+            ))
+        } else {
+            prefix.join(format!("linked-sm89-{case}-r1/mesh.safetensors"))
+        };
+        (
+            f32_tensor(&path, "vertices")?,
+            tensor(&path, "faces")?
+                .values
+                .into_iter()
+                .map(|v| v as i32)
+                .collect::<Vec<_>>(),
+        )
+    };
+    faces.extend(
+        tensor(
+            &anchor.join(format!("{case}-fill.safetensors")),
+            "added_faces",
+        )?
+        .values
+        .into_iter()
+        .map(|v| v as i32),
+    );
+    Ok(crate::sparse::SparseMesh { vertices, faces })
+}
+
+fn cascade_incidence_exact(voxels: &TriangleVoxels, path: &Path) -> Result<bool> {
+    let coordinates = tensor(path, "voxel_coords")?;
+    let counts = tensor(path, "voxel_face_count")?;
+    let offsets = tensor(path, "voxel_face_start")?;
+    let owners = tensor(path, "voxel_face_idx")?;
+    let face_counts = tensor(path, "face_voxel_count")?;
+    ensure!(
+        coordinates.shape == [counts.values.len(), 3]
+            && offsets.values.len() == counts.values.len(),
+        "invalid frozen triangle incidence layout"
+    );
+    let mut exact = face_counts.values.len() == voxels.face_counts.len()
+        && face_counts
+            .values
+            .iter()
+            .zip(&voxels.face_counts)
+            .all(|(&a, &b)| a == b as f64)
+        && coordinates.shape[0] == voxels.sites.coordinates().len()
+        && owners.values.len() == voxels.voxel_faces.len();
+    let mut differences = 0;
+    for (row, p) in coordinates.values.as_chunks::<3>().0.iter().enumerate() {
+        let Some(actual) = voxels.sites.row([0, p[0] as i32, p[1] as i32, p[2] as i32]) else {
+            differences += 1;
+            continue;
+        };
+        let actual = actual as usize;
+        let start = offsets.values[row] as usize;
+        let count = counts.values[row] as usize;
+        ensure!(
+            start + count <= owners.values.len(),
+            "frozen owner extent overflow"
+        );
+        let mut expected = owners.values[start..start + count]
+            .iter()
+            .map(|&v| v as u32)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let span = voxels.voxel_offsets[actual] as usize..voxels.voxel_offsets[actual + 1] as usize;
+        differences += usize::from(voxels.voxel_faces[span] != expected);
+    }
+    exact &= differences == 0;
+    println!(
+        "N5_M4_TRIANGLE_INCIDENCE exact={exact} expected_voxels={} actual_voxels={} expected_emissions={} actual_emissions={} different_voxel_relations={differences}",
+        coordinates.shape[0],
+        voxels.sites.coordinates().len(),
+        owners.values.len(),
+        voxels.voxel_faces.len()
+    );
+    Ok(exact)
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen mesh/support/triangle-incidence records"]
+fn hi3d_cascade_mesh_support_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_CASCADE_REFERENCE")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let device = Device::new(0)?;
+    let mut defects = 0;
+    let mut cells = 0;
+    for tag in ["minus", "exact", "plus"] {
+        let path = root.join(format!(
+            "transition-sm86-full-r1/triangle-boundary-{tag}.safetensors"
+        ));
+        let mesh = crate::sparse::SparseMesh {
+            vertices: f32_tensor(&path, "vertices")?,
+            faces: tensor(&path, "faces")?
+                .values
+                .into_iter()
+                .map(|v| v as i32)
+                .collect(),
+        };
+        let (free, _) = device.ctx.mem_get_info()?;
+        let voxels = triangle_voxels(&device, &mesh, 12, 3, usize::MAX, [free, 1 << 30])?;
+        let exact = cascade_incidence_exact(&voxels, &path)?;
+        defects += usize::from(!exact);
+        println!(
+            "{} N5_M4_TRIANGLE_BOUNDARY case={tag} exact={exact}",
+            if exact { "PASS" } else { "DEFECT" }
+        );
+        cells += 1;
+    }
+    for high in [false, true] {
+        let anchor = root.join(if high {
+            "transition1024-sm86-released-r1"
+        } else {
+            "transition-sm86-full-r1"
+        });
+        let metadata: Value = serde_json::from_slice(&std::fs::read(anchor.join("report.json"))?)?;
+        for case in ["open_loop", "cottage", "robot_crab"] {
+            let mesh = cascade_mesh(&root, &prefix, high, case)?;
+            for nominal in if high {
+                &[192u32][..]
+            } else {
+                &[128u32, 192][..]
+            } {
+                let source = &metadata["cases"][case]["voxel"][nominal.to_string()];
+                let expected_grid = source["accepted_grid"]
+                    .as_u64()
+                    .context("accepted reference grid missing")?;
+                let limit = source["budget"]
+                    .as_u64()
+                    .context("reference support budget missing")?
+                    as usize;
+                let (free, total) = device.ctx.mem_get_info()?;
+                let budget = [free, total.min(14 << 30).saturating_sub(total / 32)];
+                let (grid, voxels) =
+                    adaptive_mesh_support(&device, &mesh, *nominal, limit, usize::MAX, budget)?;
+                let exact = grid as u64 == expected_grid
+                    && cascade_incidence_exact(
+                        &voxels,
+                        &anchor.join(format!("{case}-intersections-{nominal}.safetensors")),
+                    )?;
+                defects += usize::from(!exact);
+                let baseline: BTreeSet<_> = voxels.sites.coordinates().iter().copied().collect();
+                let emissions = voxels.voxel_faces.len();
+                drop(voxels);
+                let control = triangle_voxels(&device, &mesh, grid, 0, usize::MAX, budget)?;
+                let wrong: BTreeSet<_> = control.sites.coordinates().iter().copied().collect();
+                let changed = baseline.symmetric_difference(&wrong).count();
+                defects += usize::from(changed == 0);
+                drop(control);
+                if case == "open_loop" {
+                    let short = triangle_voxels(&device, &mesh, grid, 3, emissions - 1, budget);
+                    ensure!(
+                        short
+                            .err()
+                            .is_some_and(|e| e.to_string().starts_with("triangle emission needs")),
+                        "short emission reservation was not rejected before emit"
+                    );
+                }
+                println!(
+                    "{} N5_M4_SUPPORT case={case} high={high} nominal={nominal} accepted_grid={grid} exact={exact} pad0_membership_changes={changed} emissions={emissions}",
+                    if exact && changed > 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                cells += 1;
+            }
+        }
+    }
+    println!(
+        "N5_M4_SUPPORT_GATE cells={cells} defects={defects} short_emission_capacity=rejected timing=false"
+    );
+    ensure!(
+        cells == 12 && defects == 0,
+        "mesh/support finite candidate defects"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires admitted CUDA, high-grid weights and frozen common inputs"]
 fn hi3d_cascade_flow_definition_gpu() -> Result<()> {

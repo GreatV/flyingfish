@@ -3,6 +3,8 @@
 #[path = "pixal3d_tests.rs"]
 mod tests;
 use super::sparse::{BatchGroupNorm, SparseConv};
+pub use super::sparse::{TriangleVoxels, adaptive_mesh_support, triangle_voxels};
+
 use super::{
     Device,
     blas::Blas,
