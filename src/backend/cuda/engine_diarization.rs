@@ -103,7 +103,10 @@ pub struct SpeakerSnapshot {
 
 pub struct Diarization {
     spec: DiarizationSpec,
+    device: Device,
     stream: Arc<CudaStream>,
+    initial_free: usize,
+    device_budget: usize,
     blas: CudaBlas,
     kernels: Kernels,
     embedding: Linear,
@@ -381,7 +384,8 @@ impl Diarization {
         let spec = DiarizationSpec::read(directory)?;
         let frontend = LogMel::new(spec.mel)?;
         let cp = MappedCheckpoint::open(directory)?;
-        let (initial_free, _) = device.ctx.mem_get_info()?;
+        let (initial_free, total) = device.ctx.mem_get_info()?;
+        let device_budget = device.workspace_budget(initial_free, total, total / 16)?;
         let stream = device.stream.clone();
         let blas = CudaBlas::new(stream.clone())?;
         unsafe {
@@ -544,7 +548,10 @@ impl Diarization {
         let states = [state()?, state()?];
         Ok(Self {
             spec,
+            device: device.clone(),
             stream,
+            initial_free,
+            device_budget,
             blas,
             kernels,
             embedding,
@@ -724,6 +731,37 @@ impl Diarization {
             }
         }
         Ok(probs)
+    }
+
+    fn grow_input_capacity(&mut self, rows: usize) -> Result<()> {
+        let hidden = self.spec.hidden as usize;
+        let width = self.spec.factor as usize * self.spec.mel.mel_bins as usize;
+        let current =
+            (self.workspace.input_embeds.len() / hidden).min(self.workspace.features.len() / width);
+        if rows <= current {
+            return Ok(());
+        }
+        let feature_count = rows
+            .checked_mul(width)
+            .context("diarization input feature count overflow")?;
+        let embed_count = rows
+            .checked_mul(hidden)
+            .context("diarization input embedding count overflow")?;
+        let bytes = feature_count
+            .checked_add(embed_count)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .context("diarization input buffer bytes overflow")?;
+        let available = self
+            .device
+            .workspace_budget(self.initial_free, self.device_budget, 0)
+            .context("diarization input buffer budget")?;
+        ensure!(
+            bytes <= available,
+            "diarization input buffers need {bytes} bytes; device budget {available} bytes"
+        );
+        self.workspace.features = self.stream.alloc_zeros(feature_count)?;
+        self.workspace.input_embeds = self.stream.alloc_zeros(embed_count)?;
+        Ok(())
     }
 
     fn embed_features(&mut self, features: &[f32], rows: u32, offset: usize) -> Result<()> {
@@ -1102,6 +1140,7 @@ impl Diarization {
             "diarization offline features"
         );
         let num_embeds = feature_frames.div_ceil(factor);
+        self.grow_input_capacity(num_embeds)?;
         let full_features = stack_features(features, 0, num_embeds, mel_bins, factor)?;
         self.embed_all_features(&full_features, num_embeds as u32)?;
         let mut logits = Vec::with_capacity(feature_frames * speakers);
@@ -2032,6 +2071,93 @@ mod tests {
         ensure!(
             defects == 0,
             "diarization speaker cache has {defects} DEFECTs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and external fixtures"]
+    fn diarization_offline_grows_input_buffers_for_long_recording() -> Result<()> {
+        let model = PathBuf::from(
+            std::env::var_os("FF_DIARIZATION_MODEL").context("diarization model missing")?,
+        );
+        let device = Device::new(0)?;
+        let mut engine = Diarization::load(&model, &device)?;
+        let mel_bins = engine.spec.mel.mel_bins as usize;
+        let factor = engine.spec.factor as usize;
+        let speakers = engine.spec.speakers as usize;
+        let config = engine.spec.offline;
+        let short_frames = (config.frames + config.right) as usize * factor;
+        let long_frames = 40_007;
+        ensure!(
+            long_frames > 40_000
+                && short_frames < long_frames
+                && long_frames.div_ceil(factor) > engine.spec.max_positions as usize,
+            "long-recording control does not exceed the setup capacity"
+        );
+        let mut features = vec![0.0f32; long_frames * mel_bins];
+        for (frame, row) in features.chunks_mut(mel_bins).enumerate() {
+            for (bin, value) in row.iter_mut().enumerate() {
+                let signal = (frame * 7 + bin * 13 + (frame / 19) * 23 + (bin / 29) * 31) % 37;
+                *value = signal as f32 / 37.0 - 0.5;
+            }
+        }
+        let mask: Vec<bool> = (0..long_frames).map(|frame| frame % 41 != 0).collect();
+        let short_features = features[..short_frames * mel_bins].to_vec();
+        let short_mask = mask[..short_frames].to_vec();
+        let first_window = config.frames as usize * factor * speakers;
+        engine.reset_calls();
+        let (short_logits, _) = engine.offline(&short_features, &short_mask, 0)?;
+        ensure!(
+            engine.call_counts().0 == 1,
+            "diarization short clip embedded more than once"
+        );
+        engine.reset_calls();
+        let (long_logits, _) = engine.offline(&features, &mask, 0)?;
+        let windows = long_frames
+            .div_ceil(factor)
+            .div_ceil(config.frames as usize);
+        ensure!(
+            engine.call_counts() == (1, windows as u64),
+            "diarization long recording changed the embedding call count"
+        );
+        ensure!(
+            short_logits.len() == short_frames * speakers
+                && long_logits.len() == long_frames * speakers,
+            "diarization long recording logits extent"
+        );
+        ensure!(
+            short_logits
+                .iter()
+                .chain(&long_logits)
+                .all(|value| value.is_finite()),
+            "diarization long recording produced non-finite logits"
+        );
+        for (index, (short, long)) in short_logits[..first_window]
+            .iter()
+            .zip(&long_logits[..first_window])
+            .enumerate()
+        {
+            ensure!(
+                short.to_bits() == long.to_bits(),
+                "diarization long recording first window differs at logit {index}"
+            );
+        }
+        let mut wrong_features = short_features.clone();
+        wrong_features[..mel_bins]
+            .copy_from_slice(&features[short_frames * mel_bins..(short_frames + 1) * mel_bins]);
+        engine.reset_calls();
+        let (wrong_logits, _) = engine.offline(&wrong_features, &short_mask, 0)?;
+        let differs = wrong_logits[..first_window]
+            .iter()
+            .zip(&short_logits[..first_window])
+            .any(|(left, right)| left.to_bits() != right.to_bits());
+        ensure!(
+            differs,
+            "diarization first window ignored a perturbed leading frame"
+        );
+        println!(
+            "DIARIZATION_LONG_RECORDING_GATE PASS frames={long_frames} windows={windows} first_window_logits={first_window} embedding_calls=1 negative_control=true"
         );
         Ok(())
     }
