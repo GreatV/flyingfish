@@ -2,7 +2,7 @@
 //! tensors of joint_head.safetensors as context views, dims derived from
 //! joint_head_config.json. Forward stages compose shared ops.
 
-use crate::backend::cuda::contracts::Tensor;
+use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use crate::backend::gpu::{CudaStream, DevicePtr};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -350,4 +350,44 @@ pub fn load_joint_weights(
         routing,
         decoder,
     })
+}
+
+/// Per-span row means of a BF16 [rows, width] tensor: F32 accumulation over
+/// each [begin, end) row range, BF16 result rows. Spans are device i32 pairs.
+pub fn mean_span_rows(
+    stream: &Arc<CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    x: &Tensor<bf16, 2>,
+    begins: &cudarc::driver::CudaSlice<i32>,
+    ends: &cudarc::driver::CudaSlice<i32>,
+    out: &mut TensorMut<bf16, 2>,
+    spans: usize,
+) -> Result<()> {
+    use crate::backend::gpu::{DevicePtr, LaunchConfig, PushKernelArg};
+    ensure!(
+        x.shape[1] == out.0.shape[1] && out.0.shape[0] as usize == spans,
+        "mean_span_rows shape mismatch: x={:?} out={:?} spans={spans}",
+        x.shape,
+        out.0.shape
+    );
+    ensure!(
+        x.stride == [u64::from(x.shape[1]), 1],
+        "mean_span_rows needs dense rows"
+    );
+    let width = x.shape[1];
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(&x.ptr)
+            .arg(&begins.device_ptr(stream).0)
+            .arg(&ends.device_ptr(stream).0)
+            .arg(&out.0.ptr)
+            .arg(&(width as i32))
+            .launch(LaunchConfig {
+                grid_dim: (spans as u32, width.div_ceil(256), 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(())
 }

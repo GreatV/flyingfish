@@ -1305,3 +1305,18 @@ extern "C" __global__ void q38_layer_norm_f16_fma(
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
     q38_layer_norm_f32_impl<__half, __half, true>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
+
+// Per-span row mean: x is [rows, width] BF16, spans given by begins/ends
+// (int per span, half-open); out is [spans, width] BF16 with F32 accumulation.
+// grid (spans, ceil(width/256)), block 256.
+extern "C" __global__ void mean_span_rows(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ begins,
+    const int* __restrict__ ends, __nv_bfloat16* __restrict__ out, int width) {
+    const int span = blockIdx.x;
+    const int col = blockIdx.y * 256 + threadIdx.x;
+    if (col >= width) return;
+    const int b = begins[span], e = ends[span];
+    float sum = 0.0f;
+    for (int r = b; r < e; ++r) sum += __bfloat162float(x[(size_t)r * width + col]);
+    out[(size_t)span * width + col] = __float2bfloat16_rn(sum / float(e - b));
+}
