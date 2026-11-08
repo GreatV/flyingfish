@@ -2,70 +2,70 @@
 //! tensors of joint_head.safetensors as context views, dims derived from
 //! joint_head_config.json. Forward stages compose shared ops.
 
-use crate::backend::cuda::contracts::{Tensor, TensorMut};
-use crate::backend::gpu::{CudaStream, DevicePtr};
+use crate::backend::gpu::CudaSlice;
+use crate::backend::gpu::CudaStream;
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
 pub struct RoutingWeights {
-    pub query_norm_w: Tensor<bf16, 1>,
-    pub query_norm_b: Tensor<bf16, 1>,
-    pub memory_norm_w: Tensor<bf16, 1>,
-    pub memory_norm_b: Tensor<bf16, 1>,
-    pub attn_in_proj: Tensor<bf16, 2>,
-    pub attn_in_proj_b: Tensor<bf16, 1>,
-    pub attn_out_proj: Tensor<bf16, 2>,
-    pub attn_out_proj_b: Tensor<bf16, 1>,
-    pub ff0_w: Tensor<bf16, 2>,
-    pub ff0_b: Tensor<bf16, 1>,
-    pub ff3_w: Tensor<bf16, 2>,
-    pub ff3_b: Tensor<bf16, 1>,
-    pub ff_norm_w: Tensor<bf16, 1>,
-    pub ff_norm_b: Tensor<bf16, 1>,
+    pub query_norm_w: Arc<CudaSlice<bf16>>,
+    pub query_norm_b: Arc<CudaSlice<bf16>>,
+    pub memory_norm_w: Arc<CudaSlice<bf16>>,
+    pub memory_norm_b: Arc<CudaSlice<bf16>>,
+    pub attn_in_proj: Arc<CudaSlice<bf16>>,
+    pub attn_in_proj_b: Arc<CudaSlice<bf16>>,
+    pub attn_out_proj: Arc<CudaSlice<bf16>>,
+    pub attn_out_proj_b: Arc<CudaSlice<bf16>>,
+    pub ff0_w: Arc<CudaSlice<bf16>>,
+    pub ff0_b: Arc<CudaSlice<bf16>>,
+    pub ff3_w: Arc<CudaSlice<bf16>>,
+    pub ff3_b: Arc<CudaSlice<bf16>>,
+    pub ff_norm_w: Arc<CudaSlice<bf16>>,
+    pub ff_norm_b: Arc<CudaSlice<bf16>>,
 }
 
 pub struct DecoderWeights {
-    pub self_in_proj: Tensor<bf16, 2>,
-    pub self_in_proj_b: Tensor<bf16, 1>,
-    pub self_out_proj: Tensor<bf16, 2>,
-    pub self_out_proj_b: Tensor<bf16, 1>,
-    pub cross_in_proj: Tensor<bf16, 2>,
-    pub cross_in_proj_b: Tensor<bf16, 1>,
-    pub cross_out_proj: Tensor<bf16, 2>,
-    pub cross_out_proj_b: Tensor<bf16, 1>,
-    pub norm1_w: Tensor<bf16, 1>,
-    pub norm1_b: Tensor<bf16, 1>,
-    pub norm2_w: Tensor<bf16, 1>,
-    pub norm2_b: Tensor<bf16, 1>,
-    pub norm3_w: Tensor<bf16, 1>,
-    pub norm3_b: Tensor<bf16, 1>,
-    pub linear1_w: Tensor<bf16, 2>,
-    pub linear1_b: Tensor<bf16, 1>,
-    pub linear2_w: Tensor<bf16, 2>,
-    pub linear2_b: Tensor<bf16, 1>,
+    pub self_in_proj: Arc<CudaSlice<bf16>>,
+    pub self_in_proj_b: Arc<CudaSlice<bf16>>,
+    pub self_out_proj: Arc<CudaSlice<bf16>>,
+    pub self_out_proj_b: Arc<CudaSlice<bf16>>,
+    pub cross_in_proj: Arc<CudaSlice<bf16>>,
+    pub cross_in_proj_b: Arc<CudaSlice<bf16>>,
+    pub cross_out_proj: Arc<CudaSlice<bf16>>,
+    pub cross_out_proj_b: Arc<CudaSlice<bf16>>,
+    pub norm1_w: Arc<CudaSlice<bf16>>,
+    pub norm1_b: Arc<CudaSlice<bf16>>,
+    pub norm2_w: Arc<CudaSlice<bf16>>,
+    pub norm2_b: Arc<CudaSlice<bf16>>,
+    pub norm3_w: Arc<CudaSlice<bf16>>,
+    pub norm3_b: Arc<CudaSlice<bf16>>,
+    pub linear1_w: Arc<CudaSlice<bf16>>,
+    pub linear1_b: Arc<CudaSlice<bf16>>,
+    pub linear2_w: Arc<CudaSlice<bf16>>,
+    pub linear2_b: Arc<CudaSlice<bf16>>,
 }
 
 pub struct JointWeights {
-    pub hidden_norm_w: Tensor<bf16, 1>,
-    pub hidden_norm_b: Tensor<bf16, 1>,
-    pub memory_proj: Tensor<bf16, 2>,
-    pub question_proj: Tensor<bf16, 2>,
-    pub option_question_proj: Tensor<bf16, 2>,
-    pub global_proj: Tensor<bf16, 2>,
-    pub option_context_proj: Tensor<bf16, 2>,
-    pub option_lexical_proj: Tensor<bf16, 2>,
-    pub type_embedding: Tensor<bf16, 2>,
-    pub field_norm_w: Tensor<bf16, 1>,
-    pub field_norm_b: Tensor<bf16, 1>,
-    pub option_norm_w: Tensor<bf16, 1>,
-    pub option_norm_b: Tensor<bf16, 1>,
-    pub option_summary_norm_w: Tensor<bf16, 1>,
-    pub option_summary_norm_b: Tensor<bf16, 1>,
-    pub scorer0_w: Tensor<bf16, 2>,
-    pub scorer0_b: Tensor<bf16, 1>,
-    pub scorer3_w: Tensor<bf16, 2>,
-    pub scorer3_b: Tensor<bf16, 1>,
+    pub hidden_norm_w: Arc<CudaSlice<bf16>>,
+    pub hidden_norm_b: Arc<CudaSlice<bf16>>,
+    pub memory_proj: Arc<CudaSlice<bf16>>,
+    pub question_proj: Arc<CudaSlice<bf16>>,
+    pub option_question_proj: Arc<CudaSlice<bf16>>,
+    pub global_proj: Arc<CudaSlice<bf16>>,
+    pub option_context_proj: Arc<CudaSlice<bf16>>,
+    pub option_lexical_proj: Arc<CudaSlice<bf16>>,
+    pub type_embedding: Arc<CudaSlice<bf16>>,
+    pub field_norm_w: Arc<CudaSlice<bf16>>,
+    pub field_norm_b: Arc<CudaSlice<bf16>>,
+    pub option_norm_w: Arc<CudaSlice<bf16>>,
+    pub option_norm_b: Arc<CudaSlice<bf16>>,
+    pub option_summary_norm_w: Arc<CudaSlice<bf16>>,
+    pub option_summary_norm_b: Arc<CudaSlice<bf16>>,
+    pub scorer0_w: Arc<CudaSlice<bf16>>,
+    pub scorer0_b: Arc<CudaSlice<bf16>>,
+    pub scorer3_w: Arc<CudaSlice<bf16>>,
+    pub scorer3_b: Arc<CudaSlice<bf16>>,
     pub prior_logit_scale: f32,
     pub joint_logit_scale: f32,
     pub residual_gate: f32,
@@ -79,7 +79,7 @@ pub fn upload2(
     name: &str,
     shape: [usize; 2],
     stream: &Arc<CudaStream>,
-) -> Result<Tensor<bf16, 2>> {
+) -> Result<Arc<CudaSlice<bf16>>> {
     let t = view.tensor(name)?;
     ensure!(
         t.dtype() == safetensors::Dtype::BF16 && t.shape() == shape,
@@ -89,20 +89,14 @@ pub fn upload2(
     );
     let host: Vec<bf16> = t
         .data()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let mut dev = stream.alloc_zeros::<bf16>(shape[0] * shape[1])?;
     stream.memcpy_htod(&host, &mut dev)?;
-    let (ptr, _) = dev.device_ptr(stream);
-    unsafe {
-        Tensor::new(
-            ptr,
-            [shape[0] as u32, shape[1] as u32],
-            [shape[1] as u64, 1],
-            (shape[0] * shape[1]) as u64,
-        )
-    }
+    Ok(Arc::new(dev))
 }
 
 /// Uploads one BF16 [n] tensor from the published file.
@@ -111,7 +105,7 @@ pub fn upload1(
     name: &str,
     n: usize,
     stream: &Arc<CudaStream>,
-) -> Result<Tensor<bf16, 1>> {
+) -> Result<Arc<CudaSlice<bf16>>> {
     let t = view.tensor(name)?;
     ensure!(
         t.dtype() == safetensors::Dtype::BF16 && t.shape() == [n],
@@ -121,13 +115,14 @@ pub fn upload1(
     );
     let host: Vec<bf16> = t
         .data()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let mut dev = stream.alloc_zeros::<bf16>(n)?;
     stream.memcpy_htod(&host, &mut dev)?;
-    let (ptr, _) = dev.device_ptr(stream);
-    unsafe { Tensor::new(ptr, [n as u32], [1], n as u64) }
+    Ok(Arc::new(dev))
 }
 
 /// Reads one BF16 scalar from the published file.
@@ -352,42 +347,209 @@ pub fn load_joint_weights(
     })
 }
 
-/// Per-span row means of a BF16 [rows, width] tensor: F32 accumulation over
+/// Span-mean operands: the source rows, the device span bounds and the
+/// destination, with the derived widths.
+pub struct SpanMean<'a> {
+    pub x: &'a CudaSlice<bf16>,
+    pub begins: &'a CudaSlice<i32>,
+    pub ends: &'a CudaSlice<i32>,
+    pub out: &'a mut CudaSlice<bf16>,
+    pub spans: usize,
+    pub width: usize,
+}
+
+/// Per-span row means of a BF16 [rows, width] slice: F32 accumulation over
 /// each [begin, end) row range, BF16 result rows. Spans are device i32 pairs.
 pub fn mean_span_rows(
     stream: &Arc<CudaStream>,
     kernel: &cudarc::driver::CudaFunction,
-    x: &Tensor<bf16, 2>,
-    begins: &cudarc::driver::CudaSlice<i32>,
-    ends: &cudarc::driver::CudaSlice<i32>,
-    out: &mut TensorMut<bf16, 2>,
-    spans: usize,
+    m: SpanMean<'_>,
 ) -> Result<()> {
     use crate::backend::gpu::{DevicePtr, LaunchConfig, PushKernelArg};
+    let SpanMean {
+        x,
+        begins,
+        ends,
+        out,
+        spans,
+        width,
+    } = m;
     ensure!(
-        x.shape[1] == out.0.shape[1] && out.0.shape[0] as usize == spans,
-        "mean_span_rows shape mismatch: x={:?} out={:?} spans={spans}",
-        x.shape,
-        out.0.shape
+        x.len() >= begins.len() * width
+            && out.len() == spans * width
+            && begins.len() == spans
+            && ends.len() == spans,
+        "mean_span_rows extent mismatch: x={} spans={spans} width={width} out={}",
+        x.len(),
+        out.len()
     );
-    ensure!(
-        x.stride == [u64::from(x.shape[1]), 1],
-        "mean_span_rows needs dense rows"
-    );
-    let width = x.shape[1];
     unsafe {
         stream
             .launch_builder(kernel)
-            .arg(&x.ptr)
+            .arg(&x.device_ptr(stream).0)
             .arg(&begins.device_ptr(stream).0)
             .arg(&ends.device_ptr(stream).0)
-            .arg(&out.0.ptr)
+            .arg(&out.device_ptr(stream).0)
             .arg(&(width as i32))
             .launch(LaunchConfig {
-                grid_dim: (spans as u32, width.div_ceil(256), 1),
+                grid_dim: (spans as u32, width.div_ceil(256) as u32, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    /// Loads the published joint-head weights and asserts the full census:
+    /// every tensor's element count and the three scalar gates.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL"]
+    fn joint_weights_load_census() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir =
+            std::path::PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let dev = crate::backend::cuda::Device::new(0)?;
+        let w = load_joint_weights(&dir, &dev.stream)?;
+        let ln1 = |t: &CudaSlice<bf16>| t.len() == 1024;
+        let ln4096 = |t: &CudaSlice<bf16>| t.len() == 4096;
+        let p2 = |t: &CudaSlice<bf16>| t.len() == 1024 * 4096;
+        ensure!(
+            ln4096(&w.hidden_norm_w) && ln4096(&w.hidden_norm_b),
+            "hidden_norm"
+        );
+        ensure!(p2(&w.memory_proj), "memory_proj");
+        ensure!(
+            p2(&w.question_proj) && p2(&w.option_question_proj),
+            "q/oq proj"
+        );
+        ensure!(
+            p2(&w.global_proj) && p2(&w.option_context_proj),
+            "g/ctx proj"
+        );
+        ensure!(p2(&w.option_lexical_proj), "lex proj");
+        ensure!(w.type_embedding.len() == 3 * 1024, "type_embedding");
+        ensure!(ln1(&w.field_norm_w) && ln1(&w.field_norm_b), "field_norm");
+        ensure!(
+            ln1(&w.option_norm_w) && ln1(&w.option_norm_b),
+            "option_norm"
+        );
+        ensure!(
+            ln1(&w.option_summary_norm_w) && ln1(&w.option_summary_norm_b),
+            "option_summary_norm"
+        );
+        ensure!(p2(&w.scorer0_w) && w.scorer0_b.len() == 1024, "scorer0");
+        ensure!(
+            w.scorer3_w.len() == 1024 && w.scorer3_b.len() == 1,
+            "scorer3"
+        );
+        for r in &w.routing {
+            ensure!(
+                ln1(&r.query_norm_w) && ln1(&r.query_norm_b),
+                "routing qnorm"
+            );
+            ensure!(
+                ln1(&r.memory_norm_w) && ln1(&r.memory_norm_b),
+                "routing mnorm"
+            );
+            ensure!(r.attn_in_proj.len() == 3072 * 1024, "routing in_proj");
+            ensure!(r.attn_in_proj_b.len() == 3072, "routing in_proj bias");
+            ensure!(r.attn_out_proj.len() == 1024 * 1024, "routing out_proj");
+            ensure!(r.attn_out_proj_b.len() == 1024, "routing out bias");
+            ensure!(
+                r.ff0_w.len() == 4096 * 1024 && r.ff0_b.len() == 4096,
+                "routing ff0"
+            );
+            ensure!(
+                r.ff3_w.len() == 1024 * 4096 && r.ff3_b.len() == 1024,
+                "routing ff3"
+            );
+            ensure!(ln1(&r.ff_norm_w) && ln1(&r.ff_norm_b), "routing ffnorm");
+        }
+        for d in &w.decoder {
+            ensure!(d.self_in_proj.len() == 3072 * 1024, "dec self in_proj");
+            ensure!(d.self_in_proj_b.len() == 3072, "dec self bias");
+            ensure!(d.self_out_proj.len() == 1024 * 1024, "dec self out");
+            ensure!(d.self_out_proj_b.len() == 1024, "dec self out bias");
+            ensure!(d.cross_in_proj.len() == 3072 * 1024, "dec cross in");
+            ensure!(d.cross_in_proj_b.len() == 3072, "dec cross bias");
+            ensure!(d.cross_out_proj.len() == 1024 * 1024, "dec cross out");
+            ensure!(d.cross_out_proj_b.len() == 1024, "dec cross out bias");
+            ensure!(ln1(&d.norm1_w) && ln1(&d.norm1_b), "dec norm1");
+            ensure!(ln1(&d.norm2_w) && ln1(&d.norm2_b), "dec norm2");
+            ensure!(ln1(&d.norm3_w) && ln1(&d.norm3_b), "dec norm3");
+            ensure!(d.linear1_w.len() == 4096 * 1024, "dec lin1");
+            ensure!(d.linear1_b.len() == 4096, "dec lin1 bias");
+            ensure!(d.linear2_w.len() == 1024 * 4096, "dec lin2");
+            ensure!(d.linear2_b.len() == 1024, "dec lin2 bias");
+        }
+        ensure!(w.routing.len() == 2 && w.decoder.len() == 4, "layer counts");
+        println!(
+            "JOINT_CENSUS routing={} decoder={} scales p={:.4} j={:.4} g={:.4}",
+            w.routing.len(),
+            w.decoder.len(),
+            w.prior_logit_scale,
+            w.joint_logit_scale,
+            w.residual_gate
+        );
+        Ok(())
+    }
+
+    /// mean_span_rows against a host reference on synthetic spans.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window"]
+    fn mean_span_rows_matches_host() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dev = crate::backend::cuda::Device::new(0)?;
+        let stream = &dev.stream;
+        let rows = 12usize;
+        let width = 320usize;
+        let host: Vec<bf16> = (0..rows * width)
+            .map(|i| bf16::from_f32(((i * 37) % 199) as f32 / 199.0))
+            .collect();
+        let begins = vec![0i32, 5, 11];
+        let ends = vec![5i32, 11, 12];
+        let spans = begins.len();
+        let mut x = stream.alloc_zeros::<bf16>(rows * width)?;
+        stream.memcpy_htod(&host, &mut x)?;
+        let mut b = stream.alloc_zeros::<i32>(spans)?;
+        stream.memcpy_htod(&begins, &mut b)?;
+        let mut e = stream.alloc_zeros::<i32>(spans)?;
+        stream.memcpy_htod(&ends, &mut e)?;
+        let mut out = stream.alloc_zeros::<bf16>(spans * width)?;
+        let module = crate::backend::cuda::cubin::module(&dev.ctx, "q38_common")?;
+        let kernel = module.load_function("mean_span_rows")?;
+        mean_span_rows(
+            stream,
+            &kernel,
+            SpanMean {
+                x: &x,
+                begins: &b,
+                ends: &e,
+                out: &mut out,
+                spans,
+                width,
+            },
+        )?;
+        let got = stream.clone_dtoh(&out)?;
+        for (s, (bs, en)) in begins.iter().zip(ends.iter()).enumerate() {
+            for c in 0..width {
+                let sum: f32 = (*bs as usize..*en as usize)
+                    .map(|r| host[r * width + c].to_f32())
+                    .sum();
+                let want = bf16::from_f32(sum / (en - bs) as f32);
+                ensure!(
+                    got[s * width + c].to_bits() == want.to_bits(),
+                    "span {s} col {c} mismatch"
+                );
+            }
+        }
+        println!("MEAN_SPAN_ROWS ok spans={spans} width={width}");
+        let _ = (&mut x, &mut b, &mut e);
+        Ok(())
+    }
 }

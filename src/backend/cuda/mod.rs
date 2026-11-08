@@ -33,6 +33,8 @@ pub mod gated_residual;
 pub(crate) mod gdn;
 pub mod hc;
 pub mod index_score;
+#[cfg(all(test, feature = "cuda"))]
+mod joint_schema;
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 mod kv_cache_tests;
