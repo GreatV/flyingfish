@@ -3050,19 +3050,40 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "loads official GLM and compares 256 generated tokens with and without MTP"]
+#[ignore = "official GLM greedy continuation, frozen shared-prefix tolerance and exact verify commits"]
 fn glm_mtp_greedy_256_gpu() -> Result<()> {
     let root =
         PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
     let reference = Reference::load(&root)?;
     let prompt = &reference.tokens[..33];
+    let ref_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MTP_REF_DIR").context("MTP reference missing")?);
+    let thresholds: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ref_dir.join("verify_thresholds.json"))?)?;
+    let tau: Vec<f32> = serde_json::from_value(thresholds["tau_max_abs_per_position"].clone())?;
+    ensure!(
+        tau.len() >= prompt.len() + 255 && tau.iter().all(|&t| t > 0.0 && (2.0 * t).is_finite()),
+        "Runner FAIL frozen verify tolerance extent or values"
+    );
     let mut engine = load_composition_engine()?;
     let mut baseline = vec![engine.prefill(prompt, None)?];
-    let mut baseline_margins = vec![super::mtp::top1_and_margin(&engine.decode_logits()?).1];
-    while baseline.len() < 256 {
+    let mut baseline_logits = Vec::with_capacity(256);
+    loop {
+        let logits = engine.decode_logits()?;
+        ensure!(
+            logits.len() == 154880 && logits.iter().all(|v| v.is_finite()),
+            "Runner FAIL ordinary logit extent or nonfinite values"
+        );
+        baseline_logits.push(logits);
+        if baseline.len() == 256 {
+            break;
+        }
         baseline.push(engine.decode(false, None)?);
-        baseline_margins.push(super::mtp::top1_and_margin(&engine.decode_logits()?).1);
     }
+    let baseline_margins: Vec<_> = baseline_logits
+        .iter()
+        .map(|logits| super::mtp::top1_and_margin(logits).1)
+        .collect();
     println!("GLM_MTP_FREE_BASELINE ids={baseline:?} margins={baseline_margins:?}");
     std::io::stdout().flush()?;
     drop(engine);
@@ -3073,14 +3094,104 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
         recurrent_tap: MtpRecurrentTap::PreMtpNorm,
         graph: false,
     })?;
+    let mut shared_prefix = true;
+    let mut compared = 0usize;
+    let mut id_required = 0usize;
+    let mut near_ties = 0usize;
+    let mut first_divergence = None;
+    let mut logit_defects = 0usize;
+    let mut id_defects = 0usize;
+    let mut max_logit_ratio = 0.0f32;
+    let mut compare = |index: usize, token: u32, logits: &[f32]| -> Result<()> {
+        if !shared_prefix {
+            return Ok(());
+        }
+        let plain = &baseline_logits[index];
+        ensure!(
+            logits.len() == plain.len() && logits.iter().all(|v| v.is_finite()),
+            "Runner FAIL verify logit extent or nonfinite values"
+        );
+        let position = prompt.len() - 1 + index;
+        let bound = tau[position];
+        let max_abs = logits
+            .iter()
+            .zip(plain)
+            .map(|(v, p)| (v - p).abs())
+            .fold(0.0f32, f32::max);
+        let required = baseline_margins[index] > 2.0 * bound;
+        let mismatch = token != baseline[index];
+        compared += 1;
+        id_required += usize::from(required);
+        near_ties += usize::from(!required);
+        logit_defects += usize::from(max_abs > bound);
+        id_defects += usize::from(required && mismatch);
+        max_logit_ratio = max_logit_ratio.max(max_abs / bound);
+        println!(
+            "GLM_MTP_SHARED_PREFIX index={index} input_position={position} max_abs={max_abs} tau={bound} plain_margin={} id_required={required} id_mismatch={mismatch}",
+            baseline_margins[index],
+        );
+        if mismatch {
+            first_divergence = Some(index);
+            shared_prefix = false;
+            println!(
+                "{} GLM_MTP_FREE_FIRST index={index} position={} eager_id={} mtp_id={token} eager_margin={} mtp_margin={} tau={bound}",
+                if required { "DEFECT" } else { "NEAR_TIE" },
+                position + 1,
+                baseline[index],
+                baseline_margins[index],
+                super::mtp::top1_and_margin(logits).1,
+            );
+        }
+        Ok(())
+    };
+    let check_commit =
+        |tokens: &[u32], accepted: usize, proposal: u32, verify: [&[f32]; 2]| -> Result<()> {
+            let [v0, v1] = verify.map(|logits| super::mtp::top1_and_margin(logits).0);
+            let expected = usize::from(proposal == v0);
+            ensure!(
+                accepted == expected
+                    && tokens.len() == 1 + expected
+                    && tokens[0] == v0
+                    && (expected == 0 || tokens[1] == v1),
+                "DEFECT wrong-token commit against own verify numerics"
+            );
+            Ok(())
+        };
     let mut speculative = vec![engine.mtp_prefill(prompt)?];
-    let mut speculative_margins = vec![super::mtp::top1_and_margin(&engine.decode_logits()?).1];
+    let initial = engine.decode_logits()?;
+    let mut speculative_margins = vec![super::mtp::top1_and_margin(&initial).1];
+    compare(0, speculative[0], &initial)?;
     let mut rounds = 0usize;
     let mut accepted = 0usize;
+    let mut commit_defects = 0usize;
+    let mut wrong_commit_detected = false;
     while speculative.len() < 256 {
         let out = engine.glm_mtp_round(true)?;
+        let verify = [&out.verify_row0_logits[..], &out.verify_row1_logits[..]];
+        ensure!(
+            out.round.proposals.len() == 1
+                && (1..=2).contains(&out.round.tokens.len())
+                && verify
+                    .iter()
+                    .all(|v| v.len() == 154880 && v.iter().all(|value| value.is_finite())),
+            "Runner FAIL GLM verify round extent or nonfinite values"
+        );
         rounds += 1;
         accepted += out.round.accepted;
+        let proposal = out.round.proposals[0];
+        if let Err(error) = check_commit(&out.round.tokens, out.round.accepted, proposal, verify) {
+            commit_defects += 1;
+            println!("{error}");
+        }
+        if !wrong_commit_detected && proposal != super::mtp::top1_and_margin(verify[0]).0 {
+            let v1 = super::mtp::top1_and_margin(verify[1]).0;
+            wrong_commit_detected = check_commit(&[proposal, v1], 1, proposal, verify).is_err();
+            ensure!(
+                wrong_commit_detected,
+                "Runner FAIL rejected-draft commit control escaped"
+            );
+            println!("PASS GLM_MTP_WRONG_COMMIT_CONTROL round={rounds} proposal={proposal}");
+        }
         println!(
             "GLM_MTP_FREE_ROUND round={rounds} pos={} accepted={} draft={:?} tokens={:?} margins=[{},{}]",
             out.start_pos,
@@ -3094,6 +3205,7 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
             if speculative.len() == 256 {
                 break;
             }
+            compare(speculative.len(), token, verify[index])?;
             speculative.push(token);
             speculative_margins.push(if index == 0 {
                 out.v0_margin
@@ -3103,28 +3215,21 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
         }
         std::io::stdout().flush()?;
     }
-    let differing = baseline
-        .iter()
-        .zip(&speculative)
-        .filter(|(a, b)| a != b)
-        .count();
-    let first = baseline.iter().zip(&speculative).position(|(a, b)| a != b);
-    println!("GLM_MTP_FREE_SPECULATIVE ids={speculative:?} margins={speculative_margins:?}");
-    if let Some(index) = first {
-        println!(
-            "DEFECT GLM_MTP_FREE_FIRST index={index} position={} eager_id={} mtp_id={} eager_margin={} mtp_margin={}",
-            prompt.len() + index,
-            baseline[index],
-            speculative[index],
-            baseline_margins[index],
-            speculative_margins[index],
-        );
-    }
-    println!(
-        "{} GLM_MTP_FREE_256 tokens=256 different_ids={differing} rounds={rounds} accepted={accepted} eos_ignored=true",
-        if differing == 0 { "PASS" } else { "DEFECT" },
+    ensure!(
+        wrong_commit_detected,
+        "Runner FAIL no rejected draft for commit control"
     );
-    ensure!(differing == 0, "DEFECT GLM MTP free-running token mismatch");
+    let defects = logit_defects + id_defects + commit_defects;
+    println!("GLM_MTP_FREE_SPECULATIVE ids={speculative:?} margins={speculative_margins:?}");
+    println!(
+        "{} GLM_MTP_FREE_256 tokens=256 shared_prefix_positions={compared} id_required={id_required} near_ties={near_ties} first_divergence={first_divergence:?} unpaired_positions={} max_logit_ratio={max_logit_ratio} logit_defects={logit_defects} id_defects={id_defects} commit_defects={commit_defects} wrong_token_commit_detected={wrong_commit_detected} rounds={rounds} accepted={accepted} eos_ignored=true tau_source=verify_thresholds.json",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        256 - compared,
+    );
+    ensure!(
+        defects == 0,
+        "DEFECT GLM MTP shared-prefix or verify-commit contract"
+    );
     Ok(())
 }
 
