@@ -1,13 +1,13 @@
 // Fused RoPE rotation + KV-cache write (chain/decode); bitwise-identical to
 // rope followed by kv_write.
-// __trap() unless q_heads == 16, kv_heads == 2, dim == 128, theta
-// finite and > 0, rows >= 1, and 0 <= *start <= capacity - rows.
+// __trap() unless q_heads and kv_heads are positive, dim is positive and even,
+// theta finite and > 0, rows >= 1, and 0 <= *start <= capacity - rows.
 #include "gpu_compat.cuh"
 
 namespace rope_kv_guard {
 __device__ __forceinline__ void shape(int rows, int q_heads, int kv_heads,
                                       int dim, float theta) {
-    if (q_heads != 16 || kv_heads != 2 || dim != 128) __trap();
+    if (q_heads < 1 || kv_heads < 1 || dim < 2 || (dim & 1)) __trap();
     if (!(theta > 0.f) || !isfinite(theta)) __trap();
     if (rows < 1) __trap();
 }

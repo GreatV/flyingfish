@@ -13,9 +13,9 @@
 //     ids uint32[rows] (tree: tokens).
 //   * grid = (rows,1,1), block = (256,1,1), smem 128 B static; blocks past
 //     the valid rows return before any write.
-//   * __trap() when: hidden != 2048, rows < 1, eps negative or not
-//     finite, any null buffer, blockDim.x not a multiple of 32 or outside
-//     [32,1024]. The tree entry additionally requires:
+//   * __trap() when: hidden is not a positive multiple of kVec (8), rows < 1,
+//     eps negative or not finite, any null buffer, blockDim.x not a multiple
+//     of 32 or outside [32,1024]. The tree entry additionally requires:
 //     valid_rows in [1,64], budget in [1,64], valid_rows <= budget,
 //     *prefix in [0, capacity-budget], *prefix == *expected, depth[row] in
 //     [0,7] for valid rows, gridDim.x >= valid_rows.
@@ -26,12 +26,11 @@ namespace embed_norm {
 
 using bf16 = __nv_bfloat16;
 
-constexpr int kHidden = 2048;      // hidden_size
 constexpr int kVec = 8;            // bf16 elements per 16 B access
 constexpr int kMaxPerThread = 8;   // elements cached per thread in registers
 
 __device__ __forceinline__ void shape(int rows, int hidden, float eps, unsigned nthr) {
-    if (hidden != kHidden) __trap();
+    if (hidden < kVec || (hidden & (kVec - 1))) __trap();
     if (rows < 1) __trap();
     if (!(eps >= 0.f) || !isfinite(eps)) __trap();
     if (nthr < 32u || nthr > 1024u || (nthr & 31u)) __trap();
@@ -79,7 +78,7 @@ __device__ __forceinline__ void st_vec8(bf16* __restrict__ p, const float* __res
 }
 
 // One block per row: gather the table row at `src` into x[row] and write
-// rmsnorm(x[row], w) into y[row]. n == hidden (the guard pins it to 2048).
+// rmsnorm(x[row], w) into y[row]. n == hidden.
 __device__ __forceinline__ void gather_norm_row(const bf16* __restrict__ src,
                                                 const bf16* __restrict__ w,
                                                 bf16* __restrict__ x, bf16* __restrict__ y,

@@ -1,4 +1,4 @@
-// BF16 residual capture with standard RMSNorm (mode 0); hidden 2048 or 5120.
+// BF16 residual capture with standard RMSNorm (mode 0); hidden a positive multiple of kVec (8).
 #include "gpu_compat.cuh"
 #include "q38_contract.cuh"
 
@@ -6,12 +6,11 @@ namespace add_norm_capture {
 
 using bf16 = __nv_bfloat16;
 
-constexpr int kHidden = 2048;
 constexpr int kVec = 8;            // bf16 elements per 16 B access
 constexpr int kMaxPerThread = 8;   // elements cached per thread in registers
 
 __device__ __forceinline__ void shape(int rows, int hidden, float eps, unsigned nthr) {
-    if (hidden != kHidden && hidden != 5120) __trap();
+    if (hidden < kVec || (hidden & (kVec - 1))) __trap();
     if (rows < 1) __trap();
     if (!(eps >= 0.f) || !isfinite(eps)) __trap();
     if (nthr < 32u || nthr > 1024u || (nthr & 31u)) __trap();

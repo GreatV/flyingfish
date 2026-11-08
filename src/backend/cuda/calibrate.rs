@@ -65,11 +65,26 @@ impl Occupancy {
     }
 }
 
+// Decode phase 1 packs q_heads_per_block query heads onto one KV head; qpack must
+// divide the GQA ratio. GQA divisible by 4 keeps the [2, 4] lattice unchanged.
 #[cfg(feature = "cuda")]
-fn plans(bucket: usize) -> Vec<AttentionPlan> {
+fn qpack_candidates(gqa: usize) -> Vec<usize> {
+    let candidates: Vec<usize> = [2, 4]
+        .into_iter()
+        .filter(|q| gqa.is_multiple_of(*q))
+        .collect();
+    if candidates.is_empty() {
+        vec![1]
+    } else {
+        candidates
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn plans(bucket: usize, gqa: usize) -> Vec<AttentionPlan> {
     let mut plans = Vec::new();
     for &chunk in attention_chunks(bucket) {
-        for qpack in [2, 4] {
+        for qpack in qpack_candidates(gqa) {
             for threads in [128, 256] {
                 for merge_threads in [256, 512] {
                     plans.push(AttentionPlan {
@@ -201,10 +216,10 @@ fn rank(t: &Trial) -> (f64, f64, usize) {
 }
 
 #[cfg(feature = "cuda")]
-fn check(cache: &Cache, key: &CacheKey, capacity: usize) -> Result<()> {
+fn check(cache: &Cache, key: &CacheKey, capacity: usize, gqa: usize, q_heads: usize) -> Result<()> {
     let bucket = attention_bucket(capacity)?;
     let evaluation_lengths = attention_lengths(capacity, 0)?;
-    let expected = plans(bucket);
+    let expected = plans(bucket, gqa);
     let filtered = bucket >= 3;
     ensure!(
         cache.schema == 3
@@ -237,7 +252,7 @@ fn check(cache: &Cache, key: &CacheKey, capacity: usize) -> Result<()> {
             ensure!(records.len() == 1, "missing or duplicate phase1 occupancy");
             let o = records[0];
             ensure!(
-                o.blocks == capacity.div_ceil(plan.chunk) * (16 / plan.qpack)
+                o.blocks == capacity.div_ceil(plan.chunk) * (q_heads / plan.qpack)
                     && o.active_per_sm > 0,
                 "invalid phase1 occupancy record"
             );
@@ -295,13 +310,15 @@ pub(super) fn load(
     closure: &super::closure::Closure,
 ) -> Result<Calibrated> {
     let bucket = attention_bucket(capacity)?;
+    let gqa = c.num_attention_heads / c.num_key_value_heads;
+    let q_heads = c.num_attention_heads;
     let key = d.key.clone();
     let path = cache_path(dir, &key, bucket, capacity);
     let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)
             .with_context(|| format!("read calibration cache {}", path.display()))?;
         ensure!(cache.sms == d.info.sms, "attention cache SM count mismatch");
-        check(&cache, &key, capacity)?;
+        check(&cache, &key, capacity, gqa, q_heads)?;
         (cache, true)
     } else {
         eprintln!(
@@ -310,7 +327,7 @@ pub(super) fn load(
         );
         let cache =
             measure(d, ops, c, key, capacity, closure).context("measure attention candidates")?;
-        check(&cache, &cache.key, capacity)?;
+        check(&cache, &cache.key, capacity, gqa, q_heads)?;
         super::closure::write_cache(&path, &cache)?;
         (cache, false)
     };
@@ -318,14 +335,20 @@ pub(super) fn load(
 }
 
 #[cfg(feature = "cuda")]
-pub(super) fn load_recorded(d: &Device, dir: &Path, capacity: usize) -> Result<Calibrated> {
+pub(super) fn load_recorded(
+    d: &Device,
+    dir: &Path,
+    capacity: usize,
+    gqa: usize,
+    q_heads: usize,
+) -> Result<Calibrated> {
     let bucket = attention_bucket(capacity)?;
     let key = d.key.clone();
     let path = cache_path(dir, &key, bucket, capacity);
     let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)
         .with_context(|| format!("read calibration cache {}", path.display()))?;
     ensure!(cache.sms == d.info.sms, "attention cache SM count mismatch");
-    check(&cache, &key, capacity)?;
+    check(&cache, &key, capacity, gqa, q_heads)?;
     Ok(Calibrated {
         cache,
         hit: true,
@@ -440,13 +463,14 @@ fn measure(
             }
         }
         let mut best = (f64::INFINITY, f64::INFINITY, usize::MAX);
-        for plan in plans(bucket) {
+        let gqa = c.num_attention_heads / c.num_key_value_heads;
+        for plan in plans(bucket, gqa) {
             let chunk = plan.chunk;
             let mut attention = Attention::candidate(&d.ctx, s, c, capacity, plan, false)?;
             if bucket >= 3 {
                 let record = Occupancy {
                     plan,
-                    blocks: capacity.div_ceil(chunk) * (16 / plan.qpack),
+                    blocks: capacity.div_ceil(chunk) * (c.num_attention_heads / plan.qpack),
                     active_per_sm: attention
                         .phase1_blocks_per_sm()
                         .context("query decode phase1 occupancy")?,
@@ -2506,7 +2530,45 @@ mod long_tests {
 
     #[test]
     #[cfg(feature = "cuda")]
+    fn qpack_candidates_derive_from_gqa_ratio() {
+        assert_eq!(qpack_candidates(8), vec![2, 4]);
+        assert_eq!(qpack_candidates(4), vec![2, 4]);
+        assert_eq!(qpack_candidates(16), vec![2, 4]);
+        assert_eq!(qpack_candidates(2), vec![2]);
+        assert_eq!(qpack_candidates(7), vec![1]);
+        assert_eq!(qpack_candidates(1), vec![1]);
+        for bucket in 0..crate::backend::setup::ATTENTION_CAPACITIES.len() {
+            let mut baseline = Vec::new();
+            for &chunk in attention_chunks(bucket) {
+                for qpack in [2, 4] {
+                    for threads in [128, 256] {
+                        for merge_threads in [256, 512] {
+                            baseline.push(AttentionPlan {
+                                chunk,
+                                qpack,
+                                threads,
+                                merge_threads,
+                            });
+                        }
+                    }
+                }
+            }
+            assert_eq!(plans(bucket, 8), baseline, "GQA 8 baseline unchanged");
+            let gqa7 = plans(bucket, 7);
+            assert_eq!(
+                gqa7.len(),
+                baseline.len() / 2,
+                "GQA 7 has one candidate set"
+            );
+            assert!(gqa7.iter().all(|p| p.qpack == 1), "GQA 7 admits only QP=1");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
     fn cache_requires_measured_bucket_and_complete_candidates() -> Result<()> {
+        let gqa = 8usize;
+        let q_heads = 16usize;
         assert_eq!(
             driver_release(
                 "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64 595.99.02 Release Build"
@@ -2529,11 +2591,11 @@ mod long_tests {
             };
             let mut trials = Vec::new();
             let mut phase1 = Vec::new();
-            for plan in plans(bucket) {
+            for plan in plans(bucket, gqa) {
                 if bucket >= 3 {
                     let o = Occupancy {
                         plan,
-                        blocks: capacity.div_ceil(plan.chunk) * (16 / plan.qpack),
+                        blocks: capacity.div_ceil(plan.chunk) * (q_heads / plan.qpack),
                         active_per_sm: 8,
                     };
                     let fits = o.fits(128);
@@ -2567,28 +2629,28 @@ mod long_tests {
                 phase1,
                 wall_ms: 1.0,
             };
-            check(&cache, &cache.key, capacity)?;
-            assert!(check(&cache, &cache.key, capacity - 1).is_err());
+            check(&cache, &cache.key, capacity, gqa, q_heads)?;
+            assert!(check(&cache, &cache.key, capacity - 1, gqa, q_heads).is_err());
             let mut stale = cache.key.clone();
             stale.cublaslt_version += 1;
-            assert!(check(&cache, &stale, capacity).is_err());
+            assert!(check(&cache, &stale, capacity, gqa, q_heads).is_err());
             let winner = cache.winner;
             cache.winner = cache.trials[1].plan;
-            assert!(check(&cache, &cache.key, capacity).is_err());
+            assert!(check(&cache, &cache.key, capacity, gqa, q_heads).is_err());
             cache.winner = winner;
             if bucket >= 3 {
                 cache.phase1[0].blocks += 1;
-                assert!(check(&cache, &cache.key, capacity).is_err());
+                assert!(check(&cache, &cache.key, capacity, gqa, q_heads).is_err());
                 cache.phase1[0].blocks -= 1;
             }
             cache.schema = 2;
-            assert!(check(&cache, &cache.key, capacity).is_err());
+            assert!(check(&cache, &cache.key, capacity, gqa, q_heads).is_err());
             cache.schema = 3;
             cache.trials[0].evaluation_lengths[3] = capacity + 1;
-            assert!(check(&cache, &cache.key, capacity).is_err());
+            assert!(check(&cache, &cache.key, capacity, gqa, q_heads).is_err());
             cache.trials[0].evaluation_lengths = lengths;
             cache.trials.pop();
-            assert!(check(&cache, &cache.key, capacity).is_err());
+            assert!(check(&cache, &cache.key, capacity, gqa, q_heads).is_err());
         }
         Ok(())
     }

@@ -2558,6 +2558,7 @@ mod tests {
                 upload_content_sha256: None,
                 upload_hashed_bytes: None,
                 load_wall_ms: 0.0,
+                classic: None,
             };
             use cudarc::driver::DevicePtr;
             let scratch = Scratch {
@@ -3080,6 +3081,7 @@ mod tests {
                 upload_content_sha256: None,
                 upload_hashed_bytes: None,
                 load_wall_ms: 0.0,
+                classic: None,
             };
             let dequant = crate::linear_plan::LayerDequantPlan::from_manifest(
                 &catalog.manifest,
