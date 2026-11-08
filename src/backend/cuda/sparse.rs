@@ -30,8 +30,9 @@ pub fn triangle_voxels(
     budget: [usize; 2],
 ) -> Result<TriangleVoxels> {
     ensure!(
-        resolution > 2 * pad
+        resolution > 0
             && resolution <= 2048
+            && pad < resolution.div_ceil(2)
             && !mesh.vertices.is_empty()
             && mesh.vertices.len().is_multiple_of(3)
             && !mesh.faces.is_empty()
