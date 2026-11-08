@@ -2220,9 +2220,9 @@ mod tests {
     const FORCED_BB_RMSE: f64 = 0.025961503386497498;
     const FORCED_DP_MAX: f64 = 0.875;
     const FORCED_DP_RMSE: f64 = 0.058841850608587265;
-    const SLIDE_MAX: f64 = f64::from_bits(0);
-    const SLIDE_RMSE: f64 = f64::from_bits(0);
-    const SLIDE_RMSE_TEXT: &str = "";
+    const SLIDE_MAX: f64 = 16.0;
+    const SLIDE_RMSE: f64 = 0.11044254899024963;
+    const SLIDE_RMSE_TEXT: &str = "0.11044254899024963";
 
     struct Sequence {
         ids: Vec<i32>,
@@ -2390,6 +2390,14 @@ mod tests {
         ensure!(
             FORCED_DP_RMSE.to_bits() == 0x3fae2084e0000000,
             "forced depth rmse bits"
+        );
+        ensure!(
+            SLIDE_MAX.to_bits() == 0x4030000000000000,
+            "slide max_abs bits"
+        );
+        ensure!(
+            SLIDE_RMSE.to_bits() == 0x3fbc45f680000000,
+            "slide rmse bits"
         );
         Ok(())
     }
