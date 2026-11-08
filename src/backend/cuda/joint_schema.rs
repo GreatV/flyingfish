@@ -712,7 +712,7 @@ impl JointRun<'_> {
         let ops = self.ops;
         use crate::backend::gpu::{DevicePtrMut, PushKernelArg};
         let count = rows * width;
-        ensure!(x.len() == count, "gelu extent");
+        ensure!(x.len() >= count, "gelu extent");
         let stride = width as u64;
         let (x_ptr, _guard) = x.device_ptr_mut(stream);
         unsafe {
