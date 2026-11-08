@@ -96,9 +96,11 @@ pub fn triangle_voxels(
         total > 0 && total <= capacity,
         "triangle emission needs {total} rows, capacity {capacity}"
     );
+    let unique_bound = total.min((resolution as usize).pow(3));
     let host_bytes = total
-        .checked_mul(size_of::<(u64, u32)>())
-        .and_then(|v| v.checked_add(faces * 16))
+        .checked_mul(32)
+        .and_then(|v| v.checked_add(unique_bound.checked_mul(68)?))
+        .and_then(|v| v.checked_add(faces.checked_mul(16)?))
         .context("triangle host workspace overflow")?;
     let host_available = super::calibrate::host_memory(std::path::Path::new("/"))?;
     ensure!(

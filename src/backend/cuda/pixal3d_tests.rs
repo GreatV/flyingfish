@@ -185,10 +185,6 @@ impl OperationGate {
         } else {
             &freeze[section]
         };
-        let anchor = source["candidate_anchor"]
-            .as_str()
-            .or_else(|| source["arms"][0].as_str())
-            .context("high-grid reference anchor missing")?;
         let mut cells: BTreeMap<String, Value> = serde_json::from_value(source["metrics"].clone())?;
         if section.starts_with("G2") {
             cells.retain(|name, _| {
@@ -199,6 +195,9 @@ impl OperationGate {
         }
         ensure!(cells.len() == count, "high-grid frozen coverage differs");
         for (name, cell) in &mut cells {
+            let anchor = cell["pairs"][0]["left"]
+                .as_str()
+                .context("high-grid per-cell reference provenance missing")?;
             let (file, key) = name
                 .split_once('/')
                 .context("high-grid cell has no tensor key")?;
