@@ -417,11 +417,7 @@ impl OperationGate {
                 );
             }
             let defect = if control {
-                if self.decoder_anchor.is_some() || self.prefix == "N5_M3" {
-                    value <= 10.0 * bound
-                } else {
-                    value < 10.0 * bound
-                }
+                value <= 10.0 * bound
             } else {
                 value > bound
             };
