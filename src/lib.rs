@@ -8,6 +8,7 @@ pub mod canary;
 pub mod checkpoint;
 pub mod config;
 pub mod cpu;
+pub mod diarization;
 pub mod dspark;
 pub mod engram;
 pub mod experts;

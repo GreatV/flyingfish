@@ -1177,67 +1177,14 @@ impl Blas {
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn linear_f32(
         &self,
         weight: super::contracts::Tensor<f32, 2>,
         x: super::contracts::Tensor<f32, 2>,
         y: &mut super::contracts::TensorMut<f32, 2>,
     ) -> Result<()> {
-        weight.validate()?;
-        x.validate()?;
-        y.0.validate()?;
-        let rows = x.shape[0] as usize;
-        let input = x.shape[1] as usize;
-        let output = weight.shape[0] as usize;
-        checked_dims(rows, output, input)?;
-        let column_major = y.0.stride[0] == 1 && y.0.stride[1] >= rows as u64;
-        ensure!(
-            weight.shape == [output as u32, input as u32]
-                && weight.stride == [input as u64, 1]
-                && x.stride == [input as u64, 1]
-                && y.0.shape == [rows as u32, output as u32]
-                && (y.0.stride == [output as u64, 1] || column_major),
-            "FP32 linear requires dense operands and row/column-major output"
-        );
-        let (m, n, a, b, ld) = if column_major {
-            (
-                rows,
-                output,
-                x.ptr,
-                weight.ptr,
-                usize::try_from(y.0.stride[1])?,
-            )
-        } else {
-            (output, rows, weight.ptr, x.ptr, output)
-        };
-        ensure!(ld <= i32::MAX as usize, "FP32 linear output pitch overflow");
-        let alpha = 1f32;
-        let beta = 0f32;
-        unsafe {
-            bs::cublasGemmEx(
-                *self.decode.handle(),
-                bs::cublasOperation_t::CUBLAS_OP_T,
-                bs::cublasOperation_t::CUBLAS_OP_N,
-                m as i32,
-                n as i32,
-                input as i32,
-                (&alpha as *const f32).cast(),
-                a as *const core::ffi::c_void,
-                bs::cudaDataType_t::CUDA_R_32F,
-                input as i32,
-                b as *const core::ffi::c_void,
-                bs::cudaDataType_t::CUDA_R_32F,
-                input as i32,
-                (&beta as *const f32).cast(),
-                y.0.ptr as *mut core::ffi::c_void,
-                bs::cudaDataType_t::CUDA_R_32F,
-                ld as i32,
-                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            )
-            .result()?;
-        }
-        Ok(())
+        linear_f32_on(&self.decode, weight, x, y)
     }
 
     pub(crate) fn linear_f16(
@@ -1755,6 +1702,69 @@ impl Blas {
         }
         Ok(())
     }
+}
+
+pub(crate) fn linear_f32_on(
+    blas: &CudaBlas,
+    weight: super::contracts::Tensor<f32, 2>,
+    x: super::contracts::Tensor<f32, 2>,
+    y: &mut super::contracts::TensorMut<f32, 2>,
+) -> Result<()> {
+    weight.validate()?;
+    x.validate()?;
+    y.0.validate()?;
+    let rows = x.shape[0] as usize;
+    let input = x.shape[1] as usize;
+    let output = weight.shape[0] as usize;
+    checked_dims(rows, output, input)?;
+    let column_major = y.0.stride[0] == 1 && y.0.stride[1] >= rows as u64;
+    ensure!(
+        weight.shape == [output as u32, input as u32]
+            && weight.stride == [input as u64, 1]
+            && x.stride == [input as u64, 1]
+            && y.0.shape == [rows as u32, output as u32]
+            && (y.0.stride == [output as u64, 1] || column_major),
+        "FP32 linear requires dense operands and row/column-major output"
+    );
+    let (m, n, a, b, ld) = if column_major {
+        (
+            rows,
+            output,
+            x.ptr,
+            weight.ptr,
+            usize::try_from(y.0.stride[1])?,
+        )
+    } else {
+        (output, rows, weight.ptr, x.ptr, output)
+    };
+    ensure!(ld <= i32::MAX as usize, "FP32 linear output pitch overflow");
+    let alpha = 1f32;
+    let beta = 0f32;
+    unsafe {
+        bs::cublasGemmEx(
+            *blas.handle(),
+            bs::cublasOperation_t::CUBLAS_OP_T,
+            bs::cublasOperation_t::CUBLAS_OP_N,
+            m as i32,
+            n as i32,
+            input as i32,
+            (&alpha as *const f32).cast(),
+            a as *const core::ffi::c_void,
+            bs::cudaDataType_t::CUDA_R_32F,
+            input as i32,
+            b as *const core::ffi::c_void,
+            bs::cudaDataType_t::CUDA_R_32F,
+            input as i32,
+            (&beta as *const f32).cast(),
+            y.0.ptr as *mut core::ffi::c_void,
+            bs::cudaDataType_t::CUDA_R_32F,
+            ld as i32,
+            bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+        .result()?;
+    }
+    Ok(())
 }
 
 pub(crate) fn batched_f32_on(
