@@ -3021,6 +3021,7 @@ fn cascade_decoder_stages(shapes: &[&str]) -> Result<()> {
 fn cascade_corner_incidence(
     fields: &super::super::sparse::CornerFields,
     path: &Path,
+    parents: &SparseSites,
 ) -> Result<bool> {
     let mapped = MappedCheckpoint::open_component(path, "canonical-corners")?;
     let grid = mapped.tensor("unique_grid")?;
@@ -3031,9 +3032,7 @@ fn cascade_corner_incidence(
         grid.dtype() == Dtype::I64 && cubes.dtype() == Dtype::I64 && counts.dtype() == Dtype::I64,
         "canonical corner index storage differs"
     );
-    let exact = grid.shape() == [sites.len(), 3]
-        && counts.shape() == [sites.len()]
-        && cubes.data().len() / 8 == fields.layout.cube_to_corner.len()
+    let grid_exact = grid.shape() == [sites.len(), 3]
         && grid
             .data()
             .as_chunks::<24>()
@@ -3047,14 +3046,19 @@ fn cascade_corner_incidence(
                     .iter()
                     .zip(&p[1..])
                     .all(|(b, &v)| i64::from_le_bytes(*b) == v as i64)
-            })
+            });
+    let cubes_exact = cubes.shape() == [parents.coordinates().len(), 8]
+        && cubes.data().len() / 8 == fields.layout.cube_to_corner.len()
         && cubes
             .data()
             .as_chunks::<8>()
             .0
             .iter()
-            .zip(&fields.layout.cube_to_corner)
-            .all(|(b, &v)| i64::from_le_bytes(*b) == v as i64)
+            .zip(parents.sorted_rows().iter().flat_map(|&(_, row)| {
+                fields.layout.cube_to_corner[8 * row as usize..8 * row as usize + 8].iter()
+            }))
+            .all(|(b, &v)| i64::from_le_bytes(*b) == v as i64);
+    let counts_exact = counts.shape() == [sites.len()]
         && counts
             .data()
             .as_chunks::<8>()
@@ -3062,8 +3066,9 @@ fn cascade_corner_incidence(
             .iter()
             .zip(fields.layout.contributor_offsets.windows(2))
             .all(|(b, p)| i64::from_le_bytes(*b) == (p[1] - p[0]) as i64);
+    let exact = grid_exact && cubes_exact && counts_exact;
     println!(
-        "{} N5_M4_CORNER_INCIDENCE corners={} contributions={} full_grid_cubes_counts_exact={exact}",
+        "{} N5_M4_CORNER_INCIDENCE corners={} contributions={} full_grid_cubes_counts_exact={exact} grid_exact={grid_exact} counts_exact={counts_exact} cube_rows=lexicographic_parent cubes_exact={cubes_exact}",
         if exact { "PASS" } else { "DEFECT" },
         sites.len(),
         fields.layout.contributors.len()
@@ -3176,7 +3181,7 @@ fn cascade_corner_geometry(shapes: &[&str]) -> Result<()> {
             let fields = super::super::sparse::corner_fields(&d, &sites, &input, frame, budget)?;
             drop(input);
             if !control {
-                defects += usize::from(!cascade_corner_incidence(&fields, &full_anchor)?);
+                defects += usize::from(!cascade_corner_incidence(&fields, &full_anchor, &sites)?);
                 gate.score(
                     "means",
                     &selected_values(&d, &fields.means, &rows, 5, f64::from)?,
