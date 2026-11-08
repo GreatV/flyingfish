@@ -1998,6 +1998,53 @@ impl Breeze {
         download_f32(&k.stream, &buf.d, rows * TEXT_OUT)
     }
 
+    pub fn sliding_layer(&mut self, hidden: &[f32], plant: TextPlant) -> Result<Vec<f32>> {
+        self.bound_device()?;
+        ensure!(
+            matches!(plant, TextPlant::Nominal | TextPlant::SlidingWindow),
+            "sliding plant"
+        );
+        ensure!(hidden.len().is_multiple_of(TEXT_H), "sliding input");
+        let rows = hidden.len() / TEXT_H;
+        ensure!((1..=TEXT_MAX).contains(&rows), "sliding rows {rows}");
+        ensure!(
+            hidden.iter().all(|value| value.is_finite()),
+            "non-finite sliding input"
+        );
+        let host: Vec<bf16> = hidden.iter().copied().map(bf16::from_f32).collect();
+        let Breeze {
+            ref w,
+            ref k,
+            ref mut flash,
+            ref mut buf,
+            ref blas,
+            ..
+        } = *self;
+        ensure!(!w.text[0].full, "layer 0 is full");
+        copy_h2d(&k.stream, &host, &mut buf.h.slice_mut(..host.len()))?;
+        set_meta(&k.stream, &mut buf.meta, rows)?;
+        let slide_left = flash.slide_left;
+        ensure!(slide_left > 0, "sliding window left");
+        let shift = plant == TextPlant::SlidingWindow;
+        let window_left = if shift {
+            Some(slide_left - 1)
+        } else {
+            Some(slide_left)
+        };
+        let step = TextStep {
+            rows,
+            index: 0,
+            plant,
+            window_left,
+        };
+        if shift {
+            text_layer(&w.text[0], k, &mut flash.text_slide_shift, buf, blas, step)?;
+        } else {
+            text_layer(&w.text[0], k, &mut flash.text_slide, buf, blas, step)?;
+        }
+        download_f32(&k.stream, &buf.h, rows * TEXT_H)
+    }
+
     pub fn backbone(
         &mut self,
         projected: &[f32],
@@ -2173,6 +2220,9 @@ mod tests {
     const FORCED_BB_RMSE: f64 = 0.025961503386497498;
     const FORCED_DP_MAX: f64 = 0.875;
     const FORCED_DP_RMSE: f64 = 0.058841850608587265;
+    const SLIDE_MAX: f64 = f64::from_bits(0);
+    const SLIDE_RMSE: f64 = f64::from_bits(0);
+    const SLIDE_RMSE_TEXT: &str = "";
 
     struct Sequence {
         ids: Vec<i32>,
@@ -2232,12 +2282,20 @@ mod tests {
         tau_rmse: LONG_RMSE,
         nominal: true,
     };
-    const LONG_WINDOW: GateBar = GateBar {
-        tensor: "projected_text",
+    const SLIDE_NOMINAL: GateBar = GateBar {
+        tensor: "sliding_hidden",
+        plant: "nominal",
+        source: "slide_floors.sliding_hidden",
+        tau_max: SLIDE_MAX,
+        tau_rmse: SLIDE_RMSE,
+        nominal: true,
+    };
+    const SLIDE_WINDOW: GateBar = GateBar {
+        tensor: "sliding_hidden",
         plant: "text_encoder_sliding_window",
-        source: "long_floors.projected_text",
-        tau_max: LONG_MAX,
-        tau_rmse: LONG_RMSE,
+        source: "slide_floors.sliding_hidden",
+        tau_max: SLIDE_MAX,
+        tau_rmse: SLIDE_RMSE,
         nominal: false,
     };
     const FORCED_BB_NOMINAL: GateBar = GateBar {
@@ -2496,6 +2554,26 @@ mod tests {
                 ("depth_logits", "depth_head_codebook"),
             ],
         )?;
+        Ok(())
+    }
+
+    fn assert_slide_floors() -> Result<()> {
+        ensure!(
+            SLIDE_MAX.to_bits() != 0 && SLIDE_RMSE.to_bits() != 0,
+            "slide tau unset"
+        );
+        let (text, doc) = floor_doc("N8_FLOORS_SLIDE")?;
+        check_header(&doc, "n8-m0-long-slide-v1")?;
+        check_shapes(&doc, &[("sliding_hidden", &[1, 652, 1152])])?;
+        check_tau(
+            &text,
+            &doc,
+            "sliding_hidden",
+            SLIDE_MAX,
+            SLIDE_RMSE,
+            SLIDE_RMSE_TEXT,
+        )?;
+        check_controls(&doc, &[("sliding_hidden", "text_encoder_sliding_window")])?;
         Ok(())
     }
 
@@ -2904,7 +2982,10 @@ mod tests {
         let forced_projected_path = env_path("N8_FORCED_PROJECTED", false)?;
         let forced_hidden_path = env_path("N8_FORCED_HIDDEN", false)?;
         let forced_reference = env_path("N8_FORCED_REFERENCE", false)?;
+        let slide_input_path = env_path("N8_SLIDE_INPUT", false)?;
+        let slide_reference_path = env_path("N8_SLIDE_REFERENCE", false)?;
         assert_frozen_floors()?;
+        assert_slide_floors()?;
         let short = load_sequence(&short_inputs)?;
         let long = load_sequence(&long_inputs)?;
         expect_layout(&short, 6, 2)?;
@@ -2916,6 +2997,8 @@ mod tests {
         let forced_hidden = tensor_f32(&forced_hidden_path, "backbone_hidden", &[1, 716, 2048])?;
         let forced_backbone = tensor_f32(&forced_reference, "backbone_logits", &[1, 716, 2052])?;
         let forced_depth = tensor_f32(&forced_reference, "depth_logits", &[64, 15, 2051])?;
+        let slide_input = tensor_f32(&slide_input_path, "sliding_input", &[1, 652, 1152])?;
+        let slide_hidden = tensor_f32(&slide_reference_path, "sliding_hidden", &[1, 652, 1152])?;
         let short_text = text_ids(&short)?;
         let long_text = text_ids(&long)?;
         let positions = super::Positions {
@@ -2946,9 +3029,14 @@ mod tests {
             &LONG_NOMINAL,
         )?;
         protocol |= arm(
-            &model.text(&long_text, super::TextPlant::SlidingWindow)?,
-            &long_projected,
-            &LONG_WINDOW,
+            &model.sliding_layer(&slide_input, super::TextPlant::Nominal)?,
+            &slide_hidden,
+            &SLIDE_NOMINAL,
+        )?;
+        protocol |= arm(
+            &model.sliding_layer(&slide_input, super::TextPlant::SlidingWindow)?,
+            &slide_hidden,
+            &SLIDE_WINDOW,
         )?;
         protocol |= arm(
             &model.backbone(&forced_projected, &positions, &long.codes, false)?,
