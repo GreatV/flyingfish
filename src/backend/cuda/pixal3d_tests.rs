@@ -3386,11 +3386,12 @@ fn hi3d_cascade_mesh_support_gpu() -> Result<()> {
                 .collect(),
         };
         let (free, _) = device.ctx.mem_get_info()?;
-        ensure!(
-            triangle_voxels(&device, &mesh, 12, u32::MAX, usize::MAX, [free, 1 << 30])
-                .is_err(),
-            "overflowing voxel pad was accepted"
-        );
+        for pad in [u32::MAX, (1 << 31) + 1] {
+            ensure!(
+                triangle_voxels(&device, &mesh, 12, pad, usize::MAX, [free, 1 << 30]).is_err(),
+                "overflowing voxel pad was accepted"
+            );
+        }
         let voxels = triangle_voxels(&device, &mesh, 12, 3, usize::MAX, [free, 1 << 30])?;
         let exact = cascade_incidence_exact(&voxels, &path)?;
         defects += usize::from(!exact);
