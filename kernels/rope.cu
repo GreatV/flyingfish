@@ -229,7 +229,7 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                                                     size_t v_row_stride,
                                                     const __nv_bfloat16* table) {
     const bool table_dim = dim == 128 || dim == 256 || dim == 512;
-    const bool shape = TABLE ? (q_heads > 0 && kv_heads > 0 && table_dim)
+    const bool shape = TABLE ? (q_heads > 0 && kv_heads >= 0 && table_dim)
                              : ((q_heads == 16 && kv_heads == 2) ||
                                 (q_heads == 32 && kv_heads == 4));
     if constexpr (CAST_WEIGHT && ONE_PLUS) __trap();
