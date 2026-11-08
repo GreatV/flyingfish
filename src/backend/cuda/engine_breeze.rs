@@ -1533,6 +1533,27 @@ fn launch_row_sum(
     Ok(())
 }
 
+fn audio_source_book(book: usize) -> usize {
+    (book + 1) % BOOKS
+}
+
+fn rotate_audio_table(k: &Kern, table: &CudaSlice<bf16>) -> Result<CudaSlice<bf16>> {
+    let block = (CODEBOOK as usize) * BB_H;
+    let total = BOOKS * block;
+    ensure!(table.len() == total, "audio table");
+    let mut scratch = k.stream.alloc_zeros::<bf16>(total)?;
+    for book in 0..BOOKS {
+        let src_book = audio_source_book(book);
+        let src = src_book * block;
+        let dst = book * block;
+        k.stream.memcpy_dtod(
+            &table.slice(src..src + block),
+            &mut scratch.slice_mut(dst..dst + block),
+        )?;
+    }
+    Ok(scratch)
+}
+
 fn sum_audio(
     k: &Kern,
     table: &CudaSlice<bf16>,
@@ -1998,15 +2019,11 @@ impl Breeze {
             projected.iter().all(|value| value.is_finite()),
             "non-finite projected"
         );
-        let mut audio_codes = codes.to_vec();
-        for &id in &audio_codes {
+        for &id in codes {
             ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
         }
         if plant_audio {
             ensure!(!positions.audio.is_empty(), "audio plant with no audio");
-            let next = audio_codes[0].checked_add(1).context("audio plant")?;
-            ensure!(next < CODEBOOK, "audio plant row {next}");
-            audio_codes[0] = next;
         }
         let rows = positions.seq;
         let Breeze {
@@ -2019,8 +2036,11 @@ impl Breeze {
         } = *self;
         let audio = if positions.audio.is_empty() {
             Vec::new()
+        } else if plant_audio {
+            let rotated = rotate_audio_table(k, &w.audio)?;
+            sum_audio(k, &rotated, buf, codes, positions.audio.len())?
         } else {
-            sum_audio(k, &w.audio, buf, &audio_codes, positions.audio.len())?
+            sum_audio(k, &w.audio, buf, codes, positions.audio.len())?
         };
         let eos = if positions.eos.is_empty() {
             None
@@ -2230,7 +2250,7 @@ mod tests {
     };
     const FORCED_BB_AUDIO: GateBar = GateBar {
         tensor: "backbone_logits",
-        plant: "audio_embedding_row",
+        plant: "audio_codebook_index",
         source: "forced_floors.backbone_logits",
         tau_max: FORCED_BB_MAX,
         tau_rmse: FORCED_BB_RMSE,
@@ -2518,6 +2538,25 @@ mod tests {
             "one_plus instantiation"
         );
         Ok(())
+    }
+
+    #[test]
+    fn audio_plant_wraps_every_codebook() {
+        let mut seen = [false; super::BOOKS];
+        for book in 0..super::BOOKS {
+            let source = super::audio_source_book(book);
+            assert!(source < super::BOOKS && !seen[source]);
+            seen[source] = true;
+            assert_eq!(source, (book + 1) % super::BOOKS);
+        }
+        assert!(seen.iter().all(|hit| *hit));
+        assert_eq!(super::audio_source_book(super::BOOKS - 1), 0);
+        let kernel = include_str!("../../../kernels/embed.cu");
+        assert!(kernel.contains("(size_t)book * (unsigned)vocab"));
+        let engine = include_str!("engine_breeze.rs");
+        assert!(engine.contains("audio_source_book(book)"));
+        let old = ["audio_codes", "[0]"].concat();
+        assert!(!engine.contains(&old));
     }
 
     fn position_zero(table: &[bf16], dim: usize) -> Result<()> {
