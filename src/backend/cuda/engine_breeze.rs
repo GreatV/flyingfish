@@ -154,31 +154,32 @@ fn rope_table(positions: usize, dim: usize, law: RopeLaw) -> Result<Vec<bf16>> {
     Ok(table)
 }
 
-fn planted_rope_theta(theta: f32) -> f32 {
-    if theta == 10_000.0 {
-        20_000.0
-    } else {
-        10_000.0
+fn text_rope_law(full: bool) -> RopeLaw {
+    RopeLaw::Plain {
+        theta: if full { 1_000_000.0 } else { 10_000.0 },
+        divisor: if full { 8.0 } else { 1.0 },
     }
 }
 
-fn text_rope_law(full: bool, plant: bool) -> RopeLaw {
-    let configured = if full { 1_000_000.0 } else { 10_000.0 };
-    RopeLaw::Plain {
-        theta: if plant {
-            planted_rope_theta(configured)
-        } else {
-            configured
-        },
-        divisor: if full { 8.0 } else { 1.0 },
+fn identity_rope_table(positions: usize, dim: usize) -> Result<Vec<bf16>> {
+    ensure!(
+        positions > 0 && dim.is_multiple_of(2),
+        "identity rope table"
+    );
+    let mut table = vec![bf16::ZERO; positions * dim];
+    for position in 0..positions {
+        for pair in 0..dim / 2 {
+            table[position * dim + pair] = bf16::ONE;
+        }
     }
+    Ok(table)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextPlant {
     Nominal,
-    RopeBase,
-    SlidingWindow,
+    RopeOmitted,
+    WindowIgnored,
 }
 
 pub struct Positions {
@@ -245,8 +246,7 @@ struct Kern {
     residual_scale: CudaFunction,
     table_slide: CudaSlice<bf16>,
     table_full: CudaSlice<bf16>,
-    table_slide_plant: CudaSlice<bf16>,
-    table_full_plant: CudaSlice<bf16>,
+    table_identity: CudaSlice<bf16>,
     table_backbone: CudaSlice<bf16>,
     table_depth: CudaSlice<bf16>,
 }
@@ -276,7 +276,6 @@ struct Buf {
 struct Flashes {
     text_full: Flash,
     text_slide: Flash,
-    text_slide_shift: Flash,
     backbone: Flash,
     depth: Flash,
     slide_left: usize,
@@ -340,7 +339,6 @@ struct Rms<'a> {
 #[derive(Clone, Copy)]
 struct TextStep {
     rows: usize,
-    index: usize,
     plant: TextPlant,
     window_left: Option<usize>,
 }
@@ -1315,9 +1313,6 @@ fn text_layer(
     blas: &Blas,
     step: TextStep,
 ) -> Result<()> {
-    if step.plant == TextPlant::SlidingWindow && step.index == 0 {
-        ensure!(!layer.full, "sliding-window plant on a full layer");
-    }
     let rows = step.rows;
     rms(
         k,
@@ -1332,15 +1327,10 @@ fn text_layer(
             eps: TEXT_EPS,
         },
     )?;
-    let planted = step.plant == TextPlant::RopeBase;
-    let table = if layer.full {
-        if planted {
-            &k.table_full_plant
-        } else {
-            &k.table_full
-        }
-    } else if planted {
-        &k.table_slide_plant
+    let table = if step.plant == TextPlant::RopeOmitted {
+        &k.table_identity
+    } else if layer.full {
+        &k.table_full
     } else {
         &k.table_slide
     };
@@ -1799,26 +1789,11 @@ impl Breeze {
         let embed_rows_sum = embed_module.load_function("embed_rows_sum")?;
         let residual_scale = act_module.load_function("residual_scale")?;
         let stream = device.stream.clone();
-        let table_slide = upload_table(
-            &stream,
-            TEXT_POSITIONS,
-            TEXT_DIM,
-            text_rope_law(false, false),
-        )?;
-        let table_full = upload_table(
-            &stream,
-            TEXT_POSITIONS,
-            TEXT_DIM,
-            text_rope_law(true, false),
-        )?;
-        let table_slide_plant = upload_table(
-            &stream,
-            TEXT_POSITIONS,
-            TEXT_DIM,
-            text_rope_law(false, true),
-        )?;
-        let table_full_plant =
-            upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(true, true))?;
+        let table_slide = upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(false))?;
+        let table_full = upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(true))?;
+        let identity = identity_rope_table(TEXT_POSITIONS, TEXT_DIM)?;
+        let table_identity = stream.clone_htod(&identity)?;
+        stream.synchronize()?;
         let table_backbone = upload_table(
             &stream,
             BB_MAX,
@@ -1847,20 +1822,6 @@ impl Breeze {
             TEXT_MAX,
         )
         .context("text sliding attention")?;
-        let text_slide_shift = Flash::new_with_score(
-            stream.clone(),
-            TEXT_MAX,
-            TEXT_HEADS,
-            TEXT_KV,
-            TEXT_DIM,
-            Score {
-                scale: 0.0625,
-                window_left: Some(slide_left - 1),
-                window_right: Some(slide_right + 1),
-            },
-            TEXT_MAX,
-        )
-        .context("text shifted attention")?;
         let backbone_flash = Flash::new(stream.clone(), BB_MAX, BB_HEADS, BB_KV, BB_DIM)
             .context("backbone attention")?;
         let depth_flash = Flash::new(stream.clone(), DP_ROWS, DP_HEADS, DP_KV, DP_DIM)
@@ -1892,15 +1853,13 @@ impl Breeze {
                 residual_scale,
                 table_slide,
                 table_full,
-                table_slide_plant,
-                table_full_plant,
+                table_identity,
                 table_backbone,
                 table_depth,
             },
             flash: Flashes {
                 text_full,
                 text_slide,
-                text_slide_shift,
                 backbone: backbone_flash,
                 depth: depth_flash,
                 slide_left,
@@ -1929,40 +1888,20 @@ impl Breeze {
             ref blas,
             ..
         } = *self;
-        if plant == TextPlant::SlidingWindow {
-            ensure!(!w.text[0].full, "sliding-window plant on a full layer");
-        }
         let slide_left = flash.slide_left;
         ensure!(slide_left > 0, "sliding window left");
         set_meta(&k.stream, &mut buf.meta, rows)?;
         copy_h2d(&k.stream, token_ids, &mut buf.tok.slice_mut(..rows))?;
         embed_tokens(k, &w.text_embed, &buf.tok, &mut buf.h, rows, TEXT_H)?;
         for index in 0..w.text.len() {
-            let full = w.text[index].full;
-            let shift = plant == TextPlant::SlidingWindow && index == 0;
-            let window_left = if full {
-                None
-            } else if shift {
-                Some(slide_left - 1)
-            } else {
-                Some(slide_left)
-            };
+            let unwindowed = w.text[index].full || plant == TextPlant::WindowIgnored;
+            let window_left = if unwindowed { None } else { Some(slide_left) };
             let step = TextStep {
                 rows,
-                index,
                 plant,
                 window_left,
             };
-            if shift {
-                text_layer(
-                    &w.text[index],
-                    k,
-                    &mut flash.text_slide_shift,
-                    buf,
-                    blas,
-                    step,
-                )?;
-            } else if full {
+            if unwindowed {
                 text_layer(&w.text[index], k, &mut flash.text_full, buf, blas, step)?;
             } else {
                 text_layer(&w.text[index], k, &mut flash.text_slide, buf, blas, step)?;
@@ -2001,7 +1940,7 @@ impl Breeze {
     pub fn sliding_layer(&mut self, hidden: &[f32], plant: TextPlant) -> Result<Vec<f32>> {
         self.bound_device()?;
         ensure!(
-            matches!(plant, TextPlant::Nominal | TextPlant::SlidingWindow),
+            matches!(plant, TextPlant::Nominal | TextPlant::WindowIgnored),
             "sliding plant"
         );
         ensure!(hidden.len().is_multiple_of(TEXT_H), "sliding input");
@@ -2025,20 +1964,15 @@ impl Breeze {
         set_meta(&k.stream, &mut buf.meta, rows)?;
         let slide_left = flash.slide_left;
         ensure!(slide_left > 0, "sliding window left");
-        let shift = plant == TextPlant::SlidingWindow;
-        let window_left = if shift {
-            Some(slide_left - 1)
-        } else {
-            Some(slide_left)
-        };
+        let ignored = plant == TextPlant::WindowIgnored;
+        let window_left = if ignored { None } else { Some(slide_left) };
         let step = TextStep {
             rows,
-            index: 0,
             plant,
             window_left,
         };
-        if shift {
-            text_layer(&w.text[0], k, &mut flash.text_slide_shift, buf, blas, step)?;
+        if ignored {
+            text_layer(&w.text[0], k, &mut flash.text_full, buf, blas, step)?;
         } else {
             text_layer(&w.text[0], k, &mut flash.text_slide, buf, blas, step)?;
         }
@@ -2223,6 +2157,9 @@ mod tests {
     const SLIDE_MAX: f64 = 16.0;
     const SLIDE_RMSE: f64 = 0.11044254899024963;
     const SLIDE_RMSE_TEXT: &str = "0.11044254899024963";
+    const SIGNAL_MAX: f64 = 3.0;
+    const SIGNAL_RMSE: f64 = 0.08392622321844101;
+    const SIGNAL_RMSE_TEXT: &str = "0.08392622321844101";
 
     struct Sequence {
         ids: Vec<i32>,
@@ -2239,6 +2176,7 @@ mod tests {
         tau_max: f64,
         tau_rmse: f64,
         nominal: bool,
+        rmse_detect: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2265,14 +2203,16 @@ mod tests {
         tau_max: SHORT_MAX,
         tau_rmse: SHORT_RMSE,
         nominal: true,
+        rmse_detect: false,
     };
     const SHORT_ROPE: GateBar = GateBar {
         tensor: "projected_text",
-        plant: "text_encoder_rope_base",
+        plant: "text_encoder_rope_omitted",
         source: "short_floors.projected_text",
         tau_max: SHORT_MAX,
         tau_rmse: SHORT_RMSE,
         nominal: false,
+        rmse_detect: false,
     };
     const LONG_NOMINAL: GateBar = GateBar {
         tensor: "projected_text",
@@ -2281,6 +2221,7 @@ mod tests {
         tau_max: LONG_MAX,
         tau_rmse: LONG_RMSE,
         nominal: true,
+        rmse_detect: false,
     };
     const SLIDE_NOMINAL: GateBar = GateBar {
         tensor: "sliding_hidden",
@@ -2289,14 +2230,25 @@ mod tests {
         tau_max: SLIDE_MAX,
         tau_rmse: SLIDE_RMSE,
         nominal: true,
+        rmse_detect: false,
     };
-    const SLIDE_WINDOW: GateBar = GateBar {
+    const SIGNAL_NOMINAL: GateBar = GateBar {
         tensor: "sliding_hidden",
-        plant: "text_encoder_sliding_window",
-        source: "slide_floors.sliding_hidden",
-        tau_max: SLIDE_MAX,
-        tau_rmse: SLIDE_RMSE,
+        plant: "nominal",
+        source: "slide_signal_floors.sliding_hidden",
+        tau_max: SIGNAL_MAX,
+        tau_rmse: SIGNAL_RMSE,
+        nominal: true,
+        rmse_detect: false,
+    };
+    const SIGNAL_IGNORED: GateBar = GateBar {
+        tensor: "sliding_hidden",
+        plant: "text_encoder_window_ignored",
+        source: "slide_signal_floors.sliding_hidden",
+        tau_max: SIGNAL_MAX,
+        tau_rmse: SIGNAL_RMSE,
         nominal: false,
+        rmse_detect: true,
     };
     const FORCED_BB_NOMINAL: GateBar = GateBar {
         tensor: "backbone_logits",
@@ -2305,6 +2257,7 @@ mod tests {
         tau_max: FORCED_BB_MAX,
         tau_rmse: FORCED_BB_RMSE,
         nominal: true,
+        rmse_detect: false,
     };
     const FORCED_BB_AUDIO: GateBar = GateBar {
         tensor: "backbone_logits",
@@ -2313,6 +2266,7 @@ mod tests {
         tau_max: FORCED_BB_MAX,
         tau_rmse: FORCED_BB_RMSE,
         nominal: false,
+        rmse_detect: false,
     };
     const FORCED_DP_NOMINAL: GateBar = GateBar {
         tensor: "depth_logits",
@@ -2321,6 +2275,7 @@ mod tests {
         tau_max: FORCED_DP_MAX,
         tau_rmse: FORCED_DP_RMSE,
         nominal: true,
+        rmse_detect: false,
     };
     const FORCED_DP_HEAD: GateBar = GateBar {
         tensor: "depth_logits",
@@ -2329,6 +2284,7 @@ mod tests {
         tau_max: FORCED_DP_MAX,
         tau_rmse: FORCED_DP_RMSE,
         nominal: false,
+        rmse_detect: false,
     };
 
     struct RuntimeDir(PathBuf);
@@ -2398,6 +2354,14 @@ mod tests {
         ensure!(
             SLIDE_RMSE.to_bits() == 0x3fbc45f680000000,
             "slide rmse bits"
+        );
+        ensure!(
+            SIGNAL_MAX.to_bits() == 0x4008000000000000,
+            "signal max_abs bits"
+        );
+        ensure!(
+            SIGNAL_RMSE.to_bits() == 0x3fb57c3060000000,
+            "signal rmse bits"
         );
         Ok(())
     }
@@ -2585,31 +2549,53 @@ mod tests {
         Ok(())
     }
 
+    fn assert_signal_floors() -> Result<()> {
+        let (text, doc) = floor_doc("N8_FLOORS_SLIDE_SIGNAL")?;
+        ensure!(
+            doc["schema"].as_str() == Some("n8-m0-long-slide-signal-v1"),
+            "signal schema"
+        );
+        ensure!(
+            doc["candidate_run"].as_bool() == Some(false),
+            "signal candidate_run"
+        );
+        ensure!(doc["fixture"]["far_rows"].as_u64() == Some(16), "far rows");
+        ensure!(
+            doc["fixture"]["sliding_window"].as_u64() == Some(512),
+            "signal window"
+        );
+        ensure!(doc["fixture"]["layer"].as_u64() == Some(0), "signal layer");
+        check_shapes(&doc, &[("sliding_hidden", &[1, 652, 1152])])?;
+        check_tau(
+            &text,
+            &doc,
+            "sliding_hidden",
+            SIGNAL_MAX,
+            SIGNAL_RMSE,
+            SIGNAL_RMSE_TEXT,
+        )?;
+        let name = ["text_encoder_window_", "ignored"].concat();
+        check_controls(&doc, &[("sliding_hidden", name.as_str())])?;
+        Ok(())
+    }
+
     #[test]
-    fn rope_plant_uses_the_wrong_base() -> Result<()> {
+    fn rope_omitted_table_is_identity() -> Result<()> {
+        let identity = super::identity_rope_table(2, super::TEXT_DIM)?;
+        let dim = super::TEXT_DIM;
+        for position in 0..2 {
+            let row = &identity[position * dim..(position + 1) * dim];
+            for pair in 0..dim / 2 {
+                ensure!(row[pair] == bf16::ONE, "identity cos");
+                ensure!(row[dim / 2 + pair] == bf16::ZERO, "identity sin");
+            }
+        }
+        let slide = super::rope_table(2, dim, super::text_rope_law(false))?;
+        position_zero(&slide, dim)?;
+        ensure!(slide[..dim] == identity[..dim], "position 0 sliding table");
         ensure!(
-            super::planted_rope_theta(10_000.0) == 20_000.0,
-            "sliding plant base"
-        );
-        ensure!(
-            super::planted_rope_theta(1_000_000.0) == 10_000.0,
-            "full plant base"
-        );
-        let nominal = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(false, false))?;
-        let planted = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(false, true))?;
-        let full = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(true, false))?;
-        let full_plant = super::rope_table(2, super::TEXT_DIM, super::text_rope_law(true, true))?;
-        position_zero(&nominal, super::TEXT_DIM)?;
-        position_zero(&planted, super::TEXT_DIM)?;
-        position_zero(&full, super::TEXT_DIM)?;
-        position_zero(&full_plant, super::TEXT_DIM)?;
-        ensure!(
-            nominal != planted,
-            "sliding plant matches the configured table"
-        );
-        ensure!(
-            full != full_plant,
-            "full plant matches the configured table"
+            slide[dim..] != identity[dim..],
+            "position 1 sliding table is identity"
         );
         let kernel = include_str!("../../../kernels/rope.cu");
         ensure!(
@@ -2623,6 +2609,32 @@ mod tests {
                 == 1,
             "one_plus instantiation"
         );
+        let engine = include_str!("engine_breeze.rs");
+        let rope_metric = ["text_encoder_rope_", "omitted"].concat();
+        let window_metric = ["text_encoder_window_", "ignored"].concat();
+        let detect = ["rmse_detect: ", "true"].concat();
+        let old_theta = ["planted_rope_", "theta"].concat();
+        let old_shift = ["text_slide_", "shift"].concat();
+        let old_base = ["TextPlant::", "RopeBase"].concat();
+        let old_variant = ["TextPlant::", "SlidingWindow"].concat();
+        let old_metric = ["text_encoder_rope_", "base"].concat();
+        ensure!(
+            engine.matches(&rope_metric).count() == 1,
+            "rope omitted metric"
+        );
+        ensure!(
+            engine.matches(&window_metric).count() == 1,
+            "window ignored metric"
+        );
+        ensure!(
+            engine.matches(&detect).count() == 1,
+            "one rmse detection bar"
+        );
+        ensure!(!engine.contains(&old_theta), "old rope base function");
+        ensure!(!engine.contains(&old_shift), "one-key window flash");
+        ensure!(!engine.contains(&old_base), "rope base plant");
+        ensure!(!engine.contains(&old_variant), "one-key window plant");
+        ensure!(!engine.contains(&old_metric), "rope base metric");
         Ok(())
     }
 
@@ -2907,11 +2919,24 @@ mod tests {
     fn report(bar: &GateBar, max_abs: f64, rmse: f64) -> GateStatus {
         let bar_max = 10.0 * bar.tau_max;
         let bar_rmse = 10.0 * bar.tau_rmse;
+        let detect = if bar.nominal {
+            "nominal"
+        } else if bar.rmse_detect {
+            "rmse"
+        } else {
+            "both"
+        };
         let status = if bar.nominal {
             if max_abs <= bar.tau_max && rmse <= bar.tau_rmse {
                 GateStatus::Pass
             } else {
                 GateStatus::Defect
+            }
+        } else if bar.rmse_detect {
+            if rmse >= bar_rmse {
+                GateStatus::Pass
+            } else {
+                GateStatus::ProtocolFail
             }
         } else if max_abs >= bar_max && rmse >= bar_rmse {
             GateStatus::Pass
@@ -2919,7 +2944,7 @@ mod tests {
             GateStatus::ProtocolFail
         };
         println!(
-            "METRIC tensor={} plant={} bar_source={} max_abs={max_abs:?} rmse={rmse:?} tau_max_abs={:?} tau_rmse={:?} bar_max_abs={bar_max:?} bar_rmse={bar_rmse:?} status={}",
+            "METRIC tensor={} plant={} bar_source={} max_abs={max_abs:?} rmse={rmse:?} tau_max_abs={:?} tau_rmse={:?} bar_max_abs={bar_max:?} bar_rmse={bar_rmse:?} detect={detect} status={}",
             bar.tensor,
             bar.plant,
             bar.source,
@@ -2976,7 +3001,8 @@ mod tests {
             super::super::flash::window_radii(512) == (255, 256),
             "window radii"
         );
-        assert_frozen_floors()
+        assert_frozen_floors()?;
+        assert_signal_floors()
     }
 
     #[test]
@@ -2992,8 +3018,11 @@ mod tests {
         let forced_reference = env_path("N8_FORCED_REFERENCE", false)?;
         let slide_input_path = env_path("N8_SLIDE_INPUT", false)?;
         let slide_reference_path = env_path("N8_SLIDE_REFERENCE", false)?;
+        let signal_input_path = env_path("N8_SLIDE_SIGNAL_INPUT", false)?;
+        let signal_reference_path = env_path("N8_SLIDE_SIGNAL_REFERENCE", false)?;
         assert_frozen_floors()?;
         assert_slide_floors()?;
+        assert_signal_floors()?;
         let short = load_sequence(&short_inputs)?;
         let long = load_sequence(&long_inputs)?;
         expect_layout(&short, 6, 2)?;
@@ -3007,6 +3036,8 @@ mod tests {
         let forced_depth = tensor_f32(&forced_reference, "depth_logits", &[64, 15, 2051])?;
         let slide_input = tensor_f32(&slide_input_path, "sliding_input", &[1, 652, 1152])?;
         let slide_hidden = tensor_f32(&slide_reference_path, "sliding_hidden", &[1, 652, 1152])?;
+        let signal_input = tensor_f32(&signal_input_path, "sliding_input", &[1, 652, 1152])?;
+        let signal_hidden = tensor_f32(&signal_reference_path, "sliding_hidden", &[1, 652, 1152])?;
         let short_text = text_ids(&short)?;
         let long_text = text_ids(&long)?;
         let positions = super::Positions {
@@ -3027,7 +3058,7 @@ mod tests {
             &SHORT_NOMINAL,
         )?;
         protocol |= arm(
-            &model.text(&short_text, super::TextPlant::RopeBase)?,
+            &model.text(&short_text, super::TextPlant::RopeOmitted)?,
             &short_projected,
             &SHORT_ROPE,
         )?;
@@ -3042,9 +3073,14 @@ mod tests {
             &SLIDE_NOMINAL,
         )?;
         protocol |= arm(
-            &model.sliding_layer(&slide_input, super::TextPlant::SlidingWindow)?,
-            &slide_hidden,
-            &SLIDE_WINDOW,
+            &model.sliding_layer(&signal_input, super::TextPlant::Nominal)?,
+            &signal_hidden,
+            &SIGNAL_NOMINAL,
+        )?;
+        protocol |= arm(
+            &model.sliding_layer(&signal_input, super::TextPlant::WindowIgnored)?,
+            &signal_hidden,
+            &SIGNAL_IGNORED,
         )?;
         protocol |= arm(
             &model.backbone(&forced_projected, &positions, &long.codes, false)?,
