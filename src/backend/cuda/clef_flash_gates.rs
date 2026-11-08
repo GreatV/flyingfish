@@ -656,15 +656,11 @@ mod gates {
             delta.1 / tau.1
         );
         if rmse_only {
-            ensure!(
-                delta.1 >= 10.0 * tau.1,
-                "control {label} below 10x tau_rmse"
-            );
-        } else {
-            ensure!(
-                delta.0 >= 10.0 * tau.0 && delta.1 >= 10.0 * tau.1,
-                "control {label} below 10x tau on max and rmse"
-            );
+            if delta.1 < 10.0 * tau.1 {
+                failures.push(format!("{label} below 10x tau_rmse"));
+            }
+        } else if delta.0 < 10.0 * tau.0 || delta.1 < 10.0 * tau.1 {
+            failures.push(format!("{label} below 10x tau"));
         }
         Ok(())
     }
@@ -1031,11 +1027,8 @@ mod gates {
                 delta.1,
                 delta.1 / tau.1
             );
-            if layer != 3 {
-                ensure!(
-                    delta.1 >= 10.0 * tau.1,
-                    "decoder{layer} control below 10x tau_rmse"
-                );
+            if layer != 3 && delta.1 < 10.0 * tau.1 {
+                failures.push(format!("decoder{layer} control below 10x tau_rmse"));
             }
         }
 

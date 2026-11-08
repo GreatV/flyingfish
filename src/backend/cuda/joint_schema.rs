@@ -1015,6 +1015,23 @@ impl JointRun<'_> {
         Ok(())
     }
 
+    /// Dumps one stage tensor as raw BF16 bits when FF_CLEF_JOINT_DUMP names a
+    /// directory.
+    #[cfg(test)]
+    fn dump_stage(&self, name: &str, x: &CudaSlice<bf16>) -> Result<()> {
+        let Ok(dir) = std::env::var("FF_CLEF_JOINT_DUMP") else {
+            return Ok(());
+        };
+        let host = self.stream.clone_dtoh(x)?;
+        let path = std::path::Path::new(&dir).join(name);
+        let bytes: Vec<u8> = host
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect();
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
     /// One evidence routing layer: `out = queries + FF(ff_norm(queries +
     /// attention(q_norm(queries), m_norm(memory))))`, reading
     /// `plan.routing[in_slot]` and writing `plan.routing[1 - in_slot]` over
@@ -1041,6 +1058,10 @@ impl JointRun<'_> {
             &w.query_norm_w,
             &w.query_norm_b,
         )?;
+        #[cfg(test)]
+        {
+            self.dump_stage(&format!("routing{layer}_qnorm.raw"), &plan.small)?;
+        }
         {
             let weights = self.routing_attn(w);
             let lane = AttnLane {
@@ -1064,6 +1085,10 @@ impl JointRun<'_> {
                 },
                 &mut plan.flash_routing,
             )?;
+        }
+        #[cfg(test)]
+        {
+            self.dump_stage(&format!("routing{layer}_attn.raw"), &plan.proj_out)?;
         }
         let attn = self.read(&plan.proj_out)?;
         let residual = add_round(&queries, &attn)?;
