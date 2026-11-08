@@ -72,16 +72,17 @@ fn silu_mul_value(
         | crate::model_spec::SwigluRounding::Once
         | crate::model_spec::SwigluRounding::GeluTwice => (gate.to_f32(), up.to_f32()),
     };
-    // The lane16 kernel computes `g * (1/(1+exp(-g)))`; the production kernel computes
-    // `g / (1+exp(-g))`. The two round differently, so the form selects the expression.
+    // Once uses division; the other lane16 SiLU forms use reciprocal multiplication.
     let activated = if gelu {
         let cube = gate * gate * gate;
         let inner = 0.797_884_6f32 * (gate + 0.044_715f32 * cube);
         0.5f32 * gate * (1.0f32 + inner.tanh())
     } else {
-        match form {
-            Form::Lane16 => gate * (1.0 / (1.0 + (-gate).exp())),
-            Form::Lane8 => gate / (1.0 + (-gate).exp()),
+        match (form, rounding) {
+            (Form::Lane16, crate::model_spec::SwigluRounding::Once) | (Form::Lane8, _) => {
+                gate / (1.0 + (-gate).exp())
+            }
+            (Form::Lane16, _) => gate * (1.0 / (1.0 + (-gate).exp())),
         }
     };
     match rounding {
@@ -3589,6 +3590,20 @@ mod tests {
         )?;
         assert_ne!(after, before);
         println!("expert_routed_weight_boundary bit_mismatches>0");
+        let gate = bf16::from_bits(0x3f49);
+        let up = bf16::from_bits(0x3e5f);
+        let denominator = 1.0 + (-gate.to_f32()).exp();
+        let division = bf16::from_f32((gate.to_f32() / denominator) * up.to_f32());
+        let reciprocal = bf16::from_f32((gate.to_f32() * (1.0 / denominator)) * up.to_f32());
+        assert_eq!(division.to_bits(), 0x3df1);
+        assert_ne!(division.to_bits(), reciprocal.to_bits());
+        for form in [Form::Lane8, Form::Lane16] {
+            let actual = silu_mul(gate, up, crate::model_spec::SwigluRounding::Once, 0.0, form)?;
+            assert_eq!(actual.to_bits(), division.to_bits());
+            println!(
+                "expert_silu_once_form form={form:?} bit_mismatches=0 reciprocal_control=true"
+            );
+        }
         Ok(())
     }
 
