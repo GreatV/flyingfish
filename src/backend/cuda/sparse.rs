@@ -57,7 +57,7 @@ pub fn triangle_voxels(
     let hi = hi.map(|v| v + 1e-6);
     let center: [f32; 3] = std::array::from_fn(|a| (lo[a] + hi[a]) / 2.0);
     let extent = (0..3).map(|a| hi[a] - lo[a]).fold(0f32, f32::max);
-    let scale = (resolution as f32 - (2 * pad) as f32 - 2e-6) / extent;
+    let scale = extent.recip() * (resolution as f32 - (2 * pad) as f32 - 2e-6);
     ensure!(
         scale.is_finite() && scale > 0.0,
         "invalid voxel transform scale"

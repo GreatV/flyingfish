@@ -2838,8 +2838,8 @@ where
         "high-grid point feature extent differs"
     );
     let d = &decoder.device;
-    let workspace = PointWorkspace::<T>::new(decoder, &sites, [ci, co], stage == 0)?;
     let input = d.stream.clone_htod(input)?;
+    let workspace = PointWorkspace::<T>::new(decoder, &sites, [ci, co], stage == 0)?;
     let features = decoder.point_blocks(&workspace, input, stage, [ci, co])?;
     let file = format!("dec{stage}.safetensors");
     let cell = &gate.cells[&format!("{file}/features")];
@@ -3013,6 +3013,7 @@ fn cascade_decoder_stages(shapes: &[&str]) -> Result<()> {
             defects += 1;
         }
     }
+    cascade_resources("decoder-stages")?;
     ensure!(defects == 0, "high-grid decoder candidate defects");
     Ok(())
 }
@@ -3238,6 +3239,7 @@ fn cascade_corner_geometry(shapes: &[&str]) -> Result<()> {
             defects += 1;
         }
     }
+    cascade_resources("corner-geometry")?;
     ensure!(defects == 0, "high-grid corner/geometry candidate defects");
     Ok(())
 }
@@ -3452,6 +3454,7 @@ fn hi3d_cascade_mesh_support_gpu() -> Result<()> {
     println!(
         "N5_M4_SUPPORT_GATE cells={cells} defects={defects} short_emission_capacity=rejected timing=false"
     );
+    cascade_resources("mesh-support")?;
     ensure!(
         cells == 12 && defects == 0,
         "mesh/support finite candidate defects"
@@ -4735,6 +4738,10 @@ fn linked_image_cascade(case: &str, index: usize) -> Result<()> {
     println!(
         "PASS N5_M4_LINKED_CASCADE case={case} rungs=64,128,192 image_encoder_calls=3,3 context_reused_per_rung=true prefix_noise=fixed_record high_noise=philox raw_meshes=3 timing=false"
     );
+    cascade_resources(case)
+}
+
+fn cascade_resources(case: &str) -> Result<()> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     ensure!(
         unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0,
