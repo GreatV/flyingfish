@@ -173,6 +173,51 @@ struct OperationGate {
     decoder_key: Option<String>,
 }
 impl OperationGate {
+    fn cascade(section: &str, case: Option<&str>, count: usize) -> Result<Self> {
+        let root = env_path("FF_HI3D_CASCADE_REFERENCE")?;
+        let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        ensure!(
+            freeze["status"] == "FROZEN" && freeze["numeric_cells"] == 228,
+            "invalid high-grid reference freeze"
+        );
+        let source = if let Some(case) = case {
+            &freeze[section][case]
+        } else {
+            &freeze[section]
+        };
+        let anchor = source["candidate_anchor"]
+            .as_str()
+            .or_else(|| source["arms"][0].as_str())
+            .context("high-grid reference anchor missing")?;
+        let mut cells: BTreeMap<String, Value> = serde_json::from_value(source["metrics"].clone())?;
+        if section.starts_with("G2") {
+            cells.retain(|name, _| {
+                name.ends_with("/velocity")
+                    || name.ends_with("/rotated_q")
+                    || name.ends_with("/rotated_k")
+            });
+        }
+        ensure!(cells.len() == count, "high-grid frozen coverage differs");
+        for (name, cell) in &mut cells {
+            let (file, key) = name
+                .split_once('/')
+                .context("high-grid cell has no tensor key")?;
+            cell["anchor_file"] = format!("{anchor}/{file}").into();
+            cell["anchor_tensor"] = key.into();
+            cell["bounds"] = cell["tau"].clone();
+        }
+        Ok(Self {
+            root,
+            kind: format!("{section}/{}", case.unwrap_or("bounded")),
+            prefix: "N5_M4",
+            cells,
+            seen: BTreeSet::new(),
+            defects: 0,
+            decoder_anchor: None,
+            decoder_key: None,
+        })
+    }
+
     fn new(kind: &str, count: usize) -> Result<Self> {
         let root = env_path("FF_HI3D_FIXTURES")?;
         let freeze: Value =
@@ -301,7 +346,14 @@ impl OperationGate {
     }
     fn measure(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
         let cell = self.cells.get(name).context("cell outside frozen scope")?;
-        let anchor = if let Some(path) = &self.decoder_anchor {
+        let anchor = if let Some(path) = cell["anchor_file"].as_str() {
+            tensor(
+                &self.root.join(path),
+                cell["anchor_tensor"]
+                    .as_str()
+                    .context("anchor tensor missing")?,
+            )?
+        } else if let Some(path) = &self.decoder_anchor {
             if let Some(source) = cell["source_cell"].as_str() {
                 let source = tensor(path, source)?;
                 let width = source.shape[1];
@@ -1766,7 +1818,18 @@ fn hi3d_flow_components_gpu() -> Result<()> {
     let input_path = gate.root.join("component-inputs.safetensors");
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         for (name, cell) in gate.cells.clone() {
             if !name.starts_with(component) {
                 continue;
@@ -1879,7 +1942,18 @@ fn hi3d_flow_qk_rope_gpu() -> Result<()> {
     let anchor = gate.root.join("qk/anchor.safetensors");
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         for (name, cell) in gate.cells.clone() {
             if !name.starts_with(component) {
                 continue;
@@ -2001,7 +2075,18 @@ fn hi3d_flow_blocks_gpu() -> Result<()> {
         .collect();
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let mut flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         let conditioning = flow.conditioning(&context, &[], &coordinates)?;
         let modulation = flow.device.stream.clone_htod(&modulation)?;
         for index in [0, 12, 23] {
@@ -2041,7 +2126,14 @@ fn hi3d_flow_pool_inverse_gpu() -> Result<()> {
     let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
     let root = env_path("FF_HI3D_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let flow = Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
+    let flow = Flow::<f16>::open_hi3d(
+        &root,
+        "transformer_512",
+        &runtime,
+        &coordinates,
+        64,
+        8 << 30,
+    )?;
     let io = flow.io.as_ref().context("pool IO missing")?;
     let input: Vec<_> = f32_tensor(&common, "input_blocks.1.updown.features")?
         .into_iter()
@@ -2282,7 +2374,18 @@ fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
     let inputs = gate.root.join("io-inputs.safetensors");
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let mut flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         for (name, cell) in gate.cells.clone() {
             let Some(op) = name.strip_prefix(&format!("{component}.")) else {
                 continue;
@@ -2470,8 +2573,14 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
     let noise = f32_tensor(&source, "noise")?;
     let context = f32_tensor(&fixtures.join("common.safetensors"), "context")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let mut flow =
-        Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
+    let mut flow = Flow::<f16>::open_hi3d(
+        &root,
+        "transformer_512",
+        &runtime,
+        &coordinates,
+        64,
+        8 << 30,
+    )?;
     let positive = flow.conditioning(&context, &[], &coordinates)?;
     let context_stream = flow.device.ctx.new_stream()?;
     let context_device = context_stream.clone_htod(&context)?;
@@ -2523,6 +2632,308 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
         variation["rmse"]
     );
     Ok(())
+}
+
+fn cascade_rope(
+    flow: &Flow<f16>,
+    gate: &mut OperationGate,
+    source: &Path,
+    file: &str,
+) -> Result<()> {
+    for role in ["q", "k"] {
+        let input = half_tensor(source, &format!("rope_{role}"))?;
+        ensure!(
+            input.len() == 257 * 22 * 96,
+            "high-grid QK prefix extent differs"
+        );
+        let data = flow.device.stream.clone_htod(&input)?;
+        unsafe {
+            flow.device
+                .stream
+                .launch_builder(&flow.kernels.rope)
+                .arg(&data)
+                .arg(&flow.phases)
+                .arg(&257i32)
+                .arg(&22i32)
+                .arg(&96i32)
+                .arg(&96i32)
+                .arg(&1i32)
+                .launch(flat(input.len() / 2))?;
+        }
+        let values = flow
+            .device
+            .stream
+            .clone_dtoh(&data)?
+            .into_iter()
+            .map(f16::to_f64)
+            .collect::<Vec<_>>();
+        gate.score(&format!("{file}/rotated_{role}"), &values, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA, high-grid weights and frozen common inputs"]
+fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let context = f32_tensor(
+        &prefix.join("linked-sm89-cottage-r1/handoff.safetensors"),
+        "condition",
+    )?;
+    let mut gate = OperationGate::cascade("G2_bounded", None, 12)?;
+    for maximum in [63, 64, 94, 95] {
+        let file = format!("flow-max{maximum}.safetensors");
+        let source = gate.root.join("flow-sm89-released-r1").join(&file);
+        let points = tensor(&source, "coordinates")?;
+        ensure!(
+            points.shape == [257, 3],
+            "high-grid input coordinate layout differs"
+        );
+        let coordinates = points
+            .values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| p.map(|v| v as i32))
+            .collect::<Vec<_>>();
+        let resolution = if maximum < 64 { 128 } else { 192 };
+        let mut flow = Flow::<f16>::open_hi3d(
+            &model,
+            "transformer_1024",
+            &runtime,
+            &coordinates,
+            resolution,
+            14 << 30,
+        )?;
+        let positive = flow.conditioning(&context, &[], &coordinates)?;
+        let input = flow
+            .device
+            .stream
+            .clone_htod(&f32_tensor(&source, "noise")?)?;
+        let mut output = flow.device.stream.alloc_zeros::<f32>(input.len())?;
+        flow.set_times(&[820.0])?;
+        cascade_rope(&flow, &mut gate, &source, &file)?;
+        flow.forward(&input, 0, &positive, &mut output)?;
+        gate.score(
+            &format!("{file}/velocity"),
+            &flow
+                .device
+                .stream
+                .clone_dtoh(&output)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            false,
+        )?;
+        if maximum == 95 {
+            let parent =
+                SparseSites::new(coordinates.iter().map(|p| [0, p[0], p[1], p[2]]).collect())?
+                    .downsample(2)?
+                    .0;
+            let points = flow.device.stream.clone_htod(
+                &parent
+                    .coordinates()
+                    .iter()
+                    .flat_map(|p| p[1..].iter().map(|&v| v as f32))
+                    .collect::<Vec<_>>(),
+            )?;
+            let frequencies = flow.device.stream.clone_htod(
+                &(0..48)
+                    .map(|i| 1.0 / 10000f32.powf((i % 16) as f32 / 16.0))
+                    .collect::<Vec<_>>(),
+            )?;
+            unsafe {
+                flow.device
+                    .stream
+                    .launch_builder(&flow.kernels.phases)
+                    .arg(&points)
+                    .arg(&frequencies)
+                    .arg(&(flow.rows as i32))
+                    .arg(&1i32)
+                    .arg(&96i32)
+                    .arg(&flow.phases)
+                    .launch(flat(flow.rows * 48))?;
+            }
+            flow.forward(&input, 0, &positive, &mut output)?;
+            gate.score(
+                &format!("{file}/velocity"),
+                &flow
+                    .device
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>(),
+                true,
+            )?;
+        }
+        println!(
+            "N5_M4_FLOW_EXECUTION training_grid=128 execution_grid={resolution} pooled_max={maximum} rows={} phases=spatial_phases rope=flow_rope_f16 attention=D96 eager=true",
+            coordinates.len()
+        );
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and four frozen high-grid production supports"]
+fn hi3d_cascade_production_flow_gpu() -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    for shape in [
+        "1024-cottage",
+        "1024-robot-crab",
+        "1536-cottage",
+        "1536-robot-crab",
+    ] {
+        let mut gate = OperationGate::cascade("G2_production", Some(shape), 3)?;
+        let directory = gate.root.join(format!("rung{shape}-sm86-r1"));
+        let source = directory.join("production-flow.safetensors");
+        let coordinates = lattice(&source, "coordinates")?;
+        let state = f32_tensor(&source, "state")?;
+        let time = f32_tensor(&source, "timestep")?;
+        let case = if shape.ends_with("cottage") {
+            "cottage"
+        } else {
+            "robot_crab"
+        };
+        let context = f32_tensor(
+            &prefix.join(format!("linked-sm89-{case}-r1/handoff.safetensors")),
+            "condition",
+        )?;
+        let resolution = if shape.starts_with("1024") { 128 } else { 192 };
+        for control in [false, true] {
+            let coordinates: Vec<_> = coordinates
+                .iter()
+                .map(|&p| if control { [p[2], p[1], p[0]] } else { p })
+                .collect();
+            let mut flow = Flow::<f16>::open_hi3d(
+                &model,
+                "transformer_1024",
+                &runtime,
+                &coordinates,
+                resolution,
+                14 << 30,
+            )?;
+            let condition = flow.conditioning(&context, &[], &coordinates)?;
+            let input = flow.device.stream.clone_htod(&state)?;
+            let mut output = flow.device.stream.alloc_zeros::<f32>(state.len())?;
+            flow.set_times(&time)?;
+            if !control {
+                let anchor = gate.root.join(
+                    gate.cells["production.safetensors/rotated_q"]["anchor_file"]
+                        .as_str()
+                        .context("anchor missing")?,
+                );
+                cascade_rope(&flow, &mut gate, &anchor, "production.safetensors")?;
+            }
+            flow.forward(&input, 0, &condition, &mut output)?;
+            gate.score(
+                "production.safetensors/velocity",
+                &flow
+                    .device
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>(),
+                control,
+            )?;
+            println!(
+                "N5_M4_PRODUCTION_EXECUTION case={shape} control={control} input_rows={} parent_rows={} execution_grid={resolution} eager=true",
+                coordinates.len(),
+                flow.rows
+            );
+        }
+        gate.finish()?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen common-state Heun slopes"]
+fn hi3d_cascade_heun_updates_gpu() -> Result<()> {
+    let mut gate = OperationGate::cascade("G3_common_state_and_both_slopes", None, 116)?;
+    let device = Device::new(0)?;
+    let update = cubin::module(&device.ctx, "flow")?.load_function("heun_update_f32")?;
+    let files = gate
+        .cells
+        .keys()
+        .map(|name| name.split('/').next().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    for file in files {
+        let (rows, step) = if let Some(rows) = file.strip_prefix("production-") {
+            (rows.trim_end_matches(".safetensors").parse::<usize>()?, 12)
+        } else {
+            (
+                257,
+                file.trim_start_matches("heun-")
+                    .trim_end_matches(".safetensors")
+                    .parse::<usize>()?,
+            )
+        };
+        let source = gate
+            .root
+            .join("flow-sm89-released-r1")
+            .join(format!("heun-{step:02}.safetensors"));
+        let mut inputs = Vec::new();
+        for key in ["state", "first_slope", "second_slope"] {
+            let compact = f32_tensor(&source, key)?;
+            ensure!(compact.len() == 257 * 32, "common Heun extent differs");
+            let values = (0..rows)
+                .flat_map(|r| {
+                    let index = if rows == 257 { r } else { r * 131 % 257 };
+                    compact[index * 32..(index + 1) * 32].iter().copied()
+                })
+                .collect::<Vec<_>>();
+            inputs.push(device.stream.clone_htod(&values)?);
+        }
+        let (time, next) = heun_schedule(rows, 25)?[step];
+        for (key, value) in [("sigma", time), ("next_sigma", next)] {
+            gate.score(&format!("{file}/{key}"), &[value as f64], false)?;
+        }
+        let output = device.stream.alloc_zeros::<f32>(rows * 32)?;
+        for (key, second, control) in [
+            ("predicted", 0, false),
+            ("updated", ptr(&inputs[2], &device), false),
+            ("updated", ptr(&inputs[0], &device), true),
+        ] {
+            if control && (rows != 257 || step != 12) {
+                continue;
+            }
+            let second = if control {
+                ptr(&inputs[1], &device)
+            } else {
+                second
+            };
+            unsafe {
+                device
+                    .stream
+                    .launch_builder(&update)
+                    .arg(&inputs[0])
+                    .arg(&inputs[1])
+                    .arg(&second)
+                    .arg(&output)
+                    .arg(&((rows * 32) as u64))
+                    .arg(&(time - next))
+                    .launch(flat(rows * 32))?;
+            }
+            gate.score(
+                &format!("{file}/{key}"),
+                &device
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>(),
+                control,
+            )?;
+        }
+    }
+    gate.finish()
 }
 fn metrics(x: &[f64], y: &[f64]) -> Result<BTreeMap<&'static str, f64>> {
     ensure!(!x.is_empty() && x.len() == y.len(), "metric shape mismatch");
@@ -3173,7 +3584,7 @@ fn linked_mesh_case(
             .checked_sub(total - free)
             .context("linked resident data exceeds derived device envelope")
     };
-    let mut flow = Flow::<f16>::open_hi3d(model, "transformer_512", runtime, &grid, budget()?)?;
+    let mut flow = Flow::<f16>::open_hi3d(model, "transformer_512", runtime, &grid, 64, budget()?)?;
     ensure!(
         flow.coordinates == grid
             && flow.io.as_ref().context("linked sparse IO missing")?.rows == grid.len(),

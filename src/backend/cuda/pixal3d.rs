@@ -1672,17 +1672,12 @@ impl Flow<f16> {
         component: &str,
         runtime: &Path,
         coordinates: &[[i32; 3]],
+        resolution: usize,
         budget: usize,
     ) -> Result<Self> {
         let checkpoint = Hi3DFlowCheckpoint::open(root, component)?;
+        checkpoint.spec.validate_grid(coordinates, resolution)?;
         let spec = checkpoint.spec.flow_spec();
-        ensure!(
-            coordinates
-                .iter()
-                .flatten()
-                .all(|&v| v >= 0 && (v as usize) < spec.resolution),
-            "flow coordinates outside configured grid"
-        );
         let sites = SparseSites::new(coordinates.iter().map(|p| [0, p[0], p[1], p[2]]).collect())?;
         let (parent, inverse) = sites.downsample(2)?;
         let rows = parent.coordinates().len();
@@ -1878,9 +1873,10 @@ impl Flow<f16> {
         {
             let gather_bytes = io.blocks[2].conv[0].workspace_bytes() - io.rows * 27 * 4;
             println!(
-                "SPARSE_FLOW_PLACEMENT published_bytes={} config_affine_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} shared_gather_bytes={gather_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes}",
+                "SPARSE_FLOW_PLACEMENT published_bytes={} config_affine_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} shared_gather_bytes={gather_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes} training_grid={} execution_grid={resolution} input_rows={io_rows} parent_rows={rows}",
                 checkpoint.runtime_bytes,
-                2 * spec.out_channels * 4
+                2 * spec.out_channels * 4,
+                checkpoint.spec.resolution
             );
         }
         Ok(Self {

@@ -189,6 +189,24 @@ pub struct Hi3DFlowSpec {
 }
 
 impl Hi3DFlowSpec {
+    pub fn validate_grid(&self, coordinates: &[[i32; 3]], resolution: usize) -> Result<()> {
+        ensure!(
+            matches!((self.resolution, resolution), (64, 64) | (128, 128 | 192)),
+            "unsupported flow training/execution grids {}/{}",
+            self.resolution,
+            resolution
+        );
+        ensure!(
+            !coordinates.is_empty()
+                && coordinates
+                    .iter()
+                    .flatten()
+                    .all(|&v| v >= 0 && (v as usize) < resolution),
+            "flow coordinates outside execution grid {resolution}"
+        );
+        Ok(())
+    }
+
     pub fn read(root: &Path, component: &str) -> Result<Self> {
         let resolution = match component {
             "transformer_512" => 64,
@@ -872,12 +890,52 @@ mod tests {
         let root = std::env::var_os("FF_HI3D_MODEL").context("FF_HI3D_MODEL required")?;
         for component in ["transformer_512", "transformer_1024"] {
             let checkpoint = Hi3DFlowCheckpoint::open(Path::new(&root), component)?;
+            let resolution = checkpoint.spec.resolution;
+            checkpoint.spec.validate_grid(&[[0, 1, 2]], resolution)?;
+            ensure!(
+                checkpoint
+                    .spec
+                    .validate_grid(&[[0, 1, resolution as i32]], resolution)
+                    .is_err(),
+                "out-of-grid coordinate control accepted"
+            );
+            if resolution == 128 {
+                checkpoint.spec.validate_grid(&[[128, 190, 191]], 192)?;
+                ensure!(
+                    checkpoint
+                        .spec
+                        .validate_grid(&[[128, 190, 191]], 128)
+                        .is_err()
+                        && checkpoint.spec.validate_grid(&[[0, 1, 2]], 256).is_err(),
+                    "training/execution grid control accepted"
+                );
+            } else {
+                ensure!(
+                    checkpoint.spec.validate_grid(&[[0, 1, 2]], 192).is_err(),
+                    "low-grid weights accepted for high-grid execution"
+                );
+            }
             ensure!(
                 checkpoint.runtime_bytes == 3_675_626_624,
                 "published flow byte count"
             );
             let mut tensors = checkpoint.mapped.component_tensors()?;
             ensure!(tensors.len() == 512, "published flow tensor count");
+            let key = "blocks.0.self_attn.q_rms_norm.gamma";
+            tensors
+                .get_mut(key)
+                .context("gain missing")?
+                .shape
+                .swap(0, 1);
+            ensure!(
+                checkpoint.spec.validate_tensors(&tensors).is_err(),
+                "same-element-count gain axis control accepted"
+            );
+            tensors
+                .get_mut(key)
+                .context("gain missing")?
+                .shape
+                .swap(0, 1);
             tensors
                 .get_mut("blocks.0.self_attn.q_rms_norm.gamma")
                 .context("gain missing")?
