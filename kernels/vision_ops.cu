@@ -1691,6 +1691,23 @@ extern "C" __global__ void activation_f32(
     activation(input,output,rows,width,mode);
 }
 
+// Eight consecutive F32 logit rows become one F32 probability row.
+extern "C" __global__ void sigmoid_avg_pool_f32(
+    const float* logits, float* probs, uint32_t groups, uint32_t width) {
+    const uint64_t count = uint64_t(groups) * width;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        const uint32_t group = i / width;
+        const uint32_t speaker = i % width;
+        float sum = 0.0f;
+        for (uint32_t phase = 0; phase < 8; ++phase) {
+            const float x = logits[(uint64_t(group) * 8 + phase) * width + speaker];
+            sum += 1.0f / (1.0f + expf(-x));
+        }
+        probs[i] = sum / 8.0f;
+    }
+}
+
 extern "C" __global__ void kv_unpack_head_major_f16(
     const __half* packed, __half* q, __half* k, __half* v,
     uint32_t batch, uint32_t rows, uint32_t heads, uint32_t dim, int parts) {
