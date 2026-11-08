@@ -274,6 +274,251 @@ mod gates {
         Ok(())
     }
 
+    type DecodeRefs = (BTreeMap<String, Vec<f32>>, BTreeMap<String, (f64, f64)>);
+
+    fn load_decode_refs() -> Result<DecodeRefs> {
+        let path = PathBuf::from(
+            std::env::var("FF_CLEF_DECODE_REF").context("FF_CLEF_DECODE_REF missing")?,
+        );
+        let bytes = std::fs::read(&path)?;
+        let view = SafeTensors::deserialize(&bytes)?;
+        let mut refs = BTreeMap::new();
+        for name in view.names() {
+            if view.tensor(name)?.dtype() == safetensors::Dtype::I32 {
+                continue;
+            }
+            refs.insert(name.to_owned(), tensor_f32(&view, name)?);
+        }
+        let tau_path = PathBuf::from(
+            std::env::var("FF_CLEF_DECODE_TAUS").context("FF_CLEF_DECODE_TAUS missing")?,
+        );
+        let taus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&tau_path)
+                .with_context(|| format!("decode tau file {} missing", tau_path.display()))?,
+        )?;
+        let mut bounds = BTreeMap::new();
+        for (name, cell) in taus.as_object().context("tau cells")? {
+            bounds.insert(
+                name.clone(),
+                (
+                    cell["tau"].as_f64().context("tau max")?,
+                    cell["tau_rmse"].as_f64().context("tau rmse")?,
+                ),
+            );
+        }
+        Ok((refs, bounds))
+    }
+
+    fn decode_cell(
+        refs: &BTreeMap<String, Vec<f32>>,
+
+        bounds: &BTreeMap<String, (f64, f64)>,
+        cell: &str,
+        got: &[f32],
+    ) -> Result<()> {
+        let want = refs
+            .get(cell)
+            .with_context(|| format!("decode reference {cell} missing"))?;
+        ensure!(
+            got.len() == want.len(),
+            "decode extent {cell}: got {} want {}",
+            got.len(),
+            want.len()
+        );
+        let (max, rmse) = max_rmse(got, want)?;
+        let bound = bounds
+            .get(cell)
+            .with_context(|| format!("frozen decode bound {cell} missing"))?;
+        println!(
+            "CLEF_DECODE {cell} max={max:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+            bound.0, bound.1
+        );
+        ensure!(
+            max <= bound.0 && rmse <= bound.1,
+            "decode cell {cell} exceeds the frozen bound"
+        );
+        Ok(())
+    }
+
+    fn emitted_ids(refs: &BTreeMap<String, Vec<f32>>) -> Result<Vec<u32>> {
+        (0..8)
+            .map(|step| {
+                let logits = refs
+                    .get(&format!("decode_logits_s{step}"))
+                    .context("decode logits cell missing")?;
+                let argmax = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .context("empty logits")?;
+                Ok(argmax.0 as u32)
+            })
+            .collect()
+    }
+
+    /// Decode cells D1+D2: teacher-forced K=8 steps after the 512-token
+    /// prefill. Per-step logits and the post-step GDN state/conv history
+    /// are gated against the frozen decode references.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_DECODE_REF, FF_CLEF_DECODE_TAUS, FF_CLEF_FIXTURE_IDS"]
+    fn clef_flash_decode_cells() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let (refs, bounds) = load_decode_refs()?;
+        let emitted = emitted_ids(&refs)?;
+        let ids = fixture_ids(512)?;
+        let runtime = std::env::temp_dir().join(format!("clef-decode-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        engine.prefill(&ids, None)?;
+        for (step, token) in emitted.iter().enumerate() {
+            let cell = format!("decode_logits_s{step}");
+            let logits = engine.decode_logits()?;
+            decode_cell(&refs, &bounds, &cell, &logits)?;
+            engine.set_token(*token)?;
+            engine.decode(false, None)?;
+        }
+        for layer in [0usize, 1, 2] {
+            let (state, history) = engine.decode_gdn_state(layer)?;
+            decode_cell(
+                &refs,
+                &bounds,
+                &format!("l{layer}_recurrent_states"),
+                &state,
+            )?;
+            // The engine's history [conv_dim, 3] is the last three
+            // columns of the reference window [conv_dim, 4].
+            let wide = refs
+                .get(&format!("l{layer}_conv_states"))
+                .with_context(|| format!("l{layer}_conv_states missing"))?;
+            ensure!(wide.len() % 4 == 0, "conv window width mismatch");
+            let want: Vec<f32> = (0..wide.len() / 4)
+                .flat_map(|c| wide[c * 4 + 1..c * 4 + 4].iter().copied())
+                .collect();
+            ensure!(
+                history.len() == want.len(),
+                "history extent layer {layer}: got {} want {}",
+                history.len(),
+                want.len()
+            );
+            let (max, rmse) = max_rmse(&history, &want)?;
+            let bound = bounds
+                .get(&format!("l{layer}_conv_states_history"))
+                .context("history bound missing")?;
+            println!(
+                "CLEF_DECODE l{layer}_conv_states_history max={max:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+                bound.0, bound.1
+            );
+            ensure!(
+                max <= bound.0 && rmse <= bound.1,
+                "decode cell l{layer}_conv_states_history exceeds the frozen bound"
+            );
+        }
+        Ok(())
+    }
+
+    /// Decode D3: eager and CUDA-graph decode over teacher-forced steps
+    /// must be bit-identical, and the decode reset must preserve the
+    /// identity across all four mode pairs.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_DECODE_REF, FF_CLEF_DECODE_TAUS, FF_CLEF_FIXTURE_IDS"]
+    fn clef_flash_decode_identity() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let (refs, _) = load_decode_refs()?;
+        let emitted = emitted_ids(&refs)?;
+        let ids = fixture_ids(512)?;
+        let runtime = std::env::temp_dir().join(format!("clef-dident-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        fn probe(
+            engine: &mut Engine,
+            emitted: &[u32],
+            ids: &[u32],
+            graph: bool,
+        ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
+            engine.reset()?;
+            engine.prefill(ids, None)?;
+            let mut tokens = Vec::new();
+            let mut logits = Vec::new();
+            for token in emitted {
+                let step_logits = engine.decode_logits()?;
+                logits.extend(step_logits);
+                tokens.push(*token);
+                engine.set_token(*token)?;
+                engine.decode(graph, None)?;
+            }
+            let (state, _) = engine.decode_gdn_state(1)?;
+            Ok((tokens, logits, state))
+        }
+        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime))?;
+        let mut defects = 0;
+        for (first_mode, second_mode) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let first = probe(&mut engine, &emitted, &ids, first_mode)?;
+            let second = probe(&mut engine, &emitted, &ids, second_mode)?;
+            let same = first.0 == second.0
+                && first.1.len() == second.1.len()
+                && first
+                    .1
+                    .iter()
+                    .zip(second.1.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                && first.2 == second.2;
+            println!(
+                "CLEF_DECODE_IDENTITY first={first_mode} second={second_mode} identical={same}"
+            );
+            defects += usize::from(!same);
+        }
+        ensure!(
+            defects == 0,
+            "DEFECT clef_flash_decode_identity pairs={defects}"
+        );
+        Ok(())
+    }
+
+    /// Decode D4: the conv-overwrite mutant applied after the prefill
+    /// moves the first decode-step logits far beyond the frozen bound.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_DECODE_REF, FF_CLEF_DECODE_TAUS, FF_CLEF_FIXTURE_IDS"]
+    fn clef_flash_decode_control() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let (refs, bounds) = load_decode_refs()?;
+        let emitted = emitted_ids(&refs)?;
+        let ids = fixture_ids(512)?;
+        let runtime = std::env::temp_dir().join(format!("clef-dcontrol-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        // The accepted control form: the mutant is applied at load time
+        // (before plan binding), so the whole context carries it.
+        unsafe {
+            std::env::set_var("FF_CLEF_TEST_PLANT", "conv:4:2");
+        }
+        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime.clone()))?;
+        unsafe {
+            std::env::remove_var("FF_CLEF_TEST_PLANT");
+        }
+        engine.prefill(&ids, None)?;
+        engine.set_token(emitted[0])?;
+        engine.decode(false, None)?;
+        let step1 = engine.decode_logits()?;
+        let want = refs
+            .get("decode_logits_s1")
+            .context("decode reference s1 missing")?;
+        let (max, rmse) = max_rmse(&step1, want)?;
+        let bound = bounds.get("decode_logits_s1").context("tau s1 missing")?;
+        println!(
+            "CLEF_DECODE_CONTROL decode_conv_overwrite max={max:.6e} (>= {:.6e}) rmse={rmse:.6e} (>= {:.6e})",
+            10.0 * bound.0,
+            10.0 * bound.1
+        );
+        ensure!(
+            max >= 10.0 * bound.0 && rmse >= 10.0 * bound.1,
+            "decode conv control under 10x"
+        );
+        Ok(())
+    }
+
     /// Text logits cells at 8 spread positions on both fixtures.
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_FROZEN, FF_CLEF_REF_TAPS, FF_CLEF_FIXTURE_IDS"]
@@ -316,138 +561,6 @@ mod gates {
                     "logits cell L{length}_p{i} exceeds the frozen cell"
                 );
             }
-        }
-        Ok(())
-    }
-
-    /// Engine layer-0 sub-stage trace: saves every recorded layer-0 point
-    /// (qkv_projected absent in the GDN path; mixer_out, o_proj, norm1/2,
-    /// post_attention, ffn, gdn_s, gdn_history) to the run dir for the
-    /// CPU localization table.
-    #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_N2_TRACE_OUT"]
-    fn clef_flash_layer0_trace_dump() -> Result<()> {
-        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
-        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
-        let out_dir = PathBuf::from(std::env::var("FF_N2_TRACE_OUT").context("FF_N2_TRACE_OUT")?);
-        std::fs::create_dir_all(&out_dir)?;
-        let ids = fixture_ids(512)?;
-        let runtime = std::env::temp_dir().join(format!("clef-tr0-{}", std::process::id()));
-        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
-        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime))?;
-        engine.trace_layer = 0;
-        let mut trace = Trace::all_layers();
-        engine.prefill(&ids, Some(&mut trace))?;
-        for name in trace.names() {
-            if !name.starts_with("layer.") {
-                continue;
-            }
-            let values = trace.values(name)?;
-            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let fname = name.replace('/', "_");
-            std::fs::write(out_dir.join(format!("{fname}.f32")), bytes)?;
-            println!("CLEF_TRACE0_DUMP {name} elements={}", values.len());
-        }
-        println!("CLEF_TRACE0_DUMP out={}", out_dir.display());
-        Ok(())
-    }
-    /// Engine layer-0 sub-stage trace against the reference localization
-    /// taps: the in-proj projection, the conv history, the gated output
-    /// and the block output, each compared with max/rmse. Localization
-    /// only — these tensors never enter a freeze.
-    #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_REF_TAPS, FF_CLEF_FIXTURE_IDS"]
-    fn clef_flash_layer0_substage_trace() -> Result<()> {
-        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
-        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
-        let refs = load_ref_taps()?;
-        let ids = fixture_ids(512)?;
-        let runtime = std::env::temp_dir().join(format!("clef-tr0-{}", std::process::id()));
-        Engine::calibrate(&dir, 0, 4096, None, settings(runtime.clone()))?;
-        let mut engine = Engine::load(&dir, 0, 4096, None, settings(runtime))?;
-        engine.trace_layer = 0;
-        let mut trace = Trace::all_layers();
-        engine.prefill(&ids, Some(&mut trace))?;
-        let names = trace.names();
-        println!("CLEF_TRACE0 points={}", names.len());
-        for n in &names {
-            println!("CLEF_TRACE0 has {n}");
-        }
-
-        // Conv-history check: the engine's history is the exact widening
-        // of the pre-conv input's last three rows; compare against the
-        // reference in_proj output's rows 509..512 laid out [channel, 3].
-        if let Ok(hist) = trace.values("layer.0.debug.gdn_history.e2e") {
-            // The reference splits concatenate channel-wise into the
-            // 8192-wide pre-conv input; its last three rows, laid out
-            // [channel, 3], are the conv history.
-            let q = refs.get("sub_in_proj_q").context("sub_in_proj_q missing")?;
-            let k = refs.get("sub_in_proj_k").context("sub_in_proj_k missing")?;
-            let v = refs.get("sub_in_proj_v").context("sub_in_proj_v missing")?;
-            let mut tail = Vec::with_capacity(8192 * 3);
-            for c in 0..8192usize {
-                let (split, col, stride) = if c < 2048 {
-                    (q, c, 2048usize)
-                } else if c < 4096 {
-                    (k, c - 2048, 2048usize)
-                } else {
-                    (v, c - 4096, 4096usize)
-                };
-                for j in 0..3 {
-                    tail.push(split[(509 + j) * stride + col]);
-                }
-            }
-            println!(
-                "CLEF_TRACE0 gdn_history extent={} tail={}",
-                hist.len(),
-                tail.len()
-            );
-            if tail.len() == hist.len() {
-                let (max, rmse) = max_rmse(&hist, &tail)?;
-                println!(
-                    "CLEF_TRACE0 gdn_history vs ref_inproj_tail: max={max:.6e} rmse={rmse:.6e}"
-                );
-            }
-        }
-        if let Ok(s_state) = trace.values("layer.0.debug.gdn_s.e2e") {
-            let absmax = s_state.iter().fold(0.0f64, |m, v| m.max((*v as f64).abs()));
-            let finite = s_state.iter().all(|v| v.is_finite());
-            println!(
-                "CLEF_TRACE0 gdn_s absmax={absmax:.6e} finite={finite} extent={}",
-                s_state.len()
-            );
-        }
-        for (point, ref_name) in [
-            ("layer.0.debug.mixer_out", "sub_norm_out"),
-            ("layer.0.debug.o_proj", "sub_block_out"),
-        ] {
-            let got = match trace.values(point) {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("CLEF_TRACE0 {point} absent: {e}");
-                    continue;
-                }
-            };
-            let want = match refs.get(ref_name) {
-                Some(w) => w,
-                None => {
-                    println!("CLEF_TRACE0 {point}: reference {ref_name} absent");
-                    continue;
-                }
-            };
-            if got.len() != want.len() {
-                println!(
-                    "CLEF_TRACE0 {point} vs {ref_name}: EXTENT got {} want {}",
-                    got.len(),
-                    want.len()
-                );
-                continue;
-            }
-            let (max, rmse) = max_rmse(&got, want)?;
-            println!(
-                "CLEF_TRACE0 {point} vs {ref_name}: max={max:.6e} rmse={rmse:.6e} extent={}",
-                got.len()
-            );
         }
         Ok(())
     }
