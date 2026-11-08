@@ -3065,6 +3065,8 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
     }
     println!("GLM_MTP_FREE_BASELINE ids={baseline:?} margins={baseline_margins:?}");
     std::io::stdout().flush()?;
+    drop(engine);
+    let mut engine = load_composition_engine()?;
     engine.mtp_enable(MtpOptions {
         depth: 1,
         hidden_tap: MtpHiddenTap::PostFinalNorm,
