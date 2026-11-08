@@ -1181,6 +1181,7 @@ impl Blas {
     /// Plain cuBLAS BF16 GEMM: `y = x @ w[w_rows]`^T over row-major `x`
     /// `[rows, input]` and the weight row range `w_rows` of `w`
     /// `[total_rows, input]`, F32 compute, BF16 `y` `[rows, w_rows.len()]`.
+    /// `x` and `y` may carry extra scratch capacity beyond the GEMM extent.
     /// No Lt plans, calibration or row binding.
     pub(crate) fn gemm_bf16(
         &self,
@@ -1195,7 +1196,7 @@ impl Blas {
         checked_dims(rows, w_rows, input)?;
         ensure!(
             w.len() >= (w_row0 + w_rows) * input
-                && x.len() == rows * input
+                && x.len() >= rows * input
                 && y.len() >= rows * w_rows,
             "BF16 GEMM extent mismatch: rows={rows} w_rows={w_rows} input={input} w={} x={} y={}",
             w.len(),
