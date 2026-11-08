@@ -124,7 +124,7 @@ fn triangulate_boundary(
     let point =
         |v: u32| <[f32; 3]>::try_from(&vertices[3 * v as usize..3 * v as usize + 3]).unwrap();
     let sub = |a: [f32; 3], b: [f32; 3]| std::array::from_fn::<_, 3, _>(|i| a[i] - b[i]);
-    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let dot = |a: [f32; 3], b: [f32; 3]| (0.0 + a[0] * b[0] + a[1] * b[1]) + a[2] * b[2];
     let cross = |a: [f32; 3], b: [f32; 3]| {
         [
             a[1] * b[2] - a[2] * b[1],
@@ -335,6 +335,44 @@ pub struct SerializedWindows {
     pub(crate) offsets: Vec<u32>,
 }
 impl SparseSites {
+    pub fn unit_ball_frame(&self) -> Result<[[f32; 4]; 4]> {
+        let batch = self.coordinates[0][0];
+        ensure!(
+            self.coordinates.iter().all(|p| p[0] == batch),
+            "unit-ball frame requires one sample"
+        );
+        let mut sum = [0u64; 3];
+        for p in &self.coordinates {
+            for a in 0..3 {
+                sum[a] = sum[a]
+                    .checked_add(p[a + 1] as u64)
+                    .context("coordinate sum overflow")?;
+            }
+        }
+        let inverse = 1.0f32 / self.coordinates.len() as f32;
+        let center = sum.map(|v| v as f32 * inverse);
+        let radius = self
+            .coordinates
+            .iter()
+            .map(|p| {
+                let d: [f32; 3] = std::array::from_fn(|a| p[a + 1] as f32 - center[a]);
+                ((d[0] * d[0] + d[2] * d[2]) + d[1] * d[1]).sqrt()
+            })
+            .fold(0f32, f32::max)
+            + 1e-8;
+        ensure!(
+            radius.is_finite() && radius > 0.0,
+            "invalid unit-ball radius"
+        );
+        let mut frame = [[0.0; 4]; 4];
+        for a in 0..3 {
+            frame[a][a] = 1.0 / radius;
+            frame[a][3] = -center[a] / radius;
+        }
+        frame[3][3] = 1.0;
+        Ok(frame)
+    }
+
     pub fn cube_corners(&self) -> Result<SparseCorners> {
         let count = self
             .coordinates

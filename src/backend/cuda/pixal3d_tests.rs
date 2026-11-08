@@ -3129,7 +3129,34 @@ fn cascade_corner_geometry(shapes: &[&str]) -> Result<()> {
         drop(signs);
         let matrix = f32_tensor(&source, "matrix")?;
         ensure!(matrix.len() == 16, "decoded frame extent differs");
-        let frame = std::array::from_fn(|i| std::array::from_fn(|j| matrix[4 * i + j]));
+        let coarse = tensor(
+            &root.join(format!("rung{shape}-sm86-r1/input.safetensors")),
+            "coordinates",
+        )?;
+        ensure!(
+            coarse.shape.len() == 2 && coarse.shape[1] == 3,
+            "coarse support frame layout differs"
+        );
+        let coarse = SparseSites::new(
+            coarse
+                .values
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| [0, p[0] as i32, p[1] as i32, p[2] as i32])
+                .collect(),
+        )?;
+        let frame = coarse.unit_ball_frame()?;
+        println!(
+            "N5_M4_FRAME case={shape} coarse_rows={} max_coefficient_error={}",
+            coarse.coordinates().len(),
+            frame
+                .as_flattened()
+                .iter()
+                .zip(&matrix)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0f32, f32::max)
+        );
         let rows = tensor(&root.join(&anchor), "selected_rows")?
             .values
             .into_iter()
@@ -3234,6 +3261,20 @@ fn cascade_incidence_exact(voxels: &TriangleVoxels, path: &Path) -> Result<bool>
             .all(|(&a, &b)| a == b as f64)
         && coordinates.shape[0] == voxels.sites.coordinates().len()
         && owners.values.len() == voxels.voxel_faces.len();
+    if !exact {
+        println!(
+            "N5_M4_TRIANGLE_FACE_DIAGNOSTIC first_different_counts={:?}",
+            face_counts
+                .values
+                .iter()
+                .zip(&voxels.face_counts)
+                .enumerate()
+                .filter(|(_, (a, b))| **a != **b as f64)
+                .take(8)
+                .map(|(i, (&a, &b))| (i, a, b))
+                .collect::<Vec<_>>()
+        );
+    }
     let mut differences = 0;
     for (row, p) in coordinates.values.as_chunks::<3>().0.iter().enumerate() {
         let Some(actual) = voxels.sites.row([0, p[0] as i32, p[1] as i32, p[2] as i32]) else {
@@ -3253,6 +3294,16 @@ fn cascade_incidence_exact(voxels: &TriangleVoxels, path: &Path) -> Result<bool>
             .collect::<Vec<_>>();
         expected.sort_unstable();
         let span = voxels.voxel_offsets[actual] as usize..voxels.voxel_offsets[actual + 1] as usize;
+        if voxels.voxel_faces[span.clone()] != expected && differences < 4 {
+            println!(
+                "N5_M4_TRIANGLE_VOXEL_DIAGNOSTIC coordinate={p:?} expected_prefix={:?} actual_prefix={:?}",
+                expected.iter().take(12).collect::<Vec<_>>(),
+                voxels.voxel_faces[span.clone()]
+                    .iter()
+                    .take(12)
+                    .collect::<Vec<_>>()
+            );
+        }
         differences += usize::from(voxels.voxel_faces[span] != expected);
     }
     exact &= differences == 0;
@@ -4383,15 +4434,9 @@ fn linked_mesh_case(
     Ok(mesh)
 }
 
-#[test]
-#[ignore = "requires admitted CUDA, published image/flow/decoder checkpoints and frozen media"]
-fn hi3d_linked_image_mesh_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+fn linked_image_contexts() -> Result<(Vec<CudaSlice<f32>>, usize)> {
     let image_root = env_path("FF_HI3D_IMAGE_FIXTURES")?;
-    let model = env_path("FF_HI3D_MODEL")?;
-    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?;
     let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    std::fs::create_dir_all(&output)?;
     let image_bytes = std::fs::read(image_root.join("cpu-r2/inputs.safetensors"))?;
     let images = safetensors::SafeTensors::deserialize(&image_bytes)?;
     let image_freeze: Value =
@@ -4467,6 +4512,18 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     drop(first);
     drop(swapped);
     drop(replay);
+    Ok((contexts, defects))
+}
+
+#[test]
+#[ignore = "requires admitted CUDA, published image/flow/decoder checkpoints and frozen media"]
+fn hi3d_linked_image_mesh_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let model = env_path("FF_HI3D_MODEL")?;
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?;
+    let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    std::fs::create_dir_all(&output)?;
+    let (contexts, mut defects) = linked_image_contexts()?;
     let mut meshes = Vec::new();
     for (index, support, label) in [
         (0, "cottage", "cottage-A1"),
@@ -4512,6 +4569,195 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     );
     ensure!(defects == 0, "finite linked pipeline candidate defects");
     Ok(())
+}
+
+fn linked_image_cascade(case: &str, index: usize) -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?.join(case);
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    std::fs::create_dir_all(&output)?;
+    let (mut contexts, defects) = linked_image_contexts()?;
+    ensure!(defects == 0, "linked cascade media candidate defects");
+    let context = contexts.swap_remove(index);
+    drop(contexts);
+    let d = Device::new(0)?;
+    generation_capture(
+        &output.join("native-context.safetensors"),
+        &[],
+        &d.stream.clone_dtoh(&context)?,
+        vec![1, 2917, 2048],
+    )?;
+    let budget = || -> Result<usize> {
+        let (free, total) = d.ctx.mem_get_info()?;
+        let envelope = total - total / 8;
+        envelope
+            .checked_sub(total - free)
+            .context("cascade live data exceeds detected device envelope")
+    };
+    let mut mesh = linked_mesh_case(
+        &model,
+        &prefix,
+        &runtime,
+        &output,
+        &context,
+        case,
+        "native-512",
+    )?;
+    for (stream, resolution, limit) in [(1u64, 128u32, 90_000usize), (2, 192, 110_000)] {
+        let host_available = super::super::calibrate::host_memory(Path::new("/"))?;
+        let fill_bytes = mesh
+            .faces
+            .len()
+            .checked_mul(24)
+            .and_then(|v| v.checked_add(mesh.vertices.len().checked_mul(24)?))
+            .context("boundary host reservation overflow")?;
+        ensure!(
+            fill_bytes as u64 <= host_available - host_available / 16,
+            "boundary host reservation exceeds available memory"
+        );
+        let added = mesh.fill_holes(
+            mesh.faces
+                .len()
+                .checked_mul(4)
+                .context("boundary face capacity overflow")?
+                / 3,
+        )?;
+        let (free, _) = d.ctx.mem_get_info()?;
+        let (accepted, voxels) =
+            adaptive_mesh_support(&d, &mesh, resolution, limit, usize::MAX, [free, budget()?])?;
+        let grid = voxels
+            .sites
+            .coordinates()
+            .iter()
+            .map(|p| [p[1], p[2], p[3]])
+            .collect::<Vec<_>>();
+        let frame = voxels.sites.unit_ball_frame()?;
+        let parent = voxels.sites.downsample(2)?.0;
+        let maximum = parent
+            .coordinates()
+            .iter()
+            .flat_map(|p| &p[1..])
+            .copied()
+            .max()
+            .context("empty cascade parents")?;
+        let parents = parent.coordinates().len();
+        drop(parent);
+        drop(voxels);
+        drop(mesh);
+        let n = grid.len();
+        let noise = d.stream.alloc_zeros::<f32>(n * 32)?;
+        unsafe {
+            d.stream
+                .launch_builder(
+                    &cubin::module(&d.ctx, "sample")?.load_function("philox_normal_f32")?,
+                )
+                .arg(&0u64)
+                .arg(&stream)
+                .arg(&noise)
+                .arg(&i64::try_from(n * 32)?)
+                .launch(flat((n * 32).div_ceil(4)))?;
+        }
+        let noise_host = d.stream.clone_dtoh(&noise)?;
+        drop(noise);
+        let rung = output.join(format!("native-{}", resolution * 8));
+        std::fs::create_dir(&rung)?;
+        generation_capture(
+            &rung.join("noise.safetensors"),
+            &grid,
+            &noise_host,
+            vec![n, 32],
+        )?;
+        let mut flow = Flow::<f16>::open_hi3d(
+            &model,
+            "transformer_1024",
+            &runtime,
+            &grid,
+            resolution as usize,
+            budget()?,
+        )?;
+        ensure!(
+            flow.coordinates == grid,
+            "cascade support did not reach flow"
+        );
+        let positive = flow.conditioning_device(&context, &grid)?;
+        let zero = flow.device.stream.alloc_zeros::<f32>(2917 * 2048)?;
+        let negative = flow.conditioning_device(&zero, &grid)?;
+        let latent = flow.sample_heun(&noise_host, &positive, &negative)?;
+        generation_capture(
+            &rung.join("latents.safetensors"),
+            &grid,
+            &latent,
+            vec![n, 32],
+        )?;
+        drop(negative);
+        drop(positive);
+        drop(zero);
+        drop(flow);
+        let decoder = PixalDecoder::open(
+            &d,
+            &model,
+            DecoderKind::PointTransformer,
+            &runtime,
+            budget()?,
+        )?;
+        let coordinates = grid
+            .iter()
+            .map(|p| [0, p[0], p[1], p[2]])
+            .collect::<Vec<_>>();
+        mesh = decoder.points_mesh(coordinates.clone(), &latent, frame, resolution)?;
+        drop(decoder);
+        ensure!(
+            !mesh.vertices.is_empty()
+                && !mesh.faces.is_empty()
+                && mesh.vertices.iter().all(|v| v.is_finite())
+                && mesh
+                    .faces
+                    .iter()
+                    .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+            "invalid cascade raw mesh"
+        );
+        linked_mesh_save(
+            &rung.join("native.safetensors"),
+            &mesh,
+            &coordinates,
+            &latent,
+            frame,
+        )?;
+        println!(
+            "PASS N5_M4_LINKED_BOUNDARY case={case} output_resolution={} nominal_grid={resolution} accepted_grid={accepted} filled_faces_added={added} input_rows={n} parent_rows={parents} pooled_max={maximum} updates=25 component=transformer_1024 native_input=true vertices={} faces={} published_weight_bytes=3675626624 raw_decoder_weight_bytes=376614208 noise=philox_seed0_stream{stream} noise_boundary_D2H_H2D_bytes={} topology_equivalence=false presentation_repair=false timing=false",
+            resolution * 8,
+            mesh.vertices.len() / 3,
+            mesh.faces.len() / 3,
+            n * 32 * 8
+        );
+    }
+    println!(
+        "PASS N5_M4_LINKED_CASCADE case={case} rungs=64,128,192 image_encoder_calls=3,3 context_reused_per_rung=true prefix_noise=fixed_record high_noise=philox raw_meshes=3 timing=false"
+    );
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    ensure!(
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0,
+        "native cascade getrusage failed"
+    );
+    let usage = unsafe { usage.assume_init() };
+    println!(
+        "N5_M4_NATIVE_RESOURCES case={case} peak_host_ru_maxrss_KiB={} proc_io={:?}",
+        usage.ru_maxrss,
+        std::fs::read_to_string("/proc/self/io")?
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
+fn hi3d_linked_cascade_cottage_gpu() -> Result<()> {
+    linked_image_cascade("cottage", 0)
+}
+#[test]
+#[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
+fn hi3d_linked_cascade_robot_gpu() -> Result<()> {
+    linked_image_cascade("robot_crab", 1)
 }
 
 struct Gate {
