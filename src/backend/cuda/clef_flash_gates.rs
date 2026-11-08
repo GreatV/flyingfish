@@ -586,6 +586,7 @@ mod gates {
     }
 
     fn joint_cell(
+        failures: &mut Vec<String>,
         label: &str,
         got: &[f32],
         want: &[f32],
@@ -597,11 +598,8 @@ mod gates {
             "CLEF_JOINT {label} max={max:.6e} (tau {:.6e}) rmse={rmse:.6e} (tau {:.6e}) gated={gated}",
             tau.0, tau.1
         );
-        if gated {
-            ensure!(
-                max <= tau.0 && rmse <= tau.1,
-                "joint cell {label} exceeds the frozen tau"
-            );
+        if gated && (max > tau.0 || rmse > tau.1) {
+            failures.push(label.to_owned());
         }
         Ok(())
     }
@@ -642,6 +640,7 @@ mod gates {
     }
 
     fn control_ratio(
+        failures: &mut Vec<String>,
         label: &str,
         delta: (f64, f64),
         tau: (f64, f64),
@@ -696,8 +695,10 @@ mod gates {
         let mut plan = engine.joint_plan(&fixture)?;
         engine.joint_capture(&mut plan, &fixture)?;
         let stages = engine.joint_forward(&mut plan, &fixture)?;
+        let mut failures: Vec<String> = Vec::new();
 
         joint_cell(
+            &mut failures,
             "proj_memory_projection",
             &stages.memory_row0,
             &ref_f32("proj_memory_projection")?,
@@ -705,6 +706,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "proj_question_projection",
             &stages.question_proj_row0,
             &ref_f32("proj_question_projection")?,
@@ -712,6 +714,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "proj_option_question_projection",
             &stages.option_question_last_row0,
             &ref_f32("proj_option_question_projection")?,
@@ -719,6 +722,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "proj_option_context_projection",
             &stages.option_context_last_row0,
             &ref_f32("proj_option_context_projection")?,
@@ -726,6 +730,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "proj_option_lexical_projection",
             &stages.option_lexical_last_row0,
             &ref_f32("proj_option_lexical_projection")?,
@@ -733,6 +738,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "proj_global_projection",
             &stages.global,
             &ref_f32("proj_global_projection")?,
@@ -740,6 +746,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "fields",
             &stages.fields_row0,
             &ref_f32("fields")?,
@@ -747,6 +754,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "decoder0",
             &stages.decoder[0],
             &ref_f32("decoder0")?,
@@ -754,6 +762,7 @@ mod gates {
             true,
         )?;
         joint_cell(
+            &mut failures,
             "routing0",
             &stages.routing[0],
             &ref_f32("routing0")?,
@@ -761,6 +770,7 @@ mod gates {
             false,
         )?;
         joint_cell(
+            &mut failures,
             "routing1",
             &stages.routing[1],
             &ref_f32("routing1")?,
@@ -769,6 +779,7 @@ mod gates {
         )?;
         for layer in 1..4 {
             joint_cell(
+                &mut failures,
                 &format!("decoder{layer}"),
                 &stages.decoder[layer],
                 &ref_f32(&format!("decoder{layer}"))?,
@@ -777,6 +788,7 @@ mod gates {
             )?;
         }
         joint_cell(
+            &mut failures,
             "hidden_norm",
             &stages.hidden_norm_full,
             &ref_f32("hidden_norm")?,
@@ -785,6 +797,7 @@ mod gates {
         )?;
         for (index, question) in stages.logits.iter().enumerate() {
             joint_cell(
+                &mut failures,
                 &format!("logits_q{index}"),
                 question,
                 &ref_f32(&format!("logits_q{index}"))?,
@@ -798,6 +811,7 @@ mod gates {
         let hidden_ref = joint_f32_file(&forced_dir, "hidden_norm_out", "rows")?;
         let clean_hidden = engine.joint_hidden_norm(&mut plan, &hidden_in)?;
         joint_cell(
+            &mut failures,
             "hidden_norm_forced",
             &clean_hidden,
             &hidden_ref,
@@ -810,6 +824,7 @@ mod gates {
         let clean_routing = engine.joint_forced_routing(&mut plan, &queries, &memory)?;
         for (index, cell) in [(0usize, "routing0_forced"), (1usize, "routing1_forced")] {
             joint_cell(
+                &mut failures,
                 cell,
                 &clean_routing[index],
                 &joint_f32_file(&forced_dir, "forced_out_cuda", cell)?,
@@ -822,6 +837,7 @@ mod gates {
         let mut fields_now = engine.joint_forced_decoder(&mut plan, 1, &d1_in, &memory)?;
         clean_chain.push(fields_now.clone());
         joint_cell(
+            &mut failures,
             "decoder1_forced",
             &fields_now,
             &joint_f32_file(&forced_dir, "forced_out_cuda", "decoder1_forced")?,
@@ -833,6 +849,7 @@ mod gates {
             fields_now = engine.joint_forced_decoder(&mut plan, layer, &rows, &memory)?;
             clean_chain.push(fields_now.clone());
             joint_cell(
+                &mut failures,
                 &format!("decoder{layer}_forced"),
                 &fields_now,
                 &joint_f32_file(
@@ -864,6 +881,7 @@ mod gates {
             for (index, question) in stages.logits.iter().enumerate() {
                 let delta = max_rmse(&planted.logits[index], question)?;
                 control_ratio(
+                    &mut failures,
                     &format!("logits_q{index}"),
                     delta,
                     joint_tau(&taus, &format!("logits_q{index}"))?,
@@ -886,6 +904,7 @@ mod gates {
                 w.question_proj = saved;
             }
             control_ratio(
+                &mut failures,
                 "fields",
                 max_rmse(&planted.fields_row0, &stages.fields_row0)?,
                 joint_tau(&taus, "fields")?,
@@ -907,6 +926,7 @@ mod gates {
                 w.decoder[0].self_in_proj = saved;
             }
             control_ratio(
+                &mut failures,
                 "decoder0",
                 max_rmse(&planted.decoder[0], &stages.decoder[0])?,
                 joint_tau(&taus, "decoder0")?,
@@ -928,6 +948,7 @@ mod gates {
                 w.memory_proj = saved;
             }
             control_ratio(
+                &mut failures,
                 "projmem",
                 max_rmse(&planted.memory_row0, &stages.memory_row0)?,
                 joint_tau(&taus, "proj_memory_projection")?,
@@ -949,6 +970,7 @@ mod gates {
                 w.hidden_norm_w = saved;
             }
             control_ratio(
+                &mut failures,
                 "hidden",
                 max_rmse(&planted, &clean_hidden)?,
                 joint_tau(&taus, "hidden_norm_forced")?,
@@ -970,6 +992,7 @@ mod gates {
                 w.routing[index].attn_in_proj = saved;
             }
             control_ratio(
+                &mut failures,
                 name,
                 max_rmse(&planted[index], &clean_routing[index])?,
                 joint_tau(&taus, &format!("{name}_forced"))?,
@@ -1017,6 +1040,7 @@ mod gates {
             }
         }
 
+        ensure!(failures.is_empty(), "joint gate failures: {failures:?}");
         println!("CLEF_JOINT_CELLS ok");
         Ok(())
     }
