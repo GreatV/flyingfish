@@ -1721,6 +1721,7 @@ fn serialized_attention_modes(gate: &mut OperationGate, common: &Path, maps: &Pa
             Score {
                 scale: 0.25,
                 window_left: None,
+                window_right: None,
             },
         )?;
         if grouped {

@@ -3083,6 +3083,7 @@ impl AxialTower {
             Score {
                 scale: 1.0,
                 window_left: None,
+                window_right: None,
             },
             rows,
         )?;

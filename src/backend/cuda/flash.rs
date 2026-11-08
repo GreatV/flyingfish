@@ -67,6 +67,7 @@ pub struct Query<'a> {
 pub struct Score {
     pub scale: f32,
     pub window_left: Option<usize>,
+    pub window_right: Option<usize>,
 }
 
 impl Score {
@@ -78,8 +79,30 @@ impl Score {
                     .context("attention window must contain a token")
             })
             .transpose()?;
-        Ok(Self { scale, window_left })
+        Ok(Self {
+            scale,
+            window_left,
+            window_right: None,
+        })
     }
+}
+
+/// Inclusive radii for a bidirectional window of `window` tokens: keys `q-left..=q+right`.
+pub(crate) fn window_radii(window: usize) -> (usize, usize) {
+    (window.div_ceil(2) - 1, window / 2)
+}
+
+#[cfg(test)]
+pub(crate) fn symmetric_visible(
+    query: usize,
+    key: usize,
+    keys: usize,
+    left: usize,
+    right: usize,
+) -> bool {
+    (key as u64) + (left as u64) >= query as u64
+        && (key as u64) <= (query as u64) + (right as u64)
+        && key < keys
 }
 
 pub struct Flash {
@@ -398,6 +421,14 @@ impl Flash {
             "attention window exceeds indexing range"
         );
         ensure!(
+            score.window_right.is_none_or(|w| w <= i32::MAX as usize),
+            "attention window exceeds indexing range"
+        );
+        ensure!(
+            score.window_right.is_none() || score.window_left.is_some(),
+            "attention right radius requires a left radius"
+        );
+        ensure!(
             head_dim != 512 || score.window_left.is_none(),
             "D512 binds full causal attention"
         );
@@ -412,7 +443,8 @@ impl Flash {
         };
         let explicit = matches!(head_dim, 64 | 72 | 512)
             || score.scale != legacy_scale
-            || score.window_left.is_some();
+            || score.window_left.is_some()
+            || score.window_right.is_some();
         ensure!(
             head_dim != 128 || !explicit,
             "D128 explicit score is not bound"
@@ -1193,13 +1225,14 @@ impl Flash {
                 if let Some(score) = &self.score {
                     let window = score.window_left.map_or(u32::MAX, |w| w as u32);
                     let key_extent = keys as u32;
+                    let right = score.window_right.map_or(window, |w| w as u32);
                     if bidirectional_only {
                         launch.arg(&extent);
                     } else if shape.head_dim == 256 {
                         if mode == 1 {
                             launch.arg(&key_extent);
                         } else if mode == 6 {
-                            launch.arg(&key_extent).arg(&window);
+                            launch.arg(&key_extent).arg(&window).arg(&right);
                         } else if score.window_left.is_some() {
                             launch.arg(&window);
                         } else if mode != 0 {
@@ -1223,7 +1256,11 @@ impl Flash {
                 }
                 let key_extent = keys as u32;
                 if mode == 6 {
-                    launch.arg(&key_extent).arg(&extent).arg(&0.0625f32);
+                    launch
+                        .arg(&key_extent)
+                        .arg(&extent)
+                        .arg(&extent)
+                        .arg(&0.0625f32);
                 } else {
                     if mode != 0 || window {
                         launch.arg(&extent);
@@ -1243,6 +1280,11 @@ impl Flash {
         }
         #[cfg(feature = "cuda")]
         {
+            if self.score.is_some_and(|score| {
+                score.window_right.is_some() && score.window_right != score.window_left
+            }) {
+                anyhow::bail!("asymmetric attention window has no native binding");
+            }
             let status = if let Some(window_left) = shape.window_left {
                 unsafe {
                     ff_fa2_run_window(
@@ -1655,6 +1697,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn symmetric_window_radii_change_boundary_keys() {
+        let (left, right) = window_radii(512);
+        assert_eq!((left, right), (255, 256));
+        let keys = 1000;
+        assert!(symmetric_visible(0, 256, keys, left, right));
+        assert!(!symmetric_visible(0, 257, keys, left, right));
+        assert!(symmetric_visible(300, 45, keys, left, right));
+        assert!(symmetric_visible(300, 556, keys, left, right));
+        assert!(!symmetric_visible(300, 44, keys, left, right));
+        assert!(!symmetric_visible(300, 557, keys, left, right));
+        assert!(symmetric_visible(300, 44, keys, 256, 256));
+        let (shift_left, shift_right) = (left - 1, right + 1);
+        assert_eq!((shift_left, shift_right), (254, 257));
+        assert!(!symmetric_visible(300, 45, keys, shift_left, shift_right));
+        assert!(symmetric_visible(300, 46, keys, shift_left, shift_right));
+        assert!(symmetric_visible(300, 557, keys, shift_left, shift_right));
+    }
+
+    #[test]
     fn split_chunks_cover_each_key_once() {
         for capacity in [1usize, 31, 32, 33, 129, 131072, 262144] {
             for heads in [8, 16, 32] {
@@ -1782,6 +1843,7 @@ mod tests {
                     Score {
                         scale: 1.0,
                         window_left: window,
+                        window_right: None,
                     },
                     case.capacity,
                 )?
@@ -2204,6 +2266,7 @@ mod tests {
                         scale,
                         window_left: matches!(self.mode.as_str(), "window" | "symmetric")
                             .then_some(self.extent),
+                        window_right: None,
                     },
                     self.capacity,
                 )
@@ -3146,6 +3209,7 @@ mod tests {
                         0.0625
                     },
                     window_left: (case.mode == "symmetric").then_some(case.extent),
+                    window_right: None,
                 },
                 case.capacity,
             )?

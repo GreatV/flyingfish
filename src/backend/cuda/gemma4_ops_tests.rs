@@ -1192,6 +1192,7 @@ fn media_prefill_attention_gpu() -> Result<()> {
                         1.0
                     },
                     window_left,
+                    window_right: None,
                 },
                 capacity,
             )?;

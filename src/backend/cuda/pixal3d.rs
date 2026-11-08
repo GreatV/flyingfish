@@ -1834,6 +1834,7 @@ impl Flow<f16> {
             Score {
                 scale: 1.0 / 96f32.sqrt(),
                 window_left: None,
+                window_right: None,
             },
         )?;
         let cross = Flash::new_f16(
@@ -1845,6 +1846,7 @@ impl Flow<f16> {
             Score {
                 scale: 1.0 / 96f32.sqrt(),
                 window_left: None,
+                window_right: None,
             },
         )?;
         let mods = device.stream.alloc_zeros(steps * 6 * h)?;
@@ -3964,6 +3966,7 @@ impl PixalDecoder {
             Score {
                 scale: 0.25,
                 window_left: None,
+                window_right: None,
             },
         )?;
         attention.bind_f16_windows(&maps.offsets)?;
