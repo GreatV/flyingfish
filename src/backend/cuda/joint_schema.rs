@@ -1411,20 +1411,20 @@ impl JointRun<'_> {
             let field = &base_fields[qi * WIDTH..(qi + 1) * WIDTH];
             let scores: Vec<bf16> = (q_base..q_base + count)
                 .map(|i| {
-                    let dot = dot_f32(&routed[i * WIDTH..(i + 1) * WIDTH], field)?;
-                    Ok(bf16::from_f32(dot / (WIDTH as f32).sqrt()))
+                    let dot = bf16::from_f32(dot_f32(&routed[i * WIDTH..(i + 1) * WIDTH], field)?);
+                    Ok(bf16::from_f32(dot.to_f32() / (WIDTH as f32).sqrt()))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let weights = softmax_bf16(&scores);
-            let mut acc = vec![bf16::ZERO; WIDTH];
+            let mut acc = vec![0f32; WIDTH];
             for (wi, w) in weights.iter().enumerate() {
                 let row = &routed[(q_base + wi) * WIDTH..(q_base + wi + 1) * WIDTH];
                 for c in 0..WIDTH {
                     let product = bf16::from_f32(w.to_f32() * row[c].to_f32());
-                    acc[c] = bf16::from_f32(acc[c].to_f32() + product.to_f32());
+                    acc[c] += product.to_f32();
                 }
             }
-            summaries.extend_from_slice(&acc);
+            summaries.extend(acc.iter().map(|v| bf16::from_f32(*v)));
             q_base += count;
         }
         self.upload(&summaries, &mut plan.small)?;
