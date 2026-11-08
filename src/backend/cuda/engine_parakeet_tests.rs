@@ -2,9 +2,9 @@
 
 use super::{
     Device,
-    engine_parakeet::{NemotronStream, ParakeetEncoder, StreamChunk, StreamOmit},
+    engine_parakeet::{NemotronStream, ParakeetEncoder, ParakeetTdt, StreamChunk, StreamOmit},
 };
-use crate::{audio::LogMel, nemotron::NemotronSpec};
+use crate::{audio::LogMel, nemotron::NemotronSpec, parakeet::ParakeetSpec};
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
@@ -180,6 +180,116 @@ fn match_encoder(
         }
     }
     println!("PASS {label}_ENCODER cells=6 control=identity_relative_shift");
+    Ok(())
+}
+
+fn scalar(tensors: &SafeTensors<'_>, name: &str) -> Result<f32> {
+    let values = f32_values(tensors, name)?;
+    ensure!(values.len() == 1, "{name} must be scalar");
+    Ok(values[0])
+}
+
+fn tdt_check(
+    actual: &[f32],
+    expected: &[f32],
+    floors: &Value,
+    case: &str,
+    tap: &str,
+) -> Result<()> {
+    let (maximum, rmse) = difference(actual, expected)?;
+    let (max_bound, rmse_bound) = bounds(floors, case, tap)?;
+    ensure!(
+        maximum <= max_bound && rmse <= rmse_bound,
+        "{case}/{tap} DEFECT max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound}"
+    );
+    println!(
+        "PARAKEET_TDT case={case} tap={tap} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound} PASS"
+    );
+    Ok(())
+}
+
+fn margin(logits: &[f32], start: usize, end: usize) -> (usize, f32) {
+    let mut best = start;
+    let mut second = start;
+    for (index, &value) in logits.iter().enumerate().take(end).skip(start) {
+        if value > logits[best] {
+            second = best;
+            best = index;
+        } else if index != best && (value > logits[second] || second == best) {
+            second = index;
+        }
+    }
+    (best, logits[best] - logits[second])
+}
+
+fn joint_check(
+    actual: &[f32],
+    tensors: &SafeTensors<'_>,
+    floors: &Value,
+    spec: &ParakeetSpec,
+    tap: &str,
+) -> Result<()> {
+    tdt_check(actual, &f32_values(tensors, tap)?, floors, "short", tap)?;
+    let vocab = spec.vocab as usize;
+    let joint_width = vocab + spec.durations.len();
+    let (token, token_margin) = margin(actual, 0, vocab);
+    let (duration, duration_margin) = margin(actual, vocab, joint_width);
+    let duration = duration - vocab;
+    let expected_token = scalar(tensors, &format!("{tap}_token_id"))? as usize;
+    let expected_duration = scalar(tensors, &format!("{tap}_duration_id"))? as usize;
+    let threshold = floors["id_detection"]["min_margin"]
+        .as_f64()
+        .context("id detection margin threshold missing")?;
+    println!(
+        "PARAKEET_TDT_MARGIN tap={tap} token_margin={token_margin} duration_margin={duration_margin} threshold={threshold}"
+    );
+    if scalar(tensors, &format!("{tap}_token_margin"))? as f64 >= threshold
+        && scalar(tensors, &format!("{tap}_duration_margin"))? as f64 >= threshold
+    {
+        ensure!(
+            token == expected_token && duration == expected_duration,
+            "{tap} id mismatch token={token}/{expected_token} duration={duration}/{expected_duration} margins={token_margin}/{duration_margin}"
+        );
+    }
+    Ok(())
+}
+
+fn prediction_check(
+    tdt: &mut ParakeetTdt,
+    token: u32,
+    tensors: &SafeTensors<'_>,
+    floors: &Value,
+    prefix: &str,
+    projected: &[f32],
+    spec: &ParakeetSpec,
+) -> Result<()> {
+    let output = tdt.predict(token)?;
+    tdt_check(
+        &output,
+        &f32_values(tensors, &format!("{prefix}_output"))?,
+        floors,
+        "short",
+        &format!("{prefix}_output"),
+    )?;
+    let (_, hidden, cell) = tdt.prediction_state()?;
+    tdt_check(
+        &hidden,
+        &f32_values(tensors, &format!("{prefix}_hidden"))?,
+        floors,
+        "short",
+        &format!("{prefix}_hidden"),
+    )?;
+    tdt_check(
+        &cell,
+        &f32_values(tensors, &format!("{prefix}_cell"))?,
+        floors,
+        "short",
+        &format!("{prefix}_cell"),
+    )?;
+    if prefix != "repeat0" {
+        let joint = tdt.joint(&projected[..spec.decoder_hidden as usize])?;
+        joint_check(&joint, tensors, floors, spec, &format!("joint_{prefix}"))?;
+    }
     Ok(())
 }
 
@@ -1061,4 +1171,114 @@ fn nemotron_streaming_chunks_match_reference() -> Result<()> {
     let device = Device::new(0)?;
     let engine = ParakeetEncoder::load_nemotron(&model, &device)?;
     match_nemotron_stream(&engine, &frontend, &fixtures, &floors)
+}
+
+#[test]
+#[ignore = "requires GPU lease and external prediction fixtures"]
+fn parakeet_prediction_and_joint_match_reference() -> Result<()> {
+    ensure!(
+        std::env::var("FF_PARAKEET_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model =
+        PathBuf::from(std::env::var_os("FF_PARAKEET_MODEL").context("FF_PARAKEET_MODEL missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_PARAKEET_TDT_FIXTURES").context("FF_PARAKEET_TDT_FIXTURES missing")?,
+    );
+    let encoder_fixtures = PathBuf::from(
+        std::env::var_os("FF_PARAKEET_ENCODER_FIXTURES")
+            .context("FF_PARAKEET_ENCODER_FIXTURES missing")?,
+    );
+    let floors: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
+        std::env::var_os("FF_PARAKEET_TDT_FLOORS").context("FF_PARAKEET_TDT_FLOORS missing")?,
+    ))?)?;
+    let device = Device::new(0)?;
+    let spec = ParakeetSpec::read(&model)?;
+    let mut tdt = ParakeetTdt::load(&model, &device)?;
+    let short_bytes = std::fs::read(fixtures.join("short.safetensors"))?;
+    let short = SafeTensors::deserialize(&short_bytes)?;
+    let mut projected = Vec::new();
+    for case in ["short", "edges", "production"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        let encoder = f32_values(
+            &SafeTensors::deserialize(&std::fs::read(
+                encoder_fixtures.join(format!("{case}.safetensors")),
+            )?)?,
+            "encoder",
+        )?;
+        let actual = tdt.project_encoder(&encoder)?;
+        tdt_check(
+            &actual,
+            &f32_values(&tensors, "projected")?,
+            &floors,
+            case,
+            "projected",
+        )?;
+        if case == "short" {
+            projected = actual;
+        }
+    }
+    tdt.reset()?;
+    prediction_check(
+        &mut tdt, spec.blank, &short, &floors, "initial", &projected, &spec,
+    )?;
+    ensure!(
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
+        "initial blank did not run every decoder LSTM layer"
+    );
+    tdt.reset()?;
+    prediction_check(&mut tdt, 1, &short, &floors, "nonblank", &projected, &spec)?;
+    ensure!(
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
+        "nonblank prediction call count"
+    );
+    tdt.reset()?;
+    tdt.set_prediction_state(
+        &f32_values(&short, "signed_initial_hidden")?,
+        &f32_values(&short, "signed_initial_cell")?,
+    )?;
+    prediction_check(&mut tdt, 1, &short, &floors, "signed", &projected, &spec)?;
+    ensure!(
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
+        "signed-state prediction call count"
+    );
+
+    tdt.reset()?;
+    prediction_check(&mut tdt, 1, &short, &floors, "repeat0", &projected, &spec)?;
+    prediction_check(
+        &mut tdt, spec.blank, &short, &floors, "repeat1", &projected, &spec,
+    )?;
+    prediction_check(
+        &mut tdt, spec.blank, &short, &floors, "repeat2", &projected, &spec,
+    )?;
+    ensure!(
+        tdt.lstm_call_count() == spec.decoder_layers as usize,
+        "cached blank launched LSTM"
+    );
+    let (_, hidden, cell) = tdt.prediction_state()?;
+    let control_hidden = f32_values(&short, "control_repeat_hidden")?;
+    let control_cell = f32_values(&short, "control_repeat_cell")?;
+    let (hidden_max, hidden_rmse) = difference(&hidden, &control_hidden)?;
+    let (cell_max, cell_rmse) = difference(&cell, &control_cell)?;
+    let (max_bound, rmse_bound) = bounds(&floors, "short", "repeat2_hidden")?;
+    ensure!(
+        hidden_max > 10.0 * max_bound && hidden_rmse > 10.0 * rmse_bound,
+        "cached-blank control is not discriminating"
+    );
+    let (max_bound, rmse_bound) = bounds(&floors, "short", "repeat2_cell")?;
+    ensure!(
+        cell_max > 10.0 * max_bound && cell_rmse > 10.0 * rmse_bound,
+        "cached-cell control is not discriminating"
+    );
+    let joint = tdt.joint(&projected[..spec.decoder_hidden as usize])?;
+    let control = f32_values(&short, "joint_nonblank_no_relu")?;
+    let (maximum, rmse) = difference(&joint, &control)?;
+    let (max_bound, rmse_bound) = bounds(&floors, "short", "joint_nonblank")?;
+    ensure!(
+        maximum > 10.0 * max_bound && rmse > 10.0 * rmse_bound,
+        "joint no-ReLU control is not discriminating"
+    );
+    println!("PASS PARAKEET_TDT prediction_cases=4 cached_blank=2 joint_controls=no_relu");
+    Ok(())
 }

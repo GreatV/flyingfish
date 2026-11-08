@@ -2,6 +2,33 @@
 #include <stdint.h>
 #include <math.h>
 
+// Gates are [input,forget,candidate,output], each hidden_size wide.
+extern "C" __global__ void lstm_step_f32(
+    const float* input_gates, const float* recurrent_gates,
+    const float* bias_ih, const float* bias_hh, float* cell, float* hidden,
+    uint32_t hidden_size) {
+    if (blockDim.x != 256 || !input_gates || !recurrent_gates || !bias_ih || !bias_hh ||
+        !cell || !hidden || !hidden_size) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < hidden_size;
+         i += gridDim.x * 256) {
+        float pre[4];
+        #pragma unroll
+        for (uint32_t gate = 0; gate < 4; ++gate) {
+            const uint32_t index = gate * hidden_size + i;
+            float value = __fadd_rn(input_gates[index], recurrent_gates[index]);
+            value = __fadd_rn(value, bias_ih[index]);
+            pre[gate] = __fadd_rn(value, bias_hh[index]);
+        }
+        const float input = 1.0f / (1.0f + expf(-pre[0]));
+        const float forget = 1.0f / (1.0f + expf(-pre[1]));
+        const float candidate = tanhf(pre[2]);
+        const float output = 1.0f / (1.0f + expf(-pre[3]));
+        const float next_cell = __fadd_rn(__fmul_rn(forget, cell[i]), __fmul_rn(input, candidate));
+        hidden[i] = __fmul_rn(output, tanhf(next_cell));
+        cell[i] = next_cell;
+    }
+}
+
 // Native weights[out,in/groups,3,3], NHWC input/output, stride 2.
 // Output length is (n + left_pad + right_pad - 3) / 2 + 1. Source index is output * 2 - left_pad + tap.
 extern "C" __global__ void speech_conv2d_f32(
