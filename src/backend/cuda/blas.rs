@@ -1196,7 +1196,7 @@ impl Blas {
         ensure!(
             w.len() >= (w_row0 + w_rows) * input
                 && x.len() == rows * input
-                && y.len() == rows * w_rows,
+                && y.len() >= rows * w_rows,
             "BF16 GEMM extent mismatch: rows={rows} w_rows={w_rows} input={input} w={} x={} y={}",
             w.len(),
             x.len(),
