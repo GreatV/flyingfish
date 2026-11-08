@@ -893,6 +893,11 @@ impl JointRun<'_> {
         Ok(self.stream.clone_dtoh(x)?)
     }
 
+    fn read_rows(&self, x: &CudaSlice<bf16>, elements: usize) -> Result<Vec<bf16>> {
+        ensure!(elements <= x.len(), "read extent");
+        Ok(self.stream.clone_dtoh(&x.slice(..elements))?)
+    }
+
     fn upload(&self, host: &[bf16], dst: &mut CudaSlice<bf16>) -> Result<()> {
         ensure!(host.len() <= dst.len(), "upload extent");
         self.stream
@@ -1121,7 +1126,7 @@ impl JointRun<'_> {
                 &mut plan.flash_self,
             )?;
         }
-        let attn = self.read(&plan.proj_out)?;
+        let attn = self.read_rows(&plan.proj_out, nq * WIDTH)?;
         let input = self.read(&plan.fields)?;
         let t = add_round(&input, &attn)?;
         self.upload(&t, &mut plan.small)?;
@@ -1157,7 +1162,7 @@ impl JointRun<'_> {
                 &mut plan.flash_cross,
             )?;
         }
-        let attn = self.read(&plan.proj_out)?;
+        let attn = self.read_rows(&plan.proj_out, nq * WIDTH)?;
         let input = self.read(&plan.fields)?;
         let t = add_round(&input, &attn)?;
         self.upload(&t, &mut plan.small)?;
@@ -1188,7 +1193,7 @@ impl JointRun<'_> {
             FF,
         )?;
         self.bias_add(&mut plan.small2, &w.linear2_b, 0, WIDTH)?;
-        let ff = self.read(&plan.small2)?;
+        let ff = self.read_rows(&plan.small2, nq * WIDTH)?;
         let input = self.read(&plan.fields)?;
         let t = add_round(&input, &ff)?;
         self.upload(&t, &mut plan.small)?;
