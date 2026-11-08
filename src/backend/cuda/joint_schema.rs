@@ -602,6 +602,34 @@ pub struct SpanMean<'a> {
     pub width: usize,
 }
 
+// When set, the attention projection stages dump their tensors (defect
+// localization only).
+#[cfg(test)]
+thread_local! {
+    static JOINT_MHA_DUMP: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Points the attention-stage dumps at a directory; None disables them.
+#[cfg(test)]
+pub fn set_joint_mha_dump(dir: Option<std::path::PathBuf>) {
+    JOINT_MHA_DUMP.with(|d| *d.borrow_mut() = dir);
+}
+
+#[cfg(test)]
+fn dump_mha(name: &str, x: &CudaSlice<bf16>, stream: &Arc<CudaStream>) -> Result<()> {
+    let Some(dir) = JOINT_MHA_DUMP.with(|d| d.borrow().clone()) else {
+        return Ok(());
+    };
+    let host = stream.clone_dtoh(x)?;
+    let bytes: Vec<u8> = host
+        .iter()
+        .flat_map(|v| v.to_bits().to_le_bytes())
+        .collect();
+    std::fs::write(std::path::Path::new(&dir).join(name), bytes)?;
+    Ok(())
+}
+
 fn flat(n: usize) -> crate::backend::gpu::LaunchConfig {
     crate::backend::gpu::LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
@@ -955,6 +983,8 @@ impl JointRun<'_> {
         self.blas
             .gemm_bf16(&weights.in_proj, 0..WIDTH, queries, q_proj, rows, WIDTH)?;
         self.bias_add(q_proj, &weights.in_bias, 0, WIDTH)?;
+        #[cfg(test)]
+        dump_mha("mha_qproj.raw", q_proj, self.stream)?;
         self.blas.gemm_bf16(
             &weights.in_proj,
             WIDTH..2 * WIDTH,
@@ -964,6 +994,8 @@ impl JointRun<'_> {
             WIDTH,
         )?;
         self.bias_add(kv_k, &weights.in_bias, WIDTH, WIDTH)?;
+        #[cfg(test)]
+        dump_mha("mha_kv_k.raw", kv_k, self.stream)?;
         self.blas.gemm_bf16(
             &weights.in_proj,
             2 * WIDTH..3 * WIDTH,
@@ -992,6 +1024,8 @@ impl JointRun<'_> {
                 .arg(&(HEAD_DIM as u32))
                 .launch(flat(keys * WIDTH))?;
         }
+        #[cfg(test)]
+        dump_mha("mha_k_hm.raw", k_hm, self.stream)?;
         flash.run(
             q_proj,
             WIDTH,
@@ -1009,6 +1043,8 @@ impl JointRun<'_> {
                 window_left: None,
             },
         )?;
+        #[cfg(test)]
+        dump_mha("mha_attnout.raw", attn_out, self.stream)?;
         self.blas
             .gemm_bf16(&weights.out_w, 0..WIDTH, attn_out, out, rows, WIDTH)?;
         self.bias_add(out, &weights.out_b, 0, WIDTH)?;
