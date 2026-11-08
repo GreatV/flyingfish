@@ -458,6 +458,8 @@ pub struct JointPlan {
     ctx: CudaSlice<bf16>,
     lex: CudaSlice<bf16>,
     gathered: CudaSlice<bf16>,
+    qbegins: CudaSlice<i32>,
+    qends: CudaSlice<i32>,
     begins: CudaSlice<i32>,
     ends: CudaSlice<i32>,
     lex_idx: CudaSlice<i32>,
@@ -527,8 +529,10 @@ impl JointPlan {
             ctx: alloc(options * 4096)?,
             lex: alloc(options * 4096)?,
             gathered: alloc(gather_rows * 4096)?,
-            begins: stream.alloc_zeros::<i32>(options.max(questions))?,
-            ends: stream.alloc_zeros::<i32>(options.max(questions))?,
+            qbegins: stream.alloc_zeros::<i32>(questions)?,
+            qends: stream.alloc_zeros::<i32>(questions)?,
+            begins: stream.alloc_zeros::<i32>(options)?,
+            ends: stream.alloc_zeros::<i32>(options)?,
             lex_idx: stream.alloc_zeros::<i32>(gather_rows)?,
             seq,
             questions,
@@ -890,8 +894,9 @@ impl JointRun<'_> {
     }
 
     fn upload(&self, host: &[bf16], dst: &mut CudaSlice<bf16>) -> Result<()> {
-        ensure!(host.len() == dst.len(), "upload extent");
-        self.stream.memcpy_htod(host, dst)?;
+        ensure!(host.len() <= dst.len(), "upload extent");
+        self.stream
+            .memcpy_htod(host, &mut dst.slice_mut(..host.len()))?;
         Ok(())
     }
 
@@ -902,7 +907,7 @@ impl JointRun<'_> {
         ends: &mut CudaSlice<i32>,
     ) -> Result<()> {
         ensure!(
-            spans.len() <= begins.len() && spans.len() <= ends.len(),
+            spans.len() == begins.len() && spans.len() == ends.len(),
             "span buffer extent"
         );
         let b: Vec<i32> = spans.iter().map(|s| s[0]).collect();
@@ -1288,11 +1293,11 @@ impl JointRun<'_> {
             .iter()
             .flat_map(|q| q.option_spans.iter().copied())
             .collect();
-        self.upload_spans(&qspans, &mut plan.begins, &mut plan.ends)?;
+        self.upload_spans(&qspans, &mut plan.qbegins, &mut plan.qends)?;
         self.span_means(
             &plan.normed,
-            &plan.begins,
-            &plan.ends,
+            &plan.qbegins,
+            &plan.qends,
             &mut plan.qvecs,
             nq,
             4096,
