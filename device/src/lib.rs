@@ -861,7 +861,7 @@ unsafe fn attention<
                     probability::<{ D }>(peak[0] - next[0], 0.0, scale),
                     probability::<{ D }>(peak[1] - next[1], 0.0, scale),
                 ];
-                if MODE == 3 || MODE == 5 {
+                if MODE == 3 || MODE == 5 || MODE == 6 {
                     for row in 0..2 {
                         if next[row] == f32::NEG_INFINITY {
                             negative_peak[row] = 0.0;

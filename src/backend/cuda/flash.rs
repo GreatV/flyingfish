@@ -1715,6 +1715,54 @@ mod tests {
         assert!(symmetric_visible(300, 557, keys, shift_left, shift_right));
     }
 
+    fn leading_tile_all_masked(query: usize, keys: usize, left: usize, right: usize) -> bool {
+        let diagonal = (query / 64) * 64;
+        let first = diagonal.saturating_sub(left) / 64 * 64;
+        (0..64).all(|column| {
+            let key = first + column;
+            key >= keys || !symmetric_visible(query, key, keys, left, right)
+        })
+    }
+
+    fn empty_tile_alpha(peak: f32, next: f32, scale: f32, guard: bool) -> f32 {
+        let delta = peak - next;
+        let mut alpha = if delta.is_nan() {
+            f32::NAN
+        } else {
+            (delta * std::f32::consts::LOG2_E * scale).exp2()
+        };
+        if guard && next == f32::NEG_INFINITY {
+            alpha = 0.0;
+        }
+        alpha
+    }
+
+    #[test]
+    fn mode6_masked_leading_tile_softmax_stays_finite() {
+        let (left, right) = window_radii(512);
+        let keys = 652;
+        let query = 319;
+        assert_eq!((left, right), (255, 256));
+        assert!(leading_tile_all_masked(query, keys, left, right));
+        assert!(symmetric_visible(query, query - left, keys, left, right));
+        assert!(!symmetric_visible(query, 63, keys, left, right));
+        let scale = 0.0625;
+        let guarded = empty_tile_alpha(f32::NEG_INFINITY, f32::NEG_INFINITY, scale, true);
+        let open = empty_tile_alpha(f32::NEG_INFINITY, f32::NEG_INFINITY, scale, false);
+        assert!(guarded.is_finite());
+        assert!(open.is_nan());
+        assert_eq!(guarded, 0.0);
+        let kernel = include_str!("../../../device/src/lib.rs");
+        let wipe = kernel
+            .find("alpha[row] = 0.0;")
+            .expect("empty-tile alpha wipe");
+        let before = &kernel[wipe.saturating_sub(256)..wipe];
+        assert!(
+            before.contains("MODE == 6"),
+            "mode 6 empty tile leaves non-finite softmax"
+        );
+    }
+
     #[test]
     fn split_chunks_cover_each_key_once() {
         for capacity in [1usize, 31, 32, 33, 129, 131072, 262144] {
