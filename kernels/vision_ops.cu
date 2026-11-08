@@ -6,10 +6,11 @@ __device__ static float triangle_dot(const float* a, const float* b) {
     return __fadd_rn(__fadd_rn(__fmul_rn(a[0], b[0]), __fmul_rn(a[1], b[1])), __fmul_rn(a[2], b[2]));
 }
 
-__device__ static bool triangle_axis_overlap(const float p[3][3], const float* axis) {
-    float lo = triangle_dot(p[0], axis), hi = lo;
+__device__ static bool triangle_axis_overlap(const float p[3][3], const float* axis, const float* center) {
+    const float origin = triangle_dot(center, axis);
+    float lo = __fsub_rn(triangle_dot(p[0], axis), origin), hi = lo;
     for (int vertex = 1; vertex < 3; ++vertex) {
-        const float value = triangle_dot(p[vertex], axis);
+        const float value = __fsub_rn(triangle_dot(p[vertex], axis), origin);
         lo = fminf(lo, value); hi = fmaxf(hi, value);
     }
     const float radius = __fmul_rn(0.5f, __fadd_rn(__fadd_rn(fabsf(axis[0]), fabsf(axis[1])), fabsf(axis[2])));
@@ -32,13 +33,13 @@ __device__ static bool triangle_box_overlap(const float vertices[3][3], int x, i
         float axis[3] = {0, 0, 0};
         axis[(a + 1) % 3] = edges[edge][(a + 2) % 3];
         axis[(a + 2) % 3] = -edges[edge][(a + 1) % 3];
-        if (!triangle_axis_overlap(p, axis)) return false;
+        if (!triangle_axis_overlap(vertices, axis, center)) return false;
     }
     float normal[3];
     for (int a = 0; a < 3; ++a) normal[a] = __fsub_rn(
         __fmul_rn(edges[0][(a + 1) % 3], edges[1][(a + 2) % 3]),
         __fmul_rn(edges[0][(a + 2) % 3], edges[1][(a + 1) % 3]));
-    return triangle_axis_overlap(p, normal);
+    return triangle_axis_overlap(vertices, normal, center);
 }
 
 template<bool EMIT>

@@ -787,7 +787,26 @@ mod tests {
                     faces: original.clone(),
                 };
                 let count = mesh.fill_holes(capacity)?;
-                let exact = canonical(&mesh.faces[original.len()..]) == canonical(&expected);
+                let actual_faces = canonical(&mesh.faces[original.len()..]);
+                let expected_faces = canonical(&expected);
+                let exact = actual_faces == expected_faces;
+                if !exact {
+                    let actual = actual_faces
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let expected = expected_faces
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    println!(
+                        "N5_M4_FILL_DIAGNOSTIC case={case} high={high} missing={} extra={} first_missing={:?} first_extra={:?}",
+                        expected.difference(&actual).count(),
+                        actual.difference(&expected).count(),
+                        expected.difference(&actual).take(8).collect::<Vec<_>>(),
+                        actual.difference(&expected).take(8).collect::<Vec<_>>()
+                    );
+                }
                 defects += usize::from(!exact);
                 ensure!(
                     mesh.faces[..original.len()] == original,
