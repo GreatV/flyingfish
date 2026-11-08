@@ -2925,7 +2925,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
 
         total_rounds += 1;
         let tokens_in_round = out.round.tokens.len();
-        if total_rounds <= 8 {
+        if total_rounds <= 8 || out.round.accepted == 0 {
             let draft_tok = out.round.proposals.first().copied().unwrap_or(0);
             let (v0_id, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
             let (v1_id, _) = super::mtp::top1_and_margin(&out.verify_row1_logits);
@@ -3009,6 +3009,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     );
 
     let alpha = accepted_count as f64 / total_rounds as f64;
+    println!("GLM_MTP_EMITTED ids={emitted_tokens:?}");
     let mean_b_verify = sum_b_verify as f64 / total_rounds as f64;
     let mean_u = sum_u as f64 / total_rounds as f64;
     let alpha_star = crate::mtp::glm_mtp_break_even_alpha(
@@ -3044,6 +3045,151 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         println!("{d}");
     }
     std::io::Write::flush(&mut std::io::stdout())?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "loads official GLM and compares 256 generated tokens with and without MTP"]
+fn glm_mtp_greedy_256_gpu() -> Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+    let prompt = &reference.tokens[..33];
+    let mut engine = load_composition_engine()?;
+    let mut baseline = vec![engine.prefill(prompt, None)?];
+    let mut baseline_margins = vec![super::mtp::top1_and_margin(&engine.decode_logits()?).1];
+    while baseline.len() < 256 {
+        baseline.push(engine.decode(false, None)?);
+        baseline_margins.push(super::mtp::top1_and_margin(&engine.decode_logits()?).1);
+    }
+    println!("GLM_MTP_FREE_BASELINE ids={baseline:?} margins={baseline_margins:?}");
+    std::io::stdout().flush()?;
+    engine.mtp_enable(MtpOptions {
+        depth: 1,
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
+        recurrent_tap: MtpRecurrentTap::PreMtpNorm,
+        graph: false,
+    })?;
+    let mut speculative = vec![engine.mtp_prefill(prompt)?];
+    let mut speculative_margins = vec![super::mtp::top1_and_margin(&engine.decode_logits()?).1];
+    let mut rounds = 0usize;
+    let mut accepted = 0usize;
+    while speculative.len() < 256 {
+        let out = engine.glm_mtp_round(true)?;
+        rounds += 1;
+        accepted += out.round.accepted;
+        println!(
+            "GLM_MTP_FREE_ROUND round={rounds} pos={} accepted={} draft={:?} tokens={:?} margins=[{},{}]",
+            out.start_pos,
+            out.round.accepted,
+            out.round.proposals,
+            out.round.tokens,
+            out.v0_margin,
+            out.v1_margin,
+        );
+        for (index, &token) in out.round.tokens.iter().enumerate() {
+            if speculative.len() == 256 {
+                break;
+            }
+            speculative.push(token);
+            speculative_margins.push(if index == 0 {
+                out.v0_margin
+            } else {
+                out.v1_margin
+            });
+        }
+        std::io::stdout().flush()?;
+    }
+    let differing = baseline
+        .iter()
+        .zip(&speculative)
+        .filter(|(a, b)| a != b)
+        .count();
+    let first = baseline.iter().zip(&speculative).position(|(a, b)| a != b);
+    println!("GLM_MTP_FREE_SPECULATIVE ids={speculative:?} margins={speculative_margins:?}");
+    if let Some(index) = first {
+        println!(
+            "DEFECT GLM_MTP_FREE_FIRST index={index} position={} eager_id={} mtp_id={} eager_margin={} mtp_margin={}",
+            prompt.len() + index,
+            baseline[index],
+            speculative[index],
+            baseline_margins[index],
+            speculative_margins[index],
+        );
+    }
+    println!(
+        "{} GLM_MTP_FREE_256 tokens=256 different_ids={differing} rounds={rounds} accepted={accepted} eos_ignored=true",
+        if differing == 0 { "PASS" } else { "DEFECT" },
+    );
+    ensure!(differing == 0, "DEFECT GLM MTP free-running token mismatch");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "captures target hidden states on the supplied GLM greedy continuation"]
+fn glm_mtp_conditioned_hidden_gpu() -> Result<()> {
+    let input =
+        PathBuf::from(std::env::var_os("FF_GLM_MTP_REF_DIR").context("MTP inputs missing")?);
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(input.join("continuation.json"))?)?;
+    let ids: Vec<u32> = serde_json::from_value(record["input_ids"].clone())?;
+    ensure!(
+        ids.len() > 33 && ids.len() <= 640,
+        "Runner FAIL continuation length exceeds target capacity"
+    );
+    let output =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_OUTPUT").context("output missing")?);
+    std::fs::create_dir(&output)?;
+    let mut hidden = BufWriter::new(std::fs::File::create_new(output.join("hidden.bf16"))?);
+    let mut engine = load_composition_engine()?;
+    let mut greedy_ids = Vec::with_capacity(ids.len() - 1);
+    let mut margins = Vec::with_capacity(ids.len() - 1);
+    for (position, &token) in ids[..ids.len() - 1].iter().enumerate() {
+        let greedy = if position == 0 {
+            engine.prefill(&[token], None)?
+        } else {
+            engine.set_token(token)?;
+            engine.decode(false, None)?
+        };
+        let logits = engine.decode_logits()?;
+        ensure!(
+            logits.iter().all(|value| value.is_finite()),
+            "Runner FAIL nonfinite teacher-forced target logits"
+        );
+        greedy_ids.push(greedy);
+        margins.push(super::mtp::top1_and_margin(&logits).1);
+        let row: Vec<bf16> = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.work.n.slice(..4096))?;
+        for value in row {
+            hidden.write_all(&value.to_le_bytes())?;
+        }
+        if (position + 1).is_multiple_of(50) {
+            println!("GLM_MTP_CONDITIONED_PROGRESS rows={}", position + 1);
+            std::io::stdout().flush()?;
+        }
+    }
+    hidden.flush()?;
+    let record = serde_json::json!({
+        "input_ids": ids,
+        "greedy_ids": greedy_ids,
+        "margins": margins,
+        "hidden_layout": [ids.len() - 1, 4096],
+        "hidden_dtype": "BF16",
+        "mtp_enabled": false,
+        "target_rows": 1,
+    });
+    serde_json::to_writer(
+        std::fs::File::create_new(output.join("target.json"))?,
+        &record,
+    )?;
+    println!(
+        "PASS GLM_MTP_CONDITIONED_HIDDEN rows={} hidden=4096 dtype=BF16 mtp_enabled=false",
+        ids.len() - 1,
+    );
     Ok(())
 }
 
