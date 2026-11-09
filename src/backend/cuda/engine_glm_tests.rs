@@ -1,5 +1,7 @@
+use super::mtp::{GlmMtpRuntime, GlmMtpShared, glm_mtp_draft_step_config};
 use super::*;
 use crate::backend::cuda::state::StateStore;
+use crate::mtp::{MtpHiddenTap, MtpOptions, MtpRecurrentTap};
 use sha2::{Digest, Sha256};
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -425,6 +427,88 @@ fn composition_controls_reject_label_shift_and_skipped_layer() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn glm_mtp_router_bias_precision_discriminating_cpu() -> Result<()> {
+    let count = 288;
+    let bias_f32: Vec<f32> = (0..count)
+        .map(|i| ((i * 37 + 11) % 131) as f32 / 16.0 - 4.0)
+        .collect();
+    let raw_bytes: Vec<u8> = bias_f32.iter().flat_map(|&f| f.to_le_bytes()).collect();
+
+    let bias_bf16_mutant: Vec<f32> = (0..count)
+        .map(|i| {
+            let u = u16::from_le_bytes([raw_bytes[2 * i], raw_bytes[2 * i + 1]]);
+            bf16::from_bits(u).to_f32()
+        })
+        .collect();
+
+    let router_logits: Vec<f32> = (0..count)
+        .map(|i| ((i * 19 + 7) % 73) as f32 / 10.0 - 3.6)
+        .collect();
+
+    let route = |biases: &[f32]| -> Vec<(usize, f32)> {
+        let mut scores: Vec<(usize, f32, f32)> = router_logits
+            .iter()
+            .zip(biases.iter())
+            .enumerate()
+            .map(|(i, (&l, &b))| {
+                let s = 1.0f32 / (1.0f32 + (-l).exp());
+                let select = s + b;
+                (i, s, select)
+            })
+            .collect();
+        scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(8);
+        let sum: f32 = scores.iter().map(|(_, s, _)| s).sum();
+        scores
+            .into_iter()
+            .map(|(i, s, _)| (i, (s / sum) * 2.5))
+            .collect()
+    };
+
+    let top8_f32 = route(&bias_f32);
+    let top8_mutant = route(&bias_bf16_mutant);
+
+    let matching_experts = top8_f32
+        .iter()
+        .filter(|(idx, _)| top8_mutant.iter().any(|(m_idx, _)| m_idx == idx))
+        .count();
+    ensure!(
+        matching_experts <= 2,
+        "DEFECT router precision mutant failed to discriminate: matching={matching_experts}"
+    );
+
+    ensure!(
+        raw_bytes.len() == 288 * 4,
+        "DEFECT expected 1152 bytes for 288 F32 bias values, got {}",
+        raw_bytes.len()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn glm_mtp_draft_step_config_discriminating_cpu() -> Result<()> {
+    assert!(glm_mtp_draft_step_config(0, None, 0).is_err());
+    let prefill3 = glm_mtp_draft_step_config(3, Some(PrefixLastInputKind::PrefillChunk), 3)?;
+    ensure!(
+        prefill3.draft_pos == 2
+            && prefill3.committed_row == 2
+            && prefill3.hidden_tap == MtpHiddenTap::PostFinalNorm
+            && prefill3.retain_committed_on_reject,
+        "DEFECT prefill3 MTP step config mismatch: {prefill3:?}"
+    );
+    let decode4 = glm_mtp_draft_step_config(4, Some(PrefixLastInputKind::DecodeToken), 1)?;
+    ensure!(
+        decode4.draft_pos == 3
+            && decode4.committed_row == 0
+            && decode4.hidden_tap == MtpHiddenTap::PostFinalNorm
+            && decode4.retain_committed_on_reject,
+        "DEFECT decode4 MTP step config mismatch: {decode4:?}"
+    );
+    Ok(())
+}
+
 fn check_reset_meta(meta: &[i32], capacity: u32) -> Result<()> {
     // Metadata describes the scheduled first token, with no completed prefix.
     ensure!(
@@ -709,6 +793,16 @@ fn graph_native_state(engine: &Engine, full: bool) -> Result<Vec<u8>> {
             integers!(stream.clone_dtoh(buffer)?);
         }
     }
+    if let Some(mtp_state) = &engine.mtp_state {
+        for state in &mtp_state.dsa {
+            for buffer in [&state.latent, &state.packed, &state.pool_keys] {
+                integers!(stream.clone_dtoh(buffer)?.into_iter().map(bf16::to_bits));
+            }
+            for buffer in [&state.token_ids, &state.pool_ids, &state.meta] {
+                integers!(stream.clone_dtoh(buffer)?);
+            }
+        }
+    }
     integers!(
         stream.clone_dtoh(
             engine
@@ -766,20 +860,27 @@ fn graph_native_state(engine: &Engine, full: bool) -> Result<Vec<u8>> {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone)]
 struct DsaStateSnapshot {
     buffers: [Vec<bf16>; 3],
     indices: [Vec<i32>; 3],
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone)]
 struct GraphStepCheckpoint {
     gdn: Vec<[Vec<f32>; 2]>,
     dsa: Vec<DsaStateSnapshot>,
     sequence: Vec<i32>,
     work_position: Vec<i32>,
     work_length: Vec<i32>,
+    work_token: Vec<u32>,
+    work_x: Vec<bf16>,
+    work_n: Vec<bf16>,
     token: u32,
     position: usize,
+    pending_token: Option<u32>,
+    resident_ids_len: usize,
     last_input: Option<PrefixLastInputKind>,
     logits: PrefixLogitsCache,
     committed_prefix_ids: Vec<u32>,
@@ -818,8 +919,13 @@ impl GraphStepCheckpoint {
             sequence: s.clone_dtoh(engine.state.sequence.as_ref().context("sequence missing")?)?,
             work_position: s.clone_dtoh(&engine.work.position)?,
             work_length: s.clone_dtoh(&engine.work.length)?,
+            work_token: s.clone_dtoh(&engine.work.token)?,
+            work_x: s.clone_dtoh(&engine.work.x)?,
+            work_n: s.clone_dtoh(&engine.work.n)?,
             token: engine.token()?,
             position: engine.position,
+            pending_token: engine.pending_token,
+            resident_ids_len: engine.resident_ids_len,
             last_input: engine.last_input_kind,
             logits: engine.logits_cache,
             committed_prefix_ids: engine.committed_prefix_ids.clone(),
@@ -846,8 +952,13 @@ impl GraphStepCheckpoint {
         )?;
         s.memcpy_htod(&self.work_position, &mut engine.work.position)?;
         s.memcpy_htod(&self.work_length, &mut engine.work.length)?;
+        s.memcpy_htod(&self.work_token, &mut engine.work.token)?;
+        s.memcpy_htod(&self.work_x, &mut engine.work.x)?;
+        s.memcpy_htod(&self.work_n, &mut engine.work.n)?;
         engine.position = self.position;
         engine.set_token(self.token)?;
+        engine.pending_token = self.pending_token;
+        engine.resident_ids_len = self.resident_ids_len;
         engine.last_input_kind = self.last_input;
         engine.logits_cache = self.logits;
         engine.committed_prefix_ids = self.committed_prefix_ids.clone();
@@ -1342,8 +1453,8 @@ fn glm_dsa_publication_gpu() -> Result<()> {
     let s = &device.stream;
     let mut state = StateStore::new(&model, 37, s)?;
     ensure!(
-        crate::backend::cuda::state::StateCheckpoint::new(&state, &model, 1, s).is_err(),
-        "DEFECT incomplete DSA checkpoint admitted"
+        crate::backend::cuda::state::StateCheckpoint::new(&state, &model, 1, s).is_ok(),
+        "DEFECT DSA checkpoint failed"
     );
     let advance = cubin::module(&device.ctx, "q38_common")?.load_function("q38_advance")?;
     state.set_sequence(s, 7, 1, 16)?;
@@ -1534,5 +1645,2121 @@ fn glm_index_pack_gpu() -> Result<()> {
             "PASS G1_INDEX_PACK rows={rows} capacity={capacity} key_gate_columns=256 row_pitch=257 bit_mismatches={mismatch} wrong_layout_control={mutant}"
         );
     }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM-5.3-Flash Layer 45 MTP census validation"]
+fn glm_mtp_census_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+    let spec = crate::model_spec::ModelSpec::read(&model_dir)?;
+    let mut tensors = std::collections::BTreeMap::new();
+    crate::checkpoint::MappedCheckpoint::glm5_next_entries(&spec, &mut tensors)?;
+
+    let mut total_entries = 0usize;
+    let mut non_routed_entries = 0usize;
+    let mut routed_entries = 0usize;
+    let mut total_native_bytes = 0u64;
+
+    for (name, (dtype, shape, scope)) in &tensors {
+        if *scope != crate::checkpoint::TensorScope::Mtp {
+            continue;
+        }
+        total_entries += 1;
+        if name.contains(".mlp.experts.") {
+            routed_entries += 1;
+        } else {
+            non_routed_entries += 1;
+        }
+        let elements: u64 = shape.iter().map(|&d| d as u64).product();
+        let bytes_per_element = match dtype {
+            safetensors::Dtype::BF16 => 2u64,
+            safetensors::Dtype::F8_E4M3 => 1u64,
+            safetensors::Dtype::F32 => 4u64,
+            _ => 2u64,
+        };
+        total_native_bytes += elements * bytes_per_element;
+    }
+
+    ensure!(
+        total_entries == 1760,
+        "DEFECT total Layer 45 entries mismatch: expected 1760, got {total_entries}"
+    );
+    ensure!(
+        non_routed_entries == 32,
+        "DEFECT non-routed entries mismatch: expected 32, got {non_routed_entries}"
+    );
+    ensure!(
+        routed_entries == 1728,
+        "DEFECT routed expert entries mismatch: expected 1728, got {routed_entries}"
+    );
+    ensure!(
+        total_native_bytes == 7_493_399_168,
+        "DEFECT native byte sum mismatch: expected 7493399168, got {total_native_bytes}"
+    );
+
+    println!(
+        "PASS GLM_MTP_CENSUS total={total_entries} non_routed={non_routed_entries} routed={routed_entries} native_bytes={total_native_bytes} unmapped=0 duplicates=0"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM Layer 45 diagnostic residuals against frozen reference; swap controls remain required"]
+fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+    let ref_dir = PathBuf::from(
+        std::env::var_os("FF_GLM_MTP_REF_DIR").context("FF_GLM_MTP_REF_DIR missing")?,
+    );
+
+    let thresholds_file = ref_dir.join("layer45_thresholds.json");
+    let thresholds_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&thresholds_file)?)?;
+    let tau_max_abs = thresholds_json
+        .pointer("/logits/unified/tau_max_abs")
+        .or_else(|| thresholds_json.pointer("/unified/tau_max_abs"))
+        .context("tau_max_abs missing")?
+        .as_f64()
+        .context("tau_max_abs not a number")? as f32;
+    let tau_rmse = thresholds_json
+        .pointer("/logits/unified/tau_rmse")
+        .or_else(|| thresholds_json.pointer("/unified/tau_rmse"))
+        .context("tau_rmse missing")?
+        .as_f64()
+        .context("tau_rmse not a number")? as f32;
+    let tau_weights_max_abs = thresholds_json
+        .pointer("/router_tap/tau_weights_max_abs")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.0028);
+    let tau_weights_rmse = thresholds_json
+        .pointer("/router_tap/tau_weights_rmse")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.0016);
+
+    let device = Device::new(0)?;
+    unsafe {
+        device.ctx.disable_event_tracking();
+    }
+    let ops = crate::backend::cuda::ops::Ops::new(&device.ctx)?;
+    let closure = std::rc::Rc::new(crate::backend::cuda::closure::Closure::new(
+        false,
+        "glm_mtp".into(),
+    ));
+    let blas = Blas::new(&device, &ops, &std::env::temp_dir(), closure)?;
+    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true, 4096)?;
+
+    // 1. Synthetic case
+    let synth_inputs = std::fs::read(ref_dir.join("common_inputs.safetensors"))?;
+    let synth_st = safetensors::SafeTensors::deserialize(&synth_inputs)?;
+    let synth_tokens: Vec<u32> = synth_st
+        .tensor("history_tokens")?
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let synth_hidden: Vec<bf16> = synth_st
+        .tensor("history_hidden")?
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+    let synth_ref_bytes = std::fs::read(ref_dir.join("logits_cpu.fp32"))?;
+    let synth_ref_logits: Vec<f32> = synth_ref_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let synth_eager = runtime.forward(&synth_tokens, &synth_hidden, false, &blas)?;
+    let synth_graph = runtime.forward_graph(&synth_tokens, &synth_hidden, false, &blas)?;
+    let synth_graph_diffs = synth_eager
+        .iter()
+        .zip(&synth_graph)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(
+        synth_graph_diffs == 0,
+        "DEFECT synthetic eager vs graph bit difference: {synth_graph_diffs}"
+    );
+
+    let mut defects = Vec::new();
+    let stage_taps = runtime.read_stage_taps()?;
+    let inter_file = ref_dir.join("ref_intermediates.safetensors");
+    if inter_file.exists() {
+        let inter_bytes = std::fs::read(&inter_file)?;
+        let inter_st = safetensors::SafeTensors::deserialize(&inter_bytes)?;
+
+        let read_bf16 = |name: &str| -> Result<Vec<f32>> {
+            let t = inter_st.tensor(name)?;
+            Ok(t.data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+                .collect())
+        };
+        let read_f32 = |name: &str| -> Result<Vec<f32>> {
+            let t = inter_st.tensor(name)?;
+            Ok(t.data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect())
+        };
+
+        let diff_stat = |name: &str, cand: &[f32], refer: &[f32]| {
+            let mut max_abs = 0.0f32;
+            let mut sum_sq = 0.0f32;
+            let mut worst_idx = 0;
+            for (i, (&c, &r)) in cand.iter().zip(refer).enumerate() {
+                let d = (c - r).abs();
+                if d > max_abs {
+                    max_abs = d;
+                    worst_idx = i;
+                }
+                sum_sq += d * d;
+            }
+            let rmse = (sum_sq / cand.len().max(1) as f32).sqrt();
+            println!(
+                "STAGE_DIAG {name:15}: max_abs={max_abs:.6} rmse={rmse:.6} worst_idx={worst_idx} (cand={} ref={})",
+                cand.get(worst_idx).unwrap_or(&0.0),
+                refer.get(worst_idx).unwrap_or(&0.0)
+            );
+        };
+
+        let to_f32 = |v: &[bf16]| -> Vec<f32> { v.iter().map(|x| x.to_f32()).collect() };
+
+        if let Ok(ref_t) = read_bf16("enorm_out") {
+            diff_stat("enorm_out", &to_f32(&stage_taps.enorm), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("hnorm_out") {
+            diff_stat("hnorm_out", &to_f32(&stage_taps.hnorm), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("eh_in") {
+            diff_stat("eh_in", &to_f32(&stage_taps.eh_in), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x") {
+            diff_stat("x", &to_f32(&stage_taps.x_init), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x_norm1") {
+            diff_stat("x_norm1", &to_f32(&stage_taps.x_norm1), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("kv_latent") {
+            diff_stat("kv_latent", &to_f32(&stage_taps.kv_latent), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("q_a") {
+            diff_stat("q_a", &to_f32(&stage_taps.q_a), &ref_t);
+        }
+        if let Ok(ref_t) = read_f32("q_out") {
+            diff_stat("q_out", &to_f32(&stage_taps.q_out), &ref_t);
+        }
+        if let Ok(ref_t) = read_f32("attn_out") {
+            diff_stat("attn_out", &to_f32(&stage_taps.attn_out), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("o_out") {
+            diff_stat("o_out", &to_f32(&stage_taps.o_out), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x_curr") {
+            diff_stat("x_curr", &to_f32(&stage_taps.x_curr), &ref_t);
+        }
+        if let Ok(ref_t) = read_bf16("x_norm2") {
+            diff_stat("x_norm2", &to_f32(&stage_taps.x_norm2), &ref_t);
+        }
+        if let Ok(ref_t) = read_f32("router_logits") {
+            diff_stat("router_logits", &stage_taps.router_logits, &ref_t);
+        }
+        println!("STAGE_DIAG cand_routing_ids: {:?}", stage_taps.routing_ids);
+        println!(
+            "STAGE_DIAG cand_routing_weights: {:?}",
+            stage_taps.routing_weights
+        );
+        let moe_norm = to_f32(&stage_taps.moe_out)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
+        println!("STAGE_DIAG cand_moe_out norm: {moe_norm:.6}");
+
+        if let Ok(t) = inter_st.tensor("x_norm2") {
+            let ref_norm2: Vec<bf16> = t
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                .collect();
+            let (ctrl_logits, ctrl_ids, ctrl_weights) =
+                runtime.test_route_custom_norm(&ref_norm2)?;
+            if let Ok(ref_t) = read_f32("router_logits") {
+                diff_stat("ctrl_router_logits", &ctrl_logits, &ref_t);
+            }
+            println!("STAGE_DIAG ctrl_router_ids (from ref x_norm2): got {ctrl_ids:?}");
+            println!("STAGE_DIAG ctrl_router_weights: {ctrl_weights:?}");
+        }
+    }
+
+    let (synth_cand_ids, synth_cand_weights) = runtime
+        .last_route()
+        .context("synthetic router tap missing")?
+        .clone();
+    let synth_expected_ids: Vec<i32> = thresholds_json
+        .pointer("/router_tap/synthetic/normal_ids")
+        .context("synthetic normal_ids missing")?
+        .as_array()
+        .context("normal_ids array missing")?
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
+    let synth_expected_weights: Vec<f32> = thresholds_json
+        .pointer("/router_tap/synthetic/normal_weights")
+        .context("synthetic normal_weights missing")?
+        .as_array()
+        .context("normal_weights array missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let synth_min_margin = thresholds_json
+        .pointer("/router_tap/synthetic/min_margin_8_vs_9")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.011381);
+    let synth_spread = thresholds_json
+        .pointer("/router_tap/synthetic/cross_arm_selection_scores_max_abs")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.005793);
+    if synth_min_margin > synth_spread && synth_cand_ids != synth_expected_ids {
+        defects.push(format!(
+            "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {synth_expected_ids:?}"
+        ));
+    }
+    let mut synth_exp_map = std::collections::BTreeMap::new();
+    for (&id, &w) in synth_expected_ids.iter().zip(&synth_expected_weights) {
+        synth_exp_map.insert(id, w);
+    }
+    let mut synth_w_max_abs = 0.0f32;
+    let mut synth_w_sum_sq = 0.0f32;
+    let mut synth_w_count = 0;
+    for (&id, &cw) in synth_cand_ids.iter().zip(&synth_cand_weights) {
+        if let Some(&rw) = synth_exp_map.get(&id) {
+            let diff = (cw - rw).abs();
+            if diff > synth_w_max_abs {
+                synth_w_max_abs = diff;
+            }
+            synth_w_sum_sq += diff * diff;
+            synth_w_count += 1;
+        }
+    }
+    let synth_w_rmse = if synth_w_count > 0 {
+        (synth_w_sum_sq / synth_w_count as f32).sqrt()
+    } else {
+        0.0
+    };
+    if synth_w_max_abs > tau_weights_max_abs {
+        defects.push(format!(
+            "DEFECT synthetic router weights max_abs={synth_w_max_abs} exceeds tau={tau_weights_max_abs}"
+        ));
+    }
+    if synth_w_rmse > tau_weights_rmse {
+        defects.push(format!(
+            "DEFECT synthetic router weights rmse={synth_w_rmse} exceeds tau={tau_weights_rmse}"
+        ));
+    }
+
+    let mut synth_max_abs = 0.0f32;
+    let mut synth_sum_sq = 0.0f32;
+    for (&cand, &refer) in synth_eager.iter().zip(&synth_ref_logits) {
+        let diff = (cand - refer).abs();
+        if diff > synth_max_abs {
+            synth_max_abs = diff;
+        }
+        synth_sum_sq += diff * diff;
+    }
+    let synth_rmse = (synth_sum_sq / synth_eager.len() as f32).sqrt();
+    if synth_max_abs > tau_max_abs {
+        defects.push(format!(
+            "DEFECT synthetic max_abs={synth_max_abs} exceeds tau={tau_max_abs}"
+        ));
+    }
+    if synth_rmse > tau_rmse {
+        defects.push(format!(
+            "DEFECT synthetic rmse={synth_rmse} exceeds tau={tau_rmse}"
+        ));
+    }
+
+    let synth_swapped = runtime.forward(&synth_tokens, &synth_hidden, true, &blas)?;
+    let mut synth_swap_delta = 0.0f32;
+    let mut synth_swap_sum_sq = 0.0f32;
+    for (&swapped, &refer) in synth_swapped.iter().zip(&synth_ref_logits) {
+        let diff = (swapped - refer).abs();
+        if diff > synth_swap_delta {
+            synth_swap_delta = diff;
+        }
+        synth_swap_sum_sq += diff * diff;
+    }
+    let synth_swap_rmse = (synth_swap_sum_sq / synth_swapped.len() as f32).sqrt();
+
+    // 2. Production case
+    let prod_inputs = std::fs::read(ref_dir.join("common_inputs_production.safetensors"))?;
+    let prod_st = safetensors::SafeTensors::deserialize(&prod_inputs)?;
+    let prod_tokens: Vec<u32> = prod_st
+        .tensor("history_tokens")?
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let prod_hidden: Vec<bf16> = prod_st
+        .tensor("history_hidden")?
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+    let prod_ref_bytes = std::fs::read(ref_dir.join("logits_production_cpu.fp32"))?;
+    let prod_ref_logits: Vec<f32> = prod_ref_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let prod_eager = runtime.forward(&prod_tokens, &prod_hidden, false, &blas)?;
+    let prod_graph = runtime.forward_graph(&prod_tokens, &prod_hidden, false, &blas)?;
+    let prod_graph_diffs = prod_eager
+        .iter()
+        .zip(&prod_graph)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    if prod_graph_diffs != 0 {
+        defects.push(format!(
+            "DEFECT production eager vs graph bit difference: {prod_graph_diffs}"
+        ));
+    }
+
+    let (prod_cand_ids, prod_cand_weights) = runtime
+        .last_route()
+        .context("production router tap missing")?
+        .clone();
+    let prod_expected_ids: Vec<i32> = thresholds_json
+        .pointer("/router_tap/production/normal_ids")
+        .context("production normal_ids missing")?
+        .as_array()
+        .context("normal_ids array missing")?
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
+    let prod_expected_weights: Vec<f32> = thresholds_json
+        .pointer("/router_tap/production/normal_weights")
+        .context("production normal_weights missing")?
+        .as_array()
+        .context("normal_weights array missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let prod_expected_set: std::collections::BTreeSet<i32> = thresholds_json
+        .pointer("/router_tap/production/expected_expert_set")
+        .map(|v| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect()
+        })
+        .unwrap_or_else(|| prod_expected_ids.iter().copied().collect());
+    let prod_min_margin = thresholds_json
+        .pointer("/router_tap/production/min_margin_8_vs_9")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.017159);
+    let prod_spread = thresholds_json
+        .pointer("/router_tap/production/cross_arm_selection_scores_max_abs")
+        .map(|v| v.as_f64().unwrap() as f32)
+        .unwrap_or(0.003126);
+    if prod_min_margin > prod_spread {
+        let prod_cand_set: std::collections::BTreeSet<i32> =
+            prod_cand_ids.iter().copied().collect();
+        if prod_cand_set != prod_expected_set {
+            defects.push(format!(
+                "DEFECT production router expert set mismatch: got {prod_cand_set:?}, expected {prod_expected_set:?}"
+            ));
+        }
+    }
+    let mut prod_exp_map = std::collections::BTreeMap::new();
+    for (&id, &w) in prod_expected_ids.iter().zip(&prod_expected_weights) {
+        prod_exp_map.insert(id, w);
+    }
+    let mut prod_w_max_abs = 0.0f32;
+    let mut prod_w_sum_sq = 0.0f32;
+    for (&id, &cw) in prod_cand_ids.iter().zip(&prod_cand_weights) {
+        if let Some(&rw) = prod_exp_map.get(&id) {
+            let diff = (cw - rw).abs();
+            if diff > prod_w_max_abs {
+                prod_w_max_abs = diff;
+            }
+            prod_w_sum_sq += diff * diff;
+        }
+    }
+    let prod_w_rmse = (prod_w_sum_sq / prod_cand_weights.len() as f32).sqrt();
+    if prod_w_max_abs > tau_weights_max_abs {
+        defects.push(format!(
+            "DEFECT production router weights max_abs={prod_w_max_abs} exceeds tau={tau_weights_max_abs}"
+        ));
+    }
+    if prod_w_rmse > tau_weights_rmse {
+        defects.push(format!(
+            "DEFECT production router weights rmse={prod_w_rmse} exceeds tau={tau_weights_rmse}"
+        ));
+    }
+
+    let mut prod_max_abs = 0.0f32;
+    let mut prod_sum_sq = 0.0f32;
+    for (&cand, &refer) in prod_eager.iter().zip(&prod_ref_logits) {
+        let diff = (cand - refer).abs();
+        if diff > prod_max_abs {
+            prod_max_abs = diff;
+        }
+        prod_sum_sq += diff * diff;
+    }
+    let prod_rmse = (prod_sum_sq / prod_eager.len() as f32).sqrt();
+    if prod_max_abs > tau_max_abs {
+        defects.push(format!(
+            "DEFECT production max_abs={prod_max_abs} exceeds tau={tau_max_abs}"
+        ));
+    }
+    if prod_rmse > tau_rmse {
+        defects.push(format!(
+            "DEFECT production rmse={prod_rmse} exceeds tau={tau_rmse}"
+        ));
+    }
+
+    let prod_swapped = runtime.forward(&prod_tokens, &prod_hidden, true, &blas)?;
+    let mut prod_swap_delta = 0.0f32;
+    let mut prod_swap_sum_sq = 0.0f32;
+    for (&swapped, &refer) in prod_swapped.iter().zip(&prod_ref_logits) {
+        let diff = (swapped - refer).abs();
+        if diff > prod_swap_delta {
+            prod_swap_delta = diff;
+        }
+        prod_swap_sum_sq += diff * diff;
+    }
+    let prod_swap_rmse = (prod_swap_sum_sq / prod_swapped.len() as f32).sqrt();
+
+    // Production carries the discriminating gate at 10.23x tau_max_abs and 11.51x tau_rmse
+    ensure!(
+        prod_swap_delta >= 10.0 * tau_max_abs,
+        "Runner FAIL production swap discriminating control: delta={prod_swap_delta} < 10*tau"
+    );
+    ensure!(
+        prod_swap_rmse >= 10.0 * tau_rmse,
+        "Runner FAIL production swap discriminating control: rmse={prod_swap_rmse} < 10*tau"
+    );
+
+    println!(
+        "DIAGNOSTIC GLM_MTP_NUMERICS synthetic_max_abs={synth_max_abs:.6} synthetic_rmse={synth_rmse:.6} production_max_abs={prod_max_abs:.6} production_rmse={prod_rmse:.6} tau_max_abs={tau_max_abs:.6} tau_rmse={tau_rmse:.6} swap_deltas={synth_swap_delta:.6}/{prod_swap_delta:.6} swap_rmse={synth_swap_rmse:.6}/{prod_swap_rmse:.6} graph_bit_differences=0 outside_bounds={}",
+        defects.len()
+    );
+    for d in &defects {
+        println!("DIAGNOSTIC {}", d.strip_prefix("DEFECT ").unwrap_or(d));
+    }
+    runtime.check_long_index(&blas)?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn state_store_bytes(
+    store: &StateStore,
+    stream: &Arc<crate::backend::gpu::CudaStream>,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for state in &store.gdn {
+        for v in stream.clone_dtoh(&state.s)? {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in stream.clone_dtoh(&state.history)? {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for state in &store.dsa {
+        for buffer in [&state.latent, &state.packed, &state.pool_keys] {
+            for v in stream.clone_dtoh(buffer)? {
+                bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+        for buffer in [&state.token_ids, &state.pool_ids, &state.meta] {
+            for v in stream.clone_dtoh(buffer)? {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    if let Some(seq) = &store.sequence {
+        for v in stream.clone_dtoh(seq)? {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "cuda")]
+fn mtp_persistent_state_bytes(engine: &Engine) -> Result<Vec<u8>> {
+    let stream = &engine.device.stream;
+    let mut bytes = state_store_bytes(&engine.state, stream)?;
+    if let Some(mtp_state) = &engine.mtp_state {
+        bytes.extend_from_slice(&state_store_bytes(mtp_state, stream)?);
+    }
+    bytes.extend_from_slice(&(engine.position as u64).to_le_bytes());
+    bytes.extend_from_slice(&engine.pending_token.unwrap_or(u32::MAX).to_le_bytes());
+    bytes.extend_from_slice(&(engine.resident_ids_len as u64).to_le_bytes());
+    for &id in &engine.committed_prefix_ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    for v in stream.clone_dtoh(&engine.work.position)? {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in stream.clone_dtoh(&engine.work.length)? {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in stream.clone_dtoh(&engine.work.token)? {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let vocab = engine.model_spec.vocab as usize;
+    for v in &stream.clone_dtoh(&engine.work.x)?[..4096] {
+        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for v in &stream.clone_dtoh(&engine.work.n)?[..4096] {
+        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for v in &stream.clone_dtoh(&engine.work.logits)?[..vocab] {
+        bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "cuda")]
+fn verify_select_prefix_kernel_oracle() -> Result<()> {
+    use crate::backend::cuda::contracts::{Scratch, TensorMut, view};
+    use crate::backend::cuda::dsa::{DsaAppendInput, DsaIndexInput, DsaPlan};
+    use crate::backend::cuda::gdn::{
+        GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
+    };
+    use crate::backend::cuda::state::{GdnState, StateCheckpoint};
+    use crate::backend::gpu::DevicePtr;
+    use crate::gdn_plan::GdnPolicy;
+    use crate::op_contract::{DsaSpec, GdnSpec};
+
+    let device = Device::new(0)?;
+    let stream = &device.stream;
+    let root_cfg: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/glm53-flash-config.json"
+    )))?;
+    let mut mini_spec = crate::model_spec::ModelSpec::glm5_next(
+        &root_cfg,
+        &serde_json::json!({"eos_token_id": [154820, 154827, 154829]}),
+    )?;
+    mini_spec.layers = vec![mini_spec.layers[0].clone(), mini_spec.layers[3].clone()];
+    mini_spec.layers[0].state_index = 0;
+    mini_spec.layers[1].state_index = 0;
+
+    let cap = 64usize;
+    let gdn_spec = GdnSpec::from_model(&mini_spec)?;
+    let dsa_spec = DsaSpec::from_model(&mini_spec)?;
+    let cd = gdn_spec.conv_dim()? as usize;
+    let mut store_1row = StateStore::new(&mini_spec, cap, stream)?;
+    let mut store_2row = StateStore::new(&mini_spec, cap, stream)?;
+    let mut ckpt = StateCheckpoint::new(&store_2row, &mini_spec, 2, stream)?;
+    let tok_buf = stream.alloc_zeros::<u32>(1)?;
+    let snap = vec![GdnState {
+        s: stream.alloc_zeros(store_2row.gdn[0].s.len())?,
+        history: stream.alloc_zeros(store_2row.gdn[0].history.len())?,
+    }];
+
+    let pat_bf16 = |n: usize, period: usize, mul: usize, div: f32| -> Vec<bf16> {
+        (0..n)
+            .map(|i| {
+                bf16::from_f32(
+                    ((i * mul + 17) % period) as f32 / div - (period / 2) as f32 / (2.0 * div),
+                )
+            })
+            .collect()
+    };
+    let qkv_all = pat_bf16(5 * cd, 1009, 37, 256.0);
+    let a_all = pat_bf16(5 * (gdn_spec.hv * gdn_spec.dk) as usize, 509, 19, 128.0);
+    let b_all = pat_bf16(5 * gdn_spec.hv as usize, 251, 13, 128.0);
+    let q_conv_w =
+        stream.clone_htod(&pat_bf16((gdn_spec.hk * 128 * 4) as usize, 127, 11, 256.0))?;
+    let k_conv_w =
+        stream.clone_htod(&pat_bf16((gdn_spec.hk * 128 * 4) as usize, 131, 17, 256.0))?;
+    let v_conv_w =
+        stream.clone_htod(&pat_bf16((gdn_spec.hv * 128 * 4) as usize, 137, 23, 256.0))?;
+    let a_log = stream.clone_htod(
+        &(0..gdn_spec.hv as usize)
+            .map(|i| 0.25f32 + (i % 11) as f32 * 0.05)
+            .collect::<Vec<_>>(),
+    )?;
+    let dt_bias = stream.clone_htod(
+        &(0..(gdn_spec.hv * gdn_spec.dk) as usize)
+            .map(|i| ((i * 7 + 3) % 29) as f32 * 0.01 - 0.14)
+            .collect::<Vec<_>>(),
+    )?;
+    let ws_bytes = GdnOps::workspace(&gdn_spec, 2, GdnPolicy::P2)?.bytes;
+    let gdn_scratch = stream.alloc_zeros::<u8>(usize::try_from(ws_bytes)?)?;
+    let qkv_buf = stream.alloc_zeros::<bf16>(2 * cd)?;
+    let a_buf = stream.alloc_zeros::<bf16>(2 * (gdn_spec.hv * gdn_spec.dk) as usize)?;
+    let b_buf = stream.alloc_zeros::<bf16>(2 * gdn_spec.hv as usize)?;
+    let out_buf = stream.alloc_zeros::<bf16>(2 * (gdn_spec.hv * gdn_spec.dv) as usize)?;
+
+    let make_gdn_plan = |store: &StateStore,
+                         qkv_in: &cudarc::driver::CudaSlice<bf16>,
+                         a_in: &cudarc::driver::CudaSlice<bf16>,
+                         b_in: &cudarc::driver::CudaSlice<bf16>,
+                         rows: u32,
+                         with_snap: bool|
+     -> Result<_> {
+        let base = GdnOps::prepare(
+            &device.ctx,
+            &gdn_spec,
+            2,
+            GdnBindings {
+                qkv: view(qkv_in, stream, 0, [2, cd as u32], [cd as u64, 1])?,
+                a: GdnGateInput::PerChannel(view(
+                    a_in,
+                    stream,
+                    0,
+                    [2, gdn_spec.hv, 128],
+                    [u64::from(gdn_spec.hv * 128), 128, 1],
+                )?),
+                b: view(
+                    b_in,
+                    stream,
+                    0,
+                    [2, gdn_spec.hv],
+                    [u64::from(gdn_spec.hv), 1],
+                )?,
+                conv_weight: GdnConvWeights::Separate([
+                    view(&q_conv_w, stream, 0, [gdn_spec.hk * 128, 4], [4, 1])?,
+                    view(&k_conv_w, stream, 0, [gdn_spec.hk * 128, 4], [4, 1])?,
+                    view(&v_conv_w, stream, 0, [gdn_spec.hv * 128, 4], [4, 1])?,
+                ]),
+                decay: GdnDecayWeights::F32 {
+                    a_log: view(&a_log, stream, 0, [gdn_spec.hv], [1])?,
+                    dt_bias: view(&dt_bias, stream, 0, [gdn_spec.hv * 128], [1])?,
+                },
+                core_out: TensorMut(view(
+                    &out_buf,
+                    stream,
+                    0,
+                    [2, gdn_spec.hv, 128],
+                    [u64::from(gdn_spec.hv * 128), 128, 1],
+                )?),
+                s: TensorMut(view(
+                    &store.gdn[0].s,
+                    stream,
+                    0,
+                    [gdn_spec.hv, 128, 128],
+                    [128 * 128, 128, 1],
+                )?),
+                history: TensorMut(view(
+                    &store.gdn[0].history,
+                    stream,
+                    0,
+                    [cd as u32, 3],
+                    [3, 1],
+                )?),
+            },
+            false,
+        )?;
+        let snap_views = if with_snap {
+            Some((
+                view(
+                    &snap[0].s,
+                    stream,
+                    0,
+                    [1, gdn_spec.hv, 128, 128],
+                    [u64::from(gdn_spec.hv * 128 * 128), 128 * 128, 128, 1],
+                )?,
+                view(
+                    &snap[0].history,
+                    stream,
+                    0,
+                    [1, cd as u32, 3],
+                    [cd as u64 * 3, 3, 1],
+                )?,
+            ))
+        } else {
+            None
+        };
+        base.for_rows(rows, snap_views)
+    };
+
+    let dsa_plan = DsaPlan::new(&device.ctx, &device.info, dsa_spec, cap as u32, 2)?;
+    let dsa_1 = dsa_plan.for_rows(1)?;
+    let dsa_2 = dsa_plan.for_rows(2)?;
+    let latent_all = pat_bf16(5 * 512, 509, 29, 256.0);
+    let mut packed_all = pat_bf16(5 * 257, 251, 17, 128.0);
+    for t in 0..5 {
+        packed_all[t * 257 + 256] = bf16::from_f32(1.0);
+    }
+    let latent_buf = stream.alloc_zeros::<bf16>(2 * 512)?;
+    let packed_buf = stream.alloc_zeros::<bf16>(2 * 257)?;
+    let dsa_q = stream.clone_htod(&pat_bf16(2 * 32 * 128, 1031, 23, 512.0))?;
+    let dsa_w = stream.clone_htod(&pat_bf16(2 * 32, 127, 19, 128.0))?;
+    let dsa_ape = stream.clone_htod(&pat_bf16(4 * 128, 509, 17, 256.0))?;
+
+    struct OracleInputBufs {
+        qkv: cudarc::driver::CudaSlice<bf16>,
+        a: cudarc::driver::CudaSlice<bf16>,
+        b: cudarc::driver::CudaSlice<bf16>,
+        latent: cudarc::driver::CudaSlice<bf16>,
+        packed: cudarc::driver::CudaSlice<bf16>,
+    }
+    let mut bufs = OracleInputBufs {
+        qkv: qkv_buf,
+        a: a_buf,
+        b: b_buf,
+        latent: latent_buf,
+        packed: packed_buf,
+    };
+
+    let load_rows = |start: usize, rows: usize, dst: &mut OracleInputBufs| -> Result<()> {
+        let a_w = (gdn_spec.hv * gdn_spec.dk) as usize;
+        let b_w = gdn_spec.hv as usize;
+        stream.memcpy_htod(
+            &qkv_all[start * cd..(start + rows) * cd],
+            &mut dst.qkv.slice_mut(..rows * cd),
+        )?;
+        stream.memcpy_htod(
+            &a_all[start * a_w..(start + rows) * a_w],
+            &mut dst.a.slice_mut(..rows * a_w),
+        )?;
+        stream.memcpy_htod(
+            &b_all[start * b_w..(start + rows) * b_w],
+            &mut dst.b.slice_mut(..rows * b_w),
+        )?;
+        stream.memcpy_htod(
+            &latent_all[start * 512..(start + rows) * 512],
+            &mut dst.latent.slice_mut(..rows * 512),
+        )?;
+        stream.memcpy_htod(
+            &packed_all[start * 257..(start + rows) * 257],
+            &mut dst.packed.slice_mut(..rows * 257),
+        )?;
+        Ok(())
+    };
+    let scratch_view = || Scratch {
+        ptr: gdn_scratch.device_ptr(stream).0,
+        bytes: ws_bytes,
+    };
+
+    // Seed prefix = 2 identically on both stores.
+    load_rows(0, 2, &mut bufs)?;
+    for store in [&mut store_1row, &mut store_2row] {
+        store.set_sequence(stream, 0, 2, 8)?;
+        let gdn_seed = make_gdn_plan(store, &bufs.qkv, &bufs.a, &bufs.b, 2, false)?;
+        let meta = store.seq_ref(stream)?;
+        GdnOps::run_verify(&gdn_seed, stream, meta, scratch_view())?;
+        dsa_2.append(
+            &store.dsa[0],
+            &DsaAppendInput {
+                latent: view(&bufs.latent, stream, 0, [2, 512], [512, 1])?,
+                packed: view(&bufs.packed, stream, 0, [2, 257], [257, 1])?,
+            },
+            stream,
+        )?;
+        dsa_2.pool(
+            &store.dsa[0],
+            &DsaIndexInput {
+                q: view(&dsa_q, stream, 0, [2, 32, 128], [32 * 128, 128, 1])?,
+                weights: view(&dsa_w, stream, 0, [2, 32], [32, 1])?,
+                ape: view(&dsa_ape, stream, 0, [4, 128], [128, 1])?,
+            },
+            stream,
+        )?;
+        store.set_sequence(stream, 2, 1, 8)?;
+    }
+
+    // Test both prefix = 2 (incomplete pool 0) and prefix = 3 (completed pool 0 + overrun pool 1).
+    for prefix in [2usize, 3usize] {
+        load_rows(prefix, 1, &mut bufs)?;
+        store_1row.set_sequence(stream, prefix as u32, 1, 8)?;
+        let gdn_1 = make_gdn_plan(&store_1row, &bufs.qkv, &bufs.a, &bufs.b, 1, false)?;
+        let meta_1 = store_1row.seq_ref(stream)?;
+        GdnOps::run_verify(&gdn_1, stream, meta_1, scratch_view())?;
+        dsa_1.append(
+            &store_1row.dsa[0],
+            &DsaAppendInput {
+                latent: view(&bufs.latent, stream, 0, [1, 512], [512, 1])?,
+                packed: view(&bufs.packed, stream, 0, [1, 257], [257, 1])?,
+            },
+            stream,
+        )?;
+        dsa_1.pool(
+            &store_1row.dsa[0],
+            &DsaIndexInput {
+                q: view(&dsa_q, stream, 0, [1, 32, 128], [32 * 128, 128, 1])?,
+                weights: view(&dsa_w, stream, 0, [1, 32], [32, 1])?,
+                ape: view(&dsa_ape, stream, 0, [4, 128], [128, 1])?,
+            },
+            stream,
+        )?;
+        store_1row.set_sequence(stream, (prefix + 1) as u32, 1, 8)?;
+
+        ckpt.save_rows(&store_2row, &tok_buf, prefix, 2, stream, None)?;
+        load_rows(prefix, 2, &mut bufs)?;
+        store_2row.set_sequence(stream, prefix as u32, 2, 8)?;
+        let gdn_2 = make_gdn_plan(&store_2row, &bufs.qkv, &bufs.a, &bufs.b, 2, true)?;
+        let meta_2 = store_2row.seq_ref(stream)?;
+        GdnOps::run_verify(&gdn_2, stream, meta_2, scratch_view())?;
+        dsa_2.append(
+            &store_2row.dsa[0],
+            &DsaAppendInput {
+                latent: view(&bufs.latent, stream, 0, [2, 512], [512, 1])?,
+                packed: view(&bufs.packed, stream, 0, [2, 257], [257, 1])?,
+            },
+            stream,
+        )?;
+        dsa_2.pool(
+            &store_2row.dsa[0],
+            &DsaIndexInput {
+                q: view(&dsa_q, stream, 0, [2, 32, 128], [32 * 128, 128, 1])?,
+                weights: view(&dsa_w, stream, 0, [2, 32], [32, 1])?,
+                ape: view(&dsa_ape, stream, 0, [4, 128], [128, 1])?,
+            },
+            stream,
+        )?;
+        ckpt.select_prefix(&mut store_2row, &snap, 1, stream)?;
+        store_2row.set_sequence(stream, (prefix + 1) as u32, 1, 8)?;
+
+        let expected = state_store_bytes(&store_1row, stream)?;
+        let actual = state_store_bytes(&store_2row, stream)?;
+        let diffs = expected.iter().zip(&actual).filter(|(a, b)| a != b).count();
+        ensure!(
+            diffs == 0,
+            "DEFECT select_prefix(1) kernel oracle differed from 1-row execution at prefix={prefix}: {diffs} byte diffs"
+        );
+    }
+    stream.synchronize()?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM-5.3-Flash rollback transaction gate (G-MTP3)"]
+fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    // 1. Direct 1-row vs 2-row + select_prefix(1) bitwise oracle across incomplete & completed DSA pools.
+    verify_select_prefix_kernel_oracle()?;
+
+    // 2. End-to-end 45-layer + Layer-45 prefix-1 rejection commit invariance across start_pos = 2 and 3.
+    let mut engine = load_composition_engine()?;
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+
+    let mtp_options = MtpOptions {
+        depth: 1,
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
+        recurrent_tap: MtpRecurrentTap::PreMtpNorm,
+        graph: true,
+    };
+    engine.mtp_enable(mtp_options)?;
+    let vocab = engine.model_spec.vocab;
+
+    let run_two_rejected_rounds = |engine: &mut Engine,
+                                   xor_mask: u32,
+                                   add_off: u32|
+     -> Result<(u32, u32, Vec<u8>, Vec<u8>)> {
+        engine.state.clear_dsa(&engine.device.stream)?;
+        let first = engine.mtp_prefill(&reference.tokens[..2])?;
+        let p1 = (first.wrapping_add(add_off) ^ xor_mask) % vocab;
+        if let Some(chain) = engine.mtp.as_mut() {
+            chain.force_proposals = Some(vec![p1]);
+        }
+        let out1 = engine.glm_mtp_round(false)?;
+        ensure!(
+            out1.round.accepted == 0 && out1.replay_row0_logits.is_none(),
+            "DEFECT round 1 expected prefix-1 rejection without replay"
+        );
+        let pool_ids_1 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].pool_ids)?;
+        let tok_ids_1 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].token_ids)?;
+        ensure!(
+            pool_ids_1[0] == -1 && tok_ids_1[3] == 0,
+            "DEFECT round 1 incomplete pool rollback mismatch: pool_ids[0]={} token_ids[3]={}",
+            pool_ids_1[0],
+            tok_ids_1[3]
+        );
+        let snap1 = mtp_persistent_state_bytes(engine)?;
+        let t1 = out1.round.tokens[0];
+
+        let mut p2 = (t1.wrapping_add(add_off) ^ xor_mask) % vocab;
+        if p2 == 0 {
+            p2 = 7;
+        }
+        if let Some(chain) = engine.mtp.as_mut() {
+            chain.force_proposals = Some(vec![p2]);
+        }
+        let out2 = engine.glm_mtp_round(false)?;
+        ensure!(
+            out2.round.accepted == 0 && out2.replay_row0_logits.is_none(),
+            "DEFECT round 2 expected prefix-1 rejection without replay"
+        );
+        let pool_ids_2 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].pool_ids)?;
+        let tok_ids_2 = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.state.dsa[0].token_ids)?;
+        ensure!(
+            pool_ids_2[0] == 0 && pool_ids_2[1] == 0 && tok_ids_2[3] == 3 && tok_ids_2[4] == 0,
+            "DEFECT round 2 completed-pool boundary rollback mismatch: pool_ids[0]={} pool_ids[1]={} token_ids[3]={} token_ids[4]={}",
+            pool_ids_2[0],
+            pool_ids_2[1],
+            tok_ids_2[3],
+            tok_ids_2[4]
+        );
+        let snap2 = mtp_persistent_state_bytes(engine)?;
+        Ok((t1, out2.round.tokens[0], snap1, snap2))
+    };
+
+    let (t1_a, t2_a, state_a1, state_a2) = run_two_rejected_rounds(&mut engine, 0x5a5a, 17)?;
+    let (t1_b, t2_b, state_b1, state_b2) = run_two_rejected_rounds(&mut engine, 0x33cc, 1337)?;
+    ensure!(
+        t1_a == t1_b && t2_a == t2_b,
+        "DEFECT prefix-1 committed tokens differed across rejected proposals: ({t1_a},{t2_a}) vs ({t1_b},{t2_b})"
+    );
+    let diffs_r1 = state_a1
+        .iter()
+        .zip(&state_b1)
+        .filter(|(a, b)| a != b)
+        .count();
+    let diffs_r2 = state_a2
+        .iter()
+        .zip(&state_b2)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        diffs_r1 == 0 && diffs_r2 == 0,
+        "DEFECT post-reject persistent state differed across proposals: r1={diffs_r1} r2={diffs_r2}"
+    );
+
+    // 3. Negative controls:
+    let stream = engine.device.stream.clone();
+    let mut mutant_gdn_history = stream.clone_dtoh(&engine.state.gdn[0].history)?;
+    mutant_gdn_history[0] += 1.0;
+    stream.memcpy_htod(&mutant_gdn_history, &mut engine.state.gdn[0].history)?;
+    let mutant_gdn_diffs = state_a2
+        .iter()
+        .zip(&mtp_persistent_state_bytes(&engine)?)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        mutant_gdn_diffs > 0,
+        "Runner FAIL planted GDN history rollback mutant escaped"
+    );
+    mutant_gdn_history[0] -= 1.0;
+    stream.memcpy_htod(&mutant_gdn_history, &mut engine.state.gdn[0].history)?;
+
+    let mut mutant_dsa_pools = stream.clone_dtoh(&engine.state.dsa[0].pool_ids)?;
+    mutant_dsa_pools[1] = -1;
+    stream.memcpy_htod(&mutant_dsa_pools, &mut engine.state.dsa[0].pool_ids)?;
+    let mutant_dsa_diffs = state_a2
+        .iter()
+        .zip(&mtp_persistent_state_bytes(&engine)?)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        mutant_dsa_diffs > 0,
+        "Runner FAIL planted target DSA pool rollback mutant escaped"
+    );
+    mutant_dsa_pools[1] = 0;
+    stream.memcpy_htod(&mutant_dsa_pools, &mut engine.state.dsa[0].pool_ids)?;
+
+    {
+        let mtp_state = engine.mtp_state.as_mut().context("MTP state missing")?;
+        let mut mutant_layer45 = stream.clone_dtoh(&mtp_state.dsa[0].latent)?;
+        mutant_layer45[4 * 512] = bf16::from_f32(mutant_layer45[4 * 512].to_f32() + 1.0);
+        stream.memcpy_htod(&mutant_layer45, &mut mtp_state.dsa[0].latent)?;
+    }
+    let mutant_l45_diffs = state_a2
+        .iter()
+        .zip(&mtp_persistent_state_bytes(&engine)?)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        mutant_l45_diffs > 0,
+        "Runner FAIL planted Layer 45 rollback mutant escaped"
+    );
+
+    println!(
+        "PASS GLM_MTP_ROLLBACK different_bits=0 kernel_oracle_bits=0 replay_passes=0 mutant_gdn_detected=true mutant_dsa_detected=true mutant_layer45_detected=true committed_tokens=[{t1_a},{t2_a}]"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU GLM-5.3-Flash speculative verification gate (G-MTP4) with counted proof"]
+fn glm_mtp_speculative_verification_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+    let mut engine = load_composition_engine()?;
+
+    let mtp_options = MtpOptions {
+        depth: 1,
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
+        recurrent_tap: MtpRecurrentTap::PreMtpNorm,
+        graph: true,
+    };
+    engine.mtp_enable(mtp_options)?;
+    let eos_ids = engine.model_spec.eos.clone();
+    ensure!(!eos_ids.is_empty(), "Runner FAIL GLM EOS ids missing");
+
+    // Read frozen verify thresholds (tau)
+    let ref_dir = PathBuf::from(
+        std::env::var_os("FF_GLM_MTP_REF_DIR").context("FF_GLM_MTP_REF_DIR missing")?,
+    );
+    let tau_path = ref_dir.join("verify_thresholds.json");
+    let thresholds_raw = std::fs::read_to_string(tau_path)?;
+    let thresholds: serde_json::Value = serde_json::from_str(&thresholds_raw)?;
+    let tau_max_abs_per_pos: Vec<f32> = thresholds["tau_max_abs_per_position"]
+        .as_array()
+        .context("tau_max_abs_per_position missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let tau_rmse_per_pos: Vec<f32> = thresholds["tau_rmse_per_position"]
+        .as_array()
+        .context("tau_rmse_per_position missing")?
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+
+    let control_path = ref_dir.join("verify_control_positions_r1.json");
+    let control_raw = std::fs::read_to_string(control_path)?;
+    let control_json: serde_json::Value = serde_json::from_str(&control_raw)?;
+    let gated_positions: std::collections::BTreeSet<usize> = control_json["gated_positions"]
+        .as_array()
+        .context("gated_positions missing")?
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+
+    let mut verify_compared_count = 0usize;
+    let mut verify_gated_count = 0usize;
+    let mut defects: Vec<String> = Vec::new();
+    let check_verify_row0 = |p: usize,
+                             verify_logits: &[f32],
+                             ref_logits: &[f32],
+                             label: &str,
+                             defects_out: &mut Vec<String>,
+                             compared_out: &mut usize,
+                             gated_out: &mut usize|
+     -> (f32, f32) {
+        let tau_max_abs = tau_max_abs_per_pos
+            .get(p)
+            .copied()
+            .unwrap_or(tau_max_abs_per_pos[0]);
+        let tau_rmse = tau_rmse_per_pos
+            .get(p)
+            .copied()
+            .unwrap_or(tau_rmse_per_pos[0]);
+        let mut row0_max_abs = 0.0f32;
+        let mut row0_sum_sq = 0.0f32;
+        for (&v, &r) in verify_logits.iter().zip(ref_logits) {
+            let diff = (v - r).abs();
+            if diff > row0_max_abs {
+                row0_max_abs = diff;
+            }
+            row0_sum_sq += diff * diff;
+        }
+        let row0_rmse = (row0_sum_sq / verify_logits.len() as f32).sqrt();
+        if gated_positions.contains(&p) {
+            if row0_max_abs > tau_max_abs {
+                defects_out.push(format!(
+                    "DEFECT {label} at pos={p} max_abs={row0_max_abs:.6} exceeds tau={tau_max_abs:.6}"
+                ));
+            }
+            if row0_rmse > tau_rmse {
+                defects_out.push(format!(
+                    "DEFECT {label} at pos={p} rmse={row0_rmse:.6} exceeds tau={tau_rmse:.6}"
+                ));
+            }
+            *gated_out += 1;
+        }
+        *compared_out += 1;
+        (row0_max_abs, row0_rmse)
+    };
+
+    // Exercise gated control position 1 from verify_control_positions_r1.json before passage rollout.
+    engine.mtp_prefill(&reference.tokens[..1])?;
+    let pos1_ckpt = GraphStepCheckpoint::save(&engine)?;
+    let _ = engine.decode(false, None)?;
+    let ref_pos1_logits = engine.decode_logits()?;
+    pos1_ckpt.restore(&mut engine)?;
+    let out_pos1 = engine.glm_mtp_round(true)?;
+    ensure!(
+        gated_positions.contains(&out_pos1.start_pos),
+        "Runner FAIL expected pos={} in gated_positions",
+        out_pos1.start_pos
+    );
+    let (pos1_max_abs, pos1_rmse) = check_verify_row0(
+        out_pos1.start_pos,
+        &out_pos1.verify_row0_logits,
+        &ref_pos1_logits,
+        "verify row0",
+        &mut defects,
+        &mut verify_compared_count,
+        &mut verify_gated_count,
+    );
+    let mut pos1_max_idx = 0usize;
+    let mut pos1_best_diff = -1.0f32;
+    for (idx, (&v, &r)) in out_pos1
+        .verify_row0_logits
+        .iter()
+        .zip(&ref_pos1_logits)
+        .enumerate()
+    {
+        let diff = (v - r).abs();
+        if diff > pos1_best_diff {
+            pos1_best_diff = diff;
+            pos1_max_idx = idx;
+        }
+    }
+    let pos1_verify_logit = out_pos1.verify_row0_logits[pos1_max_idx];
+    let pos1_ref_logit = ref_pos1_logits[pos1_max_idx];
+    let (pos1_verify_top1, pos1_verify_margin) =
+        super::mtp::top1_and_margin(&out_pos1.verify_row0_logits);
+    let (pos1_ref_top1, pos1_ref_margin) = super::mtp::top1_and_margin(&ref_pos1_logits);
+    println!(
+        "GLM_MTP_GATED_POS pos={} max_abs={pos1_max_abs:.6} tau_max_abs={:.6} rmse={pos1_rmse:.6} tau_rmse={:.6} vocab_idx={pos1_max_idx} verify_logit={pos1_verify_logit:.6} ref_logit={pos1_ref_logit:.6} verify_top1={pos1_verify_top1} verify_margin={pos1_verify_margin:.6} ref_top1={pos1_ref_top1} ref_margin={pos1_ref_margin:.6}",
+        out_pos1.start_pos,
+        tau_max_abs_per_pos[out_pos1.start_pos],
+        tau_rmse_per_pos[out_pos1.start_pos],
+    );
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    // 2026-11-07: prefill loc32 33-token prefix via mtp_prefill with model EOS stop ids; frozen tau and alpha* unchanged.
+    let t0 = engine.mtp_prefill(&reference.tokens[..33])?;
+    let checkpoint = GraphStepCheckpoint::save(&engine)?;
+    let _ref_t1 = engine.decode(false, None)?;
+    let ref_row0_logits = engine.decode_logits()?;
+    checkpoint.restore(&mut engine)?;
+
+    let mut accepted_count = 0usize;
+    let mut total_rounds = 0usize;
+    let mut emitted_tokens = Vec::with_capacity(600);
+    emitted_tokens.push(t0);
+
+    let mut min_margin = f32::INFINITY;
+    let mut sum_margin = 0.0f32;
+    let mut margin_count = 0usize;
+
+    // Cost model quantities
+    let w_target_dense = 5_618_368_512u64;
+    // Two key/gate/norm/APE passes bound the draft and accepted-row commit.
+    let index_key_pass = (2 * 128 * 4096 + 2 * 128 + 4 * 128) * 2;
+    let w_draft_dense = 243_872_384u64 + 2 * index_key_pass;
+    let expert_slot_bytes = 25_171_968u64;
+    let b_head = 154_880u64 * 4096 * 2; // 1,268,776,960 B
+    let b_step1 = w_target_dense + (336 * expert_slot_bytes) + b_head; // 15,344,926,720 B
+    let b_draft = w_draft_dense + (8 * expert_slot_bytes) + b_head;
+
+    let mut total_bytes_moved = 0u64;
+    let mut sum_b_verify = 0u64;
+    let mut sum_u = 0usize;
+    let mut draft_staged_experts_sum = 0usize;
+    let mut replay_1row_passes = 0usize;
+    let mut prefix1_commits = 0usize;
+    let loop_start = std::time::Instant::now();
+
+    while emitted_tokens.len() < 599
+        && !eos_ids.contains(emitted_tokens.last().context("emitted tokens empty")?)
+    {
+        let is_round0 = total_rounds == 0;
+        let out = if is_round0 {
+            let out_eager = engine.glm_mtp_round(true)?;
+            check_verify_row0(
+                out_eager.start_pos,
+                &out_eager.verify_row0_logits,
+                &ref_row0_logits,
+                "verify row0",
+                &mut defects,
+                &mut verify_compared_count,
+                &mut verify_gated_count,
+            );
+            out_eager
+        } else {
+            engine.glm_mtp_round(false)?
+        };
+
+        total_rounds += 1;
+        let tokens_in_round = out.round.tokens.len();
+        if total_rounds <= 8 || out.round.accepted == 0 {
+            let draft_tok = out.round.proposals.first().copied().unwrap_or(0);
+            let (v0_id, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
+            let (v1_id, _) = super::mtp::top1_and_margin(&out.verify_row1_logits);
+            println!(
+                "GLM_MTP_ROUND8 round={total_rounds} pos={} draft={draft_tok} verify_argmax={v0_id} verify_margin={:.4} accepted={} v1={v1_id} v1_margin={:.4}",
+                out.start_pos, out.v0_margin, out.round.accepted, out.v1_margin
+            );
+            std::io::Write::flush(&mut std::io::stdout())?;
+        }
+        let did_replay = out.replay_row0_logits.is_some();
+        ensure!(
+            !did_replay,
+            "Runner FAIL unexpected target replay on rejection at pos={}",
+            out.start_pos
+        );
+        if out.round.accepted > 0 {
+            accepted_count += 1;
+        }
+
+        // Verify emitted tokens match argmax of verify rows
+        let (top0_id, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
+        ensure!(
+            top0_id == out.round.tokens[0],
+            "DEFECT emitted token 0 ({}) does not match argmax ({top0_id})",
+            out.round.tokens[0]
+        );
+        min_margin = min_margin.min(out.v0_margin);
+        sum_margin += out.v0_margin;
+        margin_count += 1;
+
+        if tokens_in_round > 1 {
+            let (top1_id, _) = super::mtp::top1_and_margin(&out.verify_row1_logits);
+            ensure!(
+                top1_id == out.round.tokens[1],
+                "DEFECT emitted token 1 ({}) does not match argmax ({top1_id})",
+                out.round.tokens[1]
+            );
+            min_margin = min_margin.min(out.v1_margin);
+            sum_margin += out.v1_margin;
+            margin_count += 1;
+        }
+
+        // Cost accounting
+        sum_u += out.expert_union_count;
+        draft_staged_experts_sum += out.draft_staged_experts;
+        if out.round.accepted == 0 {
+            if did_replay {
+                replay_1row_passes += 1;
+            } else {
+                prefix1_commits += 1;
+            }
+        }
+        let b_verify =
+            w_target_dense + (out.expert_union_count as u64 * expert_slot_bytes) + b_head;
+        sum_b_verify += b_verify;
+        let b_round = if did_replay {
+            b_draft + b_verify + b_step1
+        } else {
+            b_draft + b_verify
+        };
+        total_bytes_moved += b_round;
+
+        for &tok in &out.round.tokens {
+            emitted_tokens.push(tok);
+            if eos_ids.contains(&tok) {
+                break;
+            }
+        }
+        if total_rounds.is_multiple_of(50) {
+            let elapsed_s = loop_start.elapsed().as_secs_f64();
+            println!(
+                "GLM_MTP_PROGRESS rounds={total_rounds} emitted={} accepted={accepted_count} elapsed_s={elapsed_s:.2}",
+                emitted_tokens.len()
+            );
+            std::io::Write::flush(&mut std::io::stdout())?;
+        }
+    }
+    ensure!(
+        total_rounds > 0,
+        "Runner FAIL zero speculative rounds executed"
+    );
+
+    let alpha = accepted_count as f64 / total_rounds as f64;
+    println!("GLM_MTP_EMITTED ids={emitted_tokens:?}");
+    let mean_b_verify = sum_b_verify as f64 / total_rounds as f64;
+    let mean_u = sum_u as f64 / total_rounds as f64;
+    let alpha_star = crate::mtp::glm_mtp_break_even_alpha(
+        b_draft,
+        mean_b_verify,
+        b_step1,
+        replay_1row_passes > 0,
+    );
+    let baseline_bytes = (emitted_tokens.len() - 1) as u64 * b_step1;
+    let efficiency_ratio = total_bytes_moved as f64 / baseline_bytes as f64;
+    let mean_margin = sum_margin / margin_count as f32;
+
+    if alpha <= alpha_star {
+        defects.push(format!(
+            "DEFECT acceptance rate alpha={alpha:.4} <= break-even alpha_star={alpha_star:.4}"
+        ));
+    }
+
+    let replay_experts_sum = replay_1row_passes * 336;
+    let target_layer_passes = (total_rounds + replay_1row_passes) * 45;
+    let head_rows_projected = total_rounds * 3 + replay_1row_passes;
+    let checkpoint_restores = total_rounds - accepted_count;
+    println!(
+        "GLM_MTP_OP_COUNTS draft_passes={total_rounds} draft_htod_experts={draft_staged_experts_sum} accept_kv_commits={accepted_count} verify_2row_passes={total_rounds} verify_union_experts={sum_u} replay_1row_passes={replay_1row_passes} replay_htod_experts={replay_experts_sum} prefix1_commits={prefix1_commits} target_layer_passes={target_layer_passes} head_rows={head_rows_projected} checkpoint_saves={total_rounds} checkpoint_restores={checkpoint_restores}"
+    );
+    let status = if defects.is_empty() { "PASS" } else { "DEFECT" };
+    println!(
+        "{status} GLM_MTP_SPECULATIVE rounds={total_rounds} accepted={accepted_count} verify_compared={verify_compared_count} verify_gated={verify_gated_count} alpha={alpha:.4} mean_u={mean_u:.2} v_bar={mean_b_verify:.0} alpha_star={alpha_star:.4} efficiency_ratio={efficiency_ratio:.4} min_margin={min_margin:.4} mean_margin={mean_margin:.4} emitted={} defects={}",
+        emitted_tokens.len(),
+        defects.len()
+    );
+    for d in &defects {
+        println!("{d}");
+    }
+    std::io::Write::flush(&mut std::io::stdout())?;
+    ensure!(
+        defects.is_empty(),
+        "DEFECT GLM MTP speculative verification"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "official GLM greedy continuation, frozen shared-prefix tolerance and exact verify commits"]
+fn glm_mtp_greedy_256_gpu() -> Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+    let prompt = &reference.tokens[..33];
+    let ref_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MTP_REF_DIR").context("MTP reference missing")?);
+    let thresholds: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ref_dir.join("verify_thresholds.json"))?)?;
+    let tau: Vec<f32> = serde_json::from_value(thresholds["tau_max_abs_per_position"].clone())?;
+    ensure!(
+        tau.len() >= prompt.len() + 255 && tau.iter().all(|&t| t > 0.0 && (2.0 * t).is_finite()),
+        "Runner FAIL frozen verify tolerance extent or values"
+    );
+    let mut engine = load_composition_engine()?;
+    let mut baseline = vec![engine.prefill(prompt, None)?];
+    let mut baseline_logits = Vec::with_capacity(256);
+    loop {
+        let logits = engine.decode_logits()?;
+        ensure!(
+            logits.len() == 154880 && logits.iter().all(|v| v.is_finite()),
+            "Runner FAIL ordinary logit extent or nonfinite values"
+        );
+        baseline_logits.push(logits);
+        if baseline.len() == 256 {
+            break;
+        }
+        baseline.push(engine.decode(false, None)?);
+    }
+    let baseline_margins: Vec<_> = baseline_logits
+        .iter()
+        .map(|logits| super::mtp::top1_and_margin(logits).1)
+        .collect();
+    println!("GLM_MTP_FREE_BASELINE ids={baseline:?} margins={baseline_margins:?}");
+    std::io::stdout().flush()?;
+    drop(engine);
+    let mut engine = load_composition_engine()?;
+    engine.mtp_enable(MtpOptions {
+        depth: 1,
+        hidden_tap: MtpHiddenTap::PostFinalNorm,
+        recurrent_tap: MtpRecurrentTap::PreMtpNorm,
+        graph: false,
+    })?;
+    let mut shared_prefix = true;
+    let mut compared = 0usize;
+    let mut id_required = 0usize;
+    let mut near_ties = 0usize;
+    let mut first_divergence = None;
+    let mut logit_defects = 0usize;
+    let mut id_defects = 0usize;
+    let mut max_logit_ratio = 0.0f32;
+    let mut compare = |index: usize, token: u32, logits: &[f32]| -> Result<()> {
+        if !shared_prefix {
+            return Ok(());
+        }
+        let plain = &baseline_logits[index];
+        ensure!(
+            logits.len() == plain.len() && logits.iter().all(|v| v.is_finite()),
+            "Runner FAIL verify logit extent or nonfinite values"
+        );
+        let position = prompt.len() - 1 + index;
+        let bound = tau[position];
+        let max_abs = logits
+            .iter()
+            .zip(plain)
+            .map(|(v, p)| (v - p).abs())
+            .fold(0.0f32, f32::max);
+        let required = baseline_margins[index] > 2.0 * bound;
+        let mismatch = token != baseline[index];
+        compared += 1;
+        id_required += usize::from(required);
+        near_ties += usize::from(!required);
+        logit_defects += usize::from(max_abs > bound);
+        id_defects += usize::from(required && mismatch);
+        max_logit_ratio = max_logit_ratio.max(max_abs / bound);
+        println!(
+            "GLM_MTP_SHARED_PREFIX index={index} input_position={position} max_abs={max_abs} tau={bound} plain_margin={} id_required={required} id_mismatch={mismatch}",
+            baseline_margins[index],
+        );
+        if mismatch {
+            first_divergence = Some(index);
+            shared_prefix = false;
+            println!(
+                "{} GLM_MTP_FREE_FIRST index={index} position={} eager_id={} mtp_id={token} eager_margin={} mtp_margin={} tau={bound}",
+                if required { "DEFECT" } else { "NEAR_TIE" },
+                position + 1,
+                baseline[index],
+                baseline_margins[index],
+                super::mtp::top1_and_margin(logits).1,
+            );
+        }
+        Ok(())
+    };
+    let check_commit =
+        |tokens: &[u32], accepted: usize, proposal: u32, verify: [&[f32]; 2]| -> Result<()> {
+            let [v0, v1] = verify.map(|logits| super::mtp::top1_and_margin(logits).0);
+            let expected = usize::from(proposal == v0);
+            ensure!(
+                accepted == expected
+                    && tokens.len() == 1 + expected
+                    && tokens[0] == v0
+                    && (expected == 0 || tokens[1] == v1),
+                "DEFECT wrong-token commit against own verify numerics"
+            );
+            Ok(())
+        };
+    let mut speculative = vec![engine.mtp_prefill(prompt)?];
+    let initial = engine.decode_logits()?;
+    let mut speculative_margins = vec![super::mtp::top1_and_margin(&initial).1];
+    compare(0, speculative[0], &initial)?;
+    let mut rounds = 0usize;
+    let mut accepted = 0usize;
+    let mut commit_defects = 0usize;
+    let mut wrong_commit_detected = false;
+    while speculative.len() < 256 {
+        let out = engine.glm_mtp_round(true)?;
+        let verify = [&out.verify_row0_logits[..], &out.verify_row1_logits[..]];
+        ensure!(
+            out.round.proposals.len() == 1
+                && (1..=2).contains(&out.round.tokens.len())
+                && verify
+                    .iter()
+                    .all(|v| v.len() == 154880 && v.iter().all(|value| value.is_finite())),
+            "Runner FAIL GLM verify round extent or nonfinite values"
+        );
+        rounds += 1;
+        accepted += out.round.accepted;
+        let proposal = out.round.proposals[0];
+        if let Err(error) = check_commit(&out.round.tokens, out.round.accepted, proposal, verify) {
+            commit_defects += 1;
+            println!("{error}");
+        }
+        if !wrong_commit_detected && proposal != super::mtp::top1_and_margin(verify[0]).0 {
+            let v1 = super::mtp::top1_and_margin(verify[1]).0;
+            wrong_commit_detected = check_commit(&[proposal, v1], 1, proposal, verify).is_err();
+            ensure!(
+                wrong_commit_detected,
+                "Runner FAIL rejected-draft commit control escaped"
+            );
+            println!("PASS GLM_MTP_WRONG_COMMIT_CONTROL round={rounds} proposal={proposal}");
+        }
+        println!(
+            "GLM_MTP_FREE_ROUND round={rounds} pos={} accepted={} draft={:?} tokens={:?} margins=[{},{}]",
+            out.start_pos,
+            out.round.accepted,
+            out.round.proposals,
+            out.round.tokens,
+            out.v0_margin,
+            out.v1_margin,
+        );
+        for (index, &token) in out.round.tokens.iter().enumerate() {
+            if speculative.len() == 256 {
+                break;
+            }
+            compare(speculative.len(), token, verify[index])?;
+            speculative.push(token);
+            speculative_margins.push(if index == 0 {
+                out.v0_margin
+            } else {
+                out.v1_margin
+            });
+        }
+        std::io::stdout().flush()?;
+    }
+    ensure!(
+        wrong_commit_detected,
+        "Runner FAIL no rejected draft for commit control"
+    );
+    let defects = logit_defects + id_defects + commit_defects;
+    println!("GLM_MTP_FREE_SPECULATIVE ids={speculative:?} margins={speculative_margins:?}");
+    println!(
+        "{} GLM_MTP_FREE_256 tokens=256 shared_prefix_positions={compared} id_required={id_required} near_ties={near_ties} first_divergence={first_divergence:?} unpaired_positions={} max_logit_ratio={max_logit_ratio} logit_defects={logit_defects} id_defects={id_defects} commit_defects={commit_defects} wrong_token_commit_detected={wrong_commit_detected} rounds={rounds} accepted={accepted} eos_ignored=true tau_source=verify_thresholds.json",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        256 - compared,
+    );
+    ensure!(
+        defects == 0,
+        "DEFECT GLM MTP shared-prefix or verify-commit contract"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "captures target hidden states on the supplied GLM greedy continuation"]
+fn glm_mtp_conditioned_hidden_gpu() -> Result<()> {
+    let input =
+        PathBuf::from(std::env::var_os("FF_GLM_MTP_REF_DIR").context("MTP inputs missing")?);
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(input.join("continuation.json"))?)?;
+    let ids: Vec<u32> = serde_json::from_value(record["input_ids"].clone())?;
+    ensure!(
+        ids.len() > 33 && ids.len() <= 640,
+        "Runner FAIL continuation length exceeds target capacity"
+    );
+    let output =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_OUTPUT").context("output missing")?);
+    std::fs::create_dir(&output)?;
+    let mut hidden = BufWriter::new(std::fs::File::create_new(output.join("hidden.bf16"))?);
+    let mut engine = load_composition_engine()?;
+    let mut greedy_ids = Vec::with_capacity(ids.len() - 1);
+    let mut margins = Vec::with_capacity(ids.len() - 1);
+    for (position, &token) in ids[..ids.len() - 1].iter().enumerate() {
+        let greedy = if position == 0 {
+            engine.prefill(&[token], None)?
+        } else {
+            engine.set_token(token)?;
+            engine.decode(false, None)?
+        };
+        let logits = engine.decode_logits()?;
+        ensure!(
+            logits.iter().all(|value| value.is_finite()),
+            "Runner FAIL nonfinite teacher-forced target logits"
+        );
+        greedy_ids.push(greedy);
+        margins.push(super::mtp::top1_and_margin(&logits).1);
+        let row: Vec<bf16> = engine
+            .device
+            .stream
+            .clone_dtoh(&engine.work.n.slice(..4096))?;
+        for value in row {
+            hidden.write_all(&value.to_le_bytes())?;
+        }
+        if (position + 1).is_multiple_of(50) {
+            println!("GLM_MTP_CONDITIONED_PROGRESS rows={}", position + 1);
+            std::io::stdout().flush()?;
+        }
+    }
+    hidden.flush()?;
+    let record = serde_json::json!({
+        "input_ids": ids,
+        "greedy_ids": greedy_ids,
+        "margins": margins,
+        "hidden_layout": [ids.len() - 1, 4096],
+        "hidden_dtype": "BF16",
+        "mtp_enabled": false,
+        "target_rows": 1,
+    });
+    serde_json::to_writer(
+        std::fs::File::create_new(output.join("target.json"))?,
+        &record,
+    )?;
+    println!(
+        "PASS GLM_MTP_CONDITIONED_HIDDEN rows={} hidden=4096 dtype=BF16 mtp_enabled=false",
+        ids.len() - 1,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+struct DraftLocalizationStep {
+    token: u32,
+    hidden_idx: usize,
+    use_post_norm: bool,
+    dsa_pos: usize,
+    t_p1: u32,
+    g_p1: u32,
+    t_p2: u32,
+    g_p2: u32,
+}
+
+#[cfg(feature = "cuda")]
+struct DraftLocalizationSummary {
+    agree_t_p2: usize,
+    agree_g_p2: usize,
+    agree_t_p1: usize,
+    agree_g_p1: usize,
+    agree_g_p2_when_g1_eq_t1: usize,
+    g1_eq_t1_total: usize,
+    min_margin: f32,
+    mean_margin: f32,
+    sample_preds: Vec<u32>,
+}
+
+#[cfg(feature = "cuda")]
+struct DraftLocalizationEnv<'a> {
+    device: &'a Device,
+    blas: &'a Blas,
+    embed: &'a cudarc::driver::CudaSlice<bf16>,
+    head: &'a cudarc::driver::CudaSlice<bf16>,
+    h_pre: &'a [cudarc::driver::CudaSlice<bf16>],
+    h_post: &'a [cudarc::driver::CudaSlice<bf16>],
+}
+
+#[cfg(feature = "cuda")]
+fn eval_draft_localization_cell(
+    runtime: &mut GlmMtpRuntime,
+    env: &DraftLocalizationEnv<'_>,
+    steps: &[DraftLocalizationStep],
+    rollback_on_reject: bool,
+) -> Result<DraftLocalizationSummary> {
+    let mut dsa = crate::backend::cuda::dsa::DsaState::new(
+        crate::op_contract::DsaSpec::glm53(),
+        2048,
+        &env.device.stream,
+    )?;
+    dsa.clear(&env.device.stream)?;
+
+    let mut agree_t_p2 = 0usize;
+    let mut agree_g_p2 = 0usize;
+    let mut agree_t_p1 = 0usize;
+    let mut agree_g_p1 = 0usize;
+    let mut agree_g_p2_when_g1_eq_t1 = 0usize;
+    let mut g1_eq_t1_total = 0usize;
+    let mut min_margin = f32::INFINITY;
+    let mut sum_margin = 0.0f32;
+    let mut sample_preds = Vec::with_capacity(8);
+
+    let shared = GlmMtpShared {
+        blas: env.blas,
+        embedding: env.embed,
+        head: env.head,
+    };
+
+    for step in steps {
+        let saved = if rollback_on_reject {
+            Some((
+                env.device.stream.clone_dtoh(&dsa.latent)?,
+                env.device.stream.clone_dtoh(&dsa.token_ids)?,
+                env.device.stream.clone_dtoh(&dsa.meta)?,
+            ))
+        } else {
+            None
+        };
+
+        let hidden = if step.use_post_norm {
+            &env.h_post[step.hidden_idx]
+        } else {
+            &env.h_pre[step.hidden_idx]
+        };
+        let (draft_id, draft_logits, _) =
+            runtime.step_draft_device(step.token, hidden, 0, shared, &mut dsa, step.dsa_pos)?;
+        let (top_id, margin) = super::mtp::top1_and_margin(&draft_logits);
+        ensure!(
+            top_id == draft_id,
+            "Runner FAIL draft argmax mismatch: {top_id} vs {draft_id}"
+        );
+        if sample_preds.len() < 8 {
+            sample_preds.push(draft_id);
+        }
+        if draft_id == step.t_p2 {
+            agree_t_p2 += 1;
+        }
+        if draft_id == step.g_p2 {
+            agree_g_p2 += 1;
+        }
+        if draft_id == step.t_p1 {
+            agree_t_p1 += 1;
+        }
+        if draft_id == step.g_p1 {
+            agree_g_p1 += 1;
+        }
+        if step.g_p1 == step.t_p1 {
+            g1_eq_t1_total += 1;
+            if draft_id == step.g_p2 {
+                agree_g_p2_when_g1_eq_t1 += 1;
+            }
+        }
+        min_margin = min_margin.min(margin);
+        sum_margin += margin;
+
+        if draft_id != step.g_p2
+            && let Some((lat, tids, meta)) = saved
+        {
+            env.device.stream.memcpy_htod(&lat, &mut dsa.latent)?;
+            env.device.stream.memcpy_htod(&tids, &mut dsa.token_ids)?;
+            env.device.stream.memcpy_htod(&meta, &mut dsa.meta)?;
+        }
+    }
+
+    Ok(DraftLocalizationSummary {
+        agree_t_p2,
+        agree_g_p2,
+        agree_t_p1,
+        agree_g_p1,
+        agree_g_p2_when_g1_eq_t1,
+        g1_eq_t1_total,
+        min_margin,
+        mean_margin: sum_margin / steps.len() as f32,
+        sample_preds,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU Phase-1 32-position draft-on-reference localization comparing definition vs engine-round pairing and hidden tap"]
+fn glm_mtp_draft_on_reference_32pos_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model_dir =
+        PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+    let comp_root = PathBuf::from(
+        std::env::var_os("G1_COMPOSITION_REFERENCE").context("G1_COMPOSITION_REFERENCE missing")?,
+    );
+    let layer44_path = PathBuf::from(
+        std::env::var_os("FF_GLM_LAYER44_TRACE").context("FF_GLM_LAYER44_TRACE missing")?,
+    );
+
+    let reference = Reference::load(&comp_root)?;
+    if let Some(parent) = layer44_path.parent() {
+        let trace_tokens_path = parent.join("tokens.json");
+        if trace_tokens_path.exists() {
+            let trace_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&trace_tokens_path)?)?;
+            let trace_ids: Vec<u32> = serde_json::from_value(trace_json["input_ids"].clone())?;
+            ensure!(
+                trace_ids.len() >= 85 && trace_ids[..85] == reference.tokens[..85],
+                "Runner FAIL layer44 trace tokens differ from composition reference"
+            );
+        }
+    }
+
+    let layer44_bytes = std::fs::read(&layer44_path)?;
+    let layer44_st = safetensors::SafeTensors::deserialize(&layer44_bytes)?;
+    let layer44_out = layer44_st.tensor("layer44.output")?;
+    ensure!(
+        layer44_out.dtype() == safetensors::Dtype::BF16 && layer44_out.shape() == [1, 85, 4, 4096],
+        "Runner FAIL unexpected layer44.output shape {:?} or dtype {:?}",
+        layer44_out.shape(),
+        layer44_out.dtype()
+    );
+    let raw_streams: Vec<bf16> = layer44_out
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+
+    let shard62_file = std::fs::File::open(model_dir.join("model-00062-of-00062.safetensors"))?;
+    let mmap62 = unsafe { memmap2::MmapOptions::new().map(&shard62_file)? };
+    let st62 = safetensors::SafeTensors::deserialize(&mmap62)?;
+    let norm_tensor = st62.tensor("model.language_model.norm.weight")?;
+    ensure!(
+        norm_tensor.dtype() == safetensors::Dtype::BF16 && norm_tensor.shape() == [4096],
+        "Runner FAIL unexpected final norm weight shape {:?}",
+        norm_tensor.shape()
+    );
+    let final_norm_host: Vec<bf16> = norm_tensor
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+
+    let device = Device::new(0)?;
+    unsafe {
+        device.ctx.disable_event_tracking();
+    }
+    let ops = crate::backend::cuda::ops::Ops::new(&device.ctx)?;
+    let closure = std::rc::Rc::new(crate::backend::cuda::closure::Closure::new(
+        false,
+        "glm_mtp_loc".into(),
+    ));
+    let blas = Blas::new(&device, &ops, &std::env::temp_dir(), closure)?;
+    let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true, 2048)?;
+    let embed_gpu = runtime
+        ._standalone_embed
+        .take()
+        .context("standalone embed missing")?;
+    let head_gpu = runtime
+        .standalone_head
+        .take()
+        .context("standalone head missing")?;
+    let final_norm_gpu = device.stream.clone_htod(&final_norm_host)?;
+
+    let count = 32usize;
+    let mut h_pre_gpu = Vec::with_capacity(count);
+    let mut h_post_gpu = Vec::with_capacity(count);
+    for p in 0..count {
+        let base = p * 4 * 4096;
+        let mut collapsed = vec![bf16::ZERO; 4096];
+        for (h, out) in collapsed.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for j in 0..4 {
+                acc = (0.25f32).mul_add(raw_streams[base + j * 4096 + h].to_f32(), acc);
+            }
+            *out = bf16::from_f32(acc);
+        }
+        let pre_slice = device.stream.clone_htod(&collapsed)?;
+        let mut post_slice = device.stream.alloc_zeros::<bf16>(4096)?;
+        let rows_i32 = 1i32;
+        let dim_i32 = 4096i32;
+        let eps = 1e-5f32;
+        unsafe {
+            device
+                .stream
+                .launch_builder(&runtime.rms_norm)
+                .arg(&pre_slice)
+                .arg(&final_norm_gpu)
+                .arg(&mut post_slice)
+                .arg(&rows_i32)
+                .arg(&dim_i32)
+                .arg(&eps)
+                .launch(crate::backend::cuda::ops::grid(1, 256))?;
+        }
+        h_pre_gpu.push(pre_slice);
+        h_post_gpu.push(post_slice);
+    }
+
+    let positions = reference.record["positions"]
+        .as_array()
+        .context("positions array missing")?;
+    let mut target_g2_eq_t2 = 0usize;
+    let mut target_g1_eq_t1 = 0usize;
+    for p in 0..count {
+        let g_p1 = positions[p]["R1_id"].as_u64().unwrap() as u32;
+        let g_p2 = positions[p + 1]["R1_id"].as_u64().unwrap() as u32;
+        if g_p1 == reference.tokens[p + 1] {
+            target_g1_eq_t1 += 1;
+        }
+        if g_p2 == reference.tokens[p + 2] {
+            target_g2_eq_t2 += 1;
+        }
+    }
+    println!(
+        "TARGET_BASELINE_32POS target_g_p2_eq_t_p2={target_g2_eq_t2}/{count} target_g_p1_eq_t_p1={target_g1_eq_t1}/{count}"
+    );
+
+    let env = DraftLocalizationEnv {
+        device: &device,
+        blas: &blas,
+        embed: &embed_gpu,
+        head: &head_gpu,
+        h_pre: &h_pre_gpu,
+        h_post: &h_post_gpu,
+    };
+
+    let build_steps = |shifted_token: bool,
+                       greedy_pending: bool,
+                       use_post_norm: bool,
+                       pos_offset: usize|
+     -> Vec<DraftLocalizationStep> {
+        (0..count)
+            .map(|p| {
+                let t_p1 = reference.tokens[p + 1];
+                let t_p2 = reference.tokens[p + 2];
+                let g_p1 = positions[p]["R1_id"].as_u64().unwrap() as u32;
+                let g_p2 = positions[p + 1]["R1_id"].as_u64().unwrap() as u32;
+                let token = if greedy_pending {
+                    g_p1
+                } else if shifted_token {
+                    t_p1
+                } else {
+                    reference.tokens[p]
+                };
+                DraftLocalizationStep {
+                    token,
+                    hidden_idx: p,
+                    use_post_norm,
+                    dsa_pos: p + pos_offset,
+                    t_p1,
+                    g_p1,
+                    t_p2,
+                    g_p2,
+                }
+            })
+            .collect()
+    };
+
+    let build_engine_round_steps =
+        |greedy_pending: bool| -> Result<(Vec<DraftLocalizationStep>, bool)> {
+            let first_cfg =
+                glm_mtp_draft_step_config(1, Some(PrefixLastInputKind::DecodeToken), 1)?;
+            let mut out = Vec::with_capacity(count);
+            for p in 0..count {
+                let cfg =
+                    glm_mtp_draft_step_config(p + 1, Some(PrefixLastInputKind::DecodeToken), 1)?;
+                let t_p1 = reference.tokens[p + 1];
+                let t_p2 = reference.tokens[p + 2];
+                let g_p1 = positions[p]["R1_id"].as_u64().unwrap() as u32;
+                let g_p2 = positions[p + 1]["R1_id"].as_u64().unwrap() as u32;
+                out.push(DraftLocalizationStep {
+                    token: if greedy_pending { g_p1 } else { t_p1 },
+                    hidden_idx: p + cfg.committed_row,
+                    use_post_norm: cfg.hidden_tap == MtpHiddenTap::PostFinalNorm,
+                    dsa_pos: cfg.draft_pos,
+                    t_p1,
+                    g_p1,
+                    t_p2,
+                    g_p2,
+                });
+            }
+            Ok((out, !first_cfg.retain_committed_on_reject))
+        };
+
+    let (eng_trace_steps, eng_trace_rollback) = build_engine_round_steps(false)?;
+    let (eng_greedy_steps, eng_greedy_rollback) = build_engine_round_steps(true)?;
+
+    let cells: [(&str, Vec<DraftLocalizationStep>, bool); 12] = [
+        (
+            "def_shifted_post_norm",
+            build_steps(true, false, true, 0),
+            false,
+        ),
+        (
+            "def_shifted_pre_norm",
+            build_steps(true, false, false, 0),
+            false,
+        ),
+        (
+            "unshifted_tok_post_norm",
+            build_steps(false, false, true, 0),
+            false,
+        ),
+        (
+            "unshifted_tok_pre_norm",
+            build_steps(false, false, false, 0),
+            false,
+        ),
+        (
+            "engine_round_trace_tok",
+            eng_trace_steps,
+            eng_trace_rollback,
+        ),
+        (
+            "engine_round_greedy_pending",
+            eng_greedy_steps,
+            eng_greedy_rollback,
+        ),
+        (
+            "legacy_pre_fix_round_trace_tok",
+            build_steps(true, false, false, 1),
+            true,
+        ),
+        (
+            "iso_post_norm_pos1_rollback",
+            build_steps(true, false, true, 1),
+            true,
+        ),
+        (
+            "iso_post_norm_pos1_no_rollback",
+            build_steps(true, false, true, 1),
+            false,
+        ),
+        (
+            "iso_post_norm_pos0_rollback",
+            build_steps(true, false, true, 0),
+            true,
+        ),
+        (
+            "iso_pre_norm_pos1_no_rollback",
+            build_steps(true, false, false, 1),
+            false,
+        ),
+        (
+            "iso_pre_norm_pos0_rollback",
+            build_steps(true, false, false, 0),
+            true,
+        ),
+    ];
+
+    for p in 0..8 {
+        println!(
+            "TRACE_POS p={p} t_p={} t_p1={} g_p1={} t_p2={} g_p2={}",
+            reference.tokens[p],
+            reference.tokens[p + 1],
+            positions[p]["R1_id"].as_u64().unwrap(),
+            reference.tokens[p + 2],
+            positions[p + 1]["R1_id"].as_u64().unwrap(),
+        );
+    }
+
+    let mut results = std::collections::BTreeMap::new();
+    for (name, steps, rollback) in &cells {
+        let s = eval_draft_localization_cell(&mut runtime, &env, steps, *rollback)?;
+        println!(
+            "DRAFT_32POS cell={name} agree_t_p2={}/{count} agree_g_p2={}/{count} agree_t_p1={}/{count} agree_g_p1={}/{count} agree_g_p2_on_g1_eq_t1={}/{} min_margin={:.4} mean_margin={:.4} first8_preds={:?}",
+            s.agree_t_p2,
+            s.agree_g_p2,
+            s.agree_t_p1,
+            s.agree_g_p1,
+            s.agree_g_p2_when_g1_eq_t1,
+            s.g1_eq_t1_total,
+            s.min_margin,
+            s.mean_margin,
+            s.sample_preds,
+        );
+        results.insert(*name, s);
+    }
+
+    let def_res = &results["def_shifted_post_norm"];
+    let eng_res = &results["engine_round_trace_tok"];
+    let unshifted_res = &results["unshifted_tok_post_norm"];
+    let legacy_res = &results["legacy_pre_fix_round_trace_tok"];
+    ensure!(
+        eng_res.agree_g_p2 == def_res.agree_g_p2 && eng_res.agree_t_p2 == def_res.agree_t_p2,
+        "DEFECT engine_round_trace_tok ({}/32) failed to match def_shifted_post_norm ({}/32)",
+        eng_res.agree_g_p2,
+        def_res.agree_g_p2
+    );
+    ensure!(
+        unshifted_res.agree_g_p2 == 0,
+        "Runner FAIL unshifted control unexpectedly matched g_p2 ({}/32)",
+        unshifted_res.agree_g_p2
+    );
+    ensure!(
+        legacy_res.agree_g_p2 < eng_res.agree_g_p2,
+        "Runner FAIL legacy pre-fix control failed to separate from fixed engine round"
+    );
+
     Ok(())
 }

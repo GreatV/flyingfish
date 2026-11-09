@@ -343,6 +343,18 @@ impl RouteOps {
         })
     }
 
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        let lt = if self.logits_gemm.is_some() {
+            ROUTE_LOGITS_WORKSPACE_BYTES
+        } else {
+            0
+        };
+        #[cfg(not(feature = "cuda"))]
+        let lt = 0;
+        self.completed.len() * std::mem::size_of::<u32>() + lt
+    }
+
     /// Affine-prescaled block router: weightless RMS x per-dimension scale
     /// x hidden^-0.5, BF16 logits GEMM, FP32 softmax top-k renormalised and
     /// scaled per expert. `prescaled` and `logits` are caller scratch.

@@ -519,7 +519,7 @@ fn take_glm_hc_weights(
 }
 
 pub(super) struct GlmDsaOutputs {
-    packed: CudaSlice<bf16>,
+    pub(super) packed: CudaSlice<bf16>,
     pub(super) selected: CudaSlice<i32>,
     pub(super) scores: CudaSlice<f32>,
     pub(super) margins: CudaSlice<f32>,
@@ -527,7 +527,7 @@ pub(super) struct GlmDsaOutputs {
 }
 
 impl GlmDsaOutputs {
-    fn new(rows: usize, s: &Arc<CudaStream>) -> Result<Self> {
+    pub(super) fn new(rows: usize, s: &Arc<CudaStream>) -> Result<Self> {
         Ok(Self {
             packed: s.alloc_zeros(rows * 257)?,
             selected: s.alloc_zeros(rows * 512)?,
@@ -2493,6 +2493,24 @@ impl Runtime {
         );
         Ok(())
     }
+
+    #[cfg(all(feature = "cuda", test))]
+    pub(crate) fn count_expert_unions_for_rows2(&self, stream: &Arc<CudaStream>) -> Result<usize> {
+        let mut count = 0;
+        for layer in &self.layers {
+            if let Some(native) = &layer.native {
+                let plan = native.plans.get(1).context("2-row native plan missing")?;
+                let (ids, _) = plan.read_route(stream)?;
+                let mut layer_set = std::collections::BTreeSet::<i32>::new();
+                if ids.len() >= 16 {
+                    layer_set.extend(&ids[..8]);
+                    layer_set.extend(&ids[8..16]);
+                }
+                count += layer_set.len();
+            }
+        }
+        Ok(count)
+    }
 }
 impl Engine {
     #[cfg(feature = "cuda")]
@@ -3352,8 +3370,9 @@ impl Engine {
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
             "HIP hybrid setup requires MiniCPM-V-4.7, Qwen3.8, Flint, Gemma 4 or GLM-5.3 with BF16 KV and no persistent prefix cache"
         );
+        let glm = model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
         ensure!(
-            model_spec.moe.is_none() || !reserve_mtp,
+            model_spec.moe.is_none() || !reserve_mtp || glm,
             "MoE MTP attachment is not bound: architecture={:?}",
             model_spec.architecture
         );
@@ -3363,7 +3382,6 @@ impl Engine {
         );
         let started = Instant::now();
         let flint = model_spec.architecture == crate::model_spec::Architecture::Flint;
-        let glm = model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
         let gemma = matches!(
             model_spec.architecture,
             crate::model_spec::Architecture::Gemma4
@@ -3657,7 +3675,22 @@ impl Engine {
         };
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
-        let mtp_budget = reserve_mtp
+        let route_handle_bytes = if glm {
+            crate::backend::cuda::moe::route::blas_handle_bytes(&device.ctx, s)?
+        } else {
+            0
+        };
+        #[cfg(feature = "cuda")]
+        let glm_mtp_bytes = if reserve_mtp && glm {
+            crate::mtp::glm_attachment_bytes(&model_spec, capacity, verify_rows)?
+                .checked_add(route_handle_bytes)
+                .context("GLM MTP handle reservation overflow")?
+        } else {
+            0
+        };
+        #[cfg(feature = "rocm")]
+        let glm_mtp_bytes = 0usize;
+        let mtp_budget = (reserve_mtp && !glm)
             .then(|| crate::mtp::AttachmentBudget::new(&model_spec, capacity))
             .transpose()?;
         let request = crate::prefill::WorkspaceRequest {
@@ -3673,6 +3706,7 @@ impl Engine {
                 .context("combined row bytes overflow")?,
             fixed_transient_bytes: Runtime::fixed_bytes(&model_spec, capacity)?
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
+                .and_then(|bytes| bytes.checked_add(glm_mtp_bytes))
                 .and_then(|bytes| bytes.checked_add(target_transaction_bytes))
                 .and_then(|bytes| bytes.checked_add(target_head_bytes))
                 .and_then(|bytes| bytes.checked_add(media_bytes))
@@ -3700,8 +3734,6 @@ impl Engine {
             None
         };
         let native_budget = if glm {
-            let route_handle_bytes =
-                crate::backend::cuda::moe::route::blas_handle_bytes(&device.ctx, s)?;
             let layers = crate::experts::catalogue::ExpertGeometry::from_model(&model_spec)?.layers;
             let native_request = crate::prefill::WorkspaceRequest {
                 capacity: capacity.min(crate::linear_plan::MAX_SKINNY_ROWS),
@@ -3955,7 +3987,7 @@ impl Engine {
             "{}",
             serde_json::json!({
                 "q38_memory_plan": budget,
-                "mtp_attachment_planned_bytes": if reserve_mtp { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { 0 },
+                "mtp_attachment_planned_bytes": if reserve_mtp && !glm { crate::mtp::attachment_bytes(&model_spec, capacity, rows, true)? } else { glm_mtp_bytes },
                 "resident_weights_bytes": weights.bytes,
                 "prefix_cache": {
                     "enabled": prefix_cache,
@@ -4184,6 +4216,7 @@ impl Engine {
                 manifest,
                 dir,
                 rows as u32,
+                glm_mtp_bytes,
             )?;
             engine.moe_slots = Some(slots);
             engine.chunk = engine.chunk.min(admitted_rows as usize);

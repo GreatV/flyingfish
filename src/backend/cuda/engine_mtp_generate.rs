@@ -78,7 +78,9 @@ impl Engine {
         )?;
         ensure!(prompt.is_none_or(|p| p > 0), "empty MTP prompt");
         engine.mtp_enable_resident(mtp)?;
-        engine.mtp_batch_enable()?;
+        if engine.model_spec.architecture != crate::model_spec::Architecture::Glm5Next {
+            engine.mtp_batch_enable()?;
+        }
         if graph {
             engine.capture()?;
         }
@@ -130,22 +132,36 @@ impl Engine {
                     .contains(generated.last().context("MTP output missing")?)
             {
                 let remaining = count - generated.len();
-                let round = match policy {
-                    #[cfg(test)]
-                    VerifyPolicy::Decode => self.mtp_round(
-                        remaining,
-                        #[cfg(test)]
-                        None,
-                    )?,
-                    VerifyPolicy::Batched => {
-                        self.mtp_batch_round(
-                            remaining,
+                let round =
+                    if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                        if remaining == 1 {
+                            let token = self.decode(false, None)?;
+                            crate::mtp::transaction::Round {
+                                tokens: vec![token],
+                                consumed: 1,
+                                ..Default::default()
+                            }
+                        } else {
+                            self.glm_mtp_round(false)?.round
+                        }
+                    } else {
+                        match policy {
                             #[cfg(test)]
-                            None,
-                        )?
-                        .round
-                    }
-                };
+                            VerifyPolicy::Decode => self.mtp_round(
+                                remaining,
+                                #[cfg(test)]
+                                None,
+                            )?,
+                            VerifyPolicy::Batched => {
+                                self.mtp_batch_round(
+                                    remaining,
+                                    #[cfg(test)]
+                                    None,
+                                )?
+                                .round
+                            }
+                        }
+                    };
                 ensure!(
                     !round.tokens.is_empty() && round.tokens.len() <= remaining,
                     "MTP publication exceeds request budget"

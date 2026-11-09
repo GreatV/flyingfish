@@ -343,25 +343,13 @@ fn generate_once(
     };
     let mut mtp_rounds = 0usize;
     let result = if mtp {
-        let mut first = true;
-        model
-            .generate_mtp_reuse(&request.ids, &run_options, true, &mut |ids, accepted| {
-                if first {
-                    first = false;
-                } else {
-                    mtp_rounds += 1;
-                }
-                on_event(EngineEvent::Tokens {
-                    ids: ids.to_vec(),
-                    accepted,
-                })
-            })
-            .map(|output| spec::Output {
-                ids: output.ids,
-                rounds: Vec::new(),
-                prefill_ms: output.prefill_ms,
-                decode_ms: output.decode_ms,
-            })
+        produce_mtp_events(
+            model,
+            &request.ids,
+            &run_options,
+            &mut on_event,
+            &mut mtp_rounds,
+        )
     } else if run_options.backend.draft_model.is_some() {
         spec::produce_events(
             model,
@@ -520,6 +508,35 @@ fn produce_plain_events(
         decode_ms: output.decode_ms,
         prefill_ms: output.prefill_ms,
     })
+}
+
+fn produce_mtp_events(
+    model: &mut Model,
+    ids: &[u32],
+    options: &SpecOptions,
+    on_event: &mut dyn FnMut(EngineEvent) -> bool,
+    mtp_rounds: &mut usize,
+) -> Result<spec::Output> {
+    let mut first = true;
+    let graph = model.mtp_graph_mode();
+    model
+        .generate_mtp_reuse(ids, options, graph, &mut |token_ids, accepted| {
+            if first {
+                first = false;
+            } else {
+                *mtp_rounds += 1;
+            }
+            on_event(EngineEvent::Tokens {
+                ids: token_ids.to_vec(),
+                accepted,
+            })
+        })
+        .map(|output| spec::Output {
+            ids: output.ids,
+            rounds: Vec::new(),
+            prefill_ms: output.prefill_ms,
+            decode_ms: output.decode_ms,
+        })
 }
 
 #[cfg(test)]
@@ -686,6 +703,89 @@ mod tests {
         println!(
             "PASS glm_plain_serving requests=2 tokens=4 graph_decode={} ids_match_eager=true",
             model.graph_decode()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "loads official GLM-5.3-Flash MTP; set FF_GLM_MODEL and FLYINGFISH_RUNTIME_DIR"]
+    fn glm_mtp_serving_decodes_and_matches_mtp_engine() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model_dir =
+            PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL missing")?);
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let settings = crate::backend::Settings {
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            device_budget_gib: None,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: Some(runtime),
+        };
+        let options = SpecOptions {
+            device: 0,
+            capacity: 64,
+            chunk: None,
+            backend: settings.clone(),
+            count: 4,
+            ignore_eos: true,
+        };
+        let mut model = Model::load_mtp(&model_dir, &options, 1, false)?;
+        let prompt = [785, 10567, 1087];
+        // 2026-11-07: G-MTP5 gates serving MTP ids against engine MTP path ids; 1-row eager ids are informational.
+        let mut eager_greedy_ids = Vec::with_capacity(4);
+        model.reset()?;
+        let first = model.prefill(&prompt, None)?;
+        eager_greedy_ids.push(first);
+        for _ in 0..3 {
+            let next = model.decode(false, None)?;
+            eager_greedy_ids.push(next);
+        }
+        ensure!(
+            eager_greedy_ids.len() == 4,
+            "expected 4 eager greedy tokens"
+        );
+        model.reset_mtp()?;
+        let engine_mtp = model.generate_mtp_reuse(&prompt, &options, false, &mut |_, _| true)?;
+        ensure!(
+            engine_mtp.ids.len() == 4,
+            "expected 4 engine MTP tokens, got {:?}",
+            engine_mtp.ids
+        );
+        for request in 0..2 {
+            let mut mtp_rounds = 0;
+            let mut streamed_ids = Vec::with_capacity(4);
+            let output = produce_mtp_events(
+                &mut model,
+                &prompt,
+                &options,
+                &mut |event| {
+                    if let EngineEvent::Tokens { ids, .. } = event {
+                        streamed_ids.extend_from_slice(&ids);
+                    }
+                    true
+                },
+                &mut mtp_rounds,
+            )?;
+            ensure!(
+                output.ids == engine_mtp.ids && streamed_ids == engine_mtp.ids,
+                "request {request} serving MTP ids {:?} (streamed {:?}) differ from engine MTP ids {:?}",
+                output.ids,
+                streamed_ids,
+                engine_mtp.ids
+            );
+        }
+        println!(
+            "PASS glm_mtp_serving requests=2 tokens=4 ids_match_mtp_engine=true ids={:?} eager_greedy_ids={:?}",
+            engine_mtp.ids, eager_greedy_ids
         );
         Ok(())
     }

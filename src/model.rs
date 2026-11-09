@@ -278,6 +278,9 @@ impl Model {
     pub fn graph_decode(&self) -> bool {
         self.backend.graph_decode()
     }
+    pub fn mtp_graph_mode(&self) -> bool {
+        self.backend.mtp_graph_mode()
+    }
     pub fn capture(&mut self) -> Result<()> {
         self.backend.capture()
     }

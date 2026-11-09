@@ -710,6 +710,7 @@ impl Slots {
         manifest: &crate::checkpoint::TensorManifest,
         directory: &Path,
         rows: u32,
+        reserve_extra: usize,
     ) -> Result<(Self, u32)> {
         let geometry = ExpertGeometry::from_model(model)?;
         let catalogue = Arc::new(ExpertCatalogue::from_manifest(
@@ -726,6 +727,7 @@ impl Slots {
         let reserve = total.div_ceil(12);
         let device_bytes = free
             .checked_sub(reserve)
+            .and_then(|bytes| bytes.checked_sub(reserve_extra))
             .context("native staging device reserve exceeds free memory")?;
         #[cfg(feature = "rocm")]
         let rows = crate::experts::plan::staging_rows(

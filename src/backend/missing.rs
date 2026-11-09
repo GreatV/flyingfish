@@ -178,6 +178,9 @@ impl Backend {
     pub fn graph_decode(&self) -> bool {
         match *self {}
     }
+    pub fn mtp_graph_mode(&self) -> bool {
+        match *self {}
+    }
     pub fn capture(&mut self) -> Result<()> {
         match *self {}
     }

@@ -1400,6 +1400,116 @@ impl Blas {
         Ok(())
     }
 
+    pub(crate) fn linear_bf16(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        weight.validate()?;
+        x.validate()?;
+        y.0.validate()?;
+        let rows = x.shape[0] as usize;
+        let input = x.shape[1] as usize;
+        let output = weight.shape[0] as usize;
+        checked_dims(rows, output, input)?;
+        let (x_pitch, y_pitch) = (x.stride[0], y.0.stride[0]);
+        ensure!(
+            weight.shape == [output as u32, input as u32]
+                && weight.stride == [input as u64, 1]
+                && x.stride[1] == 1
+                && x_pitch >= input as u64
+                && y.0.shape == [rows as u32, output as u32]
+                && y.0.stride[1] == 1
+                && y_pitch >= output as u64
+                && x_pitch <= i32::MAX as u64
+                && y_pitch <= i32::MAX as u64,
+            "linear_bf16 requires dense weights and unit-stride rows"
+        );
+        let alpha = 1f32;
+        let beta = 0f32;
+        unsafe {
+            bs::cublasGemmEx(
+                *self.decode.handle(),
+                bs::cublasOperation_t::CUBLAS_OP_T,
+                bs::cublasOperation_t::CUBLAS_OP_N,
+                output as i32,
+                rows as i32,
+                input as i32,
+                (&alpha as *const f32).cast(),
+                weight.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                input as i32,
+                x.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                x_pitch as i32,
+                (&beta as *const f32).cast(),
+                y.0.ptr as *mut core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                y_pitch as i32,
+                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn linear_bf16_to_f32(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<f32, 2>,
+    ) -> Result<()> {
+        weight.validate()?;
+        x.validate()?;
+        y.0.validate()?;
+        let rows = x.shape[0] as usize;
+        let input = x.shape[1] as usize;
+        let output = weight.shape[0] as usize;
+        checked_dims(rows, output, input)?;
+        let (x_pitch, y_pitch) = (x.stride[0], y.0.stride[0]);
+        ensure!(
+            weight.shape == [output as u32, input as u32]
+                && weight.stride == [input as u64, 1]
+                && x.stride[1] == 1
+                && x_pitch >= input as u64
+                && y.0.shape == [rows as u32, output as u32]
+                && y.0.stride[1] == 1
+                && y_pitch >= output as u64
+                && x_pitch <= i32::MAX as u64
+                && y_pitch <= i32::MAX as u64,
+            "linear_bf16_to_f32 requires dense weights and unit-stride rows"
+        );
+        let alpha = 1f32;
+        let beta = 0f32;
+        unsafe {
+            bs::cublasGemmEx(
+                *self.decode.handle(),
+                bs::cublasOperation_t::CUBLAS_OP_T,
+                bs::cublasOperation_t::CUBLAS_OP_N,
+                output as i32,
+                rows as i32,
+                input as i32,
+                (&alpha as *const f32).cast(),
+                weight.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                input as i32,
+                x.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                x_pitch as i32,
+                (&beta as *const f32).cast(),
+                y.0.ptr as *mut core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                y_pitch as i32,
+                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn linear_typed(
         &self,
         phase: crate::op_contract::ExecutionPhase,

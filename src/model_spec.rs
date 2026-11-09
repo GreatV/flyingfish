@@ -23,7 +23,7 @@ pub enum Architecture {
 impl Architecture {
     /// Architectures with a bound MTP decode path.
     pub fn mtp_decode(self) -> bool {
-        self == Self::Qwen35Text
+        self == Self::Qwen35Text || self == Self::Glm5Next
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

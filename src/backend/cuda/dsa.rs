@@ -65,6 +65,9 @@ impl DsaState {
             capacity,
         })
     }
+    pub(super) fn spec(&self) -> DsaSpec {
+        self.spec
+    }
     pub fn bytes(&self) -> usize {
         (self.latent.len() + self.packed.len() + self.pool_keys.len()) * 2
             + (self.token_ids.len() + self.pool_ids.len() + self.meta.len()) * 4
@@ -99,6 +102,14 @@ impl DsaState {
     pub fn reset(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
         stream.memcpy_htod(&[0, 0, 0, self.capacity as i32, 0, 0, 0, 0], &mut self.meta)?;
         Ok(())
+    }
+    pub fn clear(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        stream.memset_zeros(&mut self.latent)?;
+        stream.memset_zeros(&mut self.packed)?;
+        stream.memset_zeros(&mut self.pool_keys)?;
+        stream.memset_zeros(&mut self.token_ids)?;
+        stream.memset_zeros(&mut self.pool_ids)?;
+        self.reset(stream)
     }
 }
 

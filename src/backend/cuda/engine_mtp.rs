@@ -48,7 +48,7 @@ enum Control {
     StandardNorm,
 }
 
-struct MtpRuntime {
+pub(crate) struct MtpRuntime {
     plan: MtpPlan,
     work: Work,
     embedding: CudaSlice<bf16>,
@@ -981,6 +981,12 @@ impl Dump {
 #[path = "engine_mtp_tests.rs"]
 mod tests;
 
+#[path = "engine_mtp_glm.rs"]
+mod glm;
+pub(super) use glm::{GlmMtpRuntime, GlmMtpShared};
+
 #[path = "engine_mtp_chain.rs"]
 mod chain;
 pub(super) use chain::Chain;
+#[cfg(test)]
+pub(super) use chain::{glm_mtp_draft_step_config, top1_and_margin};
