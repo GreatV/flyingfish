@@ -1179,6 +1179,15 @@ impl JointRun<'_> {
         let seq = plan.seq;
         let w = &self.w.decoder[layer];
         ensure!(plan.fields.len() == nq * WIDTH, "decoder extent");
+        // Pre-norm branches: x = x + branch(norm(x)).
+        self.layer_norm(
+            &plan.fields,
+            &mut plan.small,
+            nq,
+            WIDTH,
+            &w.norm1_w,
+            &w.norm1_b,
+        )?;
         {
             let weights = self.decoder_attn(w, false);
             let lane = AttnLane {
@@ -1195,9 +1204,9 @@ impl JointRun<'_> {
                 &weights,
                 lane,
                 AttnSides {
-                    queries: &plan.fields,
+                    queries: &plan.small,
                     rows: nq,
-                    keys_values: &plan.fields,
+                    keys_values: &plan.small,
                     keys: nq,
                 },
                 &mut plan.flash_self,
@@ -1206,14 +1215,14 @@ impl JointRun<'_> {
         let attn = self.read_rows(&plan.proj_out, nq * WIDTH)?;
         let input = self.read(&plan.fields)?;
         let t = add_round(&input, &attn)?;
-        self.upload(&t, &mut plan.small)?;
+        self.upload(&t, &mut plan.fields)?;
         self.layer_norm(
-            &plan.small,
-            &mut plan.fields,
+            &plan.fields,
+            &mut plan.small,
             nq,
             WIDTH,
-            &w.norm1_w,
-            &w.norm1_b,
+            &w.norm2_w,
+            &w.norm2_b,
         )?;
         {
             let weights = self.decoder_attn(w, true);
@@ -1231,7 +1240,7 @@ impl JointRun<'_> {
                 &weights,
                 lane,
                 AttnSides {
-                    queries: &plan.fields,
+                    queries: &plan.small,
                     rows: nq,
                     keys_values: &plan.memory,
                     keys: seq,
@@ -1242,19 +1251,19 @@ impl JointRun<'_> {
         let attn = self.read_rows(&plan.proj_out, nq * WIDTH)?;
         let input = self.read(&plan.fields)?;
         let t = add_round(&input, &attn)?;
-        self.upload(&t, &mut plan.small)?;
+        self.upload(&t, &mut plan.fields)?;
         self.layer_norm(
-            &plan.small,
-            &mut plan.fields,
+            &plan.fields,
+            &mut plan.small,
             nq,
             WIDTH,
-            &w.norm2_w,
-            &w.norm2_b,
+            &w.norm3_w,
+            &w.norm3_b,
         )?;
         self.blas.gemm_bf16(
             &w.linear1_w,
             0..FF,
-            &plan.fields,
+            &plan.small,
             &mut plan.ff_hidden,
             nq,
             WIDTH,
@@ -1273,15 +1282,7 @@ impl JointRun<'_> {
         let ff = self.read_rows(&plan.small2, nq * WIDTH)?;
         let input = self.read(&plan.fields)?;
         let t = add_round(&input, &ff)?;
-        self.upload(&t, &mut plan.small)?;
-        self.layer_norm(
-            &plan.small,
-            &mut plan.fields,
-            nq,
-            WIDTH,
-            &w.norm3_w,
-            &w.norm3_b,
-        )?;
+        self.upload(&t, &mut plan.fields)?;
         Ok(())
     }
 
