@@ -3396,9 +3396,8 @@ impl Hi3DGeneration<'_> {
             self.runtime,
             Rc::new(Closure::new(false, "image refinement".into())),
         )?;
-        let mut conditioner = super::engine_vision::Hi3DImageConditioner::load(
-            device, &mut blas, self.dino, self.clip,
-        )?;
+        let mut conditioner =
+            crate::backend::Hi3DImageConditioner::load(device, &mut blas, self.dino, self.clip)?;
         conditioner.encode_rgba(&blas, self.rgba, self.dimensions, self.orientation)?;
         ensure!(
             conditioner.encoder_calls() == [1, 1],
