@@ -1060,7 +1060,7 @@ pub(crate) fn block_forward(
 ) -> Result<()> {
     let (s, blas, kernels, spec, lora_scale) = (c.s, c.blas, c.kernels, c.spec, c.lora_scale);
     let rows = work.rows;
-    let (h, width, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, w.rank);
+    let (h, width, r) = (spec.hidden, spec.heads * spec.head_dim, w.rank);
     let (rotary_width, rotary_table, modulation) = match conditioning {
         Conditioning::Modulated { rotary, modulation } => {
             ensure!(
@@ -1291,6 +1291,30 @@ pub(crate) fn block_forward(
     if modulation.is_some() {
         modulate(normed, 3, 4)?;
     }
+    ffn_forward::<false>(c, w, work)?;
+    if modulation.is_some() {
+        gated_add(xp, normed, 5)?;
+    } else {
+        residual(xp, normed)?;
+    }
+    Ok(())
+}
+
+/// FFN rows overwrite their input after the gated projection; scratch is reused between chunks.
+fn ffn_forward<const SHIFT_INPUT: bool>(
+    c: &BlockContext<'_>,
+    w: &BlockWeights,
+    work: &mut BlockWork,
+) -> Result<()> {
+    let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
+    let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
+        c.blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
+            x,
+            &mut TensorMut(y),
+        )
+    };
     let chunk = work.chunk;
     for start in (0..rows).step_by(chunk) {
         let n = chunk.min(rows - start);
@@ -1314,11 +1338,11 @@ pub(crate) fn block_forward(
             work.hidden.prefix_rows(u32::try_from(n)?)?,
             work.fixed_lora,
         )?;
-        let hidden = work.hidden.ptr;
+        let hidden = work.hidden.ptr + if SHIFT_INPUT { 256 } else { 0 };
         let gated = work.gated.ptr;
         let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
         unsafe {
-            s.launch_builder(&kernels.swiglu)
+            s.launch_builder(&c.kernels.swiglu)
                 .arg(&hidden)
                 .arg(&gated)
                 .arg(&i32::try_from(n)?)
@@ -1339,11 +1363,6 @@ pub(crate) fn block_forward(
             rows_view(&work.normed, s, start * h, n, h, h)?,
             work.fixed_lora,
         )?;
-    }
-    if modulation.is_some() {
-        gated_add(xp, normed, 5)?;
-    } else {
-        residual(xp, normed)?;
     }
     Ok(())
 }
@@ -3769,6 +3788,287 @@ mod tests {
             defects == 0,
             "DEFECT base FFN row invariance cells={defects}"
         );
+        Ok(())
+    }
+
+    /// Owned and borrowed FFN storage use identical plans, including poisoned scratch and subsequent blocks.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE, FF_H3_REPLAY, FF_H3_THRESHOLDS"]
+    fn ffn_alias_matches_owned_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let capture = path("FF_H3_CAPTURE")?;
+        let replay = path("FF_H3_REPLAY")?;
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(path("FF_H3_THRESHOLDS")?)?)?;
+        ensure!(frozen["bit_difference_limit"] == 0, "alias gate bound");
+        let spec = H3Spec::read(&model)?;
+        let transformer = model.join("transformer");
+        let manifest = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let lora_path = path("FF_H3_LORA")?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?;
+        let stem = lora_path
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .context("LoRA stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let bytes = fs::read(capture.join("lora_a_up_input.bf16"))?;
+        ensure!(
+            bytes.len() == 1511 * spec.hidden * 2,
+            "common input [1511,hidden] BF16"
+        );
+        let common: Vec<bf16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        ensure!(
+            common.iter().all(|v| v.is_finite()),
+            "RUNNER_FAIL nonfinite common input"
+        );
+        let adaln_map = mapped(&replay.join("A-bf16/adaln.safetensors"))?;
+        let adaln = SafeTensors::deserialize(&adaln_map)?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let weights: Vec<BlockWeights> = (0..2)
+            .map(|layer| {
+                BlockWeights::resident(
+                    s,
+                    &spec,
+                    adapter.rank,
+                    &format!("transformer_blocks.{layer}"),
+                    &mut Source::new(&transformer, &manifest),
+                    &mut Source::new(lora_dir, &lora_manifest),
+                )
+            })
+            .collect::<Result<_>>()?;
+        let mut cells = 0;
+        let mut defects = 0;
+        let mut control_bits = 0;
+        for case in ["A", "P"] {
+            let layout = capture_layout(&spec, &replay.join(format!("{case}-bf16")))?;
+            let rows = layout.rows();
+            let chunk = frozen["runs"][format!("{case}-derived")]["plan"]["main"]["chunk"]
+                .as_u64()
+                .context("frozen main chunk")? as usize;
+            let input: Vec<bf16> = (0..rows * spec.hidden)
+                .map(|i| common[((i / spec.hidden + 17) % 1511) * spec.hidden + i % spec.hidden])
+                .collect();
+            let runtime =
+                std::env::temp_dir().join(format!("ff-h3-alias-{}-{case}", std::process::id()));
+            fs::create_dir(&runtime)?;
+            let blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(true, "H3 alias identity".into())),
+            )?;
+            let mut owned = BlockWork::new(s, &spec, adapter.rank, rows)?;
+            let mut borrowed = BlockWork::new(s, &spec, adapter.rank, rows)?;
+            owned.prepare(&blas, &spec)?;
+            borrowed.prepare(&blas, &spec)?;
+            for (output, input) in [
+                (adapter.rank, spec.hidden),
+                (adapter.rank, spec.ffn),
+                (2 * spec.ffn, adapter.rank),
+                (spec.hidden, adapter.rank),
+            ] {
+                blas.bind_row_family(crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output,
+                    input,
+                })?;
+            }
+            let plan = owned.ffn_cost(&blas, &spec, chunk, false)?;
+            blas.bind_workspace(plan.workspace)?;
+            let mut x = s.clone_htod(&input)?;
+            owned.bind_ffn(s, &blas, &spec, plan, &x)?;
+            borrowed.bind_ffn(
+                s,
+                &blas,
+                &spec,
+                FfnPlan {
+                    borrowed: true,
+                    allocation: 0,
+                    ..plan
+                },
+                &x,
+            )?;
+            ensure!(
+                borrowed.hidden.ptr == pointer(&borrowed.q_raw, s)
+                    && borrowed.gated.ptr == pointer(&borrowed.k_raw, s)
+                    && borrowed.hidden.span_bytes + 256 <= (borrowed.q_raw.len() * 2) as u64,
+                "borrowed address/control capacity"
+            );
+            let receipt = blas.bound_plan_receipt()?;
+            let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(&spec, &layout))?;
+            let tables: Vec<_> = (0..2)
+                .map(|layer| -> Result<_> {
+                    let view = adaln.tensor(&format!("block{layer}.step0"))?;
+                    ensure!(
+                        view.dtype() == Dtype::BF16 && view.shape()[1] == 6 * spec.hidden,
+                        "modulation layout"
+                    );
+                    let values: Vec<bf16> = view
+                        .data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| bf16::from_le_bytes(*b))
+                        .collect();
+                    Ok((s.clone_htod(&values)?, u32::try_from(view.shape()[0])?))
+                })
+                .collect::<Result<_>>()?;
+            ensure!(
+                tables[0].1 == tables[1].1 && tables[0].1 > 0,
+                "modulation entries"
+            );
+            let index = s.clone_htod(
+                &(0..rows)
+                    .map(|r| (r % tables[0].1 as usize) as u32)
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+                .with_full_single_probability()?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: adapter.scale,
+            };
+            let mut run = |work: &mut BlockWork,
+                           graph: bool,
+                           full: bool,
+                           shifted: bool|
+             -> Result<Vec<bf16>> {
+                s.memcpy_htod(&input, &mut x)?;
+                s.memcpy_htod(&input, &mut work.normed)?;
+                let poison = if work.ffn_owned.is_some() { 0x3f } else { 0xbf };
+                unsafe {
+                    crate::backend::cuda::copy::memset_bytes(
+                        work.hidden.ptr,
+                        poison,
+                        usize::try_from(work.hidden.span_bytes)?,
+                        s,
+                    )?;
+                    crate::backend::cuda::copy::memset_bytes(
+                        work.gated.ptr,
+                        poison,
+                        usize::try_from(work.gated.span_bytes)?,
+                        s,
+                    )?;
+                }
+                s.synchronize()?;
+                let mut launch = || -> Result<()> {
+                    if full {
+                        for (layer, weight) in weights.iter().enumerate() {
+                            let modulation = Modulation {
+                                table: &tables[layer].0,
+                                offset: 0,
+                                entries: tables[layer].1,
+                                index: &index,
+                            };
+                            block_forward(
+                                &context,
+                                &mut flash,
+                                weight,
+                                &Conditioning::Modulated {
+                                    rotary: &rotary,
+                                    modulation: &modulation,
+                                },
+                                &mut x,
+                                work,
+                            )?;
+                        }
+                    } else if shifted {
+                        ffn_forward::<true>(&context, &weights[0], work)?;
+                    } else {
+                        ffn_forward::<false>(&context, &weights[0], work)?;
+                    }
+                    Ok(())
+                };
+                if graph {
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let result = launch();
+                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    let captured = captured?.context("alias gate captured no graph")?;
+                    captured.launch()?;
+                    captured.launch()?;
+                } else {
+                    launch()?;
+                    launch()?;
+                }
+                let output = s.clone_dtoh(if full { &x } else { &work.normed })?;
+                ensure!(
+                    output.iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL nonfinite alias output"
+                );
+                Ok(output)
+            };
+            for full in [false, true] {
+                let reference = run(&mut owned, false, full, false)?;
+                for (borrow, graph) in [(false, true), (true, false), (true, true)] {
+                    let actual = run(
+                        if borrow { &mut borrowed } else { &mut owned },
+                        graph,
+                        full,
+                        false,
+                    )?;
+                    let bits = reference
+                        .iter()
+                        .zip(&actual)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    cells += 1;
+                    defects += usize::from(bits > 0);
+                    println!(
+                        "H3_ALIAS_CELL case={case} rows={rows} chunk={chunk} tail={} borrowed={borrow} graph={graph} next_block={full} replays=2 bit_differences={bits} limit=0",
+                        rows % chunk
+                    );
+                }
+                if !full && case == "A" {
+                    let control = run(&mut borrowed, false, false, true)?;
+                    control_bits = reference
+                        .iter()
+                        .zip(&control)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    println!(
+                        "H3_ALIAS_CONTROL consumer_offset_bytes=256 bit_differences={control_bits}"
+                    );
+                }
+            }
+            ensure!(
+                receipt == blas.bound_plan_receipt()?,
+                "alias test changed bound algorithms"
+            );
+            s.synchronize()?;
+            drop(blas);
+            fs::remove_dir_all(runtime)?;
+        }
+        println!(
+            "H3_ALIAS_GATE cells={cells} defects={defects} bit_difference_limit=0 control_bit_differences={control_bits}"
+        );
+        ensure!(
+            control_bits > 0,
+            "RUNNER_FAIL alias-address control undetected"
+        );
+        ensure!(defects == 0, "DEFECT FFN storage alias cells={defects}");
         Ok(())
     }
 
