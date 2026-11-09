@@ -46,7 +46,10 @@ mod yaml {
             }
             index += 1;
         }
-        ensure!(quote.is_none(), "yaml line {number} has an unterminated quote");
+        ensure!(
+            quote.is_none(),
+            "yaml line {number} has an unterminated quote"
+        );
         Ok(line.to_owned())
     }
 
@@ -62,12 +65,19 @@ mod yaml {
             "yaml line {number} uses an unsupported construct: {text}"
         );
         if let Some(stripped) = text.strip_prefix('\'') {
-            let inner = stripped.strip_suffix('\'').with_context(|| format!("yaml line {number} scalar"))?;
+            let inner = stripped
+                .strip_suffix('\'')
+                .with_context(|| format!("yaml line {number} scalar"))?;
             return Ok(inner.replace("''", "'"));
         }
         if let Some(stripped) = text.strip_prefix('"') {
-            let inner = stripped.strip_suffix('"').with_context(|| format!("yaml line {number} scalar"))?;
-            ensure!(!inner.contains('\\'), "yaml line {number} uses string escapes");
+            let inner = stripped
+                .strip_suffix('"')
+                .with_context(|| format!("yaml line {number} scalar"))?;
+            ensure!(
+                !inner.contains('\\'),
+                "yaml line {number} uses string escapes"
+            );
             return Ok(inner.to_owned());
         }
         ensure!(
@@ -79,7 +89,9 @@ mod yaml {
 
     fn split_key(line: &Line) -> Result<(String, &str)> {
         let text = line.text.trim_start();
-        let index = text.find(": ").or_else(|| text.strip_suffix(':').map(|_| text.len() - 1));
+        let index = text
+            .find(": ")
+            .or_else(|| text.strip_suffix(':').map(|_| text.len() - 1));
         let index = index.with_context(|| format!("yaml line {} is not a mapping", line.number))?;
         let key = scalar(&text[..index], line.number)?;
         let value = text[index + 1..].trim();
@@ -93,7 +105,10 @@ mod yaml {
 
     impl Cursor {
         fn block(&mut self, indent: usize) -> Result<Value> {
-            let line = self.lines.get(self.position).context("yaml block ends early")?;
+            let line = self
+                .lines
+                .get(self.position)
+                .context("yaml block ends early")?;
             if line.text.trim_start().starts_with('-') {
                 return self.sequence(indent);
             }
@@ -111,7 +126,11 @@ mod yaml {
                     if line.indent == indent && !line.text.trim_start().starts_with('-') {
                         break;
                     }
-                    ensure!(line.indent == indent, "yaml line {} sequence indent", line.number);
+                    ensure!(
+                        line.indent == indent,
+                        "yaml line {} sequence indent",
+                        line.number
+                    );
                     (line.number, line.indent, line.text.trim_start().to_owned())
                 };
                 let rest = text
@@ -126,7 +145,10 @@ mod yaml {
                         .get(self.position)
                         .context("yaml sequence item empty")?
                         .indent;
-                    ensure!(child_indent > indent, "yaml line {number} sequence item empty");
+                    ensure!(
+                        child_indent > indent,
+                        "yaml line {number} sequence item empty"
+                    );
                     items.push(self.block(child_indent)?);
                 } else if rest.trim().contains(": ") || rest.trim().ends_with(':') {
                     let item = Line {
@@ -147,14 +169,18 @@ mod yaml {
         fn mapping(&mut self, indent: usize) -> Result<Value> {
             let mut map = BTreeMap::new();
             while self.position < self.lines.len() {
-                let (number, line_indent, key, value) = {
+                let (number, key, value) = {
                     let line = &self.lines[self.position];
                     if line.indent < indent {
                         break;
                     }
-                    ensure!(line.indent == indent, "yaml line {} mapping indent", line.number);
+                    ensure!(
+                        line.indent == indent,
+                        "yaml line {} mapping indent",
+                        line.number
+                    );
                     let (key, value) = split_key(line)?;
-                    (line.number, line.indent, key, value.to_owned())
+                    (line.number, key, value.to_owned())
                 };
                 self.position += 1;
                 let entry = if value.is_empty() {
@@ -170,7 +196,10 @@ mod yaml {
                         _ => bail!("yaml line {number} key {key} has no value"),
                     }
                 } else if value.starts_with('[') {
-                    let inner = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')).with_context(|| format!("yaml line {number} flow sequence"))?;
+                    let inner = value
+                        .strip_prefix('[')
+                        .and_then(|v| v.strip_suffix(']'))
+                        .with_context(|| format!("yaml line {number} flow sequence"))?;
                     let mut items = Vec::new();
                     for part in inner.split(',') {
                         let part = part.trim();
@@ -183,7 +212,10 @@ mod yaml {
                 } else {
                     Value::Scalar(scalar(&value, number)?)
                 };
-                ensure!(map.insert(key, entry).is_none(), "yaml duplicate key on line {number}");
+                ensure!(
+                    map.insert(key, entry).is_none(),
+                    "yaml duplicate key on line {number}"
+                );
             }
             ensure!(!map.is_empty(), "yaml empty mapping");
             Ok(Value::Mapping(map))
@@ -214,7 +246,10 @@ mod yaml {
         ensure!(lines[0].indent == 0, "yaml first line is indented");
         let mut cursor = Cursor { lines, position: 0 };
         let root = cursor.block(0)?;
-        ensure!(cursor.position == cursor.lines.len(), "yaml trailing content");
+        ensure!(
+            cursor.position == cursor.lines.len(),
+            "yaml trailing content"
+        );
         Ok(root)
     }
 
@@ -223,7 +258,8 @@ mod yaml {
             let Value::Mapping(map) = self else {
                 bail!("yaml value is not a mapping when reading {key}");
             };
-            map.get(key).with_context(|| format!("yaml key missing: {key}"))
+            map.get(key)
+                .with_context(|| format!("yaml key missing: {key}"))
         }
         pub(super) fn mapping(&self, key: &str) -> Result<&Value> {
             let value = self.entry(key)?;
@@ -474,7 +510,10 @@ joint:
             std::process::id(),
             COUNT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&path, tar_archive(&[("model_config.yaml", yaml.as_bytes())]))?;
+        std::fs::write(
+            &path,
+            tar_archive(&[("model_config.yaml", yaml.as_bytes())]),
+        )?;
         Ok(path)
     }
 
@@ -495,27 +534,38 @@ joint:
     #[test]
     fn eou_spec_rejects_config_mutations() -> Result<()> {
         for (label, yaml) in [
-            ("alias", CONFIG.replace("sample_rate: 16000", "sample_rate: *ref")),
+            (
+                "alias",
+                CONFIG.replace("sample_rate: 16000", "sample_rate: *ref"),
+            ),
             ("anchor", CONFIG.replace("n_heads: 8", "n_heads: &eight 8")),
             ("tag", CONFIG.replace("pad_to: 0", "pad_to: !!int 0")),
-            (
-                "document marker",
-                format!("---\n{CONFIG}"),
-            ),
+            ("document marker", format!("---\n{CONFIG}")),
             ("tab", CONFIG.replace("  features: 128", "\tfeatures: 128")),
             (
                 "duplicate key",
-                CONFIG.replace("sample_rate: 16000\n", "sample_rate: 16000\nsample_rate: 16001\n"),
+                CONFIG.replace(
+                    "sample_rate: 16000\n",
+                    "sample_rate: 16000\nsample_rate: 16001\n",
+                ),
             ),
             ("missing key", CONFIG.replace("  n_layers: 17\n", "")),
-            ("wrong type", CONFIG.replace("n_layers: 17", "n_layers: seventeen")),
+            (
+                "wrong type",
+                CONFIG.replace("n_layers: 17", "n_layers: seventeen"),
+            ),
             (
                 "flow mapping",
-                CONFIG.replace("pred_hidden: 640\n    pred_rnn_layers: 1", "pred_hidden: 640"),
+                CONFIG.replace(
+                    "pred_hidden: 640\n    pred_rnn_layers: 1",
+                    "pred_hidden: 640",
+                ),
             ),
         ] {
             let path = config_nemo(&yaml)?;
-            let error = EouSpec::read(&path).err().with_context(|| label.to_owned())?;
+            let error = EouSpec::read(&path)
+                .err()
+                .with_context(|| label.to_owned())?;
             std::fs::remove_file(&path)?;
             ensure!(
                 !error.to_string().is_empty(),

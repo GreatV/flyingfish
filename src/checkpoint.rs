@@ -5276,7 +5276,10 @@ pub(crate) fn tar_member(data: &[u8], name: &str) -> Result<std::ops::Range<usiz
         if header.iter().all(|&byte| byte == 0) {
             break;
         }
-        ensure!(&header[257..262] == b"ustar", "tar member header is not ustar");
+        ensure!(
+            &header[257..262] == b"ustar",
+            "tar member header is not ustar"
+        );
         let field = |range: std::ops::Range<usize>| -> Result<&str> {
             let bytes = &header[range];
             let end = bytes
@@ -5877,9 +5880,9 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
         ".storage_alignment",
         ".data/serialization_id",
     ]
-        .map(|s| format!("{prefix}{s}"))
-        .into_iter()
-        .collect();
+    .map(|s| format!("{prefix}{s}"))
+    .into_iter()
+    .collect();
     ensure!(
         entries
             .iter()
@@ -5898,7 +5901,7 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
 #[cfg(test)]
 pub(crate) fn tar_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
     let mut data = Vec::new();
-    let mut header = |name: &str, size: usize, typeflag: u8, out: &mut Vec<u8>| {
+    let header = |name: &str, size: usize, typeflag: u8, out: &mut Vec<u8>| {
         out.extend(std::iter::repeat_n(0u8, 512));
         let start = out.len() - 512;
         out[start..start + name.len()].copy_from_slice(name.as_bytes());
@@ -5910,13 +5913,16 @@ pub(crate) fn tar_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
     for (name, value) in members {
         header(name, value.len(), b'0', &mut data);
         data.extend_from_slice(value);
-        data.extend(std::iter::repeat_n(0u8, value.len().div_ceil(512) * 512 - value.len()));
+        data.extend(std::iter::repeat_n(
+            0u8,
+            value.len().div_ceil(512) * 512 - value.len(),
+        ));
     }
     data.extend(std::iter::repeat_n(0u8, 1024));
     data
 }
 
-
+#[cfg(test)]
 mod stored_zip_tests {
     use super::*;
 
@@ -6057,15 +6063,22 @@ mod stored_zip_tests {
 
     #[test]
     fn nemo_checkpoint_reads_the_tar_stored_zip_member() -> Result<()> {
-        let nemo = temp_nemo(&tar_archive(&[("model_weights.ckpt", &archive(&pickle(0), 0))]))?;
+        let nemo = temp_nemo(&tar_archive(&[(
+            "model_weights.ckpt",
+            &archive(&pickle(0), 0),
+        )]))?;
         let checkpoint = MappedCheckpoint::open_nemo(&nemo)?;
         std::fs::remove_file(&nemo)?;
         ensure!(
-            checkpoint.index.weight_map.len() == 1 && checkpoint.index.weight_map.contains_key("weight"),
+            checkpoint.index.weight_map.len() == 1
+                && checkpoint.index.weight_map.contains_key("weight"),
             "nemo tensor names"
         );
         let tensor = checkpoint.tensor("weight")?;
-        ensure!(tensor.shape() == [2] && tensor.data().len() == 8, "nemo tensor view");
+        ensure!(
+            tensor.shape() == [2] && tensor.data().len() == 8,
+            "nemo tensor view"
+        );
         let values = checkpoint.f32_tensor("weight", tensor.shape())?;
         ensure!(values == [1.25, -2.5], "nemo tensor bytes");
         println!("PASS nemo_checkpoint member=1 tensors=1 bytes_exact=true");
@@ -6077,9 +6090,12 @@ mod stored_zip_tests {
         let valid = archive(&pickle(0), 0);
         let missing = tar_archive(&[("model_config.yaml", b"key: value\n")]);
         let path = temp_nemo(&missing)?;
-        let error = MappedCheckpoint::open_nemo(&path).err().context("missing member accepted")?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("missing member accepted")?;
         ensure!(
-            error.to_string()
+            error
+                .to_string()
                 .contains("tar member missing: model_weights.ckpt"),
             "missing member error"
         );
@@ -6089,7 +6105,9 @@ mod stored_zip_tests {
         let typeflag = nonregular.len() - 1024 - valid.len().div_ceil(512) * 512 - 512 + 156;
         nonregular[typeflag] = b'2';
         let path = temp_nemo(&nonregular)?;
-        let error = MappedCheckpoint::open_nemo(&path).err().context("non-regular member accepted")?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("non-regular member accepted")?;
         ensure!(
             error.to_string().contains("not a regular file"),
             "non-regular member error"
@@ -6100,7 +6118,9 @@ mod stored_zip_tests {
         let size_field = truncated.len() - 1024 - valid.len().div_ceil(512) * 512 - 512 + 124;
         truncated[size_field] = b'7';
         let path = temp_nemo(&truncated)?;
-        let error = MappedCheckpoint::open_nemo(&path).err().context("truncated member accepted")?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("truncated member accepted")?;
         ensure!(
             error.to_string().contains("truncated"),
             "truncated member error"
@@ -6111,7 +6131,9 @@ mod stored_zip_tests {
         let pickle_payload = 512 + 40 + valid.len() / 2;
         corrupt[pickle_payload] ^= 0xff;
         let path = temp_nemo(&corrupt)?;
-        let error = MappedCheckpoint::open_nemo(&path).err().context("payload checksum accepted")?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("payload checksum accepted")?;
         ensure!(
             error.to_string().contains("checksum mismatch"),
             "payload checksum error"
@@ -6129,8 +6151,7 @@ mod stored_zip_tests {
         let nemo = std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?;
         let manifest_path = std::env::var("FF_EOU_MANIFEST").context("FF_EOU_MANIFEST missing")?;
         let checkpoint = MappedCheckpoint::open_nemo(std::path::Path::new(&nemo))?;
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
         let tensors = manifest["tensors"]
             .as_object()
             .context("manifest tensors missing")?;
@@ -6158,15 +6179,18 @@ mod stored_zip_tests {
             ensure!(tensor.data().len() == bytes, "nemo tensor {name} bytes");
             params += shape.iter().product::<usize>();
         }
-        let expected = manifest["state_params"].as_u64().context("manifest params")? as usize;
-        ensure!(params == expected, "nemo params {params} against {expected}");
+        let expected = manifest["state_params"]
+            .as_u64()
+            .context("manifest params")? as usize;
+        ensure!(
+            params == expected,
+            "nemo params {params} against {expected}"
+        );
         let members = manifest["tar_members"]
             .as_object()
             .context("manifest members")?;
         ensure!(members.len() == 5, "manifest member count");
-        let map = unsafe {
-            memmap2::MmapOptions::new().map(&std::fs::File::open(&nemo)?)?
-        };
+        let map = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&nemo)?)? };
         for (name, size) in members {
             let range = tar_member(&map, name)?;
             ensure!(
