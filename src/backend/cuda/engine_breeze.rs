@@ -2090,6 +2090,41 @@ fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Resu
     Ok(out)
 }
 
+fn decode_shape(
+    projected: &[f32],
+    cond: &[f32],
+    text_rows: usize,
+    fed: &[i32],
+    frames: &[i32],
+) -> Result<(usize, usize)> {
+    ensure!(fed.len().is_multiple_of(BOOKS), "fed codes");
+    ensure!(frames.len().is_multiple_of(BOOKS), "depth codes");
+    ensure!(cond.len().is_multiple_of(BB_H), "cond");
+    let audio_steps = fed.len() / BOOKS;
+    let depth_frames = frames.len() / BOOKS;
+    ensure!(
+        (1..=DP_FRAMES).contains(&depth_frames),
+        "frames {depth_frames}"
+    );
+    ensure!(cond.len() == depth_frames * BB_H, "cond length");
+    ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
+    ensure!(
+        audio_steps >= 1 && depth_frames >= audio_steps,
+        "decode steps"
+    );
+    ensure!(text_rows + audio_steps <= BB_MAX, "decode length");
+    ensure!(projected.len() == text_rows * BB_H, "projected length");
+    ensure!(
+        projected.iter().all(|value| value.is_finite()),
+        "non-finite projected"
+    );
+    ensure!(
+        cond.iter().all(|value| value.is_finite()),
+        "non-finite cond"
+    );
+    Ok((audio_steps, depth_frames))
+}
+
 impl Breeze {
     fn bound_device(&self) -> Result<()> {
         ensure!(self.device.ctx.ordinal() == 0, "device ordinal");
@@ -2471,28 +2506,8 @@ impl Breeze {
         frames: &[i32],
         plant_head: bool,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (audio_steps, depth_frames) = decode_shape(projected, cond, text_rows, fed, frames)?;
         self.bound_device()?;
-        ensure!(fed.len().is_multiple_of(BOOKS), "fed codes");
-        ensure!(frames.len().is_multiple_of(BOOKS), "depth codes");
-        ensure!(cond.len().is_multiple_of(BB_H), "cond");
-        let audio_steps = fed.len() / BOOKS;
-        let depth_frames = frames.len() / BOOKS;
-        ensure!(cond.len() == depth_frames * BB_H, "cond length");
-        ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
-        ensure!(
-            audio_steps >= 1 && depth_frames >= audio_steps,
-            "decode steps"
-        );
-        ensure!(text_rows + audio_steps <= BB_MAX, "decode length");
-        ensure!(projected.len() == text_rows * BB_H, "projected length");
-        ensure!(
-            projected.iter().all(|value| value.is_finite()),
-            "non-finite projected"
-        );
-        ensure!(
-            cond.iter().all(|value| value.is_finite()),
-            "non-finite cond"
-        );
         let Breeze {
             ref w,
             ref k,
@@ -3155,6 +3170,29 @@ mod tests {
         assert!(engine.contains("audio_source_book(book)"));
         let old = ["audio_codes", "[0]"].concat();
         assert!(!engine.contains(&old));
+    }
+
+    #[test]
+    fn decode_shape_accepts_64_frames_and_rejects_65() -> Result<()> {
+        let text_rows = 7;
+        let audio_steps = 4;
+        let projected = vec![0f32; text_rows * super::BB_H];
+        let fed = vec![0i32; audio_steps * super::BOOKS];
+        let frames_64 = vec![0i32; super::DP_FRAMES * super::BOOKS];
+        let cond_64 = vec![0f32; super::DP_FRAMES * super::BB_H];
+        let (steps, depth) =
+            super::decode_shape(&projected, &cond_64, text_rows, &fed, &frames_64)?;
+        ensure!(
+            steps == audio_steps && depth == super::DP_FRAMES,
+            "64 frames"
+        );
+        let frames_65 = vec![0i32; (super::DP_FRAMES + 1) * super::BOOKS];
+        let cond_65 = vec![0f32; (super::DP_FRAMES + 1) * super::BB_H];
+        ensure!(
+            super::decode_shape(&projected, &cond_65, text_rows, &fed, &frames_65).is_err(),
+            "65 frames"
+        );
+        Ok(())
     }
 
     fn position_zero(table: &[bf16], dim: usize) -> Result<()> {
