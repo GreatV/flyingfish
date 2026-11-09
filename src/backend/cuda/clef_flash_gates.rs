@@ -38,6 +38,21 @@ mod gates {
     }
 
     #[test]
+    fn max_rmse_rejects_non_finite_cells() -> Result<()> {
+        let clean = max_rmse(&[1.0, 2.0], &[1.0, 2.5])?;
+        ensure!(clean.0 > 0.0, "finite comparison must produce a delta");
+        ensure!(
+            max_rmse(&[f32::NAN, 1.0], &[0.0, 1.0]).is_err(),
+            "a NaN input must error, not score"
+        );
+        ensure!(
+            max_rmse(&[1.0, 1.0], &[f32::NAN, 1.0]).is_err(),
+            "a NaN reference must error, not score"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn reference_tap_loader_widens_bf16_bits_exactly() -> Result<()> {
         let data = [0x80u8, 0x3F, 0x00, 0xC0, 0x00, 0x3F];
         let view = safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![3], &data)?;
@@ -106,7 +121,12 @@ mod gates {
         let mut max = 0.0f64;
         let mut sum = 0.0f64;
         for (a, b) in got.iter().zip(want) {
-            let d = (*a as f64 - *b as f64).abs();
+            let (a, b) = (*a as f64, *b as f64);
+            ensure!(
+                a.is_finite() && b.is_finite(),
+                "non-finite cell value (runner FAIL)"
+            );
+            let d = (a - b).abs();
             max = max.max(d);
             sum += d * d;
         }
