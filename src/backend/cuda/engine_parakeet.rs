@@ -2602,8 +2602,7 @@ impl ParakeetEncoder {
             };
         let mut hidden = input.try_clone()?;
         feed_forward(&mut hidden, &block.ff1, 0.5)?;
-        let normalized = self.normalize(&hidden, rows, &block.attention_norm)?;
-        let q = self.linear(&normalized, rows, &block.attention.q)?;
+        let attention_input = self.normalize(&hidden, rows, &block.attention_norm)?;
         let cached = session.cache_len;
         let key_rows = (cached + rows as usize) as u32;
         let table = self.positions(key_rows as usize)?;
@@ -2614,29 +2613,32 @@ impl ParakeetEncoder {
             .stream
             .alloc_zeros(key_rows as usize * width)?;
         self.copy_device(hidden_cache, 0, &mut keys_input, 0, cached * width)?;
-        self.copy_device(&normalized, 0, &mut keys_input, cached * width, rows as usize * width)?;
+        self.copy_device(&attention_input, 0, &mut keys_input, cached * width, rows as usize * width)?;
+        let q_full = self.linear(&keys_input, key_rows, &block.attention.q)?;
         let k = self.linear(&keys_input, key_rows, &block.attention.k)?;
         let v = self.linear(&keys_input, key_rows, &block.attention.v)?;
-        let core = self.stream.alloc_zeros(hidden.len())?;
+        let core_full = self.stream.alloc_zeros(key_rows as usize * width)?;
         self.attend(AttentionLaunch {
-            q: &q,
+            q: &q_full,
             k: &k,
             v: &v,
             relative: &relative,
             bias_u: &block.attention.bias_u,
             bias_v: &block.attention.bias_v,
             mask: &session.mask,
-            output: &core,
-            rows,
+            output: &core_full,
+            rows: key_rows,
             key_rows,
             query_offset: session.cache_len as u32,
             kv_offset: 0,
             right_chunks: 0,
         })?;
+        let mut core: CudaSlice<f32> = self.stream.alloc_zeros(rows as usize * width)?;
+        self.copy_device(&core_full, cached * width, &mut core, 0, rows as usize * width)?;
         let delta = self.linear(&core, rows, &block.attention.o)?;
         self.residual(&mut hidden, &delta, 1.0)?;
-        let normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
-        let expanded = self.linear(&normalized, rows, &block.convolution.pointwise1)?;
+        let conv_normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
+        let expanded = self.linear(&conv_normalized, rows, &block.convolution.pointwise1)?;
         let activated = self.activate(&expanded, rows, self.conformer.hidden, 2)?;
         let launch_rows = if session.steps == 0 {
             rows
@@ -2677,6 +2679,10 @@ impl ParakeetEncoder {
         } else {
             convolved
         };
+        if index == 0 && session.steps == 1 {
+            let kp = self.stream.clone_dtoh(&kept)?;
+            println!("EOU_S3_SUB step=1 conv_kept={:?}", &kp[..4]);
+        }
         let normalized = self.normalize_pair(
             &kept,
             rows,
@@ -2688,7 +2694,11 @@ impl ParakeetEncoder {
         self.residual(&mut hidden, &delta, 1.0)?;
         feed_forward(&mut hidden, &block.ff2, 0.5)?;
         let output = self.normalize(&hidden, rows, &block.output_norm)?;
-        Ok((output, normalized, activated))
+        if index == 0 && session.steps == 1 {
+            let o = self.stream.clone_dtoh(&output)?;
+            println!("EOU_S3_SUB step=1 layer_out={:?}", &o[..4]);
+        }
+        Ok((output, attention_input, activated))
     }
 
     /// Runs one streaming step over the mel window; the returned rows are the
