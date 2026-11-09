@@ -188,6 +188,7 @@ impl Plan {
             algo_index,
             bias,
             sys::cudaDataType_t::CUDA_R_16BF,
+            None,
         )
     }
 
@@ -208,6 +209,7 @@ impl Plan {
             algo_index,
             None,
             sys::cudaDataType_t::CUDA_R_32F,
+            None,
         )
     }
 
@@ -219,6 +221,7 @@ impl Plan {
         algo_index: u32,
         bias: Option<u64>,
         c_dtype: sys::cudaDataType_t,
+        fixed: Option<sys::cublasLtMatmulAlgo_t>,
     ) -> Result<Self> {
         let (rows, output, input) = geometry;
         let mut p = Self {
@@ -289,19 +292,43 @@ impl Plan {
                 (&workspace as *const usize).cast(),
                 size_of::<usize>(),
             )?;
-            let algos = heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)?;
-            ensure!(
-                (algo_index as usize) < algos.len(),
-                "Lt heuristic returned {} algos; index {algo_index} unavailable",
-                algos.len()
-            );
-            p.algo_count = algos.len();
-            let heuristic = &algos[algo_index as usize];
-            heuristic.state.result()?;
-            p.waves = heuristic.wavesCount;
-            p.workspace = heuristic.workspaceSize;
-            p.algo = Some(heuristic.algo);
-            p.algo_index = algo_index;
+            if let Some(algo) = fixed {
+                let mut result = std::mem::MaybeUninit::uninit();
+                sys::cublasLtMatmulAlgoCheck(
+                    handle,
+                    p.desc,
+                    p.a,
+                    p.b,
+                    p.c,
+                    p.c,
+                    &algo,
+                    result.as_mut_ptr(),
+                )
+                .result()
+                .with_context(|| {
+                    format!("fixed Lt AlgoCheck rows={rows} output={output} input={input}")
+                })?;
+                let result = result.assume_init();
+                result.state.result()?;
+                p.algo = Some(algo);
+                p.waves = result.wavesCount;
+                p.workspace = result.workspaceSize;
+                p.algo_count = 1;
+            } else {
+                let algos = heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)?;
+                ensure!(
+                    (algo_index as usize) < algos.len(),
+                    "Lt heuristic returned {} algos; index {algo_index} unavailable",
+                    algos.len()
+                );
+                p.algo_count = algos.len();
+                let heuristic = &algos[algo_index as usize];
+                heuristic.state.result()?;
+                p.waves = heuristic.wavesCount;
+                p.workspace = heuristic.workspaceSize;
+                p.algo = Some(heuristic.algo);
+                p.algo_index = algo_index;
+            }
         }
         let split_k =
             p.attr(sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?;
@@ -455,12 +482,13 @@ pub struct Blas {
     skinny_plans: RefCell<BTreeMap<(usize, usize), (LaunchConfig, bool)>>,
     invariant_rows: usize,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
+    row_families: RefCell<BTreeMap<(usize, usize), (sys::cublasLtMatmulAlgo_t, usize)>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
     bias_add: Option<CudaFunction>,
     bias_fill_f16: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
     decode: CudaBlas,
-    workspace: CudaSlice<u8>,
+    workspace: RefCell<CudaSlice<u8>>,
     stream: Arc<CudaStream>,
     closure: Rc<super::closure::Closure>,
 }
@@ -661,12 +689,13 @@ impl Blas {
             skinny_plans: RefCell::new(BTreeMap::new()),
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
+            row_families: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
             bias_add: None,
             bias_fill_f16: None,
             handle,
             decode,
-            workspace,
+            workspace: RefCell::new(workspace),
             stream,
             closure,
         })
@@ -725,7 +754,7 @@ impl Blas {
                 rows,
                 output,
                 input,
-                self.workspace.len(),
+                self.workspace.borrow().len(),
                 algo_index,
             )
             .with_context(|| format!("Lt plan rows={rows} output={output} input={input}"))?;
@@ -976,7 +1005,8 @@ impl Blas {
             let (a, _ra) = w.device_ptr(&self.stream);
             let (b, _rb) = x.device_ptr(&self.stream);
             let (c, _rc) = y.device_ptr_mut(&self.stream);
-            let (work, _rw) = self.workspace.device_ptr(&self.stream);
+            let workspace_owner = self.workspace.borrow();
+            let (work, _rw) = workspace_owner.device_ptr(&self.stream);
             let alpha = 1f32;
             let beta = 0f32;
             unsafe {
@@ -995,7 +1025,7 @@ impl Blas {
                     p.c,
                     p.algo.as_ref().context("Lt algorithm missing")?,
                     work as _,
-                    self.workspace.len(),
+                    self.workspace.borrow().len(),
                     self.stream.cu_stream() as _,
                 )?;
             }
@@ -1100,6 +1130,57 @@ impl Blas {
         Ok(())
     }
 
+    /// One opaque algorithm per (output,input) family, selected at the canonical row count.
+    pub(crate) fn bind_row_family(&self, shape: LinearShape) -> Result<()> {
+        let key = (shape.output, shape.input);
+        ensure!(
+            !self.row_families.borrow().contains_key(&key),
+            "row family already bound {key:?}"
+        );
+        let plan = Plan::new(
+            self.handle,
+            shape.rows,
+            shape.output,
+            shape.input,
+            self.workspace.borrow().len(),
+            0,
+        )?;
+        let algo = plan.algo.context("canonical Lt algorithm missing")?;
+        self.plans
+            .borrow_mut()
+            .retain(|&(_, output, input, _), _| (output, input) != key);
+        self.row_families
+            .borrow_mut()
+            .insert(key, (algo, self.workspace.borrow().len()));
+        Ok(())
+    }
+
+    pub(crate) fn fixed_workspace(&self, shape: LinearShape) -> Result<usize> {
+        self.prepare_fixed(
+            u32::try_from(shape.rows)?,
+            u32::try_from(shape.output)?,
+            u32::try_from(shape.input)?,
+        )?;
+        let plans = self.plans.borrow();
+        let plan = plans
+            .get(&(shape.rows, shape.output, shape.input, 0))
+            .context("fixed workspace plan missing")?;
+        Ok(if plan.workspace > self.workspace.borrow().len() {
+            plan.workspace
+        } else {
+            0
+        })
+    }
+
+    /// Full replacement allocation while the old workspace remains live.
+    pub(crate) fn bind_workspace(&self, bytes: usize) -> Result<()> {
+        if bytes > self.workspace.borrow().len() {
+            let workspace = self.stream.alloc_zeros::<u8>(bytes)?;
+            *self.workspace.borrow_mut() = workspace;
+        }
+        Ok(())
+    }
+
     /// Fixed Lt plan's whole-wave work multiplier and separate split-K reduction launch count.
     pub(crate) fn fixed_plan_cost(
         &self,
@@ -1122,6 +1203,27 @@ impl Blas {
         );
         if describe {
             plan.describe(shape.rows, shape.output, shape.input)?;
+            if let Some(&(_, original_workspace)) =
+                self.row_families.borrow().get(&(shape.output, shape.input))
+            {
+                let previous = Plan::new(
+                    self.handle,
+                    shape.rows,
+                    shape.output,
+                    shape.input,
+                    original_workspace,
+                    0,
+                )?;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"row_family_comparison":{
+                        "rows":shape.rows,"output":shape.output,"input":shape.input,
+                        "bound":plan.identity()?,"heuristic":previous.identity()?,
+                        "bound_workspace":plan.workspace,"heuristic_workspace":previous.workspace,
+                        "bound_waves":plan.waves,"heuristic_waves":previous.waves
+                    }})
+                );
+            }
         }
         let split =
             plan.attr(sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?;
@@ -1147,7 +1249,20 @@ impl Blas {
             })?;
         }
         if !self.plans.borrow().contains_key(&key) {
-            let p = Plan::new(self.handle, key.0, key.1, key.2, self.workspace.len(), 0)?;
+            let fixed = self
+                .row_families
+                .borrow()
+                .get(&(key.1, key.2))
+                .map(|&(algo, _)| algo);
+            let p = Plan::build(
+                self.handle,
+                (key.0, key.1, key.2),
+                self.workspace.borrow().len(),
+                0,
+                None,
+                sys::cudaDataType_t::CUDA_R_16BF,
+                fixed,
+            )?;
             self.plans.borrow_mut().insert(key, p);
         }
         Ok(())
@@ -1326,6 +1441,27 @@ impl Blas {
         y: &mut super::contracts::TensorMut<bf16, 2>,
         alpha: f32,
     ) -> Result<()> {
+        self.accumulate_bound(weight, x, y, alpha, false)
+    }
+
+    pub(crate) fn linear_accumulate_fixed(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+        alpha: f32,
+    ) -> Result<()> {
+        self.accumulate_bound(weight, x, y, alpha, true)
+    }
+
+    fn accumulate_bound(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+        alpha: f32,
+        fixed: bool,
+    ) -> Result<()> {
         weight.validate()?;
         x.validate()?;
         y.0.validate()?;
@@ -1348,6 +1484,55 @@ impl Blas {
         );
         ensure!(alpha.is_finite(), "accumulating linear alpha {alpha}");
         let beta = 1f32;
+        if fixed {
+            super::linear::disjoint(&weight, &y.0)?;
+            super::linear::disjoint(&x, &y.0)?;
+            ensure!(
+                [weight.ptr, x.ptr, y.0.ptr]
+                    .iter()
+                    .all(|p| p.is_multiple_of(256)),
+                "fixed family pointer alignment"
+            );
+            ensure!(
+                self.row_families.borrow().contains_key(&(output, input)),
+                "accumulating row family not bound"
+            );
+            ensure!(
+                x_pitch == input as u64 && y_pitch == output as u64,
+                "fixed accumulating family requires dense rows"
+            );
+            let plans = self.plans.borrow();
+            let p = plans
+                .get(&(rows, output, input, 0))
+                .context("accumulating family was not prepared")?;
+            let owner = self.workspace.borrow();
+            ensure!(
+                p.workspace <= owner.len(),
+                "fixed accumulating workspace was not bound"
+            );
+            let (workspace, _guard) = owner.device_ptr(&self.stream);
+            unsafe {
+                lt::matmul(
+                    self.handle,
+                    p.desc,
+                    (&alpha as *const f32).cast(),
+                    (&beta as *const f32).cast(),
+                    weight.ptr as _,
+                    p.a,
+                    x.ptr as _,
+                    p.b,
+                    y.0.ptr as _,
+                    p.c,
+                    y.0.ptr as _,
+                    p.c,
+                    p.algo.as_ref().context("accumulating algorithm missing")?,
+                    workspace as _,
+                    owner.len(),
+                    self.stream.cu_stream() as _,
+                )?;
+            }
+            return Ok(());
+        }
         unsafe {
             bs::cublasGemmEx(
                 *self.decode.handle(),
@@ -1570,9 +1755,27 @@ impl Blas {
                         x.shape[0], w.shape[0], w.shape[1]
                     );
                 }
+                if self
+                    .row_families
+                    .borrow()
+                    .contains_key(&(w.shape[0] as usize, w.shape[1] as usize))
+                {
+                    super::linear::disjoint(&x, &y.0)?;
+                    ensure!(
+                        [w.ptr, x.ptr, y.0.ptr]
+                            .iter()
+                            .all(|p| p.is_multiple_of(256)),
+                        "fixed family pointer alignment"
+                    );
+                }
                 let alpha = 1f32;
                 let beta = 0f32;
-                let (workspace, _guard) = self.workspace.device_ptr(&self.stream);
+                let workspace_owner = self.workspace.borrow();
+                ensure!(
+                    p.workspace <= workspace_owner.len(),
+                    "fixed Lt workspace not bound"
+                );
+                let (workspace, _guard) = workspace_owner.device_ptr(&self.stream);
                 unsafe {
                     lt::matmul(
                         self.handle,
@@ -1589,7 +1792,7 @@ impl Blas {
                         p.c,
                         p.algo.as_ref().context("fixed Lt algo missing")?,
                         workspace as _,
-                        self.workspace.len(),
+                        self.workspace.borrow().len(),
                         self.stream.cu_stream() as _,
                     )?;
                 }
@@ -1633,7 +1836,7 @@ impl Blas {
                 shape.rows,
                 shape.output,
                 shape.input,
-                self.workspace.len(),
+                self.workspace.borrow().len(),
                 0,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
             )?;
@@ -1690,7 +1893,8 @@ impl Blas {
                 "biased Lt plan missing rows={} output={} input={} mode={mode:?}; bind before run/capture",
                 x.shape[0], weight.shape[0], weight.shape[1],
             ))?;
-        let (workspace, _read) = self.workspace.device_ptr(&self.stream);
+        let workspace_owner = self.workspace.borrow();
+        let (workspace, _read) = workspace_owner.device_ptr(&self.stream);
         let alpha = 1f32;
         let beta = 0f32;
         unsafe {
@@ -1709,7 +1913,7 @@ impl Blas {
                 p.c,
                 p.algo.as_ref().context("biased Lt algo missing")?,
                 workspace as _,
-                self.workspace.len(),
+                self.workspace.borrow().len(),
                 self.stream.cu_stream() as _,
             )?;
         }

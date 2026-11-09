@@ -330,6 +330,7 @@ fn ffn_chunk(rows: usize) -> usize {
 struct FfnPlan {
     chunk: usize,
     allocation: usize,
+    workspace: usize,
     tensor_cost: f64,
     launches: usize,
 }
@@ -349,6 +350,7 @@ impl FfnPlan {
                 let allocation = main
                     .allocation
                     .checked_add(text.allocation)
+                    .and_then(|n| n.checked_add(main.workspace.max(text.workspace)))
                     .context("joint FFN allocation overflow")?;
                 if allocation > budget {
                     continue;
@@ -679,6 +681,7 @@ pub(crate) struct BlockWork {
     rows: usize,
     rank: usize,
     chunk: usize,
+    fixed_lora: bool,
     #[cfg(test)]
     repeat_ffn_input: bool,
     normed: CudaSlice<bf16>,
@@ -711,6 +714,8 @@ impl BlockWork {
             shapes.push((rows, h, f));
             shapes.push((rows, r, h));
             shapes.push((rows, r, f));
+            shapes.push((rows, 2 * f, r));
+            shapes.push((rows, h, r));
         }
         for (rows, output, input) in shapes {
             blas.prepare_fixed(
@@ -736,6 +741,7 @@ impl BlockWork {
             } else {
                 FfnPlan::allocation(chunk, spec.ffn)?
             },
+            workspace: 0,
             tensor_cost: 0.0,
             launches: 0,
         };
@@ -743,12 +749,14 @@ impl BlockWork {
             if rows == 0 || count == 0 {
                 continue;
             }
-            let mut launches = 7;
+            let mut launches = 1;
             for (output, input) in [
                 (2 * spec.ffn, spec.hidden),
                 (spec.hidden, spec.ffn),
                 (self.rank, spec.hidden),
                 (self.rank, spec.ffn),
+                (2 * spec.ffn, self.rank),
+                (spec.hidden, self.rank),
             ] {
                 let (wave_cost, reduction) = blas.fixed_plan_cost(
                     crate::backend::setup::LinearShape {
@@ -760,7 +768,14 @@ impl BlockWork {
                 )?;
                 plan.tensor_cost +=
                     2.0 * rows as f64 * output as f64 * input as f64 * count as f64 * wave_cost;
-                launches += reduction;
+                plan.workspace = plan.workspace.max(blas.fixed_workspace(
+                    crate::backend::setup::LinearShape {
+                        rows,
+                        output,
+                        input,
+                    },
+                )?);
+                launches += 1 + reduction;
             }
             plan.launches += count * launches;
         }
@@ -772,6 +787,7 @@ impl BlockWork {
             return Ok(vec![FfnPlan {
                 chunk: self.chunk,
                 allocation: 0,
+                workspace: 0,
                 tensor_cost: 0.0,
                 launches: 0,
             }]);
@@ -786,7 +802,14 @@ impl BlockWork {
             if chunk != self.chunk && FfnPlan::allocation(chunk, spec.ffn)? > budget {
                 continue;
             }
-            choices.push(self.ffn_cost(blas, spec, chunk, false)?);
+            match self.ffn_cost(blas, spec, chunk, false) {
+                Ok(plan) => choices.push(plan),
+                Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
+                    .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
+                    eprintln!("FFN_PLAN_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                }
+                Err(error) => return Err(error.context(format!("FFN plan rows={} chunk={chunk}",self.rows))),
+            }
         }
         ensure!(
             choices
@@ -820,6 +843,7 @@ impl BlockWork {
             self.gated = gated;
             self.chunk = plan.chunk;
         }
+        self.fixed_lora = true;
         self.prepare(blas, spec)?;
         if self.rows > FFN_CHUNK_ROWS {
             self.ffn_cost(blas, spec, self.chunk, true)?;
@@ -841,6 +865,7 @@ impl BlockWork {
             rows,
             rank,
             chunk,
+            fixed_lora: false,
             #[cfg(test)]
             repeat_ffn_input: false,
             normed: s.alloc_zeros::<bf16>(rows * spec.hidden)?,
@@ -916,20 +941,28 @@ struct Operand<'a> {
 /// `y += lora_scale * (x * a^T) * b^T` for one LoRA pair; `x * a^T` is staged in `work` with row pitch `rank`.
 fn lora_pair(
     c: &BlockContext<'_>,
-    rank: usize,
     x: Operand<'_>,
     (a, b): (&CudaSlice<bf16>, &CudaSlice<bf16>),
     work: &mut CudaSlice<bf16>,
     y: Operand<'_>,
     rows: usize,
+    fixed: bool,
 ) -> Result<()> {
+    ensure!(a.len().is_multiple_of(x.width), "LoRA-A extent");
+    let rank = a.len() / x.width;
     c.blas.linear_typed(
         crate::op_contract::ExecutionPhase::Prefill,
         crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(a, c.s, rank, x.width)?),
         rows_view(x.buffer, c.s, x.offset, rows, x.width, x.width)?,
         &mut TensorMut(rows_view(work, c.s, 0, rows, rank, rank)?),
     )?;
-    c.blas.linear_accumulate(
+    let accumulate = if fixed {
+        Blas::linear_accumulate_fixed
+    } else {
+        Blas::linear_accumulate
+    };
+    accumulate(
+        c.blas,
         matrix(b, c.s, y.width, rank)?,
         rows_view(work, c.s, 0, rows, rank, rank)?,
         &mut TensorMut(rows_view(y.buffer, c.s, y.offset, rows, y.width, y.width)?),
@@ -1174,7 +1207,6 @@ pub(crate) fn block_forward(
     )?;
     lora_pair(
         c,
-        r,
         Operand {
             buffer: &work.v_raw,
             offset: 0,
@@ -1188,6 +1220,7 @@ pub(crate) fn block_forward(
             width: h,
         },
         rows,
+        false,
     )?;
     if modulation.is_some() {
         gated_add(xp, normed, 2)?;
@@ -1233,7 +1266,6 @@ pub(crate) fn block_forward(
         )?;
         lora_pair(
             c,
-            r,
             Operand {
                 buffer: &work.normed,
                 offset: input_start * h,
@@ -1247,6 +1279,7 @@ pub(crate) fn block_forward(
                 width: 2 * f,
             },
             n,
+            work.fixed_lora,
         )?;
         let hidden = pointer(&work.hidden, s);
         let gated = pointer(&work.gated, s);
@@ -1276,7 +1309,6 @@ pub(crate) fn block_forward(
         )?;
         lora_pair(
             c,
-            r,
             Operand {
                 buffer: &work.gated,
                 offset: 0,
@@ -1290,6 +1322,7 @@ pub(crate) fn block_forward(
                 width: h,
             },
             n,
+            work.fixed_lora,
         )?;
     }
     if modulation.is_some() {
@@ -1806,6 +1839,13 @@ impl Dit {
         let reserve = (total / 16)
             .checked_add(sizing.transient)
             .context("FFN live reserve overflow")?;
+        for (output, input) in [(r, h), (r, spec.ffn), (2 * spec.ffn, r), (h, r)] {
+            blas.bind_row_family(crate::backend::setup::LinearShape {
+                rows: FFN_CHUNK_ROWS,
+                output,
+                input,
+            })?;
+        }
         let budget = d.workspace_budget(free, free, reserve)?;
         let main_choices = work.ffn_choices(blas, spec, budget)?;
         let text_choices = text_work.ffn_choices(blas, spec, budget)?;
@@ -1842,10 +1882,12 @@ impl Dit {
             "{}",
             serde_json::json!({"h3_ffn_plan":{
                 "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
-                "peak_additional_bytes":chosen[0].allocation+chosen[1].allocation,
+                "peak_additional_bytes":chosen[0].allocation+chosen[1].allocation+chosen[0].workspace.max(chosen[1].workspace),
+                "lt_workspace_replacement_bytes":chosen[0].workspace.max(chosen[1].workspace),
                 "main":description(&work,chosen[0],previous[0]),"refiner":description(&text_work,chosen[1],previous[1])
             }})
         );
+        blas.bind_workspace(chosen[0].workspace.max(chosen[1].workspace))?;
         work.bind_ffn(s, blas, spec, chosen[0])?;
         text_work.bind_ffn(s, blas, spec, chosen[1])?;
         let vision = cubin::module(s.context(), "vision_ops")?;
@@ -2803,18 +2845,21 @@ mod tests {
         let baseline = FfnPlan {
             chunk: 1_002,
             allocation: 0,
+            workspace: 0,
             tensor_cost: 80.0,
             launches: 280,
         };
         let efficient = FfnPlan {
             chunk: 6_675,
             allocation: FfnPlan::allocation(6_675, 14_336)?,
+            workspace: 0,
             tensor_cost: 54.0,
             launches: 42,
         };
         let larger = FfnPlan {
             chunk: 8_009,
             allocation: FfnPlan::allocation(8_009, 14_336)?,
+            workspace: 0,
             tensor_cost: 55.0,
             launches: 35,
         };
@@ -2827,6 +2872,7 @@ mod tests {
         let text_full = FfnPlan {
             chunk: 1_327,
             allocation: FfnPlan::allocation(1_327, 14_336)?,
+            workspace: 0,
             tensor_cost: 2.0,
             launches: 7,
         };
@@ -2838,6 +2884,25 @@ mod tests {
         assert_eq!([constrained[0].chunk, constrained[1].chunk], [6_675, 664]);
         let zero = FfnPlan::pair(choices, [50, 2], 0)?;
         assert_eq!([zero[0].chunk, zero[1].chunk], [1_002, 664]);
+        let with_workspace = FfnPlan {
+            workspace: 4096,
+            ..efficient
+        };
+        assert!(FfnPlan::pair([&[with_workspace], &[text_full]], [50, 2], full + 4095).is_err());
+        assert!(
+            FfnPlan::pair(
+                [
+                    &[with_workspace],
+                    &[FfnPlan {
+                        workspace: 2048,
+                        ..text_full
+                    }]
+                ],
+                [50, 2],
+                full + 4096
+            )
+            .is_ok()
+        );
         assert!(FfnPlan::allocation(usize::MAX, 2).is_err());
         assert!(FfnPlan::pair([&[efficient], &[text_full]], [50, 2], full - 1).is_err());
         assert!(
@@ -3210,6 +3275,394 @@ mod tests {
         println!(
             "H3_ADALN_GATE PASS tables={checked} worst_max_abs={:.6e} worst_rel_rms={:.6e} worst_cosine={:.9} control=FAIL_AS_REQUIRED",
             worst[0], worst[1], worst[2]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE"]
+    fn ffn_lora_is_row_count_invariant() -> Result<()> {
+        use crate::backend::setup::LinearShape;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let path = |key| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let spec = H3Spec::read(&path("FF_MODEL")?)?;
+        let file = path("FF_H3_LORA")?;
+        let dir = file.parent().context("LoRA directory")?;
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .context("LoRA stem")?;
+        let (manifest, adapter) =
+            MappedCheckpoint::open_component(dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let captured = fs::read(path("FF_H3_CAPTURE")?.join("lora_a_up_input.bf16"))?;
+        ensure!(
+            captured.len() == 1511 * spec.hidden * 2,
+            "captured input must be [1511,hidden] BF16"
+        );
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let stream = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-row-gate-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let partitions: Vec<usize> = serde_json::from_slice(&fs::read(
+            path("FF_H3_CAPTURE")?.join("row_partitions.json"),
+        )?)?;
+        ensure!(
+            partitions.contains(&1008)
+                && partitions.contains(&1511)
+                && partitions.iter().all(|&n| n > 0 && n <= 60_431),
+            "row partitions must cover the discriminator within production extents"
+        );
+        let total = *partitions.iter().max().context("row partitions empty")?;
+        let mut source = Source::new(dir, &manifest);
+        let mut cells = 0;
+        for (name, output, input, accumulate) in [
+            ("ff.net.0.proj.lora_A", adapter.rank, spec.hidden, false),
+            ("ff.net.2.lora_A", adapter.rank, spec.ffn, false),
+            ("ff.net.0.proj.lora_B", 2 * spec.ffn, adapter.rank, true),
+            ("ff.net.2.lora_B", spec.hidden, adapter.rank, true),
+        ] {
+            let weight = source.tensor::<bf16>(
+                stream,
+                &format!("transformer_blocks.0.{name}.default.weight"),
+                output * input,
+            )?;
+            let host: Vec<bf16> = if name == "ff.net.0.proj.lora_A" {
+                captured
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| bf16::from_le_bytes(*b))
+                    .cycle()
+                    .take(total * input)
+                    .collect()
+            } else {
+                (0..total * input)
+                    .map(|i| {
+                        bf16::from_f32((((i * 37 + i / input * 11) % 251) as f32 - 125.0) / 127.0)
+                    })
+                    .collect()
+            };
+            let x = stream.clone_htod(&host)?;
+            let initial: Vec<bf16> = (0..total * output)
+                .map(|i| bf16::from_f32(((i * 19 % 257) as f32 - 128.0) / 131.0))
+                .collect();
+            let make_blas = || {
+                Blas::new(
+                    &device,
+                    &ops,
+                    &runtime,
+                    Rc::new(Closure::new(true, "FFN row invariance".into())),
+                )
+            };
+            let fixed = make_blas()?;
+            fixed.bind_row_family(LinearShape {
+                rows: FFN_CHUNK_ROWS,
+                output,
+                input,
+            })?;
+            let heuristic = make_blas()?;
+            let shape = |rows| LinearShape {
+                rows,
+                output,
+                input,
+            };
+            let mut workspace = 0;
+            for &chunk in &partitions {
+                for rows in [chunk, total % chunk].into_iter().filter(|&r| r > 0) {
+                    workspace = workspace.max(fixed.fixed_workspace(shape(rows))?);
+                    heuristic.prepare_fixed(
+                        u32::try_from(rows)?,
+                        u32::try_from(output)?,
+                        u32::try_from(input)?,
+                    )?;
+                }
+            }
+            let composition = if accumulate {
+                let width = if output == 2 * spec.ffn {
+                    spec.hidden
+                } else {
+                    spec.ffn
+                };
+                let key = name.replace("lora_B", "lora_A");
+                let a = source.tensor::<bf16>(
+                    stream,
+                    &format!("transformer_blocks.0.{key}.default.weight"),
+                    input * width,
+                )?;
+                let values: Vec<bf16> = (0..total * width)
+                    .map(|i| {
+                        bf16::from_f32((((i * 37 + i / width * 11) % 251) as f32 - 125.0) / 127.0)
+                    })
+                    .collect();
+                let raw = stream.clone_htod(&values)?;
+                fixed.bind_row_family(LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output: input,
+                    input: width,
+                })?;
+                for &chunk in &partitions {
+                    for rows in [chunk, total % chunk].into_iter().filter(|&r| r > 0) {
+                        workspace = workspace.max(fixed.fixed_workspace(LinearShape {
+                            rows,
+                            output: input,
+                            input: width,
+                        })?);
+                    }
+                }
+                Some((a, raw, width))
+            } else {
+                None
+            };
+            fixed.bind_workspace(workspace)?;
+            let run = |blas: &Blas,
+                       chunk: usize,
+                       graph: bool,
+                       fixed_b: bool,
+                       composed: bool|
+             -> Result<Vec<bf16>> {
+                let y = stream.clone_htod(&initial)?;
+                let intermediate = stream.alloc_zeros::<bf16>(total * input)?;
+                if graph {
+                    stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                }
+                let launch = (|| -> Result<()> {
+                    for start in (0..total).step_by(chunk) {
+                        let rows = chunk.min(total - start);
+                        let w = matrix(&weight, stream, output, input)?;
+                        let x = if composed {
+                            let (a, raw, width) =
+                                composition.as_ref().context("composed LoRA-A missing")?;
+                            blas.linear_typed(
+                                crate::op_contract::ExecutionPhase::Prefill,
+                                crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(
+                                    a, stream, input, *width,
+                                )?),
+                                rows_view(raw, stream, start * width, rows, *width, *width)?,
+                                &mut TensorMut(rows_view(
+                                    &intermediate,
+                                    stream,
+                                    start * input,
+                                    rows,
+                                    input,
+                                    input,
+                                )?),
+                            )?;
+                            rows_view(&intermediate, stream, start * input, rows, input, input)?
+                        } else {
+                            rows_view(&x, stream, start * input, rows, input, input)?
+                        };
+                        let mut y =
+                            TensorMut(rows_view(&y, stream, start * output, rows, output, output)?);
+                        if accumulate {
+                            if fixed_b {
+                                blas.linear_accumulate_fixed(w, x, &mut y, adapter.scale)?;
+                            } else {
+                                blas.linear_accumulate(w, x, &mut y, adapter.scale)?;
+                            }
+                        } else {
+                            blas.linear_typed(
+                                crate::op_contract::ExecutionPhase::Prefill,
+                                crate::backend::cuda::linear::LinearWeightRef::Bf16(w),
+                                x,
+                                &mut y,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if graph {
+                    let captured =
+                        stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    launch?;
+                    captured?.context("row gate captured no graph")?.launch()?;
+                } else {
+                    launch?;
+                }
+                let actual = stream.clone_dtoh(&y)?;
+                ensure!(
+                    actual.iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL nonfinite LoRA row output"
+                );
+                Ok(actual)
+            };
+            if name == "ff.net.0.proj.lora_A" {
+                let a = run(&heuristic, 1008, false, false, false)?;
+                let b = run(&heuristic, 1511, false, false, false)?;
+                let differences = a
+                    .iter()
+                    .zip(&b)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!("H3_ROW_CONTROL heuristic_1008_vs_1511 bit_differences={differences}");
+                ensure!(
+                    differences > 0,
+                    "row-count discriminator did not detect old heuristic"
+                );
+            }
+            for composed in [false, true].into_iter().filter(|&c| !c || accumulate) {
+                let expected = run(&fixed, total, false, true, composed)?;
+                for &chunk in &partitions {
+                    for graph in [false, true] {
+                        let actual = run(&fixed, chunk, graph, true, composed)?;
+                        let differences = actual
+                            .iter()
+                            .zip(&expected)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        println!(
+                            "H3_ROW_CELL operation={name} composed={composed} chunk={chunk} graph={graph} bit_differences={differences} elements={}",
+                            actual.len()
+                        );
+                        ensure!(
+                            differences == 0,
+                            "DEFECT row-count invariance {name} chunk={chunk} graph={graph}"
+                        );
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(runtime)?;
+        println!("H3_ROW_GATE PASS cells={cells} bit_difference_limit=0 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_CAPTURE"]
+    fn base_ffn_is_row_count_invariant() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let model = std::env::var_os("FF_MODEL")
+            .map(PathBuf::from)
+            .context("FF_MODEL missing")?;
+        let capture = std::env::var_os("FF_H3_CAPTURE")
+            .map(PathBuf::from)
+            .context("FF_H3_CAPTURE missing")?;
+        let partitions: Vec<usize> =
+            serde_json::from_slice(&fs::read(capture.join("row_partitions.json"))?)?;
+        ensure!(
+            partitions.contains(&1008)
+                && partitions.contains(&1511)
+                && partitions.iter().all(|&n| n > 0 && n <= 60_431),
+            "base row partitions outside production extents"
+        );
+        let spec = H3Spec::read(&model)?;
+        let dir = model.join("transformer");
+        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let stream = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-base-row-gate-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "base row invariance".into())),
+        )?;
+        let mut source = Source::new(&dir, &manifest);
+        let mut defects = 0;
+        let mut cells = 0;
+        for layer in [0, spec.layers / 2] {
+            for (name, output, input) in [
+                ("ff.net.0.proj", 2 * spec.ffn, spec.hidden),
+                ("ff.net.2", spec.hidden, spec.ffn),
+            ] {
+                let weight = source.tensor::<bf16>(
+                    stream,
+                    &format!("transformer_blocks.{layer}.{name}.weight"),
+                    output * input,
+                )?;
+                for rows in [40_045usize, 60_431] {
+                    for &other in &partitions {
+                        for chunk in [1008, other] {
+                            for n in [chunk, rows % chunk].into_iter().filter(|&n| n > 0) {
+                                blas.prepare_fixed(
+                                    u32::try_from(n)?,
+                                    u32::try_from(output)?,
+                                    u32::try_from(input)?,
+                                )?;
+                            }
+                        }
+                        let run = |start: usize, n: usize| -> Result<Vec<bf16>> {
+                            let host: Vec<bf16> = (start * input..(start + n) * input)
+                                .map(|i| {
+                                    bf16::from_f32(
+                                        (((i * 37 + i / input * 11) % 251) as f32 - 125.0) / 127.0,
+                                    )
+                                })
+                                .collect();
+                            let x = stream.clone_htod(&host)?;
+                            let y = stream.alloc_zeros::<bf16>(n * output)?;
+                            blas.linear_typed(
+                                crate::op_contract::ExecutionPhase::Prefill,
+                                crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(
+                                    &weight, stream, output, input,
+                                )?),
+                                matrix(&x, stream, n, input)?,
+                                &mut TensorMut(matrix(&y, stream, n, output)?),
+                            )?;
+                            let actual = stream.clone_dtoh(&y)?;
+                            ensure!(
+                                actual.iter().all(|v| v.is_finite()),
+                                "RUNNER_FAIL nonfinite base row output"
+                            );
+                            Ok(actual)
+                        };
+                        let mut buffers = [Vec::new(), Vec::new()];
+                        let mut begin = [0usize; 2];
+                        let mut end = [0usize; 2];
+                        let mut offset = 0;
+                        let mut differences = 0;
+                        while offset < rows {
+                            for (arm, chunk) in [1008, other].into_iter().enumerate() {
+                                if offset == end[arm] {
+                                    begin[arm] = offset;
+                                    end[arm] = (offset + chunk).min(rows);
+                                    buffers[arm] = run(offset + 17, end[arm] - offset)?;
+                                }
+                            }
+                            let stop = end[0].min(end[1]);
+                            let a = &buffers[0]
+                                [(offset - begin[0]) * output..(stop - begin[0]) * output];
+                            let b = &buffers[1]
+                                [(offset - begin[1]) * output..(stop - begin[1]) * output];
+                            differences += a
+                                .iter()
+                                .zip(b)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                            offset = stop;
+                        }
+                        println!(
+                            "H3_BASE_ROW_CELL layer={layer} operation={name} rows={rows} partition=1008_vs_{other} global_row_offset=17 bit_differences={differences} elements={}",
+                            rows * output
+                        );
+                        defects += usize::from(differences > 0);
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(runtime)?;
+        println!("H3_BASE_ROW_GATE cells={cells} defects={defects} bit_difference_limit=0");
+        ensure!(
+            defects == 0,
+            "DEFECT base FFN row invariance cells={defects}"
         );
         Ok(())
     }
