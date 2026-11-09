@@ -1,4 +1,4 @@
-//! Breeze-TTS-2 M0 prefill and M1 teacher-forced scores.
+//! Breeze-TTS-2 M0 prefill and M1 greedy decode.
 //! GEMM row count is 17 when `supports` is true for the logical row count.
 //! Text full-attention layers are indices where `(index + 1)` is divisible by 6.
 //! Depth head `k` reads post-norm position `k + 1`.
@@ -261,6 +261,10 @@ struct Buf {
     qkv: CudaSlice<bf16>,
     k: CudaSlice<bf16>,
     v: CudaSlice<bf16>,
+    lk: Vec<CudaSlice<bf16>>,
+    lv: Vec<CudaSlice<bf16>>,
+    dk: CudaSlice<bf16>,
+    dv: CudaSlice<bf16>,
     attn: CudaSlice<bf16>,
     audio: CudaSlice<bf16>,
     stack: CudaSlice<bf16>,
@@ -298,6 +302,14 @@ enum RopeKind {
     Skip,
 }
 
+#[derive(Clone, Copy)]
+enum KvSlot {
+    Shared,
+    Depth,
+    Layer(usize),
+}
+
+#[derive(Clone, Copy)]
 struct RopeGeom {
     rows: usize,
     q_heads: usize,
@@ -313,6 +325,7 @@ struct RopeGeom {
     v_row_stride: usize,
     eps: f32,
     kind: RopeKind,
+    slot: KvSlot,
 }
 
 struct Gemm<'a> {
@@ -360,6 +373,9 @@ struct DecPass<'a> {
     flash: &'a mut Flash,
     kind: RopeKind,
     geom: DecGeom,
+    origin: i32,
+    capacity: usize,
+    slot: KvSlot,
 }
 
 #[derive(Clone, Copy)]
@@ -519,6 +535,16 @@ fn residual(k: &Kern, a: &mut CudaSlice<bf16>, b: &CudaSlice<bf16>, n: usize) ->
     Ok(())
 }
 
+struct RopeBind<'a> {
+    qkv: &'a mut CudaSlice<bf16>,
+    cache_k: &'a mut CudaSlice<bf16>,
+    cache_v: &'a mut CudaSlice<bf16>,
+    start: &'a CudaSlice<i32>,
+    qn: &'a CudaSlice<bf16>,
+    kn: &'a CudaSlice<bf16>,
+    table: &'a CudaSlice<bf16>,
+}
+
 fn rope(
     k: &Kern,
     buf: &mut Buf,
@@ -528,6 +554,56 @@ fn rope(
     g: RopeGeom,
 ) -> Result<()> {
     copy_h2d(&k.stream, &[g.start], &mut buf.start)?;
+    match g.slot {
+        KvSlot::Shared => rope_launch(
+            k,
+            RopeBind {
+                qkv: &mut buf.qkv,
+                cache_k: &mut buf.k,
+                cache_v: &mut buf.v,
+                start: &buf.start,
+                qn,
+                kn,
+                table,
+            },
+            g,
+        ),
+        KvSlot::Depth => rope_launch(
+            k,
+            RopeBind {
+                qkv: &mut buf.qkv,
+                cache_k: &mut buf.dk,
+                cache_v: &mut buf.dv,
+                start: &buf.start,
+                qn,
+                kn,
+                table,
+            },
+            g,
+        ),
+        KvSlot::Layer(index) => {
+            let Buf {
+                qkv, lk, lv, start, ..
+            } = buf;
+            ensure!(index < lk.len() && index < lv.len(), "layer cache");
+            rope_launch(
+                k,
+                RopeBind {
+                    qkv,
+                    cache_k: &mut lk[index],
+                    cache_v: &mut lv[index],
+                    start,
+                    qn,
+                    kn,
+                    table,
+                },
+                g,
+            )
+        }
+    }
+}
+
+fn rope_launch(k: &Kern, bind: RopeBind<'_>, g: RopeGeom) -> Result<()> {
     let function = match g.kind {
         RopeKind::OnePlus => &k.rope_one_plus,
         RopeKind::Cast => &k.rope_cast,
@@ -548,13 +624,13 @@ fn rope(
     unsafe {
         k.stream
             .launch_builder(function)
-            .arg(&mut buf.qkv)
-            .arg(&mut buf.k)
-            .arg(&mut buf.v)
-            .arg(qn)
-            .arg(kn)
-            .arg(table)
-            .arg(&buf.start)
+            .arg(bind.qkv)
+            .arg(bind.cache_k)
+            .arg(bind.cache_v)
+            .arg(bind.qn)
+            .arg(bind.kn)
+            .arg(bind.table)
+            .arg(bind.start)
             .arg(&g.cache_start)
             .arg(&rows)
             .arg(&q_heads)
@@ -597,7 +673,19 @@ fn embed_tokens(
 }
 
 fn download_f32(stream: &Arc<CudaStream>, src: &CudaSlice<bf16>, n: usize) -> Result<Vec<f32>> {
-    let raw = stream.clone_dtoh(&src.slice(..n))?;
+    download_row(stream, src, 0, n)
+}
+
+fn download_row(
+    stream: &Arc<CudaStream>,
+    src: &CudaSlice<bf16>,
+    row: usize,
+    width: usize,
+) -> Result<Vec<f32>> {
+    let start = row.checked_mul(width).context("score offset")?;
+    let end = start.checked_add(width).context("score offset")?;
+    ensure!(end <= src.len(), "score row");
+    let raw = stream.clone_dtoh(&src.slice(start..end))?;
     stream.synchronize()?;
     let out: Vec<f32> = raw.iter().map(|value| value.to_f32()).collect();
     ensure!(
@@ -698,6 +786,12 @@ fn load_matrix(
 }
 
 fn alloc_buf(stream: &Arc<CudaStream>) -> Result<Buf> {
+    let mut lk = Vec::with_capacity(BB_LAYERS);
+    let mut lv = Vec::with_capacity(BB_LAYERS);
+    for _ in 0..BB_LAYERS {
+        lk.push(stream.alloc_zeros(KV_ELEMS)?);
+        lv.push(stream.alloc_zeros(KV_ELEMS)?);
+    }
     Ok(Buf {
         h: stream.alloc_zeros(H_ELEMS)?,
         n: stream.alloc_zeros(H_ELEMS)?,
@@ -708,6 +802,10 @@ fn alloc_buf(stream: &Arc<CudaStream>) -> Result<Buf> {
         qkv: stream.alloc_zeros(QKV_ELEMS)?,
         k: stream.alloc_zeros(KV_ELEMS)?,
         v: stream.alloc_zeros(KV_ELEMS)?,
+        lk,
+        lv,
+        dk: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
+        dv: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
         attn: stream.alloc_zeros(ATTN_ELEMS)?,
         audio: stream.alloc_zeros(AUDIO_ELEMS)?,
         stack: stream.alloc_zeros(STACK_ELEMS)?,
@@ -752,6 +850,8 @@ struct Attn<'a> {
     eps: f32,
     kind: RopeKind,
     start: i32,
+    capacity: usize,
+    slot: KvSlot,
     causal: bool,
     window_left: Option<usize>,
 }
@@ -776,6 +876,7 @@ struct DepthIn<'a> {
     cond: &'a [f32],
     ids: &'a [u32],
     frame: usize,
+    slot: KvSlot,
 }
 
 fn tensor_name(prefix: &str, index: usize, leaf: &str) -> String {
@@ -1189,6 +1290,7 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             input: call.hidden,
         },
     )?;
+    ensure!(call.start >= 0, "attention origin");
     rope(
         k,
         buf,
@@ -1200,8 +1302,8 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             q_heads: call.q_heads,
             kv_heads: call.kv_heads,
             dim: call.dim,
-            capacity: rows,
-            cache_start: 0,
+            capacity: call.capacity,
+            cache_start: call.start,
             start: call.start,
             q_row_stride: q_width,
             k_offset: k_off,
@@ -1210,20 +1312,37 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             v_row_stride: kv_width,
             eps: call.eps,
             kind: call.kind,
+            slot: call.slot,
         },
     )?;
     let shape = Shape {
         rows,
-        start: 0,
+        start: usize::try_from(call.start)?,
         q_heads: call.q_heads,
         kv_heads: call.kv_heads,
-        capacity: rows,
+        capacity: call.capacity,
         head_dim: call.dim,
         causal: call.causal,
         window_left: call.window_left,
     };
-    call.flash
-        .run(&buf.qkv, q_width, &buf.k, &buf.v, &mut buf.attn, shape)?;
+    match call.slot {
+        KvSlot::Shared => {
+            call.flash
+                .run(&buf.qkv, q_width, &buf.k, &buf.v, &mut buf.attn, shape)?;
+        }
+        KvSlot::Depth => {
+            call.flash
+                .run(&buf.qkv, q_width, &buf.dk, &buf.dv, &mut buf.attn, shape)?;
+        }
+        KvSlot::Layer(index) => {
+            let Buf {
+                qkv, lk, lv, attn, ..
+            } = buf;
+            ensure!(index < lk.len() && index < lv.len(), "layer cache");
+            call.flash
+                .run(qkv, q_width, &lk[index], &lv[index], attn, shape)?;
+        }
+    }
     gemm(
         &k.stream,
         blas,
@@ -1358,6 +1477,8 @@ fn text_layer(
             eps: TEXT_EPS,
             kind: RopeKind::OnePlus,
             start,
+            capacity: rows,
+            slot: KvSlot::Shared,
             causal: false,
             window_left: step.window_left,
         },
@@ -1457,7 +1578,9 @@ fn decoder_layer(k: &Kern, buf: &mut Buf, blas: &Blas, pass: DecPass<'_>) -> Res
             dim: pass.geom.dim,
             eps: pass.geom.eps,
             kind: pass.kind,
-            start: 0,
+            start: pass.origin,
+            capacity: pass.capacity,
+            slot: pass.slot,
             causal: true,
             window_left: None,
         },
@@ -1657,6 +1780,7 @@ fn depth_frame(k: &Kern, buf: &mut Buf, blas: &Blas, input: DepthIn<'_>) -> Resu
         cond,
         ids,
         frame,
+        slot,
     } = input;
     ensure!(cond.len() == BB_H && ids.len() == DP_ROWS, "depth frame");
     k.stream.memset_zeros(&mut buf.embed_ws)?;
@@ -1701,6 +1825,9 @@ fn depth_frame(k: &Kern, buf: &mut Buf, blas: &Blas, input: DepthIn<'_>) -> Resu
                 flash: &mut *flash,
                 kind: RopeKind::Skip,
                 geom,
+                origin: 0,
+                capacity: DP_ROWS,
+                slot,
             },
         )?;
     }
@@ -1765,6 +1892,200 @@ fn depth_heads(
             let src = frame * vocab;
             out[dst..dst + vocab].copy_from_slice(&part[src..src + vocab]);
         }
+    }
+    Ok(out)
+}
+
+struct ScorePass<'a> {
+    layers: &'a [DecoderLayer],
+    norm: &'a CudaSlice<bf16>,
+    lm: &'a CudaSlice<bf16>,
+    table: &'a CudaSlice<bf16>,
+    flash: &'a mut Flash,
+    rows: usize,
+    origin: i32,
+    score_row: usize,
+}
+
+struct DepthStep<'a> {
+    w: &'a Weights,
+    flash: &'a mut Flash,
+    cond: &'a [f32],
+    codes: &'a [i32],
+    frame: usize,
+    plant: bool,
+}
+
+fn upload_hidden(k: &Kern, buf: &mut Buf, src: &[f32]) -> Result<()> {
+    ensure!(
+        !src.is_empty() && src.len().is_multiple_of(BB_H),
+        "hidden rows"
+    );
+    ensure!(
+        src.iter().all(|value| value.is_finite()),
+        "non-finite hidden"
+    );
+    let host: Vec<bf16> = src.iter().copied().map(bf16::from_f32).collect();
+    copy_h2d(&k.stream, &host, &mut buf.h.slice_mut(..host.len()))
+}
+
+fn place_audio_row(k: &Kern, table: &CudaSlice<bf16>, buf: &mut Buf, codes: &[i32]) -> Result<()> {
+    ensure!(codes.len() == BOOKS, "audio row");
+    for &id in codes {
+        ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
+    }
+    copy_h2d(&k.stream, codes, &mut buf.ids.slice_mut(..BOOKS))?;
+    launch_row_sum(k, table, &buf.ids, &mut buf.audio, 1, BB_H)?;
+    k.stream
+        .memcpy_dtod(&buf.audio.slice(..BB_H), &mut buf.h.slice_mut(..BB_H))?;
+    Ok(())
+}
+
+fn clear_depth_kv(k: &Kern, buf: &mut Buf) -> Result<()> {
+    k.stream.memset_zeros(&mut buf.dk)?;
+    k.stream.memset_zeros(&mut buf.dv)?;
+    Ok(())
+}
+
+fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> Result<Vec<f32>> {
+    ensure!(pass.rows > 0 && pass.score_row < pass.rows, "score row");
+    ensure!(pass.origin >= 0, "score origin");
+    let end = usize::try_from(pass.origin)?
+        .checked_add(pass.rows)
+        .context("backbone cache")?;
+    ensure!(end <= BB_MAX, "backbone cache");
+    ensure!(pass.layers.len() == BB_LAYERS, "backbone layers");
+    set_meta(&k.stream, &mut buf.meta, pass.rows)?;
+    let geom = DecGeom {
+        rows: pass.rows,
+        hidden: BB_H,
+        intermediate: BB_I,
+        q_heads: BB_HEADS,
+        kv_heads: BB_KV,
+        dim: BB_DIM,
+        eps: BB_EPS,
+    };
+    for (index, layer) in pass.layers.iter().enumerate() {
+        decoder_layer(
+            k,
+            buf,
+            blas,
+            DecPass {
+                layer,
+                table: pass.table,
+                flash: &mut *pass.flash,
+                kind: RopeKind::Cast,
+                geom,
+                origin: pass.origin,
+                capacity: BB_MAX,
+                slot: KvSlot::Layer(index),
+            },
+        )?;
+    }
+    rms(
+        k,
+        &buf.meta,
+        Rms {
+            x: &buf.h,
+            y: &mut buf.n,
+            w: pass.norm,
+            rows: pass.rows,
+            width: BB_H,
+            mode: RmsMode::Standard,
+            eps: BB_EPS,
+        },
+    )?;
+    gemm(
+        &k.stream,
+        blas,
+        Gemm {
+            w: pass.lm,
+            x: &mut buf.n,
+            y: &mut buf.d,
+            x_off: 0,
+            y_off: 0,
+            logical: pass.rows,
+            output: BB_VOCAB,
+            input: BB_H,
+        },
+    )?;
+    download_row(&k.stream, &buf.d, pass.score_row, BB_VOCAB)
+}
+
+fn depth_input(codes: &[i32]) -> Result<[u32; DP_ROWS]> {
+    ensure!(codes.len() == BOOKS, "depth frame codes");
+    let mut row = [0i32; DP_ROWS];
+    for (book, &code) in codes.iter().take(HEAD_N).enumerate() {
+        row[book + 1] = code;
+    }
+    depth_ids(&row)
+}
+
+fn depth_head_row(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    heads: &[CudaSlice<bf16>],
+    frame: usize,
+    book: usize,
+    plant: bool,
+) -> Result<Vec<f32>> {
+    let vocab = CODEBOOK as usize;
+    let src = (frame * DP_ROWS + book + 1) * DP_H;
+    k.stream.memcpy_dtod(
+        &buf.stack.slice(src..src + DP_H),
+        &mut buf.head_in.slice_mut(..DP_H),
+    )?;
+    let which = if plant && book == 0 { 1 } else { book };
+    gemm(
+        &k.stream,
+        blas,
+        Gemm {
+            w: &heads[which],
+            x: &mut buf.head_in,
+            y: &mut buf.head_out,
+            x_off: 0,
+            y_off: 0,
+            logical: 1,
+            output: vocab,
+            input: DP_H,
+        },
+    )?;
+    download_f32(&k.stream, &buf.head_out, vocab)
+}
+
+fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Result<Vec<f32>> {
+    set_meta(&k.stream, &mut buf.meta, DP_ROWS)?;
+    let ids = depth_input(step.codes)?;
+    depth_frame(
+        k,
+        buf,
+        blas,
+        DepthIn {
+            layers: &step.w.depth,
+            norm: &step.w.depth_norm,
+            projector: &step.w.projector,
+            embed: &step.w.audio,
+            table: &k.table_depth,
+            flash: step.flash,
+            cond: step.cond,
+            ids: &ids,
+            frame: step.frame,
+            slot: KvSlot::Depth,
+        },
+    )?;
+    clear_depth_kv(k, buf)?;
+    let mut out = Vec::with_capacity(HEAD_N * (CODEBOOK as usize));
+    for book in 0..HEAD_N {
+        out.extend(depth_head_row(
+            k,
+            buf,
+            blas,
+            &step.w.heads,
+            step.frame,
+            book,
+            step.plant,
+        )?);
     }
     Ok(out)
 }
@@ -2052,6 +2373,9 @@ impl Breeze {
                     flash: &mut flash.backbone,
                     kind: RopeKind::Cast,
                     geom,
+                    origin: 0,
+                    capacity: rows,
+                    slot: KvSlot::Shared,
                 },
             )?;
         }
@@ -2130,10 +2454,134 @@ impl Breeze {
                     cond: cond_row,
                     ids: &id_rows[frame],
                     frame,
+                    slot: KvSlot::Shared,
                 },
             )?;
         }
         depth_heads(k, buf, blas, &w.heads, frames, plant_head)
+    }
+
+    /// Backbone KV is one BB_MAX cache per layer. Each depth frame uses DP_ROWS and is zeroed after the frame.
+    pub fn greedy_decode(
+        &mut self,
+        projected: &[f32],
+        cond: &[f32],
+        text_rows: usize,
+        fed: &[i32],
+        frames: &[i32],
+        plant_head: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.bound_device()?;
+        ensure!(fed.len().is_multiple_of(BOOKS), "fed codes");
+        ensure!(frames.len().is_multiple_of(BOOKS), "depth codes");
+        ensure!(cond.len().is_multiple_of(BB_H), "cond");
+        let audio_steps = fed.len() / BOOKS;
+        let depth_frames = frames.len() / BOOKS;
+        ensure!(cond.len() == depth_frames * BB_H, "cond length");
+        ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
+        ensure!(
+            audio_steps >= 1 && depth_frames >= audio_steps,
+            "decode steps"
+        );
+        ensure!(text_rows + audio_steps <= BB_MAX, "decode length");
+        ensure!(projected.len() == text_rows * BB_H, "projected length");
+        ensure!(
+            projected.iter().all(|value| value.is_finite()),
+            "non-finite projected"
+        );
+        ensure!(
+            cond.iter().all(|value| value.is_finite()),
+            "non-finite cond"
+        );
+        let Breeze {
+            ref w,
+            ref k,
+            ref mut flash,
+            ref mut buf,
+            ref blas,
+            ..
+        } = *self;
+        upload_hidden(k, buf, projected)?;
+        let mut backbone = Vec::with_capacity((audio_steps + 1) * BB_VOCAB);
+        let mut depth = Vec::with_capacity(depth_frames * HEAD_N * (CODEBOOK as usize));
+        backbone.extend(backbone_rows(
+            k,
+            buf,
+            blas,
+            ScorePass {
+                layers: &w.backbone,
+                norm: &w.backbone_norm,
+                lm: &w.lm,
+                table: &k.table_backbone,
+                flash: &mut flash.backbone,
+                rows: text_rows,
+                origin: 0,
+                score_row: text_rows - 1,
+            },
+        )?);
+        let mut fed_rows = fed.chunks(BOOKS);
+        let mut cond_rows = cond.chunks(BB_H);
+        for (frame, codes) in frames.chunks(BOOKS).enumerate() {
+            let row = cond_rows.next().context("cond row")?;
+            depth.extend(depth_step(
+                k,
+                buf,
+                blas,
+                DepthStep {
+                    w,
+                    flash: &mut flash.depth,
+                    cond: row,
+                    codes,
+                    frame,
+                    plant: plant_head,
+                },
+            )?);
+            if frame < audio_steps {
+                let fed_row = fed_rows.next().context("fed row")?;
+                place_audio_row(k, &w.audio, buf, fed_row)?;
+                let origin = i32::try_from(text_rows + frame)?;
+                backbone.extend(backbone_rows(
+                    k,
+                    buf,
+                    blas,
+                    ScorePass {
+                        layers: &w.backbone,
+                        norm: &w.backbone_norm,
+                        lm: &w.lm,
+                        table: &k.table_backbone,
+                        flash: &mut flash.backbone,
+                        rows: 1,
+                        origin,
+                        score_row: 0,
+                    },
+                )?);
+            }
+        }
+        ensure!(
+            backbone.len() == (audio_steps + 1) * BB_VOCAB,
+            "backbone scores"
+        );
+        ensure!(
+            depth.len() == depth_frames * HEAD_N * (CODEBOOK as usize),
+            "depth scores"
+        );
+        // per_layer: 2 RMS, 4 QKV/O GEMMs, 1 RoPE, 1 attention, 2 residuals, 3 MLP GEMMs, 1 SwiGLU.
+        let per_layer = 14;
+        let prefill = BB_LAYERS * per_layer + 2;
+        let step = prefill + 1;
+        let frame_launches = 2 + DP_LAYERS * per_layer + 1 + HEAD_N;
+        eprintln!(
+            "LAUNCH backbone_prefill={prefill} backbone_step={step} depth_frame={frame_launches}"
+        );
+        eprintln!(
+            "COPY backbone_row_bytes={} backbone_copies={} depth_row_bytes={} depth_copies={} depth_kv_clears={}",
+            BB_VOCAB * 4,
+            audio_steps + 1,
+            CODEBOOK as usize * 4,
+            depth_frames * HEAD_N,
+            depth_frames
+        );
+        Ok((backbone, depth))
     }
 }
 
@@ -3763,6 +4211,37 @@ mod tests {
         Ok(scores)
     }
 
+    fn greedy_scores(
+        model: &mut super::Breeze,
+        projected: &[f32],
+        hidden: &[f32],
+        frames: &[i32],
+        plant_audio_row: bool,
+        plant_head: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let fed_src = &frames[..M1_AUDIO * super::BOOKS];
+        let fed = if plant_audio_row {
+            plant_audio(fed_src)?
+        } else {
+            fed_src.to_vec()
+        };
+        let (mut backbone, mut depth) =
+            model.greedy_decode(projected, hidden, M1_TEXT, &fed, frames, plant_head)?;
+        mask_reserved(&mut backbone, super::BB_VOCAB)?;
+        mask_reserved(&mut depth, super::CODEBOOK as usize)?;
+        Ok((backbone, depth))
+    }
+
+    fn note_equiv(name: &str, decode: &[f32], prefill: &[f32]) -> Result<()> {
+        let (got, want) = finite_cells(decode, prefill)?;
+        let (max_abs, rmse) = difference(&got, &want)?;
+        println!(
+            "EQUIV tensor={name} cells={} max_abs={max_abs} rmse={rmse}",
+            got.len()
+        );
+        Ok(())
+    }
+
     fn note_id(
         tensor: &str,
         place: &str,
@@ -3831,11 +4310,15 @@ mod tests {
         println!("weight_bytes={}", model.weight_bytes);
         let projected = model.text(&prompt, super::TextPlant::Nominal)?;
         let fed = &frames[..M1_AUDIO * super::BOOKS];
-        let nominal_backbone = backbone_scores(&mut model, &projected, fed)?;
-        let planted = plant_audio(fed)?;
-        let audio_backbone = backbone_scores(&mut model, &projected, &planted)?;
-        let nominal_depth = depth_scores(&mut model, &hidden, &frames, false)?;
-        let head_depth = depth_scores(&mut model, &hidden, &frames, true)?;
+        let (nominal_backbone, nominal_depth) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, false, false)?;
+        let prefill_backbone = backbone_scores(&mut model, &projected, fed)?;
+        note_equiv("backbone_scores", &nominal_backbone, &prefill_backbone)?;
+        let prefill_depth = depth_scores(&mut model, &hidden, &frames, false)?;
+        note_equiv("depth_scores", &nominal_depth, &prefill_depth)?;
+        let (audio_backbone, _) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, true, false)?;
+        let (_, head_depth) = greedy_scores(&mut model, &projected, &hidden, &frames, false, true)?;
         let mut defect = false;
         let mut protocol = false;
         record(
