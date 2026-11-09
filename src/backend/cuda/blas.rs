@@ -1100,6 +1100,34 @@ impl Blas {
         Ok(())
     }
 
+    /// Fixed Lt plan's whole-wave work multiplier and separate split-K reduction launch count.
+    pub(crate) fn fixed_plan_cost(
+        &self,
+        shape: LinearShape,
+        describe: bool,
+    ) -> Result<(f64, usize)> {
+        self.prepare_fixed(
+            u32::try_from(shape.rows)?,
+            u32::try_from(shape.output)?,
+            u32::try_from(shape.input)?,
+        )?;
+        let plans = self.plans.borrow();
+        let plan = plans
+            .get(&(shape.rows, shape.output, shape.input, 0))
+            .context("fixed linear cost plan missing")?;
+        let waves = f64::from(plan.waves);
+        ensure!(
+            waves.is_finite() && waves > 0.0,
+            "invalid Lt wave count {waves}"
+        );
+        if describe {
+            plan.describe(shape.rows, shape.output, shape.input)?;
+        }
+        let split =
+            plan.attr(sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?;
+        Ok((waves.ceil() / waves, usize::from(split > 1)))
+    }
+
     /// Request-bound BF16 Lt plans have no measured choices or calibration files.
     pub(crate) fn prepare_request_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
         ensure!(

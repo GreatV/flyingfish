@@ -317,13 +317,64 @@ impl AdalnTable {
     }
 }
 
-/// Upper bound on rows per FFN chunk.
+/// Initial FFN chunk ceiling before weight placement.
 const FFN_CHUNK_ROWS: usize = 1024;
 
 /// Rows per FFN chunk: `rows` split evenly over `ceil(rows / FFN_CHUNK_ROWS)` chunks, so the tail chunk holds at
 /// least `chunk - (chunks - 1)` rows.
 fn ffn_chunk(rows: usize) -> usize {
     rows.div_ceil(rows.div_ceil(FFN_CHUNK_ROWS))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FfnPlan {
+    chunk: usize,
+    allocation: usize,
+    tensor_cost: f64,
+    launches: usize,
+}
+
+impl FfnPlan {
+    fn allocation(chunk: usize, ffn: usize) -> Result<usize> {
+        chunk
+            .checked_mul(ffn)
+            .and_then(|n| n.checked_mul(3 * std::mem::size_of::<bf16>()))
+            .context("FFN workspace extent overflow")
+    }
+
+    fn pair(choices: [&[Self]; 2], counts: [usize; 2], budget: usize) -> Result<[Self; 2]> {
+        let mut best = None;
+        for &main in choices[0] {
+            for &text in choices[1] {
+                let allocation = main
+                    .allocation
+                    .checked_add(text.allocation)
+                    .context("joint FFN allocation overflow")?;
+                if allocation > budget {
+                    continue;
+                }
+                let cost =
+                    main.tensor_cost * counts[0] as f64 + text.tensor_cost * counts[1] as f64;
+                ensure!(cost.is_finite() && cost >= 0.0, "invalid FFN tensor cost");
+                let launches = main
+                    .launches
+                    .checked_mul(counts[0])
+                    .and_then(|n| {
+                        text.launches
+                            .checked_mul(counts[1])
+                            .and_then(|m| n.checked_add(m))
+                    })
+                    .context("joint FFN launch count overflow")?;
+                let score = (cost, launches, allocation);
+                if best.as_ref().is_none_or(|(_, previous)| score < *previous) {
+                    best = Some(([main, text], score));
+                }
+            }
+        }
+        Ok(best
+            .context("no FFN plan fits the measured workspace budget")?
+            .0)
+    }
 }
 /// Threads per hidden-width RMSNorm row: 672 eight-element vectors of a 5376 row fit one register pass.
 const HIDDEN_NORM_THREADS: u32 = 768;
@@ -627,6 +678,9 @@ impl BlockKernels {
 pub(crate) struct BlockWork {
     rows: usize,
     rank: usize,
+    chunk: usize,
+    #[cfg(test)]
+    repeat_ffn_input: bool,
     normed: CudaSlice<bf16>,
     q_raw: CudaSlice<bf16>,
     k_raw: CudaSlice<bf16>,
@@ -650,7 +704,7 @@ impl BlockWork {
             (self.rows, 3 * r, h),
             (self.rows, r, width),
         ];
-        let chunk = ffn_chunk(self.rows);
+        let chunk = self.chunk;
         let tail = self.rows % chunk;
         for rows in [chunk, tail].into_iter().filter(|&n| n > 0) {
             shapes.push((rows, 2 * f, h));
@@ -668,6 +722,111 @@ impl BlockWork {
         Ok(())
     }
 
+    fn ffn_cost(
+        &self,
+        blas: &Blas,
+        spec: &H3Spec,
+        chunk: usize,
+        describe: bool,
+    ) -> Result<FfnPlan> {
+        let mut plan = FfnPlan {
+            chunk,
+            allocation: if chunk == self.chunk {
+                0
+            } else {
+                FfnPlan::allocation(chunk, spec.ffn)?
+            },
+            tensor_cost: 0.0,
+            launches: 0,
+        };
+        for (rows, count) in [(chunk, self.rows / chunk), (self.rows % chunk, 1)] {
+            if rows == 0 || count == 0 {
+                continue;
+            }
+            let mut launches = 7;
+            for (output, input) in [
+                (2 * spec.ffn, spec.hidden),
+                (spec.hidden, spec.ffn),
+                (self.rank, spec.hidden),
+                (self.rank, spec.ffn),
+            ] {
+                let (wave_cost, reduction) = blas.fixed_plan_cost(
+                    crate::backend::setup::LinearShape {
+                        rows,
+                        output,
+                        input,
+                    },
+                    describe,
+                )?;
+                plan.tensor_cost +=
+                    2.0 * rows as f64 * output as f64 * input as f64 * count as f64 * wave_cost;
+                launches += reduction;
+            }
+            plan.launches += count * launches;
+        }
+        Ok(plan)
+    }
+
+    fn ffn_choices(&self, blas: &Blas, spec: &H3Spec, budget: usize) -> Result<Vec<FfnPlan>> {
+        if self.rows <= FFN_CHUNK_ROWS {
+            return Ok(vec![FfnPlan {
+                chunk: self.chunk,
+                allocation: 0,
+                tensor_cost: 0.0,
+                launches: 0,
+            }]);
+        }
+        let mut choices = Vec::new();
+        for chunks in 1..=self.rows.div_ceil(self.chunk) {
+            let chunk = self.rows.div_ceil(chunks);
+            let tail = self.rows % chunk;
+            if tail > 0 && tail <= crate::linear_plan::MAX_SKINNY_ROWS {
+                continue;
+            }
+            if chunk != self.chunk && FfnPlan::allocation(chunk, spec.ffn)? > budget {
+                continue;
+            }
+            choices.push(self.ffn_cost(blas, spec, chunk, false)?);
+        }
+        ensure!(
+            choices
+                .iter()
+                .any(|p| p.chunk == self.chunk && p.allocation == 0),
+            "existing FFN plan missing from workspace choices"
+        );
+        Ok(choices)
+    }
+
+    fn bind_ffn(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        spec: &H3Spec,
+        plan: FfnPlan,
+    ) -> Result<()> {
+        let allocation = if plan.chunk == self.chunk {
+            0
+        } else {
+            FfnPlan::allocation(plan.chunk, spec.ffn)?
+        };
+        ensure!(
+            plan.chunk >= self.chunk && plan.chunk <= self.rows && plan.allocation == allocation,
+            "FFN binding differs from the counted allocation"
+        );
+        if plan.chunk != self.chunk {
+            let hidden = s.alloc_zeros::<bf16>(plan.chunk * 2 * spec.ffn)?;
+            let gated = s.alloc_zeros::<bf16>(plan.chunk * spec.ffn)?;
+            self.hidden = hidden;
+            self.gated = gated;
+            self.chunk = plan.chunk;
+        }
+        self.prepare(blas, spec)?;
+        if self.rows > FFN_CHUNK_ROWS {
+            self.ffn_cost(blas, spec, self.chunk, true)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
@@ -681,6 +840,9 @@ impl BlockWork {
         Ok(Self {
             rows,
             rank,
+            chunk,
+            #[cfg(test)]
+            repeat_ffn_input: false,
             normed: s.alloc_zeros::<bf16>(rows * spec.hidden)?,
             q_raw: attention()?,
             k_raw: attention()?,
@@ -1045,14 +1207,21 @@ pub(crate) fn block_forward(
     if modulation.is_some() {
         modulate(normed, 3, 4)?;
     }
-    let chunk = ffn_chunk(rows);
+    let chunk = work.chunk;
     for start in (0..rows).step_by(chunk) {
         let n = chunk.min(rows - start);
+        let input_start = start;
+        #[cfg(test)]
+        let input_start = if work.repeat_ffn_input {
+            0
+        } else {
+            input_start
+        };
         base(
             FF_IN,
             Operand {
                 buffer: &work.normed,
-                offset: start * h,
+                offset: input_start * h,
                 width: h,
             },
             Operand {
@@ -1067,7 +1236,7 @@ pub(crate) fn block_forward(
             r,
             Operand {
                 buffer: &work.normed,
-                offset: start * h,
+                offset: input_start * h,
                 width: h,
             },
             (&w.in_a, &w.in_b),
@@ -1563,9 +1732,9 @@ impl Dit {
             vector(&context[1], s)?,
             LinearBiasMode::BeforeOutputRound,
         )?;
-        let work = BlockWork::new(s, spec, r, ranges.rows)?;
+        let mut work = BlockWork::new(s, spec, r, ranges.rows)?;
         work.prepare(blas, spec)?;
-        let text_work = BlockWork::new(s, spec, r, ranges.text)?;
+        let mut text_work = BlockWork::new(s, spec, r, ranges.text)?;
         text_work.prepare(blas, spec)?;
         let flash = Flash::new(
             s.clone(),
@@ -1633,6 +1802,52 @@ impl Dit {
                 None => BlockWeights::resident(s, spec, r, &name, &mut base, &mut lora)?,
             });
         }
+        let (free, total) = d.ctx.mem_get_info()?;
+        let reserve = (total / 16)
+            .checked_add(sizing.transient)
+            .context("FFN live reserve overflow")?;
+        let budget = d.workspace_budget(free, free, reserve)?;
+        let main_choices = work.ffn_choices(blas, spec, budget)?;
+        let text_choices = text_work.ffn_choices(blas, spec, budget)?;
+        let chosen = FfnPlan::pair(
+            [&main_choices, &text_choices],
+            [spec.layers, spec.refiner_layers],
+            budget,
+        )?;
+        let previous = [
+            *main_choices
+                .iter()
+                .find(|p| p.chunk == work.chunk)
+                .context("main FFN baseline missing")?,
+            *text_choices
+                .iter()
+                .find(|p| p.chunk == text_work.chunk)
+                .context("refiner FFN baseline missing")?,
+        ];
+        for work in [&work, &text_work] {
+            if work.rows > FFN_CHUNK_ROWS {
+                work.ffn_cost(blas, spec, work.chunk, true)?;
+            }
+        }
+        let description = |work: &BlockWork, plan: FfnPlan, previous: FfnPlan| {
+            serde_json::json!({
+                "rows":work.rows,"previous_chunk":work.chunk,"chunk":plan.chunk,
+                "chunks":work.rows.div_ceil(plan.chunk),"tail":work.rows%plan.chunk,
+                "new_allocation_bytes":plan.allocation,"estimated_tensor_cost":plan.tensor_cost,
+                "estimated_launches_per_block":plan.launches,
+                "previous_tensor_cost":previous.tensor_cost,"previous_launches_per_block":previous.launches
+            })
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_ffn_plan":{
+                "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
+                "peak_additional_bytes":chosen[0].allocation+chosen[1].allocation,
+                "main":description(&work,chosen[0],previous[0]),"refiner":description(&text_work,chosen[1],previous[1])
+            }})
+        );
+        work.bind_ffn(s, blas, spec, chosen[0])?;
+        text_work.bind_ffn(s, blas, spec, chosen[1])?;
         let vision = cubin::module(s.context(), "vision_ops")?;
         Ok(Self {
             ranges,
@@ -2573,10 +2788,9 @@ mod tests {
     use safetensors::SafeTensors;
     use std::{fs, rc::Rc};
 
-    /// The production (60,431) and small (40,045) cell rows and short multiples: every FFN chunk is within
-    /// `FFN_CHUNK_ROWS` and no tail falls in the skinny-row class, which has no frozen LoRA GEMM choice.
+    /// Initial chunks avoid skinny tails; expanded plans include allocation overlap and the refiner budget.
     #[test]
-    fn ffn_chunks_leave_no_skinny_tail() {
+    fn ffn_chunks_leave_no_skinny_tail() -> Result<()> {
         for rows in [60_431, 40_045, 1_025, 2_049, 3_073, 1_024, 300] {
             let chunk = ffn_chunk(rows);
             let tail = rows % chunk;
@@ -2586,6 +2800,61 @@ mod tests {
                 "rows={rows} chunk={chunk} tail={tail}"
             );
         }
+        let baseline = FfnPlan {
+            chunk: 1_002,
+            allocation: 0,
+            tensor_cost: 80.0,
+            launches: 280,
+        };
+        let efficient = FfnPlan {
+            chunk: 6_675,
+            allocation: FfnPlan::allocation(6_675, 14_336)?,
+            tensor_cost: 54.0,
+            launches: 42,
+        };
+        let larger = FfnPlan {
+            chunk: 8_009,
+            allocation: FfnPlan::allocation(8_009, 14_336)?,
+            tensor_cost: 55.0,
+            launches: 35,
+        };
+        let text = FfnPlan {
+            chunk: 664,
+            tensor_cost: 2.0,
+            launches: 14,
+            ..baseline
+        };
+        let text_full = FfnPlan {
+            chunk: 1_327,
+            allocation: FfnPlan::allocation(1_327, 14_336)?,
+            tensor_cost: 2.0,
+            launches: 7,
+        };
+        let choices = [&[baseline, efficient, larger][..], &[text, text_full][..]];
+        let full = efficient.allocation + text_full.allocation;
+        let selected = FfnPlan::pair(choices, [50, 2], full)?;
+        assert_eq!([selected[0].chunk, selected[1].chunk], [6_675, 1_327]);
+        let constrained = FfnPlan::pair(choices, [50, 2], full - 1)?;
+        assert_eq!([constrained[0].chunk, constrained[1].chunk], [6_675, 664]);
+        let zero = FfnPlan::pair(choices, [50, 2], 0)?;
+        assert_eq!([zero[0].chunk, zero[1].chunk], [1_002, 664]);
+        assert!(FfnPlan::allocation(usize::MAX, 2).is_err());
+        assert!(FfnPlan::pair([&[efficient], &[text_full]], [50, 2], full - 1).is_err());
+        assert!(
+            FfnPlan::pair(
+                [
+                    &[FfnPlan {
+                        allocation: usize::MAX,
+                        ..baseline
+                    }],
+                    &[text_full]
+                ],
+                [50, 2],
+                usize::MAX,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     /// The small (40,045) and production (60,431) cell rows fit every launch's index type; the 1024x1792 canvas at
@@ -3640,7 +3909,7 @@ mod tests {
     /// conditioning rows are the captured FP32 VAE-encoder latents, the form under which the frozen keyframe cells
     /// are 0. Every step in `FF_H3_STEPS` (each held by `FF_H3_REPLAY`): the native velocity of the generated video
     /// rows and of the audio rows on the run's teacher-forced inputs, within the frozen `{FF_H3_CELL}.step{k}.*`
-    /// thresholds; control: text rows rotated by one must leave a threshold.
+    /// thresholds; chunked controls repeat FFN input row 0, and single-chunk controls rotate text rows by one.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_REPLAY (the replay the frozen step thresholds were measured against), FF_H3_THRESHOLDS, FF_H3_CELL, FF_H3_PLACEMENT, FF_H3_STEPS"]
     fn dit_steps_match_the_fp32_replay() -> Result<()> {
@@ -3765,7 +4034,11 @@ mod tests {
             let audio = s.clone_htod(&to_f32("audio_hidden_states")?)?;
             let row_pairs = s.clone_htod(&adaln_plan.row_pairs[k])?;
             let row_timesteps = s.clone_htod(&adaln_plan.row_timesteps[k])?;
-            let mut evaluate = |text: &CudaSlice<bf16>| -> Result<[[f64; 3]; 2]> {
+            let chunked_control = dit.work.chunk < dit.work.rows;
+            let mut evaluate = |text: &CudaSlice<bf16>,
+                                repeat_ffn_input: bool|
+             -> Result<[[f64; 3]; 2]> {
+                dit.work.repeat_ffn_input = repeat_ffn_input;
                 dit.step(
                     &context,
                     &table,
@@ -3802,7 +4075,7 @@ mod tests {
                     distance(&audio_candidate, &audio_reference),
                 ])
             };
-            let [d_video, d_audio] = evaluate(&text)?;
+            let [d_video, d_audio] = evaluate(&text, false)?;
             let video_threshold = &thresholds[format!("{cell}.step{k}.noise_pred")];
             let audio_threshold = &thresholds[format!("{cell}.step{k}.audio_noise_pred")];
             let verdict = [
@@ -3816,17 +4089,20 @@ mod tests {
                 defects.push(k);
             }
             if k == steps[0] {
-                let [c_video, c_audio] = evaluate(&rotated)?;
-                println!("H3_DIT step{k} rotated-text control video={c_video:?} audio={c_audio:?}");
+                let control_text = if chunked_control { &text } else { &rotated };
+                let kind = if chunked_control {
+                    "wrong-ffn-input-offset"
+                } else {
+                    "rotated-text"
+                };
+                let [c_video, c_audio] = evaluate(control_text, chunked_control)?;
+                println!("H3_DIT step{k} {kind} control video={c_video:?} audio={c_audio:?}");
                 control_failed =
                     !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?;
             }
         }
         fs::remove_dir(&runtime)?;
-        ensure!(
-            control_failed,
-            "rotated-text control stayed within the thresholds"
-        );
+        ensure!(control_failed, "DiT control stayed within the thresholds");
         ensure!(
             defects.is_empty(),
             "H3_DIT_GATE DEFECT cell={cell} steps outside the frozen thresholds: {defects:?} of {steps:?}"
