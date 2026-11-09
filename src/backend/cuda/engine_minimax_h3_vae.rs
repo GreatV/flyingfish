@@ -764,6 +764,7 @@ impl TileWork {
                 Score {
                     scale: (spec.head_dim as f32).sqrt().recip(),
                     window_left: None,
+                    window_right: None,
                 },
                 tokens,
             )?,

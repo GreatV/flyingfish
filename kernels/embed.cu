@@ -36,6 +36,30 @@ extern "C" __global__ void embed(const __nv_bfloat16* w, const uint32_t* ids,
     if (i < rows * dim) y[i] = w[(uint64_t)ids[i / dim] * dim + i % dim];
 }
 
+// ids are [rows, books]. out[row, d] is one bf16 of the f32 sum of books rows.
+extern "C" __global__ void embed_rows_sum(const __nv_bfloat16* table, const int32_t* ids,
+                                          __nv_bfloat16* out, int rows, int books, int vocab,
+                                          int dim) {
+    if (rows < 0 || books < 1 || vocab < 1 || dim < 1 || !table || !ids || !out) {
+        __trap();
+        return;
+    }
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * dim) return;
+    const int row = i / dim;
+    const int col = i % dim;
+    float sum = 0.0f;
+    for (int book = 0; book < books; ++book) {
+        const int id = ids[(size_t)row * books + book];
+        if ((unsigned)id >= (unsigned)vocab) {
+            __trap();
+            return;
+        }
+        sum += __bfloat162float(table[((size_t)id + (size_t)book * (unsigned)vocab) * dim + col]);
+    }
+    out[i] = __float2bfloat16_rn(sum);
+}
+
 extern "C" __global__ void embed_scale_broadcast(const __nv_bfloat16* w,
     const uint32_t* ids, const __nv_bfloat16* initial,
     __nv_bfloat16* embedded, __nv_bfloat16* broadcast, int rows, int dim, float scale,

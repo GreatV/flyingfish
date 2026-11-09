@@ -1814,6 +1814,7 @@ impl Runtime {
                             Score {
                                 scale: 1.0,
                                 window_left: layout.sliding_window.map(|window| window as usize),
+                                window_right: None,
                             }
                         } else {
                             Score::from_tokens(

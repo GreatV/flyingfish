@@ -931,7 +931,8 @@ using A = float __attribute__((ext_vector_type(8)));
 // D128 reuses K storage for scores and keeps two BF16 probability planes.
 template<int D, int MODE, bool EXPLICIT = false, bool PARTIAL = false>
 __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
-    float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0, uint32_t keys = 0) {
+    float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0, uint32_t keys = 0,
+    uint32_t right = 0) {
   if (p.position) {
     const int start = *p.position;
     if (start < 0) __trap();
@@ -989,7 +990,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
     const auto store_score = [&](int row, int column, float value) {
       const uint32_t key = base+column, query = p.start+query_base+row;
       const bool visible = query_base+row < p.rows && key < end &&
-          (MODE == 6 ? key+extent >= query && key <= query+extent :
+          (MODE == 6 ? key+extent >= query && key <= query+right :
               (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
               (MODE != 3 || query-key <= extent));
       score_memory[row*BK+column] = visible ? value*(EXPLICIT ? scale : (D == 256 ? 0.0625f : SCALE)) : -INFINITY;
@@ -1111,7 +1112,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
 }
 }
 extern "C" __global__ void attention_prefill_d256(prefill::Problem p) { prefill::run<256,0>(p,0); }
-extern "C" __global__ void attention_prefill_d256_symmetric(prefill::Problem p, uint32_t keys, uint32_t radius, float scale) { prefill::run<256,6,true>(p,radius,scale,nullptr,1,0,nullptr,0,keys); }
+extern "C" __global__ void attention_prefill_d256_symmetric(prefill::Problem p, uint32_t keys, uint32_t left, uint32_t right, float scale) { prefill::run<256,6,true>(p,left,scale,nullptr,1,0,keys,right); }
 extern "C" __global__ void attention_prefill_d256_window(prefill::Problem p, uint32_t window, float scale) { prefill::run<256,3,true>(p,window,scale); }
 extern "C" __global__ void attention_prefill_d512(prefill::Problem p, float scale) { prefill::run<512,0,true>(p,0,scale); }
 extern "C" __global__ void attention_prefill_d512_bidirectional(prefill::Problem p, uint32_t keys, float scale) { prefill::run<512,1,true>(p,keys,scale); }

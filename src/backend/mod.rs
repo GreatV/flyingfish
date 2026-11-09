@@ -38,6 +38,8 @@ pub use cuda::engine::vision_runtime::{
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
 #[cfg(feature = "cuda")]
+pub use cuda::engine_breeze::{Breeze, Positions, TextPlant};
+#[cfg(feature = "cuda")]
 pub use cuda::engine_music3_syn::Music3Syn;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use cuda::hc::{HcBinding, HcLayerWeights, HcRuntime, HcSublayerWeights};
