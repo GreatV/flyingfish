@@ -542,6 +542,15 @@ impl JointPlan {
     }
 }
 
+/// The epilogue rows a forced logits-head cell consumes.
+pub struct ForcedLogits<'a> {
+    pub fields_all: &'a [bf16],
+    pub routed: &'a [bf16],
+    pub lexical: &'a [bf16],
+    pub qvecs: &'a [bf16],
+    pub global: &'a [bf16],
+}
+
 /// The scored-stage outputs at the frozen cell extents.
 pub struct JointStages {
     /// memory_projection row 0.
@@ -1511,6 +1520,92 @@ impl JointRun<'_> {
             &w.field_norm_b,
         )?;
         let fields_all = self.read(&plan.small)?;
+        let logits = self.score_options(plan, fixture)?;
+
+        let count_last = fixture.questions[nq - 1].option_spans.len();
+        Ok(JointStages {
+            memory_row0: memory_all[..WIDTH].iter().map(|v| v.to_f32()).collect(),
+            question_proj_row0: base_fields[..WIDTH].iter().map(|v| v.to_f32()).collect(),
+            option_question_last_row0: oq_proj[(nq - 1) * WIDTH..nq * WIDTH]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            option_context_last_row0: ctx_proj
+                [(no - count_last) * WIDTH..(no - count_last + 1) * WIDTH]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            option_lexical_last_row0: lex_proj
+                [(no - count_last) * WIDTH..(no - count_last + 1) * WIDTH]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            global: global.iter().map(|v| v.to_f32()).collect(),
+            routing: [routing0, routing1],
+            decoder,
+            fields_row0: fields_all[..WIDTH].iter().map(|v| v.to_f32()).collect(),
+            logits,
+            hidden_norm_full,
+        })
+    }
+
+    /// The hidden_norm stage on caller rows (forced common-input cell).
+    pub fn hidden_norm(&self, plan: &mut JointPlan, rows: &[bf16]) -> Result<Vec<f32>> {
+        ensure!(rows.len() == plan.seq * 4096, "hidden_norm extent");
+        self.upload(rows, &mut plan.hidden_src)?;
+        self.layer_norm(
+            &plan.hidden_src,
+            &mut plan.normed,
+            plan.seq,
+            4096,
+            &self.w.hidden_norm_w,
+            &self.w.hidden_norm_b,
+        )?;
+        Ok(self
+            .read(&plan.normed)?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect())
+    }
+
+    /// The routing pair on caller-supplied rows (forced common-input cells):
+    /// both layers over the raw projected memory.
+    pub fn forced_routing(
+        &self,
+        plan: &mut JointPlan,
+        queries: &[bf16],
+        memory: &[bf16],
+    ) -> Result<[Vec<f32>; 2]> {
+        ensure!(
+            queries.len() == plan.options * WIDTH && memory.len() == plan.seq * WIDTH,
+            "forced routing extent"
+        );
+        self.upload(memory, &mut plan.memory)?;
+        self.upload(queries, &mut plan.routing[0])?;
+        self.routing_layer(plan, 0, 0)?;
+        let r0: Vec<f32> = self
+            .read(&plan.routing[1])?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        self.routing_layer(plan, 1, 1)?;
+        let r1: Vec<f32> = self
+            .read(&plan.routing[0])?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        Ok([r0, r1])
+    }
+
+    /// The scoring epilogue from the final fields and routed options in
+    /// `plan.small` / `plan.routing[0]` with the fixture's question layout:
+    /// option_norm, anchors, priors, cosines, features, residual scorer and
+    /// the per-question logits.
+    fn score_options(&self, plan: &mut JointPlan, fixture: &JointFixture) -> Result<Vec<Vec<f32>>> {
+        let nq = plan.questions;
+        let no = plan.options;
+        let w = &self.w;
+        let fields_all = self.read(&plan.small)?;
         self.layer_norm(
             &plan.routing[0],
             &mut plan.small2,
@@ -1522,8 +1617,7 @@ impl JointRun<'_> {
         let options_normed = self.read(&plan.small2)?;
 
         let qvecs = self.read(&plan.qvecs)?;
-        let global_hidden: Vec<bf16> =
-            self.read(&plan.normed)?[(seq - 1) * 4096..seq * 4096].to_vec();
+        let global_hidden: Vec<bf16> = self.read(&plan.global_row)?;
         let lexical_all = self.read(&plan.lex)?;
 
         let mut features: Vec<bf16> = Vec::with_capacity(no * 4 * WIDTH);
@@ -1614,80 +1708,39 @@ impl JointRun<'_> {
             logits.push(q_logits);
             i += count;
         }
-
-        let count_last = fixture.questions[nq - 1].option_spans.len();
-        Ok(JointStages {
-            memory_row0: memory_all[..WIDTH].iter().map(|v| v.to_f32()).collect(),
-            question_proj_row0: base_fields[..WIDTH].iter().map(|v| v.to_f32()).collect(),
-            option_question_last_row0: oq_proj[(nq - 1) * WIDTH..nq * WIDTH]
-                .iter()
-                .map(|v| v.to_f32())
-                .collect(),
-            option_context_last_row0: ctx_proj
-                [(no - count_last) * WIDTH..(no - count_last + 1) * WIDTH]
-                .iter()
-                .map(|v| v.to_f32())
-                .collect(),
-            option_lexical_last_row0: lex_proj
-                [(no - count_last) * WIDTH..(no - count_last + 1) * WIDTH]
-                .iter()
-                .map(|v| v.to_f32())
-                .collect(),
-            global: global.iter().map(|v| v.to_f32()).collect(),
-            routing: [routing0, routing1],
-            decoder,
-            fields_row0: fields_all[..WIDTH].iter().map(|v| v.to_f32()).collect(),
-            logits,
-            hidden_norm_full,
-        })
+        Ok(logits)
     }
 
-    /// The hidden_norm stage on caller rows (forced common-input cell).
-    pub fn hidden_norm(&self, plan: &mut JointPlan, rows: &[bf16]) -> Result<Vec<f32>> {
-        ensure!(rows.len() == plan.seq * 4096, "hidden_norm extent");
-        self.upload(rows, &mut plan.hidden_src)?;
-        self.layer_norm(
-            &plan.hidden_src,
-            &mut plan.normed,
-            plan.seq,
-            4096,
-            &self.w.hidden_norm_w,
-            &self.w.hidden_norm_b,
-        )?;
-        Ok(self
-            .read(&plan.normed)?
-            .iter()
-            .map(|v| v.to_f32())
-            .collect())
-    }
-
-    /// The routing pair on caller-supplied rows (forced common-input cells):
-    /// both layers over the raw projected memory.
-    pub fn forced_routing(
+    /// The scoring epilogue on caller-supplied rows (forced common-input
+    /// cell): the reference's own fields, routed options, lexical means,
+    /// question vectors and global row.
+    pub fn forced_logits(
         &self,
         plan: &mut JointPlan,
-        queries: &[bf16],
-        memory: &[bf16],
-    ) -> Result<[Vec<f32>; 2]> {
+        fixture: &JointFixture,
+        rows: ForcedLogits<'_>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let ForcedLogits {
+            fields_all,
+            routed,
+            lexical,
+            qvecs,
+            global,
+        } = rows;
         ensure!(
-            queries.len() == plan.options * WIDTH && memory.len() == plan.seq * WIDTH,
-            "forced routing extent"
+            fields_all.len() == plan.questions * WIDTH
+                && routed.len() == plan.options * WIDTH
+                && lexical.len() == plan.options * 4096
+                && qvecs.len() == plan.questions * 4096
+                && global.len() == 4096,
+            "forced logits extent"
         );
-        self.upload(memory, &mut plan.memory)?;
-        self.upload(queries, &mut plan.routing[0])?;
-        self.routing_layer(plan, 0, 0)?;
-        let r0: Vec<f32> = self
-            .read(&plan.routing[1])?
-            .iter()
-            .map(|v| v.to_f32())
-            .collect();
-        self.routing_layer(plan, 1, 1)?;
-        let r1: Vec<f32> = self
-            .read(&plan.routing[0])?
-            .iter()
-            .map(|v| v.to_f32())
-            .collect();
-        Ok([r0, r1])
+        self.upload(fields_all, &mut plan.small)?;
+        self.upload(routed, &mut plan.routing[0])?;
+        self.upload(lexical, &mut plan.lex)?;
+        self.upload(qvecs, &mut plan.qvecs)?;
+        self.upload(global, &mut plan.global_row)?;
+        self.score_options(plan, fixture)
     }
 
     /// One decoder layer on caller-supplied rows (forced common-input cells).

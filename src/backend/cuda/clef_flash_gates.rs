@@ -804,6 +804,57 @@ mod gates {
 
         // the loaded weights and restored after each planted run.
 
+        // Corrected q2 floor and forced logits-head cells (v4 freeze).
+        let taus_v4_path =
+            std::env::var("FF_CLEF_JOINT_TAUS_V4").context("FF_CLEF_JOINT_TAUS_V4")?;
+        let taus_v4: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(taus_v4_path)?)?;
+        let arm_dir =
+            PathBuf::from(std::env::var("FF_CLEF_JOINT_ARM").context("FF_CLEF_JOINT_ARM")?);
+        let epilogue_bytes = std::fs::read(arm_dir.join("epilogue_inputs.safetensors"))?;
+        let epilogue = SafeTensors::deserialize(&epilogue_bytes)?;
+        let row = |name: &str| -> Result<Vec<bf16>> {
+            let t = epilogue.tensor(name)?;
+            ensure!(t.dtype() == safetensors::Dtype::BF16, "{name} not BF16");
+            Ok(t.data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect())
+        };
+        let logits_arm_bytes = std::fs::read(arm_dir.join("logits_bf16.safetensors"))?;
+        let logits_arm = SafeTensors::deserialize(&logits_arm_bytes)?;
+        let forced_logits = engine.joint_forced_logits(
+            &mut plan,
+            &fixture,
+            crate::backend::cuda::joint_schema::ForcedLogits {
+                fields_all: &row("fields_all")?,
+                routed: &row("routed")?,
+                lexical: &row("lexical")?,
+                qvecs: &row("qvecs")?,
+                global: &row("global")?,
+            },
+        )?;
+        for (index, question) in forced_logits.iter().enumerate() {
+            joint_cell(
+                &mut failures,
+                &format!("logits_head_forced_q{index}"),
+                question,
+                &tensor_f32(&logits_arm, &format!("logits_q{index}"))?,
+                joint_tau(&taus_v4, &format!("logits_head_forced_q{index}"))?,
+                true,
+            )?;
+        }
+        joint_cell(
+            &mut failures,
+            "logits_q2_v4",
+            &stages.logits[2],
+            &tensor_f32(&logits_arm, "logits_q2")?,
+            joint_tau(&taus_v4, "logits_q2_v4")?,
+            true,
+        )?;
+
         // logits family: residual_scorer.0 <- option_question_projection.
         {
             let saved = {

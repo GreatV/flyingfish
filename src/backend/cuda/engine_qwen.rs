@@ -7862,6 +7862,26 @@ impl Engine {
         run.forced_decoder(plan, layer, fields, memory)
     }
 
+    /// The scoring epilogue on caller rows (forced common-input cell).
+    pub fn joint_forced_logits(
+        &self,
+        plan: &mut crate::backend::cuda::joint_schema::JointPlan,
+        fixture: &crate::backend::cuda::joint_schema::JointFixture,
+        rows: crate::backend::cuda::joint_schema::ForcedLogits<'_>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let q = self.qwen.as_ref().context("qwen runtime missing")?;
+        let weights = q.joint.as_ref().context("joint head weights not loaded")?;
+        let ops = crate::backend::cuda::joint_schema::JointOps::new(&self.device.ctx)?;
+        let run = crate::backend::cuda::joint_schema::JointRun::new(
+            &self.device.stream,
+            &self.blas,
+            &q.common,
+            &ops,
+            weights,
+        );
+        run.forced_logits(plan, fixture, rows)
+    }
+
     /// The joint weights for test plants.
     #[cfg(test)]
     pub fn joint_plant_handles(
