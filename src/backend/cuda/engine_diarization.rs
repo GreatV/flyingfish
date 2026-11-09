@@ -798,29 +798,40 @@ impl Diarization {
     fn embed_all_features(&mut self, features: &[f32], rows: u32) -> Result<()> {
         let mel_bins = self.spec.mel.mel_bins as usize;
         let width = (self.spec.factor as usize) * mel_bins;
-        let count = (rows as usize) * width;
+        let hidden = self.spec.hidden as usize;
+        let total_rows = rows as usize;
+        let count = total_rows * width;
         ensure!(features.len() == count, "diarization feature extent");
         ensure!(
-            (rows as usize) * (self.spec.hidden as usize) <= self.workspace.input_embeds.len(),
+            total_rows * hidden <= self.workspace.input_embeds.len(),
             "diarization input embedding extent"
         );
+        if rows == 0 {
+            self.calls[0] += 1;
+            return Ok(());
+        }
         self.stream
             .memcpy_htod(features, &mut self.workspace.features.slice_mut(..count))?;
-        let input = view(
-            &self.workspace.features,
-            &self.stream,
-            0,
-            [rows, width as u32],
-            [width as u64, 1],
-        )?;
-        let destination = view(
-            &self.workspace.input_embeds,
-            &self.stream,
-            0,
-            [rows, self.spec.hidden],
-            [u64::from(self.spec.hidden), 1],
-        )?;
-        self.apply_linear(input, &self.embedding, destination)?;
+        let tile_rows = (self.spec.offline.frames + self.spec.offline.right) as usize;
+        for tile_start in (0..total_rows).step_by(tile_rows) {
+            let tile = tile_rows.min(total_rows - tile_start);
+            let tile_u32 = u32::try_from(tile)?;
+            let input = view(
+                &self.workspace.features,
+                &self.stream,
+                tile_start * width,
+                [tile_u32, width as u32],
+                [width as u64, 1],
+            )?;
+            let destination = view(
+                &self.workspace.input_embeds,
+                &self.stream,
+                tile_start * hidden,
+                [tile_u32, self.spec.hidden],
+                [u64::from(self.spec.hidden), 1],
+            )?;
+            self.apply_linear(input, &self.embedding, destination)?;
+        }
         self.calls[0] += 1;
         Ok(())
     }
@@ -2132,6 +2143,18 @@ mod tests {
                 .chain(&long_logits)
                 .all(|value| value.is_finite()),
             "diarization long recording produced non-finite logits"
+        );
+        let mut max_abs = 0f64;
+        let mut bit_count = 0u64;
+        for (short, long) in short_logits[..first_window]
+            .iter()
+            .zip(&long_logits[..first_window])
+        {
+            max_abs = max_abs.max((f64::from(*short) - f64::from(*long)).abs());
+            bit_count += u64::from((short.to_bits() ^ long.to_bits()).count_ones());
+        }
+        println!(
+            "DIARIZATION_LONG_RECORDING_CELL cell=first_window/logits max_abs={max_abs:e} bit_count={bit_count}"
         );
         for (index, (short, long)) in short_logits[..first_window]
             .iter()
