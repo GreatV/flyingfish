@@ -14,6 +14,216 @@ use anyhow::{Context, Result, ensure};
 use half::f16;
 use std::{rc::Rc, sync::Arc};
 
+pub struct TriangleVoxels {
+    pub sites: SparseSites,
+    pub face_counts: Vec<u64>,
+    pub voxel_offsets: Vec<u64>,
+    pub voxel_faces: Vec<u32>,
+}
+
+pub fn triangle_voxels(
+    d: &Device,
+    mesh: &SparseMesh,
+    resolution: u32,
+    pad: u32,
+    capacity: usize,
+    budget: [usize; 2],
+) -> Result<TriangleVoxels> {
+    ensure!(
+        resolution > 0
+            && resolution <= 2048
+            && pad < resolution.div_ceil(2)
+            && !mesh.vertices.is_empty()
+            && mesh.vertices.len().is_multiple_of(3)
+            && !mesh.faces.is_empty()
+            && mesh.faces.len().is_multiple_of(3)
+            && mesh.vertices.iter().all(|v| v.is_finite())
+            && mesh
+                .faces
+                .iter()
+                .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+        "invalid triangle voxelization geometry"
+    );
+    let faces = mesh.faces.len() / 3;
+    let face_count = u32::try_from(faces)?;
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for p in mesh.vertices.as_chunks::<3>().0 {
+        for a in 0..3 {
+            lo[a] = lo[a].min(p[a]);
+            hi[a] = hi[a].max(p[a]);
+        }
+    }
+    let lo = lo.map(|v| v - 1e-6);
+    let hi = hi.map(|v| v + 1e-6);
+    let center: [f32; 3] = std::array::from_fn(|a| (lo[a] + hi[a]) / 2.0);
+    let extent = (0..3).map(|a| hi[a] - lo[a]).fold(0f32, f32::max);
+    let scale = extent.recip() * (resolution as f32 - (2 * pad) as f32 - 2e-6);
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "invalid voxel transform scale"
+    );
+    let normalized = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (v - center[i % 3]) * scale + resolution as f32 / 2.0)
+        .collect::<Vec<_>>();
+    let fixed = (mesh.vertices.len() + mesh.faces.len())
+        .checked_mul(4)
+        .and_then(|v| v.checked_add(faces.checked_mul(16)? + 8))
+        .context("triangle workspace overflow")?;
+    d.workspace_budget(budget[0], budget[1], fixed)?;
+    let vertices = d.stream.clone_htod(&normalized)?;
+    drop(normalized);
+    let triangles = d.stream.clone_htod(&mesh.faces)?;
+    let counts = d.stream.alloc_zeros::<u64>(faces)?;
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    unsafe {
+        d.stream
+            .launch_builder(&module.load_function("triangle_box_count")?)
+            .arg(&vertices)
+            .arg(&triangles)
+            .arg(&face_count)
+            .arg(&resolution)
+            .arg(&counts)
+            .launch(flat(faces))?;
+    }
+    let offsets = exclusive_scan(d, &counts)?;
+    let face_counts = d.stream.clone_dtoh(&counts)?;
+    let host_offsets = d.stream.clone_dtoh(&offsets)?;
+    let total = usize::try_from(*host_offsets.last().context("triangle scan missing total")?)?;
+    ensure!(
+        total > 0 && total <= capacity,
+        "triangle emission needs {total} rows, capacity {capacity}"
+    );
+    let unique_bound = total.min((resolution as usize).pow(3));
+    let host_bytes = total
+        .checked_mul(32)
+        .and_then(|v| v.checked_add(unique_bound.checked_mul(68)?))
+        .and_then(|v| v.checked_add(faces.checked_mul(16)?))
+        .context("triangle host workspace overflow")?;
+    let host_available = super::calibrate::host_memory(std::path::Path::new("/"))?;
+    ensure!(
+        host_bytes as u64 <= host_available.saturating_sub(host_available / 16),
+        "triangle emission host workspace {host_bytes} exceeds available {host_available}"
+    );
+    let available = d.workspace_budget(budget[0], budget[1], 0)?;
+    let max_face = usize::try_from(
+        face_counts
+            .iter()
+            .copied()
+            .max()
+            .context("no triangle counts")?,
+    )?;
+    let tile = (available / 12).min(total);
+    ensure!(
+        tile >= max_face && tile > 0,
+        "triangle emission cannot fit its largest face ({max_face} rows)"
+    );
+    let keys = d.stream.alloc_zeros::<u64>(tile)?;
+    let owners = d.stream.alloc_zeros::<u32>(tile)?;
+    let emit = module.load_function("triangle_box_emit")?;
+    let mut records = Vec::with_capacity(total);
+    let mut first = 0;
+    while first < faces {
+        let base = host_offsets[first];
+        let mut end = first + 1;
+        while end < faces && host_offsets[end + 1] - base <= tile as u64 {
+            end += 1;
+        }
+        let n = usize::try_from(host_offsets[end] - base)?;
+        unsafe {
+            d.stream
+                .launch_builder(&emit)
+                .arg(&vertices)
+                .arg(&triangles)
+                .arg(&u32::try_from(first)?)
+                .arg(&u32::try_from(end - first)?)
+                .arg(&resolution)
+                .arg(&counts)
+                .arg(&offsets)
+                .arg(&base)
+                .arg(&(tile as u64))
+                .arg(&keys)
+                .arg(&owners)
+                .launch(flat(end - first))?;
+        }
+        if n > 0 {
+            let keys = d.stream.clone_dtoh(&keys.slice(..n))?;
+            let owners = d.stream.clone_dtoh(&owners.slice(..n))?;
+            records.extend(keys.into_iter().zip(owners));
+        }
+        first = end;
+    }
+    records.sort_unstable();
+    let mut coordinates = Vec::new();
+    let mut voxel_offsets = vec![0];
+    let mut voxel_faces = Vec::with_capacity(total);
+    let mut previous = None;
+    for (key, face) in records {
+        if previous != Some(key) {
+            if previous.is_some() {
+                voxel_offsets.push(voxel_faces.len() as u64);
+            }
+            coordinates.push([
+                0,
+                (key >> 42) as i32,
+                ((key >> 21) & ((1 << 21) - 1)) as i32,
+                (key & ((1 << 21) - 1)) as i32,
+            ]);
+            previous = Some(key);
+        }
+        voxel_faces.push(face);
+    }
+    voxel_offsets.push(voxel_faces.len() as u64);
+    println!(
+        "TRIANGLE_VOXEL_PLACEMENT vertices={} faces={faces} resolution={resolution} pad={pad} scale={scale} emissions={total} unique={} fixed_bytes={fixed} tile_rows={tile} tile_bytes={} host_records_bytes={host_bytes} kernels=triangle_box_count,exclusive_scan_u64,triangle_box_emit timing=false",
+        mesh.vertices.len() / 3,
+        coordinates.len(),
+        tile * 12
+    );
+    Ok(TriangleVoxels {
+        sites: SparseSites::new(coordinates)?,
+        face_counts,
+        voxel_offsets,
+        voxel_faces,
+    })
+}
+
+pub fn adaptive_mesh_support(
+    d: &Device,
+    mesh: &SparseMesh,
+    nominal: u32,
+    limit: usize,
+    capacity: usize,
+    budget: [usize; 2],
+) -> Result<(u32, TriangleVoxels)> {
+    ensure!(
+        nominal >= 7 && limit > 0,
+        "invalid adaptive surface grid/budget"
+    );
+    let mut scale = 1.0f64;
+    let mut attempt = 0;
+    loop {
+        let resolution = (nominal as f64 * scale) as u32;
+        ensure!(
+            resolution >= 7,
+            "adaptive surface grid exhausted {attempt} attempts from {nominal} for {limit} sites"
+        );
+        attempt += 1;
+        let voxels = triangle_voxels(d, mesh, resolution, 3, capacity, budget)?;
+        let rows = voxels.sites.coordinates().len();
+        println!(
+            "ADAPTIVE_SURFACE_GRID attempt={attempt} nominal={nominal} resolution={resolution} rows={rows} limit={limit}"
+        );
+        if rows <= limit {
+            return Ok((resolution, voxels));
+        }
+        scale *= 0.95;
+    }
+}
+
 pub(crate) struct CornerFields {
     pub layout: SparseCorners,
     pub cube_to_corner: CudaSlice<u32>,

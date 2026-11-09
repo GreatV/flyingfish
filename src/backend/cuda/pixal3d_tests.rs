@@ -173,6 +173,65 @@ struct OperationGate {
     decoder_key: Option<String>,
 }
 impl OperationGate {
+    fn cascade(section: &str, case: Option<&str>, count: usize) -> Result<Self> {
+        let root = env_path("FF_HI3D_CASCADE_REFERENCE")?;
+        let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        ensure!(
+            freeze["status"] == "FROZEN" && freeze["numeric_cells"] == 228,
+            "invalid high-grid reference freeze"
+        );
+        let source = if let Some(case) = case {
+            &freeze[section][case]
+        } else {
+            &freeze[section]
+        };
+        let mut cells: BTreeMap<String, Value> = serde_json::from_value(source["metrics"].clone())?;
+        if section.starts_with("G2") {
+            cells.retain(|name, _| {
+                name.ends_with("/velocity")
+                    || name.ends_with("/rotated_q")
+                    || name.ends_with("/rotated_k")
+            });
+        }
+        ensure!(cells.len() == count, "high-grid frozen coverage differs");
+        for (name, cell) in &mut cells {
+            let anchor = cell["pairs"][0]["left"]
+                .as_str()
+                .context("high-grid per-cell reference provenance missing")?;
+            let (file, key) = if section == "G6_geometry" {
+                ("taps.safetensors", name.as_str())
+            } else {
+                name.split_once('/')
+                    .context("high-grid cell has no tensor key")?
+            };
+            cell["anchor_file"] = format!("{anchor}/{file}").into();
+            cell["anchor_tensor"] = key.into();
+            cell["bounds"] = cell["tau"].clone();
+            if section == "G6_stages" && name.ends_with("/activated_fields") {
+                ensure!(
+                    source["controls"]
+                        .as_array()
+                        .context("field controls missing")?
+                        .iter()
+                        .filter(|c| c["cell"] == *name && c["kind"] == "swap_xz_fields")
+                        .all(|c| c["detection_statistic"] == "rmse" && c["pass"] == true),
+                    "field detection contract differs"
+                );
+                cell["detection_statistic"] = "rmse".into();
+            }
+        }
+        Ok(Self {
+            root,
+            kind: format!("{section}/{}", case.unwrap_or("bounded")),
+            prefix: "N5_M4",
+            cells,
+            seen: BTreeSet::new(),
+            defects: 0,
+            decoder_anchor: None,
+            decoder_key: None,
+        })
+    }
+
     fn new(kind: &str, count: usize) -> Result<Self> {
         let root = env_path("FF_HI3D_FIXTURES")?;
         let freeze: Value =
@@ -301,7 +360,14 @@ impl OperationGate {
     }
     fn measure(&mut self, name: &str, values: &[f64], control: bool) -> Result<()> {
         let cell = self.cells.get(name).context("cell outside frozen scope")?;
-        let anchor = if let Some(path) = &self.decoder_anchor {
+        let anchor = if let Some(path) = cell["anchor_file"].as_str() {
+            tensor(
+                &self.root.join(path),
+                cell["anchor_tensor"]
+                    .as_str()
+                    .context("anchor tensor missing")?,
+            )?
+        } else if let Some(path) = &self.decoder_anchor {
             if let Some(source) = cell["source_cell"].as_str() {
                 let source = tensor(path, source)?;
                 let width = source.shape[1];
@@ -337,6 +403,13 @@ impl OperationGate {
                 .as_f64()
                 .context("bound missing")?;
             let value = errors[metric];
+            if control && cell["detection_statistic"] == "rmse" && metric == "max_abs" {
+                println!(
+                    "{}_CONTROL_MEASUREMENT cell={name} metric={metric} value={value:.15e} bound={bound:.15e} detection_statistic=rmse",
+                    self.prefix
+                );
+                continue;
+            }
             if !control && let Some(bound) = cell["original_tau"][metric].as_f64() {
                 println!(
                     "N5_M2B_ORIGINAL_FIELD_METRIC cell={name} metric={metric} value={value:.15e} bound={bound:.15e} result={}",
@@ -344,11 +417,7 @@ impl OperationGate {
                 );
             }
             let defect = if control {
-                if self.decoder_anchor.is_some() || self.prefix == "N5_M3" {
-                    value <= 10.0 * bound
-                } else {
-                    value < 10.0 * bound
-                }
+                value <= 10.0 * bound
             } else {
                 value > bound
             };
@@ -1766,7 +1835,18 @@ fn hi3d_flow_components_gpu() -> Result<()> {
     let input_path = gate.root.join("component-inputs.safetensors");
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         for (name, cell) in gate.cells.clone() {
             if !name.starts_with(component) {
                 continue;
@@ -1879,7 +1959,18 @@ fn hi3d_flow_qk_rope_gpu() -> Result<()> {
     let anchor = gate.root.join("qk/anchor.safetensors");
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         for (name, cell) in gate.cells.clone() {
             if !name.starts_with(component) {
                 continue;
@@ -2001,7 +2092,18 @@ fn hi3d_flow_blocks_gpu() -> Result<()> {
         .collect();
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let mut flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         let conditioning = flow.conditioning(&context, &[], &coordinates)?;
         let modulation = flow.device.stream.clone_htod(&modulation)?;
         for index in [0, 12, 23] {
@@ -2041,7 +2143,14 @@ fn hi3d_flow_pool_inverse_gpu() -> Result<()> {
     let coordinates = lattice(&common, "input_blocks.1.updown.coordinates")?;
     let root = env_path("FF_HI3D_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let flow = Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
+    let flow = Flow::<f16>::open_hi3d(
+        &root,
+        "transformer_512",
+        &runtime,
+        &coordinates,
+        64,
+        8 << 30,
+    )?;
     let io = flow.io.as_ref().context("pool IO missing")?;
     let input: Vec<_> = f32_tensor(&common, "input_blocks.1.updown.features")?
         .into_iter()
@@ -2282,7 +2391,18 @@ fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
     let inputs = gate.root.join("io-inputs.safetensors");
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
-        let mut flow = Flow::<f16>::open_hi3d(&root, component, &runtime, &coordinates, 8 << 30)?;
+        let mut flow = Flow::<f16>::open_hi3d(
+            &root,
+            component,
+            &runtime,
+            &coordinates,
+            if component == "transformer_512" {
+                64
+            } else {
+                128
+            },
+            8 << 30,
+        )?;
         for (name, cell) in gate.cells.clone() {
             let Some(op) = name.strip_prefix(&format!("{component}.")) else {
                 continue;
@@ -2470,8 +2590,14 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
     let noise = f32_tensor(&source, "noise")?;
     let context = f32_tensor(&fixtures.join("common.safetensors"), "context")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let mut flow =
-        Flow::<f16>::open_hi3d(&root, "transformer_512", &runtime, &coordinates, 8 << 30)?;
+    let mut flow = Flow::<f16>::open_hi3d(
+        &root,
+        "transformer_512",
+        &runtime,
+        &coordinates,
+        64,
+        8 << 30,
+    )?;
     let positive = flow.conditioning(&context, &[], &coordinates)?;
     let context_stream = flow.device.ctx.new_stream()?;
     let context_device = context_stream.clone_htod(&context)?;
@@ -2523,6 +2649,1088 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
         variation["rmse"]
     );
     Ok(())
+}
+
+fn cascade_rope(
+    flow: &Flow<f16>,
+    gate: &mut OperationGate,
+    source: &Path,
+    file: &str,
+) -> Result<()> {
+    for role in ["q", "k"] {
+        let input = half_tensor(source, &format!("rope_{role}"))?;
+        ensure!(
+            input.len() == 257 * 22 * 96,
+            "high-grid QK prefix extent differs"
+        );
+        let data = flow.device.stream.clone_htod(&input)?;
+        unsafe {
+            flow.device
+                .stream
+                .launch_builder(&flow.kernels.rope)
+                .arg(&data)
+                .arg(&flow.phases)
+                .arg(&257i32)
+                .arg(&22i32)
+                .arg(&96i32)
+                .arg(&96i32)
+                .arg(&1i32)
+                .launch(flat(input.len() / 2))?;
+        }
+        let values = flow
+            .device
+            .stream
+            .clone_dtoh(&data)?
+            .into_iter()
+            .map(f16::to_f64)
+            .collect::<Vec<_>>();
+        gate.score(&format!("{file}/rotated_{role}"), &values, false)?;
+    }
+    Ok(())
+}
+
+fn cascade_mesh(
+    root: &Path,
+    prefix: &Path,
+    high: bool,
+    case: &str,
+) -> Result<crate::sparse::SparseMesh> {
+    let anchor = root.join(if high {
+        "transition1024-sm86-released-r1"
+    } else {
+        "transition-sm86-full-r1"
+    });
+    let (vertices, mut faces) = if case == "open_loop" {
+        (
+            f32_tensor(&anchor.join("open_loop-fill.safetensors"), "input_vertices")?,
+            (0..7).flat_map(|i| [7, (i + 1) % 7, i]).collect(),
+        )
+    } else {
+        let path = if high {
+            root.join(format!(
+                "continued1024-{}-sm86-r1/mesh.safetensors",
+                case.replace('_', "-")
+            ))
+        } else {
+            prefix.join(format!("linked-sm89-{case}-r1/mesh.safetensors"))
+        };
+        (
+            f32_tensor(&path, "vertices")?,
+            tensor(&path, "faces")?
+                .values
+                .into_iter()
+                .map(|v| v as i32)
+                .collect::<Vec<_>>(),
+        )
+    };
+    faces.extend(
+        tensor(
+            &anchor.join(format!("{case}-fill.safetensors")),
+            "added_faces",
+        )?
+        .values
+        .into_iter()
+        .map(|v| v as i32),
+    );
+    Ok(crate::sparse::SparseMesh { vertices, faces })
+}
+
+fn cascade_stable_logits(
+    root: &Path,
+    selector: &Value,
+    values: &[f32],
+    control: bool,
+) -> Result<bool> {
+    let path = root.join(
+        selector["path"]
+            .as_str()
+            .context("stable selector path missing")?,
+    );
+    let checkpoint = MappedCheckpoint::open_component(
+        path.parent().context("selector parent missing")?,
+        path.file_stem()
+            .and_then(|v| v.to_str())
+            .context("selector stem missing")?,
+    )?;
+    let eligible = checkpoint.tensor("eligible")?;
+    let positive = checkpoint.tensor("positive")?;
+    ensure!(
+        eligible.dtype() == Dtype::U8
+            && positive.dtype() == Dtype::U8
+            && eligible.data().len() == values.len().div_ceil(8)
+            && positive.data().len() == eligible.data().len()
+            && values.iter().all(|v| v.is_finite()),
+        "invalid stable occupancy bank"
+    );
+    let mut flips = 0;
+    for ((row, &mask), &baseline) in values.chunks(8).zip(eligible.data()).zip(positive.data()) {
+        let bits = row
+            .iter()
+            .enumerate()
+            .fold(0u8, |bits, (i, &v)| bits | (u8::from(v > 0.0) << i));
+        flips += ((bits ^ baseline) & mask).count_ones() as usize;
+    }
+    let eligible = eligible
+        .data()
+        .iter()
+        .map(|v| v.count_ones() as usize)
+        .sum::<usize>();
+    ensure!(
+        selector["eligible"].as_u64() == Some(eligible as u64) && eligible > 0,
+        "stable occupancy census differs"
+    );
+    let valid = if control { flips >= 32 } else { flips == 0 };
+    println!(
+        "{} N5_M4_STABLE_OCCUPANCY eligible={eligible} flips={flips} control={control} exact={}",
+        if valid { "PASS" } else { "DEFECT" },
+        flips == 0
+    );
+    Ok(valid)
+}
+
+fn cascade_stage<T>(
+    decoder: &PixalDecoder,
+    gate: &mut OperationGate,
+    bank: &Path,
+    stage: usize,
+    input: &[T],
+    control: bool,
+    convert: impl Fn(T) -> f64 + Copy,
+) -> Result<usize>
+where
+    T: DeviceRepr + Copy + ValidAsZeroBits + 'static,
+{
+    let coordinates = tensor(bank, "coordinates")?;
+    let n = coordinates.shape[0];
+    ensure!(
+        coordinates.shape == [n, 3],
+        "high-grid point coordinate extent differs"
+    );
+    let sites = SparseSites::new(
+        coordinates
+            .values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| {
+                if control {
+                    [0, p[2] as i32, p[1] as i32, p[0] as i32]
+                } else {
+                    [0, p[0] as i32, p[1] as i32, p[2] as i32]
+                }
+            })
+            .collect(),
+    )?;
+    drop(coordinates);
+    let [ci, co] = match stage {
+        3 => [512, 512],
+        2 => [512, 256],
+        1 => [256, 128],
+        0 => [128, 128],
+        _ => anyhow::bail!("invalid decoder stage"),
+    };
+    ensure!(
+        input.len() == n * ci,
+        "high-grid point feature extent differs"
+    );
+    let d = &decoder.device;
+    let input = d.stream.clone_htod(input)?;
+    let workspace = PointWorkspace::<T>::new(decoder, &sites, [ci, co], stage == 0)?;
+    let features = decoder.point_blocks(&workspace, input, stage, [ci, co])?;
+    let file = format!("dec{stage}.safetensors");
+    let cell = &gate.cells[&format!("{file}/features")];
+    let anchor = gate.root.join(
+        cell["anchor_file"]
+            .as_str()
+            .context("stage anchor missing")?,
+    );
+    let rows = tensor(&anchor, "selected_rows")?
+        .values
+        .into_iter()
+        .map(|v| v as usize)
+        .collect::<Vec<_>>();
+    if !control {
+        gate.score(
+            &format!("{file}/features"),
+            &selected_values(d, &features, &rows, co, convert)?,
+            false,
+        )?;
+    }
+    let mut defects = 0;
+    if stage > 0 {
+        let logits =
+            decoder.point_head(&workspace, matrix::<T>(ptr(&features, d), n, co)?, stage)?;
+        let values = d.stream.clone_dtoh(&logits)?;
+        drop(logits);
+        if !control {
+            let active = values
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|r| r.map(|v| v > 0.0))
+                .collect::<Vec<_>>();
+            let count = active.iter().flatten().filter(|&&v| v).count();
+            ensure!(
+                count > 0 && sites.subdivide(&active, count - 1).is_err(),
+                "short actual child capacity was not rejected"
+            );
+            println!(
+                "PASS N5_M4_CHILD_CAPACITY rows={n} selected={count} short_capacity={} rejected_before_emit=true",
+                count - 1
+            );
+        }
+        if !control {
+            gate.score(
+                &format!("{file}/occupancy_logits"),
+                &values.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                false,
+            )?;
+        }
+        let freeze: Value = serde_json::from_slice(&std::fs::read(gate.root.join("FROZEN.json"))?)?;
+        let shape = gate.kind.split('/').nth(1).context("stage shape missing")?;
+        defects += usize::from(!cascade_stable_logits(
+            &gate.root,
+            &freeze["G6_stages"][shape]["selectors"][format!("{file}/occupancy_logits")],
+            &values,
+            control,
+        )?);
+        drop(values);
+        if !control {
+            let projection =
+                decoder.point_project(matrix::<T>(ptr(&features, d), n, co)?, stage)?;
+            gate.score(
+                &format!("{file}/projection"),
+                &selected_values(d, &projection, &rows, 8 * co, f16::to_f64)?,
+                false,
+            )?;
+        }
+    } else {
+        let fields = decoder.point_field(&workspace, &features, &workspace.conv)?;
+        drop(features);
+        let selected = selected_values(d, &fields, &rows, 40, f64::from)?;
+        if !control {
+            gate.score(
+                &format!("{file}/raw_fields"),
+                &selected
+                    .as_chunks::<40>()
+                    .0
+                    .iter()
+                    .flat_map(|r| r[8..].iter().copied())
+                    .collect::<Vec<_>>(),
+                false,
+            )?;
+            gate.score(
+                &format!("{file}/sdf_sign"),
+                &selected
+                    .as_chunks::<40>()
+                    .0
+                    .iter()
+                    .flat_map(|r| r[..8].iter().copied())
+                    .collect::<Vec<_>>(),
+                false,
+            )?;
+        }
+        unsafe {
+            d.stream
+                .launch_builder(
+                    decoder
+                        .k
+                        .corner_fields
+                        .as_ref()
+                        .context("field activation missing")?,
+                )
+                .arg(&fields)
+                .arg(&u32::try_from(n)?)
+                .launch(flat(n * 32))?;
+        }
+        let activated = selected_values(d, &fields, &rows, 40, f64::from)?
+            .as_chunks::<40>()
+            .0
+            .iter()
+            .flat_map(|r| r[8..].iter().copied())
+            .collect::<Vec<_>>();
+        gate.score(&format!("{file}/activated_fields"), &activated, control)?;
+    }
+    Ok(defects)
+}
+
+fn cascade_decoder_stages(shapes: &[&str]) -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let d = Device::new(0)?;
+    let (_, total) = d.ctx.mem_get_info()?;
+    let decoder = PixalDecoder::open(
+        &d,
+        &model,
+        DecoderKind::PointTransformer,
+        &runtime,
+        total.min(14 << 30).saturating_sub(total / 32),
+    )?;
+    let mut defects = 0;
+    for &shape in shapes {
+        let mut gate = OperationGate::cascade("G6_stages", Some(shape), 13)?;
+        for stage in [3, 2, 1, 0] {
+            let bank = gate
+                .root
+                .join(format!("rung{shape}-sm86-r1/dec{stage}-input.safetensors"));
+            if stage == 3 {
+                let input = f32_tensor(&bank, "feat")?;
+                for control in [false, true] {
+                    defects += cascade_stage(
+                        &decoder,
+                        &mut gate,
+                        &bank,
+                        stage,
+                        &input,
+                        control,
+                        f64::from,
+                    )?;
+                }
+            } else {
+                let input = half_tensor(&bank, "feat")?;
+                for control in [false, true] {
+                    defects += cascade_stage(
+                        &decoder,
+                        &mut gate,
+                        &bank,
+                        stage,
+                        &input,
+                        control,
+                        f16::to_f64,
+                    )?;
+                }
+            }
+        }
+        ensure!(
+            gate.seen.len() == gate.cells.len(),
+            "high-grid stage cells unexecuted"
+        );
+        if gate.finish().is_err() {
+            defects += 1;
+        }
+    }
+    cascade_resources("decoder-stages")?;
+    ensure!(defects == 0, "high-grid decoder candidate defects");
+    Ok(())
+}
+
+fn cascade_corner_incidence(
+    fields: &super::super::sparse::CornerFields,
+    path: &Path,
+    parents: &SparseSites,
+) -> Result<bool> {
+    let mapped = MappedCheckpoint::open_component(path, "canonical-corners")?;
+    let grid = mapped.tensor("unique_grid")?;
+    let cubes = mapped.tensor("cubes")?;
+    let counts = mapped.tensor("counts")?;
+    let sites = fields.layout.sites.coordinates();
+    ensure!(
+        grid.dtype() == Dtype::I64 && cubes.dtype() == Dtype::I64 && counts.dtype() == Dtype::I64,
+        "canonical corner index storage differs"
+    );
+    let grid_exact = grid.shape() == [sites.len(), 3]
+        && grid
+            .data()
+            .as_chunks::<24>()
+            .0
+            .iter()
+            .zip(sites)
+            .all(|(bytes, p)| {
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .zip(&p[1..])
+                    .all(|(b, &v)| i64::from_le_bytes(*b) == v as i64)
+            });
+    let cubes_exact = cubes.shape() == [parents.coordinates().len(), 8]
+        && cubes.data().len() / 8 == fields.layout.cube_to_corner.len()
+        && cubes
+            .data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(parents.sorted_rows().iter().flat_map(|&(_, row)| {
+                fields.layout.cube_to_corner[8 * row as usize..8 * row as usize + 8].iter()
+            }))
+            .all(|(b, &v)| i64::from_le_bytes(*b) == v as i64);
+    let counts_exact = counts.shape() == [sites.len()]
+        && counts
+            .data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(fields.layout.contributor_offsets.windows(2))
+            .all(|(b, p)| i64::from_le_bytes(*b) == (p[1] - p[0]) as i64);
+    let exact = grid_exact && cubes_exact && counts_exact;
+    println!(
+        "{} N5_M4_CORNER_INCIDENCE corners={} contributions={} full_grid_cubes_counts_exact={exact} grid_exact={grid_exact} counts_exact={counts_exact} cube_rows=lexicographic_parent cubes_exact={cubes_exact}",
+        if exact { "PASS" } else { "DEFECT" },
+        sites.len(),
+        fields.layout.contributors.len()
+    );
+    Ok(exact)
+}
+
+fn cascade_corner_geometry(shapes: &[&str]) -> Result<()> {
+    let root = env_path("FF_HI3D_CASCADE_REFERENCE")?;
+    let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+    let d = Device::new(0)?;
+    let mut defects = 0;
+    for &shape in shapes {
+        let mut gate = OperationGate::cascade("G6_geometry", Some(shape), 3)?;
+        let anchor = PathBuf::from(
+            gate.cells["means"]["anchor_file"]
+                .as_str()
+                .context("corner anchor missing")?,
+        );
+        let arm = anchor
+            .components()
+            .next()
+            .and_then(|p| p.as_os_str().to_str())
+            .context("corner arm missing")?;
+        let metadata = &freeze["arm_provenance"][arm]["metadata"];
+        let basename = |key: &str| -> Result<&std::ffi::OsStr> {
+            Path::new(
+                metadata[key]
+                    .as_str()
+                    .context("corner source provenance missing")?,
+            )
+            .file_name()
+            .context("corner directory missing")
+        };
+        let source = root.join(basename("source")?).join("decoded.safetensors");
+        let full_anchor = root.join(basename("anchor")?);
+        let coordinates = tensor(&source, "coordinates")?;
+        let n = coordinates.shape[0];
+        ensure!(
+            coordinates.shape == [n, 3],
+            "decoded cube coordinates differ"
+        );
+        let coordinates = coordinates
+            .values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| [0, p[0] as i32, p[1] as i32, p[2] as i32])
+            .collect::<Vec<_>>();
+        let features = f32_tensor(&source, "feat")?;
+        let signs = f32_tensor(&source, "sdf_sign")?;
+        ensure!(
+            features.len() == n * 32 && signs.len() == n * 8,
+            "decoded corner feature extent differs"
+        );
+        let attributes = features
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .zip(signs.as_chunks::<8>().0.iter())
+            .flat_map(|(f, s)| s.iter().chain(f.iter()).copied())
+            .collect::<Vec<_>>();
+        drop(features);
+        drop(signs);
+        let matrix = f32_tensor(&source, "matrix")?;
+        ensure!(matrix.len() == 16, "decoded frame extent differs");
+        let coarse = tensor(
+            &root.join(format!("rung{shape}-sm86-r1/input.safetensors")),
+            "coordinates",
+        )?;
+        ensure!(
+            coarse.shape.len() == 2 && coarse.shape[1] == 3,
+            "coarse support frame layout differs"
+        );
+        let coarse = SparseSites::new(
+            coarse
+                .values
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| [0, p[0] as i32, p[1] as i32, p[2] as i32])
+                .collect(),
+        )?;
+        let frame = coarse.unit_ball_frame()?;
+        println!(
+            "N5_M4_FRAME case={shape} coarse_rows={} max_coefficient_error={}",
+            coarse.coordinates().len(),
+            frame
+                .as_flattened()
+                .iter()
+                .zip(&matrix)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0f32, f32::max)
+        );
+        let rows = tensor(&root.join(&anchor), "selected_rows")?
+            .values
+            .into_iter()
+            .map(|v| v as usize)
+            .collect::<Vec<_>>();
+        for control in [false, true] {
+            let sites = SparseSites::new(
+                coordinates
+                    .iter()
+                    .map(|&p| if control { [0, p[3], p[2], p[1]] } else { p })
+                    .collect(),
+            )?;
+            let (free, total) = d.ctx.mem_get_info()?;
+            let budget = [free, total.min(14 << 30).saturating_sub(total / 32)];
+            let input = d.stream.clone_htod(&attributes)?;
+            let fields = super::super::sparse::corner_fields(&d, &sites, &input, frame, budget)?;
+            drop(input);
+            if !control {
+                defects += usize::from(!cascade_corner_incidence(&fields, &full_anchor, &sites)?);
+                gate.score(
+                    "means",
+                    &selected_values(&d, &fields.means, &rows, 5, f64::from)?,
+                    false,
+                )?;
+            }
+            gate.score(
+                "positions",
+                &selected_values(&d, &fields.positions, &rows, 3, f64::from)?,
+                control,
+            )?;
+            let scalar = d.stream.clone_dtoh(&fields.scalar)?;
+            if !control {
+                gate.score(
+                    "signed_sdf",
+                    &scalar.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                    false,
+                )?;
+            }
+            defects += usize::from(!cascade_stable_logits(
+                &root,
+                &freeze["G6_geometry"][shape]["selectors"]["signed_sdf"],
+                &scalar,
+                control,
+            )?);
+            drop(scalar);
+            if !control {
+                drop(fields.layout);
+                drop(fields.means);
+                let mesh = super::super::sparse::cube_mesh(
+                    &d,
+                    sites,
+                    fields.cube_to_corner,
+                    fields.positions,
+                    fields.scalar,
+                    budget,
+                )?;
+                ensure!(
+                    mesh.vertices.len().is_multiple_of(3)
+                        && mesh.faces.len().is_multiple_of(3)
+                        && mesh.vertices.iter().all(|v| v.is_finite())
+                        && mesh
+                            .faces
+                            .iter()
+                            .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+                    "nonfinite or invalid high-grid extracted mesh"
+                );
+                println!(
+                    "N5_M4_EXTRACTION_MEASUREMENT case={shape} vertices={} faces={} topology_equivalence=false timing=false",
+                    mesh.vertices.len() / 3,
+                    mesh.faces.len() / 3
+                );
+            }
+        }
+        ensure!(
+            gate.seen.len() == gate.cells.len(),
+            "high-grid corner cells unexecuted"
+        );
+        if gate.finish().is_err() {
+            defects += 1;
+        }
+    }
+    cascade_resources("corner-geometry")?;
+    ensure!(defects == 0, "high-grid corner/geometry candidate defects");
+    Ok(())
+}
+
+fn cascade_incidence_exact(voxels: &TriangleVoxels, path: &Path) -> Result<bool> {
+    let coordinates = tensor(path, "voxel_coords")?;
+    let counts = tensor(path, "voxel_face_count")?;
+    let offsets = tensor(path, "voxel_face_start")?;
+    let owners = tensor(path, "voxel_face_idx")?;
+    let face_counts = tensor(path, "face_voxel_count")?;
+    ensure!(
+        coordinates.shape == [counts.values.len(), 3]
+            && offsets.values.len() == counts.values.len(),
+        "invalid frozen triangle incidence layout"
+    );
+    let mut exact = face_counts.values.len() == voxels.face_counts.len()
+        && face_counts
+            .values
+            .iter()
+            .zip(&voxels.face_counts)
+            .all(|(&a, &b)| a == b as f64)
+        && coordinates.shape[0] == voxels.sites.coordinates().len()
+        && owners.values.len() == voxels.voxel_faces.len();
+    if !exact {
+        println!(
+            "N5_M4_TRIANGLE_FACE_DIAGNOSTIC first_different_counts={:?}",
+            face_counts
+                .values
+                .iter()
+                .zip(&voxels.face_counts)
+                .enumerate()
+                .filter(|(_, (a, b))| **a != **b as f64)
+                .take(8)
+                .map(|(i, (&a, &b))| (i, a, b))
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut differences = 0;
+    for (row, p) in coordinates.values.as_chunks::<3>().0.iter().enumerate() {
+        let Some(actual) = voxels.sites.row([0, p[0] as i32, p[1] as i32, p[2] as i32]) else {
+            differences += 1;
+            continue;
+        };
+        let actual = actual as usize;
+        let start = offsets.values[row] as usize;
+        let count = counts.values[row] as usize;
+        ensure!(
+            start + count <= owners.values.len(),
+            "frozen owner extent overflow"
+        );
+        let mut expected = owners.values[start..start + count]
+            .iter()
+            .map(|&v| v as u32)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let span = voxels.voxel_offsets[actual] as usize..voxels.voxel_offsets[actual + 1] as usize;
+        if voxels.voxel_faces[span.clone()] != expected && differences < 4 {
+            println!(
+                "N5_M4_TRIANGLE_VOXEL_DIAGNOSTIC coordinate={p:?} expected_prefix={:?} actual_prefix={:?}",
+                expected.iter().take(12).collect::<Vec<_>>(),
+                voxels.voxel_faces[span.clone()]
+                    .iter()
+                    .take(12)
+                    .collect::<Vec<_>>()
+            );
+        }
+        differences += usize::from(voxels.voxel_faces[span] != expected);
+    }
+    exact &= differences == 0;
+    println!(
+        "N5_M4_TRIANGLE_INCIDENCE exact={exact} expected_voxels={} actual_voxels={} expected_emissions={} actual_emissions={} different_voxel_relations={differences}",
+        coordinates.shape[0],
+        voxels.sites.coordinates().len(),
+        owners.values.len(),
+        voxels.voxel_faces.len()
+    );
+    Ok(exact)
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid decoder banks"]
+fn hi3d_cascade_decoder_1024_cottage_gpu() -> Result<()> {
+    cascade_decoder_stages(&["1024-cottage"])
+}
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid decoder banks"]
+fn hi3d_cascade_decoder_1024_robot_gpu() -> Result<()> {
+    cascade_decoder_stages(&["1024-robot-crab"])
+}
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid decoder banks"]
+fn hi3d_cascade_decoder_1536_cottage_gpu() -> Result<()> {
+    cascade_decoder_stages(&["1536-cottage"])
+}
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid decoder banks"]
+fn hi3d_cascade_decoder_1536_robot_gpu() -> Result<()> {
+    cascade_decoder_stages(&["1536-robot-crab"])
+}
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid corner banks"]
+fn hi3d_cascade_geometry_1024_cottage_gpu() -> Result<()> {
+    cascade_corner_geometry(&["1024-cottage"])
+}
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid corner banks"]
+fn hi3d_cascade_geometry_1024_robot_gpu() -> Result<()> {
+    cascade_corner_geometry(&["1024-robot-crab"])
+}
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid corner banks"]
+fn hi3d_cascade_geometry_1536_cottage_gpu() -> Result<()> {
+    cascade_corner_geometry(&["1536-cottage"])
+}
+#[test]
+#[ignore = "requires admitted CUDA and frozen high-grid corner banks"]
+fn hi3d_cascade_geometry_1536_robot_gpu() -> Result<()> {
+    cascade_corner_geometry(&["1536-robot-crab"])
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen mesh/support/triangle-incidence records"]
+fn hi3d_cascade_mesh_support_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_CASCADE_REFERENCE")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let device = Device::new(0)?;
+    let mut defects = 0;
+    let mut cells = 0;
+    for tag in ["minus", "exact", "plus"] {
+        let path = root.join(format!(
+            "transition-sm86-full-r1/triangle-boundary-{tag}.safetensors"
+        ));
+        let mesh = crate::sparse::SparseMesh {
+            vertices: f32_tensor(&path, "vertices")?,
+            faces: tensor(&path, "faces")?
+                .values
+                .into_iter()
+                .map(|v| v as i32)
+                .collect(),
+        };
+        let (free, _) = device.ctx.mem_get_info()?;
+        for pad in [u32::MAX, (1 << 31) + 1] {
+            ensure!(
+                triangle_voxels(&device, &mesh, 12, pad, usize::MAX, [free, 1 << 30]).is_err(),
+                "overflowing voxel pad was accepted"
+            );
+        }
+        let voxels = triangle_voxels(&device, &mesh, 12, 3, usize::MAX, [free, 1 << 30])?;
+        let exact = cascade_incidence_exact(&voxels, &path)?;
+        defects += usize::from(!exact);
+        println!(
+            "{} N5_M4_TRIANGLE_BOUNDARY case={tag} exact={exact}",
+            if exact { "PASS" } else { "DEFECT" }
+        );
+        cells += 1;
+    }
+    for high in [false, true] {
+        let anchor = root.join(if high {
+            "transition1024-sm86-released-r1"
+        } else {
+            "transition-sm86-full-r1"
+        });
+        let metadata: Value = serde_json::from_slice(&std::fs::read(anchor.join("report.json"))?)?;
+        for case in ["open_loop", "cottage", "robot_crab"] {
+            let mesh = cascade_mesh(&root, &prefix, high, case)?;
+            for nominal in if high {
+                &[192u32][..]
+            } else {
+                &[128u32, 192][..]
+            } {
+                let source = &metadata["cases"][case]["voxel"][nominal.to_string()];
+                let expected_grid = source["accepted_grid"]
+                    .as_u64()
+                    .context("accepted reference grid missing")?;
+                let limit = source["budget"]
+                    .as_u64()
+                    .context("reference support budget missing")?
+                    as usize;
+                let (free, total) = device.ctx.mem_get_info()?;
+                let budget = [free, total.min(14 << 30).saturating_sub(total / 32)];
+                let (grid, voxels) =
+                    adaptive_mesh_support(&device, &mesh, *nominal, limit, usize::MAX, budget)?;
+                let exact = grid as u64 == expected_grid
+                    && cascade_incidence_exact(
+                        &voxels,
+                        &anchor.join(format!("{case}-intersections-{nominal}.safetensors")),
+                    )?;
+                defects += usize::from(!exact);
+                let baseline: BTreeSet<_> = voxels.sites.coordinates().iter().copied().collect();
+                let emissions = voxels.voxel_faces.len();
+                drop(voxels);
+                let control = triangle_voxels(&device, &mesh, grid, 0, usize::MAX, budget)?;
+                let wrong: BTreeSet<_> = control.sites.coordinates().iter().copied().collect();
+                let changed = baseline.symmetric_difference(&wrong).count();
+                defects += usize::from(changed == 0);
+                drop(control);
+                if case == "open_loop" {
+                    let short = triangle_voxels(&device, &mesh, grid, 3, emissions - 1, budget);
+                    ensure!(
+                        short
+                            .err()
+                            .is_some_and(|e| e.to_string().starts_with("triangle emission needs")),
+                        "short emission reservation was not rejected before emit"
+                    );
+                }
+                println!(
+                    "{} N5_M4_SUPPORT case={case} high={high} nominal={nominal} accepted_grid={grid} exact={exact} pad0_membership_changes={changed} emissions={emissions}",
+                    if exact && changed > 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                cells += 1;
+            }
+        }
+    }
+    println!(
+        "N5_M4_SUPPORT_GATE cells={cells} defects={defects} short_emission_capacity=rejected timing=false"
+    );
+    cascade_resources("mesh-support")?;
+    ensure!(
+        cells == 12 && defects == 0,
+        "mesh/support finite candidate defects"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA, high-grid weights and frozen common inputs"]
+fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let context = f32_tensor(
+        &prefix.join("linked-sm89-cottage-r1/handoff.safetensors"),
+        "condition",
+    )?;
+    let mut gate = OperationGate::cascade("G2_bounded", None, 12)?;
+    for maximum in [63, 64, 94, 95] {
+        let file = format!("flow-max{maximum}.safetensors");
+        let source = gate.root.join("flow-sm89-released-r1").join(&file);
+        let points = tensor(&source, "coordinates")?;
+        ensure!(
+            points.shape == [257, 3],
+            "high-grid input coordinate layout differs"
+        );
+        let coordinates = points
+            .values
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| p.map(|v| v as i32))
+            .collect::<Vec<_>>();
+        let resolution = if maximum < 64 { 128 } else { 192 };
+        let mut flow = Flow::<f16>::open_hi3d(
+            &model,
+            "transformer_1024",
+            &runtime,
+            &coordinates,
+            resolution,
+            14 << 30,
+        )?;
+        let positive = flow.conditioning(&context, &[], &coordinates)?;
+        let input = flow
+            .device
+            .stream
+            .clone_htod(&f32_tensor(&source, "noise")?)?;
+        let mut output = flow.device.stream.alloc_zeros::<f32>(input.len())?;
+        flow.set_times(&[820.0])?;
+        cascade_rope(&flow, &mut gate, &source, &file)?;
+        flow.forward(&input, 0, &positive, &mut output)?;
+        gate.score(
+            &format!("{file}/velocity"),
+            &flow
+                .device
+                .stream
+                .clone_dtoh(&output)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            false,
+        )?;
+        if maximum == 95 {
+            let parent =
+                SparseSites::new(coordinates.iter().map(|p| [0, p[0], p[1], p[2]]).collect())?
+                    .downsample(2)?
+                    .0;
+            let points = flow.device.stream.clone_htod(
+                &parent
+                    .coordinates()
+                    .iter()
+                    .flat_map(|p| p[1..].iter().map(|&v| v as f32))
+                    .collect::<Vec<_>>(),
+            )?;
+            let frequencies = flow.device.stream.clone_htod(
+                &(0..48)
+                    .map(|i| 1.0 / 10000f32.powf((i % 16) as f32 / 16.0))
+                    .collect::<Vec<_>>(),
+            )?;
+            unsafe {
+                flow.device
+                    .stream
+                    .launch_builder(&flow.kernels.phases)
+                    .arg(&points)
+                    .arg(&frequencies)
+                    .arg(&(flow.rows as i32))
+                    .arg(&1i32)
+                    .arg(&96i32)
+                    .arg(&flow.phases)
+                    .launch(flat(flow.rows * 48))?;
+            }
+            flow.forward(&input, 0, &positive, &mut output)?;
+            gate.score(
+                &format!("{file}/velocity"),
+                &flow
+                    .device
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>(),
+                true,
+            )?;
+        }
+        println!(
+            "N5_M4_FLOW_EXECUTION training_grid=128 execution_grid={resolution} pooled_max={maximum} rows={} phases=spatial_phases rope=flow_rope_f16 attention=D96 eager=true",
+            coordinates.len()
+        );
+    }
+    gate.finish()
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and four frozen high-grid production supports"]
+fn hi3d_cascade_production_flow_gpu() -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    for shape in [
+        "1024-cottage",
+        "1024-robot-crab",
+        "1536-cottage",
+        "1536-robot-crab",
+    ] {
+        let mut gate = OperationGate::cascade("G2_production", Some(shape), 3)?;
+        let directory = gate.root.join(format!("rung{shape}-sm86-r1"));
+        let source = directory.join("production-flow.safetensors");
+        let coordinates = lattice(&source, "coordinates")?;
+        let state = f32_tensor(&source, "state")?;
+        let time = f32_tensor(&source, "timestep")?;
+        let case = if shape.ends_with("cottage") {
+            "cottage"
+        } else {
+            "robot_crab"
+        };
+        let context = f32_tensor(
+            &prefix.join(format!("linked-sm89-{case}-r1/handoff.safetensors")),
+            "condition",
+        )?;
+        let resolution = if shape.starts_with("1024") { 128 } else { 192 };
+        for control in [false, true] {
+            let coordinates: Vec<_> = coordinates
+                .iter()
+                .map(|&p| if control { [p[2], p[1], p[0]] } else { p })
+                .collect();
+            let mut flow = Flow::<f16>::open_hi3d(
+                &model,
+                "transformer_1024",
+                &runtime,
+                &coordinates,
+                resolution,
+                14 << 30,
+            )?;
+            let condition = flow.conditioning(&context, &[], &coordinates)?;
+            let input = flow.device.stream.clone_htod(&state)?;
+            let mut output = flow.device.stream.alloc_zeros::<f32>(state.len())?;
+            flow.set_times(&time)?;
+            if !control {
+                let anchor = gate.root.join(
+                    gate.cells["production.safetensors/rotated_q"]["anchor_file"]
+                        .as_str()
+                        .context("anchor missing")?,
+                );
+                cascade_rope(&flow, &mut gate, &anchor, "production.safetensors")?;
+            }
+            flow.forward(&input, 0, &condition, &mut output)?;
+            gate.score(
+                "production.safetensors/velocity",
+                &flow
+                    .device
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>(),
+                control,
+            )?;
+            println!(
+                "N5_M4_PRODUCTION_EXECUTION case={shape} control={control} input_rows={} parent_rows={} execution_grid={resolution} eager=true",
+                coordinates.len(),
+                flow.rows
+            );
+        }
+        gate.finish()?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen common-state Heun slopes"]
+fn hi3d_cascade_heun_updates_gpu() -> Result<()> {
+    let mut gate = OperationGate::cascade("G3_common_state_and_both_slopes", None, 116)?;
+    let device = Device::new(0)?;
+    let update = cubin::module(&device.ctx, "flow")?.load_function("heun_update_f32")?;
+    let files = gate
+        .cells
+        .keys()
+        .map(|name| name.split('/').next().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    for file in files {
+        let (rows, step) = if let Some(rows) = file.strip_prefix("production-") {
+            (rows.trim_end_matches(".safetensors").parse::<usize>()?, 12)
+        } else {
+            (
+                257,
+                file.trim_start_matches("heun-")
+                    .trim_end_matches(".safetensors")
+                    .parse::<usize>()?,
+            )
+        };
+        let source = gate
+            .root
+            .join("flow-sm89-released-r1")
+            .join(format!("heun-{step:02}.safetensors"));
+        let mut inputs = Vec::new();
+        for key in ["state", "first_slope", "second_slope"] {
+            let compact = f32_tensor(&source, key)?;
+            ensure!(compact.len() == 257 * 32, "common Heun extent differs");
+            let values = (0..rows)
+                .flat_map(|r| {
+                    let index = if rows == 257 { r } else { r * 131 % 257 };
+                    compact[index * 32..(index + 1) * 32].iter().copied()
+                })
+                .collect::<Vec<_>>();
+            inputs.push(device.stream.clone_htod(&values)?);
+        }
+        let (time, next) = heun_schedule(rows, 25)?[step];
+        for (key, value) in [("sigma", time), ("next_sigma", next)] {
+            gate.score(&format!("{file}/{key}"), &[value as f64], false)?;
+        }
+        let output = device.stream.alloc_zeros::<f32>(rows * 32)?;
+        for (key, second, control) in [
+            ("predicted", 0, false),
+            ("updated", ptr(&inputs[2], &device), false),
+            ("updated", ptr(&inputs[0], &device), true),
+        ] {
+            if control && (rows != 257 || step != 12) {
+                continue;
+            }
+            let second = if control {
+                ptr(&inputs[1], &device)
+            } else {
+                second
+            };
+            unsafe {
+                device
+                    .stream
+                    .launch_builder(&update)
+                    .arg(&inputs[0])
+                    .arg(&inputs[1])
+                    .arg(&second)
+                    .arg(&output)
+                    .arg(&((rows * 32) as u64))
+                    .arg(&(time - next))
+                    .launch(flat(rows * 32))?;
+            }
+            gate.score(
+                &format!("{file}/{key}"),
+                &device
+                    .stream
+                    .clone_dtoh(&output)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect::<Vec<_>>(),
+                control,
+            )?;
+        }
+    }
+    gate.finish()
 }
 fn metrics(x: &[f64], y: &[f64]) -> Result<BTreeMap<&'static str, f64>> {
     ensure!(!x.is_empty() && x.len() == y.len(), "metric shape mismatch");
@@ -3173,7 +4381,7 @@ fn linked_mesh_case(
             .checked_sub(total - free)
             .context("linked resident data exceeds derived device envelope")
     };
-    let mut flow = Flow::<f16>::open_hi3d(model, "transformer_512", runtime, &grid, budget()?)?;
+    let mut flow = Flow::<f16>::open_hi3d(model, "transformer_512", runtime, &grid, 64, budget()?)?;
     ensure!(
         flow.coordinates == grid
             && flow.io.as_ref().context("linked sparse IO missing")?.rows == grid.len(),
@@ -3236,15 +4444,9 @@ fn linked_mesh_case(
     Ok(mesh)
 }
 
-#[test]
-#[ignore = "requires admitted CUDA, published image/flow/decoder checkpoints and frozen media"]
-fn hi3d_linked_image_mesh_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+fn linked_image_contexts() -> Result<(Vec<CudaSlice<f32>>, usize)> {
     let image_root = env_path("FF_HI3D_IMAGE_FIXTURES")?;
-    let model = env_path("FF_HI3D_MODEL")?;
-    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?;
     let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    std::fs::create_dir_all(&output)?;
     let image_bytes = std::fs::read(image_root.join("cpu-r2/inputs.safetensors"))?;
     let images = safetensors::SafeTensors::deserialize(&image_bytes)?;
     let image_freeze: Value =
@@ -3320,6 +4522,18 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     drop(first);
     drop(swapped);
     drop(replay);
+    Ok((contexts, defects))
+}
+
+#[test]
+#[ignore = "requires admitted CUDA, published image/flow/decoder checkpoints and frozen media"]
+fn hi3d_linked_image_mesh_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let model = env_path("FF_HI3D_MODEL")?;
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?;
+    let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    std::fs::create_dir_all(&output)?;
+    let (contexts, mut defects) = linked_image_contexts()?;
     let mut meshes = Vec::new();
     for (index, support, label) in [
         (0, "cottage", "cottage-A1"),
@@ -3365,6 +4579,199 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     );
     ensure!(defects == 0, "finite linked pipeline candidate defects");
     Ok(())
+}
+
+fn linked_image_cascade(case: &str, index: usize) -> Result<()> {
+    let model = env_path("FF_HI3D_MODEL")?;
+    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?.join(case);
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    std::fs::create_dir_all(&output)?;
+    let (mut contexts, defects) = linked_image_contexts()?;
+    ensure!(defects == 0, "linked cascade media candidate defects");
+    let context = contexts.swap_remove(index);
+    drop(contexts);
+    let d = Device::new(0)?;
+    generation_capture(
+        &output.join("native-context.safetensors"),
+        &[],
+        &d.stream.clone_dtoh(&context)?,
+        vec![1, 2917, 2048],
+    )?;
+    let budget = || -> Result<usize> {
+        let (free, total) = d.ctx.mem_get_info()?;
+        let envelope = total - total / 8;
+        envelope
+            .checked_sub(total - free)
+            .context("cascade live data exceeds detected device envelope")
+    };
+    let mut mesh = linked_mesh_case(
+        &model,
+        &prefix,
+        &runtime,
+        &output,
+        &context,
+        case,
+        "native-512",
+    )?;
+    for (stream, resolution, limit) in [(1u64, 128u32, 90_000usize), (2, 192, 110_000)] {
+        let host_available = super::super::calibrate::host_memory(Path::new("/"))?;
+        let fill_bytes = mesh
+            .faces
+            .len()
+            .checked_mul(24)
+            .and_then(|v| v.checked_add(mesh.vertices.len().checked_mul(24)?))
+            .context("boundary host reservation overflow")?;
+        ensure!(
+            fill_bytes as u64 <= host_available - host_available / 16,
+            "boundary host reservation exceeds available memory"
+        );
+        let added = mesh.fill_holes(
+            mesh.faces
+                .len()
+                .checked_mul(4)
+                .context("boundary face capacity overflow")?
+                / 3,
+        )?;
+        let (free, _) = d.ctx.mem_get_info()?;
+        let (accepted, voxels) =
+            adaptive_mesh_support(&d, &mesh, resolution, limit, usize::MAX, [free, budget()?])?;
+        let grid = voxels
+            .sites
+            .coordinates()
+            .iter()
+            .map(|p| [p[1], p[2], p[3]])
+            .collect::<Vec<_>>();
+        let frame = voxels.sites.unit_ball_frame()?;
+        let parent = voxels.sites.downsample(2)?.0;
+        let maximum = parent
+            .coordinates()
+            .iter()
+            .flat_map(|p| &p[1..])
+            .copied()
+            .max()
+            .context("empty cascade parents")?;
+        let parents = parent.coordinates().len();
+        drop(parent);
+        drop(voxels);
+        drop(mesh);
+        let n = grid.len();
+        let noise = d.stream.alloc_zeros::<f32>(n * 32)?;
+        unsafe {
+            d.stream
+                .launch_builder(
+                    &cubin::module(&d.ctx, "sample")?.load_function("philox_normal_f32")?,
+                )
+                .arg(&0u64)
+                .arg(&stream)
+                .arg(&noise)
+                .arg(&i64::try_from(n * 32)?)
+                .launch(flat((n * 32).div_ceil(4)))?;
+        }
+        let noise_host = d.stream.clone_dtoh(&noise)?;
+        drop(noise);
+        let rung = output.join(format!("native-{}", resolution * 8));
+        std::fs::create_dir(&rung)?;
+        generation_capture(
+            &rung.join("noise.safetensors"),
+            &grid,
+            &noise_host,
+            vec![n, 32],
+        )?;
+        let mut flow = Flow::<f16>::open_hi3d(
+            &model,
+            "transformer_1024",
+            &runtime,
+            &grid,
+            resolution as usize,
+            budget()?,
+        )?;
+        ensure!(
+            flow.coordinates == grid,
+            "cascade support did not reach flow"
+        );
+        let positive = flow.conditioning_device(&context, &grid)?;
+        let zero = flow.device.stream.alloc_zeros::<f32>(2917 * 2048)?;
+        let negative = flow.conditioning_device(&zero, &grid)?;
+        let latent = flow.sample_heun(&noise_host, &positive, &negative)?;
+        generation_capture(
+            &rung.join("latents.safetensors"),
+            &grid,
+            &latent,
+            vec![n, 32],
+        )?;
+        drop(negative);
+        drop(positive);
+        drop(zero);
+        drop(flow);
+        let decoder = PixalDecoder::open(
+            &d,
+            &model,
+            DecoderKind::PointTransformer,
+            &runtime,
+            budget()?,
+        )?;
+        let coordinates = grid
+            .iter()
+            .map(|p| [0, p[0], p[1], p[2]])
+            .collect::<Vec<_>>();
+        mesh = decoder.points_mesh(coordinates.clone(), &latent, frame, resolution)?;
+        drop(decoder);
+        ensure!(
+            !mesh.vertices.is_empty()
+                && !mesh.faces.is_empty()
+                && mesh.vertices.iter().all(|v| v.is_finite())
+                && mesh
+                    .faces
+                    .iter()
+                    .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+            "invalid cascade raw mesh"
+        );
+        linked_mesh_save(
+            &rung.join("native.safetensors"),
+            &mesh,
+            &coordinates,
+            &latent,
+            frame,
+        )?;
+        println!(
+            "PASS N5_M4_LINKED_BOUNDARY case={case} output_resolution={} nominal_grid={resolution} accepted_grid={accepted} filled_faces_added={added} input_rows={n} parent_rows={parents} pooled_max={maximum} updates=25 component=transformer_1024 native_input=true vertices={} faces={} published_weight_bytes=3675626624 raw_decoder_weight_bytes=376614208 noise=philox_seed0_stream{stream} noise_boundary_D2H_H2D_bytes={} topology_equivalence=false presentation_repair=false timing=false",
+            resolution * 8,
+            mesh.vertices.len() / 3,
+            mesh.faces.len() / 3,
+            n * 32 * 8
+        );
+    }
+    println!(
+        "PASS N5_M4_LINKED_CASCADE case={case} rungs=64,128,192 image_encoder_calls=3,3 context_reused_per_rung=true prefix_noise=fixed_record high_noise=philox raw_meshes=3 timing=false"
+    );
+    cascade_resources(case)
+}
+
+fn cascade_resources(case: &str) -> Result<()> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    ensure!(
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0,
+        "native cascade getrusage failed"
+    );
+    let usage = unsafe { usage.assume_init() };
+    println!(
+        "N5_M4_NATIVE_RESOURCES case={case} peak_host_ru_maxrss_KiB={} proc_io={:?}",
+        usage.ru_maxrss,
+        std::fs::read_to_string("/proc/self/io")?
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
+fn hi3d_linked_cascade_cottage_gpu() -> Result<()> {
+    linked_image_cascade("cottage", 0)
+}
+#[test]
+#[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
+fn hi3d_linked_cascade_robot_gpu() -> Result<()> {
+    linked_image_cascade("robot_crab", 1)
 }
 
 struct Gate {

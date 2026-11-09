@@ -3,6 +3,8 @@
 #[path = "pixal3d_tests.rs"]
 mod tests;
 use super::sparse::{BatchGroupNorm, SparseConv};
+pub use super::sparse::{TriangleVoxels, adaptive_mesh_support, triangle_voxels};
+
 use super::{
     Device,
     blas::Blas,
@@ -1672,17 +1674,12 @@ impl Flow<f16> {
         component: &str,
         runtime: &Path,
         coordinates: &[[i32; 3]],
+        resolution: usize,
         budget: usize,
     ) -> Result<Self> {
         let checkpoint = Hi3DFlowCheckpoint::open(root, component)?;
+        checkpoint.spec.validate_grid(coordinates, resolution)?;
         let spec = checkpoint.spec.flow_spec();
-        ensure!(
-            coordinates
-                .iter()
-                .flatten()
-                .all(|&v| v >= 0 && (v as usize) < spec.resolution),
-            "flow coordinates outside configured grid"
-        );
         let sites = SparseSites::new(coordinates.iter().map(|p| [0, p[0], p[1], p[2]]).collect())?;
         let (parent, inverse) = sites.downsample(2)?;
         let rows = parent.coordinates().len();
@@ -1691,7 +1688,7 @@ impl Flow<f16> {
             "flow row extent overflow"
         );
         let device = Device::new(0)?;
-        let (free, _) = device.ctx.mem_get_info()?;
+        let (free, total) = device.ctx.mem_get_info()?;
         let h = spec.model_channels;
         let context_rows = 2917;
         let steps = 50;
@@ -1863,6 +1860,7 @@ impl Flow<f16> {
             .checked_add(sampler_bytes)
             .and_then(|n| n.checked_add(conditioning_bytes))
             .and_then(|n| n.checked_add(time_bytes))
+            .and_then(|n| n.checked_add(total / 16))
             .context("flow live bytes overflow")?;
         let remaining = device.workspace_budget(free, budget, live_bytes)?;
         let io = SparseFlowIo::new(
@@ -1878,9 +1876,11 @@ impl Flow<f16> {
         {
             let gather_bytes = io.blocks[2].conv[0].workspace_bytes() - io.rows * 27 * 4;
             println!(
-                "SPARSE_FLOW_PLACEMENT published_bytes={} config_affine_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} shared_gather_bytes={gather_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes}",
+                "SPARSE_FLOW_PLACEMENT published_bytes={} config_affine_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} shared_gather_bytes={gather_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes} device_reserve_bytes={} training_grid={} execution_grid={resolution} input_rows={io_rows} parent_rows={rows}",
                 checkpoint.runtime_bytes,
-                2 * spec.out_channels * 4
+                2 * spec.out_channels * 4,
+                total / 16,
+                checkpoint.spec.resolution
             );
         }
         Ok(Self {

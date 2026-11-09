@@ -8,6 +8,188 @@ pub struct SparseMesh {
     pub faces: Vec<i32>,
 }
 
+impl SparseMesh {
+    pub fn fill_holes(&mut self, capacity: usize) -> Result<usize> {
+        let vertices = self.vertices.len() / 3;
+        let faces = self.faces.len() / 3;
+        ensure!(
+            vertices > 0
+                && faces > 0
+                && self.vertices.len().is_multiple_of(3)
+                && self.faces.len().is_multiple_of(3)
+                && self.vertices.iter().all(|v| v.is_finite())
+                && self
+                    .faces
+                    .iter()
+                    .all(|&v| v >= 0 && (v as usize) < vertices),
+            "invalid boundary mesh buffers"
+        );
+        let edges = faces
+            .checked_mul(3)
+            .context("boundary edge extent overflow")?;
+        ensure!(
+            faces <= capacity && vertices <= u32::MAX as usize,
+            "boundary mesh capacity exceeded"
+        );
+        let edge = |ordinal: usize| {
+            let face = ordinal % faces;
+            let side = ordinal / faces;
+            [
+                self.faces[3 * face + side] as u32,
+                self.faces[3 * face + (side + 1) % 3] as u32,
+            ]
+        };
+        let mut incidence = (0..edges)
+            .map(|ordinal| {
+                let [a, b] = edge(ordinal);
+                ((u64::from(a.min(b)) << 32) | u64::from(a.max(b)), ordinal)
+            })
+            .collect::<Vec<_>>();
+        incidence.sort_unstable();
+        let mut boundary = Vec::new();
+        let mut first = 0;
+        while first < incidence.len() {
+            let mut end = first + 1;
+            while end < incidence.len() && incidence[end].0 == incidence[first].0 {
+                end += 1;
+            }
+            if end == first + 1 {
+                boundary.push(incidence[first].1);
+            }
+            first = end;
+        }
+        drop(incidence);
+        boundary.sort_unstable();
+        let boundary = boundary.into_iter().map(edge).collect::<Vec<_>>();
+        let mut offsets = vec![0usize; vertices + 1];
+        for &[a, _] in &boundary {
+            offsets[a as usize + 1] += 1;
+        }
+        for i in 1..offsets.len() {
+            offsets[i] += offsets[i - 1];
+        }
+        let mut slots = offsets[..vertices].to_vec();
+        let mut outgoing = vec![0; boundary.len()];
+        for (index, &[a, _]) in boundary.iter().enumerate() {
+            outgoing[slots[a as usize]] = index;
+            slots[a as usize] += 1;
+        }
+        drop(slots);
+        let mut used = vec![false; boundary.len()];
+        let mut added = Vec::new();
+        for start in 0..boundary.len() {
+            if used[start] {
+                continue;
+            }
+            let origin = boundary[start][0];
+            let mut index = start;
+            let mut polygon = Vec::new();
+            loop {
+                used[index] = true;
+                let [a, b] = boundary[index];
+                polygon.push(a);
+                if b == origin {
+                    if (3..=10_000).contains(&polygon.len()) {
+                        triangulate_boundary(&self.vertices, &mut polygon, &mut added)?;
+                    }
+                    break;
+                }
+                let span = offsets[b as usize]..offsets[b as usize + 1];
+                let next = outgoing[span].iter().copied().find(|&i| !used[i]);
+                if let Some(next) = next {
+                    index = next;
+                } else {
+                    break;
+                }
+            }
+        }
+        let required = faces
+            .checked_add(added.len() / 3)
+            .context("filled face count overflow")?;
+        ensure!(
+            required <= capacity,
+            "filled mesh needs {required} faces, capacity {capacity}"
+        );
+        let count = added.len() / 3;
+        self.faces.extend(added);
+        Ok(count)
+    }
+}
+
+fn triangulate_boundary(
+    vertices: &[f32],
+    polygon: &mut Vec<u32>,
+    output: &mut Vec<i32>,
+) -> Result<()> {
+    let point =
+        |v: u32| <[f32; 3]>::try_from(&vertices[3 * v as usize..3 * v as usize + 3]).unwrap();
+    let sub = |a: [f32; 3], b: [f32; 3]| std::array::from_fn::<_, 3, _>(|i| a[i] - b[i]);
+    let dot = |a: [f32; 3], b: [f32; 3]| (0.0 + a[0] * b[0] + a[1] * b[1]) + a[2] * b[2];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    while polygon.len() > 3 {
+        let n = polygon.len();
+        let mut center = [0f32; 3];
+        for &index in polygon.iter() {
+            for (sum, value) in center.iter_mut().zip(point(index)) {
+                *sum += value;
+            }
+        }
+        for value in &mut center {
+            *value /= n as f32;
+        }
+        let tangents = (0..n)
+            .map(|i| {
+                let t = sub(point(polygon[(i + 1) % n]), point(polygon[i]));
+                let length = dot(t, t).sqrt() + 1e-6;
+                t.map(|v| v / length)
+            })
+            .collect::<Vec<_>>();
+        let mut ear = 0;
+        let mut best = f32::NEG_INFINITY;
+        for i in 0..n {
+            let previous = tangents[(i + n - 1) % n];
+            let normal = cross(previous.map(|v| -v), tangents[i]);
+            let radial = cross(
+                sub(point(polygon[(i + 1) % n]), center),
+                sub(point(polygon[i]), center),
+            );
+            let side = dot(radial, normal);
+            let sign = if side > 0.0 {
+                1.0
+            } else if side < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            let angle = (dot(normal, normal).sqrt() * sign).atan2(-dot(previous, tangents[i]));
+            ensure!(angle.is_finite(), "nonfinite boundary angle");
+            let score = if angle == 0.0 {
+                f32::INFINITY
+            } else {
+                angle.recip()
+            };
+            if score > best {
+                best = score;
+                ear = i;
+            }
+        }
+        output.extend([
+            polygon[(ear + 1) % n] as i32,
+            polygon[ear] as i32,
+            polygon[(ear + n - 1) % n] as i32,
+        ]);
+        polygon.remove(ear);
+    }
+    output.extend(polygon.iter().rev().map(|&v| v as i32));
+    Ok(())
+}
+
 fn cube_edge_corners(edge: usize) -> [usize; 2] {
     let axis = edge / 4;
     let compressed = edge % 4;
@@ -153,6 +335,44 @@ pub struct SerializedWindows {
     pub(crate) offsets: Vec<u32>,
 }
 impl SparseSites {
+    pub fn unit_ball_frame(&self) -> Result<[[f32; 4]; 4]> {
+        let batch = self.coordinates[0][0];
+        ensure!(
+            self.coordinates.iter().all(|p| p[0] == batch),
+            "unit-ball frame requires one sample"
+        );
+        let mut sum = [0u64; 3];
+        for p in &self.coordinates {
+            for a in 0..3 {
+                sum[a] = sum[a]
+                    .checked_add(p[a + 1] as u64)
+                    .context("coordinate sum overflow")?;
+            }
+        }
+        let inverse = 1.0f32 / self.coordinates.len() as f32;
+        let center = sum.map(|v| v as f32 * inverse);
+        let radius = self
+            .coordinates
+            .iter()
+            .map(|p| {
+                let d: [f32; 3] = std::array::from_fn(|a| p[a + 1] as f32 - center[a]);
+                ((d[0] * d[0] + d[2] * d[2]) + d[1] * d[1]).sqrt()
+            })
+            .fold(0f32, f32::max)
+            + 1e-8;
+        ensure!(
+            radius.is_finite() && radius > 0.0,
+            "invalid unit-ball radius"
+        );
+        let mut frame = [[0.0; 4]; 4];
+        for a in 0..3 {
+            frame[a][a] = 1.0 / radius;
+            frame[a][3] = -center[a] / radius;
+        }
+        frame[3][3] = 1.0;
+        Ok(frame)
+    }
+
     pub fn cube_corners(&self) -> Result<SparseCorners> {
         let count = self
             .coordinates
@@ -504,6 +724,159 @@ impl SparseSites {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    #[ignore = "requires frozen raw meshes and oriented hole-fill faces; CPU only"]
+    fn sparse_mesh_fill_definition_cpu() -> Result<()> {
+        use crate::checkpoint::MappedCheckpoint;
+        use std::path::Path;
+        let root =
+            std::env::var_os("FF_HI3D_CASCADE_REFERENCE").context("cascade fixtures required")?;
+        let prefix = std::env::var_os("FF_HI3D_EXTRACTION_REFERENCE")
+            .context("raw mesh fixtures required")?;
+        let root = Path::new(&root);
+        let prefix = Path::new(&prefix);
+        let integers = |bank: &MappedCheckpoint, key: &str| -> Result<Vec<i32>> {
+            let t = bank.tensor(key)?;
+            match t.dtype() {
+                safetensors::Dtype::I32 => Ok(t
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b))
+                    .collect()),
+                safetensors::Dtype::I64 => t
+                    .data()
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| i32::try_from(i64::from_le_bytes(*b)).map_err(Into::into))
+                    .collect(),
+                _ => anyhow::bail!("mesh indices require signed integer storage"),
+            }
+        };
+        let canonical = |faces: &[i32]| {
+            let mut rows = faces
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| {
+                    let [a, b, c] = *p;
+                    [[a, b, c], [b, c, a], [c, a, b]].into_iter().min().unwrap()
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+        let mut records = 0;
+        let mut defects = 0;
+        for high in [false, true] {
+            let anchor_dir = root.join(if high {
+                "transition1024-sm86-released-r1"
+            } else {
+                "transition-sm86-full-r1"
+            });
+            for case in ["open_loop", "cottage", "robot_crab"] {
+                let anchor =
+                    MappedCheckpoint::open_component(&anchor_dir, &format!("{case}-fill"))?;
+                let source = if case == "open_loop" {
+                    anchor_dir.clone()
+                } else if high {
+                    root.join(format!("continued1024-{}-sm86-r1", case.replace('_', "-")))
+                } else {
+                    prefix.join(format!("linked-sm89-{case}-r1"))
+                };
+                let mapped = MappedCheckpoint::open_component(
+                    &source,
+                    if case == "open_loop" {
+                        "open_loop-fill"
+                    } else {
+                        "mesh"
+                    },
+                )?;
+                let t = mapped.tensor(if case == "open_loop" {
+                    "input_vertices"
+                } else {
+                    "vertices"
+                })?;
+                ensure!(
+                    t.dtype() == safetensors::Dtype::F32
+                        && t.shape().len() == 2
+                        && t.shape()[1] == 3,
+                    "mesh vertex layout differs"
+                );
+                let vertices = t
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect::<Vec<_>>();
+                let original = if case == "open_loop" {
+                    (0..7).flat_map(|i| [7, (i + 1) % 7, i]).collect::<Vec<_>>()
+                } else {
+                    integers(&mapped, "faces")?
+                };
+                let expected = integers(&anchor, "added_faces")?;
+                let capacity = original.len() / 3 + expected.len() / 3;
+                let mut mesh = SparseMesh {
+                    vertices,
+                    faces: original.clone(),
+                };
+                let count = mesh.fill_holes(capacity)?;
+                let actual_faces = canonical(&mesh.faces[original.len()..]);
+                let expected_faces = canonical(&expected);
+                let exact = actual_faces == expected_faces;
+                if !exact {
+                    let actual = actual_faces
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let expected = expected_faces
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    println!(
+                        "N5_M4_FILL_DIAGNOSTIC case={case} high={high} missing={} extra={} first_missing={:?} first_extra={:?}",
+                        expected.difference(&actual).count(),
+                        actual.difference(&expected).count(),
+                        expected.difference(&actual).take(8).collect::<Vec<_>>(),
+                        actual.difference(&expected).take(8).collect::<Vec<_>>()
+                    );
+                }
+                defects += usize::from(!exact);
+                ensure!(
+                    mesh.faces[..original.len()] == original,
+                    "fill changed original faces"
+                );
+                println!(
+                    "{} N5_M4_FILL case={case} high={high} original_faces={} added_faces={count} expected_faces={} oriented_exact={exact} skip_fill_control={}",
+                    if exact { "PASS" } else { "DEFECT" },
+                    original.len() / 3,
+                    expected.len() / 3,
+                    !expected.is_empty()
+                );
+                if case == "open_loop" {
+                    ensure!(
+                        count == 5 && capacity > 0,
+                        "skip-fill control failed to discriminate"
+                    );
+                    mesh.faces.truncate(original.len());
+                    ensure!(
+                        mesh.fill_holes(capacity - 1).is_err() && mesh.faces == original,
+                        "short fill capacity wrote output"
+                    );
+                }
+                records += 1;
+            }
+        }
+        println!(
+            "N5_M4_FILL_GATE records={records} defects={defects} short_capacity=rejected timing=false"
+        );
+        ensure!(defects == 0, "oriented boundary fill defects");
+        Ok(())
+    }
 
     struct ClosedCubeMesh {
         components: Vec<[i8; 12]>,
