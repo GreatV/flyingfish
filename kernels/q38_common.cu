@@ -1320,3 +1320,202 @@ extern "C" __global__ void mean_span_rows(
     for (int r = b; r < e; ++r) sum += __bfloat162float(x[(size_t)r * width + col]);
     out[(size_t)span * width + col] = __float2bfloat16_rn(sum / float(e - b));
 }
+
+// Weight-only RMS on dense rows [rows, width]: y = x * rsqrt(mean(x^2) + eps) * weight. One block of 256 per row.
+extern "C" __global__ void rms_rows_f32(
+    const float* __restrict__ x, const float* __restrict__ weight, float* __restrict__ y,
+    int rows, int width, float eps) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+        rows <= 0 || width <= 0 || gridDim.x != (unsigned)rows || !x || !weight || !y || !(eps > 0.f)) {
+        __trap();
+        return;
+    }
+    const float* row = x + (long long)blockIdx.x * width;
+    float* out = y + (long long)blockIdx.x * width;
+    float sum = 0.f;
+    for (int d = threadIdx.x; d < width; d += 256)
+        sum = __fadd_rn(sum, __fmul_rn(row[d], row[d]));
+    __shared__ float tmp[8];
+    const float inv = rsqrtf(__fadd_rn(block_sum(sum, tmp) / (float)width, eps));
+    for (int d = threadIdx.x; d < width; d += 256)
+        out[d] = __fmul_rn(__fmul_rn(row[d], inv), weight[d]);
+}
+
+// y[i] = y[i] + bias[i % width]. count is rows * width.
+extern "C" __global__ void row_bias_f32(float* __restrict__ y, const float* __restrict__ bias,
+    int count, int width) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= count || width <= 0 || !y || !bias) return;
+    y[i] = __fadd_rn(y[i], bias[i % width]);
+}
+
+// y[row, :] = table[codes[row], :], or added when accumulate != 0. table is [vocab, dim].
+extern "C" __global__ void codebook_gather_f32(
+    const float* __restrict__ table, const int* __restrict__ codes, float* __restrict__ y,
+    int rows, int vocab, int dim, int accumulate) {
+    const long long n = (long long)rows * dim;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || dim <= 0 || !table || !codes || !y) return;
+    const int row = (int)(i / dim);
+    const int d = (int)(i - (long long)row * dim);
+    const int code = codes[row];
+    if ((unsigned)code >= (unsigned)vocab) return;
+    const float v = table[(long long)code * dim + d];
+    y[i] = accumulate ? __fadd_rn(y[i], v) : v;
+}
+
+// Causal conv on [rows, in_dim]. Device weight is [kernel, in_per_group, out], left pad (kernel - 1) * dilation,
+// stride 1. residual is null or [rows, out] added after the bias.
+extern "C" __global__ void causal_conv_rows_f32(
+    const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
+    const float* __restrict__ residual, float* __restrict__ y,
+    int rows, int in_dim, int out_dim, int kernel, int dilation, int groups) {
+    if (!x || !w || !bias || !y || rows <= 0 || in_dim <= 0 || out_dim <= 0 || kernel <= 0 ||
+        dilation <= 0 || groups <= 0 || in_dim % groups != 0 || out_dim % groups != 0 ||
+        blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1) {
+        __trap();
+        return;
+    }
+    const int in_pg = in_dim / groups;
+    const int out_pg = out_dim / groups;
+    const int left = (kernel - 1) * dilation;
+    const int t = (int)blockIdx.x;
+    const int o = (int)blockIdx.y * 256 + (int)threadIdx.x;
+    if (t >= rows || o >= out_dim) return;
+    const int c0 = (o / out_pg) * in_pg;
+    float acc = bias[o];
+    for (int k = 0; k < kernel; ++k) {
+        const int src = t + k * dilation - left;
+        if ((unsigned)src >= (unsigned)rows) continue;
+        const float* xr = x + (long long)src * in_dim + c0;
+        const float* wk = w + ((long long)k * in_pg) * out_dim;
+        for (int c = 0; c < in_pg; ++c)
+            acc = __fmaf_rn(xr[c], wk[(long long)c * out_dim + o], acc);
+    }
+    if (residual) acc = __fadd_rn(acc, residual[(long long)t * out_dim + o]);
+    y[(long long)t * out_dim + o] = acc;
+}
+
+// Transposed conv, padding `pad`, writing the kept prefix of rows * stride. Weight is [in, out, kernel].
+// Tap k starts at (t + pad) % stride. Source row is (t + pad - k) / stride.
+extern "C" __global__ void conv_transpose_trim_rows_f32(
+    const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
+    float* __restrict__ out, int rows, int in_dim, int out_dim, int kernel, int stride, int pad) {
+    if (!x || !w || !bias || !out || rows <= 0 || in_dim <= 0 || out_dim <= 0 || kernel <= 0 ||
+        stride <= 0 || pad < 0 || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1) {
+        __trap();
+        return;
+    }
+    const long long out_rows = (long long)rows * stride;
+    for (long long t = (long long)blockIdx.x; t < out_rows; t += (long long)gridDim.x) {
+        for (int o = (int)threadIdx.x; o < out_dim; o += 256) {
+            float acc = 0.f;
+            const int start = (int)((t + pad) % stride);
+            for (int k = start; k < kernel; k += stride) {
+                const long long j = (t + pad - (long long)k) / stride;
+                if (j < 0 || j >= rows) continue;
+                const float* xr = x + j * in_dim;
+                for (int c = 0; c < in_dim; ++c) {
+                    const float wv = w[(((long long)c * out_dim + o) * kernel) + k];
+                    acc = __fmaf_rn(xr[c], wv, acc);
+                }
+            }
+            out[t * out_dim + o] = __fadd_rn(acc, bias[o]);
+        }
+    }
+}
+
+// cos/sin [rows, dim] from inv[dim/2], position t, duplicated across the two halves.
+extern "C" __global__ void rope_cos_sin_f32(
+    const float* __restrict__ inv, float* __restrict__ cosv, float* __restrict__ sinv,
+    int rows, int dim) {
+    const int half = dim >> 1;
+    const long long n = (long long)rows * half;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (half <= 0 || (dim & 1) || !inv || !cosv || !sinv) {
+        __trap();
+        return;
+    }
+    if (i >= n) return;
+    const int t = (int)(i / half);
+    const int k = (int)(i - (long long)t * half);
+    const float ang = (float)t * inv[k];
+    const float c = cosf(ang);
+    const float s = sinf(ang);
+    cosv[(long long)t * dim + k] = c;
+    cosv[(long long)t * dim + half + k] = c;
+    sinv[(long long)t * dim + k] = s;
+    sinv[(long long)t * dim + half + k] = s;
+}
+
+// Eager sliding attention. A key kv is kept when kv <= q and kv > q - window. RoPE rotate_half is
+// cat(-x2, x1) on the two halves. head dim is 64.
+extern "C" __global__ void slide_rope_attn_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ cosv, const float* __restrict__ sinv, float* __restrict__ y,
+    int rows, int heads, int dim, int window, float scale) {
+    if (!q || !k || !v || !cosv || !sinv || !y || rows <= 0 || heads <= 0 || dim != 64 ||
+        window <= 0 || window > 128 || !isfinite(scale)) {
+        __trap();
+        return;
+    }
+    const int pair = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (pair >= rows * heads) return;
+    const int t = pair / heads;
+    const int h = pair - t * heads;
+    const int half = 32;
+    float qr[64];
+    const float* qh = q + ((long long)t * heads + h) * dim;
+    const float* ct = cosv + (long long)t * dim;
+    const float* st = sinv + (long long)t * dim;
+    for (int d = 0; d < half; ++d) {
+        const float q1 = qh[d];
+        const float q2 = qh[half + d];
+        const float c = ct[d];
+        const float s = st[d];
+        qr[d] = __fsub_rn(__fmul_rn(q1, c), __fmul_rn(q2, s));
+        qr[half + d] = __fadd_rn(__fmul_rn(q2, c), __fmul_rn(q1, s));
+    }
+    int k0 = t - window + 1;
+    if (k0 < 0) k0 = 0;
+    const int nkeep = t - k0 + 1;
+    float scores[128];
+    float m = -INFINITY;
+    for (int i = 0; i < nkeep; ++i) {
+        const int kv = k0 + i;
+        const float* kh = k + ((long long)kv * heads + h) * dim;
+        const float* ck = cosv + (long long)kv * dim;
+        const float* sk = sinv + (long long)kv * dim;
+        float dot = 0.f;
+        for (int d = 0; d < half; ++d) {
+            const float k1 = kh[d];
+            const float k2 = kh[half + d];
+            const float c = ck[d];
+            const float s = sk[d];
+            const float r1 = __fsub_rn(__fmul_rn(k1, c), __fmul_rn(k2, s));
+            const float r2 = __fadd_rn(__fmul_rn(k2, c), __fmul_rn(k1, s));
+            dot = __fmaf_rn(qr[d], r1, dot);
+            dot = __fmaf_rn(qr[half + d], r2, dot);
+        }
+        const float score = __fmul_rn(dot, scale);
+        scores[i] = score;
+        m = fmaxf(m, score);
+    }
+    float sum = 0.f;
+    for (int i = 0; i < nkeep; ++i) {
+        const float e = expf(__fsub_rn(scores[i], m));
+        scores[i] = e;
+        sum = __fadd_rn(sum, e);
+    }
+    const float inv = __fdiv_rn(1.f, sum);
+    float acc[64];
+    for (int d = 0; d < 64; ++d) acc[d] = 0.f;
+    for (int i = 0; i < nkeep; ++i) {
+        const float p = __fmul_rn(scores[i], inv);
+        const float* vh = v + ((long long)(k0 + i) * heads + h) * dim;
+        for (int d = 0; d < 64; ++d) acc[d] = __fmaf_rn(p, vh[d], acc[d]);
+    }
+    float* yh = y + ((long long)t * heads + h) * dim;
+    for (int d = 0; d < 64; ++d) yh[d] = acc[d];
+}
