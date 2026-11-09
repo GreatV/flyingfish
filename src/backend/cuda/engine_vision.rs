@@ -13586,9 +13586,12 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    fn pixal_anchor(root: &std::path::Path) -> Result<serde_json::Value> {
+    fn pixal_anchor() -> Result<serde_json::Value> {
         let anchor: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("M2-CONDITIONING-FREEZE-r2.json"))?)?;
+            serde_json::from_slice(&std::fs::read(std::path::PathBuf::from(
+                std::env::var_os("FF_PIXAL_CONDITIONING_FREEZE")
+                    .context("FF_PIXAL_CONDITIONING_FREEZE")?,
+            ))?)?;
         ensure!(
             anchor["anchor"] == "r0a"
                 && anchor["tau_changed"] == true
@@ -13666,7 +13669,9 @@ mod tests {
             .as_array()
             .context("MV1 cells")?;
         ensure!(cells.len() == 4, "MV1 coverage");
-        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let root = PathBuf::from(
+            std::env::var_os("FF_PIXAL_CONDITIONING_ROOT").context("FF_PIXAL_CONDITIONING_ROOT")?,
+        );
         let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
         let naf = PathBuf::from(std::env::var_os("FF_NAF_MODEL").context("FF_NAF_MODEL")?);
         let runtime_dir = PathBuf::from(
@@ -13774,7 +13779,9 @@ mod tests {
     fn pixal_conditioning_owned_projection_gpu() -> Result<()> {
         use crate::backend::cuda::closure::Closure;
         use std::{path::PathBuf, rc::Rc};
-        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let root = PathBuf::from(
+            std::env::var_os("FF_PIXAL_CONDITIONING_ROOT").context("FF_PIXAL_CONDITIONING_ROOT")?,
+        );
         let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
         let project = root
             .parent()
@@ -13908,19 +13915,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GPU published Pixal conditioning reference; FF_P1_M2_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
+    #[ignore = "GPU published Pixal conditioning reference; FF_PIXAL_CONDITIONING_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
     #[cfg(feature = "cuda")]
     fn pixal_conditioning_definition_gpu() -> Result<()> {
         use crate::backend::cuda::closure::Closure;
         use std::{path::PathBuf, rc::Rc};
-        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let root = PathBuf::from(
+            std::env::var_os("FF_PIXAL_CONDITIONING_ROOT").context("FF_PIXAL_CONDITIONING_ROOT")?,
+        );
         let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
         let naf = PathBuf::from(std::env::var_os("FF_NAF_MODEL").context("FF_NAF_MODEL")?);
         let project = root
             .parent()
             .and_then(|p| p.parent())
             .context("evidence root")?;
-        let anchor = pixal_anchor(&root)?;
+        let anchor = pixal_anchor()?;
         let inputs_file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
         let inputs_map = unsafe { memmap2::MmapOptions::new().map(&inputs_file)? };
         let inputs = safetensors::SafeTensors::deserialize(&inputs_map)?;
@@ -13999,9 +14008,11 @@ mod tests {
                 let camera = pixal_camera(&inputs, project, name)?;
                 native.stage_rgba(s, rgba.data(), [rgba.shape()[0], rgba.shape()[1]], camera)?;
                 let reference_file = std::fs::File::open(
-                    project
-                        .join("evidence/P1-M1-r1")
-                        .join(format!("conditioning-{stage}-r0a/{name}.safetensors")),
+                    std::path::PathBuf::from(
+                        std::env::var_os("FF_PIXAL_SS_REFERENCE")
+                            .context("FF_PIXAL_SS_REFERENCE")?,
+                    )
+                    .join(format!("conditioning-{stage}-r0a/{name}.safetensors")),
                 )?;
                 let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
                 let reference = safetensors::SafeTensors::deserialize(&reference_map)?;
@@ -14156,19 +14167,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GPU published Pixal multi-view reference; FF_P1_M2_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
+    #[ignore = "GPU published Pixal multi-view reference; FF_PIXAL_CONDITIONING_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
     #[cfg(feature = "cuda")]
     fn pixal_multiview_definition_gpu() -> Result<()> {
         use crate::backend::cuda::closure::Closure;
         use std::{path::PathBuf, rc::Rc};
-        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let root = PathBuf::from(
+            std::env::var_os("FF_PIXAL_CONDITIONING_ROOT").context("FF_PIXAL_CONDITIONING_ROOT")?,
+        );
         let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
         let naf = PathBuf::from(std::env::var_os("FF_NAF_MODEL").context("FF_NAF_MODEL")?);
-        let project = root
-            .parent()
-            .and_then(|p| p.parent())
-            .context("evidence root")?;
-        let anchor = pixal_anchor(&root)?;
+        let anchor = pixal_anchor()?;
         let input_file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
         let input_map = unsafe { memmap2::MmapOptions::new().map(&input_file)? };
         let inputs = safetensors::SafeTensors::deserialize(&input_map)?;
@@ -14216,9 +14225,11 @@ mod tests {
             )?;
             for count in [1u32, 2, 4, 9] {
                 let reference_file = std::fs::File::open(
-                    project
-                        .join("evidence/P1-M1-r1")
-                        .join(format!("mv-conditioning-{stage}-r0a/V{count}.safetensors")),
+                    std::path::PathBuf::from(
+                        std::env::var_os("FF_PIXAL_SS_REFERENCE")
+                            .context("FF_PIXAL_SS_REFERENCE")?,
+                    )
+                    .join(format!("mv-conditioning-{stage}-r0a/V{count}.safetensors")),
                 )?;
                 let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
                 let reference = safetensors::SafeTensors::deserialize(&reference_map)?;
@@ -14379,16 +14390,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GPU published projection reference; FF_P1_M2_ROOT"]
+    #[ignore = "GPU published projection reference; FF_PIXAL_CONDITIONING_ROOT"]
     #[cfg(feature = "cuda")]
     fn project_bilinear_definition_gpu() -> Result<()> {
         use std::path::PathBuf;
-        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let root = PathBuf::from(
+            std::env::var_os("FF_PIXAL_CONDITIONING_ROOT").context("FF_PIXAL_CONDITIONING_ROOT")?,
+        );
         let project = root
             .parent()
             .and_then(|p| p.parent())
             .context("evidence root")?;
-        let anchor = pixal_anchor(&root)?;
+        let anchor = pixal_anchor()?;
         let table = anchor["tables"]
             .as_array()
             .context("tables")?
@@ -14440,9 +14453,11 @@ mod tests {
                         .launch(grid(1, 1))?;
                 }
                 let reference_file = std::fs::File::open(
-                    project
-                        .join("evidence/P1-M1-r1/projection-local")
-                        .join(format!("{grid_side}-{name}.safetensors")),
+                    std::path::PathBuf::from(
+                        std::env::var_os("FF_PIXAL_PROJECTION_REFERENCE")
+                            .context("FF_PIXAL_PROJECTION_REFERENCE")?,
+                    )
+                    .join(format!("{grid_side}-{name}.safetensors")),
                 )?;
                 let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
                 let reference = safetensors::SafeTensors::deserialize(&reference_map)?;

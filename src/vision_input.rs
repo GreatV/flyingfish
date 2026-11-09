@@ -2130,10 +2130,11 @@ mod resampling_tests {
     }
 
     #[test]
-    #[ignore = "CPU publisher RGBA/Lanczos fixtures; set FF_P1_M2_ROOT"]
+    #[ignore = "CPU publisher RGBA/Lanczos fixtures; set FF_PIXAL_CONDITIONING_ROOT"]
     fn pixal_preprocessing_matches_publisher_bytes() -> Result<()> {
-        let root =
-            std::path::PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let root = std::path::PathBuf::from(
+            std::env::var_os("FF_PIXAL_CONDITIONING_ROOT").context("FF_PIXAL_CONDITIONING_ROOT")?,
+        );
         let bytes = std::fs::read(root.join("gate-inputs.safetensors"))?;
         let inputs = safetensors::SafeTensors::deserialize(&bytes)?;
         for name in ["cottage", "robot_crab"] {

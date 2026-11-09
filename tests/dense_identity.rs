@@ -9,14 +9,14 @@ use flyingfish::{
 use std::{io::Write, path::PathBuf};
 
 #[test]
-#[ignore = "requires GPU lease, FF_ARGMAX_MODEL, FLYINGFISH_RUNTIME_DIR and FF_DENSE_EVIDENCE"]
+#[ignore = "requires GPU lease, FF_ARGMAX_MODEL, FLYINGFISH_RUNTIME_DIR and FF_DENSE_CAPTURE_DIR"]
 fn dense_model_identity_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window not acknowledged"
     );
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
-    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_CAPTURE_DIR")?);
     let settings = Settings {
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -193,7 +193,7 @@ fn hybrid_model_identity_gpu() -> Result<()> {
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
     let vocab = specification.vocab as usize;
     let steps = fixtures["steps"].as_u64().context("hybrid steps missing")? as usize;
-    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_CAPTURE_DIR")?);
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let settings = reference_settings(&runtime);
     drop(Model::calibrate(
@@ -272,10 +272,10 @@ fn hybrid_model_identity_gpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires FF_DENSE_REFERENCE and captured hybrid-model FF_DENSE_EVIDENCE"]
+#[ignore = "requires FF_DENSE_REFERENCE and captured hybrid-model FF_DENSE_CAPTURE_DIR"]
 fn hybrid_model_reference_outputs() -> Result<()> {
     let reference = PathBuf::from(std::env::var("FF_DENSE_REFERENCE")?);
-    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_CAPTURE_DIR")?);
     let (fixtures, specification) = hybrid_reference_fixtures()?;
     let cases = fixtures["cases"]
         .as_array()
@@ -396,7 +396,7 @@ fn dense_dspark_identity_gpu() -> Result<()> {
     );
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
     let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
-    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_CAPTURE_DIR")?);
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let mut cells = 0;
     for (budget, chunk) in [
@@ -630,7 +630,7 @@ fn dense_model_reference_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
-    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_CAPTURE_DIR")?);
     let reference = PathBuf::from(std::env::var("FF_DENSE_REFERENCE")?);
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let fixtures: ReferenceFixtures =

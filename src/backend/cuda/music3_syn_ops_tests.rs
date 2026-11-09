@@ -205,7 +205,7 @@ mod encoder {
     /// Condition encoder against the frozen-r1 cell (max 0.12478924 /
     /// rmse 0.01145017); layer-swap control must exceed the bound.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CONDITION, FF_MUSIC3_FROZEN_R1"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CONDITION, FF_MUSIC3_FROZEN_SYN_OPS"]
     fn music3_syn_cond_encoder_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
@@ -219,7 +219,7 @@ mod encoder {
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
         let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_R1")?),
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_SYN_OPS")?),
         )?)?;
         let bound_max = frozen["cells"]["condition_encoder"]["bound"]["max"]
             .as_f64()
@@ -315,7 +315,7 @@ mod vocoder_gate {
     /// Vocoder against the frozen-r1 final_audio cell; negated-latent
     /// control must exceed the bound.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN_R1"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN_SYN_OPS"]
     fn music3_syn_vocoder_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
@@ -329,7 +329,7 @@ mod vocoder_gate {
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
         let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_R1")?),
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_SYN_OPS")?),
         )?)?;
         let bound_max = frozen["cells"]["final_audio"]["bound"]["max"]
             .as_f64()
@@ -510,7 +510,7 @@ mod end_to_end {
     /// initial latent must exceed the bound; the zero condition input
     /// must exceed 10x the max bound.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN_R1"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN_SYN_OPS"]
     fn music3_syn_end_to_end_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
@@ -527,7 +527,7 @@ mod end_to_end {
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
         let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_R1")?),
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_SYN_OPS")?),
         )?)?;
         let bound_max = frozen["cells"]["final_audio"]["bound"]["max"]
             .as_f64()
@@ -650,7 +650,7 @@ mod e2e {
             std::path::PathBuf::from(std::env::var("FF_MUSIC3_E2E_CODES")?),
         )?)?;
         let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_R5")?),
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_E2E_HANDOFF")?),
         )?)?;
         let c = &frozen["cells"]["condition_input"]["bound"];
         let handoff_bound = (
@@ -686,7 +686,7 @@ mod e2e {
     /// philox_normal_f32(seed, stream, count) launch, and the seed+1
     /// control must differ.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_R5"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_E2E_HANDOFF"]
     fn music3_e2e_handoff_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let model =
@@ -792,7 +792,7 @@ mod e2e {
     /// bit-identical; the PCM is scored against the drawn-chain freeze
     /// consumed by a definition run of the same draws.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_R7"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_FREE_RUN"]
     fn music3_e2e_free_run_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let model =
@@ -874,7 +874,7 @@ mod e2e {
             )?;
             println!("M3E2E_DRAW_OUT dumped to {}", out.display());
         }
-        let frozen: serde_json::Value = match std::env::var("FF_MUSIC3_FROZEN_R7") {
+        let frozen: serde_json::Value = match std::env::var("FF_MUSIC3_FROZEN_FREE_RUN") {
             Ok(path) => serde_json::from_slice(&std::fs::read(path)?)?,
             Err(_) => {
                 println!("M3E2E_DRAW_AUDIO phase=dump (no drawn-chain freeze set)");
@@ -1025,15 +1025,15 @@ mod pair_flow {
             .map(|(a, b)| (a - b).abs() as f64)
             .fold(0.0, f64::max);
         println!(
-            "PAIR_FLOW cond max_abs={dc:.6e} uncond max_abs={du:.6e} (frozen-r3-syn cells: cond 9.796142e-03, uncond 2.662754e-02)"
+            "PAIR_FLOW cond max_abs={dc:.6e} uncond max_abs={du:.6e} (FF_MUSIC3_FROZEN cells: cond 9.796142e-03, uncond 2.662754e-02)"
         );
         ensure!(
             dc <= 9.796142e-3,
-            "pair cond velocity exceeds the frozen-r3-syn cell"
+            "pair cond velocity exceeds the FF_MUSIC3_FROZEN cell"
         );
         ensure!(
             du <= 2.662754e-2,
-            "pair uncond velocity exceeds the frozen-r3-syn cell"
+            "pair uncond velocity exceeds the FF_MUSIC3_FROZEN cell"
         );
         Ok(())
     }
