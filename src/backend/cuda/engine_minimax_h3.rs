@@ -5792,6 +5792,136 @@ mod tests {
         Ok([max, (dd / rr).sqrt(), cr / (cc * rr).sqrt()])
     }
 
+    #[test]
+    fn video_tile_batch_capacity() -> Result<()> {
+        let spec = crate::minimax_h3::VaeSpec {
+            in_channels: 3,
+            out_channels: 3,
+            latent_channels: 24,
+            block_out_channels: vec![128, 256, 256, 512, 512, 1024],
+            layers_per_block: 2,
+            spatial_factors: vec![2, 2, 2, 2, 1, 1],
+            temporal_factors: vec![1, 2, 2, 1, 1, 1],
+            spatial_ratio: 16,
+            temporal_ratio: 4,
+            dim: 2048,
+            layers: 36,
+            heads: 32,
+            head_dim: 64,
+            registers: 4,
+            ffn: 8192,
+            rope_theta: 100.0,
+            rope_dims: 48,
+            norm_eps: 1e-5,
+            clip_length: 17,
+            token_drop: 3,
+            groups: 32,
+            encoder_eps: 1e-6,
+            latents_mean: vec![0.0; 24],
+            latents_std: vec![1.0; 24],
+        };
+        let shape = (7, 16, 16);
+        assert_eq!(
+            vae::TileWork::batch_bytes(&spec, shape, 1, 28)?,
+            vae::TileWork::bytes(&spec, shape)
+        );
+        assert_eq!(
+            vae::TileWork::batch_bytes(&spec, shape, 3, 28)?,
+            630_933_552
+        );
+        assert_eq!(
+            vae::TileWork::batch_bytes(&spec, shape, 28, 28)?,
+            5_885_131_636
+        );
+        assert!(vae::TileWork::batch_bytes(&spec, shape, 0, 28).is_err());
+        assert!(vae::TileWork::batch_bytes(&spec, shape, 29, 28).is_err());
+        assert!(vae::TileWork::batch_bytes(&spec, (usize::MAX, 16, 16), 1, 28).is_err());
+        Ok(())
+    }
+
+    /// Setup receipts precede the first video tile in standalone and released-transformer pipeline contexts.
+    #[test]
+    #[ignore = "GPU; FF_MODEL, FF_H3_LORA, FF_H3_S0, FF_H3_CELL, FF_H3_PLACEMENT"]
+    fn video_decoder_batch_setup_gpu() -> Result<()> {
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let s0 = path("FF_H3_S0")?;
+        let cell = std::env::var("FF_H3_CELL")?;
+        ensure!(
+            matches!(cell.as_str(), "A" | "P"),
+            "unknown setup cell {cell}"
+        );
+        let placement = std::env::var("FF_H3_PLACEMENT")?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-vae-setup-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            match placement.as_str() {
+                "standalone" => {
+                    let spec = crate::minimax_h3::VaeSpec::read(&model)?;
+                    let dir = model.join("vae");
+                    let manifest =
+                        MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+                            .minimax_h3_vae_manifest(&spec)?;
+                    let input_map = mapped(&s0.join(format!("{cell}-bf16/decode.safetensors")))?;
+                    let file = SafeTensors::deserialize(&input_map)?;
+                    let input = file.tensor("video_decoder_input")?;
+                    let shape = input.shape();
+                    ensure!(
+                        input.dtype() == Dtype::F32
+                            && shape.len() == 5
+                            && shape[0] == 1
+                            && shape[1] == spec.latent_channels,
+                        "decoder setup input layout"
+                    );
+                    let device = Device::new(0)?;
+                    let ops = Ops::new(&device.ctx)?;
+                    device.finish_upload()?;
+                    let mut blas = Blas::new(
+                        &device,
+                        &ops,
+                        &runtime,
+                        Rc::new(Closure::new(true, "VAE setup gate".into())),
+                    )?;
+                    let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
+                    let tiles = crate::minimax_h3::VaeTiles::released(
+                        &spec,
+                        shape[3] * spec.spatial_ratio,
+                        shape[4] * spec.spatial_ratio,
+                    )?;
+                    decoder.batch_setup(
+                        &device,
+                        &mut blas,
+                        &tiles,
+                        (shape[2], shape[3], shape[4]),
+                    )?;
+                }
+                "pipeline" => {
+                    let request = seeded_request(&s0, &cell, 42)?;
+                    let result =
+                        pipeline::decoder_setup(&model, &path("FF_H3_LORA")?, &request, &runtime);
+                    match result {
+                        Err(error) if error.to_string() == "H3_VAE_SETUP_COMPLETE" => (),
+                        Err(error) => return Err(error),
+                        Ok(_) => bail!("pipeline setup probe ran past the decoder boundary"),
+                    }
+                }
+                _ => bail!("unknown setup placement {placement}"),
+            }
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
+        result?;
+        cleanup?;
+        println!(
+            "H3_VAE_BATCH_SETUP_GATE PASS cell={cell} placement={placement} numerical_candidate_executed=false model_cells_scored=0"
+        );
+        Ok(())
+    }
+
     /// N7a gate: the native video VAE decoder on the Stage 0 captured decoder input of cells A and P against the CUDA
     /// FP32 replay, whole video and the temporally cross-faded frames, under the frozen thresholds-n7n8.json bounds;
     /// the engine's BF16 cast set equals the reference load's dtype dump; tiling off must fail.

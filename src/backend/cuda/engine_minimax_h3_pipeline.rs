@@ -256,6 +256,26 @@ pub(crate) fn run(
     (index, runtime): (usize, &Path),
     gguf: Option<&Path>,
 ) -> Result<Generated> {
+    run_mode::<false>(model, lora, request, (index, runtime), gguf)
+}
+
+#[cfg(test)]
+pub(crate) fn decoder_setup(
+    model: &Path,
+    lora: &Path,
+    request: &H3Request,
+    runtime: &Path,
+) -> Result<Generated> {
+    run_mode::<true>(model, lora, request, (0, runtime), None)
+}
+
+fn run_mode<const SETUP_ONLY: bool>(
+    model: &Path,
+    lora: &Path,
+    request: &H3Request,
+    (index, runtime): (usize, &Path),
+    gguf: Option<&Path>,
+) -> Result<Generated> {
     let device = Device::new(index)?;
     let ops = Ops::new(&device.ctx)?;
     let s = &device.stream;
@@ -450,6 +470,11 @@ pub(crate) fn run(
         "decoders {weights} B plus decode work {work_bytes} B do not fit the {free_after} B free after releasing the transformer and conditioner"
     );
     let decoder = VideoDecoder::new(&device, &vae, &vae_dir, &vae_manifest)?;
+    #[cfg(test)]
+    if SETUP_ONLY {
+        decoder.batch_setup(&device, &mut blas, &tiles, (latent_frames, lh, lw))?;
+        anyhow::bail!("H3_VAE_SETUP_COMPLETE");
+    }
     let mut work = TileWork::new(s, &vae, tile)?;
     work.prepare(s, &mut blas, &decoder)?;
     let mut decoded = s.alloc_zeros::<bf16>(vae.out_channels * total_frames * pixels)?;

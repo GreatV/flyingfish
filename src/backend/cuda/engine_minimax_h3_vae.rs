@@ -166,6 +166,154 @@ pub(crate) struct VideoDecoder {
 }
 
 impl VideoDecoder {
+    #[cfg(test)]
+    pub(crate) fn batch_setup(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        tiles: &VaeTiles,
+        (frames, height, width): (usize, usize, usize),
+    ) -> Result<serde_json::Value> {
+        let spec = &self.spec;
+        let shape = (
+            spec.chunk_latents() + spec.overlap_latents(),
+            tiles.height / spec.spatial_ratio,
+            tiles.width / spec.spatial_ratio,
+        );
+        let patches = shape.0 * shape.1 * shape.2;
+        let tokens = patches + spec.registers + 1;
+        let plan = DecodePlan::new(spec, frames)?;
+        ensure!(
+            plan.pad == 0,
+            "batch setup requires unpadded temporal input"
+        );
+        let kept = spec.chunk_latents() * spec.temporal_ratio - spec.frame_pre_padding();
+        let tail_frames = shape.0 * spec.temporal_ratio
+            - spec.chunk_latents() * spec.temporal_ratio
+            - spec.frame_pre_padding();
+        let output_frames = plan.chunks * kept + tail_frames;
+        let pixels = height * width * spec.spatial_ratio * spec.spatial_ratio;
+        let output = 2 * spec.out_channels * output_frames * pixels;
+        let latent = 4 * spec.latent_channels * frames * height * width;
+        let stitch = decode_bytes(
+            spec,
+            tiles,
+            (height * spec.spatial_ratio, width * spec.spatial_ratio),
+        );
+        let grid =
+            4 * (tiles.rows.0.len() + tiles.rows.1.len() + tiles.cols.0.len() + tiles.cols.1.len());
+        device.stream.synchronize()?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let reserve = total / 16;
+        let mandatory = output + latent + stitch + grid;
+        let budget = device.workspace_budget(free, free, mandatory + reserve)?;
+        let workspace_before = blas.workspace_bytes();
+        self.post_quant.prepare(&device.stream, blas, patches)?;
+        self.proj_in.prepare(&device.stream, blas, patches)?;
+        for (owner, linear) in self.linears().enumerate() {
+            linear.prepare(&device.stream, blas, tokens)?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vae_bias_owner": {
+                    "owner":owner,"bias_pointer":pointer(&linear.bias,&device.stream),
+                    "output":linear.out,"input":linear.input,"canonical_rows":tokens
+                }})
+            );
+        }
+        let slots = tiles.count();
+        let mut choices = Vec::new();
+        for batch in 1..=slots {
+            let tail = slots % batch;
+            let groups = slots.div_ceil(batch);
+            let work = TileWork::batch_bytes(spec, shape, batch, slots)?;
+            let query = (|| -> Result<(f64, usize)> {
+                let mut cost = 0.0;
+                let mut workspace = 0;
+                for (owner, linear) in self.linears().enumerate() {
+                    for (active, count) in [(batch, slots / batch), (tail, 1)] {
+                        if active == 0 || count == 0 {
+                            continue;
+                        }
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"h3_vae_batch_query": {
+                                "batch":batch,"active":active,"owner":owner,"multiplicity":count
+                            }})
+                        );
+                        let rows = active * tokens;
+                        let (multiplier, bytes) = blas.biased_family_cost(
+                            crate::backend::setup::LinearShape {
+                                rows,
+                                output: linear.out,
+                                input: linear.input,
+                            },
+                            tokens,
+                            vector(&linear.bias, &device.stream)?,
+                        )?;
+                        cost += 2.0
+                            * rows as f64
+                            * linear.out as f64
+                            * linear.input as f64
+                            * multiplier
+                            * count as f64;
+                        workspace = workspace.max(bytes);
+                    }
+                }
+                ensure!(
+                    cost.is_finite() && cost > 0.0,
+                    "invalid tile tensor cost {cost}"
+                );
+                Ok((cost, workspace))
+            })();
+            let (cost, workspace) = match query {
+                Ok(value) => value,
+                Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
+                    .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
+                    eprintln!("H3_VAE_BATCH_REJECT batch={batch} reason={error:#}");
+                    continue;
+                }
+                Err(error) => return Err(error.context(format!("tile batch {batch}"))),
+            };
+            let replacement = if workspace > workspace_before {
+                workspace
+            } else {
+                0
+            };
+            let peak = work
+                .checked_add(replacement)
+                .context("tile batch peak overflow")?;
+            let launches = plan.chunks * (544 * groups + 4 * slots) + 2 * plan.chunks - 1;
+            let record = serde_json::json!({"batch":batch,"tail":tail,"groups_per_chunk":groups,
+                "full_rows":batch*tokens,"tail_rows":tail*tokens,"work_bytes":work,
+                "max_workspace_bytes":workspace,"workspace_replacement_bytes":replacement,
+                "peak_new_allocation_bytes":peak,"tensor_cost":cost,"launches":launches,
+                "within_budget":peak<=budget});
+            eprintln!("{}", serde_json::json!({"h3_vae_batch_candidate":record}));
+            choices.push((batch, peak, cost, launches, record));
+        }
+        ensure!(
+            choices
+                .iter()
+                .any(|(b, p, _, _, _)| *b == 1 && *p <= budget),
+            "minimum serial tile work does not fit workspace budget {budget}"
+        );
+        let chosen = choices
+            .iter()
+            .filter(|(_, p, _, _, _)| *p <= budget)
+            .min_by(|a, b| a.2.total_cmp(&b.2).then(a.3.cmp(&b.3)).then(a.1.cmp(&b.1)))
+            .context("no legal tile batch")?;
+        let result = serde_json::json!({"tokens_per_tile":tokens,"patches_per_tile":patches,
+            "slots":slots,"temporal_chunks":plan.chunks,"output_frames":output_frames,
+            "free_before_work_bytes":free,"total_bytes":total,"safety_reserve_bytes":reserve,
+            "future_output_bytes":output,"future_latent_bytes":latent,"future_stitch_bytes":stitch,
+            "future_grid_bytes":grid,"mandatory_future_bytes":mandatory,"workspace_budget_bytes":budget,
+            "workspace_before_bytes":workspace_before,"canonical_biased_owners":self.linears().count(),
+            "chosen":chosen.4,"candidates":choices.iter().map(|x| &x.4).collect::<Vec<_>>(),
+            "numerical_candidate_executed":false,"model_cells_scored":0});
+        eprintln!("{}", serde_json::json!({"h3_vae_batch_setup":result}));
+        Ok(result)
+    }
+
     pub(crate) fn new(
         d: &Device,
         spec: &VaeSpec,
@@ -706,6 +854,69 @@ pub(crate) struct TileWork {
 }
 
 impl TileWork {
+    #[cfg(test)]
+    pub(crate) fn batch_bytes(
+        spec: &VaeSpec,
+        (frames, height, width): (usize, usize, usize),
+        batch: usize,
+        slots: usize,
+    ) -> Result<usize> {
+        ensure!(batch > 0 && batch <= slots, "invalid tile batch capacity");
+        let product = |values: &[usize]| -> Result<usize> {
+            values.iter().try_fold(1usize, |a, &b| {
+                a.checked_mul(b).context("tile work overflow")
+            })
+        };
+        let sum = |values: &[usize]| -> Result<usize> {
+            values.iter().try_fold(0usize, |a, &b| {
+                a.checked_add(b).context("tile work overflow")
+            })
+        };
+        let patches = product(&[frames, height, width])?;
+        let tokens = sum(&[patches, spec.registers, 1])?;
+        let bf16s = sum(&[
+            product(&[2, patches, spec.latent_channels])?,
+            product(&[11, tokens, spec.dim])?,
+            product(&[3, tokens, spec.ffn])?,
+            product(&[tokens, spec.patch_width()])?,
+            product(&[tokens, spec.rope_dims])?,
+            spec.head_dim,
+        ])?;
+        let serial = sum(&[
+            product(&[2, bf16s])?,
+            product(&[
+                4,
+                sum(&[
+                    product(&[2, tokens, spec.dim])?,
+                    product(&[spec.heads, tokens])?,
+                ])?,
+            ])?,
+        ])?;
+        let shared = sum(&[
+            product(&[4, patches, spec.latent_channels])?,
+            product(&[2, spec.head_dim])?,
+        ])?;
+        let tail = slots % batch;
+        sum(&[
+            product(&[
+                batch,
+                serial.checked_sub(shared).context("tile shared size")?,
+            ])?,
+            shared,
+            if batch > 1 {
+                product(&[4, batch.checked_add(1).context("offset count")?])?
+            } else {
+                0
+            },
+            product(&[tail, 4, spec.heads, tokens])?,
+            if tail > 1 {
+                product(&[4, tail.checked_add(1).context("offset count")?])?
+            } else {
+                0
+            },
+        ])
+    }
+
     /// Device bytes `new` allocates for a `frames x height x width` tile: BF16 latent rows, activations, FFN, patch
     /// rows, rotary table and unit vector; the F32 residual pair; the attention LSE `[heads, tokens]` F32.
     pub(crate) fn bytes(spec: &VaeSpec, (frames, height, width): (usize, usize, usize)) -> usize {
