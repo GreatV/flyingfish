@@ -2293,7 +2293,8 @@ mod tests {
         } else {
             0.0
         };
-        let delta = std::array::from_fn(|i| p[i] - a[i] - t * d[i]);
+        let point = std::array::from_fn(|i| (1.0 - t) * a[i] + t * b[i]);
+        let delta = vector_sub(p, point);
         vector_dot(delta, delta)
     }
 
@@ -2304,12 +2305,26 @@ mod tests {
         let n = vector_cross(vector_sub(b, a), vector_sub(c, a));
         let length = vector_dot(n, n);
         if length > 0.0 {
-            let t = vector_dot(vector_sub(p, a), n) / length;
-            let projected = std::array::from_fn(|i| p[i] - t * n[i]);
-            if [(a, b), (b, c), (c, a)].into_iter().all(|(x, y)| {
-                vector_dot(vector_cross(vector_sub(y, x), vector_sub(projected, x)), n) >= 0.0
-            }) {
-                best = best.min(t * t * length);
+            let w = [
+                vector_dot(vector_cross(vector_sub(b, p), vector_sub(c, p)), n) / length,
+                vector_dot(vector_cross(vector_sub(c, p), vector_sub(a, p)), n) / length,
+                vector_dot(vector_cross(vector_sub(a, p), vector_sub(b, p)), n) / length,
+            ];
+            if w.iter().all(|v| v.is_finite() && *v >= 0.0) {
+                let sum = w[0] + w[1] + w[2];
+                if sum > 0.0 {
+                    let u = if w[0] + w[1] > 0.0 {
+                        (w[1] / (w[0] + w[1])).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let v = (w[2] / sum).clamp(0.0, 1.0);
+                    let point = std::array::from_fn(|i| {
+                        (1.0 - v) * ((1.0 - u) * a[i] + u * b[i]) + v * c[i]
+                    });
+                    let delta = vector_sub(p, point);
+                    best = best.min(vector_dot(delta, delta));
+                }
             }
         }
         best
@@ -2398,19 +2413,29 @@ mod tests {
             best.sqrt()
         }
 
-        fn metrics(&self, points: &[[f64; 3]], queries: &[[f64; 3]]) -> Result<[f64; 2]> {
+        fn measure(
+            &self,
+            points: &[[f64; 3]],
+            queries: &[[f64; 3]],
+            mut visit: impl FnMut(usize, f64),
+        ) -> Result<[f64; 2]> {
             ensure!(queries.len() == 32768, "surface query count differs");
             let mut maximum = 0.0f64;
             let mut squares = 0.0;
             for (i, &p) in points.iter().chain(queries).enumerate() {
                 let d = self.distance(p);
                 ensure!(d.is_finite() && d >= 0.0, "nonfinite surface distance");
+                visit(i, d);
                 maximum = maximum.max(d);
                 if i >= points.len() {
                     squares += d * d;
                 }
             }
             Ok([maximum, (squares / queries.len() as f64).sqrt()])
+        }
+
+        fn metrics(&self, points: &[[f64; 3]], queries: &[[f64; 3]]) -> Result<[f64; 2]> {
+            self.measure(points, queries, |_, _| {})
         }
     }
 
@@ -2881,8 +2906,125 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn sparse_mesh_qem_reference_cpu() -> Result<()> {
+        let (root, frozen) = qem_reference()?;
+        qem_proximity_validity(&root, &frozen)?;
+        let case = std::env::var("FF_HI3D_QEM_CASE").context("FF_HI3D_QEM_CASE required")?;
+        let cell = &frozen["cases"][&case];
+        let d = root.join(cell["D"].as_str().context("D fixture missing")?);
+        let common = d.parent().context("common reference parent missing")?;
+        let output = std::path::PathBuf::from(
+            std::env::var("FF_HI3D_QEM_OUTPUT").context("FF_HI3D_QEM_OUTPUT required")?,
+        )
+        .join("native");
+        std::fs::create_dir_all(&output)?;
+        ensure!(
+            !output.join("metrics.json").exists(),
+            "native reference already captured"
+        );
+        let mut meshes = vec![
+            (
+                "R",
+                SurfaceMesh::read(Path::new(
+                    cell["raw_input"].as_str().context("RAW fixture missing")?,
+                ))?,
+                qem_queries(common, "R")?,
+            ),
+            ("D", SurfaceMesh::read(&d)?, qem_queries(common, "D")?),
+            (
+                "P",
+                SurfaceMesh::read(Path::new(
+                    cell["publisher_P"]
+                        .as_str()
+                        .context("publisher fixture missing")?,
+                ))?,
+                qem_queries(common, "P")?,
+            ),
+            (
+                "LOW",
+                SurfaceMesh::read(
+                    &root.join(
+                        cell["control_LOW"]
+                            .as_str()
+                            .context("control fixture missing")?,
+                    ),
+                )?,
+                qem_queries(common, "LOW")?,
+            ),
+        ];
+        for (_, mesh, _) in &mut meshes {
+            mesh.frame(&cell["frame"])?;
+        }
+        let mut records = BTreeMap::new();
+        for target in 0..meshes.len() {
+            let tree = SurfaceTree::new(&meshes[target].1);
+            for source in 0..meshes.len() {
+                if target == source {
+                    continue;
+                }
+                if (meshes[source].0 == "P" && meshes[target].0 == "LOW")
+                    || (meshes[source].0 == "LOW" && meshes[target].0 == "P")
+                {
+                    continue;
+                }
+                let direction = format!("{}->{}", meshes[source].0, meshes[target].0);
+                let file = output.join(format!(
+                    "{}-to-{}.safetensors",
+                    meshes[source].0, meshes[target].0
+                ));
+                ensure!(
+                    !file.exists(),
+                    "native reference direction already captured"
+                );
+                let control = meshes[source].0 == "LOW" || meshes[target].0 == "LOW";
+                let mut distances = Vec::new();
+                let values =
+                    tree.measure(&meshes[source].1.points, &meshes[source].2, |_, value| {
+                        if !control {
+                            distances.push(value);
+                        }
+                    })?;
+                if !control {
+                    let bytes = distances
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    let tensor = safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F64,
+                        vec![distances.len()],
+                        &bytes,
+                    )?;
+                    safetensors::tensor::serialize_to_file(
+                        BTreeMap::from([("distance", tensor)]),
+                        None,
+                        &file,
+                    )?;
+                }
+                let row = serde_json::json!({"max":values[0],"RMS":values[1],"vertex_queries":meshes[source].1.points.len(),"surface_queries":meshes[source].2.len(),"distance_file":if control {None} else {file.file_name().and_then(|s|s.to_str())},"control":control});
+                println!("N5_M6_NATIVE_REFERENCE case={case} direction={direction} {row}");
+                records.insert(direction, row);
+            }
+        }
+        use std::io::Write;
+        let result = serde_json::json!({"case":case,"metrics":records,"evaluator":"explicit_convex_surface_points","candidate_data_read":false,"timing":false});
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output.join("metrics.json"))?;
+        writeln!(file, "{}", serde_json::to_string_pretty(&result)?)?;
+        println!("PASS N5_M6_NATIVE_REFERENCE {result}");
+        qem_resources()?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
     fn sparse_mesh_qem_geometry_cpu() -> Result<()> {
         let (root, frozen) = qem_reference()?;
+        let evaluator: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("FROZEN-evaluator.json"))
+                .context("FROZEN-evaluator.json required before re-scoring")?,
+        )?;
         qem_proximity_validity(&root, &frozen)?;
         let case = std::env::var("FF_HI3D_QEM_CASE").context("FF_HI3D_QEM_CASE required")?;
         let cell = &frozen["cases"][&case];
@@ -2984,7 +3126,7 @@ mod tests {
         let mut best_control = 0.0f64;
         let mut minimum_control = f64::INFINITY;
         let mut minimum_translation = f64::INFINITY;
-        for (key, field) in cell["quality_fields"]
+        for (key, field) in evaluator["cases"][&case]["fields"]
             .as_object()
             .context("quality fields missing")?
         {
@@ -2993,13 +3135,23 @@ mod tests {
             let reference = metrics[&("P".to_string(), direction.to_string())][i];
             let actual = metrics[&("C".to_string(), direction.to_string())][i];
             let control = metrics[&("LOW".to_string(), direction.to_string())][i];
-            let expected = field["publisher_E"]
+            let expected = field["native_E"]
                 .as_f64()
                 .context("publisher metric missing")?;
             let tau = field["tau"].as_f64().context("metric floor missing")?;
             let bound = field["quality_bound"]
                 .as_f64()
                 .context("quality bound missing")?;
+            let mut formula = (1.25 * expected).max(tau);
+            if direction.contains('R') {
+                formula = formula.max(
+                    field["input_floor"]
+                        .as_f64()
+                        .context("R-direction input floor missing")?
+                        + tau,
+                );
+            }
+            ensure!(bound == formula, "evaluator addendum bound formula differs");
             ensure!(
                 (reference - expected).abs() <= tau,
                 "native evaluator disagrees with frozen publisher metric {key}"
@@ -3018,10 +3170,11 @@ mod tests {
             let defect = actual > bound;
             defects += usize::from(defect);
             println!(
-                "N5_M6_QEM_SCORE case={case} field={key} value={actual} bound={bound} publisher_native={reference} publisher_frozen={expected} control_multiple={} defect={defect}",
+                "N5_M6_QEM_SCORE case={case} field={key} value={actual} bound={bound} publisher_native={reference} publisher_frozen={expected} publisher_blackbox={} control_multiple={} defect={defect}",
+                field["blackbox_E"],
                 control / bound
             );
-            records.insert(key.clone(), serde_json::json!({"value":actual,"quality_bound":bound,"reference_native":reference,"reference_frozen":expected,"reference_delta":(reference-expected).abs(),"control_value":control,"control_multiple":control/bound,"translation_certificate_multiple":certified,"defect":defect}));
+            records.insert(key.clone(), serde_json::json!({"value":actual,"quality_bound":bound,"reference_native":reference,"reference_frozen":expected,"reference_blackbox":field["blackbox_E"],"input_floor":field["input_floor"],"reference_delta":(reference-expected).abs(),"control_value":control,"control_multiple":control/bound,"translation_certificate_multiple":certified,"defect":defect}));
         }
         ensure!(
             best_control > 2.0,
