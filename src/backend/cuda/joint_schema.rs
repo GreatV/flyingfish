@@ -485,6 +485,7 @@ impl JointPlan {
         let score = crate::backend::cuda::flash::Score {
             scale: (HEAD_DIM as f32).sqrt().recip(),
             window_left: None,
+            window_right: None,
         };
         let flash = |rows: usize, capacity: usize| {
             crate::backend::cuda::flash::Flash::new_with_score(

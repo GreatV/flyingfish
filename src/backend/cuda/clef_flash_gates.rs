@@ -685,6 +685,68 @@ mod gates {
         Ok(())
     }
 
+    /// The multi-chunk capture discriminator: the captured hidden rows with a
+    /// forced prefill chunk (at least two chunks, derived from the fixture)
+    /// must match the single-chunk capture inside the hidden_norm floor.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_CLEF_MODEL, FF_CLEF_JOINT_FIXTURE, FF_CLEF_JOINT_TAUS"]
+    fn clef_flash_joint_multi_chunk_capture() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let dir = PathBuf::from(std::env::var("FF_CLEF_MODEL").context("FF_CLEF_MODEL")?);
+        let taus = joint_taus()?;
+        let fixture = joint_fixture()?;
+        let seq = fixture.ids.len();
+        let forced = seq.div_ceil(2).next_multiple_of(32).min(seq - 1).max(32);
+        println!("CLEF_JOINT_MULTI_CHUNK seq={seq} forced_chunk={forced}");
+
+        let runtime = std::env::temp_dir().join(format!("clef-joint-mc-a-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 8192, None, settings(runtime.clone()))?;
+        let mut engine = Engine::load(&dir, 0, 8192, None, settings(runtime))?;
+        let mut plan = engine.joint_plan(&fixture)?;
+        if std::env::var_os("FF_CLEF_JOINT_FORCED_CHUNK").is_some() {
+            let forced = fixture
+                .ids
+                .len()
+                .div_ceil(2)
+                .next_multiple_of(32)
+                .min(fixture.ids.len() - 1)
+                .max(32);
+            println!("CLEF_JOINT_FORCED_CHUNK {forced}");
+            engine.force_prefill_chunk(forced)?;
+        }
+        engine.joint_capture(&mut plan, &fixture)?;
+        let single: Vec<f32> = engine
+            .joint_hidden_rows(&plan)?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        drop(engine);
+
+        let runtime_b =
+            std::env::temp_dir().join(format!("clef-joint-mc-b-{}", std::process::id()));
+        Engine::calibrate(&dir, 0, 8192, None, settings(runtime_b.clone()))?;
+        let mut engine_b = Engine::load(&dir, 0, 8192, None, settings(runtime_b))?;
+        let mut plan_b = engine_b.joint_plan(&fixture)?;
+        engine_b.force_prefill_chunk(forced)?;
+        engine_b.joint_capture(&mut plan_b, &fixture)?;
+        let multi: Vec<f32> = engine_b
+            .joint_hidden_rows(&plan_b)?
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        let (max, rmse) = max_rmse(&multi, &single)?;
+        let tau = joint_tau(&taus, "hidden_norm")?;
+        println!(
+            "CLEF_JOINT_MULTI_CHUNK max={max:.6e} (tau {:.6e}) rmse={rmse:.6e} (tau {:.6e})",
+            tau.0, tau.1
+        );
+        ensure!(
+            max <= tau.0 && rmse <= tau.1,
+            "multi-chunk capture diverges from the single-chunk capture"
+        );
+        Ok(())
+    }
+
     /// The joint-head cells against joint-ref-taus-v3: gated end-to-end stages
     /// (projections, fields, decoder0, per-question logits), forced common-input
     /// stages on the saved reference rows (hidden_norm, routing0/1, decoder1-3),

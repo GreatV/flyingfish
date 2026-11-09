@@ -7768,13 +7768,65 @@ impl Engine {
         self.prefill_chunks(ids, None, ids.len(), |engine, chunk| {
             let rows = chunk.len();
             let stream = &engine.device.stream;
-            stream.memcpy_dtod(
-                &engine.work.n.slice(..rows * hidden),
-                &mut dst.slice_mut(offset..offset + rows * hidden),
+            // The Head stage returns early on non-final chunks, so only the
+            // final chunk's rows carry the backbone final norm in work.n.
+            // Norm every chunk's work.x rows with the final norm directly.
+            let runtime = engine.qwen.as_ref().context("qwen runtime missing")?;
+            let norm = engine
+                .weights
+                .norm
+                .as_ref()
+                .context("weighted final norm missing")?;
+            let domain = RowDomain {
+                meta: engine.state.seq_ref(stream)?,
+                row_base: 0,
+                row_capacity: rows as u32,
+            };
+            let x = heads(&engine.work.x, stream, 0, rows, 1, hidden as u32)?;
+            let weight = vector(norm, stream)?;
+            let (ptr, _dst_ptr) = dst.device_ptr(stream);
+            let y = unsafe {
+                crate::backend::cuda::contracts::Tensor::new(
+                    ptr + (offset * 2) as u64,
+                    [rows as u32, 1, hidden as u32],
+                    [hidden as u64, hidden as u64, 1],
+                    (rows * hidden * 2) as u64,
+                )?
+            };
+            runtime.common.norm.rms_with(
+                stream,
+                domain,
+                x,
+                weight,
+                &mut crate::backend::cuda::contracts::TensorMut(y),
+                crate::backend::cuda::ops::RmsOptions {
+                    mode: norm_mode(&engine.model_spec),
+                    eps: engine.model_spec.rms_eps,
+                },
             )?;
             offset += rows * hidden;
             Ok(())
         })?;
+        Ok(())
+    }
+
+    /// The captured post-backbone hidden rows (multi-chunk test reads them).
+    #[cfg(test)]
+    pub fn joint_hidden_rows(
+        &self,
+        plan: &crate::backend::cuda::joint_schema::JointPlan,
+    ) -> Result<Vec<bf16>> {
+        Ok(self.device.stream.clone_dtoh(&plan.hidden_src)?)
+    }
+
+    /// Forces the prefill chunk size (test hook for multi-chunk capture).
+    #[cfg(test)]
+    pub fn force_prefill_chunk(&mut self, chunk: usize) -> Result<()> {
+        ensure!(
+            chunk > 0 && chunk <= self.workspace_rows,
+            "forced prefill chunk {chunk} outside the bound workspace rows"
+        );
+        self.chunk = chunk;
         Ok(())
     }
 

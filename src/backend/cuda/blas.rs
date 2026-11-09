@@ -1177,6 +1177,7 @@ impl Blas {
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn linear_f32(
         &self,
         weight: super::contracts::Tensor<f32, 2>,
