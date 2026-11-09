@@ -499,6 +499,7 @@ impl Canary {
                 causal: true,
                 valid_keys: pass.queries,
                 query_base: 0,
+                window: 0,
             },
         )?;
         let delta = self.linear(&attended, pass.queries, &layer.self_attn.o)?;
@@ -517,6 +518,7 @@ impl Canary {
                 causal: false,
                 valid_keys: pass.valid,
                 query_base: 0,
+                window: 0,
             },
         )?;
         let delta = self.linear(&attended, pass.queries, &layer.cross_attn.o)?;
@@ -740,6 +742,7 @@ impl Canary {
                     causal: true,
                     valid_keys: filled_after,
                     query_base: filled_before,
+                    window: 0,
                 },
             )?;
             let delta = self.linear(&attended, queries, &self.layers[index].self_attn.o)?;
@@ -756,6 +759,7 @@ impl Canary {
                     causal: false,
                     valid_keys: cache.valid,
                     query_base: 0,
+                    window: 0,
                 },
             )?;
             let delta = self.linear(&attended, queries, &self.layers[index].cross_attn.o)?;

@@ -558,6 +558,7 @@ impl AudioDecoder {
                         .arg(&i32::try_from(up.kernel)?)
                         .arg(&i32::try_from(up.stride)?)
                         .arg(&i32::try_from((up.kernel - up.stride) / 2)?)
+                        .arg(&0i32)
                         .launch(LaunchConfig {
                             grid_dim: (u32::try_from(rows * up.stride)?, 1, 1),
                             block_dim: (256, 1, 1),

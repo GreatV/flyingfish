@@ -1457,6 +1457,7 @@ pub(crate) struct F32Mask {
     pub(crate) causal: bool,
     pub(crate) valid_keys: u32,
     pub(crate) query_base: u32,
+    pub(crate) window: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -1529,6 +1530,26 @@ impl F32Attention {
             stream,
         })
     }
+    pub(crate) fn issued_launches(&self, queries: u32, keys: u32, mask: &F32Mask) -> Result<u64> {
+        let [_, cap_queries, cap_keys, _, _] = self.geometry;
+        ensure!(
+            queries > 0 && queries <= cap_queries && keys > 0 && keys <= cap_keys,
+            "F32 attention launch count shape"
+        );
+        if mask.valid_keys == 0 || mask.valid_keys > keys {
+            anyhow::bail!("F32 attention launch count keys");
+        }
+        let exclude = mask.causal || mask.valid_keys != keys || mask.window != 0;
+        let parts = u64::from(keys.div_ceil(self.key_chunk));
+        let mut launches = 0u64;
+        for _start in (0..queries).step_by(self.tile as usize) {
+            launches += 3 + parts;
+            if exclude {
+                launches += 1;
+            }
+        }
+        Ok(launches)
+    }
     pub(crate) fn run(
         &self,
         blas: &super::blas::Blas,
@@ -1590,6 +1611,7 @@ impl F32Attention {
             causal,
             valid_keys,
             query_base,
+            window,
         } = mask;
         let queries = q.shape[1];
         let keys = k.shape[1];
@@ -1668,7 +1690,7 @@ impl F32Attention {
                 [false, true],
                 (dim as f32).sqrt().recip(),
             )?;
-            if causal || valid_keys != keys {
+            if causal || valid_keys != keys || window != 0 {
                 let count = (heads as usize)
                     .checked_mul(rows as usize)
                     .and_then(|n| n.checked_mul(keys as usize))
@@ -1691,6 +1713,7 @@ impl F32Attention {
                         .arg(&query_index)
                         .arg(&valid_keys)
                         .arg(&u32::from(causal))
+                        .arg(&window)
                         .launch(super::ops::grid(blocks, 256))?;
                 }
             }

@@ -3,7 +3,9 @@ use super::{
     Device,
     blas::linear_f32_on,
     contracts::{TensorMut, view},
-    cubin, ops,
+    cubin,
+    flash::{F32Attention, F32Mask},
+    ops,
 };
 use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
@@ -31,7 +33,6 @@ const Q_WIDTH: usize = (HEADS as usize) * (HEAD_DIM as usize);
 const PEAK: usize = MAX_FRAMES * FRAME_SAMPLES * 96;
 const RMS_EPS: f32 = 1e-5;
 const LN_EPS: f32 = 1e-6;
-const ATTN_SCALE: f32 = 0.125;
 
 pub fn check_codes(codes: &[i32]) -> Result<usize> {
     ensure!(!codes.is_empty(), "codes length");
@@ -55,9 +56,9 @@ struct Kernels {
     gather: CudaFunction,
     causal: CudaFunction,
     trans: CudaFunction,
-    trim: CudaFunction,
     rope: CudaFunction,
-    attn: CudaFunction,
+    rotate: CudaFunction,
+    add: CudaFunction,
     snake: CudaFunction,
     norm: CudaFunction,
     gelu: CudaFunction,
@@ -160,6 +161,7 @@ struct Op<'a> {
     stream: &'a Arc<CudaStream>,
     blas: &'a CudaBlas,
     kernels: &'a Kernels,
+    attention: &'a F32Attention,
     count: &'a mut u64,
 }
 
@@ -173,6 +175,7 @@ pub struct Tokenizer {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     kernels: Kernels,
+    attention: F32Attention,
     books: Vec<CudaSlice<f32>>,
     quant_first: Causal,
     quant_rest: Causal,
@@ -210,21 +213,27 @@ impl Tokenizer {
         let stream = Arc::clone(&device.stream);
         let mut weight_bytes = 0u64;
         let common = cubin::module(&device.ctx, "q38_common")?;
+        let vision = cubin::module(&device.ctx, "vision_ops")?;
         let act = cubin::module(&device.ctx, "act")?;
         let kernel = |name: &str| {
             common
                 .load_function(name)
                 .with_context(|| format!("kernel {name}"))
         };
+        let vision_kernel = |name: &str| {
+            vision
+                .load_function(name)
+                .with_context(|| format!("kernel {name}"))
+        };
         let kernels = Kernels {
-            rms: kernel("rms_rows_f32")?,
-            bias: kernel("row_bias_f32")?,
-            gather: kernel("codebook_gather_f32")?,
+            rms: vision_kernel("vision_rms_scale_f32")?,
+            bias: vision_kernel("vision_bias_f32")?,
+            gather: vision_kernel("vision_row_gather_f32")?,
             causal: kernel("causal_conv_rows_f32")?,
             trans: kernel("conv_transpose_rows_f32")?,
-            trim: kernel("conv_transpose_trim_rows_f32")?,
             rope: kernel("rope_cos_sin_f32")?,
-            attn: kernel("slide_rope_attn_f32")?,
+            rotate: kernel("rope_rotate_half_f32")?,
+            add: kernel("add_scale_f32")?,
             snake: kernel("snake_beta_rows_f32")?,
             norm: kernel("q38_layer_norm_f32")?,
             gelu: kernel("q38_gelu_f32")?,
@@ -234,6 +243,18 @@ impl Tokenizer {
                 .context("kernel silu_mul_split_f32")?,
             clamp: kernel("clamp_f32")?,
         };
+        let geometry = [
+            u32::try_from(HEADS)?,
+            u32::try_from(MAX_FRAMES)?,
+            u32::try_from(MAX_FRAMES)?,
+            u32::try_from(HEAD_DIM)?,
+            u32::try_from(HEAD_DIM)?,
+        ];
+        let attention = F32Attention::new(
+            Arc::clone(&stream),
+            geometry,
+            F32Attention::required_bytes(geometry)?,
+        )?;
         let mut books = Vec::with_capacity(BOOKS);
         books.push(codebook(
             &st,
@@ -437,6 +458,7 @@ impl Tokenizer {
             stream,
             blas,
             kernels,
+            attention,
             books,
             quant_first,
             quant_rest,
@@ -908,8 +930,9 @@ fn row_bias(
 ) -> Result<()> {
     fits(y, rows, width)?;
     ensure!(bias.len() >= width, "bias width");
-    let count = i32::try_from(rows * width)?;
-    let width_i = i32::try_from(width)?;
+    let rows_u = u32::try_from(rows)?;
+    let width_u = u32::try_from(width)?;
+    let count = usize::from(rows_u.checked_mul(width_u).context("bias count")?);
     let yp = dev(y, op.stream);
     let bp = dev(bias, op.stream);
     unsafe {
@@ -917,9 +940,10 @@ fn row_bias(
             .launch_builder(&op.kernels.bias)
             .arg(&yp)
             .arg(&bp)
-            .arg(&count)
-            .arg(&width_i)
-            .launch(ops::flat(count as usize))?;
+            .arg(&yp)
+            .arg(&rows_u)
+            .arg(&width_u)
+            .launch(ops::flat(count))?;
     }
     op.tick();
     Ok(())
@@ -953,14 +977,18 @@ fn rms(
     let xp = dev(x, op.stream);
     let wp = dev(weight, op.stream);
     let yp = dev(y, op.stream);
+    let width_u = u32::try_from(width)?;
+    let scale_stride = 1u32;
+    let bf16 = 0u64;
     unsafe {
         op.stream
             .launch_builder(&op.kernels.rms)
             .arg(&xp)
             .arg(&wp)
+            .arg(&scale_stride)
             .arg(&yp)
-            .arg(&rows)
-            .arg(&width)
+            .arg(&bf16)
+            .arg(&width_u)
             .arg(&RMS_EPS)
             .launch(ops::grid(rows as usize, 256))?;
     }
@@ -974,25 +1002,45 @@ fn gather(
     codes: u64,
     y: &CudaSlice<f32>,
     rows: i32,
-    accumulate: i32,
 ) -> Result<()> {
     fits(y, rows as usize, CODE_DIM)?;
     ensure!(table.len() == (VOCAB as usize) * CODE_DIM, "codebook table");
     let tp = dev(table, op.stream);
     let yp = dev(y, op.stream);
     let count = (rows as usize) * CODE_DIM;
-    let dim = i32::try_from(CODE_DIM)?;
+    let n = u32::try_from(rows)?;
+    let vocab = u32::try_from(VOCAB)?;
+    let width = u32::try_from(CODE_DIM)?;
     unsafe {
         op.stream
             .launch_builder(&op.kernels.gather)
             .arg(&tp)
             .arg(&codes)
             .arg(&yp)
-            .arg(&rows)
-            .arg(&VOCAB)
-            .arg(&dim)
-            .arg(&accumulate)
+            .arg(&n)
+            .arg(&vocab)
+            .arg(&width)
             .launch(ops::flat(count))?;
+    }
+    op.tick();
+    Ok(())
+}
+
+fn add_rows(op: &mut Op<'_>, y: &CudaSlice<f32>, x: &CudaSlice<f32>, rows: i32) -> Result<()> {
+    fits(y, rows as usize, CODE_DIM)?;
+    fits(x, rows as usize, CODE_DIM)?;
+    let count = i64::try_from((rows as usize) * CODE_DIM)?;
+    let yp = dev(y, op.stream);
+    let xp = dev(x, op.stream);
+    let scale = 1.0f32;
+    unsafe {
+        op.stream
+            .launch_builder(&op.kernels.add)
+            .arg(&yp)
+            .arg(&xp)
+            .arg(&count)
+            .arg(&scale)
+            .launch(ops::flat(count as usize))?;
     }
     op.tick();
     Ok(())
@@ -1034,17 +1082,16 @@ fn transpose(op: &mut Op<'_>, conv: &Trans, x: u64, y: u64, rows: i32) -> Result
     let wp = dev(&conv.weight, op.stream);
     let bp = dev(&conv.bias, op.stream);
     let grid_x = u32::try_from(out_rows)?.clamp(1, 65535);
-    let kernel = if conv.trimmed {
+    let trim = i32::from(conv.trimmed);
+    if conv.trimmed {
         ensure!(conv.kernel == 2 * conv.stride, "trim tap");
-        &op.kernels.trim
     } else {
         ensure!(conv.kernel == conv.stride, "transpose tap");
-        &op.kernels.trans
-    };
+    }
     let pad = 0i32;
     unsafe {
         op.stream
-            .launch_builder(kernel)
+            .launch_builder(&op.kernels.trans)
             .arg(&x)
             .arg(&wp)
             .arg(&bp)
@@ -1055,6 +1102,7 @@ fn transpose(op: &mut Op<'_>, conv: &Trans, x: u64, y: u64, rows: i32) -> Result
             .arg(&conv.kernel)
             .arg(&conv.stride)
             .arg(&pad)
+            .arg(&trim)
             .launch(ops::grid(grid_x as usize, 256))?;
     }
     op.tick();
@@ -1088,6 +1136,35 @@ fn rope(
     Ok(())
 }
 
+fn rotate_half(
+    op: &mut Op<'_>,
+    x: &CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    rows: i32,
+) -> Result<()> {
+    fits(x, rows as usize, Q_WIDTH)?;
+    fits(cos, rows as usize, HEAD_DIM as usize)?;
+    fits(sin, rows as usize, HEAD_DIM as usize)?;
+    let xp = dev(x, op.stream);
+    let cp = dev(cos, op.stream);
+    let sp = dev(sin, op.stream);
+    let pairs = (rows as usize) * (HEADS as usize);
+    unsafe {
+        op.stream
+            .launch_builder(&op.kernels.rotate)
+            .arg(&xp)
+            .arg(&cp)
+            .arg(&sp)
+            .arg(&rows)
+            .arg(&HEADS)
+            .arg(&HEAD_DIM)
+            .launch(ops::flat(pairs))?;
+    }
+    op.tick();
+    Ok(())
+}
+
 fn attend(
     op: &mut Op<'_>,
     q: &CudaSlice<f32>,
@@ -1099,31 +1176,28 @@ fn attend(
 ) -> Result<()> {
     let (cos, sin) = rope;
     fits(q, rows as usize, Q_WIDTH)?;
+    fits(k, rows as usize, Q_WIDTH)?;
+    fits(v, rows as usize, Q_WIDTH)?;
     fits(y, rows as usize, Q_WIDTH)?;
-    let qp = dev(q, op.stream);
-    let kp = dev(k, op.stream);
-    let vp = dev(v, op.stream);
-    let cp = dev(cos, op.stream);
-    let sp = dev(sin, op.stream);
-    let yp = dev(y, op.stream);
-    let pairs = (rows as usize) * (HEADS as usize);
-    unsafe {
-        op.stream
-            .launch_builder(&op.kernels.attn)
-            .arg(&qp)
-            .arg(&kp)
-            .arg(&vp)
-            .arg(&cp)
-            .arg(&sp)
-            .arg(&yp)
-            .arg(&rows)
-            .arg(&HEADS)
-            .arg(&HEAD_DIM)
-            .arg(&WINDOW)
-            .arg(&ATTN_SCALE)
-            .launch(ops::flat(pairs))?;
-    }
-    op.tick();
+    rotate_half(op, q, cos, sin, rows)?;
+    rotate_half(op, k, cos, sin, rows)?;
+    let queries = u32::try_from(rows)?;
+    let shape = [u32::try_from(HEADS)?, queries, u32::try_from(HEAD_DIM)?];
+    let stride = [u64::from(HEAD_DIM as u32), u64::try_from(Q_WIDTH)?, 1];
+    let qv = view(q, op.stream, 0, shape, stride)?;
+    let kv = view(k, op.stream, 0, shape, stride)?;
+    let vv = view(v, op.stream, 0, shape, stride)?;
+    let out = view(y, op.stream, 0, shape, stride)?;
+    let mask = F32Mask {
+        causal: true,
+        valid_keys: queries,
+        query_base: 0,
+        window: u32::try_from(WINDOW)?,
+    };
+    let launches = op.attention.issued_launches(queries, queries, &mask)?;
+    op.attention
+        .run_cublas(op.blas, qv, kv, vv, &mut TensorMut(out), mask)?;
+    *op.count += launches;
     Ok(())
 }
 
@@ -1308,6 +1382,7 @@ fn forward(tok: &Tokenizer, frames: i32) -> Result<u64> {
         stream: &tok.stream,
         blas: &tok.blas,
         kernels: &tok.kernels,
+        attention: &tok.attention,
         count: &mut count,
     };
     let w = &tok.work;
@@ -1318,13 +1393,14 @@ fn forward(tok: &Tokenizer, frames: i32) -> Result<u64> {
     let s1 = dev(&w.s1, op.stream);
     let wide = dev(&w.wide, op.stream);
     let code0 = code_ptr(&w.codes, op.stream, 0);
-    gather(&mut op, &tok.books[0], code0, &w.e0, frames, 0)?;
+    gather(&mut op, &tok.books[0], code0, &w.e0, frames)?;
     causal(&mut op, &tok.quant_first, e0, s0, frames, 0)?;
     let code1 = code_ptr(&w.codes, op.stream, 1);
-    gather(&mut op, &tok.books[1], code1, &w.e1, frames, 0)?;
+    gather(&mut op, &tok.books[1], code1, &w.e1, frames)?;
     for book in 2..BOOKS {
         let code = code_ptr(&w.codes, op.stream, book);
-        gather(&mut op, &tok.books[book], code, &w.e1, frames, 1)?;
+        gather(&mut op, &tok.books[book], code, &w.e0, frames)?;
+        add_rows(&mut op, &w.e1, &w.e0, frames)?;
     }
     causal(&mut op, &tok.quant_rest, e1, s1, frames, s0)?;
     causal(&mut op, &tok.pre_conv, s1, wide, frames, 0)?;
@@ -2020,6 +2096,41 @@ mod gate {
             protocol = true;
         }
         println!("CLONE frames={clone_frames} bytes_equal={clone_equal} encoder_calls=2");
+        listen("short.wav", &short_n.samples)?;
+        listen("real.wav", &real_n.samples)?;
+        listen("clone-a.wav", &left.samples)?;
+        listen("clone-b.wav", &right.samples)?;
         finish_gate(defect, protocol)
+    }
+
+    fn listen(name: &str, samples: &[f32]) -> Result<()> {
+        let Ok(dir) = std::env::var("N8_M2_LISTEN_DIR") else {
+            return Ok(());
+        };
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).context("N8_M2_LISTEN_DIR")?;
+        let data_bytes = u32::try_from(samples.len().checked_mul(2).context("listen length")?)
+            .context("listen length")?;
+        let mut data = Vec::with_capacity(44 + data_bytes as usize);
+        let rate = 24_000u32;
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        data.extend_from_slice(b"WAVEfmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&rate.to_le_bytes());
+        data.extend_from_slice(&(rate * 2).to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            let pcm = (f64::from(sample.clamp(-1.0, 1.0)) * 32767.0).round() as i32;
+            data.extend_from_slice(&(pcm.clamp(-32767, 32767) as i16).to_le_bytes());
+        }
+        std::fs::write(dir.join(name), data).with_context(|| format!("listen {name}"))?;
+        println!("LISTEN file={name} samples={}", samples.len());
+        Ok(())
     }
 }

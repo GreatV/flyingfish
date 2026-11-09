@@ -843,10 +843,11 @@ extern "C" __global__ void argmax_rows_f32(
 }
 
 // scores layout is [heads, queries, keys]. A key is excluded when
-// key >= valid_keys, or when causal != 0 and key > query_base + local_query.
+// key >= valid_keys, when causal != 0 and key > query_base + local_query, or when
+// window != 0 and key + window <= query_base + local_query. window 0 drops no extra key.
 extern "C" __global__ void score_exclude_f32(
     float* scores, uint32_t heads, uint32_t queries, uint32_t keys,
-    uint32_t query_base, uint32_t valid_keys, uint32_t causal) {
+    uint32_t query_base, uint32_t valid_keys, uint32_t causal, uint32_t window) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 ||
         gridDim.z != 1 || !scores || !heads || !queries || !keys || valid_keys > keys ||
         causal > 1) {
@@ -859,7 +860,9 @@ extern "C" __global__ void score_exclude_f32(
         const uint32_t key = uint32_t(i % keys);
         const uint32_t local_query = uint32_t((i / keys) % queries);
         const uint64_t query = uint64_t(query_base) + local_query;
-        if (key >= valid_keys || (causal && uint64_t(key) > query)) scores[i] = -INFINITY;
+        if (key >= valid_keys || (causal && uint64_t(key) > query) ||
+            (window && uint64_t(key) + window <= query))
+            scores[i] = -INFINITY;
     }
 }
 
