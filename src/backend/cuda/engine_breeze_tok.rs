@@ -932,7 +932,7 @@ fn row_bias(
     ensure!(bias.len() >= width, "bias width");
     let rows_u = u32::try_from(rows)?;
     let width_u = u32::try_from(width)?;
-    let count = usize::from(rows_u.checked_mul(width_u).context("bias count")?);
+    let count = rows_u.checked_mul(width_u).context("bias count")? as usize;
     let yp = dev(y, op.stream);
     let bp = dev(bias, op.stream);
     unsafe {
