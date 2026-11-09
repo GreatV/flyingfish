@@ -937,6 +937,53 @@ impl JointRun<'_> {
     /// `keys_values` `[keys, WIDTH]` through the weight row ranges of one
     /// in_proj tensor, the bidirectional D64 kernel, and the output
     /// projection into `lane.out` `[rows, WIDTH]`.
+    /// Linear over a contiguous row range of a row-major BF16 weight tensor
+    /// through the shared linear entry (plain cuBLAS under Lt's whole-tensor
+    /// plan binding); `x`/`y` buffers may carry scratch beyond the extent.
+    fn gemm_rows(
+        &self,
+        w: &Arc<CudaSlice<bf16>>,
+        rows: std::ops::Range<usize>,
+        x: &CudaSlice<bf16>,
+        y: &mut CudaSlice<bf16>,
+        row_count: usize,
+        input: usize,
+    ) -> Result<()> {
+        use crate::backend::cuda::contracts::{TensorMut, view};
+        use crate::backend::cuda::linear::LinearWeightRef;
+        let wv = view(
+            w,
+            self.stream,
+            0,
+            [(w.len() / input) as u32, input as u32],
+            [input as u64, 1],
+        )?;
+        let xv = view(
+            x,
+            self.stream,
+            0,
+            [row_count as u32, input as u32],
+            [input as u64, 1],
+        )?;
+        let yv = view(
+            y,
+            self.stream,
+            0,
+            [row_count as u32, rows.len() as u32],
+            [rows.len() as u64, 1],
+        )?;
+        self.blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            LinearWeightRef::Bf16Rows {
+                tensor: wv,
+                row0: rows.start as u32,
+                rows: rows.len() as u32,
+            },
+            xv,
+            &mut TensorMut(yv),
+        )
+    }
+
     fn mha(
         &self,
         weights: &AttnWeights,
@@ -961,10 +1008,9 @@ impl JointRun<'_> {
             attn_out,
             out,
         } = lane;
-        self.blas
-            .gemm_bf16(&weights.in_proj, 0..WIDTH, queries, q_proj, rows, WIDTH)?;
+        self.gemm_rows(&weights.in_proj, 0..WIDTH, queries, q_proj, rows, WIDTH)?;
         self.bias_add(q_proj, &weights.in_bias, 0, WIDTH)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &weights.in_proj,
             WIDTH..2 * WIDTH,
             keys_values,
@@ -973,7 +1019,7 @@ impl JointRun<'_> {
             WIDTH,
         )?;
         self.bias_add(kv_k, &weights.in_bias, WIDTH, WIDTH)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &weights.in_proj,
             2 * WIDTH..3 * WIDTH,
             keys_values,
@@ -1021,26 +1067,8 @@ impl JointRun<'_> {
             prefix: None,
             image_blocks: None,
         })?;
-        self.blas
-            .gemm_bf16(&weights.out_w, 0..WIDTH, attn_out, out, rows, WIDTH)?;
+        self.gemm_rows(&weights.out_w, 0..WIDTH, attn_out, out, rows, WIDTH)?;
         self.bias_add(out, &weights.out_b, 0, WIDTH)?;
-        Ok(())
-    }
-
-    /// Dumps one stage tensor as raw BF16 bits when FF_CLEF_JOINT_DUMP names a
-    /// directory.
-    #[cfg(test)]
-    fn dump_stage(&self, name: &str, x: &CudaSlice<bf16>) -> Result<()> {
-        let Ok(dir) = std::env::var("FF_CLEF_JOINT_DUMP") else {
-            return Ok(());
-        };
-        let host = self.stream.clone_dtoh(x)?;
-        let path = std::path::Path::new(&dir).join(name);
-        let bytes: Vec<u8> = host
-            .iter()
-            .flat_map(|v| v.to_bits().to_le_bytes())
-            .collect();
-        std::fs::write(path, bytes)?;
         Ok(())
     }
 
@@ -1070,10 +1098,6 @@ impl JointRun<'_> {
             &w.query_norm_w,
             &w.query_norm_b,
         )?;
-        #[cfg(test)]
-        {
-            self.dump_stage(&format!("routing{layer}_qnorm.raw"), &plan.small)?;
-        }
         {
             let weights = self.routing_attn(w);
             let lane = AttnLane {
@@ -1098,15 +1122,11 @@ impl JointRun<'_> {
                 &mut plan.flash_routing,
             )?;
         }
-        #[cfg(test)]
-        {
-            self.dump_stage(&format!("routing{layer}_attn.raw"), &plan.proj_out)?;
-        }
         let attn = self.read(&plan.proj_out)?;
         let residual = add_round(&queries, &attn)?;
         self.upload(&residual, &mut plan.small)?;
         self.layer_norm_inplace(&mut plan.small, options, WIDTH, &w.ff_norm_w, &w.ff_norm_b)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.ff0_w,
             0..FF,
             &plan.small,
@@ -1116,7 +1136,7 @@ impl JointRun<'_> {
         )?;
         self.bias_add(&mut plan.ff_hidden, &w.ff0_b, 0, FF)?;
         self.gelu(&mut plan.ff_hidden, options, FF)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.ff3_w,
             0..WIDTH,
             &plan.ff_hidden,
@@ -1220,7 +1240,7 @@ impl JointRun<'_> {
             &w.norm3_w,
             &w.norm3_b,
         )?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.linear1_w,
             0..FF,
             &plan.small,
@@ -1230,7 +1250,7 @@ impl JointRun<'_> {
         )?;
         self.bias_add(&mut plan.ff_hidden, &w.linear1_b, 0, FF)?;
         self.gelu(&mut plan.ff_hidden, nq, FF)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.linear2_w,
             0..WIDTH,
             &plan.ff_hidden,
@@ -1307,7 +1327,7 @@ impl JointRun<'_> {
             .iter()
             .map(|v| v.to_f32())
             .collect();
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.memory_proj,
             0..WIDTH,
             &plan.normed,
@@ -1320,7 +1340,7 @@ impl JointRun<'_> {
             &plan.normed.slice((seq - 1) * 4096..seq * 4096),
             &mut plan.global_row.slice_mut(..4096),
         )?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.global_proj,
             0..WIDTH,
             &plan.global_row,
@@ -1388,7 +1408,7 @@ impl JointRun<'_> {
             4096,
         )?;
 
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.option_context_proj,
             0..WIDTH,
             &plan.ctx,
@@ -1397,7 +1417,7 @@ impl JointRun<'_> {
             4096,
         )?;
         let ctx_proj = self.read(&plan.small)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.option_lexical_proj,
             0..WIDTH,
             &plan.lex,
@@ -1406,7 +1426,7 @@ impl JointRun<'_> {
             4096,
         )?;
         let lex_proj = self.read(&plan.small2)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.option_question_proj,
             0..WIDTH,
             &plan.qvecs,
@@ -1415,7 +1435,7 @@ impl JointRun<'_> {
             4096,
         )?;
         let oq_proj = self.read(&plan.oq)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.question_proj,
             0..WIDTH,
             &plan.qvecs,
@@ -1669,7 +1689,7 @@ impl JointRun<'_> {
             q_base += count;
         }
         self.upload(&features, &mut plan.features)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.scorer0_w,
             0..WIDTH,
             &plan.features,
@@ -1679,7 +1699,7 @@ impl JointRun<'_> {
         )?;
         self.bias_add(&mut plan.scorer_h, &w.scorer0_b, 0, WIDTH)?;
         self.gelu(&mut plan.scorer_h, no, WIDTH)?;
-        self.blas.gemm_bf16(
+        self.gemm_rows(
             &w.scorer3_w,
             0..1,
             &plan.scorer_h,

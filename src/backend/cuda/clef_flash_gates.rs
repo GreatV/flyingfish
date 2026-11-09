@@ -805,10 +805,10 @@ mod gates {
         // the loaded weights and restored after each planted run.
 
         // Corrected q2 floor and forced logits-head cells (v4 freeze).
-        let taus_v4_path =
-            std::env::var("FF_CLEF_JOINT_TAUS_V4").context("FF_CLEF_JOINT_TAUS_V4")?;
-        let taus_v4: BTreeMap<String, serde_json::Value> =
-            serde_json::from_str(&std::fs::read_to_string(taus_v4_path)?)?;
+        let head_taus_path =
+            std::env::var("FF_CLEF_JOINT_HEAD_TAUS").context("FF_CLEF_JOINT_HEAD_TAUS")?;
+        let head_taus: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(head_taus_path)?)?;
         let arm_dir =
             PathBuf::from(std::env::var("FF_CLEF_JOINT_ARM").context("FF_CLEF_JOINT_ARM")?);
         let epilogue_bytes = std::fs::read(arm_dir.join("epilogue_inputs.safetensors"))?;
@@ -842,16 +842,16 @@ mod gates {
                 &format!("logits_head_forced_q{index}"),
                 question,
                 &tensor_f32(&logits_arm, &format!("logits_q{index}"))?,
-                joint_tau(&taus_v4, &format!("logits_head_forced_q{index}"))?,
+                joint_tau(&head_taus, &format!("logits_head_forced_q{index}"))?,
                 true,
             )?;
         }
         joint_cell(
             &mut failures,
-            "logits_q2_v4",
+            "logits_q2_varied_floor",
             &stages.logits[2],
             &tensor_f32(&logits_arm, "logits_q2")?,
-            joint_tau(&taus_v4, "logits_q2_v4")?,
+            joint_tau(&head_taus, "logits_q2_varied_floor")?,
             true,
         )?;
 

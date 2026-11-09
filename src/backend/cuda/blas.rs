@@ -1183,25 +1183,21 @@ impl Blas {
     /// `[total_rows, input]`, F32 compute, BF16 `y` `[rows, w_rows.len()]`.
     /// `x` and `y` may carry extra scratch capacity beyond the GEMM extent.
     /// No Lt plans, calibration or row binding.
-    pub(crate) fn gemm_bf16(
+    fn gemm_ex_bf16_rows(
         &self,
-        w: &CudaSlice<bf16>,
-        w_rows: std::ops::Range<usize>,
-        x: &CudaSlice<bf16>,
-        y: &mut CudaSlice<bf16>,
-        rows: usize,
-        input: usize,
+        w: super::contracts::Tensor<bf16, 2>,
+        row0: u32,
+        w_rows: u32,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::Tensor<bf16, 2>,
     ) -> Result<()> {
-        let (w_row0, w_rows) = (w_rows.start, w_rows.len());
-        checked_dims(rows, w_rows, input)?;
+        let input = w.shape[1] as usize;
+        let rows = x.shape[0] as usize;
+        let w_row0 = row0 as usize;
+        checked_dims(rows, w_rows as usize, input)?;
         ensure!(
-            w.len() >= (w_row0 + w_rows) * input
-                && x.len() >= rows * input
-                && y.len() >= rows * w_rows,
-            "BF16 GEMM extent mismatch: rows={rows} w_rows={w_rows} input={input} w={} x={} y={}",
-            w.len(),
-            x.len(),
-            y.len()
+            w.shape[0] as usize >= w_row0 + w_rows as usize,
+            "row range outside the weight tensor"
         );
         let alpha = 1.0f32;
         let beta = 0.0f32;
@@ -1214,15 +1210,14 @@ impl Blas {
                 i32::try_from(rows)?,
                 i32::try_from(input)?,
                 (&alpha as *const f32).cast(),
-                (w.device_ptr(&self.stream).0 + ((w_row0 * input) * size_of::<bf16>()) as u64)
-                    as *const core::ffi::c_void,
+                (w.ptr + ((w_row0 * input) * size_of::<bf16>()) as u64) as *const core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_16BF,
                 i32::try_from(input)?,
-                x.device_ptr(&self.stream).0 as *const core::ffi::c_void,
+                x.ptr as *const core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_16BF,
                 i32::try_from(input)?,
                 (&beta as *const f32).cast(),
-                y.device_ptr_mut(&self.stream).0 as *mut core::ffi::c_void,
+                y.ptr as *mut core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_16BF,
                 i32::try_from(w_rows)?,
                 bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -1534,6 +1529,9 @@ impl Blas {
             ensure!(x.shape[0] == 1, "Decode requires M1");
         }
         match weight {
+            LinearWeightRef::Bf16Rows { tensor, row0, rows } => {
+                self.gemm_ex_bf16_rows(tensor, row0, rows, x, &mut y.0)
+            }
             LinearWeightRef::Fp8 {
                 codes,
                 scale,
