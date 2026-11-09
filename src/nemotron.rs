@@ -308,6 +308,10 @@ impl NemotronSpec {
                 "subsampling.layers.1.pointwise_conv",
             ],
             linear_name: "subsampling.linear",
+            attention_names: [
+                "q_proj", "k_proj", "v_proj", "o_proj", "relative_k_proj", "bias_u", "bias_v",
+            ],
+            conv_norm_name: "norm",
         })
     }
 

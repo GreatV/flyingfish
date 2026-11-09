@@ -142,14 +142,14 @@ impl Eou {
 
     /// Mel features `[frames, 128]` matching the published preprocessor.
     pub fn features(&self, waveform: &[f32]) -> Result<Vec<f32>> {
-        let batch = self.frontend.extract(&[waveform], true, true, true)?;
+        let batch = self.frontend.extract(&[waveform], false, true, false)?;
         let mel_bins = self.spec.features as usize;
         Ok(batch.features[..batch.frames * mel_bins].to_vec())
     }
 
     /// Offline encoder output `[rows, 512]` under the published [70, 1] attention window.
     pub fn encode(&self, features: &[f32], valid: usize) -> Result<Vec<f32>> {
-        let (hidden, _mask, rows) = self.encoder.encode_right(features, valid, 1)?;
+        let (hidden, _mask, rows) = self.encoder.encode_right(features, valid, 0)?;
         Ok(hidden[..rows * self.spec.d_model as usize].to_vec())
     }
 
@@ -442,7 +442,7 @@ mod tests {
         let device = Device::new(0)?;
         let mut engine = Eou::load(&nemo, &device)?;
         let mel_bins = engine.spec.features as usize;
-        let eou = engine.blank() - 1;
+        let eou = engine.spec.vocab_size as u32 - 2;
         for clip in ["clipA", "clipB", "prod120"] {
             let wave = read_wave(&arm.join(format!("inputs/{clip}.wav")))?;
             let features = engine.features(&wave)?;

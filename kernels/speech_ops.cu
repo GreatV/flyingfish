@@ -142,26 +142,28 @@ extern "C" __global__ void speech_residual_f32(
         output[i] = __fadd_rn(residual[i], __fmul_rn(scale, delta[i]));
 }
 
-// head_dim 128. Relative row is rows-1-query+key into a table of length 2*key_rows-1.
+// blockDim.x is 128; head_dim must divide 128 and lanes >= head_dim stay idle.
+// Relative row is rows-1-query+key into a table of length 2*key_rows-1.
 // chunk_size 0 attends every valid key. A positive chunk_size keeps an absolute key when
 // its chunk index is in [q_abs/chunk - left_chunks, q_abs/chunk + right_chunks].
 extern "C" __global__ void speech_relative_attention_f32(
     const float* q, const float* k, const float* v, const float* relative,
     const float* bias_u, const float* bias_v, const uint8_t* mask, float* output,
-    uint32_t rows, uint32_t heads, float scaling, uint32_t chunk_size, uint32_t left_chunks,
+    uint32_t rows, uint32_t heads, uint32_t head_dim, float scaling, uint32_t chunk_size, uint32_t left_chunks,
     uint32_t right_chunks, uint32_t key_rows, uint32_t query_offset, uint32_t kv_offset) {
     extern __shared__ float shared[];
     float* reduction = shared;
     float* probabilities = shared + 8;
     if (blockDim.x != 128 || gridDim.x != rows || gridDim.y != heads || gridDim.z != 1 ||
         !q || !k || !v || !relative || !bias_u || !bias_v || !mask || !output ||
-        !rows || !key_rows || !heads || !(scaling > 0.0f) || right_chunks > 1 ||
+        !rows || !key_rows || !heads || !head_dim || head_dim > 128 || (128 % head_dim) != 0 || !(scaling > 0.0f) || right_chunks > 1 ||
         key_rows < rows || (chunk_size == 0 && right_chunks != 0) ||
         (chunk_size == 0 && (query_offset != 0 || kv_offset != 0 || key_rows != rows))) {
         __trap(); return;
     }
     const uint32_t query = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
-    const uint32_t hidden = heads * 128;
+    const uint32_t hidden = heads * head_dim;
+    const bool active = d < head_dim;
     const uint32_t query_mask = key_rows - rows + query;
     const uint8_t query_valid = mask[query_mask];
     uint32_t key_begin = 0, key_end = key_rows;
@@ -187,10 +189,12 @@ extern "C" __global__ void speech_relative_attention_f32(
         const bool in_window = chunk_size == 0 || (key >= key_begin && key < key_end);
         if (query_valid && mask[key] && in_window) {
             const uint32_t relative_row = rows - 1 - query + key;
-            const float qu = __fadd_rn(q[uint64_t(query) * hidden + head * 128 + d], bias_u[head * 128 + d]);
-            const float qv = __fadd_rn(q[uint64_t(query) * hidden + head * 128 + d], bias_v[head * 128 + d]);
-            content = __fmul_rn(qu, k[uint64_t(key) * hidden + head * 128 + d]);
-            position = __fmul_rn(qv, relative[uint64_t(relative_row) * hidden + head * 128 + d]);
+        if (active) {
+            const float qu = __fadd_rn(q[uint64_t(query) * hidden + head * head_dim + d], bias_u[head * head_dim + d]);
+            const float qv = __fadd_rn(q[uint64_t(query) * hidden + head * head_dim + d], bias_v[head * head_dim + d]);
+            content = __fmul_rn(qu, k[uint64_t(key) * hidden + head * head_dim + d]);
+            position = __fmul_rn(qv, relative[uint64_t(relative_row) * hidden + head * head_dim + d]);
+        }
         }
         for (int offset = 16; offset > 0; offset /= 2) {
             content += __shfl_down_sync(0xffffffffu, content, offset);
@@ -220,7 +224,9 @@ extern "C" __global__ void speech_relative_attention_f32(
     }
     __syncthreads();
     float result = 0.0f;
-    for (uint32_t key = 0; key < key_rows; ++key)
-        result = __fmaf_rn(probabilities[key], v[uint64_t(key) * hidden + head * 128 + d], result);
-    output[uint64_t(query) * hidden + head * 128 + d] = result;
+    if (active) {
+        for (uint32_t key = 0; key < key_rows; ++key)
+            result = __fmaf_rn(probabilities[key], v[uint64_t(key) * hidden + head * head_dim + d], result);
+        output[uint64_t(query) * hidden + head * head_dim + d] = result;
+    }
 }

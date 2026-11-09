@@ -356,6 +356,7 @@ impl EouSpec {
             root.text("token_init_method")? == "constant",
             "EOU token init method"
         );
+        ensure!(preprocessor.text("normalize")? == "NA", "EOU preprocessor normalization");
         let context = encoder.sequence("att_context_size")?;
         let context_value = |index: usize| -> Result<u32> {
             let yaml::Value::Scalar(text) = context
@@ -418,17 +419,18 @@ impl EouSpec {
             heads: self.n_heads,
             conv_kernel: self.conv_kernel_size,
             attention_bias: false,
-            convolution_bias: true,
+            convolution_bias: false,
             prefix: "encoder",
             max_position: self.pos_emb_max_len,
-            conv_batch_norm: true,
+            conv_batch_norm: false,
             pad_left: 2,
             pad_right: 1,
             depthwise_left: self.conv_kernel_size - 1,
             // 256 channels times 128/8 + 1 subsampled rows = 4352
             linear_in: 4352,
-            chunk_size: 1,
-            left_chunks: self.att_left,
+            // chunked_limited [70, 1]: chunk = right + 1 = 2 rows, 35 left chunks
+            chunk_size: 2,
+            left_chunks: 35,
             conv_names: [
                 "pre_encode.conv.0",
                 "pre_encode.conv.2",
@@ -436,6 +438,16 @@ impl EouSpec {
             ],
             pointwise_names: ["pre_encode.conv.3", "pre_encode.conv.6"],
             linear_name: "pre_encode.out",
+            attention_names: [
+                "linear_q",
+                "linear_k",
+                "linear_v",
+                "linear_out",
+                "linear_pos",
+                "pos_bias_u",
+                "pos_bias_v",
+            ],
+            conv_norm_name: "batch_norm",
         }
     }
 
