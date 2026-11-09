@@ -2008,6 +2008,26 @@ impl ParakeetTdt {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn set_joint_state(
+        &mut self,
+        hidden: &[f32],
+        cell: &[f32],
+        prediction_output: &[f32],
+    ) -> Result<()> {
+        self.set_prediction_state(hidden, cell)?;
+        let width = self.spec.decoder_hidden as usize;
+        ensure!(
+            prediction_output.len() == width
+                && prediction_output.iter().all(|value| value.is_finite()),
+            "prediction output extent differs from decoder hidden size"
+        );
+        self.encoder
+            .stream
+            .memcpy_htod(prediction_output, &mut self.cache)?;
+        Ok(())
+    }
+
     fn predict_cached(&mut self, token: u32) -> Result<()> {
         ensure!(
             token < self.spec.vocab,

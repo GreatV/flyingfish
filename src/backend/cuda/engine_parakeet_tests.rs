@@ -1299,6 +1299,16 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
         std::env::var_os("FF_PARAKEET_DECODE_FIXTURES")
             .context("FF_PARAKEET_DECODE_FIXTURES missing")?,
     );
+    let state_fixtures = PathBuf::from(
+        std::env::var_os("FF_PARAKEET_DECODE_STATE_FIXTURES")
+            .context("FF_PARAKEET_DECODE_STATE_FIXTURES missing")?,
+    );
+    let accepted_cells = [
+        ("clip2", 44usize, 8196usize),
+        ("long", 17usize, 8196usize),
+        ("long", 244usize, 8196usize),
+        ("long", 300usize, 5926usize),
+    ];
     let floors: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
         std::env::var_os("FF_PARAKEET_DECODE_FLOORS")
             .context("FF_PARAKEET_DECODE_FLOORS missing")?,
@@ -1343,6 +1353,50 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
                 == scalar(&tensors, "lstm_calls")? as usize * spec.decoder_layers as usize,
             "{case} LSTM call count differs"
         );
+        let mut forced_cells = BTreeMap::new();
+        if accepted_cells
+            .iter()
+            .any(|(accepted_case, _, _)| *accepted_case == case)
+        {
+            let state_bytes = std::fs::read(state_fixtures.join(format!("{case}.safetensors")))?;
+            let state_tensors = SafeTensors::deserialize(&state_bytes)?;
+            let hidden = f32_values(&state_tensors, "states_hidden")?;
+            let cell = f32_values(&state_tensors, "states_cell")?;
+            let output = f32_values(&state_tensors, "prediction_outputs")?;
+            let frames = f32_values(&state_tensors, "encoder_frames")?;
+            let logits = f32_values(&state_tensors, "logits")?;
+            let width = spec.decoder_hidden as usize;
+            let layers = spec.decoder_layers as usize;
+            let joint_width = spec.vocab as usize + spec.durations.len();
+            for &(accepted_case, step, _) in &accepted_cells {
+                if accepted_case != case {
+                    continue;
+                }
+                let state_start = step * layers * width;
+                let frame_start = step * width;
+                tdt.reset()?;
+                tdt.set_joint_state(
+                    &hidden[state_start..state_start + layers * width],
+                    &cell[state_start..state_start + layers * width],
+                    &output[frame_start..frame_start + width],
+                )?;
+                let forced = tdt.joint(&frames[frame_start..frame_start + width])?;
+                ensure!(tdt.lstm_call_count() == 0, "forced cell invoked LSTM");
+                let expected = &logits[step * joint_width..(step + 1) * joint_width];
+                let (maximum, rmse) = difference(&forced, expected)?;
+                let max_bound = floors["cases"][case]["max_abs"][step]
+                    .as_f64()
+                    .context("forced max_abs bound missing")?;
+                let rmse_bound = floors["cases"][case]["rmse"][step]
+                    .as_f64()
+                    .context("forced RMSE bound missing")?;
+                let pass = maximum <= max_bound && rmse <= rmse_bound;
+                println!(
+                    "PARAKEET_DECODE_FORCED case={case} step={step} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound} pass={pass}"
+                );
+                forced_cells.insert(step, pass);
+            }
+        }
         let mut position = 0usize;
         for (step, actual) in history.iter().enumerate() {
             let expected = f32_values(&tensors, "logits")?;
@@ -1381,6 +1435,15 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
                 "PARAKEET_DECODE_STEP case={case} step={step} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound} token_margin={token_margin} duration_margin={duration_margin} reference_margins={reference_token_margin}/{reference_duration_margin} threshold={threshold}"
             );
             let numeric_defect = maximum > max_bound || rmse > rmse_bound;
+            let accepted_cell = accepted_cells
+                .iter()
+                .any(|(accepted_case, accepted_step, _)| {
+                    *accepted_case == case && *accepted_step == step
+                });
+            let forced_pass = forced_cells.get(&step).copied().unwrap_or(false);
+            let accepted_conditions =
+                token_id_equal && duration_id_equal && frame_equal && forced_pass;
+            let mut cell_unaccepted = id_defect || (accepted_cell && !accepted_conditions);
             if numeric_defect {
                 let (index, _) = actual
                     .iter()
@@ -1389,11 +1452,17 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
                     .map(|(index, (candidate, reference))| (index, (candidate - reference).abs()))
                     .max_by(|(_, a), (_, b)| a.total_cmp(b))
                     .context("decode max difference missing")?;
-                let accepted_cell =
-                    (case == "clip2" && step == 44) || (case == "long" && step == 17);
-                let accepted = accepted_cell && !id_defect;
+                let accepted_index =
+                    accepted_cells
+                        .iter()
+                        .any(|(accepted_case, accepted_step, accepted_index)| {
+                            *accepted_case == case
+                                && *accepted_step == step
+                                && *accepted_index == index
+                        });
+                let accepted = accepted_cell && accepted_index && accepted_conditions;
                 println!(
-                    "PARAKEET_DECODE_DEFECT case={case} step={step} max_abs={maximum} bound={max_bound} max_factor={} rmse={rmse} bound={rmse_bound} rmse_factor={} index={index} reference={} candidate={} ids_equal={} frame_equal={frame_equal} token_margin={token_margin} duration_margin={duration_margin} reference_margins={reference_token_margin}/{reference_duration_margin} accepted={accepted}",
+                    "PARAKEET_DECODE_DEFECT case={case} step={step} max_abs={maximum} bound={max_bound} max_factor={} rmse={rmse} bound={rmse_bound} rmse_factor={} index={index} reference={} candidate={} ids_equal={} frame_equal={frame_equal} forced_pass={forced_pass} token_margin={token_margin} duration_margin={duration_margin} reference_margins={reference_token_margin}/{reference_duration_margin} accepted={accepted}",
                     maximum / max_bound,
                     rmse / rmse_bound,
                     expected[start + index],
@@ -1402,6 +1471,8 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
                 );
                 if accepted {
                     recorded_defects += 1;
+                } else {
+                    cell_unaccepted = true;
                 }
             }
             if id_defect && !numeric_defect {
@@ -1410,10 +1481,7 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
                     token_id_equal && duration_id_equal,
                 );
             }
-            if id_defect
-                || (numeric_defect
-                    && !((case == "clip2" && step == 44) || (case == "long" && step == 17)))
-            {
+            if cell_unaccepted {
                 unaccepted_defects += 1;
             }
             position += trajectory.durations[step + 1] as usize;
@@ -1460,9 +1528,9 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
         unaccepted_defects == 0,
         "decode has {unaccepted_defects} unaccepted defects"
     );
-    ensure!(recorded_defects == 2, "unexpected decode defect count");
+    ensure!(recorded_defects == 4, "unexpected decode defect count");
     println!(
-        "PASS PARAKEET_DECODE cases=4 media_swap=distinct production_pair_readback=8 recorded_defects=2"
+        "PASS PARAKEET_DECODE cases=4 steps=460 media_swap=distinct production_pair_readback=8 recorded_defects=4"
     );
     Ok(())
 }
