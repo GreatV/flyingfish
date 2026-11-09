@@ -166,7 +166,7 @@ impl SparseMesh {
             ));
         }
         let mut state = MeshDecimator::new(self)?;
-        state.run(target_faces)?;
+        state.run(target_faces, |_, _, _, _, _| Ok(()))?;
         let (mesh, ancestry, vertices) = state.finish()?;
         *self = mesh;
         Ok((ancestry, vertices))
@@ -787,7 +787,7 @@ impl MeshDecimator {
             let previous = vector_cross(vector_sub(old[1], old[0]), vector_sub(old[2], old[0]));
             if !length.is_finite()
                 || length <= 0.0
-                || vector_dot(normal, self.normals[face as usize]) < 0.5 * length
+                || vector_dot(normal, self.normals[face as usize]) / length < 0.5
                 || vector_dot(normal, previous) <= 0.0
             {
                 return false;
@@ -855,7 +855,11 @@ impl MeshDecimator {
         self.contractions += 1;
     }
 
-    fn run(&mut self, target: usize) -> Result<()> {
+    fn run(
+        &mut self,
+        target: usize,
+        mut audit: impl FnMut(&Self, u32, u32, [f64; 3], &[u32]) -> Result<()>,
+    ) -> Result<()> {
         while self.live_faces > target {
             let (corner, lower) = self.queue.pop().with_context(|| {
                 format!(
@@ -894,6 +898,7 @@ impl MeshDecimator {
                 self.queue.set(corner, cost);
                 continue;
             }
+            audit(self, a, b, point, &star)?;
             self.collapse(a, b, point, &star);
             if self.contractions.is_multiple_of(250_000) {
                 println!(
@@ -1693,6 +1698,48 @@ mod tests {
     }
 
     #[test]
+    fn mesh_qem_queue_and_link_indices() -> Result<()> {
+        let mut queue = EdgeQueue::new(97);
+        let mut expected = BTreeMap::new();
+        for i in 0..97u32 {
+            let cost = ((i * 67) % 97) as f64;
+            queue.set(i, cost);
+            expected.insert(i, cost);
+        }
+        for i in 0..388u32 {
+            let slot = (i * 31) % 97;
+            if i % 3 == 0 {
+                queue.remove(slot);
+                expected.remove(&slot);
+            } else {
+                let cost = ((i * 43) % 103) as f64;
+                queue.set(slot, cost);
+                expected.insert(slot, cost);
+            }
+            assert!(queue.heap.len() <= 97 && queue.peak <= 97);
+        }
+        let mut order = expected.into_iter().collect::<Vec<_>>();
+        order.sort_by(|(a, x), (b, y)| x.total_cmp(y).then(a.cmp(b)));
+        for (slot, cost) in order {
+            assert_eq!(queue.pop(), Some((slot, cost)));
+        }
+        assert!(queue.pop().is_none());
+        let mut mesh = SparseMesh {
+            vertices: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            faces: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+        };
+        let state = MeshDecimator::new(&mesh)?;
+        assert!(!state.protected.iter().any(|&v| v));
+        let star = state.star(0, 1);
+        assert!(!state.link_valid(0, 1, &star));
+        let original = mesh.faces.clone();
+        assert!(mesh.simplify(2).is_err());
+        assert_eq!(mesh.faces, original);
+        assert_eq!(mesh.simplify(4)?.0, vec![0, 1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
     #[ignore]
     fn sparse_mesh_qem_definition_cpu() -> Result<()> {
         let (root, frozen) = qem_reference()?;
@@ -1906,7 +1953,110 @@ mod tests {
         let target = cell["target_faces"]
             .as_u64()
             .context("target face count missing")? as usize;
-        let (ancestry, original_vertices) = mesh.simplify(target)?;
+        let mut state = MeshDecimator::new(&mesh)?;
+        let census = fixture(
+            &root.join(
+                cell["census_fixture"]
+                    .as_str()
+                    .context("census fixture missing")?,
+            ),
+        )?;
+        let expected_protected = integers(&census, "protected_vertices")?;
+        let actual_protected = state
+            .protected
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &p)| p.then_some(i as i32))
+            .collect::<Vec<_>>();
+        let mut audit_defects = usize::from(expected_protected != actual_protected);
+        let normals = mesh_values(&census, "original_normals")?;
+        let mut inherited = state.quadrics.clone();
+        let mut adjacency = vec![Vec::<u32>::new(); state.points.len()];
+        for (f, t) in mesh.faces.as_chunks::<3>().0.iter().enumerate() {
+            for &v in t {
+                adjacency[v as usize].push(f as u32);
+            }
+        }
+        let mut observed = 0;
+        let mut minimum_original_cosine = 1.0f64;
+        state.run(target, |s, a, b, point, star| {
+            audit_defects += usize::from(
+                s.quadrics[a as usize].0 != inherited[a as usize].0
+                    || s.quadrics[b as usize].0 != inherited[b as usize].0,
+            );
+            inherited[a as usize] = inherited[a as usize].add(inherited[b as usize]);
+            let mut expected = adjacency[a as usize].clone();
+            expected.extend(&adjacency[b as usize]);
+            expected.sort_unstable();
+            expected.dedup();
+            audit_defects += usize::from(expected != star);
+            for &f in &expected {
+                let old: [i32; 3] = mesh.faces[3 * f as usize..3 * f as usize + 3].try_into()?;
+                let removed = old.contains(&(a as i32)) && old.contains(&(b as i32));
+                if !removed {
+                    let previous = old.map(|v| {
+                        std::array::from_fn(|i| f64::from(mesh.vertices[3 * v as usize + i]))
+                    });
+                    let next = old.map(|v| {
+                        if v as u32 == a || v as u32 == b {
+                            point
+                        } else {
+                            std::array::from_fn(|i| f64::from(mesh.vertices[3 * v as usize + i]))
+                        }
+                    });
+                    for (&v, p) in old.iter().zip(previous) {
+                        audit_defects += usize::from(s.points[v as usize] != p);
+                    }
+                    let n =
+                        vector_cross(vector_sub(next[1], next[0]), vector_sub(next[2], next[0]));
+                    let length = vector_dot(n, n).sqrt();
+                    let original: [f64; 3] =
+                        normals[3 * f as usize..3 * f as usize + 3].try_into()?;
+                    let cosine = vector_dot(n, original) / length;
+                    if cosine.is_finite() {
+                        minimum_original_cosine = minimum_original_cosine.min(cosine);
+                    }
+                    let before = vector_cross(
+                        vector_sub(previous[1], previous[0]),
+                        vector_sub(previous[2], previous[0]),
+                    );
+                    audit_defects += usize::from(
+                        !cosine.is_finite()
+                            || cosine < 0.5
+                            || length <= 0.0
+                            || vector_dot(n, before) <= 0.0,
+                    );
+                }
+                for &v in &old {
+                    if let Some(i) = adjacency[v as usize].iter().position(|&x| x == f) {
+                        adjacency[v as usize].swap_remove(i);
+                    } else {
+                        audit_defects += 1;
+                    }
+                }
+                if removed {
+                    mesh.faces[3 * f as usize..3 * f as usize + 3].fill(-1);
+                } else {
+                    for v in &mut mesh.faces[3 * f as usize..3 * f as usize + 3] {
+                        if *v as u32 == b {
+                            *v = a as i32;
+                        }
+                        adjacency[*v as usize].push(f);
+                    }
+                }
+            }
+            mesh.vertices[3 * a as usize..3 * a as usize + 3]
+                .copy_from_slice(&point.map(|x| x as f32));
+            observed += 1;
+            Ok(())
+        })?;
+        for (v, &head) in state.heads.iter().enumerate() {
+            if head != u32::MAX {
+                audit_defects += usize::from(state.quadrics[v].0 != inherited[v].0);
+            }
+        }
+        let peak = state.queue.peak;
+        let (mesh, ancestry, original_vertices) = state.finish()?;
         let output = std::path::PathBuf::from(
             std::env::var("FF_HI3D_QEM_OUTPUT").context("FF_HI3D_QEM_OUTPUT required")?,
         );
@@ -1968,11 +2118,814 @@ mod tests {
             .collect::<Result<BTreeMap<_, _>>>()?;
         safetensors::tensor::serialize_to_file(views, None, &output.join("native.safetensors"))?;
         println!(
-            "PASS N5_M6_QEM_CAPTURE case={case} vertices={} faces={} target={target} ancestry={} timing=false",
+            "{} N5_M6_QEM_CAPTURE case={case} vertices={} faces={} target={target} ancestry={} contractions={observed} queue_peak={peak} minimum_original_normal_cosine={minimum_original_cosine} audit_defects={audit_defects} timing=false",
+            if audit_defects == 0 { "PASS" } else { "DEFECT" },
             mesh.vertices.len() / 3,
             mesh.faces.len() / 3,
             ancestry.len()
         );
+        ensure!(audit_defects == 0, "streamed contraction audit defects");
+        Ok(())
+    }
+
+    struct SurfaceMesh {
+        points: Vec<[f64; 3]>,
+        faces: Vec<[u32; 3]>,
+    }
+
+    impl SurfaceMesh {
+        fn read(path: &Path) -> Result<Self> {
+            let bank = fixture(path)?;
+            let points = mesh_values(&bank, "vertices")?.as_chunks::<3>().0.to_vec();
+            let faces = integers(&bank, "faces")?
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| p.map(|v| v as u32))
+                .collect::<Vec<_>>();
+            ensure!(
+                !points.is_empty()
+                    && !faces.is_empty()
+                    && points.iter().flatten().all(|v| v.is_finite())
+                    && faces.iter().flatten().all(|&v| (v as usize) < points.len()),
+                "surface fixture layout or values invalid"
+            );
+            Ok(Self { points, faces })
+        }
+
+        fn triangle(&self, face: u32) -> [[f64; 3]; 3] {
+            self.faces[face as usize].map(|v| self.points[v as usize])
+        }
+
+        fn frame(&mut self, frame: &serde_json::Value) -> Result<()> {
+            let center = frame["center"].as_array().context("frame center missing")?;
+            let radius = frame["radius"].as_f64().context("frame radius missing")?;
+            ensure!(
+                center.len() == 3 && radius.is_finite() && radius > 0.0,
+                "invalid common frame"
+            );
+            for p in &mut self.points {
+                for axis in 0..3 {
+                    p[axis] = (p[axis]
+                        - center[axis].as_f64().context("frame coordinate missing")?)
+                        / radius;
+                }
+            }
+            Ok(())
+        }
+
+        fn queries(&self) -> Result<Vec<[f64; 3]>> {
+            let mut total = 0.0;
+            let cdf = (0..self.faces.len())
+                .map(|f| {
+                    let [a, b, c] = self.triangle(f as u32);
+                    let n = vector_cross(vector_sub(b, a), vector_sub(c, a));
+                    total += vector_dot(n, n).sqrt() * 0.5;
+                    total
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                total.is_finite() && total > 0.0,
+                "surface query area invalid"
+            );
+            let radical = |mut i: usize, base: usize| {
+                let mut value = 0.0;
+                let mut fraction = 1.0 / base as f64;
+                while i != 0 {
+                    value += (i % base) as f64 * fraction;
+                    i /= base;
+                    fraction /= base as f64;
+                }
+                value
+            };
+            let mut face = 0;
+            let mut queries = Vec::with_capacity(32768);
+            for i in 0..32768 {
+                let quantile = (i as f64 + 0.5) * (total / 32768.0);
+                while cdf[face] <= quantile {
+                    face += 1;
+                }
+                let r = radical(i + 1, 2).sqrt();
+                let v = radical(i + 1, 3);
+                let weights = [1.0 - r, r * (1.0 - v), r * v];
+                let t = self.triangle(face as u32);
+                queries.push(std::array::from_fn(|axis| {
+                    t[0][axis] * weights[0] + t[1][axis] * weights[1] + t[2][axis] * weights[2]
+                }));
+            }
+            Ok(queries)
+        }
+    }
+
+    struct SurfaceNode {
+        lo: [f64; 3],
+        hi: [f64; 3],
+        start: usize,
+        len: usize,
+        children: [usize; 2],
+    }
+
+    struct SurfaceTree<'a> {
+        mesh: &'a SurfaceMesh,
+        ids: Vec<u32>,
+        nodes: Vec<SurfaceNode>,
+    }
+
+    fn segment_distance(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+        let d = vector_sub(b, a);
+        let length = vector_dot(d, d);
+        let t = if length > 0.0 {
+            (vector_dot(vector_sub(p, a), d) / length).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let delta = std::array::from_fn(|i| p[i] - a[i] - t * d[i]);
+        vector_dot(delta, delta)
+    }
+
+    fn triangle_distance(p: [f64; 3], [a, b, c]: [[f64; 3]; 3]) -> f64 {
+        let mut best = segment_distance(p, a, b)
+            .min(segment_distance(p, b, c))
+            .min(segment_distance(p, c, a));
+        let n = vector_cross(vector_sub(b, a), vector_sub(c, a));
+        let length = vector_dot(n, n);
+        if length > 0.0 {
+            let t = vector_dot(vector_sub(p, a), n) / length;
+            let projected = std::array::from_fn(|i| p[i] - t * n[i]);
+            if [(a, b), (b, c), (c, a)].into_iter().all(|(x, y)| {
+                vector_dot(vector_cross(vector_sub(y, x), vector_sub(projected, x)), n) >= 0.0
+            }) {
+                best = best.min(t * t * length);
+            }
+        }
+        best
+    }
+
+    impl<'a> SurfaceTree<'a> {
+        fn new(mesh: &'a SurfaceMesh) -> Self {
+            let mut tree = Self {
+                mesh,
+                ids: (0..mesh.faces.len() as u32).collect(),
+                nodes: Vec::new(),
+            };
+            tree.partition(0, mesh.faces.len());
+            tree
+        }
+
+        fn partition(&mut self, start: usize, len: usize) -> usize {
+            let mut lo = [f64::INFINITY; 3];
+            let mut hi = [f64::NEG_INFINITY; 3];
+            for &f in &self.ids[start..start + len] {
+                for p in self.mesh.triangle(f) {
+                    for axis in 0..3 {
+                        lo[axis] = lo[axis].min(p[axis]);
+                        hi[axis] = hi[axis].max(p[axis]);
+                    }
+                }
+            }
+            let index = self.nodes.len();
+            self.nodes.push(SurfaceNode {
+                lo,
+                hi,
+                start,
+                len,
+                children: [usize::MAX; 2],
+            });
+            if len > 8 {
+                let axis = (0..3)
+                    .max_by(|&i, &j| (hi[i] - lo[i]).total_cmp(&(hi[j] - lo[j])))
+                    .unwrap();
+                let mesh = self.mesh;
+                self.ids[start..start + len].select_nth_unstable_by(len / 2, |&a, &b| {
+                    let center = |f| mesh.triangle(f).into_iter().map(|p| p[axis]).sum::<f64>();
+                    center(a).total_cmp(&center(b)).then(a.cmp(&b))
+                });
+                self.nodes[index].children = [
+                    self.partition(start, len / 2),
+                    self.partition(start + len / 2, len - len / 2),
+                ];
+            }
+            index
+        }
+
+        fn box_distance(&self, p: [f64; 3], index: usize) -> f64 {
+            let node = &self.nodes[index];
+            (0..3)
+                .map(|i| (node.lo[i] - p[i]).max(p[i] - node.hi[i]).max(0.0).powi(2))
+                .sum()
+        }
+
+        fn distance(&self, p: [f64; 3]) -> f64 {
+            let mut stack = [0usize; 64];
+            let mut count = 1;
+            let mut best = f64::INFINITY;
+            while count != 0 {
+                count -= 1;
+                let index = stack[count];
+                if self.box_distance(p, index) > best {
+                    continue;
+                }
+                let node = &self.nodes[index];
+                if node.children[0] == usize::MAX {
+                    for &f in &self.ids[node.start..node.start + node.len] {
+                        best = best.min(triangle_distance(p, self.mesh.triangle(f)));
+                    }
+                } else {
+                    let [mut a, mut b] = node.children;
+                    if self.box_distance(p, a) < self.box_distance(p, b) {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    assert!(count + 2 <= stack.len());
+                    stack[count] = a;
+                    stack[count + 1] = b;
+                    count += 2;
+                }
+            }
+            best.sqrt()
+        }
+
+        fn metrics(&self, points: &[[f64; 3]], queries: &[[f64; 3]]) -> Result<[f64; 2]> {
+            ensure!(queries.len() == 32768, "surface query count differs");
+            let mut maximum = 0.0f64;
+            let mut squares = 0.0;
+            for (i, &p) in points.iter().chain(queries).enumerate() {
+                let d = self.distance(p);
+                ensure!(d.is_finite() && d >= 0.0, "nonfinite surface distance");
+                maximum = maximum.max(d);
+                if i >= points.len() {
+                    squares += d * d;
+                }
+            }
+            Ok([maximum, (squares / queries.len() as f64).sqrt()])
+        }
+    }
+
+    fn qem_proximity_validity(root: &Path, frozen: &serde_json::Value) -> Result<()> {
+        let mut total = 0;
+        let mut kinds = 0;
+        for (path, layout) in frozen["layouts"]
+            .as_object()
+            .context("fixture layouts missing")?
+        {
+            if layout.get("queries").is_none() || layout.get("vertices").is_none() {
+                continue;
+            }
+            let key = if layout.get("expected_distance").is_some() {
+                "expected_distance"
+            } else {
+                "expected"
+            };
+            let bank = fixture(&root.join(path))?;
+            let mesh = SurfaceMesh::read(&root.join(path))?;
+            let queries = mesh_values(&bank, "queries")?;
+            let expected = mesh_values(&bank, key)?;
+            let tree = SurfaceTree::new(&mesh);
+            for (&p, &d) in queries.as_chunks::<3>().0.iter().zip(&expected) {
+                ensure!(
+                    (tree.distance(p) - d).abs() <= 1e-12,
+                    "native triangle evaluator exact fixture differs"
+                );
+            }
+            let [a, b, c] = mesh.triangle(0);
+            kinds |= if mesh.points.len() > 3 {
+                8
+            } else if a == b && a == c {
+                4
+            } else if vector_dot(
+                vector_cross(vector_sub(b, a), vector_sub(c, a)),
+                vector_cross(vector_sub(b, a), vector_sub(c, a)),
+            ) == 0.0
+            {
+                2
+            } else {
+                1
+            };
+            total += expected.len();
+        }
+        ensure!(kinds == 15, "triangle evaluator validity coverage differs");
+        ensure!(
+            frozen["native_decimator_candidates"].as_u64() == Some(0),
+            "reference freeze is not pre-candidate"
+        );
+        println!(
+            "PASS N5_M6_QEM_EVALUATOR exact_queries={total} unused_vertices_excluded_from_target=true timing=false"
+        );
+        Ok(())
+    }
+
+    struct MeshCensus {
+        labels: Vec<usize>,
+        stats: Vec<[i64; 5]>,
+        boundary: Vec<[u32; 2]>,
+        singular: Vec<(u64, Vec<(usize, bool)>)>,
+        fans: Vec<usize>,
+        zero: Vec<usize>,
+        duplicates: usize,
+    }
+
+    fn census_union(parent: &mut [usize], a: usize, b: usize) {
+        let a = component_root(parent, a);
+        let b = component_root(parent, b);
+        if a != b {
+            parent[a.max(b)] = a.min(b);
+        }
+    }
+
+    fn mesh_census(mesh: &SurfaceMesh) -> MeshCensus {
+        let mut edges = Vec::with_capacity(mesh.faces.len() * 3);
+        let mut zero = Vec::new();
+        for (f, triangle) in mesh.faces.iter().enumerate() {
+            let [a, b, c] = mesh.triangle(f as u32);
+            let n = vector_cross(vector_sub(b, a), vector_sub(c, a));
+            if vector_dot(n, n) == 0.0 {
+                zero.push(f);
+            }
+            for side in 0..3 {
+                let a = triangle[side];
+                let b = triangle[(side + 1) % 3];
+                edges.push((
+                    (u64::from(a.min(b)) << 32) | u64::from(a.max(b)),
+                    3 * f + side,
+                ));
+            }
+        }
+        edges.sort_unstable();
+        let vertex = |c: usize| mesh.faces[c / 3][c % 3];
+        let next = |c: usize| c / 3 * 3 + (c % 3 + 1) % 3;
+        let mut parent = (0..mesh.faces.len()).collect::<Vec<_>>();
+        let mut corners = (0..mesh.faces.len() * 3).collect::<Vec<_>>();
+        let mut first = 0;
+        while first < edges.len() {
+            let mut end = first + 1;
+            while end < edges.len() && edges[end].0 == edges[first].0 {
+                end += 1;
+            }
+            if end - first == 2 {
+                let (a, b) = (edges[first].1, edges[first + 1].1);
+                if a / 3 != b / 3 {
+                    census_union(&mut parent, a / 3, b / 3);
+                    if vertex(a) == vertex(b) {
+                        census_union(&mut corners, a, b);
+                        census_union(&mut corners, next(a), next(b));
+                    } else {
+                        census_union(&mut corners, a, next(b));
+                        census_union(&mut corners, next(a), b);
+                    }
+                }
+            }
+            first = end;
+        }
+        let mut roots = vec![usize::MAX; parent.len()];
+        let mut stats = Vec::<[i64; 5]>::new();
+        let mut labels = Vec::with_capacity(parent.len());
+        for f in 0..parent.len() {
+            let root = component_root(&mut parent, f);
+            if roots[root] == usize::MAX {
+                roots[root] = stats.len();
+                stats.push([f as i64, 0, 0, 0, 0]);
+            }
+            labels.push(roots[root]);
+            stats[roots[root]][3] += 1;
+        }
+        drop(parent);
+        drop(roots);
+        let mut pairs = Vec::with_capacity(mesh.faces.len() * 3);
+        for c in 0..corners.len() {
+            let root = component_root(&mut corners, c);
+            pairs.push((u64::from(vertex(c)) << 32) | root as u64);
+        }
+        drop(corners);
+        pairs.sort_unstable();
+        pairs.dedup();
+        let mut fans = vec![0; mesh.points.len()];
+        for &p in &pairs {
+            fans[(p >> 32) as usize] += 1;
+        }
+        pairs.clear();
+        for (f, triangle) in mesh.faces.iter().enumerate() {
+            for &v in triangle {
+                pairs.push(((labels[f] as u64) << 32) | u64::from(v));
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        for p in pairs {
+            stats[(p >> 32) as usize][1] += 1;
+        }
+        let mut boundary = Vec::new();
+        let mut singular = Vec::new();
+        first = 0;
+        while first < edges.len() {
+            let mut end = first + 1;
+            while end < edges.len() && edges[end].0 == edges[first].0 {
+                end += 1;
+            }
+            let mut components = edges[first..end]
+                .iter()
+                .map(|e| labels[e.1 / 3])
+                .collect::<Vec<_>>();
+            components.sort_unstable();
+            components.dedup();
+            for c in components {
+                stats[c][2] += 1;
+            }
+            if end - first == 1 {
+                boundary.push([vertex(edges[first].1), vertex(next(edges[first].1))]);
+            }
+            if end - first > 2 {
+                singular.push((
+                    edges[first].0,
+                    edges[first..end]
+                        .iter()
+                        .map(|e| (e.1 / 3, vertex(e.1) == (e.0 >> 32) as u32))
+                        .collect(),
+                ));
+            }
+            first = end;
+        }
+        drop(edges);
+        for row in &mut stats {
+            row[4] = row[1] - row[2] + row[3];
+        }
+        let mut triples = mesh
+            .faces
+            .iter()
+            .map(|t| {
+                let mut t = *t;
+                t.sort_unstable();
+                t
+            })
+            .collect::<Vec<_>>();
+        triples.sort_unstable();
+        let duplicates = (0..triples.len())
+            .filter(|&i| {
+                (i > 0 && triples[i] == triples[i - 1])
+                    || (i + 1 < triples.len() && triples[i] == triples[i + 1])
+            })
+            .count();
+        MeshCensus {
+            labels,
+            stats,
+            boundary,
+            singular,
+            fans,
+            zero,
+            duplicates,
+        }
+    }
+
+    fn qem_structural(
+        root: &Path,
+        cell: &serde_json::Value,
+        source: &SurfaceMesh,
+        candidate: &SurfaceMesh,
+        bank: &MappedCheckpoint,
+    ) -> Result<usize> {
+        let reference = fixture(
+            &root.join(
+                cell["census_fixture"]
+                    .as_str()
+                    .context("census fixture missing")?,
+            ),
+        )?;
+        let old = mesh_census(source);
+        let expected_labels = integers(&reference, "face_component")?;
+        let expected_stats = integers(&reference, "component_stats")?;
+        ensure!(
+            old.labels
+                .iter()
+                .copied()
+                .eq(expected_labels.iter().map(|&x| x as usize))
+                && old
+                    .stats
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .eq(expected_stats.iter().map(|&x| i64::from(x))),
+            "native source component census differs from frozen oracle"
+        );
+        let mut old_boundary = old.boundary.clone();
+        old_boundary.sort_unstable();
+        let mut expected_boundary = integers(&reference, "directed_boundary")?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| p.map(|v| v as u32))
+            .collect::<Vec<_>>();
+        expected_boundary.sort_unstable();
+        ensure!(
+            old_boundary == expected_boundary
+                && old.singular.len()
+                    == cell["census"]["nonmanifold_edges"]
+                        .as_u64()
+                        .context("singular edge count missing")? as usize
+                && old.fans.iter().filter(|&&n| n > 1).count()
+                    == cell["census"]["multiple_fan_vertices"]
+                        .as_u64()
+                        .context("fan count missing")? as usize,
+            "native source edge/fan census differs"
+        );
+        let current = mesh_census(candidate);
+        let ancestry = integers(bank, "original_faces")?;
+        let original_vertices = integers(bank, "original_vertices")?;
+        ensure!(
+            ancestry.len() == candidate.faces.len()
+                && original_vertices.len() == candidate.points.len()
+                && ancestry.windows(2).all(|p| p[0] < p[1])
+                && original_vertices.windows(2).all(|p| p[0] < p[1]),
+            "candidate ancestry layout invalid"
+        );
+        ensure!(
+            ancestry
+                .iter()
+                .all(|&f| f >= 0 && (f as usize) < source.faces.len())
+                && original_vertices
+                    .iter()
+                    .all(|&v| v >= 0 && (v as usize) < source.points.len()),
+            "candidate ancestry index invalid"
+        );
+        let mut defects = 0;
+        let mut boundary = current
+            .boundary
+            .iter()
+            .map(|p| p.map(|v| original_vertices[v as usize] as u32))
+            .collect::<Vec<_>>();
+        boundary.sort_unstable();
+        defects += usize::from(boundary != old_boundary);
+        for v in integers(&reference, "protected_vertices")? {
+            defects += usize::from(
+                original_vertices
+                    .binary_search(&v)
+                    .map_or(true, |i| candidate.points[i] != source.points[v as usize]),
+            );
+        }
+        for (i, &n) in current.fans.iter().enumerate() {
+            defects += usize::from(n != old.fans[original_vertices[i] as usize]);
+        }
+        let mut singular = current
+            .singular
+            .iter()
+            .map(|&(key, ref faces)| {
+                let a = original_vertices[(key >> 32) as usize] as u32;
+                let b = original_vertices[(key & 0xffffffff) as usize] as u32;
+                let mut faces = faces
+                    .iter()
+                    .map(|&(f, direction)| (ancestry[f] as usize, direction))
+                    .collect::<Vec<_>>();
+                faces.sort_unstable();
+                (((u64::from(a.min(b))) << 32) | u64::from(a.max(b)), faces)
+            })
+            .collect::<Vec<_>>();
+        singular.sort_unstable();
+        defects += usize::from(singular != old.singular);
+        defects += usize::from(current.duplicates != old.duplicates);
+        let zeros = current
+            .zero
+            .iter()
+            .map(|&f| ancestry[f] as usize)
+            .collect::<Vec<_>>();
+        defects += usize::from(zeros != old.zero);
+        let mut mapped = vec![usize::MAX; current.stats.len()];
+        for (f, &label) in current.labels.iter().enumerate() {
+            let expected = old.labels[ancestry[f] as usize];
+            if mapped[label] == usize::MAX {
+                mapped[label] = expected;
+            }
+            defects += usize::from(mapped[label] != expected);
+        }
+        let mut unique = mapped.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        defects += usize::from(unique.len() != old.stats.len() || mapped.len() != old.stats.len());
+        for (c, &original) in mapped.iter().enumerate() {
+            defects += usize::from(current.stats[c][4] != old.stats[original][4]);
+        }
+        let normals = mesh_values(&reference, "original_normals")?;
+        let mut minimum_cosine = 1.0f64;
+        for (f, &original) in ancestry.iter().enumerate() {
+            let n0: [f64; 3] =
+                normals[3 * original as usize..3 * original as usize + 3].try_into()?;
+            if n0 == [0.0; 3] {
+                continue;
+            }
+            let [a, b, c] = candidate.triangle(f as u32);
+            let n = vector_cross(vector_sub(b, a), vector_sub(c, a));
+            let length = vector_dot(n, n).sqrt();
+            let cosine = vector_dot(n, n0) / length;
+            if cosine.is_finite() {
+                minimum_cosine = minimum_cosine.min(cosine);
+            }
+            defects += usize::from(!cosine.is_finite() || length <= 0.0 || cosine < 0.5);
+        }
+        let minimum = cell["minimum_output_faces"]
+            .as_u64()
+            .context("minimum face count missing")? as usize;
+        let maximum = cell["target_faces"]
+            .as_u64()
+            .context("target face count missing")? as usize;
+        defects += usize::from(!(minimum..=maximum).contains(&candidate.faces.len()));
+        println!(
+            "N5_M6_QEM_STRUCTURE faces={} components={} boundary={} singular={} minimum_original_normal_cosine={minimum_cosine} defects={defects}",
+            candidate.faces.len(),
+            current.stats.len(),
+            current.boundary.len(),
+            current.singular.len()
+        );
+        Ok(defects)
+    }
+
+    fn qem_queries(common: &Path, kind: &str) -> Result<Vec<[f64; 3]>> {
+        let bank = fixture(&common.join(format!("{kind}-queries.safetensors")))?;
+        let points = mesh_values(&bank, "points")?;
+        ensure!(
+            points.len() == 3 * 32768,
+            "canonical point bank extent differs"
+        );
+        Ok(points.as_chunks::<3>().0.to_vec())
+    }
+
+    fn translation_certificate(input: &SurfaceMesh, output: &SurfaceMesh) -> f64 {
+        let bounds = |mesh: &SurfaceMesh, shift: f64| {
+            let mut lo = [f64::INFINITY; 3];
+            let mut hi = [f64::NEG_INFINITY; 3];
+            for triangle in &mesh.faces {
+                for &v in triangle {
+                    for axis in 0..3 {
+                        let p = mesh.points[v as usize][axis] + if axis == 0 { shift } else { 0.0 };
+                        lo[axis] = lo[axis].min(p);
+                        hi[axis] = hi[axis].max(p);
+                    }
+                }
+            }
+            (lo, hi)
+        };
+        let (a, b) = bounds(input, 0.0);
+        let (c, d) = bounds(output, 32.0);
+        (0..3)
+            .map(|i| (c[i] - b[i]).max(a[i] - d[i]).max(0.0).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    #[ignore]
+    fn sparse_mesh_qem_geometry_cpu() -> Result<()> {
+        let (root, frozen) = qem_reference()?;
+        qem_proximity_validity(&root, &frozen)?;
+        let case = std::env::var("FF_HI3D_QEM_CASE").context("FF_HI3D_QEM_CASE required")?;
+        let cell = &frozen["cases"][&case];
+        let output = std::path::PathBuf::from(
+            std::env::var("FF_HI3D_QEM_OUTPUT").context("FF_HI3D_QEM_OUTPUT required")?,
+        );
+        ensure!(
+            !output.join("SCORES.json").exists(),
+            "geometry score already recorded"
+        );
+        let source_path = root.join(cell["D"].as_str().context("D fixture missing")?);
+        let source = SurfaceMesh::read(&source_path)?;
+        let candidate = SurfaceMesh::read(&output.join("native.safetensors"))?;
+        let bank = fixture(&output.join("native.safetensors"))?;
+        let mut defects = qem_structural(&root, cell, &source, &candidate, &bank)?;
+        drop(bank);
+        let frame = &cell["frame"];
+        let common = source_path
+            .parent()
+            .context("common query parent missing")?;
+        let mut inputs = vec![
+            (
+                "R",
+                SurfaceMesh::read(Path::new(
+                    cell["raw_input"].as_str().context("RAW fixture missing")?,
+                ))?,
+                qem_queries(common, "R")?,
+            ),
+            ("D", source, qem_queries(common, "D")?),
+        ];
+        let mut outputs = vec![
+            (
+                "P",
+                SurfaceMesh::read(Path::new(
+                    cell["publisher_P"]
+                        .as_str()
+                        .context("publisher fixture missing")?,
+                ))?,
+                qem_queries(common, "P")?,
+            ),
+            ("C", candidate, Vec::new()),
+            (
+                "LOW",
+                SurfaceMesh::read(
+                    &root.join(
+                        cell["control_LOW"]
+                            .as_str()
+                            .context("control fixture missing")?,
+                    ),
+                )?,
+                qem_queries(common, "LOW")?,
+            ),
+        ];
+        for (_, mesh, _) in &mut inputs {
+            mesh.frame(frame)?;
+        }
+        for (name, mesh, queries) in &mut outputs {
+            mesh.frame(frame)?;
+            if *name == "C" {
+                *queries = mesh.queries()?;
+            }
+            if *name == "P" {
+                ensure!(
+                    *queries == mesh.queries()?,
+                    "native area-query construction differs from canonical reference"
+                );
+            }
+        }
+        let mut metrics = BTreeMap::new();
+        for (name, mesh, _) in &outputs {
+            let tree = SurfaceTree::new(mesh);
+            for (input, source, queries) in &inputs {
+                let error = tree.metrics(&source.points, queries)?;
+                metrics.insert((name.to_string(), format!("{input}->P")), error);
+                println!(
+                    "N5_M6_QEM_DISTANCE case={case} arm={name} direction={input}->{name} max={} RMS={}",
+                    error[0], error[1]
+                );
+            }
+        }
+        let mut translation = BTreeMap::new();
+        for (input, mesh, _) in &inputs {
+            translation.insert(
+                input.to_string(),
+                translation_certificate(mesh, &outputs[0].1),
+            );
+            let tree = SurfaceTree::new(mesh);
+            for (name, source, queries) in &outputs {
+                let error = tree.metrics(&source.points, queries)?;
+                metrics.insert((name.to_string(), format!("P->{input}")), error);
+                println!(
+                    "N5_M6_QEM_DISTANCE case={case} arm={name} direction={name}->{input} max={} RMS={}",
+                    error[0], error[1]
+                );
+            }
+        }
+        let mut records = BTreeMap::new();
+        let mut best_control = 0.0f64;
+        let mut minimum_control = f64::INFINITY;
+        let mut minimum_translation = f64::INFINITY;
+        for (key, field) in cell["quality_fields"]
+            .as_object()
+            .context("quality fields missing")?
+        {
+            let (direction, metric) = key.rsplit_once('.').context("metric key invalid")?;
+            let i = usize::from(metric == "RMS");
+            let reference = metrics[&("P".to_string(), direction.to_string())][i];
+            let actual = metrics[&("C".to_string(), direction.to_string())][i];
+            let control = metrics[&("LOW".to_string(), direction.to_string())][i];
+            let expected = field["publisher_E"]
+                .as_f64()
+                .context("publisher metric missing")?;
+            let tau = field["tau"].as_f64().context("metric floor missing")?;
+            let bound = field["quality_bound"]
+                .as_f64()
+                .context("quality bound missing")?;
+            ensure!(
+                (reference - expected).abs() <= tau,
+                "native evaluator disagrees with frozen publisher metric {key}"
+            );
+            let input = if direction.contains('R') { "R" } else { "D" };
+            let certified = translation[input] / bound;
+            ensure!(
+                certified > 10.0,
+                "translation validity control failed {key}"
+            );
+            minimum_translation = minimum_translation.min(certified);
+            if input == "D" {
+                best_control = best_control.max(control / bound);
+                minimum_control = minimum_control.min(control / bound);
+            }
+            let defect = actual > bound;
+            defects += usize::from(defect);
+            println!(
+                "N5_M6_QEM_SCORE case={case} field={key} value={actual} bound={bound} publisher_native={reference} publisher_frozen={expected} control_multiple={} defect={defect}",
+                control / bound
+            );
+            records.insert(key.clone(), serde_json::json!({"value":actual,"quality_bound":bound,"reference_native":reference,"reference_frozen":expected,"reference_delta":(reference-expected).abs(),"control_value":control,"control_multiple":control/bound,"translation_certificate_multiple":certified,"defect":defect}));
+        }
+        ensure!(
+            best_control > 2.0,
+            "realistic degradation control failed frozen detector"
+        );
+        let result = serde_json::json!({"case":case,"metric_cells":records.len(),"fields":records,"defects":defects,"minimum_realistic_control_multiple":minimum_control,"best_realistic_control_multiple":best_control,"minimum_translation_certificate_multiple":minimum_translation,"timing":false});
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output.join("SCORES.json"))?;
+        writeln!(file, "{}", serde_json::to_string_pretty(&result)?)?;
+        println!(
+            "{} N5_M6_QEM_GEOMETRY {result}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "mesh simplification defects");
         Ok(())
     }
 
