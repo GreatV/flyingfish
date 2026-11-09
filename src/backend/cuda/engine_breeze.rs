@@ -1,4 +1,4 @@
-//! Breeze-TTS-2 M0 prefill: T5Gemma2 text encoder, Qwen3 backbone, depth decoder.
+//! Breeze-TTS-2 M0 prefill and M1 greedy decode.
 //! GEMM row count is 17 when `supports` is true for the logical row count.
 //! Text full-attention layers are indices where `(index + 1)` is divisible by 6.
 //! Depth head `k` reads post-norm position `k + 1`.
@@ -261,6 +261,10 @@ struct Buf {
     qkv: CudaSlice<bf16>,
     k: CudaSlice<bf16>,
     v: CudaSlice<bf16>,
+    lk: Vec<CudaSlice<bf16>>,
+    lv: Vec<CudaSlice<bf16>>,
+    dk: CudaSlice<bf16>,
+    dv: CudaSlice<bf16>,
     attn: CudaSlice<bf16>,
     audio: CudaSlice<bf16>,
     stack: CudaSlice<bf16>,
@@ -298,6 +302,14 @@ enum RopeKind {
     Skip,
 }
 
+#[derive(Clone, Copy)]
+enum KvSlot {
+    Shared,
+    Depth,
+    Layer(usize),
+}
+
+#[derive(Clone, Copy)]
 struct RopeGeom {
     rows: usize,
     q_heads: usize,
@@ -313,6 +325,7 @@ struct RopeGeom {
     v_row_stride: usize,
     eps: f32,
     kind: RopeKind,
+    slot: KvSlot,
 }
 
 struct Gemm<'a> {
@@ -360,6 +373,9 @@ struct DecPass<'a> {
     flash: &'a mut Flash,
     kind: RopeKind,
     geom: DecGeom,
+    origin: i32,
+    capacity: usize,
+    slot: KvSlot,
 }
 
 #[derive(Clone, Copy)]
@@ -519,6 +535,16 @@ fn residual(k: &Kern, a: &mut CudaSlice<bf16>, b: &CudaSlice<bf16>, n: usize) ->
     Ok(())
 }
 
+struct RopeBind<'a> {
+    qkv: &'a mut CudaSlice<bf16>,
+    cache_k: &'a mut CudaSlice<bf16>,
+    cache_v: &'a mut CudaSlice<bf16>,
+    start: &'a CudaSlice<i32>,
+    qn: &'a CudaSlice<bf16>,
+    kn: &'a CudaSlice<bf16>,
+    table: &'a CudaSlice<bf16>,
+}
+
 fn rope(
     k: &Kern,
     buf: &mut Buf,
@@ -528,6 +554,56 @@ fn rope(
     g: RopeGeom,
 ) -> Result<()> {
     copy_h2d(&k.stream, &[g.start], &mut buf.start)?;
+    match g.slot {
+        KvSlot::Shared => rope_launch(
+            k,
+            RopeBind {
+                qkv: &mut buf.qkv,
+                cache_k: &mut buf.k,
+                cache_v: &mut buf.v,
+                start: &buf.start,
+                qn,
+                kn,
+                table,
+            },
+            g,
+        ),
+        KvSlot::Depth => rope_launch(
+            k,
+            RopeBind {
+                qkv: &mut buf.qkv,
+                cache_k: &mut buf.dk,
+                cache_v: &mut buf.dv,
+                start: &buf.start,
+                qn,
+                kn,
+                table,
+            },
+            g,
+        ),
+        KvSlot::Layer(index) => {
+            let Buf {
+                qkv, lk, lv, start, ..
+            } = buf;
+            ensure!(index < lk.len() && index < lv.len(), "layer cache");
+            rope_launch(
+                k,
+                RopeBind {
+                    qkv,
+                    cache_k: &mut lk[index],
+                    cache_v: &mut lv[index],
+                    start,
+                    qn,
+                    kn,
+                    table,
+                },
+                g,
+            )
+        }
+    }
+}
+
+fn rope_launch(k: &Kern, bind: RopeBind<'_>, g: RopeGeom) -> Result<()> {
     let function = match g.kind {
         RopeKind::OnePlus => &k.rope_one_plus,
         RopeKind::Cast => &k.rope_cast,
@@ -548,13 +624,13 @@ fn rope(
     unsafe {
         k.stream
             .launch_builder(function)
-            .arg(&mut buf.qkv)
-            .arg(&mut buf.k)
-            .arg(&mut buf.v)
-            .arg(qn)
-            .arg(kn)
-            .arg(table)
-            .arg(&buf.start)
+            .arg(bind.qkv)
+            .arg(bind.cache_k)
+            .arg(bind.cache_v)
+            .arg(bind.qn)
+            .arg(bind.kn)
+            .arg(bind.table)
+            .arg(bind.start)
             .arg(&g.cache_start)
             .arg(&rows)
             .arg(&q_heads)
@@ -597,7 +673,19 @@ fn embed_tokens(
 }
 
 fn download_f32(stream: &Arc<CudaStream>, src: &CudaSlice<bf16>, n: usize) -> Result<Vec<f32>> {
-    let raw = stream.clone_dtoh(&src.slice(..n))?;
+    download_row(stream, src, 0, n)
+}
+
+fn download_row(
+    stream: &Arc<CudaStream>,
+    src: &CudaSlice<bf16>,
+    row: usize,
+    width: usize,
+) -> Result<Vec<f32>> {
+    let start = row.checked_mul(width).context("score offset")?;
+    let end = start.checked_add(width).context("score offset")?;
+    ensure!(end <= src.len(), "score row");
+    let raw = stream.clone_dtoh(&src.slice(start..end))?;
     stream.synchronize()?;
     let out: Vec<f32> = raw.iter().map(|value| value.to_f32()).collect();
     ensure!(
@@ -698,6 +786,12 @@ fn load_matrix(
 }
 
 fn alloc_buf(stream: &Arc<CudaStream>) -> Result<Buf> {
+    let mut lk = Vec::with_capacity(BB_LAYERS);
+    let mut lv = Vec::with_capacity(BB_LAYERS);
+    for _ in 0..BB_LAYERS {
+        lk.push(stream.alloc_zeros(KV_ELEMS)?);
+        lv.push(stream.alloc_zeros(KV_ELEMS)?);
+    }
     Ok(Buf {
         h: stream.alloc_zeros(H_ELEMS)?,
         n: stream.alloc_zeros(H_ELEMS)?,
@@ -708,6 +802,10 @@ fn alloc_buf(stream: &Arc<CudaStream>) -> Result<Buf> {
         qkv: stream.alloc_zeros(QKV_ELEMS)?,
         k: stream.alloc_zeros(KV_ELEMS)?,
         v: stream.alloc_zeros(KV_ELEMS)?,
+        lk,
+        lv,
+        dk: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
+        dv: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
         attn: stream.alloc_zeros(ATTN_ELEMS)?,
         audio: stream.alloc_zeros(AUDIO_ELEMS)?,
         stack: stream.alloc_zeros(STACK_ELEMS)?,
@@ -752,6 +850,8 @@ struct Attn<'a> {
     eps: f32,
     kind: RopeKind,
     start: i32,
+    capacity: usize,
+    slot: KvSlot,
     causal: bool,
     window_left: Option<usize>,
 }
@@ -776,6 +876,7 @@ struct DepthIn<'a> {
     cond: &'a [f32],
     ids: &'a [u32],
     frame: usize,
+    slot: KvSlot,
 }
 
 fn tensor_name(prefix: &str, index: usize, leaf: &str) -> String {
@@ -1189,6 +1290,7 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             input: call.hidden,
         },
     )?;
+    ensure!(call.start >= 0, "attention origin");
     rope(
         k,
         buf,
@@ -1200,8 +1302,8 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             q_heads: call.q_heads,
             kv_heads: call.kv_heads,
             dim: call.dim,
-            capacity: rows,
-            cache_start: 0,
+            capacity: call.capacity,
+            cache_start: call.start,
             start: call.start,
             q_row_stride: q_width,
             k_offset: k_off,
@@ -1210,20 +1312,37 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             v_row_stride: kv_width,
             eps: call.eps,
             kind: call.kind,
+            slot: call.slot,
         },
     )?;
     let shape = Shape {
         rows,
-        start: 0,
+        start: usize::try_from(call.start)?,
         q_heads: call.q_heads,
         kv_heads: call.kv_heads,
-        capacity: rows,
+        capacity: call.capacity,
         head_dim: call.dim,
         causal: call.causal,
         window_left: call.window_left,
     };
-    call.flash
-        .run(&buf.qkv, q_width, &buf.k, &buf.v, &mut buf.attn, shape)?;
+    match call.slot {
+        KvSlot::Shared => {
+            call.flash
+                .run(&buf.qkv, q_width, &buf.k, &buf.v, &mut buf.attn, shape)?;
+        }
+        KvSlot::Depth => {
+            call.flash
+                .run(&buf.qkv, q_width, &buf.dk, &buf.dv, &mut buf.attn, shape)?;
+        }
+        KvSlot::Layer(index) => {
+            let Buf {
+                qkv, lk, lv, attn, ..
+            } = buf;
+            ensure!(index < lk.len() && index < lv.len(), "layer cache");
+            call.flash
+                .run(qkv, q_width, &lk[index], &lv[index], attn, shape)?;
+        }
+    }
     gemm(
         &k.stream,
         blas,
@@ -1358,6 +1477,8 @@ fn text_layer(
             eps: TEXT_EPS,
             kind: RopeKind::OnePlus,
             start,
+            capacity: rows,
+            slot: KvSlot::Shared,
             causal: false,
             window_left: step.window_left,
         },
@@ -1457,7 +1578,9 @@ fn decoder_layer(k: &Kern, buf: &mut Buf, blas: &Blas, pass: DecPass<'_>) -> Res
             dim: pass.geom.dim,
             eps: pass.geom.eps,
             kind: pass.kind,
-            start: 0,
+            start: pass.origin,
+            capacity: pass.capacity,
+            slot: pass.slot,
             causal: true,
             window_left: None,
         },
@@ -1657,6 +1780,7 @@ fn depth_frame(k: &Kern, buf: &mut Buf, blas: &Blas, input: DepthIn<'_>) -> Resu
         cond,
         ids,
         frame,
+        slot,
     } = input;
     ensure!(cond.len() == BB_H && ids.len() == DP_ROWS, "depth frame");
     k.stream.memset_zeros(&mut buf.embed_ws)?;
@@ -1701,6 +1825,9 @@ fn depth_frame(k: &Kern, buf: &mut Buf, blas: &Blas, input: DepthIn<'_>) -> Resu
                 flash: &mut *flash,
                 kind: RopeKind::Skip,
                 geom,
+                origin: 0,
+                capacity: DP_ROWS,
+                slot,
             },
         )?;
     }
@@ -1767,6 +1894,235 @@ fn depth_heads(
         }
     }
     Ok(out)
+}
+
+struct ScorePass<'a> {
+    layers: &'a [DecoderLayer],
+    norm: &'a CudaSlice<bf16>,
+    lm: &'a CudaSlice<bf16>,
+    table: &'a CudaSlice<bf16>,
+    flash: &'a mut Flash,
+    rows: usize,
+    origin: i32,
+    score_row: usize,
+}
+
+struct DepthStep<'a> {
+    w: &'a Weights,
+    flash: &'a mut Flash,
+    cond: &'a [f32],
+    codes: &'a [i32],
+    frame: usize,
+    plant: bool,
+}
+
+fn upload_hidden(k: &Kern, buf: &mut Buf, src: &[f32]) -> Result<()> {
+    ensure!(
+        !src.is_empty() && src.len().is_multiple_of(BB_H),
+        "hidden rows"
+    );
+    ensure!(
+        src.iter().all(|value| value.is_finite()),
+        "non-finite hidden"
+    );
+    let host: Vec<bf16> = src.iter().copied().map(bf16::from_f32).collect();
+    copy_h2d(&k.stream, &host, &mut buf.h.slice_mut(..host.len()))
+}
+
+fn place_audio_row(k: &Kern, table: &CudaSlice<bf16>, buf: &mut Buf, codes: &[i32]) -> Result<()> {
+    ensure!(codes.len() == BOOKS, "audio row");
+    for &id in codes {
+        ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
+    }
+    copy_h2d(&k.stream, codes, &mut buf.ids.slice_mut(..BOOKS))?;
+    launch_row_sum(k, table, &buf.ids, &mut buf.audio, 1, BB_H)?;
+    k.stream
+        .memcpy_dtod(&buf.audio.slice(..BB_H), &mut buf.h.slice_mut(..BB_H))?;
+    Ok(())
+}
+
+fn clear_depth_kv(k: &Kern, buf: &mut Buf) -> Result<()> {
+    k.stream.memset_zeros(&mut buf.dk)?;
+    k.stream.memset_zeros(&mut buf.dv)?;
+    Ok(())
+}
+
+fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> Result<Vec<f32>> {
+    ensure!(pass.rows > 0 && pass.score_row < pass.rows, "score row");
+    ensure!(pass.origin >= 0, "score origin");
+    let end = usize::try_from(pass.origin)?
+        .checked_add(pass.rows)
+        .context("backbone cache")?;
+    ensure!(end <= BB_MAX, "backbone cache");
+    ensure!(pass.layers.len() == BB_LAYERS, "backbone layers");
+    set_meta(&k.stream, &mut buf.meta, pass.rows)?;
+    let geom = DecGeom {
+        rows: pass.rows,
+        hidden: BB_H,
+        intermediate: BB_I,
+        q_heads: BB_HEADS,
+        kv_heads: BB_KV,
+        dim: BB_DIM,
+        eps: BB_EPS,
+    };
+    for (index, layer) in pass.layers.iter().enumerate() {
+        decoder_layer(
+            k,
+            buf,
+            blas,
+            DecPass {
+                layer,
+                table: pass.table,
+                flash: &mut *pass.flash,
+                kind: RopeKind::Cast,
+                geom,
+                origin: pass.origin,
+                capacity: BB_MAX,
+                slot: KvSlot::Layer(index),
+            },
+        )?;
+    }
+    rms(
+        k,
+        &buf.meta,
+        Rms {
+            x: &buf.h,
+            y: &mut buf.n,
+            w: pass.norm,
+            rows: pass.rows,
+            width: BB_H,
+            mode: RmsMode::Standard,
+            eps: BB_EPS,
+        },
+    )?;
+    gemm(
+        &k.stream,
+        blas,
+        Gemm {
+            w: pass.lm,
+            x: &mut buf.n,
+            y: &mut buf.d,
+            x_off: 0,
+            y_off: 0,
+            logical: pass.rows,
+            output: BB_VOCAB,
+            input: BB_H,
+        },
+    )?;
+    download_row(&k.stream, &buf.d, pass.score_row, BB_VOCAB)
+}
+
+fn depth_input(codes: &[i32]) -> Result<[u32; DP_ROWS]> {
+    ensure!(codes.len() == BOOKS, "depth frame codes");
+    let mut row = [0i32; DP_ROWS];
+    for (book, &code) in codes.iter().take(HEAD_N).enumerate() {
+        row[book + 1] = code;
+    }
+    depth_ids(&row)
+}
+
+fn depth_head_row(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    heads: &[CudaSlice<bf16>],
+    frame: usize,
+    book: usize,
+    plant: bool,
+) -> Result<Vec<f32>> {
+    let vocab = CODEBOOK as usize;
+    let src = (frame * DP_ROWS + book + 1) * DP_H;
+    k.stream.memcpy_dtod(
+        &buf.stack.slice(src..src + DP_H),
+        &mut buf.head_in.slice_mut(..DP_H),
+    )?;
+    let which = if plant && book == 0 { 1 } else { book };
+    gemm(
+        &k.stream,
+        blas,
+        Gemm {
+            w: &heads[which],
+            x: &mut buf.head_in,
+            y: &mut buf.head_out,
+            x_off: 0,
+            y_off: 0,
+            logical: 1,
+            output: vocab,
+            input: DP_H,
+        },
+    )?;
+    download_f32(&k.stream, &buf.head_out, vocab)
+}
+
+fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Result<Vec<f32>> {
+    set_meta(&k.stream, &mut buf.meta, DP_ROWS)?;
+    let ids = depth_input(step.codes)?;
+    depth_frame(
+        k,
+        buf,
+        blas,
+        DepthIn {
+            layers: &step.w.depth,
+            norm: &step.w.depth_norm,
+            projector: &step.w.projector,
+            embed: &step.w.audio,
+            table: &k.table_depth,
+            flash: step.flash,
+            cond: step.cond,
+            ids: &ids,
+            frame: step.frame,
+            slot: KvSlot::Depth,
+        },
+    )?;
+    clear_depth_kv(k, buf)?;
+    let mut out = Vec::with_capacity(HEAD_N * (CODEBOOK as usize));
+    for book in 0..HEAD_N {
+        out.extend(depth_head_row(
+            k,
+            buf,
+            blas,
+            &step.w.heads,
+            step.frame,
+            book,
+            step.plant,
+        )?);
+    }
+    Ok(out)
+}
+
+fn decode_shape(
+    projected: &[f32],
+    cond: &[f32],
+    text_rows: usize,
+    fed: &[i32],
+    frames: &[i32],
+) -> Result<(usize, usize)> {
+    ensure!(fed.len().is_multiple_of(BOOKS), "fed codes");
+    ensure!(frames.len().is_multiple_of(BOOKS), "depth codes");
+    ensure!(cond.len().is_multiple_of(BB_H), "cond");
+    let audio_steps = fed.len() / BOOKS;
+    let depth_frames = frames.len() / BOOKS;
+    ensure!(
+        (1..=DP_FRAMES).contains(&depth_frames),
+        "frames {depth_frames}"
+    );
+    ensure!(cond.len() == depth_frames * BB_H, "cond length");
+    ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
+    ensure!(
+        audio_steps >= 1 && depth_frames >= audio_steps,
+        "decode steps"
+    );
+    ensure!(text_rows + audio_steps <= BB_MAX, "decode length");
+    ensure!(projected.len() == text_rows * BB_H, "projected length");
+    ensure!(
+        projected.iter().all(|value| value.is_finite()),
+        "non-finite projected"
+    );
+    ensure!(
+        cond.iter().all(|value| value.is_finite()),
+        "non-finite cond"
+    );
+    Ok((audio_steps, depth_frames))
 }
 
 impl Breeze {
@@ -2052,6 +2408,9 @@ impl Breeze {
                     flash: &mut flash.backbone,
                     kind: RopeKind::Cast,
                     geom,
+                    origin: 0,
+                    capacity: rows,
+                    slot: KvSlot::Shared,
                 },
             )?;
         }
@@ -2130,10 +2489,114 @@ impl Breeze {
                     cond: cond_row,
                     ids: &id_rows[frame],
                     frame,
+                    slot: KvSlot::Shared,
                 },
             )?;
         }
         depth_heads(k, buf, blas, &w.heads, frames, plant_head)
+    }
+
+    /// Backbone KV is one BB_MAX cache per layer. Each depth frame uses DP_ROWS and is zeroed after the frame.
+    pub fn greedy_decode(
+        &mut self,
+        projected: &[f32],
+        cond: &[f32],
+        text_rows: usize,
+        fed: &[i32],
+        frames: &[i32],
+        plant_head: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (audio_steps, depth_frames) = decode_shape(projected, cond, text_rows, fed, frames)?;
+        self.bound_device()?;
+        let Breeze {
+            ref w,
+            ref k,
+            ref mut flash,
+            ref mut buf,
+            ref blas,
+            ..
+        } = *self;
+        upload_hidden(k, buf, projected)?;
+        let mut backbone = Vec::with_capacity((audio_steps + 1) * BB_VOCAB);
+        let mut depth = Vec::with_capacity(depth_frames * HEAD_N * (CODEBOOK as usize));
+        backbone.extend(backbone_rows(
+            k,
+            buf,
+            blas,
+            ScorePass {
+                layers: &w.backbone,
+                norm: &w.backbone_norm,
+                lm: &w.lm,
+                table: &k.table_backbone,
+                flash: &mut flash.backbone,
+                rows: text_rows,
+                origin: 0,
+                score_row: text_rows - 1,
+            },
+        )?);
+        let mut fed_rows = fed.chunks(BOOKS);
+        let mut cond_rows = cond.chunks(BB_H);
+        for (frame, codes) in frames.chunks(BOOKS).enumerate() {
+            let row = cond_rows.next().context("cond row")?;
+            depth.extend(depth_step(
+                k,
+                buf,
+                blas,
+                DepthStep {
+                    w,
+                    flash: &mut flash.depth,
+                    cond: row,
+                    codes,
+                    frame,
+                    plant: plant_head,
+                },
+            )?);
+            if frame < audio_steps {
+                let fed_row = fed_rows.next().context("fed row")?;
+                place_audio_row(k, &w.audio, buf, fed_row)?;
+                let origin = i32::try_from(text_rows + frame)?;
+                backbone.extend(backbone_rows(
+                    k,
+                    buf,
+                    blas,
+                    ScorePass {
+                        layers: &w.backbone,
+                        norm: &w.backbone_norm,
+                        lm: &w.lm,
+                        table: &k.table_backbone,
+                        flash: &mut flash.backbone,
+                        rows: 1,
+                        origin,
+                        score_row: 0,
+                    },
+                )?);
+            }
+        }
+        ensure!(
+            backbone.len() == (audio_steps + 1) * BB_VOCAB,
+            "backbone scores"
+        );
+        ensure!(
+            depth.len() == depth_frames * HEAD_N * (CODEBOOK as usize),
+            "depth scores"
+        );
+        // per_layer: 2 RMS, 4 QKV/O GEMMs, 1 RoPE, 1 attention, 2 residuals, 3 MLP GEMMs, 1 SwiGLU.
+        let per_layer = 14;
+        let prefill = BB_LAYERS * per_layer + 2;
+        let step = prefill + 1;
+        let frame_launches = 2 + DP_LAYERS * per_layer + 1 + HEAD_N;
+        eprintln!(
+            "LAUNCH backbone_prefill={prefill} backbone_step={step} depth_frame={frame_launches}"
+        );
+        eprintln!(
+            "COPY backbone_row_bytes={} backbone_copies={} depth_row_bytes={} depth_copies={} depth_kv_clears={}",
+            BB_VOCAB * 4,
+            audio_steps + 1,
+            CODEBOOK as usize * 4,
+            depth_frames * HEAD_N,
+            depth_frames
+        );
+        Ok((backbone, depth))
     }
 }
 
@@ -2160,6 +2623,18 @@ mod tests {
     const SIGNAL_MAX: f64 = 3.0;
     const SIGNAL_RMSE: f64 = 0.08392622321844101;
     const SIGNAL_RMSE_TEXT: &str = "0.08392622321844101";
+    const M1_BB_MAX: f64 = 0.25;
+    const M1_BB_RMSE: f64 = 0.039339788258075714;
+    const M1_BB_RMSE_TEXT: &str = "0.039339788258075714";
+    const M1_DP_MAX: f64 = 0.375;
+    const M1_DP_RMSE: f64 = 0.050264500081539154;
+    const M1_DP_RMSE_TEXT: &str = "0.050264500081539154";
+    const M1_TEXT: usize = 7;
+    const M1_STEPS: usize = 4;
+    const M1_AUDIO: usize = 3;
+    const M1_IDS: [i32; M1_STEPS] = [404, 1014, 1248, 1119];
+    const RESERVED_START: usize = 2048;
+    const RESERVED_END: usize = 2051;
 
     struct Sequence {
         ids: Vec<i32>,
@@ -2286,12 +2761,52 @@ mod tests {
         nominal: false,
         rmse_detect: false,
     };
+    const M1_BB_NOMINAL: GateBar = GateBar {
+        tensor: "backbone_scores",
+        plant: "nominal",
+        source: "floors-forced.backbone_scores",
+        tau_max: M1_BB_MAX,
+        tau_rmse: M1_BB_RMSE,
+        nominal: true,
+        rmse_detect: false,
+    };
+    const M1_BB_AUDIO: GateBar = GateBar {
+        tensor: "backbone_scores",
+        plant: "audio_embedding_row",
+        source: "floors-forced.backbone_scores",
+        tau_max: M1_BB_MAX,
+        tau_rmse: M1_BB_RMSE,
+        nominal: false,
+        rmse_detect: false,
+    };
+    const M1_DP_NOMINAL: GateBar = GateBar {
+        tensor: "depth_scores",
+        plant: "nominal",
+        source: "floors-forced.depth_scores",
+        tau_max: M1_DP_MAX,
+        tau_rmse: M1_DP_RMSE,
+        nominal: true,
+        rmse_detect: false,
+    };
+    const M1_DP_HEAD: GateBar = GateBar {
+        tensor: "depth_scores",
+        plant: "depth_head_codebook",
+        source: "floors-forced.depth_scores",
+        tau_max: M1_DP_MAX,
+        tau_rmse: M1_DP_RMSE,
+        nominal: false,
+        rmse_detect: false,
+    };
 
     struct RuntimeDir(PathBuf);
 
     impl RuntimeDir {
         fn create() -> Result<Self> {
-            let path = std::env::temp_dir().join(format!("n8-m0-{}", std::process::id()));
+            Self::with_prefix("n8-m0")
+        }
+
+        fn with_prefix(prefix: &str) -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
             if path.exists() {
                 std::fs::remove_dir_all(&path)?;
             }
@@ -2657,6 +3172,29 @@ mod tests {
         assert!(!engine.contains(&old));
     }
 
+    #[test]
+    fn decode_shape_accepts_64_frames_and_rejects_65() -> Result<()> {
+        let text_rows = 7;
+        let audio_steps = 4;
+        let projected = vec![0f32; text_rows * super::BB_H];
+        let fed = vec![0i32; audio_steps * super::BOOKS];
+        let frames_64 = vec![0i32; super::DP_FRAMES * super::BOOKS];
+        let cond_64 = vec![0f32; super::DP_FRAMES * super::BB_H];
+        let (steps, depth) =
+            super::decode_shape(&projected, &cond_64, text_rows, &fed, &frames_64)?;
+        ensure!(
+            steps == audio_steps && depth == super::DP_FRAMES,
+            "64 frames"
+        );
+        let frames_65 = vec![0i32; (super::DP_FRAMES + 1) * super::BOOKS];
+        let cond_65 = vec![0f32; (super::DP_FRAMES + 1) * super::BB_H];
+        ensure!(
+            super::decode_shape(&projected, &cond_65, text_rows, &fed, &frames_65).is_err(),
+            "65 frames"
+        );
+        Ok(())
+    }
+
     fn position_zero(table: &[bf16], dim: usize) -> Result<()> {
         ensure!(table.len() >= dim, "rope table");
         for d in 0..dim / 2 {
@@ -2870,6 +3408,10 @@ mod tests {
     }
 
     fn tensor_f32(path: &Path, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        tensor_values(path, name, shape, false)
+    }
+
+    fn tensor_values(path: &Path, name: &str, shape: &[usize], neginf: bool) -> Result<Vec<f32>> {
         let bytes = std::fs::read(path).with_context(|| format!("Runner FAIL read {name}"))?;
         let tensors = SafeTensors::deserialize(&bytes).context("Runner FAIL safetensors")?;
         let view = tensors
@@ -2883,10 +3425,12 @@ mod tests {
         for chunk in view.data().as_chunks::<4>().0 {
             values.push(f32::from_le_bytes(*chunk));
         }
-        ensure!(
-            values.iter().all(|value| value.is_finite()),
-            "Runner FAIL non-finite reference {name}"
-        );
+        let valid = if neginf {
+            values.iter().all(|value| score_ok(*value))
+        } else {
+            values.iter().all(|value| value.is_finite())
+        };
+        ensure!(valid, "Runner FAIL non-finite reference {name}");
         Ok(values)
     }
 
@@ -3214,5 +3758,651 @@ mod tests {
         let _ = std::io::Write::flush(&mut std::io::stdout());
         finish_gate(defect, protocol)?;
         Ok(())
+    }
+
+    fn score_ok(value: f32) -> bool {
+        !value.is_nan() && !(value.is_infinite() && value.is_sign_positive())
+    }
+
+    fn json_i32(value: &Value) -> Result<i32> {
+        let number = value.as_i64().context("Runner FAIL fixture int")?;
+        i32::try_from(number).context("Runner FAIL fixture int")
+    }
+
+    fn m1_prompt() -> [u32; M1_TEXT] {
+        [2, 262_146, 9_259, 699, 506, 20_015, 236_761]
+    }
+
+    fn selected<'a>(doc: &'a Value, name: &str) -> Result<&'a Value> {
+        let controls = doc["controls"].as_array().context("Runner FAIL controls")?;
+        controls
+            .iter()
+            .find(|item| {
+                item["name"].as_str() == Some(name) && item["measured"].as_bool() == Some(true)
+            })
+            .with_context(|| format!("Runner FAIL control {name}"))
+    }
+
+    fn forced_codes(doc: &Value) -> Result<Vec<i32>> {
+        let frames = doc["fixture"]["forced_frames"]
+            .as_array()
+            .context("Runner FAIL frames")?;
+        ensure!(frames.len() == M1_STEPS, "Runner FAIL frames");
+        let mut codes = Vec::with_capacity(M1_STEPS * super::BOOKS);
+        for (step, frame) in frames.iter().enumerate() {
+            let row = frame.as_array().context("Runner FAIL frame")?;
+            ensure!(row.len() == super::BOOKS, "Runner FAIL frame");
+            for item in row {
+                let code = json_i32(item)?;
+                ensure!(
+                    (0..super::CODEBOOK).contains(&code),
+                    "Runner FAIL code {code}"
+                );
+                codes.push(code);
+            }
+            ensure!(
+                codes[step * super::BOOKS] == M1_IDS[step],
+                "Runner FAIL code0"
+            );
+        }
+        ensure!(codes[2 * super::BOOKS + 1] == 621, "Runner FAIL plant code");
+        Ok(codes)
+    }
+
+    fn assert_m1_ids(doc: &Value) -> Result<()> {
+        let rows = doc["id_gate"]["backbone"]
+            .as_array()
+            .context("Runner FAIL backbone ids")?;
+        ensure!(rows.len() == M1_STEPS, "Runner FAIL backbone ids");
+        for (step, row) in rows.iter().enumerate() {
+            ensure!(
+                row["step"].as_u64() == Some(step as u64),
+                "Runner FAIL step"
+            );
+            ensure!(
+                row["assert_id"].as_bool() == Some(true),
+                "Runner FAIL assert"
+            );
+            for arm in ["4090_a", "4090_b", "a4000", "cpu"] {
+                ensure!(
+                    row["ids"][arm].as_i64() == Some(i64::from(M1_IDS[step])),
+                    "Runner FAIL backbone id"
+                );
+            }
+        }
+        ensure!(
+            doc["id_gate"]["depth_assert_count"].as_u64() == Some(24),
+            "Runner FAIL depth assert count"
+        );
+        ensure!(
+            doc["id_gate"]["depth_positions"].as_u64() == Some(60),
+            "Runner FAIL depth positions"
+        );
+        Ok(())
+    }
+
+    fn lock_m1_bits() -> Result<()> {
+        ensure!(
+            M1_BB_MAX.to_bits() == 0x3fd0_0000_0000_0000,
+            "m1 backbone max_abs bits"
+        );
+        ensure!(
+            M1_BB_RMSE.to_bits() == 0x3fa4_2458_4000_0000,
+            "m1 backbone rmse bits"
+        );
+        ensure!(
+            M1_DP_MAX.to_bits() == 0x3fd8_0000_0000_0000,
+            "m1 depth max_abs bits"
+        );
+        ensure!(
+            M1_DP_RMSE.to_bits() == 0x3fa9_bc44_c000_0000,
+            "m1 depth rmse bits"
+        );
+        Ok(())
+    }
+
+    fn assert_m1_fixture(doc: &Value) -> Result<()> {
+        ensure!(
+            doc["schema"].as_str() == Some("n8-m1-forced-v1"),
+            "Runner FAIL schema"
+        );
+        ensure!(
+            doc["candidate_run"].as_bool() == Some(false),
+            "Runner FAIL candidate_run"
+        );
+        ensure!(
+            doc["supersedes"].as_str()
+                == Some("floors.json n8-m1-greedy-v1 rejected 2026-11-09T04:25:37Z"),
+            "Runner FAIL supersedes"
+        );
+        let prompt = doc["fixture"]["prompt_ids"]
+            .as_array()
+            .context("Runner FAIL prompt")?;
+        ensure!(prompt.len() == M1_TEXT, "Runner FAIL prompt");
+        for (got, want) in prompt.iter().zip(m1_prompt()) {
+            ensure!(got.as_u64() == Some(u64::from(want)), "Runner FAIL prompt");
+        }
+        ensure!(
+            doc["fixture"]["text_len"].as_u64() == Some(M1_TEXT as u64),
+            "Runner FAIL text_len"
+        );
+        ensure!(
+            doc["fixture"]["max_new_tokens"].as_u64() == Some(M1_STEPS as u64),
+            "Runner FAIL steps"
+        );
+        ensure!(
+            doc["fixture"]["do_sample"].as_bool() == Some(false),
+            "Runner FAIL do_sample"
+        );
+        ensure!(
+            doc["fixture"]["depth_decoder_do_sample"].as_bool() == Some(false),
+            "Runner FAIL depth sample"
+        );
+        ensure!(
+            doc["fixture"]["output_audio"].as_bool() == Some(false),
+            "Runner FAIL output_audio"
+        );
+        ensure!(
+            doc["fixture"]["cfg_scale"]
+                .as_f64()
+                .is_some_and(|value| value.to_bits() == 1.0f64.to_bits()),
+            "Runner FAIL cfg_scale"
+        );
+        Ok(())
+    }
+
+    fn assert_m1_counts(doc: &Value) -> Result<()> {
+        ensure!(
+            doc["tensors"]["backbone_scores"]["neginf_count"].as_u64() == Some(12),
+            "Runner FAIL neginf"
+        );
+        ensure!(
+            doc["tensors"]["depth_scores"]["neginf_count"].as_u64() == Some(180),
+            "Runner FAIL neginf"
+        );
+        ensure!(
+            doc["tensors"]["backbone_scores"]["finite_count"].as_u64() == Some(8196),
+            "Runner FAIL finite"
+        );
+        ensure!(
+            doc["tensors"]["depth_scores"]["finite_count"].as_u64() == Some(122_880),
+            "Runner FAIL finite"
+        );
+        Ok(())
+    }
+
+    fn assert_m1_controls(doc: &Value) -> Result<()> {
+        let audio = selected(doc, "audio_embedding_row")?;
+        ensure!(
+            audio["tensor"].as_str() == Some("backbone_scores"),
+            "Runner FAIL audio control"
+        );
+        ensure!(
+            audio["selection"].as_str() == Some(AUDIO_SCAN),
+            "Runner FAIL audio scan"
+        );
+        ensure!(
+            audio["selected"]["frame"].as_u64() == Some(2),
+            "Runner FAIL plant frame"
+        );
+        ensure!(
+            audio["selected"]["book"].as_u64() == Some(1),
+            "Runner FAIL plant book"
+        );
+        ensure!(
+            audio["selected"]["code"].as_u64() == Some(621),
+            "Runner FAIL plant code"
+        );
+        ensure!(
+            audio["selected"]["planted_code"].as_u64() == Some(622),
+            "Runner FAIL planted code"
+        );
+        ensure!(
+            audio["selected"]["affected_step"].as_u64() == Some(3),
+            "Runner FAIL affected step"
+        );
+        ensure!(
+            audio["selected"]["exceeds_10x"].as_bool() == Some(true),
+            "Runner FAIL audio 10x"
+        );
+        let depth = selected(doc, "depth_head_codebook")?;
+        ensure!(
+            depth["tensor"].as_str() == Some("depth_scores"),
+            "Runner FAIL depth control"
+        );
+        ensure!(depth["selection"].is_null(), "Runner FAIL depth selection");
+        ensure!(
+            depth["selected"]["step"].as_u64() == Some(0),
+            "Runner FAIL depth step"
+        );
+        ensure!(
+            depth["selected"]["reads_head"].as_u64() == Some(1),
+            "Runner FAIL depth head"
+        );
+        ensure!(
+            depth["selected"]["exceeds_10x"].as_bool() == Some(true),
+            "Runner FAIL depth 10x"
+        );
+        Ok(())
+    }
+
+    fn assert_m1_floors(text: &str, doc: &Value) -> Result<Vec<i32>> {
+        lock_m1_bits()?;
+        assert_m1_fixture(doc)?;
+        check_shapes(
+            doc,
+            &[
+                (
+                    "backbone_scores",
+                    &[M1_STEPS as u64, super::BB_VOCAB as u64],
+                ),
+                (
+                    "depth_scores",
+                    &[
+                        M1_STEPS as u64,
+                        super::HEAD_N as u64,
+                        super::CODEBOOK as u64,
+                    ],
+                ),
+            ],
+        )?;
+        check_tau(
+            text,
+            doc,
+            "backbone_scores",
+            M1_BB_MAX,
+            M1_BB_RMSE,
+            M1_BB_RMSE_TEXT,
+        )?;
+        check_tau(
+            text,
+            doc,
+            "depth_scores",
+            M1_DP_MAX,
+            M1_DP_RMSE,
+            M1_DP_RMSE_TEXT,
+        )?;
+        assert_m1_counts(doc)?;
+        assert_m1_controls(doc)?;
+        assert_m1_ids(doc)?;
+        ensure!(
+            doc["id_gate"]["free_run"]["role"].as_str() == Some("measurement only; not a tau"),
+            "Runner FAIL free run"
+        );
+        ensure!(
+            doc["id_gate"]["free_run"]["near_tie"].as_str() == Some(NEAR_TIE),
+            "Runner FAIL near tie"
+        );
+        ensure!(
+            doc["id_gate"]["free_run"]["candidate_rule"].as_str() == Some(FREE_RULE),
+            "Runner FAIL free-run rule"
+        );
+        forced_codes(doc)
+    }
+
+    fn mask_reserved(scores: &mut [f32], vocab: usize) -> Result<()> {
+        ensure!(
+            vocab >= RESERVED_END && scores.len().is_multiple_of(vocab),
+            "Runner FAIL vocab"
+        );
+        let rows = scores.len() / vocab;
+        for row in 0..rows {
+            for class in RESERVED_START..RESERVED_END {
+                scores[row * vocab + class] = f32::NEG_INFINITY;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_mask(scores: &[f32], vocab: usize, neginf: usize) -> Result<()> {
+        ensure!(scores.len().is_multiple_of(vocab), "Runner FAIL vocab");
+        let mut seen = 0usize;
+        for (index, &value) in scores.iter().enumerate() {
+            ensure!(score_ok(value), "Runner FAIL non-finite reference");
+            let reserved = (RESERVED_START..RESERVED_END).contains(&(index % vocab));
+            if reserved {
+                ensure!(value.is_infinite(), "Runner FAIL reference mask");
+                seen += 1;
+            } else {
+                ensure!(value.is_finite(), "Runner FAIL reference mask");
+            }
+        }
+        ensure!(seen == neginf, "Runner FAIL neginf count");
+        Ok(())
+    }
+
+    fn finite_cells(actual: &[f32], expected: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        ensure!(actual.len() == expected.len(), "Runner FAIL element count");
+        let mut got = Vec::new();
+        let mut want = Vec::new();
+        for (&left, &right) in actual.iter().zip(expected) {
+            ensure!(score_ok(left), "Runner FAIL non-finite candidate");
+            ensure!(score_ok(right), "Runner FAIL non-finite reference");
+            ensure!(
+                left.is_infinite() == right.is_infinite(),
+                "Runner FAIL mask"
+            );
+            if left.is_finite() {
+                got.push(left);
+                want.push(right);
+            }
+        }
+        ensure!(!got.is_empty(), "Runner FAIL empty tensor");
+        Ok((got, want))
+    }
+
+    fn score_masked(
+        actual: &[f32],
+        expected: &[f32],
+        bar: &GateBar,
+        finite: usize,
+    ) -> Result<GateStatus> {
+        let (got, want) = finite_cells(actual, expected)?;
+        ensure!(got.len() == finite, "Runner FAIL finite count");
+        arm(&got, &want, bar)
+    }
+
+    fn score_row(scores: &[f32], index: usize, vocab: usize) -> Result<&[f32]> {
+        let start = index * vocab;
+        let end = start + vocab;
+        ensure!(end <= scores.len(), "Runner FAIL score row");
+        Ok(&scores[start..end])
+    }
+
+    fn top2(row: &[f32]) -> Result<(usize, f64)> {
+        let mut best_at = None;
+        let mut best = f32::NEG_INFINITY;
+        let mut second = f32::NEG_INFINITY;
+        for (index, &value) in row.iter().enumerate() {
+            ensure!(score_ok(value), "Runner FAIL non-finite score");
+            if !value.is_finite() {
+                continue;
+            }
+            if best_at.is_none() || value > best {
+                second = best;
+                best = value;
+                best_at = Some(index);
+            } else if value > second {
+                second = value;
+            }
+        }
+        let id = best_at.context("Runner FAIL finite scores")?;
+        ensure!(second.is_finite(), "Runner FAIL finite scores");
+        Ok((id, f64::from(best) - f64::from(second)))
+    }
+
+    fn agreed_id(rows: &[&[f32]], tau: f64) -> Result<Option<i32>> {
+        ensure!(rows.len() == 4, "Runner FAIL arms");
+        let mut ids = [0i32; 4];
+        let mut min_margin = f64::INFINITY;
+        for (slot, row) in rows.iter().enumerate() {
+            let (id, margin) = top2(row)?;
+            ids[slot] = i32::try_from(id)?;
+            min_margin = min_margin.min(margin);
+        }
+        if ids.iter().any(|id| *id != ids[0]) {
+            ensure!(min_margin <= tau, "Runner FAIL id disagree");
+            return Ok(None);
+        }
+        if min_margin > tau {
+            Ok(Some(ids[0]))
+        } else {
+            Ok(None)
+        }
+    }
+
+    struct ArmScores {
+        backbone: Vec<f32>,
+        depth: Vec<f32>,
+    }
+
+    fn load_arm(path: &Path, backbone: &[usize], depth: &[usize]) -> Result<ArmScores> {
+        Ok(ArmScores {
+            backbone: tensor_values(path, "backbone_scores", backbone, true)?,
+            depth: tensor_values(path, "depth_scores", depth, true)?,
+        })
+    }
+
+    fn backbone_ids(arms: &[ArmScores; 4]) -> Result<[i32; M1_STEPS]> {
+        let mut ids = [0i32; M1_STEPS];
+        for step in 0..M1_STEPS {
+            let rows = [
+                score_row(&arms[0].backbone, step, super::BB_VOCAB)?,
+                score_row(&arms[1].backbone, step, super::BB_VOCAB)?,
+                score_row(&arms[2].backbone, step, super::BB_VOCAB)?,
+                score_row(&arms[3].backbone, step, super::BB_VOCAB)?,
+            ];
+            let id = agreed_id(&rows, M1_BB_MAX)?.context("Runner FAIL backbone margin")?;
+            ensure!(id == M1_IDS[step], "Runner FAIL backbone id");
+            ids[step] = id;
+        }
+        Ok(ids)
+    }
+
+    fn depth_asserted(arms: &[ArmScores; 4]) -> Result<Vec<(usize, i32)>> {
+        let vocab = super::CODEBOOK as usize;
+        let mut out = Vec::new();
+        for index in 0..M1_STEPS * super::HEAD_N {
+            let rows = [
+                score_row(&arms[0].depth, index, vocab)?,
+                score_row(&arms[1].depth, index, vocab)?,
+                score_row(&arms[2].depth, index, vocab)?,
+                score_row(&arms[3].depth, index, vocab)?,
+            ];
+            if let Some(id) = agreed_id(&rows, M1_DP_MAX)? {
+                out.push((index, id));
+            }
+        }
+        ensure!(out.len() == 24, "Runner FAIL depth assert count");
+        Ok(out)
+    }
+
+    fn next_scores(logits: &[f32], seq: usize) -> Result<Vec<f32>> {
+        let vocab = super::BB_VOCAB;
+        ensure!(logits.len() == seq * vocab, "Runner FAIL logits");
+        let start = (M1_TEXT - 1) * vocab;
+        let end = seq * vocab;
+        ensure!(end - start == M1_STEPS * vocab, "Runner FAIL score rows");
+        let mut scores = logits[start..end].to_vec();
+        mask_reserved(&mut scores, vocab)?;
+        Ok(scores)
+    }
+
+    fn backbone_scores(
+        model: &mut super::Breeze,
+        projected: &[f32],
+        codes: &[i32],
+    ) -> Result<Vec<f32>> {
+        let seq = M1_TEXT + M1_AUDIO;
+        let positions = super::Positions {
+            text: (0..M1_TEXT).collect(),
+            audio: (M1_TEXT..seq).collect(),
+            eos: Vec::new(),
+            seq,
+        };
+        ensure!(
+            codes.len() == M1_AUDIO * super::BOOKS,
+            "Runner FAIL audio codes"
+        );
+        let logits = model.backbone(projected, &positions, codes, false)?;
+        next_scores(&logits, seq)
+    }
+
+    fn plant_audio(codes: &[i32]) -> Result<Vec<i32>> {
+        let index = 2 * super::BOOKS + 1;
+        ensure!(index < codes.len(), "Runner FAIL plant");
+        ensure!(codes[index] == 621, "Runner FAIL plant code");
+        let mut planted = codes.to_vec();
+        planted[index] = 622;
+        Ok(planted)
+    }
+
+    fn depth_scores(
+        model: &mut super::Breeze,
+        hidden: &[f32],
+        frames: &[i32],
+        plant: bool,
+    ) -> Result<Vec<f32>> {
+        let ids = depth_codes(frames, M1_STEPS)?;
+        let mut scores = model.depth(hidden, &ids, M1_STEPS, plant)?;
+        mask_reserved(&mut scores, super::CODEBOOK as usize)?;
+        Ok(scores)
+    }
+
+    fn greedy_scores(
+        model: &mut super::Breeze,
+        projected: &[f32],
+        hidden: &[f32],
+        frames: &[i32],
+        plant_audio_row: bool,
+        plant_head: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let fed_src = &frames[..M1_AUDIO * super::BOOKS];
+        let fed = if plant_audio_row {
+            plant_audio(fed_src)?
+        } else {
+            fed_src.to_vec()
+        };
+        let (mut backbone, mut depth) =
+            model.greedy_decode(projected, hidden, M1_TEXT, &fed, frames, plant_head)?;
+        mask_reserved(&mut backbone, super::BB_VOCAB)?;
+        mask_reserved(&mut depth, super::CODEBOOK as usize)?;
+        Ok((backbone, depth))
+    }
+
+    fn note_equiv(name: &str, decode: &[f32], prefill: &[f32]) -> Result<()> {
+        let (got, want) = finite_cells(decode, prefill)?;
+        let (max_abs, rmse) = difference(&got, &want)?;
+        println!(
+            "EQUIV tensor={name} cells={} max_abs={max_abs} rmse={rmse}",
+            got.len()
+        );
+        Ok(())
+    }
+
+    fn note_id(
+        tensor: &str,
+        place: &str,
+        row: &[f32],
+        expected: i32,
+        defect: &mut bool,
+    ) -> Result<()> {
+        let (id, margin) = top2(row)?;
+        let got = i32::try_from(id)?;
+        let status = if got == expected {
+            GateStatus::Pass
+        } else {
+            *defect = true;
+            GateStatus::Defect
+        };
+        println!(
+            "ID tensor={tensor} {place} id={got} margin={margin:?} expected={expected} status={}",
+            status.label()
+        );
+        Ok(())
+    }
+
+    const AUDIO_SCAN: &str = "frames 1, 2, 0; within a frame books 0..15. First plant strictly above 10x on both metrics whose affected-step argmax changes. If none changes the argmax, the first plant strictly above 10x on both metrics.";
+    const NEAR_TIE: &str = "backbone step 2, 4090 margin 0, A4000 id 508, other arms id 1248";
+    const FREE_RULE: &str =
+        "a free-run id comparison applies only where the reference margin exceeds 2x tau";
+
+    #[test]
+    #[ignore = "requires GPU lease, frozen floors, and external fixtures"]
+    fn n8_m1_candidate() -> Result<()> {
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let floors = env_path("N8_M1_FLOORS", false)?;
+        let cpu_path = env_path("N8_M1_CPU", false)?;
+        let repeat_a = env_path("N8_M1_4090_A", false)?;
+        let repeat_b = env_path("N8_M1_4090_B", false)?;
+        let a4000 = env_path("N8_M1_A4000", false)?;
+        let text = std::fs::read_to_string(&floors).context("Runner FAIL floors")?;
+        let doc: Value = serde_json::from_str(&text).context("Runner FAIL floors")?;
+        let frames = assert_m1_floors(&text, &doc)?;
+        let backbone_shape = [M1_STEPS, super::BB_VOCAB];
+        let depth_shape = [M1_STEPS, super::HEAD_N, super::CODEBOOK as usize];
+        let cpu_backbone = tensor_values(&cpu_path, "backbone_scores", &backbone_shape, true)?;
+        let cpu_depth = tensor_values(&cpu_path, "depth_scores", &depth_shape, true)?;
+        let hidden = tensor_f32(&cpu_path, "backbone_hidden", &[M1_STEPS, super::BB_H])?;
+        let depth_vocab = super::CODEBOOK as usize;
+        require_mask(&cpu_backbone, super::BB_VOCAB, 12)?;
+        require_mask(&cpu_depth, depth_vocab, 180)?;
+        let arms = [
+            load_arm(&repeat_a, &backbone_shape, &depth_shape)?,
+            load_arm(&repeat_b, &backbone_shape, &depth_shape)?,
+            load_arm(&a4000, &backbone_shape, &depth_shape)?,
+            ArmScores {
+                backbone: cpu_backbone.clone(),
+                depth: cpu_depth.clone(),
+            },
+        ];
+        for arm in &arms {
+            require_mask(&arm.backbone, super::BB_VOCAB, 12)?;
+            require_mask(&arm.depth, depth_vocab, 180)?;
+        }
+        let backbone_expected = backbone_ids(&arms)?;
+        let depth_expected = depth_asserted(&arms)?;
+        let prompt = m1_prompt();
+        let runtime = RuntimeDir::with_prefix("n8-m1")?;
+        let mut model = super::Breeze::load(&weights, &runtime.0)?;
+        println!("weight_bytes={}", model.weight_bytes);
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let fed = &frames[..M1_AUDIO * super::BOOKS];
+        let (nominal_backbone, nominal_depth) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, false, false)?;
+        let prefill_backbone = backbone_scores(&mut model, &projected, fed)?;
+        note_equiv("backbone_scores", &nominal_backbone, &prefill_backbone)?;
+        let prefill_depth = depth_scores(&mut model, &hidden, &frames, false)?;
+        note_equiv("depth_scores", &nominal_depth, &prefill_depth)?;
+        let (audio_backbone, _) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, true, false)?;
+        let (_, head_depth) = greedy_scores(&mut model, &projected, &hidden, &frames, false, true)?;
+        let mut defect = false;
+        let mut protocol = false;
+        record(
+            score_masked(&nominal_backbone, &cpu_backbone, &M1_BB_NOMINAL, 8196)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_masked(&audio_backbone, &cpu_backbone, &M1_BB_AUDIO, 8196)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_masked(&nominal_depth, &cpu_depth, &M1_DP_NOMINAL, 122_880)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_masked(&head_depth, &cpu_depth, &M1_DP_HEAD, 122_880)?,
+            &mut defect,
+            &mut protocol,
+        );
+        for (step, expected) in backbone_expected.iter().enumerate() {
+            let row = score_row(&nominal_backbone, step, super::BB_VOCAB)?;
+            note_id(
+                "backbone_scores",
+                &format!("step={step}"),
+                row,
+                *expected,
+                &mut defect,
+            )?;
+        }
+        for (index, id) in depth_expected {
+            let frame = index / super::HEAD_N;
+            let step = index % super::HEAD_N;
+            let row = score_row(&nominal_depth, index, depth_vocab)?;
+            note_id(
+                "depth_scores",
+                &format!("frame={frame} step={step}"),
+                row,
+                id,
+                &mut defect,
+            )?;
+        }
+        println!("FREE_RUN role=measurement near_tie={NEAR_TIE}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        finish_gate(defect, protocol)
     }
 }
