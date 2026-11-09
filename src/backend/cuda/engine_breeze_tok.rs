@@ -1566,6 +1566,10 @@ mod gate {
     const SYN_RMSE: f64 = f64::from_bits(0x3f3cc9433704f29f);
     const REAL_MAX: f64 = f64::from_bits(0x3f447a6000000000);
     const REAL_RMSE: f64 = f64::from_bits(0x3f045a02280fdf2d);
+    const EN_MAX: f64 = f64::from_bits(0x3f696c0000000000);
+    const EN_RMSE: f64 = f64::from_bits(0x3f23faa28f7ccccc);
+    const ZH_MAX: f64 = f64::from_bits(0x3f570e6000000000);
+    const ZH_RMSE: f64 = f64::from_bits(0x3f162a4e3d528632);
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum GateStatus {
@@ -1962,6 +1966,37 @@ mod gate {
             REAL_MAX.to_bits(),
             REAL_RMSE.to_bits(),
         )?;
+        let sampled_path = env_file("N8_M2_SAMPLED_FLOORS")?;
+        let sampled_wav = env_file("N8_M2_SAMPLED_WAV")?;
+        let sampled_en = env_file("N8_M2_SAMPLED_EN")?;
+        let sampled_zh = env_file("N8_M2_SAMPLED_ZH")?;
+        let sampled: Value =
+            serde_json::from_slice(&std::fs::read(&sampled_path).context("sampled floors")?)
+                .context("sampled floors")?;
+        ensure!(
+            sampled["schema"].as_str() == Some("n8-m2-wav-sampled-v1"),
+            "sampled schema"
+        );
+        ensure!(
+            sampled["candidate_run"].as_bool() == Some(false),
+            "sampled candidate_run"
+        );
+        let (en_max, en_rmse) = lock_cell(
+            &sampled,
+            "voice-design-en",
+            71_040,
+            37,
+            EN_MAX.to_bits(),
+            EN_RMSE.to_bits(),
+        )?;
+        let (zh_max, zh_rmse) = lock_cell(
+            &sampled,
+            "voice-design-zh",
+            96_000,
+            50,
+            ZH_MAX.to_bits(),
+            ZH_RMSE.to_bits(),
+        )?;
         let report: Value =
             serde_json::from_slice(&std::fs::read(&clone_report).context("clone report")?)
                 .context("clone report")?;
@@ -2004,6 +2039,10 @@ mod gate {
         let short_ref = host_f32(&wavs, "short_nominal", 7680)?;
         let syn_ref = host_f32(&wavs, "syn_nominal", 153600)?;
         let real_ref = host_f32(&wavs, "real_nominal", 153600)?;
+        let en_codes = host_codes(&sampled_en, 37)?;
+        let zh_codes = host_codes(&sampled_zh, 50)?;
+        let en_ref = host_f32(&sampled_wav, "voice-design-en", 71_040)?;
+        let zh_ref = host_f32(&sampled_wav, "voice-design-zh", 96_000)?;
         let device = super::super::Device::new(0)?;
         let mut tok = super::Tokenizer::load(&weights, &device)?;
         let short_n = decoded(&mut tok, &short_codes, 7680)?;
@@ -2018,6 +2057,8 @@ mod gate {
         let clone_samples = clone_frames * FRAME_SAMPLES;
         let left = decoded(&mut tok, &clone_left, clone_samples)?;
         let right = decoded(&mut tok, &clone_right, clone_samples)?;
+        let en_n = decoded(&mut tok, &en_codes, 71_040)?;
+        let zh_n = decoded(&mut tok, &zh_codes, 96_000)?;
         let launches = real_n.launches;
         for count in [
             short_n.launches,
@@ -2031,6 +2072,8 @@ mod gate {
             real_k.launches,
             left.launches,
             right.launches,
+            en_n.launches,
+            zh_n.launches,
         ] {
             ensure!(count == launches, "Runner FAIL launch count");
         }
@@ -2083,6 +2126,16 @@ mod gate {
         );
         record(
             score_causal("real", &real_k.samples, &real_ref, real_max, real_rmse)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_nominal("voice-design-en", &en_n.samples, &en_ref, en_max, en_rmse)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_nominal("voice-design-zh", &zh_n.samples, &zh_ref, zh_max, zh_rmse)?,
             &mut defect,
             &mut protocol,
         );
