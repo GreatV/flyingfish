@@ -4581,169 +4581,85 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     Ok(())
 }
 
-fn linked_image_cascade(case: &str, index: usize) -> Result<()> {
-    let model = env_path("FF_HI3D_MODEL")?;
-    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
-    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?.join(case);
-    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    std::fs::create_dir_all(&output)?;
-    let (mut contexts, defects) = linked_image_contexts()?;
-    ensure!(defects == 0, "linked cascade media candidate defects");
-    let context = contexts.swap_remove(index);
-    drop(contexts);
-    let d = Device::new(0)?;
-    generation_capture(
-        &output.join("native-context.safetensors"),
-        &[],
-        &d.stream.clone_dtoh(&context)?,
-        vec![1, 2917, 2048],
-    )?;
-    let budget = || -> Result<usize> {
-        let (free, total) = d.ctx.mem_get_info()?;
-        let envelope = total - total / 8;
-        envelope
-            .checked_sub(total - free)
-            .context("cascade live data exceeds detected device envelope")
+fn linked_image_cascade(case: &str, requested: u32) -> Result<()> {
+    let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
+    let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+    let source = freeze["initial"][case]["input_mesh"]
+        .as_str()
+        .context("initial mesh anchor missing")?;
+    let mesh = crate::sparse::SparseMesh {
+        vertices: f32_tensor(Path::new(source), "vertices")?,
+        faces: tensor(Path::new(source), "faces")?
+            .values
+            .into_iter()
+            .map(|v| v as i32)
+            .collect(),
     };
-    let mut mesh = linked_mesh_case(
-        &model,
-        &prefix,
-        &runtime,
-        &output,
-        &context,
-        case,
-        "native-512",
+    let image_root = env_path("FF_HI3D_IMAGE_FIXTURES")?;
+    let bytes = std::fs::read(image_root.join("cpu-r2/inputs.safetensors"))?;
+    let images = safetensors::SafeTensors::deserialize(&bytes)?;
+    let rgba = images.tensor(&format!("{case}.rgba"))?;
+    let orientation = images.tensor(&format!("{case}.orientation"))?;
+    ensure!(
+        rgba.dtype() == Dtype::U8 && rgba.shape().len() == 3 && rgba.shape()[2] == 4,
+        "RGBA fixture layout mismatch"
+    );
+    let generation = Hi3DGeneration {
+        model: &env_path("FF_HI3D_MODEL")?,
+        dino: &env_path("FF_DINOV2_MODEL")?,
+        clip: &env_path("FF_CLIP_MODEL")?,
+        runtime: &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        rgba: rgba.data(),
+        dimensions: [rgba.shape()[0], rgba.shape()[1]],
+        orientation: u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?,
+        mesh: &mesh,
+        requested_resolution: requested,
+        seed: 0,
+    };
+    let device = Device::new(0)?;
+    let (raw, achieved) = generation.run(&device)?;
+    ensure!(
+        achieved == requested,
+        "generation returned the wrong resolution"
+    );
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?.join(format!("{case}-{requested}"));
+    std::fs::create_dir_all(&output)?;
+    let vertices = raw
+        .vertices
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    let faces = raw
+        .faces
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    safetensors::tensor::serialize_to_file(
+        BTreeMap::from([
+            (
+                "vertices",
+                safetensors::tensor::TensorView::new(
+                    Dtype::F32,
+                    vec![raw.vertices.len() / 3, 3],
+                    &vertices,
+                )?,
+            ),
+            (
+                "faces",
+                safetensors::tensor::TensorView::new(
+                    Dtype::I32,
+                    vec![raw.faces.len() / 3, 3],
+                    &faces,
+                )?,
+            ),
+        ]),
+        None,
+        &output.join("native.safetensors"),
     )?;
-    for (stream, resolution, limit) in [(1u64, 128u32, 90_000usize), (2, 192, 110_000)] {
-        let host_available = super::super::calibrate::host_memory(Path::new("/"))?;
-        let fill_bytes = mesh
-            .faces
-            .len()
-            .checked_mul(24)
-            .and_then(|v| v.checked_add(mesh.vertices.len().checked_mul(24)?))
-            .context("boundary host reservation overflow")?;
-        ensure!(
-            fill_bytes as u64 <= host_available - host_available / 16,
-            "boundary host reservation exceeds available memory"
-        );
-        let added = mesh.fill_holes(
-            mesh.faces
-                .len()
-                .checked_mul(4)
-                .context("boundary face capacity overflow")?
-                / 3,
-        )?;
-        let (free, _) = d.ctx.mem_get_info()?;
-        let (accepted, voxels) =
-            adaptive_mesh_support(&d, &mesh, resolution, limit, usize::MAX, [free, budget()?])?;
-        let grid = voxels
-            .sites
-            .coordinates()
-            .iter()
-            .map(|p| [p[1], p[2], p[3]])
-            .collect::<Vec<_>>();
-        let frame = voxels.sites.unit_ball_frame()?;
-        let parent = voxels.sites.downsample(2)?.0;
-        let maximum = parent
-            .coordinates()
-            .iter()
-            .flat_map(|p| &p[1..])
-            .copied()
-            .max()
-            .context("empty cascade parents")?;
-        let parents = parent.coordinates().len();
-        drop(parent);
-        drop(voxels);
-        drop(mesh);
-        let n = grid.len();
-        let noise = d.stream.alloc_zeros::<f32>(n * 32)?;
-        unsafe {
-            d.stream
-                .launch_builder(
-                    &cubin::module(&d.ctx, "sample")?.load_function("philox_normal_f32")?,
-                )
-                .arg(&0u64)
-                .arg(&stream)
-                .arg(&noise)
-                .arg(&i64::try_from(n * 32)?)
-                .launch(flat((n * 32).div_ceil(4)))?;
-        }
-        let noise_host = d.stream.clone_dtoh(&noise)?;
-        drop(noise);
-        let rung = output.join(format!("native-{}", resolution * 8));
-        std::fs::create_dir(&rung)?;
-        generation_capture(
-            &rung.join("noise.safetensors"),
-            &grid,
-            &noise_host,
-            vec![n, 32],
-        )?;
-        let mut flow = Flow::<f16>::open_hi3d(
-            &model,
-            "transformer_1024",
-            &runtime,
-            &grid,
-            resolution as usize,
-            budget()?,
-        )?;
-        ensure!(
-            flow.coordinates == grid,
-            "cascade support did not reach flow"
-        );
-        let positive = flow.conditioning_device(&context, &grid)?;
-        let zero = flow.device.stream.alloc_zeros::<f32>(2917 * 2048)?;
-        let negative = flow.conditioning_device(&zero, &grid)?;
-        let latent = flow.sample_heun(&noise_host, &positive, &negative)?;
-        generation_capture(
-            &rung.join("latents.safetensors"),
-            &grid,
-            &latent,
-            vec![n, 32],
-        )?;
-        drop(negative);
-        drop(positive);
-        drop(zero);
-        drop(flow);
-        let decoder = PixalDecoder::open(
-            &d,
-            &model,
-            DecoderKind::PointTransformer,
-            &runtime,
-            budget()?,
-        )?;
-        let coordinates = grid
-            .iter()
-            .map(|p| [0, p[0], p[1], p[2]])
-            .collect::<Vec<_>>();
-        mesh = decoder.points_mesh(coordinates.clone(), &latent, frame, resolution)?;
-        drop(decoder);
-        ensure!(
-            !mesh.vertices.is_empty()
-                && !mesh.faces.is_empty()
-                && mesh.vertices.iter().all(|v| v.is_finite())
-                && mesh
-                    .faces
-                    .iter()
-                    .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
-            "invalid cascade raw mesh"
-        );
-        linked_mesh_save(
-            &rung.join("native.safetensors"),
-            &mesh,
-            &coordinates,
-            &latent,
-            frame,
-        )?;
-        println!(
-            "PASS N5_M4_LINKED_BOUNDARY case={case} output_resolution={} nominal_grid={resolution} accepted_grid={accepted} filled_faces_added={added} input_rows={n} parent_rows={parents} pooled_max={maximum} updates=25 component=transformer_1024 native_input=true vertices={} faces={} published_weight_bytes=3675626624 raw_decoder_weight_bytes=376614208 noise=philox_seed0_stream{stream} noise_boundary_D2H_H2D_bytes={} topology_equivalence=false presentation_repair=false timing=false",
-            resolution * 8,
-            mesh.vertices.len() / 3,
-            mesh.faces.len() / 3,
-            n * 32 * 8
-        );
-    }
     println!(
-        "PASS N5_M4_LINKED_CASCADE case={case} rungs=64,128,192 image_encoder_calls=3,3 context_reused_per_rung=true prefix_noise=fixed_record high_noise=philox raw_meshes=3 timing=false"
+        "PASS N5_M5_GENERATION case={case} requested={requested} achieved={achieved} initial_support=mesh_derived vertices={} faces={} raw=true topology_equivalence=false timing=false",
+        raw.vertices.len() / 3,
+        raw.faces.len() / 3
     );
     cascade_resources(case)
 }
@@ -4766,12 +4682,350 @@ fn cascade_resources(case: &str) -> Result<()> {
 #[test]
 #[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
 fn hi3d_linked_cascade_cottage_gpu() -> Result<()> {
-    linked_image_cascade("cottage", 0)
+    linked_image_cascade("cottage", 1024)
 }
 #[test]
 #[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
 fn hi3d_linked_cascade_robot_gpu() -> Result<()> {
-    linked_image_cascade("robot_crab", 1)
+    linked_image_cascade("robot_crab", 1536)
+}
+
+#[test]
+fn hi3d_generation_rejects_zero_extent() -> Result<()> {
+    let mesh = crate::sparse::SparseMesh {
+        vertices: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        faces: vec![0, 0, 0],
+    };
+    let path = Path::new("");
+    let request = Hi3DGeneration {
+        model: path,
+        dino: path,
+        clip: path,
+        runtime: path,
+        rgba: &[0, 0, 0, 255],
+        dimensions: [1, 1],
+        orientation: 1,
+        mesh: &mesh,
+        requested_resolution: 512,
+        seed: 0,
+    };
+    request.validate()?;
+    let point = crate::sparse::SparseMesh {
+        vertices: vec![0.25; 9],
+        faces: vec![0, 1, 2],
+    };
+    ensure!(
+        Hi3DGeneration {
+            mesh: &point,
+            ..request
+        }
+        .validate()
+        .is_err(),
+        "finite zero-extent mesh accepted"
+    );
+    println!(
+        "PASS N5_M5_INPUT_CONTRACT positive_extent=true degenerate_faces_retained=true zero_extent_rejected=true CUDA_initialized=false"
+    );
+    Ok(())
+}
+
+fn generation_score(
+    label: &str,
+    actual: &[f64],
+    expected: &[f64],
+    tau: &Value,
+    control: bool,
+) -> Result<bool> {
+    let observed = metrics(actual, expected)?;
+    let mut valid = true;
+    for metric in ["max_abs", "rmse"] {
+        let bound = tau[metric]
+            .as_f64()
+            .context("frozen refinement bound missing")?;
+        ensure!(
+            bound.is_finite() && bound > 0.0,
+            "invalid frozen refinement bound"
+        );
+        let pass = if control {
+            observed[metric] > 10.0 * bound
+        } else {
+            observed[metric] <= bound
+        };
+        valid &= pass;
+        println!(
+            "{} N5_M5_SCORE label={label} metric={metric} observed={} tau={bound} control={control} multiple={}",
+            if pass { "PASS" } else { "DEFECT" },
+            observed[metric],
+            observed[metric] / bound
+        );
+    }
+    Ok(valid)
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen initial geometry"]
+fn hi3d_generation_initial_support_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
+    let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+    ensure!(
+        freeze["status"] == "FROZEN_REFERENCE_VALID" && freeze["native_candidates"] == 0,
+        "invalid initial geometry freeze"
+    );
+    let device = Device::new(0)?;
+    let mut defects = 0;
+    for case in ["cottage", "robot_crab", "open_loop"] {
+        let frozen = &freeze["initial"][case];
+        let mesh_path = Path::new(
+            frozen["input_mesh"]
+                .as_str()
+                .context("initial input missing")?,
+        );
+        let mesh = crate::sparse::SparseMesh {
+            vertices: f32_tensor(mesh_path, "vertices")?,
+            faces: tensor(mesh_path, "faces")?
+                .values
+                .into_iter()
+                .map(|v| v as i32)
+                .collect(),
+        };
+        let (free, total) = device.ctx.mem_get_info()?;
+        let budget = [free, total - total / 8];
+        let (grid, voxels) = adaptive_mesh_support(&device, &mesh, 64, 80000, usize::MAX, budget)?;
+        let coordinates = tensor(
+            Path::new(
+                frozen["exact"]["coordinates"]["path"]
+                    .as_str()
+                    .context("coordinate anchor missing")?,
+            ),
+            "coordinates",
+        )?;
+        let face_counts = tensor(
+            Path::new(
+                frozen["exact"]["face_counts"]["path"]
+                    .as_str()
+                    .context("count anchor missing")?,
+            ),
+            "face_counts",
+        )?;
+        let offsets = tensor(
+            Path::new(
+                frozen["exact"]["offsets"]["path"]
+                    .as_str()
+                    .context("offset anchor missing")?,
+            ),
+            "offsets",
+        )?;
+        let faces = tensor(
+            Path::new(
+                frozen["exact"]["faces"]["path"]
+                    .as_str()
+                    .context("face anchor missing")?,
+            ),
+            "faces",
+        )?;
+        let expected_grid = frozen["reference_census"]["accepted_grid"]
+            .as_u64()
+            .context("accepted initial grid missing")?;
+        let exact = grid as u64 == expected_grid
+            && coordinates.shape == [voxels.sites.coordinates().len(), 3]
+            && coordinates
+                .values
+                .iter()
+                .zip(voxels.sites.coordinates().iter().flat_map(|p| &p[1..]))
+                .all(|(&a, &b)| a == b as f64)
+            && face_counts.values.len() == voxels.face_counts.len()
+            && face_counts
+                .values
+                .iter()
+                .zip(&voxels.face_counts)
+                .all(|(&a, &b)| a == b as f64)
+            && offsets.values.len() == voxels.voxel_offsets.len()
+            && offsets
+                .values
+                .iter()
+                .zip(&voxels.voxel_offsets)
+                .all(|(&a, &b)| a == b as f64)
+            && faces.values.len() == voxels.voxel_faces.len()
+            && faces
+                .values
+                .iter()
+                .zip(&voxels.voxel_faces)
+                .all(|(&a, &b)| a == b as f64);
+        defects += usize::from(!exact);
+        println!(
+            "{} N5_M5_INITIAL_EXACT case={case} grid={grid} coordinates={} face_counts={} offsets={} face_ids={} all_records_compared=true",
+            if exact { "PASS" } else { "DEFECT" },
+            voxels.sites.coordinates().len(),
+            voxels.face_counts.len(),
+            voxels.voxel_offsets.len(),
+            voxels.voxel_faces.len()
+        );
+        let frame = tensor(
+            Path::new(
+                frozen["frame"]["anchor"]["path"]
+                    .as_str()
+                    .context("frame anchor missing")?,
+            ),
+            "frame",
+        )?;
+        let matrix = voxels.sites.unit_ball_frame()?;
+        defects += usize::from(!generation_score(
+            &format!("{case}.frame"),
+            &matrix
+                .as_flattened()
+                .iter()
+                .map(|&v| v as f64)
+                .collect::<Vec<_>>(),
+            &frame.values,
+            &frozen["frame"]["tau"],
+            false,
+        )?);
+        let baseline: BTreeSet<_> = voxels.sites.coordinates().iter().copied().collect();
+        let emissions = voxels.voxel_faces.len();
+        drop(voxels);
+        drop(coordinates);
+        drop(face_counts);
+        drop(offsets);
+        drop(faces);
+        let wrong = triangle_voxels(&device, &mesh, grid, 0, usize::MAX, budget)?;
+        let changed = baseline
+            .symmetric_difference(&wrong.sites.coordinates().iter().copied().collect())
+            .count();
+        defects += usize::from(changed == 0);
+        let wrong_frame = wrong.sites.unit_ball_frame()?;
+        defects += usize::from(!generation_score(
+            &format!("{case}.frame.pad0"),
+            &wrong_frame
+                .as_flattened()
+                .iter()
+                .map(|&v| v as f64)
+                .collect::<Vec<_>>(),
+            &frame.values,
+            &frozen["frame"]["tau"],
+            true,
+        )?);
+        println!(
+            "{} N5_M5_INITIAL_CONTROL case={case} membership_changes={changed}",
+            if changed > 0 { "PASS" } else { "DEFECT" }
+        );
+        drop(wrong);
+        if case == "open_loop" {
+            ensure!(
+                triangle_voxels(&device, &mesh, grid, 3, emissions - 1, budget)
+                    .err()
+                    .is_some_and(|e| e.to_string().starts_with("triangle emission needs")),
+                "short emission capacity was accepted"
+            );
+            println!(
+                "PASS N5_M5_INITIAL_CAPACITY required={emissions} capacity={} rejected_before_emit=true",
+                emissions - 1
+            );
+        }
+    }
+    ensure!(
+        defects == 0,
+        "initial geometry candidate defects: {defects}"
+    );
+    println!(
+        "PASS N5_M5_INITIAL_GATE cases=3 complete_discrete_banks=12 frame_cells=3 controls=3 capacity_controls=1 defects=0 timing=false"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and frozen first-forward inputs"]
+fn hi3d_generation_first_forward_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
+    let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+    ensure!(
+        freeze["status"] == "FROZEN_REFERENCE_VALID" && freeze["native_candidates"] == 0,
+        "invalid first-forward freeze"
+    );
+    let model = env_path("FF_HI3D_MODEL")?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let mut defects = 0;
+    for case in ["cottage", "robot_crab"] {
+        let cell = &freeze["flow"][case];
+        let source = Path::new(
+            cell["common_input"]["path"]
+                .as_str()
+                .context("first-forward source missing")?,
+        );
+        let grid = decoder_coordinates(source, "coordinates")?
+            .iter()
+            .map(|p| [p[1], p[2], p[3]])
+            .collect::<Vec<_>>();
+        let noise = f32_tensor(source, "state")?;
+        let context = f32_tensor(source, "context")?;
+        let time = f32_tensor(source, "timestep")?;
+        ensure!(
+            time.len() == 1 && noise.len() == grid.len() * 32,
+            "first-forward input extent differs"
+        );
+        let anchor = tensor(
+            Path::new(
+                cell["anchor"]["path"]
+                    .as_str()
+                    .context("velocity anchor missing")?,
+            ),
+            "velocity",
+        )?;
+        for control in [false, true] {
+            let grid = grid
+                .iter()
+                .map(|p| if control { [p[2], p[1], p[0]] } else { *p })
+                .collect::<Vec<_>>();
+            let device = Device::new(0)?;
+            let (free, total) = device.ctx.mem_get_info()?;
+            let mut flow = Flow::<f16>::open_hi3d(
+                &model,
+                "transformer_512",
+                &runtime,
+                &grid,
+                64,
+                free.min(total - total / 8),
+            )?;
+            let conditioning = flow.conditioning(&context, &[], &grid)?;
+            flow.set_times(&time)?;
+            let input = flow.device.stream.clone_htod(&noise)?;
+            let mut output = flow.device.stream.alloc_zeros::<f32>(noise.len())?;
+            flow.forward(&input, 0, &conditioning, &mut output)?;
+            let actual = flow
+                .device
+                .stream
+                .clone_dtoh(&output)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>();
+            defects += usize::from(!generation_score(
+                &format!("{case}.velocity"),
+                &actual,
+                &anchor.values,
+                &cell["tau"],
+                control,
+            )?);
+            println!(
+                "N5_M5_FIRST_FORWARD_EXECUTION case={case} control={control} rows={} pooled_rows={} timestep={} common_state_and_context=true attention=D96 timing=false",
+                grid.len(),
+                flow.rows,
+                time[0]
+            );
+        }
+    }
+    ensure!(defects == 0, "first-forward candidate defects: {defects}");
+    println!("PASS N5_M5_FIRST_FORWARD_GATE cells=2 controls=2 defects=0 timing=false");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
+fn hi3d_generation_cottage_512_gpu() -> Result<()> {
+    linked_image_cascade("cottage", 512)
+}
+#[test]
+#[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
+fn hi3d_generation_robot_512_gpu() -> Result<()> {
+    linked_image_cascade("robot_crab", 512)
 }
 
 struct Gate {
