@@ -2058,7 +2058,11 @@ mod gate {
         let left = decoded(&mut tok, &clone_left, clone_samples)?;
         let right = decoded(&mut tok, &clone_right, clone_samples)?;
         let en_n = decoded(&mut tok, &en_codes, 71_040)?;
+        let en_c = decoded(&mut tok, &plant(&en_codes, 0)?, 71_040)?;
+        let en_k = decoded(&mut tok, &plant(&en_codes, 36)?, 71_040)?;
         let zh_n = decoded(&mut tok, &zh_codes, 96_000)?;
+        let zh_c = decoded(&mut tok, &plant(&zh_codes, 0)?, 96_000)?;
+        let zh_k = decoded(&mut tok, &plant(&zh_codes, 49)?, 96_000)?;
         let launches = real_n.launches;
         for count in [
             short_n.launches,
@@ -2073,7 +2077,11 @@ mod gate {
             left.launches,
             right.launches,
             en_n.launches,
+            en_c.launches,
+            en_k.launches,
             zh_n.launches,
+            zh_c.launches,
+            zh_k.launches,
         ] {
             ensure!(count == launches, "Runner FAIL launch count");
         }
@@ -2135,7 +2143,27 @@ mod gate {
             &mut protocol,
         );
         record(
+            score_control("voice-design-en", &en_c.samples, &en_ref, en_max, en_rmse)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_causal("voice-design-en", &en_k.samples, &en_ref, en_max, en_rmse)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
             score_nominal("voice-design-zh", &zh_n.samples, &zh_ref, zh_max, zh_rmse)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_control("voice-design-zh", &zh_c.samples, &zh_ref, zh_max, zh_rmse)?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            score_causal("voice-design-zh", &zh_k.samples, &zh_ref, zh_max, zh_rmse)?,
             &mut defect,
             &mut protocol,
         );
