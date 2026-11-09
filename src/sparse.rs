@@ -3104,7 +3104,14 @@ mod tests {
                 .iter()
                 .map(|b| f64::from_le_bytes(*b))
                 .collect()),
-            _ => anyhow::bail!("mesh vertices require floating point storage"),
+            safetensors::Dtype::I64 => Ok(t
+                .data()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| i64::from_le_bytes(*b) as f64)
+                .collect()),
+            _ => anyhow::bail!("mesh numeric storage requires F32, F64 or I64"),
         }
     }
 
