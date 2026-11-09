@@ -518,6 +518,7 @@ token_init_method: constant
 sample_rate: 16000
 preprocessor:
   sample_rate: 16000
+  normalize: NA
   window_size: 0.025
   window_stride: 0.01
   features: 128
