@@ -294,7 +294,7 @@ unsafe fn copy_kv<const D: usize, const L: usize, const MASK: bool>(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 0, 256, false>(
+        attention::<256, 32, 0, 256, false, true>(
             p,
             p.start + p.rows,
             0,
@@ -312,7 +312,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 0, 128, false>(
+        attention::<128, 16, 0, 128, false, true>(
             p,
             p.start + p.rows,
             0,
@@ -329,7 +329,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(p: Attention, keys: u32) {
     unsafe {
-        attention::<256, 32, 1, 256, false>(
+        attention::<256, 32, 1, 256, false, true>(
             resolve_position(p),
             keys,
             0,
@@ -352,7 +352,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
     scale: f32,
 ) {
     unsafe {
-        attention::<256, 32, 6, 256, false>(
+        attention::<256, 32, 6, 256, false, true>(
             resolve_position(p),
             keys,
             left,
@@ -374,7 +374,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional_scored(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 1, 256, false>(p, keys, 0, 0, scale, core::ptr::null(), 0);
+        attention::<256, 32, 1, 256, false, true>(p, keys, 0, 0, scale, core::ptr::null(), 0);
     }
 }
 
@@ -384,7 +384,15 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional_scored(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256_scored(p: Attention, scale: f32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 0, 256, false>(p, p.start + p.rows, 0, 0, scale, core::ptr::null(), 0);
+        attention::<256, 32, 0, 256, false, true>(
+            p,
+            p.start + p.rows,
+            0,
+            0,
+            scale,
+            core::ptr::null(),
+            0,
+        );
     }
 }
 
@@ -394,8 +402,28 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_scored(p: Attention, sc
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 1, 128, false>(
+        attention::<128, 16, 1, 128, false, true>(
             p,
+            keys,
+            0,
+            0,
+            core::f32::consts::FRAC_1_SQRT_2 / 8.0,
+            core::ptr::null(),
+            0,
+        );
+    }
+}
+
+/// # Safety
+/// All keys below `keys` are populated; launch uses 128 threads and 49152 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional_single_pv(
+    p: Attention,
+    keys: u32,
+) {
+    unsafe {
+        attention::<128, 16, 1, 128, false, false>(
+            resolve_position(p),
             keys,
             0,
             0,
@@ -416,7 +444,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<64, 8, 1, 64, false>(p, keys, 0, 0, scale, core::ptr::null(), 0);
+        attention::<64, 8, 1, 64, false, true>(p, keys, 0, 0, scale, core::ptr::null(), 0);
     }
 }
 
@@ -430,7 +458,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_f16(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<64, 8, 1, 64, true>(p, keys, 0, 0, scale, core::ptr::null(), 0);
+        attention::<64, 8, 1, 64, true, true>(p, keys, 0, 0, scale, core::ptr::null(), 0);
     }
 }
 
@@ -443,7 +471,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16(
     scale: f32,
 ) {
     unsafe {
-        attention::<64, 8, 1, 16, true>(
+        attention::<64, 8, 1, 16, true, true>(
             resolve_position(p),
             keys,
             0,
@@ -479,7 +507,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16_window
         p.lse = p.lse.add(first as usize * p.q_heads as usize);
         p.rows = end - first;
         p.start = 0;
-        attention::<64, 8, 1, 16, true>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
+        attention::<64, 8, 1, 16, true, true>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
     }
 }
 
@@ -492,7 +520,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d96_bidirectional_f16(
     scale: f32,
 ) {
     unsafe {
-        attention::<128, 16, 1, 96, true>(
+        attention::<128, 16, 1, 96, true, true>(
             resolve_position(p),
             keys,
             0,
@@ -513,7 +541,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d72_bidirectional(
     scale: f32,
 ) {
     unsafe {
-        attention::<128, 16, 1, 72, false>(
+        attention::<128, 16, 1, 72, false, true>(
             resolve_position(p),
             keys,
             0,
@@ -538,7 +566,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_blocks(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 5, 256, false>(p, keys, window, 0, scale, blocks, origin);
+        attention::<256, 32, 5, 256, false, true>(p, keys, window, 0, scale, blocks, origin);
     }
 }
 
@@ -569,7 +597,7 @@ unsafe fn block_bounds(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, prefix: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 2, 128, false>(
+        attention::<128, 16, 2, 128, false, true>(
             p,
             prefix.max(p.start + p.rows),
             prefix,
@@ -591,7 +619,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 3, 256, false>(
+        attention::<256, 32, 3, 256, false, true>(
             p,
             p.start + p.rows,
             window,
@@ -609,7 +637,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 3, 128, false>(
+        attention::<128, 16, 3, 128, false, true>(
             p,
             p.start + p.rows,
             window,
@@ -628,6 +656,7 @@ unsafe fn attention<
     const MODE: u32,
     const L: usize,
     const F16: bool,
+    const RESIDUAL: bool,
 >(
     p: Attention,
     end: u32,
@@ -898,7 +927,7 @@ unsafe fn attention<
                         sum[1] += c + d;
                         packed[$n / 2][($n % 2) * 2] = pack::<F16>(a, b);
                         packed[$n / 2][($n % 2) * 2 + 1] = pack::<F16>(c, d);
-                        if D <= 128 {
+                        if D <= 128 && RESIDUAL {
                             residual[$n / 2][($n % 2) * 2] =
                                 pack_residual::<F16>(a, b, packed[$n / 2][($n % 2) * 2]);
                             residual[$n / 2][($n % 2) * 2 + 1] =
@@ -944,7 +973,7 @@ unsafe fn attention<
                                 output[$pair * 2] = mma::<F16>(a, [b[0], b[1]], output[$pair * 2]);
                                 output[$pair * 2 + 1] =
                                     mma::<F16>(a, [b[2], b[3]], output[$pair * 2 + 1]);
-                                if D <= 128 {
+                                if D <= 128 && RESIDUAL {
                                     output[$pair * 2] = mma::<F16>(
                                         residual[$inner],
                                         [b[0], b[1]],

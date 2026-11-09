@@ -1573,14 +1573,16 @@ impl Dit {
             spec.heads,
             spec.heads,
             spec.head_dim,
-        )?;
+        )?
+        .with_full_single_probability()?;
         let text_flash = Flash::new(
             s.clone(),
             ranges.text,
             spec.heads,
             spec.heads,
             spec.head_dim,
-        )?;
+        )?
+        .with_full_single_probability()?;
         let generated = ranges.rows - ranges.video_start;
         let scratch_rows = (ranges.condition + generated).max(ranges.audio);
         let x = s.alloc_zeros::<bf16>(ranges.rows * h)?;
@@ -2668,7 +2670,8 @@ mod tests {
         for rows in [1usize, 12, 16, 17] {
             let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
             work.prepare(&blas, &spec)?;
-            let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
+            let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+                .with_full_single_probability()?;
             let input: Vec<bf16> = (0..rows * spec.hidden)
                 .map(|i| bf16::from_f32(((i * 37 % 509) as f32 - 254.0) / 127.0))
                 .collect();
@@ -3037,7 +3040,8 @@ mod tests {
             Rc::new(Closure::new(true, "MiniMax-H3 block gate".into())),
         )?;
         let r = adapter.rank;
-        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let weights = BlockWeights::resident(
             s,
@@ -3243,7 +3247,8 @@ mod tests {
         )?;
         let r = adapter.rank;
         let gguf_dir = gguf_path.parent().context("GGUF directory")?;
-        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let weights = BlockWeights::resident(
             s,
