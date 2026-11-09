@@ -1312,6 +1312,7 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
         .context("decode id threshold missing")? as f32;
     let mut trajectories = BTreeMap::new();
     let mut recorded_defects = 0usize;
+    let mut unaccepted_defects = 0usize;
     for case in ["clip0", "clip1", "clip2", "long"] {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let tensors = SafeTensors::deserialize(&bytes)?;
@@ -1371,23 +1372,16 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
             let expected_duration = f32_values(&tensors, "duration_ids")?[step] as u32;
             let reference_token_margin = f32_values(&tensors, "token_margins")?[step];
             let reference_duration_margin = f32_values(&tensors, "duration_margins")?[step];
-            if reference_token_margin >= threshold {
-                ensure!(token == expected_token, "{case}/{step} token id mismatch");
-            }
-            if reference_duration_margin >= threshold {
-                ensure!(
-                    duration == expected_duration,
-                    "{case}/{step} duration id mismatch"
-                );
-                ensure!(
-                    trajectory.frames[step + 1] == expected_frames[step] as usize,
-                    "{case}/{step} frame position mismatch"
-                );
-            }
+            let token_id_equal = token == expected_token;
+            let duration_id_equal = duration == expected_duration;
+            let frame_equal = trajectory.frames[step + 1] == expected_frames[step] as usize;
+            let id_defect = (reference_token_margin >= threshold && !token_id_equal)
+                || (reference_duration_margin >= threshold && (!duration_id_equal || !frame_equal));
             println!(
                 "PARAKEET_DECODE_STEP case={case} step={step} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound} token_margin={token_margin} duration_margin={duration_margin} reference_margins={reference_token_margin}/{reference_duration_margin} threshold={threshold}"
             );
-            if maximum > max_bound {
+            let numeric_defect = maximum > max_bound || rmse > rmse_bound;
+            if numeric_defect {
                 let (index, _) = actual
                     .iter()
                     .zip(&expected[start..start + actual.len()])
@@ -1395,22 +1389,32 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
                     .map(|(index, (candidate, reference))| (index, (candidate - reference).abs()))
                     .max_by(|(_, a), (_, b)| a.total_cmp(b))
                     .context("decode max difference missing")?;
+                let accepted_cell =
+                    (case == "clip2" && step == 44) || (case == "long" && step == 17);
+                let accepted = accepted_cell && !id_defect;
                 println!(
-                    "PARAKEET_DECODE_EXCESS case={case} step={step} index={index} reference={} candidate={}",
+                    "PARAKEET_DECODE_DEFECT case={case} step={step} max_abs={maximum} bound={max_bound} max_factor={} rmse={rmse} bound={rmse_bound} rmse_factor={} index={index} reference={} candidate={} ids_equal={} frame_equal={frame_equal} token_margin={token_margin} duration_margin={duration_margin} reference_margins={reference_token_margin}/{reference_duration_margin} accepted={accepted}",
+                    maximum / max_bound,
+                    rmse / rmse_bound,
                     expected[start + index],
-                    actual[index]
+                    actual[index],
+                    token_id_equal && duration_id_equal,
+                );
+                if accepted {
+                    recorded_defects += 1;
+                }
+            }
+            if id_defect && !numeric_defect {
+                println!(
+                    "PARAKEET_DECODE_ID_DEFECT case={case} step={step} ids_equal={} frame_equal={frame_equal} token_margin={token_margin} duration_margin={duration_margin} reference_margins={reference_token_margin}/{reference_duration_margin}",
+                    token_id_equal && duration_id_equal,
                 );
             }
-            if maximum > max_bound || rmse > rmse_bound {
-                let recorded = (case == "clip2" && step == 44) || (case == "long" && step == 17);
-                ensure!(
-                    recorded,
-                    "{case}/{step} DEFECT max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound}"
-                );
-                println!(
-                    "PARAKEET_DECODE_DEFECT case={case} step={step} max_abs={maximum} bound={max_bound} rmse={rmse} bound={rmse_bound}"
-                );
-                recorded_defects += 1;
+            if id_defect
+                || (numeric_defect
+                    && !((case == "clip2" && step == 44) || (case == "long" && step == 17)))
+            {
+                unaccepted_defects += 1;
             }
             position += trajectory.durations[step + 1] as usize;
         }
@@ -1421,8 +1425,12 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
         let expected_text = report["cases"][case]["text"]
             .as_str()
             .context("reference transcript missing")?;
-        ensure!(text == expected_text, "{case} transcript differs");
+        let text_equal = text == expected_text;
         println!("PARAKEET_DECODE_TEXT case={case} text={text:?}");
+        if !text_equal {
+            println!("PARAKEET_DECODE_TRANSCRIPT_DEFECT case={case} expected={expected_text:?}");
+            unaccepted_defects += 1;
+        }
         trajectories.insert(case, trajectory.tokens);
     }
     for left in ["clip0", "clip1", "clip2", "long"] {
@@ -1445,6 +1453,13 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
     ensure!(swapped.tokens == trajectories["clip1"]);
     ensure!(swapped.tokens != trajectories["clip0"]);
     ensure!(tdt.encoder_call_count() == 1);
+    println!(
+        "PARAKEET_DECODE_SCORE cases=4 recorded_defects={recorded_defects} unaccepted_defects={unaccepted_defects}"
+    );
+    ensure!(
+        unaccepted_defects == 0,
+        "decode has {unaccepted_defects} unaccepted defects"
+    );
     ensure!(recorded_defects == 2, "unexpected decode defect count");
     println!(
         "PASS PARAKEET_DECODE cases=4 media_swap=distinct production_pair_readback=8 recorded_defects=2"
