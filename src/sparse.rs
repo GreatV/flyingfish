@@ -335,11 +335,12 @@ impl Quadric {
             for value in &mut a[column][column..] {
                 *value /= divisor;
             }
-            for row in 0..3 {
+            let pivot_row = a[column];
+            for (row, values) in a.iter_mut().enumerate() {
                 if row != column {
-                    let factor = a[row][column];
-                    for c in column..4 {
-                        a[row][c] -= factor * a[column][c];
+                    let factor = values[column];
+                    for (value, &pivot) in values[column..].iter_mut().zip(&pivot_row[column..]) {
+                        *value -= factor * pivot;
                     }
                 }
             }
@@ -1697,6 +1698,20 @@ mod tests {
         Ok((root, frozen))
     }
 
+    fn qem_resources() -> Result<()> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        ensure!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0,
+            "mesh gate getrusage failed"
+        );
+        let usage = unsafe { usage.assume_init() };
+        println!(
+            "N5_M6_QEM_HOST ru_maxrss_KiB={} GPU_runs=0 timing=false",
+            usage.ru_maxrss
+        );
+        Ok(())
+    }
+
     #[test]
     fn mesh_qem_queue_and_link_indices() -> Result<()> {
         let mut queue = EdgeQueue::new(97);
@@ -1950,6 +1965,32 @@ mod tests {
                 .collect(),
             faces: integers(&source, "faces")?,
         };
+        let raw = fixture(Path::new(
+            cell["raw_input"].as_str().context("raw input missing")?,
+        ))?;
+        let mut raw_mesh = SparseMesh {
+            vertices: mesh_values(&raw, "vertices")?
+                .into_iter()
+                .map(|v| v as f32)
+                .collect(),
+            faces: integers(&raw, "faces")?,
+        };
+        raw_mesh.fill_holes(
+            raw_mesh
+                .faces
+                .len()
+                .checked_mul(4)
+                .context("fill capacity overflow")?
+                / 3,
+        )?;
+        raw_mesh.filter_components(0.005)?;
+        ensure!(
+            raw_mesh.vertices == mesh.vertices && raw_mesh.faces == mesh.faces,
+            "full native fill/filter handoff differs from frozen D"
+        );
+        mesh = raw_mesh;
+        drop(raw);
+        drop(source);
         let target = cell["target_faces"]
             .as_u64()
             .context("target face count missing")? as usize;
@@ -2056,12 +2097,12 @@ mod tests {
             }
         }
         let peak = state.queue.peak;
-        let (mesh, ancestry, original_vertices) = state.finish()?;
+        let (mut mesh, ancestry, original_vertices) = state.finish()?;
         let output = std::path::PathBuf::from(
             std::env::var("FF_HI3D_QEM_OUTPUT").context("FF_HI3D_QEM_OUTPUT required")?,
         );
         std::fs::create_dir(&output)?;
-        let arrays = BTreeMap::from([
+        let mut arrays = BTreeMap::from([
             (
                 "vertices",
                 (
@@ -2107,6 +2148,18 @@ mod tests {
                 ),
             ),
         ]);
+        mesh.normalize()?;
+        arrays.insert(
+            "normalized_vertices",
+            (
+                safetensors::Dtype::F32,
+                vec![mesh.vertices.len() / 3, 3],
+                mesh.vertices
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        );
         let views = arrays
             .iter()
             .map(|(&name, (dtype, shape, data))| {
@@ -2125,6 +2178,7 @@ mod tests {
             ancestry.len()
         );
         ensure!(audit_defects == 0, "streamed contraction audit defects");
+        qem_resources()?;
         Ok(())
     }
 
@@ -2767,6 +2821,64 @@ mod tests {
             .sqrt()
     }
 
+    fn qem_final_normalization(
+        frozen: &serde_json::Value,
+        case: &str,
+        mesh: &SurfaceMesh,
+        bank: &MappedCheckpoint,
+    ) -> Result<usize> {
+        let old: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            frozen["previous_operator_freeze"]
+                .as_str()
+                .context("normalization freeze missing")?,
+        )?)?;
+        let bounds = &old["float_cells"][format!("{case}.normalize")]["tau"];
+        let normalized = mesh_values(bank, "normalized_vertices")?;
+        ensure!(
+            normalized.len() == mesh.points.len() * 3 && normalized.iter().all(|v| v.is_finite()),
+            "normalized result layout invalid"
+        );
+        let mean: [f64; 3] = std::array::from_fn(|i| {
+            mesh.points.iter().map(|p| p[i]).sum::<f64>() / mesh.points.len() as f64
+        });
+        let radius = mesh
+            .points
+            .iter()
+            .map(|&p| {
+                let d = vector_sub(p, mean);
+                vector_dot(d, d).sqrt()
+            })
+            .fold(0.0, f64::max);
+        ensure!(
+            radius > 0.0 && radius.is_finite(),
+            "normalization definition radius invalid"
+        );
+        let mut maximum = 0.0f64;
+        let mut sum = 0.0;
+        for (&point, row) in mesh.points.iter().zip(normalized.as_chunks::<3>().0) {
+            for axis in 0..3 {
+                let error = ((point[axis] - mean[axis]) / radius - row[axis]).abs();
+                maximum = maximum.max(error);
+                sum += error * error;
+            }
+        }
+        let rms = (sum / normalized.len() as f64).sqrt();
+        let defects = usize::from(
+            maximum
+                > bounds["max_abs"]
+                    .as_f64()
+                    .context("normalization max floor missing")?
+                || rms
+                    > bounds["RMS"]
+                        .as_f64()
+                        .context("normalization RMS floor missing")?,
+        );
+        println!(
+            "N5_M6_PROCESSED_NORMALIZATION case={case} max_abs={maximum} RMS={rms} defects={defects}"
+        );
+        Ok(defects)
+    }
+
     #[test]
     #[ignore]
     fn sparse_mesh_qem_geometry_cpu() -> Result<()> {
@@ -2786,6 +2898,7 @@ mod tests {
         let candidate = SurfaceMesh::read(&output.join("native.safetensors"))?;
         let bank = fixture(&output.join("native.safetensors"))?;
         let mut defects = qem_structural(&root, cell, &source, &candidate, &bank)?;
+        defects += qem_final_normalization(&frozen, &case, &candidate, &bank)?;
         drop(bank);
         let frame = &cell["frame"];
         let common = source_path
@@ -2925,6 +3038,7 @@ mod tests {
             "{} N5_M6_QEM_GEOMETRY {result}",
             if defects == 0 { "PASS" } else { "DEFECT" }
         );
+        qem_resources()?;
         ensure!(defects == 0, "mesh simplification defects");
         Ok(())
     }
