@@ -102,6 +102,7 @@ struct Ops {
     activation: CudaFunction,
     bias: CudaFunction,
     layer_norm: CudaFunction,
+    argmax: CudaFunction,
 }
 
 pub struct ParakeetEncoder {
@@ -127,6 +128,13 @@ struct LstmLayer {
     recurrent_gates: CudaSlice<f32>,
 }
 
+pub struct TdtTrajectory {
+    pub tokens: Vec<u32>,
+    pub durations: Vec<u32>,
+    pub frames: Vec<usize>,
+    pub capacity: usize,
+}
+
 pub struct ParakeetTdt {
     encoder: ParakeetEncoder,
     spec: ParakeetSpec,
@@ -141,6 +149,8 @@ pub struct ParakeetTdt {
     joint_sum: CudaSlice<f32>,
     joint_activated: CudaSlice<f32>,
     joint_logits: CudaSlice<f32>,
+    selection: CudaSlice<u32>,
+    projected: Option<CudaSlice<f32>>,
     initialized: bool,
     #[cfg(test)]
     lstm_calls: std::cell::Cell<usize>,
@@ -220,6 +230,25 @@ fn norm(checkpoint: &MappedCheckpoint, stream: &Arc<CudaStream>, prefix: &str) -
 
 fn flat(count: usize) -> LaunchConfig {
     super::ops::flat(count)
+}
+
+fn duration_step(blank: bool, duration: u32) -> u32 {
+    if blank && duration == 0 { 1 } else { duration }
+}
+
+fn decode_capacity(max_symbols: usize, physical_rows: usize) -> Result<usize> {
+    ensure!(physical_rows > 0, "decode requires encoder rows");
+    max_symbols
+        .checked_mul(physical_rows)
+        .context("decode capacity overflow")
+}
+
+fn decode_admit(generated: usize, capacity: usize) -> Result<()> {
+    ensure!(
+        generated < capacity,
+        "decode capacity exceeded: generated={generated} capacity={capacity}"
+    );
+    Ok(())
 }
 
 fn relative_positions(rows: usize, hidden: usize) -> Result<Vec<f32>> {
@@ -481,6 +510,7 @@ impl ParakeetEncoder {
         let speech = cubin::module(&device.ctx, "speech_ops")?;
         let vision = cubin::module(&device.ctx, "vision_ops")?;
         let common = cubin::module(&device.ctx, "q38_common")?;
+        let sample = cubin::module(&device.ctx, "sample")?;
         let ops = Ops {
             conv2d: speech.load_function("speech_conv2d_f32")?,
             mask_time: speech.load_function("speech_mask_time_f32")?,
@@ -493,6 +523,7 @@ impl ParakeetEncoder {
             activation: vision.load_function("activation_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             layer_norm: common.load_function("q38_layer_norm_f32")?,
+            argmax: sample.load_function("argmax_f32")?,
         };
         let mut subsample_conv = Vec::new();
         for name in conformer.conv_names {
@@ -1907,6 +1938,7 @@ impl ParakeetTdt {
         let joint_sum = stream.alloc_zeros(hidden)?;
         let joint_activated = stream.alloc_zeros(hidden)?;
         let joint_logits = stream.alloc_zeros(joint_width)?;
+        let selection = stream.alloc_zeros(2)?;
         stream.synchronize()?;
         Ok(Self {
             encoder,
@@ -1922,6 +1954,8 @@ impl ParakeetTdt {
             joint_sum,
             joint_activated,
             joint_logits,
+            selection,
+            projected: None,
             initialized: false,
             #[cfg(test)]
             lstm_calls: std::cell::Cell::new(0),
@@ -1945,6 +1979,8 @@ impl ParakeetTdt {
             .stream
             .memset_zeros(&mut self.joint_activated)?;
         self.encoder.stream.memset_zeros(&mut self.joint_logits)?;
+        self.encoder.stream.memset_zeros(&mut self.selection)?;
+        self.projected = None;
         self.initialized = false;
         #[cfg(test)]
         self.lstm_calls.set(0);
@@ -1972,13 +2008,33 @@ impl ParakeetTdt {
         Ok(())
     }
 
-    pub fn predict(&mut self, token: u32) -> Result<Vec<f32>> {
+    #[cfg(test)]
+    pub fn set_joint_state(
+        &mut self,
+        hidden: &[f32],
+        cell: &[f32],
+        prediction_output: &[f32],
+    ) -> Result<()> {
+        self.set_prediction_state(hidden, cell)?;
+        let width = self.spec.decoder_hidden as usize;
+        ensure!(
+            prediction_output.len() == width
+                && prediction_output.iter().all(|value| value.is_finite()),
+            "prediction output extent differs from decoder hidden size"
+        );
+        self.encoder
+            .stream
+            .memcpy_htod(prediction_output, &mut self.cache)?;
+        Ok(())
+    }
+
+    fn predict_cached(&mut self, token: u32) -> Result<()> {
         ensure!(
             token < self.spec.vocab,
             "prediction token outside vocabulary"
         );
         if self.initialized && token == self.spec.blank {
-            return Ok(self.encoder.stream.clone_dtoh(&self.cache)?);
+            return Ok(());
         }
         let width = self.spec.decoder_hidden as usize;
         let start = token as usize * width;
@@ -2021,6 +2077,11 @@ impl ParakeetTdt {
         self.encoder
             .linear_into(&last.hidden, 1, &self.decoder_projector, &mut self.cache)?;
         self.initialized = true;
+        Ok(())
+    }
+
+    pub fn predict(&mut self, token: u32) -> Result<Vec<f32>> {
+        self.predict_cached(token)?;
         Ok(self.encoder.stream.clone_dtoh(&self.cache)?)
     }
 
@@ -2083,6 +2144,161 @@ impl ParakeetTdt {
             &mut self.joint_logits,
         )?;
         Ok(self.encoder.stream.clone_dtoh(&self.joint_logits)?)
+    }
+
+    fn joint_argmax(&mut self, frame: usize) -> Result<(u32, u32)> {
+        let width = self.spec.decoder_hidden as usize;
+        let vocab = self.spec.vocab as usize;
+        let joint_width = vocab + self.spec.durations.len();
+        let projected = self
+            .projected
+            .as_ref()
+            .context("decode projector missing")?;
+        ensure!(
+            frame < projected.len() / width,
+            "decode frame outside projected encoder"
+        );
+        let row = projected.slice(frame * width..(frame + 1) * width);
+        self.encoder
+            .stream
+            .memcpy_dtod(&self.cache, &mut self.joint_sum)?;
+        let count = self.joint_sum.len() as u64;
+        unsafe {
+            self.encoder
+                .stream
+                .launch_builder(&self.encoder.ops.residual)
+                .arg(&self.joint_sum)
+                .arg(&row)
+                .arg(&self.joint_sum)
+                .arg(&count)
+                .arg(&1.0f32)
+                .launch(flat(self.joint_sum.len()))?;
+        }
+        self.encoder.activate_into(
+            &self.joint_sum,
+            1,
+            self.spec.decoder_hidden,
+            0,
+            &mut self.joint_activated,
+        )?;
+        self.encoder.linear_into(
+            &self.joint_activated,
+            1,
+            &self.joint,
+            &mut self.joint_logits,
+        )?;
+        let token_logits = self.joint_logits.slice(..vocab);
+        let duration_logits = self.joint_logits.slice(vocab..joint_width);
+        unsafe {
+            self.encoder
+                .stream
+                .launch_builder(&self.encoder.ops.argmax)
+                .arg(&token_logits)
+                .arg(&mut self.selection.slice_mut(0..1))
+                .arg(&(token_logits.len() as i32))
+                .launch(super::ops::grid(1, 1024))?;
+            self.encoder
+                .stream
+                .launch_builder(&self.encoder.ops.argmax)
+                .arg(&duration_logits)
+                .arg(&mut self.selection.slice_mut(1..2))
+                .arg(&(duration_logits.len() as i32))
+                .launch(super::ops::grid(1, 1024))?;
+        }
+        let selected = self.encoder.stream.clone_dtoh(&self.selection)?;
+        Ok((selected[0], selected[1]))
+    }
+
+    fn decode_with(
+        &mut self,
+        input: &[f32],
+        valid: usize,
+        mut on_step: impl FnMut(&Self),
+    ) -> Result<TdtTrajectory> {
+        self.reset()?;
+        #[cfg(test)]
+        self.encoder.reset_encode_calls();
+        let (encoded, _, valid_rows) = self.encoder.encode(input, valid)?;
+        let projected = self.project_encoder(&encoded)?;
+        let width = self.spec.decoder_hidden as usize;
+        ensure!(
+            !projected.is_empty() && projected.len().is_multiple_of(width),
+            "decode projected extent differs from decoder hidden size"
+        );
+        let physical_rows = projected.len() / width;
+        ensure!(
+            valid_rows > 0 && valid_rows <= physical_rows,
+            "decode valid encoder rows outside projected extent"
+        );
+        let capacity = decode_capacity(self.spec.max_symbols as usize, physical_rows)?;
+        self.projected = Some(self.encoder.stream.clone_htod(&projected)?);
+        let mut trajectory = TdtTrajectory {
+            tokens: Vec::with_capacity(capacity),
+            durations: Vec::with_capacity(capacity),
+            frames: Vec::with_capacity(capacity),
+            capacity,
+        };
+        trajectory.tokens.push(self.spec.blank);
+        trajectory.durations.push(0);
+        trajectory.frames.push(0);
+        let mut token = self.spec.blank;
+        let mut frame = 0usize;
+        while frame < valid_rows {
+            self.predict_cached(token)?;
+            let (selected, raw_duration) = self.joint_argmax(frame)?;
+            on_step(self);
+            decode_admit(trajectory.tokens.len(), capacity).with_context(|| {
+                format!(
+                    "decode capacity state: frame={frame} token={selected} initialized={}",
+                    self.initialized
+                )
+            })?;
+            let duration = duration_step(selected == self.spec.blank, raw_duration);
+            trajectory.tokens.push(selected);
+            trajectory.durations.push(duration);
+            trajectory.frames.push(frame);
+            let next_frame = frame
+                .checked_add(duration as usize)
+                .context("decode frame overflow")?;
+            if selected == self.spec.eos || next_frame >= valid_rows {
+                break;
+            }
+            token = selected;
+            frame = next_frame;
+        }
+        ensure!(
+            trajectory.tokens.len() == trajectory.durations.len()
+                && trajectory.tokens.len() == trajectory.frames.len(),
+            "decode trajectory lengths differ"
+        );
+        Ok(trajectory)
+    }
+
+    pub fn decode(&mut self, input: &[f32], valid: usize) -> Result<TdtTrajectory> {
+        self.decode_with(input, valid, |_| {})
+    }
+
+    #[cfg(test)]
+    pub fn decode_trace(
+        &mut self,
+        input: &[f32],
+        valid: usize,
+    ) -> Result<(TdtTrajectory, Vec<Vec<f32>>)> {
+        let mut logits = Vec::new();
+        let trajectory = self.decode_with(input, valid, |this| {
+            logits.push(
+                this.encoder
+                    .stream
+                    .clone_dtoh(&this.joint_logits)
+                    .expect("joint logits readback"),
+            );
+        })?;
+        Ok((trajectory, logits))
+    }
+
+    #[cfg(test)]
+    pub fn encoder_call_count(&self) -> u64 {
+        self.encoder.encode_calls()
     }
 
     #[cfg(test)]
@@ -2237,5 +2453,21 @@ mod position_tests {
                     .count()
             })
             .collect()
+    }
+    #[test]
+    fn tdt_duration_and_capacity_rules() -> Result<()> {
+        assert_eq!(duration_step(true, 0), 1);
+        assert_eq!(duration_step(false, 0), 0);
+        assert_eq!(duration_step(true, 3), 3);
+        assert_eq!(duration_step(false, 4), 4);
+        assert_eq!(decode_capacity(10, 37)?, 370);
+        decode_admit(369, 370)?;
+        assert!(decode_admit(370, 370).is_err());
+        assert!(decode_capacity(usize::MAX, 2).is_err());
+        assert!(decode_capacity(10, 0).is_err());
+        println!(
+            "PASS TDT_CAPACITY blank_zero=1 nonblank_zero=0 capacity=370 exact_fit=true overflow_rejected=true per_frame_counter=false"
+        );
+        Ok(())
     }
 }
