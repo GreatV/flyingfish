@@ -304,15 +304,6 @@ impl Fp8ScaleRef {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum LinearWeightRef {
     Bf16(Tensor<bf16, 2>),
-    /// A contiguous row range `[row0, row0 + rows)` of a row-major BF16
-    /// weight tensor; the Lt plans bind calibrated whole-tensor geometries,
-    /// so a row range (and output scratch beyond the extent) runs plain
-    /// cuBLAS instead.
-    Bf16Rows {
-        tensor: Tensor<bf16, 2>,
-        row0: u32,
-        rows: u32,
-    },
     Fp8 {
         codes: Tensor<u8, 2>,
         scale: Fp8ScaleRef,
@@ -985,9 +976,6 @@ impl NativeProjection {
         let shape = match self.weight {
             LinearWeightRef::Fp8 { codes, .. } => codes.shape,
             LinearWeightRef::Bf16(weight) => weight.shape,
-            LinearWeightRef::Bf16Rows { .. } => {
-                anyhow::bail!("row-range weights have no FP8 projection shape")
-            }
         };
         validate_call(shape, x, &y.0)?;
         let [capacity, k] = self.shape;
@@ -1201,7 +1189,6 @@ impl LayerLinearPlan {
             #[cfg(feature = "cuda")]
             let prefill = match &resident {
                 LinearWeightRef::Bf16(w) => Some(*w),
-                LinearWeightRef::Bf16Rows { .. } => None,
                 LinearWeightRef::Fp8 {
                     scale: Fp8ScaleRef::F32(_),
                     ..
@@ -2060,7 +2047,7 @@ mod tests {
         let (n, k) = shape;
         let rows = crate::linear_plan::MAX_SKINNY_ROWS;
         let format = match weight {
-            LinearWeightRef::Bf16(_) | LinearWeightRef::Bf16Rows { .. } => "BF16",
+            LinearWeightRef::Bf16(_) => "BF16",
             LinearWeightRef::Fp8 { layout, .. } => match layout {
                 Fp8ScaleLayout::Block(_) => "FP8_BLOCK",
                 Fp8ScaleLayout::PerChannel => "FP8_PER_CHANNEL",
@@ -2068,14 +2055,11 @@ mod tests {
         };
         let stream = &device.stream;
         let materialized = match weight {
-            LinearWeightRef::Bf16(_) | LinearWeightRef::Bf16Rows { .. } => None,
+            LinearWeightRef::Bf16(_) => None,
             LinearWeightRef::Fp8 { .. } => Some(stream.alloc_zeros::<bf16>(n * k)?),
         };
         let prefill = match weight {
             LinearWeightRef::Bf16(w) => w,
-            LinearWeightRef::Bf16Rows { .. } => {
-                anyhow::bail!("row-range weights have no test projection")
-            }
             LinearWeightRef::Fp8 {
                 codes,
                 scale,

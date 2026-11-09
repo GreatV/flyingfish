@@ -938,8 +938,7 @@ impl JointRun<'_> {
     /// in_proj tensor, the bidirectional D64 kernel, and the output
     /// projection into `lane.out` `[rows, WIDTH]`.
     /// Linear over a contiguous row range of a row-major BF16 weight tensor
-    /// through the shared linear entry (plain cuBLAS under Lt's whole-tensor
-    /// plan binding); `x`/`y` buffers may carry scratch beyond the extent.
+    /// through the shared linear_bf16 entry.
     fn gemm_rows(
         &self,
         w: &Arc<CudaSlice<bf16>>,
@@ -950,12 +949,11 @@ impl JointRun<'_> {
         input: usize,
     ) -> Result<()> {
         use crate::backend::cuda::contracts::{TensorMut, view};
-        use crate::backend::cuda::linear::LinearWeightRef;
         let wv = view(
             w,
             self.stream,
-            0,
-            [(w.len() / input) as u32, input as u32],
+            rows.start * input,
+            [rows.len() as u32, input as u32],
             [input as u64, 1],
         )?;
         let xv = view(
@@ -972,16 +970,7 @@ impl JointRun<'_> {
             [row_count as u32, rows.len() as u32],
             [rows.len() as u64, 1],
         )?;
-        self.blas.linear_typed(
-            crate::op_contract::ExecutionPhase::Prefill,
-            LinearWeightRef::Bf16Rows {
-                tensor: wv,
-                row0: rows.start as u32,
-                rows: rows.len() as u32,
-            },
-            xv,
-            &mut TensorMut(yv),
-        )
+        self.blas.linear_bf16(wv, xv, &mut TensorMut(yv))
     }
 
     fn mha(
