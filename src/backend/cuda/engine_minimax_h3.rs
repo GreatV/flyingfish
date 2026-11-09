@@ -3842,6 +3842,7 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let weights: Vec<BlockWeights> = (0..2)
             .map(|layer| {
