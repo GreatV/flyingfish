@@ -2187,20 +2187,22 @@ impl ParakeetTdt {
             &self.joint,
             &mut self.joint_logits,
         )?;
+        let token_logits = self.joint_logits.slice(..vocab);
+        let duration_logits = self.joint_logits.slice(vocab..joint_width);
         unsafe {
             self.encoder
                 .stream
                 .launch_builder(&self.encoder.ops.argmax)
-                .arg(&self.joint_logits.slice(..vocab))
+                .arg(&token_logits)
                 .arg(&mut self.selection.slice_mut(0..1))
-                .arg(&(vocab as i32))
+                .arg(&(token_logits.len() as i32))
                 .launch(super::ops::grid(1, 1024))?;
             self.encoder
                 .stream
                 .launch_builder(&self.encoder.ops.argmax)
-                .arg(&self.joint_logits.slice(vocab..joint_width))
+                .arg(&duration_logits)
                 .arg(&mut self.selection.slice_mut(1..2))
-                .arg(&(joint_width as i32))
+                .arg(&(duration_logits.len() as i32))
                 .launch(super::ops::grid(1, 1024))?;
         }
         let selected = self.encoder.stream.clone_dtoh(&self.selection)?;
