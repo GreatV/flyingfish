@@ -9,21 +9,156 @@ pub struct SparseMesh {
 }
 
 impl SparseMesh {
-    pub fn fill_holes(&mut self, capacity: usize) -> Result<usize> {
-        let vertices = self.vertices.len() / 3;
-        let faces = self.faces.len() / 3;
+    fn validate(&self) -> Result<()> {
         ensure!(
-            vertices > 0
-                && faces > 0
+            !self.vertices.is_empty()
+                && !self.faces.is_empty()
                 && self.vertices.len().is_multiple_of(3)
                 && self.faces.len().is_multiple_of(3)
                 && self.vertices.iter().all(|v| v.is_finite())
                 && self
                     .faces
                     .iter()
-                    .all(|&v| v >= 0 && (v as usize) < vertices),
-            "invalid boundary mesh buffers"
+                    .all(|&v| v >= 0 && (v as usize) < self.vertices.len() / 3),
+            "invalid mesh buffers"
         );
+        Ok(())
+    }
+
+    /// Exact-two-incidence edge components; returned maps index the original faces and vertices.
+    pub fn filter_components(
+        &mut self,
+        minimum_face_ratio: f64,
+    ) -> Result<(Vec<usize>, Vec<usize>)> {
+        self.validate()?;
+        ensure!(
+            self.vertices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .any(|p| p != &self.vertices[..3]),
+            "mesh must have non-zero extent"
+        );
+        ensure!(
+            (0.0..=1.0).contains(&minimum_face_ratio),
+            "invalid component face ratio"
+        );
+        let count = self.faces.len() / 3;
+        let mut edges = Vec::with_capacity(self.faces.len());
+        for (face, triangle) in self.faces.as_chunks::<3>().0.iter().enumerate() {
+            for side in 0..3 {
+                let a = triangle[side] as u32;
+                let b = triangle[(side + 1) % 3] as u32;
+                edges.push(((u64::from(a.min(b)) << 32) | u64::from(a.max(b)), face));
+            }
+        }
+        edges.sort_unstable();
+        let mut parent: Vec<_> = (0..count).collect();
+        let mut sizes = vec![1usize; count];
+        let mut order = vec![usize::MAX; count];
+        let mut first = 0;
+        while first < edges.len() {
+            let mut end = first + 1;
+            while end < edges.len() && edges[end].0 == edges[first].0 {
+                end += 1;
+            }
+            if end - first == 2 && edges[first].1 != edges[first + 1].1 {
+                let a = edges[first].1;
+                let b = edges[first + 1].1;
+                order[a] = order[a].min(first);
+                order[b] = order[b].min(first);
+                let mut a = component_root(&mut parent, a);
+                let mut b = component_root(&mut parent, b);
+                if a != b {
+                    if sizes[a] < sizes[b] {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    parent[b] = a;
+                    sizes[a] += sizes[b];
+                }
+            }
+            first = end;
+        }
+        let isolated_start = edges.len();
+        drop(edges);
+        let mut first_seen = vec![usize::MAX; count];
+        for (face, &seen) in order.iter().enumerate() {
+            let root = component_root(&mut parent, face);
+            let seen = if seen == usize::MAX {
+                isolated_start
+                    .checked_add(face)
+                    .context("component traversal order overflow")?
+            } else {
+                seen
+            };
+            first_seen[root] = first_seen[root].min(seen);
+        }
+        let largest = (0..count)
+            .filter(|&face| parent[face] == face)
+            .max_by(|&a, &b| {
+                sizes[a]
+                    .cmp(&sizes[b])
+                    .then(first_seen[b].cmp(&first_seen[a]))
+            })
+            .context("mesh has no connected face component")?;
+        let selected = (0..count)
+            .filter(|&face| {
+                let root = component_root(&mut parent, face);
+                root == largest || sizes[root] as f64 / count as f64 >= minimum_face_ratio
+            })
+            .collect::<Vec<_>>();
+        drop(parent);
+        drop(sizes);
+        drop(order);
+        drop(first_seen);
+        let mut mapping = vec![-1i32; self.vertices.len() / 3];
+        for &face in &selected {
+            for &vertex in &self.faces[3 * face..3 * face + 3] {
+                mapping[vertex as usize] = 0;
+            }
+        }
+        let mut used = Vec::new();
+        let mut vertices = Vec::new();
+        for (vertex, destination) in mapping.iter_mut().enumerate() {
+            if *destination == 0 {
+                *destination =
+                    i32::try_from(used.len()).context("compact vertex index overflow")?;
+                used.push(vertex);
+                vertices.extend_from_slice(&self.vertices[3 * vertex..3 * vertex + 3]);
+            }
+        }
+        let mut faces = Vec::with_capacity(3 * selected.len());
+        for &face in &selected {
+            faces.extend(
+                self.faces[3 * face..3 * face + 3]
+                    .iter()
+                    .map(|&v| mapping[v as usize]),
+            );
+        }
+        self.vertices = vertices;
+        self.faces = faces;
+        Ok((selected, used))
+    }
+
+    /// F64 arithmetic vertex mean and maximum radial norm; storage returns at the F32 boundary.
+    pub fn normalize(&mut self) -> Result<()> {
+        self.validate()?;
+        let mut vertices = self
+            .vertices
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>();
+        normalize_vertices(&mut vertices)?;
+        for (destination, value) in self.vertices.iter_mut().zip(vertices) {
+            *destination = value as f32;
+        }
+        Ok(())
+    }
+
+    pub fn fill_holes(&mut self, capacity: usize) -> Result<usize> {
+        self.validate()?;
+        let vertices = self.vertices.len() / 3;
+        let faces = self.faces.len() / 3;
         let edges = faces
             .checked_mul(3)
             .context("boundary edge extent overflow")?;
@@ -114,6 +249,48 @@ impl SparseMesh {
         self.faces.extend(added);
         Ok(count)
     }
+}
+
+fn component_root(parent: &mut [usize], mut vertex: usize) -> usize {
+    while parent[vertex] != vertex {
+        parent[vertex] = parent[parent[vertex]];
+        vertex = parent[vertex];
+    }
+    vertex
+}
+
+fn normalize_vertices(vertices: &mut [f64]) -> Result<()> {
+    ensure!(
+        !vertices.is_empty()
+            && vertices.len().is_multiple_of(3)
+            && vertices.iter().all(|v| v.is_finite()),
+        "invalid normalization vertices"
+    );
+    let mut mean = [0.0; 3];
+    for point in vertices.as_chunks::<3>().0 {
+        for axis in 0..3 {
+            mean[axis] += point[axis];
+        }
+    }
+    for value in &mut mean {
+        *value /= (vertices.len() / 3) as f64;
+    }
+    let mut radius = 0.0f64;
+    for point in vertices.as_chunks::<3>().0 {
+        let delta: [f64; 3] = std::array::from_fn(|axis| point[axis] - mean[axis]);
+        let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        radius = radius.max(length);
+    }
+    ensure!(
+        radius.is_finite() && radius > 0.0,
+        "mesh cannot be normalized to a positive finite radius"
+    );
+    for point in vertices.as_chunks_mut::<3>().0 {
+        for axis in 0..3 {
+            point[axis] = (point[axis] - mean[axis]) / radius;
+        }
+    }
+    Ok(())
 }
 
 fn triangulate_boundary(
@@ -723,52 +900,365 @@ impl SparseSites {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::MappedCheckpoint;
     use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn integers(bank: &MappedCheckpoint, key: &str) -> Result<Vec<i32>> {
+        let t = bank.tensor(key)?;
+        match t.dtype() {
+            safetensors::Dtype::I32 => Ok(t
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
+                .collect()),
+            safetensors::Dtype::I64 => t
+                .data()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| i32::try_from(i64::from_le_bytes(*b)).map_err(Into::into))
+                .collect(),
+            _ => anyhow::bail!("mesh indices require signed integer storage"),
+        }
+    }
+
+    fn canonical(faces: &[i32]) -> Vec<[i32; 3]> {
+        let mut rows = faces
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| {
+                let [a, b, c] = *p;
+                [[a, b, c], [b, c, a], [c, a, b]].into_iter().min().unwrap()
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    }
+
+    fn fixture(path: &Path) -> Result<MappedCheckpoint> {
+        MappedCheckpoint::open_component(
+            path.parent().context("mesh fixture parent missing")?,
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .context("mesh fixture stem missing")?,
+        )
+    }
+
+    fn mesh_values(bank: &MappedCheckpoint, key: &str) -> Result<Vec<f64>> {
+        let t = bank.tensor(key)?;
+        match t.dtype() {
+            safetensors::Dtype::F32 => Ok(t
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f64::from(f32::from_le_bytes(*b)))
+                .collect()),
+            safetensors::Dtype::F64 => Ok(t
+                .data()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| f64::from_le_bytes(*b))
+                .collect()),
+            _ => anyhow::bail!("mesh vertices require floating point storage"),
+        }
+    }
+
+    fn compare_normalization(
+        root: &Path,
+        arm: &str,
+        input: (&str, &str),
+        expected_file: &str,
+        expected_key: &str,
+        bounds: &serde_json::Value,
+    ) -> Result<bool> {
+        let source = fixture(&root.join(arm).join(input.0))?;
+        let mut vertices = mesh_values(&source, input.1)?;
+        normalize_vertices(&mut vertices)?;
+        let reference = fixture(&root.join(arm).join(expected_file))?;
+        let expected = mesh_values(&reference, expected_key)?;
+        ensure!(
+            vertices.len() == expected.len(),
+            "normalization extent differs"
+        );
+        let max_bound = bounds["max_abs"].as_f64().context("max bound missing")?;
+        let rms_bound = bounds["RMS"].as_f64().context("RMS bound missing")?;
+        let measure = |actual: &[f64]| {
+            let mut max = 0.0f64;
+            let mut squared = 0.0;
+            for (&a, &b) in actual.iter().zip(&expected) {
+                let delta = a - b;
+                max = max.max(delta.abs());
+                squared += delta * delta;
+            }
+            (max, (squared / actual.len() as f64).sqrt())
+        };
+        ensure!(
+            vertices.iter().all(|v| v.is_finite()),
+            "nonfinite normalized mesh"
+        );
+        let (max, rms) = measure(&vertices);
+        let boundary = vertices
+            .iter()
+            .map(|&v| f64::from(v as f32))
+            .collect::<Vec<_>>();
+        let (boundary_max, boundary_rms) = measure(&boundary);
+        let control = mesh_values(&reference, "aabb_control")?;
+        ensure!(
+            control.len() == expected.len(),
+            "normalization control extent differs"
+        );
+        let (control_max, control_rms) = measure(&control);
+        ensure!(
+            control_max > 10.0 * max_bound && control_rms > 10.0 * rms_bound,
+            "normalization control does not discriminate"
+        );
+        let pass = max <= max_bound
+            && rms <= rms_bound
+            && boundary_max <= max_bound
+            && boundary_rms <= rms_bound;
+        println!(
+            "{} N5_M6_NORMALIZE arm={arm} vertices={} max_abs={max:e} RMS={rms:e} boundary_max_abs={boundary_max:e} boundary_RMS={boundary_rms:e} tau_max={max_bound:e} tau_RMS={rms_bound:e} AABB_control_max={control_max:e} AABB_control_RMS={control_rms:e}",
+            if pass { "PASS" } else { "DEFECT" },
+            vertices.len() / 3
+        );
+        Ok(pass)
+    }
+
+    fn compare_component_fixture(root: &Path, file: &str) -> Result<bool> {
+        let bank = fixture(&root.join(file))?;
+        let source_key = if file.ends_with("components.safetensors") && !file.contains("corners") {
+            "vertices"
+        } else {
+            "input_vertices"
+        };
+        let face_key = if source_key == "vertices" {
+            "faces"
+        } else {
+            "input_faces"
+        };
+        let mut mesh = SparseMesh {
+            vertices: mesh_values(&bank, source_key)?
+                .iter()
+                .map(|&v| v as f32)
+                .collect(),
+            faces: integers(&bank, face_key)?,
+        };
+        let (selected, _) = mesh.filter_components(0.005)?;
+        let expected_vertices = mesh_values(&bank, "filtered_vertices")?
+            .iter()
+            .map(|&v| v as f32)
+            .collect::<Vec<_>>();
+        let mut pass =
+            mesh.faces == integers(&bank, "filtered_faces")? && mesh.vertices == expected_vertices;
+        if source_key == "vertices" {
+            pass &= selected
+                == integers(&bank, "selected_face_ids")?
+                    .iter()
+                    .map(|&v| v as usize)
+                    .collect::<Vec<_>>();
+            let control = integers(&bank, "vertex_control_face_ids")?;
+            ensure!(
+                control.len() == selected.len() + 4,
+                "shared-vertex control does not discriminate"
+            );
+        }
+        println!(
+            "{} N5_M6_COMPONENTS fixture={file} retained_faces={} selected_first={:?} shared_vertex_control_extra_faces={}",
+            if pass { "PASS" } else { "DEFECT" },
+            mesh.faces.len() / 3,
+            selected.first(),
+            if source_key == "vertices" { 4 } else { 0 }
+        );
+        Ok(pass)
+    }
+
+    #[test]
+    #[ignore = "requires frozen final-fill, component and normalization fixtures; CPU only"]
+    fn sparse_mesh_postprocess_definition_cpu() -> Result<()> {
+        let root = std::env::var_os("FF_HI3D_POSTPROCESS_REFERENCE")
+            .context("postprocess fixtures required")?;
+        let root = Path::new(&root);
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        let mut defects = 0;
+        let mut records = 0;
+        for case in ["cottage512", "robot512", "cottage1024", "robot1536"] {
+            let arm = format!("local-{case}-r0");
+            let path = frozen["production"][case]["local"]["input"]
+                .as_str()
+                .context("raw mesh path missing")?;
+            let raw = fixture(Path::new(path))?;
+            let raw_vertices = mesh_values(&raw, "vertices")?
+                .iter()
+                .map(|&v| v as f32)
+                .collect::<Vec<_>>();
+            let original = integers(&raw, "faces")?;
+            let fill = fixture(&root.join(&arm).join("fill-added.safetensors"))?;
+            let expected_fill = integers(&fill, "added_faces")?;
+            let mut mesh = SparseMesh {
+                vertices: raw_vertices,
+                faces: original.clone(),
+            };
+            let added = mesh.fill_holes((original.len() + expected_fill.len()) / 3)?;
+            let exact = canonical(&mesh.faces[original.len()..]) == canonical(&expected_fill);
+            ensure!(
+                mesh.faces[..original.len()] == original,
+                "final fill changed original faces"
+            );
+            defects += usize::from(!exact);
+            records += 1;
+            println!(
+                "{} N5_M6_FINAL_FILL case={case} added_faces={added} expected_faces={} oriented_multiset_exact={exact}",
+                if exact { "PASS" } else { "DEFECT" },
+                expected_fill.len() / 3
+            );
+            mesh.faces = original;
+            mesh.faces.extend(expected_fill);
+            let (selected, used) = mesh.filter_components(0.005)?;
+            let expected = fixture(&root.join(&arm).join("filter-maps.safetensors"))?;
+            let exact = selected
+                == integers(&expected, "selected_filled_face_ids")?
+                    .iter()
+                    .map(|&v| v as usize)
+                    .collect::<Vec<_>>()
+                && used
+                    == integers(&expected, "used_original_vertex_ids")?
+                        .iter()
+                        .map(|&v| v as usize)
+                        .collect::<Vec<_>>();
+            defects += usize::from(!exact);
+            records += 1;
+            println!(
+                "{} N5_M6_FINAL_COMPONENTS case={case} vertices={} faces={} exact_maps={exact} common_filled_input=true",
+                if exact { "PASS" } else { "DEFECT" },
+                mesh.vertices.len() / 3,
+                mesh.faces.len() / 3
+            );
+            drop(mesh);
+            let bounds = &frozen["float_cells"][format!("{case}.normalize")]["tau"];
+            defects += usize::from(!compare_normalization(
+                root,
+                &arm,
+                ("simplified-common.safetensors", "vertices"),
+                "normalization-common.safetensors",
+                "vertices_f64",
+                bounds,
+            )?);
+            records += 1;
+        }
+        for file in [
+            "local-bounded-r1/components.safetensors",
+            "local-corners-r1/201_equal_components.safetensors",
+            "local-corners-r1/201_equal_connected_components_reverse_vertices.safetensors",
+            "local-corners-r1/nonmanifold_valence3.safetensors",
+            "local-corners-r1/duplicate_reversed_degenerate.safetensors",
+        ] {
+            defects += usize::from(!compare_component_fixture(root, file)?);
+            records += 1;
+        }
+        for case in [
+            "triangle_boundary",
+            "pyramid_boundary5",
+            "loop10001_skipped",
+        ] {
+            let source = fixture(
+                &root
+                    .join("local-corners-r1")
+                    .join(format!("{case}.safetensors")),
+            )?;
+            let mut mesh = SparseMesh {
+                vertices: mesh_values(&source, "input_vertices")?
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect(),
+                faces: integers(&source, "input_faces")?,
+            };
+            let original = mesh.faces.clone();
+            let expected = integers(&source, "added_faces")?;
+            mesh.fill_holes((original.len() + expected.len()) / 3)?;
+            let exact = canonical(&mesh.faces[original.len()..]) == canonical(&expected);
+            let reversed = canonical(&integers(&source, "reversed_ear_control")?);
+            ensure!(
+                expected.is_empty() || canonical(&expected) != reversed,
+                "reversed-ear control does not discriminate"
+            );
+            defects += usize::from(!exact);
+            records += 1;
+            println!(
+                "{} N5_M6_FINAL_FILL_CORNER case={case} added_faces={} reversed_ear_discriminates={}",
+                if exact { "PASS" } else { "DEFECT" },
+                expected.len() / 3,
+                !expected.is_empty()
+            );
+        }
+        defects += usize::from(!compare_normalization(
+            root,
+            "local-bounded-r1",
+            ("normalization.safetensors", "input_vertices"),
+            "normalization.safetensors",
+            "normalized_f64",
+            &frozen["float_cells"]["bounded.normalize"]["tau"],
+        )?);
+        records += 1;
+        println!(
+            "N5_M6_POSTPROCESS_GATE records={records} defects={defects} CPU_only=true decimator=false timing=false"
+        );
+        ensure!(defects == 0, "final mesh operator defects");
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_normalization_preserves_faces_and_rejects_invalid_buffers() -> Result<()> {
+        let mut mesh = SparseMesh {
+            vertices: vec![0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            faces: vec![0, 1, 2],
+        };
+        let original = mesh.faces.clone();
+        mesh.normalize()?;
+        assert_eq!(mesh.faces, original);
+        for axis in 0..3 {
+            assert!(
+                mesh.vertices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|p| f64::from(p[axis]))
+                    .sum::<f64>()
+                    .abs()
+                    < 1e-6
+            );
+        }
+        let mut degenerate = SparseMesh {
+            vertices: vec![1.0; 9],
+            faces: original.clone(),
+        };
+        assert!(degenerate.normalize().is_err());
+        assert_eq!(degenerate.vertices, vec![1.0; 9]);
+        let mut invalid = SparseMesh {
+            vertices: vec![0.0; 9],
+            faces: vec![-1, 1, 2],
+        };
+        assert!(invalid.filter_components(0.005).is_err());
+        assert!(invalid.normalize().is_err());
+        assert!(mesh.filter_components(f64::NAN).is_err());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires frozen raw meshes and oriented hole-fill faces; CPU only"]
     fn sparse_mesh_fill_definition_cpu() -> Result<()> {
-        use crate::checkpoint::MappedCheckpoint;
-        use std::path::Path;
         let root =
             std::env::var_os("FF_HI3D_CASCADE_REFERENCE").context("cascade fixtures required")?;
         let prefix = std::env::var_os("FF_HI3D_EXTRACTION_REFERENCE")
             .context("raw mesh fixtures required")?;
         let root = Path::new(&root);
         let prefix = Path::new(&prefix);
-        let integers = |bank: &MappedCheckpoint, key: &str| -> Result<Vec<i32>> {
-            let t = bank.tensor(key)?;
-            match t.dtype() {
-                safetensors::Dtype::I32 => Ok(t
-                    .data()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| i32::from_le_bytes(*b))
-                    .collect()),
-                safetensors::Dtype::I64 => t
-                    .data()
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|b| i32::try_from(i64::from_le_bytes(*b)).map_err(Into::into))
-                    .collect(),
-                _ => anyhow::bail!("mesh indices require signed integer storage"),
-            }
-        };
-        let canonical = |faces: &[i32]| {
-            let mut rows = faces
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .map(|p| {
-                    let [a, b, c] = *p;
-                    [[a, b, c], [b, c, a], [c, a, b]].into_iter().min().unwrap()
-                })
-                .collect::<Vec<_>>();
-            rows.sort_unstable();
-            rows
-        };
         let mut records = 0;
         let mut defects = 0;
         for high in [false, true] {
