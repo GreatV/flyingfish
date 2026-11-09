@@ -155,6 +155,23 @@ impl SparseMesh {
         Ok(())
     }
 
+    /// Inherited plane quadrics and manifold links; returned maps index original faces and vertices.
+    pub fn simplify(&mut self, target_faces: usize) -> Result<(Vec<usize>, Vec<usize>)> {
+        self.validate()?;
+        ensure!(target_faces > 0, "simplification target must be positive");
+        if self.faces.len() / 3 <= target_faces {
+            return Ok((
+                (0..self.faces.len() / 3).collect(),
+                (0..self.vertices.len() / 3).collect(),
+            ));
+        }
+        let mut state = MeshDecimator::new(self)?;
+        state.run(target_faces)?;
+        let (mesh, ancestry, vertices) = state.finish()?;
+        *self = mesh;
+        Ok((ancestry, vertices))
+    }
+
     pub fn fill_holes(&mut self, capacity: usize) -> Result<usize> {
         self.validate()?;
         let vertices = self.vertices.len() / 3;
@@ -248,6 +265,682 @@ impl SparseMesh {
         let count = added.len() / 3;
         self.faces.extend(added);
         Ok(count)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Quadric([f64; 10]);
+
+impl Quadric {
+    fn plane(p: [f64; 4]) -> Self {
+        Self([
+            p[0] * p[0],
+            p[0] * p[1],
+            p[0] * p[2],
+            p[0] * p[3],
+            p[1] * p[1],
+            p[1] * p[2],
+            p[1] * p[3],
+            p[2] * p[2],
+            p[2] * p[3],
+            p[3] * p[3],
+        ])
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self(std::array::from_fn(|i| self.0[i] + other.0[i]))
+    }
+
+    fn energy(self, [x, y, z]: [f64; 3]) -> f64 {
+        let q = self.0;
+        q[0] * x * x
+            + 2.0 * q[1] * x * y
+            + 2.0 * q[2] * x * z
+            + 2.0 * q[3] * x
+            + q[4] * y * y
+            + 2.0 * q[5] * y * z
+            + 2.0 * q[6] * y
+            + q[7] * z * z
+            + 2.0 * q[8] * z
+            + q[9]
+    }
+
+    fn matrix(self, v: [f64; 3]) -> [f64; 3] {
+        let q = self.0;
+        [
+            q[0] * v[0] + q[1] * v[1] + q[2] * v[2],
+            q[1] * v[0] + q[4] * v[1] + q[5] * v[2],
+            q[2] * v[0] + q[5] * v[1] + q[7] * v[2],
+        ]
+    }
+
+    fn stationary(self) -> Option<[f64; 3]> {
+        let q = self.0;
+        let mut a = [
+            [q[0], q[1], q[2], -q[3]],
+            [q[1], q[4], q[5], -q[6]],
+            [q[2], q[5], q[7], -q[8]],
+        ];
+        let scale = [q[0].abs(), q[4].abs(), q[7].abs()]
+            .into_iter()
+            .fold(0.0, f64::max);
+        for column in 0..3 {
+            let pivot =
+                (column..3).max_by(|&i, &j| a[i][column].abs().total_cmp(&a[j][column].abs()))?;
+            if a[pivot][column].abs() <= 1e-12 * scale {
+                return None;
+            }
+            a.swap(column, pivot);
+            let divisor = a[column][column];
+            for value in &mut a[column][column..] {
+                *value /= divisor;
+            }
+            for row in 0..3 {
+                if row != column {
+                    let factor = a[row][column];
+                    for c in column..4 {
+                        a[row][c] -= factor * a[column][c];
+                    }
+                }
+            }
+        }
+        let point = [a[0][3], a[1][3], a[2][3]];
+        point.iter().all(|v| v.is_finite()).then_some(point)
+    }
+
+    fn segment(self, a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        let d = vector_sub(b, a);
+        let qa = self.matrix(a);
+        let numerator = vector_dot(d, [qa[0] + self.0[3], qa[1] + self.0[6], qa[2] + self.0[8]]);
+        let denominator = vector_dot(d, self.matrix(d));
+        let t = if denominator > 0.0 {
+            (-numerator / denominator).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        std::array::from_fn(|i| a[i] + t * d[i])
+    }
+
+    fn candidates(self, a: [f64; 3], b: [f64; 3]) -> [Option<[f64; 3]>; 5] {
+        [
+            self.stationary(),
+            Some(self.segment(a, b)),
+            Some(a),
+            Some(b),
+            Some(std::array::from_fn(|i| (a[i] + b[i]) * 0.5)),
+        ]
+    }
+
+    fn lower_bound(self, a: [f64; 3], b: [f64; 3]) -> f64 {
+        self.candidates(a, b)
+            .into_iter()
+            .flatten()
+            .map(|p| self.energy(p).max(0.0))
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+fn vector_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|i| a[i] - b[i])
+}
+
+fn vector_dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn vector_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn corner_next(c: u32) -> u32 {
+    c / 3 * 3 + (c % 3 + 1) % 3
+}
+
+struct EdgeQueue {
+    heap: Vec<u32>,
+    positions: Vec<u32>,
+    costs: Vec<f64>,
+    peak: usize,
+}
+
+impl EdgeQueue {
+    fn new(corners: usize) -> Self {
+        Self {
+            heap: Vec::new(),
+            positions: vec![u32::MAX; corners],
+            costs: vec![0.0; corners],
+            peak: 0,
+        }
+    }
+
+    fn less(&self, a: u32, b: u32) -> bool {
+        self.costs[a as usize]
+            .total_cmp(&self.costs[b as usize])
+            .then(a.cmp(&b))
+            .is_lt()
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        self.positions[self.heap[a] as usize] = a as u32;
+        self.positions[self.heap[b] as usize] = b as u32;
+    }
+
+    fn up(&mut self, mut i: usize) {
+        while i > 0 {
+            let parent = (i - 1) / 2;
+            if !self.less(self.heap[i], self.heap[parent]) {
+                break;
+            }
+            self.swap(i, parent);
+            i = parent;
+        }
+    }
+
+    fn down(&mut self, mut i: usize) {
+        loop {
+            let left = i * 2 + 1;
+            if left >= self.heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < self.heap.len() && self.less(self.heap[right], self.heap[left]) {
+                right
+            } else {
+                left
+            };
+            if !self.less(self.heap[child], self.heap[i]) {
+                break;
+            }
+            self.swap(i, child);
+            i = child;
+        }
+    }
+
+    fn set(&mut self, corner: u32, cost: f64) {
+        let old = self.positions[corner as usize];
+        self.costs[corner as usize] = cost;
+        let i = if old == u32::MAX {
+            let i = self.heap.len();
+            self.positions[corner as usize] = i as u32;
+            self.heap.push(corner);
+            self.peak = self.peak.max(self.heap.len());
+            i
+        } else {
+            old as usize
+        };
+        if i > 0 && self.less(self.heap[i], self.heap[(i - 1) / 2]) {
+            self.up(i);
+        } else {
+            self.down(i);
+        }
+    }
+
+    fn remove(&mut self, corner: u32) {
+        let index = self.positions[corner as usize];
+        if index == u32::MAX {
+            return;
+        }
+        let i = index as usize;
+        self.heap.swap_remove(i);
+        self.positions[corner as usize] = u32::MAX;
+        if i < self.heap.len() {
+            self.positions[self.heap[i] as usize] = i as u32;
+            if i > 0 && self.less(self.heap[i], self.heap[(i - 1) / 2]) {
+                self.up(i);
+            } else {
+                self.down(i);
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<(u32, f64)> {
+        let corner = *self.heap.first()?;
+        let cost = self.costs[corner as usize];
+        self.remove(corner);
+        Some((corner, cost))
+    }
+}
+
+struct MeshDecimator {
+    points: Vec<[f64; 3]>,
+    faces: Vec<[u32; 3]>,
+    normals: Vec<[f64; 3]>,
+    quadrics: Vec<Quadric>,
+    heads: Vec<u32>,
+    next: Vec<u32>,
+    previous: Vec<u32>,
+    protected: Vec<bool>,
+    queue: EdgeQueue,
+    live_faces: usize,
+    contractions: usize,
+}
+
+impl MeshDecimator {
+    fn new(mesh: &SparseMesh) -> Result<Self> {
+        ensure!(
+            mesh.faces.len() < u32::MAX as usize,
+            "mesh corner capacity exceeds u32"
+        );
+        let points: Vec<_> = mesh
+            .vertices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| p.map(f64::from))
+            .collect();
+        let faces: Vec<_> = mesh
+            .faces
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| p.map(|v| v as u32))
+            .collect();
+        let mut state = Self {
+            normals: vec![[0.0; 3]; faces.len()],
+            quadrics: vec![Quadric::default(); points.len()],
+            heads: vec![u32::MAX; points.len()],
+            next: vec![u32::MAX; mesh.faces.len()],
+            previous: vec![u32::MAX; mesh.faces.len()],
+            protected: vec![false; points.len()],
+            queue: EdgeQueue::new(mesh.faces.len()),
+            live_faces: faces.len(),
+            contractions: 0,
+            points,
+            faces,
+        };
+        let edges = state.initialize()?;
+        let mut first = 0;
+        while first < edges.len() {
+            let mut end = first + 1;
+            while end < edges.len() && edges[end].0 == edges[first].0 {
+                end += 1;
+            }
+            if end - first == 2 {
+                let corner = edges[first..end].iter().map(|e| e.1).min().unwrap();
+                state.enqueue(corner);
+            }
+            first = end;
+        }
+        ensure!(
+            state.queue.heap.len() <= mesh.faces.len(),
+            "live edge queue capacity exceeded"
+        );
+        Ok(state)
+    }
+
+    fn initialize(&mut self) -> Result<Vec<(u64, u32)>> {
+        let mut edges = Vec::with_capacity(self.next.len());
+        for face in 0..self.faces.len() {
+            let triangle = self.faces[face];
+            let [a, b, c] = triangle.map(|v| self.points[v as usize]);
+            let normal = vector_cross(vector_sub(b, a), vector_sub(c, a));
+            let length = vector_dot(normal, normal).sqrt();
+            ensure!(length.is_finite(), "nonfinite initial face plane");
+            if length > 0.0 {
+                let n = normal.map(|v| v / length);
+                self.normals[face] = n;
+                let q = Quadric::plane([n[0], n[1], n[2], -vector_dot(n, a)]);
+                for &v in &triangle {
+                    self.quadrics[v as usize] = self.quadrics[v as usize].add(q);
+                }
+            } else {
+                for &v in &triangle {
+                    self.protected[v as usize] = true;
+                }
+            }
+            for side in 0..3 {
+                let corner = (3 * face + side) as u32;
+                self.link(corner);
+                let a = triangle[side];
+                let b = triangle[(side + 1) % 3];
+                edges.push(((u64::from(a.min(b)) << 32) | u64::from(a.max(b)), corner));
+            }
+        }
+        edges.sort_unstable();
+        let mut opposite = vec![u32::MAX; self.next.len()];
+        let mut first = 0;
+        while first < edges.len() {
+            let mut end = first + 1;
+            while end < edges.len() && edges[end].0 == edges[first].0 {
+                end += 1;
+            }
+            let c = edges[first].1;
+            if end - first == 2 && self.vertex(c) != self.vertex(edges[first + 1].1) {
+                opposite[c as usize] = edges[first + 1].1;
+                opposite[edges[first + 1].1 as usize] = c;
+            } else {
+                self.protected[self.vertex(c) as usize] = true;
+                self.protected[self.vertex(corner_next(c)) as usize] = true;
+            }
+            first = end;
+        }
+        for vertex in 0..self.points.len() {
+            if self.protected[vertex] || self.heads[vertex] == u32::MAX {
+                continue;
+            }
+            let start = self.heads[vertex];
+            let degree = self.incident(vertex as u32).len();
+            let mut corner = start;
+            let mut count = 0;
+            loop {
+                let next = opposite[corner as usize];
+                if next == u32::MAX {
+                    break;
+                }
+                corner = corner_next(next);
+                count += 1;
+                if corner == start || count >= degree {
+                    break;
+                }
+            }
+            if corner != start || count != degree {
+                self.protected[vertex] = true;
+            }
+        }
+        Ok(edges)
+    }
+
+    fn vertex(&self, corner: u32) -> u32 {
+        self.faces[corner as usize / 3][corner as usize % 3]
+    }
+
+    fn link(&mut self, corner: u32) {
+        let vertex = self.vertex(corner) as usize;
+        let old = self.heads[vertex];
+        self.next[corner as usize] = old;
+        self.previous[corner as usize] = u32::MAX;
+        if old != u32::MAX {
+            self.previous[old as usize] = corner;
+        }
+        self.heads[vertex] = corner;
+    }
+
+    fn unlink(&mut self, corner: u32) {
+        let vertex = self.vertex(corner) as usize;
+        let previous = self.previous[corner as usize];
+        let next = self.next[corner as usize];
+        if previous == u32::MAX {
+            self.heads[vertex] = next;
+        } else {
+            self.next[previous as usize] = next;
+        }
+        if next != u32::MAX {
+            self.previous[next as usize] = previous;
+        }
+    }
+
+    fn incident(&self, vertex: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut corner = self.heads[vertex as usize];
+        while corner != u32::MAX {
+            out.push(corner);
+            corner = self.next[corner as usize];
+        }
+        out
+    }
+
+    fn edge_slot(&self, a: u32, b: u32) -> Option<u32> {
+        let mut best = None;
+        let mut corner = self.heads[a as usize];
+        while corner != u32::MAX {
+            let next = corner_next(corner);
+            let previous = corner_next(next);
+            let edge = if self.vertex(next) == b {
+                Some(corner)
+            } else if self.vertex(previous) == b {
+                Some(previous)
+            } else {
+                None
+            };
+            if let Some(edge) = edge {
+                best = Some(best.map_or(edge, |old: u32| old.min(edge)));
+            }
+            corner = self.next[corner as usize];
+        }
+        best
+    }
+
+    fn enqueue(&mut self, corner: u32) {
+        let a = self.vertex(corner);
+        let b = self.vertex(corner_next(corner));
+        if self.protected[a as usize] || self.protected[b as usize] {
+            return;
+        }
+        let q = self.quadrics[a as usize].add(self.quadrics[b as usize]);
+        let cost = q.lower_bound(self.points[a as usize], self.points[b as usize]);
+        self.queue.set(corner, cost);
+    }
+
+    fn star(&self, a: u32, b: u32) -> Vec<u32> {
+        let mut faces = self.incident(a);
+        faces.extend(self.incident(b));
+        for c in &mut faces {
+            *c /= 3;
+        }
+        faces.sort_unstable();
+        faces.dedup();
+        faces
+    }
+
+    fn link_valid(&self, a: u32, b: u32, star: &[u32]) -> bool {
+        let mut neighbors = [Vec::new(), Vec::new()];
+        let mut opposite = Vec::new();
+        let mut remaining = Vec::new();
+        for &face in star {
+            let triangle = self.faces[face as usize];
+            for (i, v) in [a, b].into_iter().enumerate() {
+                if triangle.contains(&v) {
+                    neighbors[i].extend(triangle.into_iter().filter(|&n| n != v));
+                }
+            }
+            if triangle.contains(&a) && triangle.contains(&b) {
+                opposite.extend(triangle.into_iter().filter(|&v| v != a && v != b));
+            } else {
+                let mut mapped = triangle.map(|v| if v == b { a } else { v });
+                mapped.sort_unstable();
+                remaining.push(mapped);
+            }
+        }
+        if opposite.len() != 2 || opposite[0] == opposite[1] {
+            return false;
+        }
+        for row in &mut neighbors {
+            row.sort_unstable();
+            row.dedup();
+        }
+        let common: Vec<_> = neighbors[0]
+            .iter()
+            .copied()
+            .filter(|v| neighbors[1].binary_search(v).is_ok())
+            .collect();
+        opposite.sort_unstable();
+        remaining.sort_unstable();
+        common == opposite && !remaining.windows(2).any(|p| p[0] == p[1])
+    }
+
+    fn position_valid(&self, a: u32, b: u32, point: [f64; 3], star: &[u32]) -> bool {
+        if !point.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        for &face in star {
+            let triangle = self.faces[face as usize];
+            if triangle.contains(&a) && triangle.contains(&b) {
+                continue;
+            }
+            let old = triangle.map(|v| self.points[v as usize]);
+            let new = triangle.map(|v| {
+                if v == a || v == b {
+                    point
+                } else {
+                    self.points[v as usize]
+                }
+            });
+            let normal = vector_cross(vector_sub(new[1], new[0]), vector_sub(new[2], new[0]));
+            let length = vector_dot(normal, normal).sqrt();
+            let previous = vector_cross(vector_sub(old[1], old[0]), vector_sub(old[2], old[0]));
+            if !length.is_finite()
+                || length <= 0.0
+                || vector_dot(normal, self.normals[face as usize]) < 0.5 * length
+                || vector_dot(normal, previous) <= 0.0
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn collapse(&mut self, a: u32, b: u32, point: [f64; 3], star: &[u32]) {
+        let mut vertices = Vec::new();
+        for &f in star {
+            vertices.extend(self.faces[f as usize]);
+        }
+        vertices.sort_unstable();
+        vertices.dedup();
+        let mut neighborhood = Vec::new();
+        for &v in &vertices {
+            neighborhood.extend(self.incident(v).into_iter().map(|c| c / 3));
+        }
+        neighborhood.sort_unstable();
+        neighborhood.dedup();
+        for &f in &neighborhood {
+            for side in 0..3 {
+                self.queue.remove(3 * f + side);
+            }
+        }
+        for &f in star {
+            for side in 0..3 {
+                self.unlink(3 * f + side);
+            }
+        }
+        self.points[a as usize] = point;
+        self.quadrics[a as usize] = self.quadrics[a as usize].add(self.quadrics[b as usize]);
+        for &f in star {
+            let triangle = self.faces[f as usize];
+            if triangle.contains(&a) && triangle.contains(&b) {
+                self.faces[f as usize] = [u32::MAX; 3];
+                self.live_faces -= 1;
+            } else {
+                self.faces[f as usize] = triangle.map(|v| if v == b { a } else { v });
+                for side in 0..3 {
+                    self.link(3 * f + side);
+                }
+            }
+        }
+        let mut slots = Vec::new();
+        for &f in &neighborhood {
+            if self.faces[f as usize][0] == u32::MAX {
+                continue;
+            }
+            for side in 0..3 {
+                let c = 3 * f + side;
+                let a = self.vertex(c);
+                let b = self.vertex(corner_next(c));
+                if let Some(slot) = self.edge_slot(a, b) {
+                    slots.push(slot);
+                }
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            self.enqueue(slot);
+        }
+        self.contractions += 1;
+    }
+
+    fn run(&mut self, target: usize) -> Result<()> {
+        while self.live_faces > target {
+            let (corner, lower) = self.queue.pop().with_context(|| {
+                format!(
+                    "simplification legal queue exhausted at {} faces, target {target}",
+                    self.live_faces
+                )
+            })?;
+            let x = self.vertex(corner);
+            let y = self.vertex(corner_next(corner));
+            let (a, b) = (x.min(y), x.max(y));
+            let star = self.star(a, b);
+            if !self.link_valid(a, b, &star) {
+                continue;
+            }
+            let quadric = self.quadrics[a as usize].add(self.quadrics[b as usize]);
+            let point = quadric
+                .candidates(self.points[a as usize], self.points[b as usize])
+                .into_iter()
+                .flatten()
+                .map(|p| p.map(|x| f64::from(x as f32)))
+                .filter(|&p| self.position_valid(a, b, p, &star))
+                .min_by(|&p, &q| quadric.energy(p).total_cmp(&quadric.energy(q)));
+            let Some(point) = point else {
+                continue;
+            };
+            let cost = quadric.energy(point).max(0.0);
+            ensure!(cost.is_finite(), "nonfinite contraction cost");
+            if cost > lower
+                && self.queue.heap.first().is_some_and(|&next| {
+                    self.queue.costs[next as usize]
+                        .total_cmp(&cost)
+                        .then(next.cmp(&corner))
+                        .is_lt()
+                })
+            {
+                self.queue.set(corner, cost);
+                continue;
+            }
+            self.collapse(a, b, point, &star);
+            if self.contractions.is_multiple_of(250_000) {
+                println!(
+                    "MESH_QEM_PROGRESS contractions={} faces={} queue={} queue_peak={} timing=false",
+                    self.contractions,
+                    self.live_faces,
+                    self.queue.heap.len(),
+                    self.queue.peak
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(SparseMesh, Vec<usize>, Vec<usize>)> {
+        ensure!(
+            self.queue.peak <= self.next.len(),
+            "live queue exceeded original corner capacity"
+        );
+        let mut used = vec![false; self.points.len()];
+        for triangle in &self.faces {
+            if triangle[0] != u32::MAX {
+                for &v in triangle {
+                    used[v as usize] = true;
+                }
+            }
+        }
+        let mut mapping = vec![-1i32; self.points.len()];
+        let mut vertices = Vec::new();
+        let mut original_vertices = Vec::new();
+        for (v, &live) in used.iter().enumerate() {
+            if live {
+                mapping[v] = i32::try_from(vertices.len() / 3)
+                    .context("simplified vertex capacity overflow")?;
+                vertices.extend(self.points[v].map(|x| x as f32));
+                original_vertices.push(v);
+            }
+        }
+        let mut faces = Vec::with_capacity(3 * self.live_faces);
+        let mut ancestry = Vec::with_capacity(self.live_faces);
+        for (f, triangle) in self.faces.iter().enumerate() {
+            if triangle[0] != u32::MAX {
+                faces.extend(triangle.map(|v| mapping[v as usize]));
+                ancestry.push(f);
+            }
+        }
+        let mesh = SparseMesh { vertices, faces };
+        mesh.validate()?;
+        Ok((mesh, ancestry, original_vertices))
     }
 }
 
@@ -903,6 +1596,383 @@ mod tests {
     use crate::checkpoint::MappedCheckpoint;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    fn full_quadric(q: Quadric) -> [f64; 16] {
+        let q = q.0;
+        [
+            q[0], q[1], q[2], q[3], q[1], q[4], q[5], q[6], q[2], q[5], q[7], q[8], q[3], q[6],
+            q[8], q[9],
+        ]
+    }
+
+    fn qem_initial(points: &[[f64; 3]], faces: &[[i32; 3]]) -> Vec<Quadric> {
+        let mut q = vec![Quadric::default(); points.len()];
+        for triangle in faces {
+            let [a, b, c] = triangle.map(|v| points[v as usize]);
+            let n = vector_cross(vector_sub(b, a), vector_sub(c, a));
+            let length = vector_dot(n, n).sqrt();
+            let n = n.map(|v| v / length);
+            let plane = Quadric::plane([n[0], n[1], n[2], -vector_dot(n, a)]);
+            for &v in triangle {
+                q[v as usize] = q[v as usize].add(plane);
+            }
+        }
+        q
+    }
+
+    fn qem_wrong(mut q: Quadric) -> Quadric {
+        for i in [1, 2, 3, 5, 6, 8] {
+            q.0[i] *= 0.5;
+        }
+        q
+    }
+
+    fn qem_float(
+        name: &str,
+        actual: &[f64],
+        expected: &[f64],
+        control: &[f64],
+        field: &serde_json::Value,
+    ) -> Result<usize> {
+        ensure!(
+            actual.len() == expected.len() && actual.len() == control.len() && !actual.is_empty(),
+            "quadric field extent mismatch"
+        );
+        ensure!(
+            actual
+                .iter()
+                .chain(expected)
+                .chain(control)
+                .all(|v| v.is_finite()),
+            "nonfinite quadric field"
+        );
+        let stats = |values: &[f64]| {
+            let delta: Vec<_> = values
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| (a - b).abs())
+                .collect();
+            [
+                delta.iter().copied().fold(0.0, f64::max),
+                (delta.iter().map(|v| v * v).sum::<f64>() / delta.len() as f64).sqrt(),
+            ]
+        };
+        let error = stats(actual);
+        let bad = stats(control);
+        let tau = [
+            field["tau"]["max_abs"]
+                .as_f64()
+                .context("QEM max floor missing")?,
+            field["tau"]["RMS"]
+                .as_f64()
+                .context("QEM RMS floor missing")?,
+        ];
+        ensure!(
+            (0..2).all(|i| bad[i] > 10.0 * tau[i]),
+            "QEM control does not discriminate {name}"
+        );
+        let defects = usize::from((0..2).any(|i| error[i] > tau[i]));
+        println!(
+            "N5_M6_QEM_FLOAT cell={name} max_abs={} RMS={} control_max_multiple={} control_RMS_multiple={} defects={defects}",
+            error[0],
+            error[1],
+            bad[0] / tau[0],
+            bad[1] / tau[1]
+        );
+        Ok(defects)
+    }
+
+    fn qem_reference() -> Result<(std::path::PathBuf, serde_json::Value)> {
+        let root = std::path::PathBuf::from(
+            std::env::var("FF_HI3D_QEM_REFERENCE").context("FF_HI3D_QEM_REFERENCE required")?,
+        );
+        let frozen = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        Ok((root, frozen))
+    }
+
+    #[test]
+    #[ignore]
+    fn sparse_mesh_qem_definition_cpu() -> Result<()> {
+        let (root, frozen) = qem_reference()?;
+        let analytic = &frozen["analytic"];
+        let fields = &analytic["given_edge_math_fields"];
+        let old_file = Path::new(
+            analytic["existing_given_edge_math_floors"]
+                .as_str()
+                .context("operator freeze missing")?,
+        );
+        let old = old_file
+            .parent()
+            .context("operator fixture parent missing")?;
+        let mut cells = 0;
+        let mut defects = 0;
+        for label in ["asymmetric_tetrahedron", "asymmetric_octahedron"] {
+            let name = format!("{label}.initial_quadric");
+            let arm = Path::new(
+                fields[&name]["provenance"][0]
+                    .as_str()
+                    .context("quadric provenance missing")?,
+            )
+            .parent()
+            .context("quadric arm missing")?;
+            let bank = fixture(&old.join(arm).join(format!("{label}-input.safetensors")))?;
+            let p = mesh_values(&bank, "vertices")?;
+            let f = integers(&bank, "faces")?;
+            let mesh = SparseMesh {
+                vertices: p.iter().map(|&x| x as f32).collect(),
+                faces: f,
+            };
+            let state = MeshDecimator::new(&mesh)?;
+            let expected = fixture(
+                &old.join(arm)
+                    .join(format!("{label}-definition-quadrics.safetensors")),
+            )?;
+            let expected = mesh_values(&expected, "quadric_f64")?;
+            let actual: Vec<_> = state
+                .quadrics
+                .iter()
+                .copied()
+                .flat_map(full_quadric)
+                .collect();
+            let control: Vec<_> = state
+                .quadrics
+                .iter()
+                .copied()
+                .map(qem_wrong)
+                .flat_map(full_quadric)
+                .collect();
+            defects += qem_float(&name, &actual, &expected, &control, &fields[&name])?;
+            cells += 1;
+            let records: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                old.join(arm).join("FRESH_COLLAPSE_ASSOCIATION.json"),
+            )?)?;
+            let name = format!("{label}.fresh_position_given_edge");
+            let mut actual = Vec::new();
+            let mut expected = Vec::new();
+            let mut control = Vec::new();
+            for row in records.as_array().context("fresh edge records missing")? {
+                if row["case"].as_str() != Some(label) {
+                    continue;
+                }
+                let ids = row["inferred_lost_vertices"]
+                    .as_array()
+                    .context("source edge missing")?;
+                let q = state.quadrics[ids[0].as_u64().context("source vertex missing")? as usize]
+                    .add(
+                        state.quadrics[ids[1].as_u64().context("source vertex missing")? as usize],
+                    );
+                actual.extend(q.stationary().context("fresh edge matrix singular")?);
+                control.extend(
+                    qem_wrong(q)
+                        .stationary()
+                        .context("control matrix singular")?,
+                );
+                expected.extend(
+                    row["publisher_position"]
+                        .as_array()
+                        .context("publisher position missing")?
+                        .iter()
+                        .map(|v| v.as_f64().unwrap()),
+                );
+            }
+            defects += qem_float(&name, &actual, &expected, &control, &fields[&name])?;
+            cells += 1;
+        }
+        let prefix = Path::new(
+            fields["prefix1.position_given_edge"]["provenance"][0]
+                .as_str()
+                .context("prefix provenance missing")?,
+        )
+        .parent()
+        .context("prefix arm missing")?;
+        let first = fixture(&old.join(prefix).join("step-001.safetensors"))?;
+        let points = mesh_values(&first, "vertices")?;
+        let faces = integers(&first, "faces")?;
+        let mut q = qem_initial(points.as_chunks::<3>().0, faces.as_chunks::<3>().0);
+        for step in 1..=40 {
+            let bank = fixture(&old.join(prefix).join(format!("step-{step:03}.safetensors")))?;
+            let name = format!("prefix{step}.quadric_hypothesis");
+            let actual: Vec<_> = q.iter().copied().flat_map(full_quadric).collect();
+            let control: Vec<_> = q
+                .iter()
+                .copied()
+                .map(qem_wrong)
+                .flat_map(full_quadric)
+                .collect();
+            defects += qem_float(
+                &name,
+                &actual,
+                &mesh_values(&bank, "accumulated_quadric_hypothesis")?,
+                &control,
+                &fields[&name],
+            )?;
+            let ids = integers(&bank, "source_edge")?;
+            ensure!(ids.len() == 2, "prescribed edge extent differs");
+            let merged = q[ids[0] as usize].add(q[ids[1] as usize]);
+            let name = format!("prefix{step}.position_given_edge");
+            defects += qem_float(
+                &name,
+                &merged.stationary().context("prefix matrix singular")?,
+                &mesh_values(&bank, "publisher_position")?,
+                &qem_wrong(merged)
+                    .stationary()
+                    .context("prefix control matrix singular")?,
+                &fields[&name],
+            )?;
+            let points = mesh_values(&bank, "vertices")?;
+            let points = points.as_chunks::<3>().0;
+            let next = mesh_values(&bank, "next_vertices")?;
+            q = next
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| {
+                    points
+                        .iter()
+                        .position(|old| old == p)
+                        .map_or(merged, |i| q[i])
+                })
+                .collect();
+            cells += 2;
+        }
+        let exact = fixture(
+            &root.join(
+                analytic["exact_new"]
+                    .as_str()
+                    .context("exact analytic fixture missing")?,
+            ),
+        )?;
+        let planes = mesh_values(&exact, "planes")?;
+        let q = planes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .fold(Quadric::default(), |q, &p| q.add(Quadric::plane(p)));
+        ensure!(
+            full_quadric(q).as_slice() == mesh_values(&exact, "summed_quadric")?,
+            "axis-plane quadric differs"
+        );
+        let point = q.stationary().context("axis matrix singular")?;
+        ensure!(
+            point.as_slice() == mesh_values(&exact, "expected_point")? && q.energy(point) == 0.0,
+            "axis minimizer differs"
+        );
+        let wrong = qem_wrong(q).stationary().context("axis control singular")?;
+        ensure!(q.energy(wrong) == 3.5, "cross-term control not detected");
+        let segment = mesh_values(&exact, "segment")?;
+        let singular = Quadric::plane([0.0, 0.0, 1.0, -2.0]);
+        ensure!(
+            singular.stationary().is_none()
+                && singular
+                    .segment(segment[..3].try_into()?, segment[3..].try_into()?)
+                    .as_slice()
+                    == mesh_values(&exact, "segment_minimizer")?,
+            "singular segment minimizer differs"
+        );
+        let flat = mesh_values(&exact, "flat_segment")?;
+        for t in [0.0, 0.5, 1.0] {
+            ensure!(
+                singular.energy(std::array::from_fn(
+                    |i| flat[i] + t * (flat[i + 3] - flat[i])
+                )) == 0.0,
+                "flat minimizer not stationary"
+            );
+        }
+        ensure!(cells == 84, "analytic cell coverage differs");
+        println!(
+            "{} N5_M6_QEM_MATH cells={cells} defects={defects} prescribed_edges=40 control=half_cross_terms timing=false",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "quadric arithmetic defects");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn sparse_mesh_qem_production_cpu() -> Result<()> {
+        let (root, frozen) = qem_reference()?;
+        let case = std::env::var("FF_HI3D_QEM_CASE").context("FF_HI3D_QEM_CASE required")?;
+        let cell = &frozen["cases"][&case];
+        let source = fixture(&root.join(cell["D"].as_str().context("QEM source missing")?))?;
+        let mut mesh = SparseMesh {
+            vertices: mesh_values(&source, "vertices")?
+                .into_iter()
+                .map(|v| v as f32)
+                .collect(),
+            faces: integers(&source, "faces")?,
+        };
+        let target = cell["target_faces"]
+            .as_u64()
+            .context("target face count missing")? as usize;
+        let (ancestry, original_vertices) = mesh.simplify(target)?;
+        let output = std::path::PathBuf::from(
+            std::env::var("FF_HI3D_QEM_OUTPUT").context("FF_HI3D_QEM_OUTPUT required")?,
+        );
+        std::fs::create_dir(&output)?;
+        let arrays = BTreeMap::from([
+            (
+                "vertices",
+                (
+                    safetensors::Dtype::F32,
+                    vec![mesh.vertices.len() / 3, 3],
+                    mesh.vertices
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            (
+                "faces",
+                (
+                    safetensors::Dtype::I32,
+                    vec![mesh.faces.len() / 3, 3],
+                    mesh.faces
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            (
+                "original_faces",
+                (
+                    safetensors::Dtype::I64,
+                    vec![ancestry.len()],
+                    ancestry
+                        .iter()
+                        .flat_map(|&v| (v as i64).to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            (
+                "original_vertices",
+                (
+                    safetensors::Dtype::I64,
+                    vec![original_vertices.len()],
+                    original_vertices
+                        .iter()
+                        .flat_map(|&v| (v as i64).to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        ]);
+        let views = arrays
+            .iter()
+            .map(|(&name, (dtype, shape, data))| {
+                Ok((
+                    name,
+                    safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        safetensors::tensor::serialize_to_file(views, None, &output.join("native.safetensors"))?;
+        println!(
+            "PASS N5_M6_QEM_CAPTURE case={case} vertices={} faces={} target={target} ancestry={} timing=false",
+            mesh.vertices.len() / 3,
+            mesh.faces.len() / 3,
+            ancestry.len()
+        );
+        Ok(())
+    }
 
     fn integers(bank: &MappedCheckpoint, key: &str) -> Result<Vec<i32>> {
         let t = bank.tensor(key)?;
