@@ -1057,14 +1057,15 @@ mod tests {
         let mut pass =
             mesh.faces == integers(&bank, "filtered_faces")? && mesh.vertices == expected_vertices;
         if source_key == "vertices" {
+            let expected_selected = integers(&bank, "selected_face_ids")?;
             pass &= selected
-                == integers(&bank, "selected_face_ids")?
+                == expected_selected
                     .iter()
                     .map(|&v| v as usize)
                     .collect::<Vec<_>>();
             let control = integers(&bank, "vertex_control_face_ids")?;
             ensure!(
-                control.len() == selected.len() + 4,
+                control.len() == expected_selected.len() + 4,
                 "shared-vertex control does not discriminate"
             );
         }
@@ -1120,26 +1121,63 @@ mod tests {
             );
             mesh.faces = original;
             mesh.faces.extend(expected_fill);
+            let filled_faces = mesh.faces.clone();
             let (selected, used) = mesh.filter_components(0.005)?;
             let expected = fixture(&root.join(&arm).join("filter-maps.safetensors"))?;
+            let expected_selected = integers(&expected, "selected_filled_face_ids")?;
+            let expected_used = integers(&expected, "used_original_vertex_ids")?;
+            let raw_vertices = raw.tensor("vertices")?;
+            let vertices_exact = mesh.vertices.len() == 3 * expected_used.len()
+                && mesh
+                    .vertices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(&expected_used)
+                    .all(|(point, &original)| {
+                        (0..3).all(|axis| {
+                            let offset = 4 * (3 * original as usize + axis);
+                            point[axis]
+                                == f32::from_le_bytes(
+                                    raw_vertices.data()[offset..offset + 4].try_into().unwrap(),
+                                )
+                        })
+                    });
+            let faces_exact = mesh.faces.len() == 3 * expected_selected.len()
+                && mesh
+                    .faces
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(&expected_selected)
+                    .all(|(triangle, &original)| {
+                        (0..3).all(|axis| {
+                            triangle[axis] >= 0
+                                && expected_used.get(triangle[axis] as usize)
+                                    == Some(&filled_faces[3 * original as usize + axis])
+                        })
+                    });
             let exact = selected
-                == integers(&expected, "selected_filled_face_ids")?
+                == expected_selected
                     .iter()
                     .map(|&v| v as usize)
                     .collect::<Vec<_>>()
                 && used
-                    == integers(&expected, "used_original_vertex_ids")?
+                    == expected_used
                         .iter()
                         .map(|&v| v as usize)
-                        .collect::<Vec<_>>();
+                        .collect::<Vec<_>>()
+                && vertices_exact
+                && faces_exact;
             defects += usize::from(!exact);
             records += 1;
             println!(
-                "{} N5_M6_FINAL_COMPONENTS case={case} vertices={} faces={} exact_maps={exact} common_filled_input=true",
+                "{} N5_M6_FINAL_COMPONENTS case={case} vertices={} faces={} exact_maps={exact} complete_vertices={vertices_exact} complete_faces={faces_exact} common_filled_input=true",
                 if exact { "PASS" } else { "DEFECT" },
                 mesh.vertices.len() / 3,
                 mesh.faces.len() / 3
             );
+            drop(filled_faces);
             drop(mesh);
             let bounds = &frozen["float_cells"][format!("{case}.normalize")]["tau"];
             defects += usize::from(!compare_normalization(
