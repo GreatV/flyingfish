@@ -2955,16 +2955,33 @@ mod tests {
         status
     }
 
-    fn arm(actual: &[f32], expected: &[f32], bar: &GateBar) -> Result<bool> {
+    fn arm(actual: &[f32], expected: &[f32], bar: &GateBar) -> Result<GateStatus> {
         let (max_abs, rmse) = difference(actual, expected)?;
-        Ok(report(bar, max_abs, rmse) != GateStatus::Pass)
+        Ok(report(bar, max_abs, rmse))
+    }
+
+    fn record(status: GateStatus, defect: &mut bool, protocol: &mut bool) {
+        match status {
+            GateStatus::Pass => {}
+            GateStatus::Defect => *defect = true,
+            GateStatus::ProtocolFail => *protocol = true,
+        }
+    }
+
+    fn finish_gate(defect: bool, protocol: bool) -> Result<()> {
+        match (defect, protocol) {
+            (false, false) => Ok(()),
+            (true, false) => bail!("candidate DEFECT"),
+            (false, true) => bail!("protocol FAIL"),
+            (true, true) => bail!("candidate DEFECT\nprotocol FAIL"),
+        }
     }
 
     #[test]
     fn nominal_defect_fails_the_candidate() -> Result<()> {
         let row = [1.0f32];
         let zero = [0.0f32];
-        let defect = GateBar {
+        let over = GateBar {
             tensor: "probe",
             plant: "nominal",
             source: "probe",
@@ -2973,7 +2990,13 @@ mod tests {
             nominal: true,
             rmse_detect: false,
         };
-        ensure!(arm(&row, &zero, &defect)?, "nominal defect");
+        let mut defect = false;
+        let mut protocol = false;
+        record(arm(&row, &zero, &over)?, &mut defect, &mut protocol);
+        match finish_gate(defect, protocol) {
+            Ok(()) => bail!("nominal defect"),
+            Err(err) => ensure!(err.to_string() == "candidate DEFECT", "candidate DEFECT"),
+        }
         let inside = GateBar {
             tensor: "probe",
             plant: "nominal",
@@ -2983,7 +3006,10 @@ mod tests {
             nominal: true,
             rmse_detect: false,
         };
-        ensure!(!arm(&row, &zero, &inside)?, "nominal inside tau");
+        defect = false;
+        protocol = false;
+        record(arm(&row, &zero, &inside)?, &mut defect, &mut protocol);
+        finish_gate(defect, protocol)?;
         let miss = GateBar {
             tensor: "probe",
             plant: "probe",
@@ -2993,7 +3019,13 @@ mod tests {
             nominal: false,
             rmse_detect: false,
         };
-        ensure!(arm(&row, &zero, &miss)?, "control miss");
+        defect = false;
+        protocol = false;
+        record(arm(&row, &zero, &miss)?, &mut defect, &mut protocol);
+        match finish_gate(defect, protocol) {
+            Ok(()) => bail!("control miss"),
+            Err(err) => ensure!(err.to_string() == "protocol FAIL", "protocol FAIL"),
+        }
         Ok(())
     }
 
@@ -3087,59 +3119,100 @@ mod tests {
         let runtime = RuntimeDir::create()?;
         let mut model = super::Breeze::load(&weights, &runtime.0)?;
         println!("weight_bytes={}", model.weight_bytes);
-        let mut failed = false;
-        failed |= arm(
-            &model.text(&short_text, super::TextPlant::Nominal)?,
-            &short_projected,
-            &SHORT_NOMINAL,
-        )?;
-        failed |= arm(
-            &model.text(&short_text, super::TextPlant::RopeOmitted)?,
-            &short_projected,
-            &SHORT_ROPE,
-        )?;
-        failed |= arm(
-            &model.text(&long_text, super::TextPlant::Nominal)?,
-            &long_projected,
-            &LONG_NOMINAL,
-        )?;
-        failed |= arm(
-            &model.sliding_layer(&slide_input, super::TextPlant::Nominal)?,
-            &slide_hidden,
-            &SLIDE_NOMINAL,
-        )?;
-        failed |= arm(
-            &model.sliding_layer(&signal_input, super::TextPlant::Nominal)?,
-            &signal_hidden,
-            &SIGNAL_NOMINAL,
-        )?;
-        failed |= arm(
-            &model.sliding_layer(&signal_input, super::TextPlant::WindowIgnored)?,
-            &signal_hidden,
-            &SIGNAL_IGNORED,
-        )?;
-        failed |= arm(
-            &model.backbone(&forced_projected, &positions, &long.codes, false)?,
-            &forced_backbone,
-            &FORCED_BB_NOMINAL,
-        )?;
-        failed |= arm(
-            &model.backbone(&forced_projected, &positions, &long.codes, true)?,
-            &forced_backbone,
-            &FORCED_BB_AUDIO,
-        )?;
-        failed |= arm(
-            &model.depth(&cond, &depth_ids, long.audio.len(), false)?,
-            &forced_depth,
-            &FORCED_DP_NOMINAL,
-        )?;
-        failed |= arm(
-            &model.depth(&cond, &depth_ids, long.audio.len(), true)?,
-            &forced_depth,
-            &FORCED_DP_HEAD,
-        )?;
+        let mut defect = false;
+        let mut protocol = false;
+        record(
+            arm(
+                &model.text(&short_text, super::TextPlant::Nominal)?,
+                &short_projected,
+                &SHORT_NOMINAL,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.text(&short_text, super::TextPlant::RopeOmitted)?,
+                &short_projected,
+                &SHORT_ROPE,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.text(&long_text, super::TextPlant::Nominal)?,
+                &long_projected,
+                &LONG_NOMINAL,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.sliding_layer(&slide_input, super::TextPlant::Nominal)?,
+                &slide_hidden,
+                &SLIDE_NOMINAL,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.sliding_layer(&signal_input, super::TextPlant::Nominal)?,
+                &signal_hidden,
+                &SIGNAL_NOMINAL,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.sliding_layer(&signal_input, super::TextPlant::WindowIgnored)?,
+                &signal_hidden,
+                &SIGNAL_IGNORED,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.backbone(&forced_projected, &positions, &long.codes, false)?,
+                &forced_backbone,
+                &FORCED_BB_NOMINAL,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.backbone(&forced_projected, &positions, &long.codes, true)?,
+                &forced_backbone,
+                &FORCED_BB_AUDIO,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.depth(&cond, &depth_ids, long.audio.len(), false)?,
+                &forced_depth,
+                &FORCED_DP_NOMINAL,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
+        record(
+            arm(
+                &model.depth(&cond, &depth_ids, long.audio.len(), true)?,
+                &forced_depth,
+                &FORCED_DP_HEAD,
+            )?,
+            &mut defect,
+            &mut protocol,
+        );
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        ensure!(!failed, "gate FAIL");
+        finish_gate(defect, protocol)?;
         Ok(())
     }
 }
