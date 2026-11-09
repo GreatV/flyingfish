@@ -294,7 +294,15 @@ unsafe fn copy_kv<const D: usize, const L: usize, const MASK: bool>(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 0, 256, false>(p, p.start + p.rows, 0, 0, 0.0625, core::ptr::null(), 0);
+        attention::<256, 32, 0, 256, false>(
+            p,
+            p.start + p.rows,
+            0,
+            0,
+            0.0625,
+            core::ptr::null(),
+            0,
+        );
     }
 }
 
@@ -435,7 +443,15 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16(
     scale: f32,
 ) {
     unsafe {
-        attention::<64, 8, 1, 16, true>(resolve_position(p), keys, 0, 0, scale, core::ptr::null(), 0);
+        attention::<64, 8, 1, 16, true>(
+            resolve_position(p),
+            keys,
+            0,
+            0,
+            scale,
+            core::ptr::null(),
+            0,
+        );
     }
 }
 
