@@ -274,6 +274,7 @@ impl CanarySpec {
                 "subsampling.layers.5",
             ],
             pointwise_names: ["subsampling.layers.3", "subsampling.layers.6"],
+            linear_name: "subsampling.linear",
         }
     }
 

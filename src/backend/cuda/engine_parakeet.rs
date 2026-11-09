@@ -31,11 +31,11 @@ macro_rules! note_launch {
     };
 }
 
-struct Linear {
-    weight: CudaSlice<f32>,
-    bias: Option<CudaSlice<f32>>,
-    output: u32,
-    input: u32,
+pub(crate) struct Linear {
+    pub(crate) weight: CudaSlice<f32>,
+    pub(crate) bias: Option<CudaSlice<f32>>,
+    pub(crate) output: u32,
+    pub(crate) input: u32,
 }
 
 struct Norm {
@@ -90,42 +90,42 @@ struct Subsample {
     pointwise: [Linear; 2],
 }
 
-struct Ops {
-    conv2d: CudaFunction,
-    mask_time: CudaFunction,
-    pack: CudaFunction,
+pub(crate) struct Ops {
+    pub(crate) conv2d: CudaFunction,
+    pub(crate) mask_time: CudaFunction,
+    pub(crate) pack: CudaFunction,
     depthwise: CudaFunction,
     batch_norm: CudaFunction,
-    residual: CudaFunction,
+    pub(crate) residual: CudaFunction,
     relative_attention: CudaFunction,
-    lstm: CudaFunction,
-    activation: CudaFunction,
-    bias: CudaFunction,
+    pub(crate) lstm: CudaFunction,
+    pub(crate) activation: CudaFunction,
+    pub(crate) bias: CudaFunction,
     layer_norm: CudaFunction,
-    argmax: CudaFunction,
+    pub(crate) argmax: CudaFunction,
 }
 
 pub struct ParakeetEncoder {
     conformer: FastConformer,
-    stream: Arc<CudaStream>,
+    pub(crate) stream: Arc<CudaStream>,
     subsample: Subsample,
     subsample_linear: Linear,
     blas: CudaBlas,
     blocks: Vec<Block>,
-    ops: Ops,
+    pub(crate) ops: Ops,
     #[cfg(test)]
     encode_calls: AtomicU64,
 }
 
-struct LstmLayer {
-    input: Linear,
-    recurrent: Linear,
-    bias_ih: CudaSlice<f32>,
-    bias_hh: CudaSlice<f32>,
-    hidden: CudaSlice<f32>,
-    cell: CudaSlice<f32>,
-    input_gates: CudaSlice<f32>,
-    recurrent_gates: CudaSlice<f32>,
+pub(crate) struct LstmLayer {
+    pub(crate) input: Linear,
+    pub(crate) recurrent: Linear,
+    pub(crate) bias_ih: CudaSlice<f32>,
+    pub(crate) bias_hh: CudaSlice<f32>,
+    pub(crate) hidden: CudaSlice<f32>,
+    pub(crate) cell: CudaSlice<f32>,
+    pub(crate) input_gates: CudaSlice<f32>,
+    pub(crate) recurrent_gates: CudaSlice<f32>,
 }
 
 pub struct TdtTrajectory {
@@ -162,7 +162,7 @@ struct SubsampleOutput {
     valid: usize,
 }
 
-fn tensor(
+pub(crate) fn tensor(
     checkpoint: &MappedCheckpoint,
     stream: &Arc<CudaStream>,
     name: &str,
@@ -176,7 +176,7 @@ fn tensor(
     Ok(stream.clone_htod(&values)?)
 }
 
-fn linear(
+pub(crate) fn linear(
     checkpoint: &MappedCheckpoint,
     stream: &Arc<CudaStream>,
     name: &str,
@@ -497,6 +497,21 @@ impl ParakeetEncoder {
         conformer: &FastConformer,
     ) -> Result<Self> {
         let checkpoint = MappedCheckpoint::open(directory)?;
+        Self::load_conformer_checkpoint(checkpoint, device, conformer)
+    }
+
+    /// Loads the EOU encoder from the stored-ZIP member of a `.nemo` tar archive.
+    pub fn load_eou(nemo: &Path, device: &Device) -> Result<Self> {
+        let spec = crate::eou::EouSpec::read(nemo)?;
+        let checkpoint = MappedCheckpoint::open_nemo(nemo)?;
+        Self::load_conformer_checkpoint(checkpoint, device, &spec.conformer())
+    }
+
+    fn load_conformer_checkpoint(
+        checkpoint: MappedCheckpoint,
+        device: &Device,
+        conformer: &FastConformer,
+    ) -> Result<Self> {
         let root = conformer.prefix;
         let stream = Arc::clone(&device.stream);
         let blas = CudaBlas::new(Arc::clone(&stream))?;
@@ -552,8 +567,8 @@ impl ParakeetEncoder {
         let subsample_linear = linear(
             &checkpoint,
             &stream,
-            &format!("{root}.subsampling.linear"),
-            1024,
+            &format!("{root}.{}", conformer.linear_name),
+            conformer.hidden,
             conformer.linear_in,
             true,
         )?;
@@ -710,7 +725,7 @@ impl ParakeetEncoder {
         })
     }
 
-    fn linear(&self, input: &CudaSlice<f32>, rows: u32, weight: &Linear) -> Result<CudaSlice<f32>> {
+    pub(crate) fn linear(&self, input: &CudaSlice<f32>, rows: u32, weight: &Linear) -> Result<CudaSlice<f32>> {
         let mut output = self
             .stream
             .alloc_zeros(rows as usize * weight.output as usize)?;
@@ -718,7 +733,7 @@ impl ParakeetEncoder {
         Ok(output)
     }
 
-    fn linear_into(
+    pub(crate) fn linear_into(
         &self,
         input: &CudaSlice<f32>,
         rows: u32,
@@ -790,7 +805,7 @@ impl ParakeetEncoder {
         Ok(output)
     }
 
-    fn activate_into(
+    pub(crate) fn activate_into(
         &self,
         input: &CudaSlice<f32>,
         rows: u32,
@@ -863,7 +878,7 @@ impl ParakeetEncoder {
         Ok(output)
     }
 
-    fn residual(
+    pub(crate) fn residual(
         &self,
         hidden: &mut CudaSlice<f32>,
         delta: &CudaSlice<f32>,

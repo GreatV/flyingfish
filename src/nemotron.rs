@@ -307,6 +307,7 @@ impl NemotronSpec {
                 "subsampling.layers.0.pointwise_conv",
                 "subsampling.layers.1.pointwise_conv",
             ],
+            linear_name: "subsampling.linear",
         })
     }
 

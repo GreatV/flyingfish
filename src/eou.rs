@@ -1,5 +1,8 @@
 //! Parakeet realtime EOU 120m: spec from the .nemo model_config.yaml, read in place.
 
+#[cfg(feature = "cuda")]
+pub use crate::backend::cuda::engine_eou::Eou;
+
 use crate::checkpoint::tar_member_bytes;
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::MmapOptions;
@@ -406,6 +409,47 @@ impl EouSpec {
             joint_hidden: u32_of(jointnet, "joint_hidden")?,
             num_classes: u32_of(joint, "num_classes")?,
         })
+    }
+
+    pub fn conformer(&self) -> crate::parakeet::FastConformer {
+        crate::parakeet::FastConformer {
+            layers: self.n_layers,
+            hidden: self.d_model,
+            heads: self.n_heads,
+            conv_kernel: self.conv_kernel_size,
+            attention_bias: false,
+            convolution_bias: true,
+            prefix: "encoder",
+            max_position: self.pos_emb_max_len,
+            conv_batch_norm: true,
+            pad_left: 2,
+            pad_right: 1,
+            depthwise_left: self.conv_kernel_size - 1,
+            // 256 channels times 128/8 + 1 subsampled rows = 4352
+            linear_in: 4352,
+            chunk_size: 1,
+            left_chunks: self.att_left,
+            conv_names: [
+                "pre_encode.conv.0",
+                "pre_encode.conv.2",
+                "pre_encode.conv.5",
+            ],
+            pointwise_names: ["pre_encode.conv.3", "pre_encode.conv.6"],
+            linear_name: "pre_encode.out",
+        }
+    }
+
+    pub fn mel(&self) -> crate::audio::LogMelConfig {
+        crate::audio::LogMelConfig {
+            sampling_rate: self.sample_rate,
+            n_fft: self.n_fft,
+            win_length: (self.window_size * f64::from(self.sample_rate)) as u32,
+            hop_length: (self.window_stride * f64::from(self.sample_rate)) as u32,
+            mel_bins: self.features,
+            preemphasis: 0.97,
+            log_guard: 2.0f32.powi(-24),
+            norm_eps: 1e-5,
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
