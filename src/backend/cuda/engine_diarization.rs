@@ -364,6 +364,16 @@ fn stack_features(
     Ok(output)
 }
 
+fn require_prefix_mask(mask: &[bool]) -> Result<()> {
+    if let Some(hole) = mask.iter().position(|flag| !flag) {
+        ensure!(
+            mask[hole..].iter().all(|flag| !flag),
+            "diarization mask is not a padding prefix: first hole at frame {hole}"
+        );
+    }
+    Ok(())
+}
+
 fn step_mask(
     mask: &[bool],
     mel_offset: usize,
@@ -1150,6 +1160,7 @@ impl Diarization {
             features.len().is_multiple_of(mel_bins) && mask.len() == feature_frames,
             "diarization offline features"
         );
+        require_prefix_mask(mask)?;
         let num_embeds = feature_frames.div_ceil(factor);
         self.grow_input_capacity(num_embeds)?;
         let full_features = stack_features(features, 0, num_embeds, mel_bins, factor)?;
@@ -1228,6 +1239,7 @@ impl Diarization {
             features.len().is_multiple_of(mel_bins) && mask.len() == feature_frames,
             "diarization streaming features"
         );
+        require_prefix_mask(mask)?;
         let num_embeds = feature_frames.div_ceil(factor);
         let lookahead = if last { 0 } else { config.right as usize };
         ensure!(num_embeds > lookahead, "diarization streaming lookahead");
@@ -1762,6 +1774,20 @@ mod tests {
     }
 
     #[test]
+    fn diarization_rejects_non_prefix_masks() -> Result<()> {
+        let holed: Vec<bool> = (0..64).map(|frame| frame != 20).collect();
+        let error = require_prefix_mask(&holed).expect_err("interior-hole mask accepted");
+        ensure!(
+            error.to_string().contains("first hole at frame 20"),
+            "diarization mask error does not name the first hole: {error}"
+        );
+        let padded: Vec<bool> = (0..64).map(|frame| frame < 50).collect();
+        require_prefix_mask(&padded)?;
+        require_prefix_mask(&[true; 64])?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires GPU lease and external fixtures"]
     fn diarization_encoder_and_head_match_frozen_reference() -> Result<()> {
         let model = PathBuf::from(
@@ -2113,7 +2139,8 @@ mod tests {
                 *value = signal as f32 / 37.0 - 0.5;
             }
         }
-        let mask: Vec<bool> = (0..long_frames).map(|frame| frame % 41 != 0).collect();
+        // padding prefix: 40,000 valid frames plus a 7-frame padded tail
+        let mask: Vec<bool> = (0..long_frames).map(|frame| frame < 40_000).collect();
         let short_features = features[..short_frames * mel_bins].to_vec();
         let short_mask = mask[..short_frames].to_vec();
         let first_window = config.frames as usize * factor * speakers;
