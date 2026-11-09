@@ -602,43 +602,6 @@ pub struct SpanMean<'a> {
     pub width: usize,
 }
 
-// When set, the attention projection stages dump their tensors (defect
-// localization only).
-#[cfg(test)]
-thread_local! {
-    static JOINT_MHA_DUMP: std::cell::RefCell<Option<std::path::PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-    static JOINT_MHA_CALL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Points the attention-stage dumps at a directory; None disables them.
-#[cfg(test)]
-pub fn set_joint_mha_dump(dir: Option<std::path::PathBuf>) {
-    JOINT_MHA_DUMP.with(|d| *d.borrow_mut() = dir);
-    JOINT_MHA_CALL.with(|c| c.set(0));
-}
-
-#[cfg(test)]
-fn dump_mha(stage: &str, x: &CudaSlice<bf16>, stream: &Arc<CudaStream>) -> Result<()> {
-    let Some(dir) = JOINT_MHA_DUMP.with(|d| d.borrow().clone()) else {
-        return Ok(());
-    };
-    let call = JOINT_MHA_CALL.with(|c| c.get());
-    let host = stream.clone_dtoh(x)?;
-    let bytes: Vec<u8> = host
-        .iter()
-        .flat_map(|v| v.to_bits().to_le_bytes())
-        .collect();
-    std::fs::write(
-        std::path::Path::new(&dir).join(format!("mha{call:02}_{stage}.raw")),
-        bytes,
-    )?;
-    if stage == "attnout" {
-        JOINT_MHA_CALL.with(|c| c.set(call + 1));
-    }
-    Ok(())
-}
-
 fn flat(n: usize) -> crate::backend::gpu::LaunchConfig {
     crate::backend::gpu::LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
@@ -991,13 +954,7 @@ impl JointRun<'_> {
         } = lane;
         self.blas
             .gemm_bf16(&weights.in_proj, 0..WIDTH, queries, q_proj, rows, WIDTH)?;
-        #[cfg(test)]
-        dump_mha("qin", queries, self.stream)?;
-        #[cfg(test)]
-        dump_mha("kvin", keys_values, self.stream)?;
         self.bias_add(q_proj, &weights.in_bias, 0, WIDTH)?;
-        #[cfg(test)]
-        dump_mha("qproj", q_proj, self.stream)?;
         self.blas.gemm_bf16(
             &weights.in_proj,
             WIDTH..2 * WIDTH,
@@ -1007,8 +964,6 @@ impl JointRun<'_> {
             WIDTH,
         )?;
         self.bias_add(kv_k, &weights.in_bias, WIDTH, WIDTH)?;
-        #[cfg(test)]
-        dump_mha("kv_k", kv_k, self.stream)?;
         self.blas.gemm_bf16(
             &weights.in_proj,
             2 * WIDTH..3 * WIDTH,
@@ -1037,8 +992,6 @@ impl JointRun<'_> {
                 .arg(&(HEAD_DIM as u32))
                 .launch(flat(keys * WIDTH))?;
         }
-        #[cfg(test)]
-        dump_mha("k_hm", k_hm, self.stream)?;
         flash.run_masked(crate::backend::cuda::flash::Query {
             q: q_proj,
             q_row_stride: WIDTH,
@@ -1059,8 +1012,6 @@ impl JointRun<'_> {
             prefix: None,
             image_blocks: None,
         })?;
-        #[cfg(test)]
-        dump_mha("attnout", attn_out, self.stream)?;
         self.blas
             .gemm_bf16(&weights.out_w, 0..WIDTH, attn_out, out, rows, WIDTH)?;
         self.bias_add(out, &weights.out_b, 0, WIDTH)?;

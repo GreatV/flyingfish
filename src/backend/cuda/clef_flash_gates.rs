@@ -910,11 +910,7 @@ mod gates {
 
         let queries = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "routing_queries")?;
         let memory = joint_bf16_from_f32_file(&forced_dir, "stage_inputs", "memory")?;
-        crate::backend::cuda::joint_schema::set_joint_mha_dump(Some(
-            forced_dir.join("..").join("dump"),
-        ));
         let clean_routing = engine.joint_forced_routing(&mut plan, &queries, &memory)?;
-        crate::backend::cuda::joint_schema::set_joint_mha_dump(None);
         for (index, cell) in [(0usize, "routing0_forced"), (1usize, "routing1_forced")] {
             joint_cell(
                 &mut failures,
