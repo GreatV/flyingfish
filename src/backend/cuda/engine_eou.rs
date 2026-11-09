@@ -563,6 +563,14 @@ impl Eou {
             let step_rows = self
                 .encoder
                 .eou_encode_step(&mut session, &window[..length * mel_bins])?;
+            if step == 125 || step == 250 {
+                let hidden = self.spec.d_model as usize;
+                println!(
+                    "EOU_S3_ENCROWS step={step} r0={:?} r1={:?}",
+                    &step_rows.rows[..4],
+                    &step_rows.rows[hidden..hidden + 4]
+                );
+            }
             let hidden = self.spec.d_model as usize;
             let row: Vec<f32> = step_rows.rows[hidden..2 * hidden].to_vec();
             let device_row = self.encoder.stream.clone_htod(&row)?;
@@ -663,6 +671,28 @@ mod stream_tests {
             &arm.join("inputs/clipA.wav"),
         )?;
         let features = engine.features(&wave)?;
+        {
+            // step-1 enc rows against the frozen cell (post table reversal)
+            let mel_bins = engine.spec.features as usize;
+            let mut session = engine.encoder.eou_stream()?;
+            let mut window = vec![0f32; 25 * mel_bins];
+            window[..9 * mel_bins].copy_from_slice(&features[..9 * mel_bins]);
+            let s0 = engine.encoder.eou_encode_step(&mut session, &window[..9 * mel_bins])?;
+            window[..8 * mel_bins].fill(0.0);
+            window[8 * mel_bins..].copy_from_slice(&features[..17 * mel_bins]);
+            let s1 = engine.encoder.eou_encode_step(&mut session, &window)?;
+            let cell_bytes = std::fs::read(arm.join("CPU-r1/media/clipA.safetensors"))?;
+            let cell_st = SafeTensors::deserialize(&cell_bytes)?;
+            let ref0 = read_f32(&cell_st, "stream_step0_enc_out")?;
+            let ref1 = read_f32(&cell_st, "stream_step1_enc_out")?;
+            let (m0, r0) = metrics(&s0.rows, &ref0);
+            let (m1, r1) = metrics(&s1.rows, &ref1);
+            println!(
+                "EOU_S3_STEP step0 max_abs={m0:e} rmse={r0:e} step1 max_abs={m1:e} rmse={r1:e} s1_head={:?} ref1_head={:?}",
+                &s1.rows[..4],
+                &ref1[..4]
+            );
+        }
         let utterances = engine.stream_decode(&features)?;
         let bytes = std::fs::read(arm.join("CPU-r1/media/clipA.safetensors"))?;
         let st = SafeTensors::deserialize(&bytes)?;
@@ -675,6 +705,9 @@ mod stream_tests {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
+        for (index, tokens) in utterances.iter().enumerate() {
+            println!("EOU_S3_MINE utt={index} tokens={}", tokens.len());
+        }
         ensure!(
             utterances.len() == expected_counts.len(),
             "EOU stream utterances {} against {}",

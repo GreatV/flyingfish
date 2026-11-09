@@ -2606,8 +2606,7 @@ impl ParakeetEncoder {
         let q = self.linear(&normalized, rows, &block.attention.q)?;
         let cached = session.cache_len;
         let key_rows = (cached + rows as usize) as u32;
-        let mut table = self.positions(key_rows as usize)?;
-        table.reverse();
+        let table = self.positions(key_rows as usize)?;
         let table = self.stream.clone_htod(&table)?;
         let relative_rows = 2 * key_rows as usize - 1;
         let relative = self.linear(&table, relative_rows as u32, &block.attention.relative)?;
