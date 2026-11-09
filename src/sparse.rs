@@ -1751,6 +1751,40 @@ mod tests {
         assert!(mesh.simplify(2).is_err());
         assert_eq!(mesh.faces, original);
         assert_eq!(mesh.simplify(4)?.0, vec![0, 1, 2, 3]);
+        let source = SurfaceMesh {
+            points: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            faces: vec![[0, 1, 2]],
+        };
+        let mut candidate = SurfaceMesh {
+            points: source.points[..3].to_vec(),
+            faces: vec![[0, 1, 2]],
+        };
+        assert_eq!(
+            qem_inherited_faces(&source, &candidate, &[0, 1, 2])?,
+            vec![true]
+        );
+        assert_eq!(
+            qem_inherited_faces(&source, &candidate, &[0, 1, 3])?,
+            vec![false]
+        );
+        candidate.points[2][1] = f64::from_bits(1.0f64.to_bits() + 1);
+        assert_eq!(
+            qem_inherited_faces(&source, &candidate, &[0, 1, 2])?,
+            vec![false]
+        );
+        candidate.points = source.points[..3]
+            .iter()
+            .map(|p| [p[0] + 32.0, p[1], p[2]])
+            .collect();
+        assert_eq!(
+            qem_inherited_faces(&source, &candidate, &[0, 1, 2])?,
+            vec![false]
+        );
         Ok(())
     }
 
@@ -2228,7 +2262,7 @@ mod tests {
             Ok(())
         }
 
-        fn queries(&self) -> Result<Vec<[f64; 3]>> {
+        fn queries(&self, mut support: impl FnMut(u32)) -> Result<Vec<[f64; 3]>> {
             let mut total = 0.0;
             let cdf = (0..self.faces.len())
                 .map(|f| {
@@ -2263,12 +2297,59 @@ mod tests {
                 let v = radical(i + 1, 3);
                 let weights = [1.0 - r, r * (1.0 - v), r * v];
                 let t = self.triangle(face as u32);
+                support(face as u32);
                 queries.push(std::array::from_fn(|axis| {
                     t[0][axis] * weights[0] + t[1][axis] * weights[1] + t[2][axis] * weights[2]
                 }));
             }
             Ok(queries)
         }
+    }
+
+    fn qem_inherited_faces(
+        source: &SurfaceMesh,
+        candidate: &SurfaceMesh,
+        original_vertices: &[i32],
+    ) -> Result<Vec<bool>> {
+        ensure!(
+            original_vertices.len() == candidate.points.len()
+                && original_vertices
+                    .iter()
+                    .all(|&v| v >= 0 && (v as usize) < source.points.len()),
+            "inherited triangle vertex mapping invalid"
+        );
+        let canonical =
+            |[a, b, c]: [u32; 3]| [[a, b, c], [b, c, a], [c, a, b]].into_iter().min().unwrap();
+        let mut keys = source
+            .faces
+            .iter()
+            .copied()
+            .map(canonical)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        let unchanged = candidate
+            .points
+            .iter()
+            .zip(original_vertices)
+            .map(|(point, &v)| {
+                point
+                    .iter()
+                    .zip(source.points[v as usize])
+                    .all(|(&a, b)| a.to_bits() == b.to_bits())
+            })
+            .collect::<Vec<_>>();
+        Ok(candidate
+            .faces
+            .iter()
+            .map(|triangle| {
+                triangle.iter().all(|&v| unchanged[v as usize])
+                    && keys
+                        .binary_search(&canonical(
+                            triangle.map(|v| original_vertices[v as usize] as u32),
+                        ))
+                        .is_ok()
+            })
+            .collect())
     }
 
     struct SurfaceNode {
@@ -3025,6 +3106,15 @@ mod tests {
             &std::fs::read(root.join("FROZEN-evaluator.json"))
                 .context("FROZEN-evaluator.json required before re-scoring")?,
         )?;
+        let inherited_freeze: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("FROZEN-evaluator-2.json"))
+                .context("FROZEN-evaluator-2.json required before re-scoring")?,
+        )?;
+        ensure!(
+            inherited_freeze["parent"].as_str().map(Path::new)
+                == Some(root.join("FROZEN-evaluator.json").as_path()),
+            "inherited maximum addendum parent differs"
+        );
         qem_proximity_validity(&root, &frozen)?;
         let case = std::env::var("FF_HI3D_QEM_CASE").context("FF_HI3D_QEM_CASE required")?;
         let cell = &frozen["cases"][&case];
@@ -3041,6 +3131,16 @@ mod tests {
         let bank = fixture(&output.join("native.safetensors"))?;
         let mut defects = qem_structural(&root, cell, &source, &candidate, &bank)?;
         defects += qem_final_normalization(&frozen, &case, &candidate, &bank)?;
+        let inherited =
+            qem_inherited_faces(&source, &candidate, &integers(&bank, "original_vertices")?)?;
+        let mut inherited_vertices = vec![false; candidate.points.len()];
+        for (triangle, &same) in candidate.faces.iter().zip(&inherited) {
+            if same {
+                for &vertex in triangle {
+                    inherited_vertices[vertex as usize] = true;
+                }
+            }
+        }
         drop(bank);
         let frame = &cell["frame"];
         let common = source_path
@@ -3082,18 +3182,31 @@ mod tests {
         for (_, mesh, _) in &mut inputs {
             mesh.frame(frame)?;
         }
+        let mut query_faces = Vec::new();
         for (name, mesh, queries) in &mut outputs {
             mesh.frame(frame)?;
             if *name == "C" {
-                *queries = mesh.queries()?;
+                *queries = mesh.queries(|face| query_faces.push(face))?;
             }
             if *name == "P" {
                 ensure!(
-                    *queries == mesh.queries()?,
+                    *queries == mesh.queries(|_| {})?,
                     "native area-query construction differs from canonical reference"
                 );
             }
         }
+        let raw_max_field = &evaluator["cases"][&case]["fields"]["P->R.max"];
+        let raw_max_bound = raw_max_field["quality_bound"]
+            .as_f64()
+            .context("raw maximum bound missing")?;
+        let raw_max_tau = raw_max_field["tau"]
+            .as_f64()
+            .context("raw maximum floor missing")?;
+        let mut lifted_queries = 0usize;
+        let mut largest_lift = 0.0f64;
+        let mut maximum_unlifted = 0.0f64;
+        let mut inherited_violations = 0usize;
+        let mut changed_violations = 0usize;
         let mut metrics = BTreeMap::new();
         for (name, mesh, _) in &outputs {
             let tree = SurfaceTree::new(mesh);
@@ -3114,7 +3227,32 @@ mod tests {
             );
             let tree = SurfaceTree::new(mesh);
             for (name, source, queries) in &outputs {
-                let error = tree.metrics(&source.points, queries)?;
+                let error = tree.measure(&source.points, queries, |index, distance| {
+                    if *input != "R" || *name != "C" {
+                        return;
+                    }
+                    let same = if index < source.points.len() {
+                        inherited_vertices[index]
+                    } else {
+                        inherited[query_faces[index - source.points.len()] as usize]
+                    };
+                    if distance > raw_max_bound && same {
+                        let point = if index < source.points.len() {
+                            source.points[index]
+                        } else {
+                            queries[index - source.points.len()]
+                        };
+                        let input_distance = tree.distance(point);
+                        assert_eq!(input_distance.to_bits(), distance.to_bits());
+                        let permitted = raw_max_bound.max(input_distance + raw_max_tau);
+                        largest_lift = largest_lift.max(permitted - raw_max_bound);
+                        lifted_queries += 1;
+                        inherited_violations += usize::from(distance > permitted);
+                    } else {
+                        maximum_unlifted = maximum_unlifted.max(distance);
+                        changed_violations += usize::from(distance > raw_max_bound);
+                    }
+                })?;
                 metrics.insert((name.to_string(), format!("P->{input}")), error);
                 println!(
                     "N5_M6_QEM_DISTANCE case={case} arm={name} direction={name}->{input} max={} RMS={}",
@@ -3167,7 +3305,11 @@ mod tests {
                 best_control = best_control.max(control / bound);
                 minimum_control = minimum_control.min(control / bound);
             }
-            let defect = actual > bound;
+            let defect = if key == "P->R.max" {
+                maximum_unlifted > bound || inherited_violations != 0
+            } else {
+                actual > bound
+            };
             defects += usize::from(defect);
             println!(
                 "N5_M6_QEM_SCORE case={case} field={key} value={actual} bound={bound} publisher_native={reference} publisher_frozen={expected} publisher_blackbox={} control_multiple={} defect={defect}",
@@ -3180,7 +3322,9 @@ mod tests {
             best_control > 2.0,
             "realistic degradation control failed frozen detector"
         );
-        let result = serde_json::json!({"case":case,"metric_cells":records.len(),"fields":records,"defects":defects,"minimum_realistic_control_multiple":minimum_control,"best_realistic_control_multiple":best_control,"minimum_translation_certificate_multiple":minimum_translation,"timing":false});
+        let inheritance = serde_json::json!({"inherited_faces":inherited.iter().filter(|&&same|same).count(),"inherited_vertices":inherited_vertices.iter().filter(|&&same|same).count(),"inherited_surface_queries":query_faces.iter().filter(|&&face|inherited[face as usize]).count(),"max_queries_lifted":lifted_queries,"largest_lift":largest_lift,"maximum_unlifted_distance":maximum_unlifted,"changed_query_violations":changed_violations,"inherited_query_violations":inherited_violations,"R_to_C_queries_lifted":0,"RMS_lifted":false});
+        println!("N5_M6_QEM_INHERITED_MAX case={case} {inheritance}");
+        let result = serde_json::json!({"case":case,"metric_cells":records.len(),"fields":records,"defects":defects,"minimum_realistic_control_multiple":minimum_control,"best_realistic_control_multiple":best_control,"minimum_translation_certificate_multiple":minimum_translation,"inherited_max":inheritance,"timing":false});
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
