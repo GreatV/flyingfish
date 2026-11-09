@@ -399,6 +399,75 @@ impl Flash {
         )
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn with_full_single_probability(mut self) -> Result<Self> {
+        ensure!(
+            self.geometry[2] == 128 && self.score.is_none() && self.native.len() == 3,
+            "single-probability attention requires the BF16 D128 full binding"
+        );
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+            let ctx = self.stream.context();
+            let major = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+            let minor = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+            if (major, minor) == (8, 9) {
+                let name = "attention_prefill_d128_bidirectional_single_pv";
+                let module = super::cubin::module(ctx, "attention_native")?;
+                let function = module.load_function(name)?;
+                let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+                let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+                let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+                ensure!(
+                    local == 0 && registers <= 255,
+                    "{name} registers={registers} local={local}"
+                );
+                ensure!(
+                    shared + self.shared as i32
+                        <= ctx
+                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    "single-probability attention shared memory exceeds capacity"
+                );
+                function.set_attribute(
+                    F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    self.shared as i32,
+                )?;
+                let resident = function.occupancy_max_active_blocks_per_multiprocessor(
+                    128,
+                    self.shared as usize,
+                    None,
+                )?;
+                let previous = self.native[1].occupancy_max_active_blocks_per_multiprocessor(
+                    128,
+                    self.shared as usize,
+                    None,
+                )?;
+                ensure!(
+                    resident >= previous && resident > 0,
+                    "single-probability attention occupancy decreased"
+                );
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"attention_probability": {
+                        "symbol":name,"registers":registers,"local_bytes":local,
+                        "dynamic_shared_bytes":self.shared,"resident_blocks":resident,
+                        "previous_resident_blocks":previous
+                    }})
+                );
+                self.native[1] = function;
+            } else {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"attention_probability": {
+                        "symbol":"attention_prefill_d128_bidirectional",
+                        "capability":[major,minor],"form":"residual"
+                    }})
+                );
+            }
+        }
+        Ok(self)
+    }
+
     pub fn new_with_score(
         stream: Arc<CudaStream>,
         rows: usize,
@@ -2838,6 +2907,7 @@ mod tests {
         case: &Case,
         root: &std::path::Path,
         bound: &serde_json::Value,
+        single_probability: bool,
     ) -> Result<usize> {
         let data = std::fs::read(root.join(format!("{}.safetensors", case.name)))?;
         let tensors = safetensors::SafeTensors::deserialize(&data)?;
@@ -2857,6 +2927,10 @@ mod tests {
         let reference_lse = reference_f64(&tensors, "lse")?;
         let mut buffers = case.buffers(stream)?;
         let mut op = case.binding(stream)?;
+        #[cfg(feature = "cuda")]
+        if single_probability {
+            op = op.with_full_single_probability()?;
+        }
         if let Some(split) = &mut op.split {
             let elements = split.workspace.len();
             split.workspace =
@@ -3012,6 +3086,39 @@ mod tests {
                 (&reference, &reference_lse),
                 bound,
             )?;
+        }
+        if single_probability && case.rows == 129 {
+            let original = stream.clone_dtoh(&buffers.q)?;
+            let mut shifted = original.clone();
+            for row in 0..case.rows {
+                let source = (row + 64) % case.rows;
+                shifted[row * case.pitch..(row + 1) * case.pitch]
+                    .copy_from_slice(&original[source * case.pitch..(source + 1) * case.pitch]);
+            }
+            stream.memcpy_htod(&shifted, &mut buffers.q)?;
+            case.run(&mut op, &mut buffers)?;
+            let wrong = stream.clone_dtoh(&buffers.out)?;
+            let values = selected
+                .iter()
+                .flat_map(|&row| {
+                    wrong[row * case.hq * case.d..(row + 1) * case.hq * case.d]
+                        .iter()
+                        .map(|v| v.to_f64())
+                })
+                .collect::<Vec<_>>();
+            let (wrong_max, wrong_rms) = errors(&values, &reference, true)?;
+            let detected = wrong_max > limit("output_max")? || wrong_rms > limit("output_rms")?;
+            ensure!(detected, "single-probability Q-row control not detected");
+            println!(
+                "FFA_SINGLE_PV_CONTROL name={} max={wrong_max:e} rms={wrong_rms:e} detected={detected}",
+                case.name
+            );
+        }
+        if single_probability {
+            println!(
+                "FFA_SINGLE_PV_CELL name={} max={maximum:e} rms={rms:e} lse={lse_error:e} defects={defects}",
+                case.name
+            );
         }
         println!(
             "FFA_HIP_CELL name={} d={} hq={} hkv={} mode={} rows={} start={} max={maximum:e} rms={rms:e} lse={lse_error:e} defects={defects}",
@@ -3564,7 +3671,19 @@ mod tests {
                 format!("{}-{}", case.d, case.mode)
             };
             let bound = &limits["limits"][family];
-            defects += cell(&stream, case, &root, bound)?;
+            defects += cell(&stream, case, &root, bound, false)?;
+            #[cfg(feature = "cuda")]
+            {
+                use cudarc::driver::sys::CUdevice_attribute as A;
+                if case.d == 128
+                    && case.mode == "bidirectional"
+                    && case.scale.is_none()
+                    && ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)? == 8
+                    && ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)? == 9
+                {
+                    defects += cell(&stream, case, &root, bound, true)?;
+                }
+            }
         }
         println!(
             "FFA_HIP_RESULT cells={} defects={defects} frozen_limits=true",
