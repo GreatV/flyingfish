@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod cpu;
 pub mod diarization;
+pub mod eou;
 pub mod dspark;
 pub mod engram;
 pub mod experts;
