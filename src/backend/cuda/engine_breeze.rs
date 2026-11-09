@@ -2957,7 +2957,44 @@ mod tests {
 
     fn arm(actual: &[f32], expected: &[f32], bar: &GateBar) -> Result<bool> {
         let (max_abs, rmse) = difference(actual, expected)?;
-        Ok(report(bar, max_abs, rmse) == GateStatus::ProtocolFail)
+        Ok(report(bar, max_abs, rmse) != GateStatus::Pass)
+    }
+
+    #[test]
+    fn nominal_defect_fails_the_candidate() -> Result<()> {
+        let row = [1.0f32];
+        let zero = [0.0f32];
+        let defect = GateBar {
+            tensor: "probe",
+            plant: "nominal",
+            source: "probe",
+            tau_max: 0.0,
+            tau_rmse: 0.0,
+            nominal: true,
+            rmse_detect: false,
+        };
+        ensure!(arm(&row, &zero, &defect)?, "nominal defect");
+        let inside = GateBar {
+            tensor: "probe",
+            plant: "nominal",
+            source: "probe",
+            tau_max: 1.0,
+            tau_rmse: 1.0,
+            nominal: true,
+            rmse_detect: false,
+        };
+        ensure!(!arm(&row, &zero, &inside)?, "nominal inside tau");
+        let miss = GateBar {
+            tensor: "probe",
+            plant: "probe",
+            source: "probe",
+            tau_max: 100.0,
+            tau_rmse: 100.0,
+            nominal: false,
+            rmse_detect: false,
+        };
+        ensure!(arm(&row, &zero, &miss)?, "control miss");
+        Ok(())
     }
 
     #[test]
@@ -3050,59 +3087,59 @@ mod tests {
         let runtime = RuntimeDir::create()?;
         let mut model = super::Breeze::load(&weights, &runtime.0)?;
         println!("weight_bytes={}", model.weight_bytes);
-        let mut protocol = false;
-        protocol |= arm(
+        let mut failed = false;
+        failed |= arm(
             &model.text(&short_text, super::TextPlant::Nominal)?,
             &short_projected,
             &SHORT_NOMINAL,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.text(&short_text, super::TextPlant::RopeOmitted)?,
             &short_projected,
             &SHORT_ROPE,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.text(&long_text, super::TextPlant::Nominal)?,
             &long_projected,
             &LONG_NOMINAL,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.sliding_layer(&slide_input, super::TextPlant::Nominal)?,
             &slide_hidden,
             &SLIDE_NOMINAL,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.sliding_layer(&signal_input, super::TextPlant::Nominal)?,
             &signal_hidden,
             &SIGNAL_NOMINAL,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.sliding_layer(&signal_input, super::TextPlant::WindowIgnored)?,
             &signal_hidden,
             &SIGNAL_IGNORED,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.backbone(&forced_projected, &positions, &long.codes, false)?,
             &forced_backbone,
             &FORCED_BB_NOMINAL,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.backbone(&forced_projected, &positions, &long.codes, true)?,
             &forced_backbone,
             &FORCED_BB_AUDIO,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.depth(&cond, &depth_ids, long.audio.len(), false)?,
             &forced_depth,
             &FORCED_DP_NOMINAL,
         )?;
-        protocol |= arm(
+        failed |= arm(
             &model.depth(&cond, &depth_ids, long.audio.len(), true)?,
             &forced_depth,
             &FORCED_DP_HEAD,
         )?;
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        ensure!(!protocol, "protocol FAIL");
+        ensure!(!failed, "gate FAIL");
         Ok(())
     }
 }
