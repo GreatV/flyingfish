@@ -2527,3 +2527,305 @@ mod position_tests {
         Ok(())
     }
 }
+
+/// EOU cache-aware streaming session: one encoder row per step under the
+/// chunked_limited [70, 1] window, with hidden-row attention caches and
+/// depthwise conv caches per layer.
+pub struct EouStream {
+    hidden_rows: Vec<CudaSlice<f32>>,
+    depthwise: Vec<CudaSlice<f32>>,
+    cache_len: usize,
+    cumulative: u32,
+    steps: u32,
+    mask: CudaSlice<u8>,
+}
+
+pub struct EouStep {
+    /// The two encoder query rows of this step, `[2, hidden]`.
+    pub rows: Vec<f32>,
+}
+
+impl ParakeetEncoder {
+    pub fn eou_stream(&self) -> Result<EouStream> {
+        let conformer = &self.conformer;
+        ensure!(
+            conformer.chunk_size == 2
+                && conformer.left_chunks == 35
+                && conformer.layers == 17
+                && conformer.hidden == 512
+                && conformer.heads == 8
+                && conformer.conv_kernel == 9
+                && conformer.depthwise_left == 8
+                && !conformer.conv_batch_norm
+                && !conformer.convolution_bias
+                && self.blocks.len() == 17,
+            "EOU streaming session requires the published EOU encoder"
+        );
+        let mut hidden_rows = Vec::with_capacity(17);
+        let mut depthwise = Vec::with_capacity(17);
+        for _ in 0..17 {
+            hidden_rows.push(self.stream.alloc_zeros(0)?);
+            depthwise.push(self.stream.alloc_zeros(8 * 512)?);
+        }
+        Ok(EouStream {
+            hidden_rows,
+            depthwise,
+            cache_len: 0,
+            cumulative: 0,
+            steps: 0,
+            mask: self.stream.clone_htod(&vec![1u8; 72])?,
+        })
+    }
+
+    /// One streaming step: `window` is the mel window (9 frames at step 0,
+    /// 25 frames afterwards = 9 lookback + 16 chunk frames), returning the
+    /// two query rows of this step.
+    #[allow(clippy::too_many_arguments)]
+    fn eou_layer_step(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        session: &EouStream,
+        hidden_cache: &CudaSlice<f32>,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)> {
+        let block = self.blocks.get(index).context("EOU layer outside range")?;
+        let rows = 2u32;
+        let width = self.conformer.hidden as usize;
+        ensure!(input.len() == rows as usize * width, "EOU streaming layer input");
+        let feed_forward =
+            |hidden: &mut CudaSlice<f32>, ff: &FeedForward, scale: f32| -> Result<()> {
+                let normalized = self.normalize(hidden, rows, &ff.norm)?;
+                let expanded = self.linear(&normalized, rows, &ff.up)?;
+                let activated = self.activate(&expanded, rows, width as u32 * 4, 1)?;
+                let delta = self.linear(&activated, rows, &ff.down)?;
+                self.residual(hidden, &delta, scale)
+            };
+        let mut hidden = input.try_clone()?;
+        feed_forward(&mut hidden, &block.ff1, 0.5)?;
+        let normalized = self.normalize(&hidden, rows, &block.attention_norm)?;
+        let q = self.linear(&normalized, rows, &block.attention.q)?;
+        let cached = session.cache_len;
+        let key_rows = (cached + rows as usize) as u32;
+        let table = self.positions(key_rows as usize)?;
+        let table = self.stream.clone_htod(&table)?;
+        let relative_rows = 2 * key_rows as usize - 1;
+        let relative = self.linear(&table, relative_rows as u32, &block.attention.relative)?;
+        let mut keys_input = self
+            .stream
+            .alloc_zeros(key_rows as usize * width)?;
+        self.copy_device(hidden_cache, 0, &mut keys_input, 0, cached * width)?;
+        self.copy_device(&normalized, 0, &mut keys_input, cached * width, rows as usize * width)?;
+        let k = self.linear(&keys_input, key_rows, &block.attention.k)?;
+        let v = self.linear(&keys_input, key_rows, &block.attention.v)?;
+        let core = self.stream.alloc_zeros(hidden.len())?;
+        self.attend(AttentionLaunch {
+            q: &q,
+            k: &k,
+            v: &v,
+            relative: &relative,
+            bias_u: &block.attention.bias_u,
+            bias_v: &block.attention.bias_v,
+            mask: &session.mask,
+            output: &core,
+            rows,
+            key_rows,
+            query_offset: session.cache_len as u32,
+            kv_offset: 0,
+            right_chunks: 0,
+        })?;
+        let delta = self.linear(&core, rows, &block.attention.o)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        let normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
+        let expanded = self.linear(&normalized, rows, &block.convolution.pointwise1)?;
+        let activated = self.activate(&expanded, rows, self.conformer.hidden, 2)?;
+        let launch_rows = if session.steps == 0 {
+            rows
+        } else {
+            (8 + rows) as u32
+        };
+        let convolved = self.stream.alloc_zeros(launch_rows as usize * width)?;
+        if launch_rows == 8 + rows {
+            let mut joined = self.stream.alloc_zeros(launch_rows as usize * width)?;
+            self.copy_device(&session.depthwise[index], 0, &mut joined, 0, 8 * width)?;
+            self.copy_device(&activated, 0, &mut joined, 8 * width, rows as usize * width)?;
+            self.launch_depthwise(
+                &joined,
+                &block.convolution.depthwise,
+                &session.mask,
+                &convolved,
+                launch_rows,
+            )?;
+        } else {
+            self.launch_depthwise(
+                &activated,
+                &block.convolution.depthwise,
+                &session.mask,
+                &convolved,
+                launch_rows,
+            )?;
+        }
+        let kept = if launch_rows == 8 + rows {
+            let mut rows_kept = self.stream.alloc_zeros(rows as usize * width)?;
+            self.copy_device(
+                &convolved,
+                8 * width,
+                &mut rows_kept,
+                0,
+                rows as usize * width,
+            )?;
+            rows_kept
+        } else {
+            convolved
+        };
+        let normalized = self.normalize_pair(
+            &kept,
+            rows,
+            &block.convolution.conv_weight,
+            &block.convolution.conv_bias,
+        )?;
+        let activated = self.activate(&normalized, rows, self.conformer.hidden, 1)?;
+        let delta = self.linear(&activated, rows, &block.convolution.pointwise2)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        feed_forward(&mut hidden, &block.ff2, 0.5)?;
+        let output = self.normalize(&hidden, rows, &block.output_norm)?;
+        Ok((output, normalized, activated))
+    }
+
+    /// Runs one streaming step over the mel window; the returned rows are the
+    /// two query rows `[2, hidden]` (the second is the new row).
+    pub fn eou_encode_step(
+        &self,
+        session: &mut EouStream,
+        window: &[f32],
+    ) -> Result<EouStep> {
+        let width = self.conformer.hidden as usize;
+        ensure!(
+            window.len() == 9 * 128 || window.len() == 25 * 128,
+            "EOU streaming window frames {}",
+            window.len() / 128
+        );
+        ensure!(
+            window.iter().all(|value| value.is_finite()),
+            "EOU streaming window is non-finite"
+        );
+        let frames = window.len() / 128;
+        let subsampled = self.subsample_device(window, frames)?;
+        let raw_rows = subsampled.hidden.len() / width;
+        let drop = if session.steps == 0 { 0 } else { 2 };
+        ensure!(
+            raw_rows == drop + 2,
+            "EOU streaming pre-encode rows {raw_rows} with drop {drop}"
+        );
+        let mut query = self
+            .stream
+            .alloc_zeros(2 * width)?;
+        self.copy_device(
+            &subsampled.hidden,
+            drop * width,
+            &mut query,
+            0,
+            2 * width,
+        )?;
+        let mut hidden = query;
+        let mut next_attention_rows = Vec::with_capacity(17);
+        let mut next_conv_rows = Vec::with_capacity(17);
+        for index in 0..self.blocks.len() {
+            let (output, attention_input, conv_input) =
+                self.eou_layer_step(index, &hidden, session, &session.hidden_rows[index])?;
+            hidden = output;
+            next_attention_rows.push(attention_input);
+            next_conv_rows.push(conv_input);
+        }
+        let rows = self.stream.clone_dtoh(&hidden)?;
+        let keep = (session.cache_len + 1).min(70);
+        for index in 0..self.blocks.len() {
+            let mut cache = self.stream.alloc_zeros(keep * width)?;
+            let combined = session.cache_len + 1;
+            let skip = combined - keep;
+            self.copy_device(
+                &session.hidden_rows[index],
+                skip * width,
+                &mut cache,
+                0,
+                (session.cache_len - skip) * width,
+            )?;
+            self.copy_device(
+                &next_attention_rows[index],
+                0,
+                &mut cache,
+                (keep - 1) * width,
+                width,
+            )?;
+            session.hidden_rows[index] = cache;
+            let mut depthwise = self.stream.alloc_zeros(8 * width)?;
+            if session.steps == 0 {
+                self.copy_device(
+                    &next_conv_rows[index],
+                    0,
+                    &mut depthwise,
+                    7 * width,
+                    width,
+                )?;
+            } else {
+                self.copy_device(
+                    &session.depthwise[index],
+                    width,
+                    &mut depthwise,
+                    0,
+                    7 * width,
+                )?;
+                self.copy_device(
+                    &next_conv_rows[index],
+                    0,
+                    &mut depthwise,
+                    7 * width,
+                    width,
+                )?;
+            }
+            session.depthwise[index] = depthwise;
+        }
+        session.cache_len = keep;
+        session.cumulative += 1;
+        session.steps += 1;
+        Ok(EouStep { rows })
+    }
+
+/// Resets the streaming session after an <EOU>: caches and counters restart.
+    pub fn eou_stream_reset(&self, session: &mut EouStream) -> Result<()> {
+        let width = self.conformer.hidden as usize;
+        for index in 0..session.hidden_rows.len() {
+            session.hidden_rows[index] = self.stream.alloc_zeros(0)?;
+            session.depthwise[index] = self.stream.alloc_zeros(8 * width)?;
+        }
+        session.cache_len = 0;
+        session.cumulative = 0;
+        session.steps = 0;
+        Ok(())
+    }
+}
+
+impl EouStream {
+/// Per-layer hidden-row attention caches and depthwise conv caches as host vectors.
+pub fn dump(
+    &self,
+    stream: &Arc<CudaStream>,
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let mut rows = Vec::with_capacity(self.hidden_rows.len());
+    let mut depthwise = Vec::with_capacity(self.depthwise.len());
+    for cache in &self.hidden_rows {
+        rows.push(stream.clone_dtoh(cache)?);
+    }
+    for cache in &self.depthwise {
+        depthwise.push(stream.clone_dtoh(cache)?);
+    }
+    Ok((rows, depthwise))
+}
+
+pub fn cache_len(&self) -> usize {
+    self.cache_len
+}
+
+pub fn steps(&self) -> u32 {
+    self.steps
+}
+}

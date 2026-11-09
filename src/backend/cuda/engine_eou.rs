@@ -330,6 +330,10 @@ mod tests {
     use anyhow::Context;
     use safetensors::SafeTensors;
 
+    pub(crate) fn read_wave_public(path: &std::path::Path) -> Result<Vec<f32>> {
+        read_wave(path)
+    }
+
     fn read_wave(path: &std::path::Path) -> Result<Vec<f32>> {
         use std::io::Read;
         let mut file = std::fs::File::open(path)?;
@@ -505,6 +509,199 @@ mod tests {
             );
         }
         println!("EOU_S2_DECODE_GATE PASS clips=3 token_ids_exact=true");
+        Ok(())
+    }
+}
+
+impl Eou {
+    /// Streaming greedy RNNT decode at the voice-agent cadence: one encoder row
+    /// per step, hypothesis continuation, full session reset after <EOU>.
+    /// Returns one token vector per utterance (each ends with EOU except
+    /// possibly the last).
+    pub fn stream_decode(&mut self, features: &[f32]) -> Result<Vec<Vec<u32>>> {
+        let mel_bins = self.spec.features as usize;
+        ensure!(
+            !features.is_empty() && features.len().is_multiple_of(mel_bins),
+            "EOU streaming features extent"
+        );
+        let frames = features.len() / mel_bins;
+        let steps = frames / 8 + 1;
+        let mut session = self.encoder.eou_stream()?;
+        self.reset_prediction()?;
+        self.projected = None;
+        let eou_token = self.spec.vocab_size as u32 - 2;
+        let mut utterances: Vec<Vec<u32>> = Vec::new();
+        let mut current: Vec<u32> = Vec::new();
+        let mut window = vec![0f32; 25 * mel_bins];
+        for step in 0..steps {
+            // CacheAwareStreamingAudioBuffer cadence: step 0 consumes 9 frames
+            // and shifts 1; step 1 carries a zero-padded 9-frame pre-encode cache;
+            // later steps shift 8 with the window starting 16 frames before the row.
+            if step == 0 {
+                let stop = 9.min(frames);
+                window[..stop * mel_bins].copy_from_slice(&features[..stop * mel_bins]);
+                window[stop * mel_bins..].fill(0.0);
+            } else if step == 1 {
+                window[..8 * mel_bins].fill(0.0);
+                let stop = 17.min(frames);
+                window[8 * mel_bins..(8 + stop) * mel_bins]
+                    .copy_from_slice(&features[..stop * mel_bins]);
+                window[(8 + stop) * mel_bins..].fill(0.0);
+            } else {
+                let start = 8 * step - 16;
+                for (index, value) in window.iter_mut().enumerate() {
+                    let frame = start + index / mel_bins;
+                    let bin = index % mel_bins;
+                    *value = if frame < frames {
+                        features[frame * mel_bins + bin]
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            let length = if step == 0 { 9 } else { 25 };
+            let step_rows = self
+                .encoder
+                .eou_encode_step(&mut session, &window[..length * mel_bins])?;
+            let hidden = self.spec.d_model as usize;
+            let row: Vec<f32> = step_rows.rows[hidden..2 * hidden].to_vec();
+            let device_row = self.encoder.stream.clone_htod(&row)?;
+            let projected = self.encoder.linear(&device_row, 1, &self.enc_projector)?;
+            self.projected = Some(projected);
+            self.predict(self.blank())?;
+            let mut symbols = 0usize;
+            loop {
+                let selected = self.joint_argmax(0)?;
+                if selected == self.blank() {
+                    break;
+                }
+                current.push(selected);
+                self.predict(selected)?;
+                symbols += 1;
+                if symbols >= MAX_SYMBOLS {
+                    break;
+                }
+            }
+            let _ = length;
+            if current.last() == Some(&eou_token) {
+                utterances.push(std::mem::take(&mut current));
+                self.encoder.eou_stream_reset(&mut session)?;
+                self.reset_prediction()?;
+                self.projected = None;
+            }
+        }
+        if !current.is_empty() {
+            utterances.push(current);
+        }
+        Ok(utterances)
+    }
+}
+
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use anyhow::Context;
+    use safetensors::SafeTensors;
+
+    fn read_f32(st: &SafeTensors, key: &str) -> Result<Vec<f32>> {
+        let tensor = st.tensor(key)?;
+        ensure!(tensor.dtype() == safetensors::Dtype::F32, "tensor {key} dtype");
+        let bytes = tensor.data();
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
+
+    fn read_i64(st: &SafeTensors, key: &str) -> Result<Vec<i64>> {
+        let tensor = st.tensor(key)?;
+        ensure!(tensor.dtype() == safetensors::Dtype::I64, "tensor {key} dtype");
+        let bytes = tensor.data();
+        Ok(bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| {
+                i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect())
+    }
+
+    fn metrics(candidate: &[f32], reference: &[f32]) -> (f64, f64) {
+        assert_eq!(candidate.len(), reference.len());
+        let mut max_abs = 0f64;
+        let mut squares = 0f64;
+        for (left, right) in candidate.iter().zip(reference) {
+            let diff = f64::from(*left) - f64::from(*right);
+            max_abs = max_abs.max(diff.abs());
+            squares += diff * diff;
+        }
+        (max_abs, (squares / candidate.len() as f64).sqrt())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease; set FF_EOU_NEMO, FF_EOU_FROZEN, FF_EOU_ARM"]
+    fn eou_streaming_matches_frozen_reference() -> Result<()> {
+        let nemo = std::path::PathBuf::from(
+            std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?,
+        );
+        let frozen = std::path::PathBuf::from(
+            std::env::var("FF_EOU_FROZEN").context("FF_EOU_FROZEN missing")?,
+        );
+        let arm =
+            std::path::PathBuf::from(std::env::var("FF_EOU_ARM").context("FF_EOU_ARM missing")?);
+        let floors: serde_json::Value = serde_json::from_slice(&std::fs::read(&frozen)?)?;
+        ensure!(floors["status"] == "FROZEN", "reference floors not frozen");
+        let device = Device::new(0)?;
+        let mut engine = Eou::load(&nemo, &device)?;
+        let wave = crate::backend::cuda::engine_eou::tests::read_wave_public(
+            &arm.join("inputs/clipA.wav"),
+        )?;
+        let features = engine.features(&wave)?;
+        let utterances = engine.stream_decode(&features)?;
+        let bytes = std::fs::read(arm.join("CPU-r1/media/clipA.safetensors"))?;
+        let st = SafeTensors::deserialize(&bytes)?;
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            arm.join("CPU-r1/stream-report.json"),
+        )?)?;
+        let expected_counts: Vec<usize> = report["clipA"]["utterance_token_counts"]
+            .as_array()
+            .context("utterance counts")?
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        ensure!(
+            utterances.len() == expected_counts.len(),
+            "EOU stream utterances {} against {}",
+            utterances.len(),
+            expected_counts.len()
+        );
+        for (index, tokens) in utterances.iter().enumerate() {
+            let key = format!("stream_utt{index}_token_ids");
+            let reference = read_i64(&st, &key)?;
+            ensure!(
+                tokens.len() == reference.len(),
+                "EOU stream utterance {index} tokens {} against {}",
+                tokens.len(),
+                reference.len()
+            );
+            for (position, (left, right)) in tokens.iter().zip(&reference).enumerate() {
+                ensure!(
+                    i64::from(*left) == *right,
+                    "EOU stream utterance {index} token {position} = {left} against {right}"
+                );
+            }
+            println!(
+                "EOU_S3_UTT index={index} tokens={} exact=true PASS",
+                tokens.len()
+            );
+        }
+        println!("EOU_S3_STREAM_GATE PASS clip=clipA utterances={}", utterances.len());
         Ok(())
     }
 }
