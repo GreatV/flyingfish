@@ -1,4 +1,4 @@
-//! Shared flow execution on recorded conditioning and fixed coordinates, and Pixal3D dense/sparse decoder execution.
+//! Shared flow, dense/sparse decoders and image-conditioned mesh refinement.
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
 mod tests;
