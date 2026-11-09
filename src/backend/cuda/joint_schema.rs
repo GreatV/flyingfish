@@ -1039,13 +1039,13 @@ impl JointRun<'_> {
         }
         #[cfg(test)]
         dump_mha("k_hm", k_hm, self.stream)?;
-        flash.run(
-            q_proj,
-            WIDTH,
-            k_hm,
-            v_hm,
-            attn_out,
-            crate::backend::cuda::flash::Shape {
+        flash.run_masked(crate::backend::cuda::flash::Query {
+            q: q_proj,
+            q_row_stride: WIDTH,
+            k: k_hm,
+            v: v_hm,
+            out: attn_out,
+            shape: crate::backend::cuda::flash::Shape {
                 rows,
                 start: 0,
                 q_heads: HEADS,
@@ -1055,7 +1055,10 @@ impl JointRun<'_> {
                 causal: false,
                 window_left: None,
             },
-        )?;
+            keys,
+            prefix: None,
+            image_blocks: None,
+        })?;
         #[cfg(test)]
         dump_mha("attnout", attn_out, self.stream)?;
         self.blas
