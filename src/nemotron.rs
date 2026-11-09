@@ -309,7 +309,13 @@ impl NemotronSpec {
             ],
             linear_name: "subsampling.linear",
             attention_names: [
-                "q_proj", "k_proj", "v_proj", "o_proj", "relative_k_proj", "bias_u", "bias_v",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "relative_k_proj",
+                "bias_u",
+                "bias_v",
             ],
             conv_norm_name: "norm",
         })

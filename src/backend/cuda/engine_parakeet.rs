@@ -593,7 +593,12 @@ impl ParakeetEncoder {
             let convolution_bias = conformer.convolution_bias;
             let feed_forward = |branch: &str| -> Result<FeedForward> {
                 Ok(FeedForward {
-                    norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_{branch}"), conformer.hidden)?,
+                    norm: norm(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.norm_{branch}"),
+                        conformer.hidden,
+                    )?,
                     up: linear(
                         &checkpoint,
                         &stream,
@@ -635,17 +640,28 @@ impl ParakeetEncoder {
                         &checkpoint,
                         &stream,
                         &format!("{}.self_attn.{}", prefix, conformer.attention_names[5]),
-                        &[conformer.heads as usize, conformer.hidden as usize / conformer.heads as usize],
+                        &[
+                            conformer.heads as usize,
+                            conformer.hidden as usize / conformer.heads as usize,
+                        ],
                     )?,
                     bias_v: tensor(
                         &checkpoint,
                         &stream,
                         &format!("{}.self_attn.{}", prefix, conformer.attention_names[6]),
-                        &[conformer.heads as usize, conformer.hidden as usize / conformer.heads as usize],
+                        &[
+                            conformer.heads as usize,
+                            conformer.hidden as usize / conformer.heads as usize,
+                        ],
                     )?,
                 },
                 convolution: Convolution {
-                    norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_conv"), conformer.hidden)?,
+                    norm: norm(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.norm_conv"),
+                        conformer.hidden,
+                    )?,
                     pointwise1: linear_shaped(
                         &checkpoint,
                         &stream,
@@ -713,8 +729,18 @@ impl ParakeetEncoder {
                         &[conformer.hidden as usize, conformer.hidden as usize, 1],
                     )?,
                 },
-                attention_norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_self_att"), conformer.hidden)?,
-                output_norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_out"), conformer.hidden)?,
+                attention_norm: norm(
+                    &checkpoint,
+                    &stream,
+                    &format!("{prefix}.norm_self_att"),
+                    conformer.hidden,
+                )?,
+                output_norm: norm(
+                    &checkpoint,
+                    &stream,
+                    &format!("{prefix}.norm_out"),
+                    conformer.hidden,
+                )?,
             });
         }
         stream.synchronize()?;
@@ -731,7 +757,12 @@ impl ParakeetEncoder {
         })
     }
 
-    pub(crate) fn linear(&self, input: &CudaSlice<f32>, rows: u32, weight: &Linear) -> Result<CudaSlice<f32>> {
+    pub(crate) fn linear(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        weight: &Linear,
+    ) -> Result<CudaSlice<f32>> {
         let mut output = self
             .stream
             .alloc_zeros(rows as usize * weight.output as usize)?;

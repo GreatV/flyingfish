@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use std::{path::Path, sync::Arc};
 
 use super::Device;
-use super::engine_parakeet::{tensor, Linear, LstmLayer, ParakeetEncoder};
+use super::engine_parakeet::{Linear, LstmLayer, ParakeetEncoder, tensor};
 use crate::backend::gpu::{CudaSlice, PushKernelArg};
 
 const MAX_SYMBOLS: usize = 10;
@@ -155,7 +155,7 @@ impl Eou {
 
     /// Blank index: the vocabulary of 1026 fills logits 0..=1025, blank is 1026.
     pub fn blank(&self) -> u32 {
-        self.spec.vocab_size as u32
+        self.spec.vocab_size
     }
 
     fn reset_prediction(&mut self) -> Result<()> {
@@ -212,7 +212,10 @@ impl Eou {
                     .launch(super::ops::flat(width))?;
             }
         }
-        let last = self.lstm.last().context("EOU prediction LSTM stack empty")?;
+        let last = self
+            .lstm
+            .last()
+            .context("EOU prediction LSTM stack empty")?;
         self.encoder
             .linear_into(&last.hidden, 1, &self.pred_projector, &mut self.cache)?;
         self.initialized = true;
@@ -247,8 +250,12 @@ impl Eou {
             0,
             &mut self.joint_activated,
         )?;
-        self.encoder
-            .linear_into(&self.joint_activated, 1, &self.joint, &mut self.joint_logits)?;
+        self.encoder.linear_into(
+            &self.joint_activated,
+            1,
+            &self.joint,
+            &mut self.joint_logits,
+        )?;
         unsafe {
             self.encoder
                 .stream
@@ -339,27 +346,39 @@ mod tests {
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
         Ok(data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
             .collect())
     }
 
     fn read_f32(st: &SafeTensors, key: &str) -> Result<Vec<f32>> {
         let tensor = st.tensor(key)?;
-        ensure!(tensor.dtype() == safetensors::Dtype::F32, "tensor {key} dtype");
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::F32,
+            "tensor {key} dtype"
+        );
         let bytes = tensor.data();
         Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect())
     }
 
     fn read_i64(st: &SafeTensors, key: &str) -> Result<Vec<i64>> {
         let tensor = st.tensor(key)?;
-        ensure!(tensor.dtype() == safetensors::Dtype::I64, "tensor {key} dtype");
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::I64,
+            "tensor {key} dtype"
+        );
         let bytes = tensor.data();
         Ok(bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| {
                 i64::from_le_bytes([
                     chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
@@ -385,9 +404,11 @@ mod tests {
     fn eou_offline_encoder_matches_frozen_reference() -> Result<()> {
         let nemo =
             std::path::PathBuf::from(std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?);
-        let frozen =
-            std::path::PathBuf::from(std::env::var("FF_EOU_FROZEN").context("FF_EOU_FROZEN missing")?);
-        let arm = std::path::PathBuf::from(std::env::var("FF_EOU_ARM").context("FF_EOU_ARM missing")?);
+        let frozen = std::path::PathBuf::from(
+            std::env::var("FF_EOU_FROZEN").context("FF_EOU_FROZEN missing")?,
+        );
+        let arm =
+            std::path::PathBuf::from(std::env::var("FF_EOU_ARM").context("FF_EOU_ARM missing")?);
         let floors: serde_json::Value = serde_json::from_slice(&std::fs::read(&frozen)?)?;
         ensure!(floors["status"] == "FROZEN", "reference floors not frozen");
         let device = Device::new(0)?;
@@ -406,8 +427,10 @@ mod tests {
             assert_eq!(encoded.len(), reference_encoded.len());
             let (feature_abs, feature_rmse) = metrics(&features, &reference_features);
             let (encode_abs, encode_rmse) = metrics(&encoded, &reference_encoded);
-            let feature_tau = &floors["metrics"][format!("media/{clip}.safetensors/features")]["tau"];
-            let encode_tau = &floors["metrics"][format!("media/{clip}.safetensors/encoder_out")]["tau"];
+            let feature_tau =
+                &floors["metrics"][format!("media/{clip}.safetensors/features")]["tau"];
+            let encode_tau =
+                &floors["metrics"][format!("media/{clip}.safetensors/encoder_out")]["tau"];
             ensure!(
                 feature_abs <= feature_tau["max_abs"].as_f64().context("feature tau")?
                     && feature_rmse <= feature_tau["rmse"].as_f64().context("feature tau")?,
@@ -435,9 +458,11 @@ mod tests {
     fn eou_offline_decode_matches_frozen_tokens() -> Result<()> {
         let nemo =
             std::path::PathBuf::from(std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?);
-        let frozen =
-            std::path::PathBuf::from(std::env::var("FF_EOU_FROZEN").context("FF_EOU_FROZEN missing")?);
-        let arm = std::path::PathBuf::from(std::env::var("FF_EOU_ARM").context("FF_EOU_ARM missing")?);
+        let frozen = std::path::PathBuf::from(
+            std::env::var("FF_EOU_FROZEN").context("FF_EOU_FROZEN missing")?,
+        );
+        let arm =
+            std::path::PathBuf::from(std::env::var("FF_EOU_ARM").context("FF_EOU_ARM missing")?);
         let _floors: serde_json::Value = serde_json::from_slice(&std::fs::read(&frozen)?)?;
         let device = Device::new(0)?;
         let mut engine = Eou::load(&nemo, &device)?;

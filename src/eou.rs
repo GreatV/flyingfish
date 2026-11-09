@@ -356,7 +356,10 @@ impl EouSpec {
             root.text("token_init_method")? == "constant",
             "EOU token init method"
         );
-        ensure!(preprocessor.text("normalize")? == "NA", "EOU preprocessor normalization");
+        ensure!(
+            preprocessor.text("normalize")? == "NA",
+            "EOU preprocessor normalization"
+        );
         let context = encoder.sequence("att_context_size")?;
         let context_value = |index: usize| -> Result<u32> {
             let yaml::Value::Scalar(text) = context
