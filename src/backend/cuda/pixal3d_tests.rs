@@ -1836,6 +1836,7 @@ fn hi3d_flow_components_gpu() -> Result<()> {
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
         let flow = Flow::<f16>::open_hi3d(
+            &Device::new(0)?,
             &root,
             component,
             &runtime,
@@ -1960,6 +1961,7 @@ fn hi3d_flow_qk_rope_gpu() -> Result<()> {
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
         let flow = Flow::<f16>::open_hi3d(
+            &Device::new(0)?,
             &root,
             component,
             &runtime,
@@ -2093,6 +2095,7 @@ fn hi3d_flow_blocks_gpu() -> Result<()> {
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
         let mut flow = Flow::<f16>::open_hi3d(
+            &Device::new(0)?,
             &root,
             component,
             &runtime,
@@ -2144,6 +2147,7 @@ fn hi3d_flow_pool_inverse_gpu() -> Result<()> {
     let root = env_path("FF_HI3D_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     let flow = Flow::<f16>::open_hi3d(
+        &Device::new(0)?,
         &root,
         "transformer_512",
         &runtime,
@@ -2392,6 +2396,7 @@ fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for component in ["transformer_512", "transformer_1024"] {
         let mut flow = Flow::<f16>::open_hi3d(
+            &Device::new(0)?,
             &root,
             component,
             &runtime,
@@ -2591,6 +2596,7 @@ fn hi3d_flow_fixed_coordinates_heun_gpu() -> Result<()> {
     let context = f32_tensor(&fixtures.join("common.safetensors"), "context")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     let mut flow = Flow::<f16>::open_hi3d(
+        &Device::new(0)?,
         &root,
         "transformer_512",
         &runtime,
@@ -3497,6 +3503,7 @@ fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
             .collect::<Vec<_>>();
         let resolution = if maximum < 64 { 128 } else { 192 };
         let mut flow = Flow::<f16>::open_hi3d(
+            &Device::new(0)?,
             &model,
             "transformer_1024",
             &runtime,
@@ -3608,6 +3615,7 @@ fn hi3d_cascade_production_flow_gpu() -> Result<()> {
                 .map(|&p| if control { [p[2], p[1], p[0]] } else { p })
                 .collect();
             let mut flow = Flow::<f16>::open_hi3d(
+                &Device::new(0)?,
                 &model,
                 "transformer_1024",
                 &runtime,
@@ -4381,7 +4389,15 @@ fn linked_mesh_case(
             .checked_sub(total - free)
             .context("linked resident data exceeds derived device envelope")
     };
-    let mut flow = Flow::<f16>::open_hi3d(model, "transformer_512", runtime, &grid, 64, budget()?)?;
+    let mut flow = Flow::<f16>::open_hi3d(
+        &device,
+        model,
+        "transformer_512",
+        runtime,
+        &grid,
+        64,
+        budget()?,
+    )?;
     ensure!(
         flow.coordinates == grid
             && flow.io.as_ref().context("linked sparse IO missing")?.rows == grid.len(),
@@ -4935,6 +4951,16 @@ fn hi3d_generation_initial_support_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires admitted CUDA and frozen first-forward inputs"]
 fn hi3d_generation_first_forward_gpu() -> Result<()> {
+    generation_first_forward(0)
+}
+
+#[test]
+#[ignore = "requires both admitted CUDA devices and frozen first-forward inputs"]
+fn hi3d_generation_selected_device_gpu() -> Result<()> {
+    generation_first_forward(1)
+}
+
+fn generation_first_forward(ordinal: usize) -> Result<()> {
     let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
     let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
     ensure!(
@@ -4970,22 +4996,75 @@ fn hi3d_generation_first_forward_gpu() -> Result<()> {
             ),
             "velocity",
         )?;
-        for control in [false, true] {
-            let grid = grid
-                .iter()
-                .map(|p| if control { [p[2], p[1], p[0]] } else { *p })
-                .collect::<Vec<_>>();
-            let device = Device::new(0)?;
-            let (free, total) = device.ctx.mem_get_info()?;
-            let mut flow = Flow::<f16>::open_hi3d(
+        let device = Device::new(ordinal)?;
+        let device_context = device.stream.clone_htod(&context)?;
+        if ordinal != 0 {
+            let wrong_device = Device::new(0)?;
+            let wrong_flow = Flow::<f16>::open_hi3d(
+                &wrong_device,
                 &model,
                 "transformer_512",
                 &runtime,
                 &grid,
                 64,
-                free.min(total - total / 8),
+                7 << 30,
             )?;
-            let conditioning = flow.conditioning(&context, &[], &grid)?;
+            ensure!(
+                wrong_flow
+                    .conditioning_device(&device_context, &grid)
+                    .is_err(),
+                "wrong-device conditioning was accepted"
+            );
+            println!(
+                "PASS N5_M5_DEVICE_SELECTION_CONTROL case={case} selected_ordinal={ordinal} wrong_ordinal=0 rejected=true timing=false"
+            );
+        }
+        for control in [false, true] {
+            let grid = grid
+                .iter()
+                .map(|p| if control { [p[2], p[1], p[0]] } else { *p })
+                .collect::<Vec<_>>();
+            let open = || {
+                Flow::<f16>::open_hi3d(
+                    &device,
+                    &model,
+                    "transformer_512",
+                    &runtime,
+                    &grid,
+                    64,
+                    7 << 30,
+                )
+            };
+            if !control {
+                drop(open()?);
+            }
+            let first = open()?;
+            let first_workspace =
+                first.io.as_ref().context("flow IO missing")?.blocks[2].conv[0].workspace_bytes();
+            drop(first);
+            let mut flow = open()?;
+            let repeated_workspace =
+                flow.io.as_ref().context("flow IO missing")?.blocks[2].conv[0].workspace_bytes();
+            ensure!(
+                first_workspace == repeated_workspace,
+                "consecutive flow setup changed gather capacity"
+            );
+            println!(
+                "PASS N5_M5_CONSECUTIVE_SETUP case={case} control={control} ordinal={ordinal} workspace_bytes={repeated_workspace} repeat_equal=true timing=false"
+            );
+            device.stream.synchronize()?;
+            let (free_after_setup, total) = device.ctx.mem_get_info()?;
+            ensure!(
+                total - free_after_setup <= 8 << 30,
+                "consecutive flow setup exceeded the device lease"
+            );
+            ensure!(
+                flow.device.ctx == device.ctx
+                    && flow.device.stream.as_ref() == device.stream.as_ref()
+                    && flow.device.upload.as_ref() == device.upload.as_ref(),
+                "flow did not retain selected device and streams"
+            );
+            let conditioning = flow.conditioning_device(&device_context, &grid)?;
             flow.set_times(&time)?;
             let input = flow.device.stream.clone_htod(&noise)?;
             let mut output = flow.device.stream.alloc_zeros::<f32>(noise.len())?;
@@ -5005,7 +5084,8 @@ fn hi3d_generation_first_forward_gpu() -> Result<()> {
                 control,
             )?);
             println!(
-                "N5_M5_FIRST_FORWARD_EXECUTION case={case} control={control} rows={} pooled_rows={} timestep={} common_state_and_context=true attention=D96 timing=false",
+                "N5_M5_FIRST_FORWARD_EXECUTION case={case} control={control} ordinal={ordinal} context_and_streams_retained=true free_after_setup={free_after_setup} total_device_bytes={total} lease_bytes={} rows={} pooled_rows={} timestep={} common_state_and_context=true attention=D96 timing=false",
+                8u64 << 30,
                 grid.len(),
                 flow.rows,
                 time[0]

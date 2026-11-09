@@ -1670,6 +1670,7 @@ impl Flow<f16> {
     }
 
     pub fn open_hi3d(
+        device: &Device,
         root: &Path,
         component: &str,
         runtime: &Path,
@@ -1687,7 +1688,8 @@ impl Flow<f16> {
             rows <= i32::MAX as usize / (3 * spec.model_channels),
             "flow row extent overflow"
         );
-        let device = Device::new(0)?;
+        let device = device.clone();
+        device.stream.synchronize()?;
         let (free, total) = device.ctx.mem_get_info()?;
         let h = spec.model_channels;
         let context_rows = 2917;
@@ -3530,6 +3532,7 @@ impl Hi3DGeneration<'_> {
             "transformer_1024"
         };
         let mut flow = Flow::<f16>::open_hi3d(
+            device,
             self.model,
             component,
             self.runtime,
