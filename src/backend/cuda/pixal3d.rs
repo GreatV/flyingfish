@@ -3341,26 +3341,28 @@ impl Hi3DGeneration<'_> {
     /// Final filled, component-filtered, simplified and unit-radius mesh, with its resolution.
     pub fn run_processed(&self, device: &Device) -> Result<(crate::sparse::SparseMesh, u32)> {
         let (mut mesh, resolution) = self.run(device)?;
-        let bytes = (mesh.vertices.len() / 3)
-            .checked_mul(160)
-            .and_then(|v| {
-                (mesh.faces.len() / 3)
-                    .checked_mul(192)
-                    .and_then(|f| v.checked_add(f))
-            })
-            .context("mesh processing host reservation overflow")?;
-        let available = super::calibrate::host_memory(Path::new("/"))?;
-        ensure!(
-            bytes as u64 <= available.saturating_sub(available / 16),
-            "mesh processing host reservation exceeds detected available memory"
-        );
         let capacity = mesh
             .faces
             .len()
             .checked_mul(4)
             .context("filled mesh capacity overflow")?
             / 3;
+        let reserve =
+            |vertices: usize, faces: usize, per_vertex: usize, per_face: usize| -> Result<()> {
+                let bytes = vertices
+                    .checked_mul(per_vertex)
+                    .and_then(|v| faces.checked_mul(per_face).and_then(|f| v.checked_add(f)))
+                    .context("mesh processing host reservation overflow")?;
+                let available = super::calibrate::host_memory(Path::new("/"))?;
+                ensure!(
+                    bytes as u64 <= available.saturating_sub(available / 16),
+                    "mesh processing host reservation exceeds detected available memory"
+                );
+                Ok(())
+            };
+        reserve(mesh.vertices.len() / 3, capacity, 160, 48)?;
         mesh.fill_holes(capacity)?;
+        reserve(mesh.vertices.len() / 3, mesh.faces.len() / 3, 160, 192)?;
         mesh.filter_components(0.005)?;
         let target = if resolution == 1536 {
             2_000_000

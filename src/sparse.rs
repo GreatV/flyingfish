@@ -614,8 +614,10 @@ impl MeshDecimator {
                 opposite[c as usize] = edges[first + 1].1;
                 opposite[edges[first + 1].1 as usize] = c;
             } else {
-                self.protected[self.vertex(c) as usize] = true;
-                self.protected[self.vertex(corner_next(c)) as usize] = true;
+                let a = self.vertex(c) as usize;
+                let b = self.vertex(corner_next(c)) as usize;
+                self.protected[a] = true;
+                self.protected[b] = true;
             }
             first = end;
         }
