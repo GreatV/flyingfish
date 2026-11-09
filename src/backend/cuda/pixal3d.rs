@@ -1,4 +1,4 @@
-//! Shared flow execution on recorded conditioning and fixed coordinates, and Pixal3D dense/sparse decoder execution.
+//! Shared flow, dense/sparse decoders and image-conditioned mesh refinement.
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
 mod tests;
@@ -1670,6 +1670,7 @@ impl Flow<f16> {
     }
 
     pub fn open_hi3d(
+        device: &Device,
         root: &Path,
         component: &str,
         runtime: &Path,
@@ -1687,7 +1688,8 @@ impl Flow<f16> {
             rows <= i32::MAX as usize / (3 * spec.model_channels),
             "flow row extent overflow"
         );
-        let device = Device::new(0)?;
+        let device = device.clone();
+        device.stream.synchronize()?;
         let (free, total) = device.ctx.mem_get_info()?;
         let h = spec.model_channels;
         let context_rows = 2917;
@@ -3318,6 +3320,237 @@ pub struct PixalGeneration<'a> {
     pub requested_resolution: u32,
     /// Structure, low-resolution shape, high-resolution shape, texture.
     pub noise: [CoordinateNoise<'a>; 4],
+}
+
+pub struct Hi3DGeneration<'a> {
+    pub model: &'a Path,
+    pub dino: &'a Path,
+    pub clip: &'a Path,
+    pub runtime: &'a Path,
+    pub rgba: &'a [u8],
+    /// [height,width].
+    pub dimensions: [usize; 2],
+    pub orientation: u8,
+    /// Initial mesh; voxelized before any boundary fill.
+    pub mesh: &'a crate::sparse::SparseMesh,
+    pub requested_resolution: u32,
+    pub seed: u64,
+}
+
+impl Hi3DGeneration<'_> {
+    fn validate(&self) -> Result<()> {
+        let mesh = self.mesh;
+        ensure!(
+            !mesh.vertices.is_empty()
+                && mesh.vertices.len().is_multiple_of(3)
+                && !mesh.faces.is_empty()
+                && mesh.faces.len().is_multiple_of(3)
+                && mesh.vertices.iter().all(|v| v.is_finite())
+                && mesh
+                    .faces
+                    .iter()
+                    .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+            "invalid supplied refinement mesh"
+        );
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for point in mesh.vertices.as_chunks::<3>().0 {
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(point[axis]);
+                hi[axis] = hi[axis].max(point[axis]);
+            }
+        }
+        let extent = (0..3).map(|a| hi[a] - lo[a]).fold(0.0f32, f32::max);
+        ensure!(
+            extent.is_finite() && extent > 0.0,
+            "supplied mesh has no finite positive extent"
+        );
+        ensure!(
+            matches!(self.requested_resolution, 512 | 1024 | 1536),
+            "unsupported refinement resolution"
+        );
+        ensure!(
+            self.dimensions.iter().all(|&n| n > 0)
+                && self.dimensions[0]
+                    .checked_mul(self.dimensions[1])
+                    .and_then(|n| n.checked_mul(4))
+                    == Some(self.rgba.len())
+                && (1..=8).contains(&self.orientation)
+                && self.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0),
+            "invalid supplied RGBA image"
+        );
+        Ok(())
+    }
+
+    fn budget(&self, device: &Device) -> Result<usize> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        let envelope = total - total / 8;
+        envelope
+            .checked_sub(total - free)
+            .context("refinement live data exceeds detected device envelope")
+    }
+
+    /// Raw mesh before final fill, filtering, simplification and normalization, with its resolution.
+    pub fn run(&self, device: &Device) -> Result<(crate::sparse::SparseMesh, u32)> {
+        self.validate()?;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            device,
+            &ops,
+            self.runtime,
+            Rc::new(Closure::new(false, "image refinement".into())),
+        )?;
+        let mut conditioner =
+            crate::backend::Hi3DImageConditioner::load(device, &mut blas, self.dino, self.clip)?;
+        conditioner.encode_rgba(&blas, self.rgba, self.dimensions, self.orientation)?;
+        ensure!(
+            conditioner.encoder_calls() == [1, 1],
+            "refinement encoder call count differs"
+        );
+        let context = conditioner.into_context()?;
+        drop(blas);
+        println!(
+            "HI3D_GENERATION_MEDIA encoder_calls=1,1 context_rows=2917 context_channels=2048 context_reused_per_rung=true"
+        );
+        let mut previous: Option<crate::sparse::SparseMesh> = None;
+        for (stream, nominal, limit) in [
+            (0u64, 64u32, 80_000usize),
+            (1, 128, 90_000),
+            (2, 192, 110_000),
+        ] {
+            let mut added = 0;
+            if let Some(mesh) = previous.as_mut() {
+                let available = super::calibrate::host_memory(Path::new("/"))?;
+                let fill_bytes = mesh
+                    .faces
+                    .len()
+                    .checked_add(mesh.vertices.len())
+                    .and_then(|v| v.checked_mul(24))
+                    .context("boundary host reservation overflow")?;
+                ensure!(
+                    fill_bytes as u64 <= available.saturating_sub(available / 16),
+                    "boundary host reservation exceeds available memory"
+                );
+                let capacity = mesh
+                    .faces
+                    .len()
+                    .checked_mul(4)
+                    .context("boundary face capacity overflow")?
+                    / 3;
+                added = mesh.fill_holes(capacity)?;
+            }
+            let mesh = previous.as_ref().unwrap_or(self.mesh);
+            let (free, _) = device.ctx.mem_get_info()?;
+            let (accepted, voxels) = adaptive_mesh_support(
+                device,
+                mesh,
+                nominal,
+                limit,
+                usize::MAX,
+                [free, self.budget(device)?],
+            )?;
+            let coordinates = voxels.sites.coordinates().to_vec();
+            let grid = coordinates
+                .iter()
+                .map(|p| [p[1], p[2], p[3]])
+                .collect::<Vec<_>>();
+            let frame = voxels.sites.unit_ball_frame()?;
+            drop(voxels);
+            drop(previous.take());
+            let latent = self.flow_stage(device, &context, &grid, (stream, nominal))?;
+            let decoder = PixalDecoder::open(
+                device,
+                self.model,
+                DecoderKind::PointTransformer,
+                self.runtime,
+                self.budget(device)?,
+            )?;
+            let mesh = decoder.points_mesh(coordinates, &latent, frame, nominal)?;
+            drop(decoder);
+            ensure!(
+                !mesh.vertices.is_empty()
+                    && mesh.vertices.len().is_multiple_of(3)
+                    && !mesh.faces.is_empty()
+                    && mesh.faces.len().is_multiple_of(3)
+                    && mesh.vertices.iter().all(|v| v.is_finite())
+                    && mesh
+                        .faces
+                        .iter()
+                        .all(|&v| v >= 0 && (v as usize) < mesh.vertices.len() / 3),
+                "invalid raw refinement mesh"
+            );
+            println!(
+                "HI3D_GENERATION_RUNG resolution={} nominal_grid={nominal} accepted_grid={accepted} filled_faces_added={added} input_rows={} updates=25 component={} vertices={} faces={} noise=philox seed={} stream={stream} noise_boundary_D2H_H2D_bytes={} raw=true timing=false",
+                nominal * 8,
+                grid.len(),
+                if stream == 0 {
+                    "transformer_512"
+                } else {
+                    "transformer_1024"
+                },
+                mesh.vertices.len() / 3,
+                mesh.faces.len() / 3,
+                self.seed,
+                grid.len() * 32 * 8
+            );
+            if nominal * 8 == self.requested_resolution {
+                return Ok((mesh, nominal * 8));
+            }
+            previous = Some(mesh);
+        }
+        anyhow::bail!("refinement did not reach requested resolution")
+    }
+
+    fn flow_stage(
+        &self,
+        device: &Device,
+        context: &CudaSlice<f32>,
+        grid: &[[i32; 3]],
+        stage: (u64, u32),
+    ) -> Result<Vec<f32>> {
+        let (stream, nominal) = stage;
+        let elements = grid
+            .len()
+            .checked_mul(32)
+            .context("refinement noise extent overflow")?;
+        let noise = device.stream.alloc_zeros::<f32>(elements)?;
+        unsafe {
+            device
+                .stream
+                .launch_builder(
+                    &cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?,
+                )
+                .arg(&self.seed)
+                .arg(&stream)
+                .arg(&noise)
+                .arg(&i64::try_from(elements)?)
+                .launch(flat(elements.div_ceil(4)))?;
+        }
+        let noise_host = device.stream.clone_dtoh(&noise)?;
+        drop(noise);
+        let component = if stream == 0 {
+            "transformer_512"
+        } else {
+            "transformer_1024"
+        };
+        let mut flow = Flow::<f16>::open_hi3d(
+            device,
+            self.model,
+            component,
+            self.runtime,
+            grid,
+            nominal as usize,
+            self.budget(device)?,
+        )?;
+        ensure!(
+            flow.coordinates == grid,
+            "refinement support did not reach flow"
+        );
+        let positive = flow.conditioning_device(context, grid)?;
+        let zero = device.stream.alloc_zeros::<f32>(2917 * 2048)?;
+        let negative = flow.conditioning_device(&zero, grid)?;
+        flow.sample_heun(&noise_host, &positive, &negative)
+    }
 }
 
 pub struct PixalOutput {
