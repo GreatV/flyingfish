@@ -54,7 +54,7 @@ impl Gate {
             "DENSE_HIP_ERROR name={name} normalized_max={error:e} bound={bound:e} roundings={roundings} reduction={reduction}"
         );
         let root = std::path::PathBuf::from(
-            std::env::var_os("FF_DENSE_EVIDENCE").context("FF_DENSE_EVIDENCE required")?,
+            std::env::var_os("FF_DENSE_CAPTURE_DIR").context("FF_DENSE_CAPTURE_DIR required")?,
         );
         let bytes: Vec<_> = actual
             .iter()
@@ -973,7 +973,7 @@ fn fp8_quantize(
 
 #[test]
 #[cfg(feature = "rocm")]
-#[ignore = "requires GPU lease, FF_MODEL published per-channel FP8 checkpoint and FF_DENSE_EVIDENCE"]
+#[ignore = "requires GPU lease, FF_MODEL published per-channel FP8 checkpoint and FF_DENSE_CAPTURE_DIR"]
 fn fp8_published_expert_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -2433,7 +2433,7 @@ fn attention_gate(
 
 fn conversion_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
     let root = std::path::PathBuf::from(
-        std::env::var_os("FF_DENSE_EVIDENCE").context("FF_DENSE_EVIDENCE required")?,
+        std::env::var_os("FF_DENSE_CAPTURE_DIR").context("FF_DENSE_CAPTURE_DIR required")?,
     );
     std::fs::create_dir_all(&root)?;
     let source = root.join("conversion.cu");

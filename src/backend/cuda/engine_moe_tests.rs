@@ -5301,7 +5301,7 @@ fn hybrid_media_identity_gpu() -> Result<()> {
     let reference =
         PathBuf::from(std::env::var_os("FF_DENSE_REFERENCE").context("media reference missing")?);
     let output =
-        PathBuf::from(std::env::var_os("FF_DENSE_EVIDENCE").context("media output missing")?);
+        PathBuf::from(std::env::var_os("FF_DENSE_CAPTURE_DIR").context("FF_DENSE_CAPTURE_DIR")?);
     let settings = Settings {
         runtime_dir: Some(PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("media runtime missing")?,

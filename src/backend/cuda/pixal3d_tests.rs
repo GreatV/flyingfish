@@ -5480,8 +5480,8 @@ fn flow_cells(
     );
     Ok(())
 }
-fn fixed_ss(flow: &mut Flow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
-    let base = root.join(format!("evidence/P1-M1-r1/ss-operators-{variant}"));
+fn fixed_ss(flow: &mut Flow, gate: &mut Gate, variant: &str) -> Result<()> {
+    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(format!("ss-operators-{variant}"));
     let table = format!("floors-ss-fixed-{variant}-angular-r1.json");
     for fixture in ["cottage", "robot_crab"] {
         for call in [0, 1, 12, 13, 21] {
@@ -5531,10 +5531,7 @@ fn fixed_ss(flow: &mut Flow, gate: &mut Gate, root: &Path, variant: &str) -> Res
     Ok(())
 }
 fn ss_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Result<()> {
-    let conditioning = env_path("FF_PIXAL_FREEZE")?
-        .parent()
-        .context("freeze parent missing")?
-        .join("recovered/conditioning-ss-r2");
+    let conditioning = env_path("FF_PIXAL_CONDITIONING_SS_RECOVERED")?;
     for variant in ["single", "mv"] {
         let stem = format!(
             "ss_flow_img_dit_1_3B_64_bf16{}",
@@ -5549,8 +5546,8 @@ fn ss_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Resul
             &Rc::new(()),
             10_000_000_000,
         )?;
-        fixed_ss(&mut flow, gate, root, variant)?;
-        attention_ss(&mut flow, gate, root, variant)?;
+        fixed_ss(&mut flow, gate, variant)?;
+        attention_ss(&mut flow, gate, variant)?;
         let mut initial = Vec::new();
         for fixture in ["cottage", "robot_crab"] {
             let noise = f32_tensor(&root.join("fixtures/pixal3d/ss-noise.safetensors"), fixture)?;
@@ -5604,7 +5601,7 @@ fn ss_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Resul
     }
     Ok(())
 }
-fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Result<()> {
+fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path) -> Result<()> {
     for (variant, resolution, fixture, stages) in [
         ("single", 1024, "cottage", vec![0, 1]),
         ("single", 1024, "robot_crab", vec![0, 1]),
@@ -5617,9 +5614,8 @@ fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Re
         } else {
             "r0a"
         };
-        let base = root.join(format!(
-            "evidence/P1-M1-r1/pipeline-{variant}-{resolution}-{fixture}-{arm}"
-        ));
+        let base = env_path("FF_PIXAL_SS_REFERENCE")?
+            .join(format!("pipeline-{variant}-{resolution}-{fixture}-{arm}"));
         for stage in stages {
             let input = base.join(format!("shape_slat-{stage}-inputs.safetensors"));
             let coords = tensor(&input, "noise.coords")?;
@@ -5786,10 +5782,10 @@ impl Gate {
         Ok(())
     }
 }
-fn attention_ss(flow: &mut Flow, gate: &mut Gate, root: &Path, variant: &str) -> Result<()> {
+fn attention_ss(flow: &mut Flow, gate: &mut Gate, variant: &str) -> Result<()> {
     let table = "floors-attention-index-published.json";
     let n = 4096;
-    let base = root.join(format!("evidence/P1-M1-r1/ss-operators-{variant}"));
+    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(format!("ss-operators-{variant}"));
     let values: Vec<_> = (0..n)
         .flat_map(|r| {
             (0..12).flat_map(move |h| {
@@ -5889,7 +5885,7 @@ fn selected_rows(values: &[f32], rows: usize) -> Vec<f32> {
         })
         .collect()
 }
-fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) -> Result<()> {
+fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path) -> Result<()> {
     let table = "floors-sparse-attention-published.json";
     for (resolution, fixture, stage) in [
         (1024, "cottage", 0),
@@ -5897,7 +5893,9 @@ fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) 
         (1536, "robot_crab", 1),
     ] {
         let arm = if resolution == 1024 { "r2" } else { "r0a" };
-        let input=root.join(format!("evidence/P1-M1-r1/pipeline-single-{resolution}-{fixture}-{arm}/shape_slat-{stage}-inputs.safetensors"));
+        let input = env_path("FF_PIXAL_SS_REFERENCE")?.join(format!(
+            "pipeline-single-{resolution}-{fixture}-{arm}/shape_slat-{stage}-inputs.safetensors"
+        ));
         let coordinates = coordinates(&tensor(&input, "noise.coords")?)?;
         let n = coordinates.len();
         let mut flow = Flow::open(
@@ -6015,7 +6013,7 @@ fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) 
     Ok(())
 }
 
-fn transitions(gate: &mut Gate, model: &Path, root: &Path) -> Result<()> {
+fn transitions(gate: &mut Gate, model: &Path) -> Result<()> {
     let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
     let normalization = &config["args"]["shape_slat_normalization"];
     let coefficients = |name: &str| -> Result<Vec<f32>> {
@@ -6043,7 +6041,9 @@ fn transitions(gate: &mut Gate, model: &Path, root: &Path) -> Result<()> {
         ("single", 1536, "robot_crab"),
         ("mv", 1024, "mv4"),
     ] {
-        let input=root.join(format!("evidence/P1-M1-r1/pipeline-{variant}-{resolution}-{fixture}-r0a/shape_slat-1-outputs.safetensors"));
+        let input = env_path("FF_PIXAL_SS_REFERENCE")?.join(format!(
+            "pipeline-{variant}-{resolution}-{fixture}-r0a/shape_slat-1-outputs.safetensors"
+        ));
         let host = tensor(&input, "samples.features")?;
         let mut values = d
             .stream
@@ -6070,10 +6070,10 @@ fn pixal3d_flows_match_frozen_definition_gpu() -> Result<()> {
     let root = env_path("FF_PIXAL_REFERENCE")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     sampler_cells(&mut gate)?;
-    transitions(&mut gate, &model, &root)?;
+    transitions(&mut gate, &model)?;
     ss_flows(&mut gate, &model, &runtime, &root)?;
-    sparse_attention(&mut gate, &model, &runtime, &root)?;
-    shape_flows(&mut gate, &model, &runtime, &root)?;
+    sparse_attention(&mut gate, &model, &runtime)?;
+    shape_flows(&mut gate, &model, &runtime)?;
     gate.finish()
 }
 
@@ -6374,7 +6374,7 @@ impl DecoderGate {
             "M3b primary coverage mismatch"
         );
         let parent = path.parent().context("freeze parent missing")?;
-        let bytes = std::fs::read(parent.join("M3-PREFIX-FREEZE.json"))?;
+        let bytes = std::fs::read(env_path("FF_PIXAL_PREFIX_FREEZE")?)?;
         ensure!(
             format!("{:x}", Sha256::digest(&bytes))
                 == "aeebbf22ae6031391f85e1be7dec572cf9dd2cae6ee44cf02ec0ecccba025d27",
@@ -6569,12 +6569,7 @@ fn host(d: &Device, x: &CudaSlice<f16>) -> Result<Vec<f32>> {
         .collect())
 }
 
-fn dense_decoder_cells(
-    g: &mut DecoderGate,
-    root: &Path,
-    model: &Path,
-    runtime: &Path,
-) -> Result<()> {
+fn dense_decoder_cells(g: &mut DecoderGate, model: &Path, runtime: &Path) -> Result<()> {
     let decoder = PixalDecoder::open(
         &Device::new(0)?,
         model,
@@ -6587,7 +6582,9 @@ fn dense_decoder_cells(
         for fixture in ["cottage", "robot_crab"] {
             for fixed in [false, true] {
                 let arm = if fixed { "r2" } else { "r3math" };
-                let path=root.join(format!("evidence/P1-M3-freeze-r1/recovered/ss-{variant}-{arm}/{fixture}-flow.safetensors"));
+                let path = env_path("FF_PIXAL_PREFIX_RECOVERED")?.join(format!(
+                    "recovered/ss-{variant}-{arm}/{fixture}-flow.safetensors"
+                ));
                 let latent = f32_tensor(&path, "final")?;
                 let logits = decoder.structure(&latent)?;
                 let table = if fixed {
@@ -6728,7 +6725,7 @@ fn pointwise(g: &mut DecoderGate, decoder: &PixalDecoder) -> Result<()> {
     }
     Ok(())
 }
-fn sparse_ops(g: &mut DecoderGate, decoder: &PixalDecoder, root: &Path) -> Result<()> {
+fn sparse_ops(g: &mut DecoderGate, decoder: &PixalDecoder) -> Result<()> {
     let d = &decoder.device;
     let sites = SparseSites::new(vec![[0, 0, 0, 0]])?;
     let conv = SparseConv::new(d, &sites, 1, 27 * 6)?;
@@ -6761,11 +6758,11 @@ fn sparse_ops(g: &mut DecoderGate, decoder: &PixalDecoder, root: &Path) -> Resul
     drop(conv);
 
     for c2s in [false, true] {
-        let path = root.join(if c2s {
-            "evidence/P1-M1-r1/sparse-c2s-r2/operator.safetensors"
+        let path = if c2s {
+            env_path("FF_PIXAL_SPARSE_C2S_OPERATOR")?
         } else {
-            "evidence/P1-M1-r1/sparse-conv-r2/operator.safetensors"
-        });
+            env_path("FF_PIXAL_SPARSE_CONV_OPERATOR")?
+        };
         let sites = SparseSites::new(decoder_coordinates(&path, "coords")?)?;
         let n = sites.coordinates().len();
         let input = f32_tensor(&path, "features")?;
@@ -6865,13 +6862,13 @@ fn sparse_ops(g: &mut DecoderGate, decoder: &PixalDecoder, root: &Path) -> Resul
     }
     Ok(())
 }
-fn decoder_transitions(g: &mut DecoderGate, root: &Path) -> Result<()> {
+fn decoder_transitions(g: &mut DecoderGate) -> Result<()> {
     for (fixture, resolution, capture) in [
         ("cottage", 1536, "pipeline-single-1536-cottage-r0a"),
         ("robot_crab", 1408, "pipeline-single-1536-robot_crab-r0a"),
         ("mv4", 1024, "pipeline-mv-1024-mv4-r0a"),
     ] {
-        let base = root.join("evidence/P1-M1-r1").join(capture);
+        let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
         let sites = SparseSites::new(decoder_coordinates(
             &base.join("shape_slat_decoder.blocks.3.4-call0-fixed-input.safetensors"),
             "output.0.coords",
@@ -6908,7 +6905,6 @@ fn decoder_transitions(g: &mut DecoderGate, root: &Path) -> Result<()> {
 fn prefix(
     g: &mut DecoderGate,
     decoder: &PixalDecoder,
-    root: &Path,
     model: &Path,
     linked: Option<&[f32]>,
 ) -> Result<()> {
@@ -6930,7 +6926,7 @@ fn prefix(
         if linked.is_some() && case != "cottage1024" {
             continue;
         }
-        let base = root.join("evidence/P1-M1-r1").join(capture);
+        let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
         let input = base.join("shape_slat-0-outputs.safetensors");
         let coords = decoder_coordinates(&input, "samples.coords")?;
         let mut latent = match linked {
@@ -7001,9 +6997,9 @@ fn prefix(
     Ok(())
 }
 
-fn linked_lr(root: &Path, model: &Path, runtime: &Path) -> Result<Vec<f32>> {
-    let input = root
-        .join("evidence/P1-M1-r1/pipeline-single-1024-cottage-r2/shape_slat-0-inputs.safetensors");
+fn linked_lr(model: &Path, runtime: &Path) -> Result<Vec<f32>> {
+    let input = env_path("FF_PIXAL_SS_REFERENCE")?
+        .join("pipeline-single-1024-cottage-r2/shape_slat-0-inputs.safetensors");
     let points = coordinates(&tensor(&input, "noise.coords")?)?;
     let mut flow = Flow::open(
         &Device::new(0)?,
@@ -7044,11 +7040,10 @@ fn linked_lr(root: &Path, model: &Path, runtime: &Path) -> Result<Vec<f32>> {
 #[test]
 #[ignore = "requires a CUDA GPU, published checkpoints, and the frozen Pixal3D captures"]
 fn pixal3d_decoders_match_frozen_definition_gpu() -> Result<()> {
-    let root = env_path("FF_PIXAL_REFERENCE")?;
     let model = env_path("FF_PIXAL_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     let mut g = DecoderGate::new()?;
-    dense_decoder_cells(&mut g, &root, &model, &runtime)?;
+    dense_decoder_cells(&mut g, &model, &runtime)?;
     let decoder = PixalDecoder::open(
         &Device::new(0)?,
         &model,
@@ -7057,11 +7052,11 @@ fn pixal3d_decoders_match_frozen_definition_gpu() -> Result<()> {
         10_000_000_000,
     )?;
     pointwise(&mut g, &decoder)?;
-    sparse_ops(&mut g, &decoder, &root)?;
-    decoder_transitions(&mut g, &root)?;
-    prefix(&mut g, &decoder, &root, &model, None)?;
+    sparse_ops(&mut g, &decoder)?;
+    decoder_transitions(&mut g)?;
+    prefix(&mut g, &decoder, &model, None)?;
     drop(decoder);
-    let latent = linked_lr(&root, &model, &runtime)?;
+    let latent = linked_lr(&model, &runtime)?;
     let decoder = PixalDecoder::open(
         &Device::new(0)?,
         &model,
@@ -7069,7 +7064,7 @@ fn pixal3d_decoders_match_frozen_definition_gpu() -> Result<()> {
         &runtime,
         10_000_000_000,
     )?;
-    prefix(&mut g, &decoder, &root, &model, Some(&latent))?;
+    prefix(&mut g, &decoder, &model, Some(&latent))?;
     g.finish()
 }
 
@@ -7469,7 +7464,6 @@ fn surface_count(case: &str, phase: &str, plan: [usize; 3], rows: [usize; 2]) ->
 fn surface_fixed(
     g: &mut DecoderGate,
     decoder: &PixalDecoder,
-    root: &Path,
     case: (&str, &str, &str),
 ) -> Result<()> {
     let (case, capture, table) = case;
@@ -7478,7 +7472,7 @@ fn surface_fixed(
     } else {
         capture.to_owned()
     };
-    let base = root.join("evidence/P1-M1-r1").join(capture);
+    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
     let path = base.join("result.safetensors");
     let coordinates = decoder_coordinates(&path, "result.1.0.coords")?;
     let latent = f32_tensor(&path, "result.1.0.features")?;
@@ -7796,14 +7790,11 @@ fn surface_forced(g: &mut DecoderGate, decoder: &PixalDecoder, case: &str) -> Re
 fn surface_generated(
     g: &mut DecoderGate,
     decoder: &PixalDecoder,
-    root: &Path,
     model: &Path,
     case: (&str, &str, u32),
 ) -> Result<()> {
     let (case, core, requested) = case;
-    let base = root
-        .join("evidence/P1-M4-freeze-r1")
-        .join(format!("core-{core}-r0a-r2"));
+    let base = env_path("FF_PIXAL_SHAPE_MESH_REFERENCE")?.join(format!("core-{core}-r0a-r2"));
     let metadata: Value = serde_json::from_slice(&std::fs::read(base.join("metadata.json"))?)?;
     let resolution = metadata["trace"]
         .as_array()
@@ -7886,7 +7877,7 @@ fn surface_generated(
     Ok(())
 }
 
-fn surface_normalization(g: &mut DecoderGate, model: &Path, root: &Path) -> Result<()> {
+fn surface_normalization(g: &mut DecoderGate, model: &Path) -> Result<()> {
     let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
     let d = Device::new(0)?;
     for (fixture, capture) in [
@@ -7908,8 +7899,7 @@ fn surface_normalization(g: &mut DecoderGate, model: &Path, root: &Path) -> Resu
                 .iter()
                 .map(|x| x.as_f64().unwrap() as f32)
                 .collect();
-            let input = root
-                .join("evidence/P1-M1-r1")
+            let input = env_path("FF_PIXAL_SS_REFERENCE")?
                 .join(capture)
                 .join(format!("{stage}-outputs.safetensors"));
             let host = tensor(&input, "samples.features")?;
@@ -7957,10 +7947,10 @@ fn canonical_quad(faces: &[i32]) -> Option<([i32; 4], [i32; 6])> {
     Some((key, triangles.as_flattened().try_into().unwrap()))
 }
 
-fn surface_mesh(g: &mut DecoderGate, root: &Path) -> Result<()> {
+fn surface_mesh(g: &mut DecoderGate) -> Result<()> {
     let d = Device::new(0)?;
     let (free, _) = d.ctx.mem_get_info()?;
-    let base = root.join("evidence/P1-M1-r1/pipeline-single-1024-cottage-r2");
+    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join("pipeline-single-1024-cottage-r2");
     let path = base.join("shape_slat_decoder-fields.safetensors");
     let sites = SparseSites::new(decoder_coordinates(&path, "output.coords")?)?;
     let fields = f32_tensor(&path, "output.features")?;
@@ -7971,7 +7961,7 @@ fn surface_mesh(g: &mut DecoderGate, root: &Path) -> Result<()> {
         .flat_map(|v| v[3..6].iter().map(|&x| u8::from(x > 0.0)))
         .collect();
     drop(fields);
-    let mesh_path = root.join("evidence/P1-M1-r1/mesh-local/r0a.safetensors");
+    let mesh_path = env_path("FF_PIXAL_SS_REFERENCE")?.join("mesh-local/r0a.safetensors");
     let dual = d
         .stream
         .clone_htod(&f32_tensor(&mesh_path, "dual_vertices")?)?;
@@ -7997,13 +7987,7 @@ fn surface_mesh(g: &mut DecoderGate, root: &Path) -> Result<()> {
         .into_iter()
         .map(|v| v as i32)
         .collect::<Vec<_>>();
-    let weight = tensor(
-        &root.join(
-            "evidence/P1-M4-freeze-r1/replay/evidence/P1-M1-r1/mesh-local/r3math.safetensors",
-        ),
-        "split_weight",
-    )?
-    .values;
+    let weight = tensor(&env_path("FF_PIXAL_MESH_SPLIT_REFERENCE")?, "split_weight")?.values;
     let key = id(
         "floors-mesh-published-r2.json",
         "stable_split_topology",
@@ -8177,10 +8161,9 @@ fn pixal3d_surface_freeze_cpu() -> Result<()> {
 #[test]
 #[ignore = "requires CUDA, published checkpoints and frozen decoder captures"]
 fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
-    let root = env_path("FF_PIXAL_REFERENCE")?;
     let model = env_path("FF_PIXAL_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let base = root.join("evidence/P1-M4-freeze-r1/core-single-1024-cottage-r0a-r2");
+    let base = env_path("FF_PIXAL_SHAPE_MESH_REFERENCE")?.join("core-single-1024-cottage-r0a-r2");
     let input = base.join("shape_slat-0-outputs.safetensors");
     let coordinates = decoder_coordinates(&input, "samples.coords")?;
     let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
@@ -8289,13 +8272,12 @@ fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
 #[ignore = "requires CUDA, published checkpoints and frozen decoder captures"]
 fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
     let mut g = DecoderGate::surface(false)?;
-    let root = env_path("FF_PIXAL_REFERENCE")?;
     let model = env_path("FF_PIXAL_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    dense_decoder_cells(&mut g, &root, &model, &runtime)?;
-    decoder_transitions(&mut g, &root)?;
-    surface_normalization(&mut g, &model, &root)?;
-    surface_mesh(&mut g, &root)?;
+    dense_decoder_cells(&mut g, &model, &runtime)?;
+    decoder_transitions(&mut g)?;
+    surface_normalization(&mut g, &model)?;
+    surface_mesh(&mut g)?;
     let decoder = PixalDecoder::open(
         &Device::new(0)?,
         &model,
@@ -8305,8 +8287,8 @@ fn pixal3d_shape_mesh_matches_frozen_definition_gpu() -> Result<()> {
     )?;
     for (case, capture, table, core, requested) in SURFACE_CASES {
         surface_forced(&mut g, &decoder, case)?;
-        surface_fixed(&mut g, &decoder, &root, (case, capture, table))?;
-        surface_generated(&mut g, &decoder, &root, &model, (case, core, requested))?;
+        surface_fixed(&mut g, &decoder, (case, capture, table))?;
+        surface_generated(&mut g, &decoder, &model, (case, core, requested))?;
     }
     g.finish()
 }
@@ -8465,11 +8447,10 @@ fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
         seen: BTreeSet::new(),
         defects: 0,
     };
-    let root = env_path("FF_PIXAL_REFERENCE")?;
     let model = env_path("FF_PIXAL_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for (case, capture, _, core, requested) in SURFACE_CASES {
-        let base = root.join("evidence/P1-M1-r1").join(capture);
+        let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
         let input = base.join("tex_slat-0-inputs.safetensors");
         let points = coordinates(&tensor(&input, "noise.coords")?)?;
         let stem = format!(
@@ -8498,8 +8479,7 @@ fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
             &coordinates(&tensor(&input, "cond.proj.coords")?)?,
         )?;
         let physical_base = if case == "crab1408" {
-            root.join("evidence/P1-M1-r1")
-                .join(format!("{capture}-decoder-r2"))
+            env_path("FF_PIXAL_SS_REFERENCE")?.join(format!("{capture}-decoder-r2"))
         } else {
             base.clone()
         };
@@ -8552,7 +8532,7 @@ fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
     gate.finish()
 }
 
-fn material_pointwise(g: &mut DecoderGate, model: &Path, root: &Path) -> Result<()> {
+fn material_pointwise(g: &mut DecoderGate, model: &Path) -> Result<()> {
     let d = Device::new(0)?;
     let path = env_path("FF_PIXAL_NORMALIZATION")?;
     let shape = tensor(&path, "physical_shape")?;
@@ -8662,8 +8642,7 @@ fn material_pointwise(g: &mut DecoderGate, model: &Path, root: &Path) -> Result<
         ("robot_crab", "pipeline-single-1536-robot_crab-r0a"),
         ("mv4", "pipeline-mv-1024-mv4-r0a"),
     ] {
-        let input = root
-            .join("evidence/P1-M1-r1")
+        let input = env_path("FF_PIXAL_SS_REFERENCE")?
             .join(capture)
             .join("tex_slat-0-outputs.safetensors");
         let host = tensor(&input, "samples.features")?;
@@ -8687,7 +8666,6 @@ fn material_pointwise(g: &mut DecoderGate, model: &Path, root: &Path) -> Result<
 fn material_fixed(
     g: &mut DecoderGate,
     decoder: &PixalDecoder,
-    root: &Path,
     case: (&str, &str, &str),
 ) -> Result<()> {
     let (case, capture, table) = case;
@@ -8696,7 +8674,7 @@ fn material_fixed(
     } else {
         capture.to_owned()
     };
-    let base = root.join("evidence/P1-M1-r1").join(capture);
+    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
     let input = base.join("result.safetensors");
     let coords = decoder_coordinates(&input, "result.1.1.coords")?;
     let latent = f32_tensor(&input, "result.1.1.features")?;
@@ -8763,7 +8741,6 @@ fn material_generated(
     g: &mut DecoderGate,
     shape: &PixalDecoder,
     texture: &PixalDecoder,
-    root: &Path,
     case: (&str, &str),
 ) -> Result<()> {
     let (case, capture) = case;
@@ -8772,8 +8749,7 @@ fn material_generated(
     } else {
         capture.to_owned()
     };
-    let input = root
-        .join("evidence/P1-M1-r1")
+    let input = env_path("FF_PIXAL_SS_REFERENCE")?
         .join(capture)
         .join("result.safetensors");
     let coords = decoder_coordinates(&input, "result.1.0.coords")?;
@@ -8865,9 +8841,8 @@ fn material_generated(
 fn pixal3d_material_matches_frozen_definition_gpu() -> Result<()> {
     let mut g = DecoderGate::texture(false)?;
     let model = env_path("FF_PIXAL_MODEL")?;
-    let root = env_path("FF_PIXAL_REFERENCE")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    material_pointwise(&mut g, &model, &root)?;
+    material_pointwise(&mut g, &model)?;
     let shape = PixalDecoder::open(
         &Device::new(0)?,
         &model,
@@ -8883,8 +8858,8 @@ fn pixal3d_material_matches_frozen_definition_gpu() -> Result<()> {
         22_000_000_000,
     )?;
     for (case, capture, table, _, _) in SURFACE_CASES {
-        material_fixed(&mut g, &texture, &root, (case, capture, table))?;
-        material_generated(&mut g, &shape, &texture, &root, (case, capture))?;
+        material_fixed(&mut g, &texture, (case, capture, table))?;
+        material_generated(&mut g, &shape, &texture, (case, capture))?;
     }
     g.finish()
 }
@@ -9744,7 +9719,7 @@ fn pixal3d_generated_request_gpu() -> Result<()> {
         _ => anyhow::bail!("case fixture"),
     };
     let multiview = fixture.starts_with("mv");
-    let inputs = env_path("FF_P1_M2_ROOT")?
+    let inputs = env_path("FF_PIXAL_CONDITIONING_ROOT")?
         .join("gate-inputs.safetensors")
         .canonicalize()?;
     let input_file = std::fs::File::open(&inputs)?;
