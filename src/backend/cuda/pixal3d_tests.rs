@@ -4598,7 +4598,7 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     Ok(())
 }
 
-fn linked_image_cascade(case: &str, requested: u32) -> Result<()> {
+fn linked_image_cascade(case: &str, requested: u32, processed: bool) -> Result<()> {
     let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
     let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
     let source = freeze["initial"][case]["input_mesh"]
@@ -4634,12 +4634,63 @@ fn linked_image_cascade(case: &str, requested: u32) -> Result<()> {
         seed: 0,
     };
     let device = Device::new(0)?;
-    let (raw, achieved) = generation.run(&device)?;
+    let (raw, achieved) = if processed {
+        generation.run_processed(&device)?
+    } else {
+        generation.run(&device)?
+    };
     ensure!(
         achieved == requested,
         "generation returned the wrong resolution"
     );
-    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?.join(format!("{case}-{requested}"));
+    if processed {
+        let root = env_path("FF_HI3D_QEM_REFERENCE")?;
+        let frozen: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+        let old: Value = serde_json::from_slice(&std::fs::read(
+            frozen["previous_operator_freeze"]
+                .as_str()
+                .context("normalization freeze missing")?,
+        )?)?;
+        let key = format!(
+            "{}{requested}",
+            if case == "robot_crab" { "robot" } else { case }
+        );
+        let tau = old["float_cells"][format!("{key}.normalize")]["tau"]["max_abs"]
+            .as_f64()
+            .context("normalization floor missing")?;
+        let points = raw.vertices.as_chunks::<3>().0;
+        let mean: [f64; 3] = std::array::from_fn(|i| {
+            points.iter().map(|p| f64::from(p[i])).sum::<f64>() / points.len() as f64
+        });
+        let radius = points
+            .iter()
+            .map(|p| p.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>().sqrt())
+            .fold(0.0, f64::max);
+        let minimum = frozen["cases"][&key]["minimum_output_faces"]
+            .as_u64()
+            .context("minimum output count missing")? as usize;
+        let maximum = frozen["cases"][&key]["target_faces"]
+            .as_u64()
+            .context("output target missing")? as usize;
+        ensure!(
+            (minimum..=maximum).contains(&(raw.faces.len() / 3))
+                && mean.iter().all(|v| v.abs() <= tau)
+                && (radius - 1.0).abs() <= 3.0f64.sqrt() * tau,
+            "processed generation output count or normalization defect"
+        );
+        ensure!(
+            (radius * 0.5 - 1.0).abs() > 10.0 * 3.0f64.sqrt() * tau,
+            "processed scale control does not discriminate"
+        );
+        println!(
+            "PASS N5_M6_PROCESSED_ENTRY case={case} requested={requested} vertices={} faces={} mean={mean:?} radius={radius} scale_control_multiple={} timing=false",
+            points.len(),
+            raw.faces.len() / 3,
+            (radius * 0.5 - 1.0).abs() / (3.0f64.sqrt() * tau)
+        );
+    }
+    let suffix = if processed { "-processed" } else { "" };
+    let output = env_path("FF_HI3D_IMAGE_OUTPUT")?.join(format!("{case}-{requested}{suffix}"));
     std::fs::create_dir_all(&output)?;
     let vertices = raw
         .vertices
@@ -4673,11 +4724,13 @@ fn linked_image_cascade(case: &str, requested: u32) -> Result<()> {
         None,
         &output.join("native.safetensors"),
     )?;
-    println!(
-        "PASS N5_M5_GENERATION case={case} requested={requested} achieved={achieved} initial_support=mesh_derived vertices={} faces={} raw=true topology_equivalence=false timing=false",
-        raw.vertices.len() / 3,
-        raw.faces.len() / 3
-    );
+    if !processed {
+        println!(
+            "PASS N5_M5_GENERATION case={case} requested={requested} achieved={achieved} initial_support=mesh_derived vertices={} faces={} raw=true topology_equivalence=false timing=false",
+            raw.vertices.len() / 3,
+            raw.faces.len() / 3
+        );
+    }
     cascade_resources(case)
 }
 
@@ -4699,12 +4752,12 @@ fn cascade_resources(case: &str) -> Result<()> {
 #[test]
 #[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
 fn hi3d_linked_cascade_cottage_gpu() -> Result<()> {
-    linked_image_cascade("cottage", 1024)
+    linked_image_cascade("cottage", 1024, false)
 }
 #[test]
 #[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
 fn hi3d_linked_cascade_robot_gpu() -> Result<()> {
-    linked_image_cascade("robot_crab", 1536)
+    linked_image_cascade("robot_crab", 1536, false)
 }
 
 #[test]
@@ -5101,12 +5154,18 @@ fn generation_first_forward(ordinal: usize) -> Result<()> {
 #[test]
 #[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
 fn hi3d_generation_cottage_512_gpu() -> Result<()> {
-    linked_image_cascade("cottage", 512)
+    linked_image_cascade("cottage", 512, false)
 }
 #[test]
 #[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
 fn hi3d_generation_robot_512_gpu() -> Result<()> {
-    linked_image_cascade("robot_crab", 512)
+    linked_image_cascade("robot_crab", 512, false)
+}
+
+#[test]
+#[ignore = "requires admitted CUDA and published image/flow/decoder weights"]
+fn hi3d_generation_processed_512_gpu() -> Result<()> {
+    linked_image_cascade("cottage", 512, true)
 }
 
 struct Gate {
