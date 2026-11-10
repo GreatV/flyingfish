@@ -8,15 +8,17 @@ use super::{
     ops,
 };
 use crate::{
-    backend::gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg},
+    backend::gpu::{CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, PushKernelArg},
     canary::CanarySpec,
     checkpoint::MappedCheckpoint,
 };
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
 #[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{path::Path, sync::Arc};
+use std::{cell::Cell, path::Path, sync::Arc};
 
 const HEADS: u32 = 8;
 const HEAD_DIM: u32 = 128;
@@ -54,10 +56,35 @@ struct Layer {
 
 struct Ops {
     gather: CudaFunction,
+    place: CudaFunction,
     residual: CudaFunction,
     activation: CudaFunction,
     bias: CudaFunction,
     layer_norm: CudaFunction,
+    argmax: CudaFunction,
+    finite: CudaFunction,
+}
+
+enum Mark {
+    GemmEx,
+    Bias,
+    Norm,
+    Residual,
+    Activation,
+    Gather,
+    Place,
+    Argmax,
+    Finite,
+    H2d,
+    D2h,
+    D2d,
+    GraphLaunch,
+    GraphCapture,
+}
+
+enum TokenSource {
+    Host(u32),
+    Device,
 }
 
 struct Pass<'a> {
@@ -67,6 +94,24 @@ struct Pass<'a> {
     valid: u32,
     self_attn: &'a F32Attention,
     cross_attn: &'a F32Attention,
+}
+
+struct RowScratch {
+    mix: CudaSlice<f32>,
+    pos: CudaSlice<f32>,
+    state: CudaSlice<f32>,
+    q: CudaSlice<f32>,
+    kv: CudaSlice<f32>,
+    attended: CudaSlice<f32>,
+    delta: CudaSlice<f32>,
+    expanded: CudaSlice<f32>,
+    activated: CudaSlice<f32>,
+    logits: CudaSlice<f32>,
+    token: CudaSlice<i32>,
+    bounds: CudaSlice<i32>,
+    picked: CudaSlice<i32>,
+    bound_ptr: u64,
+    graph: Option<CudaGraph>,
 }
 
 struct KvCache {
@@ -79,6 +124,7 @@ struct KvCache {
     filled: u32,
     self_attn: F32Attention,
     cross_attn: F32Attention,
+    scratch: RowScratch,
 }
 
 fn require_prompt_length(len: usize) -> Result<()> {
@@ -113,8 +159,177 @@ pub struct Canary {
     ops: Ops,
     vocab: u32,
     hidden: u32,
+    graph_on: Cell<bool>,
+    #[cfg(test)]
+    tally: Tally,
+    #[cfg(test)]
+    steps: RefCell<Vec<StepTally>>,
     #[cfg(test)]
     cross_writes: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepTally {
+    pub gemm_ex: u64,
+    pub bias: u64,
+    pub norm: u64,
+    pub residual: u64,
+    pub activation: u64,
+    pub gather: u64,
+    pub place: u64,
+    pub exclude: u64,
+    pub softmax: u64,
+    pub sum_parts: u64,
+    pub strided: u64,
+    pub argmax: u64,
+    pub finite: u64,
+    pub h2d: u64,
+    pub d2h: u64,
+    pub d2d: u64,
+    pub graph_launches: u64,
+    pub graph_captures: u64,
+}
+
+#[cfg(test)]
+struct Tally {
+    gemm_ex: Cell<u64>,
+    bias: Cell<u64>,
+    norm: Cell<u64>,
+    residual: Cell<u64>,
+    activation: Cell<u64>,
+    gather: Cell<u64>,
+    place: Cell<u64>,
+    argmax: Cell<u64>,
+    finite: Cell<u64>,
+    h2d: Cell<u64>,
+    d2h: Cell<u64>,
+    d2d: Cell<u64>,
+    graph_launches: Cell<u64>,
+    graph_captures: Cell<u64>,
+}
+
+#[cfg(test)]
+struct Snap {
+    host: StepTally,
+    self_attn: [u64; 4],
+    cross_attn: [u64; 4],
+}
+
+#[cfg(test)]
+impl Tally {
+    fn new() -> Self {
+        Self {
+            gemm_ex: Cell::new(0),
+            bias: Cell::new(0),
+            norm: Cell::new(0),
+            residual: Cell::new(0),
+            activation: Cell::new(0),
+            gather: Cell::new(0),
+            place: Cell::new(0),
+            argmax: Cell::new(0),
+            finite: Cell::new(0),
+            h2d: Cell::new(0),
+            d2h: Cell::new(0),
+            d2d: Cell::new(0),
+            graph_launches: Cell::new(0),
+            graph_captures: Cell::new(0),
+        }
+    }
+
+    fn mark(&self, kind: Mark) {
+        let cell = match kind {
+            Mark::GemmEx => &self.gemm_ex,
+            Mark::Bias => &self.bias,
+            Mark::Norm => &self.norm,
+            Mark::Residual => &self.residual,
+            Mark::Activation => &self.activation,
+            Mark::Gather => &self.gather,
+            Mark::Place => &self.place,
+            Mark::Argmax => &self.argmax,
+            Mark::Finite => &self.finite,
+            Mark::GraphLaunch => &self.graph_launches,
+            Mark::GraphCapture => &self.graph_captures,
+            Mark::H2d | Mark::D2h | Mark::D2d => return,
+        };
+        cell.set(cell.get() + 1);
+    }
+
+    fn add_bytes(&self, kind: Mark, n: u64) {
+        let cell = match kind {
+            Mark::H2d => &self.h2d,
+            Mark::D2h => &self.d2h,
+            Mark::D2d => &self.d2d,
+            _ => return,
+        };
+        cell.set(cell.get() + n);
+    }
+
+    fn host(&self) -> StepTally {
+        StepTally {
+            gemm_ex: self.gemm_ex.get(),
+            bias: self.bias.get(),
+            norm: self.norm.get(),
+            residual: self.residual.get(),
+            activation: self.activation.get(),
+            gather: self.gather.get(),
+            place: self.place.get(),
+            exclude: 0,
+            softmax: 0,
+            sum_parts: 0,
+            strided: 0,
+            argmax: self.argmax.get(),
+            finite: self.finite.get(),
+            h2d: self.h2d.get(),
+            d2h: self.d2h.get(),
+            d2d: self.d2d.get(),
+            graph_launches: self.graph_launches.get(),
+            graph_captures: self.graph_captures.get(),
+        }
+    }
+
+    fn store(&self, host: StepTally) {
+        self.gemm_ex.set(host.gemm_ex);
+        self.bias.set(host.bias);
+        self.norm.set(host.norm);
+        self.residual.set(host.residual);
+        self.activation.set(host.activation);
+        self.gather.set(host.gather);
+        self.place.set(host.place);
+        self.argmax.set(host.argmax);
+        self.finite.set(host.finite);
+        self.h2d.set(host.h2d);
+        self.d2h.set(host.d2h);
+        self.d2d.set(host.d2d);
+        self.graph_launches.set(host.graph_launches);
+        self.graph_captures.set(host.graph_captures);
+    }
+}
+
+#[cfg(test)]
+impl StepTally {
+    fn sub(self, earlier: Self) -> Self {
+        Self {
+            gemm_ex: self.gemm_ex - earlier.gemm_ex,
+            bias: self.bias - earlier.bias,
+            norm: self.norm - earlier.norm,
+            residual: self.residual - earlier.residual,
+            activation: self.activation - earlier.activation,
+            gather: self.gather - earlier.gather,
+            place: self.place - earlier.place,
+            exclude: self.exclude - earlier.exclude,
+            softmax: self.softmax - earlier.softmax,
+            sum_parts: self.sum_parts - earlier.sum_parts,
+            strided: self.strided - earlier.strided,
+            argmax: self.argmax - earlier.argmax,
+            finite: self.finite - earlier.finite,
+            h2d: self.h2d - earlier.h2d,
+            d2h: self.d2h - earlier.d2h,
+            d2d: self.d2d - earlier.d2d,
+            graph_launches: self.graph_launches - earlier.graph_launches,
+            graph_captures: self.graph_captures - earlier.graph_captures,
+        }
+    }
 }
 
 fn tensor(
@@ -232,12 +447,16 @@ impl Canary {
         let vision = cubin::module(&device.ctx, "vision_ops")?;
         let speech = cubin::module(&device.ctx, "speech_ops")?;
         let common = cubin::module(&device.ctx, "q38_common")?;
+        let sample = cubin::module(&device.ctx, "sample")?;
         let ops = Ops {
             gather: vision.load_function("vision_row_gather_f32")?,
+            place: vision.load_function("row_place_f32")?,
             residual: speech.load_function("speech_residual_f32")?,
             activation: vision.load_function("activation_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             layer_norm: common.load_function("q38_layer_norm_f32")?,
+            argmax: sample.load_function("argmax_f32")?,
+            finite: common.load_function("copy_finite_f32")?,
         };
         let mut layers = Vec::with_capacity(spec.decoder_layers as usize);
         for index in 0..spec.decoder_layers {
@@ -284,12 +503,18 @@ impl Canary {
             ops,
             vocab: spec.vocab,
             hidden: spec.hidden,
+            graph_on: Cell::new(true),
             blas,
             stream,
             #[cfg(test)]
+            tally: Tally::new(),
+            #[cfg(test)]
+            steps: RefCell::new(Vec::new()),
+            #[cfg(test)]
             cross_writes: AtomicU64::new(0),
         };
-        decoder.stream.synchronize()?;
+        // Device::new opens a second stream, so event tracking stays on until finish_upload.
+        device.finish_upload()?;
         Ok(decoder)
     }
 
@@ -345,6 +570,7 @@ impl Canary {
                 cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
             .result()?;
+            self.mark(Mark::GemmEx);
             self.stream
                 .launch_builder(&self.ops.bias)
                 .arg(&destination)
@@ -353,24 +579,44 @@ impl Canary {
                 .arg(&rows)
                 .arg(&weight.output)
                 .launch(ops::flat(count))?;
+            self.mark(Mark::Bias);
         }
         Ok(())
     }
 
-    fn normalize(&self, input: &CudaSlice<f32>, rows: u32, norm: &Norm) -> Result<CudaSlice<f32>> {
-        ensure!(
-            input.len() == rows as usize * self.hidden as usize,
-            "layer norm input length"
-        );
-        let output = self.stream.alloc_zeros(input.len())?;
+    fn mark(&self, kind: Mark) {
+        #[cfg(test)]
+        self.tally.mark(kind);
+        #[cfg(not(test))]
+        let _ = kind;
+    }
+
+    fn mark_bytes(&self, kind: Mark, bytes: u64) {
+        #[cfg(test)]
+        self.tally.add_bytes(kind, bytes);
+        #[cfg(not(test))]
+        let _ = (kind, bytes);
+    }
+
+    fn normalize_into(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        norm: &Norm,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
         let width = self.hidden;
+        ensure!(
+            input.len() == rows as usize * width as usize && output.len() == input.len(),
+            "layer norm length"
+        );
         unsafe {
             self.stream
                 .launch_builder(&self.ops.layer_norm)
                 .arg(input)
                 .arg(&norm.weight)
                 .arg(&norm.bias)
-                .arg(&output)
+                .arg(&*output)
                 .arg(&rows)
                 .arg(&1u32)
                 .arg(&width)
@@ -383,6 +629,13 @@ impl Canary {
                 .arg(&1e-5f32)
                 .launch(ops::grid(rows as usize, 256))?;
         }
+        self.mark(Mark::Norm);
+        Ok(())
+    }
+
+    fn normalize(&self, input: &CudaSlice<f32>, rows: u32, norm: &Norm) -> Result<CudaSlice<f32>> {
+        let mut output = self.stream.alloc_zeros(input.len())?;
+        self.normalize_into(input, rows, norm, &mut output)?;
         Ok(output)
     }
 
@@ -404,27 +657,71 @@ impl Canary {
                 .arg(&scale)
                 .launch(ops::flat(hidden.len()))?;
         }
+        self.mark(Mark::Residual);
         Ok(())
     }
 
-    fn activate(&self, input: &CudaSlice<f32>, rows: u32, width: u32) -> Result<CudaSlice<f32>> {
+    fn activate_into(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        width: u32,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
         ensure!(
-            input.len() == rows as usize * width as usize,
-            "activation input length"
+            input.len() == rows as usize * width as usize && output.len() == input.len(),
+            "activation length"
         );
-        let output = self.stream.alloc_zeros(input.len())?;
         let mode = 0i32;
         unsafe {
             self.stream
                 .launch_builder(&self.ops.activation)
                 .arg(input)
-                .arg(&output)
+                .arg(&*output)
                 .arg(&rows)
                 .arg(&width)
                 .arg(&mode)
                 .launch(ops::flat(input.len()))?;
         }
+        self.mark(Mark::Activation);
+        Ok(())
+    }
+
+    fn activate(&self, input: &CudaSlice<f32>, rows: u32, width: u32) -> Result<CudaSlice<f32>> {
+        let mut output = self.stream.alloc_zeros(input.len())?;
+        self.activate_into(input, rows, width, &mut output)?;
         Ok(output)
+    }
+
+    fn gather_device(
+        &self,
+        table: &CudaSlice<f32>,
+        indices: &CudaSlice<i32>,
+        rows: u32,
+        in_rows: u32,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let width = self.hidden;
+        ensure!(
+            rows > 0
+                && indices.len() >= rows as usize
+                && table.len() == in_rows as usize * width as usize
+                && output.len() == rows as usize * width as usize,
+            "gather length"
+        );
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.gather)
+                .arg(table)
+                .arg(indices)
+                .arg(&*output)
+                .arg(&rows)
+                .arg(&in_rows)
+                .arg(&width)
+                .launch(ops::flat(output.len()))?;
+        }
+        self.mark(Mark::Gather);
+        Ok(())
     }
 
     fn gather(
@@ -434,25 +731,73 @@ impl Canary {
         in_rows: u32,
     ) -> Result<CudaSlice<f32>> {
         let rows = u32::try_from(indices.len()).context("gather rows")?;
+        let mut output = self
+            .stream
+            .alloc_zeros(indices.len() * self.hidden as usize)?;
+        let index = self.stream.clone_htod(indices)?;
+        self.gather_device(table, &index, rows, in_rows, &mut output)?;
+        Ok(output)
+    }
+
+    fn place_row(
+        &self,
+        src: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+        row: &CudaSlice<i32>,
+        rows: u32,
+    ) -> Result<()> {
         let width = self.hidden;
         ensure!(
-            table.len() == in_rows as usize * width as usize,
-            "gather table length"
+            src.len() == width as usize && dst.len() == rows as usize * width as usize,
+            "row place length"
         );
-        let output = self.stream.alloc_zeros(indices.len() * width as usize)?;
-        let index = self.stream.clone_htod(indices)?;
         unsafe {
             self.stream
-                .launch_builder(&self.ops.gather)
-                .arg(table)
-                .arg(&index)
-                .arg(&output)
-                .arg(&rows)
-                .arg(&in_rows)
+                .launch_builder(&self.ops.place)
+                .arg(src)
+                .arg(&*dst)
+                .arg(row)
                 .arg(&width)
-                .launch(ops::flat(output.len()))?;
+                .arg(&rows)
+                .launch(ops::flat(width as usize))?;
         }
-        Ok(output)
+        self.mark(Mark::Place);
+        Ok(())
+    }
+
+    fn attend_into(
+        &self,
+        attention: &F32Attention,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        keys_mask: (u32, F32Mask),
+    ) -> Result<()> {
+        let (keys, mask) = keys_mask;
+        let hidden = self.hidden as usize;
+        ensure!(
+            hidden > 0 && q.len().is_multiple_of(hidden) && output.len() == q.len(),
+            "attention query length"
+        );
+        let queries = u32::try_from(q.len() / hidden).context("attention queries")?;
+        ensure!(
+            k.len() >= keys as usize * hidden && v.len() >= keys as usize * hidden,
+            "attention buffer length"
+        );
+        let stride = [u64::from(HEAD_DIM), u64::from(self.hidden), 1];
+        let q = view(q, &self.stream, 0, [HEADS, queries, HEAD_DIM], stride)?;
+        let k = view(k, &self.stream, 0, [HEADS, keys, HEAD_DIM], stride)?;
+        let v = view(v, &self.stream, 0, [HEADS, keys, HEAD_DIM], stride)?;
+        let seen = view(
+            &*output,
+            &self.stream,
+            0,
+            [HEADS, queries, HEAD_DIM],
+            stride,
+        )?;
+        attention.run_cublas(&self.blas, q, k, v, &mut TensorMut(seen), mask)?;
+        Ok(())
     }
 
     fn attend(
@@ -464,23 +809,8 @@ impl Canary {
         keys: u32,
         mask: F32Mask,
     ) -> Result<CudaSlice<f32>> {
-        let hidden = self.hidden as usize;
-        ensure!(
-            hidden > 0 && q.len().is_multiple_of(hidden),
-            "attention query length"
-        );
-        let queries = u32::try_from(q.len() / hidden).context("attention queries")?;
-        ensure!(
-            k.len() >= keys as usize * hidden && v.len() >= keys as usize * hidden,
-            "attention buffer length"
-        );
-        let output = self.stream.alloc_zeros(q.len())?;
-        let stride = [u64::from(HEAD_DIM), u64::from(self.hidden), 1];
-        let q = view(q, &self.stream, 0, [HEADS, queries, HEAD_DIM], stride)?;
-        let k = view(k, &self.stream, 0, [HEADS, keys, HEAD_DIM], stride)?;
-        let v = view(v, &self.stream, 0, [HEADS, keys, HEAD_DIM], stride)?;
-        let seen = view(&output, &self.stream, 0, [HEADS, queries, HEAD_DIM], stride)?;
-        attention.run_cublas(&self.blas, q, k, v, &mut TensorMut(seen), mask)?;
+        let mut output = self.stream.alloc_zeros(q.len())?;
+        self.attend_into(attention, q, k, v, &mut output, (keys, mask))?;
         Ok(output)
     }
 
@@ -663,6 +993,7 @@ impl Canary {
                 [HEADS, MAX_POSITIONS as u32, rows, HEAD_DIM, HEAD_DIM],
                 attention_workspace(MAX_POSITIONS as u32, rows)?,
             )?,
+            scratch: self.row_scratch()?,
         };
         let encoder_state = self.stream.clone_htod(encoder)?;
         self.project_cross(&encoder_state, &mut cache)?;
@@ -694,6 +1025,355 @@ impl Canary {
             self.cross_writes.fetch_add(2, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    fn row_scratch(&self) -> Result<RowScratch> {
+        let hidden = self.hidden as usize;
+        let bounds = self.stream.alloc_zeros::<i32>(2)?;
+        let bound_ptr = bounds.device_ptr(&self.stream).0;
+        Ok(RowScratch {
+            mix: self.stream.alloc_zeros(hidden)?,
+            pos: self.stream.alloc_zeros(hidden)?,
+            state: self.stream.alloc_zeros(hidden)?,
+            q: self.stream.alloc_zeros(hidden)?,
+            kv: self.stream.alloc_zeros(hidden)?,
+            attended: self.stream.alloc_zeros(hidden)?,
+            delta: self.stream.alloc_zeros(hidden)?,
+            expanded: self.stream.alloc_zeros(INTERMEDIATE as usize)?,
+            activated: self.stream.alloc_zeros(INTERMEDIATE as usize)?,
+            logits: self.stream.alloc_zeros(self.vocab as usize)?,
+            token: self.stream.alloc_zeros(1)?,
+            bounds,
+            picked: self.stream.alloc_zeros(1)?,
+            bound_ptr,
+            graph: None,
+        })
+    }
+
+    fn row_embed(&self, cache: &mut KvCache) -> Result<()> {
+        let vocab = self.vocab;
+        let positions = MAX_POSITIONS as u32;
+        self.gather_device(
+            &self.embed,
+            &cache.scratch.token,
+            1,
+            vocab,
+            &mut cache.scratch.mix,
+        )?;
+        self.gather_device(
+            &self.positions,
+            &cache.scratch.bounds,
+            1,
+            positions,
+            &mut cache.scratch.pos,
+        )?;
+        self.residual(&mut cache.scratch.mix, &cache.scratch.pos, 1.0)?;
+        self.normalize_into(
+            &cache.scratch.mix,
+            1,
+            &self.embedding_norm,
+            &mut cache.scratch.state,
+        )?;
+        Ok(())
+    }
+
+    fn row_self(&self, cache: &mut KvCache, index: usize) -> Result<()> {
+        self.normalize_into(
+            &cache.scratch.state,
+            1,
+            &self.layers[index].input_norm,
+            &mut cache.scratch.mix,
+        )?;
+        self.linear_into(
+            &cache.scratch.mix,
+            1,
+            &self.layers[index].self_attn.q,
+            &mut cache.scratch.q,
+            0,
+        )?;
+        self.linear_into(
+            &cache.scratch.mix,
+            1,
+            &self.layers[index].self_attn.k,
+            &mut cache.scratch.kv,
+            0,
+        )?;
+        self.place_row(
+            &cache.scratch.kv,
+            &mut cache.self_k[index],
+            &cache.scratch.bounds,
+            MAX_POSITIONS as u32,
+        )?;
+        self.linear_into(
+            &cache.scratch.mix,
+            1,
+            &self.layers[index].self_attn.v,
+            &mut cache.scratch.kv,
+            0,
+        )?;
+        self.place_row(
+            &cache.scratch.kv,
+            &mut cache.self_v[index],
+            &cache.scratch.bounds,
+            MAX_POSITIONS as u32,
+        )?;
+        let query = cache.scratch.bound_ptr;
+        cache.self_attn.set_length_device(query, query + 4);
+        let attended = self.attend_into(
+            &cache.self_attn,
+            &cache.scratch.q,
+            &cache.self_k[index],
+            &cache.self_v[index],
+            &mut cache.scratch.attended,
+            (
+                MAX_POSITIONS as u32,
+                F32Mask {
+                    causal: true,
+                    valid_keys: MAX_POSITIONS as u32,
+                    query_base: 0,
+                    window: 0,
+                },
+            ),
+        );
+        cache.self_attn.set_length_device(0, 0);
+        attended?;
+        self.linear_into(
+            &cache.scratch.attended,
+            1,
+            &self.layers[index].self_attn.o,
+            &mut cache.scratch.delta,
+            0,
+        )?;
+        self.residual(&mut cache.scratch.state, &cache.scratch.delta, 1.0)?;
+        Ok(())
+    }
+
+    fn row_cross(&self, cache: &mut KvCache, index: usize) -> Result<()> {
+        self.normalize_into(
+            &cache.scratch.state,
+            1,
+            &self.layers[index].post_norm,
+            &mut cache.scratch.mix,
+        )?;
+        self.linear_into(
+            &cache.scratch.mix,
+            1,
+            &self.layers[index].cross_attn.q,
+            &mut cache.scratch.q,
+            0,
+        )?;
+        self.attend_into(
+            &cache.cross_attn,
+            &cache.scratch.q,
+            &cache.cross_k[index],
+            &cache.cross_v[index],
+            &mut cache.scratch.attended,
+            (
+                cache.rows,
+                F32Mask {
+                    causal: false,
+                    valid_keys: cache.valid,
+                    query_base: 0,
+                    window: 0,
+                },
+            ),
+        )?;
+        self.linear_into(
+            &cache.scratch.attended,
+            1,
+            &self.layers[index].cross_attn.o,
+            &mut cache.scratch.delta,
+            0,
+        )?;
+        self.residual(&mut cache.scratch.state, &cache.scratch.delta, 1.0)?;
+        Ok(())
+    }
+
+    fn row_mlp(&self, cache: &mut KvCache, index: usize) -> Result<()> {
+        let width = self.layers[index].fc1.output;
+        self.normalize_into(
+            &cache.scratch.state,
+            1,
+            &self.layers[index].final_norm,
+            &mut cache.scratch.mix,
+        )?;
+        self.linear_into(
+            &cache.scratch.mix,
+            1,
+            &self.layers[index].fc1,
+            &mut cache.scratch.expanded,
+            0,
+        )?;
+        self.activate_into(
+            &cache.scratch.expanded,
+            1,
+            width,
+            &mut cache.scratch.activated,
+        )?;
+        self.linear_into(
+            &cache.scratch.activated,
+            1,
+            &self.layers[index].fc2,
+            &mut cache.scratch.delta,
+            0,
+        )?;
+        self.residual(&mut cache.scratch.state, &cache.scratch.delta, 1.0)?;
+        Ok(())
+    }
+
+    fn row_head(&self, cache: &mut KvCache) -> Result<()> {
+        self.normalize_into(&cache.scratch.state, 1, &self.norm, &mut cache.scratch.mix)?;
+        self.linear_into(
+            &cache.scratch.mix,
+            1,
+            &self.proj,
+            &mut cache.scratch.logits,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn row_body(&self, cache: &mut KvCache) -> Result<()> {
+        self.row_embed(cache)?;
+        for index in 0..self.layers.len() {
+            self.row_self(cache, index)?;
+            self.row_cross(cache, index)?;
+            self.row_mlp(cache, index)?;
+        }
+        self.row_head(cache)
+    }
+
+    fn stage_bounds(&self, cache: &mut KvCache) -> Result<()> {
+        let position = cache.filled;
+        let filled = position
+            .checked_add(1)
+            .context("decoder position {MAX_POSITIONS}")?;
+        ensure!(
+            (filled as usize) <= MAX_POSITIONS,
+            "decoder position {MAX_POSITIONS}"
+        );
+        self.stream
+            .memcpy_htod(&[position as i32, filled as i32], &mut cache.scratch.bounds)?;
+        self.mark_bytes(Mark::H2d, 8);
+        Ok(())
+    }
+
+    fn stage(&self, cache: &mut KvCache, token: TokenSource) -> Result<()> {
+        require_step_position(cache.filled as usize)?;
+        match token {
+            TokenSource::Host(id) => {
+                ensure!(id < self.vocab, "token id >= {}", self.vocab);
+                self.stream
+                    .memcpy_htod(&[id as i32], &mut cache.scratch.token)?;
+                self.mark_bytes(Mark::H2d, 4);
+            }
+            TokenSource::Device => {
+                self.stream
+                    .memcpy_dtod(&cache.scratch.picked, &mut cache.scratch.token)?;
+                self.mark_bytes(Mark::D2d, 4);
+            }
+        }
+        self.stage_bounds(cache)
+    }
+
+    fn device_argmax(&self, ptr: u64, picked: &mut CudaSlice<i32>) -> Result<u32> {
+        let count = u64::from(self.vocab);
+        let vocab = self.vocab as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.ops.finite)
+                .arg(&ptr)
+                .arg(&ptr)
+                .arg(&count)
+                .launch(ops::flat(self.vocab as usize))?;
+            self.mark(Mark::Finite);
+            self.stream
+                .launch_builder(&self.ops.argmax)
+                .arg(&ptr)
+                .arg(&mut *picked)
+                .arg(&vocab)
+                .launch(ops::grid(1, 1024))?;
+        }
+        self.mark(Mark::Argmax);
+        let mut id = [0i32; 1];
+        self.stream
+            .memcpy_dtoh(&*picked, &mut id)
+            .context("device argmax")?;
+        self.mark_bytes(Mark::D2h, 4);
+        ensure!(id[0] >= 0, "device argmax id");
+        let id = id[0] as u32;
+        ensure!(id < self.vocab, "token id >= {}", self.vocab);
+        Ok(id)
+    }
+
+    fn replay_row(&self, cache: &mut KvCache) -> Result<()> {
+        if !self.graph_on.get() {
+            return self.row_body(cache);
+        }
+        if cache.scratch.graph.is_some() {
+            cache
+                .scratch
+                .graph
+                .as_ref()
+                .context("graph")?
+                .launch()
+                .context("graph launch")?;
+            self.mark(Mark::GraphLaunch);
+            return Ok(());
+        }
+        #[cfg(test)]
+        let saved = self.snap(cache);
+        self.row_body(cache)?;
+        self.stream.synchronize().context("graph warmup")?;
+        #[cfg(test)]
+        self.restore(cache, &saved);
+        self.stream
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .context("graph begin")?;
+        let ran = self.row_body(cache);
+        let captured = self
+            .stream
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+        ran.context("graph body")?;
+        let graph = captured?.context("empty graph")?;
+        graph.upload().context("graph upload")?;
+        self.stream.synchronize().context("graph upload")?;
+        cache.scratch.graph = Some(graph);
+        self.mark(Mark::GraphCapture);
+        Ok(())
+    }
+
+    fn cached_row(&self, cache: &mut KvCache, token: TokenSource) -> Result<u32> {
+        #[cfg(test)]
+        let before = self.snap(cache);
+        self.stage(cache, token)?;
+        self.replay_row(cache)?;
+        let ptr = cache.scratch.logits.device_ptr(&self.stream).0;
+        let id = self.device_argmax(ptr, &mut cache.scratch.picked)?;
+        #[cfg(test)]
+        self.note(cache, &before);
+        #[cfg(test)]
+        self.check_scan(&cache.scratch.logits, id)?;
+        cache.filled += 1;
+        Ok(id)
+    }
+
+    fn argmax_last(
+        &self,
+        logits: &CudaSlice<f32>,
+        rows: u32,
+        picked: &mut CudaSlice<i32>,
+    ) -> Result<u32> {
+        let width = self.vocab as usize;
+        ensure!(
+            rows > 0 && logits.len() == rows as usize * width,
+            "logit length"
+        );
+        let row = logits.slice((rows as usize - 1) * width..rows as usize * width);
+        let ptr = row.device_ptr(&self.stream).0;
+        self.device_argmax(ptr, picked)
     }
 
     fn cached_block(&self, cache: &mut KvCache, tokens: &[u32]) -> Result<CudaSlice<f32>> {
@@ -807,20 +1487,34 @@ impl Canary {
     }
 
     fn greedy_loop(&self, mut cache: KvCache, prompt: &[u32]) -> Result<(Vec<u32>, Vec<f32>)> {
+        self.clear_steps();
         require_prompt_length(prompt.len())?;
         require_token_ids(prompt, self.vocab)?;
         let mut ids = prompt.to_vec();
-        let logits = self.cached_block(&mut cache, prompt)?;
-        let prefill_logits = self.last_logit_row(&logits, u32::try_from(prompt.len())?)?;
-        let mut row = prefill_logits.clone();
+        let rows = u32::try_from(prompt.len()).context("decoder sequence length")?;
+        let (mut next, prefill_logits) = if prompt.len() == 1 {
+            let id = self.cached_row(&mut cache, TokenSource::Host(prompt[0]))?;
+            let prefill_logits = self
+                .stream
+                .clone_dtoh(&cache.scratch.logits)
+                .context("prefill logits")?;
+            (id, prefill_logits)
+        } else {
+            let logits = self.cached_block(&mut cache, prompt)?;
+            let prefill_logits = self.last_logit_row(&logits, rows)?;
+            let id = self.argmax_last(&logits, rows, &mut cache.scratch.picked)?;
+            ensure!(
+                id == Self::argmax_row(&prefill_logits)?,
+                "prefill device argmax {id}"
+            );
+            (id, prefill_logits)
+        };
         loop {
-            let next = Self::argmax_row(&row)?;
             ids.push(next);
             if next == 3 {
                 break;
             }
-            let step = self.cached_block(&mut cache, &[next])?;
-            row = self.last_logit_row(&step, 1)?;
+            next = self.cached_row(&mut cache, TokenSource::Device)?;
         }
         Ok((ids, prefill_logits))
     }
@@ -874,13 +1568,31 @@ impl Canary {
             prefill > 0 && prefill <= tokens.len(),
             "decoder prefill length"
         );
+        self.clear_steps();
         let mut cache = self.open_cache(encoder, valid)?;
         let mut logits = Vec::with_capacity(tokens.len() * self.vocab as usize);
-        let first = self.cached_block(&mut cache, &tokens[..prefill])?;
-        logits.extend(self.stream.clone_dtoh(&first)?);
+        if prefill == 1 {
+            let id = self.cached_row(&mut cache, TokenSource::Host(tokens[0]))?;
+            let row = self.stream.clone_dtoh(&cache.scratch.logits)?;
+            ensure!(id == Self::argmax_row(&row)?, "prefill device argmax {id}");
+            logits.extend(row);
+        } else {
+            let first = self.cached_block(&mut cache, &tokens[..prefill])?;
+            let host = self.stream.clone_dtoh(&first)?;
+            let rows = u32::try_from(prefill).context("decoder sequence length")?;
+            let id = self.argmax_last(&first, rows, &mut cache.scratch.picked)?;
+            let start = (prefill - 1) * self.vocab as usize;
+            ensure!(
+                id == Self::argmax_row(&host[start..start + self.vocab as usize])?,
+                "prefill device argmax {id}"
+            );
+            logits.extend(host);
+        }
         for id in &tokens[prefill..] {
-            let row = self.cached_block(&mut cache, &[*id])?;
-            logits.extend(self.stream.clone_dtoh(&row)?);
+            let chosen = self.cached_row(&mut cache, TokenSource::Host(*id))?;
+            let row = self.stream.clone_dtoh(&cache.scratch.logits)?;
+            ensure!(chosen == Self::argmax_row(&row)?, "device argmax {chosen}");
+            logits.extend(row);
         }
         Ok(logits)
     }
@@ -894,11 +1606,70 @@ impl Canary {
         prefill: usize,
     ) -> Result<Vec<f32>> {
         ensure!(tokens.len() == prefill + 1, "decoder shift length");
+        self.clear_steps();
         let mut cache = self.open_cache(encoder, valid)?;
-        self.cached_block(&mut cache, &tokens[..prefill])?;
+        if prefill == 1 {
+            self.cached_row(&mut cache, TokenSource::Host(tokens[0]))?;
+        } else {
+            self.cached_block(&mut cache, &tokens[..prefill])?;
+        }
         self.shift_cross_k(&mut cache)?;
-        let row = self.cached_block(&mut cache, &tokens[prefill..])?;
-        self.last_logit_row(&row, 1)
+        self.cached_row(&mut cache, TokenSource::Host(tokens[prefill]))?;
+        self.stream
+            .clone_dtoh(&cache.scratch.logits)
+            .context("shifted logits")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_graph(&self, on: bool) {
+        self.graph_on.set(on);
+    }
+
+    fn clear_steps(&self) {
+        #[cfg(test)]
+        self.steps.borrow_mut().clear();
+    }
+
+    #[cfg(test)]
+    fn check_scan(&self, logits: &CudaSlice<f32>, id: u32) -> Result<()> {
+        let host = self.stream.clone_dtoh(logits).context("host scan")?;
+        let host_id = Self::argmax_row(&host)?;
+        ensure!(host_id == id, "device argmax {id} host scan {host_id}");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn snap(&self, cache: &KvCache) -> Snap {
+        let self_attn = cache.self_attn.attention_launches();
+        let cross_attn = cache.cross_attn.attention_launches();
+        let mut host = self.tally.host();
+        host.strided = self_attn[0] + cross_attn[0];
+        host.exclude = self_attn[1] + cross_attn[1];
+        host.softmax = self_attn[2] + cross_attn[2];
+        host.sum_parts = self_attn[3] + cross_attn[3];
+        Snap {
+            host,
+            self_attn,
+            cross_attn,
+        }
+    }
+
+    #[cfg(test)]
+    fn restore(&self, cache: &KvCache, saved: &Snap) {
+        self.tally.store(saved.host);
+        cache.self_attn.set_attention_launches(saved.self_attn);
+        cache.cross_attn.set_attention_launches(saved.cross_attn);
+    }
+
+    #[cfg(test)]
+    fn note(&self, cache: &KvCache, before: &Snap) {
+        let after = self.snap(cache);
+        self.steps.borrow_mut().push(after.host.sub(before.host));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_steps(&self) -> Vec<StepTally> {
+        std::mem::take(&mut *self.steps.borrow_mut())
     }
 
     #[cfg(test)]

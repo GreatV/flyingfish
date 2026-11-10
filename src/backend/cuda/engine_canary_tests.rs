@@ -1,6 +1,9 @@
 #![cfg(feature = "cuda")]
 
-use super::{Device, engine_canary::Canary};
+use super::{
+    Device,
+    engine_canary::{Canary, StepTally},
+};
 use anyhow::{Context, Result, ensure};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
@@ -503,6 +506,22 @@ fn match_decoder(engine: &Canary, fixtures: &Path, floors: &Value) -> Result<()>
                 &decoded.2,
                 spec,
             )?;
+            compare_cached(
+                engine,
+                &isolated_item.encoder,
+                isolated_item.rows,
+                isolated_item.valid_rows,
+                &isolated_item.tokens,
+                &format!("CANARY_DECODER isolated {case}/{index}"),
+            )?;
+            compare_cached(
+                engine,
+                &isolated_item.encoder,
+                isolated_item.rows,
+                isolated_item.valid_rows,
+                &isolated_item.tokens_de,
+                &format!("CANARY_DECODER isolated {case}/{index} de"),
+            )?;
         }
     }
     for defect in &defects {
@@ -695,14 +714,305 @@ fn check_generated(
     Ok(())
 }
 
+const TEACHER_H2D: u64 = 4 + 8;
+const DEVICE_H2D: u64 = 8;
+const ARGMAX_D2H: u64 = 4;
+const DEVICE_D2D: u64 = 4;
+
+fn attention_parts(keys: u32) -> u32 {
+    let chunk = keys.div_ceil(32).max(512).next_multiple_of(4);
+    keys.div_ceil(chunk)
+}
+
+fn body_launches(cross_rows: u32, cross_valid: u32) -> StepTally {
+    let strided =
+        u64::from(8 * (1 + attention_parts(1024)) + 8 * (1 + attention_parts(cross_rows)));
+    let exclude = 8 + if cross_valid == cross_rows { 0 } else { 8 };
+    StepTally {
+        gemm_ex: 65,
+        bias: 65,
+        norm: 26,
+        residual: 25,
+        activation: 8,
+        gather: 2,
+        place: 16,
+        exclude,
+        softmax: 16,
+        sum_parts: 16,
+        strided,
+        argmax: 0,
+        finite: 0,
+        h2d: 0,
+        d2h: 0,
+        d2d: 0,
+        graph_launches: 0,
+        graph_captures: 0,
+    }
+}
+
+fn launch_total(step: &StepTally) -> u64 {
+    step.gemm_ex
+        + step.bias
+        + step.norm
+        + step.residual
+        + step.activation
+        + step.gather
+        + step.place
+        + step.exclude
+        + step.softmax
+        + step.sum_parts
+        + step.strided
+}
+
+fn capture_tally(cross_rows: u32, cross_valid: u32, teacher: bool) -> StepTally {
+    let mut step = body_launches(cross_rows, cross_valid);
+    step.argmax = 1;
+    step.finite = 1;
+    step.h2d = if teacher { TEACHER_H2D } else { DEVICE_H2D };
+    step.d2h = ARGMAX_D2H;
+    step.d2d = if teacher { 0 } else { DEVICE_D2D };
+    step.graph_captures = 1;
+    step
+}
+
+fn eager_tally(cross_rows: u32, cross_valid: u32, teacher: bool) -> StepTally {
+    let mut step = capture_tally(cross_rows, cross_valid, teacher);
+    step.graph_captures = 0;
+    step
+}
+
+fn replay_tally(teacher: bool) -> StepTally {
+    StepTally {
+        gemm_ex: 0,
+        bias: 0,
+        norm: 0,
+        residual: 0,
+        activation: 0,
+        gather: 0,
+        place: 0,
+        exclude: 0,
+        softmax: 0,
+        sum_parts: 0,
+        strided: 0,
+        argmax: 1,
+        finite: 1,
+        h2d: if teacher { TEACHER_H2D } else { DEVICE_H2D },
+        d2h: ARGMAX_D2H,
+        d2d: if teacher { 0 } else { DEVICE_D2D },
+        graph_launches: 1,
+        graph_captures: 0,
+    }
+}
+
+fn assert_named(label: &str, step: &StepTally, valid_eq_rows: bool) -> Result<()> {
+    ensure!(step.gather == 2, "{label} gather {}", step.gather);
+    ensure!(step.softmax == 16, "{label} softmax {}", step.softmax);
+    ensure!(step.sum_parts == 16, "{label} sum_parts {}", step.sum_parts);
+    ensure!(
+        step.exclude == if valid_eq_rows { 8 } else { 16 },
+        "{label} exclude {}",
+        step.exclude
+    );
+    Ok(())
+}
+
+fn assert_graph_steps(
+    label: &str,
+    steps: &[StepTally],
+    rows: u32,
+    valid: u32,
+    teacher: bool,
+) -> Result<()> {
+    ensure!(!steps.is_empty(), "{label} has no 1-row step");
+    let expected = capture_tally(rows, valid, teacher);
+    ensure!(
+        steps[0] == expected,
+        "{label} capture {steps:?} expected {expected:?}"
+    );
+    assert_named(&format!("{label} capture"), &steps[0], valid == rows)?;
+    let replay = replay_tally(teacher);
+    for (index, step) in steps.iter().enumerate().skip(1) {
+        ensure!(
+            *step == replay,
+            "{label} replay {index} {step:?} expected {replay:?}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_eager_steps(
+    label: &str,
+    steps: &[StepTally],
+    rows: u32,
+    valid: u32,
+    teacher: bool,
+) -> Result<()> {
+    let expected = eager_tally(rows, valid, teacher);
+    for (index, step) in steps.iter().enumerate() {
+        ensure!(
+            *step == expected,
+            "{label} eager {index} {step:?} expected {expected:?}"
+        );
+        assert_named(&format!("{label} eager {index}"), step, valid == rows)?;
+    }
+    Ok(())
+}
+
+fn first_mismatch(left: &[f32], right: &[f32]) -> usize {
+    if left.len() != right.len() {
+        return left.len().min(right.len());
+    }
+    left.iter()
+        .zip(right)
+        .position(|(left, right)| left.to_bits() != right.to_bits())
+        .unwrap_or(left.len())
+}
+
+fn compare_cached(
+    engine: &Canary,
+    encoder: &[f32],
+    rows: usize,
+    valid: usize,
+    tokens: &[u32],
+    label: &str,
+) -> Result<()> {
+    ensure!(
+        tokens.len() == SEQUENCE && rows > 0 && encoder.len() == rows * HIDDEN,
+        "{label} cached shape"
+    );
+    let rows_u = u32::try_from(rows).context("encoder rows")?;
+    let valid_u = u32::try_from(valid).context("encoder valid")?;
+    engine.set_graph(true);
+    let graph = engine.cached_logits(encoder, valid, tokens, PREFILL)?;
+    let steps = engine.take_steps();
+    ensure!(
+        steps.len() == SEQUENCE - PREFILL,
+        "{label} graph steps {}",
+        steps.len()
+    );
+    assert_graph_steps(label, &steps, rows_u, valid_u, true)?;
+    engine.set_graph(false);
+    let eager = engine.cached_logits(encoder, valid, tokens, PREFILL)?;
+    ensure!(
+        bit_equal(&graph, &eager),
+        "{label} graph/eager logit mismatch at {}",
+        first_mismatch(&graph, &eager)
+    );
+    let eager_steps = engine.take_steps();
+    ensure!(
+        eager_steps.len() == SEQUENCE - PREFILL,
+        "{label} eager steps {}",
+        eager_steps.len()
+    );
+    assert_eager_steps(label, &eager_steps, rows_u, valid_u, true)?;
+    engine.set_graph(true);
+    Ok(())
+}
+
+fn check_device_steps(
+    engine: &Canary,
+    label: &str,
+    ids: &[u32],
+    prompt_len: usize,
+    encoder: &[f32],
+    valid_rows: usize,
+) -> Result<()> {
+    let steps = engine.take_steps();
+    ensure!(
+        ids.len() > prompt_len && ids.last() == Some(&3),
+        "{label} ids"
+    );
+    ensure!(
+        steps.len() == ids.len() - prompt_len - 1,
+        "{label} steps {} ids {}",
+        steps.len(),
+        ids.len()
+    );
+    ensure!(!steps.is_empty(), "{label} device step");
+    let rows = encoder.len() / HIDDEN;
+    ensure!(
+        encoder.len() == rows * HIDDEN && rows > 0,
+        "{label} encoder rows"
+    );
+    assert_graph_steps(
+        label,
+        &steps,
+        u32::try_from(rows).context("encoder rows")?,
+        u32::try_from(valid_rows).context("encoder valid")?,
+        false,
+    )
+}
+
+#[test]
+fn one_row_launch_inventory() {
+    assert_eq!(attention_parts(1024), 2);
+    assert_eq!(attention_parts(376), 1);
+    assert_eq!(attention_parts(512), 1);
+    assert_eq!(attention_parts(513), 2);
+    assert_eq!(attention_parts(1), 1);
+    let full = body_launches(376, 376);
+    assert_eq!(
+        full,
+        StepTally {
+            gemm_ex: 65,
+            bias: 65,
+            norm: 26,
+            residual: 25,
+            activation: 8,
+            gather: 2,
+            place: 16,
+            exclude: 8,
+            softmax: 16,
+            sum_parts: 16,
+            strided: 40,
+            argmax: 0,
+            finite: 0,
+            h2d: 0,
+            d2h: 0,
+            d2d: 0,
+            graph_launches: 0,
+            graph_captures: 0,
+        }
+    );
+    assert_eq!(launch_total(&full), 287);
+    let wide = body_launches(513, 513);
+    assert_eq!(wide.strided, 48);
+    assert_eq!(wide.exclude, 8);
+    assert_eq!(launch_total(&wide), 295);
+    let dropped = body_launches(376, 375);
+    assert_eq!(dropped.exclude, 16);
+    assert_eq!(dropped.strided, 40);
+    assert_eq!(launch_total(&dropped), 295);
+    assert_eq!(TEACHER_H2D, 12);
+    assert_eq!(DEVICE_H2D, 8);
+    assert_eq!(ARGMAX_D2H, 4);
+    assert_eq!(DEVICE_D2D, 4);
+    assert_eq!(capture_tally(376, 376, true).h2d, 12);
+    assert_eq!(capture_tally(376, 376, true).d2d, 0);
+    assert_eq!(capture_tally(376, 376, true).d2h, 4);
+    assert_eq!(capture_tally(376, 376, true).graph_captures, 1);
+    assert_eq!(capture_tally(376, 376, true).graph_launches, 0);
+    assert_eq!(capture_tally(376, 376, false).h2d, 8);
+    assert_eq!(capture_tally(376, 376, false).d2d, 4);
+    assert_eq!(replay_tally(true).graph_launches, 1);
+    assert_eq!(replay_tally(true).gemm_ex, 0);
+    assert_eq!(replay_tally(false).d2d, 4);
+    assert_eq!(eager_tally(376, 376, true).graph_captures, 0);
+    assert_eq!(eager_tally(376, 376, true).gemm_ex, 65);
+    assert_eq!(launch_total(&eager_tally(513, 513, true)), 295);
+    assert_eq!(launch_total(&eager_tally(376, 375, true)), 295);
+}
+
 fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) -> Result<()> {
     engine.reset_encode_calls();
     engine.reset_cross_writes();
+    engine.set_graph(true);
     ensure!(
         engine.encode_calls() == 0 && engine.cross_writes() == 0,
         "counters did not reset"
     );
     let mut defects = Vec::new();
+    let mut eager_opens = 0u64;
     for case in ["short", "edges", "production"] {
         let items = read_numeric(&fixtures.join("numeric").join(format!("{case}.safetensors")))?;
         let (max_bound, rmse_bound) = (
@@ -718,6 +1028,16 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
                 item.logits.iter().all(|value| value.is_finite()),
                 "{case}/{index} non-finite fixture"
             );
+            let rows = item.encoder.len() / HIDDEN;
+            ensure!(
+                item.encoder.len() == rows * HIDDEN && rows > 0,
+                "{case}/{index} encoder rows"
+            );
+            if case == "production" {
+                ensure!(rows == 376, "{case}/{index} encoder rows {rows}");
+            }
+            let rows_u = u32::try_from(rows).context("encoder rows")?;
+            let valid_u = u32::try_from(item.valid_rows).context("encoder valid")?;
             let before = engine.cross_writes();
             let logits =
                 engine.cached_logits(&item.encoder, item.valid_rows, &item.tokens, PREFILL)?;
@@ -726,6 +1046,19 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
                 cross_delta(engine, before)? == 16,
                 "{case}/{index} cross writes"
             );
+            let steps = engine.take_steps();
+            ensure!(
+                steps.len() == SEQUENCE - PREFILL,
+                "{case}/{index} graph steps {}",
+                steps.len()
+            );
+            assert_graph_steps(
+                &format!("CANARY_GREEDY {case}/{index}"),
+                &steps,
+                rows_u,
+                valid_u,
+                true,
+            )?;
             within(
                 &mut defects,
                 &format!("CANARY_GREEDY {case}/{index}"),
@@ -740,6 +1073,34 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
                 &logits,
                 &floors["cases"][case]["items"][index],
             )?;
+            let before = engine.cross_writes();
+            engine.set_graph(false);
+            let eager =
+                engine.cached_logits(&item.encoder, item.valid_rows, &item.tokens, PREFILL)?;
+            ensure!(
+                cross_delta(engine, before)? == 16,
+                "{case}/{index} eager cross writes"
+            );
+            ensure!(
+                bit_equal(&logits, &eager),
+                "{case}/{index} graph/eager logit mismatch at {}",
+                first_mismatch(&logits, &eager)
+            );
+            let eager_steps = engine.take_steps();
+            ensure!(
+                eager_steps.len() == SEQUENCE - PREFILL,
+                "{case}/{index} eager steps {}",
+                eager_steps.len()
+            );
+            assert_eager_steps(
+                &format!("CANARY_GREEDY {case}/{index}"),
+                &eager_steps,
+                rows_u,
+                valid_u,
+                true,
+            )?;
+            engine.set_graph(true);
+            eager_opens += 1;
         }
     }
     let production = read_numeric(&fixtures.join("numeric/production.safetensors"))?;
@@ -760,6 +1121,17 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
     )?;
     ensure!(engine.encode_calls() == 0, "shift encode calls");
     ensure!(cross_delta(engine, before)? == 16, "shift cross writes");
+    let shift_steps = engine.take_steps();
+    let shift_rows = production[0].encoder.len() / HIDDEN;
+    ensure!(shift_rows == 376, "production shift rows {shift_rows}");
+    ensure!(shift_steps.len() == 1, "shift steps {}", shift_steps.len());
+    assert_graph_steps(
+        "CANARY_GREEDY production cross-k-shift",
+        &shift_steps,
+        u32::try_from(shift_rows).context("encoder rows")?,
+        u32::try_from(production[0].valid_rows).context("encoder valid")?,
+        true,
+    )?;
     far(
         &mut defects,
         "CANARY_GREEDY production cross-k-shift",
@@ -779,10 +1151,26 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
     let cross = engine.cross_writes();
     let (ids0, _) = engine.transcribe(&clip0.features, clip0.valid_frames, &clip0.prompt)?;
     ensure!(cross_delta(engine, cross)? == 16, "clip 0 cross writes");
+    check_device_steps(
+        engine,
+        "CANARY_GREEDY clip0",
+        &ids0,
+        clip0.prompt.len(),
+        &clip0.encoder,
+        clip0.valid_rows,
+    )?;
     let cross = engine.cross_writes();
     let (ids1, _) = engine.transcribe(&clip1.features, clip1.valid_frames, &clip1.prompt)?;
     ensure!(engine.encode_calls() - encodes == 2, "clip encode delta");
     ensure!(cross_delta(engine, cross)? == 16, "clip 1 cross writes");
+    check_device_steps(
+        engine,
+        "CANARY_GREEDY clip1",
+        &ids1,
+        clip1.prompt.len(),
+        &clip1.encoder,
+        clip1.valid_rows,
+    )?;
     check_generated(
         &mut defects,
         "CANARY_GREEDY clip0",
@@ -823,6 +1211,14 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
         cross_delta(engine, cross)? == 16,
         "swapped clip 1 cross writes"
     );
+    check_device_steps(
+        engine,
+        "CANARY_GREEDY clip1 order",
+        &ids1_again,
+        clip1.prompt.len(),
+        &clip1.encoder,
+        clip1.valid_rows,
+    )?;
     let cross = engine.cross_writes();
     let (ids0_again, _) = engine.transcribe(&clip0.features, clip0.valid_frames, &clip0.prompt)?;
     ensure!(engine.encode_calls() - encodes == 2, "swapped encode delta");
@@ -830,6 +1226,14 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
         cross_delta(engine, cross)? == 16,
         "swapped clip 0 cross writes"
     );
+    check_device_steps(
+        engine,
+        "CANARY_GREEDY clip0 order",
+        &ids0_again,
+        clip0.prompt.len(),
+        &clip0.encoder,
+        clip0.valid_rows,
+    )?;
     if ids0_again != ids0 || ids1_again != ids1 {
         defects.push(format!(
             "CANARY_GREEDY order DEFECT clip0={ids0_again:?} clip1={ids1_again:?}"
@@ -843,6 +1247,14 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
         engine.greedy(&clip_de.encoder, clip_de.valid_rows, &clip_de.prompt)?;
     ensure!(engine.encode_calls() == encodes, "de-prompt encode calls");
     ensure!(cross_delta(engine, cross)? == 16, "de-prompt cross writes");
+    check_device_steps(
+        engine,
+        "CANARY_GREEDY clip0_de",
+        &de_ids,
+        clip_de.prompt.len(),
+        &clip_de.encoder,
+        clip_de.valid_rows,
+    )?;
     check_generated(
         &mut defects,
         "CANARY_GREEDY clip0_de",
@@ -866,7 +1278,11 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
             .as_f64()
             .context("prefill rmse")?,
     )?;
-    ensure!(engine.cross_writes() == 11 * 16, "cross-write total");
+    ensure!(
+        engine.cross_writes() == (11 + eager_opens) * 16,
+        "cross-write total {} eager_opens {eager_opens}",
+        engine.cross_writes()
+    );
     for defect in &defects {
         println!("{defect}");
     }
@@ -903,3 +1319,4 @@ fn canary_greedy_matches_reference() -> Result<()> {
     let engine = Canary::load(&model, &device)?;
     match_greedy(&engine, &fixtures, &floors, &model)
 }
+

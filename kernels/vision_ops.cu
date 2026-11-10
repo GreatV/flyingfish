@@ -345,6 +345,16 @@ extern "C" __global__ void vision_row_gather_f32(
     vision_row_gather_rows(input, indices, gathered, rows, in_rows, width);
 }
 
+// dst[*row * width + column] = src[column]. *row is a device index in 0..rows.
+extern "C" __global__ void row_place_f32(
+    const float* src, float* dst, const int32_t* row, uint32_t width, uint32_t rows) {
+    if (!vision_flat_launch() || !src || !dst || !row || !width || !rows) { __trap(); return; }
+    const int32_t r = *row;
+    if (r < 0 || uint32_t(r) >= rows) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256u + threadIdx.x; i < width; i += gridDim.x * 256u)
+        dst[uint64_t(uint32_t(r)) * width + i] = src[i];
+}
+
 // Mean of each consecutive `k`-row group over `width` BF16 columns: f32 sum, one BF16 round.
 extern "C" __global__ void vision_mean_rows(
     const __nv_bfloat16* input, __nv_bfloat16* out, uint32_t rows, uint32_t width, uint32_t k) {

@@ -845,9 +845,13 @@ extern "C" __global__ void argmax_rows_f32(
 // scores layout is [heads, queries, keys]. A key is excluded when
 // key >= valid_keys, when causal != 0 and key > query_base + local_query, or when
 // window != 0 and key + window <= query_base + local_query. window 0 drops no extra key.
+// A non-null query_base_dev or valid_keys_dev replaces that by-value argument.
 extern "C" __global__ void score_exclude_f32(
     float* scores, uint32_t heads, uint32_t queries, uint32_t keys,
-    uint32_t query_base, uint32_t valid_keys, uint32_t causal, uint32_t window) {
+    uint32_t query_base, uint32_t valid_keys, uint32_t causal, uint32_t window,
+    const uint32_t* query_base_dev, const uint32_t* valid_keys_dev) {
+    if (query_base_dev) query_base = *query_base_dev;
+    if (valid_keys_dev) valid_keys = *valid_keys_dev;
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 ||
         gridDim.z != 1 || !scores || !heads || !queries || !keys || valid_keys > keys ||
         causal > 1) {

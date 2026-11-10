@@ -4,6 +4,8 @@ use anyhow::Context;
 use anyhow::{Result, ensure};
 use half::bf16;
 #[cfg(feature = "cuda")]
+use std::cell::Cell;
+#[cfg(feature = "cuda")]
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
 
@@ -1570,6 +1572,16 @@ pub(crate) struct F32Attention {
     probabilities: CudaSlice<f32>,
     softmax: CudaFunction,
     exclude: CudaFunction,
+    length_query: Cell<u64>,
+    length_valid: Cell<u64>,
+    #[cfg(test)]
+    strided_n: Cell<u64>,
+    #[cfg(test)]
+    exclude_n: Cell<u64>,
+    #[cfg(test)]
+    softmax_n: Cell<u64>,
+    #[cfg(test)]
+    sum_n: Cell<u64>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1626,7 +1638,37 @@ impl F32Attention {
             softmax,
             exclude,
             stream,
+            length_query: Cell::new(0),
+            length_valid: Cell::new(0),
+            #[cfg(test)]
+            strided_n: Cell::new(0),
+            #[cfg(test)]
+            exclude_n: Cell::new(0),
+            #[cfg(test)]
+            softmax_n: Cell::new(0),
+            #[cfg(test)]
+            sum_n: Cell::new(0),
         })
+    }
+    pub(crate) fn set_length_device(&self, query_base: u64, valid_keys: u64) {
+        self.length_query.set(query_base);
+        self.length_valid.set(valid_keys);
+    }
+    #[cfg(test)]
+    pub(crate) fn attention_launches(&self) -> [u64; 4] {
+        [
+            self.strided_n.get(),
+            self.exclude_n.get(),
+            self.softmax_n.get(),
+            self.sum_n.get(),
+        ]
+    }
+    #[cfg(test)]
+    pub(crate) fn set_attention_launches(&self, counts: [u64; 4]) {
+        self.strided_n.set(counts[0]);
+        self.exclude_n.set(counts[1]);
+        self.softmax_n.set(counts[2]);
+        self.sum_n.set(counts[3]);
     }
     pub(crate) fn issued_launches(&self, queries: u32, keys: u32, mask: &F32Mask) -> Result<u64> {
         let [_, cap_queries, cap_keys, _, _] = self.geometry;
@@ -1761,6 +1803,8 @@ impl F32Attention {
                 )
             }
         };
+        let query_dev = self.length_query.get();
+        let valid_dev = self.length_valid.get();
         for start in (0..queries).step_by(self.tile as usize) {
             let rows = self.tile.min(queries - start);
             let stride = [u64::from(rows) * u64::from(keys), u64::from(keys), 1];
@@ -1781,6 +1825,8 @@ impl F32Attention {
                     self.probabilities.len() as u64 * 4,
                 )?
             };
+            #[cfg(test)]
+            self.strided_n.set(self.strided_n.get() + 1);
             gemm(
                 slice(q, start, rows)?,
                 k,
@@ -1812,8 +1858,12 @@ impl F32Attention {
                         .arg(&valid_keys)
                         .arg(&u32::from(causal))
                         .arg(&window)
+                        .arg(&query_dev)
+                        .arg(&valid_dev)
                         .launch(super::ops::grid(blocks, 256))?;
                 }
+                #[cfg(test)]
+                self.exclude_n.set(self.exclude_n.get() + 1);
             }
             let softmax_rows = heads
                 .checked_mul(rows)
@@ -1828,6 +1878,8 @@ impl F32Attention {
                     .arg(&i64::from(keys))
                     .launch(super::ops::grid(softmax_rows as usize, 256))?;
             }
+            #[cfg(test)]
+            self.softmax_n.set(self.softmax_n.get() + 1);
             let part_elements = u64::from(heads) * u64::from(rows) * u64::from(value_dim);
             for (part, first) in (0..keys).step_by(self.key_chunk as usize).enumerate() {
                 let columns = self.key_chunk.min(keys - first);
@@ -1852,6 +1904,8 @@ impl F32Attention {
                         self.partials.len() as u64 * 4 - offset,
                     )?
                 };
+                #[cfg(test)]
+                self.strided_n.set(self.strided_n.get() + 1);
                 gemm(
                     left,
                     slice(v, first, columns)?,
@@ -1877,6 +1931,8 @@ impl F32Attention {
                         256,
                     ))?;
             }
+            #[cfg(test)]
+            self.sum_n.set(self.sum_n.get() + 1);
         }
         Ok(())
     }
