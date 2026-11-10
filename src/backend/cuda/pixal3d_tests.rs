@@ -1,3 +1,4 @@
+use super::super::{env_path, fixture_reference};
 use super::*;
 use crate::checkpoint::MappedCheckpoint;
 use serde_json::Value;
@@ -156,11 +157,6 @@ fn bank_sites(path: &Path) -> Result<SparseSites> {
 fn id(table: &str, name: &str, key: Option<&str>) -> CellId {
     (table.into(), name.into(), key.map(str::to_owned))
 }
-fn env_path(name: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(
-        std::env::var_os(name).with_context(|| format!("{name} required"))?,
-    ))
-}
 
 struct OperationGate {
     root: PathBuf,
@@ -274,10 +270,11 @@ impl OperationGate {
             decoder_key: None,
         })
     }
-    fn decoder(kind: &str, freeze_dir: &str, anchor_dir: &str, count: usize) -> Result<Self> {
+    fn decoder(kind: &str, freeze_name: &str, anchor_name: &str, count: usize) -> Result<Self> {
         let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
-        let freeze: Value =
-            serde_json::from_slice(&std::fs::read(root.join(freeze_dir).join("FROZEN.json"))?)?;
+        let freeze_path = env_path(freeze_name)?;
+        let anchor = env_path(anchor_name)?;
+        let freeze: Value = serde_json::from_slice(&std::fs::read(freeze_path)?)?;
         ensure!(
             freeze["reference_protocol"] == "PASS",
             "decoder reference protocol is invalid"
@@ -290,7 +287,7 @@ impl OperationGate {
                     .all(|cell| cell["reference_protocol"] == "PASS"),
             "decoder cell coverage or protocol mismatch"
         );
-        let decoder_anchor = Some(root.join(anchor_dir).join("anchor.safetensors"));
+        let decoder_anchor = Some(anchor.join("anchor.safetensors"));
         Ok(Self {
             root,
             kind: kind.into(),
@@ -477,6 +474,35 @@ fn frozen_rows(cell: &Value) -> Result<Vec<usize>> {
         .map(|v| usize::try_from(v.as_u64().context("invalid compared row")?).map_err(Into::into))
         .collect()
 }
+
+#[test]
+#[ignore = "requires fixture binding manifest and decoder references; CPU only"]
+fn decoder_fixture_bindings_cpu() -> Result<()> {
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(env_path("FF_FIXTURE_BINDINGS")?)?)?;
+    let bindings: Vec<(String, String, usize)> =
+        serde_json::from_value(manifest["decoder"].clone())?;
+    let mut cells = 0;
+    for (freeze, anchor, count) in &bindings {
+        let gate = OperationGate::decoder("fixture-binding", freeze, anchor, *count)?;
+        let anchor = gate.decoder_anchor.context("decoder anchor missing")?;
+        let anchor = if freeze == "FF_HI3D_DECODER_AFFINE_FREEZE" {
+            anchor.with_file_name("outputs.safetensors")
+        } else {
+            anchor
+        };
+        let file = std::fs::File::open(anchor)?;
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let tensors = safetensors::SafeTensors::deserialize(&map)?;
+        ensure!(!tensors.is_empty(), "decoder anchor is empty");
+        cells += gate.cells.len();
+    }
+    println!(
+        "PASS DECODER_FIXTURE_BINDINGS readers={} cells={cells} GPU_allocations=0",
+        bindings.len()
+    );
+    Ok(())
+}
 fn lattice(path: &Path, key: &str) -> Result<Vec<[i32; 3]>> {
     let t = tensor(path, key)?;
     ensure!(
@@ -498,8 +524,8 @@ fn lattice(path: &Path, key: &str) -> Result<Vec<[i32; 3]>> {
 fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
     let root = env_path("FF_HI3D_MODEL")?;
     let checkpoint = DecoderCheckpoint::open(&root.join("vae"), DecoderKind::PointTransformer)?;
-    let reference = env_path("FF_HI3D_DECODER_REFERENCE")?;
-    let common = reference.join("sm89-r1/additional-common-inputs.safetensors");
+    let common =
+        env_path("FF_HI3D_DECODER_NATIVE_REFERENCE")?.join("additional-common-inputs.safetensors");
     let sites = SparseSites::new(decoder_coordinates(&common, "conv.coordinates")?)?;
     let wrong_maps = sites
         .coordinates()
@@ -529,8 +555,12 @@ fn hi3d_sparse_convolution_definition_gpu() -> Result<()> {
     let mut defects = 0;
     let mut results = Vec::new();
     for tile in [127, 251] {
-        let mut gate =
-            OperationGate::decoder("sparse-convolution", "conv-freeze-r1", "sm89-r1", 54)?;
+        let mut gate = OperationGate::decoder(
+            "sparse-convolution",
+            "FF_HI3D_DECODER_CONV_FREEZE",
+            "FF_HI3D_DECODER_NATIVE_REFERENCE",
+            54,
+        )?;
         for (name, cell) in gate.cells.clone() {
             let definition = &cell["definition"];
             let ci = definition["input_shape"][1]
@@ -659,13 +689,12 @@ fn normalized_features<
 #[test]
 #[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
 fn hi3d_decoder_production_norm_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let model = env_path("FF_HI3D_MODEL")?.join("vae/model.safetensors");
     let d = Device::new(0)?;
     let mut gate = OperationGate::decoder(
         "actual-support-group-norm",
-        "production-norm-freeze-r1",
-        "production-norm-sm89-r1",
+        "FF_HI3D_DECODER_PRODUCTION_NORM_FREEZE",
+        "FF_HI3D_DECODER_PRODUCTION_NORM_REFERENCE",
         4,
     )?;
     for (name, cell) in gate.cells.clone() {
@@ -685,7 +714,7 @@ fn hi3d_decoder_production_norm_gpu() -> Result<()> {
         .file_name()
         .context("norm bank filename missing")?;
         let case = name.split('.').nth(1).context("norm case missing")?;
-        let bank = root.join(format!("{case}-decode-sm86-r1")).join(bank_name);
+        let bank = fixture_reference("FF_HI3D_DECODER", case, "REFERENCE")?.join(bank_name);
         let module = definition["module"]
             .as_str()
             .context("norm module missing")?;
@@ -742,9 +771,9 @@ fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
     stage: usize,
     input: Vec<T>,
 ) -> Result<()> {
-    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let name = format!("decoder.dec.dec{stage}.up.upsample");
-    let bank = root.join(format!("{case}-decode-sm86-r1/{name}.input.safetensors"));
+    let bank = fixture_reference("FF_HI3D_DECODER", case, "REFERENCE")?
+        .join(format!("{name}.input.safetensors"));
     let sites = bank_sites(&bank)?;
     let n = sites.coordinates().len();
     ensure!(input.len().is_multiple_of(n), "head input extent mismatch");
@@ -753,13 +782,14 @@ fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
     let input = d.stream.clone_htod(&input)?;
     let x = matrix::<T>(ptr(&input, d), n, c)?;
     let workspace = PointWorkspace::new(decoder, &sites, [c, c], false)?;
-    let maps = root.join(format!("{case}-heads-sm89-r1/maps.safetensors"));
+    let maps = fixture_reference("FF_HI3D_HEAD", case, "REFERENCE")?.join("maps.safetensors");
     let rows: Vec<_> = tensor(&maps, &format!("{name}.selected_parents"))?
         .values
         .into_iter()
         .map(|v| v as usize)
         .collect();
-    gate.decoder_anchor = Some(root.join(format!("{case}-heads-sm89-r1/anchor.safetensors")));
+    gate.decoder_anchor =
+        Some(fixture_reference("FF_HI3D_HEAD", case, "REFERENCE")?.join("anchor.safetensors"));
     let w = decoder
         .weights
         .float
@@ -819,7 +849,7 @@ fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
         .flat_map(|row| permutation.map(|i| f64::from(row[i])))
         .collect();
     gate.score(&format!("{case}.{name}.logits"), &wrong, true)?;
-    let selectors = root.join("heads-freeze-r1/selectors.safetensors");
+    let selectors = env_path("FF_HI3D_HEAD_SELECTORS")?;
     let key = format!("{case}.stage{stage}");
     let stable = tensor(&selectors, &format!("{key}.stable"))?.values;
     let expected = tensor(&selectors, &format!("{key}.expected_occupied"))?.values;
@@ -923,7 +953,6 @@ fn head_case<T: DeviceRepr + Copy + ValidAsZeroBits + 'static>(
 #[test]
 #[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
 fn hi3d_decoder_heads_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let decoder = PixalDecoder::open(
         &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
@@ -933,14 +962,14 @@ fn hi3d_decoder_heads_gpu() -> Result<()> {
     )?;
     let mut gate = OperationGate::decoder(
         "occupancy-heads",
-        "heads-freeze-r1",
-        "cottage-heads-sm89-r1",
+        "FF_HI3D_DECODER_HEADS_FREEZE",
+        "FF_HI3D_HEAD_COTTAGE_REFERENCE",
         18,
     )?;
     for case in ["cottage", "robot"] {
         for stage in [3, 2, 1] {
-            let bank = root.join(format!(
-                "{case}-decode-sm86-r1/decoder.dec.dec{stage}.up.upsample.input.safetensors"
+            let bank = fixture_reference("FF_HI3D_DECODER", case, "REFERENCE")?.join(format!(
+                "decoder.dec.dec{stage}.up.upsample.input.safetensors"
             ));
             if stage == 3 {
                 head_case(&decoder, &mut gate, case, stage, f32_tensor(&bank, "feat")?)?;
@@ -961,7 +990,6 @@ fn hi3d_decoder_heads_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
 fn hi3d_decoder_field_affine_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let mut decoder = PixalDecoder::open(
         &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
@@ -970,9 +998,14 @@ fn hi3d_decoder_field_affine_gpu() -> Result<()> {
         6 << 30,
     )?;
     let d = &decoder.device;
-    let mut field = OperationGate::decoder("corner-attributes", "fields-freeze-r1", "sm89-r1", 1)?;
+    let mut field = OperationGate::decoder(
+        "corner-attributes",
+        "FF_HI3D_DECODER_FIELDS_FREEZE",
+        "FF_HI3D_DECODER_NATIVE_REFERENCE",
+        1,
+    )?;
     let raw = f32_tensor(
-        &root.join("CPU-r3/common-inputs.safetensors"),
+        &env_path("FF_HI3D_DECODER_COMMON_REFERENCE")?.join("common-inputs.safetensors"),
         "fields.raw40",
     )?;
     ensure!(raw.len() == 97 * 40, "corner field fixture shape mismatch");
@@ -1017,11 +1050,11 @@ fn hi3d_decoder_field_affine_gpu() -> Result<()> {
     let field_result = field.finish();
     let mut gate = OperationGate::decoder(
         "single-round-affine",
-        "affine-freeze-r1",
-        "affine-rounding-sm89-r1",
+        "FF_HI3D_DECODER_AFFINE_FREEZE",
+        "FF_HI3D_AFFINE_REFERENCE",
         1,
     )?;
-    gate.decoder_anchor = Some(root.join("affine-rounding-sm89-r1/outputs.safetensors"));
+    gate.decoder_anchor = Some(env_path("FF_HI3D_AFFINE_REFERENCE")?.join("outputs.safetensors"));
     gate.decoder_key = Some("anchor".into());
     let rows = indices(&gate.cells["affine.production_qkv"]["definition"]["selected_rows"])?;
     let (n, ci, co) = (11295usize, 512usize, 1536usize);
@@ -1188,7 +1221,6 @@ where
 #[test]
 #[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
 fn hi3d_decoder_stages_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let decoder = PixalDecoder::open(
         &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
@@ -1199,13 +1231,12 @@ fn hi3d_decoder_stages_gpu() -> Result<()> {
     let d = &decoder.device;
     let mut gate = OperationGate::decoder(
         "whole-decoder-stages",
-        "stages-freeze-r1",
-        "stages-sm89-r1",
+        "FF_HI3D_DECODER_STAGES_FREEZE",
+        "FF_HI3D_DECODER_STAGES_REFERENCE",
         16,
     )?;
-    let supplement: Value = serde_json::from_slice(&std::fs::read(
-        root.join("stages-field-supplement-20261106-r1/FROZEN.json"),
-    )?)?;
+    let supplement: Value =
+        serde_json::from_slice(&std::fs::read(env_path("FF_HI3D_DECODER_FIELD_FREEZE")?)?)?;
     ensure!(
         supplement["reference_protocol"] == "PASS"
             && supplement["formula"] == "tau=max(2*max(all declared pair errors),epsilon)",
@@ -1238,10 +1269,11 @@ fn hi3d_decoder_stages_gpu() -> Result<()> {
         );
     }
     for case in ["cottage", "robot"] {
-        let directory = root.join(format!("{case}-decode-sm86-r1"));
+        let directory = fixture_reference("FF_HI3D_DECODER", case, "REFERENCE")?;
         let bank = directory.join("decoder.mid.input.safetensors");
         let n = bank_sites(&bank)?.coordinates().len();
-        let latents = root.join(format!("{case}-latents-sm86-r1/trajectory.safetensors"));
+        let latents =
+            fixture_reference("FF_HI3D_LATENT", case, "REFERENCE")?.join("trajectory.safetensors");
         stage_case(
             &decoder,
             &mut gate,
@@ -1342,7 +1374,6 @@ fn hi3d_decoder_stages_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
 fn hi3d_decoder_complete_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let decoder = PixalDecoder::open(
         &Device::new(0)?,
         &env_path("FF_HI3D_MODEL")?,
@@ -1351,12 +1382,12 @@ fn hi3d_decoder_complete_gpu() -> Result<()> {
         6 << 30,
     )?;
     for case in ["cottage", "robot"] {
-        let trajectory = root.join(format!("{case}-latents-sm86-r1/trajectory.safetensors"));
+        let trajectory =
+            fixture_reference("FF_HI3D_LATENT", case, "REFERENCE")?.join("trajectory.safetensors");
         let coordinates = decoder_coordinates(&trajectory, "coordinates")?;
         let latent = f32_tensor(&trajectory, "final_latents")?;
-        let bank = root.join(format!(
-            "{case}-decode-sm86-r1/decoder.mid.input.safetensors"
-        ));
+        let bank = fixture_reference("FF_HI3D_DECODER", case, "REFERENCE")?
+            .join("decoder.mid.input.safetensors");
         let matrix = tensor(&bank, "matrix")?;
         ensure!(
             matrix.values.len() == 16,
@@ -1406,14 +1437,18 @@ fn hi3d_decoder_complete_gpu() -> Result<()> {
 #[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
 fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
     use crate::backend::cuda::sparse::BatchGroupNorm;
-    let reference = env_path("FF_HI3D_DECODER_REFERENCE")?;
     let model = env_path("FF_HI3D_MODEL")?.join("vae/model.safetensors");
     let d = Device::new(0)?;
-    let mut gate = OperationGate::decoder("batch-group-norm", "norm-freeze-r1", "sm89-r1", 12)?;
+    let mut gate = OperationGate::decoder(
+        "batch-group-norm",
+        "FF_HI3D_DECODER_NORM_FREEZE",
+        "FF_HI3D_DECODER_NATIVE_REFERENCE",
+        12,
+    )?;
     for (name, cell) in gate.cells.clone() {
         let definition = &cell["definition"];
         let input = tensor(
-            &reference.join("CPU-r3/common-inputs.safetensors"),
+            &env_path("FF_HI3D_DECODER_COMMON_REFERENCE")?.join("common-inputs.safetensors"),
             &format!("{name}.input"),
         )?;
         let [n, c] = <[usize; 2]>::try_from(input.shape)
@@ -1476,12 +1511,16 @@ fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
         }
     }
     let norm_result = gate.finish();
-    let mut gate =
-        OperationGate::decoder("rounded-sigmoid-swish", "swish-freeze-r2", "sm89-r1", 4)?;
+    let mut gate = OperationGate::decoder(
+        "rounded-sigmoid-swish",
+        "FF_HI3D_DECODER_SWISH_FREEZE",
+        "FF_HI3D_DECODER_NATIVE_REFERENCE",
+        4,
+    )?;
     let module = cubin::module(&d.ctx, "vision_ops")?;
     for (name, cell) in gate.cells.clone() {
         let input = tensor(
-            &reference.join("CPU-r3/common-inputs.safetensors"),
+            &env_path("FF_HI3D_DECODER_COMMON_REFERENCE")?.join("common-inputs.safetensors"),
             &format!("{name}.input"),
         )?;
         let n = input.shape[0];
@@ -1571,14 +1610,13 @@ fn hi3d_serialized_attention_definition_gpu() -> Result<()> {
     let d = &decoder.device;
     let mut gate = OperationGate::decoder(
         "serialized-window-attention",
-        "attention-freeze-r2",
-        "sm89-r1",
+        "FF_HI3D_DECODER_ATTENTION_FREEZE",
+        "FF_HI3D_DECODER_NATIVE_REFERENCE",
         20,
     )?;
-    let common = gate
-        .root
-        .join("sm89-r1/additional-common-inputs.safetensors");
-    let map_file = gate.root.join("CPU-r3/maps.safetensors");
+    let common =
+        env_path("FF_HI3D_DECODER_NATIVE_REFERENCE")?.join("additional-common-inputs.safetensors");
+    let map_file = env_path("FF_HI3D_DECODER_COMMON_REFERENCE")?.join("maps.safetensors");
     let freeze: Value = serde_json::from_slice(&std::fs::read(gate.root.join("FROZEN.json"))?)?;
     let cases = freeze["exact_serialization_maps"]
         .as_object()
@@ -2696,17 +2734,12 @@ fn cascade_rope(
     Ok(())
 }
 
-fn cascade_mesh(
-    root: &Path,
-    prefix: &Path,
-    high: bool,
-    case: &str,
-) -> Result<crate::sparse::SparseMesh> {
-    let anchor = root.join(if high {
-        "transition1024-sm86-released-r1"
+fn cascade_mesh(high: bool, case: &str) -> Result<crate::sparse::SparseMesh> {
+    let anchor = env_path(if high {
+        "FF_HI3D_CASCADE_HIGH_TRANSITION_REFERENCE"
     } else {
-        "transition-sm86-full-r1"
-    });
+        "FF_HI3D_CASCADE_BASE_TRANSITION_REFERENCE"
+    })?;
     let (vertices, mut faces) = if case == "open_loop" {
         (
             f32_tensor(&anchor.join("open_loop-fill.safetensors"), "input_vertices")?,
@@ -2714,12 +2747,10 @@ fn cascade_mesh(
         )
     } else {
         let path = if high {
-            root.join(format!(
-                "continued1024-{}-sm86-r1/mesh.safetensors",
-                case.replace('_', "-")
-            ))
+            fixture_reference("FF_HI3D_CASCADE_CONTINUED", case, "REFERENCE")?
+                .join("mesh.safetensors")
         } else {
-            prefix.join(format!("linked-sm89-{case}-r1/mesh.safetensors"))
+            fixture_reference("FF_HI3D_LINKED", case, "REFERENCE")?.join("mesh.safetensors")
         };
         (
             f32_tensor(&path, "vertices")?,
@@ -2977,9 +3008,8 @@ fn cascade_decoder_stages(shapes: &[&str]) -> Result<()> {
     for &shape in shapes {
         let mut gate = OperationGate::cascade("G6_stages", Some(shape), 13)?;
         for stage in [3, 2, 1, 0] {
-            let bank = gate
-                .root
-                .join(format!("rung{shape}-sm86-r1/dec{stage}-input.safetensors"));
+            let bank = fixture_reference("FF_HI3D_CASCADE", shape, "REFERENCE")?
+                .join(format!("dec{stage}-input.safetensors"));
             if stage == 3 {
                 let input = f32_tensor(&bank, "feat")?;
                 for control in [false, true] {
@@ -3139,7 +3169,7 @@ fn cascade_corner_geometry(shapes: &[&str]) -> Result<()> {
         let matrix = f32_tensor(&source, "matrix")?;
         ensure!(matrix.len() == 16, "decoded frame extent differs");
         let coarse = tensor(
-            &root.join(format!("rung{shape}-sm86-r1/input.safetensors")),
+            &fixture_reference("FF_HI3D_CASCADE", shape, "REFERENCE")?.join("input.safetensors"),
             "coordinates",
         )?;
         ensure!(
@@ -3371,15 +3401,12 @@ fn hi3d_cascade_geometry_1536_robot_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires admitted CUDA and frozen mesh/support/triangle-incidence records"]
 fn hi3d_cascade_mesh_support_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_CASCADE_REFERENCE")?;
-    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
     let device = Device::new(0)?;
     let mut defects = 0;
     let mut cells = 0;
     for tag in ["minus", "exact", "plus"] {
-        let path = root.join(format!(
-            "transition-sm86-full-r1/triangle-boundary-{tag}.safetensors"
-        ));
+        let path = env_path("FF_HI3D_CASCADE_BASE_TRANSITION_REFERENCE")?
+            .join(format!("triangle-boundary-{tag}.safetensors"));
         let mesh = crate::sparse::SparseMesh {
             vertices: f32_tensor(&path, "vertices")?,
             faces: tensor(&path, "faces")?
@@ -3405,14 +3432,14 @@ fn hi3d_cascade_mesh_support_gpu() -> Result<()> {
         cells += 1;
     }
     for high in [false, true] {
-        let anchor = root.join(if high {
-            "transition1024-sm86-released-r1"
+        let anchor = env_path(if high {
+            "FF_HI3D_CASCADE_HIGH_TRANSITION_REFERENCE"
         } else {
-            "transition-sm86-full-r1"
-        });
+            "FF_HI3D_CASCADE_BASE_TRANSITION_REFERENCE"
+        })?;
         let metadata: Value = serde_json::from_slice(&std::fs::read(anchor.join("report.json"))?)?;
         for case in ["open_loop", "cottage", "robot_crab"] {
-            let mesh = cascade_mesh(&root, &prefix, high, case)?;
+            let mesh = cascade_mesh(high, case)?;
             for nominal in if high {
                 &[192u32][..]
             } else {
@@ -3481,15 +3508,14 @@ fn hi3d_cascade_mesh_support_gpu() -> Result<()> {
 fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
     let model = env_path("FF_HI3D_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
     let context = f32_tensor(
-        &prefix.join("linked-sm89-cottage-r1/handoff.safetensors"),
+        &env_path("FF_HI3D_LINKED_COTTAGE_REFERENCE")?.join("handoff.safetensors"),
         "condition",
     )?;
     let mut gate = OperationGate::cascade("G2_bounded", None, 12)?;
     for maximum in [63, 64, 94, 95] {
         let file = format!("flow-max{maximum}.safetensors");
-        let source = gate.root.join("flow-sm89-released-r1").join(&file);
+        let source = env_path("FF_HI3D_CASCADE_FLOW_REFERENCE")?.join(&file);
         let points = tensor(&source, "coordinates")?;
         ensure!(
             points.shape == [257, 3],
@@ -3587,7 +3613,6 @@ fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
 fn hi3d_cascade_production_flow_gpu() -> Result<()> {
     let model = env_path("FF_HI3D_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let prefix = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
     for shape in [
         "1024-cottage",
         "1024-robot-crab",
@@ -3595,7 +3620,7 @@ fn hi3d_cascade_production_flow_gpu() -> Result<()> {
         "1536-robot-crab",
     ] {
         let mut gate = OperationGate::cascade("G2_production", Some(shape), 3)?;
-        let directory = gate.root.join(format!("rung{shape}-sm86-r1"));
+        let directory = fixture_reference("FF_HI3D_CASCADE", shape, "REFERENCE")?;
         let source = directory.join("production-flow.safetensors");
         let coordinates = lattice(&source, "coordinates")?;
         let state = f32_tensor(&source, "state")?;
@@ -3606,7 +3631,7 @@ fn hi3d_cascade_production_flow_gpu() -> Result<()> {
             "robot_crab"
         };
         let context = f32_tensor(
-            &prefix.join(format!("linked-sm89-{case}-r1/handoff.safetensors")),
+            &fixture_reference("FF_HI3D_LINKED", case, "REFERENCE")?.join("handoff.safetensors"),
             "condition",
         )?;
         let resolution = if shape.starts_with("1024") { 128 } else { 192 };
@@ -3681,10 +3706,8 @@ fn hi3d_cascade_heun_updates_gpu() -> Result<()> {
                     .parse::<usize>()?,
             )
         };
-        let source = gate
-            .root
-            .join("flow-sm89-released-r1")
-            .join(format!("heun-{step:02}.safetensors"));
+        let source =
+            env_path("FF_HI3D_CASCADE_FLOW_REFERENCE")?.join(format!("heun-{step:02}.safetensors"));
         let mut inputs = Vec::new();
         for key in ["state", "first_slope", "second_slope"] {
             let compact = f32_tensor(&source, key)?;
@@ -3919,8 +3942,7 @@ fn extraction_select(values: &[f32], selected: &[usize], width: usize) -> Result
 
 fn extraction_real(g: &mut OperationGate, d: &Device, case: &str) -> Result<()> {
     let root = g.root.clone();
-    let bank = env_path("FF_HI3D_DECODER_REFERENCE")?
-        .join(format!("{case}-decode-sm86-r1/decoded.safetensors"));
+    let bank = fixture_reference("FF_HI3D_DECODER", case, "REFERENCE")?.join("decoded.safetensors");
     let original = bank_sites(&bank)?;
     let signs = f32_tensor(&bank, "sdf_sign")?;
     let features = f32_tensor(&bank, "feat")?;
@@ -3956,9 +3978,8 @@ fn extraction_real(g: &mut OperationGate, d: &Device, case: &str) -> Result<()> 
     let values = d.stream.clone_htod(&fields)?;
     let aggregate =
         super::super::sparse::corner_fields(d, &sites, &values, frame, [initial, 6 << 30])?;
-    let canonical = root.join(format!(
-        "full-definition-CPU-sm86-r1/{case}/canonical-corners.safetensors"
-    ));
+    let canonical = env_path("FF_HI3D_EXTRACTION_DEFINITION_REFERENCE")?
+        .join(format!("{case}/canonical-corners.safetensors"));
     let inverse = extraction_indices(&canonical, "cubes")?;
     extraction_exact(
         g,
@@ -4059,25 +4080,23 @@ fn extraction_real(g: &mut OperationGate, d: &Device, case: &str) -> Result<()> 
     drop(control);
     drop(fields);
     drop(associated);
-    let fixed = root.join(format!(
-        "full-definition-CPU-sm86-r1/{case}/canonical-extractor-input.safetensors"
-    ));
+    let fixed = env_path("FF_HI3D_EXTRACTION_DEFINITION_REFERENCE")?
+        .join(format!("{case}/canonical-extractor-input.safetensors"));
     let fixture = ExtractionInput {
         coordinates: sites.coordinates().to_vec(),
         cubes: inverse.iter().map(|&i| i as u32).collect(),
         positions: f32_tensor(&fixed, "positions")?,
         scalar: f32_tensor(&fixed, "signed_sdf")?,
     };
-    let correspondence = root.join(format!(
-        "vertex-CPU-math-r2/{case}.correspondence.safetensors"
-    ));
+    let correspondence = env_path("FF_HI3D_VERTEX_CORRESPONDENCE_REFERENCE")?
+        .join(format!("{case}.correspondence.safetensors"));
     let mapping = extraction_indices(&correspondence, "oracle_indices")?;
     let selection = extraction_indices(
         &root.join("selectors.safetensors"),
         &format!("{case}.vertex_indices"),
     )?;
     let source_faces = tensor(
-        &root.join(format!("vertex-sm89-definition-r1/{case}.safetensors")),
+        &env_path("FF_HI3D_VERTEX_DEFINITION_REFERENCE")?.join(format!("{case}.safetensors")),
         "faces",
     )?;
     let mesh = fixture.run(d, &fixture.positions)?;
@@ -4109,9 +4128,8 @@ fn extraction_real(g: &mut OperationGate, d: &Device, case: &str) -> Result<()> 
 }
 
 fn extraction_analytic(g: &mut OperationGate, d: &Device) -> Result<()> {
-    let root = g.root.clone();
     let proof: Value = serde_json::from_slice(&std::fs::read(
-        root.join("analytic-descriptor-r1/proof.json"),
+        env_path("FF_HI3D_ANALYTIC_DESCRIPTOR_REFERENCE")?.join("proof.json"),
     )?)?;
     let records = proof["records"]
         .as_array()
@@ -4120,13 +4138,14 @@ fn extraction_analytic(g: &mut OperationGate, d: &Device) -> Result<()> {
         records.len() == 775 && proof["reference_proof"] == "PASS",
         "invalid analytic coverage"
     );
-    let descriptor = root.join("analytic-descriptor-r1/descriptor.safetensors");
+    let descriptor =
+        env_path("FF_HI3D_ANALYTIC_DESCRIPTOR_REFERENCE")?.join("descriptor.safetensors");
     let all_positions = f32_tensor(&descriptor, "positions")?;
     let all_control = f32_tensor(&descriptor, "control_positions")?;
     let all_scalar = f32_tensor(&descriptor, "scalar")?;
-    let local = root.join("case-oracle-CPU-sm86-r1/cases.safetensors");
-    let closed = root.join("closed-oracle-CPU-sm86-r1/closed.safetensors");
-    let source = root.join("analytic-sm89-r1/outputs.safetensors");
+    let local = env_path("FF_HI3D_EXTRACTION_CASES_REFERENCE")?.join("cases.safetensors");
+    let closed = env_path("FF_HI3D_EXTRACTION_CLOSED_REFERENCE")?.join("closed.safetensors");
+    let source = env_path("FF_HI3D_ANALYTIC_FIELDS_REFERENCE")?.join("outputs.safetensors");
     let mut values = Vec::new();
     let mut controls = Vec::new();
     let mut comparable = true;
@@ -4210,8 +4229,8 @@ fn extraction_analytic(g: &mut OperationGate, d: &Device) -> Result<()> {
 }
 
 fn extraction_geometry(g: &mut OperationGate, d: &Device) -> Result<()> {
-    let source = g.root.join("geometry-sm89-r1/outputs.safetensors");
-    let cpu = g.root.join("geometry-CPU-r1/outputs.safetensors");
+    let source = env_path("FF_HI3D_GEOMETRY_NATIVE_REFERENCE")?.join("outputs.safetensors");
+    let cpu = env_path("FF_HI3D_GEOMETRY_DEFINITION_REFERENCE")?.join("outputs.safetensors");
     for case in ["open_plane", "closed_sphere", "disconnected_spheres"] {
         let fixture = ExtractionInput {
             coordinates: extraction_sites(&source, "cube_map")?,
@@ -4359,14 +4378,13 @@ fn linked_mesh_save(
 
 fn linked_mesh_case(
     model: &Path,
-    root: &Path,
     runtime: &Path,
     output: &Path,
     context: &CudaSlice<f32>,
     support: &str,
     label: &str,
 ) -> Result<crate::sparse::SparseMesh> {
-    let source = root.join(format!("linked-sm89-{support}-r1"));
+    let source = fixture_reference("FF_HI3D_LINKED", support, "REFERENCE")?;
     let handoff = source.join("handoff.safetensors");
     let coordinates = decoder_coordinates(&handoff, "coordinates")?;
     ensure!(
@@ -4445,9 +4463,11 @@ fn linked_mesh_case(
         &latent,
         frame,
     )?;
-    let repeat: Value = serde_json::from_slice(&std::fs::read(
-        root.join(format!("linked-sm89-{support}-r2/observations.json")),
-    )?)?;
+    let repeat: Value = serde_json::from_slice(&std::fs::read(fixture_reference(
+        "FF_HI3D_LINKED",
+        support,
+        "OBSERVATIONS",
+    )?)?)?;
     println!(
         "N5_M3_LINKED_MEASUREMENT label={label} support={support} input_rows={} latent_channels=32 updates=25 vertices={} faces={} source_r1_vertices={} source_r1_faces={} source_r2_vertices={} source_r2_faces={} equivalence_gate=false hole_fill=false timing=false",
         grid.len(),
@@ -4464,7 +4484,8 @@ fn linked_mesh_case(
 fn linked_image_contexts() -> Result<(Vec<CudaSlice<f32>>, usize)> {
     let image_root = env_path("FF_HI3D_IMAGE_FIXTURES")?;
     let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let image_bytes = std::fs::read(image_root.join("cpu-r2/inputs.safetensors"))?;
+    let image_bytes =
+        std::fs::read(env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("inputs.safetensors"))?;
     let images = safetensors::SafeTensors::deserialize(&image_bytes)?;
     let image_freeze: Value =
         serde_json::from_slice(&std::fs::read(image_root.join("FROZEN.json"))?)?;
@@ -4545,7 +4566,6 @@ fn linked_image_contexts() -> Result<(Vec<CudaSlice<f32>>, usize)> {
 #[test]
 #[ignore = "requires admitted CUDA, published image/flow/decoder checkpoints and frozen media"]
 fn hi3d_linked_image_mesh_gpu() -> Result<()> {
-    let root = env_path("FF_HI3D_EXTRACTION_REFERENCE")?;
     let model = env_path("FF_HI3D_MODEL")?;
     let output = env_path("FF_HI3D_IMAGE_OUTPUT")?;
     let runtime_path = env_path("FLYINGFISH_RUNTIME_DIR")?;
@@ -4560,7 +4580,6 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     ] {
         let mesh = linked_mesh_case(
             &model,
-            &root,
             &runtime_path,
             &output,
             &contexts[index],
@@ -4612,8 +4631,8 @@ fn linked_image_cascade(case: &str, requested: u32, processed: bool) -> Result<(
             .map(|v| v as i32)
             .collect(),
     };
-    let image_root = env_path("FF_HI3D_IMAGE_FIXTURES")?;
-    let bytes = std::fs::read(image_root.join("cpu-r2/inputs.safetensors"))?;
+    let bytes =
+        std::fs::read(env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("inputs.safetensors"))?;
     let images = safetensors::SafeTensors::deserialize(&bytes)?;
     let rgba = images.tensor(&format!("{case}.rgba"))?;
     let orientation = images.tensor(&format!("{case}.orientation"))?;
@@ -5668,13 +5687,11 @@ fn shape_flows(gate: &mut Gate, model: &Path, runtime: &Path) -> Result<()> {
         ("single", 1536, "robot_crab", vec![1]),
         ("mv", 1024, "mv4", vec![0, 1]),
     ] {
-        let arm = if variant == "single" && resolution == 1024 {
-            "r2"
-        } else {
-            "r0a"
-        };
-        let base = env_path("FF_PIXAL_SS_REFERENCE")?
-            .join(format!("pipeline-{variant}-{resolution}-{fixture}-{arm}"));
+        let base = fixture_reference(
+            "FF_PIXAL_PIPELINE",
+            &format!("{variant}-{resolution}-{fixture}"),
+            "REFERENCE",
+        )?;
         for stage in stages {
             let input = base.join(format!("shape_slat-{stage}-inputs.safetensors"));
             let coords = tensor(&input, "noise.coords")?;
@@ -5951,10 +5968,12 @@ fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path) -> Result<()>
         (1024, "robot_crab", 1),
         (1536, "robot_crab", 1),
     ] {
-        let arm = if resolution == 1024 { "r2" } else { "r0a" };
-        let input = env_path("FF_PIXAL_SS_REFERENCE")?.join(format!(
-            "pipeline-single-{resolution}-{fixture}-{arm}/shape_slat-{stage}-inputs.safetensors"
-        ));
+        let input = fixture_reference(
+            "FF_PIXAL_PIPELINE",
+            &format!("single-{resolution}-{fixture}"),
+            "REFERENCE",
+        )?
+        .join(format!("shape_slat-{stage}-inputs.safetensors"));
         let coordinates = coordinates(&tensor(&input, "noise.coords")?)?;
         let n = coordinates.len();
         let mut flow = Flow::open(
@@ -6100,9 +6119,12 @@ fn transitions(gate: &mut Gate, model: &Path) -> Result<()> {
         ("single", 1536, "robot_crab"),
         ("mv", 1024, "mv4"),
     ] {
-        let input = env_path("FF_PIXAL_SS_REFERENCE")?.join(format!(
-            "pipeline-{variant}-{resolution}-{fixture}-r0a/shape_slat-1-outputs.safetensors"
-        ));
+        let input = fixture_reference(
+            "FF_PIXAL_PIPELINE",
+            &format!("{variant}-{resolution}-{fixture}"),
+            "REFERENCE",
+        )?
+        .join("shape_slat-1-outputs.safetensors");
         let host = tensor(&input, "samples.features")?;
         let mut values = d
             .stream
@@ -6432,7 +6454,6 @@ impl DecoderGate {
             cells.len() == 41 && anchors.len() == 41,
             "M3b primary coverage mismatch"
         );
-        let parent = path.parent().context("freeze parent missing")?;
         let bytes = std::fs::read(env_path("FF_PIXAL_PREFIX_FREEZE")?)?;
         ensure!(
             format!("{:x}", Sha256::digest(&bytes))
@@ -6465,7 +6486,7 @@ impl DecoderGate {
                     }
                 }
                 cells.insert(k.clone(), c);
-                anchors.insert(k,serde_json::json!({"path":parent.join(format!("prefix-{case}-r3math/{stage}.safetensors")),"key":if key=="coordinates"{"coords"}else{key}}));
+                anchors.insert(k,serde_json::json!({"path":fixture_reference("FF_PIXAL_PREFIX", case, "REFERENCE")?.join(format!("{stage}.safetensors")),"key":if key=="coordinates"{"coords"}else{key}}));
             }
         }
         ensure!(
@@ -6923,11 +6944,15 @@ fn sparse_ops(g: &mut DecoderGate, decoder: &PixalDecoder) -> Result<()> {
 }
 fn decoder_transitions(g: &mut DecoderGate) -> Result<()> {
     for (fixture, resolution, capture) in [
-        ("cottage", 1536, "pipeline-single-1536-cottage-r0a"),
-        ("robot_crab", 1408, "pipeline-single-1536-robot_crab-r0a"),
-        ("mv4", 1024, "pipeline-mv-1024-mv4-r0a"),
+        ("cottage", 1536, "FF_PIXAL_PIPELINE_COTTAGE_1536_REFERENCE"),
+        (
+            "robot_crab",
+            1408,
+            "FF_PIXAL_PIPELINE_ROBOT_CRAB_1408_REFERENCE",
+        ),
+        ("mv4", 1024, "FF_PIXAL_PIPELINE_MULTIVIEW_1024_REFERENCE"),
     ] {
-        let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
+        let base = env_path(capture)?;
         let sites = SparseSites::new(decoder_coordinates(
             &base.join("shape_slat_decoder.blocks.3.4-call0-fixed-input.safetensors"),
             "output.0.coords",
@@ -6976,16 +7001,16 @@ fn prefix(
         "shape normalization width mismatch"
     );
     for (case, capture) in [
-        ("cottage1024", "pipeline-single-1024-cottage-r2"),
-        ("crab1024", "pipeline-single-1024-robot_crab-r2"),
-        ("cottage1536", "pipeline-single-1536-cottage-r0a"),
-        ("crab1408", "pipeline-single-1536-robot_crab-r0a"),
-        ("mv41024", "pipeline-mv-1024-mv4-r0a"),
+        ("cottage1024", "FF_PIXAL_PIPELINE_COTTAGE_1024_REFERENCE"),
+        ("crab1024", "FF_PIXAL_PIPELINE_ROBOT_CRAB_1024_REFERENCE"),
+        ("cottage1536", "FF_PIXAL_PIPELINE_COTTAGE_1536_REFERENCE"),
+        ("crab1408", "FF_PIXAL_PIPELINE_ROBOT_CRAB_1408_REFERENCE"),
+        ("mv41024", "FF_PIXAL_PIPELINE_MULTIVIEW_1024_REFERENCE"),
     ] {
         if linked.is_some() && case != "cottage1024" {
             continue;
         }
-        let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
+        let base = env_path(capture)?;
         let input = base.join("shape_slat-0-outputs.safetensors");
         let coords = decoder_coordinates(&input, "samples.coords")?;
         let mut latent = match linked {
@@ -7057,8 +7082,8 @@ fn prefix(
 }
 
 fn linked_lr(model: &Path, runtime: &Path) -> Result<Vec<f32>> {
-    let input = env_path("FF_PIXAL_SS_REFERENCE")?
-        .join("pipeline-single-1024-cottage-r2/shape_slat-0-inputs.safetensors");
+    let input = env_path("FF_PIXAL_PIPELINE_COTTAGE_1024_REFERENCE")?
+        .join("shape_slat-0-inputs.safetensors");
     let points = coordinates(&tensor(&input, "noise.coords")?)?;
     let mut flow = Flow::open(
         &Device::new(0)?,
@@ -7527,11 +7552,11 @@ fn surface_fixed(
 ) -> Result<()> {
     let (case, capture, table) = case;
     let capture = if case == "crab1408" {
-        format!("{capture}-decoder-r2")
+        "FF_PIXAL_TEXTURE_SHAPE_ROBOT_CRAB_1408_REFERENCE"
     } else {
-        capture.to_owned()
+        capture
     };
-    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
+    let base = env_path(capture)?;
     let path = base.join("result.safetensors");
     let coordinates = decoder_coordinates(&path, "result.1.0.coords")?;
     let latent = f32_tensor(&path, "result.1.0.features")?;
@@ -7853,7 +7878,7 @@ fn surface_generated(
     case: (&str, &str, u32),
 ) -> Result<()> {
     let (case, core, requested) = case;
-    let base = env_path("FF_PIXAL_SHAPE_MESH_REFERENCE")?.join(format!("core-{core}-r0a-r2"));
+    let base = fixture_reference("FF_PIXAL_SURFACE", core, "REFERENCE")?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(base.join("metadata.json"))?)?;
     let resolution = metadata["trace"]
         .as_array()
@@ -7940,9 +7965,9 @@ fn surface_normalization(g: &mut DecoderGate, model: &Path) -> Result<()> {
     let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
     let d = Device::new(0)?;
     for (fixture, capture) in [
-        ("cottage", "pipeline-single-1536-cottage-r0a"),
-        ("robot_crab", "pipeline-single-1536-robot_crab-r0a"),
-        ("mv4", "pipeline-mv-1024-mv4-r0a"),
+        ("cottage", "FF_PIXAL_PIPELINE_COTTAGE_1536_REFERENCE"),
+        ("robot_crab", "FF_PIXAL_PIPELINE_ROBOT_CRAB_1408_REFERENCE"),
+        ("mv4", "FF_PIXAL_PIPELINE_MULTIVIEW_1024_REFERENCE"),
     ] {
         for (kind, stage) in [("shape", "shape_slat-1"), ("tex", "tex_slat-0")] {
             let norm = &config["args"][format!("{kind}_slat_normalization")];
@@ -7958,9 +7983,7 @@ fn surface_normalization(g: &mut DecoderGate, model: &Path) -> Result<()> {
                 .iter()
                 .map(|x| x.as_f64().unwrap() as f32)
                 .collect();
-            let input = env_path("FF_PIXAL_SS_REFERENCE")?
-                .join(capture)
-                .join(format!("{stage}-outputs.safetensors"));
+            let input = env_path(capture)?.join(format!("{stage}-outputs.safetensors"));
             let host = tensor(&input, "samples.features")?;
             let mut values = d
                 .stream
@@ -8009,7 +8032,7 @@ fn canonical_quad(faces: &[i32]) -> Option<([i32; 4], [i32; 6])> {
 fn surface_mesh(g: &mut DecoderGate) -> Result<()> {
     let d = Device::new(0)?;
     let (free, _) = d.ctx.mem_get_info()?;
-    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join("pipeline-single-1024-cottage-r2");
+    let base = env_path("FF_PIXAL_PIPELINE_COTTAGE_1024_REFERENCE")?;
     let path = base.join("shape_slat_decoder-fields.safetensors");
     let sites = SparseSites::new(decoder_coordinates(&path, "output.coords")?)?;
     let fields = f32_tensor(&path, "output.features")?;
@@ -8020,7 +8043,7 @@ fn surface_mesh(g: &mut DecoderGate) -> Result<()> {
         .flat_map(|v| v[3..6].iter().map(|&x| u8::from(x > 0.0)))
         .collect();
     drop(fields);
-    let mesh_path = env_path("FF_PIXAL_SS_REFERENCE")?.join("mesh-local/r0a.safetensors");
+    let mesh_path = env_path("FF_PIXAL_SURFACE_MESH_INPUT")?;
     let dual = d
         .stream
         .clone_htod(&f32_tensor(&mesh_path, "dual_vertices")?)?;
@@ -8108,35 +8131,35 @@ fn surface_mesh(g: &mut DecoderGate) -> Result<()> {
 const SURFACE_CASES: [(&str, &str, &str, &str, u32); 5] = [
     (
         "cottage1024",
-        "pipeline-single-1024-cottage-r2",
+        "FF_PIXAL_PIPELINE_COTTAGE_1024_REFERENCE",
         "m4-floors-decoder-fixed-cottage-angular-r1.json",
         "single-1024-cottage",
         1024,
     ),
     (
         "crab1024",
-        "pipeline-single-1024-robot_crab-r2",
+        "FF_PIXAL_PIPELINE_ROBOT_CRAB_1024_REFERENCE",
         "m4-floors-decoder-fixed-robot_crab-angular-r1.json",
         "single-1024-robot_crab",
         1024,
     ),
     (
         "cottage1536",
-        "pipeline-single-1536-cottage-r0a",
+        "FF_PIXAL_PIPELINE_COTTAGE_1536_REFERENCE",
         "floors-decoder-cottage1536-full-m4.json",
         "single-1536-cottage",
         1536,
     ),
     (
         "crab1408",
-        "pipeline-single-1536-robot_crab-r0a",
+        "FF_PIXAL_PIPELINE_ROBOT_CRAB_1408_REFERENCE",
         "floors-decoder-crab1408-full-m4.json",
         "single-1536-robot_crab",
         1536,
     ),
     (
         "mv41024",
-        "pipeline-mv-1024-mv4-r0a",
+        "FF_PIXAL_PIPELINE_MULTIVIEW_1024_REFERENCE",
         "floors-decoder-mv41024-full-m4.json",
         "mv-1024-mv4",
         1024,
@@ -8222,7 +8245,7 @@ fn pixal3d_surface_freeze_cpu() -> Result<()> {
 fn pixal3d_generated_topology_isolation_gpu() -> Result<()> {
     let model = env_path("FF_PIXAL_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
-    let base = env_path("FF_PIXAL_SHAPE_MESH_REFERENCE")?.join("core-single-1024-cottage-r0a-r2");
+    let base = env_path("FF_PIXAL_SURFACE_COTTAGE_1024_REFERENCE")?;
     let input = base.join("shape_slat-0-outputs.safetensors");
     let coordinates = decoder_coordinates(&input, "samples.coords")?;
     let config: Value = serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
@@ -8509,7 +8532,7 @@ fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
     let model = env_path("FF_PIXAL_MODEL")?;
     let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
     for (case, capture, _, core, requested) in SURFACE_CASES {
-        let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
+        let base = env_path(capture)?;
         let input = base.join("tex_slat-0-inputs.safetensors");
         let points = coordinates(&tensor(&input, "noise.coords")?)?;
         let stem = format!(
@@ -8538,7 +8561,7 @@ fn pixal3d_texture_flow_matches_frozen_definition_gpu() -> Result<()> {
             &coordinates(&tensor(&input, "cond.proj.coords")?)?,
         )?;
         let physical_base = if case == "crab1408" {
-            env_path("FF_PIXAL_SS_REFERENCE")?.join(format!("{capture}-decoder-r2"))
+            env_path("FF_PIXAL_TEXTURE_SHAPE_ROBOT_CRAB_1408_REFERENCE")?
         } else {
             base.clone()
         };
@@ -8697,13 +8720,11 @@ fn material_pointwise(g: &mut DecoderGate, model: &Path) -> Result<()> {
     let mean: Vec<f32> = serde_json::from_value(norm["mean"].clone())?;
     let std: Vec<f32> = serde_json::from_value(norm["std"].clone())?;
     for (fixture, capture) in [
-        ("cottage", "pipeline-single-1536-cottage-r0a"),
-        ("robot_crab", "pipeline-single-1536-robot_crab-r0a"),
-        ("mv4", "pipeline-mv-1024-mv4-r0a"),
+        ("cottage", "FF_PIXAL_PIPELINE_COTTAGE_1536_REFERENCE"),
+        ("robot_crab", "FF_PIXAL_PIPELINE_ROBOT_CRAB_1408_REFERENCE"),
+        ("mv4", "FF_PIXAL_PIPELINE_MULTIVIEW_1024_REFERENCE"),
     ] {
-        let input = env_path("FF_PIXAL_SS_REFERENCE")?
-            .join(capture)
-            .join("tex_slat-0-outputs.safetensors");
+        let input = env_path(capture)?.join("tex_slat-0-outputs.safetensors");
         let host = tensor(&input, "samples.features")?;
         let mut values = d
             .stream
@@ -8729,11 +8750,11 @@ fn material_fixed(
 ) -> Result<()> {
     let (case, capture, table) = case;
     let capture = if case == "crab1408" {
-        format!("{capture}-decoder-r2")
+        "FF_PIXAL_TEXTURE_SHAPE_ROBOT_CRAB_1408_REFERENCE"
     } else {
-        capture.to_owned()
+        capture
     };
-    let base = env_path("FF_PIXAL_SS_REFERENCE")?.join(capture);
+    let base = env_path(capture)?;
     let input = base.join("result.safetensors");
     let coords = decoder_coordinates(&input, "result.1.1.coords")?;
     let latent = f32_tensor(&input, "result.1.1.features")?;
@@ -8804,13 +8825,11 @@ fn material_generated(
 ) -> Result<()> {
     let (case, capture) = case;
     let capture = if case == "crab1408" {
-        format!("{capture}-decoder-r2")
+        "FF_PIXAL_TEXTURE_SHAPE_ROBOT_CRAB_1408_REFERENCE"
     } else {
-        capture.to_owned()
+        capture
     };
-    let input = env_path("FF_PIXAL_SS_REFERENCE")?
-        .join(capture)
-        .join("result.safetensors");
+    let input = env_path(capture)?.join("result.safetensors");
     let coords = decoder_coordinates(&input, "result.1.0.coords")?;
     let latent = f32_tensor(&input, "result.1.0.features")?;
     let (shape_output, guides) = shape.decode(coords.clone(), &latent, &[])?;
@@ -9064,7 +9083,7 @@ fn projection_features(
 #[test]
 #[ignore = "requires CUDA and frozen projection captures"]
 fn pixal3d_indexed_projection_gpu() -> Result<()> {
-    let freeze_path = env_path("FF_PIXAL_M4C_FREEZE")?;
+    let freeze_path = env_path("FF_PIXAL_COMPOSITION_FREEZE")?;
     let bytes = std::fs::read(&freeze_path)?;
     ensure!(
         format!("{:x}", Sha256::digest(&bytes))
@@ -9450,7 +9469,7 @@ fn pixal3d_device_handoff_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires CUDA and frozen normalization captures"]
 fn pixal3d_composed_normalization_gpu() -> Result<()> {
-    let path = env_path("FF_PIXAL_M4C_FREEZE")?;
+    let path = env_path("FF_PIXAL_COMPOSITION_FREEZE")?;
     let bytes = std::fs::read(path)?;
     ensure!(
         format!("{:x}", Sha256::digest(&bytes))
@@ -9560,7 +9579,7 @@ fn coordinate_noise_preserves_batch_axes_and_channel_layout() -> Result<()> {
 #[test]
 #[ignore = "requires frozen coordinate noise fixtures; CPU only"]
 fn pixal3d_coordinate_noise_fixture_cpu() -> Result<()> {
-    let bytes = std::fs::read(env_path("FF_PIXAL_M4C_FREEZE")?)?;
+    let bytes = std::fs::read(env_path("FF_PIXAL_COMPOSITION_FREEZE")?)?;
     ensure!(
         format!("{:x}", Sha256::digest(&bytes))
             == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
@@ -9568,7 +9587,7 @@ fn pixal3d_coordinate_noise_fixture_cpu() -> Result<()> {
     );
     let freeze: Value = serde_json::from_slice(&bytes)?;
     let cells = freeze["noise"].as_array().context("noise cells")?;
-    let root = env_path("FF_PIXAL_M4C_NOISE")?;
+    let root = env_path("FF_PIXAL_COORDINATE_NOISE_ROOT")?;
     let mut scored = 0;
     for stage in ["ss", "lr", "hr", "tex"] {
         let data = tensor(&root.join(format!("{stage}.safetensors")), "noise")?;
@@ -9755,14 +9774,14 @@ fn generation_measurement(
 #[test]
 #[ignore = "requires CUDA, published Pixal3D components, RGBA/cameras and coordinate noise"]
 fn pixal3d_generated_request_gpu() -> Result<()> {
-    let bytes = std::fs::read(env_path("FF_PIXAL_M4C_FREEZE")?)?;
+    let bytes = std::fs::read(env_path("FF_PIXAL_COMPOSITION_FREEZE")?)?;
     ensure!(
         format!("{:x}", Sha256::digest(&bytes))
             == "301489b487d9ee4fccbae6dac7764612fd70807535184731bef92d79c490a6cf",
         "M4c freeze integrity"
     );
     let freeze: Value = serde_json::from_slice(&bytes)?;
-    let name = std::env::var("FF_PIXAL_M4C_CASE").context("FF_PIXAL_M4C_CASE")?;
+    let name = std::env::var("FF_PIXAL_GENERATION_CASE").context("FF_PIXAL_GENERATION_CASE")?;
     let case = freeze["cases"]
         .as_array()
         .context("chain cases")?
@@ -9819,7 +9838,7 @@ fn pixal3d_generated_request_gpu() -> Result<()> {
             camera,
         });
     }
-    let noise_root = env_path("FF_PIXAL_M4C_NOISE")?;
+    let noise_root = env_path("FF_PIXAL_COORDINATE_NOISE_ROOT")?;
     let noise = ["ss", "lr", "hr", "tex"]
         .map(|stage| -> Result<_> {
             let data = tensor(&noise_root.join(format!("{stage}.safetensors")), "noise")?;
@@ -9855,7 +9874,7 @@ fn pixal3d_generated_request_gpu() -> Result<()> {
             batch: 0,
         }),
     };
-    let output_dir = env_path("FF_PIXAL_M4C_OUTPUT")?;
+    let output_dir = env_path("FF_PIXAL_GENERATION_OUTPUT_DIR")?;
     std::fs::create_dir(&output_dir)?;
     let device = Device::new(0)?;
     if fixture == "mv4" {

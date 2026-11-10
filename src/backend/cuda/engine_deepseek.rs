@@ -3455,6 +3455,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::cuda::env_path;
     use crate::backend::cuda::hc::{HcRuntime, HcSublayerWeights};
     use crate::backend::cuda::moe::testing;
     use crate::backend::{Head, Input, Mask, Operator, Step};
@@ -4800,8 +4801,8 @@ mod tests {
             std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window required"
         );
-        let model = PathBuf::from(std::env::var("F3_MODEL")?);
-        let fixture = PathBuf::from(std::env::var("F3_FIXTURE")?);
+        let model = env_path("F3_MODEL")?;
+        let fixture = env_path("F3_FIXTURE")?;
         #[derive(serde::Deserialize)]
         struct Fixture {
             cells: Vec<EngramCell>,
@@ -4820,7 +4821,7 @@ mod tests {
         }
         let cells: Fixture = serde_json::from_slice(&std::fs::read(fixture.join("fixture.json"))?)?;
         let freeze: Freeze =
-            serde_json::from_slice(&std::fs::read(fixture.join("thresholds-engram-r1.json"))?)?;
+            serde_json::from_slice(&std::fs::read(env_path("FF_DEEPSEEK_ENGRAM_THRESHOLDS")?)?)?;
         ensure!(
             freeze.reference_only
                 && !freeze.candidate_seen
@@ -6132,11 +6133,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CPU-only fixture reader; set FF_DS41_LAYERS_FIXTURE to frozen thresholds-r3 plus layer JSON"]
+    #[ignore = "CPU-only fixture reader; requires FF_DS41_LAYERS_FIXTURE and FF_DEEPSEEK_LAYERS_THRESHOLDS"]
     fn d1_layers_fixture_contract() -> Result<()> {
-        let root = PathBuf::from(std::env::var("FF_DS41_LAYERS_FIXTURE")?);
+        let root = env_path("FF_DS41_LAYERS_FIXTURE")?;
         let frozen: std::collections::BTreeMap<String, LayerBands> =
-            serde_json::from_slice(&std::fs::read(root.join("thresholds-r3.json"))?)?;
+            serde_json::from_slice(&std::fs::read(env_path("FF_DEEPSEEK_LAYERS_THRESHOLDS")?)?)?;
         for layer in 1..40 {
             let fixture: LayerSamples = serde_json::from_slice(&std::fs::read(
                 root.join(format!("layer-{layer:02}.json")),
@@ -6152,13 +6153,13 @@ mod tests {
 
     // 2026-10-28: every judged boundary consumes all recorded upstream operands.
     #[test]
-    #[ignore = "GPU lease, FF_DS41_MODEL, FF_DS41_LAYERS_LAYER and FF_DS41_LAYERS_FIXTURE with frozen thresholds-r3"]
+    #[ignore = "GPU lease, FF_DS41_MODEL, FF_DS41_LAYERS_LAYER and FF_DS41_LAYERS_FIXTURE and FF_DEEPSEEK_LAYERS_THRESHOLDS"]
     fn d1_layers_match_model_definition() -> Result<()> {
         ensure!(
             std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window required"
         );
-        let root = PathBuf::from(std::env::var("FF_DS41_LAYERS_FIXTURE")?);
+        let root = env_path("FF_DS41_LAYERS_FIXTURE")?;
         let layer = std::env::var("FF_DS41_LAYERS_LAYER")?
             .parse::<usize>()
             .context("FF_DS41_LAYERS_LAYER must be a layer index")?;
@@ -6167,7 +6168,7 @@ mod tests {
             "FF_DS41_LAYERS_LAYER {layer} is outside layers 1..39"
         );
         let frozen: std::collections::BTreeMap<String, LayerBands> =
-            serde_json::from_slice(&std::fs::read(root.join("thresholds-r3.json"))?)?;
+            serde_json::from_slice(&std::fs::read(env_path("FF_DEEPSEEK_LAYERS_THRESHOLDS")?)?)?;
         let bands = frozen
             .get(&layer.to_string())
             .with_context(|| format!("layer {layer} has no frozen bands"))?;
@@ -10133,9 +10134,9 @@ mod tests {
     // GPU gate: run in a granted window with FF_DS41_GPU_WINDOW=granted via
     //   cargo test d1_layer0_matches_model_definition --lib -- --exact --ignored --test-threads=1
     // FF_DS41_MODEL holds the publisher checkpoint directory and
-    // FF_DS41_LAYER0_FIXTURE holds the v4 fixture beside thresholds-r2.json.
+    // FF_DEEPSEEK_LAYER0_FIXTURE holds the publisher layer fixture.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL and FF_DS41_LAYER0_FIXTURE"]
+    #[ignore = "requires coordinator-granted GPU window; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL and FF_DEEPSEEK_LAYER0_FIXTURE"]
     fn d1_layer0_matches_model_definition() -> Result<()> {
         use serde::Deserialize;
         // 2026-10-28 07:03:37 UTC: isolated-layer band = max(3*spread, analytic).
@@ -10662,10 +10663,10 @@ mod tests {
             std::env::var_os("FF_DS41_MODEL")
                 .context("FF_DS41_MODEL missing: the publisher checkpoint directory is required")?,
         );
-        let fixture_path = PathBuf::from(std::env::var_os("FF_DS41_LAYER0_FIXTURE").context(
-            "FF_DS41_LAYER0_FIXTURE missing: the recorded publisher layer-0 fixture is required",
+        let fixture_path = PathBuf::from(std::env::var_os("FF_DEEPSEEK_LAYER0_FIXTURE").context(
+            "FF_DEEPSEEK_LAYER0_FIXTURE missing: the recorded publisher layer-0 fixture is required",
         )?);
-        let thresholds_path = fixture_path.with_file_name("thresholds-r2.json");
+        let thresholds_path = env_path("FF_DEEPSEEK_LAYER0_THRESHOLDS")?;
         let reference_dir =
             PathBuf::from(std::env::var_os("FF_DS41_LAYER0_REFERENCE_DIR").context(
                 "FF_DS41_LAYER0_REFERENCE_DIR missing: the publisher's exact rows are required",
@@ -11469,7 +11470,7 @@ mod tests {
             }
             // Exact boundaries: the publisher's own rows on this recorded input, byte for byte.
             // 2026-10-28 dsflash, per 4d ruling 14:00:19Z: the values downstream of the score
-            // dot are reported, not asserted; acceptance stays the frozen thresholds-r2 bands.
+            // dot are reported, not asserted; acceptance stays the frozen bands.
             let report = |name: &str, got: &[u8]| -> Result<()> {
                 let path = reference_dir.join(format!("{name}-{position:03}.bin"));
                 let want =
