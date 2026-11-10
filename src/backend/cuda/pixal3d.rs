@@ -308,6 +308,9 @@ struct Kernels {
     norm_f32: CudaFunction,
     l2: CudaFunction,
     unpack: CudaFunction,
+    qkv_prepare: Option<CudaFunction>,
+    #[cfg(test)]
+    qkv_reference: bool,
     unpack_cross: CudaFunction,
     rope: CudaFunction,
     rope_hm: CudaFunction,
@@ -800,6 +803,13 @@ impl Kernels {
             } else {
                 "qkv_unpack_hm_bf16"
             })?,
+            qkv_prepare: if T::HALF {
+                Some(n.load_function("qkv_rope_l2_d96_f16")?)
+            } else {
+                None
+            },
+            #[cfg(test)]
+            qkv_reference: false,
             unpack_cross: v.load_function(if T::HALF {
                 "kv_unpack_head_major_f16"
             } else {
@@ -845,6 +855,76 @@ impl Kernels {
             transpose: q.load_function("transpose_f32")?,
             concat: q.load_function("concat_rows_f32")?,
         })
+    }
+    fn prepare_qkv(
+        &self,
+        d: &Device,
+        inputs: [u64; 4],
+        outputs: [u64; 3],
+        rows: usize,
+    ) -> Result<()> {
+        ensure!(
+            self.half && self.head_dim == 96,
+            "F16 QKV preparation requires D96"
+        );
+        let [packed, rotary, q_gamma, k_gamma] = inputs;
+        let [q, k, v] = outputs;
+        let count = rows
+            .checked_mul(self.heads)
+            .context("QKV head count overflow")?;
+        let rows = i32::try_from(rows)?;
+        let heads = i32::try_from(self.heads)?;
+        i32::try_from(count)?;
+        let kernel = self
+            .qkv_prepare
+            .as_ref()
+            .context("F16 QKV preparation missing")?;
+        unsafe {
+            d.stream
+                .launch_builder(kernel)
+                .arg(&packed)
+                .arg(&rotary)
+                .arg(&q_gamma)
+                .arg(&k_gamma)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&rows)
+                .arg(&heads)
+                .arg(&(96f32).sqrt())
+                .arg(&1e-12f32)
+                .launch(grid(count.div_ceil(4), 128))?;
+        }
+        Ok(())
+    }
+    fn prepare_qkv_separate(
+        &self,
+        d: &Device,
+        inputs: [u64; 4],
+        outputs: [u64; 4],
+        rows: usize,
+    ) -> Result<()> {
+        let [packed, rotary, q_gamma, k_gamma] = inputs;
+        let [q, key, kn, value] = outputs;
+        self.unpack(d, packed, [q, key, value], rows, 3)?;
+        if self.half {
+            for data in [q, key] {
+                unsafe {
+                    d.stream
+                        .launch_builder(&self.rope)
+                        .arg(&data)
+                        .arg(&rotary)
+                        .arg(&(rows as i32))
+                        .arg(&(self.heads as i32))
+                        .arg(&(self.head_dim as i32))
+                        .arg(&(self.head_dim as i32))
+                        .arg(&1i32)
+                        .launch(flat(rows * self.heads * self.head_dim / 2))?;
+                }
+            }
+        }
+        self.l2(d, q, q, q_gamma, rows, false)?;
+        self.l2(d, key, kn, k_gamma, rows, true)
     }
     fn norm(
         &self,
@@ -2226,25 +2306,34 @@ impl<T: FlowElement> Flow<T> {
         k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
         self.modulate(norm, bm, 0)?;
         b.qkv.run(&self.blas, n, norm, ptr(&self.work.qkv, d))?;
-        k.unpack(d, ptr(&self.work.qkv, d), [q, key, value], n, 3)?;
-        if T::HALF {
-            for data in [q, key] {
-                unsafe {
-                    d.stream
-                        .launch_builder(&k.rope)
-                        .arg(&data)
-                        .arg(&self.phases)
-                        .arg(&(n as i32))
-                        .arg(&(heads as i32))
-                        .arg(&(dim as i32))
-                        .arg(&(dim as i32))
-                        .arg(&1i32)
-                        .launch(flat(n * heads * dim / 2))?;
-                }
-            }
+        let fused = T::HALF;
+        #[cfg(test)]
+        let fused = fused && !k.qkv_reference;
+        if fused {
+            k.prepare_qkv(
+                d,
+                [
+                    ptr(&self.work.qkv, d),
+                    ptr(&self.phases, d),
+                    b.gamma[0],
+                    b.gamma[1],
+                ],
+                [q, kn, value],
+                n,
+            )?;
+        } else {
+            k.prepare_qkv_separate(
+                d,
+                [
+                    ptr(&self.work.qkv, d),
+                    ptr(&self.phases, d),
+                    b.gamma[0],
+                    b.gamma[1],
+                ],
+                [q, key, kn, value],
+                n,
+            )?;
         }
-        k.l2(d, q, q, b.gamma[0], n, false)?;
-        k.l2(d, key, kn, b.gamma[1], n, true)?;
         if !T::HALF {
             for (kernel, data) in [(&k.rope, q), (&k.rope_hm, kn)] {
                 unsafe {

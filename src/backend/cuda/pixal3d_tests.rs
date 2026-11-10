@@ -5041,6 +5041,268 @@ fn hi3d_generation_first_forward_gpu() -> Result<()> {
     generation_first_forward(0)
 }
 
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and FF_F16_QKV_FIXTURES"]
+fn hi3d_qkv_preparation_identity_gpu() -> Result<()> {
+    use cudarc::driver::sys::{self, CUfunction_attribute as F};
+    let fixture: Value = serde_json::from_slice(&std::fs::read(
+        env_path("FF_F16_QKV_FIXTURES")?.join("qkv.json"),
+    )?)?;
+    let models = fixture["models"]
+        .as_array()
+        .context("QKV model inputs missing")?;
+    ensure!(
+        models.len() == 2,
+        "QKV fixture requires both published models"
+    );
+    let device = Device::new(0)?;
+    let snapshot = |buffers: &[CudaSlice<f16>]| -> Result<Vec<Vec<f16>>> {
+        buffers
+            .iter()
+            .map(|buffer| Ok(device.stream.clone_dtoh(buffer)?))
+            .collect()
+    };
+    let different_bits = |left: &[Vec<f16>], right: &[Vec<f16>]| -> u64 {
+        left.iter()
+            .flatten()
+            .zip(right.iter().flatten())
+            .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+            .sum()
+    };
+    let mut defects = 0;
+    let mut cells = 0;
+    let mut controls = 0;
+    for (component, model) in ["transformer_512", "transformer_1024"]
+        .into_iter()
+        .zip(models)
+    {
+        ensure!(
+            model["component"] == component && model["gamma_layout"] == serde_json::json!([22, 96]),
+            "QKV model identity/gamma layout differs"
+        );
+        let spec: crate::pixal3d::Hi3DFlowSpec = serde_json::from_value(model["config"].clone())?;
+        ensure!(
+            spec.model_channels == 2112 && spec.num_heads == 22 && spec.num_blocks == 24,
+            "QKV published head geometry differs"
+        );
+        let spec = spec.flow_spec();
+        let kernels = Kernels::load::<f16>(&device, &spec)?;
+        let fused = kernels.qkv_prepare.as_ref().context("QKV kernel missing")?;
+        let blocks = fused.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)?;
+        let old_warps = [
+            (&kernels.unpack, 256),
+            (&kernels.rope, 256),
+            (&kernels.l2, 32),
+        ]
+        .iter()
+        .map(|(kernel, threads)| -> Result<_> {
+            Ok(
+                kernel.occupancy_max_active_blocks_per_multiprocessor(*threads, 0, None)? * threads
+                    / 32,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let local = fused.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+        ensure!(
+            local == 0 && old_warps.iter().all(|&old| blocks * 4 >= old),
+            "QKV preparation spills or reduces resident warps"
+        );
+        println!(
+            "F16_QKV_RESOURCES registers={} local_bytes={local} shared_bytes={} active_blocks={blocks} active_warps={} separate_active_warps={old_warps:?}",
+            fused.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+            fused.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?,
+            blocks * 4
+        );
+        let block_inputs = model["blocks"]
+            .as_array()
+            .context("QKV block inputs missing")?;
+        ensure!(
+            block_inputs.len() == 2,
+            "QKV fixture requires first and last blocks"
+        );
+        for (block, input) in [0, 23].into_iter().zip(block_inputs) {
+            ensure!(input["index"] == block, "QKV fixture block order differs");
+            let gamma = ["q", "k"]
+                .iter()
+                .map(|part| -> Result<Vec<f32>> {
+                    input[format!("{part}_gamma")]
+                        .as_array()
+                        .context("QKV gamma missing")?
+                        .iter()
+                        .map(|v| Ok(v.as_f64().context("QKV gamma is not numeric")? as f32))
+                        .collect()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                gamma
+                    .iter()
+                    .all(|g| g.len() == 2112 && g.iter().all(|x| x.is_finite())),
+                "QKV gamma layout/nonfinite"
+            );
+            let gamma = gamma
+                .iter()
+                .map(|g| Ok(device.stream.clone_htod(g)?))
+                .collect::<Result<Vec<_>>>()?;
+            for rows in [1usize, 3, 31, 33, 2548, 13019, 22775] {
+                let count = rows * 2112;
+                let packed = (0..3 * count)
+                    .map(|i| {
+                        if i % 2112 < 96 {
+                            f16::from_bits(if i & 1 == 0 { 0 } else { 0x8000 })
+                        } else if i % 101 == 0 {
+                            f16::from_bits(1 + (i % 31) as u16)
+                        } else {
+                            f16::from_f32(((i * 37 % 97) as f32 - 48.0) / 19.0)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let packed = device.stream.clone_htod(&packed)?;
+                let sites = SparseSites::new(
+                    (0..rows)
+                        .map(|i| {
+                            [
+                                0,
+                                (i / 4096) as i32,
+                                ((i / 64) % 64) as i32,
+                                (i % 64) as i32,
+                            ]
+                        })
+                        .collect(),
+                )?;
+                let phases = spatial_phases(&device, &kernels, &sites)?;
+                let sentinel = f16::from_f32(-123.0);
+                let allocate = || -> Result<Vec<CudaSlice<f16>>> {
+                    (0..3)
+                        .map(|_| Ok(device.stream.clone_htod(&vec![sentinel; count + 8])?))
+                        .collect()
+                };
+                let expected = allocate()?;
+                let actual = allocate()?;
+                let temporary = device.stream.alloc_zeros::<f16>(count)?;
+                let inputs = [
+                    ptr(&packed, &device),
+                    ptr(&phases, &device),
+                    ptr(&gamma[0], &device),
+                    ptr(&gamma[1], &device),
+                ];
+                let out = [
+                    ptr(&actual[0], &device),
+                    ptr(&actual[1], &device),
+                    ptr(&actual[2], &device),
+                ];
+                kernels.prepare_qkv_separate(
+                    &device,
+                    inputs,
+                    [
+                        ptr(&expected[0], &device),
+                        ptr(&temporary, &device),
+                        ptr(&expected[1], &device),
+                        ptr(&expected[2], &device),
+                    ],
+                    rows,
+                )?;
+                kernels.prepare_qkv(&device, inputs, out, rows)?;
+                let reference = snapshot(&expected)?;
+                let eager = snapshot(&actual)?;
+                ensure!(
+                    reference
+                        .iter()
+                        .chain(&eager)
+                        .all(|a| a[..count].iter().all(|v| v.is_finite())
+                            && a[count..].iter().all(|v| *v == sentinel)),
+                    "QKV nonfinite/guard failure"
+                );
+                let bits = different_bits(&reference, &eager);
+                defects += usize::from(bits != 0);
+                device
+                    .stream
+                    .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                kernels.prepare_qkv(&device, inputs, out, rows)?;
+                let graph = device
+                    .stream
+                    .end_capture(sys::CUgraphInstantiate_flags(0))?
+                    .context("QKV graph missing")?;
+                let mut nodes = 0;
+                unsafe {
+                    sys::cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut nodes)
+                        .result()?;
+                }
+                ensure!(nodes == 1, "QKV graph must contain one kernel");
+                let mut node = std::ptr::null_mut();
+                let mut params = std::mem::MaybeUninit::uninit();
+                unsafe {
+                    sys::cuGraphGetNodes(graph.cu_graph(), &mut node, &mut nodes).result()?;
+                    sys::cuGraphKernelNodeGetParams_v2(node, params.as_mut_ptr()).result()?;
+                    let params = params.assume_init();
+                    ensure!(
+                        params.func == fused.cu_function()
+                            && params.blockDimX == 128
+                            && params.gridDimX as usize == (rows * 22).div_ceil(4)
+                            && params.sharedMemBytes == 0,
+                        "QKV captured launch differs"
+                    );
+                }
+                graph.launch()?;
+                let captured = snapshot(&actual)?;
+                ensure!(
+                    captured
+                        .iter()
+                        .all(|a| a[..count].iter().all(|v| v.is_finite())
+                            && a[count..].iter().all(|v| *v == sentinel)),
+                    "QKV graph nonfinite/guard failure"
+                );
+                let graph_bits = different_bits(&reference, &captured);
+                defects += usize::from(graph_bits != 0);
+                println!(
+                    "{} F16_QKV_IDENTITY component={component} block={block} rows={rows} heads=22 dim=96 output_bits={bits} graph_bits={graph_bits} threshold_bits=0 kernel_nodes=1",
+                    if bits == 0 && graph_bits == 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                if rows == 33 && component == "transformer_512" && block == 0 {
+                    kernels.prepare_qkv(&device, inputs, out, rows - 1)?;
+                    let wrong = snapshot(&actual)?;
+                    let prefix = (rows - 1) * 2112;
+                    let q_bits: u64 = reference[0][..prefix]
+                        .iter()
+                        .zip(&wrong[0][..prefix])
+                        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+                        .sum();
+                    let changes = reference[1..]
+                        .iter()
+                        .zip(&wrong[1..])
+                        .flat_map(|(a, b)| a[..prefix].iter().zip(&b[..prefix]))
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    defects += usize::from(q_bits != 0 || changes == 0);
+                    println!(
+                        "{} F16_QKV_HEAD_STRIDE_CONTROL expected_stride={rows} wrong_stride={} q_prefix_bits={q_bits} kv_changes={changes}",
+                        if q_bits == 0 && changes > 0 {
+                            "PASS"
+                        } else {
+                            "DEFECT"
+                        },
+                        rows - 1
+                    );
+                    controls += 1;
+                }
+                cells += 1;
+            }
+        }
+    }
+    println!(
+        "F16_QKV_PREPARATION_RESULT cells={cells} controls={controls} defects={defects} threshold_bits=0 eager_graph=true"
+    );
+    ensure!(
+        cells == 28 && controls == 1 && defects == 0,
+        "QKV preparation candidate defects"
+    );
+    Ok(())
+}
+
 fn flow_padded_identity(
     flow: &mut Flow<f16>,
     input: &CudaSlice<f32>,
@@ -5068,6 +5330,22 @@ fn flow_padded_identity(
         .sum();
     println!(
         "N5_F16_D96_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} self_cross=true",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len()
+    );
+    *defects += usize::from(bits != 0);
+    flow.kernels.qkv_reference = true;
+    flow.forward(input, 0, condition, output)?;
+    flow.kernels.qkv_reference = false;
+    let separate = flow.device.stream.clone_dtoh(output)?;
+    let bits: u64 = compact
+        .iter()
+        .zip(&separate)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_QKV_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} threshold_bits=0",
         if bits == 0 { "PASS" } else { "DEFECT" },
         flow.rows,
         flow.blocks.len()

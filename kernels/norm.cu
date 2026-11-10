@@ -504,6 +504,65 @@ extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_f16(
       x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
 }
 
+extern "C" __global__ __launch_bounds__(128, 12) void qkv_rope_l2_d96_f16(
+    const __half* packed, const float* rotary, const float* q_gamma,
+    const float* k_gamma, __half* q, __half* k, __half* v,
+    int rows, int heads, float scale, float eps) {
+  if (!packed || !rotary || !q_gamma || !k_gamma || !q || !k || !v ||
+      rows < 1 || heads < 1 || blockDim.x != 128 || blockDim.y != 1 ||
+      blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+      !isfinite(scale) || !(eps > 0.0f)) { __trap(); return; }
+  const int slice = blockIdx.x * 4 + threadIdx.x / 32;
+  if (slice >= rows * heads) return;
+  const int lane = threadIdx.x & 31;
+  const int row = slice / heads;
+  const int head = slice % heads;
+  const size_t input = ((size_t)row * 3 * heads + head) * 96;
+  const size_t head_major = ((size_t)head * rows + row) * 96;
+  for (int part = 0; part < 2; ++part) {
+    float values[3];
+    float ssq = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const int d = lane + 32 * i;
+      const float value = __half2float(packed[input + (size_t)part * heads * 96 + d]);
+      const float mate = __shfl_xor_sync(FF_WARP_MASK, value, 1);
+      const float a = (lane & 1) ? mate : value;
+      const float b = (lane & 1) ? value : mate;
+      const float phase = rotary[(size_t)row * 96 + d];
+      const float phase_mate = __shfl_xor_sync(FF_WARP_MASK, phase, 1);
+      const float c = (lane & 1) ? phase_mate : phase;
+      const float s = (lane & 1) ? phase : phase_mate;
+      const float rotated = (lane & 1) ? a * s + b * c : a * c - b * s;
+      values[i] = __half2float(__float2half_rn(rotated));
+      ssq = __fadd_rn(ssq, __fmul_rn(values[i], values[i]));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(FF_WARP_MASK, ssq, offset));
+    ssq = lane == 0 ? ssq : 0.0f;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(FF_WARP_MASK, ssq, offset));
+    const float denom = fmaxf(__fsqrt_rn(ssq), eps);
+    const float* gamma = part == 0 ? q_gamma : k_gamma;
+    __half* output = part == 0 ? q : k;
+    const size_t base = part == 0 ? (size_t)slice * 96 : head_major;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const int d = lane + 32 * i;
+      const float normed = __fdiv_rn(values[i], denom);
+      const float scaled = __fmul_rn(__fmul_rn(normed, gamma[head * 96 + d]), scale);
+      output[base + d] = __float2half_rn(scaled);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const int d = lane + 32 * i;
+    v[head_major + d] = packed[input + (size_t)2 * heads * 96 + d];
+  }
+}
+
 extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_f32(
     const float* x, const float* gamma, float* y, int rows, int heads,
     int dim, float scale, float eps, int head_major_seq_len) {
