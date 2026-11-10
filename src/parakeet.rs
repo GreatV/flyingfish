@@ -35,6 +35,9 @@ pub struct FastConformer {
     pub left_chunks: u32,
     pub conv_names: [&'static str; 3],
     pub pointwise_names: [&'static str; 2],
+    pub linear_name: &'static str,
+    pub attention_names: [&'static str; 7],
+    pub conv_norm_name: &'static str,
 }
 
 /// Stride-2 kernel-3 output length for the given left and right pads.
@@ -523,6 +526,17 @@ impl ParakeetSpec {
                 "subsampling.layers.5",
             ],
             pointwise_names: ["subsampling.layers.3", "subsampling.layers.6"],
+            linear_name: "subsampling.linear",
+            attention_names: [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "relative_k_proj",
+                "bias_u",
+                "bias_v",
+            ],
+            conv_norm_name: "norm",
         }
     }
 

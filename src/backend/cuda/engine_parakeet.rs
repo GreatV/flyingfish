@@ -31,11 +31,11 @@ macro_rules! note_launch {
     };
 }
 
-struct Linear {
-    weight: CudaSlice<f32>,
-    bias: Option<CudaSlice<f32>>,
-    output: u32,
-    input: u32,
+pub(crate) struct Linear {
+    pub(crate) weight: CudaSlice<f32>,
+    pub(crate) bias: Option<CudaSlice<f32>>,
+    pub(crate) output: u32,
+    pub(crate) input: u32,
 }
 
 struct Norm {
@@ -90,42 +90,42 @@ struct Subsample {
     pointwise: [Linear; 2],
 }
 
-struct Ops {
-    conv2d: CudaFunction,
-    mask_time: CudaFunction,
-    pack: CudaFunction,
+pub(crate) struct Ops {
+    pub(crate) conv2d: CudaFunction,
+    pub(crate) mask_time: CudaFunction,
+    pub(crate) pack: CudaFunction,
     depthwise: CudaFunction,
     batch_norm: CudaFunction,
-    residual: CudaFunction,
+    pub(crate) residual: CudaFunction,
     relative_attention: CudaFunction,
-    lstm: CudaFunction,
-    activation: CudaFunction,
-    bias: CudaFunction,
+    pub(crate) lstm: CudaFunction,
+    pub(crate) activation: CudaFunction,
+    pub(crate) bias: CudaFunction,
     layer_norm: CudaFunction,
-    argmax: CudaFunction,
+    pub(crate) argmax: CudaFunction,
 }
 
 pub struct ParakeetEncoder {
     conformer: FastConformer,
-    stream: Arc<CudaStream>,
+    pub(crate) stream: Arc<CudaStream>,
     subsample: Subsample,
     subsample_linear: Linear,
     blas: CudaBlas,
     blocks: Vec<Block>,
-    ops: Ops,
+    pub(crate) ops: Ops,
     #[cfg(test)]
     encode_calls: AtomicU64,
 }
 
-struct LstmLayer {
-    input: Linear,
-    recurrent: Linear,
-    bias_ih: CudaSlice<f32>,
-    bias_hh: CudaSlice<f32>,
-    hidden: CudaSlice<f32>,
-    cell: CudaSlice<f32>,
-    input_gates: CudaSlice<f32>,
-    recurrent_gates: CudaSlice<f32>,
+pub(crate) struct LstmLayer {
+    pub(crate) input: Linear,
+    pub(crate) recurrent: Linear,
+    pub(crate) bias_ih: CudaSlice<f32>,
+    pub(crate) bias_hh: CudaSlice<f32>,
+    pub(crate) hidden: CudaSlice<f32>,
+    pub(crate) cell: CudaSlice<f32>,
+    pub(crate) input_gates: CudaSlice<f32>,
+    pub(crate) recurrent_gates: CudaSlice<f32>,
 }
 
 pub struct TdtTrajectory {
@@ -162,7 +162,7 @@ struct SubsampleOutput {
     valid: usize,
 }
 
-fn tensor(
+pub(crate) fn tensor(
     checkpoint: &MappedCheckpoint,
     stream: &Arc<CudaStream>,
     name: &str,
@@ -176,7 +176,7 @@ fn tensor(
     Ok(stream.clone_htod(&values)?)
 }
 
-fn linear(
+pub(crate) fn linear(
     checkpoint: &MappedCheckpoint,
     stream: &Arc<CudaStream>,
     name: &str,
@@ -221,10 +221,16 @@ fn linear_shaped(
     })
 }
 
-fn norm(checkpoint: &MappedCheckpoint, stream: &Arc<CudaStream>, prefix: &str) -> Result<Norm> {
+fn norm(
+    checkpoint: &MappedCheckpoint,
+    stream: &Arc<CudaStream>,
+    prefix: &str,
+    hidden: u32,
+) -> Result<Norm> {
+    let size = [hidden as usize];
     Ok(Norm {
-        weight: tensor(checkpoint, stream, &format!("{prefix}.weight"), &[1024])?,
-        bias: tensor(checkpoint, stream, &format!("{prefix}.bias"), &[1024])?,
+        weight: tensor(checkpoint, stream, &format!("{prefix}.weight"), &size)?,
+        bias: tensor(checkpoint, stream, &format!("{prefix}.bias"), &size)?,
     })
 }
 
@@ -285,6 +291,7 @@ struct AttentionLaunch<'a> {
     query_offset: u32,
     kv_offset: u32,
     right_chunks: u32,
+    valid_keys: u32,
 }
 
 #[cfg(test)]
@@ -497,6 +504,21 @@ impl ParakeetEncoder {
         conformer: &FastConformer,
     ) -> Result<Self> {
         let checkpoint = MappedCheckpoint::open(directory)?;
+        Self::load_conformer_checkpoint(checkpoint, device, conformer)
+    }
+
+    /// Loads the EOU encoder from the stored-ZIP member of a `.nemo` tar archive.
+    pub fn load_eou(nemo: &Path, device: &Device) -> Result<Self> {
+        let spec = crate::eou::EouSpec::read(nemo)?;
+        let checkpoint = MappedCheckpoint::open_nemo(nemo)?;
+        Self::load_conformer_checkpoint(checkpoint, device, &spec.conformer())
+    }
+
+    fn load_conformer_checkpoint(
+        checkpoint: MappedCheckpoint,
+        device: &Device,
+        conformer: &FastConformer,
+    ) -> Result<Self> {
         let root = conformer.prefix;
         let stream = Arc::clone(&device.stream);
         let blas = CudaBlas::new(Arc::clone(&stream))?;
@@ -552,8 +574,8 @@ impl ParakeetEncoder {
         let subsample_linear = linear(
             &checkpoint,
             &stream,
-            &format!("{root}.subsampling.linear"),
-            1024,
+            &format!("{root}.{}", conformer.linear_name),
+            conformer.hidden,
             conformer.linear_in,
             true,
         )?;
@@ -572,21 +594,26 @@ impl ParakeetEncoder {
             let convolution_bias = conformer.convolution_bias;
             let feed_forward = |branch: &str| -> Result<FeedForward> {
                 Ok(FeedForward {
-                    norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_{branch}"))?,
+                    norm: norm(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.norm_{branch}"),
+                        conformer.hidden,
+                    )?,
                     up: linear(
                         &checkpoint,
                         &stream,
                         &format!("{prefix}.{branch}.linear1"),
-                        4096,
-                        1024,
+                        conformer.hidden * 4,
+                        conformer.hidden,
                         attention_bias,
                     )?,
                     down: linear(
                         &checkpoint,
                         &stream,
                         &format!("{prefix}.{branch}.linear2"),
-                        1024,
-                        4096,
+                        conformer.hidden,
+                        conformer.hidden * 4,
                         attention_bias,
                     )?,
                 })
@@ -596,8 +623,8 @@ impl ParakeetEncoder {
                     &checkpoint,
                     &stream,
                     &format!("{prefix}.self_attn.{name}"),
-                    1024,
-                    1024,
+                    conformer.hidden,
+                    conformer.hidden,
                     bias,
                 )
             };
@@ -605,47 +632,58 @@ impl ParakeetEncoder {
                 ff1: feed_forward("feed_forward1")?,
                 ff2: feed_forward("feed_forward2")?,
                 attention: Attention {
-                    q: attention("q_proj", attention_bias)?,
-                    k: attention("k_proj", attention_bias)?,
-                    v: attention("v_proj", attention_bias)?,
-                    o: attention("o_proj", attention_bias)?,
-                    relative: attention("relative_k_proj", false)?,
+                    q: attention(conformer.attention_names[0], attention_bias)?,
+                    k: attention(conformer.attention_names[1], attention_bias)?,
+                    v: attention(conformer.attention_names[2], attention_bias)?,
+                    o: attention(conformer.attention_names[3], attention_bias)?,
+                    relative: attention(conformer.attention_names[4], false)?,
                     bias_u: tensor(
                         &checkpoint,
                         &stream,
-                        &format!("{prefix}.self_attn.bias_u"),
-                        &[8, 128],
+                        &format!("{}.self_attn.{}", prefix, conformer.attention_names[5]),
+                        &[
+                            conformer.heads as usize,
+                            conformer.hidden as usize / conformer.heads as usize,
+                        ],
                     )?,
                     bias_v: tensor(
                         &checkpoint,
                         &stream,
-                        &format!("{prefix}.self_attn.bias_v"),
-                        &[8, 128],
+                        &format!("{}.self_attn.{}", prefix, conformer.attention_names[6]),
+                        &[
+                            conformer.heads as usize,
+                            conformer.hidden as usize / conformer.heads as usize,
+                        ],
                     )?,
                 },
                 convolution: Convolution {
-                    norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_conv"))?,
+                    norm: norm(
+                        &checkpoint,
+                        &stream,
+                        &format!("{prefix}.norm_conv"),
+                        conformer.hidden,
+                    )?,
                     pointwise1: linear_shaped(
                         &checkpoint,
                         &stream,
                         &format!("{prefix}.conv.pointwise_conv1"),
-                        2048,
-                        1024,
+                        conformer.hidden * 2,
+                        conformer.hidden,
                         convolution_bias,
-                        &[2048, 1024, 1],
+                        &[conformer.hidden as usize * 2, conformer.hidden as usize, 1],
                     )?,
                     depthwise: tensor(
                         &checkpoint,
                         &stream,
                         &format!("{prefix}.conv.depthwise_conv.weight"),
-                        &[1024, 1, conformer.conv_kernel as usize],
+                        &[conformer.hidden as usize, 1, conformer.conv_kernel as usize],
                     )?,
                     depthwise_bias: if convolution_bias {
                         Some(tensor(
                             &checkpoint,
                             &stream,
                             &format!("{prefix}.conv.depthwise_conv.bias"),
-                            &[1024],
+                            &[conformer.hidden as usize],
                         )?)
                     } else {
                         None
@@ -653,21 +691,21 @@ impl ParakeetEncoder {
                     conv_weight: tensor(
                         &checkpoint,
                         &stream,
-                        &format!("{prefix}.conv.norm.weight"),
-                        &[1024],
+                        &format!("{prefix}.conv.{}.weight", conformer.conv_norm_name),
+                        &[conformer.hidden as usize],
                     )?,
                     conv_bias: tensor(
                         &checkpoint,
                         &stream,
-                        &format!("{prefix}.conv.norm.bias"),
-                        &[1024],
+                        &format!("{prefix}.conv.{}.bias", conformer.conv_norm_name),
+                        &[conformer.hidden as usize],
                     )?,
                     running_mean: if conformer.conv_batch_norm {
                         Some(tensor(
                             &checkpoint,
                             &stream,
-                            &format!("{prefix}.conv.norm.running_mean"),
-                            &[1024],
+                            &format!("{prefix}.conv.{}.running_mean", conformer.conv_norm_name),
+                            &[conformer.hidden as usize],
                         )?)
                     } else {
                         None
@@ -676,8 +714,8 @@ impl ParakeetEncoder {
                         Some(tensor(
                             &checkpoint,
                             &stream,
-                            &format!("{prefix}.conv.norm.running_var"),
-                            &[1024],
+                            &format!("{prefix}.conv.{}.running_var", conformer.conv_norm_name),
+                            &[conformer.hidden as usize],
                         )?)
                     } else {
                         None
@@ -686,14 +724,24 @@ impl ParakeetEncoder {
                         &checkpoint,
                         &stream,
                         &format!("{prefix}.conv.pointwise_conv2"),
-                        1024,
-                        1024,
+                        conformer.hidden,
+                        conformer.hidden,
                         convolution_bias,
-                        &[1024, 1024, 1],
+                        &[conformer.hidden as usize, conformer.hidden as usize, 1],
                     )?,
                 },
-                attention_norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_self_att"))?,
-                output_norm: norm(&checkpoint, &stream, &format!("{prefix}.norm_out"))?,
+                attention_norm: norm(
+                    &checkpoint,
+                    &stream,
+                    &format!("{prefix}.norm_self_att"),
+                    conformer.hidden,
+                )?,
+                output_norm: norm(
+                    &checkpoint,
+                    &stream,
+                    &format!("{prefix}.norm_out"),
+                    conformer.hidden,
+                )?,
             });
         }
         stream.synchronize()?;
@@ -710,7 +758,12 @@ impl ParakeetEncoder {
         })
     }
 
-    fn linear(&self, input: &CudaSlice<f32>, rows: u32, weight: &Linear) -> Result<CudaSlice<f32>> {
+    pub(crate) fn linear(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        weight: &Linear,
+    ) -> Result<CudaSlice<f32>> {
         let mut output = self
             .stream
             .alloc_zeros(rows as usize * weight.output as usize)?;
@@ -718,7 +771,7 @@ impl ParakeetEncoder {
         Ok(output)
     }
 
-    fn linear_into(
+    pub(crate) fn linear_into(
         &self,
         input: &CudaSlice<f32>,
         rows: u32,
@@ -790,7 +843,7 @@ impl ParakeetEncoder {
         Ok(output)
     }
 
-    fn activate_into(
+    pub(crate) fn activate_into(
         &self,
         input: &CudaSlice<f32>,
         rows: u32,
@@ -863,7 +916,7 @@ impl ParakeetEncoder {
         Ok(output)
     }
 
-    fn residual(
+    pub(crate) fn residual(
         &self,
         hidden: &mut CudaSlice<f32>,
         delta: &CudaSlice<f32>,
@@ -1019,7 +1072,7 @@ impl ParakeetEncoder {
             |hidden: &mut CudaSlice<f32>, ff: &FeedForward, scale: f32| -> Result<()> {
                 let normalized = self.normalize(hidden, rows, &ff.norm)?;
                 let expanded = self.linear(&normalized, rows, &ff.up)?;
-                let activated = self.activate(&expanded, rows, 4096, 1)?;
+                let activated = self.activate(&expanded, rows, self.conformer.hidden * 4, 1)?;
                 let delta = self.linear(&activated, rows, &ff.down)?;
                 self.residual(hidden, &delta, scale)
             };
@@ -1045,6 +1098,7 @@ impl ParakeetEncoder {
             query_offset: 0,
             kv_offset: 0,
             right_chunks,
+            valid_keys: rows,
         })?;
         let delta = self.linear(&core, rows, &block.attention.o)?;
         self.residual(&mut hidden, &delta, 1.0)?;
@@ -1201,6 +1255,7 @@ impl ParakeetEncoder {
                 && launch.output.len() == rows * hidden
                 && launch.relative.len() >= (rows + key_rows - 1) * hidden
                 && launch.mask.len() >= key_rows
+                && launch.valid_keys <= key_rows as u32
                 && (self.conformer.chunk_size != 0
                     || (launch.query_offset == 0
                         && launch.kv_offset == 0
@@ -1220,13 +1275,18 @@ impl ParakeetEncoder {
                 .arg(launch.output)
                 .arg(&launch.rows)
                 .arg(&self.conformer.heads)
-                .arg(&(1.0f32 / 128f32.sqrt()))
+                .arg(&(self.conformer.hidden / self.conformer.heads))
+                .arg(&{
+                    let head_dim = (self.conformer.hidden / self.conformer.heads) as f32;
+                    1.0f32 / head_dim.sqrt()
+                })
                 .arg(&self.conformer.chunk_size)
                 .arg(&self.conformer.left_chunks)
                 .arg(&launch.right_chunks)
                 .arg(&launch.key_rows)
                 .arg(&launch.query_offset)
                 .arg(&launch.kv_offset)
+                .arg(&launch.valid_keys)
                 .launch(LaunchConfig {
                     grid_dim: (launch.rows, self.conformer.heads, 1),
                     block_dim: (128, 1, 1),
@@ -1707,6 +1767,7 @@ impl ParakeetEncoder {
             query_offset: window.query_offset,
             kv_offset: attend_offset,
             right_chunks: 0,
+            valid_keys: attend_rows,
         })?;
         let delta = self.linear(&core, rows, &block.attention.o)?;
         self.residual(&mut hidden, &delta, 1.0)?;
@@ -2304,6 +2365,279 @@ impl ParakeetTdt {
     #[cfg(test)]
     pub fn lstm_call_count(&self) -> usize {
         self.lstm_calls.get()
+    }
+}
+
+/// EOU cache-aware streaming session: one encoder row per step under the
+/// chunked_limited [70, 1] window, with hidden-row attention caches and
+/// depthwise conv caches per layer.
+pub struct EouStream {
+    hidden_rows: Vec<CudaSlice<f32>>,
+    depthwise: Vec<CudaSlice<f32>>,
+    pub(crate) cache_len: usize,
+    mask: CudaSlice<u8>,
+}
+
+pub struct EouStep {
+    /// The two encoder query rows of this step, `[2, hidden]`.
+    pub rows: Vec<f32>,
+}
+
+impl ParakeetEncoder {
+    pub fn eou_stream(&self) -> Result<EouStream> {
+        let conformer = &self.conformer;
+        ensure!(
+            conformer.chunk_size == 2
+                && conformer.left_chunks == 35
+                && conformer.layers == 17
+                && conformer.hidden == 512
+                && conformer.heads == 8
+                && conformer.conv_kernel == 9
+                && conformer.depthwise_left == 8
+                && !conformer.conv_batch_norm
+                && !conformer.convolution_bias
+                && self.blocks.len() == 17,
+            "EOU streaming session requires the published EOU encoder"
+        );
+        let mut hidden_rows = Vec::with_capacity(17);
+        let mut depthwise = Vec::with_capacity(17);
+        for _ in 0..17 {
+            hidden_rows.push(self.stream.alloc_zeros(0)?);
+            depthwise.push(self.stream.alloc_zeros(8 * 512)?);
+        }
+        Ok(EouStream {
+            hidden_rows,
+            depthwise,
+            cache_len: 0,
+            mask: self.stream.clone_htod(&vec![1u8; 72])?,
+        })
+    }
+
+    /// One streaming step: `window` is the mel window (9 frames at a fresh
+    /// session start, 25 frames afterwards = 9 lookback + 16 chunk frames; a
+    /// post-<EOU> step keeps the steady-state window), returning the two
+    /// query rows of this step.
+    fn eou_layer_step(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        session: &EouStream,
+        hidden_cache: &CudaSlice<f32>,
+        valid: usize,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)> {
+        let block = self.blocks.get(index).context("EOU layer outside range")?;
+        let rows = 2u32;
+        let width = self.conformer.hidden as usize;
+        ensure!(
+            input.len() == rows as usize * width,
+            "EOU streaming layer input"
+        );
+        let feed_forward =
+            |hidden: &mut CudaSlice<f32>, ff: &FeedForward, scale: f32| -> Result<()> {
+                let normalized = self.normalize(hidden, rows, &ff.norm)?;
+                let expanded = self.linear(&normalized, rows, &ff.up)?;
+                let activated = self.activate(&expanded, rows, width as u32 * 4, 1)?;
+                let delta = self.linear(&activated, rows, &ff.down)?;
+                self.residual(hidden, &delta, scale)
+            };
+        let mut hidden = input.try_clone()?;
+        feed_forward(&mut hidden, &block.ff1, 0.5)?;
+        let attention_input = self.normalize(&hidden, rows, &block.attention_norm)?;
+        let cached = session.cache_len;
+        let key_rows = (cached + rows as usize) as u32;
+        let table = self
+            .stream
+            .clone_htod(&relative_positions(key_rows as usize, width)?)?;
+        let relative = self.linear(&table, 2 * key_rows - 1, &block.attention.relative)?;
+        let mut keys_input = self.stream.alloc_zeros(key_rows as usize * width)?;
+        self.copy_device(hidden_cache, 0, &mut keys_input, 0, cached * width)?;
+        self.copy_device(
+            &attention_input,
+            0,
+            &mut keys_input,
+            cached * width,
+            rows as usize * width,
+        )?;
+        let q_full = self.linear(&keys_input, key_rows, &block.attention.q)?;
+        let k = self.linear(&keys_input, key_rows, &block.attention.k)?;
+        let v = self.linear(&keys_input, key_rows, &block.attention.v)?;
+        let core_full = self.stream.alloc_zeros(key_rows as usize * width)?;
+        let valid_keys = cached as u32 + valid as u32;
+        self.attend(AttentionLaunch {
+            q: &q_full,
+            k: &k,
+            v: &v,
+            relative: &relative,
+            bias_u: &block.attention.bias_u,
+            bias_v: &block.attention.bias_v,
+            mask: &session.mask,
+            output: &core_full,
+            rows: key_rows,
+            key_rows,
+            query_offset: 0,
+            kv_offset: 0,
+            right_chunks: 1,
+            valid_keys,
+        })?;
+        let mut core: CudaSlice<f32> = self.stream.alloc_zeros(rows as usize * width)?;
+        self.copy_device(
+            &core_full,
+            cached * width,
+            &mut core,
+            0,
+            rows as usize * width,
+        )?;
+        let delta = self.linear(&core, rows, &block.attention.o)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        let conv_normalized = self.normalize(&hidden, rows, &block.convolution.norm)?;
+        let expanded = self.linear(&conv_normalized, rows, &block.convolution.pointwise1)?;
+        let mut activated = self.activate(&expanded, rows, self.conformer.hidden, 2)?;
+        if valid < rows as usize {
+            let mut zeros = self.stream.alloc_zeros(rows as usize * width)?;
+            self.copy_device(&activated, 0, &mut zeros, 0, valid * width)?;
+            activated = zeros;
+        }
+        let launch_rows = if cached == 0 { rows } else { 8 + rows };
+        let convolved = self.stream.alloc_zeros(launch_rows as usize * width)?;
+        if launch_rows == 8 + rows {
+            let mut joined = self.stream.alloc_zeros(launch_rows as usize * width)?;
+            self.copy_device(&session.depthwise[index], 0, &mut joined, 0, 8 * width)?;
+            self.copy_device(&activated, 0, &mut joined, 8 * width, rows as usize * width)?;
+            self.launch_depthwise(
+                &joined,
+                &block.convolution.depthwise,
+                &session.mask,
+                &convolved,
+                launch_rows,
+            )?;
+        } else {
+            self.launch_depthwise(
+                &activated,
+                &block.convolution.depthwise,
+                &session.mask,
+                &convolved,
+                launch_rows,
+            )?;
+        }
+        let kept = if launch_rows == 8 + rows {
+            let mut rows_kept = self.stream.alloc_zeros(rows as usize * width)?;
+            self.copy_device(
+                &convolved,
+                8 * width,
+                &mut rows_kept,
+                0,
+                rows as usize * width,
+            )?;
+            rows_kept
+        } else {
+            convolved
+        };
+        let normalized = self.normalize_pair(
+            &kept,
+            rows,
+            &block.convolution.conv_weight,
+            &block.convolution.conv_bias,
+        )?;
+        let conv_activated = self.activate(&normalized, rows, self.conformer.hidden, 1)?;
+        let delta = self.linear(&conv_activated, rows, &block.convolution.pointwise2)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        feed_forward(&mut hidden, &block.ff2, 0.5)?;
+        let output = self.normalize(&hidden, rows, &block.output_norm)?;
+        Ok((output, attention_input, activated))
+    }
+
+    /// Runs one streaming step over the mel window; the returned rows are the
+    /// two query rows `[2, hidden]` (the second is the new row).
+    pub fn eou_encode_step(
+        &self,
+        session: &mut EouStream,
+        window: &[f32],
+        valid: usize,
+    ) -> Result<EouStep> {
+        let width = self.conformer.hidden as usize;
+        ensure!(
+            window.len() == 9 * 128 || window.len() == 25 * 128,
+            "EOU streaming window frames {}",
+            window.len() / 128
+        );
+        ensure!(
+            valid > 0 || session.cache_len > 0,
+            "EOU streaming step has no valid rows and no cache"
+        );
+        ensure!(
+            window.iter().all(|value| value.is_finite()),
+            "EOU streaming window is non-finite"
+        );
+        let frames = window.len() / 128;
+        let subsampled = self.subsample_device(window, frames)?;
+        let raw_rows = subsampled.hidden.len() / width;
+        let drop = (frames - 9) / 8;
+        ensure!(
+            raw_rows == drop + 2,
+            "EOU streaming pre-encode rows {raw_rows} with drop {drop}"
+        );
+        let mut query = self.stream.alloc_zeros(2 * width)?;
+        self.copy_device(&subsampled.hidden, drop * width, &mut query, 0, 2 * width)?;
+        let mut hidden = query;
+        let mut next_attention_rows = Vec::with_capacity(17);
+        let mut next_conv_rows = Vec::with_capacity(17);
+        for index in 0..self.blocks.len() {
+            let (output, attention_input, conv_input) =
+                self.eou_layer_step(index, &hidden, session, &session.hidden_rows[index], valid)?;
+            hidden = output;
+            next_attention_rows.push(attention_input);
+            next_conv_rows.push(conv_input);
+        }
+        let rows = self.stream.clone_dtoh(&hidden)?;
+        let keep = (session.cache_len + 1).min(70);
+        for index in 0..self.blocks.len() {
+            let mut cache = self.stream.alloc_zeros(keep * width)?;
+            let combined = session.cache_len + 1;
+            let skip = combined - keep;
+            self.copy_device(
+                &session.hidden_rows[index],
+                skip * width,
+                &mut cache,
+                0,
+                (session.cache_len - skip) * width,
+            )?;
+            self.copy_device(
+                &next_attention_rows[index],
+                0,
+                &mut cache,
+                (keep - 1) * width,
+                width,
+            )?;
+            session.hidden_rows[index] = cache;
+            let mut depthwise = self.stream.alloc_zeros(8 * width)?;
+            if session.cache_len == 0 {
+                self.copy_device(&next_conv_rows[index], 0, &mut depthwise, 7 * width, width)?;
+            } else {
+                self.copy_device(
+                    &session.depthwise[index],
+                    width,
+                    &mut depthwise,
+                    0,
+                    7 * width,
+                )?;
+                self.copy_device(&next_conv_rows[index], 0, &mut depthwise, 7 * width, width)?;
+            }
+            session.depthwise[index] = depthwise;
+        }
+        session.cache_len = keep;
+        Ok(EouStep { rows })
+    }
+
+    /// Resets the streaming session after an <EOU>: both caches restart; the
+    /// window cadence continues from the stream position.
+    pub fn eou_stream_reset(&self, session: &mut EouStream) -> Result<()> {
+        let width = self.conformer.hidden as usize;
+        for index in 0..session.hidden_rows.len() {
+            session.hidden_rows[index] = self.stream.alloc_zeros(0)?;
+            session.depthwise[index] = self.stream.alloc_zeros(8 * width)?;
+        }
+        session.cache_len = 0;
+        Ok(())
     }
 }
 

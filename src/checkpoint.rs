@@ -246,6 +246,37 @@ impl MappedCheckpoint {
             files: BTreeMap::from([(name.to_owned(), file)]),
         })
     }
+
+    /// Opens the stored-ZIP `model_weights.ckpt` member of a `.nemo` tar archive.
+    pub fn open_nemo(path: &Path) -> Result<Self> {
+        ensure!(path.is_file(), "nemo archive missing: {}", path.display());
+        let file = File::open(path)?;
+        let map = unsafe { MmapOptions::new().map(&file)? };
+        let member = tar_member(&map, "model_weights.ckpt")?;
+        let mut tensors = stored_zip_tensors(&map[member.clone()])?;
+        for tensor in tensors.values_mut() {
+            tensor.range.start += member.start;
+            tensor.range.end += member.start;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("nemo archive name")?
+            .to_owned();
+        let index = Index {
+            weight_map: tensors
+                .keys()
+                .map(|key| (key.clone(), name.clone()))
+                .collect(),
+        };
+        Ok(Self {
+            index,
+            maps: BTreeMap::from([(name.clone(), map)]),
+            zip_tensors: Some(tensors),
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            files: BTreeMap::from([(name, file)]),
+        })
+    }
     pub(crate) fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
         let shard = self
             .index
@@ -5234,6 +5265,55 @@ impl<'a> CheckpointBytes<'a> {
     }
 }
 
+pub(crate) fn tar_member_bytes<'a>(data: &'a [u8], name: &str) -> Result<&'a [u8]> {
+    Ok(&data[tar_member(data, name)?])
+}
+
+pub(crate) fn tar_member(data: &[u8], name: &str) -> Result<std::ops::Range<usize>> {
+    let mut position = 0usize;
+    while position + 512 <= data.len() {
+        let header = &data[position..position + 512];
+        if header.iter().all(|&byte| byte == 0) {
+            break;
+        }
+        ensure!(
+            &header[257..262] == b"ustar",
+            "tar member header is not ustar"
+        );
+        let field = |range: std::ops::Range<usize>| -> Result<&str> {
+            let bytes = &header[range];
+            let end = bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(bytes.len());
+            Ok(std::str::from_utf8(&bytes[..end])?)
+        };
+        let member = field(0..100)?;
+        let size_text = field(124..136)?;
+        ensure!(
+            !size_text.is_empty() && size_text.bytes().all(|b| b.is_ascii_digit() || b == b' '),
+            "tar member size is not octal: {member}"
+        );
+        let size = usize::from_str_radix(size_text.trim_matches(' '), 8)
+            .with_context(|| format!("tar member size parse: {member}"))?;
+        let typeflag = header[156];
+        ensure!(
+            typeflag == b'0' || typeflag == 0,
+            "tar member is not a regular file: {member}"
+        );
+        let data_start = position + 512;
+        let data_stop = data_start
+            .checked_add(size)
+            .context("tar member size overflow")?;
+        ensure!(data_stop <= data.len(), "tar member truncated: {member}");
+        if member == name {
+            return Ok(data_start..data_stop);
+        }
+        position = data_start + size.div_ceil(512) * 512;
+    }
+    bail!("tar member missing: {name}")
+}
+
 fn stored_zip_entries(data: &[u8]) -> Result<BTreeMap<String, std::ops::Range<usize>>> {
     ensure!(data.len() >= 22, "truncated ZIP end record");
     let end = (data.len().saturating_sub(65557)..=data.len() - 22)
@@ -5558,7 +5638,7 @@ impl CheckpointPickle<'_> {
             "invalid storage key"
         );
         ensure!(
-            fields[3].text()? == "cuda:0",
+            fields[3].text()? == "cpu" || fields[3].text()? == "cuda:0",
             "unsupported stored location tag"
         );
         Ok(V::Storage(name.to_owned(), fields[4].integer()?))
@@ -5637,6 +5717,17 @@ impl CheckpointPickle<'_> {
                 }
                 b't' => Some(V::Tuple(self.marked()?)),
                 0x85 => Some(V::Tuple(vec![self.pop()?])),
+                0x86 => {
+                    let second = self.pop()?;
+                    let first = self.pop()?;
+                    Some(V::Tuple(vec![first, second]))
+                }
+                0x87 => {
+                    let third = self.pop()?;
+                    let second = self.pop()?;
+                    let first = self.pop()?;
+                    Some(V::Tuple(vec![first, second, third]))
+                }
                 b'R' => Some(self.reduce()?),
                 b'Q' => Some(self.persistent()?),
                 b'q' | b'r' => {
@@ -5750,11 +5841,20 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
     for (suffix, expected) in [
         ("byteorder", b"little".as_slice()),
         ("version", b"3\n".as_slice()),
+        (".format_version", b"1".as_slice()),
+        (".storage_alignment", b"64".as_slice()),
     ] {
-        let range = entries
-            .get(&format!("{prefix}{suffix}"))
-            .context("ZIP metadata missing")?;
-        ensure!(&data[range.clone()] == expected, "unsupported ZIP {suffix}");
+        let range = match entries.get(&format!("{prefix}{suffix}")) {
+            Some(range) => range.clone(),
+            None => {
+                ensure!(
+                    suffix == ".format_version" || suffix == ".storage_alignment",
+                    "ZIP metadata missing"
+                );
+                continue;
+            }
+        };
+        ensure!(&data[range] == expected, "unsupported ZIP {suffix}");
     }
     let range = entries[name].clone();
     ensure!(
@@ -5772,19 +5872,28 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
         prefix,
     }
     .parse()?;
-    let allowed: BTreeSet<_> = ["data.pkl", "byteorder", "version", ".data/serialization_id"]
-        .map(|s| format!("{prefix}{s}"))
-        .into_iter()
-        .collect();
+    let allowed: BTreeSet<_> = [
+        "data.pkl",
+        "byteorder",
+        "version",
+        ".format_version",
+        ".storage_alignment",
+        ".data/serialization_id",
+    ]
+    .map(|s| format!("{prefix}{s}"))
+    .into_iter()
+    .collect();
     ensure!(
         entries
             .iter()
             .all(|(name, range)| allowed.contains(name)
-                || tensors.values().any(|t| t.range == *range))
-            && entries.len() == tensors.len() + allowed.len(),
+                || tensors.values().any(|t| t.range == *range)),
         "unconsumed ZIP entries"
     );
-    let id = &data[entries[&format!("{prefix}.data/serialization_id")].clone()];
+    let id = entries
+        .get(&format!("{prefix}.data/serialization_id"))
+        .with_context(|| format!("stored-ZIP member {prefix}.data/serialization_id missing"))?;
+    let id = &data[id.clone()];
     ensure!(
         !id.is_empty() && id.iter().all(u8::is_ascii_digit),
         "invalid serialization ID"
@@ -5793,21 +5902,51 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
 }
 
 #[cfg(test)]
+pub(crate) fn tar_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut data = Vec::new();
+    let header = |name: &str, size: usize, typeflag: u8, out: &mut Vec<u8>| {
+        out.extend(std::iter::repeat_n(0u8, 512));
+        let start = out.len() - 512;
+        out[start..start + name.len()].copy_from_slice(name.as_bytes());
+        let octal = format!("{size:011o}\0");
+        out[start + 124..start + 136].copy_from_slice(octal.as_bytes());
+        out[start + 156] = typeflag;
+        out[start + 257..262].copy_from_slice(b"ustar");
+    };
+    for (name, value) in members {
+        header(name, value.len(), b'0', &mut data);
+        data.extend_from_slice(value);
+        data.extend(std::iter::repeat_n(
+            0u8,
+            value.len().div_ceil(512) * 512 - value.len(),
+        ));
+    }
+    data.extend(std::iter::repeat_n(0u8, 1024));
+    data
+}
+
+#[cfg(test)]
 mod stored_zip_tests {
     use super::*;
 
     fn archive(pickle: &[u8], method: u16) -> Vec<u8> {
         let payload = [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
-        let members = [
-            ("model/data.pkl", pickle),
-            ("model/data/0", payload.as_slice()),
-            ("model/byteorder", b"little".as_slice()),
-            ("model/version", b"3\n".as_slice()),
-            ("model/.data/serialization_id", b"12345678".as_slice()),
-        ];
+        zip_members(
+            &[
+                ("model/data.pkl", pickle),
+                ("model/data/0", payload.as_slice()),
+                ("model/byteorder", b"little".as_slice()),
+                ("model/version", b"3\n".as_slice()),
+                ("model/.data/serialization_id", b"12345678".as_slice()),
+            ],
+            method,
+        )
+    }
+
+    fn zip_members(members: &[(&str, &[u8])], method: u16) -> Vec<u8> {
         let mut data = Vec::new();
         let mut directory = Vec::new();
-        for (name, value) in members {
+        for &(name, value) in members {
             let offset = data.len() as u32;
             let mut crc = !0u32;
             for &b in value {
@@ -5874,6 +6013,28 @@ mod stored_zip_tests {
     }
 
     #[test]
+    fn stored_zip_without_serialization_id_names_the_member() {
+        let payload = [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
+        let data = zip_members(
+            &[
+                ("model/data.pkl", pickle(0).as_slice()),
+                ("model/data/0", payload.as_slice()),
+                ("model/byteorder", b"little".as_slice()),
+                ("model/version", b"3\n".as_slice()),
+            ],
+            0,
+        );
+        let err = match stored_zip_tensors(&data) {
+            Ok(_) => panic!("a stored ZIP without a serialization ID must error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(".data/serialization_id missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     #[ignore = "CPU published NAF checkpoint; set FF_MODEL to its directory"]
     fn stored_zip_tensor_layout_rejects_invalid_metadata() -> Result<()> {
         let data = archive(&pickle(0), 0);
@@ -5915,6 +6076,163 @@ mod stored_zip_tests {
         ensure!(elements == 662544, "NAF storage element count");
         println!(
             "PASS stored_zip_tensor_layout valid=1 wrong_offset=rejected unknown_opcode=rejected compressed_member=rejected"
+        );
+        Ok(())
+    }
+
+    fn temp_nemo(bytes: &[u8]) -> Result<std::path::PathBuf> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ff-nemo-{}-{}.nemo",
+            std::process::id(),
+            COUNT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn nemo_checkpoint_reads_the_tar_stored_zip_member() -> Result<()> {
+        let nemo = temp_nemo(&tar_archive(&[(
+            "model_weights.ckpt",
+            &archive(&pickle(0), 0),
+        )]))?;
+        let checkpoint = MappedCheckpoint::open_nemo(&nemo)?;
+        std::fs::remove_file(&nemo)?;
+        ensure!(
+            checkpoint.index.weight_map.len() == 1
+                && checkpoint.index.weight_map.contains_key("weight"),
+            "nemo tensor names"
+        );
+        let tensor = checkpoint.tensor("weight")?;
+        ensure!(
+            tensor.shape() == [2] && tensor.data().len() == 8,
+            "nemo tensor view"
+        );
+        let values = checkpoint.f32_tensor("weight", tensor.shape())?;
+        ensure!(values == [1.25, -2.5], "nemo tensor bytes");
+        println!("PASS nemo_checkpoint member=1 tensors=1 bytes_exact=true");
+        Ok(())
+    }
+
+    #[test]
+    fn nemo_checkpoint_rejects_tar_and_payload_defects() -> Result<()> {
+        let valid = archive(&pickle(0), 0);
+        let missing = tar_archive(&[("model_config.yaml", b"key: value\n")]);
+        let path = temp_nemo(&missing)?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("missing member accepted")?;
+        ensure!(
+            error
+                .to_string()
+                .contains("tar member missing: model_weights.ckpt"),
+            "missing member error"
+        );
+        std::fs::remove_file(&path)?;
+
+        let mut nonregular = tar_archive(&[("model_weights.ckpt", &valid)]);
+        let typeflag = nonregular.len() - 1024 - valid.len().div_ceil(512) * 512 - 512 + 156;
+        nonregular[typeflag] = b'2';
+        let path = temp_nemo(&nonregular)?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("non-regular member accepted")?;
+        ensure!(
+            error.to_string().contains("not a regular file"),
+            "non-regular member error"
+        );
+        std::fs::remove_file(&path)?;
+
+        let mut truncated = tar_archive(&[("model_weights.ckpt", &valid)]);
+        let size_field = truncated.len() - 1024 - valid.len().div_ceil(512) * 512 - 512 + 124;
+        truncated[size_field] = b'7';
+        let path = temp_nemo(&truncated)?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("truncated member accepted")?;
+        ensure!(
+            error.to_string().contains("truncated"),
+            "truncated member error"
+        );
+        std::fs::remove_file(&path)?;
+
+        let mut corrupt = tar_archive(&[("model_weights.ckpt", &valid)]);
+        let pickle_payload = 512 + 40 + valid.len() / 2;
+        corrupt[pickle_payload] ^= 0xff;
+        let path = temp_nemo(&corrupt)?;
+        let error = MappedCheckpoint::open_nemo(&path)
+            .err()
+            .context("payload checksum accepted")?;
+        ensure!(
+            error.to_string().contains("checksum mismatch"),
+            "payload checksum error"
+        );
+        std::fs::remove_file(&path)?;
+        println!(
+            "PASS nemo_checkpoint_rejects missing_member=true non_regular=true truncated=true payload_checksum=true"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "published parakeet_realtime_eou_120m-v1 archive; set FF_EOU_NEMO and FF_EOU_MANIFEST"]
+    fn nemo_checkpoint_matches_the_published_manifest() -> Result<()> {
+        let nemo = std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?;
+        let manifest_path = std::env::var("FF_EOU_MANIFEST").context("FF_EOU_MANIFEST missing")?;
+        let checkpoint = MappedCheckpoint::open_nemo(std::path::Path::new(&nemo))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let tensors = manifest["tensors"]
+            .as_object()
+            .context("manifest tensors missing")?;
+        ensure!(
+            checkpoint.index.weight_map.len() == tensors.len(),
+            "nemo tensor count {} against manifest {}",
+            checkpoint.index.weight_map.len(),
+            tensors.len()
+        );
+        let mut params = 0usize;
+        for (name, entry) in tensors {
+            let tensor = checkpoint.tensor(name)?;
+            let shape = entry["shape"]
+                .as_array()
+                .context("manifest shape")?
+                .iter()
+                .map(|v| Ok(v.as_u64().context("manifest dim")? as usize))
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                tensor.shape() == shape,
+                "nemo tensor {name} shape {:?} against manifest {shape:?}",
+                tensor.shape()
+            );
+            let bytes = entry["bytes"].as_u64().context("manifest bytes")? as usize;
+            ensure!(tensor.data().len() == bytes, "nemo tensor {name} bytes");
+            params += shape.iter().product::<usize>();
+        }
+        let expected = manifest["state_params"]
+            .as_u64()
+            .context("manifest params")? as usize;
+        ensure!(
+            params == expected,
+            "nemo params {params} against {expected}"
+        );
+        let members = manifest["tar_members"]
+            .as_object()
+            .context("manifest members")?;
+        ensure!(members.len() == 5, "manifest member count");
+        let map = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&nemo)?)? };
+        for (name, size) in members {
+            let range = tar_member(&map, name)?;
+            ensure!(
+                range.len() == size.as_u64().context("member size")? as usize,
+                "member {name} size"
+            );
+        }
+        println!(
+            "PASS nemo_published_manifest tensors={} params={} members=5",
+            tensors.len(),
+            params
         );
         Ok(())
     }

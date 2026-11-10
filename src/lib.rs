@@ -11,6 +11,7 @@ pub mod cpu;
 pub mod diarization;
 pub mod dspark;
 pub mod engram;
+pub mod eou;
 pub mod experts;
 pub mod fp8;
 pub mod gdn_plan;
