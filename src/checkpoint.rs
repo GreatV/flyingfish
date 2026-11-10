@@ -5890,7 +5890,10 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
                 || tensors.values().any(|t| t.range == *range)),
         "unconsumed ZIP entries"
     );
-    let id = &data[entries[&format!("{prefix}.data/serialization_id")].clone()];
+    let id = entries
+        .get(&format!("{prefix}.data/serialization_id"))
+        .with_context(|| format!("stored-ZIP member {prefix}.data/serialization_id missing"))?;
+    let id = &data[id.clone()];
     ensure!(
         !id.is_empty() && id.iter().all(u8::is_ascii_digit),
         "invalid serialization ID"
@@ -5928,16 +5931,22 @@ mod stored_zip_tests {
 
     fn archive(pickle: &[u8], method: u16) -> Vec<u8> {
         let payload = [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
-        let members = [
-            ("model/data.pkl", pickle),
-            ("model/data/0", payload.as_slice()),
-            ("model/byteorder", b"little".as_slice()),
-            ("model/version", b"3\n".as_slice()),
-            ("model/.data/serialization_id", b"12345678".as_slice()),
-        ];
+        zip_members(
+            &[
+                ("model/data.pkl", pickle),
+                ("model/data/0", payload.as_slice()),
+                ("model/byteorder", b"little".as_slice()),
+                ("model/version", b"3\n".as_slice()),
+                ("model/.data/serialization_id", b"12345678".as_slice()),
+            ],
+            method,
+        )
+    }
+
+    fn zip_members(members: &[(&str, &[u8])], method: u16) -> Vec<u8> {
         let mut data = Vec::new();
         let mut directory = Vec::new();
-        for (name, value) in members {
+        for &(name, value) in members {
             let offset = data.len() as u32;
             let mut crc = !0u32;
             for &b in value {
@@ -6001,6 +6010,28 @@ mod stored_zip_tests {
         data.extend_from_slice(&[b'K', 2, b't', b'Q', b'K', offset]);
         data.extend_from_slice(b"K\x02\x85K\x01\x85\x89ccollections\nOrderedDict\n)RtRu.");
         data
+    }
+
+    #[test]
+    fn stored_zip_without_serialization_id_names_the_member() {
+        let payload = [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
+        let data = zip_members(
+            &[
+                ("model/data.pkl", pickle(0).as_slice()),
+                ("model/data/0", payload.as_slice()),
+                ("model/byteorder", b"little".as_slice()),
+                ("model/version", b"3\n".as_slice()),
+            ],
+            0,
+        );
+        let err = match stored_zip_tensors(&data) {
+            Ok(_) => panic!("a stored ZIP without a serialization ID must error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(".data/serialization_id missing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

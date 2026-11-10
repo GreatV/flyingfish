@@ -2374,7 +2374,7 @@ impl ParakeetTdt {
 pub struct EouStream {
     hidden_rows: Vec<CudaSlice<f32>>,
     depthwise: Vec<CudaSlice<f32>>,
-    cache_len: usize,
+    pub(crate) cache_len: usize,
     mask: CudaSlice<u8>,
 }
 
@@ -2559,6 +2559,10 @@ impl ParakeetEncoder {
             window.len() == 9 * 128 || window.len() == 25 * 128,
             "EOU streaming window frames {}",
             window.len() / 128
+        );
+        ensure!(
+            valid > 0 || session.cache_len > 0,
+            "EOU streaming step has no valid rows and no cache"
         );
         ensure!(
             window.iter().all(|value| value.is_finite()),

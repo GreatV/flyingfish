@@ -578,6 +578,9 @@ impl Eou {
             let length = if step == 0 { 9 } else { 25 };
             let total_rows = (frames - 1) / 8 + 1;
             let valid = usize::from(step < total_rows) + usize::from(step + 1 < total_rows);
+            if valid == 0 && session.cache_len == 0 {
+                continue;
+            }
             let step_rows =
                 self.encoder
                     .eou_encode_step(&mut session, &window[..length * mel_bins], valid)?;
@@ -602,7 +605,7 @@ impl Eou {
                 }
             }
             let _ = length;
-            if current.last() == Some(&eou_token) {
+            if step_closes_utterance(&current, eou_token) {
                 utterances.push(std::mem::take(&mut current));
                 self.encoder.eou_stream_reset(&mut session)?;
                 self.reset_prediction()?;
@@ -614,6 +617,12 @@ impl Eou {
         }
         Ok((utterances, min_margin))
     }
+}
+
+/// An utterance closes when the reference's step tokens contain the EOU
+/// token at any position.
+fn step_closes_utterance(current: &[u32], eou_token: u32) -> bool {
+    current.contains(&eou_token)
 }
 
 #[cfg(test)]
@@ -757,6 +766,37 @@ mod stream_tests {
                 utterances.len()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn eou_step_closes_utterance_on_mid_row_eou() {
+        let mid = vec![4u32, 1019, 1024, 30];
+        assert!(step_closes_utterance(&mid, 1024));
+        let tail = vec![4u32, 1019, 1024];
+        assert!(step_closes_utterance(&tail, 1024));
+        let none = vec![4u32, 1019, 30];
+        assert!(!step_closes_utterance(&none, 1024));
+    }
+
+    #[test]
+    #[ignore = "GPU; set FF_EOU_NEMO to the published .nemo"]
+    fn eou_encode_step_without_valid_rows_or_cache_errors() -> Result<()> {
+        let nemo =
+            std::path::PathBuf::from(std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?);
+        let device = Device::new(0)?;
+        let engine = Eou::load(&nemo, &device)?;
+        let mut session = engine.encoder.eou_stream()?;
+        let mel_bins = engine.spec.features as usize;
+        let window = vec![0f32; 25 * mel_bins];
+        let err = match engine.encoder.eou_encode_step(&mut session, &window, 0) {
+            Ok(_) => panic!("a fully invalid window on an empty cache must error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no valid rows"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 }
