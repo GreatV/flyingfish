@@ -83,6 +83,21 @@ fn read_case(path: &Path, require_control: bool) -> Result<Fixture> {
     })
 }
 
+struct GraphDecode {
+    tokens: Vec<u32>,
+    durations: Vec<u32>,
+    frames: Vec<usize>,
+    logits: Vec<Vec<f32>>,
+}
+
+fn bits_equal(actual: &[f32], expected: &[f32]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 fn difference(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
     ensure!(
         actual.len() == expected.len(),
@@ -1321,6 +1336,7 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
         .as_f64()
         .context("decode id threshold missing")? as f32;
     let mut trajectories = BTreeMap::new();
+    let mut graph_steps: BTreeMap<String, GraphDecode> = BTreeMap::new();
     let mut recorded_defects = 0usize;
     let mut unaccepted_defects = 0usize;
     for case in ["clip0", "clip1", "clip2", "long"] {
@@ -1500,7 +1516,23 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
             unaccepted_defects += 1;
         }
         trajectories.insert(case, trajectory.tokens);
+        graph_steps.insert(
+            case.to_string(),
+            GraphDecode {
+                tokens: trajectories[case].clone(),
+                durations: trajectory.durations.clone(),
+                frames: trajectory.frames.clone(),
+                logits: history.clone(),
+            },
+        );
     }
+    let captures = tdt.graph_captures();
+    let launches = tdt.graph_launches();
+    println!("PARAKEET_DECODE_GRAPH captures={captures} launches={launches}");
+    ensure!(
+        captures == 8 && launches == 460,
+        "tdt graph captures={captures} launches={launches}"
+    );
     for left in ["clip0", "clip1", "clip2", "long"] {
         for right in ["clip0", "clip1", "clip2", "long"] {
             if left < right {
@@ -1521,6 +1553,35 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
     ensure!(swapped.tokens == trajectories["clip1"]);
     ensure!(swapped.tokens != trajectories["clip0"]);
     ensure!(tdt.encoder_call_count() == 1);
+    tdt.set_eager_steps(true);
+    let mut eager_rows = 0usize;
+    for case in ["clip0", "clip1", "clip2", "long"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        let features = f32_values(&tensors, "input_features")?;
+        let valid = tensors
+            .tensor("attention_mask")?
+            .data()
+            .iter()
+            .filter(|&&value| value != 0)
+            .count();
+        let (trajectory, history) = tdt.decode_trace(&features, valid)?;
+        let graph = &graph_steps[case];
+        ensure!(
+            trajectory.tokens == graph.tokens
+                && trajectory.durations == graph.durations
+                && trajectory.frames == graph.frames
+                && history.len() == graph.logits.len()
+                && history
+                    .iter()
+                    .zip(&graph.logits)
+                    .all(|(actual, expected)| bits_equal(actual, expected)),
+            "{case} graph and eager decode differ"
+        );
+        eager_rows += history.len();
+    }
+    println!("PARAKEET_DECODE_EAGER rows={eager_rows} bitwise=true");
+    ensure!(eager_rows == 460, "eager rows={eager_rows}");
     println!(
         "PARAKEET_DECODE_SCORE cases=4 recorded_defects={recorded_defects} unaccepted_defects={unaccepted_defects}"
     );
