@@ -91,6 +91,7 @@ pub struct HcRuntime {
     pub(crate) mix_post: CudaSlice<f32>,
     /// `[rows, mult*mult]` f32 combination matrix, rows indexed `[j=out, k=in]`.
     pub(crate) mix_comb: CudaSlice<f32>,
+    mix_partials: Option<CudaSlice<f32>>,
     /// `[rows, mult]` f32 constant one-hot on copy 0: the carried pre-mix of
     /// the first layer of a forward; bound with the carry.
     one_hot: Option<CudaSlice<f32>>,
@@ -175,6 +176,11 @@ impl HcRuntime {
             head_pre: s.clone_htod(&vec![1.0 / mult as f32; rows * mult])?,
             mix_post: s.alloc_zeros(rows * mult)?,
             mix_comb: s.alloc_zeros(rows * mult * mult)?,
+            mix_partials: if binding.fn_dtype == HcFnDtype::Bf16 {
+                Some(s.alloc_zeros(rows * (basis as usize + 1))?)
+            } else {
+                None
+            },
             one_hot: if carries {
                 Some(alloc_one_hot(s, rows, mult)?)
             } else {
@@ -333,6 +339,15 @@ impl HcRuntime {
             &weights,
             &self.binding.params,
             HcMixes {
+                partials: self
+                    .mix_partials
+                    .as_ref()
+                    .map(|buffer| {
+                        let width = mix_rows(self.binding.params.mult) as u32 + 1;
+                        view(buffer, s, 0, [rows as u32, width], [u64::from(width), 1])
+                            .map(TensorMut)
+                    })
+                    .transpose()?,
                 pre: &mut TensorMut(pre),
                 post: &mut TensorMut(post),
                 comb: &mut TensorMut(comb),

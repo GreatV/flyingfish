@@ -7,7 +7,7 @@
 use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
@@ -111,6 +111,8 @@ pub struct HcWeights {
 
 /// Mixer coefficients of one mHC row batch.
 pub struct HcMixes<'a> {
+    /// `[rows, 1+(2+mult)*mult]` F32 reciprocal RMS and dot products.
+    pub partials: Option<TensorMut<f32, 2>>,
     /// `[rows, mult]` f32.
     pub pre: &'a mut TensorMut<f32, 2>,
     /// `[rows, mult]` f32.
@@ -192,6 +194,9 @@ fn require_dense<T: Copy, const R: usize>(tensor: &Tensor<T, R>, name: &str) -> 
 pub struct MhcOps {
     mixes_f32: CudaFunction,
     mixes_bf16: CudaFunction,
+    partials_bf16: CudaFunction,
+    finish: CudaFunction,
+    sms: u32,
     collapse: CudaFunction,
     update: CudaFunction,
 }
@@ -199,9 +204,19 @@ pub struct MhcOps {
 impl MhcOps {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = cubin::module(ctx, "mhc")?;
+        #[cfg(feature = "cuda")]
+        let sms = u32::try_from(ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )?)?;
+        #[cfg(feature = "rocm")]
+        let sms = u32::try_from(ctx.properties.compute_units)?;
+        ensure!(sms > 0, "mHC device has no compute units");
         Ok(Self {
             mixes_f32: module.load_function("mhc_mixes")?,
             mixes_bf16: module.load_function("mhc_mixes_bf16")?,
+            partials_bf16: module.load_function("mhc_mixes_bf16_partials")?,
+            finish: module.load_function("mhc_mixes_finish")?,
+            sms,
             collapse: module.load_function("mhc_collapse")?,
             update: module.load_function("mhc_update")?,
         })
@@ -217,7 +232,12 @@ impl MhcOps {
         params: &HcParams,
         out: HcMixes<'_>,
     ) -> Result<()> {
-        let HcMixes { pre, post, comb } = out;
+        let HcMixes {
+            partials,
+            pre,
+            post,
+            comb,
+        } = out;
         let [fn_rows, fn_cols] = weights.fn_w.shape();
         validate_params(
             params,
@@ -299,6 +319,22 @@ impl MhcOps {
         no_overlap(&pre.0, &post.0, "pre", "post")?;
         no_overlap(&pre.0, &comb.0, "pre", "comb")?;
         no_overlap(&post.0, &comb.0, "post", "comb")?;
+        if let Some(partials) = partials
+            && rows < self.sms
+        {
+            return self.mixes_split(
+                stream,
+                x,
+                weights,
+                params,
+                HcMixes {
+                    partials: Some(partials),
+                    pre,
+                    post,
+                    comb,
+                },
+            );
+        }
         let (rows, mult, hidden) = (
             i32::try_from(rows)?,
             params.mult as i32,
@@ -328,6 +364,80 @@ impl MhcOps {
                     grid_dim: (rows as u32, 1, 1),
                     block_dim: (MHC_THREADS, 1, 1),
                     shared_mem_bytes: shared as u32,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn mixes_split(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 3>,
+        weights: &HcWeights,
+        params: &HcParams,
+        out: HcMixes<'_>,
+    ) -> Result<()> {
+        let HcMixes {
+            partials,
+            pre,
+            post,
+            comb,
+        } = out;
+        let partials = partials.context("split workspace is not bound")?;
+        let HcFnW::Bf16(fn_w) = weights.fn_w else {
+            anyhow::bail!("split mHC requires BF16 fn weights");
+        };
+        let rows = x.shape[0];
+        let width = mix_rows(params.mult) as u32 + 1;
+        require_dense(&partials.0, "partials")?;
+        ensure!(
+            partials.0.shape == [rows, width],
+            "mHC partial workspace shape"
+        );
+        no_overlap(&partials.0, &x, "partials", "stream")?;
+        no_overlap(&partials.0, &fn_w, "partials", "fn")?;
+        no_overlap(&partials.0, &weights.base, "partials", "base")?;
+        no_overlap(&partials.0, &weights.scale, "partials", "scale")?;
+        no_overlap(&partials.0, &pre.0, "partials", "pre")?;
+        no_overlap(&partials.0, &post.0, "partials", "post")?;
+        no_overlap(&partials.0, &comb.0, "partials", "comb")?;
+        let (rows, mult, hidden) = (
+            i32::try_from(rows)?,
+            params.mult as i32,
+            params.hidden as i32,
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.partials_bf16)
+                .arg(&x.ptr)
+                .arg(&fn_w.ptr)
+                .arg(&mult)
+                .arg(&hidden)
+                .arg(&params.norm_eps)
+                .arg(&partials.0.ptr)
+                .arg(&rows)
+                .launch(LaunchConfig {
+                    grid_dim: (rows as u32, width, 1),
+                    block_dim: (MHC_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            stream
+                .launch_builder(&self.finish)
+                .arg(&partials.0.ptr)
+                .arg(&weights.base.ptr)
+                .arg(&weights.scale.ptr)
+                .arg(&mult)
+                .arg(&(params.iters as i32))
+                .arg(&params.eps)
+                .arg(&pre.0.ptr)
+                .arg(&post.0.ptr)
+                .arg(&comb.0.ptr)
+                .arg(&rows)
+                .launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (MHC_THREADS, 1, 1),
+                    shared_mem_bytes: ((mix_rows(params.mult) + u64::from(params.mult).pow(2)) * 4)
+                        as u32,
                 })?;
         }
         Ok(())
@@ -1089,6 +1199,106 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GPU window"]
+    fn mhc_two_stage_bit_identity() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let ops = MhcOps::new(&device.ctx)?;
+        let params = HcParams {
+            mult: 4,
+            hidden: 4096,
+            iters: 20,
+            eps: 1e-6,
+            norm_eps: 1e-5,
+        };
+        for rows in [1, 2, 8, ops.sms] {
+            let fx = fixture(4, 4096, rows, 19);
+            let x = s.clone_htod(&fx.stream)?;
+            let weights: Vec<_> = fx.fn_w.iter().map(|v| bf16::from_f32(*v)).collect();
+            let fn_w = s.clone_htod(&weights)?;
+            let mut wrong_weights = weights.clone();
+            wrong_weights.rotate_left(1);
+            let wrong = s.clone_htod(&wrong_weights)?;
+            let base = s.clone_htod(&fx.base)?;
+            let scale = s.clone_htod(&fx.scale)?;
+            let pre = s.alloc_zeros::<f32>((rows * 4) as usize)?;
+            let post = s.alloc_zeros::<f32>((rows * 4) as usize)?;
+            let comb = s.alloc_zeros::<f32>((rows * 16) as usize)?;
+            let partials = s.clone_htod(&vec![f32::NAN; (rows * 25) as usize])?;
+            let launch = |split: bool, wrong_index: bool| -> Result<()> {
+                ops.mixes(
+                    s,
+                    testing::view(&x, s, [rows, 4, 4096], [16384, 4096, 1])?,
+                    &HcWeights {
+                        fn_w: HcFnW::Bf16(testing::view(
+                            if wrong_index { &wrong } else { &fn_w },
+                            s,
+                            [24, 16384],
+                            [16384, 1],
+                        )?),
+                        base: testing::view(&base, s, [24], [1])?,
+                        scale: testing::view(&scale, s, [3], [1])?,
+                    },
+                    &params,
+                    HcMixes {
+                        partials: if split {
+                            Some(TensorMut(testing::view(&partials, s, [rows, 25], [25, 1])?))
+                        } else {
+                            None
+                        },
+                        pre: &mut TensorMut(testing::view(&pre, s, [rows, 4], [4, 1])?),
+                        post: &mut TensorMut(testing::view(&post, s, [rows, 4], [4, 1])?),
+                        comb: &mut TensorMut(testing::view(&comb, s, [rows, 4, 4], [16, 4, 1])?),
+                    },
+                )
+            };
+            let read = || -> Result<Vec<u32>> {
+                let mut out = Vec::new();
+                for buffer in [&pre, &post, &comb] {
+                    for v in s.clone_dtoh(buffer)? {
+                        ensure!(v.is_finite(), "Runner FAIL nonfinite mHC output");
+                        out.push(v.to_bits());
+                    }
+                }
+                Ok(out)
+            };
+            launch(false, false)?;
+            let reference = read()?;
+            launch(true, false)?;
+            ensure!(
+                reference == read()?,
+                "DEFECT eager mHC two-stage bits rows={rows}"
+            );
+            let graph = testing::capture(s, || launch(true, false))?;
+            graph.launch()?;
+            ensure!(
+                reference == read()?,
+                "DEFECT graph mHC two-stage bits rows={rows}"
+            );
+            if rows < ops.sms {
+                ensure!(
+                    s.clone_dtoh(&partials)?.iter().all(|v| v.is_finite()),
+                    "Runner FAIL split partials were not written"
+                );
+            }
+            launch(true, true)?;
+            ensure!(
+                reference != read()?,
+                "Runner FAIL mHC shifted-weight control escaped"
+            );
+            println!(
+                "PASS MHC_TWO_STAGE rows={rows} input=[{rows},4,4096] fn=[24,16384] eager_bits=0 graph_bits=0 shifted_weight_control=caught split={}",
+                rows < ops.sms
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
     fn mhc_kernel_matches_oracle_both_modes() -> Result<()> {
         ensure!(
@@ -1244,6 +1454,7 @@ mod tests {
                 &HcWeights { fn_w, base, scale },
                 &params,
                 HcMixes {
+                    partials: None,
                     pre: &mut TensorMut(pre_view),
                     post: &mut TensorMut(post_view),
                     comb: &mut TensorMut(comb_view),
