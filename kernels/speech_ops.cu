@@ -189,15 +189,15 @@ extern "C" __global__ void speech_relative_attention_f32(
     }
     for (uint32_t key = 0; key < key_rows; ++key) {
         float content = 0.0f, position = 0.0f;
-        const bool in_window = chunk_size == 0 || (key >= key_begin && key < key_end);
+        const bool in_window = key >= key_begin && key < key_end;
         if (query_valid && mask[key] && in_window) {
             const uint32_t relative_row = rows - 1 - query + key;
-        if (active) {
-            const float qu = __fadd_rn(q[uint64_t(query) * hidden + head * head_dim + d], bias_u[head * head_dim + d]);
-            const float qv = __fadd_rn(q[uint64_t(query) * hidden + head * head_dim + d], bias_v[head * head_dim + d]);
-            content = __fmul_rn(qu, k[uint64_t(key) * hidden + head * head_dim + d]);
-            position = __fmul_rn(qv, relative[uint64_t(relative_row) * hidden + head * head_dim + d]);
-        }
+            if (active) {
+                const float qu = __fadd_rn(q[uint64_t(query) * hidden + head * head_dim + d], bias_u[head * head_dim + d]);
+                const float qv = __fadd_rn(q[uint64_t(query) * hidden + head * head_dim + d], bias_v[head * head_dim + d]);
+                content = __fmul_rn(qu, k[uint64_t(key) * hidden + head * head_dim + d]);
+                position = __fmul_rn(qv, relative[uint64_t(relative_row) * hidden + head * head_dim + d]);
+            }
         }
         for (int offset = 16; offset > 0; offset /= 2) {
             content += __shfl_down_sync(0xffffffffu, content, offset);

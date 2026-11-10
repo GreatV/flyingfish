@@ -2417,7 +2417,6 @@ impl ParakeetEncoder {
     /// session start, 25 frames afterwards = 9 lookback + 16 chunk frames; a
     /// post-<EOU> step keeps the steady-state window), returning the two
     /// query rows of this step.
-    #[allow(clippy::too_many_arguments)]
     fn eou_layer_step(
         &self,
         index: usize,

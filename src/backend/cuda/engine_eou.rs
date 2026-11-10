@@ -269,6 +269,21 @@ impl Eou {
         Ok(selected[0])
     }
 
+    /// Top1-top2 gap of the current joint logits, in logit units.
+    fn joint_margin(&self) -> Result<f32> {
+        let logits = self.encoder.stream.clone_dtoh(&self.joint_logits)?;
+        let (mut top1, mut top2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &value in &logits {
+            if value > top1 {
+                top2 = top1;
+                top1 = value;
+            } else if value > top2 {
+                top2 = value;
+            }
+        }
+        Ok(top1 - top2)
+    }
+
     /// Greedy RNNT decode over the offline encoder output; emits non-blank token indices.
     pub fn decode(&mut self, features: &[f32], valid: usize) -> Result<Vec<u32>> {
         self.reset_prediction()?;
@@ -518,7 +533,7 @@ impl Eou {
     /// per step, hypothesis continuation, full session reset after <EOU>.
     /// Returns one token vector per utterance (each ends with EOU except
     /// possibly the last).
-    pub fn stream_decode(&mut self, features: &[f32]) -> Result<Vec<Vec<u32>>> {
+    pub fn stream_decode(&mut self, features: &[f32]) -> Result<(Vec<Vec<u32>>, f32)> {
         let mel_bins = self.spec.features as usize;
         ensure!(
             !features.is_empty() && features.len().is_multiple_of(mel_bins),
@@ -531,6 +546,7 @@ impl Eou {
         self.projected = None;
         let eou_token = self.spec.vocab_size - 2;
         let mut utterances: Vec<Vec<u32>> = Vec::new();
+        let mut min_margin = f32::INFINITY;
         let mut current: Vec<u32> = Vec::new();
         let mut window = vec![0f32; 25 * mel_bins];
         for step in 0..steps {
@@ -577,6 +593,7 @@ impl Eou {
                 if selected == self.blank() {
                     break;
                 }
+                min_margin = min_margin.min(self.joint_margin()?);
                 current.push(selected);
                 self.predict(selected)?;
                 symbols += 1;
@@ -595,7 +612,7 @@ impl Eou {
         if !current.is_empty() {
             utterances.push(current);
         }
-        Ok(utterances)
+        Ok((utterances, min_margin))
     }
 }
 
@@ -693,47 +710,53 @@ mod stream_tests {
                 &ref1[..4]
             );
         }
-        let utterances = engine.stream_decode(&features)?;
-        let bytes = std::fs::read(arm.join("CPU-r1/media/clipA.safetensors"))?;
-        let st = SafeTensors::deserialize(&bytes)?;
-        let report: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(arm.join("CPU-r1/stream-report.json"))?)?;
-        let expected_counts: Vec<usize> = report["clipA"]["utterance_token_counts"]
-            .as_array()
-            .context("utterance counts")?
-            .iter()
-            .map(|v| v.as_u64().unwrap() as usize)
-            .collect();
-        ensure!(
-            utterances.len() == expected_counts.len(),
-            "EOU stream utterances {} against {}",
-            utterances.len(),
-            expected_counts.len()
-        );
-        for (index, tokens) in utterances.iter().enumerate() {
-            let key = format!("stream_utt{index}_token_ids");
-            let reference = read_i64(&st, &key)?;
+        for clip in ["clipA", "clipB"] {
+            let wave = crate::backend::cuda::engine_eou::tests::read_wave_public(
+                &arm.join(format!("inputs/{clip}.wav")),
+            )?;
+            let clip_features = engine.features(&wave)?;
+            let (utterances, min_margin) = engine.stream_decode(&clip_features)?;
+            let bytes = std::fs::read(arm.join(format!("CPU-r1/media/{clip}.safetensors")))?;
+            let st = SafeTensors::deserialize(&bytes)?;
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(arm.join("CPU-r1/stream-report.json"))?)?;
+            let expected_counts: Vec<usize> = report[clip]["utterance_token_counts"]
+                .as_array()
+                .context("utterance counts")?
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
             ensure!(
-                tokens.len() == reference.len(),
-                "EOU stream utterance {index} tokens {} against {}",
-                tokens.len(),
-                reference.len()
+                utterances.len() == expected_counts.len(),
+                "EOU stream utterances {} against {}",
+                utterances.len(),
+                expected_counts.len()
             );
-            for (position, (left, right)) in tokens.iter().zip(&reference).enumerate() {
+            for (index, tokens) in utterances.iter().enumerate() {
+                let key = format!("stream_utt{index}_token_ids");
+                let reference = read_i64(&st, &key)?;
                 ensure!(
-                    i64::from(*left) == *right,
-                    "EOU stream utterance {index} token {position} = {left} against {right}"
+                    tokens.len() == reference.len(),
+                    "EOU stream utterance {index} tokens {} against {}",
+                    tokens.len(),
+                    reference.len()
+                );
+                for (position, (left, right)) in tokens.iter().zip(&reference).enumerate() {
+                    ensure!(
+                        i64::from(*left) == *right,
+                        "EOU stream utterance {index} token {position} = {left} against {right}"
+                    );
+                }
+                println!(
+                    "EOU_S3_UTT clip={clip} index={index} tokens={} exact=true PASS",
+                    tokens.len()
                 );
             }
             println!(
-                "EOU_S3_UTT index={index} tokens={} exact=true PASS",
-                tokens.len()
+                "EOU_S3_STREAM_GATE PASS clip={clip} utterances={} min_top1_top2_gap={min_margin:e}",
+                utterances.len()
             );
         }
-        println!(
-            "EOU_S3_STREAM_GATE PASS clip=clipA utterances={}",
-            utterances.len()
-        );
         Ok(())
     }
 }
