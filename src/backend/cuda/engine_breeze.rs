@@ -15,8 +15,8 @@ use super::{
     verification::Shape,
 };
 use crate::backend::gpu::{
-    CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
-    PushKernelArg,
+    CudaFunction, CudaGraph, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut,
+    DeviceRepr, PushKernelArg,
 };
 use crate::backend::setup::LinearShape;
 use crate::checkpoint::MappedCheckpoint;
@@ -339,6 +339,7 @@ struct Buf {
     start: CudaSlice<i32>,
     tok: CudaSlice<u32>,
     ids: CudaSlice<i32>,
+    picked: CudaSlice<u32>, // slot 0 backbone, slots 1..15 depth heads
 }
 
 struct Flashes {
@@ -874,6 +875,74 @@ fn download_row(k: &Kern, src: &CudaSlice<bf16>, row: usize, width: usize) -> Re
     download_elems(k, src, start, width)
 }
 
+fn download_u32(k: &Kern, src: &CudaSlice<u32>, start: usize, n: usize) -> Result<Vec<u32>> {
+    let end = start.checked_add(n).context("id offset")?;
+    ensure!(n > 0 && end <= src.len(), "id row");
+    let raw = k.stream.clone_dtoh(&src.slice(start..end))?;
+    k.stream.synchronize()?;
+    k.d2h.set(k.d2h.get() + (n * 4) as u64);
+    k.drains.set(k.drains.get() + 1);
+    Ok(raw)
+}
+
+fn argmax_row(
+    k: &Kern,
+    logits: &CudaSlice<bf16>,
+    row: usize,
+    width: usize,
+    token: &mut CudaViewMut<'_, u32>,
+) -> Result<()> {
+    let start = row.checked_mul(width).context("argmax row")?;
+    let end = start.checked_add(width).context("argmax row")?;
+    ensure!(width > 0 && end <= logits.len(), "argmax row");
+    let view = logits.slice(start..end);
+    let vocab = i32::try_from(width)?;
+    // Strictly greater wins. An equal value keeps the lower index.
+    unsafe {
+        k.stream
+            .launch_builder(&k.ops.argmax)
+            .arg(&view)
+            .arg(token)
+            .arg(&vocab)
+            .launch(ops::grid(1, 1024))?;
+    }
+    Ok(())
+}
+
+fn argmax_backbone(k: &Kern, buf: &mut Buf, row: usize) -> Result<()> {
+    let Buf { d, picked, .. } = buf;
+    let mut token = picked.slice_mut(0..1);
+    argmax_row(k, d, row, BB_VOCAB, &mut token)
+}
+
+fn argmax_heads(k: &Kern, buf: &mut Buf) -> Result<()> {
+    let vocab = CODEBOOK as usize;
+    let base = gemm_rows(1, DP_H);
+    let Buf {
+        head_out, picked, ..
+    } = buf;
+    for book in 0..HEAD_N {
+        let mut token = picked.slice_mut(book + 1..book + 2);
+        argmax_row(k, head_out, base + book, vocab, &mut token)?;
+    }
+    Ok(())
+}
+
+fn take_backbone_id(ids: &mut Vec<u32>, id: u32) -> Result<()> {
+    ensure!((id as usize) < BB_VOCAB, "backbone id {id}");
+    ids.push(id);
+    Ok(())
+}
+
+fn take_depth_ids(ids: &mut Vec<u32>, row: &[u32]) -> Result<()> {
+    ensure!(row.len() == HEAD_N, "depth ids");
+    for &id in row {
+        ensure!((id as usize) < CODEBOOK as usize, "depth id {id}");
+        ids.push(id);
+    }
+    Ok(())
+}
+
 fn depth_d2d_bytes() -> u64 {
     (DP_ROWS * DP_H * 2 + HEAD_N * DP_H * 2 + 2 * HEAD_N * (CODEBOOK as usize) * 2) as u64
 }
@@ -889,6 +958,13 @@ fn traffic(text_rows: usize, audio_steps: usize, depth_frames: usize) -> (u64, u
     let d2d = (depth_frames as u64) * depth_d2d_bytes() + (audio_steps * BB_H * 2) as u64;
     let drains = (passes * 3 + 1 + audio_steps + depth_frames * 5) as u64;
     (drains, h2d, d2h, d2d)
+}
+
+fn traffic_ids(text_rows: usize, audio_steps: usize, depth_frames: usize) -> (u64, u64, u64, u64) {
+    let (drains, h2d, _, d2d) = traffic(text_rows, audio_steps, depth_frames);
+    let passes = (audio_steps + 1) as u64;
+    let d2h = (passes + (depth_frames * HEAD_N) as u64) * 4;
+    (drains - audio_steps as u64, h2d, d2h, d2d)
 }
 
 fn coverage() -> BTreeSet<(usize, usize)> {
@@ -1012,6 +1088,7 @@ fn alloc_buf(stream: &Arc<CudaStream>) -> Result<Buf> {
         start: stream.alloc_zeros(1)?,
         tok: stream.alloc_zeros(TEXT_MAX)?,
         ids: stream.alloc_zeros(IDS_ELEMS)?,
+        picked: stream.alloc_zeros(BOOKS)?,
     })
 }
 
@@ -2200,6 +2277,7 @@ fn backbone_rows(
     blas: &Blas,
     pass: ScorePass<'_>,
     audio: Option<&CudaSlice<bf16>>,
+    keep_scores: bool,
 ) -> Result<Vec<f32>> {
     ensure!(pass.rows > 0 && pass.score_row < pass.rows, "score row");
     ensure!(pass.origin >= 0, "score origin");
@@ -2272,8 +2350,11 @@ fn backbone_rows(
                 input: BB_H,
             },
         )?;
-        Ok(())
+        argmax_backbone(k, buf, pass.score_row)
     })?;
+    if !keep_scores {
+        return Ok(Vec::new());
+    }
     download_row(k, &buf.d, pass.score_row, BB_VOCAB)
 }
 
@@ -2357,7 +2438,13 @@ fn clear_depth_kv(k: &Kern, buf: &mut Buf) -> Result<()> {
     Ok(())
 }
 
-fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Result<Vec<f32>> {
+fn depth_step(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    step: DepthStep<'_>,
+    keep_scores: bool,
+) -> Result<Vec<f32>> {
     set_meta(k, &mut buf.meta, DP_ROWS)?;
     let ids = depth_input(step.codes)?;
     let vocab = CODEBOOK as usize;
@@ -2383,6 +2470,10 @@ fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Resu
         )?;
         clear_depth_kv(k, buf)?;
         depth_pack(k, buf, blas, &step.w.heads, step.frame, step.plant)?;
+        argmax_heads(k, buf)?;
+        if !keep_scores {
+            return Ok(Vec::new());
+        }
         return download_elems(k, &buf.head_out, pack, packed);
     }
     // Row 0 is the cond. The graph embeds rows 1..15 and does not rewrite row 0.
@@ -2418,8 +2509,11 @@ fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Resu
         )?;
         clear_depth_kv(k, buf)?;
         depth_pack(k, buf, blas, &step.w.heads, 0, false)?;
-        Ok(())
+        argmax_heads(k, buf)
     })?;
+    if !keep_scores {
+        return Ok(Vec::new());
+    }
     download_elems(k, &buf.head_out, pack, packed)
 }
 
@@ -2456,6 +2550,23 @@ fn decode_shape(
         "non-finite cond"
     );
     Ok((audio_steps, depth_frames))
+}
+
+struct GreedyIn<'a> {
+    projected: &'a [f32],
+    cond: &'a [f32],
+    text_rows: usize,
+    fed: &'a [i32],
+    frames: &'a [i32],
+    plant_head: bool,
+    ids_only: bool,
+}
+
+struct GreedyOut {
+    backbone: Vec<f32>,
+    depth: Vec<f32>,
+    backbone_ids: Vec<u32>,
+    depth_ids: Vec<u32>,
 }
 
 impl Breeze {
@@ -2890,6 +3001,49 @@ impl Breeze {
         frames: &[i32],
         plant_head: bool,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let out = self.decode_greedy(GreedyIn {
+            projected,
+            cond,
+            text_rows,
+            fed,
+            frames,
+            plant_head,
+            ids_only: false,
+        })?;
+        Ok((out.backbone, out.depth))
+    }
+
+    pub fn greedy_ids(
+        &mut self,
+        projected: &[f32],
+        cond: &[f32],
+        text_rows: usize,
+        fed: &[i32],
+        frames: &[i32],
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        let out = self.decode_greedy(GreedyIn {
+            projected,
+            cond,
+            text_rows,
+            fed,
+            frames,
+            plant_head: false,
+            ids_only: true,
+        })?;
+        Ok((out.backbone_ids, out.depth_ids))
+    }
+
+    fn decode_greedy(&mut self, input: GreedyIn<'_>) -> Result<GreedyOut> {
+        let GreedyIn {
+            projected,
+            cond,
+            text_rows,
+            fed,
+            frames,
+            plant_head,
+            ids_only,
+        } = input;
+        let keep_scores = !ids_only;
         let (audio_steps, depth_frames) = decode_shape(projected, cond, text_rows, fed, frames)?;
         self.bound_device()?;
         let Breeze {
@@ -2911,9 +3065,18 @@ impl Breeze {
             k.pad_once.set(false);
         }
         upload_hidden(k, buf, projected)?;
-        let mut backbone = Vec::with_capacity((audio_steps + 1) * BB_VOCAB);
-        let mut depth = Vec::with_capacity(depth_frames * HEAD_N * (CODEBOOK as usize));
-        backbone.extend(backbone_rows(
+        let mut backbone = Vec::new();
+        let mut depth = Vec::new();
+        let mut backbone_ids = Vec::new();
+        let mut depth_ids = Vec::new();
+        if ids_only {
+            backbone_ids.reserve(audio_steps + 1);
+            depth_ids.reserve(depth_frames * HEAD_N);
+        } else {
+            backbone.reserve((audio_steps + 1) * BB_VOCAB);
+            depth.reserve(depth_frames * HEAD_N * (CODEBOOK as usize));
+        }
+        let prefill_scores = backbone_rows(
             k,
             buf,
             blas,
@@ -2928,12 +3091,19 @@ impl Breeze {
                 score_row: text_rows - 1,
             },
             None,
-        )?);
+            keep_scores,
+        )?;
+        if ids_only {
+            let id = download_u32(k, &buf.picked, 0, 1)?;
+            take_backbone_id(&mut backbone_ids, id[0])?;
+        } else {
+            backbone.extend(prefill_scores);
+        }
         let mut fed_rows = fed.chunks(BOOKS);
         let mut cond_rows = cond.chunks(BB_H);
         for (frame, codes) in frames.chunks(BOOKS).enumerate() {
             let row = cond_rows.next().context("cond row")?;
-            depth.extend(depth_step(
+            let depth_scores = depth_step(
                 k,
                 buf,
                 blas,
@@ -2945,12 +3115,13 @@ impl Breeze {
                     frame,
                     plant: plant_head,
                 },
-            )?);
+                keep_scores,
+            )?;
             if frame < audio_steps {
                 let fed_row = fed_rows.next().context("fed row")?;
                 stage_audio_codes(k, buf, fed_row)?;
                 let origin = i32::try_from(text_rows + frame)?;
-                backbone.extend(backbone_rows(
+                let step_scores = backbone_rows(
                     k,
                     buf,
                     blas,
@@ -2965,34 +3136,60 @@ impl Breeze {
                         score_row: 0,
                     },
                     Some(&w.audio),
-                )?);
+                    keep_scores,
+                )?;
+                if ids_only {
+                    let packed = download_u32(k, &buf.picked, 0, BOOKS)?;
+                    take_backbone_id(&mut backbone_ids, packed[0])?;
+                    take_depth_ids(&mut depth_ids, &packed[1..])?;
+                } else {
+                    depth.extend(depth_scores);
+                    backbone.extend(step_scores);
+                }
+            } else if ids_only {
+                let heads = download_u32(k, &buf.picked, 1, HEAD_N)?;
+                take_depth_ids(&mut depth_ids, &heads)?;
+            } else {
+                depth.extend(depth_scores);
             }
         }
-        ensure!(
-            backbone.len() == (audio_steps + 1) * BB_VOCAB,
-            "backbone scores"
-        );
-        ensure!(
-            depth.len() == depth_frames * HEAD_N * (CODEBOOK as usize),
-            "depth scores"
-        );
+        if ids_only {
+            ensure!(backbone_ids.len() == audio_steps + 1, "backbone ids");
+            ensure!(depth_ids.len() == depth_frames * HEAD_N, "depth ids");
+        } else {
+            ensure!(
+                backbone.len() == (audio_steps + 1) * BB_VOCAB,
+                "backbone scores"
+            );
+            ensure!(
+                depth.len() == depth_frames * HEAD_N * (CODEBOOK as usize),
+                "depth scores"
+            );
+        }
         // per_layer: 2 RMS, 4 QKV/O GEMMs, 1 RoPE, 1 attention, 2 residuals, 3 MLP GEMMs, 1 SwiGLU.
         let per_layer = 14;
-        let prefill = BB_LAYERS * per_layer + 2;
+        let prefill = BB_LAYERS * per_layer + 3;
         let step = prefill + 1;
-        let frame_launches = 2 + DP_LAYERS * per_layer + 1 + HEAD_N;
+        let frame_launches = 2 + DP_LAYERS * per_layer + 1 + HEAD_N + HEAD_N;
         eprintln!(
             "LAUNCH backbone_prefill={prefill} backbone_step={step} depth_frame={frame_launches}"
         );
+        let (backbone_row_bytes, depth_row_bytes) = if ids_only {
+            (4, 4)
+        } else {
+            (BB_VOCAB * 4, (CODEBOOK as usize) * 4)
+        };
         eprintln!(
-            "COPY backbone_row_bytes={} backbone_copies={} depth_row_bytes={} depth_copies={} depth_kv_clears={}",
-            BB_VOCAB * 4,
+            "COPY backbone_row_bytes={backbone_row_bytes} backbone_copies={} depth_row_bytes={depth_row_bytes} depth_copies={} depth_kv_clears={}",
             audio_steps + 1,
-            CODEBOOK as usize * 4,
             depth_frames * HEAD_N,
             depth_frames
         );
-        let (drains, h2d, d2h, d2d) = traffic(text_rows, audio_steps, depth_frames);
+        let (drains, h2d, d2h, d2d) = if ids_only {
+            traffic_ids(text_rows, audio_steps, depth_frames)
+        } else {
+            traffic(text_rows, audio_steps, depth_frames)
+        };
         eprintln!(
             "TRAFFIC drains={drains} h2d={h2d} d2h={d2h} d2d={d2d} got_drains={} got_h2d={} got_d2h={} got_d2d={}",
             k.drains.get(),
@@ -3012,7 +3209,12 @@ impl Breeze {
                 && k.d2d.get() == d2d,
             "traffic"
         );
-        Ok((backbone, depth))
+        Ok(GreedyOut {
+            backbone,
+            depth,
+            backbone_ids,
+            depth_ids,
+        })
     }
 
     #[cfg(test)]
@@ -4759,6 +4961,46 @@ mod tests {
     const FREE_RULE: &str =
         "a free-run id comparison applies only where the reference margin exceeds 2x tau";
 
+    fn match_argmax(
+        scores: &[f32],
+        ids: &[u32],
+        vocab: usize,
+        tensor: &str,
+        defect: &mut bool,
+    ) -> Result<()> {
+        ensure!(scores.len() == ids.len() * vocab, "Runner FAIL id count");
+        for (index, &got) in ids.iter().enumerate() {
+            let (host, margin) = top2(score_row(scores, index, vocab)?)?;
+            let host_id = u32::try_from(host)?;
+            let status = if got == host_id {
+                GateStatus::Pass
+            } else {
+                *defect = true;
+                GateStatus::Defect
+            };
+            println!(
+                "ARGMAX tensor={tensor} index={index} id={got} host={host_id} margin={margin:?} status={}",
+                status.label()
+            );
+        }
+        Ok(())
+    }
+
+    fn prod_f32(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let step = (i * 17 + 3) % 251;
+                (step as f32) * 0.015625 - 1.5
+            })
+            .collect()
+    }
+
+    fn prod_codes(frames: usize) -> Vec<i32> {
+        (0..frames * super::BOOKS)
+            .map(|i| ((i * 17 + 3) % 2047) as i32)
+            .collect()
+    }
+
     #[test]
     #[ignore = "requires GPU lease, frozen floors, and external fixtures"]
     fn n8_m1_candidate() -> Result<()> {
@@ -4767,8 +5009,27 @@ mod tests {
             "m1 score traffic"
         );
         ensure!(
+            super::traffic_ids(M1_TEXT, M1_AUDIO, M1_STEPS) == (33, 45_792, 256, 758_480),
+            "m1 ids traffic"
+        );
+        ensure!(
             super::traffic(203, 63, 64) == (576, 1_106_368, 4_200_576, 12_197_120),
             "production score traffic"
+        );
+        ensure!(
+            super::traffic_ids(203, 63, 64) == (513, 1_106_368, 4_096, 12_197_120),
+            "production ids traffic"
+        );
+        ensure!(
+            super::traffic_ids(203, 79, 80) == (641, 1_175_104, 5_120, 15_247_424),
+            "counted 80-frame ids"
+        );
+        println!("PREDICT m1_ids drains=33 h2d=45792 d2h=256 d2d=758480 continued_d2h=64");
+        println!(
+            "PREDICT production_exec text=203 depth=64 audio=63 captures=1 launches=127 replay_launches=128"
+        );
+        println!(
+            "PREDICT production_80 drains=641 h2d=1175104 d2h=5120 d2d=15247424 source_prefill=395 source_step=396 source_depth=201"
         );
         let weights = env_path("N8_WEIGHTS", true)?;
         let floors = env_path("N8_M1_FLOORS", false)?;
@@ -4897,6 +5158,8 @@ mod tests {
         note_equiv("depth_graph", &graph_depth, &nominal_depth)?;
         let (mut replay_backbone, mut replay_depth) =
             model.greedy_decode(&projected, &hidden, M1_TEXT, fed, &frames, false)?;
+        let raw_backbone = replay_backbone.clone();
+        let raw_depth = replay_depth.clone();
         mask_reserved(&mut replay_backbone, super::BB_VOCAB)?;
         mask_reserved(&mut replay_depth, depth_vocab)?;
         println!(
@@ -4954,6 +5217,83 @@ mod tests {
                 &mut defect,
             )?;
         }
+        let (device_backbone, device_depth) =
+            model.greedy_ids(&projected, &hidden, M1_TEXT, fed, &frames)?;
+        println!(
+            "GRAPH ids_replay captures={} launches={}",
+            model.graph_captures(),
+            model.graph_launches()
+        );
+        ensure!(
+            model.graph_captures() == 0 && model.graph_launches() == graph_replay_launches,
+            "ids replay"
+        );
+        match_argmax(
+            &raw_backbone,
+            &device_backbone,
+            super::BB_VOCAB,
+            "backbone",
+            &mut defect,
+        )?;
+        match_argmax(&raw_depth, &device_depth, depth_vocab, "depth", &mut defect)?;
+        const PROD_TEXT: usize = 203;
+        const PROD_DEPTH: usize = 64;
+        const PROD_AUDIO: usize = 63;
+        ensure!(PROD_DEPTH == super::DP_FRAMES, "production depth");
+        ensure!(PROD_TEXT + PROD_AUDIO <= super::BB_MAX, "production length");
+        let prod_first_launches = u64::try_from(PROD_DEPTH + PROD_AUDIO)?;
+        let prod_replay_launches = u64::try_from(1 + PROD_DEPTH + PROD_AUDIO)?;
+        let prod_frames = prod_codes(PROD_DEPTH);
+        let prod_fed = &prod_frames[..PROD_AUDIO * super::BOOKS];
+        let prod_projected = prod_f32(PROD_TEXT * super::BB_H);
+        let prod_cond = prod_f32(PROD_DEPTH * super::BB_H);
+        let (prod_backbone, prod_depth) = model.greedy_decode(
+            &prod_projected,
+            &prod_cond,
+            PROD_TEXT,
+            prod_fed,
+            &prod_frames,
+            false,
+        )?;
+        println!(
+            "GRAPH production_capture captures={} launches={}",
+            model.graph_captures(),
+            model.graph_launches()
+        );
+        ensure!(
+            model.graph_captures() == 1 && model.graph_launches() == prod_first_launches,
+            "production capture"
+        );
+        let (prod_backbone_ids, prod_depth_ids) = model.greedy_ids(
+            &prod_projected,
+            &prod_cond,
+            PROD_TEXT,
+            prod_fed,
+            &prod_frames,
+        )?;
+        println!(
+            "GRAPH production_replay captures={} launches={}",
+            model.graph_captures(),
+            model.graph_launches()
+        );
+        ensure!(
+            model.graph_captures() == 0 && model.graph_launches() == prod_replay_launches,
+            "production replay"
+        );
+        match_argmax(
+            &prod_backbone,
+            &prod_backbone_ids,
+            super::BB_VOCAB,
+            "production_backbone",
+            &mut defect,
+        )?;
+        match_argmax(
+            &prod_depth,
+            &prod_depth_ids,
+            depth_vocab,
+            "production_depth",
+            &mut defect,
+        )?;
         println!("FREE_RUN role=measurement near_tie={NEAR_TIE}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
         finish_gate(defect, protocol)
