@@ -39,7 +39,11 @@ unsafe fn resolve_position(mut p: Attention) -> Attention {
 
 #[inline(always)]
 fn address(base: u32, row: u32, col: u32, stride: u32) -> u32 {
-    base + 2 * (row * stride + (col ^ ((row & 7) << 3)))
+    if stride == 96 {
+        base + (col / 32) * 4096 + 2 * ((row * 32 + (col & 31)) ^ ((row & 7) << 3))
+    } else {
+        base + 2 * (row * stride + (col ^ ((row & 7) << 3)))
+    }
 }
 
 #[inline(always)]
@@ -226,6 +230,13 @@ macro_rules! eight {
         $m!(7);
     };
 }
+macro_rules! six {
+    ($m:ident) => {
+        four!($m);
+        $m!(4);
+        $m!(5);
+    };
+}
 macro_rules! sixteen {
     ($m:ident) => {
         eight!($m);
@@ -272,16 +283,25 @@ unsafe fn copy_kv<const D: usize, const L: usize, const MASK: bool>(
     unsafe {
         macro_rules! transfer {
             ($i:expr) => {
-                asm!("cp.async.cg.shared.global [{dst}+{shared_offset}], [{src}+{global_offset}], 16, {bytes};",
-                    dst=in(reg32) dst[$i % 2],src=in(reg64) src,
-                    shared_offset=const ($i / 2) * 4096,global_offset=const $i * (1024 / D) * L * 2,
-                    bytes=in(reg32) if (!MASK || row + $i * (1024 / D as u32) < rows) && col < L as u32 {16u32} else {0u32});
+                if D == 96 {
+                    asm!("cp.async.cg.shared.global [{dst}+{shared_offset}], [{src}+{global_offset}], 16, {bytes};",
+                        dst=in(reg32) dst[0],src=in(reg64) src,
+                        shared_offset=const $i * 2048,global_offset=const (($i % 2) * 32 * L + ($i / 2) * 32) * 2,
+                        bytes=in(reg32) if !MASK || row + ($i % 2) * 32 < rows {16u32} else {0u32});
+                } else {
+                    asm!("cp.async.cg.shared.global [{dst}+{shared_offset}], [{src}+{global_offset}], 16, {bytes};",
+                        dst=in(reg32) dst[$i % 2],src=in(reg64) src,
+                        shared_offset=const ($i / 2) * 4096,global_offset=const $i * (1024 / D) * L * 2,
+                        bytes=in(reg32) if (!MASK || row + $i * (1024 / D as u32) < rows) && col < L as u32 {16u32} else {0u32});
+                }
             };
         }
         if D == 256 {
             sixteen!(transfer);
         } else if D == 64 {
             four!(transfer);
+        } else if D == 96 {
+            six!(transfer);
         } else {
             eight!(transfer);
         }
@@ -545,9 +565,30 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
 }
 
 /// # Safety
-/// Heads have 96 F16 columns; launch uses 128 threads and 49152 shared bytes.
+/// Heads have 96 F16 columns; launch uses 128 threads and 36864 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d96_bidirectional_f16(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        attention::<96, 12, 1, 96, true, true>(
+            resolve_position(p),
+            keys,
+            0,
+            0,
+            scale,
+            core::ptr::null(),
+            0,
+        );
+    }
+}
+
+/// # Safety
+/// Gate reference has 96 F16 columns; launch uses 128 threads and 49152 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d96_bidirectional_f16_padded(
     p: Attention,
     keys: u32,
     scale: f32,
@@ -731,8 +772,9 @@ unsafe fn attention<
         } else {
             end.min(diagonal)
         };
-        let copy_row = tid / (D as u32 / 8);
-        let copy_lane = tid % (D as u32 / 8);
+        let copy_width = if D == 96 { 4 } else { D as u32 / 8 };
+        let copy_row = tid / copy_width;
+        let copy_lane = tid % copy_width;
         let copy_col = copy_lane * 8;
         let copy_shared = [
             address(0, copy_row, copy_col, D as u32),
@@ -752,13 +794,23 @@ unsafe fn attention<
             p.v.wrapping_add(kv + (first + copy_row) as usize * L + copy_col as usize);
         macro_rules! copy_q {
             ($i:expr) => {{
-                let row = copy_row + $i * (1024 / D as u32);
+                let row = copy_row
+                    + if D == 96 {
+                        ($i % 2) * 32
+                    } else {
+                        $i * (1024 / D as u32)
+                    };
+                let col = copy_col + if D == 96 { ($i / 2) * 32 } else { 0 };
                 copy(
-                    sm + copy_shared[$i % 2] + ($i / 2) * 4096,
+                    if D == 96 {
+                        sm + copy_shared[0] + $i * 2048
+                    } else {
+                        sm + copy_shared[$i % 2] + ($i / 2) * 4096
+                    },
                     p.q.wrapping_add(
                         (qstart + row) as usize * p.q_stride as usize
                             + head as usize * L
-                            + copy_col as usize,
+                            + col as usize,
                     ),
                     qstart + row < p.rows && copy_col < L as u32,
                 );
@@ -768,6 +820,8 @@ unsafe fn attention<
             sixteen!(copy_q);
         } else if D == 64 {
             four!(copy_q);
+        } else if D == 96 {
+            six!(copy_q);
         } else {
             eight!(copy_q);
         }
@@ -823,13 +877,19 @@ unsafe fn attention<
                 let mut scores = [[0.0f32; 4]; 8];
                 macro_rules! qk_step {
                     ($inner:expr) => {{
-                        let a = ld4::<{ ($inner / 4) * 128 }>(qb[$inner % 4]);
+                        let a = if D == 96 {
+                            ld4::<{ ($inner / 2) * 4096 }>(qb[$inner % 2])
+                        } else {
+                            ld4::<{ ($inner / 4) * 128 }>(qb[$inner % 4])
+                        };
                         macro_rules! qk_pair {
                             ($pair:expr) => {{
                                 let b = if D == 256 {
                                     ld4::<{ ($inner / 4) * 128 + $pair * 8192 }>(kb[$inner % 4])
                                 } else if D == 64 {
                                     ld4::<{ $pair * 2048 }>(kb[$inner % 4])
+                                } else if D == 96 {
+                                    ld4::<{ ($inner / 2) * 4096 + $pair * 1024 }>(kb[$inner % 2])
                                 } else {
                                     ld4::<{ ($inner / 4) * 128 + $pair * 4096 }>(kb[$inner % 4])
                                 };
@@ -845,6 +905,8 @@ unsafe fn attention<
                     sixteen!(qk_step);
                 } else if D == 64 {
                     four!(qk_step);
+                } else if D == 96 {
+                    six!(qk_step);
                 } else {
                     eight!(qk_step);
                 }
@@ -984,6 +1046,12 @@ unsafe fn attention<
                     thirty_two!(rescale);
                 } else if D == 64 {
                     eight!(rescale);
+                } else if D == 96 {
+                    eight!(rescale);
+                    rescale!(8);
+                    rescale!(9);
+                    rescale!(10);
+                    rescale!(11);
                 } else {
                     sixteen!(rescale);
                 }
@@ -998,6 +1066,10 @@ unsafe fn attention<
                                     )
                                 } else if D == 64 {
                                     ld4_trans::<{ $inner * 2048 }>(vb[$pair % 4])
+                                } else if D == 96 {
+                                    ld4_trans::<{ ($pair / 2) * 4096 + $inner * 1024 }>(
+                                        vb[$pair % 2],
+                                    )
                                 } else {
                                     ld4_trans::<{ ($pair / 4) * 128 + $inner * 4096 }>(
                                         vb[$pair % 4],
@@ -1024,6 +1096,8 @@ unsafe fn attention<
                             sixteen!(pv_pair);
                         } else if D == 64 {
                             four!(pv_pair);
+                        } else if D == 96 {
+                            six!(pv_pair);
                         } else {
                             eight!(pv_pair);
                         }
@@ -1123,10 +1197,42 @@ unsafe fn attention<
         } else if D == 64 {
             stage_output!(0);
             stage_output!(1);
+        } else if D == 96 {
+            stage_output!(0);
+            stage_output!(1);
+            stage_output!(2);
         } else {
             four!(stage_output);
         }
         barrier();
+        macro_rules! write_compact_output {
+            ($step:expr) => {{
+                let row = tid / 16 + $step * 8;
+                let lane = tid % 16;
+                let col = lane * 8;
+                if qstart + row < p.rows && col < 96 {
+                    let base = sm
+                        + (row / 16) * 3072
+                        + (lane / 4) * 1024
+                        + ((row / 8) & 1) * 512
+                        + (lane & 3) * 4;
+                    let source = ((row & 7) * 4) ^ (lane / 4);
+                    let values = [
+                        load_shared(base + source * 16),
+                        load_shared(base + (source ^ 1) * 16),
+                        load_shared(base + (source ^ 2) * 16),
+                        load_shared(base + (source ^ 3) * 16),
+                    ];
+                    store_global4(
+                        p.out.wrapping_add(
+                            ((qstart + row) as usize * p.q_heads as usize + head as usize) * L
+                                + col as usize,
+                        ),
+                        values,
+                    );
+                }
+            }};
+        }
         macro_rules! write_output {
             ($step:expr) => {{
                 let row = copy_row + $step * (1024 / D as u32);
@@ -1155,6 +1261,8 @@ unsafe fn attention<
             sixteen!(write_output);
         } else if D == 64 {
             four!(write_output);
+        } else if D == 96 {
+            eight!(write_compact_output);
         } else {
             eight!(write_output);
         }

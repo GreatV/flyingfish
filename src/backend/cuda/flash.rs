@@ -758,7 +758,7 @@ impl Flash {
         let tile = 64usize;
         let physical_dim = match head_dim {
             16 | 64 => 64usize,
-            96 => 128usize,
+            96 => 96usize,
             _ => anyhow::bail!("unsupported F16 prefill head dimension {head_dim}"),
         };
         let dynamic_shared = (384 * physical_dim) as u32;
@@ -832,6 +832,22 @@ impl Flash {
             position: 0,
             position_limit: 0,
         })
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(super) fn set_f16_padded_reference(&mut self, padded: bool) -> Result<()> {
+        ensure!(self.geometry[2] == 96, "padded reference requires F16 D96");
+        self.native = vec![
+            super::cubin::module(self.stream.context(), "attention_native")?.load_function(
+                if padded {
+                    "attention_prefill_d96_bidirectional_f16_padded"
+                } else {
+                    "attention_prefill_d96_bidirectional_f16"
+                },
+            )?,
+        ];
+        self.shared = if padded { 49_152 } else { 36_864 };
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
@@ -2658,6 +2674,7 @@ mod tests {
         inputs: &[Vec<half::f16>; 3],
         [rows, keys, heads, dim]: [usize; 4],
         pitch: usize,
+        defects: &mut usize,
     ) -> Result<Vec<half::f16>> {
         use half::f16;
         ensure!(
@@ -2699,44 +2716,139 @@ mod tests {
             dim,
             Score::from_tokens((dim as f32).sqrt().recip(), None)?,
         )?;
-        let mut run = || {
-            attention.run_f16(
-                &q.slice(..),
-                pitch,
-                &k.slice(..),
-                &v.slice(..),
-                &mut output.slice_mut(..count),
-                (rows, keys, capacity),
-            )
+        let mut candidate = None;
+        let arms = if cfg!(feature = "cuda") && dim == 96 {
+            2
+        } else {
+            1
         };
-        run()?;
-        #[cfg(feature = "cuda")]
-        stream.begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )?;
-        #[cfg(feature = "rocm")]
-        let capture = stream.begin_capture()?;
-        run()?;
-        #[cfg(feature = "cuda")]
-        let graph = stream
-            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-            .context("F16 attention graph missing")?;
-        #[cfg(feature = "rocm")]
-        let graph = capture.finish()?;
-        let eager = stream.clone_dtoh(&output)?;
-        graph.launch()?;
-        let captured = stream.clone_dtoh(&output)?;
-        ensure!(eager == captured, "F16 attention graph/eager differs");
-        ensure!(
-            eager[..count].iter().all(|value| value.is_finite())
-                && eager[count..].iter().all(|&value| value == sentinel)
-                && stream
-                    .clone_dtoh(&attention.lse)?
+        for arm in 0..arms {
+            #[cfg(feature = "cuda")]
+            if arm == 1 {
+                attention.set_f16_padded_reference(true)?;
+            }
+            #[cfg(feature = "cuda")]
+            {
+                use cudarc::driver::sys::CUfunction_attribute as F;
+                let function = &attention.native[0];
+                let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+                let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+                let blocks = function.occupancy_max_active_blocks_per_multiprocessor(
+                    128,
+                    attention.shared as usize,
+                    None,
+                )?;
+                ensure!(local == 0 && blocks > 0, "F16 attention resource gate");
+                println!(
+                    "F16_ATTENTION_RESOURCES dim={dim} padded={} threads=128 registers={registers} local_bytes={local} shared_bytes={} active_blocks={blocks}",
+                    arm == 1,
+                    attention.shared
+                );
+            }
+            let mut run = || {
+                attention.run_f16(
+                    &q.slice(..),
+                    pitch,
+                    &k.slice(..),
+                    &v.slice(..),
+                    &mut output.slice_mut(..count),
+                    (rows, keys, capacity),
+                )
+            };
+            run()?;
+            #[cfg(feature = "cuda")]
+            stream.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            #[cfg(feature = "rocm")]
+            let capture = stream.begin_capture()?;
+            run()?;
+            #[cfg(feature = "cuda")]
+            let graph = stream
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("F16 attention graph missing")?;
+            #[cfg(feature = "cuda")]
+            {
+                use cudarc::driver::sys;
+                let mut count = 0;
+                unsafe {
+                    sys::cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut count)
+                        .result()?;
+                }
+                ensure!(count == 1, "F16 attention graph must have one kernel node");
+                let mut node = std::ptr::null_mut();
+                let mut params = std::mem::MaybeUninit::uninit();
+                unsafe {
+                    sys::cuGraphGetNodes(graph.cu_graph(), &mut node, &mut count).result()?;
+                    sys::cuGraphKernelNodeGetParams_v2(node, params.as_mut_ptr()).result()?;
+                    let params = params.assume_init();
+                    ensure!(
+                        params.func == attention.native[0].cu_function()
+                            && params.blockDimX == 128
+                            && params.sharedMemBytes == attention.shared,
+                        "F16 attention captured kernel/launch mismatch"
+                    );
+                }
+                println!(
+                    "PASS F16_ATTENTION_LAUNCH padded={} kernel_nodes=1 threads=128 shared_bytes={}",
+                    arm == 1,
+                    attention.shared
+                );
+            }
+            #[cfg(feature = "rocm")]
+            let graph = capture.finish()?;
+            let eager = stream.clone_dtoh(&output)?;
+            let eager_lse = stream.clone_dtoh(&attention.lse)?;
+            graph.launch()?;
+            let captured = stream.clone_dtoh(&output)?;
+            let captured_lse = stream.clone_dtoh(&attention.lse)?;
+            ensure!(
+                eager[..count].iter().all(|value| value.is_finite())
+                    && eager[count..].iter().all(|&value| value == sentinel)
+                    && eager_lse.iter().all(|value| value.is_finite()),
+                "F16 attention output/LSE/guard invalid"
+            );
+            let graph_equal = eager
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(captured.iter().map(|v| v.to_bits()))
+                && eager_lse
                     .iter()
-                    .all(|value| value.is_finite()),
-            "F16 attention output/LSE/guard invalid"
-        );
-        Ok(eager[..count].to_vec())
+                    .map(|v| v.to_bits())
+                    .eq(captured_lse.iter().map(|v| v.to_bits()));
+            *defects += usize::from(!graph_equal);
+            println!(
+                "F16_ATTENTION_GRAPH {} rows={rows} keys={keys} padded={} output_and_lse=true",
+                if graph_equal { "PASS" } else { "DEFECT" },
+                arm == 1
+            );
+            if let Some((ref output, ref lse)) = candidate {
+                let output: &Vec<f16> = output;
+                let lse: &Vec<f32> = lse;
+                let output_bits: u32 = output
+                    .iter()
+                    .zip(&eager)
+                    .map(|(a, b)| (a.to_bits() ^ b.to_bits()).count_ones())
+                    .sum();
+                let lse_bits: u32 = lse
+                    .iter()
+                    .zip(&eager_lse)
+                    .map(|(a, b)| (a.to_bits() ^ b.to_bits()).count_ones())
+                    .sum();
+                println!(
+                    "F16_ATTENTION_IDENTITY {} rows={rows} keys={keys} heads={heads} dim={dim} pitch={pitch} output_bits={output_bits} lse_bits={lse_bits} eager_graph=true",
+                    if output_bits == 0 && lse_bits == 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                *defects += usize::from(output_bits != 0 || lse_bits != 0);
+            } else {
+                candidate = Some((eager, eager_lse));
+            }
+        }
+        Ok(candidate.context("F16 attention candidate missing")?.0[..count].to_vec())
     }
 
     #[test]
@@ -2824,6 +2936,7 @@ mod tests {
                     &inputs,
                     [rows, keys, heads, dim],
                     heads * dim + padding,
+                    &mut defects,
                 )?;
                 let selected_values = selected
                     .iter()
@@ -2848,8 +2961,13 @@ mod tests {
                     head[64..].fill(half::f16::ZERO);
                 }
             }
-            let control =
-                f16_attention_cell(&stream, &wrong, [rows, keys, heads, dim], heads * dim)?;
+            let control = f16_attention_cell(
+                &stream,
+                &wrong,
+                [rows, keys, heads, dim],
+                heads * dim,
+                &mut defects,
+            )?;
             let control = selected
                 .iter()
                 .flat_map(|&row| {
@@ -2887,6 +3005,7 @@ mod tests {
                     &repeated,
                     [repeated_rows, keys, heads, dim],
                     heads * dim,
+                    &mut defects,
                 )?;
                 let expected = (0..repeated_rows)
                     .flat_map(|row| {
@@ -2910,6 +3029,34 @@ mod tests {
             }
         }
         println!("F16_ATTENTION_RESULT cells={scored} controls=4 defects={defects}");
+        for rows in [2548, 13019, 22775] {
+            for keys in [rows, 2917] {
+                let inputs = std::array::from_fn(|operand| {
+                    let count = if operand == 0 { rows } else { keys } * 22 * 96;
+                    let period = [97, 101, 103][operand];
+                    (0..count)
+                        .map(|i| {
+                            half::f16::from_f32(
+                                ((i * 37 % period) as f32 - (period / 2) as f32) / period as f32,
+                            )
+                        })
+                        .collect()
+                });
+                for padding in [0, 8] {
+                    f16_attention_cell(
+                        &stream,
+                        &inputs,
+                        [rows, keys, 22, 96],
+                        22 * 96 + padding,
+                        &mut defects,
+                    )?;
+                }
+            }
+        }
+        println!(
+            "{} F16_D96_COMPACT_IDENTITY production_cells=12 output_bits_threshold=0 lse_bits_threshold=0 defects={defects} eager_graph=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
         ensure!(defects == 0, "F16 attention candidate DEFECT");
         Ok(())
     }

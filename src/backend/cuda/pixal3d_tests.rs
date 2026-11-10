@@ -3547,6 +3547,7 @@ fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
         flow.set_times(&[820.0])?;
         cascade_rope(&flow, &mut gate, &source, &file)?;
         flow.forward(&input, 0, &positive, &mut output)?;
+        flow_padded_identity(&mut flow, &input, &positive, &mut output, &mut gate.defects)?;
         gate.score(
             &format!("{file}/velocity"),
             &flow
@@ -3662,6 +3663,15 @@ fn hi3d_cascade_production_flow_gpu() -> Result<()> {
                 cascade_rope(&flow, &mut gate, &anchor, "production.safetensors")?;
             }
             flow.forward(&input, 0, &condition, &mut output)?;
+            if !control {
+                flow_padded_identity(
+                    &mut flow,
+                    &input,
+                    &condition,
+                    &mut output,
+                    &mut gate.defects,
+                )?;
+            }
             gate.score(
                 "production.safetensors/velocity",
                 &flow
@@ -5031,6 +5041,42 @@ fn hi3d_generation_first_forward_gpu() -> Result<()> {
     generation_first_forward(0)
 }
 
+fn flow_padded_identity(
+    flow: &mut Flow<f16>,
+    input: &CudaSlice<f32>,
+    condition: &Conditioning<f16>,
+    output: &mut CudaSlice<f32>,
+    defects: &mut usize,
+) -> Result<()> {
+    let compact = flow.device.stream.clone_dtoh(output)?;
+    flow.flash.set_f16_padded_reference(true)?;
+    let CrossAttention::F16(cross) = &mut flow.cross else {
+        anyhow::bail!("F16 cross binding missing");
+    };
+    cross.set_f16_padded_reference(true)?;
+    flow.forward(input, 0, condition, output)?;
+    let padded = flow.device.stream.clone_dtoh(output)?;
+    flow.flash.set_f16_padded_reference(false)?;
+    let CrossAttention::F16(cross) = &mut flow.cross else {
+        anyhow::bail!("F16 cross binding missing");
+    };
+    cross.set_f16_padded_reference(false)?;
+    let bits: u64 = compact
+        .iter()
+        .zip(&padded)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_D96_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} self_cross=true",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len()
+    );
+    *defects += usize::from(bits != 0);
+    flow.device.stream.memcpy_htod(&compact, output)?;
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires both admitted CUDA devices and frozen first-forward inputs"]
 fn hi3d_generation_selected_device_gpu() -> Result<()> {
@@ -5146,6 +5192,9 @@ fn generation_first_forward(ordinal: usize) -> Result<()> {
             let input = flow.device.stream.clone_htod(&noise)?;
             let mut output = flow.device.stream.alloc_zeros::<f32>(noise.len())?;
             flow.forward(&input, 0, &conditioning, &mut output)?;
+            if !control {
+                flow_padded_identity(&mut flow, &input, &conditioning, &mut output, &mut defects)?;
+            }
             let actual = flow
                 .device
                 .stream
