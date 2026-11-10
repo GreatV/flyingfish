@@ -270,6 +270,7 @@ impl VideoDecoder {
         tiles: &VaeTiles,
         mut inputs: impl Iterator<Item = (Vec<f32>, [usize; 3])>,
         frozen: &serde_json::Value,
+        capture: &Path,
     ) -> Result<()> {
         let first = inputs.next().context("RUNNER_FAIL group inputs empty")?;
         let spec = &self.spec;
@@ -309,6 +310,8 @@ impl VideoDecoder {
         let mut previous: Option<Vec<bf16>> = None;
         let mut defects = 0;
         let mut passes = 0;
+        let mut video_cells = 0;
+        let mut video_defects = 0;
         for (input, [frames, height, width]) in std::iter::once(first).chain(inputs) {
             ensure!(
                 input.len() == spec.latent_channels * frames * height * width
@@ -377,6 +380,84 @@ impl VideoDecoder {
                     if bits == 0 { "PASS" } else { "DEFECT" }
                 );
             }
+            let plan = DecodePlan::new(spec, frames)?;
+            let pre = spec.frame_pre_padding();
+            let lead = spec.chunk_latents() * spec.temporal_ratio;
+            let kept = lead - pre;
+            let tail = shape.0 * spec.temporal_ratio - lead - pre;
+            let total = plan.chunks * kept + if spec.token_drop > 0 { tail } else { 0 };
+            let plane = height * r * width * r;
+            let directory = capture.join(format!("video-{passes}"));
+            std::fs::create_dir(&directory)?;
+            for work in [&mut serial, &mut grouped, &mut lower] {
+                let batch = work.batch;
+                let mut output = s.alloc_zeros::<bf16>(spec.out_channels * total * plane)?;
+                self.decode_observed(
+                    (s, blas),
+                    work,
+                    tiles,
+                    LatentVideo {
+                        data: &input,
+                        frames,
+                        height,
+                        width,
+                    },
+                    &mut output,
+                    |stage, chunk, buffer| {
+                        let values = if stage == "emitted" {
+                            let mut values = Vec::with_capacity(spec.out_channels * kept * plane);
+                            for channel in 0..spec.out_channels {
+                                let first = (channel * total + chunk * kept) * plane;
+                                values.extend(s.clone_dtoh(
+                                    &buffer.slice(first..first + kept * plane),
+                                )?);
+                            }
+                            values
+                        } else {
+                            s.clone_dtoh(buffer)?
+                        };
+                        ensure!(
+                            values.iter().all(|x| x.is_finite()),
+                            "RUNNER_FAIL video {stage} nonfinite input={passes} batch={batch} chunk={chunk}"
+                        );
+                        // BF16 scalars occupy two bytes.
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                values.as_ptr().cast::<u8>(),
+                                values.len() * 2,
+                            )
+                        };
+                        let path = directory.join(format!("{stage}-{chunk}.bf16"));
+                        if batch == 1 {
+                            std::fs::write(path, bytes)?;
+                        } else {
+                            let expected = std::fs::read(path)?;
+                            ensure!(
+                                expected.len() == bytes.len(),
+                                "RUNNER_FAIL video {stage} snapshot extent"
+                            );
+                            let bits = bytes
+                                .chunks_exact(2)
+                                .zip(expected.chunks_exact(2))
+                                .filter(|(a, b)| a != b)
+                                .count();
+                            video_cells += 1;
+                            video_defects += usize::from(bits != 0);
+                            println!(
+                                "H3_VAE_VIDEO_IDENTITY input={passes} batch={batch} chunk={chunk} stage={stage} elements={} bit_differences={bits} status={}",
+                                values.len(),
+                                if bits == 0 { "PASS" } else { "DEFECT" }
+                            );
+                        }
+                        Ok(())
+                    },
+                )?;
+                println!(
+                    "H3_VAE_VIDEO_FORWARD input={passes} batch={batch} tail={} chunks={} frames={total} tiles={slots}",
+                    work.tail, plan.chunks
+                );
+            }
+            std::fs::remove_dir_all(directory)?;
             previous = Some(expected);
             passes += 1;
         }
@@ -387,6 +468,13 @@ impl VideoDecoder {
         );
         ensure!(defects == 0, "H3_VAE_GROUP_FORWARD DEFECT cells={defects}");
         println!("H3_VAE_GROUP_FORWARD PASS repeated_inputs={passes} bit_limit=0");
+        println!(
+            "H3_VAE_VIDEO_RESULT inputs={passes} cells={video_cells} bit_limit=0 defects={video_defects}"
+        );
+        ensure!(
+            video_defects == 0,
+            "H3_VAE_VIDEO DEFECT cells={video_defects}"
+        );
         Ok(())
     }
 
@@ -1392,6 +1480,18 @@ impl VideoDecoder {
         z: LatentVideo<'_>,
         out: &mut CudaSlice<bf16>,
     ) -> Result<DecodePlan> {
+        self.decode_observed((s, blas), w, tiles, z, out, |_, _, _| Ok(()))
+    }
+
+    fn decode_observed(
+        &self,
+        (s, blas): (&Arc<CudaStream>, &Blas),
+        w: &mut TileWork,
+        tiles: &VaeTiles,
+        z: LatentVideo<'_>,
+        out: &mut CudaSlice<bf16>,
+        mut observe: impl FnMut(&str, usize, &CudaSlice<bf16>) -> Result<()>,
+    ) -> Result<DecodePlan> {
         let spec = &self.spec;
         let r = spec.spatial_ratio;
         let plan = DecodePlan::new(spec, z.frames)?;
@@ -1487,6 +1587,7 @@ impl VideoDecoder {
                     (&raw, group * w.batch),
                 )?;
             }
+            observe("raw", i, &raw)?;
             let planes = channels * clip_frames;
             unsafe {
                 s.launch_builder(&self.kernels.stitch)
@@ -1502,6 +1603,7 @@ impl VideoDecoder {
                     .arg(&(width as u32))
                     .launch(flat(planes * plane))?;
             }
+            observe("canvas", i, &canvas)?;
             let dst = i * kept;
             if i > 0 && fade > 0 {
                 unsafe {
@@ -1533,6 +1635,7 @@ impl VideoDecoder {
             } else {
                 copy_frames(s, &canvas, clip_frames, pre, out, total, dst, kept)?;
             }
+            observe("emitted", i, out)?;
             if spec.token_drop > 0 {
                 copy_frames(
                     s,
@@ -1545,10 +1648,12 @@ impl VideoDecoder {
                     tail,
                 )?;
             }
+            observe("tail", i, &faded)?;
         }
         if spec.token_drop > 0 {
             copy_frames(s, &faded, tail, 0, out, total, plan.chunks * kept, tail)?;
         }
+        observe("final", plan.chunks, out)?;
         Ok(plan)
     }
 }

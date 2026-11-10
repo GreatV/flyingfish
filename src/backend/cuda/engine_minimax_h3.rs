@@ -5889,7 +5889,14 @@ mod tests {
                 Rc::new(Closure::new(true, "VAE spatial group gate".into())),
             )?;
             let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
-            decoder.batch_identity_gate(&device, &mut blas, &tiles, inputs.into_iter(), &frozen)
+            decoder.batch_identity_gate(
+                &device,
+                &mut blas,
+                &tiles,
+                inputs.into_iter(),
+                &frozen,
+                &runtime,
+            )
         })();
         let cleanup = fs::remove_dir_all(&runtime);
         result?;
