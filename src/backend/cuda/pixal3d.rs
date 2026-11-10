@@ -3495,12 +3495,14 @@ impl Hi3DGeneration<'_> {
             drop(voxels);
             drop(previous.take());
             let latent = self.flow_stage(device, &context, &grid, (stream, nominal))?;
+            device.stream.synchronize()?;
+            let decoder_budget = self.budget(device)?;
             let decoder = PixalDecoder::open(
                 device,
                 self.model,
                 DecoderKind::PointTransformer,
                 self.runtime,
-                self.budget(device)?,
+                decoder_budget,
             )?;
             let mesh = decoder.points_mesh(coordinates, &latent, frame, nominal)?;
             drop(decoder);
@@ -4066,6 +4068,11 @@ impl<T: DeviceRepr + Copy + ValidAsZeroBits + 'static> PointWorkspace<T> {
                 entry.insert(BatchGroupNorm::new(d, &offsets, c, 32, 1e-6, 64 << 20)?);
             }
         }
+        #[cfg(test)]
+        println!(
+            "SPARSE_POINT_WORKSPACE rows={n} input_channels={ci} output_channels={co} element_bytes={} final_stage={final_stage} scratch_bytes={scratch_bytes} live_bytes={reserve}",
+            size_of::<T>()
+        );
         let available = d.workspace_budget(decoder.initial_free, decoder.device_budget, reserve)?;
         let conv = SparseConv::<f32>::promoted(d, sites, [ci, co], available)?;
         let scratch = [d.stream.alloc_zeros(count)?, d.stream.alloc_zeros(count)?];
@@ -4114,6 +4121,8 @@ impl PixalDecoder {
         let checkpoint = DecoderCheckpoint::open(&dir.join(component), kind)?;
         let device = device.clone();
         let (free, _) = device.ctx.mem_get_info()?;
+        #[cfg(test)]
+        println!("SPARSE_DECODER_PLACEMENT initial_free={free} device_budget={device_budget}");
         let ops = Ops::new(&device.ctx)?;
         let blas = Blas::new(
             &device,
