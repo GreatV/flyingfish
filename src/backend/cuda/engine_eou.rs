@@ -529,7 +529,7 @@ impl Eou {
         let mut session = self.encoder.eou_stream()?;
         self.reset_prediction()?;
         self.projected = None;
-        let eou_token = self.spec.vocab_size as u32 - 2;
+        let eou_token = self.spec.vocab_size - 2;
         let mut utterances: Vec<Vec<u32>> = Vec::new();
         let mut current: Vec<u32> = Vec::new();
         let mut window = vec![0f32; 25 * mel_bins];
@@ -560,19 +560,13 @@ impl Eou {
                 }
             }
             let length = if step == 0 { 9 } else { 25 };
-            let step_rows = self
-                .encoder
-                .eou_encode_step(&mut session, &window[..length * mel_bins])?;
-            if step == 125 || step == 250 {
-                let hidden = self.spec.d_model as usize;
-                println!(
-                    "EOU_S3_ENCROWS step={step} r0={:?} r1={:?}",
-                    &step_rows.rows[..4],
-                    &step_rows.rows[hidden..hidden + 4]
-                );
-            }
+            let total_rows = (frames - 1) / 8 + 1;
+            let valid = usize::from(step < total_rows) + usize::from(step + 1 < total_rows);
+            let step_rows =
+                self.encoder
+                    .eou_encode_step(&mut session, &window[..length * mel_bins], valid)?;
             let hidden = self.spec.d_model as usize;
-            let row: Vec<f32> = step_rows.rows[hidden..2 * hidden].to_vec();
+            let row: Vec<f32> = step_rows.rows[..hidden].to_vec();
             let device_row = self.encoder.stream.clone_htod(&row)?;
             let projected = self.encoder.linear(&device_row, 1, &self.enc_projector)?;
             self.projected = Some(projected);
@@ -605,7 +599,6 @@ impl Eou {
     }
 }
 
-
 #[cfg(test)]
 mod stream_tests {
     use super::*;
@@ -614,7 +607,10 @@ mod stream_tests {
 
     fn read_f32(st: &SafeTensors, key: &str) -> Result<Vec<f32>> {
         let tensor = st.tensor(key)?;
-        ensure!(tensor.dtype() == safetensors::Dtype::F32, "tensor {key} dtype");
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::F32,
+            "tensor {key} dtype"
+        );
         let bytes = tensor.data();
         Ok(bytes
             .as_chunks::<4>()
@@ -626,7 +622,10 @@ mod stream_tests {
 
     fn read_i64(st: &SafeTensors, key: &str) -> Result<Vec<i64>> {
         let tensor = st.tensor(key)?;
-        ensure!(tensor.dtype() == safetensors::Dtype::I64, "tensor {key} dtype");
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::I64,
+            "tensor {key} dtype"
+        );
         let bytes = tensor.data();
         Ok(bytes
             .as_chunks::<8>()
@@ -655,9 +654,8 @@ mod stream_tests {
     #[test]
     #[ignore = "requires GPU lease; set FF_EOU_NEMO, FF_EOU_FROZEN, FF_EOU_ARM"]
     fn eou_streaming_matches_frozen_reference() -> Result<()> {
-        let nemo = std::path::PathBuf::from(
-            std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?,
-        );
+        let nemo =
+            std::path::PathBuf::from(std::env::var("FF_EOU_NEMO").context("FF_EOU_NEMO missing")?);
         let frozen = std::path::PathBuf::from(
             std::env::var("FF_EOU_FROZEN").context("FF_EOU_FROZEN missing")?,
         );
@@ -677,10 +675,12 @@ mod stream_tests {
             let mut session = engine.encoder.eou_stream()?;
             let mut window = vec![0f32; 25 * mel_bins];
             window[..9 * mel_bins].copy_from_slice(&features[..9 * mel_bins]);
-            let s0 = engine.encoder.eou_encode_step(&mut session, &window[..9 * mel_bins])?;
+            let s0 = engine
+                .encoder
+                .eou_encode_step(&mut session, &window[..9 * mel_bins], 2)?;
             window[..8 * mel_bins].fill(0.0);
             window[8 * mel_bins..].copy_from_slice(&features[..17 * mel_bins]);
-            let s1 = engine.encoder.eou_encode_step(&mut session, &window)?;
+            let s1 = engine.encoder.eou_encode_step(&mut session, &window, 2)?;
             let cell_bytes = std::fs::read(arm.join("CPU-r1/media/clipA.safetensors"))?;
             let cell_st = SafeTensors::deserialize(&cell_bytes)?;
             let ref0 = read_f32(&cell_st, "stream_step0_enc_out")?;
@@ -696,18 +696,14 @@ mod stream_tests {
         let utterances = engine.stream_decode(&features)?;
         let bytes = std::fs::read(arm.join("CPU-r1/media/clipA.safetensors"))?;
         let st = SafeTensors::deserialize(&bytes)?;
-        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            arm.join("CPU-r1/stream-report.json"),
-        )?)?;
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(arm.join("CPU-r1/stream-report.json"))?)?;
         let expected_counts: Vec<usize> = report["clipA"]["utterance_token_counts"]
             .as_array()
             .context("utterance counts")?
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
-        for (index, tokens) in utterances.iter().enumerate() {
-            println!("EOU_S3_MINE utt={index} tokens={}", tokens.len());
-        }
         ensure!(
             utterances.len() == expected_counts.len(),
             "EOU stream utterances {} against {}",
@@ -734,7 +730,10 @@ mod stream_tests {
                 tokens.len()
             );
         }
-        println!("EOU_S3_STREAM_GATE PASS clip=clipA utterances={}", utterances.len());
+        println!(
+            "EOU_S3_STREAM_GATE PASS clip=clipA utterances={}",
+            utterances.len()
+        );
         Ok(())
     }
 }

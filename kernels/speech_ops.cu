@@ -146,18 +146,20 @@ extern "C" __global__ void speech_residual_f32(
 // Relative row is rows-1-query+key into a table of length 2*key_rows-1.
 // chunk_size 0 attends every valid key. A positive chunk_size keeps an absolute key when
 // its chunk index is in [q_abs/chunk - left_chunks, q_abs/chunk + right_chunks].
+// Keys at or beyond valid_keys are excluded from attention; their own query rows
+// still compute over the valid keys.
 extern "C" __global__ void speech_relative_attention_f32(
     const float* q, const float* k, const float* v, const float* relative,
     const float* bias_u, const float* bias_v, const uint8_t* mask, float* output,
     uint32_t rows, uint32_t heads, uint32_t head_dim, float scaling, uint32_t chunk_size, uint32_t left_chunks,
-    uint32_t right_chunks, uint32_t key_rows, uint32_t query_offset, uint32_t kv_offset) {
+    uint32_t right_chunks, uint32_t key_rows, uint32_t query_offset, uint32_t kv_offset, uint32_t valid_keys) {
     extern __shared__ float shared[];
     float* reduction = shared;
     float* probabilities = shared + 8;
     if (blockDim.x != 128 || gridDim.x != rows || gridDim.y != heads || gridDim.z != 1 ||
         !q || !k || !v || !relative || !bias_u || !bias_v || !mask || !output ||
-        !rows || !key_rows || !heads || !head_dim || head_dim > 128 || (128 % head_dim) != 0 || !(scaling > 0.0f) || right_chunks > 1 ||
-        key_rows < rows || (chunk_size == 0 && right_chunks != 0) ||
+        !rows || !key_rows || !valid_keys || !heads || !head_dim || head_dim > 128 || (128 % head_dim) != 0 || !(scaling > 0.0f) || right_chunks > 1 ||
+        key_rows < rows || valid_keys > key_rows || (chunk_size == 0 && right_chunks != 0) ||
         (chunk_size == 0 && (query_offset != 0 || kv_offset != 0 || key_rows != rows))) {
         __trap(); return;
     }
@@ -166,7 +168,7 @@ extern "C" __global__ void speech_relative_attention_f32(
     const bool active = d < head_dim;
     const uint32_t query_mask = key_rows - rows + query;
     const uint8_t query_valid = mask[query_mask];
-    uint32_t key_begin = 0, key_end = key_rows;
+    uint32_t key_begin = 0, key_end = valid_keys;
     if (chunk_size != 0) {
         const uint32_t q_abs = query_offset + query;
         const uint32_t query_chunk = q_abs / chunk_size;
@@ -179,7 +181,8 @@ extern "C" __global__ void speech_relative_attention_f32(
         }
         if (end_abs > kv_offset) {
             const uint64_t local = end_abs - kv_offset;
-            key_end = local > key_rows ? key_rows : uint32_t(local);
+            const uint32_t window_end = local > key_rows ? key_rows : uint32_t(local);
+            key_end = window_end < key_end ? window_end : key_end;
         } else {
             key_end = 0;
         }
