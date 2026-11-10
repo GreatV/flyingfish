@@ -3116,6 +3116,137 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted"]
+    fn decoded_rgb_is_byte_invariant_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        device.finish_upload()?;
+        let kernel =
+            cubin::module(&device.ctx, "vision_ops")?.load_function("planar_bf16_to_rgb_u8")?;
+        let (mean, std) = (
+            crate::minimax_h3::VAE_PIXEL_MEAN.map(|v| v as f32),
+            crate::minimax_h3::VAE_PIXEL_STD.map(|v| v as f32),
+        );
+        let convert = |input, output, shape, affine| {
+            super::vae::planar_bf16_to_rgb_u8(&device, &kernel, input, output, shape, affine)
+        };
+        let mut cells = 0;
+        let mut defects = 0;
+        let mut control_differences = 0;
+        for (frames, allocated, pixels) in [
+            (1usize, 1usize, 1usize),
+            (2, 3, 17),
+            (3, 5, 257),
+            (1, 1, 65536),
+            (124, 124, 768 * 1344),
+            (192, 192, 768 * 1344),
+        ] {
+            let plane = allocated * pixels;
+            let count = 3 * frames * pixels;
+            let guard = bf16::from_f32(-23.0);
+            let mut host = vec![guard; 3 * plane + 6];
+            for c in 0..3 {
+                for i in 0..plane {
+                    host[3 + c * plane + i] = if pixels == 65536 {
+                        bf16::from_bits(((i * 73 + c * 1009) % 65536) as u16)
+                    } else {
+                        bf16::from_f32(
+                            ((i * 73 + i / pixels * 37 + c * 101) % 251) as f32 / 31.0 - 4.0,
+                        )
+                    };
+                }
+            }
+            let input = s.clone_htod(&host)?;
+            let output = s.clone_htod(&vec![0xa5u8; count + 14])?;
+            super::vae::planar_bf16_to_rgb_u8(
+                &device,
+                &kernel,
+                &input.slice(3..3 + 3 * plane),
+                &output.slice(7..7 + count),
+                (frames, allocated, pixels),
+                (mean, std),
+            )?;
+            let observed = s.clone_dtoh(&output)?;
+            ensure!(
+                observed[..7]
+                    .iter()
+                    .chain(&observed[count + 7..])
+                    .all(|&v| v == 0xa5),
+                "RGB output guard changed"
+            );
+            ensure!(
+                s.clone_dtoh(&input.slice(..3))? == [guard; 3]
+                    && s.clone_dtoh(&input.slice(3 + 3 * plane..))? == [guard; 3],
+                "RGB input guard changed"
+            );
+            let mut differences = 0usize;
+            for (i, &actual) in observed[7..7 + count].iter().enumerate() {
+                let c = i % 3;
+                let v = (host[3 + c * plane + i / 3].to_f32() * std[c] + mean[c]).clamp(0.0, 1.0)
+                    * 255.0;
+                let expected = v.round_ties_even() as u8;
+                differences += usize::from(actual != expected);
+                if pixels == 65536 {
+                    control_differences += usize::from(actual != v as u8);
+                }
+            }
+            defects += usize::from(differences != 0);
+            cells += 1;
+            println!(
+                "H3_RGB_IDENTITY frames={frames} allocated_frames={allocated} pixels={pixels} elements={count} byte_differences={differences} byte_limit=0 guards=true"
+            );
+        }
+        let input = s.alloc_zeros::<bf16>(9)?;
+        let output = s.alloc_zeros::<u8>(9)?;
+        let invalid = [
+            (0, 1, 1),
+            (2, 1, 1),
+            (1, 1, 0),
+            (1, 1, 4),
+            (1, usize::MAX, 2),
+            (usize::MAX, usize::MAX, 1),
+        ];
+        for shape in invalid {
+            ensure!(
+                convert(&input, &output, shape, (mean, std)).is_err(),
+                "RGB invalid extent accepted: {shape:?}"
+            );
+        }
+        ensure!(
+            super::vae::planar_bf16_to_rgb_u8(
+                &device,
+                &kernel,
+                &input,
+                &output.slice(..2),
+                (1, 1, 1),
+                (mean, std)
+            )
+            .is_err(),
+            "RGB short output accepted"
+        );
+        ensure!(
+            convert(&input, &output, (1, 1, 1), ([f32::NAN; 3], std)).is_err(),
+            "RGB nonfinite affine accepted"
+        );
+        ensure!(
+            control_differences > 0,
+            "RGB truncation control did not discriminate"
+        );
+        println!(
+            "H3_RGB_CONTROL nearest_even_to_truncation byte_differences={control_differences} status=FAIL_AS_REQUIRED"
+        );
+        println!(
+            "H3_RGB_GATE cells={cells} defects={defects} byte_limit=0 invalid_extents=8 exhaustive_patterns_per_channel=65536 channels=3"
+        );
+        ensure!(defects == 0, "H3_RGB_GATE DEFECT cells={defects}");
+        Ok(())
+    }
+
     /// Fused RMSNorm and indexed modulation preserve the five BF16 rounding boundaries.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted"]

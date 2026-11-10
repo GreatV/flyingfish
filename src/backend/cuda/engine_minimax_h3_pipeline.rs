@@ -16,8 +16,8 @@ use crate::backend::gpu::CudaSlice;
 use crate::checkpoint::{LoadPolicy, MappedCheckpoint, TensorManifest};
 use crate::minimax_h3::{
     AdalnPlan, AudioVaeSpec, Geometry, H3Output, H3Request, H3Spec, KEYFRAME_NOISE_AUG,
-    KeyframeAnchor, PackedLayout, Schedule, TEXT_ENCODER_LAYER, VAE_PIXEL_MEAN, VAE_PIXEL_STD,
-    VaeSpec, VaeTiles, row_timestep_plan,
+    KeyframeAnchor, PackedLayout, Schedule, TEXT_ENCODER_LAYER, VaeSpec, VaeTiles,
+    row_timestep_plan,
 };
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -497,27 +497,16 @@ fn run_mode<const SETUP_ONLY: bool>(
         "decoded {frames} frames, resolved geometry has {}",
         geometry.frames
     );
-    let decoded = s.clone_dtoh(&decoded)?;
-    drop((work, decoder, latents_device));
+    drop((work, latents_device));
+    #[cfg(test)]
+    let video_decoded = s.clone_dtoh(&decoded)?;
+    let rgb = decoder.rgb(&device, &decoded, (frames, total_frames, pixels))?;
+    let video_u8 = s.clone_dtoh(&rgb)?;
+    drop((rgb, decoded, decoder));
     let audio_decoder = AudioDecoder::new(&device, &audio_spec, &audio_dir, &audio_manifest)?;
     let audio_device = s.clone_htod(&audio_latents)?;
     let pcm = s.clone_dtoh(&audio_decoder.decode((s, &blas), &audio_device, (2, latents))?)?;
 
-    let (mean, std) = (
-        VAE_PIXEL_MEAN.map(|v| v as f32),
-        VAE_PIXEL_STD.map(|v| v as f32),
-    );
-    let channels = vae.out_channels;
-    let mut video_u8 = vec![0u8; frames * pixels * channels];
-    for c in 0..channels {
-        for f in 0..frames {
-            let base = (c * total_frames + f) * pixels;
-            for p in 0..pixels {
-                let v = (decoded[base + p].to_f32() * std[c] + mean[c]).clamp(0.0, 1.0);
-                video_u8[(f * pixels + p) * channels + c] = (v * 255.0).round_ties_even() as u8;
-            }
-        }
-    }
     Ok(Generated {
         output: H3Output {
             frames,
@@ -534,8 +523,14 @@ fn run_mode<const SETUP_ONLY: bool>(
         audio_latents: (vec![2, ac, latents], audio_latents),
         #[cfg(test)]
         video_decoded: (
-            vec![1, channels, total_frames, request.height, request.width],
-            decoded,
+            vec![
+                1,
+                vae.out_channels,
+                total_frames,
+                request.height,
+                request.width,
+            ],
+            video_decoded,
         ),
     })
 }

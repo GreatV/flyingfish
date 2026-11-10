@@ -191,6 +191,26 @@ extern "C" __global__ void vision_affine_cast_bf16(
     }
 }
 
+// Input [3, allocated_frames, pixels], output [frames * pixels, 3].
+extern "C" __global__ void planar_bf16_to_rgb_u8(
+    const __nv_bfloat16* input, uint8_t* output, uint64_t allocated_frames, uint64_t frames,
+    uint64_t pixels, float mean0, float mean1, float mean2, float std0, float std1, float std2) {
+    if (!vision_flat_launch() || !input || !output || !frames || frames > allocated_frames || !pixels ||
+        !isfinite(mean0) || !isfinite(mean1) || !isfinite(mean2) ||
+        !isfinite(std0) || !isfinite(std1) || !isfinite(std2)) { __trap(); return; }
+    const float mean[3] = {mean0, mean1, mean2}, scale[3] = {std0, std1, std2};
+    const uint64_t plane = allocated_frames * pixels, count = frames * pixels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        #pragma unroll
+        for (uint32_t c = 0; c < 3; ++c) {
+            const float value = __fadd_rn(__fmul_rn(__bfloat162float(input[uint64_t(c) * plane + i]), scale[c]), mean[c]);
+            const float clamped = fminf(1.0f, fmaxf(0.0f, value));
+            output[3 * i + c] = isnan(value) ? 0 : uint8_t(__float2uint_rn(__fmul_rn(clamped, 255.0f)));
+        }
+    }
+}
+
 extern "C" __global__ void vision_clamp_bf16(
     const __nv_bfloat16* input, __nv_bfloat16* output, uint64_t count,
     const __nv_bfloat16* lower, const __nv_bfloat16* upper) {
