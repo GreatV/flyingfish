@@ -368,6 +368,14 @@ impl VideoDecoder {
         decoded: &CudaSlice<bf16>,
         shape: (usize, usize, usize),
     ) -> Result<CudaSlice<u8>> {
+        ensure!(
+            self.spec.out_channels == 3,
+            "RGB conversion requires three decoder channels"
+        );
+        ensure!(
+            shape.0 > 0 && shape.0 <= shape.1 && shape.2 > 0,
+            "invalid RGB conversion shape {shape:?}"
+        );
         let bytes = shape
             .0
             .checked_mul(shape.2)
@@ -381,7 +389,8 @@ impl VideoDecoder {
             bytes <= budget,
             "RGB output {bytes} B exceeds conversion budget {budget} B"
         );
-        let output = device.stream.alloc_zeros::<u8>(bytes)?;
+        // Every output byte is written by planar_bf16_to_rgb_u8 before transfer.
+        let output = unsafe { device.stream.alloc::<u8>(bytes)? };
         planar_bf16_to_rgb_u8(
             device,
             &self.kernels.rgb,
