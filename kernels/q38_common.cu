@@ -1307,6 +1307,90 @@ extern "C" __global__ void q38_layer_norm_f16_fma(
     q38_layer_norm_f32_impl<__half, __half, true>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
 
+template <int UPDATE>
+__device__ __forceinline__ void layer_norm_row_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* output,
+    uint32_t rows, uint32_t width, float eps) {
+    if (!hidden || !modulation || !output || !rows || !width || width > 2304 ||
+        blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != rows || gridDim.y != 1 || gridDim.z != 1 || !(eps > 0) ||
+        (UPDATE != 0 && !projected) || (UPDATE == 1 && (!weight || !bias))) {
+        __trap(); return;
+    }
+    const uint64_t base = uint64_t(blockIdx.x) * width;
+    float values[9];
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        const uint32_t d = threadIdx.x + 256 * i;
+        if (d < width) {
+            __half value = hidden[base + d];
+            if constexpr (UPDATE != 0) {
+                __half delta = projected[base + d];
+                if constexpr (UPDATE == 1) {
+                    const __half gate = __float2half_rn(modulation[d]);
+                    delta = __float2half_rn(__fmul_rn(__half2float(gate), __half2float(delta)));
+                }
+                value = __float2half_rn(__fadd_rn(__half2float(value), __half2float(delta)));
+                hidden[base + d] = value;
+            }
+            values[i] = __half2float(value);
+            sum = __fadd_rn(sum, values[i]);
+        }
+    }
+    __shared__ float partial[8];
+    const float mean = block_sum(sum, partial) / float(width);
+    __syncthreads();
+    float variance = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        if (threadIdx.x + 256 * i < width) {
+            const float delta = __fsub_rn(values[i], mean);
+            variance = __fadd_rn(variance, __fmul_rn(delta, delta));
+        }
+    }
+    const float inv = __fdiv_rn(1.0f,
+        __fsqrt_rn(__fadd_rn(block_sum(variance, partial) / float(width), eps)));
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        const uint32_t d = threadIdx.x + 256 * i;
+        if (d < width) {
+            float normalized = __fmul_rn(__fsub_rn(values[i], mean), inv);
+            if constexpr (UPDATE == 1) normalized = __fmaf_rn(normalized, weight[d], bias[d]);
+            __half value = __float2half_rn(normalized);
+            if constexpr (UPDATE != 1) {
+                const __half one_plus = __float2half_rn(__fadd_rn(1.0f, modulation[width + d]));
+                const __half scaled = __float2half_rn(__fmul_rn(__half2float(value), __half2float(one_plus)));
+                const __half shift = __float2half_rn(modulation[d]);
+                value = __float2half_rn(__fadd_rn(__half2float(scaled), __half2float(shift)));
+            }
+            output[base + d] = value;
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 6) void layer_norm_modulate_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* output,
+    uint32_t rows, uint32_t width, float eps) {
+    layer_norm_row_f16<0>(hidden, projected, modulation, weight, bias, output, rows, width, eps);
+}
+
+extern "C" __global__ __launch_bounds__(256, 6) void gated_add_layer_norm_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* output,
+    uint32_t rows, uint32_t width, float eps) {
+    layer_norm_row_f16<1>(hidden, projected, modulation, weight, bias, output, rows, width, eps);
+}
+
+extern "C" __global__ __launch_bounds__(256, 6) void residual_layer_norm_modulate_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* output,
+    uint32_t rows, uint32_t width, float eps) {
+    layer_norm_row_f16<2>(hidden, projected, modulation, weight, bias, output, rows, width, eps);
+}
+
 // Per-span row mean: x is [rows, width] BF16, spans given by begins/ends
 // (int per span, half-open); out is [spans, width] BF16 with F32 accumulation.
 // grid (spans, ceil(width/256)), block 256.

@@ -5303,6 +5303,290 @@ fn hi3d_qkv_preparation_identity_gpu() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and FF_F16_ROW_NORM_FIXTURES"]
+fn hi3d_row_norm_identity_gpu() -> Result<()> {
+    use cudarc::driver::sys::{self, CUfunction_attribute as F};
+    let fixture: Value = serde_json::from_slice(&std::fs::read(
+        env_path("FF_F16_ROW_NORM_FIXTURES")?.join("rows.json"),
+    )?)?;
+    let models = fixture["models"]
+        .as_array()
+        .context("row model inputs missing")?;
+    ensure!(models.len() == 2, "row fixture requires both models");
+    let device = Device::new(0)?;
+    let mut defects = 0;
+    let mut cells = 0;
+    let mut controls = 0;
+    for (component, model) in ["transformer_512", "transformer_1024"]
+        .into_iter()
+        .zip(models)
+    {
+        ensure!(model["component"] == component, "row fixture model differs");
+        let spec: crate::pixal3d::Hi3DFlowSpec = serde_json::from_value(model["config"].clone())?;
+        ensure!(
+            spec.model_channels == 2112 && spec.num_heads == 22 && spec.num_blocks == 24,
+            "row fusion published geometry differs"
+        );
+        let kernels = Kernels::load::<f16>(&device, &spec.flow_spec())?;
+        let functions = kernels.row_norm.as_ref().context("row kernels missing")?;
+        let old_warps = kernels
+            .norm
+            .occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?
+            * 8;
+        for (site, kernel) in functions.iter().enumerate() {
+            let local = kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+            let shared = kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+            let blocks = kernel.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?;
+            ensure!(
+                local == 0 && blocks * 8 >= old_warps,
+                "row fusion resource defect"
+            );
+            println!(
+                "F16_ROW_NORM_RESOURCE site={site} registers={} local_bytes={local} shared_bytes={shared} active_blocks={blocks} active_warps={} old_ln_warps={old_warps}",
+                kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+                blocks * 8
+            );
+        }
+        let blocks = model["blocks"]
+            .as_array()
+            .context("row fixture blocks missing")?;
+        ensure!(
+            blocks.len() == 2,
+            "row fixture requires first and last block"
+        );
+        for (block, input) in [0, 23].into_iter().zip(blocks) {
+            ensure!(input["index"] == block, "row fixture block differs");
+            let parameter = |name: &str, shape: &[usize]| -> Result<CudaSlice<f32>> {
+                ensure!(
+                    input[name]["shape"] == serde_json::json!(shape),
+                    "row fusion parameter shape differs"
+                );
+                let values = input[name]["values"]
+                    .as_array()
+                    .context("row parameters missing")?
+                    .iter()
+                    .map(|v| Ok(v.as_f64().context("row parameter nonnumeric")? as f32))
+                    .collect::<Result<Vec<_>>>()?;
+                ensure!(
+                    values.len() == shape.iter().product::<usize>(),
+                    "row parameter extent differs"
+                );
+                ensure!(
+                    values.iter().all(|v| v.is_finite()),
+                    "nonfinite row parameters"
+                );
+                Ok(device.stream.clone_htod(&values)?)
+            };
+            let modulation = parameter("modulation", &[1, 12672])?;
+            let weight = parameter("norm2.weight", &[2112])?;
+            let bias = parameter("norm2.bias", &[2112])?;
+            for rows in [1usize, 3, 31, 33, 2548, 13019, 22775] {
+                let count = rows * 2112;
+                let hidden = (0..count)
+                    .map(|i| match i % 101 {
+                        0 => f16::from_bits(1 + (i % 31) as u16),
+                        1 => f16::from_bits(if i & 1 == 0 { 0 } else { 0x8000 }),
+                        _ => f16::from_f32(((i * 37 % 97) as f32 - 48.0) / 31.0),
+                    })
+                    .collect::<Vec<_>>();
+                let projected = (0..count)
+                    .map(|i| f16::from_f32(((i * 23 % 97) as f32 - 48.0) / 53.0))
+                    .collect::<Vec<_>>();
+                let delta = device.stream.clone_htod(&projected)?;
+                let row_index = device.stream.alloc_zeros::<u32>(rows)?;
+                let sentinel = f16::from_f32(-123.0);
+                let row_modulate = |values: u64, part: usize| -> Result<()> {
+                    let shift = ptr(&modulation, &device) + (part * 2112 * 4) as u64;
+                    let scale = shift + (2112 * 4) as u64;
+                    unsafe {
+                        device
+                            .stream
+                            .launch_builder(&kernels.modulate)
+                            .arg(&values)
+                            .arg(&shift)
+                            .arg(&scale)
+                            .arg(&row_index)
+                            .arg(&values)
+                            .arg(&(rows as i32))
+                            .arg(&2112i32)
+                            .arg(&(6u64 * 2112))
+                            .arg(&1u32)
+                            .launch(crate::backend::gpu::LaunchConfig {
+                                grid_dim: (rows as u32, 9, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                    Ok(())
+                };
+                for site in 0..3 {
+                    let mut initial = hidden.clone();
+                    initial.extend([sentinel; 8]);
+                    let expected_hidden = device.stream.clone_htod(&initial)?;
+                    let mut actual_hidden = device.stream.clone_htod(&initial)?;
+                    let expected = device.stream.clone_htod(&vec![sentinel; count + 8])?;
+                    let actual = device.stream.clone_htod(&vec![sentinel; count + 8])?;
+                    let hp = ptr(&expected_hidden, &device);
+                    let output = ptr(&expected, &device);
+                    if site == 1 {
+                        let gate = ptr(&modulation, &device) + (2 * 2112 * 4) as u64;
+                        unsafe {
+                            device
+                                .stream
+                                .launch_builder(&kernels.gated)
+                                .arg(&hp)
+                                .arg(&delta)
+                                .arg(&gate)
+                                .arg(&row_index)
+                                .arg(&(rows as i32))
+                                .arg(&2112i32)
+                                .arg(&(6u64 * 2112))
+                                .arg(&1u32)
+                                .launch(crate::backend::gpu::LaunchConfig {
+                                    grid_dim: (rows as u32, 9, 1),
+                                    block_dim: (256, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })?;
+                        }
+                    } else if site == 2 {
+                        kernels.residual(&device, hp, ptr(&delta, &device), count)?;
+                    }
+                    let affine = if site == 1 {
+                        [ptr(&weight, &device), ptr(&bias, &device)]
+                    } else {
+                        [0, 0]
+                    };
+                    kernels.norm(&device, hp, output, [rows, 2112], affine, (1e-6, false))?;
+                    if site != 1 {
+                        row_modulate(output, if site == 0 { 0 } else { 3 })?;
+                    }
+                    let part = [0, 2, 3][site];
+                    let inputs = [
+                        ptr(&actual_hidden, &device),
+                        ptr(&delta, &device),
+                        ptr(&modulation, &device) + (part * 2112 * 4) as u64,
+                        affine[0],
+                        affine[1],
+                    ];
+                    let out = ptr(&actual, &device);
+                    kernels.prepare_row_norm(&device, inputs, out, [rows, 2112], site)?;
+                    let reference = [
+                        device.stream.clone_dtoh(&expected_hidden)?,
+                        device.stream.clone_dtoh(&expected)?,
+                    ];
+                    let eager = [
+                        device.stream.clone_dtoh(&actual_hidden)?,
+                        device.stream.clone_dtoh(&actual)?,
+                    ];
+                    ensure!(
+                        reference
+                            .iter()
+                            .chain(&eager)
+                            .all(|v| v[..count].iter().all(|x| x.is_finite())
+                                && v[count..].iter().all(|&x| x == sentinel)),
+                        "row fusion finite/guard failure"
+                    );
+                    let bits = |a: &[f16], b: &[f16]| -> u64 {
+                        a.iter()
+                            .zip(b)
+                            .map(|(x, y)| u64::from((x.to_bits() ^ y.to_bits()).count_ones()))
+                            .sum()
+                    };
+                    let hidden_bits = bits(&reference[0], &eager[0]);
+                    let norm_bits = bits(&reference[1], &eager[1]);
+                    device.stream.memcpy_htod(&initial, &mut actual_hidden)?;
+                    device.stream.begin_capture(
+                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    kernels.prepare_row_norm(&device, inputs, out, [rows, 2112], site)?;
+                    let graph = device
+                        .stream
+                        .end_capture(sys::CUgraphInstantiate_flags(0))?
+                        .context("row graph missing")?;
+                    let mut nodes = 0;
+                    unsafe {
+                        sys::cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut nodes)
+                            .result()?;
+                    }
+                    ensure!(nodes == 1, "row fusion graph must contain one kernel");
+                    let mut node = std::ptr::null_mut();
+                    let mut params = std::mem::MaybeUninit::uninit();
+                    unsafe {
+                        sys::cuGraphGetNodes(graph.cu_graph(), &mut node, &mut nodes).result()?;
+                        sys::cuGraphKernelNodeGetParams_v2(node, params.as_mut_ptr()).result()?;
+                        ensure!(
+                            params.assume_init().func == functions[site].cu_function(),
+                            "wrong row fusion kernel"
+                        );
+                    }
+                    graph.launch()?;
+                    let captured = [
+                        device.stream.clone_dtoh(&actual_hidden)?,
+                        device.stream.clone_dtoh(&actual)?,
+                    ];
+                    ensure!(
+                        captured
+                            .iter()
+                            .all(|v| v[..count].iter().all(|x| x.is_finite())
+                                && v[count..].iter().all(|&x| x == sentinel)),
+                        "row graph finite/guard failure"
+                    );
+                    let graph_bits =
+                        bits(&reference[0], &captured[0]) + bits(&reference[1], &captured[1]);
+                    let valid = hidden_bits == 0 && norm_bits == 0 && graph_bits == 0;
+                    defects += usize::from(!valid);
+                    println!(
+                        "{} F16_ROW_NORM_IDENTITY component={component} block={block} rows={rows} site={site} hidden_bits={hidden_bits} norm_bits={norm_bits} graph_bits={graph_bits} nodes={nodes} threshold_bits=0",
+                        if valid { "PASS" } else { "DEFECT" }
+                    );
+                    if controls == 0 && rows == 33 && site == 2 {
+                        let unrounded = hidden
+                            .iter()
+                            .zip(&projected)
+                            .map(|(a, b)| a.to_f32() + b.to_f32())
+                            .collect::<Vec<_>>();
+                        let unrounded = device.stream.clone_htod(&unrounded)?;
+                        let normalized = device.stream.alloc_zeros::<f32>(count)?;
+                        kernels.norm(
+                            &device,
+                            ptr(&unrounded, &device),
+                            ptr(&normalized, &device),
+                            [rows, 2112],
+                            [0, 0],
+                            (1e-6, true),
+                        )?;
+                        kernels.cast(&device, ptr(&normalized, &device), out, count)?;
+                        row_modulate(out, 3)?;
+                        let mutant = device.stream.clone_dtoh(&actual)?;
+                        let changed = bits(&reference[1][..count], &mutant[..count]);
+                        ensure!(
+                            mutant[..count].iter().all(|x| x.is_finite()),
+                            "nonfinite rounding control"
+                        );
+                        defects += usize::from(changed == 0);
+                        println!(
+                            "{} F16_ROW_NORM_ROUND_CONTROL omitted_hidden_round=true differing_bits={changed}",
+                            if changed > 0 { "PASS" } else { "DEFECT" }
+                        );
+                        controls += 1;
+                    }
+                    cells += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "F16_ROW_NORM_RESULT cells={cells} controls={controls} defects={defects} threshold_bits=0 eager_graph=true"
+    );
+    ensure!(
+        cells == 84 && controls == 1 && defects == 0,
+        "row fusion candidate defects"
+    );
+    Ok(())
+}
+
 fn flow_padded_identity(
     flow: &mut Flow<f16>,
     input: &CudaSlice<f32>,
@@ -5346,6 +5630,22 @@ fn flow_padded_identity(
         .sum();
     println!(
         "N5_F16_QKV_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} threshold_bits=0",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len()
+    );
+    *defects += usize::from(bits != 0);
+    flow.kernels.row_norm_reference = true;
+    flow.forward(input, 0, condition, output)?;
+    flow.kernels.row_norm_reference = false;
+    let separate = flow.device.stream.clone_dtoh(output)?;
+    let bits: u64 = compact
+        .iter()
+        .zip(&separate)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_ROW_NORM_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} threshold_bits=0",
         if bits == 0 { "PASS" } else { "DEFECT" },
         flow.rows,
         flow.blocks.len()
