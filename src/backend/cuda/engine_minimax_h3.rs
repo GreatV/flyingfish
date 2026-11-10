@@ -1132,11 +1132,13 @@ pub(crate) fn block_forward(
             },
         )
     };
+    let xp = pointer(x, s);
+    let normed = pointer(&work.normed, s);
     let hidden_norm = |weight: &CudaSlice<bf16>, shift: usize, scale: usize| -> Result<()> {
         let n = NormRows {
-            input: pointer(x, s),
+            input: xp,
             weight: pointer(weight, s),
-            output: pointer(&work.normed, s),
+            output: normed,
             rows,
             dim: h,
             threads: HIDDEN_NORM_THREADS,
@@ -1147,7 +1149,7 @@ pub(crate) fn block_forward(
                 s,
                 n,
                 ModulateRows {
-                    data: pointer(&work.normed, s),
+                    data: normed,
                     shift: chunk(shift),
                     scale: chunk(scale),
                     index,
@@ -1194,9 +1196,6 @@ pub(crate) fn block_forward(
             &mut TensorMut(y),
         )
     };
-    let xp = pointer(x, s);
-    let normed = pointer(&work.normed, s);
-
     hidden_norm(&w.norm1, 0, 1)?;
     for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
         base(
