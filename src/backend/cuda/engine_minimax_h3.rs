@@ -6155,131 +6155,137 @@ mod tests {
     }
 
     fn text_conditioner_gate(layers: usize) -> Result<()> {
-        let gate = TextGate::new(layers)?;
-        let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
-        let device = Device::new(0)?;
-        let ops = Ops::new(&device.ctx)?;
-        device.finish_upload()?;
-        let runtime = std::env::temp_dir().join(format!("ff-h3-text-{}", std::process::id()));
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-text-{}-{layers}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
-            &device,
-            &ops,
-            &runtime,
-            Rc::new(Closure::new(
-                true,
-                "MiniMax-H3 conditioner text gate".into(),
-            )),
-        )?;
-        let capacity = gate
-            .cells
-            .iter()
-            .map(|(_, c)| c.tokens.len())
-            .max()
-            .context("no cells")?;
-        let mut conditioner = Conditioner::new(
-            &device,
-            &gate.spec,
-            (layers, capacity, 0),
-            Source::new(&gate.encoder, &gate.manifest),
-            Placement::from_env()?,
-        )?;
-        let mut defects = Vec::new();
-        for (cell, inputs) in &gate.cells {
-            conditioner.prepare(&blas, inputs.tokens.len())?;
-            let map = mapped(
-                &gate
-                    .legs
-                    .join(format!("C-{cell}-fp32"))
-                    .join("conditioner.safetensors"),
+        let outcome = (|| -> Result<()> {
+            let gate = TextGate::new(layers)?;
+            let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
+            let device = Device::new(0)?;
+            let ops = Ops::new(&device.ctx)?;
+            device.finish_upload()?;
+            let blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(
+                    true,
+                    "MiniMax-H3 conditioner text gate".into(),
+                )),
             )?;
-            let reference = SafeTensors::deserialize(&map)?;
-            let merged = bf16_of(&reference, "vision.merged")?;
-            let deepstack = (0..3)
-                .map(|k| {
-                    Ok(device
-                        .stream
-                        .clone_htod(&bf16_of(&reference, &format!("vision.deepstack{k}"))?)?)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let embeds = conditioner_embeds(inputs, image_token, &gate.table, &merged, hidden)?;
-            let runs = image_runs(&inputs.tokens, image_token);
-            let rope = conditioner_rope(&gate.spec, inputs)?;
-            let input = ConditionerInput {
-                embeds: &embeds,
-                deepstack: &deepstack,
-                runs: &runs,
-                rope: &rope,
-            };
-            let mut taps = TEXT_TAPS.to_vec();
-            if layers == 51 {
-                taps.push(51);
-            }
-            let outputs = conditioner.forward(&device.stream, &blas, &input, &taps)?;
-            if !gate.score(cell, ("T", "text"), &outputs[..4], &TEXT_TAPS)? {
-                defects.push(*cell);
-            }
-            if let Some(root) = std::env::var_os("FF_H3_CAPTURE") {
-                let root = PathBuf::from(root);
-                fs::create_dir_all(&root)?;
-                let bytes: Vec<_> = outputs[3]
-                    .iter()
-                    .flat_map(|v| v.to_bits().to_le_bytes())
-                    .collect();
-                fs::write(root.join(format!("text-{cell}-tap50.bf16")), &bytes)?;
-                if let Some(parent) = std::env::var_os("FF_H3_REPLAY") {
-                    let expected =
-                        fs::read(PathBuf::from(parent).join(format!("text-{cell}-tap50.bf16")))?;
-                    ensure!(
-                        bytes.len() == expected.len(),
-                        "text parent tap extent differs"
-                    );
-                    let differences = bytes
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .zip(expected.as_chunks::<2>().0)
-                        .filter(|(a, b)| a != b)
-                        .count();
-                    println!(
-                        "H3_TEXT_PAIRED cell={cell} layers={layers} tap50_bit_differences={differences} bound=0"
-                    );
-                    if differences != 0 {
-                        defects.push(*cell);
-                    }
-                }
-            }
-            if *cell == "A" {
-                if layers == 51 {
-                    ensure!(
-                        !gate.score(cell, ("T", "text"), &outputs[4..], &[50])?,
-                        "hidden_states[51] passed the hidden_states[50] cell"
-                    );
-                }
-                let flat = ConditionerInput {
-                    deepstack: &[],
-                    ..input
+            let capacity = gate
+                .cells
+                .iter()
+                .map(|(_, c)| c.tokens.len())
+                .max()
+                .context("no cells")?;
+            let mut conditioner = Conditioner::new(
+                &device,
+                &gate.spec,
+                (layers, capacity, 0),
+                Source::new(&gate.encoder, &gate.manifest),
+                Placement::from_env()?,
+            )?;
+            let mut defects = Vec::new();
+            for (cell, inputs) in &gate.cells {
+                conditioner.prepare(&blas, inputs.tokens.len())?;
+                let map = mapped(
+                    &gate
+                        .legs
+                        .join(format!("C-{cell}-fp32"))
+                        .join("conditioner.safetensors"),
+                )?;
+                let reference = SafeTensors::deserialize(&map)?;
+                let merged = bf16_of(&reference, "vision.merged")?;
+                let deepstack = (0..3)
+                    .map(|k| {
+                        Ok(device
+                            .stream
+                            .clone_htod(&bf16_of(&reference, &format!("vision.deepstack{k}"))?)?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let embeds = conditioner_embeds(inputs, image_token, &gate.table, &merged, hidden)?;
+                let runs = image_runs(&inputs.tokens, image_token);
+                let rope = conditioner_rope(&gate.spec, inputs)?;
+                let input = ConditionerInput {
+                    embeds: &embeds,
+                    deepstack: &deepstack,
+                    runs: &runs,
+                    rope: &rope,
                 };
-                let outputs = conditioner.forward(&device.stream, &blas, &flat, &[50])?;
-                ensure!(
-                    !gate.score(cell, ("T", "text"), &outputs, &[50])?,
-                    "deepstack-off control passed cell A"
-                );
-                println!(
-                    "H3_TEXT controls cell=A layers={layers} tap51={} deepstack_off=FAIL as required",
-                    if layers == 51 {
-                        "FAIL"
-                    } else {
-                        "not_requested"
+                let mut taps = TEXT_TAPS.to_vec();
+                if layers == 51 {
+                    taps.push(51);
+                }
+                let outputs = conditioner.forward(&device.stream, &blas, &input, &taps)?;
+                if !gate.score(cell, ("T", "text"), &outputs[..4], &TEXT_TAPS)? {
+                    defects.push(*cell);
+                }
+                if let Some(root) = std::env::var_os("FF_H3_CAPTURE") {
+                    let root = PathBuf::from(root);
+                    fs::create_dir_all(&root)?;
+                    let bytes: Vec<_> = outputs[3]
+                        .iter()
+                        .flat_map(|v| v.to_bits().to_le_bytes())
+                        .collect();
+                    fs::write(root.join(format!("text-{cell}-tap50.bf16")), &bytes)?;
+                    if let Some(parent) = std::env::var_os("FF_H3_REPLAY") {
+                        let expected = fs::read(
+                            PathBuf::from(parent).join(format!("text-{cell}-tap50.bf16")),
+                        )?;
+                        ensure!(
+                            bytes.len() == expected.len(),
+                            "text parent tap extent differs"
+                        );
+                        let differences = bytes
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .zip(expected.as_chunks::<2>().0)
+                            .filter(|(a, b)| a != b)
+                            .count();
+                        println!(
+                            "H3_TEXT_PAIRED cell={cell} layers={layers} tap50_bit_differences={differences} bound=0"
+                        );
+                        if differences != 0 {
+                            defects.push(*cell);
+                        }
                     }
-                );
+                }
+                if *cell == "A" {
+                    if layers == 51 {
+                        ensure!(
+                            !gate.score(cell, ("T", "text"), &outputs[4..], &[50])?,
+                            "hidden_states[51] passed the hidden_states[50] cell"
+                        );
+                    }
+                    let flat = ConditionerInput {
+                        deepstack: &[],
+                        ..input
+                    };
+                    let outputs = conditioner.forward(&device.stream, &blas, &flat, &[50])?;
+                    ensure!(
+                        !gate.score(cell, ("T", "text"), &outputs, &[50])?,
+                        "deepstack-off control passed cell A"
+                    );
+                    println!(
+                        "H3_TEXT controls cell=A layers={layers} tap51={} deepstack_off=FAIL as required",
+                        if layers == 51 {
+                            "FAIL"
+                        } else {
+                            "not_requested"
+                        }
+                    );
+                }
             }
-        }
-        if !defects.is_empty() {
-            bail!("H3_TEXT_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
-        }
-        println!("H3_TEXT_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
-        Ok(())
+            if !defects.is_empty() {
+                bail!("H3_TEXT_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+            }
+            println!("H3_TEXT_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+            Ok(())
+        })();
+        fs::remove_dir_all(&runtime)?;
+        outcome
     }
 
     /// N6d gate: the native vision tower on the captured `pixel_values` feeds the native decoder layers 0-49 (merged
