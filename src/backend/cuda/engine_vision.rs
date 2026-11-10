@@ -6521,6 +6521,167 @@ impl DinoV3Encoder {
 }
 
 #[cfg(feature = "cuda")]
+pub struct TrellisImageConditioner {
+    stream: Arc<CudaStream>,
+    encoder: DinoEncoder<f32>,
+    workspace: DinoWorkspace<f32>,
+    capture: Vec<CudaSlice<f32>>,
+    pub allocated_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+pub struct TrellisConditioningStages {
+    pub embedding: Vec<f32>,
+    pub blocks: Vec<(usize, Vec<f32>)>,
+    pub final_hidden: Vec<f32>,
+    pub features: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl TrellisImageConditioner {
+    pub fn load(
+        device: &Device,
+        blas: &mut Blas,
+        dino_dir: &std::path::Path,
+        image_side: u32,
+        captured_blocks: &[usize],
+        limit: usize,
+    ) -> Result<Self> {
+        device.finish_upload()?;
+        let (free_before, total) = device.ctx.mem_get_info()?;
+        ensure!(
+            limit > 0 && limit <= total,
+            "invalid image conditioner device limit"
+        );
+        let cfg = VisionEncoderConfig::from_dir(dino_dir)?;
+        ensure!(
+            cfg.model_type == "dinov3_vit",
+            "TRELLIS.2 image encoder family mismatch"
+        );
+        let rows = cfg.total_rows(image_side)? as usize * cfg.hidden_size as usize;
+        let live = cfg.expected_loaded_elements() * 4
+            + cfg.workspace_bytes(image_side)?
+            + rows * 4
+            + (1 + captured_blocks.len()) * rows * 4;
+        device.workspace_budget(free_before, limit, live)?;
+        let file = std::fs::File::open(dino_dir.join("model.safetensors"))?;
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let (encoder, workspace) = DinoEncoder::<f32>::load(
+            device,
+            blas,
+            CommonOpsRef::new(&device.ctx)?,
+            cfg,
+            image_side,
+            &map,
+            false,
+        )?;
+        let capture = (0..1 + captured_blocks.len())
+            .map(|_| device.stream.alloc_zeros::<f32>(rows))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (free_after, _) = device.ctx.mem_get_info()?;
+        ensure!(
+            free_before - free_after <= limit,
+            "image conditioner exceeded whole-request device limit"
+        );
+        Ok(Self {
+            stream: device.stream.clone(),
+            encoder,
+            workspace,
+            capture,
+            allocated_bytes: free_before - free_after,
+        })
+    }
+
+    /// `embedding` is the embeddings module output, `blocks` holds the requested layer
+    /// outputs, `final_hidden` the last layer output, `features` the per-token unit-norm
+    /// output (definition image_feature_extractor.py:81-92,118).
+    pub fn stage(&mut self, chw_f32: &[f32]) -> Result<()> {
+        self.encoder
+            .stage_input(&self.stream, &mut self.workspace, chw_f32)
+    }
+
+    pub fn compute(&mut self, blas: &Blas, captured_blocks: &[usize]) -> Result<()> {
+        self.encoder
+            .embed(&self.stream, blas, &mut self.workspace)?;
+        let last = self.encoder.layers.len() - 1;
+        {
+            let capture = &mut self.capture;
+            let stream = &self.stream;
+            stream.memcpy_dtod(&self.workspace.x_a, &mut capture[0])?;
+            let mut slot = 1usize;
+            let mut tap = |index: usize, values: &CudaSlice<f32>| -> Result<()> {
+                if index != last && captured_blocks.contains(&index) {
+                    stream.memcpy_dtod(values, &mut capture[slot])?;
+                    slot += 1;
+                }
+                Ok(())
+            };
+            self.encoder.transform(
+                &self.stream,
+                blas,
+                &mut self.workspace,
+                None,
+                false,
+                Some(&mut tap),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn read_stages(&self, captured_blocks: &[usize]) -> Result<TrellisConditioningStages> {
+        let final_hidden = self.stream.clone_dtoh(&self.workspace.x_a)?.to_vec();
+        let features = self.stream.clone_dtoh(&self.workspace.feature1)?.to_vec();
+        let last = self.encoder.layers.len() - 1;
+        let embedding = self.stream.clone_dtoh(&self.capture[0])?.to_vec();
+        let mut blocks: Vec<(usize, Vec<f32>)> = Vec::with_capacity(captured_blocks.len());
+        for (slot, block) in captured_blocks.iter().enumerate() {
+            let values = if *block == last {
+                final_hidden.clone()
+            } else {
+                self.stream.clone_dtoh(&self.capture[1 + slot])?.to_vec()
+            };
+            blocks.push((*block, values));
+        }
+        Ok(TrellisConditioningStages {
+            embedding,
+            blocks,
+            final_hidden,
+            features,
+        })
+    }
+
+    pub fn encode_stages(
+        &mut self,
+        blas: &Blas,
+        chw_f32: &[f32],
+        captured_blocks: &[usize],
+    ) -> Result<TrellisConditioningStages> {
+        self.stage(chw_f32)?;
+        self.compute(blas, captured_blocks)?;
+        self.read_stages(captured_blocks)
+    }
+
+    /// PIL LANCZOS resize (Fixed22), /255, HWC RGB to CHW F32
+    /// (definition image_feature_extractor.py:109-112). The ImageNet normalization is
+    /// applied by `stage_input` (dinov3_pack_normalized_chw), not here.
+    pub fn prepare_chw(rgb_hwc_u8: &[u8], shape: [usize; 3], side: u32) -> Result<Vec<f32>> {
+        let resized = crate::serve::image::resize_lanczos(
+            rgb_hwc_u8,
+            shape,
+            [side as usize, side as usize],
+            crate::serve::image::ResizeRounding::Fixed22,
+        )?;
+        Ok((0..3)
+            .flat_map(|c| {
+                resized
+                    .chunks_exact(shape[2])
+                    .map(move |p| f32::from(p[c]) / 255.0)
+            })
+            .collect())
+    }
+}
+
+#[cfg(feature = "cuda")]
 struct NafConv {
     weight: BiasedWeight<f32>,
     kernel: u32,
@@ -10977,6 +11138,190 @@ mod tests {
         }
         println!(
             "N5_M2A_INVENTORY PASS dino_tensors=439 clip_tensors=592 clip_vision_tensors=392 integer_positions=true physical_extent_control=rejected GPU_allocations=0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "T2 M2 conditioning gate: FF_T2_DINO_MODEL FF_T2_CONDITIONING_ROOT FF_T2_CONDITIONING_OUTPUT"]
+    fn t2_conditioning_cells_gpu() -> Result<()> {
+        use crate::serve::image::{ResizeRounding, decode_image, resize_lanczos};
+        let env = |name: &str| -> Result<std::path::PathBuf> {
+            std::env::var_os(name)
+                .map(Into::into)
+                .with_context(|| format!("{name} missing"))
+        };
+        let dino_dir = env("FF_T2_DINO_MODEL")?;
+        let root = env("FF_T2_CONDITIONING_ROOT")?;
+        let out = env("FF_T2_CONDITIONING_OUTPUT")?;
+        std::fs::create_dir_all(&out)?;
+        let floor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("conditioning-floor-r1.json"))?)?;
+        let cells = floor["cells"]
+            .as_array()
+            .context("conditioning cells missing")?;
+        ensure!(cells.len() == 24, "conditioning cell scope differs");
+        let tau = |case: &str, key: &str| -> Result<(f64, f64)> {
+            let cell = cells
+                .iter()
+                .find(|c| c["case"] == case && c["key"] == key)
+                .with_context(|| format!("cell {case}/{key} missing"))?;
+            Ok((
+                cell["tau"]["max_abs"].as_f64().context("tau max_abs")?,
+                cell["tau"]["rmse"].as_f64().context("tau rmse")?,
+            ))
+        };
+        let read_cell = |case: &str, key: &str| -> Result<Vec<f32>> {
+            let bytes =
+                std::fs::read(root.join(format!("conditioning-r0a/{case}-{key}.safetensors")))?;
+            let st = safetensors::SafeTensors::deserialize(&bytes)?;
+            read_f32_tensor(&st, key)
+        };
+        let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
+            ensure!(a.len() == b.len() && !a.is_empty(), "cell extent mismatch");
+            let mut maximum = 0.0f64;
+            let mut square = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                let d = f64::from(*x) - f64::from(*y);
+                maximum = maximum.max(d.abs());
+                square += d * d;
+            }
+            Ok((maximum, (square / a.len() as f64).sqrt()))
+        };
+        fn other_case(fixture: &str, side: u32) -> String {
+            let other = if fixture == "cottage" {
+                "robot_crab"
+            } else {
+                "cottage"
+            };
+            format!("{other}-{side}")
+        }
+        let device = Device::new(0)?;
+        let mut blas = test_blas(
+            &device,
+            &out,
+            std::rc::Rc::new(crate::backend::cuda::closure::Closure::new(
+                false,
+                "t2 conditioning gate".into(),
+            )),
+        )?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = (total - total / 8).saturating_sub(total - free);
+        let blocks: [usize; 3] = [0, 11, 23];
+        let mut defects = 0usize;
+        let mut scored = 0usize;
+        for side in [512u32, 1024] {
+            let mut conditioner =
+                TrellisImageConditioner::load(&device, &mut blas, &dino_dir, side, &blocks, limit)?;
+            for fixture in ["cottage", "robot_crab"] {
+                let case = format!("{fixture}-{side}");
+                let crop = decode_image(
+                    &std::fs::read(root.join(format!("conditioning-r0a/{fixture}-crop.png")))?,
+                    Some("image/png"),
+                )?;
+                let resized = resize_lanczos(
+                    &crop.pixels,
+                    [crop.height, crop.width, 3],
+                    [side as usize, side as usize],
+                    ResizeRounding::Fixed22,
+                )?;
+                let expected = decode_image(
+                    &std::fs::read(
+                        root.join(format!("conditioning-r0a/{fixture}-{side}-rgb.png")),
+                    )?,
+                    Some("image/png"),
+                )?;
+                let mismatches = resized
+                    .iter()
+                    .zip(expected.pixels.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                println!("T2_M2_PREPARATION_EXACT case={case} mismatches={mismatches}");
+                defects += usize::from(mismatches > 0);
+                scored += 1;
+                let chw = TrellisImageConditioner::prepare_chw(
+                    &crop.pixels,
+                    [crop.height, crop.width, 3],
+                    side,
+                )?;
+                let mean = [0.485f32, 0.456, 0.406];
+                let std = [0.229f32, 0.224, 0.225];
+                let normalized: Vec<f32> = chw
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let channel = index / (side as usize * side as usize);
+                        (value - mean[channel]) / std[channel]
+                    })
+                    .collect();
+                let run = |cond: &mut TrellisImageConditioner| -> Result<Vec<(String, Vec<f32>)>> {
+                    let stages = cond.encode_stages(&blas, &chw, &blocks)?;
+                    let mut values = vec![
+                        ("actual_pixels".to_string(), normalized.clone()),
+                        ("embedding".to_string(), stages.embedding),
+                        ("features".to_string(), stages.features),
+                    ];
+                    for (block, tensor) in stages.blocks {
+                        values.push((format!("block{block}"), tensor));
+                    }
+                    Ok(values)
+                };
+                let eager = run(&mut conditioner)?;
+                let stream = &device.stream;
+                stream.synchronize()?;
+                conditioner.stage(&chw)?;
+                stream.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let launch = conditioner.compute(&blas, &blocks);
+                let graph = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launch?;
+                let graph = graph?.context("empty conditioning graph")?;
+                graph.launch().context("launch conditioning graph")?;
+                stream.synchronize()?;
+                let replay = conditioner.read_stages(&blocks)?;
+                let replay = {
+                    let stages = replay;
+                    let mut values = vec![
+                        ("actual_pixels".to_string(), normalized.clone()),
+                        ("embedding".to_string(), stages.embedding),
+                        ("features".to_string(), stages.features),
+                    ];
+                    for (block, tensor) in stages.blocks {
+                        values.push((format!("block{block}"), tensor));
+                    }
+                    values
+                };
+                ensure!(
+                    replay.len() == eager.len(),
+                    "graph/eager stage count mismatch"
+                );
+                for ((name, a), (_, b)) in replay.iter().zip(&eager) {
+                    let identical = a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+                    println!("T2_M2_GRAPH_EAGER_IDENTICAL case={case} key={name} bits={identical}");
+                    defects += usize::from(!identical);
+                }
+                for (name, native) in &eager {
+                    let (tau_max, tau_rmse) = tau(&case, name)?;
+                    let reference = read_cell(&case, name)?;
+                    let (max_abs, rmse) = metric(native, &reference)?;
+                    let pass = max_abs <= tau_max && rmse <= tau_rmse;
+                    let other_reference = read_cell(&other_case(fixture, side), name)?;
+                    let (control_max, control_rmse) = metric(native, &other_reference)?;
+                    let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+                    println!(
+                        "T2_M2_CONDITIONING_CELL case={case} key={name} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                        if pass { "PASS" } else { "DEFECT" }
+                    );
+                    defects += usize::from(!pass) + usize::from(!control_ok);
+                    scored += 1;
+                }
+            }
+        }
+        ensure!(defects == 0, "T2 M2 conditioning gate defects: {defects}");
+        println!(
+            "PASS T2_M2_CONDITIONING cells={scored} blocks=3 stages=16 exact_preprocessing=4 graph_eager_bit_identical=true"
         );
         Ok(())
     }
