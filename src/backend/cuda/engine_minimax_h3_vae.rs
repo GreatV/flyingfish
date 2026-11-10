@@ -167,6 +167,199 @@ pub(crate) struct VideoDecoder {
 
 impl VideoDecoder {
     #[cfg(test)]
+    pub(crate) fn biased_row_gate(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        frozen: &serde_json::Value,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let side = VAE_TILE / spec.spatial_ratio;
+        let canonical =
+            (spec.chunk_latents() + spec.overlap_latents()) * side * side + spec.registers + 1;
+        let rows: Vec<usize> = serde_json::from_value(frozen["row_gate_counts"].clone())?;
+        ensure!(
+            canonical == 1797
+                && rows == [1797, 3594, 5391, 50316]
+                && frozen["bit_difference_limit"] == 0
+                && frozen["row_gate_owners"] == self.linears().count(),
+            "RUNNER_FAIL biased row freeze contract mismatch"
+        );
+        let mut defects = 0;
+        let mut controls = 0;
+        for (owner, linear) in self.linears().enumerate() {
+            for &rows in &rows {
+                let (bad, control) =
+                    self.biased_row_cell(device, blas, (owner, linear), (rows, canonical), frozen)?;
+                defects += bad;
+                controls += control;
+            }
+        }
+        ensure!(
+            controls == 1,
+            "RUNNER_FAIL biased row control not discriminating"
+        );
+        println!(
+            "H3_VAE_BIASED_ROWS owners={} rows={rows:?} modes=2 bit_limit=0 defects={defects} control=FAIL_AS_REQUIRED",
+            self.linears().count()
+        );
+        ensure!(defects == 0, "H3_VAE_BIASED_ROWS DEFECT cells={defects}");
+        println!("H3_VAE_BIASED_ROWS PASS owners=217 cells=1736 bit_limit=0");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn biased_row_cell(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        (owner, linear): (usize, &Linear),
+        (rows, canonical): (usize, usize),
+        frozen: &serde_json::Value,
+    ) -> Result<(usize, usize)> {
+        use crate::backend::setup::LinearShape;
+        let s = &device.stream;
+        let shape = LinearShape {
+            rows,
+            output: linear.out,
+            input: linear.input,
+        };
+        let algorithm = blas.prepare_biased_family(shape, canonical, vector(&linear.bias, s)?)?;
+        let identity = serde_json::to_value(algorithm.data)?;
+        for arm in ["standalone-A", "standalone-P", "pipeline-A", "pipeline-P"] {
+            let expected = &frozen["arm_results"][arm]["canonical_bias_owners"][owner.to_string()];
+            ensure!(
+                expected["opaque_algorithm"] == identity
+                    && expected["output"] == linear.out
+                    && expected["input"] == linear.input,
+                "RUNNER_FAIL biased row frozen algorithm mismatch owner={owner} rows={rows} arm={arm}"
+            );
+        }
+        let guard = [bf16::from_f32(-123.5); 8];
+        let mut input = vec![guard[0]; (rows + 1) * linear.input + 16];
+        let boundary = [0x3f7f, 0x3f80, 0x3f81, 0xbf7f, 0xbf80, 0xbf81, 0x3b80];
+        for (i, x) in input[8..8 + (rows + 1) * linear.input]
+            .iter_mut()
+            .enumerate()
+        {
+            let (row, col) = (i / linear.input, i % linear.input);
+            *x = if (row + col).is_multiple_of(263) {
+                bf16::from_bits(boundary[(row + col / 263) % boundary.len()])
+            } else {
+                let signal = ((row % 251) * 17
+                    + (col % 257) * 13
+                    + (row / canonical % 269) * 19
+                    + owner * 7)
+                    % 509;
+                bf16::from_f32((signal as f32 - 254.0) / 256.0)
+            };
+        }
+        let input = s.clone_htod(&input)?;
+        let mut serial = s.alloc_zeros::<bf16>(rows * linear.out + 16)?;
+        let mut grouped = s.alloc_zeros::<bf16>(serial.len())?;
+        for out in [&mut serial, &mut grouped] {
+            let end = out.len() - 8;
+            s.memcpy_htod(&guard, &mut out.slice_mut(..8))?;
+            s.memcpy_htod(&guard, &mut out.slice_mut(end..))?;
+        }
+        ensure!(
+            rows_view(&input, s, 9, rows, linear.input, linear.input).is_err()
+                && rows_view(&grouped, s, 24, rows, linear.out, linear.out).is_err(),
+            "RUNNER_FAIL biased row alignment/capacity guard accepted invalid view"
+        );
+        let call = |offset: usize, count: usize, destination: &CudaSlice<bf16>, shifted: usize| {
+            blas.linear_biased(
+                matrix(&linear.weight, s, linear.out, linear.input)?,
+                vector(&linear.bias, s)?,
+                rows_view(
+                    &input,
+                    s,
+                    8 + (offset + shifted) * linear.input,
+                    count,
+                    linear.input,
+                    linear.input,
+                )?,
+                &mut TensorMut(rows_view(
+                    destination,
+                    s,
+                    8 + offset * linear.out,
+                    count,
+                    linear.out,
+                    linear.out,
+                )?),
+                MODE,
+            )
+        };
+        for first in (0..rows).step_by(canonical) {
+            call(first, canonical, &serial, 0)?;
+        }
+        let expected = s.clone_dtoh(&serial)?;
+        ensure!(
+            expected.iter().all(|x| x.is_finite()),
+            "RUNNER_FAIL serial biased output nonfinite"
+        );
+        let mut defects = 0;
+        let mut control = 0;
+        for graph in [false, true] {
+            let end = grouped.len() - 8;
+            s.memset_zeros(&mut grouped.slice_mut(8..end))?;
+            if graph {
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+            }
+            let launched = call(0, rows, &grouped, 0);
+            if graph {
+                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("RUNNER_FAIL biased row graph empty")?
+                    .launch()?;
+            } else {
+                launched?;
+            }
+            let actual = s.clone_dtoh(&grouped)?;
+            let last = actual.len() - 8;
+            ensure!(
+                actual[..8] == guard
+                    && actual[last..] == guard
+                    && expected[..8] == guard
+                    && expected[last..] == guard
+                    && actual.iter().all(|x| x.is_finite()),
+                "RUNNER_FAIL biased row guard/nonfinite owner={owner} rows={rows} graph={graph}"
+            );
+            let bits = expected[8..last]
+                .iter()
+                .zip(&actual[8..last])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(bits != 0);
+            println!(
+                "H3_VAE_BIASED_ROW owner={owner} rows={rows} graph={graph} bit_differences={bits} status={}",
+                if bits == 0 { "PASS" } else { "DEFECT" }
+            );
+            if owner == 0 && rows == 3 * canonical && !graph {
+                call(0, rows, &grouped, 1)?;
+                let wrong = s.clone_dtoh(&grouped)?;
+                let differences = expected[8..last]
+                    .iter()
+                    .zip(&wrong[8..last])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(
+                    differences > 0,
+                    "RUNNER_FAIL biased row wrong-view control passed"
+                );
+                println!(
+                    "H3_VAE_BIASED_ROW_CONTROL shifted_input_rows=1 bit_differences={differences} status=FAIL_AS_REQUIRED"
+                );
+                control = 1;
+            }
+        }
+        Ok((defects, control))
+    }
+
+    #[cfg(test)]
     pub(crate) fn batch_setup(
         &self,
         device: &Device,

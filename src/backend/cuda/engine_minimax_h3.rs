@@ -5793,6 +5793,44 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW, FF_MODEL, FF_H3_CAPTURE (frozen setup directory)"]
+    fn video_decoder_biased_rows_are_bitwise_invariant() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window missing"
+        );
+        let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let capture =
+            PathBuf::from(std::env::var_os("FF_H3_CAPTURE").context("FF_H3_CAPTURE missing")?);
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(capture.join("freeze.json"))?)?;
+        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
+        let dir = model.join("vae");
+        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+            .minimax_h3_vae_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-biased-rows-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            let mut blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(true, "VAE biased row gate".into())),
+            )?;
+            let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
+            decoder.biased_row_gate(&device, &mut blas, &frozen)
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    #[test]
     fn video_tile_batch_capacity() -> Result<()> {
         let spec = crate::minimax_h3::VaeSpec {
             in_channels: 3,

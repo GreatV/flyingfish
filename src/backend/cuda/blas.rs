@@ -1827,13 +1827,18 @@ impl Blas {
 
 impl Blas {
     #[cfg(test)]
-    pub(crate) fn biased_family_cost(
+    fn biased_family_plan(
         &mut self,
         shape: LinearShape,
         canonical_rows: usize,
         bias: super::contracts::Tensor<bf16, 1>,
-    ) -> Result<(f64, usize)> {
-        use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
+    ) -> Result<Plan> {
+        ensure!(
+            [shape.rows, shape.output, shape.input]
+                .iter()
+                .all(|&n| n > 0 && n <= i32::MAX as usize),
+            "invalid biased family dimensions"
+        );
         self.prepare_biased(
             u32::try_from(canonical_rows)?,
             u32::try_from(shape.output)?,
@@ -1868,6 +1873,61 @@ impl Blas {
             plan.algo.context("biased algorithm missing")?.data == algo.data,
             "biased family algorithm changed"
         );
+        Ok(plan)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_biased_family(
+        &mut self,
+        shape: LinearShape,
+        canonical_rows: usize,
+        bias: super::contracts::Tensor<bf16, 1>,
+    ) -> Result<sys::cublasLtMatmulAlgo_t> {
+        let plan = self.biased_family_plan(shape, canonical_rows, bias)?;
+        let algo = plan.algo.context("biased family algorithm missing")?;
+        let key = (
+            shape,
+            bias.ptr,
+            super::linear::LinearBiasMode::BeforeOutputRound,
+        );
+        let mut plans = self.biased_plans.borrow_mut();
+        match plans.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(plan);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                ensure!(
+                    entry.get().algo.context("biased algorithm missing")?.data == algo.data,
+                    "biased row shape already has a different algorithm"
+                );
+            }
+        }
+        Ok(algo)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn biased_family_cost(
+        &mut self,
+        shape: LinearShape,
+        canonical_rows: usize,
+        bias: super::contracts::Tensor<bf16, 1>,
+    ) -> Result<(f64, usize)> {
+        use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
+        let plan = self.biased_family_plan(shape, canonical_rows, bias)?;
+        let plans = self.biased_plans.borrow();
+        let canonical = plans
+            .get(&(
+                LinearShape {
+                    rows: canonical_rows,
+                    ..shape
+                },
+                bias.ptr,
+                super::linear::LinearBiasMode::BeforeOutputRound,
+            ))
+            .context("canonical biased plan missing")?;
+        let algo = canonical
+            .algo
+            .context("canonical biased algorithm missing")?;
         let waves = f64::from(plan.waves);
         let canonical_waves = f64::from(canonical.waves);
         ensure!(
