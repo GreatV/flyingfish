@@ -483,11 +483,23 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16(
     }
 }
 
+macro_rules! window_attention {
+    ($p:ident, $first:ident, $end:ident, $dim:expr) => {
+        $p.q = $p.q.add($first as usize * $p.q_stride as usize);
+        $p.k = $p.k.add($first as usize * $dim);
+        $p.v = $p.v.add($first as usize * $dim);
+        $p.out = $p.out.add($first as usize * $p.q_heads as usize * $dim);
+        $p.lse = $p.lse.add($first as usize * $p.q_heads as usize);
+        $p.rows = $end - $first;
+        $p.start = 0;
+    };
+}
+
 /// # Safety
 /// Offsets delimit disjoint windows of at most 48 rows; grid Z equals their count.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16_windows(
-    p: Attention,
+    mut p: Attention,
     keys: u32,
     scale: f32,
     offsets: *const u32,
@@ -500,22 +512,8 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16_window
         let first = *offsets.add(window as usize);
         let end = *offsets.add(window as usize + 1);
         assert!(first < end && end <= p.rows && end - first <= 48);
-        let p = window_attention::<16>(p, first, end);
+        window_attention!(p, first, end, 16);
         attention::<64, 8, 1, 16, true, true>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
-    }
-}
-
-#[inline(always)]
-unsafe fn window_attention<const L: usize>(mut p: Attention, first: u32, end: u32) -> Attention {
-    unsafe {
-        p.q = p.q.add(first as usize * p.q_stride as usize);
-        p.k = p.k.add(first as usize * L);
-        p.v = p.v.add(first as usize * L);
-        p.out = p.out.add(first as usize * p.q_heads as usize * L);
-        p.lse = p.lse.add(first as usize * p.q_heads as usize);
-        p.rows = end - first;
-        p.start = 0;
-        p
     }
 }
 
@@ -523,7 +521,7 @@ unsafe fn window_attention<const L: usize>(mut p: Attention, first: u32, end: u3
 /// Offsets delimit disjoint BF16 D64 windows; grid X covers the longest window, Z equals their count.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
-    p: Attention,
+    mut p: Attention,
     keys: u32,
     scale: f32,
     offsets: *const u32,
@@ -536,7 +534,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
         let first = *offsets.add(window as usize);
         let end = *offsets.add(window as usize + 1);
         assert!(first < end && end <= p.rows);
-        let p = window_attention::<64>(p, first, end);
+        window_attention!(p, first, end, 64);
         let tile: u32;
         asm!("mov.u32 {b}, %ctaid.x;", b=out(reg32) tile);
         if tile * 64 >= p.rows {
