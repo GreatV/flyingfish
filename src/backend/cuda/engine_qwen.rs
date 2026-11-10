@@ -1178,7 +1178,7 @@ impl Runtime {
                 .context("GLM configuration missing")?
                 .hc_mult,
         );
-        let hc = rows * (4 * mult * h + (4 * mult + mult * mult) * 4);
+        let hc = rows * (4 * mult * h + (4 * mult + mult * mult + mult * (mult + 2) + 1) * 4);
         let dsa = rows * ((512 * 2 + 1 + 2051) * 4 + 257 * 2);
         usize::try_from(slots + plans + tables + native_inputs + hc + dsa)
             .context("native workspace exceeds address space")

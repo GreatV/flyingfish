@@ -67,48 +67,11 @@ __device__ __forceinline__ float mhc_block_sum(float value, float* s_red) {
   return total;
 }
 
-template <typename FnT>
-__device__ __forceinline__ void mhc_mixes_body(
-    char* mhc_smem, float* s_red, const __nv_bfloat16* __restrict__ stream,
-    const FnT* __restrict__ fn, const float* __restrict__ base,
-    const float* __restrict__ scale, int mult, int hidden, int iters, float eps,
-    float norm_eps, float* __restrict__ pre, float* __restrict__ post,
-    float* __restrict__ comb, int rows) {
-  if ((int)blockIdx.x >= rows || mult < 2 || hidden <= 0 || iters < 1 ||
-      !(eps > 0.0f) || !(norm_eps > 0.0f) || blockDim.x != MHC_THREADS)
-    __trap();
-
-  const int tid = threadIdx.x;
-  const int nthr = (int)blockDim.x;
-  const int row = (int)blockIdx.x;
-  const int n = mult * hidden;
-  const int nmix = (2 + mult) * mult;
-
-  __nv_bfloat16* s_x = reinterpret_cast<__nv_bfloat16*>(mhc_smem);
-  float* s_mix = reinterpret_cast<float*>(mhc_smem + (size_t)n * 2);
-  float* s_comb = s_mix + nmix;
-
-  const __nv_bfloat16* x_row = stream + (size_t)row * n;
-  for (int i = tid; i < n; i += nthr) s_x[i] = x_row[i];
-  __syncthreads();
-
-  float sumsq = 0.0f;
-  for (int i = tid; i < n; i += nthr) {
-    const float x = __bfloat162float(s_x[i]);
-    sumsq += x * x;
-  }
-  const float rsqrt = 1.0f / sqrtf(mhc_block_sum(sumsq, s_red) / (float)n + norm_eps);
-
-  for (int c = 0; c < nmix; ++c) {
-    const FnT* fn_row = fn + (size_t)c * n;
-    float acc = 0.0f;
-    for (int d = tid; d < n; d += nthr)
-      acc = fmaf(mhc_fn_to_float(fn_row[d]), __bfloat162float(s_x[d]), acc);
-    const float dot = mhc_block_sum(acc, s_red);
-    if (tid == 0) s_mix[c] = dot * rsqrt;
-  }
-
-  if (tid == 0) {
+__device__ __forceinline__ void mhc_finish(
+    float* s_mix, float* s_comb, const float* base, const float* scale,
+    int mult, int iters, float eps, float* pre, float* post, float* comb,
+    int row) {
+  if (threadIdx.x == 0) {
     for (int j = 0; j < mult; ++j)
       pre[(size_t)row * mult + j] =
           1.0f / (1.0f + expf(-(s_mix[j] * scale[0] + base[j]))) + eps;
@@ -158,6 +121,50 @@ __device__ __forceinline__ void mhc_mixes_body(
   }
 }
 
+template <typename FnT>
+__device__ __forceinline__ void mhc_mixes_body(
+    char* mhc_smem, float* s_red, const __nv_bfloat16* __restrict__ stream,
+    const FnT* __restrict__ fn, const float* __restrict__ base,
+    const float* __restrict__ scale, int mult, int hidden, int iters, float eps,
+    float norm_eps, float* __restrict__ pre, float* __restrict__ post,
+    float* __restrict__ comb, int rows) {
+  if ((int)blockIdx.x >= rows || mult < 2 || hidden <= 0 || iters < 1 ||
+      !(eps > 0.0f) || !(norm_eps > 0.0f) || blockDim.x != MHC_THREADS)
+    __trap();
+
+  const int tid = threadIdx.x;
+  const int nthr = (int)blockDim.x;
+  const int row = (int)blockIdx.x;
+  const int n = mult * hidden;
+  const int nmix = (2 + mult) * mult;
+
+  __nv_bfloat16* s_x = reinterpret_cast<__nv_bfloat16*>(mhc_smem);
+  float* s_mix = reinterpret_cast<float*>(mhc_smem + (size_t)n * 2);
+  float* s_comb = s_mix + nmix;
+
+  const __nv_bfloat16* x_row = stream + (size_t)row * n;
+  for (int i = tid; i < n; i += nthr) s_x[i] = x_row[i];
+  __syncthreads();
+
+  float sumsq = 0.0f;
+  for (int i = tid; i < n; i += nthr) {
+    const float x = __bfloat162float(s_x[i]);
+    sumsq += x * x;
+  }
+  const float rsqrt = 1.0f / sqrtf(mhc_block_sum(sumsq, s_red) / (float)n + norm_eps);
+
+  for (int c = 0; c < nmix; ++c) {
+    const FnT* fn_row = fn + (size_t)c * n;
+    float acc = 0.0f;
+    for (int d = tid; d < n; d += nthr)
+      acc = fmaf(mhc_fn_to_float(fn_row[d]), __bfloat162float(s_x[d]), acc);
+    const float dot = mhc_block_sum(acc, s_red);
+    if (tid == 0) s_mix[c] = dot * rsqrt;
+  }
+
+  mhc_finish(s_mix, s_comb, base, scale, mult, iters, eps, pre, post, comb, row);
+}
+
 extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_mixes(
     const __nv_bfloat16* __restrict__ stream, const float* __restrict__ fn,
     const float* __restrict__ base, const float* __restrict__ scale, int mult,
@@ -181,6 +188,55 @@ extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_mixes_bf16(
   mhc_mixes_body<__nv_bfloat16>(mhc_smem, s_red, stream, fn, base, scale, mult,
                                 hidden, iters, eps, norm_eps, pre, post, comb,
                                 rows);
+}
+
+// Partials [rows, 1+nmix]: reciprocal RMS followed by unscaled dot products.
+extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_mixes_bf16_partials(
+    const __nv_bfloat16* __restrict__ stream,
+    const __nv_bfloat16* __restrict__ fn, int mult, int hidden, float norm_eps,
+    float* __restrict__ partials, int rows) {
+  const int row = (int)blockIdx.x;
+  const int part = (int)blockIdx.y;
+  const int n = mult * hidden;
+  const int nmix = (2 + mult) * mult;
+  if (row >= rows || part > nmix || mult < 2 || hidden <= 0 ||
+      !(norm_eps > 0.0f) || blockDim.x != MHC_THREADS) __trap();
+  __shared__ float s_red[8];
+  const int tid = threadIdx.x;
+  const __nv_bfloat16* x = stream + (size_t)row * n;
+  float acc = 0.0f;
+  if (part == 0) {
+    for (int i = tid; i < n; i += MHC_THREADS) {
+      const float v = __bfloat162float(x[i]);
+      acc += v * v;
+    }
+    const float rsqrt = 1.0f / sqrtf(mhc_block_sum(acc, s_red) / (float)n + norm_eps);
+    if (tid == 0) partials[(size_t)row * (nmix + 1)] = rsqrt;
+  } else {
+    const __nv_bfloat16* w = fn + (size_t)(part - 1) * n;
+    for (int d = tid; d < n; d += MHC_THREADS)
+      acc = fmaf(mhc_fn_to_float(w[d]), __bfloat162float(x[d]), acc);
+    const float dot = mhc_block_sum(acc, s_red);
+    if (tid == 0) partials[(size_t)row * (nmix + 1) + part] = dot;
+  }
+}
+
+extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_mixes_finish(
+    const float* __restrict__ partials, const float* __restrict__ base,
+    const float* __restrict__ scale, int mult, int iters, float eps,
+    float* __restrict__ pre, float* __restrict__ post,
+    float* __restrict__ comb, int rows) {
+  const int row = (int)blockIdx.x;
+  const int nmix = (2 + mult) * mult;
+  if (row >= rows || mult < 2 || iters < 1 || !(eps > 0.0f) ||
+      blockDim.x != MHC_THREADS) __trap();
+  extern __shared__ __align__(16) char mhc_smem[];
+  float* s_mix = reinterpret_cast<float*>(mhc_smem);
+  float* s_comb = s_mix + nmix;
+  const float* p = partials + (size_t)row * (nmix + 1);
+  for (int c = threadIdx.x; c < nmix; c += MHC_THREADS) s_mix[c] = p[c + 1] * p[0];
+  __syncthreads();
+  mhc_finish(s_mix, s_comb, base, scale, mult, iters, eps, pre, post, comb, row);
 }
 
 extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_collapse(

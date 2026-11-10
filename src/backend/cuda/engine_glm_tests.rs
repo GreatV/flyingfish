@@ -1222,6 +1222,59 @@ fn glm_graph_expert_tier_gpu() -> Result<()> {
 
 #[cfg(feature = "cuda")]
 #[test]
+#[ignore = "official GLM mHC eager/graph bit identity"]
+fn glm_mhc_decode_bit_identity_gpu() -> Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    let reference = Reference::load(&root)?;
+    let output =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_OUTPUT").context("output missing")?);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    let mut engine = load_composition_engine()?;
+    ensure!(
+        engine.graph_decode() && engine.glm_graph_count() == 84,
+        "Runner FAIL GLM graph capability"
+    );
+    let mut eager = Vec::new();
+    for graph in [false, true] {
+        engine.reset()?;
+        engine.prefill(&reference.tokens[..1], None)?;
+        for position in 0..8 {
+            if position > 0 {
+                engine.set_token(reference.tokens[position])?;
+                engine.decode(graph, None)?;
+            }
+            let logits = engine.decode_logits()?;
+            ensure!(
+                logits.len() == 154880 && logits.iter().all(|v| v.is_finite()),
+                "Runner FAIL GLM mHC logits"
+            );
+            let bits: Vec<_> = logits.iter().map(|v| v.to_bits()).collect();
+            if graph {
+                ensure!(
+                    eager[position] == bits,
+                    "DEFECT GLM mHC eager/graph bits position={position}"
+                );
+            } else {
+                eager.push(bits.clone());
+            }
+            for value in bits {
+                file.write_all(&value.to_le_bytes())?;
+            }
+            println!(
+                "PASS GLM_MHC_DECODE graph={graph} position={position} vocab=154880 eager_graph_bits=0"
+            );
+        }
+    }
+    file.flush()?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 #[ignore = "official GLM graph/eager composition, frozen reference and pre-graph eager logits"]
 fn glm_graph_composition_gpu() -> Result<()> {
     let root =
