@@ -527,6 +527,7 @@ struct MeshDecimator {
     star_vertices: Vec<u32>,
     neighborhood: Vec<u32>,
     slots: Vec<u32>,
+    #[cfg(test)]
     dirty_star_at: Option<usize>,
 }
 
@@ -568,6 +569,7 @@ impl MeshDecimator {
             star_vertices: Vec::new(),
             neighborhood: Vec::new(),
             slots: Vec::new(),
+            #[cfg(test)]
             dirty_star_at: None,
             points,
             faces,
@@ -738,11 +740,16 @@ impl MeshDecimator {
     }
 
     fn star(&mut self, a: u32, b: u32) {
-        if self.dirty_star_at == Some(self.contractions) {
-            self.dirty_star_at = None;
-        } else {
-            self.star_faces.clear();
+        #[cfg(test)]
+        {
+            if self.dirty_star_at == Some(self.contractions) {
+                self.dirty_star_at = None;
+            } else {
+                self.star_faces.clear();
+            }
         }
+        #[cfg(not(test))]
+        self.star_faces.clear();
         for vertex in [a, b] {
             let mut corner = self.heads[vertex as usize];
             while corner != u32::MAX {
