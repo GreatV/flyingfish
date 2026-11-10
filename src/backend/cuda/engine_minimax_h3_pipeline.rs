@@ -475,8 +475,7 @@ fn run_mode<const SETUP_ONLY: bool>(
         decoder.batch_setup(&device, &mut blas, &tiles, (latent_frames, lh, lw))?;
         anyhow::bail!("H3_VAE_SETUP_COMPLETE");
     }
-    let mut work = TileWork::new(s, &vae, tile)?;
-    work.prepare(s, &mut blas, &decoder)?;
+    let mut work = decoder.work(&device, &mut blas, &tiles, (latent_frames, lh, lw))?;
     let mut decoded = s.alloc_zeros::<bf16>(vae.out_channels * total_frames * pixels)?;
     let latents_device = s.clone_htod(&video_latents)?;
     let decode_plan = decoder.decode(

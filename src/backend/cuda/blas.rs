@@ -1826,7 +1826,6 @@ impl Blas {
 }
 
 impl Blas {
-    #[cfg(test)]
     fn biased_family_plan(
         &mut self,
         shape: LinearShape,
@@ -1876,7 +1875,6 @@ impl Blas {
         Ok(plan)
     }
 
-    #[cfg(test)]
     pub(crate) fn prepare_biased_family(
         &mut self,
         shape: LinearShape,
@@ -1905,13 +1903,13 @@ impl Blas {
         Ok(algo)
     }
 
-    #[cfg(test)]
     pub(crate) fn biased_family_cost(
         &mut self,
         shape: LinearShape,
         canonical_rows: usize,
         bias: super::contracts::Tensor<bf16, 1>,
     ) -> Result<(f64, usize)> {
+        #[cfg(test)]
         use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
         let plan = self.biased_family_plan(shape, canonical_rows, bias)?;
         let plans = self.biased_plans.borrow();
@@ -1925,6 +1923,7 @@ impl Blas {
                 super::linear::LinearBiasMode::BeforeOutputRound,
             ))
             .context("canonical biased plan missing")?;
+        #[cfg(test)]
         let algo = canonical
             .algo
             .context("canonical biased algorithm missing")?;
@@ -1938,6 +1937,7 @@ impl Blas {
             "invalid biased Lt waves {waves}"
         );
         let multiplier = canonical_rows as f64 / shape.rows as f64 * waves.ceil() / canonical_waves;
+        #[cfg(test)]
         eprintln!(
             "{}",
             serde_json::json!({"biased_row_family": {
@@ -1956,7 +1956,6 @@ impl Blas {
         Ok((multiplier, plan.workspace))
     }
 
-    #[cfg(test)]
     pub(crate) fn workspace_bytes(&self) -> usize {
         self.workspace.borrow().len()
     }

@@ -5831,6 +5831,73 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW, FF_MODEL, FF_H3_CAPTURE (frozen setup), FF_H3_S0"]
+    fn video_decoder_spatial_groups_are_bitwise_invariant() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window missing"
+        );
+        let path = |key| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(path("FF_H3_CAPTURE")?.join("freeze.json"))?)?;
+        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
+        let mut inputs = Vec::new();
+        for cell in ["A", "P"] {
+            let map = mapped(&path("FF_H3_S0")?.join(format!("{cell}-bf16/decode.safetensors")))?;
+            let file = SafeTensors::deserialize(&map)?;
+            let input = file.tensor("video_decoder_input")?;
+            let shape = input.shape();
+            ensure!(
+                input.dtype() == Dtype::F32
+                    && shape.len() == 5
+                    && shape[0] == 1
+                    && shape[1] == spec.latent_channels,
+                "group latent layout"
+            );
+            let values = input
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|x| f32::from_le_bytes(*x))
+                .collect::<Vec<_>>();
+            inputs.push((values, [shape[2], shape[3], shape[4]]));
+        }
+        let tiles = crate::minimax_h3::VaeTiles::released(
+            &spec,
+            inputs[0].1[1] * spec.spatial_ratio,
+            inputs[0].1[2] * spec.spatial_ratio,
+        )?;
+        let dir = model.join("vae");
+        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+            .minimax_h3_vae_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-group-gate-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            let mut blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(true, "VAE spatial group gate".into())),
+            )?;
+            let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
+            decoder.batch_identity_gate(&device, &mut blas, &tiles, inputs.into_iter(), &frozen)
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    #[test]
     fn video_tile_batch_capacity() -> Result<()> {
         let spec = crate::minimax_h3::VaeSpec {
             in_channels: 3,
@@ -5873,6 +5940,9 @@ mod tests {
         );
         assert!(vae::TileWork::batch_bytes(&spec, shape, 0, 28).is_err());
         assert!(vae::TileWork::batch_bytes(&spec, shape, 29, 28).is_err());
+        for shape in [(0, 16, 16), (7, 0, 16), (7, 16, 0)] {
+            assert!(vae::TileWork::batch_bytes(&spec, shape, 1, 28).is_err());
+        }
         assert!(vae::TileWork::batch_bytes(&spec, (usize::MAX, 16, 16), 1, 28).is_err());
         Ok(())
     }
@@ -5966,7 +6036,7 @@ mod tests {
     #[test]
     #[ignore = "requires FF_MODEL, FF_H3_S0, FF_H3_N7_THRESHOLDS, FF_H3_VAE_DTYPES and the GPU"]
     fn video_decoder_matches_the_fp32_replay() -> Result<()> {
-        use super::vae::{LatentVideo, TileWork, VideoDecoder, bf16_parameter};
+        use super::vae::{LatentVideo, VideoDecoder, bf16_parameter};
         let var = |key: &str| -> Result<PathBuf> {
             Ok(PathBuf::from(
                 std::env::var_os(key).with_context(|| format!("{key} missing"))?,
@@ -6034,6 +6104,7 @@ mod tests {
                 "decoder input shape {shape:?}"
             );
             let (frames, height, width) = (shape[2], shape[3], shape[4]);
+            let mut work = decoder.work(&device, blas, tiles, (frames, height, width))?;
             let z = s.clone_htod(
                 &input
                     .data()
@@ -6043,8 +6114,6 @@ mod tests {
                     .map(|v| f32::from_le_bytes(*v))
                     .collect::<Vec<_>>(),
             )?;
-            let mut work = TileWork::new(s, &spec, (clip, tiles.height / r, tiles.width / r))?;
-            work.prepare(s, blas, &decoder)?;
             let plan = crate::minimax_h3::DecodePlan::new(&spec, frames)?;
             let (lead, pre) = (
                 spec.chunk_latents() * spec.temporal_ratio,
