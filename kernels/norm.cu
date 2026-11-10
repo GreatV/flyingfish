@@ -122,11 +122,27 @@ __device__ __forceinline__ float norm_scale(float x, float inv, float weight) {
 }
 
 // One block normalizes one row of n elements (nthr = blockDim.x, gid = threadIdx.x).
-template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true>
+template <bool MODULATE>
+__device__ __forceinline__ float rmsnorm_epilogue(float value,
+                                                const __nv_bfloat16* shift,
+                                                const __nv_bfloat16* scale,
+                                                size_t at) {
+  if constexpr (MODULATE) {
+    const float weighted = __bfloat162float(__float2bfloat16(value));
+    const float factor = __bfloat162float(__float2bfloat16(1.0f + __bfloat162float(scale[at])));
+    const float scaled = __bfloat162float(__float2bfloat16(weighted * factor));
+    return scaled + __bfloat162float(shift[at]);
+  }
+  return value;
+}
+
+template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true, bool MODULATE = false>
 __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
                                             const __nv_bfloat16* __restrict__ w,
                                             __nv_bfloat16* __restrict__ y, int n,
-                                            float eps) {
+                                            float eps,
+                                            const __nv_bfloat16* shift = nullptr,
+                                            const __nv_bfloat16* scale = nullptr) {
   __shared__ float smem[32];
   const int nthr = blockDim.x;
   const int gid = threadIdx.x;
@@ -163,7 +179,9 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
         float ww[VEC], out[VEC];
         ld_vec<VEC>(w + idx, ww);
 #pragma unroll
-        for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(r[i * VEC + j], rstd, ww[j]);
+        for (int j = 0; j < VEC; ++j)
+          out[j] = rmsnorm_epilogue<MODULATE>(
+              norm_scale<BF16_SCALE>(r[i * VEC + j], rstd, ww[j]), shift, scale, idx + j);
         st_vec<VEC>(y + idx, out);
       }
     }
@@ -174,7 +192,9 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
       ld_vec<VEC>(x + idx, r);
       ld_vec<VEC>(w + idx, ww);
 #pragma unroll
-      for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(r[j], rstd, ww[j]);
+      for (int j = 0; j < VEC; ++j)
+        out[j] = rmsnorm_epilogue<MODULATE>(
+            norm_scale<BF16_SCALE>(r[j], rstd, ww[j]), shift, scale, idx + j);
       st_vec<VEC>(y + idx, out);
     }
   }
@@ -339,6 +359,21 @@ __global__ __launch_bounds__(1024) void rms_norm_bf16(const __nv_bfloat16* x,
   const size_t off = (size_t)row * dim;
   if ((dim & 7) == 0) rmsnorm_row<8, true>(x + off, w, y + off, dim, eps);
   else                rmsnorm_row<1, true>(x + off, w, y + off, dim, eps);
+}
+
+// Dense indices select BF16 shift/scale rows; each arithmetic boundary rounds to BF16.
+__global__ __launch_bounds__(768, 2) void rms_norm_modulate_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y,
+    const __nv_bfloat16* shift, const __nv_bfloat16* scale, const unsigned* index,
+    int rows, int dim, float eps, unsigned long long stride, unsigned entries) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned p = index[row];
+  if (p >= entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  const size_t param = (size_t)p * stride;
+  rmsnorm_row<8, true, true, true>(x + off, w, y + off, dim, eps,
+                                  shift + param, scale + param);
 }
 
 __global__ __launch_bounds__(1024) void add_rmsnorm_bf16(const __nv_bfloat16* x,
