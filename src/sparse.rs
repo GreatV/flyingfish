@@ -166,7 +166,7 @@ impl SparseMesh {
             ));
         }
         let mut state = MeshDecimator::new(self)?;
-        state.run(target_faces, |_, _, _, _, _| Ok(()))?;
+        state.run(target_faces, |_, _, _, _| Ok(()))?;
         let (mesh, ancestry, vertices) = state.finish()?;
         *self = mesh;
         Ok((ancestry, vertices))
@@ -519,6 +519,16 @@ struct MeshDecimator {
     queue: EdgeQueue,
     live_faces: usize,
     contractions: usize,
+    star_faces: Vec<u32>,
+    neighbors: [Vec<u32>; 2],
+    opposite: Vec<u32>,
+    remaining: Vec<[u32; 3]>,
+    common: Vec<u32>,
+    star_vertices: Vec<u32>,
+    neighborhood: Vec<u32>,
+    slots: Vec<u32>,
+    #[cfg(test)]
+    dirty_star_at: Option<usize>,
 }
 
 impl MeshDecimator {
@@ -551,6 +561,16 @@ impl MeshDecimator {
             queue: EdgeQueue::new(mesh.faces.len()),
             live_faces: faces.len(),
             contractions: 0,
+            star_faces: Vec::new(),
+            neighbors: [Vec::new(), Vec::new()],
+            opposite: Vec::new(),
+            remaining: Vec::new(),
+            common: Vec::new(),
+            star_vertices: Vec::new(),
+            neighborhood: Vec::new(),
+            slots: Vec::new(),
+            #[cfg(test)]
+            dirty_star_at: None,
             points,
             faces,
         };
@@ -719,58 +739,75 @@ impl MeshDecimator {
         self.queue.set(corner, cost);
     }
 
-    fn star(&self, a: u32, b: u32) -> Vec<u32> {
-        let mut faces = self.incident(a);
-        faces.extend(self.incident(b));
-        for c in &mut faces {
-            *c /= 3;
+    fn star(&mut self, a: u32, b: u32) {
+        #[cfg(test)]
+        {
+            if self.dirty_star_at == Some(self.contractions) {
+                self.dirty_star_at = None;
+            } else {
+                self.star_faces.clear();
+            }
         }
-        faces.sort_unstable();
-        faces.dedup();
-        faces
+        #[cfg(not(test))]
+        self.star_faces.clear();
+        for vertex in [a, b] {
+            let mut corner = self.heads[vertex as usize];
+            while corner != u32::MAX {
+                self.star_faces.push(corner / 3);
+                corner = self.next[corner as usize];
+            }
+        }
+        self.star_faces.sort_unstable();
+        self.star_faces.dedup();
     }
 
-    fn link_valid(&self, a: u32, b: u32, star: &[u32]) -> bool {
-        let mut neighbors = [Vec::new(), Vec::new()];
-        let mut opposite = Vec::new();
-        let mut remaining = Vec::new();
-        for &face in star {
+    fn link_valid(&mut self, a: u32, b: u32) -> bool {
+        self.neighbors[0].clear();
+        self.neighbors[1].clear();
+        self.opposite.clear();
+        self.remaining.clear();
+        self.common.clear();
+        let star = std::mem::take(&mut self.star_faces);
+        for &face in &star {
             let triangle = self.faces[face as usize];
             for (i, v) in [a, b].into_iter().enumerate() {
                 if triangle.contains(&v) {
-                    neighbors[i].extend(triangle.into_iter().filter(|&n| n != v));
+                    self.neighbors[i].extend(triangle.into_iter().filter(|&n| n != v));
                 }
             }
             if triangle.contains(&a) && triangle.contains(&b) {
-                opposite.extend(triangle.into_iter().filter(|&v| v != a && v != b));
+                self.opposite
+                    .extend(triangle.into_iter().filter(|&v| v != a && v != b));
             } else {
                 let mut mapped = triangle.map(|v| if v == b { a } else { v });
                 mapped.sort_unstable();
-                remaining.push(mapped);
+                self.remaining.push(mapped);
             }
         }
-        if opposite.len() != 2 || opposite[0] == opposite[1] {
+        self.star_faces = star;
+        if self.opposite.len() != 2 || self.opposite[0] == self.opposite[1] {
             return false;
         }
-        for row in &mut neighbors {
+        for row in &mut self.neighbors {
             row.sort_unstable();
             row.dedup();
         }
-        let common: Vec<_> = neighbors[0]
-            .iter()
-            .copied()
-            .filter(|v| neighbors[1].binary_search(v).is_ok())
-            .collect();
-        opposite.sort_unstable();
-        remaining.sort_unstable();
-        common == opposite && !remaining.windows(2).any(|p| p[0] == p[1])
+        for i in 0..self.neighbors[0].len() {
+            let v = self.neighbors[0][i];
+            if self.neighbors[1].binary_search(&v).is_ok() {
+                self.common.push(v);
+            }
+        }
+        self.opposite.sort_unstable();
+        self.remaining.sort_unstable();
+        self.common == self.opposite && !self.remaining.windows(2).any(|p| p[0] == p[1])
     }
 
-    fn position_valid(&self, a: u32, b: u32, point: [f64; 3], star: &[u32]) -> bool {
+    fn position_valid(&self, a: u32, b: u32, point: [f64; 3]) -> bool {
         if !point.iter().all(|v| v.is_finite()) {
             return false;
         }
-        for &face in star {
+        for &face in &self.star_faces {
             let triangle = self.faces[face as usize];
             if triangle.contains(&a) && triangle.contains(&b) {
                 continue;
@@ -797,32 +834,39 @@ impl MeshDecimator {
         true
     }
 
-    fn collapse(&mut self, a: u32, b: u32, point: [f64; 3], star: &[u32]) {
-        let mut vertices = Vec::new();
-        for &f in star {
-            vertices.extend(self.faces[f as usize]);
+    fn collapse(&mut self, a: u32, b: u32, point: [f64; 3]) {
+        let star = std::mem::take(&mut self.star_faces);
+        self.star_vertices.clear();
+        for &f in &star {
+            self.star_vertices.extend(self.faces[f as usize]);
         }
-        vertices.sort_unstable();
-        vertices.dedup();
-        let mut neighborhood = Vec::new();
-        for &v in &vertices {
-            neighborhood.extend(self.incident(v).into_iter().map(|c| c / 3));
+        self.star_vertices.sort_unstable();
+        self.star_vertices.dedup();
+        self.neighborhood.clear();
+        for i in 0..self.star_vertices.len() {
+            let v = self.star_vertices[i];
+            let mut corner = self.heads[v as usize];
+            while corner != u32::MAX {
+                self.neighborhood.push(corner / 3);
+                corner = self.next[corner as usize];
+            }
         }
-        neighborhood.sort_unstable();
-        neighborhood.dedup();
+        self.neighborhood.sort_unstable();
+        self.neighborhood.dedup();
+        let neighborhood = std::mem::take(&mut self.neighborhood);
         for &f in &neighborhood {
             for side in 0..3 {
                 self.queue.remove(3 * f + side);
             }
         }
-        for &f in star {
+        for &f in &star {
             for side in 0..3 {
                 self.unlink(3 * f + side);
             }
         }
         self.points[a as usize] = point;
         self.quadrics[a as usize] = self.quadrics[a as usize].add(self.quadrics[b as usize]);
-        for &f in star {
+        for &f in &star {
             let triangle = self.faces[f as usize];
             if triangle.contains(&a) && triangle.contains(&b) {
                 self.faces[f as usize] = [u32::MAX; 3];
@@ -834,32 +878,37 @@ impl MeshDecimator {
                 }
             }
         }
-        let mut slots = Vec::new();
+        self.slots.clear();
         for &f in &neighborhood {
             if self.faces[f as usize][0] == u32::MAX {
                 continue;
             }
             for side in 0..3 {
                 let c = 3 * f + side;
-                let a = self.vertex(c);
-                let b = self.vertex(corner_next(c));
-                if let Some(slot) = self.edge_slot(a, b) {
-                    slots.push(slot);
+                let va = self.vertex(c);
+                let vb = self.vertex(corner_next(c));
+                let slot = self.edge_slot(va, vb);
+                if let Some(slot) = slot {
+                    self.slots.push(slot);
                 }
             }
         }
-        slots.sort_unstable();
-        slots.dedup();
-        for slot in slots {
+        self.slots.sort_unstable();
+        self.slots.dedup();
+        let slots = std::mem::take(&mut self.slots);
+        for slot in slots.iter().copied() {
             self.enqueue(slot);
         }
+        self.slots = slots;
+        self.neighborhood = neighborhood;
+        self.star_faces = star;
         self.contractions += 1;
     }
 
     fn run(
         &mut self,
         target: usize,
-        mut audit: impl FnMut(&Self, u32, u32, [f64; 3], &[u32]) -> Result<()>,
+        mut audit: impl FnMut(&Self, u32, u32, [f64; 3]) -> Result<()>,
     ) -> Result<()> {
         while self.live_faces > target {
             let (corner, lower) = self.queue.pop().with_context(|| {
@@ -871,8 +920,8 @@ impl MeshDecimator {
             let x = self.vertex(corner);
             let y = self.vertex(corner_next(corner));
             let (a, b) = (x.min(y), x.max(y));
-            let star = self.star(a, b);
-            if !self.link_valid(a, b, &star) {
+            self.star(a, b);
+            if !self.link_valid(a, b) {
                 continue;
             }
             let quadric = self.quadrics[a as usize].add(self.quadrics[b as usize]);
@@ -881,7 +930,7 @@ impl MeshDecimator {
                 .into_iter()
                 .flatten()
                 .map(|p| p.map(|x| f64::from(x as f32)))
-                .filter(|&p| self.position_valid(a, b, p, &star))
+                .filter(|&p| self.position_valid(a, b, p))
                 .min_by(|&p, &q| quadric.energy(p).total_cmp(&quadric.energy(q)));
             let Some(point) = point else {
                 continue;
@@ -899,8 +948,8 @@ impl MeshDecimator {
                 self.queue.set(corner, cost);
                 continue;
             }
-            audit(self, a, b, point, &star)?;
-            self.collapse(a, b, point, &star);
+            audit(self, a, b, point)?;
+            self.collapse(a, b, point);
             if self.contractions.is_multiple_of(250_000) {
                 println!(
                     "MESH_QEM_PROGRESS contractions={} faces={} queue={} queue_peak={} timing=false",
@@ -1743,10 +1792,10 @@ mod tests {
             vertices: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             faces: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
         };
-        let state = MeshDecimator::new(&mesh)?;
+        let mut state = MeshDecimator::new(&mesh)?;
         assert!(!state.protected.iter().any(|&v| v));
-        let star = state.star(0, 1);
-        assert!(!state.link_valid(0, 1, &star));
+        state.star(0, 1);
+        assert!(!state.link_valid(0, 1));
         let original = mesh.faces.clone();
         assert!(mesh.simplify(2).is_err());
         assert_eq!(mesh.faces, original);
@@ -1784,6 +1833,53 @@ mod tests {
         assert_eq!(
             qem_inherited_faces(&source, &candidate, &[0, 1, 2])?,
             vec![false]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_qem_dirty_star_changes_output() -> Result<()> {
+        let n = 6i32;
+        let mut vertices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                vertices.extend([x as f32, y as f32, (x * y) as f32 * 0.15]);
+            }
+        }
+        let mut faces = Vec::new();
+        for y in 0..n - 1 {
+            for x in 0..n - 1 {
+                let a = y * n + x;
+                let b = a + 1;
+                let c = a + n;
+                let d = c + 1;
+                faces.extend([a, b, d, a, d, c]);
+            }
+        }
+        let source = SparseMesh { vertices, faces };
+        let target = source.faces.len() / 3 - 4;
+        let decimate = |dirty: Option<usize>| -> Result<_> {
+            let mut state = MeshDecimator::new(&source)?;
+            state.dirty_star_at = dirty;
+            state.run(target, |_, _, _, _| Ok(()))?;
+            let contractions = state.contractions;
+            let (mesh, ancestry, _) = state.finish()?;
+            Ok((mesh.vertices, mesh.faces, ancestry, contractions))
+        };
+        let (vertices, faces, ancestry, contractions) = decimate(None)?;
+        let (dirty_vertices, dirty_faces, dirty_ancestry, _) = decimate(Some(1))?;
+        ensure!(
+            contractions >= 2,
+            "patch accepted {contractions} contractions"
+        );
+        ensure!(
+            vertices != dirty_vertices,
+            "dirty star left vertices unchanged"
+        );
+        ensure!(faces != dirty_faces, "dirty star left faces unchanged");
+        ensure!(
+            ancestry != dirty_ancestry,
+            "dirty star left ancestry unchanged"
         );
         Ok(())
     }
@@ -2054,7 +2150,7 @@ mod tests {
         }
         let mut observed = 0;
         let mut minimum_original_cosine = 1.0f64;
-        state.run(target, |s, a, b, point, star| {
+        state.run(target, |s, a, b, point| {
             audit_defects += usize::from(
                 s.quadrics[a as usize].0 != inherited[a as usize].0
                     || s.quadrics[b as usize].0 != inherited[b as usize].0,
@@ -2064,7 +2160,7 @@ mod tests {
             expected.extend(&adjacency[b as usize]);
             expected.sort_unstable();
             expected.dedup();
-            audit_defects += usize::from(expected != star);
+            audit_defects += usize::from(expected != s.star_faces);
             for &f in &expected {
                 let old: [i32; 3] = mesh.faces[3 * f as usize..3 * f as usize + 3].try_into()?;
                 let removed = old.contains(&(a as i32)) && old.contains(&(b as i32));
