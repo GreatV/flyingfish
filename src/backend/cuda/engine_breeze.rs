@@ -22,6 +22,7 @@ use crate::checkpoint::MappedCheckpoint;
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use safetensors::Dtype;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::rc::Rc;
@@ -249,6 +250,10 @@ struct Kern {
     table_identity: CudaSlice<bf16>,
     table_backbone: CudaSlice<bf16>,
     table_depth: CudaSlice<bf16>,
+    drains: Cell<u64>,
+    h2d: Cell<u64>,
+    d2h: Cell<u64>,
+    d2d: Cell<u64>,
 }
 
 struct Buf {
@@ -316,8 +321,6 @@ struct RopeGeom {
     kv_heads: usize,
     dim: usize,
     capacity: usize,
-    cache_start: i32,
-    start: i32,
     q_row_stride: usize,
     k_offset: usize,
     k_row_stride: usize,
@@ -388,14 +391,26 @@ struct DecLoad {
     qk_norm: bool,
 }
 
-fn copy_h2d<T: DeviceRepr>(
-    stream: &Arc<CudaStream>,
-    host: &[T],
-    device: &mut impl DevicePtrMut<T>,
-) -> Result<()> {
-    stream.memcpy_htod(host, device)?;
-    stream.synchronize()?;
+fn copy_h2d<T: DeviceRepr>(k: &Kern, host: &[T], device: &mut impl DevicePtrMut<T>) -> Result<()> {
+    k.stream.memcpy_htod(host, device)?;
+    k.stream.synchronize()?;
+    k.h2d.set(k.h2d.get() + std::mem::size_of_val(host) as u64);
+    k.drains.set(k.drains.get() + 1);
     Ok(())
+}
+
+fn copy_d2d<T: DeviceRepr>(
+    k: &Kern,
+    src: &impl DevicePtr<T>,
+    dst: &mut impl DevicePtrMut<T>,
+) -> Result<()> {
+    k.stream.memcpy_dtod(src, dst)?;
+    k.d2d.set(k.d2d.get() + src.num_bytes() as u64);
+    Ok(())
+}
+
+fn upload_origin(k: &Kern, start: &mut CudaSlice<i32>, origin: i32) -> Result<()> {
+    copy_h2d(k, &[origin], start)
 }
 
 fn rank3(
@@ -426,9 +441,9 @@ fn domain(meta: &CudaSlice<i32>, stream: &Arc<CudaStream>, rows: usize) -> Resul
     })
 }
 
-fn set_meta(stream: &Arc<CudaStream>, meta: &mut CudaSlice<i32>, rows: usize) -> Result<()> {
+fn set_meta(k: &Kern, meta: &mut CudaSlice<i32>, rows: usize) -> Result<()> {
     let rows = i32::try_from(rows)?;
-    copy_h2d(stream, &[0, rows, rows, rows, 1, 0, 0, 0], meta)
+    copy_h2d(k, &[0, rows, rows, rows, 1, 0, 0, 0], meta)
 }
 
 fn qkv_layout(
@@ -553,7 +568,6 @@ fn rope(
     table: &CudaSlice<bf16>,
     g: RopeGeom,
 ) -> Result<()> {
-    copy_h2d(&k.stream, &[g.start], &mut buf.start)?;
     match g.slot {
         KvSlot::Shared => rope_launch(
             k,
@@ -620,6 +634,7 @@ fn rope_launch(k: &Kern, bind: RopeBind<'_>, g: RopeGeom) -> Result<()> {
     let v_offset = u64::try_from(g.v_offset)?;
     let v_stride = u64::try_from(g.v_row_stride)?;
     let ring = 0i32;
+    let cache_start = -1i32; // cache_start < 0 writes KV at *start + row.
     let grid = g.rows * (g.q_heads + 2 * g.kv_heads);
     unsafe {
         k.stream
@@ -631,7 +646,7 @@ fn rope_launch(k: &Kern, bind: RopeBind<'_>, g: RopeGeom) -> Result<()> {
             .arg(bind.kn)
             .arg(bind.table)
             .arg(bind.start)
-            .arg(&g.cache_start)
+            .arg(&cache_start)
             .arg(&rows)
             .arg(&q_heads)
             .arg(&kv_heads)
@@ -649,50 +664,86 @@ fn rope_launch(k: &Kern, bind: RopeBind<'_>, g: RopeGeom) -> Result<()> {
     Ok(())
 }
 
-fn embed_tokens(
-    k: &Kern,
-    weight: &CudaSlice<bf16>,
-    ids: &CudaSlice<u32>,
-    y: &mut CudaSlice<bf16>,
+struct Embed<'a> {
+    weight: &'a CudaSlice<bf16>,
+    ids: &'a CudaSlice<u32>,
+    y: &'a mut CudaSlice<bf16>,
+    id_off: usize,
+    y_off: usize,
     rows: usize,
     dim: usize,
-) -> Result<()> {
+}
+
+fn embed_tokens(k: &Kern, call: Embed<'_>) -> Result<()> {
+    let Embed {
+        weight,
+        ids,
+        y,
+        id_off,
+        y_off,
+        rows,
+        dim,
+    } = call;
+    let id_end = id_off.checked_add(rows).context("embed ids")?;
+    let y_elems = rows.checked_mul(dim).context("embed")?;
+    let y_end = y_off.checked_add(y_elems).context("embed")?;
+    ensure!(id_end <= ids.len() && y_end <= y.len(), "embed");
     let rows_i = i32::try_from(rows)?;
     let dim_i = i32::try_from(dim)?;
+    let ids = ids.slice(id_off..id_end);
+    let mut y = y.slice_mut(y_off..y_end);
     unsafe {
         k.stream
             .launch_builder(&k.ops.embed)
             .arg(weight)
-            .arg(ids)
-            .arg(y)
+            .arg(&ids)
+            .arg(&mut y)
             .arg(&rows_i)
             .arg(&dim_i)
-            .launch(ops::flat(rows * dim))?;
+            .launch(ops::flat(y_elems))?;
     }
     Ok(())
 }
 
-fn download_f32(stream: &Arc<CudaStream>, src: &CudaSlice<bf16>, n: usize) -> Result<Vec<f32>> {
-    download_row(stream, src, 0, n)
-}
-
-fn download_row(
-    stream: &Arc<CudaStream>,
-    src: &CudaSlice<bf16>,
-    row: usize,
-    width: usize,
-) -> Result<Vec<f32>> {
-    let start = row.checked_mul(width).context("score offset")?;
-    let end = start.checked_add(width).context("score offset")?;
+fn download_elems(k: &Kern, src: &CudaSlice<bf16>, start: usize, n: usize) -> Result<Vec<f32>> {
+    let end = start.checked_add(n).context("score offset")?;
     ensure!(end <= src.len(), "score row");
-    let raw = stream.clone_dtoh(&src.slice(start..end))?;
-    stream.synchronize()?;
+    let raw = k.stream.clone_dtoh(&src.slice(start..end))?;
+    k.stream.synchronize()?;
+    k.d2h.set(k.d2h.get() + (n * 2) as u64);
+    k.drains.set(k.drains.get() + 1);
     let out: Vec<f32> = raw.iter().map(|value| value.to_f32()).collect();
     ensure!(
         out.iter().all(|value| value.is_finite()),
         "Runner FAIL non-finite candidate"
     );
     Ok(out)
+}
+
+fn download_f32(k: &Kern, src: &CudaSlice<bf16>, n: usize) -> Result<Vec<f32>> {
+    download_elems(k, src, 0, n)
+}
+
+fn download_row(k: &Kern, src: &CudaSlice<bf16>, row: usize, width: usize) -> Result<Vec<f32>> {
+    let start = row.checked_mul(width).context("score offset")?;
+    download_elems(k, src, start, width)
+}
+
+fn depth_d2d_bytes() -> u64 {
+    (DP_ROWS * DP_H * 2 + HEAD_N * DP_H * 2 + 2 * HEAD_N * (CODEBOOK as usize) * 2) as u64
+}
+
+fn traffic(text_rows: usize, audio_steps: usize, depth_frames: usize) -> (u64, u64, u64, u64) {
+    let passes = audio_steps + 1;
+    let h2d = (text_rows * BB_H * 2) as u64
+        + (passes * 36) as u64
+        + (audio_steps * BOOKS * 4) as u64
+        + (depth_frames * (32 + 64 + BB_H * 2 + 4)) as u64;
+    let d2h =
+        (passes * BB_VOCAB * 2) as u64 + (depth_frames * HEAD_N * (CODEBOOK as usize) * 2) as u64;
+    let d2d = (depth_frames as u64) * depth_d2d_bytes() + (audio_steps * BB_H * 2) as u64;
+    let drains = (passes * 3 + 1 + audio_steps + depth_frames * 5) as u64;
+    (drains, h2d, d2h, d2d)
 }
 
 fn coverage() -> BTreeSet<(usize, usize)> {
@@ -1303,8 +1354,6 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             kv_heads: call.kv_heads,
             dim: call.dim,
             capacity: call.capacity,
-            cache_start: call.start,
-            start: call.start,
             q_row_stride: q_width,
             k_offset: k_off,
             k_row_stride: kv_width,
@@ -1659,7 +1708,8 @@ fn rotate_audio_table(k: &Kern, table: &CudaSlice<bf16>) -> Result<CudaSlice<bf1
         let src_book = audio_source_book(book);
         let src = src_book * block;
         let dst = book * block;
-        k.stream.memcpy_dtod(
+        copy_d2d(
+            k,
             &table.slice(src..src + block),
             &mut scratch.slice_mut(dst..dst + block),
         )?;
@@ -1679,9 +1729,9 @@ fn sum_audio(
     for &id in codes {
         ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
     }
-    copy_h2d(&k.stream, codes, &mut buf.ids.slice_mut(..codes.len()))?;
+    copy_h2d(k, codes, &mut buf.ids.slice_mut(..codes.len()))?;
     launch_row_sum(k, table, &buf.ids, &mut buf.audio, rows, BB_H)?;
-    let wide = download_f32(&k.stream, &buf.audio, rows * BB_H)?;
+    let wide = download_f32(k, &buf.audio, rows * BB_H)?;
     Ok(wide.into_iter().map(bf16::from_f32).collect())
 }
 
@@ -1783,14 +1833,72 @@ fn depth_frame(k: &Kern, buf: &mut Buf, blas: &Blas, input: DepthIn<'_>) -> Resu
         slot,
     } = input;
     ensure!(cond.len() == BB_H && ids.len() == DP_ROWS, "depth frame");
+    stage_depth_ids(k, buf, ids)?;
+    embed_tokens(
+        k,
+        Embed {
+            weight: embed,
+            ids: &buf.tok,
+            y: &mut buf.embed_ws,
+            id_off: 0,
+            y_off: 0,
+            rows: DP_ROWS,
+            dim: BB_H,
+        },
+    )?;
+    stage_depth_cond(k, buf, cond)?;
+    upload_origin(k, &mut buf.start, 0)?;
+    depth_after(
+        k,
+        buf,
+        blas,
+        DepthRun {
+            layers,
+            norm,
+            projector,
+            table,
+            flash,
+            frame,
+            slot,
+        },
+    )
+}
+
+fn stage_depth_ids(k: &Kern, buf: &mut Buf, ids: &[u32]) -> Result<()> {
+    ensure!(ids.len() == DP_ROWS, "depth frame");
     k.stream.memset_zeros(&mut buf.embed_ws)?;
-    copy_h2d(&k.stream, ids, &mut buf.tok.slice_mut(..DP_ROWS))?;
-    embed_tokens(k, embed, &buf.tok, &mut buf.embed_ws, DP_ROWS, BB_H)?;
+    copy_h2d(k, ids, &mut buf.tok.slice_mut(..DP_ROWS))
+}
+
+fn stage_depth_cond(k: &Kern, buf: &mut Buf, cond: &[f32]) -> Result<()> {
+    ensure!(cond.len() == BB_H, "depth frame");
     let mut row = vec![bf16::ZERO; BB_H];
     for (dst, &value) in row.iter_mut().zip(cond.iter()) {
         *dst = bf16::from_f32(value);
     }
-    copy_h2d(&k.stream, &row, &mut buf.embed_ws.slice_mut(..BB_H))?;
+    copy_h2d(k, &row, &mut buf.embed_ws.slice_mut(..BB_H))
+}
+
+struct DepthRun<'a> {
+    layers: &'a [DecoderLayer],
+    norm: &'a CudaSlice<bf16>,
+    projector: &'a CudaSlice<bf16>,
+    table: &'a CudaSlice<bf16>,
+    flash: &'a mut Flash,
+    frame: usize,
+    slot: KvSlot,
+}
+
+fn depth_after(k: &Kern, buf: &mut Buf, blas: &Blas, run: DepthRun<'_>) -> Result<()> {
+    let DepthRun {
+        layers,
+        norm,
+        projector,
+        table,
+        flash,
+        frame,
+        slot,
+    } = run;
     gemm(
         &k.stream,
         blas,
@@ -1846,9 +1954,7 @@ fn depth_frame(k: &Kern, buf: &mut Buf, blas: &Blas, input: DepthIn<'_>) -> Resu
     )?;
     let n = DP_ROWS * DP_H;
     let dst = frame * n;
-    k.stream
-        .memcpy_dtod(&buf.n.slice(..n), &mut buf.stack.slice_mut(dst..dst + n))?;
-    Ok(())
+    copy_d2d(k, &buf.n.slice(..n), &mut buf.stack.slice_mut(dst..dst + n))
 }
 
 fn depth_heads(
@@ -1866,7 +1972,8 @@ fn depth_heads(
         for frame in 0..frames {
             let src = (frame * DP_ROWS + book + 1) * DP_H;
             let dst = frame * DP_H;
-            k.stream.memcpy_dtod(
+            copy_d2d(
+                k,
                 &buf.stack.slice(src..src + DP_H),
                 &mut buf.head_in.slice_mut(dst..dst + DP_H),
             )?;
@@ -1886,7 +1993,7 @@ fn depth_heads(
                 input: DP_H,
             },
         )?;
-        let part = download_f32(&k.stream, &buf.head_out, frames * vocab)?;
+        let part = download_f32(k, &buf.head_out, frames * vocab)?;
         for frame in 0..frames {
             let dst = (frame * HEAD_N + book) * vocab;
             let src = frame * vocab;
@@ -1926,7 +2033,7 @@ fn upload_hidden(k: &Kern, buf: &mut Buf, src: &[f32]) -> Result<()> {
         "non-finite hidden"
     );
     let host: Vec<bf16> = src.iter().copied().map(bf16::from_f32).collect();
-    copy_h2d(&k.stream, &host, &mut buf.h.slice_mut(..host.len()))
+    copy_h2d(k, &host, &mut buf.h.slice_mut(..host.len()))
 }
 
 fn place_audio_row(k: &Kern, table: &CudaSlice<bf16>, buf: &mut Buf, codes: &[i32]) -> Result<()> {
@@ -1934,17 +2041,9 @@ fn place_audio_row(k: &Kern, table: &CudaSlice<bf16>, buf: &mut Buf, codes: &[i3
     for &id in codes {
         ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
     }
-    copy_h2d(&k.stream, codes, &mut buf.ids.slice_mut(..BOOKS))?;
+    copy_h2d(k, codes, &mut buf.ids.slice_mut(..BOOKS))?;
     launch_row_sum(k, table, &buf.ids, &mut buf.audio, 1, BB_H)?;
-    k.stream
-        .memcpy_dtod(&buf.audio.slice(..BB_H), &mut buf.h.slice_mut(..BB_H))?;
-    Ok(())
-}
-
-fn clear_depth_kv(k: &Kern, buf: &mut Buf) -> Result<()> {
-    k.stream.memset_zeros(&mut buf.dk)?;
-    k.stream.memset_zeros(&mut buf.dv)?;
-    Ok(())
+    copy_d2d(k, &buf.audio.slice(..BB_H), &mut buf.h.slice_mut(..BB_H))
 }
 
 fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> Result<Vec<f32>> {
@@ -1955,7 +2054,8 @@ fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> R
         .context("backbone cache")?;
     ensure!(end <= BB_MAX, "backbone cache");
     ensure!(pass.layers.len() == BB_LAYERS, "backbone layers");
-    set_meta(&k.stream, &mut buf.meta, pass.rows)?;
+    set_meta(k, &mut buf.meta, pass.rows)?;
+    upload_origin(k, &mut buf.start, pass.origin)?;
     let geom = DecGeom {
         rows: pass.rows,
         hidden: BB_H,
@@ -2009,7 +2109,7 @@ fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> R
             input: BB_H,
         },
     )?;
-    download_row(&k.stream, &buf.d, pass.score_row, BB_VOCAB)
+    download_row(k, &buf.d, pass.score_row, BB_VOCAB)
 }
 
 fn depth_input(codes: &[i32]) -> Result<[u32; DP_ROWS]> {
@@ -2029,10 +2129,11 @@ fn depth_head_row(
     frame: usize,
     book: usize,
     plant: bool,
-) -> Result<Vec<f32>> {
+) -> Result<()> {
     let vocab = CODEBOOK as usize;
     let src = (frame * DP_ROWS + book + 1) * DP_H;
-    k.stream.memcpy_dtod(
+    copy_d2d(
+        k,
         &buf.stack.slice(src..src + DP_H),
         &mut buf.head_in.slice_mut(..DP_H),
     )?;
@@ -2050,13 +2151,53 @@ fn depth_head_row(
             output: vocab,
             input: DP_H,
         },
-    )?;
-    download_f32(&k.stream, &buf.head_out, vocab)
+    )
+}
+
+fn depth_pack(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    heads: &[CudaSlice<bf16>],
+    frame: usize,
+    plant: bool,
+) -> Result<()> {
+    let vocab = CODEBOOK as usize;
+    let pack = gemm_rows(1, DP_H) * vocab;
+    let packed = HEAD_N * vocab;
+    ensure!(
+        pack + packed <= buf.head_out.len() && vocab <= buf.head_in.len(),
+        "head pack"
+    );
+    for book in 0..HEAD_N {
+        depth_head_row(k, buf, blas, heads, frame, book, plant)?;
+        copy_d2d(
+            k,
+            &buf.head_out.slice(..vocab),
+            &mut buf.head_in.slice_mut(..vocab),
+        )?;
+        let dst = pack + book * vocab;
+        copy_d2d(
+            k,
+            &buf.head_in.slice(..vocab),
+            &mut buf.head_out.slice_mut(dst..dst + vocab),
+        )?;
+    }
+    Ok(())
+}
+
+fn clear_depth_kv(k: &Kern, buf: &mut Buf) -> Result<()> {
+    k.stream.memset_zeros(&mut buf.dk)?;
+    k.stream.memset_zeros(&mut buf.dv)?;
+    Ok(())
 }
 
 fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Result<Vec<f32>> {
-    set_meta(&k.stream, &mut buf.meta, DP_ROWS)?;
+    set_meta(k, &mut buf.meta, DP_ROWS)?;
     let ids = depth_input(step.codes)?;
+    let vocab = CODEBOOK as usize;
+    let pack = gemm_rows(1, DP_H) * vocab;
+    let packed = HEAD_N * vocab;
     depth_frame(
         k,
         buf,
@@ -2075,19 +2216,8 @@ fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Resu
         },
     )?;
     clear_depth_kv(k, buf)?;
-    let mut out = Vec::with_capacity(HEAD_N * (CODEBOOK as usize));
-    for book in 0..HEAD_N {
-        out.extend(depth_head_row(
-            k,
-            buf,
-            blas,
-            &step.w.heads,
-            step.frame,
-            book,
-            step.plant,
-        )?);
-    }
-    Ok(out)
+    depth_pack(k, buf, blas, &step.w.heads, step.frame, step.plant)?;
+    download_elems(k, &buf.head_out, pack, packed)
 }
 
 fn decode_shape(
@@ -2178,11 +2308,13 @@ impl Breeze {
             TEXT_MAX,
         )
         .context("text sliding attention")?;
-        let backbone_flash = Flash::new(stream.clone(), BB_MAX, BB_HEADS, BB_KV, BB_DIM)
+        let mut backbone_flash = Flash::new(stream.clone(), BB_MAX, BB_HEADS, BB_KV, BB_DIM)
             .context("backbone attention")?;
-        let depth_flash = Flash::new(stream.clone(), DP_ROWS, DP_HEADS, DP_KV, DP_DIM)
+        let mut depth_flash = Flash::new(stream.clone(), DP_ROWS, DP_HEADS, DP_KV, DP_DIM)
             .context("depth attention")?;
         let buf = alloc_buf(&stream)?;
+        backbone_flash.bind_position(&buf.start, BB_MAX - 1)?;
+        depth_flash.bind_position(&buf.start, DP_ROWS - 1)?;
         let mut blas = Blas::new(
             &device,
             &ops,
@@ -2212,6 +2344,10 @@ impl Breeze {
                 table_identity,
                 table_backbone,
                 table_depth,
+                drains: Cell::new(0),
+                h2d: Cell::new(0),
+                d2h: Cell::new(0),
+                d2d: Cell::new(0),
             },
             flash: Flashes {
                 text_full,
@@ -2246,9 +2382,21 @@ impl Breeze {
         } = *self;
         let slide_left = flash.slide_left;
         ensure!(slide_left > 0, "sliding window left");
-        set_meta(&k.stream, &mut buf.meta, rows)?;
-        copy_h2d(&k.stream, token_ids, &mut buf.tok.slice_mut(..rows))?;
-        embed_tokens(k, &w.text_embed, &buf.tok, &mut buf.h, rows, TEXT_H)?;
+        set_meta(k, &mut buf.meta, rows)?;
+        copy_h2d(k, token_ids, &mut buf.tok.slice_mut(..rows))?;
+        upload_origin(k, &mut buf.start, 0)?;
+        embed_tokens(
+            k,
+            Embed {
+                weight: &w.text_embed,
+                ids: &buf.tok,
+                y: &mut buf.h,
+                id_off: 0,
+                y_off: 0,
+                rows,
+                dim: TEXT_H,
+            },
+        )?;
         for index in 0..w.text.len() {
             let unwindowed = w.text[index].full || plant == TextPlant::WindowIgnored;
             let window_left = if unwindowed { None } else { Some(slide_left) };
@@ -2290,7 +2438,7 @@ impl Breeze {
                 input: TEXT_H,
             },
         )?;
-        download_f32(&k.stream, &buf.d, rows * TEXT_OUT)
+        download_f32(k, &buf.d, rows * TEXT_OUT)
     }
 
     pub fn sliding_layer(&mut self, hidden: &[f32], plant: TextPlant) -> Result<Vec<f32>> {
@@ -2316,8 +2464,9 @@ impl Breeze {
             ..
         } = *self;
         ensure!(!w.text[0].full, "layer 0 is full");
-        copy_h2d(&k.stream, &host, &mut buf.h.slice_mut(..host.len()))?;
-        set_meta(&k.stream, &mut buf.meta, rows)?;
+        copy_h2d(k, &host, &mut buf.h.slice_mut(..host.len()))?;
+        set_meta(k, &mut buf.meta, rows)?;
+        upload_origin(k, &mut buf.start, 0)?;
         let slide_left = flash.slide_left;
         ensure!(slide_left > 0, "sliding window left");
         let ignored = plant == TextPlant::WindowIgnored;
@@ -2332,7 +2481,7 @@ impl Breeze {
         } else {
             text_layer(&w.text[0], k, &mut flash.text_slide, buf, blas, step)?;
         }
-        download_f32(&k.stream, &buf.h, rows * TEXT_H)
+        download_f32(k, &buf.h, rows * TEXT_H)
     }
 
     pub fn backbone(
@@ -2386,8 +2535,9 @@ impl Breeze {
             Some(sum_audio(k, &w.audio, buf, &zeros, 1)?)
         };
         let hidden = assemble_hidden(projected, positions, &audio, eos.as_deref())?;
-        copy_h2d(&k.stream, &hidden, &mut buf.h.slice_mut(..hidden.len()))?;
-        set_meta(&k.stream, &mut buf.meta, rows)?;
+        copy_h2d(k, &hidden, &mut buf.h.slice_mut(..hidden.len()))?;
+        set_meta(k, &mut buf.meta, rows)?;
+        upload_origin(k, &mut buf.start, 0)?;
         let geom = DecGeom {
             rows,
             hidden: BB_H,
@@ -2441,7 +2591,7 @@ impl Breeze {
                 input: BB_H,
             },
         )?;
-        download_f32(&k.stream, &buf.d, rows * BB_VOCAB)
+        download_f32(k, &buf.d, rows * BB_VOCAB)
     }
 
     pub fn depth(
@@ -2472,7 +2622,7 @@ impl Breeze {
             ref blas,
             ..
         } = *self;
-        set_meta(&k.stream, &mut buf.meta, DP_ROWS)?;
+        set_meta(k, &mut buf.meta, DP_ROWS)?;
         for frame in 0..frames {
             let cond_row = &cond[frame * BB_H..(frame + 1) * BB_H];
             depth_frame(
@@ -2516,6 +2666,10 @@ impl Breeze {
             ref blas,
             ..
         } = *self;
+        k.drains.set(0);
+        k.h2d.set(0);
+        k.d2h.set(0);
+        k.d2d.set(0);
         upload_hidden(k, buf, projected)?;
         let mut backbone = Vec::with_capacity((audio_steps + 1) * BB_VOCAB);
         let mut depth = Vec::with_capacity(depth_frames * HEAD_N * (CODEBOOK as usize));
@@ -2595,6 +2749,21 @@ impl Breeze {
             CODEBOOK as usize * 4,
             depth_frames * HEAD_N,
             depth_frames
+        );
+        let (drains, h2d, d2h, d2d) = traffic(text_rows, audio_steps, depth_frames);
+        eprintln!(
+            "TRAFFIC drains={drains} h2d={h2d} d2h={d2h} d2d={d2d} got_drains={} got_h2d={} got_d2h={} got_d2d={}",
+            k.drains.get(),
+            k.h2d.get(),
+            k.d2h.get(),
+            k.d2d.get()
+        );
+        ensure!(
+            k.drains.get() == drains
+                && k.h2d.get() == h2d
+                && k.d2h.get() == d2h
+                && k.d2d.get() == d2d,
+            "traffic"
         );
         Ok((backbone, depth))
     }
@@ -4310,6 +4479,14 @@ mod tests {
     #[test]
     #[ignore = "requires GPU lease, frozen floors, and external fixtures"]
     fn n8_m1_candidate() -> Result<()> {
+        ensure!(
+            super::traffic(M1_TEXT, M1_AUDIO, M1_STEPS) == (36, 45_792, 262_536, 758_480),
+            "m1 score traffic"
+        );
+        ensure!(
+            super::traffic(203, 63, 64) == (576, 1_106_368, 4_200_576, 12_197_120),
+            "production score traffic"
+        );
         let weights = env_path("N8_WEIGHTS", true)?;
         let floors = env_path("N8_M1_FLOORS", false)?;
         let cpu_path = env_path("N8_M1_CPU", false)?;
