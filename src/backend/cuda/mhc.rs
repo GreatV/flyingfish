@@ -1284,6 +1284,11 @@ mod tests {
                     s.clone_dtoh(&partials)?.iter().all(|v| v.is_finite()),
                     "Runner FAIL split partials were not written"
                 );
+            } else {
+                ensure!(
+                    s.clone_dtoh(&partials)?.iter().all(|v| v.is_nan()),
+                    "Runner FAIL saturated rows used split workspace"
+                );
             }
             launch(true, true)?;
             ensure!(

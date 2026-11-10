@@ -572,6 +572,9 @@ impl HcRuntime {
         self.head_pre = s.clone_htod(&vec![1.0 / mult as f32; rows * mult])?;
         self.mix_post = s.alloc_zeros(rows * mult)?;
         self.mix_comb = s.alloc_zeros(rows * mult * mult)?;
+        if self.mix_partials.is_some() {
+            self.mix_partials = Some(s.alloc_zeros(rows * (mult * (mult + 2) + 1))?);
+        }
         self.rows = rows;
         Ok(())
     }
