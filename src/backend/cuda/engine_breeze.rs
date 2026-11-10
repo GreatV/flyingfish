@@ -2432,12 +2432,6 @@ fn depth_pack(
     Ok(())
 }
 
-fn clear_depth_kv(k: &Kern, buf: &mut Buf) -> Result<()> {
-    k.stream.memset_zeros(&mut buf.dk)?;
-    k.stream.memset_zeros(&mut buf.dv)?;
-    Ok(())
-}
-
 fn depth_step(
     k: &Kern,
     buf: &mut Buf,
@@ -2468,7 +2462,6 @@ fn depth_step(
                 slot: KvSlot::Depth,
             },
         )?;
-        clear_depth_kv(k, buf)?;
         depth_pack(k, buf, blas, &step.w.heads, step.frame, step.plant)?;
         argmax_heads(k, buf)?;
         if !keep_scores {
@@ -2507,7 +2500,6 @@ fn depth_step(
                 slot: KvSlot::Depth,
             },
         )?;
-        clear_depth_kv(k, buf)?;
         depth_pack(k, buf, blas, &step.w.heads, 0, false)?;
         argmax_heads(k, buf)
     })?;
@@ -2991,7 +2983,7 @@ impl Breeze {
         depth_heads(k, buf, blas, &w.heads, frames, plant_head)
     }
 
-    /// Backbone KV is one BB_MAX cache per layer. Each depth frame uses DP_ROWS and is zeroed after the frame.
+    /// Backbone KV is one BB_MAX cache per layer. Depth KV is DP_KV by DP_ROWS by DP_DIM, rewritten at positions 0..DP_ROWS before each depth attention.
     pub fn greedy_decode(
         &mut self,
         projected: &[f32],
@@ -3183,7 +3175,7 @@ impl Breeze {
             "COPY backbone_row_bytes={backbone_row_bytes} backbone_copies={} depth_row_bytes={depth_row_bytes} depth_copies={} depth_kv_clears={}",
             audio_steps + 1,
             depth_frames * HEAD_N,
-            depth_frames
+            0
         );
         let (drains, h2d, d2h, d2d) = if ids_only {
             traffic_ids(text_rows, audio_steps, depth_frames)
