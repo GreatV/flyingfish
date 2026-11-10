@@ -764,13 +764,18 @@ impl VideoDecoder {
         let workspace_before = blas.workspace_bytes();
         self.post_quant.prepare(&device.stream, blas, patches)?;
         self.proj_in.prepare(&device.stream, blas, patches)?;
-        for (_owner, linear) in self.linears().enumerate() {
+        for linear in self.linears() {
             linear.prepare(&device.stream, blas, tokens)?;
+            #[cfg(test)]
+            let owner = self
+                .linears()
+                .position(|item| std::ptr::eq(item, linear))
+                .context("bias owner missing")?;
             #[cfg(test)]
             eprintln!(
                 "{}",
                 serde_json::json!({"h3_vae_bias_owner": {
-                    "owner":_owner,"bias_pointer":pointer(&linear.bias,&device.stream),
+                    "owner":owner,"bias_pointer":pointer(&linear.bias,&device.stream),
                     "output":linear.out,"input":linear.input,"canonical_rows":tokens
                 }})
             );
@@ -803,7 +808,12 @@ impl VideoDecoder {
             let query = (|| -> Result<(f64, usize)> {
                 let mut cost = 0.0;
                 let mut workspace = 0;
-                for (_owner, linear) in self.linears().enumerate() {
+                for linear in self.linears() {
+                    #[cfg(test)]
+                    let owner = self
+                        .linears()
+                        .position(|item| std::ptr::eq(item, linear))
+                        .context("bias owner missing")?;
                     for (active, count) in [(batch, slots / batch), (tail, 1)] {
                         if active == 0 || count == 0 {
                             continue;
@@ -812,7 +822,7 @@ impl VideoDecoder {
                         eprintln!(
                             "{}",
                             serde_json::json!({"h3_vae_batch_query": {
-                                "batch":batch,"active":active,"owner":_owner,"multiplicity":count
+                                "batch":batch,"active":active,"owner":owner,"multiplicity":count
                             }})
                         );
                         let rows = active * tokens;
