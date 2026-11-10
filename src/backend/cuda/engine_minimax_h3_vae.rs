@@ -11,7 +11,9 @@ use crate::backend::cuda::{
     ops::{self, flat},
     verification::Shape,
 };
-use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use crate::backend::gpu::{
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+};
 use crate::checkpoint::TensorManifest;
 use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, VaeSpec, VaeTiles};
 use anyhow::{Context, Result, ensure};
@@ -34,6 +36,103 @@ pub(crate) fn bf16_parameter(name: &str) -> bool {
         || name.ends_with(".norm2.weight")
         || name.ends_with(".scale1")
         || name.ends_with(".scale2"))
+}
+
+pub(crate) fn planar_bf16_to_rgb_u8(
+    device: &Device,
+    kernel: &CudaFunction,
+    input: &impl DevicePtr<bf16>,
+    output: &impl DevicePtr<u8>,
+    (frames, allocated_frames, pixels): (usize, usize, usize),
+    (mean, std): ([f32; 3], [f32; 3]),
+) -> Result<()> {
+    ensure!(
+        frames > 0 && frames <= allocated_frames && pixels > 0,
+        "RGB extent frames={frames} allocated_frames={allocated_frames} pixels={pixels}"
+    );
+    let plane = allocated_frames
+        .checked_mul(pixels)
+        .context("RGB plane overflow")?;
+    let elements = frames
+        .checked_mul(pixels)
+        .context("RGB pixel extent overflow")?;
+    let input_elements = plane.checked_mul(3).context("RGB input extent overflow")?;
+    let output_elements = elements
+        .checked_mul(3)
+        .context("RGB output extent overflow")?;
+    let input_bytes = input_elements
+        .checked_mul(2)
+        .context("RGB input byte extent overflow")?;
+    ensure!(
+        input.len() >= input_elements && output.len() >= output_elements,
+        "RGB needs input {input_elements}/{} and output {output_elements}/{} elements",
+        input.len(),
+        output.len()
+    );
+    ensure!(
+        mean.into_iter().chain(std).all(f32::is_finite),
+        "RGB affine parameters are nonfinite"
+    );
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let active = kernel.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?;
+    let sms = u32::try_from(
+        device
+            .ctx
+            .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+    )?;
+    let grid_limit = u32::try_from(
+        device
+            .ctx
+            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?,
+    )?;
+    let resident = active
+        .checked_mul(sms)
+        .context("RGB resident grid overflow")?;
+    ensure!(resident > 0 && grid_limit > 0, "RGB has no resident blocks");
+    let grid = u32::try_from(
+        elements
+            .div_ceil(256)
+            .min(resident.min(grid_limit) as usize),
+    )?;
+    let s = &device.stream;
+    let source = input.device_ptr(s).0;
+    let target = output.device_ptr(s).0;
+    let source_end = source
+        .checked_add(input_bytes as u64)
+        .context("RGB source address overflow")?;
+    let target_end = target
+        .checked_add(output_elements as u64)
+        .context("RGB target address overflow")?;
+    ensure!(
+        source_end <= target || target_end <= source,
+        "RGB input/output overlap"
+    );
+    unsafe {
+        s.launch_builder(kernel)
+            .arg(&source)
+            .arg(&target)
+            .arg(&(allocated_frames as u64))
+            .arg(&(frames as u64))
+            .arg(&(pixels as u64))
+            .arg(&mean[0])
+            .arg(&mean[1])
+            .arg(&mean[2])
+            .arg(&std[0])
+            .arg(&std[1])
+            .arg(&std[2])
+            .launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_rgb_launch":{"frames":frames,"allocated_frames":allocated_frames,
+        "pixels":pixels,"input_bytes":input_bytes,"output_bytes":output_elements,
+        "grid":grid,"threads":256,"active_blocks_per_sm":active,"sms":sms}})
+    );
+    Ok(())
 }
 
 /// A biased BF16 projection `[out, input]` cast from the published F32 tensor at load.
@@ -95,6 +194,7 @@ struct VaeKernels {
     stitch: CudaFunction,
     frame_blend: CudaFunction,
     latent_rows: CudaFunction,
+    rgb: CudaFunction,
 }
 
 /// Loads published F32 tensors, casting the BF16 set through one F32 device staging buffer.
@@ -262,6 +362,54 @@ fn tile_batch_budget_keeps_serial_minimum() -> Result<()> {
 }
 
 impl VideoDecoder {
+    pub(crate) fn rgb(
+        &self,
+        device: &Device,
+        decoded: &CudaSlice<bf16>,
+        shape: (usize, usize, usize),
+    ) -> Result<CudaSlice<u8>> {
+        ensure!(
+            self.spec.out_channels == 3,
+            "RGB conversion requires three decoder channels"
+        );
+        ensure!(
+            shape.0 > 0 && shape.0 <= shape.1 && shape.2 > 0,
+            "invalid RGB conversion shape {shape:?}"
+        );
+        let bytes = shape
+            .0
+            .checked_mul(shape.2)
+            .and_then(|n| n.checked_mul(3))
+            .context("RGB output byte extent overflow")?;
+        device.stream.synchronize()?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let reserve = total / 16;
+        let budget = device.workspace_budget(free, free, reserve)?;
+        ensure!(
+            bytes <= budget,
+            "RGB output {bytes} B exceeds conversion budget {budget} B"
+        );
+        // Every output byte is written by planar_bf16_to_rgb_u8 before transfer.
+        let output = unsafe { device.stream.alloc::<u8>(bytes)? };
+        planar_bf16_to_rgb_u8(
+            device,
+            &self.kernels.rgb,
+            decoded,
+            &output,
+            shape,
+            (
+                VAE_PIXEL_MEAN.map(|v| v as f32),
+                VAE_PIXEL_STD.map(|v| v as f32),
+            ),
+        )?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_rgb_memory":{"free_before_output_bytes":free,
+            "total_bytes":total,"safety_reserve_bytes":reserve,"output_bytes":bytes,"workspace_budget_bytes":budget}})
+        );
+        Ok(output)
+    }
+
     #[cfg(test)]
     pub(crate) fn batch_identity_gate(
         &self,
@@ -1053,6 +1201,7 @@ impl VideoDecoder {
             stitch: vision.load_function("tile_stitch_bf16")?,
             frame_blend: vision.load_function("frame_blend_bf16")?,
             latent_rows: vision.load_function("latent_rows_bf16")?,
+            rgb: vision.load_function("planar_bf16_to_rgb_u8")?,
         };
         let (dim, latent, ffn) = (spec.dim, spec.latent_channels, spec.ffn);
         let largest = (2 * ffn * dim).max(spec.patch_width() * dim);
