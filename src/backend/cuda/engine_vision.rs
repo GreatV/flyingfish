@@ -6526,6 +6526,7 @@ pub struct TrellisImageConditioner {
     encoder: DinoEncoder<f32>,
     workspace: DinoWorkspace<f32>,
     capture: Vec<CudaSlice<f32>>,
+    captured_order: Vec<usize>,
     pub allocated_bytes: usize,
 }
 
@@ -6588,6 +6589,7 @@ impl TrellisImageConditioner {
             encoder,
             workspace,
             capture,
+            captured_order: Vec::new(),
             allocated_bytes: free_before - free_after,
         })
     }
@@ -6604,14 +6606,17 @@ impl TrellisImageConditioner {
         self.encoder
             .embed(&self.stream, blas, &mut self.workspace)?;
         let last = self.encoder.layers.len() - 1;
+        self.captured_order.clear();
         {
             let capture = &mut self.capture;
             let stream = &self.stream;
+            let order = &mut self.captured_order;
             stream.memcpy_dtod(&self.workspace.x_a, &mut capture[0])?;
             let mut slot = 1usize;
             let mut tap = |index: usize, values: &CudaSlice<f32>| -> Result<()> {
                 if index != last && captured_blocks.contains(&index) {
                     stream.memcpy_dtod(values, &mut capture[slot])?;
+                    order.push(index);
                     slot += 1;
                 }
                 Ok(())
@@ -6634,10 +6639,15 @@ impl TrellisImageConditioner {
         let last = self.encoder.layers.len() - 1;
         let embedding = self.stream.clone_dtoh(&self.capture[0])?.to_vec();
         let mut blocks: Vec<(usize, Vec<f32>)> = Vec::with_capacity(captured_blocks.len());
-        for (slot, block) in captured_blocks.iter().enumerate() {
+        for block in captured_blocks {
             let values = if *block == last {
                 final_hidden.clone()
             } else {
+                let slot = self
+                    .captured_order
+                    .iter()
+                    .position(|index| index == block)
+                    .with_context(|| format!("block {block} stage missing"))?;
                 self.stream.clone_dtoh(&self.capture[1 + slot])?.to_vec()
             };
             blocks.push((*block, values));
@@ -11511,6 +11521,70 @@ mod tests {
         println!(
             "PASS T2_M2_CONDITIONING cells={scored} blocks=3 stages=16 exact_preprocessing=4 graph_eager_bit_identical=true"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "capture-order discriminator: FF_T2_DINO_MODEL FF_T2_CONDITIONING_ORDER_INPUT"]
+    fn trellis_conditioner_capture_order_gpu() -> Result<()> {
+        let dino_dir: std::path::PathBuf = std::env::var_os("FF_T2_DINO_MODEL")
+            .map(Into::into)
+            .context("FF_DINOV2_MODEL missing")?;
+        let input: std::path::PathBuf = std::env::var_os("FF_T2_CONDITIONING_ORDER_INPUT")
+            .map(Into::into)
+            .context("FF_T2_CONDITIONING_ORDER_INPUT missing")?;
+        let device = Device::new(0)?;
+        let output = input
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let mut blas = test_blas(
+            &device,
+            &output,
+            std::rc::Rc::new(crate::backend::cuda::closure::Closure::new(
+                false,
+                "capture order discriminator".into(),
+            )),
+        )?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = (total - total / 8).saturating_sub(total - free);
+        let mut conditioner =
+            TrellisImageConditioner::load(&device, &mut blas, &dino_dir, 512, &[23, 0, 11], limit)?;
+        let bytes = std::fs::read(&input)?;
+        let mut chw = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.as_chunks::<4>().0 {
+            chw.push(f32::from_le_bytes(*chunk));
+        }
+        let descending = conditioner.encode_stages(&blas, &chw, &[23, 0, 11])?;
+        let ascending = conditioner.encode_stages(&blas, &chw, &[0, 11, 23])?;
+        ensure!(
+            descending.embedding.len() == ascending.embedding.len()
+                && descending
+                    .embedding
+                    .iter()
+                    .zip(&ascending.embedding)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "embedding differs across capture orders"
+        );
+        fn find(stages: &TrellisConditioningStages, block: usize) -> Result<&[f32]> {
+            Ok(stages
+                .blocks
+                .iter()
+                .find(|(index, _)| *index == block)
+                .with_context(|| format!("block {block} missing"))?
+                .1
+                .as_slice())
+        }
+        for block in [0usize, 11, 23] {
+            let a = find(&descending, block)?;
+            let b = find(&ascending, block)?;
+            ensure!(
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "block {block} differs across capture orders"
+            );
+        }
+        println!("PASS T2_M2_CAPTURE_ORDER blocks=23,0,11_vs_0,11,23 identical=true");
         Ok(())
     }
 
