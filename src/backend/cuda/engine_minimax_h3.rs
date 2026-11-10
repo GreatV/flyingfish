@@ -329,6 +329,7 @@ fn ffn_chunk(rows: usize) -> usize {
 #[derive(Clone, Copy, Debug)]
 struct FfnPlan {
     chunk: usize,
+    borrowed: bool,
     allocation: usize,
     workspace: usize,
     tensor_cost: f64,
@@ -336,6 +337,12 @@ struct FfnPlan {
 }
 
 impl FfnPlan {
+    fn alias_capacity(attention: (usize, usize), ffn: usize) -> Result<usize> {
+        ensure!(ffn > 0, "zero FFN width");
+        let hidden = ffn.checked_mul(2).context("FFN hidden width overflow")?;
+        Ok((attention.0 / hidden).min(attention.1 / ffn))
+    }
+
     fn allocation(chunk: usize, ffn: usize) -> Result<usize> {
         chunk
             .checked_mul(ffn)
@@ -680,8 +687,9 @@ pub(crate) struct BlockWork {
     q: CudaSlice<bf16>,
     k: CudaSlice<bf16>,
     lora: CudaSlice<bf16>,
-    hidden: CudaSlice<bf16>,
-    gated: CudaSlice<bf16>,
+    hidden: Tensor<bf16, 2>,
+    gated: Tensor<bf16, 2>,
+    ffn_owned: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
 }
 
 impl BlockWork {
@@ -737,6 +745,7 @@ impl BlockWork {
     ) -> Result<FfnPlan> {
         let mut plan = FfnPlan {
             chunk,
+            borrowed: false,
             allocation: if chunk == self.chunk {
                 0
             } else {
@@ -817,14 +826,42 @@ impl BlockWork {
         Ok(choices)
     }
 
+    fn alias_choices(&self, blas: &Blas, spec: &H3Spec, owned: FfnPlan) -> Result<Vec<FfnPlan>> {
+        let capacity = FfnPlan::alias_capacity((self.q_raw.len(), self.k_raw.len()), spec.ffn)?;
+        let mut choices = vec![owned];
+        for chunks in 1..=self.rows.div_ceil(self.chunk) {
+            let chunk = self.rows.div_ceil(chunks);
+            let tail = self.rows % chunk;
+            if chunk > capacity || (tail > 0 && tail <= crate::linear_plan::MAX_SKINNY_ROWS) {
+                continue;
+            }
+            let mut plan = match self.ffn_cost(blas, spec, chunk, false) {
+                Ok(plan) => plan,
+                Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
+                    .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
+                    eprintln!("FFN_ALIAS_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                    continue;
+                }
+                Err(error) => return Err(error.context(format!("FFN alias rows={} chunk={chunk}",self.rows))),
+            };
+            if plan.tensor_cost <= owned.tensor_cost && plan.launches <= owned.launches {
+                plan.borrowed = true;
+                plan.allocation = 0;
+                choices.push(plan);
+            }
+        }
+        Ok(choices)
+    }
+
     fn bind_ffn(
         &mut self,
         s: &Arc<CudaStream>,
         blas: &Blas,
         spec: &H3Spec,
         plan: FfnPlan,
+        x: &CudaSlice<bf16>,
     ) -> Result<()> {
-        let allocation = if plan.chunk == self.chunk {
+        let allocation = if plan.borrowed || plan.chunk == self.chunk {
             0
         } else {
             FfnPlan::allocation(plan.chunk, spec.ffn)?
@@ -833,13 +870,47 @@ impl BlockWork {
             plan.chunk >= self.chunk && plan.chunk <= self.rows && plan.allocation == allocation,
             "FFN binding differs from the counted allocation"
         );
-        if plan.chunk != self.chunk {
+        if plan.borrowed {
+            self.hidden = rows_view(&self.q_raw, s, 0, plan.chunk, 2 * spec.ffn, 2 * spec.ffn)?;
+            self.gated = rows_view(&self.k_raw, s, 0, plan.chunk, spec.ffn, spec.ffn)?;
+            self.ffn_owned = None;
+        } else if plan.chunk != self.chunk {
             let hidden = s.alloc_zeros::<bf16>(plan.chunk * 2 * spec.ffn)?;
             let gated = s.alloc_zeros::<bf16>(plan.chunk * spec.ffn)?;
-            self.hidden = hidden;
-            self.gated = gated;
-            self.chunk = plan.chunk;
+            self.hidden = matrix(&hidden, s, plan.chunk, 2 * spec.ffn)?;
+            self.gated = matrix(&gated, s, plan.chunk, spec.ffn)?;
+            self.ffn_owned = Some((hidden, gated));
         }
+        crate::backend::cuda::contracts::no_overlap(
+            &self.hidden,
+            &self.gated,
+            "FFN hidden",
+            "FFN gated",
+        )?;
+        for (name, protected) in [
+            ("normed", &self.normed),
+            ("LoRA", &self.lora),
+            ("residual", x),
+        ] {
+            let protected = matrix(protected, s, 1, protected.len())?;
+            crate::backend::cuda::contracts::no_overlap(
+                &self.hidden,
+                &protected,
+                "FFN hidden",
+                name,
+            )?;
+            crate::backend::cuda::contracts::no_overlap(
+                &self.gated,
+                &protected,
+                "FFN gated",
+                name,
+            )?;
+        }
+        self.chunk = plan.chunk;
+        ensure!(
+            self.hidden.ptr.is_multiple_of(256) && self.gated.ptr.is_multiple_of(256),
+            "FFN view alignment"
+        );
         self.fixed_lora = true;
         self.prepare(blas, spec)?;
         if self.rows > FFN_CHUNK_ROWS {
@@ -858,6 +929,19 @@ impl BlockWork {
         let width = spec.heads * spec.head_dim;
         let chunk = ffn_chunk(rows);
         let attention = || s.alloc_zeros::<bf16>(rows * width);
+        let normed = s.alloc_zeros::<bf16>(rows * spec.hidden)?;
+        let (q_raw, k_raw, v_raw, q, k) = (
+            attention()?,
+            attention()?,
+            attention()?,
+            attention()?,
+            attention()?,
+        );
+        let lora = s.alloc_zeros::<bf16>(rows * 3 * rank)?;
+        let hidden = s.alloc_zeros::<bf16>(chunk * 2 * spec.ffn)?;
+        let gated = s.alloc_zeros::<bf16>(chunk * spec.ffn)?;
+        let hidden_view = matrix(&hidden, s, chunk, 2 * spec.ffn)?;
+        let gated_view = matrix(&gated, s, chunk, spec.ffn)?;
         Ok(Self {
             rows,
             rank,
@@ -865,15 +949,16 @@ impl BlockWork {
             fixed_lora: false,
             #[cfg(test)]
             repeat_ffn_input: false,
-            normed: s.alloc_zeros::<bf16>(rows * spec.hidden)?,
-            q_raw: attention()?,
-            k_raw: attention()?,
-            v_raw: attention()?,
-            q: attention()?,
-            k: attention()?,
-            lora: s.alloc_zeros::<bf16>(rows * 3 * rank)?,
-            hidden: s.alloc_zeros::<bf16>(chunk * 2 * spec.ffn)?,
-            gated: s.alloc_zeros::<bf16>(chunk * spec.ffn)?,
+            normed,
+            q_raw,
+            k_raw,
+            v_raw,
+            q,
+            k,
+            lora,
+            hidden: hidden_view,
+            gated: gated_view,
+            ffn_owned: Some((hidden, gated)),
         })
     }
 }
@@ -927,42 +1012,35 @@ pub(crate) struct BlockContext<'a> {
     pub lora_scale: f32,
 }
 
-/// Dense rows of `width` elements starting `offset` elements into `buffer`.
-#[derive(Clone, Copy)]
-struct Operand<'a> {
-    buffer: &'a CudaSlice<bf16>,
-    offset: usize,
-    width: usize,
-}
-
-/// `y += lora_scale * (x * a^T) * b^T` for one LoRA pair; `x * a^T` is staged in `work` with row pitch `rank`.
+/// `y += lora_scale * (x * a^T) * b^T`; the intermediate row pitch is `rank`.
 fn lora_pair(
     c: &BlockContext<'_>,
-    x: Operand<'_>,
+    x: Tensor<bf16, 2>,
     (a, b): (&CudaSlice<bf16>, &CudaSlice<bf16>),
     work: &mut CudaSlice<bf16>,
-    y: Operand<'_>,
-    rows: usize,
+    y: Tensor<bf16, 2>,
     fixed: bool,
 ) -> Result<()> {
-    ensure!(a.len().is_multiple_of(x.width), "LoRA-A extent");
-    let rank = a.len() / x.width;
-    let aw = matrix(a, c.s, rank, x.width)?;
-    let ax = rows_view(x.buffer, c.s, x.offset, rows, x.width, x.width)?;
+    let input = x.shape[1] as usize;
+    let output = y.shape[1] as usize;
+    let rows = x.shape[0] as usize;
+    ensure!(a.len().is_multiple_of(input), "LoRA-A extent");
+    let rank = a.len() / input;
+    let aw = matrix(a, c.s, rank, input)?;
     let mut ay = TensorMut(rows_view(work, c.s, 0, rows, rank, rank)?);
     if fixed {
-        c.blas.linear_row_family(aw, ax, &mut ay, 1.0, 0.0)?;
+        c.blas.linear_row_family(aw, x, &mut ay, 1.0, 0.0)?;
     } else {
         c.blas.linear_typed(
             crate::op_contract::ExecutionPhase::Prefill,
             crate::backend::cuda::linear::LinearWeightRef::Bf16(aw),
-            ax,
+            x,
             &mut ay,
         )?;
     }
-    let bw = matrix(b, c.s, y.width, rank)?;
+    let bw = matrix(b, c.s, output, rank)?;
     let bx = rows_view(work, c.s, 0, rows, rank, rank)?;
-    let mut by = TensorMut(rows_view(y.buffer, c.s, y.offset, rows, y.width, y.width)?);
+    let mut by = TensorMut(y);
     if fixed {
         c.blas.linear_row_family(bw, bx, &mut by, c.lora_scale, 1.0)
     } else {
@@ -982,7 +1060,7 @@ pub(crate) fn block_forward(
 ) -> Result<()> {
     let (s, blas, kernels, spec, lora_scale) = (c.s, c.blas, c.kernels, c.spec, c.lora_scale);
     let rows = work.rows;
-    let (h, width, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, w.rank);
+    let (h, width, r) = (spec.hidden, spec.heads * spec.head_dim, w.rank);
     let (rotary_width, rotary_table, modulation) = match conditioning {
         Conditioning::Modulated { rotary, modulation } => {
             ensure!(
@@ -1076,12 +1154,12 @@ pub(crate) fn block_forward(
         }
         Ok(())
     };
-    let base = |index: usize, x: Operand<'_>, y: Operand<'_>, count: usize| -> Result<()> {
+    let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
         blas.linear_typed(
             crate::op_contract::ExecutionPhase::Prefill,
             crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
-            rows_view(x.buffer, s, x.offset, count, x.width, x.width)?,
-            &mut TensorMut(rows_view(y.buffer, s, y.offset, count, y.width, y.width)?),
+            x,
+            &mut TensorMut(y),
         )
     };
     let xp = pointer(x, s);
@@ -1102,17 +1180,8 @@ pub(crate) fn block_forward(
     for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
         base(
             index,
-            Operand {
-                buffer: &work.normed,
-                offset: 0,
-                width: h,
-            },
-            Operand {
-                buffer: out,
-                offset: 0,
-                width,
-            },
-            rows,
+            rows_view(&work.normed, s, 0, rows, h, h)?,
+            rows_view(out, s, 0, rows, width, width)?,
         )?;
     }
     blas.linear_typed(
@@ -1193,33 +1262,15 @@ pub(crate) fn block_forward(
     )?;
     base(
         OUT,
-        Operand {
-            buffer: &work.v_raw,
-            offset: 0,
-            width,
-        },
-        Operand {
-            buffer: &work.normed,
-            offset: 0,
-            width: h,
-        },
-        rows,
+        rows_view(&work.v_raw, s, 0, rows, width, width)?,
+        rows_view(&work.normed, s, 0, rows, h, h)?,
     )?;
     lora_pair(
         c,
-        Operand {
-            buffer: &work.v_raw,
-            offset: 0,
-            width,
-        },
+        rows_view(&work.v_raw, s, 0, rows, width, width)?,
         (&w.out_a, &w.out_b),
         &mut work.lora,
-        Operand {
-            buffer: &work.normed,
-            offset: 0,
-            width: h,
-        },
-        rows,
+        rows_view(&work.normed, s, 0, rows, h, h)?,
         false,
     )?;
     if modulation.is_some() {
@@ -1240,6 +1291,30 @@ pub(crate) fn block_forward(
     if modulation.is_some() {
         modulate(normed, 3, 4)?;
     }
+    ffn_forward::<false>(c, w, work)?;
+    if modulation.is_some() {
+        gated_add(xp, normed, 5)?;
+    } else {
+        residual(xp, normed)?;
+    }
+    Ok(())
+}
+
+/// FFN rows overwrite their input after the gated projection; scratch is reused between chunks.
+fn ffn_forward<const SHIFT_INPUT: bool>(
+    c: &BlockContext<'_>,
+    w: &BlockWeights,
+    work: &mut BlockWork,
+) -> Result<()> {
+    let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
+    let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
+        c.blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
+            x,
+            &mut TensorMut(y),
+        )
+    };
     let chunk = work.chunk;
     for start in (0..rows).step_by(chunk) {
         let n = chunk.min(rows - start);
@@ -1252,40 +1327,22 @@ pub(crate) fn block_forward(
         };
         base(
             FF_IN,
-            Operand {
-                buffer: &work.normed,
-                offset: input_start * h,
-                width: h,
-            },
-            Operand {
-                buffer: &work.hidden,
-                offset: 0,
-                width: 2 * f,
-            },
-            n,
+            rows_view(&work.normed, s, input_start * h, n, h, h)?,
+            work.hidden.prefix_rows(u32::try_from(n)?)?,
         )?;
         lora_pair(
             c,
-            Operand {
-                buffer: &work.normed,
-                offset: input_start * h,
-                width: h,
-            },
+            rows_view(&work.normed, s, input_start * h, n, h, h)?,
             (&w.in_a, &w.in_b),
             &mut work.lora,
-            Operand {
-                buffer: &work.hidden,
-                offset: 0,
-                width: 2 * f,
-            },
-            n,
+            work.hidden.prefix_rows(u32::try_from(n)?)?,
             work.fixed_lora,
         )?;
-        let hidden = pointer(&work.hidden, s);
-        let gated = pointer(&work.gated, s);
+        let hidden = work.hidden.ptr + if SHIFT_INPUT { 256 } else { 0 };
+        let gated = work.gated.ptr;
         let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
         unsafe {
-            s.launch_builder(&kernels.swiglu)
+            s.launch_builder(&c.kernels.swiglu)
                 .arg(&hidden)
                 .arg(&gated)
                 .arg(&i32::try_from(n)?)
@@ -1295,40 +1352,17 @@ pub(crate) fn block_forward(
         }
         base(
             FF_OUT,
-            Operand {
-                buffer: &work.gated,
-                offset: 0,
-                width: f,
-            },
-            Operand {
-                buffer: &work.normed,
-                offset: start * h,
-                width: h,
-            },
-            n,
+            work.gated.prefix_rows(u32::try_from(n)?)?,
+            rows_view(&work.normed, s, start * h, n, h, h)?,
         )?;
         lora_pair(
             c,
-            Operand {
-                buffer: &work.gated,
-                offset: 0,
-                width: f,
-            },
+            work.gated.prefix_rows(u32::try_from(n)?)?,
             (&w.ffo_a, &w.ffo_b),
             &mut work.lora,
-            Operand {
-                buffer: &work.normed,
-                offset: start * h,
-                width: h,
-            },
-            n,
+            rows_view(&work.normed, s, start * h, n, h, h)?,
             work.fixed_lora,
         )?;
-    }
-    if modulation.is_some() {
-        gated_add(xp, normed, 5)?;
-    } else {
-        residual(xp, normed)?;
     }
     Ok(())
 }
@@ -1848,7 +1882,9 @@ impl Dit {
         }
         let budget = d.workspace_budget(free, free, reserve)?;
         let choices = work.ffn_choices(blas, spec, budget)?;
-        let chosen = FfnPlan::select(&choices, budget)?;
+        let owned = FfnPlan::select(&choices, budget)?;
+        let aliases = work.alias_choices(blas, spec, owned)?;
+        let chosen = FfnPlan::select(&aliases, budget)?;
         let previous = *choices
             .iter()
             .find(|p| p.chunk == work.chunk)
@@ -1859,6 +1895,7 @@ impl Dit {
         let description = |plan: FfnPlan| {
             serde_json::json!({
             "rows":work.rows,"previous_chunk":work.chunk,"chunk":plan.chunk,
+            "storage":if plan.borrowed {"attention_scratch"} else {"owned"},
             "chunks":work.rows.div_ceil(plan.chunk),"tail":work.rows%plan.chunk,
             "new_allocation_bytes":plan.allocation,"estimated_tensor_cost":plan.tensor_cost,
             "estimated_launches_per_block":plan.launches,"previous_tensor_cost":previous.tensor_cost,
@@ -1870,12 +1907,24 @@ impl Dit {
             "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
             "peak_additional_bytes":chosen.allocation+chosen.workspace,
             "lt_workspace_replacement_bytes":chosen.workspace,"main":description(chosen),
+            "owned_alternative":description(owned),
+            "alias_capacity_rows":FfnPlan::alias_capacity((work.q_raw.len(),work.k_raw.len()),spec.ffn)?,
             "refiner":{"rows":text_work.rows,"previous_chunk":text_work.chunk,"chunk":text_work.chunk,
                 "chunks":text_work.rows.div_ceil(text_work.chunk),"tail":text_work.rows%text_work.chunk,
                 "new_allocation_bytes":0,"ordinary_plans":true}}})
         );
         blas.bind_workspace(chosen.workspace)?;
-        work.bind_ffn(s, blas, spec, chosen)?;
+        work.bind_ffn(s, blas, spec, chosen, &x)?;
+        s.synchronize()?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_ffn_storage":{
+            "hidden_ptr":work.hidden.ptr,"hidden_shape":work.hidden.shape,"hidden_span_bytes":work.hidden.span_bytes,
+            "gated_ptr":work.gated.ptr,"gated_shape":work.gated.shape,"gated_span_bytes":work.gated.span_bytes,
+            "q_raw_ptr":pointer(&work.q_raw,s),"q_raw_bytes":2*work.q_raw.len(),
+            "k_raw_ptr":pointer(&work.k_raw,s),"k_raw_bytes":2*work.k_raw.len(),
+            "owned":work.ffn_owned.is_some(),"free_after_binding":d.ctx.mem_get_info()?.0}})
+        );
         let vision = cubin::module(s.context(), "vision_ops")?;
         Ok(Self {
             ranges,
@@ -2830,6 +2879,7 @@ mod tests {
         }
         let baseline = FfnPlan {
             chunk: 1_002,
+            borrowed: false,
             allocation: 0,
             workspace: 0,
             tensor_cost: 80.0,
@@ -2837,6 +2887,7 @@ mod tests {
         };
         let efficient = FfnPlan {
             chunk: 6_675,
+            borrowed: false,
             allocation: FfnPlan::allocation(6_675, 14_336)?,
             workspace: 0,
             tensor_cost: 54.0,
@@ -2844,6 +2895,7 @@ mod tests {
         };
         let larger = FfnPlan {
             chunk: 8_009,
+            borrowed: false,
             allocation: FfnPlan::allocation(8_009, 14_336)?,
             workspace: 0,
             tensor_cost: 55.0,
@@ -2864,6 +2916,16 @@ mod tests {
             6_675
         );
         assert!(FfnPlan::allocation(usize::MAX, 2).is_err());
+        for (rows, expected) in [(40_045, 10_011), (60_431, 15_107)] {
+            let elements = rows * 7_168;
+            let capacity = FfnPlan::alias_capacity((elements, elements), 14_336)?;
+            assert_eq!(capacity, expected);
+            assert!(capacity * 28_672 <= elements);
+            assert!((capacity + 1) * 28_672 > elements);
+            assert_eq!(FfnPlan::alias_capacity((elements, 14_335), 14_336)?, 0);
+        }
+        assert!(FfnPlan::alias_capacity((usize::MAX, usize::MAX), usize::MAX).is_err());
+        assert!(FfnPlan::alias_capacity((1, 1), 0).is_err());
         assert!(
             FfnPlan::select(
                 &[FfnPlan {
@@ -3726,6 +3788,288 @@ mod tests {
             defects == 0,
             "DEFECT base FFN row invariance cells={defects}"
         );
+        Ok(())
+    }
+
+    /// Owned and borrowed FFN storage use identical plans, including poisoned scratch and subsequent blocks.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE, FF_H3_REPLAY, FF_H3_THRESHOLDS"]
+    fn ffn_alias_matches_owned_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let capture = path("FF_H3_CAPTURE")?;
+        let replay = path("FF_H3_REPLAY")?;
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(path("FF_H3_THRESHOLDS")?)?)?;
+        ensure!(frozen["bit_difference_limit"] == 0, "alias gate bound");
+        let spec = H3Spec::read(&model)?;
+        let transformer = model.join("transformer");
+        let manifest = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let lora_path = path("FF_H3_LORA")?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?;
+        let stem = lora_path
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .context("LoRA stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let bytes = fs::read(capture.join("lora_a_up_input.bf16"))?;
+        ensure!(
+            bytes.len() == 1511 * spec.hidden * 2,
+            "common input [1511,hidden] BF16"
+        );
+        let common: Vec<bf16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        ensure!(
+            common.iter().all(|v| v.is_finite()),
+            "RUNNER_FAIL nonfinite common input"
+        );
+        let adaln_map = mapped(&replay.join("A-bf16/adaln.safetensors"))?;
+        let adaln = SafeTensors::deserialize(&adaln_map)?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let weights: Vec<BlockWeights> = (0..2)
+            .map(|layer| {
+                BlockWeights::resident(
+                    s,
+                    &spec,
+                    adapter.rank,
+                    &format!("transformer_blocks.{layer}"),
+                    &mut Source::new(&transformer, &manifest),
+                    &mut Source::new(lora_dir, &lora_manifest),
+                )
+            })
+            .collect::<Result<_>>()?;
+        let mut cells = 0;
+        let mut defects = 0;
+        let mut control_bits = 0;
+        for case in ["A", "P"] {
+            let layout = capture_layout(&spec, &replay.join(format!("{case}-bf16")))?;
+            let rows = layout.rows();
+            let chunk = frozen["runs"][format!("{case}-derived")]["plan"]["main"]["chunk"]
+                .as_u64()
+                .context("frozen main chunk")? as usize;
+            let input: Vec<bf16> = (0..rows * spec.hidden)
+                .map(|i| common[((i / spec.hidden + 17) % 1511) * spec.hidden + i % spec.hidden])
+                .collect();
+            let runtime =
+                std::env::temp_dir().join(format!("ff-h3-alias-{}-{case}", std::process::id()));
+            fs::create_dir(&runtime)?;
+            let blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(true, "H3 alias identity".into())),
+            )?;
+            let mut owned = BlockWork::new(s, &spec, adapter.rank, rows)?;
+            let mut borrowed = BlockWork::new(s, &spec, adapter.rank, rows)?;
+            owned.prepare(&blas, &spec)?;
+            borrowed.prepare(&blas, &spec)?;
+            for (output, input) in [
+                (adapter.rank, spec.hidden),
+                (adapter.rank, spec.ffn),
+                (2 * spec.ffn, adapter.rank),
+                (spec.hidden, adapter.rank),
+            ] {
+                blas.bind_row_family(crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output,
+                    input,
+                })?;
+            }
+            let plan = owned.ffn_cost(&blas, &spec, chunk, false)?;
+            blas.bind_workspace(plan.workspace)?;
+            let mut x = s.clone_htod(&input)?;
+            owned.bind_ffn(s, &blas, &spec, plan, &x)?;
+            borrowed.bind_ffn(
+                s,
+                &blas,
+                &spec,
+                FfnPlan {
+                    borrowed: true,
+                    allocation: 0,
+                    ..plan
+                },
+                &x,
+            )?;
+            ensure!(
+                borrowed.hidden.ptr == pointer(&borrowed.q_raw, s)
+                    && borrowed.gated.ptr == pointer(&borrowed.k_raw, s)
+                    && borrowed.hidden.span_bytes + 256 <= (borrowed.q_raw.len() * 2) as u64,
+                "borrowed address/control capacity"
+            );
+            let receipt = blas.bound_plan_receipt()?;
+            let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(&spec, &layout))?;
+            let tables: Vec<_> = (0..2)
+                .map(|layer| -> Result<_> {
+                    let view = adaln.tensor(&format!("block{layer}.step0"))?;
+                    ensure!(
+                        view.dtype() == Dtype::BF16 && view.shape()[1] == 6 * spec.hidden,
+                        "modulation layout"
+                    );
+                    let values: Vec<bf16> = view
+                        .data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| bf16::from_le_bytes(*b))
+                        .collect();
+                    Ok((s.clone_htod(&values)?, u32::try_from(view.shape()[0])?))
+                })
+                .collect::<Result<_>>()?;
+            ensure!(
+                tables[0].1 == tables[1].1 && tables[0].1 > 0,
+                "modulation entries"
+            );
+            let index = s.clone_htod(
+                &(0..rows)
+                    .map(|r| (r % tables[0].1 as usize) as u32)
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+                .with_full_single_probability()?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: adapter.scale,
+            };
+            let mut run = |work: &mut BlockWork,
+                           graph: bool,
+                           full: bool,
+                           shifted: bool|
+             -> Result<Vec<bf16>> {
+                s.memcpy_htod(&input, &mut x)?;
+                s.memcpy_htod(&input, &mut work.normed)?;
+                let poison = if work.ffn_owned.is_some() { 0x3f } else { 0xbf };
+                unsafe {
+                    crate::backend::cuda::copy::memset_bytes(
+                        work.hidden.ptr,
+                        poison,
+                        usize::try_from(work.hidden.span_bytes)?,
+                        s,
+                    )?;
+                    crate::backend::cuda::copy::memset_bytes(
+                        work.gated.ptr,
+                        poison,
+                        usize::try_from(work.gated.span_bytes)?,
+                        s,
+                    )?;
+                }
+                s.synchronize()?;
+                let mut launch = || -> Result<()> {
+                    if full {
+                        for (layer, weight) in weights.iter().enumerate() {
+                            let modulation = Modulation {
+                                table: &tables[layer].0,
+                                offset: 0,
+                                entries: tables[layer].1,
+                                index: &index,
+                            };
+                            block_forward(
+                                &context,
+                                &mut flash,
+                                weight,
+                                &Conditioning::Modulated {
+                                    rotary: &rotary,
+                                    modulation: &modulation,
+                                },
+                                &mut x,
+                                work,
+                            )?;
+                        }
+                    } else if shifted {
+                        ffn_forward::<true>(&context, &weights[0], work)?;
+                    } else {
+                        ffn_forward::<false>(&context, &weights[0], work)?;
+                    }
+                    Ok(())
+                };
+                if graph {
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let result = launch();
+                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    let captured = captured?.context("alias gate captured no graph")?;
+                    captured.launch()?;
+                    captured.launch()?;
+                } else {
+                    launch()?;
+                    launch()?;
+                }
+                let output = s.clone_dtoh(if full { &x } else { &work.normed })?;
+                ensure!(
+                    output.iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL nonfinite alias output"
+                );
+                Ok(output)
+            };
+            for full in [false, true] {
+                let reference = run(&mut owned, false, full, false)?;
+                for (borrow, graph) in [(false, true), (true, false), (true, true)] {
+                    let actual = run(
+                        if borrow { &mut borrowed } else { &mut owned },
+                        graph,
+                        full,
+                        false,
+                    )?;
+                    let bits = reference
+                        .iter()
+                        .zip(&actual)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    cells += 1;
+                    defects += usize::from(bits > 0);
+                    println!(
+                        "H3_ALIAS_CELL case={case} rows={rows} chunk={chunk} tail={} borrowed={borrow} graph={graph} next_block={full} replays=2 bit_differences={bits} limit=0",
+                        rows % chunk
+                    );
+                }
+                if !full && case == "A" {
+                    let control = run(&mut borrowed, false, false, true)?;
+                    control_bits = reference
+                        .iter()
+                        .zip(&control)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    println!(
+                        "H3_ALIAS_CONTROL consumer_offset_bytes=256 bit_differences={control_bits}"
+                    );
+                }
+            }
+            ensure!(
+                receipt == blas.bound_plan_receipt()?,
+                "alias test changed bound algorithms"
+            );
+            s.synchronize()?;
+            drop(blas);
+            fs::remove_dir_all(runtime)?;
+        }
+        println!(
+            "H3_ALIAS_GATE cells={cells} defects={defects} bit_difference_limit=0 control_bit_differences={control_bits}"
+        );
+        ensure!(
+            control_bits > 0,
+            "RUNNER_FAIL alias-address control undetected"
+        );
+        ensure!(defects == 0, "DEFECT FFN storage alias cells={defects}");
         Ok(())
     }
 
