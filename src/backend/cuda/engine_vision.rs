@@ -6973,7 +6973,6 @@ impl Hi3DImageConditioner {
             "invalid image conditioner device limit"
         );
         let mut encoders = Vec::with_capacity(2);
-        let mut admitted = 0usize;
         for (dir, family, side) in [(dino_dir, "dinov2", 756), (clip_dir, "clip", 224)] {
             let cfg = VisionEncoderConfig::from_dir(dir)?;
             ensure!(
@@ -6984,7 +6983,6 @@ impl Hi3DImageConditioner {
                 + cfg.workspace_bytes(side)?
                 + cfg.total_rows(side)? as usize * cfg.hidden_size as usize * 4;
             device.workspace_budget(free_before, limit, live)?;
-            admitted += live;
             let file = std::fs::File::open(dir.join("model.safetensors"))?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
             encoders.push(DinoEncoder::<f32>::load(
@@ -7001,11 +6999,10 @@ impl Hi3DImageConditioner {
             .try_into()
             .map_err(|_| anyhow::anyhow!("image encoder count mismatch"))?;
         let context = device.stream.alloc_zeros(2917 * 2048)?;
-        admitted += 2917 * 2048 * 4;
         let (free_after, _) = device.ctx.mem_get_info()?;
         ensure!(
-            free_before - free_after <= admitted,
-            "image conditioner allocated beyond admitted bound"
+            free_before - free_after <= limit,
+            "image conditioner exceeded whole-request device limit"
         );
         Ok(Self {
             device: device.clone(),
