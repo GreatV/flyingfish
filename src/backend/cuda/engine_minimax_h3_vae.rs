@@ -437,8 +437,10 @@ impl VideoDecoder {
                                 "RUNNER_FAIL video {stage} snapshot extent"
                             );
                             let bits = bytes
-                                .chunks_exact(2)
-                                .zip(expected.chunks_exact(2))
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .zip(expected.as_chunks::<2>().0)
                                 .filter(|(a, b)| a != b)
                                 .count();
                             video_cells += 1;
