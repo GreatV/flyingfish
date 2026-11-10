@@ -1683,31 +1683,54 @@ mod gate {
         Ok(status)
     }
 
-    fn score_causal(
+    fn measure_prefix(
         name: &str,
-        actual: &[f32],
-        nominal: &[f32],
+        planted: &[f32],
+        reference: &[f32],
         tau_max: f64,
         tau_rmse: f64,
-    ) -> Result<GateStatus> {
+    ) -> Result<()> {
         ensure!(
-            actual.len() >= FRAME_SAMPLES && nominal.len() >= FRAME_SAMPLES,
+            planted.len() >= FRAME_SAMPLES && reference.len() >= FRAME_SAMPLES,
             "Runner FAIL causal length"
         );
-        let (max_abs, rmse) = difference(&actual[..FRAME_SAMPLES], &nominal[..FRAME_SAMPLES])?;
-        let status = if max_abs <= tau_max && rmse <= tau_rmse {
+        let (max_abs, rmse) = difference(&planted[..FRAME_SAMPLES], &reference[..FRAME_SAMPLES])?;
+        let bar_max = 10.0 * tau_max;
+        let bar_rmse = 10.0 * tau_rmse;
+        println!(
+            "MEASURE tensor={name} plant=causal_ref bar_source=cells.{name}.tau max_abs={max_abs:?} rmse={rmse:?} tau_max_abs={tau_max:?} tau_rmse={tau_rmse:?} bar_max_abs={bar_max:?} bar_rmse={bar_rmse:?} detect=prefix status=UNSCORED"
+        );
+        Ok(())
+    }
+
+    fn measure_frame0(name: &str, actual: &[f32], reference: &[f32]) -> Result<()> {
+        ensure!(
+            actual.len() >= FRAME_SAMPLES && reference.len() >= FRAME_SAMPLES,
+            "Runner FAIL frame0 length"
+        );
+        let (max_abs, rmse) = difference(&actual[..FRAME_SAMPLES], &reference[..FRAME_SAMPLES])?;
+        println!(
+            "MEASURE tensor={name} plant=frame0 bar_source=unscored max_abs={max_abs:?} rmse={rmse:?} status=UNSCORED"
+        );
+        Ok(())
+    }
+
+    fn score_causal(name: &str, planted: &[f32], unplanted: &[f32]) -> Result<GateStatus> {
+        ensure!(
+            planted.len() >= FRAME_SAMPLES && unplanted.len() >= FRAME_SAMPLES,
+            "Runner FAIL causal length"
+        );
+        let got = &planted[..FRAME_SAMPLES];
+        let base = &unplanted[..FRAME_SAMPLES];
+        let (max_abs, rmse) = difference(got, base)?;
+        let status = if same_bytes(got, base) && max_abs == 0.0 {
             GateStatus::Pass
         } else {
             GateStatus::ProtocolFail
         };
-        emit(
-            name,
-            "causal",
-            "inside",
-            max_abs,
-            rmse,
-            (tau_max, tau_rmse),
-            status,
+        println!(
+            "METRIC tensor={name} plant=causal bar_source=bit_identity max_abs={max_abs:?} rmse={rmse:?} tau_max_abs=0 tau_rmse=0 bar_max_abs=0 bar_rmse=0 detect=prefix status={}",
+            status.label()
         );
         Ok(status)
     }
@@ -1900,11 +1923,11 @@ mod gate {
         }
         let inside = [0.0f32; FRAME_SAMPLES];
         let mut outside = inside;
-        outside[0] = 1.0;
+        outside[0] = f32::from_bits(1);
         defect = false;
         protocol = false;
         record(
-            score_causal("probe", &outside, &inside, 1e-6, 1e-7)?,
+            score_causal("probe", &outside, &inside)?,
             &mut defect,
             &mut protocol,
         );
@@ -1916,7 +1939,7 @@ mod gate {
         defect = false;
         protocol = false;
         record(
-            score_causal("probe", &inside, &inside, 1e-6, 1e-7)?,
+            score_causal("probe", &inside, &inside)?,
             &mut defect,
             &mut protocol,
         );
@@ -2102,8 +2125,9 @@ mod gate {
             &mut defect,
             &mut protocol,
         );
+        measure_prefix("short", &short_k.samples, &short_ref, short_max, short_rmse)?;
         record(
-            score_causal("short", &short_k.samples, &short_ref, short_max, short_rmse)?,
+            score_causal("short", &short_k.samples, &short_n.samples)?,
             &mut defect,
             &mut protocol,
         );
@@ -2117,8 +2141,9 @@ mod gate {
             &mut defect,
             &mut protocol,
         );
+        measure_prefix("syn", &syn_k.samples, &syn_ref, syn_max, syn_rmse)?;
         record(
-            score_causal("syn", &syn_k.samples, &syn_ref, syn_max, syn_rmse)?,
+            score_causal("syn", &syn_k.samples, &syn_n.samples)?,
             &mut defect,
             &mut protocol,
         );
@@ -2132,8 +2157,9 @@ mod gate {
             &mut defect,
             &mut protocol,
         );
+        measure_prefix("real", &real_k.samples, &real_ref, real_max, real_rmse)?;
         record(
-            score_causal("real", &real_k.samples, &real_ref, real_max, real_rmse)?,
+            score_causal("real", &real_k.samples, &real_n.samples)?,
             &mut defect,
             &mut protocol,
         );
@@ -2147,11 +2173,13 @@ mod gate {
             &mut defect,
             &mut protocol,
         );
+        measure_prefix("voice-design-en", &en_k.samples, &en_ref, en_max, en_rmse)?;
         record(
-            score_causal("voice-design-en", &en_k.samples, &en_ref, en_max, en_rmse)?,
+            score_causal("voice-design-en", &en_k.samples, &en_n.samples)?,
             &mut defect,
             &mut protocol,
         );
+        measure_frame0("voice-design-en", &en_n.samples, &en_ref)?;
         record(
             score_nominal("voice-design-zh", &zh_n.samples, &zh_ref, zh_max, zh_rmse)?,
             &mut defect,
@@ -2162,8 +2190,9 @@ mod gate {
             &mut defect,
             &mut protocol,
         );
+        measure_prefix("voice-design-zh", &zh_k.samples, &zh_ref, zh_max, zh_rmse)?;
         record(
-            score_causal("voice-design-zh", &zh_k.samples, &zh_ref, zh_max, zh_rmse)?,
+            score_causal("voice-design-zh", &zh_k.samples, &zh_n.samples)?,
             &mut defect,
             &mut protocol,
         );
