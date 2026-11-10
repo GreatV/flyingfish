@@ -8,11 +8,13 @@ use super::{
     ops,
 };
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+    CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::CudaBlas;
 use safetensors::{Dtype, SafeTensors};
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::{path::Path, sync::Arc};
 
 const MAX_FRAMES: usize = 256;
@@ -196,6 +198,10 @@ pub struct Tokenizer {
     work: Work,
     weight_bytes: u64,
     launches: u64,
+    graphs: RefCell<BTreeMap<i32, (CudaGraph, u64)>>,
+    graph_on: Cell<bool>,
+    graph_launches: Cell<u64>,
+    graph_captures: Cell<u64>,
 }
 
 impl Tokenizer {
@@ -207,7 +213,64 @@ impl Tokenizer {
         self.launches
     }
 
+    #[cfg(test)]
+    fn set_graph(&self, on: bool) {
+        self.graph_on.set(on);
+    }
+
+    #[cfg(test)]
+    fn graph_captures(&self) -> u64 {
+        self.graph_captures.get()
+    }
+
+    #[cfg(test)]
+    fn graph_launches(&self) -> u64 {
+        self.graph_launches.get()
+    }
+
+    fn replay_forward(&self, frames: i32) -> Result<u64> {
+        if !self.graph_on.get() {
+            return forward(self, frames);
+        }
+        if self.graphs.borrow().contains_key(&frames) {
+            let graphs = self.graphs.borrow();
+            let (graph, launches) = graphs.get(&frames).context("tokenizer graph")?;
+            let launches = *launches;
+            graph.launch().context("tokenizer graph launch")?;
+            drop(graphs);
+            self.graph_launches.set(self.graph_launches.get() + 1);
+            return Ok(launches);
+        }
+        let warmed = forward(self, frames)?;
+        self.stream
+            .synchronize()
+            .context("tokenizer graph warmup")?;
+        self.stream
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .context("tokenizer graph begin")?;
+        let ran = forward(self, frames);
+        let captured = self
+            .stream
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+        let launches = ran.context("tokenizer graph body")?;
+        ensure!(launches == warmed, "tokenizer graph launches");
+        let graph = captured?.context("empty tokenizer graph")?;
+        graph.upload().context("tokenizer graph upload")?;
+        self.stream
+            .synchronize()
+            .context("tokenizer graph upload")?;
+        self.graphs.borrow_mut().insert(frames, (graph, launches));
+        self.graph_captures.set(self.graph_captures.get() + 1);
+        Ok(launches)
+    }
+
     pub fn load(path: &Path, device: &Device) -> Result<Self> {
+        // Two streams enable event waits. Capture rejects a wait recorded outside it.
+        unsafe {
+            device.ctx.disable_event_tracking();
+        }
         let bytes = std::fs::read(path).context("tokenizer weights")?;
         let st = SafeTensors::deserialize(&bytes).context("tokenizer safetensors")?;
         let stream = Arc::clone(&device.stream);
@@ -479,6 +542,10 @@ impl Tokenizer {
             work,
             weight_bytes,
             launches: 0,
+            graphs: RefCell::new(BTreeMap::new()),
+            graph_on: Cell::new(true),
+            graph_launches: Cell::new(0),
+            graph_captures: Cell::new(0),
         })
     }
 
@@ -494,7 +561,7 @@ impl Tokenizer {
         self.stream
             .memcpy_htod(&packed, &mut self.work.codes)
             .context("upload codes")?;
-        let launches = forward(self, frames)?;
+        let launches = self.replay_forward(frames)?;
         self.launches = launches;
         let samples = usize::try_from(frames).unwrap_or(0) * FRAME_SAMPLES;
         ensure!(samples == frames_usize * FRAME_SAMPLES, "samples");
@@ -2068,6 +2135,26 @@ mod gate {
         let zh_ref = host_f32(&sampled_wav, "voice-design-zh", 96_000)?;
         let device = super::super::Device::new(0)?;
         let mut tok = super::Tokenizer::load(&weights, &device)?;
+        tok.set_graph(false);
+        let clone_samples = clone_frames * FRAME_SAMPLES;
+        let eager_short_n = decoded(&mut tok, &short_codes, 7680)?;
+        let eager_short_c = decoded(&mut tok, &plant(&short_codes, 0)?, 7680)?;
+        let eager_short_k = decoded(&mut tok, &plant(&short_codes, 3)?, 7680)?;
+        let eager_syn_n = decoded(&mut tok, &syn_codes, 153600)?;
+        let eager_syn_c = decoded(&mut tok, &plant(&syn_codes, 0)?, 153600)?;
+        let eager_syn_k = decoded(&mut tok, &plant(&syn_codes, 79)?, 153600)?;
+        let eager_real_n = decoded(&mut tok, &real_codes, 153600)?;
+        let eager_real_c = decoded(&mut tok, &plant(&real_codes, 0)?, 153600)?;
+        let eager_real_k = decoded(&mut tok, &plant(&real_codes, 79)?, 153600)?;
+        let eager_left = decoded(&mut tok, &clone_left, clone_samples)?;
+        let eager_right = decoded(&mut tok, &clone_right, clone_samples)?;
+        let eager_en_n = decoded(&mut tok, &en_codes, 71_040)?;
+        let eager_en_c = decoded(&mut tok, &plant(&en_codes, 0)?, 71_040)?;
+        let eager_en_k = decoded(&mut tok, &plant(&en_codes, 36)?, 71_040)?;
+        let eager_zh_n = decoded(&mut tok, &zh_codes, 96_000)?;
+        let eager_zh_c = decoded(&mut tok, &plant(&zh_codes, 0)?, 96_000)?;
+        let eager_zh_k = decoded(&mut tok, &plant(&zh_codes, 49)?, 96_000)?;
+        tok.set_graph(true);
         let short_n = decoded(&mut tok, &short_codes, 7680)?;
         let short_c = decoded(&mut tok, &plant(&short_codes, 0)?, 7680)?;
         let short_k = decoded(&mut tok, &plant(&short_codes, 3)?, 7680)?;
@@ -2077,7 +2164,6 @@ mod gate {
         let real_n = decoded(&mut tok, &real_codes, 153600)?;
         let real_c = decoded(&mut tok, &plant(&real_codes, 0)?, 153600)?;
         let real_k = decoded(&mut tok, &plant(&real_codes, 79)?, 153600)?;
-        let clone_samples = clone_frames * FRAME_SAMPLES;
         let left = decoded(&mut tok, &clone_left, clone_samples)?;
         let right = decoded(&mut tok, &clone_right, clone_samples)?;
         let en_n = decoded(&mut tok, &en_codes, 71_040)?;
@@ -2086,8 +2172,11 @@ mod gate {
         let zh_n = decoded(&mut tok, &zh_codes, 96_000)?;
         let zh_c = decoded(&mut tok, &plant(&zh_codes, 0)?, 96_000)?;
         let zh_k = decoded(&mut tok, &plant(&zh_codes, 49)?, 96_000)?;
+        let short_replay = decoded(&mut tok, &short_codes, 7680)?;
         let launches = real_n.launches;
         for count in [
+            eager_short_n.launches,
+            eager_real_n.launches,
             short_n.launches,
             short_c.launches,
             short_k.launches,
@@ -2105,12 +2194,50 @@ mod gate {
             zh_n.launches,
             zh_c.launches,
             zh_k.launches,
+            short_replay.launches,
         ] {
             ensure!(count == launches, "Runner FAIL launch count");
         }
+        let lengths = [4usize, 80, clone_frames, 37, 50];
+        let mut distinct = 0u64;
+        for (index, len) in lengths.iter().enumerate() {
+            if !lengths[..index].contains(len) {
+                distinct += 1;
+            }
+        }
+        let graph_calls = 18u64;
+        let captures = tok.graph_captures();
+        let graph_launches = tok.graph_launches();
         println!("weight_bytes={}", tok.weight_bytes());
         println!("launches={launches}");
-        println!("graphs=0");
+        println!("graphs captures={captures} launches={graph_launches}");
+        ensure!(
+            captures == distinct && graph_launches == graph_calls - distinct,
+            "tokenizer graphs"
+        );
+        for (name, graph, eager) in [
+            ("short", &short_n.samples, &eager_short_n.samples),
+            ("short_control", &short_c.samples, &eager_short_c.samples),
+            ("short_causal", &short_k.samples, &eager_short_k.samples),
+            ("syn", &syn_n.samples, &eager_syn_n.samples),
+            ("syn_control", &syn_c.samples, &eager_syn_c.samples),
+            ("syn_causal", &syn_k.samples, &eager_syn_k.samples),
+            ("real", &real_n.samples, &eager_real_n.samples),
+            ("real_control", &real_c.samples, &eager_real_c.samples),
+            ("real_causal", &real_k.samples, &eager_real_k.samples),
+            ("clone_a", &left.samples, &eager_left.samples),
+            ("clone_b", &right.samples, &eager_right.samples),
+            ("en", &en_n.samples, &eager_en_n.samples),
+            ("en_control", &en_c.samples, &eager_en_c.samples),
+            ("en_causal", &en_k.samples, &eager_en_k.samples),
+            ("zh", &zh_n.samples, &eager_zh_n.samples),
+            ("zh_control", &zh_c.samples, &eager_zh_c.samples),
+            ("zh_causal", &zh_k.samples, &eager_zh_k.samples),
+            ("short_replay", &short_replay.samples, &short_n.samples),
+        ] {
+            ensure!(same_bytes(graph, eager), "graph waveform {name}");
+            println!("GRAPH waveform={name} max_abs=0");
+        }
         println!("host_download_bytes={}", real_n.samples.len() * 4);
         println!("mask=sliding_window_causal window=72");
         let mut defect = false;

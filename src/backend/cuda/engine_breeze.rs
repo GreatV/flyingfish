@@ -15,14 +15,15 @@ use super::{
     verification::Shape,
 };
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PushKernelArg,
+    CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
+    PushKernelArg,
 };
 use crate::backend::setup::LinearShape;
 use crate::checkpoint::MappedCheckpoint;
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use safetensors::Dtype;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::rc::Rc;
@@ -254,10 +255,64 @@ struct Kern {
     h2d: Cell<u64>,
     d2h: Cell<u64>,
     d2d: Cell<u64>,
+    closure: Rc<Closure>,
+    graph_on: Cell<bool>,
+    captured: RefCell<Captured>,
+    graph_launches: Cell<u64>,
+    graph_captures: Cell<u64>,
+    closure_frozen: Cell<bool>,
     #[cfg(test)]
-    pad_plant: Cell<u8>, // 0 off, 1 pad rows, 2 backbone logical row
+    pad_plant: Cell<u8>, // 0 off, 1 pad rows, 2 backbone logical row, 3 depth logical row
     #[cfg(test)]
     pad_once: Cell<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replay {
+    Step,
+    Depth,
+    Prefill(usize),
+    Text(usize),
+}
+
+struct Captured {
+    step: Option<CudaGraph>,
+    depth: Option<CudaGraph>,
+    prefill: Vec<(usize, CudaGraph)>,
+    text: Vec<(usize, CudaGraph)>,
+}
+
+impl Captured {
+    fn contains(&self, kind: Replay) -> bool {
+        match kind {
+            Replay::Step => self.step.is_some(),
+            Replay::Depth => self.depth.is_some(),
+            Replay::Prefill(rows) => self.prefill.iter().any(|(n, _)| *n == rows),
+            Replay::Text(rows) => self.text.iter().any(|(n, _)| *n == rows),
+        }
+    }
+
+    fn get(&self, kind: Replay) -> Option<&CudaGraph> {
+        match kind {
+            Replay::Step => self.step.as_ref(),
+            Replay::Depth => self.depth.as_ref(),
+            Replay::Prefill(rows) => self
+                .prefill
+                .iter()
+                .find(|(n, _)| *n == rows)
+                .map(|(_, g)| g),
+            Replay::Text(rows) => self.text.iter().find(|(n, _)| *n == rows).map(|(_, g)| g),
+        }
+    }
+
+    fn insert(&mut self, kind: Replay, graph: CudaGraph) {
+        match kind {
+            Replay::Step => self.step = Some(graph),
+            Replay::Depth => self.depth = Some(graph),
+            Replay::Prefill(rows) => self.prefill.push((rows, graph)),
+            Replay::Text(rows) => self.text.push((rows, graph)),
+        }
+    }
 }
 
 struct Buf {
@@ -413,6 +468,57 @@ fn copy_d2d<T: DeviceRepr>(
     Ok(())
 }
 
+fn replay_d2d(kind: Replay) -> u64 {
+    match kind {
+        Replay::Step => (BB_H * 2) as u64,
+        Replay::Depth => depth_d2d_bytes(),
+        Replay::Prefill(_) | Replay::Text(_) => 0,
+    }
+}
+
+fn with_graph(k: &Kern, kind: Replay, mut body: impl FnMut() -> Result<()>) -> Result<()> {
+    if !k.graph_on.get() {
+        return body();
+    }
+    if k.captured.borrow().contains(kind) {
+        let graphs = k.captured.borrow();
+        let graph = graphs.get(kind).context("graph")?;
+        graph.launch().context("graph launch")?;
+        drop(graphs);
+        k.graph_launches.set(k.graph_launches.get() + 1);
+        k.d2d.set(k.d2d.get() + replay_d2d(kind));
+        return Ok(());
+    }
+    let saved = (k.drains.get(), k.h2d.get(), k.d2h.get(), k.d2d.get());
+    body()?;
+    k.stream.synchronize().context("graph warmup")?;
+    k.drains.set(saved.0);
+    k.h2d.set(saved.1);
+    k.d2h.set(saved.2);
+    k.d2d.set(saved.3);
+    if !k.closure_frozen.get() {
+        k.closure.freeze_fixed()?;
+        k.closure_frozen.set(true);
+    }
+    k.closure.capture()?;
+    k.stream
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .context("graph begin")?;
+    let ran = body();
+    let captured = k
+        .stream
+        .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+    ran.context("graph body")?;
+    let graph = captured?.context("empty graph")?;
+    graph.upload().context("graph upload")?;
+    k.stream.synchronize().context("graph upload")?;
+    k.captured.borrow_mut().insert(kind, graph);
+    k.graph_captures.set(k.graph_captures.get() + 1);
+    Ok(())
+}
+
 fn upload_origin(k: &Kern, start: &mut CudaSlice<i32>, origin: i32) -> Result<()> {
     copy_h2d(k, &[origin], start)
 }
@@ -478,6 +584,10 @@ fn plant_gemm_rows(
     let (off, n) = if mode == 1 && rows > logical {
         (x_off + logical * input, (rows - logical) * input)
     } else if mode == 2 && !k.pad_once.get() {
+        k.pad_once.set(true);
+        (x_off, input)
+    } else if mode == 3 && !k.pad_once.get() && logical == DP_ROWS && input == BB_H {
+        // Projector input row 0 is the depth cond row.
         k.pad_once.set(true);
         (x_off, input)
     } else {
@@ -2071,17 +2181,26 @@ fn upload_hidden(k: &Kern, buf: &mut Buf, src: &[f32]) -> Result<()> {
     copy_h2d(k, &host, &mut buf.h.slice_mut(..host.len()))
 }
 
-fn place_audio_row(k: &Kern, table: &CudaSlice<bf16>, buf: &mut Buf, codes: &[i32]) -> Result<()> {
+fn stage_audio_codes(k: &Kern, buf: &mut Buf, codes: &[i32]) -> Result<()> {
     ensure!(codes.len() == BOOKS, "audio row");
     for &id in codes {
         ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
     }
-    copy_h2d(k, codes, &mut buf.ids.slice_mut(..BOOKS))?;
+    copy_h2d(k, codes, &mut buf.ids.slice_mut(..BOOKS))
+}
+
+fn apply_audio_row(k: &Kern, table: &CudaSlice<bf16>, buf: &mut Buf) -> Result<()> {
     launch_row_sum(k, table, &buf.ids, &mut buf.audio, 1, BB_H)?;
     copy_d2d(k, &buf.audio.slice(..BB_H), &mut buf.h.slice_mut(..BB_H))
 }
 
-fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> Result<Vec<f32>> {
+fn backbone_rows(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    pass: ScorePass<'_>,
+    audio: Option<&CudaSlice<bf16>>,
+) -> Result<Vec<f32>> {
     ensure!(pass.rows > 0 && pass.score_row < pass.rows, "score row");
     ensure!(pass.origin >= 0, "score origin");
     let end = usize::try_from(pass.origin)?
@@ -2091,59 +2210,70 @@ fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> R
     ensure!(pass.layers.len() == BB_LAYERS, "backbone layers");
     set_meta(k, &mut buf.meta, pass.rows)?;
     upload_origin(k, &mut buf.start, pass.origin)?;
-    let geom = DecGeom {
-        rows: pass.rows,
-        hidden: BB_H,
-        intermediate: BB_I,
-        q_heads: BB_HEADS,
-        kv_heads: BB_KV,
-        dim: BB_DIM,
-        eps: BB_EPS,
+    let kind = if audio.is_some() {
+        Replay::Step
+    } else {
+        Replay::Prefill(pass.rows)
     };
-    for (index, layer) in pass.layers.iter().enumerate() {
-        decoder_layer(
+    with_graph(k, kind, || {
+        if let Some(table) = audio {
+            apply_audio_row(k, table, buf)?;
+        }
+        let geom = DecGeom {
+            rows: pass.rows,
+            hidden: BB_H,
+            intermediate: BB_I,
+            q_heads: BB_HEADS,
+            kv_heads: BB_KV,
+            dim: BB_DIM,
+            eps: BB_EPS,
+        };
+        for (index, layer) in pass.layers.iter().enumerate() {
+            decoder_layer(
+                k,
+                buf,
+                blas,
+                DecPass {
+                    layer,
+                    table: pass.table,
+                    flash: &mut *pass.flash,
+                    kind: RopeKind::Cast,
+                    geom,
+                    origin: pass.origin,
+                    capacity: BB_MAX,
+                    slot: KvSlot::Layer(index),
+                },
+            )?;
+        }
+        rms(
             k,
-            buf,
-            blas,
-            DecPass {
-                layer,
-                table: pass.table,
-                flash: &mut *pass.flash,
-                kind: RopeKind::Cast,
-                geom,
-                origin: pass.origin,
-                capacity: BB_MAX,
-                slot: KvSlot::Layer(index),
+            &buf.meta,
+            Rms {
+                x: &buf.h,
+                y: &mut buf.n,
+                w: pass.norm,
+                rows: pass.rows,
+                width: BB_H,
+                mode: RmsMode::Standard,
+                eps: BB_EPS,
             },
         )?;
-    }
-    rms(
-        k,
-        &buf.meta,
-        Rms {
-            x: &buf.h,
-            y: &mut buf.n,
-            w: pass.norm,
-            rows: pass.rows,
-            width: BB_H,
-            mode: RmsMode::Standard,
-            eps: BB_EPS,
-        },
-    )?;
-    gemm(
-        k,
-        blas,
-        Gemm {
-            w: pass.lm,
-            x: &mut buf.n,
-            y: &mut buf.d,
-            x_off: 0,
-            y_off: 0,
-            logical: pass.rows,
-            output: BB_VOCAB,
-            input: BB_H,
-        },
-    )?;
+        gemm(
+            k,
+            blas,
+            Gemm {
+                w: pass.lm,
+                x: &mut buf.n,
+                y: &mut buf.d,
+                x_off: 0,
+                y_off: 0,
+                logical: pass.rows,
+                output: BB_VOCAB,
+                input: BB_H,
+            },
+        )?;
+        Ok(())
+    })?;
     download_row(k, &buf.d, pass.score_row, BB_VOCAB)
 }
 
@@ -2233,25 +2363,63 @@ fn depth_step(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthStep<'_>) -> Resu
     let vocab = CODEBOOK as usize;
     let pack = gemm_rows(1, DP_H) * vocab;
     let packed = HEAD_N * vocab;
-    depth_frame(
-        k,
-        buf,
-        blas,
-        DepthIn {
-            layers: &step.w.depth,
-            norm: &step.w.depth_norm,
-            projector: &step.w.projector,
-            embed: &step.w.audio,
-            table: &k.table_depth,
-            flash: step.flash,
-            cond: step.cond,
-            ids: &ids,
-            frame: step.frame,
-            slot: KvSlot::Depth,
-        },
-    )?;
-    clear_depth_kv(k, buf)?;
-    depth_pack(k, buf, blas, &step.w.heads, step.frame, step.plant)?;
+    if !k.graph_on.get() || step.plant {
+        depth_frame(
+            k,
+            buf,
+            blas,
+            DepthIn {
+                layers: &step.w.depth,
+                norm: &step.w.depth_norm,
+                projector: &step.w.projector,
+                embed: &step.w.audio,
+                table: &k.table_depth,
+                flash: step.flash,
+                cond: step.cond,
+                ids: &ids,
+                frame: step.frame,
+                slot: KvSlot::Depth,
+            },
+        )?;
+        clear_depth_kv(k, buf)?;
+        depth_pack(k, buf, blas, &step.w.heads, step.frame, step.plant)?;
+        return download_elems(k, &buf.head_out, pack, packed);
+    }
+    // Row 0 is the cond. The graph embeds rows 1..15 and does not rewrite row 0.
+    stage_depth_ids(k, buf, &ids)?;
+    stage_depth_cond(k, buf, step.cond)?;
+    upload_origin(k, &mut buf.start, 0)?;
+    with_graph(k, Replay::Depth, || {
+        embed_tokens(
+            k,
+            Embed {
+                weight: &step.w.audio,
+                ids: &buf.tok,
+                y: &mut buf.embed_ws,
+                id_off: 1,
+                y_off: BB_H,
+                rows: DP_ROWS - 1,
+                dim: BB_H,
+            },
+        )?;
+        depth_after(
+            k,
+            buf,
+            blas,
+            DepthRun {
+                layers: &step.w.depth,
+                norm: &step.w.depth_norm,
+                projector: &step.w.projector,
+                table: &k.table_depth,
+                flash: &mut *step.flash,
+                frame: 0,
+                slot: KvSlot::Depth,
+            },
+        )?;
+        clear_depth_kv(k, buf)?;
+        depth_pack(k, buf, blas, &step.w.heads, 0, false)?;
+        Ok(())
+    })?;
     download_elems(k, &buf.head_out, pack, packed)
 }
 
@@ -2299,6 +2467,10 @@ impl Breeze {
     pub fn load(weights: &Path, runtime: &Path) -> Result<Self> {
         ensure!(runtime.is_dir(), "runtime directory");
         let device = Device::new(0)?;
+        // Two streams enable event waits. Capture rejects a wait recorded outside it.
+        unsafe {
+            device.ctx.disable_event_tracking();
+        }
         let ops = Ops::new(&device.ctx)?;
         let common = CommonOpsRef::new(&device.ctx)?;
         let rope_module = cubin::module(&device.ctx, "rope")?;
@@ -2350,12 +2522,8 @@ impl Breeze {
         let buf = alloc_buf(&stream)?;
         backbone_flash.bind_position(&buf.start, BB_MAX - 1)?;
         depth_flash.bind_position(&buf.start, DP_ROWS - 1)?;
-        let mut blas = Blas::new(
-            &device,
-            &ops,
-            runtime,
-            Rc::new(Closure::new(false, "breeze-m0".to_string())),
-        )?;
+        let closure = Rc::new(Closure::new(false, "breeze-m0".to_string()));
+        let mut blas = Blas::new(&device, &ops, runtime, Rc::clone(&closure))?;
         blas.declare(1024, &coverage());
         let ckpt = MappedCheckpoint::open(weights).context("open breeze weights")?;
         let mut weight_bytes = 0usize;
@@ -2383,6 +2551,17 @@ impl Breeze {
                 h2d: Cell::new(0),
                 d2h: Cell::new(0),
                 d2d: Cell::new(0),
+                closure,
+                graph_on: Cell::new(true),
+                captured: RefCell::new(Captured {
+                    step: None,
+                    depth: None,
+                    prefill: Vec::new(),
+                    text: Vec::new(),
+                }),
+                graph_launches: Cell::new(0),
+                graph_captures: Cell::new(0),
+                closure_frozen: Cell::new(false),
                 #[cfg(test)]
                 pad_plant: Cell::new(0),
                 #[cfg(test)]
@@ -2419,64 +2598,80 @@ impl Breeze {
             ref blas,
             ..
         } = *self;
+        k.graph_launches.set(0);
+        k.graph_captures.set(0);
         let slide_left = flash.slide_left;
         ensure!(slide_left > 0, "sliding window left");
         set_meta(k, &mut buf.meta, rows)?;
         copy_h2d(k, token_ids, &mut buf.tok.slice_mut(..rows))?;
         upload_origin(k, &mut buf.start, 0)?;
-        embed_tokens(
-            k,
-            Embed {
-                weight: &w.text_embed,
-                ids: &buf.tok,
-                y: &mut buf.h,
-                id_off: 0,
-                y_off: 0,
-                rows,
-                dim: TEXT_H,
-            },
-        )?;
-        for index in 0..w.text.len() {
-            let unwindowed = w.text[index].full || plant == TextPlant::WindowIgnored;
-            let window_left = if unwindowed { None } else { Some(slide_left) };
-            let step = TextStep {
-                rows,
-                plant,
-                window_left,
+        {
+            let mut body = || -> Result<()> {
+                embed_tokens(
+                    k,
+                    Embed {
+                        weight: &w.text_embed,
+                        ids: &buf.tok,
+                        y: &mut buf.h,
+                        id_off: 0,
+                        y_off: 0,
+                        rows,
+                        dim: TEXT_H,
+                    },
+                )?;
+                for index in 0..w.text.len() {
+                    let unwindowed = w.text[index].full || plant == TextPlant::WindowIgnored;
+                    let window_left = if unwindowed { None } else { Some(slide_left) };
+                    let step = TextStep {
+                        rows,
+                        plant,
+                        window_left,
+                    };
+                    if unwindowed {
+                        text_layer(&w.text[index], k, &mut flash.text_full, buf, blas, step)?;
+                    } else {
+                        text_layer(&w.text[index], k, &mut flash.text_slide, buf, blas, step)?;
+                    }
+                }
+                rms(
+                    k,
+                    &buf.meta,
+                    Rms {
+                        x: &buf.h,
+                        y: &mut buf.n,
+                        w: &w.text_norm,
+                        rows,
+                        width: TEXT_H,
+                        mode: RmsMode::ZeroCentered,
+                        eps: TEXT_EPS,
+                    },
+                )?;
+                gemm(
+                    k,
+                    blas,
+                    Gemm {
+                        w: &w.text_proj,
+                        x: &mut buf.n,
+                        y: &mut buf.d,
+                        x_off: 0,
+                        y_off: 0,
+                        logical: rows,
+                        output: TEXT_OUT,
+                        input: TEXT_H,
+                    },
+                )
             };
-            if unwindowed {
-                text_layer(&w.text[index], k, &mut flash.text_full, buf, blas, step)?;
+            if plant == TextPlant::Nominal {
+                with_graph(k, Replay::Text(rows), &mut body)?;
             } else {
-                text_layer(&w.text[index], k, &mut flash.text_slide, buf, blas, step)?;
+                body()?;
             }
         }
-        rms(
-            k,
-            &buf.meta,
-            Rms {
-                x: &buf.h,
-                y: &mut buf.n,
-                w: &w.text_norm,
-                rows,
-                width: TEXT_H,
-                mode: RmsMode::ZeroCentered,
-                eps: TEXT_EPS,
-            },
-        )?;
-        gemm(
-            k,
-            blas,
-            Gemm {
-                w: &w.text_proj,
-                x: &mut buf.n,
-                y: &mut buf.d,
-                x_off: 0,
-                y_off: 0,
-                logical: rows,
-                output: TEXT_OUT,
-                input: TEXT_H,
-            },
-        )?;
+        eprintln!(
+            "GRAPH captures={} launches={}",
+            k.graph_captures.get(),
+            k.graph_launches.get()
+        );
         download_f32(k, &buf.d, rows * TEXT_OUT)
     }
 
@@ -2709,8 +2904,10 @@ impl Breeze {
         k.h2d.set(0);
         k.d2h.set(0);
         k.d2d.set(0);
+        k.graph_launches.set(0);
+        k.graph_captures.set(0);
         #[cfg(test)]
-        if k.pad_plant.get() == 2 {
+        if k.pad_plant.get() == 2 || k.pad_plant.get() == 3 {
             k.pad_once.set(false);
         }
         upload_hidden(k, buf, projected)?;
@@ -2730,6 +2927,7 @@ impl Breeze {
                 origin: 0,
                 score_row: text_rows - 1,
             },
+            None,
         )?);
         let mut fed_rows = fed.chunks(BOOKS);
         let mut cond_rows = cond.chunks(BB_H);
@@ -2750,7 +2948,7 @@ impl Breeze {
             )?);
             if frame < audio_steps {
                 let fed_row = fed_rows.next().context("fed row")?;
-                place_audio_row(k, &w.audio, buf, fed_row)?;
+                stage_audio_codes(k, buf, fed_row)?;
                 let origin = i32::try_from(text_rows + frame)?;
                 backbone.extend(backbone_rows(
                     k,
@@ -2766,6 +2964,7 @@ impl Breeze {
                         origin,
                         score_row: 0,
                     },
+                    Some(&w.audio),
                 )?);
             }
         }
@@ -2801,6 +3000,11 @@ impl Breeze {
             k.d2h.get(),
             k.d2d.get()
         );
+        eprintln!(
+            "GRAPH captures={} launches={}",
+            k.graph_captures.get(),
+            k.graph_launches.get()
+        );
         ensure!(
             k.drains.get() == drains
                 && k.h2d.get() == h2d
@@ -2813,10 +3017,25 @@ impl Breeze {
 
     #[cfg(test)]
     fn set_pad_plant(&self, mode: u8) -> Result<()> {
-        ensure!(mode <= 2, "pad plant");
+        ensure!(mode <= 3, "pad plant");
         self.k.pad_plant.set(mode);
         self.k.pad_once.set(false);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_graph(&self, on: bool) {
+        self.k.graph_on.set(on);
+    }
+
+    #[cfg(test)]
+    fn graph_captures(&self) -> u64 {
+        self.k.graph_captures.get()
+    }
+
+    #[cfg(test)]
+    fn graph_launches(&self) -> u64 {
+        self.k.graph_launches.get()
     }
 }
 
@@ -3893,6 +4112,7 @@ mod tests {
         let depth_ids = depth_codes(&long.codes, long.audio.len())?;
         let runtime = RuntimeDir::create()?;
         let mut model = super::Breeze::load(&weights, &runtime.0)?;
+        model.set_graph(false);
         println!("weight_bytes={}", model.weight_bytes);
         let mut defect = false;
         let mut protocol = false;
@@ -4508,6 +4728,7 @@ mod tests {
             "EQUIV tensor={name} cells={} max_abs={max_abs} rmse={rmse}",
             got.len()
         );
+        ensure!(max_abs == 0.0 && rmse == 0.0, "bit identity");
         Ok(())
     }
 
@@ -4584,6 +4805,7 @@ mod tests {
         let prompt = m1_prompt();
         let runtime = RuntimeDir::with_prefix("n8-m1")?;
         let mut model = super::Breeze::load(&weights, &runtime.0)?;
+        model.set_graph(false);
         println!("weight_bytes={}", model.weight_bytes);
         let projected = model.text(&prompt, super::TextPlant::Nominal)?;
         let fed = &frames[..M1_AUDIO * super::BOOKS];
@@ -4616,10 +4838,82 @@ mod tests {
         println!("PAD_ROW tensor=backbone_scores max_abs={row_bb} rmse={row_bb_rmse}");
         println!("PAD_ROW tensor=depth_scores max_abs={row_dp} rmse={row_dp_rmse}");
         ensure!(row_bb != 0.0, "logical row plant");
+        model.set_pad_plant(3)?;
+        let (depth_row_backbone, depth_row_depth) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, false, false)?;
+        model.set_pad_plant(0)?;
+        let (depth_bb, depth_bb_rmse) = {
+            let (got, want) = finite_cells(&depth_row_backbone, &nominal_backbone)?;
+            difference(&got, &want)?
+        };
+        let (depth_dp, depth_dp_rmse) = {
+            let (got, want) = finite_cells(&depth_row_depth, &nominal_depth)?;
+            difference(&got, &want)?
+        };
+        println!("PAD_ROW tensor=depth_logical_backbone max_abs={depth_bb} rmse={depth_bb_rmse}");
+        println!("PAD_ROW tensor=depth_logical max_abs={depth_dp} rmse={depth_dp_rmse}");
+        ensure!(depth_dp != 0.0, "depth logical row plant");
+        ensure!(depth_bb == 0.0, "depth logical row backbone");
+        // First graph greedy: 3 captures (prefill, depth, step), 5 launches (3 depth + 2 step).
+        let graph_shapes = 3u64;
+        let graph_first_launches = u64::try_from((M1_STEPS - 1) + (M1_AUDIO - 1))?;
+        let graph_replay_launches = u64::try_from(1 + M1_STEPS + M1_AUDIO)?;
+        model.set_graph(true);
+        let text_capture = model.text(&prompt, super::TextPlant::Nominal)?;
+        println!(
+            "GRAPH text_capture captures={} launches={}",
+            model.graph_captures(),
+            model.graph_launches()
+        );
+        ensure!(
+            model.graph_captures() == 1 && model.graph_launches() == 0,
+            "text capture"
+        );
+        note_equiv("text_capture", &text_capture, &projected)?;
+        let text_replay = model.text(&prompt, super::TextPlant::Nominal)?;
+        println!(
+            "GRAPH text_replay captures={} launches={}",
+            model.graph_captures(),
+            model.graph_launches()
+        );
+        ensure!(
+            model.graph_captures() == 0 && model.graph_launches() == 1,
+            "text replay"
+        );
+        note_equiv("text_replay", &text_replay, &projected)?;
+        let (graph_backbone, graph_depth) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, false, false)?;
+        println!(
+            "GRAPH greedy_capture captures={} launches={}",
+            model.graph_captures(),
+            model.graph_launches()
+        );
+        ensure!(
+            model.graph_captures() == graph_shapes
+                && model.graph_launches() == graph_first_launches,
+            "greedy capture"
+        );
+        note_equiv("backbone_graph", &graph_backbone, &nominal_backbone)?;
+        note_equiv("depth_graph", &graph_depth, &nominal_depth)?;
+        let (mut replay_backbone, mut replay_depth) =
+            model.greedy_decode(&projected, &hidden, M1_TEXT, fed, &frames, false)?;
+        mask_reserved(&mut replay_backbone, super::BB_VOCAB)?;
+        mask_reserved(&mut replay_depth, depth_vocab)?;
+        println!(
+            "GRAPH greedy_replay captures={} launches={}",
+            model.graph_captures(),
+            model.graph_launches()
+        );
+        ensure!(
+            model.graph_captures() == 0 && model.graph_launches() == graph_replay_launches,
+            "greedy replay"
+        );
+        note_equiv("backbone_replay", &replay_backbone, &nominal_backbone)?;
+        note_equiv("depth_replay", &replay_depth, &nominal_depth)?;
         let mut defect = false;
         let mut protocol = false;
         record(
-            score_masked(&nominal_backbone, &cpu_backbone, &M1_BB_NOMINAL, 8196)?,
+            score_masked(&replay_backbone, &cpu_backbone, &M1_BB_NOMINAL, 8196)?,
             &mut defect,
             &mut protocol,
         );
@@ -4629,7 +4923,7 @@ mod tests {
             &mut protocol,
         );
         record(
-            score_masked(&nominal_depth, &cpu_depth, &M1_DP_NOMINAL, 122_880)?,
+            score_masked(&replay_depth, &cpu_depth, &M1_DP_NOMINAL, 122_880)?,
             &mut defect,
             &mut protocol,
         );
@@ -4639,7 +4933,7 @@ mod tests {
             &mut protocol,
         );
         for (step, expected) in backbone_expected.iter().enumerate() {
-            let row = score_row(&nominal_backbone, step, super::BB_VOCAB)?;
+            let row = score_row(&replay_backbone, step, super::BB_VOCAB)?;
             note_id(
                 "backbone_scores",
                 &format!("step={step}"),
@@ -4651,7 +4945,7 @@ mod tests {
         for (index, id) in depth_expected {
             let frame = index / super::HEAD_N;
             let step = index % super::HEAD_N;
-            let row = score_row(&nominal_depth, index, depth_vocab)?;
+            let row = score_row(&replay_depth, index, depth_vocab)?;
             note_id(
                 "depth_scores",
                 &format!("frame={frame} step={step}"),
