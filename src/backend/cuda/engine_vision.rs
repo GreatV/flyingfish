@@ -10905,6 +10905,8 @@ impl IdolPipelineRuntime {
 mod tests {
     use super::*;
     use crate::backend::cuda::weights::StoredTensor;
+    #[cfg(feature = "cuda")]
+    use crate::backend::cuda::{env_path, fixture_reference};
 
     fn test_blas(
         device: &Device,
@@ -10998,20 +11000,29 @@ mod tests {
             Some("encoder62_preparation37") => true,
             _ => anyhow::bail!("unsupported image freeze scope"),
         };
-        let prepared_bytes = std::fs::read(root.join("cpu-r2/preparation-anchor.safetensors"))?;
+        let prepared_bytes = std::fs::read(
+            env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("preparation-anchor.safetensors"),
+        )?;
         let prepared = safetensors::SafeTensors::deserialize(&prepared_bytes)?;
         let cells = frozen["cells"]
             .as_object()
             .context("image frozen cells missing")?;
         ensure!(cells.len() == 62, "image frozen cell scope differs");
-        let input_bytes = std::fs::read(root.join("cpu-r2/inputs.safetensors"))?;
+        let input_bytes = std::fs::read(
+            env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("inputs.safetensors"),
+        )?;
         let inputs = safetensors::SafeTensors::deserialize(&input_bytes)?;
-        let anchor_bytes = std::fs::read(root.join("cpu-r2/anchor.safetensors"))?;
+        let anchor_bytes = std::fs::read(
+            env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("anchor.safetensors"),
+        )?;
         let anchor = safetensors::SafeTensors::deserialize(&anchor_bytes)?;
-        let operator_bytes = std::fs::read(root.join("cpu-r2/operator-inputs.safetensors"))?;
+        let operator_bytes = std::fs::read(
+            env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("operator-inputs.safetensors"),
+        )?;
         let operator_inputs = safetensors::SafeTensors::deserialize(&operator_bytes)?;
-        let observations: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("cpu-r2/observations.json"))?)?;
+        let observations: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("observations.json"),
+        )?)?;
         let selected = &observations["selected_rows"];
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -13657,8 +13668,10 @@ mod tests {
         use crate::backend::cuda::closure::Closure;
         use sha2::{Digest, Sha256};
         use std::{path::PathBuf, rc::Rc};
-        let freeze_path =
-            PathBuf::from(std::env::var_os("FF_PIXAL_M4C_FREEZE").context("FF_PIXAL_M4C_FREEZE")?);
+        let freeze_path = PathBuf::from(
+            std::env::var_os("FF_PIXAL_COMPOSITION_FREEZE")
+                .context("FF_PIXAL_COMPOSITION_FREEZE")?,
+        );
         let bytes = std::fs::read(&freeze_path)?;
         ensure!(
             format!("{:x}", Sha256::digest(&bytes))
@@ -14009,11 +14022,8 @@ mod tests {
                 let camera = pixal_camera(&inputs, project, name)?;
                 native.stage_rgba(s, rgba.data(), [rgba.shape()[0], rgba.shape()[1]], camera)?;
                 let reference_file = std::fs::File::open(
-                    std::path::PathBuf::from(
-                        std::env::var_os("FF_PIXAL_SS_REFERENCE")
-                            .context("FF_PIXAL_SS_REFERENCE")?,
-                    )
-                    .join(format!("conditioning-{stage}-r0a/{name}.safetensors")),
+                    fixture_reference("FF_PIXAL_CONDITIONING", stage, "REFERENCE")?
+                        .join(format!("{name}.safetensors")),
                 )?;
                 let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
                 let reference = safetensors::SafeTensors::deserialize(&reference_map)?;
@@ -14226,11 +14236,8 @@ mod tests {
             )?;
             for count in [1u32, 2, 4, 9] {
                 let reference_file = std::fs::File::open(
-                    std::path::PathBuf::from(
-                        std::env::var_os("FF_PIXAL_SS_REFERENCE")
-                            .context("FF_PIXAL_SS_REFERENCE")?,
-                    )
-                    .join(format!("mv-conditioning-{stage}-r0a/V{count}.safetensors")),
+                    fixture_reference("FF_PIXAL_MULTIVIEW_CONDITIONING", stage, "REFERENCE")?
+                        .join(format!("V{count}.safetensors")),
                 )?;
                 let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
                 let reference = safetensors::SafeTensors::deserialize(&reference_map)?;

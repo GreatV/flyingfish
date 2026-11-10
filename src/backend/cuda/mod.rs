@@ -659,6 +659,69 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires fixture binding manifest and reference paths; CPU only"]
+    fn fixture_env_bindings_cpu() -> Result<()> {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(env_path("FF_FIXTURE_BINDINGS")?)?)?;
+        let bindings: Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)> =
+            serde_json::from_value(manifest["paths"].clone())?;
+        let paths = bindings
+            .iter()
+            .map(|(name, _, _)| env_path(name))
+            .collect::<Result<Vec<_>>>()?;
+        let mut files = 0;
+        for (path, (name, expected, probes)) in paths.iter().zip(&bindings) {
+            ensure!(path == expected, "fixture binding differs: {name}");
+            for probe in probes {
+                let probe = if probe.as_os_str().is_empty() {
+                    path.clone()
+                } else {
+                    path.join(probe)
+                };
+                let file = std::fs::File::open(&probe)
+                    .with_context(|| format!("{name}: open {}", probe.display()))?;
+                let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                if probe.extension().is_some_and(|ext| ext == "safetensors") {
+                    let tensors = safetensors::SafeTensors::deserialize(&map)?;
+                    ensure!(!tensors.is_empty(), "empty fixture: {name}");
+                } else {
+                    let _: serde_json::Value = serde_json::from_slice(&map)?;
+                }
+                files += 1;
+            }
+        }
+        println!(
+            "PASS FIXTURE_ENV_BINDINGS bindings={} files={files} GPU_allocations=0",
+            bindings.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires fixture binding manifest and reference paths; CPU only"]
+    fn fixture_family_bindings_cpu() -> Result<()> {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(env_path("FF_FIXTURE_BINDINGS")?)?)?;
+        let bindings: Vec<(String, String, String, std::path::PathBuf)> =
+            serde_json::from_value(manifest["families"].clone())?;
+        let paths = bindings
+            .iter()
+            .map(|(prefix, case, suffix, _)| fixture_reference(prefix, case, suffix))
+            .collect::<Result<Vec<_>>>()?;
+        for (path, (prefix, case, suffix, expected)) in paths.iter().zip(&bindings) {
+            ensure!(
+                path == expected,
+                "fixture family differs: {prefix}/{case}/{suffix}"
+            );
+        }
+        println!(
+            "PASS FIXTURE_FAMILY_BINDINGS cases={} GPU_allocations=0",
+            bindings.len()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn peer_copy_verifier_detects_single_byte_corruption_cpu() -> Result<()> {
         let pattern = peer_verify_pattern(PEER_VERIFY_MEMCPY_BYTES);
         assert_ne!(&pattern[..4096], &pattern[4096..8192]);
@@ -872,3 +935,29 @@ impl Device {
 
 #[cfg(all(test, feature = "cuda"))]
 mod engine_glm_gate;
+
+#[cfg(all(test, feature = "cuda"))]
+pub(super) fn env_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context;
+    Ok(std::path::PathBuf::from(
+        std::env::var_os(name).with_context(|| format!("{name} required"))?,
+    ))
+}
+
+#[cfg(all(test, feature = "cuda"))]
+pub(super) fn fixture_reference(
+    prefix: &str,
+    case: &str,
+    suffix: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let label = match case {
+        "robot" => "ROBOT_CRAB".into(),
+        "cottage1024" | "single-1024-cottage" => "COTTAGE_1024".into(),
+        "crab1024" | "single-1024-robot_crab" => "ROBOT_CRAB_1024".into(),
+        "cottage1536" | "single-1536-cottage" => "COTTAGE_1536".into(),
+        "crab1408" | "single-1536-robot_crab" => "ROBOT_CRAB_1408".into(),
+        "mv41024" | "mv-1024-mv4" => "MULTIVIEW_1024".into(),
+        _ => case.to_ascii_uppercase().replace('-', "_"),
+    };
+    env_path(&format!("{prefix}_{label}_{suffix}"))
+}
