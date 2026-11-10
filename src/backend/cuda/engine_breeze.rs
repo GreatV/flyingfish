@@ -254,6 +254,10 @@ struct Kern {
     h2d: Cell<u64>,
     d2h: Cell<u64>,
     d2d: Cell<u64>,
+    #[cfg(test)]
+    pad_plant: Cell<u8>, // 0 off, 1 pad rows, 2 backbone logical row
+    #[cfg(test)]
+    pad_once: Cell<bool>,
 }
 
 struct Buf {
@@ -460,7 +464,38 @@ fn qkv_layout(
     Ok((k_off, v_off))
 }
 
-fn gemm(stream: &Arc<CudaStream>, blas: &Blas, g: Gemm<'_>) -> Result<()> {
+#[cfg(test)]
+fn plant_gemm_rows(
+    k: &Kern,
+    x: &mut CudaSlice<bf16>,
+    x_off: usize,
+    logical: usize,
+    input: usize,
+    rows: usize,
+) -> Result<()> {
+    const BITS: u16 = 0x4280; // bf16 64
+    let mode = k.pad_plant.get();
+    let (off, n) = if mode == 1 && rows > logical {
+        (x_off + logical * input, (rows - logical) * input)
+    } else if mode == 2 && !k.pad_once.get() {
+        k.pad_once.set(true);
+        (x_off, input)
+    } else {
+        return Ok(());
+    };
+    ensure!(n > 0 && off.saturating_add(n) <= x.len(), "pad plant");
+    let (ptr, _guard) = x.device_ptr_mut(&k.stream);
+    let dst = ptr + (off * std::mem::size_of::<bf16>()) as u64;
+    // SAFETY: dst names n bf16 elements inside this stream's slice.
+    unsafe {
+        cudarc::driver::sys::cuMemsetD16Async(dst, BITS, n, k.stream.cu_stream())
+            .result()
+            .context("pad plant")?;
+    }
+    Ok(())
+}
+
+fn gemm(k: &Kern, blas: &Blas, g: Gemm<'_>) -> Result<()> {
     let rows = gemm_rows(g.logical, g.input);
     let x_need = g
         .x_off
@@ -471,10 +506,10 @@ fn gemm(stream: &Arc<CudaStream>, blas: &Blas, g: Gemm<'_>) -> Result<()> {
         .checked_add(rows.checked_mul(g.output).context("gemm extent")?)
         .context("gemm extent")?;
     ensure!(x_need <= g.x.len() && y_need <= g.y.len(), "gemm buffer");
-    if rows > g.logical {
-        let start = g.x_off + g.logical * g.input;
-        stream.memset_zeros(&mut g.x.slice_mut(start..x_need))?;
-    }
+    #[cfg(not(test))]
+    let _ = k;
+    #[cfg(test)]
+    plant_gemm_rows(k, g.x, g.x_off, g.logical, g.input, rows)?;
     blas.linear(
         g.w,
         &g.x.slice(g.x_off..x_need),
@@ -1300,7 +1335,7 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
     let kv_width = call.kv_width;
     let (k_off, v_off) = qkv_layout(rows, call.hidden, q_width, kv_width)?;
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: call.q,
@@ -1314,7 +1349,7 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
         },
     )?;
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: call.k,
@@ -1328,7 +1363,7 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
         },
     )?;
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: call.v,
@@ -1393,7 +1428,7 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
         }
     }
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: call.o,
@@ -1410,7 +1445,7 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
 
 fn mlp(k: &Kern, buf: &mut Buf, blas: &Blas, call: Mlp<'_>) -> Result<()> {
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: call.gate,
@@ -1424,7 +1459,7 @@ fn mlp(k: &Kern, buf: &mut Buf, blas: &Blas, call: Mlp<'_>) -> Result<()> {
         },
     )?;
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: call.up,
@@ -1458,7 +1493,7 @@ fn mlp(k: &Kern, buf: &mut Buf, blas: &Blas, call: Mlp<'_>) -> Result<()> {
         )?;
     }
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: call.down,
@@ -1900,7 +1935,7 @@ fn depth_after(k: &Kern, buf: &mut Buf, blas: &Blas, run: DepthRun<'_>) -> Resul
         slot,
     } = run;
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: projector,
@@ -1980,7 +2015,7 @@ fn depth_heads(
         }
         let which = if plant && book == 0 { 1 } else { book };
         gemm(
-            &k.stream,
+            k,
             blas,
             Gemm {
                 w: &heads[which],
@@ -2096,7 +2131,7 @@ fn backbone_rows(k: &Kern, buf: &mut Buf, blas: &Blas, pass: ScorePass<'_>) -> R
         },
     )?;
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: pass.lm,
@@ -2139,7 +2174,7 @@ fn depth_head_row(
     )?;
     let which = if plant && book == 0 { 1 } else { book };
     gemm(
-        &k.stream,
+        k,
         blas,
         Gemm {
             w: &heads[which],
@@ -2348,6 +2383,10 @@ impl Breeze {
                 h2d: Cell::new(0),
                 d2h: Cell::new(0),
                 d2d: Cell::new(0),
+                #[cfg(test)]
+                pad_plant: Cell::new(0),
+                #[cfg(test)]
+                pad_once: Cell::new(false),
             },
             flash: Flashes {
                 text_full,
@@ -2425,7 +2464,7 @@ impl Breeze {
             },
         )?;
         gemm(
-            &k.stream,
+            k,
             blas,
             Gemm {
                 w: &w.text_proj,
@@ -2578,7 +2617,7 @@ impl Breeze {
             },
         )?;
         gemm(
-            &k.stream,
+            k,
             blas,
             Gemm {
                 w: &w.lm,
@@ -2670,6 +2709,10 @@ impl Breeze {
         k.h2d.set(0);
         k.d2h.set(0);
         k.d2d.set(0);
+        #[cfg(test)]
+        if k.pad_plant.get() == 2 {
+            k.pad_once.set(false);
+        }
         upload_hidden(k, buf, projected)?;
         let mut backbone = Vec::with_capacity((audio_steps + 1) * BB_VOCAB);
         let mut depth = Vec::with_capacity(depth_frames * HEAD_N * (CODEBOOK as usize));
@@ -2766,6 +2809,14 @@ impl Breeze {
             "traffic"
         );
         Ok((backbone, depth))
+    }
+
+    #[cfg(test)]
+    fn set_pad_plant(&self, mode: u8) -> Result<()> {
+        ensure!(mode <= 2, "pad plant");
+        self.k.pad_plant.set(mode);
+        self.k.pad_once.set(false);
+        Ok(())
     }
 }
 
@@ -3261,6 +3312,17 @@ mod tests {
         let name = ["text_encoder_window_", "ignored"].concat();
         check_controls(&doc, &[("sliding_hidden", name.as_str())])?;
         Ok(())
+    }
+
+    #[test]
+    fn gemm_leaves_pad_rows() {
+        let engine = include_str!("engine_breeze.rs");
+        let start = engine.find("fn gemm(").expect("gemm");
+        let body = &engine[start..];
+        let end = body.find("\nfn ").expect("next fn");
+        let body = &body[..end];
+        assert!(!body.contains("memset"), "gemm pad memset");
+        assert!(engine.contains("0x4280"), "pad garbage bits");
     }
 
     #[test]
@@ -4534,6 +4596,26 @@ mod tests {
         let (audio_backbone, _) =
             greedy_scores(&mut model, &projected, &hidden, &frames, true, false)?;
         let (_, head_depth) = greedy_scores(&mut model, &projected, &hidden, &frames, false, true)?;
+        model.set_pad_plant(1)?;
+        let (pad_backbone, pad_depth) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, false, false)?;
+        note_equiv("backbone_pad", &pad_backbone, &nominal_backbone)?;
+        note_equiv("depth_pad", &pad_depth, &nominal_depth)?;
+        model.set_pad_plant(2)?;
+        let (row_backbone, row_depth) =
+            greedy_scores(&mut model, &projected, &hidden, &frames, false, false)?;
+        model.set_pad_plant(0)?;
+        let (row_bb, row_bb_rmse) = {
+            let (got, want) = finite_cells(&row_backbone, &nominal_backbone)?;
+            difference(&got, &want)?
+        };
+        let (row_dp, row_dp_rmse) = {
+            let (got, want) = finite_cells(&row_depth, &nominal_depth)?;
+            difference(&got, &want)?
+        };
+        println!("PAD_ROW tensor=backbone_scores max_abs={row_bb} rmse={row_bb_rmse}");
+        println!("PAD_ROW tensor=depth_scores max_abs={row_dp} rmse={row_dp_rmse}");
+        ensure!(row_bb != 0.0, "logical row plant");
         let mut defect = false;
         let mut protocol = false;
         record(
