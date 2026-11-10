@@ -1319,4 +1319,3 @@ fn canary_greedy_matches_reference() -> Result<()> {
     let engine = Canary::load(&model, &device)?;
     match_greedy(&engine, &fixtures, &floors, &model)
 }
-
