@@ -650,8 +650,10 @@ impl BlockWeights {
 
 pub(crate) struct BlockKernels {
     norm: crate::backend::gpu::CudaFunction,
+    norm_modulate: crate::backend::gpu::CudaFunction,
     rotary: crate::backend::gpu::CudaFunction,
     swiglu: crate::backend::gpu::CudaFunction,
+    #[cfg(test)]
     modulate: crate::backend::gpu::CudaFunction,
     gated_add: crate::backend::gpu::CudaFunction,
     residual: crate::backend::gpu::CudaFunction,
@@ -661,11 +663,24 @@ impl BlockKernels {
     pub(crate) fn new(ctx: &Arc<crate::backend::gpu::CudaContext>) -> Result<Self> {
         let modulate = cubin::module(ctx, "modulate")?;
         let norm = cubin::module(ctx, "norm")?;
+        let plain = norm.load_function("rms_norm_bf16")?;
+        let norm_modulate = norm.load_function("rms_norm_modulate_bf16")?;
+        let active = |kernel: &crate::backend::gpu::CudaFunction| {
+            kernel.occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)
+        };
+        let baseline = active(&plain)?;
+        let fused = active(&norm_modulate)?;
+        ensure!(
+            baseline > 0 && fused >= baseline,
+            "rms_norm_modulate_bf16 occupancy {fused} below rms_norm_bf16 {baseline}"
+        );
         Ok(Self {
-            norm: norm.load_function("rms_norm_bf16")?,
+            norm: plain,
+            norm_modulate,
             residual: norm.load_function("residual")?,
             rotary: cubin::module(ctx, "rope")?.load_function("rotary_prefix_kv")?,
             swiglu: cubin::module(ctx, "act")?.load_function("silu_mul")?,
+            #[cfg(test)]
             modulate: modulate.load_function("row_modulate")?,
             gated_add: modulate.load_function("row_gated_add")?,
         })
@@ -1113,21 +1128,34 @@ pub(crate) fn block_forward(
             },
         )
     };
-    let modulate = |data: u64, shift: usize, scale: usize| -> Result<()> {
-        unsafe {
-            s.launch_builder(&kernels.modulate)
-                .arg(&data)
-                .arg(&chunk(shift))
-                .arg(&chunk(scale))
-                .arg(&index)
-                .arg(&data)
-                .arg(&rows_i)
-                .arg(&i32::try_from(h)?)
-                .arg(&(stride as u64))
-                .arg(&entries)
-                .launch(row_grid)?;
+    let hidden_norm = |weight: &CudaSlice<bf16>, shift: usize, scale: usize| -> Result<()> {
+        let n = NormRows {
+            input: pointer(x, s),
+            weight: pointer(weight, s),
+            output: pointer(&work.normed, s),
+            rows,
+            dim: h,
+            threads: HIDDEN_NORM_THREADS,
+            eps: spec.norm_eps,
+        };
+        if modulation.is_some() {
+            kernels.rms_norm_modulate(
+                s,
+                n,
+                ModulateRows {
+                    data: pointer(&work.normed, s),
+                    shift: chunk(shift),
+                    scale: chunk(scale),
+                    index,
+                    rows,
+                    dim: h,
+                    stride,
+                    entries,
+                },
+            )
+        } else {
+            kernels.rms_norm(s, n)
         }
-        Ok(())
     };
     let gated_add = |residual: u64, update: u64, gate: usize| -> Result<()> {
         unsafe {
@@ -1165,18 +1193,7 @@ pub(crate) fn block_forward(
     let xp = pointer(x, s);
     let normed = pointer(&work.normed, s);
 
-    norm(
-        xp,
-        pointer(&w.norm1, s),
-        normed,
-        rows,
-        h,
-        HIDDEN_NORM_THREADS,
-        spec.norm_eps,
-    )?;
-    if modulation.is_some() {
-        modulate(normed, 0, 1)?;
-    }
+    hidden_norm(&w.norm1, 0, 1)?;
     for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
         base(
             index,
@@ -1279,18 +1296,7 @@ pub(crate) fn block_forward(
         residual(xp, normed)?;
     }
 
-    norm(
-        xp,
-        pointer(&w.norm2, s),
-        normed,
-        rows,
-        h,
-        HIDDEN_NORM_THREADS,
-        spec.norm_eps,
-    )?;
-    if modulation.is_some() {
-        modulate(normed, 3, 4)?;
-    }
+    hidden_norm(&w.norm2, 3, 4)?;
     ffn_forward::<false>(c, w, work)?;
     if modulation.is_some() {
         gated_add(xp, normed, 5)?;
@@ -1391,6 +1397,57 @@ struct ModulateRows {
 }
 
 impl BlockKernels {
+    fn rms_norm_modulate(&self, s: &Arc<CudaStream>, n: NormRows, m: ModulateRows) -> Result<()> {
+        ensure!(
+            n.rows == m.rows && n.dim == m.dim && n.output == m.data,
+            "RMSNorm modulation output extent"
+        );
+        ensure!(
+            n.rows > 0
+                && n.dim > 0
+                && n.dim.is_multiple_of(8)
+                && n.threads == HIDDEN_NORM_THREADS
+                && n.dim / 8 <= n.threads as usize
+                && m.stride >= n.dim
+                && m.entries > 0
+                && m.index != 0
+                && m.index.is_multiple_of(4),
+            "RMSNorm modulation launch extent"
+        );
+        for p in [n.input, n.weight, n.output, m.shift, m.scale] {
+            ensure!(
+                p != 0 && p.is_multiple_of(16),
+                "RMSNorm modulation alignment"
+            );
+        }
+        n.rows
+            .checked_mul(n.dim)
+            .context("RMSNorm element extent overflow")?;
+        m.stride
+            .checked_mul(m.entries as usize)
+            .context("modulation table extent overflow")?;
+        unsafe {
+            s.launch_builder(&self.norm_modulate)
+                .arg(&n.input)
+                .arg(&n.weight)
+                .arg(&n.output)
+                .arg(&m.shift)
+                .arg(&m.scale)
+                .arg(&m.index)
+                .arg(&i32::try_from(n.rows)?)
+                .arg(&i32::try_from(n.dim)?)
+                .arg(&n.eps)
+                .arg(&(m.stride as u64))
+                .arg(&m.entries)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(n.rows)?, 1, 1),
+                    block_dim: (n.threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
     fn rms_norm(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
         unsafe {
             s.launch_builder(&self.norm)
@@ -1409,6 +1466,7 @@ impl BlockKernels {
         Ok(())
     }
 
+    #[cfg(test)]
     fn row_modulate(&self, s: &Arc<CudaStream>, m: ModulateRows) -> Result<()> {
         unsafe {
             s.launch_builder(&self.modulate)
@@ -2212,7 +2270,12 @@ impl Dit {
             }
         }
         let normed = pointer(&self.work.normed, s);
-        c.kernels.rms_norm(
+        ensure!(
+            adaln.norm_out.len() == timesteps as usize * 2 * h,
+            "output-norm table extent"
+        );
+        let table = pointer(&adaln.norm_out, s);
+        c.kernels.rms_norm_modulate(
             s,
             NormRows {
                 input: pointer(&self.x, s),
@@ -2223,14 +2286,6 @@ impl Dit {
                 threads: HIDDEN_NORM_THREADS,
                 eps: spec.final_norm_eps,
             },
-        )?;
-        ensure!(
-            adaln.norm_out.len() == timesteps as usize * 2 * h,
-            "output-norm table extent"
-        );
-        let table = pointer(&adaln.norm_out, s);
-        c.kernels.row_modulate(
-            s,
             ModulateRows {
                 data: normed,
                 shift: table,
@@ -3050,6 +3105,182 @@ mod tests {
             );
             println!("H3_REFINER_SKINNY rows={rows} finite=true");
         }
+        Ok(())
+    }
+
+    /// Fused RMSNorm and indexed modulation preserve the five BF16 rounding boundaries.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted"]
+    fn rms_norm_modulation_is_bitwise_invariant_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        device.finish_upload()?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let plain_active = kernels
+            .norm
+            .occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)?;
+        let fused_active = kernels
+            .norm_modulate
+            .occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)?;
+        println!(
+            "H3_NORM_MODULATE_RESOURCE threads={HIDDEN_NORM_THREADS} plain_active={plain_active} fused_active={fused_active}"
+        );
+        let dim = 5376;
+        let guard = bf16::from_f32(-23.0);
+        let mut cells = 0;
+        let mut defects = 0;
+        let mut control_bits = 0;
+        for rows in [1usize, 2, 33, 65, 40_045, 60_431] {
+            for (stride, entries) in [(2 * dim, 1u32), (2 * dim, 7), (6 * dim, 1), (6 * dim, 7)] {
+                let index: Vec<u32> = (0..rows)
+                    .map(|r| ((r * 5 + r / 7) % entries as usize) as u32)
+                    .collect();
+                let indices = s.clone_htod(&index)?;
+                let mut weight: Vec<bf16> = (0..dim)
+                    .map(|d| bf16::from_f32(0.75 + (d * 31 % 257) as f32 / 512.0))
+                    .collect();
+                weight[0] = bf16::from_f32(129.0 / 128.0);
+                let gamma = s.clone_htod(&weight)?;
+                let mut table: Vec<bf16> = (0..stride * entries as usize)
+                    .map(|i| bf16::from_f32(((i * 37 + i / dim * 13) % 251) as f32 / 256.0 - 0.5))
+                    .collect();
+                for entry in 0..entries as usize {
+                    table[entry * stride] = bf16::from_f32(-130.0 / 128.0);
+                    table[entry * stride + dim] = bf16::from_f32(1.0 / 128.0);
+                }
+                let params = s.clone_htod(&table)?;
+                let mut input = s.alloc_zeros::<bf16>(rows * dim + 16)?;
+                let mut serial = s.clone_htod(&vec![guard; rows * dim + 16])?;
+                let mut fused = s.clone_htod(&vec![guard; rows * dim + 16])?;
+                let input_at = pointer(&input, s) + 16;
+                let serial_at = pointer(&serial, s) + 16;
+                let fused_at = pointer(&fused, s) + 16;
+                let norm = |output: u64| NormRows {
+                    input: input_at,
+                    weight: pointer(&gamma, s),
+                    output,
+                    rows,
+                    dim,
+                    threads: HIDDEN_NORM_THREADS,
+                    eps: 1e-5,
+                };
+                let modulation = |output: u64| ModulateRows {
+                    data: output,
+                    shift: pointer(&params, s),
+                    scale: pointer(&params, s) + 2 * dim as u64,
+                    index: pointer(&indices, s),
+                    rows,
+                    dim,
+                    stride,
+                    entries,
+                };
+                let launch = || kernels.rms_norm_modulate(s, norm(fused_at), modulation(fused_at));
+                s.synchronize()?;
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let capture_result = launch();
+                let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?
+                    .context("RMSNorm modulation graph")?;
+                capture_result?;
+                for replay in 0..2 {
+                    let host: Vec<bf16> = (0..rows * dim + 16)
+                        .map(|i| {
+                            if i < 8 || i >= rows * dim + 8 {
+                                guard
+                            } else if replay == 0 && i < dim + 8 {
+                                bf16::ONE
+                            } else {
+                                bf16::from_f32(
+                                    (((i - 8) * 43 + (i - 8) / dim * 17 + replay * 71) % 509)
+                                        as f32
+                                        / 127.0
+                                        - 2.0,
+                                )
+                            }
+                        })
+                        .collect();
+                    // The captured input pointer remains fixed across both replays.
+                    let mut view = input.slice_mut(..);
+                    s.memcpy_htod(&host, &mut view)?;
+                    for captured in [false, true] {
+                        s.memcpy_htod(&vec![guard; serial.len()], &mut serial)?;
+                        s.memcpy_htod(&vec![guard; fused.len()], &mut fused)?;
+                        kernels.rms_norm(s, norm(serial_at))?;
+                        kernels.row_modulate(s, modulation(serial_at))?;
+                        if captured {
+                            graph.launch()?;
+                        } else {
+                            launch()?;
+                        }
+                        let expected = s.clone_dtoh(&serial)?;
+                        let actual = s.clone_dtoh(&fused)?;
+                        ensure!(
+                            expected.iter().chain(&actual).all(|v| v.is_finite()),
+                            "RUNNER_FAIL nonfinite norm/modulation"
+                        );
+                        ensure!(
+                            actual[..8]
+                                .iter()
+                                .chain(&actual[actual.len() - 8..])
+                                .all(|v| *v == guard),
+                            "RUNNER_FAIL norm/modulation output guard"
+                        );
+                        let bits = expected
+                            .iter()
+                            .zip(&actual)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        defects += usize::from(bits > 0);
+                        cells += 1;
+                        if replay == 0
+                            && rows == 1
+                            && entries == 1
+                            && stride == 2 * dim
+                            && !captured
+                        {
+                            let unrounded_product = (129.0f32 / 128.0) * (129.0 / 128.0);
+                            let control = bf16::from_f32(unrounded_product - 130.0 / 128.0);
+                            ensure!(
+                                expected[8] == bf16::ZERO && control.to_f32() == 1.0 / 16384.0,
+                                "RUNNER_FAIL scaled-product round control fixture"
+                            );
+                            control_bits = usize::from(actual[8].to_bits() != control.to_bits());
+                            println!(
+                                "H3_NORM_MODULATE_CONTROL omitted_scaled_product_round={} correct={} bit_differences={control_bits}",
+                                control.to_f32(),
+                                actual[8].to_f32()
+                            );
+                        }
+                        println!(
+                            "H3_NORM_MODULATE_CELL rows={rows} stride={stride} entries={entries} replay={replay} captured={captured} bit_differences={bits}"
+                        );
+                    }
+                }
+                let valid = modulation(fused_at);
+                let mut invalid = norm(fused_at);
+                invalid.output += 2;
+                ensure!(
+                    kernels.rms_norm_modulate(s, invalid, valid).is_err(),
+                    "misaligned norm output accepted"
+                );
+            }
+        }
+        println!(
+            "H3_NORM_MODULATE_GATE cells={cells} defects={defects} bit_limit=0 control_bit_differences={control_bits}"
+        );
+        ensure!(
+            control_bits > 0,
+            "RUNNER_FAIL scaled-product control undetected"
+        );
+        ensure!(
+            defects == 0,
+            "DEFECT norm/modulation bitwise cells={defects}"
+        );
         Ok(())
     }
 
