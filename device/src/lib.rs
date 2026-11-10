@@ -494,25 +494,20 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16_window
     windows: u32,
 ) {
     unsafe {
-        let p = window_attention::<16, true>(p, keys, offsets, windows);
-        attention::<64, 8, 1, 16, true, true>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
-    }
-}
-
-#[inline(always)]
-unsafe fn window_attention<const L: usize, const SINGLE: bool>(
-    mut p: Attention,
-    keys: u32,
-    offsets: *const u32,
-    windows: u32,
-) -> Attention {
-    unsafe {
         let window: u32;
         asm!("mov.u32 {w}, %ctaid.z;", w=out(reg32) window);
         assert!(!offsets.is_null() && window < windows && keys == p.rows);
         let first = *offsets.add(window as usize);
         let end = *offsets.add(window as usize + 1);
-        assert!(first < end && end <= p.rows && (!SINGLE || end - first <= 48));
+        assert!(first < end && end <= p.rows && end - first <= 48);
+        let p = window_attention::<16>(p, first, end);
+        attention::<64, 8, 1, 16, true, true>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
+    }
+}
+
+#[inline(always)]
+unsafe fn window_attention<const L: usize>(mut p: Attention, first: u32, end: u32) -> Attention {
+    unsafe {
         p.q = p.q.add(first as usize * p.q_stride as usize);
         p.k = p.k.add(first as usize * L);
         p.v = p.v.add(first as usize * L);
@@ -535,7 +530,13 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
     windows: u32,
 ) {
     unsafe {
-        let p = window_attention::<64, false>(p, keys, offsets, windows);
+        let window: u32;
+        asm!("mov.u32 {w}, %ctaid.z;", w=out(reg32) window);
+        assert!(!offsets.is_null() && window < windows && keys == p.rows);
+        let first = *offsets.add(window as usize);
+        let end = *offsets.add(window as usize + 1);
+        assert!(first < end && end <= p.rows);
+        let p = window_attention::<64>(p, first, end);
         let tile: u32;
         asm!("mov.u32 {b}, %ctaid.x;", b=out(reg32) tile);
         if tile * 64 >= p.rows {
