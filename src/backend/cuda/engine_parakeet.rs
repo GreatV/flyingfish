@@ -2,7 +2,9 @@
 use crate::{
     backend::{
         cuda::{Device, cubin},
-        gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg},
+        gpu::{
+            CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+        },
     },
     checkpoint::MappedCheckpoint,
     parakeet::{FastConformer, ParakeetSpec, conv_out, position_rows_fit},
@@ -150,8 +152,18 @@ pub struct ParakeetTdt {
     joint_activated: CudaSlice<f32>,
     joint_logits: CudaSlice<f32>,
     selection: CudaSlice<u32>,
+    step_index: CudaSlice<i32>,
+    gather: CudaFunction,
+    token_graph: Option<CudaGraph>,
+    blank_graph: Option<CudaGraph>,
     projected: Option<CudaSlice<f32>>,
     initialized: bool,
+    #[cfg(test)]
+    eager_steps: std::cell::Cell<bool>,
+    #[cfg(test)]
+    graph_captures: std::cell::Cell<u64>,
+    #[cfg(test)]
+    graph_launches: std::cell::Cell<u64>,
     #[cfg(test)]
     lstm_calls: std::cell::Cell<usize>,
 }
@@ -2000,7 +2012,11 @@ impl ParakeetTdt {
         let joint_activated = stream.alloc_zeros(hidden)?;
         let joint_logits = stream.alloc_zeros(joint_width)?;
         let selection = stream.alloc_zeros(2)?;
+        let step_index = stream.alloc_zeros::<i32>(2)?;
+        let gather =
+            cubin::module(&device.ctx, "vision_ops")?.load_function("vision_row_gather_f32")?;
         stream.synchronize()?;
+        device.finish_upload()?;
         Ok(Self {
             encoder,
             spec,
@@ -2016,14 +2032,26 @@ impl ParakeetTdt {
             joint_activated,
             joint_logits,
             selection,
+            step_index,
+            gather,
+            token_graph: None,
+            blank_graph: None,
             projected: None,
             initialized: false,
+            #[cfg(test)]
+            eager_steps: std::cell::Cell::new(false),
+            #[cfg(test)]
+            graph_captures: std::cell::Cell::new(0),
+            #[cfg(test)]
+            graph_launches: std::cell::Cell::new(0),
             #[cfg(test)]
             lstm_calls: std::cell::Cell::new(0),
         })
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.token_graph = None;
+        self.blank_graph = None;
         for layer in &mut self.lstm {
             self.encoder.stream.memset_zeros(&mut layer.hidden)?;
             self.encoder.stream.memset_zeros(&mut layer.cell)?;
@@ -2041,6 +2069,7 @@ impl ParakeetTdt {
             .memset_zeros(&mut self.joint_activated)?;
         self.encoder.stream.memset_zeros(&mut self.joint_logits)?;
         self.encoder.stream.memset_zeros(&mut self.selection)?;
+        self.encoder.stream.memset_zeros(&mut self.step_index)?;
         self.projected = None;
         self.initialized = false;
         #[cfg(test)]
@@ -2102,6 +2131,15 @@ impl ParakeetTdt {
         self.encoder
             .stream
             .memcpy_dtod(&self.embedding.slice(start..start + width), &mut self.input)?;
+        self.predict_from_input()?;
+        self.initialized = true;
+        #[cfg(test)]
+        self.lstm_calls.set(self.lstm_calls.get() + self.lstm.len());
+        Ok(())
+    }
+
+    fn predict_from_input(&mut self) -> Result<()> {
+        let width = self.spec.decoder_hidden as usize;
         for index in 0..self.lstm.len() {
             let (previous, current) = self.lstm.split_at_mut(index);
             let layer = &mut current[0];
@@ -2131,13 +2169,64 @@ impl ParakeetTdt {
                     .arg(&self.spec.decoder_hidden)
                     .launch(flat(width))?;
             }
-            #[cfg(test)]
-            self.lstm_calls.set(self.lstm_calls.get() + 1);
         }
         let last = self.lstm.last().context("prediction LSTM stack empty")?;
         self.encoder
             .linear_into(&last.hidden, 1, &self.decoder_projector, &mut self.cache)?;
-        self.initialized = true;
+        Ok(())
+    }
+
+    fn gather_row(
+        stream: &Arc<CudaStream>,
+        gather: &CudaFunction,
+        table: &CudaSlice<f32>,
+        index: &CudaSlice<i32>,
+        which: usize,
+        output: &mut CudaSlice<f32>,
+        in_rows: u32,
+    ) -> Result<()> {
+        let width = u32::try_from(output.len()).context("tdt gather width")?;
+        ensure!(
+            which < index.len()
+                && table.len() == in_rows as usize * output.len()
+                && output.len() == width as usize,
+            "tdt gather shape"
+        );
+        let rows = 1u32;
+        let view = index.slice(which..which + 1);
+        unsafe {
+            stream
+                .launch_builder(gather)
+                .arg(table)
+                .arg(&view)
+                .arg(&*output)
+                .arg(&rows)
+                .arg(&in_rows)
+                .arg(&width)
+                .launch(flat(output.len()))?;
+        }
+        Ok(())
+    }
+
+    fn gather_embedding(&mut self) -> Result<()> {
+        Self::gather_row(
+            &self.encoder.stream,
+            &self.gather,
+            &self.embedding,
+            &self.step_index,
+            0,
+            &mut self.input,
+            self.spec.vocab,
+        )
+    }
+
+    fn write_indices(&mut self, token: u32, frame: usize) -> Result<()> {
+        let token = i32::try_from(token).context("tdt token index")?;
+        let frame = i32::try_from(frame).context("tdt frame index")?;
+        let indices = [token, frame];
+        self.encoder
+            .stream
+            .memcpy_htod(indices.as_slice(), &mut self.step_index)?;
         Ok(())
     }
 
@@ -2207,47 +2296,47 @@ impl ParakeetTdt {
         Ok(self.encoder.stream.clone_dtoh(&self.joint_logits)?)
     }
 
-    fn joint_argmax(&mut self, frame: usize) -> Result<(u32, u32)> {
-        let width = self.spec.decoder_hidden as usize;
-        let vocab = self.spec.vocab as usize;
-        let joint_width = vocab + self.spec.durations.len();
-        let projected = self
-            .projected
-            .as_ref()
-            .context("decode projector missing")?;
-        ensure!(
-            frame < projected.len() / width,
-            "decode frame outside projected encoder"
-        );
-        let row = projected.slice(frame * width..(frame + 1) * width);
+    fn joint_device(&mut self, physical_rows: usize) -> Result<()> {
+        let width = self.spec.decoder_hidden;
+        let in_rows = u32::try_from(physical_rows).context("tdt projected rows")?;
+        {
+            let projected = self
+                .projected
+                .as_ref()
+                .context("decode projector missing")?;
+            ensure!(
+                projected.len() == physical_rows * width as usize,
+                "decode projected extent differs from decoder hidden size"
+            );
+            Self::gather_row(
+                &self.encoder.stream,
+                &self.gather,
+                projected,
+                &self.step_index,
+                1,
+                &mut self.joint_frame,
+                in_rows,
+            )?;
+        }
         self.encoder
             .stream
             .memcpy_dtod(&self.cache, &mut self.joint_sum)?;
-        let count = self.joint_sum.len() as u64;
-        unsafe {
-            self.encoder
-                .stream
-                .launch_builder(&self.encoder.ops.residual)
-                .arg(&self.joint_sum)
-                .arg(&row)
-                .arg(&self.joint_sum)
-                .arg(&count)
-                .arg(&1.0f32)
-                .launch(flat(self.joint_sum.len()))?;
-        }
-        self.encoder.activate_into(
-            &self.joint_sum,
-            1,
-            self.spec.decoder_hidden,
-            0,
-            &mut self.joint_activated,
-        )?;
+        self.encoder
+            .residual(&mut self.joint_sum, &self.joint_frame, 1.0)?;
+        self.encoder
+            .activate_into(&self.joint_sum, 1, width, 0, &mut self.joint_activated)?;
         self.encoder.linear_into(
             &self.joint_activated,
             1,
             &self.joint,
             &mut self.joint_logits,
         )?;
+        self.launch_argmax()
+    }
+
+    fn launch_argmax(&mut self) -> Result<()> {
+        let vocab = self.spec.vocab as usize;
+        let joint_width = vocab + self.spec.durations.len();
         let token_logits = self.joint_logits.slice(..vocab);
         let duration_logits = self.joint_logits.slice(vocab..joint_width);
         unsafe {
@@ -2266,8 +2355,75 @@ impl ParakeetTdt {
                 .arg(&(duration_logits.len() as i32))
                 .launch(super::ops::grid(1, 1024))?;
         }
+        Ok(())
+    }
+
+    fn read_selection(&self) -> Result<(u32, u32)> {
         let selected = self.encoder.stream.clone_dtoh(&self.selection)?;
         Ok((selected[0], selected[1]))
+    }
+
+    fn token_body(&mut self, physical_rows: usize) -> Result<()> {
+        self.gather_embedding()?;
+        self.predict_from_input()?;
+        self.joint_device(physical_rows)
+    }
+
+    fn blank_body(&mut self, physical_rows: usize) -> Result<()> {
+        self.joint_device(physical_rows)
+    }
+
+    fn capture_step(&mut self, token_step: bool, physical_rows: usize) -> Result<()> {
+        self.encoder.stream.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        let recorded = if token_step {
+            self.token_body(physical_rows)
+        } else {
+            self.blank_body(physical_rows)
+        };
+        let captured = self
+            .encoder
+            .stream
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+        recorded.context("tdt step graph body")?;
+        let graph = captured?.context("empty tdt step graph")?;
+        graph.upload().context("tdt step graph upload")?;
+        self.encoder.stream.synchronize()?;
+        if token_step {
+            self.token_graph = Some(graph);
+        } else {
+            self.blank_graph = Some(graph);
+        }
+        #[cfg(test)]
+        self.graph_captures.set(self.graph_captures.get() + 1);
+        Ok(())
+    }
+
+    fn replay_step(&mut self, token_step: bool, #[cfg(test)] physical_rows: usize) -> Result<()> {
+        #[cfg(test)]
+        if self.eager_steps.get() {
+            return if token_step {
+                self.token_body(physical_rows)
+            } else {
+                self.blank_body(physical_rows)
+            };
+        }
+        let launched = if token_step {
+            self.token_graph
+                .as_ref()
+                .context("tdt token graph missing")?
+                .launch()
+        } else {
+            self.blank_graph
+                .as_ref()
+                .context("tdt blank graph missing")?
+                .launch()
+        };
+        launched.context("tdt step graph launch")?;
+        #[cfg(test)]
+        self.graph_launches.set(self.graph_launches.get() + 1);
+        Ok(())
     }
 
     fn decode_with(
@@ -2293,6 +2449,15 @@ impl ParakeetTdt {
         );
         let capacity = decode_capacity(self.spec.max_symbols as usize, physical_rows)?;
         self.projected = Some(self.encoder.stream.clone_htod(&projected)?);
+        self.encoder.stream.synchronize()?;
+        #[cfg(test)]
+        let eager = self.eager_steps.get();
+        #[cfg(not(test))]
+        let eager = false;
+        if !eager {
+            self.capture_step(true, physical_rows)?;
+            self.capture_step(false, physical_rows)?;
+        }
         let mut trajectory = TdtTrajectory {
             tokens: Vec::with_capacity(capacity),
             durations: Vec::with_capacity(capacity),
@@ -2305,9 +2470,20 @@ impl ParakeetTdt {
         let mut token = self.spec.blank;
         let mut frame = 0usize;
         while frame < valid_rows {
-            self.predict_cached(token)?;
-            let (selected, raw_duration) = self.joint_argmax(frame)?;
+            let token_step = !(self.initialized && token == self.spec.blank);
+            self.write_indices(token, frame)?;
+            self.replay_step(
+                token_step,
+                #[cfg(test)]
+                physical_rows,
+            )?;
+            if token_step {
+                self.initialized = true;
+                #[cfg(test)]
+                self.lstm_calls.set(self.lstm_calls.get() + self.lstm.len());
+            }
             on_step(self);
+            let (selected, raw_duration) = self.read_selection()?;
             decode_admit(trajectory.tokens.len(), capacity).with_context(|| {
                 format!(
                     "decode capacity state: frame={frame} token={selected} initialized={}",
@@ -2365,6 +2541,21 @@ impl ParakeetTdt {
     #[cfg(test)]
     pub fn lstm_call_count(&self) -> usize {
         self.lstm_calls.get()
+    }
+
+    #[cfg(test)]
+    pub fn set_eager_steps(&self, eager: bool) {
+        self.eager_steps.set(eager);
+    }
+
+    #[cfg(test)]
+    pub fn graph_captures(&self) -> u64 {
+        self.graph_captures.get()
+    }
+
+    #[cfg(test)]
+    pub fn graph_launches(&self) -> u64 {
+        self.graph_launches.get()
     }
 }
 
