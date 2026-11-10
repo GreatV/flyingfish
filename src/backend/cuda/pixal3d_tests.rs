@@ -4502,6 +4502,10 @@ fn linked_image_contexts() -> Result<(Vec<CudaSlice<f32>>, usize)> {
         &mut blas,
         &env_path("FF_DINOV2_MODEL")?,
         &env_path("FF_CLIP_MODEL")?,
+        {
+            let (free, total) = device.ctx.mem_get_info()?;
+            (total - total / 8).saturating_sub(total - free)
+        },
     )?;
     let mut contexts = Vec::new();
     let mut hosts = Vec::new();

@@ -33,7 +33,7 @@ pub use cuda::engine::vision_runtime::{
 #[cfg(feature = "cuda")]
 pub use cuda::engine::vision_runtime::{
     Hi3DImageConditioner, PixalConditioningRuntime, PixalConditioningShape, ProjectedConditioning,
-    ProjectionCamera,
+    ProjectionCamera, TrellisConditioningStages, TrellisImageConditioner,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
