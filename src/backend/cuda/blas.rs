@@ -1869,10 +1869,15 @@ impl Blas {
             "biased family algorithm changed"
         );
         let waves = f64::from(plan.waves);
+        let canonical_waves = f64::from(canonical.waves);
         ensure!(
-            waves.is_finite() && waves > 0.0,
+            waves.is_finite()
+                && waves > 0.0
+                && canonical_waves.is_finite()
+                && canonical_waves > 0.0,
             "invalid biased Lt waves {waves}"
         );
+        let multiplier = canonical_rows as f64 / shape.rows as f64 * waves.ceil() / canonical_waves;
         eprintln!(
             "{}",
             serde_json::json!({"biased_row_family": {
@@ -1882,12 +1887,13 @@ impl Blas {
                 "tile":plan.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
                 "canonical_tile":canonical.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
                 "waves":waves,"canonical_waves":canonical.waves,"waves_per_row":waves / shape.rows as f64,
-                "wave_work_multiplier":waves.ceil()/waves,"workspace_bytes":plan.workspace,
+                "wave_roundup_multiplier":waves.ceil()/waves,
+                "wave_work_multiplier":multiplier,"workspace_bytes":plan.workspace,
                 "split_k":plan.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,
                 "reduction":plan.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?
             }})
         );
-        Ok((waves.ceil() / waves, plan.workspace))
+        Ok((multiplier, plan.workspace))
     }
 
     #[cfg(test)]
