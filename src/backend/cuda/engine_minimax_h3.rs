@@ -4441,6 +4441,134 @@ mod tests {
         let rotary = s.clone_htod(&rotary_host)?;
         let table = s.clone_htod(&table_host)?;
         let index = s.clone_htod(&index)?;
+        let mut captured_norm_defects = 0;
+        {
+            let last = io.tensor("block49.output")?;
+            ensure!(
+                last.dtype() == Dtype::BF16 && last.shape() == [1, rows, spec.hidden],
+                "captured final norm input extent"
+            );
+            let hidden = s.clone_htod(&input)?;
+            let final_hidden = s.clone_htod(&bf16_of(&io, "block49.output")?)?;
+            let final_weight = Source::new(&transformer, &manifest).tensor::<bf16>(
+                s,
+                "norm_out.norm.weight",
+                spec.hidden,
+            )?;
+            let final_table = adaln.tensor("norm_out.step0")?;
+            ensure!(
+                final_table.dtype() == Dtype::BF16
+                    && final_table.shape().len() == 2
+                    && final_table.shape()[1] == 2 * spec.hidden,
+                "captured final modulation extent"
+            );
+            let final_entries = u32::try_from(final_table.shape()[0])?;
+            let final_table = s.clone_htod(&bf16_of(&adaln, "norm_out.step0")?)?;
+            let step_map = mapped(&capture.join("step0.safetensors"))?;
+            let step = SafeTensors::deserialize(&step_map)?;
+            let final_index = step.tensor("timestep_indices")?;
+            ensure!(
+                final_index.dtype() == Dtype::I64 && final_index.shape() == [rows],
+                "captured final norm index extent"
+            );
+            let final_index: Vec<u32> = final_index
+                .data()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| u32::try_from(i64::from_le_bytes(*v)))
+                .collect::<std::result::Result<_, _>>()?;
+            ensure!(
+                final_index.iter().all(|&v| v < final_entries),
+                "captured final norm index bound"
+            );
+            let final_index = s.clone_htod(&final_index)?;
+            let reference = s.alloc_zeros::<bf16>(rows * spec.hidden)?;
+            for (name, x, weight, params, indices, stride, shift, scale, entries, eps) in [
+                (
+                    "norm1",
+                    &hidden,
+                    &weights.norm1,
+                    &table,
+                    &index,
+                    6 * spec.hidden,
+                    0,
+                    spec.hidden,
+                    entries,
+                    spec.norm_eps,
+                ),
+                (
+                    "norm2",
+                    &hidden,
+                    &weights.norm2,
+                    &table,
+                    &index,
+                    6 * spec.hidden,
+                    3 * spec.hidden,
+                    4 * spec.hidden,
+                    entries,
+                    spec.norm_eps,
+                ),
+                (
+                    "norm_out",
+                    &final_hidden,
+                    &final_weight,
+                    &final_table,
+                    &final_index,
+                    2 * spec.hidden,
+                    0,
+                    spec.hidden,
+                    final_entries,
+                    spec.final_norm_eps,
+                ),
+            ] {
+                let n = NormRows {
+                    input: pointer(x, s),
+                    weight: pointer(weight, s),
+                    output: pointer(&work.normed, s),
+                    rows,
+                    dim: spec.hidden,
+                    threads: HIDDEN_NORM_THREADS,
+                    eps,
+                };
+                let m = ModulateRows {
+                    data: n.output,
+                    shift: pointer(params, s) + 2 * shift as u64,
+                    scale: pointer(params, s) + 2 * scale as u64,
+                    index: pointer(indices, s),
+                    rows,
+                    dim: spec.hidden,
+                    stride,
+                    entries,
+                };
+                let serial_n = NormRows {
+                    output: pointer(&reference, s),
+                    ..n
+                };
+                let serial_m = ModulateRows {
+                    data: serial_n.output,
+                    ..m
+                };
+                kernels.rms_norm_modulate(s, n, m)?;
+                kernels.rms_norm(s, serial_n)?;
+                kernels.row_modulate(s, serial_m)?;
+                let expected = s.clone_dtoh(&reference)?;
+                let actual = s.clone_dtoh(&work.normed)?;
+                ensure!(
+                    expected.iter().chain(&actual).all(|v| v.is_finite()),
+                    "RUNNER_FAIL captured norm output nonfinite"
+                );
+                let bits = expected
+                    .iter()
+                    .zip(&actual)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                captured_norm_defects += usize::from(bits > 0);
+                println!(
+                    "H3_CAPTURED_NORM_MODULATION_CELL name={name} rows={rows} stride={stride} entries={entries} bit_differences={bits} limit=0"
+                );
+            }
+        }
         let modulation = Modulation {
             table: &table,
             offset: 0,
@@ -4502,7 +4630,10 @@ mod tests {
             rows * rotary_width
         );
         ensure!(within(d, threshold)?, "block0 {d:?} outside {threshold}");
-        ensure!(bits == 0, "DEFECT block0 norm/modulation identity");
+        ensure!(
+            bits == 0 && captured_norm_defects == 0,
+            "DEFECT block0 or captured norm/modulation identity"
+        );
         ensure!(
             !within(d_control, threshold)?,
             "LoRA-scale-0 control stayed within {threshold}"
