@@ -1229,30 +1229,34 @@ mod tests {
             let post = s.alloc_zeros::<f32>((rows * 4) as usize)?;
             let comb = s.alloc_zeros::<f32>((rows * 16) as usize)?;
             let partials = s.clone_htod(&vec![f32::NAN; (rows * 25) as usize])?;
+            let x_view = testing::view(&x, s, [rows, 4, 4096], [16384, 4096, 1])?;
+            let fn_view = testing::view(&fn_w, s, [24, 16384], [16384, 1])?;
+            let wrong_view = testing::view(&wrong, s, [24, 16384], [16384, 1])?;
+            let base_view = testing::view(&base, s, [24], [1])?;
+            let scale_view = testing::view(&scale, s, [3], [1])?;
+            let partial_view = testing::view(&partials, s, [rows, 25], [25, 1])?;
+            let pre_view = testing::view(&pre, s, [rows, 4], [4, 1])?;
+            let post_view = testing::view(&post, s, [rows, 4], [4, 1])?;
+            let comb_view = testing::view(&comb, s, [rows, 4, 4], [16, 4, 1])?;
             let launch = |split: bool, wrong_index: bool| -> Result<()> {
                 ops.mixes(
                     s,
-                    testing::view(&x, s, [rows, 4, 4096], [16384, 4096, 1])?,
+                    x_view,
                     &HcWeights {
-                        fn_w: HcFnW::Bf16(testing::view(
-                            if wrong_index { &wrong } else { &fn_w },
-                            s,
-                            [24, 16384],
-                            [16384, 1],
-                        )?),
-                        base: testing::view(&base, s, [24], [1])?,
-                        scale: testing::view(&scale, s, [3], [1])?,
+                        fn_w: HcFnW::Bf16(if wrong_index { wrong_view } else { fn_view }),
+                        base: base_view,
+                        scale: scale_view,
                     },
                     &params,
                     HcMixes {
                         partials: if split {
-                            Some(TensorMut(testing::view(&partials, s, [rows, 25], [25, 1])?))
+                            Some(TensorMut(partial_view))
                         } else {
                             None
                         },
-                        pre: &mut TensorMut(testing::view(&pre, s, [rows, 4], [4, 1])?),
-                        post: &mut TensorMut(testing::view(&post, s, [rows, 4], [4, 1])?),
-                        comb: &mut TensorMut(testing::view(&comb, s, [rows, 4, 4], [16, 4, 1])?),
+                        pre: &mut TensorMut(pre_view),
+                        post: &mut TensorMut(post_view),
+                        comb: &mut TensorMut(comb_view),
                     },
                 )
             };
