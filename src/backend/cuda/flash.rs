@@ -115,15 +115,16 @@ pub struct Flash {
     tile: usize,
     shared: u32,
     split: Option<Split>,
-    f16_windows: Option<F16Windows>,
+    windows: Option<Windows>,
     position: u64,
     position_limit: u32,
 }
 
-struct F16Windows {
+struct Windows {
     offsets: CudaSlice<u32>,
     rows: usize,
     count: u32,
+    tiles: u32,
 }
 
 struct Split {
@@ -294,7 +295,12 @@ unsafe impl DeviceRepr for Attention {}
 
 impl Flash {
     pub(super) fn allocated_bytes(&self) -> usize {
-        4 * (self.lse.len() + self.split.as_ref().map_or(0, |split| split.workspace.len()))
+        4 * (self.lse.len()
+            + self.split.as_ref().map_or(0, |split| split.workspace.len())
+            + self
+                .windows
+                .as_ref()
+                .map_or(0, |windows| windows.offsets.len()))
     }
 
     pub fn workspace(
@@ -735,7 +741,7 @@ impl Flash {
             tile,
             shared: dynamic_shared,
             split,
-            f16_windows: None,
+            windows: None,
             position: 0,
             position_limit: 0,
         })
@@ -822,7 +828,7 @@ impl Flash {
             tile,
             shared: dynamic_shared,
             split: None,
-            f16_windows: None,
+            windows: None,
             position: 0,
             position_limit: 0,
         })
@@ -830,31 +836,77 @@ impl Flash {
 
     #[cfg(feature = "cuda")]
     pub fn bind_f16_windows(&mut self, offsets: &[u32]) -> Result<()> {
-        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
         ensure!(
             self.geometry[2] == 16,
             "grouped F16 windows require logical D16"
         );
+        self.bind_windows(
+            offsets,
+            48,
+            "attention_prefill_d16_bidirectional_f16_windows",
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn bind_bf16_windows(&mut self, offsets: &[u32]) -> Result<()> {
+        ensure!(self.geometry[2] == 64, "grouped BF16 windows require D64");
         ensure!(
-            offsets.len() >= 2
+            self.score
+                .is_some_and(|score| score.window_left.is_none() && score.window_right.is_none())
+                && self.position == 0,
+            "grouped BF16 windows require an unmasked fixed score"
+        );
+        self.bind_windows(
+            offsets,
+            i32::MAX as u32,
+            "attention_prefill_d64_bidirectional_windows",
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn window_geometry(
+        offsets: &[u32],
+        max_rows: u32,
+        heads: usize,
+        lse: usize,
+    ) -> Result<(usize, u32, u32)> {
+        ensure!(
+            max_rows > 0
+                && offsets.len() >= 2
                 && offsets[0] == 0
-                && offsets.windows(2).all(|v| v[0] < v[1] && v[1] - v[0] <= 48),
-            "invalid F16 window offsets"
+                && offsets
+                    .windows(2)
+                    .all(|v| v[0] < v[1] && v[1] - v[0] <= max_rows),
+            "invalid attention window offsets"
         );
-        let rows = *offsets.last().context("F16 window offsets empty")? as usize;
+        let rows = *offsets.last().context("attention window offsets empty")? as usize;
         ensure!(
-            rows.checked_mul(self.geometry[0])
-                .is_some_and(|n| n <= self.lse.len()),
-            "F16 windows exceed LSE capacity"
+            rows <= i32::MAX as usize
+                && heads > 0
+                && rows.checked_mul(heads).is_some_and(|n| n <= lse),
+            "attention windows exceed LSE capacity/index range"
         );
-        let ctx = self.stream.context();
         let count = u32::try_from(offsets.len() - 1)?;
+        let longest = offsets
+            .windows(2)
+            .map(|v| v[1] - v[0])
+            .max()
+            .context("attention windows empty")?;
+        Ok((rows, count, longest.div_ceil(64)))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn bind_windows(&mut self, offsets: &[u32], max_rows: u32, name: &str) -> Result<()> {
+        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+        let (rows, count, tiles) =
+            Self::window_geometry(offsets, max_rows, self.geometry[0], self.lse.len())?;
+        let ctx = self.stream.context();
         ensure!(
-            count <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as u32,
-            "F16 window count exceeds device grid limit"
+            count <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as u32
+                && tiles <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as u32,
+            "attention windows exceed device grid limits"
         );
-        let function = super::cubin::module(ctx, "attention_native")?
-            .load_function("attention_prefill_d16_bidirectional_f16_windows")?;
+        let function = super::cubin::module(ctx, "attention_native")?.load_function(name)?;
         let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
         let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
         let static_shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)? as u32;
@@ -864,7 +916,7 @@ impl Flash {
                 && self.shared + static_shared
                     <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?
                         as u32,
-            "grouped F16 resource limit registers={registers} local={local}"
+            "grouped attention resource limit {name} registers={registers} local={local}"
         );
         ensure!(
             function.occupancy_max_active_blocks_per_multiprocessor(
@@ -872,7 +924,7 @@ impl Flash {
                 self.shared as usize,
                 None
             )? > 0,
-            "grouped F16 has zero resident blocks"
+            "grouped attention {name} has zero resident blocks"
         );
         let offsets = self.stream.clone_htod(offsets)?;
         if self.native.len() == 1 {
@@ -880,10 +932,11 @@ impl Flash {
         } else {
             self.native[1] = function;
         }
-        self.f16_windows = Some(F16Windows {
+        self.windows = Some(Windows {
             offsets,
             rows,
             count,
+            tiles,
         });
         Ok(())
     }
@@ -940,7 +993,7 @@ impl Flash {
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
-        let windows = self.f16_windows.as_ref();
+        let windows = self.windows.as_ref();
         if let Some(windows) = windows {
             ensure!(
                 head_dim == 16 && rows == windows.rows && keys == rows && capacity == rows,
@@ -1176,6 +1229,18 @@ impl Flash {
             shape.rows * shape.q_heads * shape.head_dim <= out.len(),
             "prefill output buffer is too small"
         );
+        let windows = self.windows.as_ref();
+        if let Some(windows) = windows {
+            ensure!(
+                shape.head_dim == 64
+                    && mode == 1
+                    && self.position == 0
+                    && shape.rows == windows.rows
+                    && keys == windows.rows
+                    && shape.capacity == windows.rows,
+                "BF16 grouped rows/keys/capacity mismatch"
+            );
+        }
         self.stream.context().bind_to_thread()?;
         let (q, _q) = q.device_ptr(&self.stream);
         let (k, _k) = k.device_ptr(&self.stream);
@@ -1192,7 +1257,9 @@ impl Flash {
             let window = shape.window_left.is_some();
             let native = self
                 .native
-                .get(if image_blocks.is_some() {
+                .get(if windows.is_some() {
+                    1
+                } else if image_blocks.is_some() {
                     3
                 } else if bidirectional_only {
                     0
@@ -1271,6 +1338,21 @@ impl Flash {
             unsafe {
                 let mut launch = self.stream.launch_builder(native);
                 launch.arg(&args);
+                if let Some(windows) = windows {
+                    let score = self.score.context("BF16 grouped score missing")?;
+                    let keys = keys as u32;
+                    launch
+                        .arg(&keys)
+                        .arg(&score.scale)
+                        .arg(&windows.offsets)
+                        .arg(&windows.count);
+                    launch.launch(LaunchConfig {
+                        grid_dim: (windows.tiles, shape.q_heads as u32, windows.count),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: self.shared,
+                    })?;
+                    return Ok(());
+                }
                 if let Some((blocks, origin)) = image_blocks {
                     let score = self.score.context("image-block score is not bound")?;
                     let (bounds, _bounds) = blocks.device_ptr(&self.stream);
@@ -1787,6 +1869,27 @@ impl F32Attention {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn disjoint_windows_enforce_capacity_and_ragged_bounds() -> Result<()> {
+        assert_eq!(
+            Flash::window_geometry(&[0, 17, 48], 48, 12, 48 * 12)?,
+            (48, 2, 1)
+        );
+        assert_eq!(
+            Flash::window_geometry(&[0, 64, 129, 1926], 1797, 32, 1926 * 32)?,
+            (1926, 3, 29)
+        );
+        for offsets in [&[][..], &[0], &[1, 17], &[0, 0], &[0, 65, 64], &[0, 1798]] {
+            assert!(Flash::window_geometry(offsets, 1797, 32, 65536).is_err());
+        }
+        assert!(Flash::window_geometry(&[0, 64, 129], 1797, 32, 128 * 32).is_err());
+        assert!(Flash::window_geometry(&[0, u32::MAX], u32::MAX, 32, usize::MAX).is_err());
+        assert!(Flash::window_geometry(&[0, 1], 1, usize::MAX, 1).is_err());
+        assert!(Flash::window_geometry(&[0, 49], 48, 1, 49).is_err());
+        Ok(())
+    }
 
     #[test]
     fn symmetric_window_radii_change_boundary_keys() {
@@ -3662,6 +3765,209 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    fn bf16_disjoint_window_cell(
+        stream: &Arc<CudaStream>,
+        lengths: &[usize],
+        uniform: bool,
+        limits: &serde_json::Value,
+    ) -> Result<usize> {
+        let rows = lengths.iter().sum();
+        let width = 32 * 64;
+        let case = Case {
+            name: "disjoint-bf16-d64".into(),
+            d: 64,
+            hq: 32,
+            hkv: 32,
+            mode: "bidirectional".into(),
+            seed: 47,
+            rows,
+            start: 0,
+            keys: rows,
+            extent: 0,
+            capacity: rows,
+            pitch: width + 8,
+            scale: Some(0.125),
+        };
+        let sentinel = bf16::from_f32(-123.5);
+        let mut q = vec![sentinel; rows * case.pitch];
+        let mut k = vec![sentinel; rows * width];
+        let mut v = k.clone();
+        let mut offsets = vec![0u32];
+        for (tile, &length) in lengths.iter().enumerate() {
+            let first = *offsets.last().context("disjoint offsets empty")? as usize;
+            for row in first..first + length {
+                for head in 0..32 {
+                    for col in 0..64 {
+                        let position = row + tile * 269;
+                        q[row * case.pitch + head * 64 + col] = if uniform {
+                            bf16::ZERO
+                        } else {
+                            case.extended_value(position, head, col, b'q')
+                        };
+                        k[(head * rows + row) * 64 + col] =
+                            case.extended_value(position, head, col, b'k');
+                        v[(head * rows + row) * 64 + col] = bf16::from_f32(
+                            case.extended_value(position, head, col, b'v').to_f32()
+                                + tile as f32 * 0.25,
+                        );
+                    }
+                }
+            }
+            offsets.push(u32::try_from(first + length)?);
+        }
+        let mut expected = vec![bf16::ZERO; rows * width];
+        let mut expected_lse = vec![0f32; rows * 32];
+        let mut defects = 0;
+        for (tile, &length) in lengths.iter().enumerate() {
+            let (first, end) = (offsets[tile] as usize, offsets[tile + 1] as usize);
+            let mut local_k = Vec::with_capacity(length * width);
+            let mut local_v = Vec::with_capacity(length * width);
+            for head in 0..32 {
+                local_k.extend_from_slice(&k[(head * rows + first) * 64..(head * rows + end) * 64]);
+                local_v.extend_from_slice(&v[(head * rows + first) * 64..(head * rows + end) * 64]);
+            }
+            let local_case = Case {
+                rows: length,
+                keys: length,
+                capacity: length,
+                ..case.clone()
+            };
+            let mut local = local_case.binding(stream)?;
+            let mut buffers = Buffers {
+                q: stream.clone_htod(&q[first * case.pitch..end * case.pitch])?,
+                k: stream.clone_htod(&local_k)?,
+                v: stream.clone_htod(&local_v)?,
+                out: stream.alloc_zeros(length * width)?,
+            };
+            local_case.run(&mut local, &mut buffers)?;
+            let output = stream.clone_dtoh(&buffers.out)?;
+            let lse = stream.clone_dtoh(&local.lse)?;
+            ensure!(
+                output.iter().all(|x| x.is_finite()) && lse.iter().all(|x| x.is_finite()),
+                "RUNNER_FAIL serial disjoint-window reference nonfinite"
+            );
+            expected[first * width..end * width].copy_from_slice(&output);
+            expected_lse[first * 32..end * 32].copy_from_slice(&lse);
+            if uniform {
+                let reference = uniform_reference(&local_case, &local_v);
+                let actual: Vec<_> = output.iter().map(|x| x.to_f64()).collect();
+                let (maximum, rms) = errors(&actual, &reference, false)?;
+                let lse_error = lse
+                    .iter()
+                    .map(|&x| (f64::from(x) - (length as f64).ln()).abs())
+                    .fold(0f64, f64::max);
+                let bound = &limits["limits"]["128-bidirectional"];
+                let bad = maximum
+                    > bound["output_max"]
+                        .as_f64()
+                        .context("window output max bound")?
+                    || rms > bound["output_rms"].as_f64().context("window RMS bound")?
+                    || lse_error > bound["lse_max"].as_f64().context("window LSE bound")?;
+                defects += usize::from(bad);
+                println!(
+                    "BF16_WINDOWS_F64 tile={tile} rows={length} output_max={maximum:e} output_rms={rms:e} lse_max={lse_error:e} status={}",
+                    if bad { "DEFECT" } else { "PASS" }
+                );
+            }
+        }
+        let mut buffers = Buffers {
+            q: stream.clone_htod(&q)?,
+            k: stream.clone_htod(&k)?,
+            v: stream.clone_htod(&v)?,
+            out: stream.clone_htod(&vec![sentinel; rows * width + 8])?,
+        };
+        let mut grouped = case.binding(stream)?;
+        grouped.lse = stream.clone_htod(&vec![-123.5f32; rows * 32 + 8])?;
+        if lengths.len() > 1 {
+            grouped.bind_bf16_windows(&offsets)?;
+        }
+        for graph in [false, true] {
+            stream.memset_zeros(&mut buffers.out.slice_mut(..rows * width))?;
+            stream.memset_zeros(&mut grouped.lse.slice_mut(..rows * 32))?;
+            if graph {
+                stream.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+            }
+            let launched = case.run(&mut grouped, &mut buffers);
+            if graph {
+                let captured = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("RUNNER_FAIL disjoint window graph empty")?
+                    .launch()?;
+            } else {
+                launched?;
+            }
+            let output = stream.clone_dtoh(&buffers.out)?;
+            let lse = stream.clone_dtoh(&grouped.lse)?;
+            ensure!(
+                output.iter().all(|x| x.is_finite())
+                    && lse.iter().all(|x| x.is_finite())
+                    && output[rows * width..].iter().all(|&x| x == sentinel)
+                    && lse[rows * 32..].iter().all(|&x| x == -123.5),
+                "RUNNER_FAIL disjoint window guard/nonfinite lengths={lengths:?} graph={graph}"
+            );
+            let output_bits = output[..rows * width]
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let lse_bits = lse[..rows * 32]
+                .iter()
+                .zip(&expected_lse)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(output_bits != 0 || lse_bits != 0);
+            println!(
+                "BF16_WINDOWS lengths={lengths:?} heads=32 d=64 graph={graph} uniform={uniform} output_bit_differences={output_bits} packed_lse_bit_differences={lse_bits} status={}",
+                if output_bits == 0 && lse_bits == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                }
+            );
+        }
+        if lengths == [64, 64] {
+            grouped.bind_bf16_windows(&[0, rows as u32])?;
+            case.run(&mut grouped, &mut buffers)?;
+            let wrong = stream.clone_dtoh(&buffers.out)?;
+            let differences = wrong[..rows * width]
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(differences > 0, "RUNNER_FAIL merged-window control passed");
+            println!(
+                "BF16_WINDOWS_CONTROL merged_boundaries=1 output_bit_differences={differences} status=FAIL_AS_REQUIRED"
+            );
+        }
+        Ok(defects)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn bf16_disjoint_windows(
+        stream: &Arc<CudaStream>,
+        limits: &serde_json::Value,
+    ) -> Result<usize> {
+        let mut defects = 0;
+        for lengths in [
+            vec![64; 2],
+            vec![65; 3],
+            vec![1797],
+            vec![1797; 2],
+            vec![1797; 3],
+            vec![1797; 28],
+            vec![1, 64, 65, 1797],
+        ] {
+            defects += bf16_disjoint_window_cell(stream, &lengths, false, limits)?;
+        }
+        defects += bf16_disjoint_window_cell(stream, &[17, 19], true, limits)?;
+        println!("BF16_WINDOWS_RESULT cases=8 modes=2 identity_bit_limit=0 defects={defects}");
+        Ok(defects)
+    }
+
     #[test]
     #[ignore = "GPU lease and independent attention reference fixtures"]
     fn native_prefill_reference_gpu() -> Result<()> {
@@ -3683,6 +3989,10 @@ mod tests {
         }
         let stream = ctx.new_stream()?;
         let mut defects = mask_controls(&stream, &limits)?;
+        #[cfg(feature = "cuda")]
+        {
+            defects += bf16_disjoint_windows(&stream, &limits)?;
+        }
         for case in &cases {
             let family = if let Some(scale) = case.scale {
                 if case.d == 256 && scale == 0.0625 {

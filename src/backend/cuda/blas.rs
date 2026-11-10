@@ -1826,6 +1826,140 @@ impl Blas {
 }
 
 impl Blas {
+    fn biased_family_plan(
+        &mut self,
+        shape: LinearShape,
+        canonical_rows: usize,
+        bias: super::contracts::Tensor<bf16, 1>,
+    ) -> Result<Plan> {
+        ensure!(
+            [shape.rows, shape.output, shape.input]
+                .iter()
+                .all(|&n| n > 0 && n <= i32::MAX as usize),
+            "invalid biased family dimensions"
+        );
+        self.prepare_biased(
+            u32::try_from(canonical_rows)?,
+            u32::try_from(shape.output)?,
+            u32::try_from(shape.input)?,
+            bias,
+            super::linear::LinearBiasMode::BeforeOutputRound,
+        )?;
+        let plans = self.biased_plans.borrow();
+        let canonical = plans
+            .get(&(
+                LinearShape {
+                    rows: canonical_rows,
+                    ..shape
+                },
+                bias.ptr,
+                super::linear::LinearBiasMode::BeforeOutputRound,
+            ))
+            .context("canonical biased plan missing")?;
+        let algo = canonical
+            .algo
+            .context("canonical biased algorithm missing")?;
+        let plan = Plan::build(
+            self.handle,
+            (shape.rows, shape.output, shape.input),
+            self.workspace.borrow().len(),
+            0,
+            Some(bias.ptr),
+            sys::cudaDataType_t::CUDA_R_16BF,
+            Some(algo),
+        )?;
+        ensure!(
+            plan.algo.context("biased algorithm missing")?.data == algo.data,
+            "biased family algorithm changed"
+        );
+        Ok(plan)
+    }
+
+    pub(crate) fn prepare_biased_family(
+        &mut self,
+        shape: LinearShape,
+        canonical_rows: usize,
+        bias: super::contracts::Tensor<bf16, 1>,
+    ) -> Result<sys::cublasLtMatmulAlgo_t> {
+        let plan = self.biased_family_plan(shape, canonical_rows, bias)?;
+        let algo = plan.algo.context("biased family algorithm missing")?;
+        let key = (
+            shape,
+            bias.ptr,
+            super::linear::LinearBiasMode::BeforeOutputRound,
+        );
+        let mut plans = self.biased_plans.borrow_mut();
+        match plans.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(plan);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                ensure!(
+                    entry.get().algo.context("biased algorithm missing")?.data == algo.data,
+                    "biased row shape already has a different algorithm"
+                );
+            }
+        }
+        Ok(algo)
+    }
+
+    pub(crate) fn biased_family_cost(
+        &mut self,
+        shape: LinearShape,
+        canonical_rows: usize,
+        bias: super::contracts::Tensor<bf16, 1>,
+    ) -> Result<(f64, usize)> {
+        #[cfg(test)]
+        use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
+        let plan = self.biased_family_plan(shape, canonical_rows, bias)?;
+        let plans = self.biased_plans.borrow();
+        let canonical = plans
+            .get(&(
+                LinearShape {
+                    rows: canonical_rows,
+                    ..shape
+                },
+                bias.ptr,
+                super::linear::LinearBiasMode::BeforeOutputRound,
+            ))
+            .context("canonical biased plan missing")?;
+        #[cfg(test)]
+        let algo = canonical
+            .algo
+            .context("canonical biased algorithm missing")?;
+        let waves = f64::from(plan.waves);
+        let canonical_waves = f64::from(canonical.waves);
+        ensure!(
+            waves.is_finite()
+                && waves > 0.0
+                && canonical_waves.is_finite()
+                && canonical_waves > 0.0,
+            "invalid biased Lt waves {waves}"
+        );
+        let multiplier = canonical_rows as f64 / shape.rows as f64 * waves.ceil() / canonical_waves;
+        #[cfg(test)]
+        eprintln!(
+            "{}",
+            serde_json::json!({"biased_row_family": {
+                "bias_pointer":bias.ptr,"rows":shape.rows,"output":shape.output,"input":shape.input,
+                "canonical_rows":canonical_rows,"canonical_workspace_limit":self.workspace.borrow().len(),
+                "opaque_algorithm":algo.data,"id":plan.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,
+                "tile":plan.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
+                "canonical_tile":canonical.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
+                "waves":waves,"canonical_waves":canonical.waves,"waves_per_row":waves / shape.rows as f64,
+                "wave_roundup_multiplier":waves.ceil()/waves,
+                "wave_work_multiplier":multiplier,"workspace_bytes":plan.workspace,
+                "split_k":plan.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,
+                "reduction":plan.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?
+            }})
+        );
+        Ok((multiplier, plan.workspace))
+    }
+
+    pub(crate) fn workspace_bytes(&self) -> usize {
+        self.workspace.borrow().len()
+    }
+
     /// Request-bound BF16 Lt plans are keyed by geometry, bias pointer and rounding mode.
     pub(crate) fn prepare_biased(
         &mut self,

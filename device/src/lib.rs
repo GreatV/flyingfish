@@ -483,6 +483,18 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16(
     }
 }
 
+macro_rules! window_attention {
+    ($p:ident, $first:ident, $end:ident, $dim:expr) => {
+        $p.q = $p.q.add($first as usize * $p.q_stride as usize);
+        $p.k = $p.k.add($first as usize * $dim);
+        $p.v = $p.v.add($first as usize * $dim);
+        $p.out = $p.out.add($first as usize * $p.q_heads as usize * $dim);
+        $p.lse = $p.lse.add($first as usize * $p.q_heads as usize);
+        $p.rows = $end - $first;
+        $p.start = 0;
+    };
+}
+
 /// # Safety
 /// Offsets delimit disjoint windows of at most 48 rows; grid Z equals their count.
 #[unsafe(no_mangle)]
@@ -500,14 +512,35 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16_window
         let first = *offsets.add(window as usize);
         let end = *offsets.add(window as usize + 1);
         assert!(first < end && end <= p.rows && end - first <= 48);
-        p.q = p.q.add(first as usize * p.q_stride as usize);
-        p.k = p.k.add(first as usize * 16);
-        p.v = p.v.add(first as usize * 16);
-        p.out = p.out.add(first as usize * p.q_heads as usize * 16);
-        p.lse = p.lse.add(first as usize * p.q_heads as usize);
-        p.rows = end - first;
-        p.start = 0;
+        window_attention!(p, first, end, 16);
         attention::<64, 8, 1, 16, true, true>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
+    }
+}
+
+/// # Safety
+/// Offsets delimit disjoint BF16 D64 windows; grid X covers the longest window, Z equals their count.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
+    mut p: Attention,
+    keys: u32,
+    scale: f32,
+    offsets: *const u32,
+    windows: u32,
+) {
+    unsafe {
+        let window: u32;
+        asm!("mov.u32 {w}, %ctaid.z;", w=out(reg32) window);
+        assert!(!offsets.is_null() && window < windows && keys == p.rows);
+        let first = *offsets.add(window as usize);
+        let end = *offsets.add(window as usize + 1);
+        assert!(first < end && end <= p.rows);
+        window_attention!(p, first, end, 64);
+        let tile: u32;
+        asm!("mov.u32 {b}, %ctaid.x;", b=out(reg32) tile);
+        if tile * 64 >= p.rows {
+            return;
+        }
+        attention::<64, 8, 1, 64, false, true>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
     }
 }
 

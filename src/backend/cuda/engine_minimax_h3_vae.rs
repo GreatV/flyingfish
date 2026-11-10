@@ -4,7 +4,7 @@ use super::{BlockKernels, NormRows, Source, matrix, pointer, rows_view, vector};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
-    contracts::{TensorMut, view},
+    contracts::{Tensor, TensorMut, view},
     cubin,
     flash::{Flash, Score},
     linear::LinearBiasMode,
@@ -59,15 +59,14 @@ impl Linear {
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
-        x: &CudaSlice<bf16>,
-        y: &CudaSlice<bf16>,
-        rows: usize,
+        x: Tensor<bf16, 2>,
+        y: Tensor<bf16, 2>,
     ) -> Result<()> {
         blas.linear_biased(
             matrix(&self.weight, s, self.out, self.input)?,
             vector(&self.bias, s)?,
-            rows_view(x, s, 0, rows, self.input, self.input)?,
-            &mut TensorMut(rows_view(y, s, 0, rows, self.out, self.out)?),
+            x,
+            &mut TensorMut(y),
             MODE,
         )
     }
@@ -165,7 +164,875 @@ pub(crate) struct VideoDecoder {
     block_kernels: BlockKernels,
 }
 
+#[derive(Clone)]
+struct TileBatch {
+    batch: usize,
+    work: usize,
+    workspace: usize,
+    peak: usize,
+    cost: f64,
+    launches: usize,
+}
+
+impl TileBatch {
+    fn choose(choices: &[Self], budget: usize) -> Result<&Self> {
+        ensure!(
+            choices.iter().any(|c| c.batch == 1 && c.peak <= budget),
+            "minimum serial tile work does not fit workspace budget {budget}"
+        );
+        choices
+            .iter()
+            .filter(|c| c.peak <= budget)
+            .min_by(|a, b| {
+                a.cost
+                    .total_cmp(&b.cost)
+                    .then(a.launches.cmp(&b.launches))
+                    .then(a.peak.cmp(&b.peak))
+            })
+            .context("no legal tile batch")
+    }
+}
+
+#[cfg(test)]
+fn tile_bit_differences<T: super::Element + Copy>(
+    s: &Arc<CudaStream>,
+    name: &str,
+    serial: &CudaSlice<T>,
+    grouped: &CudaSlice<T>,
+    (tile, rows, columns, heads): (usize, usize, usize, usize),
+) -> Result<usize> {
+    let capacity = grouped.len() / (columns * heads);
+    let mut differences = 0;
+    for head in 0..heads {
+        let a = head * rows * columns;
+        let b = (head * capacity + tile * rows) * columns;
+        let expected = s.clone_dtoh(&serial.slice(a..a + rows * columns))?;
+        let actual = s.clone_dtoh(&grouped.slice(b..b + rows * columns))?;
+        let bytes = rows * columns * std::mem::size_of::<T>();
+        // Element implementations are BF16 and F32 scalars.
+        let (expected, actual) = unsafe {
+            (
+                std::slice::from_raw_parts(expected.as_ptr().cast::<u8>(), bytes),
+                std::slice::from_raw_parts(actual.as_ptr().cast::<u8>(), bytes),
+            )
+        };
+        ensure!(
+            T::finite(expected) && T::finite(actual),
+            "RUNNER_FAIL {name} nonfinite tile={tile}"
+        );
+        differences += expected
+            .chunks_exact(std::mem::size_of::<T>())
+            .zip(actual.chunks_exact(std::mem::size_of::<T>()))
+            .filter(|(a, b)| a != b)
+            .count();
+    }
+    println!(
+        "H3_VAE_GROUP_OP name={name} tile={tile} bit_differences={differences} status={}",
+        if differences == 0 { "PASS" } else { "DEFECT" }
+    );
+    Ok(usize::from(differences != 0))
+}
+
+#[test]
+#[cfg(test)]
+fn tile_batch_budget_keeps_serial_minimum() -> Result<()> {
+    let choices = [
+        TileBatch {
+            batch: 1,
+            work: 210_349_280,
+            workspace: 0,
+            peak: 210_349_280,
+            cost: 2.0,
+            launches: 28,
+        },
+        TileBatch {
+            batch: 3,
+            work: 630_933_552,
+            workspace: 0,
+            peak: 630_933_552,
+            cost: 1.0,
+            launches: 10,
+        },
+    ];
+    assert_eq!(TileBatch::choose(&choices, 210_349_280)?.batch, 1);
+    assert!(TileBatch::choose(&choices, 210_349_279).is_err());
+    assert_eq!(TileBatch::choose(&choices, 630_933_552)?.batch, 3);
+    assert!(TileBatch::choose(&choices[1..], 630_933_552).is_err());
+    Ok(())
+}
+
 impl VideoDecoder {
+    #[cfg(test)]
+    pub(crate) fn batch_identity_gate(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        tiles: &VaeTiles,
+        mut inputs: impl Iterator<Item = (Vec<f32>, [usize; 3])>,
+        frozen: &serde_json::Value,
+        capture: &Path,
+    ) -> Result<()> {
+        let first = inputs.next().context("RUNNER_FAIL group inputs empty")?;
+        let spec = &self.spec;
+        let s = &device.stream;
+        let r = spec.spatial_ratio;
+        let shape = (
+            spec.chunk_latents() + spec.overlap_latents(),
+            tiles.height / r,
+            tiles.width / r,
+        );
+        let [frames, height, width] = first.1;
+        let mut grouped = self.work(device, blas, tiles, (frames, height, width))?;
+        ensure!(
+            frozen["bit_difference_limit"] == 0
+                && frozen["arm_results"]["standalone-A"]["setup"]["chosen"]["batch"]
+                    == grouped.batch,
+            "RUNNER_FAIL derived group differs from frozen maximum"
+        );
+        let slots = tiles.count();
+        let mut serial = TileWork::new(s, spec, shape, (1, slots))?;
+        serial.prepare(s, blas, self)?;
+        let mut lower = TileWork::new(s, spec, shape, (3, slots))?;
+        lower.prepare(s, blas, self)?;
+        self.group_op_gate(s, blas, &mut serial, &mut grouped)?;
+        let origins: Vec<_> = tiles
+            .rows
+            .0
+            .iter()
+            .flat_map(|&row| tiles.cols.0.iter().map(move |&col| (row / r, col / r)))
+            .collect();
+        ensure!(
+            origins.len() == 28,
+            "RUNNER_FAIL group gate requires production spatial grid"
+        );
+        let mut expected_raw = s.alloc_zeros::<bf16>(slots * serial.pixels())?;
+        let mut actual_raw = s.alloc_zeros::<bf16>(expected_raw.len())?;
+        let mut previous: Option<Vec<bf16>> = None;
+        let mut defects = 0;
+        let mut passes = 0;
+        let mut video_cells = 0;
+        let mut video_defects = 0;
+        for (input, [frames, height, width]) in std::iter::once(first).chain(inputs) {
+            ensure!(
+                input.len() == spec.latent_channels * frames * height * width
+                    && input.iter().all(|x| x.is_finite()),
+                "RUNNER_FAIL group latent input layout/nonfinite"
+            );
+            let input = s.clone_htod(&input)?;
+            let z = LatentVideo {
+                data: &input,
+                frames,
+                height,
+                width,
+            };
+            s.memset_zeros(&mut expected_raw)?;
+            for (slot, origin) in origins.iter().enumerate() {
+                self.tile(
+                    s,
+                    blas,
+                    &mut serial,
+                    &z,
+                    (std::slice::from_ref(origin), 0),
+                    (&expected_raw, slot),
+                )?;
+            }
+            let expected = s.clone_dtoh(&expected_raw)?;
+            ensure!(
+                expected.iter().all(|x| x.is_finite()),
+                "RUNNER_FAIL serial group output nonfinite"
+            );
+            if let Some(previous) = &previous {
+                ensure!(
+                    previous
+                        .iter()
+                        .zip(&expected)
+                        .any(|(a, b)| a.to_bits() != b.to_bits()),
+                    "RUNNER_FAIL repeated group inputs have identical serial outputs"
+                );
+            }
+            for work in [&mut grouped, &mut lower] {
+                s.memset_zeros(&mut actual_raw)?;
+                for (group, positions) in origins.chunks(work.batch).enumerate() {
+                    self.tile(
+                        s,
+                        blas,
+                        work,
+                        &z,
+                        (positions, 0),
+                        (&actual_raw, group * work.batch),
+                    )?;
+                }
+                let actual = s.clone_dtoh(&actual_raw)?;
+                ensure!(
+                    actual.iter().all(|x| x.is_finite()),
+                    "RUNNER_FAIL grouped raw output nonfinite"
+                );
+                let bits = actual
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                defects += usize::from(bits != 0);
+                println!(
+                    "H3_VAE_GROUP_FORWARD input={passes} batch={} tail={} mode=eager tiles={slots} raw_bit_differences={bits} status={}",
+                    work.batch,
+                    work.tail,
+                    if bits == 0 { "PASS" } else { "DEFECT" }
+                );
+            }
+            let plan = DecodePlan::new(spec, frames)?;
+            let pre = spec.frame_pre_padding();
+            let lead = spec.chunk_latents() * spec.temporal_ratio;
+            let kept = lead - pre;
+            let tail = shape.0 * spec.temporal_ratio - lead - pre;
+            let total = plan.chunks * kept + if spec.token_drop > 0 { tail } else { 0 };
+            let plane = height * r * width * r;
+            let directory = capture.join(format!("video-{passes}"));
+            std::fs::create_dir(&directory)?;
+            for work in [&mut serial, &mut grouped, &mut lower] {
+                let batch = work.batch;
+                let mut output = s.alloc_zeros::<bf16>(spec.out_channels * total * plane)?;
+                self.decode_observed(
+                    (s, blas),
+                    work,
+                    tiles,
+                    LatentVideo {
+                        data: &input,
+                        frames,
+                        height,
+                        width,
+                    },
+                    &mut output,
+                    |stage, chunk, buffer| {
+                        let values = if stage == "emitted" {
+                            let mut values = Vec::with_capacity(spec.out_channels * kept * plane);
+                            for channel in 0..spec.out_channels {
+                                let first = (channel * total + chunk * kept) * plane;
+                                values.extend(s.clone_dtoh(
+                                    &buffer.slice(first..first + kept * plane),
+                                )?);
+                            }
+                            values
+                        } else {
+                            s.clone_dtoh(buffer)?
+                        };
+                        ensure!(
+                            values.iter().all(|x| x.is_finite()),
+                            "RUNNER_FAIL video {stage} nonfinite input={passes} batch={batch} chunk={chunk}"
+                        );
+                        // BF16 scalars occupy two bytes.
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                values.as_ptr().cast::<u8>(),
+                                values.len() * 2,
+                            )
+                        };
+                        let path = directory.join(format!("{stage}-{chunk}.bf16"));
+                        if batch == 1 {
+                            std::fs::write(path, bytes)?;
+                        } else {
+                            let expected = std::fs::read(path)?;
+                            ensure!(
+                                expected.len() == bytes.len(),
+                                "RUNNER_FAIL video {stage} snapshot extent"
+                            );
+                            let bits = bytes
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .zip(expected.as_chunks::<2>().0)
+                                .filter(|(a, b)| a != b)
+                                .count();
+                            video_cells += 1;
+                            video_defects += usize::from(bits != 0);
+                            println!(
+                                "H3_VAE_VIDEO_IDENTITY input={passes} batch={batch} chunk={chunk} stage={stage} elements={} bit_differences={bits} status={}",
+                                values.len(),
+                                if bits == 0 { "PASS" } else { "DEFECT" }
+                            );
+                        }
+                        Ok(())
+                    },
+                )?;
+                println!(
+                    "H3_VAE_VIDEO_FORWARD input={passes} batch={batch} tail={} chunks={} frames={total} tiles={slots}",
+                    work.tail, plan.chunks
+                );
+            }
+            std::fs::remove_dir_all(directory)?;
+            previous = Some(expected);
+            passes += 1;
+        }
+        ensure!(passes >= 2, "RUNNER_FAIL repeated group inputs missing");
+        println!(
+            "H3_VAE_GROUP_RESULT inputs={passes} batches=[{},3] bit_limit=0 defects={defects}",
+            grouped.batch
+        );
+        ensure!(defects == 0, "H3_VAE_GROUP_FORWARD DEFECT cells={defects}");
+        println!("H3_VAE_GROUP_FORWARD PASS repeated_inputs={passes} bit_limit=0");
+        println!(
+            "H3_VAE_VIDEO_RESULT inputs={passes} cells={video_cells} bit_limit=0 defects={video_defects}"
+        );
+        ensure!(
+            video_defects == 0,
+            "H3_VAE_VIDEO DEFECT cells={video_defects}"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn group_op_gate(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        serial: &mut TileWork,
+        grouped: &mut TileWork,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let (t, dim) = (serial.tokens, spec.dim);
+        let input: Vec<f32> = (0..grouped.rows * dim)
+            .map(|i| {
+                let (row, col) = (i / dim, i % dim);
+                (((row % 251) * 17 + (col % 257) * 13 + (row / t % 269) * 19) % 1009) as f32 / 512.0
+                    - 1.0
+            })
+            .collect();
+        let delta: Vec<bf16> = input
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| bf16::from_f32(x * 0.25 + ((i * 23 % 263) as f32 - 131.0) / 512.0))
+            .collect();
+        s.memcpy_htod(&input, &mut grouped.x)?;
+        s.memcpy_htod(&delta, &mut grouped.o)?;
+        let block = &self.blocks[0];
+        self.rms_weight(s, &grouped.x, &block.norm1, &grouped.normed, grouped.rows)?;
+        self.scaled_residual(s, &grouped.x, &grouped.o, &block.scale1, grouped.rows)?;
+        let mut defects = 0;
+        let mut cells = 0;
+        for tile in 0..grouped.batch {
+            let first = tile * t * dim;
+            s.memcpy_htod(&input[first..first + t * dim], &mut serial.x)?;
+            s.memcpy_htod(&delta[first..first + t * dim], &mut serial.o)?;
+            self.rms_weight(s, &serial.x, &block.norm1, &serial.normed, t)?;
+            self.scaled_residual(s, &serial.x, &serial.o, &block.scale1, t)?;
+            defects += tile_bit_differences(
+                s,
+                "weighted-rms",
+                &serial.normed,
+                &grouped.normed,
+                (tile, t, dim, 1),
+            )?;
+            defects += tile_bit_differences(
+                s,
+                "scaled-residual",
+                &serial.x,
+                &grouped.x,
+                (tile, t, dim, 1),
+            )?;
+            cells += 2;
+        }
+        s.memcpy_htod(&input, &mut grouped.x)?;
+        self.block(s, blas, block, grouped)?;
+        for tile in 0..grouped.batch {
+            let first = tile * t * dim;
+            s.memcpy_htod(&input[first..first + t * dim], &mut serial.x)?;
+            self.block(s, blas, block, serial)?;
+            for (name, a, b, columns, heads) in [
+                ("q", &serial.q, &grouped.q, dim, 1),
+                ("k", &serial.k, &grouped.k, dim, 1),
+                ("v", &serial.v, &grouped.v, dim, 1),
+                ("rope-q", &serial.q_n, &grouped.q_n, dim, 1),
+                ("head-norm-k", &serial.k_n, &grouped.k_n, dim, 1),
+                (
+                    "rope-k-cache",
+                    &serial.k_cache,
+                    &grouped.k_cache,
+                    spec.head_dim,
+                    spec.heads,
+                ),
+                (
+                    "v-cache",
+                    &serial.v_cache,
+                    &grouped.v_cache,
+                    spec.head_dim,
+                    spec.heads,
+                ),
+                ("attention", &serial.attn, &grouped.attn, dim, 1),
+                ("norm2", &serial.normed, &grouped.normed, dim, 1),
+                ("ff-in", &serial.gate_up, &grouped.gate_up, 2 * spec.ffn, 1),
+                ("silu", &serial.gated, &grouped.gated, spec.ffn, 1),
+                ("ff-out", &serial.o, &grouped.o, dim, 1),
+            ] {
+                defects += tile_bit_differences(s, name, a, b, (tile, t, columns, heads))?;
+                cells += 1;
+            }
+            defects +=
+                tile_bit_differences(s, "residual2", &serial.x, &grouped.x, (tile, t, dim, 1))?;
+            defects += tile_bit_differences(
+                s,
+                "packed-lse",
+                &serial.flash.lse,
+                &grouped.flash.lse,
+                (tile, t, spec.heads, 1),
+            )?;
+            cells += 2;
+        }
+        self.output_rows(s, blas, grouped)?;
+        for tile in 0..grouped.batch {
+            let first = tile * t * dim;
+            s.memcpy_htod(&input[first..first + t * dim], &mut serial.x)?;
+            self.block(s, blas, block, serial)?;
+            self.output_rows(s, blas, serial)?;
+            defects +=
+                tile_bit_differences(s, "norm-out-f32", &serial.y, &grouped.y, (tile, t, dim, 1))?;
+            defects += tile_bit_differences(
+                s,
+                "norm-out-bf16",
+                &serial.normed,
+                &grouped.normed,
+                (tile, t, dim, 1),
+            )?;
+            defects += tile_bit_differences(
+                s,
+                "proj-out",
+                &serial.patch_rows,
+                &grouped.patch_rows,
+                (tile, t, spec.patch_width(), 1),
+            )?;
+            cells += 3;
+        }
+        println!("H3_VAE_GROUP_OPS cells={cells} bit_limit=0 defects={defects}");
+        ensure!(defects == 0, "H3_VAE_GROUP_OPS DEFECT cells={defects}");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn biased_row_gate(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        frozen: &serde_json::Value,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let side = VAE_TILE / spec.spatial_ratio;
+        let canonical =
+            (spec.chunk_latents() + spec.overlap_latents()) * side * side + spec.registers + 1;
+        let rows: Vec<usize> = serde_json::from_value(frozen["row_gate_counts"].clone())?;
+        ensure!(
+            canonical == 1797
+                && rows == [1797, 3594, 5391, 50316]
+                && frozen["bit_difference_limit"] == 0
+                && frozen["row_gate_owners"] == self.linears().count(),
+            "RUNNER_FAIL biased row freeze contract mismatch"
+        );
+        let mut defects = 0;
+        let mut controls = 0;
+        for (owner, linear) in self.linears().enumerate() {
+            for &rows in &rows {
+                let (bad, control) =
+                    self.biased_row_cell(device, blas, (owner, linear), (rows, canonical), frozen)?;
+                defects += bad;
+                controls += control;
+            }
+        }
+        ensure!(
+            controls == 1,
+            "RUNNER_FAIL biased row control not discriminating"
+        );
+        println!(
+            "H3_VAE_BIASED_ROWS owners={} rows={rows:?} modes=2 bit_limit=0 defects={defects} control=FAIL_AS_REQUIRED",
+            self.linears().count()
+        );
+        ensure!(defects == 0, "H3_VAE_BIASED_ROWS DEFECT cells={defects}");
+        println!("H3_VAE_BIASED_ROWS PASS owners=217 cells=1736 bit_limit=0");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn biased_row_cell(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        (owner, linear): (usize, &Linear),
+        (rows, canonical): (usize, usize),
+        frozen: &serde_json::Value,
+    ) -> Result<(usize, usize)> {
+        use crate::backend::setup::LinearShape;
+        let s = &device.stream;
+        let shape = LinearShape {
+            rows,
+            output: linear.out,
+            input: linear.input,
+        };
+        let algorithm = blas.prepare_biased_family(shape, canonical, vector(&linear.bias, s)?)?;
+        let identity = serde_json::to_value(algorithm.data)?;
+        for arm in ["standalone-A", "standalone-P", "pipeline-A", "pipeline-P"] {
+            let expected = &frozen["arm_results"][arm]["canonical_bias_owners"][owner.to_string()];
+            ensure!(
+                expected["opaque_algorithm"] == identity
+                    && expected["output"] == linear.out
+                    && expected["input"] == linear.input,
+                "RUNNER_FAIL biased row frozen algorithm mismatch owner={owner} rows={rows} arm={arm}"
+            );
+        }
+        let guard = [bf16::from_f32(-123.5); 8];
+        let mut input = vec![guard[0]; (rows + 1) * linear.input + 16];
+        let boundary = [0x3f7f, 0x3f80, 0x3f81, 0xbf7f, 0xbf80, 0xbf81, 0x3b80];
+        for (i, x) in input[8..8 + (rows + 1) * linear.input]
+            .iter_mut()
+            .enumerate()
+        {
+            let (row, col) = (i / linear.input, i % linear.input);
+            *x = if (row + col).is_multiple_of(263) {
+                bf16::from_bits(boundary[(row + col / 263) % boundary.len()])
+            } else {
+                let signal = ((row % 251) * 17
+                    + (col % 257) * 13
+                    + (row / canonical % 269) * 19
+                    + owner * 7)
+                    % 509;
+                bf16::from_f32((signal as f32 - 254.0) / 256.0)
+            };
+        }
+        let input = s.clone_htod(&input)?;
+        let mut serial = s.alloc_zeros::<bf16>(rows * linear.out + 16)?;
+        let mut grouped = s.alloc_zeros::<bf16>(serial.len())?;
+        for out in [&mut serial, &mut grouped] {
+            let end = out.len() - 8;
+            s.memcpy_htod(&guard, &mut out.slice_mut(..8))?;
+            s.memcpy_htod(&guard, &mut out.slice_mut(end..))?;
+        }
+        ensure!(
+            rows_view(&input, s, 9, rows, linear.input, linear.input).is_err()
+                && rows_view(&grouped, s, 24, rows, linear.out, linear.out).is_err(),
+            "RUNNER_FAIL biased row alignment/capacity guard accepted invalid view"
+        );
+        let call = |offset: usize, count: usize, destination: &CudaSlice<bf16>, shifted: usize| {
+            blas.linear_biased(
+                matrix(&linear.weight, s, linear.out, linear.input)?,
+                vector(&linear.bias, s)?,
+                rows_view(
+                    &input,
+                    s,
+                    8 + (offset + shifted) * linear.input,
+                    count,
+                    linear.input,
+                    linear.input,
+                )?,
+                &mut TensorMut(rows_view(
+                    destination,
+                    s,
+                    8 + offset * linear.out,
+                    count,
+                    linear.out,
+                    linear.out,
+                )?),
+                MODE,
+            )
+        };
+        for first in (0..rows).step_by(canonical) {
+            call(first, canonical, &serial, 0)?;
+        }
+        let expected = s.clone_dtoh(&serial)?;
+        ensure!(
+            expected.iter().all(|x| x.is_finite()),
+            "RUNNER_FAIL serial biased output nonfinite"
+        );
+        let mut defects = 0;
+        let mut control = 0;
+        for graph in [false, true] {
+            let end = grouped.len() - 8;
+            s.memset_zeros(&mut grouped.slice_mut(8..end))?;
+            if graph {
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+            }
+            let launched = call(0, rows, &grouped, 0);
+            if graph {
+                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("RUNNER_FAIL biased row graph empty")?
+                    .launch()?;
+            } else {
+                launched?;
+            }
+            let actual = s.clone_dtoh(&grouped)?;
+            let last = actual.len() - 8;
+            ensure!(
+                actual[..8] == guard
+                    && actual[last..] == guard
+                    && expected[..8] == guard
+                    && expected[last..] == guard
+                    && actual.iter().all(|x| x.is_finite()),
+                "RUNNER_FAIL biased row guard/nonfinite owner={owner} rows={rows} graph={graph}"
+            );
+            let bits = expected[8..last]
+                .iter()
+                .zip(&actual[8..last])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(bits != 0);
+            println!(
+                "H3_VAE_BIASED_ROW owner={owner} rows={rows} graph={graph} bit_differences={bits} status={}",
+                if bits == 0 { "PASS" } else { "DEFECT" }
+            );
+            if owner == 0 && rows == 3 * canonical && !graph {
+                call(0, rows, &grouped, 1)?;
+                let wrong = s.clone_dtoh(&grouped)?;
+                let differences = expected[8..last]
+                    .iter()
+                    .zip(&wrong[8..last])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(
+                    differences > 0,
+                    "RUNNER_FAIL biased row wrong-view control passed"
+                );
+                println!(
+                    "H3_VAE_BIASED_ROW_CONTROL shifted_input_rows=1 bit_differences={differences} status=FAIL_AS_REQUIRED"
+                );
+                control = 1;
+            }
+        }
+        Ok((defects, control))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_setup(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        tiles: &VaeTiles,
+        shape: (usize, usize, usize),
+    ) -> Result<()> {
+        self.batch_plan(device, blas, tiles, shape)?;
+        Ok(())
+    }
+
+    fn batch_plan(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        tiles: &VaeTiles,
+        (frames, height, width): (usize, usize, usize),
+    ) -> Result<TileBatch> {
+        let spec = &self.spec;
+        let shape = (
+            spec.chunk_latents() + spec.overlap_latents(),
+            tiles.height / spec.spatial_ratio,
+            tiles.width / spec.spatial_ratio,
+        );
+        let patches = shape.0 * shape.1 * shape.2;
+        let tokens = patches + spec.registers + 1;
+        let plan = DecodePlan::new(spec, frames)?;
+        ensure!(
+            plan.pad == 0,
+            "batch setup requires unpadded temporal input"
+        );
+        let kept = spec.chunk_latents() * spec.temporal_ratio - spec.frame_pre_padding();
+        let tail_frames = shape.0 * spec.temporal_ratio
+            - spec.chunk_latents() * spec.temporal_ratio
+            - spec.frame_pre_padding();
+        let output_frames = plan.chunks * kept + tail_frames;
+        let pixels = height * width * spec.spatial_ratio * spec.spatial_ratio;
+        let output = 2 * spec.out_channels * output_frames * pixels;
+        let latent = 4 * spec.latent_channels * frames * height * width;
+        let stitch = decode_bytes(
+            spec,
+            tiles,
+            (height * spec.spatial_ratio, width * spec.spatial_ratio),
+        );
+        let grid =
+            4 * (tiles.rows.0.len() + tiles.rows.1.len() + tiles.cols.0.len() + tiles.cols.1.len());
+        device.stream.synchronize()?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let reserve = total / 16;
+        let mandatory = output + latent + stitch + grid;
+        let budget = device.workspace_budget(free, free, mandatory + reserve)?;
+        let workspace_before = blas.workspace_bytes();
+        self.post_quant.prepare(&device.stream, blas, patches)?;
+        self.proj_in.prepare(&device.stream, blas, patches)?;
+        for linear in self.linears() {
+            linear.prepare(&device.stream, blas, tokens)?;
+            #[cfg(test)]
+            let owner = self
+                .linears()
+                .position(|item| std::ptr::eq(item, linear))
+                .context("bias owner missing")?;
+            #[cfg(test)]
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vae_bias_owner": {
+                    "owner":owner,"bias_pointer":pointer(&linear.bias,&device.stream),
+                    "output":linear.out,"input":linear.input,"canonical_rows":tokens
+                }})
+            );
+        }
+        let slots = tiles.count();
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        let grid_x = device
+            .ctx
+            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as usize;
+        let grid_z = device
+            .ctx
+            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as usize;
+        let mut choices = Vec::new();
+        #[cfg(test)]
+        let mut records = Vec::new();
+        for batch in 1..=slots {
+            if batch > grid_z
+                || tokens.div_ceil(64) > grid_x
+                || !tokens
+                    .checked_mul(batch)
+                    .and_then(|r| r.checked_mul(2 * spec.ffn))
+                    .is_some_and(|n| n <= i32::MAX as usize)
+            {
+                eprintln!("H3_VAE_BATCH_REJECT batch={batch} reason=kernel_index_or_grid_limit");
+                continue;
+            }
+            let tail = slots % batch;
+            let groups = slots.div_ceil(batch);
+            let work = TileWork::batch_bytes(spec, shape, batch, slots)?;
+            let query = (|| -> Result<(f64, usize)> {
+                let mut cost = 0.0;
+                let mut workspace = 0;
+                for linear in self.linears() {
+                    #[cfg(test)]
+                    let owner = self
+                        .linears()
+                        .position(|item| std::ptr::eq(item, linear))
+                        .context("bias owner missing")?;
+                    for (active, count) in [(batch, slots / batch), (tail, 1)] {
+                        if active == 0 || count == 0 {
+                            continue;
+                        }
+                        #[cfg(test)]
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"h3_vae_batch_query": {
+                                "batch":batch,"active":active,"owner":owner,"multiplicity":count
+                            }})
+                        );
+                        let rows = active * tokens;
+                        let (multiplier, bytes) = blas.biased_family_cost(
+                            crate::backend::setup::LinearShape {
+                                rows,
+                                output: linear.out,
+                                input: linear.input,
+                            },
+                            tokens,
+                            vector(&linear.bias, &device.stream)?,
+                        )?;
+                        cost += 2.0
+                            * rows as f64
+                            * linear.out as f64
+                            * linear.input as f64
+                            * multiplier
+                            * count as f64;
+                        workspace = workspace.max(bytes);
+                    }
+                }
+                ensure!(
+                    cost.is_finite() && cost > 0.0,
+                    "invalid tile tensor cost {cost}"
+                );
+                Ok((cost, workspace))
+            })();
+            let (cost, workspace) = match query {
+                Ok(value) => value,
+                Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
+                    .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
+                    eprintln!("H3_VAE_BATCH_REJECT batch={batch} reason={error:#}");
+                    continue;
+                }
+                Err(error) => return Err(error.context(format!("tile batch {batch}"))),
+            };
+            let replacement = if workspace > workspace_before {
+                workspace
+            } else {
+                0
+            };
+            let peak = work
+                .checked_add(replacement)
+                .context("tile batch peak overflow")?;
+            let launches = plan.chunks * (544 * groups + 4 * slots) + 2 * plan.chunks - 1;
+            #[cfg(test)]
+            {
+                let record = serde_json::json!({"batch":batch,"tail":tail,"groups_per_chunk":groups,
+                "full_rows":batch*tokens,"tail_rows":tail*tokens,"work_bytes":work,
+                "max_workspace_bytes":workspace,"workspace_replacement_bytes":replacement,
+                "peak_new_allocation_bytes":peak,"tensor_cost":cost,"launches":launches,
+                "within_budget":peak<=budget});
+                eprintln!("{}", serde_json::json!({"h3_vae_batch_candidate":record}));
+                records.push(record);
+            }
+            choices.push(TileBatch {
+                batch,
+                peak,
+                cost,
+                launches,
+                work,
+                workspace,
+            });
+        }
+        let chosen = TileBatch::choose(&choices, budget)?;
+        #[cfg(test)]
+        {
+            let result = serde_json::json!({"tokens_per_tile":tokens,"patches_per_tile":patches,
+            "slots":slots,"temporal_chunks":plan.chunks,"output_frames":output_frames,
+            "free_before_work_bytes":free,"total_bytes":total,"safety_reserve_bytes":reserve,
+            "future_output_bytes":output,"future_latent_bytes":latent,"future_stitch_bytes":stitch,
+            "future_grid_bytes":grid,"mandatory_future_bytes":mandatory,"workspace_budget_bytes":budget,
+            "workspace_before_bytes":workspace_before,"canonical_biased_owners":self.linears().count(),
+            "chosen":records.iter().find(|x| x["batch"] == chosen.batch),"candidates":records,
+            "numerical_candidate_executed":false,"model_cells_scored":0});
+            eprintln!("{}", serde_json::json!({"h3_vae_batch_setup":result}));
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_vae_tile_plan": {
+                "batch":chosen.batch,"tail":slots%chosen.batch,"work_bytes":chosen.work,
+                "workspace_bytes":chosen.workspace,"peak_new_bytes":chosen.peak,
+            "budget_bytes":budget,"free_before_work_bytes":free,"slots":slots,
+            "future_fixed_bytes":mandatory,"safety_reserve_bytes":reserve,
+            "retained_workspace_bytes":workspace_before,"total_bytes":total,
+            "full_rows":chosen.batch*tokens,"tail_rows":(slots%chosen.batch)*tokens,
+            "predicted_launches":chosen.launches
+            }})
+        );
+        Ok(chosen.clone())
+    }
+
+    pub(crate) fn work(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        tiles: &VaeTiles,
+        shape: (usize, usize, usize),
+    ) -> Result<TileWork> {
+        let plan = self.batch_plan(device, blas, tiles, shape)?;
+        blas.bind_workspace(plan.workspace)?;
+        let spec = &self.spec;
+        let work = TileWork::new(
+            &device.stream,
+            spec,
+            (
+                spec.chunk_latents() + spec.overlap_latents(),
+                tiles.height / spec.spatial_ratio,
+                tiles.width / spec.spatial_ratio,
+            ),
+            (plan.batch, tiles.count()),
+        )?;
+        work.prepare(&device.stream, blas, self)?;
+        ensure!(
+            work.allocated_bytes() == plan.work,
+            "tile work differs from selected memory plan"
+        );
+        Ok(work)
+    }
+
     pub(crate) fn new(
         d: &Device,
         spec: &VaeSpec,
@@ -257,11 +1124,16 @@ impl VideoDecoder {
         w: &mut TileWork,
     ) -> Result<()> {
         let spec = &self.spec;
-        let (t, dim) = (w.tokens, spec.dim);
+        let (t, dim) = (w.rows, spec.dim);
         self.rms_weight(s, &w.x, &b.norm1, &w.normed, t)?;
-        b.q.run(s, blas, &w.normed, &w.q, t)?;
-        b.k.run(s, blas, &w.normed, &w.k, t)?;
-        b.v.run(s, blas, &w.normed, &w.v, t)?;
+        for (linear, output) in [(&b.q, &w.q), (&b.k, &w.k), (&b.v, &w.v)] {
+            linear.run(
+                s,
+                blas,
+                rows_view(&w.normed, s, 0, t, dim, dim)?,
+                rows_view(output, s, 0, t, dim, dim)?,
+            )?;
+        }
         for (input, output) in [(&w.q, &w.q_n), (&w.k, &w.k_n)] {
             self.block_kernels.rms_norm(
                 s,
@@ -313,10 +1185,20 @@ impl VideoDecoder {
                 window_left: None,
             },
         )?;
-        b.out.run(s, blas, &w.attn, &w.o, t)?;
+        b.out.run(
+            s,
+            blas,
+            rows_view(&w.attn, s, 0, t, dim, dim)?,
+            rows_view(&w.o, s, 0, t, dim, dim)?,
+        )?;
         self.scaled_residual(s, &w.x, &w.o, &b.scale1, t)?;
         self.rms_weight(s, &w.x, &b.norm2, &w.normed, t)?;
-        b.ff_in.run(s, blas, &w.normed, &w.gate_up, t)?;
+        b.ff_in.run(
+            s,
+            blas,
+            rows_view(&w.normed, s, 0, t, dim, dim)?,
+            rows_view(&w.gate_up, s, 0, t, 2 * spec.ffn, 2 * spec.ffn)?,
+        )?;
         let (gate_up, gated) = (pointer(&w.gate_up, s), pointer(&w.gated, s));
         let cfg = ops::silu_mul_grid(t, spec.ffn, gate_up, gated)?;
         unsafe {
@@ -328,7 +1210,12 @@ impl VideoDecoder {
                 .arg(&3i32)
                 .launch(cfg)?;
         }
-        b.ff_out.run(s, blas, &w.gated, &w.o, t)?;
+        b.ff_out.run(
+            s,
+            blas,
+            rows_view(&w.gated, s, 0, t, spec.ffn, spec.ffn)?,
+            rows_view(&w.o, s, 0, t, dim, dim)?,
+        )?;
         self.scaled_residual(s, &w.x, &w.o, &b.scale2, t)
     }
 
@@ -380,53 +1267,9 @@ impl VideoDecoder {
         Ok(())
     }
 
-    /// Decodes one spatial tile of one chunk into raw tile slot `slot` of `raw` (`[slots, channels, frames, h, w]`).
-    fn tile(
-        &self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
-        w: &mut TileWork,
-        z: &LatentVideo<'_>,
-        origin: (usize, usize, usize),
-        (raw, slot): (&CudaSlice<bf16>, usize),
-    ) -> Result<()> {
+    fn output_rows(&self, s: &Arc<CudaStream>, blas: &Blas, w: &TileWork) -> Result<()> {
         let spec = &self.spec;
-        let (n, t, dim) = (w.patches, w.tokens, spec.dim);
-        let (first_frame, first_row, first_col) = origin;
-        let count = n * spec.latent_channels;
-        unsafe {
-            s.launch_builder(&self.kernels.latent_rows)
-                .arg(&pointer(z.data, s))
-                .arg(&pointer(&w.latent, s))
-                .arg(&(spec.latent_channels as u32))
-                .arg(&(z.frames as u32))
-                .arg(&(z.height as u32))
-                .arg(&(z.width as u32))
-                .arg(&(first_frame as u32))
-                .arg(&(first_row as u32))
-                .arg(&(first_col as u32))
-                .arg(&(w.frames as u32))
-                .arg(&(w.height as u32))
-                .arg(&(w.width as u32))
-                .launch(flat(count))?;
-        }
-        self.post_quant.run(s, blas, &w.latent, &w.latent_q, n)?;
-        self.proj_in.run(s, blas, &w.latent_q, &w.hidden, n)?;
-        s.memcpy_dtod(
-            &self.registers,
-            &mut w.hidden.slice_mut(n * dim..(n + spec.registers) * dim),
-        )?;
-        let elements = u32::try_from(t * dim)?;
-        unsafe {
-            s.launch_builder(&self.kernels.upcast)
-                .arg(&pointer(&w.hidden, s))
-                .arg(&pointer(&w.x, s))
-                .arg(&elements)
-                .launch(flat(t * dim))?;
-        }
-        for b in &self.blocks {
-            self.block(s, blas, b, w)?;
-        }
+        let (t, dim) = (w.rows, spec.dim);
         let d = dim as u64;
         unsafe {
             s.launch_builder(&self.kernels.layer_norm)
@@ -459,25 +1302,171 @@ impl VideoDecoder {
                 .arg(&1f32)
                 .launch(flat(t * dim))?;
         }
-        self.proj_out.run(s, blas, &w.normed, &w.patch_rows, t)?;
-        let tile_size = w.pixels();
-        let target = pointer(raw, s) + (slot * tile_size * std::mem::size_of::<bf16>()) as u64;
+        self.proj_out.run(
+            s,
+            blas,
+            rows_view(&w.normed, s, 0, t, dim, dim)?,
+            rows_view(
+                &w.patch_rows,
+                s,
+                0,
+                t,
+                spec.patch_width(),
+                spec.patch_width(),
+            )?,
+        )?;
+        Ok(())
+    }
+
+    /// Consecutive spatial tiles write consecutive raw slots `[slots, channels, frames, h, w]`.
+    fn tile(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        w: &mut TileWork,
+        z: &LatentVideo<'_>,
+        (origins, first_frame): (&[(usize, usize)], usize),
+        (raw, slot): (&CudaSlice<bf16>, usize),
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let (n, dim) = (w.patches, spec.dim);
+        let active = origins.len();
         ensure!(
-            (slot + 1) * tile_size <= raw.len(),
-            "raw tile slot {slot} out of range"
+            active > 0 && active <= w.batch && (active == w.batch || active == w.tail),
+            "spatial group does not match its full/tail bindings"
         );
-        unsafe {
-            s.launch_builder(&self.kernels.unpatchify)
-                .arg(&pointer(&w.patch_rows, s))
-                .arg(&target)
-                .arg(&(w.frames as u32))
-                .arg(&(w.height as u32))
-                .arg(&(w.width as u32))
-                .arg(&(spec.out_channels as u32))
-                .arg(&(spec.temporal_ratio as u32))
-                .arg(&(spec.spatial_ratio as u32))
-                .launch(flat(tile_size))?;
+        ensure!(
+            slot.checked_add(active)
+                .and_then(|n| n.checked_mul(w.pixels()))
+                .is_some_and(|n| n <= raw.len()),
+            "raw spatial group exceeds slot capacity"
+        );
+        let t = active * w.tokens;
+        w.rows = t;
+        if active != w.batch {
+            std::mem::swap(
+                &mut w.flash,
+                w.tail_flash.as_mut().context("tail attention missing")?,
+            );
         }
+        let count = n * spec.latent_channels;
+        for (tile, &(first_row, first_col)) in origins.iter().enumerate() {
+            ensure!(
+                first_frame
+                    .checked_add(w.frames)
+                    .is_some_and(|n| n <= z.frames)
+                    && first_row
+                        .checked_add(w.height)
+                        .is_some_and(|n| n <= z.height)
+                    && first_col.checked_add(w.width).is_some_and(|n| n <= z.width),
+                "latent spatial group origin exceeds input capacity"
+            );
+            unsafe {
+                s.launch_builder(&self.kernels.latent_rows)
+                    .arg(&pointer(z.data, s))
+                    .arg(&pointer(&w.latent, s))
+                    .arg(&(spec.latent_channels as u32))
+                    .arg(&(z.frames as u32))
+                    .arg(&(z.height as u32))
+                    .arg(&(z.width as u32))
+                    .arg(&(first_frame as u32))
+                    .arg(&(first_row as u32))
+                    .arg(&(first_col as u32))
+                    .arg(&(w.frames as u32))
+                    .arg(&(w.height as u32))
+                    .arg(&(w.width as u32))
+                    .launch(flat(count))?;
+            }
+            self.post_quant.run(
+                s,
+                blas,
+                rows_view(
+                    &w.latent,
+                    s,
+                    0,
+                    n,
+                    spec.latent_channels,
+                    spec.latent_channels,
+                )?,
+                rows_view(
+                    &w.latent_q,
+                    s,
+                    0,
+                    n,
+                    spec.latent_channels,
+                    spec.latent_channels,
+                )?,
+            )?;
+            let offset = tile * w.tokens * dim;
+            self.proj_in.run(
+                s,
+                blas,
+                rows_view(
+                    &w.latent_q,
+                    s,
+                    0,
+                    n,
+                    spec.latent_channels,
+                    spec.latent_channels,
+                )?,
+                rows_view(&w.hidden, s, offset, n, dim, dim)?,
+            )?;
+            s.memcpy_dtod(
+                &self.registers,
+                &mut w
+                    .hidden
+                    .slice_mut(offset + n * dim..offset + (n + spec.registers) * dim),
+            )?;
+        }
+        let elements = u32::try_from(t * dim)?;
+        unsafe {
+            s.launch_builder(&self.kernels.upcast)
+                .arg(&pointer(&w.hidden, s))
+                .arg(&pointer(&w.x, s))
+                .arg(&elements)
+                .launch(flat(t * dim))?;
+        }
+        for b in &self.blocks {
+            self.block(s, blas, b, w)?;
+        }
+        self.output_rows(s, blas, w)?;
+        let tile_size = w.pixels();
+        for tile in 0..active {
+            let slot = slot + tile;
+            let target = pointer(raw, s) + (slot * tile_size * std::mem::size_of::<bf16>()) as u64;
+            let source = rows_view(
+                &w.patch_rows,
+                s,
+                tile * w.tokens * spec.patch_width(),
+                w.tokens,
+                spec.patch_width(),
+                spec.patch_width(),
+            )?
+            .ptr;
+            ensure!(
+                (slot + 1) * tile_size <= raw.len(),
+                "raw tile slot {slot} out of range"
+            );
+            unsafe {
+                s.launch_builder(&self.kernels.unpatchify)
+                    .arg(&source)
+                    .arg(&target)
+                    .arg(&(w.frames as u32))
+                    .arg(&(w.height as u32))
+                    .arg(&(w.width as u32))
+                    .arg(&(spec.out_channels as u32))
+                    .arg(&(spec.temporal_ratio as u32))
+                    .arg(&(spec.spatial_ratio as u32))
+                    .launch(flat(tile_size))?;
+            }
+        }
+        if active != w.batch {
+            std::mem::swap(
+                &mut w.flash,
+                w.tail_flash.as_mut().context("tail attention missing")?,
+            );
+        }
+        w.rows = w.batch * w.tokens;
         Ok(())
     }
 
@@ -492,6 +1481,18 @@ impl VideoDecoder {
         tiles: &VaeTiles,
         z: LatentVideo<'_>,
         out: &mut CudaSlice<bf16>,
+    ) -> Result<DecodePlan> {
+        self.decode_observed((s, blas), w, tiles, z, out, |_, _, _| Ok(()))
+    }
+
+    fn decode_observed(
+        &self,
+        (s, blas): (&Arc<CudaStream>, &Blas),
+        w: &mut TileWork,
+        tiles: &VaeTiles,
+        z: LatentVideo<'_>,
+        out: &mut CudaSlice<bf16>,
+        mut observe: impl FnMut(&str, usize, &CudaSlice<bf16>) -> Result<()>,
     ) -> Result<DecodePlan> {
         let spec = &self.spec;
         let r = spec.spatial_ratio;
@@ -572,19 +1573,23 @@ impl VideoDecoder {
             }
             Ok(())
         };
+        let origins: Vec<_> = rows
+            .0
+            .iter()
+            .flat_map(|&row| cols.0.iter().map(move |&col| (row / r, col / r)))
+            .collect();
         for i in 0..plan.chunks {
-            for (ti, &row) in rows.0.iter().enumerate() {
-                for (tj, &col) in cols.0.iter().enumerate() {
-                    self.tile(
-                        s,
-                        blas,
-                        w,
-                        &z,
-                        (i * chunk, row / r, col / r),
-                        (&raw, ti * cols.0.len() + tj),
-                    )?;
-                }
+            for (group, origins) in origins.chunks(w.batch).enumerate() {
+                self.tile(
+                    s,
+                    blas,
+                    w,
+                    &z,
+                    (origins, i * chunk),
+                    (&raw, group * w.batch),
+                )?;
             }
+            observe("raw", i, &raw)?;
             let planes = channels * clip_frames;
             unsafe {
                 s.launch_builder(&self.kernels.stitch)
@@ -600,6 +1605,7 @@ impl VideoDecoder {
                     .arg(&(width as u32))
                     .launch(flat(planes * plane))?;
             }
+            observe("canvas", i, &canvas)?;
             let dst = i * kept;
             if i > 0 && fade > 0 {
                 unsafe {
@@ -631,6 +1637,7 @@ impl VideoDecoder {
             } else {
                 copy_frames(s, &canvas, clip_frames, pre, out, total, dst, kept)?;
             }
+            observe("emitted", i, out)?;
             if spec.token_drop > 0 {
                 copy_frames(
                     s,
@@ -643,10 +1650,12 @@ impl VideoDecoder {
                     tail,
                 )?;
             }
+            observe("tail", i, &faded)?;
         }
         if spec.token_drop > 0 {
             copy_frames(s, &faded, tail, 0, out, total, plan.chunks * kept, tail)?;
         }
+        observe("final", plan.chunks, out)?;
         Ok(plan)
     }
 }
@@ -681,6 +1690,9 @@ pub(crate) struct TileWork {
     width: usize,
     patches: usize,
     tokens: usize,
+    rows: usize,
+    batch: usize,
+    tail: usize,
     latent: CudaSlice<bf16>,
     latent_q: CudaSlice<bf16>,
     hidden: CudaSlice<bf16>,
@@ -702,10 +1714,77 @@ pub(crate) struct TileWork {
     rope: CudaSlice<bf16>,
     ones: CudaSlice<bf16>,
     flash: Flash,
+    tail_flash: Option<Flash>,
     spec: VaeSpec,
 }
 
 impl TileWork {
+    pub(crate) fn batch_bytes(
+        spec: &VaeSpec,
+        (frames, height, width): (usize, usize, usize),
+        batch: usize,
+        slots: usize,
+    ) -> Result<usize> {
+        ensure!(batch > 0 && batch <= slots, "invalid tile batch capacity");
+        ensure!(
+            [frames, height, width].iter().all(|&n| n > 0),
+            "zero tile work dimension"
+        );
+        let product = |values: &[usize]| -> Result<usize> {
+            values.iter().try_fold(1usize, |a, &b| {
+                a.checked_mul(b).context("tile work overflow")
+            })
+        };
+        let sum = |values: &[usize]| -> Result<usize> {
+            values.iter().try_fold(0usize, |a, &b| {
+                a.checked_add(b).context("tile work overflow")
+            })
+        };
+        let patches = product(&[frames, height, width])?;
+        let tokens = sum(&[patches, spec.registers, 1])?;
+        let bf16s = sum(&[
+            product(&[2, patches, spec.latent_channels])?,
+            product(&[11, tokens, spec.dim])?,
+            product(&[3, tokens, spec.ffn])?,
+            product(&[tokens, spec.patch_width()])?,
+            product(&[tokens, spec.rope_dims])?,
+            spec.head_dim,
+        ])?;
+        let serial = sum(&[
+            product(&[2, bf16s])?,
+            product(&[
+                4,
+                sum(&[
+                    product(&[2, tokens, spec.dim])?,
+                    product(&[spec.heads, tokens])?,
+                ])?,
+            ])?,
+        ])?;
+        let shared = sum(&[
+            product(&[4, patches, spec.latent_channels])?,
+            product(&[2, spec.head_dim])?,
+        ])?;
+        let tail = slots % batch;
+        sum(&[
+            product(&[
+                batch,
+                serial.checked_sub(shared).context("tile shared size")?,
+            ])?,
+            shared,
+            if batch > 1 {
+                product(&[4, batch.checked_add(1).context("offset count")?])?
+            } else {
+                0
+            },
+            product(&[tail, 4, spec.heads, tokens])?,
+            if tail > 1 {
+                product(&[4, tail.checked_add(1).context("offset count")?])?
+            } else {
+                0
+            },
+        ])
+    }
+
     /// Device bytes `new` allocates for a `frames x height x width` tile: BF16 latent rows, activations, FFN, patch
     /// rows, rotary table and unit vector; the F32 residual pair; the attention LSE `[heads, tokens]` F32.
     pub(crate) fn bytes(spec: &VaeSpec, (frames, height, width): (usize, usize, usize)) -> usize {
@@ -724,40 +1803,26 @@ impl TileWork {
         s: &Arc<CudaStream>,
         spec: &VaeSpec,
         (frames, height, width): (usize, usize, usize),
+        (batch, slots): (usize, usize),
     ) -> Result<Self> {
+        let expected = Self::batch_bytes(spec, (frames, height, width), batch, slots)?;
         let patches = frames * height * width;
         let tokens = patches + spec.registers + 1;
+        let active_rows = tokens.checked_mul(batch).context("tile rows overflow")?;
+        ensure!(
+            active_rows
+                .checked_mul(2 * spec.ffn)
+                .is_some_and(|n| n <= i32::MAX as usize),
+            "tile FFN rows exceed kernel indexing range"
+        );
+        let tail = slots % batch;
         let dim = spec.dim;
         let rows = |n: usize| s.alloc_zeros::<bf16>(n);
-        let work = Self {
-            frames,
-            height,
-            width,
-            patches,
-            tokens,
-            latent: rows(patches * spec.latent_channels)?,
-            latent_q: rows(patches * spec.latent_channels)?,
-            hidden: rows(tokens * dim)?,
-            x: s.alloc_zeros::<f32>(tokens * dim)?,
-            y: s.alloc_zeros::<f32>(tokens * dim)?,
-            normed: rows(tokens * dim)?,
-            q: rows(tokens * dim)?,
-            k: rows(tokens * dim)?,
-            v: rows(tokens * dim)?,
-            q_n: rows(tokens * dim)?,
-            k_n: rows(tokens * dim)?,
-            k_cache: rows(tokens * dim)?,
-            v_cache: rows(tokens * dim)?,
-            attn: rows(tokens * dim)?,
-            o: rows(tokens * dim)?,
-            gate_up: rows(tokens * 2 * spec.ffn)?,
-            gated: rows(tokens * spec.ffn)?,
-            patch_rows: rows(tokens * spec.patch_width())?,
-            rope: s.clone_htod(&rope_table(spec, (frames, height, width)))?,
-            ones: s.clone_htod(&vec![bf16::ONE; spec.head_dim])?,
-            flash: Flash::new_with_score(
+        let flash = |batch: usize| -> Result<Flash> {
+            let count = batch * tokens;
+            let mut flash = Flash::new_with_score(
                 s.clone(),
-                tokens,
+                count,
                 spec.heads,
                 spec.heads,
                 spec.head_dim,
@@ -766,41 +1831,85 @@ impl TileWork {
                     window_left: None,
                     window_right: None,
                 },
-                tokens,
-            )?,
+                count,
+            )?;
+            if batch > 1 {
+                let offsets = (0..=batch)
+                    .map(|i| u32::try_from(i * tokens))
+                    .collect::<Result<Vec<_>, _>>()?;
+                flash.bind_bf16_windows(&offsets)?;
+            }
+            Ok(flash)
+        };
+        let work = Self {
+            frames,
+            height,
+            width,
+            patches,
+            tokens,
+            rows: active_rows,
+            batch,
+            tail,
+            latent: rows(patches * spec.latent_channels)?,
+            latent_q: rows(patches * spec.latent_channels)?,
+            hidden: rows(active_rows * dim)?,
+            x: s.alloc_zeros::<f32>(active_rows * dim)?,
+            y: s.alloc_zeros::<f32>(active_rows * dim)?,
+            normed: rows(active_rows * dim)?,
+            q: rows(active_rows * dim)?,
+            k: rows(active_rows * dim)?,
+            v: rows(active_rows * dim)?,
+            q_n: rows(active_rows * dim)?,
+            k_n: rows(active_rows * dim)?,
+            k_cache: rows(active_rows * dim)?,
+            v_cache: rows(active_rows * dim)?,
+            attn: rows(active_rows * dim)?,
+            o: rows(active_rows * dim)?,
+            gate_up: rows(active_rows * 2 * spec.ffn)?,
+            gated: rows(active_rows * spec.ffn)?,
+            patch_rows: rows(active_rows * spec.patch_width())?,
+            rope: s.clone_htod(&rope_table(spec, (frames, height, width)).repeat(batch))?,
+            ones: s.clone_htod(&vec![bf16::ONE; spec.head_dim])?,
+            flash: flash(batch)?,
+            tail_flash: if tail > 0 { Some(flash(tail)?) } else { None },
             spec: spec.clone(),
         };
+        let allocated = work.allocated_bytes();
+        ensure!(
+            allocated == expected,
+            "tile work allocated {allocated} B, planned {expected}"
+        );
+        Ok(work)
+    }
+
+    fn allocated_bytes(&self) -> usize {
         let bf16s: usize = [
-            &work.latent,
-            &work.latent_q,
-            &work.hidden,
-            &work.normed,
-            &work.q,
-            &work.k,
-            &work.v,
-            &work.q_n,
-            &work.k_n,
-            &work.k_cache,
-            &work.v_cache,
-            &work.attn,
-            &work.o,
-            &work.gate_up,
-            &work.gated,
-            &work.patch_rows,
-            &work.rope,
-            &work.ones,
+            &self.latent,
+            &self.latent_q,
+            &self.hidden,
+            &self.normed,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.q_n,
+            &self.k_n,
+            &self.k_cache,
+            &self.v_cache,
+            &self.attn,
+            &self.o,
+            &self.gate_up,
+            &self.gated,
+            &self.patch_rows,
+            &self.rope,
+            &self.ones,
         ]
         .iter()
         .map(|b| b.len())
         .sum();
-        let allocated =
-            2 * bf16s + 4 * (work.x.len() + work.y.len()) + work.flash.allocated_bytes();
-        ensure!(
-            allocated == Self::bytes(spec, (frames, height, width)),
-            "tile work allocated {allocated} B, planned {}",
-            Self::bytes(spec, (frames, height, width))
-        );
-        Ok(work)
+        2 * bf16s
+            + 4 * (self.x.len() + self.y.len())
+            + self.flash.allocated_bytes()
+            + self.tail_flash.as_ref().map_or(0, Flash::allocated_bytes)
     }
 
     /// Binds the biased GEMM plans of every decoder projection at this tile's row counts.
@@ -814,6 +1923,19 @@ impl TileWork {
         decoder.proj_in.prepare(s, blas, self.patches)?;
         for linear in decoder.linears() {
             linear.prepare(s, blas, self.tokens)?;
+            for active in [self.batch, self.tail] {
+                if active > 1 {
+                    blas.prepare_biased_family(
+                        crate::backend::setup::LinearShape {
+                            rows: active * self.tokens,
+                            output: linear.out,
+                            input: linear.input,
+                        },
+                        self.tokens,
+                        vector(&linear.bias, s)?,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
