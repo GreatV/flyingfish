@@ -967,13 +967,14 @@ extern "C" __global__ void conv_im2col_f32(const float* __restrict__ padded,
 
 // Transposed conv1d on the published [in, out * kernel] weight with bias: out row t of rows * stride sums, over taps
 // k ascending with (t + pad - k) divisible by stride, x row j = (t + pad - k) / stride in [0, rows). x [rows, in],
-// out [rows * stride, out]; kernel - 2 * pad == stride.
+// out [rows * stride, out]. trim 0 requires kernel - 2 * pad == stride. trim 1 requires pad 0 and kernel == 2 * stride.
 extern "C" __global__ void conv_transpose_rows_f32(const float* __restrict__ x,
     const float* __restrict__ w, const float* __restrict__ bias, float* __restrict__ out,
-    int rows, int in_dim, int out_dim, int kernel, int stride, int pad) {
-    if (!x || !w || !bias || !out || rows <= 0 || in_dim <= 0 || out_dim <= 0 || stride <= 0 ||
-        pad < 0 || kernel - 2 * pad != stride || blockDim.x != 256 || blockDim.y != 1 ||
-        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    int rows, int in_dim, int out_dim, int kernel, int stride, int pad, int trim) {
+    const bool tap = trim == 0 ? kernel - 2 * pad == stride : pad == 0 && kernel == 2 * stride;
+    if (!x || !w || !bias || !out || rows <= 0 || in_dim <= 0 || out_dim <= 0 || kernel <= 0 ||
+        stride <= 0 || pad < 0 || trim < 0 || trim > 1 || !tap || blockDim.x != 256 ||
+        blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
     const long long out_rows = (long long)rows * stride;
     for (long long t = (long long)blockIdx.x; t < out_rows; t += gridDim.x) {
         for (int o = threadIdx.x; o < out_dim; o += blockDim.x) {
@@ -1319,4 +1320,86 @@ extern "C" __global__ void mean_span_rows(
     float sum = 0.0f;
     for (int r = b; r < e; ++r) sum += __bfloat162float(x[(size_t)r * width + col]);
     out[(size_t)span * width + col] = __float2bfloat16_rn(sum / float(e - b));
+}
+
+// Causal conv on [rows, in_dim]. Device weight is [kernel, in_per_group, out], left pad (kernel - 1) * dilation,
+// stride 1. residual is null or [rows, out] added after the bias.
+extern "C" __global__ void causal_conv_rows_f32(
+    const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
+    const float* __restrict__ residual, float* __restrict__ y,
+    int rows, int in_dim, int out_dim, int kernel, int dilation, int groups) {
+    if (!x || !w || !bias || !y || rows <= 0 || in_dim <= 0 || out_dim <= 0 || kernel <= 0 ||
+        dilation <= 0 || groups <= 0 || in_dim % groups != 0 || out_dim % groups != 0 ||
+        blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1) {
+        __trap();
+        return;
+    }
+    const int in_pg = in_dim / groups;
+    const int out_pg = out_dim / groups;
+    const int left = (kernel - 1) * dilation;
+    const int t = (int)blockIdx.x;
+    const int o = (int)blockIdx.y * 256 + (int)threadIdx.x;
+    if (t >= rows || o >= out_dim) return;
+    const int c0 = (o / out_pg) * in_pg;
+    float acc = bias[o];
+    for (int k = 0; k < kernel; ++k) {
+        const int src = t + k * dilation - left;
+        if ((unsigned)src >= (unsigned)rows) continue;
+        const float* xr = x + (long long)src * in_dim + c0;
+        const float* wk = w + ((long long)k * in_pg) * out_dim;
+        for (int c = 0; c < in_pg; ++c)
+            acc = __fmaf_rn(xr[c], wk[(long long)c * out_dim + o], acc);
+    }
+    if (residual) acc = __fadd_rn(acc, residual[(long long)t * out_dim + o]);
+    y[(long long)t * out_dim + o] = acc;
+}
+
+// cos/sin [rows, dim] from inv[dim/2], position t, duplicated across the two halves.
+extern "C" __global__ void rope_cos_sin_f32(
+    const float* __restrict__ inv, float* __restrict__ cosv, float* __restrict__ sinv,
+    int rows, int dim) {
+    const int half = dim >> 1;
+    const long long n = (long long)rows * half;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (half <= 0 || (dim & 1) || !inv || !cosv || !sinv) {
+        __trap();
+        return;
+    }
+    if (i >= n) return;
+    const int t = (int)(i / half);
+    const int k = (int)(i - (long long)t * half);
+    const float ang = (float)t * inv[k];
+    const float c = cosf(ang);
+    const float s = sinf(ang);
+    cosv[(long long)t * dim + k] = c;
+    cosv[(long long)t * dim + half + k] = c;
+    sinv[(long long)t * dim + k] = s;
+    sinv[(long long)t * dim + half + k] = s;
+}
+
+// In-place rotate_half on [rows, heads, dim]. cos/sin are [rows, dim] with both halves equal.
+// out[:half] = x1 * cos - x2 * sin. out[half:] = x2 * cos + x1 * sin. dim is 64.
+extern "C" __global__ void rope_rotate_half_f32(
+    float* __restrict__ x, const float* __restrict__ cosv, const float* __restrict__ sinv,
+    int rows, int heads, int dim) {
+    if (!x || !cosv || !sinv || rows <= 0 || heads <= 0 || dim != 64) {
+        __trap();
+        return;
+    }
+    const int pair = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (pair >= rows * heads) return;
+    const int t = pair / heads;
+    const int h = pair - t * heads;
+    const int half = dim >> 1;
+    float* xh = x + ((long long)t * heads + h) * dim;
+    const float* ct = cosv + (long long)t * dim;
+    const float* st = sinv + (long long)t * dim;
+    for (int d = 0; d < half; ++d) {
+        const float x1 = xh[d];
+        const float x2 = xh[half + d];
+        const float c = ct[d];
+        const float s = st[d];
+        xh[d] = __fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s));
+        xh[half + d] = __fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s));
+    }
 }

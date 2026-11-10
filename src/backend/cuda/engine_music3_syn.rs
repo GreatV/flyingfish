@@ -1353,6 +1353,7 @@ impl Music3Syn {
                     .arg(&(2 * stride as i32))
                     .arg(&(stride as i32))
                     .arg(&(stride.div_ceil(2) as i32))
+                    .arg(&0i32)
                     .launch(super::ops::grid(rows * stride, 256))?;
             }
             std::mem::swap(&mut ws.voc_cur, &mut ws.voc_next);

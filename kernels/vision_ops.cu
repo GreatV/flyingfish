@@ -397,14 +397,14 @@ extern "C" __global__ void vision_bias_quick_gelu_f32(
     }
 }
 
-// One FP32 RMS normalization per row times scale[i * scale_stride] (stride 0: one scalar, 1: per element), with a
-// BF16 output and an optional (null-skipped) FP32 output.
+// One FP32 RMS normalization per row times scale[i * scale_stride] (stride 0: one scalar, 1: per element).
+// output_f32 and output_bf16 are each skipped when null. At least one is required.
 extern "C" __global__ void vision_rms_scale_f32(
     const float* input, const float* scale, uint32_t scale_stride, float* output_f32,
     __nv_bfloat16* output_bf16, uint32_t width, float eps) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.y != 1 || gridDim.z != 1 || !input || !scale || scale_stride > 1 ||
-        !output_bf16 || !width || !(eps > 0.0f)) { __trap(); return; }
+        (!output_f32 && !output_bf16) || !width || !(eps > 0.0f)) { __trap(); return; }
     uint32_t row = blockIdx.x;
     __shared__ float partial[8];
     float sum = 0.0f;
@@ -428,7 +428,7 @@ extern "C" __global__ void vision_rms_scale_f32(
         float normalized = __fmul_rn(input[uint64_t(row) * width + i], rstd);
         float scaled = __fmul_rn(normalized, scale[i * scale_stride]);
         if (output_f32) output_f32[uint64_t(row) * width + i] = scaled;
-        output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
+        if (output_bf16) output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
     }
 }
 

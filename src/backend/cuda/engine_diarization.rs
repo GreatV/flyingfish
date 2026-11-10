@@ -1319,6 +1319,7 @@ impl Diarization {
                     causal: false,
                     valid_keys: valid,
                     query_base: 0,
+                    window: 0,
                 },
             )?;
             let delta = matrix(&self.workspace.delta, &self.stream, rows, h)?;

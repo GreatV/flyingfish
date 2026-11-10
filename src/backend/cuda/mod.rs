@@ -17,6 +17,8 @@ pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod engine_breeze;
 #[cfg(feature = "cuda")]
+pub mod engine_breeze_tok;
+#[cfg(feature = "cuda")]
 pub mod engine_canary;
 #[cfg(all(test, feature = "cuda"))]
 mod engine_canary_tests;

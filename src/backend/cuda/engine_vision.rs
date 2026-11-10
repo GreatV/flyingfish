@@ -6402,6 +6402,7 @@ impl DinoScalar for f32 {
                 causal: false,
                 valid_keys: rows,
                 query_base: 0,
+                window: 0,
             },
         )
     }
