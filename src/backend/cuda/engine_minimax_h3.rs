@@ -6137,7 +6137,25 @@ mod tests {
     #[test]
     #[ignore = "GPU gate; set FF_H3_TEXT_ENCODER, FF_H3_S0, FF_H3_N6_LEGS, FF_H3_N6_THRESHOLDS and FF_H3_PLACEMENT"]
     fn conditioner_text_matches_the_fp32_reference() -> Result<()> {
-        let gate = TextGate::new(51)?;
+        text_conditioner_gate(51)
+    }
+
+    #[test]
+    #[ignore = "GPU; streamed-disk, frozen text fixtures, FF_H3_CAPTURE output and optional FF_H3_REPLAY parent taps"]
+    fn conditioner_text_disk_matches_parent_bits() -> Result<()> {
+        ensure!(
+            std::env::var("FF_H3_PLACEMENT").as_deref() == Ok("streamed-disk"),
+            "text bit gate requires streamed-disk"
+        );
+        ensure!(
+            std::env::var_os("FF_H3_CAPTURE").is_some(),
+            "text bit gate capture missing"
+        );
+        text_conditioner_gate(50)
+    }
+
+    fn text_conditioner_gate(layers: usize) -> Result<()> {
+        let gate = TextGate::new(layers)?;
         let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -6162,7 +6180,7 @@ mod tests {
         let mut conditioner = Conditioner::new(
             &device,
             &gate.spec,
-            (51, capacity, 0),
+            (layers, capacity, 0),
             Source::new(&gate.encoder, &gate.manifest),
             Placement::from_env()?,
         )?;
@@ -6194,16 +6212,50 @@ mod tests {
                 rope: &rope,
             };
             let mut taps = TEXT_TAPS.to_vec();
-            taps.push(51);
+            if layers == 51 {
+                taps.push(51);
+            }
             let outputs = conditioner.forward(&device.stream, &blas, &input, &taps)?;
             if !gate.score(cell, ("T", "text"), &outputs[..4], &TEXT_TAPS)? {
                 defects.push(*cell);
             }
+            if let Some(root) = std::env::var_os("FF_H3_CAPTURE") {
+                let root = PathBuf::from(root);
+                fs::create_dir_all(&root)?;
+                let bytes: Vec<_> = outputs[3]
+                    .iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes())
+                    .collect();
+                fs::write(root.join(format!("text-{cell}-tap50.bf16")), &bytes)?;
+                if let Some(parent) = std::env::var_os("FF_H3_REPLAY") {
+                    let expected =
+                        fs::read(PathBuf::from(parent).join(format!("text-{cell}-tap50.bf16")))?;
+                    ensure!(
+                        bytes.len() == expected.len(),
+                        "text parent tap extent differs"
+                    );
+                    let differences = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(expected.as_chunks::<2>().0)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    println!(
+                        "H3_TEXT_PAIRED cell={cell} layers={layers} tap50_bit_differences={differences} bound=0"
+                    );
+                    if differences != 0 {
+                        defects.push(*cell);
+                    }
+                }
+            }
             if *cell == "A" {
-                ensure!(
-                    !gate.score(cell, ("T", "text"), &outputs[4..], &[50])?,
-                    "hidden_states[51] passed the hidden_states[50] cell"
-                );
+                if layers == 51 {
+                    ensure!(
+                        !gate.score(cell, ("T", "text"), &outputs[4..], &[50])?,
+                        "hidden_states[51] passed the hidden_states[50] cell"
+                    );
+                }
                 let flat = ConditionerInput {
                     deepstack: &[],
                     ..input
@@ -6213,7 +6265,14 @@ mod tests {
                     !gate.score(cell, ("T", "text"), &outputs, &[50])?,
                     "deepstack-off control passed cell A"
                 );
-                println!("H3_TEXT controls cell=A tap51=FAIL deepstack_off=FAIL as required");
+                println!(
+                    "H3_TEXT controls cell=A layers={layers} tap51={} deepstack_off=FAIL as required",
+                    if layers == 51 {
+                        "FAIL"
+                    } else {
+                        "not_requested"
+                    }
+                );
             }
         }
         if !defects.is_empty() {
