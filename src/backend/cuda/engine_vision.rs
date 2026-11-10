@@ -6964,25 +6964,27 @@ impl Hi3DImageConditioner {
         blas: &mut Blas,
         dino_dir: &std::path::Path,
         clip_dir: &std::path::Path,
+        limit: usize,
     ) -> Result<Self> {
         device.finish_upload()?;
         let (free_before, total) = device.ctx.mem_get_info()?;
-        let capacity = 22_000_000_000usize.min(total.saturating_sub(total / 16));
+        ensure!(
+            limit > 0 && limit <= total,
+            "invalid image conditioner device limit"
+        );
         let mut encoders = Vec::with_capacity(2);
+        let mut admitted = 0usize;
         for (dir, family, side) in [(dino_dir, "dinov2", 756), (clip_dir, "clip", 224)] {
             let cfg = VisionEncoderConfig::from_dir(dir)?;
             ensure!(
                 cfg.model_type == family,
                 "image conditioner encoder family mismatch"
             );
-            let (free, _) = device.ctx.mem_get_info()?;
             let live = cfg.expected_loaded_elements() * 4
                 + cfg.workspace_bytes(side)?
                 + cfg.total_rows(side)? as usize * cfg.hidden_size as usize * 4;
-            ensure!(
-                live <= capacity.saturating_sub(total - free),
-                "image encoder exceeds derived device budget"
-            );
+            device.workspace_budget(free_before, limit, live)?;
+            admitted += live;
             let file = std::fs::File::open(dir.join("model.safetensors"))?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
             encoders.push(DinoEncoder::<f32>::load(
@@ -6999,10 +7001,11 @@ impl Hi3DImageConditioner {
             .try_into()
             .map_err(|_| anyhow::anyhow!("image encoder count mismatch"))?;
         let context = device.stream.alloc_zeros(2917 * 2048)?;
+        admitted += 2917 * 2048 * 4;
         let (free_after, _) = device.ctx.mem_get_info()?;
         ensure!(
-            total - free_after <= capacity,
-            "image conditioner exceeded derived device capacity"
+            free_before - free_after <= admitted,
+            "image conditioner allocated beyond admitted bound"
         );
         Ok(Self {
             device: device.clone(),
@@ -11038,6 +11041,10 @@ mod tests {
             &mut blas,
             &path("FF_DINOV2_MODEL")?,
             &path("FF_CLIP_MODEL")?,
+            {
+                let (free, total) = device.ctx.mem_get_info()?;
+                (total - total / 8).saturating_sub(total - free)
+            },
         )?;
         let mut actual = BTreeMap::new();
         let mut replay = BTreeMap::new();
