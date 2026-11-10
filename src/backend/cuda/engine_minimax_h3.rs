@@ -655,6 +655,8 @@ pub(crate) struct BlockKernels {
     swiglu: crate::backend::gpu::CudaFunction,
     #[cfg(test)]
     modulate: crate::backend::gpu::CudaFunction,
+    #[cfg(test)]
+    serial_norm_modulate: std::cell::Cell<bool>,
     gated_add: crate::backend::gpu::CudaFunction,
     residual: crate::backend::gpu::CudaFunction,
 }
@@ -682,6 +684,8 @@ impl BlockKernels {
             swiglu: cubin::module(ctx, "act")?.load_function("silu_mul")?,
             #[cfg(test)]
             modulate: modulate.load_function("row_modulate")?,
+            #[cfg(test)]
+            serial_norm_modulate: std::cell::Cell::new(false),
             gated_add: modulate.load_function("row_gated_add")?,
         })
     }
@@ -1426,6 +1430,11 @@ impl BlockKernels {
         m.stride
             .checked_mul(m.entries as usize)
             .context("modulation table extent overflow")?;
+        #[cfg(test)]
+        if self.serial_norm_modulate.get() {
+            self.rms_norm(s, n)?;
+            return self.row_modulate(s, m);
+        }
         unsafe {
             s.launch_builder(&self.norm_modulate)
                 .arg(&n.input)
@@ -3261,13 +3270,31 @@ mod tests {
                         );
                     }
                 }
-                let valid = modulation(fused_at);
-                let mut invalid = norm(fused_at);
-                invalid.output += 2;
-                ensure!(
-                    kernels.rms_norm_modulate(s, invalid, valid).is_err(),
-                    "misaligned norm output accepted"
-                );
+                for case in 0..6 {
+                    let mut n = norm(fused_at);
+                    let mut m = modulation(fused_at);
+                    match case {
+                        0 => {
+                            n.output += 2;
+                            m.data = n.output;
+                        }
+                        1 => {
+                            n.dim += 1;
+                            m.dim = n.dim;
+                        }
+                        2 => n.threads -= 32,
+                        3 => m.index = 0,
+                        4 => m.entries = 0,
+                        _ => {
+                            m.stride = usize::MAX;
+                            m.entries = 2;
+                        }
+                    }
+                    ensure!(
+                        kernels.rms_norm_modulate(s, n, m).is_err(),
+                        "invalid norm/modulation case={case} accepted"
+                    );
+                }
             }
         }
         println!(
@@ -4447,6 +4474,16 @@ mod tests {
                 .collect())
         };
         let candidate = run(adapter.scale)?;
+        kernels.serial_norm_modulate.set(true);
+        let serial = run(adapter.scale)?;
+        kernels.serial_norm_modulate.set(false);
+        let bits = candidate
+            .iter()
+            .zip(&serial)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        drop(serial);
+        println!("H3_BLOCK0_MODULATION_IDENTITY bit_differences={bits} limit=0");
         let control = run(0.0)?;
         fs::remove_dir(&runtime)?;
 
@@ -4466,6 +4503,7 @@ mod tests {
             rows * rotary_width
         );
         ensure!(within(d, threshold)?, "block0 {d:?} outside {threshold}");
+        ensure!(bits == 0, "DEFECT block0 norm/modulation identity");
         ensure!(
             !within(d_control, threshold)?,
             "LoRA-scale-0 control stayed within {threshold}"
@@ -4677,6 +4715,16 @@ mod tests {
                 .collect())
         };
         let candidate = run(&weights)?;
+        kernels.serial_norm_modulate.set(true);
+        let serial = run(&weights)?;
+        kernels.serial_norm_modulate.set(false);
+        let bits = candidate
+            .iter()
+            .zip(&serial)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        drop(serial);
+        println!("H3_GGUF_MODULATION_IDENTITY bit_differences={bits} limit=0");
         let control = run(&wrong_weights)?;
         let engine_official = run(&official_weights)?;
 
@@ -4727,6 +4775,7 @@ mod tests {
             control_rel_ratio
         );
         fs::remove_dir(&runtime)?;
+        ensure!(bits == 0, "DEFECT GGUF norm/modulation identity");
         println!("H3_GGUF_BLOCK_GATE PASS control=FAIL_AS_REQUIRED");
         Ok(())
     }
@@ -5125,47 +5174,62 @@ mod tests {
             let row_pairs = s.clone_htod(&adaln_plan.row_pairs[k])?;
             let row_timesteps = s.clone_htod(&adaln_plan.row_timesteps[k])?;
             let chunked_control = dit.work.chunk < dit.work.rows;
-            let mut evaluate = |text: &CudaSlice<bf16>,
-                                repeat_ffn_input: bool|
-             -> Result<[[f64; 3]; 2]> {
-                dit.work.repeat_ffn_input = repeat_ffn_input;
-                dit.step(
-                    &context,
-                    &table,
-                    counts,
-                    &StepInputs {
-                        video: &video,
-                        audio: &audio,
-                        text,
-                        row_pairs: &row_pairs,
-                        row_timesteps: &row_timesteps,
-                    },
-                )?;
-                let candidate: Vec<f64> = s
-                    .clone_dtoh(&dit.video)?
-                    .into_iter()
-                    .map(f64::from)
-                    .collect();
-                let audio_candidate: Vec<f64> = s
-                    .clone_dtoh(&dit.audio)?
-                    .into_iter()
-                    .map(f64::from)
-                    .collect();
-                ensure!(
-                    candidate
-                        .iter()
-                        .chain(&audio_candidate)
-                        .all(|v| v.is_finite()),
-                    "step {k}: non-finite velocity"
-                );
-                let (reference, _) = decoded(&replay, &format!("step{k}.noise_pred"))?;
-                let (audio_reference, _) = decoded(&replay, &format!("step{k}.audio_noise_pred"))?;
-                Ok([
-                    distance(&candidate, &reference[condition * patch..]),
-                    distance(&audio_candidate, &audio_reference),
-                ])
-            };
-            let [d_video, d_audio] = evaluate(&text, false)?;
+            let mut evaluate =
+                |text: &CudaSlice<bf16>, repeat_ffn_input: bool| -> Result<[Vec<f64>; 2]> {
+                    dit.work.repeat_ffn_input = repeat_ffn_input;
+                    dit.step(
+                        &context,
+                        &table,
+                        counts,
+                        &StepInputs {
+                            video: &video,
+                            audio: &audio,
+                            text,
+                            row_pairs: &row_pairs,
+                            row_timesteps: &row_timesteps,
+                        },
+                    )?;
+                    let candidate: Vec<f64> = s
+                        .clone_dtoh(&dit.video)?
+                        .into_iter()
+                        .map(f64::from)
+                        .collect();
+                    let audio_candidate: Vec<f64> = s
+                        .clone_dtoh(&dit.audio)?
+                        .into_iter()
+                        .map(f64::from)
+                        .collect();
+                    ensure!(
+                        candidate
+                            .iter()
+                            .chain(&audio_candidate)
+                            .all(|v| v.is_finite()),
+                        "step {k}: non-finite velocity"
+                    );
+                    Ok([candidate, audio_candidate])
+                };
+            let candidate = evaluate(&text, false)?;
+            kernels.serial_norm_modulate.set(true);
+            let serial = evaluate(&text, false)?;
+            kernels.serial_norm_modulate.set(false);
+            let bits: usize = candidate
+                .iter()
+                .zip(&serial)
+                .map(|(a, b)| {
+                    a.iter()
+                        .zip(b)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count()
+                })
+                .sum();
+            drop(serial);
+            println!(
+                "H3_STEP_MODULATION_IDENTITY cell={cell} step={k} bit_differences={bits} limit=0"
+            );
+            let (reference, _) = decoded(&replay, &format!("step{k}.noise_pred"))?;
+            let (audio_reference, _) = decoded(&replay, &format!("step{k}.audio_noise_pred"))?;
+            let d_video = distance(&candidate[0], &reference[condition * patch..]);
+            let d_audio = distance(&candidate[1], &audio_reference);
             let video_threshold = &thresholds[format!("{cell}.step{k}.noise_pred")];
             let audio_threshold = &thresholds[format!("{cell}.step{k}.audio_noise_pred")];
             let verdict = [
@@ -5175,7 +5239,7 @@ mod tests {
             println!(
                 "H3_DIT step{k} video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold} within={verdict:?}"
             );
-            if verdict != [true, true] {
+            if verdict != [true, true] || bits > 0 {
                 defects.push(k);
             }
             if k == steps[0] {
@@ -5185,7 +5249,9 @@ mod tests {
                 } else {
                     "rotated-text"
                 };
-                let [c_video, c_audio] = evaluate(control_text, chunked_control)?;
+                let control = evaluate(control_text, chunked_control)?;
+                let c_video = distance(&control[0], &reference[condition * patch..]);
+                let c_audio = distance(&control[1], &audio_reference);
                 println!("H3_DIT step{k} {kind} control video={c_video:?} audio={c_audio:?}");
                 control_failed =
                     !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?;
@@ -5195,7 +5261,7 @@ mod tests {
         ensure!(control_failed, "DiT control stayed within the thresholds");
         ensure!(
             defects.is_empty(),
-            "H3_DIT_GATE DEFECT cell={cell} steps outside the frozen thresholds: {defects:?} of {steps:?}"
+            "H3_DIT_GATE DEFECT cell={cell} step identity or frozen thresholds: {defects:?} of {steps:?}"
         );
         println!("H3_DIT_GATE PASS cell={cell} steps={steps:?} control=FAIL_AS_REQUIRED");
         Ok(())
@@ -5354,7 +5420,7 @@ mod tests {
         };
         let text = s.clone_htod(&text_host)?;
         let condition = layout.condition_video_rows * patch;
-        let mut chain = |grids: (&Schedule, &Schedule)| -> Result<[[f64; 3]; 2]> {
+        let mut chain = |grids: (&Schedule, &Schedule)| -> Result<[Vec<f64>; 2]> {
             let video = s.clone_htod(&video0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
             let audio = s.clone_htod(&audio0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
             dit.sample(
@@ -5374,27 +5440,43 @@ mod tests {
                 video[..condition] == video0[..condition],
                 "conditioning rows moved"
             );
-            Ok([
-                distance(&video[condition..], &final_video_rows),
-                distance(&audio, &final_audio_rows),
-            ])
+            Ok([video, audio])
         };
-        let [d_video, d_audio] = chain((&video_grid, &audio_grid))?;
+        kernels.serial_norm_modulate.set(true);
+        let serial = chain((&video_grid, &audio_grid))?;
+        kernels.serial_norm_modulate.set(false);
+        let candidate = chain((&video_grid, &audio_grid))?;
+        let bits: usize = candidate
+            .iter()
+            .zip(&serial)
+            .map(|(a, b)| {
+                a.iter()
+                    .zip(b)
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count()
+            })
+            .sum();
+        drop(serial);
+        println!("H3_CHAIN_MODULATION_IDENTITY cell={cell} bit_differences={bits} limit=0");
+        let d_video = distance(&candidate[0][condition..], &final_video_rows);
+        let d_audio = distance(&candidate[1], &final_audio_rows);
         let video_threshold = &thresholds[format!("{cell}.final.latents")];
         let audio_threshold = &thresholds[format!("{cell}.final.audio_latents")];
         println!(
             "H3_CHAIN video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold}"
         );
-        ensure!(
-            within(d_video, video_threshold)? && within(d_audio, audio_threshold)?,
-            "final latents outside the frozen thresholds"
-        );
-        let [c_video, c_audio] = chain((&audio_grid, &video_grid))?;
+        let control = chain((&audio_grid, &video_grid))?;
+        let c_video = distance(&control[0][condition..], &final_video_rows);
+        let c_audio = distance(&control[1], &final_audio_rows);
         println!("H3_CHAIN swapped-grid control video={c_video:?} audio={c_audio:?}");
         fs::remove_dir(&runtime)?;
         ensure!(
             !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?,
             "swapped-grid control stayed within the thresholds"
+        );
+        ensure!(
+            bits == 0 && within(d_video, video_threshold)? && within(d_audio, audio_threshold)?,
+            "DEFECT chain identity or final latents outside the frozen thresholds"
         );
         println!("H3_CHAIN_GATE PASS cell={cell} control=FAIL_AS_REQUIRED");
         Ok(())
