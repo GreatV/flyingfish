@@ -33,6 +33,8 @@ impl AlignedBytes {
         // SAFETY: the layout has a nonzero size and a power-of-two alignment.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
             .with_context(|| format!("allocate {bytes} B aligned buffer"))?;
+        #[cfg(test)]
+        tests::ALIGNED_ALLOCATIONS.with(|count| count.set(count.get() + 1));
         Ok(Self { ptr, layout })
     }
 
@@ -678,9 +680,8 @@ impl DiskReader {
         u32::try_from(slot).context("disk ring slot exceeds u32")
     }
 
-    /// Reads one expert's ranges through the shared span planner: the requests are merged into
-    /// aligned spans per shard, each span is fetched once in `chunk_bytes` steps, and every request
-    /// is copied into its slot offset.
+    /// Buffered single-request spans land directly in their slot slices; gathered and direct-IO
+    /// spans use aligned staging and scatter in physical source order.
     fn read_parts(
         &self,
         parts: &[(u64, &NativeRange)],
@@ -688,6 +689,7 @@ impl DiskReader {
         chunk_bytes: u64,
     ) -> Result<()> {
         ensure!(!parts.is_empty(), "expert read has no native ranges");
+        ensure!(chunk_bytes > 0, "native read chunk is zero");
         for (offset, native) in parts {
             let end = offset
                 .checked_add(native.len)
@@ -702,36 +704,89 @@ impl DiskReader {
                 .or_default()
                 .push(index);
         }
-        for (shard_name, indexes) in by_shard {
-            let shard = self
-                .shards
-                .get(shard_name)
-                .with_context(|| format!("disk shard {shard_name} not open"))?;
-            let requests: Vec<(u64, u64)> = indexes
-                .iter()
-                .map(|&index| (parts[index].1.offset, parts[index].1.len))
-                .collect();
-            let needed = requests
-                .iter()
-                .map(|&(offset, len)| Self::aligned_staging_bytes(offset, len, shard.alignment))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .max()
-                .context("empty native requests")?;
-            let align = usize::try_from(shard.alignment)?;
-            let mut staging = match self.staging.take() {
-                Some(buffer) if buffer.len() >= needed && buffer.alignment() >= align => buffer,
-                _ => AlignedBytes::new(needed, align)?,
-            };
-            let outcome = shard.read_spans(&requests, chunk_bytes, &mut staging, |index, bytes| {
-                let start = usize::try_from(parts[indexes[index]].0)?;
-                slot[start..start + bytes.len()].copy_from_slice(bytes);
-                Ok(())
-            });
-            self.staging.set(Some(staging));
-            outcome?;
-        }
-        Ok(())
+        let mut staging = self.staging.take();
+        let outcome = (|| -> Result<()> {
+            for (shard_name, mut indexes) in by_shard {
+                let shard = self
+                    .shards
+                    .get(shard_name)
+                    .with_context(|| format!("disk shard {shard_name} not open"))?;
+                indexes.sort_unstable_by_key(|&index| (parts[index].1.offset, parts[index].1.len));
+                let requests: Vec<(u64, u64)> = indexes
+                    .iter()
+                    .map(|&index| (parts[index].1.offset, parts[index].1.len))
+                    .collect();
+                for &(offset, len) in &requests {
+                    ensure!(
+                        len > 0 && offset.checked_add(len).is_some_and(|end| end <= shard.len),
+                        "invalid native range {offset}+{len} for {} bytes",
+                        shard.len
+                    );
+                }
+                let chunk = if shard.direct {
+                    chunk_bytes
+                        .checked_add(shard.alignment - 1)
+                        .context("direct chunk overflow")?
+                        & !(shard.alignment - 1)
+                } else {
+                    chunk_bytes
+                };
+                let spans = shard.plan(&requests, chunk)?;
+                let mut needed = 0;
+                for span in &spans {
+                    if shard.direct || span.last > span.first + 1 {
+                        needed = needed.max(Self::aligned_staging_bytes(
+                            span.begin,
+                            span.end - span.begin,
+                            shard.alignment,
+                        )?);
+                    }
+                }
+                let align = usize::try_from(shard.alignment)?;
+                if needed > 0
+                    && staging
+                        .as_ref()
+                        .is_none_or(|buffer| buffer.len() < needed || buffer.alignment() < align)
+                {
+                    drop(staging.take());
+                    staging = Some(AlignedBytes::new(needed, align)?);
+                }
+                for span in spans {
+                    if !shard.direct && span.last == span.first + 1 {
+                        let index = indexes[span.first];
+                        let (offset, native) = parts[index];
+                        let start = usize::try_from(offset)?;
+                        let end = start + usize::try_from(native.len)?;
+                        let mut at = native.offset;
+                        for bytes in slot[start..end].chunks_mut(usize::try_from(chunk)?) {
+                            shard.file.read_exact_at(bytes, at).with_context(|| {
+                                format!("native read {shard_name} {at}+{}", bytes.len())
+                            })?;
+                            at += bytes.len() as u64;
+                        }
+                    } else {
+                        let bytes = shard.read_span(
+                            &span,
+                            chunk,
+                            staging.as_mut().context("native staging missing")?,
+                        )?;
+                        for index in span.first..span.last {
+                            let (offset, len) = requests[index];
+                            let from = usize::try_from(offset - span.begin)?;
+                            let end = from
+                                .checked_add(usize::try_from(len)?)
+                                .context("native slice overflow")?;
+                            ensure!(end <= bytes.len(), "native request exceeds its span");
+                            let start = usize::try_from(parts[indexes[index]].0)?;
+                            slot[start..start + end - from].copy_from_slice(&bytes[from..end]);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.staging.set(staging);
+        outcome
     }
 
     /// Lease over a filled ring slot; the guard holds the values until it drops or records the
@@ -1186,6 +1241,10 @@ mod tests {
     use crate::experts::catalogue::ExpertGeometry;
     use std::collections::BTreeMap;
 
+    std::thread_local! {
+        pub(super) static ALIGNED_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
             first_layer: 0,
@@ -1436,6 +1495,266 @@ mod tests {
                 "element {index}"
             );
         }
+        Ok(())
+    }
+
+    fn compare_range_reads(
+        reader: &DiskReader,
+        ranges: &[(u64, NativeRange)],
+        slot_bytes: usize,
+        chunk: u64,
+        row_bytes: u64,
+    ) -> Result<(usize, usize)> {
+        let mut expected = vec![0xa5; slot_bytes];
+        let mut eligible = 0;
+        let mut staged = 0;
+        let mut staged_shards = 0;
+        for (name, shard) in &reader.shards {
+            let indexes: Vec<_> = ranges
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, r))| (r.shard.as_ref() == name).then_some(i))
+                .collect();
+            let requests: Vec<_> = indexes
+                .iter()
+                .map(|&i| (ranges[i].1.offset, ranges[i].1.len))
+                .collect();
+            let needed = requests
+                .iter()
+                .map(|&(offset, len)| {
+                    DiskReader::aligned_staging_bytes(offset, len, shard.alignment)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .context("empty test shard")?;
+            let mut staging = AlignedBytes::new(needed, shard.alignment as usize)?;
+            shard.read_spans(&requests, chunk, &mut staging, |index, bytes| {
+                let start = ranges[indexes[index]].0 as usize;
+                expected[start..start + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })?;
+            let mut required = false;
+            for span in shard.plan(&requests, chunk)? {
+                if !shard.direct && span.last == span.first + 1 {
+                    eligible += 1;
+                } else {
+                    staged += 1;
+                    required = true;
+                }
+            }
+            staged_shards += usize::from(required);
+        }
+        let parts: Vec<_> = ranges
+            .iter()
+            .map(|(offset, native)| (*offset, native))
+            .collect();
+        let mut actual = vec![0xa5; slot_bytes];
+        let before = ALIGNED_ALLOCATIONS.with(Cell::get);
+        reader.read_parts(&parts, &mut actual, chunk)?;
+        let allocations = ALIGNED_ALLOCATIONS.with(Cell::get) - before;
+        assert_eq!(
+            actual, expected,
+            "native destination bytes differ from staged reads"
+        );
+        let staging = reader.staging.take();
+        if staged == 0 {
+            assert!(staging.is_none(), "single buffered spans allocated staging");
+        } else {
+            assert!(staging.is_some(), "gather/direct spans did not use staging");
+        }
+        reader.staging.set(staging);
+        assert!(
+            allocations <= staged_shards,
+            "native staging grew within a shard: allocations={allocations} staged_shards={staged_shards}"
+        );
+        let mut shifted = parts;
+        shifted[0].0 += row_bytes;
+        actual.fill(0xa5);
+        reader.read_parts(&shifted, &mut actual, chunk)?;
+        assert_ne!(actual, expected, "one-row destination control escaped");
+        println!(
+            "PASS native_range_destination bytes={slot_bytes} eligible={eligible} staged={staged} staging_allocations={allocations} byte_mismatches=0 row_control={row_bytes} guards=true"
+        );
+        Ok((eligible, staged))
+    }
+
+    #[test]
+    fn range_spans_preserve_destination_bytes() -> Result<()> {
+        let dir = temp_dir("span-destinations")?;
+        for (name, salt) in [("a", 17), ("b", 83)] {
+            let bytes: Vec<_> = (0..32789).map(|i| ((i + salt) % 251) as u8).collect();
+            std::fs::write(dir.path().join(name), bytes)?;
+        }
+        for direct in [false, true] {
+            for (case, requests) in [
+                vec![("a", 17, 8311, 64), ("a", 8328, 4093, 9000)],
+                vec![("a", 31, 37, 128), ("a", 33, 11, 64), ("a", 61, 7, 256)],
+                vec![("a", 32760, 29, 64), ("a", 7, 23, 256), ("a", 7, 23, 512)],
+                vec![("b", 3, 4111, 512), ("a", 123, 71, 64), ("a", 151, 23, 80)],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let shards = ["a", "b"]
+                    .into_iter()
+                    .filter(|name| requests.iter().any(|r| r.0 == *name))
+                    .map(|name| {
+                        Ok((
+                            name.to_owned(),
+                            SpanReader::open(&dir.path().join(name), direct)?,
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                let reader = DiskReader {
+                    shards,
+                    per_expert: 0,
+                    ring: Vec::new(),
+                    next: Cell::new(0),
+                    staging: Cell::new(None),
+                };
+                let ranges: Vec<_> = requests
+                    .iter()
+                    .map(|&(name, offset, len, destination)| {
+                        (
+                            destination,
+                            NativeRange {
+                                shard: name.into(),
+                                offset,
+                                len,
+                            },
+                        )
+                    })
+                    .collect();
+                let counts = compare_range_reads(&reader, &ranges, 16384, 8192, 32)?;
+                if !direct && case == 0 {
+                    assert_eq!(counts, (2, 0));
+                }
+                if !direct && case == 1 {
+                    assert_eq!(counts, (0, 1));
+                }
+                let invalid = NativeRange {
+                    shard: "a".into(),
+                    offset: 32788,
+                    len: 2,
+                };
+                assert!(
+                    reader
+                        .read_parts(&[(0, &invalid)], &mut [0; 32], 8192)
+                        .is_err()
+                );
+                assert!(
+                    reader
+                        .read_parts(&[(32, &ranges[0].1)], &mut [0; 32], 8192)
+                        .is_err()
+                );
+                assert!(
+                    reader
+                        .read_parts(&[(0, &ranges[0].1)], &mut [0; 16384], 0)
+                        .is_err()
+                );
+            }
+        }
+        let reader = DiskReader {
+            shards: [(
+                "a".to_owned(),
+                SpanReader::open(&dir.path().join("a"), false)?,
+            )]
+            .into(),
+            per_expert: 0,
+            ring: Vec::new(),
+            next: Cell::new(0),
+            staging: Cell::new(None),
+        };
+        OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("a"))?
+            .set_len(3)?;
+        let native = NativeRange {
+            shard: "a".into(),
+            offset: 17,
+            len: 8311,
+        };
+        assert!(
+            reader
+                .read_parts(&[(64, &native)], &mut vec![0; 16384], 8192)
+                .is_err()
+        );
+        assert!(reader.staging.take().is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU production-size native range identity and staging capacity"]
+    fn production_text_ranges_preserve_bytes_without_staging() -> Result<()> {
+        use std::io::Write;
+        let dir = temp_dir("text-spans")?;
+        let mut file = File::create(dir.path().join("text"))?;
+        let lengths = [
+            262144000u64,
+            262144000,
+            262144000,
+            10485760,
+            83886080,
+            83886080,
+            10485760,
+        ];
+        let extent = 17 + lengths.iter().sum::<u64>();
+        let mut at = 0;
+        while at < extent {
+            let n = (1024 * 1024).min((extent - at) as usize);
+            let bytes: Vec<_> = (0..n).map(|i| ((at + i as u64) % 251) as u8).collect();
+            file.write_all(&bytes)?;
+            at += n as u64;
+        }
+        drop(file);
+        let reader = DiskReader {
+            shards: [(
+                "text".to_owned(),
+                SpanReader::open(&dir.path().join("text"), false)?,
+            )]
+            .into(),
+            per_expert: 0,
+            ring: Vec::new(),
+            next: Cell::new(0),
+            staging: Cell::new(None),
+        };
+        let mut offset = 17;
+        let mut destination = 64;
+        let ranges: Vec<_> = lengths
+            .into_iter()
+            .map(|len| {
+                let pair = (
+                    destination,
+                    NativeRange {
+                        shard: "text".into(),
+                        offset,
+                        len,
+                    },
+                );
+                offset += len;
+                destination += len;
+                pair
+            })
+            .collect();
+        assert_eq!(lengths.iter().sum::<u64>(), 975175680);
+        assert_eq!(
+            lengths
+                .iter()
+                .map(|n| n.div_ceil(32 * 1024 * 1024))
+                .sum::<u64>(),
+            32
+        );
+        assert_eq!(
+            compare_range_reads(
+                &reader,
+                &ranges,
+                destination as usize + 10240 + 64,
+                32 * 1024 * 1024,
+                10240
+            )?,
+            (7, 0)
+        );
         Ok(())
     }
 
