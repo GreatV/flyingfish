@@ -6661,6 +6661,82 @@ impl TrellisImageConditioner {
         self.read_stages(captured_blocks)
     }
 
+    /// The definition preprocess chain (trellis2_image_to_3d.py:135-158): alpha>204
+    /// bounding box, square side `int(size * factor)`, float center crop box with
+    /// python `round` coordinates and zero padding outside the image, then F32
+    /// alpha premultiplication with u8 truncation. `factor` is the audit control
+    /// site (`size = int(size * 1)` in the definition).
+    pub fn preprocess_rgba(
+        rgba_hwc_u8: &[u8],
+        shape: [usize; 3],
+        factor: f64,
+    ) -> Result<(Vec<u8>, [usize; 2])> {
+        let [height, width, channels] = shape;
+        ensure!(
+            height > 0 && width > 0 && channels == 4 && rgba_hwc_u8.len() == height * width * 4,
+            "preprocess RGBA extent mismatch"
+        );
+        let mut x_min = usize::MAX;
+        let mut y_min = usize::MAX;
+        let mut x_max = 0usize;
+        let mut y_max = 0usize;
+        for y in 0..height {
+            for x in 0..width {
+                if rgba_hwc_u8[(y * width + x) * 4 + 3] > 204 {
+                    x_min = x_min.min(x);
+                    y_min = y_min.min(y);
+                    x_max = x.max(x_max);
+                    y_max = y.max(y_max);
+                }
+            }
+        }
+        ensure!(x_min <= x_max && y_min <= y_max, "empty alpha mask");
+        let span = (x_max - x_min).max(y_max - y_min);
+        let size = (span as f64 * factor).trunc() as i64;
+        ensure!(size > 0, "degenerate crop side");
+        let half = (size / 2) as f64;
+        let center_x = (x_min + x_max) as f64 / 2.0;
+        let center_y = (y_min + y_max) as f64 / 2.0;
+        let round = |value: f64| -> i64 {
+            let floor = value.floor();
+            match (value - floor, (floor as i64) % 2) {
+                (fraction, _) if fraction != 0.5 => value.round() as i64,
+                (_, 0) => floor as i64,
+                _ => floor as i64 + 1,
+            }
+        };
+        let left = round(center_x - half);
+        let top = round(center_y - half);
+        let right = round(center_x + half);
+        let bottom = round(center_y + half);
+        ensure!(right > left && bottom > top, "empty crop box");
+        let crop_w = (right - left) as usize;
+        let crop_h = (bottom - top) as usize;
+        let mut output = vec![0u8; crop_w * crop_h * 3];
+        for y in 0..crop_h {
+            let source_y = top + y as i64;
+            let inside_y = (0..height as i64).contains(&source_y);
+            for x in 0..crop_w {
+                let source_x = left + x as i64;
+                let inside = inside_y && (0..width as i64).contains(&source_x);
+                let dst = (y * crop_w + x) * 3;
+                if inside {
+                    let src = ((source_y as usize) * width + source_x as usize) * 4;
+                    let rgb = [
+                        f32::from(rgba_hwc_u8[src]) / 255.0,
+                        f32::from(rgba_hwc_u8[src + 1]) / 255.0,
+                        f32::from(rgba_hwc_u8[src + 2]) / 255.0,
+                    ];
+                    let alpha = f32::from(rgba_hwc_u8[src + 3]) / 255.0;
+                    for (index, value) in rgb.iter().enumerate() {
+                        output[dst + index] = (value * alpha * 255.0) as u8;
+                    }
+                }
+            }
+        }
+        Ok((output, [crop_h, crop_w]))
+    }
+
     /// PIL LANCZOS resize (Fixed22), /255, HWC RGB to CHW F32
     /// (definition image_feature_extractor.py:109-112). The ImageNet normalization is
     /// applied by `stage_input` (dinov3_pack_normalized_chw), not here.
@@ -11211,18 +11287,130 @@ mod tests {
         let blocks: [usize; 3] = [0, 11, 23];
         let mut defects = 0usize;
         let mut scored = 0usize;
+        let project = env("FF_T2_PROJECT")?;
+        let decode_rgba = |path: &std::path::Path| -> Result<(Vec<u8>, [usize; 3])> {
+            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            let mut decoder = png::Decoder::new(reader);
+            decoder
+                .set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+            let mut reader = decoder.read_info()?;
+            let mut bytes = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+            let info = reader.next_frame(&mut bytes)?;
+            ensure!(
+                info.bit_depth == png::BitDepth::Eight && info.color_type == png::ColorType::Rgba,
+                "fixture RGBA decode mismatch: {}",
+                path.display()
+            );
+            let [w, h] = [info.width as usize, info.height as usize];
+            Ok((bytes, [h, w, 4]))
+        };
+        let original = |fixture: &str| -> Result<(Vec<u8>, [usize; 3])> {
+            let path = if fixture == "odd" {
+                project.join("evidence/T2-M0-r1/odd-rgba.png")
+            } else {
+                project.join(format!("fixtures/pixal3d/{fixture}.png"))
+            };
+            decode_rgba(&path)
+        };
+        let preprocess_audit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("preprocess-audit.json"))?)?;
+        let audit_cells = preprocess_audit["cells"]
+            .as_array()
+            .context("preprocess audit cells missing")?;
+        ensure!(audit_cells.len() == 6, "preprocess audit scope differs");
+        let mut crops: std::collections::BTreeMap<&'static str, (Vec<u8>, [usize; 2])> =
+            std::collections::BTreeMap::new();
+        for fixture in ["cottage", "robot_crab", "odd"] {
+            let (rgba, shape) = original(fixture)?;
+            let (crop, crop_shape) = TrellisImageConditioner::preprocess_rgba(&rgba, shape, 1.0)?;
+            let expected_crop = decode_image(
+                &std::fs::read(root.join(format!("conditioning-r0a/{fixture}-crop.png")))?,
+                Some("image/png"),
+            )?;
+            ensure!(
+                crop_shape == [expected_crop.height, expected_crop.width],
+                "{fixture} crop shape mismatch"
+            );
+            let crop_mismatches = crop
+                .iter()
+                .zip(expected_crop.pixels.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            println!("T2_M2_CROP_EXACT fixture={fixture} mismatches={crop_mismatches}");
+            defects += usize::from(crop_mismatches > 0);
+            scored += 1;
+            let (wrong_crop, wrong_shape) =
+                TrellisImageConditioner::preprocess_rgba(&rgba, shape, 1.1)?;
+            for side in [512u32, 1024] {
+                let baseline = resize_lanczos(
+                    &crop,
+                    [crop_shape[0], crop_shape[1], 3],
+                    [side as usize, side as usize],
+                    ResizeRounding::Fixed22,
+                )?;
+                let stored = decode_image(
+                    &std::fs::read(
+                        root.join(format!("conditioning-r0a/{fixture}-{side}-rgb.png")),
+                    )?,
+                    Some("image/png"),
+                )?;
+                let mismatches = baseline
+                    .iter()
+                    .zip(stored.pixels.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                println!(
+                    "T2_M2_PREPARATION_EXACT fixture={fixture} side={side} mismatches={mismatches}"
+                );
+                defects += usize::from(mismatches > 0);
+                scored += 1;
+                let control = resize_lanczos(
+                    &wrong_crop,
+                    [wrong_shape[0], wrong_shape[1], 3],
+                    [side as usize, side as usize],
+                    ResizeRounding::Fixed22,
+                )?;
+                let differences = control
+                    .iter()
+                    .zip(baseline.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let frozen = audit_cells
+                    .iter()
+                    .find(|c| c["fixture"] == fixture && c["side"].as_u64() == Some(side as u64))
+                    .with_context(|| format!("audit cell {fixture}/{side} missing"))?;
+                let frozen_control = frozen["control_differing_elements"]
+                    .as_u64()
+                    .context("frozen control")?;
+                println!(
+                    "T2_M2_PREPROCESS_CONTROL fixture={fixture} side={side} differences={differences} frozen={frozen_control} result={}",
+                    if differences == frozen_control as usize {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                defects += usize::from(differences != frozen_control as usize);
+                scored += 1;
+            }
+            crops.insert(
+                match fixture {
+                    "cottage" => "cottage",
+                    "robot_crab" => "robot_crab",
+                    _ => "odd",
+                },
+                (crop, crop_shape),
+            );
+        }
         for side in [512u32, 1024] {
             let mut conditioner =
                 TrellisImageConditioner::load(&device, &mut blas, &dino_dir, side, &blocks, limit)?;
             for fixture in ["cottage", "robot_crab"] {
                 let case = format!("{fixture}-{side}");
-                let crop = decode_image(
-                    &std::fs::read(root.join(format!("conditioning-r0a/{fixture}-crop.png")))?,
-                    Some("image/png"),
-                )?;
+                let (crop, crop_shape) = crops.get(fixture).context("native crop missing")?.clone();
                 let resized = resize_lanczos(
-                    &crop.pixels,
-                    [crop.height, crop.width, 3],
+                    &crop,
+                    [crop_shape[0], crop_shape[1], 3],
                     [side as usize, side as usize],
                     ResizeRounding::Fixed22,
                 )?;
@@ -11237,12 +11425,12 @@ mod tests {
                     .zip(expected.pixels.iter())
                     .filter(|(a, b)| a != b)
                     .count();
-                println!("T2_M2_PREPARATION_EXACT case={case} mismatches={mismatches}");
+                println!("T2_M2_PREPARATION_REPLAY case={case} mismatches={mismatches}");
                 defects += usize::from(mismatches > 0);
                 scored += 1;
                 let chw = TrellisImageConditioner::prepare_chw(
-                    &crop.pixels,
-                    [crop.height, crop.width, 3],
+                    &crop,
+                    [crop_shape[0], crop_shape[1], 3],
                     side,
                 )?;
                 let mean = [0.485f32, 0.456, 0.406];
