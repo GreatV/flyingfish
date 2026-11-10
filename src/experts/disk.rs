@@ -33,6 +33,8 @@ impl AlignedBytes {
         // SAFETY: the layout has a nonzero size and a power-of-two alignment.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
             .with_context(|| format!("allocate {bytes} B aligned buffer"))?;
+        #[cfg(test)]
+        tests::ALIGNED_ALLOCATIONS.with(|count| count.set(count.get() + 1));
         Ok(Self { ptr, layout })
     }
 
@@ -729,7 +731,27 @@ impl DiskReader {
                 } else {
                     chunk_bytes
                 };
-                for span in shard.plan(&requests, chunk)? {
+                let spans = shard.plan(&requests, chunk)?;
+                let mut needed = 0;
+                for span in &spans {
+                    if shard.direct || span.last > span.first + 1 {
+                        needed = needed.max(Self::aligned_staging_bytes(
+                            span.begin,
+                            span.end - span.begin,
+                            shard.alignment,
+                        )?);
+                    }
+                }
+                let align = usize::try_from(shard.alignment)?;
+                if needed > 0
+                    && staging
+                        .as_ref()
+                        .is_none_or(|buffer| buffer.len() < needed || buffer.alignment() < align)
+                {
+                    drop(staging.take());
+                    staging = Some(AlignedBytes::new(needed, align)?);
+                }
+                for span in spans {
                     if !shard.direct && span.last == span.first + 1 {
                         let index = indexes[span.first];
                         let (offset, native) = parts[index];
@@ -743,17 +765,6 @@ impl DiskReader {
                             at += bytes.len() as u64;
                         }
                     } else {
-                        let needed = Self::aligned_staging_bytes(
-                            span.begin,
-                            span.end - span.begin,
-                            shard.alignment,
-                        )?;
-                        let align = usize::try_from(shard.alignment)?;
-                        if staging.as_ref().is_none_or(|buffer| {
-                            buffer.len() < needed || buffer.alignment() < align
-                        }) {
-                            staging = Some(AlignedBytes::new(needed, align)?);
-                        }
                         let bytes = shard.read_span(
                             &span,
                             chunk,
@@ -1230,6 +1241,10 @@ mod tests {
     use crate::experts::catalogue::ExpertGeometry;
     use std::collections::BTreeMap;
 
+    std::thread_local! {
+        pub(super) static ALIGNED_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
             first_layer: 0,
@@ -1493,6 +1508,7 @@ mod tests {
         let mut expected = vec![0xa5; slot_bytes];
         let mut eligible = 0;
         let mut staged = 0;
+        let mut staged_shards = 0;
         for (name, shard) in &reader.shards {
             let indexes: Vec<_> = ranges
                 .iter()
@@ -1518,20 +1534,25 @@ mod tests {
                 expected[start..start + bytes.len()].copy_from_slice(bytes);
                 Ok(())
             })?;
+            let mut required = false;
             for span in shard.plan(&requests, chunk)? {
                 if !shard.direct && span.last == span.first + 1 {
                     eligible += 1;
                 } else {
                     staged += 1;
+                    required = true;
                 }
             }
+            staged_shards += usize::from(required);
         }
         let parts: Vec<_> = ranges
             .iter()
             .map(|(offset, native)| (*offset, native))
             .collect();
         let mut actual = vec![0xa5; slot_bytes];
+        let before = ALIGNED_ALLOCATIONS.with(Cell::get);
         reader.read_parts(&parts, &mut actual, chunk)?;
+        let allocations = ALIGNED_ALLOCATIONS.with(Cell::get) - before;
         assert_eq!(
             actual, expected,
             "native destination bytes differ from staged reads"
@@ -1543,13 +1564,17 @@ mod tests {
             assert!(staging.is_some(), "gather/direct spans did not use staging");
         }
         reader.staging.set(staging);
+        assert!(
+            allocations <= staged_shards,
+            "native staging grew within a shard: allocations={allocations} staged_shards={staged_shards}"
+        );
         let mut shifted = parts;
         shifted[0].0 += row_bytes;
         actual.fill(0xa5);
         reader.read_parts(&shifted, &mut actual, chunk)?;
         assert_ne!(actual, expected, "one-row destination control escaped");
         println!(
-            "PASS native_range_destination bytes={slot_bytes} eligible={eligible} staged={staged} byte_mismatches=0 row_control={row_bytes} guards=true"
+            "PASS native_range_destination bytes={slot_bytes} eligible={eligible} staged={staged} staging_allocations={allocations} byte_mismatches=0 row_control={row_bytes} guards=true"
         );
         Ok((eligible, staged))
     }
