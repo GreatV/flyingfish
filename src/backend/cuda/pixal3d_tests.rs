@@ -5740,7 +5740,42 @@ fn flow_padded_identity(
         flow.blocks.len()
     );
     *defects += usize::from(bits != 0);
-    flow_context_identity(flow, input, condition, output, &compact, defects)
+    flow_context_identity(flow, input, condition, output, &compact, defects)?;
+    flow_bias_identity(flow, input, condition, output, &compact, defects)
+}
+
+pub(super) fn flow_bias_identity(
+    flow: &mut Flow<f16>,
+    input: &CudaSlice<f32>,
+    condition: &Conditioning<f16>,
+    output: &mut CudaSlice<f32>,
+    compact: &[f32],
+    defects: &mut usize,
+) -> Result<()> {
+    flow.kernels.bias_reference = true;
+    let result = flow.forward(input, 0, condition, output);
+    flow.kernels.bias_reference = false;
+    result?;
+    let original = flow.device.stream.clone_dtoh(output)?;
+    ensure!(
+        compact.len() == original.len() && compact.iter().chain(&original).all(|x| x.is_finite()),
+        "non-finite producer bias velocity comparison"
+    );
+    let bits: u64 = compact
+        .iter()
+        .zip(&original)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_PRODUCER_BIAS_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} cached={} threshold_bits=0",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len(),
+        flow.context_cache.is_some()
+    );
+    *defects += usize::from(bits != 0);
+    flow.device.stream.memcpy_htod(compact, output)?;
+    Ok(())
 }
 
 pub(super) fn flow_context_identity(
@@ -11366,4 +11401,641 @@ fn generation_run(
         result.material.coordinates.len()
     );
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn bias_pattern(index: usize, tag: usize) -> f16 {
+    let mut word = ((index * 251 + tag * 4051) % 65521) as u32;
+    word ^= word >> 7;
+    word = word.wrapping_mul(0x9e37_79b9);
+    word ^= word >> 16;
+    f16::from_bits((((word >> 16) & 0x8000) | ((8 + word % 7) << 10) | ((word >> 7) & 1023)) as u16)
+}
+
+#[cfg(feature = "cuda")]
+fn bias_guarded_output(d: &Device, output: &CudaSlice<f16>, count: usize) -> Result<Vec<f16>> {
+    let values = d.stream.clone_dtoh(output)?;
+    ensure!(
+        values.len() == count + 16
+            && values[..8]
+                .iter()
+                .chain(&values[8 + count..])
+                .all(|v| *v == f16::from_f32(-123.0)),
+        "F16 biased linear output guard failure"
+    );
+    ensure!(
+        values[8..8 + count].iter().all(|v| v.is_finite()),
+        "nonfinite F16 biased linear output"
+    );
+    Ok(values[8..8 + count].to_vec())
+}
+
+#[cfg(feature = "cuda")]
+fn producer_graph_resources(graph: &cudarc::driver::CudaGraph) -> Result<Vec<Value>> {
+    use cudarc::driver::sys::{self, CUfunction_attribute as A, CUgraphNodeType as N};
+    let mut count = 0;
+    unsafe {
+        sys::cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut count).result()?;
+    }
+    let mut nodes = vec![std::ptr::null_mut(); count];
+    unsafe {
+        sys::cuGraphGetNodes(graph.cu_graph(), nodes.as_mut_ptr(), &mut count).result()?;
+    }
+    let mut result = Vec::new();
+    for node in nodes.into_iter().take(count) {
+        unsafe {
+            let mut kind = N::CU_GRAPH_NODE_TYPE_EMPTY;
+            sys::cuGraphNodeGetType(node, &mut kind).result()?;
+            if kind != N::CU_GRAPH_NODE_TYPE_KERNEL {
+                ensure!(
+                    matches!(
+                        kind,
+                        N::CU_GRAPH_NODE_TYPE_MEM_ALLOC | N::CU_GRAPH_NODE_TYPE_MEM_FREE
+                    ),
+                    "producer graph unexpected node {kind:?}"
+                );
+                result.push(serde_json::json!({"kind":format!("{kind:?}")}));
+                continue;
+            }
+            let mut params = std::mem::MaybeUninit::uninit();
+            sys::cuGraphKernelNodeGetParams_v2(node, params.as_mut_ptr()).result()?;
+            let params = params.assume_init();
+            let mut function = params.func;
+            if function.is_null() {
+                ensure!(!params.kern.is_null(), "producer graph kernel missing");
+                sys::cuKernelGetFunction(&mut function, params.kern).result()?;
+            }
+            let mut name = std::ptr::null();
+            sys::cuFuncGetName(&mut name, function).result()?;
+            ensure!(!name.is_null(), "producer graph kernel name missing");
+            let name = std::ffi::CStr::from_ptr(name).to_str()?;
+            let phase = match name {
+                "q38_bias_fill_f16" => "bias_fill",
+                "layer_norm_modulate_f16"
+                | "gated_add_layer_norm_f16"
+                | "residual_layer_norm_modulate_f16"
+                | "q38_gelu_f16"
+                | "layer_norm_modulate_bias_f16"
+                | "gated_add_layer_norm_bias_f16"
+                | "residual_layer_norm_modulate_bias_f16"
+                | "gelu_bias_fill_f16" => "producer",
+                _ => "vendor",
+            };
+            let attribute = |key| -> Result<i32> {
+                let mut value = 0;
+                sys::cuFuncGetAttribute(&mut value, key, function).result()?;
+                Ok(value)
+            };
+            let threads = params.blockDimX * params.blockDimY * params.blockDimZ;
+            let mut blocks = 0;
+            sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                &mut blocks,
+                function,
+                threads as i32,
+                params.sharedMemBytes as usize,
+            )
+            .result()?;
+            result.push(
+                serde_json::json!({"kind":"kernel","function":name,"phase":phase,
+                "registers":attribute(A::CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+                "local_bytes":attribute(A::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
+                "static_shared_bytes":attribute(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?,
+                "dynamic_shared_bytes":params.sharedMemBytes,
+                "grid":[params.gridDimX,params.gridDimY,params.gridDimZ],
+                "block":[params.blockDimX,params.blockDimY,params.blockDimZ],
+                "active_blocks":blocks,"active_warps":blocks * (threads as i32 / 32)}),
+            );
+        }
+    }
+    result.sort_by_key(Value::to_string);
+    Ok(result)
+}
+
+#[cfg(feature = "cuda")]
+struct ProducerCase<'a> {
+    device: &'a Device,
+    kernels: &'a Kernels,
+    plan: ProducerBias,
+    fill: &'a CudaFunction,
+    site: usize,
+    linear: Linear<f16>,
+    initial: Vec<f16>,
+    hidden: CudaSlice<f16>,
+    delta: CudaSlice<f16>,
+    normalized: CudaSlice<f16>,
+    output: CudaSlice<f16>,
+    parameters: [CudaSlice<f32>; 3],
+}
+
+#[cfg(feature = "cuda")]
+impl ProducerCase<'_> {
+    fn reset(&mut self) -> Result<()> {
+        self.device
+            .stream
+            .memcpy_htod(&self.initial, &mut self.hidden)?;
+        Ok(())
+    }
+    fn produce(&self, fused: bool) -> Result<()> {
+        let d = self.device;
+        let values = ptr(&self.hidden, d) + 16;
+        let output = ptr(&self.output, d) + 16;
+        if self.site == 3 {
+            if fused {
+                return self.plan.gelu(d, values, output, self.linear.bias.ptr);
+            }
+            let width = 4 * self.plan.width;
+            unsafe {
+                d.stream
+                    .launch_builder(&self.kernels.gelu)
+                    .arg(&values)
+                    .arg(&values)
+                    .arg(&self.plan.rows)
+                    .arg(&1u32)
+                    .arg(&width)
+                    .arg(&u64::from(width))
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&u64::from(width))
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&1i32)
+                    .launch(self.plan.grids[3])?;
+            }
+        } else {
+            let part = [0, 2, 3][self.site];
+            let affine = if self.site == 1 {
+                [ptr(&self.parameters[1], d), ptr(&self.parameters[2], d)]
+            } else {
+                [0, 0]
+            };
+            let inputs = [
+                values,
+                ptr(&self.delta, d),
+                ptr(&self.parameters[0], d) + (part * 2112 * 4) as u64,
+                affine[0],
+                affine[1],
+            ];
+            let normalized = ptr(&self.normalized, d) + 16;
+            if fused {
+                return self.plan.row(
+                    d,
+                    inputs,
+                    [normalized, output, self.linear.bias.ptr],
+                    self.site,
+                );
+            }
+            self.kernels.prepare_row_norm(
+                d,
+                inputs,
+                normalized,
+                [self.plan.rows as usize, 2112],
+                self.site,
+            )?;
+        }
+
+        unsafe {
+            d.stream
+                .launch_builder(self.fill)
+                .arg(&output)
+                .arg(&self.linear.bias.ptr)
+                .arg(&(u64::from(self.plan.rows) * u64::from(self.plan.output_widths[self.site])))
+                .arg(&self.plan.output_widths[self.site])
+                .launch(grid(
+                    (self.plan.rows as usize * self.plan.output_widths[self.site] as usize)
+                        .div_ceil(256)
+                        .min(65535),
+                    256,
+                ))?;
+        }
+        Ok(())
+    }
+    fn gemm(&self, blas: &Blas) -> Result<()> {
+        let input = if self.site == 3 {
+            &self.hidden
+        } else {
+            &self.normalized
+        };
+        self.linear.run_prefilled(
+            blas,
+            self.plan.rows as usize,
+            ptr(input, self.device) + 16,
+            ptr(&self.output, self.device) + 16,
+        )
+    }
+    fn snapshot(&self, blas: &Blas, fused: bool) -> Result<Vec<Vec<f16>>> {
+        self.produce(fused)?;
+        let d = self.device;
+        let input_count = self.plan.rows as usize * self.linear.weight.shape[1] as usize;
+        let mut result = vec![bias_guarded_output(d, &self.hidden, input_count)?];
+        if self.site != 3 {
+            result.push(bias_guarded_output(d, &self.normalized, input_count)?);
+        }
+        result.push(bias_guarded_output(
+            d,
+            &self.output,
+            self.plan.rows as usize * self.plan.output_widths[self.site] as usize,
+        )?);
+        self.gemm(blas)?;
+        result.push(bias_guarded_output(
+            d,
+            &self.output,
+            self.plan.rows as usize * self.plan.output_widths[self.site] as usize,
+        )?);
+        Ok(result)
+    }
+    fn capture(&self, blas: &Blas, fused: bool, gemm: bool) -> Result<cudarc::driver::CudaGraph> {
+        use cudarc::driver::sys;
+        self.device.finish_upload()?;
+        self.device
+            .stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let launch = self
+            .produce(fused)
+            .and_then(|_| if gemm { self.gemm(blas) } else { Ok(()) });
+        let graph = self
+            .device
+            .stream
+            .end_capture(sys::CUgraphInstantiate_flags(0));
+        launch?;
+        graph?.context("producer graph missing")
+    }
+    fn graph_output(&self) -> Result<Vec<Vec<f16>>> {
+        let input_count = self.plan.rows as usize * self.linear.weight.shape[1] as usize;
+        let mut result = vec![bias_guarded_output(self.device, &self.hidden, input_count)?];
+        if self.site != 3 {
+            result.push(bias_guarded_output(
+                self.device,
+                &self.normalized,
+                input_count,
+            )?);
+        }
+        result.push(bias_guarded_output(
+            self.device,
+            &self.output,
+            self.plan.rows as usize * self.plan.output_widths[self.site] as usize,
+        )?);
+        Ok(result)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn producer_snapshot_bits(expected: &[Vec<f16>], actual: &[Vec<f16>]) -> Result<u64> {
+    ensure!(
+        expected.len() == actual.len(),
+        "producer snapshot planes differ"
+    );
+    expected
+        .iter()
+        .zip(actual)
+        .try_fold(0, |sum, (a, b)| Ok(sum + context_projection_bits(a, b)?))
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and published Hi3D F16 checkpoints"]
+fn hi3d_producer_bias_published_identity_gpu() -> Result<()> {
+    producer_bias_identity(true)
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and FF_F16_QKV_FIXTURES configs"]
+fn hi3d_producer_bias_synthetic_identity_gpu() -> Result<()> {
+    producer_bias_identity(false)
+}
+
+#[cfg(feature = "cuda")]
+fn producer_bias_identity(published: bool) -> Result<()> {
+    let d = Device::new(0)?;
+    let ops = Ops::new(&d.ctx)?;
+    let fill = cubin::module(&d.ctx, "q38_common")?.load_function("q38_bias_fill_f16")?;
+    let mut blas = Blas::new(
+        &d,
+        &ops,
+        &env_path("FLYINGFISH_RUNTIME_DIR")?,
+        Rc::new(Closure::new(true, "F16 producer bias gate".into())),
+    )?;
+    blas.prepare_f16_biased()?;
+    let fixture: Value = if published {
+        Value::Null
+    } else {
+        serde_json::from_slice(&std::fs::read(
+            env_path("FF_F16_QKV_FIXTURES")?.join("qkv.json"),
+        )?)?
+    };
+    let (mut cells, mut defects, mut resource_failures) = (0, 0, 0);
+    for (owner, component) in ["transformer_512", "transformer_1024"]
+        .into_iter()
+        .enumerate()
+    {
+        let checkpoint = if published {
+            Some(Hi3DFlowCheckpoint::open(
+                &env_path("FF_HI3D_MODEL")?,
+                component,
+            )?)
+        } else {
+            None
+        };
+        let spec = if let Some(c) = &checkpoint {
+            c.spec.flow_spec()
+        } else {
+            ensure!(
+                fixture["models"][owner]["component"] == component,
+                "producer fixture component differs"
+            );
+            serde_json::from_value::<crate::pixal3d::Hi3DFlowSpec>(
+                fixture["models"][owner]["config"].clone(),
+            )?
+            .flow_spec()
+        };
+        ensure!(
+            spec.model_channels == 2112
+                && spec.num_heads == 22
+                && spec.num_blocks == 24
+                && spec.feed_forward_width() == 8448,
+            "producer published geometry differs"
+        );
+        let kernels = Kernels::load::<f16>(&d, &spec)?;
+        let tensors = checkpoint
+            .as_ref()
+            .map(|c| c.mapped.component_tensors())
+            .transpose()?;
+        for block in 0..24 {
+            for (site, (name, input, output)) in [
+                ("self_attn.to_qkv", 2112, 6336),
+                ("cross_attn.to_q", 2112, 2112),
+                ("mlp.mlp.0", 2112, 8448),
+                ("mlp.mlp.2", 8448, 2112),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let tag = 1 + owner * 24 * 4 + block * 4 + site;
+                let load = |name: &str, shape: &[usize]| -> Result<Vec<f16>> {
+                    let count: usize = shape.iter().product();
+                    if let Some(tensors) = &tensors {
+                        let key = format!("blocks.{block}.{name}");
+                        let tensor = tensors
+                            .get(&key)
+                            .with_context(|| format!("missing producer tensor {key}"))?;
+                        ensure!(
+                            tensor.dtype == "F16"
+                                && tensor.shape == shape
+                                && tensor.data.len() == 2 * count,
+                            "producer F16 tensor layout {key}"
+                        );
+                        let values: Vec<_> = tensor
+                            .data
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| f16::from_le_bytes(*b))
+                            .collect();
+                        ensure!(
+                            values.iter().all(|v| v.is_finite()),
+                            "nonfinite producer weight"
+                        );
+                        Ok(values)
+                    } else {
+                        Ok((0..count)
+                            .map(|i| bias_pattern(i, tag + name.len() * 701))
+                            .collect())
+                    }
+                };
+                let load_parameter = |name: &str, count: usize| -> Result<CudaSlice<f32>> {
+                    let values = if let Some(tensors) = &tensors {
+                        let key = format!("blocks.{block}.{name}");
+                        let tensor = tensors
+                            .get(&key)
+                            .with_context(|| format!("missing producer parameter {key}"))?;
+                        ensure!(
+                            tensor.dtype == "F32"
+                                && tensor.shape
+                                    == if name == "modulation" {
+                                        vec![1, count]
+                                    } else {
+                                        vec![count]
+                                    }
+                                && tensor.data.len() == 4 * count,
+                            "producer parameter layout {key}"
+                        );
+                        tensor
+                            .data
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_le_bytes(*b))
+                            .collect::<Vec<_>>()
+                    } else {
+                        (0..count)
+                            .map(|i| f32::from(bias_pattern(i, tag + name.len() * 13)) / 8.0)
+                            .collect()
+                    };
+                    ensure!(
+                        values.iter().all(|v| v.is_finite()),
+                        "nonfinite producer parameter"
+                    );
+                    Ok(d.stream.clone_htod(&values)?)
+                };
+                let weight = d
+                    .stream
+                    .clone_htod(&load(&format!("{name}.weight"), &[output, input])?)?;
+                let bias = d
+                    .stream
+                    .clone_htod(&load(&format!("{name}.bias"), &[output])?)?;
+                let linear = Linear {
+                    weight: dense(&weight, &d, [output as u32, input as u32])?,
+                    bias: dense(&bias, &d, [output as u32])?,
+                };
+                for rows in [1usize, 257, 2548, 13019, 22775] {
+                    let guard = f16::from_f32(-123.0);
+                    let mut initial = vec![guard; rows * input + 16];
+                    for (i, value) in initial[8..8 + rows * input].iter_mut().enumerate() {
+                        *value = bias_pattern(i, tag + 313);
+                    }
+                    let mut case = ProducerCase {
+                        device: &d,
+                        kernels: &kernels,
+                        plan: ProducerBias::new(&d, rows, 2112)?,
+                        fill: &fill,
+                        site,
+                        linear,
+                        hidden: d.stream.clone_htod(&initial)?,
+                        initial,
+                        delta: d.stream.clone_htod(
+                            &(0..rows * 2112)
+                                .map(|i| bias_pattern(i, tag + 977))
+                                .collect::<Vec<_>>(),
+                        )?,
+                        normalized: d.stream.clone_htod(&vec![guard; rows * input + 16])?,
+                        output: d.stream.clone_htod(&vec![guard; rows * output + 16])?,
+                        parameters: [
+                            load_parameter("modulation", 12672)?,
+                            load_parameter("norm2.weight", 2112)?,
+                            load_parameter("norm2.bias", 2112)?,
+                        ],
+                    };
+                    let expected = case.snapshot(&blas, false)?;
+                    case.reset()?;
+                    let repeat = case.snapshot(&blas, false)?;
+                    ensure!(
+                        producer_snapshot_bits(&expected, &repeat)? == 0,
+                        "producer old repeat differs"
+                    );
+                    drop(repeat);
+                    case.reset()?;
+                    let actual = case.snapshot(&blas, true)?;
+                    let eager_bits = producer_snapshot_bits(&expected, &actual)?;
+                    drop(actual);
+                    case.reset()?;
+                    let old_preparation = case.capture(&blas, false, false)?;
+                    old_preparation.launch()?;
+                    ensure!(
+                        producer_snapshot_bits(
+                            &expected[..expected.len() - 1],
+                            &case.graph_output()?
+                        )? == 0,
+                        "producer old initialization graph differs"
+                    );
+                    case.reset()?;
+                    let new_preparation = case.capture(&blas, true, false)?;
+                    new_preparation.launch()?;
+                    let graph_prepare_bits = producer_snapshot_bits(
+                        &expected[..expected.len() - 1],
+                        &case.graph_output()?,
+                    )?;
+                    let mut graph_expected = expected;
+                    let bias_plane = graph_expected.len() - 2;
+                    graph_expected.remove(bias_plane);
+                    case.reset()?;
+                    let old_graph = case.capture(&blas, false, true)?;
+                    let old_resources = producer_graph_resources(&old_graph)?;
+                    old_graph.launch()?;
+                    ensure!(
+                        producer_snapshot_bits(&graph_expected, &case.graph_output()?)? == 0,
+                        "producer old graph differs"
+                    );
+                    case.reset()?;
+                    let new_graph = case.capture(&blas, true, true)?;
+                    let new_resources = producer_graph_resources(&new_graph)?;
+                    new_graph.launch()?;
+                    let graph_bits =
+                        producer_snapshot_bits(&graph_expected, &case.graph_output()?)?;
+                    let select = |resources: &[Value], phase: &str| {
+                        resources
+                            .iter()
+                            .filter(|r| r["phase"] == phase)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+                    let old_producers = select(&old_resources, "producer");
+                    let new_producers = select(&new_resources, "producer");
+                    ensure!(
+                        old_producers.len() == 1
+                            && new_producers.len() == 1
+                            && select(&old_resources, "bias_fill").len() == 1
+                            && select(&new_resources, "bias_fill").is_empty(),
+                        "producer fusion graph launch counts differ"
+                    );
+                    let vendor_equal = select(&old_resources, "vendor")
+                        == select(&new_resources, "vendor")
+                        && old_resources
+                            .iter()
+                            .filter(|r| r["kind"] != "kernel")
+                            .eq(new_resources.iter().filter(|r| r["kind"] != "kernel"));
+                    let resources_valid = new_producers[0]["local_bytes"] == 0
+                        && new_producers[0]["active_warps"].as_i64()
+                            >= old_producers[0]["active_warps"].as_i64();
+                    let defect = eager_bits != 0
+                        || graph_bits != 0
+                        || graph_prepare_bits != 0
+                        || !vendor_equal;
+                    defects += usize::from(defect);
+                    resource_failures += usize::from(!resources_valid);
+                    cells += 1;
+                    println!(
+                        "{} F16_PRODUCER_BIAS_IDENTITY published={published} owner={owner} block={block} role={site} rows={rows} input={input} output={output} eager_bits={eager_bits} graph_bits={graph_bits} graph_prepare_bits={graph_prepare_bits} vendor_equal={vendor_equal} old_repeat_bits=0 old_graph_bits=0 resources_valid={resources_valid} old_resources={} candidate_resources={} threshold_bits=0",
+                        if defect { "DEFECT" } else { "PASS" },
+                        serde_json::json!(old_resources),
+                        serde_json::json!(new_resources)
+                    );
+                }
+            }
+        }
+    }
+    let control = producer_bias_index_control(&d)?;
+    defects += usize::from(!control);
+    println!(
+        "F16_PRODUCER_BIAS_RESULT published={published} cells={cells} controls=1 defects={defects} resource_failures={resource_failures} threshold_bits=0 timing=false"
+    );
+    ensure!(cells == 960, "producer cell count differs");
+    ensure!(
+        resource_failures == 0,
+        "producer resource failures={resource_failures}"
+    );
+    ensure!(defects == 0, "producer finite defects={defects}");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn producer_bias_index_control(d: &Device) -> Result<bool> {
+    let rows = 257usize;
+    let h = 2112usize;
+    let plan = ProducerBias::new(d, rows, h)?;
+    let correct: Vec<_> = (0..3 * h).map(|i| bias_pattern(i, 991)).collect();
+    let wrong: Vec<_> = (0..3 * h)
+        .map(|i| {
+            correct[if i < h {
+                i
+            } else if i < 2 * h {
+                i + h
+            } else {
+                i - h
+            }]
+        })
+        .collect();
+    let expected: Vec<_> = (0..rows * 3 * h).map(|i| correct[i % (3 * h)]).collect();
+    let mutant: Vec<_> = (0..rows * 3 * h).map(|i| wrong[i % (3 * h)]).collect();
+    let margin = context_projection_bits(&expected, &mutant)?;
+    ensure!(
+        margin > 0,
+        "producer control reference does not discriminate planes"
+    );
+    let hidden = d.stream.alloc_zeros::<f16>(rows * h)?;
+    let normalized = d.stream.alloc_zeros::<f16>(rows * h)?;
+    let output = d
+        .stream
+        .clone_htod(&vec![f16::from_f32(-123.0); rows * 3 * h + 16])?;
+    let modulation = d.stream.alloc_zeros::<f32>(6 * h)?;
+    let inputs = [ptr(&hidden, d), 0, ptr(&modulation, d), 0, 0];
+    let destination = [ptr(&normalized, d), ptr(&output, d) + 16, 0];
+    let mut observed = Vec::new();
+    for bias in [&correct, &wrong] {
+        let bias = d.stream.clone_htod(bias)?;
+        plan.row(
+            d,
+            inputs,
+            [destination[0], destination[1], ptr(&bias, d)],
+            0,
+        )?;
+        observed.push(bias_guarded_output(d, &output, rows * 3 * h)?);
+    }
+    let positive = context_projection_bits(&expected, &observed[0])?;
+    let changed = context_projection_bits(&expected, &observed[1])?;
+    let prefix: u64 = (0..rows)
+        .map(|r| {
+            context_projection_bits(
+                &expected[r * 3 * h..r * 3 * h + h],
+                &observed[1][r * 3 * h..r * 3 * h + h],
+            )
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .sum();
+    let valid = positive == 0 && changed == margin && prefix == 0;
+    println!(
+        "{} F16_PRODUCER_BIAS_INDEX_CONTROL positive_bits={positive} mutant_bits={changed} reference_margin_bits={margin} unchanged_plane0_bits={prefix} threshold_bits=0",
+        if valid { "PASS" } else { "DEFECT" }
+    );
+    Ok(valid)
 }

@@ -734,6 +734,13 @@ extern "C" __global__ void q38_gelu_f16(
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
     q38_gelu_impl(x,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,mode);
 }
+extern "C" __global__ void gelu_bias_fill_f16(
+    __half* values, __half* output, const __half* bias, uint32_t rows,
+    uint32_t width, uint32_t output_width) {
+    if (!output || !bias || !output_width) { __trap(); return; }
+    q38_gelu_impl(values, values, rows, 1, width, width, 0, 1, width, 0, 1, 1);
+    q38_bias_f16_impl<true>(output, bias, uint64_t(rows) * output_width, output_width);
+}
 extern "C" __global__ void q38_gelu_f32(
     const float* x,float* y,uint32_t rows,uint32_t heads,uint32_t width,
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
@@ -1307,16 +1314,20 @@ extern "C" __global__ void q38_layer_norm_f16_fma(
     q38_layer_norm_f32_impl<__half, __half, true>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
 
-template <int UPDATE>
+template <int UPDATE, bool BIAS_FILL = false>
 __device__ __forceinline__ void layer_norm_row_f16(
     __half* hidden, const __half* projected, const float* modulation,
     const float* weight, const float* bias, __half* output,
     uint32_t rows, uint32_t width, float eps) {
     if (!hidden || !modulation || !output || !rows || !width || width > 2304 ||
         blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
-        gridDim.x != rows || gridDim.y != 1 || gridDim.z != 1 || !(eps > 0) ||
+        (BIAS_FILL ? gridDim.x < rows : gridDim.x != rows) ||
+        gridDim.y != 1 || gridDim.z != 1 || !(eps > 0) ||
         (UPDATE != 0 && !projected) || (UPDATE == 1 && (!weight || !bias))) {
         __trap(); return;
+    }
+    if constexpr (BIAS_FILL) {
+        if (blockIdx.x >= rows) return;
     }
     const uint64_t base = uint64_t(blockIdx.x) * width;
     float values[9];
@@ -1389,6 +1400,45 @@ extern "C" __global__ __launch_bounds__(256, 6) void residual_layer_norm_modulat
     const float* weight, const float* bias, __half* output,
     uint32_t rows, uint32_t width, float eps) {
     layer_norm_row_f16<2>(hidden, projected, modulation, weight, bias, output, rows, width, eps);
+}
+
+template <int UPDATE>
+__device__ __forceinline__ void layer_norm_bias_fill_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* normalized,
+    uint32_t rows, uint32_t width, float eps,
+    __half* output, const __half* output_bias, uint32_t output_width) {
+    if (!output || !output_bias || !output_width) { __trap(); return; }
+    layer_norm_row_f16<UPDATE, true>(hidden, projected, modulation, weight, bias,
+        normalized, rows, width, eps);
+    q38_bias_f16_impl<true>(output, output_bias, uint64_t(rows) * output_width, output_width);
+}
+
+extern "C" __global__ __launch_bounds__(256, 6) void layer_norm_modulate_bias_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* normalized,
+    uint32_t rows, uint32_t width, float eps,
+    __half* output, const __half* output_bias, uint32_t output_width) {
+    layer_norm_bias_fill_f16<0>(hidden, projected, modulation, weight, bias,
+        normalized, rows, width, eps, output, output_bias, output_width);
+}
+
+extern "C" __global__ __launch_bounds__(256, 6) void gated_add_layer_norm_bias_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* normalized,
+    uint32_t rows, uint32_t width, float eps,
+    __half* output, const __half* output_bias, uint32_t output_width) {
+    layer_norm_bias_fill_f16<1>(hidden, projected, modulation, weight, bias,
+        normalized, rows, width, eps, output, output_bias, output_width);
+}
+
+extern "C" __global__ __launch_bounds__(256, 6) void residual_layer_norm_modulate_bias_f16(
+    __half* hidden, const __half* projected, const float* modulation,
+    const float* weight, const float* bias, __half* normalized,
+    uint32_t rows, uint32_t width, float eps,
+    __half* output, const __half* output_bias, uint32_t output_width) {
+    layer_norm_bias_fill_f16<2>(hidden, projected, modulation, weight, bias,
+        normalized, rows, width, eps, output, output_bias, output_width);
 }
 
 // Per-span row mean: x is [rows, width] BF16, spans given by begins/ends
