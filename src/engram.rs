@@ -772,6 +772,20 @@ pub struct EngramService {
 }
 
 impl EngramService {
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+    pub(crate) fn write_history(&self, output: &mut impl std::io::Write) -> Result<()> {
+        for (&value, &initialized) in self
+            .history
+            .compressed
+            .iter()
+            .zip(&self.history.initialized)
+        {
+            output.write_all(&value.to_le_bytes())?;
+            output.write_all(&[u8::from(initialized)])?;
+        }
+        Ok(())
+    }
+
     pub fn open(
         model_dir: &Path,
         manifest: &TensorManifest,

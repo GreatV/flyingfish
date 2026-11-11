@@ -7,7 +7,9 @@
 //! manifest (TextOnly policy): dense resident weights for every backbone
 //! layer, the three runtimes and a memory-admitted routed-expert prefix.
 use super::*;
-use crate::backend::cuda::contracts::{RowDomain, SeqRef, Tensor, TensorMut, dense_layout, view};
+use crate::backend::cuda::contracts::{
+    Position, RowDomain, SeqRef, Tensor, TensorMut, dense_layout, view,
+};
 use crate::backend::cuda::hc::{HcBinding, HcRuntime, HcSublayerWeights};
 use crate::backend::cuda::latent_window_attention::{LatentWindowAttention, LwaInputs};
 use crate::backend::cuda::mhc::{HcCombOrientation, HcFnDtype, HcParams, HcRounding};
@@ -26,6 +28,26 @@ mod dsa;
 #[cfg(test)]
 #[path = "deepseek_layer_certificate.rs"]
 mod layer_certificate;
+
+#[cfg(test)]
+pub(super) fn census_range(
+    enabled: bool,
+    position: usize,
+    name: &str,
+) -> (
+    super::super::profile::Range,
+    super::super::profile::Range,
+    std::ffi::CString,
+) {
+    let message = std::ffi::CString::new(format!("D1 position={position} {name}")).unwrap();
+    let enabled = enabled && [1, 63, 64, 127, 128, 129, 511, 512, 598].contains(&position);
+    let window = super::super::profile::Range::new(
+        enabled && (name == "graph-decode" || (name == "decode" && position != 1)),
+        c"D1_CENSUS",
+    );
+    let range = super::super::profile::Range::new(enabled, &message);
+    (range, window, message)
+}
 
 struct EngramWeights {
     projection: Fp8Projection,
@@ -634,7 +656,7 @@ impl DeepseekMixer {
                     view(&self.slots, s, 0, [visible as u32], [1])
                         .context("recorded window slot view")?,
                 ),
-                position as i32,
+                Position::Fixed(position as i32),
             )
             .context("recorded window slots")?;
         let sink = weight_view::<f32, 1>(&weights.attn_sink, s, [g.heads as u32], "attn_sink")?;
@@ -683,6 +705,7 @@ impl DeepseekMixer {
                     .context("recorded window output view")?,
                 ),
                 0,
+                Position::Fixed(position as i32),
             )
             .context("recorded window attention")?;
         self.ops
@@ -1321,7 +1344,7 @@ impl DeepseekMixer {
         rope.rope_pair_rows(
             s,
             view(&self.inv_freq[layer], s, 0, [(g.rotary / 2) as u32], [1])?,
-            position as i32,
+            Position::Sequence { meta: seq, row: 0 },
             rows,
             &mut fwd,
             &mut inv,
@@ -1368,7 +1391,10 @@ impl DeepseekMixer {
         let sink = weight_view::<f32, 1>(&weights.attn_sink, s, [g.heads as u32], "attn_sink")?;
         let p_mode: i32 = 0;
         for row in 0..rows {
-            let position = position + row;
+            let position = Position::Sequence {
+                meta: seq,
+                row: row as u32,
+            };
             self.ops.ring_write(
                 s,
                 view(
@@ -1378,7 +1404,7 @@ impl DeepseekMixer {
                     [1, g.head_dim as u32],
                     [g.head_dim as u64, 1],
                 )?,
-                position as i32,
+                position,
                 &mut codes,
                 &mut scales,
             )?;
@@ -1386,11 +1412,11 @@ impl DeepseekMixer {
                 runtime.attention(s, layer, rows, row)?;
                 continue;
             }
-            let visible = (position + 1).min(g.window);
+            let visible = g.window;
             self.ops.window_slots(
                 s,
                 &mut TensorMut(view(&self.slots, s, 0, [visible as u32], [1])?),
-                position as i32,
+                position,
             )?;
             self.ops.run(
                 s,
@@ -1416,6 +1442,7 @@ impl DeepseekMixer {
                     [g.head_dim as u64, 1],
                 )?),
                 p_mode,
+                position,
             )?;
         }
         // Attention output: per-32 quantization before the einsum, then the
@@ -1682,13 +1709,8 @@ struct LayerFfn {
     slot_valid: CudaSlice<u32>,
 }
 
-/// DeepSeek-V4.1 FFN runtime (model definition MoE.forward, decode path):
-/// the BF16 router GEMV with FP32 logits on the shared RouteOps cuBLAS
-/// handle, the sqrt-softplus noaux_tc top-k with unbiased weights,
-/// norm-top-k and routed scaling, the routed W4A8 experts dispatched on
-/// device through the per-layer slot tables (no routing data crosses to
-/// host), the W8A8 shared expert at weight 1 and the FP32 combine with one
-/// BF16 round.
+/// Native W4A8 routed experts, W8A8 shared expert and FP32 combine.
+/// Routing IDs and weights cross to host at each tier-service boundary.
 pub struct DeepseekFfn {
     route: RouteOps,
     experts: w4a8::MoeExpertW4A8,
@@ -1707,6 +1729,8 @@ pub struct DeepseekFfn {
     shared_scratch: CudaSlice<u8>,
     eps: f32,
     tiered: bool,
+    #[cfg(feature = "cuda")]
+    pub(super) graphs: Vec<(CudaGraph, CudaGraph)>,
 }
 
 struct DeepseekFfnRun<'a> {
@@ -1794,6 +1818,8 @@ impl DeepseekFfn {
         let shared_intermediate = geometry.shared_intermediate;
         let expert_intermediate = geometry.expert_intermediate;
         Ok(Self {
+            #[cfg(feature = "cuda")]
+            graphs: Vec::new(),
             route,
             experts: w4a8::MoeExpertW4A8::new(ctx)?,
             shared: w8a8::MoeSharedW8A8::new(ctx)?,
@@ -2047,6 +2073,11 @@ impl DeepseekFfn {
         if rows == self.rows {
             return Ok(());
         }
+        #[cfg(feature = "cuda")]
+        ensure!(
+            self.graphs.is_empty(),
+            "DeepSeek graph workspace growth requires setup rebinding"
+        );
         let g = &self.geometry;
         for layer in self.layers.iter_mut().flatten() {
             layer.bias_expanded = Self::expand_bias(s, &layer.gate_bias, g.experts, rows)?;
@@ -2330,7 +2361,7 @@ impl DeepseekFfn {
             #[cfg(test)]
             fixed_routes,
         } = run;
-        let (hidden, top_k) = (self.geometry.hidden, self.geometry.top_k);
+        let hidden = self.geometry.hidden;
         ensure!(
             rows >= 1 && rows <= self.rows,
             "DeepSeek-V4.1 FFN rows {rows} are outside the runtime capacity {}",
@@ -2340,8 +2371,13 @@ impl DeepseekFfn {
             x.len() >= rows * hidden && out.len() >= rows * hidden,
             "DeepSeek-V4.1 FFN work buffers do not hold {rows} rows"
         );
-        let x2 = view(x, s, 0, [rows as u32, hidden as u32], [hidden as u64, 1])?;
+        #[cfg(test)]
+        let route_range = super::super::profile::Range::new(true, c"D1 FFN route");
         self.route_only(s, rows, x, layer)?;
+        #[cfg(test)]
+        drop(route_range);
+        #[cfg(test)]
+        let service_range = super::super::profile::Range::new(true, c"D1 FFN host-service");
         if let Some(slots) = tier.as_mut() {
             ensure!(
                 self.tiered,
@@ -2352,16 +2388,51 @@ impl DeepseekFfn {
                 s.memcpy_htod(&ids, &mut self.ids.slice_mut(..ids.len()))?;
                 s.memcpy_htod(&weights, &mut self.route_weights.slice_mut(..weights.len()))?;
             }
-            let ids = s.clone_dtoh(&self.ids.slice(..rows * top_k))?;
-            let weights = s.clone_dtoh(&self.route_weights.slice(..rows * top_k))?;
-            slots.resolve_native(
-                u32::try_from(layer).context("DeepSeek-V4.1 tier layer overflow")?,
-                &ids,
-                &weights,
-            )?;
-            slots.wait_refill(s)?;
-            self.sync_tier(s, layer, slots)?;
+            self.service_tier(s, rows, layer, slots)?;
         }
+        #[cfg(test)]
+        drop(service_range);
+        self.contribute(s, rows, (x, out), layer, accumulator, tier)
+    }
+
+    fn service_tier(
+        &mut self,
+        s: &Arc<CudaStream>,
+        rows: usize,
+        layer: usize,
+        slots: &mut super::moe::Slots,
+    ) -> Result<()> {
+        ensure!(self.tiered, "DeepSeek tier executor is not bound");
+        let count = rows * self.geometry.top_k;
+        let ids = s.clone_dtoh(&self.ids.slice(..count))?;
+        let weights = s.clone_dtoh(&self.route_weights.slice(..count))?;
+        slots.resolve_native(u32::try_from(layer)?, &ids, &weights)?;
+        slots.wait_refill(s)?;
+        self.sync_tier(s, layer, slots)
+    }
+
+    fn contribute(
+        &self,
+        s: &Arc<CudaStream>,
+        rows: usize,
+        buffers: (&CudaSlice<bf16>, &mut CudaSlice<bf16>),
+        layer: usize,
+        accumulator: Accumulator,
+        mut tier: Option<&mut super::moe::Slots>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        let _contribution_range = super::super::profile::Range::new(true, c"D1 FFN contribution");
+        let (x, out) = buffers;
+        let hidden = self.geometry.hidden;
+        ensure!(
+            rows >= 1 && rows <= self.rows,
+            "DeepSeek contribution rows exceed capacity"
+        );
+        ensure!(
+            x.len() >= rows * hidden && out.len() >= rows * hidden,
+            "DeepSeek contribution buffers exceed capacity"
+        );
+        let x2 = view(x, s, 0, [rows as u32, hidden as u32], [hidden as u64, 1])?;
         let g = &self.geometry;
         let bound = self
             .layers
@@ -2383,10 +2454,6 @@ impl DeepseekFfn {
             [rows as u32, g.top_k as u32],
             [g.top_k as u64, 1],
         )?);
-        // Routed experts dispatched on device: the ids and route weights stay
-        // in device memory and the launches are sequenced from the host-known
-        // rows/top-k bounds only; a routed id outside the bound set holds a
-        // zero valid entry and traps the launch.
         let slots = bound.slots.as_ref().context(
             "DeepSeek-V4.1 FFN routed dispatch tables are not built; call finish_routed",
         )?;
@@ -2549,6 +2616,198 @@ impl DeepseekFfn {
 }
 
 impl Engine {
+    #[cfg(feature = "cuda")]
+    pub(super) fn capture_deepseek(&mut self) -> Result<()> {
+        ensure!(!self.poisoned, "DeepSeek capture requires healthy state");
+        ensure!(
+            self.position < self.capacity,
+            "DeepSeek capture exceeds capacity"
+        );
+        ensure!(self.spec.is_none(), "DeepSeek graph draft is not bound");
+        let ffn = self
+            .deepseek_ffn
+            .as_ref()
+            .context("DeepSeek graph FFN missing")?;
+        ensure!(ffn.tiered, "DeepSeek graph tier binding missing");
+        if ffn.graphs.len() == self.config.num_hidden_layers {
+            return Ok(());
+        }
+        ensure!(ffn.graphs.is_empty(), "partial DeepSeek graph publication");
+        let mut graphs = Vec::with_capacity(self.config.num_hidden_layers);
+        let result = (|| -> Result<()> {
+            self.ensure_decode()?;
+            self.prepare(1)?;
+            self.device.finish_upload()?;
+            let before = self.device.ctx.mem_get_info()?.0;
+            for layer in 0..self.config.num_hidden_layers {
+                let prefix = super::moe::graphs::record(self, |engine| {
+                    engine.deepseek_graph_segment(layer, false)
+                })?;
+                let suffix = super::moe::graphs::record(self, |engine| {
+                    engine.deepseek_graph_segment(layer, true)
+                })?;
+                graphs.push((prefix, suffix));
+            }
+            let after = self.device.ctx.mem_get_info()?.0;
+            eprintln!(
+                "{}",
+                serde_json::json!({"deepseek_graph_binding": {
+                    "segments": graphs.len() * 2,
+                    "allocation_bytes": before.saturating_sub(after),
+                    "free_before_bytes": before, "free_after_bytes": after,
+                    "capacity_basis": "free memory after graph allocation"
+                }})
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error.context("DeepSeek graph capture transaction"));
+        }
+        self.deepseek_ffn
+            .as_mut()
+            .context("DeepSeek graph FFN missing")?
+            .graphs = graphs;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn deepseek_graph_segment(&mut self, layer: usize, suffix: bool) -> Result<()> {
+        use crate::model::{LayerProgram, LayerStage};
+        let step = crate::backend::Step {
+            rows: 1,
+            input: crate::backend::Input::Token,
+            mask: crate::backend::Mask::Causal,
+            head: Head::Last,
+        };
+        let LayerProgram::Hc(stages) = crate::model::layer_program(&self.model_spec, layer)? else {
+            anyhow::bail!("DeepSeek graph requires mHC layer program");
+        };
+        let split = stages
+            .iter()
+            .position(|stage| matches!(stage, LayerStage::Ffn))
+            .context("DeepSeek graph layer program has no FFN")?;
+        if suffix {
+            self.deepseek_ffn
+                .as_ref()
+                .context("DeepSeek graph FFN missing")?
+                .contribute(
+                    &self.device.stream,
+                    1,
+                    (&self.work.n, &mut self.work.out),
+                    layer,
+                    Accumulator::Fp32,
+                    None,
+                )?;
+        } else {
+            if layer == 0 {
+                self.deepseek_embed(step)?;
+            }
+            if let Some(engram) = &self.deepseek_engram {
+                engram.run(
+                    &self.device.stream,
+                    layer,
+                    1,
+                    self.hc.as_mut().context("DeepSeek graph mHC missing")?,
+                )?;
+            }
+        }
+        for (index, stage) in stages.into_iter().enumerate() {
+            if (suffix && index <= split) || (!suffix && index >= split) {
+                continue;
+            }
+            self.run_layer_stage(index, stage, layer, step, &mut None)?;
+        }
+        #[cfg(test)]
+        if suffix {
+            self.check_capture_layer(layer)?;
+        }
+        if !suffix {
+            self.deepseek_ffn
+                .as_mut()
+                .context("DeepSeek graph FFN missing")?
+                .route_only(&self.device.stream, 1, &self.work.n, layer)?;
+        } else if layer + 1 == self.config.num_hidden_layers {
+            self.deepseek_operator(crate::backend::Operator::Head, 0, step)?;
+            self.work.advance(&self.ops, &self.device.stream)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn run_deepseek_graph(&mut self) -> Result<()> {
+        ensure!(
+            self.deepseek_engram
+                .as_ref()
+                .is_some_and(|e| e.prepared == Some((self.position, 1))),
+            "DeepSeek graph Engram records are stale"
+        );
+        let ffn = self
+            .deepseek_ffn
+            .as_mut()
+            .context("DeepSeek graph FFN missing")?;
+        ensure!(
+            ffn.graphs.len() == self.config.num_hidden_layers,
+            "DeepSeek decode graphs are not captured"
+        );
+        let slots = self
+            .moe_slots
+            .as_mut()
+            .context("DeepSeek graph tier slots missing")?;
+        if !slots.request_open {
+            slots.begin_staging_request()?;
+        }
+        slots.begin_token()?;
+        let executed = (|| -> Result<()> {
+            for layer in 0..ffn.graphs.len() {
+                #[cfg(test)]
+                let prefix_range = census_range(
+                    true,
+                    self.position,
+                    &format!("layer={layer} segment=prefix"),
+                );
+                ffn.graphs[layer].0.launch()?;
+                #[cfg(test)]
+                drop(prefix_range);
+                ffn.service_tier(&self.device.stream, 1, layer, slots)?;
+                #[cfg(test)]
+                let suffix_range = census_range(
+                    true,
+                    self.position,
+                    &format!("layer={layer} segment=suffix"),
+                );
+                ffn.graphs[layer].1.launch()?;
+                #[cfg(test)]
+                drop(suffix_range);
+                slots.record_all_readers(&self.device.stream)?;
+            }
+            Ok(())
+        })();
+        let completed = slots.finish_token();
+        executed?;
+        completed
+    }
+
+    fn deepseek_embed(&mut self, step: crate::backend::Step<'_>) -> Result<()> {
+        let ids = if matches!(step.input, crate::backend::Input::Token) {
+            &self.work.token
+        } else {
+            &self.work.ids
+        };
+        self.hc
+            .as_mut()
+            .context("DeepSeek-V4.1 mHC runtime is not bound")?
+            .begin_forward(
+                &self.device.stream,
+                step.rows,
+                ids,
+                self.weights
+                    .embed
+                    .as_ref()
+                    .context("DeepSeek-V4.1 embedding missing")?,
+            )
+    }
+
     pub(super) fn prepare_deepseek_engram(
         &mut self,
         ids: &[u32],
@@ -2608,24 +2867,7 @@ impl Engine {
                     "Engram records were not prepared for this forward"
                 );
             }
-            let runtime = self
-                .hc
-                .as_mut()
-                .context("DeepSeek-V4.1 mHC runtime is not bound")?;
-            let ids = if matches!(step.input, crate::backend::Input::Token) {
-                &self.work.token
-            } else {
-                &self.work.ids
-            };
-            return runtime.begin_forward(
-                &self.device.stream,
-                step.rows,
-                ids,
-                self.weights
-                    .embed
-                    .as_ref()
-                    .context("DeepSeek-V4.1 embedding missing")?,
-            );
+            return self.deepseek_embed(step);
         }
         if matches!(
             op,
@@ -2838,12 +3080,8 @@ pub(crate) fn dense_load(name: &str) -> DenseLoad {
     DenseLoad::Resident
 }
 
-/// DeepSeek-V4.1 engine load (the load_recurrent pattern): the TextOnly
-/// manifest maps the closed world, the dense resident weights of every
-/// backbone layer bind the three runtimes, and a memory-admitted prefix of
-/// the routed experts binds per layer. Decode rows only; no draft model, no
-/// prefix cache and no Graph capture (the model-final norm and head stages
-/// are not bound).
+/// DeepSeek-V4.1 text engine with native expert staging.
+/// Tiered CUDA decode captures two fixed regions per layer around host expert service.
 impl Engine {
     pub(super) fn load_deepseek(
         dir: &Path,
@@ -3416,7 +3654,10 @@ impl Engine {
             #[cfg(test)]
             diffusion_forced_draws: None,
         };
+        engine.closure.freeze_fixed()?;
         if tiered {
+            #[cfg(feature = "cuda")]
+            engine.capture_deepseek()?;
             let (slots, admitted_rows) = super::moe::Slots::load_staging(
                 &engine.device,
                 &engine.model_spec,
@@ -3445,7 +3686,6 @@ impl Engine {
                 "top_k": geometry.top_k, "layers": geometry.layers
             }})
         );
-        engine.closure.freeze_fixed()?;
         engine.reset()?;
         engine.closure.ready(started)?;
         Ok(engine)
@@ -3717,6 +3957,333 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    fn composition_native_state(engine: &Engine) -> Result<Vec<u8>> {
+        let s = &engine.device.stream;
+        let mut bytes = Vec::new();
+        macro_rules! integers {
+            ($values:expr) => {
+                for value in $values {
+                    bytes.extend_from_slice(&(value as u32).to_le_bytes());
+                }
+            };
+        }
+        macro_rules! floats {
+            ($values:expr) => {
+                for value in $values {
+                    bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            };
+        }
+        integers!([engine.position]);
+        integers!(s.clone_dtoh(&engine.work.token)?);
+        integers!(s.clone_dtoh(&engine.work.position)?);
+        integers!(s.clone_dtoh(&engine.work.length)?);
+        integers!(s.clone_dtoh(engine.state.sequence.as_ref().context("sequence missing")?)?);
+        for ring in &engine.state.latent {
+            bytes.extend(s.clone_dtoh(&ring.codes)?);
+            bytes.extend(s.clone_dtoh(&ring.scales)?);
+        }
+        let state = engine
+            .state
+            .compressed
+            .as_ref()
+            .context("compressed state missing")?;
+        integers!(s.clone_dtoh(&state.generation)?);
+        for kv in &state.kv {
+            integers!([kv.owner]);
+            integers!(s.clone_dtoh(&kv.count)?);
+            integers!(s.clone_dtoh(&kv.cursor)?);
+            integers!(s.clone_dtoh(&kv.ticket)?);
+            for values in [&kv.codes, &kv.scales, &kv.index_codes, &kv.index_scales] {
+                bytes.extend(s.clone_dtoh(values)?);
+            }
+            floats!(s.clone_dtoh(&kv.tail_values)?);
+            floats!(s.clone_dtoh(&kv.tail_scores)?);
+        }
+        for selection in &state.index {
+            integers!(s.clone_dtoh(&selection.ticket)?);
+            integers!(s.clone_dtoh(&selection.positions)?);
+        }
+        integers!(s.clone_dtoh(&state.candidate_ticket)?);
+        integers!(s.clone_dtoh(&state.candidates)?);
+        let hc = engine.hc.as_ref().context("mHC missing")?;
+        floats!(s.clone_dtoh(&hc.stream)?);
+        for values in [&hc.mix_pre, &hc.mix_post, &hc.mix_comb] {
+            floats!(s.clone_dtoh(values)?);
+        }
+        for values in [&hc.carry, &hc.attn_pre].into_iter().flatten() {
+            floats!(s.clone_dtoh(values)?);
+        }
+        let engram = engine.deepseek_engram.as_ref().context("Engram missing")?;
+        bytes.extend(s.clone_dtoh(&engram.mask)?);
+        for layer in &engram.layers {
+            bytes.extend(s.clone_dtoh(&layer.records)?);
+        }
+        integers!([u32::from(engram.prepared.is_some())]);
+        if let Some((position, rows)) = engram.prepared {
+            integers!([position, rows]);
+        }
+        let ffn = engine.deepseek_ffn.as_ref().context("FFN missing")?;
+        integers!(s.clone_dtoh(&ffn.ids)?);
+        floats!(s.clone_dtoh(&ffn.route_weights)?);
+        integers!([engine.pending_token.unwrap_or(u32::MAX)]);
+        integers!(engine.committed_prefix_ids.iter().copied());
+        engram.service.write_history(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn composition_capture_faults(engine: &mut Engine) -> Result<()> {
+        let graphs =
+            std::mem::take(&mut engine.deepseek_ffn.as_mut().context("FFN missing")?.graphs);
+        let ready = engine.closure.clone();
+        for stage in [
+            Some(CaptureFault::Begin),
+            Some(CaptureFault::End),
+            Some(CaptureFault::Instantiate),
+            None,
+        ] {
+            engine.closure = Rc::new(crate::backend::cuda::closure::Closure::new(
+                false,
+                "fixed capture fault gate".into(),
+            ));
+            engine.closure.freeze_fixed()?;
+            engine.capture_fail_stage = stage;
+            engine.capture_fail_after_layer = if stage.is_none() { Some((1, 1)) } else { None };
+            let before = composition_native_state(engine)?;
+            let result = engine.capture_deepseek();
+            ensure!(
+                result.is_err()
+                    && engine.poisoned
+                    && engine
+                        .deepseek_ffn
+                        .as_ref()
+                        .context("FFN missing")?
+                        .graphs
+                        .is_empty(),
+                "capture fault did not poison/dispose"
+            );
+            ensure!(
+                composition_native_state(engine)? == before,
+                "capture fault changed native state"
+            );
+            ensure!(
+                engine.advance(false, None).is_err(),
+                "capture fault permitted decode"
+            );
+            println!(
+                "COMPOSITION_CAPTURE_CONTROL stage={stage:?} state_bits=0 unpublished=true poisoned=true PASS"
+            );
+            engine.capture_fail_stage = None;
+            engine.capture_fail_after_layer = None;
+            engine.reset()?;
+        }
+        engine.closure = Rc::new(crate::backend::cuda::closure::Closure::new(
+            false,
+            "fixed capture success gate".into(),
+        ));
+        engine.closure.freeze_fixed()?;
+        let before = composition_native_state(engine)?;
+        engine.capture_deepseek()?;
+        ensure!(
+            composition_native_state(engine)? == before
+                && engine
+                    .deepseek_ffn
+                    .as_ref()
+                    .context("FFN missing")?
+                    .graphs
+                    .len()
+                    == engine.config.num_hidden_layers,
+            "successful capture changed state or published an incomplete vector"
+        );
+        println!("PASS COMPOSITION_CAPTURE_SUCCESS raw_state_bits=0 complete_vector=true");
+        engine.deepseek_ffn.as_mut().context("FFN missing")?.graphs = graphs;
+        engine.closure = ready;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn composition_graph_counts(engine: &Engine) -> Result<()> {
+        use cudarc::driver::sys::{self, CUgraphNodeType as Kind};
+        fn visit(
+            graph: sys::CUgraph,
+            kinds: &mut std::collections::BTreeMap<String, usize>,
+            kernels: &mut std::collections::BTreeMap<String, usize>,
+        ) -> Result<()> {
+            let mut count = 0;
+            unsafe {
+                sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut count).result()?;
+            }
+            let mut nodes = vec![std::ptr::null_mut(); count];
+            unsafe {
+                sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut count).result()?;
+            }
+            for node in nodes.into_iter().take(count) {
+                let mut kind = Kind::CU_GRAPH_NODE_TYPE_EMPTY;
+                unsafe {
+                    sys::cuGraphNodeGetType(node, &mut kind).result()?;
+                }
+                *kinds.entry(format!("{kind:?}")).or_default() += 1;
+                if kind == Kind::CU_GRAPH_NODE_TYPE_KERNEL {
+                    let mut params = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        sys::cuGraphKernelNodeGetParams_v2(node, &mut params).result()?;
+                    }
+                    let mut name = std::ptr::null();
+                    unsafe {
+                        if params.func.is_null() {
+                            ensure!(!params.kern.is_null(), "graph node has no kernel handle");
+                            sys::cuKernelGetName(&mut name, params.kern).result()?;
+                        } else {
+                            sys::cuFuncGetName(&mut name, params.func).result()?;
+                        }
+                    }
+                    ensure!(!name.is_null(), "graph kernel name missing");
+                    let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_str()?;
+                    *kernels.entry(name.to_owned()).or_default() += 1;
+                } else if kind == Kind::CU_GRAPH_NODE_TYPE_GRAPH {
+                    let mut child = std::ptr::null_mut();
+                    unsafe {
+                        sys::cuGraphChildGraphNodeGetGraph(node, &mut child).result()?;
+                    }
+                    visit(child, kinds, kernels)?;
+                }
+            }
+            Ok(())
+        }
+        let ffn = engine.deepseek_ffn.as_ref().context("graph FFN missing")?;
+        ensure!(
+            ffn.graphs.len() == engine.config.num_hidden_layers,
+            "incomplete graph vector"
+        );
+        let mut totals = std::collections::BTreeMap::<String, usize>::new();
+        let mut kernels = std::collections::BTreeMap::new();
+        for (layer, pair) in ffn.graphs.iter().enumerate() {
+            for (part, graph) in [("prefix", &pair.0), ("suffix", &pair.1)] {
+                let mut kinds = std::collections::BTreeMap::new();
+                visit(graph.cu_graph(), &mut kinds, &mut kernels)?;
+                println!(
+                    "DEEPSEEK_GRAPH_NODES layer={layer} part={part} kinds={}",
+                    serde_json::to_string(&kinds)?
+                );
+                for (kind, count) in kinds {
+                    *totals.entry(kind).or_default() += count;
+                }
+            }
+        }
+        println!(
+            "DEEPSEEK_GRAPH_NODES_TOTAL submissions={} kinds={} kernels={}",
+            ffn.graphs.len() * 2,
+            serde_json::to_string(&totals)?,
+            serde_json::to_string(&kernels)?
+        );
+        Ok(())
+    }
+
+    fn composition_state(
+        engine: &Engine,
+        end: usize,
+        rows: usize,
+        output: &mut impl std::io::Write,
+    ) -> Result<()> {
+        macro_rules! host {
+            ($values:expr) => {{
+                for value in $values {
+                    output.write_all(&value.to_le_bytes())?;
+                }
+            }};
+        }
+        let s = &engine.device.stream;
+        macro_rules! device {
+            ($values:expr) => {
+                host!(s.clone_dtoh($values)?)
+            };
+        }
+        host!([
+            end as u64,
+            rows as u64,
+            engine.position as u64,
+            engine.pending_token.map(u64::from).unwrap_or(u64::MAX)
+        ]);
+        host!([engine.committed_prefix_ids.len() as u64]);
+        host!(&engine.committed_prefix_ids);
+        device!(engine.state.sequence.as_ref().context("sequence absent")?);
+        device!(&engine.work.position);
+        device!(&engine.work.length);
+        for ring in &engine.state.latent {
+            device!(&ring.codes);
+            device!(&ring.scales);
+        }
+        let state = engine
+            .state
+            .compressed
+            .as_ref()
+            .context("compressed state absent")?;
+        let generation = s.clone_dtoh(&state.generation)?[0];
+        for kv in &state.kv {
+            let count = s.clone_dtoh(&kv.count)?[0] as usize;
+            let extent = engine.capacity / kv.ratio;
+            for values in [&kv.codes, &kv.scales, &kv.index_codes, &kv.index_scales] {
+                device!(&values.slice(..count * (values.len() / extent)));
+            }
+            device!(&kv.count);
+            device!(&kv.cursor);
+            let mut ticket = s.clone_dtoh(&kv.ticket)?;
+            ensure!(
+                ticket == [kv.owner as u32, generation, end as u32, count as u32],
+                "invalid state KV ticket"
+            );
+            ticket[1] = 0;
+            host!(ticket);
+            device!(&kv.tail_values);
+            device!(&kv.tail_scores);
+        }
+        for selection in &state.index {
+            device!(
+                &selection
+                    .positions
+                    .slice(..rows * (selection.positions.len() / state.rows))
+            );
+            let mut ticket = s.clone_dtoh(&selection.ticket)?;
+            ensure!(
+                ticket[2] == generation
+                    && ticket[3] == (end - rows) as u32
+                    && ticket[4] == end as u32,
+                "invalid state selection ticket"
+            );
+            ticket[2] = 0;
+            host!(ticket);
+        }
+        device!(
+            &state
+                .candidates
+                .slice(..rows * (state.candidates.len() / state.rows))
+        );
+        let mut ticket = s.clone_dtoh(&state.candidate_ticket)?;
+        ensure!(
+            ticket[2] == generation && ticket[3] == (end - rows) as u32 && ticket[4] == end as u32,
+            "invalid state candidate ticket"
+        );
+        ticket[2] = 0;
+        host!(ticket);
+        let hc = engine.hc.as_ref().context("mHC absent")?;
+        device!(
+            &hc.stream
+                .slice(..rows * (hc.stream.len() / engine.workspace_rows))
+        );
+        for value in [&hc.carry, &hc.attn_pre].into_iter().flatten() {
+            device!(&value.slice(..rows * (value.len() / engine.workspace_rows)));
+        }
+        engine
+            .deepseek_engram
+            .as_ref()
+            .context("Engram absent")?
+            .service
+            .write_history(output)?;
+        Ok(())
+    }
+
     #[test]
     #[ignore = "full-model composition; clean isolated-layer gates and live compressed-state binding required"]
     fn deepseek_composition_gpu() -> Result<()> {
@@ -3765,6 +4332,11 @@ mod tests {
             kv_format: crate::kv::KvFormat::Bf16,
             runtime_dir: Some(runtime),
         };
+        #[cfg(feature = "cuda")]
+        let mut startup_window = Some(crate::backend::cuda::profile::Range::new(
+            true,
+            c"D1_CENSUS",
+        ));
         let mut engine = Engine::load(&model, 0, 640, None, settings)?;
         ensure!(
             engine.config.num_hidden_layers == 40
@@ -3777,17 +4349,100 @@ mod tests {
             engine.config.vocab_size == reference.shape[1],
             "composition model/reference vocabulary"
         );
+        #[cfg(feature = "cuda")]
+        let cold_graph = {
+            ensure!(engine.graph_decode(), "D1 graphs were not bound at setup");
+            engine.set_token(reference.tokens[0])?;
+            let before = engine.device.ctx.mem_get_info()?.0;
+            engine.decode(true, None)?;
+            engine.device.ctx.synchronize()?;
+            let after = engine.device.ctx.mem_get_info()?.0;
+            ensure!(
+                before == after,
+                "Runner FAIL cold graph replay changed device allocation"
+            );
+            composition_live_state(&engine, 1, 1)?;
+            let logits = engine.decode_logits()?;
+            ensure!(
+                logits.len() == reference.shape[1] && logits.iter().all(|v| v.is_finite()),
+                "Runner FAIL cold graph logits"
+            );
+            let mut state = Vec::new();
+            composition_state(&engine, 1, 1, &mut state)?;
+            println!(
+                "PASS COMPOSITION_GRAPH_COLD_ALLOCATION position=0 free_before_bytes={before} free_after_bytes={after} allocation_delta_bytes=0"
+            );
+            engine.reset()?;
+            (logits, state)
+        };
+        #[cfg(feature = "cuda")]
+        {
+            ensure!(engine.graph_decode(), "D1 graphs were not bound at setup");
+            composition_graph_counts(&engine)?;
+            composition_capture_faults(&mut engine)?;
+            let before = composition_native_state(&engine)?;
+            let free = engine.device.ctx.mem_get_info()?.0;
+            engine.capture()?;
+            ensure!(
+                composition_native_state(&engine)? == before
+                    && engine.device.ctx.mem_get_info()?.0 == free,
+                "idempotent graph capture changed state/allocation"
+            );
+            println!(
+                "PASS DEEPSEEK_GRAPH_CAPTURE faults=4 state_bits=0 ready_capture_idempotent=true"
+            );
+        }
         let mut score = CompositionScore::new(&root, &output.join("decode.f32"), &reference)?;
+        let mut state_output =
+            std::io::BufWriter::new(std::fs::File::create(output.join("decode.state"))?);
         println!("COMPOSITION_ARM singleton_decode primary=true");
         engine.prefill(&reference.tokens[..1], None)?;
         composition_live_state(&engine, 1, 1)?;
         score.row(0, &engine.decode_logits()?)?;
+        composition_state(&engine, 1, 1, &mut state_output)?;
+        #[cfg(feature = "cuda")]
+        let cold_accepted = {
+            let logits = engine.decode_logits()?;
+            let logit_differences = logits
+                .iter()
+                .zip(&cold_graph.0)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let mut state = Vec::new();
+            composition_state(&engine, 1, 1, &mut state)?;
+            let state_differences = state
+                .iter()
+                .zip(&cold_graph.1)
+                .filter(|(a, b)| a != b)
+                .count()
+                + state.len().abs_diff(cold_graph.1.len());
+            println!(
+                "{} COMPOSITION_GRAPH_COLD_IDENTITY position=0 logits_bit_mismatches={logit_differences} state_byte_mismatches={state_differences}",
+                if logit_differences == 0 && state_differences == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                }
+            );
+            logit_differences == 0 && state_differences == 0
+        };
+        #[cfg(feature = "cuda")]
+        drop(cold_graph);
         for position in 1..599 {
             engine.set_token(reference.tokens[position])?;
+            let range = census_range(true, position, "decode");
             engine.decode(false, None)?;
+            engine.device.ctx.synchronize()?;
+            drop(range);
+            #[cfg(feature = "cuda")]
+            if position == 1 {
+                drop(startup_window.take());
+            }
             composition_live_state(&engine, position + 1, 1)?;
+            composition_state(&engine, position + 1, 1, &mut state_output)?;
             score.row(position, &engine.decode_logits()?)?;
         }
+        std::io::Write::flush(&mut state_output)?;
         let accepted = score.finish(false)?;
         drop(score);
         engine.reset()?;
@@ -3826,6 +4481,87 @@ mod tests {
             Ok(())
         })?;
         let _informational = chunk_score.finish(true)?;
+        #[cfg(feature = "cuda")]
+        let mut graph_accepted = true;
+        #[cfg(feature = "cuda")]
+        for request in 0..2 {
+            use std::io::{Read, Write};
+            engine.reset()?;
+            engine.capture()?;
+            let mut logits_reference =
+                std::io::BufReader::new(std::fs::File::open(output.join("decode.f32"))?);
+            let mut state_reference =
+                std::io::BufReader::new(std::fs::File::open(output.join("decode.state"))?);
+            let mut differences = [0usize; 2];
+            let replay_free = engine.device.ctx.mem_get_info()?.0;
+            for position in 0..599 {
+                engine.set_token(reference.tokens[position])?;
+                let range = census_range(true, position, "graph-decode");
+                engine.decode(true, None)?;
+                engine.device.ctx.synchronize()?;
+                drop(range);
+                composition_live_state(&engine, position + 1, 1)?;
+                let logits = engine.decode_logits()?;
+                ensure!(
+                    logits.len() == reference.shape[1] && logits.iter().all(|v| v.is_finite()),
+                    "Runner FAIL graph logits shape/finiteness"
+                );
+                let mut raw = Vec::with_capacity(logits.len() * 4);
+                for value in logits {
+                    raw.write_all(&value.to_le_bytes())?;
+                }
+                let mut expected = vec![0; raw.len()];
+                logits_reference.read_exact(&mut expected)?;
+                let logit_differences = raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(expected.as_chunks::<4>().0.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                raw.clear();
+                composition_state(&engine, position + 1, 1, &mut raw)?;
+                expected.resize(raw.len(), 0);
+                state_reference.read_exact(&mut expected)?;
+                let state_differences = raw.iter().zip(&expected).filter(|(a, b)| a != b).count();
+                differences[0] += logit_differences;
+                differences[1] += state_differences;
+                println!(
+                    "COMPOSITION_GRAPH_IDENTITY request={request} position={position} logits_words={} logits_bit_mismatches={logit_differences} state_bytes={} state_byte_mismatches={state_differences}",
+                    reference.shape[1],
+                    raw.len()
+                );
+            }
+            let free_after = engine.device.ctx.mem_get_info()?.0;
+            ensure!(
+                free_after == replay_free,
+                "Runner FAIL graph replay changed device allocation"
+            );
+            println!(
+                "PASS COMPOSITION_GRAPH_ALLOCATION request={request} free_before_bytes={replay_free} free_after_bytes={free_after} allocation_delta_bytes=0"
+            );
+            let mut extra = [0u8];
+            ensure!(
+                logits_reference.read(&mut extra)? == 0 && state_reference.read(&mut extra)? == 0,
+                "Runner FAIL graph reference trailing data"
+            );
+            println!(
+                "{} COMPOSITION_GRAPH_IDENTITY request={request} rows=599 logits_bit_mismatches={} state_byte_mismatches={} resets=true",
+                if differences == [0, 0] {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                },
+                differences[0],
+                differences[1]
+            );
+            graph_accepted &= differences == [0, 0];
+        }
+        #[cfg(feature = "cuda")]
+        ensure!(
+            graph_accepted && cold_accepted,
+            "DEFECT graph/eager identity"
+        );
         ensure!(accepted, "DEFECT full-model composition");
         Ok(())
     }
@@ -6824,11 +7560,45 @@ mod tests {
                 layer,
                 accumulator: Accumulator::Fp32,
                 tier: Some(slots),
-                fixed_routes: Some((ids, weights)),
+                fixed_routes: Some((ids.clone(), weights)),
             })?;
             slots.finish_token()?;
-            s.clone_dtoh(&work.out.slice(..5120))
-                .context("DeepSeek device readback")
+            let expected = s.clone_dtoh(&work.out.slice(..5120))?;
+            if matches!(slots.pool_control, PoolControl::Misindex) {
+                return Ok(expected);
+            }
+            let graph = crate::backend::cuda::moe::testing::capture(s, || {
+                ffn.contribute(
+                    s,
+                    1,
+                    (&work.n, &mut work.out),
+                    layer,
+                    Accumulator::Fp32,
+                    None,
+                )
+            })?;
+            let incoming = slots.evict_for_test(layer as u32, ids[0] as u32)?;
+            let source = slots.tier(layer as u32, ids[0] as u32)?;
+            ensure!(
+                source != crate::experts::plan::Tier::Gpu,
+                "graph refill target remained resident"
+            );
+            slots.begin_token()?;
+            ffn.service_tier(s, 1, layer, slots)?;
+            graph.launch()?;
+            slots.record_all_readers(s)?;
+            slots.finish_token()?;
+            let actual = s.clone_dtoh(&work.out.slice(..5120))?;
+            let differences = expected
+                .iter()
+                .zip(&actual)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            println!(
+                "DS41_WAVES_GRAPH layer={layer} incoming={incoming} refill_source={source:?} values=5120 bit_mismatches={differences}"
+            );
+            ensure!(differences == 0, "wave graph/eager contribution differs");
+            Ok(actual)
         }
 
         fn outputs(engine: &mut Engine) -> Result<Vec<Vec<bf16>>> {
@@ -6897,12 +7667,16 @@ mod tests {
                 } = engine;
                 let slots = moe_slots.as_mut().context("tiers missing")?;
                 let s = &device.stream;
-                delay_stream(s)?;
                 let (sink_ptr, _guard) = sink.device_ptr(s);
-                // SAFETY: the sink holds REFERENCE_BYTES, the leased slot is live until the recorded reader event, and both stay ordered on one stream.
-                unsafe {
-                    crate::backend::cuda::copy::dtod_raw(sink_ptr, head, REFERENCE_BYTES, s)?
-                };
+                let graph = crate::backend::cuda::moe::testing::capture(s, || {
+                    delay_stream(s)?;
+                    // SAFETY: both spans hold REFERENCE_BYTES through the recorded reader event.
+                    unsafe {
+                        crate::backend::cuda::copy::dtod_raw(sink_ptr, head, REFERENCE_BYTES, s)?;
+                    }
+                    Ok(())
+                })?;
+                graph.launch()?;
                 slots.record_all_readers(s)?;
                 slots.finish_token()?;
             }
@@ -7048,7 +7822,7 @@ mod tests {
             &reference,
         )?;
         println!(
-            "DS41_WAVES_REUSE_ORDER consumer_read_intact={ordered} control_without_reader_wait_intact={planted}"
+            "DS41_WAVES_REUSE_ORDER graph=true consumer_read_intact={ordered} control_without_reader_wait_intact={planted}"
         );
         ensure!(
             ordered,

@@ -9,7 +9,7 @@
 //! (per-32 E4M3/E8M0 quantization placed at the position's slot), the visible
 //! slot list, the adjacent-pair rotary on the tail, and the block-diagonal
 //! wo_a group projection of the quantized attention output.
-use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout, no_overlap};
+use crate::backend::cuda::contracts::{Position, Tensor, TensorMut, dense_layout, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
@@ -408,7 +408,9 @@ impl LatentWindowAttention {
         inputs: LwaInputs,
         out: &mut TensorMut<bf16, 2>,
         p_mode: i32,
+        position: Position,
     ) -> Result<()> {
+        let (sequence, position) = position.arguments()?;
         let dims = validate(inputs, &out.0)?;
         no_overlap(&inputs.q, &out.0, "q", "out")?;
         no_overlap(&inputs.k_codes, &out.0, "k_codes", "out")?;
@@ -449,6 +451,8 @@ impl LatentWindowAttention {
                 .arg(&rope_tail)
                 .arg(&scale)
                 .arg(&p_mode)
+                .arg(&sequence)
+                .arg(&position)
                 .launch(LaunchConfig {
                     grid_dim: (dims.heads, 1, 1),
                     block_dim: (LWA_THREADS, 1, 1),
@@ -464,10 +468,11 @@ impl LatentWindowAttention {
         &self,
         stream: &Arc<CudaStream>,
         kv: Tensor<bf16, 2>,
-        position: i32,
+        position: Position,
         codes: &mut TensorMut<u8, 2>,
         scales: &mut TensorMut<u8, 2>,
     ) -> Result<()> {
+        let (sequence, position) = position.arguments()?;
         validate_ring_write(&kv, position, &codes.0, &scales.0)?;
         let rows = kv.shape[0];
         let head_dim = kv.shape[1];
@@ -484,6 +489,7 @@ impl LatentWindowAttention {
                 .arg(&i32::try_from(rows)?)
                 .arg(&i32::try_from(head_dim)?)
                 .arg(&i32::try_from(window)?)
+                .arg(&sequence)
                 .launch(LaunchConfig {
                     grid_dim: (u32::try_from(warps.div_ceil(8))?, 1, 1),
                     block_dim: (LWA_THREADS, 1, 1),
@@ -552,8 +558,9 @@ impl LatentWindowAttention {
         &self,
         stream: &Arc<CudaStream>,
         slots: &mut TensorMut<i32, 1>,
-        position: i32,
+        position: Position,
     ) -> Result<()> {
+        let (sequence, position) = position.arguments()?;
         require_dense(&slots.0, "window slots")?;
         let window = slots.0.shape[0];
         ensure!(
@@ -570,6 +577,7 @@ impl LatentWindowAttention {
                 .arg(&slots.0.ptr)
                 .arg(&position)
                 .arg(&i32::try_from(window)?)
+                .arg(&sequence)
                 .launch(crate::backend::cuda::ops::flat(window as usize))?;
         }
         Ok(())
@@ -1171,6 +1179,187 @@ mod tests {
         }
     }
 
+    fn live_position_replay(device: &Device, latent: &LatentWindowAttention) -> Result<()> {
+        let s = &device.stream;
+        let rope = crate::backend::cuda::ops::Ops::new(&device.ctx)?;
+        let mut input = testing::zeros::<bf16>(s, HEAD_DIM)?;
+        let query = s.clone_htod(
+            &(0..HEADS * HEAD_DIM)
+                .map(|i| bf16::from_f64(pattern(i + 719, 0.61)))
+                .collect::<Vec<_>>(),
+        )?;
+        let sink = s.clone_htod(
+            &(0..HEADS)
+                .map(|i| pattern(i + 337, 0.43) as f32)
+                .collect::<Vec<_>>(),
+        )?;
+        let attention = (0..2)
+            .map(|_| testing::zeros::<bf16>(s, HEADS * HEAD_DIM))
+            .collect::<Result<Vec<_>>>()?;
+        let mut metadata = s.clone_htod(&[127i32, 1, 128, 640, 1, 0, 0, 0])?;
+        let frequency = s.clone_htod(
+            &(0..ROPE_TAIL / 2)
+                .map(|i| (i as f32 + 1.0).recip())
+                .collect::<Vec<_>>(),
+        )?;
+        let buffers = (0..2)
+            .map(|_| -> Result<_> {
+                Ok((
+                    testing::zeros::<u8>(s, WINDOW * HEAD_DIM)?,
+                    testing::zeros::<u8>(s, WINDOW * (HEAD_DIM / 32))?,
+                    testing::zeros::<i32>(s, WINDOW)?,
+                    testing::zeros::<f32>(s, ROPE_TAIL)?,
+                    testing::zeros::<f32>(s, ROPE_TAIL)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sequence = crate::backend::cuda::contracts::SeqRef {
+            ptr: testing::view(&metadata, s, [8], [1])?.ptr,
+        };
+        device.finish_upload()?;
+        let input_view = testing::view(&input, s, [1, HEAD_DIM as u32], [HEAD_DIM as u64, 1])?;
+        let execute = |arm: usize, position: Position| -> Result<()> {
+            let (codes, scales, slots, forward, inverse) = &buffers[arm];
+            latent.ring_write(
+                s,
+                input_view,
+                position,
+                &mut testing::mut_view(
+                    codes,
+                    s,
+                    [WINDOW as u32, HEAD_DIM as u32],
+                    [HEAD_DIM as u64, 1],
+                )?,
+                &mut testing::mut_view(
+                    scales,
+                    s,
+                    [WINDOW as u32, (HEAD_DIM / 32) as u32],
+                    [(HEAD_DIM / 32) as u64, 1],
+                )?,
+            )?;
+            latent.window_slots(
+                s,
+                &mut testing::mut_view(slots, s, [WINDOW as u32], [1])?,
+                position,
+            )?;
+            rope.rope_pair_rows(
+                s,
+                testing::view(&frequency, s, [(ROPE_TAIL / 2) as u32], [1])?,
+                position,
+                1,
+                &mut testing::mut_view(forward, s, [1, ROPE_TAIL as u32], [ROPE_TAIL as u64, 1])?,
+                &mut testing::mut_view(inverse, s, [1, ROPE_TAIL as u32], [ROPE_TAIL as u64, 1])?,
+            )?;
+            latent.run(
+                s,
+                LwaInputs {
+                    q: testing::view(
+                        &query,
+                        s,
+                        [HEADS as u32, HEAD_DIM as u32],
+                        [HEAD_DIM as u64, 1],
+                    )?,
+                    k_codes: testing::view(
+                        codes,
+                        s,
+                        [WINDOW as u32, HEAD_DIM as u32],
+                        [HEAD_DIM as u64, 1],
+                    )?,
+                    k_scales: testing::view(
+                        scales,
+                        s,
+                        [WINDOW as u32, (HEAD_DIM / 32) as u32],
+                        [(HEAD_DIM / 32) as u64, 1],
+                    )?,
+                    slot_ids: testing::view(slots, s, [WINDOW as u32], [1])?,
+                    sink: testing::view(&sink, s, [HEADS as u32], [1])?,
+                    inv_rotary: testing::view(inverse, s, [ROPE_TAIL as u32], [1])?,
+                },
+                &mut testing::mut_view(
+                    &attention[arm],
+                    s,
+                    [HEADS as u32, HEAD_DIM as u32],
+                    [HEAD_DIM as u64, 1],
+                )?,
+                0,
+                position,
+            )
+        };
+        let graph = testing::capture(s, || {
+            execute(
+                1,
+                Position::Sequence {
+                    meta: sequence,
+                    row: 0,
+                },
+            )
+        })?;
+        let attention_bits = |arm: usize| -> Result<Vec<u16>> {
+            let values = s.clone_dtoh(&attention[arm])?;
+            ensure!(
+                values.iter().all(|v| v.is_finite()),
+                "Runner FAIL live-position attention non-finite"
+            );
+            Ok(values.iter().map(|v| v.to_bits()).collect())
+        };
+        for position in [0, 1, 63, 64, 126, 127, 128, 129, 511, 512, 598] {
+            let values: Vec<_> = (0..HEAD_DIM)
+                .map(|i| bf16::from_f64(pattern(i + 509 * position as usize, 0.37)))
+                .collect();
+            s.memcpy_htod(&values, &mut input)?;
+            s.memcpy_htod(&[position, 1, position + 1, 640, 1, 0, 0, 0], &mut metadata)?;
+            execute(0, Position::Fixed(position))?;
+            graph.launch()?;
+            let (a, b) = (&buffers[0], &buffers[1]);
+            ensure!(
+                s.clone_dtoh(&a.0)? == s.clone_dtoh(&b.0)?
+                    && s.clone_dtoh(&a.1)? == s.clone_dtoh(&b.1)?,
+                "graph ring position {position}"
+            );
+            ensure!(
+                s.clone_dtoh(&a.2)? == s.clone_dtoh(&b.2)?,
+                "graph window indices position {position}"
+            );
+            for (a, b) in [(&a.3, &b.3), (&a.4, &b.4)] {
+                ensure!(
+                    s.clone_dtoh(a)?
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .eq(s.clone_dtoh(b)?.iter().map(|v| v.to_bits())),
+                    "graph rotary position {position}"
+                );
+            }
+            ensure!(
+                attention_bits(0)? == attention_bits(1)?,
+                "graph attention position {position}"
+            );
+            println!(
+                "LIVE_POSITION_GRAPH position={position} ring_bits=0 window_bits=0 rotary_bits=0 attention_bits=0"
+            );
+        }
+        s.memcpy_htod(&[128, 1, 129, 640, 1, 0, 0, 0], &mut metadata)?;
+        execute(0, Position::Fixed(128))?;
+        graph.launch()?;
+        ensure!(
+            s.clone_dtoh(&buffers[0].0)? == s.clone_dtoh(&buffers[1].0)?
+                && s.clone_dtoh(&buffers[0].3)? == s.clone_dtoh(&buffers[1].3)?
+                && attention_bits(0)? == attention_bits(1)?,
+            "first-wrap control baseline differs"
+        );
+        s.memcpy_htod(&[127, 1, 128, 640, 1, 0, 0, 0], &mut metadata)?;
+        graph.launch()?;
+        ensure!(
+            s.clone_dtoh(&buffers[0].0)? != s.clone_dtoh(&buffers[1].0)?
+                && s.clone_dtoh(&buffers[0].3)? != s.clone_dtoh(&buffers[1].3)?
+                && attention_bits(0)? != attention_bits(1)?,
+            "stale graph position discriminator escaped"
+        );
+        println!(
+            "PASS LIVE_POSITION_GRAPH cases=11 stale_position_detected=true expected_position=128 stale_position=127"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
     fn latent_window_attention_matches_oracle() -> Result<()> {
@@ -1181,6 +1370,7 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let ops = LatentWindowAttention::new(&device.ctx)?;
+        live_position_replay(&device, &ops)?;
         let mut omitted_store_controls = 0;
         for &slots in &[1usize, 64, 128] {
             let fx = fixture(HEADS, HEAD_DIM, WINDOW, slots, 7);
@@ -1248,15 +1438,65 @@ mod tests {
                 sink,
                 inv_rotary: rotary,
             };
-            ops.run(s, inputs, &mut out_view, 0)?;
+            ops.run(
+                s,
+                inputs,
+                &mut out_view,
+                0,
+                Position::Fixed(slots as i32 - 1),
+            )?;
             let wrong_inputs = LwaInputs {
                 slot_ids: wrong_ids,
                 ..inputs
             };
-            ops.run(s, wrong_inputs, &mut wrong_view, 0)?;
+            ops.run(
+                s,
+                wrong_inputs,
+                &mut wrong_view,
+                0,
+                Position::Fixed(slots as i32 - 1),
+            )?;
             s.synchronize()?;
             let host = s.clone_dtoh(&out)?;
             let wrong_host = s.clone_dtoh(&wrong_out)?;
+            let mut metadata = testing::upload_device(
+                &device,
+                vec![slots as i32 - 1, 1, slots as i32, 256, 1, 0, 0, 0],
+            )?;
+            device.finish_upload()?;
+            let sequence = crate::backend::cuda::contracts::SeqRef {
+                ptr: testing::view(&metadata, s, [8], [1])?.ptr,
+            };
+            let graph = testing::capture(s, || {
+                ops.run(
+                    s,
+                    inputs,
+                    &mut out_view,
+                    0,
+                    Position::Sequence {
+                        meta: sequence,
+                        row: 0,
+                    },
+                )
+            })?;
+            for _ in 0..2 {
+                graph.launch()?;
+                ensure!(
+                    s.clone_dtoh(&out)? == host,
+                    "sequence graph attention bits differ slots={slots}"
+                );
+            }
+            if slots > 1 {
+                s.memcpy_htod(
+                    &[slots as i32 - 2, 1, slots as i32 - 1, 256, 1, 0, 0, 0],
+                    &mut metadata,
+                )?;
+                graph.launch()?;
+                ensure!(
+                    s.clone_dtoh(&out)? != host,
+                    "stale sequence attention control escaped slots={slots}"
+                );
+            }
             for head in 0..HEADS {
                 for d in 0..HEAD_DIM {
                     let got = host[head * HEAD_DIM + d];

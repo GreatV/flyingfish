@@ -2626,6 +2626,12 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
+        #[cfg(test)]
+        let _d1_range = deepseek::census_range(
+            self.deepseek_mixer.is_some(),
+            self.position,
+            &format!("layer={layer} stage={position}:{stage:?}"),
+        );
         match stage {
             crate::model::LayerStage::Common(op) => self.run_operator(op, layer, step, trace)?,
             crate::model::LayerStage::Mixer(mixer) => self.run_mixer(mixer, layer, step, trace)?,
@@ -4152,26 +4158,33 @@ impl Engine {
         self.prepare_deepseek_engram(&[committed_token], None)?;
         if graph {
             {
-                let result =
-                    if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
-                        #[cfg(feature = "cuda")]
-                        let launched = self.run_glm_graph();
-                        #[cfg(feature = "rocm")]
-                        let launched = Err(anyhow::anyhow!("GLM HIP graph decode is not bound"));
-                        launched
-                    } else if self.moe.is_some() {
-                        self.run_moe_graph(1)
-                    } else if let Some(graph) = &self.graph {
-                        #[cfg(feature = "cuda")]
-                        let launched = graph.launch().map_err(Into::into);
-                        #[cfg(feature = "rocm")]
-                        let launched = graph.launch();
-                        launched
-                    } else if self.dense_streaming() {
-                        self.run_dense_graph()
-                    } else {
-                        anyhow::bail!("decode graph is not captured");
-                    };
+                let result = if self.model_spec.architecture
+                    == crate::model_spec::Architecture::Glm5Next
+                {
+                    #[cfg(feature = "cuda")]
+                    let launched = self.run_glm_graph();
+                    #[cfg(feature = "rocm")]
+                    let launched = Err(anyhow::anyhow!("GLM HIP graph decode is not bound"));
+                    launched
+                } else if self.deepseek_mixer.is_some() {
+                    #[cfg(feature = "cuda")]
+                    let launched = self.run_deepseek_graph();
+                    #[cfg(feature = "rocm")]
+                    let launched = Err(anyhow::anyhow!("DeepSeek HIP graph decode is not bound"));
+                    launched
+                } else if self.moe.is_some() {
+                    self.run_moe_graph(1)
+                } else if let Some(graph) = &self.graph {
+                    #[cfg(feature = "cuda")]
+                    let launched = graph.launch().map_err(Into::into);
+                    #[cfg(feature = "rocm")]
+                    let launched = graph.launch();
+                    launched
+                } else if self.dense_streaming() {
+                    self.run_dense_graph()
+                } else {
+                    anyhow::bail!("decode graph is not captured");
+                };
                 if let Err(error) = result {
                     self.poisoned = true;
                     return Err(error);
@@ -4303,7 +4316,7 @@ impl Engine {
             .sum()
     }
 
-    /// DeepSeek-V4.1 and GLM-5.3 decode eagerly.
+    /// Graph capability of the bound execution path.
     pub fn graph_decode(&self) -> bool {
         if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
             #[cfg(feature = "cuda")]
@@ -4318,9 +4331,14 @@ impl Engine {
         ) {
             return false;
         }
-        #[cfg(feature = "cuda")]
-        if self.deepseek_mixer.is_some() {
-            return false;
+        if let Some(ffn) = &self.deepseek_ffn {
+            #[cfg(feature = "cuda")]
+            return self.moe_slots.is_some() && ffn.graphs.len() == self.config.num_hidden_layers;
+            #[cfg(feature = "rocm")]
+            {
+                let _ = ffn;
+                return false;
+            }
         }
         true
     }
@@ -4342,10 +4360,11 @@ impl Engine {
             self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,
             "GLM storage-only expert graph segments are not bound"
         );
-        ensure!(
-            self.graph_decode(),
-            "DeepSeek-V4.1 decode has no bound graph path"
-        );
+        #[cfg(feature = "cuda")]
+        if self.deepseek_mixer.is_some() {
+            return self.capture_deepseek();
+        }
+        ensure!(self.graph_decode(), "decode graph path is not bound");
         if self.moe.is_some() {
             return self.capture_moe();
         }

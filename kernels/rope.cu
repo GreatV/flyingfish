@@ -1,4 +1,5 @@
 #include "gpu_compat.cuh"
+#include "q38_contract.cuh"
 
 template<typename T>
 __device__ __forceinline__ void rotary_prefix(T* q,
@@ -645,7 +646,9 @@ extern "C" __global__ void qknorm_rope_table_kv_skip(__nv_bfloat16* qkv,
 // inv[r][2i+1]=-sin(a), a = (start + r) * inv_freq[i].
 extern "C" __global__ void rope_pair_rows(
     const float* __restrict__ inv_freq, int start, int rows, int tail,
-    float* __restrict__ fwd, float* __restrict__ inv) {
+    float* __restrict__ fwd, float* __restrict__ inv,
+    const Q38SequenceMeta* __restrict__ seq) {
+  start = sequence_position(seq, start);
   if (start < 0 || rows < 1 || tail < 2 || (tail % 2) != 0) __trap();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int half = tail / 2;

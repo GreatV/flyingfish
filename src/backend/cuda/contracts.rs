@@ -190,6 +190,28 @@ impl SeqRef {
     }
 }
 #[derive(Clone, Copy, Debug)]
+pub enum Position {
+    Fixed(i32),
+    Sequence { meta: SeqRef, row: u32 },
+}
+impl Position {
+    pub fn arguments(self) -> Result<(u64, i32)> {
+        match self {
+            Self::Fixed(position) => {
+                ensure!(
+                    (0..i32::MAX).contains(&position),
+                    "invalid position {position}"
+                );
+                Ok((0, position))
+            }
+            Self::Sequence { meta, row } => {
+                meta.validate()?;
+                Ok((meta.ptr, i32::try_from(row)?))
+            }
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
 pub struct RowDomain {
     pub meta: SeqRef,
     pub row_base: u32,

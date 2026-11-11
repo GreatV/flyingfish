@@ -28,6 +28,13 @@ __device__ __forceinline__ void q38_meta_guard(const Q38SequenceMeta* s, bool ca
         s->reserved[0] || s->reserved[1] || s->reserved[2]) __trap();
 }
 
+__device__ __forceinline__ int sequence_position(const Q38SequenceMeta* seq, int offset) {
+    if (!seq) return offset;
+    q38_meta_guard(seq);
+    if (offset < 0 || offset >= seq->valid_rows) __trap();
+    return seq->prefix + offset;
+}
+
 // E8M0FN scale: the value is 2^(code - 127); 0xff is NaN.
 __device__ __forceinline__ float e8m0_decode(uint8_t code) {
     if (code == 0xffu) return __uint_as_float(0x7fc00000u);
