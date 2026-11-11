@@ -1589,6 +1589,10 @@ impl F32Attention {
     pub(crate) fn workspace_bytes(&self) -> usize {
         (self.partials.len() + self.scores.len() + self.probabilities.len()) * size_of::<f32>()
     }
+    /// Query rows processed per workspace pass.
+    pub(crate) fn tile(&self) -> u32 {
+        self.tile
+    }
     pub(crate) fn required_bytes(geometry: [u32; 5]) -> Result<usize> {
         let (bytes, _, _) = Self::row_bytes(geometry)?;
         bytes

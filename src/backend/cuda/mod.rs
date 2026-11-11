@@ -31,6 +31,8 @@ pub(crate) mod engine_music3_syn;
 pub mod engine_parakeet;
 #[cfg(all(test, feature = "cuda"))]
 mod engine_parakeet_tests;
+#[cfg(feature = "cuda")]
+pub mod engine_trellis2;
 pub mod flash;
 pub mod gated_residual;
 pub(crate) mod gdn;
