@@ -155,7 +155,7 @@ impl Ops {
         &self,
         stream: &Arc<CudaStream>,
         inv_freq: Tensor<f32, 1>,
-        start: i32,
+        start: super::contracts::Position,
         rows: usize,
         forward: &mut TensorMut<f32, 2>,
         inverse: &mut TensorMut<f32, 2>,
@@ -188,7 +188,7 @@ impl Ops {
             "rope pair rows tail {tail} is not twice the inverse-frequency count {half}"
         );
         ensure!(rows >= 1, "rope pair rows {rows} is below 1");
-        ensure!(start >= 0, "rope pair rows start {start} is negative");
+        let (sequence, start) = start.arguments()?;
         ensure!(
             forward.0.shape == [u32::try_from(rows)?, u32::try_from(tail)?],
             "rope pair forward shape {:?} != expected [{rows}, {tail}]",
@@ -209,6 +209,7 @@ impl Ops {
                 .arg(&i32::try_from(tail)?)
                 .arg(&forward.0.ptr)
                 .arg(&inverse.0.ptr)
+                .arg(&sequence)
                 .launch(flat(rows * half))?;
         }
         Ok(())

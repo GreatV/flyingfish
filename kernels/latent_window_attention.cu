@@ -48,7 +48,11 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
     const uint8_t* __restrict__ k_scales, const int* __restrict__ slot_ids,
     const float* __restrict__ sink, const float* __restrict__ inv_rotary,
     __nv_bfloat16* __restrict__ out, int heads, int head_dim, int window,
-    int slots, int rope_tail, float scale, int p_mode) {
+    int slots, int rope_tail, float scale, int p_mode,
+    const Q38SequenceMeta* __restrict__ seq, int position) {
+  position = sequence_position(seq, position);
+  if (position < 0) __trap();
+  slots = min(slots, position + 1);
   if ((int)blockIdx.x >= heads || heads < 1 || head_dim < 1 || window < 1 ||
       slots < 1 || slots > window || (head_dim % LWA_SCALE_BLOCK) != 0 ||
       rope_tail < 0 || rope_tail > head_dim || (rope_tail % 2) != 0 ||
@@ -159,7 +163,8 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
 extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_ring_write(
     const __nv_bfloat16* __restrict__ kv, unsigned char* __restrict__ codes,
     unsigned char* __restrict__ scales, int position, int rows, int head_dim,
-    int window) {
+    int window, const Q38SequenceMeta* __restrict__ seq) {
+  position = sequence_position(seq, position);
   if (position < 0 || rows < 1 || head_dim < 1 || window < 1 ||
       (head_dim % LWA_SCALE_BLOCK) != 0 || blockDim.x != LWA_THREADS)
     __trap();
@@ -202,7 +207,9 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_act_quant(
 // definition, publisher model.py get_window_topk_idxs decode branch); entries
 // beyond the visible count are left untouched.
 extern "C" __global__ void latent_window_slots(int* slot_ids, int position,
-                                               int window) {
+                                               int window,
+                                               const Q38SequenceMeta* __restrict__ seq) {
+  position = sequence_position(seq, position);
   if (position < 0 || window < 1) __trap();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= window) return;

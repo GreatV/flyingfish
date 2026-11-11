@@ -609,8 +609,8 @@ mod tests {
         };
         let mut model = Model::load(&model_dir, 0, 64, None, settings)?;
         ensure!(
-            !model.graph_decode(),
-            "DeepSeek-V4.1 declared an unbound graph decode"
+            model.graph_decode(),
+            "DeepSeek-V4.1 graph decode is not bound"
         );
         for request in 0..2 {
             let mut seen = 0;
@@ -640,7 +640,7 @@ mod tests {
             "DeepSeek-V4.1 accepted a trace target it does not record"
         );
         println!(
-            "PASS deepseek_plain_serving requests=2 tokens=4 graph_decode=false trace_rejected=true"
+            "PASS deepseek_plain_serving requests=2 tokens=4 graph_decode=true trace_rejected=true"
         );
         Ok(())
     }
