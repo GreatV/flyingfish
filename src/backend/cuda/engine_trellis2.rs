@@ -84,6 +84,7 @@ pub struct TrellisSsFlow {
     cross_v: cudarc::driver::CudaSlice<bf16>,
     cross_kn: cudarc::driver::CudaSlice<bf16>,
     ff: cudarc::driver::CudaSlice<bf16>,
+    input_x: CudaSlice<f32>,
     time_embed: cudarc::driver::CudaSlice<f32>,
     mods: cudarc::driver::CudaSlice<bf16>,
     time_out: cudarc::driver::CudaSlice<f32>,
@@ -269,13 +270,18 @@ impl TrellisSsFlow {
             super::cubin::module(&device.ctx, "vision_ops")?,
         );
         let feed_forward = spec.feed_forward_width();
-        // Live set in bytes: F32 seven rows-wide arrays, two context-wide,
-        // the time buffers and the velocity output; BF16 fourteen rows-wide
-        // arrays including the QKV and feed-forward tails, five context-wide
-        // arrays, the conditioning context and the two modulation vectors;
-        // the u32 identity row.
+        // Live set in bytes: F32 seven rows-wide arrays, the staged input,
+        // two context-wide, the time buffers and the velocity output; BF16
+        // fourteen rows-wide arrays including the QKV and feed-forward tails,
+        // five context-wide arrays, the conditioning context and the two
+        // modulation vectors; the u32 identity row.
         let live = 4
-            * (rows * h * 7 + context_rows * h * 2 + 6 * h + 256 + rows * spec.out_channels)
+            * (rows * h * 7
+                + rows * spec.in_channels
+                + context_rows * h * 2
+                + 6 * h
+                + 256
+                + rows * spec.out_channels)
             + 2 * (rows * (h * 14 + feed_forward)
                 + context_rows * (h * 5 + spec.cond_channels)
                 + 12 * h)
@@ -356,6 +362,7 @@ impl TrellisSsFlow {
             cross_v: alloc(context_rows * h)?,
             cross_kn: alloc(context_rows * h)?,
             ff: alloc(rows * feed_forward)?,
+            input_x: device.stream.alloc_zeros(rows * spec.in_channels)?,
             time_embed: device.stream.alloc_zeros(256)?,
             mods: alloc(6 * h)?,
             time_out: device.stream.alloc_zeros(6 * h)?,
@@ -697,23 +704,23 @@ impl TrellisSsFlow {
         let d = &self.device;
         let n = self.rows;
         let h = self.width;
-        let x = d.stream.clone_htod(x_f32)?;
-        let context = d.stream.clone_htod(cond)?;
-        let input_rows = d.stream.alloc_zeros::<f32>(n * h)?;
+        d.stream
+            .memcpy_htod(x_f32, &mut self.input_x)
+            .map_err(anyhow::Error::from)?;
+        d.stream
+            .memcpy_htod(cond, &mut self.context)
+            .map_err(anyhow::Error::from)?;
         run_linear_f32(
             d,
             blas,
             &self.kernels,
             self.input,
             n,
-            [ptr(&x, d), ptr(&input_rows, d)],
+            [ptr(&self.input_x, d), ptr(&self.self_q32, d)],
             false,
         )?;
         self.kernels
-            .cast(d, ptr(&input_rows, d), ptr(&self.hidden, d), n * h)?;
-        d.stream
-            .memcpy_dtod(&context, &mut self.context)
-            .map_err(anyhow::Error::from)?;
+            .cast(d, ptr(&self.self_q32, d), ptr(&self.hidden, d), n * h)?;
         self.compute_time(blas, t)?;
         Ok(())
     }
@@ -1063,10 +1070,23 @@ mod tests {
                 } else {
                     &cond
                 };
+                let free_before_stage = if call == 2 {
+                    Some(device.ctx.mem_get_info()?.0)
+                } else {
+                    None
+                };
                 flow.stage(&blas, &rows, t, call_cond)?;
                 flow.compute(&blas, blocks)?;
                 let velocity = flow.read_velocity(&blas)?;
                 let captured = flow.read_capture(blocks)?;
+                if let Some(before) = free_before_stage {
+                    let after = device.ctx.mem_get_info()?.0;
+                    ensure!(
+                        after == before,
+                        "per-call device allocation: {before} -> {after}"
+                    );
+                    println!("TRELLIS2_SS_STAGE_ALLOC free_stable=true bytes={after}");
+                }
                 let reference = read_tensor(
                     &capture_dir.join(format!("flow-call{call}-velocity.safetensors")),
                     "velocity",
