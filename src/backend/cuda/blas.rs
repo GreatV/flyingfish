@@ -1428,14 +1428,7 @@ impl Blas {
         x: super::contracts::Tensor<half::f16, 2>,
         y: &mut super::contracts::TensorMut<half::f16, 2>,
     ) -> Result<()> {
-        bias.validate()?;
-        super::linear::validate_call(weight.shape, x, &y.0)?;
-        ensure!(
-            bias.shape == [weight.shape[0]] && bias.stride == [1],
-            "F16 bias extent"
-        );
-        super::linear::disjoint(&bias, &y.0)?;
-        super::linear::disjoint(&weight, &y.0)?;
+        Self::validate_f16_bias(weight, bias, x, y)?;
         let kernel = self
             .bias_fill_f16
             .as_ref()
@@ -1459,6 +1452,33 @@ impl Blas {
                     shared_mem_bytes: 0,
                 })?;
         }
+        self.linear_f16(weight, x, y, true)
+    }
+
+    fn validate_f16_bias(
+        weight: super::contracts::Tensor<half::f16, 2>,
+        bias: super::contracts::Tensor<half::f16, 1>,
+        x: super::contracts::Tensor<half::f16, 2>,
+        y: &super::contracts::TensorMut<half::f16, 2>,
+    ) -> Result<()> {
+        bias.validate()?;
+        super::linear::validate_call(weight.shape, x, &y.0)?;
+        ensure!(
+            bias.shape == [weight.shape[0]] && bias.stride == [1],
+            "F16 bias extent"
+        );
+        super::linear::disjoint(&bias, &y.0)?;
+        super::linear::disjoint(&weight, &y.0)
+    }
+
+    pub(crate) fn linear_f16_prefilled(
+        &self,
+        weight: super::contracts::Tensor<half::f16, 2>,
+        bias: super::contracts::Tensor<half::f16, 1>,
+        x: super::contracts::Tensor<half::f16, 2>,
+        y: &mut super::contracts::TensorMut<half::f16, 2>,
+    ) -> Result<()> {
+        Self::validate_f16_bias(weight, bias, x, y)?;
         self.linear_f16(weight, x, y, true)
     }
 

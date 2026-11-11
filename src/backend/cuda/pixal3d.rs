@@ -173,6 +173,7 @@ pub trait FlowElement: DeviceRepr + Copy + Default + ValidAsZeroBits {
         weights: (Tensor<Self, 2>, Tensor<Self, 1>),
         x: Tensor<Self, 2>,
         y: &mut TensorMut<Self, 2>,
+        prefilled: bool,
     ) -> Result<()>;
     fn attention(
         op: &mut Flash,
@@ -211,7 +212,9 @@ impl FlowElement for bf16 {
         weights: (Tensor<Self, 2>, Tensor<Self, 1>),
         x: Tensor<Self, 2>,
         y: &mut TensorMut<Self, 2>,
+        prefilled: bool,
     ) -> Result<()> {
+        ensure!(!prefilled, "BF16 prefilled flow linear is unsupported");
         blas.linear_biased(
             weights.0,
             weights.1,
@@ -257,8 +260,13 @@ impl FlowElement for f16 {
         weights: (Tensor<Self, 2>, Tensor<Self, 1>),
         x: Tensor<Self, 2>,
         y: &mut TensorMut<Self, 2>,
+        prefilled: bool,
     ) -> Result<()> {
-        blas.linear_f16_biased(weights.0, weights.1, x, y)
+        if prefilled {
+            blas.linear_f16_prefilled(weights.0, weights.1, x, y)
+        } else {
+            blas.linear_f16_biased(weights.0, weights.1, x, y)
+        }
     }
     fn attention(
         op: &mut Flash,
@@ -290,6 +298,16 @@ impl<T: FlowElement> Linear<T> {
             (self.weight, self.bias),
             matrix(input, rows, self.weight.shape[1] as usize)?,
             &mut TensorMut(matrix(output, rows, self.weight.shape[0] as usize)?),
+            false,
+        )
+    }
+    fn run_prefilled(self, blas: &Blas, rows: usize, input: u64, output: u64) -> Result<()> {
+        T::linear(
+            blas,
+            (self.weight, self.bias),
+            matrix(input, rows, self.weight.shape[1] as usize)?,
+            &mut TensorMut(matrix(output, rows, self.weight.shape[0] as usize)?),
+            true,
         )
     }
 }
@@ -308,6 +326,96 @@ struct Block<T: FlowElement> {
     modulation: u64,
     gamma: [u64; 4],
 }
+
+struct ProducerBias {
+    kernels: [CudaFunction; 4],
+    grids: [crate::backend::gpu::LaunchConfig; 4],
+    rows: u32,
+    width: u32,
+    output_widths: [u32; 4],
+}
+
+impl ProducerBias {
+    fn new(d: &Device, rows: usize, width: usize) -> Result<Self> {
+        ensure!(
+            rows > 0 && width == 2112,
+            "F16 producer bias requires P>0,H2112"
+        );
+        ensure!(
+            rows <= i32::MAX as usize,
+            "F16 producer bias row count exceeds GEMM limit"
+        );
+        let rows = u32::try_from(rows)?;
+        let width = u32::try_from(width)?;
+        let output_widths = [3 * width, width, 4 * width, width];
+        let grids = output_widths.map(|output| {
+            let bias_blocks = (u64::from(rows) * u64::from(output))
+                .div_ceil(256)
+                .min(65535);
+            grid(u64::from(rows).max(bias_blocks) as usize, 256)
+        });
+        let mut grids = grids;
+        grids[3] = grid(
+            (u64::from(rows) * u64::from(4 * width))
+                .div_ceil(256)
+                .min(65535) as usize,
+            256,
+        );
+        let module = cubin::module(&d.ctx, "q38_common")?;
+        Ok(Self {
+            kernels: [
+                module.load_function("layer_norm_modulate_bias_f16")?,
+                module.load_function("gated_add_layer_norm_bias_f16")?,
+                module.load_function("residual_layer_norm_modulate_bias_f16")?,
+                module.load_function("gelu_bias_fill_f16")?,
+            ],
+            grids,
+            rows,
+            width,
+            output_widths,
+        })
+    }
+
+    fn row(&self, d: &Device, inputs: [u64; 5], outputs: [u64; 3], site: usize) -> Result<()> {
+        ensure!(site < 3, "F16 producer bias row site invalid");
+        let [hidden, projected, modulation, weight, bias] = inputs;
+        let [normalized, output, output_bias] = outputs;
+        unsafe {
+            d.stream
+                .launch_builder(&self.kernels[site])
+                .arg(&hidden)
+                .arg(&projected)
+                .arg(&modulation)
+                .arg(&weight)
+                .arg(&bias)
+                .arg(&normalized)
+                .arg(&self.rows)
+                .arg(&self.width)
+                .arg(&1e-6f32)
+                .arg(&output)
+                .arg(&output_bias)
+                .arg(&self.output_widths[site])
+                .launch(self.grids[site])?;
+        }
+        Ok(())
+    }
+
+    fn gelu(&self, d: &Device, values: u64, output: u64, bias: u64) -> Result<()> {
+        unsafe {
+            d.stream
+                .launch_builder(&self.kernels[3])
+                .arg(&values)
+                .arg(&output)
+                .arg(&bias)
+                .arg(&self.rows)
+                .arg(&(4 * self.width))
+                .arg(&self.width)
+                .launch(self.grids[3])?;
+        }
+        Ok(())
+    }
+}
+
 struct Kernels {
     half: bool,
     heads: usize,
@@ -322,6 +430,9 @@ struct Kernels {
     row_norm: Option<[CudaFunction; 3]>,
     #[cfg(test)]
     row_norm_reference: bool,
+    producer_bias: Option<ProducerBias>,
+    #[cfg(test)]
+    bias_reference: bool,
     unpack_cross: CudaFunction,
     #[cfg(test)]
     context_chains: std::cell::Cell<usize>,
@@ -879,6 +990,9 @@ impl Kernels {
             },
             #[cfg(test)]
             row_norm_reference: false,
+            producer_bias: None,
+            #[cfg(test)]
+            bias_reference: false,
             unpack_cross: v.load_function(if T::HALF {
                 "kv_unpack_head_major_f16"
             } else {
@@ -1827,6 +1941,8 @@ impl Flow<f16> {
         self.prepare_contexts(&[positive, negative])?;
         #[cfg(test)]
         let mut context_defects = 0;
+        #[cfg(test)]
+        let mut bias_defects = 0;
         let negative_values = state
             .negative
             .as_mut()
@@ -1851,6 +1967,14 @@ impl Flow<f16> {
                         &mut state.positive,
                         &compact,
                         &mut context_defects,
+                    )?;
+                    tests::flow_bias_identity(
+                        self,
+                        input,
+                        positive,
+                        &mut state.positive,
+                        &compact,
+                        &mut bias_defects,
                     )?;
                 }
                 let output = if stage == 0 {
@@ -1940,6 +2064,13 @@ impl Flow<f16> {
                 self.context_cache.is_some()
             );
             ensure!(context_defects == 0, "sampler context cache defects");
+            println!(
+                "{} F16_PRODUCER_BIAS_SAMPLER_IDENTITY input_rows={rows} parent_rows={} enabled={} defects={bias_defects} threshold_bits=0 timing=false",
+                if bias_defects == 0 { "PASS" } else { "DEFECT" },
+                self.rows,
+                self.context_cache.is_some()
+            );
+            ensure!(bias_defects == 0, "sampler producer bias defects");
         }
         Ok(values)
     }
@@ -2018,7 +2149,8 @@ impl Flow<f16> {
                 .and_then(|n| n.checked_add(io_bytes))
                 .context("flow placement bytes overflow")?,
         )?;
-        let kernels = Kernels::load::<f16>(&device, &spec)?;
+        let mut kernels = Kernels::load::<f16>(&device, &spec)?;
+        kernels.producer_bias = Some(ProducerBias::new(&device, rows, h)?);
         let ops = Ops::new(&device.ctx)?;
         let mut blas = Blas::new(
             &device,
@@ -2647,13 +2779,36 @@ impl<T: FlowElement> Flow<T> {
         let row_fused = T::HALF;
         #[cfg(test)]
         let row_fused = row_fused && !k.row_norm_reference;
-        if row_fused {
+        let producer_bias = if T::HALF {
+            Some(
+                k.producer_bias
+                    .as_ref()
+                    .context("F16 producer bias not prepared")?,
+            )
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let producer_bias = producer_bias.filter(|_| !k.bias_reference && row_fused);
+        if let Some(preparation) = producer_bias {
+            preparation.row(
+                d,
+                [hidden, 0, bm, 0, 0],
+                [norm, ptr(&self.work.qkv, d), b.qkv.bias.ptr],
+                0,
+            )?;
+        } else if row_fused {
             k.prepare_row_norm(d, [hidden, 0, bm, 0, 0], norm, [n, h], 0)?;
         } else {
             k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
             self.modulate(norm, bm, 0)?;
         }
-        b.qkv.run(&self.blas, n, norm, ptr(&self.work.qkv, d))?;
+        if producer_bias.is_some() {
+            b.qkv
+                .run_prefilled(&self.blas, n, norm, ptr(&self.work.qkv, d))?;
+        } else {
+            b.qkv.run(&self.blas, n, norm, ptr(&self.work.qkv, d))?;
+        }
         let fused = T::HALF;
         #[cfg(test)]
         let fused = fused && !k.qkv_reference;
@@ -2719,7 +2874,20 @@ impl<T: FlowElement> Flow<T> {
             [0, 0],
         )?;
         b.self_out.run(&self.blas, n, attention, projected)?;
-        if row_fused {
+        if let Some(preparation) = producer_bias {
+            preparation.row(
+                d,
+                [
+                    hidden,
+                    projected,
+                    bm + (2 * h * 4) as u64,
+                    b.norm_weight,
+                    b.norm_bias,
+                ],
+                [norm, q, b.cross_q.bias.ptr],
+                1,
+            )?;
+        } else if row_fused {
             k.prepare_row_norm(
                 d,
                 [
@@ -2744,7 +2912,11 @@ impl<T: FlowElement> Flow<T> {
                 (1e-6, false),
             )?;
         }
-        b.cross_q.run(&self.blas, n, norm, q)?;
+        if producer_bias.is_some() {
+            b.cross_q.run_prefilled(&self.blas, n, norm, q)?;
+        } else {
+            b.cross_q.run(&self.blas, n, norm, q)?;
+        }
         if T::HALF {
             let context_rows = conditioning.global.len() / self.spec.cond_channels;
             let (keys, values, offsets) = if let Some(slot) = cache_slot {
@@ -2890,7 +3062,14 @@ impl<T: FlowElement> Flow<T> {
             k.residual(d, norm, projected, n * h)?;
             k.residual(d, hidden, norm, n * h)?;
         }
-        if row_fused {
+        if let Some(preparation) = producer_bias {
+            preparation.row(
+                d,
+                [hidden, projected, bm + (3 * h * 4) as u64, 0, 0],
+                [norm, ptr(&self.work.ff, d), b.fc1.bias.ptr],
+                2,
+            )?;
+        } else if row_fused {
             k.prepare_row_norm(
                 d,
                 [hidden, projected, bm + (3 * h * 4) as u64, 0, 0],
@@ -2902,25 +3081,39 @@ impl<T: FlowElement> Flow<T> {
             k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
             self.modulate(norm, bm, 3)?;
         }
-        b.fc1.run(&self.blas, n, norm, ptr(&self.work.ff, d))?;
-        unsafe {
-            d.stream
-                .launch_builder(&k.gelu)
-                .arg(&self.work.ff)
-                .arg(&self.work.ff)
-                .arg(&(n as u32))
-                .arg(&1u32)
-                .arg(&(ff as u32))
-                .arg(&(ff as u64))
-                .arg(&0u64)
-                .arg(&1u64)
-                .arg(&(ff as u64))
-                .arg(&0u64)
-                .arg(&1u64)
-                .arg(&1i32)
-                .launch(grid((n * ff).div_ceil(256).min(65535), 256))?;
+        if producer_bias.is_some() {
+            b.fc1
+                .run_prefilled(&self.blas, n, norm, ptr(&self.work.ff, d))?;
+        } else {
+            b.fc1.run(&self.blas, n, norm, ptr(&self.work.ff, d))?;
         }
-        b.fc2.run(&self.blas, n, ptr(&self.work.ff, d), projected)?;
+        if let Some(preparation) = producer_bias {
+            preparation.gelu(d, ptr(&self.work.ff, d), projected, b.fc2.bias.ptr)?;
+        } else {
+            unsafe {
+                d.stream
+                    .launch_builder(&k.gelu)
+                    .arg(&self.work.ff)
+                    .arg(&self.work.ff)
+                    .arg(&(n as u32))
+                    .arg(&1u32)
+                    .arg(&(ff as u32))
+                    .arg(&(ff as u64))
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&(ff as u64))
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&1i32)
+                    .launch(grid((n * ff).div_ceil(256).min(65535), 256))?;
+            }
+        }
+        if producer_bias.is_some() {
+            b.fc2
+                .run_prefilled(&self.blas, n, ptr(&self.work.ff, d), projected)?;
+        } else {
+            b.fc2.run(&self.blas, n, ptr(&self.work.ff, d), projected)?;
+        }
         self.gated_add(projected, bm, 5)?;
         Ok(())
     }
