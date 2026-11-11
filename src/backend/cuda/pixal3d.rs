@@ -181,6 +181,7 @@ pub trait FlowElement: DeviceRepr + Copy + Default + ValidAsZeroBits {
         v: &CudaSlice<Self>,
         output: &mut CudaSlice<Self>,
         shape: Shape,
+        offsets: [usize; 2],
     ) -> Result<()>;
 }
 impl FlowElement for bf16 {
@@ -226,7 +227,12 @@ impl FlowElement for bf16 {
         v: &CudaSlice<Self>,
         output: &mut CudaSlice<Self>,
         shape: Shape,
+        offsets: [usize; 2],
     ) -> Result<()> {
+        ensure!(
+            offsets == [0, 0],
+            "BF16 attention cache offsets are unsupported"
+        );
         op.run(q, shape.q_heads * shape.head_dim, k, v, output, shape)
     }
 }
@@ -261,12 +267,14 @@ impl FlowElement for f16 {
         v: &CudaSlice<Self>,
         output: &mut CudaSlice<Self>,
         shape: Shape,
+        offsets: [usize; 2],
     ) -> Result<()> {
+        let count = shape.kv_heads * shape.capacity * shape.head_dim;
         op.run_f16(
             &q.slice(..),
             shape.q_heads * shape.head_dim,
-            &k.slice(..),
-            &v.slice(..),
+            &k.slice(offsets[0]..offsets[0] + count),
+            &v.slice(offsets[1]..offsets[1] + count),
             &mut output.slice_mut(..),
             (shape.rows, shape.capacity, shape.capacity),
         )
@@ -315,6 +323,8 @@ struct Kernels {
     #[cfg(test)]
     row_norm_reference: bool,
     unpack_cross: CudaFunction,
+    #[cfg(test)]
+    context_chains: std::cell::Cell<usize>,
     rope: CudaFunction,
     rope_hm: CudaFunction,
     phases: CudaFunction,
@@ -534,6 +544,51 @@ struct SparseFlowIo {
     silu: CudaFunction,
 }
 impl SparseFlowIo {
+    fn gather_partition(shape: [usize; 4], budget: usize) -> Result<[usize; 8]> {
+        let [rows, parents, hidden, channels] = shape;
+        let width = hidden
+            .max(channels)
+            .checked_mul(2)
+            .context("sparse gather width overflow")?;
+        ensure!(
+            rows > 0
+                && parents > 0
+                && hidden >= 2
+                && channels >= 2
+                && width <= i32::MAX as usize / 27,
+            "invalid sparse gather geometry"
+        );
+        let full = rows
+            .checked_mul(27 * width)
+            .context("shared sparse gather extent overflow")?;
+        let elements = full.min(budget / size_of::<f16>());
+        let shapes = [
+            (rows, channels),
+            (rows, channels / 2),
+            (parents, channels),
+            (parents, hidden / 2),
+            (rows, 2 * hidden),
+            (rows, channels / 2),
+            (rows, 2 * channels),
+            (rows, channels / 2),
+        ];
+        let mut partition = [0; 8];
+        for ((rows, channels), tile) in shapes.into_iter().zip(&mut partition) {
+            *tile = SparseConv::tile_rows(rows, channels, elements)?;
+        }
+        Ok(partition)
+    }
+    fn context_cache_fits(shape: [usize; 4], budget: usize, growth: usize) -> Result<bool> {
+        let baseline = Self::gather_partition(shape, budget)?;
+        ensure!(
+            baseline.iter().all(|&rows| rows > 0),
+            "sparse gather cannot fit one row"
+        );
+        let Some(remaining) = budget.checked_sub(growth) else {
+            return Ok(false);
+        };
+        Ok(Self::gather_partition(shape, remaining)? == baseline)
+    }
     fn new(
         d: &Device,
         sites: &SparseSites,
@@ -829,6 +884,8 @@ impl Kernels {
             } else {
                 "qkv_unpack_hm_bf16"
             })?,
+            #[cfg(test)]
+            context_chains: std::cell::Cell::new(0),
             rope: r.load_function(if T::HALF {
                 "rope_pair_tail_f16"
             } else {
@@ -970,6 +1027,25 @@ impl Kernels {
                 .arg(&1e-6f32)
                 .launch(grid(rows, 256))?;
         }
+        Ok(())
+    }
+    fn prepare_cross_kv<T: FlowElement>(
+        &self,
+        d: &Device,
+        blas: &Blas,
+        linear: Linear<T>,
+        input: u64,
+        outputs: [u64; 3],
+        rows: usize,
+    ) -> Result<()> {
+        ensure!(
+            self.half && T::HALF,
+            "context cache projection requires F16"
+        );
+        linear.run(blas, rows, input, outputs[0])?;
+        self.unpack(d, outputs[0], [0, outputs[1], outputs[2]], rows, 2)?;
+        #[cfg(test)]
+        self.context_chains.set(self.context_chains.get() + 1);
         Ok(())
     }
     fn norm(
@@ -1275,6 +1351,37 @@ fn validate_conditioning_origin(origin: &Rc<()>, flow: &Rc<()>) -> Result<()> {
     Ok(())
 }
 
+fn conditioning_cache_slot(bindings: &[Option<Rc<()>>; 2], identity: &Rc<()>) -> Result<usize> {
+    bindings
+        .iter()
+        .position(|binding| {
+            binding
+                .as_ref()
+                .is_some_and(|key| Rc::ptr_eq(key, identity))
+        })
+        .context("conditioning has no prepared context cache binding")
+}
+
+fn context_cache_offsets(geometry: [usize; 3], slot: usize, block: usize) -> Result<[usize; 2]> {
+    let [blocks, rows, channels] = geometry;
+    ensure!(
+        blocks > 0 && rows > 0 && channels > 0 && slot < 2 && block < blocks,
+        "context cache index exceeds geometry"
+    );
+    let plane = rows
+        .checked_mul(channels)
+        .context("context cache plane overflow")?;
+    let pair = plane
+        .checked_mul(2)
+        .context("context cache pair overflow")?;
+    blocks
+        .checked_mul(2)
+        .and_then(|n| n.checked_mul(pair))
+        .context("context cache capacity overflow")?;
+    let first = (slot * blocks + block) * pair;
+    Ok([first, first + plane])
+}
+
 pub(crate) fn validate_projection_binding(
     origins: [&Rc<()>; 2],
     coordinates: [&[[i32; 3]]; 2],
@@ -1296,6 +1403,7 @@ pub(crate) fn validate_projection_binding(
 
 pub struct Conditioning<T: FlowElement = bf16> {
     origin: Rc<()>,
+    identity: Rc<()>,
     global: CudaSlice<T>,
     projected: CudaSlice<T>,
     concat: Option<CudaSlice<f32>>,
@@ -1320,6 +1428,12 @@ pub struct Flow<T: FlowElement = bf16> {
     flash: Flash,
     cross: CrossAttention,
     work: Work<T>,
+    context_cache: Option<CudaSlice<T>>,
+    context_bindings: [Option<Rc<()>>; 2],
+    #[cfg(test)]
+    context_reference: bool,
+    #[cfg(test)]
+    context_allowance: usize,
     phases: CudaSlice<f32>,
     mods: CudaSlice<T>,
     time_count: usize,
@@ -1673,6 +1787,12 @@ impl Flow<bf16> {
             flash,
             cross: CrossAttention::F32(cross),
             work,
+            context_cache: None,
+            context_bindings: [None, None],
+            #[cfg(test)]
+            context_reference: false,
+            #[cfg(test)]
+            context_allowance: 0,
             phases,
             mods,
             time_count: 0,
@@ -1704,6 +1824,9 @@ impl Flow<f16> {
             .collect();
         self.set_times(&model_times)?;
         let mut state = Sampler::new(&self.device, noise, true)?;
+        self.prepare_contexts(&[positive, negative])?;
+        #[cfg(test)]
+        let mut context_defects = 0;
         let negative_values = state
             .negative
             .as_mut()
@@ -1718,6 +1841,18 @@ impl Flow<f16> {
             for (stage, t) in [time, next].into_iter().enumerate() {
                 let input = if stage == 0 { &state.state } else { &*x0 };
                 self.forward(input, 2 * step + stage, positive, &mut state.positive)?;
+                #[cfg(test)]
+                if step == 0 && stage == 0 {
+                    let compact = self.device.stream.clone_dtoh(&state.positive)?;
+                    tests::flow_context_identity(
+                        self,
+                        input,
+                        positive,
+                        &mut state.positive,
+                        &compact,
+                        &mut context_defects,
+                    )?;
+                }
                 let output = if stage == 0 {
                     &mut state.velocity
                 } else {
@@ -1792,6 +1927,20 @@ impl Flow<f16> {
             values.iter().all(|x| x.is_finite()),
             "non-finite Heun output"
         );
+        #[cfg(test)]
+        {
+            println!(
+                "{} F16_CONTEXT_SAMPLER_IDENTITY input_rows={rows} parent_rows={} enabled={} defects={context_defects} threshold_bits=0 timing=false",
+                if context_defects == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                },
+                self.rows,
+                self.context_cache.is_some()
+            );
+            ensure!(context_defects == 0, "sampler context cache defects");
+        }
         Ok(values)
     }
 
@@ -1952,7 +2101,7 @@ impl Flow<f16> {
             Linear::bind(&float, &device, "adaLN_modulation.1", [6 * h, h])?,
         ];
         let phases = spatial_phases(&device, &kernels, &parent)?;
-        let work = Work::new(&device, rows, &spec, context_rows)?;
+        let mut work = Work::new(&device, rows, &spec, context_rows)?;
         let flash = Flash::new_f16(
             device.stream.clone(),
             rows,
@@ -1992,7 +2141,41 @@ impl Flow<f16> {
             .and_then(|n| n.checked_add(time_bytes))
             .and_then(|n| n.checked_add(total / 16))
             .context("flow live bytes overflow")?;
-        let remaining = device.workspace_budget(free, budget, live_bytes)?;
+        let baseline_remaining = device.workspace_budget(free, budget, live_bytes)?;
+        let io_shape = [io_rows, rows, h, 256];
+        let baseline_partition = SparseFlowIo::gather_partition(io_shape, baseline_remaining)?;
+        let cache_elements = count(&[2, spec.num_blocks, 2, context_rows, h])?;
+        let cache_bytes = count(&[cache_elements, size_of::<f16>()])?;
+        let retired_bytes = work.cross_kn.num_bytes() + work.cross_v.num_bytes();
+        let growth = cache_bytes
+            .checked_sub(retired_bytes)
+            .context("context cache extent differs")?;
+        let zero_context_bytes = count(&[context_rows, spec.cond_channels, size_of::<f32>()])?;
+        let cache_peak_growth = growth
+            .checked_add(zero_context_bytes)
+            .context("context cache peak overflow")?;
+        let (context_cache, remaining) = if SparseFlowIo::context_cache_fits(
+            io_shape,
+            baseline_remaining,
+            cache_peak_growth,
+        )? {
+            work.cross_kn = device.stream.alloc_zeros(0)?;
+            work.cross_v = device.stream.alloc_zeros(0)?;
+            let cache = device.stream.alloc_zeros(cache_elements).with_context(|| {
+                format!("F16 context cache allocation failed: need {cache_bytes} bytes, budget {budget}, initial free {free}, measured legacy bank allowance {baseline_remaining}")
+            })?;
+            let cache_live_bytes = live_bytes
+                .checked_add(zero_context_bytes)
+                .context("context cache live bytes overflow")?;
+            let remaining = device.workspace_budget(free, budget, cache_live_bytes)?;
+            ensure!(
+                SparseFlowIo::gather_partition(io_shape, remaining)? == baseline_partition,
+                "context cache allocation changed sparse partitions; baseline allowance {baseline_remaining}, actual {remaining}, cache {cache_bytes}"
+            );
+            (Some(cache), remaining)
+        } else {
+            (None, baseline_remaining)
+        };
         let io = SparseFlowIo::new(
             &device,
             &sites,
@@ -2001,16 +2184,43 @@ impl Flow<f16> {
             (&half, &float),
             remaining,
         )?;
+        let actual_partition = std::array::from_fn(|i| io.blocks[i / 2].conv[i % 2].tile);
+        ensure!(
+            actual_partition == baseline_partition,
+            "constructed sparse partitions differ from setup"
+        );
         device.workspace_budget(free, budget, sampler_bytes + conditioning_bytes)?;
         #[cfg(test)]
         {
             let gather_bytes = io.blocks[2].conv[0].workspace_bytes() - io.rows * 27 * 4;
+            let work_bytes = work_bytes
+                - if context_cache.is_some() {
+                    retired_bytes
+                } else {
+                    0
+                };
             println!(
                 "SPARSE_FLOW_PLACEMENT published_bytes={} config_affine_bytes={} work_bytes={work_bytes} io_bytes={io_bytes} shared_gather_bytes={gather_bytes} sampler_bytes={sampler_bytes} conditioning_bytes={conditioning_bytes} device_reserve_bytes={} training_grid={} execution_grid={resolution} input_rows={io_rows} parent_rows={rows}",
                 checkpoint.runtime_bytes,
                 2 * spec.out_channels * 4,
                 total / 16,
                 checkpoint.spec.resolution
+            );
+            println!(
+                "F16_CONTEXT_CACHE_PLAN enabled={} cache_bytes={} retired_work_bytes={} fixed_growth_bytes={} zero_context_reserve_bytes={} baseline_bank_allowance={baseline_remaining} actual_bank_allowance={remaining} partitions={actual_partition:?} input_rows={io_rows} parent_rows={rows} timing=false",
+                context_cache.is_some(),
+                context_cache.as_ref().map_or(0, CudaSlice::num_bytes),
+                if context_cache.is_some() {
+                    retired_bytes
+                } else {
+                    0
+                },
+                if context_cache.is_some() { growth } else { 0 },
+                if context_cache.is_some() {
+                    zero_context_bytes
+                } else {
+                    0
+                }
             );
         }
         Ok(Self {
@@ -2033,6 +2243,12 @@ impl Flow<f16> {
             flash,
             cross: CrossAttention::F16(cross),
             work,
+            context_cache,
+            context_bindings: [None, None],
+            #[cfg(test)]
+            context_reference: false,
+            #[cfg(test)]
+            context_allowance: baseline_remaining,
             phases,
             mods,
             time_count: 0,
@@ -2141,6 +2357,81 @@ impl<T: FlowElement> Flow<T> {
         self.time_count = n;
         Ok(())
     }
+    fn prepare_contexts(&mut self, contexts: &[&Conditioning<T>]) -> Result<()> {
+        self.context_bindings = [None, None];
+        ensure!(
+            !contexts.is_empty() && contexts.len() <= 2,
+            "context cache requires one or two conditions"
+        );
+        ensure!(
+            contexts.len() == 1 || !Rc::ptr_eq(&contexts[0].identity, &contexts[1].identity),
+            "context cache conditions must have distinct identities"
+        );
+        for condition in contexts {
+            validate_conditioning_origin(&condition.origin, &self.origin)?;
+            ensure!(
+                condition.global.context() == &self.device.ctx,
+                "context cache device differs"
+            );
+            ensure!(
+                condition.global.len()
+                    == (if T::HALF { 2917 } else { 5 }) * self.spec.cond_channels,
+                "context cache input extent differs"
+            );
+        }
+        let Some(cache) = &self.context_cache else {
+            return Ok(());
+        };
+        ensure!(T::HALF, "context cache requires F16");
+        #[cfg(test)]
+        let before = self.kernels.context_chains.get();
+        let base = ptr(cache, &self.device);
+        for (slot, condition) in contexts.iter().enumerate() {
+            for (index, block) in self.blocks.iter().enumerate() {
+                let offsets = context_cache_offsets(
+                    [self.blocks.len(), 2917, self.spec.model_channels],
+                    slot,
+                    index,
+                )?;
+                self.kernels.prepare_cross_kv(
+                    &self.device,
+                    &self.blas,
+                    block.cross_kv,
+                    ptr(&condition.global, &self.device),
+                    [
+                        ptr(&self.work.cross_kv, &self.device),
+                        base + (offsets[0] * size_of::<T>()) as u64,
+                        base + (offsets[1] * size_of::<T>()) as u64,
+                    ],
+                    2917,
+                )?;
+            }
+        }
+        for (binding, condition) in self.context_bindings.iter_mut().zip(contexts) {
+            *binding = Some(condition.identity.clone());
+        }
+        #[cfg(test)]
+        println!(
+            "F16_CONTEXT_CACHE_FILL contexts={} blocks={} chains={} setup_only=true",
+            contexts.len(),
+            self.blocks.len(),
+            self.kernels.context_chains.get() - before
+        );
+        Ok(())
+    }
+    fn context_slot(&self, condition: &Conditioning<T>) -> Result<Option<usize>> {
+        if self.context_cache.is_none() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.context_reference {
+            return Ok(None);
+        }
+        Ok(Some(conditioning_cache_slot(
+            &self.context_bindings,
+            &condition.identity,
+        )?))
+    }
     pub fn conditioning(
         &self,
         global: &[f32],
@@ -2175,6 +2466,7 @@ impl<T: FlowElement> Flow<T> {
         };
         Ok(Conditioning {
             origin: self.origin.clone(),
+            identity: Rc::new(()),
             global: cast(global)?,
             projected: cast(projected)?,
             concat: None,
@@ -2200,6 +2492,7 @@ impl<T: FlowElement> Flow<T> {
         );
         Ok(Conditioning {
             origin: self.origin.clone(),
+            identity: Rc::new(()),
             global: self.cast_conditioning(global)?,
             projected: self.device.stream.alloc_zeros(0)?,
             concat: None,
@@ -2239,6 +2532,7 @@ impl<T: FlowElement> Flow<T> {
         );
         Ok(Conditioning {
             origin: self.origin.clone(),
+            identity: Rc::new(()),
             global: self.cast_conditioning(global)?,
             projected: self.cast_conditioning(projected)?,
             concat: None,
@@ -2321,6 +2615,7 @@ impl<T: FlowElement> Flow<T> {
         index: usize,
         modulation: u64,
         conditioning: &Conditioning<T>,
+        cache_slot: Option<usize>,
     ) -> Result<()> {
         let d = &self.device;
         let n = self.rows;
@@ -2421,6 +2716,7 @@ impl<T: FlowElement> Flow<T> {
                 causal: false,
                 window_left: None,
             },
+            [0, 0],
         )?;
         b.self_out.run(&self.blas, n, attention, projected)?;
         if row_fused {
@@ -2451,26 +2747,47 @@ impl<T: FlowElement> Flow<T> {
         b.cross_q.run(&self.blas, n, norm, q)?;
         if T::HALF {
             let context_rows = conditioning.global.len() / self.spec.cond_channels;
-            b.cross_kv.run(
-                &self.blas,
-                context_rows,
-                ptr(&conditioning.global, d),
-                ptr(&self.work.cross_kv, d),
-            )?;
-            k.unpack(
-                d,
-                ptr(&self.work.cross_kv, d),
-                [0, ptr(&self.work.cross_kn, d), ptr(&self.work.cross_v, d)],
-                context_rows,
-                2,
-            )?;
+            let (keys, values, offsets) = if let Some(slot) = cache_slot {
+                let cache = self
+                    .context_cache
+                    .as_ref()
+                    .context("context cache missing")?;
+                let offsets =
+                    context_cache_offsets([self.blocks.len(), context_rows, h], slot, index)?;
+                ensure!(
+                    offsets[1] + context_rows * h <= cache.len(),
+                    "context cache slot exceeds capacity"
+                );
+                (cache, cache, offsets)
+            } else {
+                b.cross_kv.run(
+                    &self.blas,
+                    context_rows,
+                    ptr(&conditioning.global, d),
+                    ptr(&self.work.cross_kv, d),
+                )?;
+                k.unpack(
+                    d,
+                    ptr(&self.work.cross_kv, d),
+                    [0, ptr(&self.work.cross_kn, d), ptr(&self.work.cross_v, d)],
+                    context_rows,
+                    2,
+                )?;
+                #[cfg(test)]
+                k.context_chains.set(k.context_chains.get() + 1);
+                (&self.work.cross_kn, &self.work.cross_v, [0, 0])
+            };
             let CrossAttention::F16(cross) = &mut self.cross else {
                 anyhow::bail!("F16 cross binding missing");
             };
             if CONTROL {
                 zero_attention_tail(
                     d,
-                    [q, ptr(&self.work.cross_kn, d), ptr(&self.work.cross_v, d)],
+                    [
+                        q,
+                        ptr(keys, d) + (offsets[0] * size_of::<T>()) as u64,
+                        ptr(values, d) + (offsets[1] * size_of::<T>()) as u64,
+                    ],
                     [n, context_rows, context_rows],
                     h,
                 )?;
@@ -2478,8 +2795,8 @@ impl<T: FlowElement> Flow<T> {
             T::attention(
                 cross,
                 &self.work.q,
-                &self.work.cross_kn,
-                &self.work.cross_v,
+                keys,
+                values,
                 &mut self.work.attention,
                 Shape {
                     rows: n,
@@ -2491,6 +2808,7 @@ impl<T: FlowElement> Flow<T> {
                     causal: false,
                     window_left: None,
                 },
+                offsets,
             )?;
             b.cross_out.run(&self.blas, n, attention, projected)?;
             if !row_fused {
@@ -2679,6 +2997,9 @@ impl<T: FlowElement> Flow<T> {
             "flow input/time extent differs from setup"
         );
         validate_conditioning_origin(&conditioning.origin, &self.origin)?;
+        let cache_slot = self.context_slot(conditioning)?;
+        #[cfg(test)]
+        let context_chains = self.kernels.context_chains.get();
         ensure!(
             conditioning.global.len() == (if T::HALF { 2917 } else { 5 }) * self.spec.cond_channels
                 && conditioning.projected.len()
@@ -2752,8 +3073,26 @@ impl<T: FlowElement> Flow<T> {
         }
         let modulation = ptr(&self.mods, &self.device) + (time * 6 * h * 2) as u64;
         for i in 0..self.blocks.len() {
-            self.block::<false>(i, modulation, conditioning)?;
+            self.block::<false>(i, modulation, conditioning, cache_slot)?;
             observe(self, i)?;
+        }
+        #[cfg(test)]
+        if T::HALF {
+            let chains = self.kernels.context_chains.get() - context_chains;
+            ensure!(
+                chains
+                    == if cache_slot.is_some() {
+                        0
+                    } else {
+                        self.blocks.len()
+                    },
+                "flow context projection count differs from prepared mode"
+            );
+            println!(
+                "F16_CONTEXT_FORWARD enabled={} chains={chains} blocks={} setup_only=false",
+                cache_slot.is_some(),
+                self.blocks.len()
+            );
         }
         if let Some(io) = &mut self.io {
             let d = &self.device;
@@ -4104,6 +4443,7 @@ impl PixalGeneration<'_> {
         } else {
             Some(Conditioning {
                 origin: flow.origin.clone(),
+                identity: Rc::new(()),
                 global: device.stream.alloc_zeros(positive.global.len())?,
                 projected: device.stream.alloc_zeros(positive.projected.len())?,
                 concat: None,
