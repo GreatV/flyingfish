@@ -2161,10 +2161,17 @@ fn hi3d_flow_blocks_gpu() -> Result<()> {
             );
             for control in [false, true] {
                 flow.work.hidden = flow.device.stream.clone_htod(&values)?;
+                flow.prepare_contexts(&[&conditioning])?;
+                let slot = flow.context_slot(&conditioning)?;
                 if control {
-                    flow.block::<true>(index, ptr(&modulation, &flow.device), &conditioning)?;
+                    flow.block::<true>(index, ptr(&modulation, &flow.device), &conditioning, slot)?;
                 } else {
-                    flow.block::<false>(index, ptr(&modulation, &flow.device), &conditioning)?;
+                    flow.block::<false>(
+                        index,
+                        ptr(&modulation, &flow.device),
+                        &conditioning,
+                        slot,
+                    )?;
                 }
                 gate.score(
                     &name,
@@ -3545,6 +3552,21 @@ fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
             .clone_htod(&f32_tensor(&source, "noise")?)?;
         let mut output = flow.device.stream.alloc_zeros::<f32>(input.len())?;
         flow.set_times(&[820.0])?;
+        ensure!(
+            flow.context_slot(&positive).is_err(),
+            "unprepared context cache binding accepted"
+        );
+        ensure!(
+            flow.prepare_contexts(&[&positive, &positive]).is_err(),
+            "duplicate context identity accepted"
+        );
+        flow.prepare_contexts(&[&positive])?;
+        let recreated = flow.conditioning(&context, &[], &coordinates)?;
+        ensure!(
+            flow.context_slot(&recreated).is_err(),
+            "same-value unprepared context identity accepted"
+        );
+        drop(recreated);
         cascade_rope(&flow, &mut gate, &source, &file)?;
         flow.forward(&input, 0, &positive, &mut output)?;
         flow_padded_identity(&mut flow, &input, &positive, &mut output, &mut gate.defects)?;
@@ -3605,6 +3627,72 @@ fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
             "N5_M4_FLOW_EXECUTION training_grid=128 execution_grid={resolution} pooled_max={maximum} rows={} phases=spatial_phases rope=flow_rope_f16 attention=D96 eager=true",
             coordinates.len()
         );
+        if maximum == 63 {
+            ensure!(
+                flow.context_cache.is_some(),
+                "bounded flow did not derive cached mode"
+            );
+            let expected = flow.device.stream.clone_dtoh(&output)?;
+            let io = flow.io.as_ref().context("bounded sparse IO missing")?;
+            let shape = [io.rows, flow.rows, flow.spec.model_channels, 256];
+            let tiles = SparseFlowIo::gather_partition(shape, flow.context_allowance)?;
+            let widths = [256, 128, 256, 1056, 4224, 128, 512, 128];
+            let minimum = tiles
+                .into_iter()
+                .zip(widths)
+                .map(|(tile, width)| 2 * 27 * width * tile)
+                .max()
+                .context("sparse partition minimum missing")?;
+            let budget = (14usize << 30)
+                .checked_sub(flow.context_allowance)
+                .and_then(|n| n.checked_add(minimum + (1_158_212_352 + 23_896_064) / 2))
+                .context("bounded uncached budget overflow")?;
+            drop(positive);
+            drop(input);
+            drop(output);
+            let device = flow.device.clone();
+            drop(flow);
+            device.stream.synchronize()?;
+            let mut uncached = Flow::<f16>::open_hi3d(
+                &device,
+                &model,
+                "transformer_1024",
+                &runtime,
+                &coordinates,
+                resolution,
+                budget,
+            )?;
+            ensure!(
+                uncached.context_cache.is_none(),
+                "bounded flow did not derive uncached mode"
+            );
+            let actual_tiles = SparseFlowIo::gather_partition(shape, uncached.context_allowance)?;
+            ensure!(actual_tiles == tiles, "bounded uncached partition differs");
+            let condition = uncached.conditioning(&context, &[], &coordinates)?;
+            let input = uncached
+                .device
+                .stream
+                .clone_htod(&f32_tensor(&source, "noise")?)?;
+            let mut output = uncached.device.stream.alloc_zeros::<f32>(input.len())?;
+            uncached.set_times(&[820.0])?;
+            uncached.prepare_contexts(&[&condition])?;
+            uncached.forward(&input, 0, &condition, &mut output)?;
+            let actual = uncached.device.stream.clone_dtoh(&output)?;
+            ensure!(
+                expected.iter().chain(&actual).all(|v| v.is_finite()),
+                "bounded cache modes nonfinite"
+            );
+            let bits: u64 = expected
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+                .sum();
+            gate.defects += usize::from(bits != 0);
+            println!(
+                "{} F16_CONTEXT_DERIVED_MODES enabled_then_disabled=true budget={budget} equal_partitions=true output_bits={bits} threshold_bits=0",
+                if bits == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
     }
     gate.finish()
 }
@@ -3654,6 +3742,7 @@ fn hi3d_cascade_production_flow_gpu() -> Result<()> {
             let input = flow.device.stream.clone_htod(&state)?;
             let mut output = flow.device.stream.alloc_zeros::<f32>(state.len())?;
             flow.set_times(&time)?;
+            flow.prepare_contexts(&[&condition])?;
             if !control {
                 let anchor = gate.root.join(
                     gate.cells["production.safetensors/rotated_q"]["anchor_file"]
@@ -5651,7 +5740,51 @@ fn flow_padded_identity(
         flow.blocks.len()
     );
     *defects += usize::from(bits != 0);
-    flow.device.stream.memcpy_htod(&compact, output)?;
+    flow_context_identity(flow, input, condition, output, &compact, defects)
+}
+
+pub(super) fn flow_context_identity(
+    flow: &mut Flow<f16>,
+    input: &CudaSlice<f32>,
+    condition: &Conditioning<f16>,
+    output: &mut CudaSlice<f32>,
+    compact: &[f32],
+    defects: &mut usize,
+) -> Result<()> {
+    let cached = flow.context_cache.is_some();
+    if cached {
+        let plane = 2917 * flow.spec.model_channels;
+        let key = flow.device.stream.alloc_zeros(plane)?;
+        let value = flow.device.stream.alloc_zeros(plane)?;
+        let old_key = std::mem::replace(&mut flow.work.cross_kn, key);
+        let old_value = std::mem::replace(&mut flow.work.cross_v, value);
+        flow.context_reference = true;
+        let result = flow.forward(input, 0, condition, output);
+        flow.context_reference = false;
+        flow.work.cross_kn = old_key;
+        flow.work.cross_v = old_value;
+        result?;
+    } else {
+        flow.forward(input, 0, condition, output)?;
+    }
+    let recomputed = flow.device.stream.clone_dtoh(output)?;
+    ensure!(
+        compact.iter().chain(&recomputed).all(|x| x.is_finite()),
+        "non-finite context velocity comparison"
+    );
+    let bits: u64 = compact
+        .iter()
+        .zip(&recomputed)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_CONTEXT_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} enabled={cached} threshold_bits=0",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len()
+    );
+    *defects += usize::from(bits != 0);
+    flow.device.stream.memcpy_htod(compact, output)?;
     Ok(())
 }
 
@@ -5767,6 +5900,7 @@ fn generation_first_forward(ordinal: usize) -> Result<()> {
             );
             let conditioning = flow.conditioning_device(&device_context, &grid)?;
             flow.set_times(&time)?;
+            flow.prepare_contexts(&[&conditioning])?;
             let input = flow.device.stream.clone_htod(&noise)?;
             let mut output = flow.device.stream.alloc_zeros::<f32>(noise.len())?;
             flow.forward(&input, 0, &conditioning, &mut output)?;
@@ -6208,7 +6342,7 @@ fn fixed_ss(flow: &mut Flow, gate: &mut Gate, variant: &str) -> Result<()> {
                     &f32_tensor(&input, "proj_cond")?,
                     &flow.coordinates,
                 )?;
-                flow.block::<false>(block, ptr(&modulation, &flow.device), &condition)?;
+                flow.block::<false>(block, ptr(&modulation, &flow.device), &condition, None)?;
                 gate.score_f32(
                     id(&table, &name, None),
                     &[1, 4096, 1536],
@@ -6790,10 +6924,521 @@ fn pixal3d_flows_match_frozen_definition_gpu() -> Result<()> {
 }
 
 #[test]
+fn context_cache_preserves_sparse_partitions() -> Result<()> {
+    let growth = 1_158_212_352usize + 23_896_064;
+    for (shape, bank, expected) in [
+        (
+            [57439, 13019, 2112, 256],
+            13_101_606_144,
+            [57439, 57439, 13019, 13019, 18829, 57439, 57439, 57439],
+        ),
+        (
+            [99928, 22775, 2112, 256],
+            11_045_120_488,
+            [99928, 99928, 22775, 22775, 18829, 99928, 99928, 99928],
+        ),
+    ] {
+        assert_eq!(SparseFlowIo::gather_partition(shape, bank)?, expected);
+        assert!(SparseFlowIo::context_cache_fits(shape, bank, growth)?);
+        let boundary = 4_294_819_584 + growth;
+        assert!(SparseFlowIo::context_cache_fits(shape, boundary, growth)?);
+        assert!(!SparseFlowIo::context_cache_fits(
+            shape,
+            boundary - 1,
+            growth
+        )?);
+        let changed = SparseFlowIo::gather_partition(shape, 4_294_819_583)?;
+        assert_eq!(
+            shape[0].div_ceil(changed[4]),
+            shape[0].div_ceil(expected[4])
+        );
+        assert_ne!(changed, expected);
+    }
+    let shape = [11295, 2548, 2112, 256];
+    let full = 2_576_344_320usize;
+    assert!(SparseFlowIo::context_cache_fits(
+        shape,
+        full + growth,
+        growth
+    )?);
+    assert!(!SparseFlowIo::context_cache_fits(
+        shape,
+        full + growth - 1,
+        growth
+    )?);
+    assert!(!SparseFlowIo::context_cache_fits(shape, full, growth)?);
+    assert!(SparseFlowIo::context_cache_fits(shape, 0, growth).is_err());
+    assert!(SparseFlowIo::gather_partition([usize::MAX, 1, 2112, 256], full).is_err());
+    assert!(SparseConv::tile_rows(1, 0, 1).is_err());
+    assert!(SparseConv::tile_rows(1, i32::MAX as usize, 1).is_err());
+    assert_eq!(SparseConv::tile_rows(99928, 4224, usize::MAX)?, 18829);
+    assert_eq!(SparseConv::tile_rows(1, 256, 27 * 256 - 1)?, 0);
+    assert_eq!(SparseConv::tile_rows(1, 256, 27 * 256)?, 1);
+    Ok(())
+}
+
+#[test]
+fn context_cache_offsets_cover_each_plane_once() -> Result<()> {
+    let geometry = [24, 2917, 2112];
+    let plane = geometry[1] * geometry[2];
+    let mut offsets = BTreeSet::new();
+    for slot in 0..2 {
+        for block in 0..24 {
+            let pair = context_cache_offsets(geometry, slot, block)?;
+            assert_eq!(pair[1] - pair[0], plane);
+            for offset in pair {
+                assert_eq!(offset % 8, 0);
+                assert!(offsets.insert(offset));
+            }
+        }
+    }
+    assert_eq!(
+        offsets.into_iter().collect::<Vec<_>>(),
+        (0..96).map(|i| i * plane).collect::<Vec<_>>()
+    );
+    for (shape, slot, block) in [
+        (geometry, 2, 0),
+        (geometry, 0, 24),
+        ([0, 2917, 2112], 0, 0),
+        ([24, 0, 2112], 0, 0),
+        ([24, 2917, 0], 0, 0),
+        ([24, usize::MAX, 2112], 0, 0),
+        ([usize::MAX, 1, 1], 0, 0),
+    ] {
+        assert!(context_cache_offsets(shape, slot, block).is_err());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn context_projection_signature(graph: &cudarc::driver::CudaGraph) -> Result<Vec<String>> {
+    use cudarc::driver::sys::{self, CUgraphNodeType};
+    let mut count = 0;
+    unsafe {
+        sys::cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut count).result()?;
+    }
+    ensure!(
+        count >= 3,
+        "context projection graph omits a chain operation"
+    );
+    let mut nodes = vec![std::ptr::null_mut(); count];
+    unsafe {
+        sys::cuGraphGetNodes(graph.cu_graph(), nodes.as_mut_ptr(), &mut count).result()?;
+    }
+    let mut signature = Vec::new();
+    for node in nodes.into_iter().take(count) {
+        let mut kind = CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+        let mut params = std::mem::MaybeUninit::uninit();
+        let mut name = std::ptr::null();
+        unsafe {
+            sys::cuGraphNodeGetType(node, &mut kind).result()?;
+            ensure!(
+                kind == CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL,
+                "context projection graph has a non-kernel node"
+            );
+            sys::cuGraphKernelNodeGetParams_v2(node, params.as_mut_ptr()).result()?;
+            let p = params.assume_init();
+            let mut function = p.func;
+            if function.is_null() {
+                ensure!(
+                    !p.kern.is_null(),
+                    "context projection kernel handle missing"
+                );
+                sys::cuKernelGetFunction(&mut function, p.kern).result()?;
+            }
+            sys::cuFuncGetName(&mut name, function).result()?;
+            ensure!(!name.is_null(), "context projection kernel name missing");
+            signature.push(format!(
+                "{}@{:p}:grid={},{},{}:block={},{},{}:shared={}",
+                std::ffi::CStr::from_ptr(name).to_str()?,
+                function,
+                p.gridDimX,
+                p.gridDimY,
+                p.gridDimZ,
+                p.blockDimX,
+                p.blockDimY,
+                p.blockDimZ,
+                p.sharedMemBytes
+            ));
+        }
+    }
+    ensure!(
+        signature
+            .iter()
+            .any(|s| s.starts_with("q38_bias_fill_f16@"))
+            && signature
+                .iter()
+                .any(|s| s.starts_with("kv_unpack_head_major_f16@")),
+        "context projection graph omits bias fill or unpack"
+    );
+    signature.sort();
+    Ok(signature)
+}
+
+#[cfg(feature = "cuda")]
+fn context_projection_bits(left: &[f16], right: &[f16]) -> Result<u64> {
+    ensure!(
+        left.len() == right.len() && left.iter().chain(right).all(|v| v.is_finite()),
+        "context projection extent/nonfinite failure"
+    );
+    Ok(left
+        .iter()
+        .zip(right)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum())
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and published Hi3D F16 checkpoints"]
+fn hi3d_context_cache_published_identity_gpu() -> Result<()> {
+    context_cache_identity(true)
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and FF_F16_QKV_FIXTURES configs"]
+fn hi3d_context_cache_synthetic_identity_gpu() -> Result<()> {
+    context_cache_identity(false)
+}
+
+#[cfg(feature = "cuda")]
+fn context_cache_identity(published: bool) -> Result<()> {
+    use cudarc::driver::sys;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let fixture: Value = if published {
+        Value::Null
+    } else {
+        serde_json::from_slice(&std::fs::read(
+            env_path("FF_F16_QKV_FIXTURES")?.join("qkv.json"),
+        )?)?
+    };
+    let device = Device::new(0)?;
+    let ops = Ops::new(&device.ctx)?;
+    let mut blas = Blas::new(
+        &device,
+        &ops,
+        &runtime,
+        Rc::new(Closure::new(true, "context cache gate".into())),
+    )?;
+    blas.prepare_f16_biased()?;
+    device.finish_upload()?;
+    let (rows, hidden, input, blocks) = (2917usize, 2112usize, 2048usize, 24usize);
+    let plane = rows * hidden;
+    let sentinel = f16::from_f32(-123.0);
+    let mut defects = 0;
+    let mut cells = 0;
+    let mut controls = 0;
+    for (owner, component) in ["transformer_512", "transformer_1024", "transformer_1024"]
+        .into_iter()
+        .enumerate()
+    {
+        let checkpoint = if published {
+            Some(Hi3DFlowCheckpoint::open(
+                &env_path("FF_HI3D_MODEL")?,
+                component,
+            )?)
+        } else {
+            None
+        };
+        let spec = if let Some(checkpoint) = &checkpoint {
+            checkpoint.spec.flow_spec()
+        } else {
+            let model = &fixture["models"][usize::from(owner != 0)];
+            ensure!(
+                model["component"] == component,
+                "context cache fixture component mismatch"
+            );
+            serde_json::from_value::<crate::pixal3d::Hi3DFlowSpec>(model["config"].clone())?
+                .flow_spec()
+        };
+        ensure!(
+            spec.num_blocks == blocks
+                && spec.model_channels == hidden
+                && spec.num_heads == 22
+                && spec.cond_channels == input,
+            "context cache published geometry mismatch"
+        );
+        let kernels = Kernels::load::<f16>(&device, &spec)?;
+        let tensors = checkpoint
+            .as_ref()
+            .map(|c| c.mapped.component_tensors())
+            .transpose()?;
+        let mut bank = device
+            .stream
+            .alloc_zeros::<f16>(2 * blocks * 2 * plane + 8)?;
+        device.stream.memcpy_htod(
+            &[sentinel; 8],
+            &mut bank.slice_mut(2 * blocks * 2 * plane..),
+        )?;
+        let packed = device.stream.clone_htod(&vec![sentinel; 2 * plane + 8])?;
+        let reference = [
+            device.stream.clone_htod(&vec![sentinel; plane + 8])?,
+            device.stream.clone_htod(&vec![sentinel; plane + 8])?,
+        ];
+        let positive: Vec<_> = (0..rows * input)
+            .map(|i| {
+                let row = i / input;
+                let channel = i % input;
+                f16::from_f32((((row * 13 + channel * 7 + owner * 19) % 97) as f32 - 48.0) / 64.0)
+            })
+            .collect();
+        let contexts = [
+            device.stream.clone_htod(&positive)?,
+            device.stream.alloc_zeros::<f16>(rows * input)?,
+        ];
+        let mut gold = Vec::new();
+        for block in 0..blocks {
+            let name = format!("blocks.{block}.cross_attn.to_kv");
+            let host = |suffix: &str, count: usize| -> Result<Vec<f16>> {
+                if let Some(tensors) = &tensors {
+                    let key = format!("{name}.{suffix}");
+                    let tensor = tensors
+                        .get(&key)
+                        .with_context(|| format!("missing context projection tensor {key}"))?;
+                    ensure!(
+                        tensor.dtype == "F16" && tensor.data.len() == 2 * count,
+                        "context projection weight dtype/extent mismatch"
+                    );
+                    Ok(tensor
+                        .data
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| f16::from_le_bytes(*b))
+                        .collect())
+                } else {
+                    Ok((0..count)
+                        .map(|i| {
+                            if suffix == "bias" {
+                                f16::from_f32(
+                                    (((i * 23 + block * 11 + owner * 17) % 89) as f32 - 44.0)
+                                        / 128.0
+                                        + 1.0 / 4096.0,
+                                )
+                            } else {
+                                f16::from_f32(
+                                    ((((i / input) * 31 + i % input * 17 + block * 13 + owner * 29)
+                                        % 101) as f32
+                                        - 50.0)
+                                        / 1024.0,
+                                )
+                            }
+                        })
+                        .collect())
+                }
+            };
+            let weight = device
+                .stream
+                .clone_htod(&host("weight", 2 * hidden * input)?)?;
+            let bias = device.stream.clone_htod(&host("bias", 2 * hidden)?)?;
+            let linear = Linear {
+                weight: dense(&weight, &device, [2 * hidden as u32, input as u32])?,
+                bias: dense(&bias, &device, [2 * hidden as u32])?,
+            };
+            for (slot, context) in contexts.iter().enumerate() {
+                let offsets = context_cache_offsets([blocks, rows, hidden], slot, block)?;
+                let outputs = [
+                    ptr(&packed, &device),
+                    ptr(&bank, &device) + (2 * offsets[0]) as u64,
+                    ptr(&bank, &device) + (2 * offsets[1]) as u64,
+                ];
+                let reference_outputs =
+                    [0, ptr(&reference[0], &device), ptr(&reference[1], &device)];
+                kernels.prepare_cross_kv(
+                    &device,
+                    &blas,
+                    linear,
+                    ptr(context, &device),
+                    outputs,
+                    rows,
+                )?;
+                let eager_packed = device.stream.clone_dtoh(&packed)?;
+                let eager = [
+                    device
+                        .stream
+                        .clone_dtoh(&bank.slice(offsets[0]..offsets[0] + plane))?,
+                    device
+                        .stream
+                        .clone_dtoh(&bank.slice(offsets[1]..offsets[1] + plane))?,
+                ];
+                linear.run(&blas, rows, ptr(context, &device), ptr(&packed, &device))?;
+                kernels.unpack(&device, ptr(&packed, &device), reference_outputs, rows, 2)?;
+                let expected_packed = device.stream.clone_dtoh(&packed)?;
+                let expected = [
+                    device.stream.clone_dtoh(&reference[0])?,
+                    device.stream.clone_dtoh(&reference[1])?,
+                ];
+                ensure!(
+                    eager_packed[2 * plane..]
+                        .iter()
+                        .chain(&expected_packed[2 * plane..])
+                        .all(|v| *v == sentinel)
+                        && expected
+                            .iter()
+                            .all(|a| a[plane..].iter().all(|v| *v == sentinel)),
+                    "context projection workspace guard failure"
+                );
+                let packed_bits = context_projection_bits(
+                    &eager_packed[..2 * plane],
+                    &expected_packed[..2 * plane],
+                )?;
+                let kv_bits = context_projection_bits(&eager[0], &expected[0][..plane])?
+                    + context_projection_bits(&eager[1], &expected[1][..plane])?;
+                device
+                    .stream
+                    .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                kernels.prepare_cross_kv(
+                    &device,
+                    &blas,
+                    linear,
+                    ptr(context, &device),
+                    outputs,
+                    rows,
+                )?;
+                let graph = device
+                    .stream
+                    .end_capture(sys::CUgraphInstantiate_flags(0))?
+                    .context("context cache graph missing")?;
+                let signature = context_projection_signature(&graph)?;
+                device
+                    .stream
+                    .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                linear.run(&blas, rows, ptr(context, &device), ptr(&packed, &device))?;
+                kernels.unpack(&device, ptr(&packed, &device), reference_outputs, rows, 2)?;
+                let old_graph = device
+                    .stream
+                    .end_capture(sys::CUgraphInstantiate_flags(0))?
+                    .context("context reference graph missing")?;
+                let old_signature = context_projection_signature(&old_graph)?;
+                let signature_equal = signature == old_signature;
+                graph.launch()?;
+                let captured_packed = device.stream.clone_dtoh(&packed)?;
+                let captured = [
+                    device
+                        .stream
+                        .clone_dtoh(&bank.slice(offsets[0]..offsets[0] + plane))?,
+                    device
+                        .stream
+                        .clone_dtoh(&bank.slice(offsets[1]..offsets[1] + plane))?,
+                ];
+                let graph_bits = context_projection_bits(
+                    &captured_packed[..2 * plane],
+                    &expected_packed[..2 * plane],
+                )? + context_projection_bits(&captured[0], &expected[0][..plane])?
+                    + context_projection_bits(&captured[1], &expected[1][..plane])?;
+                old_graph.launch()?;
+                let old_packed = device.stream.clone_dtoh(&packed)?;
+                let old_reference = [
+                    device.stream.clone_dtoh(&reference[0])?,
+                    device.stream.clone_dtoh(&reference[1])?,
+                ];
+                ensure!(
+                    captured_packed[2 * plane..]
+                        .iter()
+                        .chain(&old_packed[2 * plane..])
+                        .all(|v| *v == sentinel)
+                        && old_reference
+                            .iter()
+                            .all(|a| a[plane..].iter().all(|v| *v == sentinel)),
+                    "context projection graph workspace guard failure"
+                );
+                let reference_graph_bits = context_projection_bits(
+                    &old_packed[..2 * plane],
+                    &expected_packed[..2 * plane],
+                )? + context_projection_bits(
+                    &old_reference[0][..plane],
+                    &expected[0][..plane],
+                )? + context_projection_bits(
+                    &old_reference[1][..plane],
+                    &expected[1][..plane],
+                )?;
+                let valid = packed_bits == 0
+                    && kv_bits == 0
+                    && graph_bits == 0
+                    && reference_graph_bits == 0
+                    && signature_equal;
+                defects += usize::from(!valid);
+                cells += 1;
+                println!(
+                    "{} F16_CONTEXT_IDENTITY published={published} owner={owner} block={block} slot={slot} packed_bits={packed_bits} kv_bits={kv_bits} graph_bits={graph_bits} reference_graph_bits={reference_graph_bits} signature_equal={signature_equal} threshold_bits=0 signature={signature:?} reference_signature={old_signature:?}",
+                    if valid { "PASS" } else { "DEFECT" }
+                );
+                gold.push((
+                    offsets,
+                    [expected[0][..plane].to_vec(), expected[1][..plane].to_vec()],
+                    packed_bits,
+                ));
+                if owner == 0 && block == 0 && slot == 1 {
+                    let reference_margin = context_projection_bits(&gold[0].1[0], &gold[1].1[0])?
+                        + context_projection_bits(&gold[0].1[1], &gold[1].1[1])?;
+                    ensure!(
+                        reference_margin > 0,
+                        "context slot-swap reference control did not discriminate"
+                    );
+                    let control_bits = context_projection_bits(&gold[0].1[0], &eager[0])?
+                        + context_projection_bits(&gold[0].1[1], &eager[1])?;
+                    let positive_prefix_bits = gold[0].2;
+                    let detected = control_bits > 0 && positive_prefix_bits == 0;
+                    defects += usize::from(!detected);
+                    controls += 1;
+                    println!(
+                        "{} F16_CONTEXT_SLOT_CONTROL slot_swap=true differing_bits={control_bits} reference_margin_bits={reference_margin} packed_prefix_bits={positive_prefix_bits}",
+                        if detected { "PASS" } else { "DEFECT" }
+                    );
+                }
+            }
+        }
+        let mut reuse_bits = 0;
+        for (offsets, expected, _) in gold {
+            for (offset, expected) in offsets.into_iter().zip(expected) {
+                reuse_bits += context_projection_bits(
+                    &device
+                        .stream
+                        .clone_dtoh(&bank.slice(offset..offset + plane))?,
+                    &expected,
+                )?;
+            }
+        }
+        ensure!(
+            device
+                .stream
+                .clone_dtoh(&bank.slice(2 * blocks * 2 * plane..))?
+                .iter()
+                .all(|v| *v == sentinel),
+            "context cache bank guard failure"
+        );
+        defects += usize::from(reuse_bits != 0);
+        println!(
+            "{} F16_CONTEXT_REUSE owner={owner} planes=96 reuse_bits={reuse_bits} stored_cells=48 final_scan_refills=0 threshold_bits=0",
+            if reuse_bits == 0 { "PASS" } else { "DEFECT" }
+        );
+    }
+    println!(
+        "F16_CONTEXT_RESULT published={published} cells={cells} owners=3 controls={controls} defects={defects} threshold_bits=0 timing=false"
+    );
+    ensure!(
+        cells == 144 && controls == 1 && defects == 0,
+        "context cache candidate defects"
+    );
+    Ok(())
+}
+
+#[test]
 fn conditioning_rejects_another_flow_with_the_same_row_count() -> Result<()> {
     let coordinates = [[1, 3, 7], [2, 5, 11], [4, 9, 13]];
     let origin = Rc::new(());
     validate_conditioning_origin(&origin.clone(), &origin)?;
+    let first_context = Rc::new(());
+    let second_context = Rc::new(());
+    let mut bindings = [Some(first_context.clone()), Some(second_context.clone())];
+    assert_eq!(conditioning_cache_slot(&bindings, &first_context)?, 0);
+    assert_eq!(conditioning_cache_slot(&bindings, &second_context)?, 1);
+    assert!(conditioning_cache_slot(&bindings, &Rc::new(())).is_err());
+    drop(first_context);
+    assert!(conditioning_cache_slot(&bindings, &Rc::new(())).is_err());
+    bindings = [None, None];
+    assert!(conditioning_cache_slot(&bindings, &second_context).is_err());
     for foreign in [
         [[1, 3, 8], [2, 5, 11], [4, 9, 13]],
         [[4, 9, 13], [1, 3, 7], [2, 5, 11]],
@@ -10296,6 +10941,14 @@ fn generation_rejects_extra_decoder_passes_and_forward_branches() -> Result<()> 
         Work::<bf16>::planned_bytes(usize::MAX, &spec, 5).is_err(),
         "work count overflow accepted"
     );
+    spec.model_channels = 2112;
+    spec.mlp_ratio = 4.0;
+    assert_eq!(Work::<f16>::planned_bytes(1, &spec, 2917)?, 49_399_684);
+    assert_eq!(
+        Work::<f16>::planned_bytes(1, &spec, 2917)? - 24_642_816,
+        24_756_868
+    );
+    assert!(Work::<f16>::planned_bytes(usize::MAX, &spec, 2917).is_err());
     ensure!(
         F32Attention::required_bytes([12, 43632, 5, 128, 128])? == 847_872,
         "cross attention tile count"

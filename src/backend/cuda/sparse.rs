@@ -924,9 +924,18 @@ pub struct SparseConv<T = f16> {
     half_store: Option<CudaFunction>,
     rows: usize,
     channels: usize,
-    tile: usize,
+    pub(super) tile: usize,
 }
 impl SparseConv {
+    pub(super) fn tile_rows(rows: usize, channels: usize, elements: usize) -> Result<usize> {
+        ensure!(
+            channels > 0 && channels <= i32::MAX as usize / 27,
+            "invalid sparse gather width"
+        );
+        Ok((elements / (27 * channels))
+            .min(rows)
+            .min(i32::MAX as usize / (27 * channels)))
+    }
     pub fn new(
         device: &Device,
         sites: &SparseSites,
@@ -963,13 +972,7 @@ impl SparseConv {
         columns: Rc<CudaSlice<f16>>,
     ) -> Result<Self> {
         let rows = sites.coordinates().len();
-        ensure!(
-            channels > 0 && channels <= i32::MAX as usize / 27,
-            "invalid sparse gather width"
-        );
-        let tile = (columns.len() / (27 * channels))
-            .min(rows)
-            .min(i32::MAX as usize / (27 * channels));
+        let tile = Self::tile_rows(rows, channels, columns.len())?;
         ensure!(tile > 0, "sparse gather cannot fit one row");
         let maps = sites.neighbours_3x3()?;
         let neighbours = device.stream.clone_htod(maps.as_flattened())?;
