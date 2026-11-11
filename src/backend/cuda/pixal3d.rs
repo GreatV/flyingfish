@@ -311,6 +311,9 @@ struct Kernels {
     qkv_prepare: Option<CudaFunction>,
     #[cfg(test)]
     qkv_reference: bool,
+    row_norm: Option<[CudaFunction; 3]>,
+    #[cfg(test)]
+    row_norm_reference: bool,
     unpack_cross: CudaFunction,
     rope: CudaFunction,
     rope_hm: CudaFunction,
@@ -810,6 +813,17 @@ impl Kernels {
             },
             #[cfg(test)]
             qkv_reference: false,
+            row_norm: if T::HALF {
+                Some([
+                    q.load_function("layer_norm_modulate_f16")?,
+                    q.load_function("gated_add_layer_norm_f16")?,
+                    q.load_function("residual_layer_norm_modulate_f16")?,
+                ])
+            } else {
+                None
+            },
+            #[cfg(test)]
+            row_norm_reference: false,
             unpack_cross: v.load_function(if T::HALF {
                 "kv_unpack_head_major_f16"
             } else {
@@ -925,6 +939,38 @@ impl Kernels {
         }
         self.l2(d, q, q, q_gamma, rows, false)?;
         self.l2(d, key, kn, k_gamma, rows, true)
+    }
+    fn prepare_row_norm(
+        &self,
+        d: &Device,
+        inputs: [u64; 5],
+        output: u64,
+        shape: [usize; 2],
+        site: usize,
+    ) -> Result<()> {
+        let [rows, width] = shape;
+        ensure!(self.half && width == 2112, "F16 row fusion requires H2112");
+        let kernel = self
+            .row_norm
+            .as_ref()
+            .and_then(|kernels| kernels.get(site))
+            .context("F16 row fusion missing")?;
+        let [hidden, projected, modulation, weight, bias] = inputs;
+        unsafe {
+            d.stream
+                .launch_builder(kernel)
+                .arg(&hidden)
+                .arg(&projected)
+                .arg(&modulation)
+                .arg(&weight)
+                .arg(&bias)
+                .arg(&output)
+                .arg(&u32::try_from(rows)?)
+                .arg(&u32::try_from(width)?)
+                .arg(&1e-6f32)
+                .launch(grid(rows, 256))?;
+        }
+        Ok(())
     }
     fn norm(
         &self,
@@ -2303,8 +2349,15 @@ impl<T: FlowElement> Flow<T> {
                 .arg(&((6 * h) as u32))
                 .launch(flat(6 * h))?;
         }
-        k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
-        self.modulate(norm, bm, 0)?;
+        let row_fused = T::HALF;
+        #[cfg(test)]
+        let row_fused = row_fused && !k.row_norm_reference;
+        if row_fused {
+            k.prepare_row_norm(d, [hidden, 0, bm, 0, 0], norm, [n, h], 0)?;
+        } else {
+            k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
+            self.modulate(norm, bm, 0)?;
+        }
         b.qkv.run(&self.blas, n, norm, ptr(&self.work.qkv, d))?;
         let fused = T::HALF;
         #[cfg(test)]
@@ -2370,15 +2423,31 @@ impl<T: FlowElement> Flow<T> {
             },
         )?;
         b.self_out.run(&self.blas, n, attention, projected)?;
-        self.gated_add(projected, bm, 2)?;
-        k.norm(
-            d,
-            hidden,
-            norm,
-            [n, h],
-            [b.norm_weight, b.norm_bias],
-            (1e-6, false),
-        )?;
+        if row_fused {
+            k.prepare_row_norm(
+                d,
+                [
+                    hidden,
+                    projected,
+                    bm + (2 * h * 4) as u64,
+                    b.norm_weight,
+                    b.norm_bias,
+                ],
+                norm,
+                [n, h],
+                1,
+            )?;
+        } else {
+            self.gated_add(projected, bm, 2)?;
+            k.norm(
+                d,
+                hidden,
+                norm,
+                [n, h],
+                [b.norm_weight, b.norm_bias],
+                (1e-6, false),
+            )?;
+        }
         b.cross_q.run(&self.blas, n, norm, q)?;
         if T::HALF {
             let context_rows = conditioning.global.len() / self.spec.cond_channels;
@@ -2424,7 +2493,9 @@ impl<T: FlowElement> Flow<T> {
                 },
             )?;
             b.cross_out.run(&self.blas, n, attention, projected)?;
-            k.residual(d, hidden, projected, n * h)?;
+            if !row_fused {
+                k.residual(d, hidden, projected, n * h)?;
+            }
         } else {
             b.cross_kv.run(
                 &self.blas,
@@ -2501,8 +2572,18 @@ impl<T: FlowElement> Flow<T> {
             k.residual(d, norm, projected, n * h)?;
             k.residual(d, hidden, norm, n * h)?;
         }
-        k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
-        self.modulate(norm, bm, 3)?;
+        if row_fused {
+            k.prepare_row_norm(
+                d,
+                [hidden, projected, bm + (3 * h * 4) as u64, 0, 0],
+                norm,
+                [n, h],
+                2,
+            )?;
+        } else {
+            k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
+            self.modulate(norm, bm, 3)?;
+        }
         b.fc1.run(&self.blas, n, norm, ptr(&self.work.ff, d))?;
         unsafe {
             d.stream
