@@ -138,7 +138,7 @@ flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat c
 
 Common options:
 - MiniMax-H3 video requires a keyframe, a frame count and a seed. Requested frames round up to `17n+5`, so 136 resolves to 141; the published duration is 5-15 seconds at 24 fps. No documented frame-count or seed defaults exist.
-- `--verbose` prints placement, Lt and decode-plan diagnostics. Default stderr contains progress and errors only; timing fields are hidden unless verbose is enabled.
+- Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
 - `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
 - `--draft-model <dir>` enables a DSpark draft model.
 - `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8, GLM-5.3-Flash); 0 selects plain decoding. GLM-5.3-Flash drafts one token per round at any nonzero depth. MTP decode is CUDA-only, so ROCm builds need `--mtp 0` for such checkpoints.

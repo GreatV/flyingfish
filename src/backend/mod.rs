@@ -160,7 +160,7 @@ impl SpecBudget {
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 thread_local! {
-    static VERBOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static VERBOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -174,7 +174,7 @@ impl Drop for VerboseGuard {
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-pub(crate) fn with_verbose<T>(verbose: bool, run: impl FnOnce() -> T) -> T {
+pub fn with_verbose<T>(verbose: bool, run: impl FnOnce() -> T) -> T {
     let guard = VerboseGuard(VERBOSE.with(|current| current.replace(verbose)));
     let result = run();
     drop(guard);
@@ -375,6 +375,16 @@ pub use cuda::pixal3d::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    fn quiet_media_scope_restores_library_diagnostics() {
+        assert!(diagnostics_enabled());
+        with_verbose(false, || assert!(!diagnostics_enabled()));
+        assert!(diagnostics_enabled());
+        with_verbose(true, || assert!(diagnostics_enabled()));
+        assert!(diagnostics_enabled());
+    }
     #[test]
     fn tree_budget_limits_rows_depth_roots_and_physical_slots() {
         let parents = [-1, 0, 0, 1];

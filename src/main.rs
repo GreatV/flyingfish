@@ -591,7 +591,7 @@ fn video(
     #[cfg(not(feature = "cuda"))]
     bail!("video requires CUDA");
     #[cfg(feature = "cuda")]
-    {
+    flyingfish::backend::with_verbose(cli.verbose, || {
         let mp4 = mp4_output(output)?;
         let output = output_path(output, &cli.model)?;
         let keyframe = request
@@ -709,7 +709,7 @@ fn video(
             }
         }
         Ok(())
-    }
+    })
 }
 
 fn run() -> Result<()> {
