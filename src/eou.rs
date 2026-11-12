@@ -588,7 +588,11 @@ pub fn transcribe(
             .map(|segment| segment.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        Ok(crate::media::Transcription { text, segments })
+        Ok(crate::media::Transcription {
+            text,
+            segments,
+            words: Vec::new(),
+        })
     } else {
         let valid = features.len() / spec.features as usize;
         let ids = model.decode(&features, valid)?;

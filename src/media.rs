@@ -584,6 +584,7 @@ pub struct TextSegment {
 pub struct Transcription {
     pub text: String,
     pub segments: Vec<TextSegment>,
+    pub words: Vec<TextSegment>,
 }
 
 impl Transcription {
@@ -599,6 +600,7 @@ impl Transcription {
                 end: seconds,
                 text,
             }],
+            words: Vec::new(),
         })
     }
 }
