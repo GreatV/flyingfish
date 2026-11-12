@@ -1,5 +1,4 @@
-//! MiniMax-H3 video VAE: the non-causal ViT decoder over spatial tiles and temporal chunks of a latent video, and the
-//! causal CNN keyframe encoder over spatial tiles of one frame.
+//! MiniMax-H3 image/video VAEs: tiled ViT decoders and the causal CNN keyframe encoder.
 use super::{BlockKernels, NormRows, Source, matrix, pointer, rows_view, vector};
 use crate::backend::cuda::{
     Device,
@@ -19,6 +18,1250 @@ use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, Vae
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{path::Path, sync::Arc};
+
+struct ImageKernels {
+    bias: CudaFunction,
+    rms: CudaFunction,
+    residual: CudaFunction,
+    norm: CudaFunction,
+    softmax: CudaFunction,
+    silu: CudaFunction,
+    gather: CudaFunction,
+    append: CudaFunction,
+    pack: CudaFunction,
+    unpack: CudaFunction,
+    patches: CudaFunction,
+    stitch: CudaFunction,
+    pixels: CudaFunction,
+}
+
+impl ImageKernels {
+    fn new(s: &Arc<CudaStream>) -> Result<Self> {
+        let vision = cubin::module(s.context(), "vision_ops")?;
+        let common = cubin::module(s.context(), "q38_common")?;
+        Ok(Self {
+            bias: vision.load_function("vision_bias_f32")?,
+            rms: vision.load_function("vision_rms_scale_f32")?,
+            residual: common.load_function("channel_scale_residual_f32")?,
+            norm: common.load_function("q38_layer_norm_f32")?,
+            softmax: common.load_function("softmax_rows_f32")?,
+            silu: cubin::module(s.context(), "act")?.load_function("silu_mul_f32")?,
+            gather: vision.load_function("tile_rows_f32")?,
+            append: vision.load_function("append_register_rows_f32")?,
+            pack: vision.load_function("rotary_pack_qkv_f32")?,
+            unpack: vision.load_function("head_rows_f32")?,
+            patches: vision.load_function("unpatchify_f32")?,
+            stitch: vision.load_function("tile_stitch_f32")?,
+            pixels: vision.load_function("planar_affine_rows_f32")?,
+        })
+    }
+}
+
+struct ImageLimits {
+    budget: usize,
+    l2: usize,
+    sms: usize,
+    grid: usize,
+}
+
+#[derive(Debug)]
+struct ImagePlan {
+    linear: usize,
+    attention: usize,
+    patches: usize,
+    tokens: usize,
+    grid: usize,
+    bytes: usize,
+}
+
+impl ImagePlan {
+    fn derive(
+        spec: &VaeSpec,
+        tiles: &VaeTiles,
+        canvas: [usize; 2],
+        limits: ImageLimits,
+    ) -> Result<Self> {
+        let slots = tiles.count();
+        let patches = tiles.height / spec.spatial_ratio * (tiles.width / spec.spatial_ratio);
+        let tokens = patches + spec.registers + 1;
+        let s = 4u128 * tokens as u128 * spec.dim as u128;
+        let p = 4u128 * spec.heads as u128 * (tokens as u128).pow(2);
+        let per_tile = 4u128 * tokens as u128 * (7 * spec.dim + 3 * spec.ffn) as u128
+            + 4u128 * tokens as u128 * spec.patch_width() as u128
+            + 8u128 * patches as u128 * spec.latent_channels as u128;
+        let pixels = canvas[0] as u128 * canvas[1] as u128;
+        let grid_words = 2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2;
+        let fixed = 4u128
+            * slots as u128
+            * spec.out_channels as u128
+            * tiles.height as u128
+            * tiles.width as u128
+            + 8 * pixels * spec.out_channels as u128
+            + 4u128 * (grid_words + tokens * spec.rope_dims + spec.head_dim) as u128;
+        ensure!(
+            slots > 0 && patches > 0 && limits.sms > 0 && limits.grid > 0,
+            "image VAE setup has an empty shape or device limit"
+        );
+        ensure!(
+            pixels * spec.out_channels as u128 <= u32::MAX as u128,
+            "image VAE canvas exceeds the F32 layout index range"
+        );
+        ensure!(
+            fixed + per_tile + p <= limits.budget as u128,
+            "image VAE serial tile requires {} bytes; workspace budget {}",
+            fixed + per_tile + p,
+            limits.budget
+        );
+        let cache_cap = (limits.l2 as u128 / (4 * s + p)).max(1) as usize;
+        let wave = limits.sms.div_ceil(spec.heads);
+        let cache_cap = if cache_cap >= wave {
+            cache_cap / wave * wave
+        } else {
+            cache_cap
+        };
+        let score_cap = ((limits.budget as u128 - fixed - per_tile) / p) as usize;
+        let mut attention = cache_cap.min(slots).min(score_cap).max(1);
+        let launch_cap = (u32::MAX as usize / tokens / (2 * spec.ffn))
+            .min(i32::MAX as usize / tokens)
+            .min(limits.grid / tokens / spec.heads)
+            .min(limits.grid.saturating_mul(256) / tokens / (2 * spec.ffn));
+        loop {
+            let available = limits.budget as u128 - fixed - attention as u128 * p;
+            let mut linear = (available / per_tile) as usize;
+            linear = linear.min(slots).min(launch_cap);
+            ensure!(
+                linear > 0,
+                "image VAE has no tile batch within device launch limits"
+            );
+            if linear < attention {
+                attention = linear;
+                continue;
+            }
+            if linear < slots {
+                linear = linear / attention * attention;
+            }
+            return Ok(Self {
+                linear,
+                attention,
+                patches,
+                tokens,
+                grid: limits.grid,
+                bytes: usize::try_from(fixed + linear as u128 * per_tile + attention as u128 * p)?,
+            });
+        }
+    }
+
+    fn flat(&self, count: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (count.div_ceil(256).min(self.grid) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+}
+
+struct ImageWork {
+    plan: ImagePlan,
+    tiles: VaeTiles,
+    canvas: [usize; 2],
+    grid: CudaSlice<u32>,
+    rope: CudaSlice<f32>,
+    ones: CudaSlice<f32>,
+    x: CudaSlice<f32>,
+    norm: CudaSlice<f32>,
+    o: CudaSlice<f32>,
+    q: CudaSlice<f32>,
+    k: CudaSlice<f32>,
+    v: CudaSlice<f32>,
+    attn: CudaSlice<f32>,
+    ff: CudaSlice<f32>,
+    gated: CudaSlice<f32>,
+    latent: CudaSlice<f32>,
+    latent_q: CudaSlice<f32>,
+    patch_rows: CudaSlice<f32>,
+    scores: CudaSlice<f32>,
+    raw: CudaSlice<f32>,
+    planar: CudaSlice<f32>,
+    rgb: CudaSlice<f32>,
+}
+
+type ImageRows<'a> = (&'a CudaSlice<f32>, usize, usize, usize);
+
+struct ImageDecoder {
+    spec: VaeSpec,
+    post_quant: Linear<f32>,
+    proj_in: Linear<f32>,
+    registers: CudaSlice<f32>,
+    norm_out: (CudaSlice<f32>, CudaSlice<f32>),
+    proj_out: Linear<f32>,
+    blocks: Vec<DecoderBlock<f32>>,
+    latent_affine: (CudaSlice<f32>, CudaSlice<f32>),
+    pixel_affine: (CudaSlice<f32>, CudaSlice<f32>),
+    kernels: ImageKernels,
+}
+
+impl Linear<f32> {
+    fn load(load: &mut LoadF32<'_>, base: &str, out: usize, input: usize) -> Result<Self> {
+        Ok(Self {
+            weight: load(&format!("{base}.weight"), out * input)?,
+            bias: load(&format!("{base}.bias"), out)?,
+            out,
+            input,
+        })
+    }
+
+    fn run(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        bias: &CudaFunction,
+        x: Tensor<f32, 2>,
+        y: Tensor<f32, 2>,
+    ) -> Result<()> {
+        blas.linear_f32(
+            matrix(&self.weight, s, self.out, self.input)?,
+            x,
+            &mut TensorMut(y),
+        )?;
+        unsafe {
+            s.launch_builder(bias)
+                .arg(&y.ptr)
+                .arg(&pointer(&self.bias, s))
+                .arg(&y.ptr)
+                .arg(&y.shape[0])
+                .arg(&y.shape[1])
+                .launch(flat(y.shape[0] as usize * self.out))?;
+        }
+        Ok(())
+    }
+}
+
+impl ImageDecoder {
+    fn new(
+        device: &Device,
+        spec: VaeSpec,
+        component: &Path,
+        manifest: &TensorManifest,
+    ) -> Result<Self> {
+        let s = &device.stream;
+        ensure!(
+            spec.out_channels == VAE_PIXEL_STD.len(),
+            "image VAE pixel affine requires three channels"
+        );
+        let kernels = ImageKernels::new(s)?;
+        let expected: std::collections::BTreeSet<_> = manifest
+            .entries
+            .keys()
+            .filter(|name| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+            .cloned()
+            .collect();
+        let weight_bytes: usize = expected
+            .iter()
+            .map(|name| manifest.entries[name].bytes)
+            .sum();
+        let (free, total) = device.ctx.mem_get_info()?;
+        ensure!(
+            weight_bytes <= device.workspace_budget(free, free, total / 16)?,
+            "image VAE decoder weights need {weight_bytes} bytes"
+        );
+        let mut source = Source::new(component, manifest);
+        let mut consumed = std::collections::BTreeSet::new();
+        let mut load = |name: &str, count: usize| {
+            ensure!(
+                consumed.insert(name.to_owned()),
+                "image VAE duplicate tensor {name}"
+            );
+            source.tensor::<f32>(s, name, count)
+        };
+        let (dim, latent, ffn) = (spec.dim, spec.latent_channels, spec.ffn);
+        let post_quant = Linear::<f32>::load(&mut load, "post_quant_conv", latent, latent)?;
+        let proj_in = Linear::<f32>::load(&mut load, "decoder.proj_in", dim, latent)?;
+        let registers = load("decoder.register_tokens", spec.registers * dim)?;
+        let norm_out = (
+            load("decoder.norm_out.weight", dim)?,
+            load("decoder.norm_out.bias", dim)?,
+        );
+        let proj_out = Linear::<f32>::load(&mut load, "decoder.proj_out", spec.patch_width(), dim)?;
+        let mut blocks = Vec::with_capacity(spec.layers);
+        for layer in 0..spec.layers {
+            let b = format!("decoder.transformer_blocks.{layer}");
+            blocks.push(DecoderBlock {
+                q: Linear::<f32>::load(&mut load, &format!("{b}.attn.to_q"), dim, dim)?,
+                k: Linear::<f32>::load(&mut load, &format!("{b}.attn.to_k"), dim, dim)?,
+                v: Linear::<f32>::load(&mut load, &format!("{b}.attn.to_v"), dim, dim)?,
+                out: Linear::<f32>::load(&mut load, &format!("{b}.attn.to_out.0"), dim, dim)?,
+                ff_in: Linear::<f32>::load(&mut load, &format!("{b}.ff.net.0.proj"), 2 * ffn, dim)?,
+                ff_out: Linear::<f32>::load(&mut load, &format!("{b}.ff.net.2"), dim, ffn)?,
+                norm1: load(&format!("{b}.norm1.weight"), dim)?,
+                norm2: load(&format!("{b}.norm2.weight"), dim)?,
+                scale1: load(&format!("{b}.scale1"), dim)?,
+                scale2: load(&format!("{b}.scale2"), dim)?,
+            });
+        }
+        ensure!(
+            consumed == expected,
+            "image VAE partial loader does not cover the decoder tensor set"
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"image_vae_decoder_load":{"tensors":consumed.len(),"weight_bytes":weight_bytes,"dtype":"F32"}})
+        );
+        Ok(Self {
+            spec: spec.clone(),
+            post_quant,
+            proj_in,
+            registers,
+            norm_out,
+            proj_out,
+            blocks,
+            kernels,
+            latent_affine: (
+                s.clone_htod(&spec.latents_std)?,
+                s.clone_htod(&spec.latents_mean)?,
+            ),
+            pixel_affine: (
+                s.clone_htod(&VAE_PIXEL_STD.map(|x| x as f32))?,
+                s.clone_htod(&VAE_PIXEL_MEAN.map(|x| x as f32))?,
+            ),
+        })
+    }
+
+    fn work(&self, device: &Device, canvas: [usize; 2], budget: usize) -> Result<ImageWork> {
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        let spec = &self.spec;
+        ensure!(
+            canvas
+                .into_iter()
+                .all(|n| n > 0 && n <= u32::MAX as usize && n.is_multiple_of(spec.spatial_ratio)),
+            "image VAE invalid canvas {canvas:?}"
+        );
+        ensure!(
+            canvas[0] as u128 * canvas[1] as u128 * spec.out_channels as u128 <= u32::MAX as u128,
+            "image VAE canvas exceeds the F32 layout index range"
+        );
+        let tiles = VaeTiles::released(spec, canvas[0], canvas[1])?;
+        let plan = ImagePlan::derive(
+            spec,
+            &tiles,
+            canvas,
+            ImageLimits {
+                budget,
+                l2: usize::try_from(device.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?)?,
+                sms: usize::try_from(
+                    device
+                        .ctx
+                        .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+                )?,
+                grid: usize::try_from(
+                    device
+                        .ctx
+                        .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?,
+                )?,
+            },
+        )?;
+        let s = &device.stream;
+        let n = plan.linear * plan.tokens * spec.dim;
+        let latent = plan.linear * plan.patches * spec.latent_channels;
+        let grid: Vec<u32> = tiles
+            .rows
+            .0
+            .iter()
+            .chain(&tiles.rows.1)
+            .chain(&tiles.cols.0)
+            .chain(&tiles.cols.1)
+            .map(|&v| u32::try_from(v))
+            .collect::<Result<_, _>>()?;
+        let rope = rotary_table(
+            spec,
+            (
+                1,
+                tiles.height / spec.spatial_ratio,
+                tiles.width / spec.spatial_ratio,
+            ),
+            2,
+            |x| x,
+        );
+        let raw = tiles.count() * spec.out_channels * tiles.height * tiles.width;
+        let pixels = spec.out_channels * canvas[0] * canvas[1];
+        // Every active element is written before it is read.
+        let alloc = |count| unsafe { s.alloc::<f32>(count) };
+        let work = ImageWork {
+            grid: s.clone_htod(&grid)?,
+            rope: s.clone_htod(&rope)?,
+            ones: s.clone_htod(&vec![1f32; spec.head_dim])?,
+            x: alloc(n)?,
+            norm: alloc(n)?,
+            o: alloc(n)?,
+            q: alloc(n)?,
+            k: alloc(n)?,
+            v: alloc(n)?,
+            attn: alloc(n)?,
+            ff: alloc(n * 2 * spec.ffn / spec.dim)?,
+            gated: alloc(n * spec.ffn / spec.dim)?,
+            latent: alloc(latent)?,
+            latent_q: alloc(latent)?,
+            patch_rows: alloc(plan.linear * plan.tokens * spec.patch_width())?,
+            scores: alloc(plan.attention * spec.heads * plan.tokens * plan.tokens)?,
+            raw: alloc(raw)?,
+            planar: alloc(pixels)?,
+            rgb: alloc(pixels)?,
+            plan,
+            tiles,
+            canvas,
+        };
+        let actual = [
+            &work.rope,
+            &work.ones,
+            &work.x,
+            &work.norm,
+            &work.o,
+            &work.q,
+            &work.k,
+            &work.v,
+            &work.attn,
+            &work.ff,
+            &work.gated,
+            &work.latent,
+            &work.latent_q,
+            &work.patch_rows,
+            &work.scores,
+            &work.raw,
+            &work.planar,
+            &work.rgb,
+        ]
+        .iter()
+        .map(|b| 4 * b.len())
+        .sum::<usize>()
+            + 4 * work.grid.len();
+        ensure!(
+            actual == work.plan.bytes,
+            "image VAE work differs from counted memory plan {actual}/{}",
+            work.plan.bytes
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"image_vae_plan":{"canvas":canvas,"tiles":work.tiles.count(),
+            "tokens":work.plan.tokens,"linear_batch":work.plan.linear,"attention_batch":work.plan.attention,
+            "bytes":actual,"workspace_budget":budget,"silu_grid":flat(work.plan.linear*work.plan.tokens*spec.ffn).grid_dim.0}})
+        );
+        Ok(work)
+    }
+
+    fn rms(
+        &self,
+        s: &Arc<CudaStream>,
+        input: Tensor<f32, 2>,
+        weight: &CudaSlice<f32>,
+        output: u64,
+    ) -> Result<()> {
+        unsafe {
+            s.launch_builder(&self.kernels.rms)
+                .arg(&input.ptr)
+                .arg(&pointer(weight, s))
+                .arg(&1u32)
+                .arg(&output)
+                .arg(&0u64)
+                .arg(&input.shape[1])
+                .arg(&self.spec.norm_eps)
+                .launch(ops::grid(input.shape[0] as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    fn residual(
+        &self,
+        s: &Arc<CudaStream>,
+        w: &ImageWork,
+        branch: &CudaSlice<f32>,
+        scale: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<()> {
+        unsafe {
+            s.launch_builder(&self.kernels.residual)
+                .arg(&pointer(&w.x, s))
+                .arg(&pointer(branch, s))
+                .arg(&pointer(scale, s))
+                .arg(&pointer(&w.x, s))
+                .arg(&u32::try_from(rows)?)
+                .arg(&u32::try_from(self.spec.dim)?)
+                .launch(w.plan.flat(rows * self.spec.dim))?;
+        }
+        Ok(())
+    }
+
+    fn attention(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        w: &ImageWork,
+        active: usize,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let (t, dim) = (w.plan.tokens, spec.dim);
+        let shape = |batch, rows, width| -> Result<[u32; 3]> {
+            Ok([
+                u32::try_from(batch)?,
+                u32::try_from(rows)?,
+                u32::try_from(width)?,
+            ])
+        };
+        for first in (0..active).step_by(w.plan.attention) {
+            let batch = (active - first).min(w.plan.attention) * spec.heads;
+            let offset = first * t * dim;
+            let heads = |buffer: &CudaSlice<f32>| {
+                view(
+                    buffer,
+                    s,
+                    offset,
+                    shape(batch, t, spec.head_dim)?,
+                    [(t * spec.head_dim) as u64, spec.head_dim as u64, 1],
+                )
+            };
+            let scores = view(
+                &w.scores,
+                s,
+                0,
+                shape(batch, t, t)?,
+                [(t * t) as u64, t as u64, 1],
+            )?;
+            blas.batched_f32(
+                heads(&w.q)?,
+                heads(&w.k)?,
+                &mut TensorMut(scores),
+                [false, true],
+                (spec.head_dim as f32).sqrt().recip(),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.softmax)
+                    .arg(&scores.ptr)
+                    .arg(&u32::try_from(batch * t)?)
+                    .arg(&u32::try_from(t)?)
+                    .arg(&(t as u64))
+                    .launch(ops::grid(batch * t, 256))?;
+            }
+            blas.batched_f32(
+                scores,
+                heads(&w.v)?,
+                &mut TensorMut(heads(&w.attn)?),
+                [false, false],
+                1.0,
+            )?;
+        }
+        unsafe {
+            s.launch_builder(&self.kernels.unpack)
+                .arg(&pointer(&w.attn, s))
+                .arg(&pointer(&w.o, s))
+                .arg(&u32::try_from(active)?)
+                .arg(&u32::try_from(t)?)
+                .arg(&u32::try_from(spec.heads)?)
+                .arg(&u32::try_from(spec.head_dim)?)
+                .launch(w.plan.flat(active * t * dim))?;
+        }
+        Ok(())
+    }
+
+    fn block(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        block: &DecoderBlock<f32>,
+        w: &ImageWork,
+        group: (usize, usize, usize),
+        observe: &mut impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let (first, active, layer) = group;
+        let rows = active * w.plan.tokens;
+        let n = rows * spec.dim;
+        let states = |data, offset| rows_view(data, s, offset, rows, spec.dim, spec.dim);
+        self.rms(s, states(&w.x, 0)?, &block.norm1, pointer(&w.norm, s))?;
+        for (linear, offset) in [(&block.q, 0), (&block.k, n), (&block.v, 2 * n)] {
+            linear.run(
+                s,
+                blas,
+                &self.kernels.bias,
+                states(&w.norm, 0)?,
+                states(&w.ff, offset)?,
+            )?;
+        }
+        for (offset, name) in [(0, "q0"), (n, "k0")] {
+            let heads = rows_view(
+                &w.ff,
+                s,
+                offset,
+                rows * spec.heads,
+                spec.head_dim,
+                spec.head_dim,
+            )?;
+            self.rms(s, heads, &w.ones, heads.ptr)?;
+            if layer == 0 {
+                observe(
+                    name,
+                    first,
+                    active,
+                    (&w.ff, offset, w.plan.tokens, spec.dim),
+                )?;
+            }
+        }
+        let q = pointer(&w.ff, s);
+        unsafe {
+            s.launch_builder(&self.kernels.pack)
+                .arg(&q)
+                .arg(&(q + (4 * n) as u64))
+                .arg(&(q + (8 * n) as u64))
+                .arg(&pointer(&w.rope, s))
+                .arg(&pointer(&w.q, s))
+                .arg(&pointer(&w.k, s))
+                .arg(&pointer(&w.v, s))
+                .arg(&u32::try_from(active)?)
+                .arg(&u32::try_from(w.plan.tokens)?)
+                .arg(&u32::try_from(spec.heads)?)
+                .arg(&u32::try_from(spec.head_dim)?)
+                .arg(&u32::try_from(spec.rope_dims)?)
+                .launch(w.plan.flat(n / 2))?;
+        }
+        self.attention(s, blas, w, active)?;
+        block.out.run(
+            s,
+            blas,
+            &self.kernels.bias,
+            states(&w.o, 0)?,
+            states(&w.ff, 0)?,
+        )?;
+        self.residual(s, w, &w.ff, &block.scale1, rows)?;
+        self.rms(s, states(&w.x, 0)?, &block.norm2, pointer(&w.norm, s))?;
+        block.ff_in.run(
+            s,
+            blas,
+            &self.kernels.bias,
+            states(&w.norm, 0)?,
+            rows_view(&w.ff, s, 0, rows, 2 * spec.ffn, 2 * spec.ffn)?,
+        )?;
+        let silu_grid = flat(rows * spec.ffn);
+        unsafe {
+            s.launch_builder(&self.kernels.silu)
+                .arg(&pointer(&w.ff, s))
+                .arg(&pointer(&w.gated, s))
+                .arg(&i64::try_from(rows)?)
+                .arg(&i32::try_from(spec.ffn)?)
+                .launch(silu_grid)?;
+        }
+        block.ff_out.run(
+            s,
+            blas,
+            &self.kernels.bias,
+            rows_view(&w.gated, s, 0, rows, spec.ffn, spec.ffn)?,
+            states(&w.o, 0)?,
+        )?;
+        self.residual(s, w, &w.o, &block.scale2, rows)?;
+        if layer == 0 || layer + 1 == spec.layers {
+            observe(
+                if layer == 0 { "block0" } else { "block_last" },
+                first,
+                active,
+                (&w.x, 0, w.plan.tokens, spec.dim),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn run(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        w: ImageWork,
+        input: &CudaSlice<f32>,
+        observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
+    ) -> Result<CudaSlice<f32>> {
+        self.launch(s, blas, &w, input, observe)?;
+        s.synchronize()?;
+        Ok(w.rgb)
+    }
+
+    fn launch(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        w: &ImageWork,
+        input: &CudaSlice<f32>,
+        mut observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let (h, width) = (
+            w.canvas[0] / spec.spatial_ratio,
+            w.canvas[1] / spec.spatial_ratio,
+        );
+        ensure!(
+            input.len() == spec.latent_channels * h * width,
+            "image VAE normalized latent extent mismatch"
+        );
+        let p = &w.plan;
+        for first in (0..w.tiles.count()).step_by(p.linear) {
+            let active = (w.tiles.count() - first).min(p.linear);
+            let rows = active * p.tokens;
+            unsafe {
+                s.launch_builder(&self.kernels.gather)
+                    .arg(&pointer(input, s))
+                    .arg(&pointer(&self.latent_affine.0, s))
+                    .arg(&pointer(&self.latent_affine.1, s))
+                    .arg(&pointer(&w.grid, s))
+                    .arg(&pointer(&w.latent, s))
+                    .arg(&u32::try_from(spec.latent_channels)?)
+                    .arg(&u32::try_from(h)?)
+                    .arg(&u32::try_from(width)?)
+                    .arg(&u32::try_from(w.tiles.rows.0.len())?)
+                    .arg(&u32::try_from(w.tiles.cols.0.len())?)
+                    .arg(&u32::try_from(spec.spatial_ratio)?)
+                    .arg(&u32::try_from(w.tiles.height / spec.spatial_ratio)?)
+                    .arg(&u32::try_from(w.tiles.width / spec.spatial_ratio)?)
+                    .arg(&u32::try_from(first)?)
+                    .arg(&u32::try_from(active)?)
+                    .launch(p.flat(active * p.patches * spec.latent_channels))?;
+            }
+            let latent = |buffer| {
+                rows_view(
+                    buffer,
+                    s,
+                    0,
+                    active * p.patches,
+                    spec.latent_channels,
+                    spec.latent_channels,
+                )
+            };
+            self.post_quant.run(
+                s,
+                blas,
+                &self.kernels.bias,
+                latent(&w.latent)?,
+                latent(&w.latent_q)?,
+            )?;
+            self.proj_in.run(
+                s,
+                blas,
+                &self.kernels.bias,
+                latent(&w.latent_q)?,
+                rows_view(&w.o, s, 0, active * p.patches, spec.dim, spec.dim)?,
+            )?;
+            observe("proj_in", first, active, (&w.o, 0, p.patches, spec.dim))?;
+            unsafe {
+                s.launch_builder(&self.kernels.append)
+                    .arg(&pointer(&w.o, s))
+                    .arg(&pointer(&self.registers, s))
+                    .arg(&pointer(&w.x, s))
+                    .arg(&u32::try_from(active)?)
+                    .arg(&u32::try_from(p.patches)?)
+                    .arg(&u32::try_from(spec.registers)?)
+                    .arg(&u32::try_from(spec.dim)?)
+                    .launch(p.flat(rows * spec.dim))?;
+            }
+            for (layer, block) in self.blocks.iter().enumerate() {
+                self.block(s, blas, block, w, (first, active, layer), &mut observe)?;
+            }
+            let dim = spec.dim as u64;
+            unsafe {
+                s.launch_builder(&self.kernels.norm)
+                    .arg(&pointer(&w.x, s))
+                    .arg(&pointer(&self.norm_out.0, s))
+                    .arg(&pointer(&self.norm_out.1, s))
+                    .arg(&pointer(&w.norm, s))
+                    .arg(&u32::try_from(rows)?)
+                    .arg(&1u32)
+                    .arg(&u32::try_from(spec.dim)?)
+                    .arg(&dim)
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&dim)
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&spec.norm_eps)
+                    .launch(ops::grid(rows, 256))?;
+            }
+            observe("norm_out", first, active, (&w.norm, 0, p.tokens, spec.dim))?;
+            self.proj_out.run(
+                s,
+                blas,
+                &self.kernels.bias,
+                rows_view(&w.norm, s, 0, rows, spec.dim, spec.dim)?,
+                rows_view(
+                    &w.patch_rows,
+                    s,
+                    0,
+                    rows,
+                    spec.patch_width(),
+                    spec.patch_width(),
+                )?,
+            )?;
+            let pixels = spec.out_channels * w.tiles.height * w.tiles.width;
+            for tile in 0..active {
+                let source =
+                    pointer(&w.patch_rows, s) + (4 * tile * p.tokens * spec.patch_width()) as u64;
+                let target = pointer(&w.raw, s) + (4 * (first + tile) * pixels) as u64;
+                unsafe {
+                    s.launch_builder(&self.kernels.patches)
+                        .arg(&source)
+                        .arg(&target)
+                        .arg(&1u32)
+                        .arg(&u32::try_from(w.tiles.height / spec.spatial_ratio)?)
+                        .arg(&u32::try_from(w.tiles.width / spec.spatial_ratio)?)
+                        .arg(&u32::try_from(spec.out_channels)?)
+                        .arg(&1u32)
+                        .arg(&u32::try_from(spec.spatial_ratio)?)
+                        .launch(p.flat(pixels))?;
+                }
+            }
+        }
+        unsafe {
+            s.launch_builder(&self.kernels.stitch)
+                .arg(&pointer(&w.raw, s))
+                .arg(&pointer(&w.planar, s))
+                .arg(&pointer(&w.grid, s))
+                .arg(&u32::try_from(w.tiles.rows.0.len())?)
+                .arg(&u32::try_from(w.tiles.cols.0.len())?)
+                .arg(&u32::try_from(spec.out_channels)?)
+                .arg(&u32::try_from(w.tiles.height)?)
+                .arg(&u32::try_from(w.tiles.width)?)
+                .arg(&u32::try_from(w.canvas[0])?)
+                .arg(&u32::try_from(w.canvas[1])?)
+                .launch(p.flat(w.planar.len()))?;
+            s.launch_builder(&self.kernels.pixels)
+                .arg(&pointer(&w.planar, s))
+                .arg(&pointer(&self.pixel_affine.0, s))
+                .arg(&pointer(&self.pixel_affine.1, s))
+                .arg(&pointer(&w.rgb, s))
+                .arg(&u32::try_from(spec.out_channels)?)
+                .arg(&u64::try_from(w.canvas[0] * w.canvas[1])?)
+                .launch(p.flat(w.rgb.len()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Normalized F32 `[24, latent_h, latent_w]` to F32 `[height, width, 3]`, before clamp and quantization.
+pub(super) fn decode_image_device(
+    device: &Device,
+    blas: &Blas,
+    model: &Path,
+    latent: &CudaSlice<f32>,
+    extent: [usize; 2],
+) -> Result<CudaSlice<f32>> {
+    let component = model.join("vae_diffusers");
+    let config = component.join("config.json");
+    let spec = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
+        &std::fs::read(&config).with_context(|| format!("read {}", config.display()))?,
+    )?)?;
+    let checkpoint =
+        crate::checkpoint::MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
+    let manifest = checkpoint.minimax_h3_image_vae_manifest(&spec)?;
+    let canvas = [
+        extent[0]
+            .checked_mul(spec.spatial_ratio)
+            .context("image VAE canvas overflow")?,
+        extent[1]
+            .checked_mul(spec.spatial_ratio)
+            .context("image VAE canvas overflow")?,
+    ];
+    let elements = extent[0]
+        .checked_mul(extent[1])
+        .and_then(|n| n.checked_mul(spec.latent_channels))
+        .context("image VAE input extent overflow")?;
+    ensure!(
+        extent.into_iter().all(|n| n > 0) && latent.len() == elements,
+        "image VAE normalized latent extent mismatch"
+    );
+    let decoder = ImageDecoder::new(device, spec.single_frame(), &component, &manifest)?;
+    let (free, total) = device.ctx.mem_get_info()?;
+    let budget = device.workspace_budget(free, free, total / 16)?;
+    let work = decoder.work(device, canvas, budget)?;
+    decoder.run(&device.stream, blas, work, latent, |_, _, _, _| Ok(()))
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use crate::backend::cuda::{closure::Closure, ops::Ops};
+    use crate::checkpoint::MappedCheckpoint;
+    use safetensors::{Dtype, SafeTensors};
+    use std::{collections::BTreeMap, fs, path::PathBuf, rc::Rc};
+
+    fn geometry() -> Result<VaeSpec> {
+        Ok(
+            crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_str(include_str!(
+                "../../../tests/data/minimax-h3-image-vae-config.json"
+            ))?)?
+            .single_frame(),
+        )
+    }
+
+    #[test]
+    fn image_workspace_respects_memory_and_launch_limits() -> Result<()> {
+        let spec = geometry()?;
+        let tiles = VaeTiles::released(&spec, 4096, 4096)?;
+        let limits = |budget, grid| ImageLimits {
+            budget,
+            l2: 75_497_472,
+            sms: 128,
+            grid,
+        };
+        let plan = ImagePlan::derive(
+            &spec,
+            &tiles,
+            [4096, 4096],
+            limits(16 << 30, i32::MAX as usize),
+        )?;
+        assert_eq!((plan.linear, plan.attention, plan.tokens), (441, 8, 261));
+        assert_eq!(
+            flat(plan.linear * plan.tokens * spec.ffn).grid_dim.0,
+            1_841_616
+        );
+        let serial_bytes = 775_026_440;
+        assert!(
+            ImagePlan::derive(
+                &spec,
+                &tiles,
+                [4096, 4096],
+                limits(serial_bytes - 1, i32::MAX as usize)
+            )
+            .is_err()
+        );
+        let serial = ImagePlan::derive(
+            &spec,
+            &tiles,
+            [4096, 4096],
+            limits(serial_bytes, i32::MAX as usize),
+        )?;
+        assert_eq!(
+            (serial.linear, serial.attention, serial.bytes),
+            (1, 1, serial_bytes)
+        );
+        assert!(ImagePlan::derive(&spec, &tiles, [4096, 4096], limits(16 << 30, 1)).is_err());
+        let bounded = ImagePlan::derive(&spec, &tiles, [4096, 4096], limits(16 << 30, 65_535))?;
+        assert!(
+            bounded.linear < plan.linear
+                && flat(bounded.linear * bounded.tokens * spec.ffn).grid_dim.0 <= 65_535
+        );
+        Ok(())
+    }
+
+    fn tensor(file: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
+        let value = file.tensor(name)?;
+        ensure!(
+            value.dtype() == Dtype::F32,
+            "RUNNER_FAIL {name} fixture dtype"
+        );
+        Ok(value
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+
+    fn score(
+        label: &str,
+        actual: &[f32],
+        reference: &[f32],
+        threshold: &serde_json::Value,
+    ) -> Result<bool> {
+        ensure!(
+            !actual.is_empty() && actual.len() == reference.len(),
+            "RUNNER_FAIL {label} lengths"
+        );
+        ensure!(
+            actual.iter().chain(reference).all(|x| x.is_finite()),
+            "RUNNER_FAIL {label} nonfinite"
+        );
+        let (mut max_abs, mut squares) = (0f64, 0f64);
+        for (&a, &b) in actual.iter().zip(reference) {
+            let delta = f64::from(a) - f64::from(b);
+            max_abs = max_abs.max(delta.abs());
+            squares += delta * delta;
+        }
+        let rmse = (squares / actual.len() as f64).sqrt();
+        let max_tau = threshold["max_abs"]
+            .as_f64()
+            .context("RUNNER_FAIL missing max_abs tau")?;
+        let rmse_tau = threshold["rmse"]
+            .as_f64()
+            .context("RUNNER_FAIL missing rmse tau")?;
+        ensure!(
+            max_tau.is_finite() && rmse_tau.is_finite() && max_tau > 0.0 && rmse_tau > 0.0,
+            "RUNNER_FAIL invalid taus"
+        );
+        let defect = max_abs > max_tau || rmse > rmse_tau;
+        println!(
+            "IMAGE_VAE_CELL {label} max_abs={max_abs:.10e} rmse={rmse:.10e} tau_max={max_tau:.10e} tau_rmse={rmse_tau:.10e} status={}",
+            if defect { "DEFECT" } else { "PASS" }
+        );
+        Ok(defect)
+    }
+
+    fn path(key: &str) -> Result<PathBuf> {
+        Ok(PathBuf::from(
+            std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+        ))
+    }
+
+    fn input(root: &Path, name: &str, shape: [usize; 2]) -> Result<Vec<f32>> {
+        let bytes = fs::read(root.join(format!("inputs/decode-{name}.safetensors")))?;
+        let file = SafeTensors::deserialize(&bytes)?;
+        ensure!(
+            file.tensor("normalized_latent")?.shape() == [1, 24, shape[0] / 16, shape[1] / 16],
+            "RUNNER_FAIL {name} input shape"
+        );
+        tensor(&file, "normalized_latent")
+    }
+
+    fn save_taps(
+        path: &Path,
+        taps: &BTreeMap<String, Vec<f32>>,
+        reference: &SafeTensors<'_>,
+    ) -> Result<()> {
+        let bytes: BTreeMap<_, Vec<u8>> = taps
+            .iter()
+            .filter(|(name, _)| name.as_str() != "rgb")
+            .map(|(name, values)| {
+                (
+                    name.as_str(),
+                    values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect(),
+                )
+            })
+            .collect();
+        let views: BTreeMap<_, _> = bytes
+            .iter()
+            .map(|(name, data)| {
+                Ok((
+                    *name,
+                    safetensors::tensor::TensorView::new(
+                        Dtype::F32,
+                        reference.tensor(name)?.shape().to_vec(),
+                        data,
+                    )?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        safetensors::tensor::serialize_to_file(views, None, path)?;
+        Ok(())
+    }
+
+    fn reference_gate(root: &Path, model: &Path, runtime: &Path, capture: &Path) -> Result<()> {
+        let spec = geometry()?;
+        let component = model.join("vae_diffusers");
+        let published = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
+            &fs::read(component.join("config.json"))?,
+        )?)?;
+        ensure!(
+            published.single_frame() == spec,
+            "RUNNER_FAIL published VAE differs from the frozen geometry"
+        );
+        let checkpoint = MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
+        let manifest = checkpoint.minimax_h3_image_vae_manifest(&published)?;
+        ensure!(
+            manifest.entries.len() == 511,
+            "RUNNER_FAIL full VAE tensor census"
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("FROZEN_DECODER_FLOORS.json"))?)?;
+        ensure!(
+            frozen["formula"] == "max(2*worst_valid_pair,1e-6)",
+            "RUNNER_FAIL decoder floor formula"
+        );
+        let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        ensure!(
+            [86, 89].contains(&sm),
+            "RUNNER_FAIL VAE fixture has no sm{sm} arm"
+        );
+        let s = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            runtime,
+            Rc::new(Closure::new(true, "image VAE gate".into())),
+        )?;
+        let mut decoder = ImageDecoder::new(&device, spec.clone(), &component, &manifest)?;
+        let mut defects = 0;
+        let mut cells = 0;
+        for (name, canvas) in [
+            ("small", [128, 192]),
+            ("overlap", [272, 304]),
+            ("2048", [2048, 2048]),
+            ("4096", [4096, 4096]),
+        ] {
+            let z = s.clone_htod(&input(root, name, canvas)?)?;
+            let expected_bytes = fs::read(root.join(format!(
+                "reference-sm{sm}/output/decode-{name}-canonical0.safetensors"
+            )))?;
+            let expected = SafeTensors::deserialize(&expected_bytes)?;
+            for low in [false, true] {
+                let (free, total) = device.ctx.mem_get_info()?;
+                let live = device.workspace_budget(free, free, total / 16)?;
+                let budget = if low {
+                    let tiles = VaeTiles::released(&spec, canvas[0], canvas[1])?;
+                    let tokens = tiles.height / spec.spatial_ratio
+                        * (tiles.width / spec.spatial_ratio)
+                        + spec.registers
+                        + 1;
+                    let (p, score) = (tokens * spec.dim * 4, tokens * tokens * spec.heads * 4);
+                    let base = tiles.count() * spec.out_channels * tiles.height * tiles.width * 4
+                        + canvas[0] * canvas[1] * spec.out_channels * 8
+                        + 4 * (2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2
+                            + tokens * spec.rope_dims
+                            + spec.head_dim);
+                    let per_tile = 19 * p
+                        + 4 * tokens * spec.patch_width()
+                        + 8 * (tokens - spec.registers - 1) * spec.latent_channels;
+                    live.min(base + per_tile + score)
+                } else {
+                    live
+                };
+                let work = decoder.work(&device, canvas, budget)?;
+                if low {
+                    ensure!(
+                        work.plan.linear == 1 && work.plan.attention == 1,
+                        "RUNNER_FAIL serial budget did not force serial tiles"
+                    );
+                }
+                let selected: std::collections::BTreeSet<_> =
+                    [0, work.tiles.count() / 2, work.tiles.count() - 1]
+                        .into_iter()
+                        .collect();
+                let mut taps = BTreeMap::new();
+                decoder.launch(
+                    s,
+                    &blas,
+                    &work,
+                    &z,
+                    |role, first, active, (data, offset, rows, width)| {
+                        let role = if role == "block_last" {
+                            "block23"
+                        } else {
+                            role
+                        };
+                        for &tile in &selected {
+                            if (first..first + active).contains(&tile) {
+                                let start = offset + (tile - first) * rows * width;
+                                let value =
+                                    s.clone_dtoh(&data.slice(start..start + rows * width))?;
+                                ensure!(
+                                    taps.insert(format!("{role}.tile{tile}"), value).is_none(),
+                                    "RUNNER_FAIL duplicate tap"
+                                );
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+                taps.insert("rgb".into(), s.clone_dtoh(&work.rgb)?);
+                ensure!(
+                    taps.len() == expected.names().len(),
+                    "RUNNER_FAIL missing boundary tap"
+                );
+                for (key, actual) in &taps {
+                    defects += usize::from(score(
+                        &format!("case={name} low={low} boundary={key}"),
+                        actual,
+                        &tensor(&expected, key)?,
+                        &frozen["cases"][name][key],
+                    )?);
+                    cells += 1;
+                }
+                save_taps(
+                    &capture.join(format!("{name}-{low}-{}.safetensors", std::process::id())),
+                    &taps,
+                    &expected,
+                )?;
+                if name == "2048" && !low {
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let launched = decoder.launch(s, &blas, &work, &z, |_, _, _, _| Ok(()));
+                    let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    launched?;
+                    graph?
+                        .context("RUNNER_FAIL image VAE graph empty")?
+                        .launch()?;
+                    let actual = s.clone_dtoh(&work.rgb)?;
+                    let bits = actual
+                        .iter()
+                        .zip(&taps["rgb"])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    ensure!(
+                        actual.iter().all(|v| v.is_finite()),
+                        "RUNNER_FAIL image VAE graph nonfinite"
+                    );
+                    println!(
+                        "IMAGE_VAE_GRAPH case=2048 linear={} attention={} tail={} bit_differences={bits} status={}",
+                        work.plan.linear,
+                        work.plan.attention,
+                        work.tiles.count() % work.plan.attention,
+                        if bits == 0 { "PASS" } else { "DEFECT" }
+                    );
+                    defects += usize::from(bits != 0);
+                }
+            }
+        }
+        let mut mean = spec.latents_mean.clone();
+        mean.rotate_right(1);
+        let mut std = spec.latents_std.clone();
+        std.rotate_right(1);
+        decoder.latent_affine = (s.clone_htod(&std)?, s.clone_htod(&mean)?);
+        let z = s.clone_htod(&input(root, "2048", [2048, 2048])?)?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let work = decoder.work(
+            &device,
+            [2048, 2048],
+            device.workspace_budget(free, free, total / 16)?,
+        )?;
+        let control = decoder.run(s, &blas, work, &z, |_, _, _, _| Ok(()))?;
+        let bytes = fs::read(root.join(format!(
+            "reference-sm{sm}/output/decode-2048-canonical0.safetensors"
+        )))?;
+        let reference = SafeTensors::deserialize(&bytes)?;
+        let detected = score(
+            "control=shift24",
+            &s.clone_dtoh(&control)?,
+            &tensor(&reference, "rgb")?,
+            &frozen["cases"]["2048"]["rgb"],
+        )?;
+        println!(
+            "IMAGE_VAE_CONTROL shift24_detected={detected} status={}",
+            if detected { "PASS" } else { "FAIL" }
+        );
+        ensure!(detected, "RUNNER_FAIL image VAE control not detected");
+        println!(
+            "{} IMAGE_VAE_DECODER cells={cells} graph_cells=1 control=FAIL_AS_REQUIRED defects={defects}",
+            if defects == 0 { "PASS" } else { "FAIL" }
+        );
+        ensure!(
+            defects == 0,
+            "image VAE decoder has {defects} finite numerical defects"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_S0 frozen references, FF_H3_CAPTURE output"]
+    fn image_decoder_matches_the_frozen_reference() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let root = path("FF_H3_S0")?;
+        let model = path("FF_MODEL")?;
+        let capture = path("FF_H3_CAPTURE")?;
+        fs::create_dir_all(&capture)?;
+        let runtime = std::env::temp_dir().join(format!("ff-image-vae-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = reference_gate(&root, &model, &runtime, &capture);
+        fs::remove_dir_all(&runtime)?;
+        result
+    }
+}
 
 const MODE: LinearBiasMode = LinearBiasMode::BeforeOutputRound;
 /// Threads per q/k head-norm row of `rms_norm_bf16`.
@@ -136,9 +1379,9 @@ pub(crate) fn planar_bf16_to_rgb_u8(
 }
 
 /// A biased BF16 projection `[out, input]` cast from the published F32 tensor at load.
-struct Linear {
-    weight: CudaSlice<bf16>,
-    bias: CudaSlice<bf16>,
+struct Linear<T: crate::backend::gpu::DeviceRepr = bf16> {
+    weight: CudaSlice<T>,
+    bias: CudaSlice<T>,
     out: usize,
     input: usize,
 }
@@ -171,13 +1414,13 @@ impl Linear {
     }
 }
 
-struct DecoderBlock {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    out: Linear,
-    ff_in: Linear,
-    ff_out: Linear,
+struct DecoderBlock<T: crate::backend::gpu::DeviceRepr = bf16> {
+    q: Linear<T>,
+    k: Linear<T>,
+    v: Linear<T>,
+    out: Linear<T>,
+    ff_in: Linear<T>,
+    ff_out: Linear<T>,
     norm1: CudaSlice<f32>,
     norm2: CudaSlice<f32>,
     scale1: CudaSlice<f32>,
@@ -2106,33 +3349,40 @@ impl TileWork {
 /// patch grid followed by the register and cls tokens at angle 0. Per axis the coordinate is
 /// `2 ((i + 0.5) / size) - 1`, the angle `2 pi x coordinate x theta^(-k * 2 * axes / rope_dims)` in F32, axes in
 /// (frame, row, column) order.
-pub(crate) fn rope_table(
+pub(crate) fn rope_table(spec: &VaeSpec, shape: (usize, usize, usize)) -> Vec<bf16> {
+    rotary_table(spec, shape, ROPE_AXES, bf16::from_f32)
+}
+
+fn rotary_table<T: Clone>(
     spec: &VaeSpec,
     (frames, height, width): (usize, usize, usize),
-) -> Vec<bf16> {
+    axes: usize,
+    cast: impl Fn(f32) -> T,
+) -> Vec<T> {
     let half = spec.rope_dims / 2;
-    let freqs = half / ROPE_AXES;
-    let step = (2 * ROPE_AXES) as f32 / spec.rope_dims as f32;
+    let freqs = half / axes;
+    let step = (2 * axes) as f32 / spec.rope_dims as f32;
     let inv: Vec<f32> = (0..freqs)
         .map(|k| 1.0f32 / spec.rope_theta.powf(k as f32 * step))
         .collect();
     let coordinate = |i: usize, size: usize| 2.0f32 * ((i as f32 + 0.5) / size as f32) - 1.0;
     let turn = (2.0 * std::f64::consts::PI) as f32;
     let tokens = frames * height * width + spec.registers + 1;
-    let mut table = vec![bf16::ZERO; tokens * spec.rope_dims];
+    let mut table = vec![cast(0.0); tokens * spec.rope_dims];
     for (row, chunk) in table.chunks_mut(spec.rope_dims).enumerate() {
         if row >= frames * height * width {
-            chunk[..half].fill(bf16::ONE);
+            chunk[..half].fill(cast(1.0));
             continue;
         }
         let position = [row / (height * width), row / width % height, row % width];
         let sizes = [frames, height, width];
-        for axis in 0..ROPE_AXES {
-            let x = coordinate(position[axis], sizes[axis]);
+        for axis in 0..axes {
+            let source = 3 - axes + axis;
+            let x = coordinate(position[source], sizes[source]);
             for (k, inv) in inv.iter().enumerate() {
                 let angle = turn * x * inv;
-                chunk[axis * freqs + k] = bf16::from_f32(angle.cos());
-                chunk[half + axis * freqs + k] = bf16::from_f32(angle.sin());
+                chunk[axis * freqs + k] = cast(angle.cos());
+                chunk[half + axis * freqs + k] = cast(angle.sin());
             }
         }
     }

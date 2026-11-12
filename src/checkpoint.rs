@@ -2848,6 +2848,22 @@ impl MappedCheckpoint {
         &self,
         vae: &crate::minimax_h3::VaeSpec,
     ) -> Result<TensorManifest> {
+        self.minimax_h3_vae_parts(vae, false)
+    }
+
+    /// Published F32 image VAE: a spatial post-quant convolution and one-frame decoder patches.
+    pub fn minimax_h3_image_vae_manifest(
+        &self,
+        vae: &crate::minimax_h3::ImageVaeSpec,
+    ) -> Result<TensorManifest> {
+        self.minimax_h3_vae_parts(&vae.single_frame(), true)
+    }
+
+    fn minimax_h3_vae_parts(
+        &self,
+        vae: &crate::minimax_h3::VaeSpec,
+        image: bool,
+    ) -> Result<TensorManifest> {
         let mut expected = BTreeMap::new();
         let mut entry = |name: String, shape: Vec<usize>, scope: TensorScope| {
             put(&mut expected, name, Dtype::F32, shape, scope)
@@ -2855,7 +2871,14 @@ impl MappedCheckpoint {
         let (latent, dim) = (vae.latent_channels, vae.dim);
         let decoder = TensorScope::Text;
         for (name, shape) in [
-            ("post_quant_conv.weight", vec![latent, latent, 1, 1, 1]),
+            (
+                "post_quant_conv.weight",
+                if image {
+                    vec![latent, latent, 1, 1]
+                } else {
+                    vec![latent, latent, 1, 1, 1]
+                },
+            ),
             ("post_quant_conv.bias", vec![latent]),
             ("decoder.proj_in.weight", vec![dim, latent]),
             ("decoder.proj_in.bias", vec![dim]),
@@ -2952,7 +2975,11 @@ impl MappedCheckpoint {
         entry("quant_conv.bias".into(), vec![2 * latent], encoder);
         let planned = planned_bytes(&expected, LoadPolicy::TextWithVision)?;
         self.assemble_manifest(
-            "MiniMax-H3 video VAE",
+            if image {
+                "MiniMax-H3-Image VAE"
+            } else {
+                "MiniMax-H3 video VAE"
+            },
             expected,
             LoadPolicy::TextWithVision,
             planned,

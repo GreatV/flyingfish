@@ -8,7 +8,7 @@ use std::{
 };
 
 #[cfg(feature = "cuda")]
-pub use crate::backend::cuda::engine::minimax_h3::{generate, image_sample};
+pub use crate::backend::cuda::engine::minimax_h3::{generate, image_decode, image_sample};
 
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.
 pub const VIDEO_TAG: u8 = 0;
@@ -215,7 +215,7 @@ impl H3Spec {
     }
 }
 
-/// MiniMax-H3 video VAE configuration (`vae/config.json`): the causal 3D CNN encoder and the non-causal ViT decoder.
+/// MiniMax-H3 video VAE configuration and shared image/video execution geometry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VaeSpec {
     pub in_channels: usize,
@@ -234,7 +234,7 @@ pub struct VaeSpec {
     pub registers: usize,
     pub ffn: usize,
     pub rope_theta: f32,
-    /// Rotated channels of every head: `head_dim * decoder_rope_dim_ratio`, three axes of equal width.
+    /// Rotated channels of every head: `head_dim * decoder_rope_dim_ratio`.
     pub rope_dims: usize,
     pub norm_eps: f32,
     pub clip_length: usize,
@@ -1605,6 +1605,38 @@ impl ImageVaeSpec {
             "unsupported MiniMax-H3-Image VAE geometry: {spec:?}"
         );
         Ok(spec)
+    }
+}
+
+impl ImageVaeSpec {
+    /// Shared encoder and decoder dimensions with one decoded frame per image token.
+    pub(crate) fn single_frame(&self) -> VaeSpec {
+        VaeSpec {
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            latent_channels: self.latent_channels,
+            block_out_channels: self.block_out_channels.clone(),
+            layers_per_block: self.layers_per_block,
+            spatial_factors: self.spatial_factors.clone(),
+            temporal_factors: self.temporal_factors.clone(),
+            spatial_ratio: self.spatial_ratio,
+            temporal_ratio: 1,
+            dim: self.dim,
+            layers: self.layers,
+            heads: self.heads,
+            head_dim: self.head_dim,
+            registers: self.registers,
+            ffn: self.ffn,
+            rope_theta: self.rope_theta,
+            rope_dims: self.rope_dims,
+            norm_eps: self.norm_eps,
+            clip_length: 1,
+            token_drop: 0,
+            groups: self.groups,
+            encoder_eps: self.encoder_eps,
+            latents_mean: self.latents_mean.clone(),
+            latents_std: self.latents_std.clone(),
+        }
     }
 }
 
