@@ -1573,6 +1573,18 @@ mod tests {
             ("shape", "robot_crab", "512"),
             ("tex", "cottage", "512"),
             ("tex", "robot_crab", "512"),
+            ("shape", "cottage", "1024"),
+            ("shape", "robot_crab", "1024"),
+            ("tex", "cottage", "1024"),
+            ("tex", "robot_crab", "1024"),
+            ("shape", "cottage", "1024cascade"),
+            ("shape", "robot_crab", "1024cascade"),
+            ("tex", "cottage", "1024cascade"),
+            ("tex", "robot_crab", "1024cascade"),
+            ("shape", "cottage", "1536cascade"),
+            ("shape", "robot_crab", "1536cascade"),
+            ("tex", "cottage", "1536cascade"),
+            ("tex", "robot_crab", "1536cascade"),
         ] {
             let (kind, fixture, resolution) = case;
             let dir = root.join(format!("{kind}-{fixture}-{resolution}-r0a"));
@@ -1741,7 +1753,7 @@ mod tests {
             "TRELLIS.2 SLAT flow gate: {defects} defects over {scored} cells"
         );
         println!(
-            "PASS TRELLIS2_SLAT_FLOW cells={scored} skipped={skipped} control_defects={control_defects} cases=4"
+            "PASS TRELLIS2_SLAT_FLOW cells={scored} skipped={skipped} control_defects={control_defects} cases=16"
         );
         Ok(())
     }
