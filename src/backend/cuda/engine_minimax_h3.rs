@@ -41,6 +41,36 @@ mod pipeline;
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
+/// Decode normalized F32 NCHW image latents to F32 RGB HWC before clamp and quantization.
+pub fn image_decode(
+    model: &Path,
+    (ordinal, runtime): (usize, &Path),
+    extent: [usize; 2],
+    normalized: &[f32],
+) -> Result<Vec<f32>> {
+    ensure!(
+        normalized.iter().all(|v| v.is_finite()),
+        "image VAE input is nonfinite"
+    );
+    let device = Device::new(ordinal)?;
+    let ops = ops::Ops::new(&device.ctx)?;
+    device.finish_upload()?;
+    let blas = Blas::new(
+        &device,
+        &ops,
+        runtime,
+        Rc::new(Closure::new(true, "image VAE".into())),
+    )?;
+    let input = device.stream.clone_htod(normalized)?;
+    let rgb = vae::decode_image_device(&device, &blas, model, &input, extent)?;
+    let output = device.stream.clone_dtoh(&rgb)?;
+    ensure!(
+        output.iter().all(|v| v.is_finite()),
+        "image VAE output is nonfinite"
+    );
+    Ok(output)
+}
+
 /// Direct-IO read granularity.
 const READ_CHUNK_BYTES: u64 = 32 << 20;
 
@@ -204,12 +234,12 @@ impl EntryReader {
     }
 }
 
-fn matrix(
-    b: &CudaSlice<bf16>,
+fn matrix<T: crate::backend::gpu::DeviceRepr + Copy>(
+    b: &CudaSlice<T>,
     s: &Arc<CudaStream>,
     rows: usize,
     width: usize,
-) -> Result<Tensor<bf16, 2>> {
+) -> Result<Tensor<T, 2>> {
     view(
         b,
         s,
@@ -1045,14 +1075,14 @@ fn pointer<T>(b: &CudaSlice<T>, s: &Arc<CudaStream>) -> u64 {
     b.device_ptr(s).0
 }
 
-fn rows_view(
-    b: &CudaSlice<bf16>,
+fn rows_view<T: crate::backend::gpu::DeviceRepr + Copy>(
+    b: &CudaSlice<T>,
     s: &Arc<CudaStream>,
     offset: usize,
     rows: usize,
     width: usize,
     pitch: usize,
-) -> Result<Tensor<bf16, 2>> {
+) -> Result<Tensor<T, 2>> {
     view(
         b,
         s,
