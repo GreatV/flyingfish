@@ -2350,12 +2350,12 @@ mod tests {
                 let mut subdivision_cells = 0usize;
                 let mut head_cells = 0usize;
                 let mut field_cells = 0usize;
-                let mut score = |id: &str,
-                                 coordinates: &[[i32; 4]],
-                                 features: &[f32],
-                                 stored: &[f32],
-                                 defects: &mut usize,
-                                 scored: &mut usize|
+                let score = |id: &str,
+                             coordinates: &[[i32; 4]],
+                             features: &[f32],
+                             stored: &[f32],
+                             defects: &mut usize,
+                             scored: &mut usize|
                  -> Result<()> {
                     let (tau_max, tau_rmse) = tau_of(id)?;
                     let (max_abs, rmse) = metric(features, stored)?;
