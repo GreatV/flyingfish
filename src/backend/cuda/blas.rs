@@ -1072,12 +1072,16 @@ fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>
 }
 
 impl Blas {
-    pub(crate) fn direct_fp8_rows(&self) -> std::ops::RangeInclusive<usize> {
-        let rows = match self.invariant_rows {
+    pub(crate) fn fp8_direct_rows(invariant_rows: usize) -> std::ops::RangeInclusive<usize> {
+        let rows = match invariant_rows {
             0 => crate::mtp::MAX_VERIFY_ROWS,
             rows => rows,
         };
         1..=rows
+    }
+
+    pub(crate) fn direct_fp8_rows(&self) -> std::ops::RangeInclusive<usize> {
+        Self::fp8_direct_rows(self.invariant_rows)
     }
 
     pub(crate) fn direct_quant_rows(&self) -> std::ops::RangeInclusive<usize> {

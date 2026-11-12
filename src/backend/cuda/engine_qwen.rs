@@ -3862,15 +3862,13 @@ impl Engine {
                     )
                     .context("Q38 combined workspace overflow")
             };
-            #[cfg(feature = "cuda")]
-            let prompt_direct_max_rows =
-                if model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4 {
-                    blas.nvfp4_ops()?.direct_max_rows()
-                } else {
-                    crate::linear_plan::MAX_SKINNY_ROWS
-                };
-            #[cfg(not(feature = "cuda"))]
-            let prompt_direct_max_rows = crate::linear_plan::MAX_SKINNY_ROWS;
+            let prompt_direct_max_rows = crate::prefill::prompt_direct_max_rows(
+                &model_spec.linear_format,
+                #[cfg(feature = "cuda")]
+                blas.direct_fp8_rows(),
+                #[cfg(feature = "cuda")]
+                || Ok(blas.nvfp4_ops()?.direct_max_rows()),
+            )?;
             let solve_dense = |req: crate::prefill::WorkspaceRequest| -> Result<(crate::prefill::WorkspaceBudget, usize)> {
                 let initial = crate::prefill::WorkspaceBudget::new(req, workspace, |admitted| {
                     Ok(default_chunk(admitted))

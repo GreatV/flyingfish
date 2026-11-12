@@ -4,6 +4,27 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 #[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) fn prompt_direct_max_rows(
+    format: &crate::model_spec::LinearFormat,
+    #[cfg(feature = "cuda")] fp8_direct_rows: std::ops::RangeInclusive<usize>,
+    #[cfg(feature = "cuda")] nvfp4_direct_max_rows: impl FnOnce() -> Result<usize>,
+) -> Result<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        if *format == crate::model_spec::LinearFormat::NvFp4 {
+            nvfp4_direct_max_rows()
+        } else {
+            Ok(*fp8_direct_rows.end())
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = format;
+        Ok(crate::mtp::MAX_VERIFY_ROWS)
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn dense_prompt_bytes(
     spec: &crate::model_spec::ModelSpec,
     capacity: usize,
@@ -266,7 +287,10 @@ impl Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::{Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes};
+    use super::{
+        Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes,
+        prompt_direct_max_rows,
+    };
 
     #[test]
     fn dense_media_reservation_preserves_device_capacity() -> anyhow::Result<()> {
@@ -414,7 +438,25 @@ mod tests {
         assert_eq!(model.hidden, 5120);
         let gdn = GdnSpec::from_model(&model)?;
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model)?.row_bytes()?;
-        let direct_fp8 = crate::mtp::MAX_VERIFY_ROWS;
+        let direct_fp8 = prompt_direct_max_rows(
+            &model.linear_format,
+            #[cfg(feature = "cuda")]
+            crate::backend::cuda::blas::Blas::fp8_direct_rows(0),
+            #[cfg(feature = "cuda")]
+            || anyhow::bail!("FP8 format must not query NVFP4 direct bound"),
+        )?;
+        for chunk in 1..=crate::mtp::MAX_VERIFY_ROWS {
+            assert_eq!(
+                dense_prompt_bytes(&model, 1024, chunk, KvFormat::Bf16, direct_fp8)?,
+                0
+            );
+        }
+        for chunk in [8, 6, crate::linear_plan::MAX_SKINNY_ROWS] {
+            assert_eq!(
+                dense_prompt_bytes(&model, 1024, chunk, KvFormat::Bf16, direct_fp8)?,
+                20_971_520
+            );
+        }
         for (capacity, expected) in [(1024, 20_971_520), (4096, 83_886_080), (16384, 335_544_320)] {
             let chunk = capacity / 2;
             let bytes = dense_prompt_bytes(&model, capacity, chunk, KvFormat::Bf16, direct_fp8)?;
@@ -471,6 +513,23 @@ mod tests {
             0
         );
         model.linear_format = LinearFormat::NvFp4;
+        #[cfg(feature = "cuda")]
+        {
+            let fp8_invariant = prompt_direct_max_rows(
+                &LinearFormat::fp8_block([128, 128], safetensors::Dtype::BF16)?,
+                crate::backend::cuda::blas::Blas::fp8_direct_rows(
+                    crate::linear_plan::MAX_SKINNY_ROWS,
+                ),
+                || anyhow::bail!("FP8 format must not query NVFP4 direct bound"),
+            )?;
+            assert_eq!(fp8_invariant, crate::linear_plan::MAX_SKINNY_ROWS);
+            let nvfp4_sm89 = prompt_direct_max_rows(
+                &model.linear_format,
+                crate::backend::cuda::blas::Blas::fp8_direct_rows(0),
+                || Ok(384),
+            )?;
+            assert_eq!(nvfp4_sm89, 384);
+        }
         assert_eq!(
             dense_prompt_bytes(&model, 16384, 384, KvFormat::Bf16, 384)?,
             0
