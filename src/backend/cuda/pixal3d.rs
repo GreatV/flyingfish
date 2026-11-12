@@ -626,15 +626,20 @@ struct SparseFlowIo {
     projected: CudaSlice<f32>,
     input: CudaSlice<f16>,
     pooled: CudaSlice<f16>,
+    #[cfg(test)]
     concat: CudaSlice<f16>,
     expanded: CudaSlice<f16>,
     last_concat: CudaSlice<f16>,
+    #[cfg(test)]
     normalized: CudaSlice<f16>,
     output_float: CudaSlice<f32>,
     embedding: CudaSlice<f16>,
     pool: CudaFunction,
     index: CudaFunction,
     concatenate: CudaFunction,
+    preparation: [CudaFunction; 2],
+    #[cfg(test)]
+    preparation_reference: bool,
     silu: CudaFunction,
 }
 impl SparseFlowIo {
@@ -695,9 +700,13 @@ impl SparseFlowIo {
         let c = weights.1["input_layer.bias"].len();
         let rows = sites.coordinates().len();
         let parents = parent.coordinates().len();
+        ensure!(inverse.len() == rows, "invalid sparse IO inverse map");
         let mut lists = vec![Vec::new(); parents];
         for (child, &p) in inverse.iter().enumerate() {
-            lists[p as usize].push(child as u32);
+            lists
+                .get_mut(p as usize)
+                .context("invalid sparse IO inverse parent")?
+                .push(child as u32);
         }
         let mut offsets = vec![0u32];
         let mut children = Vec::with_capacity(rows);
@@ -755,15 +764,24 @@ impl SparseFlowIo {
             projected: d.stream.alloc_zeros(rows * c)?,
             input: d.stream.alloc_zeros(rows * c)?,
             pooled: d.stream.alloc_zeros(parents * c)?,
+            #[cfg(test)]
             concat: d.stream.alloc_zeros(parents * (2 * h))?,
             expanded: d.stream.alloc_zeros(rows * (2 * h))?,
             last_concat: d.stream.alloc_zeros(rows * (2 * c))?,
+            #[cfg(test)]
             normalized: d.stream.alloc_zeros(rows * c)?,
             output_float: d.stream.alloc_zeros(rows * c)?,
             embedding: d.stream.alloc_zeros(h)?,
             pool: v.load_function("sparse_mean_seeded_f16")?,
             index: v.load_function("sparse_index_rows_f16")?,
             concatenate: v.load_function("concat_rows_f16")?,
+            preparation: [
+                v.load_function("indexed_concat_rows_f16")?,
+                cubin::module(&d.ctx, "q38_common")?
+                    .load_function("layer_norm_f16_round_to_f32")?,
+            ],
+            #[cfg(test)]
+            preparation_reference: false,
             silu: v.load_function("vision_silu_f16")?,
         })
     }
@@ -876,23 +894,7 @@ impl SparseFlowIo {
         values: u64,
     ) -> Result<()> {
         let c = self.blocks[3].output_width;
-        let h = self.blocks[1].output_width;
-        self.concat(
-            d,
-            hidden,
-            ptr(&self.blocks[1].result, d),
-            ptr(&self.concat, d),
-            self.offsets.len() - 1,
-            h,
-        )?;
-        self.copy(
-            d,
-            ptr(&self.concat, d),
-            ptr(&self.inverse, d),
-            ptr(&self.expanded, d),
-            self.rows,
-            2 * h,
-        )?;
+        self.expand(d, hidden)?;
         self.blocks[2].run(d, blas, k, &self.expanded, ptr(&self.embedding, d))?;
         self.concat(
             d,
@@ -903,20 +905,7 @@ impl SparseFlowIo {
             c,
         )?;
         self.blocks[3].run(d, blas, k, &self.last_concat, ptr(&self.embedding, d))?;
-        k.norm(
-            d,
-            ptr(&self.blocks[3].result, d),
-            ptr(&self.normalized, d),
-            [self.rows, c],
-            [0, 0],
-            (1e-5, false),
-        )?;
-        k.upcast(
-            d,
-            ptr(&self.normalized, d),
-            ptr(&self.output_float, d),
-            self.normalized.len(),
-        )?;
+        self.normalize(d, k)?;
         run_linear_f32(
             d,
             blas,
@@ -926,6 +915,74 @@ impl SparseFlowIo {
             [ptr(&self.output_float, d), values],
             false,
         )
+    }
+    fn expand(&self, d: &Device, hidden: u64) -> Result<()> {
+        let width = self.blocks[1].output_width;
+        let parents = self.offsets.len() - 1;
+        #[cfg(test)]
+        if self.preparation_reference {
+            self.concat(
+                d,
+                hidden,
+                ptr(&self.blocks[1].result, d),
+                ptr(&self.concat, d),
+                parents,
+                width,
+            )?;
+            return self.copy(
+                d,
+                ptr(&self.concat, d),
+                ptr(&self.inverse, d),
+                ptr(&self.expanded, d),
+                self.rows,
+                2 * width,
+            );
+        }
+        unsafe {
+            d.stream
+                .launch_builder(&self.preparation[0])
+                .arg(&hidden)
+                .arg(&self.blocks[1].result)
+                .arg(&self.inverse)
+                .arg(&self.expanded)
+                .arg(&u32::try_from(self.rows)?)
+                .arg(&u32::try_from(parents)?)
+                .arg(&u32::try_from(width)?)
+                .arg(&u32::try_from(width)?)
+                .launch(flat(self.expanded.len()))?;
+        }
+        Ok(())
+    }
+    fn normalize(&self, d: &Device, _k: &Kernels) -> Result<()> {
+        let width = self.blocks[3].output_width;
+        #[cfg(test)]
+        if self.preparation_reference {
+            _k.norm(
+                d,
+                ptr(&self.blocks[3].result, d),
+                ptr(&self.normalized, d),
+                [self.rows, width],
+                [0, 0],
+                (1e-5, false),
+            )?;
+            return _k.upcast(
+                d,
+                ptr(&self.normalized, d),
+                ptr(&self.output_float, d),
+                self.normalized.len(),
+            );
+        }
+        unsafe {
+            d.stream
+                .launch_builder(&self.preparation[1])
+                .arg(&self.blocks[3].result)
+                .arg(&self.output_float)
+                .arg(&u32::try_from(self.rows)?)
+                .arg(&u32::try_from(width)?)
+                .arg(&1e-5f32)
+                .launch(grid(self.rows, 256))?;
+        }
+        Ok(())
     }
 }
 impl Kernels {

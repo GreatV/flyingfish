@@ -6306,6 +6306,377 @@ fn norm_silu_round_control(d: &Device, k: &mut Kernels) -> Result<bool> {
 
 #[test]
 #[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA"]
+fn hi3d_io_preparation_identity_gpu() -> Result<()> {
+    let fixture: Value = serde_json::from_slice(&std::fs::read(
+        env_path("FF_F16_QKV_FIXTURES")?.join("qkv.json"),
+    )?)?;
+    for (owner, component) in ["transformer_512", "transformer_1024"]
+        .into_iter()
+        .enumerate()
+    {
+        let config = &fixture["models"][owner]["config"];
+        ensure!(
+            fixture["models"][owner]["component"] == component
+                && config["model_channels"] == 2112
+                && config["num_heads"] == 22
+                && config["num_blocks"] == 24
+                && config["io_block_channels"] == serde_json::json!([256]),
+            "IO preparation published geometry differs"
+        );
+    }
+    for (rung, n, p, expected) in [
+        (512, 11295, 2548, 83),
+        (1024, 57439, 13019, 89),
+        (1536, 99928, 22775, 91),
+    ] {
+        let forwards = heun_schedule(n, 25)?
+            .iter()
+            .flat_map(|&(time, next)| [time, next])
+            .map(|t| {
+                1 + usize::from(
+                    if t >= 1.0 {
+                        4.0
+                    } else if t >= 0.7 {
+                        10.0 * t * t
+                    } else {
+                        1.0
+                    } != 1.0,
+                )
+            })
+            .sum::<usize>();
+        ensure!(
+            forwards == expected,
+            "IO preparation schedule count differs"
+        );
+        println!(
+            "F16_IO_PREPARATION_COUNTED rung={rung} rows={n} parents={p} forwards={forwards} concat_net_B={} norm_boundary_B={} removed_launches={} timing=false",
+            4 * forwards * p * 4224,
+            4 * forwards * n * 256,
+            2 * forwards
+        );
+    }
+    let d = Device::new(0)?;
+    let mut cells = 0;
+    let mut defects = 0;
+    for (rows, parents) in [
+        (1, 1),
+        (3, 2),
+        (31, 7),
+        (33, 11),
+        (257, 31),
+        (11295, 2548),
+        (57439, 13019),
+        (99928, 22775),
+    ] {
+        defects += io_concat_case(&d, [rows, parents], [2112, 2112], rows == 33)?;
+        defects += io_norm_upcast_case(&d, rows, rows == 33)?;
+        cells += 2;
+    }
+    for widths in [[1, 3], [31, 33], [256, 257]] {
+        defects += io_concat_case(&d, [33, 11], widths, false)?;
+        cells += 1;
+    }
+    println!(
+        "F16_IO_PREPARATION_RESULT cells={cells} controls=2 defects={defects} threshold_bits=0 timing=false"
+    );
+    ensure!(
+        cells == 19 && defects == 0,
+        "IO preparation candidate defects"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn io_preparation_compare(
+    d: &Device,
+    name: &str,
+    launch: impl Fn(bool, bool) -> Result<()>,
+    reset: impl Fn() -> Result<()>,
+    read: impl Fn() -> Result<Vec<u32>>,
+    control: bool,
+) -> Result<usize> {
+    use cudarc::driver::sys;
+    let differing_bits = |a: &[u32], b: &[u32]| -> Result<u64> {
+        ensure!(a.len() == b.len(), "IO comparison extent differs");
+        Ok(a.iter()
+            .zip(b)
+            .map(|(a, b)| u64::from((a ^ b).count_ones()))
+            .sum())
+    };
+    let capture = |reference| -> Result<cudarc::driver::CudaGraph> {
+        reset()?;
+        d.finish_upload()?;
+        d.stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let result = launch(reference, false);
+        let graph = d.stream.end_capture(sys::CUgraphInstantiate_flags(0));
+        result?;
+        graph?.context("IO preparation graph missing")
+    };
+    reset()?;
+    launch(true, false)?;
+    let expected = read()?;
+    reset()?;
+    launch(true, false)?;
+    let repeat_bits = differing_bits(&expected, &read()?)?;
+    let graph = capture(true)?;
+    let old_resources = producer_graph_resources(&graph)?;
+    let old_names = old_resources
+        .iter()
+        .map(|v| {
+            v["function"]
+                .as_str()
+                .context("IO reference has nonkernel node")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let required = if name == "indexed_concat_rows_f16" {
+        BTreeSet::from(["concat_rows_f16", "sparse_index_rows_f16"])
+    } else {
+        BTreeSet::from(["q38_layer_norm_f16_fma", "vision_upcast_f16_to_f32"])
+    };
+    ensure!(
+        old_resources.len() == 2 && old_names == required,
+        "IO reference kernels differ"
+    );
+    graph.launch()?;
+    let old_graph_bits = differing_bits(&expected, &read()?)?;
+    ensure!(
+        repeat_bits == 0 && old_graph_bits == 0,
+        "IO reference noise"
+    );
+    reset()?;
+    launch(false, false)?;
+    let eager_bits = differing_bits(&expected, &read()?)?;
+    let graph = capture(false)?;
+    let resources = producer_graph_resources(&graph)?;
+    ensure!(
+        resources.len() == 1
+            && resources[0]["function"] == name
+            && resources[0]["block"] == serde_json::json!([256, 1, 1])
+            && resources[0]["local_bytes"] == 0,
+        "IO preparation kernel/resource failure"
+    );
+    graph.launch()?;
+    let graph_bits = differing_bits(&expected, &read()?)?;
+    let mut defects = usize::from(eager_bits != 0 || graph_bits != 0);
+    println!(
+        "F16_IO_PREPARATION_CELL kernel={name} eager_bits={eager_bits} graph_bits={graph_bits} old_repeat_bits={repeat_bits} old_graph_bits={old_graph_bits} threshold_bits=0 old_resources={} new_resources={}",
+        serde_json::to_string(&old_resources)?,
+        serde_json::to_string(&resources)?
+    );
+    if control {
+        reset()?;
+        launch(false, true)?;
+        let mutant_bits = differing_bits(&expected, &read()?)?;
+        println!(
+            "{} F16_IO_PREPARATION_CONTROL kernel={name} positive_bits={eager_bits} mutant_bits={mutant_bits} threshold_bits=0",
+            if eager_bits == 0 && mutant_bits > 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        defects += usize::from(mutant_bits == 0);
+    }
+    Ok(defects)
+}
+
+#[cfg(feature = "cuda")]
+fn io_concat_case(
+    d: &Device,
+    shape: [usize; 2],
+    widths: [usize; 2],
+    control: bool,
+) -> Result<usize> {
+    let [rows, parents] = shape;
+    let [first_width, second_width] = widths;
+    let width = first_width + second_width;
+    let pattern = |count, seed| {
+        (0..count)
+            .map(|i| match i % 127 {
+                0 => f16::from_bits(1 + (i % 31) as u16),
+                1 => f16::from_bits(if (i + seed) & 1 == 0 { 0 } else { 0x8000 }),
+                _ => f16::from_f32((((i * 37 + seed) % 65521) as f32 - 32760.0) / 16381.0),
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = d.stream.clone_htod(&pattern(parents * first_width, 131))?;
+    let second = d.stream.clone_htod(&pattern(parents * second_width, 997))?;
+    let indices = (0..rows)
+        .map(|r| match r % 5 {
+            0 => 0,
+            1 => parents - 1,
+            _ => (r * 37) % parents,
+        } as u32)
+        .collect::<Vec<_>>();
+    let inverse = d.stream.clone_htod(&indices)?;
+    let mut wrong = indices;
+    if control {
+        ensure!(parents > 1, "parent control requires two parents");
+        wrong[rows / 2] = (wrong[rows / 2] + 1) % parents as u32;
+    }
+    let wrong = d.stream.clone_htod(&wrong)?;
+    let temporary = d.stream.alloc_zeros::<f16>(parents * width)?;
+    let sentinel = f16::from_f32(-123.0);
+    let initial_output = vec![sentinel; rows * width + 16];
+    let output = std::cell::RefCell::new(d.stream.clone_htod(&initial_output)?);
+    let out = ptr(&output.borrow(), d) + 16;
+    let reset = || -> Result<()> {
+        d.stream
+            .memcpy_htod(&initial_output, &mut *output.borrow_mut())?;
+        Ok(())
+    };
+    let module = cubin::module(&d.ctx, "vision_ops")?;
+    let concatenate = module.load_function("concat_rows_f16")?;
+    let index = module.load_function("sparse_index_rows_f16")?;
+    let fused = module.load_function("indexed_concat_rows_f16")?;
+    let launch = |reference, mutant| -> Result<()> {
+        unsafe {
+            if reference {
+                d.stream
+                    .launch_builder(&concatenate)
+                    .arg(&first)
+                    .arg(&second)
+                    .arg(&temporary)
+                    .arg(&u32::try_from(parents)?)
+                    .arg(&u32::try_from(first_width)?)
+                    .arg(&u32::try_from(second_width)?)
+                    .launch(flat(parents * width))?;
+                d.stream
+                    .launch_builder(&index)
+                    .arg(&temporary)
+                    .arg(&inverse)
+                    .arg(&out)
+                    .arg(&u32::try_from(rows)?)
+                    .arg(&u32::try_from(width)?)
+                    .launch(flat(rows * width))?;
+            } else {
+                d.stream
+                    .launch_builder(&fused)
+                    .arg(&first)
+                    .arg(&second)
+                    .arg(if mutant { &wrong } else { &inverse })
+                    .arg(&out)
+                    .arg(&u32::try_from(rows)?)
+                    .arg(&u32::try_from(parents)?)
+                    .arg(&u32::try_from(first_width)?)
+                    .arg(&u32::try_from(second_width)?)
+                    .launch(flat(rows * width))?;
+            }
+        }
+        Ok(())
+    };
+    let read = || -> Result<Vec<u32>> {
+        let values = d.stream.clone_dtoh(&*output.borrow())?;
+        ensure!(
+            values[..8]
+                .iter()
+                .chain(&values[8 + rows * width..])
+                .all(|&v| v == sentinel)
+                && values.iter().all(|v| v.is_finite()),
+            "concat guard/nonfinite failure"
+        );
+        Ok(values.iter().map(|v| u32::from(v.to_bits())).collect())
+    };
+    println!(
+        "F16_IO_PREPARATION_SHAPE operation=indexed_concat rows={rows} parents={parents} widths={widths:?} layout=F16[R,C] control={control}"
+    );
+    io_preparation_compare(d, "indexed_concat_rows_f16", launch, reset, read, control)
+}
+
+#[cfg(feature = "cuda")]
+fn io_norm_upcast_case(d: &Device, rows: usize, control: bool) -> Result<usize> {
+    let width = 256;
+    let count = rows * width;
+    let initial = (0..count)
+        .map(|i| f16::from_f32(((i * 37 % 65521) as f32 - 32760.0) / 16381.0))
+        .collect::<Vec<_>>();
+    let input = d.stream.clone_htod(&initial)?;
+    let temporary = d.stream.alloc_zeros::<f16>(count)?;
+    let sentinel = -123.0f32;
+    let initial_output = vec![sentinel; count + 16];
+    let output = std::cell::RefCell::new(d.stream.clone_htod(&initial_output)?);
+    let out = ptr(&output.borrow(), d) + 32;
+    let reset = || -> Result<()> {
+        d.stream
+            .memcpy_htod(&initial_output, &mut *output.borrow_mut())?;
+        Ok(())
+    };
+    let q = cubin::module(&d.ctx, "q38_common")?;
+    let norm = q.load_function("q38_layer_norm_f16_fma")?;
+    let upcast = cubin::module(&d.ctx, "vision_ops")?.load_function("vision_upcast_f16_to_f32")?;
+    let fused = q.load_function("layer_norm_f16_round_to_f32")?;
+    let unrounded = q.load_function("q38_layer_norm_f16_to_f32")?;
+    let launch = |reference, mutant| -> Result<()> {
+        unsafe {
+            if reference || mutant {
+                let destination = if reference { ptr(&temporary, d) } else { out };
+                d.stream
+                    .launch_builder(if reference { &norm } else { &unrounded })
+                    .arg(&input)
+                    .arg(&0u64)
+                    .arg(&0u64)
+                    .arg(&destination)
+                    .arg(&u32::try_from(rows)?)
+                    .arg(&1u32)
+                    .arg(&(width as u32))
+                    .arg(&(width as u64))
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&(width as u64))
+                    .arg(&0u64)
+                    .arg(&1u64)
+                    .arg(&1e-5f32)
+                    .launch(grid(rows, 256))?;
+                if reference {
+                    d.stream
+                        .launch_builder(&upcast)
+                        .arg(&temporary)
+                        .arg(&out)
+                        .arg(&u32::try_from(count)?)
+                        .launch(flat(count))?;
+                }
+            } else {
+                d.stream
+                    .launch_builder(&fused)
+                    .arg(&input)
+                    .arg(&out)
+                    .arg(&u32::try_from(rows)?)
+                    .arg(&(width as u32))
+                    .arg(&1e-5f32)
+                    .launch(grid(rows, 256))?;
+            }
+        }
+        Ok(())
+    };
+    let read = || -> Result<Vec<u32>> {
+        let values = d.stream.clone_dtoh(&*output.borrow())?;
+        ensure!(
+            values[..8]
+                .iter()
+                .chain(&values[8 + count..])
+                .all(|&v| v == sentinel)
+                && values.iter().all(|v| v.is_finite()),
+            "norm upcast guard/nonfinite failure"
+        );
+        Ok(values.iter().map(|v| v.to_bits()).collect())
+    };
+    println!(
+        "F16_IO_PREPARATION_SHAPE operation=norm_upcast rows={rows} width={width} layout=F16[R,C] control={control}"
+    );
+    io_preparation_compare(
+        d,
+        "layer_norm_f16_round_to_f32",
+        launch,
+        reset,
+        read,
+        control,
+    )
+}
+
+#[test]
+#[cfg(feature = "cuda")]
 #[ignore = "requires admitted CUDA and FF_F16_ROW_NORM_FIXTURES"]
 fn hi3d_row_norm_identity_gpu() -> Result<()> {
     use cudarc::driver::sys::{self, CUfunction_attribute as F};
@@ -6683,6 +7054,44 @@ pub(super) fn flow_norm_silu_identity(
         .sum();
     println!(
         "N5_F16_NORM_SILU_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} threshold_bits=0",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len()
+    );
+    *defects += usize::from(bits != 0);
+    flow_io_preparation_identity(flow, input, condition, output, compact, defects)
+}
+
+pub(super) fn flow_io_preparation_identity(
+    flow: &mut Flow<f16>,
+    input: &CudaSlice<f32>,
+    condition: &Conditioning<f16>,
+    output: &mut CudaSlice<f32>,
+    compact: &[f32],
+    defects: &mut usize,
+) -> Result<()> {
+    flow.io
+        .as_mut()
+        .context("sparse flow IO missing")?
+        .preparation_reference = true;
+    let result = flow.forward(input, 0, condition, output);
+    flow.io
+        .as_mut()
+        .context("sparse flow IO missing")?
+        .preparation_reference = false;
+    result?;
+    let separate = flow.device.stream.clone_dtoh(output)?;
+    ensure!(
+        compact.len() == separate.len() && compact.iter().chain(&separate).all(|x| x.is_finite()),
+        "nonfinite IO preparation velocity comparison"
+    );
+    let bits: u64 = compact
+        .iter()
+        .zip(&separate)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_IO_PREPARATION_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} threshold_bits=0",
         if bits == 0 { "PASS" } else { "DEFECT" },
         flow.rows,
         flow.blocks.len()
