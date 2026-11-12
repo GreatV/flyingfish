@@ -82,6 +82,8 @@ pub enum LinearFormat {
     },
     /// compressed-tensors FP8_DYNAMIC per-output-channel weights plus token activations.
     Fp8E4m3Channel,
+    /// ModelOpt NVFP4 packed E2M1 weights (`U8 [N, K/2]`), E4M3 group-16 scales, F32 global scale.
+    NvFp4,
 }
 /// Routed-expert checkpoint layout: fused or separate BF16 tensors, per-channel BF16 scales,
 /// block scales beside per-expert E4M3 weights, or block scales beside per-expert E2M1 weights.
@@ -1315,18 +1317,129 @@ impl LinearFormat {
     }
 
     fn read(root: &Value) -> Result<Self> {
-        let Some(quant) = root.get("quantization_config") else {
+        let Some(quant) = root
+            .get("quantization_config")
+            .filter(|value| !value.is_null())
+        else {
             return Ok(Self::Bf16);
         };
-        for (key, val) in [
-            ("quant_method", "fp8"),
-            ("fmt", "e4m3"),
-            ("activation_scheme", "dynamic"),
-        ] {
-            equal(quant, key, val.into())?;
+        match quant.get("quant_method").and_then(Value::as_str) {
+            Some("fp8") => {
+                for (key, val) in [
+                    ("quant_method", "fp8"),
+                    ("fmt", "e4m3"),
+                    ("activation_scheme", "dynamic"),
+                ] {
+                    equal(quant, key, val.into())?;
+                }
+                equal(quant, "weight_block_size", serde_json::json!([128, 128]))?;
+                Self::fp8_block([128, 128], safetensors::Dtype::BF16)
+            }
+            Some("modelopt") => Self::read_modelopt_nvfp4(quant),
+            other => anyhow::bail!("unsupported quantization_config.quant_method: {other:?}"),
         }
-        equal(quant, "weight_block_size", serde_json::json!([128, 128]))?;
-        Self::fp8_block([128, 128], safetensors::Dtype::BF16)
+    }
+
+    fn read_modelopt_nvfp4(quant: &Value) -> Result<Self> {
+        let object = quant
+            .as_object()
+            .context("quantization_config must be a JSON object")?;
+        for key in object.keys() {
+            ensure!(
+                matches!(
+                    key.as_str(),
+                    "config_groups"
+                        | "group_size"
+                        | "ignore"
+                        | "kv_cache_quant_algo"
+                        | "producer"
+                        | "quant_algo"
+                        | "quant_method"
+                ),
+                "quantization_config has unknown key {key}"
+            );
+        }
+        equal(quant, "quant_method", "modelopt".into())?;
+        equal(quant, "quant_algo", "NVFP4".into())?;
+        equal(quant, "group_size", 16.into())?;
+        ensure!(
+            quant.get("kv_cache_quant_algo").is_none_or(Value::is_null),
+            "unsupported quantization_config.kv_cache_quant_algo: {:?}",
+            quant.get("kv_cache_quant_algo")
+        );
+        let producer = quant
+            .get("producer")
+            .context("quantization_config.producer missing")?;
+        exact_keys(
+            producer,
+            &["name", "version"],
+            "quantization_config.producer",
+        )?;
+        equal(producer, "name", "modelopt".into())?;
+        ensure!(
+            producer
+                .get("version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| !version.is_empty()),
+            "quantization_config.producer.version missing"
+        );
+        let ignore = quant
+            .get("ignore")
+            .and_then(Value::as_array)
+            .context("quantization_config.ignore missing")?;
+        ensure!(!ignore.is_empty(), "quantization_config.ignore is empty");
+        let ignore_names = ignore
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .context("quantization_config.ignore entry must be a string")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            ignore_names.contains(&"model.language_model.embed_tokens")
+                && ignore_names.contains(&"model.visual*")
+                && !ignore_names.contains(&"lm_head"),
+            "unsupported NVFP4 ignore policy"
+        );
+        let groups = quant
+            .get("config_groups")
+            .and_then(Value::as_object)
+            .context("quantization_config.config_groups missing")?;
+        ensure!(
+            groups.len() == 1,
+            "NVFP4 expects one config group, got {}",
+            groups.len()
+        );
+        let group = groups.values().next().context("empty quantization group")?;
+        exact_keys(
+            group,
+            &["input_activations", "targets", "weights"],
+            "quantization_config.config_groups.group_0",
+        )?;
+        let expected_scheme = serde_json::json!({
+            "dynamic": false,
+            "group_size": 16,
+            "num_bits": 4,
+            "type": "float",
+        });
+        equal(group, "weights", expected_scheme.clone())?;
+        equal(group, "input_activations", expected_scheme)?;
+        let targets = group
+            .get("targets")
+            .and_then(Value::as_array)
+            .context("quantization_config targets missing")?;
+        let target_names = targets
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .context("quantization_config target entry must be a string")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            !target_names.is_empty() && target_names.contains(&"lm_head"),
+            "NVFP4 targets must include lm_head"
+        );
+        Ok(Self::NvFp4)
     }
 }
 impl ExpertFormat {

@@ -15,7 +15,11 @@ pub(crate) fn dense_prompt_bytes(
         "invalid dense prefill extent"
     );
     if spec.moe.is_some()
-        || spec.linear_format.fp8_layout().is_none()
+        || !matches!(
+            spec.linear_format,
+            crate::model_spec::LinearFormat::Fp8E4m3Block { .. }
+                | crate::model_spec::LinearFormat::NvFp4
+        )
         || kv != crate::kv::KvFormat::Bf16
         || chunk <= crate::mtp::MAX_VERIFY_ROWS
         || capacity == chunk
@@ -461,6 +465,11 @@ mod tests {
         assert!(dense_prompt_bytes(&model, 32, 33, KvFormat::Bf16).is_err());
         model.linear_format = LinearFormat::Bf16;
         assert_eq!(dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16)?, 0);
+        model.linear_format = LinearFormat::NvFp4;
+        assert_eq!(
+            dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16)?,
+            335_544_320
+        );
         let root = serde_json::from_str(include_str!("../tests/data/minicpm-config.json"))?;
         let mut moe =
             ModelSpec::minicpm(&root, &serde_json::json!({"eos_token_id":[248044,248046]}))?;

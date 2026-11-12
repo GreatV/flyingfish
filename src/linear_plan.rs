@@ -101,44 +101,7 @@ impl LayerDequantPlan {
         let mut bytes = 0u64;
         let mut slots = BTreeMap::new();
         let mut native = 0usize;
-        for (name, e) in &manifest.entries {
-            if !e.load
-                || e.is_routed_expert()
-                || e.dtype != Dtype::F8_E4M3
-                || !name.starts_with(&prefix)
-            {
-                continue;
-            }
-            ensure!(e.shape.len() == 2, "linear weight is not a matrix");
-            let n = u32::try_from(e.shape[0])?;
-            let k = u32::try_from(e.shape[1])?;
-            let layout = format.fp8_layout().context("FP8 scale layout missing")?;
-            let scale_name = format!(
-                "{}.{}",
-                name.strip_suffix(".weight").context("FP8 weight name")?,
-                layout.scale_suffix()
-            );
-            let scale = manifest
-                .entries
-                .get(&scale_name)
-                .context("FP8 weight missing scale")?;
-            let scale_dtype = layout.scale_dtype();
-            if let Some(block) = layout.block_scale() {
-                block.validate_scale(n, k, scale.dtype, &scale.shape, scale.bytes)?;
-            } else {
-                ensure!(
-                    scale.dtype == scale_dtype && scale.shape == layout.scale_shape(n, k),
-                    "FP8 scale layout mismatch"
-                );
-            }
-            ensure!(
-                e.scale_name.as_ref() == Some(&scale_name),
-                "FP8 scale name mismatch"
-            );
-            if scale_dtype != Dtype::BF16 {
-                native += 1;
-                continue;
-            }
+        let mut push_slot = |name: String, n: u32, k: u32, scale_name: String| -> Result<()> {
             let size = u64::from(n)
                 .checked_mul(u64::from(k))
                 .and_then(|v| v.checked_mul(2))
@@ -151,7 +114,7 @@ impl LayerDequantPlan {
                 .checked_add(size)
                 .context("layer arena overflow")?;
             slots.insert(
-                name.clone(),
+                name,
                 DequantSlot {
                     offset_bytes,
                     n,
@@ -159,23 +122,131 @@ impl LayerDequantPlan {
                     scale_name,
                 },
             );
+            Ok(())
+        };
+        if format == LinearFormat::NvFp4 {
+            for (name, e) in &manifest.entries {
+                if !e.load || e.is_routed_expert() || !name.starts_with(&prefix) {
+                    continue;
+                }
+                ensure!(
+                    !(e.dtype == Dtype::F8_E4M3 && name.ends_with(".weight")),
+                    "FP8 weight in NVFP4 layer: {name}"
+                );
+                if e.dtype != Dtype::U8 {
+                    continue;
+                }
+                ensure!(e.shape.len() == 2, "linear weight is not a matrix");
+                let n = u32::try_from(e.shape[0])?;
+                let packed_k = u32::try_from(e.shape[1])?;
+                let k = packed_k.checked_mul(2).context("NVFP4 K extent overflow")?;
+                ensure!(
+                    n > 0
+                        && k > 0
+                        && k.is_multiple_of(16)
+                        && Some(e.bytes) == e.shape[0].checked_mul(e.shape[1]),
+                    "invalid NVFP4 weight layout: {name}"
+                );
+                let stem = name.strip_suffix(".weight").context("NVFP4 weight name")?;
+                let scale_name = format!("{stem}.weight_scale");
+                ensure!(
+                    e.scale_name.as_ref() == Some(&scale_name),
+                    "NVFP4 scale name mismatch"
+                );
+                let scale = manifest
+                    .entries
+                    .get(&scale_name)
+                    .context("NVFP4 weight missing scale")?;
+                let groups = (k / 16) as usize;
+                ensure!(
+                    scale.load
+                        && scale.dtype == Dtype::F8_E4M3
+                        && scale.shape == [n as usize, groups]
+                        && Some(scale.bytes) == (n as usize).checked_mul(groups),
+                    "NVFP4 scale layout mismatch: {scale_name}"
+                );
+                for aux in ["weight_scale_2", "input_scale"] {
+                    let scalar = manifest
+                        .entries
+                        .get(&format!("{stem}.{aux}"))
+                        .with_context(|| format!("NVFP4 weight missing {aux}"))?;
+                    ensure!(
+                        scalar.load
+                            && scalar.dtype == Dtype::F32
+                            && scalar.shape.is_empty()
+                            && scalar.bytes == 4,
+                        "NVFP4 {aux} layout mismatch: {stem}.{aux}"
+                    );
+                }
+                push_slot(name.clone(), n, k, scale_name)?;
+            }
+        } else {
+            for (name, e) in &manifest.entries {
+                if !e.load || e.is_routed_expert() || !name.starts_with(&prefix) {
+                    continue;
+                }
+                ensure!(
+                    !(e.dtype == Dtype::U8 && e.is_linear_projection()),
+                    "NVFP4 weight in {format:?} layer: {name}"
+                );
+                if e.dtype != Dtype::F8_E4M3 {
+                    continue;
+                }
+                ensure!(e.shape.len() == 2, "linear weight is not a matrix");
+                let n = u32::try_from(e.shape[0])?;
+                let k = u32::try_from(e.shape[1])?;
+                let layout = format.fp8_layout().context("FP8 scale layout missing")?;
+                let scale_name = format!(
+                    "{}.{}",
+                    name.strip_suffix(".weight").context("FP8 weight name")?,
+                    layout.scale_suffix()
+                );
+                let scale = manifest
+                    .entries
+                    .get(&scale_name)
+                    .context("FP8 weight missing scale")?;
+                let scale_dtype = layout.scale_dtype();
+                if let Some(block) = layout.block_scale() {
+                    block.validate_scale(n, k, scale.dtype, &scale.shape, scale.bytes)?;
+                } else {
+                    ensure!(
+                        scale.dtype == scale_dtype && scale.shape == layout.scale_shape(n, k),
+                        "FP8 scale layout mismatch"
+                    );
+                }
+                ensure!(
+                    e.scale_name.as_ref() == Some(&scale_name),
+                    "FP8 scale name mismatch"
+                );
+                if scale_dtype != Dtype::BF16 {
+                    native += 1;
+                    continue;
+                }
+                push_slot(name.clone(), n, k, scale_name)?;
+            }
         }
         ensure!(
             manifest.entries.iter().any(|(name, entry)| {
                 entry.is_linear_projection()
                     && name.starts_with(&prefix)
-                    && matches!(entry.dtype, Dtype::BF16 | Dtype::F8_E4M3)
+                    && matches!(entry.dtype, Dtype::BF16 | Dtype::F8_E4M3 | Dtype::U8)
             }),
             "missing linear layer {layer}"
         );
         let plan_shape = match format {
             LinearFormat::Fp8E4m3Block { .. } => native > 0 || !slots.is_empty(),
+            LinearFormat::NvFp4 => !slots.is_empty(),
             LinearFormat::Bf16 => slots.is_empty(),
             LinearFormat::Fp8E4m3Channel => true,
         };
+        let kind = if format == LinearFormat::NvFp4 {
+            "NVFP4"
+        } else {
+            "FP8"
+        };
         ensure!(
             plan_shape,
-            "linear layer={layer} has {} FP8 slots for linear_format={format:?}",
+            "linear layer={layer} has {} {kind} slots for linear_format={format:?}",
             slots.len()
         );
         bytes = bytes.checked_add(255).context("arena size overflow")? & !255;

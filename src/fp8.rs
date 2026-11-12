@@ -120,8 +120,28 @@ pub fn encode_e4m3(value: f32) -> u8 {
     (sign << 7) | ((e as u8) << 3) | m as u8
 }
 
+#[cfg(test)]
+fn decode_e2m1(code: u8) -> f32 {
+    let magnitude = match code & 7 {
+        0 => return 0.0f32,
+        1 => 0.5f32,
+        2 => 1.0,
+        3 => 1.5,
+        4 => 2.0,
+        5 => 3.0,
+        6 => 4.0,
+        _ => 6.0,
+    };
+    f32::from_bits(magnitude.to_bits() | (u32::from(code & 8) << 28))
+}
+
 pub fn effective_weight(code: u8, scale: bf16) -> bf16 {
     bf16::from_f32(decode_e4m3(code) * scale.to_f32())
+}
+
+#[cfg(test)]
+pub(crate) fn nvfp4_effective_weight(code: u8, block_scale: u8, global_scale: f32) -> bf16 {
+    bf16::from_f32(decode_e2m1(code) * (decode_e4m3(block_scale) * global_scale))
 }
 
 /// Scale layout of a published FP8 linear weight.
@@ -165,7 +185,7 @@ impl Fp8ScaleLayout {
 impl crate::model_spec::LinearFormat {
     pub fn fp8_layout(self) -> Option<Fp8ScaleLayout> {
         match self {
-            Self::Bf16 => None,
+            Self::Bf16 | Self::NvFp4 => None,
             Self::Fp8E4m3Block { block, scale_dtype } => Some(Fp8ScaleLayout::Block(
                 Fp8BlockScale::new(block, scale_dtype).expect("invalid FP8 block layout"),
             )),
@@ -266,10 +286,93 @@ pub(crate) fn linear_reference(weight: &[bf16], x: &[bf16], k: usize) -> anyhow:
     Ok(output)
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn nvfp4_linear_reference(
+    weight: &[bf16],
+    x: &[bf16],
+    k: usize,
+) -> anyhow::Result<Vec<bf16>> {
+    anyhow::ensure!(
+        k > 0
+            && k.is_multiple_of(16)
+            && weight.len().is_multiple_of(k)
+            && x.len().is_multiple_of(k),
+        "invalid NVFP4 linear reference extents"
+    );
+    let mut output = Vec::with_capacity(x.len() / k * (weight.len() / k));
+    for input in x.chunks_exact(k) {
+        for row in weight.chunks_exact(k) {
+            let mut lanes = [0.0f32; 32];
+            for (lane, value) in lanes.iter_mut().enumerate() {
+                let mut sums = [0.0f32; 4];
+                if k.is_multiple_of(1024) {
+                    for base in (0..k).step_by(1024) {
+                        let col = base + lane * 32;
+                        for word in 0..4 {
+                            for (byte, sum) in sums.iter_mut().enumerate() {
+                                let lo = col + 8 * word + 2 * byte;
+                                let hi = lo + 1;
+                                let acc = row[lo].to_f32().mul_add(input[lo].to_f32(), *sum);
+                                *sum = row[hi].to_f32().mul_add(input[hi].to_f32(), acc);
+                            }
+                        }
+                    }
+                } else {
+                    for pair in (lane..k / 2).step_by(32) {
+                        let lo = 2 * pair;
+                        let hi = lo + 1;
+                        let acc = row[lo].to_f32().mul_add(input[lo].to_f32(), sums[0]);
+                        sums[0] = row[hi].to_f32().mul_add(input[hi].to_f32(), acc);
+                    }
+                }
+                *value = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+            }
+            for shift in [16, 8, 4, 2, 1] {
+                let prior = lanes;
+                for lane in 0..32 - shift {
+                    lanes[lane] += prior[lane + shift];
+                }
+            }
+            output.push(bf16::from_f32(lanes[0]));
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[test]
+    fn nvfp4_e2m1_and_effective_weight_contract() {
+        let magnitudes = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        for code in 0u8..16 {
+            let mag = magnitudes[(code & 7) as usize];
+            let want = if mag == 0.0 || (code & 8) == 0 {
+                mag.to_bits()
+            } else {
+                mag.to_bits() | 0x8000_0000
+            };
+            assert_eq!(decode_e2m1(code).to_bits(), want, "e2m1 {code}");
+            assert_eq!(decode_e2m1(code | 0xf0).to_bits(), want, "e2m1 hi {code}");
+            for s_code in 0u8..=255 {
+                let block_scale = decode_e4m3(s_code);
+                if block_scale.is_nan() {
+                    continue;
+                }
+                for global_scale in [0.0f32, 1.0, 0.002_929_687_5, 0.013_183_594] {
+                    let want_bf16 =
+                        bf16::from_f32(decode_e2m1(code) * (block_scale * global_scale));
+                    assert_eq!(
+                        nvfp4_effective_weight(code, s_code, global_scale).to_bits(),
+                        want_bf16.to_bits(),
+                        "code={code} s_code={s_code} global_scale={global_scale}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn block_scale_native_extents_and_controls() -> anyhow::Result<()> {

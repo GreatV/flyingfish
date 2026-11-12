@@ -491,6 +491,7 @@ pub struct Blas {
     coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
     calibration: linear_calibrate::Environment,
     fp8: Option<super::linear::Fp8Ops>,
+    nvfp4: Option<super::linear::NvFp4Ops>,
     skinny: CudaFunction,
     skinny_device: (usize, usize),
     skinny_plans: RefCell<BTreeMap<(usize, usize), (LaunchConfig, bool)>>,
@@ -698,6 +699,7 @@ impl Blas {
             coverage: None,
             calibration,
             fp8: None,
+            nvfp4: None,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
             skinny_device: (device.info.sms, device.info.l2_bytes),
             skinny_plans: RefCell::new(BTreeMap::new()),
@@ -1078,6 +1080,14 @@ impl Blas {
         1..=rows
     }
 
+    pub(crate) fn direct_quant_rows(&self) -> std::ops::RangeInclusive<usize> {
+        if self.nvfp4.is_some() {
+            1..=crate::linear_plan::MAX_SKINNY_ROWS
+        } else {
+            self.direct_fp8_rows()
+        }
+    }
+
     pub(crate) fn bind_invariant(
         &mut self,
         ctx: &Arc<cudarc::driver::CudaContext>,
@@ -1093,6 +1103,11 @@ impl Blas {
             fp8.require_rows(rows)?;
             self.fp8 = Some(fp8);
         }
+        if self.nvfp4.is_some() {
+            let nvfp4 = super::linear::NvFp4Ops::new(ctx)?;
+            nvfp4.require_rows(crate::linear_plan::MAX_SKINNY_ROWS)?;
+            self.nvfp4 = Some(nvfp4);
+        }
         self.invariant_rows = rows;
         Ok(())
     }
@@ -1104,6 +1119,13 @@ impl Blas {
         };
         fp8.require_rows(*self.direct_fp8_rows().end())?;
         self.fp8 = Some(fp8);
+        Ok(())
+    }
+    pub(crate) fn enable_nvfp4(&mut self, ctx: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
+        ensure!(self.nvfp4.is_none(), "NVFP4 operators already bound");
+        let nvfp4 = super::linear::NvFp4Ops::new(ctx)?;
+        nvfp4.require_rows(crate::linear_plan::MAX_SKINNY_ROWS)?;
+        self.nvfp4 = Some(nvfp4);
         Ok(())
     }
     #[cfg(test)]
@@ -1133,6 +1155,9 @@ impl Blas {
     }
     pub(crate) fn fp8_ops(&self) -> Result<&super::linear::Fp8Ops> {
         self.fp8.as_ref().context("FP8 operators not bound")
+    }
+    pub(crate) fn nvfp4_ops(&self) -> Result<&super::linear::NvFp4Ops> {
+        self.nvfp4.as_ref().context("NVFP4 operators not bound")
     }
     // Setup/eager binding for the fixed BF16 Lt path.
     pub(crate) fn prepare_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
@@ -1772,6 +1797,21 @@ impl Blas {
                 );
                 self.fp8_ops()?
                     .small_gemm(&self.stream, codes, scale, layout, x, y)
+            }
+            LinearWeightRef::NvFp4 {
+                codes,
+                scale,
+                global_scale,
+            } => {
+                let direct_rows = 1..=crate::linear_plan::MAX_SKINNY_ROWS;
+                ensure!(
+                    direct_rows.contains(&(x.shape[0] as usize)),
+                    "direct NVFP4 rows={} exceeds the bound={} and requires materialized BF16 weight",
+                    x.shape[0],
+                    direct_rows.end()
+                );
+                self.nvfp4_ops()?
+                    .small_gemm(&self.stream, codes, scale, global_scale, x, y)
             }
             LinearWeightRef::Bf16(w) => {
                 w.validate()?;

@@ -207,7 +207,7 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             ensure!(
                 matches!(
                     spec.linear_format,
-                    LinearFormat::Bf16 | LinearFormat::Fp8E4m3Block { .. }
+                    LinearFormat::Bf16 | LinearFormat::Fp8E4m3Block { .. } | LinearFormat::NvFp4
                 ),
                 "hybrid engine does not implement linear_format={:?} for {:?}",
                 spec.linear_format,
@@ -706,6 +706,7 @@ pub(super) struct Runtime {
     pub(super) prompt: Option<CudaSlice<bf16>>,
     mask: CudaSlice<u64>,
     layers: Vec<Layer>,
+    head: Option<LinearWeightRef>,
     common: CommonOpsRef,
     joint: Option<crate::backend::cuda::joint_schema::JointWeights>,
     advance: CudaFunction,
@@ -2201,6 +2202,11 @@ impl Runtime {
             });
         }
         let module = crate::backend::cuda::cubin::module(&engine.device.ctx, "q38_common")?;
+        let head = catalog
+            .tensors
+            .contains_key("lm_head.weight")
+            .then(|| catalog.linear_ref("lm_head.weight", s))
+            .transpose()?;
         let runtime = Self {
             attention,
             gdn,
@@ -2237,6 +2243,7 @@ impl Runtime {
             prompt: None,
             mask,
             layers,
+            head,
             common,
             joint: checkpoint_dir
                 .join("joint_head.safetensors")
@@ -2427,11 +2434,12 @@ impl Runtime {
         {
             blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
         }
-        if self
-            .gemma
-            .as_ref()
-            .and_then(|ops| ops.embedding_projection.as_ref())
-            .is_none()
+        if self.head.is_none()
+            && self
+                .gemma
+                .as_ref()
+                .and_then(|ops| ops.embedding_projection.as_ref())
+                .is_none()
         {
             blas.prepare_fixed(rows, vocab, hidden)?;
         }
@@ -3565,44 +3573,49 @@ impl Engine {
             if model_spec.linear_format.fp8_layout().is_some() {
                 blas.enable_fp8(&device.ctx)?;
             }
+            #[cfg(feature = "cuda")]
+            if model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4 {
+                blas.enable_nvfp4(&device.ctx)?;
+            }
             Ok((ops, blas))
         };
         let early_blas = gemma.then(setup_blas).transpose()?;
         let prefix_cache = settings.prefix_cache;
         #[cfg(feature = "cuda")]
-        let mut catalog =
-            if model_spec.moe.is_none() && model_spec.linear_format.fp8_layout().is_none() {
-                let rows = requested_chunk.unwrap_or(capacity.min(1024));
-                let fixed = Runtime::fixed_bytes(&model_spec, capacity)?;
-                let transient = Runtime::workspace(
-                    &model_spec,
-                    rows,
-                    capacity,
-                    gdn_policy,
-                    verify_rows,
-                    Some(s),
-                )?
-                .checked_add(
-                    Runtime::row_bytes(&model_spec)?
-                        .checked_mul(rows)
-                        .context("dense row reservation overflow")?,
-                )
-                .and_then(|n| n.checked_add(fixed))
-                .context("dense workspace reservation overflow")?;
-                WeightCatalog::load_dense(
-                    dir,
-                    &model_spec,
-                    &device,
-                    transient,
-                    media_bytes,
-                    prefix_cache,
-                    0,
-                )?
-            } else if prefix_cache {
-                WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
-            } else {
-                WeightCatalog::load(dir, &model_spec, &device)?
-            };
+        let mut catalog = if model_spec.moe.is_none()
+            && model_spec.linear_format == crate::model_spec::LinearFormat::Bf16
+        {
+            let rows = requested_chunk.unwrap_or(capacity.min(1024));
+            let fixed = Runtime::fixed_bytes(&model_spec, capacity)?;
+            let transient = Runtime::workspace(
+                &model_spec,
+                rows,
+                capacity,
+                gdn_policy,
+                verify_rows,
+                Some(s),
+            )?
+            .checked_add(
+                Runtime::row_bytes(&model_spec)?
+                    .checked_mul(rows)
+                    .context("dense row reservation overflow")?,
+            )
+            .and_then(|n| n.checked_add(fixed))
+            .context("dense workspace reservation overflow")?;
+            WeightCatalog::load_dense(
+                dir,
+                &model_spec,
+                &device,
+                transient,
+                media_bytes,
+                prefix_cache,
+                0,
+            )?
+        } else if prefix_cache {
+            WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
+        } else {
+            WeightCatalog::load(dir, &model_spec, &device)?
+        };
         #[cfg(feature = "rocm")]
         let mut catalog = WeightCatalog::load(dir, &model_spec, &device)?;
         let glm_hc_weights = if glm {
@@ -4829,7 +4842,7 @@ impl Engine {
         #[cfg(feature = "cuda")]
         if self.qwen.is_some()
             && step.input == crate::backend::Input::Ids
-            && !self.blas.direct_fp8_rows().contains(&step.rows)
+            && !self.blas.direct_quant_rows().contains(&step.rows)
         {
             self.qwen.as_mut().context("Q38 runtime missing")?.layers[i]
                 .linear
@@ -7632,15 +7645,19 @@ impl Engine {
                     }
                     return Ok(());
                 }
-                self.blas.linear_typed(
-                    phase,
-                    LinearWeightRef::Bf16(matrix(
+                let head = match q.head {
+                    Some(head) => head,
+                    None => LinearWeightRef::Bf16(matrix(
                         &self.weights.head,
                         s,
                         0,
                         self.model_spec.vocab as usize,
                         h,
                     )?),
+                };
+                self.blas.linear_typed(
+                    phase,
+                    head,
                     matrix(&w.n, s, (rows - 1) * h, 1, h)?,
                     &mut TensorMut(matrix(&w.logits, s, 0, 1, self.model_spec.vocab as usize)?),
                 )?;
@@ -9305,6 +9322,1040 @@ mod tests {
         println!(
             "FLINT_DECODE_GRAPH_LENGTH rows_512=20 bits_512={bits_512} differing_rows_512={ulp_512} rows_1024=20 bits_1024={bits_1024} differing_rows_1024={ulp_1024} frozen_bits={frozen_bits} frozen_differing_rows={frozen_ulp} PASS"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_gate_settings(runtime: std::path::PathBuf) -> crate::backend::Settings {
+        crate::backend::Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            device_budget_gib: None,
+            draft_model: None,
+            tree_builder: crate::backend::TreeBuilder::Serial,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_load_engine(
+        dir: &std::path::Path,
+        capacity: usize,
+        chunk: usize,
+        runtime: std::path::PathBuf,
+    ) -> anyhow::Result<super::Engine> {
+        let settings = nvfp4_gate_settings(runtime);
+        let calibrated = super::Engine::calibrate(dir, 0, capacity, Some(chunk), settings.clone())?;
+        anyhow::ensure!(
+            calibrated.is_none(),
+            "Runner FAIL Qwen35Text calibrate returned engine"
+        );
+        let engine = super::Engine::load(dir, 0, capacity, Some(chunk), settings)?;
+        anyhow::ensure!(
+            engine.graph.is_some(),
+            "Runner FAIL decode graph not captured"
+        );
+        Ok(engine)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_st_bf16(
+        st: &safetensors::SafeTensors<'_>,
+        name: &str,
+        shape: &[usize],
+    ) -> anyhow::Result<Vec<half::bf16>> {
+        use anyhow::ensure;
+        let t = st.tensor(name)?;
+        ensure!(
+            t.dtype() == safetensors::Dtype::BF16 && t.shape() == shape,
+            "Runner FAIL fixture {name} shape={:?} dtype={:?} expected={shape:?}",
+            t.shape(),
+            t.dtype()
+        );
+        Ok(t.data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_bits(u16::from_le_bytes(*b)))
+            .collect())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_st_f32(
+        st: &safetensors::SafeTensors<'_>,
+        name: &str,
+        shape: &[usize],
+    ) -> anyhow::Result<Vec<f32>> {
+        use anyhow::ensure;
+        let t = st.tensor(name)?;
+        ensure!(
+            t.dtype() == safetensors::Dtype::F32 && t.shape() == shape,
+            "Runner FAIL fixture {name} shape={:?} dtype={:?} expected={shape:?}",
+            t.shape(),
+            t.dtype()
+        );
+        Ok(t.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_st_u32(st: &safetensors::SafeTensors<'_>, name: &str) -> anyhow::Result<Vec<u32>> {
+        use anyhow::ensure;
+        let t = st.tensor(name)?;
+        ensure!(
+            t.dtype() == safetensors::Dtype::I64 && t.shape().len() == 1,
+            "Runner FAIL fixture {name} shape={:?} dtype={:?}",
+            t.shape(),
+            t.dtype()
+        );
+        t.data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| Ok(u32::try_from(i64::from_le_bytes(*b))?))
+            .collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_pair_metrics(actual: &[f32], reference: &[f32]) -> anyhow::Result<(f64, f64)> {
+        use anyhow::ensure;
+        ensure!(
+            actual.len() == reference.len() && !actual.is_empty(),
+            "Runner FAIL metric length mismatch {} vs {}",
+            actual.len(),
+            reference.len()
+        );
+        ensure!(
+            actual.iter().all(|v| v.is_finite()) && reference.iter().all(|v| v.is_finite()),
+            "Runner FAIL non-finite tensor values in metric comparison"
+        );
+        let mut max_abs = 0.0f64;
+        let mut sq_sum = 0.0f64;
+        for (&a, &r) in actual.iter().zip(reference) {
+            let d = (f64::from(a) - f64::from(r)).abs();
+            max_abs = max_abs.max(d);
+            sq_sum += d * d;
+        }
+        Ok((max_abs, (sq_sum / actual.len() as f64).sqrt()))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_score_cell(
+        cell: &str,
+        actual: &[f32],
+        reference: &[f32],
+        tau: (f64, f64),
+    ) -> anyhow::Result<usize> {
+        let (max_abs, rmse) = nvfp4_pair_metrics(actual, reference)?;
+        let ok = max_abs <= tau.0 && rmse <= tau.1;
+        println!(
+            "{} {cell} max_abs={max_abs:.6} tau_max_abs={:.6} rmse={rmse:.6} tau_rmse={:.6}",
+            if ok { "PASS" } else { "DEFECT" },
+            tau.0,
+            tau.1
+        );
+        Ok(usize::from(!ok))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_top1_margin(logits: &[f32]) -> f32 {
+        let mut top1 = f32::NEG_INFINITY;
+        let mut top2 = f32::NEG_INFINITY;
+        for &v in logits {
+            if v > top1 {
+                top2 = top1;
+                top1 = v;
+            } else if v > top2 {
+                top2 = v;
+            }
+        }
+        top1 - top2
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_scale_ws2(
+        engine: &mut super::Engine,
+        ws2_name: &str,
+        factor: f32,
+    ) -> anyhow::Result<[u8; 4]> {
+        use crate::backend::cuda::weights::StoredTensor;
+        use anyhow::{Context, ensure};
+        let s = engine.device.stream.clone();
+        let q = engine
+            .qwen
+            .as_mut()
+            .context("Runner FAIL qwen runtime missing")?;
+        let StoredTensor::Bytes(slice) = q
+            .catalog
+            .tensors
+            .get_mut(ws2_name)
+            .with_context(|| format!("Runner FAIL missing tensor {ws2_name}"))?
+        else {
+            anyhow::bail!("Runner FAIL {ws2_name} not stored as Bytes");
+        };
+        let orig_vec = s.clone_dtoh(slice)?;
+        ensure!(
+            orig_vec.len() == 4,
+            "Runner FAIL {ws2_name} byte length != 4"
+        );
+        let orig: [u8; 4] = [orig_vec[0], orig_vec[1], orig_vec[2], orig_vec[3]];
+        let scaled = (f32::from_le_bytes(orig) * factor).to_le_bytes();
+        s.memcpy_htod(&scaled, slice)?;
+        s.synchronize()?;
+        Ok(orig)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_restore_ws2(
+        engine: &mut super::Engine,
+        ws2_name: &str,
+        orig: [u8; 4],
+    ) -> anyhow::Result<()> {
+        use crate::backend::cuda::weights::StoredTensor;
+        use anyhow::{Context, ensure};
+        let s = engine.device.stream.clone();
+        let q = engine
+            .qwen
+            .as_mut()
+            .context("Runner FAIL qwen runtime missing")?;
+        let StoredTensor::Bytes(slice) = q
+            .catalog
+            .tensors
+            .get_mut(ws2_name)
+            .with_context(|| format!("Runner FAIL missing tensor {ws2_name}"))?
+        else {
+            anyhow::bail!("Runner FAIL {ws2_name} not stored as Bytes");
+        };
+        s.memcpy_htod(&orig, slice)?;
+        s.synchronize()?;
+        let verify = s.clone_dtoh(slice)?;
+        ensure!(
+            verify.as_slice() == orig,
+            "Runner FAIL {ws2_name} restore mismatch"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_run_isolated_layer(
+        engine: &mut super::Engine,
+        layer: usize,
+        m: usize,
+        use_token_input: bool,
+        h_in: &[half::bf16],
+    ) -> anyhow::Result<Vec<f32>> {
+        use crate::backend::{Head, Input, Mask, Step};
+        let hidden = engine.model_spec.hidden as usize;
+        anyhow::ensure!(
+            h_in.len() == m * hidden,
+            "Runner FAIL layer input extent mismatch"
+        );
+        engine.reset()?;
+        let pos: Vec<i32> = (0..m as i32).collect();
+        engine.inject_moe_test_positions([&pos, &pos, &pos])?;
+        let s = engine.device.stream.clone();
+        s.memcpy_htod(&[m as i32], &mut engine.work.length)?;
+        s.memcpy_htod(h_in, &mut engine.work.x.slice_mut(..m * hidden))?;
+        let step = Step {
+            rows: m,
+            input: if use_token_input {
+                Input::Token
+            } else {
+                Input::Ids
+            },
+            head: Head::None,
+            mask: Mask::Causal,
+        };
+        engine.run_layer(layer, step, &mut None)?;
+        s.synchronize()?;
+        Ok(s.clone_dtoh(&engine.work.x.slice(..m * hidden))?
+            .into_iter()
+            .map(half::bf16::to_f32)
+            .collect())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_H3_IMAGE_PE_MODEL, FF_H3_IMAGE_PE_REF_DIR and FLYINGFISH_RUNTIME_DIR required"]
+    fn nvfp4_h3_image_pe_layer_and_head_cells_gpu() -> anyhow::Result<()> {
+        use super::*;
+        use crate::backend::cuda::{blas::Blas, closure::Closure, contracts::view};
+        use crate::backend::{Head, Input, Mask, Operator, Step};
+        use crate::model_spec::Mixer;
+        use anyhow::{Context, ensure};
+        use std::{env, path::PathBuf, rc::Rc};
+
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let dir = PathBuf::from(
+            env::var_os("FF_H3_IMAGE_PE_MODEL").context("FF_H3_IMAGE_PE_MODEL missing")?,
+        );
+        let ref_dir = PathBuf::from(
+            env::var_os("FF_H3_IMAGE_PE_REF_DIR").context("FF_H3_IMAGE_PE_REF_DIR missing")?,
+        );
+        let runtime = PathBuf::from(
+            env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let bytes = std::fs::read(ref_dir.join("gate_b_cells.safetensors"))?;
+        let st = safetensors::SafeTensors::deserialize(&bytes)?;
+
+        let mut engine = nvfp4_load_engine(&dir, 256, 64, runtime.clone())?;
+        let hidden = engine.model_spec.hidden as usize;
+        let vocab = engine.model_spec.vocab as usize;
+        ensure!(
+            hidden == 5120
+                && vocab == 248_320
+                && engine.model_spec.layers[0].mixer == Mixer::Gdn
+                && engine.model_spec.layers[3].mixer == Mixer::FullAttention,
+            "Runner FAIL unexpected H3-Image-PE geometry"
+        );
+
+        let mut defects = 0usize;
+        for (layer, prefix, taus) in [
+            (
+                0usize,
+                "l0",
+                [
+                    (1usize, (0.5f64, 0.007_369_748_523_537_401f64)),
+                    (8usize, (0.5f64, 0.005_263_472_828_650_147f64)),
+                    (32usize, (1.0f64, 0.010_933_345_252_500_845f64)),
+                ],
+            ),
+            (
+                3usize,
+                "l3",
+                [
+                    (1usize, (1.0f64, 0.019_613_759_358_206_92f64)),
+                    (8usize, (0.5f64, 0.014_407_169_116_847_11f64)),
+                    (32usize, (0.5f64, 0.016_981_050_243_082_985f64)),
+                ],
+            ),
+        ] {
+            for (m, tau) in taus {
+                let h_in = nvfp4_st_bf16(&st, &format!("{prefix}_in_m{m}"), &[m, hidden])?;
+                let h_ref = nvfp4_st_f32(&st, &format!("{prefix}_out_m{m}"), &[m, hidden])?;
+                if m == 1 {
+                    let got_tok = nvfp4_run_isolated_layer(&mut engine, layer, 1, true, &h_in)?;
+                    defects +=
+                        nvfp4_score_cell(&format!("{prefix}_out_m1_token"), &got_tok, &h_ref, tau)?;
+                }
+                let got_ids = nvfp4_run_isolated_layer(&mut engine, layer, m, false, &h_in)?;
+                defects += nvfp4_score_cell(&format!("{prefix}_out_m{m}"), &got_ids, &h_ref, tau)?;
+            }
+        }
+
+        let s = engine.device.stream.clone();
+        let head_taus = [
+            (1usize, (0.0625f64, 0.010_989_904_723_567_09f64)),
+            (8usize, (0.0625f64, 0.010_930_538_381_105_371f64)),
+            (32usize, (0.125f64, 0.012_967_681_312_480_682f64)),
+        ];
+        for (m, tau) in head_taus {
+            let h_in = nvfp4_st_bf16(&st, &format!("head_in_m{m}"), &[m, hidden])?;
+            let l_ref = nvfp4_st_f32(&st, &format!("head_logits_m{m}"), &[m, vocab])?;
+            engine.reset()?;
+            let pos: Vec<i32> = (0..m as i32).collect();
+            engine.inject_moe_test_positions([&pos, &pos, &pos])?;
+            s.memcpy_htod(&[m as i32], &mut engine.work.length)?;
+            s.memcpy_htod(&h_in, &mut engine.work.x.slice_mut(..m * hidden))?;
+            let step = Step {
+                rows: m,
+                input: if m == 1 { Input::Token } else { Input::Ids },
+                head: Head::Last,
+                mask: Mask::Causal,
+            };
+            engine.qwen_operator(Operator::Head, 0, step, &mut None)?;
+            s.synchronize()?;
+            let last_got: Vec<f32> = engine
+                .read_decode_logits_bf16()?
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect();
+            let last_ref = &l_ref[(m - 1) * vocab..m * vocab];
+            defects += nvfp4_score_cell(&format!("head_last_m{m}"), &last_got, last_ref, tau)?;
+
+            let head_ref = engine
+                .qwen
+                .as_ref()
+                .context("Runner FAIL qwen runtime missing")?
+                .head
+                .context("Runner FAIL NVFP4 head missing")?;
+            if m == 8 {
+                let out_m8 = s.alloc_zeros::<bf16>(8 * vocab)?;
+                engine.blas.linear_typed(
+                    crate::op_contract::ExecutionPhase::Prefill,
+                    head_ref,
+                    matrix(&engine.work.n, &s, 0, 8, hidden)?,
+                    &mut TensorMut(matrix(&out_m8, &s, 0, 8, vocab)?),
+                )?;
+                s.synchronize()?;
+                let got_m8: Vec<f32> = s
+                    .clone_dtoh(&out_m8)?
+                    .into_iter()
+                    .map(bf16::to_f32)
+                    .collect();
+                defects += nvfp4_score_cell("head_logits_m8", &got_m8, &l_ref, tau)?;
+            } else if m == 32 {
+                let LinearWeightRef::NvFp4 {
+                    codes,
+                    scale,
+                    global_scale,
+                } = head_ref
+                else {
+                    anyhow::bail!("Runner FAIL head_ref is not LinearWeightRef::NvFp4");
+                };
+                let arena = engine
+                    .qwen
+                    .as_ref()
+                    .context("Runner FAIL qwen runtime missing")?
+                    .arena
+                    .as_ref()
+                    .context("Runner FAIL NVFP4 arena missing")?;
+                let mut head_blas = Blas::new(
+                    &engine.device,
+                    &engine.ops,
+                    &runtime,
+                    Rc::new(Closure::new(false, "nvfp4 head m32 tile".into())),
+                )?;
+                head_blas.enable_nvfp4(&engine.device.ctx)?;
+                head_blas
+                    .bind_invariant(&engine.device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
+                let tile_cap = 65_536usize;
+                ensure!(
+                    arena.len() >= tile_cap * hidden * 2,
+                    "Runner FAIL arena smaller than 65536x5120 BF16 tile"
+                );
+                let tile_out = s.alloc_zeros::<bf16>(32 * tile_cap)?;
+                let mut got_m32 = vec![0.0f32; 32 * vocab];
+                let mut start = 0usize;
+                while start < vocab {
+                    let tile_rows = tile_cap.min(vocab - start);
+                    let codes_tile = unsafe {
+                        Tensor::new(
+                            codes.ptr + (start * (hidden / 2)) as u64,
+                            [tile_rows as u32, (hidden / 2) as u32],
+                            [(hidden / 2) as u64, 1],
+                            (tile_rows * (hidden / 2)) as u64,
+                        )?
+                    };
+                    let scales_tile = unsafe {
+                        Tensor::new(
+                            scale.ptr + (start * (hidden / 16)) as u64,
+                            [tile_rows as u32, (hidden / 16) as u32],
+                            [(hidden / 16) as u64, 1],
+                            (tile_rows * (hidden / 16)) as u64,
+                        )?
+                    };
+                    let mat_view = unsafe {
+                        let (ptr, _guard) = arena.device_ptr(&s);
+                        Tensor::<bf16, 2>::new(
+                            ptr,
+                            [tile_rows as u32, hidden as u32],
+                            [hidden as u64, 1],
+                            (tile_rows * hidden * 2) as u64,
+                        )?
+                    };
+                    let mut mat_mut = TensorMut(mat_view);
+                    head_blas.nvfp4_ops()?.materialize(
+                        &s,
+                        codes_tile,
+                        scales_tile,
+                        global_scale,
+                        &mut mat_mut,
+                    )?;
+                    head_blas.prepare_fixed(32, tile_rows as u32, hidden as u32)?;
+                    let mut y_tile = TensorMut(view(
+                        &tile_out,
+                        &s,
+                        0,
+                        [32, tile_rows as u32],
+                        [tile_rows as u64, 1],
+                    )?);
+                    head_blas.linear_typed(
+                        crate::op_contract::ExecutionPhase::Prefill,
+                        LinearWeightRef::Bf16(mat_view),
+                        matrix(&engine.work.n, &s, 0, 32, hidden)?,
+                        &mut y_tile,
+                    )?;
+                    s.synchronize()?;
+                    let host_tile = s.clone_dtoh(&tile_out.slice(..32 * tile_rows))?;
+                    for r in 0..32 {
+                        for c in 0..tile_rows {
+                            got_m32[r * vocab + start + c] = host_tile[r * tile_rows + c].to_f32();
+                        }
+                    }
+                    start += tile_rows;
+                }
+                defects += nvfp4_score_cell("head_logits_m32", &got_m32, &l_ref, tau)?;
+            }
+        }
+
+        let ws2_ctrl = "model.language_model.layers.0.mlp.down_proj.weight_scale_2";
+        let l0_in_m8 = nvfp4_st_bf16(&st, "l0_in_m8", &[8, hidden])?;
+        let l0_ref_m8 = nvfp4_st_f32(&st, "l0_out_m8", &[8, hidden])?;
+        let l0_m8_tau = (0.5f64, 0.005_263_472_828_650_147f64);
+        let orig_ws2 = nvfp4_scale_ws2(&mut engine, ws2_ctrl, 2.0)?;
+        let ctrl_res = nvfp4_run_isolated_layer(&mut engine, 0, 8, false, &l0_in_m8);
+        nvfp4_restore_ws2(&mut engine, ws2_ctrl, orig_ws2)?;
+        let ctrl_got = ctrl_res?;
+        let (ctrl_max_abs, ctrl_rmse) = nvfp4_pair_metrics(&ctrl_got, &l0_ref_m8)?;
+        let ctrl_detected = ctrl_rmse > 10.0 * l0_m8_tau.1 && ctrl_max_abs > l0_m8_tau.0;
+        defects += usize::from(!ctrl_detected);
+        println!(
+            "{} GATE_B_CONTROL ws2=2.0x max_abs={ctrl_max_abs:.6} rmse={ctrl_rmse:.6} detected={ctrl_detected}",
+            if ctrl_detected { "PASS" } else { "DEFECT" }
+        );
+
+        let restored_got = nvfp4_run_isolated_layer(&mut engine, 0, 8, false, &l0_in_m8)?;
+        defects += nvfp4_score_cell(
+            "l0_out_m8_after_restore",
+            &restored_got,
+            &l0_ref_m8,
+            l0_m8_tau,
+        )?;
+
+        println!(
+            "{} GATE_B_SUMMARY defects={defects}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "Gate B candidate defects={defects}");
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_H3_IMAGE_PE_MODEL, FF_H3_IMAGE_PE_REF_DIR and FLYINGFISH_RUNTIME_DIR required"]
+    fn nvfp4_h3_image_pe_text_and_t2i_gpu() -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use std::{env, path::PathBuf};
+
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let dir = PathBuf::from(
+            env::var_os("FF_H3_IMAGE_PE_MODEL").context("FF_H3_IMAGE_PE_MODEL missing")?,
+        );
+        let ref_dir = PathBuf::from(
+            env::var_os("FF_H3_IMAGE_PE_REF_DIR").context("FF_H3_IMAGE_PE_REF_DIR missing")?,
+        );
+        let runtime = PathBuf::from(
+            env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let bytes = std::fs::read(ref_dir.join("gate_c_text.safetensors"))?;
+        let st = safetensors::SafeTensors::deserialize(&bytes)?;
+
+        let mut engine = nvfp4_load_engine(&dir, 5120, 512, runtime)?;
+        let vocab = engine.model_spec.vocab as usize;
+        let mut defects = 0usize;
+
+        let c1_ids = nvfp4_st_u32(&st, "c1_ids")?;
+        let c1_ref = nvfp4_st_f32(&st, "c1_logits", &[vocab])?;
+        engine.reset()?;
+        engine.prefill(&c1_ids, None)?;
+        let c1_got = engine.decode_logits()?;
+        defects += nvfp4_score_cell(
+            "c1_logits",
+            &c1_got,
+            &c1_ref,
+            (0.375f64, 0.071_592_448_053_410_43f64),
+        )?;
+
+        let c2_ids = nvfp4_st_u32(&st, "c2_ids")?;
+        let c2_ref = nvfp4_st_f32(&st, "c2_logits", &[vocab])?;
+        let c2_ref_gen = nvfp4_st_u32(&st, "c2_gen_ids")?;
+        let c2_ref_margins = nvfp4_st_f32(&st, "c2_margins", &[16])?;
+        let c2_tau = (0.3125f64, 0.062_559_873_842_800_9f64);
+
+        let mut c2_eager_logits = Vec::with_capacity(16);
+        let mut c2_eager_ids = Vec::with_capacity(16);
+        let mut c2_eager_margins = Vec::with_capacity(16);
+        engine.reset()?;
+        let mut tok = engine.prefill(&c2_ids, None)?;
+        let step0 = engine.decode_logits()?;
+        defects += nvfp4_score_cell("c2_logits", &step0, &c2_ref, c2_tau)?;
+        c2_eager_margins.push(nvfp4_top1_margin(&step0));
+        c2_eager_logits.push(step0);
+        c2_eager_ids.push(tok);
+        for _ in 1..16 {
+            tok = engine.decode(false, None)?;
+            let l = engine.decode_logits()?;
+            c2_eager_margins.push(nvfp4_top1_margin(&l));
+            c2_eager_logits.push(l);
+            c2_eager_ids.push(tok);
+        }
+
+        engine.reset()?;
+        let mut g_tok = engine.prefill(&c2_ids, None)?;
+        let mut c2_graph_ids = vec![g_tok];
+        let mut c2_graph_bits = engine
+            .decode_logits()?
+            .iter()
+            .zip(&c2_eager_logits[0])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        for eager_row in c2_eager_logits.iter().skip(1) {
+            g_tok = engine.decode(true, None)?;
+            c2_graph_ids.push(g_tok);
+            let gl = engine.decode_logits()?;
+            c2_graph_bits += gl
+                .iter()
+                .zip(eager_row)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+        }
+        let c2_graph_ok = c2_graph_bits == 0 && c2_graph_ids == c2_eager_ids;
+        defects += usize::from(!c2_graph_ok);
+        let c2_step0_qual =
+            c2_ref_margins[0] <= (2.0 * c2_tau.0 as f32) || c2_eager_ids[0] == c2_ref_gen[0];
+        defects += usize::from(!c2_step0_qual);
+        let c2_text = crate::tokenizer::decode(&dir, &c2_eager_ids)?;
+        let c2_min_margin = c2_eager_margins
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let c2_zero_margin_steps: Vec<usize> = c2_eager_margins
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &m)| (m == 0.0).then_some(idx))
+            .collect();
+        println!(
+            "{} c2_decode graph_eager_bits={c2_graph_bits} step0_qual={c2_step0_qual} min_margin={c2_min_margin:.6} zero_margin_steps={c2_zero_margin_steps:?} ids={c2_eager_ids:?} text={c2_text:?}",
+            if c2_graph_ok && c2_step0_qual {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+
+        let c3_ids = nvfp4_st_u32(&st, "c3_ids")?;
+        let c3_ref_last = nvfp4_st_f32(&st, "c3_last_logits", &[vocab])?;
+        let c3_tau = (0.375f64, 0.051_356_795_179_759_065f64);
+        let c3_r0_nll = 3.926_017_207_975_613f64;
+        let c3_tau_nll = 0.024_222_480_764_762_19f64;
+
+        engine.reset()?;
+        engine.prefill(&c3_ids, None)?;
+        let c3_prefill_last = engine.decode_logits()?;
+        defects += nvfp4_score_cell(
+            "c3_last_logits_prefill",
+            &c3_prefill_last,
+            &c3_ref_last,
+            c3_tau,
+        )?;
+
+        let (c3_eager_nll, c3_eager_rows, _, _) = forced_prefix(&mut engine, &c3_ids, false, None)?;
+        let (c3_graph_nll, _c3_graph_rows, c3_bits, c3_ulp_rows) =
+            forced_prefix(&mut engine, &c3_ids, true, Some(&c3_eager_rows))?;
+        defects += nvfp4_score_cell(
+            "c3_last_logits_forced",
+            c3_eager_rows.last().context("Runner FAIL empty c3 rows")?,
+            &c3_ref_last,
+            c3_tau,
+        )?;
+        let c3_nll_diff = (c3_graph_nll - c3_r0_nll).abs();
+        let c3_ok = c3_bits == 0 && c3_ulp_rows == 0 && c3_nll_diff <= c3_tau_nll;
+        defects += usize::from(!c3_ok);
+        println!(
+            "{} c3_nll eager_nll={c3_eager_nll:.9} graph_nll={c3_graph_nll:.9} r0_nll={c3_r0_nll:.9} abs_diff={c3_nll_diff:.9} tau_nll={c3_tau_nll:.9} graph_eager_bits={c3_bits}",
+            if c3_ok { "PASS" } else { "DEFECT" }
+        );
+
+        let c4_ids = nvfp4_st_u32(&st, "c4_t2i_ids")?;
+        let c4_ref = nvfp4_st_f32(&st, "c4_t2i_logits", &[vocab])?;
+        let c4_tau = (1.28125f64, 0.215_598_593_189_485_3f64);
+        ensure!(
+            c4_ids.len() == 3543,
+            "Runner FAIL unexpected c4_t2i_ids length"
+        );
+        engine.reset()?;
+        let mut t2i_tok = engine.prefill(&c4_ids, None)?;
+        let c4_got = engine.decode_logits()?;
+        defects += nvfp4_score_cell("c4_t2i_logits", &c4_got, &c4_ref, c4_tau)?;
+        let mut c4_gen = vec![t2i_tok];
+        let mut c4_margins = vec![nvfp4_top1_margin(&c4_got)];
+        if !engine.model_spec.eos.contains(&t2i_tok) {
+            for _ in 1..1536 {
+                t2i_tok = engine.decode(true, None)?;
+                let l = engine.decode_logits()?;
+                c4_margins.push(nvfp4_top1_margin(&l));
+                c4_gen.push(t2i_tok);
+                if engine.model_spec.eos.contains(&t2i_tok) {
+                    break;
+                }
+            }
+        }
+        let hit_eos = c4_gen
+            .last()
+            .is_some_and(|id| engine.model_spec.eos.contains(id));
+        let content_len = c4_gen
+            .iter()
+            .position(|id| engine.model_spec.eos.contains(id))
+            .unwrap_or(c4_gen.len());
+        let c4_text = crate::tokenizer::decode(&dir, &c4_gen[..content_len])?;
+        let parts: Vec<&str> = c4_text.split("</think>").collect();
+        let valid_t2i = hit_eos
+            && parts.len() == 2
+            && !parts[0].trim().is_empty()
+            && serde_json::from_str::<serde_json::Value>(parts[1].trim())
+                .ok()
+                .is_some_and(|v| {
+                    v.as_object().is_some_and(|obj| {
+                        obj.len() == 2
+                            && obj
+                                .get("expanded_caption")
+                                .and_then(|s| s.as_str())
+                                .is_some_and(|s| s.len() >= 40)
+                            && obj.get("aspect_ratio").and_then(|s| s.as_str()) == Some("1:1")
+                    })
+                });
+        let text_vision_calls = engine
+            .qwen
+            .as_ref()
+            .context("Runner FAIL qwen runtime missing")?
+            .vision_encode_calls;
+        let c4_ok = valid_t2i && text_vision_calls == 0;
+        defects += usize::from(!c4_ok);
+        let c4_min_margin = c4_margins.iter().copied().fold(f32::INFINITY, f32::min);
+        let c4_zero_margin_steps: Vec<usize> = c4_margins
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &m)| (m == 0.0).then_some(idx))
+            .collect();
+        let json_tail = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        println!(
+            "{} c4_t2i gen_len={} hit_eos={hit_eos} valid_json={valid_t2i} vision_calls={text_vision_calls} min_margin={c4_min_margin:.6} zero_margin_steps={c4_zero_margin_steps:?} json={json_tail:?}",
+            if c4_ok { "PASS" } else { "DEFECT" },
+            c4_gen.len()
+        );
+
+        let ws2_ctrl = "lm_head.weight_scale_2";
+        let orig_ws2 = nvfp4_scale_ws2(&mut engine, ws2_ctrl, -2.0)?;
+        let ctrl_res = (|| -> anyhow::Result<(f64, Vec<f32>)> {
+            let (nll, rows, _, _) = forced_prefix(&mut engine, &c3_ids, true, None)?;
+            Ok((
+                nll,
+                rows.last().context("Runner FAIL empty ctrl rows")?.clone(),
+            ))
+        })();
+        nvfp4_restore_ws2(&mut engine, ws2_ctrl, orig_ws2)?;
+        let (ctrl_nll, ctrl_last) = ctrl_res?;
+        let (ctrl_max_abs, ctrl_rmse) = nvfp4_pair_metrics(&ctrl_last, &c3_ref_last)?;
+        let ctrl_nll_diff = (ctrl_nll - c3_r0_nll).abs();
+        let ctrl_max_ratio = ctrl_max_abs / c3_tau.0;
+        let ctrl_rmse_ratio = ctrl_rmse / c3_tau.1;
+        let ctrl_nll_ratio = ctrl_nll_diff / c3_tau_nll;
+        let ctrl_detected = ctrl_max_abs >= 10.0 * c3_tau.0
+            && ctrl_rmse >= 10.0 * c3_tau.1
+            && ctrl_nll_diff >= 10.0 * c3_tau_nll;
+        defects += usize::from(!ctrl_detected);
+        println!(
+            "{} GATE_C_CONTROL plant=lm_head_ws2=-2.0x ctrl_nll={ctrl_nll:.9} nll_diff={ctrl_nll_diff:.9} nll_ratio={ctrl_nll_ratio:.2}x max_abs={ctrl_max_abs:.6} max_abs_ratio={ctrl_max_ratio:.2}x rmse={ctrl_rmse:.6} rmse_ratio={ctrl_rmse_ratio:.2}x detected={ctrl_detected}",
+            if ctrl_detected { "PASS" } else { "DEFECT" }
+        );
+
+        let (restored_nll, _, _, _) = forced_prefix(&mut engine, &c3_ids, true, None)?;
+        let restored_ok = (restored_nll - c3_graph_nll).abs() == 0.0;
+        defects += usize::from(!restored_ok);
+        println!(
+            "{} GATE_C_SUMMARY defects={defects} restored_exact={restored_ok}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "Gate C candidate defects={defects}");
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_H3_IMAGE_PE_MODEL, FF_H3_IMAGE_PE_REF_DIR, FF_H3_IMAGE_PE_MEDIA_DIR and FLYINGFISH_RUNTIME_DIR required"]
+    fn nvfp4_h3_image_pe_multimodal_vision_gpu() -> anyhow::Result<()> {
+        use crate::serve::image::{Processor, decode_image};
+        use crate::vision_input::{ImageGrid, MultimodalInput};
+        use anyhow::{Context, ensure};
+        use std::{env, path::PathBuf};
+
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let dir = PathBuf::from(
+            env::var_os("FF_H3_IMAGE_PE_MODEL").context("FF_H3_IMAGE_PE_MODEL missing")?,
+        );
+        let ref_dir = PathBuf::from(
+            env::var_os("FF_H3_IMAGE_PE_REF_DIR").context("FF_H3_IMAGE_PE_REF_DIR missing")?,
+        );
+        let media_dir = PathBuf::from(
+            env::var_os("FF_H3_IMAGE_PE_MEDIA_DIR").context("FF_H3_IMAGE_PE_MEDIA_DIR missing")?,
+        );
+        let runtime = PathBuf::from(
+            env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let bytes = std::fs::read(ref_dir.join("gate_d_mm.safetensors"))?;
+        let st = safetensors::SafeTensors::deserialize(&bytes)?;
+        let processor = Processor::load(&dir, None)?.context("Runner FAIL processor missing")?;
+        let mut engine = nvfp4_load_engine(&dir, 256, 256, runtime)?;
+        let vocab = engine.model_spec.vocab as usize;
+        let image_token = engine
+            .model_spec
+            .vision
+            .as_ref()
+            .context("Runner FAIL vision spec missing")?
+            .image_token;
+
+        struct GateDCase {
+            ids: Vec<u32>,
+            modality: Vec<u8>,
+            pixel_values: Vec<f32>,
+            grids: Vec<ImageGrid>,
+            ref_logits: Vec<f32>,
+            logits: Vec<f32>,
+            gen_ids: Vec<u32>,
+            text: String,
+        }
+        let mut defects = 0usize;
+        let mut case_outputs: Vec<GateDCase> = Vec::new();
+
+        for (tag, file, tau) in [
+            ("img_a", "img_a.png", (1.0f64, 0.204_632_093_203_926_83f64)),
+            (
+                "img_b",
+                "img_b.png",
+                (2.140_625f64, 0.211_321_968_926_511_8f64),
+            ),
+        ] {
+            let ref_ids = nvfp4_st_u32(&st, &format!("{tag}__input_ids"))?;
+            let ref_mod_u32 = nvfp4_st_u32(&st, &format!("{tag}__mm_token_type_ids"))?;
+            let ref_mod: Vec<u8> = ref_mod_u32
+                .iter()
+                .map(|&v| Ok(u8::try_from(v)?))
+                .collect::<anyhow::Result<_>>()?;
+            let ref_grid_u32 = nvfp4_st_u32(&st, &format!("{tag}__image_grid_thw"))?;
+            ensure!(ref_grid_u32.len() == 3, "Runner FAIL invalid grid_thw");
+            let ref_grid = ImageGrid {
+                t: ref_grid_u32[0],
+                h: ref_grid_u32[1],
+                w: ref_grid_u32[2],
+            };
+            let patches = (ref_grid.t * ref_grid.h * ref_grid.w) as usize;
+            let ref_pixels =
+                nvfp4_st_f32(&st, &format!("{tag}__pixel_values_fp32"), &[patches, 1536])?;
+            let ref_logits = nvfp4_st_f32(&st, &format!("{tag}__logits"), &[vocab])?;
+            let ref_gen = nvfp4_st_u32(&st, &format!("{tag}__gen_ids"))?;
+            let ref_margins = nvfp4_st_f32(&st, &format!("{tag}__margins"), &[32])?;
+
+            let mut unexpanded = Vec::new();
+            let mut seen_image = false;
+            for (&id, &m) in ref_ids.iter().zip(&ref_mod) {
+                if m == 1 {
+                    ensure!(id == image_token, "Runner FAIL modality/token mismatch");
+                    if !seen_image {
+                        unexpanded.push(image_token);
+                        seen_image = true;
+                    }
+                } else {
+                    unexpanded.push(id);
+                }
+            }
+
+            let png_bytes = std::fs::read(media_dir.join(file))?;
+            let rgb = decode_image(&png_bytes, Some("image/png"))?;
+            let packed = processor.prepare_rgb(&rgb)?;
+            let (expanded_ids, prepared) =
+                processor.expand(&unexpanded, vec![packed], Vec::new(), 256)?;
+            ensure!(
+                expanded_ids == ref_ids
+                    && prepared.modality_ids == ref_mod
+                    && prepared.grids == [ref_grid],
+                "Runner FAIL processor expand mismatch for {tag}"
+            );
+            let (pix_max_abs, _) = nvfp4_pair_metrics(&prepared.pixel_values, &ref_pixels)?;
+            ensure!(
+                pix_max_abs <= 1e-5,
+                "Runner FAIL processor pixel_values mismatch for {tag}: max_abs={pix_max_abs}"
+            );
+
+            let mm_input = prepared.input(&expanded_ids);
+            engine.reset()?;
+            let mut tok = engine.prefill_multimodal(&mm_input, None)?;
+            let calls_eager = engine
+                .qwen
+                .as_ref()
+                .context("Runner FAIL qwen runtime missing")?
+                .vision_encode_calls;
+            let got_logits = engine.decode_logits()?;
+            defects += nvfp4_score_cell(&format!("{tag}__logits"), &got_logits, &ref_logits, tau)?;
+
+            let mut eager_logits = vec![got_logits.clone()];
+            let mut eager_gen = vec![tok];
+            let mut eager_margins = vec![nvfp4_top1_margin(&got_logits)];
+            for _ in 1..32 {
+                tok = engine.decode(false, None)?;
+                let l = engine.decode_logits()?;
+                eager_margins.push(nvfp4_top1_margin(&l));
+                eager_logits.push(l);
+                eager_gen.push(tok);
+            }
+
+            engine.reset()?;
+            let mut g_tok = engine.prefill_multimodal(&mm_input, None)?;
+            let calls_graph = engine
+                .qwen
+                .as_ref()
+                .context("Runner FAIL qwen runtime missing")?
+                .vision_encode_calls;
+            let mut graph_gen = vec![g_tok];
+            let mut graph_bits = engine
+                .decode_logits()?
+                .iter()
+                .zip(&eager_logits[0])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            for eager_row in eager_logits.iter().skip(1) {
+                g_tok = engine.decode(true, None)?;
+                graph_gen.push(g_tok);
+                let gl = engine.decode_logits()?;
+                graph_bits += gl
+                    .iter()
+                    .zip(eager_row)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            }
+
+            let step0_qual = ref_margins[0] <= (2.0 * tau.0 as f32) || eager_gen[0] == ref_gen[0];
+            let calls_ok = calls_eager == 1 && calls_graph == 1;
+            let graph_ok = graph_bits == 0 && graph_gen == eager_gen;
+            let decoded_text = crate::tokenizer::decode(&dir, &eager_gen)?;
+            let text_ok = !decoded_text.trim().is_empty();
+            let case_ok = calls_ok && graph_ok && step0_qual && text_ok;
+            defects += usize::from(!case_ok);
+            let min_margin = eager_margins.iter().copied().fold(f32::INFINITY, f32::min);
+            let exact_prefix = eager_gen
+                .iter()
+                .zip(&ref_gen)
+                .take_while(|(a, b)| a == b)
+                .count();
+            println!(
+                "{} {tag}_mm vision_calls={calls_eager},{calls_graph} graph_eager_bits={graph_bits} step0_qual={step0_qual} exact_prefix={exact_prefix}/32 min_margin={min_margin:.6} text={decoded_text:?}",
+                if case_ok { "PASS" } else { "DEFECT" }
+            );
+            case_outputs.push(GateDCase {
+                ids: expanded_ids,
+                modality: prepared.modality_ids,
+                pixel_values: prepared.pixel_values,
+                grids: prepared.grids,
+                ref_logits,
+                logits: got_logits,
+                gen_ids: eager_gen,
+                text: decoded_text,
+            });
+        }
+
+        let case_a = &case_outputs[0];
+        let case_b = &case_outputs[1];
+        let (two_max_abs, two_rmse) = nvfp4_pair_metrics(&case_a.logits, &case_b.logits)?;
+        let two_media_ok = two_max_abs > 3.0 * 1.0
+            && two_rmse > 3.0 * 0.204_632_093_203_926_83
+            && case_a.gen_ids != case_b.gen_ids
+            && case_a.text != case_b.text;
+        defects += usize::from(!two_media_ok);
+        println!(
+            "{} GATE_D_TWO_MEDIA max_abs={two_max_abs:.6} rmse={two_rmse:.6} distinct_gen={} distinct_text={}",
+            if two_media_ok { "PASS" } else { "DEFECT" },
+            case_a.gen_ids != case_b.gen_ids,
+            case_a.text != case_b.text
+        );
+
+        let s = engine.device.stream.clone();
+        let orig_norm = {
+            let norm_slice = engine
+                .weights
+                .norm
+                .as_ref()
+                .context("Runner FAIL final norm missing")?;
+            s.clone_dtoh(norm_slice)?
+        };
+        let flipped_norm: Vec<half::bf16> = orig_norm
+            .iter()
+            .map(|w| half::bf16::from_f32(-2.0 - w.to_f32()))
+            .collect();
+        {
+            let norm_slice = engine
+                .weights
+                .norm
+                .as_mut()
+                .context("Runner FAIL final norm missing")?;
+            s.memcpy_htod(&flipped_norm, norm_slice)?;
+            s.synchronize()?;
+        }
+        let ctrl_mm_input = MultimodalInput {
+            audio: &[],
+            input_ids: &case_a.ids,
+            modality_ids: &case_a.modality,
+            pixel_values: &case_a.pixel_values,
+            grids: &case_a.grids,
+        };
+        let ctrl_res = (|| -> anyhow::Result<(u32, Vec<f32>)> {
+            engine.reset()?;
+            let tok = engine.prefill_multimodal(&ctrl_mm_input, None)?;
+            let logits = engine.decode_logits()?;
+            Ok((tok, logits))
+        })();
+        {
+            let norm_slice = engine
+                .weights
+                .norm
+                .as_mut()
+                .context("Runner FAIL final norm missing")?;
+            s.memcpy_htod(&orig_norm, norm_slice)?;
+            s.synchronize()?;
+            let verify = s.clone_dtoh(norm_slice)?;
+            ensure!(
+                verify
+                    .iter()
+                    .zip(&orig_norm)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "Runner FAIL final norm restore mismatch"
+            );
+        }
+        let (ctrl_tok, ctrl_logits) = ctrl_res?;
+        let tau_a = (1.0f64, 0.204_632_093_203_926_83f64);
+        let (ctrl_max_abs, ctrl_rmse) = nvfp4_pair_metrics(&ctrl_logits, &case_a.ref_logits)?;
+        let ctrl_max_ratio = ctrl_max_abs / tau_a.0;
+        let ctrl_rmse_ratio = ctrl_rmse / tau_a.1;
+        let ctrl_ok = ctrl_max_abs >= 10.0 * tau_a.0
+            && ctrl_rmse >= 10.0 * tau_a.1
+            && ctrl_tok != case_a.gen_ids[0];
+        defects += usize::from(!ctrl_ok);
+        println!(
+            "{} GATE_D_CONTROL plant=final_norm_neg max_abs={ctrl_max_abs:.6} max_abs_ratio={ctrl_max_ratio:.2}x rmse={ctrl_rmse:.6} rmse_ratio={ctrl_rmse_ratio:.2}x distinct_step0={}",
+            if ctrl_ok { "PASS" } else { "DEFECT" },
+            ctrl_tok != case_a.gen_ids[0]
+        );
+
+        engine.reset()?;
+        let restored_tok = engine.prefill_multimodal(&ctrl_mm_input, None)?;
+        let restored_logits = engine.decode_logits()?;
+        let restored_bits = restored_logits
+            .iter()
+            .zip(&case_a.logits)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let restored_ok = restored_bits == 0 && restored_tok == case_a.gen_ids[0];
+        defects += usize::from(!restored_ok);
+
+        println!(
+            "{} GATE_D_SUMMARY defects={defects} restored_exact={restored_ok}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "Gate D candidate defects={defects}");
         Ok(())
     }
 }

@@ -926,7 +926,7 @@ impl Engine {
         ensure!(
             matches!(load_dispatch(spec.architecture)?, LoadDispatch::Qwen)
                 && spec.moe.is_none()
-                && spec.linear_format.fp8_layout().is_none(),
+                && spec.linear_format == crate::model_spec::LinearFormat::Bf16,
             "media-aware dense placement requires a BF16 dense Qwen-family runtime"
         );
         #[cfg(feature = "rocm")]
@@ -4612,6 +4612,9 @@ impl Engine {
             return "BF16 skinny decode, FP32 accumulation; fixed BF16 Lt prefill";
         }
         if self.qwen.is_some() {
+            if self.model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4 {
+                return "nvfp4-storage-gemv/fp32-accum; fixed-bf16-lt";
+            }
             return "fp8-storage-gemv/fp32-accum; fixed-bf16-lt";
         }
         self.blas.decode_impl()

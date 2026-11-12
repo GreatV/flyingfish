@@ -396,7 +396,21 @@ impl Processor {
         let path = model.join("preprocessor_config.json");
         let config = match spec.architecture {
             Architecture::Qwen35Text | Architecture::Qwen3Vl => {
-                let config: QwenConfig = serde_json::from_reader(std::fs::File::open(&path)?)?;
+                let config: QwenConfig = if path.is_file() {
+                    serde_json::from_reader(std::fs::File::open(&path)?)?
+                } else {
+                    let processor_path = model.join("processor_config.json");
+                    let raw: serde_json::Value = serde_json::from_reader(
+                        std::fs::File::open(&processor_path).with_context(|| {
+                            format!("missing {:?} and {:?}", path, processor_path)
+                        })?,
+                    )?;
+                    serde_json::from_value(
+                        raw.get("image_processor")
+                            .cloned()
+                            .context("processor_config.json missing image_processor")?,
+                    )?
+                };
                 ensure!(
                     config.patch_size == 16
                         && config.temporal_patch_size == 2
