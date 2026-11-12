@@ -13241,10 +13241,9 @@ where
                 coordinates: sites.coordinates(),
                 features: &head,
             })?;
-            let mut output = decoder.output_head(&sites, x)?;
-            if matches!(decoder.kind, DecoderKind::Texture) {
-                channel_transform(d, &mut output, [&[0.5; 6], &[0.5; 6]], false)?;
-            }
+            // The frozen decoder fixtures store the raw head output; the
+            // pipeline applies the texture x0.5+0.5 affine downstream.
+            let output = decoder.output_head(&sites, x)?;
             let decoded: Vec<f32> = d.stream.clone_dtoh(&output)?.to_vec();
             fields = Some(decoded);
             break;

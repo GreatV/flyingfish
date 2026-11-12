@@ -2353,6 +2353,10 @@ mod tests {
                 let mut subdivision_cells = 0usize;
                 let mut head_cells = 0usize;
                 let mut field_cells = 0usize;
+                // A subdivision decision that flips between the native decode
+                // and the reference capture changes the children set; the
+                // row-aligned taps downstream of that stage are uncomparable.
+                let mut divergent = false;
                 let score = |id: &str,
                              coordinates: &[[i32; 4]],
                              features: &[f32],
@@ -2386,6 +2390,13 @@ mod tests {
                             features,
                         } => {
                             block_cells += 1;
+                            if divergent {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/stage{stage}-block0 reason=children_divergent"
+                                );
+                                skipped += 1;
+                                return Ok(());
+                            }
                             let path = dir.join(format!("stage{stage}-block0.safetensors"));
                             let rows = if has_key(&path, "row_indices")? {
                                 read_i64(&path, "row_indices")?
@@ -2429,6 +2440,32 @@ mod tests {
                         } => {
                             stage_cells += 1;
                             let count = [4usize, 16, 8, 4][stage];
+                            if divergent {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/stage{stage}-block{count} reason=children_divergent"
+                                );
+                                skipped += 1;
+                                return Ok(());
+                            }
+                            let stored_children = read_coords4(
+                                &dir.join(format!("children{stage}.safetensors")),
+                                "coords",
+                            )?;
+                            let mut native_sorted = coordinates.to_vec();
+                            native_sorted.sort_unstable();
+                            let mut stored_sorted = stored_children;
+                            stored_sorted.sort_unstable();
+                            if native_sorted != stored_sorted {
+                                println!(
+                                    "TRELLIS2_SLAT_STRUCTURAL id=decoder/decode-{name}/children{stage} stored_rows={} native_rows={} result=DEFECT",
+                                    stored_sorted.len(),
+                                    native_sorted.len()
+                                );
+                                defects += 1;
+                                scored += 1;
+                                divergent = true;
+                                return Ok(());
+                            }
                             let path = dir.join(format!("stage{stage}-block{count}.safetensors"));
                             let rows = read_i64(&path, "row_indices")?;
                             let stored_coords = read_coords4(&path, "coords")?;
@@ -2467,6 +2504,13 @@ mod tests {
                             logits,
                         } => {
                             subdivision_cells += 1;
+                            if divergent {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/subdivision{stage} reason=children_divergent"
+                                );
+                                skipped += 1;
+                                return Ok(());
+                            }
                             let path = dir.join(format!("subdivision{stage}.safetensors"));
                             let stored_coords = read_coords4(&path, "coords")?;
                             if stored_coords != coordinates {
@@ -2493,6 +2537,13 @@ mod tests {
                             features,
                         } => {
                             head_cells += 1;
+                            if divergent {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/head-observed reason=children_divergent"
+                                );
+                                skipped += 1;
+                                return Ok(());
+                            }
                             let path = dir.join("head-input.safetensors");
                             let stored_coords = read_coords4(&path, "coords")?;
                             if stored_coords != coordinates {
@@ -2519,6 +2570,13 @@ mod tests {
                             features,
                         } => {
                             field_cells += 1;
+                            if divergent {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/fields reason=children_divergent"
+                                );
+                                skipped += 1;
+                                return Ok(());
+                            }
                             let path = dir.join("fields.safetensors");
                             let stored_coords = read_coords4(&path, "coords")?;
                             if stored_coords != coordinates {
