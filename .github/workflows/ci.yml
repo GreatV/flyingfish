@@ -13,7 +13,45 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      fmt: ${{ steps.diff.outputs.fmt }}
+      nocuda: ${{ steps.diff.outputs.nocuda }}
+      cuda: ${{ steps.diff.outputs.cuda }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          fmt=false nocuda=false cuda=false
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            files=
+            fmt=true nocuda=true cuda=true
+          else
+            files=$(git diff --name-only --no-renames "$BASE" "$HEAD")
+            [ -n "$files" ] || { fmt=true nocuda=true cuda=true; }
+          fi
+          while IFS= read -r f; do
+            case "$f" in
+              '') ;;
+              *.md|LICENSE*|NOTICE*|.gitignore) ;;
+              kernels/*.cu) cuda=true ;;
+              kernels/*|device/*) [ "${f#device/}" = "$f" ] && nocuda=true; cuda=true ;;
+              *.rs|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|.rustfmt.toml|clippy.toml|.github/*) fmt=true nocuda=true cuda=true ;;
+              *) nocuda=true cuda=true ;;
+            esac
+            printf '%s\n' "$f"
+          done <<< "$files"
+          printf 'fmt=%s\nnocuda=%s\ncuda=%s\n' "$fmt" "$nocuda" "$cuda" | tee -a "$GITHUB_OUTPUT"
+
   fmt:
+    needs: changes
+    if: needs.changes.outputs.fmt == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -24,6 +62,8 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy-no-cuda:
+    needs: changes
+    if: needs.changes.outputs.nocuda == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -38,6 +78,8 @@ jobs:
       - run: cargo test --no-default-features --all-targets
 
   clippy-cuda:
+    needs: changes
+    if: needs.changes.outputs.cuda == 'true'
     runs-on: ubuntu-latest
     container: nvidia/cuda:13.2.0-devel-ubuntu24.04
     env:
