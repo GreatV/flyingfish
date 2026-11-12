@@ -1568,6 +1568,17 @@ mod tests {
         let mut scored = 0usize;
         let mut skipped = 0usize;
         let mut control_defects = 0usize;
+        let mut cases_run = 0usize;
+        let scope: Vec<String> = std::env::var("FF_TRELLIS2_SLAT_CASES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         for case in [
             ("shape", "cottage", "512"),
             ("shape", "robot_crab", "512"),
@@ -1587,6 +1598,10 @@ mod tests {
             ("tex", "robot_crab", "1536cascade"),
         ] {
             let (kind, fixture, resolution) = case;
+            if !scope.is_empty() && !scope.contains(&format!("{kind}-{fixture}-{resolution}")) {
+                continue;
+            }
+            cases_run += 1;
             let dir = root.join(format!("{kind}-{fixture}-{resolution}-r0a"));
             let metadata: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(dir.join("metadata.json"))?)?;
@@ -1752,8 +1767,9 @@ mod tests {
             defects == 0,
             "TRELLIS.2 SLAT flow gate: {defects} defects over {scored} cells"
         );
+        ensure!(cases_run > 0, "TRELLIS.2 SLAT flow gate: no cases matched");
         println!(
-            "PASS TRELLIS2_SLAT_FLOW cells={scored} skipped={skipped} control_defects={control_defects} cases=16"
+            "PASS TRELLIS2_SLAT_FLOW cells={scored} skipped={skipped} control_defects={control_defects} cases={cases_run}"
         );
         Ok(())
     }
