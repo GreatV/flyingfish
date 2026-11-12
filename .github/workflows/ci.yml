@@ -16,7 +16,9 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      rust: ${{ steps.diff.outputs.rust }}
+      fmt: ${{ steps.diff.outputs.fmt }}
+      nocuda: ${{ steps.diff.outputs.nocuda }}
+      cuda: ${{ steps.diff.outputs.cuda }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -26,21 +28,30 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.sha }}
         run: |
+          fmt=false nocuda=false cuda=false
           if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          files=$(git diff --name-only --no-renames "$BASE" "$HEAD")
-          printf '%s\n' "$files"
-          if grep -vE '(^|/)[^/]+\.md$|^LICENSE' <<< "$files" > /dev/null; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
+            files=
+            fmt=true nocuda=true cuda=true
           else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
+            files=$(git diff --name-only --no-renames "$BASE" "$HEAD")
+            [ -n "$files" ] || { fmt=true nocuda=true cuda=true; }
           fi
+          while IFS= read -r f; do
+            case "$f" in
+              '') ;;
+              *.md|LICENSE*|NOTICE*|.gitignore) ;;
+              kernels/*.cu) cuda=true ;;
+              kernels/*|device/*) [ "${f#device/}" = "$f" ] && nocuda=true; cuda=true ;;
+              *.rs|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|.rustfmt.toml|clippy.toml|.github/*) fmt=true nocuda=true cuda=true ;;
+              *) nocuda=true cuda=true ;;
+            esac
+            printf '%s\n' "$f"
+          done <<< "$files"
+          printf 'fmt=%s\nnocuda=%s\ncuda=%s\n' "$fmt" "$nocuda" "$cuda" | tee -a "$GITHUB_OUTPUT"
 
   fmt:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.fmt == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -52,7 +63,7 @@ jobs:
 
   clippy-no-cuda:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.nocuda == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -68,7 +79,7 @@ jobs:
 
   clippy-cuda:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.cuda == 'true'
     runs-on: ubuntu-latest
     container: nvidia/cuda:13.2.0-devel-ubuntu24.04
     env:
