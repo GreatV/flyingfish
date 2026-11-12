@@ -1,6 +1,12 @@
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("features `cuda` and `rocm` are mutually exclusive");
 
+#[derive(Clone, Debug)]
+pub struct RunOptions {
+    pub device: usize,
+    pub runtime_dir: std::path::PathBuf,
+}
+
 pub mod audio;
 pub mod backend;
 pub mod bench;
@@ -18,6 +24,7 @@ pub mod gdn_plan;
 pub mod gguf;
 pub mod kv;
 pub mod linear_plan;
+pub mod media;
 pub mod minimax_h3;
 pub mod model;
 pub mod model_spec;
