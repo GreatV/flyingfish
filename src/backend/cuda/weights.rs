@@ -1659,7 +1659,7 @@ impl Loader<'_> {
                         .all(|c| f32::from_le_bytes(*c).is_finite())
                 }
                 // Packed E2M1 nibble pairs; every byte is a valid code pair.
-                Dtype::I8 => true,
+                Dtype::I8 | Dtype::U8 => true,
                 _ => anyhow::bail!("unsupported native byte dtype {dtype:?} for {name}"),
             };
             ensure!(valid, "nonfinite native value in {name}");
@@ -2630,7 +2630,7 @@ impl WeightCatalog {
     ) -> Result<Self> {
         use crate::prefill::DensePlacement;
         ensure!(
-            spec.moe.is_none() && spec.linear_format.fp8_layout().is_none(),
+            spec.moe.is_none() && spec.linear_format == crate::model_spec::LinearFormat::Bf16,
             "dense layer streaming requires BF16 dense weights"
         );
         let mapped = MappedCheckpoint::open(dir)?;
@@ -2865,12 +2865,18 @@ impl WeightCatalog {
         } else {
             "language_model.norm.weight"
         };
-        let has_head = self.tensors.contains_key("lm_head.weight");
+        let head_entry = self.tensors.get("lm_head.weight");
+        let native_head = matches!(head_entry, Some(StoredTensor::Bytes(_)));
+        let has_head = head_entry.is_some();
         let mut take = |name: &str| match self.tensors.remove(name) {
             Some(StoredTensor::Bf16(v)) => Ok(v),
             _ => anyhow::bail!("missing/non-BF16 global tensor {name}"),
         };
-        let (embed, head) = if has_head {
+        let (embed, head) = if native_head {
+            let embed = take(embed_name)?;
+            let empty = embed.stream().alloc_zeros::<bf16>(0)?;
+            (Some(embed), empty)
+        } else if has_head {
             (Some(take(embed_name)?), take("lm_head.weight")?)
         } else {
             (None, take(embed_name)?)

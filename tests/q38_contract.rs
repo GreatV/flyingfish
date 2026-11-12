@@ -332,3 +332,393 @@ fn g6_row_work_uses_mixer_width_and_separate_projection_storage() {
     assert_eq!(w.row_bytes().unwrap(), 200900);
     assert!(flyingfish::work_layout::RowWorkSpec::elements(usize::MAX, 2).is_err());
 }
+
+fn modelopt_nvfp4_quant_config() -> Value {
+    json!({
+        "config_groups": {
+            "group_0": {
+                "input_activations": {
+                    "dynamic": false,
+                    "group_size": 16,
+                    "num_bits": 4,
+                    "type": "float"
+                },
+                "weights": {
+                    "dynamic": false,
+                    "group_size": 16,
+                    "num_bits": 4,
+                    "type": "float"
+                },
+                "targets": [
+                    "lm_head",
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv"
+                ]
+            }
+        },
+        "group_size": 16,
+        "ignore": [
+            "model.language_model.embed_tokens",
+            "model.visual*"
+        ],
+        "producer": {
+            "name": "modelopt",
+            "version": "0.48.0rc1.dev102+g28a38b6aa"
+        },
+        "quant_algo": "NVFP4",
+        "quant_method": "modelopt"
+    })
+}
+
+fn write_safetensors_file(path: &std::path::Path, entries: &[(&str, &str, &[usize])]) {
+    let mut header = serde_json::Map::new();
+    let mut offset = 0usize;
+    for &(name, dtype, shape) in entries {
+        let elem_bytes = match dtype {
+            "U8" | "F8_E4M3" => 1usize,
+            "BF16" => 2,
+            "F32" => 4,
+            other => panic!("unexpected synthetic dtype {other}"),
+        };
+        let bytes = shape.iter().product::<usize>() * elem_bytes;
+        header.insert(
+            name.to_owned(),
+            json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [offset, offset + bytes]
+            }),
+        );
+        offset += bytes;
+    }
+    let header_bytes = serde_json::to_vec(&Value::Object(header)).unwrap();
+    let mut file_bytes = (header_bytes.len() as u64).to_le_bytes().to_vec();
+    file_bytes.extend_from_slice(&header_bytes);
+    file_bytes.resize(file_bytes.len() + offset, 0u8);
+    std::fs::write(path, file_bytes).unwrap();
+}
+
+#[test]
+fn nvfp4_modelopt_config_manifest_and_controls() {
+    use flyingfish::{
+        checkpoint::{LoadPolicy, MappedCheckpoint},
+        linear_plan::LayerDequantPlan,
+    };
+
+    let mut root: Value = serde_json::from_str(include_str!("data/q38-config.json")).unwrap();
+    root["quantization_config"] = modelopt_nvfp4_quant_config();
+    root["text_config"]["mtp_num_hidden_layers"] = json!(0);
+    root["text_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mtp_use_dedicated_embeddings");
+    root["text_config"]["eos_token_id"] = json!(248046);
+    root["text_config"]["pad_token_id"] = json!(248044);
+    root["vision_config"]["model_type"] = json!("qwen3_5_vision");
+    let spec = ModelSpec::qwen(&root, &json!({"eos_token_id": 248046})).unwrap();
+    assert_eq!(spec.linear_format, LinearFormat::NvFp4);
+    assert_eq!(spec.mtp_layers, 0);
+    assert_eq!(spec.eos, vec![248046]);
+    assert!(spec.vision.is_some());
+    let encoded = serde_json::to_string(&spec).unwrap();
+    let decoded: ModelSpec = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.linear_format, LinearFormat::NvFp4);
+
+    for (pointer, bad_val) in [
+        ("/quantization_config/quant_algo", json!("FP8")),
+        ("/quantization_config/group_size", json!(32)),
+        (
+            "/quantization_config/producer/name",
+            json!("compressed-tensors"),
+        ),
+        ("/quantization_config/producer/version", json!("")),
+        (
+            "/quantization_config/config_groups/group_0/weights/dynamic",
+            json!(true),
+        ),
+        (
+            "/quantization_config/config_groups/group_0/weights/num_bits",
+            json!(8),
+        ),
+        (
+            "/quantization_config/config_groups/group_0/input_activations/group_size",
+            json!(32),
+        ),
+        (
+            "/quantization_config/ignore",
+            json!(["model.language_model.embed_tokens"]),
+        ),
+        ("/quantization_config/ignore", json!(["model.visual*"])),
+        (
+            "/quantization_config/ignore",
+            json!([
+                "model.language_model.embed_tokens",
+                "model.visual*",
+                "lm_head"
+            ]),
+        ),
+        (
+            "/quantization_config/config_groups/group_0/targets",
+            json!(["model.language_model.layers.0.mlp.down_proj"]),
+        ),
+    ] {
+        let mut bad = root.clone();
+        *bad.pointer_mut(pointer).unwrap() = bad_val;
+        assert!(ModelSpec::qwen(&bad, &Value::Null).is_err(), "{pointer}");
+    }
+    let mut bad_kv_quant = root.clone();
+    bad_kv_quant["quantization_config"]["kv_cache_quant_algo"] = json!("FP8");
+    assert!(ModelSpec::qwen(&bad_kv_quant, &Value::Null).is_err());
+    let mut extra_key = root.clone();
+    extra_key["quantization_config"]["unexpected_field"] = json!(1);
+    assert!(ModelSpec::qwen(&extra_key, &Value::Null).is_err());
+
+    let mut tiny = root.clone();
+    tiny.as_object_mut().unwrap().remove("vision_config");
+    let tc = tiny["text_config"].as_object_mut().unwrap();
+    tc.insert("hidden_size".into(), json!(64));
+    tc.insert("intermediate_size".into(), json!(128));
+    tc.insert("vocab_size".into(), json!(256));
+    tc.insert("bos_token_id".into(), json!(0));
+    tc.insert("eos_token_id".into(), json!(1));
+    tc.insert("pad_token_id".into(), json!(0));
+    tc.insert("num_hidden_layers".into(), json!(2));
+    tc.insert("full_attention_interval".into(), json!(2));
+    tc.insert(
+        "layer_types".into(),
+        json!(["linear_attention", "full_attention"]),
+    );
+    tc.insert("num_attention_heads".into(), json!(2));
+    tc.insert("num_key_value_heads".into(), json!(1));
+    tc.insert("head_dim".into(), json!(256));
+    tc.insert("linear_num_key_heads".into(), json!(2));
+    tc.insert("linear_num_value_heads".into(), json!(4));
+    tc.insert("linear_key_head_dim".into(), json!(16));
+    tc.insert("linear_value_head_dim".into(), json!(16));
+    tc.insert("linear_conv_kernel_dim".into(), json!(4));
+    let tiny_spec = ModelSpec::qwen(&tiny, &json!({"eos_token_id": 1})).unwrap();
+
+    let mut entries: Vec<(String, &'static str, Vec<usize>)> = Vec::new();
+    let push_nvfp4 =
+        |out: &mut Vec<(String, &'static str, Vec<usize>)>, stem: &str, n: usize, k: usize| {
+            out.push((format!("{stem}.weight"), "U8", vec![n, k / 2]));
+            out.push((format!("{stem}.weight_scale"), "F8_E4M3", vec![n, k / 16]));
+            out.push((format!("{stem}.weight_scale_2"), "F32", vec![]));
+            out.push((format!("{stem}.input_scale"), "F32", vec![]));
+        };
+    entries.push((
+        "model.language_model.embed_tokens.weight".into(),
+        "BF16",
+        vec![256, 64],
+    ));
+    entries.push(("model.language_model.norm.weight".into(), "BF16", vec![64]));
+    push_nvfp4(&mut entries, "lm_head", 256, 64);
+    for (layer, is_full) in [(0usize, false), (1usize, true)] {
+        let p = format!("model.language_model.layers.{layer}");
+        entries.push((format!("{p}.input_layernorm.weight"), "BF16", vec![64]));
+        entries.push((
+            format!("{p}.post_attention_layernorm.weight"),
+            "BF16",
+            vec![64],
+        ));
+        push_nvfp4(&mut entries, &format!("{p}.mlp.gate_proj"), 128, 64);
+        push_nvfp4(&mut entries, &format!("{p}.mlp.up_proj"), 128, 64);
+        push_nvfp4(&mut entries, &format!("{p}.mlp.down_proj"), 64, 128);
+        if is_full {
+            push_nvfp4(&mut entries, &format!("{p}.self_attn.q_proj"), 1024, 64);
+            push_nvfp4(&mut entries, &format!("{p}.self_attn.k_proj"), 256, 64);
+            push_nvfp4(&mut entries, &format!("{p}.self_attn.v_proj"), 256, 64);
+            push_nvfp4(&mut entries, &format!("{p}.self_attn.o_proj"), 64, 512);
+            entries.push((format!("{p}.self_attn.q_norm.weight"), "BF16", vec![256]));
+            entries.push((format!("{p}.self_attn.k_norm.weight"), "BF16", vec![256]));
+        } else {
+            push_nvfp4(
+                &mut entries,
+                &format!("{p}.linear_attn.in_proj_qkv"),
+                128,
+                64,
+            );
+            push_nvfp4(&mut entries, &format!("{p}.linear_attn.in_proj_z"), 64, 64);
+            push_nvfp4(&mut entries, &format!("{p}.linear_attn.out_proj"), 64, 64);
+            entries.push((
+                format!("{p}.linear_attn.in_proj_a.weight"),
+                "BF16",
+                vec![4, 64],
+            ));
+            entries.push((
+                format!("{p}.linear_attn.in_proj_b.weight"),
+                "BF16",
+                vec![4, 64],
+            ));
+            entries.push((
+                format!("{p}.linear_attn.conv1d.weight"),
+                "BF16",
+                vec![128, 1, 4],
+            ));
+            entries.push((format!("{p}.linear_attn.norm.weight"), "BF16", vec![16]));
+            entries.push((format!("{p}.linear_attn.A_log"), "BF16", vec![4]));
+            entries.push((format!("{p}.linear_attn.dt_bias"), "BF16", vec![4]));
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("ff-nvfp4-contract-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shard = dir.join("model.safetensors");
+    let refs = entries
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), *d, s.as_slice()))
+        .collect::<Vec<_>>();
+    write_safetensors_file(&shard, &refs);
+
+    let mapped = MappedCheckpoint::open(&dir).unwrap();
+    let manifest = mapped.manifest(&tiny_spec, LoadPolicy::TextOnly).unwrap();
+    let plan0 = LayerDequantPlan::from_model(&manifest, 0, &tiny_spec).unwrap();
+    let plan1 = LayerDequantPlan::from_model(&manifest, 1, &tiny_spec).unwrap();
+    assert_eq!(plan0.slots.len(), 6);
+    assert_eq!(plan1.slots.len(), 7);
+    assert!(plan0.slots.values().all(|s| s.offset_bytes % 256 == 0));
+    assert!(plan1.slots.values().all(|s| s.offset_bytes % 256 == 0));
+
+    assert!(LayerDequantPlan::from_manifest(&manifest, 0, LinearFormat::Bf16).is_err());
+
+    let mut missing_ws2 = manifest.clone();
+    missing_ws2
+        .entries
+        .remove("model.language_model.layers.0.mlp.down_proj.weight_scale_2")
+        .unwrap();
+    assert!(LayerDequantPlan::from_model(&missing_ws2, 0, &tiny_spec).is_err());
+
+    let mut missing_in_scale = manifest.clone();
+    missing_in_scale
+        .entries
+        .remove("model.language_model.layers.0.mlp.down_proj.input_scale")
+        .unwrap();
+    assert!(LayerDequantPlan::from_model(&missing_in_scale, 0, &tiny_spec).is_err());
+
+    let mut bad_group = manifest.clone();
+    bad_group
+        .entries
+        .get_mut("model.language_model.layers.0.mlp.down_proj.weight_scale")
+        .unwrap()
+        .shape = vec![64, 4];
+    assert!(LayerDequantPlan::from_model(&bad_group, 0, &tiny_spec).is_err());
+
+    let dropped_ws2 = entries
+        .iter()
+        .filter(|(n, _, _)| n != "lm_head.weight_scale_2")
+        .map(|(n, d, s)| (n.as_str(), *d, s.as_slice()))
+        .collect::<Vec<_>>();
+    write_safetensors_file(&shard, &dropped_ws2);
+    let bad_mapped = MappedCheckpoint::open(&dir).unwrap();
+    assert!(
+        bad_mapped
+            .manifest(&tiny_spec, LoadPolicy::TextOnly)
+            .is_err()
+    );
+
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&root).unwrap()).unwrap();
+    std::fs::write(
+        dir.join("generation_config.json"),
+        serde_json::to_vec(&json!({"eos_token_id": [248044, 248046]})).unwrap(),
+    )
+    .unwrap();
+    assert!(flyingfish::serve::image::Processor::load(&dir, None).is_err());
+    std::fs::write(
+        dir.join("processor_config.json"),
+        serde_json::to_vec(&json!({"processor_class": "Qwen3VLProcessor"})).unwrap(),
+    )
+    .unwrap();
+    assert!(flyingfish::serve::image::Processor::load(&dir, None).is_err());
+    std::fs::write(
+        dir.join("processor_config.json"),
+        serde_json::to_vec(&json!({
+            "processor_class": "Qwen3VLProcessor",
+            "image_processor": {
+                "size": {"shortest_edge": 65536, "longest_edge": 16777216},
+                "patch_size": 16,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+                "image_mean": [0.5, 0.5, 0.5],
+                "image_std": [0.5, 0.5, 0.5]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let proc = flyingfish::serve::image::Processor::load(&dir, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proc.merge(), 2);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+#[ignore = "CPU-only checkpoint header audit; set FF_H3_IMAGE_PE_MODEL"]
+fn nvfp4_published_checkpoint_census() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use flyingfish::{
+        checkpoint::{LoadPolicy, MappedCheckpoint, TensorScope, has_mtp_component},
+        linear_plan::LayerDequantPlan,
+    };
+
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("FF_H3_IMAGE_PE_MODEL").context("FF_H3_IMAGE_PE_MODEL missing")?,
+    );
+    assert!(!has_mtp_component(&dir)?);
+    let spec = ModelSpec::read(&dir)?;
+    assert_eq!(spec.linear_format, LinearFormat::NvFp4);
+    assert_eq!(spec.mtp_layers, 0);
+    assert_eq!(spec.eos, vec![248046]);
+    assert!(spec.vision.is_some());
+    let processor = flyingfish::serve::image::Processor::load(&dir, None)?
+        .context("expected Qwen3.5 image processor from processor_config.json")?;
+    assert_eq!(processor.merge(), 2);
+
+    let mapped = MappedCheckpoint::open(&dir)?;
+    for (policy, resident_bytes, text_loaded, vision_loaded) in [
+        (LoadPolicy::TextOnly, 16_994_355_336usize, 2054usize, 0usize),
+        (LoadPolicy::VisionOnly, 921_460_192, 0, 333),
+        (LoadPolicy::TextWithVision, 17_915_815_528, 2054, 333),
+    ] {
+        let m = mapped.manifest(&spec, policy)?;
+        assert_eq!(m.entries.len(), 2387);
+        assert_eq!(m.resident_bytes, resident_bytes, "{policy:?}");
+        assert_eq!(
+            m.entries
+                .values()
+                .filter(|e| e.load && e.scope == TensorScope::Text)
+                .count(),
+            text_loaded,
+            "{policy:?} text"
+        );
+        assert_eq!(
+            m.entries
+                .values()
+                .filter(|e| e.load && e.scope == TensorScope::Vision)
+                .count(),
+            vision_loaded,
+            "{policy:?} vision"
+        );
+    }
+    assert!(mapped.manifest(&spec, LoadPolicy::TextWithMtp).is_err());
+
+    let text_manifest = mapped.manifest(&spec, LoadPolicy::TextOnly)?;
+    let mut max_arena = 0u64;
+    for layer in 0..64u32 {
+        let plan = LayerDequantPlan::from_model(&text_manifest, layer, &spec)?;
+        if (layer + 1).is_multiple_of(4) {
+            assert_eq!(plan.slots.len(), 7, "layer {layer}");
+            assert_eq!(plan.bytes, 744_488_960, "layer {layer}");
+        } else {
+            assert_eq!(plan.slots.len(), 6, "layer {layer}");
+            assert_eq!(plan.bytes, 765_460_480, "layer {layer}");
+        }
+        max_arena = max_arena.max(plan.bytes);
+    }
+    assert_eq!(max_arena, 765_460_480);
+    println!(
+        "PASS nvfp4_published_checkpoint_census entries=2387 text=2054/16994355336B vision=333/921460192B max_layer_arena={max_arena}"
+    );
+    Ok(())
+}

@@ -501,20 +501,22 @@ impl MappedCheckpoint {
                 let declared_mtp_layers = spec.mtp_layers;
                 // The merger's output projection feeds the text hidden size:
                 // its shapes derive from the spec, not the frozen file.
-                put(
-                    &mut expected,
-                    "model.visual.merger.linear_fc2.weight".into(),
-                    Dtype::BF16,
-                    vec![spec.hidden as usize, 4608],
-                    TensorScope::Vision,
-                );
-                put(
-                    &mut expected,
-                    "model.visual.merger.linear_fc2.bias".into(),
-                    Dtype::BF16,
-                    vec![spec.hidden as usize],
-                    TensorScope::Vision,
-                );
+                if spec.vision.is_some() {
+                    put(
+                        &mut expected,
+                        "model.visual.merger.linear_fc2.weight".into(),
+                        Dtype::BF16,
+                        vec![spec.hidden as usize, 4608],
+                        TensorScope::Vision,
+                    );
+                    put(
+                        &mut expected,
+                        "model.visual.merger.linear_fc2.bias".into(),
+                        Dtype::BF16,
+                        vec![spec.hidden as usize],
+                        TensorScope::Vision,
+                    );
+                }
                 for item in serde_json::from_str::<Vec<Skipped>>(include_str!(
                     "checkpoint/q38_skipped.json"
                 ))? {
@@ -539,13 +541,15 @@ impl MappedCheckpoint {
                             item.name.starts_with("model.visual."),
                             "unknown non-text scope"
                         );
-                        put(
-                            &mut expected,
-                            item.name,
-                            item.dtype,
-                            item.shape,
-                            TensorScope::Vision,
-                        );
+                        if spec.vision.is_some() {
+                            put(
+                                &mut expected,
+                                item.name,
+                                item.dtype,
+                                item.shape,
+                                TensorScope::Vision,
+                            );
+                        }
                     }
                 }
             }
@@ -1241,6 +1245,7 @@ impl MappedCheckpoint {
         let kv_width = spec.kv_heads as usize * head_dim;
         let fp8 = spec.linear_format.fp8_layout();
         let dense_fp8 = fp8.filter(|layout| layout.block_scale().is_some());
+        let nvfp4 = spec.linear_format == crate::model_spec::LinearFormat::NvFp4;
         let global_prefix = match spec.architecture {
             Architecture::Flint
             | Architecture::Clover
@@ -1258,13 +1263,19 @@ impl MappedCheckpoint {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
-        for name in [
+        put(
+            expected,
             format!("{global_prefix}.embed_tokens.weight"),
-            "lm_head.weight".to_owned(),
-        ] {
+            Dtype::BF16,
+            vec![vocab, hidden],
+            TensorScope::Text,
+        );
+        if nvfp4 {
+            nvfp4_projection(expected, "lm_head".to_owned(), vocab, hidden)?;
+        } else {
             put(
                 expected,
-                name,
+                "lm_head.weight".to_owned(),
                 Dtype::BF16,
                 vec![vocab, hidden],
                 TensorScope::Text,
@@ -1387,27 +1398,18 @@ impl MappedCheckpoint {
                 }
                 crate::model_spec::FfnKind::Dense => {
                     let intermediate = spec.intermediate as usize;
-                    projection(
-                        expected,
-                        format!("{p}.mlp.gate_proj"),
-                        intermediate,
-                        hidden,
-                        dense_fp8,
-                    );
-                    projection(
-                        expected,
-                        format!("{p}.mlp.up_proj"),
-                        intermediate,
-                        hidden,
-                        dense_fp8,
-                    );
-                    projection(
-                        expected,
-                        format!("{p}.mlp.down_proj"),
-                        hidden,
-                        intermediate,
-                        dense_fp8,
-                    );
+                    for (role, n, k) in [
+                        ("gate_proj", intermediate, hidden),
+                        ("up_proj", intermediate, hidden),
+                        ("down_proj", hidden, intermediate),
+                    ] {
+                        let base = format!("{p}.mlp.{role}");
+                        if nvfp4 {
+                            nvfp4_projection(expected, base, n, k)?;
+                        } else {
+                            projection(expected, base, n, k, dense_fp8);
+                        }
+                    }
                 }
             }
             match layer.mixer {
@@ -1431,34 +1433,19 @@ impl MappedCheckpoint {
                             unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
                         }
                     };
-                    projection(
-                        expected,
-                        format!("{p}.self_attn.q_proj"),
-                        q_out,
-                        hidden,
-                        fp8,
-                    );
-                    projection(
-                        expected,
-                        format!("{p}.self_attn.k_proj"),
-                        kv_width,
-                        hidden,
-                        fp8,
-                    );
-                    projection(
-                        expected,
-                        format!("{p}.self_attn.v_proj"),
-                        kv_width,
-                        hidden,
-                        fp8,
-                    );
-                    projection(
-                        expected,
-                        format!("{p}.self_attn.o_proj"),
-                        hidden,
-                        q_width,
-                        fp8,
-                    );
+                    for (role, n, k) in [
+                        ("q_proj", q_out, hidden),
+                        ("k_proj", kv_width, hidden),
+                        ("v_proj", kv_width, hidden),
+                        ("o_proj", hidden, q_width),
+                    ] {
+                        let base = format!("{p}.self_attn.{role}");
+                        if nvfp4 {
+                            nvfp4_projection(expected, base, n, k)?;
+                        } else {
+                            projection(expected, base, n, k, fp8);
+                        }
+                    }
                     if spec.architecture != Architecture::Llama {
                         for name in ["q_norm", "k_norm"] {
                             put(
@@ -1486,27 +1473,18 @@ impl MappedCheckpoint {
                     let value_heads = g.value_heads as usize;
                     let value_dim = value_heads * g.value_head_dim as usize;
                     let conv_dim = 2 * key_dim + value_dim;
-                    projection(
-                        expected,
-                        format!("{p}.linear_attn.in_proj_qkv"),
-                        conv_dim,
-                        hidden,
-                        dense_fp8,
-                    );
-                    projection(
-                        expected,
-                        format!("{p}.linear_attn.in_proj_z"),
-                        value_dim,
-                        hidden,
-                        dense_fp8,
-                    );
-                    projection(
-                        expected,
-                        format!("{p}.linear_attn.out_proj"),
-                        hidden,
-                        value_dim,
-                        dense_fp8,
-                    );
+                    for (role, n, k) in [
+                        ("in_proj_qkv", conv_dim, hidden),
+                        ("in_proj_z", value_dim, hidden),
+                        ("out_proj", hidden, value_dim),
+                    ] {
+                        let base = format!("{p}.linear_attn.{role}");
+                        if nvfp4 {
+                            nvfp4_projection(expected, base, n, k)?;
+                        } else {
+                            projection(expected, base, n, k, dense_fp8);
+                        }
+                    }
                     for name in ["in_proj_a", "in_proj_b"] {
                         put(
                             expected,
@@ -2623,12 +2601,21 @@ impl MappedCheckpoint {
                 .context("tensor offset overflow")?;
             let (layer, role) = split_layer_role(name)?;
             let scale_name = if dtype == Dtype::F8_E4M3 {
-                Some(format!(
-                    "{}.{}",
-                    name.strip_suffix(".weight")
-                        .context("invalid FP8 tensor suffix")?,
-                    scale_suffix.context("FP8 tensor without scale layout")?
-                ))
+                if scale_suffix.is_none() && name.ends_with(".weight_scale") {
+                    None
+                } else {
+                    Some(format!(
+                        "{}.{}",
+                        name.strip_suffix(".weight")
+                            .context("invalid FP8 tensor suffix")?,
+                        scale_suffix.context("FP8 tensor without scale layout")?
+                    ))
+                }
+            } else if dtype == Dtype::U8 {
+                let stem = name
+                    .strip_suffix(".weight")
+                    .context("invalid NVFP4 tensor suffix")?;
+                Some(format!("{stem}.weight_scale"))
             } else {
                 None
             };
@@ -3544,6 +3531,47 @@ fn projection(
     projection_scoped(expected, base, n, k, fp8, TensorScope::Text);
 }
 
+fn nvfp4_projection(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    base: String,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    ensure!(
+        n > 0 && k > 0 && k.is_multiple_of(16),
+        "NVFP4 projection {base} requires positive N and K divisible by 16, got [{n}, {k}]"
+    );
+    put(
+        expected,
+        format!("{base}.weight"),
+        Dtype::U8,
+        vec![n, k / 2],
+        TensorScope::Text,
+    );
+    put(
+        expected,
+        format!("{base}.weight_scale"),
+        Dtype::F8_E4M3,
+        vec![n, k / 16],
+        TensorScope::Text,
+    );
+    put(
+        expected,
+        format!("{base}.weight_scale_2"),
+        Dtype::F32,
+        vec![],
+        TensorScope::Text,
+    );
+    put(
+        expected,
+        format!("{base}.input_scale"),
+        Dtype::F32,
+        vec![],
+        TensorScope::Text,
+    );
+    Ok(())
+}
+
 fn projection_scoped(
     expected: &mut BTreeMap<String, ExpectedTensor>,
     base: String,
@@ -3713,7 +3741,7 @@ pub struct TensorEntry {
 impl TensorEntry {
     #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn native_byte_storage(&self) -> bool {
-        matches!(self.dtype, Dtype::F8_E4M3 | Dtype::F32)
+        matches!(self.dtype, Dtype::F8_E4M3 | Dtype::U8 | Dtype::F32)
             || (self.dtype == Dtype::BF16
                 && matches!(self.role.as_str(), "hc_attn_fn" | "hc_ffn_fn"))
     }

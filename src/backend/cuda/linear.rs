@@ -309,6 +309,157 @@ pub(crate) enum LinearWeightRef {
         scale: Fp8ScaleRef,
         layout: Fp8ScaleLayout,
     },
+    NvFp4 {
+        codes: Tensor<u8, 2>,
+        scale: Tensor<u8, 2>,
+        global_scale: Tensor<f32, 1>,
+    },
+}
+
+pub(crate) fn validate_nvfp4(
+    codes: &Tensor<u8, 2>,
+    scale: &Tensor<u8, 2>,
+    global_scale: &Tensor<f32, 1>,
+) -> Result<[u32; 2]> {
+    codes.validate()?;
+    scale.validate()?;
+    global_scale.validate()?;
+    let [n, packed_k] = codes.shape;
+    let k = packed_k.checked_mul(2).context("NVFP4 K extent overflow")?;
+    ensure!(
+        n <= i32::MAX as u32
+            && k <= i32::MAX as u32
+            && k.is_multiple_of(16)
+            && codes.stride == [u64::from(packed_k), 1]
+            && codes.span_bytes == u64::from(n) * u64::from(packed_k),
+        "invalid NVFP4 code extent"
+    );
+    let groups = k / 16;
+    ensure!(
+        scale.shape == [n, groups]
+            && scale.stride == [u64::from(groups), 1]
+            && scale.span_bytes == u64::from(n) * u64::from(groups),
+        "NVFP4 scale extent mismatch"
+    );
+    ensure!(
+        global_scale.shape == [1]
+            && global_scale.stride == [1]
+            && global_scale.span_bytes == size_of::<f32>() as u64,
+        "NVFP4 global scale extent mismatch"
+    );
+    super::contracts::no_overlap(codes, scale, "NVFP4 codes", "NVFP4 scales")?;
+    super::contracts::no_overlap(codes, global_scale, "NVFP4 codes", "NVFP4 global scale")?;
+    super::contracts::no_overlap(scale, global_scale, "NVFP4 scales", "NVFP4 global scale")?;
+    Ok([n, k])
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct NvFp4Ops {
+    dequant: CudaFunction,
+    small: Vec<CudaFunction>,
+}
+
+#[cfg(feature = "cuda")]
+impl NvFp4Ops {
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        Self::for_rows(ctx, crate::linear_plan::MAX_SKINNY_ROWS)
+    }
+
+    pub(super) fn for_rows(ctx: &Arc<CudaContext>, rows: usize) -> Result<Self> {
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+            "NVFP4 skinny row bound={rows} exceeds {}",
+            crate::linear_plan::MAX_SKINNY_ROWS
+        );
+        let module = super::cubin::module(ctx, "nvfp4_linear")?;
+        let small = (1..=rows)
+            .map(|row| {
+                module.load_function(&if row == 1 {
+                    "nvfp4_gemv_bf16".to_owned()
+                } else {
+                    format!("nvfp4_skinny_bf16_m{row}")
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self {
+            dequant: module.load_function("nvfp4_dequant_bf16")?,
+            small,
+        })
+    }
+
+    pub(super) fn require_rows(&self, rows: usize) -> Result<()> {
+        ensure!(
+            rows > 0 && self.small.len() >= rows,
+            "direct NVFP4 rows={rows} exceeds bound table={}",
+            self.small.len()
+        );
+        Ok(())
+    }
+
+    pub fn materialize(
+        &self,
+        stream: &Arc<CudaStream>,
+        codes: Tensor<u8, 2>,
+        scale: Tensor<u8, 2>,
+        global_scale: Tensor<f32, 1>,
+        dst: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let [n, k] = validate_nvfp4(&codes, &scale, &global_scale)?;
+        dst.0.validate()?;
+        ensure!(
+            dst.0.shape == [n, k] && dst.0.stride == [u64::from(k), 1],
+            "NVFP4 dequant output mismatch"
+        );
+        disjoint(&codes, &dst.0)?;
+        disjoint(&scale, &dst.0)?;
+        super::contracts::no_overlap(&global_scale, &dst.0, "NVFP4 global scale", "output")?;
+        let pairs = u64::from(n) * u64::from(k / 2);
+        unsafe {
+            stream
+                .launch_builder(&self.dequant)
+                .arg(&codes.ptr)
+                .arg(&scale.ptr)
+                .arg(&global_scale.ptr)
+                .arg(&dst.0.ptr)
+                .arg(&(n as i32))
+                .arg(&(k as i32))
+                .launch(super::ops::grid(
+                    pairs.div_ceil(256).min(65535) as usize,
+                    256,
+                ))?;
+        }
+        Ok(())
+    }
+
+    pub fn small_gemm(
+        &self,
+        stream: &Arc<CudaStream>,
+        codes: Tensor<u8, 2>,
+        scale: Tensor<u8, 2>,
+        global_scale: Tensor<f32, 1>,
+        x: Tensor<bf16, 2>,
+        y: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let [n, k] = validate_nvfp4(&codes, &scale, &global_scale)?;
+        validate_call([n, k], x, &y.0)?;
+        self.require_rows(x.shape[0] as usize)?;
+        disjoint(&codes, &y.0)?;
+        disjoint(&scale, &y.0)?;
+        super::contracts::no_overlap(&global_scale, &y.0, "NVFP4 global scale", "output")?;
+        unsafe {
+            stream
+                .launch_builder(&self.small[x.shape[0] as usize - 1])
+                .arg(&codes.ptr)
+                .arg(&scale.ptr)
+                .arg(&global_scale.ptr)
+                .arg(&x.ptr)
+                .arg(&y.0.ptr)
+                .arg(&(n as i32))
+                .arg(&(k as i32))
+                .launch(super::ops::grid(n.div_ceil(4) as usize, 128))?;
+        }
+        Ok(())
+    }
 }
 pub(crate) struct Fp8Ops {
     quant_block_f32: CudaFunction,
@@ -841,33 +992,142 @@ impl WeightCatalog {
                     buffer, stream, *offset, shape, stride,
                 )?))
             }
-            super::weights::StoredTensor::Bytes(w) => {
-                ensure!(
-                    entry.dtype == safetensors::Dtype::F8_E4M3,
-                    "native linear weight is not FP8: {name}"
-                );
-                let scale_name = entry
-                    .scale_name
-                    .as_ref()
-                    .context("FP8 scale descriptor missing")?;
-                let layout = self
-                    .linear_format
-                    .fp8_layout()
-                    .context("FP8 tensor declared as BF16")?;
-                let scale = self.fp8_scale_ref(scale_name, stream)?;
-                let (wp, _rw) = w.device_ptr(stream);
-                ensure!(
-                    w.len() == entry.bytes,
-                    "FP8 code upload extent mismatch: {name}"
-                );
-                let codes = unsafe { Tensor::new(wp, shape, stride, entry.bytes as u64)? };
-                scale.validate(&codes, layout)?;
-                Ok(LinearWeightRef::Fp8 {
-                    layout,
-                    codes,
-                    scale,
-                })
-            }
+            super::weights::StoredTensor::Bytes(w) => match entry.dtype {
+                safetensors::Dtype::F8_E4M3 => {
+                    let scale_name = entry
+                        .scale_name
+                        .as_ref()
+                        .context("FP8 scale descriptor missing")?;
+                    let layout = self
+                        .linear_format
+                        .fp8_layout()
+                        .context("FP8 tensor declared as non-FP8")?;
+                    let scale = self.fp8_scale_ref(scale_name, stream)?;
+                    let (wp, _rw) = w.device_ptr(stream);
+                    ensure!(
+                        w.len() == entry.bytes,
+                        "FP8 code upload extent mismatch: {name}"
+                    );
+                    let codes = unsafe { Tensor::new(wp, shape, stride, entry.bytes as u64)? };
+                    scale.validate(&codes, layout)?;
+                    Ok(LinearWeightRef::Fp8 {
+                        layout,
+                        codes,
+                        scale,
+                    })
+                }
+                safetensors::Dtype::U8 => {
+                    ensure!(
+                        self.linear_format == crate::model_spec::LinearFormat::NvFp4,
+                        "NVFP4 tensor declared as {:?}",
+                        self.linear_format
+                    );
+                    let stem = name
+                        .strip_suffix(".weight")
+                        .with_context(|| format!("invalid NVFP4 weight name: {name}"))?;
+                    let scale_name = entry
+                        .scale_name
+                        .as_ref()
+                        .context("NVFP4 scale descriptor missing")?;
+                    ensure!(
+                        scale_name == &format!("{stem}.weight_scale"),
+                        "NVFP4 scale descriptor mismatch: {name}"
+                    );
+                    let scale_entry = self.manifest.entries.get(scale_name).with_context(|| {
+                        format!("NVFP4 scale missing from manifest: {scale_name}")
+                    })?;
+                    ensure!(
+                        scale_entry.dtype == safetensors::Dtype::F8_E4M3
+                            && scale_entry.shape.len() == 2,
+                        "NVFP4 scale must be 2D E4M3: {scale_name}"
+                    );
+                    let scale_shape = [
+                        u32::try_from(scale_entry.shape[0])?,
+                        u32::try_from(scale_entry.shape[1])?,
+                    ];
+                    let super::weights::StoredTensor::Bytes(sw) = self
+                        .tensors
+                        .get(scale_name)
+                        .with_context(|| format!("NVFP4 scale not uploaded: {scale_name}"))?
+                    else {
+                        anyhow::bail!("NVFP4 scale not uploaded as bytes: {scale_name}");
+                    };
+                    ensure!(
+                        sw.len() == scale_entry.bytes,
+                        "NVFP4 scale upload extent mismatch: {scale_name}"
+                    );
+                    let ws2_name = format!("{stem}.weight_scale_2");
+                    let ws2_entry = self
+                        .manifest
+                        .entries
+                        .get(&ws2_name)
+                        .with_context(|| format!("NVFP4 weight_scale_2 missing: {ws2_name}"))?;
+                    ensure!(
+                        ws2_entry.dtype == safetensors::Dtype::F32
+                            && ws2_entry.shape.iter().product::<usize>() == 1
+                            && ws2_entry.bytes == size_of::<f32>(),
+                        "NVFP4 weight_scale_2 must be scalar F32: {ws2_name}"
+                    );
+                    let super::weights::StoredTensor::Bytes(gs) =
+                        self.tensors.get(&ws2_name).with_context(|| {
+                            format!("NVFP4 weight_scale_2 not uploaded: {ws2_name}")
+                        })?
+                    else {
+                        anyhow::bail!("NVFP4 weight_scale_2 not uploaded as bytes: {ws2_name}");
+                    };
+                    ensure!(
+                        gs.len() == size_of::<f32>(),
+                        "NVFP4 weight_scale_2 upload extent mismatch: {ws2_name}"
+                    );
+                    let in_scale_name = format!("{stem}.input_scale");
+                    let in_scale_entry =
+                        self.manifest.entries.get(&in_scale_name).with_context(|| {
+                            format!("NVFP4 input_scale missing: {in_scale_name}")
+                        })?;
+                    ensure!(
+                        in_scale_entry.dtype == safetensors::Dtype::F32
+                            && in_scale_entry.shape.iter().product::<usize>() == 1
+                            && in_scale_entry.bytes == size_of::<f32>(),
+                        "NVFP4 input_scale must be scalar F32: {in_scale_name}"
+                    );
+                    let super::weights::StoredTensor::Bytes(in_s) =
+                        self.tensors.get(&in_scale_name).with_context(|| {
+                            format!("NVFP4 input_scale not uploaded: {in_scale_name}")
+                        })?
+                    else {
+                        anyhow::bail!("NVFP4 input_scale not uploaded as bytes: {in_scale_name}");
+                    };
+                    ensure!(
+                        in_s.len() == size_of::<f32>(),
+                        "NVFP4 input_scale upload extent mismatch: {in_scale_name}"
+                    );
+                    ensure!(
+                        w.len() == entry.bytes,
+                        "NVFP4 code upload extent mismatch: {name}"
+                    );
+                    let (wp, _rw) = w.device_ptr(stream);
+                    let (sp, _rs) = sw.device_ptr(stream);
+                    let (gp, _rg) = gs.device_ptr(stream);
+                    let codes = unsafe { Tensor::new(wp, shape, stride, entry.bytes as u64)? };
+                    let scale = unsafe {
+                        Tensor::new(
+                            sp,
+                            scale_shape,
+                            [u64::from(scale_shape[1]), 1],
+                            scale_entry.bytes as u64,
+                        )?
+                    };
+                    let global_scale =
+                        unsafe { Tensor::new(gp, [1], [1], size_of::<f32>() as u64)? };
+                    validate_nvfp4(&codes, &scale, &global_scale)?;
+                    Ok(LinearWeightRef::NvFp4 {
+                        codes,
+                        scale,
+                        global_scale,
+                    })
+                }
+                other => anyhow::bail!("unsupported native linear weight dtype {other:?}: {name}"),
+            },
         }
     }
 }
@@ -975,6 +1235,7 @@ impl NativeProjection {
     ) -> Result<()> {
         let shape = match self.weight {
             LinearWeightRef::Fp8 { codes, .. } => codes.shape,
+            LinearWeightRef::NvFp4 { codes, .. } => [codes.shape[0], codes.shape[1] * 2],
             LinearWeightRef::Bf16(weight) => weight.shape,
         };
         validate_call(shape, x, &y.0)?;
@@ -1193,10 +1454,10 @@ impl LayerLinearPlan {
                     scale: Fp8ScaleRef::F32(_),
                     ..
                 } => None,
-                LinearWeightRef::Fp8 { .. } => {
+                LinearWeightRef::Fp8 { .. } | LinearWeightRef::NvFp4 { .. } => {
                     let LinearWeightRef::Bf16(w) = plan.weight(
                         name,
-                        arena.context("FP8 layer has no materialization arena")?,
+                        arena.context("quantized layer has no materialization arena")?,
                     )?
                     else {
                         unreachable!()
@@ -1342,7 +1603,12 @@ impl LayerLinearPlan {
                     input: weight.shape[1] as usize,
                 })?;
             }
-            if rows as usize > p.invariant_rows {
+            let direct_bound = if matches!(p.resident, LinearWeightRef::NvFp4 { .. }) {
+                crate::linear_plan::MAX_SKINNY_ROWS
+            } else {
+                p.invariant_rows
+            };
+            if rows as usize > direct_bound {
                 blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
             }
         }
@@ -1383,16 +1649,25 @@ impl LayerLinearPlan {
         stream: &Arc<CudaStream>,
     ) -> Result<()> {
         for (weight, dst) in &mut self.materialize {
-            let LinearWeightRef::Fp8 {
-                codes,
-                scale,
-                layout,
-            } = *weight
-            else {
-                anyhow::bail!("materialization source requires an FP8 weight");
-            };
-            blas.fp8_ops()?
-                .materialize(stream, codes, scale, layout, dst)?;
+            match *weight {
+                LinearWeightRef::Fp8 {
+                    codes,
+                    scale,
+                    layout,
+                } => blas
+                    .fp8_ops()?
+                    .materialize(stream, codes, scale, layout, dst)?,
+                LinearWeightRef::NvFp4 {
+                    codes,
+                    scale,
+                    global_scale,
+                } => blas
+                    .nvfp4_ops()?
+                    .materialize(stream, codes, scale, global_scale, dst)?,
+                LinearWeightRef::Bf16(_) => {
+                    anyhow::bail!("materialization source requires a quantized weight")
+                }
+            }
         }
         Ok(())
     }
@@ -1436,8 +1711,14 @@ impl LayerLinearPlan {
         #[cfg(feature = "rocm")]
         let weight = p.resident;
         #[cfg(feature = "cuda")]
+        let direct_rows = if matches!(p.resident, LinearWeightRef::NvFp4 { .. }) {
+            1..=crate::linear_plan::MAX_SKINNY_ROWS
+        } else {
+            blas.direct_fp8_rows()
+        };
+        #[cfg(feature = "cuda")]
         let weight = if phase == crate::op_contract::ExecutionPhase::Prefill
-            && !blas.direct_fp8_rows().contains(&(x.shape[0] as usize))
+            && !direct_rows.contains(&(x.shape[0] as usize))
         {
             LinearWeightRef::Bf16(p.prefill.context("native projection was not bound")?)
         } else {
@@ -2052,11 +2333,14 @@ mod tests {
                 Fp8ScaleLayout::Block(_) => "FP8_BLOCK",
                 Fp8ScaleLayout::PerChannel => "FP8_PER_CHANNEL",
             },
+            LinearWeightRef::NvFp4 { .. } => "NVFP4",
         };
         let stream = &device.stream;
         let materialized = match weight {
             LinearWeightRef::Bf16(_) => None,
-            LinearWeightRef::Fp8 { .. } => Some(stream.alloc_zeros::<bf16>(n * k)?),
+            LinearWeightRef::Fp8 { .. } | LinearWeightRef::NvFp4 { .. } => {
+                Some(stream.alloc_zeros::<bf16>(n * k)?)
+            }
         };
         let prefill = match weight {
             LinearWeightRef::Bf16(w) => w,
@@ -2074,6 +2358,22 @@ mod tests {
                 )?);
                 blas.fp8_ops()?
                     .materialize(stream, codes, scale, layout, &mut output)?;
+                output.read()
+            }
+            LinearWeightRef::NvFp4 {
+                codes,
+                scale,
+                global_scale,
+            } => {
+                let mut output = TensorMut(view(
+                    materialized.as_ref().context("NVFP4 test arena missing")?,
+                    stream,
+                    0,
+                    [n as u32, k as u32],
+                    [k as u64, 1],
+                )?);
+                blas.nvfp4_ops()?
+                    .materialize(stream, codes, scale, global_scale, &mut output)?;
                 output.read()
             }
         };
@@ -3725,5 +4025,454 @@ mod tests {
             fc1_blocks.len() / 18
         );
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU window required"]
+    #[cfg(feature = "cuda")]
+    fn nvfp4_dequant_gemv_skinny_lt_and_controls_gpu() -> Result<()> {
+        use crate::backend::cuda::contracts::view;
+        use crate::fp8::{nvfp4_effective_weight, nvfp4_linear_reference};
+
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let root = std::env::temp_dir().join(format!("ff-nvfp4-gate-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+
+        let result = (|| -> Result<()> {
+            let device = Device::new(0)?;
+            let stream = &device.stream;
+            let ops = Ops::new(&device.ctx)?;
+            let mut blas = Blas::new(
+                &device,
+                &ops,
+                &root,
+                Rc::new(Closure::new(false, "nvfp4 linear gate A".into())),
+            )?;
+            blas.enable_nvfp4(&device.ctx)?;
+            blas.bind_invariant(&device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
+
+            let finite_scales: Vec<u8> = (0u16..=255)
+                .map(|v| v as u8)
+                .filter(|&s| (s & 0x7f) != 0x7f)
+                .collect();
+            let ex_n = finite_scales.len();
+            let packed_row: [u8; 8] =
+                std::array::from_fn(|i| ((2 * i) as u8) | (((2 * i + 1) as u8) << 4));
+            let ex_codes_host: Vec<u8> = (0..ex_n).flat_map(|_| packed_row).collect();
+            let ex_codes_dev = stream.clone_htod(&ex_codes_host)?;
+            let ex_scales_dev = stream.clone_htod(&finite_scales)?;
+            let ex_out_dev = stream.alloc_zeros::<bf16>(ex_n * 16)?;
+            for ws2 in [0.002_929_687_5f32, 0.013_183_594, 0.123_456_79, 1.0] {
+                let ws2_dev = stream.clone_htod(&[ws2])?;
+                let mut out_view =
+                    TensorMut(view(&ex_out_dev, stream, 0, [ex_n as u32, 16], [16, 1])?);
+                blas.nvfp4_ops()?.materialize(
+                    stream,
+                    view(&ex_codes_dev, stream, 0, [ex_n as u32, 8], [8, 1])?,
+                    view(&ex_scales_dev, stream, 0, [ex_n as u32, 1], [1, 1])?,
+                    view(&ws2_dev, stream, 0, [1], [1])?,
+                    &mut out_view,
+                )?;
+                let got = stream.clone_dtoh(&ex_out_dev)?;
+                for (r, &s_code) in finite_scales.iter().enumerate() {
+                    for c in 0..16usize {
+                        let want = nvfp4_effective_weight(c as u8, s_code, ws2);
+                        ensure!(
+                            got[r * 16 + c].to_bits() == want.to_bits(),
+                            "exhaustive nvfp4_dequant mismatch r={r} c={c} ws2={ws2}"
+                        );
+                    }
+                }
+            }
+
+            let mut defects = 0usize;
+            for (n, k) in [(67usize, 48usize), (1024, 5120), (256, 6144), (512, 17408)] {
+                let codes_host: Vec<u8> = (0..n * (k / 2))
+                    .map(|i| {
+                        let lo = ((i * 37 + (i / (k / 2)) * 71) % 16) as u8;
+                        let hi = ((i * 97 + (i / (k / 2)) * 131 + 5) % 16) as u8;
+                        lo | (hi << 4)
+                    })
+                    .collect();
+                let scales_host: Vec<u8> = (0..n * (k / 16))
+                    .map(|i| {
+                        let exp = 5u8 + ((i * 29 + 3) % 4) as u8;
+                        let mant = ((i * 53 + 1) % 8) as u8;
+                        let sign = if (i * 17) % 11 == 0 { 0x80u8 } else { 0u8 };
+                        sign | (exp << 3) | mant
+                    })
+                    .collect();
+                let ws2 = 0.003_906_25f32;
+                let codes_dev = stream.clone_htod(&codes_host)?;
+                let scales_dev = stream.clone_htod(&scales_host)?;
+                let ws2_dev = stream.clone_htod(&[ws2])?;
+                let weight = LinearWeightRef::NvFp4 {
+                    codes: view(
+                        &codes_dev,
+                        stream,
+                        0,
+                        [n as u32, (k / 2) as u32],
+                        [(k / 2) as u64, 1],
+                    )?,
+                    scale: view(
+                        &scales_dev,
+                        stream,
+                        0,
+                        [n as u32, (k / 16) as u32],
+                        [(k / 16) as u64, 1],
+                    )?,
+                    global_scale: view(&ws2_dev, stream, 0, [1], [1])?,
+                };
+                defects += invariant_rows(&device, &blas, &ops, weight, (n, k))?;
+            }
+            ensure!(defects == 0, "nvfp4 invariant_rows defects={defects}");
+
+            let (n, k, rows) = (256usize, 5120usize, 32usize);
+            let codes_host: Vec<u8> = (0..n * (k / 2))
+                .map(|i| {
+                    let lo = ((i * 41 + 3) % 16) as u8;
+                    let hi = ((i * 83 + 9) % 16) as u8;
+                    lo | (hi << 4)
+                })
+                .collect();
+            let scales_host: Vec<u8> = (0..n * (k / 16))
+                .map(|i| {
+                    let exp = 5u8 + ((i * 31) % 3) as u8;
+                    let mant = ((i * 19 + 2) % 8) as u8;
+                    let sign = if (i * 23) % 7 == 0 { 0x80u8 } else { 0u8 };
+                    sign | (exp << 3) | mant
+                })
+                .collect();
+            let ws2 = 0.002_929_687_5f32;
+            let weight_host: Vec<bf16> = (0..n)
+                .flat_map(|r| {
+                    let row_codes = &codes_host[r * (k / 2)..(r + 1) * (k / 2)];
+                    let row_scales = &scales_host[r * (k / 16)..(r + 1) * (k / 16)];
+                    (0..k).map(move |c| {
+                        let byte = row_codes[c / 2];
+                        let nib = if c % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                        nvfp4_effective_weight(nib, row_scales[c / 16], ws2)
+                    })
+                })
+                .collect();
+            let x_host: Vec<bf16> = (0..rows * k)
+                .map(|i| bf16::from_f32((((i * 43 + (i / k) * 67) % 251) as f32 - 125.0) / 128.0))
+                .collect();
+            let ref_m32 = nvfp4_linear_reference(&weight_host, &x_host, k)?;
+
+            let name = "model.language_model.layers.0.mlp.gate_proj.weight".to_owned();
+            let scale_name = "model.language_model.layers.0.mlp.gate_proj.weight_scale".to_owned();
+            let ws2_name = "model.language_model.layers.0.mlp.gate_proj.weight_scale_2".to_owned();
+            let in_scale_name =
+                "model.language_model.layers.0.mlp.gate_proj.input_scale".to_owned();
+            let mk_entry = |dtype, shape: Vec<usize>, bytes, role: &str, sname| {
+                crate::checkpoint::TensorEntry {
+                    dtype,
+                    shape,
+                    shard: "model.safetensors".into(),
+                    bytes,
+                    load: true,
+                    data_start: 1024,
+                    data_offsets: [0, bytes as u64],
+                    scope: crate::checkpoint::TensorScope::Text,
+                    layer: Some(0),
+                    role: role.into(),
+                    scale_name: sname,
+                    quant: None,
+                    swap_halves: false,
+                }
+            };
+            let total_bytes = codes_host.len() + scales_host.len() + 8;
+            let small_manifest = TensorManifest {
+                entries: [
+                    (
+                        name.clone(),
+                        mk_entry(
+                            safetensors::Dtype::U8,
+                            vec![n, k / 2],
+                            codes_host.len(),
+                            "mlp.gate_proj.weight",
+                            Some(scale_name.clone()),
+                        ),
+                    ),
+                    (
+                        scale_name.clone(),
+                        mk_entry(
+                            safetensors::Dtype::F8_E4M3,
+                            vec![n, k / 16],
+                            scales_host.len(),
+                            "mlp.gate_proj.weight_scale",
+                            None,
+                        ),
+                    ),
+                    (
+                        ws2_name.clone(),
+                        mk_entry(
+                            safetensors::Dtype::F32,
+                            vec![],
+                            4,
+                            "mlp.gate_proj.weight_scale_2",
+                            None,
+                        ),
+                    ),
+                    (
+                        in_scale_name.clone(),
+                        mk_entry(
+                            safetensors::Dtype::F32,
+                            vec![],
+                            4,
+                            "mlp.gate_proj.input_scale",
+                            None,
+                        ),
+                    ),
+                ]
+                .into(),
+                resident_bytes: total_bytes,
+            };
+            let dequant_plan = crate::linear_plan::LayerDequantPlan::from_manifest(
+                &small_manifest,
+                0,
+                crate::model_spec::LinearFormat::NvFp4,
+            )?;
+            let catalog = WeightCatalog {
+                #[cfg(feature = "cuda")]
+                dense: None,
+                linear_format: crate::model_spec::LinearFormat::NvFp4,
+                tensors: [
+                    (
+                        name.clone(),
+                        StoredTensor::Bytes(stream.clone_htod(&codes_host)?),
+                    ),
+                    (
+                        scale_name,
+                        StoredTensor::Bytes(stream.clone_htod(&scales_host)?),
+                    ),
+                    (
+                        ws2_name,
+                        StoredTensor::Bytes(stream.clone_htod(&ws2.to_le_bytes())?),
+                    ),
+                    (
+                        in_scale_name,
+                        StoredTensor::Bytes(stream.clone_htod(&1.0f32.to_le_bytes())?),
+                    ),
+                ]
+                .into(),
+                manifest: small_manifest,
+                bytes: total_bytes,
+                upload_content_sha256: None,
+                upload_hashed_bytes: None,
+                load_wall_ms: 0.0,
+                classic: None,
+            };
+            let arena = stream.alloc_zeros::<u8>(dequant_plan.bytes as usize)?;
+            let scratch = Scratch {
+                ptr: arena.device_ptr(stream).0,
+                bytes: arena.len() as u64,
+            };
+            let mut layer = LayerLinearPlan::bind(&dequant_plan, &catalog, Some(&scratch), stream)?;
+            layer.prepare(&blas, rows as u32)?;
+            let x_dev = stream.clone_htod(&x_host)?;
+            let y_dev = stream.alloc_zeros::<bf16>(rows * n)?;
+            for &m in &[1usize, 8, 12, 32] {
+                if m > crate::linear_plan::MAX_SKINNY_ROWS {
+                    layer.materialize(&blas, stream)?;
+                }
+                let mut y_view = TensorMut(view(
+                    &y_dev,
+                    stream,
+                    0,
+                    [m as u32, n as u32],
+                    [n as u64, 1],
+                )?);
+                layer.run(
+                    &blas,
+                    "mlp.gate_proj.weight",
+                    if m == 1 {
+                        ExecutionPhase::Decode
+                    } else {
+                        ExecutionPhase::Prefill
+                    },
+                    view(&x_dev, stream, 0, [m as u32, k as u32], [k as u64, 1])?,
+                    &mut y_view,
+                )?;
+                let got = stream.clone_dtoh(&y_dev)?;
+                let total = m * n;
+                let mut bit_mismatches = 0usize;
+                let mut max_abs = 0.0f32;
+                let mut sum_sq = 0.0f64;
+                for i in 0..total {
+                    if got[i].to_bits() != ref_m32[i].to_bits() {
+                        bit_mismatches += 1;
+                    }
+                    let d = (got[i].to_f32() - ref_m32[i].to_f32()).abs();
+                    max_abs = max_abs.max(d);
+                    sum_sq += f64::from(d) * f64::from(d);
+                }
+                let rmse = (sum_sq / total as f64).sqrt() as f32;
+                if m <= crate::linear_plan::MAX_SKINNY_ROWS {
+                    ensure!(
+                        bit_mismatches == 0,
+                        "nvfp4 M={m} direct kernel bit_mismatches={bit_mismatches}/{total}"
+                    );
+                } else {
+                    ensure!(
+                        max_abs <= 0.03125 && rmse <= 0.004,
+                        "nvfp4 M={m} numerical bound exceeded: max_abs={max_abs} rmse={rmse}"
+                    );
+                }
+                println!(
+                    "PASS NVFP4_GATE_A m={m} bit_mismatches={bit_mismatches}/{total} max_abs={max_abs:.6} rmse={rmse:.6}"
+                );
+            }
+
+            let swapped_codes: Vec<u8> = codes_host.iter().map(|&b| b.rotate_left(4)).collect();
+            let swapped_dev = stream.clone_htod(&swapped_codes)?;
+            let scales_dev = stream.clone_htod(&scales_host)?;
+            let ws2_dev = stream.clone_htod(&[ws2])?;
+            let mut bad_y = TensorMut(view(&y_dev, stream, 0, [1, n as u32], [n as u64, 1])?);
+            blas.linear_typed_bound(
+                ExecutionPhase::Decode,
+                LinearWeightRef::NvFp4 {
+                    codes: view(
+                        &swapped_dev,
+                        stream,
+                        0,
+                        [n as u32, (k / 2) as u32],
+                        [(k / 2) as u64, 1],
+                    )?,
+                    scale: view(
+                        &scales_dev,
+                        stream,
+                        0,
+                        [n as u32, (k / 16) as u32],
+                        [(k / 16) as u64, 1],
+                    )?,
+                    global_scale: view(&ws2_dev, stream, 0, [1], [1])?,
+                },
+                view(&x_dev, stream, 0, [1, k as u32], [k as u64, 1])?,
+                &mut bad_y,
+                crate::linear_plan::MAX_SKINNY_ROWS,
+            )?;
+            let bad_got = stream.clone_dtoh(&y_dev)?;
+            let swap_bit_mismatches = (0..n)
+                .filter(|&i| bad_got[i].to_bits() != ref_m32[i].to_bits())
+                .count();
+            ensure!(
+                swap_bit_mismatches >= 240,
+                "nibble-swap control escaped: swap_bit_mismatches={swap_bit_mismatches}/{n}"
+            );
+
+            let bad_ws2_dev = stream.clone_htod(&[ws2 * 1.25])?;
+            let codes_dev = stream.clone_htod(&codes_host)?;
+            let mut bad_ws2_y = TensorMut(view(&y_dev, stream, 0, [1, n as u32], [n as u64, 1])?);
+            blas.linear_typed_bound(
+                ExecutionPhase::Decode,
+                LinearWeightRef::NvFp4 {
+                    codes: view(
+                        &codes_dev,
+                        stream,
+                        0,
+                        [n as u32, (k / 2) as u32],
+                        [(k / 2) as u64, 1],
+                    )?,
+                    scale: view(
+                        &scales_dev,
+                        stream,
+                        0,
+                        [n as u32, (k / 16) as u32],
+                        [(k / 16) as u64, 1],
+                    )?,
+                    global_scale: view(&bad_ws2_dev, stream, 0, [1], [1])?,
+                },
+                view(&x_dev, stream, 0, [1, k as u32], [k as u64, 1])?,
+                &mut bad_ws2_y,
+                crate::linear_plan::MAX_SKINNY_ROWS,
+            )?;
+            let bad_ws2_got = stream.clone_dtoh(&y_dev)?;
+            let ws2_bit_mismatches = (0..n)
+                .filter(|&i| bad_ws2_got[i].to_bits() != ref_m32[i].to_bits())
+                .count();
+            ensure!(
+                ws2_bit_mismatches >= 240,
+                "ws2 perturbation control escaped: ws2_bit_mismatches={ws2_bit_mismatches}/{n}"
+            );
+            println!(
+                "PASS NVFP4_GATE_A_CONTROLS swap_bit_mismatches={swap_bit_mismatches}/{n} ws2_bit_mismatches={ws2_bit_mismatches}/{n}"
+            );
+
+            if let Ok(golden_path) = std::env::var("FF_H3_IMAGE_PE_ORACLE_GOLDEN") {
+                let bytes = std::fs::read(&golden_path)?;
+                let st = safetensors::SafeTensors::deserialize(&bytes)?;
+                for key in [
+                    "lm_head",
+                    "model__language_model__layers__0__linear_attn__in_proj_qkv",
+                    "model__language_model__layers__3__mlp__down_proj",
+                    "model__language_model__layers__3__self_attn__q_proj",
+                ] {
+                    let w_t = st.tensor(&format!("{key}__weight"))?;
+                    let ws_t = st.tensor(&format!("{key}__weight_scale"))?;
+                    let ws2_t = st.tensor(&format!("{key}__weight_scale_2"))?;
+                    let ref_t = st.tensor(&format!("{key}__modelopt_bf16"))?;
+                    let r_rows = ref_t.shape()[0];
+                    let r_k = ref_t.shape()[1];
+                    let w_dev = stream.clone_htod(w_t.data())?;
+                    let ws_dev = stream.clone_htod(ws_t.data())?;
+                    let ws2_val = f32::from_le_bytes(ws2_t.data()[..4].try_into()?);
+                    let ws2_d = stream.clone_htod(&[ws2_val])?;
+                    let out_d = stream.alloc_zeros::<bf16>(r_rows * r_k)?;
+                    let mut out_v = TensorMut(view(
+                        &out_d,
+                        stream,
+                        0,
+                        [r_rows as u32, r_k as u32],
+                        [r_k as u64, 1],
+                    )?);
+                    blas.nvfp4_ops()?.materialize(
+                        stream,
+                        view(
+                            &w_dev,
+                            stream,
+                            0,
+                            [r_rows as u32, (r_k / 2) as u32],
+                            [(r_k / 2) as u64, 1],
+                        )?,
+                        view(
+                            &ws_dev,
+                            stream,
+                            0,
+                            [r_rows as u32, (r_k / 16) as u32],
+                            [(r_k / 16) as u64, 1],
+                        )?,
+                        view(&ws2_d, stream, 0, [1], [1])?,
+                        &mut out_v,
+                    )?;
+                    let got_bf16 = stream.clone_dtoh(&out_d)?;
+                    let want_bf16: Vec<bf16> = ref_t
+                        .data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
+                        .collect();
+                    let diff_bits = got_bf16
+                        .iter()
+                        .zip(&want_bf16)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    ensure!(
+                        diff_bits == 0,
+                        "real-row CUDA dequant vs ModelOpt mismatch on {key}: diff_bits={diff_bits}"
+                    );
+                }
+                println!("PASS NVFP4_GATE_A_REAL_ORACLE_ROWS diff_bits=0");
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&root);
+        result
     }
 }
