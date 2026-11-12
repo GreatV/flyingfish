@@ -300,7 +300,9 @@ pub fn write_png(writer: impl Write, width: usize, height: usize, rgb: &[u8]) ->
     let mut encoder = png::Encoder::new(writer, width, height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.write_header()?.write_image_data(rgb)?;
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgb)?;
+    writer.finish()?;
     Ok(())
 }
 
@@ -397,7 +399,7 @@ pub fn write_y4m(
     ensure!(fps.0 > 0 && fps.1 > 0, "invalid Y4M frame rate");
     writeln!(
         writer,
-        "YUV4MPEG2 W{width} H{height} F{}:{} Ip A1:1 C420jpeg",
+        "YUV4MPEG2 W{width} H{height} F{}:{} Ip A1:1 C420jpeg XCOLORRANGE=FULL",
         fps.0, fps.1
     )?;
     let chroma_pixels = pixels / 4;
@@ -602,6 +604,40 @@ mod tests {
         assert_eq!(info.bit_depth, png::BitDepth::Eight);
         assert_eq!(&decoded[..info.buffer_size()], pixels);
         assert!(write_png(Vec::new(), 2, 1, &pixels[..5]).is_err());
+        let mut valid = Vec::new();
+        write_png(&mut valid, 2, 1, &pixels)?;
+        struct FinalWriteFailure {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        impl Write for FinalWriteFailure {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                if self.bytes.len() + buffer.len() > self.limit {
+                    return Err(std::io::Error::other("injected final PNG write failure"));
+                }
+                self.bytes.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_png(
+            &mut FinalWriteFailure {
+                bytes: Vec::new(),
+                limit: valid.len() - 4,
+            },
+            2,
+            1,
+            &pixels,
+        )
+        .expect_err("final PNG write failure must propagate")
+        .to_string();
+        assert!(
+            error.contains("injected final PNG write failure"),
+            "{error}"
+        );
         Ok(())
     }
 
@@ -646,7 +682,7 @@ mod tests {
         let video = [red.repeat(4), mixed].concat();
         let mut bytes = Vec::new();
         write_y4m(&mut bytes, 2, 2, (24, 1), 2, &video)?;
-        let header = b"YUV4MPEG2 W2 H2 F24:1 Ip A1:1 C420jpeg\n";
+        let header = b"YUV4MPEG2 W2 H2 F24:1 Ip A1:1 C420jpeg XCOLORRANGE=FULL\n";
         assert!(bytes.starts_with(header));
         let frame_bytes = 6 + 4 + 1 + 1;
         assert_eq!(bytes.len(), header.len() + 2 * frame_bytes);
@@ -704,11 +740,40 @@ mod tests {
             .collect();
         let mut encoded = Vec::new();
         write_y4m(&mut encoded, width, height, (24, 1), frames, &video)?;
-        let header_len = b"YUV4MPEG2 W4 H2 F24:1 Ip A1:1 C420jpeg\n".len();
+        let header_len = b"YUV4MPEG2 W4 H2 F24:1 Ip A1:1 C420jpeg XCOLORRANGE=FULL\n".len();
         assert_eq!(
             &encoded[header_len + 6..header_len + 6 + 12],
             &[0, 0, 3, 3, 0, 0, 3, 3, 128, 130, 128, 127]
         );
+        let raw_y4m = directory.join("input.y4m");
+        std::fs::write(&raw_y4m, encoded)?;
+        let raw_decoded = tool_stdout(
+            "Y4M test decode",
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-i",
+                raw_y4m.to_str().context("test Y4M path")?,
+                "-map",
+                "0:v:0",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
+            ],
+            Duration::from_secs(60),
+            video.len() + 1,
+        )?;
+        assert_eq!(raw_decoded.len(), video.len());
+        let raw_delta = raw_decoded
+            .iter()
+            .zip(&video)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .context("decoded Y4M is empty")?;
+        assert!(raw_delta <= 2, "raw Y4M RGB max delta {raw_delta}");
         mux_mp4(
             &output,
             Y4mVideo {
