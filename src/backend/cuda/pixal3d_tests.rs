@@ -2533,6 +2533,524 @@ fn hi3d_flow_sparse_convolutions_gpu() -> Result<()> {
     gate.finish()
 }
 
+#[cfg(feature = "cuda")]
+fn sparse_gather_pattern(i: usize, raw: bool) -> f16 {
+    if raw && i.is_multiple_of(19) {
+        f16::from_bits([0, 0x8000, 1, 0x8001, 0x7bff, 0xfbff][i / 19 % 6])
+    } else {
+        f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 512.0)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn sparse_gather_case(
+    d: &Device,
+    blas: &Blas,
+    shape: [usize; 4],
+    range: [usize; 2],
+    raw: bool,
+    control: bool,
+) -> Result<usize> {
+    use cudarc::driver::sys;
+    let [sites, ci, co, tile] = shape;
+    let [first, rows] = range;
+    ensure!(first + rows <= sites && rows <= tile, "sparse gate range");
+    let width = 27 * ci;
+    let guard = f16::from_f32(-123.0);
+    let bank = Rc::new(d.stream.alloc_zeros::<f16>(tile * width + 8)?);
+    let lattice = SparseSites::new(
+        (0..sites)
+            .map(|i| {
+                [
+                    0,
+                    (i / 4096) as i32,
+                    ((i / 64) % 64) as i32,
+                    (i % 64) as i32,
+                ]
+            })
+            .collect(),
+    )?;
+    let mut conv = SparseConv::shared(d, &lattice, ci, bank.clone())?;
+    let mut maps = (0..sites)
+        .map(|row| {
+            std::array::from_fn(|tap| {
+                if (row + tap) % 11 == 0 {
+                    -1
+                } else {
+                    ((row * 131 + tap * 17 + 3) % sites) as i32
+                }
+            })
+        })
+        .collect::<Vec<[i32; 27]>>();
+    maps[first][0] = -1;
+    maps[first][1] = 0;
+    maps[first][2] = (sites - 1) as i32;
+    maps[first][3] = (sites - 1) as i32;
+    conv.replace_neighbours(&maps)?;
+    let mut scalar = SparseConv::shared(d, &lattice, ci, bank.clone())?;
+    scalar.replace_neighbours(&maps)?;
+    scalar.set_gather_reference(true)?;
+    let input = d.stream.clone_htod(
+        &(0..sites * ci)
+            .map(|i| sparse_gather_pattern(i, raw))
+            .collect::<Vec<_>>(),
+    )?;
+    let output = d.stream.alloc_zeros::<f16>(sites * co + 16)?;
+    let bias = d.stream.clone_htod(
+        &(0..co)
+            .map(|i| sparse_gather_pattern(i + 313, false))
+            .collect::<Vec<_>>(),
+    )?;
+    let weight = d.stream.clone_htod(
+        &(0..co * width)
+            .map(|i| sparse_gather_pattern(i + 977, false))
+            .collect::<Vec<_>>(),
+    )?;
+    let guard_device = d.stream.clone_htod(&[guard])?;
+    let fill = cubin::module(&d.ctx, "q38_common")?.load_function("q38_bias_fill_f16")?;
+    let reset = || -> Result<()> {
+        for (address, count) in [(ptr(&bank, d), bank.len()), (ptr(&output, d), output.len())] {
+            unsafe {
+                d.stream
+                    .launch_builder(&fill)
+                    .arg(&address)
+                    .arg(&guard_device)
+                    .arg(&(count as u64))
+                    .arg(&1u32)
+                    .launch(flat(count))?;
+            }
+        }
+        Ok(())
+    };
+    let y = view(
+        &output,
+        &d.stream,
+        8 + first * co,
+        [rows as u32, co as u32],
+        [co as u64, 1],
+    )?;
+    let b = dense(&bias, d, [co as u32])?;
+    let w = matrix(ptr(&weight, d), co, width)?;
+    let x = matrix(ptr(&bank, d), rows, width)?;
+    let gemm = || -> Result<()> {
+        if !raw {
+            blas.linear_f16(w, x, &mut TensorMut(y), true)?;
+        }
+        Ok(())
+    };
+    let snapshot = || -> Result<Vec<Vec<f16>>> {
+        let columns = d.stream.clone_dtoh(bank.as_ref())?;
+        let values = d.stream.clone_dtoh(&output)?;
+        ensure!(
+            columns[rows * width..].iter().all(|v| *v == guard)
+                && values[..8 + first * co]
+                    .iter()
+                    .chain(&values[8 + (first + rows) * co..])
+                    .all(|v| *v == guard),
+            "sparse gather canary overwritten"
+        );
+        ensure!(
+            columns.iter().chain(&values).all(|v| v.is_finite()),
+            "nonfinite sparse gather"
+        );
+        Ok(vec![columns, values])
+    };
+    reset()?;
+    scalar.prepare(&input, b, y, range)?;
+    let expected = snapshot()?;
+    for (i, value) in expected[0][..rows * width].iter().enumerate() {
+        let source = maps[first + i / width][i % width / ci];
+        let reference = if source < 0 {
+            f16::ZERO
+        } else {
+            sparse_gather_pattern(source as usize * ci + i % ci, raw)
+        };
+        ensure!(
+            value.to_bits() == reference.to_bits(),
+            "invalid scalar gather reference"
+        );
+    }
+    for (i, value) in expected[1][8 + first * co..8 + (first + rows) * co]
+        .iter()
+        .enumerate()
+    {
+        ensure!(
+            value.to_bits() == sparse_gather_pattern(i % co + 313, false).to_bits(),
+            "invalid bias reference"
+        );
+    }
+    gemm()?;
+    let expected_output = d.stream.clone_dtoh(&output)?;
+    let mut defects = 0;
+    reset()?;
+    conv.prepare(&input, b, y, range)?;
+    let column_bias_bits = producer_snapshot_bits(&expected, &snapshot()?)?;
+    gemm()?;
+    let bits = |a: &[f16], b: &[f16]| -> u64 {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+            .sum()
+    };
+    let output_bits = bits(&expected_output, &d.stream.clone_dtoh(&output)?);
+    defects += usize::from(column_bias_bits != 0 || output_bits != 0);
+    let mut signatures = Vec::new();
+    for reference in [true, false] {
+        let selected = if reference { &scalar } else { &conv };
+        for full in [false, true] {
+            reset()?;
+            d.finish_upload()?;
+            d.stream
+                .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            selected.prepare(&input, b, y, range)?;
+            if full {
+                gemm()?;
+            }
+            let graph = d
+                .stream
+                .end_capture(sys::CUgraphInstantiate_flags(0))?
+                .context("sparse graph missing")?;
+            let resources = producer_graph_resources(&graph)?;
+            let prep = resources
+                .iter()
+                .filter(|r| r["phase"] == "sparse_gather" || r["phase"] == "bias_fill")
+                .collect::<Vec<_>>();
+            let vector = ci.is_multiple_of(8) && !reference;
+            ensure!(
+                prep.len() == if vector { 1 } else { 2 },
+                "sparse prep launch count differs"
+            );
+            let gather = prep
+                .iter()
+                .find(|r| r["phase"] == "sparse_gather")
+                .context("sparse graph gather missing")?;
+            ensure!(
+                gather["function"]
+                    == if vector {
+                        "sparse_gather_bias_f16x8"
+                    } else {
+                        "sparse_gather_f16"
+                    }
+                    && gather["block"] == serde_json::json!([256, 1, 1])
+                    && gather["dynamic_shared_bytes"] == 0
+                    && gather["local_bytes"] == 0,
+                "sparse graph binding/resources differ"
+            );
+            let groups = if vector {
+                (rows * width / 8).max(rows * co)
+            } else {
+                rows * width
+            };
+            ensure!(
+                gather["grid"] == serde_json::json!([groups.div_ceil(256), 1, 1]),
+                "sparse graph grid differs"
+            );
+            graph.launch()?;
+            let graph_bits = if full {
+                let values = snapshot()?;
+                bits(&expected[0], &values[0]) + bits(&expected_output, &values[1])
+            } else {
+                producer_snapshot_bits(&expected, &snapshot()?)?
+            };
+            ensure!(
+                !reference || graph_bits == 0,
+                "scalar sparse graph reference differs"
+            );
+            defects += usize::from(graph_bits != 0);
+            println!(
+                "{} F16_VECTOR_GATHER_GRAPH shape={shape:?} range={range:?} reference={reference} full={full} raw={raw} bits={graph_bits} threshold_bits=0 resources={}",
+                if graph_bits == 0 { "PASS" } else { "DEFECT" },
+                serde_json::json!(resources)
+            );
+            if full {
+                signatures.push(resources);
+            }
+        }
+    }
+    let select = |r: &[Value], phase: &str| {
+        r.iter()
+            .filter(|v| v["phase"] == phase)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    ensure!(
+        select(&signatures[0], "vendor") == select(&signatures[1], "vendor"),
+        "sparse vendor GEMM changed"
+    );
+    let old = select(&signatures[0], "sparse_gather");
+    let new = select(&signatures[1], "sparse_gather");
+    ensure!(
+        new[0]["active_warps"].as_u64() >= old[0]["active_warps"].as_u64(),
+        "sparse gather loses resident warps"
+    );
+    if control {
+        maps[first][13] = if maps[first][13] == 0 { 1 } else { 0 };
+        conv.replace_neighbours(&maps)?;
+        reset()?;
+        conv.prepare(&input, b, y, range)?;
+        let actual = snapshot()?;
+        let start = 13 * ci;
+        let margin = bits(
+            &expected[0][start..start + ci],
+            &actual[0][start..start + ci],
+        );
+        let unchanged = bits(&expected[0][..start], &actual[0][..start])
+            + bits(&expected[0][start + ci..], &actual[0][start + ci..])
+            + bits(&expected[1], &actual[1]);
+        defects += usize::from(margin == 0 || unchanged != 0);
+        println!(
+            "{} F16_VECTOR_GATHER_CONTROL wrong_neighbour=true margin_bits={margin} unaffected_bits={unchanged}",
+            if margin > 0 && unchanged == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        maps[first][13] = -2;
+        ensure!(
+            conv.replace_neighbours(&maps).is_err(),
+            "invalid sparse neighbour accepted"
+        );
+        maps[first][13] = sites as i32;
+        ensure!(
+            conv.replace_neighbours(&maps).is_err(),
+            "out-of-bounds sparse neighbour accepted"
+        );
+        ensure!(
+            matrix::<f16>(ptr(&input, d) + 2, 1, ci).is_err(),
+            "unaligned sparse view accepted"
+        );
+    }
+    println!(
+        "{} F16_VECTOR_GATHER_IDENTITY shape={shape:?} range={range:?} raw={raw} column_bias_bits={column_bias_bits} output_bits={output_bits} defects={defects} threshold_bits=0 eager_graph=true",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    Ok(defects)
+}
+
+#[test]
+#[ignore]
+#[cfg(feature = "cuda")]
+fn f16_sparse_gather_identity_gpu() -> Result<()> {
+    let d = Device::new(0)?;
+    let ops = Ops::new(&d.ctx)?;
+    let runtime = env_path("FLYINGFISH_RUNTIME_DIR")?;
+    let blas = Blas::new(
+        &d,
+        &ops,
+        &runtime,
+        Rc::new(Closure::new(false, "sparse gather identity".into())),
+    )?;
+    let mut defects = 0;
+    defects += promoted_sparse_pair(&d, &blas, f16::from_f32, f16::to_f32)?;
+    defects += promoted_sparse_pair(&d, &blas, f16::from_f32, |x: f32| x)?;
+    defects += promoted_sparse_pair(&d, &blas, |x: f32| x, f16::to_f32)?;
+    defects += promoted_sparse_pair(&d, &blas, |x: f32| x, |x: f32| x)?;
+    let mut cells = 0;
+    for ci in [1, 7, 8, 9, 15, 16, 128, 256, 512, 1024, 1056, 4224] {
+        for (co, tile, first, rows) in [(128, 17, 0, 17), (13, 8, 8, 7)] {
+            defects += sparse_gather_case(
+                &d,
+                &blas,
+                [33, ci, co, tile],
+                [first, rows],
+                false,
+                ci == 8 && first == 0,
+            )?;
+            cells += 1;
+        }
+    }
+    for (shape, range) in [
+        ([1, 8, 1, 1], [0, 1]),
+        ([33, 8, 7, 32], [0, 32]),
+        ([258, 256, 1056, 257], [0, 257]),
+        ([258, 4224, 128, 257], [257, 1]),
+        ([99928, 4224, 128, 257], [99671, 257]),
+        ([99928, 128, 128, 127], [127, 127]),
+    ] {
+        defects += sparse_gather_case(&d, &blas, shape, range, false, false)?;
+        cells += 1;
+    }
+    defects += sparse_gather_case(&d, &blas, [33, 128, 13, 8], [8, 7], true, false)?;
+    cells += 1;
+    let sm = cubin::capability(&d.ctx)?;
+    ensure!(
+        matches!(sm, 86 | 89),
+        "sparse gate architecture {sm} unqualified"
+    );
+    if sm == 89 {
+        for range in [[0, 18829], [18829, 9]] {
+            defects +=
+                sparse_gather_case(&d, &blas, [18838, 4224, 128, 18829], range, false, false)?;
+            cells += 1;
+        }
+    }
+    println!(
+        "F16_VECTOR_GATHER_RESULT sm={sm} cells={cells} controls=1 max_tile={} defects={defects} threshold_bits=0 timing=false",
+        sm == 89
+    );
+    ensure!(
+        defects == 0 && cells == if sm == 89 { 33 } else { 31 },
+        "sparse gather candidate defects"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn promoted_sparse_pair<I, O>(
+    d: &Device,
+    blas: &Blas,
+    encode: fn(f32) -> I,
+    decode: fn(O) -> f32,
+) -> Result<usize>
+where
+    I: DeviceRepr + Copy + 'static,
+    O: DeviceRepr + crate::backend::gpu::ValidAsZeroBits + Copy + 'static,
+{
+    use cudarc::driver::sys;
+    let mut defects = 0;
+    for ci in [9, 16] {
+        let (co, sites, tile) = (13, 17, 8);
+        let lattice = SparseSites::new((0..sites).map(|i| [0, i as i32, 0, 0]).collect())?;
+        let map = lattice.neighbours_3x3()?;
+        let input_host = (0..sites * ci)
+            .map(|i| sparse_gather_pattern(i, false).to_f32())
+            .collect::<Vec<_>>();
+        let input = d
+            .stream
+            .clone_htod(&input_host.iter().copied().map(encode).collect::<Vec<_>>())?;
+        let output = d.stream.alloc_zeros::<O>(sites * co)?;
+        let expected = d.stream.alloc_zeros::<O>(sites * co)?;
+        let weight = d.stream.clone_htod(
+            &(0..co * 27 * ci)
+                .map(|i| sparse_gather_pattern(i + 977, false).to_f32())
+                .collect::<Vec<_>>(),
+        )?;
+        let bias = d.stream.clone_htod(
+            &(0..co)
+                .map(|i| sparse_gather_pattern(i + 313, false).to_f32())
+                .collect::<Vec<_>>(),
+        )?;
+        let budget = sites * 108 + tile * (27 * 17 + co) * 4;
+        let conv = SparseConv::<f32>::promoted(d, &lattice, [17, co], budget)?;
+        let weight = matrix(ptr(&weight, d), co, 27 * ci)?;
+        let b = dense(&bias, d, [co as u32])?;
+        let run = || {
+            conv.run_promoted(
+                blas,
+                matrix::<I>(ptr(&input, d), sites, ci)?,
+                weight,
+                b,
+                &mut TensorMut(matrix::<O>(ptr(&output, d), sites, co)?),
+            )
+        };
+        run()?;
+        let store = cubin::module(&d.ctx, "vision_ops")?.load_function(if size_of::<O>() == 2 {
+            "sparse_conv_store_f16"
+        } else {
+            "sparse_conv_store_f32"
+        })?;
+        for first in (0..sites).step_by(tile) {
+            let rows = tile.min(sites - first);
+            let columns = (0..rows * 27 * ci)
+                .map(|i| {
+                    let source = map[first + i / (27 * ci)][i % (27 * ci) / ci];
+                    if source < 0 {
+                        0.0
+                    } else {
+                        input_host[source as usize * ci + i % ci]
+                    }
+                })
+                .collect::<Vec<_>>();
+            let columns = d.stream.clone_htod(&columns)?;
+            let product = d.stream.alloc_zeros::<f32>(rows * co)?;
+            blas.linear_f32(
+                weight,
+                matrix(ptr(&columns, d), rows, 27 * ci)?,
+                &mut TensorMut(matrix(ptr(&product, d), rows, co)?),
+            )?;
+            unsafe {
+                d.stream
+                    .launch_builder(&store)
+                    .arg(&product)
+                    .arg(&b.ptr)
+                    .arg(&expected)
+                    .arg(&(first as u64))
+                    .arg(&(rows as u32))
+                    .arg(&(co as u32))
+                    .launch(flat(rows * co))?;
+            }
+        }
+        let reference = d.stream.clone_dtoh(&expected)?;
+        let bits = |actual: &[O]| -> Result<u64> {
+            ensure!(
+                reference.len() == actual.len()
+                    && reference
+                        .iter()
+                        .chain(actual)
+                        .all(|&v| decode(v).is_finite()),
+                "promoted sparse extent/nonfinite failure"
+            );
+            Ok(reference
+                .iter()
+                .zip(actual)
+                .map(|(&a, &b)| u64::from((decode(a).to_bits() ^ decode(b).to_bits()).count_ones()))
+                .sum())
+        };
+        let eager_bits = bits(&d.stream.clone_dtoh(&output)?)?;
+        d.finish_upload()?;
+        d.stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        run()?;
+        let graph = d
+            .stream
+            .end_capture(sys::CUgraphInstantiate_flags(0))?
+            .context("promoted sparse graph missing")?;
+        let resources = producer_graph_resources(&graph)?;
+        let gather = if size_of::<I>() == 2 {
+            "sparse_gather_f16_to_f32"
+        } else {
+            "sparse_gather_f32"
+        };
+        ensure!(
+            resources.iter().filter(|r| r["function"] == gather).count() == 3
+                && resources
+                    .iter()
+                    .filter(|r| r["function"]
+                        == if size_of::<O>() == 2 {
+                            "sparse_conv_store_f16"
+                        } else {
+                            "sparse_conv_store_f32"
+                        })
+                    .count()
+                    == 3
+                && resources
+                    .iter()
+                    .all(|r| r["function"] != "sparse_gather_bias_f16x8"),
+            "promoted sparse binding changed"
+        );
+        graph.launch()?;
+        let graph_bits = bits(&d.stream.clone_dtoh(&output)?)?;
+        ensure!(
+            reference.iter().all(|&v| decode(v).is_finite()),
+            "nonfinite promoted reference"
+        );
+        println!(
+            "{} F16_VECTOR_GATHER_PROMOTED input={} output={} actual_Ci={ci} reserved_Ci=17 Co=13 rows=17 tile=8 eager_bits={eager_bits} graph_bits={graph_bits} threshold_bits=0 resources={}",
+            if eager_bits == 0 && graph_bits == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            },
+            std::any::type_name::<I>(),
+            std::any::type_name::<O>(),
+            serde_json::json!(resources)
+        );
+        defects += usize::from(eager_bits != 0 || graph_bits != 0);
+    }
+    Ok(defects)
+}
+
 #[test]
 #[ignore = "requires frozen Heun common inputs; CUDA"]
 fn hi3d_heun_updates_gpu() -> Result<()> {
@@ -5693,6 +6211,7 @@ fn flow_padded_identity(
     defects: &mut usize,
 ) -> Result<()> {
     let compact = flow.device.stream.clone_dtoh(output)?;
+    flow_gather_identity(flow, input, condition, output, &compact, defects)?;
     flow_attention_identity(flow, input, condition, output, &compact, defects)?;
     flow.flash.set_f16_reference(2)?;
     let CrossAttention::F16(cross) = &mut flow.cross else {
@@ -5752,6 +6271,49 @@ fn flow_padded_identity(
     *defects += usize::from(bits != 0);
     flow_context_identity(flow, input, condition, output, &compact, defects)?;
     flow_bias_identity(flow, input, condition, output, &compact, defects)
+}
+
+pub(super) fn flow_gather_identity(
+    flow: &mut Flow<f16>,
+    input: &CudaSlice<f32>,
+    condition: &Conditioning<f16>,
+    output: &mut CudaSlice<f32>,
+    compact: &[f32],
+    defects: &mut usize,
+) -> Result<()> {
+    let io = flow.io.as_mut().context("sparse flow IO missing")?;
+    for block in &mut io.blocks {
+        for conv in &mut block.conv {
+            conv.set_gather_reference(true)?;
+        }
+    }
+    let result = flow.forward(input, 0, condition, output);
+    for block in &mut flow.io.as_mut().context("sparse flow IO missing")?.blocks {
+        for conv in &mut block.conv {
+            conv.set_gather_reference(false)?;
+        }
+    }
+    result?;
+    let separate = flow.device.stream.clone_dtoh(output)?;
+    ensure!(
+        compact.len() == separate.len() && compact.iter().chain(&separate).all(|x| x.is_finite()),
+        "nonfinite vector gather velocity comparison"
+    );
+    let bits: u64 = compact
+        .iter()
+        .zip(&separate)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_VECTOR_GATHER_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} cached={} threshold_bits=0",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len(),
+        flow.context_cache.is_some()
+    );
+    *defects += usize::from(bits != 0);
+    flow.device.stream.memcpy_htod(compact, output)?;
+    Ok(())
 }
 
 pub(super) fn flow_attention_identity(
@@ -11498,6 +12060,22 @@ fn producer_graph_resources(graph: &cudarc::driver::CudaGraph) -> Result<Vec<Val
         unsafe {
             let mut kind = N::CU_GRAPH_NODE_TYPE_EMPTY;
             sys::cuGraphNodeGetType(node, &mut kind).result()?;
+            if kind == N::CU_GRAPH_NODE_TYPE_MEMSET {
+                let mut params = std::mem::MaybeUninit::uninit();
+                sys::cuGraphMemsetNodeGetParams(node, params.as_mut_ptr()).result()?;
+                let params = params.assume_init();
+                ensure!(
+                    params.dst != 0
+                        && matches!(params.elementSize, 1 | 2 | 4)
+                        && params.width > 0
+                        && params.height > 0,
+                    "vendor graph memset invalid"
+                );
+                result.push(serde_json::json!({"kind":"memset","phase":"vendor",
+                    "value":params.value,"element_size":params.elementSize,
+                    "width":params.width,"height":params.height,"pitch":params.pitch}));
+                continue;
+            }
             if kind != N::CU_GRAPH_NODE_TYPE_KERNEL {
                 ensure!(
                     matches!(
@@ -11523,6 +12101,7 @@ fn producer_graph_resources(graph: &cudarc::driver::CudaGraph) -> Result<Vec<Val
             let name = std::ffi::CStr::from_ptr(name).to_str()?;
             let phase = match name {
                 "q38_bias_fill_f16" => "bias_fill",
+                "sparse_gather_f16" | "sparse_gather_bias_f16x8" => "sparse_gather",
                 "layer_norm_modulate_f16"
                 | "gated_add_layer_norm_f16"
                 | "residual_layer_norm_modulate_f16"

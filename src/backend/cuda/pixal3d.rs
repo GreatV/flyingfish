@@ -1950,6 +1950,8 @@ impl Flow<f16> {
         let mut bias_defects = 0;
         #[cfg(test)]
         let mut attention_defects = 0;
+        #[cfg(test)]
+        let mut gather_defects = 0;
         let negative_values = state
             .negative
             .as_mut()
@@ -1967,6 +1969,14 @@ impl Flow<f16> {
                 #[cfg(test)]
                 if step == 0 && stage == 0 {
                     let compact = self.device.stream.clone_dtoh(&state.positive)?;
+                    tests::flow_gather_identity(
+                        self,
+                        input,
+                        positive,
+                        &mut state.positive,
+                        &compact,
+                        &mut gather_defects,
+                    )?;
                     tests::flow_attention_identity(
                         self,
                         input,
@@ -2097,6 +2107,17 @@ impl Flow<f16> {
                 self.context_cache.is_some()
             );
             ensure!(attention_defects == 0, "sampler Q reuse defects");
+            println!(
+                "{} F16_VECTOR_GATHER_SAMPLER_IDENTITY input_rows={rows} parent_rows={} enabled={} defects={gather_defects} threshold_bits=0 timing=false",
+                if gather_defects == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                },
+                self.rows,
+                self.context_cache.is_some()
+            );
+            ensure!(gather_defects == 0, "sampler vector gather defects");
         }
         Ok(values)
     }

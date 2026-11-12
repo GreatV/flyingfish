@@ -1434,6 +1434,34 @@ extern "C" __global__ void sparse_gather_f16(
     }
 }
 
+extern "C" __global__ void sparse_gather_bias_f16x8(
+    const __half* x, const int32_t* neighbours, __half* columns,
+    const __half* bias, __half* output, uint32_t sites, uint32_t channels,
+    uint32_t first, uint32_t rows, uint32_t out_channels) {
+    if (!vision_flat_launch() || !x || !neighbours || !columns || !bias || !output ||
+        !sites || !channels || channels % 8 || !rows || !out_channels ||
+        uint64_t(first) + rows > sites ||
+        ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(columns)) & 15)) {
+        __trap(); return;
+    }
+    const uint64_t groups = channels / 8, width = 27 * groups;
+    const uint64_t begin = uint64_t(blockIdx.x) * 256 + threadIdx.x;
+    const uint64_t step = uint64_t(gridDim.x) * 256;
+    const uint4* input = reinterpret_cast<const uint4*>(x);
+    uint4* bank = reinterpret_cast<uint4*>(columns);
+    for (uint64_t i = begin; i < uint64_t(rows) * width; i += step) {
+        const uint32_t row = first + uint32_t(i / width);
+        const uint32_t tap = uint32_t((i % width) / groups);
+        const uint32_t channel = uint32_t(i % groups);
+        const int32_t source = neighbours[uint64_t(row) * 27 + tap];
+        if (source < -1 || (source >= 0 && uint32_t(source) >= sites)) { __trap(); return; }
+        bank[i] = source < 0 ? make_uint4(0, 0, 0, 0) : input[uint64_t(source) * groups + channel];
+    }
+    for (uint64_t i = begin; i < uint64_t(rows) * out_channels; i += step) {
+        output[i] = bias[i % out_channels];
+    }
+}
+
 template<class T>
 __device__ __forceinline__ void sparse_gather_promoted(
     const T* x, const int32_t* neighbours, float* columns,

@@ -919,6 +919,7 @@ pub struct SparseConv<T = f16> {
     neighbours: CudaSlice<i32>,
     columns: Rc<CudaSlice<T>>,
     gather: CudaFunction,
+    vectorized: bool,
     bias: CudaFunction,
     half_gather: Option<CudaFunction>,
     half_store: Option<CudaFunction>,
@@ -976,11 +977,17 @@ impl SparseConv {
         ensure!(tile > 0, "sparse gather cannot fit one row");
         let maps = sites.neighbours_3x3()?;
         let neighbours = device.stream.clone_htod(maps.as_flattened())?;
+        let vectorized = channels.is_multiple_of(8);
         Ok(Self {
             device: device.clone(),
             neighbours,
             columns,
-            gather: cubin::module(&device.ctx, "vision_ops")?.load_function("sparse_gather_f16")?,
+            gather: cubin::module(&device.ctx, "vision_ops")?.load_function(if vectorized {
+                "sparse_gather_bias_f16x8"
+            } else {
+                "sparse_gather_f16"
+            })?,
+            vectorized,
             bias: cubin::module(&device.ctx, "q38_common")?.load_function("q38_bias_fill_f16")?,
             half_gather: None,
             half_store: None,
@@ -1030,20 +1037,19 @@ impl SparseConv {
         no_overlap(&input_view, &output_view, "sparse input", "sparse output")?;
         no_overlap(&weight, &output_view, "sparse weight", "sparse output")?;
         no_overlap(&bias, &output_view, "sparse bias", "sparse output")?;
+        let bank = view(
+            &self.columns,
+            stream,
+            0,
+            [self.tile as u32, width as u32],
+            [width as u64, 1],
+        )?;
+        no_overlap(&bank, &input_view, "sparse bank", "sparse input")?;
+        no_overlap(&bank, &output_view, "sparse bank", "sparse output")?;
+        no_overlap(&bank, &weight, "sparse bank", "sparse weight")?;
+        no_overlap(&bank, &bias, "sparse bank", "sparse bias")?;
         for first in (0..self.rows).step_by(self.tile) {
             let rows = self.tile.min(self.rows - first);
-            unsafe {
-                stream
-                    .launch_builder(&self.gather)
-                    .arg(input)
-                    .arg(&self.neighbours)
-                    .arg(self.columns.as_ref())
-                    .arg(&(self.rows as u32))
-                    .arg(&(self.channels as u32))
-                    .arg(&(first as u32))
-                    .arg(&(rows as u32))
-                    .launch(flat(rows * width))?;
-            }
             let x = view(
                 &self.columns,
                 stream,
@@ -1058,17 +1064,67 @@ impl SparseConv {
                 [rows as u32, out as u32],
                 [out as u64, 1],
             )?;
-            unsafe {
+            self.prepare(input, bias, y, [first, rows])?;
+            blas.linear_f16(weight, x, &mut TensorMut(y), true)?;
+        }
+        Ok(())
+    }
+    pub(super) fn prepare(
+        &self,
+        input: &CudaSlice<f16>,
+        bias: Tensor<f16, 1>,
+        output: Tensor<f16, 2>,
+        range: [usize; 2],
+    ) -> Result<()> {
+        let [first, rows] = range;
+        let out = output.shape[1] as usize;
+        let sites = self.rows as u32;
+        let channels = self.channels as u32;
+        let first = first as u32;
+        let tile_rows = rows as u32;
+        let out_channels = out as u32;
+        let stream = &self.device.stream;
+        unsafe {
+            let mut gather = stream.launch_builder(&self.gather);
+            gather
+                .arg(input)
+                .arg(&self.neighbours)
+                .arg(self.columns.as_ref());
+            if self.vectorized {
+                gather.arg(&bias.ptr).arg(&output.ptr);
+            }
+            gather
+                .arg(&sites)
+                .arg(&channels)
+                .arg(&first)
+                .arg(&tile_rows);
+            if self.vectorized {
+                gather
+                    .arg(&out_channels)
+                    .launch(flat((rows * 27 * self.channels / 8).max(rows * out)))?;
+            } else {
+                gather.launch(flat(rows * 27 * self.channels))?;
                 stream
                     .launch_builder(&self.bias)
-                    .arg(&y.ptr)
+                    .arg(&output.ptr)
                     .arg(&bias.ptr)
                     .arg(&((rows * out) as u64))
                     .arg(&(out as u32))
                     .launch(flat(rows * out))?;
             }
-            blas.linear_f16(weight, x, &mut TensorMut(y), true)?;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_gather_reference(&mut self, reference: bool) -> Result<()> {
+        self.vectorized = self.channels.is_multiple_of(8) && !reference;
+        self.gather =
+            cubin::module(&self.device.ctx, "vision_ops")?.load_function(if self.vectorized {
+                "sparse_gather_bias_f16x8"
+            } else {
+                "sparse_gather_f16"
+            })?;
         Ok(())
     }
 }
@@ -1135,6 +1191,7 @@ impl SparseConv<f32> {
             neighbours,
             columns,
             gather: module.load_function("sparse_gather_f32")?,
+            vectorized: false,
             bias: module.load_function("sparse_conv_store_f32")?,
             half_gather: Some(module.load_function("sparse_gather_f16_to_f32")?),
             half_store: Some(module.load_function("sparse_conv_store_f16")?),
