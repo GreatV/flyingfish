@@ -9,6 +9,7 @@ pub(crate) fn dense_prompt_bytes(
     capacity: usize,
     chunk: usize,
     kv: crate::kv::KvFormat,
+    direct_max_rows: usize,
 ) -> Result<usize> {
     ensure!(
         capacity > 0 && chunk > 0 && chunk <= capacity,
@@ -21,7 +22,7 @@ pub(crate) fn dense_prompt_bytes(
                 | crate::model_spec::LinearFormat::NvFp4
         )
         || kv != crate::kv::KvFormat::Bf16
-        || chunk <= crate::mtp::MAX_VERIFY_ROWS
+        || chunk <= direct_max_rows
         || capacity == chunk
     {
         return Ok(0);
@@ -413,16 +414,17 @@ mod tests {
         assert_eq!(model.hidden, 5120);
         let gdn = GdnSpec::from_model(&model)?;
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model)?.row_bytes()?;
+        let direct_fp8 = crate::mtp::MAX_VERIFY_ROWS;
         for (capacity, expected) in [(1024, 20_971_520), (4096, 83_886_080), (16384, 335_544_320)] {
             let chunk = capacity / 2;
-            let bytes = dense_prompt_bytes(&model, capacity, chunk, KvFormat::Bf16)?;
+            let bytes = dense_prompt_bytes(&model, capacity, chunk, KvFormat::Bf16, direct_fp8)?;
             assert_eq!(bytes, expected);
             assert_eq!(
-                dense_prompt_bytes(&model, capacity, capacity, KvFormat::Bf16)?,
+                dense_prompt_bytes(&model, capacity, capacity, KvFormat::Bf16, direct_fp8)?,
                 0
             );
             assert_eq!(
-                dense_prompt_bytes(&model, capacity, chunk, KvFormat::Affine8)?,
+                dense_prompt_bytes(&model, capacity, chunk, KvFormat::Affine8, direct_fp8)?,
                 0
             );
             let workspace = |rows| {
@@ -461,13 +463,32 @@ mod tests {
                 "PASS dense_prompt_capacity capacity={capacity} chunk={chunk} layout=[2,{capacity},5120] prompt_bytes={bytes} planned_transient_bytes={live} boundary_minus_one_rejected=true"
             );
         }
-        assert!(dense_prompt_bytes(&model, usize::MAX, 32, KvFormat::Bf16).is_err());
-        assert!(dense_prompt_bytes(&model, 32, 33, KvFormat::Bf16).is_err());
+        assert!(dense_prompt_bytes(&model, usize::MAX, 32, KvFormat::Bf16, direct_fp8).is_err());
+        assert!(dense_prompt_bytes(&model, 32, 33, KvFormat::Bf16, direct_fp8).is_err());
         model.linear_format = LinearFormat::Bf16;
-        assert_eq!(dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16)?, 0);
+        assert_eq!(
+            dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16, direct_fp8)?,
+            0
+        );
         model.linear_format = LinearFormat::NvFp4;
         assert_eq!(
-            dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16)?,
+            dense_prompt_bytes(&model, 16384, 384, KvFormat::Bf16, 384)?,
+            0
+        );
+        assert_eq!(
+            dense_prompt_bytes(&model, 16384, 512, KvFormat::Bf16, 384)?,
+            335_544_320
+        );
+        assert_eq!(
+            dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16, 384)?,
+            335_544_320
+        );
+        assert_eq!(
+            dense_prompt_bytes(&model, 16384, 128, KvFormat::Bf16, 147)?,
+            0
+        );
+        assert_eq!(
+            dense_prompt_bytes(&model, 16384, 256, KvFormat::Bf16, 147)?,
             335_544_320
         );
         let root = serde_json::from_str(include_str!("../tests/data/minicpm-config.json"))?;
@@ -476,7 +497,7 @@ mod tests {
         moe.linear_format = LinearFormat::Fp8E4m3Channel;
         for capacity in [1024, 4096, 16384] {
             assert_eq!(
-                dense_prompt_bytes(&moe, capacity, capacity / 2, KvFormat::Bf16)?,
+                dense_prompt_bytes(&moe, capacity, capacity / 2, KvFormat::Bf16, direct_fp8)?,
                 0
             );
         }

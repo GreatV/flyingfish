@@ -3658,8 +3658,12 @@ impl Engine {
             Some(fixed) => fixed,
             None => setup_kv()?,
         };
+        let (ops, mut blas) = match early_blas {
+            Some(fixed) => fixed,
+            None => setup_blas()?,
+        };
         #[cfg(feature = "cuda")]
-        let arena_bytes = (0..model_spec.layers.len())
+        let max_dequant_bytes = (0..model_spec.layers.len())
             .map(|i| {
                 LayerDequantPlan::from_model(&catalog.manifest, i as u32, &model_spec)
                     .map(|p| p.bytes)
@@ -3669,15 +3673,27 @@ impl Engine {
             .max()
             .context("missing Q38 layers")?;
         #[cfg(feature = "rocm")]
-        let arena_bytes = 0u64;
-        let arena = if arena_bytes == 0 {
+        let max_dequant_bytes = 0u64;
+        #[cfg(feature = "cuda")]
+        let mut arena_bytes = if model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4
+        {
+            0u64
+        } else {
+            max_dequant_bytes
+        };
+        #[cfg(feature = "rocm")]
+        let arena_bytes = max_dequant_bytes;
+        #[cfg(feature = "cuda")]
+        let mut arena = if arena_bytes == 0 {
             None
         } else {
             Some(s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?)
         };
-        let (ops, mut blas) = match early_blas {
-            Some(fixed) => fixed,
-            None => setup_blas()?,
+        #[cfg(feature = "rocm")]
+        let arena = if arena_bytes == 0 {
+            None
+        } else {
+            Some(s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?)
         };
         let mut draft = if let Some(draft_config) = &draft_config {
             let path = settings
@@ -3846,34 +3862,94 @@ impl Engine {
                     )
                     .context("Q38 combined workspace overflow")
             };
-            let initial = crate::prefill::WorkspaceBudget::new(request, workspace, |admitted| {
-                Ok(default_chunk(admitted))
-            })?;
-            dense_prompt_bytes = crate::prefill::dense_prompt_bytes(
-                &model_spec,
-                capacity,
-                initial.plan.chunk,
-                settings.kv_format,
-            )?;
-            dense_budget = if dense_prompt_bytes == 0 {
-                initial
-            } else {
-                crate::prefill::WorkspaceBudget::new(
-                    crate::prefill::WorkspaceRequest {
-                        fixed_transient_bytes: request.fixed_transient_bytes
-                            .checked_add(dense_prompt_bytes)
-                            .context("dense prefill fixed bytes overflow")?,
-                        ..request
-                    },
-                    workspace,
-                    |admitted| {
-                        ensure!(initial.plan.chunk <= admitted,
-                            "dense prefill prompt buffers cannot preserve chunk {} within {admitted} rows",
-                            initial.plan.chunk);
-                        Ok(initial.plan.chunk)
-                    },
-                ).context("dense prefill prompt-buffer admission")?
+            #[cfg(feature = "cuda")]
+            let prompt_direct_max_rows =
+                if model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4 {
+                    blas.nvfp4_ops()?.direct_max_rows()
+                } else {
+                    crate::linear_plan::MAX_SKINNY_ROWS
+                };
+            #[cfg(not(feature = "cuda"))]
+            let prompt_direct_max_rows = crate::linear_plan::MAX_SKINNY_ROWS;
+            let solve_dense = |req: crate::prefill::WorkspaceRequest| -> Result<(crate::prefill::WorkspaceBudget, usize)> {
+                let initial = crate::prefill::WorkspaceBudget::new(req, workspace, |admitted| {
+                    Ok(default_chunk(admitted))
+                })?;
+                let prompt_bytes = crate::prefill::dense_prompt_bytes(
+                    &model_spec,
+                    capacity,
+                    initial.plan.chunk,
+                    settings.kv_format,
+                    prompt_direct_max_rows,
+                )?;
+                let solved = if prompt_bytes == 0 {
+                    initial
+                } else {
+                    crate::prefill::WorkspaceBudget::new(
+                        crate::prefill::WorkspaceRequest {
+                            fixed_transient_bytes: req
+                                .fixed_transient_bytes
+                                .checked_add(prompt_bytes)
+                                .context("dense prefill fixed bytes overflow")?,
+                            ..req
+                        },
+                        workspace,
+                        |admitted| {
+                            ensure!(
+                                initial.plan.chunk <= admitted,
+                                "dense prefill prompt buffers cannot preserve chunk {} within {admitted} rows",
+                                initial.plan.chunk
+                            );
+                            Ok(initial.plan.chunk)
+                        },
+                    )
+                    .context("dense prefill prompt-buffer admission")?
+                };
+                Ok((solved, prompt_bytes))
             };
+            #[cfg(feature = "cuda")]
+            if model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4 {
+                let dequant_bytes = usize::try_from(max_dequant_bytes)?;
+                let req_with_arena = crate::prefill::WorkspaceRequest {
+                    fixed_transient_bytes: request
+                        .fixed_transient_bytes
+                        .checked_add(dequant_bytes)
+                        .context("NVFP4 arena reservation overflow")?,
+                    ..request
+                };
+                if capacity <= prompt_direct_max_rows
+                    || requested_chunk.is_some_and(|c| c <= prompt_direct_max_rows)
+                {
+                    (dense_budget, dense_prompt_bytes) = solve_dense(request)?;
+                } else if requested_chunk.is_some() {
+                    (dense_budget, dense_prompt_bytes) = solve_dense(req_with_arena)?;
+                    arena_bytes = max_dequant_bytes;
+                    arena = Some(s.alloc_zeros::<u8>(dequant_bytes)?);
+                } else if let Ok((b, p_bytes)) = solve_dense(req_with_arena)
+                    && b.plan.chunk > prompt_direct_max_rows
+                {
+                    dense_budget = b;
+                    dense_prompt_bytes = p_bytes;
+                    arena_bytes = max_dequant_bytes;
+                    arena = Some(s.alloc_zeros::<u8>(dequant_bytes)?);
+                } else {
+                    dense_budget = crate::prefill::WorkspaceBudget::new(
+                        crate::prefill::WorkspaceRequest {
+                            capacity: request.capacity.min(prompt_direct_max_rows),
+                            ..request
+                        },
+                        workspace,
+                        |admitted| Ok(default_chunk(admitted)),
+                    )?;
+                    dense_prompt_bytes = 0;
+                }
+            } else {
+                (dense_budget, dense_prompt_bytes) = solve_dense(request)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                (dense_budget, dense_prompt_bytes) = solve_dense(request)?;
+            }
             &dense_budget
         };
         let chunk = budget.plan.chunk;
@@ -5347,6 +5423,16 @@ impl Engine {
             ExecutionPhase::Prefill
         };
         let linear_rows = q.linear_rows(rows as u32, phase)? as usize;
+        #[cfg(feature = "cuda")]
+        let quant_rows = if self.model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4
+            && self.blas.direct_quant_rows().contains(&rows)
+        {
+            rows
+        } else {
+            linear_rows
+        };
+        #[cfg(feature = "rocm")]
+        let quant_rows = linear_rows;
         if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
             && self.model_spec.layers[i].mixer == Mixer::FullAttention
         {
@@ -6041,8 +6127,8 @@ impl Engine {
                         &self.blas,
                         role,
                         phase,
-                        matrix(&w.n, s, 0, linear_rows, hidden)?,
-                        &mut TensorMut(matrix(&w.qkv, s, offset, linear_rows, width)?),
+                        matrix(&w.n, s, 0, quant_rows, hidden)?,
+                        &mut TensorMut(matrix(&w.qkv, s, offset, quant_rows, width)?),
                     )?;
                 }
                 match phase {
@@ -6215,8 +6301,8 @@ impl Engine {
                     &self.blas,
                     "self_attn.o_proj.weight",
                     phase,
-                    matrix(&w.attn, s, 0, linear_rows, q_width as usize)?,
-                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
+                    matrix(&w.attn, s, 0, quant_rows, q_width as usize)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, quant_rows, hidden)?),
                 )?;
             }
             BoundMixer::Gdn {
@@ -6246,23 +6332,42 @@ impl Engine {
                         [linear_rows, self.workspace_rows, hidden],
                     )?;
                 } else {
-                    for (role, output, offset, width) in [
-                        ("linear_attn.in_proj_qkv.weight", &w.qkv, 0, conv),
-                        ("linear_attn.in_proj_z.weight", &mw.gate, 0, value),
-                        ("linear_attn.in_proj_a.weight", &mw.ab, 0, a_width),
+                    for (role, output, offset, width, proj_rows) in [
+                        (
+                            "linear_attn.in_proj_qkv.weight",
+                            &w.qkv,
+                            0,
+                            conv,
+                            quant_rows,
+                        ),
+                        (
+                            "linear_attn.in_proj_z.weight",
+                            &mw.gate,
+                            0,
+                            value,
+                            quant_rows,
+                        ),
+                        (
+                            "linear_attn.in_proj_a.weight",
+                            &mw.ab,
+                            0,
+                            a_width,
+                            linear_rows,
+                        ),
                         (
                             "linear_attn.in_proj_b.weight",
                             &mw.ab,
                             self.workspace_rows * a_width,
                             hv,
+                            linear_rows,
                         ),
                     ] {
                         layer.linear.run(
                             &self.blas,
                             role,
                             phase,
-                            matrix(&w.n, s, 0, linear_rows, hidden)?,
-                            &mut TensorMut(matrix(output, s, offset, linear_rows, width)?),
+                            matrix(&w.n, s, 0, proj_rows, hidden)?,
+                            &mut TensorMut(matrix(output, s, offset, proj_rows, width)?),
                         )?;
                     }
                 }
@@ -6354,8 +6459,8 @@ impl Engine {
                         "linear_attn.out_proj.weight"
                     },
                     phase,
-                    matrix(&w.attn, s, 0, linear_rows, value)?,
-                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
+                    matrix(&w.attn, s, 0, quant_rows, value)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, quant_rows, hidden)?),
                 )?;
             }
         }
@@ -7003,6 +7108,16 @@ impl Engine {
             ExecutionPhase::Prefill
         };
         let linear_rows = q.linear_rows(rows as u32, phase)? as usize;
+        #[cfg(feature = "cuda")]
+        let quant_rows = if self.model_spec.linear_format == crate::model_spec::LinearFormat::NvFp4
+            && self.blas.direct_quant_rows().contains(&rows)
+        {
+            rows
+        } else {
+            linear_rows
+        };
+        #[cfg(feature = "rocm")]
+        let quant_rows = linear_rows;
         let domain = RowDomain {
             meta: self.state.seq_ref(s)?,
             row_base: 0,
@@ -7398,8 +7513,8 @@ impl Engine {
                             &self.blas,
                             role,
                             phase,
-                            matrix(&w.n, s, 0, linear_rows, h)?,
-                            &mut TensorMut(matrix(&w.gu, s, offset, linear_rows, f)?),
+                            matrix(&w.n, s, 0, quant_rows, h)?,
+                            &mut TensorMut(matrix(&w.gu, s, offset, quant_rows, f)?),
                         )?;
                     }
                 }
@@ -7506,8 +7621,8 @@ impl Engine {
                     &self.blas,
                     "mlp.down_proj.weight",
                     phase,
-                    matrix(&w.act, s, 0, linear_rows, f)?,
-                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
+                    matrix(&w.act, s, 0, quant_rows, f)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, quant_rows, h)?),
                 )?;
                 if let Some(target) = trace
                     .as_mut()
@@ -9585,11 +9700,10 @@ mod tests {
     #[ignore = "GPU window; FF_H3_IMAGE_PE_MODEL, FF_H3_IMAGE_PE_REF_DIR and FLYINGFISH_RUNTIME_DIR required"]
     fn nvfp4_h3_image_pe_layer_and_head_cells_gpu() -> anyhow::Result<()> {
         use super::*;
-        use crate::backend::cuda::{blas::Blas, closure::Closure, contracts::view};
         use crate::backend::{Head, Input, Mask, Operator, Step};
         use crate::model_spec::Mixer;
         use anyhow::{Context, ensure};
-        use std::{env, path::PathBuf, rc::Rc};
+        use std::{env, path::PathBuf};
 
         ensure!(
             env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -9682,119 +9796,36 @@ mod tests {
             let last_ref = &l_ref[(m - 1) * vocab..m * vocab];
             defects += nvfp4_score_cell(&format!("head_last_m{m}"), &last_got, last_ref, tau)?;
 
+            ensure!(
+                engine
+                    .qwen
+                    .as_ref()
+                    .context("Runner FAIL qwen runtime missing")?
+                    .arena
+                    .is_none(),
+                "Runner FAIL chunk=64 NVFP4 engine allocated a materialization arena"
+            );
             let head_ref = engine
                 .qwen
                 .as_ref()
                 .context("Runner FAIL qwen runtime missing")?
                 .head
                 .context("Runner FAIL NVFP4 head missing")?;
-            if m == 8 {
-                let out_m8 = s.alloc_zeros::<bf16>(8 * vocab)?;
+            if m == 8 || m == 32 {
+                let out_m = s.alloc_zeros::<bf16>(m * vocab)?;
                 engine.blas.linear_typed(
                     crate::op_contract::ExecutionPhase::Prefill,
                     head_ref,
-                    matrix(&engine.work.n, &s, 0, 8, hidden)?,
-                    &mut TensorMut(matrix(&out_m8, &s, 0, 8, vocab)?),
+                    matrix(&engine.work.n, &s, 0, m, hidden)?,
+                    &mut TensorMut(matrix(&out_m, &s, 0, m, vocab)?),
                 )?;
                 s.synchronize()?;
-                let got_m8: Vec<f32> = s
-                    .clone_dtoh(&out_m8)?
+                let got_m: Vec<f32> = s
+                    .clone_dtoh(&out_m)?
                     .into_iter()
                     .map(bf16::to_f32)
                     .collect();
-                defects += nvfp4_score_cell("head_logits_m8", &got_m8, &l_ref, tau)?;
-            } else if m == 32 {
-                let LinearWeightRef::NvFp4 {
-                    codes,
-                    scale,
-                    global_scale,
-                } = head_ref
-                else {
-                    anyhow::bail!("Runner FAIL head_ref is not LinearWeightRef::NvFp4");
-                };
-                let arena = engine
-                    .qwen
-                    .as_ref()
-                    .context("Runner FAIL qwen runtime missing")?
-                    .arena
-                    .as_ref()
-                    .context("Runner FAIL NVFP4 arena missing")?;
-                let mut head_blas = Blas::new(
-                    &engine.device,
-                    &engine.ops,
-                    &runtime,
-                    Rc::new(Closure::new(false, "nvfp4 head m32 tile".into())),
-                )?;
-                head_blas.enable_nvfp4(&engine.device.ctx)?;
-                head_blas
-                    .bind_invariant(&engine.device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
-                let tile_cap = 65_536usize;
-                ensure!(
-                    arena.len() >= tile_cap * hidden * 2,
-                    "Runner FAIL arena smaller than 65536x5120 BF16 tile"
-                );
-                let tile_out = s.alloc_zeros::<bf16>(32 * tile_cap)?;
-                let mut got_m32 = vec![0.0f32; 32 * vocab];
-                let mut start = 0usize;
-                while start < vocab {
-                    let tile_rows = tile_cap.min(vocab - start);
-                    let codes_tile = unsafe {
-                        Tensor::new(
-                            codes.ptr + (start * (hidden / 2)) as u64,
-                            [tile_rows as u32, (hidden / 2) as u32],
-                            [(hidden / 2) as u64, 1],
-                            (tile_rows * (hidden / 2)) as u64,
-                        )?
-                    };
-                    let scales_tile = unsafe {
-                        Tensor::new(
-                            scale.ptr + (start * (hidden / 16)) as u64,
-                            [tile_rows as u32, (hidden / 16) as u32],
-                            [(hidden / 16) as u64, 1],
-                            (tile_rows * (hidden / 16)) as u64,
-                        )?
-                    };
-                    let mat_view = unsafe {
-                        let (ptr, _guard) = arena.device_ptr(&s);
-                        Tensor::<bf16, 2>::new(
-                            ptr,
-                            [tile_rows as u32, hidden as u32],
-                            [hidden as u64, 1],
-                            (tile_rows * hidden * 2) as u64,
-                        )?
-                    };
-                    let mut mat_mut = TensorMut(mat_view);
-                    head_blas.nvfp4_ops()?.materialize(
-                        &s,
-                        codes_tile,
-                        scales_tile,
-                        global_scale,
-                        &mut mat_mut,
-                    )?;
-                    head_blas.prepare_fixed(32, tile_rows as u32, hidden as u32)?;
-                    let mut y_tile = TensorMut(view(
-                        &tile_out,
-                        &s,
-                        0,
-                        [32, tile_rows as u32],
-                        [tile_rows as u64, 1],
-                    )?);
-                    head_blas.linear_typed(
-                        crate::op_contract::ExecutionPhase::Prefill,
-                        LinearWeightRef::Bf16(mat_view),
-                        matrix(&engine.work.n, &s, 0, 32, hidden)?,
-                        &mut y_tile,
-                    )?;
-                    s.synchronize()?;
-                    let host_tile = s.clone_dtoh(&tile_out.slice(..32 * tile_rows))?;
-                    for r in 0..32 {
-                        for c in 0..tile_rows {
-                            got_m32[r * vocab + start + c] = host_tile[r * tile_rows + c].to_f32();
-                        }
-                    }
-                    start += tile_rows;
-                }
-                defects += nvfp4_score_cell("head_logits_m32", &got_m32, &l_ref, tau)?;
+                defects += nvfp4_score_cell(&format!("head_logits_m{m}"), &got_m, &l_ref, tau)?;
             }
         }
 
