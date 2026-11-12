@@ -1621,13 +1621,18 @@ mod tests {
                 .collect();
             // Call order from the published schedule: a guided step issues
             // pos then neg (zero context) inside the guidance interval; a
-            // step outside it issues a single pos call.
+            // step outside it issues a single pos call. The texture sampler
+            // runs strength 1.0: one pos call per step, no branch.
             let times = super::super::pixal3d::schedule(true, 12);
             let mut branch: Vec<bool> = Vec::new();
-            for t in &times[..12] {
-                branch.push(false);
-                if (0.6..=1.0).contains(t) {
-                    branch.push(true);
+            if kind == "tex" {
+                branch = vec![false; 12];
+            } else {
+                for t in &times[..12] {
+                    branch.push(false);
+                    if (0.6..=1.0).contains(t) {
+                        branch.push(true);
+                    }
                 }
             }
             ensure!(
