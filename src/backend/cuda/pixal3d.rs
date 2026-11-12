@@ -427,6 +427,11 @@ pub(crate) struct Kernels {
     pub(crate) head_dim: usize,
     pub(crate) norm: CudaFunction,
     pub(crate) norm_f32: CudaFunction,
+    norm_silu: Option<[CudaFunction; 2]>,
+    #[cfg(test)]
+    norm_silu_reference: bool,
+    #[cfg(test)]
+    norm_silu_separate: Option<[CudaFunction; 2]>,
     pub(crate) l2: CudaFunction,
     pub(crate) unpack: CudaFunction,
     qkv_prepare: Option<CudaFunction>,
@@ -479,7 +484,6 @@ struct ResidualIo {
     residual: CudaSlice<f16>,
     parameters: CudaSlice<f16>,
     silu: CudaFunction,
-    modulate: CudaFunction,
 }
 impl ResidualIo {
     fn new(
@@ -537,7 +541,6 @@ impl ResidualIo {
                 .alloc_zeros(if input == output { 0 } else { rows * output })?,
             parameters: d.stream.alloc_zeros(2 * hidden)?,
             silu: cubin::module(&d.ctx, "vision_ops")?.load_function("vision_silu_f16")?,
-            modulate: cubin::module(&d.ctx, "modulate")?.load_function("row_modulate_f16")?,
         })
     }
     fn run(
@@ -562,18 +565,13 @@ impl ResidualIo {
         };
         self.embedding
             .run(blas, 1, embedding, ptr(&self.parameters, d))?;
-        k.norm(
+        k.norm_silu(
             d,
             ptr(input, d),
             ptr(&self.normalized, d),
             [self.rows, self.input_width],
             self.norm,
-            (1e-6, false),
-        )?;
-        activate(
-            ptr(&self.normalized, d),
-            ptr(&self.normalized, d),
-            self.normalized.len(),
+            0,
         )?;
         self.conv[0].run(
             blas,
@@ -582,34 +580,14 @@ impl ResidualIo {
             self.conv_weights[0].1,
             &mut self.first,
         )?;
-        k.norm(
+        k.norm_silu(
             d,
             ptr(&self.first, d),
             ptr(&self.first, d),
             [self.rows, hidden],
             [0, 0],
-            (1e-6, false),
+            ptr(&self.parameters, d),
         )?;
-        let parameter = ptr(&self.parameters, d);
-        unsafe {
-            d.stream
-                .launch_builder(&self.modulate)
-                .arg(&self.first)
-                .arg(&(parameter + (hidden * 2) as u64))
-                .arg(&parameter)
-                .arg(&0u64)
-                .arg(&self.first)
-                .arg(&(self.rows as i32))
-                .arg(&(hidden as i32))
-                .arg(&((2 * hidden) as u64))
-                .arg(&1u32)
-                .launch(crate::backend::gpu::LaunchConfig {
-                    grid_dim: (self.rows as u32, hidden.div_ceil(256) as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-        activate(ptr(&self.first, d), ptr(&self.first, d), self.first.len())?;
         self.conv[1].run(
             blas,
             &self.first,
@@ -967,6 +945,25 @@ impl Kernels {
                 "q38_layer_norm_bf16_affine_f32"
             })?,
             norm_f32: q.load_function("q38_layer_norm_f32")?,
+            norm_silu: if T::HALF {
+                Some([
+                    q.load_function("layer_norm_silu_f16")?,
+                    q.load_function("layer_norm_modulate_silu_f16")?,
+                ])
+            } else {
+                None
+            },
+            #[cfg(test)]
+            norm_silu_reference: false,
+            #[cfg(test)]
+            norm_silu_separate: if T::HALF {
+                Some([
+                    v.load_function("vision_silu_f16")?,
+                    m.load_function("row_modulate_f16")?,
+                ])
+            } else {
+                None
+            },
             l2: n.load_function(if T::HALF {
                 "l2_norm_scale_f16"
             } else {
@@ -1196,6 +1193,83 @@ impl Kernels {
                 .arg(&1u64)
                 .arg(&eps)
                 .launch(grid(rows, 256))?;
+        }
+        Ok(())
+    }
+    fn norm_silu(
+        &self,
+        d: &Device,
+        input: u64,
+        output: u64,
+        shape: [usize; 2],
+        affine: [u64; 2],
+        modulation: u64,
+    ) -> Result<()> {
+        let [rows, width] = shape;
+        ensure!(
+            self.half && rows > 0 && width > 0,
+            "invalid F16 norm SiLU shape"
+        );
+        let rows32 = u32::try_from(rows)?;
+        let width32 = u32::try_from(width)?;
+        let functions = self
+            .norm_silu
+            .as_ref()
+            .context("F16 norm SiLU kernels missing")?;
+        #[cfg(test)]
+        if self.norm_silu_reference {
+            let separate = self
+                .norm_silu_separate
+                .as_ref()
+                .context("norm SiLU reference missing")?;
+            self.norm(d, input, output, shape, affine, (1e-6, false))?;
+            unsafe {
+                if modulation != 0 {
+                    d.stream
+                        .launch_builder(&separate[1])
+                        .arg(&output)
+                        .arg(&(modulation + 2 * width as u64))
+                        .arg(&modulation)
+                        .arg(&0u64)
+                        .arg(&output)
+                        .arg(&i32::try_from(rows)?)
+                        .arg(&i32::try_from(width)?)
+                        .arg(&(2 * width as u64))
+                        .arg(&1u32)
+                        .launch(crate::backend::gpu::LaunchConfig {
+                            grid_dim: (rows32, width32.div_ceil(256), 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+                d.stream
+                    .launch_builder(&separate[0])
+                    .arg(&output)
+                    .arg(&output)
+                    .arg(&u32::try_from(
+                        rows.checked_mul(width)
+                            .context("norm SiLU extent overflow")?,
+                    )?)
+                    .launch(flat(rows * width))?;
+            }
+            return Ok(());
+        }
+        unsafe {
+            let mut launch = d
+                .stream
+                .launch_builder(&functions[usize::from(modulation != 0)]);
+            launch
+                .arg(&input)
+                .arg(&affine[0])
+                .arg(&affine[1])
+                .arg(&output)
+                .arg(&rows32)
+                .arg(&width32)
+                .arg(&1e-6f32);
+            if modulation != 0 {
+                launch.arg(&modulation);
+            }
+            launch.launch(grid(rows, 256))?;
         }
         Ok(())
     }
@@ -1952,6 +2026,8 @@ impl Flow<f16> {
         let mut attention_defects = 0;
         #[cfg(test)]
         let mut gather_defects = 0;
+        #[cfg(test)]
+        let mut norm_silu_defects = 0;
         let negative_values = state
             .negative
             .as_mut()
@@ -1969,6 +2045,14 @@ impl Flow<f16> {
                 #[cfg(test)]
                 if step == 0 && stage == 0 {
                     let compact = self.device.stream.clone_dtoh(&state.positive)?;
+                    tests::flow_norm_silu_identity(
+                        self,
+                        input,
+                        positive,
+                        &mut state.positive,
+                        &compact,
+                        &mut norm_silu_defects,
+                    )?;
                     tests::flow_gather_identity(
                         self,
                         input,
@@ -2118,6 +2202,16 @@ impl Flow<f16> {
                 self.context_cache.is_some()
             );
             ensure!(gather_defects == 0, "sampler vector gather defects");
+            println!(
+                "{} F16_NORM_SILU_SAMPLER_IDENTITY input_rows={rows} parent_rows={} defects={norm_silu_defects} threshold_bits=0 timing=false",
+                if norm_silu_defects == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                },
+                self.rows
+            );
+            ensure!(norm_silu_defects == 0, "sampler norm SiLU defects");
         }
         Ok(values)
     }

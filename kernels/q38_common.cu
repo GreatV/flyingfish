@@ -667,11 +667,12 @@ __device__ __forceinline__ void q38_gelu_impl(
     }
 }
 
-template <typename InT, typename OutT, bool FUSED_AFFINE = false>
+template <typename InT, typename OutT, bool FUSED_AFFINE = false, int EPILOGUE = 0>
 __device__ __forceinline__ void q38_layer_norm_f32_impl(
     const InT* x, const float* weight, const float* bias, OutT* y,
     uint32_t rows, uint32_t heads, uint32_t width,
-    uint64_t xs0, uint64_t xs1, uint64_t xs2, uint64_t ys0, uint64_t ys1, uint64_t ys2, float eps) {
+    uint64_t xs0, uint64_t xs1, uint64_t xs2, uint64_t ys0, uint64_t ys1, uint64_t ys2, float eps,
+    const __half* modulation = nullptr) {
     if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
        !rows || !heads || !width || uint64_t(gridDim.x)!=uint64_t(rows)*heads ||
        !x || bool(weight)!=bool(bias) || !y || !(eps>0)) {__trap();return;}
@@ -696,6 +697,16 @@ __device__ __forceinline__ void q38_layer_norm_f32_impl(
         if(weight) {
             if constexpr(FUSED_AFFINE) out=__fmaf_rn(normalized,weight[d],bias[d]);
             else out=__fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]);
+        }
+        if constexpr(EPILOGUE != 0) {
+            __half value = __float2half_rn(out);
+            if constexpr(EPILOGUE == 2) {
+                const __half one_plus = __float2half_rn(__fadd_rn(1.0f, __half2float(modulation[d])));
+                const __half scaled = __float2half_rn(__fmul_rn(__half2float(value), __half2float(one_plus)));
+                value = __float2half_rn(__fadd_rn(__half2float(scaled), __half2float(modulation[width + d])));
+            }
+            const float activated = __half2float(value);
+            out = __fdiv_rn(activated, __fadd_rn(1.0f, expf(-activated)));
         }
         y[uint64_t(d)*ys2]=q38_from_f32<OutT>(out);
     }
@@ -1312,6 +1323,21 @@ extern "C" __global__ void q38_layer_norm_f16_fma(
     uint32_t rows,uint32_t heads,uint32_t width,
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
     q38_layer_norm_f32_impl<__half, __half, true>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
+}
+
+extern "C" __global__ __launch_bounds__(256) void layer_norm_silu_f16(
+    const __half* x, const float* weight, const float* bias, __half* y,
+    uint32_t rows, uint32_t width, float eps) {
+    q38_layer_norm_f32_impl<__half, __half, true, 1>(x, weight, bias, y, rows, 1,
+        width, width, 0, 1, width, 0, 1, eps);
+}
+
+extern "C" __global__ __launch_bounds__(256) void layer_norm_modulate_silu_f16(
+    const __half* x, const float* weight, const float* bias, __half* y,
+    uint32_t rows, uint32_t width, float eps, const __half* modulation) {
+    if (!modulation) { __trap(); return; }
+    q38_layer_norm_f32_impl<__half, __half, true, 2>(x, weight, bias, y, rows, 1,
+        width, width, 0, 1, width, 0, 1, eps, modulation);
 }
 
 template <int UPDATE, bool BIAS_FILL = false>
