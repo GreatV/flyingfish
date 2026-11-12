@@ -1,11 +1,11 @@
-//! MiniMax-H3 FL2VA transformer geometry, packed-sequence layout and sampling schedule.
+//! MiniMax-H3 FL2VA geometry, and the MiniMax-H3-Image canvas, packed layout and sampling grid.
 use crate::model_spec::{equal, exact_keys, positive, u32_list};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{fs, path::Path};
 
 #[cfg(feature = "cuda")]
-pub use crate::backend::cuda::engine::minimax_h3::generate;
+pub use crate::backend::cuda::engine::minimax_h3::{generate, image_sample};
 
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.
 pub const VIDEO_TAG: u8 = 0;
@@ -943,6 +943,11 @@ pub struct AdalnPlan {
 
 impl AdalnPlan {
     pub fn build(layout: &PackedLayout, plan: &[RowTimesteps]) -> Self {
+        Self::from_tags(&layout.token_tags, plan)
+    }
+
+    /// `(timestep, tag)` pairs addressed by `token_tags` over every evaluation in `plan`.
+    pub fn from_tags(token_tags: &[u8], plan: &[RowTimesteps]) -> Self {
         let mut timesteps: Vec<f32> = plan
             .iter()
             .flat_map(|step| step.timesteps.clone())
@@ -959,11 +964,7 @@ impl AdalnPlan {
             .collect();
         let mut pairs: Vec<(u32, u8)> = row_timesteps
             .iter()
-            .flat_map(|rows| {
-                rows.iter()
-                    .zip(&layout.token_tags)
-                    .map(|(&t, &tag)| (t, tag))
-            })
+            .flat_map(|rows| rows.iter().zip(token_tags).map(|(&t, &tag)| (t, tag)))
             .collect();
         pairs.sort_unstable();
         pairs.dedup();
@@ -971,7 +972,7 @@ impl AdalnPlan {
             .iter()
             .map(|rows| {
                 rows.iter()
-                    .zip(&layout.token_tags)
+                    .zip(token_tags)
                     .map(|(&t, &tag)| pairs.partition_point(|&p| p < (t, tag)) as u32)
                     .collect()
             })
@@ -1053,14 +1054,18 @@ fn f32_linear(weight: &[f32], bias: &[f32], x: &[f32], input: usize) -> Vec<f32>
 /// `[rows, 6 * rope_freq_dim]` BF16 rotary table: the cosines of each row's `3 * rope_freq_dim` angles, then their
 /// sines. Angle `(axis, i)` is `f32(position[axis]) * inv_freq[i]` with `inv_freq[i] = 1 / theta^(2i / (2 *
 /// rope_freq_dim))` in f32; axes in `(t, h, w)` order.
-pub fn rotary_table(spec: &H3Spec, layout: &PackedLayout) -> Vec<half::bf16> {
-    let width = 2 * spec.rope_freq_dim;
-    let inv_freq: Vec<f32> = (0..spec.rope_freq_dim)
-        .map(|i| 1.0f32 / spec.rope_theta.powf((2 * i) as f32 / width as f32))
+pub fn rotary_rows(
+    rope_freq_dim: usize,
+    rope_theta: f32,
+    positions: &[[f64; 3]],
+) -> Vec<half::bf16> {
+    let width = 2 * rope_freq_dim;
+    let inv_freq: Vec<f32> = (0..rope_freq_dim)
+        .map(|i| 1.0f32 / rope_theta.powf((2 * i) as f32 / width as f32))
         .collect();
-    let mut table = Vec::with_capacity(layout.rows() * 3 * width);
-    let mut angles = Vec::with_capacity(3 * spec.rope_freq_dim);
-    for position in &layout.position_ids {
+    let mut table = Vec::with_capacity(positions.len() * 3 * width);
+    let mut angles = Vec::with_capacity(3 * rope_freq_dim);
+    for position in positions {
         angles.clear();
         for &coordinate in position {
             angles.extend(inv_freq.iter().map(|&f| coordinate as f32 * f));
@@ -1069,6 +1074,10 @@ pub fn rotary_table(spec: &H3Spec, layout: &PackedLayout) -> Vec<half::bf16> {
         table.extend(angles.iter().map(|a| half::bf16::from_f32(a.sin())));
     }
     table
+}
+
+pub fn rotary_table(spec: &H3Spec, layout: &PackedLayout) -> Vec<half::bf16> {
+    rotary_rows(spec.rope_freq_dim, spec.rope_theta, &layout.position_ids)
 }
 
 /// `[rows, head_dim]` f32 interleaved-mRoPE table of the Qwen3-VL conditioner: the cosines of each prompt row's
@@ -1263,4 +1272,484 @@ pub struct H3Output {
     pub samples: usize,
     pub sampling_rate: usize,
     pub audio: Vec<f32>,
+}
+
+/// Image-row AdaLN tag. Slot 0 of the 3-slot modulation table; text rows stay `TEXT_TAG`.
+pub const IMAGE_TAG: u8 = 0;
+/// Default smallest generation area, in pixels: `2048 * 2048`.
+pub const IMAGE_MIN_GENERATION_AREA: usize = 2048 * 2048;
+const IMAGE_MIN_AREA_BOUND: usize = 1024;
+const IMAGE_MAX_AREA_BOUND: usize = 4096 * 4096;
+/// Published sampling grid, seven values, six evaluations. `shift_provided_sigmas` is false.
+pub const IMAGE_SAMPLE_SIGMAS: [f64; 7] = [
+    1.0,
+    0.9675236940383911,
+    0.8875485062599182,
+    0.75,
+    0.5327739119529724,
+    0.23200887441635132,
+    0.0,
+];
+const IMAGE_TRANSFORMER_KEYS: [&str; 20] = [
+    "_class_name",
+    "_diffusers_version",
+    "num_attention_heads",
+    "attention_head_dim",
+    "hidden_size",
+    "num_layers",
+    "num_refiner_layers",
+    "ffn_dim",
+    "in_channels",
+    "patch_size",
+    "text_dim",
+    "freq_dim",
+    "time_embed_hidden_dim",
+    "time_embed_dim",
+    "rope_freq_dim",
+    "rope_theta",
+    "norm_eps",
+    "qk_norm_eps",
+    "final_norm_eps",
+    "num_pdd_heads",
+];
+const IMAGE_VAE_KEYS: [&str; 22] = [
+    "_class_name",
+    "_diffusers_version",
+    "in_channels",
+    "out_channels",
+    "latent_channels",
+    "block_out_channels",
+    "layers_per_block",
+    "spatial_downsample_factors",
+    "temporal_downsample_factors",
+    "norm_num_groups",
+    "norm_eps",
+    "spatial_padding_mode",
+    "decoder_num_layers",
+    "decoder_num_attention_heads",
+    "decoder_attention_head_dim",
+    "decoder_num_register_tokens",
+    "decoder_ffn_mult",
+    "decoder_rope_theta",
+    "decoder_rope_dim_ratio",
+    "decoder_norm_eps",
+    "latents_mean",
+    "latents_std",
+];
+
+/// MiniMax-H3-Image transformer (`transformer_diffusers/config.json`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageSpec {
+    pub hidden: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub layers: usize,
+    pub refiner_layers: usize,
+    pub ffn: usize,
+    pub in_channels: usize,
+    /// `(t, h, w)` latent patch.
+    pub patch: [usize; 3],
+    pub text_dim: usize,
+    pub freq_dim: usize,
+    pub time_hidden: usize,
+    pub time_dim: usize,
+    pub rope_freq_dim: usize,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+    pub qk_norm_eps: f32,
+    pub final_norm_eps: f32,
+    /// One output head per sampling evaluation.
+    pub pdd_heads: usize,
+}
+
+impl ImageSpec {
+    /// Reads `transformer_diffusers/config.json` and checks `vae_diffusers/config.json`.
+    pub fn read(model_dir: &Path) -> Result<Self> {
+        let read = |component: &str| -> Result<Value> {
+            let path = model_dir.join(component).join("config.json");
+            serde_json::from_slice(
+                &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            )
+            .with_context(|| format!("parse {}", path.display()))
+        };
+        ImageVaeSpec::parse(&read("vae_diffusers")?)?;
+        Self::parse(&read("transformer_diffusers")?)
+    }
+
+    pub fn parse(root: &Value) -> Result<Self> {
+        exact_keys(
+            root,
+            &IMAGE_TRANSFORMER_KEYS,
+            "MiniMax-H3-Image transformer config",
+        )?;
+        equal(
+            root,
+            "_class_name",
+            "MiniMaxH3ImageTransformer2DModel".into(),
+        )?;
+        let n = |key| positive(root, key).map(|v| v as usize);
+        let f = |key: &str| {
+            root.get(key)
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| v as f32)
+                .with_context(|| format!("missing/invalid {key}"))
+        };
+        let patch = u32_list(root, "patch_size")?;
+        ensure!(patch.len() == 3, "patch_size is not (t, h, w)");
+        let spec = Self {
+            hidden: n("hidden_size")?,
+            heads: n("num_attention_heads")?,
+            head_dim: n("attention_head_dim")?,
+            layers: n("num_layers")?,
+            refiner_layers: n("num_refiner_layers")?,
+            ffn: n("ffn_dim")?,
+            in_channels: n("in_channels")?,
+            patch: [patch[0] as usize, patch[1] as usize, patch[2] as usize],
+            text_dim: n("text_dim")?,
+            freq_dim: n("freq_dim")?,
+            time_hidden: n("time_embed_hidden_dim")?,
+            time_dim: n("time_embed_dim")?,
+            rope_freq_dim: n("rope_freq_dim")?,
+            rope_theta: f("rope_theta")?,
+            norm_eps: f("norm_eps")?,
+            qk_norm_eps: f("qk_norm_eps")?,
+            final_norm_eps: f("final_norm_eps")?,
+            pdd_heads: n("num_pdd_heads")?,
+        };
+        ensure!(
+            spec.head_dim == 128 && 6 * spec.rope_freq_dim <= spec.head_dim,
+            "unsupported MiniMax-H3-Image head_dim {} rope_freq_dim {}",
+            spec.head_dim,
+            spec.rope_freq_dim
+        );
+        ensure!(
+            spec.patch[0] == 1 && spec.patch[1] > 0 && spec.patch[1] == spec.patch[2],
+            "unsupported MiniMax-H3-Image patch {:?}",
+            spec.patch
+        );
+        ensure!(
+            spec.pdd_heads == IMAGE_SAMPLE_SIGMAS.len() - 1,
+            "num_pdd_heads {} is not the {} published evaluations",
+            spec.pdd_heads,
+            IMAGE_SAMPLE_SIGMAS.len() - 1
+        );
+        Ok(spec)
+    }
+
+    /// Channels of one patchified image row.
+    pub fn row_width(&self) -> usize {
+        self.in_channels * self.patch.iter().product::<usize>()
+    }
+
+    /// `(name, out, in)` of every refiner block, then every transformer block.
+    pub fn block_linears(&self) -> Vec<(String, usize, usize)> {
+        let width = self.heads * self.head_dim;
+        let blocks = (0..self.refiner_layers)
+            .map(|i| format!("token_refiner.refiner_blocks.{i}"))
+            .chain((0..self.layers).map(|i| format!("transformer_blocks.{i}")));
+        blocks
+            .flat_map(|block| {
+                [
+                    ("attn.to_q", width, self.hidden),
+                    ("attn.to_k", width, self.hidden),
+                    ("attn.to_v", width, self.hidden),
+                    ("attn.to_out.0", self.hidden, width),
+                    ("ff.net.0.proj", 2 * self.ffn, self.hidden),
+                    ("ff.net.2", self.hidden, self.ffn),
+                ]
+                .map(|(name, out, input)| (format!("{block}.{name}"), out, input))
+            })
+            .collect()
+    }
+}
+
+/// MiniMax-H3-Image VAE (`vae_diffusers/config.json`): one-frame encoder and a 2D ViT decoder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageVaeSpec {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub latent_channels: usize,
+    pub block_out_channels: Vec<usize>,
+    pub layers_per_block: usize,
+    pub spatial_factors: Vec<usize>,
+    pub temporal_factors: Vec<usize>,
+    pub spatial_ratio: usize,
+    pub temporal_ratio: usize,
+    pub dim: usize,
+    pub layers: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub registers: usize,
+    pub ffn: usize,
+    pub rope_theta: f32,
+    /// Rotated channels of every head, split into two spatial axes of equal even width.
+    pub rope_dims: usize,
+    pub norm_eps: f32,
+    pub groups: usize,
+    pub encoder_eps: f32,
+    pub latents_mean: Vec<f32>,
+    pub latents_std: Vec<f32>,
+}
+
+impl ImageVaeSpec {
+    pub fn parse(root: &Value) -> Result<Self> {
+        exact_keys(root, &IMAGE_VAE_KEYS, "MiniMax-H3-Image VAE config")?;
+        equal(root, "_class_name", "AutoencoderKLMiniMaxH3Image".into())?;
+        equal(root, "spatial_padding_mode", "reflect".into())?;
+        let n = |key| positive(root, key).map(|v| v as usize);
+        let f = |key: &str| {
+            root.get(key)
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .with_context(|| format!("missing/invalid {key}"))
+        };
+        let list = |key| -> Result<Vec<usize>> {
+            Ok(u32_list(root, key)?
+                .into_iter()
+                .map(|v| v as usize)
+                .collect())
+        };
+        let (spatial_factors, temporal_factors) = (
+            list("spatial_downsample_factors")?,
+            list("temporal_downsample_factors")?,
+        );
+        let head_dim = n("decoder_attention_head_dim")?;
+        let heads = n("decoder_num_attention_heads")?;
+        let rope = head_dim as f64 * f("decoder_rope_dim_ratio")?;
+        let spec = Self {
+            in_channels: n("in_channels")?,
+            out_channels: n("out_channels")?,
+            latent_channels: n("latent_channels")?,
+            block_out_channels: list("block_out_channels")?,
+            layers_per_block: n("layers_per_block")?,
+            spatial_ratio: spatial_factors.iter().product(),
+            temporal_ratio: temporal_factors.iter().product(),
+            spatial_factors,
+            temporal_factors,
+            dim: heads * head_dim,
+            layers: n("decoder_num_layers")?,
+            heads,
+            head_dim,
+            registers: n("decoder_num_register_tokens")?,
+            ffn: n("decoder_ffn_mult")? * heads * head_dim,
+            rope_theta: f("decoder_rope_theta")? as f32,
+            rope_dims: rope as usize,
+            norm_eps: f("decoder_norm_eps")? as f32,
+            groups: n("norm_num_groups")?,
+            encoder_eps: f("norm_eps")? as f32,
+            latents_mean: f32_list(root, "latents_mean")?,
+            latents_std: f32_list(root, "latents_std")?,
+        };
+        let blocks = spec.block_out_channels.len();
+        ensure!(
+            spec.spatial_factors.len() == blocks
+                && spec.temporal_factors.len() == blocks
+                && spec.spatial_ratio == VAE_SPATIAL_RATIO
+                && rope.fract() == 0.0
+                && spec.rope_dims.is_multiple_of(4)
+                && spec.rope_dims <= head_dim
+                && spec
+                    .block_out_channels
+                    .iter()
+                    .all(|c| c.is_multiple_of(spec.groups))
+                && spec
+                    .spatial_factors
+                    .iter()
+                    .zip(&spec.temporal_factors)
+                    .all(|(&s, &t)| s == 2 || (s == 1 && t == 1))
+                && spec.latents_mean.len() == spec.latent_channels
+                && spec.latents_std.len() == spec.latent_channels
+                && spec.latents_std.iter().all(|v| *v > 0.0),
+            "unsupported MiniMax-H3-Image VAE geometry: {spec:?}"
+        );
+        Ok(spec)
+    }
+}
+
+/// Canvas `(height, width)` for a requested image. Sides scale by `max(1, sqrt(min_area / (width * height)))`, then
+/// round half-to-even to `vae_spatial_ratio * patch_w` and land on at least one multiple.
+pub fn image_canvas(
+    spec: &ImageSpec,
+    height: usize,
+    width: usize,
+    min_area: usize,
+) -> Result<(usize, usize)> {
+    ensure!(
+        height > 0 && width > 0,
+        "image size {height}x{width} is not positive"
+    );
+    ensure!(
+        (IMAGE_MIN_AREA_BOUND..=IMAGE_MAX_AREA_BOUND).contains(&min_area),
+        "min_generation_area {min_area} is outside [{IMAGE_MIN_AREA_BOUND}, {IMAGE_MAX_AREA_BOUND}]"
+    );
+    let area = height
+        .checked_mul(width)
+        .context("image canvas area overflows")?;
+    let scale = ((min_area as f64) / (area as f64)).sqrt().max(1.0);
+    let multiple = VAE_SPATIAL_RATIO * spec.patch[2];
+    let snap = |side: usize| -> usize {
+        let units = (side as f64 * scale / multiple as f64).round_ties_even();
+        (units * multiple as f64).max(multiple as f64) as usize
+    };
+    Ok((snap(height), snap(width)))
+}
+
+/// Packed image sequence `[text | reference images | generated image]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageLayout {
+    /// `[rows, 3]` `(t, h, w)` rotary coordinates, float64.
+    pub position_ids: Vec<[f64; 3]>,
+    pub token_tags: Vec<u8>,
+    /// Image rows, reference rows first.
+    pub image_indices: Vec<u32>,
+    pub text_indices: Vec<u32>,
+    /// Leading image rows that are references.
+    pub reference_rows: usize,
+}
+
+impl ImageLayout {
+    pub fn rows(&self) -> usize {
+        self.token_tags.len()
+    }
+
+    /// AdaLN table row of every sequence row: `timestep_index * MODALITIES + tag`.
+    pub fn adaln_indices(&self, step: &RowTimesteps) -> Vec<u32> {
+        step.indices
+            .iter()
+            .zip(&self.token_tags)
+            .map(|(&index, &tag)| index * MODALITIES + u32::from(tag))
+            .collect()
+    }
+}
+
+/// `(t, h, w)` layout. Each image takes one integer rotary time slot, references first, starting at the text length.
+/// Spatial axes are the float64 linspace grid scaled by 32.
+pub fn image_layout(
+    spec: &ImageSpec,
+    text_tags: &[u8],
+    references: &[(usize, usize)],
+    latent_height: usize,
+    latent_width: usize,
+) -> Result<ImageLayout> {
+    ensure!(
+        text_tags
+            .iter()
+            .all(|&tag| tag == TEXT_TAG || tag == IMAGE_TAG),
+        "text rows carry a tag other than text or image"
+    );
+    let (patch_h, patch_w) = (spec.patch[1], spec.patch[2]);
+    let frame = |height: usize, width: usize| -> Result<Vec<[f64; 2]>> {
+        ensure!(
+            height > 0 && width > 0,
+            "latent {height}x{width} is not positive"
+        );
+        ensure!(
+            height.is_multiple_of(patch_h) && width.is_multiple_of(patch_w),
+            "latent {height}x{width} is not divisible by the patch"
+        );
+        let pixels = height.checked_mul(width).context("latent area overflows")?;
+        let sqrt_area = (pixels as f64).sqrt();
+        let height_grid = spatial_grid(height, patch_h, sqrt_area);
+        let width_grid = spatial_grid(width, patch_w, sqrt_area);
+        Ok(height_grid
+            .iter()
+            .flat_map(|&h| width_grid.iter().map(move |&w| [h, w]))
+            .collect())
+    };
+    let reference_grids = references
+        .iter()
+        .map(|&(height, width)| frame(height, width))
+        .collect::<Result<Vec<_>>>()?;
+    let target = frame(latent_height, latent_width)?;
+    let text = text_tags.len();
+    let reference_rows = reference_grids.iter().map(Vec::len).sum::<usize>();
+    let rows = text + reference_rows + target.len();
+    u32::try_from(rows).context("packed image sequence exceeds u32 rows")?;
+
+    let mut position_ids = vec![[0.0f64; 3]; rows];
+    for (row, position) in position_ids.iter_mut().take(text).enumerate() {
+        position[0] = row as f64;
+    }
+    let mut cursor = text;
+    let mut rotary_time = text as f64;
+    for grid in &reference_grids {
+        for (position, &[h, w]) in position_ids[cursor..cursor + grid.len()]
+            .iter_mut()
+            .zip(grid)
+        {
+            *position = [rotary_time, h, w];
+        }
+        cursor += grid.len();
+        rotary_time += 1.0;
+    }
+    for (position, &[h, w]) in position_ids[cursor..].iter_mut().zip(&target) {
+        *position = [rotary_time, h, w];
+    }
+    let mut token_tags = text_tags.to_vec();
+    token_tags.extend(std::iter::repeat_n(IMAGE_TAG, rows - text));
+    let range = |a: usize, b: usize| (a as u32..b as u32).collect::<Vec<_>>();
+    Ok(ImageLayout {
+        position_ids,
+        token_tags,
+        image_indices: range(text, rows),
+        text_indices: range(0, text),
+        reference_rows,
+    })
+}
+
+/// Published image grid after the float32 round trip `sigma = 1 - f32(1 - sigma)`, terminal 0, and the timesteps
+/// `1 - sigma` of the six evaluations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageSchedule {
+    pub sigmas: [f32; IMAGE_SAMPLE_SIGMAS.len()],
+    pub timesteps: [f32; IMAGE_SAMPLE_SIGMAS.len() - 1],
+}
+
+impl ImageSchedule {
+    pub fn published() -> Result<Self> {
+        let mut sigmas = [0f32; IMAGE_SAMPLE_SIGMAS.len()];
+        let mut timesteps = [0f32; IMAGE_SAMPLE_SIGMAS.len() - 1];
+        for i in 0..timesteps.len() {
+            let sigma = IMAGE_SAMPLE_SIGMAS[i];
+            ensure!(sigma.is_finite(), "image sample sigma is not finite");
+            let cast = (1.0 - sigma) as f32;
+            sigmas[i] = 1.0 - cast;
+            timesteps[i] = 1.0 - sigmas[i];
+        }
+        ensure!(
+            sigmas.windows(2).all(|pair| pair[0] > pair[1])
+                && sigmas[IMAGE_SAMPLE_SIGMAS.len() - 1] == 0.0,
+            "image sigma grid is not strictly decreasing to 0"
+        );
+        Ok(Self { sigmas, timesteps })
+    }
+}
+
+/// One evaluation's row timesteps. Reference image rows are pinned at f32 `0.999`; text and generated rows take
+/// `timestep`. Distinct values are sorted ascending.
+pub fn image_row_timesteps(layout: &ImageLayout, timestep: f32) -> Result<RowTimesteps> {
+    ensure!(timestep.is_finite(), "image timestep is not finite");
+    let mut values = vec![timestep; layout.rows()];
+    let pin = KEYFRAME_NOISE_AUG as f32;
+    for &row in layout.image_indices.iter().take(layout.reference_rows) {
+        values[row as usize] = pin;
+    }
+    let mut timesteps = values.clone();
+    timesteps.sort_by(f32::total_cmp);
+    timesteps.dedup();
+    let indices = values
+        .iter()
+        .map(|t| timesteps.partition_point(|v| v < t) as u32)
+        .collect();
+    Ok(RowTimesteps { timesteps, indices })
+}
+
+/// One [`RowTimesteps`] per published evaluation.
+pub fn image_row_plan(layout: &ImageLayout, schedule: &ImageSchedule) -> Result<Vec<RowTimesteps>> {
+    schedule
+        .timesteps
+        .iter()
+        .map(|&timestep| image_row_timesteps(layout, timestep))
+        .collect()
 }

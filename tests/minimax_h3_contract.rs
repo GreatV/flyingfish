@@ -1,14 +1,20 @@
 //! MiniMax-H3 FL2VA geometry, layout, schedule and request-producer gates.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use flyingfish::{
-    checkpoint::MappedCheckpoint,
+    checkpoint::{MappedCheckpoint, TensorScope},
     minimax_h3::{
-        AUDIO_TAG, AdalnPlan, DecodePlan, Geometry, H3Spec, KeyframeAnchor, PackedLayout,
-        RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec, VaeTiles, row_timestep_plan,
+        AUDIO_TAG, AdalnPlan, DecodePlan, Geometry, H3Spec, IMAGE_MIN_GENERATION_AREA, IMAGE_TAG,
+        ImageLayout, ImageSchedule, ImageSpec, ImageVaeSpec, KeyframeAnchor, PackedLayout,
+        RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec, VaeTiles, image_canvas, image_layout,
+        image_row_plan, image_row_timesteps, row_timestep_plan,
     },
 };
 use safetensors::{Dtype, SafeTensors};
-use std::{env, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 /// Turbo 8-NFE recipe: 9 grid points, video shift 6, audio shift 3.
 const GRID_POINTS: usize = 9;
@@ -983,5 +989,550 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
             "H3_IMAGE_PRODUCER_GATE PASS cells=2 keyframe=MEASUREMENT within={within_all} control=NOT_DETECTED_AT_10X"
         );
     }
+    Ok(())
+}
+
+fn image_spec() -> Result<ImageSpec> {
+    ImageSpec::parse(&serde_json::from_str(include_str!(
+        "data/minimax-h3-image-transformer-config.json"
+    ))?)
+}
+
+fn image_json() -> Result<serde_json::Value> {
+    Ok(serde_json::from_str(include_str!(
+        "data/minimax-h3-image-transformer-config.json"
+    ))?)
+}
+
+#[test]
+fn minimax_h3_image_config_matches_the_published_transformer() -> Result<()> {
+    let spec = image_spec()?;
+    ensure!(
+        spec.hidden == 5376
+            && spec.heads == 56
+            && spec.head_dim == 128
+            && spec.layers == 50
+            && spec.refiner_layers == 2
+            && spec.ffn == 14336
+            && spec.row_width() == 96
+            && spec.text_dim == 5120
+            && spec.freq_dim == 256
+            && spec.time_hidden == 5376
+            && spec.time_dim == 2688
+            && spec.rope_freq_dim == 16
+            && spec.pdd_heads == 6
+            && spec.patch == [1, 2, 2]
+            && spec.block_linears().len() == 312
+            && IMAGE_TAG == 0
+            && TEXT_TAG == 1,
+        "unexpected MiniMax-H3-Image geometry: {spec:?}"
+    );
+    let vae = ImageVaeSpec::parse(&serde_json::from_str(include_str!(
+        "data/minimax-h3-image-vae-config.json"
+    ))?)?;
+    ensure!(
+        (
+            vae.dim,
+            vae.layers,
+            vae.heads,
+            vae.head_dim,
+            vae.registers,
+            vae.ffn,
+            vae.rope_dims
+        ) == (1024, 24, 16, 64, 4, 4096, 32)
+            && vae.spatial_ratio == 16
+            && vae.temporal_ratio == 4
+            && vae.latent_channels == 24
+            && vae.latents_mean.len() == 24
+            && vae.latents_std.len() == 24,
+        "unexpected MiniMax-H3-Image VAE geometry: {vae:?}"
+    );
+    let mut unknown = image_json()?;
+    unknown["audio_in_channels"] = 32.into();
+    ensure!(ImageSpec::parse(&unknown).is_err(), "accepted an audio key");
+    unknown = image_json()?;
+    unknown["num_pdd_heads"] = 5.into();
+    ensure!(
+        ImageSpec::parse(&unknown).is_err(),
+        "accepted a head count other than the six evaluations"
+    );
+    unknown = image_json()?;
+    unknown["_class_name"] = "MiniMaxH3Transformer3DModel".into();
+    ensure!(
+        ImageSpec::parse(&unknown).is_err(),
+        "accepted the video class"
+    );
+    let mut vae_json: serde_json::Value =
+        serde_json::from_str(include_str!("data/minimax-h3-image-vae-config.json"))?;
+    vae_json["clip_length"] = 17.into();
+    ensure!(
+        ImageVaeSpec::parse(&vae_json).is_err(),
+        "accepted a video VAE key"
+    );
+    Ok(())
+}
+
+#[test]
+fn minimax_h3_image_canvas_matches_the_definition_table() -> Result<()> {
+    let spec = image_spec()?;
+    let rows = |h: usize, w: usize| (h / 32) * (w / 32);
+    for (height, width, canvas_h, canvas_w) in [
+        (4096, 4096, 4096, 4096),
+        (1024, 1024, 2048, 2048),
+        (768, 1280, 1600, 2656),
+        (4736, 3552, 4736, 3552),
+        (5472, 3072, 5472, 3072),
+        (6272, 2688, 6272, 2688),
+    ] {
+        let got = image_canvas(&spec, height, width, IMAGE_MIN_GENERATION_AREA)?;
+        ensure!(
+            got == (canvas_h, canvas_w) && rows(got.0, got.1) == rows(canvas_h, canvas_w),
+            "{height}x{width} -> {got:?}"
+        );
+    }
+    ensure!(
+        image_canvas(&spec, 512, 512, 1024)? == (512, 512),
+        "512 with min area 1024 was scaled"
+    );
+    ensure!(
+        image_canvas(&spec, 0, 512, 1024).is_err()
+            && image_canvas(&spec, 512, 512, 1023).is_err()
+            && image_canvas(&spec, 512, 512, 4096 * 4096 + 1).is_err(),
+        "accepted an illegal canvas input"
+    );
+    Ok(())
+}
+
+/// Edit layout: 5 text rows, one 14x22 reference latent (77 rows), a 32x32 target (256 rows).
+fn image_edit_layout(spec: &ImageSpec) -> Result<ImageLayout> {
+    image_layout(
+        spec,
+        &[TEXT_TAG, TEXT_TAG, IMAGE_TAG, TEXT_TAG, TEXT_TAG],
+        &[(14, 22)],
+        32,
+        32,
+    )
+}
+
+#[test]
+fn minimax_h3_image_layout_matches_the_frozen_coordinates() -> Result<()> {
+    let spec = image_spec()?;
+    let p = |layout: &ImageLayout, row: usize| f64_bits(layout.position_ids[row]);
+    let edit = image_edit_layout(&spec)?;
+    ensure!(
+        edit.rows() == 338
+            && edit.reference_rows == 77
+            && edit.text_indices.len() == 5
+            && edit.image_indices.len() == 333
+            && edit.image_indices[0] == 5
+            && edit.token_tags[2] == IMAGE_TAG
+            && edit.token_tags[4] == TEXT_TAG
+            && edit.token_tags[5] == IMAGE_TAG
+            && edit.token_tags[82] == IMAGE_TAG,
+        "edit extents"
+    );
+    ensure!(
+        p(&edit, 2) == [0x4000000000000000, 0, 0]
+            && p(&edit, 5) == [0x4014000000000000, 0x4009e42dc6c100ac, 0xc0103a6e518ced30]
+            && p(&edit, 81) == [0x4014000000000000, 0x40391de9a08a323a, 0x4040348576e2c6ce]
+            && p(&edit, 82) == [0x4018000000000000, 0, 0]
+            && p(&edit, 83) == [0x4018000000000000, 0, 0x4000000000000000]
+            && p(&edit, 337) == [0x4018000000000000, 0x403e000000000000, 0x403e000000000000],
+        "edit coordinates"
+    );
+    let t2i = image_layout(&spec, &[TEXT_TAG; 7], &[], 32, 32)?;
+    ensure!(
+        t2i.rows() == 263
+            && t2i.reference_rows == 0
+            && p(&t2i, 7) == [0x401c000000000000, 0, 0]
+            && p(&t2i, 22) == [0x401c000000000000, 0, 0x403e000000000000]
+            && p(&t2i, 262) == [0x401c000000000000, 0x403e000000000000, 0x403e000000000000],
+        "text2image coordinates"
+    );
+    ensure!(
+        image_layout(&spec, &[AUDIO_TAG], &[], 32, 32).is_err()
+            && image_layout(&spec, &[TEXT_TAG], &[(14, 21)], 32, 32).is_err(),
+        "accepted an illegal layout"
+    );
+    let schedule = ImageSchedule::published()?;
+    let plan = image_row_plan(&edit, &schedule)?;
+    let bits = |step: &RowTimesteps| {
+        step.timesteps
+            .iter()
+            .map(|t| t.to_bits())
+            .collect::<Vec<_>>()
+    };
+    ensure!(plan.len() == 6, "evaluation count");
+    ensure!(
+        bits(&plan[0]) == [0, 0x3f7fbe77]
+            && bits(&plan[5]) == [0x3f449b11, 0x3f7fbe77]
+            && plan
+                .iter()
+                .all(|step| { [step.indices[0], step.indices[5], step.indices[82]] == [0, 1, 0] }),
+        "published row timesteps"
+    );
+    let adaln = edit.adaln_indices(&plan[0]);
+    ensure!(
+        [adaln[0], adaln[5], adaln[82]] == [1, 3, 0],
+        "AdaLN indices at step 0"
+    );
+    let table = AdalnPlan::from_tags(&edit.token_tags, &plan);
+    ensure!(
+        table.row_pairs.len() == plan.len()
+            && table
+                .row_pairs
+                .iter()
+                .zip(&table.row_timesteps)
+                .zip(&plan)
+                .all(|((pairs, times), step)| {
+                    pairs.len() == edit.rows()
+                        && times.len() == edit.rows()
+                        && pairs
+                            .iter()
+                            .zip(times)
+                            .zip(&edit.token_tags)
+                            .all(|((&pair, &time), &tag)| table.pairs[pair as usize] == (time, tag))
+                        && step.indices.iter().zip(times).all(|(&local, &time)| {
+                            table.timesteps[time as usize].to_bits()
+                                == step.timesteps[local as usize].to_bits()
+                        })
+                }),
+        "image AdaLN pair table"
+    );
+    let above = image_row_timesteps(&edit, f32::from_bits(0x3f7fdf3b))?;
+    let above_adaln = edit.adaln_indices(&above);
+    ensure!(
+        bits(&above) == [0x3f7fbe77, 0x3f7fdf3b]
+            && [above.indices[0], above.indices[5], above.indices[82]] == [1, 0, 1]
+            && [above_adaln[0], above_adaln[5], above_adaln[82]] == [4, 0, 3],
+        "a timestep above 0.999 lifted the reference rows"
+    );
+    Ok(())
+}
+
+#[test]
+fn minimax_h3_image_schedule_matches_the_published_sigmas() -> Result<()> {
+    let schedule = ImageSchedule::published()?;
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    ensure!(
+        bits(&schedule.sigmas)
+            == [
+                0x3f800000, 0x3f77afa2, 0x3f633661, 0x3f400000, 0x3f0863df, 0x3e6d93bc, 0
+            ]
+            && bits(&schedule.timesteps)
+                == [
+                    0, 0x3d0505e0, 0x3de64cf8, 0x3e800000, 0x3eef3842, 0x3f449b11
+                ],
+        "published grid {:?} {:?}",
+        schedule.sigmas,
+        schedule.timesteps
+    );
+    ensure!(
+        bits(&Schedule::new(7, 12.0)?.sigmas) != bits(&schedule.sigmas)
+            && bits(&Schedule::new(7, 1.0)?.sigmas) != bits(&schedule.sigmas),
+        "image grid matched a shifted linspace"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "CPU-only published image checkpoint audit; set FF_H3_IMAGE"]
+fn minimax_h3_image_manifest_matches_the_published_checkpoint() -> Result<()> {
+    let model = PathBuf::from(env::var_os("FF_H3_IMAGE").context("FF_H3_IMAGE missing")?);
+    let spec = ImageSpec::read(&model)?;
+    let manifest = MappedCheckpoint::open_component(
+        &model.join("transformer_diffusers"),
+        "diffusion_pytorch_model",
+    )?
+    .minimax_h3_image_manifest(&spec)?;
+    let f32_count = manifest
+        .entries
+        .values()
+        .filter(|entry| entry.dtype == Dtype::F32)
+        .count();
+    let dormant = manifest
+        .entries
+        .values()
+        .filter(|entry| entry.scope == TensorScope::Dormant)
+        .count();
+    ensure!(
+        manifest.entries.len() == 644 && f32_count == 18 && dormant == 100,
+        "manifest {} entries, {f32_count} F32, {dormant} dormant",
+        manifest.entries.len()
+    );
+    ensure!(
+        manifest.entries.contains_key("pdd_proj_out.5.weight")
+            && manifest.entries["pdd_proj_out.5.weight"].shape == [96, 5376]
+            && !manifest.entries.keys().any(|name| name.contains("audio")),
+        "published head set"
+    );
+    println!("H3_IMAGE_MANIFEST PASS tensors=644 f32=18 dormant=100");
+    Ok(())
+}
+
+struct Image512Cell {
+    name: &'static str,
+    cross_max_abs: f64,
+    cross_rmse: f64,
+}
+
+const IMAGE_512_EPS: f64 = 1e-6;
+
+/// Cross-device pair of the 512 canvas. Same-box repeats are bit-identical, so each tau is
+/// `max(2 * this pair, 1e-6)`.
+const IMAGE_512_CELLS: &[Image512Cell] = &[
+    Image512Cell {
+        name: "conditioner_edit",
+        cross_max_abs: 10964.0,
+        cross_rmse: 4.837_434_178_563_576,
+    },
+    Image512Cell {
+        name: "conditioner_edit_pixel",
+        cross_max_abs: 19423.0,
+        cross_rmse: 8.556_175_050_112_666,
+    },
+    Image512Cell {
+        name: "conditioner_edit_two",
+        cross_max_abs: 14804.0,
+        cross_rmse: 4.628_175_131_716_904,
+    },
+    Image512Cell {
+        name: "conditioner_t2i",
+        cross_max_abs: 2.0,
+        cross_rmse: 5.6267461982255844e-2,
+    },
+    Image512Cell {
+        name: "dit_edit_step0",
+        cross_max_abs: 4.986_862_897_872_925,
+        cross_rmse: 1.7005365820597132e-1,
+    },
+    Image512Cell {
+        name: "dit_step0",
+        cross_max_abs: 7.214_647_103_101_015e-1,
+        cross_rmse: 5.7145887678887466e-2,
+    },
+    Image512Cell {
+        name: "dit_step5",
+        cross_max_abs: 2.703_127_861_022_949e-1,
+        cross_rmse: 2.1146607018288893e-2,
+    },
+    Image512Cell {
+        name: "euler_edit_step0",
+        cross_max_abs: 2.859_330_177_307_129e-2,
+        cross_rmse: 1.3387505749533405e-3,
+    },
+    Image512Cell {
+        name: "euler_step0",
+        cross_max_abs: 2.343_052_625_656_128e-2,
+        cross_rmse: 1.8558872180865057e-3,
+    },
+    Image512Cell {
+        name: "vae_decode",
+        cross_max_abs: 3.921_568_393_707_275e-3,
+        cross_rmse: 1.5944132011252836e-5,
+    },
+    Image512Cell {
+        name: "vae_encode_one",
+        cross_max_abs: 0.0,
+        cross_rmse: 0.0,
+    },
+    Image512Cell {
+        name: "vae_encode_pixel",
+        cross_max_abs: 0.0,
+        cross_rmse: 0.0,
+    },
+];
+
+const IMAGE_512_EXACT: &[&str] = &[
+    "conditioner_edit_pixel_tags",
+    "conditioner_edit_tags",
+    "conditioner_edit_two_tags",
+    "conditioner_t2i_tags",
+];
+
+fn image_512_tau(cross: f64) -> f64 {
+    (2.0 * cross).max(IMAGE_512_EPS)
+}
+
+struct Image512Capture {
+    f32: BTreeMap<String, Vec<f32>>,
+    i64: BTreeMap<String, Vec<i64>>,
+    shape: BTreeMap<String, Vec<usize>>,
+}
+
+fn image_512_capture(path: &Path) -> Result<Image512Capture> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let file = SafeTensors::deserialize(&bytes)?;
+    let mut capture = Image512Capture {
+        f32: BTreeMap::new(),
+        i64: BTreeMap::new(),
+        shape: BTreeMap::new(),
+    };
+    for name in file.names() {
+        let tensor = file.tensor(name)?;
+        capture
+            .shape
+            .insert(name.to_owned(), tensor.shape().to_vec());
+        match tensor.dtype() {
+            Dtype::F32 => {
+                let (chunks, rest) = tensor.data().as_chunks::<4>();
+                ensure!(rest.is_empty(), "{name} trailing bytes");
+                capture.f32.insert(
+                    name.to_owned(),
+                    chunks.iter().map(|b| f32::from_le_bytes(*b)).collect(),
+                );
+            }
+            Dtype::I64 => {
+                let (chunks, rest) = tensor.data().as_chunks::<8>();
+                ensure!(rest.is_empty(), "{name} trailing bytes");
+                capture.i64.insert(
+                    name.to_owned(),
+                    chunks.iter().map(|b| i64::from_le_bytes(*b)).collect(),
+                );
+            }
+            other => bail!("{name} dtype {other:?}"),
+        }
+    }
+    Ok(capture)
+}
+
+fn image_512_error(left: &[f32], right: &[f32]) -> Result<(f64, f64)> {
+    ensure!(left.len() == right.len() && !left.is_empty(), "pair length");
+    let mut max_abs = 0f64;
+    let mut sum = 0f64;
+    for (&x, &y) in left.iter().zip(right) {
+        let delta = f64::from(x) - f64::from(y);
+        max_abs = max_abs.max(delta.abs());
+        sum += delta * delta;
+    }
+    Ok((max_abs, (sum / left.len() as f64).sqrt()))
+}
+
+fn image_512_bits_equal(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+fn image_512_close(measured: f64, frozen: f64) -> bool {
+    if frozen == 0.0 {
+        measured == 0.0
+    } else {
+        (measured - frozen).abs() <= 1e-9 * frozen.abs()
+    }
+}
+
+/// The 512 reference pair matches the frozen cross-device floor. Same-box repeats are bit-identical.
+#[test]
+#[ignore = "FF_H3_IMAGE_DEVICE0 and FF_H3_IMAGE_DEVICE1, each with a.safetensors and b.safetensors"]
+fn minimax_h3_image_512_floor_matches_the_frozen_pair() -> Result<()> {
+    let device0 = PathBuf::from(env::var_os("FF_H3_IMAGE_DEVICE0").context("FF_H3_IMAGE_DEVICE0")?);
+    let device1 = PathBuf::from(env::var_os("FF_H3_IMAGE_DEVICE1").context("FF_H3_IMAGE_DEVICE1")?);
+    let (a0, b0) = (
+        image_512_capture(&device0.join("a.safetensors"))?,
+        image_512_capture(&device0.join("b.safetensors"))?,
+    );
+    let (a1, b1) = (
+        image_512_capture(&device1.join("a.safetensors"))?,
+        image_512_capture(&device1.join("b.safetensors"))?,
+    );
+    ensure!(
+        a0.shape == b0.shape && a1.shape == b1.shape && a0.shape == a1.shape,
+        "pair shapes differ"
+    );
+    for name in IMAGE_512_EXACT {
+        let (left, right) = (
+            a0.i64.get(*name).context(*name)?,
+            a1.i64.get(*name).context(*name)?,
+        );
+        ensure!(
+            left == right
+                && left == b0.i64.get(*name).context(*name)?
+                && left == b1.i64.get(*name).context(*name)?,
+            "{name} tags differ"
+        );
+    }
+    for cell in IMAGE_512_CELLS {
+        let left = a0.f32.get(cell.name).context(cell.name)?;
+        let right = a1.f32.get(cell.name).context(cell.name)?;
+        let repeat0 = b0.f32.get(cell.name).context(cell.name)?;
+        let repeat1 = b1.f32.get(cell.name).context(cell.name)?;
+        ensure!(
+            image_512_bits_equal(left, repeat0) && image_512_bits_equal(right, repeat1),
+            "{} same-box pair differs",
+            cell.name
+        );
+        let (max_abs, rmse) = image_512_error(left, right)?;
+        ensure!(
+            image_512_close(max_abs, cell.cross_max_abs) && image_512_close(rmse, cell.cross_rmse),
+            "{} measured max_abs={max_abs:.16e} rmse={rmse:.16e} frozen max_abs={:.16e} rmse={:.16e}",
+            cell.name,
+            cell.cross_max_abs,
+            cell.cross_rmse
+        );
+        println!(
+            "H3_IMAGE_512_CELL {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e}",
+            name = cell.name,
+            tau_max = image_512_tau(cell.cross_max_abs),
+            tau_rmse = image_512_tau(cell.cross_rmse)
+        );
+    }
+    let names: Vec<_> = a0
+        .shape
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !IMAGE_512_EXACT.contains(name))
+        .collect();
+    ensure!(
+        names.len() == IMAGE_512_CELLS.len()
+            && IMAGE_512_CELLS
+                .iter()
+                .all(|cell| names.contains(&cell.name)),
+        "cell set {names:?}"
+    );
+    let edit = a0
+        .shape
+        .get("conditioner_edit")
+        .context("conditioner_edit")?;
+    let two = a0
+        .shape
+        .get("conditioner_edit_two")
+        .context("conditioner_edit_two")?;
+    ensure!(edit != two, "two-reference conditioner shapes match");
+    let tensor = |name: &str| -> Result<&Vec<f32>> { a0.f32.get(name).context(name.to_owned()) };
+    let (pixel_max, _) = image_512_error(
+        tensor("conditioner_edit")?,
+        tensor("conditioner_edit_pixel")?,
+    )?;
+    let (head_max, _) = image_512_error(tensor("dit_step0")?, tensor("dit_step5")?)?;
+    let (vae_max, _) = image_512_error(tensor("vae_encode_one")?, tensor("vae_encode_pixel")?)?;
+    let edit_tau = image_512_tau(
+        IMAGE_512_CELLS
+            .iter()
+            .find(|cell| cell.name == "conditioner_edit")
+            .context("conditioner_edit")?
+            .cross_max_abs,
+    );
+    let head_tau = image_512_tau(
+        IMAGE_512_CELLS
+            .iter()
+            .find(|cell| cell.name == "dit_step5")
+            .context("dit_step5")?
+            .cross_max_abs,
+    );
+    let vae_tau = image_512_tau(0.0);
+    println!(
+        "H3_IMAGE_512_CONTROL pixel_max={pixel_max:.8e} pixel_gt_10tau={} head_max={head_max:.8e} head_gt_10tau={} vae_max={vae_max:.8e} vae_gt_10tau={}",
+        pixel_max > 10.0 * edit_tau,
+        head_max > 10.0 * head_tau,
+        vae_max > 10.0 * vae_tau
+    );
+    println!(
+        "H3_IMAGE_512_FLOOR PASS cells={} exact={}",
+        IMAGE_512_CELLS.len(),
+        IMAGE_512_EXACT.len()
+    );
     Ok(())
 }

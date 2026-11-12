@@ -2658,6 +2658,23 @@ impl MappedCheckpoint {
         self.assemble_manifest("MiniMax-H3", expected, LoadPolicy::TextOnly, planned, None)
     }
 
+    /// MiniMax-H3-Image transformer: F32 patch, time-embedding and per-step heads, BF16 elsewhere. Per-block AdaLN
+    /// projections are Dormant.
+    pub fn minimax_h3_image_manifest(
+        &self,
+        spec: &crate::minimax_h3::ImageSpec,
+    ) -> Result<TensorManifest> {
+        let expected = minimax_h3_image_expected(spec)?;
+        let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        self.assemble_manifest(
+            "MiniMax-H3-Image",
+            expected,
+            LoadPolicy::TextOnly,
+            planned,
+            None,
+        )
+    }
+
     /// MiniMax-H3 transformer weights from one community GGUF file. The expected set is `minimax_h3_expected`;
     /// every GGUF tensor is matched by name, checked against the official shape and stored type, and mapped to its
     /// official entry. `rope.inv_freq` has no official counterpart and is ignored; any other unknown tensor is an
@@ -3241,6 +3258,113 @@ pub(crate) fn minimax_h3_expected(
             format!("{base}.bias"),
             Dtype::F32,
             vec![n],
+            scope,
+        );
+    }
+    let modulation = 6 * spec.hidden * crate::minimax_h3::MODALITIES as usize;
+    for (name, shape) in [
+        ("context_embedder.weight", vec![spec.hidden, spec.text_dim]),
+        ("context_embedder.bias", vec![spec.hidden]),
+        ("token_refiner.final_norm.weight", vec![spec.hidden]),
+        ("norm_out.norm.weight", vec![spec.hidden]),
+        (
+            "norm_out.linear.weight",
+            vec![2 * spec.hidden, spec.time_dim],
+        ),
+        ("norm_out.linear.bias", vec![2 * spec.hidden]),
+    ] {
+        put(&mut expected, name.to_owned(), Dtype::BF16, shape, scope);
+    }
+    let blocks = (0..spec.refiner_layers)
+        .map(|i| (format!("token_refiner.refiner_blocks.{i}"), false))
+        .chain((0..spec.layers).map(|i| (format!("transformer_blocks.{i}"), true)));
+    for (block, adaln) in blocks {
+        for (name, shape) in [
+            ("norm1.weight", vec![spec.hidden]),
+            ("norm2.weight", vec![spec.hidden]),
+            ("attn.norm_q.weight", vec![spec.head_dim]),
+            ("attn.norm_k.weight", vec![spec.head_dim]),
+        ] {
+            put(
+                &mut expected,
+                format!("{block}.{name}"),
+                Dtype::BF16,
+                shape,
+                scope,
+            );
+        }
+        if adaln {
+            let base = format!("{block}.adaln_proj.linear");
+            put(
+                &mut expected,
+                format!("{base}.weight"),
+                Dtype::BF16,
+                vec![modulation, spec.time_dim],
+                TensorScope::Dormant,
+            );
+            put(
+                &mut expected,
+                format!("{base}.bias"),
+                Dtype::BF16,
+                vec![modulation],
+                TensorScope::Dormant,
+            );
+        }
+    }
+    for (base, n, k) in spec.block_linears() {
+        put(
+            &mut expected,
+            format!("{base}.weight"),
+            Dtype::BF16,
+            vec![n, k],
+            scope,
+        );
+    }
+    Ok(expected)
+}
+
+/// Official MiniMax-H3-Image tensor set. F32 `proj_in`, the time MLP and `pdd_proj_out.{i}`; no audio projection and
+/// no single `proj_out`. Per-block AdaLN projections are Dormant.
+pub(crate) fn minimax_h3_image_expected(
+    spec: &crate::minimax_h3::ImageSpec,
+) -> Result<BTreeMap<String, ExpectedTensor>> {
+    let scope = TensorScope::Text;
+    let mut expected = BTreeMap::new();
+    let row = spec.row_width();
+    for (base, n, k) in [
+        ("proj_in", spec.hidden, row),
+        ("time_embedder.linear_1", spec.time_hidden, spec.freq_dim),
+        ("time_embedder.linear_2", spec.time_dim, spec.time_hidden),
+    ] {
+        put(
+            &mut expected,
+            format!("{base}.weight"),
+            Dtype::F32,
+            vec![n, k],
+            scope,
+        );
+        put(
+            &mut expected,
+            format!("{base}.bias"),
+            Dtype::F32,
+            vec![n],
+            scope,
+        );
+    }
+    for head in 0..spec.pdd_heads {
+        let base = format!("pdd_proj_out.{head}");
+        put(
+            &mut expected,
+            format!("{base}.weight"),
+            Dtype::F32,
+            vec![row, spec.hidden],
+            scope,
+        );
+        put(
+            &mut expected,
+            format!("{base}.bias"),
+            Dtype::F32,
+            vec![row],
             scope,
         );
     }
@@ -6749,6 +6873,185 @@ mod gguf_tests {
             manifest.resident_bytes == resident,
             "resident bytes {} != loaded entries {resident}",
             manifest.resident_bytes
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod image_manifest_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const F32_NAMES: [&str; 18] = [
+        "proj_in.bias",
+        "proj_in.weight",
+        "time_embedder.linear_1.bias",
+        "time_embedder.linear_1.weight",
+        "time_embedder.linear_2.bias",
+        "time_embedder.linear_2.weight",
+        "pdd_proj_out.0.bias",
+        "pdd_proj_out.0.weight",
+        "pdd_proj_out.1.bias",
+        "pdd_proj_out.1.weight",
+        "pdd_proj_out.2.bias",
+        "pdd_proj_out.2.weight",
+        "pdd_proj_out.3.bias",
+        "pdd_proj_out.3.weight",
+        "pdd_proj_out.4.bias",
+        "pdd_proj_out.4.weight",
+        "pdd_proj_out.5.bias",
+        "pdd_proj_out.5.weight",
+    ];
+
+    fn published() -> Result<crate::minimax_h3::ImageSpec> {
+        crate::minimax_h3::ImageSpec::parse(&serde_json::from_str(include_str!(
+            "../tests/data/minimax-h3-image-transformer-config.json"
+        ))?)
+    }
+
+    fn tiny() -> crate::minimax_h3::ImageSpec {
+        crate::minimax_h3::ImageSpec {
+            hidden: 32,
+            heads: 1,
+            head_dim: 32,
+            layers: 1,
+            refiner_layers: 1,
+            ffn: 64,
+            in_channels: 4,
+            patch: [1, 2, 2],
+            text_dim: 16,
+            freq_dim: 8,
+            time_hidden: 16,
+            time_dim: 8,
+            rope_freq_dim: 4,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            qk_norm_eps: 1e-5,
+            final_norm_eps: 1e-5,
+            pdd_heads: 6,
+        }
+    }
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_checkpoint(
+        spec: &crate::minimax_h3::ImageSpec,
+        drop_name: Option<&str>,
+        extra: Option<&str>,
+    ) -> Result<Scratch> {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flyingfish-h3-image-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let expected = minimax_h3_image_expected(spec)?;
+        let mut owned = Vec::new();
+        for (name, (dtype, shape, _)) in &expected {
+            if drop_name == Some(name.as_str()) {
+                continue;
+            }
+            owned.push((
+                name.clone(),
+                vec![0u8; tensor_bytes(*dtype, shape)?],
+                *dtype,
+                shape.clone(),
+            ));
+        }
+        if let Some(name) = extra {
+            owned.push((name.to_owned(), vec![0u8; 4], Dtype::F32, vec![1]));
+        }
+        let views = owned
+            .iter()
+            .map(|(name, data, dtype, shape)| {
+                Ok((name.as_str(), TensorView::new(*dtype, shape.clone(), data)?))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        safetensors::tensor::serialize_to_file(
+            views,
+            None,
+            &dir.join("diffusion_pytorch_model.safetensors"),
+        )?;
+        Ok(Scratch(dir))
+    }
+
+    #[test]
+    fn minimax_h3_image_expected_names_match_the_published_set() -> Result<()> {
+        let spec = published()?;
+        let expected = minimax_h3_image_expected(&spec)?;
+        let f32_names = expected
+            .iter()
+            .filter(|(_, (dtype, _, _))| *dtype == Dtype::F32)
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<_>>();
+        let bf16 = expected
+            .values()
+            .filter(|(dtype, _, _)| *dtype == Dtype::BF16)
+            .count();
+        let dormant = expected
+            .values()
+            .filter(|(_, _, scope)| *scope == TensorScope::Dormant)
+            .count();
+        ensure!(
+            expected.len() == 644
+                && bf16 == 626
+                && dormant == 100
+                && f32_names == F32_NAMES.into_iter().collect::<BTreeSet<_>>()
+                && !expected
+                    .keys()
+                    .any(|name| name.contains("audio") || name.starts_with("proj_out.")),
+            "published image tensor set"
+        );
+        ensure!(
+            expected["proj_in.weight"].1 == [5376, 96]
+                && expected["pdd_proj_out.0.weight"].1 == [96, 5376]
+                && expected["pdd_proj_out.5.weight"].1 == [96, 5376]
+                && expected["transformer_blocks.0.adaln_proj.linear.weight"].1 == [96768, 2688]
+                && expected["transformer_blocks.0.adaln_proj.linear.weight"].2
+                    == TensorScope::Dormant
+                && !expected
+                    .contains_key("token_refiner.refiner_blocks.0.adaln_proj.linear.weight"),
+            "published image shapes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_h3_image_manifest_rejects_a_missing_head_and_an_audio_key() -> Result<()> {
+        let spec = tiny();
+        let complete = write_checkpoint(&spec, None, None)?;
+        let manifest = MappedCheckpoint::open_component(&complete.0, "diffusion_pytorch_model")?
+            .minimax_h3_image_manifest(&spec)?;
+        ensure!(
+            manifest.entries.len() == 46
+                && manifest.entries["pdd_proj_out.5.weight"].dtype == Dtype::F32
+                && manifest.entries["pdd_proj_out.5.weight"].load
+                && manifest.entries["transformer_blocks.0.adaln_proj.linear.weight"].scope
+                    == TensorScope::Dormant
+                && !manifest.entries["transformer_blocks.0.adaln_proj.linear.weight"].load,
+            "tiny image manifest"
+        );
+        let missing = write_checkpoint(&spec, Some("pdd_proj_out.5.weight"), None)?;
+        ensure!(
+            MappedCheckpoint::open_component(&missing.0, "diffusion_pytorch_model")?
+                .minimax_h3_image_manifest(&spec)
+                .is_err(),
+            "accepted a checkpoint missing pdd_proj_out.5"
+        );
+        let audio = write_checkpoint(&spec, None, Some("audio_proj_in.weight"))?;
+        ensure!(
+            MappedCheckpoint::open_component(&audio.0, "diffusion_pytorch_model")?
+                .minimax_h3_image_manifest(&spec)
+                .is_err(),
+            "accepted an audio projection"
         );
         Ok(())
     }

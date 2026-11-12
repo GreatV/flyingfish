@@ -1,10 +1,11 @@
-//! MiniMax-H3 FL2VA transformer execution.
+//! MiniMax-H3 FL2VA transformer execution, and the MiniMax-H3-Image transformer.
 use crate::backend::cuda::weights::{
     DequantCopy, QuantKernels, dequantizes, device_slot_bytes, quant_source_finite,
 };
 use crate::backend::cuda::{
     Device,
     blas::Blas,
+    closure::Closure,
     contracts::{Tensor, TensorMut, view},
     cubin,
     flash::Flash,
@@ -16,16 +17,20 @@ use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig,
     PushKernelArg,
 };
-use crate::checkpoint::{TensorEntry, TensorManifest};
+use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::gguf::GgmlType;
-use crate::minimax_h3::{AdalnPlan, AdalnTimeEmbedder, H3Spec, MODALITIES, adaln_input};
+use crate::minimax_h3::{
+    AdalnPlan, AdalnTimeEmbedder, H3Spec, ImageLayout, ImageSchedule, ImageSpec, MODALITIES,
+    adaln_input, image_row_plan, rotary_rows,
+};
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use safetensors::Dtype;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, OnceLock},
 };
 
@@ -540,7 +545,7 @@ fn matrix_layout(
 
 impl BlockWeights {
     /// Base linears read into one owned buffer in `matrix_layout` order.
-    pub(crate) fn resident(
+    pub(crate) fn resident<const LORA: bool>(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
         rank: usize,
@@ -559,13 +564,14 @@ impl BlockWeights {
             )?;
         }
         let at = pointer(&storage, s);
-        let mut weights = Self::with_linears(s, spec, rank, block, (at, &layout), base, lora)?;
+        let mut weights =
+            Self::with_linears::<LORA>(s, spec, rank, block, (at, &layout), base, lora)?;
         weights.storage = Some(storage);
         Ok(weights)
     }
 
     /// Base linears read from the `DenseStreaming` slot at `slot`, valid between the layer's `begin` and `end`.
-    pub(crate) fn streamed(
+    pub(crate) fn streamed<const LORA: bool>(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
         rank: usize,
@@ -575,10 +581,10 @@ impl BlockWeights {
         lora: &mut Source<'_>,
     ) -> Result<Self> {
         let (layout, _) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
-        Self::with_linears(s, spec, rank, block, (slot, &layout), base, lora)
+        Self::with_linears::<LORA>(s, spec, rank, block, (slot, &layout), base, lora)
     }
 
-    fn with_linears(
+    fn with_linears<const LORA: bool>(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
         rank: usize,
@@ -603,15 +609,7 @@ impl BlockWeights {
         let linears: [Tensor<bf16, 2>; 6] = linears
             .try_into()
             .map_err(|_| anyhow::anyhow!("block linear count"))?;
-        let (h, w, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
-        let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
-        for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
-            lora.fill(
-                s,
-                &format!("{block}.attn.{name}.lora_A.default.weight"),
-                &mut qkv_a.slice_mut(i * r * h..(i + 1) * r * h),
-            )?;
-        }
+        let (h, w, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
         let mut n =
             |name: &str, count: usize| base.tensor(s, &format!("{block}.{name}.weight"), count);
         let (norm1, norm2) = (n("norm1", h)?, n("norm2", h)?);
@@ -619,23 +617,63 @@ impl BlockWeights {
             n("attn.norm_q", spec.head_dim)?,
             n("attn.norm_k", spec.head_dim)?,
         );
-        let mut l = |name: &str, factor: &str, count: usize| {
-            lora.tensor(
-                s,
-                &format!("{block}.{name}.lora_{factor}.default.weight"),
-                count,
+        let (qkv_a, q_b, k_b, v_b, out_a, out_b, in_a, in_b, ffo_a, ffo_b, rank) = if LORA {
+            let r = rank;
+            let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
+            for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+                lora.fill(
+                    s,
+                    &format!("{block}.attn.{name}.lora_A.default.weight"),
+                    &mut qkv_a.slice_mut(i * r * h..(i + 1) * r * h),
+                )?;
+            }
+            let mut l = |name: &str, factor: &str, count: usize| {
+                lora.tensor(
+                    s,
+                    &format!("{block}.{name}.lora_{factor}.default.weight"),
+                    count,
+                )
+            };
+            (
+                qkv_a,
+                l("attn.to_q", "B", w * r)?,
+                l("attn.to_k", "B", w * r)?,
+                l("attn.to_v", "B", w * r)?,
+                l("attn.to_out.0", "A", r * w)?,
+                l("attn.to_out.0", "B", h * r)?,
+                l("ff.net.0.proj", "A", r * h)?,
+                l("ff.net.0.proj", "B", 2 * f * r)?,
+                l("ff.net.2", "A", r * f)?,
+                l("ff.net.2", "B", h * r)?,
+                r,
+            )
+        } else {
+            ensure!(rank == 0, "{block}: rank {rank} without LoRA");
+            let empty = || s.alloc_zeros::<bf16>(0);
+            (
+                empty()?,
+                empty()?,
+                empty()?,
+                empty()?,
+                empty()?,
+                empty()?,
+                empty()?,
+                empty()?,
+                empty()?,
+                empty()?,
+                0,
             )
         };
         Ok(Self {
-            q_b: l("attn.to_q", "B", w * r)?,
-            k_b: l("attn.to_k", "B", w * r)?,
-            v_b: l("attn.to_v", "B", w * r)?,
-            out_a: l("attn.to_out.0", "A", r * w)?,
-            out_b: l("attn.to_out.0", "B", h * r)?,
-            in_a: l("ff.net.0.proj", "A", r * h)?,
-            in_b: l("ff.net.0.proj", "B", 2 * f * r)?,
-            ffo_a: l("ff.net.2", "A", r * f)?,
-            ffo_b: l("ff.net.2", "B", h * r)?,
+            q_b,
+            k_b,
+            v_b,
+            out_a,
+            out_b,
+            in_a,
+            in_b,
+            ffo_a,
+            ffo_b,
             norm1,
             norm2,
             norm_q,
@@ -715,26 +753,22 @@ impl BlockWork {
     /// Binds the fixed GEMM plans of every base and LoRA-A linear shape these rows run: q/k/v, out, the stacked
     /// q/k/v LoRA A and the out LoRA A over all rows; the two FFN projections and their LoRA A over full and tail
     /// chunks.
-    pub(crate) fn prepare(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
+    pub(crate) fn prepare<const LORA: bool>(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
         let (h, width, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, self.rank);
-        let mut shapes = vec![
-            (self.rows, width, h, false),
-            (self.rows, h, width, false),
-            (self.rows, 3 * r, h, false),
-            (self.rows, r, width, false),
-        ];
+        let mut shapes = vec![(self.rows, width, h, false), (self.rows, h, width, false)];
+        if LORA {
+            shapes.extend([(self.rows, 3 * r, h, false), (self.rows, r, width, false)]);
+        }
         for rows in [self.chunk, self.rows % self.chunk]
             .into_iter()
             .filter(|&n| n > 0)
         {
-            shapes.extend([
-                (rows, 2 * f, h, false),
-                (rows, h, f, false),
-                (rows, r, h, self.fixed_lora),
-                (rows, r, f, self.fixed_lora),
-            ]);
-            if self.fixed_lora {
-                shapes.extend([(rows, 2 * f, r, true), (rows, h, r, true)]);
+            shapes.extend([(rows, 2 * f, h, false), (rows, h, f, false)]);
+            if LORA {
+                shapes.extend([(rows, r, h, self.fixed_lora), (rows, r, f, self.fixed_lora)]);
+                if self.fixed_lora {
+                    shapes.extend([(rows, 2 * f, r, true), (rows, h, r, true)]);
+                }
             }
         }
         for (rows, output, input, family) in shapes {
@@ -755,7 +789,7 @@ impl BlockWork {
         Ok(())
     }
 
-    fn ffn_cost(
+    fn ffn_cost<const LORA: bool>(
         &self,
         blas: &Blas,
         spec: &H3Spec,
@@ -779,17 +813,16 @@ impl BlockWork {
                 continue;
             }
             let mut launches = 1;
-            for (index, (output, input)) in [
+            let shapes = [
                 (2 * spec.ffn, spec.hidden),
                 (spec.hidden, spec.ffn),
                 (self.rank, spec.hidden),
                 (self.rank, spec.ffn),
                 (2 * spec.ffn, self.rank),
                 (spec.hidden, self.rank),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            ];
+            let counted = if LORA { shapes.len() } else { 2 };
+            for (index, &(output, input)) in shapes[..counted].iter().enumerate() {
                 let (wave_cost, reduction) = blas.fixed_plan_cost(
                     crate::backend::setup::LinearShape {
                         rows,
@@ -816,7 +849,12 @@ impl BlockWork {
         Ok(plan)
     }
 
-    fn ffn_choices(&self, blas: &Blas, spec: &H3Spec, budget: usize) -> Result<Vec<FfnPlan>> {
+    fn ffn_choices<const LORA: bool>(
+        &self,
+        blas: &Blas,
+        spec: &H3Spec,
+        budget: usize,
+    ) -> Result<Vec<FfnPlan>> {
         let mut choices = Vec::new();
         for chunks in 1..=self.rows.div_ceil(self.chunk) {
             let chunk = self.rows.div_ceil(chunks);
@@ -827,7 +865,7 @@ impl BlockWork {
             if chunk != self.chunk && FfnPlan::allocation(chunk, spec.ffn)? > budget {
                 continue;
             }
-            match self.ffn_cost(blas, spec, chunk, false) {
+            match self.ffn_cost::<LORA>(blas, spec, chunk, false) {
                 Ok(plan) => choices.push(plan),
                 Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
                     .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
@@ -845,7 +883,12 @@ impl BlockWork {
         Ok(choices)
     }
 
-    fn alias_choices(&self, blas: &Blas, spec: &H3Spec, owned: FfnPlan) -> Result<Vec<FfnPlan>> {
+    fn alias_choices<const LORA: bool>(
+        &self,
+        blas: &Blas,
+        spec: &H3Spec,
+        owned: FfnPlan,
+    ) -> Result<Vec<FfnPlan>> {
         let capacity = FfnPlan::alias_capacity((self.q_raw.len(), self.k_raw.len()), spec.ffn)?;
         let mut choices = vec![owned];
         for chunks in 1..=self.rows.div_ceil(self.chunk) {
@@ -854,7 +897,7 @@ impl BlockWork {
             if chunk > capacity || (tail > 0 && tail <= crate::linear_plan::MAX_SKINNY_ROWS) {
                 continue;
             }
-            let mut plan = match self.ffn_cost(blas, spec, chunk, false) {
+            let mut plan = match self.ffn_cost::<LORA>(blas, spec, chunk, false) {
                 Ok(plan) => plan,
                 Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
                     .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
@@ -872,7 +915,7 @@ impl BlockWork {
         Ok(choices)
     }
 
-    fn bind_ffn(
+    fn bind_ffn<const LORA: bool>(
         &mut self,
         s: &Arc<CudaStream>,
         blas: &Blas,
@@ -906,34 +949,27 @@ impl BlockWork {
             "FFN hidden",
             "FFN gated",
         )?;
-        for (name, protected) in [
-            ("normed", &self.normed),
-            ("LoRA", &self.lora),
-            ("residual", x),
-        ] {
-            let protected = matrix(protected, s, 1, protected.len())?;
-            crate::backend::cuda::contracts::no_overlap(
-                &self.hidden,
-                &protected,
-                "FFN hidden",
-                name,
-            )?;
-            crate::backend::cuda::contracts::no_overlap(
-                &self.gated,
-                &protected,
-                "FFN gated",
-                name,
-            )?;
+        let hidden = &self.hidden;
+        let gated = &self.gated;
+        let overlap = |name: &str, buffer: &CudaSlice<bf16>| -> Result<()> {
+            let protected = matrix(buffer, s, 1, buffer.len())?;
+            crate::backend::cuda::contracts::no_overlap(hidden, &protected, "FFN hidden", name)?;
+            crate::backend::cuda::contracts::no_overlap(gated, &protected, "FFN gated", name)
+        };
+        overlap("normed", &self.normed)?;
+        if LORA {
+            overlap("LoRA", &self.lora)?;
         }
+        overlap("residual", x)?;
         self.chunk = plan.chunk;
         ensure!(
             self.hidden.ptr.is_multiple_of(256) && self.gated.ptr.is_multiple_of(256),
             "FFN view alignment"
         );
         self.fixed_lora = true;
-        self.prepare(blas, spec)?;
+        self.prepare::<LORA>(blas, spec)?;
         if self.rows > FFN_CHUNK_ROWS {
-            self.ffn_cost(blas, spec, self.chunk, true)?;
+            self.ffn_cost::<LORA>(blas, spec, self.chunk, true)?;
         }
         Ok(())
     }
@@ -1067,9 +1103,10 @@ fn lora_pair(
     }
 }
 
-/// One MiniMax-H3 transformer or token refiner block over `x [rows, hidden]` in place, BF16, LoRA applied online
-/// at `c.lora_scale`. A modulated block's `rotary` is `[rows, 6 * rope_freq_dim]` from `rotary_table`.
-pub(crate) fn block_forward(
+/// One MiniMax-H3 transformer or token refiner block over `x [rows, hidden]` in place, BF16. The `LORA` monomorph
+/// applies LoRA online at `c.lora_scale`; the other monomorph launches no LoRA GEMM. A modulated block's `rotary`
+/// is `[rows, 6 * rope_freq_dim]` from `rotary_table`.
+pub(crate) fn block_forward<const LORA: bool>(
     c: &BlockContext<'_>,
     flash: &mut Flash,
     w: &BlockWeights,
@@ -1204,26 +1241,28 @@ pub(crate) fn block_forward(
             rows_view(out, s, 0, rows, width, width)?,
         )?;
     }
-    blas.linear_typed(
-        crate::op_contract::ExecutionPhase::Prefill,
-        crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(&w.qkv_a, s, 3 * r, h)?),
-        rows_view(&work.normed, s, 0, rows, h, h)?,
-        &mut TensorMut(rows_view(&work.lora, s, 0, rows, 3 * r, 3 * r)?),
-    )?;
-    for (i, (b, out)) in [
-        (&w.q_b, &work.q_raw),
-        (&w.k_b, &work.k_raw),
-        (&w.v_b, &work.v_raw),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        blas.linear_accumulate(
-            matrix(b, s, width, r)?,
-            rows_view(&work.lora, s, i * r, rows, r, 3 * r)?,
-            &mut TensorMut(matrix(out, s, rows, width)?),
-            lora_scale,
+    if LORA {
+        blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(&w.qkv_a, s, 3 * r, h)?),
+            rows_view(&work.normed, s, 0, rows, h, h)?,
+            &mut TensorMut(rows_view(&work.lora, s, 0, rows, 3 * r, 3 * r)?),
         )?;
+        for (i, (b, out)) in [
+            (&w.q_b, &work.q_raw),
+            (&w.k_b, &work.k_raw),
+            (&w.v_b, &work.v_raw),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            blas.linear_accumulate(
+                matrix(b, s, width, r)?,
+                rows_view(&work.lora, s, i * r, rows, r, 3 * r)?,
+                &mut TensorMut(matrix(out, s, rows, width)?),
+                lora_scale,
+            )?;
+        }
     }
     let head_rows = rows * spec.heads;
     norm(
@@ -1285,14 +1324,16 @@ pub(crate) fn block_forward(
         rows_view(&work.v_raw, s, 0, rows, width, width)?,
         rows_view(&work.normed, s, 0, rows, h, h)?,
     )?;
-    lora_pair(
-        c,
-        rows_view(&work.v_raw, s, 0, rows, width, width)?,
-        (&w.out_a, &w.out_b),
-        &mut work.lora,
-        rows_view(&work.normed, s, 0, rows, h, h)?,
-        false,
-    )?;
+    if LORA {
+        lora_pair(
+            c,
+            rows_view(&work.v_raw, s, 0, rows, width, width)?,
+            (&w.out_a, &w.out_b),
+            &mut work.lora,
+            rows_view(&work.normed, s, 0, rows, h, h)?,
+            false,
+        )?;
+    }
     if modulation.is_some() {
         gated_add(xp, normed, 2)?;
     } else {
@@ -1300,7 +1341,7 @@ pub(crate) fn block_forward(
     }
 
     hidden_norm(&w.norm2, 3, 4)?;
-    ffn_forward::<false>(c, w, work)?;
+    ffn_forward::<false, LORA>(c, w, work)?;
     if modulation.is_some() {
         gated_add(xp, normed, 5)?;
     } else {
@@ -1310,7 +1351,7 @@ pub(crate) fn block_forward(
 }
 
 /// FFN rows overwrite their input after the gated projection; scratch is reused between chunks.
-fn ffn_forward<const SHIFT_INPUT: bool>(
+fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     c: &BlockContext<'_>,
     w: &BlockWeights,
     work: &mut BlockWork,
@@ -1339,14 +1380,16 @@ fn ffn_forward<const SHIFT_INPUT: bool>(
             rows_view(&work.normed, s, input_start * h, n, h, h)?,
             work.hidden.prefix_rows(u32::try_from(n)?)?,
         )?;
-        lora_pair(
-            c,
-            rows_view(&work.normed, s, input_start * h, n, h, h)?,
-            (&w.in_a, &w.in_b),
-            &mut work.lora,
-            work.hidden.prefix_rows(u32::try_from(n)?)?,
-            work.fixed_lora,
-        )?;
+        if LORA {
+            lora_pair(
+                c,
+                rows_view(&work.normed, s, input_start * h, n, h, h)?,
+                (&w.in_a, &w.in_b),
+                &mut work.lora,
+                work.hidden.prefix_rows(u32::try_from(n)?)?,
+                work.fixed_lora,
+            )?;
+        }
         let hidden = work.hidden.ptr + if SHIFT_INPUT { 256 } else { 0 };
         let gated = work.gated.ptr;
         let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
@@ -1364,14 +1407,16 @@ fn ffn_forward<const SHIFT_INPUT: bool>(
             work.gated.prefix_rows(u32::try_from(n)?)?,
             rows_view(&work.normed, s, start * h, n, h, h)?,
         )?;
-        lora_pair(
-            c,
-            work.gated.prefix_rows(u32::try_from(n)?)?,
-            (&w.ffo_a, &w.ffo_b),
-            &mut work.lora,
-            rows_view(&work.normed, s, start * h, n, h, h)?,
-            work.fixed_lora,
-        )?;
+        if LORA {
+            lora_pair(
+                c,
+                work.gated.prefix_rows(u32::try_from(n)?)?,
+                (&w.ffo_a, &w.ffo_b),
+                &mut work.lora,
+                rows_view(&work.normed, s, start * h, n, h, h)?,
+                work.fixed_lora,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1848,7 +1893,7 @@ impl Dit {
         let norm_out = base.tensor(s, "norm_out.norm.weight", h)?;
         let refiners = (0..spec.refiner_layers)
             .map(|i| {
-                BlockWeights::resident(
+                BlockWeights::resident::<true>(
                     s,
                     spec,
                     r,
@@ -1866,9 +1911,9 @@ impl Dit {
             LinearBiasMode::BeforeOutputRound,
         )?;
         let mut work = BlockWork::new(s, spec, r, ranges.rows)?;
-        work.prepare(blas, spec)?;
+        work.prepare::<true>(blas, spec)?;
         let text_work = BlockWork::new(s, spec, r, ranges.text)?;
-        text_work.prepare(blas, spec)?;
+        text_work.prepare::<true>(blas, spec)?;
         let flash = Flash::new(
             s.clone(),
             ranges.rows,
@@ -1930,9 +1975,9 @@ impl Dit {
             };
             blocks.push(match slot {
                 Some(slot) => {
-                    BlockWeights::streamed(s, spec, r, &name, slot, &mut base, &mut lora)?
+                    BlockWeights::streamed::<true>(s, spec, r, &name, slot, &mut base, &mut lora)?
                 }
-                None => BlockWeights::resident(s, spec, r, &name, &mut base, &mut lora)?,
+                None => BlockWeights::resident::<true>(s, spec, r, &name, &mut base, &mut lora)?,
             });
         }
         let (free, total) = d.ctx.mem_get_info()?;
@@ -1947,16 +1992,16 @@ impl Dit {
             })?;
         }
         let budget = d.workspace_budget(free, free, reserve)?;
-        let choices = work.ffn_choices(blas, spec, budget)?;
+        let choices = work.ffn_choices::<true>(blas, spec, budget)?;
         let owned = FfnPlan::select(&choices, budget)?;
-        let aliases = work.alias_choices(blas, spec, owned)?;
+        let aliases = work.alias_choices::<true>(blas, spec, owned)?;
         let chosen = FfnPlan::select(&aliases, budget)?;
         let previous = *choices
             .iter()
             .find(|p| p.chunk == work.chunk)
             .context("main FFN baseline missing")?;
         if work.rows > FFN_CHUNK_ROWS {
-            work.ffn_cost(blas, spec, work.chunk, true)?;
+            work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
         }
         let description = |plan: FfnPlan| {
             serde_json::json!({
@@ -1980,7 +2025,7 @@ impl Dit {
                 "new_allocation_bytes":0,"ordinary_plans":true}}})
         );
         blas.bind_workspace(chosen.workspace)?;
-        work.bind_ffn(s, blas, spec, chosen, &x)?;
+        work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
         s.synchronize()?;
         eprintln!(
             "{}",
@@ -2206,7 +2251,7 @@ impl Dit {
             LinearBiasMode::BeforeOutputRound,
         )?;
         for refiner in &self.refiners {
-            block_forward(
+            block_forward::<true>(
                 c,
                 &mut self.text_flash,
                 refiner,
@@ -2262,7 +2307,7 @@ impl Dit {
                 entries: pairs,
                 index: inputs.row_pairs,
             };
-            block_forward(
+            block_forward::<true>(
                 c,
                 &mut self.flash,
                 block,
@@ -2322,6 +2367,523 @@ impl Dit {
             &self.audio,
             r.audio,
         )?;
+        Ok(())
+    }
+}
+
+/// Block geometry of an image transformer. `audio_in_channels` is 0.
+fn image_block_spec(spec: &ImageSpec) -> H3Spec {
+    H3Spec {
+        hidden: spec.hidden,
+        heads: spec.heads,
+        head_dim: spec.head_dim,
+        layers: spec.layers,
+        refiner_layers: spec.refiner_layers,
+        ffn: spec.ffn,
+        in_channels: spec.in_channels,
+        audio_in_channels: 0,
+        patch: spec.patch,
+        text_dim: spec.text_dim,
+        freq_dim: spec.freq_dim,
+        time_hidden: spec.time_hidden,
+        time_dim: spec.time_dim,
+        rope_freq_dim: spec.rope_freq_dim,
+        rope_theta: spec.rope_theta,
+        norm_eps: spec.norm_eps,
+        qk_norm_eps: spec.qk_norm_eps,
+        final_norm_eps: spec.final_norm_eps,
+    }
+}
+
+/// One image evaluation: patchified image rows `[image rows, 96]` in F32 (references first), text states
+/// `[text rows, text_dim]` in BF16, and the AdaLN pair and timestep of every packed row.
+pub(crate) struct ImageStepInputs<'a> {
+    pub image: &'a CudaSlice<f32>,
+    pub text: &'a CudaSlice<bf16>,
+    pub row_pairs: &'a CudaSlice<u32>,
+    pub row_timesteps: &'a CudaSlice<u32>,
+}
+
+/// Image transformer over one `[text | reference | generated]` layout. No audio projection and no LoRA. Six F32
+/// `pdd_proj_out` heads; head `k` is evaluation `k`. The block matrices are placed by `DensePlacement`.
+pub(crate) struct ImageDit {
+    text_rows: usize,
+    image_rows: usize,
+    reference_rows: usize,
+    row_width: usize,
+    proj_in: [CudaSlice<f32>; 2],
+    heads: Vec<[CudaSlice<f32>; 2]>,
+    context: [CudaSlice<bf16>; 2],
+    final_norm: CudaSlice<bf16>,
+    norm_out: CudaSlice<bf16>,
+    refiners: Vec<BlockWeights>,
+    blocks: Vec<BlockWeights>,
+    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    rotary: CudaSlice<bf16>,
+    x: CudaSlice<bf16>,
+    work: BlockWork,
+    flash: Flash,
+    text: CudaSlice<bf16>,
+    text_work: BlockWork,
+    text_flash: Flash,
+    scratch: CudaSlice<f32>,
+    /// Velocity of every image row, `[image rows, 96]`, references first.
+    pub velocity: CudaSlice<f32>,
+    upcast: crate::backend::gpu::CudaFunction,
+    bias: crate::backend::gpu::CudaFunction,
+    round: crate::backend::gpu::CudaFunction,
+    euler: crate::backend::gpu::CudaFunction,
+}
+
+impl ImageDit {
+    pub(crate) fn new(
+        d: &Device,
+        blas: &mut Blas,
+        (spec, image): (&H3Spec, &ImageSpec),
+        layout: &ImageLayout,
+        dir: &Path,
+        manifest: &TensorManifest,
+        placement: Placement,
+    ) -> Result<Self> {
+        ensure!(
+            image_block_spec(image) == *spec,
+            "image block geometry differs from the image spec"
+        );
+        let s = &d.stream;
+        let text_rows = layout.text_indices.len();
+        let image_rows = layout.image_indices.len();
+        let rows = layout.rows();
+        let reference_rows = layout.reference_rows;
+        ensure!(
+            text_rows > 0
+                && image_rows > reference_rows
+                && text_rows + image_rows == rows
+                && layout
+                    .text_indices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &row)| row as usize == i)
+                && layout
+                    .image_indices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &row)| row as usize == text_rows + i),
+            "image layout is not [text | reference | generated]"
+        );
+        let mut base = Source::new(dir, manifest);
+        let mut unused = Source::new(dir, manifest);
+        let (h, row_width) = (spec.hidden, image.row_width());
+        let proj_in = [
+            base.tensor(s, "proj_in.weight", h * row_width)?,
+            base.tensor(s, "proj_in.bias", h)?,
+        ];
+        let mut heads = Vec::with_capacity(image.pdd_heads);
+        for head in 0..image.pdd_heads {
+            let name = format!("pdd_proj_out.{head}");
+            heads.push([
+                base.tensor(s, &format!("{name}.weight"), row_width * h)?,
+                base.tensor(s, &format!("{name}.bias"), row_width)?,
+            ]);
+        }
+        let context = [
+            base.tensor(s, "context_embedder.weight", h * spec.text_dim)?,
+            base.tensor(s, "context_embedder.bias", h)?,
+        ];
+        let final_norm = base.tensor(s, "token_refiner.final_norm.weight", h)?;
+        let norm_out = base.tensor(s, "norm_out.norm.weight", h)?;
+        let refiners = (0..spec.refiner_layers)
+            .map(|i| {
+                BlockWeights::resident::<false>(
+                    s,
+                    spec,
+                    0,
+                    &format!("token_refiner.refiner_blocks.{i}"),
+                    &mut base,
+                    &mut unused,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        blas.prepare_biased(
+            u32::try_from(text_rows)?,
+            u32::try_from(h)?,
+            u32::try_from(spec.text_dim)?,
+            vector(&context[1], s)?,
+            LinearBiasMode::BeforeOutputRound,
+        )?;
+        let mut work = BlockWork::new(s, spec, 0, rows)?;
+        work.prepare::<false>(blas, spec)?;
+        let text_work = BlockWork::new(s, spec, 0, text_rows)?;
+        text_work.prepare::<false>(blas, spec)?;
+        let flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
+        let text_flash = Flash::new(s.clone(), text_rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
+        let x = s.alloc_zeros::<bf16>(rows * h)?;
+        let text = s.alloc_zeros::<bf16>(text_rows * h)?;
+        let scratch = s.alloc_zeros::<f32>(image_rows * h)?;
+        let velocity = s.alloc_zeros::<f32>(image_rows * row_width)?;
+        let rotary = s.clone_htod(&rotary_rows(
+            spec.rope_freq_dim,
+            spec.rope_theta,
+            &layout.position_ids,
+        ))?;
+        let sizing = dense_sizing(manifest, spec.layers)?;
+        let owned =
+            spec.layers * 2 * (2 * h + 2 * spec.head_dim) + sizing.staging + sizing.transient;
+        let dense = place_layers(
+            d,
+            &mut base,
+            (
+                &sizing.layers,
+                &sizing.source_layers,
+                sizing.largest,
+                owned,
+                0,
+            ),
+            placement,
+            |layer| format!("transformer_blocks.{layer}"),
+            &LINEAR_ROLES,
+        )?;
+        let mut blocks = Vec::with_capacity(spec.layers);
+        for (layer, &bytes) in sizing.layers.iter().enumerate() {
+            let name = format!("transformer_blocks.{layer}");
+            let slot = match &dense {
+                Some(dense) if dense.plan.slots[layer].is_some() => {
+                    Some(dense.pointer(layer, 0, bytes)?)
+                }
+                _ => None,
+            };
+            blocks.push(match slot {
+                Some(slot) => BlockWeights::streamed::<false>(
+                    s,
+                    spec,
+                    0,
+                    &name,
+                    slot,
+                    &mut base,
+                    &mut unused,
+                )?,
+                None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, &mut unused)?,
+            });
+        }
+        let (free, total) = d.ctx.mem_get_info()?;
+        let reserve = (total / 16)
+            .checked_add(sizing.transient)
+            .context("FFN live reserve overflow")?;
+        let budget = d.workspace_budget(free, free, reserve)?;
+        let choices = work.ffn_choices::<false>(blas, spec, budget)?;
+        let owned_plan = FfnPlan::select(&choices, budget)?;
+        let aliases = work.alias_choices::<false>(blas, spec, owned_plan)?;
+        let chosen = FfnPlan::select(&aliases, budget)?;
+        blas.bind_workspace(chosen.workspace)?;
+        work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
+        s.synchronize()?;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "h3_image_ffn_plan": {
+                    "rows": rows,
+                    "chunk": chosen.chunk,
+                    "allocation": chosen.allocation,
+                    "workspace": chosen.workspace,
+                }
+            })
+        );
+        let vision = cubin::module(s.context(), "vision_ops")?;
+        Ok(Self {
+            text_rows,
+            image_rows,
+            reference_rows,
+            row_width,
+            proj_in,
+            heads,
+            context,
+            final_norm,
+            norm_out,
+            refiners,
+            blocks,
+            dense,
+            rotary,
+            x,
+            work,
+            flash,
+            text,
+            text_work,
+            text_flash,
+            scratch,
+            velocity,
+            upcast: vision.load_function("vision_upcast_f32")?,
+            bias: vision.load_function("vision_bias_f32")?,
+            round: vision.load_function("vision_affine_cast_bf16")?,
+            euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
+        })
+    }
+
+    fn projection(
+        &self,
+        c: &BlockContext<'_>,
+        [w, b]: &[CudaSlice<f32>; 2],
+        x: &CudaSlice<f32>,
+        y: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<()> {
+        let s = c.s;
+        let (n, k) = (b.len(), w.len() / b.len());
+        c.blas.linear_f32(
+            view(
+                w,
+                s,
+                0,
+                [u32::try_from(n)?, u32::try_from(k)?],
+                [k as u64, 1],
+            )?,
+            view(
+                x,
+                s,
+                0,
+                [u32::try_from(rows)?, u32::try_from(k)?],
+                [k as u64, 1],
+            )?,
+            &mut TensorMut(view(
+                y,
+                s,
+                0,
+                [u32::try_from(rows)?, u32::try_from(n)?],
+                [n as u64, 1],
+            )?),
+        )?;
+        let out = pointer(y, s);
+        unsafe {
+            s.launch_builder(&self.bias)
+                .arg(&out)
+                .arg(&pointer(b, s))
+                .arg(&out)
+                .arg(&u32::try_from(rows)?)
+                .arg(&u32::try_from(n)?)
+                .launch(flat(rows * n))?;
+        }
+        Ok(())
+    }
+
+    fn round_into(
+        &self,
+        s: &Arc<CudaStream>,
+        source: u64,
+        target: usize,
+        count: usize,
+    ) -> Result<()> {
+        cast_rows(
+            s,
+            &self.round,
+            source,
+            pointer(&self.x, s) + 2 * target as u64,
+            count,
+        )
+    }
+
+    fn upcast_from(&self, s: &Arc<CudaStream>, source: usize, count: usize) -> Result<()> {
+        unsafe {
+            s.launch_builder(&self.upcast)
+                .arg(&(pointer(&self.work.normed, s) + 2 * source as u64))
+                .arg(&pointer(&self.scratch, s))
+                .arg(&u32::try_from(count)?)
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// `x = r * x + (1 - r) * (x + sigma * v)` on the generated image rows. Reference rows stay put.
+    fn euler(
+        &self,
+        s: &Arc<CudaStream>,
+        image: &CudaSlice<f32>,
+        schedule: &ImageSchedule,
+        k: usize,
+    ) -> Result<()> {
+        let width = self.row_width;
+        let offset = self.reference_rows * width;
+        let count = (self.image_rows - self.reference_rows) * width;
+        ensure!(
+            k + 1 < schedule.sigmas.len()
+                && offset + count <= image.len()
+                && offset + count <= self.velocity.len(),
+            "image Euler extent"
+        );
+        let sigma = schedule.sigmas[k];
+        let sigma_next = schedule.sigmas[k + 1];
+        ensure!(sigma > 0.0 && sigma_next >= 0.0, "image sigma {sigma}");
+        let ratio = sigma_next / sigma;
+        unsafe {
+            s.launch_builder(&self.euler)
+                .arg(&(pointer(image, s) + 4 * offset as u64))
+                .arg(&(pointer(&self.velocity, s) + 4 * offset as u64))
+                .arg(&(count as u64))
+                .arg(&sigma)
+                .arg(&ratio)
+                .arg(&(1.0f32 - ratio))
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// One evaluation. Head `head` writes the velocity of every image row into `self.velocity`.
+    pub(crate) fn step(
+        &mut self,
+        c: &BlockContext<'_>,
+        adaln: &AdalnTable,
+        (pairs, timesteps): (u32, u32),
+        head: usize,
+        inputs: &ImageStepInputs<'_>,
+    ) -> Result<()> {
+        let (s, spec) = (c.s, c.spec);
+        let h = spec.hidden;
+        let (text_rows, image_rows, rows) = (
+            self.text_rows,
+            self.image_rows,
+            self.text_rows + self.image_rows,
+        );
+        ensure!(
+            head < self.heads.len()
+                && inputs.image.len() == image_rows * self.row_width
+                && inputs.text.len() == text_rows * spec.text_dim
+                && inputs.row_pairs.len() == rows
+                && inputs.row_timesteps.len() == rows,
+            "image evaluation inputs differ from the layout"
+        );
+        c.blas.linear_biased(
+            matrix(&self.context[0], s, h, spec.text_dim)?,
+            vector(&self.context[1], s)?,
+            matrix(inputs.text, s, text_rows, spec.text_dim)?,
+            &mut TensorMut(matrix(&self.text, s, text_rows, h)?),
+            LinearBiasMode::BeforeOutputRound,
+        )?;
+        for refiner in &self.refiners {
+            block_forward::<false>(
+                c,
+                &mut self.text_flash,
+                refiner,
+                &Conditioning::Plain,
+                &mut self.text,
+                &mut self.text_work,
+            )?;
+        }
+        c.kernels.rms_norm(
+            s,
+            NormRows {
+                input: pointer(&self.text, s),
+                weight: pointer(&self.final_norm, s),
+                output: pointer(&self.x, s),
+                rows: text_rows,
+                dim: h,
+                threads: HIDDEN_NORM_THREADS,
+                eps: spec.final_norm_eps,
+            },
+        )?;
+        self.projection(c, &self.proj_in, inputs.image, &self.scratch, image_rows)?;
+        self.round_into(s, pointer(&self.scratch, s), text_rows * h, image_rows * h)?;
+        let block_rows = 6 * h * pairs as usize;
+        for (layer, block) in self.blocks.iter().enumerate() {
+            if let Some(dense) = self.dense.as_mut() {
+                dense.begin(layer, s)?;
+            }
+            let modulation = Modulation {
+                table: &adaln.blocks,
+                offset: layer * block_rows,
+                entries: pairs,
+                index: inputs.row_pairs,
+            };
+            block_forward::<false>(
+                c,
+                &mut self.flash,
+                block,
+                &Conditioning::Modulated {
+                    rotary: &self.rotary,
+                    modulation: &modulation,
+                },
+                &mut self.x,
+                &mut self.work,
+            )?;
+            if let Some(dense) = self.dense.as_mut() {
+                dense.end(layer, s)?;
+            }
+        }
+        let normed = pointer(&self.work.normed, s);
+        ensure!(
+            adaln.norm_out.len() == timesteps as usize * 2 * h,
+            "output-norm table extent"
+        );
+        let table = pointer(&adaln.norm_out, s);
+        c.kernels.rms_norm_modulate(
+            s,
+            NormRows {
+                input: pointer(&self.x, s),
+                weight: pointer(&self.norm_out, s),
+                output: normed,
+                rows,
+                dim: h,
+                threads: HIDDEN_NORM_THREADS,
+                eps: spec.final_norm_eps,
+            },
+            ModulateRows {
+                data: normed,
+                shift: table,
+                scale: table + 2 * h as u64,
+                index: pointer(inputs.row_timesteps, s),
+                rows,
+                dim: h,
+                stride: 2 * h,
+                entries: timesteps,
+            },
+        )?;
+        self.upcast_from(s, text_rows * h, image_rows * h)?;
+        self.projection(
+            c,
+            &self.heads[head],
+            &self.scratch,
+            &self.velocity,
+            image_rows,
+        )?;
+        Ok(())
+    }
+
+    /// Six published evaluations. `image` is updated in place on the generated rows; reference rows stay put.
+    pub(crate) fn sample(
+        &mut self,
+        c: &BlockContext<'_>,
+        adaln: (&AdalnTable, &AdalnPlan),
+        schedule: &ImageSchedule,
+        image: &CudaSlice<f32>,
+        text: &CudaSlice<bf16>,
+    ) -> Result<()> {
+        let (table, plan) = adaln;
+        let s = c.s;
+        ensure!(
+            plan.row_pairs.len() == schedule.timesteps.len()
+                && schedule.sigmas.len() == schedule.timesteps.len() + 1,
+            "image plan and schedule differ"
+        );
+        let counts = (
+            u32::try_from(plan.pairs.len())?,
+            u32::try_from(plan.timesteps.len())?,
+        );
+        for k in 0..plan.row_pairs.len() {
+            let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
+            let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
+            self.step(
+                c,
+                table,
+                counts,
+                k,
+                &ImageStepInputs {
+                    image,
+                    text,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            self.euler(s, image, schedule, k)?;
+        }
+        s.synchronize()?;
         Ok(())
     }
 }
@@ -2840,6 +3402,71 @@ pub fn generate(
     Ok(pipeline::run(model, lora, request, (device, runtime), gguf)?.output)
 }
 
+/// Six published image evaluations. `rows` is `[image rows, 96]`, references first. The returned buffer is those
+/// image rows after the six Euler updates. Reference rows stay at their input values. Placement is derived.
+pub fn image_sample(
+    model: &Path,
+    layout: &ImageLayout,
+    (device, runtime): (usize, &Path),
+    rows: &[f32],
+    text: &[bf16],
+) -> Result<Vec<f32>> {
+    let image = ImageSpec::read(model)?;
+    let spec = image_block_spec(&image);
+    let schedule = ImageSchedule::published()?;
+    let width = image.row_width();
+    ensure!(
+        rows.len() == layout.image_indices.len() * width
+            && text.len() == layout.text_indices.len() * spec.text_dim
+            && !rows.is_empty()
+            && rows.iter().all(|v| v.is_finite())
+            && text.iter().all(|v| v.to_f32().is_finite()),
+        "image sample extents"
+    );
+    let dir = model.join("transformer_diffusers");
+    let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+        .minimax_h3_image_manifest(&image)?;
+    let plan = image_row_plan(layout, &schedule)?;
+    let adaln = AdalnPlan::from_tags(&layout.token_tags, &plan);
+    let device = Device::new(device)?;
+    let ops = ops::Ops::new(&device.ctx)?;
+    device.finish_upload()?;
+    let mut blas = Blas::new(
+        &device,
+        &ops,
+        runtime,
+        Rc::new(Closure::new(true, "MiniMax-H3-Image".into())),
+    )?;
+    let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &adaln)?;
+    let mut dit = ImageDit::new(
+        &device,
+        &mut blas,
+        (&spec, &image),
+        layout,
+        &dir,
+        &manifest,
+        Placement::Derived,
+    )?;
+    let kernels = BlockKernels::new(&device.ctx)?;
+    let s = &device.stream;
+    let context = BlockContext {
+        s,
+        blas: &blas,
+        kernels: &kernels,
+        spec: &spec,
+        lora_scale: 1.0,
+    };
+    let image_rows = s.clone_htod(rows)?;
+    let text = s.clone_htod(text)?;
+    dit.sample(&context, (&table, &adaln), &schedule, &image_rows, &text)?;
+    let out = s.clone_dtoh(&image_rows)?;
+    ensure!(
+        out.len() == rows.len() && out.iter().all(|v| v.is_finite()),
+        "non-finite image sample"
+    );
+    Ok(out)
+}
+
 /// One Qwen3-VL conditioner prompt: prompt tokens with their image grids and packed `pixel_values`.
 pub(crate) struct ConditionerPrompt {
     pub tokens: Vec<u32>,
@@ -2921,8 +3548,8 @@ mod tests {
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::checkpoint::MappedCheckpoint;
     use crate::minimax_h3::{
-        Geometry, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, noise_draws,
-        row_timestep_plan,
+        Geometry, ImageSchedule, ImageSpec, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule,
+        image_layout, noise_draws, rotary_rows, row_timestep_plan,
     };
     use anyhow::bail;
     use safetensors::SafeTensors;
@@ -3074,7 +3701,7 @@ mod tests {
             )),
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
-        let weights = BlockWeights::resident(
+        let weights = BlockWeights::resident::<true>(
             s,
             &spec,
             adapter.rank,
@@ -3084,7 +3711,7 @@ mod tests {
         )?;
         for rows in [1usize, 12, 16, 17] {
             let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
-            work.prepare(&blas, &spec)?;
+            work.prepare::<true>(&blas, &spec)?;
             let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
                 .with_full_single_probability()?;
             let input: Vec<bf16> = (0..rows * spec.hidden)
@@ -3098,7 +3725,7 @@ mod tests {
                 spec: &spec,
                 lora_scale: adapter.scale,
             };
-            block_forward(
+            block_forward::<true>(
                 &context,
                 &mut flash,
                 &weights,
@@ -4234,7 +4861,7 @@ mod tests {
         let kernels = BlockKernels::new(&device.ctx)?;
         let weights: Vec<BlockWeights> = (0..2)
             .map(|layer| {
-                BlockWeights::resident(
+                BlockWeights::resident::<true>(
                     s,
                     &spec,
                     adapter.rank,
@@ -4267,8 +4894,8 @@ mod tests {
             )?;
             let mut owned = BlockWork::new(s, &spec, adapter.rank, rows)?;
             let mut borrowed = BlockWork::new(s, &spec, adapter.rank, rows)?;
-            owned.prepare(&blas, &spec)?;
-            borrowed.prepare(&blas, &spec)?;
+            owned.prepare::<true>(&blas, &spec)?;
+            borrowed.prepare::<true>(&blas, &spec)?;
             for (output, input) in [
                 (adapter.rank, spec.hidden),
                 (adapter.rank, spec.ffn),
@@ -4281,11 +4908,11 @@ mod tests {
                     input,
                 })?;
             }
-            let plan = owned.ffn_cost(&blas, &spec, chunk, false)?;
+            let plan = owned.ffn_cost::<true>(&blas, &spec, chunk, false)?;
             blas.bind_workspace(plan.workspace)?;
             let mut x = s.clone_htod(&input)?;
-            owned.bind_ffn(s, &blas, &spec, plan, &x)?;
-            borrowed.bind_ffn(
+            owned.bind_ffn::<true>(s, &blas, &spec, plan, &x)?;
+            borrowed.bind_ffn::<true>(
                 s,
                 &blas,
                 &spec,
@@ -4371,7 +4998,7 @@ mod tests {
                                 entries: tables[layer].1,
                                 index: &index,
                             };
-                            block_forward(
+                            block_forward::<true>(
                                 &context,
                                 &mut flash,
                                 weight,
@@ -4384,9 +5011,9 @@ mod tests {
                             )?;
                         }
                     } else if shifted {
-                        ffn_forward::<true>(&context, &weights[0], work)?;
+                        ffn_forward::<true, true>(&context, &weights[0], work)?;
                     } else {
-                        ffn_forward::<false>(&context, &weights[0], work)?;
+                        ffn_forward::<false, true>(&context, &weights[0], work)?;
                     }
                     Ok(())
                 };
@@ -4559,7 +5186,7 @@ mod tests {
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
         let kernels = BlockKernels::new(&device.ctx)?;
-        let weights = BlockWeights::resident(
+        let weights = BlockWeights::resident::<true>(
             s,
             &spec,
             r,
@@ -4568,7 +5195,7 @@ mod tests {
             &mut Source::new(&lora_dir, &lora_manifest),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
-        work.prepare(&blas, &spec)?;
+        work.prepare::<true>(&blas, &spec)?;
         let rotary = s.clone_htod(&rotary_host)?;
         let table = s.clone_htod(&table_host)?;
         let index = s.clone_htod(&index)?;
@@ -4715,7 +5342,7 @@ mod tests {
                 spec: &spec,
                 lora_scale,
             };
-            block_forward(
+            block_forward::<true>(
                 &context,
                 &mut flash,
                 &weights,
@@ -4908,7 +5535,7 @@ mod tests {
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
         let kernels = BlockKernels::new(&device.ctx)?;
-        let weights = BlockWeights::resident(
+        let weights = BlockWeights::resident::<true>(
             s,
             &spec,
             r,
@@ -4922,7 +5549,7 @@ mod tests {
             .get_mut("transformer_blocks.0.ff.net.0.proj.weight")
             .context("fc1 entry")?
             .swap_halves = false;
-        let wrong_weights = BlockWeights::resident(
+        let wrong_weights = BlockWeights::resident::<true>(
             s,
             &spec,
             r,
@@ -4930,7 +5557,7 @@ mod tests {
             &mut Source::new(gguf_dir, &wrong),
             &mut Source::new(&lora_dir, &lora_manifest),
         )?;
-        let official_weights = BlockWeights::resident(
+        let official_weights = BlockWeights::resident::<true>(
             s,
             &spec,
             r,
@@ -4939,7 +5566,7 @@ mod tests {
             &mut Source::new(&lora_dir, &lora_manifest),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
-        work.prepare(&blas, &spec)?;
+        work.prepare::<true>(&blas, &spec)?;
         let rotary_device = s.clone_htod(&rotary_host)?;
         let table_device = s.clone_htod(&table_host)?;
         let index_device = s.clone_htod(&index_host)?;
@@ -4962,7 +5589,7 @@ mod tests {
         };
         let mut run = |weights: &BlockWeights| -> Result<Vec<f64>> {
             let mut x = s.clone_htod(&input_host)?;
-            block_forward(
+            block_forward::<true>(
                 &context,
                 &mut flash,
                 weights,
@@ -5105,7 +5732,7 @@ mod tests {
                 let mut mismatches = Vec::new();
                 for (layer, &layer_bytes) in sizing.layers.iter().enumerate() {
                     let name = format!("transformer_blocks.{layer}");
-                    let resident = BlockWeights::resident(
+                    let resident = BlockWeights::resident::<true>(
                         stream,
                         &spec,
                         adapter.rank,
@@ -7603,6 +8230,478 @@ mod tests {
             bail!("H3_SPLICE_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
         }
         println!("H3_SPLICE_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    struct ImageDitCell {
+        name: &'static str,
+        cross_max_abs: f64,
+        cross_rmse: f64,
+    }
+
+    /// Cross-device pair of the 512 DiT cells. `tau = max(2 * pair, 1e-6)`.
+    const IMAGE_DIT_512: &[ImageDitCell] = &[
+        ImageDitCell {
+            name: "dit_edit_step0",
+            cross_max_abs: 4.986_862_897_872_925,
+            cross_rmse: 1.7005365820597132e-1,
+        },
+        ImageDitCell {
+            name: "dit_step0",
+            cross_max_abs: 7.214_647_103_101_015e-1,
+            cross_rmse: 5.7145887678887466e-2,
+        },
+        ImageDitCell {
+            name: "dit_step5",
+            cross_max_abs: 2.703_127_861_022_949e-1,
+            cross_rmse: 2.1146607018288893e-2,
+        },
+        ImageDitCell {
+            name: "euler_edit_step0",
+            cross_max_abs: 2.859_330_177_307_129e-2,
+            cross_rmse: 1.3387505749533405e-3,
+        },
+        ImageDitCell {
+            name: "euler_step0",
+            cross_max_abs: 2.343_052_625_656_128e-2,
+            cross_rmse: 1.8558872180865057e-3,
+        },
+    ];
+
+    fn image_dit_tau(cross: f64) -> f64 {
+        (2.0 * cross).max(1e-6)
+    }
+
+    fn image_f32(file: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
+        let view = file.tensor(name).with_context(|| format!("lacks {name}"))?;
+        ensure!(
+            view.dtype() == Dtype::F32,
+            "{name} dtype {:?}",
+            view.dtype()
+        );
+        let (chunks, rest) = view.data().as_chunks::<4>();
+        ensure!(rest.is_empty(), "{name} trailing bytes");
+        Ok(chunks.iter().map(|b| f32::from_le_bytes(*b)).collect())
+    }
+
+    fn image_tags(file: &SafeTensors<'_>, name: &str) -> Result<Vec<u8>> {
+        let view = file.tensor(name).with_context(|| format!("lacks {name}"))?;
+        ensure!(
+            view.dtype() == Dtype::I64,
+            "{name} dtype {:?}",
+            view.dtype()
+        );
+        let (chunks, rest) = view.data().as_chunks::<8>();
+        ensure!(rest.is_empty(), "{name} trailing bytes");
+        chunks
+            .iter()
+            .map(|b| u8::try_from(i64::from_le_bytes(*b)).with_context(|| format!("{name} tag")))
+            .collect()
+    }
+
+    fn image_bf16_exact(values: &[f32]) -> Result<Vec<bf16>> {
+        let out: Vec<bf16> = values.iter().copied().map(bf16::from_f32).collect();
+        ensure!(
+            out.iter()
+                .zip(values)
+                .all(|(got, &want)| got.to_f32().to_bits() == want.to_bits()),
+            "conditioner values are not bf16"
+        );
+        Ok(out)
+    }
+
+    fn image_max_rmse(candidate: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
+        ensure!(
+            candidate.len() == reference.len() && !candidate.is_empty(),
+            "cell length {} {}",
+            candidate.len(),
+            reference.len()
+        );
+        let mut max_abs = 0f64;
+        let mut sum = 0f64;
+        for (&x, &y) in candidate.iter().zip(reference) {
+            let delta = f64::from(x) - f64::from(y);
+            max_abs = max_abs.max(delta.abs());
+            sum += delta * delta;
+        }
+        Ok((max_abs, (sum / candidate.len() as f64).sqrt()))
+    }
+
+    /// Blocks placed per `FF_H3_PLACEMENT`, eager. Step 0 and step 5 are separate forwards on the same patchified
+    /// rows. Euler step 0 writes generated rows only. `inputs.safetensors` supplies `t2i_rows` and `edit_rows`.
+    /// Image row `i` takes the `(h, w)` of image row `i + 1`. That line is printed.
+    /// Every image row's `(h, w)` is swapped to `(w, h)`.
+    /// Control bar dated 2026-11-12: both metrics must exceed `3 * tau`.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_DEVICE0, FF_H3_PLACEMENT"]
+    fn image_dit_512_matches_the_frozen_cells() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let path = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let model = path("FF_H3_IMAGE")?;
+        let floor = path("FF_H3_IMAGE_DEVICE0")?;
+        let placement = Placement::from_env()?;
+        let image_spec = ImageSpec::read(&model)?;
+        let spec = super::image_block_spec(&image_spec);
+        let width = image_spec.row_width();
+        let capture_map = mapped(&floor.join("a.safetensors"))?;
+        let capture = SafeTensors::deserialize(&capture_map)?;
+        let inputs_map = mapped(&floor.join("inputs.safetensors"))?;
+        let inputs = SafeTensors::deserialize(&inputs_map)?;
+        let t2i_tags = image_tags(&capture, "conditioner_t2i_tags")?;
+        let edit_tags = image_tags(&capture, "conditioner_edit_tags")?;
+        let encode = capture.tensor("vae_encode_one")?;
+        ensure!(
+            encode.shape().len() == 4
+                && encode.shape()[0] == 1
+                && encode.shape()[1] == image_spec.in_channels,
+            "vae_encode_one shape {:?}",
+            encode.shape()
+        );
+        let (ref_h, ref_w) = (encode.shape()[2], encode.shape()[3]);
+        let step0_ref = image_f32(&capture, "dit_step0")?;
+        ensure!(
+            step0_ref.len().is_multiple_of(width)
+                && capture.tensor("dit_step0")?.shape().last() == Some(&width),
+            "dit_step0 width"
+        );
+        let image_rows = step0_ref.len() / width;
+        let mut tokens = 1usize;
+        while tokens * tokens < image_rows {
+            tokens += 1;
+        }
+        ensure!(
+            tokens * tokens == image_rows,
+            "t2i image rows {image_rows} are not a square token grid"
+        );
+        let latent = tokens * image_spec.patch[1];
+        let t2i_layout = image_layout(&image_spec, &t2i_tags, &[], latent, latent)?;
+        let edit_layout = image_layout(&image_spec, &edit_tags, &[(ref_h, ref_w)], latent, latent)?;
+        let t2i_text = image_bf16_exact(&image_f32(&capture, "conditioner_t2i")?)?;
+        let edit_text = image_bf16_exact(&image_f32(&capture, "conditioner_edit")?)?;
+        let t2i_rows = image_f32(&inputs, "t2i_rows")?;
+        let edit_rows = image_f32(&inputs, "edit_rows")?;
+        let step5_ref = image_f32(&capture, "dit_step5")?;
+        let euler_ref = image_f32(&capture, "euler_step0")?;
+        let edit_step_ref = image_f32(&capture, "dit_edit_step0")?;
+        let edit_euler_ref = image_f32(&capture, "euler_edit_step0")?;
+        ensure!(
+            t2i_tags.len() >= 2
+                && t2i_text.len() == t2i_tags.len() * image_spec.text_dim
+                && edit_text.len() == edit_tags.len() * image_spec.text_dim
+                && t2i_layout.image_indices.len() == image_rows
+                && t2i_rows.len() == step0_ref.len()
+                && step5_ref.len() == step0_ref.len()
+                && euler_ref.len() == step0_ref.len()
+                && edit_layout.image_indices.len() * width == edit_step_ref.len()
+                && edit_rows.len() == edit_step_ref.len()
+                && edit_euler_ref.len() == edit_step_ref.len()
+                && t2i_rows.iter().any(|v| *v != 0.0)
+                && edit_rows.iter().any(|v| *v != 0.0)
+                && t2i_rows.iter().chain(&edit_rows).all(|v| v.is_finite()),
+            "512 DiT fixture extents"
+        );
+        let source = t2i_layout.position_ids.clone();
+        let image_at = &t2i_layout.image_indices;
+        let n_image = image_at.len();
+        let mut shifted_ids = source.clone();
+        for i in 0..n_image {
+            let to = image_at[i] as usize;
+            let from = image_at[(i + 1) % n_image] as usize;
+            shifted_ids[to][1] = source[from][1];
+            shifted_ids[to][2] = source[from][2];
+        }
+        ensure!(
+            n_image >= 2
+                && shifted_ids != source
+                && shifted_ids
+                    .iter()
+                    .zip(&source)
+                    .all(|(got, want)| got[0] == want[0])
+                && t2i_layout
+                    .text_indices
+                    .iter()
+                    .all(|&row| shifted_ids[row as usize] == source[row as usize])
+                && image_at.iter().enumerate().all(|(i, &row)| {
+                    let from = image_at[(i + 1) % n_image] as usize;
+                    let got = shifted_ids[row as usize];
+                    got[1] == source[from][1] && got[2] == source[from][2]
+                }),
+            "rope shift is not a one-patch image-row rotation"
+        );
+        let mut transposed_ids = source.clone();
+        for &row in image_at {
+            let row = row as usize;
+            transposed_ids[row][1] = source[row][2];
+            transposed_ids[row][2] = source[row][1];
+        }
+        ensure!(
+            transposed_ids != source
+                && transposed_ids
+                    .iter()
+                    .zip(&source)
+                    .all(|(got, want)| got[0] == want[0])
+                && t2i_layout
+                    .text_indices
+                    .iter()
+                    .all(|&row| transposed_ids[row as usize] == source[row as usize])
+                && image_at.iter().all(|&row| {
+                    let row = row as usize;
+                    transposed_ids[row][1] == source[row][2]
+                        && transposed_ids[row][2] == source[row][1]
+                }),
+            "spatial transpose is not (h, w) to (w, h)"
+        );
+        let schedule = ImageSchedule::published()?;
+        let t2i_plan = AdalnPlan::from_tags(
+            &t2i_layout.token_tags,
+            &image_row_plan(&t2i_layout, &schedule)?,
+        );
+        let edit_plan = AdalnPlan::from_tags(
+            &edit_layout.token_tags,
+            &image_row_plan(&edit_layout, &schedule)?,
+        );
+        ensure!(
+            t2i_plan.row_pairs.len() == 6 && edit_plan.row_pairs.len() == 6,
+            "evaluation count"
+        );
+        let dir = model.join("transformer_diffusers");
+        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+            .minimax_h3_image_manifest(&image_spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-image-dit-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3-Image DiT gate".into())),
+        )?;
+        let mut defects = Vec::new();
+        let (
+            shift_max,
+            shift_rmse,
+            shift_vs_max,
+            shift_vs_rmse,
+            control_max,
+            control_rmse,
+            versus_max,
+            versus_rmse,
+            sample_changed,
+        ) = {
+            let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &t2i_plan)?;
+            let mut dit = ImageDit::new(
+                &device,
+                &mut blas,
+                (&spec, &image_spec),
+                &t2i_layout,
+                &dir,
+                &manifest,
+                placement,
+            )?;
+            let kernels = BlockKernels::new(&device.ctx)?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: 1.0,
+            };
+            let counts = (
+                u32::try_from(t2i_plan.pairs.len())?,
+                u32::try_from(t2i_plan.timesteps.len())?,
+            );
+            let rows_d = s.clone_htod(&t2i_rows)?;
+            let text_d = s.clone_htod(&t2i_text)?;
+            let velocity =
+                |head: usize, text: &CudaSlice<bf16>, dit: &mut ImageDit| -> Result<Vec<f32>> {
+                    let row_pairs = s.clone_htod(&t2i_plan.row_pairs[head])?;
+                    let row_timesteps = s.clone_htod(&t2i_plan.row_timesteps[head])?;
+                    dit.step(
+                        &context,
+                        &table,
+                        counts,
+                        head,
+                        &ImageStepInputs {
+                            image: &rows_d,
+                            text,
+                            row_pairs: &row_pairs,
+                            row_timesteps: &row_timesteps,
+                        },
+                    )?;
+                    Ok(s.clone_dtoh(&dit.velocity)?)
+                };
+            let step0 = velocity(0, &text_d, &mut dit)?;
+            let euler_rows = s.clone_htod(&t2i_rows)?;
+            dit.euler(s, &euler_rows, &schedule, 0)?;
+            let euler = s.clone_dtoh(&euler_rows)?;
+            let step5 = velocity(5, &text_d, &mut dit)?;
+            let fresh = s.clone_htod(&t2i_rows)?;
+            dit.sample(&context, (&table, &t2i_plan), &schedule, &fresh, &text_d)?;
+            let sampled = s.clone_dtoh(&fresh)?;
+            let changed = sampled.len() == t2i_rows.len()
+                && sampled.iter().all(|v| v.is_finite())
+                && sampled
+                    .iter()
+                    .zip(&t2i_rows)
+                    .any(|(got, want)| got.to_bits() != want.to_bits());
+            for (name, candidate, reference) in [
+                ("dit_step0", &step0, &step0_ref),
+                ("dit_step5", &step5, &step5_ref),
+                ("euler_step0", &euler, &euler_ref),
+            ] {
+                let cell = IMAGE_DIT_512
+                    .iter()
+                    .find(|cell| cell.name == name)
+                    .context(name)?;
+                let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
+                let tau_max = image_dit_tau(cell.cross_max_abs);
+                let tau_rmse = image_dit_tau(cell.cross_rmse);
+                let ok = candidate.iter().all(|v| v.is_finite())
+                    && max_abs <= tau_max
+                    && rmse <= tau_rmse;
+                println!(
+                    "H3_IMAGE_DIT {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
+                );
+                if !ok {
+                    defects.push(name);
+                }
+            }
+            let shifted_table = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &shifted_ids);
+            let transposed_table =
+                rotary_rows(spec.rope_freq_dim, spec.rope_theta, &transposed_ids);
+            ensure!(
+                shifted_table.len() == dit.rotary.len()
+                    && transposed_table.len() == dit.rotary.len(),
+                "rotated rotary length {} {} {}",
+                shifted_table.len(),
+                transposed_table.len(),
+                dit.rotary.len()
+            );
+            dit.rotary = s.clone_htod(&shifted_table)?;
+            let shift = velocity(0, &text_d, &mut dit)?;
+            dit.rotary = s.clone_htod(&transposed_table)?;
+            let control = velocity(0, &text_d, &mut dit)?;
+            let (shift_max, shift_rmse) = image_max_rmse(&shift, &step0_ref)?;
+            let (shift_vs_max, shift_vs_rmse) = image_max_rmse(&shift, &step0)?;
+            let (control_max, control_rmse) = image_max_rmse(&control, &step0_ref)?;
+            let (versus_max, versus_rmse) = image_max_rmse(&control, &step0)?;
+            (
+                shift_max,
+                shift_rmse,
+                shift_vs_max,
+                shift_vs_rmse,
+                control_max,
+                control_rmse,
+                versus_max,
+                versus_rmse,
+                changed,
+            )
+        };
+        {
+            let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &edit_plan)?;
+            let mut dit = ImageDit::new(
+                &device,
+                &mut blas,
+                (&spec, &image_spec),
+                &edit_layout,
+                &dir,
+                &manifest,
+                placement,
+            )?;
+            let kernels = BlockKernels::new(&device.ctx)?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: 1.0,
+            };
+            let counts = (
+                u32::try_from(edit_plan.pairs.len())?,
+                u32::try_from(edit_plan.timesteps.len())?,
+            );
+            let rows_d = s.clone_htod(&edit_rows)?;
+            let text_d = s.clone_htod(&edit_text)?;
+            let row_pairs = s.clone_htod(&edit_plan.row_pairs[0])?;
+            let row_timesteps = s.clone_htod(&edit_plan.row_timesteps[0])?;
+            dit.step(
+                &context,
+                &table,
+                counts,
+                0,
+                &ImageStepInputs {
+                    image: &rows_d,
+                    text: &text_d,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            let step0 = s.clone_dtoh(&dit.velocity)?;
+            dit.euler(s, &rows_d, &schedule, 0)?;
+            let euler = s.clone_dtoh(&rows_d)?;
+            let prefix = edit_layout.reference_rows * width;
+            let reference_exact = euler[..prefix]
+                .iter()
+                .zip(&edit_rows[..prefix])
+                .all(|(got, want)| got.to_bits() == want.to_bits());
+            println!("H3_IMAGE_DIT euler_edit_reference_rows exact={reference_exact}");
+            if !reference_exact {
+                defects.push("euler_edit_reference_rows");
+            }
+            for (name, candidate, reference) in [
+                ("dit_edit_step0", &step0, &edit_step_ref),
+                ("euler_edit_step0", &euler, &edit_euler_ref),
+            ] {
+                let cell = IMAGE_DIT_512
+                    .iter()
+                    .find(|cell| cell.name == name)
+                    .context(name)?;
+                let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
+                let tau_max = image_dit_tau(cell.cross_max_abs);
+                let tau_rmse = image_dit_tau(cell.cross_rmse);
+                let ok = candidate.iter().all(|v| v.is_finite())
+                    && max_abs <= tau_max
+                    && rmse <= tau_rmse;
+                println!(
+                    "H3_IMAGE_DIT {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
+                );
+                if !ok {
+                    defects.push(name);
+                }
+            }
+        }
+        fs::remove_dir_all(&runtime)?;
+        let step0_cell = IMAGE_DIT_512
+            .iter()
+            .find(|cell| cell.name == "dit_step0")
+            .context("dit_step0")?;
+        let bar_max = 3.0 * image_dit_tau(step0_cell.cross_max_abs);
+        let bar_rmse = 3.0 * image_dit_tau(step0_cell.cross_rmse);
+        let shift_gt = shift_max > bar_max && shift_rmse > bar_rmse;
+        let caught = control_max > bar_max && control_rmse > bar_rmse;
+        println!(
+            "H3_IMAGE_DIT rope_shift max_abs={shift_max:.8e} rmse={shift_rmse:.8e} vs_step0_max={shift_vs_max:.8e} vs_step0_rmse={shift_vs_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={shift_gt} sample_changed={sample_changed}"
+        );
+        println!(
+            "H3_IMAGE_DIT rope_transpose max_abs={control_max:.8e} rmse={control_rmse:.8e} vs_step0_max={versus_max:.8e} vs_step0_rmse={versus_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught} sample_changed={sample_changed}"
+        );
+        ensure!(caught, "rope-transpose control stayed within 3x tau");
+        ensure!(sample_changed, "image sample left the input unchanged");
+        ensure!(
+            defects.is_empty(),
+            "H3_IMAGE_DIT_GATE DEFECT cells outside the frozen taus: {defects:?}"
+        );
+        println!("H3_IMAGE_DIT_GATE PASS cells=5 control=FAIL_AS_REQUIRED");
         Ok(())
     }
 }
