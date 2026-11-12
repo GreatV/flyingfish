@@ -23,7 +23,7 @@ Language and multimodal models:
 | DeepSeek-V4.1-Flash | `DeepseekV41ForCausalLM` | Block FP8 projections, E2M1 experts, compressed latent attention, mHC; segmented CUDA-graph decode | CUDA |
 | GLM-5.3-Flash | `Glm5NextForConditionalGeneration` | FP8 routed experts tiered across GPU, pinned host and NVMe; DSA and KDA attention, mHC; segmented CUDA-graph decode; MTP with one draft token per round | CUDA |
 | Gemma 4 E2B, E4B, 12B, 31B | `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` | Text for all sizes; image and audio input for E2B, E4B and 12B; image input for 31B; 12B and 31B stream dense layers when they do not fit | CUDA |
-| EmbeddingGemma-2 | `EmbeddingGemma2Model` | Text, image and audio embeddings | CUDA |
+| EmbeddingGemma-2 | `EmbeddingGemma2Model` | Text embeddings through `embed` with JSON output; image and audio embeddings remain library-only | CUDA |
 | clef-flash | `Qwen3_5ForConditionalGeneration` | Hybrid linear-attention and full-attention text tower with plain decode; the vision tower and MTP layers are not run; the joint schema head scoring path is gated, with no CLI or library entry | CUDA |
 | MiniMax-H3-Image-PE | `Qwen3_5ForConditionalGeneration` | ModelOpt NVFP4 projections executed as W4A16 (weights decoded to BF16, no FP4 tensor-core path); image input | CUDA |
 
@@ -34,15 +34,15 @@ Diffusion language models:
 | Clover-35B-A3B | `CloverMoeModelLM` | Canvas inference with tiered experts | CUDA |
 | DiffusionGemma-26B-A4B | `DiffusionGemmaForBlockDiffusion` | Canvas inference | CUDA |
 
-Speech (library entry points, no CLI):
+Speech (library entry points and CLI):
 
 | Model | Notes | Backends |
 |---|---|---|
-| Parakeet TDT | Log-mel frontend, 24-layer FastConformer encoder, greedy TDT decode with one CUDA graph per decode step; `flyingfish::parakeet::ParakeetTdt` | CUDA |
-| Canary-1B-v2 | FastConformer encoder, AED decoder, greedy decode with cached attention and one CUDA graph per decode step; `flyingfish::canary::Canary` | CUDA |
+| Parakeet TDT | Log-mel frontend, 24-layer FastConformer encoder, greedy TDT decode with one CUDA graph per decode step; `flyingfish::parakeet::ParakeetTdt` and `transcribe`; txt/json/srt/vtt output with duration-derived cues | CUDA |
+| Canary-1B-v2 | FastConformer encoder, AED decoder, greedy decode with cached attention and one CUDA graph per decode step; `flyingfish::canary::Canary` and `transcribe` with published language/punctuation prompts; Canary subtitles are whole-clip only | CUDA |
 | Nemotron 3.5 ASR streaming 0.6B | FastConformer encoder over a full clip and as a chunked stream with cached context; the RNNT decoder and joint are not run; `flyingfish::parakeet::ParakeetEncoder` | CUDA |
-| parakeet realtime EOU 120M | Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware streaming with a reset on end-of-utterance; `flyingfish::eou::Eou` | CUDA |
-| Nemotron-3-Diarization | Offline and streaming speaker diarization with an arrival-order speaker cache; `flyingfish::diarization::Diarization` | CUDA |
+| parakeet realtime EOU 120M | Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware streaming with a reset on end-of-utterance; `flyingfish::eou::Eou` and `transcribe`; offline subtitles are whole-clip only, streaming subtitles are per utterance | CUDA |
+| Nemotron-3-Diarization | Offline and streaming speaker diarization with an arrival-order speaker cache; `flyingfish::diarization::Diarization` and `diarize`; RTTM output with overlaps preserved | CUDA |
 | Multitalker Parakeet streaming 0.6B | Reads the `.nemo` container in place; 1-4 speaker lanes through the pre-encode, layer-0 speaker and background kernels, and 24 conformer layers with block-anchored attention windows; the RNNT decoder and joint are not run; `flyingfish::multitalker::Multitalker` | CUDA |
 | Breeze-TTS-2 | Text encoder, backbone and depth decoder; greedy decode over supplied audio-code frames with per-layer KV caches and CUDA-graph replay; audio tokenizer decode to a 24 kHz waveform; `flyingfish::backend::{Breeze, BreezeTokenizer}`. No sampling and no free-running text-to-speech entry | CUDA |
 
@@ -125,6 +125,15 @@ flyingfish --model <model-dir> --runtime-dir <dir> calibrate
 
 # Generate from a prompt.
 flyingfish --model <model-dir> --runtime-dir <dir> generate --prompt "Hello" --max-new-tokens 64 --graph
+
+# Transcribe a 16 kHz WAV (PCM16, PCM24 or F32) with duration-derived SRT cues.
+flyingfish --model <parakeet-dir> --runtime-dir <dir> transcribe clip.wav --format srt
+
+# Write speaker segments as RTTM.
+flyingfish --model <diarization-dir> --runtime-dir <dir> diarize meeting.wav -o meeting.rttm
+
+# Embed raw text as a 768-value JSON vector.
+flyingfish --model <EmbeddingGemma-2-dir> --runtime-dir <dir> embed --text "a red cube"
 
 # OpenAI-compatible server: /v1/completions and /v1/chat/completions.
 flyingfish --model <model-dir> --runtime-dir <dir> serve --port 8080

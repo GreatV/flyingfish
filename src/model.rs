@@ -20,6 +20,48 @@ pub fn check_generation_capacity(prompt: usize, count: usize, capacity: usize) -
     Ok(())
 }
 
+fn embedding_input_parts(ids: &[u32]) -> Result<(Vec<u8>, Vec<bool>)> {
+    ensure!(!ids.is_empty(), "embedding input is empty");
+    Ok((vec![0; ids.len()], vec![true; ids.len()]))
+}
+
+pub fn embedding_json(values: &[f32]) -> Result<serde_json::Value> {
+    ensure!(
+        values.len() == 768 && values.iter().all(|value| value.is_finite()),
+        "embedding output must be 768 finite values"
+    );
+    Ok(serde_json::json!({"embedding": values, "dimension": values.len()}))
+}
+
+pub fn embed_text(directory: &Path, text: &str, options: crate::RunOptions) -> Result<Vec<f32>> {
+    let ids = crate::tokenizer::encode(directory, text)?;
+    let (modality_ids, mask) = embedding_input_parts(&ids)?;
+    let settings = Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: false,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+        runtime_dir: Some(options.runtime_dir),
+        device_budget_gib: None,
+    };
+    let mut model = Model::load(directory, options.device, 1024, Some(1024), settings)?;
+    let input = crate::vision_input::MultimodalInput {
+        input_ids: &ids,
+        modality_ids: &modality_ids,
+        pixel_values: &[],
+        grids: &[],
+        audio: &[],
+    };
+    let values = model.embed(&input, &mask, None)?;
+    ensure!(
+        values.len() == 768 && values.iter().all(|value| value.is_finite()),
+        "embedding output must be 768 finite values"
+    );
+    Ok(values)
+}
+
 pub struct GenerationOutput {
     pub ids: Vec<u32>,
     pub prefill_ms: f64,
@@ -648,5 +690,28 @@ impl Model {
 impl Model {
     pub fn verification_impl(&self) -> &'static str {
         self.backend.verification_impl()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_input_and_json_have_the_published_shape() -> Result<()> {
+        let ids = [11, 22, 33];
+        let (modality, mask) = embedding_input_parts(&ids)?;
+        assert_eq!(modality, [0, 0, 0]);
+        assert_eq!(mask, [true, true, true]);
+        let report = embedding_json(&[0.25; 768])?;
+        assert_eq!(report["dimension"], 768);
+        assert_eq!(
+            report["embedding"].as_array().context("embedding")?.len(),
+            768
+        );
+        assert_eq!(report["embedding"][0], 0.25);
+        assert!(embedding_json(&[0.0; 767]).is_err());
+        assert!(embedding_json(&[f32::NAN; 768]).is_err());
+        Ok(())
     }
 }

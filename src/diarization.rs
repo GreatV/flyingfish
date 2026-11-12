@@ -49,6 +49,177 @@ pub struct DiarizationSpec {
     pub modes: BTreeMap<String, [u32; 2]>,
 }
 
+pub const DIARIZATION_THRESHOLD: f64 = 0.5;
+
+pub fn speaker_segments(
+    logits: &[f32],
+    speakers: usize,
+    attention_mask: Option<&[bool]>,
+    threshold: f64,
+    frame_seconds: f64,
+) -> Result<Vec<crate::media::TextSegment>> {
+    ensure!(speakers > 0, "speaker count must be positive");
+    ensure!(
+        !logits.is_empty() && logits.len().is_multiple_of(speakers),
+        "diarization logits extent"
+    );
+    ensure!(
+        logits.iter().all(|value| value.is_finite()),
+        "non-finite logit"
+    );
+    ensure!(
+        threshold.is_finite() && (0.0..=1.0).contains(&threshold),
+        "invalid diarization threshold"
+    );
+    ensure!(
+        frame_seconds.is_finite() && frame_seconds > 0.0,
+        "invalid frame duration"
+    );
+    let frames = logits.len() / speakers;
+    if let Some(mask) = attention_mask {
+        ensure!(mask.len() == frames, "diarization mask extent");
+    }
+    let mut segments = Vec::new();
+    for speaker in 0..speakers {
+        let mut start = None;
+        for index in 0..=frames {
+            let active = index < frames && {
+                let logit = logits[index * speakers + speaker];
+                let valid = attention_mask.is_none_or(|mask| mask[index]);
+                valid && 1.0 / (1.0 + (-f64::from(logit)).exp()) > threshold
+            };
+            match (start, active) {
+                (None, true) => start = Some(index),
+                (Some(begin), false) => {
+                    let round = |frame: usize| {
+                        let seconds = frame as f64 * frame_seconds;
+                        (seconds * 100.0).round_ties_even() / 100.0
+                    };
+                    segments.push((round(begin), speaker, round(index)));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    segments.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    Ok(segments
+        .into_iter()
+        .map(|(start, speaker, end)| crate::media::TextSegment {
+            start,
+            end,
+            text: format!("speaker_{speaker}"),
+        })
+        .collect())
+}
+
+#[cfg(feature = "cuda")]
+pub fn stream_frontend_step(
+    engine: &Diarization,
+    wave: &[f32],
+    step: usize,
+    config: ChunkConfig,
+    mel_index: usize,
+) -> Result<(Vec<f32>, Vec<bool>, bool)> {
+    let mel = engine.spec().mel;
+    let factor = engine.spec().factor as usize;
+    let hop = mel.hop_length as usize;
+    let win = mel.win_length as usize;
+    let n_fft = mel.n_fft as usize;
+    let mel_bins = mel.mel_bins as usize;
+    let chunk_mel = (config.frames as usize + config.right as usize) * factor;
+    let first_samples = (chunk_mel - 1) * hop + win / 2;
+    let later_samples = chunk_mel * hop + win;
+    let start = if step == 0 {
+        0
+    } else {
+        mel_index
+            .checked_mul(hop)
+            .and_then(|value| value.checked_sub(n_fft / 2))
+            .context("streaming start underflow")?
+    };
+    let size = if step == 0 {
+        first_samples
+    } else {
+        later_samples
+    };
+    let end = (start + size).min(wave.len());
+    ensure!(
+        start <= end && end <= wave.len(),
+        "streaming waveform extent"
+    );
+    let last = end >= wave.len();
+    let batch = engine.audio_features(&wave[start..end], step == 0, last)?;
+    let valid = batch.mask.iter().filter(|flag| **flag).count();
+    ensure!(
+        valid * mel_bins <= batch.features.len() && valid <= batch.mask.len(),
+        "streaming frontend extent"
+    );
+    Ok((
+        batch.features[..valid * mel_bins].to_vec(),
+        batch.mask[..valid].to_vec(),
+        last,
+    ))
+}
+
+#[cfg(feature = "cuda")]
+pub fn diarize(
+    directory: &Path,
+    waveform: &[f32],
+    stream: bool,
+    threshold: f64,
+    options: crate::RunOptions,
+) -> Result<Vec<crate::media::TextSegment>> {
+    let spec = DiarizationSpec::read(directory)?;
+    let device = crate::backend::cuda::Device::new(options.device)?;
+    let mut engine = Diarization::load(directory, &device)?;
+    let frame_seconds = f64::from(spec.mel.hop_length) / f64::from(spec.mel.sampling_rate);
+    if stream {
+        let mode = spec
+            .modes
+            .get("low_latency")
+            .context("diarization low_latency mode")?;
+        let config = ChunkConfig {
+            frames: mode[0],
+            right: mode[1],
+            fifo: spec.cache.fifo,
+            update: spec.cache.update,
+        };
+        engine.configure(0, config)?;
+        let factor = spec.factor as usize;
+        let step_mel = config.frames as usize * factor;
+        let mut logits = Vec::new();
+        let mut mask = Vec::new();
+        for step in 0.. {
+            let (features, valid, last) =
+                stream_frontend_step(&engine, waveform, step, config, step * step_mel)?;
+            let (step_logits, _) = engine.stream_step(&features, &valid, config, last, 0)?;
+            logits.extend(step_logits);
+            mask.extend(valid);
+            if last {
+                break;
+            }
+        }
+        speaker_segments(
+            &logits,
+            spec.speakers as usize,
+            Some(&mask),
+            threshold,
+            frame_seconds,
+        )
+    } else {
+        let batch = engine.audio_features(waveform, false, false)?;
+        let (logits, _) = engine.offline(&batch.features, &batch.mask, 0)?;
+        speaker_segments(
+            &logits,
+            spec.speakers as usize,
+            Some(&batch.mask),
+            threshold,
+            frame_seconds,
+        )
+    }
+}
+
 impl DiarizationSpec {
     pub fn read(directory: &Path) -> Result<Self> {
         let root = serde_json::from_slice(&std::fs::read(directory.join("config.json"))?)?;
@@ -329,6 +500,27 @@ impl DiarizationSpec {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn speaker_segments_preserve_overlap_mask_and_default_threshold() -> Result<()> {
+        let logits = [10.0, -10.0, 10.0, 10.0, -10.0, 10.0, -10.0, 10.0];
+        let mask = [true, true, true, false];
+        let segments = speaker_segments(&logits, 2, Some(&mask), DIARIZATION_THRESHOLD, 0.01)?;
+        assert_eq!(segments.len(), 2);
+        assert_eq!((segments[0].start, segments[0].end), (0.0, 0.02));
+        assert_eq!((segments[1].start, segments[1].end), (0.01, 0.03));
+        assert_eq!(segments[0].text, "speaker_0");
+        assert_eq!(segments[1].text, "speaker_1");
+        let mut rttm = Vec::new();
+        crate::media::write_rttm(&mut rttm, "clip", &segments)?;
+        assert_eq!(
+            String::from_utf8(rttm)?,
+            "SPEAKER clip 1 0.000 0.020 <NA> <NA> speaker_0 <NA> <NA>\nSPEAKER clip 1 0.010 0.020 <NA> <NA> speaker_1 <NA> <NA>\n"
+        );
+        assert_eq!(DIARIZATION_THRESHOLD, 0.5);
+        assert!(speaker_segments(&[0.0], 1, None, DIARIZATION_THRESHOLD, 0.01)?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn published_layout_rejects_same_size_convolution_axis_swap() -> Result<()> {

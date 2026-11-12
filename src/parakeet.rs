@@ -3,7 +3,7 @@
 pub use crate::backend::cuda::engine_parakeet::StreamOmit;
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::engine_parakeet::{
-    NemotronStream, ParakeetEncoder, ParakeetTdt, StreamChunk,
+    NemotronStream, ParakeetEncoder, ParakeetTdt, StreamChunk, TdtTrajectory,
 };
 
 use crate::{
@@ -575,5 +575,127 @@ impl ParakeetSpec {
         insert("joint.head.weight".into(), Dtype::F32, &[joint, d]);
         insert("joint.head.bias".into(), Dtype::F32, &[joint]);
         require_checkpoint(checkpoint, &expected, "Parakeet")
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn tdt_cues_with(
+    directory: &Path,
+    tokens: &[u32],
+    durations: &[u32],
+    blank: u32,
+    mut decode: impl FnMut(&Path, &[u32]) -> Result<String>,
+) -> Result<crate::media::Transcription> {
+    ensure!(tokens.len() == durations.len(), "TDT token/duration extent");
+    let full_text = decode(directory, tokens)?;
+    let mut cues: Vec<crate::media::TextSegment> = Vec::new();
+    let mut previous_text = String::new();
+    let mut frame = 0usize;
+    for (index, (&token, &duration)) in tokens.iter().zip(durations).enumerate() {
+        if token == blank || token == 2 {
+            frame += duration as usize;
+            continue;
+        }
+        let text = decode(directory, &tokens[..=index])?;
+        let chunk = text
+            .strip_prefix(&previous_text)
+            .context("TDT incremental detokenization changed earlier text")?
+            .to_string();
+        previous_text = text;
+        if chunk.is_empty() {
+            frame += duration as usize;
+            continue;
+        }
+        let start = frame as f64 * 0.08;
+        let end = (frame + duration as usize) as f64 * 0.08;
+        if ["?", "'", "¡", "¿", "-", ":", ",", "%", "/", ".", "!"].contains(&chunk.as_str())
+            && !cues.is_empty()
+        {
+            let previous_end = cues.last().expect("nonempty cues").end;
+            cues.push(crate::media::TextSegment {
+                start: previous_end,
+                end: previous_end,
+                text: chunk,
+            });
+        } else {
+            cues.push(crate::media::TextSegment {
+                start,
+                end,
+                text: chunk,
+            });
+        }
+        frame += duration as usize;
+    }
+    Ok(crate::media::Transcription {
+        text: full_text,
+        segments: cues,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn tdt_transcription(
+    directory: &Path,
+    trajectory: &TdtTrajectory,
+    blank: u32,
+) -> Result<crate::media::Transcription> {
+    tdt_cues_with(
+        directory,
+        &trajectory.tokens,
+        &trajectory.durations,
+        blank,
+        crate::tokenizer::decode,
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub fn transcribe(
+    directory: &Path,
+    waveform: &[f32],
+    options: crate::RunOptions,
+) -> Result<crate::media::Transcription> {
+    let spec = ParakeetSpec::read(directory)?;
+    let device = crate::backend::cuda::Device::new(options.device)?;
+    let mut model = ParakeetTdt::load(directory, &device)?;
+    let mel = crate::audio::LogMel::new(spec.mel)?.extract(&[waveform], true, true, false)?;
+    let valid = mel.mask.iter().filter(|flag| **flag).count();
+    let trajectory = model.decode(&mel.features, valid)?;
+    tdt_transcription(directory, &trajectory, spec.blank)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tdt_cues_use_durations_and_previous_token_punctuation() -> Result<()> {
+        let tokens = [8192, 10, 11, 2, 12];
+        let durations = [0, 2, 1, 0, 1];
+        let decode = |_: &Path, ids: &[u32]| -> Result<String> {
+            Ok(match ids {
+                [10] => "hello".into(),
+                [10, 11] => "hello world".into(),
+                [10, 11, 12] => "hello world.".into(),
+                [8192, 10] => "hello".into(),
+                [8192, 10, 11] => "hello world".into(),
+                [8192, 10, 11, 2, 12] => "hello world.".into(),
+                _ => String::new(),
+            })
+        };
+        let result = tdt_cues_with(Path::new("model"), &tokens, &durations, 8192, decode)?;
+        assert_eq!(result.text, "hello world.");
+        assert_eq!(result.segments.len(), 3);
+        assert_eq!(
+            (result.segments[0].start, result.segments[0].end),
+            (0.0, 0.16)
+        );
+        assert_eq!(
+            (result.segments[1].start, result.segments[1].end),
+            (0.16, 0.24)
+        );
+        assert_eq!(
+            (result.segments[2].start, result.segments[2].end),
+            (0.24, 0.24)
+        );
+        Ok(())
     }
 }

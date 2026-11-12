@@ -350,26 +350,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn read_wave(path: &std::path::Path) -> Result<Vec<f32>> {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
-        let mut header = [0u8; 44];
-        file.read_exact(&mut header)?;
-        ensure!(
-            header[..4] == *b"RIFF" && header[8..12] == *b"WAVE" && header[22..24] == [1, 0],
-            "wav header: {}",
-            path.display()
-        );
-        let rate = u16::from_le_bytes([header[24], header[25]]) as u32
-            | (u16::from_le_bytes([header[26], header[27]]) as u32) << 8;
-        ensure!(rate == 16_000, "wav rate {rate}");
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        Ok(data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
-            .collect())
+        crate::media::read_wav(std::fs::File::open(path)?, 16000)
     }
 
     fn read_f32(st: &SafeTensors, key: &str) -> Result<Vec<f32>> {
@@ -528,12 +509,28 @@ pub(crate) mod tests {
     }
 }
 
+pub struct EouUtterance {
+    pub tokens: Vec<u32>,
+    pub end_step: usize,
+}
+
 impl Eou {
     /// Streaming greedy RNNT decode at the voice-agent cadence: one encoder row
     /// per step, hypothesis continuation, full session reset after <EOU>.
     /// Returns one token vector per utterance (each ends with EOU except
     /// possibly the last).
     pub fn stream_decode(&mut self, features: &[f32]) -> Result<(Vec<Vec<u32>>, f32)> {
+        let (utterances, margin) = self.stream_decode_timed(features)?;
+        Ok((
+            utterances
+                .into_iter()
+                .map(|utterance| utterance.tokens)
+                .collect(),
+            margin,
+        ))
+    }
+
+    pub fn stream_decode_timed(&mut self, features: &[f32]) -> Result<(Vec<EouUtterance>, f32)> {
         let mel_bins = self.spec.features as usize;
         ensure!(
             !features.is_empty() && features.len().is_multiple_of(mel_bins),
@@ -545,7 +542,7 @@ impl Eou {
         self.reset_prediction()?;
         self.projected = None;
         let eou_token = self.spec.vocab_size - 2;
-        let mut utterances: Vec<Vec<u32>> = Vec::new();
+        let mut utterances: Vec<EouUtterance> = Vec::new();
         let mut min_margin = f32::INFINITY;
         let mut current: Vec<u32> = Vec::new();
         let mut window = vec![0f32; 25 * mel_bins];
@@ -606,14 +603,20 @@ impl Eou {
             }
             let _ = length;
             if step_closes_utterance(&current, eou_token) {
-                utterances.push(std::mem::take(&mut current));
+                utterances.push(EouUtterance {
+                    tokens: std::mem::take(&mut current),
+                    end_step: step,
+                });
                 self.encoder.eou_stream_reset(&mut session)?;
                 self.reset_prediction()?;
                 self.projected = None;
             }
         }
         if !current.is_empty() {
-            utterances.push(current);
+            utterances.push(EouUtterance {
+                tokens: current,
+                end_step: steps - 1,
+            });
         }
         Ok((utterances, min_margin))
     }
