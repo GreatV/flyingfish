@@ -8,6 +8,7 @@ use flyingfish::{
         RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec, VaeTiles, image_canvas, image_layout,
         image_row_plan, image_row_timesteps, row_timestep_plan,
     },
+    prefill::DensePlacement,
 };
 use safetensors::{Dtype, SafeTensors};
 use std::{
@@ -1533,6 +1534,121 @@ fn minimax_h3_image_512_floor_matches_the_frozen_pair() -> Result<()> {
         "H3_IMAGE_512_FLOOR PASS cells={} exact={}",
         IMAGE_512_CELLS.len(),
         IMAGE_512_EXACT.len()
+    );
+    Ok(())
+}
+
+/// Counted 4090 budget after the image workspace: free 22375430048, total 24 GiB, host cap 44 GiB.
+/// Native BF16 image blocks: the dequant staging and transient are 0. One slot less free is the discriminator.
+#[test]
+fn minimax_h3_image_4096_placement_matches_the_counted_budget() -> Result<()> {
+    let spec = image_spec()?;
+    let linears: Vec<_> = spec
+        .block_linears()
+        .into_iter()
+        .filter(|(name, _, _)| name.starts_with("transformer_blocks.0."))
+        .collect();
+    ensure!(linears.len() == 6, "transformer block linears");
+    let mut slot = 0usize;
+    let mut largest = 0usize;
+    for (_, out, input) in &linears {
+        let bytes = out
+            .checked_mul(*input)
+            .and_then(|n| n.checked_mul(2))
+            .context("block linear bytes")?;
+        slot = slot.checked_add(bytes).context("block slot bytes")?;
+        largest = largest.max(bytes);
+    }
+    let owned = spec.layers * 2 * (2 * spec.hidden + 2 * spec.head_dim);
+    ensure!(
+        slot == 770_703_360 && largest == 308_281_344 && owned == 1_100_800,
+        "block bytes slot={slot} largest={largest} owned={owned}"
+    );
+    let layers = vec![slot; spec.layers];
+    let free = 22_375_430_048usize;
+    let total = 24usize << 30;
+    let host_cap = 44usize << 30;
+    let device_budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+    let reserved = 2 * slot + largest + (4usize << 30);
+    let host_budget = host_cap
+        .checked_sub(reserved)
+        .context("host reserve exceeds the 44 GiB cap")?;
+    ensure!(
+        device_budget == 20_763_716_512
+            && host_budget == 41_099_984_896
+            && host_budget / slot == 53,
+        "budget device={device_budget} host={host_budget}"
+    );
+    let counts = |plan: &DensePlacement| {
+        let resident = plan.slots.iter().filter(|entry| entry.is_none()).count();
+        let host = plan.host.iter().filter(|flag| **flag).count();
+        let disk = plan
+            .slots
+            .iter()
+            .zip(&plan.host)
+            .filter(|(entry, flag)| entry.is_some() && !**flag)
+            .count();
+        (resident, host, disk)
+    };
+    let plan = DensePlacement::new(&layers, Some(&layers), device_budget, host_budget)?;
+    ensure!(
+        counts(&plan) == (24, 26, 0)
+            && plan.slot_bytes == slot
+            && plan.resident_bytes == 24 * slot
+            && plan.host_bytes == 26 * slot
+            && plan.disk_bytes == 0,
+        "counted placement {:?} resident={} host_bytes={} disk={}",
+        counts(&plan),
+        plan.resident_bytes,
+        plan.host_bytes,
+        plan.disk_bytes
+    );
+    let free_less = free - slot;
+    let budget_less = DensePlacement::device_budget(free_less, total, owned, 0, 0)?;
+    ensure!(
+        budget_less == 19_993_013_152,
+        "one-slot budget {budget_less}"
+    );
+    let less = DensePlacement::new(&layers, Some(&layers), budget_less, host_budget)?;
+    ensure!(
+        counts(&less) == (23, 27, 0)
+            && less.slot_bytes == slot
+            && less.resident_bytes == 23 * slot
+            && less.host_bytes == 27 * slot
+            && less.disk_bytes == 0,
+        "one slot less free {:?} resident={} host_bytes={} disk={}",
+        counts(&less),
+        less.resident_bytes,
+        less.host_bytes,
+        less.disk_bytes
+    );
+    let tokens = 128usize;
+    let latent = tokens * spec.patch[1];
+    let layout = image_layout(&spec, &[TEXT_TAG; 7], &[], latent, latent)?;
+    ensure!(
+        latent == 256
+            && layout.rows() == 7 + tokens * tokens
+            && layout.image_indices.len() == tokens * tokens
+            && layout.text_indices.len() == 7
+            && layout.reference_rows == 0,
+        "4096 layout extents"
+    );
+    ensure!(
+        layout
+            .text_indices
+            .iter()
+            .enumerate()
+            .all(|(k, &row)| layout.position_ids[row as usize] == [k as f64, 0.0, 0.0]),
+        "text position ids"
+    );
+    ensure!(
+        (0..tokens).all(|h| {
+            (0..tokens).all(|w| {
+                let id = layout.position_ids[7 + h * tokens + w];
+                id[0] == 7.0 && id[1] == h as f64 * 0.25 && id[2] == w as f64 * 0.25
+            })
+        }),
+        "spatial position ids"
     );
     Ok(())
 }
