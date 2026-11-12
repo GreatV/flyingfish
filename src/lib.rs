@@ -14,6 +14,7 @@ pub mod bench;
 pub mod canary;
 pub mod checkpoint;
 pub mod config;
+pub mod convrot;
 pub mod cpu;
 pub mod diarization;
 pub mod dspark;

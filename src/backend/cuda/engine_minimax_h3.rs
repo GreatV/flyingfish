@@ -2019,6 +2019,10 @@ impl Dit {
         mut lora: Source<'_>,
         placement: Placement,
     ) -> Result<Self> {
+        ensure!(
+            !spec.is_hyperflow()?,
+            "HyperFlow weights stay stored; the BF16 block slot does not load them"
+        );
         let s = &d.stream;
         let ranges = Ranges::of(layout)?;
         let (h, r) = (spec.hidden, rank);
@@ -2545,6 +2549,10 @@ fn image_block_spec(spec: &ImageSpec) -> H3Spec {
         norm_eps: spec.norm_eps,
         qk_norm_eps: spec.qk_norm_eps,
         final_norm_eps: spec.final_norm_eps,
+        hyperflow_gate: None,
+        dropped_blocks: None,
+        lowrank_ranks: None,
+        int8_convrot: None,
     }
 }
 
