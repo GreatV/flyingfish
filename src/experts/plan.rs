@@ -434,13 +434,34 @@ pub fn staging_capacity(
     host_bytes: u64,
     copy_engines: u32,
 ) -> Result<(Capacity, Admission)> {
-    native_staging_capacity(
+    staging_capacity_ring(
         geometry,
         layout,
         rows,
         device_bytes,
         host_bytes,
         copy_engines,
+        (copy_engines.min(2), 0),
+    )
+}
+
+/// `disk_ring` is `(depth, registered slot bytes)`. Depth at `min(copy_engines, 2)` adds no ring bytes.
+pub fn staging_capacity_ring(
+    geometry: ExpertGeometry,
+    layout: crate::experts::catalogue::ExpertLayout,
+    rows: u32,
+    device_bytes: u64,
+    host_bytes: u64,
+    copy_engines: u32,
+    disk_ring: (u32, u64),
+) -> Result<(Capacity, Admission)> {
+    native_staging_capacity(
+        geometry,
+        layout,
+        rows,
+        device_bytes,
+        host_bytes,
+        (copy_engines, disk_ring.0, disk_ring.1),
         false,
     )
 }
@@ -484,7 +505,7 @@ pub fn cohort_capacity(
         rows,
         device_bytes - staging * slot,
         host_bytes,
-        copy_engines,
+        (copy_engines, copy_engines.min(2), 0),
         true,
     )?;
     capacity.prefill_staging_slots = u32::try_from(staging)?;
@@ -502,9 +523,10 @@ fn native_staging_capacity(
     rows: u32,
     device_bytes: u64,
     host_bytes: u64,
-    copy_engines: u32,
+    copy: (u32, u32, u64),
     cohorts: bool,
 ) -> Result<(Capacity, Admission)> {
+    let (copy_engines, disk_depth, ring_slot_bytes) = copy;
     ensure!(
         rows > 0 && geometry.layers > 0 && geometry.top_k > 0,
         "zero native staging extent"
@@ -558,8 +580,21 @@ fn native_staging_capacity(
     );
 
     let copies = u64::from(copy_engines.min(2));
+    // Added bytes are the ring slots past min(copy_engines, 2), each `ring_slot_bytes`.
+    let depth = u64::from(disk_depth);
+    ensure!(depth >= 1, "disk ring depth is zero");
+    let extra = depth.saturating_sub(copies);
+    ensure!(
+        extra == 0 || ring_slot_bytes > 0,
+        "disk ring slot bytes are zero at depth {disk_depth}"
+    );
+    let added = extra
+        .checked_mul(ring_slot_bytes)
+        .context("disk ring reserve overflow")?;
     let host_io = (3 * copies)
         .checked_mul(slot)
+        .context("native copy stage bytes overflow")?
+        .checked_add(added)
         .context("native copy stage bytes overflow")?;
     let host_expert_bytes = host_bytes
         .checked_sub(host_io)
@@ -2112,7 +2147,22 @@ mod tests {
         assert_eq!(short.prefill_staging_slots, 32);
         assert_eq!(short.slots_total(), 40 * 32);
         assert_eq!(short.slots_per_layer.iter().filter(|&&n| n == 0).count(), 2);
-        assert!(staging_capacity(geometry, layout, 4, 80 << 30, 38 * slot, 2).is_err());
+        assert!(staging_capacity(geometry, layout.clone(), 4, 80 << 30, 38 * slot, 2).is_err());
+        let ring = 25_184_256u64;
+        let (deeper, _) = staging_capacity_ring(
+            geometry,
+            layout.clone(),
+            4,
+            80 << 30,
+            24 << 30,
+            2,
+            (8, ring),
+        )?;
+        assert_eq!(
+            capacity.host_expert_bytes - deeper.host_expert_bytes,
+            6 * ring
+        );
+        assert_eq!(capacity.host_blocks - deeper.host_blocks, 6);
         Ok(())
     }
 
@@ -2221,7 +2271,22 @@ mod tests {
         )?;
         assert_eq!(short.prefill_staging_slots, 96);
         assert_eq!(short.slots_total(), 38 * 96);
-        assert!(staging_capacity(geometry, layout, 16, 80 << 30, 102 * slot, 2).is_err());
+        assert!(staging_capacity(geometry, layout.clone(), 16, 80 << 30, 102 * slot, 2).is_err());
+        let ring = 18_825_216u64;
+        let (deeper, _) = staging_capacity_ring(
+            geometry,
+            layout.clone(),
+            16,
+            80 << 30,
+            24 << 30,
+            2,
+            (6, ring),
+        )?;
+        assert_eq!(
+            capacity.host_expert_bytes - deeper.host_expert_bytes,
+            4 * ring
+        );
+        assert_eq!(capacity.host_blocks - deeper.host_blocks, 4);
         Ok(())
     }
 

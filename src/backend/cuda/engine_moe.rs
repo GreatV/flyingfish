@@ -682,6 +682,7 @@ impl Setup {
                 directory: &self.directory,
                 catalogue: self.catalogue,
                 engines: self.measured.copy_engines,
+                disk_depth: self.measured.copy_engines.min(2),
                 max_rows: u32::try_from(cpu.0.max(self.decode_rows))?,
                 swiglu_rounding: engine.model_spec.swiglu_rounding(),
                 swiglu_limit: engine.model_spec.swiglu_limit(),
