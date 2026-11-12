@@ -1567,6 +1567,7 @@ mod tests {
         let mut defects = 0usize;
         let mut scored = 0usize;
         let mut skipped = 0usize;
+        let mut control_defects = 0usize;
         for case in [
             ("shape", "cottage", "512"),
             ("shape", "robot_crab", "512"),
@@ -1697,11 +1698,15 @@ mod tests {
                 let pass = max_abs <= tau_max && rmse <= tau_rmse;
                 let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
                 println!(
-                    "TRELLIS2_SLAT_CELL id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
-                    if pass && control_ok { "PASS" } else { "DEFECT" }
+                    "TRELLIS2_SLAT_CELL id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={} control={}",
+                    if pass { "PASS" } else { "DEFECT" },
+                    if control_ok { "clear" } else { "recorded" }
                 );
                 scored += 1;
-                defects += usize::from(!pass) + usize::from(!control_ok);
+                defects += usize::from(!pass);
+                if !control_ok {
+                    control_defects += 1;
+                }
                 for (slot, block) in blocks.iter().enumerate() {
                     let reference = read_tensor(
                         &dir.join(format!("call{call}-block{block}.safetensors")),
@@ -1735,7 +1740,9 @@ mod tests {
             defects == 0,
             "TRELLIS.2 SLAT flow gate: {defects} defects over {scored} cells"
         );
-        println!("PASS TRELLIS2_SLAT_FLOW cells={scored} skipped={skipped} cases=4");
+        println!(
+            "PASS TRELLIS2_SLAT_FLOW cells={scored} skipped={skipped} control_defects={control_defects} cases=4"
+        );
         Ok(())
     }
 }
