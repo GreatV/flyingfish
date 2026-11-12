@@ -859,37 +859,64 @@ impl TrellisSsFlow {
         Ok((velocity, blocks))
     }
 
-    /// Euler interval-CFG sampling on the published 12-step schedule:
-    /// sigma_min 1e-5, rescale_t 5.0, guidance 7.5 with 0.7 rescale inside
-    /// [0.6, 1.0], single-branch outside; the unguided branch conditions on
-    /// a zero context.
+    /// Euler interval-CFG sampling on the published 12-step schedule
+    /// (sigma_min 1e-5). The stage parameters select the published
+    /// configuration: SS dense rescale_t 5.0 / rescale 0.7, shape SLAT
+    /// sparse rescale_t 3.0 / rescale 0.5, both guided at 7.5 inside
+    /// [0.6, 1.0] with the unguided branch conditioning on a zero context;
+    /// texture runs strength 1.0: single-branch with the shape latent
+    /// appended to the flow input channels.
     pub fn sample(
         &mut self,
         blas: &Blas,
         noise: &[f32],
         cond: &[bf16],
+        stage: StageSampling<'_>,
         record_states: bool,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        let concat_width = stage.concat.map_or(0, |concat| concat.len() / self.rows);
+        let state_channels = self.in_channels - concat_width;
         ensure!(
-            noise.len() == self.rows * self.in_channels
+            concat_width == 0 || concat_width == 32,
+            "flow sample concat width {concat_width} is not the published 32"
+        );
+        ensure!(
+            noise.len() == self.rows * state_channels
                 && cond.len() == self.context_rows * self.cond_width,
             "flow sample extent mismatch"
         );
         let negative = vec![bf16::from_f32(0.0); cond.len()];
-        let times = super::pixal3d::schedule(false, 12);
-        let mut sampler = super::pixal3d::Sampler::new(&self.device, noise, true)?;
+        let times = super::pixal3d::schedule(stage.sparse, 12);
+        let mut sampler = super::pixal3d::Sampler::new(&self.device, noise, stage.guided)?;
         let mut states = Vec::new();
         for step in 0..12 {
             let t = times[step];
             let state: Vec<f32> = self.device.stream.clone_dtoh(&sampler.state)?.to_vec();
-            let (positive, _) = self.velocity(blas, &state, (1000.0 * t) as f32, cond, &[])?;
+            let input = stage.concat.map_or_else(
+                || state.clone(),
+                |concat| {
+                    let mut input = vec![0f32; self.rows * self.in_channels];
+                    for row in 0..self.rows {
+                        for channel in 0..state_channels {
+                            input[row * self.in_channels + channel] =
+                                state[row * state_channels + channel];
+                        }
+                        for channel in 0..concat_width {
+                            input[row * self.in_channels + state_channels + channel] =
+                                f32::from(concat[row * concat_width + channel]);
+                        }
+                    }
+                    input
+                },
+            );
+            let (positive, _) = self.velocity(blas, &input, (1000.0 * t) as f32, cond, &[])?;
             self.device
                 .stream
                 .memcpy_htod(&positive, &mut sampler.positive)
                 .map_err(anyhow::Error::from)?;
-            if (0.6..=1.0).contains(&t) {
+            if stage.guided && (0.6..=1.0).contains(&t) {
                 let (unguided, _) =
-                    self.velocity(blas, &state, (1000.0 * t) as f32, &negative, &[])?;
+                    self.velocity(blas, &input, (1000.0 * t) as f32, &negative, &[])?;
                 let branch = sampler
                     .negative
                     .as_mut()
@@ -899,7 +926,7 @@ impl TrellisSsFlow {
                     .memcpy_htod(&unguided, branch)
                     .map_err(anyhow::Error::from)?;
             }
-            sampler.step(&self.device, t, times[step + 1], false)?;
+            sampler.step(&self.device, t, times[step + 1], stage.sparse)?;
             if record_states {
                 states.push(self.device.stream.clone_dtoh(&sampler.state)?.to_vec());
             }
@@ -907,6 +934,32 @@ impl TrellisSsFlow {
         let final_state: Vec<f32> = self.device.stream.clone_dtoh(&sampler.state)?.to_vec();
         Ok((final_state, states))
     }
+}
+
+/// Stage configuration for [`TrellisSsFlow::sample`]: the dense SS stage and
+/// the sparse SLAT stages differ in the schedule warp (rescale_t 5.0 vs 3.0)
+/// and the guidance-rescale factor bound to the sampler's sparse flag, the
+/// texture stage runs single-branch (guidance strength 1.0) with the shape
+/// latent occupying the upper 32 flow input channels.
+pub struct StageSampling<'a> {
+    pub sparse: bool,
+    pub guided: bool,
+    pub concat: Option<&'a [bf16]>,
+}
+
+/// Stage output affine from the pipeline's shape/tex _slat_normalization:
+/// slat = state * std + mean per channel.
+pub fn normalize_slat(state: &[f32], mean: &[f32], std: &[f32]) -> Vec<f32> {
+    let channels = mean.len();
+    state
+        .chunks(channels)
+        .flat_map(|row| {
+            row.iter()
+                .zip(std)
+                .zip(mean)
+                .map(|((value, scale), shift)| value * scale + shift)
+        })
+        .collect()
 }
 
 fn ensure_captured_blocks(blocks: &[usize], total: usize, slots: usize) -> Result<()> {
@@ -1771,6 +1824,310 @@ mod tests {
         println!(
             "PASS TRELLIS2_SLAT_FLOW cells={scored} skipped={skipped} control_defects={control_defects} cases={cases_run}"
         );
+        Ok(())
+    }
+
+    #[ignore = "TRELLIS.2 SLAT sampler cells: FF_TRELLIS2_MODEL FF_TRELLIS2_SLAT_FIXTURES FF_TRELLIS2_SLAT_OUTPUT FLYINGFISH_RUNTIME_DIR, optional FF_TRELLIS2_SS_LIMIT_BYTES FF_TRELLIS2_SLAT_CASES"]
+    #[test]
+    fn slat_sample_cells_gpu() -> Result<()> {
+        let model: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_MODEL")
+            .map(Into::into)
+            .context("FF_TRELLIS2_MODEL missing")?;
+        let root: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_FIXTURES")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_FIXTURES missing")?;
+        let out: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_OUTPUT")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_OUTPUT missing")?;
+        std::fs::create_dir_all(&out)?;
+        let runtime = std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let floor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("sampler-floor-r1/floor.json"))?)?;
+        let cells = floor["cells"]
+            .as_array()
+            .context("sampler floor cells missing")?;
+        let tau_of = |id: &str| -> Result<(f64, f64)> {
+            let cell = cells
+                .iter()
+                .find(|c| c["id"] == id)
+                .with_context(|| format!("cell {id} missing"))?;
+            Ok((
+                cell["tau"]["max_abs"].as_f64().context("tau max_abs")?,
+                cell["tau"]["rmse"].as_f64().context("tau rmse")?,
+            ))
+        };
+        let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
+            ensure!(
+                a.len() == b.len() && !a.is_empty(),
+                "cell extent mismatch: {} vs {}",
+                a.len(),
+                b.len()
+            );
+            let mut maximum = 0.0f64;
+            let mut square = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                let d = f64::from(*x) - f64::from(*y);
+                maximum = maximum.max(d.abs());
+                square += d * d;
+            }
+            Ok((maximum, (square / a.len() as f64).sqrt()))
+        };
+        let pipeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
+        let models = &pipeline["args"]["models"];
+        let device = Device::new(0)?;
+        let ops = super::super::ops::Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            std::rc::Rc::new(super::super::closure::Closure::new(
+                false,
+                "SLAT sampler cells".into(),
+            )),
+        )?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = match std::env::var("FF_TRELLIS2_SS_LIMIT_BYTES") {
+            Ok(value) => value
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid FF_TRELLIS2_SS_LIMIT_BYTES: {value}"))?,
+            Err(_) => (total - total / 8).saturating_sub(total - free),
+        };
+        let mut defects = 0usize;
+        let mut scored = 0usize;
+        let mut cases_run = 0usize;
+        let scope: Vec<String> = std::env::var("FF_TRELLIS2_SLAT_CASES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for case in [
+            ("shape", "cottage", "512"),
+            ("shape", "robot_crab", "512"),
+            ("tex", "cottage", "512"),
+            ("tex", "robot_crab", "512"),
+            ("shape", "cottage", "1024"),
+            ("shape", "robot_crab", "1024"),
+            ("tex", "cottage", "1024"),
+            ("tex", "robot_crab", "1024"),
+            ("shape", "cottage", "1024cascade"),
+            ("shape", "robot_crab", "1024cascade"),
+            ("tex", "cottage", "1024cascade"),
+            ("tex", "robot_crab", "1024cascade"),
+            ("shape", "cottage", "1536cascade"),
+            ("shape", "robot_crab", "1536cascade"),
+            ("tex", "cottage", "1536cascade"),
+            ("tex", "robot_crab", "1536cascade"),
+        ] {
+            let (kind, fixture, resolution) = case;
+            let name = format!("{kind}-{fixture}-{resolution}");
+            if !scope.is_empty() && !scope.contains(&name) {
+                continue;
+            }
+            cases_run += 1;
+            let dir = root.join(format!("{name}-r0a"));
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("metadata.json"))?)?;
+            let checkpoint_key = metadata["checkpoint"].as_str().context("checkpoint key")?;
+            let context_rows = metadata["context_rows"].as_u64().context("context rows")? as usize;
+            let forwards = metadata["forwards"].as_u64().context("forwards")? as usize;
+            let sites = read_coords(&dir.join("sampler-input.safetensors"), "noise.coords")?;
+            let noise = read_tensor(&dir.join("sampler-input.safetensors"), "noise.features")?;
+            let cond: Vec<bf16> = read_tensor(&dir.join("sampler-input.safetensors"), "cond")?
+                .iter()
+                .map(|v| bf16::from_f32(*v))
+                .collect();
+            ensure!(
+                cond.len() == context_rows * 1024,
+                "context extent mismatch on {name}"
+            );
+            // The frozen state cells price the Euler blend given the
+            // reference model outputs (the captured per-call velocities);
+            // the native model difference is bounded by the flow cells.
+            let mut velocities = Vec::with_capacity(forwards);
+            for call in 1..=forwards {
+                velocities.push(read_tensor(
+                    &dir.join(format!("call{call}-velocity.safetensors")),
+                    "velocity.features",
+                )?);
+            }
+            let guided = kind == "shape";
+            if guided {
+                let stored_neg: Vec<bf16> =
+                    read_tensor(&dir.join("sampler-input.safetensors"), "neg_cond")?
+                        .iter()
+                        .map(|v| bf16::from_f32(*v))
+                        .collect();
+                ensure!(
+                    stored_neg.iter().all(|v| v.to_bits() == 0),
+                    "stored unguided context is not all-zero bits on {name}"
+                );
+            }
+            let times = super::super::pixal3d::schedule(true, 12);
+            let mut sampler = super::super::pixal3d::Sampler::new(&device, &noise, guided)?;
+            let mut call = 0usize;
+            let mut previous = noise.clone();
+            for step in 0..12 {
+                let t = times[step];
+                device
+                    .stream
+                    .memcpy_htod(&velocities[call], &mut sampler.positive)
+                    .map_err(anyhow::Error::from)?;
+                call += 1;
+                if guided && (0.6..=1.0).contains(&t) {
+                    let branch = sampler
+                        .negative
+                        .as_mut()
+                        .context("CFG branch buffer missing")?;
+                    device
+                        .stream
+                        .memcpy_htod(&velocities[call], branch)
+                        .map_err(anyhow::Error::from)?;
+                    call += 1;
+                }
+                sampler.step(&device, t, times[step + 1], true)?;
+                let state: Vec<f32> = device.stream.clone_dtoh(&sampler.state)?.to_vec();
+                let reference = read_tensor(
+                    &dir.join("sampler-output.safetensors"),
+                    &format!("state{}.features", step + 1),
+                )?;
+                let id = format!("sampler/{name}-r0a/state{}", step + 1);
+                let (tau_max, tau_rmse) = tau_of(&id)?;
+                let (max_abs, rmse) = metric(&state, &reference)?;
+                let flipped: Vec<f32> = state
+                    .iter()
+                    .zip(previous.iter())
+                    .map(|(s, p)| 2.0 * p - s)
+                    .collect();
+                let (control_max, control_rmse) = metric(&state, &flipped)?;
+                let pass = max_abs <= tau_max && rmse <= tau_rmse;
+                let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+                println!(
+                    "TRELLIS2_SLAT_SAMPLE id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                    if pass && control_ok { "PASS" } else { "DEFECT" }
+                );
+                scored += 1;
+                defects += usize::from(!pass) + usize::from(!control_ok);
+                previous = state;
+            }
+            ensure!(
+                call == forwards,
+                "schedule call count {call} differs from forwards {forwards} on {name}"
+            );
+            let normalization = &pipeline["args"][format!("{kind}_slat_normalization")];
+            let mean = normalization["mean"]
+                .as_array()
+                .context("normalization mean missing")?;
+            let std = normalization["std"]
+                .as_array()
+                .context("normalization std missing")?;
+            ensure!(
+                mean.len() == 32 && std.len() == 32,
+                "normalization channels are not the published 32"
+            );
+            let mean: Vec<f32> = mean
+                .iter()
+                .filter_map(|v| v.as_f64().map(|v| v as f32))
+                .collect();
+            let std: Vec<f32> = std
+                .iter()
+                .filter_map(|v| v.as_f64().map(|v| v as f32))
+                .collect();
+            let channels = noise.len() / sites.len();
+            let slat = normalize_slat(&previous, &mean, &std);
+            let reference =
+                read_tensor(&dir.join("stage-output.safetensors"), "slat.features")?;
+            let mut omitted = slat.clone();
+            for row in 0..sites.len() {
+                omitted[row * channels] = previous[row * channels];
+            }
+            let id = format!("normalization/{name}-r0a");
+            let (tau_max, tau_rmse) = tau_of(&id)?;
+            let (max_abs, rmse) = metric(&slat, &reference)?;
+            let (control_max, control_rmse) = metric(&slat, &omitted)?;
+            let pass = max_abs <= tau_max && rmse <= tau_rmse;
+            let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+            println!(
+                "TRELLIS2_SLAT_NORMALIZE id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                if pass && control_ok { "PASS" } else { "DEFECT" }
+            );
+            scored += 1;
+            defects += usize::from(!pass) + usize::from(!control_ok);
+            if name == "shape-cottage-512" || name == "tex-cottage-512" {
+                let checkpoint = model.join(format!(
+                    "ckpts/{}.safetensors",
+                    models[checkpoint_key]
+                        .as_str()
+                        .context("pipeline model entry missing")?
+                        .trim_start_matches("ckpts/")
+                ));
+                let concat = if kind == "tex" {
+                    Some(
+                        read_tensor(
+                            &dir.join("sampler-input.safetensors"),
+                            "concat_cond.features",
+                        )?
+                        .iter()
+                        .map(|v| bf16::from_f32(*v))
+                        .collect::<Vec<bf16>>(),
+                    )
+                } else {
+                    None
+                };
+                let mut flow = TrellisSsFlow::load_flow(
+                    &device,
+                    &mut blas,
+                    &checkpoint,
+                    &sites,
+                    context_rows,
+                    limit,
+                )?;
+                let (_, states) = flow.sample(
+                    &blas,
+                    &noise,
+                    &cond,
+                    StageSampling {
+                        sparse: true,
+                        guided,
+                        concat: concat.as_deref(),
+                    },
+                    true,
+                )?;
+                let stored_states: Vec<Vec<f32>> = (1..=12)
+                    .map(|step| {
+                        read_tensor(
+                            &dir.join("sampler-output.safetensors"),
+                            &format!("state{step}.features"),
+                        )
+                    })
+                    .collect::<Result<_>>()?;
+                let drift: Vec<f64> = states
+                    .iter()
+                    .zip(&stored_states)
+                    .map(|(state, stored)| metric(state, stored).map(|(m, _)| m))
+                    .collect::<Result<_>>()?;
+                println!(
+                    "TRELLIS2_SLAT_NATIVE_LOOP case={name} calls={forwards} states={} final_state_drift={:.15e} worst_intermediate={:.15e}",
+                    drift.len(),
+                    drift[11],
+                    drift[..11].iter().copied().fold(f64::MIN, f64::max)
+                );
+            }
+        }
+        ensure!(
+            defects == 0,
+            "TRELLIS.2 SLAT sampler gate: {defects} defects over {scored} cells"
+        );
+        ensure!(cases_run > 0, "TRELLIS.2 SLAT sampler gate: no cases matched");
+        println!("PASS TRELLIS2_SLAT_SAMPLE cells={scored} cases={cases_run}");
         Ok(())
     }
 }
