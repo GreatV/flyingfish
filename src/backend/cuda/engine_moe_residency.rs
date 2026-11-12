@@ -6,8 +6,9 @@ use crate::experts::{
     catalogue::ExpertCatalogue,
     disk::{DiskExperts, DiskReader},
     plan::Tier,
-    runtime::{MoveSource, PromptMove, Residency},
+    runtime::{MoveSource, PlannedAdmit, PromptMove, Residency},
 };
+use half::bf16;
 use std::cell::RefCell;
 
 #[path = "engine_moe_prefill.rs"]
@@ -526,6 +527,29 @@ impl Transfers {
         }
     }
 
+    fn copy_host_block(&self, block: u32, values: &[bf16]) -> Result<()> {
+        ensure!(
+            !self.pinned,
+            "host admission copy on a pinned host block {block}"
+        );
+        self.ready_host(block)?;
+        let arena = self
+            .host
+            .as_ref()
+            .context("host admission has no host arena")?;
+        let mut claim = arena.claim(block)?;
+        let destination = claim.slice()?;
+        ensure!(
+            destination.len() == values.len(),
+            "host admission block {block} holds {} elements for {} ring elements",
+            destination.len(),
+            values.len()
+        );
+        destination.copy_from_slice(values);
+        drop(claim);
+        Ok(())
+    }
+
     fn finish(&self) -> Result<()> {
         if self.backing.is_some() {
             self.h2d.synchronize()?;
@@ -594,6 +618,14 @@ pub(in crate::backend::cuda::engine) enum PoolControl {
     SkipReaderWait,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(in crate::backend::cuda::engine) struct RouteStamp {
+    pub layer: u32,
+    pub rows: u32,
+    pub experts: Vec<u32>,
+}
+
 pub(in crate::backend::cuda::engine) struct Slots {
     pub storage: super::super::super::weights::ExpertStorage,
     gate_up: CudaSlice<u64>,
@@ -620,7 +652,11 @@ pub(in crate::backend::cuda::engine) struct Slots {
     moves: Vec<PromptMove>,
     readers: Vec<u32>,
     disk_cpu: Option<DiskExperts>,
+    pending_admits: Vec<PlannedAdmit>,
+    reserved_blocks: Vec<u32>,
     pub request_open: bool,
+    #[cfg(test)]
+    route_tape: Option<Vec<RouteStamp>>,
     #[cfg(test)]
     pending_reads: u64,
     #[cfg(test)]
@@ -774,7 +810,13 @@ impl Slots {
                 "host_available_bytes": host, "source": "capacity; GPU compute; native host staging"
             }})
         );
-        let slots = Self::load(
+        #[cfg(test)]
+        let capacity = {
+            let mut capacity = capacity;
+            Self::pin_host_width(&mut capacity, &geometry)?;
+            capacity
+        };
+        let loaded = Self::load(
             device,
             None,
             geometry,
@@ -790,8 +832,73 @@ impl Slots {
                 swiglu_limit: model.swiglu_limit(),
                 routed_weight: model.routed_weight_boundary(),
             },
-        )?;
+        );
+        #[cfg(test)]
+        let loaded = loaded.map_err(|error| Self::pinned_arena_error(&capacity, error));
+        let slots = loaded?;
         Ok((slots, rows))
+    }
+
+    #[cfg(test)]
+    fn pin_host_width(
+        capacity: &mut crate::experts::plan::Capacity,
+        geometry: &ExpertGeometry,
+    ) -> Result<()> {
+        let Some(pinned) = crate::experts::plan::pinned_host_blocks() else {
+            return Ok(());
+        };
+        let slot = capacity.slot_bytes();
+        let experts = u64::from(geometry.layers)
+            .checked_mul(u64::from(geometry.experts))
+            .context("pinned host width expert count overflow")?;
+        let non_gpu = experts
+            .checked_sub(u64::from(capacity.slots_total()))
+            .context("pinned host width exceeds gpu slots")?;
+        ensure!(
+            u64::from(pinned) <= non_gpu,
+            "pinned host width {pinned} exceeds non-gpu experts {non_gpu}"
+        );
+        let derived = capacity.host_blocks;
+        capacity.host_blocks = pinned;
+        capacity.disk_bytes = non_gpu
+            .checked_sub(u64::from(pinned))
+            .and_then(|blocks| blocks.checked_mul(slot))
+            .context("pinned disk extent overflow")?;
+        let arena_bytes = u64::from(pinned)
+            .checked_add(u64::from(capacity.spare_blocks))
+            .and_then(|blocks| blocks.checked_mul(slot))
+            .context("pinned host arena bytes overflow")?;
+        if arena_bytes > capacity.host_expert_bytes {
+            capacity.host_expert_bytes = arena_bytes;
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "pinned_host_blocks": pinned,
+                "derived_host_blocks": derived,
+            })
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pinned_arena_error(
+        capacity: &crate::experts::plan::Capacity,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let text = format!("{error:#}");
+        if crate::experts::plan::pinned_host_blocks().is_some()
+            && text.contains("allocate host expert arena")
+        {
+            anyhow::anyhow!(
+                "pinned host arena: host_blocks {} spare {} slot_bytes {}: {error:#}",
+                capacity.host_blocks,
+                capacity.spare_blocks,
+                capacity.slot_bytes()
+            )
+        } else {
+            error
+        }
     }
 
     pub(super) fn load(
@@ -969,6 +1076,8 @@ impl Slots {
             readers: Vec::with_capacity(
                 physical_count.max(input.max_rows as usize * geometry.top_k as usize),
             ),
+            pending_admits: Vec::new(),
+            reserved_blocks: Vec::new(),
             disk_cpu: if input.capacity.disk_workers > 0 {
                 Some(DiskExperts::new_with_swiglu_rounding(
                     input.catalogue.clone(),
@@ -983,6 +1092,8 @@ impl Slots {
                 None
             },
             request_open: false,
+            #[cfg(test)]
+            route_tape: None,
             #[cfg(test)]
             pending_reads: 0,
             #[cfg(test)]
@@ -1225,8 +1336,30 @@ impl Slots {
                     .context("copy native disk expert into its physical slot")?;
                 }
                 let copy = self.events.record(&self.transfers.h2d)?;
+                let reserved_source = if let Some(index) = self
+                    .pending_admits
+                    .iter()
+                    .position(|admit| admit.layer == layer && admit.expert == expert)
+                {
+                    let admit = self.pending_admits[index];
+                    if self.reserved_blocks.contains(&admit.block) {
+                        Some((admit.victim, admit.block))
+                    } else {
+                        self.transfers.copy_host_block(admit.block, &values)?;
+                        self.policy.commit_host_admit(admit)?;
+                        self.pending_admits.swap_remove(index);
+                        None
+                    }
+                } else {
+                    None
+                };
                 values.copied(copy.id)?;
                 disk.copied[ring as usize] = Some(copy);
+                if let Some((victim, block)) = reserved_source {
+                    anyhow::bail!(
+                        "reserved host source: layer {layer} expert {victim} block {block}"
+                    );
+                }
                 (pointer, None, Some(ring))
             }
         };
@@ -1325,6 +1458,8 @@ impl Slots {
         &mut self,
         frequency: &[Vec<f64>],
     ) -> Result<()> {
+        self.pending_admits.clear();
+        self.reserved_blocks.clear();
         self.moves.clear();
         self.moves
             .extend_from_slice(self.policy.begin_request(frequency)?);
@@ -1374,6 +1509,8 @@ impl Slots {
     }
 
     pub fn end_request(&mut self) -> Result<()> {
+        self.pending_admits.clear();
+        self.reserved_blocks.clear();
         self.policy.end_request()?;
         self.transfers.finish()?;
         if let Some(disk) = &self.disk_cpu {
@@ -1381,6 +1518,39 @@ impl Slots {
         }
         self.request_open = false;
         Ok(())
+    }
+
+    pub(in crate::backend::cuda::engine) fn accumulate_prefill(&mut self) {
+        self.policy.accumulate_prefill();
+    }
+
+    pub(in crate::backend::cuda::engine) fn freeze_prefill_rank(&mut self) -> Result<()> {
+        self.policy.freeze_prefill_rank()
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn budget(&self) -> &crate::experts::plan::Capacity {
+        self.policy.budget()
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn set_host_admit(&mut self, enabled: bool) {
+        self.policy.set_host_admit(enabled);
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn admit_copies(&self) -> u64 {
+        self.policy.admit_copies()
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn arm_route_tape(&mut self) {
+        self.route_tape = Some(Vec::new());
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn take_route_tape(&mut self) -> Vec<RouteStamp> {
+        self.route_tape.take().unwrap_or_default()
     }
 
     pub fn begin_token(&mut self) -> Result<()> {
@@ -1394,6 +1564,8 @@ impl Slots {
     }
 
     pub fn finish_token(&mut self) -> Result<()> {
+        self.pending_admits.clear();
+        self.reserved_blocks.clear();
         self.moves.clear();
         for published in self.policy.finish_token()? {
             let source = match (published.from_host, published.source_block) {
@@ -1434,7 +1606,6 @@ impl Slots {
         let same_layer = self.leased_layer == layer;
         let mut new_leased = Vec::with_capacity(leased.len());
         let mut available_slots: Vec<usize> = (0..self.pool.len()).collect();
-        let mut refills = 0usize;
         if same_layer {
             for lease in &leased {
                 if let Some(&(expert, slot)) = self.leased.iter().find(|&&(e, _)| e == lease.expert)
@@ -1444,8 +1615,9 @@ impl Slots {
                 }
             }
         }
-        for lease in leased {
-            if same_layer && new_leased.iter().any(|&(e, _)| e == lease.expert) {
+        let mut jobs = Vec::new();
+        for lease in &leased {
+            if new_leased.iter().any(|&(expert, _)| expert == lease.expert) {
                 continue;
             }
             let index = available_slots
@@ -1457,20 +1629,55 @@ impl Slots {
             if let Some(reader) = reader {
                 self.events.wait(&self.transfers.h2d, reader.id)?;
             }
-            let destination = self.pool[index].pointer;
-            let source = match lease.source_block {
-                Some(block) => MoveSource::Host(block),
-                None => MoveSource::Disk,
-            };
-            let staging = self.upload(layer, lease.expert, destination, source)?;
-            let copy = self.events.record(&self.transfers.h2d)?;
-            if let MoveSource::Host(block) = source {
-                self.transfers.copied_host(block, staging, &copy);
-            }
-            self.pool[index].copy = Some(copy);
-            new_leased.push((lease.expert, index));
-            refills += 1;
+            jobs.push((lease.expert, lease.source_block, index));
         }
+        let mut host_jobs = Vec::new();
+        let mut disk_jobs = Vec::new();
+        for job in jobs {
+            if job.1.is_some() {
+                host_jobs.push(job);
+            } else {
+                disk_jobs.push(job);
+            }
+        }
+        self.reserved_blocks.clear();
+        self.reserved_blocks
+            .extend(host_jobs.iter().filter_map(|job| job.1));
+        for (expert, source_block, index) in &host_jobs {
+            let block = source_block.context("host lease has no source block")?;
+            let destination = self.pool[*index].pointer;
+            let staging = self.upload(layer, *expert, destination, MoveSource::Host(block))?;
+            let copy = self.events.record(&self.transfers.h2d)?;
+            self.transfers.copied_host(block, staging, &copy);
+            self.pool[*index].copy = Some(copy);
+            self.reserved_blocks.retain(|reserved| *reserved != block);
+        }
+        self.pending_admits = self
+            .policy
+            .plan_streamed_admits(layer, &self.reserved_blocks)?;
+        for (expert, _, index) in &disk_jobs {
+            let destination = self.pool[*index].pointer;
+            let staging = self.upload(layer, *expert, destination, MoveSource::Disk)?;
+            ensure!(
+                staging.is_none(),
+                "disk upload of layer {layer} expert {expert} staged a host block"
+            );
+            let copy = self.events.record(&self.transfers.h2d)?;
+            self.pool[*index].copy = Some(copy);
+        }
+        self.pending_admits.clear();
+        self.reserved_blocks.clear();
+        let refills = host_jobs.len() + disk_jobs.len();
+        new_leased.extend(
+            host_jobs
+                .into_iter()
+                .map(|(expert, _, index)| (expert, index)),
+        );
+        new_leased.extend(
+            disk_jobs
+                .into_iter()
+                .map(|(expert, _, index)| (expert, index)),
+        );
         self.leased = new_leased;
         self.leased_layer = layer;
         if refills > 0 {
@@ -1486,6 +1693,8 @@ impl Slots {
             ids.len(),
             weights.len()
         );
+        self.pending_admits.clear();
+        self.reserved_blocks.clear();
         self.routes.clear();
         for (choice, (&expert, &weight)) in ids.iter().zip(weights).enumerate() {
             self.routes.push(crate::experts::runtime::Route {
@@ -1495,6 +1704,17 @@ impl Slots {
                 expert: u32::try_from(expert)
                     .context("native tier expert id is negative or too large")?,
                 weight,
+            });
+        }
+        #[cfg(test)]
+        if let Some(tape) = self.route_tape.as_mut() {
+            let top_k = self.catalogue.geometry().top_k;
+            let rows = u32::try_from(ids.len() / top_k as usize)
+                .context("native tier route rows exceed u32")?;
+            tape.push(RouteStamp {
+                layer,
+                rows,
+                experts: self.routes.iter().map(|route| route.expert).collect(),
             });
         }
         let dispatch = self.policy.dispatch(layer, &self.routes)?;
@@ -2025,6 +2245,57 @@ impl Slots {
 }
 
 #[cfg(test)]
+pub(in crate::backend::cuda::engine) fn group_route_stamps(
+    stamps: &[RouteStamp],
+    layers: u32,
+    experts: u32,
+    top_k: u32,
+) -> Result<Vec<Vec<(u32, u32)>>> {
+    let width = layers as usize;
+    let k = top_k as usize;
+    ensure!(width > 0 && k > 0, "empty route grouping");
+    let mut index = 0usize;
+    let mut tokens = Vec::new();
+    while index < stamps.len() {
+        ensure!(
+            index + width <= stamps.len(),
+            "truncated route chunk at {index} of {}",
+            stamps.len()
+        );
+        let rows = stamps[index].rows;
+        ensure!(rows > 0, "empty route chunk");
+        for layer in 0..width {
+            let stamp = &stamps[index + layer];
+            ensure!(
+                stamp.layer == layer as u32
+                    && stamp.rows == rows
+                    && stamp.experts.len() == rows as usize * k,
+                "route chunk layer={layer} recorded_layer={} rows={} ids={} expected_rows={rows}",
+                stamp.layer,
+                stamp.rows,
+                stamp.experts.len()
+            );
+            ensure!(
+                stamp.experts.iter().all(|&expert| expert < experts),
+                "route id outside 0..{experts}"
+            );
+        }
+        for row in 0..rows as usize {
+            let mut token = Vec::with_capacity(width * k);
+            for layer in 0..width {
+                let start = row * k;
+                for &expert in &stamps[index + layer].experts[start..start + k] {
+                    token.push((layer as u32, expert));
+                }
+            }
+            tokens.push(token);
+        }
+        index += width;
+    }
+    Ok(tokens)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2037,6 +2308,31 @@ mod tests {
         assert_eq!(event_index(10, &ids)?, 1);
         assert!(event_index(0, &ids).is_err());
         assert!(event_index(1, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn route_stamps_group_chunk_rows_into_tokens() -> Result<()> {
+        let stamps = [
+            RouteStamp {
+                layer: 0,
+                rows: 2,
+                experts: vec![10, 11, 12, 13],
+            },
+            RouteStamp {
+                layer: 1,
+                rows: 2,
+                experts: vec![20, 21, 22, 23],
+            },
+        ];
+        let tokens = group_route_stamps(&stamps, 2, 24, 2)?;
+        assert_eq!(
+            tokens,
+            vec![
+                vec![(0, 10), (0, 11), (1, 20), (1, 21)],
+                vec![(0, 12), (0, 13), (1, 22), (1, 23)],
+            ]
+        );
         Ok(())
     }
 

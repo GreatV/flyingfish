@@ -631,6 +631,17 @@ fn staged_waves(geometry: ExpertGeometry, live: u32, budget_slots: u64) -> Resul
 #[cfg(test)]
 std::thread_local! {
     pub static FORCED_WAVES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static PINNED_HOST_BLOCKS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub fn pin_host_blocks(blocks: Option<u32>) {
+    PINNED_HOST_BLOCKS.with(|pin| pin.set(blocks));
+}
+
+#[cfg(test)]
+pub fn pinned_host_blocks() -> Option<u32> {
+    PINNED_HOST_BLOCKS.with(|pin| pin.get())
 }
 
 #[cfg(test)]
@@ -1615,6 +1626,30 @@ impl TierLedger {
             self.host_blocks - self.free_host_blocks(),
             self.host_blocks
         );
+        self.host[l][e] = true;
+        debug_assert!(self.check().is_ok());
+        Ok(())
+    }
+
+    /// Moves one host block from a host resident to a disk expert. The host block count is unchanged.
+    pub fn replace_host(&mut self, layer: u32, expert: u32, victim: u32) -> Result<()> {
+        self.check_index(layer, expert)?;
+        self.check_index(layer, victim)?;
+        ensure!(expert != victim, "candidate {expert} equals its victim");
+        let (l, e, v) = (layer as usize, expert as usize, victim as usize);
+        ensure!(
+            !self.gpu[l][e] && !self.gpu[l][v],
+            "expert {expert} or victim {victim} of layer {layer} is GPU resident"
+        );
+        ensure!(
+            self.tier(layer, expert)? == Tier::Disk,
+            "expert {expert} of layer {layer} is not disk resident"
+        );
+        ensure!(
+            self.tier(layer, victim)? == Tier::Host,
+            "victim {victim} of layer {layer} is not host resident"
+        );
+        self.host[l][v] = false;
         self.host[l][e] = true;
         debug_assert!(self.check().is_ok());
         Ok(())
