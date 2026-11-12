@@ -837,18 +837,18 @@ impl Flash {
     }
 
     #[cfg(all(test, feature = "cuda"))]
-    pub(super) fn set_f16_padded_reference(&mut self, padded: bool) -> Result<()> {
-        ensure!(self.geometry[2] == 96, "padded reference requires F16 D96");
+    pub(super) fn set_f16_reference(&mut self, reference: usize) -> Result<()> {
+        ensure!(self.geometry[2] == 96, "F16 reference requires D96");
+        let name = match reference {
+            0 => "attention_prefill_d96_bidirectional_f16",
+            1 => "attention_prefill_d96_bidirectional_f16_reload",
+            2 => "attention_prefill_d96_bidirectional_f16_padded",
+            _ => anyhow::bail!("unknown F16 attention reference {reference}"),
+        };
         self.native = vec![
-            super::cubin::module(self.stream.context(), "attention_native")?.load_function(
-                if padded {
-                    "attention_prefill_d96_bidirectional_f16_padded"
-                } else {
-                    "attention_prefill_d96_bidirectional_f16"
-                },
-            )?,
+            super::cubin::module(self.stream.context(), "attention_native")?.load_function(name)?,
         ];
-        self.shared = if padded { 49_152 } else { 36_864 };
+        self.shared = if reference == 2 { 49_152 } else { 36_864 };
         Ok(())
     }
 
@@ -2735,7 +2735,7 @@ mod tests {
         [rows, keys, heads, dim]: [usize; 4],
         pitch: usize,
         defects: &mut usize,
-    ) -> Result<Vec<half::f16>> {
+    ) -> Result<(Vec<half::f16>, Vec<f32>)> {
         use half::f16;
         ensure!(
             inputs[0].len() == rows * heads * dim
@@ -2778,14 +2778,14 @@ mod tests {
         )?;
         let mut candidate = None;
         let arms = if cfg!(feature = "cuda") && dim == 96 {
-            2
+            3
         } else {
             1
         };
         for arm in 0..arms {
             #[cfg(feature = "cuda")]
-            if arm == 1 {
-                attention.set_f16_padded_reference(true)?;
+            if dim == 96 {
+                attention.set_f16_reference(arm)?;
             }
             #[cfg(feature = "cuda")]
             {
@@ -2798,10 +2798,13 @@ mod tests {
                     attention.shared as usize,
                     None,
                 )?;
-                ensure!(local == 0 && blocks > 0, "F16 attention resource gate");
+                ensure!(
+                    local == 0 && blocks >= if dim == 96 { 2 } else { 1 },
+                    "F16 attention resource gate"
+                );
                 println!(
-                    "F16_ATTENTION_RESOURCES dim={dim} padded={} threads=128 registers={registers} local_bytes={local} shared_bytes={} active_blocks={blocks}",
-                    arm == 1,
+                    "F16_ATTENTION_RESOURCES dim={dim} reference={arm} padded={} threads=128 registers={registers} local_bytes={local} shared_bytes={} active_blocks={blocks}",
+                    arm == 2,
                     attention.shared
                 );
             }
@@ -2850,8 +2853,8 @@ mod tests {
                     );
                 }
                 println!(
-                    "PASS F16_ATTENTION_LAUNCH padded={} kernel_nodes=1 threads=128 shared_bytes={}",
-                    arm == 1,
+                    "PASS F16_ATTENTION_LAUNCH reference={arm} padded={} kernel_nodes=1 threads=128 shared_bytes={}",
+                    arm == 2,
                     attention.shared
                 );
             }
@@ -2878,9 +2881,9 @@ mod tests {
                     .eq(captured_lse.iter().map(|v| v.to_bits()));
             *defects += usize::from(!graph_equal);
             println!(
-                "F16_ATTENTION_GRAPH {} rows={rows} keys={keys} padded={} output_and_lse=true",
+                "F16_ATTENTION_GRAPH {} rows={rows} keys={keys} reference={arm} padded={} output_and_lse=true",
                 if graph_equal { "PASS" } else { "DEFECT" },
-                arm == 1
+                arm == 2
             );
             if let Some((ref output, ref lse)) = candidate {
                 let output: &Vec<f16> = output;
@@ -2896,7 +2899,7 @@ mod tests {
                     .map(|(a, b)| (a.to_bits() ^ b.to_bits()).count_ones())
                     .sum();
                 println!(
-                    "F16_ATTENTION_IDENTITY {} rows={rows} keys={keys} heads={heads} dim={dim} pitch={pitch} output_bits={output_bits} lse_bits={lse_bits} eager_graph=true",
+                    "F16_ATTENTION_IDENTITY {} rows={rows} keys={keys} heads={heads} dim={dim} pitch={pitch} reference={arm} output_bits={output_bits} lse_bits={lse_bits} eager_graph=true",
                     if output_bits == 0 && lse_bits == 0 {
                         "PASS"
                     } else {
@@ -2908,7 +2911,8 @@ mod tests {
                 candidate = Some((eager, eager_lse));
             }
         }
-        Ok(candidate.context("F16 attention candidate missing")?.0[..count].to_vec())
+        let (output, lse) = candidate.context("F16 attention candidate missing")?;
+        Ok((output[..count].to_vec(), lse))
     }
 
     #[test]
@@ -2997,7 +3001,8 @@ mod tests {
                     [rows, keys, heads, dim],
                     heads * dim + padding,
                     &mut defects,
-                )?;
+                )?
+                .0;
                 let selected_values = selected
                     .iter()
                     .flat_map(|&row| {
@@ -3027,7 +3032,8 @@ mod tests {
                 [rows, keys, heads, dim],
                 heads * dim,
                 &mut defects,
-            )?;
+            )?
+            .0;
             let control = selected
                 .iter()
                 .flat_map(|&row| {
@@ -3066,7 +3072,8 @@ mod tests {
                     [repeated_rows, keys, heads, dim],
                     heads * dim,
                     &mut defects,
-                )?;
+                )?
+                .0;
                 let expected = (0..repeated_rows)
                     .flat_map(|row| {
                         expected[row % rows * heads * dim..(row % rows + 1) * heads * dim]
@@ -3089,35 +3096,146 @@ mod tests {
             }
         }
         println!("F16_ATTENTION_RESULT cells={scored} controls=4 defects={defects}");
-        for rows in [2548, 13019, 22775] {
-            for keys in [rows, 2917] {
-                let inputs = std::array::from_fn(|operand| {
-                    let count = if operand == 0 { rows } else { keys } * 22 * 96;
-                    let period = [97, 101, 103][operand];
-                    (0..count)
-                        .map(|i| {
-                            half::f16::from_f32(
-                                ((i * 37 % period) as f32 - (period / 2) as f32) / period as f32,
-                            )
-                        })
-                        .collect()
-                });
-                for padding in [0, 8] {
-                    f16_attention_cell(
-                        &stream,
-                        &inputs,
-                        [rows, keys, 22, 96],
-                        22 * 96 + padding,
-                        &mut defects,
-                    )?;
+        f16_q_reuse_cells(&stream, &mut defects)?;
+        ensure!(defects == 0, "F16 attention candidate DEFECT");
+        Ok(())
+    }
+
+    fn f16_q_reuse_cells(stream: &Arc<CudaStream>, defects: &mut usize) -> Result<()> {
+        let shapes = [
+            [1, 1],
+            [17, 63],
+            [63, 64],
+            [64, 65],
+            [65, 129],
+            [127, 65],
+            [129, 127],
+            [2548, 2548],
+            [2548, 2917],
+            [13019, 13019],
+            [13019, 2917],
+            [22775, 22775],
+            [22775, 2917],
+        ];
+        let mut cells = 0;
+        let mut controls = 0;
+        for [rows, keys] in shapes {
+            let inputs: [Vec<half::f16>; 3] = std::array::from_fn(|operand| {
+                let count = if operand == 0 { rows } else { keys } * 22 * 96;
+                let period = [97, 101, 103][operand];
+                (0..count)
+                    .map(|i| {
+                        half::f16::from_f32(
+                            ((i * 37 % period) as f32 - (period / 2) as f32) / period as f32,
+                        )
+                    })
+                    .collect()
+            });
+            for padding in [0, 8] {
+                let (output, lse) = f16_attention_cell(
+                    stream,
+                    &inputs,
+                    [rows, keys, 22, 96],
+                    22 * 96 + padding,
+                    defects,
+                )?;
+                cells += 1;
+                if rows == 65 && keys == 129 && padding == 0 {
+                    let mut wrong = inputs.clone();
+                    for row in wrong[0].as_chunks_mut::<{ 22 * 96 }>().0 {
+                        row.copy_within(96 + 16..96 + 32, 96);
+                    }
+                    let (changed, changed_lse) =
+                        f16_attention_cell(stream, &wrong, [rows, keys, 22, 96], 22 * 96, defects)?;
+                    let mut output_bits = 0u64;
+                    let mut prefix_bits = 0u64;
+                    for (i, (a, b)) in output.iter().zip(&changed).enumerate() {
+                        let bits = u64::from((a.to_bits() ^ b.to_bits()).count_ones());
+                        output_bits += bits;
+                        if i % (22 * 96) < 96 {
+                            prefix_bits += bits;
+                        }
+                    }
+                    let lse_bits: u64 = lse
+                        .iter()
+                        .zip(&changed_lse)
+                        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+                        .sum();
+                    prefix_bits += lse[..rows]
+                        .iter()
+                        .zip(&changed_lse[..rows])
+                        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+                        .sum::<u64>();
+                    let valid = output_bits > 0 && lse_bits > 0 && prefix_bits == 0;
+                    *defects += usize::from(!valid);
+                    controls += 1;
+                    println!(
+                        "{} F16_Q_REUSE_SLAB_CONTROL rows={rows} keys={keys} changed_head=1 output_bits={output_bits} lse_bits={lse_bits} unchanged_head0_bits={prefix_bits} positive_threshold_bits=0",
+                        if valid { "PASS" } else { "DEFECT" }
+                    );
                 }
             }
         }
         println!(
-            "{} F16_D96_COMPACT_IDENTITY production_cells=12 output_bits_threshold=0 lse_bits_threshold=0 defects={defects} eager_graph=true",
-            if defects == 0 { "PASS" } else { "DEFECT" }
+            "{} F16_Q_REUSE_IDENTITY cells={cells} controls={controls} defects={defects} output_bits_threshold=0 lse_bits_threshold=0 eager_graph=true timing=false",
+            if *defects == 0 { "PASS" } else { "DEFECT" }
         );
-        ensure!(defects == 0, "F16 attention candidate DEFECT");
+        ensure!(cells == 26 && controls == 1, "Q reuse gate coverage");
+        for dim in [16, 64] {
+            let rows = 65;
+            let keys = 129;
+            let heads = 16;
+            let inputs = [
+                vec![half::f16::ZERO; rows * heads * dim],
+                vec![half::f16::ZERO; keys * heads * dim],
+                (0..keys * heads * dim)
+                    .map(|i| {
+                        half::f16::from_f32(if (i / dim) % heads % 2 == 0 {
+                            0.25
+                        } else {
+                            -0.5
+                        })
+                    })
+                    .collect(),
+            ];
+            let (output, _) = f16_attention_cell(
+                stream,
+                &inputs,
+                [rows, keys, heads, dim],
+                heads * dim + 8,
+                defects,
+            )?;
+            let bits: u64 = output
+                .iter()
+                .enumerate()
+                .map(|(i, value)| {
+                    u64::from(
+                        (value.to_bits() ^ inputs[2][i % (heads * dim)].to_bits()).count_ones(),
+                    )
+                })
+                .sum();
+            *defects += usize::from(bits != 0);
+            println!(
+                "{} F16_Q_REUSE_PRESERVATION dim={dim} rows={rows} keys={keys} heads={heads} output_bits={bits} threshold_bits=0 eager_graph=true",
+                if bits == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "GPU lease; F16 D96 Q reuse synthetic identity"]
+    fn f16_d96_q_reuse_identity_gpu() -> Result<()> {
+        let context = crate::backend::gpu::CudaContext::new(0)?;
+        unsafe {
+            context.disable_event_tracking();
+        }
+        let stream = context.new_stream()?;
+        let mut defects = 0;
+        f16_q_reuse_cells(&stream, &mut defects)?;
+        ensure!(defects == 0, "F16 Q reuse candidate DEFECT");
         Ok(())
     }
 

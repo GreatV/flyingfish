@@ -3692,6 +3692,15 @@ fn hi3d_cascade_flow_definition_gpu() -> Result<()> {
                 "{} F16_CONTEXT_DERIVED_MODES enabled_then_disabled=true budget={budget} equal_partitions=true output_bits={bits} threshold_bits=0",
                 if bits == 0 { "PASS" } else { "DEFECT" }
             );
+            let negative = uncached.conditioning(&vec![0.0; context.len()], &[], &coordinates)?;
+            let noise = f32_tensor(&source, "noise")?;
+            let sampled = uncached.sample_heun(&noise, &condition, &negative)?;
+            ensure!(
+                uncached.context_cache.is_none()
+                    && sampled.len() == noise.len()
+                    && sampled.iter().all(|value| value.is_finite()),
+                "derived uncached sampler extent, mode or nonfinite failure"
+            );
         }
     }
     gate.finish()
@@ -5684,18 +5693,19 @@ fn flow_padded_identity(
     defects: &mut usize,
 ) -> Result<()> {
     let compact = flow.device.stream.clone_dtoh(output)?;
-    flow.flash.set_f16_padded_reference(true)?;
+    flow_attention_identity(flow, input, condition, output, &compact, defects)?;
+    flow.flash.set_f16_reference(2)?;
     let CrossAttention::F16(cross) = &mut flow.cross else {
         anyhow::bail!("F16 cross binding missing");
     };
-    cross.set_f16_padded_reference(true)?;
+    cross.set_f16_reference(2)?;
     flow.forward(input, 0, condition, output)?;
     let padded = flow.device.stream.clone_dtoh(output)?;
-    flow.flash.set_f16_padded_reference(false)?;
+    flow.flash.set_f16_reference(0)?;
     let CrossAttention::F16(cross) = &mut flow.cross else {
         anyhow::bail!("F16 cross binding missing");
     };
-    cross.set_f16_padded_reference(false)?;
+    cross.set_f16_reference(0)?;
     let bits: u64 = compact
         .iter()
         .zip(&padded)
@@ -5742,6 +5752,48 @@ fn flow_padded_identity(
     *defects += usize::from(bits != 0);
     flow_context_identity(flow, input, condition, output, &compact, defects)?;
     flow_bias_identity(flow, input, condition, output, &compact, defects)
+}
+
+pub(super) fn flow_attention_identity(
+    flow: &mut Flow<f16>,
+    input: &CudaSlice<f32>,
+    condition: &Conditioning<f16>,
+    output: &mut CudaSlice<f32>,
+    compact: &[f32],
+    defects: &mut usize,
+) -> Result<()> {
+    flow.flash.set_f16_reference(1)?;
+    let CrossAttention::F16(cross) = &mut flow.cross else {
+        anyhow::bail!("F16 cross binding missing");
+    };
+    cross.set_f16_reference(1)?;
+    let result = flow.forward(input, 0, condition, output);
+    flow.flash.set_f16_reference(0)?;
+    let CrossAttention::F16(cross) = &mut flow.cross else {
+        anyhow::bail!("F16 cross binding missing");
+    };
+    cross.set_f16_reference(0)?;
+    result?;
+    let original = flow.device.stream.clone_dtoh(output)?;
+    ensure!(
+        compact.len() == original.len() && compact.iter().chain(&original).all(|x| x.is_finite()),
+        "non-finite Q reuse velocity comparison"
+    );
+    let bits: u64 = compact
+        .iter()
+        .zip(&original)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_Q_REUSE_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} cached={} threshold_bits=0",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len(),
+        flow.context_cache.is_some()
+    );
+    *defects += usize::from(bits != 0);
+    flow.device.stream.memcpy_htod(compact, output)?;
+    Ok(())
 }
 
 pub(super) fn flow_bias_identity(
