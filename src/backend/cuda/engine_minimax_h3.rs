@@ -1738,33 +1738,46 @@ fn dense_sizing(manifest: &TensorManifest, layers: usize) -> Result<DenseSizing>
     })
 }
 
-/// Dense streaming of `layers` (per-layer device matrix bytes, `largest` device matrix) beside `owned` resident bytes:
-/// placement derived from free device memory and host RAM, or forced streamed / disk-only. `source_layers` sizes the
-/// host/disk tier; it equals `layers` for a native BF16 manifest and is the stored source size for a quantized one.
-/// Host-tier copies are filled from `base` in `roles` order before the first `begin`.
-fn place_layers(
-    d: &Device,
-    base: &mut Source<'_>,
+/// Bytes the dense placer read at setup: device free and total, the owned reserve, the largest matrix, and the host
+/// budget after `2 * slot + largest + 4 GiB`.
+#[derive(Clone, Copy)]
+struct PlacementFacts {
+    free_bytes: usize,
+    total_bytes: usize,
+    owned_bytes: usize,
+    largest_bytes: usize,
+    host_available_bytes: Option<usize>,
+    device_budget: usize,
+    host_budget: usize,
+}
+
+struct PlacedLayers {
+    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    #[cfg(test)]
+    facts: PlacementFacts,
+}
+
+/// Device budget and host budget for `layers`, then the `DensePlacement` those budgets produce. `host_available` is
+/// measured only when the two slots do not hold every layer.
+fn plan_dense_layers(
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
-    name: impl Fn(usize) -> String,
-    roles: &[&str],
-) -> Result<Option<crate::backend::cuda::weights::DenseStreaming>> {
+    (free, total, host_available): (usize, usize, Option<usize>),
+) -> Result<(crate::prefill::DensePlacement, PlacementFacts)> {
     use crate::prefill::DensePlacement;
-    let (free, total) = d.ctx.mem_get_info()?;
-    let mut budget = DensePlacement::device_budget(free, total, owned, 0, media)?;
+    let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, media)?;
     if placement != Placement::Derived {
         let slots = 2 * layers.iter().copied().max().context("no streamed layers")?;
-        ensure!(slots <= budget, "two block slots exceed the device budget");
-        budget = slots;
+        ensure!(
+            slots <= device_budget,
+            "two block slots exceed the device budget"
+        );
+        device_budget = slots;
     }
-    let mut plan = DensePlacement::new(layers, Some(source_layers), budget, 0)?;
-    let mut host = None;
-    if plan.slot_bytes > 0 {
-        let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
-            "/",
-        ))?)?;
-        let reserved = 2 * plan.slot_bytes + largest + (4 << 30);
+    let probe = DensePlacement::new(layers, Some(source_layers), device_budget, 0)?;
+    let (host_budget, host_available) = if probe.slot_bytes > 0 {
+        let available = host_available.context("host tier without a measured host budget")?;
+        let reserved = 2 * probe.slot_bytes + largest + (4 << 30);
         ensure!(
             available >= reserved,
             "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
@@ -1776,18 +1789,70 @@ fn place_layers(
             #[cfg(test)]
             Placement::StreamedDisk => 0,
         };
-        plan = DensePlacement::new(layers, Some(source_layers), budget, host_bytes)?;
-        host = Some(available);
-    }
+        (host_bytes, Some(available))
+    } else {
+        (0, None)
+    };
+    let plan = DensePlacement::new(layers, Some(source_layers), device_budget, host_budget)?;
     ensure!(
         placement == Placement::Derived || plan.resident_bytes == 0,
         "{placement:?} placement kept a resident block"
     );
+    Ok((
+        plan,
+        PlacementFacts {
+            free_bytes: free,
+            total_bytes: total,
+            owned_bytes: owned,
+            largest_bytes: largest,
+            host_available_bytes: host_available,
+            device_budget,
+            host_budget,
+        },
+    ))
+}
+
+/// Dense streaming of `layers` (per-layer device matrix bytes, `largest` device matrix) beside `owned` resident bytes:
+/// placement derived from free device memory and host RAM, or forced streamed / disk-only. `source_layers` sizes the
+/// host/disk tier; it equals `layers` for a native BF16 manifest and is the stored source size for a quantized one.
+/// Host-tier copies are filled from `base` in `roles` order before the first `begin`.
+fn place_layers(
+    d: &Device,
+    base: &mut Source<'_>,
+    (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
+    placement: Placement,
+    name: impl Fn(usize) -> String,
+    roles: &[&str],
+) -> Result<PlacedLayers> {
+    use crate::prefill::DensePlacement;
+    let (free, total) = d.ctx.mem_get_info()?;
+    let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, media)?;
+    if placement != Placement::Derived {
+        let slots = 2 * layers.iter().copied().max().context("no streamed layers")?;
+        ensure!(
+            slots <= device_budget,
+            "two block slots exceed the device budget"
+        );
+        device_budget = slots;
+    }
+    let probe = DensePlacement::new(layers, Some(source_layers), device_budget, 0)?;
+    let host_available = if probe.slot_bytes > 0 {
+        Some(usize::try_from(
+            crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+        )?)
+    } else {
+        None
+    };
+    let (plan, facts) = plan_dense_layers(
+        (layers, source_layers, largest, owned, media),
+        placement,
+        (free, total, host_available),
+    )?;
     eprintln!(
         "{}",
-        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": free, "total_bytes": total, "owned_block_bytes": owned, "host_available_bytes": host})
+        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
     );
-    Ok(if plan.slot_bytes > 0 {
+    let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
         let mut dense =
@@ -1825,7 +1890,15 @@ fn place_layers(
         Some(dense)
     } else {
         None
-    })
+    };
+    #[cfg(test)]
+    {
+        Ok(PlacedLayers { dense, facts })
+    }
+    #[cfg(not(test))]
+    {
+        Ok(PlacedLayers { dense })
+    }
 }
 
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
@@ -1963,7 +2036,8 @@ impl Dit {
             placement,
             |layer| format!("transformer_blocks.{layer}"),
             &LINEAR_ROLES,
-        )?;
+        )?
+        .dense;
         let mut blocks = Vec::with_capacity(spec.layers);
         for (layer, &bytes) in sizing.layers.iter().enumerate() {
             let name = format!("transformer_blocks.{layer}");
@@ -2419,6 +2493,8 @@ pub(crate) struct ImageDit {
     refiners: Vec<BlockWeights>,
     blocks: Vec<BlockWeights>,
     dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    #[cfg(test)]
+    placement: PlacementFacts,
     rotary: CudaSlice<bf16>,
     x: CudaSlice<bf16>,
     work: BlockWork,
@@ -2530,7 +2606,7 @@ impl ImageDit {
         let sizing = dense_sizing(manifest, spec.layers)?;
         let owned =
             spec.layers * 2 * (2 * h + 2 * spec.head_dim) + sizing.staging + sizing.transient;
-        let dense = place_layers(
+        let placed = place_layers(
             d,
             &mut base,
             (
@@ -2544,6 +2620,9 @@ impl ImageDit {
             |layer| format!("transformer_blocks.{layer}"),
             &LINEAR_ROLES,
         )?;
+        #[cfg(test)]
+        let placement_facts = placed.facts;
+        let dense = placed.dense;
         let mut blocks = Vec::with_capacity(spec.layers);
         for (layer, &bytes) in sizing.layers.iter().enumerate() {
             let name = format!("transformer_blocks.{layer}");
@@ -2603,6 +2682,8 @@ impl ImageDit {
             refiners,
             blocks,
             dense,
+            #[cfg(test)]
+            placement: placement_facts,
             rotary,
             x,
             work,
@@ -3069,7 +3150,8 @@ impl Conditioner {
             placement,
             name,
             &TEXT_ROLES,
-        )?;
+        )?
+        .dense;
         let mut text_layers = Vec::with_capacity(layers);
         for (layer, &layer_bytes) in bytes.iter().enumerate() {
             let slot = match &dense {
@@ -5725,6 +5807,7 @@ mod tests {
                     |layer| format!("transformer_blocks.{layer}"),
                     &LINEAR_ROLES,
                 )?
+                .dense
                 .context("streamed placement")?;
                 if let Some((layer, name, delta)) = perturb {
                     dense.shift_source_offset(layer, name, delta)?;
@@ -8702,6 +8785,356 @@ mod tests {
             "H3_IMAGE_DIT_GATE DEFECT cells outside the frozen taus: {defects:?}"
         );
         println!("H3_IMAGE_DIT_GATE PASS cells=5 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    struct Image4096Cell {
+        name: &'static str,
+        tau_max: f64,
+        tau_rmse: f64,
+    }
+
+    /// 4096 taus, `max(2 * worst pair, 1e-6)` of the four arms. The frozen reference is the G4 sdpa B=1 arm.
+    const IMAGE_DIT_4096: &[Image4096Cell] = &[
+        Image4096Cell {
+            name: "dit_step0",
+            tau_max: 1.0555169582366943,
+            tau_rmse: 0.10097579439649207,
+        },
+        Image4096Cell {
+            name: "dit_step5",
+            tau_max: 2.0533370971679688,
+            tau_rmse: 0.10246208378706335,
+        },
+        Image4096Cell {
+            name: "euler_step0",
+            tau_max: 1.6550288200378418,
+            tau_rmse: 0.3006873726360839,
+        },
+    ];
+
+    fn image_f32_shaped(
+        file: &SafeTensors<'_>,
+        name: &str,
+        rows: usize,
+        width: usize,
+    ) -> Result<Vec<f32>> {
+        let view = file.tensor(name).with_context(|| format!("lacks {name}"))?;
+        let shape = view.shape();
+        ensure!(
+            shape == [rows, width] || shape == [1, rows, width],
+            "{name} shape {shape:?}"
+        );
+        let values = image_f32(file, name)?;
+        ensure!(
+            values.len() == rows * width && values.iter().all(|v| v.is_finite()),
+            "{name} length {} or a non-finite value",
+            values.len()
+        );
+        Ok(values)
+    }
+
+    /// Canvas 4096, latent 256, 16384 image rows, S=16391. Placement is `Derived`.
+    /// Step 0, Euler of a copy of those rows, then step 5. The reference is the G4 sdpa B=1 arm.
+    /// Every image row swaps `(h, w)` to `(w, h)`.
+    /// Control bar dated 2026-11-12: both metrics must exceed `3 * tau`.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_4096"]
+    fn image_dit_4096_matches_the_frozen_cells() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let path = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let model = path("FF_H3_IMAGE")?;
+        let fixture = path("FF_H3_IMAGE_4096")?;
+        let image_spec = ImageSpec::read(&model)?;
+        let spec = super::image_block_spec(&image_spec);
+        let width = image_spec.row_width();
+        let tokens = 128usize;
+        let latent = tokens * image_spec.patch[1];
+        ensure!(
+            width == 96 && latent == 256 && image_spec.patch == [1, 2, 2],
+            "4096 image geometry width={width} latent={latent} patch={:?}",
+            image_spec.patch
+        );
+        let image_rows = tokens * tokens;
+        let capture_map = mapped(&fixture)?;
+        let capture = SafeTensors::deserialize(&capture_map)?;
+        let tags = image_tags(&capture, "conditioner_t2i_tags")?;
+        let text_view = capture.tensor("conditioner_t2i")?;
+        ensure!(
+            tags.len() == 7
+                && tags.iter().all(|&tag| tag == crate::minimax_h3::TEXT_TAG)
+                && (text_view.shape() == [1, 7, image_spec.text_dim]
+                    || text_view.shape() == [7, image_spec.text_dim]),
+            "conditioner tags {:?} text {:?}",
+            tags,
+            text_view.shape()
+        );
+        let text = image_bf16_exact(&image_f32(&capture, "conditioner_t2i")?)?;
+        let rows_host = image_f32_shaped(&capture, "t2i_rows", image_rows, width)?;
+        let step0_ref = image_f32_shaped(&capture, "dit_step0", image_rows, width)?;
+        let step5_ref = image_f32_shaped(&capture, "dit_step5", image_rows, width)?;
+        let euler_ref = image_f32_shaped(&capture, "euler_step0", image_rows, width)?;
+        ensure!(
+            text.len() == tags.len() * image_spec.text_dim && rows_host.iter().any(|v| *v != 0.0),
+            "4096 fixture extents"
+        );
+        let layout = image_layout(&image_spec, &tags, &[], latent, latent)?;
+        ensure!(
+            layout.rows() == tags.len() + image_rows
+                && layout.image_indices.len() == image_rows
+                && layout.text_indices.len() == tags.len()
+                && layout.reference_rows == 0,
+            "4096 layout extents"
+        );
+        ensure!(
+            layout
+                .text_indices
+                .iter()
+                .enumerate()
+                .all(|(k, &row)| { layout.position_ids[row as usize] == [k as f64, 0.0, 0.0] }),
+            "text position ids"
+        );
+        ensure!(
+            (0..tokens).all(|h| {
+                (0..tokens).all(|w| {
+                    let id = layout.position_ids[tags.len() + h * tokens + w];
+                    id[0] == tags.len() as f64
+                        && id[1] == h as f64 * 0.25
+                        && id[2] == w as f64 * 0.25
+                })
+            }),
+            "spatial position ids"
+        );
+        let source = layout.position_ids.clone();
+        let mut transposed_ids = source.clone();
+        for &row in &layout.image_indices {
+            let row = row as usize;
+            transposed_ids[row][1] = source[row][2];
+            transposed_ids[row][2] = source[row][1];
+        }
+        ensure!(
+            transposed_ids != source
+                && transposed_ids
+                    .iter()
+                    .zip(&source)
+                    .all(|(got, want)| got[0] == want[0])
+                && layout
+                    .text_indices
+                    .iter()
+                    .all(|&row| transposed_ids[row as usize] == source[row as usize])
+                && layout.image_indices.iter().all(|&row| {
+                    let row = row as usize;
+                    transposed_ids[row][1] == source[row][2]
+                        && transposed_ids[row][2] == source[row][1]
+                }),
+            "spatial transpose is not (h, w) to (w, h)"
+        );
+        let schedule = ImageSchedule::published()?;
+        let row_plan =
+            AdalnPlan::from_tags(&layout.token_tags, &image_row_plan(&layout, &schedule)?);
+        ensure!(row_plan.row_pairs.len() == 6, "evaluation count");
+        let dir = model.join("transformer_diffusers");
+        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+            .minimax_h3_image_manifest(&image_spec)?;
+        let sizing = super::dense_sizing(&manifest, spec.layers)?;
+        let owned = spec.layers * 2 * (2 * spec.hidden + 2 * spec.head_dim)
+            + sizing.staging
+            + sizing.transient;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-image-dit-4096-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3-Image 4096 DiT gate".into())),
+        )?;
+        let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &row_plan)?;
+        let mut dit = ImageDit::new(
+            &device,
+            &mut blas,
+            (&spec, &image_spec),
+            &layout,
+            &dir,
+            &manifest,
+            Placement::Derived,
+        )?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 1.0,
+        };
+        {
+            let facts = dit.placement;
+            let dense = dit
+                .dense
+                .as_ref()
+                .context("4096 placement kept every block resident")?;
+            ensure!(
+                facts.largest_bytes == sizing.largest && facts.owned_bytes == owned,
+                "placement facts differ from the image block sizes"
+            );
+            ensure!(
+                facts.host_available_bytes.is_some() && dense.plan.slot_bytes > 0,
+                "4096 placement kept every block resident"
+            );
+            let (plan, again) = super::plan_dense_layers(
+                (
+                    &sizing.layers,
+                    &sizing.source_layers,
+                    sizing.largest,
+                    owned,
+                    0,
+                ),
+                Placement::Derived,
+                (
+                    facts.free_bytes,
+                    facts.total_bytes,
+                    facts.host_available_bytes,
+                ),
+            )?;
+            let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
+            let host = plan.host.iter().filter(|flag| **flag).count();
+            let disk = plan
+                .slots
+                .iter()
+                .zip(&plan.host)
+                .filter(|(slot, flag)| slot.is_some() && !**flag)
+                .count();
+            let streamed = sizing
+                .source_layers
+                .iter()
+                .zip(&plan.slots)
+                .filter(|(_, slot)| slot.is_some())
+                .map(|(bytes, _)| *bytes)
+                .sum::<usize>();
+            let host_available = facts
+                .host_available_bytes
+                .context("4096 placement kept every block resident")?;
+            println!(
+                "H3_IMAGE_4096_PLACEMENT resident={resident} host={host} disk={disk} free_bytes={} total_bytes={} device_budget={} host_budget={} slot_bytes={} host_available_bytes={host_available}",
+                facts.free_bytes,
+                facts.total_bytes,
+                facts.device_budget,
+                facts.host_budget,
+                plan.slot_bytes
+            );
+            ensure!(
+                again.device_budget == facts.device_budget
+                    && again.host_budget == facts.host_budget
+                    && plan.slots == dense.plan.slots
+                    && plan.host == dense.plan.host
+                    && plan.slot_bytes == dense.plan.slot_bytes
+                    && plan.resident_bytes == dense.plan.resident_bytes
+                    && plan.host_bytes == dense.plan.host_bytes
+                    && plan.disk_bytes == dense.plan.disk_bytes,
+                "derived placement disagrees with the live free bytes"
+            );
+            if facts.host_budget >= streamed {
+                ensure!(plan.disk_bytes == 0, "host budget holds the spill");
+            }
+        }
+        let counts = (
+            u32::try_from(row_plan.pairs.len())?,
+            u32::try_from(row_plan.timesteps.len())?,
+        );
+        let rows_d = s.clone_htod(&rows_host)?;
+        let text_d = s.clone_htod(&text)?;
+        let mut defects = Vec::new();
+        let mut score = |name: &'static str, candidate: &[f32], reference: &[f32]| -> Result<()> {
+            ensure!(
+                candidate.len() == image_rows * width && candidate.iter().all(|v| v.is_finite()),
+                "{name} length {} or a non-finite value",
+                candidate.len()
+            );
+            let cell = IMAGE_DIT_4096
+                .iter()
+                .find(|cell| cell.name == name)
+                .context(name)?;
+            let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
+            let (tau_max, tau_rmse) = (cell.tau_max, cell.tau_rmse);
+            let ok = max_abs <= tau_max && rmse <= tau_rmse;
+            println!(
+                "H3_IMAGE_4096 {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
+            );
+            if !ok {
+                defects.push(name);
+            }
+            Ok(())
+        };
+        let velocity = |head: usize, dit: &mut ImageDit| -> Result<Vec<f32>> {
+            let row_pairs = s.clone_htod(&row_plan.row_pairs[head])?;
+            let row_timesteps = s.clone_htod(&row_plan.row_timesteps[head])?;
+            dit.step(
+                &context,
+                &table,
+                counts,
+                head,
+                &ImageStepInputs {
+                    image: &rows_d,
+                    text: &text_d,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            Ok(s.clone_dtoh(&dit.velocity)?)
+        };
+        let step0 = velocity(0, &mut dit)?;
+        score("dit_step0", &step0, &step0_ref)?;
+        let euler_rows = s.clone_htod(&rows_host)?;
+        dit.euler(s, &euler_rows, &schedule, 0)?;
+        let euler = s.clone_dtoh(&euler_rows)?;
+        score("euler_step0", &euler, &euler_ref)?;
+        let step5 = velocity(5, &mut dit)?;
+        score("dit_step5", &step5, &step5_ref)?;
+        let transposed = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &transposed_ids);
+        ensure!(
+            transposed.len() == dit.rotary.len(),
+            "transposed rotary length {} {}",
+            transposed.len(),
+            dit.rotary.len()
+        );
+        dit.rotary = s.clone_htod(&transposed)?;
+        let control = velocity(0, &mut dit)?;
+        ensure!(
+            control.len() == image_rows * width && control.iter().all(|v| v.is_finite()),
+            "rope_transpose length {} or a non-finite value",
+            control.len()
+        );
+        let (control_max, control_rmse) = image_max_rmse(&control, &step0_ref)?;
+        let (versus_max, versus_rmse) = image_max_rmse(&control, &step0)?;
+        drop(score);
+        fs::remove_dir_all(&runtime)?;
+        let step0_cell = IMAGE_DIT_4096
+            .iter()
+            .find(|cell| cell.name == "dit_step0")
+            .context("dit_step0")?;
+        let bar_max = 3.0 * step0_cell.tau_max;
+        let bar_rmse = 3.0 * step0_cell.tau_rmse;
+        let caught = control_max > bar_max && control_rmse > bar_rmse;
+        println!(
+            "H3_IMAGE_4096 rope_transpose max_abs={control_max:.8e} rmse={control_rmse:.8e} vs_step0_max={versus_max:.8e} vs_step0_rmse={versus_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught}"
+        );
+        ensure!(caught, "rope-transpose control stayed within 3x tau");
+        ensure!(
+            defects.is_empty(),
+            "H3_IMAGE_4096_GATE DEFECT cells outside the frozen taus: {defects:?}"
+        );
+        println!("H3_IMAGE_4096_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
         Ok(())
     }
 }
