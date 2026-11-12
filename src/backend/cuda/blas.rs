@@ -80,6 +80,47 @@ use std::{
     sync::Arc,
 };
 
+/// Algorithm selection for one plan: a heuristic rank or a fixed algorithm.
+enum PlanAlgo {
+    Heuristic(u32),
+    Fixed(sys::cublasLtMatmulAlgo_t),
+}
+
+/// Config identity of a raw Lt algorithm struct.
+fn algo_config(algo: &sys::cublasLtMatmulAlgo_t) -> Result<LtAlgorithm> {
+    use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
+    let read = |attr: sys::cublasLtMatmulAlgoConfigAttributes_t, width: usize| -> Result<i64> {
+        let mut value = 0i64;
+        let mut written = 0usize;
+        unsafe {
+            sys::cublasLtMatmulAlgoConfigGetAttribute(
+                algo,
+                attr,
+                (&mut value as *mut i64).cast(),
+                width,
+                &mut written,
+            )
+            .result()?;
+        }
+        ensure!(
+            written == width,
+            "Lt attribute {attr:?} returned {written} bytes"
+        );
+        Ok(value)
+    };
+    Ok(LtAlgorithm {
+        id: read(A::CUBLASLT_ALGO_CONFIG_ID, size_of::<i32>())? as i32,
+        tile: read(A::CUBLASLT_ALGO_CONFIG_TILE_ID, size_of::<i32>())? as i32,
+        split_k: read(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM, size_of::<i32>())? as i32,
+        reduction: read(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, size_of::<i32>())? as i32,
+        swizzle: read(A::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, size_of::<i32>())? as i32,
+        custom: read(A::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, size_of::<i32>())? as i32,
+        stages: read(A::CUBLASLT_ALGO_CONFIG_STAGES_ID, size_of::<i32>())? as i32,
+        inner: read(A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, size_of::<u16>())? as u16,
+        cluster: read(A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, size_of::<u16>())? as u16,
+    })
+}
+
 struct Plan {
     desc: sys::cublasLtMatmulDesc_t,
     a: sys::cublasLtMatrixLayout_t,
@@ -94,39 +135,8 @@ struct Plan {
 }
 
 impl Plan {
-    fn attr16(&self, attr: sys::cublasLtMatmulAlgoConfigAttributes_t) -> Result<u16> {
-        let mut value = 0u16;
-        let mut written = 0usize;
-        unsafe {
-            sys::cublasLtMatmulAlgoConfigGetAttribute(
-                self.algo.as_ref().context("Lt algorithm missing")?,
-                attr,
-                (&mut value as *mut u16).cast(),
-                size_of::<u16>(),
-                &mut written,
-            )
-            .result()?;
-        }
-        ensure!(
-            written == size_of::<u16>(),
-            "Lt attribute {attr:?} returned {written} bytes"
-        );
-        Ok(value)
-    }
-
     fn identity(&self) -> Result<LtAlgorithm> {
-        use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
-        Ok(LtAlgorithm {
-            id: self.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,
-            tile: self.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
-            split_k: self.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,
-            reduction: self.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?,
-            swizzle: self.attr(A::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING)?,
-            custom: self.attr(A::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION)?,
-            stages: self.attr(A::CUBLASLT_ALGO_CONFIG_STAGES_ID)?,
-            inner: self.attr16(A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID)?,
-            cluster: self.attr16(A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID)?,
-        })
+        algo_config(self.algo.as_ref().context("Lt algorithm missing")?)
     }
 
     fn attr(&self, attr: sys::cublasLtMatmulAlgoConfigAttributes_t) -> Result<i32> {
@@ -185,10 +195,9 @@ impl Plan {
             handle,
             (rows, output, input),
             workspace,
-            algo_index,
             bias,
             sys::cudaDataType_t::CUDA_R_16BF,
-            None,
+            PlanAlgo::Heuristic(algo_index),
         )
     }
 
@@ -206,10 +215,9 @@ impl Plan {
             handle,
             (rows, output, input),
             workspace,
-            algo_index,
             None,
             sys::cudaDataType_t::CUDA_R_32F,
-            None,
+            PlanAlgo::Heuristic(algo_index),
         )
     }
 
@@ -218,10 +226,9 @@ impl Plan {
         handle: sys::cublasLtHandle_t,
         geometry: (usize, usize, usize),
         workspace: usize,
-        algo_index: u32,
         bias: Option<u64>,
         c_dtype: sys::cudaDataType_t,
-        fixed: Option<sys::cublasLtMatmulAlgo_t>,
+        select: PlanAlgo,
     ) -> Result<Self> {
         let (rows, output, input) = geometry;
         let mut p = Self {
@@ -292,7 +299,26 @@ impl Plan {
                 (&workspace as *const usize).cast(),
                 size_of::<usize>(),
             )?;
-            if let Some(algo) = fixed {
+            let checked = match select {
+                PlanAlgo::Heuristic(index) => {
+                    let algos = heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)?;
+                    ensure!(
+                        (index as usize) < algos.len(),
+                        "Lt heuristic returned {} algos; index {index} unavailable",
+                        algos.len()
+                    );
+                    p.algo_count = algos.len();
+                    let heuristic = &algos[index as usize];
+                    heuristic.state.result()?;
+                    p.waves = heuristic.wavesCount;
+                    p.workspace = heuristic.workspaceSize;
+                    p.algo = Some(heuristic.algo);
+                    p.algo_index = index;
+                    None
+                }
+                PlanAlgo::Fixed(algo) => Some(algo),
+            };
+            if let Some(algo) = checked {
                 let mut result = std::mem::MaybeUninit::uninit();
                 sys::cublasLtMatmulAlgoCheck(
                     handle,
@@ -314,20 +340,6 @@ impl Plan {
                 p.waves = result.wavesCount;
                 p.workspace = result.workspaceSize;
                 p.algo_count = 1;
-            } else {
-                let algos = heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)?;
-                ensure!(
-                    (algo_index as usize) < algos.len(),
-                    "Lt heuristic returned {} algos; index {algo_index} unavailable",
-                    algos.len()
-                );
-                p.algo_count = algos.len();
-                let heuristic = &algos[algo_index as usize];
-                heuristic.state.result()?;
-                p.waves = heuristic.wavesCount;
-                p.workspace = heuristic.workspaceSize;
-                p.algo = Some(heuristic.algo);
-                p.algo_index = algo_index;
             }
         }
         let split_k =
@@ -1096,21 +1108,21 @@ impl Blas {
     }
     #[cfg(test)]
     pub(crate) fn bound_plan_receipt(&self) -> Result<serde_json::Value> {
-        use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
         let mut plans = Vec::new();
         for (&(rows, output, input, index, row_family), p) in self.plans.borrow().iter() {
+            let id = p.identity()?;
             plans.push(serde_json::json!({
                 "rows":rows,"output":output,"input":input,"algo_index":index,"row_family":row_family,
-                "id":p.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,
-                "tile":p.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
-                "split_k":p.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,
-                "reduction_scheme":p.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?,
+                "id":id.id,
+                "tile":id.tile,
+                "split_k":id.split_k,
+                "reduction_scheme":id.reduction,
                 "workspace_bytes":p.workspace,
-                "cta_swizzling":p.attr(A::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING)?,
-                "custom_option":p.attr(A::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION)?,
-                "stages_id":p.attr(A::CUBLASLT_ALGO_CONFIG_STAGES_ID)?,
-                "inner_shape_id":p.attr16(A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID)?,
-                "cluster_shape_id":p.attr16(A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID)?,
+                "cta_swizzling":id.swizzle,
+                "custom_option":id.custom,
+                "stages_id":id.stages,
+                "inner_shape_id":id.inner,
+                "cluster_shape_id":id.cluster,
                 "opaque_algorithm":p.algo.as_ref().context("fixed Lt algorithm missing")?.data
             }));
         }
@@ -1169,10 +1181,9 @@ impl Blas {
                 self.handle,
                 (shape.rows, shape.output, shape.input),
                 self.workspace.borrow().len(),
-                0,
                 None,
                 sys::cudaDataType_t::CUDA_R_16BF,
-                Some(algo),
+                PlanAlgo::Fixed(algo),
             )?;
             self.plans.borrow_mut().insert(key, plan);
         }
@@ -1883,10 +1894,9 @@ impl Blas {
             self.handle,
             (shape.rows, shape.output, shape.input),
             self.workspace.borrow().len(),
-            0,
             Some(bias.ptr),
             sys::cudaDataType_t::CUDA_R_16BF,
-            Some(algo),
+            PlanAlgo::Fixed(algo),
         )?;
         ensure!(
             plan.algo.context("biased algorithm missing")?.data == algo.data,
@@ -2014,6 +2024,56 @@ impl Blas {
                 shape.output,
                 shape.input,
                 self.workspace.borrow().len(),
+                0,
+                (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
+            )?;
+            plan.describe(shape.rows, shape.output, shape.input)?;
+            entry.insert(plan);
+        }
+        if mode == super::linear::LinearBiasMode::AfterOutputRound && self.bias_add.is_none() {
+            self.bias_add = Some(
+                cubin::module(self.stream.context(), "q38_common")?
+                    .load_function("q38_bias_add")?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Biased Lt plan bound at heuristic rank 0 under a 1 MiB workspace
+    /// preference.
+    pub(crate) fn prepare_biased_reference(
+        &mut self,
+        rows: u32,
+        output: u32,
+        input: u32,
+        bias: super::contracts::Tensor<bf16, 1>,
+        mode: super::linear::LinearBiasMode,
+    ) -> Result<()> {
+        ensure!(
+            [rows, output, input]
+                .iter()
+                .all(|&n| n > 0 && n <= i32::MAX as u32),
+            "invalid biased linear dimensions"
+        );
+        bias.validate()?;
+        ensure!(
+            bias.shape == [output] && bias.stride == [1],
+            "linear bias shape mismatch"
+        );
+        let shape = LinearShape {
+            rows: rows as usize,
+            output: output as usize,
+            input: input as usize,
+        };
+        let key = (shape, bias.ptr, mode);
+        let mut plans = self.biased_plans.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
+            let plan = Plan::new_with_bias(
+                self.handle,
+                shape.rows,
+                shape.output,
+                shape.input,
+                1 << 20,
                 0,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
             )?;

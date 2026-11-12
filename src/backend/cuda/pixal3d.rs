@@ -28,7 +28,7 @@ use half::{bf16, f16};
 use safetensors::Dtype;
 use std::{collections::BTreeMap, mem::size_of, path::Path, rc::Rc};
 
-type FlowWeights<T> = BTreeMap<String, CudaSlice<T>>;
+pub(crate) type FlowWeights<T> = BTreeMap<String, CudaSlice<T>>;
 
 fn wait_input<T>(device: &Device, input: &CudaSlice<T>) -> Result<()> {
     ensure!(
@@ -63,7 +63,7 @@ fn finite_copy(device: &Device, input: &CudaSlice<f32>, output: &CudaSlice<f32>)
     Ok(())
 }
 
-fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
+pub(crate) fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
     x.device_ptr(&d.stream).0
 }
 fn zero_attention_tail(d: &Device, values: [u64; 3], rows: [usize; 3], width: usize) -> Result<()> {
@@ -81,7 +81,7 @@ fn zero_attention_tail(d: &Device, values: [u64; 3], rows: [usize; 3], width: us
     }
     Ok(())
 }
-fn dense<T: DeviceRepr + Copy, const R: usize>(
+pub(crate) fn dense<T: DeviceRepr + Copy, const R: usize>(
     x: &CudaSlice<T>,
     d: &Device,
     shape: [u32; R],
@@ -89,7 +89,7 @@ fn dense<T: DeviceRepr + Copy, const R: usize>(
     let (stride, _) = super::contracts::dense_layout(shape)?;
     view(x, &d.stream, 0, shape, stride)
 }
-fn matrix<T: Copy>(address: u64, rows: usize, width: usize) -> Result<Tensor<T, 2>> {
+pub(crate) fn matrix<T: Copy>(address: u64, rows: usize, width: usize) -> Result<Tensor<T, 2>> {
     let bytes = rows
         .checked_mul(width)
         .and_then(|n| n.checked_mul(size_of::<T>()))
@@ -104,7 +104,7 @@ fn matrix<T: Copy>(address: u64, rows: usize, width: usize) -> Result<Tensor<T, 
     }
 }
 
-fn run_linear_f32(
+pub(crate) fn run_linear_f32(
     d: &Device,
     blas: &Blas,
     kernels: &Kernels,
@@ -140,12 +140,17 @@ fn run_linear_f32(
 }
 
 #[derive(Clone, Copy)]
-struct Linear<T> {
-    weight: Tensor<T, 2>,
-    bias: Tensor<T, 1>,
+pub(crate) struct Linear<T> {
+    pub(crate) weight: Tensor<T, 2>,
+    pub(crate) bias: Tensor<T, 1>,
 }
 impl<T: DeviceRepr + Copy> Linear<T> {
-    fn bind(weights: &FlowWeights<T>, d: &Device, name: &str, shape: [usize; 2]) -> Result<Self> {
+    pub(crate) fn bind(
+        weights: &FlowWeights<T>,
+        d: &Device,
+        name: &str,
+        shape: [usize; 2],
+    ) -> Result<Self> {
         let weight = weights
             .get(&format!("{name}.weight"))
             .with_context(|| format!("linear weight missing: {name}"))?;
@@ -289,10 +294,10 @@ impl FlowElement for f16 {
     }
 }
 impl<T: FlowElement> Linear<T> {
-    fn prepare(self, blas: &mut Blas, rows: usize) -> Result<()> {
+    pub(crate) fn prepare(self, blas: &mut Blas, rows: usize) -> Result<()> {
         T::prepare(blas, rows, (self.weight, self.bias))
     }
-    fn run(self, blas: &Blas, rows: usize, input: u64, output: u64) -> Result<()> {
+    pub(crate) fn run(self, blas: &Blas, rows: usize, input: u64, output: u64) -> Result<()> {
         T::linear(
             blas,
             (self.weight, self.bias),
@@ -312,19 +317,19 @@ impl<T: FlowElement> Linear<T> {
     }
 }
 
-struct Block<T: FlowElement> {
-    qkv: Linear<T>,
-    self_out: Linear<T>,
-    cross_q: Linear<T>,
-    cross_kv: Linear<T>,
-    cross_out: Linear<T>,
-    projection: Option<Linear<T>>,
-    fc1: Linear<T>,
-    fc2: Linear<T>,
-    norm_weight: u64,
-    norm_bias: u64,
-    modulation: u64,
-    gamma: [u64; 4],
+pub(crate) struct Block<T: FlowElement> {
+    pub(crate) qkv: Linear<T>,
+    pub(crate) self_out: Linear<T>,
+    pub(crate) cross_q: Linear<T>,
+    pub(crate) cross_kv: Linear<T>,
+    pub(crate) cross_out: Linear<T>,
+    pub(crate) projection: Option<Linear<T>>,
+    pub(crate) fc1: Linear<T>,
+    pub(crate) fc2: Linear<T>,
+    pub(crate) norm_weight: u64,
+    pub(crate) norm_bias: u64,
+    pub(crate) modulation: u64,
+    pub(crate) gamma: [u64; 4],
 }
 
 struct ProducerBias {
@@ -416,14 +421,14 @@ impl ProducerBias {
     }
 }
 
-struct Kernels {
-    half: bool,
-    heads: usize,
-    head_dim: usize,
-    norm: CudaFunction,
-    norm_f32: CudaFunction,
-    l2: CudaFunction,
-    unpack: CudaFunction,
+pub(crate) struct Kernels {
+    pub(crate) half: bool,
+    pub(crate) heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) norm: CudaFunction,
+    pub(crate) norm_f32: CudaFunction,
+    pub(crate) l2: CudaFunction,
+    pub(crate) unpack: CudaFunction,
     qkv_prepare: Option<CudaFunction>,
     #[cfg(test)]
     qkv_reference: bool,
@@ -433,24 +438,24 @@ struct Kernels {
     producer_bias: Option<ProducerBias>,
     #[cfg(test)]
     bias_reference: bool,
-    unpack_cross: CudaFunction,
+    pub(crate) unpack_cross: CudaFunction,
     #[cfg(test)]
     context_chains: std::cell::Cell<usize>,
-    rope: CudaFunction,
-    rope_hm: CudaFunction,
-    phases: CudaFunction,
-    modulate: CudaFunction,
-    gated: CudaFunction,
-    add_mod: CudaFunction,
-    residual: CudaFunction,
-    cast: CudaFunction,
-    upcast: CudaFunction,
-    bias: CudaFunction,
-    silu: CudaFunction,
-    sinusoid: CudaFunction,
-    gelu: CudaFunction,
-    transpose: CudaFunction,
-    concat: CudaFunction,
+    pub(crate) rope: CudaFunction,
+    pub(crate) rope_hm: CudaFunction,
+    pub(crate) phases: CudaFunction,
+    pub(crate) modulate: CudaFunction,
+    pub(crate) gated: CudaFunction,
+    pub(crate) add_mod: CudaFunction,
+    pub(crate) residual: CudaFunction,
+    pub(crate) cast: CudaFunction,
+    pub(crate) upcast: CudaFunction,
+    pub(crate) bias: CudaFunction,
+    pub(crate) silu: CudaFunction,
+    pub(crate) sinusoid: CudaFunction,
+    pub(crate) gelu: CudaFunction,
+    pub(crate) transpose: CudaFunction,
+    pub(crate) concat: CudaFunction,
 }
 enum CrossAttention {
     F32(F32Attention),
@@ -946,7 +951,7 @@ impl SparseFlowIo {
     }
 }
 impl Kernels {
-    fn load<T: FlowElement>(d: &Device, spec: &FlowSpec) -> Result<Self> {
+    pub(crate) fn load<T: FlowElement>(d: &Device, spec: &FlowSpec) -> Result<Self> {
         let q = cubin::module(&d.ctx, "q38_common")?;
         let n = cubin::module(&d.ctx, "norm")?;
         let r = cubin::module(&d.ctx, "rope")?;
@@ -1162,7 +1167,7 @@ impl Kernels {
         self.context_chains.set(self.context_chains.get() + 1);
         Ok(())
     }
-    fn norm(
+    pub(crate) fn norm(
         &self,
         d: &Device,
         input: u64,
@@ -1194,7 +1199,7 @@ impl Kernels {
         }
         Ok(())
     }
-    fn cast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
+    pub(crate) fn cast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
         let count32 = u32::try_from(count)?;
         let count64 = count as u64;
         unsafe {
@@ -1209,7 +1214,7 @@ impl Kernels {
         }
         Ok(())
     }
-    fn upcast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
+    pub(crate) fn upcast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
         unsafe {
             d.stream
                 .launch_builder(&self.upcast)
@@ -1220,7 +1225,7 @@ impl Kernels {
         }
         Ok(())
     }
-    fn l2(
+    pub(crate) fn l2(
         &self,
         d: &Device,
         input: u64,
@@ -1245,7 +1250,7 @@ impl Kernels {
         }
         Ok(())
     }
-    fn unpack(
+    pub(crate) fn unpack(
         &self,
         d: &Device,
         input: u64,
@@ -1273,7 +1278,7 @@ impl Kernels {
         }
         Ok(())
     }
-    fn residual(&self, d: &Device, x: u64, y: u64, count: usize) -> Result<()> {
+    pub(crate) fn residual(&self, d: &Device, x: u64, y: u64, count: usize) -> Result<()> {
         unsafe {
             d.stream
                 .launch_builder(&self.residual)
@@ -3830,7 +3835,7 @@ impl DecoderKernels {
             },
         })
     }
-    fn norm(
+    pub(crate) fn norm(
         &self,
         d: &Device,
         io: [u64; 2],
@@ -3880,7 +3885,7 @@ impl DecoderKernels {
         }
         Ok(())
     }
-    fn cast(&self, d: &Device, io: [u64; 2], count: usize, up: bool) -> Result<()> {
+    pub(crate) fn cast(&self, d: &Device, io: [u64; 2], count: usize, up: bool) -> Result<()> {
         unsafe {
             d.stream
                 .launch_builder(if up { &self.upcast } else { &self.cast })
