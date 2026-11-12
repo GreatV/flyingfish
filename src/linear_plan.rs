@@ -7,6 +7,83 @@ use std::collections::BTreeMap;
 /// Activation tile width of gemm_skinny_bf16.
 pub const MAX_SKINNY_ROWS: usize = 16;
 
+/// Dense BF16-input FP32-accumulate m16n8k16 Tensor Core FLOPs per SM clock.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn tc_flops_per_sm_clock(sm: u32) -> Result<u32> {
+    match sm {
+        80 => Ok(2048),
+        86 | 87 | 89 => Ok(512),
+        90 => Ok(2048),
+        100 => Ok(4096),
+        120 => Ok(512),
+        other => anyhow::bail!(
+            "NVFP4 fused prefill unsupported compute capability sm_{other}: no BF16 Tensor Core rate defined"
+        ),
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct NvFp4MMaxPlan {
+    pub sm: u32,
+    pub sms: usize,
+    pub clock_khz: i32,
+    pub memory_bytes_per_second: f64,
+    pub tc_flops_per_sm_clock: u32,
+    pub peak_tc_flops_per_second: f64,
+    pub ridge_flops_per_byte: f64,
+    pub m_max: usize,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl NvFp4MMaxPlan {
+    pub(crate) fn derive(
+        sm: u32,
+        sms: usize,
+        clock_khz: i32,
+        memory_bytes_per_second: f64,
+    ) -> Result<Self> {
+        let rate = tc_flops_per_sm_clock(sm)?;
+        ensure!(
+            sms > 0
+                && clock_khz > 0
+                && memory_bytes_per_second.is_finite()
+                && memory_bytes_per_second > 0.0,
+            "invalid device topology for NVFP4 m_max: sms={sms} clock_khz={clock_khz} bw={memory_bytes_per_second}"
+        );
+        let peak_tc_flops_per_second =
+            (sms as f64) * f64::from(rate) * (f64::from(clock_khz) * 1000.0);
+        let ridge_flops_per_byte = peak_tc_flops_per_second / memory_bytes_per_second;
+        ensure!(
+            ridge_flops_per_byte.is_finite() && ridge_flops_per_byte < 4096.0 / 7.0,
+            "NVFP4 ridge_flops_per_byte={ridge_flops_per_byte} exceeds asymptotic byte-savings bound"
+        );
+        let mut m = MAX_SKINNY_ROWS + 1;
+        loop {
+            let bm_fused = if m <= 64 { 64usize } else { 128usize };
+            let lt_passes = m.div_ceil(256) as f64;
+            let fused_passes = m.div_ceil(bm_fused) as f64;
+            let delta_bytes_per_weight = 2.5625 + 2.0 * lt_passes - 0.5625 * fused_passes;
+            if delta_bytes_per_weight <= 0.0
+                || (2.0 * m as f64) / delta_bytes_per_weight > ridge_flops_per_byte
+            {
+                break;
+            }
+            m = m.checked_add(1).context("NVFP4 m_max overflow")?;
+        }
+        Ok(Self {
+            sm,
+            sms,
+            clock_khz,
+            memory_bytes_per_second,
+            tc_flops_per_sm_clock: rate,
+            peak_tc_flops_per_second,
+            ridge_flops_per_byte,
+            m_max: m,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct DequantSlot {
     pub offset_bytes: u64,
@@ -524,6 +601,37 @@ mod tests {
                 && gap_err.contains("model.language_model.layers.3.mlp.up_proj.weight"),
             "{gap_err}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nvfp4_m_max_derivation_and_closed_capability_table() -> Result<()> {
+        for (sm, want) in [
+            (80, 2048),
+            (86, 512),
+            (87, 512),
+            (89, 512),
+            (90, 2048),
+            (100, 4096),
+            (120, 512),
+        ] {
+            assert_eq!(tc_flops_per_sm_clock(sm)?, want);
+        }
+        for unknown in [0, 70, 75, 88, 91, 101, 121] {
+            let err = tc_flops_per_sm_clock(unknown).unwrap_err().to_string();
+            assert!(err.contains(&format!("sm_{unknown}")), "{err}");
+        }
+        let rtx4090 = NvFp4MMaxPlan::derive(89, 128, 2_520_000, 1_008_096_000_000.0)?;
+        assert_eq!(rtx4090.m_max, 385);
+        let rtx4090_oc = NvFp4MMaxPlan::derive(89, 128, 2_640_000, 1_008_096_000_000.0)?;
+        assert_eq!(rtx4090_oc.m_max, 385);
+        let a4000 = NvFp4MMaxPlan::derive(86, 48, 1_560_000, 448_064_000_000.0)?;
+        assert_eq!(a4000.m_max, 148);
+        assert!(NvFp4MMaxPlan::derive(88, 128, 2_520_000, 1.0e12).is_err());
+        assert!(NvFp4MMaxPlan::derive(89, 0, 2_520_000, 1.0e12).is_err());
+        assert!(NvFp4MMaxPlan::derive(89, 128, 0, 1.0e12).is_err());
+        assert!(NvFp4MMaxPlan::derive(89, 128, 2_520_000, 0.0).is_err());
+        assert!(NvFp4MMaxPlan::derive(100, 256, 3_000_000, 1.0e12).is_err());
         Ok(())
     }
 }

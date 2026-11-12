@@ -357,6 +357,9 @@ pub(crate) fn validate_nvfp4(
 pub(crate) struct NvFp4Ops {
     dequant: CudaFunction,
     small: Vec<CudaFunction>,
+    mma_m64: CudaFunction,
+    mma_m128: CudaFunction,
+    plan: crate::linear_plan::NvFp4MMaxPlan,
 }
 
 #[cfg(feature = "cuda")]
@@ -366,11 +369,27 @@ impl NvFp4Ops {
     }
 
     pub(super) fn for_rows(ctx: &Arc<CudaContext>, rows: usize) -> Result<Self> {
+        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
         ensure!(
             (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
             "NVFP4 skinny row bound={rows} exceeds {}",
             crate::linear_plan::MAX_SKINNY_ROWS
         );
+        let sm = super::cubin::capability(ctx)?;
+        let sms = usize::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)
+            .context("invalid CUDA SM count")?;
+        let clock_khz = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE)?;
+        let memory_clock_khz = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?;
+        let memory_bus_bits = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
+        ensure!(
+            memory_clock_khz > 0 && memory_bus_bits > 0,
+            "invalid CUDA memory clock={memory_clock_khz} kHz bus={memory_bus_bits} bits"
+        );
+        let memory_bytes_per_second =
+            2.0 * (f64::from(memory_clock_khz) * 1000.0) * (f64::from(memory_bus_bits) / 8.0);
+        let plan =
+            crate::linear_plan::NvFp4MMaxPlan::derive(sm, sms, clock_khz, memory_bytes_per_second)?;
+        eprintln!("{}", serde_json::json!({"nvfp4_prefill_plan": &plan}));
         let module = super::cubin::module(ctx, "nvfp4_linear")?;
         let small = (1..=rows)
             .map(|row| {
@@ -381,10 +400,30 @@ impl NvFp4Ops {
                 })
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mma_m64 = module.load_function("nvfp4_mma_bf16_m64")?;
+        let mma_m128 = module.load_function("nvfp4_mma_bf16_m128")?;
+        for (label, function) in [
+            ("nvfp4_mma_bf16_m64", &mma_m64),
+            ("nvfp4_mma_bf16_m128", &mma_m128),
+        ] {
+            ensure!(
+                function.max_threads_per_block()? >= 256
+                    && function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? == 0
+                    && function.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)? > 0,
+                "{label} failed 256-thread zero-spill residency check"
+            );
+        }
         Ok(Self {
             dequant: module.load_function("nvfp4_dequant_bf16")?,
             small,
+            mma_m64,
+            mma_m128,
+            plan,
         })
+    }
+
+    pub(crate) fn direct_max_rows(&self) -> usize {
+        self.plan.m_max - 1
     }
 
     pub(super) fn require_rows(&self, rows: usize) -> Result<()> {
@@ -431,7 +470,7 @@ impl NvFp4Ops {
         Ok(())
     }
 
-    pub fn small_gemm(
+    pub fn gemm(
         &self,
         stream: &Arc<CudaStream>,
         codes: Tensor<u8, 2>,
@@ -442,21 +481,56 @@ impl NvFp4Ops {
     ) -> Result<()> {
         let [n, k] = validate_nvfp4(&codes, &scale, &global_scale)?;
         validate_call([n, k], x, &y.0)?;
-        self.require_rows(x.shape[0] as usize)?;
         disjoint(&codes, &y.0)?;
         disjoint(&scale, &y.0)?;
         super::contracts::no_overlap(&global_scale, &y.0, "NVFP4 global scale", "output")?;
+        let m = x.shape[0] as usize;
+        if m <= crate::linear_plan::MAX_SKINNY_ROWS {
+            self.require_rows(m)?;
+            unsafe {
+                stream
+                    .launch_builder(&self.small[m - 1])
+                    .arg(&codes.ptr)
+                    .arg(&scale.ptr)
+                    .arg(&global_scale.ptr)
+                    .arg(&x.ptr)
+                    .arg(&y.0.ptr)
+                    .arg(&(n as i32))
+                    .arg(&(k as i32))
+                    .launch(super::ops::grid(n.div_ceil(4) as usize, 128))?;
+            }
+            return Ok(());
+        }
+        ensure!(m <= i32::MAX as usize, "NVFP4 MMA M={m} exceeds i32::MAX");
+        let (kernel, bm) = if m <= 64 {
+            (&self.mma_m64, 64u32)
+        } else {
+            (&self.mma_m128, 128u32)
+        };
+        let blocks = x.shape[0]
+            .div_ceil(bm)
+            .checked_mul(n.div_ceil(128))
+            .context("NVFP4 MMA grid overflow")?;
+        ensure!(
+            blocks <= i32::MAX as u32,
+            "NVFP4 MMA grid={blocks} exceeds i32::MAX"
+        );
         unsafe {
             stream
-                .launch_builder(&self.small[x.shape[0] as usize - 1])
+                .launch_builder(kernel)
                 .arg(&codes.ptr)
                 .arg(&scale.ptr)
                 .arg(&global_scale.ptr)
                 .arg(&x.ptr)
                 .arg(&y.0.ptr)
+                .arg(&(m as i32))
                 .arg(&(n as i32))
                 .arg(&(k as i32))
-                .launch(super::ops::grid(n.div_ceil(4) as usize, 128))?;
+                .launch(crate::backend::gpu::LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
         Ok(())
     }
@@ -1428,7 +1502,10 @@ impl LayerLinearPlan {
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
         #[cfg(feature = "cuda")]
-        if plan.bytes > 0 {
+        let needs_arena = plan.bytes > 0
+            && (catalog.linear_format != crate::model_spec::LinearFormat::NvFp4 || arena.is_some());
+        #[cfg(feature = "cuda")]
+        if needs_arena {
             arena
                 .context("FP8 layer has no materialization arena")?
                 .validate(plan.bytes)?;
@@ -1454,6 +1531,7 @@ impl LayerLinearPlan {
                     scale: Fp8ScaleRef::F32(_),
                     ..
                 } => None,
+                LinearWeightRef::NvFp4 { .. } if arena.is_none() => None,
                 LinearWeightRef::Fp8 { .. } | LinearWeightRef::NvFp4 { .. } => {
                     let LinearWeightRef::Bf16(w) = plan.weight(
                         name,
@@ -1494,7 +1572,11 @@ impl LayerLinearPlan {
         }
         #[cfg(feature = "cuda")]
         ensure!(
-            materialize.len() == plan.slots.len(),
+            if needs_arena {
+                materialize.len() == plan.slots.len()
+            } else {
+                materialize.is_empty()
+            },
             "layer linear plan does not cover materialization slots"
         );
         Ok(Self {
@@ -1564,7 +1646,8 @@ impl LayerLinearPlan {
     pub fn prepare_native(&self, ops: &Fp8Ops, stream: &Arc<CudaStream>, rows: u32) -> Result<()> {
         for projection in self.projections.values() {
             #[cfg(feature = "cuda")]
-            let native = projection.prefill.is_none();
+            let native = projection.prefill.is_none()
+                && matches!(projection.resident, LinearWeightRef::Fp8 { .. });
             #[cfg(feature = "rocm")]
             let native = matches!(
                 projection.resident,
@@ -1604,7 +1687,14 @@ impl LayerLinearPlan {
                 })?;
             }
             let direct_bound = if matches!(p.resident, LinearWeightRef::NvFp4 { .. }) {
-                crate::linear_plan::MAX_SKINNY_ROWS
+                #[cfg(feature = "cuda")]
+                {
+                    *blas.direct_quant_rows().end()
+                }
+                #[cfg(feature = "rocm")]
+                {
+                    crate::linear_plan::MAX_SKINNY_ROWS
+                }
             } else {
                 p.invariant_rows
             };
@@ -1684,13 +1774,20 @@ impl LayerLinearPlan {
             .get(role)
             .with_context(|| format!("layer projection not bound: {role}"))?;
         #[cfg(feature = "cuda")]
-        if p.prefill.is_none() {
-            let native = p.native.borrow();
-            return native
-                .as_ref()
-                .context("native projection setup missing")?
-                .run(blas.fp8_ops()?, blas.stream(), x, y);
+        if let Some(native) = p.native.borrow().as_ref() {
+            return native.run(blas.fp8_ops()?, blas.stream(), x, y);
         }
+        #[cfg(feature = "cuda")]
+        ensure!(
+            !matches!(
+                p.resident,
+                LinearWeightRef::Fp8 {
+                    scale: Fp8ScaleRef::F32(_),
+                    ..
+                }
+            ),
+            "native projection setup missing"
+        );
         #[cfg(feature = "rocm")]
         if let Some(native) = p.native.borrow().as_ref() {
             return native.run(blas.fp8_ops()?, blas.stream(), x, y);
@@ -1712,7 +1809,7 @@ impl LayerLinearPlan {
         let weight = p.resident;
         #[cfg(feature = "cuda")]
         let direct_rows = if matches!(p.resident, LinearWeightRef::NvFp4 { .. }) {
-            1..=crate::linear_plan::MAX_SKINNY_ROWS
+            blas.direct_quant_rows()
         } else {
             blas.direct_fp8_rows()
         };
@@ -1720,7 +1817,9 @@ impl LayerLinearPlan {
         let weight = if phase == crate::op_contract::ExecutionPhase::Prefill
             && !direct_rows.contains(&(x.shape[0] as usize))
         {
-            LinearWeightRef::Bf16(p.prefill.context("native projection was not bound")?)
+            LinearWeightRef::Bf16(p.prefill.context(
+                "quantized projection has no materialization arena for rows >= direct bound",
+            )?)
         } else {
             p.resident
         };
@@ -4054,6 +4153,16 @@ mod tests {
             )?;
             blas.enable_nvfp4(&device.ctx)?;
             blas.bind_invariant(&device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
+            let m_max = blas.nvfp4_ops()?.plan.m_max;
+            ensure!(
+                m_max > crate::linear_plan::MAX_SKINNY_ROWS
+                    && *blas.direct_quant_rows().end() + 1 == m_max,
+                "invalid NVFP4 m_max={m_max}"
+            );
+            println!(
+                "PASS NVFP4_GATE_A_PLAN m_max={m_max} direct_max_rows={}",
+                m_max - 1
+            );
 
             let finite_scales: Vec<u8> = (0u16..=255)
                 .map(|v| v as u8)
@@ -4278,7 +4387,7 @@ mod tests {
             let x_dev = stream.clone_htod(&x_host)?;
             let y_dev = stream.alloc_zeros::<bf16>(rows * n)?;
             for &m in &[1usize, 8, 12, 32] {
-                if m > crate::linear_plan::MAX_SKINNY_ROWS {
+                if m >= m_max {
                     layer.materialize(&blas, stream)?;
                 }
                 let mut y_view = TensorMut(view(
@@ -4403,6 +4512,779 @@ mod tests {
             println!(
                 "PASS NVFP4_GATE_A_CONTROLS swap_bit_mismatches={swap_bit_mismatches}/{n} ws2_bit_mismatches={ws2_bit_mismatches}/{n}"
             );
+
+            let parallel_ref = |w_host: &[bf16],
+                                x_all: &[bf16],
+                                rows_total: usize,
+                                width: usize|
+             -> Result<Vec<bf16>> {
+                let out_cols = w_host.len() / width;
+                let workers = std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(4)
+                    .min(16)
+                    .min(rows_total.max(1));
+                let chunk_rows = rows_total.div_ceil(workers);
+                let mut out = vec![bf16::ZERO; rows_total * out_cols];
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles = Vec::new();
+                    for (x_chunk, out_chunk) in x_all
+                        .chunks(chunk_rows * width)
+                        .zip(out.chunks_mut(chunk_rows * out_cols))
+                    {
+                        handles.push(s.spawn(move || -> Result<()> {
+                            let part = nvfp4_linear_reference(w_host, x_chunk, width)?;
+                            out_chunk.copy_from_slice(&part);
+                            Ok(())
+                        }));
+                    }
+                    for h in handles {
+                        h.join().map_err(|_| {
+                            anyhow::anyhow!("nvfp4_linear_reference thread panicked")
+                        })??;
+                    }
+                    Ok(())
+                })?;
+                Ok(out)
+            };
+
+            let rounding_bf16 = |r: usize, c: usize, phase: usize| -> bf16 {
+                let exp_idx = ((r * 31 + c * 23 + 7 + phase * 5) % 29) % 9;
+                let biased_exp = (121 + exp_idx) as u16;
+                let frac = (((r * 83 + c * 59 + 19 + phase * 13) % 251) & 0x7f) as u16;
+                let sign = if (r * 19 + c * 3 + 5 + phase * 17) % 199 < 99 {
+                    0x8000u16
+                } else {
+                    0u16
+                };
+                bf16::from_bits(sign | (biased_exp << 7) | frac)
+            };
+            let score_and_bits = |cand: &[bf16], want: &[bf16]| -> (usize, f32, f32) {
+                let mut bits = 0usize;
+                let mut max_abs = 0.0f32;
+                let mut sum_sq = 0.0f64;
+                for (&a, &b) in cand.iter().zip(want) {
+                    bits += usize::from(a.to_bits() != b.to_bits());
+                    let d = (a.to_f32() - b.to_f32()).abs();
+                    max_abs = max_abs.max(d);
+                    sum_sq += f64::from(d) * f64::from(d);
+                }
+                (bits, max_abs, (sum_sq / cand.len() as f64).sqrt() as f32)
+            };
+
+            let canary = bf16::from_bits(0x7fc1);
+            let mut mma_defects = 0usize;
+            for (set_name, is_rounding) in [("exact", false), ("rounding", true)] {
+                let mut set_lt_bits = 0usize;
+                let mut set_fp64_bits = 0usize;
+                for (n_s, k_s) in [
+                    (67usize, 48usize),
+                    (1024, 5120),
+                    (256, 6144),
+                    (512, 17408),
+                    (256, 5120),
+                ] {
+                    let s_codes: Vec<u8> = (0..n_s * (k_s / 2))
+                        .map(|i| {
+                            let r = i / (k_s / 2);
+                            let lo = ((i * 37 + r * 71 + 3) % 16) as u8;
+                            let hi = ((i * 97 + r * 131 + 11) % 16) as u8;
+                            lo | (hi << 4)
+                        })
+                        .collect();
+                    let s_scales: Vec<u8> = (0..n_s * (k_s / 16))
+                        .map(|i| {
+                            let r = i / (k_s / 16);
+                            let g = i % (k_s / 16);
+                            let (exp, sign) = if is_rounding {
+                                (
+                                    2u8 + (((r * 13 + g * 7 + 1) % 19) % 9) as u8,
+                                    if (i * 17 + g) % 103 < 51 { 0x80u8 } else { 0u8 },
+                                )
+                            } else {
+                                (
+                                    5u8 + ((r * 13 + g * 3 + 1) % 4) as u8,
+                                    if (i * 17 + g) % 11 == 0 { 0x80u8 } else { 0u8 },
+                                )
+                            };
+                            let mant = ((r * 29 + g * 5 + 2) % 8) as u8;
+                            sign | (exp << 3) | mant
+                        })
+                        .collect();
+                    let s_ws2 = if is_rounding {
+                        1.0f32 / 2903.0f32
+                    } else {
+                        0.003_906_25f32
+                    };
+                    let s_weight_host: Vec<bf16> = (0..n_s)
+                        .flat_map(|r| {
+                            let rc = &s_codes[r * (k_s / 2)..(r + 1) * (k_s / 2)];
+                            let rs = &s_scales[r * (k_s / 16)..(r + 1) * (k_s / 16)];
+                            (0..k_s).map(move |c| {
+                                let byte = rc[c / 2];
+                                let nib = if c % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                                nvfp4_effective_weight(nib, rs[c / 16], s_ws2)
+                            })
+                        })
+                        .collect();
+                    let max_m = 3543usize;
+                    let s_x_host: Vec<bf16> = (0..max_m * k_s)
+                        .map(|i| {
+                            let r = i / k_s;
+                            let c = i % k_s;
+                            if is_rounding {
+                                rounding_bf16(r, c, 0)
+                            } else {
+                                bf16::from_f32(
+                                    (((r * 67 + c * 43 + 19) % 251) as f32 - 125.0) / 128.0,
+                                )
+                            }
+                        })
+                        .collect();
+                    if is_rounding {
+                        let mut exp_mask = 0u16;
+                        let mut frac_seen = [0u64; 2];
+                        for &v in &s_x_host {
+                            let b = v.to_bits();
+                            let e = (b >> 7) & 0xff;
+                            ensure!(
+                                (121..=129).contains(&e),
+                                "rounding set exponent {e} outside 2^-6..2^2"
+                            );
+                            exp_mask |= 1u16 << (e - 121);
+                            let f = (b & 0x7f) as usize;
+                            frac_seen[f >> 6] |= 1u64 << (f & 63);
+                        }
+                        ensure!(
+                            exp_mask == 0x1ff && frac_seen == [u64::MAX, u64::MAX],
+                            "rounding set incomplete BF16 coverage [{n_s},{k_s}]: exp_mask={exp_mask:#x}"
+                        );
+                    }
+                    let s_ref_fp64 = parallel_ref(&s_weight_host, &s_x_host, max_m, k_s)?;
+                    let s_codes_dev = stream.clone_htod(&s_codes)?;
+                    let s_scales_dev = stream.clone_htod(&s_scales)?;
+                    let s_ws2_dev = stream.clone_htod(&[s_ws2])?;
+                    let s_x_dev = stream.clone_htod(&s_x_host)?;
+                    let s_mat_dev = stream.alloc_zeros::<bf16>(n_s * k_s)?;
+                    let codes_v = view(
+                        &s_codes_dev,
+                        stream,
+                        0,
+                        [n_s as u32, (k_s / 2) as u32],
+                        [(k_s / 2) as u64, 1],
+                    )?;
+                    let scales_v = view(
+                        &s_scales_dev,
+                        stream,
+                        0,
+                        [n_s as u32, (k_s / 16) as u32],
+                        [(k_s / 16) as u64, 1],
+                    )?;
+                    let ws2_v = view(&s_ws2_dev, stream, 0, [1], [1])?;
+                    let mat_v = view(
+                        &s_mat_dev,
+                        stream,
+                        0,
+                        [n_s as u32, k_s as u32],
+                        [k_s as u64, 1],
+                    )?;
+                    blas.nvfp4_ops()?.materialize(
+                        stream,
+                        codes_v,
+                        scales_v,
+                        ws2_v,
+                        &mut TensorMut(mat_v),
+                    )?;
+
+                    for m_s in [17usize, 32, 64, 256, 3543] {
+                        blas.prepare_fixed(m_s as u32, n_s as u32, k_s as u32)?;
+                        let x_v = view(
+                            &s_x_dev,
+                            stream,
+                            0,
+                            [m_s as u32, k_s as u32],
+                            [k_s as u64, 1],
+                        )?;
+                        let lt_dev = stream.alloc_zeros::<bf16>(m_s * n_s)?;
+                        blas.linear_typed(
+                            ExecutionPhase::Prefill,
+                            LinearWeightRef::Bf16(mat_v),
+                            x_v,
+                            &mut TensorMut(view(
+                                &lt_dev,
+                                stream,
+                                0,
+                                [m_s as u32, n_s as u32],
+                                [n_s as u64, 1],
+                            )?),
+                        )?;
+                        let got_lt = stream.clone_dtoh(&lt_dev)?;
+
+                        let eager_dev = stream.clone_htod(&vec![canary; (m_s + 1) * n_s])?;
+                        let graph_dev = stream.clone_htod(&vec![canary; (m_s + 1) * n_s])?;
+                        let eager_v = view(
+                            &eager_dev,
+                            stream,
+                            0,
+                            [m_s as u32, n_s as u32],
+                            [n_s as u64, 1],
+                        )?;
+                        let graph_v = view(
+                            &graph_dev,
+                            stream,
+                            0,
+                            [m_s as u32, n_s as u32],
+                            [n_s as u64, 1],
+                        )?;
+                        device.finish_upload()?;
+                        blas.nvfp4_ops()?.gemm(
+                            stream,
+                            codes_v,
+                            scales_v,
+                            ws2_v,
+                            x_v,
+                            &mut TensorMut(eager_v),
+                        )?;
+                        {
+                            use cudarc::driver::sys;
+                            stream.synchronize()?;
+                            stream.begin_capture(
+                                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                            )?;
+                            let launched = blas.nvfp4_ops()?.gemm(
+                                stream,
+                                codes_v,
+                                scales_v,
+                                ws2_v,
+                                x_v,
+                                &mut TensorMut(graph_v),
+                            );
+                            let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                            launched?;
+                            captured?.context("empty NVFP4 MMA graph")?.launch()?;
+                        }
+                        stream.synchronize()?;
+                        let got_eager = stream.clone_dtoh(&eager_dev)?;
+                        let got_graph = stream.clone_dtoh(&graph_dev)?;
+                        let count = m_s * n_s;
+                        ensure!(
+                            got_eager[..count].iter().all(|v| v.is_finite())
+                                && got_graph[..count].iter().all(|v| v.is_finite()),
+                            "nonfinite NVFP4 MMA output set={set_name} [{n_s},{k_s}] m={m_s}"
+                        );
+                        ensure!(
+                            got_eager[count..]
+                                .iter()
+                                .all(|v| v.to_bits() == canary.to_bits())
+                                && got_graph[count..]
+                                    .iter()
+                                    .all(|v| v.to_bits() == canary.to_bits()),
+                            "NVFP4 MMA overwrote tail canary set={set_name} [{n_s},{k_s}] m={m_s}"
+                        );
+                        let graph_bits = got_eager[..count]
+                            .iter()
+                            .zip(&got_graph[..count])
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        let (lt_bits, max_lt, rmse_lt) =
+                            score_and_bits(&got_eager[..count], &got_lt);
+                        let (fp64_bits, max_fp64, rmse_fp64) =
+                            score_and_bits(&got_eager[..count], &s_ref_fp64[..count]);
+                        set_lt_bits += lt_bits;
+                        set_fp64_bits += fp64_bits;
+                        let bad = graph_bits != 0
+                            || max_lt > 0.03125
+                            || rmse_lt > 0.004
+                            || max_fp64 > 0.03125
+                            || rmse_fp64 > 0.004;
+                        mma_defects += usize::from(bad);
+                        println!(
+                            "{} NVFP4_MMA set={set_name} shape=[{n_s},{k_s}] m={m_s} graph_bits={graph_bits} lt_bits={lt_bits}/{count} lt_max_abs={max_lt:.6} lt_rmse={rmse_lt:.6} fp64_bits={fp64_bits}/{count} fp64_max_abs={max_fp64:.6} fp64_rmse={rmse_fp64:.6}",
+                            if bad { "DEFECT" } else { "PASS" }
+                        );
+                    }
+
+                    if (n_s, k_s) == (512, 17408) {
+                        let groups = k_s / 16;
+                        let mut rot_scales = s_scales.clone();
+                        for r in 0..n_s {
+                            let row = &mut rot_scales[r * groups..(r + 1) * groups];
+                            for q in row.as_chunks_mut::<4>().0 {
+                                q.rotate_left(1);
+                            }
+                        }
+                        let rot_dev = stream.clone_htod(&rot_scales)?;
+                        let rot_v = view(
+                            &rot_dev,
+                            stream,
+                            0,
+                            [n_s as u32, groups as u32],
+                            [groups as u64, 1],
+                        )?;
+                        for m_ctrl in [64usize, 256] {
+                            let ctrl_out = stream.alloc_zeros::<bf16>(m_ctrl * n_s)?;
+                            blas.nvfp4_ops()?.gemm(
+                                stream,
+                                codes_v,
+                                rot_v,
+                                ws2_v,
+                                view(
+                                    &s_x_dev,
+                                    stream,
+                                    0,
+                                    [m_ctrl as u32, k_s as u32],
+                                    [k_s as u64, 1],
+                                )?,
+                                &mut TensorMut(view(
+                                    &ctrl_out,
+                                    stream,
+                                    0,
+                                    [m_ctrl as u32, n_s as u32],
+                                    [n_s as u64, 1],
+                                )?),
+                            )?;
+                            let got_ctrl = stream.clone_dtoh(&ctrl_out)?;
+                            let (_, max_abs, rmse) =
+                                score_and_bits(&got_ctrl, &s_ref_fp64[..m_ctrl * n_s]);
+                            ensure!(
+                                max_abs >= 0.3125 && rmse >= 0.040,
+                                "NVFP4 MMA scale-quartet control escaped set={set_name} m={m_ctrl}: max_abs={max_abs} rmse={rmse}"
+                            );
+                            println!(
+                                "PASS NVFP4_MMA_SCALE_QUARTET_CONTROL set={set_name} m={m_ctrl} max_abs={max_abs:.6} rmse={rmse:.6}"
+                            );
+                        }
+                    }
+                }
+                if is_rounding {
+                    ensure!(
+                        set_lt_bits > 0 && set_fp64_bits > 0,
+                        "rounding set failed to exercise accumulation order: lt_bits={set_lt_bits} fp64_bits={set_fp64_bits}"
+                    );
+                }
+
+                for (n_inv, k_inv) in [(67usize, 48usize), (256, 5120)] {
+                    let b_codes: Vec<u8> = (0..n_inv * (k_inv / 2))
+                        .map(|i| {
+                            let lo = ((i * 53 + 7) % 16) as u8;
+                            let hi = ((i * 89 + 13) % 16) as u8;
+                            lo | (hi << 4)
+                        })
+                        .collect();
+                    let b_scales: Vec<u8> = (0..n_inv * (k_inv / 16))
+                        .map(|i| {
+                            let (exp, sign) = if is_rounding {
+                                (
+                                    2u8 + (((i * 23 + 2) % 19) % 9) as u8,
+                                    if (i * 19) % 103 < 51 { 0x80u8 } else { 0u8 },
+                                )
+                            } else {
+                                (
+                                    5u8 + ((i * 23 + 2) % 4) as u8,
+                                    if (i * 19) % 9 == 0 { 0x80u8 } else { 0u8 },
+                                )
+                            };
+                            let mant = ((i * 41 + 3) % 8) as u8;
+                            sign | (exp << 3) | mant
+                        })
+                        .collect();
+                    let b_ws2 = if is_rounding {
+                        1.0f32 / 2903.0f32
+                    } else {
+                        0.003_906_25f32
+                    };
+                    let b_weight_host: Vec<bf16> = (0..n_inv)
+                        .flat_map(|r| {
+                            let rc = &b_codes[r * (k_inv / 2)..(r + 1) * (k_inv / 2)];
+                            let rs = &b_scales[r * (k_inv / 16)..(r + 1) * (k_inv / 16)];
+                            (0..k_inv).map(move |c| {
+                                let byte = rc[c / 2];
+                                let nib = if c % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                                nvfp4_effective_weight(nib, rs[c / 16], b_ws2)
+                            })
+                        })
+                        .collect();
+                    let b_codes_dev = stream.clone_htod(&b_codes)?;
+                    let b_scales_dev = stream.clone_htod(&b_scales)?;
+                    let b_ws2_dev = stream.clone_htod(&[b_ws2])?;
+                    let codes_v = view(
+                        &b_codes_dev,
+                        stream,
+                        0,
+                        [n_inv as u32, (k_inv / 2) as u32],
+                        [(k_inv / 2) as u64, 1],
+                    )?;
+                    let scales_v = view(
+                        &b_scales_dev,
+                        stream,
+                        0,
+                        [n_inv as u32, (k_inv / 16) as u32],
+                        [(k_inv / 16) as u64, 1],
+                    )?;
+                    let ws2_v = view(&b_ws2_dev, stream, 0, [1], [1])?;
+                    let x_probe: Vec<bf16> = (0..k_inv)
+                        .map(|c| {
+                            if is_rounding {
+                                rounding_bf16(0, c, 1)
+                            } else {
+                                bf16::from_f32((((c * 73 + 29) % 251) as f32 - 125.0) / 128.0)
+                            }
+                        })
+                        .collect();
+                    let x_bg: Vec<bf16> = (0..256 * k_inv)
+                        .map(|i| {
+                            let q = i / k_inv;
+                            let c = i % k_inv;
+                            if is_rounding {
+                                rounding_bf16(q + 1, c, 2)
+                            } else {
+                                bf16::from_f32(
+                                    (((q * 131 + c * 59 + 11) % 241) as f32 - 120.0) / 128.0,
+                                )
+                            }
+                        })
+                        .collect();
+                    let mut x_batch_dev = stream.alloc_zeros::<bf16>(256 * k_inv)?;
+                    let y_batch_dev = stream.alloc_zeros::<bf16>(256 * n_inv)?;
+                    let mut x_init = x_bg[..17 * k_inv].to_vec();
+                    x_init[..k_inv].copy_from_slice(&x_probe);
+                    stream.memcpy_htod(&x_init, &mut x_batch_dev.slice_mut(..17 * k_inv))?;
+                    blas.nvfp4_ops()?.gemm(
+                        stream,
+                        codes_v,
+                        scales_v,
+                        ws2_v,
+                        view(
+                            &x_batch_dev,
+                            stream,
+                            0,
+                            [17, k_inv as u32],
+                            [k_inv as u64, 1],
+                        )?,
+                        &mut TensorMut(view(
+                            &y_batch_dev,
+                            stream,
+                            0,
+                            [17, n_inv as u32],
+                            [n_inv as u64, 1],
+                        )?),
+                    )?;
+                    let ref_row = stream.clone_dtoh(&y_batch_dev.slice(..n_inv))?;
+                    let b_mat_dev = stream.alloc_zeros::<bf16>(n_inv * k_inv)?;
+                    let b_mat_v = view(
+                        &b_mat_dev,
+                        stream,
+                        0,
+                        [n_inv as u32, k_inv as u32],
+                        [k_inv as u64, 1],
+                    )?;
+                    blas.nvfp4_ops()?.materialize(
+                        stream,
+                        codes_v,
+                        scales_v,
+                        ws2_v,
+                        &mut TensorMut(b_mat_v),
+                    )?;
+                    blas.prepare_fixed(17, n_inv as u32, k_inv as u32)?;
+                    let lt_probe_dev = stream.alloc_zeros::<bf16>(17 * n_inv)?;
+                    blas.linear_typed(
+                        ExecutionPhase::Prefill,
+                        LinearWeightRef::Bf16(b_mat_v),
+                        view(
+                            &x_batch_dev,
+                            stream,
+                            0,
+                            [17, k_inv as u32],
+                            [k_inv as u64, 1],
+                        )?,
+                        &mut TensorMut(view(
+                            &lt_probe_dev,
+                            stream,
+                            0,
+                            [17, n_inv as u32],
+                            [n_inv as u64, 1],
+                        )?),
+                    )?;
+                    let got_lt_probe = stream.clone_dtoh(&lt_probe_dev.slice(..n_inv))?;
+                    let (probe_lt_bits, _, _) = score_and_bits(&ref_row, &got_lt_probe);
+                    let probe_fp64 = nvfp4_linear_reference(&b_weight_host, &x_probe, k_inv)?;
+                    let (probe_fp64_bits, _, _) = score_and_bits(&ref_row, &probe_fp64);
+                    let mut placements = 0usize;
+                    let mut diff_bits = 0usize;
+                    for m_b in [17usize, 63, 64, 65, 127, 128, 129, 256] {
+                        let mut x_buf = x_bg[..m_b * k_inv].to_vec();
+                        for r in 0..m_b {
+                            x_buf[r * k_inv..(r + 1) * k_inv].copy_from_slice(&x_probe);
+                            if r > 0 {
+                                x_buf[(r - 1) * k_inv..r * k_inv]
+                                    .copy_from_slice(&x_bg[(r - 1) * k_inv..r * k_inv]);
+                            }
+                            stream
+                                .memcpy_htod(&x_buf, &mut x_batch_dev.slice_mut(..m_b * k_inv))?;
+                            blas.nvfp4_ops()?.gemm(
+                                stream,
+                                codes_v,
+                                scales_v,
+                                ws2_v,
+                                view(
+                                    &x_batch_dev,
+                                    stream,
+                                    0,
+                                    [m_b as u32, k_inv as u32],
+                                    [k_inv as u64, 1],
+                                )?,
+                                &mut TensorMut(view(
+                                    &y_batch_dev,
+                                    stream,
+                                    0,
+                                    [m_b as u32, n_inv as u32],
+                                    [n_inv as u64, 1],
+                                )?),
+                            )?;
+                            let got = stream.clone_dtoh(&y_batch_dev.slice(..m_b * n_inv))?;
+                            let row_got = &got[r * n_inv..(r + 1) * n_inv];
+                            let other_got =
+                                &got[((r + 1) % m_b) * n_inv..((r + 1) % m_b + 1) * n_inv];
+                            ensure!(
+                                row_got
+                                    .iter()
+                                    .zip(other_got)
+                                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                                "batch-invariance background row aliased probe row set={set_name} [{n_inv},{k_inv}] m={m_b} r={r}"
+                            );
+                            diff_bits += row_got
+                                .iter()
+                                .zip(&ref_row)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                            placements += 1;
+                        }
+                    }
+                    ensure!(
+                        placements == 849 && diff_bits == 0,
+                        "NVFP4 MMA batch invariance failed set={set_name} [{n_inv},{k_inv}]: placements={placements} diff_bits={diff_bits}"
+                    );
+                    println!(
+                        "PASS NVFP4_MMA_BATCH_INVARIANCE set={set_name} shape=[{n_inv},{k_inv}] placements={placements} diff_bits={diff_bits} probe_lt_bits={probe_lt_bits}/{n_inv} probe_fp64_bits={probe_fp64_bits}/{n_inv}"
+                    );
+                }
+            }
+            ensure!(mma_defects == 0, "NVFP4 MMA sweep defects={mma_defects}");
+
+            {
+                let m_below = m_max - 1;
+                let m_at = m_max;
+                let x_bound_host: Vec<bf16> = (0..m_at * k)
+                    .map(|i| {
+                        bf16::from_f32((((i * 47 + (i / k) * 61) % 251) as f32 - 125.0) / 128.0)
+                    })
+                    .collect();
+                let ref_bound = parallel_ref(&weight_host, &x_bound_host, m_at, k)?;
+                let x_bound_dev = stream.clone_htod(&x_bound_host)?;
+                let y_bound_dev = stream.alloc_zeros::<bf16>(m_at * n)?;
+
+                let layer_no_arena = LayerLinearPlan::bind(&dequant_plan, &catalog, None, stream)?;
+                layer_no_arena.prepare(&blas, m_below as u32)?;
+                layer_no_arena.run(
+                    &blas,
+                    "mlp.gate_proj.weight",
+                    ExecutionPhase::Prefill,
+                    view(
+                        &x_bound_dev,
+                        stream,
+                        0,
+                        [m_below as u32, k as u32],
+                        [k as u64, 1],
+                    )?,
+                    &mut TensorMut(view(
+                        &y_bound_dev,
+                        stream,
+                        0,
+                        [m_below as u32, n as u32],
+                        [n as u64, 1],
+                    )?),
+                )?;
+                let got_no_arena = stream.clone_dtoh(&y_bound_dev.slice(..m_below * n))?;
+                let mut max_no_arena = 0.0f32;
+                let mut sq_no_arena = 0.0f64;
+                for (&a, &b) in got_no_arena.iter().zip(&ref_bound[..m_below * n]) {
+                    let d = (a.to_f32() - b.to_f32()).abs();
+                    max_no_arena = max_no_arena.max(d);
+                    sq_no_arena += f64::from(d) * f64::from(d);
+                }
+                let rmse_no_arena = (sq_no_arena / (m_below * n) as f64).sqrt() as f32;
+                ensure!(
+                    max_no_arena <= 0.03125 && rmse_no_arena <= 0.004,
+                    "arena=None m_max-1={m_below} out of bounds: max_abs={max_no_arena} rmse={rmse_no_arena}"
+                );
+                ensure!(
+                    layer_no_arena
+                        .run(
+                            &blas,
+                            "mlp.gate_proj.weight",
+                            ExecutionPhase::Prefill,
+                            view(
+                                &x_bound_dev,
+                                stream,
+                                0,
+                                [m_at as u32, k as u32],
+                                [k as u64, 1],
+                            )?,
+                            &mut TensorMut(view(
+                                &y_bound_dev,
+                                stream,
+                                0,
+                                [m_at as u32, n as u32],
+                                [n as u64, 1],
+                            )?),
+                        )
+                        .is_err(),
+                    "arena=None accepted m_max={m_at} without materialization arena"
+                );
+                ensure!(
+                    blas.linear_typed_bound(
+                        ExecutionPhase::Prefill,
+                        LinearWeightRef::NvFp4 {
+                            codes: view(
+                                &codes_dev,
+                                stream,
+                                0,
+                                [n as u32, (k / 2) as u32],
+                                [(k / 2) as u64, 1],
+                            )?,
+                            scale: view(
+                                &scales_dev,
+                                stream,
+                                0,
+                                [n as u32, (k / 16) as u32],
+                                [(k / 16) as u64, 1],
+                            )?,
+                            global_scale: view(&ws2_dev, stream, 0, [1], [1])?,
+                        },
+                        view(
+                            &x_bound_dev,
+                            stream,
+                            0,
+                            [m_at as u32, k as u32],
+                            [k as u64, 1],
+                        )?,
+                        &mut TensorMut(view(
+                            &y_bound_dev,
+                            stream,
+                            0,
+                            [m_at as u32, n as u32],
+                            [n as u64, 1],
+                        )?),
+                        0,
+                    )
+                    .is_err(),
+                    "Blas::linear_typed_bound accepted direct NVFP4 at m_max={m_at}"
+                );
+
+                let arena_zero = stream.alloc_zeros::<u8>(dequant_plan.bytes as usize)?;
+                let scratch_zero = Scratch {
+                    ptr: arena_zero.device_ptr(stream).0,
+                    bytes: arena_zero.len() as u64,
+                };
+                let mut layer_zero =
+                    LayerLinearPlan::bind(&dequant_plan, &catalog, Some(&scratch_zero), stream)?;
+                layer_zero.prepare(&blas, m_below as u32)?;
+                layer_zero.prepare(&blas, m_at as u32)?;
+                layer_zero.run(
+                    &blas,
+                    "mlp.gate_proj.weight",
+                    ExecutionPhase::Prefill,
+                    view(
+                        &x_bound_dev,
+                        stream,
+                        0,
+                        [m_below as u32, k as u32],
+                        [k as u64, 1],
+                    )?,
+                    &mut TensorMut(view(
+                        &y_bound_dev,
+                        stream,
+                        0,
+                        [m_below as u32, n as u32],
+                        [n as u64, 1],
+                    )?),
+                )?;
+                let arena_bytes_after_below = stream.clone_dtoh(&arena_zero)?;
+                ensure!(
+                    arena_bytes_after_below.iter().all(|&b| b == 0),
+                    "m_max-1={m_below} modified materialization arena"
+                );
+                let got_below = stream.clone_dtoh(&y_bound_dev.slice(..m_below * n))?;
+                ensure!(
+                    got_below
+                        .iter()
+                        .zip(&got_no_arena)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "arena=Some(zero) m_max-1={m_below} differed from arena=None"
+                );
+
+                layer_zero.run(
+                    &blas,
+                    "mlp.gate_proj.weight",
+                    ExecutionPhase::Prefill,
+                    view(
+                        &x_bound_dev,
+                        stream,
+                        0,
+                        [m_at as u32, k as u32],
+                        [k as u64, 1],
+                    )?,
+                    &mut TensorMut(view(
+                        &y_bound_dev,
+                        stream,
+                        0,
+                        [m_at as u32, n as u32],
+                        [n as u64, 1],
+                    )?),
+                )?;
+                let got_unmat_at = stream.clone_dtoh(&y_bound_dev)?;
+                ensure!(
+                    got_unmat_at.iter().all(|v| v.to_f32() == 0.0),
+                    "m_max={m_at} did not dispatch cuBLASLt on materialization arena"
+                );
+
+                layer_zero.materialize(&blas, stream)?;
+                layer_zero.run(
+                    &blas,
+                    "mlp.gate_proj.weight",
+                    ExecutionPhase::Prefill,
+                    view(
+                        &x_bound_dev,
+                        stream,
+                        0,
+                        [m_at as u32, k as u32],
+                        [k as u64, 1],
+                    )?,
+                    &mut TensorMut(view(
+                        &y_bound_dev,
+                        stream,
+                        0,
+                        [m_at as u32, n as u32],
+                        [n as u64, 1],
+                    )?),
+                )?;
+                let got_mat_at = stream.clone_dtoh(&y_bound_dev)?;
+                let mut max_at = 0.0f32;
+                let mut sq_at = 0.0f64;
+                for (&a, &b) in got_mat_at.iter().zip(&ref_bound) {
+                    let d = (a.to_f32() - b.to_f32()).abs();
+                    max_at = max_at.max(d);
+                    sq_at += f64::from(d) * f64::from(d);
+                }
+                let rmse_at = (sq_at / (m_at * n) as f64).sqrt() as f32;
+                ensure!(
+                    max_at <= 0.03125 && rmse_at <= 0.004,
+                    "m_max={m_at} materialized cuBLASLt out of bounds: max_abs={max_at} rmse={rmse_at}"
+                );
+                println!(
+                    "PASS NVFP4_M_MAX_DISPATCH m_below={m_below} m_at={m_at} below_max_abs={max_no_arena:.6} below_rmse={rmse_no_arena:.6} at_max_abs={max_at:.6} at_rmse={rmse_at:.6}"
+                );
+            }
 
             if let Ok(golden_path) = std::env::var("FF_H3_IMAGE_PE_ORACLE_GOLDEN") {
                 let bytes = std::fs::read(&golden_path)?;

@@ -1072,17 +1072,21 @@ fn drop_result(name: &str, result: std::result::Result<(), impl std::fmt::Debug>
 }
 
 impl Blas {
-    pub(crate) fn direct_fp8_rows(&self) -> std::ops::RangeInclusive<usize> {
-        let rows = match self.invariant_rows {
+    pub(crate) fn fp8_direct_rows(invariant_rows: usize) -> std::ops::RangeInclusive<usize> {
+        let rows = match invariant_rows {
             0 => crate::mtp::MAX_VERIFY_ROWS,
             rows => rows,
         };
         1..=rows
     }
 
+    pub(crate) fn direct_fp8_rows(&self) -> std::ops::RangeInclusive<usize> {
+        Self::fp8_direct_rows(self.invariant_rows)
+    }
+
     pub(crate) fn direct_quant_rows(&self) -> std::ops::RangeInclusive<usize> {
-        if self.nvfp4.is_some() {
-            1..=crate::linear_plan::MAX_SKINNY_ROWS
+        if let Some(nvfp4) = &self.nvfp4 {
+            1..=nvfp4.direct_max_rows()
         } else {
             self.direct_fp8_rows()
         }
@@ -1103,10 +1107,8 @@ impl Blas {
             fp8.require_rows(rows)?;
             self.fp8 = Some(fp8);
         }
-        if self.nvfp4.is_some() {
-            let nvfp4 = super::linear::NvFp4Ops::new(ctx)?;
-            nvfp4.require_rows(crate::linear_plan::MAX_SKINNY_ROWS)?;
-            self.nvfp4 = Some(nvfp4);
+        if let Some(nvfp4) = &self.nvfp4 {
+            nvfp4.require_rows(rows)?;
         }
         self.invariant_rows = rows;
         Ok(())
@@ -1803,15 +1805,15 @@ impl Blas {
                 scale,
                 global_scale,
             } => {
-                let direct_rows = 1..=crate::linear_plan::MAX_SKINNY_ROWS;
+                let nvfp4 = self.nvfp4_ops()?;
+                let direct_rows = 1..=nvfp4.direct_max_rows();
                 ensure!(
                     direct_rows.contains(&(x.shape[0] as usize)),
                     "direct NVFP4 rows={} exceeds the bound={} and requires materialized BF16 weight",
                     x.shape[0],
                     direct_rows.end()
                 );
-                self.nvfp4_ops()?
-                    .small_gemm(&self.stream, codes, scale, global_scale, x, y)
+                nvfp4.gemm(&self.stream, codes, scale, global_scale, x, y)
             }
             LinearWeightRef::Bf16(w) => {
                 w.validate()?;
