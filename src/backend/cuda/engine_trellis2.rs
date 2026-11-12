@@ -1025,6 +1025,36 @@ mod tests {
         assert!(ensure_captured_blocks(&[0, 1, 2, 3], 30, 3).is_err());
     }
 
+    fn read_coords(path: &std::path::Path, key: &str) -> Result<Vec<[i32; 3]>> {
+        let bytes = std::fs::read(path)?;
+        #[derive(serde::Deserialize)]
+        struct Header {
+            dtype: String,
+            data_offsets: [usize; 2],
+        }
+        let header_len = u64::from_le_bytes(bytes[0..8].try_into()?) as usize;
+        let header: std::collections::BTreeMap<String, Header> =
+            serde_json::from_slice(&bytes[8..8 + header_len])?;
+        let entry = header
+            .get(key)
+            .with_context(|| format!("tensor {key} missing"))?;
+        ensure!(entry.dtype == "I32", "coords tensor is not I32");
+        let start = entry.data_offsets[0];
+        let end = entry.data_offsets[1];
+        let data = &bytes[8 + header_len + start..8 + header_len + end];
+        ensure!(data.len() % 16 == 0, "coords tensor extent mismatch");
+        let stride = data.len() / 16;
+        let words: Vec<i32> = data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b))
+            .collect();
+        Ok((0..stride)
+            .map(|row| [words[row * 4 + 1], words[row * 4 + 2], words[row * 4 + 3]])
+            .collect())
+    }
+
     fn read_tensor(path: &std::path::Path, key: &str) -> Result<Vec<f32>> {
         let bytes = std::fs::read(path)?;
         #[derive(serde::Deserialize)]
@@ -1452,6 +1482,230 @@ mod tests {
             "TRELLIS.2 SS sampler/decode gate: {defects} defects over {scored} cells"
         );
         println!("PASS TRELLIS2_SS_SAMPLE_DECODE cells={scored} fixtures=2 states=12");
+        Ok(())
+    }
+
+    #[ignore = "TRELLIS.2 SLAT flow cells: FF_TRELLIS2_MODEL FF_TRELLIS2_SLAT_FIXTURES FF_TRELLIS2_SLAT_OUTPUT FLYINGFISH_RUNTIME_DIR, optional FF_TRELLIS2_SS_LIMIT_BYTES"]
+    #[test]
+    fn slat_flow_cells_gpu() -> Result<()> {
+        let model: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_MODEL")
+            .map(Into::into)
+            .context("FF_TRELLIS2_MODEL missing")?;
+        let root: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_FIXTURES")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_FIXTURES missing")?;
+        let out: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_OUTPUT")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_OUTPUT missing")?;
+        std::fs::create_dir_all(&out)?;
+        let runtime = std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let floor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("flow-floor-r2.json"))?)?;
+        let cells = floor["cells"]
+            .as_array()
+            .context("flow floor cells missing")?;
+        let tau_of = |id: &str| -> Result<(f64, f64)> {
+            let cell = cells
+                .iter()
+                .find(|c| c["id"] == id)
+                .with_context(|| format!("cell {id} missing"))?;
+            Ok((
+                cell["tau"]["max_abs"].as_f64().context("tau max_abs")?,
+                cell["tau"]["rmse"].as_f64().context("tau rmse")?,
+            ))
+        };
+        let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
+            ensure!(a.len() == b.len() && !a.is_empty(), "cell extent mismatch");
+            let mut maximum = 0.0f64;
+            let mut square = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                let d = f64::from(*x) - f64::from(*y);
+                maximum = maximum.max(d.abs());
+                square += d * d;
+            }
+            Ok((maximum, (square / a.len() as f64).sqrt()))
+        };
+        let device = Device::new(0)?;
+        let ops = super::super::ops::Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            std::rc::Rc::new(super::super::closure::Closure::new(
+                false,
+                "SLAT flow cells".into(),
+            )),
+        )?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = match std::env::var("FF_TRELLIS2_SS_LIMIT_BYTES") {
+            Ok(value) => value
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid FF_TRELLIS2_SS_LIMIT_BYTES: {value}"))?,
+            Err(_) => (total - total / 8).saturating_sub(total - free),
+        };
+        let pipeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
+        let models = &pipeline["args"]["models"];
+        let mut defects = 0usize;
+        let mut scored = 0usize;
+        for case in [
+            ("shape", "cottage", "512"),
+            ("shape", "robot_crab", "512"),
+            ("tex", "cottage", "512"),
+            ("tex", "robot_crab", "512"),
+        ] {
+            let (kind, fixture, resolution) = case;
+            let dir = root.join(format!("{kind}-{fixture}-{resolution}-r0a"));
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("metadata.json"))?)?;
+            let checkpoint_key = metadata["checkpoint"].as_str().context("checkpoint key")?;
+            let checkpoint = model.join(format!(
+                "ckpts/{}.safetensors",
+                models[checkpoint_key]
+                    .as_str()
+                    .context("pipeline model entry missing")?
+                    .trim_start_matches("ckpts/")
+            ));
+            let context_rows = metadata["context_rows"].as_u64().context("context rows")? as usize;
+            let calls = metadata["forwards"].as_u64().context("forwards")? as usize;
+            let sites = read_coords(&dir.join("sampler-input.safetensors"), "noise.coords")?;
+            let concat = if kind == "tex" {
+                Some(read_tensor(
+                    &dir.join("sampler-input.safetensors"),
+                    "concat_cond.features",
+                )?)
+            } else {
+                None
+            };
+            let cond: Vec<bf16> = read_tensor(&dir.join("sampler-input.safetensors"), "cond")?
+                .iter()
+                .map(|v| bf16::from_f32(*v))
+                .collect();
+            let mut flow = TrellisSsFlow::load_flow(
+                &device,
+                &mut blas,
+                &checkpoint,
+                &sites,
+                context_rows,
+                limit,
+            )?;
+            let block_calls: Vec<usize> = (1..=calls)
+                .filter(|call| {
+                    cells.iter().any(|c| {
+                        c["id"].as_str().is_some_and(|id| {
+                            id.starts_with(&format!(
+                                "flow/{kind}-{fixture}-{resolution}/call{call}-block"
+                            ))
+                        })
+                    })
+                })
+                .collect();
+            // Call order from the published schedule: a guided step issues
+            // pos then neg (zero context) inside the guidance interval; a
+            // step outside it issues a single pos call.
+            let times = super::super::pixal3d::schedule(true, 12);
+            let mut branch: Vec<bool> = Vec::new();
+            for t in &times[..12] {
+                branch.push(false);
+                if (0.6..=1.0).contains(t) {
+                    branch.push(true);
+                }
+            }
+            ensure!(
+                branch.len() == calls,
+                "schedule call count {} differs from forwards {calls}",
+                branch.len()
+            );
+            for call in 1..=calls {
+                let input_path = if dir
+                    .join(format!("flow-call{call}-input.safetensors"))
+                    .exists()
+                {
+                    dir.join(format!("flow-call{call}-input.safetensors"))
+                } else {
+                    dir.join(format!("call{call}-input.safetensors"))
+                };
+                let input = read_tensor(&input_path, "x.features")?;
+                let t = read_tensor(&dir.join(format!("call{call}-input.safetensors")), "t")?[0];
+                let mut x = input.clone();
+                if let Some(concat) = &concat {
+                    let rows = input.len() / 32;
+                    x = (0..rows * 64)
+                        .map(|i| {
+                            let row = i / 64;
+                            let channel = i % 64;
+                            if channel < 32 {
+                                input[row * 32 + channel]
+                            } else {
+                                concat[row * 32 + channel - 32]
+                            }
+                        })
+                        .collect();
+                }
+                let blocks: Vec<usize> = if block_calls.contains(&call) {
+                    vec![0, 15, 29]
+                } else {
+                    Vec::new()
+                };
+                let guidance: Vec<bf16> = if branch[call - 1] {
+                    vec![bf16::from_f32(0.0); cond.len()]
+                } else {
+                    cond.clone()
+                };
+                let (velocity, captures) = flow.velocity(&blas, &x, t, &guidance, &blocks)?;
+                let reference = read_tensor(
+                    &dir.join(format!("call{call}-velocity.safetensors")),
+                    "velocity.features",
+                )?;
+                let id = format!(
+                    "flow/{kind}-{fixture}-{resolution}/call{call}-velocity/velocity.features"
+                );
+                let (tau_max, tau_rmse) = tau_of(&id)?;
+                let (max_abs, rmse) = metric(&velocity, &reference)?;
+                let width = velocity.len() / 32;
+                let rotated: Vec<f32> = (0..velocity.len())
+                    .map(|index| {
+                        let channel = index / width;
+                        velocity[index - channel * width + ((channel + 1) % 32) * width]
+                    })
+                    .collect();
+                let (control_max, control_rmse) = metric(&velocity, &rotated)?;
+                let pass = max_abs <= tau_max && rmse <= tau_rmse;
+                let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+                println!(
+                    "TRELLIS2_SLAT_CELL id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                    if pass && control_ok { "PASS" } else { "DEFECT" }
+                );
+                scored += 1;
+                defects += usize::from(!pass) + usize::from(!control_ok);
+                for (slot, block) in blocks.iter().enumerate() {
+                    let reference = read_tensor(
+                        &dir.join(format!("call{call}-block{block}.safetensors")),
+                        "output.features",
+                    )?;
+                    let id = format!(
+                        "flow/{kind}-{fixture}-{resolution}/call{call}-block{block}/output.features"
+                    );
+                    let (tau_max, tau_rmse) = tau_of(&id)?;
+                    let (max_abs, rmse) = metric(&captures[slot], &reference)?;
+                    let pass = max_abs <= tau_max && rmse <= tau_rmse;
+                    println!(
+                        "TRELLIS2_SLAT_CELL id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} result={}",
+                        if pass { "PASS" } else { "DEFECT" }
+                    );
+                    scored += 1;
+                    defects += usize::from(!pass);
+                }
+            }
+        }
+        ensure!(
+            defects == 0,
+            "TRELLIS.2 SLAT flow gate: {defects} defects over {scored} cells"
+        );
+        println!("PASS TRELLIS2_SLAT_FLOW cells={scored} cases=4");
         Ok(())
     }
 }
