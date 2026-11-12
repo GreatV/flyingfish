@@ -1,7 +1,7 @@
 //! Shared flow, dense/sparse decoders and image-conditioned mesh refinement.
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 use super::sparse::{BatchGroupNorm, SparseConv};
 pub use super::sparse::{TriangleVoxels, adaptive_mesh_support, triangle_voxels};
 
@@ -5890,6 +5890,20 @@ impl PixalDecoder {
         c: usize,
         blocks: usize,
     ) -> Result<CudaSlice<f16>> {
+        self.next_blocks_observed(stage, conv, x, c, blocks, |_, _| Ok(()))
+    }
+    fn next_blocks_observed<F>(
+        &self,
+        stage: usize,
+        conv: &SparseConv,
+        x: CudaSlice<f16>,
+        c: usize,
+        blocks: usize,
+        mut observe: F,
+    ) -> Result<CudaSlice<f16>>
+    where
+        F: FnMut(usize, &CudaSlice<f16>) -> Result<()>,
+    {
         let d = &self.device;
         let n = x.len() / c;
         let features = n.checked_mul(c).context("sparse features overflow")?;
@@ -5908,6 +5922,7 @@ impl PixalDecoder {
             self.k.act(d, ptr(&wide, d), n, 4 * c, false)?;
             self.linear16(&format!("{name}.mlp.2"), &wide, &mut a, [n, 4 * c, c])?;
             self.k.add(d, &x, &a, &self.ones, [n, c])?;
+            observe(block, &x)?;
         }
         Ok(x)
     }

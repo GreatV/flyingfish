@@ -1131,6 +1131,12 @@ mod tests {
                 .iter()
                 .map(|b| f32::from_le_bytes(*b))
                 .collect(),
+            "F16" => data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
+                .collect(),
             "BF16" => data
                 .as_chunks::<2>()
                 .0
@@ -1139,6 +1145,71 @@ mod tests {
                 .collect(),
             other => anyhow::bail!("unexpected gate tensor dtype {other}"),
         })
+    }
+
+    fn read_i64(path: &std::path::Path, key: &str) -> Result<Vec<i64>> {
+        let bytes = std::fs::read(path)?;
+        #[derive(serde::Deserialize)]
+        struct Header {
+            dtype: String,
+            data_offsets: [usize; 2],
+        }
+        let header_len = u64::from_le_bytes(bytes[0..8].try_into()?) as usize;
+        let header: std::collections::BTreeMap<String, Header> =
+            serde_json::from_slice(&bytes[8..8 + header_len])?;
+        let entry = header
+            .get(key)
+            .with_context(|| format!("tensor {key} missing"))?;
+        ensure!(entry.dtype == "I64", "indices tensor is not I64");
+        let start = entry.data_offsets[0];
+        let end = entry.data_offsets[1];
+        Ok(bytes[8 + header_len + start..8 + header_len + end]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
+            .collect())
+    }
+
+    fn has_key(path: &std::path::Path, key: &str) -> Result<bool> {
+        let bytes = std::fs::read(path)?;
+        let header_len = u64::from_le_bytes(bytes[0..8].try_into()?) as usize;
+        let header: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(&bytes[8..8 + header_len])?;
+        Ok(header.contains_key(key))
+    }
+
+    fn read_coords4(path: &std::path::Path, key: &str) -> Result<Vec<[i32; 4]>> {
+        let bytes = std::fs::read(path)?;
+        #[derive(serde::Deserialize)]
+        struct Header {
+            dtype: String,
+            data_offsets: [usize; 2],
+        }
+        let header_len = u64::from_le_bytes(bytes[0..8].try_into()?) as usize;
+        let header: std::collections::BTreeMap<String, Header> =
+            serde_json::from_slice(&bytes[8..8 + header_len])?;
+        let entry = header
+            .get(key)
+            .with_context(|| format!("tensor {key} missing"))?;
+        ensure!(entry.dtype == "I32", "coords tensor is not I32");
+        let start = entry.data_offsets[0];
+        let end = entry.data_offsets[1];
+        let data = &bytes[8 + header_len + start..8 + header_len + end];
+        ensure!(data.len() % 16 == 0, "coords tensor extent mismatch");
+        Ok(data
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|b| {
+                [
+                    i32::from_le_bytes(b[0..4].try_into().unwrap()),
+                    i32::from_le_bytes(b[4..8].try_into().unwrap()),
+                    i32::from_le_bytes(b[8..12].try_into().unwrap()),
+                    i32::from_le_bytes(b[12..16].try_into().unwrap()),
+                ]
+            })
+            .collect())
     }
 
     #[test]
@@ -2043,8 +2114,7 @@ mod tests {
                 .collect();
             let channels = noise.len() / sites.len();
             let slat = normalize_slat(&previous, &mean, &std);
-            let reference =
-                read_tensor(&dir.join("stage-output.safetensors"), "slat.features")?;
+            let reference = read_tensor(&dir.join("stage-output.safetensors"), "slat.features")?;
             let mut omitted = slat.clone();
             for row in 0..sites.len() {
                 omitted[row * channels] = previous[row * channels];
@@ -2126,8 +2196,367 @@ mod tests {
             defects == 0,
             "TRELLIS.2 SLAT sampler gate: {defects} defects over {scored} cells"
         );
-        ensure!(cases_run > 0, "TRELLIS.2 SLAT sampler gate: no cases matched");
+        ensure!(
+            cases_run > 0,
+            "TRELLIS.2 SLAT sampler gate: no cases matched"
+        );
         println!("PASS TRELLIS2_SLAT_SAMPLE cells={scored} cases={cases_run}");
+        Ok(())
+    }
+    #[ignore = "TRELLIS.2 SLAT decoder cells: FF_TRELLIS2_MODEL FF_TRELLIS2_SLAT_FIXTURES FF_TRELLIS2_SLAT_OUTPUT FLYINGFISH_RUNTIME_DIR, optional FF_TRELLIS2_SS_LIMIT_BYTES FF_TRELLIS2_SLAT_CASES"]
+    #[test]
+    fn slat_decoder_cells_gpu() -> Result<()> {
+        let model: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_MODEL")
+            .map(Into::into)
+            .context("FF_TRELLIS2_MODEL missing")?;
+        let root: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_FIXTURES")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_FIXTURES missing")?;
+        let out: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_OUTPUT")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_OUTPUT missing")?;
+        std::fs::create_dir_all(&out)?;
+        let runtime = std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let floor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("decoder-floor-r1.json"))?)?;
+        let cells = floor["cells"]
+            .as_array()
+            .context("decoder floor cells missing")?;
+        let tau_of = |id: &str| -> Result<(f64, f64)> {
+            let cell = cells
+                .iter()
+                .find(|c| c["id"] == id)
+                .with_context(|| format!("cell {id} missing"))?;
+            Ok((
+                cell["tau"]["max_abs"].as_f64().context("tau max_abs")?,
+                cell["tau"]["rmse"].as_f64().context("tau rmse")?,
+            ))
+        };
+        let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
+            ensure!(
+                a.len() == b.len() && !a.is_empty(),
+                "cell extent mismatch: {} vs {}",
+                a.len(),
+                b.len()
+            );
+            let mut maximum = 0.0f64;
+            let mut square = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                let d = f64::from(*x) - f64::from(*y);
+                maximum = maximum.max(d.abs());
+                square += d * d;
+            }
+            Ok((maximum, (square / a.len() as f64).sqrt()))
+        };
+        // The floor control class: a sparse gather reading the x+1 neighbour
+        // instead of the site itself. Emulated on the native output by
+        // permuting rows along the x sibling relation.
+        let gather_control = |coordinates: &[[i32; 4]], features: &[f32]| -> Vec<f32> {
+            let width = features.len() / coordinates.len();
+            let mut lookup = std::collections::HashMap::with_capacity(coordinates.len());
+            for (row, site) in coordinates.iter().enumerate() {
+                lookup.insert(*site, row);
+            }
+            let mut permuted = features.to_vec();
+            for (row, site) in coordinates.iter().enumerate() {
+                let mut neighbour = *site;
+                neighbour[3] += 1;
+                if let Some(&source) = lookup.get(&neighbour) {
+                    for channel in 0..width {
+                        permuted[row * width + channel] = features[source * width + channel];
+                    }
+                }
+            }
+            permuted
+        };
+        let device = Device::new(0)?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = match std::env::var("FF_TRELLIS2_SS_LIMIT_BYTES") {
+            Ok(value) => value
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid FF_TRELLIS2_SS_LIMIT_BYTES: {value}"))?,
+            Err(_) => (total - total / 8).saturating_sub(total - free),
+        };
+        let scope: Vec<String> = std::env::var("FF_TRELLIS2_SLAT_CASES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut defects = 0usize;
+        let mut scored = 0usize;
+        let mut skipped = 0usize;
+        let mut cases_run = 0usize;
+        for kind in ["shape", "tex"] {
+            let mut in_scope = false;
+            for case in [
+                ("cottage", "512"),
+                ("robot_crab", "512"),
+                ("cottage", "1024"),
+                ("robot_crab", "1024"),
+                ("cottage", "1024cascade"),
+                ("robot_crab", "1024cascade"),
+                ("cottage", "1536cascade"),
+                ("robot_crab", "1536cascade"),
+            ] {
+                let name = format!("{kind}-{}-{}", case.0, case.1);
+                if !scope.is_empty() && !scope.contains(&name) {
+                    continue;
+                }
+                in_scope = true;
+                let decoder_kind = if kind == "shape" {
+                    crate::pixal3d::DecoderKind::Shape
+                } else {
+                    crate::pixal3d::DecoderKind::Texture
+                };
+                let device = device.clone();
+                let decoder = super::super::pixal3d::PixalDecoder::open(
+                    &device,
+                    &model,
+                    decoder_kind,
+                    &runtime,
+                    limit,
+                )?;
+                cases_run += 1;
+                let dir = root.join(format!("decode-{name}-r0a"));
+                let stage_output = root.join(format!("{name}-r0a/stage-output.safetensors"));
+                let coordinates = read_coords4(&stage_output, "slat.coords")?;
+                let latent = read_tensor(&stage_output, "slat.features")?;
+                let guides: Vec<super::super::pixal3d::SparseDecoderOutput> = if kind == "tex" {
+                    let shape_dir = root.join(format!("decode-shape-{}-{}-r0a", case.0, case.1));
+                    (0..4)
+                        .map(|stage| {
+                            let path = shape_dir.join(format!("subdivision{stage}.safetensors"));
+                            Ok(super::super::pixal3d::SparseDecoderOutput {
+                                coordinates: read_coords4(&path, "coords")?,
+                                features: read_tensor(&path, "features")?,
+                                channels: 8,
+                            })
+                        })
+                        .collect::<Result<_>>()?
+                } else {
+                    Vec::new()
+                };
+                let mut block_cells = 0usize;
+                let mut stage_cells = 0usize;
+                let mut subdivision_cells = 0usize;
+                let mut head_cells = 0usize;
+                let mut field_cells = 0usize;
+                let mut score = |id: &str,
+                                 coordinates: &[[i32; 4]],
+                                 features: &[f32],
+                                 stored: &[f32],
+                                 defects: &mut usize,
+                                 scored: &mut usize|
+                 -> Result<()> {
+                    let (tau_max, tau_rmse) = tau_of(id)?;
+                    let (max_abs, rmse) = metric(features, stored)?;
+                    let control = gather_control(coordinates, features);
+                    let (control_max, control_rmse) = metric(features, &control)?;
+                    let pass = max_abs <= tau_max && rmse <= tau_rmse;
+                    let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+                    println!(
+                        "TRELLIS2_SLAT_DECODE id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                        if pass && control_ok { "PASS" } else { "DEFECT" }
+                    );
+                    *scored += 1;
+                    *defects += usize::from(!pass) + usize::from(!control_ok);
+                    Ok(())
+                };
+                super::super::pixal3d::tests::decode_tapped(
+                    &decoder,
+                    coordinates.clone(),
+                    &latent,
+                    &guides,
+                    |tap| match tap {
+                        super::super::pixal3d::tests::DecodeTap::Block0 {
+                            stage,
+                            coordinates,
+                            features,
+                        } => {
+                            block_cells += 1;
+                            let path = dir.join(format!("stage{stage}-block0.safetensors"));
+                            let rows = if has_key(&path, "row_indices")? {
+                                read_i64(&path, "row_indices")?
+                            } else {
+                                (0..coordinates.len() as i64).collect::<Vec<i64>>()
+                            };
+                            let width = features.len() / coordinates.len();
+                            let subset_coords: Vec<[i32; 4]> =
+                                rows.iter().map(|&r| coordinates[r as usize]).collect();
+                            let stored_coords = read_coords4(&path, "coords")?;
+                            if stored_coords != subset_coords {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/stage{stage}-block0 stored_rows={} case_rows={}",
+                                    stored_coords.len(),
+                                    subset_coords.len()
+                                );
+                                return Ok(());
+                            }
+                            let stored = read_tensor(&path, "features")?;
+                            let subset: Vec<f32> = rows
+                                .iter()
+                                .flat_map(|&r| {
+                                    let row = r as usize * width;
+                                    features[row..row + width].iter().copied()
+                                })
+                                .collect();
+                            score(
+                                &format!("decoder/decode-{name}/stage{stage}-block0"),
+                                &subset_coords,
+                                &subset,
+                                &stored,
+                                &mut defects,
+                                &mut scored,
+                            )
+                        }
+                        super::super::pixal3d::tests::DecodeTap::Stage {
+                            stage,
+                            coordinates,
+                            features,
+                        } => {
+                            stage_cells += 1;
+                            let count = [4usize, 16, 8, 4][stage];
+                            let path = dir.join(format!("stage{stage}-block{count}.safetensors"));
+                            let rows = read_i64(&path, "row_indices")?;
+                            let stored_coords = read_coords4(&path, "coords")?;
+                            let width = features.len() / coordinates.len();
+                            let subset_coords: Vec<[i32; 4]> =
+                                rows.iter().map(|&r| coordinates[r as usize]).collect();
+                            if stored_coords != subset_coords {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/stage{stage}-block{count} stored_rows={} case_rows={}",
+                                    stored_coords.len(),
+                                    subset_coords.len()
+                                );
+                                return Ok(());
+                            }
+                            let stored = read_tensor(&path, "features")?;
+                            let subset: Vec<f32> = rows
+                                .iter()
+                                .flat_map(|&r| {
+                                    let row = r as usize * width;
+                                    features[row..row + width].iter().copied()
+                                })
+                                .collect();
+                            score(
+                                &format!("decoder/decode-{name}/stage{stage}-block{count}"),
+                                &subset_coords,
+                                &subset,
+                                &stored,
+                                &mut defects,
+                                &mut scored,
+                            )
+                        }
+                        super::super::pixal3d::tests::DecodeTap::Subdivision {
+                            stage,
+                            coordinates,
+                            logits,
+                        } => {
+                            subdivision_cells += 1;
+                            let path = dir.join(format!("subdivision{stage}.safetensors"));
+                            let stored_coords = read_coords4(&path, "coords")?;
+                            if stored_coords != coordinates {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/subdivision{stage} stored_rows={} case_rows={}",
+                                    stored_coords.len(),
+                                    coordinates.len()
+                                );
+                                return Ok(());
+                            }
+                            let stored = read_tensor(&path, "features")?;
+                            score(
+                                &format!("decoder/decode-{name}/subdivision{stage}"),
+                                coordinates,
+                                logits,
+                                &stored,
+                                &mut defects,
+                                &mut scored,
+                            )
+                        }
+                        super::super::pixal3d::tests::DecodeTap::Head {
+                            coordinates,
+                            features,
+                        } => {
+                            head_cells += 1;
+                            let path = dir.join("head-input.safetensors");
+                            let stored_coords = read_coords4(&path, "coords")?;
+                            if stored_coords != coordinates {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/head-observed stored_rows={} case_rows={}",
+                                    stored_coords.len(),
+                                    coordinates.len()
+                                );
+                                return Ok(());
+                            }
+                            let stored = read_tensor(&path, "features")?;
+                            score(
+                                &format!("decoder/decode-{name}/head-observed"),
+                                coordinates,
+                                features,
+                                &stored,
+                                &mut defects,
+                                &mut scored,
+                            )
+                        }
+                        super::super::pixal3d::tests::DecodeTap::Fields {
+                            coordinates,
+                            features,
+                        } => {
+                            field_cells += 1;
+                            let path = dir.join("fields.safetensors");
+                            let stored_coords = read_coords4(&path, "coords")?;
+                            if stored_coords != coordinates {
+                                println!(
+                                    "TRELLIS2_SLAT_SKIP id=decoder/decode-{name}/fields stored_rows={} case_rows={}",
+                                    stored_coords.len(),
+                                    coordinates.len()
+                                );
+                                return Ok(());
+                            }
+                            let stored = read_tensor(&path, "features")?;
+                            score(
+                                &format!("decoder/decode-{name}/fields"),
+                                coordinates,
+                                features,
+                                &stored,
+                                &mut defects,
+                                &mut scored,
+                            )
+                        }
+                    },
+                )?;
+                let expected_subdivisions = usize::from(kind == "shape") * 4;
+                ensure!(
+                    block_cells == 4
+                        && stage_cells == 4
+                        && subdivision_cells == expected_subdivisions
+                        && head_cells == 1
+                        && field_cells == 1,
+                    "tap counts differ from the fixture contract on {name}: blocks={block_cells} stages={stage_cells} subdivisions={subdivision_cells} head={head_cells} fields={field_cells}"
+                );
+            }
+            if in_scope {
+                // The decoder for this kind is dropped implicitly at the loop
+                // iteration boundary; the next kind opens its own weights.
+            }
+        }
+        ensure!(
+            defects == 0,
+            "TRELLIS.2 SLAT decoder gate: {defects} defects over {scored} cells"
+        );
+        ensure!(
+            cases_run > 0,
+            "TRELLIS.2 SLAT decoder gate: no cases matched"
+        );
+        println!("PASS TRELLIS2_SLAT_DECODE cells={scored} skipped={skipped} cases={cases_run}");
         Ok(())
     }
 }
