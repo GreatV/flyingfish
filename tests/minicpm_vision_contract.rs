@@ -60,6 +60,10 @@ fn measured_floor(case: &str, tap: &str) -> Result<(f64, f32)> {
     let rms = entry["rms"]
         .as_f64()
         .with_context(|| format!("missing rms {case}/{tap}"))?;
+    ensure!(
+        k.is_finite() && k >= 0.0 && rms.is_finite() && rms >= 0.0,
+        "invalid tolerance {case}/{tap}: k={k} rms={rms}"
+    );
     Ok((k, rms as f32))
 }
 
@@ -878,7 +882,12 @@ fn patch_rows_reorder_matches_the_reference() -> Result<()> {
                 added[patch * hidden + o] = half::bf16::from_f32(sum).to_f32();
             }
         }
-        worst[arm] = flyingfish::verify::half_ulp_ratio(&added, &reference, rms);
+        worst[arm] = flyingfish::verify::half_ulp_ratio(
+            "minicpm_vision.patch_rows",
+            &added,
+            &reference,
+            rms,
+        )?;
         println!(
             "{}",
             serde_json::json!({"patch_rows": {"transposed": transposed, "max_half_ulp_ratio": worst[arm], "k": k}})
@@ -1037,7 +1046,12 @@ fn final_merger_groups_match_the_reference() -> Result<()> {
             let row = matmul_f32(&activated, &l2_w, &l2_b, 1, fc1, output);
             out[token * output..][..output].copy_from_slice(&row);
         }
-        worst[arm] = flyingfish::verify::half_ulp_ratio(&out, &reference, rms);
+        worst[arm] = flyingfish::verify::half_ulp_ratio(
+            "minicpm_vision.merger_groups",
+            &out,
+            &reference,
+            rms,
+        )?;
         println!(
             "{}",
             serde_json::json!({"merger_groups": {"contiguous": contiguous, "max_half_ulp_ratio": worst[arm], "k": k}})
