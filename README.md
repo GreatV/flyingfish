@@ -60,8 +60,9 @@ Image to 3D (library entry points, no CLI):
 | Idol | DINOv3 and FLUX.2 VAE encoders, latent flow denoiser, octree and Gaussian decoders: a preprocessed 1024 px image to a Gaussian splat and a camera; `flyingfish::backend::IdolPipelineRuntime` | CUDA |
 | Pixal3D | Single-view and multiview: RGBA views with camera parameters and supplied noise, through sparse-structure, shape and texture flows, to a raw mesh with six material channels; `flyingfish::backend::PixalGeneration` | CUDA |
 | Hi3D | DINOv2 and CLIP image conditioning, sparse flow and sparse VAE decoder at 512, 1024 or 1536, refining a supplied coarse mesh; raw mesh or a hole-filled, simplified and normalized mesh; `flyingfish::backend::Hi3DGeneration` | CUDA |
+| TRELLIS.2-4B | DINOv3 image conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders on supplied noise; decoder output differs from the reference at F16 quanta (see the PR); stage-level entry, no image-to-mesh entry yet; `flyingfish::backend::TrellisSsFlow` | CUDA |
 
-In progress: TRELLIS.2 image-to-3D (DINOv3 image conditioning and the sparse-structure flow transformer landed; no sampler loop, structured-latent or texture stages yet); MiniMax-H3-Image (no text encoder, VAE decoder or 4096 canvas yet).
+In progress: TRELLIS.2 image-to-3D (flow sampling and the structured-latent, mesh and texture stages landed; remaining: render, GLB and bake, the shape and texture encoders, and closing the decoder and structure-latent differences from the reference); MiniMax-H3-Image (no text encoder, VAE decoder or 4096 canvas yet).
 
 ## Platforms
 
