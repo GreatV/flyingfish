@@ -3293,6 +3293,12 @@ impl Dit {
                 eps: spec.final_norm_eps,
             },
         )?;
+        // `[text, hidden]` refiner rows. The block stack then writes `x`.
+        #[cfg(test)]
+        {
+            let count = r.text * h;
+            s.memcpy_dtod(&self.x.slice(..count), &mut self.text.slice_mut(..count))?;
+        }
         self.projection(
             c,
             &self.proj_in,
@@ -4649,15 +4655,15 @@ mod tests {
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::checkpoint::MappedCheckpoint;
     use crate::minimax_h3::{
-        Geometry, IMAGE_MIN_GENERATION_AREA, ImageLayout, ImageSchedule, ImageSpec,
+        AUDIO_TAG, Geometry, IMAGE_MIN_GENERATION_AREA, ImageLayout, ImageSchedule, ImageSpec,
         KEYFRAME_NOISE_AUG, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, TEXT_TAG,
-        image_canvas, image_latent_extent, image_layout, image_reference_latent_extent,
-        image_vae_reference_size, noise_draws, patchify_latents, rotary_rows, row_timestep_plan,
-        unpatchify_latents,
+        VIDEO_TAG, hyperflow_steps, image_canvas, image_latent_extent, image_layout,
+        image_reference_latent_extent, image_vae_reference_size, noise_draws, patchify_latents,
+        rotary_rows, row_timestep_plan, unpatchify_latents,
     };
     use anyhow::bail;
     use safetensors::SafeTensors;
-    use std::{fs, rc::Rc};
+    use std::{collections::BTreeMap, fs, rc::Rc};
 
     /// Initial chunks avoid skinny tails; selection counts scratch and workspace replacements.
     #[test]
@@ -11702,5 +11708,750 @@ mod tests {
             println!("HYPERFLOW_BLOCK_GATE DEFECT cells={defects:?} controls=FAIL_AS_REQUIRED");
         }
         Ok(())
+    }
+
+    /// 6-step raw table cast f64 to f32, then `shift * base / ((shift - 1) * base + 1)` in f32.
+    fn step_grid(shift: f32) -> Schedule {
+        let raw = [
+            1.0f64, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0,
+        ];
+        let sigmas: Vec<f32> = raw
+            .iter()
+            .map(|&base| {
+                let base = base as f32;
+                shift * base / ((shift - 1.0) * base + 1.0)
+            })
+            .collect();
+        let timesteps = sigmas[..sigmas.len() - 1]
+            .iter()
+            .map(|sigma| 1.0 - sigma)
+            .collect();
+        Schedule { sigmas, timesteps }
+    }
+
+    fn assert_step_grids(video: &Schedule, audio: &Schedule) -> Result<()> {
+        let flow = hyperflow_steps(6)?;
+        ensure!(
+            flow.len() == 6 && video.sigmas.len() == 7 && audio.sigmas.len() == 7,
+            "step grid extent"
+        );
+        for (k, step) in flow.iter().enumerate() {
+            ensure!(
+                video.timesteps[k].to_bits() == step.video_t.to_bits()
+                    && (1.0 - video.sigmas[k + 1]).to_bits() == step.video_r.to_bits(),
+                "video grid step {k} differs from hyperflow_steps"
+            );
+            ensure!(
+                audio.timesteps[k].to_bits() == step.audio_t.to_bits()
+                    && (1.0 - audio.sigmas[k + 1]).to_bits() == step.audio_r.to_bits(),
+                "audio grid step {k} differs from hyperflow_steps"
+            );
+            ensure!(
+                video.sigmas[k] != 0.0 && audio.sigmas[k] != 0.0,
+                "evaluation sigma {k} is zero"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hyperflow_step_grid_matches_hyperflow_steps() -> Result<()> {
+        assert_step_grids(&step_grid(12.0), &step_grid(3.0))
+    }
+
+    const STEP_TEXT: usize = 7;
+    const STEP_KEY: usize = 17;
+    const STEP_AUDIO: usize = 40;
+    const STEP_GENERATED: usize = 936;
+    const STEP_VIDEO: usize = STEP_KEY + STEP_GENERATED;
+    const STEP_ROWS: usize = STEP_TEXT + STEP_KEY + STEP_AUDIO + STEP_GENERATED;
+    const STEP_VIDEO_WIDTH: usize = 96;
+    const STEP_AUDIO_WIDTH: usize = 32;
+
+    fn step_layout() -> PackedLayout {
+        let audio_start = STEP_TEXT + STEP_KEY;
+        let video_start = audio_start + STEP_AUDIO;
+        let mut position_ids = vec![[0.0f64; 3]; STEP_ROWS];
+        for (row, position) in position_ids.iter_mut().enumerate() {
+            for (axis, slot) in position.iter_mut().enumerate() {
+                *slot = (((row * 3 + axis) * 5 + 1) % 17) as f64;
+            }
+        }
+        let mut token_tags = vec![TEXT_TAG; STEP_TEXT];
+        token_tags.extend(std::iter::repeat_n(VIDEO_TAG, STEP_KEY));
+        token_tags.extend(std::iter::repeat_n(AUDIO_TAG, STEP_AUDIO));
+        token_tags.extend(std::iter::repeat_n(VIDEO_TAG, STEP_GENERATED));
+        let range = |start: usize, end: usize| (start as u32..end as u32).collect::<Vec<_>>();
+        let mut video_indices = range(STEP_TEXT, STEP_TEXT + STEP_KEY);
+        video_indices.extend(range(video_start, STEP_ROWS));
+        PackedLayout {
+            position_ids,
+            token_tags,
+            video_indices,
+            audio_indices: range(audio_start, video_start),
+            text_indices: range(0, STEP_TEXT),
+            condition_video_rows: STEP_KEY,
+        }
+    }
+
+    fn step_pattern(count: usize) -> Vec<f32> {
+        (0..count)
+            .map(|i| ((i * 17 + 3) % 251 % 17) as f32 - 8.0)
+            .collect()
+    }
+
+    struct StepTau {
+        name: &'static str,
+        abs: f64,
+        rmse: f64,
+        rel: f64,
+        /// True when relative RMSE is the gate and max-abs is reported.
+        relative: bool,
+    }
+
+    /// max(2 × worst pair, 1e-6) and max(2 × worst pair, 1e-7). The eps floor binds nothing.
+    const STEP_TAUS: &[StepTau] = &[
+        StepTau {
+            name: "refiner.bf16",
+            abs: 1.0,
+            rmse: 0.02525967030888548,
+            rel: 0.011894049114080173,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-0.f32",
+            abs: 1.0344287157058716,
+            rmse: 0.08480887073585625,
+            rel: 0.03737819870938896,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-0.f32",
+            abs: 1.2973367869853973,
+            rmse: 0.35147537383978655,
+            rel: 0.12659836498390653,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-0.f32",
+            abs: 0.01794123649597168,
+            rmse: 0.0014709306476793245,
+            rel: 0.00030436084823948987,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-0.f32",
+            abs: 0.08555293083190918,
+            rmse: 0.023178044608518033,
+            rel: 0.004942957125442557,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-0.f32",
+            abs: 1.0344287157058716,
+            rmse: 0.08480887073585625,
+            rel: 0.03737819870938896,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-0.f32",
+            abs: 1.2973367869853973,
+            rmse: 0.35147537383978655,
+            rel: 0.12659836498390653,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-1.f32",
+            abs: 0.6497125625610352,
+            rmse: 0.06660809516296118,
+            rel: 0.027951056617136708,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-1.f32",
+            abs: 1.6679048538208008,
+            rmse: 0.2512035030694407,
+            rel: 0.09332653380557283,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-1.f32",
+            abs: 0.04277610778808594,
+            rmse: 0.004835248490736819,
+            rel: 0.0010299083327436733,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-1.f32",
+            abs: 0.37093067169189453,
+            rmse: 0.05664436512246173,
+            rel: 0.013632521602094846,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-1.f32",
+            abs: 0.8052752614021301,
+            rmse: 0.06484987049676891,
+            rel: 0.027213244838100666,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-1.f32",
+            abs: 2.3954267501831055,
+            rmse: 0.2548296150311912,
+            rel: 0.09467369838109052,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-2.f32",
+            abs: 0.6330146789550781,
+            rmse: 0.06821279829460544,
+            rel: 0.026989072706701332,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-2.f32",
+            abs: 1.1475920677185059,
+            rmse: 0.216037983598139,
+            rel: 0.08374482569409536,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-2.f32",
+            abs: 0.14624595642089844,
+            rmse: 0.016806086510819676,
+            rel: 0.003968390152038171,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-2.f32",
+            abs: 0.5485353469848633,
+            rmse: 0.08862821877285647,
+            rel: 0.027361272251040947,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-2.f32",
+            abs: 0.6307210922241211,
+            rmse: 0.06718731531069264,
+            rel: 0.026583330155387518,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-2.f32",
+            abs: 0.8542909622192383,
+            rmse: 0.185065455100368,
+            rel: 0.07173865457015058,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-3.f32",
+            abs: 1.0802555084228516,
+            rmse: 0.08557588311113899,
+            rel: 0.03679224202385931,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-3.f32",
+            abs: 1.540313720703125,
+            rmse: 0.2872992311398981,
+            rel: 0.1336442409171142,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-3.f32",
+            abs: 0.277801513671875,
+            rmse: 0.028397494333519183,
+            rel: 0.007408600318011723,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-3.f32",
+            abs: 0.5863490104675293,
+            rmse: 0.10182856943460111,
+            rel: 0.03549959772912339,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-3.f32",
+            abs: 0.9124784469604492,
+            rmse: 0.08180765830905622,
+            rel: 0.03517214260007093,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-3.f32",
+            abs: 1.3214263319969177,
+            rmse: 0.27508126771898883,
+            rel: 0.12796075739207344,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-4.f32",
+            abs: 0.9622354507446289,
+            rmse: 0.08843276977313971,
+            rel: 0.04125339004308106,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-4.f32",
+            abs: 1.509389877319336,
+            rmse: 0.2899731406880125,
+            rel: 0.14560669844538246,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-4.f32",
+            abs: 0.3898341655731201,
+            rmse: 0.032307474598488914,
+            rel: 0.008911228870711975,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-4.f32",
+            abs: 0.5971055030822754,
+            rmse: 0.10068899567672909,
+            rel: 0.03682861818829619,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-4.f32",
+            abs: 0.9593095779418945,
+            rmse: 0.08518561480349118,
+            rel: 0.03973861050109811,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-4.f32",
+            abs: 1.9413082599639893,
+            rmse: 0.3236822992442777,
+            rel: 0.16253336714684885,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-5.f32",
+            abs: 1.1887826919555664,
+            rmse: 0.0944259072454749,
+            rel: 0.043959013882068826,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-5.f32",
+            abs: 1.9153492450714111,
+            rmse: 0.39024225987989564,
+            rel: 0.19295143171868911,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-5.f32",
+            abs: 0.34001898765563965,
+            rmse: 0.032920431940877466,
+            rel: 0.00937076536622547,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-5.f32",
+            abs: 0.5137481689453125,
+            rmse: 0.09958590270065194,
+            rel: 0.037359167926177196,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-5.f32",
+            abs: 1.1486835479736328,
+            rmse: 0.0967375876840172,
+            rel: 0.04503519303091845,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-5.f32",
+            abs: 2.3399438858032227,
+            rmse: 0.41770544253584774,
+            rel: 0.20653033118141956,
+            relative: true,
+        },
+    ];
+
+    fn step_tau(name: &str) -> Result<&'static StepTau> {
+        STEP_TAUS
+            .iter()
+            .find(|tau| tau.name == name)
+            .with_context(|| format!("no tau for {name}"))
+    }
+
+    type StepF32 = BTreeMap<String, Vec<f32>>;
+
+    fn step_references(dir: &Path, hidden: usize) -> Result<(Vec<bf16>, StepF32)> {
+        let mut saved = BTreeMap::new();
+        let mut refiner = None;
+        for tau in STEP_TAUS {
+            if tau.name.ends_with(".bf16") {
+                refiner = Some(read_bf16(&dir.join(tau.name), STEP_TEXT * hidden)?);
+            } else {
+                let elements = if tau.name.contains("video") {
+                    STEP_GENERATED * STEP_VIDEO_WIDTH
+                } else {
+                    STEP_AUDIO * STEP_AUDIO_WIDTH
+                };
+                saved.insert(
+                    tau.name.to_owned(),
+                    read_f32(&dir.join(tau.name), elements)?,
+                );
+            }
+        }
+        Ok((refiner.context("refiner fixture")?, saved))
+    }
+
+    fn record_step(
+        arm: &str,
+        tau: &'static StepTau,
+        candidate: &[f64],
+        reference: &[f64],
+        scored: &mut Vec<&'static str>,
+        defects: &mut Vec<&'static str>,
+    ) -> Result<()> {
+        let (abs, rmse) = max_rmse(candidate, reference)?;
+        let square: f64 = reference.iter().map(|value| value * value).sum();
+        let rms = (square / reference.len() as f64).sqrt();
+        ensure!(rms.is_finite() && rms > 0.0, "{} reference rms", tau.name);
+        let rel = rmse / rms;
+        let pass = if tau.relative {
+            rel <= tau.rel
+        } else {
+            abs <= tau.abs && rmse <= tau.rmse
+        };
+        let gate = if tau.relative {
+            "relative-RMSE"
+        } else {
+            "max-abs+RMSE"
+        };
+        println!(
+            "HYPERFLOW_STEP arm={arm} cell={} max_abs={abs:.16e} rmse={rmse:.16e} rel={rel:.16e} tau_abs={:.16e} tau_rmse={:.16e} tau_rel={:.16e} gate={gate} {}",
+            tau.name,
+            tau.abs,
+            tau.rmse,
+            tau.rel,
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        scored.push(tau.name);
+        if !pass {
+            defects.push(tau.name);
+        }
+        Ok(())
+    }
+
+    fn score_f32(
+        arm: &str,
+        name: &str,
+        candidate: &[f32],
+        saved: &StepF32,
+        scored: &mut Vec<&'static str>,
+        defects: &mut Vec<&'static str>,
+    ) -> Result<()> {
+        let tau = step_tau(name)?;
+        let reference = saved.get(name).with_context(|| format!("saved {name}"))?;
+        record_step(
+            arm,
+            tau,
+            &f64_of_f32(candidate),
+            &f64_of_f32(reference),
+            scored,
+            defects,
+        )
+        .with_context(|| name.to_string())
+    }
+
+    fn note_refiner(seen: &mut Option<Vec<u16>>, now: &[bf16], label: &str) -> Result<()> {
+        ensure!(
+            now.iter().all(|value| value.to_f32().is_finite()),
+            "{label} refiner is non-finite"
+        );
+        let bits: Vec<u16> = now.iter().map(|value| value.to_bits()).collect();
+        if let Some(first) = seen {
+            ensure!(bits == *first, "{label} refiner changed");
+        } else {
+            *seen = Some(bits);
+        }
+        Ok(())
+    }
+
+    /// Refiner rows and six free and teacher-forced steps at the frozen pair taus. A numeric miss returns Err.
+    #[test]
+    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_STEP_REF"]
+    fn hyperflow_step_cells_match_the_definition() -> Result<()> {
+        let model = env_dir("FF_HYPERFLOW_MODEL")?;
+        let reference = env_dir("FF_HYPERFLOW_STEP_REF")?;
+        let arm = reference
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("reference arm name")?
+            .to_owned();
+        let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+            model.join("config.json"),
+        )?)?)?;
+        ensure!(spec.is_hyperflow()?, "transformer config is not HyperFlow");
+        ensure!(
+            spec.hidden == 5376
+                && spec.text_dim == 5120
+                && spec.video_row_width() == STEP_VIDEO_WIDTH
+                && spec.audio_in_channels == STEP_AUDIO_WIDTH,
+            "config shape hidden {} text {} video width {} audio width {}",
+            spec.hidden,
+            spec.text_dim,
+            spec.video_row_width(),
+            spec.audio_in_channels
+        );
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(reference.join("meta.json"))?)?;
+        ensure!(
+            meta["candidate_run"].as_bool() == Some(false),
+            "reference arm is marked as a candidate run"
+        );
+        ensure!(
+            meta["rows"].as_u64() == Some(u64::try_from(STEP_ROWS)?)
+                && meta["video_rows"].as_u64() == Some(u64::try_from(STEP_VIDEO)?)
+                && meta["teacher_from"].as_bool() == Some(true),
+            "reference meta rows"
+        );
+        let layout = step_layout();
+        ensure!(
+            layout.rows() == STEP_ROWS
+                && layout.video_indices.len() == STEP_VIDEO
+                && layout.audio_indices.len() == STEP_AUDIO
+                && layout.text_indices.len() == STEP_TEXT
+                && layout.condition_video_rows == STEP_KEY,
+            "pack layout"
+        );
+        let video_grid = step_grid(12.0);
+        let audio_grid = step_grid(3.0);
+        assert_step_grids(&video_grid, &audio_grid)?;
+        let flow = hyperflow_steps(6)?;
+        let row_plan: Vec<RowTimesteps> = flow
+            .iter()
+            .map(|step| RowTimesteps::hyperflow(&layout, step))
+            .collect();
+        let plan = AdalnPlan::build(&layout, &row_plan)?;
+        ensure!(
+            plan.row_pairs.len() == 6
+                && plan.row_timesteps.len() == 6
+                && plan
+                    .row_pairs
+                    .iter()
+                    .chain(&plan.row_timesteps)
+                    .all(|row| row.len() == STEP_ROWS),
+            "adaln plan extent"
+        );
+        let (refiner_ref, saved) = step_references(&reference, spec.hidden)?;
+        let manifest = MappedCheckpoint::open_component(&model, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-hyperflow-step-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let _runtime = BlockRuntime(runtime.clone());
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "HyperFlow step cells".into())),
+        )?;
+        let table = AdalnTable::build(&device, &mut blas, &model, &manifest, &spec, &plan)?;
+        let mut dit = Dit::new(
+            &device,
+            &mut blas,
+            &spec,
+            (0, &layout),
+            Source::new(&model, &manifest),
+            Source::new(&model, &manifest),
+            Placement::Derived,
+        )?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+        let counts = (
+            u32::try_from(plan.pairs.len())?,
+            u32::try_from(plan.timesteps.len())?,
+        );
+        let video_count = STEP_VIDEO * STEP_VIDEO_WIDTH;
+        let audio_count = STEP_AUDIO * STEP_AUDIO_WIDTH;
+        let text_count = STEP_TEXT * spec.text_dim;
+        let blob = step_pattern(video_count + audio_count + text_count);
+        let video_host = blob[..video_count].to_vec();
+        let audio_init = blob[video_count..video_count + audio_count].to_vec();
+        let text_host: Vec<bf16> = blob[video_count + audio_count..]
+            .iter()
+            .copied()
+            .map(bf16::from_f32)
+            .collect();
+        let key_elems = STEP_KEY * STEP_VIDEO_WIDTH;
+        let generated_elems = STEP_GENERATED * STEP_VIDEO_WIDTH;
+        let text = s.clone_htod(&text_host)?;
+        let video = s.clone_htod(&video_host)?;
+        let audio = s.clone_htod(&audio_init)?;
+        let mut refiner_seen = None;
+        let mut scored = Vec::new();
+        let mut defects = Vec::new();
+        for k in 0..6 {
+            let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
+            let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
+            dit.step(
+                &context,
+                &table,
+                counts,
+                &StepInputs {
+                    video: &video,
+                    audio: &audio,
+                    text: &text,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            let refiner = s.clone_dtoh(&dit.text)?;
+            ensure!(
+                refiner.len() == STEP_TEXT * spec.hidden,
+                "free step {k} refiner extent"
+            );
+            note_refiner(&mut refiner_seen, &refiner, &format!("free step {k}"))?;
+            if k == 0 {
+                record_step(
+                    &arm,
+                    step_tau("refiner.bf16")?,
+                    &f64_of_bf16(&refiner),
+                    &f64_of_bf16(&refiner_ref),
+                    &mut scored,
+                    &mut defects,
+                )?;
+            }
+            let vel_video = s.clone_dtoh(&dit.video)?;
+            let vel_audio = s.clone_dtoh(&dit.audio)?;
+            score_f32(
+                &arm,
+                &format!("vel-video-{k}.f32"),
+                &vel_video,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            score_f32(
+                &arm,
+                &format!("vel-audio-{k}.f32"),
+                &vel_audio,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            dit.euler(
+                s,
+                (&video, key_elems, generated_elems),
+                &dit.video,
+                &video_grid,
+                k,
+            )?;
+            dit.euler(s, (&audio, 0, audio_count), &dit.audio, &audio_grid, k)?;
+            let video_now = s.clone_dtoh(&video)?;
+            let audio_now = s.clone_dtoh(&audio)?;
+            ensure!(
+                video_now.len() == video_host.len()
+                    && video_now[..key_elems]
+                        .iter()
+                        .zip(&video_host[..key_elems])
+                        .all(|(got, want)| got.to_bits() == want.to_bits()),
+                "free step {k} keyframe changed"
+            );
+            score_f32(
+                &arm,
+                &format!("lat-video-{k}.f32"),
+                &video_now[key_elems..],
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            score_f32(
+                &arm,
+                &format!("lat-audio-{k}.f32"),
+                &audio_now,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+        }
+        for k in 0..6 {
+            let generated = if k == 0 {
+                video_host[key_elems..].to_vec()
+            } else {
+                saved
+                    .get(&format!("lat-video-{}.f32", k - 1))
+                    .with_context(|| format!("teacher video latent {}", k - 1))?
+                    .clone()
+            };
+            let audio_in = if k == 0 {
+                audio_init.clone()
+            } else {
+                saved
+                    .get(&format!("lat-audio-{}.f32", k - 1))
+                    .with_context(|| format!("teacher audio latent {}", k - 1))?
+                    .clone()
+            };
+            let mut packed = video_host[..key_elems].to_vec();
+            packed.extend(generated);
+            let video_k = s.clone_htod(&packed)?;
+            let audio_k = s.clone_htod(&audio_in)?;
+            let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
+            let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
+            dit.step(
+                &context,
+                &table,
+                counts,
+                &StepInputs {
+                    video: &video_k,
+                    audio: &audio_k,
+                    text: &text,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            let refiner = s.clone_dtoh(&dit.text)?;
+            note_refiner(&mut refiner_seen, &refiner, &format!("teacher step {k}"))?;
+            let vel_video = s.clone_dtoh(&dit.video)?;
+            let vel_audio = s.clone_dtoh(&dit.audio)?;
+            score_f32(
+                &arm,
+                &format!("teacher-vel-video-{k}.f32"),
+                &vel_video,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            score_f32(
+                &arm,
+                &format!("teacher-vel-audio-{k}.f32"),
+                &vel_audio,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+        }
+        ensure!(
+            scored.len() == STEP_TAUS.len()
+                && STEP_TAUS.iter().all(|tau| scored.contains(&tau.name)),
+            "scored {} of {}",
+            scored.len(),
+            STEP_TAUS.len()
+        );
+        if defects.is_empty() {
+            println!("HYPERFLOW_STEP_GATE PASS cells={}", STEP_TAUS.len());
+            Ok(())
+        } else {
+            println!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}");
+            bail!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}")
+        }
     }
 }
