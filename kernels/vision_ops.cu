@@ -1326,6 +1326,21 @@ extern "C" __global__ void concat_rows_f16(const __half* first, const __half* se
     }
 }
 
+extern "C" __global__ void indexed_concat_rows_f16(const __half* first, const __half* second,
+    const uint32_t* index, __half* output, uint32_t rows, uint32_t parents,
+    uint32_t first_width, uint32_t second_width) {
+    if (!vision_flat_launch() || !first || !second || !index || !output || !rows ||
+        !parents || !first_width || !second_width) { __trap(); return; }
+    const uint64_t width = uint64_t(first_width) + second_width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * width;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t r = index[i / width], c = i % width;
+        if (r >= parents) { __trap(); return; }
+        output[i] = c < first_width ? first[r * first_width + c]
+                                   : second[r * second_width + c - first_width];
+    }
+}
+
 extern "C" __global__ void concat_rows_broadcast_f32(const float* first, const float* second,
     float* output, uint32_t rows, uint32_t first_width, uint32_t second_width) {
     if (!vision_flat_launch() || !first || !second || !output || !rows ||
