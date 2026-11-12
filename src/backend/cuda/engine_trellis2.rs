@@ -2111,11 +2111,17 @@ mod tests {
                 .filter_map(|v| v.as_f64().map(|v| v as f32))
                 .collect();
             let channels = noise.len() / sites.len();
-            let slat = normalize_slat(&previous, &mean, &std);
+            // The frozen normalization taus price the affine arithmetic on
+            // the captured state12 (every floor arm recomputed the affine
+            // from the same stored tensor), not the sampler replay residual,
+            // which the state cells score separately.
+            let stored_state =
+                read_tensor(&dir.join("sampler-output.safetensors"), "state12.features")?;
+            let slat = normalize_slat(&stored_state, &mean, &std);
             let reference = read_tensor(&dir.join("stage-output.safetensors"), "slat.features")?;
             let mut omitted = slat.clone();
             for row in 0..sites.len() {
-                omitted[row * channels] = previous[row * channels];
+                omitted[row * channels] = stored_state[row * channels];
             }
             let id = format!("normalization/{name}-r0a");
             let (tau_max, tau_rmse) = tau_of(&id)?;
