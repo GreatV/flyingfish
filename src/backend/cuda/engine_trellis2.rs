@@ -176,11 +176,8 @@ impl TrellisSsFlow {
             "flow config differs from the published DIT family"
         );
         ensure!(
-            !sites.is_empty()
-                && sites
-                    .iter()
-                    .all(|c| c.iter().all(|&v| v >= 0 && (v as usize) < spec.resolution)),
-            "flow sites outside the config resolution"
+            !sites.is_empty() && sites.iter().all(|c| c.iter().all(|&v| v >= 0)),
+            "flow sites must be non-negative"
         );
         device.finish_upload()?;
         let (free_before, total) = device.ctx.mem_get_info()?;
