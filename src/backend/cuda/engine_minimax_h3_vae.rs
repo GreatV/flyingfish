@@ -11,7 +11,7 @@ use crate::backend::cuda::{
     verification::Shape,
 };
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
 };
 use crate::checkpoint::TensorManifest;
 use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, VaeSpec, VaeTiles};
@@ -875,6 +875,95 @@ pub(super) fn decode_image_device(
     decoder.run(&device.stream, blas, work, latent, |_, _, _, _| Ok(()))
 }
 
+/// F32 RGB `[height,width,3]` and F32 posterior noise `[1,24,height/16,width/16]` to cropped normalized latents.
+pub(super) fn encode_image_device(
+    device: &Device,
+    blas: &Blas,
+    model: &Path,
+    rgb: &CudaSlice<f32>,
+    extent: [usize; 2],
+    epsilon: &CudaSlice<f32>,
+) -> Result<(CudaSlice<f32>, [usize; 2])> {
+    let component = model.join("vae_diffusers");
+    let published = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
+        &std::fs::read(component.join("config.json"))?,
+    )?)?;
+    let spec = published.single_frame();
+    let shape = image_encode_shape(&spec, extent, rgb.len(), epsilon.len())?;
+    let checkpoint =
+        crate::checkpoint::MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
+    let manifest = checkpoint.minimax_h3_image_vae_manifest(&published)?;
+    let encoder = KeyframeEncoder::load(device, &spec, &component, &manifest, true)?;
+    let tiles = VaeTiles::released(&spec, shape.0[0], shape.0[1])?;
+    let (free, total) = device.ctx.mem_get_info()?;
+    let budget = device.workspace_budget(free, free, total / 16)?;
+    let future = image_encode_future(&spec, &tiles, shape.0, shape.1)?;
+    let mut work = EncodeWork::with_budget(
+        &device.stream,
+        &encoder,
+        (tiles.height, tiles.width),
+        budget
+            .checked_sub(future)
+            .context("image encoder budget holds no frame buffers")?,
+    )?;
+    let [_, _, latents] = encoder.encode_frame(
+        (&device.stream, blas),
+        &mut work,
+        &tiles,
+        (rgb, extent[0], extent[1]),
+        epsilon,
+        shape.0,
+    )?;
+    Ok((latents, shape.1))
+}
+
+fn image_encode_shape(
+    spec: &VaeSpec,
+    extent: [usize; 2],
+    rgb: usize,
+    noise: usize,
+) -> Result<([usize; 2], [usize; 2])> {
+    let r = spec.spatial_ratio;
+    ensure!(
+        extent.into_iter().all(|n| n <= u32::MAX as usize),
+        "image encoder extent exceeds kernel indices"
+    );
+    let input = extent[0]
+        .checked_mul(extent[1])
+        .and_then(|n| n.checked_mul(spec.in_channels))
+        .context("image encoder RGB extent overflow")?;
+    let latent = [extent[0] / r, extent[1] / r];
+    let expected = latent[0]
+        .checked_mul(latent[1])
+        .and_then(|n| n.checked_mul(spec.latent_channels))
+        .context("image encoder posterior extent overflow")?;
+    let output = latent.map(|n| n / 2 * 2);
+    ensure!(
+        output.into_iter().all(|n| n > 0) && input == rgb && expected == noise,
+        "image encoder RGB/posterior shapes differ: {extent:?}, RGB{rgb}/{input}, epsilon{noise}/{expected}"
+    );
+    Ok((latent.map(|n| n * r), output))
+}
+
+fn image_encode_future(
+    spec: &VaeSpec,
+    tiles: &VaeTiles,
+    canvas: [usize; 2],
+    output: [usize; 2],
+) -> Result<usize> {
+    let c = spec.latent_channels as u128;
+    let plane = (canvas[0] / spec.spatial_ratio) as u128 * (canvas[1] / spec.spatial_ratio) as u128;
+    let tile_plane =
+        (tiles.height / spec.spatial_ratio) as u128 * (tiles.width / spec.spatial_ratio) as u128;
+    let grid = (2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2) as u128;
+    Ok(usize::try_from(
+        4 * (grid
+            + tiles.count() as u128 * 2 * c * tile_plane
+            + 4 * c * plane
+            + c * output[0] as u128 * output[1] as u128),
+    )?)
+}
+
 #[cfg(test)]
 mod image_tests {
     use super::*;
@@ -890,6 +979,23 @@ mod image_tests {
             ))?)?
             .single_frame(),
         )
+    }
+
+    #[test]
+    fn image_encoder_shapes_keep_noise_before_patch_crop() -> Result<()> {
+        let spec = geometry()?;
+        assert_eq!(
+            image_encode_shape(&spec, [270, 286], 270 * 286 * 3, 24 * 16 * 17)?,
+            ([256, 272], [16, 16])
+        );
+        assert!(image_encode_shape(&spec, [270, 286], 270 * 286 * 3, 24 * 16 * 16).is_err());
+        assert_eq!(
+            image_encode_shape(&spec, [32, 32], 32 * 32 * 3, 24 * 2 * 2)?,
+            ([32, 32], [2, 2])
+        );
+        assert!(image_encode_shape(&spec, [31, 32], 31 * 32 * 3, 24 * 2).is_err());
+        assert!(image_encode_shape(&spec, [usize::MAX, 32], 0, 0).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1258,6 +1364,325 @@ mod image_tests {
         let runtime = std::env::temp_dir().join(format!("ff-image-vae-{}", std::process::id()));
         fs::create_dir(&runtime)?;
         let result = reference_gate(&root, &model, &runtime, &capture);
+        fs::remove_dir_all(&runtime)?;
+        result
+    }
+
+    fn encoder_layouts(device: &Device, encoder: &KeyframeEncoder) -> Result<usize> {
+        let s = &device.stream;
+        let rgb: Vec<f32> = (0..60).map(|i| ((i * 37) % 251) as f32 / 8.0).collect();
+        let pixels = s.clone_htod(&rgb)?;
+        let norm = s.clone_htod(&vec![-12345.5f32; 18 + 64])?;
+        let plane = 16 * 17;
+        let count = 24 * plane;
+        let moments = s.clone_htod(&vec![0f32; 2 * count])?;
+        let noise: Vec<f32> = (0..count)
+            .map(|i| ((i * 37) % 251) as f32 / 137.0 - 1.0)
+            .collect();
+        let eps = s.clone_htod(&noise)?;
+        let mean = s.clone_htod(&vec![-12345.5f32; count + 64])?;
+        let std = s.clone_htod(&vec![-12345.5f32; count + 64])?;
+        let latent = s.clone_htod(&vec![-12345.5f32; 24 * 256 + 64])?;
+        let launch = || -> Result<()> {
+            unsafe {
+                s.launch_builder(&encoder.kernels.pixels)
+                    .arg(&pointer(&pixels, s))
+                    .arg(&pointer(&encoder.pixel_table, s))
+                    .arg(&(pointer(&norm, s) + 128))
+                    .arg(&3u32)
+                    .arg(&4u32)
+                    .arg(&5u32)
+                    .arg(&1u32)
+                    .arg(&1u32)
+                    .arg(&2u32)
+                    .arg(&3u32)
+                    .launch(flat(18))?;
+                s.launch_builder(&encoder.kernels.posterior)
+                    .arg(&pointer(&moments, s))
+                    .arg(&pointer(&eps, s))
+                    .arg(&pointer(&encoder.latent_table, s))
+                    .arg(&(pointer(&mean, s) + 128))
+                    .arg(&(pointer(&std, s) + 128))
+                    .arg(&(pointer(&latent, s) + 128))
+                    .arg(&24u32)
+                    .arg(&16u32)
+                    .arg(&17u32)
+                    .arg(&16u32)
+                    .arg(&16u32)
+                    .launch(flat(count))?;
+            }
+            Ok(())
+        };
+        launch()?;
+        let eager = [&norm, &mean, &std, &latent]
+            .into_iter()
+            .map(|b| s.clone_dtoh(b))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for values in &eager {
+            ensure!(
+                values.iter().all(|v| v.is_finite()),
+                "RUNNER_FAIL encoder layout nonfinite"
+            );
+            ensure!(
+                values[..32]
+                    .iter()
+                    .chain(&values[values.len() - 32..])
+                    .all(|v| *v == -12345.5),
+                "RUNNER_FAIL encoder layout guard overwritten"
+            );
+        }
+        let mut fractional_bits = 0usize;
+        for y in 0..2 {
+            for x in 0..3 {
+                for c in 0..3 {
+                    let v = rgb[((y + 1) * 5 + x + 1) * 3 + c] * (1f32 / 255.0);
+                    let expected = (v - VAE_PIXEL_MEAN[c] as f32) / VAE_PIXEL_STD[c] as f32;
+                    fractional_bits += (eager[0][32 + (y * 3 + x) * 3 + c].to_bits()
+                        ^ expected.to_bits())
+                    .count_ones() as usize;
+                }
+            }
+        }
+        let moment_errors = eager[1][32..32 + count]
+            .iter()
+            .filter(|v| **v != 0.0)
+            .count()
+            + eager[2][32..32 + count]
+                .iter()
+                .filter(|v| **v != 1.0)
+                .count();
+        let mut crop_bits = 0usize;
+        for c in 0..24 {
+            for y in 0..16 {
+                for x in 0..16 {
+                    let rounded = half::f16::from_f32(noise[(c * 16 + y) * 17 + x]).to_f32();
+                    let expected =
+                        (rounded - encoder.spec.latents_mean[c]) / encoder.spec.latents_std[c];
+                    crop_bits += (eager[3][32 + (c * 16 + y) * 16 + x].to_bits()
+                        ^ expected.to_bits())
+                    .count_ones() as usize;
+                }
+            }
+        }
+        s.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        let launched = launch();
+        let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+        launched?;
+        graph?
+            .context("RUNNER_FAIL encoder layout graph empty")?
+            .launch()?;
+        let mut graph_bits = 0usize;
+        for (buffer, before) in [&norm, &mean, &std, &latent].into_iter().zip(eager) {
+            let after = s.clone_dtoh(buffer)?;
+            ensure!(
+                after.iter().all(|v| v.is_finite()),
+                "RUNNER_FAIL encoder layout graph nonfinite"
+            );
+            graph_bits += after
+                .iter()
+                .zip(before)
+                .map(|(a, b)| (a.to_bits() ^ b.to_bits()).count_ones() as usize)
+                .sum::<usize>();
+        }
+        let defects = [fractional_bits, moment_errors, crop_bits, graph_bits]
+            .into_iter()
+            .filter(|v| *v != 0)
+            .count();
+        println!(
+            "{} IMAGE_VAE_ENCODER_LAYOUTS exports=2 fractional_rgb_bits={fractional_bits} mean_std_bad_values={moment_errors} posterior_crop_bits={crop_bits} graph_eager_bits={graph_bits} guards=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        Ok(defects)
+    }
+
+    fn encoder_reference_gate(
+        root: &Path,
+        model: &Path,
+        runtime: &Path,
+        capture: &Path,
+    ) -> Result<()> {
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        let spec = geometry()?;
+        let component = model.join("vae_diffusers");
+        let published = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
+            &fs::read(component.join("config.json"))?,
+        )?)?;
+        ensure!(
+            published.single_frame() == spec,
+            "RUNNER_FAIL encoder published geometry differs"
+        );
+        let checkpoint = MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
+        let manifest = checkpoint.minimax_h3_image_vae_manifest(&published)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            runtime,
+            Rc::new(Closure::new(true, "image VAE encoder gate".into())),
+        )?;
+        let encoder = KeyframeEncoder::load(&device, &spec, &component, &manifest, true)?;
+        let s = &device.stream;
+        let sm = device
+            .ctx
+            .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?
+            * 10
+            + device
+                .ctx
+                .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        ensure!(
+            [86, 89].contains(&sm),
+            "RUNNER_FAIL encoder reference missing for sm{sm}"
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("FROZEN_ENCODER_FLOORS.json"))?)?;
+        let mut defects = encoder_layouts(&device, &encoder)?;
+        let mut cells = 0;
+        for (name, extent) in [
+            ("edit0", [1536, 1024]),
+            ("edit1", [1536, 1024]),
+            ("crop", [270, 286]),
+            ("landscape0", [1024, 1536]),
+            ("landscape1", [1024, 1536]),
+        ] {
+            let input_bytes =
+                fs::read(root.join(format!("encoder-inputs/encode-{name}.safetensors")))?;
+            let input = SafeTensors::deserialize(&input_bytes)?;
+            ensure!(
+                input.tensor("rgb")?.shape() == [extent[0], extent[1], 3],
+                "RUNNER_FAIL encoder RGB fixture shape"
+            );
+            let rgb = tensor(&input, "rgb")?;
+            let noise = tensor(&input, "epsilon")?;
+            let shape = image_encode_shape(&spec, extent, rgb.len(), noise.len())?;
+            let pixels = s.clone_htod(&rgb)?;
+            let eps = s.clone_htod(&noise)?;
+            let tiles = VaeTiles::released(&spec, shape.0[0], shape.0[1])?;
+            let expected_bytes = fs::read(root.join(format!(
+                "reference-sm{sm}-cudnn/output/encode-{name}-canonical0.safetensors"
+            )))?;
+            let expected = SafeTensors::deserialize(&expected_bytes)?;
+            for low in [false, true] {
+                let (free, total) = device.ctx.mem_get_info()?;
+                let available = device
+                    .workspace_budget(free, free, total / 16)?
+                    .checked_sub(image_encode_future(&spec, &tiles, shape.0, shape.1)?)
+                    .context("RUNNER_FAIL encoder future memory budget")?;
+                let budget = if low {
+                    available.min(167_772_160 + (64 << 20))
+                } else {
+                    available
+                };
+                let mut work =
+                    EncodeWork::with_budget(s, &encoder, (tiles.height, tiles.width), budget)?;
+                ensure!(
+                    !low || work.columns.len() * 4 <= 64 << 20,
+                    "RUNNER_FAIL low encoder budget not forced"
+                );
+                ensure!(
+                    EncodeWork::with_budget(
+                        s,
+                        &encoder,
+                        (tiles.height, tiles.width),
+                        5 * work.x.len() * 4 - 1
+                    )
+                    .is_err(),
+                    "RUNNER_FAIL encoder accepted insufficient activation budget"
+                );
+                let outputs = encoder.encode_frame(
+                    (s, &blas),
+                    &mut work,
+                    &tiles,
+                    (&pixels, extent[0], extent[1]),
+                    &eps,
+                    shape.0,
+                )?;
+                let mut taps = BTreeMap::new();
+                for (role, buffer) in ["mean", "std", "normalized_latent"]
+                    .into_iter()
+                    .zip(&outputs)
+                {
+                    let actual = s.clone_dtoh(buffer)?;
+                    defects += usize::from(score(
+                        &format!("encoder case={name} low={low} boundary={role}"),
+                        &actual,
+                        &tensor(&expected, role)?,
+                        &frozen["cases"][name][role],
+                    )?);
+                    cells += 1;
+                    taps.insert(role.to_owned(), actual);
+                }
+                save_taps(
+                    &capture.join(format!(
+                        "encoder-{name}-{low}-{}.safetensors",
+                        std::process::id()
+                    )),
+                    &taps,
+                    &expected,
+                )?;
+                println!(
+                    "IMAGE_VAE_ENCODER_PLAN case={name} low={low} tiles={} column_bytes={} output={:?}",
+                    tiles.count(),
+                    4 * work.columns.len(),
+                    shape.1
+                );
+            }
+            if name == "edit0" {
+                let eps = s.clone_htod(&vec![0f32; noise.len()])?;
+                let (free, total) = device.ctx.mem_get_info()?;
+                let budget = device
+                    .workspace_budget(free, free, total / 16)?
+                    .checked_sub(image_encode_future(&spec, &tiles, shape.0, shape.1)?)
+                    .context("RUNNER_FAIL control budget")?;
+                let mut work =
+                    EncodeWork::with_budget(s, &encoder, (tiles.height, tiles.width), budget)?;
+                let [_, _, out] = encoder.encode_frame(
+                    (s, &blas),
+                    &mut work,
+                    &tiles,
+                    (&pixels, extent[0], extent[1]),
+                    &eps,
+                    shape.0,
+                )?;
+                let detected = score(
+                    "encoder control=posterior_mode",
+                    &s.clone_dtoh(&out)?,
+                    &tensor(&expected, "normalized_latent")?,
+                    &frozen["cases"][name]["normalized_latent"],
+                )?;
+                ensure!(detected, "RUNNER_FAIL posterior-mode control not detected");
+                println!("IMAGE_VAE_ENCODER_CONTROL posterior_mode_detected=true status=PASS");
+            }
+        }
+        println!(
+            "{} IMAGE_VAE_ENCODER cells={cells} modes=2 control=FAIL_AS_REQUIRED defects={defects}",
+            if defects == 0 { "PASS" } else { "FAIL" }
+        );
+        ensure!(
+            defects == 0,
+            "image VAE encoder has {defects} finite numerical defects"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_S0 encoder references, FF_H3_CAPTURE output"]
+    fn image_encoder_matches_the_frozen_reference() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let root = path("FF_H3_S0")?;
+        let model = path("FF_MODEL")?;
+        let capture = path("FF_H3_CAPTURE")?;
+        fs::create_dir_all(&capture)?;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-image-vae-encoder-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = encoder_reference_gate(&root, &model, &runtime, &capture);
         fs::remove_dir_all(&runtime)?;
         result
     }
@@ -3469,9 +3894,10 @@ struct EncoderKernels {
     posterior: CudaFunction,
 }
 
-/// The video VAE encoder side (encoder and quant_conv), F32 and resident, for single keyframes.
+/// Image/video encoder and quant_conv weights, F32 and resident, for single frames.
 pub(crate) struct KeyframeEncoder {
     spec: VaeSpec,
+    image: bool,
     conv_in: Conv,
     levels: Vec<EncoderLevel>,
     norm_out: GroupNorm,
@@ -3483,7 +3909,7 @@ pub(crate) struct KeyframeEncoder {
     kernels: EncoderKernels,
 }
 
-/// Device `[mean, std, latents]` of one encoded keyframe, each `[latent_channels, height, width]` F32.
+/// F32 mean/std at the posterior extent and normalized latents at the output extent, channel-major.
 pub(crate) type KeyframeLatents = [CudaSlice<f32>; 3];
 
 impl KeyframeEncoder {
@@ -3493,8 +3919,34 @@ impl KeyframeEncoder {
         vae_dir: &Path,
         manifest: &TensorManifest,
     ) -> Result<Self> {
+        Self::load(d, spec, vae_dir, manifest, false)
+    }
+
+    fn load(
+        d: &Device,
+        spec: &VaeSpec,
+        vae_dir: &Path,
+        manifest: &TensorManifest,
+        image: bool,
+    ) -> Result<Self> {
         let s = &d.stream;
         let (free, total) = d.ctx.mem_get_info()?;
+        let expected: std::collections::BTreeSet<_> = manifest
+            .entries
+            .keys()
+            .filter(|name| name.starts_with("encoder.") || name.starts_with("quant_conv."))
+            .cloned()
+            .collect();
+        if image {
+            let required: usize = expected
+                .iter()
+                .map(|name| manifest.entries[name].bytes)
+                .sum();
+            ensure!(
+                required <= d.workspace_budget(free, free, total / 16)?,
+                "image VAE encoder weights need {required} bytes"
+            );
+        }
         ensure!(
             spec.in_channels == VAE_PIXEL_MEAN.len(),
             "{} input channels, pixel normalisation has {}",
@@ -3506,14 +3958,27 @@ impl KeyframeEncoder {
             im2col: vision.load_function("causal_frame_im2col_f32")?,
             group_norm: vision.load_function("group_norm_silu_f32")?,
             bias_residual: vision.load_function("bias_residual_f32")?,
-            pixels: vision.load_function("normalize_u8_window_f32")?,
+            pixels: vision.load_function(if image {
+                "normalize_hwc_window_f32"
+            } else {
+                "normalize_u8_window_f32"
+            })?,
             stitch: vision.load_function("tile_stitch_f32")?,
-            posterior: vision.load_function("gaussian_posterior_f32")?,
+            posterior: vision.load_function(if image {
+                "gaussian_posterior_crop_f32"
+            } else {
+                "gaussian_posterior_f32"
+            })?,
         };
         let mut source = Source::new(vae_dir, manifest);
         let mut bytes = 0usize;
+        let mut consumed = std::collections::BTreeSet::new();
         let load: &mut LoadF32<'_> = &mut |name: &str, elements: usize| {
             ensure!(!bf16_parameter(name), "{name} is in the BF16 set");
+            ensure!(
+                consumed.insert(name.to_owned()),
+                "duplicate encoder tensor {name}"
+            );
             bytes += 4 * elements;
             source.tensor::<f32>(s, name, elements)
         };
@@ -3555,6 +4020,10 @@ impl KeyframeEncoder {
         let norm_out = GroupNorm::load(load, "encoder.norm_out", input)?;
         let conv_out = Conv::load(load, "encoder.conv_out", (latent2, input, 3))?;
         let quant = Conv::load(load, "quant_conv", (latent2, latent2, 1))?;
+        ensure!(
+            consumed == expected,
+            "encoder partial loader tensor set differs"
+        );
         let table =
             |a: &[f64], b: &[f64]| -> Vec<f32> { a.iter().chain(b).map(|&v| v as f32).collect() };
         let pixel_table = s.clone_htod(&table(&VAE_PIXEL_MEAN, &VAE_PIXEL_STD))?;
@@ -3570,10 +4039,12 @@ impl KeyframeEncoder {
         eprintln!(
             "{}",
             serde_json::json!({"h3_vae_encoder_placement": {"mode": "resident", "weight_bytes": bytes,
+                "tensors":consumed.len(),"image":image,
                 "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
         );
         Ok(Self {
             spec: spec.clone(),
+            image,
             conv_in,
             levels,
             norm_out,
@@ -3750,11 +4221,11 @@ impl KeyframeEncoder {
 
     /// Encodes the tile at pixel `origin` of `frame` (`[in_channels, height, width]` u8) into moments slot `slot` of
     /// `moments` (`[slots, 2 * latent_channels, tile_h / r, tile_w / r]`, channel-major).
-    fn tile(
+    fn tile<T: DeviceRepr>(
         &self,
         (s, blas): (&Arc<CudaStream>, &Blas),
         w: &mut EncodeWork,
-        (frame, height, width): (&CudaSlice<u8>, usize, usize),
+        (frame, height, width): (&CudaSlice<T>, usize, usize),
         origin: (usize, usize),
         (moments, slot): (&CudaSlice<f32>, usize),
     ) -> Result<()> {
@@ -3853,6 +4324,25 @@ impl KeyframeEncoder {
         (frame, height, width): (&CudaSlice<u8>, usize, usize),
         eps: &CudaSlice<f32>,
     ) -> Result<KeyframeLatents> {
+        self.encode_frame(
+            (s, blas),
+            w,
+            tiles,
+            (frame, height, width),
+            eps,
+            [height, width],
+        )
+    }
+
+    fn encode_frame<T: DeviceRepr>(
+        &self,
+        (s, blas): (&Arc<CudaStream>, &Blas),
+        w: &mut EncodeWork,
+        tiles: &VaeTiles,
+        (frame, source_h, source_w): (&CudaSlice<T>, usize, usize),
+        eps: &CudaSlice<f32>,
+        [height, width]: [usize; 2],
+    ) -> Result<KeyframeLatents> {
         let spec = &self.spec;
         let r = spec.spatial_ratio;
         ensure!(
@@ -3860,7 +4350,9 @@ impl KeyframeEncoder {
                 && w.width == tiles.width
                 && height.is_multiple_of(r)
                 && width.is_multiple_of(r)
-                && frame.len() == spec.in_channels * height * width,
+                && height <= source_h
+                && width <= source_w
+                && frame.len() == spec.in_channels * source_h * source_w,
             "encode work {}x{} / frame {height}x{width} do not match the tile grid {}x{}",
             w.height,
             w.width,
@@ -3893,7 +4385,7 @@ impl KeyframeEncoder {
                 self.tile(
                     (s, blas),
                     w,
-                    (frame, height, width),
+                    (frame, source_h, source_w),
                     (row, col),
                     (&moments, ti * cols.0.len() + tj),
                 )?;
@@ -3917,19 +4409,45 @@ impl KeyframeEncoder {
         let out = [
             s.alloc_zeros::<f32>(latent * plane)?,
             s.alloc_zeros::<f32>(latent * plane)?,
-            s.alloc_zeros::<f32>(latent * plane)?,
+            s.alloc_zeros::<f32>(
+                latent
+                    * if self.image {
+                        (lh / 2 * 2) * (lw / 2 * 2)
+                    } else {
+                        plane
+                    },
+            )?,
         ];
         unsafe {
-            s.launch_builder(&self.kernels.posterior)
-                .arg(&pointer(&canvas, s))
-                .arg(&pointer(eps, s))
-                .arg(&pointer(&self.latent_table, s))
-                .arg(&pointer(&out[0], s))
-                .arg(&pointer(&out[1], s))
-                .arg(&pointer(&out[2], s))
-                .arg(&u32::try_from(latent)?)
-                .arg(&(plane as u64))
-                .launch(flat(latent * plane))?;
+            let pointers = [
+                pointer(&canvas, s),
+                pointer(eps, s),
+                pointer(&self.latent_table, s),
+                pointer(&out[0], s),
+                pointer(&out[1], s),
+                pointer(&out[2], s),
+            ];
+            let channels = u32::try_from(latent)?;
+            let dimensions = [
+                u32::try_from(lh)?,
+                u32::try_from(lw)?,
+                u32::try_from(lh / 2 * 2)?,
+                u32::try_from(lw / 2 * 2)?,
+            ];
+            let plane = plane as u64;
+            let mut launch = s.launch_builder(&self.kernels.posterior);
+            for p in &pointers {
+                launch.arg(p);
+            }
+            launch.arg(&channels);
+            if self.image {
+                for d in &dimensions {
+                    launch.arg(d);
+                }
+            } else {
+                launch.arg(&plane);
+            }
+            launch.launch(flat(latent * plane as usize))?;
         }
         Ok(out)
     }
@@ -3955,6 +4473,15 @@ impl EncodeWork {
         encoder: &KeyframeEncoder,
         (height, width): (usize, usize),
     ) -> Result<Self> {
+        Self::with_budget(s, encoder, (height, width), usize::MAX)
+    }
+
+    fn with_budget(
+        s: &Arc<CudaStream>,
+        encoder: &KeyframeEncoder,
+        (height, width): (usize, usize),
+        budget: usize,
+    ) -> Result<Self> {
         let activations = encoder
             .convolutions((height, width))
             .iter()
@@ -3974,7 +4501,31 @@ impl EncodeWork {
                 .max()
                 .context("encoder without spatial convolutions")
         };
-        let workspace = columns((height, width))?.min(columns((VAE_TILE, VAE_TILE))?);
+        let fixed = 5 * activations * 4;
+        let available = budget
+            .checked_sub(fixed)
+            .context("encoder budget holds no activation set")?;
+        let workspace = columns((height, width))?
+            .min(columns((VAE_TILE, VAE_TILE))?)
+            .min(available / 4);
+        let minimum = encoder
+            .convolutions((height, width))
+            .iter()
+            .filter(|(c, ..)| c.kernel > 1)
+            .map(|(c, ..)| 4 * c.columns())
+            .max()
+            .context("encoder without spatial convolutions")?;
+        ensure!(
+            workspace >= minimum,
+            "encoder im2col budget needs at least {} bytes",
+            4 * minimum
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"vae_encoder_work":{
+            "activation_bytes":fixed,"column_bytes":4 * workspace,"minimum_column_bytes":4 * minimum,
+            "budget":budget,"tile":[height,width]}})
+        );
         let buffer = || s.alloc_zeros::<f32>(activations);
         Ok(Self {
             height,

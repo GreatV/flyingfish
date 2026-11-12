@@ -71,6 +71,44 @@ pub fn image_decode(
     Ok(output)
 }
 
+/// F32 RGB HWC in [0,255] and caller posterior noise to normalized F32 NCHW latents and their spatial extent.
+pub fn image_encode(
+    model: &Path,
+    (ordinal, runtime): (usize, &Path),
+    extent: [usize; 2],
+    rgb: &[f32],
+    epsilon: &[f32],
+) -> Result<(Vec<f32>, [usize; 2])> {
+    ensure!(
+        rgb.iter()
+            .all(|v| v.is_finite() && (0.0..=255.0).contains(v)),
+        "image VAE RGB outside [0,255]"
+    );
+    ensure!(
+        epsilon.iter().all(|v| v.is_finite()),
+        "image VAE posterior noise is nonfinite"
+    );
+    let device = Device::new(ordinal)?;
+    let ops = ops::Ops::new(&device.ctx)?;
+    device.finish_upload()?;
+    let blas = Blas::new(
+        &device,
+        &ops,
+        runtime,
+        Rc::new(Closure::new(true, "image VAE encoder".into())),
+    )?;
+    let pixels = device.stream.clone_htod(rgb)?;
+    let noise = device.stream.clone_htod(epsilon)?;
+    let (latents, shape) =
+        vae::encode_image_device(&device, &blas, model, &pixels, extent, &noise)?;
+    let output = device.stream.clone_dtoh(&latents)?;
+    ensure!(
+        output.iter().all(|v| v.is_finite()),
+        "image VAE encoder output is nonfinite"
+    );
+    Ok((output, shape))
+}
+
 /// Direct-IO read granularity.
 const READ_CHUNK_BYTES: u64 = 32 << 20;
 
