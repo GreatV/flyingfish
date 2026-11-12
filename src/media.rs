@@ -686,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires ffmpeg on PATH"]
     fn mp4_mux_round_trip_decodes_video_and_audio() -> Result<()> {
         let directory = test_dir("mp4-round-trip")?;
         let output = directory.join("out.mp4");
