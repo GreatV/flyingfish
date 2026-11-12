@@ -13226,7 +13226,7 @@ where
             // the normalized features.
             let rows = sites.coordinates().len();
             let channels = x.len() / rows;
-            let mut normalized = d.stream.alloc_zeros::<f32>(x.len())?;
+            let normalized = d.stream.alloc_zeros::<f32>(x.len())?;
             decoder.k.norm(
                 d,
                 [ptr(&x, d), ptr(&normalized, d)],

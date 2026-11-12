@@ -949,6 +949,7 @@ pub struct StageSampling<'a> {
 
 /// Stage output affine from the pipeline's shape/tex _slat_normalization:
 /// slat = state * std + mean per channel.
+#[cfg(test)]
 pub fn normalize_slat(state: &[f32], mean: &[f32], std: &[f32]) -> Vec<f32> {
     let channels = mean.len();
     state
@@ -2398,6 +2399,7 @@ mod tests {
                                     stored_coords.len(),
                                     subset_coords.len()
                                 );
+                                skipped += 1;
                                 return Ok(());
                             }
                             let stored = read_tensor(&path, "features")?;
@@ -2436,6 +2438,7 @@ mod tests {
                                     stored_coords.len(),
                                     subset_coords.len()
                                 );
+                                skipped += 1;
                                 return Ok(());
                             }
                             let stored = read_tensor(&path, "features")?;
@@ -2469,6 +2472,7 @@ mod tests {
                                     stored_coords.len(),
                                     coordinates.len()
                                 );
+                                skipped += 1;
                                 return Ok(());
                             }
                             let stored = read_tensor(&path, "features")?;
@@ -2494,6 +2498,7 @@ mod tests {
                                     stored_coords.len(),
                                     coordinates.len()
                                 );
+                                skipped += 1;
                                 return Ok(());
                             }
                             let stored = read_tensor(&path, "features")?;
@@ -2519,6 +2524,7 @@ mod tests {
                                     stored_coords.len(),
                                     coordinates.len()
                                 );
+                                skipped += 1;
                                 return Ok(());
                             }
                             let stored = read_tensor(&path, "features")?;
