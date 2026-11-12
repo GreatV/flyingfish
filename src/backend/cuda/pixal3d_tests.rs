@@ -13497,3 +13497,170 @@ fn producer_bias_index_control(d: &Device) -> Result<bool> {
     );
     Ok(valid)
 }
+
+pub(crate) enum DecodeTap<'a> {
+    Block0 {
+        stage: usize,
+        coordinates: &'a [[i32; 4]],
+        features: &'a [f32],
+    },
+    Stage {
+        stage: usize,
+        coordinates: &'a [[i32; 4]],
+        features: &'a [f32],
+    },
+    Subdivision {
+        stage: usize,
+        coordinates: &'a [[i32; 4]],
+        logits: &'a [f32],
+    },
+    Head {
+        coordinates: &'a [[i32; 4]],
+        features: &'a [f32],
+    },
+    Fields {
+        coordinates: &'a [[i32; 4]],
+        features: &'a [f32],
+    },
+}
+
+/// Full sparse decode with host taps: block-0 output per stage, the stage
+/// output after C2S upsampling, the shape subdivision logits, the pre-head
+/// features and the final fields (texture affine applied).
+pub(crate) fn decode_tapped<F>(
+    decoder: &PixalDecoder,
+    coordinates: Vec<[i32; 4]>,
+    latent: &[f32],
+    guides: &[SparseDecoderOutput],
+    mut tap: F,
+) -> Result<()>
+where
+    F: FnMut(DecodeTap<'_>) -> Result<()>,
+{
+    ensure!(
+        latent.len() == coordinates.len() * 32 && latent.iter().all(|x| x.is_finite()),
+        "invalid denormalized sparse latent"
+    );
+    let d = &decoder.device;
+    d.workspace_budget(
+        decoder.initial_free,
+        decoder.device_budget,
+        latent
+            .len()
+            .checked_mul(size_of::<f32>())
+            .context("latent bytes overflow")?,
+    )?;
+    let input = d.stream.clone_htod(latent)?;
+    wait_input(d, &input)?;
+    let sites = SparseSites::new(coordinates)?;
+    let n = sites.coordinates().len();
+    let live = n
+        .checked_mul(1024 * 6)
+        .context("sparse input live bytes overflow")?;
+    d.workspace_budget(decoder.initial_free, decoder.device_budget, live)?;
+    let mut float = d.stream.alloc_zeros::<f32>(n * 1024)?;
+    decoder.linear32("from_latent", &input, &mut float, [n, 32, 1024])?;
+    drop(input);
+    let mut x = d.stream.alloc_zeros::<f16>(n * 1024)?;
+    decoder
+        .k
+        .cast(d, [ptr(&float, d), ptr(&x, d)], n * 1024, false)?;
+    drop(float);
+    let additional = n
+        .checked_mul(1024 * 14)
+        .context("initial sparse workspace overflow")?;
+    let budget = d.workspace_budget(decoder.initial_free, decoder.device_budget, additional)?;
+    let mut conv = SparseConv::new(d, &sites, 1024, budget)?;
+    let mut sites = sites;
+    let borrowed: Vec<_> = guides
+        .iter()
+        .map(|g| SubdivisionGuide {
+            coordinates: &g.coordinates,
+            logits: &g.features,
+        })
+        .collect();
+    let mut fields = None;
+    for stage in 0..4 {
+        let parent = sites.coordinates().to_vec();
+        let c = 1024 >> stage;
+        x = decoder.next_blocks_observed(
+            stage,
+            &conv,
+            x,
+            c,
+            [4, 16, 8, 4][stage],
+            |block, out| {
+                if block != 0 {
+                    return Ok(());
+                }
+                let features: Vec<f32> = d
+                    .stream
+                    .clone_dtoh(out)?
+                    .iter()
+                    .map(|value| f16::to_f32(*value))
+                    .collect();
+                tap(DecodeTap::Block0 {
+                    stage,
+                    coordinates: &parent,
+                    features: &features,
+                })
+            },
+        )?;
+        let (next, features, predicted, next_conv) =
+            decoder.up_stage(stage, &sites, x, conv, borrowed.get(stage))?;
+        if matches!(decoder.kind, DecoderKind::Shape) {
+            tap(DecodeTap::Subdivision {
+                stage,
+                coordinates: sites.coordinates(),
+                logits: &predicted,
+            })?;
+        }
+        let stage_features: Vec<f32> = d
+            .stream
+            .clone_dtoh(&features)?
+            .iter()
+            .map(|value| f16::to_f32(*value))
+            .collect();
+        tap(DecodeTap::Stage {
+            stage,
+            coordinates: next.coordinates(),
+            features: &stage_features,
+        })?;
+        sites = next;
+        x = features;
+        conv = next_conv;
+        if stage == 3 {
+            // The published head normalizes its input (LN eps 1e-5, no
+            // affine) before the output projection; the head tap observes
+            // the normalized features.
+            let rows = sites.coordinates().len();
+            let channels = x.len() / rows;
+            let normalized = d.stream.alloc_zeros::<f32>(x.len())?;
+            decoder.k.norm(
+                d,
+                [ptr(&x, d), ptr(&normalized, d)],
+                [rows, channels],
+                [0, 0],
+                [false, true],
+                1e-5,
+            )?;
+            let head: Vec<f32> = d.stream.clone_dtoh(&normalized)?.to_vec();
+            drop(normalized);
+            tap(DecodeTap::Head {
+                coordinates: sites.coordinates(),
+                features: &head,
+            })?;
+            // The frozen decoder fixtures store the raw head output; the
+            // pipeline applies the texture x0.5+0.5 affine downstream.
+            let output = decoder.output_head(&sites, x)?;
+            let decoded: Vec<f32> = d.stream.clone_dtoh(&output)?.to_vec();
+            fields = Some(decoded);
+            break;
+        }
+    }
+    let fields = fields.context("decode produced no fields")?;
+    tap(DecodeTap::Fields {
+        coordinates: sites.coordinates(),
+        features: &fields,
+    })
+}

@@ -1,7 +1,7 @@
 //! Shared flow, dense/sparse decoders and image-conditioned mesh refinement.
 #[cfg(test)]
 #[path = "pixal3d_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 use super::sparse::{BatchGroupNorm, SparseConv};
 pub use super::sparse::{TriangleVoxels, adaptive_mesh_support, triangle_voxels};
 
@@ -3538,10 +3538,10 @@ impl<T: FlowElement> Flow<T> {
     }
 }
 
-struct Sampler {
-    state: CudaSlice<f32>,
-    positive: CudaSlice<f32>,
-    negative: Option<CudaSlice<f32>>,
+pub(crate) struct Sampler {
+    pub(crate) state: CudaSlice<f32>,
+    pub(crate) positive: CudaSlice<f32>,
+    pub(crate) negative: Option<CudaSlice<f32>>,
     velocity: CudaSlice<f32>,
     x0: Option<CudaSlice<f32>>,
     positive_x0: Option<CudaSlice<f32>>,
@@ -3553,7 +3553,7 @@ struct Sampler {
     euler: CudaFunction,
 }
 impl Sampler {
-    fn new(d: &Device, noise: &[f32], guided: bool) -> Result<Self> {
+    pub(crate) fn new(d: &Device, noise: &[f32], guided: bool) -> Result<Self> {
         ensure!(
             noise.len() > 1 && noise.iter().all(|x| x.is_finite()),
             "invalid flow noise"
@@ -3605,7 +3605,7 @@ impl Sampler {
         }
         Ok(())
     }
-    fn step(&mut self, d: &Device, t: f64, next: f64, sparse: bool) -> Result<()> {
+    pub(crate) fn step(&mut self, d: &Device, t: f64, next: f64, sparse: bool) -> Result<()> {
         ensure!(
             t.is_finite() && next.is_finite() && next >= 0.0 && next < t && t <= 1.0,
             "invalid Euler time pair"
@@ -3676,7 +3676,7 @@ impl Sampler {
     }
 }
 
-fn schedule(sparse: bool, steps: usize) -> Vec<f64> {
+pub(crate) fn schedule(sparse: bool, steps: usize) -> Vec<f64> {
     let scale = if sparse { 3.0 } else { 5.0 };
     (0..=steps)
         .map(|i| {
@@ -5947,6 +5947,20 @@ impl PixalDecoder {
         c: usize,
         blocks: usize,
     ) -> Result<CudaSlice<f16>> {
+        self.next_blocks_observed(stage, conv, x, c, blocks, |_, _| Ok(()))
+    }
+    fn next_blocks_observed<F>(
+        &self,
+        stage: usize,
+        conv: &SparseConv,
+        x: CudaSlice<f16>,
+        c: usize,
+        blocks: usize,
+        mut observe: F,
+    ) -> Result<CudaSlice<f16>>
+    where
+        F: FnMut(usize, &CudaSlice<f16>) -> Result<()>,
+    {
         let d = &self.device;
         let n = x.len() / c;
         let features = n.checked_mul(c).context("sparse features overflow")?;
@@ -5965,6 +5979,7 @@ impl PixalDecoder {
             self.k.act(d, ptr(&wide, d), n, 4 * c, false)?;
             self.linear16(&format!("{name}.mlp.2"), &wide, &mut a, [n, 4 * c, c])?;
             self.k.add(d, &x, &a, &self.ones, [n, c])?;
+            observe(block, &x)?;
         }
         Ok(x)
     }
@@ -6227,6 +6242,12 @@ impl PixalDecoder {
             channels: 64,
         })
     }
+    /// Binds every subsequent F16 linear of this decoder to the reference
+    /// library's algorithm pick (the heuristic first result).
+    pub fn bind_reference_f16(&mut self) {
+        self.blas.enable_f16_reference();
+    }
+
     pub fn decode(
         &self,
         coordinates: Vec<[i32; 4]>,
