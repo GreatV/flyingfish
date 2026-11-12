@@ -540,7 +540,7 @@ fn minimax_h3_adaln_plan_addresses_every_row_pair() -> Result<()> {
     ] {
         let layout = PackedLayout::build(&spec, &geometry, &text_tags(), anchors)?;
         let plan = row_timestep_plan(&layout, &video, &audio)?;
-        let adaln = AdalnPlan::build(&layout, &plan);
+        let adaln = AdalnPlan::build(&layout, &plan)?;
         ensure!(
             adaln.timesteps.len() == 16 && adaln.pairs.len() == 25,
             "AdaLN extent: timesteps={} pairs={}",
@@ -1279,7 +1279,7 @@ fn minimax_h3_image_layout_matches_the_frozen_coordinates() -> Result<()> {
         [adaln[0], adaln[5], adaln[82]] == [1, 3, 0],
         "AdaLN indices at step 0"
     );
-    let table = AdalnPlan::from_tags(&edit.token_tags, &plan);
+    let table = AdalnPlan::from_tags(&edit.token_tags, &plan)?;
     ensure!(
         table.row_pairs.len() == plan.len()
             && table
@@ -2000,6 +2000,47 @@ fn hyperflow_temb_and_dropped_block_and_lowrank_pad() -> Result<()> {
     );
     let padded = product(&padded_down, &padded_up, 8);
     ensure!(padded == original, "padded product {padded:?} {original:?}");
+    let layout = PackedLayout {
+        position_ids: vec![[0.0; 3]; 4],
+        token_tags: vec![TEXT_TAG, VIDEO_TAG, AUDIO_TAG, VIDEO_TAG],
+        video_indices: vec![1, 3],
+        audio_indices: vec![2],
+        text_indices: vec![0],
+        condition_video_rows: 1,
+    };
+    let step = &hyperflow_steps(4)?[0];
+    ensure!(
+        step.video_t == 0.0 && step.audio_t == 0.0 && step.video_r != step.audio_r,
+        "step 0 shares t and splits r"
+    );
+    let rows = RowTimesteps::hyperflow(&layout, step);
+    let video = rows.indices[0] as usize;
+    let key = rows.indices[1] as usize;
+    let audio = rows.indices[2] as usize;
+    ensure!(
+        rows.timesteps.len() == 3
+            && rows.endpoints.len() == 3
+            && rows.indices[3] == rows.indices[0]
+            && video != audio
+            && key != video
+            && key != audio
+            && rows.timesteps[video] == step.video_t
+            && rows.endpoints[video] == step.video_r
+            && rows.timesteps[audio] == step.audio_t
+            && rows.endpoints[audio] == step.audio_r
+            && rows.timesteps[key] == step.keyframe_t
+            && rows.endpoints[key] == step.keyframe_r,
+        "row pairs {:?} {:?}",
+        rows.timesteps,
+        rows.indices
+    );
+    let plan = AdalnPlan::from_tags(&layout.token_tags, std::slice::from_ref(&rows))?;
+    ensure!(
+        plan.endpoints.len() == 3
+            && plan.row_timesteps[0][0] != plan.row_timesteps[0][2]
+            && plan.row_timesteps[0] == rows.indices,
+        "plan keeps distinct endpoints at one t"
+    );
     Ok(())
 }
 

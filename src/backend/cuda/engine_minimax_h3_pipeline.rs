@@ -356,7 +356,7 @@ fn run_mode<const SETUP_ONLY: bool>(
     let video_grid = Schedule::new(request.evaluations + 1, request.shifts.0)?;
     let audio_grid = Schedule::new(request.evaluations + 1, request.shifts.1)?;
     let plan = row_timestep_plan(&layout, &video_grid, &audio_grid)?;
-    let adaln_plan = AdalnPlan::build(&layout, &plan);
+    let adaln_plan = AdalnPlan::build(&layout, &plan)?;
     let (video, audio, free_before) = {
         let table = AdalnTable::build(
             &device,

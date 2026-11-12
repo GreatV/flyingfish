@@ -1298,9 +1298,11 @@ fn shifted_sigmas(raw: &[f64], shift: f32) -> Vec<f32> {
 }
 
 /// Distinct timesteps of one evaluation, ascending, and the index of every sequence row into them.
+/// `endpoints` is parallel to `timesteps` for a HyperFlow `(t, r)` pair, and empty for one time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowTimesteps {
     pub timesteps: Vec<f32>,
+    pub endpoints: Vec<f32>,
     pub indices: Vec<u32>,
 }
 
@@ -1323,7 +1325,40 @@ impl RowTimesteps {
             .iter()
             .map(|t| timesteps.partition_point(|v| v < t) as u32)
             .collect();
-        Self { timesteps, indices }
+        Self {
+            timesteps,
+            endpoints: Vec::new(),
+            indices,
+        }
+    }
+
+    /// Distinct `(t, r)` pairs, sorted by `t` then `r`.
+    /// Text and generated video rows take the video pair. Generated audio rows take the audio pair.
+    /// Conditioning video rows take the keyframe pair.
+    pub fn hyperflow(layout: &PackedLayout, step: &FlowStep) -> Self {
+        let mut pairs = vec![(step.video_t, step.video_r); layout.rows()];
+        for &row in &layout.video_indices[..layout.condition_video_rows] {
+            pairs[row as usize] = (step.keyframe_t, step.keyframe_r);
+        }
+        for &row in &layout.audio_indices {
+            pairs[row as usize] = (step.audio_t, step.audio_r);
+        }
+        let mut unique = pairs.clone();
+        unique.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        unique.dedup();
+        let indices = pairs
+            .iter()
+            .map(|pair| {
+                unique.partition_point(|v| {
+                    v.0.total_cmp(&pair.0).then(v.1.total_cmp(&pair.1)).is_lt()
+                }) as u32
+            })
+            .collect();
+        Self {
+            timesteps: unique.iter().map(|pair| pair.0).collect(),
+            endpoints: unique.iter().map(|pair| pair.1).collect(),
+            indices,
+        }
     }
 
     pub fn adaln_indices(&self, layout: &PackedLayout) -> Vec<u32> {
@@ -1365,8 +1400,10 @@ pub struct LoraAdapter {
 /// Every `(timestep, tag)` AdaLN pair addressed by any evaluation of a request, with per-evaluation row maps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdalnPlan {
-    /// Distinct timesteps over all evaluations, ascending.
+    /// Distinct timesteps over all evaluations, ascending. HyperFlow stores `t` here.
     pub timesteps: Vec<f32>,
+    /// Endpoint `r` parallel to `timesteps`. Empty for a single-time plan.
+    pub endpoints: Vec<f32>,
     /// `(index into timesteps, tag)` in ascending order.
     pub pairs: Vec<(u32, u8)>,
     /// Per evaluation, the pair of every sequence row.
@@ -1376,12 +1413,22 @@ pub struct AdalnPlan {
 }
 
 impl AdalnPlan {
-    pub fn build(layout: &PackedLayout, plan: &[RowTimesteps]) -> Self {
+    pub fn build(layout: &PackedLayout, plan: &[RowTimesteps]) -> Result<Self> {
         Self::from_tags(&layout.token_tags, plan)
     }
 
     /// `(timestep, tag)` pairs addressed by `token_tags` over every evaluation in `plan`.
-    pub fn from_tags(token_tags: &[u8], plan: &[RowTimesteps]) -> Self {
+    /// A plan whose rows carry `endpoints` keys each row by `(t, r)`.
+    pub fn from_tags(token_tags: &[u8], plan: &[RowTimesteps]) -> Result<Self> {
+        if plan.iter().any(|step| !step.endpoints.is_empty()) {
+            let (timesteps, endpoints, row_timesteps) = endpoint_rows(plan)?;
+            return Ok(plan_from_rows(
+                token_tags,
+                timesteps,
+                endpoints,
+                row_timesteps,
+            ));
+        }
         let mut timesteps: Vec<f32> = plan
             .iter()
             .flat_map(|step| step.timesteps.clone())
@@ -1396,28 +1443,85 @@ impl AdalnPlan {
                 step.indices.iter().map(|&i| map[i as usize]).collect()
             })
             .collect();
-        let mut pairs: Vec<(u32, u8)> = row_timesteps
-            .iter()
-            .flat_map(|rows| rows.iter().zip(token_tags).map(|(&t, &tag)| (t, tag)))
-            .collect();
-        pairs.sort_unstable();
-        pairs.dedup();
-        let row_pairs = row_timesteps
-            .iter()
-            .map(|rows| {
-                rows.iter()
-                    .zip(token_tags)
-                    .map(|(&t, &tag)| pairs.partition_point(|&p| p < (t, tag)) as u32)
-                    .collect()
-            })
-            .collect();
-        Self {
+        Ok(plan_from_rows(
+            token_tags,
             timesteps,
-            pairs,
-            row_pairs,
+            Vec::new(),
             row_timesteps,
-        }
+        ))
     }
+}
+
+fn plan_from_rows(
+    token_tags: &[u8],
+    timesteps: Vec<f32>,
+    endpoints: Vec<f32>,
+    row_timesteps: Vec<Vec<u32>>,
+) -> AdalnPlan {
+    let mut pairs: Vec<(u32, u8)> = row_timesteps
+        .iter()
+        .flat_map(|rows| rows.iter().zip(token_tags).map(|(&t, &tag)| (t, tag)))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let row_pairs = row_timesteps
+        .iter()
+        .map(|rows| {
+            rows.iter()
+                .zip(token_tags)
+                .map(|(&t, &tag)| pairs.partition_point(|&p| p < (t, tag)) as u32)
+                .collect()
+        })
+        .collect();
+    AdalnPlan {
+        timesteps,
+        endpoints,
+        pairs,
+        row_pairs,
+        row_timesteps,
+    }
+}
+
+type EndpointRows = (Vec<f32>, Vec<f32>, Vec<Vec<u32>>);
+
+fn endpoint_rows(plan: &[RowTimesteps]) -> Result<EndpointRows> {
+    for step in plan {
+        ensure!(
+            step.endpoints.len() == step.timesteps.len(),
+            "HyperFlow endpoints differ from its timesteps"
+        );
+    }
+    let mut keys: Vec<(f32, f32)> = plan
+        .iter()
+        .flat_map(|step| {
+            step.timesteps
+                .iter()
+                .copied()
+                .zip(step.endpoints.iter().copied())
+        })
+        .collect();
+    keys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    keys.dedup();
+    let global = |t: f32, r: f32| {
+        keys.partition_point(|v| v.0.total_cmp(&t).then(v.1.total_cmp(&r)).is_lt()) as u32
+    };
+    let row_timesteps = plan
+        .iter()
+        .map(|step| {
+            let map: Vec<u32> = step
+                .timesteps
+                .iter()
+                .zip(&step.endpoints)
+                .map(|(&t, &r)| global(t, r))
+                .collect();
+            step.indices.iter().map(|&i| map[i as usize]).collect()
+        })
+        .collect();
+    Ok((
+        keys.iter().map(|pair| pair.0).collect(),
+        keys.iter().map(|pair| pair.1).collect(),
+        row_timesteps,
+    ))
 }
 
 /// The F32 time-embedder tensors (`time_embedder.linear_1/2`) the AdaLN input is computed from.
@@ -1428,14 +1532,14 @@ pub struct AdalnTimeEmbedder {
     pub linear_2_bias: Vec<f32>,
 }
 
-/// `silu(time_embedder(sinusoid(t)))` rounded to BF16, `[timesteps, time_dim]`: the input of every AdaLN projection.
+fn silu(v: f32) -> f32 {
+    v / (1.0 + (-v).exp())
+}
+
+/// f32 `time_embedder(time_proj(t))`, `[timesteps, time_dim]`, before the AdaLN SiLU.
 /// Sinusoid `[cos(t f_i), sin(t f_i)]`, `f_i = exp(-ln(10000) * i / half)` in f32; the two F32 linears accumulate in
 /// f64 and round once.
-pub fn adaln_input(
-    spec: &H3Spec,
-    time: &AdalnTimeEmbedder,
-    timesteps: &[f32],
-) -> Result<Vec<half::bf16>> {
+fn time_embed(spec: &H3Spec, time: &AdalnTimeEmbedder, timesteps: &[f32]) -> Vec<f32> {
     let half = spec.freq_dim / 2;
     let log_period = -(10000.0f64.ln()) as f32;
     let frequencies: Vec<f32> = (0..half)
@@ -1446,7 +1550,6 @@ pub fn adaln_input(
         x.extend(frequencies.iter().map(|&f| (t * f).cos()));
         x.extend(frequencies.iter().map(|&f| (t * f).sin()));
     }
-    let silu = |v: f32| v / (1.0 + (-v).exp());
     let hidden = f32_linear(
         &time.linear_1_weight,
         &time.linear_1_bias,
@@ -1454,15 +1557,45 @@ pub fn adaln_input(
         spec.freq_dim,
     );
     let hidden: Vec<f32> = hidden.into_iter().map(silu).collect();
-    let embedding = f32_linear(
+    f32_linear(
         &time.linear_2_weight,
         &time.linear_2_bias,
         &hidden,
         spec.time_hidden,
-    );
-    Ok(embedding
+    )
+}
+
+/// `silu(time_embedder(sinusoid(t)))` rounded to BF16, `[timesteps, time_dim]`: the input of every AdaLN projection.
+pub fn adaln_input(spec: &H3Spec, time: &AdalnTimeEmbedder, timesteps: &[f32]) -> Vec<half::bf16> {
+    time_embed(spec, time, timesteps)
         .into_iter()
         .map(|v| half::bf16::from_f32(silu(v)))
+        .collect()
+}
+
+/// SiLU of `mix_temb` on each f32 lane of the two time embedders, rounded to BF16.
+pub fn mixed_adaln_input(
+    spec: &H3Spec,
+    current: &AdalnTimeEmbedder,
+    endpoint: &AdalnTimeEmbedder,
+    timesteps: &[f32],
+    endpoints: &[f32],
+    gate: f32,
+) -> Result<Vec<half::bf16>> {
+    ensure!(
+        timesteps.len() == endpoints.len() && gate.is_finite(),
+        "HyperFlow temb extent"
+    );
+    let current = time_embed(spec, current, timesteps);
+    let endpoint = time_embed(spec, endpoint, endpoints);
+    ensure!(
+        current.len() == endpoint.len() && current.iter().chain(&endpoint).all(|v| v.is_finite()),
+        "HyperFlow temb is not finite"
+    );
+    Ok(current
+        .into_iter()
+        .zip(endpoint)
+        .map(|(c, e)| half::bf16::from_f32(silu(mix_temb(c, e, gate))))
         .collect())
 }
 
@@ -2548,7 +2681,11 @@ pub fn image_row_timesteps(layout: &ImageLayout, timestep: f32) -> Result<RowTim
         .iter()
         .map(|t| timesteps.partition_point(|v| v < t) as u32)
         .collect();
-    Ok(RowTimesteps { timesteps, indices })
+    Ok(RowTimesteps {
+        timesteps,
+        endpoints: Vec::new(),
+        indices,
+    })
 }
 
 /// One [`RowTimesteps`] per published evaluation.

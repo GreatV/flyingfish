@@ -22,7 +22,7 @@ use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::gguf::GgmlType;
 use crate::minimax_h3::{
     AdalnPlan, AdalnTimeEmbedder, H3Spec, ImageLayout, ImageSchedule, ImageSpec, LinearStorage,
-    MODALITIES, adaln_input, image_row_plan, rotary_rows,
+    MODALITIES, adaln_input, image_row_plan, mixed_adaln_input, rotary_rows,
 };
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
@@ -308,9 +308,9 @@ pub(crate) struct AdalnTable {
 }
 
 impl AdalnTable {
-    /// One pass over the 50 `adaln_proj` weights: each block's `[18 * hidden, time_dim]` projection of the plan's
-    /// timesteps (bias before output rounding), of which only the addressed `(timestep, tag)` slices are kept.
-    /// A HyperFlow spec returns zero tables. The `(t, r)` mix is not applied.
+    /// Kept blocks: `[18 * hidden, time_dim]` projection of the plan embedding, bias before output rounding,
+    /// keeping the addressed `(timestep, tag)` slices. HyperFlow's embedding is SiLU of `mix_temb` on the two f32
+    /// time embedders, rounded to BF16. A dropped block's modulation rows stay zero.
     pub(crate) fn build(
         d: &Device,
         blas: &mut Blas,
@@ -322,23 +322,9 @@ impl AdalnTable {
         let s = &d.stream;
         let timesteps = plan.timesteps.len();
         let width = 6 * spec.hidden;
-        if spec.is_hyperflow()? {
-            let pairs = plan.pairs.len();
-            let blocks = s.alloc_zeros::<bf16>(
-                spec.layers
-                    .checked_mul(pairs)
-                    .and_then(|n| n.checked_mul(width))
-                    .context("HyperFlow modulation extent")?,
-            )?;
-            let norm_out = s.alloc_zeros::<bf16>(
-                timesteps
-                    .checked_mul(2 * spec.hidden)
-                    .context("HyperFlow output-norm extent")?,
-            )?;
-            return Ok(Self { blocks, norm_out });
-        }
         let modulation = width * MODALITIES as usize;
         let mut source = Source::new(transformer_dir, manifest);
+        let hyperflow = spec.is_hyperflow()?;
         let time = AdalnTimeEmbedder {
             linear_1_weight: source.host_f32(
                 s,
@@ -353,7 +339,46 @@ impl AdalnTable {
             )?,
             linear_2_bias: source.host_f32(s, "time_embedder.linear_2.bias", spec.time_dim)?,
         };
-        let x = s.clone_htod(&adaln_input(spec, &time, &plan.timesteps)?)?;
+        let x_host = if hyperflow {
+            ensure!(
+                !plan.timesteps.is_empty() && plan.endpoints.len() == plan.timesteps.len(),
+                "HyperFlow temb mix is not bound"
+            );
+            let gate = spec.hyperflow_gate.context("HyperFlow gate")?;
+            let endpoint = AdalnTimeEmbedder {
+                linear_1_weight: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_1.weight",
+                    spec.time_hidden * spec.freq_dim,
+                )?,
+                linear_1_bias: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_1.bias",
+                    spec.time_hidden,
+                )?,
+                linear_2_weight: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_2.weight",
+                    spec.time_dim * spec.time_hidden,
+                )?,
+                linear_2_bias: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_2.bias",
+                    spec.time_dim,
+                )?,
+            };
+            mixed_adaln_input(
+                spec,
+                &time,
+                &endpoint,
+                &plan.timesteps,
+                &plan.endpoints,
+                gate,
+            )?
+        } else {
+            adaln_input(spec, &time, &plan.timesteps)
+        };
+        let x = s.clone_htod(&x_host)?;
         let mut weight = s.alloc_zeros::<bf16>(modulation * spec.time_dim)?;
         let mut bias = s.alloc_zeros::<bf16>(modulation)?;
         let y = s.alloc_zeros::<bf16>(timesteps * modulation)?;
@@ -366,7 +391,11 @@ impl AdalnTable {
             vector(&bias, s)?,
             mode,
         )?;
+        let dropped = spec.dropped_blocks.as_deref().unwrap_or(&[]);
         for layer in 0..spec.layers {
+            if dropped.contains(&layer) {
+                continue;
+            }
             let base = format!("transformer_blocks.{layer}.adaln_proj.linear");
             for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
                 let name = format!("{base}.{suffix}");
@@ -2695,13 +2724,6 @@ fn place_stored_layers(
     Ok((dense, packed))
 }
 
-fn hyperflow_temb(spec: &H3Spec) -> Result<()> {
-    if spec.is_hyperflow()? {
-        bail!("HyperFlow temb mix is not bound");
-    }
-    Ok(())
-}
-
 fn forward_block<const LORA: bool>(
     c: &BlockContext<'_>,
     flash: &mut Flash,
@@ -3219,7 +3241,6 @@ impl Dit {
         (pairs, timesteps): (u32, u32),
         inputs: &StepInputs<'_>,
     ) -> Result<()> {
-        hyperflow_temb(c.spec)?;
         let (s, spec, r) = (c.s, c.spec, self.ranges);
         let h = spec.hidden;
         let video_rows = r.condition + (r.rows - r.video_start);
@@ -4500,7 +4521,7 @@ pub(crate) fn image_sample_trace(
     let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
         .minimax_h3_image_manifest(&image)?;
     let plan = image_row_plan(layout, &schedule)?;
-    let adaln = AdalnPlan::from_tags(&layout.token_tags, &plan);
+    let adaln = AdalnPlan::from_tags(&layout.token_tags, &plan)?;
     let device = Device::new(device)?;
     let ops = ops::Ops::new(&device.ctx)?;
     device.finish_upload()?;
@@ -5287,7 +5308,7 @@ mod tests {
         let layout = capture_layout(&spec, &capture)?;
         let plan: Vec<RowTimesteps> =
             row_timestep_plan(&layout, &Schedule::new(9, 6.0)?, &Schedule::new(9, 3.0)?)?;
-        let adaln = AdalnPlan::build(&layout, &plan);
+        let adaln = AdalnPlan::build(&layout, &plan)?;
 
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -6949,6 +6970,7 @@ mod tests {
             .collect();
         let plan = AdalnPlan {
             timesteps: timesteps.clone(),
+            endpoints: Vec::new(),
             pairs: pairs.clone(),
             row_pairs: Vec::new(),
             row_timesteps: Vec::new(),
@@ -7054,7 +7076,7 @@ mod tests {
             MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
         let layout = capture_layout(&spec, &capture)?;
         let plan = row_timestep_plan(&layout, &Schedule::new(9, 6.0)?, &Schedule::new(9, 3.0)?)?;
-        let adaln_plan = AdalnPlan::build(&layout, &plan);
+        let adaln_plan = AdalnPlan::build(&layout, &plan)?;
         let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
         let replay = SafeTensors::deserialize(&replay_map)?;
         let steps = std::env::var("FF_H3_STEPS")
@@ -7279,7 +7301,7 @@ mod tests {
         let video_grid = Schedule::new(9, 6.0)?;
         let audio_grid = Schedule::new(9, 3.0)?;
         let plan = row_timestep_plan(&layout, &video_grid, &audio_grid)?;
-        let adaln_plan = AdalnPlan::build(&layout, &plan);
+        let adaln_plan = AdalnPlan::build(&layout, &plan)?;
         let read = |file: &str, name: &str| -> Result<(Vec<f64>, Vec<usize>)> {
             let map = mapped(&capture.join(file))?;
             decoded(&SafeTensors::deserialize(&map)?, name)
@@ -9546,11 +9568,11 @@ mod tests {
         let t2i_plan = AdalnPlan::from_tags(
             &t2i_layout.token_tags,
             &image_row_plan(&t2i_layout, &schedule)?,
-        );
+        )?;
         let edit_plan = AdalnPlan::from_tags(
             &edit_layout.token_tags,
             &image_row_plan(&edit_layout, &schedule)?,
-        );
+        )?;
         ensure!(
             t2i_plan.row_pairs.len() == 6 && edit_plan.row_pairs.len() == 6,
             "evaluation count"
@@ -9946,7 +9968,7 @@ mod tests {
         );
         let schedule = ImageSchedule::published()?;
         let row_plan =
-            AdalnPlan::from_tags(&layout.token_tags, &image_row_plan(&layout, &schedule)?);
+            AdalnPlan::from_tags(&layout.token_tags, &image_row_plan(&layout, &schedule)?)?;
         ensure!(row_plan.row_pairs.len() == 6, "evaluation count");
         let dir = model.join("transformer_diffusers");
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
