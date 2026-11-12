@@ -13,28 +13,29 @@ use half::bf16;
 /// cos/sin [rows, dim]. Frequency-axis 0 is the slowest-varying grid
 /// coordinate: the model builds rope_phases from meshgrid coords whose first
 /// column is the slowest axis (sparse_structure_flow.py:108-113).
-fn rope_phase_values(extents: [usize; 3], dim: usize, freq_dim: usize) -> Vec<f32> {
-    let freqs: Vec<f32> = (0..freq_dim)
+fn rope_freqs(freq_dim: usize) -> Vec<f32> {
+    (0..freq_dim)
         .map(|i| (-10000f64.ln() as f32 * i as f32 / freq_dim as f32).exp())
-        .collect();
-    let [dz, dy, dx] = extents;
-    let mut phase_values = vec![0f32; dz * dy * dx * dim];
-    for z in 0..dz {
-        for y in 0..dy {
-            for x in 0..dx {
-                let row = (z * dy + y) * dx + x;
-                let coords = [z as f32, y as f32, x as f32];
-                for pair in 0..dim / 2 {
-                    let base = row * dim + 2 * pair;
-                    if pair < 3 * freq_dim {
-                        let angle = coords[pair / freq_dim] * freqs[pair % freq_dim];
-                        phase_values[base] = angle.cos();
-                        phase_values[base + 1] = angle.sin();
-                    } else {
-                        phase_values[base] = 1.0;
-                        phase_values[base + 1] = 0.0;
-                    }
-                }
+        .collect()
+}
+
+/// Per-site rotary phases for sparse integer [z, y, x] coordinates, stored
+/// interleaved cos/sin [sites, dim]. Frequency-axis 0 is the slowest grid
+/// coordinate, matching the model's per-token phase buffer.
+fn rope_phase_sites(coords: &[[i32; 3]], dim: usize, freq_dim: usize) -> Vec<f32> {
+    let freqs = rope_freqs(freq_dim);
+    let mut phase_values = vec![0f32; coords.len() * dim];
+    for (row, c) in coords.iter().enumerate() {
+        let site = [c[0] as f32, c[1] as f32, c[2] as f32];
+        for pair in 0..dim / 2 {
+            let base = row * dim + 2 * pair;
+            if pair < 3 * freq_dim {
+                let angle = site[pair / freq_dim] * freqs[pair % freq_dim];
+                phase_values[base] = angle.cos();
+                phase_values[base + 1] = angle.sin();
+            } else {
+                phase_values[base] = 1.0;
+                phase_values[base + 1] = 0.0;
             }
         }
     }
@@ -66,6 +67,7 @@ pub struct TrellisSsFlow {
     dim: usize,
     width: usize,
     cond_width: usize,
+    in_channels: usize,
     feed_forward: usize,
     phases: cudarc::driver::CudaSlice<f32>,
     context: cudarc::driver::CudaSlice<bf16>,
@@ -95,6 +97,7 @@ pub struct TrellisSsFlow {
 }
 
 impl TrellisSsFlow {
+    /// Loads a flow on the dense [16, 16, 16] sparse-structure grid.
     pub fn load(
         device: &Device,
         blas: &mut Blas,
@@ -102,10 +105,50 @@ impl TrellisSsFlow {
         context_rows: usize,
         limit: usize,
     ) -> Result<Self> {
+        let mut sites = Vec::with_capacity(4096);
+        for z in 0..16i32 {
+            for y in 0..16i32 {
+                for x in 0..16i32 {
+                    sites.push([z, y, x]);
+                }
+            }
+        }
+        Self::load_flow(device, blas, checkpoint, &sites, context_rows, limit)
+    }
+
+    /// Loads a published TRELLIS.2 flow over sparse [z, y, x] sites. The
+    /// sibling config must declare the published DIT family; windowed
+    /// attention fields are rejected (the definition compiles full
+    /// attention only for these checkpoints).
+    pub fn load_flow(
+        device: &Device,
+        blas: &mut Blas,
+        checkpoint: &std::path::Path,
+        sites: &[[i32; 3]],
+        context_rows: usize,
+        limit: usize,
+    ) -> Result<Self> {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(checkpoint.with_extension("json"))?)?;
+        let args = &config["args"];
+        ensure!(
+            config["name"] == "SparseStructureFlowModel" || config["name"] == "SLatFlowModel",
+            "unsupported flow model family"
+        );
+        ensure!(
+            args.get("attn_mode").is_none()
+                && args.get("window_size").is_none()
+                && args.get("shift_window").is_none(),
+            "windowed attention config not supported"
+        );
+        let read = |name: &str| -> Result<usize> {
+            usize::try_from(args[name].as_u64().context("flow config field missing")?)
+                .context("flow config field overflow")
+        };
         let spec = FlowSpec {
-            resolution: 16,
-            in_channels: 8,
-            out_channels: 8,
+            resolution: read("resolution")?,
+            in_channels: read("in_channels")?,
+            out_channels: read("out_channels")?,
             model_channels: 1536,
             cond_channels: 1024,
             num_blocks: 30,
@@ -119,6 +162,26 @@ impl TrellisSsFlow {
             dtype: "bfloat16".into(),
             proj_in_channels: None,
         };
+        ensure!(
+            args["model_channels"] == 1536
+                && args["cond_channels"] == 1024
+                && args["num_blocks"] == 30
+                && args["num_heads"] == 12
+                && args["mlp_ratio"] == 5.3334
+                && args["pe_mode"] == "rope"
+                && args["share_mod"] == true
+                && args["qk_rms_norm"] == true
+                && args["qk_rms_norm_cross"] == true
+                && args["dtype"] == "bfloat16",
+            "flow config differs from the published DIT family"
+        );
+        ensure!(
+            !sites.is_empty()
+                && sites
+                    .iter()
+                    .all(|c| c.iter().all(|&v| v >= 0 && (v as usize) < spec.resolution)),
+            "flow sites outside the config resolution"
+        );
         device.finish_upload()?;
         let (free_before, total) = device.ctx.mem_get_info()?;
         ensure!(
@@ -194,7 +257,7 @@ impl TrellisSsFlow {
             }
         }
         let h = spec.model_channels;
-        let rows = spec.resolution.pow(3);
+        let rows = sites.len();
         let mut blocks = Vec::with_capacity(spec.num_blocks);
         for index in 0..spec.num_blocks {
             let p = format!("blocks.{index}");
@@ -259,10 +322,9 @@ impl TrellisSsFlow {
         let heads = spec.num_heads;
         let dim = h / heads;
         let freq_dim = dim / 2 / 3;
-        let phases =
-            device
-                .stream
-                .clone_htod(&rope_phase_values([spec.resolution; 3], dim, freq_dim))?;
+        let phases = device
+            .stream
+            .clone_htod(&rope_phase_sites(sites, dim, freq_dim))?;
         // The F32 attention cubin modules load here, before the budget
         // split, so their bytes are counted in the measured allocation.
         let _attention_modules = (
@@ -342,6 +404,7 @@ impl TrellisSsFlow {
             dim,
             width: h,
             cond_width: spec.cond_channels,
+            in_channels: spec.in_channels,
             feed_forward,
             phases,
             context: device
@@ -698,8 +761,9 @@ impl TrellisSsFlow {
     /// sparse_structure_flow.py:224-241); no device compute, safe outside graphs.
     pub fn stage(&mut self, blas: &Blas, x_f32: &[f32], t: f32, cond: &[bf16]) -> Result<()> {
         ensure!(
-            x_f32.len() == self.rows * 8 && cond.len() == self.context_rows * self.cond_width,
-            "SS flow input extent mismatch"
+            x_f32.len() == self.rows * self.in_channels
+                && cond.len() == self.context_rows * self.cond_width,
+            "flow input extent mismatch"
         );
         let d = &self.device;
         let n = self.rows;
@@ -807,8 +871,9 @@ impl TrellisSsFlow {
         record_states: bool,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
         ensure!(
-            noise.len() == self.rows * 8 && cond.len() == self.context_rows * self.cond_width,
-            "SS flow sample extent mismatch"
+            noise.len() == self.rows * self.in_channels
+                && cond.len() == self.context_rows * self.cond_width,
+            "flow sample extent mismatch"
         );
         let negative = vec![bf16::from_f32(0.0); cond.len()];
         let times = super::pixal3d::schedule(false, 12);
@@ -872,7 +937,15 @@ mod tests {
         let extents = [3usize, 4, 5];
         let dim = 128usize;
         let freq_dim = dim / 2 / 3;
-        let phases = rope_phase_values(extents, dim, freq_dim);
+        let mut sites = Vec::new();
+        for z in 0..extents[0] {
+            for y in 0..extents[1] {
+                for x in 0..extents[2] {
+                    sites.push([z as i32, y as i32, x as i32]);
+                }
+            }
+        }
+        let phases = rope_phase_sites(&sites, dim, freq_dim);
         let row = (extents[1] + 2) * extents[2] + 3;
         // Expected phases built from the model definition: freqs[i] =
         // 10000^(-i/21), pair p uses axis p/21 (slowest first) and freq p%21.
