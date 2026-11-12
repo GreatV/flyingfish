@@ -1197,4 +1197,188 @@ mod tests {
         );
         Ok(())
     }
+
+    #[ignore = "TRELLIS.2 SS sampler and decode: FF_TRELLIS2_SS_CHECKPOINT FF_TRELLIS2_SS_FIXTURES FF_TRELLIS2_SS_OUTPUT FF_TRELLIS_IMAGE_MODEL FLYINGFISH_RUNTIME_DIR, optional FF_TRELLIS2_SS_LIMIT_BYTES"]
+    #[test]
+    fn ss_sample_decode_cells_gpu() -> Result<()> {
+        let checkpoint: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SS_CHECKPOINT")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SS_CHECKPOINT missing")?;
+        ensure!(
+            checkpoint.is_file(),
+            "SS flow checkpoint not found: {}",
+            checkpoint.display()
+        );
+        let root: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SS_FIXTURES")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SS_FIXTURES missing")?;
+        let image_model: std::path::PathBuf = std::env::var_os("FF_TRELLIS_IMAGE_MODEL")
+            .map(Into::into)
+            .context("FF_TRELLIS_IMAGE_MODEL missing")?;
+        let runtime = std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let sampler_floor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("sampler-floor-r1/floor.json"))?)?;
+        let sampler_cells = sampler_floor["cells"]
+            .as_array()
+            .context("sampler floor cells missing")?;
+        let ss_floor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("ss-floor-r3.json"))?)?;
+        let ss_cells = ss_floor["cells"]
+            .as_array()
+            .context("SS floor cells missing")?;
+        let tau_of = |cells: &[serde_json::Value], id: &str| -> Result<(f64, f64)> {
+            let cell = cells
+                .iter()
+                .find(|c| c["id"] == id)
+                .with_context(|| format!("cell {id} missing"))?;
+            Ok((
+                cell["tau"]["max_abs"].as_f64().context("tau max_abs")?,
+                cell["tau"]["rmse"].as_f64().context("tau rmse")?,
+            ))
+        };
+        let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
+            ensure!(a.len() == b.len() && !a.is_empty(), "cell extent mismatch");
+            let mut maximum = 0.0f64;
+            let mut square = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                let d = f64::from(*x) - f64::from(*y);
+                maximum = maximum.max(d.abs());
+                square += d * d;
+            }
+            Ok((maximum, (square / a.len() as f64).sqrt()))
+        };
+        let device = Device::new(0)?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = match std::env::var("FF_TRELLIS2_SS_LIMIT_BYTES") {
+            Ok(value) => value
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid FF_TRELLIS2_SS_LIMIT_BYTES: {value}"))?,
+            Err(_) => (total - total / 8).saturating_sub(total - free),
+        };
+        let mut defects = 0usize;
+        let mut scored = 0usize;
+        let rows = 4096usize;
+        for fixture in ["cottage", "robot_crab"] {
+            let record = root.join(format!("ss-{fixture}-r0a"));
+            let mut noise = vec![0f32; rows * 8];
+            {
+                let stored = read_tensor(&record.join("sampler-input.safetensors"), "noise")?;
+                for (index, value) in stored.iter().enumerate() {
+                    noise[(index % rows) * 8 + index / rows] = *value;
+                }
+            }
+            let stored_neg: Vec<bf16> =
+                read_tensor(&record.join("sampler-input.safetensors"), "neg_cond")?
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect();
+            ensure!(
+                stored_neg.iter().all(|v| v.to_bits() == 0),
+                "stored unguided context is not all-zero bits"
+            );
+            // The frozen state cells price the Euler blend given the
+            // reference model outputs (the captured per-call velocities),
+            // not the native model difference, which the flow cells bound.
+            let mut velocities = Vec::new();
+            for call in 1..=22 {
+                let stored = read_tensor(
+                    &record.join(format!("flow-call{call}-velocity.safetensors")),
+                    "velocity",
+                )?;
+                let mut row_major = vec![0f32; rows * 8];
+                for (index, value) in stored.iter().enumerate() {
+                    row_major[(index % rows) * 8 + index / rows] = *value;
+                }
+                velocities.push(row_major);
+            }
+            let times = super::super::pixal3d::schedule(false, 12);
+            let mut sampler = super::super::pixal3d::Sampler::new(&device, &noise, true)?;
+            let mut call = 0usize;
+            let mut previous = noise.clone();
+            for step in 0..12 {
+                let t = times[step];
+                device
+                    .stream
+                    .memcpy_htod(&velocities[call], &mut sampler.positive)
+                    .map_err(anyhow::Error::from)?;
+                call += 1;
+                if (0.6..=1.0).contains(&t) {
+                    let branch = sampler
+                        .negative
+                        .as_mut()
+                        .context("CFG branch buffer missing")?;
+                    device
+                        .stream
+                        .memcpy_htod(&velocities[call], branch)
+                        .map_err(anyhow::Error::from)?;
+                    call += 1;
+                }
+                sampler.step(&device, t, times[step + 1], false)?;
+                let state: Vec<f32> = device.stream.clone_dtoh(&sampler.state)?.to_vec();
+                let stored = read_tensor(
+                    &record.join("sampler-output.safetensors"),
+                    &format!("state{}", step + 1),
+                )?;
+                let mut reference = vec![0f32; rows * 8];
+                for (index, value) in stored.iter().enumerate() {
+                    reference[(index % rows) * 8 + index / rows] = *value;
+                }
+                let id = format!("sampler/ss-{fixture}-r0a/state{}", step + 1);
+                let (tau_max, tau_rmse) = tau_of(sampler_cells, &id)?;
+                let (max_abs, rmse) = metric(&state, &reference)?;
+                let flipped: Vec<f32> = state
+                    .iter()
+                    .zip(previous.iter())
+                    .map(|(s, p)| 2.0 * p - s)
+                    .collect();
+                let (control_max, control_rmse) = metric(&state, &flipped)?;
+                let pass = max_abs <= tau_max && rmse <= tau_rmse;
+                let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+                println!(
+                    "TRELLIS2_SS_SAMPLE id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                    if pass && control_ok { "PASS" } else { "DEFECT" }
+                );
+                scored += 1;
+                defects += usize::from(!pass) + usize::from(!control_ok);
+                previous = state;
+            }
+            ensure!(call == 22, "captured velocity call count mismatch: {call}");
+            let decoder = super::super::pixal3d::PixalDecoder::open(
+                &device,
+                &image_model,
+                crate::pixal3d::DecoderKind::Structure,
+                &runtime,
+                limit,
+            )?;
+            let latent = read_tensor(&record.join("decoder-final.safetensors"), "latent")?;
+            let logits = decoder.structure(&latent)?;
+            let reference = read_tensor(&record.join("decoder-final.safetensors"), "logits")?;
+            for id in [
+                format!("ss/{fixture}/decoder-final/logits"),
+                format!("ss/{fixture}/decoder-out_layer.2/output"),
+            ] {
+                let (tau_max, tau_rmse) = tau_of(ss_cells, &id)?;
+                let (max_abs, rmse) = metric(&logits, &reference)?;
+                let flipped: Vec<f32> = logits.iter().map(|v| -v).collect();
+                let (control_max, control_rmse) = metric(&logits, &flipped)?;
+                let pass = max_abs <= tau_max && rmse <= tau_rmse;
+                let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+                println!(
+                    "TRELLIS2_SS_DECODE id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                    if pass && control_ok { "PASS" } else { "DEFECT" }
+                );
+                scored += 1;
+                defects += usize::from(!pass) + usize::from(!control_ok);
+            }
+        }
+        ensure!(
+            defects == 0,
+            "TRELLIS.2 SS sampler/decode gate: {defects} defects over {scored} cells"
+        );
+        println!("PASS TRELLIS2_SS_SAMPLE_DECODE cells={scored} fixtures=2 states=12");
+        Ok(())
+    }
 }
