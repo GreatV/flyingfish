@@ -2224,7 +2224,7 @@ mod tests {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
         );
         let floor: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("decoder-floor-r1.json"))?)?;
+            serde_json::from_slice(&std::fs::read(root.join("decoder-floor-mlp32-r2.json"))?)?;
         let cells = floor["cells"]
             .as_array()
             .context("decoder floor cells missing")?;
