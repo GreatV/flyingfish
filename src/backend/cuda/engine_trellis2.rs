@@ -794,6 +794,54 @@ impl TrellisSsFlow {
         let blocks = self.read_capture(captured_blocks)?;
         Ok((velocity, blocks))
     }
+
+    /// Euler interval-CFG sampling on the published 12-step schedule:
+    /// sigma_min 1e-5, rescale_t 5.0, guidance 7.5 with 0.7 rescale inside
+    /// [0.6, 1.0], single-branch outside; the unguided branch conditions on
+    /// a zero context.
+    pub fn sample(
+        &mut self,
+        blas: &Blas,
+        noise: &[f32],
+        cond: &[bf16],
+        record_states: bool,
+    ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        ensure!(
+            noise.len() == self.rows * 8 && cond.len() == self.context_rows * self.cond_width,
+            "SS flow sample extent mismatch"
+        );
+        let negative = vec![bf16::from_f32(0.0); cond.len()];
+        let times = super::pixal3d::schedule(false, 12);
+        let mut sampler = super::pixal3d::Sampler::new(&self.device, noise, true)?;
+        let mut states = Vec::new();
+        for step in 0..12 {
+            let t = times[step];
+            let state: Vec<f32> = self.device.stream.clone_dtoh(&sampler.state)?.to_vec();
+            let (positive, _) = self.velocity(blas, &state, (1000.0 * t) as f32, cond, &[])?;
+            self.device
+                .stream
+                .memcpy_htod(&positive, &mut sampler.positive)
+                .map_err(anyhow::Error::from)?;
+            if (0.6..=1.0).contains(&t) {
+                let (unguided, _) =
+                    self.velocity(blas, &state, (1000.0 * t) as f32, &negative, &[])?;
+                let branch = sampler
+                    .negative
+                    .as_mut()
+                    .context("CFG branch buffer missing")?;
+                self.device
+                    .stream
+                    .memcpy_htod(&unguided, branch)
+                    .map_err(anyhow::Error::from)?;
+            }
+            sampler.step(&self.device, t, times[step + 1], false)?;
+            if record_states {
+                states.push(self.device.stream.clone_dtoh(&sampler.state)?.to_vec());
+            }
+        }
+        let final_state: Vec<f32> = self.device.stream.clone_dtoh(&sampler.state)?.to_vec();
+        Ok((final_state, states))
+    }
 }
 
 fn ensure_captured_blocks(blocks: &[usize], total: usize, slots: usize) -> Result<()> {

@@ -3481,10 +3481,10 @@ impl<T: FlowElement> Flow<T> {
     }
 }
 
-struct Sampler {
-    state: CudaSlice<f32>,
-    positive: CudaSlice<f32>,
-    negative: Option<CudaSlice<f32>>,
+pub(crate) struct Sampler {
+    pub(crate) state: CudaSlice<f32>,
+    pub(crate) positive: CudaSlice<f32>,
+    pub(crate) negative: Option<CudaSlice<f32>>,
     velocity: CudaSlice<f32>,
     x0: Option<CudaSlice<f32>>,
     positive_x0: Option<CudaSlice<f32>>,
@@ -3496,7 +3496,7 @@ struct Sampler {
     euler: CudaFunction,
 }
 impl Sampler {
-    fn new(d: &Device, noise: &[f32], guided: bool) -> Result<Self> {
+    pub(crate) fn new(d: &Device, noise: &[f32], guided: bool) -> Result<Self> {
         ensure!(
             noise.len() > 1 && noise.iter().all(|x| x.is_finite()),
             "invalid flow noise"
@@ -3548,7 +3548,7 @@ impl Sampler {
         }
         Ok(())
     }
-    fn step(&mut self, d: &Device, t: f64, next: f64, sparse: bool) -> Result<()> {
+    pub(crate) fn step(&mut self, d: &Device, t: f64, next: f64, sparse: bool) -> Result<()> {
         ensure!(
             t.is_finite() && next.is_finite() && next >= 0.0 && next < t && t <= 1.0,
             "invalid Euler time pair"
@@ -3619,7 +3619,7 @@ impl Sampler {
     }
 }
 
-fn schedule(sparse: bool, steps: usize) -> Vec<f64> {
+pub(crate) fn schedule(sparse: bool, steps: usize) -> Vec<f64> {
     let scale = if sparse { 3.0 } else { 5.0 };
     (0..=steps)
         .map(|i| {
