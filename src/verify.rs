@@ -145,6 +145,43 @@ pub(crate) fn percentile(cell: &str, values: &[f64], q: f64) -> Result<f64> {
     Ok(value)
 }
 
+/// Derived systematic-ratio percentile. `+inf` is the ordered zero-probe sentinel; NaN, `-inf`,
+/// empty input and invalid `q` fail. Raw candidate/reference comparisons reject every non-finite value.
+fn systematic_percentile(cell: &str, values: &[f64], q: f64) -> Result<f64> {
+    ensure!(!values.is_empty(), "Runner FAIL {cell}: empty percentile");
+    ensure!(
+        q.is_finite() && (0.0..=1.0).contains(&q),
+        "Runner FAIL {cell}: invalid percentile q={q}"
+    );
+    let mut finite = Vec::with_capacity(values.len());
+    for (index, &value) in values.iter().enumerate() {
+        ensure!(
+            !value.is_nan() && value != f64::NEG_INFINITY,
+            "Runner FAIL {cell}: invalid ratio[{index}]={value}"
+        );
+        if value.is_finite() {
+            finite.push(value);
+        }
+    }
+    finite.sort_by(f64::total_cmp);
+    let index = q * (values.len() - 1) as f64;
+    let lo = finite
+        .get(index.floor() as usize)
+        .copied()
+        .unwrap_or(f64::INFINITY);
+    let hi = finite
+        .get(index.ceil() as usize)
+        .copied()
+        .unwrap_or(f64::INFINITY);
+    let value = if lo == hi {
+        lo
+    } else {
+        lo + (hi - lo) * (index - index.floor())
+    };
+    ensure!(!value.is_nan(), "Runner FAIL {cell}: NaN percentile result");
+    Ok(value)
+}
+
 fn logits_steps(value: &serde_json::Value) -> Result<usize> {
     Ok(value
         .as_array()
@@ -396,8 +433,8 @@ impl Rules {
                 .zip(probe)
                 .map(|(a, p)| if *p > 0.0 { *a / *p } else { f64::INFINITY })
                 .collect();
-            let median = percentile(&format!("systematic.{kind}.median"), &ratios, 0.5)?;
-            let p90 = percentile(&format!("systematic.{kind}.p90"), &ratios, 0.9)?;
+            let median = systematic_percentile(&format!("systematic.{kind}.median"), &ratios, 0.5)?;
+            let p90 = systematic_percentile(&format!("systematic.{kind}.p90"), &ratios, 0.9)?;
             let pass = median <= rule.gates.ratio_median_max && p90 <= rule.gates.ratio_p90_max;
             passed &= pass;
             println!(
@@ -421,9 +458,11 @@ impl Rules {
 pub struct Metrics {
     pub max_abs: f64,
     pub mean_abs: f64,
+    #[serde(skip)]
     pub rmse: f64,
     pub rel_rmse: f64,
     pub cosine: f64,
+    #[serde(skip)]
     pub peak_ref: f64,
     pub exact: bool,
 }
@@ -495,14 +534,34 @@ pub fn metrics<A: Scalar, B: Scalar>(
         (0f64, 0f64, 0f64, 0f64, 0f64);
     let mut peak_ref = 0f64;
     let mut exact = true;
-    for (&c, &r) in candidate.iter().zip(reference) {
+    for (index, (&c, &r)) in candidate.iter().zip(reference).enumerate() {
         let a = c.to_f64();
         let r = r.to_f64();
         sum_abs += (a - r).abs();
+        ensure!(
+            sum_abs.is_finite(),
+            "Runner FAIL {cell}: absolute-sum overflow at [{index}]"
+        );
         square_error += (a - r).powi(2);
+        ensure!(
+            square_error.is_finite(),
+            "Runner FAIL {cell}: squared-error overflow at [{index}]"
+        );
         square_ref += r.powi(2);
+        ensure!(
+            square_ref.is_finite(),
+            "Runner FAIL {cell}: squared-reference overflow at [{index}]"
+        );
         square_actual += a.powi(2);
+        ensure!(
+            square_actual.is_finite(),
+            "Runner FAIL {cell}: squared-candidate overflow at [{index}]"
+        );
         dot += a * r;
+        ensure!(
+            dot.is_finite(),
+            "Runner FAIL {cell}: dot-product overflow at [{index}]"
+        );
         peak_ref = peak_ref.max(r.abs());
         exact &= a.to_bits() == r.to_bits();
     }
@@ -518,7 +577,19 @@ pub fn metrics<A: Scalar, B: Scalar>(
     let cosine = if square_actual == 0.0 || square_ref == 0.0 {
         if exact { 1.0 } else { 0.0 }
     } else {
-        dot / (square_actual * square_ref).sqrt()
+        let product = square_actual * square_ref;
+        let norm = if product.is_finite() && product > 0.0 {
+            product.sqrt()
+        } else {
+            square_actual.sqrt() * square_ref.sqrt()
+        };
+        ensure!(
+            norm.is_finite() && norm > 0.0,
+            "Runner FAIL {cell}: invalid norm product"
+        );
+        let cosine = dot / norm;
+        ensure!(cosine.is_finite(), "Runner FAIL {cell}: non-finite cosine");
+        cosine
     };
     Ok(Metrics {
         max_abs,
@@ -1180,6 +1251,104 @@ mod tests {
     fn ties_select_smallest_id_and_positive_margin() -> Result<()> {
         assert_eq!(top_two("test.ties", &[-2.0, -2.0, -3.0])?, (0, 0.0));
         assert_eq!(top_two("test.margin", &[-3.0, -1.0, -2.0])?, (1, 1.0));
+        Ok(())
+    }
+
+    #[test]
+    fn saved_metrics_keep_the_main_schema_and_compare_saved_rechecks_them() -> Result<()> {
+        use std::collections::BTreeSet;
+        use std::fmt::Write as _;
+
+        let metric = Metrics {
+            max_abs: 0.2,
+            mean_abs: 0.01,
+            rmse: 0.2,
+            rel_rmse: 0.0,
+            cosine: 1.0,
+            peak_ref: 1.0,
+            exact: true,
+        };
+        let record = serde_json::to_string(&metric)?;
+        let fields: BTreeSet<_> = serde_json::from_str::<serde_json::Value>(&record)?
+            .as_object()
+            .context("serialized metrics are not an object")?
+            .keys()
+            .cloned()
+            .collect();
+        let expected: BTreeSet<_> = ["cosine", "exact", "max_abs", "mean_abs", "rel_rmse"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(fields, expected);
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "flyingfish-verify-saved-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory)?;
+        let fixture = directory.join("fixture.safetensors");
+        let log_path = directory.join("saved.jsonl");
+        std::fs::write(&fixture, [])?;
+        let mut log = String::new();
+        writeln!(
+            log,
+            "{{\"tensor\":\"hidden_states.0\",\"metrics\":{record}}}"
+        )?;
+        for step in 0..STEPS {
+            writeln!(
+                log,
+                "{{\"step\":{step},\"logits\":{record},\"actual_token\":0,\"expected_token\":0,\"reference_margin\":1.0}}"
+            )?;
+        }
+        writeln!(
+            log,
+            "{{\"teacher_forced\":true,\"fixture\":{}}}",
+            serde_json::to_string(&fixture.to_string_lossy())?
+        )?;
+        std::fs::write(&log_path, log)?;
+        let mut rules = rules(STEPS, (0.1, 1.5), (0.01, 0.2), (1.5, 2.5));
+        rules.hidden = Some(HiddenRules {
+            limits: vec![LayerLimit {
+                rel: 0.2,
+                cos_min: 0.99,
+            }],
+            source: "test".into(),
+        });
+        compare_saved(&fixture, &log_path, &rules)?;
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_metrics_guard_large_f64_intermediates() -> Result<()> {
+        let m = metrics("test.large.finite", &[1e100], &[1e100])?;
+        assert_eq!(m.cosine, 1.0);
+        assert_eq!(m.rel_rmse, 0.0);
+        let error = metrics("test.large.overflow", &[1e200], &[1e200])
+            .map(|_| ())
+            .expect_err("squared f64 norms must not overflow silently")
+            .to_string();
+        assert!(
+            error.contains("test.large.overflow")
+                && error.contains("overflow")
+                && error.contains("[0]"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn systematic_percentile_preserves_the_zero_probe_sentinel() -> Result<()> {
+        let mut ratios = vec![1.0; 63];
+        ratios.push(f64::INFINITY);
+        assert_eq!(systematic_percentile("test.sentinel", &ratios, 0.5)?, 1.0);
+        assert_eq!(systematic_percentile("test.sentinel", &ratios, 0.9)?, 1.0);
+        assert!(systematic_percentile("test.sentinel", &[f64::NAN], 0.5).is_err());
+        assert!(systematic_percentile("test.sentinel", &[], 0.5).is_err());
+        assert!(percentile("test.raw", &[f64::INFINITY], 0.5).is_err());
         Ok(())
     }
 
