@@ -5691,6 +5691,8 @@ struct CheckpointPickle<'a> {
     memo: BTreeMap<usize, std::rc::Rc<CheckpointValue>>,
     entries: &'a BTreeMap<String, std::ops::Range<usize>>,
     prefix: &'a str,
+    /// Storage files referenced by tensors, including storages shared by views.
+    consumed: BTreeSet<String>,
 }
 
 impl CheckpointPickle<'_> {
@@ -5753,23 +5755,23 @@ impl CheckpointPickle<'_> {
                 .context("tensor element count overflow")?;
         }
         ensure!(
-            offset == 0 && elements == *count,
+            offset + elements <= *count,
             "tensor storage offset/size mismatch"
         );
         let range = self
             .entries
             .get(&format!("{}data/{storage}", self.prefix))
             .context("tensor ZIP storage missing")?;
+        self.consumed
+            .insert(format!("{}data/{storage}", self.prefix));
         ensure!(
-            range.len()
-                == elements
-                    .checked_mul(4)
-                    .context("tensor byte count overflow")?,
+            range.len() == count.checked_mul(4).context("tensor byte count overflow")?,
             "tensor storage byte count mismatch"
         );
+        let start = range.start + offset * 4;
         Ok(V::Tensor(StoredTensor {
             shape,
-            range: range.clone(),
+            range: start..start + elements * 4,
         }))
     }
     fn persistent(&mut self) -> Result<CheckpointValue> {
@@ -5815,7 +5817,7 @@ impl CheckpointPickle<'_> {
             .push(std::rc::Rc::new(CheckpointValue::Dictionary(map)));
         Ok(())
     }
-    fn parse(mut self) -> Result<BTreeMap<String, StoredTensor>> {
+    fn parse(mut self) -> Result<(BTreeMap<String, StoredTensor>, BTreeSet<String>)> {
         use CheckpointValue as V;
         use std::rc::Rc;
         ensure!(
@@ -5965,7 +5967,7 @@ impl CheckpointPickle<'_> {
                         tensors.insert(name.clone(), tensor.clone());
                     }
                     ensure!(!tensors.is_empty(), "empty state dictionary");
-                    return Ok(tensors);
+                    return Ok((tensors, self.consumed));
                 }
                 _ => bail!(
                     "unsupported pickle opcode 0x{opcode:02x} at {}",
@@ -6013,7 +6015,7 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
         range.len() <= 16 * 1024 * 1024,
         "pickle metadata exceeds 16 MiB"
     );
-    let tensors = CheckpointPickle {
+    let parser = CheckpointPickle {
         bytes: CheckpointBytes {
             data: &data[range],
             position: 0,
@@ -6021,9 +6023,10 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
         stack: Vec::new(),
         memo: BTreeMap::new(),
         entries: &entries,
+        consumed: BTreeSet::new(),
         prefix,
-    }
-    .parse()?;
+    };
+    let (tensors, consumed) = parser.parse()?;
     let allowed: BTreeSet<_> = [
         "data.pkl",
         "byteorder",
@@ -6038,8 +6041,7 @@ fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
     ensure!(
         entries
             .iter()
-            .all(|(name, range)| allowed.contains(name)
-                || tensors.values().any(|t| t.range == *range)),
+            .all(|(name, _)| allowed.contains(name) || consumed.contains(name)),
         "unconsumed ZIP entries"
     );
     let id = entries
@@ -6147,6 +6149,10 @@ mod stored_zip_tests {
     }
 
     fn pickle(offset: u8) -> Vec<u8> {
+        pickle_storage(offset, 2)
+    }
+
+    fn pickle_storage(offset: u8, count: u8) -> Vec<u8> {
         let mut data = b"\x80\x02ccollections\nOrderedDict\n)R(".to_vec();
         fn string(data: &mut Vec<u8>, value: &str) {
             data.push(b'X');
@@ -6159,7 +6165,7 @@ mod stored_zip_tests {
         data.extend_from_slice(b"ctorch\nFloatStorage\n");
         string(&mut data, "0");
         string(&mut data, "cuda:0");
-        data.extend_from_slice(&[b'K', 2, b't', b'Q', b'K', offset]);
+        data.extend_from_slice(&[b'K', count, b't', b'Q', b'K', offset]);
         data.extend_from_slice(b"K\x02\x85K\x01\x85\x89ccollections\nOrderedDict\n)RtRu.");
         data
     }
@@ -6203,6 +6209,35 @@ mod stored_zip_tests {
         ensure!(
             stored_zip_tensors(&archive(&pickle(1), 0)).is_err(),
             "wrong storage offset accepted"
+        );
+        // A contiguous view at a nonzero offset over a larger storage (the
+        // multitalker RNNT LSTM gate weights share one storage).
+        let view_storage = [
+            1.25f32.to_le_bytes(),
+            (-2.5f32).to_le_bytes(),
+            0.5f32.to_le_bytes(),
+        ]
+        .concat();
+        let view_data = zip_members(
+            &[
+                ("model/data.pkl", pickle_storage(1, 3).as_slice()),
+                ("model/data/0", view_storage.as_slice()),
+                ("model/byteorder", b"little".as_slice()),
+                ("model/version", b"3\n".as_slice()),
+            ],
+            0,
+        );
+        let tensors = stored_zip_tensors(&view_data)?;
+        let tensor = &tensors["weight"];
+        ensure!(
+            tensor.shape == [2]
+                && view_data[tensor.range.clone()]
+                    == [(-2.5f32).to_le_bytes(), 0.5f32.to_le_bytes()].concat(),
+            "viewed stored tensor bytes"
+        );
+        ensure!(
+            stored_zip_tensors(&archive(&pickle_storage(2, 3), 0)).is_err(),
+            "view past the storage end accepted"
         );
         let mut unknown = pickle(0);
         unknown[2] = 0xff;

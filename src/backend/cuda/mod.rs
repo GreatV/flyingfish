@@ -25,6 +25,7 @@ mod engine_canary_tests;
 #[cfg(feature = "cuda")]
 pub mod engine_diarization;
 pub mod engine_eou;
+pub mod engine_multitalker;
 #[cfg(feature = "cuda")]
 pub(crate) mod engine_music3_syn;
 #[cfg(feature = "cuda")]

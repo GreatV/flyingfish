@@ -43,6 +43,7 @@ Speech (library entry points, no CLI):
 | Nemotron 3.5 ASR streaming 0.6B | FastConformer encoder over a full clip and as a chunked stream with cached context; the RNNT decoder and joint are not run; `flyingfish::parakeet::ParakeetEncoder` | CUDA |
 | parakeet realtime EOU 120M | Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware streaming with a reset on end-of-utterance; `flyingfish::eou::Eou` | CUDA |
 | Nemotron-3-Diarization | Offline and streaming speaker diarization with an arrival-order speaker cache; `flyingfish::diarization::Diarization` | CUDA |
+| Multitalker Parakeet streaming 0.6B | Reads the `.nemo` container in place; 1-4 speaker lanes through the pre-encode, layer-0 speaker and background kernels, and 24 conformer layers with block-anchored attention windows; the RNNT decoder and joint are not run; `flyingfish::multitalker::Multitalker` | CUDA |
 | Breeze-TTS-2 | Text encoder, backbone and depth decoder; greedy decode over supplied audio-code frames with per-layer KV caches and CUDA-graph replay; audio tokenizer decode to a 24 kHz waveform; `flyingfish::backend::{Breeze, BreezeTokenizer}`. No sampling and no free-running text-to-speech entry | CUDA |
 
 Media generation (library entry points and CLI):

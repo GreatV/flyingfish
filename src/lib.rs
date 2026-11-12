@@ -29,6 +29,7 @@ pub mod minimax_h3;
 pub mod model;
 pub mod model_spec;
 pub mod mtp;
+pub mod multitalker;
 pub mod music3;
 pub mod nemotron;
 pub mod op_contract;

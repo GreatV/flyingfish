@@ -168,6 +168,39 @@ impl LogMel {
         })
     }
 
+    /// Builds the frontend from the published `preprocessor.featurizer` tensors:
+    /// a `[win_length]` window centered into the n_fft frame and a
+    /// `[mel_bins, n_fft/2+1]` filterbank.
+    pub fn with_filterbank(
+        config: LogMelConfig,
+        window: Vec<f32>,
+        filters: Vec<f32>,
+    ) -> Result<Self> {
+        let n_fft = config.n_fft as usize;
+        let bins = n_fft / 2 + 1;
+        ensure!(
+            window.len() >= 2 && window.len() <= n_fft && window.iter().all(|v| v.is_finite()),
+            "published window length {}",
+            window.len()
+        );
+        ensure!(
+            filters.len() == config.mel_bins as usize * bins
+                && filters.iter().all(|v| v.is_finite()),
+            "published filterbank length {}",
+            filters.len()
+        );
+        let fft = Radix2Fft::new(n_fft)?;
+        let mut padded = vec![0.0; n_fft];
+        let first = (n_fft - window.len()) / 2;
+        padded[first..first + window.len()].copy_from_slice(&window);
+        Ok(Self {
+            config,
+            fft,
+            window: padded,
+            filters,
+        })
+    }
+
     pub fn extract(
         &self,
         waveforms: &[&[f32]],

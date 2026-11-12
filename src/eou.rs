@@ -8,11 +8,11 @@ use anyhow::{Context, Result, bail, ensure};
 use memmap2::MmapOptions;
 use std::{fs::File, path::Path};
 
-mod yaml {
+pub(crate) mod yaml {
     use anyhow::{Context, Result, bail, ensure};
     use std::collections::BTreeMap;
 
-    pub(super) enum Value {
+    pub(crate) enum Value {
         Scalar(String),
         Sequence(Vec<Value>),
         Mapping(BTreeMap<String, Value>),
@@ -161,6 +161,14 @@ mod yaml {
                     };
                     self.lines.insert(self.position, item);
                     items.push(self.mapping(line_indent + 2)?);
+                } else if rest.trim_start().starts_with('-') {
+                    let item = Line {
+                        number,
+                        indent: line_indent + 2,
+                        text: format!("{}{}", " ".repeat(line_indent + 2), rest),
+                    };
+                    self.lines.insert(self.position, item);
+                    items.push(self.sequence(line_indent + 2)?);
                 } else {
                     items.push(Value::Scalar(scalar(&rest, number)?));
                 }
@@ -225,7 +233,7 @@ mod yaml {
         }
     }
 
-    pub(super) fn parse(text: &str) -> Result<Value> {
+    pub(crate) fn parse(text: &str) -> Result<Value> {
         let mut lines = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let stripped = strip_comment(raw, index + 1)?;
@@ -264,7 +272,7 @@ mod yaml {
             map.get(key)
                 .with_context(|| format!("yaml key missing: {key}"))
         }
-        pub(super) fn mapping(&self, key: &str) -> Result<&Value> {
+        pub(crate) fn mapping(&self, key: &str) -> Result<&Value> {
             let value = self.entry(key)?;
             ensure!(
                 matches!(value, Value::Mapping(_)),
@@ -272,31 +280,31 @@ mod yaml {
             );
             Ok(value)
         }
-        pub(super) fn sequence(&self, key: &str) -> Result<&[Value]> {
+        pub(crate) fn sequence(&self, key: &str) -> Result<&[Value]> {
             let value = self.entry(key)?;
             let Value::Sequence(items) = value else {
                 bail!("yaml key {key} is not a sequence");
             };
             Ok(items)
         }
-        pub(super) fn text(&self, key: &str) -> Result<&str> {
+        pub(crate) fn text(&self, key: &str) -> Result<&str> {
             let value = self.entry(key)?;
             let Value::Scalar(text) = value else {
                 bail!("yaml key {key} is not a scalar");
             };
             Ok(text)
         }
-        pub(super) fn integer(&self, key: &str) -> Result<i64> {
+        pub(crate) fn integer(&self, key: &str) -> Result<i64> {
             self.text(key)?
                 .parse::<i64>()
                 .with_context(|| format!("yaml key {key} is not an integer"))
         }
-        pub(super) fn float(&self, key: &str) -> Result<f64> {
+        pub(crate) fn float(&self, key: &str) -> Result<f64> {
             self.text(key)?
                 .parse::<f64>()
                 .with_context(|| format!("yaml key {key} is not a float"))
         }
-        pub(super) fn boolean(&self, key: &str) -> Result<bool> {
+        pub(crate) fn boolean(&self, key: &str) -> Result<bool> {
             match self.text(key)? {
                 "true" => Ok(true),
                 "false" => Ok(false),
