@@ -11194,6 +11194,12 @@ mod tests {
     const BLOCK1_TAU: (f64, f64) = (256.0, 3.944915533065796);
     const BLOCK6_TAU: (f64, f64) = (1e-6, 1e-7);
     const TEMB_TAU: (f64, f64) = (0.00738525390625, 0.0026896463241428137);
+    /// 1000 rows. Remainders 8, 40 and 232 against tiles 16, 64 and 256.
+    const RAGGED_ROWS: usize = 1000;
+    /// max(2 × worst pair, eps). Worst pair is floor-cpu versus either GPU: max-abs 768, RMSE 2.6518330574035645.
+    const RAGGED_BLOCK0_TAU: (f64, f64) = (1536.0, 5.303666114807129);
+    /// Worst max-abs is 256. Worst RMSE is 4090 versus A4000, 1.9843404293060303.
+    const RAGGED_BLOCK1_TAU: (f64, f64) = (512.0, 3.9686808586120605);
 
     fn record_cell(
         arm: &str,
@@ -11231,9 +11237,9 @@ mod tests {
         }
     }
 
-    /// INT8 block 0, low-rank block 1, dropped block 6, and the pre-SiLU f32 temb mix, at the frozen pair taus.
+    /// INT8 block 0, low-rank block 1, dropped block 6, the pre-SiLU f32 temb mix, and blocks 0 and 1 at 1000 rows.
     #[test]
-    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_BLOCK_REF"]
+    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_BLOCK_REF, FF_HYPERFLOW_BLOCK_REF_RAGGED"]
     fn hyperflow_block_cells_match_the_definition() -> Result<()> {
         let model = env_dir("FF_HYPERFLOW_MODEL")?;
         let reference = env_dir("FF_HYPERFLOW_BLOCK_REF")?;
@@ -11329,6 +11335,46 @@ mod tests {
             "reference-temb-swapped",
             max_rmse(&f64_of_f32(&temb_swapped), &f64_of_f32(&temb_ref))?,
             TEMB_TAU,
+            &mut control_fail,
+        );
+        let ragged = env_dir("FF_HYPERFLOW_BLOCK_REF_RAGGED")?;
+        let ragged_meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(ragged.join("meta.json"))?)?;
+        ensure!(
+            ragged_meta["candidate_run"].as_bool() == Some(false),
+            "ragged reference arm is marked as a candidate run"
+        );
+        ensure!(
+            ragged_meta["rows"].as_u64() == Some(u64::try_from(RAGGED_ROWS)?),
+            "ragged reference rows"
+        );
+        let (ragged_steps, ragged_ends) = pair_columns(&ragged_meta)?;
+        ensure!(
+            ragged_steps == timesteps && ragged_ends == endpoints,
+            "ragged pairs differ from the 20-row arm"
+        );
+        let ragged_count = RAGGED_ROWS * spec.hidden;
+        let ragged_hidden = read_bf16(&ragged.join("hidden.i16"), ragged_count)?;
+        let ragged_positions = read_f32(&ragged.join("positions.f32"), RAGGED_ROWS * 3)?;
+        let ragged_adaln = read_u32(&ragged.join("adaln.i32"), RAGGED_ROWS)?;
+        ensure!(
+            ragged_adaln.iter().all(|&index| index < entries),
+            "ragged adaln index is outside {entries} rows"
+        );
+        let ragged_block0 = read_bf16(&ragged.join("block0.i16"), ragged_count)?;
+        let ragged_block1 = read_bf16(&ragged.join("block1.i16"), ragged_count)?;
+        let ragged_control0 = read_bf16(&ragged.join("control0.i16"), ragged_count)?;
+        let ragged_control1 = read_bf16(&ragged.join("control1.i16"), ragged_count)?;
+        record_control(
+            "reference-ragged-block0",
+            max_rmse(&f64_of_bf16(&ragged_control0), &f64_of_bf16(&ragged_block0))?,
+            RAGGED_BLOCK0_TAU,
+            &mut control_fail,
+        );
+        record_control(
+            "reference-ragged-block1",
+            max_rmse(&f64_of_bf16(&ragged_control1), &f64_of_bf16(&ragged_block1))?,
+            RAGGED_BLOCK1_TAU,
             &mut control_fail,
         );
         ensure!(
@@ -11540,12 +11586,118 @@ mod tests {
             BLOCK6_TAU,
             &mut defects,
         );
+        drop(flash);
+        drop(work);
+        let ragged_coords: Vec<[f64; 3]> = ragged_positions
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|row| [f64::from(row[0]), f64::from(row[1]), f64::from(row[2])])
+            .collect();
+        ensure!(ragged_coords.len() == RAGGED_ROWS, "ragged position rows");
+        let ragged_rotary_host = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &ragged_coords);
+        ensure!(
+            ragged_rotary_host.len() == RAGGED_ROWS * 6 * spec.rope_freq_dim,
+            "ragged rotary length {}",
+            ragged_rotary_host.len()
+        );
+        let mut flash = Flash::new(
+            s.clone(),
+            RAGGED_ROWS,
+            spec.heads,
+            spec.heads,
+            spec.head_dim,
+        )?
+        .with_full_single_probability()?;
+        let mut work = BlockWork::new(s, &spec, 0, RAGGED_ROWS)?;
+        work.prepare::<false>(&blas, &spec)?;
+        let ragged_rotary = s.clone_htod(&ragged_rotary_host)?;
+        let ragged_index = s.clone_htod(&ragged_adaln)?;
+        let ragged_swapped = s.clone_htod(&swap_video_pair(&ragged_adaln))?;
+        for (block, tau, reference_out) in [
+            (0usize, RAGGED_BLOCK0_TAU, ragged_block0),
+            (1, RAGGED_BLOCK1_TAU, ragged_block1),
+        ] {
+            let mut lora = Source::new(&model, &manifest);
+            let weights = BlockWeights::stored(
+                s,
+                &spec,
+                &format!("transformer_blocks.{block}"),
+                &mut source,
+                &mut lora,
+                None,
+            )?;
+            let name = format!("transformer_blocks.{block}.adaln_proj.linear");
+            for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
+                source.fill(s, &format!("{name}.{suffix}"), &mut buffer.slice_mut(..))?;
+            }
+            blas.linear_biased(
+                matrix(&weight, s, modulation_width, spec.time_dim)?,
+                vector(&bias, s)?,
+                matrix(&x, s, timesteps.len(), spec.time_dim)?,
+                &mut TensorMut(matrix(&projected, s, timesteps.len(), modulation_width)?),
+                mode,
+            )?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: 0.0,
+            };
+            let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
+                let mut row = s.clone_htod(&ragged_hidden)?;
+                let modulation = Modulation {
+                    table: &projected,
+                    offset: 0,
+                    entries,
+                    index,
+                };
+                block_forward::<false>(
+                    &context,
+                    &mut flash,
+                    &weights,
+                    &Conditioning::Modulated {
+                        rotary: &ragged_rotary,
+                        modulation: &modulation,
+                    },
+                    &mut row,
+                    &mut work,
+                )?;
+                let host = s.clone_dtoh(&row)?;
+                ensure!(
+                    host.len() == ragged_hidden.len()
+                        && host.iter().all(|v| v.to_f32().is_finite()),
+                    "ragged block {block} output extent or a non-finite value"
+                );
+                Ok(host.into_iter().map(|v| f64::from(v.to_f32())).collect())
+            };
+            let output = launch(&ragged_index)?;
+            record_cell(
+                &arm,
+                if block == 0 {
+                    "ragged-block0"
+                } else {
+                    "ragged-block1"
+                },
+                max_rmse(&output, &f64_of_bf16(&reference_out))?,
+                tau,
+                &mut defects,
+            );
+            let swapped_out = launch(&ragged_swapped)?;
+            record_control(
+                &format!("candidate-ragged-block{block}"),
+                max_rmse(&swapped_out, &output)?,
+                tau,
+                &mut control_fail,
+            );
+        }
         ensure!(
             control_fail.is_empty(),
             "control stayed within 10x tau: {control_fail:?}"
         );
         if defects.is_empty() {
-            println!("HYPERFLOW_BLOCK_GATE PASS cells=4 controls=FAIL_AS_REQUIRED");
+            println!("HYPERFLOW_BLOCK_GATE PASS cells=6 controls=FAIL_AS_REQUIRED");
         } else {
             println!("HYPERFLOW_BLOCK_GATE DEFECT cells={defects:?} controls=FAIL_AS_REQUIRED");
         }
