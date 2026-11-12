@@ -10,6 +10,8 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::mpsc;
 
 /// Alignment of a ring slot; one slot holds one expert's gate-up then down bytes.
 const RING_ALIGN: usize = 4096;
@@ -70,6 +72,8 @@ struct AlignedSlot {
     residues: UnsafeCell<Vec<u32>>,
     /// Packed logical bytes. Filled on the first `values` view when a window is in use.
     packed_view: UnsafeCell<Vec<u8>>,
+    /// Staging for this slot's non-window slices. One fill owns it until the fill returns.
+    staging: Cell<Option<AlignedBytes>>,
 }
 
 /// One slice inside a ring slot. `ring` is the window or staged-tail offset.
@@ -166,6 +170,7 @@ impl AlignedSlot {
             state: Cell::new(RingState::Free),
             residues: UnsafeCell::new(Vec::new()),
             packed_view: UnsafeCell::new(Vec::new()),
+            staging: Cell::new(None),
         })
     }
 }
@@ -380,6 +385,51 @@ pub(crate) fn plan_spans(
     Ok(spans)
 }
 
+fn filesystem_alignment(file: &File) -> Result<u64> {
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the file descriptor is open and stat is writable.
+    let rc = unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) };
+    ensure!(rc == 0, "fstatvfs: {}", std::io::Error::last_os_error());
+    // SAFETY: sysconf takes no pointer arguments.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    ensure!(
+        page > 0 && stat.f_frsize > 0,
+        "invalid direct IO page/filesystem block size"
+    );
+    let page = u64::try_from(page)?;
+    let block = stat.f_frsize;
+    let (mut a, mut b) = (page, block);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let alignment = (page / a)
+        .checked_mul(block)
+        .context("direct IO alignment overflow")?;
+    require_direct_alignment(alignment)?;
+    Ok(alignment)
+}
+
+/// Alignment `DiskReader::open` will require of the shards under `path`.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn directory_alignment(path: &Path) -> Result<u64> {
+    let file = File::open(path)
+        .with_context(|| format!("open {} for direct alignment", path.display()))?;
+    filesystem_alignment(&file)
+}
+
+/// Outstanding `read_at` calls for one layer. The depth is `top_k`.
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) fn disk_read_depth(path: &Path, top_k: u32) -> Result<u32> {
+    ensure!(top_k >= 1, "disk read depth has top_k 0");
+    File::open(path).with_context(|| format!("open {} for disk read depth", path.display()))?;
+    Ok(top_k)
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn ring_slot_bytes(layout: &ExpertLayout, alignment: u64) -> Result<u64> {
+    u64::try_from(plan_slot(layout, alignment)?.ring_bytes).context("ring slot bytes exceed u64")
+}
+
 /// Shared shard reader; direct mode uses filesystem-derived aligned IO.
 pub(crate) struct SpanReader {
     file: File,
@@ -401,34 +451,7 @@ impl SpanReader {
             .with_context(|| format!("open native shard {} direct={direct}", path.display()))?;
         let len = file.metadata().context("stat native shard")?.len();
         let alignment = if direct {
-            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-            // SAFETY: the file descriptor is open and stat is writable.
-            let rc = unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) };
-            ensure!(
-                rc == 0,
-                "native shard fstatvfs: {}",
-                std::io::Error::last_os_error()
-            );
-            // SAFETY: sysconf takes no pointer arguments.
-            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            ensure!(
-                page > 0 && stat.f_frsize > 0,
-                "invalid direct IO page/filesystem block size"
-            );
-            let page = u64::try_from(page)?;
-            let block = stat.f_frsize;
-            let (mut a, mut b) = (page, block);
-            while b != 0 {
-                (a, b) = (b, a % b);
-            }
-            let alignment = (page / a)
-                .checked_mul(block)
-                .context("direct IO alignment overflow")?;
-            ensure!(
-                alignment.is_power_of_two() && alignment >= RING_ALIGN as u64,
-                "invalid direct IO alignment {alignment}"
-            );
-            alignment
+            filesystem_alignment(&file)?
         } else {
             RING_ALIGN as u64
         };
@@ -603,14 +626,203 @@ impl SpanReader {
     }
 }
 
+struct FillJob {
+    id: usize,
+    layer: u32,
+    expert: u32,
+    slot: *const AlignedSlot,
+    plan: *const SlotPlan,
+    parts: Vec<(u64, NativeRange)>,
+}
+
+// SAFETY: `slot` and `plan` stay in the owning `DiskReader` until this job's reply is received.
+// The owner does not move that reader or write the slot while the job runs. One job writes one slot.
+unsafe impl Send for FillJob {}
+
+enum ReadCmd {
+    Fill(FillJob),
+    Stop,
+}
+
+struct Done {
+    id: usize,
+    result: Result<()>,
+}
+
+/// `open` starts one thread per ring slot. The thread blocks in `read_at` into that slot.
+/// `read_experts` submits the layer's routed experts, at most one per slot, and waits for every read.
+/// A read error or a short read returns the first failure in submission order and names the layer, expert, and slice.
+struct ReadPool {
+    txs: Vec<mpsc::SyncSender<ReadCmd>>,
+    done: mpsc::Receiver<Done>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ReadPool {
+    fn empty() -> Self {
+        let (_tx, done) = mpsc::channel();
+        Self {
+            txs: Vec::new(),
+            done,
+            threads: Vec::new(),
+        }
+    }
+
+    fn start(shards: Arc<BTreeMap<String, SpanReader>>, threads: usize) -> Result<Self> {
+        let (done_tx, done) = mpsc::channel();
+        let mut txs: Vec<mpsc::SyncSender<ReadCmd>> = Vec::with_capacity(threads);
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let (tx, rx) = mpsc::sync_channel(1);
+            let shards = Arc::clone(&shards);
+            let done_tx = done_tx.clone();
+            let handle = match std::thread::Builder::new()
+                .name("expert-disk-read".into())
+                .spawn(move || reader_loop(shards, rx, done_tx))
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    for tx in &txs {
+                        let _ = tx.send(ReadCmd::Stop);
+                    }
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(error).context("start expert disk reader");
+                }
+            };
+            txs.push(tx);
+            handles.push(handle);
+        }
+        drop(done_tx);
+        Ok(Self {
+            txs,
+            done,
+            threads: handles,
+        })
+    }
+}
+
+impl Drop for ReadPool {
+    fn drop(&mut self) {
+        for tx in &self.txs {
+            let _ = tx.send(ReadCmd::Stop);
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn reader_loop(
+    shards: Arc<BTreeMap<String, SpanReader>>,
+    rx: mpsc::Receiver<ReadCmd>,
+    done: mpsc::Sender<Done>,
+) {
+    while let Ok(job) = rx.recv() {
+        match job {
+            ReadCmd::Stop => break,
+            ReadCmd::Fill(fill) => {
+                #[cfg(test)]
+                flight::enter();
+                let result = fill_job(&shards, &fill);
+                #[cfg(test)]
+                flight::leave();
+                if done
+                    .send(Done {
+                        id: fill.id,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn fill_job(shards: &BTreeMap<String, SpanReader>, fill: &FillJob) -> Result<()> {
+    // SAFETY: the owner waits for this reply before moving the reader or writing this slot.
+    let slot = unsafe { &*fill.slot };
+    let plan = unsafe { &*fill.plan };
+    let parts: Vec<(u64, &NativeRange)> = fill
+        .parts
+        .iter()
+        .map(|(packed, native)| (*packed, native))
+        .collect();
+    fill_slot(shards, plan, slot, &parts, fill.layer, fill.expert)
+}
+
+#[cfg(test)]
+mod flight {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static HOLD: AtomicUsize = AtomicUsize::new(0);
+    static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED: AtomicUsize = AtomicUsize::new(0);
+    static SERIAL: AtomicBool = AtomicBool::new(false);
+
+    // `arrived` and `released` stay through `leave`. `reset` clears them.
+    pub(super) fn enter() {
+        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+        if SERIAL.load(Ordering::SeqCst) {
+            return;
+        }
+        let hold = HOLD.load(Ordering::SeqCst);
+        if hold <= 1 {
+            return;
+        }
+        let ticket = ARRIVED.fetch_add(1, Ordering::SeqCst) + 1;
+        if ticket >= hold {
+            RELEASED.store(ticket, Ordering::SeqCst);
+            return;
+        }
+        while RELEASED.load(Ordering::SeqCst) < hold && HOLD.load(Ordering::SeqCst) >= hold {
+            std::thread::yield_now();
+        }
+    }
+
+    pub(super) fn leave() {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn reset() {
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+        ARRIVED.store(0, Ordering::SeqCst);
+        RELEASED.store(0, Ordering::SeqCst);
+    }
+
+    pub(super) fn max_in_flight() -> usize {
+        MAX_IN_FLIGHT.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn hold(n: usize) {
+        HOLD.store(n, Ordering::SeqCst);
+    }
+
+    pub(super) fn force_serial(on: bool) {
+        SERIAL.store(on, Ordering::SeqCst);
+    }
+
+    pub(super) fn serial() -> bool {
+        SERIAL.load(Ordering::SeqCst)
+    }
+}
+
 /// Read-only disk tier over the native checkpoint shards with a bounded aligned ring.
 pub struct DiskReader {
-    shards: BTreeMap<String, SpanReader>,
+    shards: Arc<BTreeMap<String, SpanReader>>,
     per_expert: usize,
     ring: Vec<AlignedSlot>,
     next: Cell<usize>,
     staging: Cell<Option<AlignedBytes>>,
     plan: Option<SlotPlan>,
+    pool: ReadPool,
 }
 
 // SAFETY: the ring holds a private allocation owned by this reader; moving the reader to one
@@ -656,6 +868,199 @@ fn visit_slices(
                 visit(native)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn owned_parts(
+    catalogue: &ExpertCatalogue,
+    layer: u32,
+    expert: u32,
+) -> Result<Vec<(u64, NativeRange)>> {
+    let range = catalogue.range(layer, expert)?;
+    let layout = catalogue.layout();
+    let mut parts = Vec::new();
+    match (layout, range) {
+        (ExpertLayout::Bf16Fused { gate_up_bytes, .. }, ExpertRange::Bf16 { gate_up, down }) => {
+            parts.push((0, gate_up.clone()));
+            parts.push((*gate_up_bytes, down.clone()));
+        }
+        (
+            ExpertLayout::Bf16Separate { matrix_bytes, .. },
+            ExpertRange::Bf16Separate { gate, up, down },
+        ) => {
+            parts.push((0, gate.clone()));
+            parts.push((*matrix_bytes, up.clone()));
+            parts.push((*matrix_bytes * 2, down.clone()));
+        }
+        (
+            ExpertLayout::Fp8W8a16(slot) | ExpertLayout::Fp8W8a16Block(slot, _),
+            ExpertRange::Fp8 {
+                gate,
+                up,
+                down,
+                gate_scale,
+                up_scale,
+                down_scale,
+            },
+        ) => {
+            parts.push((slot.gate.start, gate.clone()));
+            parts.push((slot.up.start, up.clone()));
+            parts.push((slot.down.start, down.clone()));
+            parts.push((slot.gate_scale.start, gate_scale.clone()));
+            parts.push((slot.up_scale.start, up_scale.clone()));
+            parts.push((slot.down_scale.start, down_scale.clone()));
+        }
+        (
+            ExpertLayout::Fp4E2m1Block(slot, _),
+            ExpertRange::E2m1 {
+                gate,
+                up,
+                down,
+                gate_scale,
+                up_scale,
+                down_scale,
+            },
+        ) => {
+            parts.push((slot.gate.start, gate.clone()));
+            parts.push((slot.up.start, up.clone()));
+            parts.push((slot.down.start, down.clone()));
+            parts.push((slot.gate_scale.start, gate_scale.clone()));
+            parts.push((slot.up_scale.start, up_scale.clone()));
+            parts.push((slot.down_scale.start, down_scale.clone()));
+        }
+        _ => bail!("expert range does not match the catalogue layout"),
+    }
+    Ok(parts)
+}
+
+fn fill_slot(
+    shards: &BTreeMap<String, SpanReader>,
+    plan: &SlotPlan,
+    slot: &AlignedSlot,
+    parts: &[(u64, &NativeRange)],
+    layer: u32,
+    expert: u32,
+) -> Result<()> {
+    let alignment = plan.alignment;
+    let places = &plan.places;
+    ensure!(
+        parts.len() == places.len(),
+        "native plan covers {} slices, read has {}",
+        places.len(),
+        parts.len()
+    );
+    // SAFETY: this fill owns the slot until it returns.
+    unsafe {
+        (*slot.residues.get()).clear();
+        (*slot.packed_view.get()).clear();
+    }
+    let ring_len = slot.bytes.len();
+    let ring_ptr = slot.bytes.as_ptr() as *mut u8;
+    let mut residues = Vec::with_capacity(places.len());
+    let mut staging = slot.staging.take();
+    let outcome = (|| -> Result<()> {
+        for (index, (place, &(packed, native))) in places.iter().zip(parts).enumerate() {
+            (|| -> Result<()> {
+                ensure!(
+                    packed == u64::from(place.packed) && native.len == u64::from(place.len),
+                    "native slice does not match the slot plan"
+                );
+                let shard = shards
+                    .get(native.shard.as_ref())
+                    .with_context(|| format!("disk shard {} not open", native.shard))?;
+                ensure!(
+                    shard.direct && shard.alignment == alignment,
+                    "native shard {} is not the planned direct alignment",
+                    native.shard
+                );
+                if place.windowed {
+                    let residue = native.offset % alignment;
+                    let begin = native.offset - residue;
+                    let raw_end = begin
+                        .checked_add(native.len)
+                        .and_then(|end| end.checked_add(alignment))
+                        .context("window end overflow")?;
+                    let end = raw_end.min(shard.len);
+                    let width = end - begin;
+                    let logical_end = native
+                        .offset
+                        .checked_add(native.len)
+                        .context("window logical end overflow")?;
+                    ensure!(
+                        logical_end <= end,
+                        "windowed slice {}+{} outside {begin}..{end}",
+                        native.offset,
+                        native.len
+                    );
+                    let dest = place.ring as usize;
+                    let requested = usize::try_from(width.div_ceil(alignment) * alignment)?;
+                    ensure!(dest + requested <= ring_len, "window exceeds the ring");
+                    // SAFETY: the window is inside this slot's allocation and is not aliased.
+                    let buffer =
+                        unsafe { std::slice::from_raw_parts_mut(ring_ptr.add(dest), requested) };
+                    shard.read_direct(begin, width, buffer)?;
+                    residues.push(u32::try_from(residue).context("window residue exceeds u32")?);
+                } else {
+                    let begin = native.offset & !(alignment - 1);
+                    let logical_end = native
+                        .offset
+                        .checked_add(native.len)
+                        .context("staged slice end overflow")?;
+                    let aligned_end = logical_end.div_ceil(alignment) * alignment;
+                    let end = aligned_end.min(shard.len);
+                    ensure!(logical_end <= end, "staged slice extends past the shard");
+                    let span = ReadSpan {
+                        begin,
+                        end,
+                        first: 0,
+                        last: 1,
+                    };
+                    let need =
+                        DiskReader::aligned_staging_bytes(native.offset, native.len, alignment)?;
+                    let align_usize = usize::try_from(alignment)?;
+                    if staging.as_ref().is_none_or(|buffer| {
+                        buffer.len() < need || buffer.alignment() < align_usize
+                    }) {
+                        drop(staging.take());
+                        staging = Some(AlignedBytes::new(need, align_usize)?);
+                    }
+                    let bytes = shard.read_span(
+                        &span,
+                        alignment,
+                        staging.as_mut().context("native staging missing")?,
+                    )?;
+                    let from = usize::try_from(native.offset - begin)?;
+                    let len = usize::try_from(native.len)?;
+                    ensure!(from + len <= bytes.len(), "staged slice exceeds its span");
+                    let dest = place.ring as usize;
+                    ensure!(dest + len <= ring_len, "staged slice exceeds the ring");
+                    // SAFETY: the staging allocation and the ring allocation do not overlap.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr().add(from),
+                            ring_ptr.add(dest),
+                            len,
+                        );
+                    }
+                    residues.push(0);
+                }
+                Ok(())
+            })()
+            .with_context(|| {
+                format!(
+                    "layer {layer} expert {expert} slice {index} shard {} offset {}",
+                    native.shard, native.offset
+                )
+            })?;
+        }
+        Ok(())
+    })();
+    slot.staging.set(staging);
+    outcome?;
+    // SAFETY: the slot is not leased until the caller marks it filled.
+    unsafe {
+        *slot.residues.get() = residues;
     }
     Ok(())
 }
@@ -721,6 +1126,8 @@ impl DiskReader {
         let ring = (0..ring_slots)
             .map(|_| AlignedSlot::new(plan.ring_bytes, ring_align))
             .collect::<Result<Vec<_>>>()?;
+        let shards = Arc::new(shards);
+        let pool = ReadPool::start(Arc::clone(&shards), ring_slots as usize)?;
         Ok(Self {
             shards,
             per_expert,
@@ -728,6 +1135,7 @@ impl DiskReader {
             next: Cell::new(0),
             staging: Cell::new(None),
             plan: Some(plan),
+            pool,
         })
     }
 
@@ -786,13 +1194,27 @@ impl DiskReader {
             .map(|_| AlignedSlot::new(slot_bytes, RING_ALIGN))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            shards,
+            shards: Arc::new(shards),
             per_expert,
             ring,
             next: Cell::new(0),
             staging: Cell::new(None),
             plan: None,
+            pool: ReadPool::empty(),
         })
+    }
+
+    #[cfg(test)]
+    fn detached(shards: BTreeMap<String, SpanReader>) -> Self {
+        Self {
+            shards: Arc::new(shards),
+            per_expert: 0,
+            ring: Vec::new(),
+            next: Cell::new(0),
+            staging: Cell::new(None),
+            plan: None,
+            pool: ReadPool::empty(),
+        }
     }
 
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -928,117 +1350,15 @@ impl DiskReader {
         }
     }
 
-    fn read_planned(&self, parts: &[(u64, &NativeRange)], slot: usize) -> Result<()> {
-        let (alignment, places) = {
-            let plan = self.plan.as_ref().context("native slot plan missing")?;
-            (plan.alignment, plan.places.clone())
-        };
-        ensure!(
-            parts.len() == places.len(),
-            "native plan covers {} slices, read has {}",
-            places.len(),
-            parts.len()
-        );
-        self.reset_view(slot);
-        let ring_len = self.ring[slot].bytes.len();
-        let ring_ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
-        let mut residues = Vec::with_capacity(places.len());
-        let mut staging = self.staging.take();
-        let outcome = (|| -> Result<()> {
-            for (&place, &(packed, native)) in places.iter().zip(parts) {
-                ensure!(
-                    packed == u64::from(place.packed) && native.len == u64::from(place.len),
-                    "native slice does not match the slot plan"
-                );
-                let shard = self
-                    .shards
-                    .get(native.shard.as_ref())
-                    .with_context(|| format!("disk shard {} not open", native.shard))?;
-                ensure!(
-                    shard.direct && shard.alignment == alignment,
-                    "native shard {} is not the planned direct alignment",
-                    native.shard
-                );
-                if place.windowed {
-                    let residue = native.offset % alignment;
-                    let begin = native.offset - residue;
-                    let raw_end = begin
-                        .checked_add(native.len)
-                        .and_then(|end| end.checked_add(alignment))
-                        .context("window end overflow")?;
-                    let end = raw_end.min(shard.len);
-                    let width = end - begin;
-                    let logical_end = native
-                        .offset
-                        .checked_add(native.len)
-                        .context("window logical end overflow")?;
-                    ensure!(
-                        logical_end <= end,
-                        "windowed slice {}+{} outside {begin}..{end}",
-                        native.offset,
-                        native.len
-                    );
-                    let dest = place.ring as usize;
-                    let requested = usize::try_from(width.div_ceil(alignment) * alignment)?;
-                    ensure!(dest + requested <= ring_len, "window exceeds the ring");
-                    // SAFETY: the window is inside this slot's allocation and is not aliased.
-                    let buffer =
-                        unsafe { std::slice::from_raw_parts_mut(ring_ptr.add(dest), requested) };
-                    shard.read_direct(begin, width, buffer)?;
-                    residues.push(u32::try_from(residue).context("window residue exceeds u32")?);
-                } else {
-                    let begin = native.offset & !(alignment - 1);
-                    let logical_end = native
-                        .offset
-                        .checked_add(native.len)
-                        .context("staged slice end overflow")?;
-                    let aligned_end = logical_end.div_ceil(alignment) * alignment;
-                    let end = aligned_end.min(shard.len);
-                    ensure!(logical_end <= end, "staged slice extends past the shard");
-                    let span = ReadSpan {
-                        begin,
-                        end,
-                        first: 0,
-                        last: 1,
-                    };
-                    let need = Self::aligned_staging_bytes(native.offset, native.len, alignment)?;
-                    let align_usize = usize::try_from(alignment)?;
-                    if staging.as_ref().is_none_or(|buffer| {
-                        buffer.len() < need || buffer.alignment() < align_usize
-                    }) {
-                        drop(staging.take());
-                        staging = Some(AlignedBytes::new(need, align_usize)?);
-                    }
-                    let bytes = shard.read_span(
-                        &span,
-                        alignment,
-                        staging.as_mut().context("native staging missing")?,
-                    )?;
-                    let from = usize::try_from(native.offset - begin)?;
-                    let len = usize::try_from(native.len)?;
-                    ensure!(from + len <= bytes.len(), "staged slice exceeds its span");
-                    let dest = place.ring as usize;
-                    ensure!(dest + len <= ring_len, "staged slice exceeds the ring");
-                    // SAFETY: the staging allocation and the ring allocation do not overlap.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            bytes.as_ptr().add(from),
-                            ring_ptr.add(dest),
-                            len,
-                        );
-                    }
-                    residues.push(0);
-                }
-            }
-            Ok(())
-        })();
-        self.staging.set(staging);
-        outcome?;
-        // SAFETY: the slot is not leased until the caller marks it filled.
-        unsafe {
-            *self.ring[slot].residues.get() = residues;
-        }
-        Ok(())
+    fn read_planned(
+        &self,
+        parts: &[(u64, &NativeRange)],
+        slot: usize,
+        layer: u32,
+        expert: u32,
+    ) -> Result<()> {
+        let plan = self.plan.as_ref().context("native slot plan missing")?;
+        fill_slot(&self.shards, plan, &self.ring[slot], parts, layer, expert)
     }
 
     fn claim_free_slot(&self) -> Result<usize> {
@@ -1052,6 +1372,7 @@ impl DiskReader {
             }
         }
         let slot = chosen.with_context(|| format!("all {slots} disk ring slots are in use"))?;
+        self.ring[slot].state.set(RingState::Filled);
         self.next.set((slot + 1) % slots);
         Ok(slot)
     }
@@ -1060,17 +1381,23 @@ impl DiskReader {
     pub fn read_ranges(&self, ranges: &[(u64, NativeRange)], chunk_bytes: u64) -> Result<u32> {
         ensure!(chunk_bytes > 0, "disk read chunk is not positive");
         let slot = self.claim_free_slot()?;
-        self.reset_view(slot);
-        let bytes = self.ring[slot].bytes.len();
-        let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
-        // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
-        let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
-        let parts: Vec<(u64, &NativeRange)> = ranges
-            .iter()
-            .map(|(offset, native)| (*offset, native))
-            .collect();
-        self.read_parts(&parts, buffer, chunk_bytes)?;
-        self.ring[slot].state.set(RingState::Filled);
+        let filled = (|| -> Result<()> {
+            self.reset_view(slot);
+            let bytes = self.ring[slot].bytes.len();
+            let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
+            // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
+            let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
+            let parts: Vec<(u64, &NativeRange)> = ranges
+                .iter()
+                .map(|(offset, native)| (*offset, native))
+                .collect();
+            self.read_parts(&parts, buffer, chunk_bytes)?;
+            Ok(())
+        })();
+        if let Err(error) = filled {
+            self.ring[slot].state.set(RingState::Free);
+            return Err(error);
+        }
         u32::try_from(slot).context("disk ring slot exceeds u32")
     }
 
@@ -1083,67 +1410,30 @@ impl DiskReader {
         chunk_bytes: u64,
     ) -> Result<u32> {
         ensure!(chunk_bytes > 0, "disk read chunk is not positive");
-        let range: &ExpertRange = catalogue.range(layer, expert)?;
-        let layout = catalogue.layout();
         let slot = self.claim_free_slot()?;
-        self.reset_view(slot);
-        let mut parts: Vec<(u64, &NativeRange)> = Vec::new();
-        match (layout, range) {
-            (
-                ExpertLayout::Bf16Fused { gate_up_bytes, .. },
-                ExpertRange::Bf16 { gate_up, down },
-            ) => {
-                parts.push((0, gate_up));
-                parts.push((*gate_up_bytes, down));
-            }
-            (
-                ExpertLayout::Bf16Separate { matrix_bytes, .. },
-                ExpertRange::Bf16Separate { gate, up, down },
-            ) => {
-                parts.push((0, gate));
-                parts.push((*matrix_bytes, up));
-                parts.push((*matrix_bytes * 2, down));
-            }
-            (
-                ExpertLayout::Fp8W8a16(slot) | ExpertLayout::Fp8W8a16Block(slot, _),
-                ExpertRange::Fp8 {
-                    gate,
-                    up,
-                    down,
-                    gate_scale,
-                    up_scale,
-                    down_scale,
-                },
-            ) => {
-                parts.push((slot.gate.start, gate));
-                parts.push((slot.up.start, up));
-                parts.push((slot.down.start, down));
-                parts.push((slot.gate_scale.start, gate_scale));
-                parts.push((slot.up_scale.start, up_scale));
-                parts.push((slot.down_scale.start, down_scale));
-            }
-            (
-                ExpertLayout::Fp4E2m1Block(slot, _),
-                ExpertRange::E2m1 {
-                    gate,
-                    up,
-                    down,
-                    gate_scale,
-                    up_scale,
-                    down_scale,
-                },
-            ) => {
-                parts.push((slot.gate.start, gate));
-                parts.push((slot.up.start, up));
-                parts.push((slot.down.start, down));
-                parts.push((slot.gate_scale.start, gate_scale));
-                parts.push((slot.up_scale.start, up_scale));
-                parts.push((slot.down_scale.start, down_scale));
-            }
-            _ => bail!("expert range does not match the catalogue layout"),
+        if let Err(error) = self.read_into(layer, expert, catalogue, slot, chunk_bytes) {
+            self.ring[slot].state.set(RingState::Free);
+            return Err(error);
         }
+        u32::try_from(slot).context("disk ring slot exceeds u32")
+    }
+
+    fn read_into(
+        &self,
+        layer: u32,
+        expert: u32,
+        catalogue: &ExpertCatalogue,
+        slot: usize,
+        chunk_bytes: u64,
+    ) -> Result<()> {
+        self.reset_view(slot);
+        let owned = owned_parts(catalogue, layer, expert)?;
+        let parts: Vec<(u64, &NativeRange)> = owned
+            .iter()
+            .map(|(packed, native)| (*packed, native))
+            .collect();
         if self.plan.is_some() {
-            self.read_planned(&parts, slot)?;
+            self.read_planned(&parts, slot, layer, expert)?;
         } else {
             let bytes = self.ring[slot].bytes.len();
             let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
@@ -1151,8 +1441,133 @@ impl DiskReader {
             let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
             self.read_parts(&parts, buffer, chunk_bytes)?;
         }
-        self.ring[slot].state.set(RingState::Filled);
-        u32::try_from(slot).context("disk ring slot exceeds u32")
+        Ok(())
+    }
+
+    /// Reads `experts` of one layer into free ring slots and waits for every read.
+    /// At most one expert is in flight per ring slot. Slot `i` is filled by pool thread `i`.
+    pub fn read_experts(
+        &self,
+        layer: u32,
+        experts: &[u32],
+        catalogue: &ExpertCatalogue,
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            !experts.is_empty(),
+            "layer {layer} disk read has no experts"
+        );
+        ensure!(
+            experts.len() <= self.ring.len(),
+            "layer {layer} has {} disk experts; the ring holds {}",
+            experts.len(),
+            self.ring.len()
+        );
+        ensure!(
+            self.pool.txs.len() == self.ring.len(),
+            "disk reader pool holds {} threads for {} slots",
+            self.pool.txs.len(),
+            self.ring.len()
+        );
+        let mut assigned: Vec<(u32, usize)> = Vec::with_capacity(experts.len());
+        for &expert in experts {
+            let slot = match self.claim_free_slot() {
+                Ok(slot) => slot,
+                Err(error) => {
+                    for &(_, slot) in &assigned {
+                        self.ring[slot].state.set(RingState::Free);
+                    }
+                    return Err(error);
+                }
+            };
+            assigned.push((expert, slot));
+        }
+        let filled = self.fill_assigned(layer, &assigned, catalogue);
+        if let Err(error) = filled {
+            for &(_, slot) in &assigned {
+                if self.ring[slot].state.get() == RingState::Filled {
+                    self.ring[slot].state.set(RingState::Free);
+                }
+            }
+            return Err(error);
+        }
+        let mut slots = Vec::with_capacity(assigned.len());
+        for &(_, slot) in &assigned {
+            self.ring[slot].state.set(RingState::Filled);
+            slots.push(u32::try_from(slot).context("disk ring slot exceeds u32")?);
+        }
+        Ok(slots)
+    }
+
+    fn fill_assigned(
+        &self,
+        layer: u32,
+        assigned: &[(u32, usize)],
+        catalogue: &ExpertCatalogue,
+    ) -> Result<()> {
+        for (i, &(_, slot)) in assigned.iter().enumerate() {
+            ensure!(
+                assigned[..i].iter().all(|&(_, other)| other != slot),
+                "layer {layer} disk slot {slot} got two reads"
+            );
+        }
+        #[cfg(test)]
+        if flight::serial() {
+            for &(expert, slot) in assigned {
+                flight::enter();
+                let result = self.read_into(layer, expert, catalogue, slot, 1);
+                flight::leave();
+                result?;
+            }
+            return Ok(());
+        }
+        let plan = self.plan.as_ref().context("native slot plan missing")? as *const SlotPlan;
+        let mut jobs = Vec::with_capacity(assigned.len());
+        for (id, &(expert, slot)) in assigned.iter().enumerate() {
+            jobs.push(FillJob {
+                id,
+                layer,
+                expert,
+                slot: &self.ring[slot] as *const AlignedSlot,
+                plan,
+                parts: owned_parts(catalogue, layer, expert)?,
+            });
+        }
+        for (sent, job) in jobs.into_iter().enumerate() {
+            let index = assigned[job.id].1;
+            if self.pool.txs[index].send(ReadCmd::Fill(job)).is_err() {
+                for _ in 0..sent {
+                    self.pool
+                        .done
+                        .recv()
+                        .with_context(|| format!("layer {layer} disk reader dropped a reply"))?;
+                }
+                bail!("layer {layer} disk reader stopped");
+            }
+        }
+        let mut first: Option<(usize, anyhow::Error)> = None;
+        for _ in 0..assigned.len() {
+            let done = self
+                .pool
+                .done
+                .recv()
+                .with_context(|| format!("layer {layer} disk reader dropped a reply"))?;
+            if let Err(error) = done.result
+                && first.as_ref().is_none_or(|(id, _)| done.id < *id)
+            {
+                first = Some((done.id, error));
+            }
+        }
+        if let Some((_, error)) = first {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn slot_is_free(&self, slot: usize) -> bool {
+        self.ring
+            .get(slot)
+            .is_some_and(|slot| slot.state.get() == RingState::Free)
     }
 
     /// Buffered single-request spans land directly in their slot slices; gathered and direct-IO
@@ -1893,9 +2308,13 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> Result<TempDir> {
+        temp_dir_at(&std::env::temp_dir(), tag)
+    }
+
+    fn temp_dir_at(root: &std::path::Path, tag: &str) -> Result<TempDir> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = root.join(format!(
             "flyingfish-disk-{}-{}-{}",
             std::process::id(),
             tag,
@@ -1950,6 +2369,124 @@ mod tests {
         Ok(())
     }
 
+    fn require_outstanding(in_flight: usize, misses: usize) -> Result<()> {
+        ensure!(
+            in_flight == misses,
+            "in-flight {in_flight} covers {misses} misses"
+        );
+        Ok(())
+    }
+
+    fn expert_bytes(
+        reader: &DiskReader,
+        slot: u32,
+        file: &[u8],
+        layer: u32,
+        expert: u32,
+    ) -> Result<Vec<u8>> {
+        let values = reader.values(slot)?;
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for value in values.iter() {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let layer_base = layer as usize * 768;
+        let gate = layer_base + expert as usize * 128;
+        let down = layer_base + 512 + expert as usize * 64;
+        let mut expected = Vec::with_capacity(bytes.len());
+        for index in 0..values.len() {
+            let at = if index < 64 {
+                gate + index * 2
+            } else {
+                down + (index - 64) * 2
+            };
+            expected.extend_from_slice(&file[at..at + 2]);
+        }
+        assert_eq!(bytes, expected, "layer {layer} expert {expert}");
+        Ok(bytes)
+    }
+
+    #[test]
+    fn one_layer_misses_stay_outstanding() -> Result<()> {
+        struct ResetFlight;
+        impl Drop for ResetFlight {
+            fn drop(&mut self) {
+                super::flight::force_serial(false);
+                super::flight::hold(0);
+                super::flight::reset();
+            }
+        }
+        let _reset = ResetFlight;
+        let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
+        let file = pattern(1536, 0);
+        let catalogue = std::sync::Arc::new(catalogue);
+        let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
+        super::flight::reset();
+        super::flight::hold(2);
+        super::flight::force_serial(false);
+        let slots = reader.read_experts(0, &[0, 1], &catalogue)?;
+        let together = super::flight::max_in_flight();
+        require_outstanding(together, 2)?;
+        expert_bytes(&reader, slots[0], &file, 0, 0)?;
+        expert_bytes(&reader, slots[1], &file, 0, 1)?;
+        super::flight::reset();
+        super::flight::hold(0);
+        super::flight::force_serial(true);
+        let serial_slots = reader.read_experts(0, &[0, 1], &catalogue)?;
+        let serial = super::flight::max_in_flight();
+        let rejected = require_outstanding(serial, 2);
+        assert!(
+            rejected.is_err(),
+            "depth-1 mutant reported in-flight {serial}"
+        );
+        expert_bytes(&reader, serial_slots[0], &file, 0, 0)?;
+        expert_bytes(&reader, serial_slots[1], &file, 0, 1)?;
+        super::flight::force_serial(false);
+        super::flight::hold(0);
+        super::flight::reset();
+        println!(
+            "PASS layer_reads_outstanding misses=2 in_flight={together} depth1_in_flight={serial} depth1_rejected=true"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disk_read_depth_is_top_k_without_a_block_queue() -> Result<()> {
+        use std::os::linux::fs::MetadataExt;
+        let mut root = None;
+        for candidate in [std::env::temp_dir(), std::path::PathBuf::from("/dev/shm")] {
+            if !candidate.is_dir() {
+                continue;
+            }
+            let dev = std::fs::metadata(&candidate)?.st_dev();
+            let node = std::path::PathBuf::from(format!(
+                "/sys/dev/block/{}:{}",
+                libc::major(dev),
+                libc::minor(dev)
+            ));
+            if !node.exists() {
+                root = Some(candidate);
+                break;
+            }
+        }
+        let root = root.context("no temp filesystem without a sysfs block queue")?;
+        let dir = temp_dir_at(&root, "queue")?;
+        let path = dir.path().join("payload");
+        std::fs::write(&path, [1u8, 2, 3, 4])?;
+        let dev = std::fs::metadata(&path)?.st_dev();
+        let node = format!("/sys/dev/block/{}:{}", libc::major(dev), libc::minor(dev));
+        assert!(
+            !std::path::Path::new(&node).exists(),
+            "{node} is a sysfs block queue"
+        );
+        assert_eq!(super::disk_read_depth(&path, 1)?, 1);
+        assert_eq!(super::disk_read_depth(&path, 6)?, 6);
+        assert_eq!(super::disk_read_depth(&path, 8)?, 8);
+        assert_eq!(super::disk_read_depth(&path, 2048)?, 2048);
+        assert!(super::disk_read_depth(&path, 0).is_err());
+        println!("PASS disk_read_depth depth=top_k top_k=6,8 sysfs_block=absent");
+        Ok(())
+    }
+
     #[test]
     fn gate_up_and_down_may_live_in_different_shards() -> Result<()> {
         let (dir, catalogue) = staged("gate.safetensors", "down.safetensors")?;
@@ -1984,7 +2521,7 @@ mod tests {
         let mut eligible = 0;
         let mut staged = 0;
         let mut staged_shards = 0;
-        for (name, shard) in &reader.shards {
+        for (name, shard) in reader.shards.iter() {
             let indexes: Vec<_> = ranges
                 .iter()
                 .enumerate()
@@ -2081,14 +2618,7 @@ mod tests {
                         ))
                     })
                     .collect::<Result<BTreeMap<_, _>>>()?;
-                let reader = DiskReader {
-                    shards,
-                    per_expert: 0,
-                    ring: Vec::new(),
-                    next: Cell::new(0),
-                    staging: Cell::new(None),
-                    plan: None,
-                };
+                let reader = DiskReader::detached(shards);
                 let ranges: Vec<_> = requests
                     .iter()
                     .map(|&(name, offset, len, destination)| {
@@ -2131,18 +2661,13 @@ mod tests {
                 );
             }
         }
-        let reader = DiskReader {
-            shards: [(
+        let reader = DiskReader::detached(
+            [(
                 "a".to_owned(),
                 SpanReader::open(&dir.path().join("a"), false)?,
             )]
             .into(),
-            per_expert: 0,
-            ring: Vec::new(),
-            next: Cell::new(0),
-            staging: Cell::new(None),
-            plan: None,
-        };
+        );
         OpenOptions::new()
             .write(true)
             .open(dir.path().join("a"))?
@@ -2185,18 +2710,13 @@ mod tests {
             at += n as u64;
         }
         drop(file);
-        let reader = DiskReader {
-            shards: [(
+        let reader = DiskReader::detached(
+            [(
                 "text".to_owned(),
                 SpanReader::open(&dir.path().join("text"), false)?,
             )]
             .into(),
-            per_expert: 0,
-            ring: Vec::new(),
-            next: Cell::new(0),
-            staging: Cell::new(None),
-            plan: None,
-        };
+        );
         let mut offset = 17;
         let mut destination = 64;
         let ranges: Vec<_> = lengths

@@ -232,7 +232,7 @@ impl Reader {
         Ok(())
     }
 
-    pub(in crate::backend::cuda) fn read(&mut self, layer: u32, item: u32) -> Result<u32> {
+    fn reclaim_completed(&mut self) -> Result<()> {
         for (slot, event) in self.copied.iter_mut().enumerate() {
             let complete = if let Some(ticket) = event.as_ref() {
                 ticket.event.try_is_complete()?
@@ -244,18 +244,62 @@ impl Reader {
                 self.disk.reclaim(slot as u32, completed.id)?;
             }
         }
+        Ok(())
+    }
+
+    fn sync_oldest(&mut self) -> Result<()> {
+        let (slot, _) = self
+            .copied
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.is_some())
+            .min_by_key(|(_, event)| event.as_ref().map(|ticket| ticket.id))
+            .context("expert disk ring has no slots")?;
+        let event = self.copied[slot]
+            .take()
+            .context("expert disk ring event missing")?;
+        event.event.synchronize()?;
+        self.disk.reclaim(slot as u32, event.id)?;
+        Ok(())
+    }
+
+    fn free_slots(&self) -> usize {
+        (0..self.copied.len())
+            .filter(|&slot| self.disk.slot_is_free(slot))
+            .count()
+    }
+
+    /// Fills `experts` into free ring slots. The caller submits their HtoD copies afterwards.
+    pub(in crate::backend::cuda) fn read_layer(
+        &mut self,
+        layer: u32,
+        experts: &[u32],
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            !experts.is_empty(),
+            "layer {layer} disk read has no experts"
+        );
+        ensure!(
+            experts.len() <= self.copied.len(),
+            "layer {layer} has {} disk experts; the ring holds {}",
+            experts.len(),
+            self.copied.len()
+        );
+        self.reclaim_completed()?;
+        while self.free_slots() < experts.len() {
+            self.sync_oldest()?;
+        }
+        let catalogue = self
+            .catalogue
+            .clone()
+            .context("disk layer read has no catalogue")?;
+        self.disk.read_experts(layer, experts, &catalogue)
+    }
+
+    pub(in crate::backend::cuda) fn read(&mut self, layer: u32, item: u32) -> Result<u32> {
+        self.reclaim_completed()?;
         if self.copied.iter().all(Option::is_some) {
-            let (slot, _) = self
-                .copied
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, event)| event.as_ref().map(|ticket| ticket.id))
-                .context("expert disk ring has no slots")?;
-            let event = self.copied[slot]
-                .take()
-                .context("expert disk ring event missing")?;
-            event.event.synchronize()?;
-            self.disk.reclaim(slot as u32, event.id)?;
+            self.sync_oldest()?;
         }
         if let Some(catalogue) = &self.catalogue {
             return self
@@ -606,6 +650,7 @@ pub(super) struct Load<'a> {
     pub catalogue: Arc<ExpertCatalogue>,
     pub directory: &'a Path,
     pub engines: u32,
+    pub disk_depth: u32,
     pub max_rows: u32,
     pub swiglu_rounding: crate::model_spec::SwigluRounding,
     pub swiglu_limit: f32,
@@ -788,14 +833,31 @@ impl Slots {
         )?;
         let host = host_memory(Path::new("/"))?;
         let copies = super::super::super::calibrate::copy_engines(device)?;
-        let (capacity, admission) = crate::experts::plan::staging_capacity(
+        let depth = crate::experts::disk::disk_read_depth(directory, geometry.top_k)?;
+        let alignment = crate::experts::disk::directory_alignment(directory)?;
+        let ring_slot = crate::experts::disk::ring_slot_bytes(catalogue.layout(), alignment)?;
+        let ring_bytes = u64::from(depth)
+            .checked_mul(ring_slot)
+            .context("disk ring bytes overflow")?;
+        let host_budget = host - host / 16;
+        let (capacity, admission) = crate::experts::plan::staging_capacity_ring(
             geometry,
             catalogue.layout().clone(),
             rows,
             device_bytes as u64,
-            host - host / 16,
+            host_budget,
+            copies,
+            (depth, ring_slot),
+        )?;
+        let (plain, _) = crate::experts::plan::staging_capacity(
+            geometry,
+            catalogue.layout().clone(),
+            rows,
+            device_bytes as u64,
+            host_budget,
             copies,
         )?;
+        let host_blocks_delta = i64::from(plain.host_blocks) - i64::from(capacity.host_blocks);
         let resident_layers = capacity
             .slots_per_layer
             .iter()
@@ -820,6 +882,8 @@ impl Slots {
                 "device_fixed_or_external_bytes": total - free, "gpu_slots": capacity.slots_total(),
                 "host_blocks": capacity.host_blocks, "spare_blocks": capacity.spare_blocks,
                 "disk_bytes": capacity.disk_bytes, "live_rows": rows, "copy_engines": copies,
+                "disk_depth": depth, "ring_slot_bytes": ring_slot, "ring_bytes": ring_bytes,
+                "host_blocks_without_added_ring": plain.host_blocks, "host_blocks_delta": host_blocks_delta,
                 "waves_staged": waves, "resident_layers": resident_layers, "pool_slots": capacity.prefill_staging_slots,
                 "host_available_bytes": host, "source": "capacity; GPU compute; native host staging"
             }})
@@ -841,6 +905,7 @@ impl Slots {
                 directory,
                 catalogue,
                 engines: copies,
+                disk_depth: depth,
                 max_rows: rows,
                 swiglu_rounding: model.swiglu_rounding(),
                 swiglu_limit: model.swiglu_limit(),
@@ -936,6 +1001,7 @@ impl Slots {
             input.engines > 0,
             "expert setup has no measured copy engines"
         );
+        ensure!(input.disk_depth > 0, "disk ring depth is zero");
         let phase_started = std::time::Instant::now();
         let has_peer = input.capacity.gpu0_layers < geometry.layers;
         let peer_streams = if has_peer {
@@ -961,7 +1027,7 @@ impl Slots {
         let disk = Reader::new(
             device,
             has_peer,
-            DiskReader::open(&input.catalogue, input.directory, input.engines.min(2))?,
+            DiskReader::open(&input.catalogue, input.directory, input.disk_depth)?,
             &input.catalogue,
         )?;
         let reader_open_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
@@ -1296,6 +1362,62 @@ impl Slots {
         Ok(())
     }
 
+    fn copy_filled_disk(
+        &mut self,
+        layer: u32,
+        expert: u32,
+        destination: u64,
+        ring: u32,
+    ) -> Result<()> {
+        let on_peer = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| layer >= peer.gpu0_layers);
+        self.transfers.h2d.context().bind_to_thread()?;
+        let disk = self
+            .disk
+            .as_mut()
+            .context("decode disk reader is owned by prefill IO")?;
+        let guard = disk.disk.values(ring)?;
+        if on_peer {
+            let peer = self.peer.as_ref().context("peer slots missing")?;
+            peer.upload.context().bind_to_thread()?;
+            submit_disk_copies(&guard, destination, peer.upload.as_ref())
+                .context("copy native disk expert into its peer physical slot")?;
+            peer.synced.record(&peer.upload)?;
+            self.transfers.h2d.wait(&peer.synced)?;
+            self.transfers.h2d.context().bind_to_thread()?;
+        } else {
+            submit_disk_copies(&guard, destination, self.transfers.h2d.as_ref())
+                .context("copy native disk expert into its physical slot")?;
+        }
+        let copy = self.events.record(&self.transfers.h2d)?;
+        let reserved_source = if let Some(index) = self
+            .pending_admits
+            .iter()
+            .position(|admit| admit.layer == layer && admit.expert == expert)
+        {
+            let admit = self.pending_admits[index];
+            if self.reserved_blocks.contains(&admit.block) {
+                Some((admit.victim, admit.block))
+            } else {
+                self.transfers
+                    .copy_host_block(admit.block, |dst| guard.copy_logical(dst))?;
+                self.policy.commit_host_admit(admit)?;
+                self.pending_admits.swap_remove(index);
+                None
+            }
+        } else {
+            None
+        };
+        guard.copied(copy.id)?;
+        disk.copied[ring as usize] = Some(copy);
+        if let Some((victim, block)) = reserved_source {
+            anyhow::bail!("reserved host source: layer {layer} expert {victim} block {block}");
+        }
+        Ok(())
+    }
+
     fn upload(
         &mut self,
         layer: u32,
@@ -1314,50 +1436,14 @@ impl Slots {
                 (pointer, staging, None)
             }
             MoveSource::Disk => {
-                let disk = self
-                    .disk
-                    .as_mut()
-                    .context("decode disk reader is owned by prefill IO")?;
-                let ring = disk.read(layer, expert)?;
-                let guard = disk.disk.values(ring)?;
-                if on_peer {
-                    let peer = self.peer.as_ref().context("peer slots missing")?;
-                    peer.upload.context().bind_to_thread()?;
-                    submit_disk_copies(&guard, destination, peer.upload.as_ref())
-                        .context("copy native disk expert into its peer physical slot")?;
-                    peer.synced.record(&peer.upload)?;
-                    self.transfers.h2d.wait(&peer.synced)?;
-                    self.transfers.h2d.context().bind_to_thread()?;
-                } else {
-                    submit_disk_copies(&guard, destination, self.transfers.h2d.as_ref())
-                        .context("copy native disk expert into its physical slot")?;
-                }
-                let copy = self.events.record(&self.transfers.h2d)?;
-                let reserved_source = if let Some(index) = self
-                    .pending_admits
-                    .iter()
-                    .position(|admit| admit.layer == layer && admit.expert == expert)
-                {
-                    let admit = self.pending_admits[index];
-                    if self.reserved_blocks.contains(&admit.block) {
-                        Some((admit.victim, admit.block))
-                    } else {
-                        self.transfers
-                            .copy_host_block(admit.block, |dst| guard.copy_logical(dst))?;
-                        self.policy.commit_host_admit(admit)?;
-                        self.pending_admits.swap_remove(index);
-                        None
-                    }
-                } else {
-                    None
+                let ring = {
+                    let disk = self
+                        .disk
+                        .as_mut()
+                        .context("decode disk reader is owned by prefill IO")?;
+                    disk.read(layer, expert)?
                 };
-                guard.copied(copy.id)?;
-                disk.copied[ring as usize] = Some(copy);
-                if let Some((victim, block)) = reserved_source {
-                    anyhow::bail!(
-                        "reserved host source: layer {layer} expert {victim} block {block}"
-                    );
-                }
+                self.copy_filled_disk(layer, expert, destination, ring)?;
                 (0, None, Some(ring))
             }
         };
@@ -1653,15 +1739,34 @@ impl Slots {
         self.pending_admits = self
             .policy
             .plan_streamed_admits(layer, &self.reserved_blocks)?;
-        for (expert, _, index) in &disk_jobs {
-            let destination = self.pool[*index].pointer;
-            let staging = self.upload(layer, *expert, destination, MoveSource::Disk)?;
-            ensure!(
-                staging.is_none(),
-                "disk upload of layer {layer} expert {expert} staged a host block"
-            );
-            let copy = self.events.record(&self.transfers.h2d)?;
-            self.pool[*index].copy = Some(copy);
+        if !disk_jobs.is_empty() {
+            let depth = self
+                .disk
+                .as_ref()
+                .context("decode disk reader is owned by prefill IO")?
+                .disk
+                .ring_slots() as usize;
+            ensure!(depth >= 1, "layer {layer} disk ring is empty");
+            let mut start = 0;
+            while start < disk_jobs.len() {
+                let end = (start + depth).min(disk_jobs.len());
+                let wave = &disk_jobs[start..end];
+                let experts: Vec<u32> = wave.iter().map(|job| job.0).collect();
+                let rings = {
+                    let reader = self
+                        .disk
+                        .as_mut()
+                        .context("decode disk reader is owned by prefill IO")?;
+                    reader.read_layer(layer, &experts)?
+                };
+                for ((expert, _, index), ring) in wave.iter().zip(rings) {
+                    let destination = self.pool[*index].pointer;
+                    self.copy_filled_disk(layer, *expert, destination, ring)?;
+                    let copy = self.events.record(&self.transfers.h2d)?;
+                    self.pool[*index].copy = Some(copy);
+                }
+                start = end;
+            }
         }
         self.pending_admits.clear();
         self.reserved_blocks.clear();
