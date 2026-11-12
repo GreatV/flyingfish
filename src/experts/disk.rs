@@ -6,13 +6,9 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -421,88 +417,12 @@ pub(crate) fn directory_alignment(path: &Path) -> Result<u64> {
     filesystem_alignment(&file)
 }
 
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-fn read_queue_depth(path: &Path) -> Result<u32> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let depth: u32 = text
-        .trim()
-        .parse()
-        .with_context(|| format!("nr_requests {} is {text:?}", path.display()))?;
-    ensure!(depth >= 1, "nr_requests {depth} at {}", path.display());
-    Ok(depth)
-}
-
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-fn canonicalize_node(node: &Path) -> Result<PathBuf> {
-    std::fs::canonicalize(node).with_context(|| format!("block device {}", node.display()))
-}
-
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-fn queue_depth_canonical(node: &Path, seen: &mut BTreeSet<PathBuf>) -> Result<u32> {
-    ensure!(
-        seen.insert(node.to_path_buf()),
-        "block queue cycle at {}",
-        node.display()
-    );
-    let requests = node.join("queue/nr_requests");
-    if requests.is_file() {
-        return read_queue_depth(&requests);
-    }
-    let slaves = node.join("slaves");
-    if slaves.is_dir() {
-        let mut listed = std::fs::read_dir(&slaves)
-            .with_context(|| format!("read slaves of {}", node.display()))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("read slaves of {}", node.display()))?;
-        listed.sort_by_key(|entry| entry.file_name());
-        ensure!(
-            !listed.is_empty(),
-            "device mapper {} has no slaves",
-            node.display()
-        );
-        let mut min = u32::MAX;
-        for entry in listed {
-            let child = canonicalize_node(&entry.path())?;
-            min = min.min(queue_depth_canonical(&child, seen)?);
-        }
-        return Ok(min);
-    }
-    if node.join("partition").is_file() {
-        let parent = node
-            .parent()
-            .with_context(|| format!("partition {} has no disk", node.display()))?;
-        return queue_depth_canonical(parent, seen);
-    }
-    bail!("no block queue at {}", node.display())
-}
-
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-fn queue_depth_of(node: &Path) -> Result<u32> {
-    let node = canonicalize_node(node)?;
-    queue_depth_canonical(&node, &mut BTreeSet::new())
-}
-
-/// `nr_requests` of the block device that holds `path`.
-/// A device-mapper node with no queue uses the minimum slave queue.
-/// A partition uses its disk's queue.
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-pub(crate) fn block_queue_depth(path: &Path) -> Result<u32> {
-    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let dev = meta.st_dev();
-    let node = PathBuf::from(format!(
-        "/sys/dev/block/{}:{}",
-        libc::major(dev),
-        libc::minor(dev)
-    ));
-    queue_depth_of(&node)
-}
-
-/// `min(top_k, nr_requests)` for the block device that holds `path`.
+/// Outstanding `read_at` calls for one layer. The depth is `top_k`.
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn disk_read_depth(path: &Path, top_k: u32) -> Result<u32> {
     ensure!(top_k >= 1, "disk read depth has top_k 0");
-    let queue = block_queue_depth(path)?;
-    Ok(top_k.min(queue))
+    File::open(path).with_context(|| format!("open {} for disk read depth", path.display()))?;
+    Ok(top_k)
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -2388,9 +2308,13 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> Result<TempDir> {
+        temp_dir_at(&std::env::temp_dir(), tag)
+    }
+
+    fn temp_dir_at(root: &std::path::Path, tag: &str) -> Result<TempDir> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = root.join(format!(
             "flyingfish-disk-{}-{}-{}",
             std::process::id(),
             tag,
@@ -2526,38 +2450,40 @@ mod tests {
     }
 
     #[test]
-    fn block_queue_depth_uses_the_minimum_slave_queue() -> Result<()> {
-        let dir = temp_dir("queue")?;
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("disks/nvme0n1/queue"))?;
-        std::fs::create_dir_all(root.join("disks/nvme1n1/nvme1n1p3"))?;
-        std::fs::create_dir_all(root.join("disks/nvme1n1/queue"))?;
-        std::fs::create_dir_all(root.join("devices/virtual/block/dm-0/slaves"))?;
-        std::fs::create_dir_all(root.join("dev/block"))?;
-        std::fs::write(root.join("disks/nvme0n1/queue/nr_requests"), "11\n")?;
-        std::fs::write(root.join("disks/nvme1n1/queue/nr_requests"), "4\n")?;
-        std::fs::write(root.join("disks/nvme1n1/nvme1n1p3/partition"), "3\n")?;
-        std::os::unix::fs::symlink(
-            "../../../../../disks/nvme0n1",
-            root.join("devices/virtual/block/dm-0/slaves/nvme0n1"),
-        )?;
-        std::os::unix::fs::symlink(
-            "../../../../../disks/nvme1n1/nvme1n1p3",
-            root.join("devices/virtual/block/dm-0/slaves/nvme1n1p3"),
-        )?;
-        std::os::unix::fs::symlink(
-            "../../devices/virtual/block/dm-0",
-            root.join("dev/block/252:0"),
-        )?;
-        assert_eq!(super::queue_depth_of(&root.join("dev/block/252:0"))?, 4);
-        assert_eq!(super::queue_depth_of(&root.join("disks/nvme0n1"))?, 11);
-        assert!(super::queue_depth_of(&root.join("disks")).is_err());
-        let live = super::block_queue_depth(root)?;
-        assert!(live >= 1, "block queue depth {live}");
-        assert_eq!(super::disk_read_depth(root, 1)?, 1);
-        assert_eq!(super::disk_read_depth(root, live)?, live);
-        assert_eq!(super::disk_read_depth(root, live.saturating_add(5))?, live);
-        assert!(super::disk_read_depth(root, 0).is_err());
+    fn disk_read_depth_is_top_k_without_a_block_queue() -> Result<()> {
+        use std::os::linux::fs::MetadataExt;
+        let mut root = None;
+        for candidate in [std::env::temp_dir(), std::path::PathBuf::from("/dev/shm")] {
+            if !candidate.is_dir() {
+                continue;
+            }
+            let dev = std::fs::metadata(&candidate)?.st_dev();
+            let node = std::path::PathBuf::from(format!(
+                "/sys/dev/block/{}:{}",
+                libc::major(dev),
+                libc::minor(dev)
+            ));
+            if !node.exists() {
+                root = Some(candidate);
+                break;
+            }
+        }
+        let root = root.context("no temp filesystem without a sysfs block queue")?;
+        let dir = temp_dir_at(&root, "queue")?;
+        let path = dir.path().join("payload");
+        std::fs::write(&path, [1u8, 2, 3, 4])?;
+        let dev = std::fs::metadata(&path)?.st_dev();
+        let node = format!("/sys/dev/block/{}:{}", libc::major(dev), libc::minor(dev));
+        assert!(
+            !std::path::Path::new(&node).exists(),
+            "{node} is a sysfs block queue"
+        );
+        assert_eq!(super::disk_read_depth(&path, 1)?, 1);
+        assert_eq!(super::disk_read_depth(&path, 6)?, 6);
+        assert_eq!(super::disk_read_depth(&path, 8)?, 8);
+        assert_eq!(super::disk_read_depth(&path, 2048)?, 2048);
+        assert!(super::disk_read_depth(&path, 0).is_err());
+        println!("PASS disk_read_depth depth=top_k top_k=6,8 sysfs_block=absent");
         Ok(())
     }
 
