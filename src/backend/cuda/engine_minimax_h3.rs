@@ -21,8 +21,8 @@ use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::gguf::GgmlType;
 use crate::minimax_h3::{
-    AdalnPlan, AdalnTimeEmbedder, H3Spec, ImageLayout, ImageSchedule, ImageSpec, MODALITIES,
-    adaln_input, image_row_plan, rotary_rows,
+    AdalnPlan, AdalnTimeEmbedder, H3Spec, ImageLayout, ImageSchedule, ImageSpec, LinearStorage,
+    MODALITIES, adaln_input, image_row_plan, rotary_rows,
 };
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
@@ -138,6 +138,14 @@ impl Element for f32 {
             .0
             .iter()
             .all(|v| f32::from_le_bytes(*v).is_finite())
+    }
+}
+
+impl Element for i8 {
+    const DTYPE: Dtype = Dtype::I8;
+    /// Every int8 code is finite.
+    fn finite(_bytes: &[u8]) -> bool {
+        true
     }
 }
 
@@ -302,6 +310,7 @@ pub(crate) struct AdalnTable {
 impl AdalnTable {
     /// One pass over the 50 `adaln_proj` weights: each block's `[18 * hidden, time_dim]` projection of the plan's
     /// timesteps (bias before output rounding), of which only the addressed `(timestep, tag)` slices are kept.
+    /// A HyperFlow spec returns zero tables. The `(t, r)` mix is not applied.
     pub(crate) fn build(
         d: &Device,
         blas: &mut Blas,
@@ -313,6 +322,21 @@ impl AdalnTable {
         let s = &d.stream;
         let timesteps = plan.timesteps.len();
         let width = 6 * spec.hidden;
+        if spec.is_hyperflow()? {
+            let pairs = plan.pairs.len();
+            let blocks = s.alloc_zeros::<bf16>(
+                spec.layers
+                    .checked_mul(pairs)
+                    .and_then(|n| n.checked_mul(width))
+                    .context("HyperFlow modulation extent")?,
+            )?;
+            let norm_out = s.alloc_zeros::<bf16>(
+                timesteps
+                    .checked_mul(2 * spec.hidden)
+                    .context("HyperFlow output-norm extent")?,
+            )?;
+            return Ok(Self { blocks, norm_out });
+        }
         let modulation = width * MODALITIES as usize;
         let mut source = Source::new(transformer_dir, manifest);
         let time = AdalnTimeEmbedder {
@@ -453,15 +477,35 @@ const HIDDEN_NORM_THREADS: u32 = 768;
 /// Threads per head-width RMSNorm row.
 const HEAD_NORM_THREADS: u32 = 32;
 
-/// One block's BF16 weights: the base linears as row-major views (`LINEAR_ROLES` order) into `storage` or a dense
-/// streaming slot, norms and LoRA factors owned; the q, k, v LoRA A factors are stacked `[3 * rank, hidden]`.
+/// One base linear: dense BF16, int8 convrot (`qweight` `[out, in]`, `wscale` `[out]`), or `up(down(x))`.
+enum BlockLinear {
+    Dense {
+        weight: Tensor<bf16, 2>,
+        owned: Option<CudaSlice<bf16>>,
+    },
+    Int8 {
+        qweight: Tensor<i8, 2>,
+        wscale: CudaSlice<f32>,
+        group: u32,
+        owned: Option<CudaSlice<i8>>,
+    },
+    LowRank {
+        down: Tensor<bf16, 2>,
+        up: Tensor<bf16, 2>,
+        owned: Vec<CudaSlice<bf16>>,
+    },
+}
+
+/// One block's weights. `linears` is `LINEAR_ROLES` order. Dense MiniMax views point into `storage` or a streaming
+/// slot. A dropped block's `linears` are 1×1 views of `storage` and `dropped` is set.
 pub(crate) struct BlockWeights {
     norm1: CudaSlice<bf16>,
     norm2: CudaSlice<bf16>,
     norm_q: CudaSlice<bf16>,
     norm_k: CudaSlice<bf16>,
-    linears: [Tensor<bf16, 2>; 6],
+    linears: [BlockLinear; 6],
     storage: Option<CudaSlice<bf16>>,
+    dropped: bool,
     qkv_a: CudaSlice<bf16>,
     q_b: CudaSlice<bf16>,
     k_b: CudaSlice<bf16>,
@@ -666,18 +710,33 @@ impl BlockWeights {
         for role in LINEAR_ROLES {
             let (offset, shape) = layout[role];
             let bytes = 2 * u64::from(shape[0]) * u64::from(shape[1]);
-            linears.push(unsafe {
-                Tensor::new(
-                    at + 2 * offset as u64,
-                    shape,
-                    [u64::from(shape[1]), 1],
-                    bytes,
-                )?
+            linears.push(BlockLinear::Dense {
+                weight: unsafe {
+                    Tensor::new(
+                        at + 2 * offset as u64,
+                        shape,
+                        [u64::from(shape[1]), 1],
+                        bytes,
+                    )?
+                },
+                owned: None,
             });
         }
-        let linears: [Tensor<bf16, 2>; 6] = linears
+        let linears: [BlockLinear; 6] = linears
             .try_into()
             .map_err(|_| anyhow::anyhow!("block linear count"))?;
+        Self::with_linears_ready::<LORA>(s, spec, rank, block, linears, base, lora)
+    }
+
+    fn with_linears_ready<const LORA: bool>(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        rank: usize,
+        block: &str,
+        linears: [BlockLinear; 6],
+        base: &mut Source<'_>,
+        lora: &mut Source<'_>,
+    ) -> Result<Self> {
         let (h, w, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
         let mut n =
             |name: &str, count: usize| base.tensor(s, &format!("{block}.{name}.weight"), count);
@@ -733,6 +792,9 @@ impl BlockWeights {
                 0,
             )
         };
+        for linear in &linears {
+            linear.retain_resident(s)?;
+        }
         Ok(Self {
             q_b,
             k_b,
@@ -749,8 +811,208 @@ impl BlockWeights {
             norm_k,
             linears,
             storage: None,
+            dropped: false,
             qkv_a,
             rank,
+        })
+    }
+
+    /// No checkpoint tensors. `block_forward` returns the input.
+    fn identity(s: &Arc<CudaStream>, spec: &H3Spec) -> Result<Self> {
+        let storage = s.alloc_zeros::<bf16>(1)?;
+        let weight = unsafe { Tensor::new(pointer(&storage, s), [1, 1], [1, 1], 2)? };
+        let linears = std::array::from_fn(|_| BlockLinear::Dense {
+            weight,
+            owned: None,
+        });
+        let empty = || s.alloc_zeros::<bf16>(0);
+        Ok(Self {
+            norm1: s.alloc_zeros::<bf16>(spec.hidden)?,
+            norm2: s.alloc_zeros::<bf16>(spec.hidden)?,
+            norm_q: s.alloc_zeros::<bf16>(spec.head_dim)?,
+            norm_k: s.alloc_zeros::<bf16>(spec.head_dim)?,
+            linears,
+            storage: Some(storage),
+            dropped: true,
+            qkv_a: empty()?,
+            q_b: empty()?,
+            k_b: empty()?,
+            v_b: empty()?,
+            out_a: empty()?,
+            out_b: empty()?,
+            in_a: empty()?,
+            in_b: empty()?,
+            ffo_a: empty()?,
+            ffo_b: empty()?,
+            rank: 0,
+        })
+    }
+
+    /// Stored HyperFlow factors. `slot` is the layer's streaming base; resident factors are owned.
+    fn stored(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        block: &str,
+        base: &mut Source<'_>,
+        lora: &mut Source<'_>,
+        slot: Option<(u64, &[(String, usize)])>,
+    ) -> Result<Self> {
+        let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
+        for role in LINEAR_ROLES {
+            let suffix = role.strip_suffix(".weight").context("linear role")?;
+            let name = format!("{block}.{suffix}");
+            linears.push(match spec.linear_storage(&name)? {
+                LinearStorage::Dense => dense_factor(s, base, slot, &format!("{name}.weight"))?,
+                LinearStorage::Int8 { group } => int8_factor(s, base, slot, &name, group)?,
+                LinearStorage::LowRank { rank } => low_rank_factor(s, base, slot, &name, rank)?,
+            });
+        }
+        let linears: [BlockLinear; 6] = linears
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("block linear count"))?;
+        Self::with_linears_ready::<false>(s, spec, 0, block, linears, base, lora)
+    }
+}
+
+fn packed_offset(packed: &[(String, usize)], name: &str) -> Result<usize> {
+    packed
+        .iter()
+        .find(|(entry, _)| entry == name)
+        .map(|(_, offset)| *offset)
+        .with_context(|| format!("{name} is outside the block slot"))
+}
+
+fn view_at<T: Copy>(base: u64, offset: usize, rows: usize, cols: usize) -> Result<Tensor<T, 2>> {
+    let ptr = base
+        .checked_add(u64::try_from(offset)?)
+        .context("stored factor address")?;
+    let span = u64::try_from(rows)?
+        .checked_mul(u64::try_from(cols)?)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<T>() as u64))
+        .context("stored factor bytes")?;
+    ensure!(
+        offset.is_multiple_of(16) && ptr.is_multiple_of(16),
+        "stored factor alignment"
+    );
+    unsafe {
+        Tensor::new(
+            ptr,
+            [u32::try_from(rows)?, u32::try_from(cols)?],
+            [u64::try_from(cols)?, 1],
+            span,
+        )
+    }
+}
+
+fn factor_shape(base: &Source<'_>, name: &str, dtype: Dtype) -> Result<(usize, usize)> {
+    let entry = base
+        .manifest
+        .entries
+        .get(name)
+        .with_context(|| format!("manifest lacks {name}"))?;
+    ensure!(
+        entry.dtype == dtype && entry.shape.len() == 2 && entry.load,
+        "{name} stored layout"
+    );
+    Ok((entry.shape[0], entry.shape[1]))
+}
+
+fn dense_factor(
+    s: &Arc<CudaStream>,
+    base: &mut Source<'_>,
+    slot: Option<(u64, &[(String, usize)])>,
+    name: &str,
+) -> Result<BlockLinear> {
+    let (rows, cols) = factor_shape(base, name, Dtype::BF16)?;
+    if let Some((ptr, packed)) = slot {
+        Ok(BlockLinear::Dense {
+            weight: view_at(ptr, packed_offset(packed, name)?, rows, cols)?,
+            owned: None,
+        })
+    } else {
+        let owned = base.tensor::<bf16>(s, name, rows * cols)?;
+        let weight = matrix(&owned, s, rows, cols)?;
+        Ok(BlockLinear::Dense {
+            weight,
+            owned: Some(owned),
+        })
+    }
+}
+
+fn int8_factor(
+    s: &Arc<CudaStream>,
+    base: &mut Source<'_>,
+    slot: Option<(u64, &[(String, usize)])>,
+    name: &str,
+    group: u32,
+) -> Result<BlockLinear> {
+    let qname = format!("{name}.qweight");
+    let (rows, cols) = factor_shape(base, &qname, Dtype::I8)?;
+    let group_usize = usize::try_from(group)?;
+    ensure!(
+        group_usize > 0 && cols.is_multiple_of(group_usize),
+        "{name} convrot group {group}"
+    );
+    let wscale = base.tensor::<f32>(s, &format!("{name}.wscale"), rows)?;
+    let (qweight, owned) = if let Some((ptr, packed)) = slot {
+        (
+            view_at(ptr, packed_offset(packed, &qname)?, rows, cols)?,
+            None,
+        )
+    } else {
+        let owned = base.tensor::<i8>(s, &qname, rows * cols)?;
+        let qweight = view(
+            &owned,
+            s,
+            0,
+            [u32::try_from(rows)?, u32::try_from(cols)?],
+            [u64::try_from(cols)?, 1],
+        )?;
+        (qweight, Some(owned))
+    };
+    Ok(BlockLinear::Int8 {
+        qweight,
+        wscale,
+        group,
+        owned,
+    })
+}
+
+fn low_rank_factor(
+    s: &Arc<CudaStream>,
+    base: &mut Source<'_>,
+    slot: Option<(u64, &[(String, usize)])>,
+    name: &str,
+    rank: usize,
+) -> Result<BlockLinear> {
+    let down_name = format!("{name}.down.weight");
+    let up_name = format!("{name}.up.weight");
+    let (down_rows, down_cols) = factor_shape(base, &down_name, Dtype::BF16)?;
+    let (up_rows, up_cols) = factor_shape(base, &up_name, Dtype::BF16)?;
+    ensure!(
+        down_rows == rank && up_cols == rank && rank > 0,
+        "{name} low-rank {rank}"
+    );
+    if let Some((ptr, packed)) = slot {
+        Ok(BlockLinear::LowRank {
+            down: view_at(
+                ptr,
+                packed_offset(packed, &down_name)?,
+                down_rows,
+                down_cols,
+            )?,
+            up: view_at(ptr, packed_offset(packed, &up_name)?, up_rows, up_cols)?,
+            owned: Vec::new(),
+        })
+    } else {
+        let down_owned = base.tensor::<bf16>(s, &down_name, down_rows * down_cols)?;
+        let up_owned = base.tensor::<bf16>(s, &up_name, up_rows * up_cols)?;
+        let down = matrix(&down_owned, s, down_rows, down_cols)?;
+        let up = matrix(&up_owned, s, up_rows, up_cols)?;
+        Ok(BlockLinear::LowRank {
+            down,
+            up,
+            owned: vec![down_owned, up_owned],
         })
     }
 }
@@ -766,6 +1028,7 @@ pub(crate) struct BlockKernels {
     serial_norm_modulate: std::cell::Cell<bool>,
     gated_add: crate::backend::gpu::CudaFunction,
     residual: crate::backend::gpu::CudaFunction,
+    stored_launch: std::sync::OnceLock<StoredLaunch>,
 }
 
 impl BlockKernels {
@@ -794,8 +1057,29 @@ impl BlockKernels {
             #[cfg(test)]
             serial_norm_modulate: std::cell::Cell::new(false),
             gated_add: modulate.load_function("row_gated_add")?,
+            stored_launch: std::sync::OnceLock::new(),
         })
     }
+
+    fn stored_launch(
+        &self,
+        ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>,
+    ) -> Result<&StoredLaunch> {
+        if let Some(launch) = self.stored_launch.get() {
+            return Ok(launch);
+        }
+        let launch = StoredLaunch {
+            upcast: cubin::module(ctx, "vision_ops")?.load_function("vision_upcast_f32")?,
+            convrot: crate::convrot::load_convrot(ctx)?,
+        };
+        let _ = self.stored_launch.set(launch);
+        self.stored_launch.get().context("stored launch")
+    }
+}
+
+struct StoredLaunch {
+    upcast: crate::backend::gpu::CudaFunction,
+    convrot: crate::convrot::ConvrotFns,
 }
 
 /// Activations of one block forward over `rows` sequence rows.
@@ -816,6 +1100,29 @@ pub(crate) struct BlockWork {
     hidden: Tensor<bf16, 2>,
     gated: Tensor<bf16, 2>,
     ffn_owned: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
+    stored: Option<StoredScratch>,
+}
+
+/// Convrot and low-rank scratch for one block forward. `codes` aliases `x`.
+struct StoredScratch {
+    x: CudaSlice<f32>,
+    rotated: CudaSlice<f32>,
+    scales: CudaSlice<f32>,
+    mid: CudaSlice<bf16>,
+    k: usize,
+    rank: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StoredPtrs {
+    x: u64,
+    rotated: u64,
+    codes: u64,
+    scales: u64,
+    mid: u64,
+    rows: usize,
+    k: usize,
+    rank: usize,
 }
 
 impl BlockWork {
@@ -852,6 +1159,47 @@ impl BlockWork {
                     u32::try_from(rows)?,
                     u32::try_from(output)?,
                     u32::try_from(input)?,
+                )?;
+            }
+        }
+        if spec.is_hyperflow()? {
+            self.prepare_low_rank(blas, spec)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_low_rank(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
+        let ranks = spec.lowrank_ranks.as_ref().context("HyperFlow rank set")?;
+        for (name, &rank) in ranks {
+            let suffix = name
+                .split_once('.')
+                .and_then(|(_, rest)| rest.split_once('.').map(|(_, suffix)| suffix))
+                .with_context(|| format!("{name} low-rank suffix"))?;
+            let width = spec.heads * spec.head_dim;
+            let (out, input, ffn) = match suffix {
+                "attn.to_q" | "attn.to_k" | "attn.to_v" => (width, spec.hidden, false),
+                "attn.to_out.0" => (spec.hidden, width, false),
+                "ff.net.0.proj" => (2 * spec.ffn, spec.hidden, true),
+                "ff.net.2" => (spec.hidden, spec.ffn, true),
+                _ => bail!("{name} is not a block linear"),
+            };
+            let mut row_sets = vec![self.rows];
+            if ffn {
+                row_sets = [self.chunk, self.rows % self.chunk]
+                    .into_iter()
+                    .filter(|&n| n > 0)
+                    .collect();
+            }
+            for rows in row_sets {
+                blas.prepare_fixed(
+                    u32::try_from(rows)?,
+                    u32::try_from(rank)?,
+                    u32::try_from(input)?,
+                )?;
+                blas.prepare_fixed(
+                    u32::try_from(rows)?,
+                    u32::try_from(out)?,
+                    u32::try_from(rank)?,
                 )?;
             }
         }
@@ -1070,6 +1418,24 @@ impl BlockWork {
         let gated = s.alloc_zeros::<bf16>(chunk * spec.ffn)?;
         let hidden_view = matrix(&hidden, s, chunk, 2 * spec.ffn)?;
         let gated_view = matrix(&gated, s, chunk, spec.ffn)?;
+        let stored = if spec.is_hyperflow()? {
+            let k = spec.hidden.max(width).max(spec.ffn);
+            let low_rank = spec
+                .lowrank_ranks
+                .as_ref()
+                .and_then(|ranks| ranks.values().copied().max())
+                .unwrap_or(0);
+            Some(StoredScratch {
+                x: s.alloc_zeros::<f32>(rows * k)?,
+                rotated: s.alloc_zeros::<f32>(rows * k)?,
+                scales: s.alloc_zeros::<f32>(rows)?,
+                mid: s.alloc_zeros::<bf16>(rows * low_rank.max(1))?,
+                k,
+                rank: low_rank,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             rows,
             rank,
@@ -1087,6 +1453,7 @@ impl BlockWork {
             hidden: hidden_view,
             gated: gated_view,
             ffn_owned: Some((hidden, gated)),
+            stored,
         })
     }
 }
@@ -1176,9 +1543,188 @@ fn lora_pair(
     }
 }
 
+fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
+    let scratch = work.stored.as_ref()?;
+    let x = pointer(&scratch.x, s);
+    Some(StoredPtrs {
+        x,
+        rotated: pointer(&scratch.rotated, s),
+        codes: x,
+        scales: pointer(&scratch.scales, s),
+        mid: pointer(&scratch.mid, s),
+        rows: work.rows,
+        k: scratch.k,
+        rank: scratch.rank,
+    })
+}
+
+fn resident_span<T>(owned: &CudaSlice<T>, s: &Arc<CudaStream>, view: &Tensor<T, 2>) -> Result<()> {
+    let base = pointer(owned, s);
+    let bytes = u64::try_from(owned.len())?
+        .checked_mul(std::mem::size_of::<T>() as u64)
+        .context("resident factor bytes")?;
+    let end = base.checked_add(bytes).context("resident factor bytes")?;
+    let stop = view
+        .ptr
+        .checked_add(view.span_bytes)
+        .context("resident factor span")?;
+    ensure!(
+        view.ptr >= base && stop <= end,
+        "resident factor leaves its allocation"
+    );
+    Ok(())
+}
+
+impl BlockLinear {
+    /// A resident factor's view addresses the allocation in `owned`.
+    fn retain_resident(&self, s: &Arc<CudaStream>) -> Result<()> {
+        match self {
+            BlockLinear::Dense {
+                weight,
+                owned: Some(slice),
+            } => resident_span(slice, s, weight),
+            BlockLinear::Dense { owned: None, .. } => Ok(()),
+            BlockLinear::Int8 {
+                qweight,
+                owned: Some(slice),
+                ..
+            } => resident_span(slice, s, qweight),
+            BlockLinear::Int8 { owned: None, .. } => Ok(()),
+            BlockLinear::LowRank { down, up, owned } if owned.len() == 2 => {
+                resident_span(&owned[0], s, down)?;
+                resident_span(&owned[1], s, up)
+            }
+            BlockLinear::LowRank { owned, .. } => {
+                ensure!(owned.is_empty(), "low-rank resident factors");
+                Ok(())
+            }
+        }
+    }
+}
+
+fn apply_linear(
+    c: &BlockContext<'_>,
+    linear: &BlockLinear,
+    x: Tensor<bf16, 2>,
+    y: Tensor<bf16, 2>,
+    scratch: Option<StoredPtrs>,
+) -> Result<()> {
+    match linear {
+        BlockLinear::Dense { weight, .. } => c.blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            crate::backend::cuda::linear::LinearWeightRef::Bf16(*weight),
+            x,
+            &mut TensorMut(y),
+        ),
+        BlockLinear::Int8 {
+            qweight,
+            wscale,
+            group,
+            ..
+        } => apply_int8(c, *qweight, wscale, *group, x, y, scratch),
+        BlockLinear::LowRank { down, up, .. } => apply_low_rank(c, *down, *up, x, y, scratch),
+    }
+}
+
+fn apply_int8(
+    c: &BlockContext<'_>,
+    qweight: Tensor<i8, 2>,
+    wscale: &CudaSlice<f32>,
+    group: u32,
+    x: Tensor<bf16, 2>,
+    y: Tensor<bf16, 2>,
+    scratch: Option<StoredPtrs>,
+) -> Result<()> {
+    let ptrs = scratch.context("stored linear without scratch")?;
+    let rows = x.shape[0] as usize;
+    let k = x.shape[1] as usize;
+    let n = y.shape[1] as usize;
+    ensure!(
+        qweight.shape == [u32::try_from(n)?, u32::try_from(k)?]
+            && wscale.len() == n
+            && y.shape[0] as usize == rows
+            && rows <= ptrs.rows
+            && k <= ptrs.k,
+        "convrot shape"
+    );
+    let count = rows * k;
+    let launch = c.kernels.stored_launch(c.s.context())?;
+    unsafe {
+        c.s.launch_builder(&launch.upcast)
+            .arg(&x.ptr)
+            .arg(&ptrs.x)
+            .arg(&u32::try_from(count)?)
+            .launch(flat(count))?;
+    }
+    crate::convrot::launch_device(
+        c.s,
+        &launch.convrot,
+        &crate::convrot::ConvrotArgs {
+            x: ptrs.x,
+            qweight: qweight.ptr,
+            wscale: pointer(wscale, c.s),
+            y: y.ptr,
+            rotated: ptrs.rotated,
+            codes: ptrs.codes,
+            scales: ptrs.scales,
+            rows: i32::try_from(rows)?,
+            k: i32::try_from(k)?,
+            n: i32::try_from(n)?,
+            group: i32::try_from(group)?,
+        },
+    )
+}
+
+fn apply_low_rank(
+    c: &BlockContext<'_>,
+    down: Tensor<bf16, 2>,
+    up: Tensor<bf16, 2>,
+    x: Tensor<bf16, 2>,
+    y: Tensor<bf16, 2>,
+    scratch: Option<StoredPtrs>,
+) -> Result<()> {
+    let ptrs = scratch.context("stored linear without scratch")?;
+    let rows = x.shape[0] as usize;
+    let k = x.shape[1] as usize;
+    let n = y.shape[1] as usize;
+    let rank = down.shape[0] as usize;
+    ensure!(
+        down.shape[1] as usize == k
+            && up.shape == [u32::try_from(n)?, u32::try_from(rank)?]
+            && y.shape[0] as usize == rows
+            && rows <= ptrs.rows
+            && rank > 0
+            && rank <= ptrs.rank,
+        "low-rank shape"
+    );
+    let mid = unsafe {
+        Tensor::new(
+            ptrs.mid,
+            [u32::try_from(rows)?, u32::try_from(rank)?],
+            [u64::try_from(rank)?, 1],
+            u64::try_from(rows)?
+                .checked_mul(u64::try_from(rank)?)
+                .and_then(|elements| elements.checked_mul(2))
+                .context("low-rank scratch bytes")?,
+        )?
+    };
+    c.blas.linear_typed(
+        crate::op_contract::ExecutionPhase::Prefill,
+        crate::backend::cuda::linear::LinearWeightRef::Bf16(down),
+        x,
+        &mut TensorMut(mid),
+    )?;
+    c.blas.linear_typed(
+        crate::op_contract::ExecutionPhase::Prefill,
+        crate::backend::cuda::linear::LinearWeightRef::Bf16(up),
+        mid,
+        &mut TensorMut(y),
+    )
+}
+
 /// One MiniMax-H3 transformer or token refiner block over `x [rows, hidden]` in place, BF16. The `LORA` monomorph
 /// applies LoRA online at `c.lora_scale`; the other monomorph launches no LoRA GEMM. A modulated block's `rotary`
-/// is `[rows, 6 * rope_freq_dim]` from `rotary_table`.
+/// is `[rows, 6 * rope_freq_dim]` from `rotary_table`. A dropped block returns `x`.
 pub(crate) fn block_forward<const LORA: bool>(
     c: &BlockContext<'_>,
     flash: &mut Flash,
@@ -1205,6 +1751,9 @@ pub(crate) fn block_forward<const LORA: bool>(
         Conditioning::Plain => (0, pointer(&work.q, s), None),
     };
     ensure!(x.len() == rows * h, "block rows differ from the work rows");
+    if w.dropped {
+        return Ok(());
+    }
     let stride = 6 * h;
     let (table, index, entries) = match modulation {
         Some(m) => (
@@ -1298,13 +1847,9 @@ pub(crate) fn block_forward<const LORA: bool>(
         }
         Ok(())
     };
+    let scratch = stored_ptrs(s, work);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
-        blas.linear_typed(
-            crate::op_contract::ExecutionPhase::Prefill,
-            crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
-            x,
-            &mut TensorMut(y),
-        )
+        apply_linear(c, &w.linears[index], x, y, scratch)
     };
     hidden_norm(&w.norm1, 0, 1)?;
     for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
@@ -1414,7 +1959,7 @@ pub(crate) fn block_forward<const LORA: bool>(
     }
 
     hidden_norm(&w.norm2, 3, 4)?;
-    ffn_forward::<false, LORA>(c, w, work)?;
+    ffn_forward::<false, LORA>(c, w, work, scratch)?;
     if modulation.is_some() {
         gated_add(xp, normed, 5)?;
     } else {
@@ -1428,15 +1973,11 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     c: &BlockContext<'_>,
     w: &BlockWeights,
     work: &mut BlockWork,
+    scratch: Option<StoredPtrs>,
 ) -> Result<()> {
     let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
-        c.blas.linear_typed(
-            crate::op_contract::ExecutionPhase::Prefill,
-            crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
-            x,
-            &mut TensorMut(y),
-        )
+        apply_linear(c, &w.linears[index], x, y, scratch)
     };
     let chunk = work.chunk;
     for start in (0..rows).step_by(chunk) {
@@ -1976,9 +2517,206 @@ fn place_layers(
     }
 }
 
+type StoredOffsets = Vec<Vec<(String, usize)>>;
+
+/// HyperFlow transformer blocks. Dropped layers stay out of `DensePlacement` and come back as empty slots.
+/// A kept layer's device bytes equal its stored bytes. `packed` is `(name, byte offset)` in manifest order.
+fn place_stored_layers(
+    d: &Device,
+    base: &mut Source<'_>,
+    spec: &H3Spec,
+    sizing: &DenseSizing,
+    owned: usize,
+    placement: Placement,
+) -> Result<(
+    Option<crate::backend::cuda::weights::DenseStreaming>,
+    StoredOffsets,
+)> {
+    use crate::prefill::DensePlacement;
+    let dropped = spec
+        .dropped_blocks
+        .as_deref()
+        .context("HyperFlow dropped blocks")?;
+    let mut order = vec![Vec::new(); spec.layers];
+    let mut packed = vec![Vec::new(); spec.layers];
+    let mut cursor = vec![0usize; spec.layers];
+    for (name, entry) in &base.manifest.entries {
+        let Some(layer) = entry.layer else {
+            continue;
+        };
+        if !entry.load || entry.shape.len() != 2 {
+            continue;
+        }
+        let layer = layer as usize;
+        ensure!(
+            layer < spec.layers,
+            "stored linear {name} is outside {} layers",
+            spec.layers
+        );
+        let bytes = device_slot_bytes(name, entry)?;
+        ensure!(bytes == entry.bytes, "{name} is not pass-through");
+        ensure!(cursor[layer].is_multiple_of(16), "stored factor alignment");
+        match entry.dtype {
+            Dtype::BF16 | Dtype::I8 => {}
+            other => bail!("{name}: stored dtype {other:?}"),
+        }
+        packed[layer].push((name.clone(), cursor[layer]));
+        order[layer].push(name.clone());
+        cursor[layer] = cursor[layer]
+            .checked_add(entry.bytes)
+            .with_context(|| format!("{name} stored offset"))?;
+    }
+    for (layer, &bytes) in cursor.iter().enumerate() {
+        ensure!(
+            bytes == sizing.layers[layer] && bytes == sizing.source_layers[layer],
+            "block {layer} stored bytes"
+        );
+    }
+    let mut kept_device = Vec::new();
+    let mut kept_source = Vec::new();
+    let mut kept_index = Vec::new();
+    for layer in 0..spec.layers {
+        let (device, source) = (sizing.layers[layer], sizing.source_layers[layer]);
+        if dropped.contains(&layer) {
+            ensure!(
+                device == 0 && source == 0,
+                "dropped block {layer} stores a linear"
+            );
+            continue;
+        }
+        ensure!(device > 0, "block {layer} has no stored linear");
+        ensure!(
+            device == source,
+            "block {layer} device bytes differ from the stored bytes"
+        );
+        kept_device.push(device);
+        kept_source.push(source);
+        kept_index.push(layer);
+    }
+    ensure!(!kept_device.is_empty(), "no stored transformer block");
+    let (free, total) = d.ctx.mem_get_info()?;
+    let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+    if placement != Placement::Derived {
+        let slots = 2 * kept_device
+            .iter()
+            .copied()
+            .max()
+            .context("no stored transformer block")?;
+        ensure!(
+            slots <= device_budget,
+            "two block slots exceed the device budget"
+        );
+        device_budget = slots;
+    }
+    let probe = DensePlacement::new(&kept_device, Some(&kept_source), device_budget, 0)?;
+    let host_available = if probe.slot_bytes > 0 {
+        Some(usize::try_from(
+            crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+        )?)
+    } else {
+        None
+    };
+    let (compact, facts) = plan_dense_layers(
+        (&kept_device, &kept_source, sizing.largest, owned, 0),
+        placement,
+        (free, total, host_available),
+    )?;
+    ensure!(
+        compact.slots.len() == kept_index.len() && compact.host.len() == kept_index.len(),
+        "stored placement extent"
+    );
+    let mut slots = vec![None; spec.layers];
+    let mut host_flags = vec![false; spec.layers];
+    for (index, &layer) in kept_index.iter().enumerate() {
+        slots[layer] = compact.slots[index];
+        host_flags[layer] = compact.host[index];
+    }
+    let plan = DensePlacement {
+        slots,
+        host: host_flags,
+        slot_bytes: compact.slot_bytes,
+        resident_bytes: compact.resident_bytes,
+        host_bytes: compact.host_bytes,
+        disk_bytes: compact.disk_bytes,
+    };
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
+    );
+    let dense = if plan.slot_bytes > 0 {
+        let dir = base.reader.dir.clone();
+        let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
+            &dir,
+            base.manifest,
+            plan,
+            d,
+            Some(&order),
+        )?;
+        for (layer, names) in order.iter().enumerate() {
+            if !dense.plan.host[layer] {
+                continue;
+            }
+            let host = dense.host_layer(layer)?.with_context(|| {
+                format!("transformer_blocks.{layer}: host tier without a pinned copy")
+            })?;
+            ensure!(
+                host.len() == sizing.source_layers[layer],
+                "transformer_blocks.{layer}: pinned copy size"
+            );
+            let mut offset = 0usize;
+            for name in names {
+                let entry = base
+                    .manifest
+                    .entries
+                    .get(name)
+                    .with_context(|| format!("manifest lacks {name}"))?
+                    .clone();
+                ensure!(offset.is_multiple_of(16), "stored factor alignment");
+                let end = offset
+                    .checked_add(entry.bytes)
+                    .with_context(|| format!("{name} stored host offset"))?;
+                let dest = &mut host[offset..end];
+                match entry.dtype {
+                    Dtype::BF16 => base.reader.read_into(name, &entry, dest)?,
+                    Dtype::I8 => base.reader.read_raw(name, &entry, dest)?,
+                    other => bail!("{name}: stored dtype {other:?}"),
+                }
+                offset = end;
+            }
+            ensure!(
+                offset == host.len(),
+                "transformer_blocks.{layer}: pinned copy size"
+            );
+        }
+        Some(dense)
+    } else {
+        None
+    };
+    Ok((dense, packed))
+}
+
+fn hyperflow_temb(spec: &H3Spec) -> Result<()> {
+    if spec.is_hyperflow()? {
+        bail!("HyperFlow temb mix is not bound");
+    }
+    Ok(())
+}
+
+fn forward_block<const LORA: bool>(
+    c: &BlockContext<'_>,
+    flash: &mut Flash,
+    weights: &BlockWeights,
+    conditioning: &Conditioning<'_>,
+    x: &mut CudaSlice<bf16>,
+    work: &mut BlockWork,
+) -> Result<()> {
+    block_forward::<LORA>(c, flash, weights, conditioning, x, work)
+}
+
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
 /// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
+/// A HyperFlow kept block loads its stored int8, low-rank, or dense factor. A dropped block is identity.
 pub(crate) struct Dit {
     ranges: Ranges,
     proj_in: [CudaSlice<f32>; 2],
@@ -2019,9 +2757,10 @@ impl Dit {
         mut lora: Source<'_>,
         placement: Placement,
     ) -> Result<Self> {
+        let hyperflow = spec.is_hyperflow()?;
         ensure!(
-            !spec.is_hyperflow()?,
-            "HyperFlow weights stay stored; the BF16 block slot does not load them"
+            !hyperflow || rank == 0,
+            "HyperFlow weights have no LoRA adapter"
         );
         let s = &d.stream;
         let ranges = Ranges::of(layout)?;
@@ -2043,18 +2782,33 @@ impl Dit {
         ];
         let final_norm = base.tensor(s, "token_refiner.final_norm.weight", h)?;
         let norm_out = base.tensor(s, "norm_out.norm.weight", h)?;
-        let refiners = (0..spec.refiner_layers)
-            .map(|i| {
-                BlockWeights::resident::<true>(
-                    s,
-                    spec,
-                    r,
-                    &format!("token_refiner.refiner_blocks.{i}"),
-                    &mut base,
-                    &mut lora,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let refiners = if hyperflow {
+            (0..spec.refiner_layers)
+                .map(|i| {
+                    BlockWeights::resident::<false>(
+                        s,
+                        spec,
+                        r,
+                        &format!("token_refiner.refiner_blocks.{i}"),
+                        &mut base,
+                        &mut lora,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            (0..spec.refiner_layers)
+                .map(|i| {
+                    BlockWeights::resident::<true>(
+                        s,
+                        spec,
+                        r,
+                        &format!("token_refiner.refiner_blocks.{i}"),
+                        &mut base,
+                        &mut lora,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         blas.prepare_biased(
             u32::try_from(ranges.text)?,
             u32::try_from(h)?,
@@ -2063,9 +2817,14 @@ impl Dit {
             LinearBiasMode::BeforeOutputRound,
         )?;
         let mut work = BlockWork::new(s, spec, r, ranges.rows)?;
-        work.prepare::<true>(blas, spec)?;
         let text_work = BlockWork::new(s, spec, r, ranges.text)?;
-        text_work.prepare::<true>(blas, spec)?;
+        if hyperflow {
+            work.prepare::<false>(blas, spec)?;
+            text_work.prepare::<false>(blas, spec)?;
+        } else {
+            work.prepare::<true>(blas, spec)?;
+            text_work.prepare::<true>(blas, spec)?;
+        }
         let flash = Flash::new(
             s.clone(),
             ranges.rows,
@@ -2092,69 +2851,137 @@ impl Dit {
         let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
 
         let sizing = dense_sizing(base.manifest, spec.layers)?;
-        let owned = lora
-            .manifest
-            .entries
-            .iter()
-            .filter(|(name, _)| name.starts_with("transformer_blocks."))
-            .map(|(_, entry)| entry.bytes)
-            .sum::<usize>()
+        let lora_bytes = if hyperflow {
+            0
+        } else {
+            lora.manifest
+                .entries
+                .iter()
+                .filter(|(name, _)| name.starts_with("transformer_blocks."))
+                .map(|(_, entry)| entry.bytes)
+                .sum::<usize>()
+        };
+        let mut owned = lora_bytes
             + spec.layers * 2 * (2 * h + 2 * spec.head_dim)
             + sizing.staging
             + sizing.transient;
-        let dense = place_layers(
-            d,
-            &mut base,
-            (
-                &sizing.layers,
-                &sizing.source_layers,
-                sizing.largest,
-                owned,
-                0,
-            ),
-            placement,
-            |layer| format!("transformer_blocks.{layer}"),
-            &LINEAR_ROLES,
-        )?
-        .dense;
-        let mut blocks = Vec::with_capacity(spec.layers);
-        for (layer, &bytes) in sizing.layers.iter().enumerate() {
-            let name = format!("transformer_blocks.{layer}");
-            let slot = match &dense {
-                Some(dense) if dense.plan.slots[layer].is_some() => {
-                    Some(dense.pointer(layer, 0, bytes)?)
-                }
-                _ => None,
-            };
-            blocks.push(match slot {
-                Some(slot) => {
-                    BlockWeights::streamed::<true>(s, spec, r, &name, slot, &mut base, &mut lora)?
-                }
-                None => BlockWeights::resident::<true>(s, spec, r, &name, &mut base, &mut lora)?,
-            });
+        if hyperflow {
+            let wscale = base
+                .manifest
+                .entries
+                .iter()
+                .filter(|(name, entry)| {
+                    name.starts_with("transformer_blocks.")
+                        && name.ends_with(".wscale")
+                        && entry.load
+                })
+                .try_fold(0usize, |sum, (_, entry)| {
+                    sum.checked_add(entry.bytes)
+                        .context("HyperFlow wscale bytes")
+                })?;
+            owned = owned
+                .checked_add(wscale)
+                .context("HyperFlow wscale bytes")?;
         }
+        let (dense, blocks) = if hyperflow {
+            let (dense, packed) =
+                place_stored_layers(d, &mut base, spec, &sizing, owned, placement)?;
+            let dropped = spec
+                .dropped_blocks
+                .as_deref()
+                .context("HyperFlow dropped blocks")?;
+            let mut blocks = Vec::with_capacity(spec.layers);
+            for (layer, factors) in packed.iter().enumerate() {
+                if dropped.contains(&layer) {
+                    blocks.push(BlockWeights::identity(s, spec)?);
+                    continue;
+                }
+                let name = format!("transformer_blocks.{layer}");
+                let bytes = sizing.layers[layer];
+                let slot = match &dense {
+                    Some(streaming) if streaming.plan.slots[layer].is_some() => {
+                        Some((streaming.pointer(layer, 0, bytes)?, factors.as_slice()))
+                    }
+                    _ => None,
+                };
+                blocks.push(BlockWeights::stored(
+                    s, spec, &name, &mut base, &mut lora, slot,
+                )?);
+            }
+            (dense, blocks)
+        } else {
+            let dense = place_layers(
+                d,
+                &mut base,
+                (
+                    &sizing.layers,
+                    &sizing.source_layers,
+                    sizing.largest,
+                    owned,
+                    0,
+                ),
+                placement,
+                |layer| format!("transformer_blocks.{layer}"),
+                &LINEAR_ROLES,
+            )?
+            .dense;
+            let mut blocks = Vec::with_capacity(spec.layers);
+            for (layer, &bytes) in sizing.layers.iter().enumerate() {
+                let name = format!("transformer_blocks.{layer}");
+                let slot = match &dense {
+                    Some(streaming) if streaming.plan.slots[layer].is_some() => {
+                        Some(streaming.pointer(layer, 0, bytes)?)
+                    }
+                    _ => None,
+                };
+                blocks.push(match slot {
+                    Some(slot) => BlockWeights::streamed::<true>(
+                        s, spec, r, &name, slot, &mut base, &mut lora,
+                    )?,
+                    None => {
+                        BlockWeights::resident::<true>(s, spec, r, &name, &mut base, &mut lora)?
+                    }
+                });
+            }
+            (dense, blocks)
+        };
         let (free, total) = d.ctx.mem_get_info()?;
         let reserve = (total / 16)
             .checked_add(sizing.transient)
             .context("FFN live reserve overflow")?;
-        for (output, input) in [(r, h), (r, spec.ffn), (2 * spec.ffn, r), (h, r)] {
-            blas.bind_row_family(crate::backend::setup::LinearShape {
-                rows: FFN_CHUNK_ROWS,
-                output,
-                input,
-            })?;
+        if !hyperflow {
+            for (output, input) in [(r, h), (r, spec.ffn), (2 * spec.ffn, r), (h, r)] {
+                blas.bind_row_family(crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output,
+                    input,
+                })?;
+            }
         }
         let budget = d.workspace_budget(free, free, reserve)?;
-        let choices = work.ffn_choices::<true>(blas, spec, budget)?;
-        let owned = FfnPlan::select(&choices, budget)?;
-        let aliases = work.alias_choices::<true>(blas, spec, owned)?;
-        let chosen = FfnPlan::select(&aliases, budget)?;
+        let (choices, owned, chosen) = if hyperflow {
+            let choices = work.ffn_choices::<false>(blas, spec, budget)?;
+            let owned = FfnPlan::select(&choices, budget)?;
+            let aliases = work.alias_choices::<false>(blas, spec, owned)?;
+            let chosen = FfnPlan::select(&aliases, budget)?;
+            (choices, owned, chosen)
+        } else {
+            let choices = work.ffn_choices::<true>(blas, spec, budget)?;
+            let owned = FfnPlan::select(&choices, budget)?;
+            let aliases = work.alias_choices::<true>(blas, spec, owned)?;
+            let chosen = FfnPlan::select(&aliases, budget)?;
+            (choices, owned, chosen)
+        };
         let previous = *choices
             .iter()
             .find(|p| p.chunk == work.chunk)
             .context("main FFN baseline missing")?;
         if work.rows > FFN_CHUNK_ROWS {
-            work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
+            if hyperflow {
+                work.ffn_cost::<false>(blas, spec, work.chunk, true)?;
+            } else {
+                work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
+            }
         }
         let description = |plan: FfnPlan| {
             serde_json::json!({
@@ -2180,7 +3007,11 @@ impl Dit {
             );
         }
         blas.bind_workspace(chosen.workspace)?;
-        work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
+        if hyperflow {
+            work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
+        } else {
+            work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
+        }
         s.synchronize()?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
@@ -2388,6 +3219,7 @@ impl Dit {
         (pairs, timesteps): (u32, u32),
         inputs: &StepInputs<'_>,
     ) -> Result<()> {
+        hyperflow_temb(c.spec)?;
         let (s, spec, r) = (c.s, c.spec, self.ranges);
         let h = spec.hidden;
         let video_rows = r.condition + (r.rows - r.video_start);
@@ -2408,14 +3240,25 @@ impl Dit {
             LinearBiasMode::BeforeOutputRound,
         )?;
         for refiner in &self.refiners {
-            block_forward::<true>(
-                c,
-                &mut self.text_flash,
-                refiner,
-                &Conditioning::Plain,
-                &mut self.text,
-                &mut self.text_work,
-            )?;
+            if spec.is_hyperflow()? {
+                forward_block::<false>(
+                    c,
+                    &mut self.text_flash,
+                    refiner,
+                    &Conditioning::Plain,
+                    &mut self.text,
+                    &mut self.text_work,
+                )?;
+            } else {
+                forward_block::<true>(
+                    c,
+                    &mut self.text_flash,
+                    refiner,
+                    &Conditioning::Plain,
+                    &mut self.text,
+                    &mut self.text_work,
+                )?;
+            }
         }
         c.kernels.rms_norm(
             s,
@@ -2464,17 +3307,31 @@ impl Dit {
                 entries: pairs,
                 index: inputs.row_pairs,
             };
-            block_forward::<true>(
-                c,
-                &mut self.flash,
-                block,
-                &Conditioning::Modulated {
-                    rotary: &self.rotary,
-                    modulation: &modulation,
-                },
-                &mut self.x,
-                &mut self.work,
-            )?;
+            if spec.is_hyperflow()? {
+                forward_block::<false>(
+                    c,
+                    &mut self.flash,
+                    block,
+                    &Conditioning::Modulated {
+                        rotary: &self.rotary,
+                        modulation: &modulation,
+                    },
+                    &mut self.x,
+                    &mut self.work,
+                )?;
+            } else {
+                forward_block::<true>(
+                    c,
+                    &mut self.flash,
+                    block,
+                    &Conditioning::Modulated {
+                        rotary: &self.rotary,
+                        modulation: &modulation,
+                    },
+                    &mut self.x,
+                    &mut self.work,
+                )?;
+            }
             if let Some(dense) = self.dense.as_mut() {
                 dense.end(layer, s)?;
             }
@@ -5237,9 +6094,9 @@ mod tests {
                             )?;
                         }
                     } else if shifted {
-                        ffn_forward::<true, true>(&context, &weights[0], work)?;
+                        ffn_forward::<true, true>(&context, &weights[0], work, None)?;
                     } else {
-                        ffn_forward::<false, true>(&context, &weights[0], work)?;
+                        ffn_forward::<false, true>(&context, &weights[0], work, None)?;
                     }
                     Ok(())
                 };

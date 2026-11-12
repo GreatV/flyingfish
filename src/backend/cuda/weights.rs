@@ -1981,8 +1981,12 @@ impl DenseStreaming {
                         .entries
                         .get(name)
                         .with_context(|| format!("dense ordered tensor {name} missing"))?;
+                    let stored = entry.is_linear_projection()
+                        || (entry.load
+                            && entry.shape.len() == 2
+                            && entry.role.ends_with(".qweight"));
                     ensure!(
-                        entry.is_linear_projection() && entry.layer == Some(layer_index as u32),
+                        stored && entry.layer == Some(layer_index as u32),
                         "dense ordered tensor {name} is outside layer {layer_index}"
                     );
                     add(name, layer_index, entry)?;
