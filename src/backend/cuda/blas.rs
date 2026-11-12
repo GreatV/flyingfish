@@ -197,6 +197,28 @@ impl Plan {
             workspace,
             bias,
             sys::cudaDataType_t::CUDA_R_16BF,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            PlanAlgo::Heuristic(algo_index),
+        )
+    }
+
+    /// F16-input plan bound to the heuristic first result, the reference
+    /// library's pick for plain F16 linears.
+    fn new_f16(
+        handle: sys::cublasLtHandle_t,
+        rows: usize,
+        output: usize,
+        input: usize,
+        workspace: usize,
+        algo_index: u32,
+    ) -> Result<Self> {
+        Self::build(
+            handle,
+            (rows, output, input),
+            workspace,
+            None,
+            sys::cudaDataType_t::CUDA_R_16F,
+            sys::cudaDataType_t::CUDA_R_16F,
             PlanAlgo::Heuristic(algo_index),
         )
     }
@@ -216,6 +238,7 @@ impl Plan {
             (rows, output, input),
             workspace,
             None,
+            sys::cudaDataType_t::CUDA_R_16BF,
             sys::cudaDataType_t::CUDA_R_32F,
             PlanAlgo::Heuristic(algo_index),
         )
@@ -227,6 +250,7 @@ impl Plan {
         geometry: (usize, usize, usize),
         workspace: usize,
         bias: Option<u64>,
+        ab_dtype: sys::cudaDataType_t,
         c_dtype: sys::cudaDataType_t,
         select: PlanAlgo,
     ) -> Result<Self> {
@@ -256,7 +280,7 @@ impl Plan {
                 size_of::<i32>(),
             )?;
         }
-        let dtype = sys::cudaDataType_t::CUDA_R_16BF;
+        let dtype = ab_dtype;
         if let Some(ptr) = bias {
             let epilogue = sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
             unsafe {
@@ -499,6 +523,8 @@ pub struct Blas {
     plans: LinearPlans,
     row_families: RefCell<BTreeMap<(usize, usize), (sys::cublasLtMatmulAlgo_t, usize)>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
+    f16_reference: bool,
+    f16_plans: RefCell<BTreeMap<LinearShape, Plan>>,
     bias_add: Option<CudaFunction>,
     bias_fill_f16: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
@@ -707,6 +733,8 @@ impl Blas {
             plans: RefCell::new(BTreeMap::new()),
             row_families: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
+            f16_reference: false,
+            f16_plans: RefCell::new(BTreeMap::new()),
             bias_add: None,
             bias_fill_f16: None,
             handle,
@@ -1210,6 +1238,7 @@ impl Blas {
                 self.workspace.borrow().len(),
                 None,
                 sys::cudaDataType_t::CUDA_R_16BF,
+                sys::cudaDataType_t::CUDA_R_16BF,
                 PlanAlgo::Fixed(algo),
             )?;
             self.plans.borrow_mut().insert(key, plan);
@@ -1420,6 +1449,9 @@ impl Blas {
                 && y.0.stride == [output as u64, 1],
             "FP16 linear requires dense [output,input] x [rows,input] -> [rows,output]"
         );
+        if self.f16_reference {
+            return self.linear_f16_reference(weight, x, y, accumulate);
+        }
         let alpha = 1f32;
         let beta = if accumulate { 1f32 } else { 0f32 };
         unsafe {
@@ -1445,6 +1477,67 @@ impl Blas {
                 bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
             .result()?;
+        }
+        Ok(())
+    }
+
+    /// Binds subsequent F16 linears to the heuristic first result, the
+    /// reference library's algorithm pick, instead of the legacy GEMM entry.
+    pub(crate) fn enable_f16_reference(&mut self) {
+        self.f16_reference = true;
+    }
+
+    fn linear_f16_reference(
+        &self,
+        weight: super::contracts::Tensor<half::f16, 2>,
+        x: super::contracts::Tensor<half::f16, 2>,
+        y: &mut super::contracts::TensorMut<half::f16, 2>,
+        accumulate: bool,
+    ) -> Result<()> {
+        let shape = LinearShape {
+            rows: x.shape[0] as usize,
+            output: weight.shape[0] as usize,
+            input: weight.shape[1] as usize,
+        };
+        {
+            let mut plans = self.f16_plans.borrow_mut();
+            if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(shape) {
+                let plan = Plan::new_f16(
+                    self.handle,
+                    shape.rows,
+                    shape.output,
+                    shape.input,
+                    1 << 20,
+                    0,
+                )?;
+                entry.insert(plan);
+            }
+        }
+        let plans = self.f16_plans.borrow();
+        let p = plans.get(&shape).context("F16 reference plan missing")?;
+        let workspace_owner = self.workspace.borrow();
+        let (workspace, _read) = workspace_owner.device_ptr(&self.stream);
+        let alpha = 1f32;
+        let beta = if accumulate { 1f32 } else { 0f32 };
+        unsafe {
+            lt::matmul(
+                self.handle,
+                p.desc,
+                (&alpha as *const f32).cast(),
+                (&beta as *const f32).cast(),
+                weight.ptr as _,
+                p.a,
+                x.ptr as _,
+                p.b,
+                y.0.ptr as _,
+                p.c,
+                y.0.ptr as _,
+                p.c,
+                p.algo.as_ref().context("F16 reference algo missing")?,
+                workspace as _,
+                workspace_owner.len(),
+                self.stream.cu_stream() as _,
+            )?;
         }
         Ok(())
     }
@@ -1937,6 +2030,7 @@ impl Blas {
             (shape.rows, shape.output, shape.input),
             self.workspace.borrow().len(),
             Some(bias.ptr),
+            sys::cudaDataType_t::CUDA_R_16BF,
             sys::cudaDataType_t::CUDA_R_16BF,
             PlanAlgo::Fixed(algo),
         )?;

@@ -6185,6 +6185,12 @@ impl PixalDecoder {
             channels: 64,
         })
     }
+    /// Binds every subsequent F16 linear of this decoder to the reference
+    /// library's algorithm pick (the heuristic first result).
+    pub fn bind_reference_f16(&mut self) {
+        self.blas.enable_f16_reference();
+    }
+
     pub fn decode(
         &self,
         coordinates: Vec<[i32; 4]>,

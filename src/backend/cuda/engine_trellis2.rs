@@ -2321,13 +2321,14 @@ mod tests {
                     crate::pixal3d::DecoderKind::Texture
                 };
                 let device = device.clone();
-                let decoder = super::super::pixal3d::PixalDecoder::open(
+                let mut decoder = super::super::pixal3d::PixalDecoder::open(
                     &device,
                     &model,
                     decoder_kind,
                     &runtime,
                     limit,
                 )?;
+                decoder.bind_reference_f16();
                 cases_run += 1;
                 let dir = root.join(format!("decode-{name}-r0a"));
                 let stage_output = root.join(format!("{name}-r0a/stage-output.safetensors"));
