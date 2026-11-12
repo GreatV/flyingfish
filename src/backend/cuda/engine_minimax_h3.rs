@@ -11321,6 +11321,16 @@ mod tests {
             BLOCK6_TAU,
             &mut control_fail,
         );
+        let temb_swapped = read_f32(
+            &reference.join("temb_swapped.f32"),
+            timesteps.len() * spec.time_dim,
+        )?;
+        record_control(
+            "reference-temb-swapped",
+            max_rmse(&f64_of_f32(&temb_swapped), &f64_of_f32(&temb_ref))?,
+            TEMB_TAU,
+            &mut control_fail,
+        );
         ensure!(
             control_fail.is_empty(),
             "reference control stayed within 10x tau: {control_fail:?}"
@@ -11360,6 +11370,19 @@ mod tests {
             max_rmse(&f64_of_f32(&temb), &f64_of_f32(&temb_ref))?,
             TEMB_TAU,
             &mut defects,
+        );
+        let swapped_temb = crate::minimax_h3::mixed_temb(
+            &spec, &current, &endpoint, &endpoints, &timesteps, gate,
+        )?;
+        ensure!(
+            swapped_temb.len() == temb_ref.len() && swapped_temb.iter().all(|v| v.is_finite()),
+            "swapped temb extent or a non-finite lane"
+        );
+        record_control(
+            "candidate-temb-swapped",
+            max_rmse(&f64_of_f32(&swapped_temb), &f64_of_f32(&temb_ref))?,
+            TEMB_TAU,
+            &mut control_fail,
         );
         let x_host = mixed_adaln_input(&spec, &current, &endpoint, &timesteps, &endpoints, gate)?;
         ensure!(
