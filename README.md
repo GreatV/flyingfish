@@ -45,11 +45,11 @@ Speech (library entry points, no CLI):
 | Nemotron-3-Diarization | Offline and streaming speaker diarization with an arrival-order speaker cache; `flyingfish::diarization::Diarization` | CUDA |
 | Breeze-TTS-2 | Text encoder, backbone and depth decoder; greedy decode over supplied audio-code frames with per-layer KV caches and CUDA-graph replay; audio tokenizer decode to a 24 kHz waveform; `flyingfish::backend::{Breeze, BreezeTokenizer}`. No sampling and no free-running text-to-speech entry | CUDA |
 
-Media generation (library entry points, no CLI):
+Media generation (library entry points and CLI):
 
 | Model | Notes | Backends |
 |---|---|---|
-| MiniMax-H3 | Image and text to video with audio: Qwen3-VL conditioner, streamed diffusion transformer with Turbo LoRA, video and audio decoders, native prompt, canvas and keyframe producers, noise drawn from the request seed; the diffusion transformer also loads from a GGUF Q4_0 file; `flyingfish::minimax_h3::generate` | CUDA |
+| MiniMax-H3 | Image-to-video with audio: Qwen3-VL conditioner, streamed diffusion transformer with Turbo LoRA, video and audio decoders, native prompt, canvas and keyframe producers, noise drawn from the request seed; the diffusion transformer also loads from a GGUF Q4_0 file; `flyingfish::minimax_h3::run_minimax_h3_i2va`; the `video` command writes MP4 or Y4M+WAV | CUDA |
 | MiniMax-H3-Image | Diffusion transformer with the six-step Euler sampler and the edit path, streamed weights, on supplied text embeddings and latent rows; `flyingfish::minimax_h3::image_sample` | CUDA |
 | MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) in one entry from token ids and a seed to stereo PCM; `flyingfish::music3::generate` | CUDA |
 
@@ -79,7 +79,8 @@ Two-GPU MoE expert residency with peer compute is supported.
 Requirements:
 - the Rust toolchain pinned in `rust-toolchain.toml`;
 - a CUDA toolkit with `nvcc` on `PATH` or under `CUDA_HOME`;
-- an NVIDIA driver.
+- an NVIDIA driver;
+- ffmpeg on `PATH` for MP4 output. Y4M+WAV output does not require it.
 
 CUDA builds also require the device-only `nightly-2026-10-06` toolchain, with
 `rust-src`, `llvm-tools`, `llvm-bitcode-linker`, and the `nvptx64-nvidia-cuda`
@@ -125,6 +126,12 @@ flyingfish --model <model-dir> --runtime-dir <dir> generate --prompt "Hello" --m
 
 # OpenAI-compatible server: /v1/completions and /v1/chat/completions.
 flyingfish --model <model-dir> --runtime-dir <dir> serve --port 8080
+
+# Generate MiniMax-H3 video and audio from a keyframe.
+flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image keyframe.png --frames 136 --seed 42 --lora <turbo-lora> -o out.mp4
+
+# Raw output: out.y4m and out.wav. Add --json to print output metadata as JSON.
+flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image keyframe.png --frames 136 --seed 42 --lora <turbo-lora> -o out.y4m --json
 ```
 
 Common options:

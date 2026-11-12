@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use flyingfish::backend;
 use flyingfish::{
@@ -113,6 +113,24 @@ enum Command {
             help = "Processor-packed image input saved by the serve input trace"
         )]
         image_tensors: Option<PathBuf>,
+    },
+    Video {
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        image: Option<PathBuf>,
+        #[arg(long)]
+        frames: usize,
+        #[arg(long)]
+        seed: u64,
+        #[arg(long)]
+        lora: PathBuf,
+        #[arg(long)]
+        gguf: Option<PathBuf>,
+        #[arg(short = 'o', long = "output")]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     Serve {
         #[arg(long, default_value_t = 8080)]
@@ -532,6 +550,145 @@ fn checkpoint_mtp(dir: &Path, requested: Option<u8>, plain_selected: bool) -> Re
     resolve_mtp(requested, component, plain_selected)
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn mp4_output(path: &Path) -> Result<bool> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("mp4") => Ok(true),
+        Some("y4m") => Ok(false),
+        _ => bail!("video output must end in .mp4 or .y4m"),
+    }
+}
+
+fn video(
+    cli: &Cli,
+    request: flyingfish::minimax_h3::MiniMaxH3I2vaRequest,
+    output: &Path,
+    json: bool,
+) -> Result<()> {
+    let _ = (cli, &request, output, json);
+    #[cfg(not(feature = "cuda"))]
+    bail!("video requires CUDA");
+    #[cfg(feature = "cuda")]
+    {
+        let mp4 = mp4_output(output)?;
+        let output = output_path(output, &cli.model)?;
+        let keyframe = request
+            .keyframe
+            .canonicalize()
+            .with_context(|| format!("resolve keyframe {}", request.keyframe.display()))?;
+        let lora = request
+            .lora
+            .canonicalize()
+            .with_context(|| format!("resolve LoRA {}", request.lora.display()))?;
+        let gguf = request
+            .gguf
+            .as_ref()
+            .map(|path| {
+                path.canonicalize()
+                    .with_context(|| format!("resolve GGUF {}", path.display()))
+            })
+            .transpose()?;
+        let request = flyingfish::minimax_h3::MiniMaxH3I2vaRequest {
+            model: cli.model.clone(),
+            lora,
+            keyframe,
+            gguf,
+            ..request
+        };
+        let options = flyingfish::RunOptions {
+            device: cli.device,
+            runtime_dir: cli
+                .kernels
+                .runtime_dir
+                .clone()
+                .context("--runtime-dir is required for video")?,
+        };
+        let generated = flyingfish::minimax_h3::run_minimax_h3_i2va(&request, options)?;
+        let flyingfish::minimax_h3::H3Output {
+            frames,
+            height,
+            width,
+            video,
+            samples,
+            sampling_rate,
+            audio,
+        } = generated;
+        ensure!(
+            audio.len() == samples.checked_mul(2).context("audio extent overflow")?,
+            "MiniMax-H3 audio extent"
+        );
+        let mut interleaved = Vec::with_capacity(audio.len());
+        for index in 0..samples {
+            interleaved.push(audio[index]);
+            interleaved.push(audio[samples + index]);
+        }
+        let mut outputs = Vec::new();
+        if mp4 {
+            flyingfish::media::mux_mp4(
+                &output,
+                flyingfish::media::Y4mVideo {
+                    width,
+                    height,
+                    fps: (flyingfish::minimax_h3::FPS, 1),
+                    frames,
+                    video,
+                },
+                Some((sampling_rate, 2, &interleaved)),
+            )?;
+            outputs.push(output);
+        } else {
+            let wav = output_path(&output.with_extension("wav"), &cli.model)?;
+            let result = (|| -> Result<()> {
+                flyingfish::media::write_y4m(
+                    fs::File::create(&output)?,
+                    width,
+                    height,
+                    (flyingfish::minimax_h3::FPS, 1),
+                    frames,
+                    &video,
+                )?;
+                flyingfish::media::write_wav(
+                    fs::File::create(&wav)?,
+                    sampling_rate,
+                    2,
+                    &interleaved,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = fs::remove_file(&output);
+                let _ = fs::remove_file(&wav);
+                return Err(error);
+            }
+            outputs.push(output);
+            outputs.push(wav);
+        }
+        if json {
+            let outputs: Vec<_> = outputs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({"video": {
+                    "outputs": outputs,
+                    "frames": frames,
+                    "width": width,
+                    "height": height,
+                    "samples": samples,
+                    "sampling_rate": sampling_rate,
+                    "seed": request.seed,
+                }})
+            );
+        } else {
+            for path in outputs {
+                println!("{}", path.display());
+            }
+        }
+        Ok(())
+    }
+}
+
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
     normalize_budget(&mut cli);
@@ -576,6 +733,30 @@ fn run() -> Result<()> {
                     image_tensors,
                 )
             }
+        }
+        Command::Video {
+            prompt,
+            image,
+            frames,
+            seed,
+            lora,
+            gguf,
+            output,
+            json,
+        } => {
+            let keyframe = image
+                .clone()
+                .context("--image is required for MiniMax-H3 image-to-video+audio")?;
+            let request = flyingfish::minimax_h3::MiniMaxH3I2vaRequest {
+                model: cli.model.clone(),
+                lora: lora.clone(),
+                keyframe,
+                prompt: prompt.clone(),
+                frames: *frames,
+                seed: *seed,
+                gguf: gguf.clone(),
+            };
+            video(&cli, request, output, *json)
         }
         Command::Serve { port, mtp } => {
             let draft = cli
@@ -978,6 +1159,74 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_parse_covers_i2va_media_and_output_options() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "--runtime-dir",
+            "runtime",
+            "--device",
+            "1",
+            "video",
+            "--prompt",
+            "a boat",
+            "--image",
+            "keyframe.png",
+            "--frames",
+            "121",
+            "--seed",
+            "42",
+            "--lora",
+            "turbo.safetensors",
+            "--gguf",
+            "transformer.gguf",
+            "-o",
+            "out.y4m",
+            "--json",
+        ])?;
+        assert_eq!(cli.device, 1);
+        assert_eq!(cli.kernels.runtime_dir, Some(PathBuf::from("runtime")));
+        match cli.command {
+            Command::Video {
+                prompt,
+                image,
+                frames,
+                seed,
+                lora,
+                gguf,
+                output,
+                json,
+            } => {
+                assert_eq!(prompt, "a boat");
+                assert_eq!(image, Some(PathBuf::from("keyframe.png")));
+                assert_eq!(frames, 121);
+                assert_eq!(seed, 42);
+                assert_eq!(lora, PathBuf::from("turbo.safetensors"));
+                assert_eq!(gguf, Some(PathBuf::from("transformer.gguf")));
+                assert_eq!(output, PathBuf::from("out.y4m"));
+                assert!(json);
+            }
+            _ => panic!("video subcommand was not selected"),
+        }
+        assert!(mp4_output(Path::new("out.mp4"))?);
+        assert!(!mp4_output(Path::new("out.y4m"))?);
+        assert!(mp4_output(Path::new("out.avi")).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "flyingfish",
+                "--model",
+                "model",
+                "video",
+                "--prompt",
+                "a boat"
+            ])
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn mtp_default_resolves_from_checkpoint_and_explicit_plain_modes() -> Result<()> {

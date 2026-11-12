@@ -2,7 +2,10 @@
 use crate::model_spec::{equal, exact_keys, positive, u32_list};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::engine::minimax_h3::{generate, image_sample};
@@ -16,7 +19,7 @@ pub const MODALITIES: u32 = 3;
 const VAE_CLIP_FRAMES: usize = 17;
 const VAE_CLIP_LATENTS: usize = 5;
 const VAE_SPATIAL_RATIO: usize = 16;
-const FPS: f64 = 24.0;
+pub const FPS: u32 = 24;
 const MIN_SECONDS: f64 = 5.0;
 const MAX_SECONDS: f64 = 15.0;
 const AUDIO_LATENTS_PER_SECOND: f64 = 40.0;
@@ -640,7 +643,7 @@ impl Geometry {
         ensure!(frames > 0, "frame count must be positive");
         let frames = frames
             + (VAE_CLIP_LATENTS + VAE_CLIP_FRAMES - frames % VAE_CLIP_FRAMES) % VAE_CLIP_FRAMES;
-        let seconds = frames as f64 / FPS;
+        let seconds = frames as f64 / f64::from(FPS);
         ensure!(
             (MIN_SECONDS..=MAX_SECONDS).contains(&seconds),
             "aligned frame count {frames} is {seconds} s, outside [{MIN_SECONDS}, {MAX_SECONDS}]"
@@ -652,8 +655,8 @@ impl Geometry {
             latent_frames: (frames - VAE_CLIP_LATENTS) / VAE_CLIP_FRAMES * VAE_CLIP_LATENTS + 2,
             latent_height: height / VAE_SPATIAL_RATIO,
             latent_width: width / VAE_SPATIAL_RATIO,
-            audio_latents: (frames as f64 / FPS * AUDIO_LATENTS_PER_SECOND).round_ties_even()
-                as usize,
+            audio_latents: (frames as f64 / f64::from(FPS) * AUDIO_LATENTS_PER_SECOND)
+                .round_ties_even() as usize,
         })
     }
 }
@@ -1272,6 +1275,44 @@ pub struct H3Output {
     pub samples: usize,
     pub sampling_rate: usize,
     pub audio: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MiniMaxH3I2vaRequest {
+    pub model: PathBuf,
+    pub lora: PathBuf,
+    pub keyframe: PathBuf,
+    pub prompt: String,
+    pub frames: usize,
+    pub seed: u64,
+    pub gguf: Option<PathBuf>,
+}
+
+#[cfg(feature = "cuda")]
+pub fn run_minimax_h3_i2va(
+    request: &MiniMaxH3I2vaRequest,
+    options: crate::RunOptions,
+) -> Result<H3Output> {
+    H3Spec::read(&request.model)?;
+    let keyframe = crate::serve::image::decode_image(
+        &fs::read(&request.keyframe)
+            .with_context(|| format!("read keyframe {}", request.keyframe.display()))?,
+        None,
+    )?;
+    let prepared = prepare_i2va(
+        &request.model,
+        &request.prompt,
+        &keyframe,
+        (request.frames, request.seed),
+        (8, (6.0, 3.0)),
+    )?;
+    generate(
+        &request.model,
+        &request.lora,
+        &prepared,
+        (options.device, &options.runtime_dir),
+        request.gguf.as_deref(),
+    )
 }
 
 /// Image-row AdaLN tag. Slot 0 of the 3-slot modulation table; text rows stay `TEXT_TAG`.

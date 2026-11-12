@@ -1,10 +1,14 @@
+#[cfg(test)]
+use crate::media::stderr_tail;
+use crate::media::{ScratchFile, tool_output, tool_stdout};
 use crate::model_spec::{Architecture, ModelSpec};
 use crate::serve::detok::Shared;
 use crate::vision_input::{ImageGrid, MultimodalInput};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
-use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::io::Cursor;
+use std::path::Path;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -13,7 +17,6 @@ const MAX_DECODED_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_SOURCE_PIXELS: usize = 4 * 16_777_216;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const DECODE_TIMEOUT: Duration = Duration::from_secs(600);
-static VIDEO_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(super) static VIDEO_PROBE_TRAP_CALLS: AtomicU64 = AtomicU64::new(0);
 
@@ -1713,13 +1716,14 @@ fn probe_video(bytes: &[u8]) -> Result<(ScratchVideo, ProbedVideo)> {
         bytes.len() <= MAX_ENCODED_BYTES,
         "encoded video exceeds byte limit"
     );
-    let source = ScratchVideo::write(bytes)?;
+    let source = ScratchVideo::write(bytes, "mp4")?;
     let path = source
         .path()
         .to_str()
         .context("video scratch path is not UTF-8")?;
     let file = format!("file:{path}");
     let probe = tool_stdout(
+        "video decoding",
         "ffprobe",
         &[
             "-v",
@@ -1917,9 +1921,14 @@ fn decode_raw(
         "rgb24",
         "-",
     ]);
-    tool_output("ffmpeg", &args, DECODE_TIMEOUT, limit, |bytes| {
-        output.push(bytes)
-    })
+    tool_output(
+        "video decoding",
+        "ffmpeg",
+        &args,
+        DECODE_TIMEOUT,
+        limit,
+        |bytes| output.push(bytes),
+    )
     .map_err(|error| redact_scratch(error, path))
 }
 
@@ -1927,220 +1936,7 @@ fn redact_scratch(error: anyhow::Error, path: &str) -> anyhow::Error {
     anyhow::anyhow!("{}", error.to_string().replace(path, "<video>"))
 }
 
-/// Last lines of a bounded stderr tail, each line capped; never the whole stream.
-fn stderr_tail(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    let mut lines: Vec<String> = text
-        .lines()
-        .rev()
-        .take(8)
-        .map(|line| line.chars().take(240).collect())
-        .collect();
-    lines.reverse();
-    lines.join(" | ")
-}
-
-enum ToolExit {
-    Status(std::process::ExitStatus),
-    TimedOut,
-    WaitFailed(String),
-}
-
-/// Runs one tool, keeps stdout under `limit` bytes and kills it after `timeout`.
-fn tool_stdout(tool: &str, args: &[&str], timeout: Duration, limit: usize) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    tool_output(tool, args, timeout, limit, |bytes| {
-        output.extend_from_slice(bytes);
-        Ok(())
-    })?;
-    Ok(output)
-}
-
-fn tool_output(
-    tool: &str,
-    args: &[&str],
-    timeout: Duration,
-    limit: usize,
-    mut consume: impl FnMut(&[u8]) -> Result<()>,
-) -> Result<()> {
-    let mut child = std::process::Command::new(tool)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!("video decoding requires {tool} on PATH")
-            } else {
-                anyhow::Error::new(error).context(format!("run {tool}"))
-            }
-        })?;
-    let mut stdout = child.stdout.take().context("tool stdout pipe missing")?;
-    let mut stderr = child.stderr.take().context("tool stderr pipe missing")?;
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    let (exit_tx, exit_rx) = std::sync::mpsc::channel::<ToolExit>();
-    let waiter = std::thread::Builder::new()
-        .name(format!("{tool}-wait"))
-        .spawn(move || {
-            let deadline = std::time::Instant::now() + timeout;
-            let exit = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break ToolExit::Status(status),
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break ToolExit::WaitFailed(error.to_string());
-                    }
-                }
-                if stop_rx.try_recv().is_ok() {
-                    let _ = child.kill();
-                    break child.wait().map_or_else(
-                        |error| ToolExit::WaitFailed(error.to_string()),
-                        ToolExit::Status,
-                    );
-                }
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break ToolExit::TimedOut;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            };
-            let _ = exit_tx.send(exit);
-        })
-        .context("spawn tool waiter")?;
-    let stderr_reader = std::thread::Builder::new()
-        .name(format!("{tool}-stderr"))
-        .spawn(move || {
-            const TAIL_BYTES: usize = 64 * 1024;
-            let mut buffer = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stderr.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        buffer.extend_from_slice(&chunk[..read]);
-                        if buffer.len() > TAIL_BYTES {
-                            let excess = buffer.len() - TAIL_BYTES;
-                            buffer.drain(..excess);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            buffer
-        })
-        .context("spawn tool stderr reader")?;
-    let mut received = 0usize;
-    let mut chunk = vec![0u8; 1 << 20];
-    let mut failure = None;
-    loop {
-        match stdout.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => {
-                if failure.is_none() && received.checked_add(read).is_none_or(|n| n > limit) {
-                    failure = Some(anyhow::anyhow!(
-                        "{tool} output exceeds the {limit}-byte limit"
-                    ));
-                    let _ = stop_tx.send(());
-                }
-                if failure.is_none() {
-                    received += read;
-                    if let Err(error) = consume(&chunk[..read]) {
-                        failure = Some(error);
-                        let _ = stop_tx.send(());
-                    }
-                }
-            }
-            Err(error) => {
-                if failure.is_none() {
-                    failure = Some(anyhow::anyhow!("read {tool} stdout: {error}"));
-                }
-                let _ = stop_tx.send(());
-                break;
-            }
-        }
-    }
-    drop(stdout);
-    let exit = exit_rx.recv().context("tool waiter stopped")?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("{tool} stderr reader panicked"))?;
-    waiter
-        .join()
-        .map_err(|_| anyhow::anyhow!("{tool} waiter panicked"))?;
-    if let Some(failure) = failure {
-        return Err(failure);
-    }
-    match exit {
-        ToolExit::TimedOut => bail!(
-            "{tool} timed out after {} s and was killed",
-            timeout.as_secs()
-        ),
-        ToolExit::WaitFailed(error) => bail!("wait for {tool}: {error}"),
-        ToolExit::Status(status) => {
-            if !status.success() {
-                bail!("{tool} failed ({}): {}", status, stderr_tail(&stderr));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-struct ScratchVideo {
-    path: PathBuf,
-}
-
-impl ScratchVideo {
-    fn write(bytes: &[u8]) -> Result<Self> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let directory = std::env::temp_dir();
-        for _ in 0..8 {
-            let counter = VIDEO_SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = directory.join(format!(
-                "flyingfish-video-{}-{counter}.mp4",
-                std::process::id()
-            ));
-            let mut file = match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("create video scratch file {}", path.display()));
-                }
-            };
-            if let Err(error) = file.write_all(bytes) {
-                let _ = std::fs::remove_file(&path);
-                return Err(error)
-                    .with_context(|| format!("write video scratch file {}", path.display()));
-            }
-            return Ok(Self { path });
-        }
-        bail!(
-            "could not create a video scratch file in {}",
-            directory.display()
-        )
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for ScratchVideo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+type ScratchVideo = ScratchFile;
 
 #[derive(Deserialize)]
 struct ProbeReport {
@@ -2780,7 +2576,7 @@ mod tests {
         assert_eq!(probed.metadata()?.duration, 1e12);
         let error = processor
             .plan_probed_video(
-                ScratchVideo::write(&[])?,
+                ScratchVideo::write(&[], "mp4")?,
                 probed,
                 VideoOptions {
                     max_num_frames: u32::MAX as usize,
@@ -2911,7 +2707,7 @@ mod tests {
     #[test]
     #[ignore = "requires system ffmpeg"]
     fn video_selected_frames_preserve_repeated_low_fps_samples() -> Result<()> {
-        let clip = ScratchVideo::write(&[])?;
+        let clip = ScratchVideo::write(&[], "mp4")?;
         let status = std::process::Command::new("ffmpeg")
             .args([
                 "-v",
@@ -3417,6 +3213,7 @@ mod tests {
     #[test]
     fn missing_video_tools_are_named() {
         let error = tool_stdout(
+            "video decoding",
             "ffmpeg-not-on-path-ds",
             &[],
             std::time::Duration::from_millis(10),
