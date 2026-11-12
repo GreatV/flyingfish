@@ -616,8 +616,8 @@ fn measure(
                     samples.push(begin.elapsed_ms(end)? as f64 * 1000.0);
                 }
             }
-            let median = calibrate::percentile(&samples, 0.5);
-            let p90 = calibrate::percentile(&samples, 0.9);
+            let median = calibrate::percentile("multi_calibrate.samples.median", &samples, 0.5)?;
+            let p90 = calibrate::percentile("multi_calibrate.samples.p90", &samples, 0.9)?;
             if (median, p90) < best {
                 best = (median, p90);
                 winner = Some(plan);
@@ -628,7 +628,7 @@ fn measure(
                 samples: samples.len(),
                 median_us: median,
                 p90_us: p90,
-                p10_us: calibrate::percentile(&samples, 0.1),
+                p10_us: calibrate::percentile("multi_calibrate.samples.p10", &samples, 0.1)?,
                 max_abs_error: max_error,
             });
         }

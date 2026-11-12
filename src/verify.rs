@@ -1,11 +1,90 @@
 use crate::{model::Model, trace::Trace};
 use anyhow::{Context, Result, ensure};
-use half::bf16;
+use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
 const STEPS: usize = 64;
+
+mod scalar_sealed {
+    pub trait Sealed {}
+
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+    impl Sealed for half::bf16 {}
+    impl Sealed for half::f16 {}
+}
+
+pub trait Scalar: scalar_sealed::Sealed + Copy + std::fmt::Display {
+    fn to_f64(self) -> f64;
+    fn is_finite_scalar(self) -> bool;
+    fn bits_eq(self, other: Self) -> bool;
+}
+
+macro_rules! impl_scalar {
+    ($type:ty) => {
+        impl Scalar for $type {
+            fn to_f64(self) -> f64 {
+                self as f64
+            }
+
+            fn is_finite_scalar(self) -> bool {
+                self.is_finite()
+            }
+
+            fn bits_eq(self, other: Self) -> bool {
+                self.to_bits() == other.to_bits()
+            }
+        }
+    };
+}
+
+impl_scalar!(f32);
+impl_scalar!(f64);
+
+macro_rules! impl_half_scalar {
+    ($type:ty) => {
+        impl Scalar for $type {
+            fn to_f64(self) -> f64 {
+                f64::from(self.to_f32())
+            }
+
+            fn is_finite_scalar(self) -> bool {
+                self.is_finite()
+            }
+
+            fn bits_eq(self, other: Self) -> bool {
+                self.to_bits() == other.to_bits()
+            }
+        }
+    };
+}
+
+impl_half_scalar!(bf16);
+impl_half_scalar!(f16);
+
+fn ensure_pair<A, B>(cell: &str, candidate: &[A], reference: &[B]) -> Result<()> {
+    ensure!(
+        !candidate.is_empty(),
+        "Runner FAIL {cell}: empty comparison"
+    );
+    ensure!(
+        candidate.len() == reference.len(),
+        "Runner FAIL {cell}: length mismatch {} vs {}",
+        candidate.len(),
+        reference.len()
+    );
+    Ok(())
+}
+
+fn ensure_finite<T: Scalar>(cell: &str, side: &str, index: usize, value: T) -> Result<()> {
+    ensure!(
+        value.is_finite_scalar(),
+        "Runner FAIL {cell}: non-finite {side}[{index}]={value}"
+    );
+    Ok(())
+}
 
 pub struct Rules {
     hidden: Option<HiddenRules>,
@@ -40,17 +119,30 @@ struct SystemRule {
     max: Vec<f64>,
 }
 
-pub(crate) fn percentile(values: &[f64], q: f64) -> f64 {
+pub(crate) fn percentile(cell: &str, values: &[f64], q: f64) -> Result<f64> {
+    ensure!(!values.is_empty(), "Runner FAIL {cell}: empty percentile");
+    ensure!(
+        q.is_finite() && (0.0..=1.0).contains(&q),
+        "Runner FAIL {cell}: invalid percentile q={q}"
+    );
+    for (index, &value) in values.iter().enumerate() {
+        ensure_finite(cell, "value", index, value)?;
+    }
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let index = q * (sorted.len() - 1) as f64;
     let lo = sorted[index.floor() as usize];
     let hi = sorted[index.ceil() as usize];
-    if lo == hi {
+    let value = if lo == hi {
         lo
     } else {
         lo + (hi - lo) * (index - index.floor())
-    }
+    };
+    ensure!(
+        value.is_finite(),
+        "Runner FAIL {cell}: non-finite percentile result"
+    );
+    Ok(value)
 }
 
 fn logits_steps(value: &serde_json::Value) -> Result<usize> {
@@ -107,9 +199,13 @@ impl Rules {
             "logit step outside reference/rules"
         );
         let vocab = reference.logits.len() / reference.tokens.len();
-        let m = metrics(actual, &reference.logits[step * vocab..(step + 1) * vocab])?;
+        let m = metrics(
+            &format!("logits.step.{step}"),
+            actual,
+            &reference.logits[step * vocab..(step + 1) * vocab],
+        )?;
         ensure!(
-            top_two(actual)?.0 == token,
+            top_two(&format!("logits.step.{step}"), actual)?.0 == token,
             "verification argmax disagrees with logits at step {step}"
         );
         let exact = token == reference.tokens[step];
@@ -300,8 +396,8 @@ impl Rules {
                 .zip(probe)
                 .map(|(a, p)| if *p > 0.0 { *a / *p } else { f64::INFINITY })
                 .collect();
-            let median = percentile(&ratios, 0.5);
-            let p90 = percentile(&ratios, 0.9);
+            let median = percentile(&format!("systematic.{kind}.median"), &ratios, 0.5)?;
+            let p90 = percentile(&format!("systematic.{kind}.p90"), &ratios, 0.9)?;
             let pass = median <= rule.gates.ratio_median_max && p90 <= rule.gates.ratio_p90_max;
             passed &= pass;
             println!(
@@ -323,11 +419,13 @@ impl Rules {
 
 #[derive(Serialize, Deserialize)]
 pub struct Metrics {
-    max_abs: f64,
-    mean_abs: f64,
-    rel_rmse: f64,
-    cosine: f64,
-    exact: bool,
+    pub max_abs: f64,
+    pub mean_abs: f64,
+    pub rmse: f64,
+    pub rel_rmse: f64,
+    pub cosine: f64,
+    pub peak_ref: f64,
+    pub exact: bool,
 }
 
 /// Half a BF16 ulp at magnitude `x`: 2^(⌊log2 x⌋ − 8); 0 at `x <= 0`.
@@ -340,35 +438,72 @@ pub fn bf16_half_ulp(x: f64) -> f64 {
 }
 
 /// Largest per-element distance in half-BF16-ulp units of `max(|reference_i|, rms)`.
-pub fn half_ulp_ratio(candidate: &[f32], reference: &[f32], rms: f32) -> f64 {
+pub fn half_ulp_ratio(cell: &str, candidate: &[f32], reference: &[f32], rms: f32) -> Result<f64> {
+    ensure_pair(cell, candidate, reference)?;
+    ensure!(
+        rms.is_finite() && rms >= 0.0,
+        "Runner FAIL {cell}: invalid rms={rms}"
+    );
     let mut worst = 0f64;
-    for (&c, &r) in candidate.iter().zip(reference) {
+    for (index, (&c, &r)) in candidate.iter().zip(reference).enumerate() {
+        ensure_finite(cell, "candidate", index, c)?;
+        ensure_finite(cell, "reference", index, r)?;
         let scale = r.abs().max(rms).max(2f32.powi(-30));
-        worst = worst.max(f64::from((c - r).abs()) / bf16_half_ulp(f64::from(scale)));
+        let distance = (f64::from(c) - f64::from(r)).abs() / bf16_half_ulp(f64::from(scale));
+        ensure!(
+            distance.is_finite(),
+            "Runner FAIL {cell}: non-finite half-ULP distance at [{index}]"
+        );
+        worst = worst.max(distance);
     }
-    worst
+    Ok(worst)
 }
 
-fn metrics(actual: &[f32], expected: &[f32]) -> Result<Metrics> {
-    ensure!(
-        !actual.is_empty() && actual.len() == expected.len(),
-        "comparison shape mismatch {} vs {}",
-        actual.len(),
-        expected.len()
-    );
+pub fn max_abs_rmse<A: Scalar, B: Scalar>(
+    cell: &str,
+    candidate: &[A],
+    reference: &[B],
+) -> Result<(f64, f64)> {
+    ensure_pair(cell, candidate, reference)?;
     let mut max_abs = 0f64;
+    let mut sum_sq = 0f64;
+    for (index, (&c, &r)) in candidate.iter().zip(reference).enumerate() {
+        ensure_finite(cell, "candidate", index, c)?;
+        ensure_finite(cell, "reference", index, r)?;
+        let d = (c.to_f64() - r.to_f64()).abs();
+        ensure!(
+            d.is_finite(),
+            "Runner FAIL {cell}: finite diff overflow at [{index}]"
+        );
+        max_abs = max_abs.max(d);
+        sum_sq += d * d;
+        ensure!(
+            sum_sq.is_finite(),
+            "Runner FAIL {cell}: finite squared-error overflow at [{index}]"
+        );
+    }
+    Ok((max_abs, (sum_sq / candidate.len() as f64).sqrt()))
+}
+
+pub fn metrics<A: Scalar, B: Scalar>(
+    cell: &str,
+    candidate: &[A],
+    reference: &[B],
+) -> Result<Metrics> {
+    let (max_abs, rmse) = max_abs_rmse(cell, candidate, reference)?;
     let (mut sum_abs, mut square_error, mut square_ref, mut square_actual, mut dot) =
         (0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut peak_ref = 0f64;
     let mut exact = true;
-    for (&a, &r) in actual.iter().zip(expected) {
-        ensure!(a.is_finite() && r.is_finite(), "nonfinite comparison value");
-        let e = (a - r).abs();
-        max_abs = max_abs.max(e as f64);
-        sum_abs += e as f64;
-        square_error += (e as f64).powi(2);
-        square_ref += (r as f64).powi(2);
-        square_actual += (a as f64).powi(2);
-        dot += a as f64 * r as f64;
+    for (&c, &r) in candidate.iter().zip(reference) {
+        let a = c.to_f64();
+        let r = r.to_f64();
+        sum_abs += (a - r).abs();
+        square_error += (a - r).powi(2);
+        square_ref += r.powi(2);
+        square_actual += a.powi(2);
+        dot += a * r;
+        peak_ref = peak_ref.max(r.abs());
         exact &= a.to_bits() == r.to_bits();
     }
     let rel_rmse = if square_ref == 0.0 {
@@ -387,11 +522,59 @@ fn metrics(actual: &[f32], expected: &[f32]) -> Result<Metrics> {
     };
     Ok(Metrics {
         max_abs,
-        mean_abs: sum_abs / actual.len() as f64,
+        mean_abs: sum_abs / candidate.len() as f64,
+        rmse,
         rel_rmse,
         cosine,
+        peak_ref,
         exact,
     })
+}
+
+pub fn bf16_ulp_max(
+    cell: &str,
+    candidate: &[bf16],
+    reference: &[bf16],
+    floor: Option<&[f32]>,
+) -> Result<(u16, f64, usize)> {
+    fn key(value: bf16) -> u32 {
+        let bits = u32::from(value.to_bits());
+        if bits & 0x8000 != 0 {
+            (!bits) & 0xffff
+        } else {
+            bits | 0x8000
+        }
+    }
+
+    ensure_pair(cell, candidate, reference)?;
+    if let Some(floor) = floor {
+        ensure_pair(cell, candidate, floor)?;
+    }
+    let mut max_ulp = 0u16;
+    let mut max_abs = 0f64;
+    let mut mismatches = 0usize;
+    for (index, (&c, &r)) in candidate.iter().zip(reference).enumerate() {
+        ensure_finite(cell, "candidate", index, c)?;
+        ensure_finite(cell, "reference", index, r)?;
+        if let Some(floor) = floor {
+            ensure_finite(cell, "floor", index, floor[index])?;
+        }
+        max_ulp = max_ulp.max(key(c).abs_diff(key(r)) as u16);
+        max_abs = max_abs.max((c.to_f64() - r.to_f64()).abs());
+        mismatches += usize::from(!c.bits_eq(r));
+    }
+    Ok((max_ulp, max_abs, mismatches))
+}
+
+pub fn bit_mismatches<T: Scalar>(cell: &str, candidate: &[T], reference: &[T]) -> Result<usize> {
+    ensure_pair(cell, candidate, reference)?;
+    let mut mismatches = 0usize;
+    for (index, (&c, &r)) in candidate.iter().zip(reference).enumerate() {
+        ensure_finite(cell, "candidate", index, c)?;
+        ensure_finite(cell, "reference", index, r)?;
+        mismatches += usize::from(!c.bits_eq(r));
+    }
+    Ok(mismatches)
 }
 
 fn floats(t: TensorView<'_>) -> Result<Vec<f32>> {
@@ -424,20 +607,29 @@ fn ids(t: TensorView<'_>) -> Result<Vec<u32>> {
         .collect()
 }
 
-fn top_two(values: &[f32]) -> Result<(u32, f32)> {
-    ensure!(values.len() >= 2, "logits vocabulary is too small");
-    let (mut best, mut second, mut id) = (f32::NEG_INFINITY, f32::NEG_INFINITY, 0u32);
-    for (i, &v) in values.iter().enumerate() {
-        ensure!(v.is_finite(), "nonfinite logits");
-        if v > best {
+pub fn top_two<T: Scalar>(cell: &str, values: &[T]) -> Result<(u32, f64)> {
+    ensure!(
+        values.len() >= 2,
+        "Runner FAIL {cell}: logits vocabulary is too small"
+    );
+    let (mut best, mut second, mut id) = (f64::NEG_INFINITY, f64::NEG_INFINITY, 0u32);
+    for (index, &value) in values.iter().enumerate() {
+        ensure_finite(cell, "value", index, value)?;
+        let value = value.to_f64();
+        if value > best {
             second = best;
-            best = v;
-            id = i as u32;
-        } else if v > second {
-            second = v;
+            best = value;
+            id = index as u32;
+        } else if value > second {
+            second = value;
         }
     }
-    Ok((id, best - second))
+    let margin = best - second;
+    ensure!(
+        margin.is_finite(),
+        "Runner FAIL {cell}: non-finite top-two margin"
+    );
+    Ok((id, margin))
 }
 
 struct Reference {
@@ -507,13 +699,16 @@ impl Reference {
         );
         let logits = floats(logits_tensor)?;
         for step in 0..steps {
-            let (token, margin) = top_two(&logits[step * vocab..(step + 1) * vocab])?;
+            let (token, margin) = top_two(
+                &format!("reference.logits.step.{step}"),
+                &logits[step * vocab..(step + 1) * vocab],
+            )?;
             ensure!(
                 token == greedy[step],
                 "reference greedy_ids[{step}] disagrees with logits argmax"
             );
             ensure!(
-                margin.to_bits() == margins[step].to_bits(),
+                (margin as f32).to_bits() == margins[step].to_bits(),
                 "reference margins[{step}] disagrees with top1-top2"
             );
         }
@@ -565,7 +760,7 @@ fn hidden_compare(
             "unexpected captured hidden length at layer {layer}"
         );
         let actual = &actual[actual.len() - expected_rows * width..];
-        let m = metrics(actual, &expected).with_context(|| format!("hidden_states.{layer}"))?;
+        let m = metrics(&format!("hidden_states.{layer}"), actual, &expected)?;
         let pass = if layer == 0 {
             m.exact
         } else {
@@ -588,9 +783,13 @@ fn logits_compare(
     token: u32,
     rules: &Rules,
 ) -> Result<(bool, bool, Metrics)> {
-    let m = metrics(actual, &reference.logits[step * vocab..(step + 1) * vocab])?;
+    let m = metrics(
+        &format!("logits.step.{step}"),
+        actual,
+        &reference.logits[step * vocab..(step + 1) * vocab],
+    )?;
     ensure!(
-        top_two(actual)?.0 == token,
+        top_two(&format!("logits.step.{step}"), actual)?.0 == token,
         "device argmax disagrees with logits at step {step}"
     );
     let exact = token == reference.greedy[step];
@@ -628,7 +827,7 @@ pub fn compare_prefill(
         &reference,
         0,
         vocab,
-        top_two(last_logits)?.0,
+        top_two("prefill.logits.step.0", last_logits)?.0,
         rules,
     )?;
     println!(
@@ -870,8 +1069,10 @@ mod tests {
         let make = |ratio: f64| Metrics {
             max_abs: 0.2 * ratio,
             mean_abs: 0.01 * ratio,
+            rmse: 0.0,
             rel_rmse: 0.0,
             cosine: 1.0,
+            peak_ref: 0.0,
             exact: false,
         };
         let mut values: Vec<_> = (0..STEPS).map(|_| make(1.25)).collect();
@@ -891,7 +1092,7 @@ mod tests {
     fn per_layer_cosine_schema_controls_acceptance() -> Result<()> {
         let limit: LayerLimit = serde_json::from_str(r#"{"rel":0.2,"cos_min":0.99}"#)?;
         let strict: LayerLimit = serde_json::from_str(r#"{"rel":0.2,"cos_min":0.999}"#)?;
-        let m = metrics(&[1.0, 0.1], &[1.0, 0.0])?;
+        let m = metrics("test.layer", &[1.0, 0.1], &[1.0, 0.0])?;
         assert!(limit.accepts(&m));
         assert!(!strict.accepts(&m));
         assert!(serde_json::from_str::<LayerLimit>("0.2").is_err());
@@ -903,10 +1104,10 @@ mod tests {
     fn outlier_scale_and_localized_error() -> Result<()> {
         let reference = [10000.0, 1.0, -1.0];
         let got = [10098.0, 1.0, -1.0];
-        let m = metrics(&got, &reference)?;
+        let m = metrics("test.localized", &got, &reference)?;
         assert_eq!(m.max_abs, 98.0);
         assert!(m.rel_rmse < 0.05 && m.cosine >= 0.999);
-        let m = metrics(&[0.0, 10.0, -1.0], &reference)?;
+        let m = metrics("test.localized.control", &[0.0, 10.0, -1.0], &reference)?;
         assert!(m.rel_rmse > 0.05 || m.cosine < 0.999);
         Ok(())
     }
@@ -942,8 +1143,10 @@ mod tests {
             .map(|_| Metrics {
                 max_abs: 1.0,
                 mean_abs: 0.05,
+                rmse: 0.0,
                 rel_rmse: 0.0,
                 cosine: 1.0,
+                peak_ref: 0.0,
                 exact: false,
             })
             .collect();
@@ -975,9 +1178,114 @@ mod tests {
 
     #[test]
     fn ties_select_smallest_id_and_positive_margin() -> Result<()> {
-        assert_eq!(top_two(&[-2.0, -2.0, -3.0])?, (0, 0.0));
-        assert_eq!(top_two(&[-3.0, -1.0, -2.0])?, (1, 1.0));
+        assert_eq!(top_two("test.ties", &[-2.0, -2.0, -3.0])?, (0, 0.0));
+        assert_eq!(top_two("test.margin", &[-3.0, -1.0, -2.0])?, (1, 1.0));
         Ok(())
+    }
+
+    #[test]
+    fn shared_comparisons_reject_nonfinite_candidate_and_reference_with_cell_and_index() {
+        let cell = "shared.probe";
+        let check_f32 = |candidate: &[f32], reference: &[f32], side: &str, index: usize| {
+            let results = [
+                max_abs_rmse(cell, candidate, reference).map(|_| ()),
+                metrics(cell, candidate, reference).map(|_| ()),
+                half_ulp_ratio(cell, candidate, reference, 0.0).map(|_| ()),
+                bit_mismatches(cell, candidate, reference).map(|_| ()),
+            ];
+            for result in results {
+                let message = result.expect_err("non-finite input passed").to_string();
+                assert!(
+                    message.contains("Runner FAIL shared.probe")
+                        && message.contains(&format!("{side}[{index}]")),
+                    "{message}"
+                );
+            }
+        };
+        check_f32(&[0.0, f32::NAN, 0.0], &[0.0, 1.0, 0.0], "candidate", 1);
+        check_f32(&[0.0, 1.0, 0.0], &[0.0, 1.0, f32::INFINITY], "reference", 2);
+        check_f32(
+            &[0.0, 1.0, 0.0],
+            &[0.0, 1.0, f32::NEG_INFINITY],
+            "reference",
+            2,
+        );
+        for (values, index) in [
+            (&[0.0, f32::NAN, 0.0][..], 1),
+            (&[0.0, 1.0, f32::INFINITY][..], 2),
+            (&[0.0, 1.0, f32::NEG_INFINITY][..], 2),
+        ] {
+            let message = top_two(cell, values)
+                .map(|_| ())
+                .expect_err("non-finite top-two input passed")
+                .to_string();
+            assert!(
+                message.contains("shared.probe") && message.contains(&format!("value[{index}]")),
+                "{message}"
+            );
+        }
+        let all_nan = max_abs_rmse(cell, &[f32::NAN; 2], &[0.0; 2])
+            .map(|_| ())
+            .expect_err("all-NaN candidate passed")
+            .to_string();
+        assert!(all_nan.contains("shared.probe") && all_nan.contains("candidate[0]"));
+
+        let bf16_results = [
+            bf16_ulp_max(
+                cell,
+                &[bf16::ZERO, bf16::NAN],
+                &[bf16::ZERO, bf16::ONE],
+                None,
+            )
+            .map(|_| ()),
+            bit_mismatches(cell, &[bf16::ZERO, bf16::NAN], &[bf16::ZERO, bf16::ONE]).map(|_| ()),
+        ];
+        for result in bf16_results {
+            let message = result.expect_err("BF16 NaN passed").to_string();
+            assert!(message.contains("shared.probe") && message.contains("candidate[1]"));
+        }
+        let infinite = bf16_ulp_max(
+            cell,
+            &[bf16::MAX, bf16::MAX],
+            &[bf16::MAX, bf16::INFINITY],
+            None,
+        )
+        .map(|_| ())
+        .expect_err("BF16 infinity compared as one ULP")
+        .to_string();
+        assert!(infinite.contains("shared.probe") && infinite.contains("reference[1]"));
+
+        for result in [
+            max_abs_rmse("shared.empty", &[] as &[f32], &[] as &[f32]).map(|_| ()),
+            max_abs_rmse("shared.length", &[0.0], &[0.0, 1.0]).map(|_| ()),
+            percentile("shared.percentile", &[0.0, f64::NAN], 0.5).map(|_| ()),
+        ] {
+            let message = result.expect_err("invalid comparison passed").to_string();
+            assert!(message.contains("Runner FAIL shared."), "{message}");
+        }
+
+        let (max_abs, rmse) =
+            max_abs_rmse(cell, &[1.0, 3.0], &[1.0, 1.0]).expect("finite comparison failed");
+        assert_eq!((max_abs, rmse), (2.0, 2f64.sqrt()));
+        let m = metrics(cell, &[1.0, 3.0], &[1.0, 1.0]).expect("finite metrics failed");
+        assert_eq!(m.max_abs, 2.0);
+        assert_eq!(m.mean_abs, 1.0);
+        assert_eq!(m.rmse, 2f64.sqrt());
+        assert_eq!(m.rel_rmse, 2f64.sqrt());
+        assert_eq!(m.cosine, 4.0 / 20f64.sqrt());
+        assert_eq!(m.peak_ref, 1.0);
+        assert!(!m.exact);
+        let (ulp, max_abs, mismatches) = bf16_ulp_max(
+            cell,
+            &[bf16::ONE, bf16::from_f32(2.0)],
+            &[bf16::ONE, bf16::ONE],
+            Some(&[0.0, 0.0]),
+        )
+        .expect("finite BF16 comparison failed");
+        assert_eq!((ulp, max_abs, mismatches), (128, 1.0, 1));
+        let (mixed, _) = max_abs_rmse(cell, &[f16::from_f32(2.0)], &[bf16::ONE])
+            .expect("mixed half comparison failed");
+        assert_eq!(mixed, 1.0);
     }
 
     #[test]

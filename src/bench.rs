@@ -161,7 +161,7 @@ pub fn run(dir: &Path, ids: &[u32], s: &Settings) -> Result<()> {
     }
     let times: Vec<_> = samples.iter().map(|x| x.ms).collect();
     let roof: Vec<_> = samples.iter().map(|x| x.roofline_pct).collect();
-    let median = percentile(&times, 0.5);
+    let median = percentile("bench.decode.median", &times, 0.5)?;
     let h = model.config.hidden_size as f64;
     let f = model.config.intermediate_size as f64;
     let qkv = model.config.qkv_dim() as f64;
@@ -170,7 +170,7 @@ pub fn run(dir: &Path, ids: &[u32], s: &Settings) -> Result<()> {
         2.0 * t * model.config.num_hidden_layers as f64 * (h * qkv + h * h + 3.0 * h * f)
             + 2.0 * h * model.config.vocab_size as f64;
     let attention_flops = 2.0 * h * t * (t + 1.0) * model.config.num_hidden_layers as f64;
-    let prefill_ms_gpu = percentile(&prefill_gpu_ms, 0.5);
+    let prefill_ms_gpu = percentile("bench.prefill_gpu.median", &prefill_gpu_ms, 0.5)?;
     let prefill_bandwidth_floor_ms =
         (model.decode_weight_bytes() + model.kv_read_bytes(ids.len())) as f64 / (s.dram_gb_s * 1e9)
             * 1000.0;
@@ -183,11 +183,11 @@ pub fn run(dir: &Path, ids: &[u32], s: &Settings) -> Result<()> {
         "prefill_chunk":model.chunk(),"prefill_attention":"FA2 BF16 d128 causal",
         "kernel_settings":s.kernels,"attention_chunk":model.attention_chunk(),"attention_plan":model.attention_plan(),"decode_linear":model.decode_linear(),
         "context_read_min":ids.len()+1,"context_read_max":ids.len()+s.steps,"decode_ms_median":median,
-        "decode_ms_p10":percentile(&times,0.1),"decode_ms_p90":percentile(&times,0.9),"decode_tok_s":1000.0/median,
-        "decode_roofline_pct_median":percentile(&roof,0.5),"dram_denominator_gb_s":s.dram_gb_s,
+        "decode_ms_p10":percentile("bench.decode.p10",&times,0.1)?,"decode_ms_p90":percentile("bench.decode.p90",&times,0.9)?,"decode_tok_s":1000.0/median,
+        "decode_roofline_pct_median":percentile("bench.decode_roofline.median",&roof,0.5)?,"dram_denominator_gb_s":s.dram_gb_s,
         "checkpoint_weight_bytes":model.weight_bytes(),"decode_weight_read_bytes":model.decode_weight_bytes(),
-        "prefill_wall_ms_median":percentile(&prefill_ms,0.5),"prefill_gpu_ms_median":percentile(&prefill_gpu_ms,0.5),
-        "prefill_tok_s":t*1000.0/percentile(&prefill_ms,0.5),"prefill_linear_flops":linear_flops,"prefill_causal_attention_flops":attention_flops,
+        "prefill_wall_ms_median":percentile("bench.prefill_wall.median",&prefill_ms,0.5)?,"prefill_gpu_ms_median":percentile("bench.prefill_gpu.median",&prefill_gpu_ms,0.5)?,
+        "prefill_tok_s":t*1000.0/percentile("bench.prefill_wall.median",&prefill_ms,0.5)?,"prefill_linear_flops":linear_flops,"prefill_causal_attention_flops":attention_flops,
         "prefill_ideal_minimum_read_bytes":model.decode_weight_bytes()+model.kv_read_bytes(ids.len()),
         "prefill_compute_denominator_tflops":s.gemm_tflops,"prefill_compute_denominator_source":"configured reference input",
         "prefill_compute_floor_ms":prefill_compute_floor_ms,"prefill_bandwidth_floor_ms":prefill_bandwidth_floor_ms,
@@ -282,11 +282,15 @@ mod tests {
     }
 
     #[test]
-    fn percentiles_interpolate_short_and_tail_distributions() {
-        assert_eq!(percentile(&[3.0, 1.0, 2.0, 4.0], 0.5), 2.5);
-        assert_eq!(percentile(&[10.0], 0.1), 10.0);
+    fn percentiles_interpolate_short_and_tail_distributions() -> Result<()> {
+        assert_eq!(
+            percentile("bench.test.short", &[3.0, 1.0, 2.0, 4.0], 0.5)?,
+            2.5
+        );
+        assert_eq!(percentile("bench.test.single", &[10.0], 0.1)?, 10.0);
         let x: Vec<_> = (0..201).map(|i| i as f64).collect();
-        assert_eq!(percentile(&x, 0.1), 20.0);
-        assert_eq!(percentile(&x, 0.9), 180.0);
+        assert_eq!(percentile("bench.test.tail.p10", &x, 0.1)?, 20.0);
+        assert_eq!(percentile("bench.test.tail.p90", &x, 0.9)?, 180.0);
+        Ok(())
     }
 }

@@ -275,9 +275,21 @@ fn measure(
             trials.push(Trial {
                 body,
                 bursts: burst_means.len(),
-                burst_mean_us: super::calibrate::percentile(&burst_means, 0.5),
-                burst_p90_us: super::calibrate::percentile(&burst_means, 0.9),
-                cold_first_us: super::calibrate::percentile(&cold_firsts, 0.5),
+                burst_mean_us: super::calibrate::percentile(
+                    "markov_calibrate.burst.median",
+                    &burst_means,
+                    0.5,
+                )?,
+                burst_p90_us: super::calibrate::percentile(
+                    "markov_calibrate.burst.p90",
+                    &burst_means,
+                    0.9,
+                )?,
+                cold_first_us: super::calibrate::percentile(
+                    "markov_calibrate.cold_first.median",
+                    &cold_firsts,
+                    0.5,
+                )?,
             });
         }
         let winner = trials

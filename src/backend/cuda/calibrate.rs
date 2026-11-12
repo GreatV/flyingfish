@@ -541,12 +541,12 @@ fn measure(
                 }
             }
             let wall_ms = timer.elapsed().as_secs_f64() * 1000.0;
-            let median_us = percentile(&samples, 0.5);
+            let median_us = percentile("calibrate.samples.median", &samples, 0.5)?;
             ensure!(
                 s.clone_dtoh(&out)?.iter().all(|v| v.is_finite()),
                 "nonfinite calibration output"
             );
-            let p90_us = percentile(&samples, 0.9);
+            let p90_us = percentile("calibrate.samples.p90", &samples, 0.9)?;
             let score = (median_us, p90_us, usize::MAX - chunk);
             if score < best {
                 best = score;
@@ -557,8 +557,8 @@ fn measure(
                 plan,
                 samples: samples.len(),
                 median_us,
-                p10_us: percentile(&samples, 0.1),
-                p90_us: percentile(&samples, 0.9),
+                p10_us: percentile("calibrate.samples.p10", &samples, 0.1)?,
+                p90_us: percentile("calibrate.samples.p90", &samples, 0.9)?,
                 wall_ms,
                 max_abs_error: max_error,
                 evaluation_lengths,
@@ -1019,8 +1019,10 @@ impl ExpertCache {
                     "invalid expert peer transfer cell bytes={} expected={bytes}",
                     cell.bytes
                 );
-                let rate_0_to_1 = cell.bytes as f64 / percentile(&cell.h2d_seconds, 0.5);
-                let rate_1_to_0 = cell.bytes as f64 / percentile(&cell.d2h_seconds, 0.5);
+                let rate_0_to_1 = cell.bytes as f64
+                    / percentile("calibrate.peer.h2d.median", &cell.h2d_seconds, 0.5)?;
+                let rate_1_to_0 = cell.bytes as f64
+                    / percentile("calibrate.peer.d2h.median", &cell.d2h_seconds, 0.5)?;
                 ensure!(
                     rate_0_to_1.is_finite()
                         && rate_1_to_0.is_finite()
@@ -1070,8 +1072,10 @@ impl ExpertCache {
             .transfers
             .first()
             .context("missing native-slot transfer cell")?;
-        let h2d_bytes_per_second = slot.bytes as f64 / percentile(&slot.h2d_seconds, 0.5);
-        let d2h_bytes_per_second = slot.bytes as f64 / percentile(&slot.d2h_seconds, 0.5);
+        let h2d_bytes_per_second =
+            slot.bytes as f64 / percentile("calibrate.native.h2d.median", &slot.h2d_seconds, 0.5)?;
+        let d2h_bytes_per_second =
+            slot.bytes as f64 / percentile("calibrate.native.d2h.median", &slot.d2h_seconds, 0.5)?;
         ensure!(
             h2d_bytes_per_second.is_finite() && d2h_bytes_per_second.is_finite(),
             "non-finite expert transfer rate h2d={h2d_bytes_per_second} d2h={d2h_bytes_per_second}"

@@ -12593,8 +12593,16 @@ mod tests {
                 let rms = tolerances[case][tap]["rms"]
                     .as_f64()
                     .with_context(|| format!("missing rms {case}/{tap}"))?;
-                let ratio =
-                    crate::verify::half_ulp_ratio(&candidate, &reference_values, rms as f32);
+                ensure!(
+                    k.is_finite() && k >= 0.0 && rms.is_finite() && rms >= 0.0,
+                    "invalid tolerance {case}/{tap}: k={k} rms={rms}"
+                );
+                let ratio = crate::verify::half_ulp_ratio(
+                    &format!("minicpm_vision.{case}.{tap}"),
+                    &candidate,
+                    &reference_values,
+                    rms as f32,
+                )?;
                 let fixture_values = tensor_values(&source, tap, safetensors::Dtype::BF16, |v| {
                     bf16::from_bits(u16::from_le_bytes(v)).to_f32()
                 })?;
@@ -12703,17 +12711,27 @@ mod tests {
                 let rms = bound["rms"]
                     .as_f64()
                     .with_context(|| format!("missing rms {case}/merger_out_packed"))?;
-                let ratio = crate::verify::half_ulp_ratio(block, reference, rms as f32);
+                ensure!(
+                    k.is_finite() && k >= 0.0 && rms.is_finite() && rms >= 0.0,
+                    "invalid tolerance {case}/merger_out_packed: k={k} rms={rms}"
+                );
+                let ratio = crate::verify::half_ulp_ratio(
+                    &format!("minicpm_vision.{case}.merger_out_packed"),
+                    block,
+                    reference,
+                    rms as f32,
+                )?;
                 let shifted = if index == 0 {
                     start + output_width
                 } else {
                     start - output_width
                 };
                 let shifted_ratio = crate::verify::half_ulp_ratio(
+                    &format!("minicpm_vision.{case}.merger_out_packed_shifted"),
                     &merged[shifted..shifted + extent],
                     reference,
                     rms as f32,
-                );
+                )?;
                 let pass = ratio <= k;
                 eprintln!(
                     "{}",
@@ -12740,12 +12758,13 @@ mod tests {
             );
             let (k, rms) = packed_bounds[0];
             let swapped_ratio = crate::verify::half_ulp_ratio(
+                &format!("minicpm_vision.{case}.merger_out_packed_swapped"),
                 &merged[first..first + extent],
                 standalone
                     .get(&format!("{case}/merger_out"))
                     .with_context(|| format!("standalone merger missing for {case}"))?,
                 rms as f32,
-            );
+            )?;
             eprintln!(
                 "{}",
                 serde_json::json!({"minicpm_vision_control": {"case": case,

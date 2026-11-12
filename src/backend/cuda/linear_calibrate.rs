@@ -232,9 +232,9 @@ impl Environment {
             trials.push(Trial {
                 implementation,
                 samples: samples.len(),
-                median_us: calibrate::percentile(&samples, 0.5),
-                p10_us: calibrate::percentile(&samples, 0.1),
-                p90_us: calibrate::percentile(&samples, 0.9),
+                median_us: calibrate::percentile("linear_calibrate.samples.median", &samples, 0.5)?,
+                p10_us: calibrate::percentile("linear_calibrate.samples.p10", &samples, 0.1)?,
+                p90_us: calibrate::percentile("linear_calibrate.samples.p90", &samples, 0.9)?,
             });
         }
         let best = best(&trials)?;
