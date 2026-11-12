@@ -23,6 +23,12 @@ struct Cli {
     draft_model: Option<PathBuf>,
     #[arg(long, default_value_t = 0, global = true)]
     device: usize,
+    #[arg(
+        long,
+        global = true,
+        help = "Print placement, Lt and decode-plan diagnostics"
+    )]
+    verbose: bool,
     #[arg(long, default_value_t = 4096, global = true)]
     capacity: usize,
     #[arg(
@@ -115,21 +121,37 @@ enum Command {
         image_tensors: Option<PathBuf>,
     },
     Video {
-        #[arg(long)]
+        #[arg(long, help = "Video description in natural language")]
         prompt: String,
-        #[arg(long)]
+        #[arg(long, help = "Keyframe image (required for MiniMax-H3)")]
         image: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Requested frame count; rounds up to 17n+5 (136 -> 141), published duration 5-15 s at 24 fps"
+        )]
         frames: usize,
-        #[arg(long)]
+        #[arg(long, help = "Noise seed (required; no documented default)")]
         seed: u64,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Turbo LoRA safetensors (e.g. minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors)"
+        )]
         lora: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Use a GGUF Q4_0 transformer instead of transformer safetensors"
+        )]
         gguf: Option<PathBuf>,
-        #[arg(short = 'o', long = "output")]
+        #[arg(
+            short = 'o',
+            long = "output",
+            help = "Output .mp4 (requires ffmpeg on PATH) or .y4m with a sibling .wav"
+        )]
         output: PathBuf,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Print resolved output metadata, including the aligned frame count, as JSON"
+        )]
         json: bool,
     },
     Serve {
@@ -602,6 +624,7 @@ fn video(
                 .runtime_dir
                 .clone()
                 .context("--runtime-dir is required for video")?,
+            verbose: cli.verbose,
         };
         let generated = flyingfish::minimax_h3::run_minimax_h3_i2va(&request, options)?;
         let flyingfish::minimax_h3::H3Output {
@@ -1159,6 +1182,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_help_documents_required_keyframe_and_frame_rounding() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("video")
+            .expect("video subcommand")
+            .render_help()
+            .to_string();
+        assert!(help.contains("required for MiniMax-H3"), "{help}");
+        assert!(help.contains("17n+5"), "{help}");
+        assert!(help.contains("5-15 s at 24 fps"), "{help}");
+        assert!(help.contains("requires ffmpeg on PATH"), "{help}");
+        assert!(help.contains("sibling .wav"), "{help}");
+    }
 
     #[test]
     fn video_parse_covers_i2va_media_and_output_options() -> Result<()> {

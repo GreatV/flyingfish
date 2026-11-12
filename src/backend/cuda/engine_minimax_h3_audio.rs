@@ -266,11 +266,13 @@ impl AudioDecoder {
         let bytes = load.bytes;
         drop(load);
         s.synchronize()?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_audio_decoder_placement": {"mode": "resident", "published_bytes": bytes,
-                "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_audio_decoder_placement": {"mode": "resident", "published_bytes": bytes,
+                    "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
+            );
+        }
         Ok(Self {
             spec: spec.clone(),
             in_proj,
@@ -525,11 +527,13 @@ impl AudioDecoder {
         let samples = frames * self.spec.hop();
         let mut out = s.alloc_zeros::<f32>(channels * samples)?;
         let mut w = self.work(s, frames)?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_audio_decode": {"channels": channels, "frames": frames, "samples": samples,
-                "alias_free": self.alias_free, "free_bytes": s.context().mem_get_info()?.0}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_audio_decode": {"channels": channels, "frames": frames, "samples": samples,
+                    "alias_free": self.alias_free, "free_bytes": s.context().mem_get_info()?.0}})
+            );
+        }
         for b in 0..channels {
             let source =
                 pointer(latents, s) + (b * lc * frames * std::mem::size_of::<f32>()) as u64;

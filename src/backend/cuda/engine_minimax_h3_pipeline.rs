@@ -459,12 +459,14 @@ fn run_mode<const SETUP_ONLY: bool>(
         + AudioDecoder::work_bytes(&audio_spec, (2, latents))?;
     let planned = weights + work_bytes;
     let (free_after, total) = device.ctx.mem_get_info()?;
-    eprintln!(
-        "{}",
-        serde_json::json!({"h3_release": {"free_before_release_bytes": free_before, "free_after_release_bytes": free_after,
-            "decoder_weight_bytes": weights, "decode_work_bytes": work_bytes, "planned_bytes": planned,
-            "total_bytes": total, "placement": "resident"}})
-    );
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_release": {"free_before_release_bytes": free_before, "free_after_release_bytes": free_after,
+                "decoder_weight_bytes": weights, "decode_work_bytes": work_bytes, "planned_bytes": planned,
+                "total_bytes": total, "placement": "resident"}})
+        );
+    }
     ensure!(
         planned < free_after,
         "decoders {weights} B plus decode work {work_bytes} B do not fit the {free_after} B free after releasing the transformer and conditioner"

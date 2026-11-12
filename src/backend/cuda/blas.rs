@@ -161,13 +161,15 @@ impl Plan {
 
     fn describe(&self, rows: usize, output: usize, input: usize) -> Result<()> {
         use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
-        eprintln!(
-            "{}",
-            serde_json::json!({"cublaslt_plan":{"rows":rows,"output":output,"input":input,
-            "id":self.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,"tile":self.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
-            "split_k":self.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,"reduction_scheme":self.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?,
-            "estimated_waves":self.waves,"workspace_bytes":self.workspace}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"cublaslt_plan":{"rows":rows,"output":output,"input":input,
+                "id":self.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,"tile":self.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
+                "split_k":self.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,"reduction_scheme":self.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?,
+                "estimated_waves":self.waves,"workspace_bytes":self.workspace}})
+            );
+        }
         Ok(())
     }
 
@@ -1317,15 +1319,17 @@ impl Blas {
                     original_workspace,
                     0,
                 )?;
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"row_family_comparison":{
-                        "rows":shape.rows,"output":shape.output,"input":shape.input,
-                        "bound":plan.identity()?,"heuristic":previous.identity()?,
-                        "bound_workspace":plan.workspace,"heuristic_workspace":previous.workspace,
-                        "bound_waves":plan.waves,"heuristic_waves":previous.waves
-                    }})
-                );
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"row_family_comparison":{
+                            "rows":shape.rows,"output":shape.output,"input":shape.input,
+                            "bound":plan.identity()?,"heuristic":previous.identity()?,
+                            "bound_workspace":plan.workspace,"heuristic_workspace":previous.workspace,
+                            "bound_waves":plan.waves,"heuristic_waves":previous.waves
+                        }})
+                    );
+                }
             }
         }
         let split =

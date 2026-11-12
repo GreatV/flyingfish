@@ -869,7 +869,9 @@ impl BlockWork {
                 Ok(plan) => choices.push(plan),
                 Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
                     .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
-                    eprintln!("FFN_PLAN_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                    if crate::backend::diagnostics_enabled() {
+                        eprintln!("FFN_PLAN_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                    }
                 }
                 Err(error) => return Err(error.context(format!("FFN plan rows={} chunk={chunk}",self.rows))),
             }
@@ -901,7 +903,9 @@ impl BlockWork {
                 Ok(plan) => plan,
                 Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
                     .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
-                    eprintln!("FFN_ALIAS_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                    if crate::backend::diagnostics_enabled() {
+                        eprintln!("FFN_ALIAS_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                    }
                     continue;
                 }
                 Err(error) => return Err(error.context(format!("FFN alias rows={} chunk={chunk}",self.rows))),
@@ -1848,10 +1852,12 @@ fn place_layers(
         placement,
         (free, total, host_available),
     )?;
-    eprintln!(
-        "{}",
-        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
-    );
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
+        );
+    }
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
@@ -2086,30 +2092,34 @@ impl Dit {
             "estimated_launches_per_block":plan.launches,"previous_tensor_cost":previous.tensor_cost,
             "previous_launches_per_block":previous.launches})
         };
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_ffn_plan":{
-            "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
-            "peak_additional_bytes":chosen.allocation+chosen.workspace,
-            "lt_workspace_replacement_bytes":chosen.workspace,"main":description(chosen),
-            "owned_alternative":description(owned),
-            "alias_capacity_rows":FfnPlan::alias_capacity((work.q_raw.len(),work.k_raw.len()),spec.ffn)?,
-            "refiner":{"rows":text_work.rows,"previous_chunk":text_work.chunk,"chunk":text_work.chunk,
-                "chunks":text_work.rows.div_ceil(text_work.chunk),"tail":text_work.rows%text_work.chunk,
-                "new_allocation_bytes":0,"ordinary_plans":true}}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_ffn_plan":{
+                "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
+                "peak_additional_bytes":chosen.allocation+chosen.workspace,
+                "lt_workspace_replacement_bytes":chosen.workspace,"main":description(chosen),
+                "owned_alternative":description(owned),
+                "alias_capacity_rows":FfnPlan::alias_capacity((work.q_raw.len(),work.k_raw.len()),spec.ffn)?,
+                "refiner":{"rows":text_work.rows,"previous_chunk":text_work.chunk,"chunk":text_work.chunk,
+                    "chunks":text_work.rows.div_ceil(text_work.chunk),"tail":text_work.rows%text_work.chunk,
+                    "new_allocation_bytes":0,"ordinary_plans":true}}})
+            );
+        }
         blas.bind_workspace(chosen.workspace)?;
         work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
         s.synchronize()?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_ffn_storage":{
-            "hidden_ptr":work.hidden.ptr,"hidden_shape":work.hidden.shape,"hidden_span_bytes":work.hidden.span_bytes,
-            "gated_ptr":work.gated.ptr,"gated_shape":work.gated.shape,"gated_span_bytes":work.gated.span_bytes,
-            "q_raw_ptr":pointer(&work.q_raw,s),"q_raw_bytes":2*work.q_raw.len(),
-            "k_raw_ptr":pointer(&work.k_raw,s),"k_raw_bytes":2*work.k_raw.len(),
-            "owned":work.ffn_owned.is_some(),"free_after_binding":d.ctx.mem_get_info()?.0}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_ffn_storage":{
+                "hidden_ptr":work.hidden.ptr,"hidden_shape":work.hidden.shape,"hidden_span_bytes":work.hidden.span_bytes,
+                "gated_ptr":work.gated.ptr,"gated_shape":work.gated.shape,"gated_span_bytes":work.gated.span_bytes,
+                "q_raw_ptr":pointer(&work.q_raw,s),"q_raw_bytes":2*work.q_raw.len(),
+                "k_raw_ptr":pointer(&work.k_raw,s),"k_raw_bytes":2*work.k_raw.len(),
+                "owned":work.ffn_owned.is_some(),"free_after_binding":d.ctx.mem_get_info()?.0}})
+            );
+        }
         let vision = cubin::module(s.context(), "vision_ops")?;
         Ok(Self {
             ranges,
@@ -2657,17 +2667,19 @@ impl ImageDit {
         blas.bind_workspace(chosen.workspace)?;
         work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
         s.synchronize()?;
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "h3_image_ffn_plan": {
-                    "rows": rows,
-                    "chunk": chosen.chunk,
-                    "allocation": chosen.allocation,
-                    "workspace": chosen.workspace,
-                }
-            })
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "h3_image_ffn_plan": {
+                        "rows": rows,
+                        "chunk": chosen.chunk,
+                        "allocation": chosen.allocation,
+                        "workspace": chosen.workspace,
+                    }
+                })
+            );
+        }
         let vision = cubin::module(s.context(), "vision_ops")?;
         Ok(Self {
             text_rows,

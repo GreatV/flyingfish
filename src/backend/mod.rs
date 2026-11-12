@@ -158,6 +158,34 @@ impl SpecBudget {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+thread_local! {
+    static VERBOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct VerboseGuard(bool);
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl Drop for VerboseGuard {
+    fn drop(&mut self) {
+        VERBOSE.with(|verbose| verbose.set(self.0));
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn with_verbose<T>(verbose: bool, run: impl FnOnce() -> T) -> T {
+    let guard = VerboseGuard(VERBOSE.with(|current| current.replace(verbose)));
+    let result = run();
+    drop(guard);
+    result
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn diagnostics_enabled() -> bool {
+    VERBOSE.with(|verbose| verbose.get())
+}
+
 #[derive(Clone, Debug, clap::Args, Serialize)]
 pub struct Settings {
     #[arg(long, global = true, value_enum, default_value_t = TreeBuilder::Waves)]

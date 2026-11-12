@@ -158,13 +158,15 @@ impl RingDecode {
             let slots = sms
                 .checked_mul(resident)
                 .context("ring decode occupancy overflow")?;
-            eprintln!(
-                "{}",
-                serde_json::json!({"ring_decode_resources":{
-                    "pack":pack,"sms":sms,"registers":regs,"local_bytes":local,
-                    "static_shared_bytes":static_shared,"dynamic_shared_bytes":shared,"resident_blocks":resident
-                }})
-            );
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"ring_decode_resources":{
+                        "pack":pack,"sms":sms,"registers":regs,"local_bytes":local,
+                        "static_shared_bytes":static_shared,"dynamic_shared_bytes":shared,"resident_blocks":resident
+                    }})
+                );
+            }
             for chunk in (32..=ring).step_by(32) {
                 let parts = ring.div_ceil(chunk);
                 let blocks = (heads / pack) as usize * parts as usize;
@@ -233,17 +235,19 @@ impl RingDecode {
             None,
         )?;
         ensure!(merge_resident > 0, "ring decode merge zero occupancy");
-        eprintln!(
-            "{}",
-            serde_json::json!({"ring_decode_plan":{
-                "head_dim":256,"heads":heads,"kv_heads":kv_heads,"ring":ring,"scale":scale,
-                "pack":score.2,"chunk":plan.chunk,"parts":plan.first_launch.grid_dim.0,
-                "blocks":plan.first_launch.grid_dim.0 * plan.first_launch.grid_dim.1,
-                "sms":sms,"resident_fraction":score.1,"workspace_bytes":plan.workspace_bytes(),
-                "merge_registers":regs,"merge_local_bytes":local,"merge_static_shared_bytes":shared,
-                "merge_dynamic_shared_bytes":plan.merge_launch.shared_mem_bytes,"merge_resident_blocks":merge_resident
-            }})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"ring_decode_plan":{
+                    "head_dim":256,"heads":heads,"kv_heads":kv_heads,"ring":ring,"scale":scale,
+                    "pack":score.2,"chunk":plan.chunk,"parts":plan.first_launch.grid_dim.0,
+                    "blocks":plan.first_launch.grid_dim.0 * plan.first_launch.grid_dim.1,
+                    "sms":sms,"resident_fraction":score.1,"workspace_bytes":plan.workspace_bytes(),
+                    "merge_registers":regs,"merge_local_bytes":local,"merge_static_shared_bytes":shared,
+                    "merge_dynamic_shared_bytes":plan.merge_launch.shared_mem_bytes,"merge_resident_blocks":merge_resident
+                }})
+            );
+        }
         Ok(plan)
     }
 
@@ -532,13 +536,15 @@ impl CausalDecodeD512 {
                 resident > 0,
                 "causal decode d512 zero occupancy pack={pack}"
             );
-            eprintln!(
-                "{}",
-                serde_json::json!({"causal_decode_d512_resources":{
-                    "pack":pack,"sms":sms,"registers":regs,"local_bytes":local,
-                    "static_shared_bytes":static_shared,"dynamic_shared_bytes":shared,"resident_blocks":resident
-                }})
-            );
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"causal_decode_d512_resources":{
+                        "pack":pack,"sms":sms,"registers":regs,"local_bytes":local,
+                        "static_shared_bytes":static_shared,"dynamic_shared_bytes":shared,"resident_blocks":resident
+                    }})
+                );
+            }
             residents.push((pack, resident));
             functions.push((pack, first));
         }
@@ -583,17 +589,19 @@ impl CausalDecodeD512 {
             merge_resident > 0,
             "causal decode d512 merge zero occupancy"
         );
-        eprintln!(
-            "{}",
-            serde_json::json!({"causal_decode_d512_plan":{
-                "head_dim":512,"heads":heads,"kv_heads":kv_heads,"capacity":capacity,"scale":scale,
-                "pack":pack,"chunk":plan.chunk,"max_parts":plan.first_launch.grid_dim.0,
-                "max_blocks":plan.first_launch.grid_dim.0 * plan.first_launch.grid_dim.1,
-                "sms":sms,"resident_fill_permille":fill_permille,"workspace_bytes":plan.workspace_bytes(),
-                "merge_registers":merge_regs,"merge_local_bytes":merge_local,"merge_static_shared_bytes":merge_static_shared,
-                "merge_dynamic_shared_bytes":plan.merge_launch.shared_mem_bytes,"merge_resident_blocks":merge_resident
-            }})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"causal_decode_d512_plan":{
+                    "head_dim":512,"heads":heads,"kv_heads":kv_heads,"capacity":capacity,"scale":scale,
+                    "pack":pack,"chunk":plan.chunk,"max_parts":plan.first_launch.grid_dim.0,
+                    "max_blocks":plan.first_launch.grid_dim.0 * plan.first_launch.grid_dim.1,
+                    "sms":sms,"resident_fill_permille":fill_permille,"workspace_bytes":plan.workspace_bytes(),
+                    "merge_registers":merge_regs,"merge_local_bytes":merge_local,"merge_static_shared_bytes":merge_static_shared,
+                    "merge_dynamic_shared_bytes":plan.merge_launch.shared_mem_bytes,"merge_resident_blocks":merge_resident
+                }})
+            );
+        }
         Ok(plan)
     }
 

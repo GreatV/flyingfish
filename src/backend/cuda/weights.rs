@@ -2716,10 +2716,12 @@ impl WeightCatalog {
             link_width > 0 && !link_speed.trim().is_empty(),
             "invalid dense PCIe capability"
         );
-        eprintln!(
-            "{}",
-            serde_json::json!({"dense_placement": &plan, "fixed_bytes": fixed, "transient_bytes": transient_bytes, "host_available_bytes": available_host, "copy_engines": copy_engines, "memory_bus_bits": memory_bus_bits, "sms": d.info.sms, "pcie_link_width": link_width, "pcie_max_link_speed": link_speed.trim()})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"dense_placement": &plan, "fixed_bytes": fixed, "transient_bytes": transient_bytes, "host_available_bytes": available_host, "copy_engines": copy_engines, "memory_bus_bits": memory_bus_bits, "sms": d.info.sms, "pcie_link_width": link_width, "pcie_max_link_speed": link_speed.trim()})
+            );
+        }
         let started = Instant::now();
         let mut dense = DenseStreaming::new(dir, &manifest, plan, d, order.as_deref())?;
         let mut offsets = vec![0; layers.len()];
@@ -3154,19 +3156,21 @@ impl WeightCatalog {
             manifest.resident_bytes
         );
         let load_wall_ms = started.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "{}",
-            serde_json::json!({"weight_load_phase": {
-                "bytes": bytes,
-                "tensors": tensors.len(),
-                "load_wall_ms": load_wall_ms,
-                "mapped_open_ms": mapped_open_ms,
-                "manifest_ms": manifest_ms,
-                "checkpoint_wall_ms": checkpoint_wall_ms,
-                "chunk_bytes": UPLOAD_CHUNK_BYTES,
-                "timings": upload_timings
-            }})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"weight_load_phase": {
+                    "bytes": bytes,
+                    "tensors": tensors.len(),
+                    "load_wall_ms": load_wall_ms,
+                    "mapped_open_ms": mapped_open_ms,
+                    "manifest_ms": manifest_ms,
+                    "checkpoint_wall_ms": checkpoint_wall_ms,
+                    "chunk_bytes": UPLOAD_CHUNK_BYTES,
+                    "timings": upload_timings
+                }})
+            );
+        }
         Self {
             #[cfg(feature = "cuda")]
             dense: None,

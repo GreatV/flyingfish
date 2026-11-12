@@ -2092,13 +2092,15 @@ impl LayerNormTower {
             })
             .collect::<Result<Vec<_>>>()?;
         s.synchronize()?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"vision_memory_plan": {
-                "rows":rows,"padded_rows":padded,"images":packing.images(),
-                "payload_bytes":bytes,"operator_scratch_bytes":scratch_bytes,"free_bytes":free,"reserve_bytes":reserve
-            }})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"vision_memory_plan": {
+                    "rows":rows,"padded_rows":padded,"images":packing.images(),
+                    "payload_bytes":bytes,"operator_scratch_bytes":scratch_bytes,"free_bytes":free,"reserve_bytes":reserve
+                }})
+            );
+        }
         Ok(LayerNormRequest {
             prefix,
             packing,

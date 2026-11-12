@@ -126,12 +126,14 @@ pub(crate) fn planar_bf16_to_rgb_u8(
                 shared_mem_bytes: 0,
             })?;
     }
-    eprintln!(
-        "{}",
-        serde_json::json!({"h3_rgb_launch":{"frames":frames,"allocated_frames":allocated_frames,
-        "pixels":pixels,"input_bytes":input_bytes,"output_bytes":output_elements,
-        "grid":grid,"threads":256,"active_blocks_per_sm":active,"sms":sms}})
-    );
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_rgb_launch":{"frames":frames,"allocated_frames":allocated_frames,
+            "pixels":pixels,"input_bytes":input_bytes,"output_bytes":output_elements,
+            "grid":grid,"threads":256,"active_blocks_per_sm":active,"sms":sms}})
+        );
+    }
     Ok(())
 }
 
@@ -402,11 +404,13 @@ impl VideoDecoder {
                 VAE_PIXEL_STD.map(|v| v as f32),
             ),
         )?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_rgb_memory":{"free_before_output_bytes":free,
-            "total_bytes":total,"safety_reserve_bytes":reserve,"output_bytes":bytes,"workspace_budget_bytes":budget}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_rgb_memory":{"free_before_output_bytes":free,
+                "total_bytes":total,"safety_reserve_bytes":reserve,"output_bytes":bytes,"workspace_budget_bytes":budget}})
+            );
+        }
         Ok(output)
     }
 
@@ -1037,7 +1041,11 @@ impl VideoDecoder {
                     .and_then(|r| r.checked_mul(2 * spec.ffn))
                     .is_some_and(|n| n <= i32::MAX as usize)
             {
-                eprintln!("H3_VAE_BATCH_REJECT batch={batch} reason=kernel_index_or_grid_limit");
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "H3_VAE_BATCH_REJECT batch={batch} reason=kernel_index_or_grid_limit"
+                    );
+                }
                 continue;
             }
             let tail = slots % batch;
@@ -1092,7 +1100,9 @@ impl VideoDecoder {
                 Ok(value) => value,
                 Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
                     .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
-                    eprintln!("H3_VAE_BATCH_REJECT batch={batch} reason={error:#}");
+                    if crate::backend::diagnostics_enabled() {
+                        eprintln!("H3_VAE_BATCH_REJECT batch={batch} reason={error:#}");
+                    }
                     continue;
                 }
                 Err(error) => return Err(error.context(format!("tile batch {batch}"))),
@@ -1138,18 +1148,20 @@ impl VideoDecoder {
             "numerical_candidate_executed":false,"model_cells_scored":0});
             eprintln!("{}", serde_json::json!({"h3_vae_batch_setup":result}));
         }
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_vae_tile_plan": {
-                "batch":chosen.batch,"tail":slots%chosen.batch,"work_bytes":chosen.work,
-                "workspace_bytes":chosen.workspace,"peak_new_bytes":chosen.peak,
-            "budget_bytes":budget,"free_before_work_bytes":free,"slots":slots,
-            "future_fixed_bytes":mandatory,"safety_reserve_bytes":reserve,
-            "retained_workspace_bytes":workspace_before,"total_bytes":total,
-            "full_rows":chosen.batch*tokens,"tail_rows":(slots%chosen.batch)*tokens,
-            "predicted_launches":chosen.launches
-            }})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vae_tile_plan": {
+                    "batch":chosen.batch,"tail":slots%chosen.batch,"work_bytes":chosen.work,
+                    "workspace_bytes":chosen.workspace,"peak_new_bytes":chosen.peak,
+                "budget_bytes":budget,"free_before_work_bytes":free,"slots":slots,
+                "future_fixed_bytes":mandatory,"safety_reserve_bytes":reserve,
+                "retained_workspace_bytes":workspace_before,"total_bytes":total,
+                "full_rows":chosen.batch*tokens,"tail_rows":(slots%chosen.batch)*tokens,
+                "predicted_launches":chosen.launches
+                }})
+            );
+        }
         Ok(chosen.clone())
     }
 
@@ -1239,11 +1251,13 @@ impl VideoDecoder {
         let loaded = load.bytes;
         drop(load);
         s.synchronize()?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_vae_decoder_placement": {"mode": "resident", "weight_bytes": loaded,
-                "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vae_decoder_placement": {"mode": "resident", "weight_bytes": loaded,
+                    "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
+            );
+        }
         Ok(Self {
             spec: spec.clone(),
             post_quant,
@@ -1697,12 +1711,14 @@ impl VideoDecoder {
                 == decode_bytes(spec, tiles, (height, width)),
             "decode buffers differ from decode_bytes"
         );
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_vae_decode": {"chunks": plan.chunks, "tiles": slots, "tokens_per_tile": w.tokens,
-                "frames": plan.frames, "raw_tile_bytes": 2 * raw.len(), "canvas_bytes": 2 * canvas.len(),
-                "output_bytes": 2 * out.len(), "free_bytes": s.context().mem_get_info()?.0}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vae_decode": {"chunks": plan.chunks, "tiles": slots, "tokens_per_tile": w.tokens,
+                    "frames": plan.frames, "raw_tile_bytes": 2 * raw.len(), "canvas_bytes": 2 * canvas.len(),
+                    "output_bytes": 2 * out.len(), "free_bytes": s.context().mem_get_info()?.0}})
+            );
+        }
         let copy_frames = |s: &Arc<CudaStream>,
                            from: &CudaSlice<bf16>,
                            from_frames: usize,
@@ -2317,11 +2333,13 @@ impl KeyframeEncoder {
                 .collect::<Vec<f32>>(),
         )?;
         s.synchronize()?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_vae_encoder_placement": {"mode": "resident", "weight_bytes": bytes,
-                "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vae_encoder_placement": {"mode": "resident", "weight_bytes": bytes,
+                    "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
+            );
+        }
         Ok(Self {
             spec: spec.clone(),
             conv_in,
