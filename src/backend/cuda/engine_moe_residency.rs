@@ -1,6 +1,6 @@
 //! Native expert DMA ownership and the CPU residency runtime.
 use super::*;
-use crate::backend::gpu::CudaFunction;
+use crate::backend::gpu::{CudaFunction, CudaStream};
 use crate::experts::{
     arena::{BlockLease, WriteClaim},
     catalogue::ExpertCatalogue,
@@ -103,6 +103,27 @@ pub(in crate::backend::cuda) struct Reader {
     chunk_bytes: u64,
 }
 
+fn submit_disk_copies(
+    guard: &crate::experts::disk::SlotLease<'_>,
+    destination: u64,
+    stream: &CudaStream,
+) -> Result<()> {
+    let base = guard.bytes_ptr();
+    for (offset, len, packed) in guard.disk_slices()? {
+        ensure!(len > 0, "empty disk slice");
+        // SAFETY: the registered ring stays leased until the caller records the copy event.
+        unsafe {
+            copy::htod_raw(
+                destination + packed as u64,
+                base.add(offset).cast(),
+                len,
+                stream,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl Reader {
     fn new(
         device: &Device,
@@ -127,13 +148,9 @@ impl Reader {
         } else {
             0
         };
-        for _ in 0..slots {
-            let slot = reader
-                .disk
-                .read_expert(0, 0, catalogue, catalogue.slot_bytes())?;
-            let values = reader.disk.values(slot)?;
-            let address = values.as_ptr() as u64;
-            let bytes = std::mem::size_of_val(values.values());
+        let spans = reader.disk.ring_spans();
+        ensure!(spans.len() == slots, "expert ring registration lost a slot");
+        for (slot, (address, bytes)) in spans.into_iter().enumerate() {
             ensure!(
                 !reader.registrations.contains(&address),
                 "disk ring registration repeated address={address:#x}"
@@ -527,7 +544,11 @@ impl Transfers {
         }
     }
 
-    fn copy_host_block(&self, block: u32, values: &[bf16]) -> Result<()> {
+    fn copy_host_block(
+        &self,
+        block: u32,
+        fill: impl FnOnce(&mut [bf16]) -> Result<()>,
+    ) -> Result<()> {
         ensure!(
             !self.pinned,
             "host admission copy on a pinned host block {block}"
@@ -538,14 +559,7 @@ impl Transfers {
             .as_ref()
             .context("host admission has no host arena")?;
         let mut claim = arena.claim(block)?;
-        let destination = claim.slice()?;
-        ensure!(
-            destination.len() == values.len(),
-            "host admission block {block} holds {} elements for {} ring elements",
-            destination.len(),
-            values.len()
-        );
-        destination.copy_from_slice(values);
+        fill(claim.slice()?)?;
         drop(claim);
         Ok(())
     }
@@ -1305,35 +1319,18 @@ impl Slots {
                     .as_mut()
                     .context("decode disk reader is owned by prefill IO")?;
                 let ring = disk.read(layer, expert)?;
-                let values = disk.disk.values(ring)?;
-                let pointer = values.as_ptr() as u64;
+                let guard = disk.disk.values(ring)?;
                 if on_peer {
                     let peer = self.peer.as_ref().context("peer slots missing")?;
                     peer.upload.context().bind_to_thread()?;
-                    // SAFETY: the portable registered ring guard remains alive until the copy is submitted.
-                    unsafe {
-                        copy::htod_raw(
-                            destination,
-                            pointer as *const std::ffi::c_void,
-                            usize::try_from(self.catalogue.slot_bytes())?,
-                            peer.upload.as_ref(),
-                        )
-                    }
-                    .context("copy native disk expert into its peer physical slot")?;
+                    submit_disk_copies(&guard, destination, peer.upload.as_ref())
+                        .context("copy native disk expert into its peer physical slot")?;
                     peer.synced.record(&peer.upload)?;
                     self.transfers.h2d.wait(&peer.synced)?;
                     self.transfers.h2d.context().bind_to_thread()?;
                 } else {
-                    // SAFETY: the registered ring guard remains alive until the copy is submitted.
-                    unsafe {
-                        copy::htod_raw(
-                            destination,
-                            pointer as *const std::ffi::c_void,
-                            usize::try_from(self.catalogue.slot_bytes())?,
-                            self.transfers.h2d.as_ref(),
-                        )
-                    }
-                    .context("copy native disk expert into its physical slot")?;
+                    submit_disk_copies(&guard, destination, self.transfers.h2d.as_ref())
+                        .context("copy native disk expert into its physical slot")?;
                 }
                 let copy = self.events.record(&self.transfers.h2d)?;
                 let reserved_source = if let Some(index) = self
@@ -1345,7 +1342,8 @@ impl Slots {
                     if self.reserved_blocks.contains(&admit.block) {
                         Some((admit.victim, admit.block))
                     } else {
-                        self.transfers.copy_host_block(admit.block, &values)?;
+                        self.transfers
+                            .copy_host_block(admit.block, |dst| guard.copy_logical(dst))?;
                         self.policy.commit_host_admit(admit)?;
                         self.pending_admits.swap_remove(index);
                         None
@@ -1353,14 +1351,14 @@ impl Slots {
                 } else {
                     None
                 };
-                values.copied(copy.id)?;
+                guard.copied(copy.id)?;
                 disk.copied[ring as usize] = Some(copy);
                 if let Some((victim, block)) = reserved_source {
                     anyhow::bail!(
                         "reserved host source: layer {layer} expert {victim} block {block}"
                     );
                 }
-                (pointer, None, Some(ring))
+                (0, None, Some(ring))
             }
         };
         if ring.is_none() {

@@ -2717,19 +2717,10 @@ impl Gpu {
                     .disk
                     .as_mut()
                     .context("prefill disk DMA has no reader owner")?;
-                let values = disk.disk.values(ring)?;
-                let source = values.as_ptr() as u64;
-                // SAFETY: the registered disk ring remains leased until its H2D event.
-                unsafe {
-                    copy::htod_raw(
-                        pointer,
-                        source as *const std::ffi::c_void,
-                        bytes,
-                        slots.transfers.h2d.as_ref(),
-                    )?;
-                }
+                let guard = disk.disk.values(ring)?;
+                super::submit_disk_copies(&guard, pointer, slots.transfers.h2d.as_ref())?;
                 let copied = slots.events.record(&slots.transfers.h2d)?;
-                values.copied(copied.id)?;
+                guard.copied(copied.id)?;
                 disk.copied[ring as usize] = Some(copied);
                 return Ok(());
             }
