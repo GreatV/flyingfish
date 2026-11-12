@@ -578,22 +578,38 @@ impl ParakeetSpec {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn tokenizer_boundary_vocabulary(directory: &Path) -> Result<BTreeMap<u32, String>> {
+    let root: Value = serde_json::from_slice(&std::fs::read(directory.join("tokenizer.json"))?)?;
+    root["model"]["vocab"]
+        .as_object()
+        .context("Parakeet tokenizer vocabulary")?
+        .iter()
+        .map(|(piece, id)| {
+            Ok((
+                u32::try_from(id.as_u64().context("Parakeet token id")?)?,
+                piece.clone(),
+            ))
+        })
+        .collect()
+}
+
 #[cfg(any(feature = "cuda", test))]
 fn tdt_word_segments(
-    token_cues: Vec<crate::media::TextSegment>,
+    token_cues: Vec<(bool, crate::media::TextSegment)>,
 ) -> (
     Vec<crate::media::TextSegment>,
     Vec<crate::media::TextSegment>,
 ) {
     let mut words: Vec<crate::media::TextSegment> = Vec::new();
-    for cue in token_cues {
+    for (marked, cue) in token_cues {
         let text = cue.text.trim();
         if text.is_empty() {
             continue;
         }
         let punctuation = ["?", "'", "¡", "¿", "-", ":", ",", "%", "/", ".", "!"].contains(&text);
         let boundary = cue.text.starts_with(char::is_whitespace) || cue.text.starts_with('▁');
-        if words.is_empty() || !punctuation && boundary {
+        if words.is_empty() || marked || !punctuation && boundary {
             words.push(crate::media::TextSegment {
                 start: cue.start,
                 end: cue.end,
@@ -637,10 +653,11 @@ fn tdt_cues_with(
     durations: &[u32],
     blank: u32,
     mut decode: impl FnMut(&Path, &[u32]) -> Result<String>,
+    mut boundary: impl FnMut(u32) -> bool,
 ) -> Result<crate::media::Transcription> {
     ensure!(tokens.len() == durations.len(), "TDT token/duration extent");
     let full_text = decode(directory, tokens)?;
-    let mut cues: Vec<crate::media::TextSegment> = Vec::new();
+    let mut cues: Vec<(bool, crate::media::TextSegment)> = Vec::new();
     let mut previous_text = String::new();
     let mut frame = 0usize;
     for (index, (&token, &duration)) in tokens.iter().zip(durations).enumerate() {
@@ -661,20 +678,27 @@ fn tdt_cues_with(
         let start = frame as f64 * 0.08;
         let end = (frame + duration as usize) as f64 * 0.08;
         if ["?", "'", "¡", "¿", "-", ":", ",", "%", "/", ".", "!"].contains(&chunk.as_str())
+            && !boundary(token)
             && !cues.is_empty()
         {
-            let previous_end = cues.last().expect("nonempty cues").end;
-            cues.push(crate::media::TextSegment {
-                start: previous_end,
-                end: previous_end,
-                text: chunk,
-            });
+            let previous_end = cues.last().expect("nonempty cues").1.end;
+            cues.push((
+                boundary(token),
+                crate::media::TextSegment {
+                    start: previous_end,
+                    end: previous_end,
+                    text: chunk,
+                },
+            ));
         } else {
-            cues.push(crate::media::TextSegment {
-                start,
-                end,
-                text: chunk,
-            });
+            cues.push((
+                boundary(token),
+                crate::media::TextSegment {
+                    start,
+                    end,
+                    text: chunk,
+                },
+            ));
         }
         frame += duration as usize;
     }
@@ -692,12 +716,18 @@ pub fn tdt_transcription(
     trajectory: &TdtTrajectory,
     blank: u32,
 ) -> Result<crate::media::Transcription> {
+    let vocabulary = tokenizer_boundary_vocabulary(directory)?;
     tdt_cues_with(
         directory,
         &trajectory.tokens,
         &trajectory.durations,
         blank,
         crate::tokenizer::decode,
+        |token| {
+            vocabulary
+                .get(&token)
+                .is_some_and(|piece| piece.starts_with('▁'))
+        },
     )
 }
 
@@ -722,8 +752,8 @@ mod tests {
 
     #[test]
     fn tdt_cues_use_durations_and_previous_token_punctuation() -> Result<()> {
-        let tokens = [8192, 10, 11, 12, 2, 13, 14, 15, 16];
-        let durations = [0, 2, 1, 1, 0, 1, 1, 1, 2];
+        let tokens = [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17, 18];
+        let durations = [0, 2, 1, 1, 0, 1, 1, 1, 2, 1, 1];
         let decode = |_: &Path, ids: &[u32]| -> Result<String> {
             Ok(match ids {
                 [8192, 10] => "hello".into(),
@@ -733,12 +763,23 @@ mod tests {
                 [8192, 10, 11, 12, 2, 13, 14] => "hello world. Next".into(),
                 [8192, 10, 11, 12, 2, 13, 14, 15] => "hello world. Next sentence".into(),
                 [8192, 10, 11, 12, 2, 13, 14, 15, 16] => "hello world. Next sentence!".into(),
+                [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17] => "hello world. Next sentence!'".into(),
+                [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17, 18] => {
+                    "hello world. Next sentence!'cause".into()
+                }
                 _ => String::new(),
             })
         };
-        let result = tdt_cues_with(Path::new("model"), &tokens, &durations, 8192, decode)?;
-        assert_eq!(result.text, "hello world. Next sentence!");
-        assert_eq!(result.words.len(), 4, "{:?}", result.words);
+        let result = tdt_cues_with(
+            Path::new("model"),
+            &tokens,
+            &durations,
+            8192,
+            decode,
+            |token| token == 17,
+        )?;
+        assert_eq!(result.text, "hello world. Next sentence!'cause");
+        assert_eq!(result.words.len(), 5, "{:?}", result.words);
         assert_eq!(result.words[0].text, "hello");
         assert_eq!((result.words[0].start, result.words[0].end), (0.0, 0.16));
         assert_eq!(result.words[1].text, "world.");
@@ -747,13 +788,15 @@ mod tests {
         assert_eq!((result.words[2].start, result.words[2].end), (0.4, 0.48));
         assert_eq!(result.words[3].text, "sentence!");
         assert_eq!((result.words[3].start, result.words[3].end), (0.48, 0.56));
+        assert_eq!(result.words[4].text, "'cause");
+        assert_eq!((result.words[4].start, result.words[4].end), (0.72, 0.88));
         assert!(
             result
                 .words
                 .iter()
                 .all(|word| word.text == word.text.trim())
         );
-        assert_eq!(result.segments.len(), 2);
+        assert_eq!(result.segments.len(), 3);
         assert_eq!(result.segments[0].text, "hello world.");
         assert_eq!(
             (result.segments[0].start, result.segments[0].end),
@@ -764,17 +807,28 @@ mod tests {
             (result.segments[1].start, result.segments[1].end),
             (0.4, 0.56)
         );
+        assert_eq!(result.segments[2].text, "'cause");
+        assert_eq!(
+            (result.segments[2].start, result.segments[2].end),
+            (0.72, 0.88)
+        );
         let (_, undelimited) = tdt_word_segments(vec![
-            crate::media::TextSegment {
-                start: 0.0,
-                end: 0.08,
-                text: "hello".into(),
-            },
-            crate::media::TextSegment {
-                start: 0.08,
-                end: 0.16,
-                text: " world".into(),
-            },
+            (
+                false,
+                crate::media::TextSegment {
+                    start: 0.0,
+                    end: 0.08,
+                    text: "hello".into(),
+                },
+            ),
+            (
+                false,
+                crate::media::TextSegment {
+                    start: 0.08,
+                    end: 0.16,
+                    text: " world".into(),
+                },
+            ),
         ]);
         assert_eq!(undelimited.len(), 1);
         assert_eq!(undelimited[0].text, "hello world");
