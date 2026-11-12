@@ -943,8 +943,9 @@ extern "C" __global__ void bias_residual_f32(
 
 // u8 planes [channels, height, width] -> F32 [h * w, channels] of the h x w window at (y0, x0):
 // (u * (1 / 255) - mean[c]) / std[c], table = [mean | std].
-extern "C" __global__ void normalize_u8_window_f32(
-    const uint8_t* planes, const float* table, float* out, uint32_t channels, uint32_t height,
+template<typename T, bool HWC>
+__device__ __forceinline__ void normalize_window_f32(
+    const T* planes, const float* table, float* out, uint32_t channels, uint32_t height,
     uint32_t width, uint32_t y0, uint32_t x0, uint32_t h, uint32_t w) {
     if (!vision_flat_launch() || !planes || !table || !out || !channels || y0 + h > height ||
         x0 + w > width) { __trap(); return; }
@@ -953,18 +954,33 @@ extern "C" __global__ void normalize_u8_window_f32(
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t c = uint32_t(i % channels);
         const uint64_t p = i / channels;
-        const uint64_t src = (uint64_t(c) * height + y0 + p / w) * width + x0 + p % w;
+        const uint64_t src = HWC ? ((uint64_t(y0) + p / w) * width + x0 + p % w) * channels + c
+                                : (uint64_t(c) * height + y0 + p / w) * width + x0 + p % w;
         const float v = __fmul_rn(float(planes[src]), __frcp_rn(255.0f));
         out[i] = __fdiv_rn(__fsub_rn(v, table[c]), table[channels + c]);
     }
 }
 
+extern "C" __global__ void normalize_u8_window_f32(
+    const uint8_t* planes, const float* table, float* out, uint32_t channels, uint32_t height,
+    uint32_t width, uint32_t y0, uint32_t x0, uint32_t h, uint32_t w) {
+    normalize_window_f32<uint8_t, false>(planes, table, out, channels, height, width, y0, x0, h, w);
+}
+
+extern "C" __global__ void normalize_hwc_window_f32(
+    const float* pixels, const float* table, float* out, uint32_t channels, uint32_t height,
+    uint32_t width, uint32_t y0, uint32_t x0, uint32_t h, uint32_t w) {
+    normalize_window_f32<float, true>(pixels, table, out, channels, height, width, y0, x0, h, w);
+}
+
 // Moments [2 * channels, plane] (mean, then log-variance) and eps [channels, plane] -> mean, std =
 // exp(0.5 * clamp(logvar, -30, 20)) and latents = (f32(f16(mean + std * eps)) - table[c]) / table[channels + c],
 // table = [latents_mean | latents_std], all [channels, plane] F32.
-extern "C" __global__ void gaussian_posterior_f32(
+template<bool CROP>
+__device__ __forceinline__ void gaussian_posterior(
     const float* moments, const float* eps, const float* table, float* mean, float* stdev,
-    float* latents, uint32_t channels, uint64_t plane) {
+    float* latents, uint32_t channels, uint64_t plane, uint32_t width = 0,
+    uint32_t out_height = 0, uint32_t out_width = 0) {
     if (!vision_flat_launch() || !moments || !eps || !table || !mean || !stdev || !latents ||
         !channels || !plane) { __trap(); return; }
     const uint64_t count = uint64_t(channels) * plane;
@@ -977,8 +993,30 @@ extern "C" __global__ void gaussian_posterior_f32(
         const float sample = __half2float(__float2half_rn(__fadd_rn(m, __fmul_rn(s, eps[i]))));
         mean[i] = m;
         stdev[i] = s;
-        latents[i] = __fdiv_rn(__fsub_rn(sample, table[c]), table[channels + c]);
+        if constexpr (CROP) {
+            const uint64_t p = i % plane;
+            if (p / width < out_height && p % width < out_width)
+                latents[(uint64_t(c) * out_height + p / width) * out_width + p % width]
+                    = __fdiv_rn(__fsub_rn(sample, table[c]), table[channels + c]);
+        } else latents[i] = __fdiv_rn(__fsub_rn(sample, table[c]), table[channels + c]);
     }
+}
+
+extern "C" __global__ void gaussian_posterior_f32(
+    const float* moments, const float* eps, const float* table, float* mean, float* stdev,
+    float* latents, uint32_t channels, uint64_t plane) {
+    gaussian_posterior<false>(moments, eps, table, mean, stdev, latents, channels, plane);
+}
+
+extern "C" __global__ void gaussian_posterior_crop_f32(
+    const float* moments, const float* eps, const float* table, float* mean, float* stdev,
+    float* latents, uint32_t channels, uint32_t height, uint32_t width,
+    uint32_t out_height, uint32_t out_width) {
+    if (!height || !width || !out_height || !out_width || out_height > height || out_width > width) {
+        __trap(); return;
+    }
+    gaussian_posterior<true>(moments, eps, table, mean, stdev, latents, channels,
+        uint64_t(height) * width, width, out_height, out_width);
 }
 
 // F32 CHW [channels, height, width] -> BF16 NHWC [height, width, channels] with
