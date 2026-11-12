@@ -1573,15 +1573,15 @@ pub fn adaln_input(spec: &H3Spec, time: &AdalnTimeEmbedder, timesteps: &[f32]) -
         .collect()
 }
 
-/// SiLU of `mix_temb` on each f32 lane of the two time embedders, rounded to BF16.
-pub fn mixed_adaln_input(
+/// Pre-SiLU `mix_temb` lanes, `[timesteps, time_dim]`.
+pub(crate) fn mixed_temb(
     spec: &H3Spec,
     current: &AdalnTimeEmbedder,
     endpoint: &AdalnTimeEmbedder,
     timesteps: &[f32],
     endpoints: &[f32],
     gate: f32,
-) -> Result<Vec<half::bf16>> {
+) -> Result<Vec<f32>> {
     ensure!(
         timesteps.len() == endpoints.len() && gate.is_finite(),
         "HyperFlow temb extent"
@@ -1595,8 +1595,25 @@ pub fn mixed_adaln_input(
     Ok(current
         .into_iter()
         .zip(endpoint)
-        .map(|(c, e)| half::bf16::from_f32(silu(mix_temb(c, e, gate))))
+        .map(|(c, e)| mix_temb(c, e, gate))
         .collect())
+}
+
+/// SiLU of `mix_temb` on each f32 lane of the two time embedders, rounded to BF16.
+pub fn mixed_adaln_input(
+    spec: &H3Spec,
+    current: &AdalnTimeEmbedder,
+    endpoint: &AdalnTimeEmbedder,
+    timesteps: &[f32],
+    endpoints: &[f32],
+    gate: f32,
+) -> Result<Vec<half::bf16>> {
+    Ok(
+        mixed_temb(spec, current, endpoint, timesteps, endpoints, gate)?
+            .into_iter()
+            .map(|v| half::bf16::from_f32(silu(v)))
+            .collect(),
+    )
 }
 
 /// `x [rows, input] * weight[output, input]^T + bias`.

@@ -11041,4 +11041,491 @@ mod tests {
         println!("H3_IMAGE_E2E_GATE PASS cells=a,b,e e_t2i={t2i_decision} e_edit={edit_decision}");
         Ok(())
     }
+
+    /// Removes the BLAS runtime directory when the block-cell gate returns.
+    struct BlockRuntime(PathBuf);
+
+    impl Drop for BlockRuntime {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn env_dir(key: &str) -> Result<PathBuf> {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .with_context(|| format!("{key} missing"))
+    }
+
+    fn read_exact(path: &Path, bytes: usize) -> Result<Vec<u8>> {
+        let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        ensure!(
+            data.len() == bytes,
+            "{} is {} bytes, expected {bytes}",
+            path.display(),
+            data.len()
+        );
+        Ok(data)
+    }
+
+    fn read_bf16(path: &Path, elements: usize) -> Result<Vec<bf16>> {
+        let data = read_exact(path, elements * 2)?;
+        Ok(data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect())
+    }
+
+    fn read_f32(path: &Path, elements: usize) -> Result<Vec<f32>> {
+        let data = read_exact(path, elements * 4)?;
+        Ok(data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+
+    fn read_u32(path: &Path, elements: usize) -> Result<Vec<u32>> {
+        let data = read_exact(path, elements * 4)?;
+        Ok(data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect())
+    }
+
+    /// `(max_abs, rmse)` in f64. Reference pairs were measured in f32; these taus are that measurement.
+    fn max_rmse(candidate: &[f64], reference: &[f64]) -> Result<(f64, f64)> {
+        ensure!(
+            !candidate.is_empty() && candidate.len() == reference.len(),
+            "metric extent {} {}",
+            candidate.len(),
+            reference.len()
+        );
+        let mut max_abs = 0f64;
+        let mut square = 0f64;
+        for (&left, &right) in candidate.iter().zip(reference) {
+            ensure!(
+                left.is_finite() && right.is_finite(),
+                "non-finite metric input"
+            );
+            let delta = (left - right).abs();
+            max_abs = max_abs.max(delta);
+            square += delta * delta;
+        }
+        Ok((max_abs, (square / candidate.len() as f64).sqrt()))
+    }
+
+    fn f64_of_bf16(values: &[bf16]) -> Vec<f64> {
+        values.iter().map(|v| f64::from(v.to_f32())).collect()
+    }
+
+    fn f64_of_f32(values: &[f32]) -> Vec<f64> {
+        values.iter().copied().map(f64::from).collect()
+    }
+
+    /// Pair 0 rewritten to pair 2. Tag stays in `index % 3`.
+    fn swap_video_pair(index: &[u32]) -> Vec<u32> {
+        index
+            .iter()
+            .map(|&value| {
+                let pair = value / MODALITIES;
+                let tag = value % MODALITIES;
+                let pair = if pair == 0 { 2 } else { pair };
+                pair * MODALITIES + tag
+            })
+            .collect()
+    }
+
+    fn pair_columns(meta: &serde_json::Value) -> Result<(Vec<f32>, Vec<f32>)> {
+        let pairs = meta["pair_values"]
+            .as_array()
+            .context("reference pair_values")?;
+        let mut timesteps = Vec::with_capacity(pairs.len());
+        let mut endpoints = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            let row = pair.as_array().context("reference pair")?;
+            ensure!(row.len() == 2, "reference pair width");
+            let t = row[0].as_f64().context("reference pair t")? as f32;
+            let r = row[1].as_f64().context("reference pair r")? as f32;
+            ensure!(
+                t.is_finite() && r.is_finite(),
+                "reference pair is not finite"
+            );
+            timesteps.push(t);
+            endpoints.push(r);
+        }
+        ensure!(!timesteps.is_empty(), "reference pairs are empty");
+        Ok((timesteps, endpoints))
+    }
+
+    fn time_embedder(
+        source: &mut Source<'_>,
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        prefix: &str,
+    ) -> Result<AdalnTimeEmbedder> {
+        Ok(AdalnTimeEmbedder {
+            linear_1_weight: source.host_f32(
+                s,
+                &format!("{prefix}.linear_1.weight"),
+                spec.time_hidden * spec.freq_dim,
+            )?,
+            linear_1_bias: source.host_f32(
+                s,
+                &format!("{prefix}.linear_1.bias"),
+                spec.time_hidden,
+            )?,
+            linear_2_weight: source.host_f32(
+                s,
+                &format!("{prefix}.linear_2.weight"),
+                spec.time_dim * spec.time_hidden,
+            )?,
+            linear_2_bias: source.host_f32(s, &format!("{prefix}.linear_2.bias"), spec.time_dim)?,
+        })
+    }
+
+    /// max-abs, RMSE. `max(2 × worst pair, eps)` from floor-cpu, 4090-a, 4090-b, a4000-a, a4000-b on 2026-11-12.
+    const BLOCK0_TAU: (f64, f64) = (1024.0, 5.925411224365234);
+    const BLOCK1_TAU: (f64, f64) = (256.0, 3.944915533065796);
+    const BLOCK6_TAU: (f64, f64) = (1e-6, 1e-7);
+    const TEMB_TAU: (f64, f64) = (0.00738525390625, 0.0026896463241428137);
+
+    fn record_cell(
+        arm: &str,
+        cell: &'static str,
+        got: (f64, f64),
+        tau: (f64, f64),
+        defects: &mut Vec<&'static str>,
+    ) {
+        let pass = got.0 <= tau.0 && got.1 <= tau.1;
+        println!(
+            "HYPERFLOW_BLOCK arm={arm} cell={cell} max_abs={:.16e} rmse={:.16e} tau_abs={:.16e} tau_rmse={:.16e} {}",
+            got.0,
+            got.1,
+            tau.0,
+            tau.1,
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        if !pass {
+            defects.push(cell);
+        }
+    }
+
+    fn record_control(name: &str, got: (f64, f64), tau: (f64, f64), failed: &mut Vec<String>) {
+        let abs_ratio = got.0 / tau.0;
+        let rmse_ratio = got.1 / tau.1;
+        let pass = abs_ratio > 10.0 && rmse_ratio > 10.0;
+        println!(
+            "HYPERFLOW_BLOCK control={name} max_abs={:.16e} rmse={:.16e} ratio_abs={abs_ratio:.6} ratio_rmse={rmse_ratio:.6} {}",
+            got.0,
+            got.1,
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            failed.push(name.to_owned());
+        }
+    }
+
+    /// INT8 block 0, low-rank block 1, dropped block 6, and the pre-SiLU f32 temb mix, at the frozen pair taus.
+    #[test]
+    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_BLOCK_REF"]
+    fn hyperflow_block_cells_match_the_definition() -> Result<()> {
+        let model = env_dir("FF_HYPERFLOW_MODEL")?;
+        let reference = env_dir("FF_HYPERFLOW_BLOCK_REF")?;
+        let arm = reference
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("reference arm name")?
+            .to_owned();
+        let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+            model.join("config.json"),
+        )?)?)?;
+        ensure!(spec.is_hyperflow()?, "transformer config is not HyperFlow");
+        ensure!(
+            matches!(
+                spec.linear_storage("transformer_blocks.0.attn.to_q")?,
+                LinearStorage::Int8 { .. }
+            ),
+            "block 0 to_q is not int8"
+        );
+        ensure!(
+            matches!(
+                spec.linear_storage("transformer_blocks.1.attn.to_q")?,
+                LinearStorage::LowRank { .. }
+            ),
+            "block 1 to_q is not low-rank"
+        );
+        let dropped = spec.dropped_blocks.as_deref().context("dropped blocks")?;
+        ensure!(
+            dropped.contains(&6) && !dropped.contains(&0) && !dropped.contains(&1),
+            "blocks 0, 1 and 6 roles {dropped:?}"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(reference.join("meta.json"))?)?;
+        ensure!(
+            meta["candidate_run"].as_bool() == Some(false),
+            "reference arm is marked as a candidate run"
+        );
+        ensure!(meta["rows"].as_u64() == Some(20), "reference rows");
+        let rows = 20usize;
+        let hidden_count = rows * spec.hidden;
+        let hidden = read_bf16(&reference.join("hidden.i16"), hidden_count)?;
+        let positions = read_f32(&reference.join("positions.f32"), rows * 3)?;
+        let adaln = read_u32(&reference.join("adaln.i32"), rows)?;
+        let (timesteps, endpoints) = pair_columns(&meta)?;
+        let entries = u32::try_from(timesteps.len())? * MODALITIES;
+        ensure!(
+            adaln.iter().all(|&index| index < entries),
+            "adaln index is outside {entries} rows"
+        );
+        let temb_ref = read_f32(&reference.join("temb.f32"), timesteps.len() * spec.time_dim)?;
+        let block_ref =
+            |block: usize| read_bf16(&reference.join(format!("block{block}.i16")), hidden_count);
+        let block0_ref = block_ref(0)?;
+        let block1_ref = block_ref(1)?;
+        let block6_ref = block_ref(6)?;
+        ensure!(
+            block6_ref
+                .iter()
+                .zip(&hidden)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "dropped reference is not the input"
+        );
+        let control0 = read_bf16(&reference.join("control0.i16"), hidden_count)?;
+        let control1 = read_bf16(&reference.join("control1.i16"), hidden_count)?;
+        let mut control_fail = Vec::new();
+        record_control(
+            "reference-block0",
+            max_rmse(&f64_of_bf16(&control0), &f64_of_bf16(&block0_ref))?,
+            BLOCK0_TAU,
+            &mut control_fail,
+        );
+        record_control(
+            "reference-block1",
+            max_rmse(&f64_of_bf16(&control1), &f64_of_bf16(&block1_ref))?,
+            BLOCK1_TAU,
+            &mut control_fail,
+        );
+        let mutant: Vec<bf16> = hidden
+            .iter()
+            .map(|v| bf16::from_f32(v.to_f32() + v.to_f32()))
+            .collect();
+        record_control(
+            "reference-block6-mutant",
+            max_rmse(&f64_of_bf16(&mutant), &f64_of_bf16(&block6_ref))?,
+            BLOCK6_TAU,
+            &mut control_fail,
+        );
+        ensure!(
+            control_fail.is_empty(),
+            "reference control stayed within 10x tau: {control_fail:?}"
+        );
+
+        let manifest = MappedCheckpoint::open_component(&model, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-hyperflow-block-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let _runtime = BlockRuntime(runtime.clone());
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "HyperFlow block cells".into())),
+        )?;
+        let mut source = Source::new(&model, &manifest);
+        let current = time_embedder(&mut source, s, &spec, "time_embedder")?;
+        let endpoint = time_embedder(&mut source, s, &spec, "endpoint_time_embedder")?;
+        let gate = spec.hyperflow_gate.context("HyperFlow gate")?;
+        let temb = crate::minimax_h3::mixed_temb(
+            &spec, &current, &endpoint, &timesteps, &endpoints, gate,
+        )?;
+        ensure!(
+            temb.len() == temb_ref.len() && temb.iter().all(|v| v.is_finite()),
+            "temb extent or a non-finite lane"
+        );
+        let mut defects = Vec::new();
+        record_cell(
+            &arm,
+            "temb",
+            max_rmse(&f64_of_f32(&temb), &f64_of_f32(&temb_ref))?,
+            TEMB_TAU,
+            &mut defects,
+        );
+        let x_host = mixed_adaln_input(&spec, &current, &endpoint, &timesteps, &endpoints, gate)?;
+        ensure!(
+            x_host.len() == timesteps.len() * spec.time_dim,
+            "adaln input extent"
+        );
+        let coords: Vec<[f64; 3]> = positions
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|row| [f64::from(row[0]), f64::from(row[1]), f64::from(row[2])])
+            .collect();
+        ensure!(coords.len() == rows, "position rows");
+        let rotary_host = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &coords);
+        ensure!(
+            rotary_host.len() == rows * 6 * spec.rope_freq_dim,
+            "rotary length {}",
+            rotary_host.len()
+        );
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let mut work = BlockWork::new(s, &spec, 0, rows)?;
+        work.prepare::<false>(&blas, &spec)?;
+        let modulation_width = 6 * spec.hidden * MODALITIES as usize;
+        let mut weight = s.alloc_zeros::<bf16>(modulation_width * spec.time_dim)?;
+        let mut bias = s.alloc_zeros::<bf16>(modulation_width)?;
+        let projected = s.alloc_zeros::<bf16>(timesteps.len() * modulation_width)?;
+        let mode = LinearBiasMode::BeforeOutputRound;
+        blas.prepare_biased(
+            u32::try_from(timesteps.len())?,
+            u32::try_from(modulation_width)?,
+            u32::try_from(spec.time_dim)?,
+            vector(&bias, s)?,
+            mode,
+        )?;
+        let x = s.clone_htod(&x_host)?;
+        let rotary = s.clone_htod(&rotary_host)?;
+        let index = s.clone_htod(&adaln)?;
+        let swapped = s.clone_htod(&swap_video_pair(&adaln))?;
+        for (block, tau, reference_out) in [
+            (0usize, BLOCK0_TAU, block0_ref),
+            (1, BLOCK1_TAU, block1_ref),
+        ] {
+            let mut lora = Source::new(&model, &manifest);
+            let weights = BlockWeights::stored(
+                s,
+                &spec,
+                &format!("transformer_blocks.{block}"),
+                &mut source,
+                &mut lora,
+                None,
+            )?;
+            let name = format!("transformer_blocks.{block}.adaln_proj.linear");
+            for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
+                source.fill(s, &format!("{name}.{suffix}"), &mut buffer.slice_mut(..))?;
+            }
+            blas.linear_biased(
+                matrix(&weight, s, modulation_width, spec.time_dim)?,
+                vector(&bias, s)?,
+                matrix(&x, s, timesteps.len(), spec.time_dim)?,
+                &mut TensorMut(matrix(&projected, s, timesteps.len(), modulation_width)?),
+                mode,
+            )?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: 0.0,
+            };
+            let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
+                let mut row = s.clone_htod(&hidden)?;
+                let modulation = Modulation {
+                    table: &projected,
+                    offset: 0,
+                    entries,
+                    index,
+                };
+                block_forward::<false>(
+                    &context,
+                    &mut flash,
+                    &weights,
+                    &Conditioning::Modulated {
+                        rotary: &rotary,
+                        modulation: &modulation,
+                    },
+                    &mut row,
+                    &mut work,
+                )?;
+                let host = s.clone_dtoh(&row)?;
+                ensure!(
+                    host.len() == hidden.len() && host.iter().all(|v| v.to_f32().is_finite()),
+                    "block {block} output extent or a non-finite value"
+                );
+                Ok(host.into_iter().map(|v| f64::from(v.to_f32())).collect())
+            };
+            let output = launch(&index)?;
+            record_cell(
+                &arm,
+                if block == 0 { "block0" } else { "block1" },
+                max_rmse(&output, &f64_of_bf16(&reference_out))?,
+                tau,
+                &mut defects,
+            );
+            let swapped_out = launch(&swapped)?;
+            record_control(
+                &format!("candidate-block{block}"),
+                max_rmse(&swapped_out, &output)?,
+                tau,
+                &mut control_fail,
+            );
+        }
+        let identity = BlockWeights::identity(s, &spec)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+        let mut row = s.clone_htod(&hidden)?;
+        let modulation = Modulation {
+            table: &projected,
+            offset: 0,
+            entries,
+            index: &index,
+        };
+        block_forward::<false>(
+            &context,
+            &mut flash,
+            &identity,
+            &Conditioning::Modulated {
+                rotary: &rotary,
+                modulation: &modulation,
+            },
+            &mut row,
+            &mut work,
+        )?;
+        let dropped_out = s.clone_dtoh(&row)?;
+        ensure!(
+            dropped_out.len() == hidden.len() && dropped_out.iter().all(|v| v.to_f32().is_finite()),
+            "dropped block output extent or a non-finite value"
+        );
+        record_cell(
+            &arm,
+            "block6",
+            max_rmse(
+                &dropped_out
+                    .iter()
+                    .map(|v| f64::from(v.to_f32()))
+                    .collect::<Vec<_>>(),
+                &f64_of_bf16(&block6_ref),
+            )?,
+            BLOCK6_TAU,
+            &mut defects,
+        );
+        ensure!(
+            control_fail.is_empty(),
+            "control stayed within 10x tau: {control_fail:?}"
+        );
+        if defects.is_empty() {
+            println!("HYPERFLOW_BLOCK_GATE PASS cells=4 controls=FAIL_AS_REQUIRED");
+        } else {
+            println!("HYPERFLOW_BLOCK_GATE DEFECT cells={defects:?} controls=FAIL_AS_REQUIRED");
+        }
+        Ok(())
+    }
 }
