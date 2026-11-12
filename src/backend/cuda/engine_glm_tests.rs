@@ -3816,3 +3816,214 @@ fn glm_mtp_draft_on_reference_32pos_gpu() -> Result<()> {
 
     Ok(())
 }
+
+const ADMIT_PREFILL: usize = 536;
+const ADMIT_STEPS: usize = 64;
+const ADMIT_R2_SHA: &str = "9c5eb391cc756e43aee6bd95b0877f7f32e0f78c6afeb72dac7b9eb285f231c7";
+
+fn admit_glm_tokens(path: &std::path::Path, sha: &str) -> Result<Vec<u32>> {
+    let bytes = std::fs::read(path)?;
+    ensure!(
+        format!("{:x}", Sha256::digest(&bytes)) == sha,
+        "Runner FAIL frozen token integrity"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let ids: Vec<u32> = serde_json::from_value(value["input_ids"].clone())?;
+    ensure!(
+        ids.len() == ADMIT_PREFILL + ADMIT_STEPS && ids.iter().all(|&id| id < 154880),
+        "Runner FAIL census token shape len={}",
+        ids.len()
+    );
+    Ok(ids)
+}
+
+fn admit_glm_engine() -> Result<Engine> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model = PathBuf::from(std::env::var_os("FF_GLM_MODEL").context("GLM model missing")?);
+    let settings = crate::backend::Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: false,
+        draft_model: None,
+        prefix_cache: false,
+        device_budget_gib: None,
+        kv_format: crate::kv::KvFormat::Bf16,
+        runtime_dir: Some(PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?,
+        )),
+    };
+    crate::experts::plan::FORCED_WAVES.set(None);
+    crate::experts::plan::pin_host_blocks(Some(1618));
+    let loaded = Engine::load(&model, 0, 640, None, settings);
+    crate::experts::plan::pin_host_blocks(None);
+    let engine = loaded?;
+    let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&engine.model_spec)?;
+    let budget = engine
+        .moe_slots
+        .as_ref()
+        .context("native slots missing")?
+        .budget();
+    let resident = budget
+        .slots_per_layer
+        .iter()
+        .filter(|&&count| count > 0)
+        .count();
+    ensure!(
+        geometry.layers == 42
+            && geometry.experts == 288
+            && geometry.top_k == 8
+            && geometry.first_layer == 3
+            && engine.config.vocab_size == 154880
+            && engine.config.num_hidden_layers == 45
+            && budget.host_blocks == 1618
+            && budget.slots_total() == 0
+            && resident == 0
+            && !budget.pinned
+            && budget.slot_bytes() == 25_171_968,
+        "Runner FAIL live budget host_blocks={} gpu_slots={} resident={resident} pinned={} slot_bytes={}",
+        budget.host_blocks,
+        budget.slots_total(),
+        budget.pinned,
+        budget.slot_bytes()
+    );
+    Ok(engine)
+}
+
+fn admit_logit_bits(engine: &Engine) -> Result<Vec<u32>> {
+    let row = engine.decode_logits()?;
+    ensure!(
+        row.iter().all(|value| value.is_finite()),
+        "Runner FAIL non-finite logits"
+    );
+    Ok(row.into_iter().map(f32::to_bits).collect())
+}
+
+fn admit_same_bits(step: usize, left: &[u32], right: &[u32]) -> Result<()> {
+    let mismatch = left
+        .iter()
+        .zip(right)
+        .position(|(left, right)| left != right);
+    ensure!(
+        left.len() == right.len() && mismatch.is_none(),
+        "DEFECT admit logits differ at step {step} len {}/{} index {mismatch:?}",
+        left.len(),
+        right.len()
+    );
+    Ok(())
+}
+
+fn admit_glm_prompt(engine: &mut Engine, tokens: &[u32], prompt: &str) -> Result<()> {
+    let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&engine.model_spec)?;
+    let budget = engine
+        .moe_slots
+        .as_ref()
+        .context("native slots missing")?
+        .budget()
+        .clone();
+    engine.reset()?;
+    engine
+        .moe_slots
+        .as_mut()
+        .context("native slots missing")?
+        .set_host_admit(false);
+    engine.prefill(&tokens[..ADMIT_PREFILL], None)?;
+    let mut off = Vec::with_capacity(ADMIT_STEPS + 1);
+    off.push(admit_logit_bits(engine)?);
+    for step in 0..ADMIT_STEPS {
+        engine.set_token(tokens[ADMIT_PREFILL + step])?;
+        engine.decode(false, None)?;
+        off.push(admit_logit_bits(engine)?);
+        if (step + 1).is_multiple_of(16) {
+            println!("ADMIT_ON_MISS prompt={prompt} phase=off step={}", step + 1);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+    ensure!(
+        engine
+            .moe_slots
+            .as_ref()
+            .context("native slots missing")?
+            .admit_copies()
+            == 0,
+        "DEFECT host admission ran with the test switch off"
+    );
+    engine.reset()?;
+    {
+        let slots = engine.moe_slots.as_mut().context("native slots missing")?;
+        slots.set_host_admit(true);
+        slots.arm_route_tape();
+    }
+    engine.prefill(&tokens[..ADMIT_PREFILL], None)?;
+    admit_same_bits(0, &off[0], &admit_logit_bits(engine)?)?;
+    for step in 0..ADMIT_STEPS {
+        engine.set_token(tokens[ADMIT_PREFILL + step])?;
+        engine.decode(false, None)?;
+        admit_same_bits(step + 1, &off[step + 1], &admit_logit_bits(engine)?)?;
+        if (step + 1).is_multiple_of(16) {
+            println!("ADMIT_ON_MISS prompt={prompt} phase=on step={}", step + 1);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+    let tape = engine
+        .moe_slots
+        .as_mut()
+        .context("native slots missing")?
+        .take_route_tape();
+    let grouped = super::super::moe::group_route_stamps(
+        &tape,
+        geometry.layers,
+        geometry.experts,
+        geometry.top_k,
+    )?;
+    ensure!(
+        grouped.len() == ADMIT_PREFILL + ADMIT_STEPS,
+        "Runner FAIL route tape tokens {}",
+        grouped.len()
+    );
+    let replay = crate::experts::runtime::replay_admit_on_miss(
+        &geometry,
+        &budget,
+        &grouped[..ADMIT_PREFILL],
+        &grouped[ADMIT_PREFILL..],
+    )?;
+    crate::experts::runtime::assert_frozen_admit(prompt, &replay)?;
+    let copies = engine
+        .moe_slots
+        .as_ref()
+        .context("native slots missing")?
+        .admit_copies();
+    ensure!(
+        copies == replay.admissions,
+        "DEFECT live admissions {copies} replay {}",
+        replay.admissions
+    );
+    println!(
+        "PASS ADMIT_ON_MISS prompt={prompt} gpu={} host={} file={} admissions={} copy_bytes={} file_bytes={} file_per_token={} max_layer_admits={} live_copies={copies}",
+        replay.gpu_hits,
+        replay.host_hits,
+        replay.file_hits,
+        replay.admissions,
+        replay.copy_bytes,
+        replay.file_bytes,
+        replay.file_per_token,
+        replay.max_layer_admits,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "official GLM weights; FF_Q38_GPU_WINDOW=granted, FF_GLM_MODEL, FLYINGFISH_RUNTIME_DIR, G1_COMPOSITION_REFERENCE"]
+fn glm_admit_on_miss_gpu() -> Result<()> {
+    let r2 = admit_glm_tokens(
+        &PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("r2 tokens missing")?)
+            .join("tokens.json"),
+        ADMIT_R2_SHA,
+    )?;
+    let mut engine = admit_glm_engine()?;
+    admit_glm_prompt(&mut engine, &r2, "r2")?;
+    println!("PASS ADMIT_ON_MISS model=glm prompts=1 host_blocks=1618 gpu_slots=0");
+    Ok(())
+}

@@ -180,8 +180,49 @@ pub struct Residency {
     published: Vec<Published>,
     moves: Vec<PromptMove>,
     dispatched: Vec<bool>,
+    /// Selection counts for the open request. Frozen into `prefill_rank` at the prefill boundary.
+    prefill_counts: Vec<Vec<u32>>,
+    prefill_rank: Option<Vec<Vec<u32>>>,
+    #[cfg(test)]
+    host_admit: bool,
+    #[cfg(test)]
+    admit_copies: u64,
     token_open: bool,
     request_open: bool,
+}
+
+/// One decode file miss copied into an existing host block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedAdmit {
+    pub layer: u32,
+    pub expert: u32,
+    pub victim: u32,
+    pub block: u32,
+}
+
+/// Decode trajectory of one frozen prefill rank over a fixed GPU bank and the load-time host set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmitReplay {
+    pub gpu_hits: u64,
+    pub host_hits: u64,
+    pub file_hits: u64,
+    pub file_experts: u64,
+    pub admissions: u64,
+    pub copy_bytes: u64,
+    pub file_bytes: u64,
+    pub file_per_token: u64,
+    pub held_host: u64,
+    pub held_file: u64,
+    pub id_host: u64,
+    pub id_file: u64,
+    pub layer_host_min: u32,
+    pub layer_host_max: u32,
+    pub converged_step: Option<u32>,
+    pub ramp_host: [u64; 8],
+    pub ramp_file: [u64; 8],
+    pub ramp_admit: [u64; 8],
+    /// Most admissions one layer records inside one decode step.
+    pub max_layer_admits: u32,
 }
 
 fn compact_row(miss_rows: &[u32], row: u32) -> Result<u32> {
@@ -398,6 +439,12 @@ impl Residency {
             published: Vec::with_capacity(select_capacity),
             moves: Vec::with_capacity(positions as usize),
             dispatched: vec![false; layers],
+            prefill_counts: vec![vec![0u32; experts]; layers],
+            prefill_rank: None,
+            #[cfg(test)]
+            host_admit: true,
+            #[cfg(test)]
+            admit_copies: 0,
             token_open: false,
             request_open: false,
         };
@@ -683,6 +730,11 @@ impl Residency {
             if !self.routed[l][e] {
                 self.routed[l][e] = true;
                 self.scores[l][e] += 1.0;
+            }
+            if self.prefill_rank.is_none() {
+                self.prefill_counts[l][e] = self.prefill_counts[l][e]
+                    .checked_add(1)
+                    .context("prefill route count overflow")?;
             }
         }
         for route in routes {
@@ -1141,7 +1193,152 @@ impl Residency {
         ensure!(!self.token_open, "request ends inside an open token");
         ensure!(self.request_open, "no open request");
         self.request_open = false;
+        for row in &mut self.prefill_counts {
+            row.fill(0);
+        }
+        self.prefill_rank = None;
+        #[cfg(test)]
+        {
+            self.admit_copies = 0;
+        }
         Ok(())
+    }
+
+    /// Freezes the current request's prefill selection counts. Later decode misses compare against this rank.
+    pub fn freeze_prefill_rank(&mut self) -> Result<()> {
+        ensure!(
+            self.prefill_rank.is_none(),
+            "prefill rank is already frozen"
+        );
+        self.prefill_rank = Some(self.prefill_counts.clone());
+        Ok(())
+    }
+
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+    pub(crate) fn budget(&self) -> &Capacity {
+        &self.capacity
+    }
+
+    /// Streamed-layer file misses that strictly beat the lowest unreserved host resident.
+    pub fn plan_streamed_admits(&self, layer: u32, reserved: &[u32]) -> Result<Vec<PlannedAdmit>> {
+        self.plan_streamed_admits_inner(layer, reserved, false)
+    }
+
+    #[cfg(test)]
+    fn plan_streamed_admits_ignoring_reserve(
+        &self,
+        layer: u32,
+        reserved: &[u32],
+    ) -> Result<Vec<PlannedAdmit>> {
+        self.plan_streamed_admits_inner(layer, reserved, true)
+    }
+
+    fn plan_streamed_admits_inner(
+        &self,
+        layer: u32,
+        reserved: &[u32],
+        ignore_reserve: bool,
+    ) -> Result<Vec<PlannedAdmit>> {
+        #[cfg(test)]
+        if !self.host_admit {
+            return Ok(Vec::new());
+        }
+        let Some(rank) = self.prefill_rank.as_ref() else {
+            return Ok(Vec::new());
+        };
+        ensure!(
+            layer < self.geometry.layers,
+            "expert layer {layer} outside {}",
+            self.geometry.layers
+        );
+        ensure!(
+            self.capacity.slots_per_layer[layer as usize] == 0,
+            "resident layer {layer} does not take a host admission"
+        );
+        let experts = self.geometry.experts as usize;
+        let counts = &rank[layer as usize];
+        let mut misses: Vec<usize> = self.dispatches[layer as usize]
+            .disk
+            .iter()
+            .map(|route| route.expert as usize)
+            .collect();
+        misses.sort_unstable();
+        misses.dedup();
+        misses.sort_by(|&left, &right| counts[right].cmp(&counts[left]).then(left.cmp(&right)));
+        let mut host = vec![false; experts];
+        for (expert, on) in host.iter_mut().enumerate() {
+            if self.ledger.tier(layer, expert as u32)? == Tier::Host {
+                *on = true;
+            }
+        }
+        let blocks = &self.host_block[layer as usize];
+        let mut planned = Vec::new();
+        for miss in misses {
+            let victim =
+                lowest_host_victim(layer, &host, counts, blocks, reserved, ignore_reserve)?;
+            let Some(victim) = victim else {
+                break;
+            };
+            if !prefill_rank_beats(counts, miss, victim) {
+                break;
+            }
+            let block = blocks[victim];
+            ensure!(
+                block != NO_BLOCK,
+                "host expert {victim} of layer {layer} has no block"
+            );
+            host[victim] = false;
+            host[miss] = true;
+            planned.push(PlannedAdmit {
+                layer,
+                expert: miss as u32,
+                victim: victim as u32,
+                block,
+            });
+        }
+        Ok(planned)
+    }
+
+    /// Records one planned admission on the ledger after its host block has been filled.
+    pub fn commit_host_admit(&mut self, admit: PlannedAdmit) -> Result<()> {
+        ensure!(
+            self.prefill_rank.is_some(),
+            "host admission before the prefill rank is frozen"
+        );
+        ensure!(
+            admit.layer < self.geometry.layers
+                && admit.expert < self.geometry.experts
+                && admit.victim < self.geometry.experts,
+            "host admission outside the geometry"
+        );
+        let block = self.host_block[admit.layer as usize][admit.victim as usize];
+        ensure!(
+            block == admit.block && block != NO_BLOCK,
+            "host admission block {} differs from victim block {block}",
+            admit.block
+        );
+        self.ledger
+            .replace_host(admit.layer, admit.expert, admit.victim)?;
+        self.host_block[admit.layer as usize][admit.victim as usize] = NO_BLOCK;
+        self.host_block[admit.layer as usize][admit.expert as usize] = block;
+        #[cfg(test)]
+        {
+            self.admit_copies = self
+                .admit_copies
+                .checked_add(1)
+                .context("host admission count overflow")?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn set_host_admit(&mut self, enabled: bool) {
+        self.host_admit = enabled;
+    }
+
+    #[cfg(test)]
+    pub fn admit_copies(&self) -> u64 {
+        self.admit_copies
     }
 
     fn validate_released(&self) -> Result<()> {
@@ -1198,6 +1395,388 @@ impl Residency {
     pub fn free_host_blocks(&self) -> u32 {
         u32::try_from(self.free_blocks.len()).expect("free host block count fits u32")
     }
+}
+
+fn prefill_rank_beats(counts: &[u32], miss: usize, victim: usize) -> bool {
+    let (left, right) = (counts[miss], counts[victim]);
+    left > right || (left == right && miss < victim)
+}
+
+fn lowest_host_victim(
+    layer: u32,
+    host: &[bool],
+    counts: &[u32],
+    blocks: &[u32],
+    reserved: &[u32],
+    ignore_reserve: bool,
+) -> Result<Option<usize>> {
+    let mut victim = None;
+    for expert in 0..host.len() {
+        if !host[expert] {
+            continue;
+        }
+        if !ignore_reserve && reserved.contains(&blocks[expert]) {
+            continue;
+        }
+        victim = Some(match victim {
+            None => expert,
+            Some(current) => {
+                let worse = counts[expert] < counts[current]
+                    || (counts[expert] == counts[current] && expert > current);
+                if worse { expert } else { current }
+            }
+        });
+    }
+    if let Some(expert) = victim
+        && reserved.contains(&blocks[expert])
+    {
+        anyhow::bail!(
+            "reserved host source: layer {layer} expert {expert} block {}",
+            blocks[expert]
+        );
+    }
+    Ok(victim)
+}
+
+/// Replays decode admissions from recorded route ids. GPU banks stay the id-ordered initial set.
+/// The host set starts at `host_fill_order` and changes only by this admission rule.
+pub fn replay_admit_on_miss(
+    geometry: &ExpertGeometry,
+    capacity: &Capacity,
+    prefill: &[Vec<(u32, u32)>],
+    decode: &[Vec<(u32, u32)>],
+) -> Result<AdmitReplay> {
+    let layers = geometry.layers as usize;
+    let experts = geometry.experts as usize;
+    let top_k = geometry.top_k as usize;
+    ensure!(
+        layers > 0
+            && experts > 0
+            && top_k > 0
+            && capacity.slots_per_layer.len() == layers
+            && !decode.is_empty()
+            && decode.len() <= 64
+            && capacity.slot_bytes().is_multiple_of(64),
+        "admit replay shape layers={layers} experts={experts} steps={}",
+        decode.len()
+    );
+    let width = layers * top_k;
+    let frequency = vec![vec![1.0f64; experts]; layers];
+    let initial = initial_residency(&frequency, &capacity.slots_per_layer, geometry)?;
+    let mut gpu = vec![vec![false; experts]; layers];
+    for (layer, set) in initial.iter().enumerate() {
+        for &expert in set {
+            gpu[layer][expert as usize] = true;
+        }
+    }
+    let peer_complete = capacity.slots_per_layer[capacity.gpu0_layers as usize..]
+        .iter()
+        .all(|&slots| slots == geometry.experts);
+    let order = host_fill_order(
+        &initial,
+        geometry,
+        capacity.gpu0_layers,
+        peer_complete,
+        capacity.host_blocks,
+    );
+    ensure!(
+        order.len() == capacity.host_blocks as usize,
+        "host fill {} differs from host_blocks {}",
+        order.len(),
+        capacity.host_blocks
+    );
+    let mut host = vec![vec![false; experts]; layers];
+    for &(layer, expert) in &order {
+        ensure!(
+            !gpu[layer as usize][expert as usize],
+            "host fill pair ({layer},{expert}) is GPU resident"
+        );
+        host[layer as usize][expert as usize] = true;
+    }
+    let mut counts = vec![vec![0u32; experts]; layers];
+    for token in prefill {
+        ensure!(token.len() == width, "prefill token width {}", token.len());
+        for (index, &(layer, expert)) in token.iter().enumerate() {
+            let layer_i = layer as usize;
+            let expert_i = expert as usize;
+            ensure!(
+                layer_i == index / top_k && expert_i < experts,
+                "prefill route ({layer},{expert}) outside the token order"
+            );
+            counts[layer_i][expert_i] = counts[layer_i][expert_i]
+                .checked_add(1)
+                .context("prefill route count overflow")?;
+        }
+    }
+    let mut freq = host.clone();
+    for layer in 0..layers {
+        let kept = host[layer].iter().filter(|&&on| on).count();
+        let mut ranked: Vec<usize> = (0..experts).filter(|&expert| !gpu[layer][expert]).collect();
+        let row = &counts[layer];
+        ranked.sort_by(|&left, &right| row[right].cmp(&row[left]).then(left.cmp(&right)));
+        freq[layer].fill(false);
+        for expert in ranked.into_iter().take(kept) {
+            freq[layer][expert] = true;
+        }
+    }
+    let mut held_host = 0u64;
+    let mut id_host_hits = 0u64;
+    let mut gpu_hits = 0u64;
+    for token in decode {
+        ensure!(token.len() == width, "decode token width {}", token.len());
+        for (index, &(layer, expert)) in token.iter().enumerate() {
+            let layer_i = layer as usize;
+            let expert_i = expert as usize;
+            ensure!(
+                layer_i == index / top_k && expert_i < experts,
+                "decode route ({layer},{expert}) outside the token order"
+            );
+            if gpu[layer_i][expert_i] {
+                gpu_hits += 1;
+            } else if freq[layer_i][expert_i] {
+                held_host += 1;
+            }
+            if !gpu[layer_i][expert_i] && host[layer_i][expert_i] {
+                id_host_hits += 1;
+            }
+        }
+    }
+    let selections = decode.len() as u64 * width as u64;
+    let mut host_hits = 0u64;
+    let mut file_hits = 0u64;
+    let mut file_experts = 0u64;
+    let mut admissions = 0u64;
+    let mut layer_hits = vec![0u32; layers];
+    let mut ramp_host = [0u64; 8];
+    let mut ramp_file = [0u64; 8];
+    let mut ramp_admit = [0u64; 8];
+    let mut max_layer_admits = 0u32;
+    let mut converged = None;
+    for (step, token) in decode.iter().enumerate() {
+        let bucket = step / 8;
+        let mut misses = vec![Vec::new(); layers];
+        for &(layer, expert) in token {
+            let layer_i = layer as usize;
+            let expert_i = expert as usize;
+            if gpu[layer_i][expert_i] {
+                continue;
+            }
+            if host[layer_i][expert_i] {
+                host_hits += 1;
+                layer_hits[layer_i] += 1;
+                ramp_host[bucket] += 1;
+            } else {
+                file_hits += 1;
+                ramp_file[bucket] += 1;
+                if !misses[layer_i].contains(&expert_i) {
+                    misses[layer_i].push(expert_i);
+                }
+            }
+        }
+        for layer in 0..layers {
+            file_experts += misses[layer].len() as u64;
+            let row = &counts[layer];
+            misses[layer]
+                .sort_by(|&left, &right| row[right].cmp(&row[left]).then(left.cmp(&right)));
+            let mut layer_admits = 0u32;
+            for miss in misses[layer].iter().copied() {
+                let victim = (0..experts)
+                    .filter(|&expert| host[layer][expert])
+                    .min_by(|&left, &right| row[left].cmp(&row[right]).then(right.cmp(&left)));
+                let Some(victim) = victim else {
+                    break;
+                };
+                if !prefill_rank_beats(row, miss, victim) {
+                    break;
+                }
+                host[layer][victim] = false;
+                host[layer][miss] = true;
+                admissions += 1;
+                ramp_admit[bucket] += 1;
+                layer_admits += 1;
+            }
+            max_layer_admits = max_layer_admits.max(layer_admits);
+        }
+        if converged.is_none() && host == freq {
+            converged = Some(u32::try_from(step + 1).context("converged step exceeds u32")?);
+        }
+    }
+    for (layer, row) in host.iter().enumerate() {
+        let kept = row.iter().filter(|&&on| on).count();
+        let initial_kept = order
+            .iter()
+            .filter(|&&(host_layer, _)| host_layer as usize == layer)
+            .count();
+        ensure!(
+            kept == initial_kept,
+            "admit replay width drift layer={layer} kept={kept} initial={initial_kept}"
+        );
+    }
+    ensure!(
+        gpu_hits + host_hits + file_hits == selections
+            && ramp_host.iter().sum::<u64>() == host_hits
+            && ramp_file.iter().sum::<u64>() == file_hits
+            && ramp_admit.iter().sum::<u64>() == admissions
+            && admissions <= file_experts
+            && file_experts <= file_hits
+            && max_layer_admits <= geometry.top_k,
+        "admit replay partition gpu={gpu_hits} host={host_hits} file={file_hits} experts={file_experts} admissions={admissions}"
+    );
+    let slot_bytes = capacity.slot_bytes();
+    let steps = u64::try_from(decode.len())?;
+    Ok(AdmitReplay {
+        gpu_hits,
+        host_hits,
+        file_hits,
+        file_experts,
+        admissions,
+        copy_bytes: admissions
+            .checked_mul(slot_bytes)
+            .context("admit copy bytes")?,
+        file_bytes: file_hits
+            .checked_mul(slot_bytes)
+            .context("admit file bytes")?,
+        file_per_token: file_hits
+            .checked_mul(slot_bytes)
+            .context("admit file rate")?
+            / steps,
+        held_host,
+        held_file: selections - gpu_hits - held_host,
+        id_host: id_host_hits,
+        id_file: selections - gpu_hits - id_host_hits,
+        layer_host_min: layer_hits.iter().copied().min().unwrap_or(0),
+        layer_host_max: layer_hits.iter().copied().max().unwrap_or(0),
+        converged_step: converged,
+        ramp_host,
+        ramp_file,
+        ramp_admit,
+        max_layer_admits,
+    })
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+pub(crate) fn assert_frozen_admit(prompt: &str, replay: &AdmitReplay) -> Result<()> {
+    let frozen = match prompt {
+        "r2" => FrozenAdmit {
+            gpu: 0,
+            host: 10757,
+            file: 10747,
+            file_experts: 10747,
+            admissions: 2258,
+            copy_bytes: 56_838_303_744,
+            file_bytes: 270_523_140_096,
+            file_per_token: 4_226_924_064,
+            held_host: 10425,
+            held_file: 11079,
+            id_host: 2914,
+            id_file: 18590,
+            layer_host_min: 119,
+            layer_host_max: 329,
+            ramp_host: [1237, 1622, 1401, 1582, 1537, 1196, 969, 1213],
+            ramp_file: [1451, 1066, 1287, 1106, 1151, 1492, 1719, 1475],
+            ramp_admit: [1205, 364, 264, 109, 131, 105, 46, 34],
+        },
+        "domain2" => FrozenAdmit {
+            gpu: 494,
+            host: 11159,
+            file: 3707,
+            file_experts: 3707,
+            admissions: 2271,
+            copy_bytes: 42_696_253_440,
+            file_bytes: 69_693_972_480,
+            file_per_token: 1_088_968_320,
+            held_host: 11273,
+            held_file: 3593,
+            id_host: 2294,
+            id_file: 12572,
+            layer_host_min: 185,
+            layer_host_max: 331,
+            ramp_host: [1006, 1377, 1379, 1504, 1417, 1502, 1464, 1510],
+            ramp_file: [859, 481, 476, 363, 450, 354, 389, 335],
+            ramp_admit: [812, 389, 334, 213, 179, 129, 134, 81],
+        },
+        "f6" => FrozenAdmit {
+            gpu: 698,
+            host: 10293,
+            file: 4369,
+            file_experts: 4369,
+            admissions: 2430,
+            copy_bytes: 45_685_555_200,
+            file_bytes: 82_139_996_160,
+            file_per_token: 1_283_437_440,
+            held_host: 10814,
+            held_file: 3848,
+            id_host: 2125,
+            id_file: 12537,
+            layer_host_min: 187,
+            layer_host_max: 313,
+            ramp_host: [935, 1332, 1449, 1425, 1299, 1182, 1313, 1358],
+            ramp_file: [905, 509, 400, 427, 499, 656, 521, 452],
+            ramp_admit: [877, 422, 277, 243, 253, 170, 107, 81],
+        },
+        _ => anyhow::bail!("admit replay prompt {prompt}"),
+    };
+    ensure!(
+        replay.gpu_hits == frozen.gpu
+            && replay.host_hits == frozen.host
+            && replay.file_hits == frozen.file
+            && replay.file_experts == frozen.file_experts
+            && replay.admissions == frozen.admissions
+            && replay.copy_bytes == frozen.copy_bytes
+            && replay.file_bytes == frozen.file_bytes
+            && replay.file_per_token == frozen.file_per_token
+            && replay.held_host == frozen.held_host
+            && replay.held_file == frozen.held_file
+            && replay.id_host == frozen.id_host
+            && replay.id_file == frozen.id_file
+            && replay.layer_host_min == frozen.layer_host_min
+            && replay.layer_host_max == frozen.layer_host_max
+            && replay.converged_step.is_none()
+            && replay.ramp_host == frozen.ramp_host
+            && replay.ramp_file == frozen.ramp_file
+            && replay.ramp_admit == frozen.ramp_admit,
+        "admit replay {prompt} gpu={} host={} file={} experts={} admissions={} copy_bytes={} file_bytes={} file_per_token={} held_host={} held_file={} id_host={} id_file={} layer_host={}..{} converged={:?} ramp_host={:?} ramp_file={:?} ramp_admit={:?}",
+        replay.gpu_hits,
+        replay.host_hits,
+        replay.file_hits,
+        replay.file_experts,
+        replay.admissions,
+        replay.copy_bytes,
+        replay.file_bytes,
+        replay.file_per_token,
+        replay.held_host,
+        replay.held_file,
+        replay.id_host,
+        replay.id_file,
+        replay.layer_host_min,
+        replay.layer_host_max,
+        replay.converged_step,
+        replay.ramp_host,
+        replay.ramp_file,
+        replay.ramp_admit
+    );
+    Ok(())
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+struct FrozenAdmit {
+    gpu: u64,
+    host: u64,
+    file: u64,
+    file_experts: u64,
+    admissions: u64,
+    copy_bytes: u64,
+    file_bytes: u64,
+    file_per_token: u64,
+    held_host: u64,
+    held_file: u64,
+    id_host: u64,
+    id_file: u64,
+    layer_host_min: u32,
+    layer_host_max: u32,
+    ramp_host: [u64; 8],
+    ramp_file: [u64; 8],
+    ramp_admit: [u64; 8],
 }
 
 #[cfg(test)]
@@ -2384,6 +2963,191 @@ mod tests {
         println!(
             "PASS residency_complete_backing requests=2 tokens=4 borrow=2 d2h_bytes=0 spare_blocks=0 unique_union=true read_lease=true peer_swappable=true"
         );
+        Ok(())
+    }
+
+    fn replay_capacity(slots_per_layer: Vec<u32>, host_blocks: u32) -> Result<Capacity> {
+        let geometry = geometry();
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
+        ensure!(
+            slot.is_multiple_of(64),
+            "replay slot {slot} is not a multiple of 64"
+        );
+        Ok(Capacity {
+            layout,
+            span_rows: 1,
+            wave_rows: 1,
+            device_expert_bytes: 0,
+            peer_expert_bytes: 0,
+            host_expert_bytes: u64::from(host_blocks) * slot,
+            gpu0_layers: 0,
+            slots_per_layer,
+            host_blocks,
+            spare_blocks: 0,
+            disk_bytes: 0,
+            worker_count: 1,
+            disk_workers: 1,
+            prefill_staging_slots: 0,
+            pinned: false,
+        })
+    }
+
+    #[test]
+    fn admit_replay_stops_at_the_first_miss_that_loses() -> Result<()> {
+        let geometry = geometry();
+        let capacity = replay_capacity(vec![0, 0], 4)?;
+        let slot = capacity.slot_bytes();
+        let prefill = vec![
+            vec![(0, 4), (0, 5), (1, 0), (1, 1)],
+            vec![(0, 4), (0, 2), (1, 0), (1, 1)],
+            vec![(0, 5), (0, 2), (1, 0), (1, 1)],
+        ];
+        let decode = vec![
+            vec![(0, 4), (0, 5), (1, 0), (1, 1)],
+            vec![(0, 2), (0, 6), (1, 0), (1, 1)],
+        ];
+        let replay = replay_admit_on_miss(&geometry, &capacity, &prefill, &decode)?;
+        assert_eq!(replay.gpu_hits, 0);
+        assert_eq!(replay.host_hits, 4);
+        assert_eq!(replay.file_hits, 4);
+        assert_eq!(replay.admissions, 3);
+        assert_eq!(replay.max_layer_admits, 2);
+        assert_eq!(replay.copy_bytes, 3 * slot);
+        assert_eq!(replay.file_bytes, 4 * slot);
+        assert_eq!(replay.file_per_token, 2 * slot);
+        assert_eq!(replay.id_host, 4);
+        assert_eq!(replay.held_host, 6);
+        assert_eq!(replay.converged_step, Some(2));
+        assert_eq!(replay.layer_host_min, 0);
+        assert_eq!(replay.layer_host_max, 4);
+        let stopped = replay_admit_on_miss(
+            &geometry,
+            &capacity,
+            &[],
+            &[vec![(0, 6), (0, 7), (1, 0), (1, 1)]],
+        )?;
+        assert_eq!(stopped.admissions, 0);
+        assert_eq!(stopped.file_hits, 2);
+        assert_eq!(stopped.host_hits, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn admit_replay_does_not_evict_a_gpu_bank() -> Result<()> {
+        let geometry = geometry();
+        let capacity = replay_capacity(vec![2, 0], 2)?;
+        let prefill = vec![
+            vec![(0, 3), (0, 0), (1, 0), (1, 1)],
+            vec![(0, 3), (0, 0), (1, 0), (1, 1)],
+        ];
+        let decode = vec![vec![(0, 0), (0, 3), (1, 0), (1, 0)]];
+        let replay = replay_admit_on_miss(&geometry, &capacity, &prefill, &decode)?;
+        assert_eq!(replay.gpu_hits, 1);
+        assert_eq!(replay.file_hits, 1);
+        assert_eq!(replay.host_hits, 2);
+        assert_eq!(replay.admissions, 1);
+        assert_eq!(replay.max_layer_admits, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_admission_keeps_a_reserved_source() -> Result<()> {
+        let geometry = three_layers();
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
+        let (capacity, admission) =
+            crate::experts::plan::staging_capacity(geometry, layout, 1, 4 * slot, 12 * slot, 2)?;
+        assert_eq!(capacity.slots_per_layer, vec![2, 0, 0]);
+        assert_eq!(capacity.host_blocks, 4);
+        let host = HostBlocks::new(
+            capacity.host_blocks + capacity.spare_blocks,
+            usize::try_from(slot / 2)?,
+        )?;
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = vec![vec![1.0; 8]; 3];
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
+        let (mut residency, _) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: Some(&host),
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        residency.begin_request(&frequency)?;
+        residency.begin_token()?;
+        let disk = (0..8u32)
+            .find(|&expert| {
+                residency
+                    .ledger()
+                    .tier(1, expert)
+                    .is_ok_and(|tier| tier == Tier::Disk)
+            })
+            .context("layer 1 has no disk expert")?;
+        residency.dispatch(1, &[route(0, 0, disk)])?;
+        assert!(residency.plan_streamed_admits(1, &[])?.is_empty());
+        residency.freeze_prefill_rank()?;
+        assert!(residency.freeze_prefill_rank().is_err());
+        assert!(residency.plan_streamed_admits(0, &[]).is_err());
+        let mut reserved = Vec::new();
+        for expert in 0..8u32 {
+            if residency.ledger().tier(1, expert)? == Tier::Host {
+                reserved.push(residency.host_block(1, expert)?);
+            }
+        }
+        ensure!(reserved.len() == 1, "layer 1 host blocks {reserved:?}");
+        assert!(residency.plan_streamed_admits(1, &reserved)?.is_empty());
+        let rejected = residency
+            .plan_streamed_admits_ignoring_reserve(1, &reserved)
+            .unwrap_err()
+            .to_string();
+        let victim = (0..8u32)
+            .find(|&expert| residency.host_block(1, expert).ok() == Some(reserved[0]))
+            .context("reserved block has no host expert")?;
+        ensure!(
+            rejected.contains("reserved host source")
+                && rejected.contains(&format!("layer 1 expert {victim} block {}", reserved[0])),
+            "reserved-source error was {rejected}"
+        );
+        residency.set_host_admit(false);
+        assert!(residency.plan_streamed_admits(1, &[])?.is_empty());
+        residency.set_host_admit(true);
+        let planned = residency.plan_streamed_admits(1, &[])?;
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].expert, disk);
+        assert_eq!(planned[0].victim, victim);
+        assert_eq!(planned[0].block, reserved[0]);
+        let host_before = (0..8u32)
+            .filter(|&expert| {
+                residency
+                    .ledger()
+                    .tier(1, expert)
+                    .is_ok_and(|tier| tier == Tier::Host)
+            })
+            .count();
+        residency.commit_host_admit(planned[0])?;
+        assert_eq!(residency.admit_copies(), 1);
+        assert_eq!(residency.ledger().tier(1, disk)?, Tier::Host);
+        assert_eq!(residency.ledger().tier(1, victim)?, Tier::Disk);
+        assert_eq!(residency.host_block(1, disk)?, reserved[0]);
+        assert_eq!(residency.host_block(1, victim)?, NO_BLOCK);
+        let host_after = (0..8u32)
+            .filter(|&expert| {
+                residency
+                    .ledger()
+                    .tier(1, expert)
+                    .is_ok_and(|tier| tier == Tier::Host)
+            })
+            .count();
+        assert_eq!(host_before, host_after);
+        assert!(residency.finish_token()?.is_empty());
+        residency.end_request()?;
+        assert_eq!(residency.admit_copies(), 0);
+        assert!(residency.plan_streamed_admits(1, &[])?.is_empty());
         Ok(())
     }
 }

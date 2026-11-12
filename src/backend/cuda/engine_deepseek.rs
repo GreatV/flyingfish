@@ -12860,4 +12860,222 @@ mod tests {
         let _ = std::fs::remove_dir_all(&runtime_dir);
         Ok(())
     }
+
+    const ADMIT_PREFILL: usize = 536;
+    const ADMIT_STEPS: usize = 64;
+    const ADMIT_DOMAIN2_SHA: &str =
+        "a644644c43749c97f885e84c72e13fab789e047892cd7b8953d33bbd1285b79a";
+    const ADMIT_F6_SHA: &str = "415cef2b082e6799de008c505e282a8b253984330a244fa4e74e736377908eba";
+
+    fn admit_d1_tokens(path: &std::path::Path, sha: &str) -> Result<Vec<u32>> {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path)?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes)) == sha,
+            "Runner FAIL frozen token integrity"
+        );
+        let ids: Vec<u32> = serde_json::from_slice(&bytes)?;
+        ensure!(
+            ids.len() == ADMIT_PREFILL + ADMIT_STEPS && ids.iter().all(|&id| id < 129280),
+            "Runner FAIL census token shape len={}",
+            ids.len()
+        );
+        Ok(ids)
+    }
+
+    fn admit_d1_engine() -> Result<Engine> {
+        ensure!(
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model = PathBuf::from(std::env::var_os("F3_MODEL").context("F3_MODEL missing")?);
+        let settings = crate::backend::Settings {
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            device_budget_gib: None,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: Some(PathBuf::from(
+                std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?,
+            )),
+        };
+        crate::experts::plan::FORCED_WAVES.set(None);
+        crate::experts::plan::pin_host_blocks(Some(2279));
+        let loaded = Engine::load(&model, 0, 640, None, settings);
+        crate::experts::plan::pin_host_blocks(None);
+        let engine = loaded?;
+        let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&engine.model_spec)?;
+        let budget = engine
+            .moe_slots
+            .as_ref()
+            .context("native slots missing")?
+            .budget();
+        let resident = budget
+            .slots_per_layer
+            .iter()
+            .filter(|&&count| count > 0)
+            .count();
+        ensure!(
+            geometry.layers == 40
+                && geometry.experts == 384
+                && geometry.top_k == 6
+                && engine.config.num_hidden_layers == 40
+                && engine.config.vocab_size == 129280
+                && engine.deepseek_ffn.as_ref().is_some_and(|ffn| ffn.tiered)
+                && budget.host_blocks == 2279
+                && budget.slots_total() == 624
+                && resident == 13
+                && budget.prefill_staging_slots == 48
+                && !budget.pinned
+                && budget.slot_bytes() == 18_800_640,
+            "Runner FAIL live budget host_blocks={} gpu_slots={} resident={resident} pool={} pinned={} slot_bytes={}",
+            budget.host_blocks,
+            budget.slots_total(),
+            budget.prefill_staging_slots,
+            budget.pinned,
+            budget.slot_bytes()
+        );
+        Ok(engine)
+    }
+
+    fn admit_logit_bits(engine: &Engine) -> Result<Vec<u32>> {
+        let row = engine.decode_logits()?;
+        ensure!(
+            row.iter().all(|value| value.is_finite()),
+            "Runner FAIL non-finite logits"
+        );
+        Ok(row.into_iter().map(f32::to_bits).collect())
+    }
+
+    fn admit_same_bits(step: usize, left: &[u32], right: &[u32]) -> Result<()> {
+        let mismatch = left
+            .iter()
+            .zip(right)
+            .position(|(left, right)| left != right);
+        ensure!(
+            left.len() == right.len() && mismatch.is_none(),
+            "DEFECT admit logits differ at step {step} len {}/{} index {mismatch:?}",
+            left.len(),
+            right.len()
+        );
+        Ok(())
+    }
+
+    fn admit_d1_prompt(engine: &mut Engine, tokens: &[u32], prompt: &str) -> Result<()> {
+        let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&engine.model_spec)?;
+        let budget = engine
+            .moe_slots
+            .as_ref()
+            .context("native slots missing")?
+            .budget()
+            .clone();
+        engine.reset()?;
+        engine
+            .moe_slots
+            .as_mut()
+            .context("native slots missing")?
+            .set_host_admit(false);
+        engine.prefill(&tokens[..ADMIT_PREFILL], None)?;
+        let mut off = Vec::with_capacity(ADMIT_STEPS + 1);
+        off.push(admit_logit_bits(engine)?);
+        for step in 0..ADMIT_STEPS {
+            engine.set_token(tokens[ADMIT_PREFILL + step])?;
+            engine.decode(false, None)?;
+            off.push(admit_logit_bits(engine)?);
+            if (step + 1).is_multiple_of(16) {
+                println!("ADMIT_ON_MISS prompt={prompt} phase=off step={}", step + 1);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+        ensure!(
+            engine
+                .moe_slots
+                .as_ref()
+                .context("native slots missing")?
+                .admit_copies()
+                == 0,
+            "DEFECT host admission ran with the test switch off"
+        );
+        engine.reset()?;
+        {
+            let slots = engine.moe_slots.as_mut().context("native slots missing")?;
+            slots.set_host_admit(true);
+            slots.arm_route_tape();
+        }
+        engine.prefill(&tokens[..ADMIT_PREFILL], None)?;
+        admit_same_bits(0, &off[0], &admit_logit_bits(engine)?)?;
+        for step in 0..ADMIT_STEPS {
+            engine.set_token(tokens[ADMIT_PREFILL + step])?;
+            engine.decode(false, None)?;
+            admit_same_bits(step + 1, &off[step + 1], &admit_logit_bits(engine)?)?;
+            if (step + 1).is_multiple_of(16) {
+                println!("ADMIT_ON_MISS prompt={prompt} phase=on step={}", step + 1);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+        }
+        let tape = engine
+            .moe_slots
+            .as_mut()
+            .context("native slots missing")?
+            .take_route_tape();
+        let grouped = super::super::moe::group_route_stamps(
+            &tape,
+            geometry.layers,
+            geometry.experts,
+            geometry.top_k,
+        )?;
+        ensure!(
+            grouped.len() == ADMIT_PREFILL + ADMIT_STEPS,
+            "Runner FAIL route tape tokens {}",
+            grouped.len()
+        );
+        let replay = crate::experts::runtime::replay_admit_on_miss(
+            &geometry,
+            &budget,
+            &grouped[..ADMIT_PREFILL],
+            &grouped[ADMIT_PREFILL..],
+        )?;
+        crate::experts::runtime::assert_frozen_admit(prompt, &replay)?;
+        let copies = engine
+            .moe_slots
+            .as_ref()
+            .context("native slots missing")?
+            .admit_copies();
+        ensure!(copies > 0, "DEFECT streamed admission copied nothing");
+        println!(
+            "PASS ADMIT_ON_MISS prompt={prompt} gpu={} host={} file={} admissions={} copy_bytes={} file_bytes={} file_per_token={} max_layer_admits={} live_copies={copies}",
+            replay.gpu_hits,
+            replay.host_hits,
+            replay.file_hits,
+            replay.admissions,
+            replay.copy_bytes,
+            replay.file_bytes,
+            replay.file_per_token,
+            replay.max_layer_admits,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "official DeepSeek weights; FF_DS41_GPU_WINDOW=granted, F3_MODEL, FLYINGFISH_RUNTIME_DIR, D1_CENSUS_DOMAIN2, D1_CENSUS_F6"]
+    fn deepseek_admit_on_miss_gpu() -> Result<()> {
+        let domain2 = admit_d1_tokens(
+            &PathBuf::from(
+                std::env::var_os("D1_CENSUS_DOMAIN2").context("domain2 tokens missing")?,
+            ),
+            ADMIT_DOMAIN2_SHA,
+        )?;
+        let f6 = admit_d1_tokens(
+            &PathBuf::from(std::env::var_os("D1_CENSUS_F6").context("f6 tokens missing")?),
+            ADMIT_F6_SHA,
+        )?;
+        for (prompt, tokens) in [("domain2", &domain2), ("f6", &f6)] {
+            let mut engine = admit_d1_engine()?;
+            admit_d1_prompt(&mut engine, tokens, prompt)?;
+        }
+        println!("PASS ADMIT_ON_MISS model=deepseek prompts=2 host_blocks=2279 gpu_slots=624");
+        Ok(())
+    }
 }
