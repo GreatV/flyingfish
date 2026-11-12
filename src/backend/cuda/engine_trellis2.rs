@@ -1117,7 +1117,12 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(a.len() == b.len() && !a.is_empty(), "cell extent mismatch");
+            ensure!(
+                a.len() == b.len() && !a.is_empty(),
+                "cell extent mismatch: {} vs {}",
+                a.len(),
+                b.len()
+            );
             let mut maximum = 0.0f64;
             let mut square = 0.0f64;
             for (x, y) in a.iter().zip(b) {
@@ -1342,7 +1347,12 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(a.len() == b.len() && !a.is_empty(), "cell extent mismatch");
+            ensure!(
+                a.len() == b.len() && !a.is_empty(),
+                "cell extent mismatch: {} vs {}",
+                a.len(),
+                b.len()
+            );
             let mut maximum = 0.0f64;
             let mut square = 0.0f64;
             for (x, y) in a.iter().zip(b) {
@@ -1517,7 +1527,12 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(a.len() == b.len() && !a.is_empty(), "cell extent mismatch");
+            ensure!(
+                a.len() == b.len() && !a.is_empty(),
+                "cell extent mismatch: {} vs {}",
+                a.len(),
+                b.len()
+            );
             let mut maximum = 0.0f64;
             let mut square = 0.0f64;
             for (x, y) in a.iter().zip(b) {
