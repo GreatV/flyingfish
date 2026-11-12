@@ -11,6 +11,10 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
+
+/// Pinned f32 GEMM algorithm for the lane stack; AlgoChecked at 14/28/42/56 rows.
+const LANE_GEMM_ALGO: cublas_sys::cublasGemmAlgo_t =
+    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_ALGO0;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{path::Path, sync::Arc};
@@ -105,6 +109,7 @@ pub(crate) struct Ops {
     pub(crate) bias: CudaFunction,
     layer_norm: CudaFunction,
     pub(crate) argmax: CudaFunction,
+    row_scale: CudaFunction,
 }
 
 pub struct ParakeetEncoder {
@@ -300,10 +305,14 @@ struct AttentionLaunch<'a> {
     output: &'a CudaSlice<f32>,
     rows: u32,
     key_rows: u32,
-    query_offset: u32,
-    kv_offset: u32,
+    query_offset: i64,
+    kv_offset: i64,
     right_chunks: u32,
     valid_keys: u32,
+    /// Speaker lanes: q/k/v/relative/output carry `lanes` planes; the mask is shared.
+    lanes: u32,
+    /// Sliding left window in rows (0 = chunk-aligned left_chunks semantics).
+    left_slide: u32,
 }
 
 #[cfg(test)]
@@ -329,8 +338,8 @@ struct ChunkCaches {
 
 struct StreamWindow {
     key_rows: u32,
-    query_offset: u32,
-    kv_offset: u32,
+    query_offset: i64,
+    kv_offset: i64,
     cached: u32,
     #[cfg(test)]
     omit: StreamOmit,
@@ -397,8 +406,8 @@ fn stream_window(
     table_index(key_rows)?;
     Ok(StreamWindow {
         key_rows,
-        query_offset: cumulative_before,
-        kv_offset,
+        query_offset: i64::from(cumulative_before),
+        kv_offset: i64::from(kv_offset),
         cached,
         #[cfg(test)]
         omit,
@@ -408,11 +417,14 @@ fn stream_window(
 fn attend_span(window: &StreamWindow, query_rows: u32) -> (u32, u32) {
     #[cfg(test)]
     if window.omit == StreamOmit::Keys {
-        return (query_rows, window.query_offset);
+        return (query_rows, u32::try_from(window.query_offset).unwrap_or(0));
     }
     #[cfg(not(test))]
     let _ = query_rows;
-    (window.key_rows, window.kv_offset)
+    (
+        window.key_rows,
+        u32::try_from(window.kv_offset).unwrap_or(0),
+    )
 }
 
 fn copy_cached_keys(window: &StreamWindow) -> bool {
@@ -526,6 +538,13 @@ impl ParakeetEncoder {
         Self::load_conformer_checkpoint(checkpoint, device, &spec.conformer())
     }
 
+    /// Loads the multitalker encoder from the stored-ZIP member of a `.nemo` tar archive.
+    pub fn load_multitalker(nemo: &Path, device: &Device) -> Result<Self> {
+        let spec = crate::multitalker::MultitalkerSpec::read(nemo)?;
+        let checkpoint = MappedCheckpoint::open_nemo(nemo)?;
+        Self::load_conformer_checkpoint(checkpoint, device, &spec.conformer())
+    }
+
     fn load_conformer_checkpoint(
         checkpoint: MappedCheckpoint,
         device: &Device,
@@ -558,6 +577,7 @@ impl ParakeetEncoder {
             bias: vision.load_function("vision_bias_f32")?,
             layer_norm: common.load_function("q38_layer_norm_f32")?,
             argmax: sample.load_function("argmax_f32")?,
+            row_scale: speech.load_function("speech_row_scale_f32")?,
         };
         let mut subsample_conv = Vec::new();
         for name in conformer.conv_names {
@@ -783,12 +803,88 @@ impl ParakeetEncoder {
         Ok(output)
     }
 
+    pub(crate) fn lane_linear(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        canonical: u32,
+        weight: &Linear,
+    ) -> Result<CudaSlice<f32>> {
+        let mut output = self
+            .stream
+            .alloc_zeros(rows as usize * weight.output as usize)?;
+        self.lane_linear_into(input, rows, canonical, weight, &mut output)?;
+        Ok(output)
+    }
+
     pub(crate) fn linear_into(
         &self,
         input: &CudaSlice<f32>,
         rows: u32,
         weight: &Linear,
         output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        self.linear_into_algo(
+            input,
+            rows,
+            weight,
+            output,
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    }
+
+    /// Row-invariant GEMM for the multitalker lane stack: every lane count
+    /// runs the identical GEMM shape — rows below the 4-lane canonical count
+    /// are zero-padded to it — so a lane's rows are bitwise-identical whether
+    /// it runs alone or stacked. The pad is performance-neutral: these GEMMs
+    /// are weight-traffic-bound at every lane count.
+    pub(crate) fn lane_linear_into(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        canonical: u32,
+        weight: &Linear,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && canonical >= rows && canonical.is_multiple_of(4),
+            "lane GEMM rows {rows} vs canonical {canonical}"
+        );
+        if canonical == rows {
+            self.linear_into_algo(input, rows, weight, output, LANE_GEMM_ALGO)?;
+            return Ok(());
+        }
+        let mut padded_in = self
+            .stream
+            .alloc_zeros(canonical as usize * weight.input as usize)?;
+        self.copy_device(input, 0, &mut padded_in, 0, input.len())?;
+        let mut padded_out = self
+            .stream
+            .alloc_zeros(canonical as usize * weight.output as usize)?;
+        self.linear_into_algo(
+            &padded_in,
+            canonical,
+            weight,
+            &mut padded_out,
+            LANE_GEMM_ALGO,
+        )?;
+        self.copy_device(
+            &padded_out,
+            0,
+            output,
+            0,
+            rows as usize * weight.output as usize,
+        )?;
+        Ok(())
+    }
+
+    fn linear_into_algo(
+        &self,
+        input: &CudaSlice<f32>,
+        rows: u32,
+        weight: &Linear,
+        output: &mut CudaSlice<f32>,
+        algo: cublas_sys::cublasGemmAlgo_t,
     ) -> Result<()> {
         ensure!(rows > 0, "linear requires rows");
         ensure!(
@@ -818,7 +914,7 @@ impl ParakeetEncoder {
                 cublas_sys::cudaDataType_t::CUDA_R_32F,
                 weight.output as i32,
                 cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                algo,
             )
             .result()?;
         }
@@ -949,6 +1045,18 @@ impl ParakeetEncoder {
         Ok(())
     }
 
+    /// Host-side row count of the pre-encode for a `[frames, 128]` window: the
+    /// three conv stages' time shrink, mirroring `subsample_device`.
+    pub(crate) fn multitalker_subsample_rows(&self, frames: usize) -> Result<usize> {
+        let left = self.conformer.pad_left;
+        let right = self.conformer.pad_right;
+        conv_out(
+            conv_out(conv_out(frames, left, right)?, left, right)?,
+            left,
+            right,
+        )
+    }
+
     fn subsample_device(&self, input: &[f32], valid: usize) -> Result<SubsampleOutput> {
         ensure!(
             valid > 0
@@ -985,6 +1093,7 @@ impl ParakeetEncoder {
                     .arg(&u32::try_from(next_valid)?)
                     .arg(&pad_left)
                     .arg(&pad_right)
+                    .arg(&1u32)
                     .launch(flat(output.len()))?;
             }
             note_launch!();
@@ -1111,6 +1220,8 @@ impl ParakeetEncoder {
             kv_offset: 0,
             right_chunks,
             valid_keys: rows,
+            lanes: 1,
+            left_slide: 0,
         })?;
         let delta = self.linear(&core, rows, &block.attention.o)?;
         self.residual(&mut hidden, &delta, 1.0)?;
@@ -1129,6 +1240,7 @@ impl ParakeetEncoder {
                 .arg(&self.conformer.hidden)
                 .arg(&self.conformer.conv_kernel)
                 .arg(&self.conformer.depthwise_left)
+                .arg(&1u32)
                 .launch(flat(convolved.len()))?;
         }
         note_launch!();
@@ -1258,21 +1370,23 @@ impl ParakeetEncoder {
         let hidden = self.conformer.hidden as usize;
         let rows = launch.rows as usize;
         let key_rows = launch.key_rows as usize;
+        let lanes = launch.lanes as usize;
         self.check_right(launch.right_chunks)?;
         ensure!(
-            key_rows >= rows
-                && launch.k.len() == key_rows * hidden
-                && launch.v.len() == key_rows * hidden
-                && launch.q.len() == rows * hidden
-                && launch.output.len() == rows * hidden
-                && launch.relative.len() >= (rows + key_rows - 1) * hidden
+            lanes >= 1
+                && key_rows >= rows
+                && launch.k.len() == lanes * key_rows * hidden
+                && launch.v.len() == lanes * key_rows * hidden
+                && launch.q.len() == lanes * rows * hidden
+                && launch.output.len() == lanes * rows * hidden
+                && launch.relative.len() >= lanes * (rows + key_rows - 1) * hidden
                 && launch.mask.len() >= key_rows
                 && launch.valid_keys <= key_rows as u32
                 && (self.conformer.chunk_size != 0
                     || (launch.query_offset == 0
                         && launch.kv_offset == 0
                         && launch.key_rows == launch.rows)),
-            "attention launch shape rows={rows} key_rows={key_rows}"
+            "attention launch shape rows={rows} key_rows={key_rows} lanes={lanes}"
         );
         unsafe {
             self.stream
@@ -1299,8 +1413,10 @@ impl ParakeetEncoder {
                 .arg(&launch.query_offset)
                 .arg(&launch.kv_offset)
                 .arg(&launch.valid_keys)
+                .arg(&launch.lanes)
+                .arg(&launch.left_slide)
                 .launch(LaunchConfig {
-                    grid_dim: (launch.rows, self.conformer.heads, 1),
+                    grid_dim: (launch.rows, self.conformer.heads, launch.lanes),
                     block_dim: (128, 1, 1),
                     shared_mem_bytes: (8 + launch.key_rows) * 4,
                 })?;
@@ -1661,6 +1777,7 @@ impl ParakeetEncoder {
                     .arg(&next_time_u)
                     .arg(&0u32)
                     .arg(&0u32)
+                    .arg(&1u32)
                     .launch(flat(output.len()))?;
             }
             note_launch!();
@@ -1777,9 +1894,11 @@ impl ParakeetEncoder {
             rows,
             key_rows: attend_rows,
             query_offset: window.query_offset,
-            kv_offset: attend_offset,
+            kv_offset: i64::from(attend_offset),
             right_chunks: 0,
             valid_keys: attend_rows,
+            lanes: 1,
+            left_slide: 0,
         })?;
         let delta = self.linear(&core, rows, &block.attention.o)?;
         self.residual(&mut hidden, &delta, 1.0)?;
@@ -1828,6 +1947,7 @@ impl ParakeetEncoder {
                 &session.mask,
                 &convolved,
                 launch_rows,
+                1,
             )?;
         } else {
             self.launch_depthwise(
@@ -1836,6 +1956,7 @@ impl ParakeetEncoder {
                 &session.mask,
                 &convolved,
                 launch_rows,
+                1,
             )?;
         }
         // Rows 8..11 are the 4 kernel-9 outputs of the 12-frame cache concatenation. Rows 0..7 are discarded.
@@ -1897,9 +2018,10 @@ impl ParakeetEncoder {
         mask: &CudaSlice<u8>,
         output: &CudaSlice<f32>,
         rows: u32,
+        lanes: u32,
     ) -> Result<()> {
         ensure!(
-            input.len() == rows as usize * self.conformer.hidden as usize
+            input.len() == lanes as usize * rows as usize * self.conformer.hidden as usize
                 && output.len() == input.len()
                 && mask.len() >= rows as usize,
             "depthwise launch shape"
@@ -1915,6 +2037,7 @@ impl ParakeetEncoder {
                 .arg(&self.conformer.hidden)
                 .arg(&self.conformer.conv_kernel)
                 .arg(&self.conformer.depthwise_left)
+                .arg(&lanes)
                 .launch(flat(output.len()))?;
         }
         note_launch!();
@@ -2669,6 +2792,8 @@ impl ParakeetEncoder {
             kv_offset: 0,
             right_chunks: 1,
             valid_keys,
+            lanes: 1,
+            left_slide: 0,
         })?;
         let mut core: CudaSlice<f32> = self.stream.alloc_zeros(rows as usize * width)?;
         self.copy_device(
@@ -2700,6 +2825,7 @@ impl ParakeetEncoder {
                 &session.mask,
                 &convolved,
                 launch_rows,
+                1,
             )?;
         } else {
             self.launch_depthwise(
@@ -2708,6 +2834,7 @@ impl ParakeetEncoder {
                 &session.mask,
                 &convolved,
                 launch_rows,
+                1,
             )?;
         }
         let kept = if launch_rows == 8 + rows {
@@ -2830,8 +2957,767 @@ impl ParakeetEncoder {
         session.cache_len = 0;
         Ok(())
     }
+
+    /// Multitalker cache-aware streaming session: one step per published buffer
+    /// chunk (105 mel frames first, then 9 pre-encode cache frames + 112 new),
+    /// a variable number of rows per step on absolute chunk-14 boundaries, all
+    /// active speaker lanes stacked as rows of the same launches. Attention and
+    /// depthwise caches are lane-major `[lanes, rows, hidden]`.
+    pub fn multitalker_stream(&self, lanes: u32) -> Result<MultitalkerStream> {
+        let conformer = &self.conformer;
+        ensure!(
+            conformer.chunk_size == 14
+                && conformer.left_chunks == 5
+                && conformer.layers == 24
+                && conformer.hidden == 1024
+                && conformer.heads == 8
+                && conformer.conv_kernel == 9
+                && conformer.depthwise_left == 8
+                && !conformer.conv_batch_norm
+                && !conformer.convolution_bias
+                && self.blocks.len() == 24
+                && (1..=4).contains(&lanes),
+            "multitalker streaming session requires the published encoder and 1..=4 lanes"
+        );
+        let width = conformer.hidden as usize;
+        let mut keys = Vec::with_capacity(24);
+        let mut values = Vec::with_capacity(24);
+        let mut depthwise = Vec::with_capacity(24);
+        for _ in 0..24 {
+            keys.push(self.stream.alloc_zeros(0)?);
+            values.push(self.stream.alloc_zeros(0)?);
+            depthwise.push(self.stream.alloc_zeros(lanes as usize * 8 * width)?);
+        }
+        Ok(MultitalkerStream {
+            keys,
+            values,
+            depthwise,
+            mask: self.stream.clone_htod(&vec![1u8; 112])?,
+            lanes,
+            cumulative: 0,
+            steps: 0,
+            #[cfg(test)]
+            trace: Vec::new(),
+            #[cfg(test)]
+            block_trace: Vec::new(),
+        })
+    }
+
+    /// One multitalker streaming step. `windows` holds the per-lane mel chunk
+    /// `[frames, 128]` (masked mode: lane-masked features; kernel mode: the raw
+    /// window for every lane). `masks.spk` holds the step's `[lanes, 14]` diar
+    /// frames, end-aligned to the rows with a 1.0 left pad exactly as
+    /// solve_length_mismatch does; `masks.bg` arrives at `[lanes, rows]`,
+    /// sliced from the step start exactly as the reference captures it.
+    /// Returns the step's per-lane valid rows and the layer-0 cells for the gate.
+    pub(crate) fn multitalker_encode_step(
+        &self,
+        session: &mut MultitalkerStream,
+        windows: &[Vec<f32>],
+        masks: &MultitalkerMasks<'_>,
+        kernels: &MultitalkerKernels<'_>,
+        keep_all: bool,
+    ) -> Result<MultitalkerStep> {
+        let width = self.conformer.hidden as usize;
+        let lanes = session.lanes as usize;
+        ensure!(
+            windows.len() == lanes
+                && masks.spk.len() == lanes * 14
+                && windows.iter().all(|window| {
+                    window.len().is_multiple_of(128) && window.iter().all(|value| value.is_finite())
+                }),
+            "multitalker streaming step inputs"
+        );
+        let frames = windows[0].len() / 128;
+        ensure!(
+            windows.iter().all(|window| window.len() == frames * 128),
+            "multitalker streaming lanes disagree on chunk length"
+        );
+        let mut subsampled = Vec::with_capacity(lanes);
+        for window in windows {
+            let output = self.subsample_device(window, frames)?;
+            subsampled.push(output);
+        }
+        let rows = subsampled[0].hidden.len() / width;
+        ensure!(
+            rows >= 1
+                && subsampled
+                    .iter()
+                    .all(|output| output.hidden.len() == rows * width),
+            "multitalker streaming pre-encode rows"
+        );
+        let mut hidden = self.stream.alloc_zeros(lanes * rows * width)?;
+        for (lane, output) in subsampled.iter().enumerate() {
+            self.copy_device(
+                &output.hidden,
+                0,
+                &mut hidden,
+                lane * rows * width,
+                rows * width,
+            )?;
+        }
+        let layer0_in = self.stream.clone_dtoh(&hidden)?;
+        let spk_rows = Self::align_masks(masks.spk, lanes, rows, 1.0);
+        ensure!(
+            masks.bg.len() == lanes * rows,
+            "multitalker bg mask rows {} vs step rows {rows}",
+            masks.bg.len() / lanes.max(1)
+        );
+        let bg_rows = masks.bg.to_vec();
+        self.multitalker_speaker_ff(
+            &mut hidden,
+            (lanes * rows) as u32,
+            (4 * rows) as u32,
+            &spk_rows,
+            &bg_rows,
+            kernels,
+        )?;
+        let layer0_post = self.stream.clone_dtoh(&hidden)?;
+
+        // One attention call per outer step over all its rows (the reference's
+        // captured form: N queries over [cache | new N]); the sliding window
+        // and within-chunk right edge live in the kernel's left_slide/chunk
+        // arithmetic. Mid-stream steps emit their first 14 rows; the final
+        // step emits them all.
+        let mut span = self.multitalker_span(session.cumulative, rows as u32)?;
+        span.right_chunks = u32::from(keep_all);
+        let table = relative_positions(span.key_rows as usize, width)?;
+        let table_dev = self.stream.clone_htod(&table)?;
+        let mut step = hidden;
+        let mut caches = Vec::with_capacity(self.blocks.len());
+        #[cfg(test)]
+        let mut traced: Vec<Vec<f32>> = Vec::with_capacity(self.blocks.len() + 1);
+        #[cfg(test)]
+        traced.push(self.stream.clone_dtoh(&step)?);
+        for index in 0..self.blocks.len() {
+            let (next, cache) =
+                self.multitalker_layer_step(index, &step, session, &table_dev, &span)?;
+            step = next;
+            #[cfg(test)]
+            traced.push(self.stream.clone_dtoh(&step)?);
+            caches.push(cache);
+        }
+        #[cfg(test)]
+        {
+            session.trace = traced;
+        }
+        for (index, cache) in caches.into_iter().enumerate() {
+            session.keys[index] = cache.key;
+            session.values[index] = cache.value;
+            session.depthwise[index] = cache.depthwise;
+        }
+        session.cumulative += rows as u32;
+        let out_rows = if keep_all { rows } else { rows.min(14) };
+        let mut output = self.stream.alloc_zeros(lanes * out_rows * width)?;
+        for lane in 0..lanes {
+            self.copy_device(
+                &step,
+                lane * rows * width,
+                &mut output,
+                lane * out_rows * width,
+                out_rows * width,
+            )?;
+        }
+        let rows_out = self.stream.clone_dtoh(&output)?;
+        session.steps += 1;
+        Ok(MultitalkerStep {
+            rows: rows_out,
+            layer0_in,
+            layer0_post,
+        })
+    }
+
+    /// Diar masks cover the chunk's last rows: steps with more rows than the 14
+    /// diar frames left-pad with the mask default (1.0 spk / 0.0 bg); shorter
+    /// final steps keep the last rows of the mask, as solve_length_mismatch does.
+    fn align_masks(masks: &[f32], lanes: usize, rows: usize, default: f32) -> Vec<f32> {
+        let mut aligned = vec![default; lanes * rows];
+        let covered = rows.min(14);
+        for lane in 0..lanes {
+            for row in 0..covered {
+                aligned[lane * rows + rows - covered + row] = masks[lane * 14 + 14 - covered + row];
+            }
+        }
+        aligned
+    }
+
+    /// Key span for a step's queries on absolute chunk-14 boundaries: five left
+    /// chunks plus every chunk the new rows touch (a step may straddle two).
+    fn multitalker_span(&self, cumulative: u32, rows: u32) -> Result<MultitalkerWindow> {
+        ensure!(rows >= 1, "multitalker step rows");
+        // att_left is a sliding 70-row left context (the reference's fixed
+        // 70-slot cache); the layout covers the 70 rows before the chunk.
+        // A cold start carries zero-filled slots before absolute row zero.
+        let first_chunk = cumulative / 14;
+        let begin = i64::from(first_chunk) * 14 - 70;
+        let zeros = begin.min(0).unsigned_abs() as u32;
+        let kv_offset = begin;
+        let span_cache = cumulative - begin.max(0) as u32;
+        let key_rows = zeros + span_cache + rows;
+        ensure!(
+            key_rows >= rows && key_rows <= 98,
+            "multitalker key span {key_rows}"
+        );
+        Ok(MultitalkerWindow {
+            key_rows,
+            kv_offset,
+            zeros,
+            query_offset: i64::from(cumulative),
+            rows,
+            right_chunks: 0,
+            left_slide: 70,
+        })
+    }
+
+    /// The layer-0 speaker kernels: x += ff(x * spk); x += ff(x * bg).
+    fn multitalker_speaker_ff(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        rows: u32,
+        canonical: u32,
+        spk: &[f32],
+        bg: &[f32],
+        kernels: &MultitalkerKernels<'_>,
+    ) -> Result<()> {
+        let width = self.conformer.hidden;
+        let apply = |hidden: &mut CudaSlice<f32>,
+                     masks: &[f32],
+                     up: &Linear,
+                     down: &Linear|
+         -> Result<()> {
+            let masks_dev = self.stream.clone_htod(masks)?;
+            let scaled = self.stream.alloc_zeros(hidden.len())?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.ops.row_scale)
+                    .arg(&*hidden)
+                    .arg(&masks_dev)
+                    .arg(&scaled)
+                    .arg(&(hidden.len() as u64))
+                    .arg(&width)
+                    .launch(flat(hidden.len()))?;
+            }
+            let expanded = self.lane_linear(&scaled, rows, canonical, up)?;
+            let activated = self.activate(&expanded, rows, width, 0)?;
+            let delta = self.lane_linear(&activated, rows, canonical, down)?;
+            self.residual(hidden, &delta, 1.0)
+        };
+        apply(hidden, spk, kernels.speaker_up, kernels.speaker_down)?;
+        apply(hidden, bg, kernels.background_up, kernels.background_down)?;
+        Ok(())
+    }
+
+    fn multitalker_layer_step(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        session: &mut MultitalkerStream,
+        table_dev: &CudaSlice<f32>,
+        span: &MultitalkerWindow,
+    ) -> Result<(CudaSlice<f32>, MultitalkerLayerStep)> {
+        let rows = span.rows;
+        let block = self
+            .blocks
+            .get(index)
+            .context("encoder layer outside range")?;
+        let width = self.conformer.hidden as usize;
+        let lanes = session.lanes as usize;
+        let rows_us = span.rows as usize;
+        let stacked = (lanes * rows_us) as u32;
+        let canonical = (4 * rows_us) as u32;
+        let table_rows = 2 * span.key_rows - 1;
+        // The kernel consumes the layer's linear_pos-projected table.
+        let projected = self.linear(table_dev, table_rows, &block.attention.relative)?;
+        let mut relative = self
+            .stream
+            .alloc_zeros(lanes * table_rows as usize * width)?;
+        for lane in 0..lanes {
+            self.copy_device(
+                &projected,
+                0,
+                &mut relative,
+                lane * table_rows as usize * width,
+                table_rows as usize * width,
+            )?;
+        }
+        ensure!(
+            input.len() == lanes * rows_us * width,
+            "multitalker layer input"
+        );
+        let feed_forward =
+            |hidden: &mut CudaSlice<f32>, ff: &FeedForward, scale: f32| -> Result<()> {
+                let normalized = self.normalize(hidden, stacked, &ff.norm)?;
+                let expanded = self.lane_linear(&normalized, stacked, canonical, &ff.up)?;
+                let activated = self.activate(&expanded, stacked, width as u32 * 4, 1)?;
+                let delta = self.lane_linear(&activated, stacked, canonical, &ff.down)?;
+                self.residual(hidden, &delta, scale)
+            };
+        let mut hidden = input.try_clone()?;
+        feed_forward(&mut hidden, &block.ff1, 0.5)?;
+        #[cfg(test)]
+        session.block_trace.push(self.stream.clone_dtoh(&hidden)?);
+        let normalized = self.normalize(&hidden, stacked, &block.attention_norm)?;
+        let q = self.lane_linear(&normalized, stacked, canonical, &block.attention.q)?;
+        let k = self.lane_linear(&normalized, stacked, canonical, &block.attention.k)?;
+        let v = self.lane_linear(&normalized, stacked, canonical, &block.attention.v)?;
+        let key_rows = span.key_rows as usize;
+        let cached = session.cumulative.min(98) as usize;
+        // The span covers whole chunks, including rows that do not exist yet;
+        // attention is bounded by the real row count.
+        let span_cache = session
+            .cumulative
+            .saturating_sub(span.kv_offset.max(0) as u32) as usize;
+        let zeros = span.zeros as usize;
+        ensure!(
+            zeros + span_cache + rows_us == key_rows,
+            "multitalker layout zeros {zeros} cache {span_cache} rows {rows_us} keys {key_rows}"
+        );
+        ensure!(
+            span_cache <= cached
+                && session.keys[index].len() == lanes * cached * width
+                && session.values[index].len() == lanes * cached * width,
+            "multitalker layer {index} cache length cached={cached} span_cache={span_cache}"
+        );
+        let mut cat_k = self.stream.alloc_zeros(lanes * key_rows * width)?;
+        let mut cat_v = self.stream.alloc_zeros(lanes * key_rows * width)?;
+        for lane in 0..lanes {
+            let cache_start = (lane * cached + cached - span_cache) * width;
+            let lane_k = lane * key_rows * width;
+            self.copy_device(
+                &session.keys[index],
+                cache_start,
+                &mut cat_k,
+                lane_k + zeros * width,
+                span_cache * width,
+            )?;
+            self.copy_device(
+                &session.values[index],
+                cache_start,
+                &mut cat_v,
+                lane_k + zeros * width,
+                span_cache * width,
+            )?;
+            self.copy_device(
+                &k,
+                lane * rows_us * width,
+                &mut cat_k,
+                lane_k + (zeros + span_cache) * width,
+                rows_us * width,
+            )?;
+            self.copy_device(
+                &v,
+                lane * rows_us * width,
+                &mut cat_v,
+                lane_k + (zeros + span_cache) * width,
+                rows_us * width,
+            )?;
+        }
+        let core = self.stream.alloc_zeros(hidden.len())?;
+
+        self.attend(AttentionLaunch {
+            q: &q,
+            k: &cat_k,
+            v: &cat_v,
+            relative: &relative,
+            bias_u: &block.attention.bias_u,
+            bias_v: &block.attention.bias_v,
+            mask: &session.mask,
+            output: &core,
+            rows,
+            key_rows: span.key_rows,
+            query_offset: span.query_offset,
+            kv_offset: span.kv_offset,
+            right_chunks: span.right_chunks,
+            valid_keys: span.key_rows,
+            lanes: session.lanes,
+            left_slide: span.left_slide,
+        })?;
+        let delta = self.lane_linear(&core, stacked, canonical, &block.attention.o)?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        #[cfg(test)]
+        session.block_trace.push(self.stream.clone_dtoh(&hidden)?);
+        let normalized = self.normalize(&hidden, stacked, &block.convolution.norm)?;
+        let expanded = self.lane_linear(
+            &normalized,
+            stacked,
+            canonical,
+            &block.convolution.pointwise1,
+        )?;
+        let activated = self.activate(&expanded, stacked, width as u32, 2)?;
+        let launch_rows = if session.cumulative == 0 {
+            rows
+        } else {
+            rows + 8
+        };
+        ensure!(
+            session.depthwise[index].len() == lanes * 8 * width,
+            "multitalker layer {index} depthwise cache"
+        );
+        let joined = if launch_rows == rows + 8 {
+            let mut joined = self
+                .stream
+                .alloc_zeros(lanes * launch_rows as usize * width)?;
+            for lane in 0..lanes {
+                self.copy_device(
+                    &session.depthwise[index],
+                    lane * 8 * width,
+                    &mut joined,
+                    lane * launch_rows as usize * width,
+                    8 * width,
+                )?;
+                self.copy_device(
+                    &activated,
+                    lane * rows_us * width,
+                    &mut joined,
+                    (lane * launch_rows as usize + 8) * width,
+                    rows_us * width,
+                )?;
+            }
+            joined
+        } else {
+            activated
+        };
+        let convolved = self.stream.alloc_zeros(joined.len())?;
+        self.launch_depthwise(
+            &joined,
+            &block.convolution.depthwise,
+            &session.mask,
+            &convolved,
+            launch_rows,
+            session.lanes,
+        )?;
+        let kept = {
+            let mut kept = self.stream.alloc_zeros(hidden.len())?;
+            let offset = if launch_rows == rows + 8 { 8 } else { 0 };
+            for lane in 0..lanes {
+                self.copy_device(
+                    &convolved,
+                    (lane * launch_rows as usize + offset) * width,
+                    &mut kept,
+                    lane * rows_us * width,
+                    rows_us * width,
+                )?;
+            }
+            kept
+        };
+        let mut next_depth = self.stream.alloc_zeros(lanes * 8 * width)?;
+        {
+            let source_rows = launch_rows as usize;
+            let available = source_rows.min(8);
+            for lane in 0..lanes {
+                self.copy_device(
+                    &joined,
+                    (lane * source_rows + source_rows - available) * width,
+                    &mut next_depth,
+                    (lane * 8 + 8 - available) * width,
+                    available * width,
+                )?;
+            }
+        }
+        ensure!(
+            block.convolution.running_mean.is_none() && block.convolution.running_var.is_none(),
+            "multitalker convolution has batch-norm statistics"
+        );
+        let normalized = self.normalize_pair(
+            &kept,
+            stacked,
+            &block.convolution.conv_weight,
+            &block.convolution.conv_bias,
+        )?;
+        let activated = self.activate(&normalized, stacked, width as u32, 1)?;
+        let delta = self.lane_linear(
+            &activated,
+            stacked,
+            canonical,
+            &block.convolution.pointwise2,
+        )?;
+        self.residual(&mut hidden, &delta, 1.0)?;
+        #[cfg(test)]
+        session.block_trace.push(self.stream.clone_dtoh(&hidden)?);
+        feed_forward(&mut hidden, &block.ff2, 0.5)?;
+        let output = self.normalize(&hidden, stacked, &block.output_norm)?;
+        let keep = (session.cumulative + rows).min(98) as usize;
+        let drop = cached + rows_us - keep;
+        let mut next_k = self.stream.alloc_zeros(lanes * keep * width)?;
+        let mut next_v = self.stream.alloc_zeros(lanes * keep * width)?;
+        for lane in 0..lanes {
+            if keep > rows_us {
+                self.copy_device(
+                    &session.keys[index],
+                    (lane * cached + drop) * width,
+                    &mut next_k,
+                    lane * keep * width,
+                    (keep - rows_us) * width,
+                )?;
+                self.copy_device(
+                    &session.values[index],
+                    (lane * cached + drop) * width,
+                    &mut next_v,
+                    lane * keep * width,
+                    (keep - rows_us) * width,
+                )?;
+            }
+            self.copy_device(
+                &k,
+                lane * rows_us * width,
+                &mut next_k,
+                (lane * keep + keep - rows_us) * width,
+                rows_us * width,
+            )?;
+            self.copy_device(
+                &v,
+                lane * rows_us * width,
+                &mut next_v,
+                (lane * keep + keep - rows_us) * width,
+                rows_us * width,
+            )?;
+        }
+        Ok((
+            output,
+            MultitalkerLayerStep {
+                key: next_k,
+                value: next_v,
+                depthwise: next_depth,
+            },
+        ))
+    }
 }
 
+/// Multitalker streaming session state.
+pub struct MultitalkerStream {
+    keys: Vec<CudaSlice<f32>>,
+    values: Vec<CudaSlice<f32>>,
+    depthwise: Vec<CudaSlice<f32>>,
+    mask: CudaSlice<u8>,
+    lanes: u32,
+    cumulative: u32,
+    steps: u32,
+    #[cfg(test)]
+    pub(crate) trace: Vec<Vec<f32>>,
+    #[cfg(test)]
+    pub(crate) block_trace: Vec<Vec<f32>>,
+}
+
+impl MultitalkerStream {
+    pub fn lanes(&self) -> u32 {
+        self.lanes
+    }
+
+    pub fn cumulative(&self) -> u32 {
+        self.cumulative
+    }
+
+    pub fn steps(&self) -> u32 {
+        self.steps
+    }
+}
+
+struct MultitalkerWindow {
+    key_rows: u32,
+    kv_offset: i64,
+    // Zero-filled layout slots before absolute row zero at a cold start.
+    zeros: u32,
+    query_offset: i64,
+    rows: u32,
+    // The final keep_all step opens the window over every real key.
+    right_chunks: u32,
+    // Sliding left window in rows (the reference's att_left as rows).
+    left_slide: u32,
+}
+
+/// Per-layer streaming caches produced by one multitalker layer step.
+struct MultitalkerLayerStep {
+    key: CudaSlice<f32>,
+    value: CudaSlice<f32>,
+    depthwise: CudaSlice<f32>,
+}
+
+/// Per-step diar masks `[lanes, 14]`.
+pub(crate) struct MultitalkerMasks<'a> {
+    pub spk: &'a [f32],
+    pub bg: &'a [f32],
+}
+
+/// Layer-0 speaker and background kernel weights.
+pub(crate) struct MultitalkerKernels<'a> {
+    pub speaker_up: &'a Linear,
+    pub speaker_down: &'a Linear,
+    pub background_up: &'a Linear,
+    pub background_down: &'a Linear,
+}
+
+/// One multitalker streaming step's outputs.
+pub struct MultitalkerStep {
+    /// Valid output rows `[lanes, out_rows, hidden]`.
+    pub rows: Vec<f32>,
+    /// Layer-0 input before the speaker kernels `[lanes, rows, hidden]`.
+    pub layer0_in: Vec<f32>,
+    /// Layer-0 input after the speaker kernels `[lanes, rows, hidden]`.
+    pub layer0_post: Vec<f32>,
+}
+
+impl ParakeetEncoder {
+    /// Runs one layer over an injected input with a fresh step-0 session for
+    /// the common-input bisection (no caches exist at step 0).
+    #[cfg(test)]
+    pub(crate) fn multitalker_inject_layer(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        session: &mut MultitalkerStream,
+    ) -> Result<CudaSlice<f32>> {
+        let width = self.conformer.hidden as usize;
+        let span = self.multitalker_span(0, 14)?;
+        let table = relative_positions(span.key_rows as usize, width)?;
+        let table_dev = self.stream.clone_htod(&table)?;
+        let (output, _) = self.multitalker_layer_step(index, input, session, &table_dev, &span)?;
+        Ok(output)
+    }
+
+    /// Common-input probes for the layer-0 submodules over the captured
+    /// (already normed) submodule inputs; each returns the module output
+    /// before the layer applies its residual.
+    #[cfg(test)]
+    pub(crate) fn multitalker_inject_ff1(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>> {
+        let block = self.blocks.get(index).context("layer")?;
+        let rows = (input.len() / self.conformer.hidden as usize) as u32;
+        let expanded = self.linear(input, rows, &block.ff1.up)?;
+        let activated = self.activate(&expanded, rows, self.conformer.hidden * 4, 1)?;
+        self.linear(&activated, rows, &block.ff1.down)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn multitalker_inject_attn(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        session: &mut MultitalkerStream,
+    ) -> Result<CudaSlice<f32>> {
+        let block = self.blocks.get(index).context("layer")?;
+        let width = self.conformer.hidden as usize;
+        let lanes = session.lanes as usize;
+        let rows = (input.len() / width / lanes) as u32;
+        let stacked = rows * session.lanes;
+        let q = self.linear(input, stacked, &block.attention.q)?;
+        let k = self.linear(input, stacked, &block.attention.k)?;
+        let v = self.linear(input, stacked, &block.attention.v)?;
+        let span = self.multitalker_span(0, rows)?;
+        let key_rows = span.key_rows as usize;
+        let zeros = span.zeros as usize;
+        let rows_us = rows as usize;
+        let mut cat_k = self.stream.alloc_zeros(lanes * key_rows * width)?;
+        let mut cat_v = self.stream.alloc_zeros(lanes * key_rows * width)?;
+        for lane in 0..lanes {
+            let lane_k = lane * key_rows * width;
+            self.copy_device(
+                &k,
+                lane * rows_us * width,
+                &mut cat_k,
+                lane_k + zeros * width,
+                rows_us * width,
+            )?;
+            self.copy_device(
+                &v,
+                lane * rows_us * width,
+                &mut cat_v,
+                lane_k + zeros * width,
+                rows_us * width,
+            )?;
+        }
+        let table = relative_positions(span.key_rows as usize, width)?;
+        let table_rows = 2 * span.key_rows - 1;
+        let table_dev = self.stream.clone_htod(&table)?;
+        // The kernel consumes the linear_pos-projected table.
+        let projected = self.linear(&table_dev, table_rows, &block.attention.relative)?;
+        let lanes = session.lanes as usize;
+        let mut relative = self
+            .stream
+            .alloc_zeros(lanes * (2 * span.key_rows as usize - 1) * width)?;
+        for lane in 0..lanes {
+            self.copy_device(
+                &projected,
+                0,
+                &mut relative,
+                lane * table.len(),
+                table.len(),
+            )?;
+        }
+        let core = self.stream.alloc_zeros(input.len())?;
+        #[cfg(test)]
+        {
+            let qh = self.stream.clone_dtoh(&q)?;
+            let kh = self.stream.clone_dtoh(&k)?;
+            let vh = self.stream.clone_dtoh(&v)?;
+            let rh = self.stream.clone_dtoh(&table_dev)?;
+            let uh = self.stream.clone_dtoh(&block.attention.bias_u)?;
+            let ch = self.stream.clone_dtoh(&core)?;
+            println!(
+                "ATTN_DBG q={:?} k={:?} v={:?} rel0={:?} bu={:?}",
+                &qh[..4],
+                &kh[..4],
+                &vh[..4],
+                &rh[..4],
+                &uh[..4]
+            );
+            let _ = ch;
+        }
+        self.attend(AttentionLaunch {
+            q: &q,
+            k: &cat_k,
+            v: &cat_v,
+            relative: &relative,
+            bias_u: &block.attention.bias_u,
+            bias_v: &block.attention.bias_v,
+            mask: &session.mask,
+            output: &core,
+            rows,
+            key_rows: span.key_rows,
+            query_offset: span.query_offset,
+            kv_offset: span.kv_offset,
+            right_chunks: 0,
+            valid_keys: span.key_rows,
+            lanes: session.lanes,
+            left_slide: 0,
+        })?;
+        self.linear(&core, stacked, &block.attention.o)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn multitalker_inject_conv(
+        &self,
+        index: usize,
+        input: &CudaSlice<f32>,
+        session: &mut MultitalkerStream,
+    ) -> Result<CudaSlice<f32>> {
+        let block = self.blocks.get(index).context("layer")?;
+        let width = self.conformer.hidden as usize;
+        let rows = (input.len() / width / session.lanes as usize) as u32;
+        let stacked = rows * session.lanes;
+        let expanded = self.linear(input, stacked, &block.convolution.pointwise1)?;
+        let activated = self.activate(&expanded, stacked, self.conformer.hidden, 2)?;
+        let convolved = self.stream.alloc_zeros(activated.len())?;
+        self.launch_depthwise(
+            &activated,
+            &block.convolution.depthwise,
+            &session.mask,
+            &convolved,
+            rows,
+            session.lanes,
+        )?;
+        let normalized = self.normalize_pair(
+            &convolved,
+            stacked,
+            &block.convolution.conv_weight,
+            &block.convolution.conv_bias,
+        )?;
+        let activated = self.activate(&normalized, stacked, self.conformer.hidden, 1)?;
+        self.linear(&activated, stacked, &block.convolution.pointwise2)
+    }
+}
 #[cfg(test)]
 mod position_tests {
     use super::*;
@@ -2956,7 +3842,7 @@ mod position_tests {
         ensure!(
             omitted.key_rows == 60
                 && attend_rows == 4
-                && attend_offset == omitted.query_offset
+                && i64::from(attend_offset) == omitted.query_offset
                 && table_index(attend_rows)? == 0
                 && (query_table[self_row] - 0.0).abs() < 1e-6
                 && (query_table[self_row + 1] - 1.0).abs() < 1e-6

@@ -340,7 +340,7 @@ impl Eou {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use anyhow::Context;
     use safetensors::SafeTensors;
@@ -349,7 +349,7 @@ mod tests {
         read_wave(path)
     }
 
-    fn read_wave(path: &std::path::Path) -> Result<Vec<f32>> {
+    pub(crate) fn read_wave(path: &std::path::Path) -> Result<Vec<f32>> {
         use std::io::Read;
         let mut file = std::fs::File::open(path)?;
         let mut header = [0u8; 44];
