@@ -113,7 +113,7 @@ impl TrellisSsFlow {
                 }
             }
         }
-        Self::load_flow(device, blas, checkpoint, &sites, context_rows, limit)
+        Self::load_flow(device, blas, checkpoint, &sites, context_rows, limit, true)
     }
 
     /// Loads a published TRELLIS.2 flow over sparse [z, y, x] sites. The
@@ -127,6 +127,7 @@ impl TrellisSsFlow {
         sites: &[[i32; 3]],
         context_rows: usize,
         limit: usize,
+        sampling_guided: bool,
     ) -> Result<Self> {
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(checkpoint.with_extension("json"))?)?;
@@ -345,6 +346,12 @@ impl TrellisSsFlow {
                 + context_rows * (h * 5 + spec.cond_channels)
                 + 12 * h)
             + 4 * rows;
+        let state_channels = if spec.in_channels > 32 {
+            spec.in_channels - 32
+        } else {
+            spec.in_channels
+        };
+        let live = live + sampler_live_bytes(rows, state_channels, sampling_guided);
         let remaining = device.workspace_budget(free_before, limit, live)?;
         let self_geometry = [
             heads as u32,
@@ -361,11 +368,10 @@ impl TrellisSsFlow {
             dim as u32,
         ];
         // Both attention workspaces divide the budget remaining after the
-        // live arrays, half each, capped at the full 128-query tile; the
-        // self-attention workspace takes the cross workspace's surplus.
-        let cross_workspace = F32Attention::required_bytes(cross_geometry)?.min(remaining / 2);
-        let self_workspace =
-            F32Attention::required_bytes(self_geometry)?.min(remaining - cross_workspace);
+        // live arrays and the sampler set, half each, capped at the full
+        // 128-query tile; the self-attention workspace takes the surplus.
+        let (cross_workspace, self_workspace) =
+            attention_workspace_split(remaining, self_geometry, cross_geometry)?;
         let cross = F32Attention::new(device.stream.clone(), cross_geometry, cross_workspace)?;
         let alloc = |n: usize| -> Result<cudarc::driver::CudaSlice<bf16>> {
             Ok(device.stream.alloc_zeros(n)?)
@@ -960,6 +966,28 @@ pub fn normalize_slat(state: &[f32], mean: &[f32], std: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// Sampler live set for a sampling stage: state, positive and velocity
+/// always; the CFG negative, x0, positive-x0 buffers and the two std
+/// scalars when guided. Bytes, F32.
+fn sampler_live_bytes(rows: usize, channels: usize, guided: bool) -> usize {
+    let buffers = if guided { 6 } else { 3 };
+    let scalars = usize::from(guided) * 2;
+    4 * (rows * channels * buffers + scalars)
+}
+
+/// Both attention workspaces divide the remaining budget half each, capped
+/// at the full 128-query tile; self-attention takes the cross surplus.
+fn attention_workspace_split(
+    remaining: usize,
+    self_geometry: [u32; 5],
+    cross_geometry: [u32; 5],
+) -> Result<(usize, usize)> {
+    let cross_workspace = F32Attention::required_bytes(cross_geometry)?.min(remaining / 2);
+    let self_workspace =
+        F32Attention::required_bytes(self_geometry)?.min(remaining - cross_workspace);
+    Ok((cross_workspace, self_workspace))
+}
+
 fn ensure_captured_blocks(blocks: &[usize], total: usize, slots: usize) -> Result<()> {
     ensure!(
         blocks.len() <= slots,
@@ -980,6 +1008,43 @@ fn ensure_captured_blocks(blocks: &[usize], total: usize, slots: usize) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampler_live_reserved_in_attention_split() -> Result<()> {
+        // Rows and geometry of the largest published case: guided shape
+        // sampling at 47548 sites, 12 heads of dim 128.
+        let rows = 47548usize;
+        let channels = 32usize;
+        let heads = 12u32;
+        let dim = 128u32;
+        let live = 4 * (rows * 1536 * 7 + rows * 32 + 4101 * 1536 * 2);
+        let sampler = sampler_live_bytes(rows, channels, true);
+        let self_geometry = [heads, rows as u32, rows as u32, dim, dim];
+        let cross_geometry = [heads, rows as u32, 4101, dim, dim];
+        let full_cross = F32Attention::required_bytes(cross_geometry)?;
+        let full_self = F32Attention::required_bytes(self_geometry)?;
+        // A limit that covers the live set, the sampler and both full-tile
+        // workspaces minus less than the sampler bytes: the reserved split
+        // must shrink a workspace so everything fits, while the unreserved
+        // split overshoots the whole-request limit.
+        let limit = live + sampler + full_cross + full_self - sampler / 2;
+        let remaining = limit - live - sampler;
+        let (cross, self_ws) = attention_workspace_split(remaining, self_geometry, cross_geometry)?;
+        assert!(live + sampler + cross + self_ws <= limit);
+        let (cross0, self0) =
+            attention_workspace_split(limit - live, self_geometry, cross_geometry)?;
+        assert!(live + sampler + cross0 + self0 > limit);
+        // The unguided set drops the CFG buffers and the std scalars.
+        assert_eq!(
+            sampler_live_bytes(rows, channels, true),
+            4 * (rows * channels * 6 + 2)
+        );
+        assert_eq!(
+            sampler_live_bytes(rows, channels, false),
+            4 * rows * channels * 3
+        );
+        Ok(())
+    }
 
     #[test]
     fn rope_phase_axes_are_slowest_first() {
@@ -1757,6 +1822,7 @@ mod tests {
                 &sites,
                 context_rows,
                 limit,
+                kind == "shape",
             )?;
             let block_calls: Vec<usize> = (1..=calls)
                 .filter(|call| {
@@ -2163,6 +2229,7 @@ mod tests {
                     &sites,
                     context_rows,
                     limit,
+                    kind == "shape",
                 )?;
                 let (_, states) = flow.sample(
                     &blas,
@@ -3015,6 +3082,7 @@ mod tests {
                     &lr_sites,
                     1029,
                     limit,
+                    true,
                 )?;
                 let (state, _) = flow.sample(
                     &blas,
@@ -3132,6 +3200,7 @@ mod tests {
                     &hr_sites,
                     4101,
                     limit,
+                    true,
                 )?;
                 let (state, _) = flow.sample(
                     &blas,
@@ -3213,6 +3282,7 @@ mod tests {
                     &hr_sites,
                     4101,
                     limit,
+                    false,
                 )?;
                 let (state, _) = flow.sample(
                     &blas,
@@ -3235,7 +3305,11 @@ mod tests {
                 "TRELLIS2_E2E_DRIFT stage=tex fixture={fixture} kind=slat max_abs={tex_drift:.15e} rows={}",
                 tex_slat.len() / 32
             );
-            let tex_fields = {
+            // The Fields tap carries the raw head output (the fields
+            // fixtures); the material applies the pipeline x0.5+0.5 affine
+            // on top of it.
+            let mut tex_fields = Vec::new();
+            {
                 let decoder = super::super::pixal3d::PixalDecoder::open(
                     &device,
                     &model,
@@ -3243,15 +3317,22 @@ mod tests {
                     &runtime,
                     limit,
                 )?;
-                let latent = device.stream.clone_htod(&tex_slat)?;
-                let (decoded, generated) =
-                    decoder.decode_device(hr_sites4.clone(), latent, &guides)?;
-                ensure!(
-                    generated.is_empty(),
-                    "texture decoder predicted subdivision"
-                );
-                decoded.features
-            };
+                super::super::pixal3d::tests::decode_tapped(
+                    &decoder,
+                    hr_sites4.clone(),
+                    &tex_slat,
+                    &guides,
+                    |tap| {
+                        if let super::super::pixal3d::tests::DecodeTap::Fields {
+                            features, ..
+                        } = tap
+                        {
+                            tex_fields = features.to_vec();
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
             let stored_fields = read_tensor(
                 &root.join(format!(
                     "decode-tex-{fixture}-1024cascade-r0a/fields.safetensors"
