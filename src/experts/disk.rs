@@ -3,7 +3,7 @@ use crate::experts::catalogue::{ExpertCatalogue, ExpertLayout, ExpertRange, Nati
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -66,6 +66,26 @@ impl Drop for AlignedBytes {
 struct AlignedSlot {
     bytes: AlignedBytes,
     state: Cell<RingState>,
+    /// One residue per planned slice, written by the read that filled the slot.
+    residues: UnsafeCell<Vec<u32>>,
+    /// Packed logical bytes. Filled on the first `values` view when a window is in use.
+    packed_view: UnsafeCell<Vec<u8>>,
+}
+
+/// One slice inside a ring slot. `ring` is the window or staged-tail offset.
+#[derive(Clone, Copy)]
+struct Place {
+    ring: u32,
+    len: u32,
+    packed: u32,
+    windowed: bool,
+}
+
+/// Ring placement of one native slot. Built once at open.
+struct SlotPlan {
+    places: Vec<Place>,
+    ring_bytes: usize,
+    alignment: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,11 +106,25 @@ pub struct SlotLease<'a> {
 
 impl SlotLease<'_> {
     pub fn values(&self) -> &[bf16] {
-        let ring = &self.reader.ring[self.slot];
-        // SAFETY: the slot holds `per_expert` initialized bf16 values for the guard's lifetime.
-        unsafe {
-            std::slice::from_raw_parts(ring.bytes.as_ptr() as *const bf16, self.reader.per_expert)
-        }
+        let ptr = self.reader.packed_bytes(self.slot);
+        // SAFETY: `packed_bytes` returns `per_expert` initialized bf16 values owned by this slot.
+        // The view is not resized while this lease is held.
+        unsafe { std::slice::from_raw_parts(ptr as *const bf16, self.reader.per_expert) }
+    }
+
+    /// Base of this slot's ring allocation.
+    pub fn bytes_ptr(&self) -> *const u8 {
+        self.reader.ring[self.slot].bytes.as_ptr()
+    }
+
+    /// Coalesced `(ring_offset, len, packed_offset)` device copies of the logical slices.
+    pub fn disk_slices(&self) -> Result<Vec<(usize, usize, usize)>> {
+        self.reader.disk_slices(self.slot)
+    }
+
+    /// Writes the packed logical bytes into `dst` from the ring windows.
+    pub fn copy_logical(&self, dst: &mut [bf16]) -> Result<()> {
+        self.reader.copy_logical(self.slot, dst)
     }
 
     /// Marks the slot's data copied to the device; the slot is reusable only through `reclaim`
@@ -126,12 +160,162 @@ impl Drop for SlotLease<'_> {
 }
 
 impl AlignedSlot {
-    fn new(bytes: usize) -> Result<Self> {
+    fn new(bytes: usize, alignment: usize) -> Result<Self> {
         Ok(Self {
-            bytes: AlignedBytes::new(bytes, RING_ALIGN)?,
+            bytes: AlignedBytes::new(bytes, alignment)?,
             state: Cell::new(RingState::Free),
+            residues: UnsafeCell::new(Vec::new()),
+            packed_view: UnsafeCell::new(Vec::new()),
         })
     }
+}
+
+/// `alignment` is a power of two and at least [`RING_ALIGN`].
+fn require_direct_alignment(alignment: u64) -> Result<()> {
+    ensure!(
+        alignment.is_power_of_two() && alignment >= RING_ALIGN as u64,
+        "invalid direct IO alignment {alignment}"
+    );
+    Ok(())
+}
+
+fn layout_slices(layout: &ExpertLayout) -> Vec<(u64, u64)> {
+    let six = |gate: &std::ops::Range<u64>,
+               up: &std::ops::Range<u64>,
+               down: &std::ops::Range<u64>,
+               gate_scale: &std::ops::Range<u64>,
+               up_scale: &std::ops::Range<u64>,
+               down_scale: &std::ops::Range<u64>| {
+        [gate, up, down, gate_scale, up_scale, down_scale]
+            .into_iter()
+            .map(|range| (range.start, range.end - range.start))
+            .collect()
+    };
+    match layout {
+        ExpertLayout::Bf16Fused {
+            slot_bytes,
+            gate_up_bytes,
+        } => vec![
+            (0, *gate_up_bytes),
+            (*gate_up_bytes, slot_bytes - gate_up_bytes),
+        ],
+        ExpertLayout::Bf16Separate { matrix_bytes, .. } => {
+            vec![
+                (0, *matrix_bytes),
+                (*matrix_bytes, *matrix_bytes),
+                (matrix_bytes * 2, *matrix_bytes),
+            ]
+        }
+        ExpertLayout::Fp8W8a16(slot) | ExpertLayout::Fp8W8a16Block(slot, _) => six(
+            &slot.gate,
+            &slot.up,
+            &slot.down,
+            &slot.gate_scale,
+            &slot.up_scale,
+            &slot.down_scale,
+        ),
+        ExpertLayout::Fp4E2m1Block(slot, _) => six(
+            &slot.gate,
+            &slot.up,
+            &slot.down,
+            &slot.gate_scale,
+            &slot.up_scale,
+            &slot.down_scale,
+        ),
+    }
+}
+
+fn coalesce(places: &[Place], residues: &[u32]) -> Result<Vec<(usize, usize, usize)>> {
+    ensure!(
+        residues.len() == places.len(),
+        "disk residues {} do not cover {} slices",
+        residues.len(),
+        places.len()
+    );
+    let mut out = Vec::with_capacity(places.len());
+    for (place, &residue) in places.iter().zip(residues) {
+        let src = DiskReader::slice_offset(*place, residue);
+        let len = place.len as usize;
+        let packed = place.packed as usize;
+        if let Some((prev_src, prev_len, prev_packed)) = out.last_mut()
+            && *prev_src + *prev_len == src
+            && *prev_packed + *prev_len == packed
+        {
+            *prev_len += len;
+            continue;
+        }
+        out.push((src, len, packed));
+    }
+    Ok(out)
+}
+
+fn plan_slot(layout: &ExpertLayout, alignment: u64) -> Result<SlotPlan> {
+    ensure!(
+        alignment.is_power_of_two() && alignment >= RING_ALIGN as u64,
+        "invalid direct IO alignment {alignment}"
+    );
+    let align = usize::try_from(alignment)?;
+    let slices = layout_slices(layout);
+    ensure!(!slices.is_empty(), "native slot has no slices");
+    let mut windowed = vec![false; slices.len()];
+    for (index, &(_, len)) in slices.iter().enumerate() {
+        let len = usize::try_from(len).context("native slice exceeds usize")?;
+        ensure!(len > 0, "native slice is empty");
+        windowed[index] = len.is_multiple_of(align);
+    }
+    let mut ring_of = vec![0u32; slices.len()];
+    let mut cursor = 0usize;
+    if windowed.iter().any(|&flag| flag) {
+        for (index, &is_window) in windowed.iter().enumerate() {
+            if !is_window {
+                continue;
+            }
+            let len = usize::try_from(slices[index].1).context("native slice exceeds usize")?;
+            ring_of[index] = u32::try_from(cursor).context("ring offset exceeds u32")?;
+            cursor = cursor
+                .checked_add(len + align)
+                .context("native ring extent overflow")?;
+        }
+        for (index, &is_window) in windowed.iter().enumerate() {
+            if is_window {
+                continue;
+            }
+            let len = usize::try_from(slices[index].1).context("native slice exceeds usize")?;
+            ring_of[index] = u32::try_from(cursor).context("ring offset exceeds u32")?;
+            cursor = cursor
+                .checked_add(len)
+                .context("native ring extent overflow")?;
+        }
+    } else {
+        let mut end = 0u64;
+        for (index, &(packed, len)) in slices.iter().enumerate() {
+            ring_of[index] = u32::try_from(packed).context("packed offset exceeds u32")?;
+            end = end.max(
+                packed
+                    .checked_add(len)
+                    .context("packed slice end overflow")?,
+            );
+        }
+        cursor = usize::try_from(end).context("packed slot exceeds usize")?;
+    }
+    let places = slices
+        .iter()
+        .enumerate()
+        .map(|(index, &(_, len))| {
+            Ok(Place {
+                ring: ring_of[index],
+                len: u32::try_from(len).context("native slice exceeds u32")?,
+                packed: u32::try_from(slices[index].0).context("packed offset exceeds u32")?,
+                windowed: windowed[index],
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(cursor > 0, "native ring is empty");
+    Ok(SlotPlan {
+        places,
+        ring_bytes: cursor,
+        alignment,
+    })
 }
 
 /// One planned aligned read: a file span and the request range that lands inside it.
@@ -328,6 +512,52 @@ impl SpanReader {
         Ok(&staging.as_mut()[..width])
     }
 
+    /// Direct read of `[begin, begin+width)` into `dest`. `dest` holds the next multiple of the
+    /// alignment. A short read is accepted when `got == width`.
+    fn read_direct(&self, begin: u64, width: u64, dest: &mut [u8]) -> Result<()> {
+        ensure!(self.direct, "buffered reader issued a direct window");
+        let align = self.alignment;
+        ensure!(
+            width > 0 && begin.checked_add(width).is_some_and(|end| end <= self.len),
+            "direct window {begin}+{width} outside {}",
+            self.len
+        );
+        ensure!(
+            begin.is_multiple_of(align),
+            "misaligned direct window at {begin}"
+        );
+        let requested = width.div_ceil(align) * align;
+        ensure!(
+            dest.len() as u64 >= requested,
+            "direct window buffer holds {} of {requested}",
+            dest.len()
+        );
+        ensure!(
+            (dest.as_ptr() as usize).is_multiple_of(align as usize),
+            "direct window buffer is misaligned"
+        );
+        let mut written = 0u64;
+        while written < width {
+            let logical = width - written;
+            let count = logical.div_ceil(align) * align;
+            let at = begin + written;
+            let buffer = &mut dest[written as usize..(written + count) as usize];
+            let got = self
+                .file
+                .read_at(buffer, at)
+                .with_context(|| format!("direct read {at}+{count}"))?;
+            if got == logical as usize {
+                break;
+            }
+            ensure!(
+                got > 0 && (got as u64).is_multiple_of(align) && (got as u64) < logical,
+                "short native direct read at {at}: got {got}, expected {logical}"
+            );
+            written += got as u64;
+        }
+        Ok(())
+    }
+
     /// The callback receives the original request index and its complete native bytes.
     pub(crate) fn read_spans(
         &self,
@@ -380,6 +610,7 @@ pub struct DiskReader {
     ring: Vec<AlignedSlot>,
     next: Cell<usize>,
     staging: Cell<Option<AlignedBytes>>,
+    plan: Option<SlotPlan>,
 }
 
 // SAFETY: the ring holds a private allocation owned by this reader; moving the reader to one
@@ -446,15 +677,24 @@ impl DiskReader {
         }
         let mut shards = BTreeMap::new();
         let mut lengths = BTreeMap::new();
+        let mut alignment = None;
         for name in names {
-            let file = SpanReader::open(
-                &model_dir.join(name.as_ref()),
-                matches!(catalogue.layout(), ExpertLayout::Fp4E2m1Block(..)),
-            )?;
+            let file = SpanReader::open(&model_dir.join(name.as_ref()), true)?;
+            if let Some(previous) = alignment {
+                ensure!(
+                    previous == file.alignment,
+                    "native shard {name} alignment {} differs from {previous}",
+                    file.alignment
+                );
+            } else {
+                alignment = Some(file.alignment);
+            }
             let length = file.len;
             shards.insert(name.to_string(), file);
             lengths.insert(name.to_string(), length);
         }
+        let alignment = alignment.context("native catalogue has no shards")?;
+        require_direct_alignment(alignment)?;
         for layer in 0..geometry.layers {
             for expert in 0..geometry.experts {
                 visit_slices(catalogue.range(layer, expert)?, &mut |native| {
@@ -476,8 +716,10 @@ impl DiskReader {
                 })?;
             }
         }
+        let plan = plan_slot(catalogue.layout(), alignment)?;
+        let ring_align = usize::try_from(alignment)?;
         let ring = (0..ring_slots)
-            .map(|_| AlignedSlot::new(slot_bytes))
+            .map(|_| AlignedSlot::new(plan.ring_bytes, ring_align))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             shards,
@@ -485,6 +727,7 @@ impl DiskReader {
             ring,
             next: Cell::new(0),
             staging: Cell::new(None),
+            plan: Some(plan),
         })
     }
 
@@ -540,7 +783,7 @@ impl DiskReader {
             }
         }
         let ring = (0..ring_slots)
-            .map(|_| AlignedSlot::new(slot_bytes))
+            .map(|_| AlignedSlot::new(slot_bytes, RING_ALIGN))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             shards,
@@ -548,6 +791,7 @@ impl DiskReader {
             ring,
             next: Cell::new(0),
             staging: Cell::new(None),
+            plan: None,
         })
     }
 
@@ -572,6 +816,231 @@ impl DiskReader {
         usize::try_from(bytes).context("expert staging extent exceeds usize")
     }
 
+    fn reset_view(&self, slot: usize) {
+        // SAFETY: this thread owns the reader and the slot is not leased.
+        unsafe {
+            (*self.ring[slot].residues.get()).clear();
+            (*self.ring[slot].packed_view.get()).clear();
+        }
+    }
+
+    fn slice_offset(place: Place, residue: u32) -> usize {
+        place.ring as usize + if place.windowed { residue as usize } else { 0 }
+    }
+
+    fn disk_slices(&self, slot: usize) -> Result<Vec<(usize, usize, usize)>> {
+        let plan = self.plan.as_ref().context("disk slice plan missing")?;
+        // SAFETY: the lease owns the slot. The residue vec is not mutated while the lease is held.
+        let residues = unsafe { &*self.ring[slot].residues.get() };
+        coalesce(&plan.places, residues)
+    }
+
+    fn copy_logical(&self, slot: usize, dst: &mut [bf16]) -> Result<()> {
+        ensure!(
+            dst.len() == self.per_expert,
+            "logical copy holds {} elements for {}",
+            dst.len(),
+            self.per_expert
+        );
+        let nbytes = self.per_expert * std::mem::size_of::<bf16>();
+        // SAFETY: `dst` is `nbytes` initialized bytes and is exclusive for this call.
+        let dst_bytes =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), nbytes) };
+        let ring = &self.ring[slot];
+        let Some(plan) = self.plan.as_ref() else {
+            // SAFETY: a dense slot's prefix is the packed slot.
+            let src = unsafe { std::slice::from_raw_parts(ring.bytes.as_ptr(), nbytes) };
+            dst_bytes.copy_from_slice(src);
+            return Ok(());
+        };
+        // SAFETY: the lease owns the slot.
+        let residues = unsafe { &*ring.residues.get() };
+        ensure!(
+            residues.len() == plan.places.len(),
+            "disk residues incomplete"
+        );
+        let needs = plan
+            .places
+            .iter()
+            .any(|place| place.windowed || place.ring != place.packed);
+        if !needs {
+            let src = unsafe { std::slice::from_raw_parts(ring.bytes.as_ptr(), nbytes) };
+            dst_bytes.copy_from_slice(src);
+            return Ok(());
+        }
+        let src = ring.bytes.as_ptr();
+        let ring_len = ring.bytes.len();
+        for (place, &residue) in plan.places.iter().zip(residues) {
+            let from = Self::slice_offset(*place, residue);
+            let start = place.packed as usize;
+            let len = place.len as usize;
+            ensure!(
+                from + len <= ring_len && start + len <= nbytes,
+                "logical slice outside the ring"
+            );
+            // SAFETY: the source window and the packed destination do not overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add(from),
+                    dst_bytes.as_mut_ptr().add(start),
+                    len,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn packed_bytes(&self, slot: usize) -> *const u8 {
+        let nbytes = self.per_expert * std::mem::size_of::<bf16>();
+        let ring = &self.ring[slot];
+        let src = ring.bytes.as_ptr();
+        // SAFETY: plan, residues and the packed view are distinct and owned by this thread.
+        let plan = self.plan.as_ref().map(|plan| plan as *const SlotPlan);
+        let residues_ptr = ring.residues.get();
+        let view_ptr = ring.packed_view.get();
+        unsafe {
+            let Some(plan) = plan else {
+                return src;
+            };
+            let plan = &*plan;
+            let residues = &*residues_ptr;
+            let needs = residues.len() == plan.places.len()
+                && plan
+                    .places
+                    .iter()
+                    .any(|place| place.windowed || place.ring != place.packed);
+            if !needs {
+                return src;
+            }
+            let view = &mut *view_ptr;
+            if view.len() != nbytes {
+                view.resize(nbytes, 0);
+                for (place, &residue) in plan.places.iter().zip(residues.iter()) {
+                    let from = Self::slice_offset(*place, residue);
+                    std::ptr::copy_nonoverlapping(
+                        src.add(from),
+                        view.as_mut_ptr().add(place.packed as usize),
+                        place.len as usize,
+                    );
+                }
+            }
+            view.as_ptr()
+        }
+    }
+
+    fn read_planned(&self, parts: &[(u64, &NativeRange)], slot: usize) -> Result<()> {
+        let (alignment, places) = {
+            let plan = self.plan.as_ref().context("native slot plan missing")?;
+            (plan.alignment, plan.places.clone())
+        };
+        ensure!(
+            parts.len() == places.len(),
+            "native plan covers {} slices, read has {}",
+            places.len(),
+            parts.len()
+        );
+        self.reset_view(slot);
+        let ring_len = self.ring[slot].bytes.len();
+        let ring_ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
+        let mut residues = Vec::with_capacity(places.len());
+        let mut staging = self.staging.take();
+        let outcome = (|| -> Result<()> {
+            for (&place, &(packed, native)) in places.iter().zip(parts) {
+                ensure!(
+                    packed == u64::from(place.packed) && native.len == u64::from(place.len),
+                    "native slice does not match the slot plan"
+                );
+                let shard = self
+                    .shards
+                    .get(native.shard.as_ref())
+                    .with_context(|| format!("disk shard {} not open", native.shard))?;
+                ensure!(
+                    shard.direct && shard.alignment == alignment,
+                    "native shard {} is not the planned direct alignment",
+                    native.shard
+                );
+                if place.windowed {
+                    let residue = native.offset % alignment;
+                    let begin = native.offset - residue;
+                    let raw_end = begin
+                        .checked_add(native.len)
+                        .and_then(|end| end.checked_add(alignment))
+                        .context("window end overflow")?;
+                    let end = raw_end.min(shard.len);
+                    let width = end - begin;
+                    let logical_end = native
+                        .offset
+                        .checked_add(native.len)
+                        .context("window logical end overflow")?;
+                    ensure!(
+                        logical_end <= end,
+                        "windowed slice {}+{} outside {begin}..{end}",
+                        native.offset,
+                        native.len
+                    );
+                    let dest = place.ring as usize;
+                    let requested = usize::try_from(width.div_ceil(alignment) * alignment)?;
+                    ensure!(dest + requested <= ring_len, "window exceeds the ring");
+                    // SAFETY: the window is inside this slot's allocation and is not aliased.
+                    let buffer =
+                        unsafe { std::slice::from_raw_parts_mut(ring_ptr.add(dest), requested) };
+                    shard.read_direct(begin, width, buffer)?;
+                    residues.push(u32::try_from(residue).context("window residue exceeds u32")?);
+                } else {
+                    let begin = native.offset & !(alignment - 1);
+                    let logical_end = native
+                        .offset
+                        .checked_add(native.len)
+                        .context("staged slice end overflow")?;
+                    let aligned_end = logical_end.div_ceil(alignment) * alignment;
+                    let end = aligned_end.min(shard.len);
+                    ensure!(logical_end <= end, "staged slice extends past the shard");
+                    let span = ReadSpan {
+                        begin,
+                        end,
+                        first: 0,
+                        last: 1,
+                    };
+                    let need = Self::aligned_staging_bytes(native.offset, native.len, alignment)?;
+                    let align_usize = usize::try_from(alignment)?;
+                    if staging.as_ref().is_none_or(|buffer| {
+                        buffer.len() < need || buffer.alignment() < align_usize
+                    }) {
+                        drop(staging.take());
+                        staging = Some(AlignedBytes::new(need, align_usize)?);
+                    }
+                    let bytes = shard.read_span(
+                        &span,
+                        alignment,
+                        staging.as_mut().context("native staging missing")?,
+                    )?;
+                    let from = usize::try_from(native.offset - begin)?;
+                    let len = usize::try_from(native.len)?;
+                    ensure!(from + len <= bytes.len(), "staged slice exceeds its span");
+                    let dest = place.ring as usize;
+                    ensure!(dest + len <= ring_len, "staged slice exceeds the ring");
+                    // SAFETY: the staging allocation and the ring allocation do not overlap.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr().add(from),
+                            ring_ptr.add(dest),
+                            len,
+                        );
+                    }
+                    residues.push(0);
+                }
+            }
+            Ok(())
+        })();
+        self.staging.set(staging);
+        outcome?;
+        // SAFETY: the slot is not leased until the caller marks it filled.
+        unsafe {
+            *self.ring[slot].residues.get() = residues;
+        }
+        Ok(())
+    }
+
     fn claim_free_slot(&self) -> Result<usize> {
         let slots = self.ring.len();
         let mut chosen = None;
@@ -591,6 +1060,7 @@ impl DiskReader {
     pub fn read_ranges(&self, ranges: &[(u64, NativeRange)], chunk_bytes: u64) -> Result<u32> {
         ensure!(chunk_bytes > 0, "disk read chunk is not positive");
         let slot = self.claim_free_slot()?;
+        self.reset_view(slot);
         let bytes = self.ring[slot].bytes.len();
         let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
         // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
@@ -616,10 +1086,7 @@ impl DiskReader {
         let range: &ExpertRange = catalogue.range(layer, expert)?;
         let layout = catalogue.layout();
         let slot = self.claim_free_slot()?;
-        let bytes = self.ring[slot].bytes.len();
-        let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
-        // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
-        let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
+        self.reset_view(slot);
         let mut parts: Vec<(u64, &NativeRange)> = Vec::new();
         match (layout, range) {
             (
@@ -675,7 +1142,15 @@ impl DiskReader {
             }
             _ => bail!("expert range does not match the catalogue layout"),
         }
-        self.read_parts(&parts, buffer, chunk_bytes)?;
+        if self.plan.is_some() {
+            self.read_planned(&parts, slot)?;
+        } else {
+            let bytes = self.ring[slot].bytes.len();
+            let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
+            // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
+            let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
+            self.read_parts(&parts, buffer, chunk_bytes)?;
+        }
         self.ring[slot].state.set(RingState::Filled);
         u32::try_from(slot).context("disk ring slot exceeds u32")
     }
@@ -1446,7 +1921,7 @@ mod tests {
 
     #[test]
     fn reads_native_ranges_at_the_catalogue_offsets() -> Result<()> {
-        assert!(AlignedSlot::new(0).is_err());
+        assert!(AlignedSlot::new(0, RING_ALIGN).is_err());
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let pattern = pattern(1536, 0);
         let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
@@ -1612,6 +2087,7 @@ mod tests {
                     ring: Vec::new(),
                     next: Cell::new(0),
                     staging: Cell::new(None),
+                    plan: None,
                 };
                 let ranges: Vec<_> = requests
                     .iter()
@@ -1665,6 +2141,7 @@ mod tests {
             ring: Vec::new(),
             next: Cell::new(0),
             staging: Cell::new(None),
+            plan: None,
         };
         OpenOptions::new()
             .write(true)
@@ -1718,6 +2195,7 @@ mod tests {
             ring: Vec::new(),
             next: Cell::new(0),
             staging: Cell::new(None),
+            plan: None,
         };
         let mut offset = 17;
         let mut destination = 64;
@@ -2404,9 +2882,10 @@ mod tests {
 mod e2m1_tests {
     use super::*;
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
-    use crate::experts::catalogue::{ExpertCatalogue, ExpertGeometry};
+    use crate::experts::catalogue::{ExpertCatalogue, ExpertGeometry, ExpertLayout, ExpertRange};
     use crate::model_spec::ExpertFormat;
     use std::collections::BTreeMap;
+    use std::os::unix::io::AsRawFd;
     use std::sync::Arc;
 
     /// The audited DeepSeek E2M1 names: packed `[rows, cols/2]` I8 codes and
@@ -2655,6 +3134,472 @@ mod e2m1_tests {
         .unwrap_err();
         assert!(!error.to_string().is_empty());
         let _ = (catalogue, dir, error);
+        Ok(())
+    }
+
+    fn byte_at(index: u64) -> u8 {
+        (index.wrapping_mul(37).wrapping_add(11) % 251) as u8
+    }
+
+    fn logical_with(reader: &DiskReader, slot: usize, residues: &[u32]) -> Vec<u8> {
+        let plan = reader.plan.as_ref().expect("slot plan");
+        let src = reader.ring[slot].bytes.as_ptr();
+        let mut out = vec![0u8; reader.per_expert * 2];
+        for (place, &residue) in plan.places.iter().zip(residues) {
+            let from = DiskReader::slice_offset(*place, residue);
+            let len = place.len as usize;
+            let at = place.packed as usize;
+            // SAFETY: the test holds the slot lease and the offsets stay inside the ring and the slot.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(from), out.as_mut_ptr().add(at), len);
+            }
+        }
+        out
+    }
+
+    fn slices_of(reader: &DiskReader, slot: usize) -> Vec<u8> {
+        let guard_residues = unsafe { &*reader.ring[slot].residues.get() };
+        logical_with(reader, slot, guard_residues)
+    }
+
+    #[test]
+    fn published_direct_rings_match_the_counted_slots() -> Result<()> {
+        let g1 = ExpertLayout::new(
+            ExpertFormat::Fp8W8a16Block {
+                block: [128, 128],
+                scale_dtype: safetensors::Dtype::F32,
+            },
+            &ExpertGeometry {
+                first_layer: 0,
+                layers: 42,
+                experts: 288,
+                hidden: 4096,
+                intermediate: 2048,
+                top_k: 1,
+            },
+        )?;
+        assert_eq!(g1.slot_bytes(), 25_171_968);
+        let g1_plan = super::plan_slot(&g1, 4096)?;
+        assert_eq!(g1_plan.ring_bytes, 25_184_256);
+        assert_eq!(
+            g1_plan.places.iter().filter(|place| place.windowed).count(),
+            3
+        );
+        let g1_residues = [728u32, 728, 728, 0, 0, 0];
+        let g1_copies = super::coalesce(&g1_plan.places, &g1_residues)?;
+        assert_eq!(g1_copies.len(), 4);
+        assert_eq!(g1_copies[3].1, 6144);
+        let g1_catalogue = g1.slot_bytes() * 42 * 288;
+        assert_eq!(g1_catalogue, 304_480_124_928);
+        let d1 = ExpertLayout::new(
+            e2m1_format(),
+            &ExpertGeometry {
+                first_layer: 0,
+                layers: 40,
+                experts: 384,
+                hidden: 5120,
+                intermediate: 2304,
+                top_k: 1,
+            },
+        )?;
+        assert_eq!(d1.slot_bytes(), 18_800_640);
+        let d1_plan = super::plan_slot(&d1, 4096)?;
+        assert_eq!(d1_plan.ring_bytes, 18_825_216);
+        assert!(d1_plan.places.iter().all(|place| place.windowed));
+        let d1_copies = super::coalesce(&d1_plan.places, &[760u32; 6])?;
+        assert_eq!(d1_copies.len(), 6);
+        assert_eq!(
+            d1_plan
+                .places
+                .iter()
+                .map(|place| place.ring)
+                .collect::<Vec<_>>(),
+            vec![0, 5_902_336, 11_804_672, 17_707_008, 18_079_744, 18_452_480]
+        );
+        let d1_catalogue = d1.slot_bytes() * 40 * 384;
+        assert_eq!(d1_catalogue, 288_777_830_400);
+        assert!(super::require_direct_alignment(2048).is_err());
+        assert!(super::require_direct_alignment(6144).is_err());
+        println!("PASS direct_rings g1_ring=25184256 g1_copies=4 d1_ring=18825216 d1_copies=6");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_windows_match_every_residue_class_and_reject_a_shifted_read() -> Result<()> {
+        const ALIGN: u64 = 4096;
+        let code_residues = [760u64, 1192, 1592, 2944, 3104, 3928, 728, 3952];
+        let clamp_expert = 2usize;
+        let hidden = 2048usize;
+        let intermediate = 64usize;
+        let code_gate = (intermediate * hidden.div_ceil(2)) as u64;
+        let code_down = (hidden * intermediate.div_ceil(2)) as u64;
+        let scale_gate = (intermediate * hidden.div_ceil(32)) as u64;
+        let scale_down = (hidden * intermediate.div_ceil(32)) as u64;
+        assert!(
+            [code_gate, code_down, scale_gate, scale_down]
+                .into_iter()
+                .all(|len| len.is_multiple_of(ALIGN))
+        );
+        struct Item {
+            name: String,
+            dtype: safetensors::Dtype,
+            shape: Vec<usize>,
+            len: u64,
+            residue: u64,
+            clamp: bool,
+            offset: u64,
+        }
+        let mut items = Vec::new();
+        for (expert, &residue) in code_residues.iter().enumerate() {
+            let scale_residue = (residue + 2304) % ALIGN;
+            let name = |role: &str| format!("layers.0.ffn.experts.{expert}.{role}");
+            let rows = intermediate;
+            let cols = hidden;
+            for (role, dtype, shape, len, item_residue) in [
+                (
+                    "w1.weight",
+                    safetensors::Dtype::I8,
+                    vec![rows, cols / 2],
+                    code_gate,
+                    residue,
+                ),
+                (
+                    "w3.weight",
+                    safetensors::Dtype::I8,
+                    vec![rows, cols / 2],
+                    code_gate,
+                    residue,
+                ),
+                (
+                    "w2.weight",
+                    safetensors::Dtype::I8,
+                    vec![cols, rows / 2],
+                    code_down,
+                    residue,
+                ),
+                (
+                    "w1.scale",
+                    safetensors::Dtype::F8_E8M0,
+                    vec![rows, cols / 32],
+                    scale_gate,
+                    scale_residue,
+                ),
+                (
+                    "w3.scale",
+                    safetensors::Dtype::F8_E8M0,
+                    vec![rows, cols / 32],
+                    scale_gate,
+                    scale_residue,
+                ),
+                (
+                    "w2.scale",
+                    safetensors::Dtype::F8_E8M0,
+                    vec![cols, rows / 32],
+                    scale_down,
+                    scale_residue,
+                ),
+            ] {
+                items.push(Item {
+                    name: name(role),
+                    dtype,
+                    shape,
+                    len,
+                    residue: item_residue,
+                    clamp: expert == clamp_expert && role == "w3.weight",
+                    offset: 0,
+                });
+            }
+        }
+        let clamp_at = items.iter().position(|item| item.clamp).expect("clamp");
+        let clamped = items.remove(clamp_at);
+        items.push(clamped);
+        let mut cursor = 0u64;
+        for item in &mut items {
+            let base = cursor.div_ceil(ALIGN) * ALIGN;
+            item.offset = base + item.residue;
+            cursor = if item.clamp {
+                item.offset + item.len
+            } else {
+                base + item.len + ALIGN
+            };
+        }
+        let file_len = cursor;
+        let file: Vec<u8> = (0..file_len).map(byte_at).collect();
+        let dir = temp_dir("windows")?;
+        std::fs::write(dir.path().join("windows.bin"), &file)?;
+        let mut entries = BTreeMap::new();
+        for item in &items {
+            entries.insert(
+                item.name.clone(),
+                TensorEntry {
+                    dtype: item.dtype,
+                    shape: item.shape.clone(),
+                    shard: "windows.bin".into(),
+                    bytes: item.len as usize,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [item.offset, item.offset + item.len],
+                    scope: TensorScope::Text,
+                    layer: None,
+                    role: item.name.clone(),
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                },
+            );
+        }
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 1,
+            experts: code_residues.len() as u32,
+            hidden: hidden as u32,
+            intermediate: intermediate as u32,
+            top_k: 2,
+        };
+        let catalogue = ExpertCatalogue::from_manifest(
+            &TensorManifest {
+                entries,
+                resident_bytes: 0,
+            },
+            geometry,
+            e2m1_format(),
+        )?;
+        let reader = DiskReader::open(&catalogue, dir.path(), geometry.experts)?;
+        for shard in reader.shards.values() {
+            let flags = unsafe { libc::fcntl(shard.file.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::O_DIRECT != 0);
+        }
+        let plan = reader.plan.as_ref().expect("plan");
+        assert!(plan.places.iter().all(|place| place.windowed));
+        assert_eq!(plan.ring_bytes, reader.per_expert * 2 + 6 * ALIGN as usize);
+        let mut classes = 0usize;
+        for expert in 0..geometry.experts {
+            let slot = reader.read_expert(0, expert, &catalogue, catalogue.slot_bytes())?;
+            let guard = reader.values(slot)?;
+            let stored = unsafe { &*reader.ring[guard.slot].residues.get() }.clone();
+            let expected = slices_of(&reader, guard.slot);
+            let range = catalogue.range(0, expert)?;
+            let ExpertRange::E2m1 {
+                gate,
+                up,
+                down,
+                gate_scale,
+                up_scale,
+                down_scale,
+            } = range
+            else {
+                bail!("E2M1 range");
+            };
+            let mut file_bytes = Vec::new();
+            for native in [gate, up, down, gate_scale, up_scale, down_scale] {
+                let start = native.offset as usize;
+                let end = start + native.len as usize;
+                file_bytes.extend_from_slice(&file[start..end]);
+            }
+            assert_eq!(expected, file_bytes, "expert {expert}");
+            let viewed: Vec<u8> = guard
+                .iter()
+                .flat_map(|value| value.to_bits().to_le_bytes())
+                .collect();
+            assert_eq!(viewed, file_bytes, "expert {expert} packed view");
+            let copies = guard.disk_slices()?;
+            assert_eq!(copies.len(), 6);
+            let mut from_copies = vec![0u8; file_bytes.len()];
+            let base = guard.bytes_ptr();
+            for &(offset, len, packed) in &copies {
+                // SAFETY: the lease holds the ring and the copy stays inside it.
+                let src = unsafe { std::slice::from_raw_parts(base.add(offset), len) };
+                from_copies[packed..packed + len].copy_from_slice(src);
+            }
+            assert_eq!(from_copies, file_bytes, "expert {expert} device slices");
+            let mut cleared = stored.clone();
+            for (place, residue) in plan.places.iter().zip(cleared.iter_mut()) {
+                if place.windowed {
+                    *residue = 0;
+                }
+            }
+            assert_ne!(logical_with(&reader, guard.slot, &cleared), file_bytes);
+            let neighbour = code_residues[(expert as usize + 1) % code_residues.len()];
+            let neighbour_scale = ((neighbour + 2304) % ALIGN) as u32;
+            let mut shifted = stored.clone();
+            for (index, residue) in shifted.iter_mut().enumerate() {
+                *residue = if index < 3 {
+                    neighbour as u32
+                } else {
+                    neighbour_scale
+                };
+            }
+            assert_ne!(logical_with(&reader, guard.slot, &shifted), file_bytes);
+            if expert as usize == clamp_expert {
+                assert_eq!(up.offset + up.len, file_len);
+                assert_ne!(up.offset % ALIGN, 0);
+                let begin = up.offset - up.offset % ALIGN;
+                let shortfall = begin + up.len + ALIGN - file_len;
+                assert_eq!(shortfall, ALIGN - up.offset % ALIGN);
+            }
+            classes += 1;
+            drop(guard);
+        }
+        assert_eq!(classes, code_residues.len());
+        println!(
+            "PASS direct_window_bytes classes={classes} clamped_expert={clamp_expert} file_bytes={file_len} mismatches=0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_scales_coalesce_behind_the_weight_windows() -> Result<()> {
+        const ALIGN: u64 = 4096;
+        let hidden = 64usize;
+        let intermediate = 128usize;
+        let code = (intermediate * hidden.div_ceil(2)) as u64;
+        let scale = (intermediate * hidden.div_ceil(32)) as u64;
+        let down_scale = (hidden * intermediate.div_ceil(32)) as u64;
+        assert!(code.is_multiple_of(ALIGN));
+        assert!(!scale.is_multiple_of(ALIGN) && !down_scale.is_multiple_of(ALIGN));
+        let staged_scale_bytes = (scale * 2 + down_scale) as usize;
+        let residue = 728u64;
+        let scale_residue = (residue + 2304) % ALIGN;
+        let roles = [
+            (
+                "w1.weight",
+                safetensors::Dtype::I8,
+                intermediate,
+                hidden / 2,
+                code,
+                residue,
+            ),
+            (
+                "w3.weight",
+                safetensors::Dtype::I8,
+                intermediate,
+                hidden / 2,
+                code,
+                residue,
+            ),
+            (
+                "w2.weight",
+                safetensors::Dtype::I8,
+                hidden,
+                intermediate / 2,
+                code,
+                residue,
+            ),
+            (
+                "w1.scale",
+                safetensors::Dtype::F8_E8M0,
+                intermediate,
+                hidden / 32,
+                scale,
+                scale_residue,
+            ),
+            (
+                "w3.scale",
+                safetensors::Dtype::F8_E8M0,
+                intermediate,
+                hidden / 32,
+                scale,
+                scale_residue,
+            ),
+            (
+                "w2.scale",
+                safetensors::Dtype::F8_E8M0,
+                hidden,
+                intermediate / 32,
+                down_scale,
+                scale_residue,
+            ),
+        ];
+        let mut cursor = 0u64;
+        let mut placed = Vec::new();
+        for (role, dtype, rows, cols, len, item_residue) in roles {
+            let base = cursor.div_ceil(ALIGN) * ALIGN;
+            let offset = base + item_residue;
+            cursor = base + len + ALIGN;
+            placed.push((role, dtype, rows, cols, len, offset));
+        }
+        let file: Vec<u8> = (0..cursor).map(byte_at).collect();
+        let dir = temp_dir("staged-scales")?;
+        std::fs::write(dir.path().join("staged.bin"), &file)?;
+        let mut entries = BTreeMap::new();
+        for (role, dtype, rows, cols, len, offset) in placed {
+            entries.insert(
+                format!("layers.0.ffn.experts.0.{role}"),
+                TensorEntry {
+                    dtype,
+                    shape: vec![rows, cols],
+                    shard: "staged.bin".into(),
+                    bytes: len as usize,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [offset, offset + len],
+                    scope: TensorScope::Text,
+                    layer: None,
+                    role: role.into(),
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                },
+            );
+        }
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 1,
+            experts: 1,
+            hidden: hidden as u32,
+            intermediate: intermediate as u32,
+            top_k: 1,
+        };
+        let catalogue = ExpertCatalogue::from_manifest(
+            &TensorManifest {
+                entries,
+                resident_bytes: 0,
+            },
+            geometry,
+            e2m1_format(),
+        )?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let slot = reader.read_expert(0, 0, &catalogue, catalogue.slot_bytes())?;
+        let guard = reader.values(slot)?;
+        let got = slices_of(&reader, guard.slot);
+        let range = catalogue.range(0, 0)?;
+        let ExpertRange::E2m1 {
+            gate,
+            up,
+            down,
+            gate_scale,
+            up_scale,
+            down_scale,
+        } = range
+        else {
+            bail!("E2M1 range");
+        };
+        let mut expected = Vec::new();
+        for native in [gate, up, down, gate_scale, up_scale, down_scale] {
+            let start = native.offset as usize;
+            expected.extend_from_slice(&file[start..start + native.len as usize]);
+        }
+        assert_eq!(got, expected);
+        let viewed: Vec<u8> = guard
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect();
+        assert_eq!(viewed, expected);
+        let copies = guard.disk_slices()?;
+        assert_eq!(copies.len(), 4);
+        assert_eq!(copies[3].1, staged_scale_bytes);
+        let mut cleared = unsafe { &*reader.ring[guard.slot].residues.get() }.clone();
+        let plan = reader.plan.as_ref().expect("plan");
+        for (place, residue) in plan.places.iter().zip(cleared.iter_mut()) {
+            if place.windowed {
+                *residue = 0;
+            }
+        }
+        assert_ne!(logical_with(&reader, guard.slot, &cleared), expected);
+        println!(
+            "PASS staged_scale_copies copies=4 scale_bytes={} weight_residue={residue}",
+            copies[3].1
+        );
         Ok(())
     }
 }

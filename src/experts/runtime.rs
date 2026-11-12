@@ -395,11 +395,11 @@ impl Residency {
             let block = u32::try_from(index).context("host block id exceeds u32")?;
             let arena = host.context("host arena missing for the host fill")?;
             let slot = reader.read_expert(layer, expert, catalogue, catalogue.slot_bytes())?;
-            let values = reader.values(slot)?;
+            let guard = reader.values(slot)?;
             let mut claim = arena.claim(block)?;
-            claim.slice()?.copy_from_slice(&values);
+            guard.copy_logical(claim.slice()?)?;
             drop(claim);
-            drop(values);
+            drop(guard);
             ledger.place_host(layer, expert)?;
             host_block[layer as usize][expert as usize] = block;
             host_bytes = host_bytes

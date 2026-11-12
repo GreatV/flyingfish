@@ -444,7 +444,9 @@ impl CohortStorage {
             for &expert in experts {
                 let slot =
                     disk.read_expert(layer as u32, expert, &catalogue, catalogue.slot_bytes())?;
-                staging.as_mut_slice()?.copy_from_slice(&disk.values(slot)?);
+                let guard = disk.values(slot)?;
+                guard.copy_logical(staging.as_mut_slice()?)?;
+                drop(guard);
                 // The pinned slot and destination remain live until upload synchronization.
                 unsafe {
                     super::copy::htod_async(
@@ -609,9 +611,9 @@ impl CohortStorage {
                         &self.catalogue,
                         self.catalogue.slot_bytes(),
                     )?;
-                    claim
-                        .slice()?
-                        .copy_from_slice(&self.disk.values(disk_slot)?);
+                    let guard = self.disk.values(disk_slot)?;
+                    guard.copy_logical(claim.slice()?)?;
+                    drop(guard);
                     // The writer claim remains owned until ready synchronizes the upload.
                     unsafe {
                         super::copy::htod_async(destination, claim.slice()?, &self.upload)?;
