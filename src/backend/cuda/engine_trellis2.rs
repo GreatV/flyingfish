@@ -2565,4 +2565,652 @@ mod tests {
         println!("PASS TRELLIS2_SLAT_DECODE cells={scored} skipped={skipped} cases={cases_run}");
         Ok(())
     }
+    #[ignore = "TRELLIS.2 geometry cells: FF_TRELLIS2_MODEL FF_TRELLIS2_SLAT_FIXTURES FF_TRELLIS2_SLAT_OUTPUT FLYINGFISH_RUNTIME_DIR, optional FF_TRELLIS2_SLAT_CASES"]
+    #[test]
+    fn slat_geometry_cells_gpu() -> Result<()> {
+        let root: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_FIXTURES")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_FIXTURES missing")?;
+        let out: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_OUTPUT")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_OUTPUT missing")?;
+        std::fs::create_dir_all(&out)?;
+        let floor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("geometry-floor-r1/floor.json"))?)?;
+        let cells = floor["cells"]
+            .as_array()
+            .context("geometry floor cells missing")?;
+        let tau_of = |id: &str| -> Result<(f64, f64)> {
+            let cell = cells
+                .iter()
+                .find(|c| c["id"] == id)
+                .with_context(|| format!("cell {id} missing"))?;
+            Ok((
+                cell["tau"]["max_abs"].as_f64().context("tau max_abs")?,
+                cell["tau"]["rmse"].as_f64().context("tau rmse")?,
+            ))
+        };
+        let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
+            ensure!(
+                a.len() == b.len() && !a.is_empty(),
+                "cell extent mismatch: {} vs {}",
+                a.len(),
+                b.len()
+            );
+            let mut maximum = 0.0f64;
+            let mut square = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                let d = f64::from(*x) - f64::from(*y);
+                maximum = maximum.max(d.abs());
+                square += d * d;
+            }
+            Ok((maximum, (square / a.len() as f64).sqrt()))
+        };
+        let score = |id: &str,
+                     native: &[f32],
+                     stored: &[f32],
+                     control: &[f32],
+                     defects: &mut usize|
+         -> Result<()> {
+            let (tau_max, tau_rmse) = tau_of(id)?;
+            let (max_abs, rmse) = metric(native, stored)?;
+            let (control_max, control_rmse) = metric(native, control)?;
+            let pass = max_abs <= tau_max && rmse <= tau_rmse;
+            let control_ok = control_max > 10.0 * tau_max && control_rmse > 10.0 * tau_rmse;
+            println!(
+                "TRELLIS2_GEOMETRY_CELL id={id} max_abs={max_abs:.15e} rmse={rmse:.15e} tau_max={tau_max:.15e} tau_rmse={tau_rmse:.15e} control_max={control_max:.15e} control_rmse={control_rmse:.15e} result={}",
+                if pass && control_ok { "PASS" } else { "DEFECT" }
+            );
+            if !pass || !control_ok {
+                *defects += 1;
+            }
+            Ok(())
+        };
+        let device = Device::new(0)?;
+        let (free, _) = device.ctx.mem_get_info()?;
+        let scope: Vec<String> = std::env::var("FF_TRELLIS2_SLAT_CASES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let vision_ops = super::super::cubin::module(&device.ctx, "vision_ops")?;
+        let mut defects = 0usize;
+        let mut scored = 0usize;
+        let mut cases_run = 0usize;
+        for fixture in ["cottage", "robot_crab"] {
+            for resolution in ["512", "1024", "1024cascade", "1536cascade"] {
+                let name = format!("{fixture}-{resolution}");
+                if !scope.is_empty() && !scope.contains(&name) {
+                    continue;
+                }
+                cases_run += 1;
+                let geometry_dir = root.join(format!("geometry-{name}-r0a"));
+                let metadata: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(geometry_dir.join("metadata.json"))?)?;
+                let resolution = metadata["resolution"].as_u64().context("resolution")? as u32;
+                let shape_fields = read_tensor(
+                    &root.join(format!("decode-shape-{name}-r0a/fields.safetensors")),
+                    "features",
+                )?;
+                let coordinates = read_coords4(
+                    &root.join(format!("decode-shape-{name}-r0a/fields.safetensors")),
+                    "coords",
+                )?;
+                let rows = coordinates.len();
+                ensure!(shape_fields.len() == rows * 7, "shape fields extent");
+                let sites = crate::sparse::SparseSites::new(coordinates.clone())?;
+                let d = &device;
+                let fields = d.stream.clone_htod(&shape_fields)?;
+                let vertices = d.stream.alloc_zeros::<f32>(rows * 3)?;
+                let flags = d.stream.alloc_zeros::<u8>(rows * 3)?;
+                let weights = d.stream.alloc_zeros::<f32>(rows)?;
+                unsafe {
+                    d.stream
+                        .launch_builder(&vision_ops.load_function("dual_grid_head_f32")?)
+                        .arg(&fields)
+                        .arg(&(rows as u32))
+                        .arg(&vertices)
+                        .arg(&flags)
+                        .arg(&weights)
+                        .launch(super::super::ops::flat(rows))?;
+                }
+                let native_weights: Vec<f32> = d.stream.clone_dtoh(&weights)?.to_vec();
+                unsafe {
+                    d.stream
+                        .launch_builder(&vision_ops.load_function("activation_f32")?)
+                        .arg(&weights)
+                        .arg(&weights)
+                        .arg(&(rows as u32))
+                        .arg(&1u32)
+                        .arg(&3i32)
+                        .launch(super::super::ops::flat(rows))?;
+                }
+                let dual: Vec<f32> = d.stream.clone_dtoh(&vertices)?.to_vec();
+                let stored_dual =
+                    read_tensor(&geometry_dir.join("extraction-input.safetensors"), "dual")?;
+                if stored_dual.len() != dual.len() {
+                    println!(
+                        "TRELLIS2_SLAT_SKIP id=geometry/{name}/dual stored_rows={} case_rows={}",
+                        stored_dual.len() / 3,
+                        dual.len() / 3
+                    );
+                    continue;
+                }
+                let mut swapped = dual.clone();
+                for row in 0..rows {
+                    swapped.swap(row * 3, row * 3 + 2);
+                }
+                score(
+                    &format!("geometry/{name}/dual"),
+                    &dual,
+                    &stored_dual,
+                    &swapped,
+                    &mut defects,
+                )?;
+                scored += 1;
+                let stored_weights = read_tensor(
+                    &geometry_dir.join("extraction-input.safetensors"),
+                    "weights",
+                )?;
+                let activated: Vec<f32> = d.stream.clone_dtoh(&weights)?.to_vec();
+                ensure!(
+                    stored_weights.len() == activated.len(),
+                    "weights extent mismatch on {name}"
+                );
+                score(
+                    &format!("geometry/{name}/weights"),
+                    &activated,
+                    &stored_weights,
+                    &native_weights,
+                    &mut defects,
+                )?;
+                scored += 1;
+                let budget = [free, free];
+                let mesh = super::super::sparse::mesh_from_dual(
+                    d, sites, vertices, flags, weights, resolution, budget,
+                )?;
+                let stored_vertices =
+                    read_tensor(&geometry_dir.join("raw-mesh.safetensors"), "vertices")?;
+                ensure!(
+                    stored_vertices.len() == mesh.vertices.len(),
+                    "vertex extent mismatch on {name}: {} vs {}",
+                    stored_vertices.len(),
+                    mesh.vertices.len()
+                );
+                let rescaled: Vec<f32> = mesh
+                    .vertices
+                    .iter()
+                    .map(|v| (v + 0.5) * resolution as f32 / (resolution + 1) as f32 - 0.5)
+                    .collect();
+                score(
+                    &format!("geometry/{name}/vertices"),
+                    &mesh.vertices,
+                    &stored_vertices,
+                    &rescaled,
+                    &mut defects,
+                )?;
+                scored += 1;
+                let tex_fields = read_tensor(
+                    &root.join(format!("decode-tex-{name}-r0a/fields.safetensors")),
+                    "features",
+                )?;
+                let material: Vec<f32> = tex_fields.iter().map(|value| value * 0.5 + 0.5).collect();
+                let stored_material =
+                    read_tensor(&geometry_dir.join("material.safetensors"), "features")?;
+                ensure!(
+                    stored_material.len() == material.len(),
+                    "material extent mismatch on {name}"
+                );
+                let width = 6usize;
+                let mut swapped_channels = material.clone();
+                for row in 0..material.len() / width {
+                    swapped_channels.swap(row * width, row * width + 2);
+                }
+                score(
+                    &format!("geometry/{name}/material"),
+                    &material,
+                    &stored_material,
+                    &swapped_channels,
+                    &mut defects,
+                )?;
+                scored += 1;
+            }
+        }
+        ensure!(
+            defects == 0,
+            "TRELLIS.2 geometry gate: {defects} defects over {scored} cells"
+        );
+        ensure!(cases_run > 0, "TRELLIS.2 geometry gate: no cases matched");
+        println!("PASS TRELLIS2_GEOMETRY cells={scored} cases={cases_run}");
+        Ok(())
+    }
+
+    #[ignore = "TRELLIS.2 end-to-end mesh: FF_TRELLIS2_MODEL FF_TRELLIS_IMAGE_MODEL FF_TRELLIS2_SLAT_FIXTURES FF_TRELLIS2_SLAT_OUTPUT FLYINGFISH_RUNTIME_DIR"]
+    #[test]
+    fn slat_e2e_mesh_gpu() -> Result<()> {
+        let model: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_MODEL")
+            .map(Into::into)
+            .context("FF_TRELLIS2_MODEL missing")?;
+        let image_model: std::path::PathBuf = std::env::var_os("FF_TRELLIS_IMAGE_MODEL")
+            .map(Into::into)
+            .context("FF_TRELLIS_IMAGE_MODEL missing")?;
+        let root: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_FIXTURES")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_FIXTURES missing")?;
+        let out: std::path::PathBuf = std::env::var_os("FF_TRELLIS2_SLAT_OUTPUT")
+            .map(Into::into)
+            .context("FF_TRELLIS2_SLAT_OUTPUT missing")?;
+        std::fs::create_dir_all(&out)?;
+        let runtime = std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let pipeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
+        let models = &pipeline["args"]["models"];
+        let normalization = |kind: &str| -> Result<(Vec<f32>, Vec<f32>)> {
+            let entry = &pipeline["args"][format!("{kind}_slat_normalization")];
+            let read = |key: &str| -> Result<Vec<f32>> {
+                entry[key]
+                    .as_array()
+                    .context("normalization entry missing")?
+                    .iter()
+                    .map(|v| Ok(v.as_f64().context("normalization value")? as f32))
+                    .collect()
+            };
+            Ok((read("mean")?, read("std")?))
+        };
+        let checkpoint = |key: &str| -> Result<std::path::PathBuf> {
+            Ok(model.join(format!(
+                "ckpts/{}.safetensors",
+                models[key]
+                    .as_str()
+                    .context("pipeline model entry missing")?
+                    .trim_start_matches("ckpts/")
+            )))
+        };
+        let metric = |a: &[f32], b: &[f32]| -> Result<f64> {
+            ensure!(a.len() == b.len() && !a.is_empty(), "extent mismatch");
+            let mut maximum = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                maximum = maximum.max((f64::from(*x) - f64::from(*y)).abs());
+            }
+            Ok(maximum)
+        };
+        let device = Device::new(0)?;
+        let ops = super::super::ops::Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            std::rc::Rc::new(super::super::closure::Closure::new(
+                false,
+                "SLAT end to end".into(),
+            )),
+        )?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = (total - total / 8).saturating_sub(total - free);
+        for fixture in ["cottage", "robot_crab"] {
+            let ss_dir = root.join(format!("ss-{fixture}-r0a"));
+            let ss_noise_stored = read_tensor(&ss_dir.join("sampler-input.safetensors"), "noise")?;
+            let ss_cond: Vec<bf16> =
+                read_tensor(&ss_dir.join("sampler-input.safetensors"), "cond")?
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect();
+            let mut ss_noise = vec![0f32; ss_noise_stored.len()];
+            for (index, value) in ss_noise_stored.iter().enumerate() {
+                ss_noise[(index % 4096) * 8 + index / 4096] = *value;
+            }
+            {
+                let mut flow = TrellisSsFlow::load(
+                    &device,
+                    &mut blas,
+                    &checkpoint("sparse_structure_flow_model")?,
+                    1029,
+                    limit,
+                )?;
+                let (z_s, _) = flow.sample(
+                    &blas,
+                    &ss_noise,
+                    &ss_cond,
+                    StageSampling {
+                        sparse: false,
+                        guided: true,
+                        concat: None,
+                    },
+                    false,
+                )?;
+                drop(flow);
+                let stored_z_stored =
+                    read_tensor(&ss_dir.join("sampler-output.safetensors"), "state12")?;
+                let mut stored_z = vec![0f32; stored_z_stored.len()];
+                for (index, value) in stored_z_stored.iter().enumerate() {
+                    stored_z[(index % 4096) * 8 + index / 4096] = *value;
+                }
+                let drift = metric(&z_s, &stored_z)?;
+                println!(
+                    "TRELLIS2_E2E_DRIFT stage=ss fixture={fixture} kind=z_s max_abs={drift:.15e} rows={}",
+                    z_s.len() / 8
+                );
+                let decoder = super::super::pixal3d::PixalDecoder::open(
+                    &device,
+                    &image_model,
+                    crate::pixal3d::DecoderKind::Structure,
+                    &runtime,
+                    limit,
+                )?;
+                let mut latent = vec![0f32; z_s.len()];
+                for (index, value) in z_s.iter().enumerate() {
+                    latent[(index % 8) * 4096 + index / 8] = *value;
+                }
+                let logits = decoder.structure(&latent)?;
+                drop(decoder);
+                let sites = super::super::pixal3d::PixalDecoder::structure_sites(&logits, 64, 32)?;
+                let stored_sites = read_coords(
+                    &root.join(format!("shape-{fixture}-512-r0a/sampler-input.safetensors")),
+                    "noise.coords",
+                )?;
+                let native_sites: Vec<[i32; 3]> = sites
+                    .coordinates()
+                    .iter()
+                    .map(|c| [c[1], c[2], c[3]])
+                    .collect();
+                let mut native_sorted = native_sites.clone();
+                native_sorted.sort_unstable();
+                let mut stored_sorted = stored_sites.clone();
+                stored_sorted.sort_unstable();
+                ensure!(
+                    native_sorted == stored_sorted,
+                    "SS site set differs on {fixture}: {} vs {}",
+                    native_sorted.len(),
+                    stored_sorted.len()
+                );
+                println!(
+                    "TRELLIS2_E2E_STRUCTURE stage=ss-decode fixture={fixture} sites={} identical=true",
+                    native_sites.len()
+                );
+            }
+            let lr_dir = root.join(format!("shape-{fixture}-512-r0a"));
+            let lr_sites = read_coords(&lr_dir.join("sampler-input.safetensors"), "noise.coords")?;
+            let lr_noise =
+                read_tensor(&lr_dir.join("sampler-input.safetensors"), "noise.features")?;
+            let lr_cond: Vec<bf16> =
+                read_tensor(&lr_dir.join("sampler-input.safetensors"), "cond")?
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect();
+            let (shape_mean, shape_std) = normalization("shape")?;
+            let lr_slat = {
+                let mut flow = TrellisSsFlow::load_flow(
+                    &device,
+                    &mut blas,
+                    &checkpoint("shape_slat_flow_model_512")?,
+                    &lr_sites,
+                    1029,
+                    limit,
+                )?;
+                let (state, _) = flow.sample(
+                    &blas,
+                    &lr_noise,
+                    &lr_cond,
+                    StageSampling {
+                        sparse: true,
+                        guided: true,
+                        concat: None,
+                    },
+                    false,
+                )?;
+                drop(flow);
+                normalize_slat(&state, &shape_mean, &shape_std)
+            };
+            let stored_lr = read_tensor(&lr_dir.join("stage-output.safetensors"), "slat.features")?;
+            let lr_drift = metric(&lr_slat, &stored_lr)?;
+            println!(
+                "TRELLIS2_E2E_DRIFT stage=shape-lr fixture={fixture} kind=slat max_abs={lr_drift:.15e} rows={}",
+                lr_slat.len() / 32
+            );
+            let hr_coordinates = {
+                let decoder = super::super::pixal3d::PixalDecoder::open(
+                    &device,
+                    &model,
+                    crate::pixal3d::DecoderKind::Shape,
+                    &runtime,
+                    limit,
+                )?;
+                let coords4: Vec<[i32; 4]> =
+                    lr_sites.iter().map(|c| [0, c[0], c[1], c[2]]).collect();
+                let (decoded, _) = decoder.decode(coords4, &lr_slat, &[])?;
+                decoded.coordinates
+            };
+            let cascade_dir = root.join(format!("cascade-{fixture}-1024-r0a"));
+            let cascade_metadata: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cascade_dir.join("metadata.json"))?)?;
+            let input_rows = cascade_metadata["input_rows"]
+                .as_u64()
+                .context("input rows")? as usize;
+            ensure!(
+                hr_coordinates.len() == input_rows,
+                "LR decode site count differs on {fixture}: {} vs {input_rows}",
+                hr_coordinates.len()
+            );
+            let stored_hr = read_coords4(&cascade_dir.join("coordinates.safetensors"), "coords")?;
+            // Published rule: ((coord + 0.5) / 512 * (resolution / 16))
+            // truncated to int, then unique; the resolution drops by 128 while
+            // the token count stays >= 49152 (1024 floor).
+            let quantize = |resolution: usize| -> Vec<[i32; 4]> {
+                let mut quantized: Vec<[i32; 4]> = hr_coordinates
+                    .iter()
+                    .map(|c| {
+                        [
+                            c[0],
+                            (((c[1] as f64 + 0.5) / 512.0 * (resolution as f64 / 16.0)) as i32),
+                            (((c[2] as f64 + 0.5) / 512.0 * (resolution as f64 / 16.0)) as i32),
+                            (((c[3] as f64 + 0.5) / 512.0 * (resolution as f64 / 16.0)) as i32),
+                        ]
+                    })
+                    .collect();
+                quantized.sort_unstable();
+                quantized.dedup();
+                quantized
+            };
+            let mut hr_resolution = 1024usize;
+            let mut hr_sites4 = quantize(hr_resolution);
+            while hr_sites4.len() >= 49152 && hr_resolution > 1024 {
+                hr_resolution -= 128;
+                hr_sites4 = quantize(hr_resolution);
+            }
+            ensure!(
+                hr_sites4.len() == stored_hr.len(),
+                "cascade site count differs on {fixture}: {} vs {}",
+                hr_sites4.len(),
+                stored_hr.len()
+            );
+            ensure!(hr_sites4 == stored_hr, "cascade sites differ on {fixture}");
+            let mut rounded: Vec<[i32; 4]> = hr_coordinates
+                .iter()
+                .map(|c| {
+                    [
+                        c[0],
+                        (((c[1] as f64 + 0.5) / 512.0 * (1024.0 / 16.0)).round()) as i32,
+                        (((c[2] as f64 + 0.5) / 512.0 * (1024.0 / 16.0)).round()) as i32,
+                        (((c[3] as f64 + 0.5) / 512.0 * (1024.0 / 16.0)).round()) as i32,
+                    ]
+                })
+                .collect();
+            rounded.sort_unstable();
+            rounded.dedup();
+            ensure!(
+                rounded.len() != stored_hr.len(),
+                "rounding control does not discriminate on {fixture}"
+            );
+            println!(
+                "TRELLIS2_E2E_STRUCTURE stage=cascade fixture={fixture} resolution={hr_resolution} sites={} round_control_sites={} identical=true",
+                hr_sites4.len(),
+                rounded.len()
+            );
+            let hr_dir = root.join(format!("shape-{fixture}-1024cascade-r0a"));
+            let hr_noise =
+                read_tensor(&hr_dir.join("sampler-input.safetensors"), "noise.features")?;
+            let hr_cond: Vec<bf16> =
+                read_tensor(&hr_dir.join("sampler-input.safetensors"), "cond")?
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect();
+            let hr_sites: Vec<[i32; 3]> = hr_sites4.iter().map(|c| [c[1], c[2], c[3]]).collect();
+            let shape_slat = {
+                let mut flow = TrellisSsFlow::load_flow(
+                    &device,
+                    &mut blas,
+                    &checkpoint("shape_slat_flow_model_1024")?,
+                    &hr_sites,
+                    4101,
+                    limit,
+                )?;
+                let (state, _) = flow.sample(
+                    &blas,
+                    &hr_noise,
+                    &hr_cond,
+                    StageSampling {
+                        sparse: true,
+                        guided: true,
+                        concat: None,
+                    },
+                    false,
+                )?;
+                drop(flow);
+                normalize_slat(&state, &shape_mean, &shape_std)
+            };
+            let stored_hr_slat =
+                read_tensor(&hr_dir.join("stage-output.safetensors"), "slat.features")?;
+            let hr_drift = metric(&shape_slat, &stored_hr_slat)?;
+            println!(
+                "TRELLIS2_E2E_DRIFT stage=shape-hr fixture={fixture} kind=slat max_abs={hr_drift:.15e} rows={}",
+                shape_slat.len() / 32
+            );
+            let (mesh, guides) = {
+                let decoder = super::super::pixal3d::PixalDecoder::open(
+                    &device,
+                    &model,
+                    crate::pixal3d::DecoderKind::Shape,
+                    &runtime,
+                    limit,
+                )?;
+                let latent = device.stream.clone_htod(&shape_slat)?;
+                let (mesh, guides) = decoder.shape_mesh_device(
+                    hr_sites4.clone(),
+                    latent,
+                    u32::try_from(hr_resolution)?,
+                )?;
+                (mesh, guides)
+            };
+            let geometry_dir = root.join(format!("geometry-{fixture}-1024cascade-r0a"));
+            let geometry_metadata: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(geometry_dir.join("metadata.json"))?)?;
+            let stored_vertices =
+                read_tensor(&geometry_dir.join("raw-mesh.safetensors"), "vertices")?;
+            let expected_vertices =
+                geometry_metadata["vertices"].as_u64().context("vertices")? as usize;
+            ensure!(
+                mesh.vertices.len() == expected_vertices * 3,
+                "mesh vertex count differs on {fixture}: {} vs {expected_vertices}",
+                mesh.vertices.len() / 3
+            );
+            let mesh_drift = metric(&mesh.vertices, &stored_vertices)?;
+            println!(
+                "TRELLIS2_E2E_DRIFT stage=mesh fixture={fixture} kind=vertices max_abs={mesh_drift:.15e} vertices={} faces={}",
+                mesh.vertices.len() / 3,
+                mesh.faces.len() / 3
+            );
+            let tex_dir = root.join(format!("tex-{fixture}-1024cascade-r0a"));
+            let tex_noise =
+                read_tensor(&tex_dir.join("sampler-input.safetensors"), "noise.features")?;
+            let tex_cond: Vec<bf16> =
+                read_tensor(&tex_dir.join("sampler-input.safetensors"), "cond")?
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect();
+            let (tex_mean, tex_std) = normalization("tex")?;
+            let concat: Vec<bf16> = shape_slat
+                .chunks(32)
+                .flat_map(|row| {
+                    (0..32).map(|channel| {
+                        bf16::from_f32((row[channel] - shape_mean[channel]) / shape_std[channel])
+                    })
+                })
+                .collect();
+            let tex_slat = {
+                let mut flow = TrellisSsFlow::load_flow(
+                    &device,
+                    &mut blas,
+                    &checkpoint("tex_slat_flow_model_1024")?,
+                    &hr_sites,
+                    4101,
+                    limit,
+                )?;
+                let (state, _) = flow.sample(
+                    &blas,
+                    &tex_noise,
+                    &tex_cond,
+                    StageSampling {
+                        sparse: true,
+                        guided: false,
+                        concat: Some(&concat),
+                    },
+                    false,
+                )?;
+                drop(flow);
+                normalize_slat(&state, &tex_mean, &tex_std)
+            };
+            let stored_tex_slat =
+                read_tensor(&tex_dir.join("stage-output.safetensors"), "slat.features")?;
+            let tex_drift = metric(&tex_slat, &stored_tex_slat)?;
+            println!(
+                "TRELLIS2_E2E_DRIFT stage=tex fixture={fixture} kind=slat max_abs={tex_drift:.15e} rows={}",
+                tex_slat.len() / 32
+            );
+            let tex_fields = {
+                let decoder = super::super::pixal3d::PixalDecoder::open(
+                    &device,
+                    &model,
+                    crate::pixal3d::DecoderKind::Texture,
+                    &runtime,
+                    limit,
+                )?;
+                let latent = device.stream.clone_htod(&tex_slat)?;
+                let (decoded, generated) =
+                    decoder.decode_device(hr_sites4.clone(), latent, &guides)?;
+                ensure!(
+                    generated.is_empty(),
+                    "texture decoder predicted subdivision"
+                );
+                decoded.features
+            };
+            let stored_fields = read_tensor(
+                &root.join(format!(
+                    "decode-tex-{fixture}-1024cascade-r0a/fields.safetensors"
+                )),
+                "features",
+            )?;
+            let fields_drift = metric(&tex_fields, &stored_fields)?;
+            println!(
+                "TRELLIS2_E2E_DRIFT stage=tex-decode fixture={fixture} kind=fields max_abs={fields_drift:.15e} rows={}",
+                tex_fields.len() / 6
+            );
+            let material: Vec<f32> = tex_fields.iter().map(|v| v * 0.5 + 0.5).collect();
+            let stored_material =
+                read_tensor(&geometry_dir.join("material.safetensors"), "features")?;
+            let material_drift = metric(&material, &stored_material)?;
+            println!(
+                "TRELLIS2_E2E_DRIFT stage=material fixture={fixture} kind=features max_abs={material_drift:.15e} rows={}",
+                material.len() / 6
+            );
+        }
+        println!("PASS TRELLIS2_E2E fixtures=2 stages=8 structural=exact");
+        Ok(())
+    }
 }
