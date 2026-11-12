@@ -5921,6 +5921,391 @@ fn hi3d_qkv_preparation_identity_gpu() -> Result<()> {
 
 #[test]
 #[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and published Hi3D F16 checkpoints"]
+fn hi3d_norm_silu_published_identity_gpu() -> Result<()> {
+    norm_silu_identity(true)
+}
+
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "requires admitted CUDA and FF_F16_QKV_FIXTURES configs"]
+fn hi3d_norm_silu_synthetic_identity_gpu() -> Result<()> {
+    norm_silu_identity(false)
+}
+
+#[cfg(feature = "cuda")]
+fn norm_silu_identity(published: bool) -> Result<()> {
+    for (rung, n, p, expected) in [
+        (512, 11295, 2548, 83),
+        (1024, 57439, 13019, 89),
+        (1536, 99928, 22775, 91),
+    ] {
+        let times = heun_schedule(n, 25)?;
+        let forwards = times
+            .iter()
+            .flat_map(|&(time, next)| [time, next])
+            .map(|t| {
+                1 + usize::from(
+                    if t >= 1.0 {
+                        4.0
+                    } else if t >= 0.7 {
+                        10.0 * (t * t)
+                    } else {
+                        1.0
+                    } != 1.0,
+                )
+            })
+            .sum::<usize>();
+        ensure!(forwards == expected, "norm epilogue schedule count differs");
+        let norm1_bytes = 4 * forwards * (4992 * n + 256 * p);
+        let norm2_bytes = 8 * forwards * (384 * n + 1056 * p);
+        println!(
+            "F16_NORM_SILU_COUNTED rung={rung} rows={n} parents={p} forwards={forwards} removed_launches={} norm1_boundary_B={norm1_bytes} norm2_boundary_B={norm2_bytes} source_boundary_B={} timing=false",
+            12 * forwards,
+            norm1_bytes + norm2_bytes
+        );
+    }
+    let d = Device::new(0)?;
+    let fixture: Value = if published {
+        Value::Null
+    } else {
+        serde_json::from_slice(&std::fs::read(
+            env_path("FF_F16_QKV_FIXTURES")?.join("qkv.json"),
+        )?)?
+    };
+    let (mut cells, mut defects, mut controls) = (0, 0, 0);
+    for (owner, component) in ["transformer_512", "transformer_1024"]
+        .into_iter()
+        .enumerate()
+    {
+        let checkpoint = if published {
+            Some(Hi3DFlowCheckpoint::open(
+                &env_path("FF_HI3D_MODEL")?,
+                component,
+            )?)
+        } else {
+            None
+        };
+        let spec = if let Some(c) = &checkpoint {
+            c.spec.flow_spec()
+        } else {
+            ensure!(
+                fixture["models"][owner]["component"] == component,
+                "norm SiLU fixture owner differs"
+            );
+            serde_json::from_value::<crate::pixal3d::Hi3DFlowSpec>(
+                fixture["models"][owner]["config"].clone(),
+            )?
+            .flow_spec()
+        };
+        ensure!(
+            spec.model_channels == 2112 && spec.num_heads == 22 && spec.num_blocks == 24,
+            "norm SiLU published geometry differs"
+        );
+        let tensors = checkpoint
+            .as_ref()
+            .map(|c| c.mapped.component_tensors())
+            .transpose()?;
+        let load = |name: &str, width: usize, half: bool| -> Result<Vec<f32>> {
+            let values = if let Some(tensors) = &tensors {
+                let t = tensors
+                    .get(name)
+                    .with_context(|| format!("missing norm SiLU parameter {name}"))?;
+                ensure!(
+                    t.shape == [width] && t.dtype == if half { "F16" } else { "F32" },
+                    "norm SiLU parameter layout {name}"
+                );
+                if half {
+                    t.data
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|v| f16::from_le_bytes(*v).to_f32())
+                        .collect()
+                } else {
+                    t.data
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|v| f32::from_le_bytes(*v))
+                        .collect()
+                }
+            } else {
+                (0..width)
+                    .map(|i| {
+                        let v = ((i * 37 + name.len() * 131 + owner * 997) % 65521) as f32
+                            / 65521.0
+                            - 0.5;
+                        if name.ends_with("weight") {
+                            1.0 + v
+                        } else {
+                            v / 8.0
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            ensure!(
+                values.len() == width && values.iter().all(|v| v.is_finite()),
+                "invalid norm SiLU parameters"
+            );
+            Ok(values)
+        };
+        let mut k = Kernels::load::<f16>(&d, &spec)?;
+        for (name, input, hidden, parent) in [
+            ("input_blocks.0", 256, 128, false),
+            ("input_blocks.1", 256, 1056, true),
+            ("out_blocks.0", 4224, 128, false),
+            ("out_blocks.1", 512, 128, false),
+        ] {
+            let weight =
+                d.stream
+                    .clone_htod(&load(&format!("{name}.norm1.weight"), input, false)?)?;
+            let bias = d
+                .stream
+                .clone_htod(&load(&format!("{name}.norm1.bias"), input, false)?)?;
+            let parameters = load(&format!("{name}.emb_layers.1.bias"), 2 * hidden, true)?
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            let parameters = d.stream.clone_htod(&parameters)?;
+            for modulated in [false, true] {
+                let width = if modulated { hidden } else { input };
+                let affine = if modulated {
+                    [0, 0]
+                } else {
+                    [ptr(&weight, &d), ptr(&bias, &d)]
+                };
+                let modulation = if modulated { ptr(&parameters, &d) } else { 0 };
+                let full = if parent {
+                    [2548, 13019, 22775]
+                } else {
+                    [11295, 57439, 99928]
+                };
+                for rows in [1, 3, 31, 33, 257].into_iter().chain(full) {
+                    let result = norm_silu_case(&d, &mut k, [rows, width], affine, modulation)?;
+                    println!(
+                        "{} F16_NORM_SILU_IDENTITY component={component} published={published} role={name} rows={rows} width={width} modulated={modulated} defects={result} threshold_bits=0 eager_graph=true in_out_place=true",
+                        if result == 0 { "PASS" } else { "DEFECT" }
+                    );
+                    defects += result;
+                    cells += 1;
+                }
+            }
+        }
+        if controls == 0 {
+            defects += usize::from(!norm_silu_round_control(&d, &mut k)?);
+            controls += 1;
+        }
+    }
+    println!(
+        "F16_NORM_SILU_RESULT published={published} cells={cells} controls={controls} defects={defects} threshold_bits=0 timing=false"
+    );
+    ensure!(
+        cells == 128 && controls == 1 && defects == 0,
+        "norm SiLU candidate defects"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn norm_silu_case(
+    d: &Device,
+    k: &mut Kernels,
+    shape: [usize; 2],
+    affine: [u64; 2],
+    modulation: u64,
+) -> Result<usize> {
+    use cudarc::driver::sys;
+    let [rows, width] = shape;
+    let count = rows
+        .checked_mul(width)
+        .context("norm SiLU extent overflow")?;
+    let sentinel = f16::from_f32(-123.0);
+    let mut initial = vec![sentinel; count + 16];
+    for (i, v) in initial[8..8 + count].iter_mut().enumerate() {
+        *v = match i % 127 {
+            0 => f16::from_bits(1 + (i % 31) as u16),
+            1 => f16::from_bits(if i & 1 == 0 { 0 } else { 0x8000 }),
+            _ => f16::from_f32(((i * 37 % 65521) as f32 - 32760.0) / 16381.0),
+        };
+    }
+    let mut input = d.stream.clone_htod(&initial)?;
+    let output = d.stream.clone_htod(&vec![sentinel; count + 16])?;
+    let input_ptr = ptr(&input, d) + 16;
+    let output_ptr = ptr(&output, d) + 16;
+    let launch = |k: &Kernels, inplace: bool| {
+        k.norm_silu(
+            d,
+            input_ptr,
+            if inplace { input_ptr } else { output_ptr },
+            shape,
+            affine,
+            modulation,
+        )
+    };
+    let read = |buffer: &CudaSlice<f16>| -> Result<Vec<f16>> {
+        let values = d.stream.clone_dtoh(buffer)?;
+        ensure!(
+            values[..8]
+                .iter()
+                .chain(&values[8 + count..])
+                .all(|&v| v == sentinel)
+                && values[8..8 + count].iter().all(|v| v.is_finite()),
+            "norm SiLU guard/nonfinite failure"
+        );
+        Ok(values)
+    };
+    let capture = |k: &Kernels, inplace: bool| -> Result<cudarc::driver::CudaGraph> {
+        d.finish_upload()?;
+        d.stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let result = launch(k, inplace);
+        let graph = d.stream.end_capture(sys::CUgraphInstantiate_flags(0));
+        result?;
+        graph?.context("norm SiLU graph missing")
+    };
+    k.norm_silu_reference = true;
+    launch(k, false)?;
+    let expected = read(&output)?;
+    launch(k, false)?;
+    let repeat_bits = context_projection_bits(&expected, &read(&output)?)?;
+    let graph = capture(k, false)?;
+    let reference_nodes = producer_graph_resources(&graph)?;
+    let names = reference_nodes
+        .iter()
+        .map(|v| {
+            v["function"]
+                .as_str()
+                .context("norm reference graph has nonkernel node")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut required = BTreeSet::from(["q38_layer_norm_f16_fma", "vision_silu_f16"]);
+    if modulation != 0 {
+        required.insert("row_modulate_f16");
+    }
+    ensure!(
+        reference_nodes.len() == required.len() && names == required,
+        "wrong norm SiLU reference graph"
+    );
+    graph.launch()?;
+    let reference_graph_bits = context_projection_bits(&expected, &read(&output)?)?;
+    ensure!(
+        repeat_bits == 0 && reference_graph_bits == 0,
+        "norm SiLU reference noise"
+    );
+    k.norm_silu_reference = false;
+    let mut defects = 0;
+    for inplace in [false, true] {
+        if inplace {
+            d.stream.memcpy_htod(&initial, &mut input)?;
+        }
+        launch(k, inplace)?;
+        let eager_bits =
+            context_projection_bits(&expected, &read(if inplace { &input } else { &output })?)?;
+        if inplace {
+            d.stream.memcpy_htod(&initial, &mut input)?;
+        }
+        let graph = capture(k, inplace)?;
+        let nodes = producer_graph_resources(&graph)?;
+        let expected_name = if modulation == 0 {
+            "layer_norm_silu_f16"
+        } else {
+            "layer_norm_modulate_silu_f16"
+        };
+        ensure!(
+            nodes.len() == 1
+                && nodes[0]["function"] == expected_name
+                && nodes[0]["block"] == serde_json::json!([256, 1, 1])
+                && nodes[0]["grid"] == serde_json::json!([rows, 1, 1])
+                && nodes[0]["local_bytes"] == 0,
+            "norm SiLU launch/resource failure"
+        );
+        graph.launch()?;
+        let graph_bits =
+            context_projection_bits(&expected, &read(if inplace { &input } else { &output })?)?;
+        defects += usize::from(eager_bits != 0 || graph_bits != 0);
+        println!(
+            "F16_NORM_SILU_CELL shape={shape:?} modulated={} inplace={inplace} eager_bits={eager_bits} graph_bits={graph_bits} old_repeat_bits={repeat_bits} old_graph_bits={reference_graph_bits} threshold_bits=0 old_resources={} new_resources={}",
+            modulation != 0,
+            serde_json::to_string(&reference_nodes)?,
+            serde_json::to_string(&nodes)?
+        );
+    }
+    Ok(defects)
+}
+
+#[cfg(feature = "cuda")]
+fn norm_silu_round_control(d: &Device, k: &mut Kernels) -> Result<bool> {
+    let (rows, width) = (33usize, 256usize);
+    let count = rows * width;
+    let initial = (0..count)
+        .map(|i| f16::from_f32(((i * 37 % 65521) as f32 - 32760.0) / 16381.0))
+        .collect::<Vec<_>>();
+    let input = d.stream.clone_htod(&initial)?;
+    let correct = d.stream.alloc_zeros::<f16>(count)?;
+    let candidate = d.stream.alloc_zeros::<f16>(count)?;
+    let mutant = d.stream.alloc_zeros::<f16>(count)?;
+    let full = d.stream.alloc_zeros::<f32>(count)?;
+    k.norm_silu_reference = true;
+    k.norm_silu(
+        d,
+        ptr(&input, d),
+        ptr(&correct, d),
+        [rows, width],
+        [0, 0],
+        0,
+    )?;
+    k.norm_silu_reference = false;
+    k.norm_silu(
+        d,
+        ptr(&input, d),
+        ptr(&candidate, d),
+        [rows, width],
+        [0, 0],
+        0,
+    )?;
+    let norm = cubin::module(&d.ctx, "q38_common")?.load_function("q38_layer_norm_f16_to_f32")?;
+    unsafe {
+        d.stream
+            .launch_builder(&norm)
+            .arg(&input)
+            .arg(&0u64)
+            .arg(&0u64)
+            .arg(&full)
+            .arg(&(rows as u32))
+            .arg(&1u32)
+            .arg(&(width as u32))
+            .arg(&(width as u64))
+            .arg(&0u64)
+            .arg(&1u64)
+            .arg(&(width as u64))
+            .arg(&0u64)
+            .arg(&1u64)
+            .arg(&1e-6f32)
+            .launch(grid(rows, 256))?;
+        d.stream
+            .launch_builder(&k.silu)
+            .arg(&full)
+            .arg(&0u64)
+            .arg(&full)
+            .arg(&(count as u32))
+            .arg(&(width as u32))
+            .launch(flat(count))?;
+    }
+    k.cast(d, ptr(&full, d), ptr(&mutant, d), count)?;
+    let expected = d.stream.clone_dtoh(&correct)?;
+    let positive_bits = context_projection_bits(&expected, &d.stream.clone_dtoh(&candidate)?)?;
+    let mutant_bits = context_projection_bits(&expected, &d.stream.clone_dtoh(&mutant)?)?;
+    let valid = positive_bits == 0 && mutant_bits > 0;
+    println!(
+        "{} F16_NORM_SILU_ROUND_CONTROL rows={rows} width={width} omitted=normalized_f16_round positive_bits={positive_bits} mutant_bits={mutant_bits} threshold_bits=0",
+        if valid { "PASS" } else { "DEFECT" }
+    );
+    Ok(valid)
+}
+
+#[test]
+#[cfg(feature = "cuda")]
 #[ignore = "requires admitted CUDA and FF_F16_ROW_NORM_FIXTURES"]
 fn hi3d_row_norm_identity_gpu() -> Result<()> {
     use cudarc::driver::sys::{self, CUfunction_attribute as F};
@@ -6211,6 +6596,7 @@ fn flow_padded_identity(
     defects: &mut usize,
 ) -> Result<()> {
     let compact = flow.device.stream.clone_dtoh(output)?;
+    flow_norm_silu_identity(flow, input, condition, output, &compact, defects)?;
     flow_gather_identity(flow, input, condition, output, &compact, defects)?;
     flow_attention_identity(flow, input, condition, output, &compact, defects)?;
     flow.flash.set_f16_reference(2)?;
@@ -6271,6 +6657,38 @@ fn flow_padded_identity(
     *defects += usize::from(bits != 0);
     flow_context_identity(flow, input, condition, output, &compact, defects)?;
     flow_bias_identity(flow, input, condition, output, &compact, defects)
+}
+
+pub(super) fn flow_norm_silu_identity(
+    flow: &mut Flow<f16>,
+    input: &CudaSlice<f32>,
+    condition: &Conditioning<f16>,
+    output: &mut CudaSlice<f32>,
+    compact: &[f32],
+    defects: &mut usize,
+) -> Result<()> {
+    flow.kernels.norm_silu_reference = true;
+    let result = flow.forward(input, 0, condition, output);
+    flow.kernels.norm_silu_reference = false;
+    result?;
+    let separate = flow.device.stream.clone_dtoh(output)?;
+    ensure!(
+        compact.len() == separate.len() && compact.iter().chain(&separate).all(|x| x.is_finite()),
+        "nonfinite norm SiLU velocity comparison"
+    );
+    let bits: u64 = compact
+        .iter()
+        .zip(&separate)
+        .map(|(a, b)| u64::from((a.to_bits() ^ b.to_bits()).count_ones()))
+        .sum();
+    println!(
+        "N5_F16_NORM_SILU_FLOW_IDENTITY {} rows={} output_bits={bits} blocks={} threshold_bits=0",
+        if bits == 0 { "PASS" } else { "DEFECT" },
+        flow.rows,
+        flow.blocks.len()
+    );
+    *defects += usize::from(bits != 0);
+    Ok(())
 }
 
 pub(super) fn flow_gather_identity(
