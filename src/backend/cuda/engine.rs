@@ -4049,6 +4049,14 @@ impl Engine {
         }
         let trace_start = self.position + ids.len() - keep;
         let end = self.position + ids.len();
+        if matches!(
+            self.model_spec.architecture,
+            crate::model_spec::Architecture::DeepseekV41
+                | crate::model_spec::Architecture::Glm5Next
+        ) && let Some(slots) = self.moe_slots.as_mut()
+        {
+            slots.accumulate_prefill();
+        }
         let mut part = 0usize;
         let mut consumed = 0;
         while consumed < ids.len() {

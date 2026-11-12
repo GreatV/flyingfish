@@ -180,9 +180,11 @@ pub struct Residency {
     published: Vec<Published>,
     moves: Vec<PromptMove>,
     dispatched: Vec<bool>,
-    /// Selection counts for the open request. Frozen into `prefill_rank` at the prefill boundary.
+    /// Selection counts for the open request. Copied into `prefill_rank` at each prefill end.
     prefill_counts: Vec<Vec<u32>>,
     prefill_rank: Option<Vec<Vec<u32>>>,
+    /// An appended prefill is accumulating rows. Decode admissions stay off until the next freeze.
+    prefill_open: bool,
     #[cfg(test)]
     host_admit: bool,
     #[cfg(test)]
@@ -441,6 +443,7 @@ impl Residency {
             dispatched: vec![false; layers],
             prefill_counts: vec![vec![0u32; experts]; layers],
             prefill_rank: None,
+            prefill_open: false,
             #[cfg(test)]
             host_admit: true,
             #[cfg(test)]
@@ -731,7 +734,7 @@ impl Residency {
                 self.routed[l][e] = true;
                 self.scores[l][e] += 1.0;
             }
-            if self.prefill_rank.is_none() {
+            if self.prefill_rank.is_none() || self.prefill_open {
                 self.prefill_counts[l][e] = self.prefill_counts[l][e]
                     .checked_add(1)
                     .context("prefill route count overflow")?;
@@ -1197,6 +1200,7 @@ impl Residency {
             row.fill(0);
         }
         self.prefill_rank = None;
+        self.prefill_open = false;
         #[cfg(test)]
         {
             self.admit_copies = 0;
@@ -1204,13 +1208,15 @@ impl Residency {
         Ok(())
     }
 
-    /// Freezes the current request's prefill selection counts. Later decode misses compare against this rank.
+    /// The following dispatches are prefill rows of the open request.
+    pub fn accumulate_prefill(&mut self) {
+        self.prefill_open = true;
+    }
+
+    /// Replaces the rank with the prefill counts accumulated for the open request.
     pub fn freeze_prefill_rank(&mut self) -> Result<()> {
-        ensure!(
-            self.prefill_rank.is_none(),
-            "prefill rank is already frozen"
-        );
         self.prefill_rank = Some(self.prefill_counts.clone());
+        self.prefill_open = false;
         Ok(())
     }
 
@@ -1241,6 +1247,9 @@ impl Residency {
     ) -> Result<Vec<PlannedAdmit>> {
         #[cfg(test)]
         if !self.host_admit {
+            return Ok(Vec::new());
+        }
+        if self.prefill_open {
             return Ok(Vec::new());
         }
         let Some(rank) = self.prefill_rank.as_ref() else {
@@ -3091,7 +3100,7 @@ mod tests {
         residency.dispatch(1, &[route(0, 0, disk)])?;
         assert!(residency.plan_streamed_admits(1, &[])?.is_empty());
         residency.freeze_prefill_rank()?;
-        assert!(residency.freeze_prefill_rank().is_err());
+        residency.freeze_prefill_rank()?;
         assert!(residency.plan_streamed_admits(0, &[]).is_err());
         let mut reserved = Vec::new();
         for expert in 0..8u32 {
@@ -3148,6 +3157,88 @@ mod tests {
         residency.end_request()?;
         assert_eq!(residency.admit_copies(), 0);
         assert!(residency.plan_streamed_admits(1, &[])?.is_empty());
+        Ok(())
+    }
+
+    fn open_streamed() -> Result<(Residency, TempDir)> {
+        let geometry = three_layers();
+        let layout = bf16_layout(&geometry)?;
+        let slot = layout.slot_bytes();
+        let (capacity, admission) =
+            crate::experts::plan::staging_capacity(geometry, layout, 1, 4 * slot, 12 * slot, 2)?;
+        let host = HostBlocks::new(
+            capacity.host_blocks + capacity.spare_blocks,
+            usize::try_from(slot / 2)?,
+        )?;
+        let (dir, catalogue) = staged(geometry)?;
+        let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
+        let frequency = vec![vec![1.0; 8]; 3];
+        let initial = initial_residency(&frequency, &capacity.slots_per_layer, &geometry)?;
+        let (mut residency, _) = Residency::load(LoadInputs {
+            geometry,
+            capacity,
+            admission,
+            max_rows: 8,
+            initial: &initial,
+            host: Some(&host),
+            catalogue: &catalogue,
+            reader: &reader,
+        })?;
+        residency.begin_request(&frequency)?;
+        Ok((residency, dir))
+    }
+
+    #[test]
+    fn appended_prefill_refreezes_the_rank_of_both_segments() -> Result<()> {
+        let (mut split, _split_dir) = open_streamed()?;
+        let (mut whole, _whole_dir) = open_streamed()?;
+        let disk = (0..8u32)
+            .find(|&expert| {
+                split
+                    .ledger()
+                    .tier(1, expert)
+                    .is_ok_and(|tier| tier == Tier::Disk)
+            })
+            .context("layer 1 has no disk expert")?;
+        ensure!(
+            whole.ledger().tier(1, disk)? == Tier::Disk,
+            "paired residency moved expert {disk}"
+        );
+        let other = (0..8u32)
+            .find(|&expert| expert != disk)
+            .context("layer 1 has one expert")?;
+        split.begin_token()?;
+        split.dispatch(1, &[route(0, 0, disk)])?;
+        split.finish_token()?;
+        split.freeze_prefill_rank()?;
+        split.accumulate_prefill();
+        split.begin_token()?;
+        assert!(split.plan_streamed_admits(1, &[])?.is_empty());
+        split.dispatch(1, &[route(0, 0, other)])?;
+        assert!(split.plan_streamed_admits(1, &[])?.is_empty());
+        split.finish_token()?;
+        split.freeze_prefill_rank()?;
+        whole.begin_token()?;
+        whole.dispatch(1, &[route(0, 0, disk)])?;
+        whole.finish_token()?;
+        whole.begin_token()?;
+        whole.dispatch(1, &[route(0, 0, other)])?;
+        whole.finish_token()?;
+        whole.freeze_prefill_rank()?;
+        assert_eq!(split.prefill_rank, whole.prefill_rank);
+        ensure!(
+            split.prefill_counts[1][disk as usize] == 1
+                && split.prefill_counts[1][other as usize] == 1,
+            "appended prefill counts {:?}",
+            split.prefill_counts[1]
+        );
+        split.begin_token()?;
+        split.dispatch(1, &[route(0, 0, disk)])?;
+        let split_plan = split.plan_streamed_admits(1, &[])?;
+        whole.begin_token()?;
+        whole.dispatch(1, &[route(0, 0, disk)])?;
+        let whole_plan = whole.plan_streamed_admits(1, &[])?;
+        assert_eq!(split_plan, whole_plan);
         Ok(())
     }
 }

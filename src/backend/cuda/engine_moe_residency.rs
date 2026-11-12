@@ -1520,6 +1520,10 @@ impl Slots {
         Ok(())
     }
 
+    pub(in crate::backend::cuda::engine) fn accumulate_prefill(&mut self) {
+        self.policy.accumulate_prefill();
+    }
+
     pub(in crate::backend::cuda::engine) fn freeze_prefill_rank(&mut self) -> Result<()> {
         self.policy.freeze_prefill_rank()
     }
