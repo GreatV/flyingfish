@@ -4447,6 +4447,137 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GPU lease and publisher teacher trace"]
+    fn breeze_teacher_eos_matches_publisher_frames() -> Result<()> {
+        const ROW_MAX: f32 = 0.25;
+        const EOS_PROB_MAX: f64 = 0.03;
+        const TRANSFORM_MAX: f32 = 1e-5;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let trace = env_path("N8_TRACE", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(trace)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let codes = doc["codes"]
+            .as_array()
+            .context("codes")?
+            .iter()
+            .flat_map(|frame| frame.as_array().into_iter().flatten())
+            .map(|value| i32::try_from(value.as_i64().context("code")?).context("code"))
+            .collect::<Result<Vec<_>>>()?;
+        let expected = doc["frames"]
+            .as_array()
+            .context("frames")?
+            .iter()
+            .map(|frame| {
+                frame["raw_logits"]
+                    .as_array()
+                    .context("raw logits")?
+                    .iter()
+                    .map(|value| value.as_f64().context("logit").map(|v| v as f32))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(codes.len().is_multiple_of(super::BOOKS), "trace code rows");
+        let text_rows = prompt.len();
+        let audio = codes.len() / super::BOOKS;
+        ensure!(expected.len() == audio + 1, "trace EOS row");
+        let runtime = RuntimeDir::with_prefix("n8-teacher-eos")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, text_rows, audio + 1)?;
+        model.set_graph(false);
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let positions = super::Positions {
+            text: (0..text_rows).collect(),
+            audio: (text_rows..text_rows + audio).collect(),
+            eos: Vec::new(),
+            seq: text_rows + audio,
+        };
+        let logits = model.backbone(&projected, &positions, &codes, false)?;
+        let sampling = crate::sampling::Sampling::new(0.9, 50, 1.0)?;
+        let mut worst_row = 0.0f32;
+        let mut worst_eos = 0.0f32;
+        let mut worst_probability = 0.0f64;
+        let mut worst_transform = 0.0f32;
+        for (frame, expected) in expected.iter().enumerate() {
+            let start = (text_rows - 1 + frame) * super::BB_VOCAB;
+            let row = &logits[start..start + super::BB_VOCAB];
+            ensure!(row.len() == expected.len(), "trace vocabulary");
+            let row_max = row
+                .iter()
+                .zip(expected)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0f32, f32::max);
+            let eos_max = (row[2051] - expected[2051]).abs();
+            let probabilities = sampling.probabilities(row, (2048, 2050), Some(2051))?;
+            let publisher_probability = doc["frames"][frame]["eos_top_k_probability"]
+                .as_f64()
+                .context("publisher probability")?;
+            let probability_max = (f64::from(probabilities[2051]) - publisher_probability).abs();
+            super::sample_rows(
+                &model.k,
+                &model.buf.d,
+                &mut model.buf.probabilities,
+                &mut model.buf.picked,
+                super::SampleRequest {
+                    source_start: start,
+                    picked_start: 0,
+                    rows: 1,
+                    vocab: super::BB_VOCAB,
+                    sampling,
+                    seed: 42,
+                    stream: 0,
+                    counter: frame as u64,
+                    allow: 2051,
+                },
+            )?;
+            let gpu = model
+                .k
+                .stream
+                .clone_dtoh(&model.buf.probabilities.slice(..super::BB_VOCAB))?;
+            model.k.stream.synchronize()?;
+            let transform_max = gpu
+                .iter()
+                .zip(&probabilities)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0f32, f32::max);
+            ensure!(row_max <= ROW_MAX, "teacher row {frame} max={row_max}");
+            ensure!(eos_max <= ROW_MAX, "teacher EOS {frame} max={eos_max}");
+            ensure!(
+                probability_max <= EOS_PROB_MAX,
+                "teacher EOS probability {frame} max={probability_max}"
+            );
+            ensure!(
+                transform_max <= TRANSFORM_MAX,
+                "CUDA distribution {frame} max={transform_max}"
+            );
+            worst_row = worst_row.max(row_max);
+            worst_eos = worst_eos.max(eos_max);
+            worst_probability = worst_probability.max(probability_max);
+            worst_transform = worst_transform.max(transform_max);
+        }
+        println!(
+            "BREEZE_TEACHER_EOS PASS frames={} row_max={} eos_logit_max={} eos_prob_max={} transform_max={} thresholds={}/{}/{}",
+            expected.len(),
+            worst_row,
+            worst_eos,
+            worst_probability,
+            worst_transform,
+            ROW_MAX,
+            EOS_PROB_MAX,
+            TRANSFORM_MAX
+        );
+        Ok(())
+    }
+
+    #[test]
     fn depth_sample_counters_are_disjoint_across_frames() {
         let mut seen = std::collections::BTreeSet::new();
         for frame in 0..750 {
