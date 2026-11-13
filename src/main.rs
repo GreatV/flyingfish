@@ -984,7 +984,7 @@ fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> 
     #[cfg(not(feature = "cuda"))]
     bail!("speak requires CUDA");
     #[cfg(feature = "cuda")]
-    {
+    flyingfish::backend::with_verbose(cli.verbose, || {
         let text = if text == "-" {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input)?;
@@ -1031,6 +1031,7 @@ fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> 
         Ok(())
     })
                 .context("--runtime-dir is required for speak")?,
+            verbose: cli.verbose,
         };
         let speech = flyingfish::breeze::speak(&cli.model, &text, seed, options)?;
         let mut bytes = Vec::new();
@@ -1050,7 +1051,7 @@ fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> 
             std::io::stdout().write_all(&bytes)?;
         }
         Ok(())
-    }
+    })
 }
 
 fn video(
