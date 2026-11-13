@@ -5,8 +5,11 @@ use flyingfish::{
     minimax_h3::{
         AUDIO_TAG, AdalnPlan, DecodePlan, Geometry, H3Spec, IMAGE_MIN_GENERATION_AREA, IMAGE_TAG,
         ImageLayout, ImageSchedule, ImageSpec, ImageVaeSpec, KeyframeAnchor, PackedLayout,
-        RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec, VaeTiles, image_canvas, image_layout,
-        image_row_plan, image_row_timesteps, row_timestep_plan,
+        RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec, VaeTiles, image_canvas,
+        image_edit_rows, image_latent_extent, image_layout, image_picture_label,
+        image_reference_latent_extent, image_reference_size, image_rgb8, image_row_plan,
+        image_row_timesteps, image_text_rows, patchify_latents, row_timestep_plan,
+        unpatchify_latents,
     },
     prefill::DensePlacement,
 };
@@ -1100,6 +1103,96 @@ fn minimax_h3_image_canvas_matches_the_definition_table() -> Result<()> {
             && image_canvas(&spec, 512, 512, 1023).is_err()
             && image_canvas(&spec, 512, 512, 4096 * 4096 + 1).is_err(),
         "accepted an illegal canvas input"
+    );
+    Ok(())
+}
+
+#[test]
+fn minimax_h3_image_reference_extent_and_presentation() -> Result<()> {
+    let spec = image_spec()?;
+    ensure!(
+        image_reference_size((44, 20), (32, 64), 8)? == (72, 32)
+            && image_reference_size((100, 80), (32, 64), 8)? == (80, 64)
+            && image_reference_size((60, 50), (32, 64), 8)? == (60, 50)
+            && image_reference_size((22, 16), (32, 64), 8)? == (48, 32)
+            && image_reference_size((18, 16), (32, 64), 8)? == (32, 32)
+            && image_reference_size((1100, 1030), (1024, 2048), 32)? == (1100, 1030)
+            && image_reference_size((3000, 2000), (1024, 1024), 32)? == (1536, 1024),
+        "reference size"
+    );
+    ensure!(
+        image_reference_size((16, 40), (32, 64), 32).is_err(),
+        "accepted a side shorter than the multiple"
+    );
+    ensure!(
+        image_latent_extent(&spec, 2048, 2048)? == (128, 128)
+            && image_reference_latent_extent(&spec, 1200, 1500)? == (74, 92)
+            && image_latent_extent(&spec, 1500, 1500).is_err(),
+        "latent extent"
+    );
+    ensure!(
+        image_picture_label(0) == "Picture 1: " && !image_picture_label(0).contains('<'),
+        "picture label"
+    );
+    let (ids, tags) = image_edit_rows(&[&[1, 2]], &[&[9, 9, 9]], &[3, 4, 5])?;
+    ensure!(
+        ids == [1, 2, 9, 9, 9, 3, 4, 5]
+            && tags
+                == [
+                    TEXT_TAG, TEXT_TAG, IMAGE_TAG, IMAGE_TAG, IMAGE_TAG, TEXT_TAG, TEXT_TAG,
+                    TEXT_TAG
+                ],
+        "edit rows"
+    );
+    let long = vec![7u32; 4097];
+    let prompt = vec![8u32; 4097];
+    let (ids, tags) = image_edit_rows(&[&long], &[&[9, 9]], &prompt)?;
+    ensure!(
+        ids.len() == 8194
+            && ids[..4096].iter().all(|&id| id == 7)
+            && ids[4096..4098] == [9, 9]
+            && ids[4098..].iter().all(|&id| id == 8)
+            && tags[..4096].iter().all(|&tag| tag == TEXT_TAG)
+            && tags[4096..4098].iter().all(|&tag| tag == IMAGE_TAG)
+            && tags[4098..].iter().all(|&tag| tag == TEXT_TAG)
+            && image_edit_rows(&[&[1]], &[&[9]], &[]).is_err()
+            && image_text_rows(&[]).is_err(),
+        "edit truncation"
+    );
+    let canvas = [0.0f32, 0.5, 1.0, -0.2, 1.2, 0.25];
+    ensure!(
+        image_rgb8(&canvas, [2, 1], [2, 1])? == [0, 127, 255, 0, 255, 63]
+            && image_rgb8(&[0.0, 0.0, f32::NAN], [1, 1], [1, 1]).is_err(),
+        "rgb8 truncation"
+    );
+    let wide = vec![0.5f32; 12];
+    let quant: Vec<u8> = wide
+        .iter()
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0).trunc() as u8)
+        .collect();
+    ensure!(
+        image_rgb8(&wide, [2, 2], [1, 1])?
+            == flyingfish::serve::image::resize_lanczos(
+                &quant,
+                [2, 2, 3],
+                [1, 1],
+                flyingfish::serve::image::ResizeRounding::F64,
+            )?,
+        "rgb8 resize"
+    );
+    let (frames, h, w) = (1usize, 4, 6);
+    let n = spec.in_channels * frames * h * w;
+    let values: Vec<f32> = (0..n).map(|i| (i * 17 % 251) as f32 + 0.125).collect();
+    let rows = patchify_latents(&values, (spec.in_channels, frames, h, w), spec.patch);
+    ensure!(
+        unpatchify_latents(&rows, (spec.in_channels, frames, h, w), spec.patch) == values,
+        "patch roundtrip"
+    );
+    let mut swapped = rows.clone();
+    swapped.swap(0, 1);
+    ensure!(
+        unpatchify_latents(&swapped, (spec.in_channels, frames, h, w), spec.patch) != values,
+        "patch column order"
     );
     Ok(())
 }

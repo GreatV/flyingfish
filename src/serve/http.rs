@@ -270,6 +270,35 @@ fn render_chat(
     env.get_template("chat")?.render(context)
 }
 
+/// Renders `chat_template.jinja` for one system message and one user message, with thinking enabled.
+#[cfg(feature = "cuda")]
+pub(crate) fn render_image_messages(
+    model_dir: &std::path::Path,
+    system: &str,
+    user: &str,
+) -> Result<String> {
+    let template_text = read_chat_template(model_dir)?;
+    let mut env = Environment::new();
+    env.set_unknown_method_callback(template_string_methods);
+    env.add_function("raise_exception", template_exception);
+    env.add_template_owned("chat", template_text)
+        .map_err(|e| anyhow::anyhow!("chat template parse: {e}"))?;
+    let bos = read_bos_token(model_dir)?;
+    let messages = [
+        json!({"role": "system", "content": system}),
+        json!({"role": "user", "content": user}),
+    ];
+    render_chat(
+        &env,
+        &messages,
+        &bos,
+        &ChatTemplateOptions {
+            enable_thinking: Some(true),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("chat template render: {e}"))
+}
+
 fn check_greedy(params: &CommonParams) -> Result<(), Box<Response>> {
     if params.temperature.is_some_and(|t| t != 0.0) {
         return Err(Box::new(bad_request(

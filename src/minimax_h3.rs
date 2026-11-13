@@ -9,7 +9,7 @@ use std::{
 
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::engine::minimax_h3::{
-    generate, image_decode, image_encode, image_sample,
+    generate, image_decode, image_encode, image_latents, image_sample,
 };
 
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.
@@ -20,7 +20,7 @@ pub const MODALITIES: u32 = 3;
 /// Pixel frames per video VAE clip, the latent frames a clip keeps, and pixels per latent.
 const VAE_CLIP_FRAMES: usize = 17;
 const VAE_CLIP_LATENTS: usize = 5;
-const VAE_SPATIAL_RATIO: usize = 16;
+pub(crate) const VAE_SPATIAL_RATIO: usize = 16;
 pub const FPS: u32 = 24;
 const MIN_SECONDS: f64 = 5.0;
 const MAX_SECONDS: f64 = 15.0;
@@ -41,6 +41,8 @@ pub const STREAM_POSTERIOR_EPS: u64 = 0;
 pub const STREAM_ANCHOR_NOISE: u64 = 1;
 pub const STREAM_VIDEO_NOISE: u64 = 2;
 pub const STREAM_AUDIO_ROWS: u64 = 3;
+/// Philox stream of the image generation noise. No identity with the model definition's torch generator is claimed.
+pub const STREAM_IMAGE_NOISE: u64 = 4;
 /// Latent frame `i` spans `ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[i % 5]` rotary time units.
 const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
@@ -1323,6 +1325,13 @@ pub fn run_minimax_h3_i2va(
 pub const IMAGE_TAG: u8 = 0;
 /// Default smallest generation area, in pixels: `2048 * 2048`.
 pub const IMAGE_MIN_GENERATION_AREA: usize = 2048 * 2048;
+/// Tokens kept from a prompt or a picture label.
+pub const IMAGE_MAX_SEQUENCE_LENGTH: usize = 4096;
+/// Released VAE reference short-edge bounds, in pixels.
+pub const IMAGE_REFERENCE_MIN_SHORT: usize = 1024;
+pub const IMAGE_REFERENCE_MAX_SHORT: usize = 2048;
+/// Released vision-tower short edge, in pixels. The minimum and the maximum are the same value.
+pub const IMAGE_VISION_SHORT: usize = 1024;
 const IMAGE_MIN_AREA_BOUND: usize = 1024;
 const IMAGE_MAX_AREA_BOUND: usize = 4096 * 4096;
 /// Published sampling grid, seven values, six evaluations. `shift_provided_sigmas` is false.
@@ -1610,9 +1619,7 @@ impl ImageVaeSpec {
         );
         Ok(spec)
     }
-}
 
-impl ImageVaeSpec {
     /// Shared encoder and decoder dimensions with one decoded frame per image token.
     pub(crate) fn single_frame(&self) -> VaeSpec {
         VaeSpec {
@@ -1670,6 +1677,301 @@ pub fn image_canvas(
         (units * multiple as f64).max(multiple as f64) as usize
     };
     Ok((snap(height), snap(width)))
+}
+
+/// `(width, height)` a reference is resized to. A short edge inside `[min_short, max_short]` keeps its size.
+/// Otherwise the short edge lands on the nearer bound and both sides round half-to-even onto `multiple`.
+/// A side shorter than `multiple` is an error.
+pub fn image_reference_size(
+    (width, height): (usize, usize),
+    (min_short, max_short): (usize, usize),
+    multiple: usize,
+) -> Result<(usize, usize)> {
+    ensure!(
+        width > 0 && height > 0 && multiple > 0 && min_short > 0 && max_short >= min_short,
+        "reference size {width}x{height} bounds {min_short}..={max_short} multiple {multiple}"
+    );
+    ensure!(
+        width.min(height) >= multiple,
+        "reference {width}x{height} is shorter than {multiple} on a side"
+    );
+    let short = width.min(height);
+    if (min_short..=max_short).contains(&short) {
+        return Ok((width, height));
+    }
+    let bound = if short < min_short {
+        min_short
+    } else {
+        max_short
+    };
+    let scale = bound as f64 / short as f64;
+    let snap = |side: usize| {
+        let units = (side as f64 * scale / multiple as f64).round_ties_even();
+        (units * multiple as f64).max(multiple as f64) as usize
+    };
+    Ok((snap(width), snap(height)))
+}
+
+/// VAE copy of [`image_reference_size`] at the released bounds and the canvas multiple.
+pub fn image_vae_reference_size(
+    spec: &ImageSpec,
+    width: usize,
+    height: usize,
+) -> Result<(usize, usize)> {
+    image_reference_size(
+        (width, height),
+        (IMAGE_REFERENCE_MIN_SHORT, IMAGE_REFERENCE_MAX_SHORT),
+        VAE_SPATIAL_RATIO * spec.patch[2],
+    )
+}
+
+/// Vision-tower copy of [`image_reference_size`]. The short-edge minimum and maximum are both 1024.
+pub fn image_vision_reference_size(
+    spec: &ImageSpec,
+    width: usize,
+    height: usize,
+) -> Result<(usize, usize)> {
+    image_reference_size(
+        (width, height),
+        (IMAGE_VISION_SHORT, IMAGE_VISION_SHORT),
+        VAE_SPATIAL_RATIO * spec.patch[2],
+    )
+}
+
+/// Latent `(height, width)` of a canvas whose sides are multiples of the VAE ratio and the patch.
+pub fn image_latent_extent(
+    spec: &ImageSpec,
+    height: usize,
+    width: usize,
+) -> Result<(usize, usize)> {
+    ensure!(
+        height > 0
+            && width > 0
+            && height.is_multiple_of(VAE_SPATIAL_RATIO)
+            && width.is_multiple_of(VAE_SPATIAL_RATIO),
+        "canvas {height}x{width} is not a multiple of the VAE ratio"
+    );
+    let (latent_h, latent_w) = (height / VAE_SPATIAL_RATIO, width / VAE_SPATIAL_RATIO);
+    ensure!(
+        latent_h.is_multiple_of(spec.patch[1]) && latent_w.is_multiple_of(spec.patch[2]),
+        "latent {latent_h}x{latent_w} is not a multiple of the patch"
+    );
+    Ok((latent_h, latent_w))
+}
+
+/// Latent `(height, width)` after the top-left crop of a resized reference to whole patches.
+pub fn image_reference_latent_extent(
+    spec: &ImageSpec,
+    height: usize,
+    width: usize,
+) -> Result<(usize, usize)> {
+    let (unit_h, unit_w) = (
+        VAE_SPATIAL_RATIO * spec.patch[1],
+        VAE_SPATIAL_RATIO * spec.patch[2],
+    );
+    ensure!(
+        height >= unit_h && width >= unit_w,
+        "reference {height}x{width} has no whole patch"
+    );
+    Ok((
+        height / unit_h * spec.patch[1],
+        width / unit_w * spec.patch[2],
+    ))
+}
+
+/// Reference label `Picture {n}: `, `n` starting at 1. The label has no angle brackets.
+pub fn image_picture_label(index: usize) -> String {
+    format!("Picture {}: ", index + 1)
+}
+
+/// Text-to-image rows: `ids` truncated to [`IMAGE_MAX_SEQUENCE_LENGTH`], every tag [`TEXT_TAG`].
+pub fn image_text_rows(ids: &[u32]) -> Result<(Vec<u32>, Vec<u8>)> {
+    ensure!(!ids.is_empty(), "image prompt is empty");
+    let ids: Vec<u32> = ids
+        .iter()
+        .take(IMAGE_MAX_SEQUENCE_LENGTH)
+        .copied()
+        .collect();
+    let tags = vec![TEXT_TAG; ids.len()];
+    Ok((ids, tags))
+}
+
+/// Edit rows. Each label and the prompt are truncated to [`IMAGE_MAX_SEQUENCE_LENGTH`]. A vision block is
+/// tagged [`IMAGE_TAG`] and is not truncated. Labels and the prompt are [`TEXT_TAG`].
+pub fn image_edit_rows(
+    labels: &[&[u32]],
+    vision: &[&[u32]],
+    prompt: &[u32],
+) -> Result<(Vec<u32>, Vec<u8>)> {
+    ensure!(!prompt.is_empty(), "image prompt is empty");
+    ensure!(
+        !labels.is_empty() && labels.len() == vision.len(),
+        "edit presentation references"
+    );
+    let mut ids = Vec::new();
+    let mut tags = Vec::new();
+    for (label, block) in labels.iter().zip(vision) {
+        let label: Vec<u32> = label
+            .iter()
+            .take(IMAGE_MAX_SEQUENCE_LENGTH)
+            .copied()
+            .collect();
+        ensure!(
+            !label.is_empty() && !block.is_empty(),
+            "empty picture label or vision block"
+        );
+        tags.extend(std::iter::repeat_n(TEXT_TAG, label.len()));
+        ids.extend(label);
+        tags.extend(std::iter::repeat_n(IMAGE_TAG, block.len()));
+        ids.extend_from_slice(block);
+    }
+    let prompt: Vec<u32> = prompt
+        .iter()
+        .take(IMAGE_MAX_SEQUENCE_LENGTH)
+        .copied()
+        .collect();
+    tags.extend(std::iter::repeat_n(TEXT_TAG, prompt.len()));
+    ids.extend(prompt);
+    Ok((ids, tags))
+}
+
+/// RGB8 of a denormalised canvas in `[0, 1]`: `(x * 255)` clamped into `0..=255` and truncated toward zero,
+/// then Lanczos-3 to `(height, width)` when that differs from the canvas. The resize runs on the truncated bytes.
+pub fn image_rgb8(canvas: &[f32], from: [usize; 2], to: [usize; 2]) -> Result<Vec<u8>> {
+    let [height, width] = from;
+    let [out_h, out_w] = to;
+    let count = height
+        .checked_mul(width)
+        .and_then(|n| n.checked_mul(3))
+        .context("image rgb extent overflows")?;
+    ensure!(
+        height > 0 && width > 0 && out_h > 0 && out_w > 0 && canvas.len() == count,
+        "image rgb extent"
+    );
+    ensure!(
+        canvas.iter().all(|v| v.is_finite()),
+        "non-finite canvas pixel"
+    );
+    let bytes: Vec<u8> = canvas
+        .iter()
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0).trunc() as u8)
+        .collect();
+    crate::serve::image::resize_lanczos(
+        &bytes,
+        [height, width, 3],
+        [out_h, out_w],
+        crate::serve::image::ResizeRounding::F64,
+    )
+}
+
+/// Rows `[(f / pt) * (h / ph) * (w / pw), channels * pt * ph * pw]` of `x` `[channels, frames, h, w]`: frame-major
+/// then row-major, columns (channel, patch t, patch h, patch w).
+pub fn patchify_latents(
+    x: &[f32],
+    (channels, frames, h, w): (usize, usize, usize, usize),
+    patch: [usize; 3],
+) -> Vec<f32> {
+    let [pt, ph, pw] = patch;
+    let mut rows = Vec::with_capacity(x.len());
+    for f in 0..frames / pt {
+        for i in 0..h / ph {
+            for j in 0..w / pw {
+                for c in 0..channels {
+                    for a in 0..pt {
+                        for y in 0..ph {
+                            for z in 0..pw {
+                                rows.push(
+                                    x[((c * frames + f * pt + a) * h + i * ph + y) * w
+                                        + j * pw
+                                        + z],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// Inverse of [`patchify_latents`].
+pub fn unpatchify_latents(
+    rows: &[f32],
+    (channels, frames, h, w): (usize, usize, usize, usize),
+    patch: [usize; 3],
+) -> Vec<f32> {
+    let [pt, ph, pw] = patch;
+    let mut x = vec![0f32; rows.len()];
+    let mut next = rows.iter();
+    for f in 0..frames / pt {
+        for i in 0..h / ph {
+            for j in 0..w / pw {
+                for c in 0..channels {
+                    for a in 0..pt {
+                        for y in 0..ph {
+                            for z in 0..pw {
+                                x[((c * frames + f * pt + a) * h + i * ph + y) * w + j * pw + z] =
+                                    *next.next().expect("rows cover the patch grid");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    x
+}
+
+/// Device ordinal and the cuBLAS calibration directory.
+#[derive(Clone, Debug)]
+pub struct ImageRunOptions {
+    pub device: usize,
+    pub runtime_dir: PathBuf,
+}
+
+/// One edit reference: upright RGB8. The pipeline encodes it.
+pub struct ImageReference {
+    pub image: crate::serve::image::RgbImage,
+}
+
+/// One image request. `width` and `height` are the returned size. An expander replaces `prompt` and does not
+/// change the size.
+pub struct ImageRequest {
+    pub prompt: String,
+    pub width: usize,
+    pub height: usize,
+    pub seed: u64,
+    pub min_generation_area: usize,
+    pub expander: Option<PathBuf>,
+    pub references: Vec<ImageReference>,
+}
+
+impl ImageRequest {
+    pub fn new(prompt: impl Into<String>, width: usize, height: usize, seed: u64) -> Self {
+        Self {
+            prompt: prompt.into(),
+            width,
+            height,
+            seed,
+            min_generation_area: IMAGE_MIN_GENERATION_AREA,
+            expander: None,
+            references: Vec::new(),
+        }
+    }
+}
+
+/// Normalised generated latent, NCHW `[1, channels, height, width]`, at `canvas_height` x `canvas_width` pixels.
+/// `rgb` is HWC RGB8 at the requested size.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageLatents {
+    pub channels: usize,
+    pub height: usize,
+    pub width: usize,
+    pub values: Vec<f32>,
+    pub canvas_height: usize,
+    pub canvas_width: usize,
+    pub rgb: Vec<u8>,
 }
 
 /// Packed image sequence `[text | reference images | generated image]`.
