@@ -302,10 +302,12 @@ impl ImageDecoder {
             consumed == expected,
             "image VAE partial loader does not cover the decoder tensor set"
         );
-        eprintln!(
-            "{}",
-            serde_json::json!({"image_vae_decoder_load":{"tensors":consumed.len(),"weight_bytes":weight_bytes,"dtype":"F32"}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"image_vae_decoder_load":{"tensors":consumed.len(),"weight_bytes":weight_bytes,"dtype":"F32"}})
+            );
+        }
         Ok(Self {
             spec: spec.clone(),
             post_quant,
@@ -438,12 +440,14 @@ impl ImageDecoder {
             "image VAE work differs from counted memory plan {actual}/{}",
             work.plan.bytes
         );
-        eprintln!(
-            "{}",
-            serde_json::json!({"image_vae_plan":{"canvas":canvas,"tiles":work.tiles.count(),
-            "tokens":work.plan.tokens,"linear_batch":work.plan.linear,"attention_batch":work.plan.attention,
-            "bytes":actual,"workspace_budget":budget,"silu_grid":flat(work.plan.linear*work.plan.tokens*spec.ffn).grid_dim.0}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"image_vae_plan":{"canvas":canvas,"tiles":work.tiles.count(),
+                "tokens":work.plan.tokens,"linear_batch":work.plan.linear,"attention_batch":work.plan.attention,
+                "bytes":actual,"workspace_budget":budget,"silu_grid":flat(work.plan.linear*work.plan.tokens*spec.ffn).grid_dim.0}})
+            );
+        }
         Ok(work)
     }
 
@@ -4538,12 +4542,14 @@ impl EncodeWork {
             "encoder im2col budget needs at least {} bytes",
             4 * minimum
         );
-        eprintln!(
-            "{}",
-            serde_json::json!({"vae_encoder_work":{
-            "activation_bytes":fixed,"column_bytes":4 * workspace,"minimum_column_bytes":4 * minimum,
-            "budget":budget,"tile":[height,width]}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"vae_encoder_work":{
+                "activation_bytes":fixed,"column_bytes":4 * workspace,"minimum_column_bytes":4 * minimum,
+                "budget":budget,"tile":[height,width]}})
+            );
+        }
         let buffer = || s.alloc_zeros::<f32>(activations);
         Ok(Self {
             height,
