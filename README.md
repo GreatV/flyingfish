@@ -51,7 +51,7 @@ Media generation (library entry points and CLI):
 | Model | Notes | Backends |
 |---|---|---|
 | MiniMax-H3 | Image-to-video with audio: Qwen3-VL conditioner, streamed diffusion transformer with Turbo LoRA, video and audio decoders, native prompt, canvas and keyframe producers, noise drawn from the request seed; the diffusion transformer also loads from a GGUF Q4_0 file; `flyingfish::minimax_h3::run_minimax_h3_i2va`; the `video` command writes MP4 or Y4M+WAV | CUDA |
-| MiniMax-H3-Image | Diffusion transformer with the six-step Euler sampler and the edit path, streamed weights, on supplied text embeddings and latent rows; `flyingfish::minimax_h3::image_sample` | CUDA |
+| MiniMax-H3-Image | Prompt-to-image is usable. A prompt and optional upright RGB8 references become RGB8 through the Qwen3-VL conditioner, native VAE encode, six-step Euler under a derived placement, native VAE decode, truncation toward zero and Lanczos-3; one Philox draw from the request seed; `flyingfish::minimax_h3::image_latents`, `flyingfish::minimax_h3::image_encode`, `flyingfish::minimax_h3::image_decode`. `image_sample` runs the six evaluations on supplied embeddings and latent rows | CUDA |
 | MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) in one entry from token ids and a seed to stereo PCM; `flyingfish::music3::generate` | CUDA |
 
 Image to 3D (library entry points, no CLI):
@@ -63,7 +63,7 @@ Image to 3D (library entry points, no CLI):
 | Hi3D | DINOv2 and CLIP image conditioning, sparse flow and sparse VAE decoder at 512, 1024 or 1536, refining a supplied coarse mesh; raw mesh or a hole-filled, simplified and normalized mesh; `flyingfish::backend::Hi3DGeneration` | CUDA |
 | TRELLIS.2-4B | DINOv3 image conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders on supplied noise; decoder output differs from the reference at F16 quanta (see the PR); the stages run inside the crate, no library entry yet | CUDA |
 
-In progress: TRELLIS.2 image-to-3D (flow sampling and the structured-latent, mesh and texture stages landed; remaining: render, GLB and bake, the shape and texture encoders, and closing the decoder and structure-latent differences from the reference); MiniMax-H3-Image (no text encoder, VAE decoder or 4096 canvas yet).
+In progress: TRELLIS.2 image-to-3D (flow sampling and the structured-latent, mesh and texture stages landed; remaining: render, GLB and bake, the shape and texture encoders, and closing the decoder and structure-latent differences from the reference).
 
 ## Platforms
 
