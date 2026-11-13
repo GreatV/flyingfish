@@ -2085,6 +2085,32 @@ fn image_dimensions(bytes: &[u8], mime: Option<&str>) -> Result<(usize, usize)> 
     }
 }
 
+/// RGBA decode with alpha retained; an image without an alpha channel is
+/// the caller's error to name (image-to-3D inputs need the background
+/// already removed, which lives in the alpha channel).
+pub fn decode_image_rgba(bytes: &[u8], mime: Option<&str>) -> Result<(Vec<u8>, usize, usize)> {
+    ensure!(
+        matches!(image_format(bytes, mime)?, ImageFormat::Png),
+        "image-to-3D input must be a PNG"
+    );
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info()?;
+    let mut bytes = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut bytes)?;
+    ensure!(
+        info.bit_depth == png::BitDepth::Eight && info.color_type == png::ColorType::Rgba,
+        "image-to-3D input has no alpha channel; background removal (RMBG-2.0) is not yet available"
+    );
+    let width = info.width as usize;
+    let height = info.height as usize;
+    checked_pixels(width, height)?;
+    bytes.truncate(width * height * 4);
+    Ok((bytes, width, height))
+}
+
 pub fn decode_image(bytes: &[u8], mime: Option<&str>) -> Result<RgbImage> {
     match image_format(bytes, mime)? {
         ImageFormat::Png => decode_png(bytes),
