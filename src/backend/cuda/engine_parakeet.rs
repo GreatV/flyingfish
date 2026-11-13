@@ -3021,10 +3021,13 @@ impl ParakeetEncoder {
         windows: &[Vec<f32>],
         masks: &MultitalkerMasks<'_>,
         kernels: &MultitalkerKernels<'_>,
-        keep_all: bool,
         active: &[usize],
-        shared_pre_encode: bool,
+        mode: MultitalkerStepMode,
     ) -> Result<MultitalkerStep> {
+        let MultitalkerStepMode {
+            keep_all,
+            shared_pre_encode,
+        } = mode;
         let width = self.conformer.hidden as usize;
         let lanes = session.lanes as usize;
         ensure!(
@@ -3176,8 +3179,8 @@ impl ParakeetEncoder {
             session.depthwise[index] = cache.depthwise;
         }
         session.cumulative += rows as u32;
-        for lane in 0..lanes {
-            if main[lane] {
+        for (lane, is_main) in main.iter().enumerate() {
+            if *is_main {
                 session.lane_cumulative[lane] += rows as u32;
             }
         }
@@ -3246,7 +3249,10 @@ impl ParakeetEncoder {
                 group_spk.extend_from_slice(&masks.spk[*lane * 14..(*lane + 1) * 14]);
                 group_bg.extend_from_slice(&masks.bg[*lane * rows..(*lane + 1) * rows]);
             }
-            let group_masks = MultitalkerMasks { spk: &group_spk, bg: &group_bg };
+            let group_masks = MultitalkerMasks {
+                spk: &group_spk,
+                bg: &group_bg,
+            };
             let group_kernels = MultitalkerKernels {
                 speaker_up: kernels.speaker_up,
                 speaker_down: kernels.speaker_down,
@@ -3259,9 +3265,11 @@ impl ParakeetEncoder {
                 &group_windows,
                 &group_masks,
                 &group_kernels,
-                keep_all,
                 &slots,
-                shared_pre_encode,
+                MultitalkerStepMode {
+                    keep_all,
+                    shared_pre_encode,
+                },
             )?;
             #[cfg(test)]
             {
@@ -3296,11 +3304,15 @@ impl ParakeetEncoder {
             for (slot, lane) in group.iter().enumerate() {
                 session.lane_cumulative[*lane] += rows as u32;
                 merged_rows[*lane * out_rows * width..(*lane + 1) * out_rows * width]
-                    .copy_from_slice(&group_step.rows[slot * out_rows * width..(slot + 1) * out_rows * width]);
-                merged_in[*lane * rows * width..(*lane + 1) * rows * width]
-                    .copy_from_slice(&group_step.layer0_in[slot * rows * width..(slot + 1) * rows * width]);
-                merged_post[*lane * rows * width..(*lane + 1) * rows * width]
-                    .copy_from_slice(&group_step.layer0_post[slot * rows * width..(slot + 1) * rows * width]);
+                    .copy_from_slice(
+                        &group_step.rows[slot * out_rows * width..(slot + 1) * out_rows * width],
+                    );
+                merged_in[*lane * rows * width..(*lane + 1) * rows * width].copy_from_slice(
+                    &group_step.layer0_in[slot * rows * width..(slot + 1) * rows * width],
+                );
+                merged_post[*lane * rows * width..(*lane + 1) * rows * width].copy_from_slice(
+                    &group_step.layer0_post[slot * rows * width..(slot + 1) * rows * width],
+                );
             }
         }
         Ok(MultitalkerStep {
@@ -3467,10 +3479,10 @@ impl ParakeetEncoder {
         );
         let mut cat_k = self.stream.alloc_zeros(lanes * key_rows * width)?;
         let mut cat_v = self.stream.alloc_zeros(lanes * key_rows * width)?;
-        for lane in 0..lanes {
+        for (lane, is_live) in live.iter().enumerate() {
             let cached = session.lane_cumulative[lane].min(98) as usize;
             let lane_k = lane * key_rows * width;
-            if cached > 0 && live[lane] {
+            if cached > 0 && *is_live {
                 let cache_start = (lane * stride + cached - span_cache) * width;
                 self.copy_device(
                     &session.keys[index],
@@ -3594,8 +3606,8 @@ impl ParakeetEncoder {
         {
             let source_rows = launch_rows as usize;
             let available = source_rows.min(8);
-            for lane in 0..lanes {
-                if !live[lane] {
+            for (lane, is_live) in live.iter().enumerate() {
+                if !is_live {
                     self.copy_device(
                         &session.depthwise[index],
                         lane * 8 * width,
@@ -3639,8 +3651,8 @@ impl ParakeetEncoder {
         let stride = 98usize;
         let mut next_k = self.stream.alloc_zeros(lanes * stride * width)?;
         let mut next_v = self.stream.alloc_zeros(lanes * stride * width)?;
-        for lane in 0..lanes {
-            if !live[lane] {
+        for (lane, is_live) in live.iter().enumerate() {
+            if !is_live {
                 self.copy_device(
                     &session.keys[index],
                     lane * stride * width,
@@ -3755,6 +3767,13 @@ struct MultitalkerLayerStep {
     key: CudaSlice<f32>,
     value: CudaSlice<f32>,
     depthwise: CudaSlice<f32>,
+}
+/// Per-call mode flags for the multitalker encode step: keep-all rows
+/// (kernel mode) versus the 14-row emission window, and whether the
+/// pre-encode input is shared across the lane stack.
+pub(crate) struct MultitalkerStepMode {
+    pub(crate) keep_all: bool,
+    pub(crate) shared_pre_encode: bool,
 }
 
 /// Per-step diar masks `[lanes, 14]`.

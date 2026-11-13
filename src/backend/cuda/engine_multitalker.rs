@@ -67,7 +67,11 @@ struct MultitalkerRnnt {
 }
 
 impl MultitalkerRnnt {
-    fn load(checkpoint: &MappedCheckpoint, stream: &Arc<CudaStream>, spec: &MultitalkerSpec) -> Result<Self> {
+    fn load(
+        checkpoint: &MappedCheckpoint,
+        stream: &Arc<CudaStream>,
+        spec: &MultitalkerSpec,
+    ) -> Result<Self> {
         let hidden = spec.pred_hidden as usize;
         let vocab_blank = spec.vocab_size as usize + 1;
         let gate = 4 * hidden;
@@ -317,8 +321,13 @@ impl Multitalker {
             .layers
             .last()
             .context("prediction LSTM stack empty")?;
-        self.encoder
-            .lane_linear_into(&last.hidden, 4, 4, &self.rnnt.pred_projection, &mut dstream.prediction)?;
+        self.encoder.lane_linear_into(
+            &last.hidden,
+            4,
+            4,
+            &self.rnnt.pred_projection,
+            &mut dstream.prediction,
+        )?;
         *initialized = true;
         Ok(())
     }
@@ -354,8 +363,7 @@ impl Multitalker {
     ) -> Result<Vec<f32>> {
         let stream = &self.encoder.stream;
         let hidden = self.spec.pred_hidden as usize;
-        for lane in 0..4 {
-            let start = row_offsets[lane];
+        for (lane, &start) in row_offsets.iter().enumerate() {
             stream.memcpy_dtod(
                 &projected.slice(start..start + hidden),
                 &mut dstream
@@ -511,7 +519,9 @@ impl Multitalker {
             let mut input = vec![0.0f32; 4 * width];
             input[lane * width..(lane + 1) * width].copy_from_slice(row);
             let device_in = self.encoder.stream.clone_htod(&input)?;
-            let projected_all = self.encoder.linear(&device_in, 4, &self.rnnt.enc_projection)?;
+            let projected_all = self
+                .encoder
+                .linear(&device_in, 4, &self.rnnt.enc_projection)?;
             self.encoder.stream.memcpy_dtod(
                 &projected_all.slice(lane * joint_hidden..(lane + 1) * joint_hidden),
                 &mut projected.slice_mut(lane * joint_hidden..(lane + 1) * joint_hidden),
@@ -673,9 +683,11 @@ impl Multitalker {
             &windows,
             &masks,
             &kernels,
-            keep_all,
             &active,
-            !session.masked_asr,
+            crate::backend::cuda::engine_parakeet::MultitalkerStepMode {
+                keep_all,
+                shared_pre_encode: !session.masked_asr,
+            },
         )?;
         Ok(Some(step))
     }
@@ -1100,7 +1112,10 @@ mod gate_tests {
     }
 
     fn feature_frames(model: &Multitalker, wave: &[f32]) -> usize {
-        model.features(wave).map(|f| f.len() / 128 + 28).unwrap_or(0)
+        model
+            .features(wave)
+            .map(|f| f.len() / 128 + 28)
+            .unwrap_or(0)
     }
 
     fn tau_of(taus: &Value, key: &str, tensor: &str) -> f32 {
@@ -1114,79 +1129,6 @@ mod gate_tests {
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         sorted[(fraction * sorted.len() / 100).min(sorted.len() - 1)]
-    }
-
-    #[test]
-    #[ignore = "diagnostic; set FF_MULTITALKER_NEMO, FF_N6E_INPUTS, FF_N6E_ROWS_OUT"]
-    fn multitalker_arrival_rows_dump() -> Result<()> {
-        let nemo = std::env::var("FF_MULTITALKER_NEMO").context("FF_MULTITALKER_NEMO")?;
-        let inputs_root = std::env::var("FF_N6E_INPUTS").context("FF_N6E_INPUTS")?;
-        let out_path = std::env::var("FF_N6E_ROWS_OUT").context("FF_N6E_ROWS_OUT")?;
-        let device = Device::new(0)?;
-        let model = Multitalker::load(Path::new(&nemo), &device)?;
-        let root = Path::new(&inputs_root);
-        let clip = std::env::var("FF_N6E_ROWS_CLIP").unwrap_or_else(|_| "arrival".into());
-        let (wave, diar) = if clip == "meeting" {
-            let wave = read_wave(&root.join("meeting.wav"))?;
-            let features = model.features(&wave)?;
-            let frames = features.len() / 128 + 28;
-            (wave, gt_masks(root, frames)?)
-        } else {
-            let wave = read_wave(&root.join("arrival-swap.wav"))?;
-            let frames = feature_frames(&model, &wave);
-            let base = gt_masks(root, frames)?;
-            (wave, rotate_masks(&base, frames))
-        };
-        let features = model.features(&wave)?;
-        let mode = std::env::var("FF_N6E_ROWS_MODE").unwrap_or_else(|_| "masked".into());
-        let masked_asr = mode == "masked";
-        let mut session = model.stream(features, diar, masked_asr, 4, true)?;
-        let mut stream = model.encoder.multitalker_stream(4)?;
-        let mut dstream = model.decode_stream()?;
-        let mut steps = Vec::new();
-        let mut cold_dump: Option<Value> = None;
-        while let Some(step) = model.stream_step(&mut session, &mut stream)? {
-            let active = model.decode_step(&mut session, &mut dstream, &step)?;
-            if cold_dump.is_none() && active.contains(&0) && session.steps_taken() > 1 {
-                let lanes = 4;
-                let width = 1024usize;
-                let rows = step.rows.len() / (width * lanes);
-                let mut trace: Vec<Value> = Vec::new();
-                for layer in &stream.trace {
-                    trace.push(serde_json::json!(layer[0..rows * width]));
-                }
-                cold_dump = Some(serde_json::json!({
-                    "step": session.steps_taken() - 1,
-                    "layer0_in_len": step.layer0_in.len(),
-                    "layer0_in_lane0": step.layer0_in[0..16 * width],
-                    "rows_lane0": step.rows[0..rows * width],
-                    "trace_lane0": trace,
-                }));
-            }
-            let lanes = 4;
-            let width = 1024usize;
-            let rows = step.rows.len() / (width * lanes);
-            let mut entry = serde_json::json!({
-                "active": active,
-                "rows": rows,
-                "lane0": [],
-            });
-            for row in 0..rows {
-                let base = 0 * rows * width + row * width;
-                entry["lane0"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!(step.rows[base..base + width]));
-            }
-            steps.push(entry);
-        }
-        let dump = serde_json::json!({
-            "steps": steps,
-            "cold": cold_dump,
-        });
-        std::fs::write(&out_path, serde_json::to_string(&dump)?)?;
-        println!("PASS rows_dump steps={}", steps.len());
-        Ok(())
     }
 
     #[test]
@@ -1207,7 +1149,10 @@ mod gate_tests {
             .iter()
             .filter(|input| input.name == "meeting" || input.name == "arrival")
             .collect();
-        ensure!(clips.len() == 2, "published-loop fixture needs both AMI clips");
+        ensure!(
+            clips.len() == 2,
+            "published-loop fixture needs both AMI clips"
+        );
         let mut diverged: Vec<String> = Vec::new();
         for (masked_asr, mode) in [(true, "masked"), (false, "kernel")] {
             for input in &clips {
@@ -1215,8 +1160,13 @@ mod gate_tests {
                 let steps = fixture[&case]["stream"]["steps"]
                     .as_array()
                     .with_context(|| format!("{case} steps"))?;
-                let mut session =
-                    model.stream(input.features.clone(), input.diar.clone(), masked_asr, 4, true)?;
+                let mut session = model.stream(
+                    input.features.clone(),
+                    input.diar.clone(),
+                    masked_asr,
+                    4,
+                    true,
+                )?;
                 let mut stream = model.encoder.multitalker_stream(4)?;
                 let mut dstream = model.decode_stream()?;
                 let mut lengths: Vec<Vec<usize>> = vec![Vec::new(); 4];
@@ -1233,12 +1183,16 @@ mod gate_tests {
                         active == expect,
                         "{case} step {step} active {active:?} reference {expect:?}"
                     );
-                    for lane in 0..4 {
-                        lengths[lane].push(session.hypotheses[lane].tokens.len());
+                    for (lane, lengths) in lengths.iter_mut().enumerate() {
+                        lengths.push(session.hypotheses[lane].tokens.len());
                     }
                     step += 1;
                 }
-                ensure!(step == steps.len(), "{case} steps {step} vs {}", steps.len());
+                ensure!(
+                    step == steps.len(),
+                    "{case} steps {step} vs {}",
+                    steps.len()
+                );
                 let finals = fixture[&case]["stream"]["final"]
                     .as_object()
                     .with_context(|| format!("{case} finals"))?;
@@ -1257,11 +1211,7 @@ mod gate_tests {
                         .iter()
                         .map(|value| value.as_u64().unwrap_or(u64::MAX) as u32)
                         .collect();
-                    let first_mismatch = hyp
-                        .tokens
-                        .iter()
-                        .zip(&tokens)
-                        .position(|(a, b)| a != b);
+                    let first_mismatch = hyp.tokens.iter().zip(&tokens).position(|(a, b)| a != b);
                     if hyp.tokens != tokens {
                         let at = first_mismatch.unwrap_or(hyp.tokens.len().min(tokens.len()));
                         let lo = at.saturating_sub(8);
@@ -1299,11 +1249,20 @@ mod gate_tests {
                             tokens.len(),
                             first_mismatch
                         );
-                        diverged.push(format!("{case}/speaker{lane}"));
+                        // Ruling 2026-11-13T15:38:10Z: the published wrapper's
+                        // own pre-encode differs by 4.272e-4 between torch
+                        // batch-1 and batch-4 realizations, flipping ordinary
+                        // decisions; kernel-mode free-running streams are
+                        // informational. Masked-mode streams stay exact.
+                        if masked_asr {
+                            diverged.push(format!("{case}/speaker{lane}"));
+                        }
                         continue;
                     }
                     ensure!(
-                        hyp.margins.iter().all(|margin| margin.is_finite() && *margin > 0.0),
+                        hyp.margins
+                            .iter()
+                            .all(|margin| margin.is_finite() && *margin > 0.0),
                         "{case} speaker {lane} non-positive joint margin"
                     );
                     println!(
@@ -1320,9 +1279,8 @@ mod gate_tests {
                     // lane swap produces) concatenates the tokens of every
                     // speaker that passed through one batch slot; the
                     // speaker-keyed streams must differ from all of those.
-                    let final_tokens = |lane: usize| -> Vec<u32> {
-                        session.hypotheses[lane].tokens.clone()
-                    };
+                    let final_tokens =
+                        |lane: usize| -> Vec<u32> { session.hypotheses[lane].tokens.clone() };
                     for slot in 0..2usize {
                         let mut keyed = Vec::new();
                         for (index, step_active) in steps.iter().enumerate() {
@@ -1355,11 +1313,10 @@ mod gate_tests {
                 }
             }
         }
-        ensure!(
-            diverged.is_empty(),
-            "streams diverged: {diverged:?}"
+        ensure!(diverged.is_empty(), "masked streams diverged: {diverged:?}");
+        println!(
+            "PASS multitalker_rnnt_streams masked=exact kernel=informational timestamps=exact"
         );
-        println!("PASS multitalker_rnnt_streams cases=4 tokens=exact timestamps=exact");
         Ok(())
     }
 
@@ -1373,13 +1330,18 @@ mod gate_tests {
         let gpu: Value = serde_json::from_str(&std::fs::read_to_string(&gpu_path)?)?;
         let device = Device::new(0)?;
         let model = Multitalker::load(Path::new(&nemo), &device)?;
-        // Frozen before the candidate run: tau = 2x the worst per-decision
-        // max-abs difference between the cpu and 4090-fp32 reference arms
-        // (r3 fixtures, raw joint logits): 2 x 2.44140625e-04 = 4.8828125e-04.
-        // Literal precision corrected 2026-11-12: the first spelling
-        // (4.882812e-04) parsed one float ulp below the intended bound and
-        // tripped the arm-pair guard at exactly half the tau.
-        const TAU: f32 = 4.8828125e-04;
+        // Frozen before the candidate run (ruling 2026-11-13T15:38:10Z):
+        // tau = max over 2x the worst arm pair - the cpu-vs-4090-fp32
+        // reference arms on raw joint logits (2.44140625e-04, r4 fixtures)
+        // and the torch batch-1 vs batch-4 pre-encode pair on identical
+        // input (4.272e-04, report 10 2026-11-13T08:09:58Z) - so
+        // 2 x 4.272e-04 = 8.544e-04.
+        const TAU: f32 = 8.544e-04;
+        const PRE_ENCODE_PAIR: f32 = 4.272e-04;
+        ensure!(
+            2.0 * PRE_ENCODE_PAIR >= 4.8828125e-04,
+            "the frozen pair basis changed"
+        );
         fn f32_values(value: &Value) -> Result<Vec<f32>> {
             value
                 .as_array()
@@ -1399,7 +1361,12 @@ mod gate_tests {
         let mut pair = 0.0f32;
         let mut worst = 0.0f32;
         let mut worst_where = String::new();
-        for case in ["masked/meeting", "masked/arrival", "kernel/meeting", "kernel/arrival"] {
+        for case in [
+            "masked/meeting",
+            "masked/arrival",
+            "kernel/meeting",
+            "kernel/arrival",
+        ] {
             let steps = cpu[case]["stream"]["steps"]
                 .as_array()
                 .with_context(|| format!("{case} steps"))?;
@@ -1429,13 +1396,9 @@ mod gate_tests {
                             "{case} step rows {} < {count}",
                             slot_rows.len()
                         );
-                        for offset in 0..count {
-                            ensure!(
-                                slot_rows[offset].len() == 1024,
-                                "{case} step row width {}",
-                                slot_rows[offset].len()
-                            );
-                            rows[*speaker].push(slot_rows[offset].clone());
+                        for row in slot_rows.iter().take(count) {
+                            ensure!(row.len() == 1024, "{case} step row width {}", row.len());
+                            rows[*speaker].push(row.clone());
                         }
                     }
                     base[*speaker] += count;
@@ -1492,8 +1455,13 @@ mod gate_tests {
                     })
                     .collect();
                 let mut dstream = model.decode_stream()?;
-                let candidate =
-                    model.decode_teacher_forced(&mut dstream, 0, &decision_rows, &emits, &tokens)?;
+                let candidate = model.decode_teacher_forced(
+                    &mut dstream,
+                    0,
+                    &decision_rows,
+                    &emits,
+                    &tokens,
+                )?;
                 ensure!(candidate.len() == reference.len(), "candidate decisions");
                 for (index, logits) in candidate.iter().enumerate() {
                     let diff = logits
@@ -1505,16 +1473,147 @@ mod gate_tests {
                         worst = diff;
                         worst_where = format!("{case} speaker {speaker} decision {index}");
                     }
+                    // Ruling 2026-11-13T15:38:10Z: argmax equality is
+                    // required at every decision whose reference margin
+                    // exceeds 2 x tau.
+                    let mut sorted = reference[index].clone();
+                    sorted.sort_by(|a, b| b.total_cmp(a));
+                    let margin = sorted[0] - sorted[1];
+                    if margin > 2.0 * TAU {
+                        let argmax = logits
+                            .iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                            .map(|(index, _)| index)
+                            .unwrap_or(usize::MAX);
+                        let reference_argmax = reference[index]
+                            .iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                            .map(|(index, _)| index)
+                            .unwrap_or(usize::MAX);
+                        ensure!(
+                            argmax == reference_argmax,
+                            "{case} speaker {speaker} decision {index} argmax {argmax} != {reference_argmax} at margin {margin:.3e}"
+                        );
+                    }
                 }
             }
         }
-        ensure!(pair * 2.0 <= TAU, "arm pair {pair:.3e} exceeds half the frozen tau");
+        ensure!(
+            pair * 2.0 <= TAU,
+            "arm pair {pair:.3e} exceeds half the frozen tau"
+        );
         ensure!(
             worst <= TAU,
             "teacher-forced logits diff {worst:.3e} > tau {TAU:.3e} at {worst_where}"
         );
+        // Slot-carry control (ruling 2026-11-13T15:38:10Z): feeding the
+        // other speaker's token history with this lane's rows - the
+        // logits a slot-keyed carry would produce at the rotation - must
+        // differ from the reference beyond tau somewhere.
+        let mut control_diff = 0.0f32;
+        let mut control_where = String::new();
+        for case in ["masked/arrival", "kernel/arrival"] {
+            let speakers: Vec<usize> = cpu[case]["cells"]
+                .as_object()
+                .context("cells")?
+                .keys()
+                .filter_map(|key| key.parse::<usize>().ok())
+                .collect();
+            ensure!(speakers.len() >= 2, "{case} control needs two speakers");
+            type LaneHistory = (Vec<Vec<f32>>, Vec<bool>, Vec<u32>);
+            let history = |lane: usize| -> Result<LaneHistory> {
+                let decisions = cpu[case]["cells"][lane.to_string()]["decisions"]
+                    .as_array()
+                    .context("decisions")?;
+                Ok((
+                    decisions
+                        .iter()
+                        .map(|decision| f32_values(&decision["logits"]))
+                        .collect::<Result<_>>()?,
+                    decisions
+                        .iter()
+                        .map(|decision| decision["kind"].as_str() == Some("emit"))
+                        .collect(),
+                    decisions
+                        .iter()
+                        .map(|decision| decision["token"].as_u64().unwrap_or(u64::MAX) as u32)
+                        .collect(),
+                ))
+            };
+            let (this_reference, _, this_tokens) = history(speakers[0])?;
+            let (other_reference, other_emits, other_tokens) = history(speakers[1])?;
+            let count = this_reference.len().min(other_reference.len());
+            let steps = cpu[case]["stream"]["steps"]
+                .as_array()
+                .with_context(|| format!("{case} steps"))?;
+            let mut rows: Vec<Vec<f32>> = Vec::new();
+            for step in steps {
+                let active = active_of(step)?;
+                let lens: Vec<usize> = step["encoded_len"]
+                    .as_array()
+                    .context("encoded_len")?
+                    .iter()
+                    .map(|value| value.as_u64().unwrap_or(u64::MAX) as usize)
+                    .collect();
+                let block = step.get("encoded_rows");
+                if let Some(block) = block.and_then(Value::as_array) {
+                    for (slot, speaker) in active.iter().enumerate() {
+                        if *speaker != speakers[0] {
+                            continue;
+                        }
+                        let count_rows = lens.get(slot).copied().unwrap_or(0);
+                        let slot_rows: Vec<Vec<f32>> = block[slot]
+                            .as_array()
+                            .context("slot rows")?
+                            .iter()
+                            .map(f32_values)
+                            .collect::<Result<_>>()?;
+                        for row in slot_rows.iter().take(count_rows) {
+                            rows.push(row.clone());
+                        }
+                    }
+                }
+            }
+            let decision_rows: Vec<&[f32]> =
+                cpu[case]["cells"][speakers[0].to_string()]["decisions"]
+                    .as_array()
+                    .context("decisions")?
+                    .iter()
+                    .map(|decision| {
+                        let row = decision["row"].as_u64().unwrap_or(u64::MAX) as usize;
+                        rows[row].as_slice()
+                    })
+                    .collect();
+            let control_rows: Vec<&[f32]> = decision_rows[..count].to_vec();
+            let mut dstream = model.decode_stream()?;
+            let control = model.decode_teacher_forced(
+                &mut dstream,
+                0,
+                &control_rows,
+                &other_emits[..count],
+                &other_tokens[..count],
+            )?;
+            for index in 0..count {
+                let diff = control[index]
+                    .iter()
+                    .zip(&this_reference[index])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                if diff > control_diff {
+                    control_diff = diff;
+                    control_where = format!("{case} decision {index}");
+                }
+            }
+            let _ = this_tokens;
+        }
+        ensure!(
+            control_diff > TAU,
+            "slot-carry control diff {control_diff:.3e} <= tau {TAU:.3e} at {control_where}"
+        );
         println!(
-            "PASS multitalker_rnnt_logits arm_pair={pair:.3e} worst={worst:.3e} tau={TAU:.3e}"
+            "PASS multitalker_rnnt_logits arm_pair={pair:.3e} worst={worst:.3e} tau={TAU:.3e} slot_carry={control_diff:.3e}"
         );
         Ok(())
     }
