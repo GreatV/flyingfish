@@ -113,6 +113,11 @@ pub fn speaker_segments(
         .collect())
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn streaming_final_right_pad(step: usize, last: bool) -> bool {
+    last && step != 0
+}
+
 #[cfg(feature = "cuda")]
 pub fn stream_frontend_step(
     engine: &Diarization,
@@ -149,7 +154,11 @@ pub fn stream_frontend_step(
         "streaming waveform extent"
     );
     let last = end >= wave.len();
-    let batch = engine.audio_features(&wave[start..end], step == 0, last)?;
+    let batch = engine.audio_features(
+        &wave[start..end],
+        step == 0,
+        streaming_final_right_pad(step, last),
+    )?;
     let valid = batch.mask.iter().filter(|flag| **flag).count();
     ensure!(
         valid * mel_bins <= batch.features.len() && valid <= batch.mask.len(),
@@ -539,6 +548,13 @@ mod tests {
         assert_eq!(DIARIZATION_THRESHOLD, 0.5);
         assert!(speaker_segments(&[0.0], 1, None, DIARIZATION_THRESHOLD, 0.01)?.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn streaming_first_last_chunk_keeps_centered_frontend() {
+        assert!(!streaming_final_right_pad(0, true));
+        assert!(streaming_final_right_pad(1, true));
+        assert!(!streaming_final_right_pad(1, false));
     }
 
     #[test]
