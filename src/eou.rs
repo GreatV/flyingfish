@@ -1,7 +1,7 @@
 //! Parakeet realtime EOU 120m: spec from the .nemo model_config.yaml, read in place.
 
 #[cfg(feature = "cuda")]
-pub use crate::backend::cuda::engine_eou::Eou;
+pub use crate::backend::cuda::engine_eou::{Eou, EouUtterance};
 
 use crate::checkpoint::tar_member_bytes;
 use anyhow::{Context, Result, bail, ensure};
@@ -515,11 +515,107 @@ impl EouSpec {
     }
 }
 
+fn unigram_decode(vocabulary: &str, ids: &[u32]) -> Result<String> {
+    let mut pieces = Vec::new();
+    for line in vocabulary.lines() {
+        let (piece, score) = line.rsplit_once('\t').context("EOU vocabulary row")?;
+        let score = score.parse::<f64>()?;
+        ensure!(score.is_finite(), "EOU vocabulary score is not finite");
+        pieces.push((piece.to_string(), score));
+    }
+    let model = tokenizers::models::unigram::Unigram::from(pieces, Some(0), false)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let builder: tokenizers::tokenizer::TokenizerBuilder<
+        _,
+        tokenizers::normalizers::NormalizerWrapper,
+        tokenizers::pre_tokenizers::PreTokenizerWrapper,
+        tokenizers::processors::PostProcessorWrapper,
+        tokenizers::decoders::DecoderWrapper,
+    > = tokenizers::tokenizer::TokenizerBuilder::new();
+    let builder = builder.with_model(model).with_decoder(Some(
+        tokenizers::decoders::DecoderWrapper::Metaspace(
+            tokenizers::pre_tokenizers::metaspace::Metaspace::new(
+                '▁',
+                tokenizers::pre_tokenizers::metaspace::PrependScheme::Always,
+                true,
+            ),
+        ),
+    ));
+    let tokenizer = builder
+        .build()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    tokenizer
+        .decode(ids, true)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+pub fn eou_decode(nemo: &Path, ids: &[u32]) -> Result<String> {
+    let file = File::open(nemo)?;
+    let map = unsafe { MmapOptions::new().map(&file)? };
+    let bytes = &map[crate::checkpoint::tar_member_suffix(&map, "_tokenizer.vocab")?];
+    unigram_decode(std::str::from_utf8(bytes)?, ids)
+}
+
+#[cfg(feature = "cuda")]
+pub fn transcribe(
+    nemo: &Path,
+    waveform: &[f32],
+    stream: bool,
+    options: crate::RunOptions,
+) -> Result<crate::media::Transcription> {
+    let spec = EouSpec::read(nemo)?;
+    spec.validate()?;
+    let device = crate::backend::cuda::Device::new(options.device)?;
+    let mut model = Eou::load(nemo, &device)?;
+    let features = model.features(waveform)?;
+    if stream {
+        let (utterances, _) = model.stream_decode_timed(&features)?;
+        let mut segments = Vec::new();
+        let mut start = 0.0;
+        for utterance in utterances {
+            let ids: Vec<_> = utterance
+                .tokens
+                .into_iter()
+                .filter(|token| *token != spec.vocab_size - 2)
+                .collect();
+            let text = eou_decode(nemo, &ids)?;
+            let end = utterance.end_step as f64 * 0.08;
+            segments.push(crate::media::TextSegment { start, end, text });
+            start = end;
+        }
+        let text = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(crate::media::Transcription {
+            text,
+            segments,
+            words: Vec::new(),
+        })
+    } else {
+        let valid = features.len() / spec.features as usize;
+        let ids = model.decode(&features, valid)?;
+        let text = eou_decode(nemo, &ids)?;
+        crate::media::Transcription::whole_clip(text, waveform.len() as f64 / 16000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::checkpoint::tar_archive;
     use anyhow::Context;
+
+    #[test]
+    fn unigram_decodes_published_vocabulary_form() -> Result<()> {
+        let decoded = unigram_decode(
+            "<unk>\t0.0\n▁hello\t-1.0\n▁world\t-2.0\n▁again\t-3.0",
+            &[1, 2],
+        )?;
+        assert_eq!(decoded, "hello world");
+        Ok(())
+    }
 
     const CONFIG: &str = "\
 token_init_method: constant

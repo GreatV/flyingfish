@@ -384,6 +384,10 @@ mod tests {
         assert!(diagnostics_enabled());
         with_verbose(true, || assert!(diagnostics_enabled()));
         assert!(diagnostics_enabled());
+        for _command in ["transcribe", "diarize", "embed"] {
+            with_verbose(false, || assert!(!diagnostics_enabled()));
+            assert!(diagnostics_enabled());
+        }
     }
     #[test]
     fn tree_budget_limits_rows_depth_roots_and_physical_slots() {

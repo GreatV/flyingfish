@@ -5449,6 +5449,18 @@ pub(crate) fn tar_member_bytes<'a>(data: &'a [u8], name: &str) -> Result<&'a [u8
 }
 
 pub(crate) fn tar_member(data: &[u8], name: &str) -> Result<std::ops::Range<usize>> {
+    tar_member_matching(data, name, |member| member == name)
+}
+
+pub(crate) fn tar_member_suffix(data: &[u8], suffix: &str) -> Result<std::ops::Range<usize>> {
+    tar_member_matching(data, suffix, |member| member.ends_with(suffix))
+}
+
+fn tar_member_matching(
+    data: &[u8],
+    name: &str,
+    matches: impl Fn(&str) -> bool,
+) -> Result<std::ops::Range<usize>> {
     let mut position = 0usize;
     while position + 512 <= data.len() {
         let header = &data[position..position + 512];
@@ -5485,7 +5497,7 @@ pub(crate) fn tar_member(data: &[u8], name: &str) -> Result<std::ops::Range<usiz
             .checked_add(size)
             .context("tar member size overflow")?;
         ensure!(data_stop <= data.len(), "tar member truncated: {member}");
-        if member == name {
+        if matches(member) {
             return Ok(data_start..data_stop);
         }
         position = data_start + size.div_ceil(512) * 512;

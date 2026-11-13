@@ -3,7 +3,7 @@
 pub use crate::backend::cuda::engine_parakeet::StreamOmit;
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::engine_parakeet::{
-    NemotronStream, ParakeetEncoder, ParakeetTdt, StreamChunk,
+    NemotronStream, ParakeetEncoder, ParakeetTdt, StreamChunk, TdtTrajectory,
 };
 
 use crate::{
@@ -575,5 +575,291 @@ impl ParakeetSpec {
         insert("joint.head.weight".into(), Dtype::F32, &[joint, d]);
         insert("joint.head.bias".into(), Dtype::F32, &[joint]);
         require_checkpoint(checkpoint, &expected, "Parakeet")
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn tokenizer_boundary_vocabulary(tokenizer: &tokenizers::Tokenizer) -> BTreeMap<u32, String> {
+    tokenizer
+        .get_vocab(false)
+        .into_iter()
+        .map(|(piece, id)| (id, piece))
+        .collect()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn tdt_word_segments(
+    token_cues: Vec<(bool, crate::media::TextSegment)>,
+) -> (
+    Vec<crate::media::TextSegment>,
+    Vec<crate::media::TextSegment>,
+) {
+    let mut words: Vec<crate::media::TextSegment> = Vec::new();
+    let mut pending_boundary = false;
+    for (marked, cue) in token_cues {
+        let text = cue.text.trim();
+        let boundary = cue.text.starts_with(char::is_whitespace) || cue.text.starts_with('▁');
+        if text.is_empty() {
+            pending_boundary |= marked || boundary;
+            continue;
+        }
+        let marked = marked || pending_boundary;
+        let boundary = boundary || pending_boundary;
+        pending_boundary = false;
+        let punctuation = ["?", "'", "¡", "¿", "-", ":", ",", "%", "/", ".", "!"].contains(&text);
+        if words.is_empty() || marked || !punctuation && boundary {
+            words.push(crate::media::TextSegment {
+                start: cue.start,
+                end: cue.end,
+                text: text.to_string(),
+            });
+        } else {
+            let word = words.last_mut().expect("nonempty words");
+            word.end = cue.end;
+            word.text.push_str(text);
+        }
+    }
+    let mut segments = Vec::new();
+    let mut current: Option<crate::media::TextSegment> = None;
+    for word in words.iter() {
+        if let Some(segment) = current.as_mut() {
+            segment.end = word.end;
+            segment.text.push(' ');
+            segment.text.push_str(&word.text);
+        } else {
+            current = Some(word.clone());
+        }
+        if current
+            .as_ref()
+            .expect("segment exists")
+            .text
+            .ends_with(['.', '?', '!'])
+        {
+            segments.push(current.take().expect("segment exists"));
+        }
+    }
+    if let Some(current) = current {
+        segments.push(current);
+    }
+    (words, segments)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn tdt_cues_with(
+    directory: &Path,
+    tokens: &[u32],
+    durations: &[u32],
+    blank: u32,
+    mut decode: impl FnMut(&Path, &[u32]) -> Result<String>,
+    mut boundary: impl FnMut(u32) -> bool,
+) -> Result<crate::media::Transcription> {
+    ensure!(tokens.len() == durations.len(), "TDT token/duration extent");
+    let full_text = decode(directory, tokens)?;
+    let mut cues: Vec<(bool, crate::media::TextSegment)> = Vec::new();
+    let mut frame = 0usize;
+    for (&token, &duration) in tokens.iter().zip(durations) {
+        if token == blank || token == 2 {
+            frame += duration as usize;
+            continue;
+        }
+        let chunk = decode(directory, &[token])?;
+        if chunk.is_empty() {
+            frame += duration as usize;
+            continue;
+        }
+        let start = frame as f64 * 0.08;
+        let end = (frame + duration as usize) as f64 * 0.08;
+        if ["?", "'", "¡", "¿", "-", ":", ",", "%", "/", ".", "!"].contains(&chunk.as_str())
+            && !boundary(token)
+            && !cues.is_empty()
+        {
+            let previous_end = cues.last().expect("nonempty cues").1.end;
+            cues.push((
+                boundary(token),
+                crate::media::TextSegment {
+                    start: previous_end,
+                    end: previous_end,
+                    text: chunk,
+                },
+            ));
+        } else {
+            cues.push((
+                boundary(token),
+                crate::media::TextSegment {
+                    start,
+                    end,
+                    text: chunk,
+                },
+            ));
+        }
+        frame += duration as usize;
+    }
+    let (words, segments) = tdt_word_segments(cues);
+    Ok(crate::media::Transcription {
+        text: full_text,
+        segments,
+        words,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn tdt_transcription(
+    directory: &Path,
+    trajectory: &TdtTrajectory,
+    blank: u32,
+) -> Result<crate::media::Transcription> {
+    let tokenizer = crate::tokenizer::load(directory)?;
+    let vocabulary = tokenizer_boundary_vocabulary(&tokenizer);
+    tdt_cues_with(
+        directory,
+        &trajectory.tokens,
+        &trajectory.durations,
+        blank,
+        |_, ids| crate::tokenizer::decode_with(&tokenizer, ids),
+        |token| {
+            vocabulary
+                .get(&token)
+                .is_some_and(|piece| piece.starts_with('▁'))
+        },
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub fn transcribe(
+    directory: &Path,
+    waveform: &[f32],
+    options: crate::RunOptions,
+) -> Result<crate::media::Transcription> {
+    let spec = ParakeetSpec::read(directory)?;
+    let device = crate::backend::cuda::Device::new(options.device)?;
+    let mut model = ParakeetTdt::load(directory, &device)?;
+    let mel = crate::audio::LogMel::new(spec.mel)?.extract(&[waveform], true, true, false)?;
+    let valid = mel.mask.iter().filter(|flag| **flag).count();
+    let trajectory = model.decode(&mel.features, valid)?;
+    tdt_transcription(directory, &trajectory, spec.blank)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tdt_cues_use_durations_and_previous_token_punctuation() -> Result<()> {
+        let tokens = [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17, 18];
+        let durations = [0, 2, 1, 1, 0, 1, 1, 1, 2, 1, 1];
+        let decode_calls = std::cell::Cell::new(0usize);
+        let decode = |_: &Path, ids: &[u32]| -> Result<String> {
+            decode_calls.set(decode_calls.get() + 1);
+            Ok(match ids {
+                [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17, 18] => {
+                    "hello world. Next sentence!'cause".into()
+                }
+                [10] => "hello".into(),
+                [11] => " wo".into(),
+                [12] => "rld".into(),
+                [13] => ".".into(),
+                [14] => " Next".into(),
+                [15] => " sentence".into(),
+                [16] => "!".into(),
+                [17] => "'".into(),
+                [18] => "cause".into(),
+                _ => String::new(),
+            })
+        };
+        let result = tdt_cues_with(
+            Path::new("model"),
+            &tokens,
+            &durations,
+            8192,
+            decode,
+            |token| token == 17,
+        )?;
+        assert_eq!(result.text, "hello world. Next sentence!'cause");
+        assert_eq!(decode_calls.get(), 10);
+        assert_eq!(result.words.len(), 5, "{:?}", result.words);
+        assert_eq!(result.words[0].text, "hello");
+        assert_eq!((result.words[0].start, result.words[0].end), (0.0, 0.16));
+        assert_eq!(result.words[1].text, "world.");
+        assert_eq!((result.words[1].start, result.words[1].end), (0.16, 0.32));
+        assert_eq!(result.words[2].text, "Next");
+        assert_eq!((result.words[2].start, result.words[2].end), (0.4, 0.48));
+        assert_eq!(result.words[3].text, "sentence!");
+        assert_eq!((result.words[3].start, result.words[3].end), (0.48, 0.56));
+        assert_eq!(result.words[4].text, "'cause");
+        assert_eq!((result.words[4].start, result.words[4].end), (0.72, 0.88));
+        assert!(
+            result
+                .words
+                .iter()
+                .all(|word| word.text == word.text.trim())
+        );
+        assert_eq!(result.segments.len(), 3);
+        assert_eq!(result.segments[0].text, "hello world.");
+        assert_eq!(
+            (result.segments[0].start, result.segments[0].end),
+            (0.0, 0.32)
+        );
+        assert_eq!(result.segments[1].text, "Next sentence!");
+        assert_eq!(
+            (result.segments[1].start, result.segments[1].end),
+            (0.4, 0.56)
+        );
+        assert_eq!(result.segments[2].text, "'cause");
+        assert_eq!(
+            (result.segments[2].start, result.segments[2].end),
+            (0.72, 0.88)
+        );
+        let (_, undelimited) = tdt_word_segments(vec![
+            (
+                false,
+                crate::media::TextSegment {
+                    start: 0.0,
+                    end: 0.08,
+                    text: "hello".into(),
+                },
+            ),
+            (
+                false,
+                crate::media::TextSegment {
+                    start: 0.08,
+                    end: 0.16,
+                    text: " world".into(),
+                },
+            ),
+        ]);
+        assert_eq!(undelimited.len(), 1);
+        assert_eq!(undelimited[0].text, "hello world");
+        assert_eq!((undelimited[0].start, undelimited[0].end), (0.0, 0.16));
+        let boundary_calls = std::cell::Cell::new(0usize);
+        let boundary_decode = |_: &Path, ids: &[u32]| -> Result<String> {
+            boundary_calls.set(boundary_calls.get() + 1);
+            Ok(match ids {
+                [8192, 20, 21, 22] => "hello world".into(),
+                [20] => "hello".into(),
+                [21] => " ".into(),
+                [22] => "world".into(),
+                _ => String::new(),
+            })
+        };
+        let boundary_only = tdt_cues_with(
+            Path::new("model"),
+            &[8192, 20, 21, 22],
+            &[0, 1, 1, 1],
+            8192,
+            boundary_decode,
+            |token| token == 21,
+        )?;
+        assert_eq!(boundary_calls.get(), 4);
+        assert_eq!(boundary_only.text, "hello world");
+        assert_eq!(boundary_only.words.len(), 2);
+        assert_eq!(boundary_only.words[0].text, "hello");
+        assert_eq!(boundary_only.words[1].text, "world");
+        assert_eq!(
+            (boundary_only.words[1].start, boundary_only.words[1].end),
+            (0.16, 0.24)
+        );
+        assert_eq!(boundary_only.segments.len(), 1);
+        assert_eq!(boundary_only.segments[0].text, "hello world");
+        Ok(())
     }
 }

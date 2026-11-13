@@ -8,6 +8,8 @@ use flyingfish::{
     tokenizer,
     trace::Trace,
 };
+#[cfg(feature = "cuda")]
+use std::io::Read;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -94,6 +96,73 @@ impl Input {
     }
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum TranscriptionFormat {
+    Txt,
+    Json,
+    Srt,
+    Vtt,
+}
+
+impl TranscriptionFormat {
+    #[cfg(feature = "cuda")]
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Txt => "txt",
+            Self::Json => "json",
+            Self::Srt => "srt",
+            Self::Vtt => "vtt",
+        }
+    }
+}
+
+#[derive(Args)]
+struct TranscribeArgs {
+    input: PathBuf,
+    #[arg(long, value_enum, default_value_t = TranscriptionFormat::Txt)]
+    format: TranscriptionFormat,
+    #[arg(long)]
+    stream: bool,
+    #[arg(long, default_value = "en")]
+    source_lang: String,
+    #[arg(long, default_value = "en")]
+    target_lang: String,
+    #[arg(long, conflicts_with = "no_pnc")]
+    pnc: bool,
+    #[arg(long, conflicts_with = "pnc")]
+    no_pnc: bool,
+    #[arg(short = 'o', long = "output")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct DiarizeArgs {
+    input: PathBuf,
+    #[arg(long)]
+    stream: bool,
+    #[arg(long, default_value_t = flyingfish::diarization::DIARIZATION_THRESHOLD)]
+    threshold: f64,
+    #[arg(short = 'o', long = "output")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct EmbedInput {
+    #[arg(long)]
+    text: Option<String>,
+    #[arg(long)]
+    input: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct EmbedArgs {
+    #[command(flatten)]
+    input: EmbedInput,
+    #[arg(short = 'o', long = "output")]
+    output: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     Calibrate,
@@ -120,6 +189,9 @@ enum Command {
         )]
         image_tensors: Option<PathBuf>,
     },
+    Transcribe(TranscribeArgs),
+    Diarize(DiarizeArgs),
+    Embed(EmbedArgs),
     Video {
         #[arg(long, help = "Video description in natural language")]
         prompt: String,
@@ -572,6 +644,190 @@ fn checkpoint_mtp(dir: &Path, requested: Option<u8>, plain_selected: bool) -> Re
     resolve_mtp(requested, component, plain_selected)
 }
 
+#[cfg(feature = "cuda")]
+fn model_class(model: &Path) -> Result<String> {
+    if model
+        .extension()
+        .is_some_and(|extension| extension == "nemo")
+    {
+        return Ok("nemo".into());
+    }
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(model.join("config.json"))?)?;
+    config["architectures"][0]
+        .as_str()
+        .map(str::to_string)
+        .context("model architecture class is missing")
+}
+
+#[cfg(feature = "cuda")]
+fn input_bytes(input: &Path) -> Result<Vec<u8>> {
+    if input == Path::new("-") {
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes)?;
+        Ok(bytes)
+    } else {
+        Ok(fs::read(input)?)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn write_bytes_output(
+    output: Option<&Path>,
+    model: &Path,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Some(output) = output {
+        ensure!(
+            output.extension().is_some_and(|value| value == extension),
+            "output must end in .{extension}"
+        );
+        let output = output_path(output, model)?;
+        if let Err(error) = fs::write(&output, bytes) {
+            let _ = fs::remove_file(&output);
+            return Err(error.into());
+        }
+        println!("{}", output.display());
+    } else {
+        print!("{}", std::str::from_utf8(bytes)?);
+    }
+    Ok(())
+}
+
+fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
+    let _ = (cli, args);
+    #[cfg(not(feature = "cuda"))]
+    bail!("transcribe requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        let waveform = flyingfish::media::read_wav(input_bytes(&args.input)?.as_slice(), 16000)?;
+        let class = model_class(&cli.model)?;
+        if args.stream && class != "nemo" {
+            bail!("streaming transcription is supported only for parakeet realtime EOU");
+        }
+        let options = flyingfish::RunOptions {
+            device: cli.device,
+            runtime_dir: cli
+                .kernels
+                .runtime_dir
+                .clone()
+                .context("--runtime-dir is required for transcribe")?,
+            verbose: cli.verbose,
+        };
+        let result = match class.as_str() {
+            "ParakeetForTDT" => flyingfish::parakeet::transcribe(&cli.model, &waveform, options)?,
+            "CanaryForConditionalGeneration" => flyingfish::canary::transcribe(
+                &cli.model,
+                &waveform,
+                &args.source_lang,
+                &args.target_lang,
+                !args.no_pnc,
+                options,
+            )?,
+            "nemo" => flyingfish::eou::transcribe(&cli.model, &waveform, args.stream, options)?,
+            _ => bail!("unsupported transcription architecture {class}"),
+        };
+        let bytes = match args.format {
+            TranscriptionFormat::Txt => format!("{}\n", result.text).into_bytes(),
+            TranscriptionFormat::Json => {
+                format!("{}\n", serde_json::to_string(&result)?).into_bytes()
+            }
+            TranscriptionFormat::Srt => {
+                let mut bytes = Vec::new();
+                flyingfish::media::write_srt(&mut bytes, &result.segments)?;
+                bytes
+            }
+            TranscriptionFormat::Vtt => {
+                let mut bytes = Vec::new();
+                flyingfish::media::write_vtt(&mut bytes, &result.segments)?;
+                bytes
+            }
+        };
+        write_bytes_output(
+            args.output.as_deref(),
+            &cli.model,
+            args.format.extension(),
+            &bytes,
+        )
+    })
+}
+
+fn diarize(cli: &Cli, args: &DiarizeArgs) -> Result<()> {
+    let _ = (cli, args);
+    #[cfg(not(feature = "cuda"))]
+    bail!("diarize requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        let waveform = flyingfish::media::read_wav(input_bytes(&args.input)?.as_slice(), 16000)?;
+        let class = model_class(&cli.model)?;
+        ensure!(
+            class == "Nemotron3DiarizationForAudioFrameClassification",
+            "unsupported diarization architecture {class}"
+        );
+        let options = flyingfish::RunOptions {
+            device: cli.device,
+            runtime_dir: cli
+                .kernels
+                .runtime_dir
+                .clone()
+                .context("--runtime-dir is required for diarize")?,
+            verbose: cli.verbose,
+        };
+        let segments = flyingfish::diarization::diarize(
+            &cli.model,
+            &waveform,
+            args.stream,
+            args.threshold,
+            options,
+        )?;
+        let file_id = if args.input == Path::new("-") {
+            "stdin".to_string()
+        } else {
+            args.input
+                .file_stem()
+                .context("input filename missing")?
+                .to_string_lossy()
+                .replace(char::is_whitespace, "_")
+        };
+        let mut bytes = Vec::new();
+        flyingfish::media::write_rttm(&mut bytes, &file_id, &segments)?;
+        write_bytes_output(args.output.as_deref(), &cli.model, "rttm", &bytes)
+    })
+}
+
+fn embed(cli: &Cli, args: &EmbedArgs) -> Result<()> {
+    let _ = (cli, args);
+    #[cfg(not(feature = "cuda"))]
+    bail!("embed requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        let text = if let Some(text) = &args.input.text {
+            text.clone()
+        } else {
+            String::from_utf8(input_bytes(
+                args.input.input.as_deref().context("text input missing")?,
+            )?)?
+        };
+        ensure!(
+            flyingfish::model_spec::ModelSpec::read(&cli.model)?.architecture
+                == flyingfish::model_spec::Architecture::EmbeddingGemma2,
+            "embed requires EmbeddingGemma-2"
+        );
+        let options = flyingfish::RunOptions {
+            device: cli.device,
+            runtime_dir: cli
+                .kernels
+                .runtime_dir
+                .clone()
+                .context("--runtime-dir is required for embed")?,
+            verbose: cli.verbose,
+        };
+        let values = flyingfish::model::embed_text(&cli.model, &text, options)?;
+        let bytes = format!("{}\n", flyingfish::model::embedding_json(&values)?).into_bytes();
+        write_bytes_output(args.output.as_deref(), &cli.model, "json", &bytes)
+    })
+}
+
 #[cfg(any(feature = "cuda", test))]
 fn mp4_output(path: &Path) -> Result<bool> {
     match path.extension().and_then(|extension| extension.to_str()) {
@@ -757,6 +1013,9 @@ fn run() -> Result<()> {
                 )
             }
         }
+        Command::Transcribe(args) => transcribe(&cli, args),
+        Command::Diarize(args) => diarize(&cli, args),
+        Command::Embed(args) => embed(&cli, args),
         Command::Video {
             prompt,
             image,
@@ -1198,6 +1457,80 @@ mod tests {
         assert!(help.contains("5-15 s at 24 fps"), "{help}");
         assert!(help.contains("requires ffmpeg on PATH"), "{help}");
         assert!(help.contains("sibling .wav"), "{help}");
+    }
+
+    #[test]
+    fn phase_one_commands_parse_audio_text_and_output_options() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "--runtime-dir",
+            "runtime",
+            "transcribe",
+            "clip.wav",
+            "--format",
+            "json",
+            "--stream",
+            "--source-lang",
+            "en",
+            "--target-lang",
+            "de",
+            "--no-pnc",
+            "-o",
+            "transcript.json",
+        ])?;
+        match cli.command {
+            Command::Transcribe(args) => {
+                assert_eq!(args.input, PathBuf::from("clip.wav"));
+                assert!(matches!(args.format, TranscriptionFormat::Json));
+                assert!(args.stream);
+                assert_eq!(args.source_lang, "en");
+                assert_eq!(args.target_lang, "de");
+                assert!(args.no_pnc);
+                assert_eq!(args.output, Some(PathBuf::from("transcript.json")));
+            }
+            _ => panic!("transcribe subcommand was not selected"),
+        }
+        let cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "diarize",
+            "meeting.wav",
+            "--stream",
+            "--threshold",
+            "0.5",
+            "-o",
+            "meeting.rttm",
+        ])?;
+        match cli.command {
+            Command::Diarize(args) => {
+                assert_eq!(args.input, PathBuf::from("meeting.wav"));
+                assert!(args.stream);
+                assert_eq!(args.threshold, 0.5);
+                assert_eq!(args.output, Some(PathBuf::from("meeting.rttm")));
+            }
+            _ => panic!("diarize subcommand was not selected"),
+        }
+        let cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "embed",
+            "--text",
+            "a red cube",
+            "-o",
+            "embedding.json",
+        ])?;
+        match cli.command {
+            Command::Embed(args) => {
+                assert_eq!(args.input.text.as_deref(), Some("a red cube"));
+                assert_eq!(args.output, Some(PathBuf::from("embedding.json")));
+            }
+            _ => panic!("embed subcommand was not selected"),
+        }
+        Ok(())
     }
 
     #[test]

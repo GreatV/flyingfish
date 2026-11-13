@@ -368,3 +368,126 @@ impl CanarySpec {
         Ok(count)
     }
 }
+
+const CANARY_LANGUAGES: [&str; 25] = [
+    "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt",
+    "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
+];
+
+fn canary_prompt_with(
+    source_language: &str,
+    target_language: &str,
+    punctuation: bool,
+    mut encode: impl FnMut(&str) -> Result<Vec<u32>>,
+) -> Result<Vec<u32>> {
+    for language in [source_language, target_language] {
+        ensure!(
+            CANARY_LANGUAGES.contains(&language),
+            "unsupported Canary language {language}; published set: {}",
+            CANARY_LANGUAGES.join(",")
+        );
+    }
+    let mut tokens = Vec::new();
+    for text in [
+        "<|startofcontext|>".to_string(),
+        "<|startoftranscript|>".to_string(),
+        "<|emo:undefined|>".to_string(),
+        format!("<|{source_language}|>"),
+        format!("<|{target_language}|>"),
+        if punctuation { "<|pnc|>" } else { "<|nopnc|>" }.to_string(),
+        "<|noitn|>".to_string(),
+        "<|notimestamp|>".to_string(),
+        "<|nodiarize|>".to_string(),
+    ] {
+        let ids = encode(&text)?;
+        ensure!(ids.len() == 1, "Canary prompt token {text} is not atomic");
+        tokens.extend(ids);
+    }
+    Ok(tokens)
+}
+
+pub fn canary_prompt(
+    directory: &Path,
+    source_language: &str,
+    target_language: &str,
+    punctuation: bool,
+) -> Result<Vec<u32>> {
+    let generation: Value =
+        serde_json::from_slice(&std::fs::read(directory.join("generation_config.json"))?)?;
+    ensure!(
+        generation["decoder_start_token_id"] == 7
+            && generation["bos_token_id"] == 4
+            && generation["eos_token_id"] == 3,
+        "Canary generation token IDs"
+    );
+    let template = std::fs::read_to_string(directory.join("chat_template.jinja"))?;
+    for required in [
+        "<|startofcontext|><|startoftranscript|><|emo:undefined|>",
+        "source_language",
+        "target_language",
+        "punctuation",
+        "<|noitn|><|notimestamp|><|nodiarize|>",
+    ] {
+        ensure!(
+            template.contains(required),
+            "Canary chat template missing {required}"
+        );
+    }
+    canary_prompt_with(source_language, target_language, punctuation, |text| {
+        crate::tokenizer::encode(directory, text)
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn transcribe(
+    directory: &Path,
+    waveform: &[f32],
+    source_language: &str,
+    target_language: &str,
+    punctuation: bool,
+    options: crate::RunOptions,
+) -> Result<crate::media::Transcription> {
+    let spec = CanarySpec::read(directory)?;
+    let prompt = canary_prompt(directory, source_language, target_language, punctuation)?;
+    let device = crate::backend::cuda::Device::new(options.device)?;
+    let model = Canary::load(directory, &device)?;
+    let mel = crate::audio::LogMel::new(spec.mel)?.extract(&[waveform], true, true, false)?;
+    let valid = mel.mask.iter().filter(|flag| **flag).count();
+    let (output, _) = model.transcribe(&mel.features, valid, &prompt)?;
+    let text = crate::tokenizer::decode(directory, &output)?;
+    crate::media::Transcription::whole_clip(text, waveform.len() as f64 / 16000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canary_prompt_maps_languages_and_punctuation() -> Result<()> {
+        let encode = |text: &str| -> Result<Vec<u32>> {
+            Ok(vec![match text {
+                "<|startofcontext|>" => 7,
+                "<|startoftranscript|>" => 4,
+                "<|emo:undefined|>" => 16,
+                "<|en|>" => 64,
+                "<|de|>" => 78,
+                "<|pnc|>" => 5,
+                "<|nopnc|>" => 6,
+                "<|noitn|>" => 9,
+                "<|notimestamp|>" => 11,
+                "<|nodiarize|>" => 13,
+                _ => 0,
+            }])
+        };
+        assert_eq!(
+            canary_prompt_with("en", "en", true, encode)?,
+            [7, 4, 16, 64, 64, 5, 9, 11, 13]
+        );
+        assert_eq!(
+            canary_prompt_with("en", "de", false, encode)?,
+            [7, 4, 16, 64, 78, 6, 9, 11, 13]
+        );
+        assert!(canary_prompt_with("en", "zz", true, encode).is_err());
+        Ok(())
+    }
+}

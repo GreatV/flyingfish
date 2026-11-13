@@ -573,6 +573,194 @@ fn mux_with_tool(
     result
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TextSegment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Transcription {
+    pub text: String,
+    pub segments: Vec<TextSegment>,
+    pub words: Vec<TextSegment>,
+}
+
+impl Transcription {
+    pub fn whole_clip(text: String, seconds: f64) -> Result<Self> {
+        ensure!(
+            seconds.is_finite() && seconds >= 0.0,
+            "invalid clip duration"
+        );
+        Ok(Self {
+            text: text.clone(),
+            segments: vec![TextSegment {
+                start: 0.0,
+                end: seconds,
+                text,
+            }],
+            words: Vec::new(),
+        })
+    }
+}
+
+pub fn read_wav(mut reader: impl Read, expected_rate: u32) -> Result<Vec<f32>> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    ensure!(bytes.len() >= 12, "WAV header is truncated");
+    ensure!(
+        &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "invalid WAV header"
+    );
+    let mut offset = 12usize;
+    let mut format = None;
+    let mut data = None;
+    while offset + 8 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into()?) as usize;
+        let body = offset + 8;
+        let end = body
+            .checked_add(size)
+            .context("WAV chunk extent overflow")?;
+        ensure!(end <= bytes.len(), "WAV chunk is truncated");
+        match &bytes[offset..offset + 4] {
+            b"fmt " => {
+                ensure!(size >= 16, "short WAV format chunk");
+                let encoding = u16::from_le_bytes(bytes[body..body + 2].try_into()?);
+                let channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into()?);
+                let rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into()?);
+                let align = u16::from_le_bytes(bytes[body + 12..body + 14].try_into()?);
+                let bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into()?);
+                ensure!(channels == 1, "WAV must be mono");
+                ensure!(
+                    rate == expected_rate,
+                    "WAV rate {rate} does not match model rate {expected_rate}; convert with: ffmpeg -i <input> -ar {expected_rate} -ac 1 <output>"
+                );
+                ensure!(
+                    (encoding == 1 && matches!(bits, 16 | 24) || encoding == 3 && bits == 32),
+                    "WAV must be PCM16, PCM24 or F32"
+                );
+                ensure!(align == channels * (bits / 8), "WAV block align mismatch");
+                format = Some(bits);
+            }
+            b"data" => data = Some(body..end),
+            _ => {}
+        }
+        offset = end.checked_add(size & 1).context("WAV padding overflow")?;
+    }
+    let bits = format.context("missing WAV format chunk")?;
+    let data = data.context("missing WAV data chunk")?;
+    let width = usize::from(bits / 8);
+    ensure!(
+        !data.is_empty() && data.len() % width == 0,
+        "invalid WAV data extent"
+    );
+    bytes[data]
+        .chunks_exact(width)
+        .map(|sample| {
+            Ok(match bits {
+                16 => f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0,
+                24 => {
+                    let value = i32::from(sample[0])
+                        | (i32::from(sample[1]) << 8)
+                        | (i32::from(sample[2]) << 16);
+                    ((value << 8) >> 8) as f32 / 8388608.0
+                }
+                32 => {
+                    let value = f32::from_le_bytes(sample.try_into()?);
+                    ensure!(value.is_finite(), "WAV F32 sample is not finite");
+                    value
+                }
+                _ => bail!("unsupported WAV sample width"),
+            })
+        })
+        .collect()
+}
+
+fn validate_segment(segment: &TextSegment) -> Result<()> {
+    ensure!(
+        segment.start.is_finite()
+            && segment.end.is_finite()
+            && segment.start >= 0.0
+            && segment.end >= segment.start,
+        "invalid text segment time range"
+    );
+    Ok(())
+}
+
+fn milliseconds(seconds: f64) -> Result<u64> {
+    ensure!(seconds.is_finite() && seconds >= 0.0, "invalid timestamp");
+    let millis = (seconds * 1000.0).round();
+    ensure!(
+        millis >= 0.0 && millis <= u64::MAX as f64,
+        "timestamp overflow"
+    );
+    Ok(millis as u64)
+}
+
+fn timestamp(seconds: f64, decimal: char) -> Result<String> {
+    let millis = milliseconds(seconds)?;
+    let hours = millis / 3_600_000;
+    let minutes = millis / 60_000 % 60;
+    let seconds = millis / 1000 % 60;
+    let millis = millis % 1000;
+    Ok(format!(
+        "{hours:02}:{minutes:02}:{seconds:02}{decimal}{millis:03}"
+    ))
+}
+
+pub fn write_srt(mut writer: impl Write, segments: &[TextSegment]) -> Result<()> {
+    for (index, segment) in segments.iter().enumerate() {
+        validate_segment(segment)?;
+        writeln!(
+            writer,
+            "{}\n{} --> {}\n{}\n",
+            index + 1,
+            timestamp(segment.start, ',')?,
+            timestamp(segment.end, ',')?,
+            segment.text
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_vtt(mut writer: impl Write, segments: &[TextSegment]) -> Result<()> {
+    writer.write_all(b"WEBVTT\n\n")?;
+    for segment in segments {
+        validate_segment(segment)?;
+        writeln!(
+            writer,
+            "{} --> {}\n{}\n",
+            timestamp(segment.start, '.')?,
+            timestamp(segment.end, '.')?,
+            segment.text
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_rttm(mut writer: impl Write, file_id: &str, segments: &[TextSegment]) -> Result<()> {
+    ensure!(
+        !file_id.is_empty() && !file_id.chars().any(char::is_whitespace),
+        "RTTM file id must be one token"
+    );
+    for segment in segments {
+        validate_segment(segment)?;
+        ensure!(
+            !segment.text.is_empty() && !segment.text.chars().any(char::is_whitespace),
+            "RTTM speaker label must be one token"
+        );
+        writeln!(
+            writer,
+            "SPEAKER {file_id} 1 {:.3} {:.3} <NA> <NA> {} <NA> <NA>",
+            segment.start,
+            segment.end - segment.start,
+            segment.text
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +906,122 @@ mod tests {
             )
         );
         assert!(write_y4m(Vec::new(), 3, 2, (24, 1), 1, &[0; 18]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn wav_reader_decodes_pcm16_pcm24_and_f32_with_chunk_padding() -> Result<()> {
+        fn container(encoding: u16, bits: u16, rate: u32, data: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(b"WAVE");
+            bytes.extend_from_slice(b"JUNK");
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&[0x7f, 0]);
+            bytes.extend_from_slice(b"fmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&encoding.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&rate.to_le_bytes());
+            let align = bits / 8;
+            bytes.extend_from_slice(&(rate * u32::from(align)).to_le_bytes());
+            bytes.extend_from_slice(&align.to_le_bytes());
+            bytes.extend_from_slice(&bits.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(data);
+            bytes
+        }
+
+        let pcm16: Vec<_> = [-32768i16, 0, 32767]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let decoded = read_wav(Cursor::new(container(1, 16, 16000, &pcm16)), 16000)?;
+        assert_eq!(decoded, [-1.0, 0.0, 32767.0 / 32768.0]);
+        let pcm24: Vec<_> = [-8388608i32, 0, 8388607]
+            .into_iter()
+            .flat_map(|value| {
+                let bytes = value.to_le_bytes();
+                [bytes[0], bytes[1], bytes[2]]
+            })
+            .collect();
+        let decoded = read_wav(Cursor::new(container(1, 24, 16000, &pcm24)), 16000)?;
+        assert_eq!(decoded, [-1.0, 0.0, 8388607.0 / 8388608.0]);
+        let f32_data: Vec<_> = [-1.0f32, 0.25, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let decoded = read_wav(Cursor::new(container(3, 32, 16000, &f32_data)), 16000)?;
+        assert_eq!(decoded, [-1.0, 0.25, 1.0]);
+        let nan = f32::NAN.to_le_bytes();
+        assert!(read_wav(Cursor::new(container(3, 32, 16000, &nan)), 16000).is_err());
+        let error = read_wav(Cursor::new(container(1, 16, 8000, &pcm16)), 16000)
+            .expect_err("sample-rate mismatch must fail")
+            .to_string();
+        assert!(
+            error.contains("ffmpeg") && error.contains("-ar 16000"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timed_text_writers_preserve_timestamps_and_overlap() -> Result<()> {
+        let segments = vec![
+            TextSegment {
+                start: 0.0,
+                end: 1.25,
+                text: "hello".into(),
+            },
+            TextSegment {
+                start: 1.25,
+                end: 2.5,
+                text: "world".into(),
+            },
+        ];
+        let mut srt = Vec::new();
+        write_srt(&mut srt, &segments)?;
+        assert_eq!(
+            String::from_utf8(srt)?,
+            "1\n00:00:00,000 --> 00:00:01,250\nhello\n\n2\n00:00:01,250 --> 00:00:02,500\nworld\n\n"
+        );
+        let mut vtt = Vec::new();
+        write_vtt(&mut vtt, &segments)?;
+        assert_eq!(
+            String::from_utf8(vtt)?,
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.250\nhello\n\n00:00:01.250 --> 00:00:02.500\nworld\n\n"
+        );
+        let speakers = vec![
+            TextSegment {
+                start: 0.0,
+                end: 2.0,
+                text: "speaker_0".into(),
+            },
+            TextSegment {
+                start: 1.0,
+                end: 2.5,
+                text: "speaker_1".into(),
+            },
+        ];
+        let mut rttm = Vec::new();
+        write_rttm(&mut rttm, "clip", &speakers)?;
+        assert_eq!(
+            String::from_utf8(rttm)?,
+            "SPEAKER clip 1 0.000 2.000 <NA> <NA> speaker_0 <NA> <NA>\nSPEAKER clip 1 1.000 1.500 <NA> <NA> speaker_1 <NA> <NA>\n"
+        );
+        assert!(
+            write_srt(
+                Vec::new(),
+                &[TextSegment {
+                    start: f64::NAN,
+                    end: 1.0,
+                    text: "bad".into(),
+                }]
+            )
+            .is_err()
+        );
         Ok(())
     }
 

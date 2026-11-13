@@ -390,6 +390,10 @@ fn step_mask(
 }
 
 impl Diarization {
+    pub(crate) fn spec(&self) -> &DiarizationSpec {
+        &self.spec
+    }
+
     pub fn load(directory: &Path, device: &Device) -> Result<Self> {
         let spec = DiarizationSpec::read(directory)?;
         let frontend = LogMel::new(spec.mel)?;
@@ -1556,53 +1560,7 @@ mod tests {
     }
 
     fn read_wave(path: &Path) -> Result<Vec<f32>> {
-        let bytes = std::fs::read(path)?;
-        ensure!(
-            bytes.len() >= 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
-            "invalid WAV header"
-        );
-        let mut offset = 12usize;
-        let mut format = false;
-        let mut data = None;
-        while offset + 8 <= bytes.len() {
-            let size = u32::from_le_bytes([
-                bytes[offset + 4],
-                bytes[offset + 5],
-                bytes[offset + 6],
-                bytes[offset + 7],
-            ]) as usize;
-            let body = offset + 8;
-            ensure!(body + size <= bytes.len(), "invalid WAV chunk");
-            let id = &bytes[offset..offset + 4];
-            if id == b"fmt " {
-                ensure!(size >= 16, "short WAV format chunk");
-                let channels = u16::from_le_bytes([bytes[body], bytes[body + 1]]);
-                let rate = u32::from_le_bytes([
-                    bytes[body + 4],
-                    bytes[body + 5],
-                    bytes[body + 6],
-                    bytes[body + 7],
-                ]);
-                let bits = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]);
-                ensure!(
-                    channels == 1 && rate == 16000 && bits == 16,
-                    "unsupported WAV format"
-                );
-                format = true;
-            } else if id == b"data" {
-                data = Some(body..body + size);
-                break;
-            }
-            offset = body + size + (size & 1);
-        }
-        ensure!(format, "missing WAV format chunk");
-        let range = data.context("missing WAV data chunk")?;
-        Ok(bytes[range]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|value| f32::from(i16::from_le_bytes(*value)) / 32768.0)
-            .collect())
+        crate::media::read_wav(std::fs::File::open(path)?, 16000)
     }
 
     fn before_snapshot(
@@ -1648,54 +1606,6 @@ mod tests {
             }
         }
         Ok(false)
-    }
-
-    fn frontend_step(
-        engine: &Diarization,
-        wave: &[f32],
-        step: usize,
-        config: ChunkConfig,
-        mel_index: usize,
-    ) -> Result<(Vec<f32>, Vec<bool>, bool)> {
-        let mel = engine.spec.mel;
-        let factor = engine.spec.factor as usize;
-        let hop = mel.hop_length as usize;
-        let win = mel.win_length as usize;
-        let n_fft = mel.n_fft as usize;
-        let mel_bins = mel.mel_bins as usize;
-        let chunk_mel = (config.frames as usize + config.right as usize) * factor;
-        let first_samples = (chunk_mel - 1) * hop + win / 2;
-        let later_samples = chunk_mel * hop + win;
-        let start = if step == 0 {
-            0
-        } else {
-            mel_index
-                .checked_mul(hop)
-                .and_then(|value| value.checked_sub(n_fft / 2))
-                .context("streaming start underflow")?
-        };
-        let size = if step == 0 {
-            first_samples
-        } else {
-            later_samples
-        };
-        let end = (start + size).min(wave.len());
-        ensure!(
-            start <= end && end <= wave.len(),
-            "streaming waveform extent"
-        );
-        let last = end >= wave.len();
-        let batch = engine.audio_features(&wave[start..end], step == 0, last)?;
-        let valid = batch.mask.iter().filter(|flag| **flag).count();
-        ensure!(
-            valid * mel_bins <= batch.features.len() && valid <= batch.mask.len(),
-            "streaming frontend extent"
-        );
-        Ok((
-            batch.features[..valid * mel_bins].to_vec(),
-            batch.mask[..valid].to_vec(),
-            last,
-        ))
     }
 
     struct CompressionContext<'a> {
@@ -2289,8 +2199,9 @@ mod tests {
                     let step_mel = config.frames as usize * factor;
                     for (step, record) in step_rows.iter().enumerate() {
                         let mel_index = step * step_mel;
-                        let (features, mask, last) =
-                            frontend_step(&engine, wave, step, config, mel_index)?;
+                        let (features, mask, last) = crate::diarization::stream_frontend_step(
+                            &engine, wave, step, config, mel_index,
+                        )?;
                         let expected_last =
                             record["last"].as_bool().context("missing step last flag")?;
                         if !exact_bool(
