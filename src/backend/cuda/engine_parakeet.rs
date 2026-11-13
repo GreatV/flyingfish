@@ -3179,7 +3179,7 @@ impl ParakeetEncoder {
             session.depthwise[index] = cache.depthwise;
         }
         session.cumulative += rows as u32;
-        for (lane, is_main) in main.iter().enumerate() {
+        for (lane, is_main) in main[..lanes].iter().enumerate() {
             if *is_main {
                 session.lane_cumulative[lane] += rows as u32;
             }
@@ -3479,7 +3479,7 @@ impl ParakeetEncoder {
         );
         let mut cat_k = self.stream.alloc_zeros(lanes * key_rows * width)?;
         let mut cat_v = self.stream.alloc_zeros(lanes * key_rows * width)?;
-        for (lane, is_live) in live.iter().enumerate() {
+        for (lane, is_live) in live[..lanes].iter().enumerate() {
             let cached = session.lane_cumulative[lane].min(98) as usize;
             let lane_k = lane * key_rows * width;
             if cached > 0 && *is_live {
@@ -3606,7 +3606,7 @@ impl ParakeetEncoder {
         {
             let source_rows = launch_rows as usize;
             let available = source_rows.min(8);
-            for (lane, is_live) in live.iter().enumerate() {
+            for (lane, is_live) in live[..lanes].iter().enumerate() {
                 if !is_live {
                     self.copy_device(
                         &session.depthwise[index],
@@ -3651,7 +3651,7 @@ impl ParakeetEncoder {
         let stride = 98usize;
         let mut next_k = self.stream.alloc_zeros(lanes * stride * width)?;
         let mut next_v = self.stream.alloc_zeros(lanes * stride * width)?;
-        for (lane, is_live) in live.iter().enumerate() {
+        for (lane, is_live) in live[..lanes].iter().enumerate() {
             if !is_live {
                 self.copy_device(
                     &session.keys[index],
