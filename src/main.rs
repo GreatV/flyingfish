@@ -192,6 +192,29 @@ enum Command {
     Transcribe(TranscribeArgs),
     Diarize(DiarizeArgs),
     Embed(EmbedArgs),
+    Image {
+        #[arg(long, help = "Image description in natural language")]
+        prompt: String,
+        #[arg(long, value_parser = parse_image_size, help = "Requested output size WIDTHxHEIGHT")]
+        size: (usize, usize),
+        #[arg(long, help = "Image noise seed (required; no documented default)")]
+        seed: u64,
+        #[arg(
+            long,
+            help = "Prompt-expander model directory; replaces the input prompt"
+        )]
+        expand: Option<PathBuf>,
+        #[arg(long, action = clap::ArgAction::Append, help = "Upright RGB8 edit reference; repeat for multiple images")]
+        edit: Vec<PathBuf>,
+        #[arg(
+            short = 'o',
+            long = "output",
+            help = "Output .png at the requested size"
+        )]
+        output: PathBuf,
+        #[arg(long, help = "Print output size, seed and reference count as JSON")]
+        json: bool,
+    },
     Video {
         #[arg(long, help = "Video description in natural language")]
         prompt: String,
@@ -828,6 +851,29 @@ fn embed(cli: &Cli, args: &EmbedArgs) -> Result<()> {
     })
 }
 
+fn parse_image_size(text: &str) -> Result<(usize, usize)> {
+    let (width, height) = text
+        .split_once('x')
+        .context("image size must be WIDTHxHEIGHT")?;
+    let width = width
+        .parse::<usize>()
+        .with_context(|| format!("invalid image width {width}"))?;
+    let height = height
+        .parse::<usize>()
+        .with_context(|| format!("invalid image height {height}"))?;
+    ensure!(width > 0 && height > 0, "image size must be positive");
+    Ok((width, height))
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn png_output(path: &Path) -> Result<()> {
+    ensure!(
+        path.extension().is_some_and(|extension| extension == "png"),
+        "image output must end in .png"
+    );
+    Ok(())
+}
+
 #[cfg(any(feature = "cuda", test))]
 fn mp4_output(path: &Path) -> Result<bool> {
     match path.extension().and_then(|extension| extension.to_str()) {
@@ -835,6 +881,103 @@ fn mp4_output(path: &Path) -> Result<bool> {
         Some("y4m") => Ok(false),
         _ => bail!("video output must end in .mp4 or .y4m"),
     }
+}
+
+struct ImageCliRequest {
+    prompt: String,
+    width: usize,
+    height: usize,
+    seed: u64,
+    expander: Option<PathBuf>,
+    references: Vec<PathBuf>,
+}
+
+fn image(cli: &Cli, request: ImageCliRequest, output: &Path, json: bool) -> Result<()> {
+    let _ = (
+        cli,
+        &request.prompt,
+        &request.width,
+        &request.height,
+        &request.seed,
+        &request.expander,
+        &request.references,
+        output,
+        json,
+    );
+    #[cfg(not(feature = "cuda"))]
+    bail!("image requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        png_output(output)?;
+        let output = output_path(output, &cli.model)?;
+        let expander = request
+            .expander
+            .as_ref()
+            .map(|path| {
+                path.canonicalize()
+                    .with_context(|| format!("resolve prompt expander {}", path.display()))
+            })
+            .transpose()?;
+        let references = request
+            .references
+            .iter()
+            .map(|path| {
+                let path = path
+                    .canonicalize()
+                    .with_context(|| format!("resolve edit reference {}", path.display()))?;
+                let bytes = fs::read(&path)
+                    .with_context(|| format!("read edit reference {}", path.display()))?;
+                Ok(flyingfish::minimax_h3::ImageReference {
+                    image: flyingfish::serve::image::decode_image(&bytes, None)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut request = flyingfish::minimax_h3::ImageRequest::new(
+            request.prompt,
+            request.width,
+            request.height,
+            request.seed,
+        );
+        request.expander = expander;
+        request.references = references;
+        let options = flyingfish::minimax_h3::ImageRunOptions {
+            device: cli.device,
+            runtime_dir: cli
+                .kernels
+                .runtime_dir
+                .clone()
+                .context("--runtime-dir is required for image")?,
+        };
+        let generated = flyingfish::minimax_h3::image_latents(&cli.model, &options, &request)?;
+        ensure!(
+            generated.rgb.len() == request.width * request.height * 3,
+            "image entry RGB extent"
+        );
+        if let Err(error) = flyingfish::media::write_png(
+            fs::File::create(&output)?,
+            request.width,
+            request.height,
+            &generated.rgb,
+        ) {
+            let _ = fs::remove_file(&output);
+            return Err(error);
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"image": {
+                    "output": output.display().to_string(),
+                    "width": request.width,
+                    "height": request.height,
+                    "seed": request.seed,
+                    "references": request.references.len(),
+                }})
+            );
+        } else {
+            println!("{}", output.display());
+        }
+        Ok(())
+    })
 }
 
 fn video(
@@ -1016,6 +1159,25 @@ fn run() -> Result<()> {
         Command::Transcribe(args) => transcribe(&cli, args),
         Command::Diarize(args) => diarize(&cli, args),
         Command::Embed(args) => embed(&cli, args),
+        Command::Image {
+            prompt,
+            size,
+            seed,
+            expand,
+            edit,
+            output,
+            json,
+        } => {
+            let request = ImageCliRequest {
+                prompt: prompt.clone(),
+                width: size.0,
+                height: size.1,
+                seed: *seed,
+                expander: expand.clone(),
+                references: edit.clone(),
+            };
+            image(&cli, request, output, *json)
+        }
         Command::Video {
             prompt,
             image,
@@ -1441,6 +1603,89 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_parse_covers_size_expander_edits_and_png_output() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "--runtime-dir",
+            "runtime",
+            "--device",
+            "1",
+            "image",
+            "--prompt",
+            "a red cube",
+            "--size",
+            "1536x1024",
+            "--seed",
+            "42",
+            "--expand",
+            "pe",
+            "--edit",
+            "first.png",
+            "--edit",
+            "second.png",
+            "-o",
+            "out.png",
+            "--json",
+        ])?;
+        assert_eq!(cli.device, 1);
+        match cli.command {
+            Command::Image {
+                prompt,
+                size,
+                seed,
+                expand,
+                edit,
+                output,
+                json,
+            } => {
+                assert_eq!(prompt, "a red cube");
+                assert_eq!(size, (1536, 1024));
+                assert_eq!(seed, 42);
+                assert_eq!(expand, Some(PathBuf::from("pe")));
+                assert_eq!(
+                    edit,
+                    [PathBuf::from("first.png"), PathBuf::from("second.png")]
+                );
+                assert_eq!(output, PathBuf::from("out.png"));
+                assert!(json);
+            }
+            _ => panic!("image subcommand was not selected"),
+        }
+        let help = {
+            use clap::CommandFactory;
+            Cli::command()
+                .find_subcommand_mut("image")
+                .expect("image subcommand")
+                .render_help()
+                .to_string()
+        };
+        assert!(help.contains("WIDTHxHEIGHT"), "{help}");
+        assert!(help.contains("required; no documented default"), "{help}");
+        assert!(help.contains("replaces the input prompt"), "{help}");
+        assert!(help.contains("repeat for multiple images"), "{help}");
+        assert!(help.contains("Output .png"), "{help}");
+        assert!(help.contains("reference count as JSON"), "{help}");
+        for invalid in ["0x1024", "1024", "1024X1024", "-1x2"] {
+            assert!(parse_image_size(invalid).is_err(), "accepted {invalid}");
+        }
+        assert!(png_output(Path::new("out.jpg")).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "flyingfish",
+                "--model",
+                "model",
+                "image",
+                "--prompt",
+                "a red cube"
+            ])
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn video_help_documents_required_keyframe_and_frame_rounding() {
