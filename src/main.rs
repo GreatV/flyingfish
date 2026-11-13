@@ -699,7 +699,7 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     bail!("transcribe requires CUDA");
     #[cfg(feature = "cuda")]
-    {
+    flyingfish::backend::with_verbose(cli.verbose, || {
         let waveform = flyingfish::media::read_wav(input_bytes(&args.input)?.as_slice(), 16000)?;
         let class = model_class(&cli.model)?;
         if args.stream && class != "nemo" {
@@ -712,6 +712,7 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
                 .runtime_dir
                 .clone()
                 .context("--runtime-dir is required for transcribe")?,
+            verbose: cli.verbose,
         };
         let result = match class.as_str() {
             "ParakeetForTDT" => flyingfish::parakeet::transcribe(&cli.model, &waveform, options)?,
@@ -748,7 +749,7 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
             args.format.extension(),
             &bytes,
         )
-    }
+    })
 }
 
 fn diarize(cli: &Cli, args: &DiarizeArgs) -> Result<()> {
@@ -756,7 +757,7 @@ fn diarize(cli: &Cli, args: &DiarizeArgs) -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     bail!("diarize requires CUDA");
     #[cfg(feature = "cuda")]
-    {
+    flyingfish::backend::with_verbose(cli.verbose, || {
         let waveform = flyingfish::media::read_wav(input_bytes(&args.input)?.as_slice(), 16000)?;
         let class = model_class(&cli.model)?;
         ensure!(
@@ -770,6 +771,7 @@ fn diarize(cli: &Cli, args: &DiarizeArgs) -> Result<()> {
                 .runtime_dir
                 .clone()
                 .context("--runtime-dir is required for diarize")?,
+            verbose: cli.verbose,
         };
         let segments = flyingfish::diarization::diarize(
             &cli.model,
@@ -790,7 +792,7 @@ fn diarize(cli: &Cli, args: &DiarizeArgs) -> Result<()> {
         let mut bytes = Vec::new();
         flyingfish::media::write_rttm(&mut bytes, &file_id, &segments)?;
         write_bytes_output(args.output.as_deref(), &cli.model, "rttm", &bytes)
-    }
+    })
 }
 
 fn embed(cli: &Cli, args: &EmbedArgs) -> Result<()> {
@@ -798,7 +800,7 @@ fn embed(cli: &Cli, args: &EmbedArgs) -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     bail!("embed requires CUDA");
     #[cfg(feature = "cuda")]
-    {
+    flyingfish::backend::with_verbose(cli.verbose, || {
         let text = if let Some(text) = &args.input.text {
             text.clone()
         } else {
@@ -818,11 +820,12 @@ fn embed(cli: &Cli, args: &EmbedArgs) -> Result<()> {
                 .runtime_dir
                 .clone()
                 .context("--runtime-dir is required for embed")?,
+            verbose: cli.verbose,
         };
         let values = flyingfish::model::embed_text(&cli.model, &text, options)?;
         let bytes = format!("{}\n", flyingfish::model::embedding_json(&values)?).into_bytes();
         write_bytes_output(args.output.as_deref(), &cli.model, "json", &bytes)
-    }
+    })
 }
 
 #[cfg(any(feature = "cuda", test))]
