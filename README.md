@@ -54,14 +54,14 @@ Media generation (library entry points and CLI):
 | MiniMax-H3-Image | Prompt-to-image is usable. A prompt and optional upright RGB8 references become RGB8 through the Qwen3-VL conditioner, native VAE encode, six-step Euler under a derived placement, native VAE decode, truncation toward zero and Lanczos-3; one Philox draw from the request seed; `flyingfish::minimax_h3::image_latents`, `flyingfish::minimax_h3::image_encode`, `flyingfish::minimax_h3::image_decode` and the `image` command writes PNG. `image_sample` runs the six evaluations on supplied embeddings and latent rows | CUDA |
 | MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) in one entry from token ids and a seed to stereo PCM; `flyingfish::music3::generate` | CUDA |
 
-Image to 3D (library entry points, no CLI):
+Image to 3D (library entry points and CLI):
 
 | Model | Notes | Backends |
 |---|---|---|
 | Idol | DINOv3 and FLUX.2 VAE encoders, latent flow denoiser, octree and Gaussian decoders: a preprocessed 1024 px image to a Gaussian splat and a camera; `flyingfish::backend::IdolPipelineRuntime` | CUDA |
 | Pixal3D | Single-view and multiview: RGBA views with camera parameters and supplied noise, through sparse-structure, shape and texture flows, to a raw mesh with six material channels; `flyingfish::backend::PixalGeneration` | CUDA |
 | Hi3D | DINOv2 and CLIP image conditioning, sparse flow and sparse VAE decoder at 512, 1024 or 1536, refining a supplied coarse mesh; raw mesh or a hole-filled, simplified and normalized mesh; `flyingfish::backend::Hi3DGeneration` | CUDA |
-| TRELLIS.2-4B | DINOv3 image conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders on supplied noise; decoder output differs from the reference at F16 quanta (see the PR); the stages run inside the crate, no library entry yet | CUDA |
+| TRELLIS.2-4B | Image to a textured mesh on the default 1024-cascade pipeline: DINOv3 conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders, seeded stage noise; raw mesh only (no fill, simplify, UV, bake or render), RGBA input with the background already removed, and the decoder and structure-latent outputs differ from the reference at F16 quanta; `flyingfish::backend::TrellisTo3d`, CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --seed 42 -o mesh.ply` | CUDA |
 
 In progress: TRELLIS.2 image-to-3D (flow sampling and the structured-latent, mesh and texture stages landed; remaining: render, GLB and bake, the shape and texture encoders, and closing the decoder and structure-latent differences from the reference).
 
