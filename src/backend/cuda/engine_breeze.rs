@@ -948,6 +948,10 @@ fn argmax_heads(k: &Kern, buf: &mut Buf) -> Result<()> {
     Ok(())
 }
 
+fn depth_sample_counter(frame: usize) -> u64 {
+    frame as u64 * HEAD_N as u64
+}
+
 struct SampleRequest {
     source_start: usize,
     picked_start: usize,
@@ -3196,7 +3200,7 @@ impl Breeze {
                     sampling,
                     seed,
                     stream: 1,
-                    counter: frame as u64,
+                    counter: depth_sample_counter(frame),
                     allow: -1,
                 },
             )?;
@@ -4082,6 +4086,18 @@ mod tests {
             "65 frames"
         );
         Ok(())
+    }
+
+    #[test]
+    fn depth_sample_counters_are_disjoint_across_frames() {
+        let mut seen = std::collections::BTreeSet::new();
+        for frame in 0..750 {
+            for head in 0..super::HEAD_N {
+                let counter = super::depth_sample_counter(frame) + head as u64;
+                assert!(seen.insert(counter), "duplicate frame={frame} head={head}");
+            }
+        }
+        assert_eq!(seen.len(), 750 * super::HEAD_N);
     }
 
     #[test]
