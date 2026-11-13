@@ -3,19 +3,21 @@ use anyhow::{Context, Result, bail, ensure};
 use flyingfish::{
     checkpoint::{MappedCheckpoint, TensorScope},
     minimax_h3::{
-        AUDIO_TAG, AdalnPlan, DecodePlan, Geometry, H3Spec, IMAGE_MIN_GENERATION_AREA, IMAGE_TAG,
-        ImageLayout, ImageSchedule, ImageSpec, ImageVaeSpec, KeyframeAnchor, PackedLayout,
-        RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec, VaeTiles, image_canvas,
-        image_edit_rows, image_latent_extent, image_layout, image_picture_label,
-        image_reference_latent_extent, image_reference_size, image_rgb8, image_row_plan,
-        image_row_timesteps, image_text_rows, patchify_latents, row_timestep_plan,
+        AUDIO_TAG, AdalnPlan, DecodePlan, FlowStep, Geometry, H3Spec, IMAGE_MIN_GENERATION_AREA,
+        IMAGE_TAG, ImageLayout, ImageSchedule, ImageSpec, ImageVaeSpec, KeyframeAnchor,
+        LinearStorage, PackedLayout, RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec,
+        VaeTiles, dropped_block, hyperflow_steps, image_canvas, image_edit_rows,
+        image_latent_extent, image_layout, image_picture_label, image_reference_latent_extent,
+        image_reference_size, image_rgb8, image_row_plan, image_row_timesteps, image_text_rows,
+        mix_temb, pad_lowrank, patchify_latents, report_stored_placement, row_timestep_plan,
+        stored_scratch_bytes, stored_scratch_extents, unchunked_activation_bytes,
         unpatchify_latents,
     },
     prefill::DensePlacement,
 };
 use safetensors::{Dtype, SafeTensors};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -61,6 +63,14 @@ fn minimax_h3_config_normalizes_the_published_transformer() -> Result<()> {
         "unexpected MiniMax-H3 geometry: {spec:?}"
     );
     ensure!(spec.block_linears().len() == 312, "block linear count");
+    ensure!(
+        spec.hyperflow_gate.is_none()
+            && spec.dropped_blocks.is_none()
+            && spec.lowrank_ranks.is_none()
+            && spec.int8_convrot.is_none()
+            && !spec.is_hyperflow()?,
+        "MiniMax-H3 config set a HyperFlow field"
+    );
     let mut unknown: serde_json::Value =
         serde_json::from_str(include_str!("data/minimax-h3-transformer-config.json"))?;
     unknown["sliding_window"] = 1.into();
@@ -531,7 +541,7 @@ fn minimax_h3_adaln_plan_addresses_every_row_pair() -> Result<()> {
     ] {
         let layout = PackedLayout::build(&spec, &geometry, &text_tags(), anchors)?;
         let plan = row_timestep_plan(&layout, &video, &audio)?;
-        let adaln = AdalnPlan::build(&layout, &plan);
+        let adaln = AdalnPlan::build(&layout, &plan)?;
         ensure!(
             adaln.timesteps.len() == 16 && adaln.pairs.len() == 25,
             "AdaLN extent: timesteps={} pairs={}",
@@ -1270,7 +1280,7 @@ fn minimax_h3_image_layout_matches_the_frozen_coordinates() -> Result<()> {
         [adaln[0], adaln[5], adaln[82]] == [1, 3, 0],
         "AdaLN indices at step 0"
     );
-    let table = AdalnPlan::from_tags(&edit.token_tags, &plan);
+    let table = AdalnPlan::from_tags(&edit.token_tags, &plan)?;
     ensure!(
         table.row_pairs.len() == plan.len()
             && table
@@ -1743,5 +1753,478 @@ fn minimax_h3_image_4096_placement_matches_the_counted_budget() -> Result<()> {
         }),
         "spatial position ids"
     );
+    Ok(())
+}
+
+fn hyperflow_json() -> serde_json::Value {
+    serde_json::json!({
+        "_class_name": "HyperFlowH3FlashTransformer3DModel",
+        "_diffusers_version": "0.0.0",
+        "num_attention_heads": 2,
+        "attention_head_dim": 128,
+        "hidden_size": 256,
+        "num_layers": 3,
+        "num_refiner_layers": 1,
+        "ffn_dim": 256,
+        "in_channels": 4,
+        "audio_in_channels": 8,
+        "patch_size": [1, 2, 2],
+        "text_dim": 16,
+        "freq_dim": 8,
+        "time_embed_hidden_dim": 32,
+        "time_embed_dim": 16,
+        "rope_freq_dim": 16,
+        "rope_theta": 10000.0,
+        "norm_eps": 1e-5,
+        "qk_norm_eps": 1e-5,
+        "final_norm_eps": 1e-5,
+        "hyperflow_gate": 0.25,
+        "dropped_blocks": [1],
+        "lowrank_ranks": {"transformer_blocks.2.ff.net.2": 2},
+        "auto_map": {},
+        "quantization": {
+            "method": "int8_convrot",
+            "group": 256,
+            "linears": [
+                "transformer_blocks.0.attn.to_q",
+                "transformer_blocks.0.attn.to_k"
+            ]
+        }
+    })
+}
+
+#[test]
+fn hyperflow_config_reads_the_published_fields_without_defaults() -> Result<()> {
+    let mut mini = spec()?;
+    mini.hyperflow_gate = Some(0.25);
+    ensure!(mini.is_hyperflow().is_err(), "partial fields");
+    let spec = H3Spec::parse(&hyperflow_json())?;
+    ensure!(spec.is_hyperflow()?, "HyperFlow class");
+    ensure!(
+        spec.hyperflow_gate == Some(0.25),
+        "gate {:?}",
+        spec.hyperflow_gate
+    );
+    ensure!(spec.dropped_blocks.as_deref() == Some(&[1][..]), "dropped");
+    let linears = spec.block_linears();
+    ensure!(linears.len() == 18, "kept linears {}", linears.len());
+    ensure!(
+        linears
+            .iter()
+            .all(|(name, _, _)| !name.starts_with("transformer_blocks.1.")),
+        "dropped block listed"
+    );
+    let mut int8 = 0;
+    let mut low = 0;
+    for (name, _, _) in &linears {
+        match spec.linear_storage(name)? {
+            LinearStorage::Int8 { group } => {
+                ensure!(group == 256, "group {group}");
+                int8 += 1;
+            }
+            LinearStorage::LowRank { rank } => {
+                ensure!(rank == 2, "rank {rank}");
+                low += 1;
+            }
+            LinearStorage::Dense => {}
+        }
+    }
+    ensure!(int8 == 2 && low == 1, "roles int8 {int8} low {low}");
+    let mut missing = hyperflow_json();
+    missing
+        .as_object_mut()
+        .context("object")?
+        .remove("hyperflow_gate");
+    ensure!(H3Spec::parse(&missing).is_err(), "missing gate defaulted");
+    let mut partial = hyperflow_json();
+    partial
+        .as_object_mut()
+        .context("object")?
+        .remove("auto_map");
+    ensure!(H3Spec::parse(&partial).is_err(), "missing auto_map");
+    let mut group = hyperflow_json();
+    group["quantization"]["group"] = 128.into();
+    ensure!(H3Spec::parse(&group).is_err(), "group 128");
+    let mut both = hyperflow_json();
+    both["quantization"]["linears"]
+        .as_array_mut()
+        .context("linears")?
+        .push("transformer_blocks.2.ff.net.2".into());
+    ensure!(H3Spec::parse(&both).is_err(), "name in both sets");
+    let mut dropped = hyperflow_json();
+    dropped["quantization"]["linears"]
+        .as_array_mut()
+        .context("linears")?
+        .push("transformer_blocks.1.attn.to_v".into());
+    ensure!(H3Spec::parse(&dropped).is_err(), "name on a dropped block");
+    let mut other = hyperflow_json();
+    other["quantization"]["linears"]
+        .as_array_mut()
+        .context("linears")?
+        .push("proj_in".into());
+    ensure!(H3Spec::parse(&other).is_err(), "non-block linear");
+    let mut duplicate = hyperflow_json();
+    duplicate["quantization"]["linears"]
+        .as_array_mut()
+        .context("linears")?
+        .push("transformer_blocks.0.attn.to_q".into());
+    ensure!(H3Spec::parse(&duplicate).is_err(), "duplicate int8 name");
+    Ok(())
+}
+
+fn pair_bits(steps: &[FlowStep]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
+    (
+        steps.iter().map(|step| step.video_t.to_bits()).collect(),
+        steps.iter().map(|step| step.video_r.to_bits()).collect(),
+        steps.iter().map(|step| step.audio_t.to_bits()).collect(),
+        steps.iter().map(|step| step.audio_r.to_bits()).collect(),
+    )
+}
+
+#[test]
+fn hyperflow_steps_match_the_shifted_4_6_8_grids() -> Result<()> {
+    let four = hyperflow_steps(4)?;
+    let six = hyperflow_steps(6)?;
+    let eight = hyperflow_steps(8)?;
+    ensure!(
+        (four.len(), six.len(), eight.len()) == (4, 6, 8),
+        "forward count"
+    );
+    ensure!(
+        pair_bits(&four)
+            == (
+                vec![0, 1025067536, 1048187984, 1060110372],
+                vec![1025067536, 1048187984, 1060110372, 1065353216],
+                vec![0, 1040830728, 1058035013, 1063641270],
+                vec![1040830728, 1058035013, 1063641270, 1065353216],
+            ),
+        "4-step bits {:?}",
+        pair_bits(&four)
+    );
+    ensure!(
+        pair_bits(&six)
+            == (
+                vec![
+                    0, 1015944480, 1034866656, 1051100780, 1058890234, 1062684710
+                ],
+                vec![
+                    1015944480, 1034866656, 1051100780, 1058890234, 1062684710, 1065353216
+                ],
+                vec![
+                    0, 1032261168, 1049308268, 1059623432, 1063080981, 1064595728
+                ],
+                vec![
+                    1032261168, 1049308268, 1059623432, 1063080981, 1064595728, 1065353216
+                ],
+            ),
+        "6-step bits {:?}",
+        pair_bits(&six)
+    );
+    ensure!(
+        pair_bits(&eight)
+            == (
+                vec![
+                    0, 1002934400, 1015068544, 1024131280, 1033734616, 1042875616, 1050359350,
+                    1057488840
+                ],
+                vec![
+                    1002934400, 1015068544, 1024131280, 1033734616, 1042875616, 1050359350,
+                    1057488840, 1065353216
+                ],
+                vec![
+                    0, 1019476896, 1031133280, 1039946080, 1048576000, 1055004180, 1059230366,
+                    1062321156
+                ],
+                vec![
+                    1019476896, 1031133280, 1039946080, 1048576000, 1055004180, 1059230366,
+                    1062321156, 1065353216
+                ],
+            ),
+        "8-step bits {:?}",
+        pair_bits(&eight)
+    );
+    for steps in [&four[..], &six[..], &eight[..]] {
+        ensure!(
+            steps.iter().all(|step| {
+                step.keyframe_t.to_bits() == 1065336439
+                    && step.keyframe_r.to_bits() == 1065336439
+                    && step.reference_t == 1.0
+                    && step.reference_r == 1.0
+            }),
+            "keyframe or reference pair"
+        );
+    }
+    ensure!(
+        hyperflow_steps(5).is_err() && hyperflow_steps(9).is_err() && hyperflow_steps(0).is_err(),
+        "unknown step count"
+    );
+    Ok(())
+}
+
+#[test]
+fn hyperflow_temb_and_dropped_block_and_lowrank_pad() -> Result<()> {
+    let mixed = mix_temb(4.0, 8.0, 0.25);
+    ensure!(mixed == 5.0, "temb {mixed}");
+    ensure!(mixed != 4.0 + (8.0 - 4.0), "gate omitted");
+    let input = [1.0f32, -2.0, 0.5];
+    ensure!(dropped_block(&input) == input, "dropped block");
+    let residual: Vec<f32> = input.iter().map(|value| value + 1.0).collect();
+    ensure!(residual != dropped_block(&input), "residual mutant");
+    let down = [1.0f32, 2.0, 3.0, 4.0];
+    let up = [5.0f32, 6.0, 7.0, 8.0];
+    let x = [0.5f32, -1.0];
+    let product = |down: &[f32], up: &[f32], rank: usize| -> [f32; 2] {
+        let mut hidden = vec![0.0f32; rank];
+        for row in 0..rank {
+            hidden[row] = down[row * 2] * x[0] + down[row * 2 + 1] * x[1];
+        }
+        let mut y = [0.0f32; 2];
+        for column in 0..2 {
+            for row in 0..rank {
+                y[column] += up[column * rank + row] * hidden[row];
+            }
+        }
+        y
+    };
+    let original = product(&down, &up, 2);
+    let (padded_down, padded_up) = pad_lowrank(&down, &up, 2, 2, 2, 8)?;
+    ensure!(
+        padded_down.len() == 16 && padded_up.len() == 16,
+        "pad extents {} {}",
+        padded_down.len(),
+        padded_up.len()
+    );
+    ensure!(
+        padded_down[4..].iter().all(|value| *value == 0.0)
+            && (0..2).all(|column| (2..8).all(|row| padded_up[column * 8 + row] == 0.0)),
+        "pad is not zero"
+    );
+    let padded = product(&padded_down, &padded_up, 8);
+    ensure!(padded == original, "padded product {padded:?} {original:?}");
+    let layout = PackedLayout {
+        position_ids: vec![[0.0; 3]; 4],
+        token_tags: vec![TEXT_TAG, VIDEO_TAG, AUDIO_TAG, VIDEO_TAG],
+        video_indices: vec![1, 3],
+        audio_indices: vec![2],
+        text_indices: vec![0],
+        condition_video_rows: 1,
+    };
+    let step = &hyperflow_steps(4)?[0];
+    ensure!(
+        step.video_t == 0.0 && step.audio_t == 0.0 && step.video_r != step.audio_r,
+        "step 0 shares t and splits r"
+    );
+    let rows = RowTimesteps::hyperflow(&layout, step);
+    let video = rows.indices[0] as usize;
+    let key = rows.indices[1] as usize;
+    let audio = rows.indices[2] as usize;
+    ensure!(
+        rows.timesteps.len() == 3
+            && rows.endpoints.len() == 3
+            && rows.indices[3] == rows.indices[0]
+            && video != audio
+            && key != video
+            && key != audio
+            && rows.timesteps[video] == step.video_t
+            && rows.endpoints[video] == step.video_r
+            && rows.timesteps[audio] == step.audio_t
+            && rows.endpoints[audio] == step.audio_r
+            && rows.timesteps[key] == step.keyframe_t
+            && rows.endpoints[key] == step.keyframe_r,
+        "row pairs {:?} {:?}",
+        rows.timesteps,
+        rows.indices
+    );
+    let plan = AdalnPlan::from_tags(&layout.token_tags, std::slice::from_ref(&rows))?;
+    ensure!(
+        plan.endpoints.len() == 3
+            && plan.row_timesteps[0][0] != plan.row_timesteps[0][2]
+            && plan.row_timesteps[0] == rows.indices,
+        "plan keeps distinct endpoints at one t"
+    );
+    Ok(())
+}
+
+#[test]
+fn hyperflow_stored_placement_prints_124_resident_and_345_streamed() -> Result<()> {
+    let spec = spec()?;
+    let device = 24_564u64 * 1024 * 1024;
+    let weights = 15_880_568_448u64;
+    let short = Geometry::resolve(&spec, 768, 1344, 124)?;
+    let long = Geometry::resolve(&spec, 768, 1344, 345)?;
+    ensure!(
+        (short.frames, short.latent_frames, short.audio_latents) == (124, 37, 207),
+        "124 geometry {short:?}"
+    );
+    ensure!(
+        (long.frames, long.latent_frames, long.audio_latents) == (345, 102, 575),
+        "345 geometry {long:?}"
+    );
+    let short_act = unchunked_activation_bytes(&spec, &short)?;
+    let long_act = unchunked_activation_bytes(&spec, &long)?;
+    ensure!(short_act == 4_346_043_840, "124 activations {short_act}");
+    ensure!(device - (weights + short_act) == 5_530_608_576, "124 slack");
+    ensure!(long_act == 11_981_801_408, "345 activations {long_act}");
+    ensure!((weights + long_act) - device == 2_105_148_992, "345 over");
+    ensure!(
+        report_stored_placement(&spec, &short, device, weights)?,
+        "124 streamed"
+    );
+    ensure!(
+        !report_stored_placement(&spec, &long, device, weights)?,
+        "345 resident"
+    );
+    ensure!(
+        report_stored_placement(&spec, &long, weights + long_act, weights)?,
+        "mode hardcoded"
+    );
+    ensure!(
+        stored_scratch_extents(&spec)?.is_none() && stored_scratch_bytes(&spec, 1)? == 0,
+        "dense spec allocated convrot scratch"
+    );
+    let mut hyper = spec.clone();
+    hyper.hyperflow_gate = Some(0.25);
+    hyper.dropped_blocks = Some(vec![6, 21, 22]);
+    hyper.lowrank_ranks = Some(BTreeMap::from([(
+        "transformer_blocks.49.ff.net.2".to_string(),
+        2,
+    )]));
+    hyper.int8_convrot = Some((256, BTreeSet::new()));
+    let frame_rows = (short.latent_height / hyper.patch[1]) * (short.latent_width / hyper.patch[2]);
+    let rows = short.latent_frames * frame_rows + short.audio_latents * 2;
+    ensure!(
+        rows == 37710 && frame_rows == 1008,
+        "124 scratch rows {rows}"
+    );
+    let packed = rows + 2044 + 2 * frame_rows;
+    let text_rows = 2044usize;
+    ensure!(packed == 41770, "124 packed scratch rows {packed}");
+    let (k, low_rank) = stored_scratch_extents(&hyper)?.context("hyperflow scratch")?;
+    ensure!(
+        k == 14336 && low_rank == 2,
+        "scratch extents {k} {low_rank}"
+    );
+    let per_row = |n: usize| -> Result<u64> {
+        let n = u64::try_from(n)?;
+        Ok(n * u64::try_from(k)? * 8 + n * 4 + n * u64::try_from(low_rank.max(1))? * 2)
+    };
+    let video_audio_scratch = per_row(rows)?;
+    let scratch = per_row(packed)? + per_row(text_rows)?;
+    ensure!(
+        stored_scratch_bytes(&hyper, packed)? == per_row(packed)?
+            && stored_scratch_bytes(&hyper, text_rows)? == per_row(text_rows)?
+            && scratch > video_audio_scratch,
+        "scratch bytes {scratch}"
+    );
+    let hyper_act = unchunked_activation_bytes(&hyper, &short)?;
+    ensure!(
+        hyper_act == short_act + scratch,
+        "124 hyperflow activations {hyper_act}"
+    );
+    ensure!(
+        !report_stored_placement(&hyper, &short, weights + short_act, weights)?,
+        "old 124 budget accepted the convrot scratch"
+    );
+    ensure!(
+        !report_stored_placement(
+            &hyper,
+            &short,
+            weights + short_act + video_audio_scratch,
+            weights
+        )?,
+        "video-plus-audio scratch accepted the text copy"
+    );
+    ensure!(
+        report_stored_placement(&hyper, &short, weights + hyper_act, weights)?,
+        "exact 124 hyperflow budget streamed"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires FF_HYPERFLOW_FL2VA"]
+fn hyperflow_fl2va_role_table_matches_the_published_shards() -> Result<()> {
+    let dir = PathBuf::from(env::var("FF_HYPERFLOW_FL2VA").context("FF_HYPERFLOW_FL2VA")?);
+    let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+        dir.join("config.json"),
+    )?)?)?;
+    ensure!(spec.is_hyperflow()?, "published config");
+    ensure!(
+        spec.hyperflow_gate == Some(0.25)
+            && spec.dropped_blocks.as_deref() == Some(&[6, 21, 22][..])
+            && spec.int8_convrot.as_ref().context("int8")?.1.len() == 180
+            && spec.lowrank_ranks.as_ref().context("ranks")?.len() == 102
+            && spec.block_linears().len() == 294,
+        "published role counts"
+    );
+    let group = spec.int8_convrot.as_ref().context("int8")?.0;
+    let mut shared = 0usize;
+    for index in 0..spec.layers {
+        let q = format!("transformer_blocks.{index}.attn.to_q");
+        let k = format!("transformer_blocks.{index}.attn.to_k");
+        let q_int8 = spec.linear_storage(&q)? == LinearStorage::Int8 { group };
+        let k_int8 = spec.linear_storage(&k)? == LinearStorage::Int8 { group };
+        ensure!(q_int8 == k_int8, "block {index} splits to_q and to_k");
+        shared += usize::from(q_int8);
+    }
+    ensure!(shared == 30, "shared rotate-quant blocks {shared}");
+    let checkpoint = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?;
+    let manifest = checkpoint.minimax_h3_manifest(&spec)?;
+    ensure!(
+        manifest.entries.len() == 888,
+        "names {}",
+        manifest.entries.len()
+    );
+    let qweight = manifest
+        .entries
+        .keys()
+        .filter(|name| name.ends_with(".qweight"))
+        .count();
+    let down = manifest
+        .entries
+        .keys()
+        .filter(|name| name.ends_with(".down.weight"))
+        .count();
+    ensure!(
+        qweight == 180 && down == 102,
+        "qweight {qweight} down {down}"
+    );
+    for block in [6, 21, 22] {
+        let prefix = format!("transformer_blocks.{block}.");
+        ensure!(
+            manifest
+                .entries
+                .keys()
+                .all(|name| !name.starts_with(&prefix)),
+            "dropped block {block}"
+        );
+    }
+    let bytes: usize = manifest.entries.values().map(|entry| entry.bytes).sum();
+    ensure!(bytes == 15_880_568_448, "payload {bytes}");
+    let ranks = spec.lowrank_ranks.as_ref().context("ranks")?;
+    for (name, entry) in &manifest.entries {
+        if let Some(base) = name.strip_suffix(".qweight") {
+            ensure!(
+                entry.dtype == Dtype::I8 && entry.shape.len() == 2 && entry.shape[1] % 256 == 0,
+                "{name} {:?}",
+                entry.shape
+            );
+            let scale = &manifest.entries[&format!("{base}.wscale")];
+            ensure!(
+                scale.dtype == Dtype::F32 && scale.shape == vec![entry.shape[0]],
+                "{base} wscale"
+            );
+        }
+        if let Some(base) = name.strip_suffix(".down.weight") {
+            let rank = ranks[base];
+            ensure!(entry.shape.first() == Some(&rank), "{name} rank");
+            let up = &manifest.entries[&format!("{base}.up.weight")];
+            ensure!(
+                up.dtype == Dtype::BF16 && up.shape.len() == 2 && up.shape[1] == rank,
+                "{base} up {:?}",
+                up.shape
+            );
+        }
+    }
     Ok(())
 }

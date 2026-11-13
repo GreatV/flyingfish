@@ -2653,9 +2653,14 @@ impl MappedCheckpoint {
     /// MiniMax-H3 transformer: F32 patch, time-embedding and output projections, BF16 elsewhere. The per-block AdaLN
     /// projections are Dormant: read once at setup into the modulation table, never part of the per-step layer set.
     pub fn minimax_h3_manifest(&self, spec: &crate::minimax_h3::H3Spec) -> Result<TensorManifest> {
+        let label = if spec.is_hyperflow()? {
+            "HyperFlow"
+        } else {
+            "MiniMax-H3"
+        };
         let expected = minimax_h3_expected(spec)?;
         let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
-        self.assemble_manifest("MiniMax-H3", expected, LoadPolicy::TextOnly, planned, None)
+        self.assemble_manifest(label, expected, LoadPolicy::TextOnly, planned, None)
     }
 
     /// MiniMax-H3-Image transformer: F32 patch, time-embedding and per-step heads, BF16 elsewhere. Per-block AdaLN
@@ -2683,6 +2688,10 @@ impl MappedCheckpoint {
         spec: &crate::minimax_h3::H3Spec,
         gguf: &crate::gguf::GgufFile,
     ) -> Result<TensorManifest> {
+        ensure!(
+            !spec.is_hyperflow()?,
+            "HyperFlow linears are not a GGUF Q4_0 map"
+        );
         let expected = minimax_h3_expected(spec)?;
         let shard = gguf
             .path()
@@ -3204,6 +3213,10 @@ impl MappedCheckpoint {
                 && field("floating_dtype") == Some("bfloat16"),
             "unsupported MiniMax-H3 LoRA metadata {metadata:?}"
         );
+        ensure!(
+            !spec.is_hyperflow()?,
+            "HyperFlow linears are not a LoRA residual"
+        );
         let alpha: f32 = field("alpha")
             .context("MiniMax-H3 LoRA alpha missing")?
             .parse()
@@ -3257,22 +3270,38 @@ impl MappedCheckpoint {
     }
 }
 
-/// The official MiniMax-H3 tensor set: F32 patch, time-embedding and output projections, BF16 elsewhere. The
-/// per-block AdaLN projections are Dormant: read once at setup into the modulation table, never part of the
-/// per-step layer set.
+/// MiniMax-H3 tensor set. HyperFlow adds the endpoint time embedder, stores int8 convrot as I8 `qweight`
+/// `[out, in]` plus F32 `wscale` `[out]`, and stores a low-rank linear as BF16 `down` `[rank, in]` and `up`
+/// `[out, rank]`. Dropped blocks are absent. Other linears are BF16. AdaLN projections are Dormant.
 pub(crate) fn minimax_h3_expected(
     spec: &crate::minimax_h3::H3Spec,
 ) -> Result<BTreeMap<String, ExpectedTensor>> {
+    let hyperflow = spec.is_hyperflow()?;
     let scope = TensorScope::Text;
     let mut expected = BTreeMap::new();
-    for (base, n, k) in [
+    let mut projections = vec![
         ("proj_in", spec.hidden, spec.video_row_width()),
         ("audio_proj_in", spec.hidden, spec.audio_in_channels),
         ("time_embedder.linear_1", spec.time_hidden, spec.freq_dim),
         ("time_embedder.linear_2", spec.time_dim, spec.time_hidden),
         ("proj_out", spec.video_row_width(), spec.hidden),
         ("audio_proj_out", spec.audio_in_channels, spec.hidden),
-    ] {
+    ];
+    if hyperflow {
+        projections.extend([
+            (
+                "endpoint_time_embedder.linear_1",
+                spec.time_hidden,
+                spec.freq_dim,
+            ),
+            (
+                "endpoint_time_embedder.linear_2",
+                spec.time_dim,
+                spec.time_hidden,
+            ),
+        ]);
+    }
+    for (base, n, k) in projections {
         put(
             &mut expected,
             format!("{base}.weight"),
@@ -3302,9 +3331,16 @@ pub(crate) fn minimax_h3_expected(
     ] {
         put(&mut expected, name.to_owned(), Dtype::BF16, shape, scope);
     }
+    let dropped = spec.dropped_blocks.as_deref().unwrap_or(&[]);
     let blocks = (0..spec.refiner_layers)
         .map(|i| (format!("token_refiner.refiner_blocks.{i}"), false))
-        .chain((0..spec.layers).map(|i| (format!("transformer_blocks.{i}"), true)));
+        .chain((0..spec.layers).filter_map(|i| {
+            if dropped.contains(&i) {
+                None
+            } else {
+                Some((format!("transformer_blocks.{i}"), true))
+            }
+        }));
     for (block, adaln) in blocks {
         for (name, shape) in [
             ("norm1.weight", vec![spec.hidden]),
@@ -3339,13 +3375,49 @@ pub(crate) fn minimax_h3_expected(
         }
     }
     for (base, n, k) in spec.block_linears() {
-        put(
-            &mut expected,
-            format!("{base}.weight"),
-            Dtype::BF16,
-            vec![n, k],
-            scope,
-        );
+        match spec.linear_storage(&base)? {
+            crate::minimax_h3::LinearStorage::Dense => {
+                put(
+                    &mut expected,
+                    format!("{base}.weight"),
+                    Dtype::BF16,
+                    vec![n, k],
+                    scope,
+                );
+            }
+            crate::minimax_h3::LinearStorage::Int8 { .. } => {
+                put(
+                    &mut expected,
+                    format!("{base}.qweight"),
+                    Dtype::I8,
+                    vec![n, k],
+                    scope,
+                );
+                put(
+                    &mut expected,
+                    format!("{base}.wscale"),
+                    Dtype::F32,
+                    vec![n],
+                    scope,
+                );
+            }
+            crate::minimax_h3::LinearStorage::LowRank { rank } => {
+                put(
+                    &mut expected,
+                    format!("{base}.down.weight"),
+                    Dtype::BF16,
+                    vec![rank, k],
+                    scope,
+                );
+                put(
+                    &mut expected,
+                    format!("{base}.up.weight"),
+                    Dtype::BF16,
+                    vec![n, rank],
+                    scope,
+                );
+            }
+        }
     }
     Ok(expected)
 }
@@ -6589,6 +6661,10 @@ mod gguf_tests {
             norm_eps: 1e-5,
             qk_norm_eps: 1e-5,
             final_norm_eps: 1e-5,
+            hyperflow_gate: None,
+            dropped_blocks: None,
+            lowrank_ranks: None,
+            int8_convrot: None,
         }
     }
 
@@ -6948,6 +7024,102 @@ mod gguf_tests {
             "resident bytes {} != loaded entries {resident}",
             manifest.resident_bytes
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hyperflow_manifest_tests {
+    use super::*;
+    use crate::minimax_h3::H3Spec;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn bare() -> H3Spec {
+        H3Spec {
+            hidden: 32,
+            heads: 1,
+            head_dim: 32,
+            layers: 3,
+            refiner_layers: 1,
+            ffn: 16,
+            in_channels: 4,
+            audio_in_channels: 4,
+            patch: [1, 2, 2],
+            text_dim: 16,
+            freq_dim: 8,
+            time_hidden: 16,
+            time_dim: 8,
+            rope_freq_dim: 4,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
+            qk_norm_eps: 1e-5,
+            final_norm_eps: 1e-5,
+            hyperflow_gate: None,
+            dropped_blocks: None,
+            lowrank_ranks: None,
+            int8_convrot: None,
+        }
+    }
+
+    #[test]
+    fn hyperflow_expected_tensors_follow_the_role_table() -> Result<()> {
+        let mini = minimax_h3_expected(&bare())?;
+        ensure!(
+            mini.contains_key("transformer_blocks.1.attn.to_q.weight")
+                && mini.contains_key("transformer_blocks.0.attn.to_q.weight")
+                && !mini.keys().any(|name| name.starts_with("endpoint_")),
+            "MiniMax expected set changed"
+        );
+        let mut spec = bare();
+        spec.hyperflow_gate = Some(0.25);
+        ensure!(spec.is_hyperflow().is_err(), "partial HyperFlow fields");
+        spec.dropped_blocks = Some(vec![1]);
+        spec.lowrank_ranks = Some(BTreeMap::from([(
+            "transformer_blocks.2.ff.net.2".to_owned(),
+            2,
+        )]));
+        spec.int8_convrot = Some((
+            256,
+            BTreeSet::from(["transformer_blocks.0.attn.to_q".to_owned()]),
+        ));
+        let expected = minimax_h3_expected(&spec)?;
+        ensure!(
+            expected.get("transformer_blocks.0.attn.to_q.qweight")
+                == Some(&(Dtype::I8, vec![32, 32], TensorScope::Text))
+                && expected.get("transformer_blocks.0.attn.to_q.wscale")
+                    == Some(&(Dtype::F32, vec![32], TensorScope::Text))
+                && !expected.contains_key("transformer_blocks.0.attn.to_q.weight"),
+            "int8 role"
+        );
+        ensure!(
+            expected.get("transformer_blocks.2.ff.net.2.down.weight")
+                == Some(&(Dtype::BF16, vec![2, 16], TensorScope::Text))
+                && expected.get("transformer_blocks.2.ff.net.2.up.weight")
+                    == Some(&(Dtype::BF16, vec![32, 2], TensorScope::Text))
+                && !expected.contains_key("transformer_blocks.2.ff.net.2.weight"),
+            "low-rank role"
+        );
+        ensure!(
+            expected
+                .keys()
+                .all(|name| !name.starts_with("transformer_blocks.1.")),
+            "dropped block tensors"
+        );
+        ensure!(
+            expected.get("endpoint_time_embedder.linear_1.weight")
+                == Some(&(Dtype::F32, vec![16, 8], TensorScope::Text))
+                && expected.get("endpoint_time_embedder.linear_2.weight")
+                    == Some(&(Dtype::F32, vec![8, 16], TensorScope::Text))
+                && expected.contains_key("endpoint_time_embedder.linear_1.bias")
+                && expected.contains_key("endpoint_time_embedder.linear_2.bias"),
+            "endpoint embedder"
+        );
+        ensure!(
+            expected.get("token_refiner.refiner_blocks.0.attn.to_q.weight")
+                == Some(&(Dtype::BF16, vec![32, 32], TensorScope::Text)),
+            "refiner stays dense"
+        );
+        ensure!(spec.block_linears().len() == 18, "kept linears");
         Ok(())
     }
 }

@@ -1,8 +1,9 @@
 //! MiniMax-H3 FL2VA geometry, and the MiniMax-H3-Image canvas, packed layout and sampling grid.
 use crate::model_spec::{equal, exact_keys, positive, u32_list};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -27,6 +28,10 @@ const MAX_SECONDS: f64 = 15.0;
 const AUDIO_LATENTS_PER_SECOND: f64 = 40.0;
 /// Stereo audio rows are packed channel-major, one block per channel.
 const AUDIO_CHANNELS: usize = 2;
+/// Packed text-prefix rows a request can carry: prompt tokens plus keyframe vision tokens.
+const MAX_TEXT_ROWS: usize = 2044;
+/// A request can pack a first keyframe and a last keyframe.
+const MAX_KEYFRAME_ANCHORS: usize = 2;
 /// Conditioning video rows are pinned at `max(t, KEYFRAME_NOISE_AUG)`; keyframe anchors are noised to it.
 pub const KEYFRAME_NOISE_AUG: f64 = 0.999;
 /// Qwen3-VL hidden state that conditions the transformer (model definition `text_encoder_layer`).
@@ -103,6 +108,42 @@ const TRANSFORMER_KEYS: [&str; 20] = [
     "qk_norm_eps",
     "final_norm_eps",
 ];
+const HYPERFLOW_KEYS: [&str; 25] = [
+    "_class_name",
+    "_diffusers_version",
+    "num_attention_heads",
+    "attention_head_dim",
+    "hidden_size",
+    "num_layers",
+    "num_refiner_layers",
+    "ffn_dim",
+    "in_channels",
+    "audio_in_channels",
+    "patch_size",
+    "text_dim",
+    "freq_dim",
+    "time_embed_hidden_dim",
+    "time_embed_dim",
+    "rope_freq_dim",
+    "rope_theta",
+    "norm_eps",
+    "qk_norm_eps",
+    "final_norm_eps",
+    "hyperflow_gate",
+    "dropped_blocks",
+    "lowrank_ranks",
+    "auto_map",
+    "quantization",
+];
+/// Block linear suffixes. `in_features` follow this order: hidden, hidden, hidden, head width, hidden, ffn.
+const LINEAR_SUFFIXES: [&str; 6] = [
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "ff.net.0.proj",
+    "ff.net.2",
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct H3Spec {
@@ -126,6 +167,12 @@ pub struct H3Spec {
     pub norm_eps: f32,
     pub qk_norm_eps: f32,
     pub final_norm_eps: f32,
+    /// Absent on MiniMax-H3. Present only together with the other three HyperFlow fields.
+    pub hyperflow_gate: Option<f32>,
+    pub dropped_blocks: Option<Vec<usize>>,
+    pub lowrank_ranks: Option<BTreeMap<String, usize>>,
+    /// `(group, linear names)` of quantization method `int8_convrot`.
+    pub int8_convrot: Option<(u32, BTreeSet<String>)>,
 }
 
 impl H3Spec {
@@ -143,8 +190,30 @@ impl H3Spec {
     }
 
     pub fn parse(root: &Value) -> Result<Self> {
-        exact_keys(root, &TRANSFORMER_KEYS, "MiniMax-H3 transformer config")?;
-        equal(root, "_class_name", "MiniMaxH3Transformer3DModel".into())?;
+        let class = root
+            .get("_class_name")
+            .and_then(Value::as_str)
+            .context("missing transformer class")?;
+        let hyperflow = match class {
+            "MiniMaxH3Transformer3DModel" => false,
+            "HyperFlowH3FlashTransformer3DModel" => true,
+            other => bail!("unsupported transformer class {other}"),
+        };
+        if hyperflow {
+            exact_keys(root, &HYPERFLOW_KEYS, "HyperFlow transformer config")?;
+        } else {
+            exact_keys(root, &TRANSFORMER_KEYS, "MiniMax-H3 transformer config")?;
+            equal(root, "_class_name", "MiniMaxH3Transformer3DModel".into())?;
+        }
+        let mut spec = Self::geometry(root)?;
+        if hyperflow {
+            bind_hyperflow(&mut spec, root)?;
+        }
+        spec.is_hyperflow()?;
+        Ok(spec)
+    }
+
+    fn geometry(root: &Value) -> Result<Self> {
         let n = |key| positive(root, key).map(|v| v as usize);
         let f = |key: &str| {
             root.get(key)
@@ -174,6 +243,10 @@ impl H3Spec {
             norm_eps: f("norm_eps")?,
             qk_norm_eps: f("qk_norm_eps")?,
             final_norm_eps: f("final_norm_eps")?,
+            hyperflow_gate: None,
+            dropped_blocks: None,
+            lowrank_ranks: None,
+            int8_convrot: None,
         };
         ensure!(
             spec.head_dim == 128,
@@ -192,31 +265,390 @@ impl H3Spec {
         Ok(spec)
     }
 
+    /// All four HyperFlow fields are set, or none are.
+    pub fn is_hyperflow(&self) -> Result<bool> {
+        let flags = [
+            self.hyperflow_gate.is_some(),
+            self.dropped_blocks.is_some(),
+            self.lowrank_ranks.is_some(),
+            self.int8_convrot.is_some(),
+        ];
+        ensure!(
+            flags.iter().all(|set| *set) || flags.iter().all(|set| !*set),
+            "HyperFlow config fields are partially set"
+        );
+        Ok(flags[0])
+    }
+
+    /// Storage of one block linear. MiniMax-H3 is dense. A HyperFlow name outside both sets is dense.
+    pub fn linear_storage(&self, name: &str) -> Result<LinearStorage> {
+        if !self.is_hyperflow()? {
+            return Ok(LinearStorage::Dense);
+        }
+        let (group, names) = self
+            .int8_convrot
+            .as_ref()
+            .context("HyperFlow quantization set")?;
+        if names.contains(name) {
+            return Ok(LinearStorage::Int8 { group: *group });
+        }
+        let ranks = self.lowrank_ranks.as_ref().context("HyperFlow rank set")?;
+        if let Some(&rank) = ranks.get(name) {
+            return Ok(LinearStorage::LowRank { rank });
+        }
+        Ok(LinearStorage::Dense)
+    }
+
     /// Channels of one patchified video row.
     pub fn video_row_width(&self) -> usize {
         self.in_channels * self.patch.iter().product::<usize>()
     }
 
-    /// `(name, out, in)` of the attention and FFN projections of every refiner block, then every transformer block.
+    /// `(name, out, in)` of every refiner linear, then every transformer linear. Dropped transformer blocks are omitted.
     pub fn block_linears(&self) -> Vec<(String, usize, usize)> {
         let width = self.heads * self.head_dim;
-        let blocks = (0..self.refiner_layers)
-            .map(|i| format!("token_refiner.refiner_blocks.{i}"))
-            .chain((0..self.layers).map(|i| format!("transformer_blocks.{i}")));
-        blocks
-            .flat_map(|block| {
-                [
-                    ("attn.to_q", width, self.hidden),
-                    ("attn.to_k", width, self.hidden),
-                    ("attn.to_v", width, self.hidden),
-                    ("attn.to_out.0", self.hidden, width),
-                    ("ff.net.0.proj", 2 * self.ffn, self.hidden),
-                    ("ff.net.2", self.hidden, self.ffn),
-                ]
-                .map(|(name, out, input)| (format!("{block}.{name}"), out, input))
-            })
-            .collect()
+        let shapes = [
+            (width, self.hidden),
+            (width, self.hidden),
+            (width, self.hidden),
+            (self.hidden, width),
+            (2 * self.ffn, self.hidden),
+            (self.hidden, self.ffn),
+        ];
+        let dropped = self.dropped_blocks.as_deref().unwrap_or(&[]);
+        let mut linears = Vec::new();
+        for index in 0..self.refiner_layers {
+            push_linears(
+                &mut linears,
+                &format!("token_refiner.refiner_blocks.{index}"),
+                &shapes,
+            );
+        }
+        for index in 0..self.layers {
+            if dropped.contains(&index) {
+                continue;
+            }
+            push_linears(
+                &mut linears,
+                &format!("transformer_blocks.{index}"),
+                &shapes,
+            );
+        }
+        linears
     }
+}
+
+/// Dense BF16, int8 convrot, or a rank-factorized pair with no base matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearStorage {
+    Dense,
+    Int8 { group: u32 },
+    LowRank { rank: usize },
+}
+
+fn push_linears(linears: &mut Vec<(String, usize, usize)>, block: &str, shapes: &[(usize, usize)]) {
+    for (suffix, &(out, input)) in LINEAR_SUFFIXES.iter().zip(shapes) {
+        linears.push((format!("{block}.{suffix}"), out, input));
+    }
+}
+
+fn bind_hyperflow(spec: &mut H3Spec, root: &Value) -> Result<()> {
+    let gate = root
+        .get("hyperflow_gate")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+        .context("missing/invalid hyperflow_gate")? as f32;
+    spec.hyperflow_gate = Some(gate);
+    spec.dropped_blocks = Some(parse_dropped(root, spec.layers)?);
+    spec.lowrank_ranks = Some(parse_ranks(root)?);
+    spec.int8_convrot = Some(parse_quantization(root)?);
+    check_roles(spec)
+}
+
+fn parse_dropped(root: &Value, layers: usize) -> Result<Vec<usize>> {
+    let values = root
+        .get("dropped_blocks")
+        .and_then(Value::as_array)
+        .context("missing/invalid dropped_blocks")?;
+    let mut dropped = Vec::with_capacity(values.len());
+    for value in values {
+        let index = value
+            .as_u64()
+            .context("dropped_blocks contains a non-unsigned integer")?;
+        let index = usize::try_from(index).context("dropped block overflows usize")?;
+        ensure!(
+            index < layers,
+            "dropped block {index} is outside {layers} layers"
+        );
+        ensure!(!dropped.contains(&index), "duplicate dropped block {index}");
+        dropped.push(index);
+    }
+    Ok(dropped)
+}
+
+fn parse_ranks(root: &Value) -> Result<BTreeMap<String, usize>> {
+    let object = root
+        .get("lowrank_ranks")
+        .and_then(Value::as_object)
+        .context("missing/invalid lowrank_ranks")?;
+    let mut ranks = BTreeMap::new();
+    for (name, value) in object {
+        let rank = value
+            .as_u64()
+            .with_context(|| format!("missing/invalid lowrank rank {name}"))?;
+        ensure!(rank > 0, "lowrank rank of {name} is 0");
+        ranks.insert(
+            name.clone(),
+            usize::try_from(rank).with_context(|| format!("lowrank rank of {name}"))?,
+        );
+    }
+    Ok(ranks)
+}
+
+const QUANT_KEYS: [&str; 3] = ["method", "group", "linears"];
+
+fn parse_quantization(root: &Value) -> Result<(u32, BTreeSet<String>)> {
+    let quantization = root.get("quantization").context("missing quantization")?;
+    exact_keys(quantization, &QUANT_KEYS, "HyperFlow quantization")?;
+    equal(quantization, "method", "int8_convrot".into())?;
+    let group = positive(quantization, "group")?;
+    ensure!(
+        group >= 4 && group.is_power_of_two() && group.trailing_zeros().is_multiple_of(2),
+        "quantization group {group} is not a power of 4"
+    );
+    let values = quantization
+        .get("linears")
+        .and_then(Value::as_array)
+        .context("missing/invalid quantization linears")?;
+    let mut names = BTreeSet::new();
+    for value in values {
+        let name = value
+            .as_str()
+            .context("quantization linear is not a string")?;
+        ensure!(
+            names.insert(name.to_owned()),
+            "duplicate quantization linear {name}"
+        );
+    }
+    Ok((group, names))
+}
+
+fn check_roles(spec: &H3Spec) -> Result<()> {
+    let (group, names) = spec
+        .int8_convrot
+        .as_ref()
+        .context("HyperFlow quantization set")?;
+    let ranks = spec.lowrank_ranks.as_ref().context("HyperFlow rank set")?;
+    for name in names {
+        let input = linear_extent(spec, name)?;
+        ensure!(
+            input % usize::try_from(*group)? == 0,
+            "{name} in_features {input} is not a multiple of group {group}"
+        );
+        ensure!(
+            !ranks.contains_key(name),
+            "{name} is both int8 and low-rank"
+        );
+    }
+    for name in ranks.keys() {
+        linear_extent(spec, name)?;
+    }
+    Ok(())
+}
+
+/// `in_features` of `transformer_blocks.{index}.{suffix}`. The block is kept.
+fn linear_extent(spec: &H3Spec, name: &str) -> Result<usize> {
+    let rest = name
+        .strip_prefix("transformer_blocks.")
+        .with_context(|| format!("{name} is not a block linear"))?;
+    let (index, suffix) = rest
+        .split_once('.')
+        .with_context(|| format!("{name} is not a block linear"))?;
+    let index: usize = index
+        .parse()
+        .with_context(|| format!("{name} block index"))?;
+    ensure!(
+        index < spec.layers,
+        "{name} block {index} is outside {} layers",
+        spec.layers
+    );
+    if spec
+        .dropped_blocks
+        .as_ref()
+        .is_some_and(|dropped| dropped.contains(&index))
+    {
+        bail!("{name} is on dropped block {index}");
+    }
+    let Some(slot) = LINEAR_SUFFIXES.iter().position(|item| *item == suffix) else {
+        bail!("{name} is not a block linear");
+    };
+    let width = spec.heads * spec.head_dim;
+    let inputs = [
+        spec.hidden,
+        spec.hidden,
+        spec.hidden,
+        width,
+        spec.hidden,
+        spec.ffn,
+    ];
+    Ok(inputs[slot])
+}
+
+/// `current + gate * (endpoint - current)`, both embeddings f32.
+pub fn mix_temb(current: f32, endpoint: f32, gate: f32) -> f32 {
+    current + gate * (endpoint - current)
+}
+
+/// A dropped block returns its input.
+pub fn dropped_block(hidden: &[f32]) -> Vec<f32> {
+    hidden.to_vec()
+}
+
+/// Zero-pads `down` `[rank, k]` with rows and `up` `[out, rank]` with columns to a multiple of `multiple`.
+pub fn pad_lowrank(
+    down: &[f32],
+    up: &[f32],
+    k: usize,
+    rank: usize,
+    out: usize,
+    multiple: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    ensure!(
+        multiple > 0 && down.len() == rank * k && up.len() == out * rank,
+        "low-rank pad shape"
+    );
+    let padded = rank.div_ceil(multiple) * multiple;
+    let mut down_out = vec![0.0; padded * k];
+    let mut up_out = vec![0.0; out * padded];
+    for row in 0..rank {
+        down_out[row * k..(row + 1) * k].copy_from_slice(&down[row * k..(row + 1) * k]);
+        for column in 0..out {
+            up_out[column * padded + row] = up[column * rank + row];
+        }
+    }
+    Ok((down_out, up_out))
+}
+
+/// `(k, low_rank)` of the HyperFlow convrot scratch one block workspace allocates. `k` is `max(hidden, width, ffn)`. `low_rank` is the maximum stored rank, or 0 when the rank map is empty. `None` when the spec is not HyperFlow.
+pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
+    if !spec.is_hyperflow()? {
+        return Ok(None);
+    }
+    let width = spec
+        .heads
+        .checked_mul(spec.head_dim)
+        .context("stored scratch width")?;
+    let k = spec.hidden.max(width).max(spec.ffn);
+    let low_rank = spec
+        .lowrank_ranks
+        .as_ref()
+        .and_then(|ranks| ranks.values().copied().max())
+        .unwrap_or(0);
+    Ok(Some((k, low_rank)))
+}
+
+/// Bytes of one HyperFlow convrot scratch for `rows`: two f32 buffers of `rows * k`, one f32 scale per row, and `rows * max(low_rank, 1)` bf16 elements. Zero when the spec is not HyperFlow.
+pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
+    let Some((k, low_rank)) = stored_scratch_extents(spec)? else {
+        return Ok(0);
+    };
+    let rows = u64::try_from(rows)?;
+    let k = u64::try_from(k)?;
+    let mid = u64::try_from(low_rank.max(1))?;
+    let f32_elems = rows
+        .checked_mul(k)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(rows))
+        .context("stored scratch elements")?;
+    f32_elems
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(rows.checked_mul(mid)?.checked_mul(2)?))
+        .context("stored scratch bytes")
+}
+
+/// t2va bytes for video rows plus stereo audio rows: `(2 * hidden + 5 * width) * 2 + 6 * rope_freq_dim * 2 + heads * 4` per row, plus f32 video scratch `hidden * 4`, video latent `video_row_width * 4` and audio latent `audio_in_channels * 4`. Text rows and keyframe rows are not included in those terms. A HyperFlow spec adds two convrot scratches: packed rows of that count plus `MAX_TEXT_ROWS` plus `MAX_KEYFRAME_ANCHORS` latent frames, and a second scratch of `MAX_TEXT_ROWS`.
+pub fn unchunked_activation_bytes(spec: &H3Spec, geometry: &Geometry) -> Result<u64> {
+    ensure!(
+        geometry.latent_height.is_multiple_of(spec.patch[1])
+            && geometry.latent_width.is_multiple_of(spec.patch[2]),
+        "latent canvas is not divisible by the patch"
+    );
+    let frame_rows = u64::try_from(geometry.latent_height / spec.patch[1])?
+        * u64::try_from(geometry.latent_width / spec.patch[2])?;
+    let video_rows = u64::try_from(geometry.latent_frames)? * frame_rows;
+    let audio_rows = u64::try_from(geometry.audio_latents)? * u64::try_from(AUDIO_CHANNELS)?;
+    let sequence_rows = video_rows
+        .checked_add(audio_rows)
+        .context("activation rows")?;
+    let width = u64::try_from(spec.heads)? * u64::try_from(spec.head_dim)?;
+    let hidden = u64::try_from(spec.hidden)?;
+    let rope = 6 * u64::try_from(spec.rope_freq_dim)? * 2;
+    let lse = u64::try_from(spec.heads)? * 4;
+    let per_row = (2 * hidden + 5 * width)
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(rope))
+        .and_then(|n| n.checked_add(lse))
+        .context("activation row")?;
+    let block = sequence_rows
+        .checked_mul(per_row)
+        .context("activation block")?;
+    let scratch = video_rows
+        .checked_mul(hidden)
+        .and_then(|n| n.checked_mul(4))
+        .context("activation scratch")?;
+    let video = video_rows
+        .checked_mul(u64::try_from(spec.video_row_width())?)
+        .and_then(|n| n.checked_mul(4))
+        .context("activation video")?;
+    let audio = audio_rows
+        .checked_mul(u64::try_from(spec.audio_in_channels)?)
+        .and_then(|n| n.checked_mul(4))
+        .context("activation audio")?;
+    let anchor_rows = u64::try_from(MAX_KEYFRAME_ANCHORS)?
+        .checked_mul(frame_rows)
+        .context("anchor rows")?;
+    let text_rows = u64::try_from(MAX_TEXT_ROWS)?;
+    let packed_rows = sequence_rows
+        .checked_add(text_rows)
+        .and_then(|n| n.checked_add(anchor_rows))
+        .context("packed scratch rows")?;
+    let convrot = stored_scratch_bytes(
+        spec,
+        usize::try_from(packed_rows).context("packed scratch rows")?,
+    )?
+    .checked_add(stored_scratch_bytes(spec, MAX_TEXT_ROWS)?)
+    .context("convrot scratch bytes")?;
+    block
+        .checked_add(scratch)
+        .and_then(|n| n.checked_add(video))
+        .and_then(|n| n.checked_add(audio))
+        .and_then(|n| n.checked_add(convrot))
+        .context("activation bytes")
+}
+
+/// Prints `resident` when stored weights plus the unchunked activations fit in `device_bytes`.
+pub fn report_stored_placement(
+    spec: &H3Spec,
+    geometry: &Geometry,
+    device_bytes: u64,
+    weight_bytes: u64,
+) -> Result<bool> {
+    let activation_bytes = unchunked_activation_bytes(spec, geometry)?;
+    let sum = weight_bytes
+        .checked_add(activation_bytes)
+        .context("placement byte sum")?;
+    let resident = sum <= device_bytes;
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "hyperflow_placement": if resident { "resident" } else { "streamed" },
+            "frames": geometry.frames,
+            "device_bytes": device_bytes,
+            "weight_bytes": weight_bytes,
+            "activation_bytes": activation_bytes,
+        })
+    );
+    Ok(resident)
 }
 
 /// MiniMax-H3 video VAE configuration and shared image/video execution geometry.
@@ -870,10 +1302,63 @@ impl Schedule {
     }
 }
 
+/// One HyperFlow evaluation: `t = 1 - sigma_i`, `r = 1 - sigma_{i+1}`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlowStep {
+    pub video_t: f32,
+    pub video_r: f32,
+    pub audio_t: f32,
+    pub audio_r: f32,
+    pub keyframe_t: f32,
+    pub keyframe_r: f32,
+    pub reference_t: f32,
+    pub reference_r: f32,
+}
+
+/// 4, 6 or 8 steps. Raw decimals cast f64 to f32, then video shift 12 and audio shift 3 in f32.
+pub fn hyperflow_steps(steps: usize) -> Result<Vec<FlowStep>> {
+    let raw: &[f64] = match steps {
+        4 => &[1.0, 0.681872, 0.205019, 0.036496, 0.0],
+        6 => &[1.0, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0],
+        8 => &[
+            1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0,
+        ],
+        _ => bail!("HyperFlow step count {steps} is not 4, 6 or 8"),
+    };
+    let video = shifted_sigmas(raw, 12.0);
+    let audio = shifted_sigmas(raw, 3.0);
+    let key = KEYFRAME_NOISE_AUG as f32;
+    let mut out = Vec::with_capacity(steps);
+    for index in 0..steps {
+        out.push(FlowStep {
+            video_t: 1.0 - video[index],
+            video_r: 1.0 - video[index + 1],
+            audio_t: 1.0 - audio[index],
+            audio_r: 1.0 - audio[index + 1],
+            keyframe_t: key,
+            keyframe_r: key,
+            reference_t: 1.0,
+            reference_r: 1.0,
+        });
+    }
+    Ok(out)
+}
+
+fn shifted_sigmas(raw: &[f64], shift: f32) -> Vec<f32> {
+    raw.iter()
+        .map(|&base| {
+            let base = base as f32;
+            shift * base / ((shift - 1.0) * base + 1.0)
+        })
+        .collect()
+}
+
 /// Distinct timesteps of one evaluation, ascending, and the index of every sequence row into them.
+/// `endpoints` is parallel to `timesteps` for a HyperFlow `(t, r)` pair, and empty for one time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowTimesteps {
     pub timesteps: Vec<f32>,
+    pub endpoints: Vec<f32>,
     pub indices: Vec<u32>,
 }
 
@@ -896,7 +1381,40 @@ impl RowTimesteps {
             .iter()
             .map(|t| timesteps.partition_point(|v| v < t) as u32)
             .collect();
-        Self { timesteps, indices }
+        Self {
+            timesteps,
+            endpoints: Vec::new(),
+            indices,
+        }
+    }
+
+    /// Distinct `(t, r)` pairs, sorted by `t` then `r`.
+    /// Text and generated video rows take the video pair. Generated audio rows take the audio pair.
+    /// Conditioning video rows take the keyframe pair.
+    pub fn hyperflow(layout: &PackedLayout, step: &FlowStep) -> Self {
+        let mut pairs = vec![(step.video_t, step.video_r); layout.rows()];
+        for &row in &layout.video_indices[..layout.condition_video_rows] {
+            pairs[row as usize] = (step.keyframe_t, step.keyframe_r);
+        }
+        for &row in &layout.audio_indices {
+            pairs[row as usize] = (step.audio_t, step.audio_r);
+        }
+        let mut unique = pairs.clone();
+        unique.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        unique.dedup();
+        let indices = pairs
+            .iter()
+            .map(|pair| {
+                unique.partition_point(|v| {
+                    v.0.total_cmp(&pair.0).then(v.1.total_cmp(&pair.1)).is_lt()
+                }) as u32
+            })
+            .collect();
+        Self {
+            timesteps: unique.iter().map(|pair| pair.0).collect(),
+            endpoints: unique.iter().map(|pair| pair.1).collect(),
+            indices,
+        }
     }
 
     pub fn adaln_indices(&self, layout: &PackedLayout) -> Vec<u32> {
@@ -938,8 +1456,10 @@ pub struct LoraAdapter {
 /// Every `(timestep, tag)` AdaLN pair addressed by any evaluation of a request, with per-evaluation row maps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdalnPlan {
-    /// Distinct timesteps over all evaluations, ascending.
+    /// Distinct timesteps over all evaluations, ascending. HyperFlow stores `t` here.
     pub timesteps: Vec<f32>,
+    /// Endpoint `r` parallel to `timesteps`. Empty for a single-time plan.
+    pub endpoints: Vec<f32>,
     /// `(index into timesteps, tag)` in ascending order.
     pub pairs: Vec<(u32, u8)>,
     /// Per evaluation, the pair of every sequence row.
@@ -949,12 +1469,22 @@ pub struct AdalnPlan {
 }
 
 impl AdalnPlan {
-    pub fn build(layout: &PackedLayout, plan: &[RowTimesteps]) -> Self {
+    pub fn build(layout: &PackedLayout, plan: &[RowTimesteps]) -> Result<Self> {
         Self::from_tags(&layout.token_tags, plan)
     }
 
     /// `(timestep, tag)` pairs addressed by `token_tags` over every evaluation in `plan`.
-    pub fn from_tags(token_tags: &[u8], plan: &[RowTimesteps]) -> Self {
+    /// A plan whose rows carry `endpoints` keys each row by `(t, r)`.
+    pub fn from_tags(token_tags: &[u8], plan: &[RowTimesteps]) -> Result<Self> {
+        if plan.iter().any(|step| !step.endpoints.is_empty()) {
+            let (timesteps, endpoints, row_timesteps) = endpoint_rows(plan)?;
+            return Ok(plan_from_rows(
+                token_tags,
+                timesteps,
+                endpoints,
+                row_timesteps,
+            ));
+        }
         let mut timesteps: Vec<f32> = plan
             .iter()
             .flat_map(|step| step.timesteps.clone())
@@ -969,28 +1499,85 @@ impl AdalnPlan {
                 step.indices.iter().map(|&i| map[i as usize]).collect()
             })
             .collect();
-        let mut pairs: Vec<(u32, u8)> = row_timesteps
-            .iter()
-            .flat_map(|rows| rows.iter().zip(token_tags).map(|(&t, &tag)| (t, tag)))
-            .collect();
-        pairs.sort_unstable();
-        pairs.dedup();
-        let row_pairs = row_timesteps
-            .iter()
-            .map(|rows| {
-                rows.iter()
-                    .zip(token_tags)
-                    .map(|(&t, &tag)| pairs.partition_point(|&p| p < (t, tag)) as u32)
-                    .collect()
-            })
-            .collect();
-        Self {
+        Ok(plan_from_rows(
+            token_tags,
             timesteps,
-            pairs,
-            row_pairs,
+            Vec::new(),
             row_timesteps,
-        }
+        ))
     }
+}
+
+fn plan_from_rows(
+    token_tags: &[u8],
+    timesteps: Vec<f32>,
+    endpoints: Vec<f32>,
+    row_timesteps: Vec<Vec<u32>>,
+) -> AdalnPlan {
+    let mut pairs: Vec<(u32, u8)> = row_timesteps
+        .iter()
+        .flat_map(|rows| rows.iter().zip(token_tags).map(|(&t, &tag)| (t, tag)))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let row_pairs = row_timesteps
+        .iter()
+        .map(|rows| {
+            rows.iter()
+                .zip(token_tags)
+                .map(|(&t, &tag)| pairs.partition_point(|&p| p < (t, tag)) as u32)
+                .collect()
+        })
+        .collect();
+    AdalnPlan {
+        timesteps,
+        endpoints,
+        pairs,
+        row_pairs,
+        row_timesteps,
+    }
+}
+
+type EndpointRows = (Vec<f32>, Vec<f32>, Vec<Vec<u32>>);
+
+fn endpoint_rows(plan: &[RowTimesteps]) -> Result<EndpointRows> {
+    for step in plan {
+        ensure!(
+            step.endpoints.len() == step.timesteps.len(),
+            "HyperFlow endpoints differ from its timesteps"
+        );
+    }
+    let mut keys: Vec<(f32, f32)> = plan
+        .iter()
+        .flat_map(|step| {
+            step.timesteps
+                .iter()
+                .copied()
+                .zip(step.endpoints.iter().copied())
+        })
+        .collect();
+    keys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    keys.dedup();
+    let global = |t: f32, r: f32| {
+        keys.partition_point(|v| v.0.total_cmp(&t).then(v.1.total_cmp(&r)).is_lt()) as u32
+    };
+    let row_timesteps = plan
+        .iter()
+        .map(|step| {
+            let map: Vec<u32> = step
+                .timesteps
+                .iter()
+                .zip(&step.endpoints)
+                .map(|(&t, &r)| global(t, r))
+                .collect();
+            step.indices.iter().map(|&i| map[i as usize]).collect()
+        })
+        .collect();
+    Ok((
+        keys.iter().map(|pair| pair.0).collect(),
+        keys.iter().map(|pair| pair.1).collect(),
+        row_timesteps,
+    ))
 }
 
 /// The F32 time-embedder tensors (`time_embedder.linear_1/2`) the AdaLN input is computed from.
@@ -1001,14 +1588,14 @@ pub struct AdalnTimeEmbedder {
     pub linear_2_bias: Vec<f32>,
 }
 
-/// `silu(time_embedder(sinusoid(t)))` rounded to BF16, `[timesteps, time_dim]`: the input of every AdaLN projection.
+fn silu(v: f32) -> f32 {
+    v / (1.0 + (-v).exp())
+}
+
+/// f32 `time_embedder(time_proj(t))`, `[timesteps, time_dim]`, before the AdaLN SiLU.
 /// Sinusoid `[cos(t f_i), sin(t f_i)]`, `f_i = exp(-ln(10000) * i / half)` in f32; the two F32 linears accumulate in
 /// f64 and round once.
-pub fn adaln_input(
-    spec: &H3Spec,
-    time: &AdalnTimeEmbedder,
-    timesteps: &[f32],
-) -> Result<Vec<half::bf16>> {
+fn time_embed(spec: &H3Spec, time: &AdalnTimeEmbedder, timesteps: &[f32]) -> Vec<f32> {
     let half = spec.freq_dim / 2;
     let log_period = -(10000.0f64.ln()) as f32;
     let frequencies: Vec<f32> = (0..half)
@@ -1019,7 +1606,6 @@ pub fn adaln_input(
         x.extend(frequencies.iter().map(|&f| (t * f).cos()));
         x.extend(frequencies.iter().map(|&f| (t * f).sin()));
     }
-    let silu = |v: f32| v / (1.0 + (-v).exp());
     let hidden = f32_linear(
         &time.linear_1_weight,
         &time.linear_1_bias,
@@ -1027,16 +1613,63 @@ pub fn adaln_input(
         spec.freq_dim,
     );
     let hidden: Vec<f32> = hidden.into_iter().map(silu).collect();
-    let embedding = f32_linear(
+    f32_linear(
         &time.linear_2_weight,
         &time.linear_2_bias,
         &hidden,
         spec.time_hidden,
-    );
-    Ok(embedding
+    )
+}
+
+/// `silu(time_embedder(sinusoid(t)))` rounded to BF16, `[timesteps, time_dim]`: the input of every AdaLN projection.
+pub fn adaln_input(spec: &H3Spec, time: &AdalnTimeEmbedder, timesteps: &[f32]) -> Vec<half::bf16> {
+    time_embed(spec, time, timesteps)
         .into_iter()
         .map(|v| half::bf16::from_f32(silu(v)))
+        .collect()
+}
+
+/// Pre-SiLU `mix_temb` lanes, `[timesteps, time_dim]`.
+pub(crate) fn mixed_temb(
+    spec: &H3Spec,
+    current: &AdalnTimeEmbedder,
+    endpoint: &AdalnTimeEmbedder,
+    timesteps: &[f32],
+    endpoints: &[f32],
+    gate: f32,
+) -> Result<Vec<f32>> {
+    ensure!(
+        timesteps.len() == endpoints.len() && gate.is_finite(),
+        "HyperFlow temb extent"
+    );
+    let current = time_embed(spec, current, timesteps);
+    let endpoint = time_embed(spec, endpoint, endpoints);
+    ensure!(
+        current.len() == endpoint.len() && current.iter().chain(&endpoint).all(|v| v.is_finite()),
+        "HyperFlow temb is not finite"
+    );
+    Ok(current
+        .into_iter()
+        .zip(endpoint)
+        .map(|(c, e)| mix_temb(c, e, gate))
         .collect())
+}
+
+/// SiLU of `mix_temb` on each f32 lane of the two time embedders, rounded to BF16.
+pub fn mixed_adaln_input(
+    spec: &H3Spec,
+    current: &AdalnTimeEmbedder,
+    endpoint: &AdalnTimeEmbedder,
+    timesteps: &[f32],
+    endpoints: &[f32],
+    gate: f32,
+) -> Result<Vec<half::bf16>> {
+    Ok(
+        mixed_temb(spec, current, endpoint, timesteps, endpoints, gate)?
+            .into_iter()
+            .map(|v| half::bf16::from_f32(silu(v)))
+            .collect(),
+    )
 }
 
 /// `x [rows, input] * weight[output, input]^T + bias`.
@@ -2121,7 +2754,11 @@ pub fn image_row_timesteps(layout: &ImageLayout, timestep: f32) -> Result<RowTim
         .iter()
         .map(|t| timesteps.partition_point(|v| v < t) as u32)
         .collect();
-    Ok(RowTimesteps { timesteps, indices })
+    Ok(RowTimesteps {
+        timesteps,
+        endpoints: Vec::new(),
+        indices,
+    })
 }
 
 /// One [`RowTimesteps`] per published evaluation.

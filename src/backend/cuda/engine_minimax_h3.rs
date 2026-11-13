@@ -21,8 +21,8 @@ use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::gguf::GgmlType;
 use crate::minimax_h3::{
-    AdalnPlan, AdalnTimeEmbedder, H3Spec, ImageLayout, ImageSchedule, ImageSpec, MODALITIES,
-    adaln_input, image_row_plan, rotary_rows,
+    AdalnPlan, AdalnTimeEmbedder, H3Spec, ImageLayout, ImageSchedule, ImageSpec, LinearStorage,
+    MODALITIES, adaln_input, image_row_plan, mixed_adaln_input, rotary_rows,
 };
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
@@ -138,6 +138,14 @@ impl Element for f32 {
             .0
             .iter()
             .all(|v| f32::from_le_bytes(*v).is_finite())
+    }
+}
+
+impl Element for i8 {
+    const DTYPE: Dtype = Dtype::I8;
+    /// Every int8 code is finite.
+    fn finite(_bytes: &[u8]) -> bool {
+        true
     }
 }
 
@@ -300,8 +308,9 @@ pub(crate) struct AdalnTable {
 }
 
 impl AdalnTable {
-    /// One pass over the 50 `adaln_proj` weights: each block's `[18 * hidden, time_dim]` projection of the plan's
-    /// timesteps (bias before output rounding), of which only the addressed `(timestep, tag)` slices are kept.
+    /// Kept blocks: `[18 * hidden, time_dim]` projection of the plan embedding, bias before output rounding,
+    /// keeping the addressed `(timestep, tag)` slices. HyperFlow's embedding is SiLU of `mix_temb` on the two f32
+    /// time embedders, rounded to BF16. A dropped block's modulation rows stay zero.
     pub(crate) fn build(
         d: &Device,
         blas: &mut Blas,
@@ -315,6 +324,7 @@ impl AdalnTable {
         let width = 6 * spec.hidden;
         let modulation = width * MODALITIES as usize;
         let mut source = Source::new(transformer_dir, manifest);
+        let hyperflow = spec.is_hyperflow()?;
         let time = AdalnTimeEmbedder {
             linear_1_weight: source.host_f32(
                 s,
@@ -329,7 +339,46 @@ impl AdalnTable {
             )?,
             linear_2_bias: source.host_f32(s, "time_embedder.linear_2.bias", spec.time_dim)?,
         };
-        let x = s.clone_htod(&adaln_input(spec, &time, &plan.timesteps)?)?;
+        let x_host = if hyperflow {
+            ensure!(
+                !plan.timesteps.is_empty() && plan.endpoints.len() == plan.timesteps.len(),
+                "HyperFlow temb mix is not bound"
+            );
+            let gate = spec.hyperflow_gate.context("HyperFlow gate")?;
+            let endpoint = AdalnTimeEmbedder {
+                linear_1_weight: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_1.weight",
+                    spec.time_hidden * spec.freq_dim,
+                )?,
+                linear_1_bias: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_1.bias",
+                    spec.time_hidden,
+                )?,
+                linear_2_weight: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_2.weight",
+                    spec.time_dim * spec.time_hidden,
+                )?,
+                linear_2_bias: source.host_f32(
+                    s,
+                    "endpoint_time_embedder.linear_2.bias",
+                    spec.time_dim,
+                )?,
+            };
+            mixed_adaln_input(
+                spec,
+                &time,
+                &endpoint,
+                &plan.timesteps,
+                &plan.endpoints,
+                gate,
+            )?
+        } else {
+            adaln_input(spec, &time, &plan.timesteps)
+        };
+        let x = s.clone_htod(&x_host)?;
         let mut weight = s.alloc_zeros::<bf16>(modulation * spec.time_dim)?;
         let mut bias = s.alloc_zeros::<bf16>(modulation)?;
         let y = s.alloc_zeros::<bf16>(timesteps * modulation)?;
@@ -342,7 +391,11 @@ impl AdalnTable {
             vector(&bias, s)?,
             mode,
         )?;
+        let dropped = spec.dropped_blocks.as_deref().unwrap_or(&[]);
         for layer in 0..spec.layers {
+            if dropped.contains(&layer) {
+                continue;
+            }
             let base = format!("transformer_blocks.{layer}.adaln_proj.linear");
             for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
                 let name = format!("{base}.{suffix}");
@@ -453,15 +506,35 @@ const HIDDEN_NORM_THREADS: u32 = 768;
 /// Threads per head-width RMSNorm row.
 const HEAD_NORM_THREADS: u32 = 32;
 
-/// One block's BF16 weights: the base linears as row-major views (`LINEAR_ROLES` order) into `storage` or a dense
-/// streaming slot, norms and LoRA factors owned; the q, k, v LoRA A factors are stacked `[3 * rank, hidden]`.
+/// One base linear: dense BF16, int8 convrot (`qweight` `[out, in]`, `wscale` `[out]`), or `up(down(x))`.
+enum BlockLinear {
+    Dense {
+        weight: Tensor<bf16, 2>,
+        owned: Option<CudaSlice<bf16>>,
+    },
+    Int8 {
+        qweight: Tensor<i8, 2>,
+        wscale: CudaSlice<f32>,
+        group: u32,
+        owned: Option<CudaSlice<i8>>,
+    },
+    LowRank {
+        down: Tensor<bf16, 2>,
+        up: Tensor<bf16, 2>,
+        owned: Vec<CudaSlice<bf16>>,
+    },
+}
+
+/// One block's weights. `linears` is `LINEAR_ROLES` order. Dense MiniMax views point into `storage` or a streaming
+/// slot. A dropped block's `linears` are 1×1 views of `storage` and `dropped` is set.
 pub(crate) struct BlockWeights {
     norm1: CudaSlice<bf16>,
     norm2: CudaSlice<bf16>,
     norm_q: CudaSlice<bf16>,
     norm_k: CudaSlice<bf16>,
-    linears: [Tensor<bf16, 2>; 6],
+    linears: [BlockLinear; 6],
     storage: Option<CudaSlice<bf16>>,
+    dropped: bool,
     qkv_a: CudaSlice<bf16>,
     q_b: CudaSlice<bf16>,
     k_b: CudaSlice<bf16>,
@@ -666,18 +739,33 @@ impl BlockWeights {
         for role in LINEAR_ROLES {
             let (offset, shape) = layout[role];
             let bytes = 2 * u64::from(shape[0]) * u64::from(shape[1]);
-            linears.push(unsafe {
-                Tensor::new(
-                    at + 2 * offset as u64,
-                    shape,
-                    [u64::from(shape[1]), 1],
-                    bytes,
-                )?
+            linears.push(BlockLinear::Dense {
+                weight: unsafe {
+                    Tensor::new(
+                        at + 2 * offset as u64,
+                        shape,
+                        [u64::from(shape[1]), 1],
+                        bytes,
+                    )?
+                },
+                owned: None,
             });
         }
-        let linears: [Tensor<bf16, 2>; 6] = linears
+        let linears: [BlockLinear; 6] = linears
             .try_into()
             .map_err(|_| anyhow::anyhow!("block linear count"))?;
+        Self::with_linears_ready::<LORA>(s, spec, rank, block, linears, base, lora)
+    }
+
+    fn with_linears_ready<const LORA: bool>(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        rank: usize,
+        block: &str,
+        linears: [BlockLinear; 6],
+        base: &mut Source<'_>,
+        lora: &mut Source<'_>,
+    ) -> Result<Self> {
         let (h, w, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
         let mut n =
             |name: &str, count: usize| base.tensor(s, &format!("{block}.{name}.weight"), count);
@@ -733,6 +821,9 @@ impl BlockWeights {
                 0,
             )
         };
+        for linear in &linears {
+            linear.retain_resident(s)?;
+        }
         Ok(Self {
             q_b,
             k_b,
@@ -749,8 +840,208 @@ impl BlockWeights {
             norm_k,
             linears,
             storage: None,
+            dropped: false,
             qkv_a,
             rank,
+        })
+    }
+
+    /// No checkpoint tensors. `block_forward` returns the input.
+    fn identity(s: &Arc<CudaStream>, spec: &H3Spec) -> Result<Self> {
+        let storage = s.alloc_zeros::<bf16>(1)?;
+        let weight = unsafe { Tensor::new(pointer(&storage, s), [1, 1], [1, 1], 2)? };
+        let linears = std::array::from_fn(|_| BlockLinear::Dense {
+            weight,
+            owned: None,
+        });
+        let empty = || s.alloc_zeros::<bf16>(0);
+        Ok(Self {
+            norm1: s.alloc_zeros::<bf16>(spec.hidden)?,
+            norm2: s.alloc_zeros::<bf16>(spec.hidden)?,
+            norm_q: s.alloc_zeros::<bf16>(spec.head_dim)?,
+            norm_k: s.alloc_zeros::<bf16>(spec.head_dim)?,
+            linears,
+            storage: Some(storage),
+            dropped: true,
+            qkv_a: empty()?,
+            q_b: empty()?,
+            k_b: empty()?,
+            v_b: empty()?,
+            out_a: empty()?,
+            out_b: empty()?,
+            in_a: empty()?,
+            in_b: empty()?,
+            ffo_a: empty()?,
+            ffo_b: empty()?,
+            rank: 0,
+        })
+    }
+
+    /// Stored HyperFlow factors. `slot` is the layer's streaming base; resident factors are owned.
+    fn stored(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        block: &str,
+        base: &mut Source<'_>,
+        lora: &mut Source<'_>,
+        slot: Option<(u64, &[(String, usize)])>,
+    ) -> Result<Self> {
+        let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
+        for role in LINEAR_ROLES {
+            let suffix = role.strip_suffix(".weight").context("linear role")?;
+            let name = format!("{block}.{suffix}");
+            linears.push(match spec.linear_storage(&name)? {
+                LinearStorage::Dense => dense_factor(s, base, slot, &format!("{name}.weight"))?,
+                LinearStorage::Int8 { group } => int8_factor(s, base, slot, &name, group)?,
+                LinearStorage::LowRank { rank } => low_rank_factor(s, base, slot, &name, rank)?,
+            });
+        }
+        let linears: [BlockLinear; 6] = linears
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("block linear count"))?;
+        Self::with_linears_ready::<false>(s, spec, 0, block, linears, base, lora)
+    }
+}
+
+fn packed_offset(packed: &[(String, usize)], name: &str) -> Result<usize> {
+    packed
+        .iter()
+        .find(|(entry, _)| entry == name)
+        .map(|(_, offset)| *offset)
+        .with_context(|| format!("{name} is outside the block slot"))
+}
+
+fn view_at<T: Copy>(base: u64, offset: usize, rows: usize, cols: usize) -> Result<Tensor<T, 2>> {
+    let ptr = base
+        .checked_add(u64::try_from(offset)?)
+        .context("stored factor address")?;
+    let span = u64::try_from(rows)?
+        .checked_mul(u64::try_from(cols)?)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<T>() as u64))
+        .context("stored factor bytes")?;
+    ensure!(
+        offset.is_multiple_of(16) && ptr.is_multiple_of(16),
+        "stored factor alignment"
+    );
+    unsafe {
+        Tensor::new(
+            ptr,
+            [u32::try_from(rows)?, u32::try_from(cols)?],
+            [u64::try_from(cols)?, 1],
+            span,
+        )
+    }
+}
+
+fn factor_shape(base: &Source<'_>, name: &str, dtype: Dtype) -> Result<(usize, usize)> {
+    let entry = base
+        .manifest
+        .entries
+        .get(name)
+        .with_context(|| format!("manifest lacks {name}"))?;
+    ensure!(
+        entry.dtype == dtype && entry.shape.len() == 2 && entry.load,
+        "{name} stored layout"
+    );
+    Ok((entry.shape[0], entry.shape[1]))
+}
+
+fn dense_factor(
+    s: &Arc<CudaStream>,
+    base: &mut Source<'_>,
+    slot: Option<(u64, &[(String, usize)])>,
+    name: &str,
+) -> Result<BlockLinear> {
+    let (rows, cols) = factor_shape(base, name, Dtype::BF16)?;
+    if let Some((ptr, packed)) = slot {
+        Ok(BlockLinear::Dense {
+            weight: view_at(ptr, packed_offset(packed, name)?, rows, cols)?,
+            owned: None,
+        })
+    } else {
+        let owned = base.tensor::<bf16>(s, name, rows * cols)?;
+        let weight = matrix(&owned, s, rows, cols)?;
+        Ok(BlockLinear::Dense {
+            weight,
+            owned: Some(owned),
+        })
+    }
+}
+
+fn int8_factor(
+    s: &Arc<CudaStream>,
+    base: &mut Source<'_>,
+    slot: Option<(u64, &[(String, usize)])>,
+    name: &str,
+    group: u32,
+) -> Result<BlockLinear> {
+    let qname = format!("{name}.qweight");
+    let (rows, cols) = factor_shape(base, &qname, Dtype::I8)?;
+    let group_usize = usize::try_from(group)?;
+    ensure!(
+        group_usize > 0 && cols.is_multiple_of(group_usize),
+        "{name} convrot group {group}"
+    );
+    let wscale = base.tensor::<f32>(s, &format!("{name}.wscale"), rows)?;
+    let (qweight, owned) = if let Some((ptr, packed)) = slot {
+        (
+            view_at(ptr, packed_offset(packed, &qname)?, rows, cols)?,
+            None,
+        )
+    } else {
+        let owned = base.tensor::<i8>(s, &qname, rows * cols)?;
+        let qweight = view(
+            &owned,
+            s,
+            0,
+            [u32::try_from(rows)?, u32::try_from(cols)?],
+            [u64::try_from(cols)?, 1],
+        )?;
+        (qweight, Some(owned))
+    };
+    Ok(BlockLinear::Int8 {
+        qweight,
+        wscale,
+        group,
+        owned,
+    })
+}
+
+fn low_rank_factor(
+    s: &Arc<CudaStream>,
+    base: &mut Source<'_>,
+    slot: Option<(u64, &[(String, usize)])>,
+    name: &str,
+    rank: usize,
+) -> Result<BlockLinear> {
+    let down_name = format!("{name}.down.weight");
+    let up_name = format!("{name}.up.weight");
+    let (down_rows, down_cols) = factor_shape(base, &down_name, Dtype::BF16)?;
+    let (up_rows, up_cols) = factor_shape(base, &up_name, Dtype::BF16)?;
+    ensure!(
+        down_rows == rank && up_cols == rank && rank > 0,
+        "{name} low-rank {rank}"
+    );
+    if let Some((ptr, packed)) = slot {
+        Ok(BlockLinear::LowRank {
+            down: view_at(
+                ptr,
+                packed_offset(packed, &down_name)?,
+                down_rows,
+                down_cols,
+            )?,
+            up: view_at(ptr, packed_offset(packed, &up_name)?, up_rows, up_cols)?,
+            owned: Vec::new(),
+        })
+    } else {
+        let down_owned = base.tensor::<bf16>(s, &down_name, down_rows * down_cols)?;
+        let up_owned = base.tensor::<bf16>(s, &up_name, up_rows * up_cols)?;
+        let down = matrix(&down_owned, s, down_rows, down_cols)?;
+        let up = matrix(&up_owned, s, up_rows, up_cols)?;
+        Ok(BlockLinear::LowRank {
+            down,
+            up,
+            owned: vec![down_owned, up_owned],
         })
     }
 }
@@ -766,6 +1057,7 @@ pub(crate) struct BlockKernels {
     serial_norm_modulate: std::cell::Cell<bool>,
     gated_add: crate::backend::gpu::CudaFunction,
     residual: crate::backend::gpu::CudaFunction,
+    stored_launch: std::sync::OnceLock<StoredLaunch>,
 }
 
 impl BlockKernels {
@@ -794,8 +1086,29 @@ impl BlockKernels {
             #[cfg(test)]
             serial_norm_modulate: std::cell::Cell::new(false),
             gated_add: modulate.load_function("row_gated_add")?,
+            stored_launch: std::sync::OnceLock::new(),
         })
     }
+
+    fn stored_launch(
+        &self,
+        ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>,
+    ) -> Result<&StoredLaunch> {
+        if let Some(launch) = self.stored_launch.get() {
+            return Ok(launch);
+        }
+        let launch = StoredLaunch {
+            upcast: cubin::module(ctx, "vision_ops")?.load_function("vision_upcast_f32")?,
+            convrot: crate::convrot::load_convrot(ctx)?,
+        };
+        let _ = self.stored_launch.set(launch);
+        self.stored_launch.get().context("stored launch")
+    }
+}
+
+struct StoredLaunch {
+    upcast: crate::backend::gpu::CudaFunction,
+    convrot: crate::convrot::ConvrotFns,
 }
 
 /// Activations of one block forward over `rows` sequence rows.
@@ -816,6 +1129,29 @@ pub(crate) struct BlockWork {
     hidden: Tensor<bf16, 2>,
     gated: Tensor<bf16, 2>,
     ffn_owned: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
+    stored: Option<StoredScratch>,
+}
+
+/// Convrot and low-rank scratch for one block forward. `codes` aliases `x`.
+struct StoredScratch {
+    x: CudaSlice<f32>,
+    rotated: CudaSlice<f32>,
+    scales: CudaSlice<f32>,
+    mid: CudaSlice<bf16>,
+    k: usize,
+    rank: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StoredPtrs {
+    x: u64,
+    rotated: u64,
+    codes: u64,
+    scales: u64,
+    mid: u64,
+    rows: usize,
+    k: usize,
+    rank: usize,
 }
 
 impl BlockWork {
@@ -852,6 +1188,47 @@ impl BlockWork {
                     u32::try_from(rows)?,
                     u32::try_from(output)?,
                     u32::try_from(input)?,
+                )?;
+            }
+        }
+        if spec.is_hyperflow()? {
+            self.prepare_low_rank(blas, spec)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_low_rank(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
+        let ranks = spec.lowrank_ranks.as_ref().context("HyperFlow rank set")?;
+        for (name, &rank) in ranks {
+            let suffix = name
+                .split_once('.')
+                .and_then(|(_, rest)| rest.split_once('.').map(|(_, suffix)| suffix))
+                .with_context(|| format!("{name} low-rank suffix"))?;
+            let width = spec.heads * spec.head_dim;
+            let (out, input, ffn) = match suffix {
+                "attn.to_q" | "attn.to_k" | "attn.to_v" => (width, spec.hidden, false),
+                "attn.to_out.0" => (spec.hidden, width, false),
+                "ff.net.0.proj" => (2 * spec.ffn, spec.hidden, true),
+                "ff.net.2" => (spec.hidden, spec.ffn, true),
+                _ => bail!("{name} is not a block linear"),
+            };
+            let mut row_sets = vec![self.rows];
+            if ffn {
+                row_sets = [self.chunk, self.rows % self.chunk]
+                    .into_iter()
+                    .filter(|&n| n > 0)
+                    .collect();
+            }
+            for rows in row_sets {
+                blas.prepare_fixed(
+                    u32::try_from(rows)?,
+                    u32::try_from(rank)?,
+                    u32::try_from(input)?,
+                )?;
+                blas.prepare_fixed(
+                    u32::try_from(rows)?,
+                    u32::try_from(out)?,
+                    u32::try_from(rank)?,
                 )?;
             }
         }
@@ -1070,6 +1447,18 @@ impl BlockWork {
         let gated = s.alloc_zeros::<bf16>(chunk * spec.ffn)?;
         let hidden_view = matrix(&hidden, s, chunk, 2 * spec.ffn)?;
         let gated_view = matrix(&gated, s, chunk, spec.ffn)?;
+        let stored = if let Some((k, low_rank)) = crate::minimax_h3::stored_scratch_extents(spec)? {
+            Some(StoredScratch {
+                x: s.alloc_zeros::<f32>(rows * k)?,
+                rotated: s.alloc_zeros::<f32>(rows * k)?,
+                scales: s.alloc_zeros::<f32>(rows)?,
+                mid: s.alloc_zeros::<bf16>(rows * low_rank.max(1))?,
+                k,
+                rank: low_rank,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             rows,
             rank,
@@ -1087,6 +1476,7 @@ impl BlockWork {
             hidden: hidden_view,
             gated: gated_view,
             ffn_owned: Some((hidden, gated)),
+            stored,
         })
     }
 }
@@ -1176,9 +1566,188 @@ fn lora_pair(
     }
 }
 
+fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
+    let scratch = work.stored.as_ref()?;
+    let x = pointer(&scratch.x, s);
+    Some(StoredPtrs {
+        x,
+        rotated: pointer(&scratch.rotated, s),
+        codes: x,
+        scales: pointer(&scratch.scales, s),
+        mid: pointer(&scratch.mid, s),
+        rows: work.rows,
+        k: scratch.k,
+        rank: scratch.rank,
+    })
+}
+
+fn resident_span<T>(owned: &CudaSlice<T>, s: &Arc<CudaStream>, view: &Tensor<T, 2>) -> Result<()> {
+    let base = pointer(owned, s);
+    let bytes = u64::try_from(owned.len())?
+        .checked_mul(std::mem::size_of::<T>() as u64)
+        .context("resident factor bytes")?;
+    let end = base.checked_add(bytes).context("resident factor bytes")?;
+    let stop = view
+        .ptr
+        .checked_add(view.span_bytes)
+        .context("resident factor span")?;
+    ensure!(
+        view.ptr >= base && stop <= end,
+        "resident factor leaves its allocation"
+    );
+    Ok(())
+}
+
+impl BlockLinear {
+    /// A resident factor's view addresses the allocation in `owned`.
+    fn retain_resident(&self, s: &Arc<CudaStream>) -> Result<()> {
+        match self {
+            BlockLinear::Dense {
+                weight,
+                owned: Some(slice),
+            } => resident_span(slice, s, weight),
+            BlockLinear::Dense { owned: None, .. } => Ok(()),
+            BlockLinear::Int8 {
+                qweight,
+                owned: Some(slice),
+                ..
+            } => resident_span(slice, s, qweight),
+            BlockLinear::Int8 { owned: None, .. } => Ok(()),
+            BlockLinear::LowRank { down, up, owned } if owned.len() == 2 => {
+                resident_span(&owned[0], s, down)?;
+                resident_span(&owned[1], s, up)
+            }
+            BlockLinear::LowRank { owned, .. } => {
+                ensure!(owned.is_empty(), "low-rank resident factors");
+                Ok(())
+            }
+        }
+    }
+}
+
+fn apply_linear(
+    c: &BlockContext<'_>,
+    linear: &BlockLinear,
+    x: Tensor<bf16, 2>,
+    y: Tensor<bf16, 2>,
+    scratch: Option<StoredPtrs>,
+) -> Result<()> {
+    match linear {
+        BlockLinear::Dense { weight, .. } => c.blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            crate::backend::cuda::linear::LinearWeightRef::Bf16(*weight),
+            x,
+            &mut TensorMut(y),
+        ),
+        BlockLinear::Int8 {
+            qweight,
+            wscale,
+            group,
+            ..
+        } => apply_int8(c, *qweight, wscale, *group, x, y, scratch),
+        BlockLinear::LowRank { down, up, .. } => apply_low_rank(c, *down, *up, x, y, scratch),
+    }
+}
+
+fn apply_int8(
+    c: &BlockContext<'_>,
+    qweight: Tensor<i8, 2>,
+    wscale: &CudaSlice<f32>,
+    group: u32,
+    x: Tensor<bf16, 2>,
+    y: Tensor<bf16, 2>,
+    scratch: Option<StoredPtrs>,
+) -> Result<()> {
+    let ptrs = scratch.context("stored linear without scratch")?;
+    let rows = x.shape[0] as usize;
+    let k = x.shape[1] as usize;
+    let n = y.shape[1] as usize;
+    ensure!(
+        qweight.shape == [u32::try_from(n)?, u32::try_from(k)?]
+            && wscale.len() == n
+            && y.shape[0] as usize == rows
+            && rows <= ptrs.rows
+            && k <= ptrs.k,
+        "convrot shape"
+    );
+    let count = rows * k;
+    let launch = c.kernels.stored_launch(c.s.context())?;
+    unsafe {
+        c.s.launch_builder(&launch.upcast)
+            .arg(&x.ptr)
+            .arg(&ptrs.x)
+            .arg(&u32::try_from(count)?)
+            .launch(flat(count))?;
+    }
+    crate::convrot::launch_device(
+        c.s,
+        &launch.convrot,
+        &crate::convrot::ConvrotArgs {
+            x: ptrs.x,
+            qweight: qweight.ptr,
+            wscale: pointer(wscale, c.s),
+            y: y.ptr,
+            rotated: ptrs.rotated,
+            codes: ptrs.codes,
+            scales: ptrs.scales,
+            rows: i32::try_from(rows)?,
+            k: i32::try_from(k)?,
+            n: i32::try_from(n)?,
+            group: i32::try_from(group)?,
+        },
+    )
+}
+
+fn apply_low_rank(
+    c: &BlockContext<'_>,
+    down: Tensor<bf16, 2>,
+    up: Tensor<bf16, 2>,
+    x: Tensor<bf16, 2>,
+    y: Tensor<bf16, 2>,
+    scratch: Option<StoredPtrs>,
+) -> Result<()> {
+    let ptrs = scratch.context("stored linear without scratch")?;
+    let rows = x.shape[0] as usize;
+    let k = x.shape[1] as usize;
+    let n = y.shape[1] as usize;
+    let rank = down.shape[0] as usize;
+    ensure!(
+        down.shape[1] as usize == k
+            && up.shape == [u32::try_from(n)?, u32::try_from(rank)?]
+            && y.shape[0] as usize == rows
+            && rows <= ptrs.rows
+            && rank > 0
+            && rank <= ptrs.rank,
+        "low-rank shape"
+    );
+    let mid = unsafe {
+        Tensor::new(
+            ptrs.mid,
+            [u32::try_from(rows)?, u32::try_from(rank)?],
+            [u64::try_from(rank)?, 1],
+            u64::try_from(rows)?
+                .checked_mul(u64::try_from(rank)?)
+                .and_then(|elements| elements.checked_mul(2))
+                .context("low-rank scratch bytes")?,
+        )?
+    };
+    c.blas.linear_typed(
+        crate::op_contract::ExecutionPhase::Prefill,
+        crate::backend::cuda::linear::LinearWeightRef::Bf16(down),
+        x,
+        &mut TensorMut(mid),
+    )?;
+    c.blas.linear_typed(
+        crate::op_contract::ExecutionPhase::Prefill,
+        crate::backend::cuda::linear::LinearWeightRef::Bf16(up),
+        mid,
+        &mut TensorMut(y),
+    )
+}
+
 /// One MiniMax-H3 transformer or token refiner block over `x [rows, hidden]` in place, BF16. The `LORA` monomorph
 /// applies LoRA online at `c.lora_scale`; the other monomorph launches no LoRA GEMM. A modulated block's `rotary`
-/// is `[rows, 6 * rope_freq_dim]` from `rotary_table`.
+/// is `[rows, 6 * rope_freq_dim]` from `rotary_table`. A dropped block returns `x`.
 pub(crate) fn block_forward<const LORA: bool>(
     c: &BlockContext<'_>,
     flash: &mut Flash,
@@ -1205,6 +1774,9 @@ pub(crate) fn block_forward<const LORA: bool>(
         Conditioning::Plain => (0, pointer(&work.q, s), None),
     };
     ensure!(x.len() == rows * h, "block rows differ from the work rows");
+    if w.dropped {
+        return Ok(());
+    }
     let stride = 6 * h;
     let (table, index, entries) = match modulation {
         Some(m) => (
@@ -1298,13 +1870,9 @@ pub(crate) fn block_forward<const LORA: bool>(
         }
         Ok(())
     };
+    let scratch = stored_ptrs(s, work);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
-        blas.linear_typed(
-            crate::op_contract::ExecutionPhase::Prefill,
-            crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
-            x,
-            &mut TensorMut(y),
-        )
+        apply_linear(c, &w.linears[index], x, y, scratch)
     };
     hidden_norm(&w.norm1, 0, 1)?;
     for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
@@ -1414,7 +1982,7 @@ pub(crate) fn block_forward<const LORA: bool>(
     }
 
     hidden_norm(&w.norm2, 3, 4)?;
-    ffn_forward::<false, LORA>(c, w, work)?;
+    ffn_forward::<false, LORA>(c, w, work, scratch)?;
     if modulation.is_some() {
         gated_add(xp, normed, 5)?;
     } else {
@@ -1428,15 +1996,11 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     c: &BlockContext<'_>,
     w: &BlockWeights,
     work: &mut BlockWork,
+    scratch: Option<StoredPtrs>,
 ) -> Result<()> {
     let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
-        c.blas.linear_typed(
-            crate::op_contract::ExecutionPhase::Prefill,
-            crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
-            x,
-            &mut TensorMut(y),
-        )
+        apply_linear(c, &w.linears[index], x, y, scratch)
     };
     let chunk = work.chunk;
     for start in (0..rows).step_by(chunk) {
@@ -1976,9 +2540,199 @@ fn place_layers(
     }
 }
 
+type StoredOffsets = Vec<Vec<(String, usize)>>;
+
+/// HyperFlow transformer blocks. Dropped layers stay out of `DensePlacement` and come back as empty slots.
+/// A kept layer's device bytes equal its stored bytes. `packed` is `(name, byte offset)` in manifest order.
+fn place_stored_layers(
+    d: &Device,
+    base: &mut Source<'_>,
+    spec: &H3Spec,
+    sizing: &DenseSizing,
+    owned: usize,
+    placement: Placement,
+) -> Result<(
+    Option<crate::backend::cuda::weights::DenseStreaming>,
+    StoredOffsets,
+)> {
+    use crate::prefill::DensePlacement;
+    let dropped = spec
+        .dropped_blocks
+        .as_deref()
+        .context("HyperFlow dropped blocks")?;
+    let mut order = vec![Vec::new(); spec.layers];
+    let mut packed = vec![Vec::new(); spec.layers];
+    let mut cursor = vec![0usize; spec.layers];
+    for (name, entry) in &base.manifest.entries {
+        let Some(layer) = entry.layer else {
+            continue;
+        };
+        if !entry.load || entry.shape.len() != 2 {
+            continue;
+        }
+        let layer = layer as usize;
+        ensure!(
+            layer < spec.layers,
+            "stored linear {name} is outside {} layers",
+            spec.layers
+        );
+        let bytes = device_slot_bytes(name, entry)?;
+        ensure!(bytes == entry.bytes, "{name} is not pass-through");
+        ensure!(cursor[layer].is_multiple_of(16), "stored factor alignment");
+        match entry.dtype {
+            Dtype::BF16 | Dtype::I8 => {}
+            other => bail!("{name}: stored dtype {other:?}"),
+        }
+        packed[layer].push((name.clone(), cursor[layer]));
+        order[layer].push(name.clone());
+        cursor[layer] = cursor[layer]
+            .checked_add(entry.bytes)
+            .with_context(|| format!("{name} stored offset"))?;
+    }
+    for (layer, &bytes) in cursor.iter().enumerate() {
+        ensure!(
+            bytes == sizing.layers[layer] && bytes == sizing.source_layers[layer],
+            "block {layer} stored bytes"
+        );
+    }
+    let mut kept_device = Vec::new();
+    let mut kept_source = Vec::new();
+    let mut kept_index = Vec::new();
+    for layer in 0..spec.layers {
+        let (device, source) = (sizing.layers[layer], sizing.source_layers[layer]);
+        if dropped.contains(&layer) {
+            ensure!(
+                device == 0 && source == 0,
+                "dropped block {layer} stores a linear"
+            );
+            continue;
+        }
+        ensure!(device > 0, "block {layer} has no stored linear");
+        ensure!(
+            device == source,
+            "block {layer} device bytes differ from the stored bytes"
+        );
+        kept_device.push(device);
+        kept_source.push(source);
+        kept_index.push(layer);
+    }
+    ensure!(!kept_device.is_empty(), "no stored transformer block");
+    let (free, total) = d.ctx.mem_get_info()?;
+    let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+    if placement != Placement::Derived {
+        let slots = 2 * kept_device
+            .iter()
+            .copied()
+            .max()
+            .context("no stored transformer block")?;
+        ensure!(
+            slots <= device_budget,
+            "two block slots exceed the device budget"
+        );
+        device_budget = slots;
+    }
+    let probe = DensePlacement::new(&kept_device, Some(&kept_source), device_budget, 0)?;
+    let host_available = if probe.slot_bytes > 0 {
+        Some(usize::try_from(
+            crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+        )?)
+    } else {
+        None
+    };
+    let (compact, facts) = plan_dense_layers(
+        (&kept_device, &kept_source, sizing.largest, owned, 0),
+        placement,
+        (free, total, host_available),
+    )?;
+    ensure!(
+        compact.slots.len() == kept_index.len() && compact.host.len() == kept_index.len(),
+        "stored placement extent"
+    );
+    let mut slots = vec![None; spec.layers];
+    let mut host_flags = vec![false; spec.layers];
+    for (index, &layer) in kept_index.iter().enumerate() {
+        slots[layer] = compact.slots[index];
+        host_flags[layer] = compact.host[index];
+    }
+    let plan = DensePlacement {
+        slots,
+        host: host_flags,
+        slot_bytes: compact.slot_bytes,
+        resident_bytes: compact.resident_bytes,
+        host_bytes: compact.host_bytes,
+        disk_bytes: compact.disk_bytes,
+    };
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
+    );
+    let dense = if plan.slot_bytes > 0 {
+        let dir = base.reader.dir.clone();
+        let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
+            &dir,
+            base.manifest,
+            plan,
+            d,
+            Some(&order),
+        )?;
+        for (layer, names) in order.iter().enumerate() {
+            if !dense.plan.host[layer] {
+                continue;
+            }
+            let host = dense.host_layer(layer)?.with_context(|| {
+                format!("transformer_blocks.{layer}: host tier without a pinned copy")
+            })?;
+            ensure!(
+                host.len() == sizing.source_layers[layer],
+                "transformer_blocks.{layer}: pinned copy size"
+            );
+            let mut offset = 0usize;
+            for name in names {
+                let entry = base
+                    .manifest
+                    .entries
+                    .get(name)
+                    .with_context(|| format!("manifest lacks {name}"))?
+                    .clone();
+                ensure!(offset.is_multiple_of(16), "stored factor alignment");
+                let end = offset
+                    .checked_add(entry.bytes)
+                    .with_context(|| format!("{name} stored host offset"))?;
+                let dest = &mut host[offset..end];
+                match entry.dtype {
+                    Dtype::BF16 => base.reader.read_into(name, &entry, dest)?,
+                    Dtype::I8 => base.reader.read_raw(name, &entry, dest)?,
+                    other => bail!("{name}: stored dtype {other:?}"),
+                }
+                offset = end;
+            }
+            ensure!(
+                offset == host.len(),
+                "transformer_blocks.{layer}: pinned copy size"
+            );
+        }
+        Some(dense)
+    } else {
+        None
+    };
+    Ok((dense, packed))
+}
+
+fn forward_block<const LORA: bool>(
+    c: &BlockContext<'_>,
+    flash: &mut Flash,
+    weights: &BlockWeights,
+    conditioning: &Conditioning<'_>,
+    x: &mut CudaSlice<bf16>,
+    work: &mut BlockWork,
+) -> Result<()> {
+    block_forward::<LORA>(c, flash, weights, conditioning, x, work)
+}
+
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
 /// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
+/// A HyperFlow kept block loads its stored int8, low-rank, or dense factor. A dropped block is identity.
 pub(crate) struct Dit {
     ranges: Ranges,
     proj_in: [CudaSlice<f32>; 2],
@@ -2019,6 +2773,11 @@ impl Dit {
         mut lora: Source<'_>,
         placement: Placement,
     ) -> Result<Self> {
+        let hyperflow = spec.is_hyperflow()?;
+        ensure!(
+            !hyperflow || rank == 0,
+            "HyperFlow weights have no LoRA adapter"
+        );
         let s = &d.stream;
         let ranges = Ranges::of(layout)?;
         let (h, r) = (spec.hidden, rank);
@@ -2039,18 +2798,33 @@ impl Dit {
         ];
         let final_norm = base.tensor(s, "token_refiner.final_norm.weight", h)?;
         let norm_out = base.tensor(s, "norm_out.norm.weight", h)?;
-        let refiners = (0..spec.refiner_layers)
-            .map(|i| {
-                BlockWeights::resident::<true>(
-                    s,
-                    spec,
-                    r,
-                    &format!("token_refiner.refiner_blocks.{i}"),
-                    &mut base,
-                    &mut lora,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let refiners = if hyperflow {
+            (0..spec.refiner_layers)
+                .map(|i| {
+                    BlockWeights::resident::<false>(
+                        s,
+                        spec,
+                        r,
+                        &format!("token_refiner.refiner_blocks.{i}"),
+                        &mut base,
+                        &mut lora,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            (0..spec.refiner_layers)
+                .map(|i| {
+                    BlockWeights::resident::<true>(
+                        s,
+                        spec,
+                        r,
+                        &format!("token_refiner.refiner_blocks.{i}"),
+                        &mut base,
+                        &mut lora,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         blas.prepare_biased(
             u32::try_from(ranges.text)?,
             u32::try_from(h)?,
@@ -2059,9 +2833,14 @@ impl Dit {
             LinearBiasMode::BeforeOutputRound,
         )?;
         let mut work = BlockWork::new(s, spec, r, ranges.rows)?;
-        work.prepare::<true>(blas, spec)?;
         let text_work = BlockWork::new(s, spec, r, ranges.text)?;
-        text_work.prepare::<true>(blas, spec)?;
+        if hyperflow {
+            work.prepare::<false>(blas, spec)?;
+            text_work.prepare::<false>(blas, spec)?;
+        } else {
+            work.prepare::<true>(blas, spec)?;
+            text_work.prepare::<true>(blas, spec)?;
+        }
         let flash = Flash::new(
             s.clone(),
             ranges.rows,
@@ -2088,69 +2867,137 @@ impl Dit {
         let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
 
         let sizing = dense_sizing(base.manifest, spec.layers)?;
-        let owned = lora
-            .manifest
-            .entries
-            .iter()
-            .filter(|(name, _)| name.starts_with("transformer_blocks."))
-            .map(|(_, entry)| entry.bytes)
-            .sum::<usize>()
+        let lora_bytes = if hyperflow {
+            0
+        } else {
+            lora.manifest
+                .entries
+                .iter()
+                .filter(|(name, _)| name.starts_with("transformer_blocks."))
+                .map(|(_, entry)| entry.bytes)
+                .sum::<usize>()
+        };
+        let mut owned = lora_bytes
             + spec.layers * 2 * (2 * h + 2 * spec.head_dim)
             + sizing.staging
             + sizing.transient;
-        let dense = place_layers(
-            d,
-            &mut base,
-            (
-                &sizing.layers,
-                &sizing.source_layers,
-                sizing.largest,
-                owned,
-                0,
-            ),
-            placement,
-            |layer| format!("transformer_blocks.{layer}"),
-            &LINEAR_ROLES,
-        )?
-        .dense;
-        let mut blocks = Vec::with_capacity(spec.layers);
-        for (layer, &bytes) in sizing.layers.iter().enumerate() {
-            let name = format!("transformer_blocks.{layer}");
-            let slot = match &dense {
-                Some(dense) if dense.plan.slots[layer].is_some() => {
-                    Some(dense.pointer(layer, 0, bytes)?)
-                }
-                _ => None,
-            };
-            blocks.push(match slot {
-                Some(slot) => {
-                    BlockWeights::streamed::<true>(s, spec, r, &name, slot, &mut base, &mut lora)?
-                }
-                None => BlockWeights::resident::<true>(s, spec, r, &name, &mut base, &mut lora)?,
-            });
+        if hyperflow {
+            let wscale = base
+                .manifest
+                .entries
+                .iter()
+                .filter(|(name, entry)| {
+                    name.starts_with("transformer_blocks.")
+                        && name.ends_with(".wscale")
+                        && entry.load
+                })
+                .try_fold(0usize, |sum, (_, entry)| {
+                    sum.checked_add(entry.bytes)
+                        .context("HyperFlow wscale bytes")
+                })?;
+            owned = owned
+                .checked_add(wscale)
+                .context("HyperFlow wscale bytes")?;
         }
+        let (dense, blocks) = if hyperflow {
+            let (dense, packed) =
+                place_stored_layers(d, &mut base, spec, &sizing, owned, placement)?;
+            let dropped = spec
+                .dropped_blocks
+                .as_deref()
+                .context("HyperFlow dropped blocks")?;
+            let mut blocks = Vec::with_capacity(spec.layers);
+            for (layer, factors) in packed.iter().enumerate() {
+                if dropped.contains(&layer) {
+                    blocks.push(BlockWeights::identity(s, spec)?);
+                    continue;
+                }
+                let name = format!("transformer_blocks.{layer}");
+                let bytes = sizing.layers[layer];
+                let slot = match &dense {
+                    Some(streaming) if streaming.plan.slots[layer].is_some() => {
+                        Some((streaming.pointer(layer, 0, bytes)?, factors.as_slice()))
+                    }
+                    _ => None,
+                };
+                blocks.push(BlockWeights::stored(
+                    s, spec, &name, &mut base, &mut lora, slot,
+                )?);
+            }
+            (dense, blocks)
+        } else {
+            let dense = place_layers(
+                d,
+                &mut base,
+                (
+                    &sizing.layers,
+                    &sizing.source_layers,
+                    sizing.largest,
+                    owned,
+                    0,
+                ),
+                placement,
+                |layer| format!("transformer_blocks.{layer}"),
+                &LINEAR_ROLES,
+            )?
+            .dense;
+            let mut blocks = Vec::with_capacity(spec.layers);
+            for (layer, &bytes) in sizing.layers.iter().enumerate() {
+                let name = format!("transformer_blocks.{layer}");
+                let slot = match &dense {
+                    Some(streaming) if streaming.plan.slots[layer].is_some() => {
+                        Some(streaming.pointer(layer, 0, bytes)?)
+                    }
+                    _ => None,
+                };
+                blocks.push(match slot {
+                    Some(slot) => BlockWeights::streamed::<true>(
+                        s, spec, r, &name, slot, &mut base, &mut lora,
+                    )?,
+                    None => {
+                        BlockWeights::resident::<true>(s, spec, r, &name, &mut base, &mut lora)?
+                    }
+                });
+            }
+            (dense, blocks)
+        };
         let (free, total) = d.ctx.mem_get_info()?;
         let reserve = (total / 16)
             .checked_add(sizing.transient)
             .context("FFN live reserve overflow")?;
-        for (output, input) in [(r, h), (r, spec.ffn), (2 * spec.ffn, r), (h, r)] {
-            blas.bind_row_family(crate::backend::setup::LinearShape {
-                rows: FFN_CHUNK_ROWS,
-                output,
-                input,
-            })?;
+        if !hyperflow {
+            for (output, input) in [(r, h), (r, spec.ffn), (2 * spec.ffn, r), (h, r)] {
+                blas.bind_row_family(crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output,
+                    input,
+                })?;
+            }
         }
         let budget = d.workspace_budget(free, free, reserve)?;
-        let choices = work.ffn_choices::<true>(blas, spec, budget)?;
-        let owned = FfnPlan::select(&choices, budget)?;
-        let aliases = work.alias_choices::<true>(blas, spec, owned)?;
-        let chosen = FfnPlan::select(&aliases, budget)?;
+        let (choices, owned, chosen) = if hyperflow {
+            let choices = work.ffn_choices::<false>(blas, spec, budget)?;
+            let owned = FfnPlan::select(&choices, budget)?;
+            let aliases = work.alias_choices::<false>(blas, spec, owned)?;
+            let chosen = FfnPlan::select(&aliases, budget)?;
+            (choices, owned, chosen)
+        } else {
+            let choices = work.ffn_choices::<true>(blas, spec, budget)?;
+            let owned = FfnPlan::select(&choices, budget)?;
+            let aliases = work.alias_choices::<true>(blas, spec, owned)?;
+            let chosen = FfnPlan::select(&aliases, budget)?;
+            (choices, owned, chosen)
+        };
         let previous = *choices
             .iter()
             .find(|p| p.chunk == work.chunk)
             .context("main FFN baseline missing")?;
         if work.rows > FFN_CHUNK_ROWS {
-            work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
+            if hyperflow {
+                work.ffn_cost::<false>(blas, spec, work.chunk, true)?;
+            } else {
+                work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
+            }
         }
         let description = |plan: FfnPlan| {
             serde_json::json!({
@@ -2176,7 +3023,11 @@ impl Dit {
             );
         }
         blas.bind_workspace(chosen.workspace)?;
-        work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
+        if hyperflow {
+            work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
+        } else {
+            work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
+        }
         s.synchronize()?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
@@ -2404,14 +3255,25 @@ impl Dit {
             LinearBiasMode::BeforeOutputRound,
         )?;
         for refiner in &self.refiners {
-            block_forward::<true>(
-                c,
-                &mut self.text_flash,
-                refiner,
-                &Conditioning::Plain,
-                &mut self.text,
-                &mut self.text_work,
-            )?;
+            if spec.is_hyperflow()? {
+                forward_block::<false>(
+                    c,
+                    &mut self.text_flash,
+                    refiner,
+                    &Conditioning::Plain,
+                    &mut self.text,
+                    &mut self.text_work,
+                )?;
+            } else {
+                forward_block::<true>(
+                    c,
+                    &mut self.text_flash,
+                    refiner,
+                    &Conditioning::Plain,
+                    &mut self.text,
+                    &mut self.text_work,
+                )?;
+            }
         }
         c.kernels.rms_norm(
             s,
@@ -2425,6 +3287,12 @@ impl Dit {
                 eps: spec.final_norm_eps,
             },
         )?;
+        // `[text, hidden]` refiner rows. The block stack then writes `x`.
+        #[cfg(test)]
+        {
+            let count = r.text * h;
+            s.memcpy_dtod(&self.x.slice(..count), &mut self.text.slice_mut(..count))?;
+        }
         self.projection(
             c,
             &self.proj_in,
@@ -2460,17 +3328,31 @@ impl Dit {
                 entries: pairs,
                 index: inputs.row_pairs,
             };
-            block_forward::<true>(
-                c,
-                &mut self.flash,
-                block,
-                &Conditioning::Modulated {
-                    rotary: &self.rotary,
-                    modulation: &modulation,
-                },
-                &mut self.x,
-                &mut self.work,
-            )?;
+            if spec.is_hyperflow()? {
+                forward_block::<false>(
+                    c,
+                    &mut self.flash,
+                    block,
+                    &Conditioning::Modulated {
+                        rotary: &self.rotary,
+                        modulation: &modulation,
+                    },
+                    &mut self.x,
+                    &mut self.work,
+                )?;
+            } else {
+                forward_block::<true>(
+                    c,
+                    &mut self.flash,
+                    block,
+                    &Conditioning::Modulated {
+                        rotary: &self.rotary,
+                        modulation: &modulation,
+                    },
+                    &mut self.x,
+                    &mut self.work,
+                )?;
+            }
             if let Some(dense) = self.dense.as_mut() {
                 dense.end(layer, s)?;
             }
@@ -2545,6 +3427,10 @@ fn image_block_spec(spec: &ImageSpec) -> H3Spec {
         norm_eps: spec.norm_eps,
         qk_norm_eps: spec.qk_norm_eps,
         final_norm_eps: spec.final_norm_eps,
+        hyperflow_gate: None,
+        dropped_blocks: None,
+        lowrank_ranks: None,
+        int8_convrot: None,
     }
 }
 
@@ -3635,7 +4521,7 @@ pub(crate) fn image_sample_trace(
     let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
         .minimax_h3_image_manifest(&image)?;
     let plan = image_row_plan(layout, &schedule)?;
-    let adaln = AdalnPlan::from_tags(&layout.token_tags, &plan);
+    let adaln = AdalnPlan::from_tags(&layout.token_tags, &plan)?;
     let device = Device::new(device)?;
     let ops = ops::Ops::new(&device.ctx)?;
     device.finish_upload()?;
@@ -3763,15 +4649,15 @@ mod tests {
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::checkpoint::MappedCheckpoint;
     use crate::minimax_h3::{
-        Geometry, IMAGE_MIN_GENERATION_AREA, ImageLayout, ImageSchedule, ImageSpec,
+        AUDIO_TAG, Geometry, IMAGE_MIN_GENERATION_AREA, ImageLayout, ImageSchedule, ImageSpec,
         KEYFRAME_NOISE_AUG, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, TEXT_TAG,
-        image_canvas, image_latent_extent, image_layout, image_reference_latent_extent,
-        image_vae_reference_size, noise_draws, patchify_latents, rotary_rows, row_timestep_plan,
-        unpatchify_latents,
+        VIDEO_TAG, hyperflow_steps, image_canvas, image_latent_extent, image_layout,
+        image_reference_latent_extent, image_vae_reference_size, noise_draws, patchify_latents,
+        rotary_rows, row_timestep_plan, unpatchify_latents,
     };
     use anyhow::bail;
     use safetensors::SafeTensors;
-    use std::{fs, rc::Rc};
+    use std::{collections::BTreeMap, fs, rc::Rc};
 
     /// Initial chunks avoid skinny tails; selection counts scratch and workspace replacements.
     #[test]
@@ -4422,7 +5308,7 @@ mod tests {
         let layout = capture_layout(&spec, &capture)?;
         let plan: Vec<RowTimesteps> =
             row_timestep_plan(&layout, &Schedule::new(9, 6.0)?, &Schedule::new(9, 3.0)?)?;
-        let adaln = AdalnPlan::build(&layout, &plan);
+        let adaln = AdalnPlan::build(&layout, &plan)?;
 
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -5229,9 +6115,9 @@ mod tests {
                             )?;
                         }
                     } else if shifted {
-                        ffn_forward::<true, true>(&context, &weights[0], work)?;
+                        ffn_forward::<true, true>(&context, &weights[0], work, None)?;
                     } else {
-                        ffn_forward::<false, true>(&context, &weights[0], work)?;
+                        ffn_forward::<false, true>(&context, &weights[0], work, None)?;
                     }
                     Ok(())
                 };
@@ -6084,6 +6970,7 @@ mod tests {
             .collect();
         let plan = AdalnPlan {
             timesteps: timesteps.clone(),
+            endpoints: Vec::new(),
             pairs: pairs.clone(),
             row_pairs: Vec::new(),
             row_timesteps: Vec::new(),
@@ -6189,7 +7076,7 @@ mod tests {
             MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
         let layout = capture_layout(&spec, &capture)?;
         let plan = row_timestep_plan(&layout, &Schedule::new(9, 6.0)?, &Schedule::new(9, 3.0)?)?;
-        let adaln_plan = AdalnPlan::build(&layout, &plan);
+        let adaln_plan = AdalnPlan::build(&layout, &plan)?;
         let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
         let replay = SafeTensors::deserialize(&replay_map)?;
         let steps = std::env::var("FF_H3_STEPS")
@@ -6414,7 +7301,7 @@ mod tests {
         let video_grid = Schedule::new(9, 6.0)?;
         let audio_grid = Schedule::new(9, 3.0)?;
         let plan = row_timestep_plan(&layout, &video_grid, &audio_grid)?;
-        let adaln_plan = AdalnPlan::build(&layout, &plan);
+        let adaln_plan = AdalnPlan::build(&layout, &plan)?;
         let read = |file: &str, name: &str| -> Result<(Vec<f64>, Vec<usize>)> {
             let map = mapped(&capture.join(file))?;
             decoded(&SafeTensors::deserialize(&map)?, name)
@@ -8681,11 +9568,11 @@ mod tests {
         let t2i_plan = AdalnPlan::from_tags(
             &t2i_layout.token_tags,
             &image_row_plan(&t2i_layout, &schedule)?,
-        );
+        )?;
         let edit_plan = AdalnPlan::from_tags(
             &edit_layout.token_tags,
             &image_row_plan(&edit_layout, &schedule)?,
-        );
+        )?;
         ensure!(
             t2i_plan.row_pairs.len() == 6 && edit_plan.row_pairs.len() == 6,
             "evaluation count"
@@ -9081,7 +9968,7 @@ mod tests {
         );
         let schedule = ImageSchedule::published()?;
         let row_plan =
-            AdalnPlan::from_tags(&layout.token_tags, &image_row_plan(&layout, &schedule)?);
+            AdalnPlan::from_tags(&layout.token_tags, &image_row_plan(&layout, &schedule)?)?;
         ensure!(row_plan.row_pairs.len() == 6, "evaluation count");
         let dir = model.join("transformer_diffusers");
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
@@ -10153,5 +11040,1412 @@ mod tests {
         );
         println!("H3_IMAGE_E2E_GATE PASS cells=a,b,e e_t2i={t2i_decision} e_edit={edit_decision}");
         Ok(())
+    }
+
+    /// Removes the BLAS runtime directory when the block-cell gate returns.
+    struct BlockRuntime(PathBuf);
+
+    impl Drop for BlockRuntime {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn env_dir(key: &str) -> Result<PathBuf> {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .with_context(|| format!("{key} missing"))
+    }
+
+    fn read_exact(path: &Path, bytes: usize) -> Result<Vec<u8>> {
+        let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        ensure!(
+            data.len() == bytes,
+            "{} is {} bytes, expected {bytes}",
+            path.display(),
+            data.len()
+        );
+        Ok(data)
+    }
+
+    fn read_bf16(path: &Path, elements: usize) -> Result<Vec<bf16>> {
+        let data = read_exact(path, elements * 2)?;
+        Ok(data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect())
+    }
+
+    fn read_f32(path: &Path, elements: usize) -> Result<Vec<f32>> {
+        let data = read_exact(path, elements * 4)?;
+        Ok(data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+
+    fn read_u32(path: &Path, elements: usize) -> Result<Vec<u32>> {
+        let data = read_exact(path, elements * 4)?;
+        Ok(data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect())
+    }
+
+    /// `(max_abs, rmse)` in f64. Reference pairs were measured in f32; these taus are that measurement.
+    fn max_rmse(candidate: &[f64], reference: &[f64]) -> Result<(f64, f64)> {
+        ensure!(
+            !candidate.is_empty() && candidate.len() == reference.len(),
+            "metric extent {} {}",
+            candidate.len(),
+            reference.len()
+        );
+        let mut max_abs = 0f64;
+        let mut square = 0f64;
+        for (&left, &right) in candidate.iter().zip(reference) {
+            ensure!(
+                left.is_finite() && right.is_finite(),
+                "non-finite metric input"
+            );
+            let delta = (left - right).abs();
+            max_abs = max_abs.max(delta);
+            square += delta * delta;
+        }
+        Ok((max_abs, (square / candidate.len() as f64).sqrt()))
+    }
+
+    fn f64_of_bf16(values: &[bf16]) -> Vec<f64> {
+        values.iter().map(|v| f64::from(v.to_f32())).collect()
+    }
+
+    fn f64_of_f32(values: &[f32]) -> Vec<f64> {
+        values.iter().copied().map(f64::from).collect()
+    }
+
+    /// Pair 0 rewritten to pair 2. Tag stays in `index % 3`.
+    fn swap_video_pair(index: &[u32]) -> Vec<u32> {
+        index
+            .iter()
+            .map(|&value| {
+                let pair = value / MODALITIES;
+                let tag = value % MODALITIES;
+                let pair = if pair == 0 { 2 } else { pair };
+                pair * MODALITIES + tag
+            })
+            .collect()
+    }
+
+    fn pair_columns(meta: &serde_json::Value) -> Result<(Vec<f32>, Vec<f32>)> {
+        let pairs = meta["pair_values"]
+            .as_array()
+            .context("reference pair_values")?;
+        let mut timesteps = Vec::with_capacity(pairs.len());
+        let mut endpoints = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            let row = pair.as_array().context("reference pair")?;
+            ensure!(row.len() == 2, "reference pair width");
+            let t = row[0].as_f64().context("reference pair t")? as f32;
+            let r = row[1].as_f64().context("reference pair r")? as f32;
+            ensure!(
+                t.is_finite() && r.is_finite(),
+                "reference pair is not finite"
+            );
+            timesteps.push(t);
+            endpoints.push(r);
+        }
+        ensure!(!timesteps.is_empty(), "reference pairs are empty");
+        Ok((timesteps, endpoints))
+    }
+
+    fn time_embedder(
+        source: &mut Source<'_>,
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        prefix: &str,
+    ) -> Result<AdalnTimeEmbedder> {
+        Ok(AdalnTimeEmbedder {
+            linear_1_weight: source.host_f32(
+                s,
+                &format!("{prefix}.linear_1.weight"),
+                spec.time_hidden * spec.freq_dim,
+            )?,
+            linear_1_bias: source.host_f32(
+                s,
+                &format!("{prefix}.linear_1.bias"),
+                spec.time_hidden,
+            )?,
+            linear_2_weight: source.host_f32(
+                s,
+                &format!("{prefix}.linear_2.weight"),
+                spec.time_dim * spec.time_hidden,
+            )?,
+            linear_2_bias: source.host_f32(s, &format!("{prefix}.linear_2.bias"), spec.time_dim)?,
+        })
+    }
+
+    /// max-abs, RMSE. `max(2 × worst pair, eps)` from floor-cpu, 4090-a, 4090-b, a4000-a, a4000-b on 2026-11-12.
+    const BLOCK0_TAU: (f64, f64) = (1024.0, 5.925411224365234);
+    const BLOCK1_TAU: (f64, f64) = (256.0, 3.944915533065796);
+    const BLOCK6_TAU: (f64, f64) = (1e-6, 1e-7);
+    const TEMB_TAU: (f64, f64) = (0.00738525390625, 0.0026896463241428137);
+    /// 1000 rows. Remainders 8, 40 and 232 against tiles 16, 64 and 256.
+    const RAGGED_ROWS: usize = 1000;
+    /// max(2 × worst pair, eps). Worst pair is floor-cpu versus either GPU: max-abs 768, RMSE 2.6518330574035645.
+    const RAGGED_BLOCK0_TAU: (f64, f64) = (1536.0, 5.303666114807129);
+    /// Worst max-abs is 256. Worst RMSE is 4090 versus A4000, 1.9843404293060303.
+    const RAGGED_BLOCK1_TAU: (f64, f64) = (512.0, 3.9686808586120605);
+
+    fn record_cell(
+        arm: &str,
+        cell: &'static str,
+        got: (f64, f64),
+        tau: (f64, f64),
+        defects: &mut Vec<&'static str>,
+    ) {
+        let pass = got.0 <= tau.0 && got.1 <= tau.1;
+        println!(
+            "HYPERFLOW_BLOCK arm={arm} cell={cell} max_abs={:.16e} rmse={:.16e} tau_abs={:.16e} tau_rmse={:.16e} {}",
+            got.0,
+            got.1,
+            tau.0,
+            tau.1,
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        if !pass {
+            defects.push(cell);
+        }
+    }
+
+    fn record_control(name: &str, got: (f64, f64), tau: (f64, f64), failed: &mut Vec<String>) {
+        let abs_ratio = got.0 / tau.0;
+        let rmse_ratio = got.1 / tau.1;
+        let pass = abs_ratio > 10.0 && rmse_ratio > 10.0;
+        println!(
+            "HYPERFLOW_BLOCK control={name} max_abs={:.16e} rmse={:.16e} ratio_abs={abs_ratio:.6} ratio_rmse={rmse_ratio:.6} {}",
+            got.0,
+            got.1,
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            failed.push(name.to_owned());
+        }
+    }
+
+    /// INT8 block 0, low-rank block 1, dropped block 6, the pre-SiLU f32 temb mix, and blocks 0 and 1 at 1000 rows.
+    #[test]
+    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_BLOCK_REF, FF_HYPERFLOW_BLOCK_REF_RAGGED"]
+    fn hyperflow_block_cells_match_the_definition() -> Result<()> {
+        let model = env_dir("FF_HYPERFLOW_MODEL")?;
+        let reference = env_dir("FF_HYPERFLOW_BLOCK_REF")?;
+        let arm = reference
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("reference arm name")?
+            .to_owned();
+        let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+            model.join("config.json"),
+        )?)?)?;
+        ensure!(spec.is_hyperflow()?, "transformer config is not HyperFlow");
+        ensure!(
+            matches!(
+                spec.linear_storage("transformer_blocks.0.attn.to_q")?,
+                LinearStorage::Int8 { .. }
+            ),
+            "block 0 to_q is not int8"
+        );
+        ensure!(
+            matches!(
+                spec.linear_storage("transformer_blocks.1.attn.to_q")?,
+                LinearStorage::LowRank { .. }
+            ),
+            "block 1 to_q is not low-rank"
+        );
+        let dropped = spec.dropped_blocks.as_deref().context("dropped blocks")?;
+        ensure!(
+            dropped.contains(&6) && !dropped.contains(&0) && !dropped.contains(&1),
+            "blocks 0, 1 and 6 roles {dropped:?}"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(reference.join("meta.json"))?)?;
+        ensure!(
+            meta["candidate_run"].as_bool() == Some(false),
+            "reference arm is marked as a candidate run"
+        );
+        ensure!(meta["rows"].as_u64() == Some(20), "reference rows");
+        let rows = 20usize;
+        let hidden_count = rows * spec.hidden;
+        let hidden = read_bf16(&reference.join("hidden.i16"), hidden_count)?;
+        let positions = read_f32(&reference.join("positions.f32"), rows * 3)?;
+        let adaln = read_u32(&reference.join("adaln.i32"), rows)?;
+        let (timesteps, endpoints) = pair_columns(&meta)?;
+        let entries = u32::try_from(timesteps.len())? * MODALITIES;
+        ensure!(
+            adaln.iter().all(|&index| index < entries),
+            "adaln index is outside {entries} rows"
+        );
+        let temb_ref = read_f32(&reference.join("temb.f32"), timesteps.len() * spec.time_dim)?;
+        let block_ref =
+            |block: usize| read_bf16(&reference.join(format!("block{block}.i16")), hidden_count);
+        let block0_ref = block_ref(0)?;
+        let block1_ref = block_ref(1)?;
+        let block6_ref = block_ref(6)?;
+        ensure!(
+            block6_ref
+                .iter()
+                .zip(&hidden)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "dropped reference is not the input"
+        );
+        let control0 = read_bf16(&reference.join("control0.i16"), hidden_count)?;
+        let control1 = read_bf16(&reference.join("control1.i16"), hidden_count)?;
+        let mut control_fail = Vec::new();
+        record_control(
+            "reference-block0",
+            max_rmse(&f64_of_bf16(&control0), &f64_of_bf16(&block0_ref))?,
+            BLOCK0_TAU,
+            &mut control_fail,
+        );
+        record_control(
+            "reference-block1",
+            max_rmse(&f64_of_bf16(&control1), &f64_of_bf16(&block1_ref))?,
+            BLOCK1_TAU,
+            &mut control_fail,
+        );
+        let mutant: Vec<bf16> = hidden
+            .iter()
+            .map(|v| bf16::from_f32(v.to_f32() + v.to_f32()))
+            .collect();
+        record_control(
+            "reference-block6-mutant",
+            max_rmse(&f64_of_bf16(&mutant), &f64_of_bf16(&block6_ref))?,
+            BLOCK6_TAU,
+            &mut control_fail,
+        );
+        let temb_swapped = read_f32(
+            &reference.join("temb_swapped.f32"),
+            timesteps.len() * spec.time_dim,
+        )?;
+        record_control(
+            "reference-temb-swapped",
+            max_rmse(&f64_of_f32(&temb_swapped), &f64_of_f32(&temb_ref))?,
+            TEMB_TAU,
+            &mut control_fail,
+        );
+        let ragged = env_dir("FF_HYPERFLOW_BLOCK_REF_RAGGED")?;
+        let ragged_meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(ragged.join("meta.json"))?)?;
+        ensure!(
+            ragged_meta["candidate_run"].as_bool() == Some(false),
+            "ragged reference arm is marked as a candidate run"
+        );
+        ensure!(
+            ragged_meta["rows"].as_u64() == Some(u64::try_from(RAGGED_ROWS)?),
+            "ragged reference rows"
+        );
+        let (ragged_steps, ragged_ends) = pair_columns(&ragged_meta)?;
+        ensure!(
+            ragged_steps == timesteps && ragged_ends == endpoints,
+            "ragged pairs differ from the 20-row arm"
+        );
+        let ragged_count = RAGGED_ROWS * spec.hidden;
+        let ragged_hidden = read_bf16(&ragged.join("hidden.i16"), ragged_count)?;
+        let ragged_positions = read_f32(&ragged.join("positions.f32"), RAGGED_ROWS * 3)?;
+        let ragged_adaln = read_u32(&ragged.join("adaln.i32"), RAGGED_ROWS)?;
+        ensure!(
+            ragged_adaln.iter().all(|&index| index < entries),
+            "ragged adaln index is outside {entries} rows"
+        );
+        let ragged_block0 = read_bf16(&ragged.join("block0.i16"), ragged_count)?;
+        let ragged_block1 = read_bf16(&ragged.join("block1.i16"), ragged_count)?;
+        let ragged_control0 = read_bf16(&ragged.join("control0.i16"), ragged_count)?;
+        let ragged_control1 = read_bf16(&ragged.join("control1.i16"), ragged_count)?;
+        record_control(
+            "reference-ragged-block0",
+            max_rmse(&f64_of_bf16(&ragged_control0), &f64_of_bf16(&ragged_block0))?,
+            RAGGED_BLOCK0_TAU,
+            &mut control_fail,
+        );
+        record_control(
+            "reference-ragged-block1",
+            max_rmse(&f64_of_bf16(&ragged_control1), &f64_of_bf16(&ragged_block1))?,
+            RAGGED_BLOCK1_TAU,
+            &mut control_fail,
+        );
+        ensure!(
+            control_fail.is_empty(),
+            "reference control stayed within 10x tau: {control_fail:?}"
+        );
+
+        let manifest = MappedCheckpoint::open_component(&model, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-hyperflow-block-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let _runtime = BlockRuntime(runtime.clone());
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "HyperFlow block cells".into())),
+        )?;
+        let mut source = Source::new(&model, &manifest);
+        let current = time_embedder(&mut source, s, &spec, "time_embedder")?;
+        let endpoint = time_embedder(&mut source, s, &spec, "endpoint_time_embedder")?;
+        let gate = spec.hyperflow_gate.context("HyperFlow gate")?;
+        let temb = crate::minimax_h3::mixed_temb(
+            &spec, &current, &endpoint, &timesteps, &endpoints, gate,
+        )?;
+        ensure!(
+            temb.len() == temb_ref.len() && temb.iter().all(|v| v.is_finite()),
+            "temb extent or a non-finite lane"
+        );
+        let mut defects = Vec::new();
+        record_cell(
+            &arm,
+            "temb",
+            max_rmse(&f64_of_f32(&temb), &f64_of_f32(&temb_ref))?,
+            TEMB_TAU,
+            &mut defects,
+        );
+        let swapped_temb = crate::minimax_h3::mixed_temb(
+            &spec, &current, &endpoint, &endpoints, &timesteps, gate,
+        )?;
+        ensure!(
+            swapped_temb.len() == temb_ref.len() && swapped_temb.iter().all(|v| v.is_finite()),
+            "swapped temb extent or a non-finite lane"
+        );
+        record_control(
+            "candidate-temb-swapped",
+            max_rmse(&f64_of_f32(&swapped_temb), &f64_of_f32(&temb_ref))?,
+            TEMB_TAU,
+            &mut control_fail,
+        );
+        let x_host = mixed_adaln_input(&spec, &current, &endpoint, &timesteps, &endpoints, gate)?;
+        ensure!(
+            x_host.len() == timesteps.len() * spec.time_dim,
+            "adaln input extent"
+        );
+        let coords: Vec<[f64; 3]> = positions
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|row| [f64::from(row[0]), f64::from(row[1]), f64::from(row[2])])
+            .collect();
+        ensure!(coords.len() == rows, "position rows");
+        let rotary_host = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &coords);
+        ensure!(
+            rotary_host.len() == rows * 6 * spec.rope_freq_dim,
+            "rotary length {}",
+            rotary_host.len()
+        );
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let mut work = BlockWork::new(s, &spec, 0, rows)?;
+        work.prepare::<false>(&blas, &spec)?;
+        let modulation_width = 6 * spec.hidden * MODALITIES as usize;
+        let mut weight = s.alloc_zeros::<bf16>(modulation_width * spec.time_dim)?;
+        let mut bias = s.alloc_zeros::<bf16>(modulation_width)?;
+        let projected = s.alloc_zeros::<bf16>(timesteps.len() * modulation_width)?;
+        let mode = LinearBiasMode::BeforeOutputRound;
+        blas.prepare_biased(
+            u32::try_from(timesteps.len())?,
+            u32::try_from(modulation_width)?,
+            u32::try_from(spec.time_dim)?,
+            vector(&bias, s)?,
+            mode,
+        )?;
+        let x = s.clone_htod(&x_host)?;
+        let rotary = s.clone_htod(&rotary_host)?;
+        let index = s.clone_htod(&adaln)?;
+        let swapped = s.clone_htod(&swap_video_pair(&adaln))?;
+        for (block, tau, reference_out) in [
+            (0usize, BLOCK0_TAU, block0_ref),
+            (1, BLOCK1_TAU, block1_ref),
+        ] {
+            let mut lora = Source::new(&model, &manifest);
+            let weights = BlockWeights::stored(
+                s,
+                &spec,
+                &format!("transformer_blocks.{block}"),
+                &mut source,
+                &mut lora,
+                None,
+            )?;
+            let name = format!("transformer_blocks.{block}.adaln_proj.linear");
+            for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
+                source.fill(s, &format!("{name}.{suffix}"), &mut buffer.slice_mut(..))?;
+            }
+            blas.linear_biased(
+                matrix(&weight, s, modulation_width, spec.time_dim)?,
+                vector(&bias, s)?,
+                matrix(&x, s, timesteps.len(), spec.time_dim)?,
+                &mut TensorMut(matrix(&projected, s, timesteps.len(), modulation_width)?),
+                mode,
+            )?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: 0.0,
+            };
+            let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
+                let mut row = s.clone_htod(&hidden)?;
+                let modulation = Modulation {
+                    table: &projected,
+                    offset: 0,
+                    entries,
+                    index,
+                };
+                block_forward::<false>(
+                    &context,
+                    &mut flash,
+                    &weights,
+                    &Conditioning::Modulated {
+                        rotary: &rotary,
+                        modulation: &modulation,
+                    },
+                    &mut row,
+                    &mut work,
+                )?;
+                let host = s.clone_dtoh(&row)?;
+                ensure!(
+                    host.len() == hidden.len() && host.iter().all(|v| v.to_f32().is_finite()),
+                    "block {block} output extent or a non-finite value"
+                );
+                Ok(host.into_iter().map(|v| f64::from(v.to_f32())).collect())
+            };
+            let output = launch(&index)?;
+            record_cell(
+                &arm,
+                if block == 0 { "block0" } else { "block1" },
+                max_rmse(&output, &f64_of_bf16(&reference_out))?,
+                tau,
+                &mut defects,
+            );
+            let swapped_out = launch(&swapped)?;
+            record_control(
+                &format!("candidate-block{block}"),
+                max_rmse(&swapped_out, &output)?,
+                tau,
+                &mut control_fail,
+            );
+        }
+        let identity = BlockWeights::identity(s, &spec)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+        let mut row = s.clone_htod(&hidden)?;
+        let modulation = Modulation {
+            table: &projected,
+            offset: 0,
+            entries,
+            index: &index,
+        };
+        block_forward::<false>(
+            &context,
+            &mut flash,
+            &identity,
+            &Conditioning::Modulated {
+                rotary: &rotary,
+                modulation: &modulation,
+            },
+            &mut row,
+            &mut work,
+        )?;
+        let dropped_out = s.clone_dtoh(&row)?;
+        ensure!(
+            dropped_out.len() == hidden.len() && dropped_out.iter().all(|v| v.to_f32().is_finite()),
+            "dropped block output extent or a non-finite value"
+        );
+        record_cell(
+            &arm,
+            "block6",
+            max_rmse(
+                &dropped_out
+                    .iter()
+                    .map(|v| f64::from(v.to_f32()))
+                    .collect::<Vec<_>>(),
+                &f64_of_bf16(&block6_ref),
+            )?,
+            BLOCK6_TAU,
+            &mut defects,
+        );
+        drop(flash);
+        drop(work);
+        let ragged_coords: Vec<[f64; 3]> = ragged_positions
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|row| [f64::from(row[0]), f64::from(row[1]), f64::from(row[2])])
+            .collect();
+        ensure!(ragged_coords.len() == RAGGED_ROWS, "ragged position rows");
+        let ragged_rotary_host = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &ragged_coords);
+        ensure!(
+            ragged_rotary_host.len() == RAGGED_ROWS * 6 * spec.rope_freq_dim,
+            "ragged rotary length {}",
+            ragged_rotary_host.len()
+        );
+        let mut flash = Flash::new(
+            s.clone(),
+            RAGGED_ROWS,
+            spec.heads,
+            spec.heads,
+            spec.head_dim,
+        )?
+        .with_full_single_probability()?;
+        let mut work = BlockWork::new(s, &spec, 0, RAGGED_ROWS)?;
+        work.prepare::<false>(&blas, &spec)?;
+        let ragged_rotary = s.clone_htod(&ragged_rotary_host)?;
+        let ragged_index = s.clone_htod(&ragged_adaln)?;
+        let ragged_swapped = s.clone_htod(&swap_video_pair(&ragged_adaln))?;
+        for (block, tau, reference_out) in [
+            (0usize, RAGGED_BLOCK0_TAU, ragged_block0),
+            (1, RAGGED_BLOCK1_TAU, ragged_block1),
+        ] {
+            let mut lora = Source::new(&model, &manifest);
+            let weights = BlockWeights::stored(
+                s,
+                &spec,
+                &format!("transformer_blocks.{block}"),
+                &mut source,
+                &mut lora,
+                None,
+            )?;
+            let name = format!("transformer_blocks.{block}.adaln_proj.linear");
+            for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
+                source.fill(s, &format!("{name}.{suffix}"), &mut buffer.slice_mut(..))?;
+            }
+            blas.linear_biased(
+                matrix(&weight, s, modulation_width, spec.time_dim)?,
+                vector(&bias, s)?,
+                matrix(&x, s, timesteps.len(), spec.time_dim)?,
+                &mut TensorMut(matrix(&projected, s, timesteps.len(), modulation_width)?),
+                mode,
+            )?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: 0.0,
+            };
+            let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
+                let mut row = s.clone_htod(&ragged_hidden)?;
+                let modulation = Modulation {
+                    table: &projected,
+                    offset: 0,
+                    entries,
+                    index,
+                };
+                block_forward::<false>(
+                    &context,
+                    &mut flash,
+                    &weights,
+                    &Conditioning::Modulated {
+                        rotary: &ragged_rotary,
+                        modulation: &modulation,
+                    },
+                    &mut row,
+                    &mut work,
+                )?;
+                let host = s.clone_dtoh(&row)?;
+                ensure!(
+                    host.len() == ragged_hidden.len()
+                        && host.iter().all(|v| v.to_f32().is_finite()),
+                    "ragged block {block} output extent or a non-finite value"
+                );
+                Ok(host.into_iter().map(|v| f64::from(v.to_f32())).collect())
+            };
+            let output = launch(&ragged_index)?;
+            record_cell(
+                &arm,
+                if block == 0 {
+                    "ragged-block0"
+                } else {
+                    "ragged-block1"
+                },
+                max_rmse(&output, &f64_of_bf16(&reference_out))?,
+                tau,
+                &mut defects,
+            );
+            let swapped_out = launch(&ragged_swapped)?;
+            record_control(
+                &format!("candidate-ragged-block{block}"),
+                max_rmse(&swapped_out, &output)?,
+                tau,
+                &mut control_fail,
+            );
+        }
+        ensure!(
+            control_fail.is_empty(),
+            "control stayed within 10x tau: {control_fail:?}"
+        );
+        if defects.is_empty() {
+            println!("HYPERFLOW_BLOCK_GATE PASS cells=6 controls=FAIL_AS_REQUIRED");
+        } else {
+            println!("HYPERFLOW_BLOCK_GATE DEFECT cells={defects:?} controls=FAIL_AS_REQUIRED");
+        }
+        Ok(())
+    }
+
+    /// 6-step raw table cast f64 to f32, then `shift * base / ((shift - 1) * base + 1)` in f32.
+    fn step_grid(shift: f32) -> Schedule {
+        let raw = [
+            1.0f64, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0,
+        ];
+        let sigmas: Vec<f32> = raw
+            .iter()
+            .map(|&base| {
+                let base = base as f32;
+                shift * base / ((shift - 1.0) * base + 1.0)
+            })
+            .collect();
+        let timesteps = sigmas[..sigmas.len() - 1]
+            .iter()
+            .map(|sigma| 1.0 - sigma)
+            .collect();
+        Schedule { sigmas, timesteps }
+    }
+
+    fn assert_step_grids(video: &Schedule, audio: &Schedule) -> Result<()> {
+        let flow = hyperflow_steps(6)?;
+        ensure!(
+            flow.len() == 6 && video.sigmas.len() == 7 && audio.sigmas.len() == 7,
+            "step grid extent"
+        );
+        for (k, step) in flow.iter().enumerate() {
+            ensure!(
+                video.timesteps[k].to_bits() == step.video_t.to_bits()
+                    && (1.0 - video.sigmas[k + 1]).to_bits() == step.video_r.to_bits(),
+                "video grid step {k} differs from hyperflow_steps"
+            );
+            ensure!(
+                audio.timesteps[k].to_bits() == step.audio_t.to_bits()
+                    && (1.0 - audio.sigmas[k + 1]).to_bits() == step.audio_r.to_bits(),
+                "audio grid step {k} differs from hyperflow_steps"
+            );
+            ensure!(
+                video.sigmas[k] != 0.0 && audio.sigmas[k] != 0.0,
+                "evaluation sigma {k} is zero"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hyperflow_step_grid_matches_hyperflow_steps() -> Result<()> {
+        assert_step_grids(&step_grid(12.0), &step_grid(3.0))
+    }
+
+    const STEP_TEXT: usize = 7;
+    const STEP_KEY: usize = 17;
+    const STEP_AUDIO: usize = 40;
+    const STEP_GENERATED: usize = 936;
+    const STEP_VIDEO: usize = STEP_KEY + STEP_GENERATED;
+    const STEP_ROWS: usize = STEP_TEXT + STEP_KEY + STEP_AUDIO + STEP_GENERATED;
+    const STEP_VIDEO_WIDTH: usize = 96;
+    const STEP_AUDIO_WIDTH: usize = 32;
+
+    fn step_layout() -> PackedLayout {
+        let audio_start = STEP_TEXT + STEP_KEY;
+        let video_start = audio_start + STEP_AUDIO;
+        let mut position_ids = vec![[0.0f64; 3]; STEP_ROWS];
+        for (row, position) in position_ids.iter_mut().enumerate() {
+            for (axis, slot) in position.iter_mut().enumerate() {
+                *slot = (((row * 3 + axis) * 5 + 1) % 17) as f64;
+            }
+        }
+        let mut token_tags = vec![TEXT_TAG; STEP_TEXT];
+        token_tags.extend(std::iter::repeat_n(VIDEO_TAG, STEP_KEY));
+        token_tags.extend(std::iter::repeat_n(AUDIO_TAG, STEP_AUDIO));
+        token_tags.extend(std::iter::repeat_n(VIDEO_TAG, STEP_GENERATED));
+        let range = |start: usize, end: usize| (start as u32..end as u32).collect::<Vec<_>>();
+        let mut video_indices = range(STEP_TEXT, STEP_TEXT + STEP_KEY);
+        video_indices.extend(range(video_start, STEP_ROWS));
+        PackedLayout {
+            position_ids,
+            token_tags,
+            video_indices,
+            audio_indices: range(audio_start, video_start),
+            text_indices: range(0, STEP_TEXT),
+            condition_video_rows: STEP_KEY,
+        }
+    }
+
+    fn step_pattern(count: usize) -> Vec<f32> {
+        (0..count)
+            .map(|i| ((i * 17 + 3) % 251 % 17) as f32 - 8.0)
+            .collect()
+    }
+
+    struct StepTau {
+        name: &'static str,
+        abs: f64,
+        rmse: f64,
+        rel: f64,
+        /// True when relative RMSE is the gate and max-abs is reported.
+        relative: bool,
+    }
+
+    /// max(2 × worst pair, 1e-6) and max(2 × worst pair, 1e-7). The eps floor binds nothing.
+    const STEP_TAUS: &[StepTau] = &[
+        StepTau {
+            name: "refiner.bf16",
+            abs: 1.0,
+            rmse: 0.02525967030888548,
+            rel: 0.011894049114080173,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-0.f32",
+            abs: 1.0344287157058716,
+            rmse: 0.08480887073585625,
+            rel: 0.03737819870938896,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-0.f32",
+            abs: 1.2973367869853973,
+            rmse: 0.35147537383978655,
+            rel: 0.12659836498390653,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-0.f32",
+            abs: 0.01794123649597168,
+            rmse: 0.0014709306476793245,
+            rel: 0.00030436084823948987,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-0.f32",
+            abs: 0.08555293083190918,
+            rmse: 0.023178044608518033,
+            rel: 0.004942957125442557,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-0.f32",
+            abs: 1.0344287157058716,
+            rmse: 0.08480887073585625,
+            rel: 0.03737819870938896,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-0.f32",
+            abs: 1.2973367869853973,
+            rmse: 0.35147537383978655,
+            rel: 0.12659836498390653,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-1.f32",
+            abs: 0.6497125625610352,
+            rmse: 0.06660809516296118,
+            rel: 0.027951056617136708,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-1.f32",
+            abs: 1.6679048538208008,
+            rmse: 0.2512035030694407,
+            rel: 0.09332653380557283,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-1.f32",
+            abs: 0.04277610778808594,
+            rmse: 0.004835248490736819,
+            rel: 0.0010299083327436733,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-1.f32",
+            abs: 0.37093067169189453,
+            rmse: 0.05664436512246173,
+            rel: 0.013632521602094846,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-1.f32",
+            abs: 0.8052752614021301,
+            rmse: 0.06484987049676891,
+            rel: 0.027213244838100666,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-1.f32",
+            abs: 2.3954267501831055,
+            rmse: 0.2548296150311912,
+            rel: 0.09467369838109052,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-2.f32",
+            abs: 0.6330146789550781,
+            rmse: 0.06821279829460544,
+            rel: 0.026989072706701332,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-2.f32",
+            abs: 1.1475920677185059,
+            rmse: 0.216037983598139,
+            rel: 0.08374482569409536,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-2.f32",
+            abs: 0.14624595642089844,
+            rmse: 0.016806086510819676,
+            rel: 0.003968390152038171,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-2.f32",
+            abs: 0.5485353469848633,
+            rmse: 0.08862821877285647,
+            rel: 0.027361272251040947,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-2.f32",
+            abs: 0.6307210922241211,
+            rmse: 0.06718731531069264,
+            rel: 0.026583330155387518,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-2.f32",
+            abs: 0.8542909622192383,
+            rmse: 0.185065455100368,
+            rel: 0.07173865457015058,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-3.f32",
+            abs: 1.0802555084228516,
+            rmse: 0.08557588311113899,
+            rel: 0.03679224202385931,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-3.f32",
+            abs: 1.540313720703125,
+            rmse: 0.2872992311398981,
+            rel: 0.1336442409171142,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-3.f32",
+            abs: 0.277801513671875,
+            rmse: 0.028397494333519183,
+            rel: 0.007408600318011723,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-3.f32",
+            abs: 0.5863490104675293,
+            rmse: 0.10182856943460111,
+            rel: 0.03549959772912339,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-3.f32",
+            abs: 0.9124784469604492,
+            rmse: 0.08180765830905622,
+            rel: 0.03517214260007093,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-3.f32",
+            abs: 1.3214263319969177,
+            rmse: 0.27508126771898883,
+            rel: 0.12796075739207344,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-4.f32",
+            abs: 0.9622354507446289,
+            rmse: 0.08843276977313971,
+            rel: 0.04125339004308106,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-4.f32",
+            abs: 1.509389877319336,
+            rmse: 0.2899731406880125,
+            rel: 0.14560669844538246,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-4.f32",
+            abs: 0.3898341655731201,
+            rmse: 0.032307474598488914,
+            rel: 0.008911228870711975,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-4.f32",
+            abs: 0.5971055030822754,
+            rmse: 0.10068899567672909,
+            rel: 0.03682861818829619,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-4.f32",
+            abs: 0.9593095779418945,
+            rmse: 0.08518561480349118,
+            rel: 0.03973861050109811,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-4.f32",
+            abs: 1.9413082599639893,
+            rmse: 0.3236822992442777,
+            rel: 0.16253336714684885,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-5.f32",
+            abs: 1.1887826919555664,
+            rmse: 0.0944259072454749,
+            rel: 0.043959013882068826,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-5.f32",
+            abs: 1.9153492450714111,
+            rmse: 0.39024225987989564,
+            rel: 0.19295143171868911,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-5.f32",
+            abs: 0.34001898765563965,
+            rmse: 0.032920431940877466,
+            rel: 0.00937076536622547,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-5.f32",
+            abs: 0.5137481689453125,
+            rmse: 0.09958590270065194,
+            rel: 0.037359167926177196,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-5.f32",
+            abs: 1.1486835479736328,
+            rmse: 0.0967375876840172,
+            rel: 0.04503519303091845,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-5.f32",
+            abs: 2.3399438858032227,
+            rmse: 0.41770544253584774,
+            rel: 0.20653033118141956,
+            relative: true,
+        },
+    ];
+
+    fn step_tau(name: &str) -> Result<&'static StepTau> {
+        STEP_TAUS
+            .iter()
+            .find(|tau| tau.name == name)
+            .with_context(|| format!("no tau for {name}"))
+    }
+
+    type StepF32 = BTreeMap<String, Vec<f32>>;
+
+    fn step_references(dir: &Path, hidden: usize) -> Result<(Vec<bf16>, StepF32)> {
+        let mut saved = BTreeMap::new();
+        let mut refiner = None;
+        for tau in STEP_TAUS {
+            if tau.name.ends_with(".bf16") {
+                refiner = Some(read_bf16(&dir.join(tau.name), STEP_TEXT * hidden)?);
+            } else {
+                let elements = if tau.name.contains("video") {
+                    STEP_GENERATED * STEP_VIDEO_WIDTH
+                } else {
+                    STEP_AUDIO * STEP_AUDIO_WIDTH
+                };
+                saved.insert(
+                    tau.name.to_owned(),
+                    read_f32(&dir.join(tau.name), elements)?,
+                );
+            }
+        }
+        Ok((refiner.context("refiner fixture")?, saved))
+    }
+
+    fn record_step(
+        arm: &str,
+        tau: &'static StepTau,
+        candidate: &[f64],
+        reference: &[f64],
+        scored: &mut Vec<&'static str>,
+        defects: &mut Vec<&'static str>,
+    ) -> Result<()> {
+        let (abs, rmse) = max_rmse(candidate, reference)?;
+        let square: f64 = reference.iter().map(|value| value * value).sum();
+        let rms = (square / reference.len() as f64).sqrt();
+        ensure!(rms.is_finite() && rms > 0.0, "{} reference rms", tau.name);
+        let rel = rmse / rms;
+        let pass = if tau.relative {
+            rel <= tau.rel
+        } else {
+            abs <= tau.abs && rmse <= tau.rmse
+        };
+        let gate = if tau.relative {
+            "relative-RMSE"
+        } else {
+            "max-abs+RMSE"
+        };
+        println!(
+            "HYPERFLOW_STEP arm={arm} cell={} max_abs={abs:.16e} rmse={rmse:.16e} rel={rel:.16e} tau_abs={:.16e} tau_rmse={:.16e} tau_rel={:.16e} gate={gate} {}",
+            tau.name,
+            tau.abs,
+            tau.rmse,
+            tau.rel,
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        scored.push(tau.name);
+        if !pass {
+            defects.push(tau.name);
+        }
+        Ok(())
+    }
+
+    fn score_f32(
+        arm: &str,
+        name: &str,
+        candidate: &[f32],
+        saved: &StepF32,
+        scored: &mut Vec<&'static str>,
+        defects: &mut Vec<&'static str>,
+    ) -> Result<()> {
+        let tau = step_tau(name)?;
+        let reference = saved.get(name).with_context(|| format!("saved {name}"))?;
+        record_step(
+            arm,
+            tau,
+            &f64_of_f32(candidate),
+            &f64_of_f32(reference),
+            scored,
+            defects,
+        )
+        .with_context(|| name.to_string())
+    }
+
+    fn note_refiner(seen: &mut Option<Vec<u16>>, now: &[bf16], label: &str) -> Result<()> {
+        ensure!(
+            now.iter().all(|value| value.to_f32().is_finite()),
+            "{label} refiner is non-finite"
+        );
+        let bits: Vec<u16> = now.iter().map(|value| value.to_bits()).collect();
+        if let Some(first) = seen {
+            ensure!(bits == *first, "{label} refiner changed");
+        } else {
+            *seen = Some(bits);
+        }
+        Ok(())
+    }
+
+    /// Refiner rows and six free and teacher-forced steps at the frozen pair taus. A numeric miss returns Err.
+    #[test]
+    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_STEP_REF"]
+    fn hyperflow_step_cells_match_the_definition() -> Result<()> {
+        let model = env_dir("FF_HYPERFLOW_MODEL")?;
+        let reference = env_dir("FF_HYPERFLOW_STEP_REF")?;
+        let arm = reference
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("reference arm name")?
+            .to_owned();
+        let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+            model.join("config.json"),
+        )?)?)?;
+        ensure!(spec.is_hyperflow()?, "transformer config is not HyperFlow");
+        ensure!(
+            spec.hidden == 5376
+                && spec.text_dim == 5120
+                && spec.video_row_width() == STEP_VIDEO_WIDTH
+                && spec.audio_in_channels == STEP_AUDIO_WIDTH,
+            "config shape hidden {} text {} video width {} audio width {}",
+            spec.hidden,
+            spec.text_dim,
+            spec.video_row_width(),
+            spec.audio_in_channels
+        );
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(reference.join("meta.json"))?)?;
+        ensure!(
+            meta["candidate_run"].as_bool() == Some(false),
+            "reference arm is marked as a candidate run"
+        );
+        ensure!(
+            meta["rows"].as_u64() == Some(u64::try_from(STEP_ROWS)?)
+                && meta["video_rows"].as_u64() == Some(u64::try_from(STEP_VIDEO)?)
+                && meta["teacher_from"].as_bool() == Some(true),
+            "reference meta rows"
+        );
+        let layout = step_layout();
+        ensure!(
+            layout.rows() == STEP_ROWS
+                && layout.video_indices.len() == STEP_VIDEO
+                && layout.audio_indices.len() == STEP_AUDIO
+                && layout.text_indices.len() == STEP_TEXT
+                && layout.condition_video_rows == STEP_KEY,
+            "pack layout"
+        );
+        let video_grid = step_grid(12.0);
+        let audio_grid = step_grid(3.0);
+        assert_step_grids(&video_grid, &audio_grid)?;
+        let flow = hyperflow_steps(6)?;
+        let row_plan: Vec<RowTimesteps> = flow
+            .iter()
+            .map(|step| RowTimesteps::hyperflow(&layout, step))
+            .collect();
+        let plan = AdalnPlan::build(&layout, &row_plan)?;
+        ensure!(
+            plan.row_pairs.len() == 6
+                && plan.row_timesteps.len() == 6
+                && plan
+                    .row_pairs
+                    .iter()
+                    .chain(&plan.row_timesteps)
+                    .all(|row| row.len() == STEP_ROWS),
+            "adaln plan extent"
+        );
+        let (refiner_ref, saved) = step_references(&reference, spec.hidden)?;
+        let manifest = MappedCheckpoint::open_component(&model, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-hyperflow-step-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let _runtime = BlockRuntime(runtime.clone());
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "HyperFlow step cells".into())),
+        )?;
+        let table = AdalnTable::build(&device, &mut blas, &model, &manifest, &spec, &plan)?;
+        let mut dit = Dit::new(
+            &device,
+            &mut blas,
+            &spec,
+            (0, &layout),
+            Source::new(&model, &manifest),
+            Source::new(&model, &manifest),
+            Placement::Derived,
+        )?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+        let counts = (
+            u32::try_from(plan.pairs.len())?,
+            u32::try_from(plan.timesteps.len())?,
+        );
+        let video_count = STEP_VIDEO * STEP_VIDEO_WIDTH;
+        let audio_count = STEP_AUDIO * STEP_AUDIO_WIDTH;
+        let text_count = STEP_TEXT * spec.text_dim;
+        let blob = step_pattern(video_count + audio_count + text_count);
+        let video_host = blob[..video_count].to_vec();
+        let audio_init = blob[video_count..video_count + audio_count].to_vec();
+        let text_host: Vec<bf16> = blob[video_count + audio_count..]
+            .iter()
+            .copied()
+            .map(bf16::from_f32)
+            .collect();
+        let key_elems = STEP_KEY * STEP_VIDEO_WIDTH;
+        let generated_elems = STEP_GENERATED * STEP_VIDEO_WIDTH;
+        let text = s.clone_htod(&text_host)?;
+        let video = s.clone_htod(&video_host)?;
+        let audio = s.clone_htod(&audio_init)?;
+        let mut refiner_seen = None;
+        let mut scored = Vec::new();
+        let mut defects = Vec::new();
+        for k in 0..6 {
+            let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
+            let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
+            dit.step(
+                &context,
+                &table,
+                counts,
+                &StepInputs {
+                    video: &video,
+                    audio: &audio,
+                    text: &text,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            let refiner = s.clone_dtoh(&dit.text)?;
+            ensure!(
+                refiner.len() == STEP_TEXT * spec.hidden,
+                "free step {k} refiner extent"
+            );
+            note_refiner(&mut refiner_seen, &refiner, &format!("free step {k}"))?;
+            if k == 0 {
+                record_step(
+                    &arm,
+                    step_tau("refiner.bf16")?,
+                    &f64_of_bf16(&refiner),
+                    &f64_of_bf16(&refiner_ref),
+                    &mut scored,
+                    &mut defects,
+                )?;
+            }
+            let vel_video = s.clone_dtoh(&dit.video)?;
+            let vel_audio = s.clone_dtoh(&dit.audio)?;
+            score_f32(
+                &arm,
+                &format!("vel-video-{k}.f32"),
+                &vel_video,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            score_f32(
+                &arm,
+                &format!("vel-audio-{k}.f32"),
+                &vel_audio,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            dit.euler(
+                s,
+                (&video, key_elems, generated_elems),
+                &dit.video,
+                &video_grid,
+                k,
+            )?;
+            dit.euler(s, (&audio, 0, audio_count), &dit.audio, &audio_grid, k)?;
+            let video_now = s.clone_dtoh(&video)?;
+            let audio_now = s.clone_dtoh(&audio)?;
+            ensure!(
+                video_now.len() == video_host.len()
+                    && video_now[..key_elems]
+                        .iter()
+                        .zip(&video_host[..key_elems])
+                        .all(|(got, want)| got.to_bits() == want.to_bits()),
+                "free step {k} keyframe changed"
+            );
+            score_f32(
+                &arm,
+                &format!("lat-video-{k}.f32"),
+                &video_now[key_elems..],
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            score_f32(
+                &arm,
+                &format!("lat-audio-{k}.f32"),
+                &audio_now,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+        }
+        for k in 0..6 {
+            let generated = if k == 0 {
+                video_host[key_elems..].to_vec()
+            } else {
+                saved
+                    .get(&format!("lat-video-{}.f32", k - 1))
+                    .with_context(|| format!("teacher video latent {}", k - 1))?
+                    .clone()
+            };
+            let audio_in = if k == 0 {
+                audio_init.clone()
+            } else {
+                saved
+                    .get(&format!("lat-audio-{}.f32", k - 1))
+                    .with_context(|| format!("teacher audio latent {}", k - 1))?
+                    .clone()
+            };
+            let mut packed = video_host[..key_elems].to_vec();
+            packed.extend(generated);
+            let video_k = s.clone_htod(&packed)?;
+            let audio_k = s.clone_htod(&audio_in)?;
+            let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
+            let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
+            dit.step(
+                &context,
+                &table,
+                counts,
+                &StepInputs {
+                    video: &video_k,
+                    audio: &audio_k,
+                    text: &text,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            let refiner = s.clone_dtoh(&dit.text)?;
+            note_refiner(&mut refiner_seen, &refiner, &format!("teacher step {k}"))?;
+            let vel_video = s.clone_dtoh(&dit.video)?;
+            let vel_audio = s.clone_dtoh(&dit.audio)?;
+            score_f32(
+                &arm,
+                &format!("teacher-vel-video-{k}.f32"),
+                &vel_video,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+            score_f32(
+                &arm,
+                &format!("teacher-vel-audio-{k}.f32"),
+                &vel_audio,
+                &saved,
+                &mut scored,
+                &mut defects,
+            )?;
+        }
+        ensure!(
+            scored.len() == STEP_TAUS.len()
+                && STEP_TAUS.iter().all(|tau| scored.contains(&tau.name)),
+            "scored {} of {}",
+            scored.len(),
+            STEP_TAUS.len()
+        );
+        if defects.is_empty() {
+            println!("HYPERFLOW_STEP_GATE PASS cells={}", STEP_TAUS.len());
+            Ok(())
+        } else {
+            println!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}");
+            bail!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}")
+        }
     }
 }
