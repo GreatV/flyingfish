@@ -579,18 +579,11 @@ impl ParakeetSpec {
 }
 
 #[cfg(feature = "cuda")]
-fn tokenizer_boundary_vocabulary(directory: &Path) -> Result<BTreeMap<u32, String>> {
-    let root: Value = serde_json::from_slice(&std::fs::read(directory.join("tokenizer.json"))?)?;
-    root["model"]["vocab"]
-        .as_object()
-        .context("Parakeet tokenizer vocabulary")?
-        .iter()
-        .map(|(piece, id)| {
-            Ok((
-                u32::try_from(id.as_u64().context("Parakeet token id")?)?,
-                piece.clone(),
-            ))
-        })
+fn tokenizer_boundary_vocabulary(tokenizer: &tokenizers::Tokenizer) -> BTreeMap<u32, String> {
+    tokenizer
+        .get_vocab(false)
+        .into_iter()
+        .map(|(piece, id)| (id, piece))
         .collect()
 }
 
@@ -602,13 +595,18 @@ fn tdt_word_segments(
     Vec<crate::media::TextSegment>,
 ) {
     let mut words: Vec<crate::media::TextSegment> = Vec::new();
+    let mut pending_boundary = false;
     for (marked, cue) in token_cues {
         let text = cue.text.trim();
+        let boundary = cue.text.starts_with(char::is_whitespace) || cue.text.starts_with('▁');
         if text.is_empty() {
+            pending_boundary |= marked || boundary;
             continue;
         }
+        let marked = marked || pending_boundary;
+        let boundary = boundary || pending_boundary;
+        pending_boundary = false;
         let punctuation = ["?", "'", "¡", "¿", "-", ":", ",", "%", "/", ".", "!"].contains(&text);
-        let boundary = cue.text.starts_with(char::is_whitespace) || cue.text.starts_with('▁');
         if words.is_empty() || marked || !punctuation && boundary {
             words.push(crate::media::TextSegment {
                 start: cue.start,
@@ -658,19 +656,13 @@ fn tdt_cues_with(
     ensure!(tokens.len() == durations.len(), "TDT token/duration extent");
     let full_text = decode(directory, tokens)?;
     let mut cues: Vec<(bool, crate::media::TextSegment)> = Vec::new();
-    let mut previous_text = String::new();
     let mut frame = 0usize;
-    for (index, (&token, &duration)) in tokens.iter().zip(durations).enumerate() {
+    for (&token, &duration) in tokens.iter().zip(durations) {
         if token == blank || token == 2 {
             frame += duration as usize;
             continue;
         }
-        let text = decode(directory, &tokens[..=index])?;
-        let chunk = text
-            .strip_prefix(&previous_text)
-            .context("TDT incremental detokenization changed earlier text")?
-            .to_string();
-        previous_text = text;
+        let chunk = decode(directory, &[token])?;
         if chunk.is_empty() {
             frame += duration as usize;
             continue;
@@ -716,13 +708,14 @@ pub fn tdt_transcription(
     trajectory: &TdtTrajectory,
     blank: u32,
 ) -> Result<crate::media::Transcription> {
-    let vocabulary = tokenizer_boundary_vocabulary(directory)?;
+    let tokenizer = crate::tokenizer::load(directory)?;
+    let vocabulary = tokenizer_boundary_vocabulary(&tokenizer);
     tdt_cues_with(
         directory,
         &trajectory.tokens,
         &trajectory.durations,
         blank,
-        crate::tokenizer::decode,
+        |_, ids| crate::tokenizer::decode_with(&tokenizer, ids),
         |token| {
             vocabulary
                 .get(&token)
@@ -754,19 +747,22 @@ mod tests {
     fn tdt_cues_use_durations_and_previous_token_punctuation() -> Result<()> {
         let tokens = [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17, 18];
         let durations = [0, 2, 1, 1, 0, 1, 1, 1, 2, 1, 1];
+        let decode_calls = std::cell::Cell::new(0usize);
         let decode = |_: &Path, ids: &[u32]| -> Result<String> {
+            decode_calls.set(decode_calls.get() + 1);
             Ok(match ids {
-                [8192, 10] => "hello".into(),
-                [8192, 10, 11] => "hello wo".into(),
-                [8192, 10, 11, 12] => "hello world".into(),
-                [8192, 10, 11, 12, 2, 13] => "hello world.".into(),
-                [8192, 10, 11, 12, 2, 13, 14] => "hello world. Next".into(),
-                [8192, 10, 11, 12, 2, 13, 14, 15] => "hello world. Next sentence".into(),
-                [8192, 10, 11, 12, 2, 13, 14, 15, 16] => "hello world. Next sentence!".into(),
-                [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17] => "hello world. Next sentence!'".into(),
                 [8192, 10, 11, 12, 2, 13, 14, 15, 16, 17, 18] => {
                     "hello world. Next sentence!'cause".into()
                 }
+                [10] => "hello".into(),
+                [11] => " wo".into(),
+                [12] => "rld".into(),
+                [13] => ".".into(),
+                [14] => " Next".into(),
+                [15] => " sentence".into(),
+                [16] => "!".into(),
+                [17] => "'".into(),
+                [18] => "cause".into(),
                 _ => String::new(),
             })
         };
@@ -779,6 +775,7 @@ mod tests {
             |token| token == 17,
         )?;
         assert_eq!(result.text, "hello world. Next sentence!'cause");
+        assert_eq!(decode_calls.get(), 10);
         assert_eq!(result.words.len(), 5, "{:?}", result.words);
         assert_eq!(result.words[0].text, "hello");
         assert_eq!((result.words[0].start, result.words[0].end), (0.0, 0.16));
@@ -833,6 +830,36 @@ mod tests {
         assert_eq!(undelimited.len(), 1);
         assert_eq!(undelimited[0].text, "hello world");
         assert_eq!((undelimited[0].start, undelimited[0].end), (0.0, 0.16));
+        let boundary_calls = std::cell::Cell::new(0usize);
+        let boundary_decode = |_: &Path, ids: &[u32]| -> Result<String> {
+            boundary_calls.set(boundary_calls.get() + 1);
+            Ok(match ids {
+                [8192, 20, 21, 22] => "hello world".into(),
+                [20] => "hello".into(),
+                [21] => " ".into(),
+                [22] => "world".into(),
+                _ => String::new(),
+            })
+        };
+        let boundary_only = tdt_cues_with(
+            Path::new("model"),
+            &[8192, 20, 21, 22],
+            &[0, 1, 1, 1],
+            8192,
+            boundary_decode,
+            |token| token == 21,
+        )?;
+        assert_eq!(boundary_calls.get(), 4);
+        assert_eq!(boundary_only.text, "hello world");
+        assert_eq!(boundary_only.words.len(), 2);
+        assert_eq!(boundary_only.words[0].text, "hello");
+        assert_eq!(boundary_only.words[1].text, "world");
+        assert_eq!(
+            (boundary_only.words[1].start, boundary_only.words[1].end),
+            (0.16, 0.24)
+        );
+        assert_eq!(boundary_only.segments.len(), 1);
+        assert_eq!(boundary_only.segments[0].text, "hello world");
         Ok(())
     }
 }
