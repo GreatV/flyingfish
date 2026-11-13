@@ -3214,6 +3214,7 @@ impl Engine {
                     .arg(&(vocab as i64))
                     .arg(&r.seed)
                     .arg(&(counter * 2))
+                    .arg(&0u64)
                     .arg(&1024i32)
                     .launch(grid(canvas, 1024))?;
                 s.launch_builder(&r.philox)

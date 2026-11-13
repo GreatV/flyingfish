@@ -53,6 +53,33 @@ const BB_DIM: usize = 128;
 const BB_Q: usize = BB_HEADS * BB_DIM;
 const BB_KVW: usize = BB_KV * BB_DIM;
 const BB_MAX: usize = 716;
+const BB_POSITION_MAX: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct Geometry {
+    backbone: usize,
+    frames: usize,
+}
+
+const GREEDY_GEOMETRY: Geometry = Geometry {
+    backbone: BB_MAX,
+    frames: DP_FRAMES,
+};
+
+fn generation_geometry(text_rows: usize, max_new_tokens: usize) -> Result<Geometry> {
+    ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
+    ensure!(max_new_tokens > 0, "generation token limit is zero");
+    let available = BB_POSITION_MAX
+        .checked_sub(text_rows)
+        .context("text prompt exceeds backbone positions")?;
+    let frames = max_new_tokens.min(available);
+    ensure!(frames > 0, "no generation frames remain");
+    Ok(Geometry {
+        backbone: text_rows + frames,
+        frames,
+    })
+}
+
 const BB_EPS: f32 = 1e-6;
 const BB_VOCAB: usize = 2052;
 
@@ -75,18 +102,8 @@ const AUDIO: i32 = 262_144;
 #[cfg(test)]
 const AUDIO_EOS: i32 = 262_145;
 
-const H_ELEMS: usize = BB_MAX * BB_H;
-const D_ELEMS: usize = BB_MAX * BB_VOCAB;
 const MLP_ELEMS: usize = TEXT_MAX * TEXT_I;
-const QKV_ELEMS: usize = BB_MAX * (BB_Q + BB_KVW + BB_KVW);
-const KV_ELEMS: usize = BB_KV * BB_MAX * BB_DIM;
-const ATTN_ELEMS: usize = H_ELEMS;
-const AUDIO_ELEMS: usize = DP_FRAMES * BB_H;
-const STACK_ELEMS: usize = DP_FRAMES * DP_ROWS * DP_H;
-const HEAD_IN_ELEMS: usize = DP_FRAMES * DP_H;
-const HEAD_OUT_ELEMS: usize = DP_FRAMES * (CODEBOOK as usize);
 const EMBED_WS: usize = 17 * BB_H;
-const IDS_ELEMS: usize = DP_FRAMES * BOOKS;
 
 pub fn gemm_rows(logical: usize, input: usize) -> usize {
     if super::linear_calibrate::supports(LinearShape {
@@ -239,6 +256,7 @@ struct Weights {
 
 struct Kern {
     stream: Arc<CudaStream>,
+    geometry: Geometry,
     ops: Ops,
     common: CommonOpsRef,
     rope_one_plus: CudaFunction,
@@ -246,6 +264,8 @@ struct Kern {
     rope_skip: CudaFunction,
     embed_rows_sum: CudaFunction,
     residual_scale: CudaFunction,
+    distribution: CudaFunction,
+    categorical: CudaFunction,
     table_slide: CudaSlice<bf16>,
     table_full: CudaSlice<bf16>,
     table_identity: CudaSlice<bf16>,
@@ -340,6 +360,7 @@ struct Buf {
     tok: CudaSlice<u32>,
     ids: CudaSlice<i32>,
     picked: CudaSlice<u32>, // slot 0 backbone, slots 1..15 depth heads
+    probabilities: CudaSlice<f32>,
 }
 
 struct Flashes {
@@ -351,7 +372,6 @@ struct Flashes {
 }
 
 pub struct Breeze {
-    device: Device,
     w: Weights,
     k: Kern,
     flash: Flashes,
@@ -928,6 +948,72 @@ fn argmax_heads(k: &Kern, buf: &mut Buf) -> Result<()> {
     Ok(())
 }
 
+struct SampleRequest {
+    source_start: usize,
+    picked_start: usize,
+    rows: usize,
+    vocab: usize,
+    sampling: crate::sampling::Sampling,
+    seed: u64,
+    stream: u64,
+    counter: u64,
+    allow: i32,
+}
+
+fn sample_rows(
+    k: &Kern,
+    logits: &CudaSlice<bf16>,
+    probabilities: &mut CudaSlice<f32>,
+    picked: &mut CudaSlice<u32>,
+    request: SampleRequest,
+) -> Result<()> {
+    let elements = request
+        .rows
+        .checked_mul(request.vocab)
+        .context("sampling rows")?;
+    ensure!(
+        request.source_start + elements <= logits.len() && elements <= probabilities.len(),
+        "sampling logits extent"
+    );
+    ensure!(
+        request.picked_start + request.rows <= picked.len(),
+        "sampling token extent"
+    );
+    let source = logits.slice(request.source_start..request.source_start + elements);
+    let mut probs = probabilities.slice_mut(..elements);
+    let mut out = picked.slice_mut(request.picked_start..request.picked_start + request.rows);
+    let rows_i = i32::try_from(request.rows)?;
+    let vocab_i = i64::try_from(request.vocab)?;
+    let top_k = i32::try_from(request.sampling.top_k)?;
+    unsafe {
+        k.stream
+            .launch_builder(&k.distribution)
+            .arg(&source)
+            .arg(&mut probs)
+            .arg(&rows_i)
+            .arg(&vocab_i)
+            .arg(&request.sampling.temperature)
+            .arg(&top_k)
+            .arg(&request.sampling.top_p)
+            .arg(&2048i32)
+            .arg(&2050i32)
+            .arg(&request.allow)
+            .launch(ops::grid(request.rows, 256u32))?;
+        k.stream
+            .launch_builder(&k.categorical)
+            .arg(&mut probs)
+            .arg(&mut out)
+            .arg(&rows_i)
+            .arg(&vocab_i)
+            .arg(&request.seed)
+            .arg(&request.stream)
+            .arg(&request.counter)
+            .arg(&256i32)
+            .launch(ops::grid(request.rows, 256u32))?;
+    }
+    Ok(())
+}
+
 fn take_backbone_id(ids: &mut Vec<u32>, id: u32) -> Result<()> {
     ensure!((id as usize) < BB_VOCAB, "backbone id {id}");
     ids.push(id);
@@ -1057,38 +1143,41 @@ fn load_matrix(
     upload(stream, &host, bytes)
 }
 
-fn alloc_buf(stream: &Arc<CudaStream>) -> Result<Buf> {
+fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
+    let h_elems = geometry.backbone * BB_H;
+    let kv_elems = BB_KV * geometry.backbone * BB_DIM;
     let mut lk = Vec::with_capacity(BB_LAYERS);
     let mut lv = Vec::with_capacity(BB_LAYERS);
     for _ in 0..BB_LAYERS {
-        lk.push(stream.alloc_zeros(KV_ELEMS)?);
-        lv.push(stream.alloc_zeros(KV_ELEMS)?);
+        lk.push(stream.alloc_zeros(kv_elems)?);
+        lv.push(stream.alloc_zeros(kv_elems)?);
     }
     Ok(Buf {
-        h: stream.alloc_zeros(H_ELEMS)?,
-        n: stream.alloc_zeros(H_ELEMS)?,
-        d: stream.alloc_zeros(D_ELEMS)?,
+        h: stream.alloc_zeros(h_elems)?,
+        n: stream.alloc_zeros(h_elems)?,
+        d: stream.alloc_zeros(geometry.backbone * BB_VOCAB)?,
         gate: stream.alloc_zeros(MLP_ELEMS)?,
         up: stream.alloc_zeros(MLP_ELEMS)?,
         act: stream.alloc_zeros(MLP_ELEMS)?,
-        qkv: stream.alloc_zeros(QKV_ELEMS)?,
-        k: stream.alloc_zeros(KV_ELEMS)?,
-        v: stream.alloc_zeros(KV_ELEMS)?,
+        qkv: stream.alloc_zeros(geometry.backbone * (BB_Q + BB_KVW + BB_KVW))?,
+        k: stream.alloc_zeros(kv_elems)?,
+        v: stream.alloc_zeros(kv_elems)?,
         lk,
         lv,
         dk: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
         dv: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
-        attn: stream.alloc_zeros(ATTN_ELEMS)?,
-        audio: stream.alloc_zeros(AUDIO_ELEMS)?,
-        stack: stream.alloc_zeros(STACK_ELEMS)?,
-        head_in: stream.alloc_zeros(HEAD_IN_ELEMS)?,
-        head_out: stream.alloc_zeros(HEAD_OUT_ELEMS)?,
+        attn: stream.alloc_zeros(h_elems)?,
+        audio: stream.alloc_zeros(geometry.frames * BB_H)?,
+        stack: stream.alloc_zeros(geometry.frames * DP_ROWS * DP_H)?,
+        head_in: stream.alloc_zeros(geometry.frames * DP_H)?,
+        head_out: stream.alloc_zeros(geometry.frames * (CODEBOOK as usize))?,
         embed_ws: stream.alloc_zeros(EMBED_WS)?,
         meta: stream.alloc_zeros(8)?,
         start: stream.alloc_zeros(1)?,
         tok: stream.alloc_zeros(TEXT_MAX)?,
-        ids: stream.alloc_zeros(IDS_ELEMS)?,
+        ids: stream.alloc_zeros(geometry.frames * BOOKS)?,
         picked: stream.alloc_zeros(BOOKS)?,
+        probabilities: stream.alloc_zeros(BOOKS * BB_VOCAB)?,
     })
 }
 
@@ -1947,7 +2036,7 @@ fn sum_audio(
     rows: usize,
 ) -> Result<Vec<bf16>> {
     ensure!(codes.len() == rows * BOOKS, "audio code length");
-    ensure!(rows > 0 && rows <= DP_FRAMES, "audio rows {rows}");
+    ensure!(rows > 0 && rows <= k.geometry.frames, "audio rows {rows}");
     for &id in codes {
         ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
     }
@@ -1957,16 +2046,16 @@ fn sum_audio(
     Ok(wide.into_iter().map(bf16::from_f32).collect())
 }
 
-fn check_positions(positions: &Positions) -> Result<()> {
+fn check_positions(positions: &Positions, geometry: Geometry) -> Result<()> {
     let Positions {
         text,
         audio,
         eos,
         seq,
     } = positions;
-    ensure!((1..=BB_MAX).contains(seq), "seq {seq}");
+    ensure!((1..=geometry.backbone).contains(seq), "seq {seq}");
     ensure!(
-        text.len() <= TEXT_MAX && audio.len() <= DP_FRAMES,
+        text.len() <= TEXT_MAX && audio.len() <= geometry.frames,
         "position counts"
     );
     let mut seen = vec![0u8; *seq];
@@ -2284,7 +2373,7 @@ fn backbone_rows(
     let end = usize::try_from(pass.origin)?
         .checked_add(pass.rows)
         .context("backbone cache")?;
-    ensure!(end <= BB_MAX, "backbone cache");
+    ensure!(end <= k.geometry.backbone, "backbone cache");
     ensure!(pass.layers.len() == BB_LAYERS, "backbone layers");
     set_meta(k, &mut buf.meta, pass.rows)?;
     upload_origin(k, &mut buf.start, pass.origin)?;
@@ -2318,7 +2407,7 @@ fn backbone_rows(
                     kind: RopeKind::Cast,
                     geom,
                     origin: pass.origin,
-                    capacity: BB_MAX,
+                    capacity: k.geometry.backbone,
                     slot: KvSlot::Layer(index),
                 },
             )?;
@@ -2515,6 +2604,7 @@ fn decode_shape(
     text_rows: usize,
     fed: &[i32],
     frames: &[i32],
+    geometry: Geometry,
 ) -> Result<(usize, usize)> {
     ensure!(fed.len().is_multiple_of(BOOKS), "fed codes");
     ensure!(frames.len().is_multiple_of(BOOKS), "depth codes");
@@ -2522,7 +2612,7 @@ fn decode_shape(
     let audio_steps = fed.len() / BOOKS;
     let depth_frames = frames.len() / BOOKS;
     ensure!(
-        (1..=DP_FRAMES).contains(&depth_frames),
+        (1..=geometry.frames).contains(&depth_frames),
         "frames {depth_frames}"
     );
     ensure!(cond.len() == depth_frames * BB_H, "cond length");
@@ -2531,7 +2621,10 @@ fn decode_shape(
         audio_steps >= 1 && depth_frames >= audio_steps,
         "decode steps"
     );
-    ensure!(text_rows + audio_steps <= BB_MAX, "decode length");
+    ensure!(
+        text_rows + audio_steps <= geometry.backbone,
+        "decode length"
+    );
     ensure!(projected.len() == text_rows * BB_H, "projected length");
     ensure!(
         projected.iter().all(|value| value.is_finite()),
@@ -2562,14 +2655,29 @@ struct GreedyOut {
 }
 
 impl Breeze {
-    fn bound_device(&self) -> Result<()> {
-        ensure!(self.device.ctx.ordinal() == 0, "device ordinal");
-        Ok(())
+    pub fn load(weights: &Path, runtime: &Path) -> Result<Self> {
+        Self::load_geometry(weights, runtime, GREEDY_GEOMETRY, 0)
     }
 
-    pub fn load(weights: &Path, runtime: &Path) -> Result<Self> {
+    pub fn load_for_generation(
+        weights: &Path,
+        runtime: &Path,
+        ordinal: usize,
+        text_rows: usize,
+        max_new_tokens: usize,
+    ) -> Result<Self> {
+        let geometry = generation_geometry(text_rows, max_new_tokens)?;
+        Self::load_geometry(weights, runtime, geometry, ordinal)
+    }
+
+    fn load_geometry(
+        weights: &Path,
+        runtime: &Path,
+        geometry: Geometry,
+        ordinal: usize,
+    ) -> Result<Self> {
         ensure!(runtime.is_dir(), "runtime directory");
-        let device = Device::new(0)?;
+        let device = Device::new(ordinal)?;
         // Two streams enable event waits. Capture rejects a wait recorded outside it.
         unsafe {
             device.ctx.disable_event_tracking();
@@ -2579,11 +2687,14 @@ impl Breeze {
         let rope_module = cubin::module(&device.ctx, "rope")?;
         let embed_module = cubin::module(&device.ctx, "embed")?;
         let act_module = cubin::module(&device.ctx, "act")?;
+        let sample_module = cubin::module(&device.ctx, "sample")?;
         let rope_one_plus = rope_module.load_function("qknorm_rope_table_kv_one_plus")?;
         let rope_cast = rope_module.load_function("qknorm_rope_table_kv_cast")?;
         let rope_skip = rope_module.load_function("qknorm_rope_table_kv_skip")?;
         let embed_rows_sum = embed_module.load_function("embed_rows_sum")?;
         let residual_scale = act_module.load_function("residual_scale")?;
+        let distribution = sample_module.load_function("distribution_rows_bf16")?;
+        let categorical = sample_module.load_function("categorical_sample_rows")?;
         let stream = device.stream.clone();
         let table_slide = upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(false))?;
         let table_full = upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(true))?;
@@ -2592,7 +2703,7 @@ impl Breeze {
         stream.synchronize()?;
         let table_backbone = upload_table(
             &stream,
-            BB_MAX,
+            geometry.backbone,
             BB_DIM,
             RopeLaw::Plain {
                 theta: 1_000_000.0,
@@ -2618,12 +2729,13 @@ impl Breeze {
             TEXT_MAX,
         )
         .context("text sliding attention")?;
-        let mut backbone_flash = Flash::new(stream.clone(), BB_MAX, BB_HEADS, BB_KV, BB_DIM)
-            .context("backbone attention")?;
+        let mut backbone_flash =
+            Flash::new(stream.clone(), geometry.backbone, BB_HEADS, BB_KV, BB_DIM)
+                .context("backbone attention")?;
         let mut depth_flash = Flash::new(stream.clone(), DP_ROWS, DP_HEADS, DP_KV, DP_DIM)
             .context("depth attention")?;
-        let buf = alloc_buf(&stream)?;
-        backbone_flash.bind_position(&buf.start, BB_MAX - 1)?;
+        let buf = alloc_buf(&stream, geometry)?;
+        backbone_flash.bind_position(&buf.start, geometry.backbone - 1)?;
         depth_flash.bind_position(&buf.start, DP_ROWS - 1)?;
         let closure = Rc::new(Closure::new(false, "breeze-m0".to_string()));
         let mut blas = Blas::new(&device, &ops, runtime, Rc::clone(&closure))?;
@@ -2634,10 +2746,10 @@ impl Breeze {
         drop(ckpt);
         eprintln!("weight_bytes={weight_bytes}");
         Ok(Self {
-            device,
             w,
             k: Kern {
                 stream,
+                geometry,
                 ops,
                 common,
                 rope_one_plus,
@@ -2645,6 +2757,8 @@ impl Breeze {
                 rope_skip,
                 embed_rows_sum,
                 residual_scale,
+                distribution,
+                categorical,
                 table_slide,
                 table_full,
                 table_identity,
@@ -2684,7 +2798,6 @@ impl Breeze {
     }
 
     pub fn text(&mut self, token_ids: &[u32], plant: TextPlant) -> Result<Vec<f32>> {
-        self.bound_device()?;
         let rows = token_ids.len();
         ensure!((1..=TEXT_MAX).contains(&rows), "text rows {rows}");
         ensure!(
@@ -2779,7 +2892,6 @@ impl Breeze {
     }
 
     pub fn sliding_layer(&mut self, hidden: &[f32], plant: TextPlant) -> Result<Vec<f32>> {
-        self.bound_device()?;
         ensure!(
             matches!(plant, TextPlant::Nominal | TextPlant::WindowIgnored),
             "sliding plant"
@@ -2828,8 +2940,7 @@ impl Breeze {
         codes: &[i32],
         plant_audio: bool,
     ) -> Result<Vec<f32>> {
-        self.bound_device()?;
-        check_positions(positions)?;
+        check_positions(positions, self.k.geometry)?;
         ensure!(
             projected.len() == positions.text.len() * BB_H,
             "projected length"
@@ -2938,8 +3049,10 @@ impl Breeze {
         frames: usize,
         plant_head: bool,
     ) -> Result<Vec<f32>> {
-        self.bound_device()?;
-        ensure!((1..=DP_FRAMES).contains(&frames), "frames {frames}");
+        ensure!(
+            (1..=self.k.geometry.frames).contains(&frames),
+            "frames {frames}"
+        );
         ensure!(cond.len() == frames * BB_H, "cond length");
         ensure!(codes.len() == frames * DP_ROWS, "depth code length");
         ensure!(
@@ -2981,6 +3094,124 @@ impl Breeze {
             )?;
         }
         depth_heads(k, buf, blas, &w.heads, frames, plant_head)
+    }
+
+    pub fn sample_decode(
+        &mut self,
+        projected: &[f32],
+        text_rows: usize,
+        sampling: crate::sampling::Sampling,
+        seed: u64,
+    ) -> Result<Vec<i32>> {
+        ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
+        ensure!(
+            projected.len() == text_rows * BB_H && projected.iter().all(|value| value.is_finite()),
+            "sampled projected text"
+        );
+        ensure!(
+            self.k.geometry.backbone == text_rows + self.k.geometry.frames,
+            "sampled generation geometry"
+        );
+        let Breeze {
+            ref w,
+            ref k,
+            ref mut flash,
+            ref mut buf,
+            ref blas,
+            ..
+        } = *self;
+        upload_hidden(k, buf, projected)?;
+        let mut output = Vec::new();
+        for frame in 0..k.geometry.frames {
+            let prefill = frame == 0;
+            let rows = if prefill { text_rows } else { 1 };
+            let origin = if prefill { 0 } else { text_rows + frame - 1 };
+            let score_row = if prefill { text_rows - 1 } else { 0 };
+            backbone_rows(
+                k,
+                buf,
+                blas,
+                ScorePass {
+                    layers: &w.backbone,
+                    norm: &w.backbone_norm,
+                    lm: &w.lm,
+                    table: &k.table_backbone,
+                    flash: &mut flash.backbone,
+                    rows,
+                    origin: i32::try_from(origin)?,
+                    score_row,
+                },
+                (!prefill).then_some(&w.audio),
+                false,
+            )?;
+            sample_rows(
+                k,
+                &buf.d,
+                &mut buf.probabilities,
+                &mut buf.picked,
+                SampleRequest {
+                    source_start: score_row * BB_VOCAB,
+                    picked_start: 0,
+                    rows: 1,
+                    vocab: BB_VOCAB,
+                    sampling,
+                    seed,
+                    stream: 0,
+                    counter: frame as u64,
+                    allow: 2051,
+                },
+            )?;
+            let backbone = download_u32(k, &buf.picked, 0, 1)?[0];
+            if backbone == 2051 {
+                break;
+            }
+            ensure!(backbone < 2048, "reserved backbone token {backbone}");
+            let cond = download_row(k, &buf.n, score_row, BB_H)?;
+            let mut codes = [0i32; BOOKS];
+            codes[0] = i32::try_from(backbone)?;
+            depth_step(
+                k,
+                buf,
+                blas,
+                DepthStep {
+                    w,
+                    flash: &mut flash.depth,
+                    cond: &cond,
+                    codes: &codes,
+                    frame,
+                    plant: false,
+                },
+                false,
+            )?;
+            sample_rows(
+                k,
+                &buf.head_out,
+                &mut buf.probabilities,
+                &mut buf.picked,
+                SampleRequest {
+                    source_start: gemm_rows(1, DP_H) * CODEBOOK as usize,
+                    picked_start: 1,
+                    rows: HEAD_N,
+                    vocab: CODEBOOK as usize,
+                    sampling,
+                    seed,
+                    stream: 1,
+                    counter: frame as u64,
+                    allow: -1,
+                },
+            )?;
+            let depth = download_u32(k, &buf.picked, 1, HEAD_N)?;
+            for (book, id) in depth.into_iter().enumerate() {
+                ensure!(id < 2048, "reserved depth token {id}");
+                codes[book + 1] = i32::try_from(id)?;
+            }
+            output.extend_from_slice(&codes);
+            if frame + 1 < k.geometry.frames {
+                stage_audio_codes(k, buf, &codes)?;
+            }
+        }
+        ensure!(!output.is_empty(), "Breeze generated no audio frames");
+        Ok(output)
     }
 
     /// Backbone KV is one BB_MAX cache per layer. Depth KV is DP_KV by DP_ROWS by DP_DIM, rewritten at positions 0..DP_ROWS before each depth attention.
@@ -3036,8 +3267,8 @@ impl Breeze {
             ids_only,
         } = input;
         let keep_scores = !ids_only;
-        let (audio_steps, depth_frames) = decode_shape(projected, cond, text_rows, fed, frames)?;
-        self.bound_device()?;
+        let (audio_steps, depth_frames) =
+            decode_shape(projected, cond, text_rows, fed, frames, self.k.geometry)?;
         let Breeze {
             ref w,
             ref k,
@@ -3824,8 +4055,14 @@ mod tests {
         let fed = vec![0i32; audio_steps * super::BOOKS];
         let frames_64 = vec![0i32; super::DP_FRAMES * super::BOOKS];
         let cond_64 = vec![0f32; super::DP_FRAMES * super::BB_H];
-        let (steps, depth) =
-            super::decode_shape(&projected, &cond_64, text_rows, &fed, &frames_64)?;
+        let (steps, depth) = super::decode_shape(
+            &projected,
+            &cond_64,
+            text_rows,
+            &fed,
+            &frames_64,
+            super::GREEDY_GEOMETRY,
+        )?;
         ensure!(
             steps == audio_steps && depth == super::DP_FRAMES,
             "64 frames"
@@ -3833,8 +4070,40 @@ mod tests {
         let frames_65 = vec![0i32; (super::DP_FRAMES + 1) * super::BOOKS];
         let cond_65 = vec![0f32; (super::DP_FRAMES + 1) * super::BB_H];
         ensure!(
-            super::decode_shape(&projected, &cond_65, text_rows, &fed, &frames_65).is_err(),
+            super::decode_shape(
+                &projected,
+                &cond_65,
+                text_rows,
+                &fed,
+                &frames_65,
+                super::GREEDY_GEOMETRY
+            )
+            .is_err(),
             "65 frames"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generation_geometry_spans_fixture_limits_and_position_bound() -> Result<()> {
+        let generation = super::generation_geometry(3, 750)?;
+        ensure!(
+            generation.frames == 750 && generation.backbone == 753,
+            "750 frames"
+        );
+        ensure!(generation.frames > 256, "fixture limits");
+        let bounded = super::generation_geometry(652, 1500)?;
+        ensure!(
+            bounded.frames == 1396 && bounded.backbone == 2048,
+            "position bound"
+        );
+        ensure!(
+            super::generation_geometry(2048, 750).is_err(),
+            "no audio positions"
+        );
+        ensure!(
+            super::generation_geometry(3, 0).is_err(),
+            "zero generation limit"
         );
         Ok(())
     }

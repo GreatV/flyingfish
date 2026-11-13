@@ -11,6 +11,8 @@ pub struct RunOptions {
 pub mod audio;
 pub mod backend;
 pub mod bench;
+#[cfg(any(feature = "cuda", test))]
+pub mod breeze;
 pub mod canary;
 pub mod checkpoint;
 pub mod config;
@@ -39,6 +41,7 @@ pub mod parakeet;
 pub mod pixal3d;
 pub mod prefill;
 pub mod prefix_state;
+pub mod sampling;
 pub mod serve;
 pub mod spec;
 pub mod tensors;

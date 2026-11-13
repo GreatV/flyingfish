@@ -450,6 +450,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&1234u64)
             .arg(&9u64)
+            .arg(&0u64)
             .arg(&256i32)
             .launch(crate::backend::cuda::ops::grid(srows, 256u32))?;
     }
@@ -468,6 +469,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&1234u64)
             .arg(&9u64)
+            .arg(&0u64)
             .arg(&256i32)
             .launch(crate::backend::cuda::ops::grid(srows, 256u32))?;
     }
@@ -488,6 +490,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&0u64)
             .arg(&38471471u64)
+            .arg(&0u64)
             .arg(&256i32)
             .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
     }
@@ -497,6 +500,99 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
     let _ = bf16::ZERO;
     println!(
         "DIFFUSION_SAMPLER temperature=bitexact entropy_rel={worst}/{worst_prod} accept=exact argmax=exact philox_4sigma_ok categorical_hits={hits}/{srows}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
+fn breeze_sampling_ops_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let sample = crate::backend::cuda::cubin::module(&device.ctx, "sample")?;
+    let distribution = sample.load_function("distribution_rows_bf16")?;
+    let categorical = sample.load_function("categorical_sample_rows")?;
+    let sampling = crate::sampling::Sampling::new(2.0, 3, 0.8)?;
+    let logits = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    let rows = 64usize;
+    let vocab = logits.len();
+    let host: Vec<bf16> = logits
+        .iter()
+        .cycle()
+        .take(rows * vocab)
+        .map(|value| bf16::from_f32(*value))
+        .collect();
+    let d_logits = s.clone_htod(&host)?;
+    let d_probs = s.alloc_zeros::<f32>(rows * vocab)?;
+    let run_distribution = |allow: i32| -> Result<()> {
+        unsafe {
+            s.launch_builder(&distribution)
+                .arg(&d_logits)
+                .arg(&d_probs)
+                .arg(&(rows as i32))
+                .arg(&(vocab as i64))
+                .arg(&2.0f32)
+                .arg(&3i32)
+                .arg(&0.8f32)
+                .arg(&6i32)
+                .arg(&6i32)
+                .arg(&allow)
+                .launch(crate::backend::cuda::ops::grid(rows, 256u32))?;
+        }
+        Ok(())
+    };
+    run_distribution(-1)?;
+    let expected = sampling.probabilities(&logits, (6, 6), None)?;
+    let got = s.clone_dtoh(&d_probs)?;
+    for row in got.chunks_exact(vocab) {
+        for (actual, expected) in row.iter().zip(&expected) {
+            ensure!(
+                (actual - expected).abs() <= 1e-5,
+                "distribution mismatch actual={actual} expected={expected}"
+            );
+        }
+        ensure!(row[6] == 0.0 && row[4] == 0.0, "top-k/reserved mask");
+    }
+    run_distribution(6)?;
+    let allowed = s.clone_dtoh(&d_probs)?;
+    ensure!(allowed[6] > 0.0, "reserved allow token");
+    run_distribution(-1)?;
+    let sample_with = |seed: u64| -> Result<Vec<i32>> {
+        let out = s.alloc_zeros::<i32>(rows)?;
+        unsafe {
+            s.launch_builder(&categorical)
+                .arg(&d_probs)
+                .arg(&out)
+                .arg(&(rows as i32))
+                .arg(&(vocab as i64))
+                .arg(&seed)
+                .arg(&1u64)
+                .arg(&3u64)
+                .arg(&256i32)
+                .launch(crate::backend::cuda::ops::grid(rows, 256u32))?;
+        }
+        Ok(s.clone_dtoh(&out)?)
+    };
+    let first = sample_with(7)?;
+    let repeat = sample_with(7)?;
+    ensure!(first == repeat, "same-seed categorical replay");
+    let changed = sample_with(8)?;
+    ensure!(
+        first.iter().zip(&changed).filter(|(a, b)| a != b).count() > 0,
+        "seed+1 control"
+    );
+    ensure!(
+        first
+            .iter()
+            .all(|id| (0..vocab as i32).contains(id) && *id != 6 && *id != 4),
+        "sampled masked token"
+    );
+    println!(
+        "BREEZE_SAMPLER PASS rows=64 top_k=3 top_p=0.8 reserved=6 allow=6 same_seed=exact seed_plus_one=different"
     );
     Ok(())
 }
