@@ -198,14 +198,16 @@ impl Split {
             .and_then(|n| n.checked_mul(parts))
             .and_then(|n| n.checked_mul(514))
             .context("HIP D512 workspace overflow")?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"native_attention_split": {
-                "head_dim":512,"capacity":capacity,"heads":heads,"max_rows":rows.min(16),
-                "compute_units":units,"resident_blocks_per_cu":resident,"parts":parts,"chunk":chunk,
-                "workspace_bytes":elements.checked_mul(4).context("HIP D512 workspace bytes overflow")?
-            }})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"native_attention_split": {
+                    "head_dim":512,"capacity":capacity,"heads":heads,"max_rows":rows.min(16),
+                    "compute_units":units,"resident_blocks_per_cu":resident,"parts":parts,"chunk":chunk,
+                    "workspace_bytes":elements.checked_mul(4).context("HIP D512 workspace bytes overflow")?
+                }})
+            );
+        }
         Ok(Self {
             partial,
             merge,
@@ -258,14 +260,16 @@ impl Split {
             .and_then(|v| v.checked_mul(parts))
             .and_then(|v| v.checked_mul(514))
             .context("D512 partial workspace overflow")?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"native_attention_split":{
-                "head_dim":512,"capacity":capacity,"heads":heads,"max_rows":rows.min(16),
-                "sms":sms,"resident_blocks_per_sm":resident,"parts":parts,"chunk":chunk,
-                "workspace_bytes":elements.checked_mul(4).context("D512 workspace bytes overflow")?
-            }})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"native_attention_split":{
+                    "head_dim":512,"capacity":capacity,"heads":heads,"max_rows":rows.min(16),
+                    "sms":sms,"resident_blocks_per_sm":resident,"parts":parts,"chunk":chunk,
+                    "workspace_bytes":elements.checked_mul(4).context("D512 workspace bytes overflow")?
+                }})
+            );
+        }
         Ok(Self {
             partial,
             merge,
@@ -454,23 +458,27 @@ impl Flash {
                     resident >= previous && resident > 0,
                     "single-probability attention occupancy decreased"
                 );
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"attention_probability": {
-                        "symbol":name,"registers":registers,"local_bytes":local,
-                        "dynamic_shared_bytes":self.shared,"resident_blocks":resident,
-                        "previous_resident_blocks":previous
-                    }})
-                );
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"attention_probability": {
+                            "symbol":name,"registers":registers,"local_bytes":local,
+                            "dynamic_shared_bytes":self.shared,"resident_blocks":resident,
+                            "previous_resident_blocks":previous
+                        }})
+                    );
+                }
                 self.native[1] = function;
             } else {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"attention_probability": {
-                        "symbol":"attention_prefill_d128_bidirectional",
-                        "capability":[major,minor],"form":"residual"
-                    }})
-                );
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"attention_probability": {
+                            "symbol":"attention_prefill_d128_bidirectional",
+                            "capability":[major,minor],"form":"residual"
+                        }})
+                    );
+                }
             }
         }
         Ok(self)

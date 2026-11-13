@@ -1299,20 +1299,22 @@ pub fn run_minimax_h3_i2va(
             .with_context(|| format!("read keyframe {}", request.keyframe.display()))?,
         None,
     )?;
-    let prepared = prepare_i2va(
-        &request.model,
-        &request.prompt,
-        &keyframe,
-        (request.frames, request.seed),
-        (8, (6.0, 3.0)),
-    )?;
-    generate(
-        &request.model,
-        &request.lora,
-        &prepared,
-        (options.device, &options.runtime_dir),
-        request.gguf.as_deref(),
-    )
+    crate::backend::with_verbose(options.verbose, || {
+        let prepared = prepare_i2va(
+            &request.model,
+            &request.prompt,
+            &keyframe,
+            (request.frames, request.seed),
+            (8, (6.0, 3.0)),
+        )?;
+        generate(
+            &request.model,
+            &request.lora,
+            &prepared,
+            (options.device, &options.runtime_dir),
+            request.gguf.as_deref(),
+        )
+    })
 }
 
 /// Image-row AdaLN tag. Slot 0 of the 3-slot modulation table; text rows stay `TEXT_TAG`.

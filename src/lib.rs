@@ -5,6 +5,7 @@ compile_error!("features `cuda` and `rocm` are mutually exclusive");
 pub struct RunOptions {
     pub device: usize,
     pub runtime_dir: std::path::PathBuf,
+    pub verbose: bool,
 }
 
 pub mod audio;

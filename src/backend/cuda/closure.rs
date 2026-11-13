@@ -384,10 +384,12 @@ impl Closure {
             "fixed plan cannot reuse measured calibration"
         );
         self.stage.set(Stage::Frozen);
-        eprintln!(
-            "{}",
-            serde_json::json!({"fixed_operator_closure":{"selection_source":"fixed","measurements":0,"files":0}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"fixed_operator_closure":{"selection_source":"fixed","measurements":0,"files":0}})
+            );
+        }
         Ok(())
     }
     #[cfg(feature = "cuda")]
@@ -440,10 +442,12 @@ impl Closure {
             );
         }
         self.stage.set(Stage::Frozen);
-        eprintln!(
-            "{}",
-            serde_json::json!({"calibration_closure":{"path":path,"linear_keys":manifest.profile.linear.len(),"measurements":self.measurements.get(),"files":manifest.files.len(),"write":self.write}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"calibration_closure":{"path":path,"linear_keys":manifest.profile.linear.len(),"measurements":self.measurements.get(),"files":manifest.files.len(),"write":self.write}})
+            );
+        }
         Ok(())
     }
     pub fn ready(&self, started: Instant) -> Result<()> {
@@ -457,10 +461,12 @@ impl Closure {
         );
         self.stage.set(Stage::Ready);
         self.assert_ready()?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"backend_ready":{"wall_ms":started.elapsed().as_secs_f64()*1000.0,"measurements":self.measurements.get(),"production_captures":self.captures.get(),"late_attempts":self.late_attempts.get()}})
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"backend_ready":{"wall_ms":started.elapsed().as_secs_f64()*1000.0,"measurements":self.measurements.get(),"production_captures":self.captures.get(),"late_attempts":self.late_attempts.get()}})
+            );
+        }
         Ok(())
     }
     pub fn assert_ready(&self) -> Result<()> {
