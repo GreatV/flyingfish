@@ -952,7 +952,6 @@ pub struct StageSampling<'a> {
 
 /// Stage output affine from the pipeline's shape/tex _slat_normalization:
 /// slat = state * std + mean per channel.
-#[cfg(test)]
 pub fn normalize_slat(state: &[f32], mean: &[f32], std: &[f32]) -> Vec<f32> {
     let channels = mean.len();
     state
@@ -986,6 +985,361 @@ fn attention_workspace_split(
     let self_workspace =
         F32Attention::required_bytes(self_geometry)?.min(remaining - cross_workspace);
     Ok((cross_workspace, self_workspace))
+}
+
+/// Philox counter-stream ids for the four stage noise draws of one
+/// request: sparse structure, low-resolution shape, high-resolution shape,
+/// texture. Each (seed, stream) pair is a distinct counter range.
+pub const TRELLIS_NOISE_STREAMS: [u64; 4] = [1, 2, 3, 4];
+
+/// An image-to-mesh request on the published default pipeline
+/// (1024_cascade): the model and DINOv3 directories, an RGBA image with the
+/// background already removed, and the request seed for the four noise
+/// draws. The device and every stage resource are owned by the call; one
+/// stage is resident at a time under the whole-request limit derived at
+/// setup.
+pub struct TrellisTo3d<'a> {
+    pub model: &'a std::path::Path,
+    pub dino: &'a std::path::Path,
+    pub runtime: &'a std::path::Path,
+    pub rgba: &'a [u8],
+    /// [height, width].
+    pub dimensions: [usize; 2],
+    pub seed: u64,
+}
+
+/// The decoded mesh: world-space vertices [rows, 3], triangle indices
+/// [faces, 3] with winding retained, per-vertex material [rows, 6]
+/// (R, G, B, metallic, roughness, alpha) in the pipeline's output space,
+/// and the resolved resolution.
+pub struct TrellisMesh {
+    pub vertices: Vec<f32>,
+    pub faces: Vec<i32>,
+    pub material: Vec<f32>,
+    pub resolution: u32,
+}
+
+fn philox_normals(
+    device: &super::Device,
+    seed: u64,
+    stream: u64,
+    count: usize,
+) -> Result<Vec<f32>> {
+    let noise = device.stream.alloc_zeros::<f32>(count)?;
+    unsafe {
+        device
+            .stream
+            .launch_builder(
+                &super::cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?,
+            )
+            .arg(&seed)
+            .arg(&stream)
+            .arg(&noise)
+            .arg(&i64::try_from(count)?)
+            .launch(super::ops::flat(count.div_ceil(4)))?;
+    }
+    Ok(device.stream.clone_dtoh(&noise)?.to_vec())
+}
+
+impl TrellisTo3d<'_> {
+    pub fn run(&self) -> Result<TrellisMesh> {
+        let device = super::Device::new(0)?;
+        let ops = super::ops::Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            self.runtime,
+            std::rc::Rc::new(super::closure::Closure::new(
+                false,
+                "TRELLIS.2 image to mesh".into(),
+            )),
+        )?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        let limit = (total - total / 8).saturating_sub(total - free);
+        let pipeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.model.join("pipeline.json"))?)?;
+        let models = &pipeline["args"]["models"];
+        ensure!(
+            pipeline["args"]["default_pipeline_type"] == "1024_cascade",
+            "the published default pipeline changed"
+        );
+        let checkpoint = |key: &str| -> Result<std::path::PathBuf> {
+            Ok(self.model.join(format!(
+                "ckpts/{}.safetensors",
+                models[key]
+                    .as_str()
+                    .context("pipeline model entry missing")?
+                    .trim_start_matches("ckpts/")
+            )))
+        };
+        let (processed, crop) = crate::backend::TrellisImageConditioner::preprocess_rgba(
+            self.rgba,
+            [self.dimensions[0], self.dimensions[1], 4],
+            1.0,
+        )?;
+        let mut conditioning = |side: u32| -> Result<(Vec<bf16>, usize)> {
+            let mut conditioner = crate::backend::TrellisImageConditioner::load(
+                &device,
+                &mut blas,
+                self.dino,
+                side,
+                &[],
+                limit,
+            )?;
+            let chw = crate::backend::TrellisImageConditioner::prepare_chw(
+                &processed,
+                [crop[0], crop[1], 3],
+                side,
+            )?;
+            let stages = conditioner.encode_stages(&blas, &chw, &[])?;
+            let tokens = stages.features.len() / 1024;
+            Ok((
+                stages.features.iter().map(|v| bf16::from_f32(*v)).collect(),
+                tokens,
+            ))
+        };
+        let (cond_512, ss_tokens) = conditioning(512)?;
+        let (cond_1024, hr_tokens) = conditioning(1024)?;
+        ensure!(
+            ss_tokens == 1029 && hr_tokens == 4101,
+            "conditioning token count mismatch"
+        );
+        let normalization = |kind: &str| -> Result<(Vec<f32>, Vec<f32>)> {
+            let entry = &pipeline["args"][format!("{kind}_slat_normalization")];
+            let read = |key: &str| -> Result<Vec<f32>> {
+                entry[key]
+                    .as_array()
+                    .context("normalization entry missing")?
+                    .iter()
+                    .map(|v| Ok(v.as_f64().context("normalization value")? as f32))
+                    .collect()
+            };
+            Ok((read("mean")?, read("std")?))
+        };
+        let (shape_mean, shape_std) = normalization("shape")?;
+        let (tex_mean, tex_std) = normalization("tex")?;
+        // Sparse-structure stage: the drawn flat sequence is the definition's
+        // channel-major [8, 4096] layout; the sampler state is row-major.
+        let ss_noise_flat = philox_normals(&device, self.seed, TRELLIS_NOISE_STREAMS[0], 8 * 4096)?;
+        let mut ss_noise = vec![0f32; ss_noise_flat.len()];
+        for (index, value) in ss_noise_flat.iter().enumerate() {
+            ss_noise[(index % 4096) * 8 + index / 4096] = *value;
+        }
+        let hr_coordinates = {
+            let mut flow = TrellisSsFlow::load(
+                &device,
+                &mut blas,
+                &checkpoint("sparse_structure_flow_model")?,
+                ss_tokens,
+                limit,
+            )?;
+            let (z_s, _) = flow.sample(
+                &blas,
+                &ss_noise,
+                &cond_512,
+                StageSampling {
+                    sparse: false,
+                    guided: true,
+                    concat: None,
+                },
+                false,
+            )?;
+            drop(flow);
+            let mut latent = vec![0f32; z_s.len()];
+            for (index, value) in z_s.iter().enumerate() {
+                latent[(index % 8) * 4096 + index / 8] = *value;
+            }
+            let decoder = super::pixal3d::PixalDecoder::open(
+                &device,
+                &self.model.join(".."),
+                crate::pixal3d::DecoderKind::Structure,
+                self.runtime,
+                limit,
+            )?;
+            let logits = decoder.structure(&latent)?;
+            let sites = super::pixal3d::PixalDecoder::structure_sites(&logits, 64, 32)?;
+            let lr_sites: Vec<[i32; 3]> = sites
+                .coordinates()
+                .iter()
+                .map(|c| [c[1], c[2], c[3]])
+                .collect();
+            let lr_noise = philox_normals(
+                &device,
+                self.seed,
+                TRELLIS_NOISE_STREAMS[1],
+                lr_sites.len() * 32,
+            )?;
+            let lr_slat = {
+                let mut flow = TrellisSsFlow::load_flow(
+                    &device,
+                    &mut blas,
+                    &checkpoint("shape_slat_flow_model_512")?,
+                    &lr_sites,
+                    ss_tokens,
+                    limit,
+                    true,
+                )?;
+                let (state, _) = flow.sample(
+                    &blas,
+                    &lr_noise,
+                    &cond_512,
+                    StageSampling {
+                        sparse: true,
+                        guided: true,
+                        concat: None,
+                    },
+                    false,
+                )?;
+                drop(flow);
+                normalize_slat(&state, &shape_mean, &shape_std)
+            };
+            {
+                let decoder = super::pixal3d::PixalDecoder::open(
+                    &device,
+                    self.model,
+                    crate::pixal3d::DecoderKind::Shape,
+                    self.runtime,
+                    limit,
+                )?;
+                let coords4: Vec<[i32; 4]> =
+                    lr_sites.iter().map(|c| [0, c[0], c[1], c[2]]).collect();
+                let (decoded, _) = decoder.decode(coords4, &lr_slat, &[])?;
+                decoded.coordinates
+            }
+        };
+        // Published cascade rule: truncating quantize-unique with the -128
+        // reduction while the token count stays >= 49152 (floor 1024).
+        let quantize = |resolution: usize| -> Vec<[i32; 4]> {
+            let mut quantized: Vec<[i32; 4]> = hr_coordinates
+                .iter()
+                .map(|c| {
+                    [
+                        c[0],
+                        (((c[1] as f64 + 0.5) / 512.0 * (resolution as f64 / 16.0)) as i32),
+                        (((c[2] as f64 + 0.5) / 512.0 * (resolution as f64 / 16.0)) as i32),
+                        (((c[3] as f64 + 0.5) / 512.0 * (resolution as f64 / 16.0)) as i32),
+                    ]
+                })
+                .collect();
+            quantized.sort_unstable();
+            quantized.dedup();
+            quantized
+        };
+        let mut hr_resolution = 1024usize;
+        let mut hr_sites4 = quantize(hr_resolution);
+        while hr_sites4.len() >= 49152 && hr_resolution > 1024 {
+            hr_resolution -= 128;
+            hr_sites4 = quantize(hr_resolution);
+        }
+        let hr_sites: Vec<[i32; 3]> = hr_sites4.iter().map(|c| [c[1], c[2], c[3]]).collect();
+        let hr_noise = philox_normals(
+            &device,
+            self.seed,
+            TRELLIS_NOISE_STREAMS[2],
+            hr_sites.len() * 32,
+        )?;
+        let shape_slat = {
+            let mut flow = TrellisSsFlow::load_flow(
+                &device,
+                &mut blas,
+                &checkpoint("shape_slat_flow_model_1024")?,
+                &hr_sites,
+                hr_tokens,
+                limit,
+                true,
+            )?;
+            let (state, _) = flow.sample(
+                &blas,
+                &hr_noise,
+                &cond_1024,
+                StageSampling {
+                    sparse: true,
+                    guided: true,
+                    concat: None,
+                },
+                false,
+            )?;
+            drop(flow);
+            normalize_slat(&state, &shape_mean, &shape_std)
+        };
+        let (mesh, guides) = {
+            let decoder = super::pixal3d::PixalDecoder::open(
+                &device,
+                self.model,
+                crate::pixal3d::DecoderKind::Shape,
+                self.runtime,
+                limit,
+            )?;
+            let latent = device.stream.clone_htod(&shape_slat)?;
+            let (mesh, guides) = decoder.shape_mesh_device(
+                hr_sites4.clone(),
+                latent,
+                u32::try_from(hr_resolution)?,
+            )?;
+            (mesh, guides)
+        };
+        ensure!(!guides.is_empty(), "shape decode produced no guides");
+        let tex_noise = philox_normals(
+            &device,
+            self.seed,
+            TRELLIS_NOISE_STREAMS[3],
+            hr_sites.len() * 32,
+        )?;
+        let concat: Vec<bf16> = shape_slat
+            .chunks(32)
+            .flat_map(|row| {
+                (0..32).map(|channel| {
+                    bf16::from_f32((row[channel] - shape_mean[channel]) / shape_std[channel])
+                })
+            })
+            .collect();
+        let tex_slat = {
+            let mut flow = TrellisSsFlow::load_flow(
+                &device,
+                &mut blas,
+                &checkpoint("tex_slat_flow_model_1024")?,
+                &hr_sites,
+                hr_tokens,
+                limit,
+                false,
+            )?;
+            let (state, _) = flow.sample(
+                &blas,
+                &tex_noise,
+                &cond_1024,
+                StageSampling {
+                    sparse: true,
+                    guided: false,
+                    concat: Some(&concat),
+                },
+                false,
+            )?;
+            drop(flow);
+            normalize_slat(&state, &tex_mean, &tex_std)
+        };
+        let material = {
+            let decoder = super::pixal3d::PixalDecoder::open(
+                &device,
+                self.model,
+                crate::pixal3d::DecoderKind::Texture,
+                self.runtime,
+                limit,
+            )?;
+            let latent = device.stream.clone_htod(&tex_slat)?;
+            let (decoded, generated) = decoder.decode_device(hr_sites4, latent, &guides)?;
+            ensure!(
+                generated.is_empty(),
+                "texture decoder predicted subdivision"
+            );
+            decoded.features
+        };
+        Ok(TrellisMesh {
+            vertices: mesh.vertices,
+            faces: mesh.faces,
+            material,
+            resolution: u32::try_from(hr_resolution)?,
+        })
+    }
 }
 
 fn ensure_captured_blocks(blocks: &[usize], total: usize, slots: usize) -> Result<()> {
@@ -1043,6 +1397,32 @@ mod tests {
             sampler_live_bytes(rows, channels, false),
             4 * rows * channels * 3
         );
+        Ok(())
+    }
+
+    #[ignore = "TRELLIS.2 noise draws: requires admitted GPU"]
+    #[test]
+    fn trellis_noise_draws_are_seeded_per_stream() -> Result<()> {
+        let device = super::Device::new(0)?;
+        let count = 256usize;
+        let draw = |seed: u64, stream: u64| -> Result<Vec<f32>> {
+            super::philox_normals(&device, seed, stream, count)
+        };
+        let reference = draw(42, super::TRELLIS_NOISE_STREAMS[0])?;
+        // Same seed and stream: bit-identical redraw.
+        let repeat = draw(42, super::TRELLIS_NOISE_STREAMS[0])?;
+        assert_eq!(reference, repeat);
+        // Seed + 1 changes every draw's bits (the control).
+        let seeded = draw(43, super::TRELLIS_NOISE_STREAMS[0])?;
+        assert_ne!(reference, seeded);
+        // The four documented stream ids are pairwise distinct, and each
+        // stream's counter range is disjoint: draws at the same seed differ.
+        for (index, stream) in super::TRELLIS_NOISE_STREAMS.iter().enumerate() {
+            for other in &super::TRELLIS_NOISE_STREAMS[index + 1..] {
+                assert_ne!(stream, other);
+                assert_ne!(draw(42, *stream)?, draw(42, *other)?);
+            }
+        }
         Ok(())
     }
 

@@ -192,6 +192,29 @@ enum Command {
     Transcribe(TranscribeArgs),
     Diarize(DiarizeArgs),
     Embed(EmbedArgs),
+    /// Image to 3D mesh.
+    #[command(name = "to-3d")]
+    To3d {
+        #[arg(
+            value_name = "IMAGE",
+            help = "input PNG with alpha; the background must already be removed (RMBG-2.0 integration is pending)"
+        )]
+        image: PathBuf,
+        #[arg(long, help = "DINOv3 encoder directory")]
+        dino: PathBuf,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "request seed for the four stage noise draws"
+        )]
+        seed: u64,
+        #[arg(
+            short = 'o',
+            long = "output",
+            help = "output mesh (.ply or .obj); GLB, texture bake and render are out of scope"
+        )]
+        output: PathBuf,
+    },
     Image {
         #[arg(long, help = "Image description in natural language")]
         prompt: String,
@@ -1178,6 +1201,68 @@ fn run() -> Result<()> {
             };
             image(&cli, request, output, *json)
         }
+        #[cfg(feature = "cuda")]
+        Command::To3d {
+            image,
+            dino,
+            seed,
+            output,
+        } => {
+            let (rgba, width, height) =
+                flyingfish::serve::image::decode_image_rgba(&fs::read(image)?, None)?;
+            let runtime_dir = cli
+                .kernels
+                .runtime_dir
+                .clone()
+                .context("--runtime-dir is required for to-3d")?;
+            let request = flyingfish::backend::TrellisTo3d {
+                model: &cli.model,
+                dino,
+                runtime: &runtime_dir,
+                rgba: &rgba,
+                dimensions: [height, width],
+                seed: *seed,
+            };
+            let mesh = request.run()?;
+            let rgb: Vec<u8> = mesh
+                .material
+                .chunks(6)
+                .flat_map(|row| {
+                    [row[0], row[1], row[2]]
+                        .iter()
+                        .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
+                        .collect::<Vec<u8>>()
+                })
+                .collect();
+            let metallic: Vec<f32> = mesh.material.chunks(6).map(|row| row[3]).collect();
+            let roughness: Vec<f32> = mesh.material.chunks(6).map(|row| row[4]).collect();
+            let alpha: Vec<f32> = mesh.material.chunks(6).map(|row| row[5]).collect();
+            let view = flyingfish::media::MeshWrite {
+                positions: &mesh.vertices,
+                triangles: &mesh.faces,
+                rgb: Some(&rgb),
+                extras: &[
+                    ("metallic", &metallic),
+                    ("roughness", &roughness),
+                    ("alpha", &alpha),
+                ],
+            };
+            match output.extension().and_then(|e| e.to_str()) {
+                Some("ply") => flyingfish::media::write_ply(fs::File::create(output)?, &view)?,
+                Some("obj") => flyingfish::media::write_obj(fs::File::create(output)?, &view)?,
+                other => bail!("output must be .ply or .obj, got {other:?}"),
+            }
+            println!(
+                "wrote {} vertices {} faces resolution {} to {}",
+                mesh.vertices.len() / 3,
+                mesh.faces.len() / 3,
+                mesh.resolution,
+                output.display()
+            );
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        Command::To3d { .. } => bail!("to-3d requires CUDA"),
         Command::Video {
             prompt,
             image,
@@ -1808,6 +1893,7 @@ mod tests {
         assert_eq!(cli.device, 1);
         assert_eq!(cli.kernels.runtime_dir, Some(PathBuf::from("runtime")));
         match cli.command {
+            Command::To3d { .. } => {}
             Command::Video {
                 prompt,
                 image,
