@@ -2092,17 +2092,28 @@ fn hyperflow_stored_placement_prints_124_resident_and_345_streamed() -> Result<(
     hyper.int8_convrot = Some((256, BTreeSet::new()));
     let frame_rows = (short.latent_height / hyper.patch[1]) * (short.latent_width / hyper.patch[2]);
     let rows = short.latent_frames * frame_rows + short.audio_latents * 2;
-    ensure!(rows == 37710, "124 scratch rows {rows}");
+    ensure!(
+        rows == 37710 && frame_rows == 1008,
+        "124 scratch rows {rows}"
+    );
+    let packed = rows + 2044 + 2 * frame_rows;
+    let text_rows = 2044usize;
+    ensure!(packed == 41770, "124 packed scratch rows {packed}");
     let (k, low_rank) = stored_scratch_extents(&hyper)?.context("hyperflow scratch")?;
     ensure!(
         k == 14336 && low_rank == 2,
         "scratch extents {k} {low_rank}"
     );
-    let rows_u = u64::try_from(rows)?;
-    let scratch =
-        rows_u * u64::try_from(k)? * 8 + rows_u * 4 + rows_u * u64::try_from(low_rank.max(1))? * 2;
+    let per_row = |n: usize| -> Result<u64> {
+        let n = u64::try_from(n)?;
+        Ok(n * u64::try_from(k)? * 8 + n * 4 + n * u64::try_from(low_rank.max(1))? * 2)
+    };
+    let video_audio_scratch = per_row(rows)?;
+    let scratch = per_row(packed)? + per_row(text_rows)?;
     ensure!(
-        stored_scratch_bytes(&hyper, rows)? == scratch && scratch > (4u64 << 30),
+        stored_scratch_bytes(&hyper, packed)? == per_row(packed)?
+            && stored_scratch_bytes(&hyper, text_rows)? == per_row(text_rows)?
+            && scratch > video_audio_scratch,
         "scratch bytes {scratch}"
     );
     let hyper_act = unchunked_activation_bytes(&hyper, &short)?;
@@ -2113,6 +2124,15 @@ fn hyperflow_stored_placement_prints_124_resident_and_345_streamed() -> Result<(
     ensure!(
         !report_stored_placement(&hyper, &short, weights + short_act, weights)?,
         "old 124 budget accepted the convrot scratch"
+    );
+    ensure!(
+        !report_stored_placement(
+            &hyper,
+            &short,
+            weights + short_act + video_audio_scratch,
+            weights
+        )?,
+        "video-plus-audio scratch accepted the text copy"
     );
     ensure!(
         report_stored_placement(&hyper, &short, weights + hyper_act, weights)?,

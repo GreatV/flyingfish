@@ -28,6 +28,10 @@ const MAX_SECONDS: f64 = 15.0;
 const AUDIO_LATENTS_PER_SECOND: f64 = 40.0;
 /// Stereo audio rows are packed channel-major, one block per channel.
 const AUDIO_CHANNELS: usize = 2;
+/// Packed text-prefix rows a request can carry: prompt tokens plus keyframe vision tokens.
+const MAX_TEXT_ROWS: usize = 2044;
+/// A request can pack a first keyframe and a last keyframe.
+const MAX_KEYFRAME_ANCHORS: usize = 2;
 /// Conditioning video rows are pinned at `max(t, KEYFRAME_NOISE_AUG)`; keyframe anchors are noised to it.
 pub const KEYFRAME_NOISE_AUG: f64 = 0.999;
 /// Qwen3-VL hidden state that conditions the transformer (model definition `text_encoder_layer`).
@@ -562,7 +566,7 @@ pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
         .context("stored scratch bytes")
 }
 
-/// t2va bytes for video rows plus stereo audio rows: `(2 * hidden + 5 * width) * 2 + 6 * rope_freq_dim * 2 + heads * 4` per row, plus f32 video scratch `hidden * 4`, video latent `video_row_width * 4` and audio latent `audio_in_channels * 4`. A HyperFlow spec adds one convrot scratch at that row count. Text rows and keyframe rows are not included.
+/// t2va bytes for video rows plus stereo audio rows: `(2 * hidden + 5 * width) * 2 + 6 * rope_freq_dim * 2 + heads * 4` per row, plus f32 video scratch `hidden * 4`, video latent `video_row_width * 4` and audio latent `audio_in_channels * 4`. Text rows and keyframe rows are not included in those terms. A HyperFlow spec adds two convrot scratches: packed rows of that count plus `MAX_TEXT_ROWS` plus `MAX_KEYFRAME_ANCHORS` latent frames, and a second scratch of `MAX_TEXT_ROWS`.
 pub fn unchunked_activation_bytes(spec: &H3Spec, geometry: &Geometry) -> Result<u64> {
     ensure!(
         geometry.latent_height.is_multiple_of(spec.patch[1])
@@ -600,10 +604,20 @@ pub fn unchunked_activation_bytes(spec: &H3Spec, geometry: &Geometry) -> Result<
         .checked_mul(u64::try_from(spec.audio_in_channels)?)
         .and_then(|n| n.checked_mul(4))
         .context("activation audio")?;
+    let anchor_rows = u64::try_from(MAX_KEYFRAME_ANCHORS)?
+        .checked_mul(frame_rows)
+        .context("anchor rows")?;
+    let text_rows = u64::try_from(MAX_TEXT_ROWS)?;
+    let packed_rows = sequence_rows
+        .checked_add(text_rows)
+        .and_then(|n| n.checked_add(anchor_rows))
+        .context("packed scratch rows")?;
     let convrot = stored_scratch_bytes(
         spec,
-        usize::try_from(sequence_rows).context("activation rows")?,
-    )?;
+        usize::try_from(packed_rows).context("packed scratch rows")?,
+    )?
+    .checked_add(stored_scratch_bytes(spec, MAX_TEXT_ROWS)?)
+    .context("convrot scratch bytes")?;
     block
         .checked_add(scratch)
         .and_then(|n| n.checked_add(video))
