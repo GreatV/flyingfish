@@ -9,15 +9,12 @@ use flyingfish::{
     trace::Trace,
 };
 #[cfg(feature = "cuda")]
-use std::io::Read;
+use std::io::{Read, Write};
 use std::{
     fs,
     path::{Path, PathBuf},
     time::Instant,
 };
-
-#[cfg(feature = "cuda")]
-use std::io::{Read, Write};
 
 #[derive(Parser)]
 #[command(version)]
@@ -979,20 +976,6 @@ fn image(cli: &Cli, request: ImageCliRequest, output: &Path, json: bool) -> Resu
         request.expander = expander;
         request.references = references;
         let options = flyingfish::minimax_h3::ImageRunOptions {
-fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> {
-    let _ = (cli, text, seed, output);
-    #[cfg(not(feature = "cuda"))]
-    bail!("speak requires CUDA");
-    #[cfg(feature = "cuda")]
-    flyingfish::backend::with_verbose(cli.verbose, || {
-        let text = if text == "-" {
-            let mut input = String::new();
-            std::io::stdin().read_to_string(&mut input)?;
-            input
-        } else {
-            text.to_owned()
-        };
-        let options = flyingfish::RunOptions {
             device: cli.device,
             runtime_dir: cli
                 .kernels
@@ -1030,6 +1013,27 @@ fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> 
         }
         Ok(())
     })
+}
+
+fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> {
+    let _ = (cli, text, seed, output);
+    #[cfg(not(feature = "cuda"))]
+    bail!("speak requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        let text = if text == "-" {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            input
+        } else {
+            text.to_owned()
+        };
+        let options = flyingfish::RunOptions {
+            device: cli.device,
+            runtime_dir: cli
+                .kernels
+                .runtime_dir
+                .clone()
                 .context("--runtime-dir is required for speak")?,
             verbose: cli.verbose,
         };

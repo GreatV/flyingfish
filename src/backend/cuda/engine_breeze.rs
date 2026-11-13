@@ -20,7 +20,7 @@ use crate::backend::gpu::{
 };
 use crate::backend::setup::LinearShape;
 use crate::checkpoint::MappedCheckpoint;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use safetensors::Dtype;
 use std::cell::{Cell, RefCell};
@@ -263,6 +263,7 @@ struct Kern {
     rope_cast: CudaFunction,
     rope_skip: CudaFunction,
     embed_rows_sum: CudaFunction,
+    embed_code: CudaFunction,
     residual_scale: CudaFunction,
     distribution: CudaFunction,
     categorical: CudaFunction,
@@ -271,6 +272,9 @@ struct Kern {
     table_identity: CudaSlice<bf16>,
     table_backbone: CudaSlice<bf16>,
     table_depth: CudaSlice<bf16>,
+    depth_starts: CudaSlice<i32>,
+    depth_meta_one: CudaSlice<i32>,
+    depth_meta_two: CudaSlice<i32>,
     drains: Cell<u64>,
     h2d: Cell<u64>,
     d2h: Cell<u64>,
@@ -291,6 +295,7 @@ struct Kern {
 enum Replay {
     Step,
     Depth,
+    DepthSample,
     Prefill(usize),
     Text(usize),
 }
@@ -298,6 +303,7 @@ enum Replay {
 struct Captured {
     step: Option<CudaGraph>,
     depth: Option<CudaGraph>,
+    depth_sample: Option<CudaGraph>,
     prefill: Vec<(usize, CudaGraph)>,
     text: Vec<(usize, CudaGraph)>,
 }
@@ -307,6 +313,7 @@ impl Captured {
         match kind {
             Replay::Step => self.step.is_some(),
             Replay::Depth => self.depth.is_some(),
+            Replay::DepthSample => self.depth_sample.is_some(),
             Replay::Prefill(rows) => self.prefill.iter().any(|(n, _)| *n == rows),
             Replay::Text(rows) => self.text.iter().any(|(n, _)| *n == rows),
         }
@@ -316,6 +323,7 @@ impl Captured {
         match kind {
             Replay::Step => self.step.as_ref(),
             Replay::Depth => self.depth.as_ref(),
+            Replay::DepthSample => self.depth_sample.as_ref(),
             Replay::Prefill(rows) => self
                 .prefill
                 .iter()
@@ -329,6 +337,7 @@ impl Captured {
         match kind {
             Replay::Step => self.step = Some(graph),
             Replay::Depth => self.depth = Some(graph),
+            Replay::DepthSample => self.depth_sample = Some(graph),
             Replay::Prefill(rows) => self.prefill.push((rows, graph)),
             Replay::Text(rows) => self.text.push((rows, graph)),
         }
@@ -349,6 +358,8 @@ struct Buf {
     lv: Vec<CudaSlice<bf16>>,
     dk: CudaSlice<bf16>,
     dv: CudaSlice<bf16>,
+    ldk: Vec<CudaSlice<bf16>>,
+    ldv: Vec<CudaSlice<bf16>>,
     attn: CudaSlice<bf16>,
     audio: CudaSlice<bf16>,
     stack: CudaSlice<bf16>,
@@ -391,6 +402,7 @@ enum RopeKind {
 enum KvSlot {
     Shared,
     Depth,
+    DepthLayer(usize),
     Layer(usize),
 }
 
@@ -493,6 +505,7 @@ fn replay_d2d(kind: Replay) -> u64 {
     match kind {
         Replay::Step => (BB_H * 2) as u64,
         Replay::Depth => depth_d2d_bytes(),
+        Replay::DepthSample => depth_sample_d2d_bytes(),
         Replay::Prefill(_) | Replay::Text(_) => 0,
     }
 }
@@ -761,6 +774,29 @@ fn rope(
             },
             g,
         ),
+        KvSlot::DepthLayer(index) => {
+            let Buf {
+                qkv,
+                ldk,
+                ldv,
+                start,
+                ..
+            } = buf;
+            ensure!(index < ldk.len() && index < ldv.len(), "depth layer cache");
+            rope_launch(
+                k,
+                RopeBind {
+                    qkv,
+                    cache_k: &mut ldk[index],
+                    cache_v: &mut ldv[index],
+                    start,
+                    qn,
+                    kn,
+                    table,
+                },
+                g,
+            )
+        }
         KvSlot::Layer(index) => {
             let Buf {
                 qkv, lk, lv, start, ..
@@ -1148,7 +1184,8 @@ fn load_matrix(
 }
 
 fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
-    let h_elems = geometry.backbone * BB_H;
+    let workspace_rows = geometry.backbone.max(17);
+    let h_elems = workspace_rows * BB_H;
     let kv_elems = BB_KV * geometry.backbone * BB_DIM;
     let mut lk = Vec::with_capacity(BB_LAYERS);
     let mut lv = Vec::with_capacity(BB_LAYERS);
@@ -1156,25 +1193,36 @@ fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
         lk.push(stream.alloc_zeros(kv_elems)?);
         lv.push(stream.alloc_zeros(kv_elems)?);
     }
+    let depth_kv_elems = DP_KV * DP_ROWS * DP_DIM;
+    let mut ldk = Vec::with_capacity(DP_LAYERS);
+    let mut ldv = Vec::with_capacity(DP_LAYERS);
+    for _ in 0..DP_LAYERS {
+        ldk.push(stream.alloc_zeros(depth_kv_elems)?);
+        ldv.push(stream.alloc_zeros(depth_kv_elems)?);
+    }
+    let head_in_rows = geometry.frames.max((CODEBOOK as usize).div_ceil(DP_H));
+    let head_out_rows = geometry.frames.max(gemm_rows(1, DP_H) + HEAD_N);
     Ok(Buf {
         h: stream.alloc_zeros(h_elems)?,
         n: stream.alloc_zeros(h_elems)?,
-        d: stream.alloc_zeros(geometry.backbone * BB_VOCAB)?,
+        d: stream.alloc_zeros(workspace_rows * BB_VOCAB)?,
         gate: stream.alloc_zeros(MLP_ELEMS)?,
         up: stream.alloc_zeros(MLP_ELEMS)?,
         act: stream.alloc_zeros(MLP_ELEMS)?,
-        qkv: stream.alloc_zeros(geometry.backbone * (BB_Q + BB_KVW + BB_KVW))?,
+        qkv: stream.alloc_zeros(workspace_rows * (BB_Q + BB_KVW + BB_KVW))?,
         k: stream.alloc_zeros(kv_elems)?,
         v: stream.alloc_zeros(kv_elems)?,
         lk,
         lv,
         dk: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
         dv: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
+        ldk,
+        ldv,
         attn: stream.alloc_zeros(h_elems)?,
         audio: stream.alloc_zeros(geometry.frames * BB_H)?,
         stack: stream.alloc_zeros(geometry.frames * DP_ROWS * DP_H)?,
-        head_in: stream.alloc_zeros(geometry.frames * DP_H)?,
-        head_out: stream.alloc_zeros(geometry.frames * (CODEBOOK as usize))?,
+        head_in: stream.alloc_zeros(head_in_rows * DP_H)?,
+        head_out: stream.alloc_zeros(head_out_rows * (CODEBOOK as usize))?,
         embed_ws: stream.alloc_zeros(EMBED_WS)?,
         meta: stream.alloc_zeros(8)?,
         start: stream.alloc_zeros(1)?,
@@ -1697,6 +1745,18 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
         KvSlot::Depth => {
             call.flash
                 .run(&buf.qkv, q_width, &buf.dk, &buf.dv, &mut buf.attn, shape)?;
+        }
+        KvSlot::DepthLayer(index) => {
+            let Buf {
+                qkv,
+                ldk,
+                ldv,
+                attn,
+                ..
+            } = buf;
+            ensure!(index < ldk.len() && index < ldv.len(), "depth layer cache");
+            call.flash
+                .run(qkv, q_width, &ldk[index], &ldv[index], attn, shape)?;
         }
         KvSlot::Layer(index) => {
             let Buf {
@@ -2602,6 +2662,265 @@ fn depth_step(
     download_elems(k, &buf.head_out, pack, packed)
 }
 
+fn depth_sample_d2d_bytes() -> u64 {
+    (HEAD_N * 9 * 4) as u64
+}
+
+fn stage_depth_runtime(k: &Kern, buf: &mut Buf, rows: usize, start: usize) -> Result<()> {
+    if k.graph_on.get() {
+        let meta = match rows {
+            1 => &k.depth_meta_one,
+            2 => &k.depth_meta_two,
+            _ => bail!("depth sample rows {rows}"),
+        };
+        copy_d2d(k, meta, &mut buf.meta)?;
+        copy_d2d(k, &k.depth_starts.slice(start..start + 1), &mut buf.start)
+    } else {
+        set_meta(k, &mut buf.meta, rows)?;
+        upload_origin(k, &mut buf.start, i32::try_from(start)?)
+    }
+}
+
+struct DepthSampleRun<'a> {
+    layers: &'a [DecoderLayer],
+    norm: &'a CudaSlice<bf16>,
+    projector: &'a CudaSlice<bf16>,
+    table: &'a CudaSlice<bf16>,
+    flash: &'a mut Flash,
+    rows: usize,
+    start: usize,
+}
+
+fn depth_sample_transform(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    run: DepthSampleRun<'_>,
+) -> Result<()> {
+    let DepthSampleRun {
+        layers,
+        norm,
+        projector,
+        table,
+        flash,
+        rows,
+        start,
+    } = run;
+    gemm(
+        k,
+        blas,
+        Gemm {
+            w: projector,
+            x: &mut buf.embed_ws,
+            y: &mut buf.h,
+            x_off: 0,
+            y_off: 0,
+            logical: rows,
+            output: DP_H,
+            input: BB_H,
+        },
+    )?;
+    let geom = DecGeom {
+        rows,
+        hidden: DP_H,
+        intermediate: DP_I,
+        q_heads: DP_HEADS,
+        kv_heads: DP_KV,
+        dim: DP_DIM,
+        eps: DP_EPS,
+    };
+    for (index, layer) in layers.iter().enumerate() {
+        decoder_layer(
+            k,
+            buf,
+            blas,
+            DecPass {
+                layer,
+                table,
+                flash: &mut *flash,
+                kind: RopeKind::Skip,
+                geom,
+                origin: i32::try_from(start)?,
+                capacity: DP_ROWS,
+                slot: KvSlot::DepthLayer(index),
+            },
+        )?;
+    }
+    rms(
+        k,
+        &buf.meta,
+        Rms {
+            x: &buf.h,
+            y: &mut buf.n,
+            w: norm,
+            rows,
+            width: DP_H,
+            mode: RmsMode::Standard,
+            eps: DP_EPS,
+        },
+    )
+}
+
+struct DepthSampleHead<'a> {
+    weight: &'a CudaSlice<bf16>,
+    head: usize,
+    hidden_row: usize,
+    counter: u64,
+    sampling: crate::sampling::Sampling,
+    seed: u64,
+}
+
+fn depth_sample_head(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    call: DepthSampleHead<'_>,
+) -> Result<()> {
+    ensure!(
+        call.head < HEAD_N && call.hidden_row < DP_ROWS,
+        "depth sample head"
+    );
+    gemm(
+        k,
+        blas,
+        Gemm {
+            w: call.weight,
+            x: &mut buf.n,
+            y: &mut buf.head_out,
+            x_off: call.hidden_row * DP_H,
+            y_off: 0,
+            logical: 1,
+            output: CODEBOOK as usize,
+            input: DP_H,
+        },
+    )?;
+    sample_rows(
+        k,
+        &buf.head_out,
+        &mut buf.probabilities,
+        &mut buf.picked,
+        SampleRequest {
+            source_start: 0,
+            picked_start: call.head + 1,
+            rows: 1,
+            vocab: CODEBOOK as usize,
+            sampling: call.sampling,
+            seed: call.seed,
+            stream: 1,
+            counter: call.counter,
+            allow: -1,
+        },
+    )
+}
+
+fn embed_sampled(
+    k: &Kern,
+    buf: &mut Buf,
+    weight: &CudaSlice<bf16>,
+    code_slot: usize,
+    book: usize,
+    row: usize,
+) -> Result<()> {
+    ensure!(
+        code_slot < BOOKS && book < HEAD_N && row < DP_ROWS,
+        "sampled embed"
+    );
+    let code = buf.picked.slice(code_slot..code_slot + 1);
+    let mut out = buf.embed_ws.slice_mut(row * BB_H..(row + 1) * BB_H);
+    let offset = i32::try_from(book * CODEBOOK as usize)?;
+    unsafe {
+        k.stream
+            .launch_builder(&k.embed_code)
+            .arg(weight)
+            .arg(&code)
+            .arg(&mut out)
+            .arg(&offset)
+            .arg(&CODEBOOK)
+            .arg(&(BB_H as i32))
+            .arg(&1i32)
+            .launch(ops::flat(BB_H))?;
+    }
+    Ok(())
+}
+
+struct DepthSample<'a> {
+    w: &'a Weights,
+    flash: &'a mut Flash,
+    cond: &'a [f32],
+    frame: usize,
+    sampling: crate::sampling::Sampling,
+    seed: u64,
+}
+
+fn sample_depth(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthSample<'_>) -> Result<()> {
+    stage_depth_cond(k, buf, step.cond)?;
+    let flash = &mut *step.flash;
+    let counter = depth_sample_counter(step.frame);
+    with_graph(k, Replay::DepthSample, || {
+        embed_sampled(k, buf, &step.w.audio, 0, 0, 1)?;
+        stage_depth_runtime(k, buf, 2, 0)?;
+        depth_sample_transform(
+            k,
+            buf,
+            blas,
+            DepthSampleRun {
+                layers: &step.w.depth,
+                norm: &step.w.depth_norm,
+                projector: &step.w.projector,
+                table: &k.table_depth,
+                flash: &mut *flash,
+                rows: 2,
+                start: 0,
+            },
+        )?;
+        depth_sample_head(
+            k,
+            buf,
+            blas,
+            DepthSampleHead {
+                weight: &step.w.heads[0],
+                head: 0,
+                hidden_row: 1,
+                counter,
+                sampling: step.sampling,
+                seed: step.seed,
+            },
+        )?;
+        for head in 1..HEAD_N {
+            embed_sampled(k, buf, &step.w.audio, head, head, 0)?;
+            stage_depth_runtime(k, buf, 1, head + 1)?;
+            depth_sample_transform(
+                k,
+                buf,
+                blas,
+                DepthSampleRun {
+                    layers: &step.w.depth,
+                    norm: &step.w.depth_norm,
+                    projector: &step.w.projector,
+                    table: &k.table_depth,
+                    flash: &mut *flash,
+                    rows: 1,
+                    start: head + 1,
+                },
+            )?;
+            depth_sample_head(
+                k,
+                buf,
+                blas,
+                DepthSampleHead {
+                    weight: &step.w.heads[head],
+                    head,
+                    hidden_row: 0,
+                    counter: counter + head as u64,
+                    sampling: step.sampling,
+                    seed: step.seed,
+                },
+            )?;
+        }
+        Ok(())
+    })
+}
+
 fn decode_shape(
     projected: &[f32],
     cond: &[f32],
@@ -2696,6 +3015,7 @@ impl Breeze {
         let rope_cast = rope_module.load_function("qknorm_rope_table_kv_cast")?;
         let rope_skip = rope_module.load_function("qknorm_rope_table_kv_skip")?;
         let embed_rows_sum = embed_module.load_function("embed_rows_sum")?;
+        let embed_code = embed_module.load_function("embed_code_broadcast")?;
         let residual_scale = act_module.load_function("residual_scale")?;
         let distribution = sample_module.load_function("distribution_rows_bf16")?;
         let categorical = sample_module.load_function("categorical_sample_rows")?;
@@ -2715,6 +3035,10 @@ impl Breeze {
             },
         )?;
         let table_depth = upload_table(&stream, DP_ROWS, DP_DIM, RopeLaw::Llama3)?;
+        let depth_starts = stream.clone_htod(&(0..i32::try_from(DP_ROWS)?).collect::<Vec<_>>())?;
+        let depth_meta_one = stream.clone_htod(&[0, 1, 1, 1, 1, 0, 0, 0])?;
+        let depth_meta_two = stream.clone_htod(&[0, 2, 2, 2, 1, 0, 0, 0])?;
+        stream.synchronize()?;
         let (slide_left, slide_right) = flash::window_radii(512);
         ensure!(slide_left == 255 && slide_right == 256, "window radii");
         let text_full = Flash::new(stream.clone(), TEXT_MAX, TEXT_HEADS, TEXT_KV, TEXT_DIM)
@@ -2760,6 +3084,7 @@ impl Breeze {
                 rope_cast,
                 rope_skip,
                 embed_rows_sum,
+                embed_code,
                 residual_scale,
                 distribution,
                 categorical,
@@ -2768,6 +3093,9 @@ impl Breeze {
                 table_identity,
                 table_backbone,
                 table_depth,
+                depth_starts,
+                depth_meta_one,
+                depth_meta_two,
                 drains: Cell::new(0),
                 h2d: Cell::new(0),
                 d2h: Cell::new(0),
@@ -2777,6 +3105,7 @@ impl Breeze {
                 captured: RefCell::new(Captured {
                     step: None,
                     depth: None,
+                    depth_sample: None,
                     prefill: Vec::new(),
                     text: Vec::new(),
                 }),
@@ -3173,35 +3502,17 @@ impl Breeze {
             let cond = download_row(k, &buf.n, score_row, BB_H)?;
             let mut codes = [0i32; BOOKS];
             codes[0] = i32::try_from(backbone)?;
-            depth_step(
+            sample_depth(
                 k,
                 buf,
                 blas,
-                DepthStep {
+                DepthSample {
                     w,
                     flash: &mut flash.depth,
                     cond: &cond,
-                    codes: &codes,
                     frame,
-                    plant: false,
-                },
-                false,
-            )?;
-            sample_rows(
-                k,
-                &buf.head_out,
-                &mut buf.probabilities,
-                &mut buf.picked,
-                SampleRequest {
-                    source_start: gemm_rows(1, DP_H) * CODEBOOK as usize,
-                    picked_start: 1,
-                    rows: HEAD_N,
-                    vocab: CODEBOOK as usize,
                     sampling,
                     seed,
-                    stream: 1,
-                    counter: depth_sample_counter(frame),
-                    allow: -1,
                 },
             )?;
             let depth = download_u32(k, &buf.picked, 1, HEAD_N)?;
@@ -4085,6 +4396,53 @@ mod tests {
             .is_err(),
             "65 frames"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher Philox fixture"]
+    fn breeze_sample_prefix_matches_publisher_philox() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let expected = doc["expected_codes"]
+            .as_array()
+            .context("expected codes")?
+            .iter()
+            .map(|value| {
+                i32::try_from(value.as_i64().context("expected code")?).context("expected code")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(expected.len() == super::BOOKS, "expected frame");
+        let runtime = RuntimeDir::with_prefix("n8-sample-prefix")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 1)?;
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let codes = model.sample_decode(
+            &projected,
+            prompt.len(),
+            crate::sampling::Sampling::new(0.9, 50, 1.0)?,
+            42,
+        )?;
+        ensure!(
+            codes[..6] == expected[..6],
+            "sampled prefix {codes:?} != {expected:?}"
+        );
+        ensure!(
+            codes.iter().all(|id| (0..2048).contains(id)),
+            "reserved sampled token {codes:?}"
+        );
+        println!("BREEZE_SAMPLE_PREFIX PASS frames=1 prefix_books=6 seed=42");
         Ok(())
     }
 
