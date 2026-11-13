@@ -4450,7 +4450,7 @@ mod tests {
     #[ignore = "requires GPU lease and publisher teacher trace"]
     fn breeze_teacher_eos_matches_publisher_frames() -> Result<()> {
         const ROW_MAX: f32 = 0.25;
-        const EOS_PROB_MAX: f64 = 0.03;
+        const EOS_PROB_MAX: f64 = 0.0013277586549520493;
         const TRANSFORM_MAX: f32 = 1e-5;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
