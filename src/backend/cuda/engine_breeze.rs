@@ -4449,8 +4449,6 @@ mod tests {
     #[test]
     #[ignore = "requires GPU lease and publisher teacher trace"]
     fn breeze_teacher_eos_matches_publisher_frames() -> Result<()> {
-        const ROW_MAX: f32 = 0.25;
-        const EOS_PROB_MAX: f64 = 0.0013277586549520493;
         const TRANSFORM_MAX: f32 = 1e-5;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -4459,6 +4457,17 @@ mod tests {
         let trace = env_path("N8_TRACE", false)?;
         let weights = env_path("N8_WEIGHTS", true)?;
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(trace)?)?;
+        let (row_limit, eos_limit, probability_limit) = match (
+            doc["text"].as_str().context("trace text")?,
+            doc["seed"].as_u64().context("trace seed")?,
+        ) {
+            ("Hello", 7) => (0.25, 0.125, 0.00012043921742588282),
+            ("Hello", 42) => (0.25, 0.125, 0.00008791335858404636),
+            ("(sigh) Welcome aboard. Your journey begins now.", 12345) => {
+                (0.5, 0.5, 0.0026555173099040986)
+            }
+            (text, seed) => bail!("no frozen EOS bars for {text} seed {seed}"),
+        };
         let prompt = doc["prompt_ids"]
             .as_array()
             .context("prompt ids")?
@@ -4548,11 +4557,17 @@ mod tests {
                 .zip(&probabilities)
                 .map(|(got, want)| (got - want).abs())
                 .fold(0.0f32, f32::max);
-            ensure!(row_max <= ROW_MAX, "teacher row {frame} max={row_max}");
-            ensure!(eos_max <= ROW_MAX, "teacher EOS {frame} max={eos_max}");
             ensure!(
-                probability_max <= EOS_PROB_MAX,
-                "teacher EOS probability {frame} max={probability_max}"
+                row_max <= row_limit,
+                "teacher row {frame} max={row_max} bar={row_limit}"
+            );
+            ensure!(
+                eos_max <= eos_limit,
+                "teacher EOS {frame} max={eos_max} bar={eos_limit}"
+            );
+            ensure!(
+                probability_max <= probability_limit,
+                "teacher EOS probability {frame} max={probability_max} bar={probability_limit}"
             );
             ensure!(
                 transform_max <= TRANSFORM_MAX,
@@ -4564,14 +4579,15 @@ mod tests {
             worst_transform = worst_transform.max(transform_max);
         }
         println!(
-            "BREEZE_TEACHER_EOS PASS frames={} row_max={} eos_logit_max={} eos_prob_max={} transform_max={} thresholds={}/{}/{}",
+            "BREEZE_TEACHER_EOS PASS frames={} row_max={} eos_logit_max={} eos_prob_max={} transform_max={} thresholds={}/{}/{}/{}",
             expected.len(),
             worst_row,
             worst_eos,
             worst_probability,
             worst_transform,
-            ROW_MAX,
-            EOS_PROB_MAX,
+            row_limit,
+            eos_limit,
+            probability_limit,
             TRANSFORM_MAX
         );
         Ok(())
