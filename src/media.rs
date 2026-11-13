@@ -761,8 +761,185 @@ pub fn write_rttm(mut writer: impl Write, file_id: &str, segments: &[TextSegment
     Ok(())
 }
 
+/// A triangle mesh for the mesh writers: row-major positions [rows, 3],
+/// triangle indices [faces, 3], optional per-vertex RGB bytes [rows, 3] and
+/// named extra per-vertex float channels [rows].
+pub struct MeshWrite<'a> {
+    pub positions: &'a [f32],
+    pub triangles: &'a [i32],
+    pub rgb: Option<&'a [u8]>,
+    pub extras: &'a [(&'a str, &'a [f32])],
+}
+
+impl MeshWrite<'_> {
+    fn rows(&self) -> Result<usize> {
+        let rows = self.positions.len() / 3;
+        ensure!(
+            !self.positions.is_empty() && self.positions.len() == rows * 3,
+            "mesh positions extent"
+        );
+        ensure!(
+            self.triangles.len().is_multiple_of(3),
+            "mesh triangle extent"
+        );
+        if let Some(rgb) = self.rgb {
+            ensure!(rgb.len() == rows * 3, "mesh RGB extent");
+        }
+        for (name, values) in self.extras {
+            ensure!(values.len() == rows, "mesh extra channel {name} extent");
+        }
+        Ok(rows)
+    }
+}
+
+/// Binary little-endian PLY with float x y z, optional uchar red green blue
+/// and named float extras, and uchar-count/int-index triangle lists. The
+/// publisher's mesh export stores vertex colours as bytes scaled linearly
+/// from the attribute values (o_voxel postprocess.py:281-284); no sRGB
+/// conversion is applied here either.
+pub fn write_ply(mut writer: impl Write, mesh: &MeshWrite<'_>) -> Result<()> {
+    let rows = mesh.rows()?;
+    let faces = mesh.triangles.len() / 3;
+    let mut header = format!(
+        "ply\nformat binary_little_endian 1.0\nelement vertex {rows}\nproperty float x\nproperty float y\nproperty float z\n"
+    );
+    if mesh.rgb.is_some() {
+        header.push_str("property uchar red\nproperty uchar green\nproperty uchar blue\n");
+    }
+    for (name, _) in mesh.extras {
+        header.push_str(&format!("property float {name}\n"));
+    }
+    header.push_str(&format!(
+        "element face {faces}\nproperty list uchar int vertex_index\nend_header\n"
+    ));
+    writer.write_all(header.as_bytes())?;
+    let mut vertex = Vec::with_capacity(12 + 3 + 4 * mesh.extras.len());
+    for row in 0..rows {
+        vertex.clear();
+        for value in &mesh.positions[row * 3..row * 3 + 3] {
+            vertex.extend_from_slice(&value.to_le_bytes());
+        }
+        if let Some(rgb) = mesh.rgb {
+            vertex.extend_from_slice(&rgb[row * 3..row * 3 + 3]);
+        }
+        for (_, values) in mesh.extras {
+            vertex.extend_from_slice(&values[row].to_le_bytes());
+        }
+        writer.write_all(&vertex)?;
+    }
+    for face in mesh.triangles.as_chunks::<3>().0 {
+        writer.write_all(&3u8.to_le_bytes())?;
+        for index in face {
+            writer.write_all(&index.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// OBJ with v x y z r g b (the common vertex-colour extension, RGB as [0, 1]
+/// floats from the byte channels) and 1-based f v1 v2 v3 triangles. Extra
+/// float channels have no OBJ slot and are not written.
+pub fn write_obj(mut writer: impl Write, mesh: &MeshWrite<'_>) -> Result<()> {
+    let rows = mesh.rows()?;
+    for row in 0..rows {
+        let [x, y, z] = [
+            mesh.positions[row * 3],
+            mesh.positions[row * 3 + 1],
+            mesh.positions[row * 3 + 2],
+        ];
+        if let Some(rgb) = mesh.rgb {
+            let [r, g, b] = [
+                f32::from(rgb[row * 3]) / 255.0,
+                f32::from(rgb[row * 3 + 1]) / 255.0,
+                f32::from(rgb[row * 3 + 2]) / 255.0,
+            ];
+            writeln!(writer, "v {x} {y} {z} {r} {g} {b}")?;
+        } else {
+            writeln!(writer, "v {x} {y} {z}")?;
+        }
+    }
+    for face in mesh.triangles.as_chunks::<3>().0 {
+        writeln!(writer, "f {} {} {}", face[0] + 1, face[1] + 1, face[2] + 1)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mesh_writers_round_trip() -> Result<()> {
+        // The index pattern crosses a base boundary (row 0 and row 9 touch
+        // both ends) so an OBJ off-by-one in the 1-based conversion moves a
+        // vertex; the RGB channels are 1/2/3-distinct per row so a channel
+        // swap changes every read; the extra channel carries row-index
+        // values that expose a row stride error.
+        let rows = 10usize;
+        let positions: Vec<f32> = (0..rows)
+            .flat_map(|row| [row as f32 * 0.5, -(row as f32), (row as f32) + 0.25])
+            .collect();
+        let triangles: Vec<i32> = (0..rows - 2)
+            .flat_map(|i| [i as i32, i as i32 + 1, 9])
+            .collect();
+        let rgb: Vec<u8> = (0..rows).flat_map(|row| [1 + row as u8, 2, 3]).collect();
+        let extras_source: Vec<f32> = (0..rows).map(|row| row as f32 * 7.0).collect();
+        let extras = [("quality", extras_source.as_slice())];
+        let mesh = MeshWrite {
+            positions: &positions,
+            triangles: &triangles,
+            rgb: Some(&rgb),
+            extras: &extras,
+        };
+        let mut ply = Vec::new();
+        write_ply(&mut ply, &mesh)?;
+        let text = String::from_utf8_lossy(&ply);
+        assert!(text.starts_with(
+            "ply
+format binary_little_endian 1.0
+element vertex 10
+"
+        ));
+        assert!(text.contains(
+            "property uchar red
+property uchar green
+property uchar blue
+property float quality
+"
+        ));
+        assert!(text.contains(
+            "element face 8
+property list uchar int vertex_index
+end_header
+"
+        ));
+        let header_end = ply.windows(10).position(|w| w == b"end_header").unwrap() + 11;
+        let body = &ply[header_end..];
+        // vertex 0: floats + rgb + extra, row stride 12 + 3 + 4 bytes
+        assert_eq!(body.len(), rows * 19 + 8 * 13);
+        // 0.0, 0.0, 0.25 as little-endian f32 bytes, then rgb, then extra
+        assert_eq!(&body[0..12], &[0u8, 0, 0, 0, 0, 0, 0, 128, 0, 0, 128, 62]);
+        assert_eq!(&body[12..15], &[1, 2, 3]);
+        assert_eq!(&body[15..19], &[0u8, 0, 0, 0]);
+        // vertex 9 exposes a stride or index error
+        let v9 = &body[9 * 19..10 * 19];
+        assert_eq!(&v9[0..4], &4.5f32.to_le_bytes());
+        assert_eq!(&v9[12..15], &[10, 2, 3]);
+        assert_eq!(&v9[15..19], &63.0f32.to_le_bytes());
+        // face 0: count byte + three int indices, 1:1 with the input
+        let faces = &body[rows * 19..];
+        assert_eq!(faces[0], 3);
+        assert_eq!(&faces[1..13], &[0u8, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0],);
+        let mut obj = Vec::new();
+        write_obj(&mut obj, &mesh)?;
+        let obj_text = String::from_utf8(obj)?;
+        let lines: Vec<&str> = obj_text.lines().collect();
+        assert_eq!(lines.len(), rows + rows - 2);
+        // vertex 10's colour line carries distinct r so a channel swap shows
+        assert!(lines[9].starts_with("v 4.5 -9 9.25 0.039215688 0.007843138 0.011764706"));
+        // the first face is 1-based: f 1 2 10, not f 0 1 9
+        assert_eq!(lines[rows], "f 1 2 10");
+        Ok(())
+    }
     use super::*;
     use std::io::Cursor;
 
