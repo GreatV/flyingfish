@@ -1149,9 +1149,12 @@ impl TrellisTo3d<'_> {
             for (index, value) in z_s.iter().enumerate() {
                 latent[(index % 8) * 4096 + index / 8] = *value;
             }
+            // pipeline.json names the structure decoder inside the
+            // TRELLIS-image-large package that ships beside this model.
+            let structure_root = self.model.join("../TRELLIS-image-large");
             let decoder = super::pixal3d::PixalDecoder::open(
                 &device,
-                &self.model.join(".."),
+                &structure_root,
                 crate::pixal3d::DecoderKind::Structure,
                 self.runtime,
                 limit,
