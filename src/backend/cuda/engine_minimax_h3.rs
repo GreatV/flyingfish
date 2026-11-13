@@ -38,6 +38,7 @@ use std::{
 mod audio;
 #[path = "engine_minimax_h3_pipeline.rs"]
 mod pipeline;
+pub use pipeline::image_latents;
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
@@ -2579,6 +2580,8 @@ pub(crate) struct ImageDit {
     euler: crate::backend::gpu::CudaFunction,
 }
 
+type ImageCaptured<'a> = (Option<&'a mut Vec<Vec<f32>>>, Option<&'a [Vec<f32>]>);
+
 impl ImageDit {
     pub(crate) fn new(
         d: &Device,
@@ -2996,14 +2999,18 @@ impl ImageDit {
     }
 
     /// Six published evaluations. `image` is updated in place on the generated rows; reference rows stay put.
+    /// `captured.0`, when present, receives the generated rows after each Euler update.
+    /// `captured.1`, when present, replaces `image` before evaluation k.
     pub(crate) fn sample(
         &mut self,
         c: &BlockContext<'_>,
         adaln: (&AdalnTable, &AdalnPlan),
         schedule: &ImageSchedule,
-        image: &CudaSlice<f32>,
+        image: &mut CudaSlice<f32>,
         text: &CudaSlice<bf16>,
+        captured: ImageCaptured<'_>,
     ) -> Result<()> {
+        let (mut trace, entering) = captured;
         let (table, plan) = adaln;
         let s = c.s;
         ensure!(
@@ -3011,11 +3018,26 @@ impl ImageDit {
                 && schedule.sigmas.len() == schedule.timesteps.len() + 1,
             "image plan and schedule differ"
         );
+        if let Some(steps) = trace.as_deref() {
+            ensure!(steps.is_empty(), "image step trace is not empty");
+        }
+        if let Some(steps) = entering {
+            ensure!(
+                steps.len() == plan.row_pairs.len()
+                    && steps.iter().all(|rows| {
+                        rows.len() == image.len() && rows.iter().all(|value| value.is_finite())
+                    }),
+                "image entering rows"
+            );
+        }
         let counts = (
             u32::try_from(plan.pairs.len())?,
             u32::try_from(plan.timesteps.len())?,
         );
         for k in 0..plan.row_pairs.len() {
+            if let Some(steps) = entering {
+                s.memcpy_htod(&steps[k], image)?;
+            }
             let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
             let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
             self.step(
@@ -3031,6 +3053,16 @@ impl ImageDit {
                 },
             )?;
             self.euler(s, image, schedule, k)?;
+            if let Some(steps) = trace.as_deref_mut() {
+                let width = self.row_width;
+                let offset = self.reference_rows * width;
+                let count = (self.image_rows - self.reference_rows) * width;
+                let full = s.clone_dtoh(image)?;
+                ensure!(offset + count <= full.len(), "image step trace extent");
+                let rows = full[offset..offset + count].to_vec();
+                ensure!(rows.iter().all(|v| v.is_finite()), "non-finite image step");
+                steps.push(rows);
+            }
         }
         s.synchronize()?;
         Ok(())
@@ -3561,6 +3593,20 @@ pub fn image_sample(
     rows: &[f32],
     text: &[bf16],
 ) -> Result<Vec<f32>> {
+    image_sample_trace(model, layout, (device, runtime), rows, text, None, None)
+}
+
+/// Same evaluations as [`image_sample`]. `trace` receives the generated rows after each Euler update.
+/// `entering`, when present, replaces the image rows before evaluation k.
+pub(crate) fn image_sample_trace(
+    model: &Path,
+    layout: &ImageLayout,
+    (device, runtime): (usize, &Path),
+    rows: &[f32],
+    text: &[bf16],
+    trace: Option<&mut Vec<Vec<f32>>>,
+    entering: Option<&[Vec<f32>]>,
+) -> Result<Vec<f32>> {
     let image = ImageSpec::read(model)?;
     let spec = image_block_spec(&image);
     let schedule = ImageSchedule::published()?;
@@ -3606,9 +3652,16 @@ pub fn image_sample(
         spec: &spec,
         lora_scale: 1.0,
     };
-    let image_rows = s.clone_htod(rows)?;
+    let mut image_rows = s.clone_htod(rows)?;
     let text = s.clone_htod(text)?;
-    dit.sample(&context, (&table, &adaln), &schedule, &image_rows, &text)?;
+    dit.sample(
+        &context,
+        (&table, &adaln),
+        &schedule,
+        &mut image_rows,
+        &text,
+        (trace, entering),
+    )?;
     let out = s.clone_dtoh(&image_rows)?;
     ensure!(
         out.len() == rows.len() && out.iter().all(|v| v.is_finite()),
@@ -3698,8 +3751,11 @@ mod tests {
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::checkpoint::MappedCheckpoint;
     use crate::minimax_h3::{
-        Geometry, ImageSchedule, ImageSpec, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule,
-        image_layout, noise_draws, rotary_rows, row_timestep_plan,
+        Geometry, IMAGE_MIN_GENERATION_AREA, ImageLayout, ImageSchedule, ImageSpec,
+        KEYFRAME_NOISE_AUG, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, TEXT_TAG,
+        image_canvas, image_latent_extent, image_layout, image_reference_latent_extent,
+        image_vae_reference_size, noise_draws, patchify_latents, rotary_rows, row_timestep_plan,
+        unpatchify_latents,
     };
     use anyhow::bail;
     use safetensors::SafeTensors;
@@ -8696,8 +8752,15 @@ mod tests {
             dit.euler(s, &euler_rows, &schedule, 0)?;
             let euler = s.clone_dtoh(&euler_rows)?;
             let step5 = velocity(5, &text_d, &mut dit)?;
-            let fresh = s.clone_htod(&t2i_rows)?;
-            dit.sample(&context, (&table, &t2i_plan), &schedule, &fresh, &text_d)?;
+            let mut fresh = s.clone_htod(&t2i_rows)?;
+            dit.sample(
+                &context,
+                (&table, &t2i_plan),
+                &schedule,
+                &mut fresh,
+                &text_d,
+                (None, None),
+            )?;
             let sampled = s.clone_dtoh(&fresh)?;
             let changed = sampled.len() == t2i_rows.len()
                 && sampled.iter().all(|v| v.is_finite())
@@ -9203,6 +9266,880 @@ mod tests {
             "H3_IMAGE_4096_GATE DEFECT cells outside the frozen taus: {defects:?}"
         );
         println!("H3_IMAGE_4096_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    struct ImageE2eCell {
+        name: &'static str,
+        tau_max: f64,
+        tau_rmse: f64,
+        tau_rel: f64,
+        gate_max: bool,
+        gate_rmse: bool,
+        gate_rel: bool,
+        uncross_max: f64,
+        uncross_rmse: f64,
+    }
+
+    /// Taus are `max(2 * pair, 1e-6)`. t2i_conditioner and t2i cell (b) are the 2026-11-13 isolated correction.
+    /// Edit cells and cell (e) stay the 2026-11-12 recapture.
+    /// t2i `uncross_*` is the isolated arm-A versus MATH pair. It is 0 when a cell has no uncross figure.
+    /// `gate_max` is false where the max_abs tau exceeds rms(arm A).
+    const IMAGE_E2E: &[ImageE2eCell] = &[
+        ImageE2eCell {
+            name: "t2i_conditioner",
+            tau_max: 4.0,
+            tau_rmse: 0.11145047448683923,
+            tau_rel: 0.0013261567336856647,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: true,
+            uncross_max: 0.0,
+            uncross_rmse: 0.0,
+        },
+        ImageE2eCell {
+            name: "edit_conditioner",
+            tau_max: 1.408e3,
+            tau_rmse: 1.2445085138788345e+00,
+            tau_rel: 1.0412441562422288e-01,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: true,
+            uncross_max: 0.0,
+            uncross_rmse: 0.0,
+        },
+        ImageE2eCell {
+            name: "t2i_step0",
+            tau_max: 0.02681148052215576,
+            tau_rmse: 0.0015735558732471566,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.011798381805419922,
+            uncross_rmse: 0.0006590668803632128,
+        },
+        ImageE2eCell {
+            name: "t2i_step1",
+            tau_max: 0.12804865837097168,
+            tau_rmse: 0.0056322554985020635,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.06402432918548584,
+            uncross_rmse: 0.0028161277492510317,
+        },
+        ImageE2eCell {
+            name: "t2i_step2",
+            tau_max: 0.27604198455810547,
+            tau_rmse: 0.007397312102626611,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.13802099227905273,
+            uncross_rmse: 0.0036986560513133054,
+        },
+        ImageE2eCell {
+            name: "t2i_step3",
+            tau_max: 0.2156376838684082,
+            tau_rmse: 0.005701600502433918,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.1078188419342041,
+            uncross_rmse: 0.002850800251216959,
+        },
+        ImageE2eCell {
+            name: "t2i_step4",
+            tau_max: 0.3148576021194458,
+            tau_rmse: 0.0060046395838299835,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.1574288010597229,
+            uncross_rmse: 0.0030023197919149917,
+        },
+        ImageE2eCell {
+            name: "t2i_step5",
+            tau_max: 0.1341700553894043,
+            tau_rmse: 0.00342396006666815,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.06708502769470215,
+            uncross_rmse: 0.001711980033334075,
+        },
+        ImageE2eCell {
+            name: "t2i_latent",
+            tau_max: 0.1341700553894043,
+            tau_rmse: 0.00342396006666815,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.06708502769470215,
+            uncross_rmse: 0.001711980033334075,
+        },
+        ImageE2eCell {
+            name: "edit_step0",
+            tau_max: 4.474771022796631e-2,
+            tau_rmse: 3.210507202025054e-3,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 6.309986114501953e-2,
+            uncross_rmse: 3.511065910889702e-3,
+        },
+        ImageE2eCell {
+            name: "edit_step1",
+            tau_max: 4.0012475848197937e-01,
+            tau_rmse: 1.505041278553131e-2,
+            tau_rel: 0.0,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 2.748512029647827e-1,
+            uncross_rmse: 1.967127688184552e-2,
+        },
+        ImageE2eCell {
+            name: "edit_step2",
+            tau_max: 1.4161487221717834e+00,
+            tau_rmse: 4.996969378738491e-2,
+            tau_rel: 0.0,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 7.28495180606842e-1,
+            uncross_rmse: 4.290312446688843e-2,
+        },
+        ImageE2eCell {
+            name: "edit_step3",
+            tau_max: 3.1202070713043213e+00,
+            tau_rmse: 1.1337469423903028e-01,
+            tau_rel: 0.0,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 1.487925112247467,
+            uncross_rmse: 8.683005638543116e-2,
+        },
+        ImageE2eCell {
+            name: "edit_step4",
+            tau_max: 5.407879829406738,
+            tau_rmse: 2.0802742376685993e-01,
+            tau_rel: 0.0,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 2.5422056913375854e+00,
+            uncross_rmse: 1.5130835032512951e-01,
+        },
+        ImageE2eCell {
+            name: "edit_step5",
+            tau_max: 7.03294825553894,
+            tau_rmse: 2.8209972577655884e-01,
+            tau_rel: 0.0,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 3.3823635578155518e+00,
+            uncross_rmse: 2.022746474277021e-1,
+        },
+        ImageE2eCell {
+            name: "edit_latent",
+            tau_max: 7.03294825553894,
+            tau_rmse: 2.820997257765589e-1,
+            tau_rel: 0.0,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 3.3823635578155518e+00,
+            uncross_rmse: 2.022746474277021e-1,
+        },
+        ImageE2eCell {
+            name: "t2i_rgb",
+            tau_max: 0.0,
+            tau_rmse: 1.465530558268238e-1,
+            tau_rel: 0.0,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.0,
+            uncross_rmse: 0.0,
+        },
+        ImageE2eCell {
+            name: "edit_rgb",
+            tau_max: 0.0,
+            tau_rmse: 1.406691362579064e-1,
+            tau_rel: 0.0,
+            gate_max: false,
+            gate_rmse: true,
+            gate_rel: false,
+            uncross_max: 0.0,
+            uncross_rmse: 0.0,
+        },
+    ];
+
+    const IMAGE_E2E_T2I_NAMES: [&str; 7] = [
+        "t2i_step0",
+        "t2i_step1",
+        "t2i_step2",
+        "t2i_step3",
+        "t2i_step4",
+        "t2i_step5",
+        "t2i_latent",
+    ];
+    const IMAGE_E2E_EDIT_NAMES: [&str; 7] = [
+        "edit_step0",
+        "edit_step1",
+        "edit_step2",
+        "edit_step3",
+        "edit_step4",
+        "edit_step5",
+        "edit_latent",
+    ];
+    const IMAGE_E2E_PROMPT_T2I: &str = "a red cube on a white table";
+    const IMAGE_E2E_PROMPT_EDIT: &str = "replace the left half of <Picture 1> with a blue square";
+    const IMAGE_E2E_SEED: u64 = 20261112;
+    const IMAGE_E2E_CONTROL_SEED: u64 = 20261113;
+
+    fn image_e2e_cell(name: &'static str) -> Result<&'static ImageE2eCell> {
+        IMAGE_E2E
+            .iter()
+            .find(|cell| cell.name == name)
+            .context(name)
+    }
+
+    fn image_e2e_env(key: &str) -> Result<PathBuf> {
+        Ok(PathBuf::from(
+            std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+        ))
+    }
+
+    fn image_e2e_npy(path: &Path, shape: &[usize]) -> Result<Vec<f32>> {
+        let bytes = fs::read(path).with_context(|| format!("npy {}", path.display()))?;
+        ensure!(
+            bytes.len() >= 10 && bytes[..6] == *b"\x93NUMPY",
+            "npy magic"
+        );
+        let (header_len, header_at) = match bytes[6] {
+            1 => (
+                u16::from_le_bytes(bytes[8..10].try_into().context("npy header")?) as usize,
+                10,
+            ),
+            2 | 3 => (
+                u32::from_le_bytes(bytes[8..12].try_into().context("npy header")?) as usize,
+                12,
+            ),
+            major => bail!("npy version {major}"),
+        };
+        let header = std::str::from_utf8(
+            bytes
+                .get(header_at..header_at + header_len)
+                .context("npy header length")?,
+        )
+        .context("npy header")?;
+        ensure!(
+            header.contains("'<f4'") && header.contains("'fortran_order': False"),
+            "npy descr"
+        );
+        let shape_at = header.find("'shape':").context("npy shape")?;
+        let rest = &header[shape_at..];
+        let open = rest.find('(').context("npy shape")?;
+        let close = rest.find(')').context("npy shape")?;
+        let mut dims = Vec::new();
+        for part in rest[open + 1..close].split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            dims.push(
+                part.parse::<usize>()
+                    .with_context(|| format!("npy dim {part}"))?,
+            );
+        }
+        ensure!(dims.as_slice() == shape, "npy shape {dims:?}");
+        let data = &bytes[header_at + header_len..];
+        let (chunks, rest) = data.as_chunks::<4>();
+        ensure!(rest.is_empty(), "npy trailing bytes");
+        let values: Vec<f32> = chunks
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        let count: usize = shape.iter().product();
+        ensure!(
+            values.len() == count && values.iter().all(|value| value.is_finite()),
+            "npy values"
+        );
+        Ok(values)
+    }
+
+    fn image_e2e_tags(path: &Path, len: usize) -> Result<Vec<u8>> {
+        image_e2e_npy(path, &[len])?
+            .into_iter()
+            .map(|value| {
+                ensure!(value == 0.0 || value == 1.0, "tag {value}");
+                Ok(value as u8)
+            })
+            .collect()
+    }
+
+    fn image_e2e_steps(dir: &Path, case: &str) -> Result<[Vec<f32>; 6]> {
+        let load = |index: usize| {
+            image_e2e_npy(
+                &dir.join(format!("{case}-latent-step{index}.npy")),
+                &[4096, 96],
+            )
+        };
+        Ok([load(0)?, load(1)?, load(2)?, load(3)?, load(4)?, load(5)?])
+    }
+
+    fn image_e2e_rms(values: &[f32]) -> Result<f64> {
+        ensure!(
+            !values.is_empty() && values.iter().all(|value| value.is_finite()),
+            "rms"
+        );
+        let sum: f64 = values
+            .iter()
+            .map(|&value| {
+                let value = f64::from(value);
+                value * value
+            })
+            .sum();
+        let rms = (sum / values.len() as f64).sqrt();
+        ensure!(rms.is_finite() && rms > 0.0, "rms");
+        Ok(rms)
+    }
+
+    fn image_e2e_judge(
+        cell: &ImageE2eCell,
+        label: &'static str,
+        candidate: &[f32],
+        reference: &[f32],
+        rms_a: f64,
+    ) -> Result<bool> {
+        ensure!(
+            candidate.len() == reference.len()
+                && candidate.iter().all(|value| value.is_finite())
+                && reference.iter().all(|value| value.is_finite()),
+            "{label} length {} or a non-finite value",
+            candidate.len()
+        );
+        let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
+        let rel = rmse / rms_a;
+        ensure!(rel.is_finite(), "{label} relative rmse");
+        let within = (!cell.gate_max || max_abs <= cell.tau_max)
+            && (!cell.gate_rmse || rmse <= cell.tau_rmse)
+            && (!cell.gate_rel || rel <= cell.tau_rel);
+        if cell.uncross_max != 0.0 || cell.uncross_rmse != 0.0 {
+            println!(
+                "H3_IMAGE_E2E {label} max_abs={max_abs:.16e} rmse={rmse:.16e} rel={rel:.16e} tau_max={:.16e} tau_rmse={:.16e} tau_rel={:.16e} gate_max={} gate_rmse={} gate_rel={} uncross_max={:.16e} uncross_rmse={:.16e} within={within}",
+                cell.tau_max,
+                cell.tau_rmse,
+                cell.tau_rel,
+                cell.gate_max,
+                cell.gate_rmse,
+                cell.gate_rel,
+                cell.uncross_max,
+                cell.uncross_rmse,
+            );
+        } else {
+            println!(
+                "H3_IMAGE_E2E {label} max_abs={max_abs:.16e} rmse={rmse:.16e} rel={rel:.16e} tau_max={:.16e} tau_rmse={:.16e} tau_rel={:.16e} gate_max={} gate_rmse={} gate_rel={} within={within}",
+                cell.tau_max,
+                cell.tau_rmse,
+                cell.tau_rel,
+                cell.gate_max,
+                cell.gate_rmse,
+                cell.gate_rel,
+            );
+        }
+        Ok(within)
+    }
+
+    fn image_e2e_keep(defects: &mut Vec<&'static str>, label: &'static str, within: bool) {
+        if !within {
+            defects.push(label);
+        }
+    }
+
+    fn image_e2e_geometry(spec: &ImageSpec) -> Result<()> {
+        let (canvas_h, canvas_w) = image_canvas(spec, 1024, 1024, IMAGE_MIN_GENERATION_AREA)?;
+        let (latent_h, latent_w) = image_latent_extent(spec, canvas_h, canvas_w)?;
+        let (ref_w, ref_h) = image_vae_reference_size(spec, 1536, 1024)?;
+        let (crop_h, crop_w) = image_reference_latent_extent(spec, ref_h, ref_w)?;
+        let reference_rows = (crop_h / spec.patch[1]) * (crop_w / spec.patch[2]);
+        ensure!(
+            canvas_h == 2048
+                && canvas_w == 2048
+                && latent_h == 128
+                && latent_w == 128
+                && spec.in_channels == 24
+                && spec.patch == [1, 2, 2]
+                && spec.row_width() == 96
+                && spec.text_dim == 5120
+                && ref_w == 1536
+                && ref_h == 1024
+                && crop_h == 64
+                && crop_w == 96
+                && reference_rows == 1536,
+            "e2e geometry canvas={canvas_h}x{canvas_w} latent={latent_h}x{latent_w} ref={ref_w}x{ref_h} crop={crop_h}x{crop_w} rows={reference_rows} width={} patch={:?} text_dim={}",
+            spec.row_width(),
+            spec.patch,
+            spec.text_dim
+        );
+        Ok(())
+    }
+
+    fn image_e2e_noise_equal(root: &Path) -> Result<()> {
+        for (name, shape) in [
+            ("t2i-generated-noise.npy", &[1usize, 24, 1, 128, 128][..]),
+            ("edit-generated-noise.npy", &[1, 24, 1, 128, 128][..]),
+            ("edit-posterior-eps.npy", &[1, 24, 64, 96][..]),
+            ("edit-reference-noise.npy", &[1, 24, 64, 96][..]),
+        ] {
+            let left = image_e2e_npy(&root.join("arm-a").join(name), shape)?;
+            let right = image_e2e_npy(&root.join("arm-b").join(name), shape)?;
+            ensure!(left == right, "{name} arms differ");
+        }
+        Ok(())
+    }
+
+    fn image_e2e_patch(values: &[f32], shape: (usize, usize, usize, usize)) -> Result<Vec<f32>> {
+        let (channels, frames, height, width) = shape;
+        ensure!(
+            values.len() == channels * frames * height * width,
+            "patchify extent"
+        );
+        let rows = patchify_latents(values, shape, [1, 2, 2]);
+        ensure!(rows.len() == values.len(), "patchify length");
+        Ok(rows)
+    }
+
+    fn image_e2e_mix(latent: &[f32], noise: &[f32]) -> Result<Vec<f32>> {
+        ensure!(latent.len() == noise.len(), "mix extent");
+        let scale = KEYFRAME_NOISE_AUG as f32;
+        let mixed: Vec<f32> = latent
+            .iter()
+            .zip(noise)
+            .map(|(&value, &draw)| scale * value + (1.0 - scale) * draw)
+            .collect();
+        ensure!(
+            mixed.iter().all(|value| value.is_finite()),
+            "non-finite reference mix"
+        );
+        Ok(mixed)
+    }
+
+    fn image_e2e_reference() -> crate::serve::image::RgbImage {
+        let (width, height) = (1536usize, 1024usize);
+        let mut pixels = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push(((3 * x + y) % 256) as u8);
+                pixels.push(((x + 5 * y) % 256) as u8);
+                pixels.push(((7 * x + 11 * y) % 256) as u8);
+            }
+        }
+        crate::serve::image::RgbImage {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn image_e2e_request(prompt: &str, seed: u64, edit: bool) -> crate::minimax_h3::ImageRequest {
+        let mut request = crate::minimax_h3::ImageRequest::new(prompt, 1024, 1024, seed);
+        if edit {
+            request.references.push(crate::minimax_h3::ImageReference {
+                image: image_e2e_reference(),
+            });
+        }
+        request
+    }
+
+    fn image_e2e_runtime(label: &str) -> Result<PathBuf> {
+        let dir =
+            std::env::temp_dir().join(format!("ff-h3-image-e2e-{label}-{}", std::process::id()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        fs::create_dir(&dir)?;
+        Ok(dir)
+    }
+
+    fn image_e2e_nchw(rgb: &[u8], height: usize, width: usize) -> Result<Vec<f32>> {
+        ensure!(rgb.len() == height * width * 3, "rgb extent");
+        let plane = height * width;
+        let mut out = vec![0f32; 3 * plane];
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = (y * width + x) * 3;
+                for channel in 0..3 {
+                    out[channel * plane + y * width + x] = f32::from(rgb[pixel + channel]) / 255.0;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    struct ImageE2eTeacher<'a> {
+        model: &'a Path,
+        spec: &'a ImageSpec,
+        runtime: &'a Path,
+        layout: &'a ImageLayout,
+        rows: &'a [f32],
+        text: &'a [bf16],
+        steps: &'a [Vec<f32>; 6],
+        latent: &'a [f32],
+        names: &'a [&'static str; 7],
+    }
+
+    fn image_e2e_teacher(job: &ImageE2eTeacher<'_>, defects: &mut Vec<&'static str>) -> Result<()> {
+        let width = job.spec.row_width();
+        let mut trace = Vec::new();
+        // Entering rows cover the image when reference_rows is 0.
+        let entering = if job.layout.reference_rows == 0 {
+            let mut prior = Vec::with_capacity(6);
+            prior.push(job.rows.to_vec());
+            for rows in &job.steps[..5] {
+                ensure!(rows.len() == job.rows.len(), "t2i entering rows");
+                prior.push(rows.clone());
+            }
+            Some(prior)
+        } else {
+            None
+        };
+        let sampled = super::image_sample_trace(
+            job.model,
+            job.layout,
+            (0, job.runtime),
+            job.rows,
+            job.text,
+            Some(&mut trace),
+            entering.as_deref(),
+        )?;
+        let prefix = job.layout.reference_rows * width;
+        let generated = job.layout.image_indices.len() - job.layout.reference_rows;
+        ensure!(
+            sampled.len() == job.rows.len() && sampled[..prefix] == job.rows[..prefix],
+            "sample moved a reference row"
+        );
+        ensure!(
+            trace.len() == 6 && trace.iter().all(|rows| rows.len() == generated * width),
+            "image step trace"
+        );
+        ensure!(
+            trace[5].as_slice() == &sampled[prefix..],
+            "step 5 differs from the returned rows"
+        );
+        for (index, (step, reference)) in trace.iter().zip(job.steps.iter()).enumerate() {
+            let name = job.names[index];
+            let cell = image_e2e_cell(name)?;
+            let rms = image_e2e_rms(reference)?;
+            let within = image_e2e_judge(cell, name, step, reference, rms)?;
+            image_e2e_keep(defects, name, within);
+        }
+        let values = unpatchify_latents(
+            &sampled[prefix..],
+            (job.spec.in_channels, 1, 128, 128),
+            job.spec.patch,
+        );
+        let cell = image_e2e_cell(job.names[6])?;
+        let rms = image_e2e_rms(job.latent)?;
+        let within = image_e2e_judge(cell, job.names[6], &values, job.latent, rms)?;
+        image_e2e_keep(defects, job.names[6], within);
+        Ok(())
+    }
+
+    fn image_e2e_finish(runtime: &Path, outcome: Result<()>) -> Result<()> {
+        fs::remove_dir_all(runtime)?;
+        outcome
+    }
+
+    fn image_e2e_run_teacher(
+        model: &Path,
+        spec: &ImageSpec,
+        arm: &Path,
+        edit: bool,
+        defects: &mut Vec<&'static str>,
+    ) -> Result<()> {
+        let case = if edit { "edit" } else { "t2i" };
+        let tags = image_e2e_tags(
+            &arm.join(format!("{case}-tags.npy")),
+            if edit { 1557 } else { 7 },
+        )?;
+        if !edit {
+            ensure!(tags.iter().all(|&tag| tag == TEXT_TAG), "t2i tags");
+        }
+        let references: &[(usize, usize)] = if edit { &[(64, 96)] } else { &[] };
+        let layout = image_layout(spec, &tags, references, 128, 128)?;
+        ensure!(
+            layout.reference_rows == if edit { 1536 } else { 0 }
+                && layout.image_indices.len() == layout.reference_rows + 4096,
+            "{case} layout rows"
+        );
+        let conditioner = image_e2e_npy(
+            &arm.join(format!("{case}-conditioner.npy")),
+            if edit {
+                &[1usize, 1557, 5120][..]
+            } else {
+                &[1, 7, 5120][..]
+            },
+        )?;
+        ensure!(
+            conditioner.len() == tags.len() * spec.text_dim,
+            "{case} conditioner rows"
+        );
+        let text = image_bf16_exact(&conditioner)?;
+        let generated = image_e2e_patch(
+            &image_e2e_npy(
+                &arm.join(format!("{case}-generated-noise.npy")),
+                &[1, 24, 1, 128, 128],
+            )?,
+            (24, 1, 128, 128),
+        )?;
+        ensure!(
+            generated.len() == 4096 * spec.row_width(),
+            "{case} generated rows"
+        );
+        let rows = if edit {
+            let mixed = image_e2e_mix(
+                &image_e2e_npy(&arm.join("edit-reference-latent.npy"), &[1, 24, 64, 96])?,
+                &image_e2e_npy(&arm.join("edit-reference-noise.npy"), &[1, 24, 64, 96])?,
+            )?;
+            let mut packed = image_e2e_patch(&mixed, (24, 1, 64, 96))?;
+            ensure!(
+                packed.len() == 1536 * spec.row_width(),
+                "edit reference rows"
+            );
+            packed.extend(generated);
+            packed
+        } else {
+            generated
+        };
+        ensure!(
+            rows.len() == layout.image_indices.len() * spec.row_width(),
+            "{case} sample rows"
+        );
+        let steps = image_e2e_steps(arm, case)?;
+        let latent = image_e2e_npy(&arm.join(format!("{case}-latent.npy")), &[1, 24, 128, 128])?;
+        let names = if edit {
+            &IMAGE_E2E_EDIT_NAMES
+        } else {
+            &IMAGE_E2E_T2I_NAMES
+        };
+        let runtime = image_e2e_runtime(&format!("{case}-b"))?;
+        let outcome = image_e2e_teacher(
+            &ImageE2eTeacher {
+                model,
+                spec,
+                runtime: &runtime,
+                layout: &layout,
+                rows: &rows,
+                text: &text,
+                steps: &steps,
+                latent: &latent,
+                names,
+            },
+            defects,
+        );
+        image_e2e_finish(&runtime, outcome)
+    }
+
+    fn image_e2e_noise(arm: &Path, edit: bool) -> Result<Vec<f32>> {
+        let generated = image_e2e_patch(
+            &image_e2e_npy(
+                &arm.join(if edit {
+                    "edit-generated-noise.npy"
+                } else {
+                    "t2i-generated-noise.npy"
+                }),
+                &[1, 24, 1, 128, 128],
+            )?,
+            (24, 1, 128, 128),
+        )?;
+        if !edit {
+            return Ok(generated);
+        }
+        let epsilon = image_e2e_npy(&arm.join("edit-posterior-eps.npy"), &[1, 24, 64, 96])?;
+        let mix = image_e2e_npy(&arm.join("edit-reference-noise.npy"), &[1, 24, 64, 96])?;
+        ensure!(
+            epsilon.len() == 24 * 64 * 96
+                && mix.len() == epsilon.len()
+                && generated.len() == 4096 * 96,
+            "edit noise extent"
+        );
+        let mut noise = epsilon;
+        noise.extend(generated);
+        noise.extend(mix);
+        Ok(noise)
+    }
+
+    fn image_e2e_rgb_values(rgb: &[u8], reference: &[f32]) -> Result<Vec<f32>> {
+        ensure!(rgb.len() == 1024 * 1024 * 3, "rgb bytes");
+        let values = image_e2e_nchw(rgb, 1024, 1024)?;
+        ensure!(values.len() == reference.len(), "rgb extent");
+        Ok(values)
+    }
+
+    fn image_e2e_run_pass(
+        model: &Path,
+        arm_a: &Path,
+        arm_b: &Path,
+        edit: bool,
+        defects: &mut Vec<&'static str>,
+    ) -> Result<bool> {
+        let case = if edit { "edit" } else { "t2i" };
+        let shape: &[usize] = if edit {
+            &[1, 1557, 5120]
+        } else {
+            &[1, 7, 5120]
+        };
+        let left = image_e2e_npy(&arm_a.join(format!("{case}-conditioner.npy")), shape)?;
+        let right = image_e2e_npy(&arm_b.join(format!("{case}-conditioner.npy")), shape)?;
+        ensure!(left.len() == right.len(), "{case} conditioner pair");
+        let rgb = image_e2e_npy(&arm_a.join(format!("{case}-rgb.npy")), &[1, 3, 1024, 1024])?;
+        let noise = image_e2e_noise(arm_a, edit)?;
+        let prompt = if edit {
+            IMAGE_E2E_PROMPT_EDIT
+        } else {
+            IMAGE_E2E_PROMPT_T2I
+        };
+        let request = image_e2e_request(prompt, IMAGE_E2E_SEED, edit);
+        let runtime = image_e2e_runtime(&format!("{case}-e"))?;
+        let outcome = (|| {
+            let options = crate::minimax_h3::ImageRunOptions {
+                device: 0,
+                runtime_dir: runtime.clone(),
+            };
+            let (latents, text) =
+                super::pipeline::image_pass(model, &options, &request, Some(&noise))?;
+            ensure!(
+                latents.channels == 24 && latents.height == 128 && latents.width == 128,
+                "{case} latent extent"
+            );
+            let got: Vec<f32> = text.iter().copied().map(|value| value.to_f32()).collect();
+            let rms = image_e2e_rms(&left)?;
+            let cell_name = if edit {
+                "edit_conditioner"
+            } else {
+                "t2i_conditioner"
+            };
+            let cell = image_e2e_cell(cell_name)?;
+            let (label_a, label_b) = if edit {
+                ("edit_conditioner_a", "edit_conditioner_b")
+            } else {
+                ("t2i_conditioner_a", "t2i_conditioner_b")
+            };
+            image_e2e_keep(
+                defects,
+                label_a,
+                image_e2e_judge(cell, label_a, &got, &left, rms)?,
+            );
+            image_e2e_keep(
+                defects,
+                label_b,
+                image_e2e_judge(cell, label_b, &got, &right, rms)?,
+            );
+            let rgb_name = if edit { "edit_rgb" } else { "t2i_rgb" };
+            let values = image_e2e_rgb_values(&latents.rgb, &rgb)?;
+            image_e2e_judge(
+                image_e2e_cell(rgb_name)?,
+                rgb_name,
+                &values,
+                &rgb,
+                image_e2e_rms(&rgb)?,
+            )
+        })();
+        fs::remove_dir_all(&runtime)?;
+        outcome
+    }
+
+    fn image_e2e_run_control(model: &Path, arm_a: &Path, edit: bool) -> Result<f64> {
+        let case = if edit { "edit" } else { "t2i" };
+        let rgb = image_e2e_npy(&arm_a.join(format!("{case}-rgb.npy")), &[1, 3, 1024, 1024])?;
+        let prompt = if edit {
+            IMAGE_E2E_PROMPT_EDIT
+        } else {
+            IMAGE_E2E_PROMPT_T2I
+        };
+        let request = image_e2e_request(prompt, IMAGE_E2E_CONTROL_SEED, edit);
+        let runtime = image_e2e_runtime(&format!("{case}-c"))?;
+        let outcome = (|| {
+            let options = crate::minimax_h3::ImageRunOptions {
+                device: 0,
+                runtime_dir: runtime.clone(),
+            };
+            let latents = super::image_latents(model, &options, &request)?;
+            ensure!(
+                latents.channels == 24 && latents.height == 128 && latents.width == 128,
+                "{case} control latent extent"
+            );
+            let values = image_e2e_rgb_values(&latents.rgb, &rgb)?;
+            Ok(image_max_rmse(&values, &rgb)?.1)
+        })();
+        fs::remove_dir_all(&runtime)?;
+        outcome
+    }
+
+    /// Control bar dated 2026-11-12: RGB rmse must exceed `3 * tau`.
+    fn image_e2e_rgb_decision(
+        defects: &mut Vec<&'static str>,
+        label: &'static str,
+        scored_within: bool,
+        control_rmse: f64,
+    ) -> Result<&'static str> {
+        let cell = image_e2e_cell(label)?;
+        let bar = 3.0 * cell.tau_rmse;
+        let clears = control_rmse > bar;
+        let decision = if clears { "gated" } else { "informational" };
+        println!(
+            "H3_IMAGE_E2E {label}_control rmse={control_rmse:.16e} bar={bar:.16e} clears={clears} decision={decision} scored_within={scored_within}"
+        );
+        if clears && !scored_within {
+            defects.push(label);
+        }
+        Ok(decision)
+    }
+
+    /// Cells (a), (b) and (e). Cell (d) is the contract `image_rgb8` test. Cell (c) has no tau.
+    /// Captured generated noise is patchified into rows. Posterior epsilon and the reference mix stay NCHW.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_E2E"]
+    fn image_e2e_matches_the_frozen_cells() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let model = image_e2e_env("FF_H3_IMAGE")?;
+        let root = image_e2e_env("FF_H3_IMAGE_E2E")?;
+        let spec = ImageSpec::read(&model)?;
+        image_e2e_geometry(&spec)?;
+        image_e2e_noise_equal(&root)?;
+        let arm_a = root.join("arm-a");
+        let arm_b = root.join("arm-b");
+        let mut defects = Vec::new();
+        image_e2e_run_teacher(&model, &spec, &arm_a, false, &mut defects)?;
+        image_e2e_run_teacher(&model, &spec, &arm_a, true, &mut defects)?;
+        let t2i_rgb = image_e2e_run_pass(&model, &arm_a, &arm_b, false, &mut defects)?;
+        let edit_rgb = image_e2e_run_pass(&model, &arm_a, &arm_b, true, &mut defects)?;
+        let t2i_control = image_e2e_run_control(&model, &arm_a, false)?;
+        let edit_control = image_e2e_run_control(&model, &arm_a, true)?;
+        let t2i_decision = image_e2e_rgb_decision(&mut defects, "t2i_rgb", t2i_rgb, t2i_control)?;
+        let edit_decision =
+            image_e2e_rgb_decision(&mut defects, "edit_rgb", edit_rgb, edit_control)?;
+        ensure!(
+            defects.is_empty(),
+            "H3_IMAGE_E2E_GATE DEFECT cells outside the frozen taus: {defects:?}"
+        );
+        println!("H3_IMAGE_E2E_GATE PASS cells=a,b,e e_t2i={t2i_decision} e_edit={edit_decision}");
         Ok(())
     }
 }
