@@ -1222,6 +1222,7 @@ fn run() -> Result<()> {
                 rgba: &rgba,
                 dimensions: [height, width],
                 seed: *seed,
+                device: cli.device,
             };
             let mesh = request.run()?;
             let rgb: Vec<u8> = mesh
@@ -1247,11 +1248,22 @@ fn run() -> Result<()> {
                     ("alpha", &alpha),
                 ],
             };
-            match output.extension().and_then(|e| e.to_str()) {
-                Some("ply") => flyingfish::media::write_ply(fs::File::create(output)?, &view)?,
-                Some("obj") => flyingfish::media::write_obj(fs::File::create(output)?, &view)?,
-                other => bail!("output must be .ply or .obj, got {other:?}"),
+            let extension = output
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_owned);
+            ensure!(
+                matches!(extension.as_deref(), Some("ply") | Some("obj")),
+                "output must be .ply or .obj, got {extension:?}"
+            );
+            let mut buffered = std::io::BufWriter::new(fs::File::create(output)?);
+            use std::io::Write as _;
+            match extension.as_deref() {
+                Some("ply") => flyingfish::media::write_ply(&mut buffered, &view)?,
+                Some("obj") => flyingfish::media::write_obj(&mut buffered, &view)?,
+                _ => unreachable!(),
             }
+            buffered.flush()?;
             println!(
                 "wrote {} vertices {} faces resolution {} to {}",
                 mesh.vertices.len() / 3,

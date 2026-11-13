@@ -2098,17 +2098,71 @@ pub fn decode_image_rgba(bytes: &[u8], mime: Option<&str>) -> Result<(Vec<u8>, u
     decoder.set_ignore_text_chunk(true);
     decoder.set_ignore_iccp_chunk(true);
     let mut reader = decoder.read_info()?;
+    let (width, height) = (reader.info().width as usize, reader.info().height as usize);
+    checked_pixels(width, height)?;
     let mut bytes = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
     let info = reader.next_frame(&mut bytes)?;
     ensure!(
         info.bit_depth == png::BitDepth::Eight && info.color_type == png::ColorType::Rgba,
         "image-to-3D input has no alpha channel; background removal (RMBG-2.0) is not yet available"
     );
-    let width = info.width as usize;
-    let height = info.height as usize;
-    checked_pixels(width, height)?;
     bytes.truncate(width * height * 4);
     Ok((bytes, width, height))
+}
+
+#[cfg(test)]
+mod decode_image_rgba_tests {
+    use super::*;
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let bit = crc & 1;
+                crc >>= 1;
+                if bit == 1 {
+                    crc ^= 0xedb8_8320;
+                }
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn oversized_rgba_png_is_rejected_before_allocation() -> Result<()> {
+        // Encode a real 1x1 RGBA PNG, then patch its IHDR to declare
+        // 4096x4096 (16.8M pixels, above MAX_SOURCE_PIXELS) with a matching
+        // CRC; the frame is never decoded because the dimension check must
+        // fire first, so the bogus declared size never allocates.
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header()?;
+            writer.write_image_data(&[10, 20, 30, 255])?;
+            writer.finish()?;
+        }
+        let width_at = encoded
+            .windows(4)
+            .position(|w| w == b"IHDR")
+            .expect("IHDR present")
+            + 4;
+        encoded[width_at..width_at + 4].copy_from_slice(&16384u32.to_be_bytes());
+        encoded[width_at + 4..width_at + 8].copy_from_slice(&16384u32.to_be_bytes());
+        // Recompute the IHDR CRC over the patched type + data.
+        let crc = crc32(&encoded[width_at - 4..width_at + 13]);
+        let crc_at = width_at + 13;
+        encoded[crc_at..crc_at + 4].copy_from_slice(&crc.to_be_bytes());
+        let png = encoded;
+        let error = decode_image_rgba(&png, None).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds pixel limit"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
 }
 
 pub fn decode_image(bytes: &[u8], mime: Option<&str>) -> Result<RgbImage> {
