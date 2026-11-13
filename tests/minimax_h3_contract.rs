@@ -10,13 +10,14 @@ use flyingfish::{
         image_latent_extent, image_layout, image_picture_label, image_reference_latent_extent,
         image_reference_size, image_rgb8, image_row_plan, image_row_timesteps, image_text_rows,
         mix_temb, pad_lowrank, patchify_latents, report_stored_placement, row_timestep_plan,
-        unchunked_activation_bytes, unpatchify_latents,
+        stored_scratch_bytes, stored_scratch_extents, unchunked_activation_bytes,
+        unpatchify_latents,
     },
     prefill::DensePlacement,
 };
 use safetensors::{Dtype, SafeTensors};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -2076,6 +2077,46 @@ fn hyperflow_stored_placement_prints_124_resident_and_345_streamed() -> Result<(
     ensure!(
         report_stored_placement(&spec, &long, weights + long_act, weights)?,
         "mode hardcoded"
+    );
+    ensure!(
+        stored_scratch_extents(&spec)?.is_none() && stored_scratch_bytes(&spec, 1)? == 0,
+        "dense spec allocated convrot scratch"
+    );
+    let mut hyper = spec.clone();
+    hyper.hyperflow_gate = Some(0.25);
+    hyper.dropped_blocks = Some(vec![6, 21, 22]);
+    hyper.lowrank_ranks = Some(BTreeMap::from([(
+        "transformer_blocks.49.ff.net.2".to_string(),
+        2,
+    )]));
+    hyper.int8_convrot = Some((256, BTreeSet::new()));
+    let frame_rows = (short.latent_height / hyper.patch[1]) * (short.latent_width / hyper.patch[2]);
+    let rows = short.latent_frames * frame_rows + short.audio_latents * 2;
+    ensure!(rows == 37710, "124 scratch rows {rows}");
+    let (k, low_rank) = stored_scratch_extents(&hyper)?.context("hyperflow scratch")?;
+    ensure!(
+        k == 14336 && low_rank == 2,
+        "scratch extents {k} {low_rank}"
+    );
+    let rows_u = u64::try_from(rows)?;
+    let scratch =
+        rows_u * u64::try_from(k)? * 8 + rows_u * 4 + rows_u * u64::try_from(low_rank.max(1))? * 2;
+    ensure!(
+        stored_scratch_bytes(&hyper, rows)? == scratch && scratch > (4u64 << 30),
+        "scratch bytes {scratch}"
+    );
+    let hyper_act = unchunked_activation_bytes(&hyper, &short)?;
+    ensure!(
+        hyper_act == short_act + scratch,
+        "124 hyperflow activations {hyper_act}"
+    );
+    ensure!(
+        !report_stored_placement(&hyper, &short, weights + short_act, weights)?,
+        "old 124 budget accepted the convrot scratch"
+    );
+    ensure!(
+        report_stored_placement(&hyper, &short, weights + hyper_act, weights)?,
+        "exact 124 hyperflow budget streamed"
     );
     Ok(())
 }

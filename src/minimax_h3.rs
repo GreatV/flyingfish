@@ -525,7 +525,44 @@ pub fn pad_lowrank(
     Ok((down_out, up_out))
 }
 
-/// t2va bytes for video rows plus stereo audio rows: `(2 * hidden + 5 * width) * 2 + 6 * rope_freq_dim * 2 + heads * 4` per row, plus f32 video scratch `hidden * 4`, video latent `video_row_width * 4` and audio latent `audio_in_channels * 4`. Text rows and keyframe rows are not included.
+/// `(k, low_rank)` of the HyperFlow convrot scratch one block workspace allocates. `k` is `max(hidden, width, ffn)`. `low_rank` is the maximum stored rank, or 0 when the rank map is empty. `None` when the spec is not HyperFlow.
+pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
+    if !spec.is_hyperflow()? {
+        return Ok(None);
+    }
+    let width = spec
+        .heads
+        .checked_mul(spec.head_dim)
+        .context("stored scratch width")?;
+    let k = spec.hidden.max(width).max(spec.ffn);
+    let low_rank = spec
+        .lowrank_ranks
+        .as_ref()
+        .and_then(|ranks| ranks.values().copied().max())
+        .unwrap_or(0);
+    Ok(Some((k, low_rank)))
+}
+
+/// Bytes of one HyperFlow convrot scratch for `rows`: two f32 buffers of `rows * k`, one f32 scale per row, and `rows * max(low_rank, 1)` bf16 elements. Zero when the spec is not HyperFlow.
+pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
+    let Some((k, low_rank)) = stored_scratch_extents(spec)? else {
+        return Ok(0);
+    };
+    let rows = u64::try_from(rows)?;
+    let k = u64::try_from(k)?;
+    let mid = u64::try_from(low_rank.max(1))?;
+    let f32_elems = rows
+        .checked_mul(k)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(rows))
+        .context("stored scratch elements")?;
+    f32_elems
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(rows.checked_mul(mid)?.checked_mul(2)?))
+        .context("stored scratch bytes")
+}
+
+/// t2va bytes for video rows plus stereo audio rows: `(2 * hidden + 5 * width) * 2 + 6 * rope_freq_dim * 2 + heads * 4` per row, plus f32 video scratch `hidden * 4`, video latent `video_row_width * 4` and audio latent `audio_in_channels * 4`. A HyperFlow spec adds one convrot scratch at that row count. Text rows and keyframe rows are not included.
 pub fn unchunked_activation_bytes(spec: &H3Spec, geometry: &Geometry) -> Result<u64> {
     ensure!(
         geometry.latent_height.is_multiple_of(spec.patch[1])
@@ -563,10 +600,15 @@ pub fn unchunked_activation_bytes(spec: &H3Spec, geometry: &Geometry) -> Result<
         .checked_mul(u64::try_from(spec.audio_in_channels)?)
         .and_then(|n| n.checked_mul(4))
         .context("activation audio")?;
+    let convrot = stored_scratch_bytes(
+        spec,
+        usize::try_from(sequence_rows).context("activation rows")?,
+    )?;
     block
         .checked_add(scratch)
         .and_then(|n| n.checked_add(video))
         .and_then(|n| n.checked_add(audio))
+        .and_then(|n| n.checked_add(convrot))
         .context("activation bytes")
 }
 

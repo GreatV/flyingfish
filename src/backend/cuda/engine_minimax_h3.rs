@@ -1447,13 +1447,7 @@ impl BlockWork {
         let gated = s.alloc_zeros::<bf16>(chunk * spec.ffn)?;
         let hidden_view = matrix(&hidden, s, chunk, 2 * spec.ffn)?;
         let gated_view = matrix(&gated, s, chunk, spec.ffn)?;
-        let stored = if spec.is_hyperflow()? {
-            let k = spec.hidden.max(width).max(spec.ffn);
-            let low_rank = spec
-                .lowrank_ranks
-                .as_ref()
-                .and_then(|ranks| ranks.values().copied().max())
-                .unwrap_or(0);
+        let stored = if let Some((k, low_rank)) = crate::minimax_h3::stored_scratch_extents(spec)? {
             Some(StoredScratch {
                 x: s.alloc_zeros::<f32>(rows * k)?,
                 rotated: s.alloc_zeros::<f32>(rows * k)?,
