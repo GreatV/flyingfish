@@ -162,6 +162,21 @@ pub fn stream_frontend_step(
     ))
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn emitted_stream_mask<'a>(
+    mask: &'a [bool],
+    logits: &[f32],
+    speakers: usize,
+) -> Result<&'a [bool]> {
+    ensure!(
+        speakers > 0 && logits.len().is_multiple_of(speakers),
+        "diarization streaming logit extent"
+    );
+    let frames = logits.len() / speakers;
+    ensure!(frames <= mask.len(), "diarization streaming mask extent");
+    Ok(&mask[..frames])
+}
+
 #[cfg(feature = "cuda")]
 pub fn diarize(
     directory: &Path,
@@ -194,8 +209,12 @@ pub fn diarize(
             let (features, valid, last) =
                 stream_frontend_step(&engine, waveform, step, config, step * step_mel)?;
             let (step_logits, _) = engine.stream_step(&features, &valid, config, last, 0)?;
+            mask.extend_from_slice(emitted_stream_mask(
+                &valid,
+                &step_logits,
+                spec.speakers as usize,
+            )?);
             logits.extend(step_logits);
-            mask.extend(valid);
             if last {
                 break;
             }
@@ -519,6 +538,20 @@ mod tests {
         );
         assert_eq!(DIARIZATION_THRESHOLD, 0.5);
         assert!(speaker_segments(&[0.0], 1, None, DIARIZATION_THRESHOLD, 0.01)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_mask_tracks_emitted_frames_without_right_context() -> Result<()> {
+        let mask = [true; 104];
+        let emitted = vec![0.0; 72 * 8];
+        assert_eq!(emitted_stream_mask(&mask, &emitted, 8)?.len(), 72);
+        let final_logits = vec![0.0; 32 * 8];
+        let mut accumulated = emitted_stream_mask(&mask, &emitted, 8)?.to_vec();
+        accumulated.extend_from_slice(emitted_stream_mask(&mask[72..], &final_logits, 8)?);
+        assert_eq!(accumulated.len(), 104);
+        let too_many = vec![0.0; 105 * 8];
+        assert!(emitted_stream_mask(&mask, &too_many, 8).is_err());
         Ok(())
     }
 

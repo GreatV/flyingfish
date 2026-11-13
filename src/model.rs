@@ -25,6 +25,15 @@ fn embedding_input_parts(ids: &[u32]) -> Result<(Vec<u8>, Vec<bool>)> {
     Ok((vec![0; ids.len()], vec![true; ids.len()]))
 }
 
+fn embedding_workspace(tokens: usize, max_position: u32) -> Result<usize> {
+    ensure!(tokens > 0, "embedding input is empty");
+    ensure!(
+        tokens <= max_position as usize,
+        "embedding input {tokens} exceeds model context {max_position}"
+    );
+    Ok(tokens.max(1024))
+}
+
 pub fn embedding_json(values: &[f32]) -> Result<serde_json::Value> {
     ensure!(
         values.len() == 768 && values.iter().all(|value| value.is_finite()),
@@ -35,6 +44,8 @@ pub fn embedding_json(values: &[f32]) -> Result<serde_json::Value> {
 
 pub fn embed_text(directory: &Path, text: &str, options: crate::RunOptions) -> Result<Vec<f32>> {
     let ids = crate::tokenizer::encode(directory, text)?;
+    let spec = crate::model_spec::ModelSpec::read(directory)?;
+    let workspace = embedding_workspace(ids.len(), spec.max_position)?;
     let (modality_ids, mask) = embedding_input_parts(&ids)?;
     let settings = Settings {
         tree_builder: crate::backend::TreeBuilder::Waves,
@@ -46,7 +57,13 @@ pub fn embed_text(directory: &Path, text: &str, options: crate::RunOptions) -> R
         runtime_dir: Some(options.runtime_dir),
         device_budget_gib: None,
     };
-    let mut model = Model::load(directory, options.device, 1024, Some(1024), settings)?;
+    let mut model = Model::load(
+        directory,
+        options.device,
+        workspace,
+        Some(workspace),
+        settings,
+    )?;
     let input = crate::vision_input::MultimodalInput {
         input_ids: &ids,
         modality_ids: &modality_ids,
@@ -712,6 +729,12 @@ mod tests {
         assert_eq!(report["embedding"][0], 0.25);
         assert!(embedding_json(&[0.0; 767]).is_err());
         assert!(embedding_json(&[f32::NAN; 768]).is_err());
+        assert_eq!(embedding_workspace(1, 8192)?, 1024);
+        assert_eq!(embedding_workspace(1024, 8192)?, 1024);
+        assert_eq!(embedding_workspace(1025, 8192)?, 1025);
+        assert_eq!(embedding_workspace(8192, 8192)?, 8192);
+        assert!(embedding_workspace(0, 8192).is_err());
+        assert!(embedding_workspace(8193, 8192).is_err());
         Ok(())
     }
 }
