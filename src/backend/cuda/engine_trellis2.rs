@@ -1006,6 +1006,8 @@ pub struct TrellisTo3d<'a> {
     /// [height, width].
     pub dimensions: [usize; 2],
     pub seed: u64,
+    /// CUDA device ordinal.
+    pub device: usize,
 }
 
 /// The decoded mesh: world-space vertices [rows, 3], triangle indices
@@ -1043,7 +1045,7 @@ fn philox_normals(
 
 impl TrellisTo3d<'_> {
     pub fn run(&self) -> Result<TrellisMesh> {
-        let device = super::Device::new(0)?;
+        let device = super::Device::new(self.device)?;
         let ops = super::ops::Ops::new(&device.ctx)?;
         let mut blas = Blas::new(
             &device,
@@ -1152,14 +1154,16 @@ impl TrellisTo3d<'_> {
             // pipeline.json names the structure decoder inside the
             // TRELLIS-image-large package that ships beside this model.
             let structure_root = self.model.join("../TRELLIS-image-large");
-            let decoder = super::pixal3d::PixalDecoder::open(
-                &device,
-                &structure_root,
-                crate::pixal3d::DecoderKind::Structure,
-                self.runtime,
-                limit,
-            )?;
-            let logits = decoder.structure(&latent)?;
+            let logits = {
+                let decoder = super::pixal3d::PixalDecoder::open(
+                    &device,
+                    &structure_root,
+                    crate::pixal3d::DecoderKind::Structure,
+                    self.runtime,
+                    limit,
+                )?;
+                decoder.structure(&latent)?
+            };
             let sites = super::pixal3d::PixalDecoder::structure_sites(&logits, 64, 32)?;
             let lr_sites: Vec<[i32; 3]> = sites
                 .coordinates()
