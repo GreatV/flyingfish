@@ -2980,12 +2980,15 @@ impl ParakeetEncoder {
             "multitalker streaming session requires the published encoder and 1..=4 lanes"
         );
         let width = conformer.hidden as usize;
+        // Cache tensors use the fixed 98-row stride per lane: lanes pause and
+        // rejoin at different row counts, so per-lane extents are host-side.
+        let stride = lanes as usize * 98 * width;
         let mut keys = Vec::with_capacity(24);
         let mut values = Vec::with_capacity(24);
         let mut depthwise = Vec::with_capacity(24);
         for _ in 0..24 {
-            keys.push(self.stream.alloc_zeros(0)?);
-            values.push(self.stream.alloc_zeros(0)?);
+            keys.push(self.stream.alloc_zeros(stride)?);
+            values.push(self.stream.alloc_zeros(stride)?);
             depthwise.push(self.stream.alloc_zeros(lanes as usize * 8 * width)?);
         }
         Ok(MultitalkerStream {
@@ -2995,6 +2998,8 @@ impl ParakeetEncoder {
             mask: self.stream.clone_htod(&vec![1u8; 112])?,
             lanes,
             cumulative: 0,
+            lane_cumulative: [0; 4],
+            cold_conv_pad: false,
             steps: 0,
             #[cfg(test)]
             trace: Vec::new(),
@@ -3010,14 +3015,19 @@ impl ParakeetEncoder {
     /// solve_length_mismatch does; `masks.bg` arrives at `[lanes, rows]`,
     /// sliced from the step start exactly as the reference captures it.
     /// Returns the step's per-lane valid rows and the layer-0 cells for the gate.
-    pub(crate) fn multitalker_encode_step(
+    pub(crate) fn multitanker_encode_step(
         &self,
         session: &mut MultitalkerStream,
         windows: &[Vec<f32>],
         masks: &MultitalkerMasks<'_>,
         kernels: &MultitalkerKernels<'_>,
-        keep_all: bool,
+        active: &[usize],
+        mode: MultitalkerStepMode,
     ) -> Result<MultitalkerStep> {
+        let MultitalkerStepMode {
+            keep_all,
+            shared_pre_encode,
+        } = mode;
         let width = self.conformer.hidden as usize;
         let lanes = session.lanes as usize;
         ensure!(
@@ -3033,28 +3043,51 @@ impl ParakeetEncoder {
             windows.iter().all(|window| window.len() == frames * 128),
             "multitalker streaming lanes disagree on chunk length"
         );
-        let mut subsampled = Vec::with_capacity(lanes);
-        for window in windows {
-            let output = self.subsample_device(window, frames)?;
-            subsampled.push(output);
-        }
-        let rows = subsampled[0].hidden.len() / width;
-        ensure!(
-            rows >= 1
-                && subsampled
-                    .iter()
-                    .all(|output| output.hidden.len() == rows * width),
-            "multitalker streaming pre-encode rows"
-        );
-        let mut hidden = self.stream.alloc_zeros(lanes * rows * width)?;
-        for (lane, output) in subsampled.iter().enumerate() {
-            self.copy_device(
-                &output.hidden,
-                0,
-                &mut hidden,
-                lane * rows * width,
-                rows * width,
-            )?;
+        // Kernel mode passes the same raw window for every lane: the
+        // published loop pre-encodes the session chunk once (a batch of one)
+        // and stacks the rows per lane; the conv stack is batch-shape
+        // sensitive at the 4e-4 level, so the shared path replicates one
+        // pre-encode instead of running the lane stack through it.
+        let rows;
+        let mut hidden;
+        if shared_pre_encode {
+            let output = self.subsample_device(&windows[0], frames)?;
+            rows = output.hidden.len() / width;
+            ensure!(rows >= 1, "multitalker streaming pre-encode rows");
+            hidden = self.stream.alloc_zeros(lanes * rows * width)?;
+            for lane in 0..lanes {
+                self.copy_device(
+                    &output.hidden,
+                    0,
+                    &mut hidden,
+                    lane * rows * width,
+                    rows * width,
+                )?;
+            }
+        } else {
+            let mut subsampled = Vec::with_capacity(lanes);
+            for window in windows {
+                let output = self.subsample_device(window, frames)?;
+                subsampled.push(output);
+            }
+            rows = subsampled[0].hidden.len() / width;
+            ensure!(
+                rows >= 1
+                    && subsampled
+                        .iter()
+                        .all(|output| output.hidden.len() == rows * width),
+                "multitalker streaming pre-encode rows"
+            );
+            hidden = self.stream.alloc_zeros(lanes * rows * width)?;
+            for (lane, output) in subsampled.iter().enumerate() {
+                self.copy_device(
+                    &output.hidden,
+                    0,
+                    &mut hidden,
+                    lane * rows * width,
+                    rows * width,
+                )?;
+            }
         }
         let layer0_in = self.stream.clone_dtoh(&hidden)?;
         let spk_rows = Self::align_masks(masks.spk, lanes, rows, 1.0);
@@ -3079,6 +3112,45 @@ impl ParakeetEncoder {
         // and within-chunk right edge live in the kernel's left_slide/chunk
         // arithmetic. Mid-stream steps emit their first 14 rows; the final
         // step emits them all.
+        let mut live = [false; 4];
+        for lane in active {
+            ensure!(
+                *lane < lanes,
+                "active lane {lane} outside the stack of {lanes} (active {active:?}, step {})",
+                session.steps
+            );
+            live[*lane] = true;
+        }
+        let first_step = session.steps == 0;
+        // The shared launch requires every encoded lane to fill the grid's
+        // sliding left context with its own rows. A live lane whose history
+        // is shorter (not yet started, or started late) runs detached below
+        // in a sub-session over its own row grid.
+        let grid_cache = {
+            let probe = self.multitalker_span(session.cumulative, rows as u32)?;
+            session
+                .cumulative
+                .saturating_sub(probe.kv_offset.max(0) as u32) as usize
+        };
+        let mut main = [false; 4];
+        let mut detached: Vec<(u32, Vec<usize>)> = Vec::new();
+        for lane in 0..lanes {
+            let count = session.lane_cumulative[lane];
+            if !live[lane] {
+                ensure!(
+                    count == 0 || count >= 70,
+                    "lane {lane} pauses at {count} rows; only pauses at >= 70 are handled"
+                );
+                continue;
+            }
+            if count as usize >= grid_cache || first_step {
+                main[lane] = true;
+            } else if let Some(group) = detached.iter_mut().find(|(seed, _)| *seed == count) {
+                group.1.push(lane);
+            } else {
+                detached.push((count, vec![lane]));
+            }
+        }
         let mut span = self.multitalker_span(session.cumulative, rows as u32)?;
         span.right_chunks = u32::from(keep_all);
         let table = relative_positions(span.key_rows as usize, width)?;
@@ -3091,7 +3163,7 @@ impl ParakeetEncoder {
         traced.push(self.stream.clone_dtoh(&step)?);
         for index in 0..self.blocks.len() {
             let (next, cache) =
-                self.multitalker_layer_step(index, &step, session, &table_dev, &span)?;
+                self.multitalker_layer_step(index, &step, session, &table_dev, &span, &main)?;
             step = next;
             #[cfg(test)]
             traced.push(self.stream.clone_dtoh(&step)?);
@@ -3107,6 +3179,11 @@ impl ParakeetEncoder {
             session.depthwise[index] = cache.depthwise;
         }
         session.cumulative += rows as u32;
+        for (lane, is_main) in main[..lanes].iter().enumerate() {
+            if *is_main {
+                session.lane_cumulative[lane] += rows as u32;
+            }
+        }
         let out_rows = if keep_all { rows } else { rows.min(14) };
         let mut output = self.stream.alloc_zeros(lanes * out_rows * width)?;
         for lane in 0..lanes {
@@ -3120,10 +3197,128 @@ impl ParakeetEncoder {
         }
         let rows_out = self.stream.clone_dtoh(&output)?;
         session.steps += 1;
+        // Detached lanes (late starts and young histories) run through a
+        // sub-session over their own row grid — a fresh cold start for seed 0,
+        // or a seeded continuation carrying their existing rows — and their
+        // caches and outputs merge back into this step's result.
+        let mut merged_rows = rows_out.clone();
+        let mut merged_in = layer0_in.clone();
+        let mut merged_post = layer0_post.clone();
+        let stride = 98usize;
+        for (seed, group) in &detached {
+            let mut fresh = self.multitalker_stream(group.len() as u32)?;
+            fresh.cold_conv_pad = *seed == 0 && !first_step;
+            if *seed > 0 {
+                fresh.cumulative = *seed;
+                fresh.steps = (*seed / 14).max(1);
+                for lane_index in fresh.lane_cumulative.iter_mut() {
+                    *lane_index = *seed;
+                }
+                let carry = (*seed as usize).min(stride);
+                for index in 0..self.blocks.len() {
+                    for (slot, lane) in group.iter().enumerate() {
+                        self.copy_device(
+                            &session.keys[index],
+                            lane * stride * width,
+                            &mut fresh.keys[index],
+                            slot * stride * width,
+                            carry * width,
+                        )?;
+                        self.copy_device(
+                            &session.values[index],
+                            lane * stride * width,
+                            &mut fresh.values[index],
+                            slot * stride * width,
+                            carry * width,
+                        )?;
+                        self.copy_device(
+                            &session.depthwise[index],
+                            lane * 8 * width,
+                            &mut fresh.depthwise[index],
+                            slot * 8 * width,
+                            8 * width,
+                        )?;
+                    }
+                }
+            }
+            let mut group_windows = Vec::with_capacity(group.len());
+            let mut group_spk = Vec::with_capacity(group.len() * 14);
+            let mut group_bg = Vec::with_capacity(rows * group.len());
+            for lane in group {
+                group_windows.push(windows[*lane].clone());
+                group_spk.extend_from_slice(&masks.spk[*lane * 14..(*lane + 1) * 14]);
+                group_bg.extend_from_slice(&masks.bg[*lane * rows..(*lane + 1) * rows]);
+            }
+            let group_masks = MultitalkerMasks {
+                spk: &group_spk,
+                bg: &group_bg,
+            };
+            let group_kernels = MultitalkerKernels {
+                speaker_up: kernels.speaker_up,
+                speaker_down: kernels.speaker_down,
+                background_up: kernels.background_up,
+                background_down: kernels.background_down,
+            };
+            let slots: Vec<usize> = (0..group.len()).collect();
+            let group_step = self.multitanker_encode_step(
+                &mut fresh,
+                &group_windows,
+                &group_masks,
+                &group_kernels,
+                &slots,
+                MultitalkerStepMode {
+                    keep_all,
+                    shared_pre_encode,
+                },
+            )?;
+            #[cfg(test)]
+            {
+                session.trace = fresh.trace.clone();
+                session.block_trace = fresh.block_trace.clone();
+            }
+            for index in 0..self.blocks.len() {
+                for (slot, lane) in group.iter().enumerate() {
+                    self.copy_device(
+                        &fresh.keys[index],
+                        slot * stride * width,
+                        &mut session.keys[index],
+                        lane * stride * width,
+                        stride * width,
+                    )?;
+                    self.copy_device(
+                        &fresh.values[index],
+                        slot * stride * width,
+                        &mut session.values[index],
+                        lane * stride * width,
+                        stride * width,
+                    )?;
+                    self.copy_device(
+                        &fresh.depthwise[index],
+                        slot * 8 * width,
+                        &mut session.depthwise[index],
+                        lane * 8 * width,
+                        8 * width,
+                    )?;
+                }
+            }
+            for (slot, lane) in group.iter().enumerate() {
+                session.lane_cumulative[*lane] += rows as u32;
+                merged_rows[*lane * out_rows * width..(*lane + 1) * out_rows * width]
+                    .copy_from_slice(
+                        &group_step.rows[slot * out_rows * width..(slot + 1) * out_rows * width],
+                    );
+                merged_in[*lane * rows * width..(*lane + 1) * rows * width].copy_from_slice(
+                    &group_step.layer0_in[slot * rows * width..(slot + 1) * rows * width],
+                );
+                merged_post[*lane * rows * width..(*lane + 1) * rows * width].copy_from_slice(
+                    &group_step.layer0_post[slot * rows * width..(slot + 1) * rows * width],
+                );
+            }
+        }
         Ok(MultitalkerStep {
-            rows: rows_out,
-            layer0_in,
-            layer0_post,
+            rows: merged_rows,
+            layer0_in: merged_in,
+            layer0_post: merged_post,
         })
     }
 
@@ -3214,6 +3409,7 @@ impl ParakeetEncoder {
         session: &mut MultitalkerStream,
         table_dev: &CudaSlice<f32>,
         span: &MultitalkerWindow,
+        live: &[bool; 4],
     ) -> Result<(CudaSlice<f32>, MultitalkerLayerStep)> {
         let rows = span.rows;
         let block = self
@@ -3261,7 +3457,6 @@ impl ParakeetEncoder {
         let k = self.lane_linear(&normalized, stacked, canonical, &block.attention.k)?;
         let v = self.lane_linear(&normalized, stacked, canonical, &block.attention.v)?;
         let key_rows = span.key_rows as usize;
-        let cached = session.cumulative.min(98) as usize;
         // The span covers whole chunks, including rows that do not exist yet;
         // attention is bounded by the real row count.
         let span_cache = session
@@ -3272,31 +3467,38 @@ impl ParakeetEncoder {
             zeros + span_cache + rows_us == key_rows,
             "multitalker layout zeros {zeros} cache {span_cache} rows {rows_us} keys {key_rows}"
         );
+        let stride = 98usize;
         ensure!(
-            span_cache <= cached
-                && session.keys[index].len() == lanes * cached * width
-                && session.values[index].len() == lanes * cached * width,
-            "multitalker layer {index} cache length cached={cached} span_cache={span_cache}"
+            session.keys[index].len() == lanes * stride * width
+                && session.values[index].len() == lanes * stride * width
+                && (0..lanes).all(|lane| {
+                    let count = session.lane_cumulative[lane].min(98) as usize;
+                    count >= span_cache || count == 0 || !live[lane]
+                }),
+            "multitalker layer {index} cache extent"
         );
         let mut cat_k = self.stream.alloc_zeros(lanes * key_rows * width)?;
         let mut cat_v = self.stream.alloc_zeros(lanes * key_rows * width)?;
-        for lane in 0..lanes {
-            let cache_start = (lane * cached + cached - span_cache) * width;
+        for (lane, is_live) in live[..lanes].iter().enumerate() {
+            let cached = session.lane_cumulative[lane].min(98) as usize;
             let lane_k = lane * key_rows * width;
-            self.copy_device(
-                &session.keys[index],
-                cache_start,
-                &mut cat_k,
-                lane_k + zeros * width,
-                span_cache * width,
-            )?;
-            self.copy_device(
-                &session.values[index],
-                cache_start,
-                &mut cat_v,
-                lane_k + zeros * width,
-                span_cache * width,
-            )?;
+            if cached > 0 && *is_live {
+                let cache_start = (lane * stride + cached - span_cache) * width;
+                self.copy_device(
+                    &session.keys[index],
+                    cache_start,
+                    &mut cat_k,
+                    lane_k + zeros * width,
+                    span_cache * width,
+                )?;
+                self.copy_device(
+                    &session.values[index],
+                    cache_start,
+                    &mut cat_v,
+                    lane_k + zeros * width,
+                    span_cache * width,
+                )?;
+            }
             self.copy_device(
                 &k,
                 lane * rows_us * width,
@@ -3344,7 +3546,7 @@ impl ParakeetEncoder {
             &block.convolution.pointwise1,
         )?;
         let activated = self.activate(&expanded, stacked, width as u32, 2)?;
-        let launch_rows = if session.cumulative == 0 {
+        let launch_rows = if session.cumulative == 0 && !session.cold_conv_pad {
             rows
         } else {
             rows + 8
@@ -3404,7 +3606,17 @@ impl ParakeetEncoder {
         {
             let source_rows = launch_rows as usize;
             let available = source_rows.min(8);
-            for lane in 0..lanes {
+            for (lane, is_live) in live[..lanes].iter().enumerate() {
+                if !is_live {
+                    self.copy_device(
+                        &session.depthwise[index],
+                        lane * 8 * width,
+                        &mut next_depth,
+                        lane * 8 * width,
+                        8 * width,
+                    )?;
+                    continue;
+                }
                 self.copy_device(
                     &joined,
                     (lane * source_rows + source_rows - available) * width,
@@ -3436,24 +3648,43 @@ impl ParakeetEncoder {
         session.block_trace.push(self.stream.clone_dtoh(&hidden)?);
         feed_forward(&mut hidden, &block.ff2, 0.5)?;
         let output = self.normalize(&hidden, stacked, &block.output_norm)?;
-        let keep = (session.cumulative + rows).min(98) as usize;
-        let drop = cached + rows_us - keep;
-        let mut next_k = self.stream.alloc_zeros(lanes * keep * width)?;
-        let mut next_v = self.stream.alloc_zeros(lanes * keep * width)?;
-        for lane in 0..lanes {
+        let stride = 98usize;
+        let mut next_k = self.stream.alloc_zeros(lanes * stride * width)?;
+        let mut next_v = self.stream.alloc_zeros(lanes * stride * width)?;
+        for (lane, is_live) in live[..lanes].iter().enumerate() {
+            if !is_live {
+                self.copy_device(
+                    &session.keys[index],
+                    lane * stride * width,
+                    &mut next_k,
+                    lane * stride * width,
+                    stride * width,
+                )?;
+                self.copy_device(
+                    &session.values[index],
+                    lane * stride * width,
+                    &mut next_v,
+                    lane * stride * width,
+                    stride * width,
+                )?;
+                continue;
+            }
+            let cached = session.lane_cumulative[lane].min(98) as usize;
+            let keep = (session.lane_cumulative[lane] as usize + rows_us).min(stride);
+            let drop = cached + rows_us - keep;
             if keep > rows_us {
                 self.copy_device(
                     &session.keys[index],
-                    (lane * cached + drop) * width,
+                    (lane * stride + drop) * width,
                     &mut next_k,
-                    lane * keep * width,
+                    lane * stride * width,
                     (keep - rows_us) * width,
                 )?;
                 self.copy_device(
                     &session.values[index],
-                    (lane * cached + drop) * width,
+                    (lane * stride + drop) * width,
                     &mut next_v,
-                    lane * keep * width,
+                    lane * stride * width,
                     (keep - rows_us) * width,
                 )?;
             }
@@ -3461,14 +3692,14 @@ impl ParakeetEncoder {
                 &k,
                 lane * rows_us * width,
                 &mut next_k,
-                (lane * keep + keep - rows_us) * width,
+                (lane * stride + keep - rows_us) * width,
                 rows_us * width,
             )?;
             self.copy_device(
                 &v,
                 lane * rows_us * width,
                 &mut next_v,
-                (lane * keep + keep - rows_us) * width,
+                (lane * stride + keep - rows_us) * width,
                 rows_us * width,
             )?;
         }
@@ -3491,6 +3722,12 @@ pub struct MultitalkerStream {
     mask: CudaSlice<u8>,
     lanes: u32,
     cumulative: u32,
+    /// Per-lane encoded rows; an inactive lane's caches freeze at its own
+    /// count until the reference's gating re-admits it.
+    lane_cumulative: [u32; 4],
+    /// A cold start on a mid-stream window convolves with the zero-filled
+    /// 8-row left cache the reference initializes every lane with.
+    cold_conv_pad: bool,
     steps: u32,
     #[cfg(test)]
     pub(crate) trace: Vec<Vec<f32>>,
@@ -3531,6 +3768,13 @@ struct MultitalkerLayerStep {
     value: CudaSlice<f32>,
     depthwise: CudaSlice<f32>,
 }
+/// Per-call mode flags for the multitalker encode step: keep-all rows
+/// (kernel mode) versus the 14-row emission window, and whether the
+/// pre-encode input is shared across the lane stack.
+pub(crate) struct MultitalkerStepMode {
+    pub(crate) keep_all: bool,
+    pub(crate) shared_pre_encode: bool,
+}
 
 /// Per-step diar masks `[lanes, 14]`.
 pub(crate) struct MultitalkerMasks<'a> {
@@ -3570,7 +3814,14 @@ impl ParakeetEncoder {
         let span = self.multitalker_span(0, 14)?;
         let table = relative_positions(span.key_rows as usize, width)?;
         let table_dev = self.stream.clone_htod(&table)?;
-        let (output, _) = self.multitalker_layer_step(index, input, session, &table_dev, &span)?;
+        let (output, _) = self.multitalker_layer_step(
+            index,
+            input,
+            session,
+            &table_dev,
+            &span,
+            &[true, true, true, true],
+        )?;
         Ok(output)
     }
 
