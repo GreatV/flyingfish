@@ -1323,12 +1323,16 @@ mod gate_tests {
         Ok(())
     }
 
-    /// Control for the joint gather: a lane that finishes its rows while
-    /// another still emits must not push its row offset past the projected
-    /// buffer. One row per lane keeps the projection at the probe's 4-row
-    /// GEMM shape: lane 3 blanks (1 joint call); lane 0's first decision
-    /// emits, so its second call reads a completed lane 3. The 2-row-per-lane
-    /// variant runs once more as a row-count GEMM variance diagnostic.
+    /// Control for the joint gather and lane-count invariance: a lane that
+    /// finishes its rows while another still emits must not push its row
+    /// offset past the projected buffer, and lane 0's tokens must not depend
+    /// on the other lanes' liveness or on the step's row count. Every leg
+    /// runs on a fresh decode stream, so each first decision is the
+    /// zero-state SOS prime, the computation production makes at stream
+    /// start. Lane 3 blanks every row; lane 0's first decision emits, so its
+    /// next joint call reads a completed lane 3. Legs: one row per lane with
+    /// all lanes live, one row per lane with lane 0 the only live lane, and
+    /// two rows per lane (an 8-row projection where the probe's is 4-row).
     #[test]
     #[ignore = "GPU + published archive; set FF_MULTITALKER_NEMO, FF_N6E_M2B"]
     fn multitalker_decode_tolerates_early_finishers() -> Result<()> {
@@ -1338,7 +1342,6 @@ mod gate_tests {
         let device = Device::new(0)?;
         let model = Multitalker::load(Path::new(&nemo), &device)?;
         let blank = model.blank() as usize;
-        let mut dstream = model.decode_stream()?;
         let argmax = |logits: &[f32]| -> usize {
             logits
                 .iter()
@@ -1377,6 +1380,7 @@ mod gate_tests {
         let mut blank_row: Option<Vec<f32>> = None;
         let mut symbol: Option<(Vec<f32>, u32)> = None;
         for row in &candidates {
+            let mut dstream = model.decode_stream()?;
             let sos = model.decode_teacher_forced(
                 &mut dstream,
                 0,
@@ -1386,8 +1390,10 @@ mod gate_tests {
             )?;
             let logits = &sos[0];
             let best = argmax(logits);
-            // The crafted step projects 8 rows where this probe projects 4;
-            // only decisions clear of the GEMM tile difference carry over.
+            // The probe projects a 4-row batch (one row per lane slot); the
+            // crafted steps project 4-row and 8-row batches. A row enters
+            // the crafted steps only with a top1-top2 margin above 0.1, so
+            // its decision carries over the projection shape difference.
             let mut top = [f32::NEG_INFINITY; 2];
             for value in logits {
                 if *value > top[0] {
@@ -1415,17 +1421,17 @@ mod gate_tests {
         let width = model.spec.d_model as usize;
         fn decode_primed(
             model: &Multitalker,
-            dstream: &mut MultitalkerDecodeStream,
             features: &[f32],
             diar: &[f32],
             step: &MultitalkerStep,
         ) -> Result<(Vec<usize>, Vec<Vec<u32>>)> {
             let mut session = model.stream(features.to_vec(), diar.to_vec(), true, 4, true)?;
             let mut stream = model.encoder.multitalker_stream(4)?;
+            let mut dstream = model.decode_stream()?;
             model
                 .stream_step(&mut session, &mut stream)?
                 .context("primer step")?;
-            let active = model.decode_step(&mut session, dstream, step)?;
+            let active = model.decode_step(&mut session, &mut dstream, step)?;
             let tokens = session
                 .hypotheses
                 .iter()
@@ -1435,20 +1441,32 @@ mod gate_tests {
         }
         let features = model.features(&synth_signal())?;
         let frames = features.len() / 128 + 28;
-        let mut diar = vec![0.0f32; frames * 4];
-        diar[..4].fill(1.0);
-        let mut rows4 = vec![0.0f32; 4 * width];
-        rows4[..width].copy_from_slice(&sym_row);
-        for lane in 1..4 {
-            let base = lane * width;
-            rows4[base..base + width].copy_from_slice(&blank_row);
-        }
-        let step4 = MultitalkerStep {
-            rows: rows4,
-            layer0_in: Vec::new(),
-            layer0_post: Vec::new(),
+        let mut diar_all = vec![0.0f32; frames * 4];
+        diar_all[..4].fill(1.0);
+        let mut diar_solo = vec![0.0f32; frames * 4];
+        diar_solo[0] = 1.0;
+        let craft = |per_lane: usize| -> MultitalkerStep {
+            let mut rows = vec![0.0f32; 4 * per_lane * width];
+            rows[..width].copy_from_slice(&sym_row);
+            for index in 1..per_lane {
+                rows[index * width..(index + 1) * width].copy_from_slice(&blank_row);
+            }
+            for lane in 1..4 {
+                let base = lane * per_lane * width;
+                for index in 0..per_lane {
+                    rows[base + index * width..base + (index + 1) * width]
+                        .copy_from_slice(&blank_row);
+                }
+            }
+            MultitalkerStep {
+                rows,
+                layer0_in: Vec::new(),
+                layer0_post: Vec::new(),
+            }
         };
-        let (active, tokens) = decode_primed(&model, &mut dstream, &features, &diar, &step4)?;
+        let step4 = craft(1);
+        let step8 = craft(2);
+        let (active, tokens) = decode_primed(&model, &features, &diar_all, &step4)?;
         ensure!(active == vec![0, 1, 2, 3], "crafted step lanes {active:?}");
         ensure!(
             tokens[0].first() == Some(&token),
@@ -1458,34 +1476,20 @@ mod gate_tests {
         for (lane, lane_tokens) in tokens.iter().enumerate().skip(1) {
             ensure!(lane_tokens.is_empty(), "lane {lane} tokens {lane_tokens:?}");
         }
-        println!("PASS multitalker_decode_early_finishers lane0=first_symbol lane3=finished_first");
-        let mut rows8 = vec![0.0f32; 4 * 2 * width];
-        rows8[..width].copy_from_slice(&sym_row);
-        rows8[width..2 * width].copy_from_slice(&blank_row);
-        for lane in 1..4 {
-            let base = lane * 2 * width;
-            rows8[base..base + width].copy_from_slice(&blank_row);
-            rows8[base + width..base + 2 * width].copy_from_slice(&blank_row);
-        }
-        let step8 = MultitalkerStep {
-            rows: rows8,
-            layer0_in: Vec::new(),
-            layer0_post: Vec::new(),
-        };
-        let (_, tokens8) = decode_primed(&model, &mut dstream, &features, &diar, &step8)?;
-        let reprobe = model.decode_teacher_forced(
-            &mut dstream,
-            0,
-            &[sym_row.as_slice()],
-            &[false],
-            &[blank as u32],
-        )?;
-        println!(
-            "DIAG early_finishers probe={token} step4_first={:?} step8_first={:?} reprobe={}",
-            tokens[0].first(),
-            tokens8[0].first(),
-            argmax(&reprobe[0])
+        let (solo_active, solo_tokens) = decode_primed(&model, &features, &diar_solo, &step4)?;
+        ensure!(solo_active == vec![0], "solo step lanes {solo_active:?}");
+        ensure!(
+            solo_tokens[0].first() == Some(&token),
+            "solo lane 0 first token {:?} vs {token}",
+            solo_tokens[0].first()
         );
+        let (_, tokens8) = decode_primed(&model, &features, &diar_all, &step8)?;
+        ensure!(
+            tokens8[0].first() == Some(&token),
+            "2-row step lane 0 first token {:?} vs {token}",
+            tokens8[0].first()
+        );
+        println!("PASS multitalker_decode_early_finishers lane0={token} shapes=4,8 live=4,1");
         Ok(())
     }
 
