@@ -209,17 +209,22 @@ impl EntryReader {
         Ok(buffer)
     }
 
-    /// Copies a finite BF16 tensor into host memory of exactly its size.
+    /// Copies a finite BF16 or F32 tensor into host memory of exactly its size.
     fn read_into(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
         ensure!(
-            entry.dtype == Dtype::BF16 && entry.bytes == destination.len(),
+            matches!(entry.dtype, Dtype::BF16 | Dtype::F32) && entry.bytes == destination.len(),
             "{name}: {:?} {} B does not fill {} B",
             entry.dtype,
             entry.bytes,
             destination.len()
         );
         let bytes = self.read(name, entry)?;
-        ensure!(<bf16 as Element>::finite(bytes), "{name}: nonfinite value");
+        let finite = if entry.dtype == Dtype::F32 {
+            <f32 as Element>::finite(bytes)
+        } else {
+            <bf16 as Element>::finite(bytes)
+        };
+        ensure!(finite, "{name}: nonfinite value");
         destination.copy_from_slice(bytes);
         Ok(())
     }
@@ -506,6 +511,13 @@ const HIDDEN_NORM_THREADS: u32 = 768;
 /// Threads per head-width RMSNorm row.
 const HEAD_NORM_THREADS: u32 = 32;
 
+/// A vector view and its owned allocation or shared byte arena.
+struct VectorWeight<T> {
+    tensor: Tensor<T, 1>,
+    _owned: Option<CudaSlice<T>>,
+    _arena: Option<Arc<CudaSlice<u8>>>,
+}
+
 /// One base linear: dense BF16, int8 convrot (`qweight` `[out, in]`, `wscale` `[out]`), or `up(down(x))`.
 enum BlockLinear {
     Dense {
@@ -514,7 +526,7 @@ enum BlockLinear {
     },
     Int8 {
         qweight: Tensor<i8, 2>,
-        wscale: CudaSlice<f32>,
+        wscale: VectorWeight<f32>,
         group: u32,
         owned: Option<CudaSlice<i8>>,
     },
@@ -526,12 +538,12 @@ enum BlockLinear {
 }
 
 /// One block's weights. `linears` is `LINEAR_ROLES` order. Dense MiniMax views point into `storage` or a streaming
-/// slot. A dropped block's `linears` are 1×1 views of `storage` and `dropped` is set.
+/// slot. A dropped block's `linears` are 1×1 views of the vector arena and `dropped` is set.
 pub(crate) struct BlockWeights {
-    norm1: CudaSlice<bf16>,
-    norm2: CudaSlice<bf16>,
-    norm_q: CudaSlice<bf16>,
-    norm_k: CudaSlice<bf16>,
+    norm1: VectorWeight<bf16>,
+    norm2: VectorWeight<bf16>,
+    norm_q: VectorWeight<bf16>,
+    norm_k: VectorWeight<bf16>,
     linears: [BlockLinear; 6],
     storage: Option<CudaSlice<bf16>>,
     dropped: bool,
@@ -553,6 +565,9 @@ pub(crate) struct Source<'a> {
     reader: EntryReader,
     manifest: &'a TensorManifest,
     quant: OnceLock<QuantKernels>,
+    vectors: Option<(VectorArenaLayout, Arc<CudaSlice<u8>>)>,
+    #[cfg(test)]
+    vector_bytes: Option<Vec<u8>>,
 }
 
 impl<'a> Source<'a> {
@@ -561,6 +576,9 @@ impl<'a> Source<'a> {
             reader: EntryReader::new(dir),
             manifest,
             quant: OnceLock::new(),
+            vectors: None,
+            #[cfg(test)]
+            vector_bytes: None,
         }
     }
 
@@ -618,14 +636,98 @@ impl<'a> Source<'a> {
         name: &str,
         elements: usize,
     ) -> Result<CudaSlice<T>> {
+        #[cfg(test)]
+        let free_before = s.context().mem_get_info()?.0;
         let mut buffer = s.alloc_zeros::<T>(elements)?;
         self.fill(s, name, &mut buffer.slice_mut(..))?;
+        #[cfg(test)]
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_allocation_tensor": {
+                "name": name, "dtype": format!("{:?}", T::DTYPE),
+                "logical_bytes": elements * std::mem::size_of::<T>(),
+                "free_before": free_before, "free_after": s.context().mem_get_info()?.0,
+                "synchronized": false
+            }})
+        );
         Ok(buffer)
     }
 
     fn host_f32(&mut self, s: &Arc<CudaStream>, name: &str, elements: usize) -> Result<Vec<f32>> {
         let tensor = self.tensor::<f32>(s, name, elements)?;
         Ok(s.clone_dtoh(&tensor)?)
+    }
+
+    fn vector<T: Element + crate::backend::gpu::ValidAsZeroBits + Copy>(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        elements: usize,
+    ) -> Result<VectorWeight<T>> {
+        if let Some((layout, buffer)) = &self.vectors {
+            let &(offset, bytes, dtype) = layout
+                .offsets
+                .get(name)
+                .with_context(|| format!("vector arena lacks {name}"))?;
+            ensure!(
+                dtype == T::DTYPE && bytes == elements * std::mem::size_of::<T>(),
+                "{name}: vector arena type or extent"
+            );
+            let ptr = pointer(buffer, s)
+                .checked_add(u64::try_from(offset)?)
+                .context("vector arena address overflow")?;
+            return Ok(VectorWeight {
+                tensor: unsafe {
+                    Tensor::new(ptr, [u32::try_from(elements)?], [1], u64::try_from(bytes)?)?
+                },
+                _owned: None,
+                _arena: Some(buffer.clone()),
+            });
+        }
+        let owned = self.tensor::<T>(s, name, elements)?;
+        let tensor = view(&owned, s, 0, [u32::try_from(elements)?], [1])?;
+        Ok(VectorWeight {
+            tensor,
+            _owned: Some(owned),
+            _arena: None,
+        })
+    }
+
+    fn pack_vectors(&mut self, s: &Arc<CudaStream>, spec: &H3Spec) -> Result<()> {
+        ensure!(self.vectors.is_none(), "vector arena already loaded");
+        let layout = VectorArenaLayout::new(self.manifest, spec)?;
+        let dropped = spec
+            .dropped_blocks
+            .as_deref()
+            .context("HyperFlow dropped blocks")?;
+        let mut bytes = vec![0u8; layout.bytes];
+        for (name, &(offset, len, dtype)) in &layout.offsets {
+            if let Some(entry) = self.manifest.entries.get(name) {
+                ensure!(
+                    entry.load
+                        && entry.dtype == dtype
+                        && entry.bytes == len
+                        && entry.quant.is_none(),
+                    "{name}: vector arena manifest extent or type"
+                );
+                self.reader
+                    .read_into(name, entry, &mut bytes[offset..offset + len])?;
+            } else {
+                ensure!(
+                    dropped
+                        .iter()
+                        .any(|layer| name.starts_with(&format!("transformer_blocks.{layer}."))),
+                    "manifest lacks vector arena tensor {name}"
+                );
+            }
+        }
+        let buffer = Arc::new(s.clone_htod(&bytes)?);
+        #[cfg(test)]
+        {
+            self.vector_bytes = Some(bytes);
+        }
+        self.vectors = Some((layout, buffer));
+        Ok(())
     }
 }
 
@@ -693,7 +795,7 @@ impl BlockWeights {
         rank: usize,
         block: &str,
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
         let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         let mut storage = s.alloc_zeros::<bf16>(elements)?;
@@ -720,7 +822,7 @@ impl BlockWeights {
         block: &str,
         slot: u64,
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
         let (layout, _) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         Self::with_linears::<LORA>(s, spec, rank, block, (slot, &layout), base, lora)
@@ -733,7 +835,7 @@ impl BlockWeights {
         block: &str,
         (at, layout): (u64, &MatrixLayout),
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
         let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
         for role in LINEAR_ROLES {
@@ -764,17 +866,22 @@ impl BlockWeights {
         block: &str,
         linears: [BlockLinear; 6],
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
+        ensure!(
+            LORA == lora.is_some(),
+            "{block}: LoRA source does not match the block mode"
+        );
         let (h, w, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
         let mut n =
-            |name: &str, count: usize| base.tensor(s, &format!("{block}.{name}.weight"), count);
+            |name: &str, count: usize| base.vector(s, &format!("{block}.{name}.weight"), count);
         let (norm1, norm2) = (n("norm1", h)?, n("norm2", h)?);
         let (norm_q, norm_k) = (
             n("attn.norm_q", spec.head_dim)?,
             n("attn.norm_k", spec.head_dim)?,
         );
         let (qkv_a, q_b, k_b, v_b, out_a, out_b, in_a, in_b, ffo_a, ffo_b, rank) = if LORA {
+            let lora = lora.context("LoRA block without a source")?;
             let r = rank;
             let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
             for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
@@ -847,21 +954,27 @@ impl BlockWeights {
     }
 
     /// No checkpoint tensors. `block_forward` returns the input.
-    fn identity(s: &Arc<CudaStream>, spec: &H3Spec) -> Result<Self> {
-        let storage = s.alloc_zeros::<bf16>(1)?;
-        let weight = unsafe { Tensor::new(pointer(&storage, s), [1, 1], [1, 1], 2)? };
+    fn identity(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        base: &mut Source<'_>,
+        layer: usize,
+    ) -> Result<Self> {
+        let block = format!("transformer_blocks.{layer}");
+        let storage = base.vector::<bf16>(s, &format!("{block}.identity"), 1)?;
+        let weight = unsafe { Tensor::new(storage.tensor.ptr, [1, 1], [1, 1], 2)? };
         let linears = std::array::from_fn(|_| BlockLinear::Dense {
             weight,
             owned: None,
         });
         let empty = || s.alloc_zeros::<bf16>(0);
         Ok(Self {
-            norm1: s.alloc_zeros::<bf16>(spec.hidden)?,
-            norm2: s.alloc_zeros::<bf16>(spec.hidden)?,
-            norm_q: s.alloc_zeros::<bf16>(spec.head_dim)?,
-            norm_k: s.alloc_zeros::<bf16>(spec.head_dim)?,
+            norm1: base.vector(s, &format!("{block}.norm1.weight"), spec.hidden)?,
+            norm2: base.vector(s, &format!("{block}.norm2.weight"), spec.hidden)?,
+            norm_q: base.vector(s, &format!("{block}.attn.norm_q.weight"), spec.head_dim)?,
+            norm_k: base.vector(s, &format!("{block}.attn.norm_k.weight"), spec.head_dim)?,
             linears,
-            storage: Some(storage),
+            storage: None,
             dropped: true,
             qkv_a: empty()?,
             q_b: empty()?,
@@ -883,7 +996,6 @@ impl BlockWeights {
         spec: &H3Spec,
         block: &str,
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
         slot: Option<(u64, &[(String, usize)])>,
     ) -> Result<Self> {
         let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
@@ -899,7 +1011,7 @@ impl BlockWeights {
         let linears: [BlockLinear; 6] = linears
             .try_into()
             .map_err(|_| anyhow::anyhow!("block linear count"))?;
-        Self::with_linears_ready::<false>(s, spec, 0, block, linears, base, lora)
+        Self::with_linears_ready::<false>(s, spec, 0, block, linears, base, None)
     }
 }
 
@@ -986,7 +1098,7 @@ fn int8_factor(
         cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
     )?)?;
     crate::convrot::ensure_group(group, optin).with_context(|| format!("{name} convrot group"))?;
-    let wscale = base.tensor::<f32>(s, &format!("{name}.wscale"), rows)?;
+    let wscale = base.vector::<f32>(s, &format!("{name}.wscale"), rows)?;
     let (qweight, owned) = if let Some((ptr, packed)) = slot {
         (
             view_at(ptr, packed_offset(packed, &qname)?, rows, cols)?,
@@ -1682,7 +1794,7 @@ fn apply_linear(
 fn apply_int8(
     c: &BlockContext<'_>,
     qweight: Tensor<i8, 2>,
-    wscale: &CudaSlice<f32>,
+    wscale: &VectorWeight<f32>,
     group: u32,
     x: Tensor<bf16, 2>,
     y: Tensor<bf16, 2>,
@@ -1694,7 +1806,7 @@ fn apply_int8(
     let n = y.shape[1] as usize;
     ensure!(
         qweight.shape == [u32::try_from(n)?, u32::try_from(k)?]
-            && wscale.len() == n
+            && wscale.tensor.shape == [u32::try_from(n)?]
             && y.shape[0] as usize == rows
             && rows <= ptrs.rows
             && k <= ptrs.k,
@@ -1715,7 +1827,7 @@ fn apply_int8(
         &crate::convrot::ConvrotArgs {
             x: ptrs.x,
             qweight: qweight.ptr,
-            wscale: pointer(wscale, c.s),
+            wscale: wscale.tensor.ptr,
             y: y.ptr,
             rotated: ptrs.rotated,
             codes: ptrs.codes,
@@ -1728,14 +1840,14 @@ fn apply_int8(
     )
 }
 
-fn int8_linear(linear: &BlockLinear) -> Option<(Tensor<i8, 2>, &CudaSlice<f32>, u32)> {
+fn int8_linear(linear: &BlockLinear) -> Option<(Tensor<i8, 2>, Tensor<f32, 1>, u32)> {
     match linear {
         BlockLinear::Int8 {
             qweight,
             wscale,
             group,
             ..
-        } => Some((*qweight, wscale, *group)),
+        } => Some((*qweight, wscale.tensor, *group)),
         _ => None,
     }
 }
@@ -1774,9 +1886,9 @@ fn apply_shared_qkv(
             && v.0.shape[0] == q.0.shape[0]
             && kdim == h
             && n == width
-            && q.1.len() == n
-            && k.1.len() == n
-            && v.1.len() == n
+            && q.1.shape[0] == q.0.shape[0]
+            && k.1.shape[0] == k.0.shape[0]
+            && v.1.shape[0] == v.0.shape[0]
             && rows <= ptrs.rows
             && kdim <= ptrs.k,
         "convrot shape"
@@ -1822,7 +1934,7 @@ fn apply_shared_qkv(
             &crate::convrot::ConvrotArgs {
                 x: ptrs.x,
                 qweight: qweight.ptr,
-                wscale: pointer(wscale, c.s),
+                wscale: wscale.ptr,
                 y: y.ptr,
                 rotated: ptrs.rotated,
                 codes: ptrs.codes,
@@ -1953,10 +2065,10 @@ pub(crate) fn block_forward<const LORA: bool>(
     };
     let xp = pointer(x, s);
     let normed = pointer(&work.normed, s);
-    let hidden_norm = |weight: &CudaSlice<bf16>, shift: usize, scale: usize| -> Result<()> {
+    let hidden_norm = |weight: &VectorWeight<bf16>, shift: usize, scale: usize| -> Result<()> {
         let n = NormRows {
             input: xp,
-            weight: pointer(weight, s),
+            weight: weight.tensor.ptr,
             output: normed,
             rows,
             dim: h,
@@ -2044,7 +2156,7 @@ pub(crate) fn block_forward<const LORA: bool>(
     let head_rows = rows * spec.heads;
     norm(
         pointer(&work.q_raw, s),
-        pointer(&w.norm_q, s),
+        w.norm_q.tensor.ptr,
         pointer(&work.q, s),
         head_rows,
         spec.head_dim,
@@ -2053,7 +2165,7 @@ pub(crate) fn block_forward<const LORA: bool>(
     )?;
     norm(
         pointer(&work.k_raw, s),
-        pointer(&w.norm_k, s),
+        w.norm_k.tensor.ptr,
         pointer(&work.k, s),
         head_rows,
         spec.head_dim,
@@ -2727,8 +2839,161 @@ fn place_layers(
 
 type StoredOffsets = Vec<Vec<(String, usize)>>;
 
+struct VectorArenaLayout {
+    offsets: BTreeMap<String, (usize, usize, Dtype)>,
+    bytes: usize,
+}
+
+impl VectorArenaLayout {
+    fn new(manifest: &TensorManifest, spec: &H3Spec) -> Result<Self> {
+        let dropped = spec
+            .dropped_blocks
+            .as_deref()
+            .context("HyperFlow dropped blocks")?;
+        let mut offsets = BTreeMap::new();
+        let mut bytes = 0usize;
+        let mut add = |name: String, len: usize, dtype: Dtype| -> Result<()> {
+            ensure!(len > 0, "{name}: empty vector arena tensor");
+            let offset = bytes;
+            bytes = bytes
+                .checked_add(stored_allocation_bytes(len, 256)?)
+                .context("vector arena extent overflow")?;
+            ensure!(
+                offsets.insert(name.clone(), (offset, len, dtype)).is_none(),
+                "duplicate vector arena tensor {name}"
+            );
+            Ok(())
+        };
+        for layer in 0..spec.layers {
+            for (role, width) in [
+                ("norm1", spec.hidden),
+                ("norm2", spec.hidden),
+                ("attn.norm_q", spec.head_dim),
+                ("attn.norm_k", spec.head_dim),
+            ] {
+                add(
+                    format!("transformer_blocks.{layer}.{role}.weight"),
+                    width.checked_mul(2).context("norm extent overflow")?,
+                    Dtype::BF16,
+                )?;
+            }
+            if dropped.contains(&layer) {
+                add(
+                    format!("transformer_blocks.{layer}.identity"),
+                    2,
+                    Dtype::BF16,
+                )?;
+            }
+        }
+        for (name, entry) in &manifest.entries {
+            if entry.load && entry.layer.is_some() && name.ends_with(".wscale") {
+                ensure!(
+                    entry.dtype == Dtype::F32 && entry.shape.len() == 1,
+                    "{name}: vector arena scale layout"
+                );
+                add(name.clone(), entry.bytes, Dtype::F32)?;
+            }
+        }
+        Ok(Self { offsets, bytes })
+    }
+}
+
+fn stored_allocation_granularity(d: &Device) -> Result<usize> {
+    use cudarc::driver::sys::{self, CUmemAllocationGranularity_flags as G};
+    let mut properties: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+    properties.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+    properties.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+    properties.location.__bindgen_anon_1.id = d.ctx.cu_device();
+    let mut granularity = 0;
+    unsafe {
+        sys::cuMemGetAllocationGranularity(
+            &mut granularity,
+            &properties,
+            G::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+        )
+        .result()?;
+    }
+    ensure!(granularity > 0, "zero stored allocation granularity");
+    Ok(granularity)
+}
+
+fn stored_allocation_bytes(bytes: usize, granularity: usize) -> Result<usize> {
+    ensure!(granularity > 0, "zero stored allocation granularity");
+    bytes
+        .div_ceil(granularity)
+        .checked_mul(granularity)
+        .context("stored allocation extent overflow")
+}
+
+fn stored_allocation_costs(
+    manifest: &TensorManifest,
+    spec: &H3Spec,
+    granularity: usize,
+    owned: usize,
+) -> Result<(Vec<usize>, usize)> {
+    let mut layers = vec![0usize; spec.layers];
+    let arena = VectorArenaLayout::new(manifest, spec)?;
+    let logical_metadata = arena
+        .offsets
+        .iter()
+        .filter(|(name, _)| !name.ends_with(".identity"))
+        .try_fold(0usize, |sum, (_, (_, bytes, _))| {
+            sum.checked_add(*bytes).context("stored metadata extent")
+        })?;
+    for (name, entry) in &manifest.entries {
+        let Some(layer) = entry.layer else { continue };
+        if !entry.load {
+            continue;
+        }
+        let layer = layer as usize;
+        ensure!(layer < spec.layers, "{name}: stored allocation layer");
+        if entry.shape.len() == 2 {
+            layers[layer] = layers[layer]
+                .checked_add(stored_allocation_bytes(entry.bytes, granularity)?)
+                .context("stored layer allocation extent")?;
+        }
+    }
+    let arena_bytes = stored_allocation_bytes(arena.bytes, granularity)?;
+    let owned = owned
+        .checked_sub(logical_metadata)
+        .and_then(|n| n.checked_add(arena_bytes))
+        .context("stored owned allocation extent")?;
+    Ok((layers, owned))
+}
+
+#[cfg(test)]
+fn trace_placement_pool(d: &Device, phase: &str) -> Result<()> {
+    use cudarc::driver::sys::{self, CUmemPool_attribute};
+    let mut pool = std::ptr::null_mut();
+    let (mut reserved, mut used) = (0u64, 0u64);
+    unsafe {
+        sys::cuDeviceGetDefaultMemPool(&mut pool, d.ctx.cu_device()).result()?;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            (&mut reserved as *mut u64).cast(),
+        )
+        .result()?;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            (&mut used as *mut u64).cast(),
+        )
+        .result()?;
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_placement_pool": {
+            "phase": phase, "reserved_bytes": reserved, "used_bytes": used,
+            "free_bytes": d.ctx.mem_get_info()?.0,
+            "event_tracking": d.ctx.is_event_tracking(), "synchronized": false
+        }})
+    );
+    Ok(())
+}
+
 /// HyperFlow transformer blocks. Dropped layers stay out of `DensePlacement` and come back as empty slots.
-/// A kept layer's device bytes equal its stored bytes. `packed` is `(name, byte offset)` in manifest order.
+/// `packed` contains stored byte offsets; placement prices allocations at the reported granularity.
 fn place_stored_layers(
     d: &Device,
     base: &mut Source<'_>,
@@ -2802,10 +3067,22 @@ fn place_stored_layers(
         kept_index.push(layer);
     }
     ensure!(!kept_device.is_empty(), "no stored transformer block");
+    let granularity = stored_allocation_granularity(d)?;
+    let (charged_layers, owned) = stored_allocation_costs(base.manifest, spec, granularity, owned)?;
+    let charged_device: Vec<_> = kept_index
+        .iter()
+        .map(|&layer| charged_layers[layer])
+        .collect();
+    let charged_slots: Vec<_> = kept_device
+        .iter()
+        .map(|&bytes| stored_allocation_bytes(bytes, granularity))
+        .collect::<Result<_>>()?;
+    #[cfg(test)]
+    trace_placement_pool(d, "before_placement")?;
     let (free, total) = d.ctx.mem_get_info()?;
     let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
     if placement != Placement::Derived {
-        let slots = 2 * kept_device
+        let slots = 2 * charged_slots
             .iter()
             .copied()
             .max()
@@ -2814,9 +3091,22 @@ fn place_stored_layers(
             slots <= device_budget,
             "two block slots exceed the device budget"
         );
-        device_budget = slots;
+        device_budget = slots
+            .checked_add(kept_device.len() * granularity)
+            .context("stored streaming setup extent")?;
+        ensure!(
+            device_budget <= DensePlacement::device_budget(free, total, owned, 0, 0)?,
+            "stored streaming setup exceeds the device budget"
+        );
     }
-    let probe = DensePlacement::new(&kept_device, Some(&kept_source), device_budget, 0)?;
+    let probe = DensePlacement::with_allocations(
+        &charged_device,
+        &charged_slots,
+        Some(&kept_source),
+        device_budget,
+        0,
+        granularity,
+    )?;
     let host_available = if probe.slot_bytes > 0 {
         Some(usize::try_from(
             crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
@@ -2824,11 +3114,38 @@ fn place_stored_layers(
     } else {
         None
     };
-    let (compact, facts) = plan_dense_layers(
-        (&kept_device, &kept_source, sizing.largest, owned, 0),
-        placement,
-        (free, total, host_available),
+    let host_budget = if let Some(available) = host_available {
+        let reserve = 2 * probe.slot_bytes + sizing.largest + (4 << 30);
+        let budget = available
+            .checked_sub(reserve)
+            .context("stored pinned staging and host reserve exceed available RAM")?;
+        match placement {
+            Placement::Derived => budget,
+            #[cfg(test)]
+            Placement::Streamed => budget,
+            #[cfg(test)]
+            Placement::StreamedDisk => 0,
+        }
+    } else {
+        0
+    };
+    let compact = DensePlacement::with_allocations(
+        &charged_device,
+        &charged_slots,
+        Some(&kept_source),
+        device_budget,
+        host_budget,
+        granularity,
     )?;
+    let facts = PlacementFacts {
+        free_bytes: free,
+        total_bytes: total,
+        owned_bytes: owned,
+        largest_bytes: sizing.largest,
+        host_available_bytes: host_available,
+        device_budget,
+        host_budget,
+    };
     ensure!(
         compact.slots.len() == kept_index.len() && compact.host.len() == kept_index.len(),
         "stored placement extent"
@@ -2839,17 +3156,39 @@ fn place_stored_layers(
         slots[layer] = compact.slots[index];
         host_flags[layer] = compact.host[index];
     }
+    let slot_bytes = kept_device
+        .iter()
+        .zip(&compact.slots)
+        .filter_map(|(&bytes, slot)| slot.is_some().then_some(bytes))
+        .max()
+        .unwrap_or(0);
+    let resident_bytes = kept_device
+        .iter()
+        .zip(&compact.slots)
+        .filter_map(|(&bytes, slot)| slot.is_none().then_some(bytes))
+        .sum();
     let plan = DensePlacement {
         slots,
         host: host_flags,
-        slot_bytes: compact.slot_bytes,
-        resident_bytes: compact.resident_bytes,
+        slot_bytes,
+        resident_bytes,
         host_bytes: compact.host_bytes,
         disk_bytes: compact.disk_bytes,
     };
+    let predicted_free = facts
+        .free_bytes
+        .checked_sub(facts.owned_bytes)
+        .and_then(|bytes| bytes.checked_sub(compact.resident_bytes))
+        .and_then(|bytes| bytes.checked_sub(2 * compact.slot_bytes))
+        .and_then(|bytes| {
+            bytes.checked_sub(
+                compact.slots.iter().filter(|slot| slot.is_some()).count() * granularity,
+            )
+        })
+        .context("stored placement physical extent exceeds free VRAM")?;
     eprintln!(
         "{}",
-        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
+        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes, "allocation_granularity": granularity, "charged_resident_bytes": compact.resident_bytes, "charged_slot_bytes": compact.slot_bytes, "predicted_min_driver_free_after_placement": predicted_free})
     );
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
@@ -2955,13 +3294,17 @@ impl Dit {
         spec: &H3Spec,
         (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
         mut base: Source<'_>,
-        mut lora: Source<'_>,
+        mut lora: Option<Source<'_>>,
         placement: Placement,
     ) -> Result<Self> {
         let hyperflow = spec.is_hyperflow()?;
         ensure!(
-            !hyperflow || rank == 0,
-            "HyperFlow weights have no LoRA adapter"
+            if hyperflow {
+                rank == 0 && lora.is_none()
+            } else {
+                lora.is_some()
+            },
+            "HyperFlow requires no LoRA and rank0; MiniMax-H3 requires a LoRA source"
         );
         let s = &d.stream;
         let ranges = Ranges::of(layout)?;
@@ -2992,7 +3335,7 @@ impl Dit {
                         r,
                         &format!("token_refiner.refiner_blocks.{i}"),
                         &mut base,
-                        &mut lora,
+                        None,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -3005,7 +3348,7 @@ impl Dit {
                         r,
                         &format!("token_refiner.refiner_blocks.{i}"),
                         &mut base,
-                        &mut lora,
+                        lora.as_mut(),
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -3055,7 +3398,9 @@ impl Dit {
         let lora_bytes = if hyperflow {
             0
         } else {
-            lora.manifest
+            lora.as_ref()
+                .context("MiniMax-H3 LoRA source")?
+                .manifest
                 .entries
                 .iter()
                 .filter(|(name, _)| name.starts_with("transformer_blocks."))
@@ -3087,14 +3432,29 @@ impl Dit {
         let (dense, blocks) = if hyperflow {
             let (dense, packed) =
                 place_stored_layers(d, &mut base, spec, &sizing, owned, placement)?;
+            #[cfg(test)]
+            trace_placement_pool(d, "after_streaming_slots")?;
+            base.pack_vectors(s, spec)?;
             let dropped = spec
                 .dropped_blocks
                 .as_deref()
                 .context("HyperFlow dropped blocks")?;
             let mut blocks = Vec::with_capacity(spec.layers);
             for (layer, factors) in packed.iter().enumerate() {
+                #[cfg(test)]
+                let allocation_before = d.ctx.mem_get_info()?.0;
                 if dropped.contains(&layer) {
-                    blocks.push(BlockWeights::identity(s, spec)?);
+                    blocks.push(BlockWeights::identity(s, spec, &mut base, layer)?);
+                    #[cfg(test)]
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"h3_allocation_block": {
+                            "layer": layer, "dropped": true,
+                            "free_before": allocation_before,
+                            "free_after": d.ctx.mem_get_info()?.0,
+                            "synchronized": false
+                        }})
+                    );
                     continue;
                 }
                 let name = format!("transformer_blocks.{layer}");
@@ -3105,10 +3465,21 @@ impl Dit {
                     }
                     _ => None,
                 };
-                blocks.push(BlockWeights::stored(
-                    s, spec, &name, &mut base, &mut lora, slot,
-                )?);
+                blocks.push(BlockWeights::stored(s, spec, &name, &mut base, slot)?);
+                #[cfg(test)]
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"h3_allocation_block": {
+                        "layer": layer, "dropped": false,
+                        "resident": slot.is_none(), "logical_matrix_bytes": bytes,
+                        "free_before": allocation_before,
+                        "free_after": d.ctx.mem_get_info()?.0,
+                        "synchronized": false
+                    }})
+                );
             }
+            #[cfg(test)]
+            trace_placement_pool(d, "after_stored_blocks")?;
             (dense, blocks)
         } else {
             let dense = place_layers(
@@ -3137,10 +3508,16 @@ impl Dit {
                 };
                 blocks.push(match slot {
                     Some(slot) => BlockWeights::streamed::<true>(
-                        s, spec, r, &name, slot, &mut base, &mut lora,
+                        s,
+                        spec,
+                        r,
+                        &name,
+                        slot,
+                        &mut base,
+                        lora.as_mut(),
                     )?,
                     None => {
-                        BlockWeights::resident::<true>(s, spec, r, &name, &mut base, &mut lora)?
+                        BlockWeights::resident::<true>(s, spec, r, &name, &mut base, lora.as_mut())?
                     }
                 });
             }
@@ -3226,6 +3603,25 @@ impl Dit {
             );
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
+        #[cfg(test)]
+        if let Some((layout, buffer)) = &base.vectors {
+            let expected = base
+                .vector_bytes
+                .as_ref()
+                .context("vector arena upload bytes missing")?;
+            ensure!(
+                s.clone_dtoh(buffer.as_ref())?.as_slice() == expected.as_slice(),
+                "RUNNER_FAIL vector arena upload changed a byte"
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vector_arena": {
+                    "tensors": layout.offsets.len(), "storage_bytes": layout.bytes,
+                    "logical_bytes": layout.offsets.values().map(|(_, bytes, _)| bytes).sum::<usize>(),
+                    "alignment": 256, "device_allocations": 1, "upload_byte_differences": 0
+                }})
+            );
+        }
         Ok(Self {
             ranges,
             proj_in,
@@ -3478,6 +3874,7 @@ impl Dit {
             let count = r.text * h;
             s.memcpy_dtod(&self.x.slice(..count), &mut self.text.slice_mut(..count))?;
         }
+
         self.projection(
             c,
             &self.proj_in,
@@ -3699,7 +4096,6 @@ impl ImageDit {
             "image layout is not [text | reference | generated]"
         );
         let mut base = Source::new(dir, manifest);
-        let mut unused = Source::new(dir, manifest);
         let (h, row_width) = (spec.hidden, image.row_width());
         let proj_in = [
             base.tensor(s, "proj_in.weight", h * row_width)?,
@@ -3727,7 +4123,7 @@ impl ImageDit {
                     0,
                     &format!("token_refiner.refiner_blocks.{i}"),
                     &mut base,
-                    &mut unused,
+                    None,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3785,16 +4181,10 @@ impl ImageDit {
                 _ => None,
             };
             blocks.push(match slot {
-                Some(slot) => BlockWeights::streamed::<false>(
-                    s,
-                    spec,
-                    0,
-                    &name,
-                    slot,
-                    &mut base,
-                    &mut unused,
-                )?,
-                None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, &mut unused)?,
+                Some(slot) => {
+                    BlockWeights::streamed::<false>(s, spec, 0, &name, slot, &mut base, None)?
+                }
+                None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, None)?,
             });
         }
         let (free, total) = d.ctx.mem_get_info()?;
@@ -4558,6 +4948,15 @@ impl Conditioner {
                     .launch(cfg)?;
             }
             linear(layer.down, &self.gated, self.ffn, &self.normed, h)?;
+            #[cfg(test)]
+            if index == 43 && rows > 20 && h > 731 {
+                let coordinate = s.clone_dtoh(&self.normed.slice(20 * h + 731..20 * h + 732))?[0];
+                println!(
+                    "H3_CONDITIONER_MLP layer=43 row=20 column=731 value={coordinate} finite={} utc={}",
+                    coordinate.is_finite(),
+                    pipeline::composition_stamp()?
+                );
+            }
             residual(x, normed, rows * h)?;
             if let Some(features) = input.deepstack.get(index) {
                 let mut feature = 0usize;
@@ -4665,6 +5064,15 @@ pub fn generate(
     gguf: Option<&Path>,
 ) -> Result<crate::minimax_h3::H3Output> {
     Ok(pipeline::run(model, lora, request, (device, runtime), gguf)?.output)
+}
+
+pub(crate) fn generate_hyperflow(
+    model: &Path,
+    transformer: &Path,
+    request: &crate::minimax_h3::H3Request,
+    device: (usize, &Path),
+) -> Result<crate::minimax_h3::H3Output> {
+    Ok(pipeline::run_hyperflow((model, transformer), request, device)?.output)
 }
 
 /// Six published image evaluations. `rows` is `[image rows, 96]`, references first. The returned buffer is those
@@ -4996,7 +5404,7 @@ mod tests {
             adapter.rank,
             "token_refiner.refiner_blocks.0",
             &mut Source::new(&transformer, &manifest),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         for rows in [1usize, 12, 16, 17] {
             let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
@@ -5119,6 +5527,15 @@ mod tests {
         }
         let input = s.alloc_zeros::<bf16>(9)?;
         let output = s.alloc_zeros::<u8>(9)?;
+        convert(&input, &output, (1, 1, 1), (mean, std))?;
+        let zero = s.clone_dtoh(&output.slice(..3))?;
+        let zero_pass = zero == [124, 116, 104];
+        defects += usize::from(!zero_pass);
+        cells += 1;
+        println!(
+            "H3_RGB_IDENTITY decoded_zero={zero:?} expected=[124,116,104] byte_limit=0 {}",
+            if zero_pass { "PASS" } else { "DEFECT" }
+        );
         let invalid = [
             (0, 1, 1),
             (2, 1, 1),
@@ -6688,7 +7105,7 @@ mod tests {
                     adapter.rank,
                     &format!("transformer_blocks.{layer}"),
                     &mut Source::new(&transformer, &manifest),
-                    &mut Source::new(lora_dir, &lora_manifest),
+                    Some(&mut Source::new(lora_dir, &lora_manifest)),
                 )
             })
             .collect::<Result<_>>()?;
@@ -7013,7 +7430,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(&transformer, &manifest),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
@@ -7067,7 +7484,7 @@ mod tests {
                 (
                     "norm1",
                     &hidden,
-                    &weights.norm1,
+                    weights.norm1.tensor,
                     &table,
                     &index,
                     6 * spec.hidden,
@@ -7079,7 +7496,7 @@ mod tests {
                 (
                     "norm2",
                     &hidden,
-                    &weights.norm2,
+                    weights.norm2.tensor,
                     &table,
                     &index,
                     6 * spec.hidden,
@@ -7091,7 +7508,7 @@ mod tests {
                 (
                     "norm_out",
                     &final_hidden,
-                    &final_weight,
+                    vector(&final_weight, s)?,
                     &final_table,
                     &final_index,
                     2 * spec.hidden,
@@ -7103,7 +7520,7 @@ mod tests {
             ] {
                 let n = NormRows {
                     input: pointer(x, s),
-                    weight: pointer(weight, s),
+                    weight: weight.ptr,
                     output: pointer(&work.normed, s),
                     rows,
                     dim: spec.hidden,
@@ -7362,7 +7779,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(gguf_dir, &manifest),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let mut wrong = manifest.clone();
         wrong
@@ -7376,7 +7793,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(gguf_dir, &wrong),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let official_weights = BlockWeights::resident::<true>(
             s,
@@ -7384,7 +7801,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(&transformer, &official),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
@@ -7560,7 +7977,7 @@ mod tests {
                         adapter.rank,
                         &name,
                         &mut Source::new(&gguf_dir, &manifest),
-                        &mut Source::new(&lora_dir, &lora_manifest),
+                        Some(&mut Source::new(&lora_dir, &lora_manifest)),
                     )?;
                     let expected = stream
                         .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
@@ -7845,7 +8262,7 @@ mod tests {
             &spec,
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
-            Source::new(&lora_dir, &lora_manifest),
+            Some(Source::new(&lora_dir, &lora_manifest)),
             Placement::from_env()?,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
@@ -8118,7 +8535,7 @@ mod tests {
             &spec,
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
-            Source::new(&lora_dir, &lora_manifest),
+            Some(Source::new(&lora_dir, &lora_manifest)),
             Placement::from_env()?,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
@@ -9566,7 +9983,10 @@ mod tests {
             text_tags,
             grids,
             pixel_values,
-            keyframe: pixels.data().to_vec(),
+            keyframes: vec![(
+                crate::minimax_h3::KeyframeAnchor::First,
+                pixels.data().to_vec(),
+            )],
             height: shape[3],
             width: shape[4],
             frames: meta["cell"]["frames"].as_u64().context("meta frames")? as usize,
@@ -12083,6 +12503,7 @@ mod tests {
             Rc::new(Closure::new(true, "HyperFlow block cells".into())),
         )?;
         let mut source = Source::new(&model, &manifest);
+        source.pack_vectors(s, &spec)?;
         let current = time_embedder(&mut source, s, &spec, "time_embedder")?;
         let endpoint = time_embedder(&mut source, s, &spec, "endpoint_time_embedder")?;
         let gate = spec.hyperflow_gate.context("HyperFlow gate")?;
@@ -12157,13 +12578,11 @@ mod tests {
             (0usize, BLOCK0_TAU, block0_ref),
             (1, BLOCK1_TAU, block1_ref),
         ] {
-            let mut lora = Source::new(&model, &manifest);
             let weights = BlockWeights::stored(
                 s,
                 &spec,
                 &format!("transformer_blocks.{block}"),
                 &mut source,
-                &mut lora,
                 None,
             )?;
             let name = format!("transformer_blocks.{block}.adaln_proj.linear");
@@ -12226,7 +12645,7 @@ mod tests {
                 &mut control_fail,
             );
         }
-        let identity = BlockWeights::identity(s, &spec)?;
+        let identity = BlockWeights::identity(s, &spec, &mut source, 6)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -12302,13 +12721,11 @@ mod tests {
             (0usize, RAGGED_BLOCK0_TAU, ragged_block0),
             (1, RAGGED_BLOCK1_TAU, ragged_block1),
         ] {
-            let mut lora = Source::new(&model, &manifest);
             let weights = BlockWeights::stored(
                 s,
                 &spec,
                 &format!("transformer_blocks.{block}"),
                 &mut source,
-                &mut lora,
                 None,
             )?;
             let name = format!("transformer_blocks.{block}.adaln_proj.linear");
@@ -12943,7 +13360,7 @@ mod tests {
             &spec,
             (0, &layout),
             Source::new(&model, &manifest),
-            Source::new(&model, &manifest),
+            None,
             Placement::Derived,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;

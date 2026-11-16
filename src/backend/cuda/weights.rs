@@ -2026,10 +2026,29 @@ impl DenseStreaming {
                 }
             }
         }
+        #[cfg(test)]
+        let mut allocation_before = d.ctx.mem_get_info()?.0;
+        #[cfg(test)]
+        let mut allocation_record =
+            |phase: &str, logical_bytes: usize, host_bytes: usize| -> Result<()> {
+                let after = d.ctx.mem_get_info()?.0;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"dense_allocation": {
+                        "phase": phase, "logical_bytes": logical_bytes, "host_bytes": host_bytes,
+                        "free_before": allocation_before, "free_after": after,
+                        "synchronized": false
+                    }})
+                );
+                allocation_before = after;
+                Ok(())
+            };
         for (index, layer) in layers.iter_mut().enumerate() {
             if plan.host[index] {
                 layer.host =
                     Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.source_bytes, 0)? });
+                #[cfg(test)]
+                allocation_record(&format!("pinned_layer{index}"), 0, layer.source_bytes)?;
             }
         }
         let (disk, events, read_ahead) = if plan.disk_bytes > 0 {
@@ -2042,16 +2061,27 @@ impl DenseStreaming {
         } else {
             (None, None, super::engine::ReadAhead::new(2, 0, 1)?)
         };
+        #[cfg(test)]
+        allocation_record("disk_reader_events", 0, 0)?;
         let slots = (0..2)
             .map(|_| {
+                let device = d.upload.alloc_zeros::<u8>(plan.slot_bytes)?;
+                #[cfg(test)]
+                allocation_record("slot_tensor", plan.slot_bytes, 0)?;
+                let ready = d
+                    .ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+                #[cfg(test)]
+                allocation_record("slot_ready_event", 0, 0)?;
+                let retired = d
+                    .ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+                #[cfg(test)]
+                allocation_record("slot_retired_event", 0, 0)?;
                 Ok(DenseSlot {
-                    device: d.upload.alloc_zeros::<u8>(plan.slot_bytes)?,
-                    ready: d
-                        .ctx
-                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
-                    retired: d
-                        .ctx
-                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
+                    device,
+                    ready,
+                    retired,
                     retired_valid: false,
                     loaded: None,
                 })
@@ -2063,6 +2093,8 @@ impl DenseStreaming {
         let quant = (staging_bytes > 0)
             .then(|| QuantKernels::new(&d.ctx))
             .transpose()?;
+        #[cfg(test)]
+        allocation_record("staging_and_quant_modules", staging_bytes, 0)?;
         Ok(Self {
             layers,
             slots,

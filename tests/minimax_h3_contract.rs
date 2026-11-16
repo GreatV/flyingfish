@@ -139,6 +139,7 @@ fn minimax_h3_vae_decode_geometry_equals_the_model_definition() -> Result<()> {
     assert_eq!(DecodePlan::new(&vae, 57)?.chunks, 11);
     assert!(DecodePlan::new(&vae, 2).is_err());
     let spec = spec()?;
+    assert!(Geometry::resolve(&spec, 768, 1344, usize::MAX).is_err());
     assert_eq!(Geometry::resolve(&spec, 768, 1344, 120)?.frames, 124);
     for requested in 120..=345 {
         let geometry = Geometry::resolve(&spec, 768, 1344, requested)?;
@@ -965,8 +966,8 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
             request.height,
             request.width
         );
-        let diff: Vec<u8> = request
-            .keyframe
+        let diff: Vec<u8> = request.keyframes[0]
+            .1
             .iter()
             .zip(&planes)
             .map(|(&a, &b)| a.abs_diff(b))
@@ -980,11 +981,11 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
             request.pixel_values == want
         );
         within_all &= ok;
-        let shifted_max = (0..request.keyframe.len())
+        let shifted_max = (0..request.keyframes[0].1.len())
             .map(|i| {
                 let x = i % width;
                 let from = if x + 1 < width { i + 1 } else { i };
-                request.keyframe[from].abs_diff(planes[i])
+                request.keyframes[0].1[from].abs_diff(planes[i])
             })
             .max()
             .context("empty keyframe")?;
@@ -1788,6 +1789,8 @@ fn hyperflow_config_reads_the_published_fields_without_defaults() -> Result<()> 
     ensure!(mini.is_hyperflow().is_err(), "partial fields");
     let spec = H3Spec::parse(&hyperflow_json())?;
     ensure!(spec.is_hyperflow()?, "HyperFlow class");
+    assert_eq!(Geometry::resolve(&spec, 768, 1344, 360)?.frames, 362);
+    assert!(Geometry::resolve(&spec, 768, 1344, 363).is_err());
     ensure!(
         spec.hyperflow_gate == Some(0.25),
         "gate {:?}",

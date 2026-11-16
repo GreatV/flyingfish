@@ -1066,7 +1066,7 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// Rounds `frames` up to the next `17 n + 5`; the aligned duration must lie in `[5, 15]` s at 24 fps.
+    /// Frames align to `17 n + 5`; H3 admits 5–15 seconds, HyperFlow up to 362 frames, at 24 fps.
     pub fn resolve(spec: &H3Spec, height: usize, width: usize, frames: usize) -> Result<Self> {
         let multiple = VAE_SPATIAL_RATIO * spec.patch[2];
         ensure!(
@@ -1078,11 +1078,19 @@ impl Geometry {
         );
         ensure!(frames > 0, "frame count must be positive");
         let frames = frames
-            + (VAE_CLIP_LATENTS + VAE_CLIP_FRAMES - frames % VAE_CLIP_FRAMES) % VAE_CLIP_FRAMES;
+            .checked_add(
+                (VAE_CLIP_LATENTS + VAE_CLIP_FRAMES - frames % VAE_CLIP_FRAMES) % VAE_CLIP_FRAMES,
+            )
+            .context("aligned video frame count overflow")?;
         let seconds = frames as f64 / f64::from(FPS);
+        let maximum = if spec.is_hyperflow()? {
+            MAX_SECONDS + 2.0 / f64::from(FPS)
+        } else {
+            MAX_SECONDS
+        };
         ensure!(
-            (MIN_SECONDS..=MAX_SECONDS).contains(&seconds),
-            "aligned frame count {frames} is {seconds} s, outside [{MIN_SECONDS}, {MAX_SECONDS}]"
+            (MIN_SECONDS..=maximum).contains(&seconds),
+            "aligned frame count {frames} is {seconds} s, outside [{MIN_SECONDS}, {maximum}]"
         );
         Ok(Self {
             height,
@@ -1316,7 +1324,7 @@ pub struct FlowStep {
 }
 
 /// 4, 6 or 8 steps. Raw decimals cast f64 to f32, then video shift 12 and audio shift 3 in f32.
-pub fn hyperflow_steps(steps: usize) -> Result<Vec<FlowStep>> {
+pub(crate) fn hyperflow_schedules(steps: usize) -> Result<(Schedule, Schedule)> {
     let raw: &[f64] = match steps {
         4 => &[1.0, 0.681872, 0.205019, 0.036496, 0.0],
         6 => &[1.0, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0],
@@ -1325,16 +1333,25 @@ pub fn hyperflow_steps(steps: usize) -> Result<Vec<FlowStep>> {
         ],
         _ => bail!("HyperFlow step count {steps} is not 4, 6 or 8"),
     };
-    let video = shifted_sigmas(raw, 12.0);
-    let audio = shifted_sigmas(raw, 3.0);
+    let schedule = |shift| {
+        let sigmas = shifted_sigmas(raw, shift);
+        let timesteps = sigmas[..steps].iter().map(|&sigma| 1.0 - sigma).collect();
+        Schedule { sigmas, timesteps }
+    };
+    Ok((schedule(12.0), schedule(3.0)))
+}
+
+/// 4, 6 or 8 exact shifted grids, including each step's endpoint.
+pub fn hyperflow_steps(steps: usize) -> Result<Vec<FlowStep>> {
+    let (video, audio) = hyperflow_schedules(steps)?;
     let key = KEYFRAME_NOISE_AUG as f32;
     let mut out = Vec::with_capacity(steps);
     for index in 0..steps {
         out.push(FlowStep {
-            video_t: 1.0 - video[index],
-            video_r: 1.0 - video[index + 1],
-            audio_t: 1.0 - audio[index],
-            audio_r: 1.0 - audio[index + 1],
+            video_t: video.timesteps[index],
+            video_r: 1.0 - video.sigmas[index + 1],
+            audio_t: audio.timesteps[index],
+            audio_r: 1.0 - audio.sigmas[index + 1],
             keyframe_t: key,
             keyframe_r: key,
             reference_t: 1.0,
@@ -1750,8 +1767,8 @@ pub fn mrope_table(
     Ok(table)
 }
 
-/// One MiniMax-H3 i2va request in the form the native path consumes. Conditioner prompt: token ids, the text tag of
-/// every text row, image grids `[t, h, w]` and Qwen3-VL `pixel_values` rows. Keyframe: u8 pixels `[3, height, width]`.
+/// Conditioner token ids, row tags, image grids `[t, h, w]`, Qwen3-VL pixel rows, and ordered keyframe anchors.
+/// Each keyframe stores planar u8 pixels `[3, height, width]`.
 /// `seed` is the request input from which the four normal draws are generated on device; the conditioning posterior
 /// uses `KEYFRAME_ENCODE_SEED` instead. There is no recorded-draw path. Sampling: pixel frames, evaluation count and
 /// the video / audio grid shifts.
@@ -1761,13 +1778,48 @@ pub struct H3Request {
     pub text_tags: Vec<u8>,
     pub grids: Vec<crate::vision_input::ImageGrid>,
     pub pixel_values: Vec<f32>,
-    pub keyframe: Vec<u8>,
+    pub keyframes: Vec<(KeyframeAnchor, Vec<u8>)>,
     pub height: usize,
     pub width: usize,
     pub frames: usize,
     pub seed: u64,
     pub evaluations: usize,
     pub shifts: (f64, f64),
+}
+
+impl H3Request {
+    #[cfg(feature = "cuda")]
+    pub(crate) fn layout(&self, spec: &H3Spec) -> Result<(Geometry, PackedLayout)> {
+        let frame_bytes = self
+            .height
+            .checked_mul(self.width)
+            .and_then(|n| n.checked_mul(3))
+            .context("video keyframe extent overflow")?;
+        ensure!(
+            !self.token_ids.is_empty()
+                && self.token_ids.len() == self.text_tags.len()
+                && self.keyframes.len() <= 2
+                && self.keyframes.len() == self.grids.len()
+                && self.keyframes.iter().all(|(_, p)| p.len() == frame_bytes)
+                && self.keyframes.windows(2).all(|pair| {
+                    pair[0].0 == KeyframeAnchor::First && pair[1].0 == KeyframeAnchor::Last
+                })
+                && self.pixel_values.iter().all(|v| v.is_finite()),
+            "video prompt, keyframes or image grids differ from their declared extents"
+        );
+        ensure!(
+            !self.keyframes.is_empty() || self.pixel_values.is_empty(),
+            "video without keyframes has image pixels"
+        );
+        let geometry = Geometry::resolve(spec, self.height, self.width, self.frames)?;
+        let anchors = self
+            .keyframes
+            .iter()
+            .map(|(anchor, _)| *anchor)
+            .collect::<Vec<_>>();
+        let layout = PackedLayout::build(spec, &geometry, &self.text_tags, &anchors)?;
+        Ok((geometry, layout))
+    }
 }
 
 /// Released canvas of MiniMax-H3 (model definition `canvas_short_edge` and `canvas_max_pixels`) and the aspect
@@ -1860,45 +1912,127 @@ pub fn prepare_i2va(
     (evaluations, shifts): (usize, (f64, f64)),
 ) -> Result<H3Request> {
     let spec = H3Spec::read(model)?;
+    prepare_video(
+        model,
+        &spec,
+        prompt,
+        &[(KeyframeAnchor::First, keyframe)],
+        ((frames, seed), (evaluations, shifts)),
+    )
+}
+
+pub(crate) fn prepare_video(
+    model: &Path,
+    spec: &H3Spec,
+    prompt: &str,
+    keyframes: &[(KeyframeAnchor, &crate::serve::image::RgbImage)],
+    ((frames, seed), (evaluations, shifts)): ((usize, u64), (usize, (f64, f64))),
+) -> Result<H3Request> {
+    ensure!(
+        keyframes.len() <= 2
+            && keyframes.windows(2).all(|pair| {
+                pair[0].0 == KeyframeAnchor::First && pair[1].0 == KeyframeAnchor::Last
+            }),
+        "video keyframes must be first, last, or first followed by last"
+    );
+    let (aspect_width, aspect_height) = keyframes.first().map_or((16.0, 9.0), |(_, image)| {
+        (image.width as f64, image.height as f64)
+    });
+    let (height, width) = canvas_size(spec, aspect_width, aspect_height)?;
+    let geometry = Geometry::resolve(spec, height, width, frames)?;
     let encoder = model.join("text_encoder");
-    let (height, width) = canvas_size(&spec, keyframe.width as f64, keyframe.height as f64)?;
-    let canvas = crate::serve::image::RgbImage {
-        width,
-        height,
-        pixels: crate::serve::image::resize_lanczos(
-            &keyframe.pixels,
-            [keyframe.height, keyframe.width, 3],
-            [height, width],
-            crate::serve::image::ResizeRounding::F64,
-        )?,
-    };
-    let processor = crate::serve::image::Processor::load(&encoder, None)?
-        .context("MiniMax-H3 text encoder without an image processor")?;
-    let packed = processor.prepare_rgb(&canvas)?;
-    let merge = (processor.merge() * processor.merge()) as usize;
-    let image_tokens = packed
-        .grids
-        .iter()
-        .map(|g| (g.t * g.h * g.w) as usize / merge)
-        .collect::<Vec<_>>();
+    let mut grids = Vec::new();
+    let mut pixel_values = Vec::new();
+    let mut image_tokens = Vec::new();
+    let mut pixels = Vec::with_capacity(keyframes.len());
+    if !keyframes.is_empty() {
+        let processor = crate::serve::image::Processor::load(&encoder, None)?
+            .context("MiniMax-H3 text encoder without an image processor")?;
+        let merge = (processor.merge() * processor.merge()) as usize;
+        for (index, &(anchor, image)) in keyframes.iter().enumerate() {
+            let canvas = video_keyframe_canvas(image, [height, width], index > 0)?;
+            let packed = processor.prepare_rgb(&canvas)?;
+            image_tokens.extend(
+                packed
+                    .grids
+                    .iter()
+                    .map(|g| (g.t * g.h * g.w) as usize / merge),
+            );
+            grids.extend(packed.grids);
+            pixel_values.extend(packed.pixel_values);
+            let planes = (0..3)
+                .flat_map(|c| canvas.pixels.iter().skip(c).step_by(3).copied())
+                .collect();
+            pixels.push((anchor, planes));
+        }
+    }
     let tokenizer = crate::serve::detok::Shared::load(&encoder)?;
     let (token_ids, text_tags) = presentation(&tokenizer, prompt, &image_tokens)?;
-    let geometry = Geometry::resolve(&spec, height, width, frames)?;
-    let planes = (0..3)
-        .flat_map(|c| canvas.pixels.iter().skip(c).step_by(3).copied())
-        .collect();
     Ok(H3Request {
         token_ids,
         text_tags,
-        grids: packed.grids,
-        pixel_values: packed.pixel_values,
-        keyframe: planes,
+        grids,
+        pixel_values,
+        keyframes: pixels,
         height,
         width,
         frames: geometry.frames,
         seed,
         evaluations,
         shifts,
+    })
+}
+
+fn video_keyframe_canvas(
+    image: &crate::serve::image::RgbImage,
+    [height, width]: [usize; 2],
+    cover: bool,
+) -> Result<crate::serve::image::RgbImage> {
+    use crate::serve::image::{ResizeRounding, RgbImage, resize_lanczos};
+    ensure!(
+        image.width > 0
+            && image.height > 0
+            && image
+                .width
+                .checked_mul(image.height)
+                .and_then(|n| n.checked_mul(3))
+                == Some(image.pixels.len())
+            && height > 0
+            && width > 0,
+        "video keyframe RGB extent mismatch"
+    );
+    let [out_h, out_w] = if cover {
+        let scale = (width as f64 / image.width as f64).max(height as f64 / image.height as f64);
+        [
+            height.max((image.height as f64 * scale).round_ties_even() as usize),
+            width.max((image.width as f64 * scale).round_ties_even() as usize),
+        ]
+    } else {
+        [height, width]
+    };
+    let resized = resize_lanczos(
+        &image.pixels,
+        [image.height, image.width, 3],
+        [out_h, out_w],
+        ResizeRounding::Fixed22,
+    )?;
+    if [out_h, out_w] == [height, width] {
+        return Ok(RgbImage {
+            width,
+            height,
+            pixels: resized,
+        });
+    }
+    let (top, left) = ((out_h - height) / 2, (out_w - width) / 2);
+    let mut pixels = Vec::with_capacity(height * width * 3);
+    for y in top..top + height {
+        let start = (y * out_w + left) * 3;
+        pixels.extend_from_slice(&resized[start..start + width * 3]);
+    }
+    Ok(RgbImage {
+        width,
+        height,
+        pixels,
     })
 }
 
@@ -1923,6 +2057,49 @@ pub struct MiniMaxH3I2vaRequest {
     pub frames: usize,
     pub seed: u64,
     pub gguf: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HyperFlowH3Request {
+    pub model: PathBuf,
+    pub base_model: PathBuf,
+    pub first_frame: Option<PathBuf>,
+    pub last_frame: Option<PathBuf>,
+    pub prompt: String,
+    pub frames: usize,
+    pub seed: u64,
+}
+
+pub fn is_hyperflow_model(model: &Path) -> Result<bool> {
+    let mut family = None;
+    for (component, hyperflow) in [("transformer", false), ("fl2va_int8_convrot", true)] {
+        let path = model.join(component).join("config.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        let config =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        let actual = H3Spec::parse(&config)?.is_hyperflow()?;
+        ensure!(
+            actual == hyperflow,
+            "video transformer class differs from its published component at {}",
+            path.display()
+        );
+        ensure!(
+            family.is_none(),
+            "ambiguous video transformer components in {}",
+            model.display()
+        );
+        family = Some(actual);
+    }
+    family.with_context(|| {
+        format!(
+            "video needs transformer/config.json or fl2va_int8_convrot/config.json in {}",
+            model.display()
+        )
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -1950,6 +2127,53 @@ pub fn run_minimax_h3_i2va(
             &prepared,
             (options.device, &options.runtime_dir),
             request.gguf.as_deref(),
+        )
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn run_hyperflow_h3_video(
+    request: &HyperFlowH3Request,
+    options: crate::RunOptions,
+) -> Result<H3Output> {
+    crate::backend::with_verbose(options.verbose, || {
+        let component = request.model.join("fl2va_int8_convrot");
+        let path = component.join("config.json");
+        let spec = H3Spec::parse(&serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )?)?;
+        ensure!(spec.is_hyperflow()?, "fl2va component is not HyperFlow");
+        let image = |path: &Option<PathBuf>| {
+            path.as_ref()
+                .map(|path| {
+                    crate::serve::image::decode_image(
+                        &fs::read(path)
+                            .with_context(|| format!("read keyframe {}", path.display()))?,
+                        None,
+                    )
+                })
+                .transpose()
+        };
+        let (first, last) = (image(&request.first_frame)?, image(&request.last_frame)?);
+        let anchors: Vec<_> = [
+            (KeyframeAnchor::First, &first),
+            (KeyframeAnchor::Last, &last),
+        ]
+        .into_iter()
+        .filter_map(|(anchor, image)| image.as_ref().map(|image| (anchor, image)))
+        .collect();
+        let prepared = prepare_video(
+            &request.base_model,
+            &spec,
+            &request.prompt,
+            &anchors,
+            ((request.frames, request.seed), (6, (12.0, 3.0))),
+        )?;
+        crate::backend::cuda::engine::minimax_h3::generate_hyperflow(
+            &request.base_model,
+            &component,
+            &prepared,
+            (options.device, &options.runtime_dir),
         )
     })
 }
@@ -2501,11 +2725,23 @@ pub fn image_rgb8(canvas: &[f32], from: [usize; 2], to: [usize; 2]) -> Result<Ve
 /// then row-major, columns (channel, patch t, patch h, patch w).
 pub fn patchify_latents(
     x: &[f32],
-    (channels, frames, h, w): (usize, usize, usize, usize),
+    shape: (usize, usize, usize, usize),
     patch: [usize; 3],
 ) -> Vec<f32> {
-    let [pt, ph, pw] = patch;
     let mut rows = Vec::with_capacity(x.len());
+    patchify_latents_into(x, shape, patch, &mut rows);
+    rows
+}
+
+/// Appends frame-major latent patches to `rows`.
+pub(crate) fn patchify_latents_into(
+    x: &[f32],
+    (channels, frames, h, w): (usize, usize, usize, usize),
+    patch: [usize; 3],
+    rows: &mut Vec<f32>,
+) {
+    let [pt, ph, pw] = patch;
+    rows.reserve(x.len());
     for f in 0..frames / pt {
         for i in 0..h / ph {
             for j in 0..w / pw {
@@ -2525,7 +2761,6 @@ pub fn patchify_latents(
             }
         }
     }
-    rows
 }
 
 /// Inverse of [`patchify_latents`].
@@ -2768,4 +3003,438 @@ pub fn image_row_plan(layout: &ImageLayout, schedule: &ImageSchedule) -> Result<
         .iter()
         .map(|&timestep| image_row_timesteps(layout, timestep))
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "CPU; FF_MODEL companion root, FF_HYPERFLOW_MODEL component, FF_H3_S0 reference fixtures"]
+fn hyperflow_preparation_matches_the_published_capture() -> Result<()> {
+    use crate::serve::image::RgbImage;
+    use safetensors::{Dtype, SafeTensors};
+    use sha2::Digest;
+    let path = |name| {
+        std::env::var_os(name)
+            .map(std::path::PathBuf::from)
+            .with_context(|| format!("{name} missing"))
+    };
+    let (model, component, root) = (
+        path("FF_MODEL")?,
+        path("FF_HYPERFLOW_MODEL")?,
+        path("FF_H3_S0")?,
+    );
+    let arm = root.join("arm-a");
+    let integrity: Value = serde_json::from_slice(&fs::read(arm.join("fixture-integrity.json"))?)?;
+    let load = |file: &Path| -> Result<(Dtype, Vec<usize>, Vec<u8>)> {
+        let relative = file
+            .strip_prefix(&arm)?
+            .to_str()
+            .context("fixture path UTF8")?;
+        let bytes = fs::read(file).with_context(|| format!("read {}", file.display()))?;
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        ensure!(
+            integrity[relative]["fixture_sha256"].as_str() == Some(digest.as_str()),
+            "RUNNER_FAIL fixture integrity {relative}"
+        );
+        let values = SafeTensors::deserialize(&bytes)?;
+        ensure!(
+            values.names() == ["value"],
+            "RUNNER_FAIL fixture field count {relative}"
+        );
+        let value = values.tensor("value")?;
+        Ok((value.dtype(), value.shape().to_vec(), value.data().to_vec()))
+    };
+    let difference = |a: &[u8], b: &[u8]| {
+        a.len().abs_diff(b.len()) + a.iter().zip(b).filter(|(a, b)| a != b).count()
+    };
+    let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+        component.join("config.json"),
+    )?)?)?;
+    ensure!(
+        spec.is_hyperflow()?,
+        "RUNNER_FAIL HyperFlow component required"
+    );
+    let text_spec = crate::model_spec::ModelSpec::read(&model.join("text_encoder"))?;
+    let vision = text_spec
+        .vision
+        .as_ref()
+        .context("RUNNER_FAIL conditioner vision config")?;
+    let pixel_width = vision.patch_elements(text_spec.architecture)?;
+    let image = |height, width, offset| RgbImage {
+        height,
+        width,
+        pixels: (0..height * width * 3)
+            .map(|i| ((i * 73 + offset) % 251) as u8)
+            .collect(),
+    };
+    let (first, last) = (image(273, 481, 17), image(389, 267, 83));
+    let mut defects = 0;
+    let mut fields = 0;
+    for (case, anchors) in [
+        ("text", vec![]),
+        ("first", vec![(KeyframeAnchor::First, &first)]),
+        ("last", vec![(KeyframeAnchor::Last, &first)]),
+        (
+            "both",
+            vec![
+                (KeyframeAnchor::First, &first),
+                (KeyframeAnchor::Last, &last),
+            ],
+        ),
+    ] {
+        let request = prepare_video(
+            &model,
+            &spec,
+            "A small animal walks beside a wooden bridge in warm daylight.",
+            &anchors,
+            ((124, 42), (6, (12.0, 3.0))),
+        )?;
+        let geometry = Geometry::resolve(&spec, request.height, request.width, request.frames)?;
+        let layout = PackedLayout::build(
+            &spec,
+            &geometry,
+            &request.text_tags,
+            &request
+                .keyframes
+                .iter()
+                .map(|&(anchor, _)| anchor)
+                .collect::<Vec<_>>(),
+        )?;
+        ensure!(
+            (
+                geometry.height,
+                geometry.width,
+                geometry.frames,
+                geometry.latent_frames,
+                geometry.latent_height,
+                geometry.latent_width,
+                geometry.audio_latents
+            ) == (768, 1344, 124, 37, 48, 84, 207),
+            "RUNNER_FAIL published production geometry differs"
+        );
+        let prepared = arm.join("prep").join(case);
+        let source = arm.join("a").join(case);
+        let mut compare = |name: &str,
+                           file: &Path,
+                           dtype: Dtype,
+                           shape: Vec<usize>,
+                           bytes: Vec<u8>|
+         -> Result<()> {
+            let (wanted_dtype, wanted_shape, wanted) = load(file)?;
+            ensure!(
+                wanted_dtype == dtype,
+                "RUNNER_FAIL reference dtype {case}/{name}"
+            );
+            let different = difference(&bytes, &wanted);
+            let bad = different != 0 || shape != wanted_shape;
+            println!(
+                "HYPERFLOW_PREPARATION case={case} field={name} shape={shape:?} reference_shape={wanted_shape:?} byte_differences={different} status={}",
+                if bad { "DEFECT" } else { "PASS" }
+            );
+            defects += usize::from(bad);
+            fields += 1;
+            Ok(())
+        };
+        let integers = |values: &[i64]| {
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        compare(
+            "token_ids",
+            &source.join("input_ids.safetensors"),
+            Dtype::I64,
+            vec![1, request.token_ids.len()],
+            integers(
+                &request
+                    .token_ids
+                    .iter()
+                    .map(|&v| i64::from(v))
+                    .collect::<Vec<_>>(),
+            ),
+        )?;
+        compare(
+            "text_tags",
+            &source.join("tags.safetensors"),
+            Dtype::I64,
+            vec![request.text_tags.len()],
+            integers(
+                &request
+                    .text_tags
+                    .iter()
+                    .map(|&v| i64::from(v))
+                    .collect::<Vec<_>>(),
+            ),
+        )?;
+        compare(
+            "modality",
+            &source.join("mm_token_type_ids.safetensors"),
+            Dtype::I64,
+            vec![1, request.token_ids.len()],
+            integers(
+                &request
+                    .token_ids
+                    .iter()
+                    .map(|&v| i64::from(v == vision.image_token))
+                    .collect::<Vec<_>>(),
+            ),
+        )?;
+        for (index, (_, bytes)) in request.keyframes.iter().enumerate() {
+            compare(
+                &format!("keyframe{index}"),
+                &prepared.join(format!("keyframe-{index}.safetensors")),
+                Dtype::U8,
+                vec![3, request.height, request.width],
+                bytes.clone(),
+            )?;
+        }
+        if !request.keyframes.is_empty() {
+            compare(
+                "grids",
+                &source.join("image_grid_thw.safetensors"),
+                Dtype::I64,
+                vec![request.grids.len(), 3],
+                integers(
+                    &request
+                        .grids
+                        .iter()
+                        .flat_map(|g| [i64::from(g.t), i64::from(g.h), i64::from(g.w)])
+                        .collect::<Vec<_>>(),
+                ),
+            )?;
+            let rows = request
+                .grids
+                .iter()
+                .map(|g| (g.t * g.h * g.w) as usize)
+                .sum::<usize>();
+            compare(
+                "model_pixels_bf16",
+                &source.join("pixel_values.safetensors"),
+                Dtype::F32,
+                vec![rows, pixel_width],
+                request
+                    .pixel_values
+                    .iter()
+                    .flat_map(|&v| half::bf16::from_f32(v).to_f32().to_le_bytes())
+                    .collect(),
+            )?;
+        } else {
+            ensure!(
+                request.grids.is_empty() && request.pixel_values.is_empty(),
+                "RUNNER_FAIL text-only vision rows"
+            );
+        }
+        compare(
+            "positions",
+            &source.join("position_ids.safetensors"),
+            Dtype::F64,
+            vec![layout.rows(), 3],
+            layout
+                .position_ids
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        )?;
+        compare(
+            "token_tags",
+            &source.join("token_tags.safetensors"),
+            Dtype::I64,
+            vec![layout.rows()],
+            integers(
+                &layout
+                    .token_tags
+                    .iter()
+                    .map(|&v| i64::from(v))
+                    .collect::<Vec<_>>(),
+            ),
+        )?;
+        for (name, indices) in [
+            ("video_indices", &layout.video_indices),
+            ("audio_indices", &layout.audio_indices),
+            ("text_indices", &layout.text_indices),
+        ] {
+            compare(
+                name,
+                &source.join(format!("{name}.safetensors")),
+                Dtype::I64,
+                vec![indices.len()],
+                integers(&indices.iter().map(|&v| i64::from(v)).collect::<Vec<_>>()),
+            )?;
+        }
+        let wanted_anchors: Vec<String> =
+            serde_json::from_slice(&fs::read(prepared.join("anchors.json"))?)?;
+        let actual_anchors = request
+            .keyframes
+            .iter()
+            .map(|(anchor, _)| match anchor {
+                KeyframeAnchor::First => "first",
+                KeyframeAnchor::Last => "last",
+            })
+            .collect::<Vec<_>>();
+        defects += usize::from(wanted_anchors != actual_anchors);
+        let (_, _, expected_audio) = load(&source.join("audio_indices.safetensors"))?;
+        let mut wrong_row = expected_audio.clone();
+        wrong_row.rotate_left(8);
+        ensure!(
+            difference(&wrong_row, &expected_audio) != 0,
+            "RUNNER_FAIL audio-index control not detected"
+        );
+        println!("HYPERFLOW_PREPARATION_CONTROL case={case} wrong_audio_row=FAIL_AS_REQUIRED");
+    }
+    println!(
+        "{} HYPERFLOW_PREPARATION cases=4 fields={fields} controls=4 defects={defects} GPU_calls=0",
+        if defects == 0 { "PASS" } else { "FAIL" }
+    );
+    ensure!(
+        defects == 0,
+        "HyperFlow preparation has {defects} finite exact-contract defects"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "CPU; FF_H3_S0 published PIL keyframe fixtures"]
+fn video_keyframe_canvas_matches_the_published_pil_bytes() -> Result<()> {
+    use crate::serve::image::{ResizeRounding, RgbImage, resize_lanczos};
+    use safetensors::{Dtype, SafeTensors};
+    use sha2::Digest;
+    let root = std::path::PathBuf::from(std::env::var_os("FF_H3_S0").context("FF_H3_S0 missing")?)
+        .join("arm-a");
+    let integrity: Value = serde_json::from_slice(&fs::read(root.join("fixture-integrity.json"))?)?;
+    let mut first_reference = Vec::new();
+    for (index, (height, width, offset)) in [(273, 481, 17), (389, 267, 83)].into_iter().enumerate()
+    {
+        let image = RgbImage {
+            height,
+            width,
+            pixels: (0..height * width * 3)
+                .map(|i| ((i * 73 + offset) % 251) as u8)
+                .collect(),
+        };
+        let file = format!("prep/both/keyframe-{index}.safetensors");
+        let bytes = fs::read(root.join(&file))?;
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        ensure!(
+            integrity[&file]["fixture_sha256"].as_str() == Some(digest.as_str()),
+            "RUNNER_FAIL keyframe fixture integrity"
+        );
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        let expected = tensors.tensor("value")?;
+        ensure!(
+            expected.dtype() == Dtype::U8 && expected.shape() == [3, 768, 1344],
+            "RUNNER_FAIL keyframe fixture layout"
+        );
+        let canvas = video_keyframe_canvas(&image, [768, 1344], index > 0)?;
+        let actual: Vec<u8> = (0..3)
+            .flat_map(|c| canvas.pixels.iter().skip(c).step_by(3).copied())
+            .collect();
+        let different = actual
+            .iter()
+            .zip(expected.data())
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("KEYFRAME_PIL_EXACT case={index} shape=[3,768,1344] byte_differences={different}");
+        ensure!(
+            actual.as_slice() == expected.data(),
+            "shared MiniMax-H3 keyframe differs from published PIL bytes"
+        );
+        if index == 0 {
+            first_reference.extend_from_slice(expected.data());
+        }
+    }
+    let image: Vec<u8> = (0..273 * 481 * 3)
+        .map(|i| ((i * 73 + 17) % 251) as u8)
+        .collect();
+    let old = resize_lanczos(&image, [273, 481, 3], [768, 1344], ResizeRounding::F64)?;
+    let old: Vec<u8> = (0..3)
+        .flat_map(|c| old.iter().skip(c).step_by(3).copied())
+        .collect();
+    let different = old
+        .iter()
+        .zip(&first_reference)
+        .filter(|(a, b)| a != b)
+        .count();
+    ensure!(
+        different > 0,
+        "RUNNER_FAIL old keyframe coefficient control not detected"
+    );
+    println!(
+        "PASS KEYFRAME_PIL_EXACT cases=2 byte_differences=0 old_F64_control=FAIL_AS_REQUIRED control_differences={different} GPU_calls=0"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn video_keyframes_preserve_cover_crop_and_anchor_bounds() -> Result<()> {
+    use crate::serve::image::RgbImage;
+    for (height, width) in [(3, 5), (5, 3)] {
+        let image = RgbImage {
+            width,
+            height,
+            pixels: (0..height * width * 3)
+                .map(|i| ((i * 17 + 3) % 251) as u8)
+                .collect(),
+        };
+        let got = video_keyframe_canvas(&image, [3, 3], true)?;
+        let mut expected = Vec::new();
+        for y in (height - 3) / 2..(height - 3) / 2 + 3 {
+            let first = (y * width + (width - 3) / 2) * 3;
+            expected.extend_from_slice(&image.pixels[first..first + 9]);
+        }
+        assert_eq!(got.pixels, expected);
+        assert_ne!(
+            got.pixels,
+            video_keyframe_canvas(&image, [3, 3], false)?.pixels
+        );
+    }
+    assert!(
+        video_keyframe_canvas(
+            &RgbImage {
+                width: usize::MAX,
+                height: 2,
+                pixels: vec![],
+            },
+            [3, 3],
+            true,
+        )
+        .is_err()
+    );
+    #[cfg(feature = "cuda")]
+    {
+        let spec = H3Spec::parse(&serde_json::from_str(include_str!(
+            "../tests/data/minimax-h3-transformer-config.json"
+        ))?)?;
+        for anchors in [
+            vec![],
+            vec![KeyframeAnchor::First],
+            vec![KeyframeAnchor::Last],
+            vec![KeyframeAnchor::First, KeyframeAnchor::Last],
+        ] {
+            let mut request = H3Request {
+                token_ids: vec![7, 11],
+                text_tags: vec![TEXT_TAG; 2],
+                grids: vec![crate::vision_input::ImageGrid { t: 1, h: 2, w: 4 }; anchors.len()],
+                pixel_values: vec![],
+                keyframes: anchors.iter().map(|&a| (a, vec![0; 3 * 32 * 64])).collect(),
+                height: 32,
+                width: 64,
+                frames: 124,
+                seed: 42,
+                evaluations: 6,
+                shifts: (12.0, 3.0),
+            };
+            let (_, layout) = request.layout(&spec)?;
+            assert_eq!(layout.condition_video_rows, 2 * anchors.len());
+            if let Some(anchor) = anchors.first() {
+                let time = layout.position_ids[layout.video_indices[0] as usize][0];
+                assert_eq!(time == 2.0, *anchor == KeyframeAnchor::First);
+                request.keyframes[0].1.pop();
+                assert!(request.layout(&spec).is_err());
+            }
+        }
+    }
+    Ok(())
 }

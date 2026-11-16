@@ -99,9 +99,24 @@ impl DensePlacement {
         device_bytes: usize,
         host_bytes: usize,
     ) -> Result<Self> {
+        Self::with_allocations(layers, layers, host_layers, device_bytes, host_bytes, 0)
+    }
+
+    pub(crate) fn with_allocations(
+        layers: &[usize],
+        slot_layers: &[usize],
+        host_layers: Option<&[usize]>,
+        device_bytes: usize,
+        host_bytes: usize,
+        streamed_overhead: usize,
+    ) -> Result<Self> {
         ensure!(
-            !layers.is_empty() && layers.iter().all(|&n| n > 0),
+            !layers.is_empty() && layers.iter().all(|&n| n > 0 && n >= streamed_overhead),
             "empty dense layer extent"
+        );
+        ensure!(
+            slot_layers.len() == layers.len() && slot_layers.iter().all(|&n| n > 0),
+            "dense slot layer extent differs from resident layers"
         );
         let host_layers = host_layers.unwrap_or(layers);
         ensure!(
@@ -122,7 +137,7 @@ impl DensePlacement {
         if total <= device_bytes {
             return Ok(plan);
         }
-        let mut sizes = layers.to_vec();
+        let mut sizes = slot_layers.to_vec();
         sizes.sort_unstable();
         sizes.dedup();
         let mut order: Vec<_> = (0..layers.len()).collect();
@@ -130,14 +145,19 @@ impl DensePlacement {
         let mut best = None;
         for slot in sizes {
             let slots = slot.checked_mul(2).context("dense slots overflow")?;
-            let Some(mut remaining) = device_bytes.checked_sub(slots) else {
+            let setup = layers
+                .len()
+                .checked_mul(streamed_overhead)
+                .and_then(|n| n.checked_add(slots))
+                .context("dense streaming setup overflow")?;
+            let Some(mut remaining) = device_bytes.checked_sub(setup) else {
                 continue;
             };
             let mut resident = vec![false; layers.len()];
             let mut required = 0usize;
             for &i in &order {
-                if layers[i] > slot {
-                    required += layers[i];
+                if slot_layers[i] > slot {
+                    required += layers[i] - streamed_overhead;
                     resident[i] = true;
                 }
             }
@@ -146,12 +166,16 @@ impl DensePlacement {
             };
             remaining = available;
             for &i in &order {
-                if !resident[i] && layers[i] <= remaining {
+                if !resident[i] && layers[i] - streamed_overhead <= remaining {
                     resident[i] = true;
-                    remaining -= layers[i];
+                    remaining -= layers[i] - streamed_overhead;
                 }
             }
-            let kept = device_bytes - slots - remaining;
+            let kept = layers
+                .iter()
+                .zip(&resident)
+                .filter_map(|(&bytes, &kept)| kept.then_some(bytes))
+                .sum::<usize>();
             if best
                 .as_ref()
                 .is_none_or(|(_, _, previous)| kept > *previous)
