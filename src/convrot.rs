@@ -7,7 +7,7 @@
 //! accumulator, K in groups of 16) and `q` is ties-to-even of `xR * (1/s_x)`.
 //! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 61440 bytes dynamic smem.
 //! [`linear`] is the below-[`TENSOR_CORE_ROWS`] form.
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 use anyhow::Context;
 use anyhow::{Result, ensure};
 use half::bf16;
@@ -186,6 +186,38 @@ fn linear_omitting_rotation(
     int8_product(&codes, &scales, k, qweight, n, wscale)
 }
 
+/// Dynamic shared bytes of one group: a 16-row bf16 tile plus eight 8×16 bf16 Hadamard tiles.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn group_dot_smem(group: u32) -> u32 {
+    32 * group + 2048
+}
+
+/// Largest multiple of 16 whose [`group_dot_smem`] fits in `optin` bytes.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn max_group(optin: usize) -> Result<u32> {
+    let bytes = u32::try_from(optin).context("convrot opt-in shared memory")?;
+    ensure!(bytes >= 2048 + 512, "convrot opt-in shared memory {optin}");
+    let raw = (bytes - 2048) / 32;
+    let group = raw / 16 * 16;
+    ensure!(group >= 16, "convrot opt-in shared memory {optin}");
+    ensure!(
+        group_dot_smem(group) <= bytes,
+        "convrot group {group} tile exceeds opt-in {optin}"
+    );
+    Ok(group)
+}
+
+/// `group` fits the tile derived from `optin`. Returns that tile.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn ensure_group(group: u32, optin: usize) -> Result<u32> {
+    let max = max_group(optin)?;
+    ensure!(
+        group <= max,
+        "convrot group {group} exceeds device tile {max}"
+    );
+    Ok(max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{hadamard, linear, linear_omitting_rotation};
@@ -273,6 +305,24 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn group_tile_fits_the_optin() -> Result<()> {
+        let optin = 99usize << 10;
+        let max = super::max_group(optin)?;
+        ensure!(
+            max >= 1024
+                && super::group_dot_smem(1024) == 34_816
+                && usize::try_from(super::group_dot_smem(max))? <= optin
+                && super::ensure_group(1024, optin)? == max,
+            "group tile optin={optin} max={max}"
+        );
+        ensure!(
+            super::ensure_group(max + 16, optin).is_err(),
+            "group above the tile was accepted"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -281,6 +331,7 @@ pub struct ConvrotFns {
     group_dot: crate::backend::gpu::CudaFunction,
     quantize: crate::backend::gpu::CudaFunction,
     product: crate::backend::gpu::CudaFunction,
+    max_group: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -315,11 +366,21 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         i32::try_from(PRODUCT_SMEM)?,
     )?;
+    let group_dot = module.load_function("convrot_group_dot")?;
+    let optin = usize::try_from(ctx.attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    )?)?;
+    let max_group = max_group(optin)?;
+    group_dot.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        i32::try_from(group_dot_smem(max_group))?,
+    )?;
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
-        group_dot: module.load_function("convrot_group_dot")?,
+        group_dot,
         quantize: module.load_function("convrot_quantize")?,
         product,
+        max_group,
     })
 }
 
@@ -427,6 +488,11 @@ pub(crate) fn launch_rotate_quant(
     let rows = args.rows as u32;
     let group = args.group as u32;
     let k = args.k as u32;
+    ensure!(
+        group <= fns.max_group,
+        "convrot group {group} exceeds device tile {}",
+        fns.max_group
+    );
     unsafe {
         stream
             .launch_builder(&fns.group_dot)
@@ -438,7 +504,7 @@ pub(crate) fn launch_rotate_quant(
             .launch(LaunchConfig {
                 grid_dim: group_dot_grid(rows, k, group),
                 block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: group_dot_smem(group),
             })?;
     }
     let quant_threads = 128u32;
@@ -962,6 +1028,49 @@ mod device {
                 }
             }
         }
+        let wide = 1024usize;
+        let rows = 20usize;
+        let k = 7168usize;
+        let max = super::max_group(device.info.optin_shared_bytes)?;
+        ensure!(
+            u32::try_from(wide)? <= max,
+            "device tile {max} excludes group {wide}"
+        );
+        emit(&format!(
+            "CONVROT_MAX_GROUP optin={} max={max}",
+            device.info.optin_shared_bytes
+        ));
+        let (gx, gy, gz) = super::group_dot_grid(
+            u32::try_from(rows)?,
+            u32::try_from(k)?,
+            u32::try_from(wide)?,
+        );
+        ensure!(
+            gx == u32::try_from(rows)?.div_ceil(16)
+                && gy == 1
+                && gz == u32::try_from(k)? / u32::try_from(wide)?
+                && gy != u32::try_from(wide)? / 8,
+            "group_dot grid rows={rows} k={k} group={wide} got {gx},{gy},{gz}"
+        );
+        emit(&format!(
+            "CONVROT_MMA rows={rows} k={k} n={n} group={wide} begin"
+        ));
+        let x = activation(rows, k);
+        let qweight = weight(n, k);
+        let wscale = wscale_row(n);
+        let host = {
+            let (codes, scales) = mma_rotate_quant(&x, k, wide)?;
+            host_product(&codes, &scales, k, &qweight, n, &wscale)?
+        };
+        let y = launch(device, &x, k, wide, &qweight, n, &wscale)?;
+        let mismatched = bit_diff(&y, &host);
+        emit(&format!(
+            "CONVROT_MMA rows={rows} k={k} n={n} group={wide} differ={mismatched}"
+        ));
+        ensure!(
+            mismatched == 0,
+            "convrot mma rows={rows} k={k} n={n} group={wide} differing bits {mismatched}"
+        );
         Ok(())
     }
 

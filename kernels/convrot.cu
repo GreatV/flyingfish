@@ -91,20 +91,20 @@ extern "C" __global__ void convrot_linear(
 // 17 rows and above. One block owns 16 rows and one group.
 // The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
 // grid: (ceil(rows/16), 1, k/group). block: 256.
-// A tile is 16*256 bf16. Each warp stages its own 8*16 bf16 Hadamard tile.
+// Dynamic smem is 16*group bf16, then 8*8*16 bf16. Bytes are 32*group+2048.
 extern "C" __global__ void convrot_group_dot(const float* __restrict__ x, float* __restrict__ y, int rows, int k,
                                              int group) {
-    if (rows < 17 || group < 16 || group > 256 || (group & 15) || (k % group)) __trap();
+    if (rows < 17 || group < 16 || (group & 15) || (k % group)) __trap();
     constexpr int STRIDE = 16;
-    constexpr int GROUP_MAX = 256;
-    __shared__ __nv_bfloat16 atile[16 * GROUP_MAX];
-    __shared__ __nv_bfloat16 bsmem[8 * 8 * STRIDE];
+    extern __shared__ __align__(16) __nv_bfloat16 tile[];
+    __nv_bfloat16* atile = tile;
+    __nv_bfloat16* bsmem = tile + 16 * group;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int row0 = static_cast<int>(blockIdx.x) * 16;
     const int x_col0 = static_cast<int>(blockIdx.z) * group;
-    const int tile = 16 * group;
-    for (int i = static_cast<int>(threadIdx.x); i < tile; i += static_cast<int>(blockDim.x)) {
+    const int count = 16 * group;
+    for (int i = static_cast<int>(threadIdx.x); i < count; i += static_cast<int>(blockDim.x)) {
         const int r = i / group;
         const int c = i - r * group;
         const int gr = row0 + r;
