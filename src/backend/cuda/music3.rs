@@ -70,7 +70,6 @@ struct Policy {
     keep: CudaSlice<u8>,
     codes: CudaSlice<u32>,
     counter_base: CudaSlice<u64>,
-    stream: CudaSlice<u64>,
     history: CudaSlice<i32>,
     features: CudaSlice<bf16>,
     host_features: PinnedHostSlice<bf16>,
@@ -85,7 +84,6 @@ impl Policy {
             keep: d.stream.alloc_zeros(200000)?,
             codes: d.stream.alloc_zeros(8)?,
             counter_base: d.stream.alloc_zeros(1)?,
-            stream: d.stream.alloc_zeros(1)?,
             history: d.stream.alloc_zeros(200000)?,
             features: d.stream.alloc_zeros(32768)?,
             host_features: pinned_zeros(&d.ctx, 32768)?,
@@ -584,7 +582,7 @@ impl Runtime {
     }
 
     fn draw(
-        &mut self,
+        &self,
         codebook: usize,
         seed: u64,
         draw: u64,
@@ -592,9 +590,6 @@ impl Runtime {
     ) -> Result<()> {
         ensure!(codebook < 8, "AR draw codebook");
         let vocab = if codebook == 0 { 200000i64 } else { 1024i64 };
-        self.device
-            .stream
-            .memcpy_htod(&[draw], &mut self.policy.stream)?;
         unsafe {
             self.device
                 .stream
@@ -604,7 +599,7 @@ impl Runtime {
                 .arg(&1i32)
                 .arg(&vocab)
                 .arg(&seed)
-                .arg(&self.policy.stream)
+                .arg(&draw)
                 .arg(&ptr(&self.policy.counter_base, &self.device))
                 .arg(&256i32)
                 .arg(&ptr(&self.policy.history, &self.device))
