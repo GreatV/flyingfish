@@ -734,7 +734,7 @@ fn hi3d_decoder_production_norm_gpu() -> Result<()> {
             } else {
                 vec![0, n as u32]
             };
-            let plan = BatchGroupNorm::new(&d, &offsets, c, 32, 1e-6, 64 << 20)?;
+            let plan = BatchGroupNorm::new(&d, &offsets, c, 32, 1e-6, 128 << 20)?;
             let x = half_tensor(&bank, "feat")?;
             ensure!(x.len() == n * c, "actual support feature count mismatch");
             let values = if name.ends_with(".field") {
