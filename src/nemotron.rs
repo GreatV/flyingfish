@@ -20,6 +20,8 @@ pub struct NemotronSpec {
     pub decoder_layers: u32,
     pub vocab: u32,
     pub blank: u32,
+    pub max_symbols: u32,
+    pub default_prompt: u32,
     pub prompts: u32,
     pub prompt_intermediate: u32,
     pub mel: LogMelConfig,
@@ -258,6 +260,8 @@ impl NemotronSpec {
             decoder_layers,
             vocab,
             blank,
+            max_symbols: positive(root, "max_symbols_per_step")?,
+            default_prompt: positive(root, "default_prompt_id")?,
             prompts,
             prompt_intermediate,
             mel,
@@ -365,6 +369,20 @@ impl NemotronSpec {
     pub fn validate_checkpoint(&self, checkpoint: &MappedCheckpoint) -> Result<usize> {
         parakeet::require_checkpoint(checkpoint, &self.expected_tensors()?, "Nemotron")
     }
+}
+
+#[cfg(feature = "cuda")]
+pub fn transcribe(
+    directory: &Path,
+    waveform: &[f32],
+    streaming: bool,
+    options: crate::RunOptions,
+) -> Result<crate::media::Transcription> {
+    let device = crate::backend::cuda::Device::new(options.device)?;
+    let model = crate::backend::cuda::engine_nemotron::Nemotron::load(directory, &device)?;
+    let hypothesis = model.decode(waveform, streaming)?;
+    let text = crate::tokenizer::decode(directory, &hypothesis.tokens)?;
+    crate::media::Transcription::whole_clip(text, waveform.len() as f64 / 16000.0)
 }
 
 #[cfg(test)]

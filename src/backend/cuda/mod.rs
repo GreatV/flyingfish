@@ -29,9 +29,13 @@ pub mod engine_multitalker;
 #[cfg(feature = "cuda")]
 pub(crate) mod engine_music3_syn;
 #[cfg(feature = "cuda")]
+pub(crate) mod engine_nemotron;
+#[cfg(feature = "cuda")]
 pub mod engine_parakeet;
 #[cfg(all(test, feature = "cuda"))]
 mod engine_parakeet_tests;
+#[cfg(feature = "cuda")]
+pub(crate) mod engine_rnnt;
 #[cfg(feature = "cuda")]
 pub mod engine_trellis2;
 pub mod flash;
