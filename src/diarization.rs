@@ -247,7 +247,7 @@ fn diarization_frames(
             factor: spec.factor as usize,
         })
     } else {
-        let batch = engine.audio_features(waveform, false, false)?;
+        let batch = engine.audio_features(waveform, true, false)?;
         let (logits, _) = engine.offline(&batch.features, &batch.mask, 0)?;
         Ok(DiarizationFrames {
             logits,

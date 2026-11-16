@@ -1671,12 +1671,10 @@ mod gate_tests {
             "native diarizer channels {} vs fixture {speakers}",
             masks.speakers
         );
-        // 2026-11-16 correction: the transformers processor emits one extra
-        // spectrogram frame over the 120.0 s clip (12001 raw, 12000 valid)
-        // pooling to 1500 frames; the native frontend yields 1499. The
-        // comparison covers the common prefix and demands the fixture's
-        // frames beyond it be inactive everywhere, so the missing tail
-        // carries no activity either side could act on.
+        // The offline frontend is centered like the published extractor
+        // (diarization_frames), so both sides pool the same 1500 frames over
+        // the 120.0 s clip; the guard below still demands an inactive tail
+        // if the frame counts ever diverge again.
         let compared = masks.frames.min(frames);
         if compared < frames {
             let tail_inactive = (compared..frames)
