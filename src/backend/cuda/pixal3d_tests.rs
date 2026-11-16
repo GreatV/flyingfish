@@ -5231,12 +5231,12 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     Ok(())
 }
 
-/// Run-stability probe: two full generations of the same case in ONE
-/// process, same seed. Distinguishes kernel nondeterminism (differs
-/// in-process) from free-memory-dependent placement (stable in-process).
+/// Rerun stability: two full generations of the same case in ONE process,
+/// same seed, must produce the bit-identical raw mesh. Guards the group
+/// norm's fixed-order moment reduction (and any later ordering regression).
 #[test]
 #[ignore = "GPU + published models; set FF_HI3D_MODEL, FF_DINOV2_MODEL, FF_CLIP_MODEL, FF_HI3D_GENERATION_REFERENCE, FF_HI3D_IMAGE_PREPARATION_REFERENCE, FLYINGFISH_RUNTIME_DIR"]
-fn hi3d_generation_run_stability_probe() -> Result<()> {
+fn hi3d_generation_rerun_stability_gpu() -> Result<()> {
     let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
     let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
     let case = freeze["initial"]
@@ -5283,7 +5283,7 @@ fn hi3d_generation_run_stability_probe() -> Result<()> {
     }
     let same = runs[0].0 == runs[1].0 && runs[0].1 == runs[1].1;
     println!(
-        "HI3D_RUN_STABILITY in_process_runs=2 raw_equal={same} vertices={}",
+        "HI3D_RERUN_STABILITY in_process_runs=2 raw_equal={same} vertices={}",
         runs[0].0.len() / 3
     );
     ensure!(same, "in-process reruns differ: kernel nondeterminism");

@@ -313,6 +313,7 @@ pub struct BatchGroupNorm {
     reduce_blocks: u32,
     group_tile: u32,
     apply_blocks: u32,
+    tiles: u32,
     eps: f32,
 }
 
@@ -407,8 +408,11 @@ impl BatchGroupNorm {
             .min(sms * resident)
             .min(max_grid)
             .max(1);
+        let tiles = groups.div_ceil(group_tile);
         let partial_elements = bg
-            .checked_mul(2)
+            .checked_mul(tiles)
+            .and_then(|n| n.checked_mul(reduce_blocks))
+            .and_then(|n| n.checked_mul(2))
             .context("group norm partial extent overflow")?;
         let moment_elements = bg.checked_mul(2).context("group norm moments overflow")?;
         let bytes = partial_elements
@@ -438,6 +442,7 @@ impl BatchGroupNorm {
             batches: u32::try_from(batches)?,
             reduce_blocks: u32::try_from(reduce_blocks)?,
             group_tile: u32::try_from(group_tile)?,
+            tiles: u32::try_from(tiles)?,
             apply_blocks: u32::try_from(apply_blocks)?,
             eps,
         })
@@ -478,20 +483,10 @@ impl BatchGroupNorm {
         }
         let stream = &self.device.stream;
         unsafe {
-            super::copy::memset_words(
-                view(
-                    &self.partial,
-                    stream,
-                    0,
-                    [u32::try_from(self.partial.len())?],
-                    [1],
-                )?
-                .ptr,
-                0,
-                self.partial.len(),
-                stream,
-            )?;
-            for group_first in (0..self.groups).step_by(self.group_tile as usize) {
+            for (tile, group_first) in (0..self.groups)
+                .step_by(self.group_tile as usize)
+                .enumerate()
+            {
                 let group_count = self.group_tile.min(self.groups - group_first);
                 stream
                     .launch_builder(&self.reduce[usize::from(half)])
@@ -503,6 +498,8 @@ impl BatchGroupNorm {
                     .arg(&self.groups)
                     .arg(&group_first)
                     .arg(&group_count)
+                    .arg(&self.tiles)
+                    .arg(&(tile as u32))
                     .launch(crate::backend::gpu::LaunchConfig {
                         grid_dim: (self.reduce_blocks, self.batches, 1),
                         block_dim: (256, 1, 1),
@@ -518,7 +515,13 @@ impl BatchGroupNorm {
                 .arg(&self.channels)
                 .arg(&self.groups)
                 .arg(&self.eps)
-                .launch(flat(self.batches as usize * self.groups as usize))?;
+                .arg(&self.tiles)
+                .arg(&self.reduce_blocks)
+                .launch(crate::backend::gpu::LaunchConfig {
+                    grid_dim: (self.batches * self.groups, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
             stream
                 .launch_builder(
                     &self.apply[if half && !output_half {
