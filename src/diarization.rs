@@ -187,14 +187,15 @@ fn emitted_stream_mask<'a>(
 }
 
 /// Frame logits and validity over the whole clip: `logits` is
-/// `[frames][speakers]`, `valid` one flag per frame, `frame_seconds` the
-/// frame period.
+/// `[frames][speakers]` at the spectrogram frame grid, `valid` one flag per
+/// frame, `frame_seconds` the frame period, `factor` the head's subsampling.
 #[cfg(feature = "cuda")]
 struct DiarizationFrames {
     logits: Vec<f32>,
     valid: Vec<bool>,
     speakers: usize,
     frame_seconds: f64,
+    factor: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -243,6 +244,7 @@ fn diarization_frames(
             valid: mask,
             speakers: spec.speakers as usize,
             frame_seconds,
+            factor: spec.factor as usize,
         })
     } else {
         let batch = engine.audio_features(waveform, false, false)?;
@@ -252,13 +254,17 @@ fn diarization_frames(
             valid: batch.mask,
             speakers: spec.speakers as usize,
             frame_seconds,
+            factor: spec.factor as usize,
         })
     }
 }
 
 /// Binarized speaker activity over the diarization frame grid: one bool per
-/// `[frame][speaker]`, the same sigmoid-over-threshold rule as the segment
-/// path; frames outside the validity mask stay inactive.
+/// Binarized speaker activity at the encoder frame grid, pooled exactly as
+/// the published speaker cache does (`_pool_probs`: the mean sigmoid over
+/// each `factor` consecutive spectrogram frames, then the threshold; a
+/// pooled frame is valid when its window's first frame is). One bool per
+/// `[frame][speaker]`.
 #[cfg(feature = "cuda")]
 pub struct SpeakerMasks {
     pub frames: usize,
@@ -276,25 +282,35 @@ pub fn speaker_masks(
     options: crate::RunOptions,
 ) -> Result<SpeakerMasks> {
     let frames = diarization_frames(directory, waveform, stream, options)?;
-    let count = frames.logits.len() / frames.speakers;
+    ensure!(frames.factor > 0, "diarization subsampling factor");
+    let raw = frames.logits.len() / frames.speakers;
     ensure!(
-        frames.logits.len() == count * frames.speakers && frames.valid.len() == count,
+        frames.logits.len() == raw * frames.speakers && frames.valid.len() == raw,
         "diarization frame extents"
     );
-    let mut active = vec![false; frames.logits.len()];
+    let count = raw / frames.factor;
+    let mut active = vec![false; count * frames.speakers];
     for frame in 0..count {
-        if !frames.valid[frame] {
+        if !frames.valid[frame * frames.factor] {
             continue;
         }
         for speaker in 0..frames.speakers {
-            let logit = f64::from(frames.logits[frame * frames.speakers + speaker]);
-            active[frame * frames.speakers + speaker] = 1.0 / (1.0 + (-logit).exp()) > threshold;
+            let mean = (0..frames.factor)
+                .map(|sub| {
+                    let logit = f64::from(
+                        frames.logits[(frame * frames.factor + sub) * frames.speakers + speaker],
+                    );
+                    1.0 / (1.0 + (-logit).exp())
+                })
+                .sum::<f64>()
+                / frames.factor as f64;
+            active[frame * frames.speakers + speaker] = mean > threshold;
         }
     }
     Ok(SpeakerMasks {
         frames: count,
         speakers: frames.speakers,
-        frame_seconds: frames.frame_seconds,
+        frame_seconds: frames.frame_seconds * frames.factor as f64,
         active,
     })
 }
