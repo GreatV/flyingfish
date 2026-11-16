@@ -3137,10 +3137,9 @@ impl ParakeetEncoder {
         for lane in 0..lanes {
             let count = session.lane_cumulative[lane];
             if !live[lane] {
-                ensure!(
-                    count == 0 || count >= 70,
-                    "lane {lane} pauses at {count} rows; only pauses at >= 70 are handled"
-                );
+                // Parked lane: its caches ride the dead-lane keep-alive
+                // copies; on resume it runs seeded-detached below
+                // (count < grid_cache) or joins the main grid.
                 continue;
             }
             if count as usize >= grid_cache || first_step {

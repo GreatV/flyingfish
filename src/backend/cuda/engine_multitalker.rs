@@ -436,7 +436,10 @@ impl Multitalker {
         while live.iter().any(|value| *value) {
             let mut row_offsets = [0usize; 4];
             for lane in 0..4 {
-                row_offsets[lane] = lane * out_rows * joint_hidden + cursor[lane] * joint_hidden;
+                // Completed lanes re-read their last row; their logits are
+                // discarded with the lane.
+                let row = cursor[lane].min(out_rows - 1);
+                row_offsets[lane] = (lane * out_rows + row) * joint_hidden;
             }
             let logits = self.joint_rows(dstream, &projected, &row_offsets)?;
             for &lane in &active {
@@ -1316,6 +1319,291 @@ mod gate_tests {
         ensure!(diverged.is_empty(), "masked streams diverged: {diverged:?}");
         println!(
             "PASS multitalker_rnnt_streams masked=exact kernel=informational timestamps=exact"
+        );
+        Ok(())
+    }
+
+    /// Control for the joint gather and lane-count invariance: a lane that
+    /// finishes its rows while another still emits must not push its row
+    /// offset past the projected buffer, and lane 0's tokens must not depend
+    /// on the other lanes' liveness or on the step's row count. Every leg
+    /// runs on a fresh decode stream, so each first decision is the
+    /// zero-state SOS prime, the computation production makes at stream
+    /// start. Lane 3 blanks every row; lane 0's first decision emits, so its
+    /// next joint call reads a completed lane 3. Legs: one row per lane with
+    /// all lanes live, one row per lane with lane 0 the only live lane, and
+    /// two rows per lane (an 8-row projection where the probe's is 4-row).
+    #[test]
+    #[ignore = "GPU + published archive; set FF_MULTITALKER_NEMO, FF_N6E_M2B"]
+    fn multitalker_decode_tolerates_early_finishers() -> Result<()> {
+        let nemo = std::env::var("FF_MULTITALKER_NEMO").context("FF_MULTITALKER_NEMO")?;
+        let m2b = std::env::var("FF_N6E_M2B").context("FF_N6E_M2B")?;
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&m2b)?)?;
+        let device = Device::new(0)?;
+        let model = Multitalker::load(Path::new(&nemo), &device)?;
+        let blank = model.blank() as usize;
+        let argmax = |logits: &[f32]| -> usize {
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(index, _)| index)
+                .unwrap_or(0)
+        };
+        let steps = fixture["masked/meeting"]["stream"]["steps"]
+            .as_array()
+            .context("masked/meeting steps")?;
+        let f32_row = |value: &Value| -> Result<Vec<f32>> {
+            value
+                .as_array()
+                .context("row")?
+                .iter()
+                .map(|item| Ok(item.as_f64().context("row value")? as f32))
+                .collect()
+        };
+        let mut candidates: Vec<Vec<f32>> = Vec::new();
+        for step in steps.iter().take(6) {
+            let block = step
+                .get("encoded_rows")
+                .and_then(Value::as_array)
+                .context("encoded_rows")?;
+            for slot in block {
+                let rows: Vec<Vec<f32>> = slot
+                    .as_array()
+                    .context("slot rows")?
+                    .iter()
+                    .map(f32_row)
+                    .collect::<Result<_>>()?;
+                candidates.extend(rows.into_iter().take(8));
+            }
+        }
+        let mut blank_row: Option<Vec<f32>> = None;
+        let mut symbol: Option<(Vec<f32>, u32)> = None;
+        for row in &candidates {
+            let mut dstream = model.decode_stream()?;
+            let sos = model.decode_teacher_forced(
+                &mut dstream,
+                0,
+                &[row.as_slice()],
+                &[false],
+                &[blank as u32],
+            )?;
+            let logits = &sos[0];
+            let best = argmax(logits);
+            // The probe projects a 4-row batch (one row per lane slot); the
+            // crafted steps project 4-row and 8-row batches. A row enters
+            // the crafted steps only with a top1-top2 margin above 0.1, so
+            // its decision carries over the projection shape difference.
+            let mut top = [f32::NEG_INFINITY; 2];
+            for value in logits {
+                if *value > top[0] {
+                    top[1] = top[0];
+                    top[0] = *value;
+                } else if *value > top[1] {
+                    top[1] = *value;
+                }
+            }
+            if top[0] - top[1] <= 0.1 {
+                continue;
+            }
+            if best == blank {
+                blank_row.get_or_insert_with(|| row.clone());
+            } else {
+                symbol.get_or_insert((row.clone(), best as u32));
+            }
+            if blank_row.is_some() && symbol.is_some() {
+                break;
+            }
+        }
+        let blank_row = blank_row.context("no clear SOS-blank row in the first meeting steps")?;
+        let (sym_row, token) =
+            symbol.context("no clear SOS-symbol row in the first meeting steps")?;
+        let width = model.spec.d_model as usize;
+        fn decode_primed(
+            model: &Multitalker,
+            features: &[f32],
+            diar: &[f32],
+            step: &MultitalkerStep,
+        ) -> Result<(Vec<usize>, Vec<Vec<u32>>)> {
+            let mut session = model.stream(features.to_vec(), diar.to_vec(), true, 4, true)?;
+            let mut stream = model.encoder.multitalker_stream(4)?;
+            let mut dstream = model.decode_stream()?;
+            model
+                .stream_step(&mut session, &mut stream)?
+                .context("primer step")?;
+            let active = model.decode_step(&mut session, &mut dstream, step)?;
+            let tokens = session
+                .hypotheses
+                .iter()
+                .map(|hyp| hyp.tokens.clone())
+                .collect();
+            Ok((active, tokens))
+        }
+        let features = model.features(&synth_signal())?;
+        let frames = features.len() / 128 + 28;
+        let mut diar_all = vec![0.0f32; frames * 4];
+        diar_all[..4].fill(1.0);
+        let mut diar_solo = vec![0.0f32; frames * 4];
+        diar_solo[0] = 1.0;
+        let craft = |per_lane: usize| -> MultitalkerStep {
+            let mut rows = vec![0.0f32; 4 * per_lane * width];
+            rows[..width].copy_from_slice(&sym_row);
+            for index in 1..per_lane {
+                rows[index * width..(index + 1) * width].copy_from_slice(&blank_row);
+            }
+            for lane in 1..4 {
+                let base = lane * per_lane * width;
+                for index in 0..per_lane {
+                    rows[base + index * width..base + (index + 1) * width]
+                        .copy_from_slice(&blank_row);
+                }
+            }
+            MultitalkerStep {
+                rows,
+                layer0_in: Vec::new(),
+                layer0_post: Vec::new(),
+            }
+        };
+        let step4 = craft(1);
+        let step8 = craft(2);
+        let (active, tokens) = decode_primed(&model, &features, &diar_all, &step4)?;
+        ensure!(active == vec![0, 1, 2, 3], "crafted step lanes {active:?}");
+        ensure!(
+            tokens[0].first() == Some(&token),
+            "lane 0 first token {:?} vs {token}",
+            tokens[0].first()
+        );
+        for (lane, lane_tokens) in tokens.iter().enumerate().skip(1) {
+            ensure!(lane_tokens.is_empty(), "lane {lane} tokens {lane_tokens:?}");
+        }
+        let (solo_active, solo_tokens) = decode_primed(&model, &features, &diar_solo, &step4)?;
+        ensure!(solo_active == vec![0], "solo step lanes {solo_active:?}");
+        ensure!(
+            solo_tokens[0].first() == Some(&token),
+            "solo lane 0 first token {:?} vs {token}",
+            solo_tokens[0].first()
+        );
+        let (_, tokens8) = decode_primed(&model, &features, &diar_all, &step8)?;
+        ensure!(
+            tokens8[0].first() == Some(&token),
+            "2-row step lane 0 first token {:?} vs {token}",
+            tokens8[0].first()
+        );
+        println!("PASS multitalker_decode_early_finishers lane0={token} shapes=4,8 live=4,1");
+        Ok(())
+    }
+
+    /// Control for young-lane parking: a speaker active for two steps, off
+    /// until frame `resume`, then on again parks under 70 rows and resumes
+    /// through the seeded detached path; tokens, timestamps and every active
+    /// list match the published loop on the same crafted mask. The old code
+    /// rejected the pause outright.
+    #[test]
+    #[ignore = "GPU + published archive; set FF_MULTITALKER_NEMO, FF_N6E_INPUTS, FF_N6E_FROZEN, FF_N6E_M2B_BLIP"]
+    fn multitalker_streams_pause_young_lane() -> Result<()> {
+        let nemo = std::env::var("FF_MULTITALKER_NEMO").context("FF_MULTITALKER_NEMO")?;
+        let inputs_root = std::env::var("FF_N6E_INPUTS").context("FF_N6E_INPUTS")?;
+        let frozen = std::env::var("FF_N6E_FROZEN").context("FF_N6E_FROZEN")?;
+        let blip_path = std::env::var("FF_N6E_M2B_BLIP").context("FF_N6E_M2B_BLIP")?;
+        let cells: Value = serde_json::from_str(&std::fs::read_to_string(
+            Path::new(&frozen).join("frozen-cells-4090a1-fp32-kfix.json"),
+        )?)?;
+        let blip: Value = serde_json::from_str(&std::fs::read_to_string(&blip_path)?)?;
+        let device = Device::new(0)?;
+        let model = Multitalker::load(Path::new(&nemo), &device)?;
+        let all = inputs(&model, Path::new(&inputs_root), &cells)?;
+        let meeting = all
+            .iter()
+            .find(|input| input.name == "meeting")
+            .context("meeting clip")?;
+        let lanes = 4usize;
+        let frames = meeting.diar.len() / lanes;
+        let resume = (60..frames)
+            .find(|frame| meeting.diar[frame * lanes] > 0.5)
+            .context("no speaker-0 mask frame at or after 60")?;
+        ensure!(
+            blip["meta"]["resume"].as_u64() == Some(resume as u64),
+            "blip fixture resume {} vs ours {resume}",
+            blip["meta"]["resume"]
+        );
+        let steps = blip["masked/blip"]["stream"]["steps"]
+            .as_array()
+            .context("blip steps")?;
+        // The blip mask: the meeting ground truth with speaker 0 forced on
+        // frames [0,2), speaker 0 off and filler lane 2 on over [2,resume),
+        // ground truth elsewhere, as the published-loop fixture recorded it.
+        let mut diar = meeting.diar.clone();
+        diar[0] = 1.0;
+        diar[lanes] = 1.0;
+        for frame in 2..resume {
+            diar[frame * lanes] = 0.0;
+            diar[frame * lanes + 2] = 1.0;
+        }
+        let mut session = model.stream(meeting.features.clone(), diar, true, 4, true)?;
+        let mut stream = model.encoder.multitalker_stream(4)?;
+        let mut dstream = model.decode_stream()?;
+        let mut lane0_steps = 0usize;
+        let mut parked_young = false;
+        let mut resumed_young = false;
+        let mut step = 0usize;
+        while let Some(result) = model.stream_step(&mut session, &mut stream)? {
+            let active = model.decode_step(&mut session, &mut dstream, &result)?;
+            let expect: Vec<usize> = steps[step]["active"]
+                .as_array()
+                .with_context(|| format!("blip step {step} active"))?
+                .iter()
+                .map(|value| value.as_u64().unwrap_or(u64::MAX) as usize)
+                .collect();
+            ensure!(
+                active == expect,
+                "blip step {step} active {active:?} reference {expect:?}"
+            );
+            if active.contains(&0) {
+                if parked_young && lane0_steps <= 2 {
+                    resumed_young = true;
+                }
+                lane0_steps += 1;
+            } else if lane0_steps > 0 && lane0_steps <= 2 {
+                parked_young = true;
+            }
+            step += 1;
+        }
+        ensure!(step == steps.len(), "blip steps {step} vs {}", steps.len());
+        ensure!(
+            parked_young,
+            "the crafted mask never parked speaker 0 young"
+        );
+        ensure!(resumed_young, "speaker 0 never resumed from the young park");
+        let finals = blip["masked/blip"]["stream"]["final"]
+            .as_object()
+            .context("blip finals")?;
+        for (speaker, expect) in finals {
+            let lane = speaker.parse::<usize>()?;
+            let hyp = &session.hypotheses[lane];
+            let tokens: Vec<u32> = expect["tokens"]
+                .as_array()
+                .context("final tokens")?
+                .iter()
+                .map(|value| value.as_u64().unwrap_or(u64::MAX) as u32)
+                .collect();
+            let stamps: Vec<u32> = expect["timestamps"]
+                .as_array()
+                .context("final timestamps")?
+                .iter()
+                .map(|value| value.as_u64().unwrap_or(u64::MAX) as u32)
+                .collect();
+            ensure!(
+                hyp.tokens == tokens && hyp.timestamps == stamps,
+                "blip speaker {lane} ours {} tokens reference {} (first mismatch {:?})",
+                hyp.tokens.len(),
+                tokens.len(),
+                hyp.tokens.iter().zip(&tokens).position(|(a, b)| a != b)
+            );
+        }
+        println!(
+            "PASS multitalker_streams_pause_young resume_frame={} exact=true speakers={}",
+            resume,
+            finals.len()
         );
         Ok(())
     }
