@@ -1716,15 +1716,15 @@ __device__ __forceinline__ void batch_group_moments_scatter(
     }
     __syncthreads();
     if (threadIdx.x < group_count) {
-        float sum = 0.0f, square = 0.0f;
+        double sum = 0.0, square = 0.0;
         for (uint32_t thread = 0; thread < 256; ++thread) {
-            sum = __fadd_rn(sum, staged[0][threadIdx.x][thread]);
-            square = __fadd_rn(square, staged[1][threadIdx.x][thread]);
+            sum += double(staged[0][threadIdx.x][thread]);
+            square += double(staged[1][threadIdx.x][thread]);
         }
         const uint64_t bg = uint64_t(batch) * groups + group_first + threadIdx.x;
         const uint64_t slot = (bg * tiles + tile) * gridDim.x + blockIdx.x;
-        partials[2 * slot] = sum;
-        partials[2 * slot + 1] = square;
+        partials[2 * slot] = float(sum);
+        partials[2 * slot + 1] = float(square);
     }
 }
 
@@ -1760,24 +1760,25 @@ extern "C" __global__ void batch_group_moments_finish_f32(
     const uint32_t lane_count = uint32_t((slots + 255) / 256);
     const uint64_t begin = uint64_t(threadIdx.x) * lane_count;
     const uint64_t end = min(uint64_t(begin + lane_count), slots);
-    float sum = 0.0f, squares = 0.0f;
+    double sum = 0.0, squares = 0.0;
     for (uint64_t slot = begin; slot < end; ++slot) {
         const uint64_t at = (bg * tiles) * reduce_blocks + slot;
-        sum = __fadd_rn(sum, partials[2 * at]);
-        squares = __fadd_rn(squares, partials[2 * at + 1]);
+        sum += double(partials[2 * at]);
+        squares += double(partials[2 * at + 1]);
     }
-    __shared__ float staged[2][256];
+    __shared__ double staged[2][256];
     staged[0][threadIdx.x] = sum;
     staged[1][threadIdx.x] = squares;
     __syncthreads();
     if (threadIdx.x == 0) {
         for (uint32_t thread = 1; thread < 256; ++thread) {
-            sum = __fadd_rn(sum, staged[0][thread]);
-            squares = __fadd_rn(squares, staged[1][thread]);
+            sum += staged[0][thread];
+            squares += staged[1][thread];
         }
         const float denominator = __fadd_rn(float(count), eps);
-        const float mean = __fdiv_rn(sum, denominator);
-        const float variance = __fsub_rn(__fdiv_rn(squares, denominator), __fmul_rn(mean, mean));
+        const float mean = float(sum / double(denominator));
+        const float variance =
+            float(squares / double(denominator) - double(mean) * double(mean));
         moments[2 * bg] = mean;
         moments[2 * bg + 1] = rsqrtf(__fadd_rn(variance, eps));
     }

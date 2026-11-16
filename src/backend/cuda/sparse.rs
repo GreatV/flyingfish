@@ -390,10 +390,15 @@ impl BatchGroupNorm {
             "group norm grid or occupancy exceeds device limits"
         );
         let group_tile = groups.min(8);
+        // Enough blocks to cover the elements once, capped at two resident
+        // waves; the strided loop keeps every ordering a fixed function of
+        // the block index.
         let reduce_blocks = maximum
             .checked_mul(group_tile)
             .context("group norm reduction extent overflow")?
-            .div_ceil(256);
+            .div_ceil(256)
+            .min(sms * resident * 2)
+            .max(1);
         let max_grid = device
             .ctx
             .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as usize;
