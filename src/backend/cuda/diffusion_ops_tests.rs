@@ -2552,6 +2552,47 @@ fn diffusion_real_load_gpu() -> Result<()> {
     anyhow::bail!("CUDA feature required");
 }
 
+/// Native categorical/renoise calls through the real DiffusionGemma engine.
+#[test]
+#[ignore = "requires coordinator-granted GPU window and FF_MODEL"]
+fn diffusion_native_sampling_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    #[cfg(feature = "cuda")]
+    {
+        use crate::backend::{Settings, SpecBudget, TreeBuilder};
+        let target =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let settings = Settings {
+            tree_builder: TreeBuilder::Waves,
+            spec_budget: SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            runtime_dir: None,
+            prefix_cache: false,
+            device_budget_gib: Some(14),
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let mut model =
+            crate::backend::cuda::engine::Engine::load(&target, 0, 4096, None, settings)?;
+        model.check_ready()?;
+        model.reset()?;
+        let first = model.diffusion_sample_for_test(1)?;
+        let second = model.diffusion_sample_for_test(2)?;
+        ensure!(first.len() == 256 && second.len() == 256, "sampling canvas");
+        ensure!(
+            first.iter().chain(&second).all(|id| *id >= 0),
+            "negative sampled id"
+        );
+        println!("DIFFUSION_NATIVE_PICKS step1={first:?} step2={second:?}");
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    anyhow::bail!("CUDA feature required");
+}
+
 /// Engine-level trajectory gate on the frozen DG1 reference: teacher-forced
 /// canvas steps with recorded draws, every bound read from FROZEN.json at
 /// run time (no hardcoded tolerances). The encoder leg compares hidden taps
