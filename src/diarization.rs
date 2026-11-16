@@ -271,6 +271,8 @@ pub struct SpeakerMasks {
     pub speakers: usize,
     pub frame_seconds: f64,
     pub active: Vec<bool>,
+    /// The pooled speaker probabilities the mask binarizes, `[frame][speaker]`.
+    pub pooled: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -289,6 +291,7 @@ pub fn speaker_masks(
         "diarization frame extents"
     );
     let count = raw / frames.factor;
+    let mut pooled = vec![0.0f32; count * frames.speakers];
     let mut active = vec![false; count * frames.speakers];
     for frame in 0..count {
         if !frames.valid[frame * frames.factor] {
@@ -304,6 +307,7 @@ pub fn speaker_masks(
                 })
                 .sum::<f64>()
                 / frames.factor as f64;
+            pooled[frame * frames.speakers + speaker] = mean as f32;
             active[frame * frames.speakers + speaker] = mean > threshold;
         }
     }
@@ -312,6 +316,7 @@ pub fn speaker_masks(
         speakers: frames.speakers,
         frame_seconds: frames.frame_seconds * frames.factor as f64,
         active,
+        pooled,
     })
 }
 

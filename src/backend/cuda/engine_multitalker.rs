@@ -1686,10 +1686,25 @@ mod gate_tests {
                 "native diarizer stops at frame {compared} of {frames} and the fixture carries activity beyond"
             );
         }
+        let reference_pooled: Vec<f32> = fixture["masks"]["pooled"]
+            .as_array()
+            .context("fixture pooled")?
+            .iter()
+            .map(|value| Ok(value.as_f64().context("pooled entry")? as f32))
+            .collect::<Result<_>>()?;
         let mut mismatches = 0usize;
         let mut first = None;
         for (index, (ours, reference)) in masks.active.iter().zip(&expected).enumerate() {
             if ours != reference {
+                if mismatches < 32 {
+                    println!(
+                        "MASK_DIVERGED frame {} channel {} native_pooled {:.6} reference_pooled {:.6}",
+                        index / speakers,
+                        index % speakers,
+                        masks.pooled[index],
+                        reference_pooled[index],
+                    );
+                }
                 mismatches += 1;
                 if first.is_none() {
                     first = Some(index);
@@ -1740,12 +1755,20 @@ mod gate_tests {
             .map(|value| value.as_bool().context("mask entry"))
             .collect::<Result<_>>()?;
         ensure!(active.len() == frames * speakers, "fixture mask extent");
+        let pooled: Vec<f32> = fixture["masks"]["pooled"]
+            .as_array()
+            .context("fixture pooled")?
+            .iter()
+            .map(|value| Ok(value.as_f64().context("pooled entry")? as f32))
+            .collect::<Result<_>>()?;
+        ensure!(pooled.len() == frames * speakers, "fixture pooled extent");
         let masks_of = |active: &[bool]| -> crate::diarization::SpeakerMasks {
             crate::diarization::SpeakerMasks {
                 frames,
                 speakers,
                 frame_seconds: 0.08,
                 active: active.to_vec(),
+                pooled: pooled.clone(),
             }
         };
         let expected = |mode: &str, speaker: usize| -> Result<(Vec<u32>, Vec<u32>, String)> {
