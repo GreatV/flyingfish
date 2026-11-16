@@ -1224,7 +1224,7 @@ fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
         ldk.push(stream.alloc_zeros(depth_kv_elems)?);
         ldv.push(stream.alloc_zeros(depth_kv_elems)?);
     }
-    let head_in_rows = geometry.frames.max((CODEBOOK as usize).div_ceil(DP_H));
+    let head_in_rows = geometry.frames.max(gemm_rows(1, DP_H));
     let head_out_rows = geometry.frames.max(gemm_rows(1, DP_H) + HEAD_N);
     Ok(Buf {
         h: stream.alloc_zeros(h_elems)?,
@@ -3487,6 +3487,8 @@ impl Breeze {
             ref blas,
             ..
         } = *self;
+        k.stream.memset_zeros(&mut buf.backbone_history)?;
+        k.captured.borrow_mut().depth_sample = None;
         upload_hidden(k, buf, projected)?;
         let mut output = Vec::new();
         for frame in 0..k.geometry.frames {
@@ -4436,6 +4438,96 @@ mod tests {
             .is_err(),
             "65 frames"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher prompt fixture"]
+    fn breeze_repeated_generation_resets_history() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let runtime = RuntimeDir::with_prefix("n8-history-reset")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 64)?;
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let sampling = crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?;
+        let first = model.sample_decode(&projected, prompt.len(), sampling, 18)?;
+        let second = model.sample_decode(&projected, prompt.len(), sampling, 18)?;
+        ensure!(first == second, "repeated generation history differs");
+        println!(
+            "BREEZE_HISTORY_RESET PASS frames={}",
+            first.len() / super::BOOKS
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher prompt fixture"]
+    fn breeze_generation_graph_tracks_seed_and_sampling() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let initial = crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?;
+        let changed = crate::sampling::Sampling::new(1.2, 7, 0.75, 1.1)?;
+        let runtime = RuntimeDir::with_prefix("n8-generation-state")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 64)?;
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let first = model.sample_decode(&projected, prompt.len(), initial, 18)?;
+        let second = model.sample_decode(&projected, prompt.len(), changed, 19)?;
+        let fresh_runtime = RuntimeDir::with_prefix("n8-generation-fresh")?;
+        let mut fresh =
+            super::Breeze::load_for_generation(&weights, &fresh_runtime.0, 0, prompt.len(), 64)?;
+        let fresh_projected = fresh.text(&prompt, super::TextPlant::Nominal)?;
+        let expected = fresh.sample_decode(&fresh_projected, prompt.len(), changed, 19)?;
+        ensure!(first != second, "changed generation did not differ");
+        ensure!(second == expected, "second generation reused graph inputs");
+        println!(
+            "BREEZE_GENERATION_STATE PASS frames={}",
+            second.len() / super::BOOKS
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease"]
+    fn breeze_head_in_covers_padded_gemm_rows() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let device = super::Device::new(0)?;
+        for max_new_tokens in 1..=16 {
+            let geometry = super::generation_geometry(13, max_new_tokens)?;
+            let buf = super::alloc_buf(&device.stream, geometry)?;
+            ensure!(
+                buf.head_in.len()
+                    == geometry.frames.max(super::gemm_rows(1, super::DP_H)) * super::DP_H,
+                "head_in rows for max_new_tokens={max_new_tokens}"
+            );
+        }
+        println!("BREEZE_HEAD_IN PASS max_new_tokens=1..16");
         Ok(())
     }
 

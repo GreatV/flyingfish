@@ -604,8 +604,8 @@ impl Runtime {
                 .arg(&1i32)
                 .arg(&vocab)
                 .arg(&seed)
+                .arg(&self.policy.stream)
                 .arg(&ptr(&self.policy.counter_base, &self.device))
-                .arg(&ptr(&self.policy.stream, &self.device))
                 .arg(&256i32)
                 .arg(&ptr(&self.policy.history, &self.device))
                 .arg(&0i32)
@@ -1607,6 +1607,51 @@ mod tests {
             "DEFECT paired CFG alias control isolated={isolated} detected={detected}"
         );
         println!("PASS music3_cfg_cache_control branch1_bits=0 branch0_perturbation_detected=true");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a GPU lease and the published Music3 checkpoint"]
+    fn music3_native_sampling_gpu() -> Result<()> {
+        let model =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let scratch = std::env::temp_dir().join(format!("ff-music3-draws-{}", std::process::id()));
+        std::fs::create_dir(&scratch)?;
+        let mut ar = Runtime::load(&model, &scratch, 1, 25, 22000000000)?;
+        let mut records = Vec::new();
+        for codebook in 0..2 {
+            ar.device
+                .stream
+                .memset_zeros(&mut ar.policy.probabilities)?;
+            let (base, probabilities) = if codebook == 0 {
+                (151675, [0.2, 0.3, 0.25, 0.25])
+            } else {
+                (17, [0.1, 0.2, 0.3, 0.4])
+            };
+            for (offset, probability) in probabilities.into_iter().enumerate() {
+                ar.device.stream.memcpy_htod(
+                    &[probability],
+                    &mut ar
+                        .policy
+                        .probabilities
+                        .slice_mut(base + offset..base + offset + 1),
+                )?;
+            }
+            for seed in [42, 7] {
+                for draw in [0, 1, 17, 38471471] {
+                    ar.draw(codebook, seed, draw, None)?;
+                    let code = ar
+                        .device
+                        .stream
+                        .clone_dtoh(&ar.policy.codes.slice(codebook..codebook + 1))?[0];
+                    records.push((codebook, seed, draw, code));
+                }
+            }
+        }
+        ensure!(records.len() == 16, "draw count");
+        println!("MUSIC3_NATIVE_DRAWS {records:?}");
+        drop(ar);
+        std::fs::remove_dir_all(scratch)?;
         Ok(())
     }
 
