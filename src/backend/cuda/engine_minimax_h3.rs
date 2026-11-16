@@ -1709,6 +1709,115 @@ fn apply_int8(
     )
 }
 
+fn int8_linear(linear: &BlockLinear) -> Option<(Tensor<i8, 2>, &CudaSlice<f32>, u32)> {
+    match linear {
+        BlockLinear::Int8 {
+            qweight,
+            wscale,
+            group,
+            ..
+        } => Some((*qweight, wscale, *group)),
+        _ => None,
+    }
+}
+
+/// Int8 Q, K, and V at or above [`crate::convrot::TENSOR_CORE_ROWS`] share one rotate-quant.
+fn apply_shared_qkv(
+    c: &BlockContext<'_>,
+    w: &BlockWeights,
+    work: &BlockWork,
+    scratch: Option<StoredPtrs>,
+) -> Result<bool> {
+    let Some(q) = int8_linear(&w.linears[Q]) else {
+        return Ok(false);
+    };
+    let Some(k) = int8_linear(&w.linears[K]) else {
+        return Ok(false);
+    };
+    let Some(v) = int8_linear(&w.linears[V]) else {
+        return Ok(false);
+    };
+    let rows = work.rows;
+    if rows < crate::convrot::TENSOR_CORE_ROWS {
+        return Ok(false);
+    }
+    ensure!(
+        q.0.shape[1] == k.0.shape[1] && k.0.shape[1] == v.0.shape[1] && q.2 == k.2 && k.2 == v.2,
+        "convrot shared activation"
+    );
+    let ptrs = scratch.context("stored linear without scratch")?;
+    let h = c.spec.hidden;
+    let width = c.spec.heads * c.spec.head_dim;
+    let kdim = usize::try_from(q.0.shape[1])?;
+    let n = usize::try_from(q.0.shape[0])?;
+    ensure!(
+        k.0.shape[0] == q.0.shape[0]
+            && v.0.shape[0] == q.0.shape[0]
+            && kdim == h
+            && n == width
+            && q.1.len() == n
+            && k.1.len() == n
+            && v.1.len() == n
+            && rows <= ptrs.rows
+            && kdim <= ptrs.k,
+        "convrot shape"
+    );
+    let count = rows * kdim;
+    let launch = c.kernels.stored_launch(c.s.context())?;
+    let x = rows_view(&work.normed, c.s, 0, rows, h, h)?;
+    unsafe {
+        c.s.launch_builder(&launch.upcast)
+            .arg(&x.ptr)
+            .arg(&ptrs.x)
+            .arg(&u32::try_from(count)?)
+            .launch(flat(count))?;
+    }
+    let group = i32::try_from(q.2)?;
+    let rows_i = i32::try_from(rows)?;
+    let k_i = i32::try_from(kdim)?;
+    crate::convrot::launch_rotate_quant(
+        c.s,
+        &launch.convrot,
+        &crate::convrot::ConvrotArgs {
+            x: ptrs.x,
+            qweight: 0,
+            wscale: 0,
+            y: 0,
+            rotated: ptrs.rotated,
+            codes: ptrs.codes,
+            scales: ptrs.scales,
+            rows: rows_i,
+            k: k_i,
+            n: 0,
+            group,
+        },
+    )?;
+    for ((qweight, wscale, _), out) in [(q.0, q.1, q.2), (k.0, k.1, k.2), (v.0, v.1, v.2)]
+        .into_iter()
+        .zip([&work.q_raw, &work.k_raw, &work.v_raw])
+    {
+        let y = rows_view(out, c.s, 0, rows, width, width)?;
+        crate::convrot::launch_product(
+            c.s,
+            &launch.convrot,
+            &crate::convrot::ConvrotArgs {
+                x: ptrs.x,
+                qweight: qweight.ptr,
+                wscale: pointer(wscale, c.s),
+                y: y.ptr,
+                rotated: ptrs.rotated,
+                codes: ptrs.codes,
+                scales: ptrs.scales,
+                rows: rows_i,
+                k: k_i,
+                n: i32::try_from(n)?,
+                group,
+            },
+        )?;
+    }
+    Ok(true)
+}
+
 fn apply_low_rank(
     c: &BlockContext<'_>,
     down: Tensor<bf16, 2>,
@@ -1890,12 +1999,14 @@ pub(crate) fn block_forward<const LORA: bool>(
         apply_linear(c, &w.linears[index], x, y, scratch)
     };
     hidden_norm(&w.norm1, 0, 1)?;
-    for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
-        base(
-            index,
-            rows_view(&work.normed, s, 0, rows, h, h)?,
-            rows_view(out, s, 0, rows, width, width)?,
-        )?;
+    if !apply_shared_qkv(c, w, work, scratch)? {
+        for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
+            base(
+                index,
+                rows_view(&work.normed, s, 0, rows, h, h)?,
+                rows_view(out, s, 0, rows, width, width)?,
+            )?;
+        }
     }
     if LORA {
         blas.linear_typed(

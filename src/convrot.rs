@@ -374,7 +374,7 @@ fn launch_rows(
 }
 
 #[cfg(feature = "cuda")]
-fn launch_product(
+pub(crate) fn launch_product(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
     args: &ConvrotArgs,
@@ -406,15 +406,16 @@ fn launch_product(
     Ok(())
 }
 
+/// `convrot_group_dot` then `convrot_quantize`. The product is a separate launch.
 #[cfg(feature = "cuda")]
-fn launch_groups(
+pub(crate) fn launch_rotate_quant(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
     args: &ConvrotArgs,
 ) -> Result<()> {
     use crate::backend::gpu::{LaunchConfig, PushKernelArg};
     ensure!(
-        args.group % 16 == 0 && args.k % args.group == 0,
+        args.group > 0 && args.group % 16 == 0 && args.k % args.group == 0,
         "convrot tensor-core shape"
     );
     let rows = args.rows as u32;
@@ -449,6 +450,16 @@ fn launch_groups(
                 shared_mem_bytes: 0,
             })?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn launch_groups(
+    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    fns: &ConvrotFns,
+    args: &ConvrotArgs,
+) -> Result<()> {
+    launch_rotate_quant(stream, fns, args)?;
     launch_product(stream, fns, args)
 }
 
@@ -931,6 +942,208 @@ mod device {
             );
             println!("CONVROT_PRODUCT_SASS sm_{sm} IMMA.16832.S8.S8");
         }
+        Ok(())
+    }
+
+    fn count_i8(got: &[i8], expected: &[i8]) -> usize {
+        got.iter().zip(expected).filter(|(a, b)| a != b).count()
+            + got.len().abs_diff(expected.len())
+    }
+
+    fn count_f32(got: &[f32], expected: &[f32]) -> usize {
+        got.iter()
+            .zip(expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
+            + got.len().abs_diff(expected.len())
+    }
+
+    fn salted_weight(n: usize, k: usize, salt: usize) -> Vec<i8> {
+        (0..n)
+            .flat_map(|col| (0..k).map(move |i| code(col + salt * n, i)))
+            .collect()
+    }
+
+    fn salted_wscale(n: usize, salt: usize) -> Vec<f32> {
+        (0..n)
+            .map(|col| ((col + salt) % 5 + 1) as f32 * 1.0e-2)
+            .collect()
+    }
+
+    fn per_product(
+        device: &Device,
+        fns: &super::ConvrotFns,
+        x: &[f32],
+        k: usize,
+        group: usize,
+        qweight: &[i8],
+        wscale: &[f32],
+    ) -> Result<(Vec<i8>, Vec<f32>, Vec<bf16>)> {
+        let n = wscale.len();
+        let rows = x.len() / k;
+        let stream = &device.stream;
+        let x_d = stream.clone_htod(x)?;
+        let weight_d = stream.clone_htod(qweight)?;
+        let scale_d = stream.clone_htod(wscale)?;
+        let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
+        let rotated = stream.alloc_zeros::<f32>(rows * k)?;
+        let codes = stream.alloc_zeros::<i8>(rows * k)?;
+        let scales = stream.alloc_zeros::<f32>(rows)?;
+        launch_device(
+            stream,
+            fns,
+            &ConvrotArgs {
+                x: x_d.device_ptr(stream).0,
+                qweight: weight_d.device_ptr(stream).0,
+                wscale: scale_d.device_ptr(stream).0,
+                y: y_d.device_ptr(stream).0,
+                rotated: rotated.device_ptr(stream).0,
+                codes: codes.device_ptr(stream).0,
+                scales: scales.device_ptr(stream).0,
+                rows: i32::try_from(rows)?,
+                k: i32::try_from(k)?,
+                n: i32::try_from(n)?,
+                group: i32::try_from(group)?,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok((
+            stream.clone_dtoh(&codes)?,
+            stream.clone_dtoh(&scales)?,
+            stream.clone_dtoh(&y_d)?,
+        ))
+    }
+
+    fn check_shared(
+        device: &Device,
+        fns: &super::ConvrotFns,
+        rows: usize,
+        k: usize,
+        n: usize,
+        mutant: bool,
+    ) -> Result<()> {
+        let group = 256usize;
+        let x = activation(rows, k);
+        let stream = &device.stream;
+        let x_d = stream.clone_htod(&x)?;
+        let rotated = stream.alloc_zeros::<f32>(rows * k)?;
+        let codes_d = stream.alloc_zeros::<i8>(rows * k)?;
+        let scales_d = stream.alloc_zeros::<f32>(rows)?;
+        super::launch_rotate_quant(
+            stream,
+            fns,
+            &ConvrotArgs {
+                x: x_d.device_ptr(stream).0,
+                qweight: 0,
+                wscale: 0,
+                y: 0,
+                rotated: rotated.device_ptr(stream).0,
+                codes: codes_d.device_ptr(stream).0,
+                scales: scales_d.device_ptr(stream).0,
+                rows: i32::try_from(rows)?,
+                k: i32::try_from(k)?,
+                n: 0,
+                group: i32::try_from(group)?,
+            },
+        )?;
+        stream.synchronize()?;
+        drop(rotated);
+        drop(x_d);
+        let shared_codes: Vec<i8> = stream.clone_dtoh(&codes_d)?;
+        let shared_scales: Vec<f32> = stream.clone_dtoh(&scales_d)?;
+        let mut codes_differ = 0usize;
+        let mut scales_differ = 0usize;
+        let mut product_differ = [0usize; 3];
+        let mut kept_y = None;
+        let mut kept_weight = None;
+        let mut kept_wscale = None;
+        for (salt, differ) in product_differ.iter_mut().enumerate() {
+            let qweight = salted_weight(n, k, salt);
+            let wscale = salted_wscale(n, salt);
+            let (codes, scales, y) = per_product(device, fns, &x, k, group, &qweight, &wscale)?;
+            codes_differ += count_i8(&shared_codes, &codes);
+            scales_differ += count_f32(&shared_scales, &scales);
+            let weight_d = stream.clone_htod(&qweight)?;
+            let wscale_d = stream.clone_htod(&wscale)?;
+            let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
+            super::launch_product(
+                stream,
+                fns,
+                &ConvrotArgs {
+                    x: 0,
+                    qweight: weight_d.device_ptr(stream).0,
+                    wscale: wscale_d.device_ptr(stream).0,
+                    y: y_d.device_ptr(stream).0,
+                    rotated: 0,
+                    codes: codes_d.device_ptr(stream).0,
+                    scales: scales_d.device_ptr(stream).0,
+                    rows: i32::try_from(rows)?,
+                    k: i32::try_from(k)?,
+                    n: i32::try_from(n)?,
+                    group: i32::try_from(group)?,
+                },
+            )?;
+            stream.synchronize()?;
+            let shared_y: Vec<bf16> = stream.clone_dtoh(&y_d)?;
+            *differ = bit_diff(&shared_y, &y);
+            if mutant && salt == 0 {
+                kept_y = Some(shared_y);
+                kept_weight = Some(qweight);
+                kept_wscale = Some(wscale);
+            }
+        }
+        println!(
+            "CONVROT_SHARED rows={rows} k={k} n={n} codes={codes_differ} scales={scales_differ} y0={} y1={} y2={}",
+            product_differ[0], product_differ[1], product_differ[2]
+        );
+        ensure!(
+            codes_differ == 0,
+            "shared codes rows={rows} differ {codes_differ}"
+        );
+        ensure!(
+            scales_differ == 0,
+            "shared scales rows={rows} differ {scales_differ}"
+        );
+        ensure!(
+            product_differ == [0, 0, 0],
+            "shared products rows={rows} differ {product_differ:?}"
+        );
+        if !mutant {
+            return Ok(());
+        }
+        let kept_y = kept_y.context("shared product")?;
+        let kept_weight = kept_weight.context("shared weight")?;
+        let kept_wscale = kept_wscale.context("shared wscale")?;
+        let mut wrong = shared_codes;
+        let before = wrong[0];
+        wrong[0] = if before < 0 { 127 } else { -127 };
+        ensure!(wrong[0] != before, "shared mutant code was unchanged");
+        let shifted = launch_product_at(
+            device,
+            &wrong,
+            &shared_scales,
+            &kept_weight,
+            &kept_wscale,
+            k,
+            0,
+        )?;
+        let moved = bit_diff(&shifted, &kept_y);
+        println!("CONVROT_SHARED_MUTANT differ={moved}");
+        ensure!(moved > 0, "one changed shared code matched the product");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn convrot_shared_quant_matches_per_product() -> Result<()> {
+        let device = Device::new(0)?;
+        let fns = load_convrot(&device.ctx)?;
+        let k = 5_376usize;
+        let n = 7_168usize;
+        for rows in [17usize, 20, 42] {
+            check_shared(&device, &fns, rows, k, n, false)?;
+        }
+        check_shared(&device, &fns, 41_770, k, n, true)?;
         Ok(())
     }
 }
