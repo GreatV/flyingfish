@@ -982,6 +982,10 @@ fn int8_factor(
         group_usize > 0 && cols.is_multiple_of(group_usize),
         "{name} convrot group {group}"
     );
+    let optin = usize::try_from(s.context().attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    )?)?;
+    crate::convrot::ensure_group(group, optin).with_context(|| format!("{name} convrot group"))?;
     let wscale = base.tensor::<f32>(s, &format!("{name}.wscale"), rows)?;
     let (qweight, owned) = if let Some((ptr, packed)) = slot {
         (
