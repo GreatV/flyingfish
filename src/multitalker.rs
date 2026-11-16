@@ -352,14 +352,19 @@ pub fn transcribe(
     let mut stream = model.encoder.multitalker_stream(4)?;
     let mut dstream = model.decode_stream()?;
     // The published wrapper converts a lane's hypothesis timestamps to clip
-    // times as `offset(step) + row x frame_seconds` (SpeakerTaggedASR
-    // update_seglsts -> _compute_hypothesis_timestamps), where offset(step) is
-    // the chunk start `step x 14 x frame_seconds` and the row is the lane's
-    // own cumulative ordinal. Per token, the emitting step is recorded so
-    // word and speaker times reproduce that sum.
+    // times as `offset + row x frame_seconds` (SpeakerTaggedASR
+    // update_seglsts -> _compute_hypothesis_timestamps), where the row is
+    // the lane's own cumulative ordinal and `offset` is the chunk start
+    // counted in ACTIVE steps only: a step whose gating finds no speaker
+    // returns before update_seglsts and never advances
+    // `_offset_chunk_start_time` (step_one_chunk's early return), so the
+    // base is the ordinal of the step among those with active speakers, not
+    // the global step. Per token, that ordinal is recorded so word and
+    // speaker times reproduce the sum.
     let rows_per_step = 14u32;
     let mut token_steps: Vec<Vec<u32>> = vec![Vec::new(); 4];
-    for emitted_step in 0u32.. {
+    let mut active_step = 0u32;
+    loop {
         let Some(step) = model.stream_step(&mut session, &mut stream)? else {
             break;
         };
@@ -368,11 +373,15 @@ pub fn transcribe(
             .iter()
             .map(|hyp| hyp.tokens.len())
             .collect();
-        model.decode_step(&mut session, &mut dstream, &step)?;
+        let active = model.decode_step(&mut session, &mut dstream, &step)?;
+        if active.is_empty() {
+            continue;
+        }
         for (lane, hypothesis) in session.hypotheses.iter().enumerate() {
             let grown = hypothesis.tokens.len().saturating_sub(before[lane]);
-            token_steps[lane].extend(std::iter::repeat_n(emitted_step, grown));
+            token_steps[lane].extend(std::iter::repeat_n(active_step, grown));
         }
+        active_step += 1;
     }
     let file = File::open(nemo)?;
     let map = unsafe { MmapOptions::new().map(&file)? };
