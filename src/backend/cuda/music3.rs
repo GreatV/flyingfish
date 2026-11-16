@@ -256,16 +256,6 @@ impl Runtime {
         prompt: usize,
         frames: usize,
         device_limit: usize,
-    ) -> Result<Self> {
-        Self::load_on(model, runtime, prompt, frames, device_limit, 0)
-    }
-
-    pub fn load_on(
-        model: &Path,
-        runtime: &Path,
-        prompt: usize,
-        frames: usize,
-        device_limit: usize,
         ordinal: usize,
     ) -> Result<Self> {
         let ar = ArCheckpoint::open(model)?;
@@ -1417,7 +1407,7 @@ pub(crate) fn generate_inner(
 
     let device_ctx = Device::new(request.device)?;
     let (free, _t) = device_ctx.ctx.mem_get_info()?;
-    let mut ar = Runtime::load_on(
+    let mut ar = Runtime::load(
         model,
         runtime,
         request.prompt_ids.len() / 2,
@@ -1655,7 +1645,7 @@ mod tests {
         let device_limit = std::env::var("FF_MUSIC3_DEVICE_BYTES")
             .context("FF_MUSIC3_DEVICE_BYTES missing")?
             .parse()?;
-        let mut ar = Runtime::load(&model, &scratch, ids.len() / 2, frames, device_limit)?;
+        let mut ar = Runtime::load(&model, &scratch, ids.len() / 2, frames, device_limit, 0)?;
         let placement =
             std::env::var("FF_MUSIC3_PLACEMENT").context("FF_MUSIC3_PLACEMENT missing")?;
         ensure!(
