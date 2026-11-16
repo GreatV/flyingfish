@@ -32,10 +32,24 @@ pub(crate) struct Generated {
     pub audio_latents: (Vec<usize>, Vec<f32>),
     #[cfg(test)]
     pub video_decoded: (Vec<usize>, Vec<f32>),
+    #[cfg(test)]
+    replay: Option<Replay>,
 }
 
 enum NoiseDraws {
     Seed([(u64, u64); 4]),
+    #[cfg(test)]
+    Recorded(ReplayInput),
+}
+
+#[cfg(test)]
+struct ReplayInput {
+    case: &'static str,
+    gate: Rc<std::cell::RefCell<CompositionGate>>,
+    draws: [Vec<f32>; 4],
+    conditioner: Vec<bf16>,
+    anchors: Vec<Vec<f32>>,
+    teacher_inputs: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
 impl NoiseDraws {
@@ -50,8 +64,26 @@ impl NoiseDraws {
             Self::Seed(draws) => {
                 super::draw_normals(&device.stream, normal, draws[index], count, 256)
             }
+            #[cfg(test)]
+            Self::Recorded(input) => {
+                let values = &input.draws[index];
+                ensure!(
+                    values.len() == count && values.iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL recorded draw{index} needs{count} finite values, got{}",
+                    values.len()
+                );
+                Ok(device.stream.clone_htod(values)?)
+            }
         }
     }
+}
+
+#[cfg(test)]
+struct Replay {
+    initial: (Vec<f32>, Vec<f32>),
+    refiner: Vec<bf16>,
+    steps: Vec<super::SampleTrace>,
+    chunks: (usize, usize),
 }
 
 /// Conditioner stage: Qwen3-VL decoder layers `0..TEXT_ENCODER_LAYER` (released on return) map the prompt to the
@@ -475,10 +507,29 @@ fn run_mode<const SETUP_ONLY: bool>(
     };
     let audio = draws.draw(&device, &normal, 3, audio_count)?;
 
+    #[cfg(not(test))]
     let (text, anchors) = (
         condition(&device, &mut blas, model, request)?,
         keyframes(&device, &blas, model, request, posterior_eps.as_ref())?,
     );
+    #[cfg(test)]
+    let (text, anchors) = match &draws {
+        NoiseDraws::Recorded(input) => (input.conditioner.clone(), input.anchors.clone()),
+        NoiseDraws::Seed(_) => (
+            condition(&device, &mut blas, model, request)?,
+            keyframes(&device, &blas, model, request, posterior_eps.as_ref())?,
+        ),
+    };
+    #[cfg(test)]
+    let mut replay = match &draws {
+        NoiseDraws::Recorded(_) => Some(Replay {
+            initial: (Vec::new(), Vec::new()),
+            refiner: Vec::new(),
+            steps: Vec::new(),
+            chunks: (0, 0),
+        }),
+        NoiseDraws::Seed(_) => None,
+    };
 
     let patch = spec.patch;
     let condition_rows = {
@@ -517,6 +568,10 @@ fn run_mode<const SETUP_ONLY: bool>(
         patch,
         &mut video_rows,
     );
+    #[cfg(test)]
+    if let Some(replay) = &mut replay {
+        replay.initial = (video_rows.clone(), s.clone_dtoh(&audio)?);
+    }
 
     let (video, audio, free_before) = {
         let (mut dit, table, adaln_plan, video_grid, audio_grid, scale) = prepare_transformer(
@@ -524,7 +579,14 @@ fn run_mode<const SETUP_ONLY: bool>(
             (transformer, lora, gguf),
             (&spec, &layout, request),
         )?;
-
+        #[cfg(test)]
+        if let Some(replay) = &mut replay {
+            replay.chunks = (dit.work.chunk, dit.text_work.chunk);
+            dit.trace = Some(Vec::new());
+            if let NoiseDraws::Recorded(input) = &draws {
+                dit.trace_gate = Some((input.case, Rc::clone(&input.gate)));
+            }
+        }
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
             s,
@@ -542,7 +604,17 @@ fn run_mode<const SETUP_ONLY: bool>(
             (&video, &audio),
             &text,
         )?;
-
+        #[cfg(test)]
+        if let Some(replay) = &mut replay {
+            replay.steps = dit
+                .trace
+                .take()
+                .context("RUNNER_FAIL sample trace missing")?;
+            replay.refiner = dit
+                .refiner_trace
+                .take()
+                .context("RUNNER_FAIL refiner trace missing")?;
+        }
         let (video, audio) = (s.clone_dtoh(&video)?, s.clone_dtoh(&audio)?);
         (video, audio, device.ctx.mem_get_info()?.0)
     };
@@ -566,7 +638,11 @@ fn run_mode<const SETUP_ONLY: bool>(
         (video_latents, audio_latents),
         (free_before, super::Placement::Derived),
     )?;
-
+    #[cfg(test)]
+    let generated = Generated {
+        replay,
+        ..generated
+    };
     Ok(generated)
 }
 
@@ -697,6 +773,8 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
             ],
             video_decoded,
         ),
+        #[cfg(test)]
+        replay: None,
     })
 }
 
@@ -1118,4 +1196,2032 @@ pub(crate) fn image_pass(
         },
         text,
     ))
+}
+
+#[cfg(test)]
+#[derive(Clone, serde::Deserialize)]
+struct CompositionCell {
+    shape: Vec<usize>,
+    tau_abs: f64,
+    tau_rmse: f64,
+    tau_relative_rmse: f64,
+    gating: bool,
+    gating_metrics: Vec<String>,
+    reference_arms: Vec<String>,
+}
+
+#[cfg(test)]
+#[derive(serde::Deserialize)]
+struct ConditionerReading {
+    cpu_row: Vec<f32>,
+    max_abs: f64,
+    rmse: f64,
+    coordinate_abs: f64,
+}
+
+#[cfg(test)]
+#[derive(serde::Deserialize)]
+struct CompositionFloors {
+    freeze_revision: String,
+    formula: String,
+    native_candidate_run: bool,
+    native_candidate_used_in_floor: bool,
+    r6_qualified: bool,
+    r6_control_checks: usize,
+    conditioner_partition: serde_json::Value,
+    cells: std::collections::BTreeMap<String, CompositionCell>,
+    conditioner_reading: ConditionerReading,
+    stage_controls: std::collections::BTreeMap<String, bool>,
+}
+
+#[cfg(test)]
+pub(super) struct CompositionGate {
+    root: std::path::PathBuf,
+    floors: CompositionFloors,
+    gating: usize,
+    measurements: usize,
+    controls: usize,
+    control_failed: bool,
+    defects: Vec<String>,
+    seen: std::collections::BTreeSet<String>,
+    capture: Option<(std::path::PathBuf, String)>,
+}
+
+#[cfg(test)]
+pub(super) fn composition_stamp() -> Result<String> {
+    let output = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()?;
+    ensure!(output.status.success(), "Runner FAIL UTC clock command");
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(test)]
+fn composition_values(root: &Path, relative: &str, shape: &[usize]) -> Result<Vec<f64>> {
+    use safetensors::{Dtype, SafeTensors};
+    let path = root.join(relative).with_extension("safetensors");
+    let bytes = std::fs::read(&path).with_context(|| format!("open {}", path.display()))?;
+    let file = SafeTensors::deserialize(&bytes)?;
+    let value = file.tensor("value")?;
+    ensure!(
+        value.shape() == shape,
+        "Runner FAIL {relative} shape {:?} != {shape:?}",
+        value.shape()
+    );
+    let values: Vec<f64> = match value.dtype() {
+        Dtype::F32 => value
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f64::from(f32::from_le_bytes(*b)))
+            .collect(),
+        Dtype::F64 => value
+            .data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
+            .collect(),
+        Dtype::I64 => value
+            .data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b) as f64)
+            .collect(),
+        Dtype::U8 => value.data().iter().map(|&v| f64::from(v)).collect(),
+        other => anyhow::bail!("Runner FAIL {relative} dtype {other:?}"),
+    };
+    ensure!(
+        values.iter().all(|v| v.is_finite()),
+        "Runner FAIL {relative} nonfinite fixture"
+    );
+    Ok(values)
+}
+
+#[cfg(test)]
+impl CompositionGate {
+    fn read(root: &Path) -> Result<Self> {
+        let floors: CompositionFloors =
+            serde_json::from_slice(&std::fs::read(root.join("FROZEN_FLOORS.json"))?)?;
+        ensure!(
+            floors.freeze_revision == "r6-conv"
+                && floors.formula == "max(2 * worst_valid_reference_pair, 1e-6)"
+                && !floors.native_candidate_run
+                && !floors.native_candidate_used_in_floor
+                && floors.r6_qualified
+                && floors.r6_control_checks == 41,
+            "Runner FAIL composition floor declaration"
+        );
+        for stage in [
+            "conditioner",
+            "anchor",
+            "transformer_video",
+            "transformer_audio",
+            "video_decoder",
+            "audio_decoder",
+        ] {
+            ensure!(
+                floors.stage_controls.get(stage) == Some(&true),
+                "Runner FAIL {stage} has no detected reference control"
+            );
+        }
+        for (key, cell) in &floors.cells {
+            ensure!(
+                [cell.tau_abs, cell.tau_rmse, cell.tau_relative_rmse]
+                    .into_iter()
+                    .all(|v| v.is_finite() && v >= 1e-6),
+                "Runner FAIL {key} invalid floor"
+            );
+            ensure!(
+                (cell.gating_metrics == ["max_abs", "rmse"]
+                    || cell.gating_metrics == ["max_abs", "rmse", "relative_rmse"])
+                    && !cell.reference_arms.is_empty(),
+                "Runner FAIL {key} scoring declaration"
+            );
+        }
+        ensure!(
+            !floors
+                .cells
+                .keys()
+                .any(|key| key.starts_with("conditioner-effect/")),
+            "Runner FAIL functional conditioner cells are not composition gates"
+        );
+        for case in ["text", "first", "last", "both"] {
+            for part in ["bulk", "outlier"] {
+                let key = format!("producer/{case}/conditioner/{part}");
+                let cell = floors
+                    .cells
+                    .get(&key)
+                    .context("conditioner subcell missing")?;
+                ensure!(
+                    cell.gating == (case == "text")
+                        && cell.gating_metrics == ["max_abs", "rmse"]
+                        && cell.reference_arms == ["arm-a", "arm-b", "arm-e"],
+                    "Runner FAIL {key} conditioner status or references"
+                );
+            }
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            floors,
+            gating: 0,
+            measurements: 0,
+            controls: 0,
+            control_failed: false,
+            defects: Vec::new(),
+            seen: std::collections::BTreeSet::new(),
+            capture: None,
+        })
+    }
+
+    fn complete(&self, case: &str, conv_only: bool) -> Result<()> {
+        let expected: std::collections::BTreeSet<_> = self
+            .floors
+            .cells
+            .iter()
+            .filter(|(key, floor)| {
+                let conv = (key.starts_with("producer/") && key.contains("/anchor-"))
+                    || (key.starts_with("replay/") && key.contains("/decoded-"));
+                floor.gating && key.split('/').nth(1) == Some(case) && (!conv_only || conv)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        ensure!(
+            !expected.is_empty() && self.seen == expected,
+            "Runner FAIL case={case} gating coverage missing={:?} extra={:?}",
+            expected.difference(&self.seen).collect::<Vec<_>>(),
+            self.seen.difference(&expected).collect::<Vec<_>>()
+        );
+        if conv_only {
+            let cells = match case {
+                "text" => 3,
+                "first" | "last" => 4,
+                "both" => 5,
+                _ => anyhow::bail!("Runner FAIL unknown conv case {case}"),
+            };
+            ensure!(
+                expected.len() == cells
+                    && expected
+                        .iter()
+                        .all(|key| self.floors.cells[key].reference_arms
+                            == ["arm-a", "arm-b", "arm-f"])
+                    && self.gating == cells * 3
+                    && self.controls == 0
+                    && !self.control_failed,
+                "Runner FAIL case={case} conv cells, references or comparison count"
+            );
+            return Ok(());
+        }
+        let exact = expected
+            .iter()
+            .filter(|key| key.starts_with("replay/") && key.contains("/decoder-"))
+            .count();
+        let comparisons = expected
+            .iter()
+            .filter(|key| !(key.starts_with("replay/") && key.contains("/decoder-")))
+            .map(|key| self.floors.cells[key].reference_arms.len())
+            .sum::<usize>()
+            + usize::from(case == "first" || case == "both");
+        let controls = if case == "text" { 2 } else { 0 };
+        ensure!(
+            exact == 2
+                && self.gating == comparisons
+                && self.controls == controls
+                && !self.control_failed,
+            "Runner FAIL case={case} comparison count or control strength"
+        );
+        Ok(())
+    }
+
+    fn values(&self, relative: &str, shape: &[usize]) -> Result<Vec<f64>> {
+        composition_values(&self.root, relative, shape)
+    }
+
+    fn f32(&self, relative: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        let values: Vec<f32> = self
+            .values(relative, shape)?
+            .into_iter()
+            .map(|v| v as f32)
+            .collect();
+        ensure!(
+            values.iter().all(|v| v.is_finite()),
+            "Runner FAIL {relative} F32 overflow"
+        );
+        Ok(values)
+    }
+
+    fn exact<A: crate::verify::Scalar>(
+        &self,
+        relative: &str,
+        candidate: &[A],
+        shape: &[usize],
+    ) -> Result<()> {
+        let reference = self.values(relative, shape)?;
+        ensure!(
+            candidate.len() == reference.len()
+                && candidate
+                    .iter()
+                    .zip(&reference)
+                    .all(|(&a, &b)| a.to_f64().to_bits() == b.to_bits()),
+            "Runner FAIL {relative} input bits differ"
+        );
+        println!(
+            "HYPERFLOW_EXACT PASS input={relative} shape={shape:?} bits=0 utc={}",
+            composition_stamp()?
+        );
+        Ok(())
+    }
+
+    fn media(&mut self, case: &str, mode: &str, generated: &Generated) -> Result<()> {
+        let (shape, decoded) = &generated.video_decoded;
+        ensure!(
+            shape.len() == 5
+                && shape[0] == 1
+                && shape[1] == 3
+                && shape[2] >= 124
+                && shape[3] == 768
+                && shape[4] == 1344
+                && decoded.len() == shape.iter().product::<usize>(),
+            "Runner FAIL decoded video shape {shape:?}"
+        );
+        let pixels = 768 * 1344;
+        let mut sample = Vec::with_capacity(3 * 5 * pixels);
+        for channel in 0..3 {
+            for frame in [0, 31, 62, 93, 123] {
+                let start = (channel * shape[2] + frame) * pixels;
+                sample.extend_from_slice(&decoded[start..start + pixels]);
+            }
+        }
+        let mut statistics = Vec::with_capacity(124 * 3 * 4);
+        for frame in 0..124 {
+            for channel in 0..3 {
+                let start = (channel * shape[2] + frame) * pixels;
+                let plane = &decoded[start..start + pixels];
+                ensure!(
+                    plane.iter().all(|v| v.is_finite()),
+                    "Runner FAIL decoder nonfinite frame={frame}"
+                );
+                let mean = plane.iter().map(|v| f64::from(*v)).sum::<f64>() / pixels as f64;
+                let variance = plane
+                    .iter()
+                    .map(|v| (f64::from(*v) - mean).powi(2))
+                    .sum::<f64>()
+                    / pixels as f64;
+                let lo = plane
+                    .iter()
+                    .map(|v| f64::from(*v))
+                    .fold(f64::INFINITY, f64::min);
+                let hi = plane
+                    .iter()
+                    .map(|v| f64::from(*v))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                statistics.extend([mean, variance.sqrt(), lo, hi]);
+            }
+        }
+        let source = if mode == "replay" { "replay-a" } else { "a" };
+        for (role, values, extent) in [
+            (
+                "decoded-video-sample",
+                sample.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
+                vec![1, 3, 5, 768, 1344],
+            ),
+            ("decoded-video-stats", statistics, vec![124, 3, 4]),
+            (
+                "decoded-audio",
+                generated
+                    .output
+                    .audio
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .collect(),
+                vec![2, 165600],
+            ),
+        ] {
+            self.score(
+                &format!("{mode}/{case}/{role}"),
+                &format!("{source}/{case}/{role}"),
+                &values,
+                &extent,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn begin_cell(&mut self, key: &str, shape: &[usize]) -> Result<()> {
+        let floor = self
+            .floors
+            .cells
+            .get(key)
+            .with_context(|| format!("Runner FAIL missing floor {key}"))?;
+        ensure!(
+            floor.shape == shape,
+            "Runner FAIL {key} candidate shape {shape:?} != {:?}",
+            floor.shape
+        );
+        if floor.gating {
+            ensure!(
+                self.seen.insert(key.to_owned()),
+                "Runner FAIL duplicate gating cell {key}"
+            );
+        }
+        Ok(())
+    }
+
+    fn score_values<A: crate::verify::Scalar>(
+        &mut self,
+        key: &str,
+        arm: &str,
+        candidate: &[A],
+        reference: &[f64],
+    ) -> Result<()> {
+        let floor = self
+            .floors
+            .cells
+            .get(key)
+            .context("Runner FAIL score cell")?;
+        let m = crate::verify::metrics(key, candidate, reference)?;
+        let pass = m.max_abs <= floor.tau_abs
+            && m.rmse <= floor.tau_rmse
+            && (!floor.gating_metrics.iter().any(|v| v == "relative_rmse")
+                || m.rel_rmse <= floor.tau_relative_rmse);
+        let result = if !floor.gating {
+            "MEASUREMENT"
+        } else if pass {
+            "PASS"
+        } else {
+            "DEFECT"
+        };
+        println!(
+            "HYPERFLOW_CELL {result} cell={key} reference={arm} max_abs={} rmse={} relative_rmse={} tau_abs={} tau_rmse={} tau_relative_rmse={} utc={}",
+            m.max_abs,
+            m.rmse,
+            m.rel_rmse,
+            floor.tau_abs,
+            floor.tau_rmse,
+            floor.tau_relative_rmse,
+            composition_stamp()?
+        );
+        if floor.gating {
+            self.gating += 1;
+            if !pass {
+                self.defects.push(format!("{key}/{arm}"));
+            }
+        } else {
+            self.measurements += 1;
+        }
+        Ok(())
+    }
+
+    fn score<A: crate::verify::Scalar>(
+        &mut self,
+        key: &str,
+        relative: &str,
+        candidate: &[A],
+        shape: &[usize],
+    ) -> Result<()> {
+        self.begin_cell(key, shape)?;
+        if let Some((directory, device)) = &self.capture {
+            let file = directory.join(key.replace('/', "-"));
+            if key.ends_with("decoded-video-stats") {
+                let path = file.with_extension("json");
+                ensure!(!path.exists(), "Runner FAIL capture already exists");
+                let values: Vec<_> = candidate.iter().map(|&v| v.to_f64()).collect();
+                ensure!(
+                    values.iter().all(|v| v.is_finite()),
+                    "Runner FAIL capture nonfinite"
+                );
+                std::fs::write(
+                    path,
+                    serde_json::to_vec(&serde_json::json!({"shape":shape,"value":values}))?,
+                )?;
+            } else {
+                let path = file.with_extension("safetensors");
+                ensure!(!path.exists(), "Runner FAIL capture already exists");
+                let mut trace = crate::trace::Trace::default();
+                trace.set_device(device)?;
+                trace.add(
+                    "value".into(),
+                    shape.to_vec(),
+                    candidate.iter().map(|&v| v.to_f64() as f32).collect(),
+                )?;
+                trace.save(&path)?;
+            }
+        }
+        for arm in self.floors.cells[key].reference_arms.clone() {
+            let reference = self.values(&format!("{arm}/{relative}"), shape)?;
+            self.score_values(key, &arm, candidate, &reference)?;
+        }
+        Ok(())
+    }
+
+    fn conditioner(&mut self, case: &str, values: &[bf16]) -> Result<()> {
+        ensure!(
+            values.len().is_multiple_of(5120),
+            "Runner FAIL conditioner extent"
+        );
+        let rows = values.len() / 5120;
+        let outliers: Vec<usize> =
+            serde_json::from_value(self.floors.conditioner_partition["outlier_channels"].clone())?;
+        ensure!(
+            !outliers.is_empty()
+                && outliers.len() < 5120
+                && outliers.windows(2).all(|v| v[0] < v[1])
+                && outliers.iter().all(|&v| v < 5120),
+            "Runner FAIL conditioner partition"
+        );
+        for (part, is_outlier) in [("bulk", false), ("outlier", true)] {
+            let channels: Vec<_> = (0..5120)
+                .filter(|c| outliers.binary_search(c).is_ok() == is_outlier)
+                .collect();
+            let actual: Vec<_> = values
+                .as_chunks::<5120>()
+                .0
+                .iter()
+                .flat_map(|row| channels.iter().map(|&c| row[c]))
+                .collect();
+            let key = format!("producer/{case}/conditioner/{part}");
+            self.begin_cell(&key, &[1, rows, channels.len()])?;
+            for arm in self.floors.cells[&key].reference_arms.clone() {
+                let full = self.values(
+                    &format!("{arm}/producer-a/{case}/conditioner"),
+                    &[1, rows, 5120],
+                )?;
+                let reference: Vec<_> = full
+                    .as_chunks::<5120>()
+                    .0
+                    .iter()
+                    .flat_map(|row| channels.iter().map(|&c| row[c]))
+                    .collect();
+                self.score_values(&key, &arm, &actual, &reference)?;
+            }
+        }
+        if case == "both" {
+            let refs = ["arm-a", "arm-b", "arm-e"].map(|arm| -> Result<f64> {
+                Ok(self.values(
+                    &format!("{arm}/producer-a/{case}/conditioner"),
+                    &[1, rows, 5120],
+                )?[1953 * 5120 + 731])
+            });
+            let [a, b, e] = refs;
+            println!(
+                "HYPERFLOW_NAMED_MEASUREMENT cell=producer/both/conditioner/row1953-column731 native={} reference_a={} reference_b={} reference_e={} gating=false",
+                values[1953 * 5120 + 731],
+                a?,
+                b?,
+                e?
+            );
+            self.measurements += 1;
+        }
+        Ok(())
+    }
+
+    pub(super) fn sample_step(
+        &mut self,
+        case: &str,
+        i: usize,
+        step: &super::SampleTrace,
+    ) -> Result<()> {
+        let common = format!("common/a/{case}");
+        let video_rows = self.floors.cells[&format!("free/{case}/post-video-{i}")].shape[0];
+        for (role, values, shape) in [
+            ("post-video", &step.video, vec![video_rows, 96]),
+            ("post-audio", &step.audio, vec![414, 32]),
+            ("velocity-video", &step.video_velocity, vec![37296, 96]),
+            ("velocity-audio", &step.audio_velocity, vec![414, 32]),
+        ] {
+            self.score(
+                &format!("free/{case}/{role}-{i}"),
+                &format!("a/{case}/{role}-{i}"),
+                values,
+                &shape,
+            )?;
+        }
+        let prefix = (video_rows - 37296) * 96;
+        let initial = self.values(&format!("{common}/enter-video-0"), &[video_rows, 96])?;
+        ensure!(
+            step.video[..prefix]
+                .iter()
+                .zip(&initial[..prefix])
+                .all(|(&a, &b)| f64::from(a).to_bits() == b.to_bits()),
+            "Runner FAIL conditioning prefix changed step{i}"
+        );
+        println!(
+            "HYPERFLOW_FORWARD case={case} phase=free step={i} state=COMPLETE utc={}",
+            composition_stamp()?
+        );
+        Ok(())
+    }
+
+    fn conditioner_reading(&mut self, values: &[bf16]) -> Result<()> {
+        let row = values
+            .get(20 * 5120..21 * 5120)
+            .context("Runner FAIL conditioner row20")?;
+        let rule = &self.floors.conditioner_reading;
+        let m = crate::verify::metrics("conditioner-F32-row", row, &rule.cpu_row)?;
+        let coordinate = f64::from(row[731].to_f32());
+        let delta = (coordinate - f64::from(rule.cpu_row[731])).abs();
+        let pass = m.max_abs <= rule.max_abs && m.rmse <= rule.rmse && delta <= rule.coordinate_abs;
+        println!(
+            "HYPERFLOW_CONDITIONER_READING {} row=20 column=731 native={coordinate} cpu_f32={} distance={delta} allowed_coordinate={} max_abs={} allowed_max_abs={} rmse={} allowed_rmse={} utc={}",
+            if pass { "PASS" } else { "DEFECT" },
+            rule.cpu_row[731],
+            rule.coordinate_abs,
+            m.max_abs,
+            rule.max_abs,
+            m.rmse,
+            rule.rmse,
+            composition_stamp()?
+        );
+        self.gating += 1;
+        if !pass {
+            self.defects.push("conditioner/F32-row".into());
+        }
+        Ok(())
+    }
+
+    fn handoff_control(&mut self, stream: &str, values: &[f32]) -> Result<()> {
+        let swapped: Vec<_> = match stream {
+            "audio" => {
+                ensure!(
+                    values.len() == 414 * 32,
+                    "Runner FAIL teacher audio control extent"
+                );
+                values[207 * 32..]
+                    .iter()
+                    .chain(&values[..207 * 32])
+                    .copied()
+                    .collect()
+            }
+            "video" => {
+                ensure!(
+                    values.len() == 37296 * 96,
+                    "Runner FAIL teacher video control extent"
+                );
+                values
+                    .as_chunks::<96>()
+                    .0
+                    .iter()
+                    .flat_map(|row| row[48..].iter().chain(&row[..48]))
+                    .copied()
+                    .collect()
+            }
+            _ => anyhow::bail!("Runner FAIL unknown teacher control stream {stream}"),
+        };
+        let key = format!("teacher/text/teacher-{stream}-3");
+        let floor = self
+            .floors
+            .cells
+            .get(&key)
+            .context("Runner FAIL handoff control floor")?;
+        let shape = if stream == "video" {
+            [37296, 96]
+        } else {
+            [414, 32]
+        };
+        for arm in ["arm-a", "arm-b"] {
+            let reference = self.values(&format!("{arm}/a/text/teacher-{stream}-3"), &shape)?;
+            let m = crate::verify::metrics(&key, &swapped, &reference)?;
+            let ratios = [
+                m.max_abs / floor.tau_abs,
+                m.rmse / floor.tau_rmse,
+                m.rel_rmse / floor.tau_relative_rmse,
+            ];
+            let detected = ratios.into_iter().any(|r| r > 3.0);
+            println!(
+                "HYPERFLOW_CONTROL {} cell={key} reference={arm} channel_block_swap=true factor=3 ratio_abs={} ratio_rmse={} ratio_relative_rmse={} utc={}",
+                if detected { "PASS" } else { "FAIL" },
+                ratios[0],
+                ratios[1],
+                ratios[2],
+                composition_stamp()?
+            );
+            self.control_failed |= !detected;
+        }
+        self.controls += 1;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU; FF_MODEL, FF_HYPERFLOW_MODEL, FF_HYPERFLOW_COMPOSITION, FF_HYPERFLOW_CASE and FF_H3_CAPTURE"]
+fn hyperflow_anchor_and_decoders_match_frozen_references() -> Result<()> {
+    conv_decoder_gate::<false>(true, super::Placement::Derived)
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU; published F32 decoder references and capture directory"]
+fn minimax_video_decoder_matches_frozen_references() -> Result<()> {
+    conv_decoder_gate::<false>(false, super::Placement::Derived)
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU; published F32 decoder references and capture directory"]
+fn hyperflow_streamed_decoder_matches_frozen_references() -> Result<()> {
+    conv_decoder_gate::<false>(true, super::Placement::Streamed)
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU; published F32 decoder references and capture directory"]
+fn minimax_streamed_decoder_matches_frozen_references() -> Result<()> {
+    conv_decoder_gate::<false>(false, super::Placement::Streamed)
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU; published F32 decoder references and capture directory"]
+fn hyperflow_serial_decoder_matches_frozen_references() -> Result<()> {
+    conv_decoder_gate::<true>(true, super::Placement::Derived)
+}
+
+#[cfg(test)]
+fn conv_decoder_gate<const SERIAL: bool>(
+    hyperflow: bool,
+    placement: super::Placement,
+) -> Result<()> {
+    use crate::minimax_h3::{KeyframeAnchor, prepare_video};
+    use crate::serve::image::RgbImage;
+    let path = |key| {
+        std::env::var_os(key)
+            .map(std::path::PathBuf::from)
+            .with_context(|| format!("{key} missing"))
+    };
+    let case = std::env::var("FF_HYPERFLOW_CASE").context("FF_HYPERFLOW_CASE missing")?;
+    let model = path("FF_MODEL")?;
+    let component = if hyperflow {
+        path("FF_HYPERFLOW_MODEL")?
+    } else {
+        model.join("transformer")
+    };
+    let spec = H3Spec::parse(&serde_json::from_slice(&std::fs::read(
+        component.join("config.json"),
+    )?)?)?;
+    ensure!(
+        spec.is_hyperflow()? == hyperflow,
+        "Runner FAIL HyperFlow component required"
+    );
+    let mut gate = CompositionGate::read(&path("FF_HYPERFLOW_COMPOSITION")?)?;
+    let out = path("FF_H3_CAPTURE")?;
+    std::fs::create_dir_all(&out)?;
+    let image = |height, width, offset| RgbImage {
+        height,
+        width,
+        pixels: (0..height * width * 3)
+            .map(|i| ((i * 73 + offset) % 251) as u8)
+            .collect(),
+    };
+    let (first, last) = (image(273, 481, 17), image(389, 267, 83));
+    let anchors = match case.as_str() {
+        "text" => vec![],
+        "first" => vec![(KeyframeAnchor::First, &first)],
+        "last" => vec![(KeyframeAnchor::Last, &first)],
+        "both" => vec![
+            (KeyframeAnchor::First, &first),
+            (KeyframeAnchor::Last, &last),
+        ],
+        _ => anyhow::bail!("Runner FAIL unknown conv case {case}"),
+    };
+    let request = prepare_video(
+        &model,
+        &spec,
+        "A small animal walks beside a wooden bridge in warm daylight.",
+        &anchors,
+        ((124, 42), (6, (12.0, 3.0))),
+    )?;
+    let (geometry, _) = request.layout(&spec)?;
+    let vae = VaeSpec::read(&model)?;
+    let audio = AudioVaeSpec::read(&model)?;
+    let video_shape = [
+        1,
+        vae.latent_channels,
+        geometry.latent_frames,
+        geometry.latent_height,
+        geometry.latent_width,
+    ];
+    let anchor_shape = [
+        1,
+        vae.latent_channels,
+        1,
+        geometry.latent_height,
+        geometry.latent_width,
+    ];
+    ensure!(
+        video_shape == [1, 24, 37, 48, 84]
+            && request.height == 768
+            && request.width == 1344
+            && geometry.frames == 124,
+        "Runner FAIL conv production geometry"
+    );
+    for (i, (_, pixels)) in request.keyframes.iter().enumerate() {
+        let values: Vec<_> = pixels.iter().map(|&v| f64::from(v)).collect();
+        gate.exact(
+            &format!("prepared/{case}/keyframe-{i}"),
+            &values,
+            &[3, 768, 1344],
+        )?;
+    }
+    let runtime = std::env::temp_dir().join(format!("ff-hyperflow-conv-{}", std::process::id()));
+    std::fs::create_dir(&runtime)?;
+    let result = (|| -> Result<()> {
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(false, "HyperFlow conv cells".into())),
+        )?;
+        gate.capture = Some((out.clone(), device.info.name.clone()));
+        println!(
+            "HYPERFLOW_CONV_CASE_START case={case} conditioner_forwards=0 dit_forwards=0 utc={}",
+            composition_stamp()?
+        );
+        let eps = if request.keyframes.is_empty() {
+            None
+        } else {
+            let values = gate.f32(&format!("common/a/{case}/posterior-eps-0"), &anchor_shape)?;
+            if request.keyframes.len() == 2 {
+                gate.exact(
+                    &format!("common/a/{case}/posterior-eps-1"),
+                    &values,
+                    &anchor_shape,
+                )?;
+            }
+            Some(device.stream.clone_htod(&values)?)
+        };
+        let produced = keyframes(&device, &blas, &model, &request, eps.as_ref())?;
+        ensure!(
+            produced.len() == anchors.len(),
+            "Runner FAIL conv anchor count"
+        );
+        for (i, values) in produced.iter().enumerate() {
+            gate.score(
+                &format!("producer/{case}/anchor-{i}"),
+                &format!("producer-a/{case}/anchor-{i}"),
+                values,
+                &anchor_shape,
+            )?;
+        }
+        let video = gate.f32(
+            &format!("arm-a/replay-a/{case}/decoder-video-input"),
+            &video_shape,
+        )?;
+        let audio_input = gate.f32(
+            &format!("arm-a/replay-a/{case}/decoder-audio-input"),
+            &[2, 32, 207],
+        )?;
+        let generated = decode::<false, SERIAL>(
+            &device,
+            &mut blas,
+            &model,
+            &request,
+            (&geometry, &vae, &audio),
+            (video, audio_input),
+            (device.ctx.mem_get_info()?.0, placement),
+        )?;
+        gate.exact(
+            &format!("arm-a/replay-a/{case}/decoder-video-input"),
+            &generated.video_latents.1,
+            &video_shape,
+        )?;
+        gate.exact(
+            &format!("arm-a/replay-a/{case}/decoder-audio-input"),
+            &generated.audio_latents.1,
+            &[2, 32, 207],
+        )?;
+        gate.media(&case, "replay", &generated)?;
+        gate.complete(&case, true)?;
+        Ok(())
+    })();
+    let cleanup = std::fs::remove_dir_all(&runtime);
+    result?;
+    cleanup?;
+    let pass = gate.defects.is_empty();
+    println!(
+        "HYPERFLOW_CONV_CASE_COMPLETE case={case} result={} gating_comparisons={} defects={} conditioner_forwards=0 dit_forwards=0 utc={}",
+        if pass { "PASS" } else { "DEFECT" },
+        gate.gating,
+        gate.defects.len(),
+        composition_stamp()?
+    );
+    ensure!(pass, "DEFECT conv cells {:?}", gate.defects);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU; FF_MODEL, FF_HYPERFLOW_MODEL, FF_HYPERFLOW_COMPOSITION fixtures and FF_HYPERFLOW_CASE"]
+fn hyperflow_composition_matches_frozen_references() -> Result<()> {
+    use crate::minimax_h3::{KeyframeAnchor, prepare_video};
+    use crate::serve::image::RgbImage;
+    let path = |key| {
+        std::env::var_os(key)
+            .map(std::path::PathBuf::from)
+            .with_context(|| format!("{key} missing"))
+    };
+    let selected = std::env::var("FF_HYPERFLOW_CASE").context("FF_HYPERFLOW_CASE missing")?;
+    ensure!(
+        matches!(selected.as_str(), "text" | "first" | "last" | "both"),
+        "Runner FAIL unknown composition case {selected}"
+    );
+    let (model, component) = (path("FF_MODEL")?, path("FF_HYPERFLOW_MODEL")?);
+    let spec = H3Spec::parse(&serde_json::from_slice(&std::fs::read(
+        component.join("config.json"),
+    )?)?)?;
+    ensure!(
+        spec.is_hyperflow()?,
+        "setup needs the HyperFlow fl2va component"
+    );
+    let shared_gate = Rc::new(std::cell::RefCell::new(CompositionGate::read(&path(
+        "FF_HYPERFLOW_COMPOSITION",
+    )?)?));
+    let vae = VaeSpec::read(&model)?;
+    let audio_spec = AudioVaeSpec::read(&model)?;
+    let image = |height, width, offset| RgbImage {
+        height,
+        width,
+        pixels: (0..height * width * 3)
+            .map(|i| ((i * 73 + offset) % 251) as u8)
+            .collect(),
+    };
+    let (first, last) = (image(273, 481, 17), image(389, 267, 83));
+    let runtime =
+        std::env::temp_dir().join(format!("ff-hyperflow-composition-{}", std::process::id()));
+    std::fs::create_dir(&runtime)?;
+    let result = (|| -> Result<bool> {
+        let mut cases = Vec::new();
+        for (case, anchors) in [
+            ("text", vec![]),
+            ("first", vec![(KeyframeAnchor::First, &first)]),
+            ("last", vec![(KeyframeAnchor::Last, &first)]),
+            (
+                "both",
+                vec![
+                    (KeyframeAnchor::First, &first),
+                    (KeyframeAnchor::Last, &last),
+                ],
+            ),
+        ]
+        .into_iter()
+        .filter(|(case, _)| *case == selected)
+        {
+            let mut gate = shared_gate.borrow_mut();
+            let request = prepare_video(
+                &model,
+                &spec,
+                "A small animal walks beside a wooden bridge in warm daylight.",
+                &anchors,
+                ((124, 42), (6, (12.0, 3.0))),
+            )?;
+            let (geometry, layout) = request.layout(&spec)?;
+            let common = format!("common/a/{case}");
+            let anchor_count = request.keyframes.len();
+            let (text_rows, video_rows, audio_rows) = (
+                request.token_ids.len(),
+                layout.video_indices.len(),
+                layout.audio_indices.len(),
+            );
+            let video_shape = [
+                1,
+                vae.latent_channels,
+                geometry.latent_frames,
+                geometry.latent_height,
+                geometry.latent_width,
+            ];
+            let anchor_shape = [
+                1,
+                vae.latent_channels,
+                1,
+                geometry.latent_height,
+                geometry.latent_width,
+            ];
+            ensure!(
+                video_shape == [1, 24, 37, 48, 84]
+                    && audio_rows == 414
+                    && spec.video_row_width() == 96,
+                "Runner FAIL production geometry"
+            );
+            gate.exact(
+                &format!("{common}/input_ids"),
+                &request
+                    .token_ids
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .collect::<Vec<_>>(),
+                &[1, text_rows],
+            )?;
+            gate.exact(
+                &format!("{common}/token_tags"),
+                &layout
+                    .token_tags
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .collect::<Vec<_>>(),
+                &[layout.rows()],
+            )?;
+            gate.exact(
+                &format!("{common}/position_ids"),
+                &layout
+                    .position_ids
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                &[layout.rows(), 3],
+            )?;
+            for (role, ids) in [
+                ("video_indices", &layout.video_indices),
+                ("audio_indices", &layout.audio_indices),
+                ("text_indices", &layout.text_indices),
+            ] {
+                gate.exact(
+                    &format!("{common}/{role}"),
+                    &ids.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+                    &[ids.len()],
+                )?;
+            }
+            for (i, step) in hyperflow_steps(6)?.iter().enumerate() {
+                let row = RowTimesteps::hyperflow(&layout, step);
+                gate.exact(
+                    &format!("{common}/t-{i}"),
+                    &row.timesteps,
+                    &[row.timesteps.len()],
+                )?;
+                gate.exact(
+                    &format!("{common}/r-{i}"),
+                    &row.endpoints,
+                    &[row.endpoints.len()],
+                )?;
+                gate.exact(
+                    &format!("{common}/time-indices-{i}"),
+                    &row.indices
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect::<Vec<_>>(),
+                    &[layout.rows()],
+                )?;
+            }
+            let input = {
+                let load =
+                    |role: &str, shape: &[usize]| gate.f32(&format!("{common}/{role}"), shape);
+                let posterior = if anchor_count == 0 {
+                    Vec::new()
+                } else {
+                    load("posterior-eps-0", &anchor_shape)?
+                };
+                if anchor_count == 2 {
+                    gate.exact(
+                        &format!("{common}/posterior-eps-1"),
+                        &posterior,
+                        &anchor_shape,
+                    )?;
+                }
+                let mut anchor_draws = Vec::new();
+                let mut reference_anchors = Vec::new();
+                for i in 0..anchor_count {
+                    anchor_draws.extend(load(&format!("noise-{i}"), &anchor_shape)?);
+                    reference_anchors.push(load(&format!("anchor-{i}"), &anchor_shape)?);
+                }
+                let mut teachers = Vec::new();
+                for i in 0..6 {
+                    teachers.push((
+                        load(&format!("enter-video-{i}"), &[video_rows, 96])?,
+                        load(&format!("enter-audio-{i}"), &[audio_rows, 32])?,
+                    ));
+                }
+                ReplayInput {
+                    case,
+                    gate: Rc::clone(&shared_gate),
+                    draws: [
+                        posterior,
+                        anchor_draws,
+                        load(&format!("noise-{anchor_count}"), &video_shape)?,
+                        load(&format!("noise-{}", anchor_count + 1), &[audio_rows, 32])?,
+                    ],
+                    conditioner: load("conditioner", &[1, text_rows, 5120])?
+                        .into_iter()
+                        .map(bf16::from_f32)
+                        .collect(),
+                    anchors: reference_anchors,
+                    teacher_inputs: teachers,
+                }
+            };
+            println!(
+                "HYPERFLOW_CASE_START case={case} phase=producer utc={}",
+                composition_stamp()?
+            );
+            {
+                let device = Device::new(0)?;
+                let ops = Ops::new(&device.ctx)?;
+                let mut blas = Blas::new(
+                    &device,
+                    &ops,
+                    &runtime,
+                    Rc::new(Closure::new(false, "HyperFlow producers".into())),
+                )?;
+                let conditioner = condition(&device, &mut blas, &model, &request)?;
+                gate.conditioner(case, &conditioner)?;
+                if case == "both" {
+                    gate.conditioner_reading(&conditioner)?;
+                }
+                let posterior = if anchor_count == 0 {
+                    None
+                } else {
+                    Some(device.stream.clone_htod(&input.draws[0])?)
+                };
+                let produced = keyframes(&device, &blas, &model, &request, posterior.as_ref())?;
+                ensure!(
+                    produced.len() == anchor_count,
+                    "Runner FAIL producer anchor count"
+                );
+                for (i, anchor) in produced.iter().enumerate() {
+                    gate.score(
+                        &format!("producer/{case}/anchor-{i}"),
+                        &format!("producer-a/{case}/anchor-{i}"),
+                        anchor,
+                        &anchor_shape,
+                    )?;
+                }
+                if case == "first" {
+                    let mut control = request.clone();
+                    control.pixel_values =
+                        gate.f32("arm-a/media-control/first/pixel_values", &[4032, 1536])?;
+                    ensure!(
+                        control.pixel_values != request.pixel_values,
+                        "Runner FAIL media-control input identical"
+                    );
+                    let output = condition(&device, &mut blas, &model, &control)?;
+                    let distance =
+                        crate::verify::metrics("conditioner-media-control", &output, &conditioner)?;
+                    let reached = !distance.exact;
+                    println!(
+                        "HYPERFLOW_MEDIA {} ids_grids_equal=true pixels_different=true conditioner_different={reached} max_abs={} rmse={} utc={}",
+                        if reached { "PASS" } else { "DEFECT" },
+                        distance.max_abs,
+                        distance.rmse,
+                        composition_stamp()?
+                    );
+                    gate.gating += 1;
+                    if !reached {
+                        gate.defects.push("conditioner/media-control".into());
+                    }
+                }
+            }
+            drop(gate);
+            cases.push((case, request, input));
+        }
+        for (case, request, input) in &cases {
+            let mut gate = shared_gate.borrow_mut();
+            let device = Device::new(0)?;
+            let ops = Ops::new(&device.ctx)?;
+            let mut blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(false, "HyperFlow teacher".into())),
+            )?;
+            let (_, layout) = request.layout(&spec)?;
+            let (mut dit, table, plan, _, _, scale) = prepare_transformer(
+                (&device, &mut blas),
+                (&component, None, None),
+                (&spec, &layout, request),
+            )?;
+            ensure!(
+                input.teacher_inputs.len() == plan.row_pairs.len(),
+                "Runner FAIL teacher step count"
+            );
+            let kernels = BlockKernels::new(&device.ctx)?;
+            let context = BlockContext {
+                s: &device.stream,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: scale,
+            };
+            let text = device.stream.clone_htod(&input.conditioner)?;
+            println!(
+                "HYPERFLOW_CASE_START case={case} phase=teacher steps=6 utc={}",
+                composition_stamp()?
+            );
+            for (i, (video, audio)) in input.teacher_inputs.iter().enumerate() {
+                println!(
+                    "HYPERFLOW_FORWARD case={case} phase=teacher step={i} state=START utc={}",
+                    composition_stamp()?
+                );
+                let s = &device.stream;
+                let video = s.clone_htod(video)?;
+                let audio = s.clone_htod(audio)?;
+                let row_pairs = s.clone_htod(&plan.row_pairs[i])?;
+                let row_timesteps = s.clone_htod(&plan.row_timesteps[i])?;
+                dit.step(
+                    &context,
+                    &table,
+                    (
+                        u32::try_from(plan.pairs.len())?,
+                        u32::try_from(plan.timesteps.len())?,
+                    ),
+                    &super::StepInputs {
+                        video: &video,
+                        audio: &audio,
+                        text: &text,
+                        row_pairs: &row_pairs,
+                        row_timesteps: &row_timesteps,
+                    },
+                )?;
+                let video = s.clone_dtoh(&dit.video)?;
+                let audio = s.clone_dtoh(&dit.audio)?;
+                for (role, values, shape) in
+                    [("video", &video, [37296, 96]), ("audio", &audio, [414, 32])]
+                {
+                    gate.score(
+                        &format!("teacher/{case}/teacher-{role}-{i}"),
+                        &format!("a/{case}/teacher-{role}-{i}"),
+                        values,
+                        &shape,
+                    )?;
+                }
+                if *case == "text" && i == 3 {
+                    gate.handoff_control("video", &video)?;
+                    gate.handoff_control("audio", &audio)?;
+                }
+                println!(
+                    "HYPERFLOW_FORWARD case={case} phase=teacher step={i} state=COMPLETE utc={}",
+                    composition_stamp()?
+                );
+            }
+        }
+        for (case, request, _) in &cases {
+            let mut gate = shared_gate.borrow_mut();
+            println!(
+                "HYPERFLOW_CASE_START case={case} phase=isolated_decoder video_dtype=BF16 audio_dtype=F32 utc={}",
+                composition_stamp()?
+            );
+            let (geometry, layout) = request.layout(&spec)?;
+            let video_shape = [
+                1,
+                vae.latent_channels,
+                geometry.latent_frames,
+                geometry.latent_height,
+                geometry.latent_width,
+            ];
+            let video_rows = layout.video_indices.len();
+            let common = format!("common/a/{case}");
+            let decoded = {
+                let device = Device::new(0)?;
+                let ops = Ops::new(&device.ctx)?;
+                let mut blas = Blas::new(
+                    &device,
+                    &ops,
+                    &runtime,
+                    Rc::new(Closure::new(false, "HyperFlow isolated decoders".into())),
+                )?;
+                let last_video = gate.f32(&format!("{common}/post-video-5"), &[video_rows, 96])?;
+                let last_audio = gate.f32(&format!("{common}/post-audio-5"), &[414, 32])?;
+                let latents = decoder_latents(
+                    (&spec, &vae, &audio_spec),
+                    (&geometry, &layout),
+                    (&last_video, &last_audio),
+                )?;
+                gate.exact(
+                    &format!("arm-a/replay-a/{case}/decoder-video-input"),
+                    &latents.0,
+                    &video_shape,
+                )?;
+                gate.exact(
+                    &format!("arm-a/replay-a/{case}/decoder-audio-input"),
+                    &latents.1,
+                    &[2, 32, 207],
+                )?;
+                for role in ["video", "audio"] {
+                    gate.seen
+                        .insert(format!("replay/{case}/decoder-{role}-input"));
+                }
+                decode::<false, false>(
+                    &device,
+                    &mut blas,
+                    &model,
+                    request,
+                    (&geometry, &vae, &audio_spec),
+                    latents,
+                    (device.ctx.mem_get_info()?.0, super::Placement::Derived),
+                )?
+            };
+            gate.media(case, "replay", &decoded)?;
+        }
+        for (case, request, input) in cases {
+            println!(
+                "HYPERFLOW_CASE_START case={case} phase=free_measurement steps=6 utc={}",
+                composition_stamp()?
+            );
+            let (geometry, layout) = request.layout(&spec)?;
+            let (video_rows, audio_rows, text_rows) = (
+                layout.video_indices.len(),
+                layout.audio_indices.len(),
+                request.token_ids.len(),
+            );
+            let video_shape = [
+                1,
+                vae.latent_channels,
+                geometry.latent_frames,
+                geometry.latent_height,
+                geometry.latent_width,
+            ];
+            let common = format!("common/a/{case}");
+            let generated = run_mode::<false>(
+                (&model, &component),
+                None,
+                &request,
+                (0, &runtime),
+                None,
+                NoiseDraws::Recorded(input),
+            )?;
+            let replay = generated
+                .replay
+                .as_ref()
+                .context("Runner FAIL composition replay missing")?;
+            ensure!(
+                replay.steps.len() == 6,
+                "Runner FAIL composition sample count"
+            );
+            let mut gate = shared_gate.borrow_mut();
+            gate.exact(
+                &format!("{common}/enter-video-0"),
+                &replay.initial.0,
+                &[video_rows, 96],
+            )?;
+            gate.exact(
+                &format!("{common}/enter-audio-0"),
+                &replay.initial.1,
+                &[audio_rows, 32],
+            )?;
+            gate.score(
+                &format!("free/{case}/refiner"),
+                &format!("a/{case}/refiner"),
+                &replay.refiner,
+                &[1, text_rows, spec.hidden],
+            )?;
+            gate.score(
+                &format!("free/{case}/decoder-video-input"),
+                &format!("a/{case}/decoder-video-input"),
+                &generated.video_latents.1,
+                &video_shape,
+            )?;
+            gate.score(
+                &format!("free/{case}/decoder-audio-input"),
+                &format!("a/{case}/decoder-audio-input"),
+                &generated.audio_latents.1,
+                &[2, 32, 207],
+            )?;
+            gate.media(case, "free", &generated)?;
+            println!(
+                "HYPERFLOW_CHAIN case={case} rows={} ffn_chunk={} text_chunk={} forwards=6 prefix_bits=0 utc={}",
+                layout.rows(),
+                replay.chunks.0,
+                replay.chunks.1,
+                composition_stamp()?
+            );
+        }
+        let gate = shared_gate.borrow();
+        gate.complete(&selected, false)?;
+        println!(
+            "{} HYPERFLOW_COMPOSITION case={selected} cases=1 sampler_steps=6 teacher_steps=6 gating_comparisons={} measurements={} controls={} defects={} utc={}",
+            if gate.defects.is_empty() {
+                "PASS"
+            } else {
+                "DEFECT"
+            },
+            gate.gating,
+            gate.measurements,
+            gate.controls,
+            gate.defects.len(),
+            composition_stamp()?
+        );
+        Ok(gate.defects.is_empty())
+    })();
+    let cleanup = std::fs::remove_dir_all(&runtime);
+    let pass = result?;
+    cleanup?;
+    println!(
+        "HYPERFLOW_CASE_COMPLETE case={selected} result={} utc={}",
+        if pass { "PASS" } else { "DEFECT" },
+        composition_stamp()?
+    );
+    ensure!(
+        pass,
+        "DEFECT composition cells {:?}",
+        shared_gate.borrow().defects
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn composition_case_completion_retains_defects_and_rejects_missing_cells() -> Result<()> {
+    let keys = [
+        "teacher/first/teacher-video-1",
+        "replay/first/decoder-video-input",
+        "replay/first/decoder-audio-input",
+        "producer/first/conditioner/bulk",
+    ];
+    let floors = CompositionFloors {
+        freeze_revision: "r6-conv".into(),
+        formula: "max(2 * worst_valid_reference_pair, 1e-6)".into(),
+        native_candidate_run: false,
+        native_candidate_used_in_floor: false,
+        r6_qualified: true,
+        r6_control_checks: 41,
+        conditioner_partition: serde_json::json!({"outlier_channels":[731]}),
+        cells: keys
+            .iter()
+            .map(|key| {
+                (
+                    (*key).into(),
+                    CompositionCell {
+                        shape: vec![1],
+                        tau_abs: 1e-6,
+                        tau_rmse: 1e-6,
+                        tau_relative_rmse: 1e-6,
+                        gating: !key.starts_with("producer/"),
+                        gating_metrics: vec!["max_abs".into(), "rmse".into()],
+                        reference_arms: if key.starts_with("producer/") {
+                            vec!["arm-a".into(), "arm-b".into(), "arm-e".into()]
+                        } else {
+                            vec!["arm-a".into(), "arm-b".into()]
+                        },
+                    },
+                )
+            })
+            .collect(),
+        conditioner_reading: ConditionerReading {
+            cpu_row: Vec::new(),
+            max_abs: 0.0,
+            rmse: 0.0,
+            coordinate_abs: 0.0,
+        },
+        stage_controls: std::collections::BTreeMap::new(),
+    };
+    let mut gate = CompositionGate {
+        root: std::path::PathBuf::new(),
+        floors,
+        gating: 3,
+        measurements: 0,
+        controls: 0,
+        control_failed: false,
+        defects: vec![format!("{}/arm-a", keys[0])],
+        seen: keys
+            .into_iter()
+            .filter(|key| !key.starts_with("producer/"))
+            .map(str::to_owned)
+            .collect(),
+        capture: None,
+    };
+    gate.complete("first", false)?;
+    assert!(!gate.defects.is_empty());
+    gate.score_values(keys[3], "arm-e", &[100.0f32], &[0.0])?;
+    assert_eq!(gate.measurements, 1);
+    assert_eq!(gate.defects.len(), 1);
+    gate.complete("first", false)?;
+    gate.gating -= 1;
+    assert!(gate.complete("first", false).is_err());
+    gate.gating += 1;
+    gate.seen.remove(keys[0]);
+    assert!(gate.complete("first", false).is_err());
+    let conv = [
+        "producer/first/anchor-0",
+        "replay/first/decoded-video-sample",
+        "replay/first/decoded-video-stats",
+        "replay/first/decoded-audio",
+    ];
+    let cell = gate.floors.cells[keys[0]].clone();
+    gate.floors.cells = conv
+        .iter()
+        .map(|key| {
+            let mut cell = cell.clone();
+            cell.reference_arms = vec!["arm-a".into(), "arm-b".into(), "arm-f".into()];
+            ((*key).into(), cell)
+        })
+        .collect();
+    gate.seen = conv.iter().map(|key| (*key).to_owned()).collect();
+    gate.gating = 12;
+    gate.complete("first", true)?;
+    assert!(!gate.defects.is_empty());
+    gate.seen.remove(conv[0]);
+    assert!(gate.complete("first", true).is_err());
+    gate.seen.insert(conv[0].into());
+    gate.gating -= 1;
+    assert!(gate.complete("first", true).is_err());
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConditionerEffectFloor {
+    tau_abs: f64,
+    tau_rmse: f64,
+}
+
+#[cfg(test)]
+fn conditioner_effect_floor(reference: [&[f32]; 3]) -> Result<ConditionerEffectFloor> {
+    let mut floor = ConditionerEffectFloor {
+        tau_abs: 1e-6,
+        tau_rmse: 1e-6,
+    };
+    for (left, right) in [(0, 1), (0, 2), (1, 2)] {
+        let m = crate::verify::metrics(
+            "conditioner-effect-reference",
+            reference[left],
+            reference[right],
+        )?;
+        floor.tau_abs = floor.tau_abs.max(2.0 * m.max_abs);
+        floor.tau_rmse = floor.tau_rmse.max(2.0 * m.rmse);
+    }
+    Ok(floor)
+}
+
+#[cfg(test)]
+#[test]
+fn conditioner_effect_freezes_reference_spread_and_requires_shift_detection() -> Result<()> {
+    let a = [0.0, 1.0, 2.0, 3.0];
+    let b = [0.0, 1.001, 2.0, 3.0];
+    let e = [0.0, 0.999, 2.0, 3.0];
+    let floor = conditioner_effect_floor([&a, &b, &e])?;
+    let worst = crate::verify::metrics("reference-worst", &b, &e)?;
+    assert_eq!(floor.tau_abs, 2.0 * worst.max_abs);
+    assert_eq!(floor.tau_rmse, 2.0 * worst.rmse);
+    let shifted = [3.0, 0.0, 1.0, 2.0];
+    let control = crate::verify::metrics("shift", &shifted, &a)?;
+    assert!(control.max_abs > 3.0 * floor.tau_abs || control.rmse > 3.0 * floor.tau_rmse);
+    let omitted = crate::verify::metrics("omitted-shift", &a, &a)?;
+    assert!(omitted.max_abs <= 3.0 * floor.tau_abs && omitted.rmse <= 3.0 * floor.tau_rmse);
+    let outside = crate::verify::metrics("outside", &shifted, &e)?;
+    assert!(outside.max_abs > floor.tau_abs && outside.rmse > floor.tau_rmse);
+    Ok(())
+}
+
+#[cfg(test)]
+fn conditioner_effect_measurements(
+    case: &str,
+    values: &[bf16],
+    root: &Path,
+    authorization: &serde_json::Value,
+) -> Result<()> {
+    let outliers: Vec<usize> =
+        serde_json::from_value(authorization["conditioner_outlier_channels"].clone())?;
+    ensure!(
+        !outliers.is_empty()
+            && outliers.len() < 5120
+            && outliers.windows(2).all(|v| v[0] < v[1])
+            && outliers.iter().all(|&v| v < 5120)
+            && values.len().is_multiple_of(5120),
+        "Runner FAIL conditioner measurement partition"
+    );
+    let rows = values.len() / 5120;
+    for (part, is_outlier) in [("bulk", false), ("outlier", true)] {
+        let channels: Vec<_> = (0..5120)
+            .filter(|c| outliers.binary_search(c).is_ok() == is_outlier)
+            .collect();
+        let actual: Vec<_> = values
+            .as_chunks::<5120>()
+            .0
+            .iter()
+            .flat_map(|row| channels.iter().map(|&c| row[c]))
+            .collect();
+        let key = format!("producer/{case}/conditioner/{part}");
+        let floor = &authorization["conditioner_measurement_floors"][&key];
+        ensure!(
+            floor["gating"] == false,
+            "Runner FAIL image subcell is not a measurement"
+        );
+        let tau_abs = floor["tau_abs"].as_f64().context("measurement abs floor")?;
+        let tau_rmse = floor["tau_rmse"]
+            .as_f64()
+            .context("measurement RMSE floor")?;
+        for arm in ["arm-a", "arm-b", "arm-e"] {
+            let full = composition_values(
+                root,
+                &format!("{arm}/producer-a/{case}/conditioner"),
+                &[1, rows, 5120],
+            )?;
+            let expected: Vec<_> = full
+                .as_chunks::<5120>()
+                .0
+                .iter()
+                .flat_map(|row| channels.iter().map(|&c| row[c]))
+                .collect();
+            let m = crate::verify::metrics(&key, &actual, &expected)?;
+            println!(
+                "CONDITIONER_SUBCELL_MEASUREMENT cell={key} reference={arm} max_abs={} rmse={} tau_abs={tau_abs} tau_rmse={tau_rmse} gating=false",
+                m.max_abs, m.rmse
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "GPU; merged MMA, explicit reference/native phase and composition fixtures"]
+fn hyperflow_conditioner_effect_gpu() -> Result<()> {
+    use crate::minimax_h3::{KeyframeAnchor, prepare_video};
+    use crate::serve::image::RgbImage;
+    let path = |key| {
+        std::env::var_os(key)
+            .map(std::path::PathBuf::from)
+            .with_context(|| format!("{key} missing"))
+    };
+    let case = std::env::var("FF_HYPERFLOW_CASE").context("FF_HYPERFLOW_CASE missing")?;
+    ensure!(
+        matches!(case.as_str(), "first" | "last" | "both"),
+        "Runner FAIL effect case"
+    );
+    let phase = std::env::var("FF_HYPERFLOW_EFFECT_PHASE").context("effect phase missing")?;
+    ensure!(
+        matches!(phase.as_str(), "reference" | "native"),
+        "Runner FAIL effect phase"
+    );
+    let root = path("FF_HYPERFLOW_COMPOSITION")?;
+    let out = path("FF_H3_CAPTURE")?;
+    let model = path("FF_MODEL")?;
+    let component = path("FF_HYPERFLOW_MODEL")?;
+    let mma = std::env::var("FF_HYPERFLOW_MMA_COMMIT").context("merged MMA commit missing")?;
+    ensure!(
+        mma.len() == 40 && mma.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Runner FAIL MMA commit"
+    );
+    let ancestry = std::process::Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "merge-base",
+            "--is-ancestor",
+            &mma,
+            "HEAD",
+        ])
+        .status()?;
+    ensure!(
+        ancestry.success(),
+        "Runner FAIL MMA commit absent from source"
+    );
+    let spec = H3Spec::parse(&serde_json::from_slice(&std::fs::read(
+        component.join("config.json"),
+    )?)?)?;
+    ensure!(spec.is_hyperflow()?, "Runner FAIL effect component");
+    let image = |height, width, offset| RgbImage {
+        height,
+        width,
+        pixels: (0..height * width * 3)
+            .map(|i| ((i * 73 + offset) % 251) as u8)
+            .collect(),
+    };
+    let (first, last) = (image(273, 481, 17), image(389, 267, 83));
+    let anchors = match case.as_str() {
+        "first" => vec![(KeyframeAnchor::First, &first)],
+        "last" => vec![(KeyframeAnchor::Last, &first)],
+        "both" => vec![
+            (KeyframeAnchor::First, &first),
+            (KeyframeAnchor::Last, &last),
+        ],
+        _ => unreachable!(),
+    };
+    let request = prepare_video(
+        &model,
+        &spec,
+        "A small animal walks beside a wooden bridge in warm daylight.",
+        &anchors,
+        ((124, 42), (6, (12.0, 3.0))),
+    )?;
+    let (_, layout) = request.layout(&spec)?;
+    let common = format!("common/a/{case}");
+    let load = |directory: &Path, name: &str, shape: &[usize]| -> Result<Vec<f32>> {
+        let result: Vec<_> = composition_values(directory, name, shape)?
+            .into_iter()
+            .map(|v| v as f32)
+            .collect();
+        ensure!(
+            result.iter().all(|v| v.is_finite()),
+            "Runner FAIL effect F32 input"
+        );
+        Ok(result)
+    };
+    let ids = composition_values(
+        &root,
+        &format!("{common}/input_ids"),
+        &[1, request.token_ids.len()],
+    )?;
+    ensure!(
+        ids.iter()
+            .copied()
+            .eq(request.token_ids.iter().map(|&v| f64::from(v))),
+        "Runner FAIL effect ids"
+    );
+    let text_shape = [1, request.token_ids.len(), 5120];
+    let reference = if phase == "native" {
+        let directory = path("FF_H3_REPLAY")?;
+        let authorization: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            directory.join("MEASUREMENT_AUTHORIZATION.json"),
+        )?)?;
+        ensure!(
+            authorization["measurement_only"] == true
+                && authorization["ruling"] == "2026-11-16T11:17:46Z"
+                && authorization["reference_controls_passed"] == false
+                && authorization["cases"] == serde_json::json!(["first", "last", "both"]),
+            "Runner FAIL effect measurement authorization"
+        );
+        Some((directory.join(&case), authorization))
+    } else {
+        None
+    };
+    let runtime =
+        std::env::temp_dir().join(format!("ff-conditioner-effect-{}", std::process::id()));
+    std::fs::create_dir(&runtime)?;
+    let result = (|| -> Result<bool> {
+        let native_conditioner = if phase == "native" {
+            let device = Device::new(0)?;
+            let ops = Ops::new(&device.ctx)?;
+            let mut blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(false, "conditioner effect producer".into())),
+            )?;
+            Some(condition(&device, &mut blas, &model, &request)?)
+        } else {
+            None
+        };
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(false, "conditioner effect".into())),
+        )?;
+        let save = |name: &str, shape: &[usize], values: Vec<f32>| -> Result<()> {
+            let file = out.join(name).with_extension("safetensors");
+            ensure!(!file.exists(), "Runner FAIL effect output already exists");
+            let mut trace = crate::trace::Trace::default();
+            trace.set_device(&device.info.name)?;
+            trace.add("value".into(), shape.to_vec(), values)?;
+            trace.save(&file)
+        };
+        let mut conditioning = Vec::new();
+        if phase == "reference" {
+            for arm in ["arm-a", "arm-b", "arm-e"] {
+                let values = load(
+                    &root,
+                    &format!("{arm}/producer-a/{case}/conditioner"),
+                    &text_shape,
+                )?;
+                ensure!(
+                    values
+                        .iter()
+                        .all(|&v| bf16::from_f32(v).to_f32().to_bits() == v.to_bits()),
+                    "Runner FAIL reference not BF16-exact"
+                );
+                conditioning.push((
+                    arm,
+                    values.into_iter().map(bf16::from_f32).collect::<Vec<_>>(),
+                ));
+            }
+            let a = &conditioning[0].1;
+            let shifted = a[a.len() - 5120..]
+                .iter()
+                .chain(&a[..a.len() - 5120])
+                .copied()
+                .collect();
+            conditioning.push(("row-shift", shifted));
+        } else {
+            let values = native_conditioner.context("Runner FAIL missing native conditioning")?;
+            let (_, authorization) = reference
+                .as_ref()
+                .context("Runner FAIL measurement authorization path")?;
+            conditioner_effect_measurements(&case, &values, &root, authorization)?;
+            save(
+                "native-conditioner",
+                &text_shape,
+                values.iter().map(|v| v.to_f32()).collect(),
+            )?;
+            if case == "both" {
+                println!(
+                    "CONDITIONER_EFFECT_MEASUREMENT case=both row=1953 channel=731 native={} reference_range=140..161",
+                    values[1953 * 5120 + 731]
+                );
+            }
+            conditioning.push(("native", values));
+        }
+        let (mut dit, table, plan, _, _, scale) = prepare_transformer(
+            (&device, &mut blas),
+            (&component, None, None),
+            (&spec, &layout, &request),
+        )?;
+        let s = &device.stream;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: scale,
+        };
+        let video = s.clone_htod(&load(
+            &root,
+            &format!("{common}/enter-video-0"),
+            &[layout.video_indices.len(), 96],
+        )?)?;
+        let audio = s.clone_htod(&load(
+            &root,
+            &format!("{common}/enter-audio-0"),
+            &[414, 32],
+        )?)?;
+        let row_pairs = s.clone_htod(&plan.row_pairs[0])?;
+        let row_timesteps = s.clone_htod(&plan.row_timesteps[0])?;
+        let mut velocities = std::collections::BTreeMap::new();
+        for (name, values) in conditioning {
+            let text = s.clone_htod(&values)?;
+            dit.step(
+                &context,
+                &table,
+                (
+                    u32::try_from(plan.pairs.len())?,
+                    u32::try_from(plan.timesteps.len())?,
+                ),
+                &super::StepInputs {
+                    video: &video,
+                    audio: &audio,
+                    text: &text,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            let outputs = [s.clone_dtoh(&dit.video)?, s.clone_dtoh(&dit.audio)?];
+            for (index, (role, shape)) in [("video", [37296, 96]), ("audio", [414, 32])]
+                .into_iter()
+                .enumerate()
+            {
+                save(&format!("{name}-{role}"), &shape, outputs[index].clone())?;
+            }
+            velocities.insert(name, outputs);
+            println!(
+                "CONDITIONER_EFFECT_FORWARD case={case} phase={phase} conditioning={name} step=0 complete=true utc={}",
+                composition_stamp()?
+            );
+        }
+        let mut defects = Vec::new();
+        let mut floors = serde_json::Map::new();
+        let mut controls = serde_json::Map::new();
+        for (index, (role, shape)) in [("video", [37296, 96]), ("audio", [414, 32])]
+            .into_iter()
+            .enumerate()
+        {
+            if phase == "reference" {
+                let samples =
+                    ["arm-a", "arm-b", "arm-e"].map(|arm| velocities[arm][index].as_slice());
+                let floor = conditioner_effect_floor(samples)?;
+                let m = crate::verify::metrics(role, &velocities["row-shift"][index], samples[0])?;
+                let ratios = [m.max_abs / floor.tau_abs, m.rmse / floor.tau_rmse];
+                let detected = ratios.into_iter().any(|v| v > 3.0);
+                println!(
+                    "CONDITIONER_EFFECT_REFERENCE_CONTROL {} case={case} stream={role} factor=3 ratio_abs={} ratio_rmse={}",
+                    if detected { "PASS" } else { "DEFECT" },
+                    ratios[0],
+                    ratios[1]
+                );
+                if !detected {
+                    defects.push(role.to_owned());
+                }
+                floors.insert(role.into(), serde_json::to_value(floor)?);
+                controls.insert(role.into(), serde_json::json!({"detected":detected,"factor":3,"ratio_abs":ratios[0],"ratio_rmse":ratios[1]}));
+            } else {
+                let (directory, authorization) = reference
+                    .as_ref()
+                    .context("Runner FAIL effect reference path")?;
+                let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                    directory.join("REFERENCE_FLOORS.json"),
+                )?)?;
+                ensure!(
+                    frozen["case"] == case
+                        && frozen["formula"] == "max(2 * worst_valid_reference_pair, 1e-6)",
+                    "Runner FAIL effect floor declaration"
+                );
+                let floor: ConditionerEffectFloor =
+                    serde_json::from_value(frozen["cells"][role].clone())?;
+                ensure!(
+                    floor.tau_abs.is_finite()
+                        && floor.tau_abs >= 1e-6
+                        && floor.tau_rmse.is_finite()
+                        && floor.tau_rmse >= 1e-6,
+                    "Runner FAIL invalid effect floor"
+                );
+                let key = format!("conditioner-effect/{case}/{role}");
+                let spread = &authorization["cells"][&key]["reference_spread"];
+                let spread_abs = spread["max_abs"].as_f64().context("reference abs spread")?;
+                let spread_rmse = spread["rmse"].as_f64().context("reference RMSE spread")?;
+                ensure!(
+                    spread_abs.is_finite()
+                        && spread_abs > 0.0
+                        && spread_rmse.is_finite()
+                        && spread_rmse > 0.0
+                        && floor.tau_abs == (2.0 * spread_abs).max(1e-6),
+                    "Runner FAIL reference spread declaration"
+                );
+                for arm in ["arm-a", "arm-b", "arm-e"] {
+                    let expected = load(directory, &format!("{arm}-{role}"), &shape)?;
+                    let m = crate::verify::metrics(role, &velocities["native"][index], &expected)?;
+                    println!(
+                        "CONDITIONER_EFFECT_MEASUREMENT case={case} stream={role} reference={arm} max_abs={} rmse={} reference_spread_max_abs={spread_abs} reference_spread_rmse={spread_rmse} ratio_abs={} ratio_rmse={} gating=false",
+                        m.max_abs,
+                        m.rmse,
+                        m.max_abs / spread_abs,
+                        m.rmse / spread_rmse
+                    );
+                }
+            }
+        }
+        if phase == "reference" {
+            std::fs::write(
+                out.join("REFERENCE_FLOORS.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"case":case,"formula":"max(2 * worst_valid_reference_pair, 1e-6)","native_conditioning_run":false,"cells":floors}),
+                )?,
+            )?;
+            std::fs::write(
+                out.join("REFERENCE_CONTROLS.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"case":case,"passed":defects.is_empty(),"streams":controls}),
+                )?,
+            )?;
+        }
+        std::fs::write(
+            out.join("RESULT.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"case":case,"phase":phase,"result":if phase=="native"{"MEASUREMENT"}else if defects.is_empty(){"PASS"}else{"DEFECT"},"gating":false,"defects":defects}),
+            )?,
+        )?;
+        Ok(defects.is_empty())
+    })();
+    let cleanup = std::fs::remove_dir_all(&runtime);
+    let pass = result?;
+    cleanup?;
+    println!(
+        "CONDITIONER_EFFECT_CASE_COMPLETE case={case} phase={phase} result={} utc={}",
+        if phase == "native" {
+            "MEASUREMENT"
+        } else if pass {
+            "PASS"
+        } else {
+            "DEFECT"
+        },
+        composition_stamp()?
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn packed_decoder_handoffs_preserve_video_patches_and_stereo_channels() -> Result<()> {
+    use crate::minimax_h3::{KeyframeAnchor, TEXT_TAG};
+    let spec = H3Spec::parse(&serde_json::from_str(include_str!(
+        "../../../tests/data/minimax-h3-transformer-config.json"
+    ))?)?;
+    let mut vae = VaeSpec::parse(&serde_json::from_str(include_str!(
+        "../../../tests/data/minimax-h3-vae-config.json"
+    ))?)?;
+    vae.latents_mean = (0..24).map(|c| c as f32 / 16.0).collect();
+    vae.latents_std = (0..24).map(|c| 1.0 + c as f32 / 32.0).collect();
+    let audio_spec = AudioVaeSpec {
+        encoder_dim: 64,
+        encoder_rates: vec![2, 4, 5, 5, 4],
+        latent_dim: 64,
+        latent_channels: 32,
+        heads: 1,
+        decoder_dim: 64,
+        decoder_rates: vec![2, 4, 5, 5, 4],
+        decoder_kernels: vec![4, 8, 10, 10, 8],
+        resblock_kernels: vec![3],
+        resblock_dilations: vec![vec![1]],
+        sampling_rate: 32000,
+        latents_mean: (0..32).map(|c| c as f32 / 8.0).collect(),
+        latents_std: (0..32).map(|c| 1.0 + c as f32 / 16.0).collect(),
+    };
+    for (height, width, anchors) in [
+        (32, 64, vec![]),
+        (32, 64, vec![KeyframeAnchor::First]),
+        (32, 64, vec![KeyframeAnchor::Last]),
+        (768, 1344, vec![KeyframeAnchor::First, KeyframeAnchor::Last]),
+    ] {
+        let geometry = Geometry::resolve(&spec, height, width, 124)?;
+        let layout = PackedLayout::build(&spec, &geometry, &[TEXT_TAG; 7], &anchors)?;
+        let (h, w, frames) = (
+            geometry.latent_height,
+            geometry.latent_width,
+            geometry.latent_frames,
+        );
+        let signal = |i: usize| ((i * 73 + 17) % 251) as f32 / 32.0 - 4.0;
+        let count = spec.in_channels * frames * h * w;
+        let input: Vec<f32> = (0..count).map(signal).collect();
+        let prefix = layout.condition_video_rows * spec.video_row_width();
+        let mut packed = vec![12345.0; prefix];
+        patchify_latents_into(
+            &input,
+            (spec.in_channels, frames, h, w),
+            spec.patch,
+            &mut packed,
+        );
+        for (row, patch) in packed[prefix..].as_chunks::<96>().0.iter().enumerate() {
+            let (f, spatial) = (row / (h / 2 * (w / 2)), row % (h / 2 * (w / 2)));
+            let (y, x) = (spatial / (w / 2) * 2, spatial % (w / 2) * 2);
+            for (column, &value) in patch.iter().enumerate() {
+                let (c, p) = (column / 4, column % 4);
+                assert_eq!(
+                    value,
+                    signal(((c * frames + f) * h + y + p / 2) * w + x + p % 2)
+                );
+            }
+        }
+        let audio: Vec<f32> = (0..2 * geometry.audio_latents * 32).map(signal).collect();
+        let (video, pcm) = decoder_latents(
+            (&spec, &vae, &audio_spec),
+            (&geometry, &layout),
+            (&packed, &audio),
+        )?;
+        assert_eq!(video.len(), input.len());
+        let plane = frames * h * w;
+        let mut channel_control = 0;
+        for (i, &value) in video.iter().enumerate() {
+            let c = i / plane;
+            assert_eq!(value, signal(i) * vae.latents_std[c] + vae.latents_mean[c]);
+            let wrong = (c + 1) % 24;
+            channel_control +=
+                usize::from(value != signal(i) * vae.latents_std[wrong] + vae.latents_mean[wrong]);
+        }
+        let mut stereo_control = 0;
+        for (i, &value) in pcm.iter().enumerate() {
+            let (channel, t) = (i / geometry.audio_latents, i % geometry.audio_latents);
+            let (stereo, c) = (channel / 32, channel % 32);
+            let index = (stereo * geometry.audio_latents + t) * 32 + c;
+            assert_eq!(
+                value,
+                signal(index) * audio_spec.latents_std[c] + audio_spec.latents_mean[c]
+            );
+            let wrong = (t * 2 + stereo) * 32 + c;
+            stereo_control += usize::from(
+                value != signal(wrong) * audio_spec.latents_std[c] + audio_spec.latents_mean[c],
+            );
+        }
+        assert!(channel_control > 0 && stereo_control > 0);
+        assert!(
+            decoder_latents(
+                (&spec, &vae, &audio_spec),
+                (&geometry, &layout),
+                (&packed[..packed.len() - 1], &audio),
+            )
+            .is_err()
+        );
+    }
+    Ok(())
 }

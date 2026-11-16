@@ -1305,6 +1305,8 @@ struct VaeKernels {
 pub(crate) struct VideoDecoder {
     core: ImageDecoder,
     kernels: VaeKernels,
+    #[cfg(test)]
+    prefix_only: bool,
 }
 
 impl std::ops::Deref for VideoDecoder {
@@ -1331,6 +1333,8 @@ impl VideoDecoder {
                 rgb: vision.load_function("planar_f32_to_rgb_u8")?,
                 stitch: vision.load_function("tile_stitch_f32")?,
             },
+            #[cfg(test)]
+            prefix_only: false,
         })
     }
 
@@ -1503,7 +1507,10 @@ impl VideoDecoder {
             latent(&w.latent_q)?,
             rows_view(&w.o, s, 0, active * p, spec.dim, spec.dim)?,
         )?;
-
+        #[cfg(test)]
+        if self.prefix_only {
+            return Ok(());
+        }
         let rows = active * w.tokens;
         unsafe {
             s.launch_builder(&self.core.kernels.append)
@@ -2789,6 +2796,271 @@ mod image_tests {
         Ok(PathBuf::from(
             std::env::var_os(key).with_context(|| format!("{key} missing"))?,
         ))
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_MODEL, longest video capacity and forced F32 streaming"]
+    fn video_decoder_longest_capacity_gpu() -> Result<()> {
+        let model = path("FF_MODEL")?;
+        let spec = VaeSpec::read(&model)?;
+        let component = model.join("vae");
+        let manifest = MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?
+            .minimax_h3_vae_manifest(&spec)?;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-video-capacity-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            let d = Device::new(0)?;
+            let s = &d.stream;
+            let ops = Ops::new(&d.ctx)?;
+            let mut blas = Blas::new(
+                &d,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(false, "F32 video capacity".into())),
+            )?;
+            let (height, width) = (576, 1856);
+            let r = spec.spatial_ratio;
+            let tiles = VaeTiles::released(&spec, height, width)?;
+            let tile = (
+                spec.chunk_latents() + spec.overlap_latents(),
+                tiles.height / r,
+                tiles.width / r,
+            );
+            for (frames, latent_frames, caller) in
+                [(345, 102, "MiniMax-H3"), (362, 107, "HyperFlow")]
+            {
+                let plan = DecodePlan::new(&spec, latent_frames)?;
+                ensure!(
+                    plan.frames == frames && plan.pad == 0,
+                    "RUNNER_FAIL longest frame layout"
+                );
+                let total = plan.chunks
+                    * (spec.chunk_latents() * spec.temporal_ratio - spec.frame_pre_padding())
+                    + tile.0 * spec.temporal_ratio
+                    - spec.chunk_latents() * spec.temporal_ratio
+                    - spec.frame_pre_padding();
+                let count = spec.latent_channels * latent_frames * (height / r) * (width / r);
+                let output_count = spec.out_channels * total * height * width;
+                let scratch = decode_bytes(&spec, &tiles, (height, width));
+                let future =
+                    TileWork::bytes(&spec, tile) + scratch + 4 * (count + output_count) + (1 << 30);
+                for placement in [
+                    super::super::Placement::Derived,
+                    super::super::Placement::Streamed,
+                ] {
+                    let mut decoder =
+                        VideoDecoder::new(&d, &spec, &component, &manifest, (future, placement))?;
+                    decoder.prefix_only = true;
+                    let mut work = decoder.work(
+                        &d,
+                        &mut blas,
+                        &tiles,
+                        (latent_frames, height / r, width / r),
+                    )?;
+                    ensure!(
+                        work.allocated_bytes() == work.plan.bytes,
+                        "RUNNER_FAIL capacity workspace count"
+                    );
+                    let input: Vec<_> = (0..count)
+                        .map(|i| ((i * 73 % 65521) as f32 - 32760.0) / 8192.0)
+                        .collect();
+                    let input_device = s.clone_htod(&input)?;
+                    let output = s.alloc_zeros::<f32>(output_count)?;
+                    let raw = s.alloc_zeros::<f32>(tiles.count() * work.pixels())?;
+                    let canvas = s.alloc_zeros::<f32>(
+                        spec.out_channels * tile.0 * spec.temporal_ratio * height * width,
+                    )?;
+                    let tail = tile.0 * spec.temporal_ratio
+                        - spec.chunk_latents() * spec.temporal_ratio
+                        - spec.frame_pre_padding();
+                    let faded = s.alloc_zeros::<f32>(spec.out_channels * tail * height * width)?;
+                    ensure!(
+                        4 * (raw.len() + canvas.len() + faded.len()) == scratch,
+                        "RUNNER_FAIL longest stitch count"
+                    );
+                    let first_frame = (plan.chunks - 1) * spec.chunk_latents();
+                    let row = *tiles.rows.0.last().context("no tile rows")? / r;
+                    let col = *tiles.cols.0.last().context("no tile columns")? / r;
+                    decoder.tile(
+                        s,
+                        &blas,
+                        &mut work,
+                        &LatentVideo {
+                            data: &input_device,
+                            frames: latent_frames,
+                            height: height / r,
+                            width: width / r,
+                        },
+                        (&[(row, col)], first_frame),
+                        (&raw, tiles.count() - 1),
+                    )?;
+                    let actual =
+                        s.clone_dtoh(&work.latent.slice(..work.patches * spec.latent_channels))?;
+                    let mut differing = 0;
+                    for (i, value) in actual.iter().enumerate() {
+                        let c = i % spec.latent_channels;
+                        let token = i / spec.latent_channels;
+                        let x = token % tile.2;
+                        let y = token / tile.2 % tile.1;
+                        let t = token / (tile.1 * tile.2);
+                        let index =
+                            ((c * latent_frames + first_frame + t) * (height / r) + row + y)
+                                * (width / r)
+                                + col
+                                + x;
+                        differing += usize::from(value.to_bits() != input[index].to_bits());
+                    }
+                    ensure!(
+                        differing == 0,
+                        "DEFECT longest last-tile F32 gather {differing}"
+                    );
+                    let active = 4
+                        * (input_device.len()
+                            + output.len()
+                            + raw.len()
+                            + canvas.len()
+                            + faded.len())
+                        + work.allocated_bytes();
+                    println!(
+                        "PASS VIDEO_F32_CAPACITY caller={caller} frames={frames} latent=[1,24,{latent_frames},{},{}] canvas=[{height},{width}] placement={placement:?} linear={} attention={} activation_bytes={active} last_tile_differences={differing} transformer_forwards=0",
+                        height / r,
+                        width / r,
+                        work.batch,
+                        work.plan.attention
+                    );
+                    drop((faded, canvas, raw, output, input_device, work, decoder));
+                    s.synchronize()?;
+                }
+            }
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_MODEL, FF_H3_S0 prefix prediction and FF_H3_CAPTURE"]
+    fn video_decoder_prefix_capture_gpu() -> Result<()> {
+        let (model, root, capture) = (path("FF_MODEL")?, path("FF_H3_S0")?, path("FF_H3_CAPTURE")?);
+        let prediction: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("PREDICTION.json"))?)?;
+        ensure!(
+            prediction["rule"] == "r7-prefix-rounds-v1"
+                && prediction["native_arrays_read"] == false,
+            "RUNNER_FAIL prefix prediction declaration"
+        );
+        let spec = VaeSpec::read(&model)?;
+        let shape = (
+            spec.chunk_latents() + spec.overlap_latents(),
+            VAE_TILE / spec.spatial_ratio,
+            VAE_TILE / spec.spatial_ratio,
+        );
+        ensure!(
+            shape == (7, 16, 16) && spec.latent_channels == 24 && spec.dim == 2048,
+            "RUNNER_FAIL prefix production shape"
+        );
+        let bytes = fs::read(root.join("input.safetensors"))?;
+        let input = SafeTensors::deserialize(&bytes)?;
+        ensure!(
+            input.tensor("value")?.shape() == [1, 24, 37, 48, 84],
+            "RUNNER_FAIL prefix input shape"
+        );
+        let values = tensor(&input, "value")?;
+        let runtime = std::env::temp_dir().join(format!("ff-video-prefix-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        fs::create_dir_all(&capture)?;
+        let result = (|| -> Result<()> {
+            let device = Device::new(0)?;
+            let s = &device.stream;
+            let ops = Ops::new(&device.ctx)?;
+            let blas = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(false, "video decoder prefix capture".into())),
+            )?;
+            let component = model.join("vae");
+            let manifest = MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?
+                .minimax_h3_vae_manifest(&spec)?;
+            let mut decoder = VideoDecoder::new(
+                &device,
+                &spec,
+                &component,
+                &manifest,
+                (
+                    TileWork::bytes(&spec, shape),
+                    super::super::Placement::Derived,
+                ),
+            )?;
+            decoder.prefix_only = true;
+            let mut work = TileWork::new(s, &spec, shape, (1, 1))?;
+            let input = s.clone_htod(&values)?;
+            let raw = s.alloc_zeros::<f32>(work.pixels())?;
+            decoder.tile(
+                s,
+                &blas,
+                &mut work,
+                &LatentVideo {
+                    data: &input,
+                    frames: 37,
+                    height: 48,
+                    width: 84,
+                },
+                (&[(0, 0)], 0),
+                (&raw, 0),
+            )?;
+            let packed = s.clone_dtoh(&work.latent)?;
+            let bytes = fs::read(root.join("f32/packed.safetensors"))?;
+            let expected = tensor(&SafeTensors::deserialize(&bytes)?, "value")?;
+            ensure!(
+                packed.len() == expected.len()
+                    && packed
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "RUNNER_FAIL packed F32 input mismatch"
+            );
+            let shifted = packed
+                .iter()
+                .enumerate()
+                .any(|(i, a)| a.to_bits() != expected[(i + 24) % expected.len()].to_bits());
+            ensure!(shifted, "RUNNER_FAIL prefix row-shift control missed");
+            for (name, shape, values) in [
+                ("packed", vec![work.patches, 24], packed),
+                (
+                    "post_quant",
+                    vec![work.patches, 24],
+                    s.clone_dtoh(&work.latent_q)?,
+                ),
+                (
+                    "proj_in",
+                    vec![work.patches, 2048],
+                    s.clone_dtoh(&work.o.slice(..work.patches * 2048))?,
+                ),
+            ] {
+                let file = capture.join(name).with_extension("safetensors");
+                ensure!(!file.exists(), "RUNNER_FAIL prefix capture exists");
+                let mut trace = crate::trace::Trace::default();
+                trace.set_device(&device.info.name)?;
+                trace.add("value".into(), shape, values)?;
+                trace.save(&file)?;
+            }
+            println!(
+                "PASS VIDEO_PREFIX_CAPTURE boundaries=3 packed_exact=true row_shift_control=true transformer_forwards=0 input_bytes={} work_bytes={} raw_bytes={} blas_workspace_bytes={}",
+                4 * values.len(),
+                work.allocated_bytes(),
+                4 * work.pixels(),
+                blas.workspace_bytes()
+            );
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
+        result?;
+        cleanup?;
+        Ok(())
     }
 
     fn input(root: &Path, name: &str, shape: [usize; 2]) -> Result<Vec<f32>> {

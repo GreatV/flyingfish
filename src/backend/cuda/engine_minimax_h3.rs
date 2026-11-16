@@ -3256,6 +3256,14 @@ fn forward_block<const LORA: bool>(
     block_forward::<LORA>(c, flash, weights, conditioning, x, work)
 }
 
+#[cfg(test)]
+struct SampleTrace {
+    video: Vec<f32>,
+    audio: Vec<f32>,
+    video_velocity: Vec<f32>,
+    audio_velocity: Vec<f32>,
+}
+
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
 /// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
@@ -3288,6 +3296,15 @@ pub(crate) struct Dit {
     pub video: CudaSlice<f32>,
     /// Velocity of the audio rows, `[audio rows, 32]`.
     pub audio: CudaSlice<f32>,
+    #[cfg(test)]
+    trace: Option<Vec<SampleTrace>>,
+    #[cfg(test)]
+    trace_gate: Option<(
+        &'static str,
+        Rc<std::cell::RefCell<pipeline::CompositionGate>>,
+    )>,
+    #[cfg(test)]
+    refiner_trace: Option<Vec<bf16>>,
 }
 
 impl Dit {
@@ -3651,6 +3668,12 @@ impl Dit {
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
             video,
             audio,
+            #[cfg(test)]
+            trace: None,
+            #[cfg(test)]
+            trace_gate: None,
+            #[cfg(test)]
+            refiner_trace: None,
         })
     }
 
@@ -3785,6 +3808,13 @@ impl Dit {
         let condition = self.ranges.condition;
         let generated = self.ranges.rows - self.ranges.video_start;
         for k in 0..plan.row_pairs.len() {
+            #[cfg(test)]
+            if let Some((case, _)) = &self.trace_gate {
+                println!(
+                    "HYPERFLOW_FORWARD case={case} phase=free step={k} state=START utc={}",
+                    pipeline::composition_stamp()?
+                );
+            }
             let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
             let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
             self.step(
@@ -3807,6 +3837,22 @@ impl Dit {
                 k,
             )?;
             self.euler(s, (audio, 0, audio.len()), &self.audio, audio_grid, k)?;
+            #[cfg(test)]
+            if let Some(trace) = &mut self.trace {
+                trace.push(SampleTrace {
+                    video: s.clone_dtoh(video)?,
+                    audio: s.clone_dtoh(audio)?,
+                    video_velocity: s.clone_dtoh(&self.video)?,
+                    audio_velocity: s.clone_dtoh(&self.audio)?,
+                });
+                if let Some((case, gate)) = &self.trace_gate {
+                    gate.borrow_mut().sample_step(
+                        case,
+                        k,
+                        trace.last().context("Runner FAIL free trace missing")?,
+                    )?;
+                }
+            }
         }
         s.synchronize()?;
         Ok(())
@@ -3877,7 +3923,10 @@ impl Dit {
             let count = r.text * h;
             s.memcpy_dtod(&self.x.slice(..count), &mut self.text.slice_mut(..count))?;
         }
-
+        #[cfg(test)]
+        if self.trace.as_ref().is_some_and(Vec::is_empty) && self.refiner_trace.is_none() {
+            self.refiner_trace = Some(s.clone_dtoh(&self.x.slice(..r.text * h))?);
+        }
         self.projection(
             c,
             &self.proj_in,
@@ -5255,6 +5304,122 @@ mod tests {
     use safetensors::SafeTensors;
     use std::{collections::BTreeMap, fs, rc::Rc};
 
+    #[test]
+    fn stored_placement_preserves_the_physical_reserve() -> Result<()> {
+        use crate::checkpoint::TensorScope;
+        use crate::prefill::DensePlacement;
+        let mut spec = H3Spec::parse(&serde_json::from_str(include_str!(
+            "../../../tests/data/minimax-h3-transformer-config.json"
+        ))?)?;
+        spec.layers = 3;
+        spec.hidden = 3;
+        spec.head_dim = 2;
+        spec.dropped_blocks = Some(vec![1]);
+        let mut entries = BTreeMap::new();
+        for (name, layer, bytes, shape) in [
+            ("transformer_blocks.0.a.weight", 0, 33, vec![3, 11]),
+            ("transformer_blocks.0.b.weight", 0, 17, vec![1, 17]),
+            ("transformer_blocks.2.a.weight", 2, 33, vec![3, 11]),
+            ("transformer_blocks.2.b.weight", 2, 17, vec![1, 17]),
+            ("transformer_blocks.2.a.wscale", 2, 4, vec![1]),
+        ] {
+            entries.insert(
+                name.to_owned(),
+                TensorEntry {
+                    dtype: if name.ends_with(".wscale") {
+                        Dtype::F32
+                    } else {
+                        Dtype::I8
+                    },
+                    shape,
+                    shard: String::new(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope: TensorScope::Text,
+                    layer: Some(layer),
+                    role: name.to_owned(),
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                },
+            );
+        }
+        let manifest = TensorManifest {
+            entries,
+            resident_bytes: 104,
+        };
+        let (layers, owned) = stored_allocation_costs(&manifest, &spec, 16, 64)?;
+        assert_eq!(layers, [80, 0, 80]);
+        assert_eq!(owned, 3_584);
+        let arena = VectorArenaLayout::new(&manifest, &spec)?;
+        assert_eq!(arena.offsets.len(), 14);
+        assert_eq!(arena.bytes, 3_584);
+        let mut spans: Vec<_> = arena.offsets.values().copied().collect();
+        spans.sort_unstable_by_key(|&(offset, _, _)| offset);
+        for (index, &(offset, bytes, _)) in spans.iter().enumerate() {
+            assert_eq!(offset % 256, 0);
+            assert!(bytes > 0 && offset + bytes <= arena.bytes);
+            if let Some(&(next, _, _)) = spans.get(index + 1) {
+                assert!(offset + bytes <= next);
+            }
+        }
+        let &(offset, bytes, _) = spans.last().context("arena is empty")?;
+        assert_eq!(offset + stored_allocation_bytes(bytes, 256)?, arena.bytes);
+        let total = 65_536;
+        let reserve = total / 16;
+        let exact = reserve + owned + 160;
+        let budget = DensePlacement::device_budget(exact, total, owned, 0, 0)?;
+        let plan = DensePlacement::new(&[layers[0], layers[2]], Some(&[50, 50]), budget, 0)?;
+        assert_eq!(plan.resident_bytes, 160);
+        assert_eq!(
+            exact.checked_sub(reserve + owned + plan.resident_bytes),
+            Some(0)
+        );
+        let short = DensePlacement::device_budget(exact - 1, total, owned, 0, 0)?;
+        assert!(DensePlacement::new(&[layers[0], layers[2]], Some(&[50, 50]), short, 0).is_err());
+        assert!(DensePlacement::new(&[50, 50], None, exact - 1 - reserve - 64, 0).is_ok());
+        assert_eq!(
+            DensePlacement::device_budget(reserve + owned, total, owned, 0, 0)?,
+            0
+        );
+        assert!(DensePlacement::device_budget(reserve + owned - 1, total, owned, 0, 0).is_err());
+        let streamed = DensePlacement::with_allocations(
+            &[96, 80, 80, 80],
+            &[64, 64, 64, 64],
+            Some(&[50, 50, 50, 50]),
+            256,
+            150,
+            16,
+        )?;
+        let streamed_count = streamed.slots.iter().filter(|slot| slot.is_some()).count();
+        assert_eq!(
+            streamed.resident_bytes + 2 * streamed.slot_bytes + streamed_count * 16,
+            256
+        );
+        assert_eq!(streamed_count, 3);
+        assert_eq!(streamed.host_bytes, 150);
+        assert_eq!(streamed.disk_bytes, 0);
+        assert!(
+            DensePlacement::with_allocations(
+                &[96, 80, 80, 80],
+                &[64, 64, 64, 64],
+                Some(&[50, 50, 50, 50]),
+                191,
+                150,
+                16
+            )
+            .is_err()
+        );
+        assert!(stored_allocation_bytes(usize::MAX, 2).is_err());
+        assert!(stored_allocation_bytes(1, 0).is_err());
+        println!(
+            "PASS STORED_PHYSICAL_RESERVE arena_tensors=14 aligned_disjoint=true exact_headroom=0 one_byte_short=ERROR logical_only_control=FAIL_AS_REQUIRED"
+        );
+        Ok(())
+    }
+
     /// Initial chunks avoid skinny tails; selection counts scratch and workspace replacements.
     #[test]
     fn ffn_chunks_leave_no_skinny_tail() -> Result<()> {
@@ -6184,7 +6349,7 @@ mod tests {
             adapter.rank,
             "transformer_blocks.0",
             &mut base,
-            &mut lora,
+            Some(&mut lora),
         )?;
         let rows = 1usize;
         let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
@@ -6243,7 +6408,13 @@ mod tests {
             "zero gates must leave the residual untouched"
         );
         let normed = std::mem::take(&mut work.normed_probe);
-        let norm2 = s.clone_dtoh(&weights.norm2)?;
+        let norm2 = s.clone_dtoh(
+            weights
+                .norm2
+                ._owned
+                .as_ref()
+                .context("resident norm2 allocation")?,
+        )?;
         let shift_mlp = &table[3 * hidden..4 * hidden];
         let scale_mlp = &table[4 * hidden..5 * hidden];
         let pre = modulate_rows(
