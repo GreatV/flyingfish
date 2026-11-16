@@ -1890,6 +1890,127 @@ mod gate_tests {
         Ok(())
     }
 
+    /// Time arm of the CLI gate: the transcribe entry's speaker times match
+    /// the published wrapper's SegLST times on the young park/resume mask
+    /// and on a late joiner (lane 1 first active at chunk 40). The published
+    /// rule, quoted from SpeakerTaggedASR (update_seglsts ->
+    /// _compute_hypothesis_timestamps): sentence start = offset(step) +
+    /// timestamp[0] x 0.08 s and end = offset(step) + (timestamp[-1]+1) x
+    /// 0.08 s, with offset(step) = step x 14 x 0.08 s the chunk start and
+    /// the timestamps the lane's own row ordinals; per token the emitting
+    /// step is what reproduces the sum. Tokens also match the published
+    /// finals on both masks.
+    #[test]
+    #[ignore = "GPU + published archive + fixture; set FF_MULTITALKER_NEMO, FF_N6E_INPUTS, FF_N6E_M3C"]
+    fn multitalker_transcribe_times_match_the_published_seglst() -> Result<()> {
+        let nemo = std::env::var("FF_MULTITALKER_NEMO").context("FF_MULTITALKER_NEMO")?;
+        let inputs_root = std::env::var("FF_N6E_INPUTS").context("FF_N6E_INPUTS")?;
+        let m3c = std::env::var("FF_N6E_M3C").context("FF_N6E_M3C")?;
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&m3c)?)?;
+        let root = Path::new(&inputs_root);
+        let frames = fixture["meta"]["frames"].as_u64().context("frames")? as usize;
+        let gt = gt_masks(root, frames)?;
+        let resume = (60..frames)
+            .find(|frame| gt[frame * 4] > 0.5)
+            .context("no speaker-0 GT frame at or after 60")?;
+        let mut blip = gt.clone();
+        blip[0] = 1.0;
+        blip[4] = 1.0;
+        for frame in 2..resume {
+            blip[frame * 4] = 0.0;
+            blip[frame * 4 + 2] = 1.0;
+        }
+        let mut late = gt.clone();
+        for frame in 0..frames {
+            late[frame * 4 + 1] = if frame >= 40 * 14 {
+                gt[frame * 4 + 1]
+            } else {
+                0.0
+            };
+        }
+        let wave = read_wave(&root.join("meeting.wav"))?;
+        let options = crate::RunOptions {
+            device: 0,
+            runtime_dir: std::path::PathBuf::new(),
+            verbose: false,
+        };
+        for (case, diar) in [("blip", blip), ("late", late)] {
+            let masks = crate::diarization::SpeakerMasks {
+                frames,
+                speakers: 4,
+                frame_seconds: 0.08,
+                active: diar.iter().map(|value| *value > 0.5).collect(),
+                pooled: diar.to_vec(),
+            };
+            let result = crate::multitalker::transcribe(
+                &std::path::PathBuf::from(&nemo),
+                &wave,
+                &masks,
+                true,
+                options.clone(),
+            )?;
+            let reference = fixture[case]
+                .as_object()
+                .with_context(|| format!("{case} sentences"))?;
+            let finals = reference["final"]
+                .as_object()
+                .with_context(|| format!("{case} finals"))?;
+            let sentences = reference["sentences"]
+                .as_array()
+                .with_context(|| format!("{case} seglst"))?;
+            for speaker in &result.speakers {
+                let entry = finals
+                    .get(&speaker.speaker.to_string())
+                    .and_then(Value::as_object)
+                    .with_context(|| format!("{case} speaker {}", speaker.speaker))?;
+                let tokens: Vec<u32> = entry["tokens"]
+                    .as_array()
+                    .context("tokens")?
+                    .iter()
+                    .map(|value| Ok(value.as_u64().context("token")? as u32))
+                    .collect::<Result<_>>()?;
+                ensure!(
+                    speaker.tokens == tokens,
+                    "{case} speaker {} tokens {} vs reference {}",
+                    speaker.speaker,
+                    speaker.tokens.len(),
+                    tokens.len()
+                );
+                let own: Vec<&Value> = sentences
+                    .iter()
+                    .filter(|entry| {
+                        entry["speaker"].as_str() == Some(&format!("speaker_{}", speaker.speaker))
+                    })
+                    .collect();
+                let start = own
+                    .first()
+                    .and_then(|entry| entry["start"].as_f64())
+                    .with_context(|| format!("{case} speaker {} start", speaker.speaker))?;
+                let end = own
+                    .last()
+                    .and_then(|entry| entry["end"].as_f64())
+                    .with_context(|| format!("{case} speaker {} end", speaker.speaker))?;
+                ensure!(
+                    (speaker.start - start).abs() < 1e-6,
+                    "{case} speaker {} start {} vs published {start}",
+                    speaker.speaker,
+                    speaker.start
+                );
+                ensure!(
+                    (speaker.end - end).abs() < 1e-6,
+                    "{case} speaker {} end {} vs published {end}",
+                    speaker.speaker,
+                    speaker.end
+                );
+            }
+            println!(
+                "PASS multitalker_transcribe_times case={case} speakers={} times=published",
+                result.speakers.len()
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "GPU + published archive + fixture arms; set FF_MULTITALKER_NEMO, FF_N6E_M2B, FF_N6E_M2B_GPU"]
     fn multitalker_rnnt_teacher_forced_logits() -> Result<()> {

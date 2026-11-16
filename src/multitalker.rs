@@ -351,8 +351,28 @@ pub fn transcribe(
     let mut session = model.stream(features, diar, masked_asr, 4, true)?;
     let mut stream = model.encoder.multitalker_stream(4)?;
     let mut dstream = model.decode_stream()?;
-    while let Some(step) = model.stream_step(&mut session, &mut stream)? {
+    // The published wrapper converts a lane's hypothesis timestamps to clip
+    // times as `offset(step) + row x frame_seconds` (SpeakerTaggedASR
+    // update_seglsts -> _compute_hypothesis_timestamps), where offset(step) is
+    // the chunk start `step x 14 x frame_seconds` and the row is the lane's
+    // own cumulative ordinal. Per token, the emitting step is recorded so
+    // word and speaker times reproduce that sum.
+    let rows_per_step = 14u32;
+    let mut token_steps: Vec<Vec<u32>> = vec![Vec::new(); 4];
+    for emitted_step in 0u32.. {
+        let Some(step) = model.stream_step(&mut session, &mut stream)? else {
+            break;
+        };
+        let before: Vec<usize> = session
+            .hypotheses
+            .iter()
+            .map(|hyp| hyp.tokens.len())
+            .collect();
         model.decode_step(&mut session, &mut dstream, &step)?;
+        for (lane, hypothesis) in session.hypotheses.iter().enumerate() {
+            let grown = hypothesis.tokens.len().saturating_sub(before[lane]);
+            token_steps[lane].extend(std::iter::repeat_n(emitted_step, grown));
+        }
     }
     let file = File::open(nemo)?;
     let map = unsafe { MmapOptions::new().map(&file)? };
@@ -369,7 +389,9 @@ pub fn transcribe(
         let (text, words) = speaker_words(
             &hypothesis.tokens,
             &hypothesis.timestamps,
+            &token_steps[lane],
             &pieces,
+            rows_per_step,
             frame_seconds,
         )?;
         if words.is_empty() {
@@ -390,56 +412,84 @@ pub fn transcribe(
 
 /// Text and word cues of one lane: a piece carrying the sentencepiece word
 /// prefix starts a word; the text is the pieces concatenated with the
-/// prefix as the word separator.
+/// prefix as the word separator. Each cue's time follows the published
+/// wrapper's sum: the emitting step's chunk base `step x rows_per_step`
+/// plus the lane's own row ordinal, in seconds.
 #[cfg(feature = "cuda")]
 fn speaker_words(
     tokens: &[u32],
     timestamps: &[u32],
+    token_steps: &[u32],
     pieces: &[String],
+    rows_per_step: u32,
     frame_seconds: f64,
 ) -> Result<(String, Vec<crate::media::TextSegment>)> {
     ensure!(
-        tokens.len() == timestamps.len(),
+        tokens.len() == timestamps.len() && tokens.len() == token_steps.len(),
         "speaker token/timestamp extents"
     );
     let mut joined = String::new();
     let mut words: Vec<crate::media::TextSegment> = Vec::new();
     let mut current = String::new();
-    let mut start_row = 0u32;
-    let mut last_row = 0u32;
-    for (&token, &row) in tokens.iter().zip(timestamps) {
+    let mut start = 0usize;
+    let mut last = 0usize;
+    for (index, &token) in tokens.iter().enumerate() {
         let piece = pieces
             .get(token as usize)
             .with_context(|| format!("token {token} outside the sentencepiece table"))?;
         joined.push_str(piece);
         let stripped = piece.trim_start_matches('▁');
         if piece.starts_with('▁') && !current.is_empty() {
-            words.push(cue(current.clone(), start_row, last_row, frame_seconds));
+            words.push(cue(
+                current.clone(),
+                start,
+                last,
+                token_steps,
+                timestamps,
+                rows_per_step,
+                frame_seconds,
+            ));
             current.clear();
         }
         if current.is_empty() {
-            start_row = row;
+            start = index;
         }
         current.push_str(stripped);
-        last_row = row;
+        last = index;
     }
     if !current.is_empty() {
-        words.push(cue(current, start_row, last_row, frame_seconds));
+        words.push(cue(
+            current,
+            start,
+            last,
+            token_steps,
+            timestamps,
+            rows_per_step,
+            frame_seconds,
+        ));
     }
     let text = joined.replace('▁', " ").trim().to_string();
     Ok((text, words))
 }
 
+/// One cue from token indices `start..=last`: start = the first token's
+/// emitting step base plus its row, end = one row past the last token's.
 #[cfg(feature = "cuda")]
 fn cue(
     text: String,
-    start_row: u32,
-    end_row: u32,
+    start: usize,
+    last: usize,
+    token_steps: &[u32],
+    timestamps: &[u32],
+    rows_per_step: u32,
     frame_seconds: f64,
 ) -> crate::media::TextSegment {
+    let row =
+        |index: usize| -> f64 { f64::from(token_steps[index] * rows_per_step + timestamps[index]) };
+    let round = |seconds: f64| (seconds * 100.0).round_ties_even() / 100.0;
     crate::media::TextSegment {
-        start: (start_row as f64 * frame_seconds * 100.0).round_ties_even() / 100.0,
-        end: ((f64::from(end_row) + 1.0) * frame_seconds * 100.0).round_ties_even() / 100.0,
+        start: round(row(start) * frame_seconds),
+        end: round((row(last) + 1.0) * frame_seconds),
         text,
     }
 }

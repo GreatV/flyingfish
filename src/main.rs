@@ -805,7 +805,7 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
                     format!("{}\n", serde_json::to_string(&result)?).into_bytes()
                 }
                 TranscriptionFormat::Srt | TranscriptionFormat::Vtt => {
-                    let segments: Vec<flyingfish::media::TextSegment> = result
+                    let mut segments: Vec<flyingfish::media::TextSegment> = result
                         .speakers
                         .iter()
                         .flat_map(|speaker| {
@@ -819,6 +819,12 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
                                 })
                         })
                         .collect();
+                    segments.sort_by(|a, b| {
+                        a.start
+                            .total_cmp(&b.start)
+                            .then(a.end.total_cmp(&b.end))
+                            .then_with(|| a.text.cmp(&b.text))
+                    });
                     let mut bytes = Vec::new();
                     match args.format {
                         TranscriptionFormat::Srt => {
