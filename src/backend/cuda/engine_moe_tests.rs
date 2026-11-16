@@ -3678,42 +3678,15 @@ pub(super) fn placement_compare(
     b: &[f32],
     bf16_ulp_limit: Option<u16>,
 ) -> Result<usize> {
-    ensure!(
-        !a.is_empty() && a.len() == b.len(),
-        "Runner FAIL {label} extent"
-    );
-    ensure!(
-        a.iter().chain(b).all(|v| v.is_finite()),
-        "Runner FAIL {label} nonfinite"
-    );
-    let mismatches = a
-        .iter()
-        .zip(b)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
+    let (max_abs, _) = crate::verify::max_abs_rmse(label, a, b)?;
+    let mismatches = crate::verify::bit_mismatches(label, a, b)?;
     let first = a
         .iter()
         .zip(b)
         .position(|(a, b)| a.to_bits() != b.to_bits());
-    let max_abs = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    let ordered = |value: f32| {
-        let bits = bf16::from_f32(value).to_bits();
-        if bits & 0x8000 == 0 {
-            bits | 0x8000
-        } else {
-            !bits
-        }
-    };
-    let max_bf16_ulp = a
-        .iter()
-        .zip(b)
-        .map(|(&a, &b)| ordered(a).abs_diff(ordered(b)))
-        .max()
-        .context("empty comparison")?;
+    let candidate: Vec<bf16> = a.iter().copied().map(bf16::from_f32).collect();
+    let reference: Vec<bf16> = b.iter().copied().map(bf16::from_f32).collect();
+    let (max_bf16_ulp, _, _) = crate::verify::bf16_ulp_max(label, &candidate, &reference, None)?;
     let passed = match bf16_ulp_limit {
         Some(limit) => max_bf16_ulp <= limit,
         None => mismatches == 0,
@@ -4330,10 +4303,7 @@ fn published_streamed_model_gpu() -> Result<()> {
                     "DEFECT streamed absolute position"
                 );
                 let logits = engine.decode_logits()?;
-                ensure!(
-                    logits.len() == 248144 && logits.iter().all(|v| v.is_finite()),
-                    "Runner FAIL streamed logits"
-                );
+                ensure!(logits.len() == 248144, "Runner FAIL streamed logits");
                 let bits = logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 if repeat == 0 {
                     eager.push((token, bits));
@@ -4348,15 +4318,13 @@ fn published_streamed_model_gpu() -> Result<()> {
                     scale.is_finite() && scale > 0.0,
                     "Runner FAIL reference scale"
                 );
-                let mut error_max = 0.0f64;
-                let mut error_square = 0.0f64;
-                for (&actual, &wanted) in logits.iter().zip(reference) {
-                    let error = f64::from(actual) - f64::from(wanted);
-                    error_max = error_max.max(error.abs());
-                    error_square += error * error;
-                }
+                let (error_max, error_rmse) = crate::verify::max_abs_rmse(
+                    &format!("moe.stream.r{rows}.s{step}"),
+                    &logits,
+                    reference,
+                )?;
                 maximum = maximum.max(error_max / scale);
-                rms = rms.max((error_square / 248144.0).sqrt() / scale);
+                rms = rms.max(error_rmse / scale);
                 let mut order = (0..248144).collect::<Vec<_>>();
                 order.sort_unstable_by(|&a, &b| {
                     reference[b].total_cmp(&reference[a]).then(a.cmp(&b))
@@ -4714,16 +4682,10 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
                     actual.len() == rows * expected.len(),
                     "chain boundary trace extent"
                 );
-                let mismatches = actual
-                    .iter()
-                    .zip(&expected)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                let maximum = actual
-                    .iter()
-                    .zip(&expected)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max);
+                let row0 = &actual[..expected.len()];
+                let cell = format!("moe.chain.boundary.c{chunk}.p{prefix}.l{layer}.{point}");
+                let mismatches = crate::verify::bit_mismatches(&cell, row0, &expected)?;
+                let (maximum, _) = crate::verify::max_abs_rmse(&cell, row0, &expected)?;
                 println!(
                     "CHAIN_BOUNDARY chunk={chunk} prefix={prefix} layer={layer} point={point} row0_mismatches={mismatches} max_abs={maximum}"
                 );
@@ -5057,16 +5019,9 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
                         "commit boundary trace extent"
                     );
                     let actual = &actual[2 * expected.len()..3 * expected.len()];
-                    let mismatches = actual
-                        .iter()
-                        .zip(&expected)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    let maximum = actual
-                        .iter()
-                        .zip(&expected)
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0f32, f32::max);
+                    let cell = format!("moe.chain.commit.c{chunk}.{name}");
+                    let mismatches = crate::verify::bit_mismatches(&cell, actual, &expected)?;
+                    let (maximum, _) = crate::verify::max_abs_rmse(&cell, actual, &expected)?;
                     println!(
                         "CHAIN_COMMIT_BOUNDARY chunk={chunk} row=2 point={name} mismatches={mismatches} max_abs={maximum}"
                     );
@@ -5654,14 +5609,13 @@ impl Input {
                 && input.pixels.iter().all(|value| value.is_finite()),
             "video pixel extent/finite check {case}"
         );
-        let error = input
-            .pixels
-            .iter()
-            .zip(&reference.pixels)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let (error, _) = crate::verify::max_abs_rmse(
+            &format!("moe.video.{case}"),
+            &input.pixels,
+            &reference.pixels,
+        )?;
         ensure!(
-            error <= tolerance,
+            error <= f64::from(tolerance),
             "video preprocess {case} pixel max={error} > {tolerance}"
         );
         let axes = input.packed().validate(&spec, 4352)?.packed_axes()?;

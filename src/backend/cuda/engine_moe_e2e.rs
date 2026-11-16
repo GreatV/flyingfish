@@ -493,44 +493,20 @@ impl Bounds {
     }
 }
 
-fn metrics(a: &[f32], b: &[f32]) -> Result<[f64; 4]> {
-    ensure!(
-        !a.is_empty() && a.len() == b.len(),
-        "comparison lengths {}/{}",
-        a.len(),
-        b.len()
-    );
-    ensure!(
-        a.iter().chain(b).all(|v| v.is_finite()),
-        "nonfinite comparison"
-    );
-    if a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()) {
-        return Ok([0.0, 0.0, 0.0, 1.0]);
-    }
-    let mut errors = Vec::with_capacity(a.len());
-    let (mut dot, mut aa, mut bb) = (0.0, 0.0, 0.0);
-    for (&a, &b) in a.iter().zip(b) {
-        let (a, b) = (f64::from(a), f64::from(b));
-        errors.push((a - b).abs());
-        dot += a * b;
-        aa += a * a;
-        bb += b * b;
-    }
+fn metrics(cell: &str, a: &[f32], b: &[f32]) -> Result<[f64; 4]> {
+    let m = crate::verify::metrics(cell, a, b)?;
+    let mut errors: Vec<f64> = a
+        .iter()
+        .zip(b)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .collect();
     errors.sort_unstable_by(f64::total_cmp);
-    Ok([
-        errors[errors.len() - 1],
-        errors[(errors.len() * 99).div_ceil(100).saturating_sub(1)],
-        errors.iter().sum::<f64>() / errors.len() as f64,
-        if aa == 0.0 && bb == 0.0 {
-            1.0
-        } else {
-            dot / (aa * bb).sqrt()
-        },
-    ])
+    let p99 = errors[(errors.len() * 99).div_ceil(100).saturating_sub(1)];
+    Ok([m.max_abs, p99, m.mean_abs, m.cosine])
 }
 
 fn score(name: &str, a: &[f32], b: &[f32], bound: [f64; 4]) -> Result<usize> {
-    let m = metrics(a, b)?;
+    let m = metrics(name, a, b)?;
     ensure!(m.iter().all(|v| v.is_finite()), "nonfinite metrics {name}");
     let pass = m[0] <= bound[0]
         && m[1] <= bound[1]
@@ -569,7 +545,7 @@ fn score_chain(
     rounds: u32,
     reductions: &[usize],
 ) -> Result<usize> {
-    let values = metrics(got, expected)?;
+    let values = metrics(name, got, expected)?;
     let magnitude = got
         .iter()
         .chain(expected)
@@ -2024,19 +2000,22 @@ fn teacher_force(
             .context("empty logits")?
             .0 as u32;
         predictions.push(prediction);
-        let error = (0..2)
-            .map(|j| {
-                let error = (values[top[2 * step + j] as usize] - expected[2 * step + j]).abs();
-                errors.push(error);
-                error
-            })
-            .fold(0.0f32, f32::max);
+        let mut error = 0.0f64;
+        for j in 0..2 {
+            let (one, _) = crate::verify::max_abs_rmse(
+                &format!("minicpm.teacher.{case}.s{step}.j{j}"),
+                &[values[top[2 * step + j] as usize]],
+                &[expected[2 * step + j]],
+            )?;
+            errors.push(one);
+            error = error.max(one);
+        }
         // Either of the two logits may move by the measured absolute-error bound.
         let id_margin = bounds.decode[0] + bounds.decode[0];
         let above_margin = f64::from(margins[step]) > id_margin;
         let id_ok = !above_margin || prediction == ids[step];
         scored += usize::from(above_margin);
-        let pass = f64::from(error) <= bounds.decode[0] && id_ok;
+        let pass = error <= bounds.decode[0] && id_ok;
         defects += usize::from(!pass);
         println!(
             "{} minicpm_teacher {case} step={step} top2_max={error} reference_margin={} id_scored={} predicted={prediction} reference={}",
@@ -2053,12 +2032,12 @@ fn teacher_force(
             drop(range);
         }
     }
-    errors.sort_unstable_by(f32::total_cmp);
+    errors.sort_unstable_by(f64::total_cmp);
     let median = errors[errors.len() / 2];
-    defects += usize::from(f64::from(median) > bounds.decode[1]);
+    defects += usize::from(median > bounds.decode[1]);
     println!(
         "{} minicpm_teacher_summary {case} steps={steps} ids_scored={scored} median_top2_error={median}",
-        if f64::from(median) <= bounds.decode[1] {
+        if median <= bounds.decode[1] {
             "PASS"
         } else {
             "DEFECT"
@@ -2149,7 +2128,7 @@ fn media_control(
     engine.reset()?;
     engine.prefill_multimodal(&input.packed(), None)?;
     let changed = engine.decode_logits()?;
-    let m = metrics(&changed, baseline)?;
+    let m = metrics("minicpm.media_control", &changed, baseline)?;
     let calls = engine
         .qwen
         .as_ref()
@@ -2202,6 +2181,7 @@ fn video_splice_control(
     engine.images = None;
     engine.prefill(&input.ids, None)?;
     let metrics = metrics(
+        "minicpm.video_splice",
         &engine.decode_logits()?,
         &floats(source, "prefill_last_logits_bf16")?,
     )?;
@@ -2226,11 +2206,11 @@ fn cosine_budget_covers_two_opposite_reference_errors() -> Result<()> {
     let reference = [1.0, 0.0];
     let a = [3.0, 4.0];
     let b = [3.0, -4.0];
-    let floor = metrics(&reference, &a)?;
+    let floor = metrics("minicpm.cosine.floor", &reference, &a)?;
     let cell = serde_json::json!({"max_abs":floor[0], "p99_abs":floor[1],
         "mean_abs":floor[2], "cosine_sim":floor[3]});
     let bound = measured_bounds(&[&cell])?;
-    let actual = metrics(&a, &b)?[3];
+    let actual = metrics("minicpm.cosine.pair", &a, &b)?[3];
     let linear = 1.0 - 2.0 * (1.0 - floor[3]);
     ensure!(
         actual < linear,
@@ -2627,7 +2607,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         }
     }
     if format == crate::model_spec::ExpertFormat::Bf16 {
-        let media = metrics(&media_logits[0], &media_logits[1])?;
+        let media = metrics("minicpm.two_media", &media_logits[0], &media_logits[1])?;
         defects += usize::from(media[0] < cross_media[0] || media[3] > cross_media[1]);
         println!(
             "minicpm_two_media max={} cosine={} defects={defects}",
@@ -2642,7 +2622,11 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
         .context("video bounds missing")?
         .1;
     for (index, bound) in [(1, video_bounds.cross_media), (2, video_bounds.media)] {
-        let metrics = metrics(&videos[0].1, &videos[index].1)?;
+        let metrics = metrics(
+            &format!("minicpm.two_videos.{}", videos[index].0),
+            &videos[0].1,
+            &videos[index].1,
+        )?;
         let pass =
             metrics[0] >= bound[0] && metrics[3] <= bound[1] && videos[0].2 != videos[index].2;
         defects += usize::from(!pass);
@@ -3481,13 +3465,12 @@ fn minicpm_decode_key_split_gpu() -> Result<()> {
                 reference.len() == prefill_logits.len(),
                 "reference logit extent"
             );
-            Some(
-                reference
-                    .iter()
-                    .zip(&prefill_logits)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max),
-            )
+            let (error, _) = crate::verify::max_abs_rmse(
+                &format!("minicpm.split.{case}.prefill"),
+                &prefill_logits,
+                &reference,
+            )?;
+            Some(error)
         } else {
             ensure!(case == "text_16k", "required reference logits missing");
             None
@@ -3505,7 +3488,7 @@ fn minicpm_decode_key_split_gpu() -> Result<()> {
             engine.set_token(*ids.last().context("empty split fixture")?)?;
             let mut margins = Vec::new();
             let mut predictions = Vec::new();
-            let mut shape_variation = 0.0f32;
+            let mut shape_variation = 0.0f64;
             for step in 0..9 {
                 let range =
                     super::super::super::profile::Range::new(!graph, c"attention_split_decode");
@@ -3518,11 +3501,12 @@ fn minicpm_decode_key_split_gpu() -> Result<()> {
                     "nonfinite split logits"
                 );
                 if step == 0 {
-                    shape_variation = logits
-                        .iter()
-                        .zip(&prefill_logits)
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0f32, f32::max);
+                    let (variation, _) = crate::verify::max_abs_rmse(
+                        &format!("minicpm.split.{case}.shape"),
+                        &logits,
+                        &prefill_logits,
+                    )?;
+                    shape_variation = variation;
                 }
                 let mut top = [f32::NEG_INFINITY; 2];
                 for &v in &logits {

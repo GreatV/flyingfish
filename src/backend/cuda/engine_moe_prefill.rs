@@ -3112,15 +3112,12 @@ mod tests {
                 && read(&reference, "routing", &[32, geometry.top_k as usize])? == routing,
             "expert tier reference input differs from T0"
         );
-        let reference_bound = |a: &[bf16], b: &[bf16]| {
-            let delta = a
-                .iter()
-                .zip(b)
-                .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                .fold(0.0f32, f32::max);
+        let reference_bound = |a: &[bf16], b: &[bf16]| -> Result<f32> {
+            let (delta, _) = crate::verify::max_abs_rmse("moe.expert_tier.bound", a, b)?;
             let twice = delta + delta;
-            let rounded = bf16::from_f32(twice);
-            bf16::from_bits(rounded.to_bits() + u16::from(rounded.to_f32() < twice)).to_f32()
+            let twice_f = twice as f32;
+            let rounded = bf16::from_f32(twice_f);
+            Ok(bf16::from_bits(rounded.to_bits() + u16::from(rounded.to_f32() < twice_f)).to_f32())
         };
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -3614,7 +3611,7 @@ mod tests {
                             read(&reference, &format!("batch{rows}_{name}"), &[rows, width])?;
                         let per_row = read(&reference, &format!("perrow32_{name}"), &[32, width])?;
                         let fp64 = read(&reference, &format!("fp64_{name}"), &[32, width])?;
-                        let bound = reference_bound(&batch, &per_row[..rows * width]);
+                        let bound = reference_bound(&batch, &per_row[..rows * width])?;
                         let sources = [
                             ("gpu_grouped", gpu_stages[stage].as_slice()),
                             ("cpu", cpu_stages[stage].as_slice()),
@@ -3625,22 +3622,12 @@ mod tests {
                         for a in 0..sources.len() {
                             for b in a + 1..sources.len() {
                                 let (left, right) = (sources[a], sources[b]);
-                                ensure!(
-                                    left.1.iter().chain(right.1).all(|value| value.is_finite()),
-                                    "nonfinite expert stage={name}"
-                                );
-                                let mismatches = left
-                                    .1
-                                    .iter()
-                                    .zip(right.1)
-                                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                                    .count();
-                                let maximum = left
-                                    .1
-                                    .iter()
-                                    .zip(right.1)
-                                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                                    .fold(0.0f32, f32::max);
+                                let cell =
+                                    format!("moe.expert_tier.stage.{name}.{}.{}", left.0, right.0);
+                                let mismatches =
+                                    crate::verify::bit_mismatches(&cell, left.1, right.1)?;
+                                let (maximum, _) =
+                                    crate::verify::max_abs_rmse(&cell, left.1, right.1)?;
                                 let first = left
                                     .1
                                     .iter()
@@ -3655,8 +3642,8 @@ mod tests {
                                     left.0, right.0
                                 );
                                 if a < 2 && (b == 2 || b == 3) {
-                                    let pass =
-                                        maximum <= bound && (bound != 0.0 || mismatches == 0);
+                                    let pass = maximum <= f64::from(bound)
+                                        && (bound != 0.0 || mismatches == 0);
                                     defects += usize::from(!pass);
                                     println!(
                                         "{} expert_tier_stage_reference rows={rows} stage={name} tier={} reference={} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
@@ -3680,20 +3667,13 @@ mod tests {
                 };
                 let batch = weighted_reference(&format!("batch{rows}_down"), &[rows, hidden])?;
                 let per_row = weighted_reference("perrow32_down", &[32, hidden])?;
-                let bound = reference_bound(&batch, &per_row);
+                let bound = reference_bound(&batch, &per_row)?;
                 for (tier, actual) in [("gpu", &gpu), ("cpu", &cpu), ("disk", &from_disk)] {
                     for (name, expected) in [("batch", &batch), ("per_row", &per_row)] {
-                        let mismatches = actual
-                            .iter()
-                            .zip(expected)
-                            .filter(|(a, b)| a.to_bits() != b.to_bits())
-                            .count();
-                        let maximum = actual
-                            .iter()
-                            .zip(expected)
-                            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                            .fold(0.0f32, f32::max);
-                        let pass = maximum <= bound && (bound != 0.0 || mismatches == 0);
+                        let cell = format!("moe.expert_tier.weighted.{tier}.{name}");
+                        let mismatches = crate::verify::bit_mismatches(&cell, actual, expected)?;
+                        let (maximum, _) = crate::verify::max_abs_rmse(&cell, actual, expected)?;
+                        let pass = maximum <= f64::from(bound) && (bound != 0.0 || mismatches == 0);
                         defects += usize::from(!pass);
                         println!(
                             "{} expert_tier_weighted_reference rows={rows} weighted={weighted} tier={tier} reference={name} max_abs={maximum} bound={bound} bit_mismatches={mismatches}",
@@ -3706,20 +3686,9 @@ mod tests {
                     ("gpu_vs_disk", &gpu, &from_disk),
                     ("cpu_pool_vs_disk", &cpu, &from_disk),
                 ] {
-                    ensure!(
-                        a.iter().chain(b).all(|value| value.is_finite()),
-                        "nonfinite expert tier contribution {name}"
-                    );
-                    let mismatches = a
-                        .iter()
-                        .zip(b)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    let maximum = a
-                        .iter()
-                        .zip(b)
-                        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                        .fold(0.0f32, f32::max);
+                    let cell = format!("moe.expert_tier.identity.{name}");
+                    let mismatches = crate::verify::bit_mismatches(&cell, a, b)?;
+                    let (maximum, _) = crate::verify::max_abs_rmse(&cell, a, b)?;
                     let first = a
                         .iter()
                         .zip(b)
@@ -5228,23 +5197,6 @@ mod tests {
         Ok((hidden, engine.decode_logits()?))
     }
 
-    fn max_difference<T: Copy>(a: &[T], b: &[T], value: impl Fn(T) -> f32) -> Result<f32> {
-        ensure!(
-            a.len() == b.len() && !a.is_empty(),
-            "Runner FAIL prefill comparison extents {} vs {}",
-            a.len(),
-            b.len()
-        );
-        ensure!(
-            a.iter().chain(b).all(|&x| value(x).is_finite()),
-            "Runner FAIL prefill comparison contains nonfinite values"
-        );
-        Ok(a.iter()
-            .zip(b)
-            .map(|(&a, &b)| (value(a) - value(b)).abs())
-            .fold(0.0, f32::max))
-    }
-
     fn reference_cohorts(
         ids: &[i32],
         layer: u32,
@@ -5508,15 +5460,23 @@ mod tests {
                 ));
             }
         }
-        let mut floor = [0.0f32; 2];
+        let mut floor = [0.0f64; 2];
         for (case, other, repeat) in floor_cases {
             ensure!(
                 same_bits(&other.0, &repeat.0, |x| u32::from(x.to_bits()))
                     && same_bits(&other.1, &repeat.1, f32::to_bits),
                 "Runner FAIL prefill floor reference repeat differs case={case}"
             );
-            let hidden = max_difference(&baseline.0, &other.0, bf16::to_f32)?;
-            let logits = max_difference(&baseline.1, &other.1, |x| x)?;
+            let (hidden, _) = crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.{case}.hidden"),
+                &baseline.0,
+                &other.0,
+            )?;
+            let (logits, _) = crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.{case}.logits"),
+                &baseline.1,
+                &other.1,
+            )?;
             floor[0] = floor[0].max(hidden);
             floor[1] = floor[1].max(logits);
             println!(
@@ -5538,8 +5498,16 @@ mod tests {
                 "Runner FAIL same-order reference repeat differs span_rows={}",
                 capacity.span_rows
             );
-            max_difference(&expected.0, &repeated.0, bf16::to_f32)?;
-            max_difference(&expected.1, &repeated.1, |x| x)?;
+            crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.repeat.{}.hidden", capacity.span_rows),
+                &expected.0,
+                &repeated.0,
+            )?;
+            crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.repeat.{}.logits", capacity.span_rows),
+                &expected.1,
+                &repeated.1,
+            )?;
             println!(
                 "PASS prefill_order_identity_reference span_rows={} chunk=8 wave=4 hidden_words={} logits_words={} same_form_bitwise=true ref_outside_NVTX=true",
                 capacity.span_rows,
@@ -5583,8 +5551,16 @@ mod tests {
                 engine.device.stream.synchronize()?;
             }
             let logits = engine.decode_logits()?;
-            max_difference(&identity.0, &hidden, bf16::to_f32)?;
-            max_difference(&identity.1, &logits, |x| x)?;
+            crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.identity.{span_rows}.hidden"),
+                &identity.0,
+                &hidden,
+            )?;
+            crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.identity.{span_rows}.logits"),
+                &identity.1,
+                &logits,
+            )?;
             let identity_hidden = identity
                 .0
                 .iter()
@@ -5604,8 +5580,16 @@ mod tests {
                 hidden.len(),
                 logits.len()
             );
-            let hidden_error = max_difference(&baseline.0, &hidden, bf16::to_f32)?;
-            let logits_error = max_difference(&baseline.1, &logits, |x| x)?;
+            let (hidden_error, _) = crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.candidate.{span_rows}.hidden"),
+                &baseline.0,
+                &hidden,
+            )?;
+            let (logits_error, _) = crate::verify::max_abs_rmse(
+                &format!("moe.prefill.order.candidate.{span_rows}.logits"),
+                &baseline.1,
+                &logits,
+            )?;
             let hidden_bitwise = same_bits(&baseline.0, &hidden, |x| u32::from(x.to_bits()));
             let logits_bitwise = same_bits(&baseline.1, &logits, f32::to_bits);
             let drains = engine

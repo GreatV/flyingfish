@@ -1120,7 +1120,7 @@ impl GpuCase<'_> {
         self.ops.prefill(s, input, self.scratch)?;
         s.synchronize()?;
         let y = s.clone_dtoh(&case_bufs.y)?;
-        let mut max_diff = 0.0f32;
+        let mut max_diff = 0.0f64;
         for &row in check {
             let keep_row: Vec<usize> = (0..top_k)
                 .filter(|&c| active[row * top_k + c] == 1)
@@ -1153,21 +1153,20 @@ impl GpuCase<'_> {
                     self.routed_weight,
                 )
             };
-            for c in 0..hidden {
-                let got = y[row * hidden + c];
-                anyhow::ensure!(
-                    got.to_f32().is_finite(),
-                    "moe_prefill {label} row {row} column {c} is non-finite"
-                );
-                max_diff = max_diff.max((got.to_f32() - expected[c].to_f32()).abs());
-            }
+            let got_row = &y[row * hidden..(row + 1) * hidden];
+            let (row_diff, _) = crate::verify::max_abs_rmse(
+                &format!("moe.prefill.{label}.r{row}"),
+                got_row,
+                &expected,
+            )?;
+            max_diff = max_diff.max(row_diff);
         }
         eprintln!(
             "moe_prefill {label} rows={rows} checked={} max_diff={max_diff:.6} tol={:.6}",
             check.len(),
             tol
         );
-        if max_diff > tol {
+        if max_diff > f64::from(tol) {
             defects.push(format!(
                 "{label} rows={rows} max_diff {max_diff:.6} > tol {:.6}",
                 tol
@@ -1304,7 +1303,7 @@ fn control_diff(
     weights: &[bf16],
     gens: &[u64],
     slots: &DeviceSlots,
-) -> Result<f32> {
+) -> Result<f64> {
     let s = case.s;
     let (top_k, hidden) = (case.fx.dims.top_k, case.fx.dims.hidden);
     let case_bufs = case.bufs(rows, ids, active, weights, gens)?;
@@ -1314,7 +1313,7 @@ fn control_diff(
     s.synchronize()?;
     let y = s.clone_dtoh(&case_bufs.y)?;
     let all: Vec<usize> = (0..top_k).collect();
-    let mut max_diff = 0.0f32;
+    let mut max_diff = 0.0f64;
     for row in 0..rows {
         let expected = reference::moe_row_ids_with_boundary(
             case.fx,
@@ -1325,9 +1324,12 @@ fn control_diff(
             Combine::Fp32,
             case.routed_weight,
         );
-        for c in 0..hidden {
-            max_diff = max_diff.max((y[row * hidden + c].to_f32() - expected[c].to_f32()).abs());
-        }
+        let (row_diff, _) = crate::verify::max_abs_rmse(
+            &format!("moe.prefill.control.r{row}"),
+            &y[row * hidden..(row + 1) * hidden],
+            &expected,
+        )?;
+        max_diff = max_diff.max(row_diff);
     }
     Ok(max_diff)
 }
@@ -1682,13 +1684,13 @@ fn moe_prefill_gpu() -> Result<()> {
             &(0..mk).collect::<Vec<_>>(),
             reference::Combine::Fp32,
         );
-        let diff_m = got_m[..mh]
-            .iter()
-            .zip(&want_m)
-            .map(|(got, want)| (got.to_f32() - want.to_f32()).abs())
-            .fold(0.0f32, f32::max);
+        let (diff_m, _) = crate::verify::max_abs_rmse(
+            &format!("moe.prefill.mixed.i{mi}.s{msi}"),
+            &got_m[..mh],
+            &want_m,
+        )?;
         let tol_m = reference::tolerance(&mixed, &[0]);
-        if diff_m > tol_m {
+        if diff_m > f64::from(tol_m) {
             defects.push(format!(
                 "mixed prefill expert_inter={mi} shared_inter={msi} max_diff={diff_m:e} tol={tol_m:e}"
             ));
@@ -1784,7 +1786,7 @@ fn moe_prefill_gpu() -> Result<()> {
         )?;
         let diff = control_diff(&case, rows, &ids, &active, &weights, &gens, &swapped)?;
         anyhow::ensure!(
-            diff > tol,
+            diff > f64::from(tol),
             "swapped slot-table control was not detected: {diff:.6} <= {tol:.6}"
         );
 
@@ -1812,7 +1814,7 @@ fn moe_prefill_gpu() -> Result<()> {
         )?;
         let diff = control_diff(&case, rows, &ids, &active, &weights, &gens, &rolled_slots)?;
         anyhow::ensure!(
-            diff > tol,
+            diff > f64::from(tol),
             "rolled gate/up split control was not detected: {diff:.6} <= {tol:.6}"
         );
     }
@@ -1972,8 +1974,8 @@ fn moe_prefill_gpu() -> Result<()> {
             &cohort.contributions,
             &cohort.done,
         )?;
-        let mut row0_diff = 0.0f32;
-        let mut max_diff = 0.0f32;
+        let mut row0_diff = 0.0f64;
+        let mut max_diff = 0.0f64;
         for row in 0..rows {
             let expected = reference::moe_row_ids(
                 &fx,
@@ -1983,21 +1985,27 @@ fn moe_prefill_gpu() -> Result<()> {
                 &(0..top_k).collect::<Vec<_>>(),
                 Combine::Fp32,
             );
-            for c in 0..hidden {
-                let got = bf16::from_bits(bits[row * hidden + c]).to_f32();
-                let diff = (got - expected[c].to_f32()).abs();
-                if row == 0 {
-                    row0_diff = row0_diff.max(diff);
-                }
-                max_diff = max_diff.max(diff);
+            let got_row: Vec<bf16> = bits[row * hidden..(row + 1) * hidden]
+                .iter()
+                .copied()
+                .map(bf16::from_bits)
+                .collect();
+            let (row_diff, _) = crate::verify::max_abs_rmse(
+                &format!("moe.prefill.pos_of.r{row}"),
+                &got_row,
+                &expected,
+            )?;
+            if row == 0 {
+                row0_diff = row_diff;
             }
+            max_diff = max_diff.max(row_diff);
         }
         eprintln!(
             "moe_prefill K2 duplicate-pos_of rows={rows} planted pos_of[1]={} (was {}) row0 max_diff={row0_diff:.6} max_diff={max_diff:.6} tol={:.6}",
             planted.0, planted.1, tol
         );
         anyhow::ensure!(
-            row0_diff > tol && max_diff > tol,
+            row0_diff > f64::from(tol) && max_diff > f64::from(tol),
             "duplicate pos_of was not detected: row0 {row0_diff:.6} max {max_diff:.6} <= tol {tol:.6}"
         );
     }
@@ -4773,11 +4781,11 @@ fn clover_layer_cohorts(
         .zip(&reference_logits)
         .filter(|(a, b)| a.to_bits() != bf16::from_f32(**b).to_bits())
         .count();
-    let logit_delta = native_logits
-        .iter()
-        .zip(&reference_logits)
-        .map(|(a, b)| (a.to_f32() - b).abs())
-        .fold(0.0f32, f32::max);
+    let (logit_delta, _) = crate::verify::max_abs_rmse(
+        &format!("moe.clover.{tag}.logits"),
+        &native_logits,
+        &reference_logits,
+    )?;
     let mut margin = f32::INFINITY;
     let mut ties = 0;
     for row in reference_logits.as_chunks::<256>().0 {

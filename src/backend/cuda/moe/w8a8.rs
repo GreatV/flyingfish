@@ -501,19 +501,6 @@ mod tests {
         exponent + i32::from((bits & 0x7FFFFF) != 0)
     }
 
-    /// Distance in representable BF16 values between two outputs.
-    fn bf16_ulp_distance(a: bf16, b: bf16) -> u32 {
-        fn key(value: bf16) -> u32 {
-            let bits = u32::from(value.to_bits());
-            if bits & 0x8000 != 0 {
-                (!bits) & 0xffff
-            } else {
-                bits | 0x8000
-            }
-        }
-        key(a).abs_diff(key(b))
-    }
-
     /// Activation quantization of one row: per `block` elements the amax is
     /// floored at 1e-4, the E8M0 scale is 2^ceil(log2(amax/448)) and the
     /// codes are E4M3.
@@ -938,10 +925,15 @@ mod tests {
             for d in 0..HIDDEN {
                 let got = host[d];
                 let want = bf16::from_f32(expected[d] as f32);
-                let distance = bf16_ulp_distance(got, want);
+                let (distance, _, _) = crate::verify::bf16_ulp_max(
+                    &format!("w8a8.shared{index}.d{d}"),
+                    &[got],
+                    &[want],
+                    None,
+                )?;
                 let abs = (f64::from(got.to_f32()) - expected[d]).abs();
                 ensure!(
-                    distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
+                    u32::from(distance) <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                     "w8a8 shared expert {index} dim {d} bf16 ulp distance {distance} abs {abs}"
                 );
             }
@@ -949,9 +941,14 @@ mod tests {
             for d in 0..HIDDEN {
                 let got = host[d];
                 let wrong = wrong_host[d];
-                let distance = bf16_ulp_distance(got, wrong);
+                let (distance, _, _) = crate::verify::bf16_ulp_max(
+                    &format!("w8a8.shared{index}.ctrl.d{d}"),
+                    &[got],
+                    &[wrong],
+                    None,
+                )?;
                 let abs = (f64::from(got.to_f32()) - f64::from(wrong.to_f32())).abs();
-                if distance > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
+                if u32::from(distance) > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
                     caught += 1;
                 }
             }

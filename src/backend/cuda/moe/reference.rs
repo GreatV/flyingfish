@@ -753,21 +753,16 @@ impl CloverMoeFixture {
     ) -> Result<bool> {
         let reference = self.values(&format!("{tag}.fp.{metric}"))?;
         ensure!(
-            values.len() == reference.len()
-                && values.iter().all(|v| v.is_finite())
-                && reference.iter().all(|v| v.is_finite()),
-            "Runner FAIL MoE shape/nonfinite {tag} {metric}"
+            values.len() == reference.len(),
+            "Runner FAIL MoE shape {tag} {metric}"
         );
-        let mut maximum = 0.0f64;
-        let mut squared = 0.0f64;
-        let mut norm = 0.0f64;
-        for (value, expected) in values.iter().zip(reference) {
-            let delta = value.to_f64() - f64::from(expected);
-            maximum = maximum.max(delta.abs());
-            squared += delta * delta;
-            norm += f64::from(expected).powi(2);
-        }
-        let relative = (squared / norm.max(1e-60)).sqrt();
+        let measured = crate::verify::metrics(
+            &format!("moe.reference.score.{tag}.{metric}"),
+            values,
+            &reference,
+        )?;
+        let maximum = measured.max_abs;
+        let relative = measured.rel_rmse;
         let pass = maximum <= bound["max_abs"].as_f64().unwrap()
             && relative <= bound["relative_l2"].as_f64().unwrap();
         println!(
@@ -818,9 +813,7 @@ mod tests {
             .0;
         let keep: Vec<usize> = (0..fx.dims.top_k).filter(|&c| c != drop).collect();
         let sub = moe_row_choices(&fx, 1, &keep);
-        let maxdiff = (0..fx.dims.hidden)
-            .map(|d| (full[d].to_f32() - sub[d].to_f32()).abs())
-            .fold(0.0f32, f32::max);
+        let (maxdiff, _) = crate::verify::max_abs_rmse("moe.reference.drop", &full, &sub).unwrap();
         assert!(maxdiff > 0.0, "dropping a contribution must change the row");
     }
 
