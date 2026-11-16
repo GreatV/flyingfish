@@ -745,7 +745,7 @@ extern "C" __global__ void __launch_bounds__(256) distribution_rows_bf16(
 extern "C" __global__ void categorical_sample_rows(
     const float* __restrict__ probs, int* __restrict__ out, int rows,
     long long vocab, unsigned long long seed, unsigned long long stream,
-    unsigned long long counter_base, int vocab_threads,
+    const unsigned long long* __restrict__ counter_base, int vocab_threads,
     int* __restrict__ history, int track_history) {
   if (rows < 1 || vocab < 1 || vocab_threads < 1 || (blockDim.x & 31) != 0 ||
       (int)blockDim.x != vocab_threads || vocab_threads > 1024 ||
@@ -757,7 +757,7 @@ extern "C" __global__ void categorical_sample_rows(
   const int warp = tid >> 5;
   const uint2 key =
       make_uint2((unsigned)(seed & 0xffffffffu), (unsigned)(seed >> 32));
-  const unsigned long long draw = counter_base + (unsigned long long)row;
+  const unsigned long long draw = counter_base[0] + (unsigned long long)row;
   const uint4 counter =
       make_uint4((unsigned)(stream & 0xffffffffu), (unsigned)(stream >> 32),
                  (unsigned)(draw & 0xffffffffu), (unsigned)(draw >> 32));

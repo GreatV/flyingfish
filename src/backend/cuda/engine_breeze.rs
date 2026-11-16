@@ -373,6 +373,7 @@ struct Buf {
     picked: CudaSlice<u32>, // slot 0 backbone, slots 1..15 depth heads
     probabilities: CudaSlice<f32>,
     backbone_history: CudaSlice<i32>,
+    sample_counters: CudaSlice<u64>,
 }
 
 struct Flashes {
@@ -997,7 +998,7 @@ struct SampleRequest {
     sampling: crate::sampling::Sampling,
     seed: u64,
     stream: u64,
-    counter: u64,
+    counter_index: usize,
     allow: i32,
     repetition: bool,
 }
@@ -1008,6 +1009,7 @@ fn sample_rows(
     probabilities: &mut CudaSlice<f32>,
     picked: &mut CudaSlice<u32>,
     backbone_history: &mut CudaSlice<i32>,
+    sample_counters: &CudaSlice<u64>,
     request: SampleRequest,
 ) -> Result<()> {
     let elements = request
@@ -1026,6 +1028,11 @@ fn sample_rows(
         backbone_history.len() >= request.vocab,
         "sampling history extent"
     );
+    ensure!(
+        request.counter_index + request.rows <= sample_counters.len(),
+        "sampling counter extent"
+    );
+    let counter = sample_counters.slice(request.counter_index..request.counter_index + 1);
     let source = logits.slice(request.source_start..request.source_start + elements);
     let mut probs = probabilities.slice_mut(..elements);
     let mut out = picked.slice_mut(request.picked_start..request.picked_start + request.rows);
@@ -1062,7 +1069,7 @@ fn sample_rows(
             .arg(&vocab_i)
             .arg(&request.seed)
             .arg(&request.stream)
-            .arg(&request.counter)
+            .arg(&counter)
             .arg(&256i32)
             .arg(backbone_history)
             .arg(&track_history)
@@ -1248,6 +1255,7 @@ fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
         picked: stream.alloc_zeros(BOOKS)?,
         probabilities: stream.alloc_zeros(BOOKS * BB_VOCAB)?,
         backbone_history: stream.alloc_zeros(BB_VOCAB)?,
+        sample_counters: stream.alloc_zeros(HEAD_N)?,
     })
 }
 
@@ -2783,7 +2791,7 @@ struct DepthSampleHead<'a> {
     weight: &'a CudaSlice<bf16>,
     head: usize,
     hidden_row: usize,
-    counter: u64,
+    counter_index: usize,
     sampling: crate::sampling::Sampling,
     seed: u64,
 }
@@ -2818,6 +2826,7 @@ fn depth_sample_head(
         &mut buf.probabilities,
         &mut buf.picked,
         &mut buf.backbone_history,
+        &buf.sample_counters,
         SampleRequest {
             source_start: 0,
             picked_start: call.head + 1,
@@ -2826,7 +2835,7 @@ fn depth_sample_head(
             sampling: call.sampling,
             seed: call.seed,
             stream: 1,
-            counter: call.counter,
+            counter_index: call.counter_index,
             allow: -1,
             repetition: false,
         },
@@ -2875,7 +2884,12 @@ struct DepthSample<'a> {
 fn sample_depth(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthSample<'_>) -> Result<()> {
     stage_depth_cond(k, buf, step.cond)?;
     let flash = &mut *step.flash;
-    let counter = depth_sample_counter(step.frame);
+    let counters = (0..HEAD_N)
+        .map(|head| depth_sample_counter(step.frame) + head as u64)
+        .collect::<Vec<_>>();
+    k.stream.memcpy_htod(&counters, &mut buf.sample_counters)?;
+    k.h2d
+        .set(k.h2d.get() + (HEAD_N * std::mem::size_of::<u64>()) as u64);
     with_graph(k, Replay::DepthSample, || {
         embed_sampled(k, buf, &step.w.audio, 0, 0, 1)?;
         stage_depth_runtime(k, buf, 2, 0)?;
@@ -2901,7 +2915,7 @@ fn sample_depth(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthSample<'_>) -> 
                 weight: &step.w.heads[0],
                 head: 0,
                 hidden_row: 1,
-                counter,
+                counter_index: 0,
                 sampling: step.sampling,
                 seed: step.seed,
             },
@@ -2931,7 +2945,7 @@ fn sample_depth(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthSample<'_>) -> 
                     weight: &step.w.heads[head],
                     head,
                     hidden_row: 0,
-                    counter: counter + head as u64,
+                    counter_index: head,
                     sampling: step.sampling,
                     seed: step.seed,
                 },
@@ -3497,12 +3511,16 @@ impl Breeze {
                 (!prefill).then_some(&w.audio),
                 false,
             )?;
+            k.stream
+                .memcpy_htod(&[frame as u64], &mut buf.sample_counters.slice_mut(0..1))?;
+            k.h2d.set(k.h2d.get() + std::mem::size_of::<u64>() as u64);
             sample_rows(
                 k,
                 &buf.d,
                 &mut buf.probabilities,
                 &mut buf.picked,
                 &mut buf.backbone_history,
+                &buf.sample_counters,
                 SampleRequest {
                     source_start: score_row * BB_VOCAB,
                     picked_start: 0,
@@ -3511,7 +3529,7 @@ impl Breeze {
                     sampling,
                     seed,
                     stream: 0,
-                    counter: frame as u64,
+                    counter_index: 0,
                     allow: 2051,
                     repetition: true,
                 },
@@ -4422,6 +4440,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GPU lease and publisher prompt fixture"]
+    fn breeze_sample_decode_eager_graph_match() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let run = |graph| -> Result<Vec<i32>> {
+            let runtime = RuntimeDir::with_prefix("n8-depth-counter")?;
+            let mut model =
+                super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 750)?;
+            model.set_graph(graph);
+            let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+            model.sample_decode(
+                &projected,
+                prompt.len(),
+                crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?,
+                18,
+            )
+        };
+        let eager = run(false)?;
+        let graph = run(true)?;
+        let mismatch = eager
+            .iter()
+            .zip(&graph)
+            .position(|(a, b)| a != b)
+            .map(|index| index / super::BOOKS);
+        println!(
+            "BREEZE_DEPTH_COUNTER_CONTROL eager_frames={} graph_frames={} first_mismatch={:?}",
+            eager.len() / super::BOOKS,
+            graph.len() / super::BOOKS,
+            mismatch
+        );
+        ensure!(eager.len() == 50 * super::BOOKS, "eager trajectory length");
+        ensure!(eager == graph, "eager/graph sampled trajectories differ");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires GPU lease and publisher Philox fixture"]
     fn breeze_sample_prefix_matches_publisher_philox() -> Result<()> {
         ensure!(
@@ -4552,12 +4617,18 @@ mod tests {
                 .as_f64()
                 .context("publisher probability")?;
             let probability_max = (f64::from(probabilities[2051]) - publisher_probability).abs();
+            super::copy_h2d(
+                &model.k,
+                &[frame as u64],
+                &mut model.buf.sample_counters.slice_mut(0..1),
+            )?;
             super::sample_rows(
                 &model.k,
                 &model.buf.d,
                 &mut model.buf.probabilities,
                 &mut model.buf.picked,
                 &mut model.buf.backbone_history,
+                &model.buf.sample_counters,
                 super::SampleRequest {
                     source_start: start,
                     picked_start: 0,
@@ -4566,7 +4637,7 @@ mod tests {
                     sampling,
                     seed: 42,
                     stream: 0,
-                    counter: frame as u64,
+                    counter_index: 0,
                     allow: 2051,
                     repetition: false,
                 },

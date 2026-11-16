@@ -443,6 +443,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
     let d_probs = s.clone_htod(&probs)?;
     let d_pick = s.clone_htod(&vec![-1i32; srows])?;
     let mut d_categorical_history = s.alloc_zeros::<i32>(svocab)?;
+    let d_counter_zero = s.clone_htod(&[0u64])?;
     unsafe {
         s.launch_builder(&categorical)
             .arg(&d_probs)
@@ -451,7 +452,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&1234u64)
             .arg(&9u64)
-            .arg(&0u64)
+            .arg(&d_counter_zero)
             .arg(&256i32)
             .arg(&mut d_categorical_history)
             .arg(&0i32)
@@ -472,7 +473,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&1234u64)
             .arg(&9u64)
-            .arg(&0u64)
+            .arg(&d_counter_zero)
             .arg(&256i32)
             .arg(&mut d_categorical_history)
             .arg(&0i32)
@@ -495,7 +496,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&0u64)
             .arg(&38471471u64)
-            .arg(&0u64)
+            .arg(&d_counter_zero)
             .arg(&256i32)
             .arg(&mut d_categorical_history)
             .arg(&0i32)
@@ -536,6 +537,7 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
     let d_logits = s.clone_htod(&host)?;
     let d_probs = s.alloc_zeros::<f32>(rows * vocab)?;
     let mut d_history = s.alloc_zeros::<i32>(vocab)?;
+    let d_counter_three = s.clone_htod(&[3u64])?;
     let run_distribution =
         |history: &cudarc::driver::CudaSlice<i32>, allow: i32, penalty: f32| -> Result<()> {
             unsafe {
@@ -583,7 +585,7 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
                 .arg(&(vocab as i64))
                 .arg(&seed)
                 .arg(&1u64)
-                .arg(&3u64)
+                .arg(&d_counter_three)
                 .arg(&256i32)
                 .arg(&mut untracked)
                 .arg(&0i32)
@@ -614,7 +616,7 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
             .arg(&(vocab as i64))
             .arg(&7u64)
             .arg(&1u64)
-            .arg(&3u64)
+            .arg(&d_counter_three)
             .arg(&256i32)
             .arg(&mut d_history)
             .arg(&1i32)
