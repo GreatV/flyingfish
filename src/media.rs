@@ -290,18 +290,35 @@ impl Drop for ScratchFile {
 }
 
 pub fn write_png(writer: impl Write, width: usize, height: usize, rgb: &[u8]) -> Result<()> {
+    write_png_color(writer, width, height, rgb, png::ColorType::Rgb)
+}
+
+/// RGBA PNG with the alpha channel retained (image-to-3D inputs carry the
+/// removed background in alpha).
+pub fn write_png_rgba(writer: impl Write, width: usize, height: usize, rgba: &[u8]) -> Result<()> {
+    write_png_color(writer, width, height, rgba, png::ColorType::Rgba)
+}
+
+fn write_png_color(
+    writer: impl Write,
+    width: usize,
+    height: usize,
+    data: &[u8],
+    color: png::ColorType,
+) -> Result<()> {
     let width = u32::try_from(width).context("PNG width exceeds u32")?;
     let height = u32::try_from(height).context("PNG height exceeds u32")?;
+    let channels = color.samples();
     let expected = (width as usize)
         .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(3))
+        .and_then(|n| n.checked_mul(channels))
         .context("PNG extent overflow")?;
-    ensure!(expected > 0 && rgb.len() == expected, "PNG RGB extent");
+    ensure!(expected > 0 && data.len() == expected, "PNG pixel extent");
     let mut encoder = png::Encoder::new(writer, width, height);
-    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_color(color);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
-    writer.write_image_data(rgb)?;
+    writer.write_image_data(data)?;
     writer.finish()?;
     Ok(())
 }
@@ -864,8 +881,190 @@ pub fn write_obj(mut writer: impl Write, mesh: &MeshWrite<'_>) -> Result<()> {
     Ok(())
 }
 
+/// A triangle mesh read from a mesh file: row-major positions [rows, 3] and
+/// triangle indices [faces, 3].
+pub struct MeshRead {
+    pub positions: Vec<f32>,
+    pub triangles: Vec<i32>,
+}
+
+/// Reads the binary little-endian PLY layout `write_ply` emits (float x y z,
+/// optional uchar red green blue, named float extras, uchar-count/int-index
+/// triangle lists; extra vertex properties are skipped by size) and OBJ `v`
+/// vertex and `f` triangle lines (other lines are ignored). Vertex colours
+/// and extras are discarded.
+pub fn read_mesh(bytes: &[u8], extension: &str) -> Result<MeshRead> {
+    match extension {
+        "ply" => read_ply(bytes),
+        "obj" => read_obj(bytes),
+        other => bail!("unsupported mesh extension {other:?}"),
+    }
+}
+
+fn read_ply(bytes: &[u8]) -> Result<MeshRead> {
+    let header_end = bytes
+        .windows("end_header\n".len())
+        .position(|window| window == b"end_header\n")
+        .map(|position| position + "end_header\n".len())
+        .context("PLY end_header missing")?;
+    let header = std::str::from_utf8(&bytes[..header_end])?;
+    ensure!(
+        header.contains("format binary_little_endian 1.0"),
+        "only binary little-endian PLY is supported"
+    );
+    let mut vertex_properties = 0usize;
+    let mut vertex_bytes = 0usize;
+    let mut faces = 0usize;
+    let mut rows = 0usize;
+    let mut in_vertices = false;
+    for line in header.lines() {
+        let words: Vec<_> = line.split_whitespace().collect();
+        match (words.first().copied(), in_vertices) {
+            (Some("element"), _) => {
+                in_vertices = words.get(1).copied() == Some("vertex");
+                if words.get(1).copied() == Some("face") {
+                    faces = words
+                        .get(2)
+                        .and_then(|count| count.parse::<usize>().ok())
+                        .context("PLY face count")?;
+                }
+                if in_vertices {
+                    rows = words
+                        .get(2)
+                        .and_then(|count| count.parse::<usize>().ok())
+                        .context("PLY vertex count")?;
+                }
+            }
+            (Some("property"), true) => {
+                vertex_properties += 1;
+                vertex_bytes += match words.get(1).copied() {
+                    Some("float") | Some("float32") => 4,
+                    Some("uchar") | Some("uint8") => 1,
+                    Some("int") | Some("int32") => 4,
+                    other => bail!("unsupported PLY property type {other:?}"),
+                };
+            }
+            _ => {}
+        }
+    }
+    ensure!(
+        vertex_properties >= 3 && vertex_bytes >= 12,
+        "PLY vertex properties carry no x y z"
+    );
+    let mut body = &bytes[header_end..];
+    let mut positions = Vec::with_capacity(rows * 3);
+    for _ in 0..rows {
+        let row = body.get(..vertex_bytes).context("truncated PLY vertex")?;
+        body = &body[vertex_bytes..];
+        positions.extend(
+            row[..12]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|value| f32::from_le_bytes(*value)),
+        );
+    }
+    let mut triangles = Vec::with_capacity(faces * 3);
+    for _ in 0..faces {
+        let count = *body.first().context("truncated PLY face count")? as usize;
+        ensure!(count == 3, "PLY face with {count} vertices");
+        body = &body[1..];
+        let face = body.get(..12).context("truncated PLY face")?;
+        body = &body[12..];
+        triangles.extend(
+            face.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|value| i32::from_le_bytes(*value)),
+        );
+    }
+    Ok(MeshRead {
+        positions,
+        triangles,
+    })
+}
+
+fn read_obj(bytes: &[u8]) -> Result<MeshRead> {
+    let text = std::str::from_utf8(bytes)?;
+    let mut positions = Vec::new();
+    let mut triangles = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("v") => {
+                let values: Vec<f32> = words
+                    .take(3)
+                    .map(|word| word.parse::<f32>())
+                    .collect::<Result<_, _>>()
+                    .context("OBJ vertex")?;
+                positions.extend(values);
+            }
+            Some("f") => {
+                let indices: Vec<i32> = words
+                    .take(3)
+                    .map(|word| {
+                        word.split('/')
+                            .next()
+                            .and_then(|index| index.parse::<i32>().ok())
+                            .context("OBJ face index")
+                    })
+                    .collect::<Result<_, _>>()?;
+                triangles.extend(indices.iter().map(|index| index - 1));
+            }
+            _ => {}
+        }
+    }
+    Ok(MeshRead {
+        positions,
+        triangles,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mesh_reader_round_trips_both_writers() -> Result<()> {
+        // Same discriminating pattern as mesh_writers_round_trip: the RGB and
+        // extra channels are skipped by size, so a stride error moves every
+        // position after row 0, and the OBJ 1-based conversion moves the
+        // cross-boundary faces.
+        let rows = 10usize;
+        let positions: Vec<f32> = (0..rows)
+            .flat_map(|row| [row as f32 * 0.5, -(row as f32), (row as f32) + 0.25])
+            .collect();
+        let triangles: Vec<i32> = (0..rows - 2)
+            .flat_map(|i| [i as i32, i as i32 + 1, 9])
+            .collect();
+        let rgb: Vec<u8> = (0..rows).flat_map(|row| [1 + row as u8, 2, 3]).collect();
+        let extras_source: Vec<f32> = (0..rows).map(|row| row as f32 * 7.0).collect();
+        let extras = [("quality", extras_source.as_slice())];
+        let mesh = MeshWrite {
+            positions: &positions,
+            triangles: &triangles,
+            rgb: Some(&rgb),
+            extras: &extras,
+        };
+        for extension in ["ply", "obj"] {
+            let mut bytes = Vec::new();
+            if extension == "ply" {
+                write_ply(&mut bytes, &mesh)?;
+            } else {
+                write_obj(&mut bytes, &mesh)?;
+            }
+            let read = read_mesh(&bytes, extension)?;
+            assert_eq!(read.positions, positions, "{extension} positions");
+            assert_eq!(read.triangles, triangles, "{extension} triangles");
+        }
+        let truncated = read_mesh(&positions_f32_bytes(), "ply");
+        assert!(truncated.is_err(), "truncated PLY accepted");
+        Ok(())
+    }
+
+    fn positions_f32_bytes() -> Vec<u8> {
+        b"ply\nformat binary_little_endian 1.0\nelement vertex 4\nproperty float x\nend_header\n"
+            .to_vec()
+    }
 
     #[test]
     fn mesh_writers_round_trip() -> Result<()> {
