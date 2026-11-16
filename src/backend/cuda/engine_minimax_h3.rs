@@ -2207,15 +2207,13 @@ impl BlockKernels {
     #[cfg(test)]
     fn rms_norm_modulate(&self, s: &Arc<CudaStream>, n: NormRows, m: ModulateRows) -> Result<()> {
         self.prepare_norm_modulate(&n, &m)?;
-        #[cfg(test)]
-        if self.serial_norm_modulate.get() {
-            self.rms_norm_f32(s, n)?;
-            return self.row_modulate(s, m);
-        }
         self.launch_norm_modulate(s, &self.norm_modulate, &n, &m)
     }
 
     /// Weight multiplies in f32. The modulate stores keep the four BF16 rounds.
+    /// The test-only serial flag swaps the fused launch for the separate
+    /// f32 norm and row modulation, so the identity gates compare distinct
+    /// paths.
     fn rms_norm_modulate_f32(
         &self,
         s: &Arc<CudaStream>,
@@ -2223,6 +2221,11 @@ impl BlockKernels {
         m: ModulateRows,
     ) -> Result<()> {
         self.prepare_norm_modulate(&n, &m)?;
+        #[cfg(test)]
+        if self.serial_norm_modulate.get() {
+            self.rms_norm_f32(s, n)?;
+            return self.row_modulate(s, m);
+        }
         self.launch_norm_modulate(s, &self.norm_modulate_f32, &n, &m)
     }
 
