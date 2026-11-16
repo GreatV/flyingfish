@@ -11,6 +11,218 @@ use std::{collections::BTreeMap, fs, path::Path};
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::music3::{Runtime, generate};
 
+fn rewrite_special_tags(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<|") {
+        output.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("|>") else {
+            output.push_str(&rest[open..]);
+            return output;
+        };
+        let inner = &after[..close];
+        let mut parts = inner.split_whitespace();
+        if let (Some(first), Some(second)) = (parts.next(), parts.next()) {
+            output.push_str(first);
+            output.push_str(" is ");
+            output.push_str(second);
+            let remainder = parts.collect::<Vec<_>>().join(" ");
+            if !remainder.is_empty() {
+                output.push(' ');
+                output.push_str(&remainder);
+            }
+        } else {
+            output.push_str(inner.trim());
+        }
+        rest = &after[close + 2..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn strip_heading(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && index < 3 && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    let start = index;
+    while index < bytes.len() && index - start < 6 && bytes[index] == b'#' {
+        index += 1;
+    }
+    if index > start && index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        line[index..].trim_start()
+    } else {
+        line
+    }
+}
+
+fn strip_bullet(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() > 1 && matches!(bytes[0], b'*' | b'+' | b'-') && bytes[1].is_ascii_whitespace() {
+        trimmed[1..].trim_start()
+    } else {
+        line
+    }
+}
+
+fn replace_bold(line: &str) -> String {
+    let mut output = line.to_owned();
+    while let Some(open) = output.find("**") {
+        let Some(relative_close) = output[open + 2..].find("**") else {
+            break;
+        };
+        let close = open + 2 + relative_close;
+        if close == open + 2 {
+            break;
+        }
+        let content = output[open + 2..close].to_owned();
+        output.replace_range(open..close + 2, &content);
+    }
+    output
+}
+
+fn replace_italic(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut output = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'*' && (index == 0 || bytes[index - 1] != b'*') {
+            let mut close = index + 1;
+            let mut found = false;
+            while close < bytes.len() {
+                if bytes[close] == b'*'
+                    && close > index + 1
+                    && (close + 1 == bytes.len() || bytes[close + 1] != b'*')
+                {
+                    output.push_str(&line[index + 1..close]);
+                    index = close + 1;
+                    found = true;
+                    break;
+                }
+                close += 1;
+            }
+            if found {
+                continue;
+            }
+        }
+        let character = line[index..].chars().next().expect("character boundary");
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
+}
+
+fn clean_caption(caption: &str) -> String {
+    let text = rewrite_special_tags(caption);
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let line = strip_heading(line);
+        let line = strip_bullet(line);
+        let line = strip_bullet(line);
+        let line = replace_bold(line);
+        let line = replace_italic(&line);
+        lines.push(line.trim_end().to_owned());
+    }
+    let text = lines
+        .into_iter()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed.chars().count() < 3
+                || !trimmed
+                    .chars()
+                    .all(|value| matches!(value, '-' | '*' | '_' | ' ' | '\t'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.replace("• ", "").replace("    ", "");
+    let mut collapsed = text;
+    while collapsed.contains("\n\n") {
+        collapsed = collapsed.replace("\n\n", "\n");
+    }
+    collapsed
+}
+
+fn leading_tags(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    let start = index;
+    while index < bytes.len() && bytes[index] == b'[' {
+        let close = bytes[index + 1..].iter().position(|value| *value == b']')? + index + 1;
+        if close == index + 1 {
+            return None;
+        }
+        index = close + 1;
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+            index += 1;
+        }
+    }
+    (index > start).then(|| line[start..index].trim().to_owned())
+}
+
+fn normalize_lyrics(lyrics: &str) -> String {
+    let lines = lyrics
+        .split('\n')
+        .map(|line| leading_tags(line).unwrap_or_else(|| line.to_owned()))
+        .collect::<Vec<_>>();
+    let text = lines.join("\n");
+    let text = text
+        .replace("] ", "]\n")
+        .replace(" [", "\n[")
+        .replace(" ^ ", "\n");
+    let mut normalized = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(open) = rest.find('[') {
+        normalized.push_str(&rest[..open]);
+        let Some(close) = rest[open + 1..].find(']') else {
+            normalized.push_str(&rest[open..]);
+            return format!("[start]\n{normalized}");
+        };
+        if close == 0 {
+            normalized.push_str(&rest[open..open + 1]);
+            rest = &rest[open + 1..];
+            continue;
+        }
+        normalized.push('[');
+        normalized.push_str(&rest[open + 1..open + 1 + close].to_lowercase());
+        normalized.push(']');
+        rest = &rest[open + 1 + close + 1..];
+    }
+    normalized.push_str(rest);
+    format!("[start]\n{normalized}")
+}
+
+/// Build the paired conditional/unconditional prompt consumed by Music3.
+pub fn prompt_ids(directory: &Path, prompt: &str, lyrics: &str) -> Result<Vec<u32>> {
+    ensure!(!prompt.trim().is_empty(), "empty Music3 prompt");
+    ensure!(!lyrics.trim().is_empty(), "empty Music3 lyrics");
+    let text = format!(
+        "<|im_start|><|caption_start|>{}<|caption_end|><|lyrics_start|>{}<|lyrics_end|><|im_end|><|audio_start|>",
+        clean_caption(prompt),
+        normalize_lyrics(lyrics)
+    );
+    let conditional =
+        crate::tokenizer::encode(&directory.join("qwen_7B/qwen3-8B-tokenizer-music"), &text)?;
+    ensure!(
+        conditional.len() <= 5000,
+        "Music3 prompt has {} tokens",
+        conditional.len()
+    );
+    let mut unconditional = conditional.clone();
+    let last = unconditional.len() - 2;
+    for id in &mut unconditional[1..last] {
+        *id = 151654;
+    }
+    let mut paired = conditional;
+    paired.extend(unconditional);
+    Ok(paired)
+}
+
 /// One production synthesis request: AR prompt token ids in the paired
 /// cond/uncond layout [2, prompt_rows] (row 0 cond, row 1 uncond; the
 /// length must be even), the audio frame count, and the sampling seed
@@ -19,11 +231,25 @@ pub struct Music3Request {
     pub prompt_ids: Vec<u32>,
     pub frames: usize,
     pub seed: u64,
+    pub device: usize,
 }
 
 /// Synthesis output: stereo PCM [2, latent_length(frames) * upsampling].
 pub struct Music3Output {
     pub pcm: Vec<f32>,
+}
+
+impl Music3Output {
+    pub fn interleaved(&self) -> Result<Vec<f32>> {
+        ensure!(self.pcm.len().is_multiple_of(2), "stereo PCM extent");
+        let per_channel = self.pcm.len() / 2;
+        let mut interleaved = Vec::with_capacity(self.pcm.len());
+        for index in 0..per_channel {
+            interleaved.push(self.pcm[index]);
+            interleaved.push(self.pcm[per_channel + index]);
+        }
+        Ok(interleaved)
+    }
 }
 
 /// Synthesis-stage geometry from the per-component configs.
@@ -725,4 +951,69 @@ fn product(values: &[usize]) -> Result<usize> {
     values.iter().try_fold(1usize, |n, &v| {
         n.checked_mul(v).context("Music3 extent overflow")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    #[ignore = "requires the Music3 checkpoint tokenizer"]
+    fn prompt_ids_match_publisher_and_detect_dropped_audio_start() -> Result<()> {
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/music3_prompt.json"))?;
+        for case in cases {
+            let expected = case["ids"]
+                .as_array()
+                .context("fixture ids")?
+                .iter()
+                .map(|value| u32::try_from(value.as_u64().context("fixture id")?).context("id"))
+                .collect::<Result<Vec<_>>>()?;
+            let actual = prompt_ids(
+                &directory,
+                case["prompt"].as_str().context("prompt")?,
+                case["lyrics"].as_str().context("lyrics")?,
+            )?;
+            ensure!(
+                actual == expected,
+                "prompt ids differ on {} expected={expected:?} actual={actual:?}",
+                case["name"]
+            );
+            let split = actual.len() / 2;
+            ensure!(actual[0] == actual[split]);
+            ensure!(actual[split - 2..split] == actual[split + split - 2..]);
+            ensure!(
+                actual[split + 1..actual.len() - 2]
+                    .iter()
+                    .all(|id| *id == 151654)
+            );
+            let mutated = case["assembled"]
+                .as_str()
+                .context("assembled prompt")?
+                .replace("<|audio_start|>", "");
+            let mutant = crate::tokenizer::encode(
+                &directory.join("qwen_7B/qwen3-8B-tokenizer-music"),
+                &mutated,
+            )?;
+            ensure!(
+                mutant != actual[..split],
+                "dropped audio_start not detected on {}",
+                case["name"]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stereo_interleaving_preserves_channel_order() -> Result<()> {
+        let output = Music3Output {
+            pcm: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        };
+        assert_eq!(output.interleaved()?, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert!(Music3Output { pcm: vec![1.0] }.interleaved().is_err());
+        Ok(())
+    }
 }

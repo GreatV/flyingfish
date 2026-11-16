@@ -53,7 +53,7 @@ Media generation (library entry points and CLI):
 | MiniMax-H3 | Image-to-video with audio: Qwen3-VL conditioner, streamed diffusion transformer with Turbo LoRA, video and audio decoders, native prompt, canvas and keyframe producers, noise drawn from the request seed; the diffusion transformer also loads from a GGUF Q4_0 file; `flyingfish::minimax_h3::run_minimax_h3_i2va`; the `video` command writes MP4 or Y4M+WAV | CUDA |
 | MiniMax-H3-Image | Prompt-to-image is usable. A prompt and optional upright RGB8 references become RGB8 through the Qwen3-VL conditioner, native VAE encode, six-step Euler under a derived placement, native VAE decode, truncation toward zero and Lanczos-3; one Philox draw from the request seed; `flyingfish::minimax_h3::image_latents`, `flyingfish::minimax_h3::image_encode`, `flyingfish::minimax_h3::image_decode` and the `image` command writes PNG. `image_sample` runs the six evaluations on supplied embeddings and latent rows | CUDA |
 | HyperFlow H3 Flash | Published INT8 convrot and low-rank factors, 50 layers with blocks 6, 21 and 22 absent, loaded inside the crate when the LoRA rank is 0; a forward uses the shared diffusion-transformer block and the existing Euler. No CLI and no public sampling entry; sampling remains the MiniMax linspace path and still requires LoRA. All 37 scored step cells pass at their frozen taus. teacher-vel-audio-2 max-abs is 4.3835091590881348e-1 and its RMSE is 7.6671853056417993e-2, inside the frozen max-abs tau 8.5429096221923828e-1. Per kept block, modulated norm1 and norm2 multiply the RMS weight in f32, and Q and K do the same; the modulate epilogue then rounds the weighted value, 1+scale, that product, and the shift add. The attention probability is packed to BF16 before the value mix, matching the definition's CUDA attention. FFN intermediates are two rounding points. MiniMax keeps the pre-weight round | CUDA |
-| MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) in one entry from token ids and a seed to stereo PCM; `flyingfish::music3::generate` | CUDA |
+| MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) in one entry from token ids and a seed to stereo PCM; published caption/lyrics prompt construction with paired conditional/unconditional ids and the `music` command writing 44.1 kHz stereo WAV; `flyingfish::music3::generate` | CUDA |
 
 Image to 3D (library entry points and CLI):
 
@@ -147,12 +147,16 @@ flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat c
 
 # Generate a MiniMax-H3-Image PNG, optionally with --expand or repeated --edit references.
 flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o cube.png --json
+
+# Generate MiniMax-Music3 stereo audio from a caption and lyrics.
+flyingfish --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o song.wav
 ```
 
 Common options:
 - MiniMax-H3 video requires a keyframe, a frame count and a seed. Requested frames round up to `17n+5`, so 136 resolves to 141; the published duration is 5-15 seconds at 24 fps. No documented frame-count or seed defaults exist.
 - MiniMax-H3-Image `image` requires a prompt, `WIDTHxHEIGHT` size and seed. `--expand <dir>` replaces the prompt through the expander; repeated `--edit <image>` supplies upright RGB8 references. Output is PNG at the requested size, and `--json` reports size, seed and reference count.
-- Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video, image, transcribe, diarize and embed default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
+- MiniMax-Music3 `music` requires a caption, lyrics and seed. `--frames` defaults to 1500 (60 seconds at 25 fps); output is stereo 44.1 kHz PCM16 WAV, or WAV bytes to stdout when `-o` is omitted.
+- Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video, image, music, transcribe, diarize and embed default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
 - `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
 - `--draft-model <dir>` enables a DSpark draft model.
 - `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8, GLM-5.3-Flash); 0 selects plain decoding. GLM-5.3-Flash drafts one token per round at any nonzero depth. MTP decode is CUDA-only, so ROCm builds need `--mtp 0` for such checkpoints.
