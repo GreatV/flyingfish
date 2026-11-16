@@ -996,17 +996,22 @@ fn read_obj(bytes: &[u8]) -> Result<MeshRead> {
             Some("f") => {
                 // Positive indices are 1-based; negative indices count back
                 // from the vertex count at this face (OBJ relative
-                // references).
+                // references). Polygons other than triangles are rejected,
+                // not truncated.
                 let rows = positions.len() / 3;
                 let indices: Vec<i32> = words
-                    .take(3)
                     .map(|word| {
                         word.split('/')
                             .next()
                             .and_then(|index| index.parse::<i32>().ok())
                             .context("OBJ face index")
                     })
-                    .collect::<Result<_, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()?;
+                ensure!(
+                    indices.len() == 3,
+                    "OBJ face carries {} vertex references; only triangles are supported",
+                    indices.len()
+                );
                 let resolved: Vec<i32> = indices
                     .iter()
                     .map(|index| {
@@ -1080,6 +1085,13 @@ mod tests {
             out_of_range.is_err(),
             "relative index past the vertices accepted"
         );
+        let polygon = read_mesh(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nf 1 2 3 4\n".as_bytes(),
+            "obj",
+        );
+        assert!(polygon.is_err(), "non-triangular OBJ face accepted");
+        let short = read_mesh("v 0 0 0\nv 1 0 0\nf 1 2\n".as_bytes(), "obj");
+        assert!(short.is_err(), "two-reference OBJ face accepted");
         Ok(())
     }
 
