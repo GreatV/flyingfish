@@ -169,13 +169,16 @@ fn penalty_cells(device: &Device, fixture: &CloverMoeFixture) -> Result<(usize, 
             )?;
             let probabilities = s.clone_dtoh(&sampler.probabilities)?;
             let reference = fixture.values(&format!("{tag}.confidence"))?;
-            let maximum = picks
+            let picked: Vec<f32> = picks
                 .iter()
                 .enumerate()
-                .map(|(r, &id)| {
-                    (probabilities[r * policy.vocab as usize + id as usize] - reference[r]).abs()
-                })
-                .fold(0.0f32, f32::max);
+                .map(|(r, &id)| probabilities[r * policy.vocab as usize + id as usize])
+                .collect();
+            let (maximum, _) = crate::verify::max_abs_rmse(
+                &format!("{tag}.confidence"),
+                &picked,
+                &reference[..picks.len()],
+            )?;
             println!(
                 "CLOVER_SAMPLE_MARGIN tag={name} confidence_max_abs={maximum} reference_margin={} top2_margin={}",
                 case["confidence_margin"], case["top2_margin"]

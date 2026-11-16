@@ -39,15 +39,21 @@ mod gates {
 
     #[test]
     fn max_rmse_rejects_non_finite_cells() -> Result<()> {
-        let clean = max_rmse(&[1.0, 2.0], &[1.0, 2.5])?;
+        let clean = crate::verify::max_abs_rmse("clef.max_rmse", &[1.0, 2.0], &[1.0, 2.5])?;
         ensure!(clean.0 > 0.0, "finite comparison must produce a delta");
+        let candidate = crate::verify::max_abs_rmse("clef.max_rmse", &[f32::NAN, 1.0], &[0.0, 1.0])
+            .expect_err("a NaN input must error, not score")
+            .to_string();
         ensure!(
-            max_rmse(&[f32::NAN, 1.0], &[0.0, 1.0]).is_err(),
-            "a NaN input must error, not score"
+            candidate.contains("clef.max_rmse") && candidate.contains("candidate[0]"),
+            "NaN candidate must name the cell and index: {candidate}"
         );
+        let reference = crate::verify::max_abs_rmse("clef.max_rmse", &[1.0, 1.0], &[1.0, f32::NAN])
+            .expect_err("a NaN reference must error, not score")
+            .to_string();
         ensure!(
-            max_rmse(&[1.0, 1.0], &[f32::NAN, 1.0]).is_err(),
-            "a NaN reference must error, not score"
+            reference.contains("clef.max_rmse") && reference.contains("reference[1]"),
+            "NaN reference must name the cell and index: {reference}"
         );
         Ok(())
     }
@@ -111,28 +117,6 @@ mod gates {
             .collect())
     }
 
-    fn max_rmse(got: &[f32], want: &[f32]) -> Result<(f64, f64)> {
-        ensure!(
-            got.len() == want.len(),
-            "cell extent differs: got {} want {}",
-            got.len(),
-            want.len()
-        );
-        let mut max = 0.0f64;
-        let mut sum = 0.0f64;
-        for (a, b) in got.iter().zip(want) {
-            let (a, b) = (*a as f64, *b as f64);
-            ensure!(
-                a.is_finite() && b.is_finite(),
-                "non-finite cell value (runner FAIL)"
-            );
-            let d = (a - b).abs();
-            max = max.max(d);
-            sum += d * d;
-        }
-        Ok((max, (sum / got.len() as f64).sqrt()))
-    }
-
     fn settings(runtime: PathBuf) -> Settings {
         Settings {
             tree_builder: crate::backend::TreeBuilder::Waves,
@@ -179,7 +163,7 @@ mod gates {
         let want = refs
             .get(&format!("h{length}_l{layer}_{point}"))
             .with_context(|| format!("reference tap h{length}_l{layer}_{point} missing"))?;
-        let (max, rmse) = max_rmse(&got, want)?;
+        let (max, rmse) = crate::verify::max_abs_rmse(&name, &got, want)?;
         let bound = frozen
             .get(&format!("h{length}_l{layer}_{point}"))
             .with_context(|| format!("frozen cell h{length}_l{layer}_{point} missing"))?;
@@ -279,7 +263,7 @@ mod gates {
             clean_l2.len()
         );
         let want = refs.get("h512_l2_mixer_out").context("ref tap")?;
-        let (max, rmse) = max_rmse(&got, want)?;
+        let (max, rmse) = crate::verify::max_abs_rmse("h512_l2_mixer_out", &got, want)?;
         let bound = frozen.get("h512_l2_mixer_out").context("cell")?;
         println!(
             "CLEF_CONTROL conv_overwrite max={max:.6e} (>= {:.6e}) rmse={rmse:.6e} (>= {:.6e})",
@@ -346,7 +330,7 @@ mod gates {
             got.len(),
             want.len()
         );
-        let (max, rmse) = max_rmse(got, want)?;
+        let (max, rmse) = crate::verify::max_abs_rmse(cell, got, want)?;
         let bound = bounds
             .get(cell)
             .with_context(|| format!("frozen decode bound {cell} missing"))?;
@@ -367,12 +351,24 @@ mod gates {
                 let logits = refs
                     .get(&format!("decode_logits_s{step}"))
                     .context("decode logits cell missing")?;
-                let argmax = logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .context("empty logits")?;
-                Ok(argmax.0 as u32)
+                ensure!(
+                    logits.len() >= 2,
+                    "Runner FAIL decode_logits_s{step}: logits vocabulary is too small"
+                );
+                let mut best = f64::NEG_INFINITY;
+                let mut argmax = 0u32;
+                for (index, value) in logits.iter().enumerate() {
+                    ensure!(
+                        value.is_finite(),
+                        "Runner FAIL decode_logits_s{step}: non-finite candidate[{index}]={value}"
+                    );
+                    let value = f64::from(*value);
+                    if value >= best {
+                        best = value;
+                        argmax = index as u32;
+                    }
+                }
+                Ok(argmax)
             })
             .collect()
     }
@@ -422,7 +418,11 @@ mod gates {
                 history.len(),
                 want.len()
             );
-            let (max, rmse) = max_rmse(&history, &want)?;
+            let (max, rmse) = crate::verify::max_abs_rmse(
+                &format!("l{layer}_conv_states_history"),
+                &history,
+                &want,
+            )?;
             let bound = bounds
                 .get(&format!("l{layer}_conv_states_history"))
                 .context("history bound missing")?;
@@ -526,7 +526,7 @@ mod gates {
         let want = refs
             .get("decode_logits_s1")
             .context("decode reference s1 missing")?;
-        let (max, rmse) = max_rmse(&step1, want)?;
+        let (max, rmse) = crate::verify::max_abs_rmse("decode_logits_s1", &step1, want)?;
         let bound = bounds.get("decode_logits_s1").context("tau s1 missing")?;
         println!(
             "CLEF_DECODE_CONTROL decode_conv_overwrite max={max:.6e} (>= {:.6e}) rmse={rmse:.6e} (>= {:.6e})",
@@ -569,7 +569,8 @@ mod gates {
                     got.len(),
                     want.len()
                 );
-                let (max, rmse) = max_rmse(&got, want)?;
+                let (max, rmse) =
+                    crate::verify::max_abs_rmse(&format!("logits{length}_p{i}"), &got, want)?;
                 let bound = frozen
                     .get(&format!("logits{length}_p{i}"))
                     .with_context(|| format!("frozen cell logits{length}_p{i} missing"))?;
@@ -613,7 +614,7 @@ mod gates {
         tau: (f64, f64),
         gated: bool,
     ) -> Result<()> {
-        let (max, rmse) = max_rmse(got, want)?;
+        let (max, rmse) = crate::verify::max_abs_rmse(label, got, want)?;
         println!(
             "CLEF_JOINT {label} max={max:.6e} (tau {:.6e}) rmse={rmse:.6e} (tau {:.6e}) gated={gated}",
             tau.0, tau.1
@@ -734,7 +735,7 @@ mod gates {
             .iter()
             .map(|v| v.to_f32())
             .collect();
-        let (max, rmse) = max_rmse(&multi, &single)?;
+        let (max, rmse) = crate::verify::max_abs_rmse("hidden_norm", &multi, &single)?;
         let tau = joint_tau(&taus, "hidden_norm")?;
         println!(
             "CLEF_JOINT_MULTI_CHUNK max={max:.6e} (tau {:.6e}) rmse={rmse:.6e} (tau {:.6e})",
@@ -951,7 +952,11 @@ mod gates {
                 w.scorer0_w = saved;
             }
             for (index, question) in stages.logits.iter().enumerate() {
-                let delta = max_rmse(&planted.logits[index], question)?;
+                let delta = crate::verify::max_abs_rmse(
+                    &format!("logits.{index}"),
+                    &planted.logits[index],
+                    question,
+                )?;
                 control_ratio(
                     &mut failures,
                     &format!("logits_q{index}"),
@@ -978,7 +983,7 @@ mod gates {
             control_ratio(
                 &mut failures,
                 "fields",
-                max_rmse(&planted.fields_row0, &stages.fields_row0)?,
+                crate::verify::max_abs_rmse("fields", &planted.fields_row0, &stages.fields_row0)?,
                 joint_tau(&taus, "fields")?,
                 false,
             )?;
@@ -1000,7 +1005,7 @@ mod gates {
             control_ratio(
                 &mut failures,
                 "decoder0",
-                max_rmse(&planted.decoder[0], &stages.decoder[0])?,
+                crate::verify::max_abs_rmse("decoder0", &planted.decoder[0], &stages.decoder[0])?,
                 joint_tau(&taus, "decoder0")?,
                 false,
             )?;
@@ -1022,7 +1027,7 @@ mod gates {
             control_ratio(
                 &mut failures,
                 "projmem",
-                max_rmse(&planted.memory_row0, &stages.memory_row0)?,
+                crate::verify::max_abs_rmse("projmem", &planted.memory_row0, &stages.memory_row0)?,
                 joint_tau(&taus, "proj_memory_projection")?,
                 false,
             )?;
@@ -1100,7 +1105,7 @@ mod gates {
             control_ratio(
                 &mut failures,
                 "hidden",
-                max_rmse(&planted, &clean_hidden)?,
+                crate::verify::max_abs_rmse("hidden", &planted, &clean_hidden)?,
                 joint_tau(&taus, "hidden_norm_forced")?,
                 false,
             )?;
@@ -1122,7 +1127,7 @@ mod gates {
             control_ratio(
                 &mut failures,
                 name,
-                max_rmse(&planted[index], &clean_routing[index])?,
+                crate::verify::max_abs_rmse(name, &planted[index], &clean_routing[index])?,
                 joint_tau(&taus, &format!("{name}_forced"))?,
                 true,
             )?;
@@ -1151,7 +1156,11 @@ mod gates {
                 let w = engine.joint_plant_handles()?;
                 w.decoder[layer].self_in_proj = saved;
             }
-            let delta = max_rmse(&planted, &clean_chain[layer - 1])?;
+            let delta = crate::verify::max_abs_rmse(
+                &format!("decoder{layer}"),
+                &planted,
+                &clean_chain[layer - 1],
+            )?;
             let tau = joint_tau(&taus, &format!("decoder{layer}_forced"))?;
             println!(
                 "CLEF_JOINT_CONTROL decoder{layer} max={:.3e} ({:.1}x) rmse={:.3e} ({:.1}x)",
@@ -1228,7 +1237,9 @@ pub(crate) fn apply_test_plants(
                     s.memcpy_htod(&src_host, dst_ref)?;
                 }
                 let readback = s.clone_dtoh(catalog.bf16(&dst)?)?;
-                let absmax = readback.iter().fold(0.0f32, |m, v| m.max(v.to_f32().abs()));
+                let zeros = vec![bf16::ZERO; readback.len()];
+                let (absmax, _) =
+                    crate::verify::max_abs_rmse("clef.plant.conv", &readback, &zeros)?;
                 println!("CLEF_LOAD_PLANT_CONV {src} -> {dst} absmax_after={absmax:.6e}");
             }
             _ => anyhow::bail!("unrecognized FF_CLEF_TEST_PLANT entry {plant}"),

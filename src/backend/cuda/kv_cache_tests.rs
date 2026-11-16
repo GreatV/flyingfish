@@ -477,14 +477,10 @@ fn gqa32_attention_window_sink_gpu() -> Result<()> {
         ("full", &sink, &full_expected),
         ("window", &window, &window_expected),
     ] {
+        let (max, _) = crate::verify::max_abs_rmse(name, actual, expected)?;
         let magnitude = expected
             .iter()
             .map(|value| value.abs())
-            .fold(0f32, f32::max);
-        let max = actual
-            .iter()
-            .zip(expected)
-            .map(|(a, b)| (a.to_f32() - b).abs())
             .fold(0f32, f32::max);
         if let Some((index, value, wanted)) = actual
             .iter()
@@ -500,15 +496,12 @@ fn gqa32_attention_window_sink_gpu() -> Result<()> {
                 index % dim
             );
         }
+        let limit = bound as f32 * magnitude;
         ensure!(
-            max <= bound as f32 * magnitude,
-            "{name} attention max={max:e} bound={}",
-            bound as f32 * magnitude
+            max <= f64::from(limit),
+            "{name} attention max={max:e} bound={limit}",
         );
-        eprintln!(
-            "GQA32_ATTENTION mode={name} max_abs={max:e} relative_bound={} PASS",
-            bound as f32 * magnitude
-        );
+        eprintln!("GQA32_ATTENTION mode={name} max_abs={max:e} relative_bound={limit} PASS");
     }
 
     let mut r5_attention = Attention::new(
@@ -716,47 +709,22 @@ struct AttentionMetrics {
     max_reference: f32,
 }
 
-fn attention_metrics(actual: &[bf16], expected: &[f32]) -> AttentionMetrics {
-    assert_eq!(actual.len(), expected.len());
-    let mut errors: Vec<_> = actual
+fn attention_metrics(cell: &str, actual: &[bf16], expected: &[f32]) -> Result<AttentionMetrics> {
+    let scored = crate::verify::metrics(cell, actual, expected)?;
+    let mut errors: Vec<f64> = actual
         .iter()
         .zip(expected)
-        .map(|(actual, expected)| (actual.to_f32() - expected).abs())
+        .map(|(actual, expected)| (actual.to_f64() - f64::from(*expected)).abs())
         .collect();
-    errors.sort_by(f32::total_cmp);
-    let max_abs = errors.last().copied().unwrap_or_default();
+    errors.sort_by(f64::total_cmp);
     let p99_abs = errors[(expected.len() * 99).div_ceil(100) - 1];
-    let mean_abs = errors.iter().sum::<f32>() / errors.len() as f32;
-    let dot = actual
-        .iter()
-        .zip(expected)
-        .map(|(actual, expected)| actual.to_f32() * expected)
-        .sum::<f32>();
-    let actual_norm = actual
-        .iter()
-        .map(|value| value.to_f32() * value.to_f32())
-        .sum::<f32>()
-        .sqrt();
-    let expected_norm = expected
-        .iter()
-        .map(|value| value * value)
-        .sum::<f32>()
-        .sqrt();
-    let cosine = if actual_norm == 0.0 && expected_norm == 0.0 {
-        1.0
-    } else {
-        dot / (actual_norm * expected_norm)
-    };
-    AttentionMetrics {
-        max_abs,
-        p99_abs,
-        mean_abs,
-        cosine,
-        max_reference: expected
-            .iter()
-            .map(|value| value.abs())
-            .fold(0f32, f32::max),
-    }
+    Ok(AttentionMetrics {
+        max_abs: scored.max_abs as f32,
+        p99_abs: p99_abs as f32,
+        mean_abs: scored.mean_abs as f32,
+        cosine: scored.cosine as f32,
+        max_reference: scored.peak_ref as f32,
+    })
 }
 
 #[test]
@@ -885,19 +853,21 @@ fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
                 "{name} rows={rows} V writes are not bitwise"
             );
             let output_metrics = attention_metrics(
+                &format!("{name}.output"),
                 &actual_output,
                 &expected_output
                     .iter()
                     .map(|value| value.to_f32())
                     .collect::<Vec<_>>(),
-            );
+            )?;
             let k_metrics = attention_metrics(
+                &format!("{name}.k"),
                 &live_k,
                 &expected_k
                     .iter()
                     .map(|value| value.to_f32())
                     .collect::<Vec<_>>(),
-            );
+            )?;
             let bound = super::bf16_chain_bound(3, &[dim]);
             let output_bound = bound as f32 * output_metrics.max_reference;
             let k_bound = bound as f32 * k_metrics.max_reference;
@@ -1006,19 +976,21 @@ fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
         }
         let expected_v = &planar[v_offset as usize..];
         let q_metrics = attention_metrics(
+            &format!("{name}.q"),
             &actual[..rows * q_width],
             &expected_q
                 .iter()
                 .map(|value| value.to_f32())
                 .collect::<Vec<_>>(),
-        );
+        )?;
         let k_metrics = attention_metrics(
+            &format!("{name}.k"),
             &actual[k_offset as usize..k_offset as usize + rows * kv_width],
             &expected_k
                 .iter()
                 .map(|value| value.to_f32())
                 .collect::<Vec<_>>(),
-        );
+        )?;
         let mismatch = actual[v_offset as usize..]
             .iter()
             .zip(expected_v)
@@ -1289,12 +1261,13 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
     };
     let interleaved = run_case(true)?;
     let metrics = attention_metrics(
+        "kv.interleaved",
         &interleaved,
         &expected
             .iter()
             .map(|value| value.to_f32())
             .collect::<Vec<_>>(),
-    );
+    )?;
     let bound = super::bf16_chain_bound(3, &[dim, ring + 1]) as f32;
     let max_bound = bound * metrics.max_reference;
     ensure!(
@@ -1310,12 +1283,13 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
     );
     let legacy = run_case(false)?;
     let legacy_metrics = attention_metrics(
+        "kv.legacy",
         &legacy,
         &expected
             .iter()
             .map(|value| value.to_f32())
             .collect::<Vec<_>>(),
-    );
+    )?;
     let legacy_bound = bound * legacy_metrics.max_reference;
     ensure!(
         legacy_metrics.max_abs > legacy_bound || legacy_metrics.cosine < 1.0 - bound,
@@ -1476,7 +1450,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             }
         }
     }
-    let metrics = attention_metrics(&staged_actual, &expected);
+    let metrics = attention_metrics("kv.staged", &staged_actual, &expected)?;
     let bound = super::bf16_chain_bound(3, &[dim, window + 2]) as f32 * metrics.max_reference;
     ensure!(
         metrics.max_abs <= bound,
@@ -1638,7 +1612,7 @@ fn fa2_gqa32_learned_sink_gpu() -> Result<()> {
             }
         }
     }
-    let metrics = attention_metrics(&sink_output, &expected);
+    let metrics = attention_metrics("kv.sink", &sink_output, &expected)?;
     let bound = super::bf16_chain_bound(3, &[dim, capacity + 1]);
     let max_bound = bound as f32 * metrics.max_reference;
     ensure!(
@@ -1728,7 +1702,7 @@ fn fa2_gqa32_learned_sink_gpu() -> Result<()> {
             slide_expected[(row * hq + head) * dim] = window_sum / (tokens as f32 + 1.0);
         }
     }
-    let slide_metrics = attention_metrics(&slide_sink, &slide_expected);
+    let slide_metrics = attention_metrics("kv.slide", &slide_sink, &slide_expected)?;
     let slide_bound = super::bf16_chain_bound(3, &[dim, window + 2]);
     let slide_max_bound = slide_bound as f32 * slide_metrics.max_reference;
     eprintln!(

@@ -764,10 +764,8 @@ fn q38_primitives_gpu() -> Result<()> {
         "beta zero-input mismatch"
     );
     let values = s.clone_dtoh(&g)?;
-    let max_err = values[..96]
-        .iter()
-        .map(|v| (v + std::f32::consts::LN_2).abs())
-        .fold(0f32, f32::max);
+    let want = vec![-std::f32::consts::LN_2; 96];
+    let (max_err, _) = crate::verify::max_abs_rmse("q38.g", &values[..96], &want)?;
     ensure!(
         values.iter().all(|v| v.is_finite()),
         "nonfinite g for finite zero input"
@@ -2667,20 +2665,13 @@ fn vision_opref_diagnostics(
                 }
             }
             let got = s.clone_dtoh(&out)?;
-            ensure!(
-                got.iter().all(|v| v.is_finite()) && gold.iter().all(|v| v.is_finite()),
-                "OpRef output is unwritten/nonfinite"
-            );
+            let (max_abs, _) =
+                crate::verify::max_abs_rmse(&format!("q38.opref.{kind}.{case}"), &got, &gold)?;
             let equal = got
                 .iter()
                 .zip(&gold)
                 .filter(|(a, b)| a.to_bits() == b.to_bits())
                 .count();
-            let max_abs = got
-                .iter()
-                .zip(&gold)
-                .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                .fold(0f32, f32::max);
             if kind == "gelu" && equal != gold.len() {
                 let input = s.clone_dtoh(&x)?;
                 let mut seen = std::collections::BTreeSet::new();

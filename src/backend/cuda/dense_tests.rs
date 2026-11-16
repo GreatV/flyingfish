@@ -36,18 +36,15 @@ impl Gate {
         roundings: u32,
         reduction: usize,
     ) -> Result<bool> {
-        ensure!(
-            actual.len() == expected.len() && !actual.is_empty(),
-            "RUNNER_FAIL {name}: reference extent"
-        );
-        let error = actual.iter().zip(expected).try_fold(0f64, |max, (a, b)| {
-            let (a, b) = (f64::from(a.to_f32()), f64::from(b.to_f32()));
-            ensure!(
-                a.is_finite() && b.is_finite(),
-                "RUNNER_FAIL {name}: nonfinite value"
-            );
-            Ok::<_, anyhow::Error>(max.max((a - b).abs() / (1.0 + b.abs())))
-        })?;
+        crate::verify::max_abs_rmse(name, actual, expected)?;
+        let error = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| {
+                let (a, b) = (f64::from(a.to_f32()), f64::from(b.to_f32()));
+                (a - b).abs() / (1.0 + b.abs())
+            })
+            .fold(0f64, f64::max);
         let nu = reduction as f64 * 2f64.powi(-24);
         let bound = 2.0 * (f64::from(roundings) * 2f64.powi(-8) + nu / (1.0 - nu)) + 1e-5;
         println!(
@@ -356,9 +353,14 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
                     .recip()
                         / if side == 0 { 128f64.sqrt() } else { 1.0 };
                     for (d, value) in source.iter().enumerate() {
+                        let index = (row * heads + head) * 128 + d;
+                        let prepared = prepared_side[index];
+                        ensure!(
+                            value.is_finite() && prepared.is_finite(),
+                            "Runner FAIL gdn.qk_norm: non-finite candidate[{index}]={prepared} reference={value:?}"
+                        );
                         let expected = value.to_f64() * scale;
-                        let error =
-                            (prepared_side[(row * heads + head) * 128 + d] - expected).abs();
+                        let error = (prepared - expected).abs();
                         norm_ratio = norm_ratio.max(if expected == 0.0 {
                             if error == 0.0 { 0.0 } else { f64::INFINITY }
                         } else {
@@ -382,15 +384,20 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
             1,
         )?;
         let gate_bound = crate::backend::cuda::gamma(8, 2f64.powi(-24));
-        let gate_error = prepared[4]
+        let expected_gate: Vec<f64> = prepared[4]
             .iter()
             .enumerate()
-            .map(|(i, actual)| {
+            .map(|(i, _)| {
                 let h = i % heads;
                 let t = f64::from(a[i].to_f32() + dt[h].to_f32());
-                let expected = -a_log[h].to_f64().exp() * t.exp().ln_1p();
-                (actual - expected).abs() / (1.0 + expected.abs())
+                -a_log[h].to_f64().exp() * t.exp().ln_1p()
             })
+            .collect();
+        crate::verify::max_abs_rmse("gdn.decay_gate", &prepared[4], &expected_gate)?;
+        let gate_error = prepared[4]
+            .iter()
+            .zip(&expected_gate)
+            .map(|(actual, expected)| (actual - expected).abs() / (1.0 + expected.abs()))
             .fold(0f64, f64::max);
         gate.check("gdn.decay_gate", gate_error <= gate_bound);
         gate.check(
@@ -409,16 +416,12 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
             n * 512,
         )?;
         let bound = crate::backend::cuda::gamma(n * 512 + 128, 2f64.powi(-24));
+        crate::verify::max_abs_rmse("gdn.state", &state, &expected_state)?;
         let error = state
             .iter()
             .zip(&expected_state)
-            .try_fold(0f64, |e, (a, b)| {
-                ensure!(
-                    a.is_finite() && b.is_finite(),
-                    "RUNNER_FAIL GDN state nonfinite"
-                );
-                Ok::<_, anyhow::Error>(e.max((f64::from(*a) - b).abs() / (1.0 + b.abs())))
-            })?;
+            .map(|(a, b)| (f64::from(*a) - b).abs() / (1.0 + b.abs()))
+            .fold(0f64, f64::max);
         gate.check("gdn.state", error <= bound);
         let history_bad = hist
             .iter()
@@ -2815,7 +2818,9 @@ fn wmma_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                     &mut dy.slice_mut(17..17 + rows * output),
                 )?;
                 let mutant = s.clone_dtoh(&dy)?;
-                let error = mutant[17..17 + rows * output]
+                let got = &mutant[17..17 + rows * output];
+                crate::verify::max_abs_rmse("mutant.wmma_weight_stride", got, &expected)?;
+                let error = got
                     .iter()
                     .zip(&expected)
                     .map(|(a, b)| {
@@ -2965,10 +2970,6 @@ fn markov_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> 
                 let top = s.clone_dtoh(&top)?;
                 let logp = s.clone_dtoh(&logp)?;
                 let lse = s.clone_dtoh(&lse)?;
-                ensure!(
-                    logp.iter().chain(&lse).all(|v| v.is_finite()),
-                    "RUNNER_FAIL Markov nonfinite output"
-                );
                 for (j, &(row, token)) in requests.iter().enumerate() {
                     let scores: Vec<_> = (0..vocab)
                         .map(|v| {
@@ -2999,16 +3000,14 @@ fn markov_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> 
                             .map(|&x| (f64::from(x) - mx).exp())
                             .sum::<f64>()
                             .ln();
-                    let error = (f64::from(lse[j]) - expected_lse).abs().max(
-                        (0..4)
-                            .map(|k| {
-                                (f64::from(logp[j * 4 + k])
-                                    - (f64::from(scores[order[k] as usize]) - expected_lse))
-                                    .abs()
-                            })
-                            .fold(0.0, f64::max),
-                    );
                     let name = format!("markov.v{vocab}.p{p}.round{rounding}.row{j}");
+                    let got_row: Vec<f64> = std::iter::once(f64::from(lse[j]))
+                        .chain((0..4).map(|k| f64::from(logp[j * 4 + k])))
+                        .collect();
+                    let want_row: Vec<f64> = std::iter::once(expected_lse)
+                        .chain((0..4).map(|k| f64::from(scores[order[k] as usize]) - expected_lse))
+                        .collect();
+                    let (error, _) = crate::verify::max_abs_rmse(&name, &got_row, &want_row)?;
                     println!(
                         "MARKOV_ERROR name={name} lse_logp_max={error:e} bound=1e-4 margin4_5={}",
                         scores[order[3] as usize] - scores[order[4] as usize]
@@ -3197,19 +3196,21 @@ fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
                 "{name} rows={rows} V writes are not bitwise"
             );
             let output_metrics = attention_metrics(
+                &format!("{name}.output"),
                 &actual_output,
                 &expected_output
                     .iter()
                     .map(|value| value.to_f32())
                     .collect::<Vec<_>>(),
-            );
+            )?;
             let k_metrics = attention_metrics(
+                &format!("{name}.k"),
                 &live_k,
                 &expected_k
                     .iter()
                     .map(|value| value.to_f32())
                     .collect::<Vec<_>>(),
-            );
+            )?;
             let bound = crate::backend::cuda::bf16_chain_bound(3, &[dim]);
             let output_bound = bound as f32 * output_metrics.max_reference;
             let k_bound = bound as f32 * k_metrics.max_reference;
@@ -3318,19 +3319,21 @@ fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
         }
         let expected_v = &planar[v_offset as usize..];
         let q_metrics = attention_metrics(
+            &format!("{name}.q"),
             &actual[..rows * q_width],
             &expected_q
                 .iter()
                 .map(|value| value.to_f32())
                 .collect::<Vec<_>>(),
-        );
+        )?;
         let k_metrics = attention_metrics(
+            &format!("{name}.k"),
             &actual[k_offset as usize..k_offset as usize + rows * kv_width],
             &expected_k
                 .iter()
                 .map(|value| value.to_f32())
                 .collect::<Vec<_>>(),
-        );
+        )?;
         let mismatch = actual[v_offset as usize..]
             .iter()
             .zip(expected_v)
@@ -3602,12 +3605,13 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
     };
     let interleaved = run_case(true)?;
     let metrics = attention_metrics(
+        "dense.interleaved",
         &interleaved,
         &expected
             .iter()
             .map(|value| value.to_f32())
             .collect::<Vec<_>>(),
-    );
+    )?;
     let bound = crate::backend::cuda::bf16_chain_bound(3, &[dim, ring + 1]) as f32;
     let max_bound = bound * metrics.max_reference;
     ensure!(
@@ -3623,12 +3627,13 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
     );
     let legacy = run_case(false)?;
     let legacy_metrics = attention_metrics(
+        "dense.legacy",
         &legacy,
         &expected
             .iter()
             .map(|value| value.to_f32())
             .collect::<Vec<_>>(),
-    );
+    )?;
     let legacy_bound = bound * legacy_metrics.max_reference;
     ensure!(
         legacy_metrics.max_abs > legacy_bound || legacy_metrics.cosine < 1.0 - bound,
@@ -3789,7 +3794,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             }
         }
     }
-    let metrics = attention_metrics(&staged_actual, &expected);
+    let metrics = attention_metrics("dense.staged", &staged_actual, &expected)?;
     let bound = crate::backend::cuda::bf16_chain_bound(3, &[dim, window + 2]) as f32
         * metrics.max_reference;
     ensure!(
@@ -3916,11 +3921,8 @@ fn d128_gqa32_learned_sink_gpu() -> Result<()> {
             .any(|(a, b)| a.to_bits() != b.to_bits()),
         "meaningful FA2 sink did not change ordinary output"
     );
-    let negligible_max = ordinary
-        .iter()
-        .zip(&negligible_output)
-        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-        .fold(0f32, f32::max);
+    let (negligible_max, _) =
+        crate::verify::max_abs_rmse("dense.fa2.negligible", &ordinary, &negligible_output)?;
 
     let mut expected = vec![0f32; rows * hq * dim];
     for row in 0..rows {
@@ -3952,7 +3954,7 @@ fn d128_gqa32_learned_sink_gpu() -> Result<()> {
             }
         }
     }
-    let metrics = attention_metrics(&sink_output, &expected);
+    let metrics = attention_metrics("dense.sink", &sink_output, &expected)?;
     let bound = crate::backend::cuda::bf16_chain_bound(3, &[dim, capacity + 1]);
     let max_bound = bound as f32 * metrics.max_reference;
     ensure!(
@@ -4042,7 +4044,7 @@ fn d128_gqa32_learned_sink_gpu() -> Result<()> {
             slide_expected[(row * hq + head) * dim] = window_sum / (tokens as f32 + 1.0);
         }
     }
-    let slide_metrics = attention_metrics(&slide_sink, &slide_expected);
+    let slide_metrics = attention_metrics("dense.slide", &slide_sink, &slide_expected)?;
     let slide_bound = crate::backend::cuda::bf16_chain_bound(3, &[dim, window + 2]);
     let slide_max_bound = slide_bound as f32 * slide_metrics.max_reference;
     eprintln!(
@@ -4139,45 +4141,24 @@ struct AttentionMetrics {
     max_reference: f32,
 }
 
-fn attention_metrics(actual: &[half::bf16], expected: &[f32]) -> AttentionMetrics {
-    assert_eq!(actual.len(), expected.len());
-    let mut errors: Vec<_> = actual
+fn attention_metrics(
+    cell: &str,
+    actual: &[half::bf16],
+    expected: &[f32],
+) -> Result<AttentionMetrics> {
+    let scored = crate::verify::metrics(cell, actual, expected)?;
+    let mut errors: Vec<f64> = actual
         .iter()
         .zip(expected)
-        .map(|(actual, expected)| (actual.to_f32() - expected).abs())
+        .map(|(actual, expected)| (actual.to_f64() - f64::from(*expected)).abs())
         .collect();
-    errors.sort_by(f32::total_cmp);
-    let max_abs = errors.last().copied().unwrap_or_default();
+    errors.sort_by(f64::total_cmp);
     let p99_abs = errors[(expected.len() * 99).div_ceil(100) - 1];
-    let mean_abs = errors.iter().sum::<f32>() / errors.len() as f32;
-    let dot = actual
-        .iter()
-        .zip(expected)
-        .map(|(actual, expected)| actual.to_f32() * expected)
-        .sum::<f32>();
-    let actual_norm = actual
-        .iter()
-        .map(|value| value.to_f32() * value.to_f32())
-        .sum::<f32>()
-        .sqrt();
-    let expected_norm = expected
-        .iter()
-        .map(|value| value * value)
-        .sum::<f32>()
-        .sqrt();
-    let cosine = if actual_norm == 0.0 && expected_norm == 0.0 {
-        1.0
-    } else {
-        dot / (actual_norm * expected_norm)
-    };
-    AttentionMetrics {
-        max_abs,
-        p99_abs,
-        mean_abs,
-        cosine,
-        max_reference: expected
-            .iter()
-            .map(|value| value.abs())
-            .fold(0f32, f32::max),
-    }
+    Ok(AttentionMetrics {
+        max_abs: scored.max_abs as f32,
+        p99_abs: p99_abs as f32,
+        mean_abs: scored.mean_abs as f32,
+        cosine: scored.cosine as f32,
+        max_reference: scored.peak_ref as f32,
+    })
 }

@@ -2692,30 +2692,21 @@ mod tests {
             .collect())
     }
     fn errors(actual: &[f64], expected: &[f64], normalized: bool) -> Result<(f64, f64)> {
-        ensure!(
-            actual.len() == expected.len() && !actual.is_empty(),
-            "reference extent"
-        );
-        ensure!(
-            actual.iter().chain(expected).all(|x| x.is_finite()),
-            "nonfinite attention output"
-        );
+        let (max_abs, rmse) = crate::verify::max_abs_rmse("flash", actual, expected)?;
+        if !normalized {
+            return Ok((max_abs, rmse));
+        }
         let mut maximum = 0f64;
         let mut square = 0f64;
         let mut norm = 0f64;
         for (&a, &b) in actual.iter().zip(expected) {
-            maximum = maximum.max((a - b).abs() / if normalized { 1.0 + b.abs() } else { 1.0 });
+            maximum = maximum.max((a - b).abs() / (1.0 + b.abs()));
             square += (a - b).powi(2);
             norm += b * b;
         }
         Ok((
             maximum,
-            (square / actual.len() as f64).sqrt()
-                / if normalized {
-                    1.0 + (norm / actual.len() as f64).sqrt()
-                } else {
-                    1.0
-                },
+            (square / actual.len() as f64).sqrt() / (1.0 + (norm / actual.len() as f64).sqrt()),
         ))
     }
     fn f16_values(
