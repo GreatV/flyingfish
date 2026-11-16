@@ -1990,14 +1990,18 @@ mod gate_tests {
                     .last()
                     .and_then(|entry| entry["end"].as_f64())
                     .with_context(|| format!("{case} speaker {} end", speaker.speaker))?;
+                // The wrapper sums its times in float32 (201.6 reads as
+                // 201.60000610...), so equality is asserted at the published
+                // output's two-decimal resolution.
+                let cents = |seconds: f64| (seconds * 100.0).round() as i64;
                 ensure!(
-                    (speaker.start - start).abs() < 1e-6,
+                    cents(speaker.start) == cents(start),
                     "{case} speaker {} start {} vs published {start}",
                     speaker.speaker,
                     speaker.start
                 );
                 ensure!(
-                    (speaker.end - end).abs() < 1e-6,
+                    cents(speaker.end) == cents(end),
                     "{case} speaker {} end {} vs published {end}",
                     speaker.speaker,
                     speaker.end
