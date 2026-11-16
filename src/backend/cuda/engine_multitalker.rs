@@ -1529,9 +1529,12 @@ mod gate_tests {
         let steps = blip["masked/blip"]["stream"]["steps"]
             .as_array()
             .context("blip steps")?;
+        // The blip mask: the meeting ground truth with speaker 0 forced on
+        // frames [0,2), speaker 0 off and filler lane 2 on over [2,resume),
+        // ground truth elsewhere, as the published-loop fixture recorded it.
         let mut diar = meeting.diar.clone();
-        diar[..lanes].fill(1.0);
-        diar[lanes..2 * lanes].fill(1.0);
+        diar[0] = 1.0;
+        diar[lanes] = 1.0;
         for frame in 2..resume {
             diar[frame * lanes] = 0.0;
             diar[frame * lanes + 2] = 1.0;
