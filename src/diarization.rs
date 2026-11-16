@@ -186,14 +186,24 @@ fn emitted_stream_mask<'a>(
     Ok(&mask[..frames])
 }
 
+/// Frame logits and validity over the whole clip: `logits` is
+/// `[frames][speakers]`, `valid` one flag per frame, `frame_seconds` the
+/// frame period.
 #[cfg(feature = "cuda")]
-pub fn diarize(
+struct DiarizationFrames {
+    logits: Vec<f32>,
+    valid: Vec<bool>,
+    speakers: usize,
+    frame_seconds: f64,
+}
+
+#[cfg(feature = "cuda")]
+fn diarization_frames(
     directory: &Path,
     waveform: &[f32],
     stream: bool,
-    threshold: f64,
     options: crate::RunOptions,
-) -> Result<Vec<crate::media::TextSegment>> {
+) -> Result<DiarizationFrames> {
     let spec = DiarizationSpec::read(directory)?;
     let device = crate::backend::cuda::Device::new(options.device)?;
     let mut engine = Diarization::load(directory, &device)?;
@@ -228,24 +238,83 @@ pub fn diarize(
                 break;
             }
         }
-        speaker_segments(
-            &logits,
-            spec.speakers as usize,
-            Some(&mask),
-            threshold,
+        Ok(DiarizationFrames {
+            logits,
+            valid: mask,
+            speakers: spec.speakers as usize,
             frame_seconds,
-        )
+        })
     } else {
         let batch = engine.audio_features(waveform, false, false)?;
         let (logits, _) = engine.offline(&batch.features, &batch.mask, 0)?;
-        speaker_segments(
-            &logits,
-            spec.speakers as usize,
-            Some(&batch.mask),
-            threshold,
+        Ok(DiarizationFrames {
+            logits,
+            valid: batch.mask,
+            speakers: spec.speakers as usize,
             frame_seconds,
-        )
+        })
     }
+}
+
+/// Binarized speaker activity over the diarization frame grid: one bool per
+/// `[frame][speaker]`, the same sigmoid-over-threshold rule as the segment
+/// path; frames outside the validity mask stay inactive.
+#[cfg(feature = "cuda")]
+pub struct SpeakerMasks {
+    pub frames: usize,
+    pub speakers: usize,
+    pub frame_seconds: f64,
+    pub active: Vec<bool>,
+}
+
+#[cfg(feature = "cuda")]
+pub fn speaker_masks(
+    directory: &Path,
+    waveform: &[f32],
+    stream: bool,
+    threshold: f64,
+    options: crate::RunOptions,
+) -> Result<SpeakerMasks> {
+    let frames = diarization_frames(directory, waveform, stream, options)?;
+    let count = frames.logits.len() / frames.speakers;
+    ensure!(
+        frames.logits.len() == count * frames.speakers && frames.valid.len() == count,
+        "diarization frame extents"
+    );
+    let mut active = vec![false; frames.logits.len()];
+    for frame in 0..count {
+        if !frames.valid[frame] {
+            continue;
+        }
+        for speaker in 0..frames.speakers {
+            let logit = f64::from(frames.logits[frame * frames.speakers + speaker]);
+            active[frame * frames.speakers + speaker] = 1.0 / (1.0 + (-logit).exp()) > threshold;
+        }
+    }
+    Ok(SpeakerMasks {
+        frames: count,
+        speakers: frames.speakers,
+        frame_seconds: frames.frame_seconds,
+        active,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn diarize(
+    directory: &Path,
+    waveform: &[f32],
+    stream: bool,
+    threshold: f64,
+    options: crate::RunOptions,
+) -> Result<Vec<crate::media::TextSegment>> {
+    let frames = diarization_frames(directory, waveform, stream, options)?;
+    speaker_segments(
+        &frames.logits,
+        frames.speakers,
+        Some(&frames.valid),
+        threshold,
+        frames.frame_seconds,
+    )
 }
 
 impl DiarizationSpec {

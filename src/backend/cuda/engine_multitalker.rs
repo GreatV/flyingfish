@@ -1619,6 +1619,241 @@ mod gate_tests {
         );
         Ok(())
     }
+    /// Mask arm of the CLI gate: the native diarizer's binarized speaker
+    /// activity on the recorded meeting equals the published (transformers)
+    /// diarizer's, frame by frame, on all 8 channels. The compared frames'
+    /// sigmoid margins stay above 1e-2, ten times the 1.018e-3 probability
+    /// shift bound from the diarizer's frozen logit floors (worst max_abs
+    /// 4.071e-3 in N6f-M0/FROZEN.json times the 0.25 sigmoid slope), so a
+    /// native diarizer within its own gates cannot flip a compared frame.
+    #[test]
+    #[ignore = "GPU + published diarizer + fixture; set FF_N6E_DIAR, FF_N6E_INPUTS, FF_N6E_M3"]
+    fn multitalker_cli_masks_match_the_published_diarizer() -> Result<()> {
+        let diar_dir = std::env::var("FF_N6E_DIAR").context("FF_N6E_DIAR")?;
+        let inputs_root = std::env::var("FF_N6E_INPUTS").context("FF_N6E_INPUTS")?;
+        let m3 = std::env::var("FF_N6E_M3").context("FF_N6E_M3")?;
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&m3)?)?;
+        let min_margin = fixture["meta"]["min_margin"]
+            .as_f64()
+            .context("fixture min margin")?;
+        ensure!(
+            min_margin >= 1e-2,
+            "fixture margin {min_margin:.4e} below the frozen 1e-2 rule"
+        );
+        let speakers = fixture["masks"]["speakers"].as_u64().context("speakers")? as usize;
+        let frames = fixture["masks"]["frames"].as_u64().context("frames")? as usize;
+        let expected: Vec<bool> = fixture["masks"]["active"]
+            .as_array()
+            .context("fixture mask")?
+            .iter()
+            .map(|value| value.as_bool().context("mask entry"))
+            .collect::<Result<_>>()?;
+        ensure!(expected.len() == frames * speakers, "fixture mask extent");
+        let wave = read_wave(&Path::new(&inputs_root).join("meeting.wav"))?;
+        let options = crate::RunOptions {
+            device: 0,
+            runtime_dir: std::path::PathBuf::new(),
+            verbose: false,
+        };
+        let masks = crate::diarization::speaker_masks(
+            &std::path::PathBuf::from(diar_dir),
+            &wave,
+            false,
+            crate::diarization::DIARIZATION_THRESHOLD,
+            options,
+        )?;
+        ensure!(
+            masks.speakers == speakers,
+            "native diarizer channels {} vs fixture {speakers}",
+            masks.speakers
+        );
+        let compared = masks.frames.min(frames);
+        ensure!(
+            compared == masks.frames && compared == frames,
+            "native diarizer frames {} vs fixture {frames}",
+            masks.frames
+        );
+        let mut mismatches = 0usize;
+        let mut first = None;
+        for (index, (ours, reference)) in masks.active.iter().zip(&expected).enumerate() {
+            if ours != reference {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some(index);
+                }
+            }
+        }
+        ensure!(
+            mismatches == 0,
+            "diarizer masks differ at {mismatches} of {} entries, first at frame {} channel {}",
+            compared * speakers,
+            first.map(|index| index / speakers).unwrap_or(0),
+            first.map(|index| index % speakers).unwrap_or(0),
+        );
+        let active_channels = (0..speakers)
+            .filter(|channel| {
+                expected
+                    .iter()
+                    .skip(*channel)
+                    .step_by(speakers)
+                    .any(|value| *value)
+            })
+            .count();
+        println!(
+            "PASS multitalker_cli_masks frames={compared} channels={speakers} active={active_channels} min_margin={min_margin:.4e}"
+        );
+        Ok(())
+    }
+
+    /// ASR arm of the CLI gate: with the fixture's diarizer masks, the
+    /// transcribe entry's masked path reproduces the published loop's
+    /// per-speaker tokens, timestamps and text exactly; the kernel path is
+    /// a measurement against the published kernel loop. Swapping two
+    /// speakers' mask channels must change the transcription.
+    #[test]
+    #[ignore = "GPU + published archive + fixture; set FF_MULTITALKER_NEMO, FF_N6E_INPUTS, FF_N6E_M3"]
+    fn multitalker_transcribe_matches_the_published_pipeline() -> Result<()> {
+        let nemo = std::env::var("FF_MULTITALKER_NEMO").context("FF_MULTITALKER_NEMO")?;
+        let inputs_root = std::env::var("FF_N6E_INPUTS").context("FF_N6E_INPUTS")?;
+        let m3 = std::env::var("FF_N6E_M3").context("FF_N6E_M3")?;
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&m3)?)?;
+        let speakers = fixture["masks"]["speakers"].as_u64().context("speakers")? as usize;
+        let frames = fixture["masks"]["frames"].as_u64().context("frames")? as usize;
+        let active: Vec<bool> = fixture["masks"]["active"]
+            .as_array()
+            .context("fixture mask")?
+            .iter()
+            .map(|value| value.as_bool().context("mask entry"))
+            .collect::<Result<_>>()?;
+        ensure!(active.len() == frames * speakers, "fixture mask extent");
+        let masks_of = |active: &[bool]| -> crate::diarization::SpeakerMasks {
+            crate::diarization::SpeakerMasks {
+                frames,
+                speakers,
+                frame_seconds: 0.08,
+                active: active.to_vec(),
+            }
+        };
+        let expected = |mode: &str, speaker: usize| -> Result<(Vec<u32>, Vec<u32>, String)> {
+            let entry = fixture[mode][speaker.to_string()]
+                .as_object()
+                .with_context(|| format!("{mode} speaker {speaker}"))?;
+            let numbers = |key: &str| -> Result<Vec<u32>> {
+                entry[key]
+                    .as_array()
+                    .with_context(|| format!("{mode} speaker {speaker} {key}"))?
+                    .iter()
+                    .map(|value| Ok(value.as_u64().context("entry")? as u32))
+                    .collect()
+            };
+            Ok((
+                numbers("tokens")?,
+                numbers("timestamps")?,
+                entry["text"]
+                    .as_str()
+                    .with_context(|| format!("{mode} speaker {speaker} text"))?
+                    .to_string(),
+            ))
+        };
+        let wave = read_wave(&Path::new(&inputs_root).join("meeting.wav"))?;
+        let options = crate::RunOptions {
+            device: 0,
+            runtime_dir: std::path::PathBuf::new(),
+            verbose: false,
+        };
+        let run = |active: &[bool],
+                   masked_asr: bool|
+         -> Result<crate::multitalker::MultitalkerTranscription> {
+            crate::multitalker::transcribe(
+                &std::path::PathBuf::from(&nemo),
+                &wave,
+                &masks_of(active),
+                masked_asr,
+                options.clone(),
+            )
+        };
+        let masked = run(&active, true)?;
+        let reference_speakers = fixture["masked"]
+            .as_object()
+            .context("masked finals")?
+            .keys()
+            .count();
+        let native_speakers = masked.speakers.len();
+        ensure!(
+            native_speakers == reference_speakers,
+            "masked speakers {native_speakers} vs reference {reference_speakers}"
+        );
+        for speaker in &masked.speakers {
+            let (tokens, timestamps, text) = expected("masked", speaker.speaker)?;
+            ensure!(
+                speaker.tokens == tokens,
+                "masked speaker {} tokens {} vs reference {} (first mismatch {:?})",
+                speaker.speaker,
+                speaker.tokens.len(),
+                tokens.len(),
+                speaker.tokens.iter().zip(&tokens).position(|(a, b)| a != b)
+            );
+            ensure!(
+                speaker.timestamps == timestamps,
+                "masked speaker {} timestamps differ (first at {:?})",
+                speaker.speaker,
+                speaker
+                    .timestamps
+                    .iter()
+                    .zip(&timestamps)
+                    .position(|(a, b)| a != b)
+            );
+            ensure!(
+                speaker.text == text,
+                "masked speaker {} text differs: {:?} vs {:?}",
+                speaker.speaker,
+                speaker.text,
+                text
+            );
+        }
+        println!(
+            "PASS multitalker_transcribe_masked speakers={native_speakers} tokens={}",
+            masked
+                .speakers
+                .iter()
+                .map(|s| s.tokens.len())
+                .sum::<usize>()
+        );
+        let kernel = run(&active, false)?;
+        for speaker in &kernel.speakers {
+            let Ok((tokens, _, _)) = expected("kernel", speaker.speaker) else {
+                continue;
+            };
+            let first = speaker.tokens.iter().zip(&tokens).position(|(a, b)| a != b);
+            println!(
+                "KERNEL_DIVERGED speaker {} ours {} reference {} first_mismatch {:?} text_equal {}",
+                speaker.speaker,
+                speaker.tokens.len(),
+                tokens.len(),
+                first,
+                expected("kernel", speaker.speaker)
+                    .map(|(_, _, text)| text == speaker.text)
+                    .unwrap_or(false)
+            );
+        }
+        let mut swapped = active.to_vec();
+        for frame in 0..frames {
+            swapped.swap(frame * speakers, frame * speakers + 1);
+        }
+        let control = run(&swapped, true)?;
+        let unchanged = masked.speakers.iter().all(|speaker| {
+            control
+                .speakers
+                .iter()
+                .any(|other| other.speaker == speaker.speaker && other.tokens == speaker.tokens)
+        });
+        ensure!(
+            !unchanged,
+            "swapping speakers 0 and 1 left the transcription unchanged"
+        );
+        println!("PASS multitalker_transcribe_control swapped speakers 0/1 changed the output");
+        Ok(())
+    }
 
     #[test]
     #[ignore = "GPU + published archive + fixture arms; set FF_MULTITALKER_NEMO, FF_N6E_M2B, FF_N6E_M2B_GPU"]
