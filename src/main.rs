@@ -131,6 +131,17 @@ struct TranscribeArgs {
     pnc: bool,
     #[arg(long, conflicts_with = "pnc")]
     no_pnc: bool,
+    #[arg(
+        long,
+        help = "Diarization model directory selecting the multitalker path"
+    )]
+    diar_model: Option<PathBuf>,
+    #[arg(
+        long,
+        requires = "diar_model",
+        help = "Masked-ASR lane masking instead of the speaker-kernel default"
+    )]
+    masked: bool,
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
 }
@@ -760,33 +771,101 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
                 .context("--runtime-dir is required for transcribe")?,
             verbose: cli.verbose,
         };
-        let result = match class.as_str() {
-            "ParakeetForTDT" => flyingfish::parakeet::transcribe(&cli.model, &waveform, options)?,
-            "CanaryForConditionalGeneration" => flyingfish::canary::transcribe(
+        let bytes = if let Some(diar_model) = &args.diar_model {
+            ensure!(
+                class == "nemo",
+                "--diar-model selects the multitalker path; unsupported for architecture {class}"
+            );
+            let masks = flyingfish::diarization::speaker_masks(
+                diar_model,
+                &waveform,
+                args.stream,
+                flyingfish::diarization::DIARIZATION_THRESHOLD,
+                options.clone(),
+            )?;
+            let result = flyingfish::multitalker::transcribe(
                 &cli.model,
                 &waveform,
-                &args.source_lang,
-                &args.target_lang,
-                !args.no_pnc,
+                &masks,
+                args.masked,
                 options,
-            )?,
-            "nemo" => flyingfish::eou::transcribe(&cli.model, &waveform, args.stream, options)?,
-            _ => bail!("unsupported transcription architecture {class}"),
-        };
-        let bytes = match args.format {
-            TranscriptionFormat::Txt => format!("{}\n", result.text).into_bytes(),
-            TranscriptionFormat::Json => {
-                format!("{}\n", serde_json::to_string(&result)?).into_bytes()
+            )?;
+            match args.format {
+                TranscriptionFormat::Txt => {
+                    let mut text = String::new();
+                    for speaker in &result.speakers {
+                        text.push_str(&format!(
+                            "speaker_{} [{:.2}-{:.2}]\n{}\n",
+                            speaker.speaker, speaker.start, speaker.end, speaker.text
+                        ));
+                    }
+                    format!("{text}\n").into_bytes()
+                }
+                TranscriptionFormat::Json => {
+                    format!("{}\n", serde_json::to_string(&result)?).into_bytes()
+                }
+                TranscriptionFormat::Srt | TranscriptionFormat::Vtt => {
+                    let mut segments: Vec<flyingfish::media::TextSegment> = result
+                        .speakers
+                        .iter()
+                        .flat_map(|speaker| {
+                            speaker
+                                .words
+                                .iter()
+                                .map(|word| flyingfish::media::TextSegment {
+                                    start: word.start,
+                                    end: word.end,
+                                    text: format!("speaker_{}: {}", speaker.speaker, word.text),
+                                })
+                        })
+                        .collect();
+                    segments.sort_by(|a, b| {
+                        a.start
+                            .total_cmp(&b.start)
+                            .then(a.end.total_cmp(&b.end))
+                            .then_with(|| a.text.cmp(&b.text))
+                    });
+                    let mut bytes = Vec::new();
+                    match args.format {
+                        TranscriptionFormat::Srt => {
+                            flyingfish::media::write_srt(&mut bytes, &segments)?
+                        }
+                        _ => flyingfish::media::write_vtt(&mut bytes, &segments)?,
+                    }
+                    bytes
+                }
             }
-            TranscriptionFormat::Srt => {
-                let mut bytes = Vec::new();
-                flyingfish::media::write_srt(&mut bytes, &result.segments)?;
-                bytes
-            }
-            TranscriptionFormat::Vtt => {
-                let mut bytes = Vec::new();
-                flyingfish::media::write_vtt(&mut bytes, &result.segments)?;
-                bytes
+        } else {
+            let result = match class.as_str() {
+                "ParakeetForTDT" => {
+                    flyingfish::parakeet::transcribe(&cli.model, &waveform, options)?
+                }
+                "CanaryForConditionalGeneration" => flyingfish::canary::transcribe(
+                    &cli.model,
+                    &waveform,
+                    &args.source_lang,
+                    &args.target_lang,
+                    !args.no_pnc,
+                    options,
+                )?,
+                "nemo" => flyingfish::eou::transcribe(&cli.model, &waveform, args.stream, options)?,
+                _ => bail!("unsupported transcription architecture {class}"),
+            };
+            match args.format {
+                TranscriptionFormat::Txt => format!("{}\n", result.text).into_bytes(),
+                TranscriptionFormat::Json => {
+                    format!("{}\n", serde_json::to_string(&result)?).into_bytes()
+                }
+                TranscriptionFormat::Srt => {
+                    let mut bytes = Vec::new();
+                    flyingfish::media::write_srt(&mut bytes, &result.segments)?;
+                    bytes
+                }
+                TranscriptionFormat::Vtt => {
+                    let mut bytes = Vec::new();
+                    flyingfish::media::write_vtt(&mut bytes, &result.segments)?;
+                    bytes
+                }
             }
         };
         write_bytes_output(
