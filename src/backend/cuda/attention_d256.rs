@@ -1579,18 +1579,18 @@ mod tests {
                 prefix_v: &prefix_v,
             });
             let want = reference.core_out();
+            let (q_abs, _) = crate::verify::max_abs_rmse(
+                "attention_d256.q",
+                &q_roped[..reference.q.len()],
+                &reference.q,
+            )?;
             let q_scale = reference
                 .q
                 .iter()
                 .map(|v| v.abs())
                 .fold(0f32, f32::max)
                 .max(1e-12);
-            let q_rel = q_roped
-                .iter()
-                .zip(&reference.q)
-                .map(|(a, b)| (a.to_f32() - b).abs())
-                .fold(0f32, f32::max)
-                / q_scale;
+            let q_rel = q_abs as f32 / q_scale;
             // Full rotary: two RMS rounds, cos/sin, two products and the sum; partial rotary: RMS and RoPE.
             let q_bound = bf16_chain_bound(if full { 6 } else { 2 }, &[d]) as f32;
             eprintln!("P1D_BINDER_Q rel={q_rel:e} bound={q_bound:e}");
@@ -1607,12 +1607,9 @@ mod tests {
             // Full rotary: six rounds on each of Q/K, P and O; partial rotary: two on Q/K, P and O.
             // FP32 reductions: Q/K RMS and QK over D; softmax and PV over visible keys.
             let bound = bf16_chain_bound(if full { 14 } else { 6 }, &[d, d, d, keys, keys]) as f32;
-            let worst = want
-                .iter()
-                .enumerate()
-                .map(|(i, &w)| (got[i].to_f32() - w).abs())
-                .fold(0f32, f32::max);
-            let rel = worst / scale;
+            let (worst, _) =
+                crate::verify::max_abs_rmse("attention_d256.core", &got[..want.len()], &want)?;
+            let rel = worst as f32 / scale;
             eprintln!(
                 "P1D_BINDER prefix={prefix} valid_rows={valid_rows} max_rows={max_rows} \
                  capacity={capacity} key_chunk={key_chunk} segments={} max_parts={} \
@@ -1766,27 +1763,16 @@ mod tests {
                 kv_bits.extend(cache[start..start + d].iter().map(|v| v.to_bits()));
             }
         }
-        ensure!(
-            output
-                .iter()
-                .chain(&oracle)
-                .chain(&lse)
-                .chain(&oracle_lse)
-                .all(|x| x.is_finite()),
-            "nonfinite split probe"
-        );
-        let error = |a: &[f64], b: &[f64]| {
-            a.iter()
-                .zip(b)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f64::max)
-        };
+        let (output_error, _) =
+            crate::verify::max_abs_rmse("attention_d256.split.output", &output, &oracle)?;
+        let (lse_error, _) =
+            crate::verify::max_abs_rmse("attention_d256.split.lse", &lse, &oracle_lse)?;
         Ok(serde_json::json!({
             "hq":hq,"hkv":hkv,"keys":keys,"capacity":case.capacity,
             "max_rows":case.max_rows,"graph":case.graph,"control":case.boundary_probe,
             "key_chunk":case.key_chunk,"pmax":ws.max_parts,"active_ctas":active*hkv,
             "workspace_bytes":ws.bytes,"output":output,"lse":lse,"q_bits":q_bits,"kv_bits":kv_bits,
-            "output_error":error(&output,&oracle),"lse_error":error(&lse,&oracle_lse),
+            "output_error":output_error,"lse_error":lse_error,
             "oracle_output":oracle,"oracle_lse":oracle_lse
         }))
     }

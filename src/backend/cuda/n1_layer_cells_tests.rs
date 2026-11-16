@@ -129,22 +129,6 @@ mod gates {
         Ok(values)
     }
 
-    fn metrics(candidate: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
-        ensure!(
-            candidate.len() == reference.len() && !candidate.is_empty(),
-            "tap extent differs"
-        );
-        let mut max_abs = 0.0f64;
-        let mut squared = 0.0f64;
-        for (&a, &b) in candidate.iter().zip(reference) {
-            ensure!(a.is_finite() && b.is_finite(), "non-finite tap value");
-            let d = (f64::from(a) - f64::from(b)).abs();
-            max_abs = max_abs.max(d);
-            squared += d * d;
-        }
-        Ok((max_abs, (squared / candidate.len() as f64).sqrt()))
-    }
-
     fn arm_dirs(frozen: &Value) -> Result<BTreeMap<String, String>> {
         let mut out = BTreeMap::new();
         if let Some(arms) = frozen.get("arms").and_then(Value::as_object) {
@@ -378,7 +362,7 @@ mod gates {
                         .and_then(|taps| taps.get(key))
                         .with_context(|| format!("{source} {key} missing reference arm {arm}"))?;
                     ensure!(reference.len() == numel, "reference {key} extent differs");
-                    let pair = metrics(values, reference)?;
+                    let pair = crate::verify::max_abs_rmse(key, values, reference)?;
                     worst.0 = worst.0.max(pair.0);
                     worst.1 = worst.1.max(pair.1);
                 }
@@ -609,7 +593,7 @@ mod gates {
                     .get(&arm)
                     .and_then(|taps| taps.get(key))
                     .with_context(|| format!("control {key} missing reference arm {arm}"))?;
-                let pair = metrics(values, reference)?;
+                let pair = crate::verify::max_abs_rmse(key, values, reference)?;
                 control_worst.0 = control_worst.0.max(pair.0);
                 control_worst.1 = control_worst.1.max(pair.1);
             }

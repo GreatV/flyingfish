@@ -184,26 +184,6 @@ fn bf16_bits(words: &[bf16]) -> Vec<u16> {
     words.iter().map(|w| w.to_bits()).collect()
 }
 
-fn ensure_bitwise(name: &str, got: &[u16], want: &[u16]) -> Result<()> {
-    anyhow::ensure!(
-        got.len() == want.len(),
-        "{name} word count {} != {}",
-        got.len(),
-        want.len()
-    );
-    for (idx, (&g, &w)) in got.iter().zip(want).enumerate() {
-        anyhow::ensure!(g == w, "{name} word {idx}: {g:#06x} != {w:#06x}");
-    }
-    Ok(())
-}
-
-fn max_row_diff(got: &[bf16], want: &[bf16]) -> f32 {
-    got.iter()
-        .zip(want)
-        .map(|(&g, &w)| (g.to_f32() - w.to_f32()).abs())
-        .fold(0.0f32, f32::max)
-}
-
 fn row<T: Copy>(tensor: Tensor<T, 2>, index: usize) -> Result<Tensor<T, 2>> {
     ensure!(index < tensor.shape[0] as usize, "test row outside tensor");
     let offset = index as u64 * tensor.stride[0] * size_of::<T>() as u64;
@@ -1152,7 +1132,7 @@ fn decode_expert_ffn_gpu() -> Result<()> {
         let got = gate.run(rows, &rt)?;
         let sample: Vec<usize> = (0..rows as usize).collect();
         let tol = reference::tolerance(&fx, &sample);
-        let mut worst = 0.0f32;
+        let mut worst = 0.0f64;
         for r in 0..rows as usize {
             let want = reference::moe_row_ids(
                 &fx,
@@ -1162,10 +1142,14 @@ fn decode_expert_ffn_gpu() -> Result<()> {
                 &keep_all,
                 Combine::Fp32,
             );
-            let diff = max_row_diff(&got[r * h..(r + 1) * h], &want);
+            let (diff, _) = crate::verify::max_abs_rmse(
+                &format!("moe.decode.r{rows}.row{r}"),
+                &got[r * h..(r + 1) * h],
+                &want,
+            )?;
             worst = worst.max(diff);
             anyhow::ensure!(
-                diff <= tol,
+                diff <= f64::from(tol),
                 "decode rows={rows} row={r} max diff {diff:e} exceeds tolerance {tol:e}"
             );
             println!("MOE_DECODE_SPREAD rows={rows} row={r} max_diff={diff:e} tol={tol:e}");
@@ -1201,9 +1185,9 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             Combine::Fp32,
         );
         let tol = reference::tolerance(&fx, &[0]);
-        let diff = max_row_diff(&got[..h], &want);
+        let (diff, _) = crate::verify::max_abs_rmse("moe.decode.partial", &got[..h], &want)?;
         anyhow::ensure!(
-            diff <= tol,
+            diff <= f64::from(tol),
             "partial-active row 0 (dropped {dropped:?}) max diff {diff:e} exceeds tolerance {tol:e}"
         );
         println!("MOE_DECODE_PARTIAL row=0 dropped={dropped:?} max_diff={diff:e} tol={tol:e} PASS");
@@ -1286,9 +1270,9 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             Combine::Fp32,
         );
         let tol = reference::tolerance(&mixed, &[0]);
-        let diff = max_row_diff(&got[..mh], &want);
+        let (diff, _) = crate::verify::max_abs_rmse("moe.decode.mixed", &got[..mh], &want)?;
         anyhow::ensure!(
-            diff <= tol,
+            diff <= f64::from(tol),
             "mixed shared width max diff {diff:e} exceeds tolerance {tol:e}"
         );
         println!(
@@ -1338,9 +1322,9 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             &keep_all,
             Combine::Fp32,
         );
-        let diff = max_row_diff(&got[..h], &want);
+        let (diff, _) = crate::verify::max_abs_rmse("moe.decode.swapped", &got[..h], &want)?;
         anyhow::ensure!(
-            diff > tol0,
+            diff > f64::from(tol0),
             "swapped slot-table control undetected: diff {diff:e} within tolerance {tol0:e}"
         );
         println!("MOE_DECODE_CONTROL swapped_slots diff={diff:e} tol={tol0:e} DETECTED");
@@ -1379,9 +1363,9 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             &keep_all,
             Combine::Fp32,
         );
-        let diff = max_row_diff(&got[..h], &want);
+        let (diff, _) = crate::verify::max_abs_rmse("moe.decode.rolled", &got[..h], &want)?;
         anyhow::ensure!(
-            diff > tol0,
+            diff > f64::from(tol0),
             "gate/up off-by-one control undetected: diff {diff:e} within tolerance {tol0:e}"
         );
         println!("MOE_DECODE_CONTROL gate_up_rolled diff={diff:e} tol={tol0:e} DETECTED");
@@ -1438,9 +1422,9 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             Combine::Fp32,
         );
         let tol2 = reference::tolerance(&fx2, &[0]);
-        let diff = max_row_diff(&got[..h], &want);
+        let (diff, _) = crate::verify::max_abs_rmse("moe.decode.evict", &got[..h], &want)?;
         anyhow::ensure!(
-            diff <= tol2,
+            diff <= f64::from(tol2),
             "eviction-reuse row 0 (victim {victim}, generation 2) max diff {diff:e} exceeds tolerance {tol2:e}"
         );
         println!(
@@ -1744,26 +1728,34 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
         let shared_out_bf16 = s.clone_dtoh(&io_bf16._shared_out_dev)?;
 
         let (h_bytes, hs_bytes) = (k * i * 2, i * 2);
-        ensure_bitwise(
-            "h",
-            &u16_words(&scratch_w8[..h_bytes]),
-            &u16_words(&scratch_bf16[..h_bytes]),
-        )?;
-        ensure_bitwise(
-            "h_shared",
-            &u16_words(&scratch_w8[h_bytes..h_bytes + hs_bytes]),
-            &u16_words(&scratch_bf16[h_bytes..h_bytes + hs_bytes]),
-        )?;
-        ensure_bitwise(
-            "contributions",
-            &bf16_bits(&contrib_w8),
-            &bf16_bits(&contrib_bf16),
-        )?;
-        ensure_bitwise(
-            "shared_out",
-            &bf16_bits(&shared_out_w8),
-            &bf16_bits(&shared_out_bf16),
-        )?;
+        let pairs = [
+            (
+                "moe.decode.w8a16.h",
+                u16_words(&scratch_w8[..h_bytes]),
+                u16_words(&scratch_bf16[..h_bytes]),
+            ),
+            (
+                "moe.decode.w8a16.h_shared",
+                u16_words(&scratch_w8[h_bytes..h_bytes + hs_bytes]),
+                u16_words(&scratch_bf16[h_bytes..h_bytes + hs_bytes]),
+            ),
+            (
+                "moe.decode.w8a16.contributions",
+                bf16_bits(&contrib_w8),
+                bf16_bits(&contrib_bf16),
+            ),
+            (
+                "moe.decode.w8a16.shared_out",
+                bf16_bits(&shared_out_w8),
+                bf16_bits(&shared_out_bf16),
+            ),
+        ];
+        for (name, got, want) in pairs {
+            let got: Vec<bf16> = got.into_iter().map(bf16::from_bits).collect();
+            let want: Vec<bf16> = want.into_iter().map(bf16::from_bits).collect();
+            let mismatches = crate::verify::bit_mismatches(name, &got, &want)?;
+            anyhow::ensure!(mismatches == 0, "{name} bit mismatches {mismatches}");
+        }
         println!(
             "MOE_DECODE_W8A16_K1_BITWISE h={h_bytes}B h_shared={hs_bytes}B contributions={}w shared_out={}w PASS",
             k * h,
@@ -1784,7 +1776,7 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
         let got = w8.run(rows, &rt, &scratch)?;
         let sample: Vec<usize> = (0..rows as usize).collect();
         let tol = reference::tolerance(&fxq, &sample);
-        let mut worst = 0.0f32;
+        let mut worst = 0.0f64;
         for r in 0..rows as usize {
             let want = reference::moe_row_ids(
                 &fxq,
@@ -1794,10 +1786,14 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
                 &keep_all,
                 Combine::Fp32,
             );
-            let diff = max_row_diff(&got[r * h..(r + 1) * h], &want);
+            let (diff, _) = crate::verify::max_abs_rmse(
+                &format!("moe.decode.w8a16.r{rows}.row{r}"),
+                &got[r * h..(r + 1) * h],
+                &want,
+            )?;
             worst = worst.max(diff);
             anyhow::ensure!(
-                diff <= tol,
+                diff <= f64::from(tol),
                 "w8a16 decode rows={rows} row={r} max diff {diff:e} exceeds tolerance {tol:e}"
             );
             println!("MOE_DECODE_W8A16_SPREAD rows={rows} row={r} max_diff={diff:e} tol={tol:e}");
@@ -1861,9 +1857,9 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
             Combine::Fp32,
         );
         let tol0 = reference::tolerance(&fxq, &[0]);
-        let diff = max_row_diff(&got[..h], &want);
+        let (diff, _) = crate::verify::max_abs_rmse("moe.decode.w8a16.control", &got[..h], &want)?;
         anyhow::ensure!(
-            diff > tol0,
+            diff > f64::from(tol0),
             "swapped gate-scale control undetected: diff {diff:e} within tolerance {tol0:e}"
         );
         println!(

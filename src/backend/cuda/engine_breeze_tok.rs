@@ -1656,30 +1656,7 @@ mod gate {
     }
 
     fn difference(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
-        ensure!(!actual.is_empty(), "Runner FAIL empty tensor");
-        ensure!(actual.len() == expected.len(), "Runner FAIL element count");
-        ensure!(
-            actual.iter().all(|value| value.is_finite()),
-            "Runner FAIL non-finite candidate"
-        );
-        ensure!(
-            expected.iter().all(|value| value.is_finite()),
-            "Runner FAIL non-finite reference"
-        );
-        let mut max_abs = 0.0f64;
-        let mut squares = 0.0f64;
-        for (&got, &want) in actual.iter().zip(expected) {
-            let error = (f64::from(got) - f64::from(want)).abs();
-            max_abs = max_abs.max(error);
-            squares += error * error;
-        }
-        let n = u32::try_from(actual.len()).context("Runner FAIL element count")?;
-        let rmse = (squares / f64::from(n)).sqrt();
-        ensure!(
-            max_abs.is_finite() && rmse.is_finite(),
-            "Runner FAIL non-finite metric"
-        );
-        Ok((max_abs, rmse))
+        crate::verify::max_abs_rmse("breeze_tok.difference", actual, expected)
     }
 
     fn emit(

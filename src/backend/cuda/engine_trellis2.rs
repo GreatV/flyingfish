@@ -1691,20 +1691,7 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(
-                a.len() == b.len() && !a.is_empty(),
-                "cell extent mismatch: {} vs {}",
-                a.len(),
-                b.len()
-            );
-            let mut maximum = 0.0f64;
-            let mut square = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                let d = f64::from(*x) - f64::from(*y);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / a.len() as f64).sqrt()))
+            crate::verify::max_abs_rmse("trellis.pair", a, b)
         };
         let score = |native: &[f32],
                      reference: &[f32],
@@ -1921,20 +1908,7 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(
-                a.len() == b.len() && !a.is_empty(),
-                "cell extent mismatch: {} vs {}",
-                a.len(),
-                b.len()
-            );
-            let mut maximum = 0.0f64;
-            let mut square = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                let d = f64::from(*x) - f64::from(*y);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / a.len() as f64).sqrt()))
+            crate::verify::max_abs_rmse("trellis.pair", a, b)
         };
         let device = Device::new(0)?;
         let (free, total) = device.ctx.mem_get_info()?;
@@ -2101,20 +2075,7 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(
-                a.len() == b.len() && !a.is_empty(),
-                "cell extent mismatch: {} vs {}",
-                a.len(),
-                b.len()
-            );
-            let mut maximum = 0.0f64;
-            let mut square = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                let d = f64::from(*x) - f64::from(*y);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / a.len() as f64).sqrt()))
+            crate::verify::max_abs_rmse("trellis.pair", a, b)
         };
         let device = Device::new(0)?;
         let ops = super::super::ops::Ops::new(&device.ctx)?;
@@ -2381,20 +2342,7 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(
-                a.len() == b.len() && !a.is_empty(),
-                "cell extent mismatch: {} vs {}",
-                a.len(),
-                b.len()
-            );
-            let mut maximum = 0.0f64;
-            let mut square = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                let d = f64::from(*x) - f64::from(*y);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / a.len() as f64).sqrt()))
+            crate::verify::max_abs_rmse("trellis.pair", a, b)
         };
         let pipeline: serde_json::Value =
             serde_json::from_slice(&std::fs::read(model.join("pipeline.json"))?)?;
@@ -2693,20 +2641,7 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(
-                a.len() == b.len() && !a.is_empty(),
-                "cell extent mismatch: {} vs {}",
-                a.len(),
-                b.len()
-            );
-            let mut maximum = 0.0f64;
-            let mut square = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                let d = f64::from(*x) - f64::from(*y);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / a.len() as f64).sqrt()))
+            crate::verify::max_abs_rmse("trellis.pair", a, b)
         };
         // The floor control class: a sparse gather reading the x+1 neighbour
         // instead of the site itself. Emulated on the native output by
@@ -3107,20 +3042,7 @@ mod tests {
             ))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(
-                a.len() == b.len() && !a.is_empty(),
-                "cell extent mismatch: {} vs {}",
-                a.len(),
-                b.len()
-            );
-            let mut maximum = 0.0f64;
-            let mut square = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                let d = f64::from(*x) - f64::from(*y);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / a.len() as f64).sqrt()))
+            crate::verify::max_abs_rmse("trellis.pair", a, b)
         };
         let score = |id: &str,
                      native: &[f32],
@@ -3350,12 +3272,7 @@ mod tests {
             )))
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<f64> {
-            ensure!(a.len() == b.len() && !a.is_empty(), "extent mismatch");
-            let mut maximum = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                maximum = maximum.max((f64::from(*x) - f64::from(*y)).abs());
-            }
-            Ok(maximum)
+            Ok(crate::verify::max_abs_rmse("trellis.max", a, b)?.0)
         };
         let device = Device::new(0)?;
         let ops = super::super::ops::Ops::new(&device.ctx)?;

@@ -292,28 +292,8 @@ fn embedding_f32(
 }
 
 fn embedding_distance(actual: &[f32], expected: &[f32]) -> Result<(f64, f64, f64)> {
-    ensure!(
-        actual.len() == expected.len(),
-        "embedding metric shape differs"
-    );
-    ensure!(
-        actual.iter().all(|value| value.is_finite()),
-        "nonfinite native embedding output"
-    );
-    let (mut maximum, mut squared, mut dot, mut a, mut b) = (0f64, 0f64, 0f64, 0f64, 0f64);
-    for (&actual, &expected) in actual.iter().zip(expected) {
-        let (actual, expected) = (f64::from(actual), f64::from(expected));
-        maximum = maximum.max((actual - expected).abs());
-        squared += (actual - expected).powi(2);
-        dot += actual * expected;
-        a += actual * actual;
-        b += expected * expected;
-    }
-    Ok((
-        maximum,
-        (squared / actual.len() as f64).sqrt(),
-        1.0 - dot / (a.sqrt() * b.sqrt()),
-    ))
+    let measured = flyingfish::verify::metrics("gemma4.embedding", actual, expected)?;
+    Ok((measured.max_abs, measured.rmse, 1.0 - measured.cosine))
 }
 
 fn embedding_stage(

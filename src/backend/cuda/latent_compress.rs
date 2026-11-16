@@ -443,14 +443,18 @@ mod tests {
                             && result.tail_scores == baseline.tail_scores,
                         "compression tail state differs"
                     );
-                    for (bits, &want) in result.pooled.iter().zip(&expected) {
-                        let error = (f64::from(bf16::from_bits(*bits).to_f32()) - want).abs();
-                        ensure!(
-                            error <= threshold,
-                            "compression FP64 error {error} > frozen {threshold}"
-                        );
-                        maximum = maximum.max(error);
-                    }
+                    let candidate: Vec<bf16> =
+                        result.pooled.iter().copied().map(bf16::from_bits).collect();
+                    let (error, _) = crate::verify::max_abs_rmse(
+                        &format!("latent.compress.s{seed}.i{initial}.g{graph}"),
+                        &candidate,
+                        &expected,
+                    )?;
+                    ensure!(
+                        error <= threshold,
+                        "compression FP64 error {error} > frozen {threshold}"
+                    );
+                    maximum = maximum.max(error);
                     cases += 1;
                 }
             }
@@ -513,14 +517,21 @@ mod tests {
                 for graph in [false, true] {
                     let result =
                         trace_operands(&ctx, &cell.values, &cell.scores, initial, [graph, false])?;
+                    let got_bf: Vec<bf16> =
+                        result.pooled.iter().copied().map(bf16::from_bits).collect();
+                    let want_bf: Vec<bf16> =
+                        cell.pooled.iter().copied().map(bf16::from_bits).collect();
+                    let (maximum, _) = crate::verify::max_abs_rmse(
+                        &format!("latent.compress.{}.i{initial}.g{graph}", cell.owner),
+                        &got_bf,
+                        &want_bf,
+                    )?;
                     let mut bad = 0;
-                    let mut maximum = 0.0f64;
                     for (index, (&got, &want)) in result.pooled.iter().zip(&cell.pooled).enumerate()
                     {
                         let distance = (f64::from(bf16::from_bits(got).to_f32())
                             - f64::from(bf16::from_bits(want).to_f32()))
                         .abs();
-                        maximum = maximum.max(distance);
                         if distance > cell.bound {
                             let row = index / 512 * 2;
                             let column = index % 512;

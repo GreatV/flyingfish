@@ -582,19 +582,6 @@ mod tests {
         f64::from(bf16::from_f32(value as f32).to_f32())
     }
 
-    /// Distance in representable BF16 values between two outputs.
-    fn bf16_ulp_distance(a: bf16, b: bf16) -> u32 {
-        fn key(value: bf16) -> u32 {
-            let bits = u32::from(value.to_bits());
-            if bits & 0x8000 != 0 {
-                (!bits) & 0xffff
-            } else {
-                bits | 0x8000
-            }
-        }
-        key(a).abs_diff(key(b))
-    }
-
     /// FP64 reference with the published rounding points.
     #[derive(Clone, Copy, Debug)]
     struct Oracle {
@@ -1559,8 +1546,13 @@ mod tests {
                 let collapse = oracle.collapse(stream, &kernel_pre);
                 for (h, want) in collapse.iter().enumerate() {
                     let got = collapsed_host[row * hidden + h];
-                    let distance = bf16_ulp_distance(got, *want);
-                    let abs = (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs();
+                    let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                        &format!("mhc.collapse.r{row}.h{h}"),
+                        &[got],
+                        &[*want],
+                        None,
+                    )?;
+                    let distance = u32::from(distance);
                     ensure!(
                         distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                         "mHC collapse row={row} h={h} bf16 ulp distance {distance} abs {abs}"
@@ -1576,8 +1568,13 @@ mod tests {
                     let mut caught = 0usize;
                     for h in 0..hidden {
                         let got = collapsed_host[row * hidden + h];
-                        let distance = bf16_ulp_distance(got, wrong[h]);
-                        let abs = (f64::from(got.to_f32()) - f64::from(wrong[h].to_f32())).abs();
+                        let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                            &format!("mhc.collapse.plant.h{h}"),
+                            &[got],
+                            &[wrong[h]],
+                            None,
+                        )?;
+                        let distance = u32::from(distance);
                         if distance > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
                             caught += 1;
                         }
@@ -1659,10 +1656,13 @@ mod tests {
                 for j in 0..mult {
                     for h in 0..hidden {
                         let got = updated_host[(row * mult + j) * hidden + h];
-                        let distance = bf16_ulp_distance(got, update[j * hidden + h]);
-                        let abs = (f64::from(got.to_f32())
-                            - f64::from(update[j * hidden + h].to_f32()))
-                        .abs();
+                        let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                            &format!("mhc.update.r{row}.j{j}.h{h}"),
+                            &[got],
+                            &[update[j * hidden + h]],
+                            None,
+                        )?;
+                        let distance = u32::from(distance);
                         ensure!(
                             distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                             "mHC update row={row} j={j} h={h} bf16 ulp distance {distance} abs {abs}"
@@ -1683,8 +1683,13 @@ mod tests {
                     let mut caught = 0usize;
                     for k in 0..mult * hidden {
                         let got = updated_host[row * mult * hidden + k];
-                        let distance = bf16_ulp_distance(got, swapped[k]);
-                        let abs = (f64::from(got.to_f32()) - f64::from(swapped[k].to_f32())).abs();
+                        let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                            &format!("mhc.orient.r{row}.k{k}"),
+                            &[got],
+                            &[swapped[k]],
+                            None,
+                        )?;
+                        let distance = u32::from(distance);
                         if distance > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
                             caught += 1;
                         }
@@ -1826,15 +1831,20 @@ mod tests {
                         .map(|&v| f64::from(v))
                         .collect();
                     let expected = oracle.collapse(stream, &own);
-                    for (&got, &want) in collapsed[row * hidden..(row + 1) * hidden]
+                    for (h, (&got, &want)) in collapsed[row * hidden..(row + 1) * hidden]
                         .iter()
                         .zip(&expected)
+                        .enumerate()
                     {
+                        let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                            &format!("mhc.glm.collapse.r{row}.h{h}"),
+                            &[got],
+                            &[want],
+                            None,
+                        )?;
                         ensure!(
-                            bf16_ulp_distance(got, want) <= 1
-                                || (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs()
-                                    <= OUTPUT_ABS_TOL,
-                            "GLM own-policy collapse mismatch"
+                            u32::from(distance) <= 1 || abs <= OUTPUT_ABS_TOL,
+                            "GLM own-policy collapse mismatch row={row} h={h}"
                         );
                     }
                     if matches!(stage, HcSublayer::Ffn) {
@@ -1843,14 +1853,21 @@ mod tests {
                             .map(|&v| f64::from(v))
                             .collect();
                         let wrong = oracle.collapse(stream, &stale);
-                        controls += expected
-                            .iter()
-                            .zip(wrong)
-                            .filter(|(a, b)| {
-                                bf16_ulp_distance(**a, *b) > 1
-                                    && (a.to_f32() - b.to_f32()).abs() > OUTPUT_ABS_TOL as f32
-                            })
-                            .count();
+                        let mut policy_caught = 0usize;
+                        for (h, (a, b)) in expected.iter().zip(&wrong).enumerate() {
+                            let (distance, _, _) = crate::verify::bf16_ulp_max(
+                                &format!("mhc.policy.r{row}.h{h}"),
+                                &[*a],
+                                &[*b],
+                                None,
+                            )?;
+                            if u32::from(distance) > 1
+                                && (a.to_f32() - b.to_f32()).abs() > OUTPUT_ABS_TOL as f32
+                            {
+                                policy_caught += 1;
+                            }
+                        }
+                        controls += policy_caught;
                     }
                 }
                 prior_pre = pre;

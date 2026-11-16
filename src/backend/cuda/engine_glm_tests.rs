@@ -1878,66 +1878,66 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
                 .collect())
         };
 
-        let diff_stat = |name: &str, cand: &[f32], refer: &[f32]| {
-            let mut max_abs = 0.0f32;
-            let mut sum_sq = 0.0f32;
-            let mut worst_idx = 0;
+        let diff_stat = |name: &str, cand: &[f32], refer: &[f32]| -> Result<()> {
+            let (max_abs, rmse) =
+                crate::verify::max_abs_rmse(&format!("glm.stage.{name}"), cand, refer)?;
+            let mut worst_idx = 0usize;
+            let mut seen = 0.0f64;
             for (i, (&c, &r)) in cand.iter().zip(refer).enumerate() {
-                let d = (c - r).abs();
-                if d > max_abs {
-                    max_abs = d;
+                let d = (f64::from(c) - f64::from(r)).abs();
+                if d > seen {
+                    seen = d;
                     worst_idx = i;
                 }
-                sum_sq += d * d;
             }
-            let rmse = (sum_sq / cand.len().max(1) as f32).sqrt();
             println!(
                 "STAGE_DIAG {name:15}: max_abs={max_abs:.6} rmse={rmse:.6} worst_idx={worst_idx} (cand={} ref={})",
                 cand.get(worst_idx).unwrap_or(&0.0),
                 refer.get(worst_idx).unwrap_or(&0.0)
             );
+            Ok(())
         };
 
         let to_f32 = |v: &[bf16]| -> Vec<f32> { v.iter().map(|x| x.to_f32()).collect() };
 
         if let Ok(ref_t) = read_bf16("enorm_out") {
-            diff_stat("enorm_out", &to_f32(&stage_taps.enorm), &ref_t);
+            diff_stat("enorm_out", &to_f32(&stage_taps.enorm), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("hnorm_out") {
-            diff_stat("hnorm_out", &to_f32(&stage_taps.hnorm), &ref_t);
+            diff_stat("hnorm_out", &to_f32(&stage_taps.hnorm), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("eh_in") {
-            diff_stat("eh_in", &to_f32(&stage_taps.eh_in), &ref_t);
+            diff_stat("eh_in", &to_f32(&stage_taps.eh_in), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("x") {
-            diff_stat("x", &to_f32(&stage_taps.x_init), &ref_t);
+            diff_stat("x", &to_f32(&stage_taps.x_init), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("x_norm1") {
-            diff_stat("x_norm1", &to_f32(&stage_taps.x_norm1), &ref_t);
+            diff_stat("x_norm1", &to_f32(&stage_taps.x_norm1), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("kv_latent") {
-            diff_stat("kv_latent", &to_f32(&stage_taps.kv_latent), &ref_t);
+            diff_stat("kv_latent", &to_f32(&stage_taps.kv_latent), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("q_a") {
-            diff_stat("q_a", &to_f32(&stage_taps.q_a), &ref_t);
+            diff_stat("q_a", &to_f32(&stage_taps.q_a), &ref_t)?;
         }
         if let Ok(ref_t) = read_f32("q_out") {
-            diff_stat("q_out", &to_f32(&stage_taps.q_out), &ref_t);
+            diff_stat("q_out", &to_f32(&stage_taps.q_out), &ref_t)?;
         }
         if let Ok(ref_t) = read_f32("attn_out") {
-            diff_stat("attn_out", &to_f32(&stage_taps.attn_out), &ref_t);
+            diff_stat("attn_out", &to_f32(&stage_taps.attn_out), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("o_out") {
-            diff_stat("o_out", &to_f32(&stage_taps.o_out), &ref_t);
+            diff_stat("o_out", &to_f32(&stage_taps.o_out), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("x_curr") {
-            diff_stat("x_curr", &to_f32(&stage_taps.x_curr), &ref_t);
+            diff_stat("x_curr", &to_f32(&stage_taps.x_curr), &ref_t)?;
         }
         if let Ok(ref_t) = read_bf16("x_norm2") {
-            diff_stat("x_norm2", &to_f32(&stage_taps.x_norm2), &ref_t);
+            diff_stat("x_norm2", &to_f32(&stage_taps.x_norm2), &ref_t)?;
         }
         if let Ok(ref_t) = read_f32("router_logits") {
-            diff_stat("router_logits", &stage_taps.router_logits, &ref_t);
+            diff_stat("router_logits", &stage_taps.router_logits, &ref_t)?;
         }
         println!("STAGE_DIAG cand_routing_ids: {:?}", stage_taps.routing_ids);
         println!(
@@ -1962,7 +1962,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
             let (ctrl_logits, ctrl_ids, ctrl_weights) =
                 runtime.test_route_custom_norm(&ref_norm2)?;
             if let Ok(ref_t) = read_f32("router_logits") {
-                diff_stat("ctrl_router_logits", &ctrl_logits, &ref_t);
+                diff_stat("ctrl_router_logits", &ctrl_logits, &ref_t)?;
             }
             println!("STAGE_DIAG ctrl_router_ids (from ref x_norm2): got {ctrl_ids:?}");
             println!("STAGE_DIAG ctrl_router_weights: {ctrl_weights:?}");
@@ -2840,7 +2840,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
                              defects_out: &mut Vec<String>,
                              compared_out: &mut usize,
                              gated_out: &mut usize|
-     -> (f32, f32) {
+     -> Result<(f64, f64)> {
         let tau_max_abs = tau_max_abs_per_pos
             .get(p)
             .copied()
@@ -2849,23 +2849,15 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
             .get(p)
             .copied()
             .unwrap_or(tau_rmse_per_pos[0]);
-        let mut row0_max_abs = 0.0f32;
-        let mut row0_sum_sq = 0.0f32;
-        for (&v, &r) in verify_logits.iter().zip(ref_logits) {
-            let diff = (v - r).abs();
-            if diff > row0_max_abs {
-                row0_max_abs = diff;
-            }
-            row0_sum_sq += diff * diff;
-        }
-        let row0_rmse = (row0_sum_sq / verify_logits.len() as f32).sqrt();
+        let (row0_max_abs, row0_rmse) =
+            crate::verify::max_abs_rmse(&format!("{label}.p{p}"), verify_logits, ref_logits)?;
         if gated_positions.contains(&p) {
-            if row0_max_abs > tau_max_abs {
+            if row0_max_abs > f64::from(tau_max_abs) {
                 defects_out.push(format!(
                     "DEFECT {label} at pos={p} max_abs={row0_max_abs:.6} exceeds tau={tau_max_abs:.6}"
                 ));
             }
-            if row0_rmse > tau_rmse {
+            if row0_rmse > f64::from(tau_rmse) {
                 defects_out.push(format!(
                     "DEFECT {label} at pos={p} rmse={row0_rmse:.6} exceeds tau={tau_rmse:.6}"
                 ));
@@ -2873,7 +2865,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
             *gated_out += 1;
         }
         *compared_out += 1;
-        (row0_max_abs, row0_rmse)
+        Ok((row0_max_abs, row0_rmse))
     };
 
     // Exercise gated control position 1 from verify_control_positions_r1.json before passage rollout.
@@ -2896,7 +2888,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         &mut defects,
         &mut verify_compared_count,
         &mut verify_gated_count,
-    );
+    )?;
     let mut pos1_max_idx = 0usize;
     let mut pos1_best_diff = -1.0f32;
     for (idx, (&v, &r)) in out_pos1
@@ -2914,8 +2906,11 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let pos1_verify_logit = out_pos1.verify_row0_logits[pos1_max_idx];
     let pos1_ref_logit = ref_pos1_logits[pos1_max_idx];
     let (pos1_verify_top1, pos1_verify_margin) =
-        super::mtp::top1_and_margin(&out_pos1.verify_row0_logits);
-    let (pos1_ref_top1, pos1_ref_margin) = super::mtp::top1_and_margin(&ref_pos1_logits);
+        crate::verify::top_two("glm.mtp.gated.verify", &out_pos1.verify_row0_logits)?;
+    let pos1_verify_margin = pos1_verify_margin as f32;
+    let (pos1_ref_top1, pos1_ref_margin) =
+        crate::verify::top_two("glm.mtp.gated.ref", &ref_pos1_logits)?;
+    let pos1_ref_margin = pos1_ref_margin as f32;
     println!(
         "GLM_MTP_GATED_POS pos={} max_abs={pos1_max_abs:.6} tau_max_abs={:.6} rmse={pos1_rmse:.6} tau_rmse={:.6} vocab_idx={pos1_max_idx} verify_logit={pos1_verify_logit:.6} ref_logit={pos1_ref_logit:.6} verify_top1={pos1_verify_top1} verify_margin={pos1_verify_margin:.6} ref_top1={pos1_ref_top1} ref_margin={pos1_ref_margin:.6}",
         out_pos1.start_pos,
@@ -2972,7 +2967,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
                 &mut defects,
                 &mut verify_compared_count,
                 &mut verify_gated_count,
-            );
+            )?;
             out_eager
         } else {
             engine.glm_mtp_round(false)?
@@ -2982,8 +2977,10 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         let tokens_in_round = out.round.tokens.len();
         if total_rounds <= 8 || out.round.accepted == 0 {
             let draft_tok = out.round.proposals.first().copied().unwrap_or(0);
-            let (v0_id, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
-            let (v1_id, _) = super::mtp::top1_and_margin(&out.verify_row1_logits);
+            let (v0_id, _) =
+                crate::verify::top_two("glm.mtp.round.verify0", &out.verify_row0_logits)?;
+            let (v1_id, _) =
+                crate::verify::top_two("glm.mtp.round.verify1", &out.verify_row1_logits)?;
             println!(
                 "GLM_MTP_ROUND8 round={total_rounds} pos={} draft={draft_tok} verify_argmax={v0_id} verify_margin={:.4} accepted={} v1={v1_id} v1_margin={:.4}",
                 out.start_pos, out.v0_margin, out.round.accepted, out.v1_margin
@@ -3001,7 +2998,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         }
 
         // Verify emitted tokens match argmax of verify rows
-        let (top0_id, _) = super::mtp::top1_and_margin(&out.verify_row0_logits);
+        let (top0_id, _) = crate::verify::top_two("glm.mtp.emit.0", &out.verify_row0_logits)?;
         ensure!(
             top0_id == out.round.tokens[0],
             "DEFECT emitted token 0 ({}) does not match argmax ({top0_id})",
@@ -3012,7 +3009,7 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
         margin_count += 1;
 
         if tokens_in_round > 1 {
-            let (top1_id, _) = super::mtp::top1_and_margin(&out.verify_row1_logits);
+            let (top1_id, _) = crate::verify::top_two("glm.mtp.emit.1", &out.verify_row1_logits)?;
             ensure!(
                 top1_id == out.round.tokens[1],
                 "DEFECT emitted token 1 ({}) does not match argmax ({top1_id})",
@@ -3139,10 +3136,13 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
         }
         baseline.push(engine.decode(false, None)?);
     }
-    let baseline_margins: Vec<_> = baseline_logits
+    let baseline_margins: Vec<f32> = baseline_logits
         .iter()
-        .map(|logits| super::mtp::top1_and_margin(logits).1)
-        .collect();
+        .enumerate()
+        .map(|(index, logits)| {
+            Ok(crate::verify::top_two(&format!("glm.mtp.free.baseline.{index}"), logits)?.1 as f32)
+        })
+        .collect::<Result<_>>()?;
     println!("GLM_MTP_FREE_BASELINE ids={baseline:?} margins={baseline_margins:?}");
     std::io::stdout().flush()?;
     drop(engine);
@@ -3160,31 +3160,24 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
     let mut first_divergence = None;
     let mut logit_defects = 0usize;
     let mut id_defects = 0usize;
-    let mut max_logit_ratio = 0.0f32;
+    let mut max_logit_ratio = 0.0f64;
     let mut compare = |index: usize, token: u32, logits: &[f32]| -> Result<()> {
         if !shared_prefix {
             return Ok(());
         }
         let plain = &baseline_logits[index];
-        ensure!(
-            logits.len() == plain.len() && logits.iter().all(|v| v.is_finite()),
-            "Runner FAIL verify logit extent or nonfinite values"
-        );
         let position = prompt.len() - 1 + index;
         let bound = tau[position];
-        let max_abs = logits
-            .iter()
-            .zip(plain)
-            .map(|(v, p)| (v - p).abs())
-            .fold(0.0f32, f32::max);
+        let (max_abs, _) =
+            crate::verify::max_abs_rmse(&format!("glm.mtp.shared.p{position}"), logits, plain)?;
         let required = baseline_margins[index] > 2.0 * bound;
         let mismatch = token != baseline[index];
         compared += 1;
         id_required += usize::from(required);
         near_ties += usize::from(!required);
-        logit_defects += usize::from(max_abs > bound);
+        logit_defects += usize::from(max_abs > f64::from(bound));
         id_defects += usize::from(required && mismatch);
-        max_logit_ratio = max_logit_ratio.max(max_abs / bound);
+        max_logit_ratio = max_logit_ratio.max(max_abs / f64::from(bound));
         println!(
             "GLM_MTP_SHARED_PREFIX index={index} input_position={position} max_abs={max_abs} tau={bound} plain_margin={} id_required={required} id_mismatch={mismatch}",
             baseline_margins[index],
@@ -3198,14 +3191,15 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
                 position + 1,
                 baseline[index],
                 baseline_margins[index],
-                super::mtp::top1_and_margin(logits).1,
+                crate::verify::top_two(&format!("glm.mtp.free.first.{index}"), logits)?.1 as f32,
             );
         }
         Ok(())
     };
     let check_commit =
         |tokens: &[u32], accepted: usize, proposal: u32, verify: [&[f32]; 2]| -> Result<()> {
-            let [v0, v1] = verify.map(|logits| super::mtp::top1_and_margin(logits).0);
+            let v0 = crate::verify::top_two("glm.mtp.free.commit.0", verify[0])?.0;
+            let v1 = crate::verify::top_two("glm.mtp.free.commit.1", verify[1])?.0;
             let expected = usize::from(proposal == v0);
             ensure!(
                 accepted == expected
@@ -3218,7 +3212,8 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
         };
     let mut speculative = vec![engine.mtp_prefill(prompt)?];
     let initial = engine.decode_logits()?;
-    let mut speculative_margins = vec![super::mtp::top1_and_margin(&initial).1];
+    let mut speculative_margins =
+        vec![crate::verify::top_two("glm.mtp.free.initial", &initial)?.1 as f32];
     compare(0, speculative[0], &initial)?;
     let mut rounds = 0usize;
     let mut accepted = 0usize;
@@ -3242,8 +3237,10 @@ fn glm_mtp_greedy_256_gpu() -> Result<()> {
             commit_defects += 1;
             println!("{error}");
         }
-        if !wrong_commit_detected && proposal != super::mtp::top1_and_margin(verify[0]).0 {
-            let v1 = super::mtp::top1_and_margin(verify[1]).0;
+        if !wrong_commit_detected
+            && proposal != crate::verify::top_two("glm.mtp.free.wrong0", verify[0])?.0
+        {
+            let v1 = crate::verify::top_two("glm.mtp.free.wrong1", verify[1])?.0;
             wrong_commit_detected = check_commit(&[proposal, v1], 1, proposal, verify).is_err();
             ensure!(
                 wrong_commit_detected,
@@ -3325,7 +3322,9 @@ fn glm_mtp_conditioned_hidden_gpu() -> Result<()> {
             "Runner FAIL nonfinite teacher-forced target logits"
         );
         greedy_ids.push(greedy);
-        margins.push(super::mtp::top1_and_margin(&logits).1);
+        margins.push(
+            crate::verify::top_two(&format!("glm.mtp.conditioned.p{position}"), &logits)?.1 as f32,
+        );
         let row: Vec<bf16> = engine
             .device
             .stream
@@ -3442,7 +3441,9 @@ fn eval_draft_localization_cell(
         };
         let (draft_id, draft_logits, _) =
             runtime.step_draft_device(step.token, hidden, 0, shared, &mut dsa, step.dsa_pos)?;
-        let (top_id, margin) = super::mtp::top1_and_margin(&draft_logits);
+        let (top_id, margin) =
+            crate::verify::top_two(&format!("glm.mtp.draft.p{}", step.dsa_pos), &draft_logits)?;
+        let margin = margin as f32;
         ensure!(
             top_id == draft_id,
             "Runner FAIL draft argmax mismatch: {top_id} vs {draft_id}"

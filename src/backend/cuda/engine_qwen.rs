@@ -9536,28 +9536,6 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    fn nvfp4_pair_metrics(actual: &[f32], reference: &[f32]) -> anyhow::Result<(f64, f64)> {
-        use anyhow::ensure;
-        ensure!(
-            actual.len() == reference.len() && !actual.is_empty(),
-            "Runner FAIL metric length mismatch {} vs {}",
-            actual.len(),
-            reference.len()
-        );
-        ensure!(
-            actual.iter().all(|v| v.is_finite()) && reference.iter().all(|v| v.is_finite()),
-            "Runner FAIL non-finite tensor values in metric comparison"
-        );
-        let mut max_abs = 0.0f64;
-        let mut sq_sum = 0.0f64;
-        for (&a, &r) in actual.iter().zip(reference) {
-            let d = (f64::from(a) - f64::from(r)).abs();
-            max_abs = max_abs.max(d);
-            sq_sum += d * d;
-        }
-        Ok((max_abs, (sq_sum / actual.len() as f64).sqrt()))
-    }
-
     #[cfg(feature = "cuda")]
     fn nvfp4_score_cell(
         cell: &str,
@@ -9565,7 +9543,7 @@ mod tests {
         reference: &[f32],
         tau: (f64, f64),
     ) -> anyhow::Result<usize> {
-        let (max_abs, rmse) = nvfp4_pair_metrics(actual, reference)?;
+        let (max_abs, rmse) = crate::verify::max_abs_rmse(cell, actual, reference)?;
         let ok = max_abs <= tau.0 && rmse <= tau.1;
         println!(
             "{} {cell} max_abs={max_abs:.6} tau_max_abs={:.6} rmse={rmse:.6} tau_rmse={:.6}",
@@ -9577,20 +9555,6 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    fn nvfp4_top1_margin(logits: &[f32]) -> f32 {
-        let mut top1 = f32::NEG_INFINITY;
-        let mut top2 = f32::NEG_INFINITY;
-        for &v in logits {
-            if v > top1 {
-                top2 = top1;
-                top1 = v;
-            } else if v > top2 {
-                top2 = v;
-            }
-        }
-        top1 - top2
-    }
-
     #[cfg(feature = "cuda")]
     fn nvfp4_scale_ws2(
         engine: &mut super::Engine,
@@ -9835,7 +9799,8 @@ mod tests {
         let ctrl_res = nvfp4_run_isolated_layer(&mut engine, 0, 8, false, &l0_in_m8);
         nvfp4_restore_ws2(&mut engine, ws2_ctrl, orig_ws2)?;
         let ctrl_got = ctrl_res?;
-        let (ctrl_max_abs, ctrl_rmse) = nvfp4_pair_metrics(&ctrl_got, &l0_ref_m8)?;
+        let (ctrl_max_abs, ctrl_rmse) =
+            crate::verify::max_abs_rmse("qwen.nvfp4.l0.ctrl", &ctrl_got, &l0_ref_m8)?;
         let ctrl_detected = ctrl_rmse > 10.0 * l0_m8_tau.1 && ctrl_max_abs > l0_m8_tau.0;
         defects += usize::from(!ctrl_detected);
         println!(
@@ -9911,13 +9876,13 @@ mod tests {
         let mut tok = engine.prefill(&c2_ids, None)?;
         let step0 = engine.decode_logits()?;
         defects += nvfp4_score_cell("c2_logits", &step0, &c2_ref, c2_tau)?;
-        c2_eager_margins.push(nvfp4_top1_margin(&step0));
+        c2_eager_margins.push(crate::verify::top_two("qwen.nvfp4.c2.s0", &step0)?.1);
         c2_eager_logits.push(step0);
         c2_eager_ids.push(tok);
         for _ in 1..16 {
             tok = engine.decode(false, None)?;
             let l = engine.decode_logits()?;
-            c2_eager_margins.push(nvfp4_top1_margin(&l));
+            c2_eager_margins.push(crate::verify::top_two("qwen.nvfp4.c2", &l)?.1);
             c2_eager_logits.push(l);
             c2_eager_ids.push(tok);
         }
@@ -9950,7 +9915,7 @@ mod tests {
         let c2_min_margin = c2_eager_margins
             .iter()
             .copied()
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let c2_zero_margin_steps: Vec<usize> = c2_eager_margins
             .iter()
             .enumerate()
@@ -10010,12 +9975,12 @@ mod tests {
         let c4_got = engine.decode_logits()?;
         defects += nvfp4_score_cell("c4_t2i_logits", &c4_got, &c4_ref, c4_tau)?;
         let mut c4_gen = vec![t2i_tok];
-        let mut c4_margins = vec![nvfp4_top1_margin(&c4_got)];
+        let mut c4_margins = vec![crate::verify::top_two("qwen.nvfp4.c4.s0", &c4_got)?.1];
         if !engine.model_spec.eos.contains(&t2i_tok) {
             for _ in 1..1536 {
                 t2i_tok = engine.decode(true, None)?;
                 let l = engine.decode_logits()?;
-                c4_margins.push(nvfp4_top1_margin(&l));
+                c4_margins.push(crate::verify::top_two("qwen.nvfp4.c4", &l)?.1);
                 c4_gen.push(t2i_tok);
                 if engine.model_spec.eos.contains(&t2i_tok) {
                     break;
@@ -10053,7 +10018,7 @@ mod tests {
             .vision_encode_calls;
         let c4_ok = valid_t2i && text_vision_calls == 0;
         defects += usize::from(!c4_ok);
-        let c4_min_margin = c4_margins.iter().copied().fold(f32::INFINITY, f32::min);
+        let c4_min_margin = c4_margins.iter().copied().fold(f64::INFINITY, f64::min);
         let c4_zero_margin_steps: Vec<usize> = c4_margins
             .iter()
             .enumerate()
@@ -10077,7 +10042,8 @@ mod tests {
         })();
         nvfp4_restore_ws2(&mut engine, ws2_ctrl, orig_ws2)?;
         let (ctrl_nll, ctrl_last) = ctrl_res?;
-        let (ctrl_max_abs, ctrl_rmse) = nvfp4_pair_metrics(&ctrl_last, &c3_ref_last)?;
+        let (ctrl_max_abs, ctrl_rmse) =
+            crate::verify::max_abs_rmse("qwen.nvfp4.c3.ctrl", &ctrl_last, &c3_ref_last)?;
         let ctrl_nll_diff = (ctrl_nll - c3_r0_nll).abs();
         let ctrl_max_ratio = ctrl_max_abs / c3_tau.0;
         let ctrl_rmse_ratio = ctrl_rmse / c3_tau.1;
@@ -10205,7 +10171,11 @@ mod tests {
                     && prepared.grids == [ref_grid],
                 "Runner FAIL processor expand mismatch for {tag}"
             );
-            let (pix_max_abs, _) = nvfp4_pair_metrics(&prepared.pixel_values, &ref_pixels)?;
+            let (pix_max_abs, _) = crate::verify::max_abs_rmse(
+                "qwen.nvfp4.pixels",
+                &prepared.pixel_values,
+                &ref_pixels,
+            )?;
             ensure!(
                 pix_max_abs <= 1e-5,
                 "Runner FAIL processor pixel_values mismatch for {tag}: max_abs={pix_max_abs}"
@@ -10224,11 +10194,12 @@ mod tests {
 
             let mut eager_logits = vec![got_logits.clone()];
             let mut eager_gen = vec![tok];
-            let mut eager_margins = vec![nvfp4_top1_margin(&got_logits)];
+            let mut eager_margins =
+                vec![crate::verify::top_two(&format!("qwen.nvfp4.{tag}.s0"), &got_logits)?.1];
             for _ in 1..32 {
                 tok = engine.decode(false, None)?;
                 let l = engine.decode_logits()?;
-                eager_margins.push(nvfp4_top1_margin(&l));
+                eager_margins.push(crate::verify::top_two(&format!("qwen.nvfp4.{tag}"), &l)?.1);
                 eager_logits.push(l);
                 eager_gen.push(tok);
             }
@@ -10265,7 +10236,7 @@ mod tests {
             let text_ok = !decoded_text.trim().is_empty();
             let case_ok = calls_ok && graph_ok && step0_qual && text_ok;
             defects += usize::from(!case_ok);
-            let min_margin = eager_margins.iter().copied().fold(f32::INFINITY, f32::min);
+            let min_margin = eager_margins.iter().copied().fold(f64::INFINITY, f64::min);
             let exact_prefix = eager_gen
                 .iter()
                 .zip(&ref_gen)
@@ -10289,7 +10260,8 @@ mod tests {
 
         let case_a = &case_outputs[0];
         let case_b = &case_outputs[1];
-        let (two_max_abs, two_rmse) = nvfp4_pair_metrics(&case_a.logits, &case_b.logits)?;
+        let (two_max_abs, two_rmse) =
+            crate::verify::max_abs_rmse("qwen.nvfp4.ab.logits", &case_a.logits, &case_b.logits)?;
         let two_media_ok = two_max_abs > 3.0 * 1.0
             && two_rmse > 3.0 * 0.204_632_093_203_926_83
             && case_a.gen_ids != case_b.gen_ids
@@ -10356,7 +10328,11 @@ mod tests {
         }
         let (ctrl_tok, ctrl_logits) = ctrl_res?;
         let tau_a = (1.0f64, 0.204_632_093_203_926_83f64);
-        let (ctrl_max_abs, ctrl_rmse) = nvfp4_pair_metrics(&ctrl_logits, &case_a.ref_logits)?;
+        let (ctrl_max_abs, ctrl_rmse) = crate::verify::max_abs_rmse(
+            "qwen.nvfp4.ctrl.logits",
+            &ctrl_logits,
+            &case_a.ref_logits,
+        )?;
         let ctrl_max_ratio = ctrl_max_abs / tau_a.0;
         let ctrl_rmse_ratio = ctrl_rmse / tau_a.1;
         let ctrl_ok = ctrl_max_abs >= 10.0 * tau_a.0

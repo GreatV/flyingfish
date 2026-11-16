@@ -1514,25 +1514,12 @@ mod tests {
     }
 
     fn measure(cell: &str, left: &[f32], right: &[f32], floors: &Value) -> Result<bool> {
-        ensure!(
-            left.len() == right.len()
-                && !left.is_empty()
-                && left.iter().chain(right).all(|value| value.is_finite()),
-            "fixture {cell} has a non-finite or mismatched extent"
-        );
         let tau = &floors["metrics"][cell]["tau"];
         let max_tau = tau["max_abs"]
             .as_f64()
             .context("missing frozen max_abs tau")?;
         let rmse_tau = tau["rmse"].as_f64().context("missing frozen rmse tau")?;
-        let mut maximum = 0f64;
-        let mut square = 0f64;
-        for (&a, &b) in left.iter().zip(right) {
-            let delta = f64::from(a) - f64::from(b);
-            maximum = maximum.max(delta.abs());
-            square += delta * delta;
-        }
-        let rmse = (square / left.len() as f64).sqrt();
+        let (maximum, rmse) = crate::verify::max_abs_rmse(cell, left, right)?;
         let pass = maximum <= max_tau && rmse <= rmse_tau;
         println!(
             "DIARIZATION_M2_CELL cell={cell} max_abs={maximum:e} tau={max_tau:e} rmse={rmse:e} tau_rmse={rmse_tau:e} {}",
@@ -1717,23 +1704,8 @@ mod tests {
         );
         let device = Device::new(0)?;
         let mut engine = Diarization::load(&model, &device)?;
-        let difference = |left: &[f32], right: &[f32]| -> Result<(f64, f64)> {
-            ensure!(
-                left.len() == right.len() && !left.is_empty(),
-                "frame-logit extent mismatch"
-            );
-            ensure!(
-                left.iter().chain(right).all(|x| x.is_finite()),
-                "non-finite frame logits"
-            );
-            let mut maximum = 0f64;
-            let mut square = 0f64;
-            for (&a, &b) in left.iter().zip(right) {
-                let d = f64::from(a) - f64::from(b);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / left.len() as f64).sqrt()))
+        let difference = |cell: &str, candidate: &[f32], reference: &[f32]| -> Result<(f64, f64)> {
+            crate::verify::max_abs_rmse(cell, candidate, reference)
         };
         let mut defects = 0;
         let mut first = None;
@@ -1766,7 +1738,8 @@ mod tests {
                 .as_f64()
                 .context("missing frame max_abs floor")?;
             let rms_limit = limit["rmse"].as_f64().context("missing frame RMSE floor")?;
-            let (maximum, rmse) = difference(&expected, &actual)?;
+            let (maximum, rmse) =
+                difference(&format!("diarization.frame.{case}"), &actual, &expected)?;
             let pass = maximum <= max_limit && rmse <= rms_limit;
             defects += usize::from(!pass);
             println!(
@@ -1780,7 +1753,11 @@ mod tests {
                 mutant[row * speakers..(row + 1) * speakers]
                     .copy_from_slice(&actual[source * speakers..(source + 1) * speakers]);
             }
-            let (control_abs, control_rmse) = difference(&expected, &mutant)?;
+            let (control_abs, control_rmse) = difference(
+                &format!("diarization.frame.{case}.control"),
+                &mutant,
+                &expected,
+            )?;
             let detected = control_abs > 10. * max_limit && control_rmse > 10. * rms_limit;
             defects += usize::from(!detected);
             println!(
@@ -2082,13 +2059,16 @@ mod tests {
                 .all(|value| value.is_finite()),
             "diarization long recording produced non-finite logits"
         );
-        let mut max_abs = 0f64;
+        let (max_abs, _) = crate::verify::max_abs_rmse(
+            "diarization.long.first_window",
+            &short_logits[..first_window],
+            &long_logits[..first_window],
+        )?;
         let mut bit_count = 0u64;
         for (short, long) in short_logits[..first_window]
             .iter()
             .zip(&long_logits[..first_window])
         {
-            max_abs = max_abs.max((f64::from(*short) - f64::from(*long)).abs());
             bit_count += u64::from((short.to_bits() ^ long.to_bits()).count_ones());
         }
         println!(
@@ -2414,14 +2394,11 @@ mod tests {
                 .as_f64()
                 .context("missing frozen max_abs tau")?;
             let rmse_tau = tau["rmse"].as_f64().context("missing frozen rmse tau")?;
-            let mut maximum = 0f64;
-            let mut square = 0f64;
-            for (&a, &b) in left.2.iter().zip(&right.2) {
-                let delta = f64::from(a) - f64::from(b);
-                maximum = maximum.max(delta.abs());
-                square += delta * delta;
-            }
-            let rmse = (square / left.2.len() as f64).sqrt();
+            let (maximum, rmse) = crate::verify::max_abs_rmse(
+                &format!("diarization.arrival.{mode}"),
+                &left.2,
+                &right.2,
+            )?;
             let detected = left.2 != right.2 && maximum > 10.0 * max_tau && rmse > 10.0 * rmse_tau;
             println!(
                 "DIARIZATION_ARRIVAL_CONTROL mode={mode} max_abs={maximum:e} rmse={rmse:e} nonidentical={} {}",

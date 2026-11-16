@@ -430,11 +430,8 @@ mod euler {
         let want_sigma = tensor_f32(&view, "syn_sigma_schedule")?;
         let derived = Music3Syn::sigma_schedule(30);
         ensure!(want_sigma.len() == 31 && derived.len() == 31);
-        let sigma_max = derived
-            .iter()
-            .zip(&want_sigma)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let (sigma_max, _) =
+            crate::verify::max_abs_rmse("music3.syn.sigma", &derived, &want_sigma)?;
         println!("MUSIC3_EULER sigma max_abs={sigma_max:.6e} (bound 2.4e-07)");
         ensure!(
             sigma_max <= 2.4e-7,
@@ -444,7 +441,7 @@ mod euler {
         let s = &engine.stream;
         // Per-step guided update with the engine kernel on the captured
         // branch velocities.
-        let mut max_update = 0.0f32;
+        let mut max_update = 0.0f64;
         let mut x: cudarc::driver::CudaSlice<f32> =
             s.clone_htod(&tensor_f32(&view, "syn_x_t_000")?)?;
         for step in 0..30 {
@@ -468,11 +465,11 @@ mod euler {
                 count,
             )?;
             let got = s.clone_dtoh(&x)?;
-            let delta = got
-                .iter()
-                .zip(&want_next)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+            let (delta, _) = crate::verify::max_abs_rmse(
+                &format!("music3.syn.euler.s{step}"),
+                &got,
+                &want_next,
+            )?;
             max_update = max_update.max(delta);
         }
         println!("MUSIC3_EULER update max_abs={max_update:.6e} (frozen bound 1.0e-05)");

@@ -295,21 +295,18 @@ mod tests {
                     && gate[..live * 4] == eager.1[..live * 4],
                 "gated residual eager/graph bits DEFECT"
             );
-            let gate_error = gate[..live * 4]
-                .iter()
-                .zip(&reference_gates)
-                .map(|(&a, &b)| f64::from((a - b).abs()))
-                .fold(0.0, f64::max);
-            let output_error = actual[..live * 20480]
-                .iter()
-                .zip(&expected)
-                .map(|(&a, &b)| (f64::from(a.to_f32()) - f64::from(b.to_f32())).abs())
-                .fold(0.0, f64::max);
+            let (gate_error, _) = crate::verify::max_abs_rmse(
+                "gated_residual.gate",
+                &gate[..live * 4],
+                &reference_gates[..live * 4],
+            )?;
+            let (output_error, _) = crate::verify::max_abs_rmse(
+                "gated_residual.output",
+                &actual[..live * 20480],
+                &expected[..live * 20480],
+            )?;
             ensure!(
-                gate[..live * 4].iter().all(|v| v.is_finite())
-                    && actual[..live * 20480].iter().all(|v| v.is_finite())
-                    && gate_error <= GATE_LIMIT
-                    && output_error <= OUTPUT_LIMIT,
+                gate_error <= GATE_LIMIT && output_error <= OUTPUT_LIMIT,
                 "gated residual DEFECT rows={rows} seed={} graph={graph} live={live} gate={gate_error} output={output_error}",
                 cell.seed
             );

@@ -3048,21 +3048,11 @@ mod tests {
                     }
                     stream.synchronize()?;
                     let got = stream.clone_dtoh(&y)?;
-                    ensure!(
-                        got.iter().all(|v| v.is_finite()),
-                        "nonfinite projection output"
-                    );
-                    let bit_bad = got
-                        .iter()
-                        .zip(&expected)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    let max_abs = got
-                        .iter()
-                        .zip(&torch)
-                        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                        .fold(0.0f32, f32::max);
-                    let mut bad = bit_bad > 0 || max_abs > limit;
+                    let bit_bad =
+                        crate::verify::bit_mismatches(&format!("fp8.{op}.bits"), &got, &expected)?;
+                    let (max_abs, _) =
+                        crate::verify::max_abs_rmse(&format!("fp8.{op}.torch"), &got, &torch)?;
+                    let mut bad = bit_bad > 0 || max_abs > f64::from(limit);
                     if op == "o" {
                         let tap = taps.tensor("layer_03_mixer_out")?;
                         ensure!(
@@ -3070,12 +3060,16 @@ mod tests {
                                 && tap.shape() == [32, n as usize],
                             "invalid T13 o output tap"
                         );
-                        let max_t13 = got
+                        let tap: Vec<bf16> = tap
+                            .data()
+                            .as_chunks::<2>()
+                            .0
                             .iter()
-                            .zip(tap.data().as_chunks::<2>().0.iter())
-                            .map(|(a, b)| (a.to_f32() - bf16::from_le_bytes(*b).to_f32()).abs())
-                            .fold(0.0f32, f32::max);
-                        bad |= max_t13 > limit;
+                            .map(|b| bf16::from_le_bytes(*b))
+                            .collect();
+                        let (max_t13, _) =
+                            crate::verify::max_abs_rmse("fp8.o.t13", &got, &tap[..got.len()])?;
+                        bad |= max_t13 > f64::from(limit);
                         println!(
                             "FP8_T13_O rows={m} graph={graph} max_abs={max_t13} limit={limit}"
                         );
@@ -4410,18 +4404,13 @@ mod tests {
                 )?;
                 let got = stream.clone_dtoh(&y_dev)?;
                 let total = m * n;
-                let mut bit_mismatches = 0usize;
-                let mut max_abs = 0.0f32;
-                let mut sum_sq = 0.0f64;
-                for i in 0..total {
-                    if got[i].to_bits() != ref_m32[i].to_bits() {
-                        bit_mismatches += 1;
-                    }
-                    let d = (got[i].to_f32() - ref_m32[i].to_f32()).abs();
-                    max_abs = max_abs.max(d);
-                    sum_sq += f64::from(d) * f64::from(d);
-                }
-                let rmse = (sum_sq / total as f64).sqrt() as f32;
+                let bit_mismatches = crate::verify::bit_mismatches(
+                    "nvfp4.skinny",
+                    &got[..total],
+                    &ref_m32[..total],
+                )?;
+                let (max_abs, rmse) =
+                    crate::verify::max_abs_rmse("nvfp4.skinny", &got[..total], &ref_m32[..total])?;
                 if m <= crate::linear_plan::MAX_SKINNY_ROWS {
                     ensure!(
                         bit_mismatches == 0,
@@ -4559,17 +4548,10 @@ mod tests {
                 };
                 bf16::from_bits(sign | (biased_exp << 7) | frac)
             };
-            let score_and_bits = |cand: &[bf16], want: &[bf16]| -> (usize, f32, f32) {
-                let mut bits = 0usize;
-                let mut max_abs = 0.0f32;
-                let mut sum_sq = 0.0f64;
-                for (&a, &b) in cand.iter().zip(want) {
-                    bits += usize::from(a.to_bits() != b.to_bits());
-                    let d = (a.to_f32() - b.to_f32()).abs();
-                    max_abs = max_abs.max(d);
-                    sum_sq += f64::from(d) * f64::from(d);
-                }
-                (bits, max_abs, (sum_sq / cand.len() as f64).sqrt() as f32)
+            let score_and_bits = |cand: &[bf16], want: &[bf16]| -> Result<(usize, f64, f64)> {
+                let bits = crate::verify::bit_mismatches("nvfp4", cand, want)?;
+                let (max_abs, rmse) = crate::verify::max_abs_rmse("nvfp4", cand, want)?;
+                Ok((bits, max_abs, rmse))
             };
 
             let canary = bf16::from_bits(0x7fc1);
@@ -4781,15 +4763,15 @@ mod tests {
                                     .all(|v| v.to_bits() == canary.to_bits()),
                             "NVFP4 MMA overwrote tail canary set={set_name} [{n_s},{k_s}] m={m_s}"
                         );
-                        let graph_bits = got_eager[..count]
-                            .iter()
-                            .zip(&got_graph[..count])
-                            .filter(|(a, b)| a.to_bits() != b.to_bits())
-                            .count();
+                        let graph_bits = crate::verify::bit_mismatches(
+                            "nvfp4.graph",
+                            &got_eager[..count],
+                            &got_graph[..count],
+                        )?;
                         let (lt_bits, max_lt, rmse_lt) =
-                            score_and_bits(&got_eager[..count], &got_lt);
+                            score_and_bits(&got_eager[..count], &got_lt)?;
                         let (fp64_bits, max_fp64, rmse_fp64) =
-                            score_and_bits(&got_eager[..count], &s_ref_fp64[..count]);
+                            score_and_bits(&got_eager[..count], &s_ref_fp64[..count])?;
                         set_lt_bits += lt_bits;
                         set_fp64_bits += fp64_bits;
                         let bad = graph_bits != 0
@@ -4845,7 +4827,7 @@ mod tests {
                             )?;
                             let got_ctrl = stream.clone_dtoh(&ctrl_out)?;
                             let (_, max_abs, rmse) =
-                                score_and_bits(&got_ctrl, &s_ref_fp64[..m_ctrl * n_s]);
+                                score_and_bits(&got_ctrl, &s_ref_fp64[..m_ctrl * n_s])?;
                             ensure!(
                                 max_abs >= 0.3125 && rmse >= 0.040,
                                 "NVFP4 MMA scale-quartet control escaped set={set_name} m={m_ctrl}: max_abs={max_abs} rmse={rmse}"
@@ -5006,9 +4988,9 @@ mod tests {
                         )?),
                     )?;
                     let got_lt_probe = stream.clone_dtoh(&lt_probe_dev.slice(..n_inv))?;
-                    let (probe_lt_bits, _, _) = score_and_bits(&ref_row, &got_lt_probe);
+                    let (probe_lt_bits, _, _) = score_and_bits(&ref_row, &got_lt_probe)?;
                     let probe_fp64 = nvfp4_linear_reference(&b_weight_host, &x_probe, k_inv)?;
-                    let (probe_fp64_bits, _, _) = score_and_bits(&ref_row, &probe_fp64);
+                    let (probe_fp64_bits, _, _) = score_and_bits(&ref_row, &probe_fp64)?;
                     let mut placements = 0usize;
                     let mut diff_bits = 0usize;
                     for m_b in [17usize, 63, 64, 65, 127, 128, 129, 256] {

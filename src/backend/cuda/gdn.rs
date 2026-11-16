@@ -2194,25 +2194,19 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     fn clover_rounding_outside(values: &[f32], reference: &[f32]) -> Result<usize> {
-        ensure!(
-            values.len() == reference.len(),
-            "Runner FAIL rounding extent"
-        );
-        let rank = |value: f32| {
-            let bits = bf16::from_f32(value).to_bits();
+        let candidate: Vec<_> = values.iter().copied().map(bf16::from_f32).collect();
+        let wanted: Vec<_> = reference.iter().copied().map(bf16::from_f32).collect();
+        crate::verify::bf16_ulp_max("clover.gdn.rounding", &candidate, &wanted, None)?;
+        let rank = |bits: u16| {
             if bits & 0x8000 != 0 {
                 0x8000i32 - i32::from(bits & 0x7fff)
             } else {
                 0x8000i32 + i32::from(bits)
             }
         };
-        let mut outside = 0;
-        for (&a, &b) in values.iter().zip(reference) {
-            ensure!(
-                a.is_finite() && b.is_finite(),
-                "Runner FAIL rounding nonfinite"
-            );
-            outside += usize::from((rank(a) - rank(b)).abs() > 1);
+        let mut outside = 0usize;
+        for (&a, &b) in candidate.iter().zip(&wanted) {
+            outside += usize::from((rank(a.to_bits()) - rank(b.to_bits())).abs() > 1);
         }
         Ok(outside)
     }
@@ -2223,20 +2217,11 @@ mod tests {
         reference: &[f32],
         bound: &serde_json::Value,
     ) -> Result<(bool, f64, f64)> {
-        ensure!(
-            values.len() == reference.len(),
-            "Runner FAIL comparison extent"
-        );
-        let mut max_abs = 0.0f64;
+        let (max_abs, _) = crate::verify::max_abs_rmse("clover.gdn", values, reference)?;
         let mut squared = 0.0;
         let mut norm = 0.0;
         for (&value, &reference) in values.iter().zip(reference) {
-            ensure!(
-                value.is_finite() && reference.is_finite(),
-                "Runner FAIL comparison nonfinite"
-            );
             let delta = f64::from(value) - f64::from(reference);
-            max_abs = max_abs.max(delta.abs());
             squared += delta * delta;
             norm += f64::from(reference).powi(2);
         }
@@ -4551,16 +4536,24 @@ mod tests {
                             false,
                             GeometryControl::StrongDecay,
                         )?;
+                        let extent = valid as usize * 8192;
+                        let out = &candidate.out[..extent];
+                        let reference_out = &reference.out[..extent];
+                        crate::verify::max_abs_rmse("gdn.key_decay.out", out, reference_out)?;
                         candidate.oracle_out = reference.oracle_out.max(
-                            candidate.out[..valid as usize * 8192]
-                                .iter()
-                                .zip(&reference.out)
+                            out.iter()
+                                .zip(reference_out)
                                 .map(|(a, b)| {
                                     let (a, b) = (f64::from(a.to_f32()), f64::from(b.to_f32()));
                                     (a - b).abs() / (1e-4 + b.abs())
                                 })
                                 .fold(0.0, f64::max),
                         );
+                        crate::verify::max_abs_rmse(
+                            "gdn.key_decay.state",
+                            &candidate.state,
+                            &reference.state,
+                        )?;
                         candidate.oracle_state = reference.oracle_state.max(
                             candidate
                                 .state

@@ -90,31 +90,8 @@ struct GraphDecode {
     logits: Vec<Vec<f32>>,
 }
 
-fn bits_equal(actual: &[f32], expected: &[f32]) -> bool {
-    actual.len() == expected.len()
-        && actual
-            .iter()
-            .zip(expected)
-            .all(|(left, right)| left.to_bits() == right.to_bits())
-}
-
 fn difference(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
-    ensure!(
-        actual.len() == expected.len(),
-        "reference element count mismatch"
-    );
-    ensure!(
-        actual.iter().all(|value| value.is_finite()),
-        "non-finite candidate"
-    );
-    let mut maximum = 0.0f64;
-    let mut squares = 0.0f64;
-    for (&a, &b) in actual.iter().zip(expected) {
-        let error = f64::from(a - b).abs();
-        maximum = maximum.max(error);
-        squares += error * error;
-    }
-    Ok((maximum, (squares / actual.len() as f64).sqrt()))
+    crate::verify::max_abs_rmse("parakeet.difference", actual, expected)
 }
 
 fn bounds(floors: &Value, case: &str, tap: &str) -> Result<(f64, f64)> {
@@ -226,18 +203,9 @@ fn tdt_check(
     Ok(())
 }
 
-fn margin(logits: &[f32], start: usize, end: usize) -> (usize, f32) {
-    let mut best = start;
-    let mut second = start;
-    for (index, &value) in logits.iter().enumerate().take(end).skip(start) {
-        if value > logits[best] {
-            second = best;
-            best = index;
-        } else if index != best && (value > logits[second] || second == best) {
-            second = index;
-        }
-    }
-    (best, logits[best] - logits[second])
+fn margin(cell: &str, logits: &[f32], start: usize, end: usize) -> Result<(usize, f64)> {
+    let (id, gap) = crate::verify::top_two(cell, &logits[start..end])?;
+    Ok((start + id as usize, gap))
 }
 
 fn joint_check(
@@ -250,8 +218,9 @@ fn joint_check(
     tdt_check(actual, &f32_values(tensors, tap)?, floors, "short", tap)?;
     let vocab = spec.vocab as usize;
     let joint_width = vocab + spec.durations.len();
-    let (token, token_margin) = margin(actual, 0, vocab);
-    let (duration, duration_margin) = margin(actual, vocab, joint_width);
+    let (token, token_margin) = margin("parakeet.joint.token", actual, 0, vocab)?;
+    let (duration, duration_margin) =
+        margin("parakeet.joint.duration", actual, vocab, joint_width)?;
     let duration = duration - vocab;
     let expected_token = scalar(tensors, &format!("{tap}_token_id"))? as usize;
     let expected_duration = scalar(tensors, &format!("{tap}_duration_id"))? as usize;
@@ -1426,9 +1395,15 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
                 .context("decode RMSE bound missing")?;
             let vocab = spec.vocab as usize;
             let joint_width = vocab + spec.durations.len();
-            let (token, token_margin) = margin(actual, 0, vocab);
+            let (token, token_margin) =
+                margin(&format!("parakeet.decode.{case}.token"), actual, 0, vocab)?;
             let token = token as u32;
-            let (duration, duration_margin) = margin(actual, vocab, joint_width);
+            let (duration, duration_margin) = margin(
+                &format!("parakeet.decode.{case}.duration"),
+                actual,
+                vocab,
+                joint_width,
+            )?;
             let duration = (duration - vocab) as u32;
             ensure!(token == trajectory.tokens[step + 1]);
             let corrected = if token == spec.blank && duration == 0 {
@@ -1567,15 +1542,19 @@ fn parakeet_greedy_tdt_decode_matches_reference() -> Result<()> {
             .count();
         let (trajectory, history) = tdt.decode_trace(&features, valid)?;
         let graph = &graph_steps[case];
+        for (actual, expected) in history.iter().zip(&graph.logits) {
+            let mismatches = crate::verify::bit_mismatches(
+                &format!("parakeet.decode.{case}"),
+                actual,
+                expected,
+            )?;
+            ensure!(mismatches == 0, "{case} graph and eager logits differ");
+        }
         ensure!(
             trajectory.tokens == graph.tokens
                 && trajectory.durations == graph.durations
                 && trajectory.frames == graph.frames
-                && history.len() == graph.logits.len()
-                && history
-                    .iter()
-                    .zip(&graph.logits)
-                    .all(|(actual, expected)| bits_equal(actual, expected)),
+                && history.len() == graph.logits.len(),
             "{case} graph and eager decode differ"
         );
         eager_rows += history.len();

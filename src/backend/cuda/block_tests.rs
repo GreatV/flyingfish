@@ -525,14 +525,10 @@ fn score(
 ) -> Result<bool> {
     let tag = case["tag"].as_str().unwrap();
     let reference = fixture.values(&format!("{tag}.fp.{name}"))?;
-    ensure!(
-        values.len() == reference.len() && values.iter().chain(&reference).all(|v| v.is_finite()),
-        "Runner FAIL layer shape/nonfinite {tag} {name}"
-    );
-    let (mut maximum, mut squared, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+    let (maximum, _) = crate::verify::max_abs_rmse(&format!("{tag}.{name}"), values, &reference)?;
+    let (mut squared, mut norm) = (0.0f64, 0.0f64);
     for (&value, &expected) in values.iter().zip(&reference) {
         let delta = f64::from(value) - f64::from(expected);
-        maximum = maximum.max(delta.abs());
         squared += delta * delta;
         norm += f64::from(expected).powi(2);
     }
@@ -804,11 +800,12 @@ fn report_full_routes(
     let denominator: f64 = probabilities.iter().sum();
     let reconstructed: Vec<_> = probabilities.iter().map(|p| p / denominator).collect();
     let native_weights = &weights[row * 8..(row + 1) * 8];
-    let arithmetic_error = reconstructed
-        .iter()
-        .zip(native_weights)
-        .map(|(&a, &b)| (a - f64::from(b)).abs())
-        .fold(0.0f64, f64::max);
+    let want: Vec<f64> = native_weights.iter().copied().map(f64::from).collect();
+    let (arithmetic_error, _) = crate::verify::max_abs_rmse(
+        &format!("{tag}.route_weight_arithmetic"),
+        &reconstructed,
+        &want,
+    )?;
     let aligned: Vec<_> = native
         .iter()
         .enumerate()
@@ -881,18 +878,11 @@ fn track_full(
     let tag = case["tag"].as_str().context("Runner FAIL tracking tag")?;
     for arm in ["bf", "fp"] {
         let reference = fixture.values(&format!("{tag}.{arm}.{name}"))?;
-        ensure!(
-            actual.len() == reference.len(),
-            "Runner FAIL tracking shape"
-        );
-        let (mut maximum, mut squared, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+        let (maximum, _) =
+            crate::verify::max_abs_rmse(&format!("{tag}.{arm}.{name}"), actual, &reference)?;
+        let (mut squared, mut norm) = (0.0f64, 0.0f64);
         for (&a, &b) in actual.iter().zip(&reference) {
-            ensure!(
-                a.is_finite() && b.is_finite(),
-                "Runner FAIL tracking nonfinite"
-            );
             let delta = f64::from(a) - f64::from(b);
-            maximum = maximum.max(delta.abs());
             squared += delta * delta;
             norm += f64::from(b).powi(2);
         }
@@ -1001,8 +991,6 @@ fn score_full_routes(
             && reference_weights.len() == ids.len()
             && logits.len() == 32 * 256
             && native_logits.len() == logits.len()
-            && native_logits.iter().all(|v| v.is_finite())
-            && logits.iter().all(|v| v.is_finite())
             && allowed.len() == 256
             && allowed.iter().all(|&v| v <= 1),
         "Runner FAIL matched route shape"
@@ -1019,11 +1007,8 @@ fn score_full_routes(
             "reference_ids":reference_ids,"reference_weights":reference_weights,
             "reference_logits":logits,"bounds":case["bounds"],"acceptance":fixture.table["acceptance"]})
     );
-    let logit_error = native_logits
-        .iter()
-        .zip(&logits)
-        .map(|(a, b)| (a.to_f64() - f64::from(*b)).abs())
-        .fold(0.0f64, f64::max);
+    let (logit_error, _) =
+        crate::verify::max_abs_rmse(&format!("{tag}.route_logits"), &native_logits, &logits)?;
     let (mut maximum, mut squared, mut norm) = (0.0f64, 0.0f64, 0.0f64);
     let (mut id_bad, mut tie_exempt, mut changed) = (0, 0, 0);
     for row in 0..32 {
@@ -1063,6 +1048,10 @@ fn score_full_routes(
         };
         for (native, reference) in pairs {
             let (a, b) = (actual[native as usize], expected[reference as usize]);
+            ensure!(
+                a.is_finite() && b.is_finite(),
+                "Runner FAIL {tag}.weights: non-finite native[{native}]={a} reference[{reference}]={b}"
+            );
             if native != reference {
                 let difference = f64::from(row_logits[reference as usize])
                     - f64::from(row_logits[native as usize]);
@@ -1171,18 +1160,11 @@ fn localize_full_layer(
     values.insert("weights".into(), s.clone_dtoh(&model.moe.weights)?);
     for (name, actual) in values {
         let reference = fixture.values(&format!("{tag}.bf.{name}"))?;
-        ensure!(
-            actual.len() == reference.len(),
-            "Runner FAIL localization shape"
-        );
-        let (mut maximum, mut squared, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+        let (maximum, _) =
+            crate::verify::max_abs_rmse(&format!("{tag}.bf.{name}"), &actual, &reference)?;
+        let (mut squared, mut norm) = (0.0f64, 0.0f64);
         for (&a, &b) in actual.iter().zip(&reference) {
-            ensure!(
-                a.is_finite() && b.is_finite(),
-                "Runner FAIL localization nonfinite"
-            );
             let delta = f64::from(a) - f64::from(b);
-            maximum = maximum.max(delta.abs());
             squared += delta * delta;
             norm += f64::from(b).powi(2);
         }
@@ -1210,15 +1192,11 @@ fn boundary_distance(
     let mut within = false;
     for precision in ["bf", "fp"] {
         let reference = fixture.values(&format!("{key}.{precision}"))?;
-        ensure!(
-            values.len() == reference.len()
-                && values.iter().chain(&reference).all(|v| v.is_finite()),
-            "Runner FAIL boundary shape/nonfinite {key}"
-        );
-        let (mut maximum, mut squared, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+        let (maximum, _) =
+            crate::verify::max_abs_rmse(&format!("{key}.{precision}"), values, &reference)?;
+        let (mut squared, mut norm) = (0.0f64, 0.0f64);
         for (&a, &b) in values.iter().zip(&reference) {
             let delta = f64::from(a) - f64::from(b);
-            maximum = maximum.max(delta.abs());
             squared += delta * delta;
             norm += f64::from(b).powi(2);
         }
@@ -1286,16 +1264,10 @@ fn clover_generation_commit_operands_gpu() -> Result<()> {
     let weights = LayerWeights::load(&device, &fixture, 2)?;
     let table = s.alloc_zeros::<bf16>(96 * 64)?;
     let distance = |values: &[f32], reference: &[f32]| -> Result<serde_json::Value> {
-        ensure!(
-            !values.is_empty()
-                && values.len() == reference.len()
-                && values.iter().chain(reference).all(|v| v.is_finite()),
-            "Runner FAIL commit output shape/nonfinite"
-        );
-        let (mut maximum, mut squared, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+        let (maximum, _) = crate::verify::max_abs_rmse("clover.commit", values, reference)?;
+        let (mut squared, mut norm) = (0.0f64, 0.0f64);
         for (&value, &expected) in values.iter().zip(reference) {
             let delta = f64::from(value) - f64::from(expected);
-            maximum = maximum.max(delta.abs());
             squared += delta * delta;
             norm += f64::from(expected).powi(2);
         }

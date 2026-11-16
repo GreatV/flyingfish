@@ -615,27 +615,6 @@ fn poison_snapshot_rows(
     Ok(())
 }
 
-fn chain_margin(logits: impl IntoIterator<Item = f32>) -> Result<f32> {
-    let mut top = [f32::NEG_INFINITY; 2];
-    let mut count = 0;
-    for value in logits {
-        ensure!(value.is_finite(), "Runner FAIL nonfinite chain logits");
-        count += 1;
-        if value > top[0] {
-            top[1] = top[0];
-            top[0] = value;
-        } else if value > top[1] {
-            top[1] = value;
-        }
-    }
-    let margin = top[0] - top[1];
-    ensure!(
-        count == VOCAB && margin.is_finite() && margin >= 0.0,
-        "Runner FAIL chain logits extent={count} margin={margin}"
-    );
-    Ok(margin)
-}
-
 const CHAIN_LOGIT_TOLERANCE: f32 = 0.6875;
 
 fn chain_identity(
@@ -650,20 +629,31 @@ fn chain_identity(
     let mut defects = 0;
     let mut near_ties = 0;
     let mut compared = 0;
-    let mut maximum = 0.0f32;
+    let mut maximum = 0.0f64;
     let mut diverged_at = None;
     for (position, (expected, actual)) in plain.iter().zip(batched).enumerate() {
-        let plain_margin = chain_margin(expected.1.iter().copied())?;
-        let batched_margin = chain_margin(actual.1.iter().copied())?;
-        let drift = expected
-            .1
-            .iter()
-            .zip(&actual.1)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        ensure!(
+            expected.1.len() == VOCAB,
+            "Runner FAIL mtp.chain.{case}.p{position}.plain: extent {}",
+            expected.1.len()
+        );
+        let plain_margin =
+            crate::verify::top_two(&format!("mtp.chain.{case}.p{position}.plain"), &expected.1)?.1;
+        ensure!(
+            actual.1.len() == VOCAB,
+            "Runner FAIL mtp.chain.{case}.p{position}.batched: extent {}",
+            actual.1.len()
+        );
+        let batched_margin =
+            crate::verify::top_two(&format!("mtp.chain.{case}.p{position}.batched"), &actual.1)?.1;
+        let (drift, _) = crate::verify::max_abs_rmse(
+            &format!("mtp.chain.{case}.p{position}"),
+            &expected.1,
+            &actual.1,
+        )?;
         let different_id = expected.0 != actual.0;
-        let valid = drift <= CHAIN_LOGIT_TOLERANCE
-            && (!different_id || plain_margin <= 2.0 * CHAIN_LOGIT_TOLERANCE);
+        let valid = drift <= f64::from(CHAIN_LOGIT_TOLERANCE)
+            && (!different_id || plain_margin <= 2.0 * f64::from(CHAIN_LOGIT_TOLERANCE));
         let near_tie = valid && different_id;
         defects += usize::from(!valid);
         near_ties += usize::from(near_tie);
@@ -759,17 +749,33 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
         e.reset()?;
         let first = e.prefill(&ids, None)?;
         let logits = e.decode_logits()?;
-        chain_margin(logits.iter().copied())?;
+        ensure!(
+            logits.len() == VOCAB,
+            "Runner FAIL mtp.chain.plain.prefill: extent {}",
+            logits.len()
+        );
+        crate::verify::top_two("mtp.chain.plain.prefill", &logits)?;
         let mut plain = vec![(first, logits)];
         while plain.len() < 64 && !e.model_spec.eos.contains(&plain.last().unwrap().0) {
             let token = e.decode(true, None)?;
             let logits = e.decode_logits()?;
-            chain_margin(logits.iter().copied())?;
+            ensure!(
+                logits.len() == VOCAB,
+                "Runner FAIL mtp.chain.plain.p{}: extent {}",
+                plain.len(),
+                logits.len()
+            );
+            crate::verify::top_two(&format!("mtp.chain.plain.p{}", plain.len()), &logits)?;
             plain.push((token, logits));
         }
         let first = e.mtp_prefill(&ids)?;
         let logits = e.decode_logits()?;
-        chain_margin(logits.iter().copied())?;
+        ensure!(
+            logits.len() == VOCAB,
+            "Runner FAIL mtp.chain.batched.prefill: extent {}",
+            logits.len()
+        );
+        crate::verify::top_two("mtp.chain.batched.prefill", &logits)?;
         let mut batched = vec![(first, logits)];
         while batched.len() < 64 && !e.model_spec.eos.contains(&batched.last().unwrap().0) {
             let round = e.mtp_batch_round(64 - batched.len(), None)?;
@@ -783,7 +789,12 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
                     "Runner FAIL single-row tail extent"
                 );
                 let logits = e.decode_logits()?;
-                chain_margin(logits.iter().copied())?;
+                ensure!(
+                    logits.len() == VOCAB,
+                    "Runner FAIL mtp.chain.batched.tail: extent {}",
+                    logits.len()
+                );
+                crate::verify::top_two("mtp.chain.batched.tail", &logits)?;
                 batched.push((round.round.tokens[0], logits));
             } else {
                 let rows = round.verify_predictions.len();
@@ -805,7 +816,15 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
                 for (&token, values) in round.round.tokens.iter().zip(logits.as_chunks::<VOCAB>().0)
                 {
                     let values: Vec<_> = values.iter().map(|x| x.to_f32()).collect();
-                    chain_margin(values.iter().copied())?;
+                    ensure!(
+                        values.len() == VOCAB,
+                        "Runner FAIL mtp.chain.batched.verify: extent {}",
+                        values.len()
+                    );
+                    crate::verify::top_two(
+                        &format!("mtp.chain.batched.verify.{}", batched.len()),
+                        &values,
+                    )?;
                     batched.push((token, values));
                 }
             }
@@ -1292,15 +1311,11 @@ fn q38_compact_failed_round_then_plain_decode_gpu() -> Result<()> {
                 .memcpy_htod(&[input], &mut bf16.work.token)?;
             bf16.decode(false, None)?;
             let reference = bf16.decode_logits()?;
-            ensure!(
-                candidate.iter().chain(&reference).all(|x| x.is_finite()),
-                "nonfinite post-fault logits row {row}"
-            );
-            let max_error = candidate
-                .iter()
-                .zip(&reference)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+            let (max_error, _) = crate::verify::max_abs_rmse(
+                &format!("mtp.compact.row{row}"),
+                candidate,
+                &reference,
+            )?;
             println!(
                 "COMPACT_FAILED_ROUND_BF16_COMPARISON affine8 row={row} max_logit_error={max_error}"
             );

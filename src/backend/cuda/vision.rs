@@ -901,18 +901,14 @@ mod probe {
         out
     }
 
-    fn max_rel(got: &[f32], reference: &[f32]) -> (f32, f32) {
+    fn max_rel(cell: &str, got: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
+        let (err, _) = crate::verify::max_abs_rmse(cell, got, reference)?;
         let peak = reference
             .iter()
-            .map(|v| v.abs())
-            .fold(0f32, f32::max)
+            .map(|v| f64::from(v.abs()))
+            .fold(0.0, f64::max)
             .max(1e-12);
-        let err = got
-            .iter()
-            .zip(reference)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        (err, err / peak)
+        Ok((err, err / peak))
     }
 
     #[test]
@@ -999,13 +995,13 @@ mod probe {
         s.synchronize()?;
         let got: Vec<f32> = s.clone_dtoh(&dev_o)?.iter().map(|v| v.to_f32()).collect();
         let reference = reference_attn(&grids, &q_in, &k_in, &v_pad, &kb);
-        let (err, rel) = max_rel(&got, &reference);
+        let (err, rel) = max_rel("vision.attn", &got, &reference)?;
         let keys = grids.iter().map(|g| (g.h * g.w) as usize).max().unwrap();
         // BF16 roundings: rotated Q, rotated K, P, O. FP32 reductions: QK over D, softmax sum and PV over the image keys.
         let bound = bf16_chain_bound(4, &[d, keys, keys]) as f32;
         eprintln!("Q38_VISION_ATTN_BINDER max|d|={err:.3e} rel={rel:.3e} bound={bound:.3e}");
         ensure!(
-            rel <= bound,
+            rel <= f64::from(bound),
             "attention binder output differs from the fp32 reference: rel={rel:.3e} bound={bound:.3e}"
         );
 
@@ -1062,13 +1058,13 @@ mod probe {
         )?;
         s.synchronize()?;
         let got2: Vec<f32> = s.clone_dtoh(&dev_o)?.iter().map(|v| v.to_f32()).collect();
-        let (_, ctl_rel) = max_rel(&got2, &reference);
+        let (_, ctl_rel) = max_rel("vision.attn.control", &got2, &reference)?;
         eprintln!(
             "Q38_VISION_ATTN_CONTROL rel={ctl_rel:.3e} bound={bound:.3e} rel/bound={:.3}",
-            ctl_rel / bound
+            ctl_rel / f64::from(bound)
         );
         ensure!(
-            ctl_rel > bound,
+            ctl_rel > f64::from(bound),
             "negative control was not rejected: rel={ctl_rel:.3e} bound={bound:.3e}"
         );
 
@@ -1155,24 +1151,24 @@ mod probe {
             b2: &b2,
         };
         let mref = reference_merger(&x, mrows, &mw, false);
-        let (merr, mrel) = max_rel(&mgot, &mref);
+        let (merr, mrel) = max_rel("vision.merger", &mgot, &mref)?;
         // BF16 roundings: LayerNorm, fc1, GELU, fc2. FP32 reductions: LayerNorm mean and variance over HIDDEN, fc1 and fc2 over MERGER_FC1.
         let mbound = bf16_chain_bound(4, &[hidden, hidden, fc1, fc1]) as f32;
         eprintln!("Q38_VISION_MERGER_BINDER max|d|={merr:.3e} rel={mrel:.3e} bound={mbound:.3e}");
         ensure!(
-            mrel <= mbound,
+            mrel <= f64::from(mbound),
             "merger binder output differs from the fp32 reference: rel={mrel:.3e} bound={mbound:.3e}"
         );
 
         // Negative control: block-wise (post-shuffle) LayerNorm statistics must exceed the bound.
         let mctl = reference_merger(&x, mrows, &mw, true);
-        let (_, mctl_rel) = max_rel(&mgot, &mctl);
+        let (_, mctl_rel) = max_rel("vision.merger.control", &mgot, &mctl)?;
         eprintln!(
             "Q38_VISION_MERGER_CONTROL rel={mctl_rel:.3e} bound={mbound:.3e} rel/bound={:.3}",
-            mctl_rel / mbound
+            mctl_rel / f64::from(mbound)
         );
         ensure!(
-            mctl_rel > mbound,
+            mctl_rel > f64::from(mbound),
             "post-shuffle-norm negative control was not rejected: rel={mctl_rel:.3e} bound={mbound:.3e}"
         );
 

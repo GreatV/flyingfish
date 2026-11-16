@@ -1501,23 +1501,11 @@ fn image_512_capture(path: &Path) -> Result<Image512Capture> {
 }
 
 fn image_512_error(left: &[f32], right: &[f32]) -> Result<(f64, f64)> {
-    ensure!(left.len() == right.len() && !left.is_empty(), "pair length");
-    let mut max_abs = 0f64;
-    let mut sum = 0f64;
-    for (&x, &y) in left.iter().zip(right) {
-        let delta = f64::from(x) - f64::from(y);
-        max_abs = max_abs.max(delta.abs());
-        sum += delta * delta;
-    }
-    Ok((max_abs, (sum / left.len() as f64).sqrt()))
+    flyingfish::verify::max_abs_rmse("h3.image512", left, right)
 }
 
-fn image_512_bits_equal(left: &[f32], right: &[f32]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(x, y)| x.to_bits() == y.to_bits())
+fn image_512_bits_equal(left: &[f32], right: &[f32]) -> Result<bool> {
+    Ok(flyingfish::verify::bit_mismatches("h3.image512.bits", left, right)? == 0)
 }
 
 fn image_512_close(measured: f64, frozen: f64) -> bool {
@@ -1564,7 +1552,7 @@ fn minimax_h3_image_512_floor_matches_the_frozen_pair() -> Result<()> {
         let repeat0 = b0.f32.get(cell.name).context(cell.name)?;
         let repeat1 = b1.f32.get(cell.name).context(cell.name)?;
         ensure!(
-            image_512_bits_equal(left, repeat0) && image_512_bits_equal(right, repeat1),
+            image_512_bits_equal(left, repeat0)? && image_512_bits_equal(right, repeat1)?,
             "{} same-box pair differs",
             cell.name
         );

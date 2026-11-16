@@ -1607,14 +1607,13 @@ mod tests {
                 && reference.len().is_multiple_of(width),
             "{name} extent mismatch"
         );
+        let (error, _) = crate::verify::max_abs_rmse(name, actual, reference)?;
         ensure!(
-            actual.iter().all(|v| v.is_finite())
-                && floor.iter().all(|v| v.is_finite() && *v >= 0.0),
-            "nonfinite {name}"
+            floor.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "Runner FAIL {name}: non-finite floor"
         );
         let mut failures = 0;
         let mut maximum = 0f64;
-        let mut error = 0f64;
         for ((actual, reference), floor) in actual
             .chunks_exact(width)
             .zip(reference.chunks_exact(width))
@@ -1631,7 +1630,6 @@ mod tests {
                 } else {
                     delta / bound
                 });
-                error = error.max(delta);
             }
         }
         println!(

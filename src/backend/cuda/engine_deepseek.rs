@@ -4971,6 +4971,12 @@ mod tests {
                     .zip(&graph)
                     .filter(|(a, b)| a.to_bits() != b.to_bits())
                     .count();
+                let tiled: Vec<f32> = (0..eager.len()).map(|i| cell.output[i % width]).collect();
+                let (max, _) = crate::verify::max_abs_rmse(
+                    &format!("deepseek.source.{}.p{}", cell.name, cell.position),
+                    &eager,
+                    &tiled,
+                )?;
                 let (mut bad, mut exempt) = (0usize, 0usize);
                 for (i, &value) in eager.iter().enumerate() {
                     if (f64::from(value) - f64::from(cell.output[i % width])).abs() > cell.bound {
@@ -4981,11 +4987,6 @@ mod tests {
                         }
                     }
                 }
-                let max = eager
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (f64::from(*v) - f64::from(cell.output[i % width])).abs())
-                    .fold(0.0f64, f64::max);
                 defects += bad + repeat_bits;
                 cases += 1;
                 println!(
@@ -5132,18 +5133,12 @@ mod tests {
     }
 
     fn engram_distance(actual: &[bf16], expected: &[bf16], bound: f64) -> Result<(usize, f64)> {
-        ensure!(
-            actual.len() == expected.len(),
-            "Engram boundary extent differs"
-        );
-        let mut beyond = 0;
-        let mut maximum = 0.0f64;
-        for (a, b) in actual.iter().zip(expected) {
-            ensure!(a.is_finite() && b.is_finite(), "nonfinite Engram boundary");
-            let delta = (f64::from(a.to_f32()) - f64::from(b.to_f32())).abs();
-            beyond += usize::from(delta > bound);
-            maximum = maximum.max(delta);
-        }
+        let (maximum, _) = crate::verify::max_abs_rmse("deepseek.engram", actual, expected)?;
+        let beyond = actual
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| (f64::from(a.to_f32()) - f64::from(b.to_f32())).abs() > bound)
+            .count();
         Ok((beyond, maximum))
     }
 
@@ -5677,19 +5672,6 @@ mod tests {
 
     fn sigmoid(value: f64) -> f64 {
         1.0 / (1.0 + (-value).exp())
-    }
-
-    /// Distance in representable BF16 values between two outputs.
-    fn bf16_ulp_distance(a: bf16, b: bf16) -> u32 {
-        fn key(value: bf16) -> u32 {
-            let bits = u32::from(value.to_bits());
-            if bits & 0x8000 != 0 {
-                (!bits) & 0xffff
-            } else {
-                bits | 0x8000
-            }
-        }
-        key(a).abs_diff(key(b))
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -6345,13 +6327,15 @@ mod tests {
             .boundaries
             .get(name)
             .context("reference boundary missing")?;
-        ensure!(
-            !got.is_empty()
-                && got.len() == want.len()
-                && got.iter().chain(want).all(|v| v.is_finite()),
-            "boundary shape/nonfinite"
-        );
-        let (mut beyond, mut exempt, mut max_abs) = (0usize, 0usize, 0.0f64);
+        let (max_abs, _) = crate::verify::max_abs_rmse(
+            &format!(
+                "deepseek.boundary.{name}.l{}.p{}",
+                frozen.layer, row.position
+            ),
+            got,
+            want,
+        )?;
+        let (mut beyond, mut exempt) = (0usize, 0usize);
         let common_projection_operands = if name == "attn"
             && got
                 .iter()
@@ -6386,7 +6370,6 @@ mod tests {
         };
         for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
             let error = (f64::from(a) - f64::from(b)).abs();
-            max_abs = max_abs.max(error);
             if error > entry.bound {
                 beyond += 1;
                 let proven = if let Some(chain) = chain.filter(|_| name == "attn") {
@@ -7143,13 +7126,11 @@ mod tests {
                     }
                     let replay: Vec<bf16> = s.clone_dtoh(&engine.work.out.slice(..5120))?;
                     let want = layer_expected(row, "attn", 5120)?;
-                    let max_abs = replay
-                        .iter()
-                        .zip(&want)
-                        .map(|(got, want)| {
-                            (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs()
-                        })
-                        .fold(0.0f64, f64::max);
+                    let (max_abs, _) = crate::verify::max_abs_rmse(
+                        &format!("deepseek.replay.attn.p{}", row.position),
+                        &replay,
+                        &want,
+                    )?;
                     let bound = bands.bands["attn"][bands
                         .positions
                         .iter()
@@ -7279,18 +7260,16 @@ mod tests {
                     plan.run(s)?;
                     let indexed = s.clone_dtoh(&indexed_out)?;
                     let window_raw = mixer.attn_output_host(s, 1)?.0;
-                    let bit_mismatches = indexed
-                        .iter()
-                        .zip(&window_raw)
-                        .filter(|(got, want)| got.to_bits() != want.to_bits())
-                        .count();
-                    let max_abs = indexed
-                        .iter()
-                        .zip(&window_raw)
-                        .map(|(got, want)| {
-                            (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs()
-                        })
-                        .fold(0.0f64, f64::max);
+                    let bit_mismatches = crate::verify::bit_mismatches(
+                        &format!("deepseek.indexed.p{}", row.position),
+                        &indexed,
+                        &window_raw,
+                    )?;
+                    let (max_abs, _) = crate::verify::max_abs_rmse(
+                        &format!("deepseek.indexed.p{}", row.position),
+                        &indexed,
+                        &window_raw,
+                    )?;
                     println!(
                         "LAYER_INDEXED_REPLAY layer={layer} position={} selected=0 compared={} bit_mismatches={bit_mismatches} max_abs={max_abs:e}",
                         row.position,
@@ -8364,8 +8343,13 @@ mod tests {
             let collapse = oracle.collapse(stream, &carried_pre);
             for h in 0..HIDDEN {
                 let got = x0[row * HIDDEN + h];
-                let distance = bf16_ulp_distance(got, collapse[h]);
-                let abs = (f64::from(got.to_f32()) - f64::from(collapse[h].to_f32())).abs();
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.hc.attn.collapse.r{row}.h{h}"),
+                    &[got],
+                    &[collapse[h]],
+                    None,
+                )?;
+                let distance = u32::from(distance);
                 ensure!(
                     distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                     "attn collapse row={row} h={h} bf16 ulp distance {distance} abs {abs}"
@@ -8390,8 +8374,13 @@ mod tests {
             let update = oracle.update(sublayer, residual, &kernel_post, &kernel_comb);
             for k in 0..MULT * HIDDEN {
                 let got = stream1[row * mix_width + k];
-                let distance = bf16_ulp_distance(got, update[k]);
-                let abs = (f64::from(got.to_f32()) - f64::from(update[k].to_f32())).abs();
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.hc.attn.update.r{row}.k{k}"),
+                    &[got],
+                    &[update[k]],
+                    None,
+                )?;
+                let distance = u32::from(distance);
                 ensure!(
                     distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                     "attn update row={row} k={k} bf16 ulp distance {distance} abs {abs}"
@@ -8442,8 +8431,13 @@ mod tests {
             let collapse = oracle.collapse(stream, &kernel_attn_pre);
             for h in 0..HIDDEN {
                 let got = x4[row * HIDDEN + h];
-                let distance = bf16_ulp_distance(got, collapse[h]);
-                let abs = (f64::from(got.to_f32()) - f64::from(collapse[h].to_f32())).abs();
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.hc.ffn.collapse.r{row}.h{h}"),
+                    &[got],
+                    &[collapse[h]],
+                    None,
+                )?;
+                let distance = u32::from(distance);
                 ensure!(
                     distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                     "ffn collapse row={row} h={h} bf16 ulp distance {distance} abs {abs}"
@@ -8468,8 +8462,13 @@ mod tests {
             let update = oracle.update(sublayer, residual, &kernel_post, &kernel_comb);
             for k in 0..MULT * HIDDEN {
                 let got = stream2[row * mix_width + k];
-                let distance = bf16_ulp_distance(got, update[k]);
-                let abs = (f64::from(got.to_f32()) - f64::from(update[k].to_f32())).abs();
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.hc.ffn.update.r{row}.k{k}"),
+                    &[got],
+                    &[update[k]],
+                    None,
+                )?;
+                let distance = u32::from(distance);
                 ensure!(
                     distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                     "ffn update row={row} k={k} bf16 ulp distance {distance} abs {abs}"
@@ -8500,8 +8499,13 @@ mod tests {
         let x_control: Vec<bf16> = s.clone_dtoh(&engine.work.x.slice(..ROWS * HIDDEN))?;
         let mut caught = 0usize;
         for i in 0..ROWS * HIDDEN {
-            let distance = bf16_ulp_distance(x_control[i], x4[i]);
-            let abs = (f64::from(x_control[i].to_f32()) - f64::from(x4[i].to_f32())).abs();
+            let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                &format!("deepseek.hc.carry[{i}]"),
+                &[x_control[i]],
+                &[x4[i]],
+                None,
+            )?;
+            let distance = u32::from(distance);
             if distance > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
                 caught += 1;
             }
@@ -8534,15 +8538,24 @@ mod tests {
             let expected = oracle.collapse(stream, &kernel_pre);
             for h in 0..HIDDEN {
                 let got = x_own[row * HIDDEN + h];
-                let distance = bf16_ulp_distance(got, expected[h]);
-                let abs = (f64::from(got.to_f32()) - f64::from(expected[h].to_f32())).abs();
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.hc.own.r{row}.h{h}"),
+                    &[got],
+                    &[expected[h]],
+                    None,
+                )?;
+                let distance = u32::from(distance);
                 ensure!(
                     distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                     "own-policy ffn collapse row={row} h={h} bf16 ulp distance {distance} abs {abs}"
                 );
-                let distance = bf16_ulp_distance(got, x4[row * HIDDEN + h]);
-                let abs =
-                    (f64::from(got.to_f32()) - f64::from(x4[row * HIDDEN + h].to_f32())).abs();
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.hc.own_vs_attn.r{row}.h{h}"),
+                    &[got],
+                    &[x4[row * HIDDEN + h]],
+                    None,
+                )?;
+                let distance = u32::from(distance);
                 if distance > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
                     caught += 1;
                 }
@@ -8931,41 +8944,23 @@ mod tests {
             .collect()
     }
 
-    fn mix_bf16_ulp(a: bf16, b: bf16) -> u32 {
-        fn key(value: bf16) -> u32 {
-            let bits = u32::from(value.to_bits());
-            if bits & 0x8000 != 0 {
-                (!bits) & 0xffff
-            } else {
-                bits | 0x8000
-            }
-        }
-        key(a).abs_diff(key(b))
-    }
-
-    fn mix_within_tol(got: bf16, want: bf16, abs_tol: f64) -> bool {
-        mix_bf16_ulp(got, want) <= MIX_ULP_TOL
-            || (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs() <= abs_tol
-    }
-
     fn mix_check(label: &str, got: &[bf16], want: &[bf16], abs_tol: f64) -> Result<usize> {
         ensure!(
             got.len() == want.len(),
-            "{label} extents differ: {} != {}",
+            "Runner FAIL {label}: length mismatch {} vs {}",
             got.len(),
             want.len()
         );
         let mut abs_branch = 0usize;
         for (index, (g, w)) in got.iter().zip(want).enumerate() {
+            let (distance, abs, _) =
+                crate::verify::bf16_ulp_max(&format!("{label}[{index}]"), &[*g], &[*w], None)?;
+            let distance = u32::from(distance);
             ensure!(
-                mix_within_tol(*g, *w, abs_tol),
-                "{label} element {index}: bf16 ulp distance {} abs {} (got {}, want {})",
-                mix_bf16_ulp(*g, *w),
-                (f64::from(g.to_f32()) - f64::from(w.to_f32())).abs(),
-                g,
-                w
+                distance <= MIX_ULP_TOL || abs <= abs_tol,
+                "{label} element {index}: bf16 ulp distance {distance} abs {abs} (got {g}, want {w})"
             );
-            if mix_bf16_ulp(*g, *w) > 1 {
+            if distance > 1 {
                 abs_branch += 1;
             }
         }
@@ -9546,7 +9541,13 @@ mod tests {
         let control: Vec<bf16> = s.clone_dtoh(&engine.work.out.slice(..MIX_HIDDEN))?;
         let mut caught = 0usize;
         for h in 0..MIX_HIDDEN {
-            if !mix_within_tol(control[h], out[h], MIX_OUT_ABS_TOL) {
+            let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                &format!("deepseek.mix.wrong_slot[{h}]"),
+                &[control[h]],
+                &[out[h]],
+                None,
+            )?;
+            if u32::from(distance) > MIX_ULP_TOL && abs > MIX_OUT_ABS_TOL {
                 caught += 1;
             }
         }
@@ -9900,15 +9901,25 @@ mod tests {
                         * u.clamp(-limit64, limit64) as f32,
                 );
                 let unclamped = bf16::from_f64(silu(g) * u);
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.swiglu.s{spec_index}[{i}]"),
+                    &[got[i]],
+                    &[want],
+                    None,
+                )?;
                 ensure!(
-                    mix_within_tol(got[i], want, SWIGLU_ABS_TOL),
-                    "clamped swiglu spec {spec_index} element {i}: ulp {} abs {} (got {}, want {})",
-                    mix_bf16_ulp(got[i], want),
-                    (f64::from(got[i].to_f32()) - f64::from(want.to_f32())).abs(),
+                    u32::from(distance) <= MIX_ULP_TOL || abs <= SWIGLU_ABS_TOL,
+                    "clamped swiglu spec {spec_index} element {i}: ulp {distance} abs {abs} (got {}, want {})",
                     got[i],
                     want
                 );
-                if !mix_within_tol(want, unclamped, SWIGLU_ABS_TOL) {
+                let (gap, gap_abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("deepseek.swiglu.unclamped.s{spec_index}[{i}]"),
+                    &[want],
+                    &[unclamped],
+                    None,
+                )?;
+                if u32::from(gap) > MIX_ULP_TOL && gap_abs > SWIGLU_ABS_TOL {
                     clamp_caught += 1;
                 }
             }
@@ -10347,11 +10358,15 @@ mod tests {
                 );
                 for (i, got) in n.iter().enumerate() {
                     let want = bf16::from_f64(lora[i] * rstd * f64::from(fixture.norm[i].to_f32()));
+                    let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                        &format!("deepseek.ffn.norm[{i}]"),
+                        &[*got],
+                        &[want],
+                        None,
+                    )?;
                     ensure!(
-                        mix_within_tol(*got, want, FF_NORM_ABS_TOL),
-                        "norm element {i}: ulp {} abs {}",
-                        mix_bf16_ulp(*got, want),
-                        (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs()
+                        u32::from(distance) <= MIX_ULP_TOL || abs <= FF_NORM_ABS_TOL,
+                        "norm element {i}: ulp {distance} abs {abs}"
                     );
                 }
             }
@@ -10759,13 +10774,15 @@ mod tests {
                 for h in 0..FF_HIDDEN {
                     let got = out_dev[row * FF_HIDDEN + h];
                     let want = bf16::from_f64(oracle_final[row][h]);
+                    let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                        &format!("deepseek.ffn.out.r{row}.h{h}"),
+                        &[got],
+                        &[want],
+                        None,
+                    )?;
                     ensure!(
-                        mix_within_tol(got, want, FF_FINAL_ABS_TOL),
-                        "ffn output row {row} dim {h}: ulp {} abs {} (got {}, want {})",
-                        mix_bf16_ulp(got, want),
-                        (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs(),
-                        got,
-                        want
+                        u32::from(distance) <= MIX_ULP_TOL || abs <= FF_FINAL_ABS_TOL,
+                        "ffn output row {row} dim {h}: ulp {distance} abs {abs} (got {got}, want {want})"
                     );
                 }
             }
@@ -11420,13 +11437,9 @@ mod tests {
 
         // One boundary's max and RMS divergence: the profile that shows which
         // stage a layer's divergence starts at.
-        fn profile(got: &[bf16], want: &[bf16]) -> (f64, f64) {
-            let max = got
-                .iter()
-                .zip(want)
-                .map(|(got, want)| (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs())
-                .fold(0.0f64, f64::max);
-            (max, rms_divergence(got, want))
+        fn profile(cell: &str, got: &[bf16], want: &[bf16]) -> Result<(f64, f64)> {
+            let (max, _) = crate::verify::max_abs_rmse(cell, got, want)?;
+            Ok((max, rms_divergence(got, want)))
         }
 
         ensure!(
@@ -12052,7 +12065,8 @@ mod tests {
             let x: Vec<bf16> = s.clone_dtoh(&engine.work.x.slice(..HIDDEN))?;
             let want_collapse = &records.collapse[0][index * HIDDEN..(index + 1) * HIDDEN];
             collapse_margin.bf16s(position, &x, want_collapse, band("collapse_attn", tf));
-            let (collapse_max, collapse_rms) = profile(&x, want_collapse);
+            let (collapse_max, collapse_rms) =
+                profile("deepseek.profile.collapse_attn", &x, want_collapse)?;
             if position == 0 {
                 let carry: Vec<f32> = s.clone_dtoh(
                     &engine
@@ -12217,7 +12231,7 @@ mod tests {
                     attn_defect += defect;
                 }
             }
-            let (attn_max, attn_rms) = profile(&attn_out, want_attn);
+            let (attn_max, attn_rms) = profile("deepseek.profile.attn", &attn_out, want_attn)?;
             if position <= 20 {
                 let count = (position + 1).min(window);
                 let ids = engine
@@ -12363,7 +12377,8 @@ mod tests {
             let stream = stream[..STREAM_WIDTH].to_vec();
             let want_expand = &records.expand[0][index * STREAM_WIDTH..(index + 1) * STREAM_WIDTH];
             expand_margin.bf16s(position, &stream, want_expand, band("expand_attn", tf));
-            let (expand_max, expand_rms) = profile(&stream, want_expand);
+            let (expand_max, expand_rms) =
+                profile("deepseek.profile.expand", &stream, want_expand)?;
             if let Some(dir) = std::env::var_os("FF_DS41_LAYER0_DUMP_DIR") {
                 let raw: Vec<u8> = stream
                     .iter()
@@ -12458,7 +12473,8 @@ mod tests {
             let x: Vec<bf16> = s.clone_dtoh(&engine.work.x.slice(..HIDDEN))?;
             let want_collapse_ffn = &records.collapse[1][index * HIDDEN..(index + 1) * HIDDEN];
             collapse_margin.bf16s(position, &x, want_collapse_ffn, band("collapse_ffn", tf));
-            let (collapse_ffn_max, collapse_ffn_rms) = profile(&x, want_collapse_ffn);
+            let (collapse_ffn_max, collapse_ffn_rms) =
+                profile("deepseek.profile.collapse_ffn", &x, want_collapse_ffn)?;
             engine.run_operator(Operator::PostNorm, 0, step, &mut None)?;
             engine.run_ffn(0, step, &mut None)?;
             // MoE instrument (4d plan 2026-10-28T19:08:31Z): router logits, chosen ids, applied
@@ -12513,7 +12529,7 @@ mod tests {
             let ffn_out: Vec<bf16> = s.clone_dtoh(&engine.work.out.slice(..HIDDEN))?;
             let want_ffn = &records.ffn[0][index * HIDDEN..(index + 1) * HIDDEN];
             ffn_margin.bf16s(position, &ffn_out, want_ffn, band("ffn", tf));
-            let (ffn_max, ffn_rms) = profile(&ffn_out, want_ffn);
+            let (ffn_max, ffn_rms) = profile("deepseek.profile.ffn", &ffn_out, want_ffn)?;
             // Rule A applied to the FFN chain (4d rulings 2026-10-28T21:19:49Z and 21:24:59Z): an
             // isolated boundary takes ALL its upstream operands from the record. The publisher's
             // recorded FFN row is the sublayer output, and the recorded post/comb are the mix
@@ -12580,7 +12596,7 @@ mod tests {
             let final_row = final_row[..STREAM_WIDTH].to_vec();
             let want_final = &records.expand[1][index * STREAM_WIDTH..(index + 1) * STREAM_WIDTH];
             final_stream.bf16s(position, &final_row, want_final, band("expand_ffn", tf));
-            let (final_max, final_rms) = profile(&final_row, want_final);
+            let (final_max, final_rms) = profile("deepseek.profile.final", &final_row, want_final)?;
             println!(
                 "LAYER0 profile_ffn pos={position} collapse={collapse_ffn_max:.3e}/{collapse_ffn_rms:.3e} \
                  ffn={ffn_max:.3e}/{ffn_rms:.3e} final={final_max:.3e}/{final_rms:.3e}"
