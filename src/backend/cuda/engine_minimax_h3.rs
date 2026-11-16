@@ -1048,7 +1048,9 @@ fn low_rank_factor(
 
 pub(crate) struct BlockKernels {
     norm: crate::backend::gpu::CudaFunction,
+    norm_f32: crate::backend::gpu::CudaFunction,
     norm_modulate: crate::backend::gpu::CudaFunction,
+    norm_modulate_f32: crate::backend::gpu::CudaFunction,
     rotary: crate::backend::gpu::CudaFunction,
     swiglu: crate::backend::gpu::CudaFunction,
     #[cfg(test)]
@@ -1065,19 +1067,28 @@ impl BlockKernels {
         let modulate = cubin::module(ctx, "modulate")?;
         let norm = cubin::module(ctx, "norm")?;
         let plain = norm.load_function("rms_norm_bf16")?;
+        let norm_f32 = norm.load_function("rms_norm")?;
         let norm_modulate = norm.load_function("rms_norm_modulate_bf16")?;
+        let norm_modulate_f32 = norm.load_function("rms_norm_modulate")?;
         let active = |kernel: &crate::backend::gpu::CudaFunction| {
             kernel.occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)
         };
         let baseline = active(&plain)?;
         let fused = active(&norm_modulate)?;
+        let fused_f32 = active(&norm_modulate_f32)?;
         ensure!(
             baseline > 0 && fused >= baseline,
             "rms_norm_modulate_bf16 occupancy {fused} below rms_norm_bf16 {baseline}"
         );
+        ensure!(
+            fused_f32 >= baseline,
+            "rms_norm_modulate occupancy {fused_f32} below rms_norm_bf16 {baseline}"
+        );
         Ok(Self {
             norm: plain,
+            norm_f32,
             norm_modulate,
+            norm_modulate_f32,
             residual: norm.load_function("residual")?,
             rotary: cubin::module(ctx, "rope")?.load_function("rotary_prefix_kv")?,
             swiglu: cubin::module(ctx, "act")?.load_function("silu_mul")?,
@@ -1757,6 +1768,7 @@ pub(crate) fn block_forward<const LORA: bool>(
     work: &mut BlockWork,
 ) -> Result<()> {
     let (s, blas, kernels, spec, lora_scale) = (c.s, c.blas, c.kernels, c.spec, c.lora_scale);
+    let hyperflow = spec.is_hyperflow()?;
     let rows = work.rows;
     let (h, width, r) = (spec.hidden, spec.heads * spec.head_dim, w.rank);
     let (rotary_width, rotary_table, modulation) = match conditioning {
@@ -1801,18 +1813,20 @@ pub(crate) fn block_forward<const LORA: bool>(
                 threads: u32,
                 eps: f32|
      -> Result<()> {
-        kernels.rms_norm(
-            s,
-            NormRows {
-                input,
-                weight,
-                output,
-                rows,
-                dim,
-                threads,
-                eps,
-            },
-        )
+        let n = NormRows {
+            input,
+            weight,
+            output,
+            rows,
+            dim,
+            threads,
+            eps,
+        };
+        if hyperflow && modulation.is_some() {
+            kernels.rms_norm_f32(s, n)
+        } else {
+            kernels.rms_norm(s, n)
+        }
     };
     let xp = pointer(x, s);
     let normed = pointer(&work.normed, s);
@@ -1827,20 +1841,21 @@ pub(crate) fn block_forward<const LORA: bool>(
             eps: spec.norm_eps,
         };
         if modulation.is_some() {
-            kernels.rms_norm_modulate(
-                s,
-                n,
-                ModulateRows {
-                    data: normed,
-                    shift: chunk(shift),
-                    scale: chunk(scale),
-                    index,
-                    rows,
-                    dim: h,
-                    stride,
-                    entries,
-                },
-            )
+            let m = ModulateRows {
+                data: normed,
+                shift: chunk(shift),
+                scale: chunk(scale),
+                index,
+                rows,
+                dim: h,
+                stride,
+                entries,
+            };
+            if hyperflow {
+                kernels.rms_norm_modulate_f32(s, n, m)
+            } else {
+                kernels.rms_norm_modulate(s, n, m)
+            }
         } else {
             kernels.rms_norm(s, n)
         }
@@ -2083,6 +2098,27 @@ struct ModulateRows {
 
 impl BlockKernels {
     fn rms_norm_modulate(&self, s: &Arc<CudaStream>, n: NormRows, m: ModulateRows) -> Result<()> {
+        self.prepare_norm_modulate(&n, &m)?;
+        #[cfg(test)]
+        if self.serial_norm_modulate.get() {
+            self.rms_norm(s, n)?;
+            return self.row_modulate(s, m);
+        }
+        self.launch_norm_modulate(s, &self.norm_modulate, &n, &m)
+    }
+
+    /// Weight multiplies in f32. The modulate stores keep the four BF16 rounds.
+    fn rms_norm_modulate_f32(
+        &self,
+        s: &Arc<CudaStream>,
+        n: NormRows,
+        m: ModulateRows,
+    ) -> Result<()> {
+        self.prepare_norm_modulate(&n, &m)?;
+        self.launch_norm_modulate(s, &self.norm_modulate_f32, &n, &m)
+    }
+
+    fn prepare_norm_modulate(&self, n: &NormRows, m: &ModulateRows) -> Result<()> {
         ensure!(
             n.rows == m.rows && n.dim == m.dim && n.output == m.data,
             "RMSNorm modulation output extent"
@@ -2111,13 +2147,18 @@ impl BlockKernels {
         m.stride
             .checked_mul(m.entries as usize)
             .context("modulation table extent overflow")?;
-        #[cfg(test)]
-        if self.serial_norm_modulate.get() {
-            self.rms_norm(s, n)?;
-            return self.row_modulate(s, m);
-        }
+        Ok(())
+    }
+
+    fn launch_norm_modulate(
+        &self,
+        s: &Arc<CudaStream>,
+        kernel: &crate::backend::gpu::CudaFunction,
+        n: &NormRows,
+        m: &ModulateRows,
+    ) -> Result<()> {
         unsafe {
-            s.launch_builder(&self.norm_modulate)
+            s.launch_builder(kernel)
                 .arg(&n.input)
                 .arg(&n.weight)
                 .arg(&n.output)
@@ -2139,8 +2180,22 @@ impl BlockKernels {
     }
 
     fn rms_norm(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
+        self.launch_rms_norm(s, &self.norm, n)
+    }
+
+    /// Weight multiplies in f32 and the store rounds once.
+    fn rms_norm_f32(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
+        self.launch_rms_norm(s, &self.norm_f32, n)
+    }
+
+    fn launch_rms_norm(
+        &self,
+        s: &Arc<CudaStream>,
+        kernel: &crate::backend::gpu::CudaFunction,
+        n: NormRows,
+    ) -> Result<()> {
         unsafe {
-            s.launch_builder(&self.norm)
+            s.launch_builder(kernel)
                 .arg(&n.input)
                 .arg(&n.weight)
                 .arg(&n.output)
@@ -2273,8 +2328,9 @@ impl Placement {
 }
 
 /// `rows` sequence rows keep every launch of the block path inside its index type: `rotary_prefix_kv` indexes
-/// `rows * 2 * heads * head_dim` elements and `residual` `rows * hidden` elements in i32, the q/k `rms_norm_bf16`
-/// runs `rows * heads` rows in i32, and `vision_upcast_f32` / `vision_bias_f32` take u32 counts of `rows * hidden`.
+/// `rows * 2 * heads * head_dim` elements and `residual` `rows * hidden` elements in i32, the q/k norm
+/// (`rms_norm_bf16`, or `rms_norm` on a HyperFlow modulated block) runs `rows * heads` rows in i32, and
+/// `vision_upcast_f32` / `vision_bias_f32` take u32 counts of `rows * hidden`.
 fn launch_extents(spec: &H3Spec, rows: usize) -> Result<()> {
     let limit = i32::MAX as usize;
     for (kernel, per_row) in [
@@ -5170,6 +5226,247 @@ mod tests {
             "DEFECT norm/modulation bitwise cells={defects}"
         );
         Ok(())
+    }
+
+    fn bf16_round(value: f32) -> f32 {
+        bf16::from_f32(value).to_f32()
+    }
+
+    /// Host of `norm_scale`: `pre_weight` rounds `x * rstd` before the weight multiply.
+    fn host_norm_rows(
+        x: &[bf16],
+        weight: &[bf16],
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        pre_weight: bool,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * dim];
+        for row in 0..rows {
+            let mut ssq = 0.0f32;
+            for value in &x[row * dim..(row + 1) * dim] {
+                let v = value.to_f32();
+                ssq += v * v;
+            }
+            let rstd = 1.0 / (ssq / dim as f32 + eps).sqrt();
+            for (d, value) in x[row * dim..(row + 1) * dim].iter().enumerate() {
+                let normalized = value.to_f32() * rstd;
+                let scaled = if pre_weight {
+                    bf16_round(normalized) * weight[d].to_f32()
+                } else {
+                    normalized * weight[d].to_f32()
+                };
+                out[row * dim + d] = bf16_round(scaled);
+            }
+        }
+        out
+    }
+
+    fn host_modulate(value: f32, shift: f32, scale: f32) -> f32 {
+        let weighted = bf16_round(value);
+        let factor = bf16_round(1.0 + scale);
+        let scaled = bf16_round(weighted * factor);
+        bf16_round(scaled + shift)
+    }
+
+    fn f32_abs_diff(actual: &[bf16], expected: &[f32]) -> (usize, f32) {
+        let mut n = 0usize;
+        let mut max = 0.0f32;
+        for (got, want) in actual.iter().zip(expected) {
+            let delta = (got.to_f32() - want).abs();
+            if got.to_f32().to_bits() != want.to_bits() {
+                n += 1;
+            }
+            max = max.max(delta);
+        }
+        (n, max)
+    }
+
+    /// The f32-weight kernels match the post-weight cast and miss the pre-weight cast. The BF16 kernels do the opposite.
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn hyperflow_norm_skips_the_pre_weight_round_gpu() -> Result<()> {
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        device.finish_upload()?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let eps = 1.0e-5f32;
+        let pattern = |len: usize, stride: usize, bias: usize| -> Vec<bf16> {
+            (0..len)
+                .map(|i| bf16::from_f32(((i * stride + bias) % 251) as f32 / 17.0 - 7.0))
+                .collect()
+        };
+        let weight_of = |dim: usize| -> Vec<bf16> {
+            (0..dim)
+                .map(|d| bf16::from_f32(0.5 + (d * 13 % 64) as f32 / 32.0))
+                .collect()
+        };
+        let score = |label: &str, actual: &[bf16], pre: &[f32], post: &[f32]| -> Result<()> {
+            let (pre_n, pre_max) = f32_abs_diff(actual, pre);
+            let (post_n, post_max) = f32_abs_diff(actual, post);
+            let (formula_n, formula_max) = f32_abs_diff(
+                &pre.iter().copied().map(bf16::from_f32).collect::<Vec<_>>(),
+                post,
+            );
+            println!(
+                "HYPERFLOW_NORM_CONTROL {label} pre_diff={pre_n} pre_max={pre_max:.8} post_diff={post_n} post_max={post_max:.8} formula_diff={formula_n} formula_max={formula_max:.8}"
+            );
+            ensure!(
+                formula_n > 0 && formula_max >= 0.015625,
+                "RUNNER_FAIL {label} formulas do not separate"
+            );
+            Ok(())
+        };
+        let separate = |label: &str,
+                        closer_to_post: bool,
+                        actual: &[bf16],
+                        pre: &[f32],
+                        post: &[f32]|
+         -> Result<()> {
+            score(label, actual, pre, post)?;
+            let (pre_n, _) = f32_abs_diff(actual, pre);
+            let (post_n, _) = f32_abs_diff(actual, post);
+            if closer_to_post {
+                ensure!(
+                    post_n * 10 < pre_n,
+                    "DEFECT {label} f32-weight kernel matches the pre-weight round pre_diff={pre_n} post_diff={post_n}"
+                );
+            } else {
+                ensure!(
+                    pre_n * 10 < post_n,
+                    "DEFECT {label} bf16 kernel matches the post-weight round pre_diff={pre_n} post_diff={post_n}"
+                );
+            }
+            Ok(())
+        };
+
+        let rows = 3usize;
+        let dim = 128usize;
+        let x = pattern(rows * dim, 17, 3);
+        let w = weight_of(dim);
+        let pre = host_norm_rows(&x, &w, rows, dim, eps, true);
+        let post = host_norm_rows(&x, &w, rows, dim, eps, false);
+        let input = s.clone_htod(&x)?;
+        let gamma = s.clone_htod(&w)?;
+        let y_f32 = s.alloc_zeros::<bf16>(rows * dim)?;
+        let y_bf16 = s.alloc_zeros::<bf16>(rows * dim)?;
+        let norm = |output: &CudaSlice<bf16>| NormRows {
+            input: pointer(&input, s),
+            weight: pointer(&gamma, s),
+            output: pointer(output, s),
+            rows,
+            dim,
+            threads: HEAD_NORM_THREADS,
+            eps,
+        };
+        kernels.rms_norm_f32(s, norm(&y_f32))?;
+        kernels.rms_norm(s, norm(&y_bf16))?;
+        let got_f32 = s.clone_dtoh(&y_f32)?;
+        let got_bf16 = s.clone_dtoh(&y_bf16)?;
+        let device_diff = got_f32
+            .iter()
+            .zip(&got_bf16)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("HYPERFLOW_NORM_CONTROL qk device_diff={device_diff} rows={rows} dim={dim}");
+        ensure!(device_diff > 0, "DEFECT qk kernels are bitwise identical");
+        separate("qk-f32", true, &got_f32, &pre, &post)?;
+        separate("qk-bf16", false, &got_bf16, &pre, &post)?;
+
+        for (rows, dim) in [(3usize, 128usize), (1usize, 5376usize)] {
+            let x = pattern(rows * dim, 17, 3);
+            let w = weight_of(dim);
+            let shift_h: Vec<bf16> = (0..dim)
+                .map(|d| bf16::from_f32(((d * 37) % 251) as f32 / 256.0 - 0.5))
+                .collect();
+            let scale_h: Vec<bf16> = (0..dim)
+                .map(|d| bf16::from_f32(((d * 19 + 5) % 251) as f32 / 256.0 - 0.5))
+                .collect();
+            let pre = modulate_rows(&x, &w, &shift_h, &scale_h, dim, eps, true);
+            let post = modulate_rows(&x, &w, &shift_h, &scale_h, dim, eps, false);
+            let input = s.clone_htod(&x)?;
+            let gamma = s.clone_htod(&w)?;
+            let shift = s.clone_htod(&shift_h)?;
+            let scale = s.clone_htod(&scale_h)?;
+            let index = s.clone_htod(&vec![0u32; rows])?;
+            let y_f32 = s.alloc_zeros::<bf16>(rows * dim)?;
+            let y_bf16 = s.alloc_zeros::<bf16>(rows * dim)?;
+            let norm = |output: &CudaSlice<bf16>| NormRows {
+                input: pointer(&input, s),
+                weight: pointer(&gamma, s),
+                output: pointer(output, s),
+                rows,
+                dim,
+                threads: HIDDEN_NORM_THREADS,
+                eps,
+            };
+            let modulation = |output: &CudaSlice<bf16>| ModulateRows {
+                data: pointer(output, s),
+                shift: pointer(&shift, s),
+                scale: pointer(&scale, s),
+                index: pointer(&index, s),
+                rows,
+                dim,
+                stride: dim,
+                entries: 1,
+            };
+            kernels.rms_norm_modulate_f32(s, norm(&y_f32), modulation(&y_f32))?;
+            kernels.rms_norm_modulate(s, norm(&y_bf16), modulation(&y_bf16))?;
+            let got_f32 = s.clone_dtoh(&y_f32)?;
+            let got_bf16 = s.clone_dtoh(&y_bf16)?;
+            let device_diff = got_f32
+                .iter()
+                .zip(&got_bf16)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            println!(
+                "HYPERFLOW_NORM_CONTROL modulate device_diff={device_diff} rows={rows} dim={dim}"
+            );
+            ensure!(
+                device_diff > 0,
+                "DEFECT modulate kernels are bitwise identical rows={rows} dim={dim}"
+            );
+            separate(&format!("modulate-f32-{dim}"), true, &got_f32, &pre, &post)?;
+            separate(
+                &format!("modulate-bf16-{dim}"),
+                false,
+                &got_bf16,
+                &pre,
+                &post,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn modulate_rows(
+        x: &[bf16],
+        weight: &[bf16],
+        shift: &[bf16],
+        scale: &[bf16],
+        dim: usize,
+        eps: f32,
+        pre_weight: bool,
+    ) -> Vec<f32> {
+        let rows = x.len() / dim;
+        let mut out = vec![0.0f32; rows * dim];
+        for row in 0..rows {
+            let mut ssq = 0.0f32;
+            for value in &x[row * dim..(row + 1) * dim] {
+                let v = value.to_f32();
+                ssq += v * v;
+            }
+            let rstd = 1.0 / (ssq / dim as f32 + eps).sqrt();
+            for d in 0..dim {
+                let normalized = x[row * dim + d].to_f32() * rstd;
+                let scaled = if pre_weight {
+                    bf16_round(normalized) * weight[d].to_f32()
+                } else {
+                    normalized * weight[d].to_f32()
+                };
+                out[row * dim + d] = host_modulate(scaled, shift[d].to_f32(), scale[d].to_f32());
+            }
+        }
+        out
     }
 
     /// `cast_rows` with `count == 0` launches nothing (the kernel traps on a zero count); a non-zero count rounds.
