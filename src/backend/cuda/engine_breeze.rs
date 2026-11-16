@@ -1208,7 +1208,10 @@ fn load_matrix(
 
 fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
     let workspace_rows = geometry.backbone.max(17);
-    let mlp_elems = workspace_rows * BB_I;
+    let text_rows = geometry.backbone - geometry.frames;
+    let mlp_elems = (gemm_rows(text_rows, TEXT_H) * TEXT_I)
+        .max(gemm_rows(geometry.backbone, BB_H) * BB_I)
+        .max(gemm_rows(geometry.frames, DP_H) * DP_I);
     let h_elems = workspace_rows * BB_H;
     let kv_elems = BB_KV * geometry.backbone * BB_DIM;
     let mut lk = Vec::with_capacity(BB_LAYERS);
@@ -4438,6 +4441,48 @@ mod tests {
             .is_err(),
             "65 frames"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_depth_min_generation_mlp_scratch() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let runtime = RuntimeDir::with_prefix("n8-depth-min")?;
+        let mut model = super::Breeze::load_for_generation(&weights, &runtime.0, 0, 3, 1)?;
+        model.set_graph(false);
+        let cond = vec![0.0f32; super::BB_H];
+        let codes = vec![0i32; super::DP_ROWS];
+        let scores = model.depth(&cond, &codes, 1, false)?;
+        ensure!(scores.len() == super::HEAD_N * super::CODEBOOK as usize);
+        ensure!(scores.iter().all(|value| value.is_finite()), "depth scores");
+        println!("BREEZE_DEPTH_MIN_SCRATCH PASS frames=1");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_default_text_max_mlp_scratch() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let runtime = RuntimeDir::with_prefix("n8-text-max")?;
+        let mut model = super::Breeze::load(&weights, &runtime.0)?;
+        model.set_graph(false);
+        let ids = vec![2u32; super::TEXT_MAX];
+        let projected = model.text(&ids, super::TextPlant::Nominal)?;
+        ensure!(projected.len() == super::TEXT_MAX * super::BB_H);
+        ensure!(
+            projected.iter().all(|value| value.is_finite()),
+            "text output"
+        );
+        println!("BREEZE_DEFAULT_TEXT_SCRATCH PASS text_rows=652");
         Ok(())
     }
 
