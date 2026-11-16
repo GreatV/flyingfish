@@ -1135,6 +1135,12 @@ pub(crate) struct BlockWork {
     fixed_lora: bool,
     #[cfg(test)]
     repeat_ffn_input: bool,
+    /// When set, `block_forward` copies the modulated norm2 rows out right
+    /// after they are written (the FFN overwrites them otherwise).
+    #[cfg(test)]
+    keep_normed: bool,
+    #[cfg(test)]
+    normed_probe: Vec<bf16>,
     normed: CudaSlice<bf16>,
     q_raw: CudaSlice<bf16>,
     k_raw: CudaSlice<bf16>,
@@ -1479,6 +1485,10 @@ impl BlockWork {
             rows,
             rank,
             chunk,
+            #[cfg(test)]
+            keep_normed: false,
+            #[cfg(test)]
+            normed_probe: Vec::new(),
             fixed_lora: false,
             #[cfg(test)]
             repeat_ffn_input: false,
@@ -2104,6 +2114,10 @@ pub(crate) fn block_forward<const LORA: bool>(
     }
 
     hidden_norm(&w.norm2, 3, 4)?;
+    #[cfg(test)]
+    if work.keep_normed {
+        work.normed_probe = s.clone_dtoh(&work.normed)?;
+    }
     ffn_forward::<false, LORA>(c, w, work, scratch)?;
     if modulation.is_some() {
         gated_add(xp, normed, 5)?;
@@ -5754,6 +5768,7 @@ mod tests {
         let rows = 1usize;
         let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
         work.prepare::<true>(&blas, &spec)?;
+        work.keep_normed = true;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
         let hidden = spec.hidden;
@@ -5806,7 +5821,7 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "zero gates must leave the residual untouched"
         );
-        let normed = s.clone_dtoh(&work.normed)?;
+        let normed = std::mem::take(&mut work.normed_probe);
         let norm2 = s.clone_dtoh(&weights.norm2)?;
         let shift_mlp = &table[3 * hidden..4 * hidden];
         let scale_mlp = &table[4 * hidden..5 * hidden];
