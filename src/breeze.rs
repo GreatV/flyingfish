@@ -52,12 +52,10 @@ fn generation_config_value(root: Value) -> Result<GenerationConfig> {
     equal(&root, "bos_token_id", 2.into())?;
     equal(&root, "eos_token_id", json!([1]))?;
     equal(&root, "pad_token_id", 0.into())?;
-    if let Some(penalty) = root.get("repetition_penalty") {
-        ensure!(
-            penalty.as_f64() == Some(1.0),
-            "unsupported Breeze repetition_penalty"
-        );
-    }
+    let repetition_penalty = root
+        .get("repetition_penalty")
+        .map_or(Some(1.1), Value::as_f64)
+        .context("Breeze repetition penalty")?;
     let temperature = root["temperature"].as_f64().context("Breeze temperature")?;
     let depth_temperature = root["depth_decoder_temperature"]
         .as_f64()
@@ -80,7 +78,12 @@ fn generation_config_value(root: Value) -> Result<GenerationConfig> {
         "Breeze generation limit {max_new_tokens} exceeds 750"
     );
     Ok(GenerationConfig {
-        sampling: Sampling::new(temperature as f32, top_k as usize, top_p as f32)?,
+        sampling: Sampling::new(
+            temperature as f32,
+            top_k as usize,
+            top_p as f32,
+            repetition_penalty as f32,
+        )?,
         max_new_tokens,
     })
 }
@@ -168,6 +171,7 @@ mod tests {
         assert_eq!(config.sampling.temperature, 0.9);
         assert_eq!(config.sampling.top_k, 50);
         assert_eq!(config.sampling.top_p, 1.0);
+        assert_eq!(config.sampling.repetition_penalty, 1.1);
         Ok(())
     }
 }

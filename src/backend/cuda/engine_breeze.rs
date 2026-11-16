@@ -372,6 +372,7 @@ struct Buf {
     ids: CudaSlice<i32>,
     picked: CudaSlice<u32>, // slot 0 backbone, slots 1..15 depth heads
     probabilities: CudaSlice<f32>,
+    backbone_history: CudaSlice<i32>,
 }
 
 struct Flashes {
@@ -998,6 +999,7 @@ struct SampleRequest {
     stream: u64,
     counter: u64,
     allow: i32,
+    repetition: bool,
 }
 
 fn sample_rows(
@@ -1005,6 +1007,7 @@ fn sample_rows(
     logits: &CudaSlice<bf16>,
     probabilities: &mut CudaSlice<f32>,
     picked: &mut CudaSlice<u32>,
+    backbone_history: &mut CudaSlice<i32>,
     request: SampleRequest,
 ) -> Result<()> {
     let elements = request
@@ -1019,12 +1022,22 @@ fn sample_rows(
         request.picked_start + request.rows <= picked.len(),
         "sampling token extent"
     );
+    ensure!(
+        backbone_history.len() >= request.vocab,
+        "sampling history extent"
+    );
     let source = logits.slice(request.source_start..request.source_start + elements);
     let mut probs = probabilities.slice_mut(..elements);
     let mut out = picked.slice_mut(request.picked_start..request.picked_start + request.rows);
     let rows_i = i32::try_from(request.rows)?;
     let vocab_i = i64::try_from(request.vocab)?;
     let top_k = i32::try_from(request.sampling.top_k)?;
+    let repetition_penalty = if request.repetition {
+        request.sampling.repetition_penalty
+    } else {
+        1.0
+    };
+    let track_history = request.repetition as i32;
     unsafe {
         k.stream
             .launch_builder(&k.distribution)
@@ -1035,6 +1048,8 @@ fn sample_rows(
             .arg(&request.sampling.temperature)
             .arg(&top_k)
             .arg(&request.sampling.top_p)
+            .arg(&*backbone_history)
+            .arg(&repetition_penalty)
             .arg(&2048i32)
             .arg(&2050i32)
             .arg(&request.allow)
@@ -1049,6 +1064,8 @@ fn sample_rows(
             .arg(&request.stream)
             .arg(&request.counter)
             .arg(&256i32)
+            .arg(backbone_history)
+            .arg(&track_history)
             .launch(ops::grid(request.rows, 256u32))?;
     }
     Ok(())
@@ -1230,6 +1247,7 @@ fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
         ids: stream.alloc_zeros(geometry.frames * BOOKS)?,
         picked: stream.alloc_zeros(BOOKS)?,
         probabilities: stream.alloc_zeros(BOOKS * BB_VOCAB)?,
+        backbone_history: stream.alloc_zeros(BB_VOCAB)?,
     })
 }
 
@@ -2799,6 +2817,7 @@ fn depth_sample_head(
         &buf.head_out,
         &mut buf.probabilities,
         &mut buf.picked,
+        &mut buf.backbone_history,
         SampleRequest {
             source_start: 0,
             picked_start: call.head + 1,
@@ -2809,6 +2828,7 @@ fn depth_sample_head(
             stream: 1,
             counter: call.counter,
             allow: -1,
+            repetition: false,
         },
     )
 }
@@ -3482,6 +3502,7 @@ impl Breeze {
                 &buf.d,
                 &mut buf.probabilities,
                 &mut buf.picked,
+                &mut buf.backbone_history,
                 SampleRequest {
                     source_start: score_row * BB_VOCAB,
                     picked_start: 0,
@@ -3492,6 +3513,7 @@ impl Breeze {
                     stream: 0,
                     counter: frame as u64,
                     allow: 2051,
+                    repetition: true,
                 },
             )?;
             let backbone = download_u32(k, &buf.picked, 0, 1)?[0];
@@ -4431,7 +4453,7 @@ mod tests {
         let codes = model.sample_decode(
             &projected,
             prompt.len(),
-            crate::sampling::Sampling::new(0.9, 50, 1.0)?,
+            crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?,
             42,
         )?;
         ensure!(
@@ -4510,7 +4532,7 @@ mod tests {
             seq: text_rows + audio,
         };
         let logits = model.backbone(&projected, &positions, &codes, false)?;
-        let sampling = crate::sampling::Sampling::new(0.9, 50, 1.0)?;
+        let sampling = crate::sampling::Sampling::new(0.9, 50, 1.0, 1.0)?;
         let mut worst_row = 0.0f32;
         let mut worst_eos = 0.0f32;
         let mut worst_probability = 0.0f64;
@@ -4525,7 +4547,7 @@ mod tests {
                 .map(|(got, want)| (got - want).abs())
                 .fold(0.0f32, f32::max);
             let eos_max = (row[2051] - expected[2051]).abs();
-            let probabilities = sampling.probabilities(row, (2048, 2050), Some(2051))?;
+            let probabilities = sampling.probabilities(row, &[], (2048, 2050), Some(2051))?;
             let publisher_probability = doc["frames"][frame]["eos_top_k_probability"]
                 .as_f64()
                 .context("publisher probability")?;
@@ -4535,6 +4557,7 @@ mod tests {
                 &model.buf.d,
                 &mut model.buf.probabilities,
                 &mut model.buf.picked,
+                &mut model.buf.backbone_history,
                 super::SampleRequest {
                     source_start: start,
                     picked_start: 0,
@@ -4545,6 +4568,7 @@ mod tests {
                     stream: 0,
                     counter: frame as u64,
                     allow: 2051,
+                    repetition: false,
                 },
             )?;
             let gpu = model

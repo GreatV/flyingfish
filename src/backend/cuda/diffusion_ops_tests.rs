@@ -442,6 +442,7 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
     }
     let d_probs = s.clone_htod(&probs)?;
     let d_pick = s.clone_htod(&vec![-1i32; srows])?;
+    let mut d_categorical_history = s.alloc_zeros::<i32>(svocab)?;
     unsafe {
         s.launch_builder(&categorical)
             .arg(&d_probs)
@@ -452,6 +453,8 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&9u64)
             .arg(&0u64)
             .arg(&256i32)
+            .arg(&mut d_categorical_history)
+            .arg(&0i32)
             .launch(crate::backend::cuda::ops::grid(srows, 256u32))?;
     }
     let picks = s.clone_dtoh(&d_pick)?;
@@ -471,6 +474,8 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&9u64)
             .arg(&0u64)
             .arg(&256i32)
+            .arg(&mut d_categorical_history)
+            .arg(&0i32)
             .launch(crate::backend::cuda::ops::grid(srows, 256u32))?;
     }
     let repeat = s.clone_dtoh(&d_pick2)?;
@@ -492,6 +497,8 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&38471471u64)
             .arg(&0u64)
             .arg(&256i32)
+            .arg(&mut d_categorical_history)
+            .arg(&0i32)
             .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
     }
     let gap_pick = s.clone_dtoh(&d_gap_pick)?[0];
@@ -516,7 +523,7 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
     let sample = crate::backend::cuda::cubin::module(&device.ctx, "sample")?;
     let distribution = sample.load_function("distribution_rows_bf16")?;
     let categorical = sample.load_function("categorical_sample_rows")?;
-    let sampling = crate::sampling::Sampling::new(2.0, 3, 0.8)?;
+    let sampling = crate::sampling::Sampling::new(2.0, 3, 0.8, 1.0)?;
     let logits = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
     let rows = 64usize;
     let vocab = logits.len();
@@ -528,25 +535,29 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
         .collect();
     let d_logits = s.clone_htod(&host)?;
     let d_probs = s.alloc_zeros::<f32>(rows * vocab)?;
-    let run_distribution = |allow: i32| -> Result<()> {
-        unsafe {
-            s.launch_builder(&distribution)
-                .arg(&d_logits)
-                .arg(&d_probs)
-                .arg(&(rows as i32))
-                .arg(&(vocab as i64))
-                .arg(&2.0f32)
-                .arg(&3i32)
-                .arg(&0.8f32)
-                .arg(&6i32)
-                .arg(&6i32)
-                .arg(&allow)
-                .launch(crate::backend::cuda::ops::grid(rows, 256u32))?;
-        }
-        Ok(())
-    };
-    run_distribution(-1)?;
-    let expected = sampling.probabilities(&logits, (6, 6), None)?;
+    let mut d_history = s.alloc_zeros::<i32>(vocab)?;
+    let run_distribution =
+        |history: &cudarc::driver::CudaSlice<i32>, allow: i32, penalty: f32| -> Result<()> {
+            unsafe {
+                s.launch_builder(&distribution)
+                    .arg(&d_logits)
+                    .arg(&d_probs)
+                    .arg(&(rows as i32))
+                    .arg(&(vocab as i64))
+                    .arg(&2.0f32)
+                    .arg(&3i32)
+                    .arg(&0.8f32)
+                    .arg(history)
+                    .arg(&penalty)
+                    .arg(&6i32)
+                    .arg(&6i32)
+                    .arg(&allow)
+                    .launch(crate::backend::cuda::ops::grid(rows, 256u32))?;
+            }
+            Ok(())
+        };
+    run_distribution(&d_history, -1, 1.0)?;
+    let expected = sampling.probabilities(&logits, &[], (6, 6), None)?;
     let got = s.clone_dtoh(&d_probs)?;
     for row in got.chunks_exact(vocab) {
         for (actual, expected) in row.iter().zip(&expected) {
@@ -557,12 +568,13 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
         }
         ensure!(row[6] == 0.0 && row[4] == 0.0, "top-k/reserved mask");
     }
-    run_distribution(6)?;
+    run_distribution(&d_history, 6, 1.0)?;
     let allowed = s.clone_dtoh(&d_probs)?;
     ensure!(allowed[6] > 0.0, "reserved allow token");
-    run_distribution(-1)?;
+    run_distribution(&d_history, -1, 1.0)?;
     let sample_with = |seed: u64| -> Result<Vec<i32>> {
         let out = s.alloc_zeros::<i32>(rows)?;
+        let mut untracked = s.alloc_zeros::<i32>(vocab)?;
         unsafe {
             s.launch_builder(&categorical)
                 .arg(&d_probs)
@@ -573,6 +585,8 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
                 .arg(&1u64)
                 .arg(&3u64)
                 .arg(&256i32)
+                .arg(&mut untracked)
+                .arg(&0i32)
                 .launch(crate::backend::cuda::ops::grid(rows, 256u32))?;
         }
         Ok(s.clone_dtoh(&out)?)
@@ -591,8 +605,49 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
             .all(|id| (0..vocab as i32).contains(id) && *id != 6 && *id != 4),
         "sampled masked token"
     );
+    let tracked = s.alloc_zeros::<i32>(1)?;
+    unsafe {
+        s.launch_builder(&categorical)
+            .arg(&d_probs)
+            .arg(&tracked)
+            .arg(&1i32)
+            .arg(&(vocab as i64))
+            .arg(&7u64)
+            .arg(&1u64)
+            .arg(&3u64)
+            .arg(&256i32)
+            .arg(&mut d_history)
+            .arg(&1i32)
+            .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
+    }
+    let tracked = s.clone_dtoh(&tracked)?[0];
+    let history = s.clone_dtoh(&d_history)?;
+    ensure!(
+        history.iter().sum::<i32>() == 1 && history[tracked as usize] == 1,
+        "tracked history pick={tracked} state={history:?}"
+    );
+    let penalized = crate::sampling::Sampling::new(2.0, 3, 0.8, 1.1)?.probabilities(
+        &logits,
+        &[tracked as u32],
+        (6, 6),
+        None,
+    )?;
+    run_distribution(&d_history, -1, 1.1)?;
+    let actual = s.clone_dtoh(&d_probs)?;
+    let maximum = actual
+        .iter()
+        .zip(penalized.iter().cycle())
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(maximum <= 1e-5, "repetition distribution max={maximum}");
+    let detected = actual
+        .iter()
+        .zip(expected.iter().cycle())
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(detected > 0.001, "omit-penalty GPU control max={detected}");
     println!(
-        "BREEZE_SAMPLER PASS rows=64 top_k=3 top_p=0.8 reserved=6 allow=6 same_seed=exact seed_plus_one=different"
+        "BREEZE_SAMPLER PASS rows=64 top_k=3 top_p=0.8 reserved=6 allow=6 same_seed=exact seed_plus_one=different repetition_max={maximum} omit_penalty={detected}"
     );
     Ok(())
 }
