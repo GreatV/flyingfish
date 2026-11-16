@@ -9,7 +9,7 @@ use flyingfish::{
     trace::Trace,
 };
 #[cfg(feature = "cuda")]
-use std::io::Read;
+use std::io::{Read, Write};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -271,6 +271,22 @@ enum Command {
             help = "Print resolved output metadata, including the aligned frame count, as JSON"
         )]
         json: bool,
+    },
+    Music {
+        #[arg(long, help = "Music description in natural language")]
+        prompt: String,
+        #[arg(long, help = "Lyrics with optional section tags, or - to read stdin")]
+        lyrics: String,
+        #[arg(long, help = "Sampling seed")]
+        seed: u64,
+        #[arg(long, default_value_t = 1500, help = "Maximum audio frames at 25 fps")]
+        frames: usize,
+        #[arg(
+            short = 'o',
+            long = "output",
+            help = "Output stereo 44.1 kHz WAV; stdout if omitted"
+        )]
+        output: Option<PathBuf>,
     },
     Serve {
         #[arg(long, default_value_t = 8080)]
@@ -1003,6 +1019,63 @@ fn image(cli: &Cli, request: ImageCliRequest, output: &Path, json: bool) -> Resu
     })
 }
 
+fn music(
+    cli: &Cli,
+    prompt: &str,
+    lyrics: &str,
+    seed: u64,
+    frames: usize,
+    output: Option<&Path>,
+) -> Result<()> {
+    let _ = (cli, prompt, lyrics, seed, frames, output);
+    #[cfg(not(feature = "cuda"))]
+    bail!("music requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        ensure!(frames > 0, "music frames must be positive");
+        let lyrics = if lyrics == "-" {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            input
+        } else {
+            lyrics.to_owned()
+        };
+        let prompt_ids = flyingfish::music3::prompt_ids(&cli.model, prompt, &lyrics)?;
+        let spec = flyingfish::music3::SynSpec::read(&cli.model)?;
+        let runtime_dir = cli
+            .kernels
+            .runtime_dir
+            .clone()
+            .context("--runtime-dir is required for music")?;
+        let result = flyingfish::music3::generate(
+            &cli.model,
+            &flyingfish::music3::Music3Request {
+                prompt_ids,
+                frames,
+                seed,
+            },
+            &runtime_dir,
+        )?;
+        let mut bytes = Vec::new();
+        flyingfish::media::write_wav(&mut bytes, spec.output_rate as usize, 2, &result.pcm)?;
+        if let Some(output) = output {
+            ensure!(
+                output.extension().is_some_and(|value| value == "wav"),
+                "music output must end in .wav"
+            );
+            let output = output_path(output, &cli.model)?;
+            if let Err(error) = fs::write(&output, bytes) {
+                let _ = fs::remove_file(&output);
+                return Err(error.into());
+            }
+            println!("{}", output.display());
+        } else {
+            std::io::stdout().write_all(&bytes)?;
+        }
+        Ok(())
+    })
+}
+
 fn video(
     cli: &Cli,
     request: flyingfish::minimax_h3::MiniMaxH3I2vaRequest,
@@ -1299,6 +1372,13 @@ fn run() -> Result<()> {
             };
             video(&cli, request, output, *json)
         }
+        Command::Music {
+            prompt,
+            lyrics,
+            seed,
+            frames,
+            output,
+        } => music(&cli, prompt, lyrics, *seed, *frames, output.as_deref()),
         Command::Serve { port, mtp } => {
             let draft = cli
                 .draft_model
