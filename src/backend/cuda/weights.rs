@@ -1816,6 +1816,14 @@ pub(crate) fn device_slot_bytes(name: &str, entry: &TensorEntry) -> Result<usize
 #[cfg(feature = "cuda")]
 pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8]) -> Result<()> {
     match entry.quant {
+        None if entry.dtype == safetensors::Dtype::F32 => {
+            let (words, rest) = bytes.as_chunks::<4>();
+            ensure!(
+                rest.is_empty() && words.iter().all(|v| f32::from_le_bytes(*v).is_finite()),
+                "{name}: nonfinite or partial F32 source"
+            );
+        }
+
         Some(GgmlType::F16) => {
             let (words, rest) = bytes.as_chunks::<2>();
             ensure!(
@@ -1986,7 +1994,11 @@ impl DenseStreaming {
                             && entry.shape.len() == 2
                             && entry.role.ends_with(".qweight"));
                     ensure!(
-                        stored && entry.layer == Some(layer_index as u32),
+                        (stored && entry.layer == Some(layer_index as u32))
+                            || (entry.load
+                                && entry.layer.is_none()
+                                && entry.quant.is_none()
+                                && entry.dtype == safetensors::Dtype::F32),
                         "dense ordered tensor {name} is outside layer {layer_index}"
                     );
                     add(name, layer_index, entry)?;
@@ -4253,6 +4265,19 @@ mod tests {
                 "{quant:?} has no device path"
             );
         }
+        let mut native = entry(vec![2], 8, None);
+        native.dtype = safetensors::Dtype::F32;
+        let finite: Vec<_> = [0.15625001f32, -1.0000001]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert!(quant_source_finite("f32", &native, &finite).is_ok());
+        let invalid: Vec<_> = [1.0f32, f32::NAN]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert!(quant_source_finite("f32", &native, &invalid).is_err());
+        assert!(quant_source_finite("f32", &native, &finite[..7]).is_err());
         let nan = 0x7e00u16.to_le_bytes();
         let mut f16 = vec![0u8; 8];
         f16[2..4].copy_from_slice(&nan);

@@ -301,7 +301,10 @@ fn matrix<T: crate::backend::gpu::DeviceRepr + Copy>(
     )
 }
 
-fn vector(b: &CudaSlice<bf16>, s: &Arc<CudaStream>) -> Result<Tensor<bf16, 1>> {
+fn vector<T: crate::backend::gpu::DeviceRepr + Copy>(
+    b: &CudaSlice<T>,
+    s: &Arc<CudaStream>,
+) -> Result<Tensor<T, 1>> {
     view(b, s, 0, [u32::try_from(b.len())?], [1])
 }
 
@@ -5451,13 +5454,13 @@ mod tests {
         let s = &device.stream;
         device.finish_upload()?;
         let kernel =
-            cubin::module(&device.ctx, "vision_ops")?.load_function("planar_bf16_to_rgb_u8")?;
+            cubin::module(&device.ctx, "vision_ops")?.load_function("planar_f32_to_rgb_u8")?;
         let (mean, std) = (
             crate::minimax_h3::VAE_PIXEL_MEAN.map(|v| v as f32),
             crate::minimax_h3::VAE_PIXEL_STD.map(|v| v as f32),
         );
         let convert = |input, output, shape, affine| {
-            super::vae::planar_bf16_to_rgb_u8(&device, &kernel, input, output, shape, affine)
+            super::vae::planar_f32_to_rgb_u8(&device, &kernel, input, output, shape, affine)
         };
         let mut cells = 0;
         let mut defects = 0;
@@ -5472,22 +5475,20 @@ mod tests {
         ] {
             let plane = allocated * pixels;
             let count = 3 * frames * pixels;
-            let guard = bf16::from_f32(-23.0);
+            let guard = -23.0f32;
             let mut host = vec![guard; 3 * plane + 6];
             for c in 0..3 {
                 for i in 0..plane {
                     host[3 + c * plane + i] = if pixels == 65536 {
-                        bf16::from_bits(((i * 73 + c * 1009) % 65536) as u16)
+                        f32::from_bits((((i * 73 + c * 1009) % 65536) as u32) << 16)
                     } else {
-                        bf16::from_f32(
-                            ((i * 73 + i / pixels * 37 + c * 101) % 251) as f32 / 31.0 - 4.0,
-                        )
+                        ((i * 73 + i / pixels * 37 + c * 101) % 251) as f32 / 31.0 - 4.0
                     };
                 }
             }
             let input = s.clone_htod(&host)?;
             let output = s.clone_htod(&vec![0xa5u8; count + 14])?;
-            super::vae::planar_bf16_to_rgb_u8(
+            super::vae::planar_f32_to_rgb_u8(
                 &device,
                 &kernel,
                 &input.slice(3..3 + 3 * plane),
@@ -5511,8 +5512,7 @@ mod tests {
             let mut differences = 0usize;
             for (i, &actual) in observed[7..7 + count].iter().enumerate() {
                 let c = i % 3;
-                let v = (host[3 + c * plane + i / 3].to_f32() * std[c] + mean[c]).clamp(0.0, 1.0)
-                    * 255.0;
+                let v = (host[3 + c * plane + i / 3] * std[c] + mean[c]).clamp(0.0, 1.0) * 255.0;
                 let expected = v.round_ties_even() as u8;
                 differences += usize::from(actual != expected);
                 if pixels == 65536 {
@@ -5525,7 +5525,7 @@ mod tests {
                 "H3_RGB_IDENTITY frames={frames} allocated_frames={allocated} pixels={pixels} elements={count} byte_differences={differences} byte_limit=0 guards=true"
             );
         }
-        let input = s.alloc_zeros::<bf16>(9)?;
+        let input = s.alloc_zeros::<f32>(9)?;
         let output = s.alloc_zeros::<u8>(9)?;
         convert(&input, &output, (1, 1, 1), (mean, std))?;
         let zero = s.clone_dtoh(&output.slice(..3))?;
@@ -5551,7 +5551,7 @@ mod tests {
             );
         }
         ensure!(
-            super::vae::planar_bf16_to_rgb_u8(
+            super::vae::planar_f32_to_rgb_u8(
                 &device,
                 &kernel,
                 &input,
@@ -9262,149 +9262,33 @@ mod tests {
         Ok(())
     }
 
-    /// `[max_abs, rel_rms, cosine]` of BF16 decoder output `[channels, frames, plane]` against the F32 reference bytes of
-    /// the same layout, over the listed frames (all frames when `frames` is None), accumulated in f64.
     fn video_distance(
-        candidate: &[bf16],
+        candidate: &[f32],
         reference: &[u8],
         (channels, total, plane): (usize, usize, usize),
         frames: Option<&[usize]>,
     ) -> Result<[f64; 3]> {
         ensure!(
             candidate.len() == channels * total * plane && reference.len() == 4 * candidate.len(),
-            "video extents differ: {} vs {} B",
-            candidate.len(),
-            reference.len()
+            "video comparison extent"
         );
-        let all: Vec<usize> = (0..total).collect();
+        let all: Vec<_> = (0..total).collect();
         let mut got = Vec::new();
         let mut want = Vec::new();
         for c in 0..channels {
             for &f in frames.unwrap_or(&all) {
-                let base = (c * total + f) * plane;
-                for (x, r) in candidate[base..base + plane]
+                let start = (c * total + f) * plane;
+                for (&v, r) in candidate[start..start + plane]
                     .iter()
-                    .zip(reference[4 * base..4 * (base + plane)].as_chunks::<4>().0)
+                    .zip(reference[4 * start..4 * (start + plane)].as_chunks::<4>().0)
                 {
-                    got.push(f64::from(x.to_f32()));
+                    got.push(f64::from(v));
                     want.push(f64::from(f32::from_le_bytes(*r)));
                 }
             }
         }
         let measured = crate::verify::metrics("h3.video", &got, &want)?;
         Ok([measured.max_abs, measured.rel_rmse, measured.cosine])
-    }
-
-    #[test]
-    #[ignore = "GPU; FF_Q38_GPU_WINDOW, FF_MODEL, FF_H3_CAPTURE (frozen setup directory)"]
-    fn video_decoder_biased_rows_are_bitwise_invariant() -> Result<()> {
-        ensure!(
-            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
-            "GPU window missing"
-        );
-        let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
-        let capture =
-            PathBuf::from(std::env::var_os("FF_H3_CAPTURE").context("FF_H3_CAPTURE missing")?);
-        let frozen: serde_json::Value =
-            serde_json::from_slice(&fs::read(capture.join("freeze.json"))?)?;
-        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
-        let dir = model.join("vae");
-        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
-            .minimax_h3_vae_manifest(&spec)?;
-        let device = Device::new(0)?;
-        let ops = Ops::new(&device.ctx)?;
-        device.finish_upload()?;
-        let runtime =
-            std::env::temp_dir().join(format!("ff-h3-biased-rows-{}", std::process::id()));
-        fs::create_dir(&runtime)?;
-        let result = (|| -> Result<()> {
-            let mut blas = Blas::new(
-                &device,
-                &ops,
-                &runtime,
-                Rc::new(Closure::new(true, "VAE biased row gate".into())),
-            )?;
-            let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
-            decoder.biased_row_gate(&device, &mut blas, &frozen)
-        })();
-        let cleanup = fs::remove_dir_all(&runtime);
-        result?;
-        cleanup?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "GPU; FF_Q38_GPU_WINDOW, FF_MODEL, FF_H3_CAPTURE (frozen setup), FF_H3_S0"]
-    fn video_decoder_spatial_groups_are_bitwise_invariant() -> Result<()> {
-        ensure!(
-            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
-            "GPU window missing"
-        );
-        let path = |key| {
-            std::env::var_os(key)
-                .map(PathBuf::from)
-                .with_context(|| format!("{key} missing"))
-        };
-        let model = path("FF_MODEL")?;
-        let frozen: serde_json::Value =
-            serde_json::from_slice(&fs::read(path("FF_H3_CAPTURE")?.join("freeze.json"))?)?;
-        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
-        let mut inputs = Vec::new();
-        for cell in ["A", "P"] {
-            let map = mapped(&path("FF_H3_S0")?.join(format!("{cell}-bf16/decode.safetensors")))?;
-            let file = SafeTensors::deserialize(&map)?;
-            let input = file.tensor("video_decoder_input")?;
-            let shape = input.shape();
-            ensure!(
-                input.dtype() == Dtype::F32
-                    && shape.len() == 5
-                    && shape[0] == 1
-                    && shape[1] == spec.latent_channels,
-                "group latent layout"
-            );
-            let values = input
-                .data()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|x| f32::from_le_bytes(*x))
-                .collect::<Vec<_>>();
-            inputs.push((values, [shape[2], shape[3], shape[4]]));
-        }
-        let tiles = crate::minimax_h3::VaeTiles::released(
-            &spec,
-            inputs[0].1[1] * spec.spatial_ratio,
-            inputs[0].1[2] * spec.spatial_ratio,
-        )?;
-        let dir = model.join("vae");
-        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
-            .minimax_h3_vae_manifest(&spec)?;
-        let device = Device::new(0)?;
-        let ops = Ops::new(&device.ctx)?;
-        device.finish_upload()?;
-        let runtime = std::env::temp_dir().join(format!("ff-h3-group-gate-{}", std::process::id()));
-        fs::create_dir(&runtime)?;
-        let result = (|| -> Result<()> {
-            let mut blas = Blas::new(
-                &device,
-                &ops,
-                &runtime,
-                Rc::new(Closure::new(true, "VAE spatial group gate".into())),
-            )?;
-            let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
-            decoder.batch_identity_gate(
-                &device,
-                &mut blas,
-                &tiles,
-                inputs.into_iter(),
-                &frozen,
-                &runtime,
-            )
-        })();
-        let cleanup = fs::remove_dir_all(&runtime);
-        result?;
-        cleanup?;
-        Ok(())
     }
 
     #[test]
@@ -9442,11 +9326,11 @@ mod tests {
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 3, 28)?,
-            630_933_552
+            1_320_059_200
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 28, 28)?,
-            5_885_131_636
+            8_873_185_600
         );
         assert!(vae::TileWork::batch_bytes(&spec, shape, 0, 28).is_err());
         assert!(vae::TileWork::batch_bytes(&spec, shape, 29, 28).is_err());
@@ -9454,6 +9338,25 @@ mod tests {
             assert!(vae::TileWork::batch_bytes(&spec, shape, 1, 28).is_err());
         }
         assert!(vae::TileWork::batch_bytes(&spec, (usize::MAX, 16, 16), 1, 28).is_err());
+        let block = 268_574_720;
+        let fixed = 25_434_464;
+        let future = 9_293_928_100;
+        let total = 16_000_000_000;
+        let budget = crate::prefill::DensePlacement::device_budget(total, total, fixed, 0, future)?;
+        let plan = crate::prefill::DensePlacement::new(&[block; 36], None, budget, 10_000_000_000)?;
+        assert_eq!(plan.resident_bytes, 19 * block);
+        assert_eq!(plan.slot_bytes, block);
+        assert_eq!(plan.host_bytes, 17 * block);
+        assert_eq!(plan.disk_bytes, 0);
+        assert!(fixed + future + plan.resident_bytes + 2 * plan.slot_bytes + total / 16 <= total);
+        let streamed =
+            crate::prefill::DensePlacement::new(&[block; 36], None, 2 * block, 10_000_000_000)?;
+        assert_eq!(streamed.resident_bytes, 0);
+        assert_eq!(streamed.host_bytes, 36 * block);
+        assert!(
+            crate::prefill::DensePlacement::new(&[block; 36], None, 2 * block - 1, 10_000_000_000)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -9504,7 +9407,13 @@ mod tests {
                         &runtime,
                         Rc::new(Closure::new(true, "VAE setup gate".into())),
                     )?;
-                    let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
+                    let decoder = vae::VideoDecoder::new(
+                        &device,
+                        &spec,
+                        &dir,
+                        &manifest,
+                        (0, Placement::Derived),
+                    )?;
                     let tiles = crate::minimax_h3::VaeTiles::released(
                         &spec,
                         shape[3] * spec.spatial_ratio,
@@ -9537,184 +9446,6 @@ mod tests {
         println!(
             "H3_VAE_BATCH_SETUP_GATE PASS cell={cell} placement={placement} numerical_candidate_executed=false model_cells_scored=0"
         );
-        Ok(())
-    }
-
-    /// N7a gate: the native video VAE decoder on the Stage 0 captured decoder input of cells A and P against the CUDA
-    /// FP32 replay, whole video and the temporally cross-faded frames, under the frozen thresholds-n7n8.json bounds;
-    /// the engine's BF16 cast set equals the reference load's dtype dump; tiling off must fail.
-    #[test]
-    #[ignore = "requires FF_MODEL, FF_H3_S0, FF_H3_N7_THRESHOLDS, FF_H3_VAE_DTYPES and the GPU"]
-    fn video_decoder_matches_the_fp32_replay() -> Result<()> {
-        use super::vae::{LatentVideo, VideoDecoder, bf16_parameter};
-        let var = |key: &str| -> Result<PathBuf> {
-            Ok(PathBuf::from(
-                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
-            ))
-        };
-        let (model, s0) = (var("FF_MODEL")?, var("FF_H3_S0")?);
-        let frozen: serde_json::Value =
-            serde_json::from_slice(&fs::read(var("FF_H3_N7_THRESHOLDS")?)?)?;
-        let dtypes: serde_json::Value =
-            serde_json::from_slice(&fs::read(var("FF_H3_VAE_DTYPES")?)?)?;
-        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
-        let vae_dir = model.join("vae");
-        let checkpoint = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?;
-        let manifest = checkpoint.minimax_h3_vae_manifest(&spec)?;
-        let dumped = dtypes["vae"]["parameters"]
-            .as_object()
-            .context("dtype dump lacks vae parameters")?;
-        ensure!(
-            dumped.len() == manifest.entries.len(),
-            "dtype dump lists {} parameters, the manifest {}",
-            dumped.len(),
-            manifest.entries.len()
-        );
-        for name in manifest.entries.keys() {
-            let reference = dumped
-                .get(name)
-                .and_then(|v| v.as_str())
-                .with_context(|| format!("dtype dump lacks {name}"))?;
-            ensure!(
-                bf16_parameter(name) == (reference == "torch.bfloat16"),
-                "{name}: engine BF16 {} vs reference {reference}",
-                bf16_parameter(name)
-            );
-        }
-        println!("H3_VAE_DTYPE_MAP PASS parameters={}", dumped.len());
-        let device = Device::new(0)?;
-        let s = &device.stream;
-        let ops = Ops::new(&device.ctx)?;
-        let runtime = std::env::temp_dir().join(format!("ff-h3-vae-{}", std::process::id()));
-        fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
-            &device,
-            &ops,
-            &runtime,
-            Rc::new(Closure::new(true, "MiniMax-H3 video decoder gate".into())),
-        )?;
-        let decoder = VideoDecoder::new(&device, &spec, &vae_dir, &manifest)?;
-        let clip = spec.chunk_latents() + spec.overlap_latents();
-        let r = spec.spatial_ratio;
-        let decode = |blas: &mut Blas,
-                      cell: &str,
-                      tiles: &crate::minimax_h3::VaeTiles|
-         -> Result<(Vec<bf16>, usize, usize)> {
-            let map = mapped(&s0.join(format!("{cell}-bf16")).join("decode.safetensors"))?;
-            let file = SafeTensors::deserialize(&map)?;
-            let input = file.tensor("video_decoder_input")?;
-            ensure!(
-                input.dtype() == Dtype::F32,
-                "decoder input dtype {:?}",
-                input.dtype()
-            );
-            let shape = input.shape().to_vec();
-            ensure!(
-                shape.len() == 5 && shape[0] == 1 && shape[1] == spec.latent_channels,
-                "decoder input shape {shape:?}"
-            );
-            let (frames, height, width) = (shape[2], shape[3], shape[4]);
-            let mut work = decoder.work(&device, blas, tiles, (frames, height, width))?;
-            let z = s.clone_htod(
-                &input
-                    .data()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|v| f32::from_le_bytes(*v))
-                    .collect::<Vec<_>>(),
-            )?;
-            let plan = crate::minimax_h3::DecodePlan::new(&spec, frames)?;
-            let (lead, pre) = (
-                spec.chunk_latents() * spec.temporal_ratio,
-                spec.frame_pre_padding(),
-            );
-            let total = plan.chunks * (lead - pre) + clip * spec.temporal_ratio - lead - pre;
-            let mut out =
-                s.alloc_zeros::<bf16>(spec.out_channels * total * height * r * width * r)?;
-            decoder.decode(
-                s,
-                blas,
-                &mut work,
-                tiles,
-                LatentVideo {
-                    data: &z,
-                    frames,
-                    height,
-                    width,
-                },
-                &mut out,
-            )?;
-            s.synchronize()?;
-            Ok((s.clone_dtoh(&out)?, total, height * r * width * r))
-        };
-        let mut defects = Vec::new();
-        let mut tiling_off = None;
-        for cell in ["A", "P"] {
-            let reference_map = mapped(
-                &s0.join(format!("{cell}-fp32-replay"))
-                    .join("replay.safetensors"),
-            )?;
-            let reference_file = SafeTensors::deserialize(&reference_map)?;
-            let reference = reference_file.tensor("decode.video_decoder_output")?;
-            ensure!(
-                reference.dtype() == Dtype::F32,
-                "reference dtype {:?}",
-                reference.dtype()
-            );
-            let tiles = crate::minimax_h3::VaeTiles::released(
-                &spec,
-                reference.shape()[3],
-                reference.shape()[4],
-            )?;
-            let (video, frames, plane) = decode(&mut blas, cell, &tiles)?;
-            ensure!(
-                frames == reference.shape()[2],
-                "decoded {frames} frames, reference {}",
-                reference.shape()[2]
-            );
-            let extents = (spec.out_channels, frames, plane);
-            let whole = video_distance(&video, reference.data(), extents, None)?;
-            let key = format!("{cell}.decode.video_decoder_output");
-            let ok = within(whole, &frozen["cells"][&key])?;
-            println!("H3_VAE cell={cell} video={whole:?} within={ok}");
-            if !ok {
-                defects.push(key.clone());
-            }
-            let fade_key = format!("{key}.crossfade_frames");
-            let fade: Vec<usize> = frozen["cells"][&fade_key]["frames"]
-                .as_array()
-                .context("crossfade frame list missing")?
-                .iter()
-                .map(|v| v.as_u64().map(|v| v as usize).context("crossfade frame"))
-                .collect::<Result<_>>()?;
-            let faded = video_distance(&video, reference.data(), extents, Some(&fade))?;
-            let ok = within(faded, &frozen["cells"][&fade_key])?;
-            println!(
-                "H3_VAE cell={cell} crossfade_frames={faded:?} frames={} within={ok}",
-                fade.len()
-            );
-            if !ok {
-                defects.push(fade_key);
-            }
-            if cell == "A" {
-                let whole_frame =
-                    crate::minimax_h3::VaeTiles::whole(reference.shape()[3], reference.shape()[4]);
-                let (untiled, _, _) = decode(&mut blas, cell, &whole_frame)?;
-                let d = video_distance(&untiled, reference.data(), extents, None)?;
-                let failed = !within(d, &frozen["cells"][&key])?;
-                println!("H3_VAE tiling-off control cell=A video={d:?} fails={failed}");
-                tiling_off = Some(failed);
-            }
-        }
-        ensure!(
-            tiling_off == Some(true),
-            "tiling-off control passed the A bound"
-        );
-        if !defects.is_empty() {
-            bail!("H3_VAE_DECODE_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
-        }
-        println!("H3_VAE_DECODE_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
         Ok(())
     }
 
@@ -10051,7 +9782,7 @@ mod tests {
                 generated.audio_latents.0.clone(),
                 &generated.audio_latents.1,
             )?;
-            t.bf16(
+            t.f32(
                 "video_decoded".into(),
                 generated.video_decoded.0.clone(),
                 &generated.video_decoded.1,
@@ -10390,7 +10121,7 @@ mod tests {
             let video = native.tensor("video_decoded")?;
             let want = reference.tensor("video_decoder_output")?;
             ensure!(
-                video.dtype() == Dtype::BF16
+                video.dtype() == Dtype::F32
                     && want.dtype() == Dtype::F32
                     && video.shape() == want.shape(),
                 "splice video {:?} {:?} vs {:?} {:?}",
@@ -10401,12 +10132,12 @@ mod tests {
             );
             let shape = video.shape().to_vec();
             let extents = (shape[1], shape[2], shape[3] * shape[4]);
-            let candidate: Vec<bf16> = video
+            let candidate: Vec<f32> = video
                 .data()
-                .as_chunks::<2>()
+                .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|b| bf16::from_le_bytes(*b))
+                .map(|b| f32::from_le_bytes(*b))
                 .collect();
             let key = format!("{cell}.decode.video_decoder_output");
             let whole = video_distance(&candidate, want.data(), extents, None)?;

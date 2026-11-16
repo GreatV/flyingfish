@@ -2,9 +2,7 @@
 //! decoders after the transformer and conditioner are released. Stages run in that order and each stage's weights are
 //! dropped before the next stage's placement is derived from the then-free device memory.
 use super::audio::AudioDecoder;
-use super::vae::{
-    EncodeWork, KeyframeEncoder, LatentVideo, TileWork, VideoDecoder, bf16_parameter, decode_bytes,
-};
+use super::vae::{EncodeWork, KeyframeEncoder, LatentVideo, TileWork, VideoDecoder, decode_bytes};
 use super::{
     AdalnTable, BlockContext, BlockKernels, Conditioner, ConditionerInput, ConditionerPrompt, Dit,
     Placement, Source, conditioner_embeds, conditioner_rope, embedding_rows, image_runs,
@@ -33,7 +31,7 @@ pub(crate) struct Generated {
     #[cfg(test)]
     pub audio_latents: (Vec<usize>, Vec<f32>),
     #[cfg(test)]
-    pub video_decoded: (Vec<usize>, Vec<bf16>),
+    pub video_decoded: (Vec<usize>, Vec<f32>),
 }
 
 enum NoiseDraws {
@@ -242,13 +240,7 @@ fn decoder_bytes(video: &TensorManifest, audio: &TensorManifest) -> usize {
         .filter(|(name, e)| {
             e.load && !name.starts_with("encoder.") && !name.starts_with("quant_conv.")
         })
-        .map(|(name, e)| {
-            if bf16_parameter(name) {
-                e.bytes / 2
-            } else {
-                e.bytes
-            }
-        })
+        .map(|(_, e)| e.bytes)
         .sum();
     video_bytes
         + audio
@@ -565,27 +557,27 @@ fn run_mode<const SETUP_ONLY: bool>(
         (&geometry, &layout),
         (&video, &audio),
     )?;
-    let generated = decode::<SETUP_ONLY>(
+    let generated = decode::<SETUP_ONLY, false>(
         &device,
         &mut blas,
         model,
         request,
         (&geometry, &vae, &audio_spec),
         (video_latents, audio_latents),
-        free_before,
+        (free_before, super::Placement::Derived),
     )?;
 
     Ok(generated)
 }
 
-fn decode<const SETUP_ONLY: bool>(
+fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
     device: &Device,
     blas: &mut Blas,
     model: &Path,
     request: &H3Request,
     (geometry, vae, audio_spec): (&Geometry, &VaeSpec, &AudioVaeSpec),
     (video_latents, audio_latents): (Vec<f32>, Vec<f32>),
-    free_before: usize,
+    (free_before, placement): (usize, super::Placement),
 ) -> Result<Generated> {
     let s = &device.stream;
     let r = vae.spatial_ratio;
@@ -615,7 +607,7 @@ fn decode<const SETUP_ONLY: bool>(
     let weights = decoder_bytes(&vae_manifest, &audio_manifest);
     let work_bytes = TileWork::bytes(vae, tile)
         + decode_bytes(vae, &tiles, (request.height, request.width))
-        + 2 * vae.out_channels * total_frames * pixels
+        + 4 * vae.out_channels * total_frames * pixels
         + 4 * (video_latents.len() + audio_latents.len())
         + AudioDecoder::work_bytes(audio_spec, (2, latents))?;
     let planned = weights + work_bytes;
@@ -629,18 +621,27 @@ fn decode<const SETUP_ONLY: bool>(
                 "planned_bytes": planned, "total_bytes": total, "placement": "resident"}})
         );
     }
-    ensure!(
-        planned < free_after,
-        "decoders {weights} B plus decode work {work_bytes} B do not fit the {free_after} B free after releasing the transformer and conditioner"
-    );
-    let decoder = VideoDecoder::new(device, vae, &vae_dir, &vae_manifest)?;
+    let decoder_weights: usize = vae_manifest
+        .entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("decoder.") || n.starts_with("post_quant_conv."))
+        .map(|(_, e)| e.bytes)
+        .sum();
+    let future =
+        work_bytes + weights - decoder_weights + 3 * decode_plan.frames * pixels + (1 << 30);
+    let decoder = VideoDecoder::new(device, vae, &vae_dir, &vae_manifest, (future, placement))?;
     #[cfg(test)]
     if SETUP_ONLY {
         decoder.batch_setup(device, blas, &tiles, (latent_frames, lh, lw))?;
         anyhow::bail!("H3_VAE_SETUP_COMPLETE");
     }
     let mut work = decoder.work(device, blas, &tiles, (latent_frames, lh, lw))?;
-    let mut decoded = s.alloc_zeros::<bf16>(vae.out_channels * total_frames * pixels)?;
+    #[cfg(test)]
+    if SERIAL {
+        drop(work);
+        work = TileWork::new(s, vae, tile, (1, tiles.count()))?;
+    }
+    let mut decoded = s.alloc_zeros::<f32>(vae.out_channels * total_frames * pixels)?;
     let latents_device = s.clone_htod(&video_latents)?;
     let decode_plan = decoder.decode(
         s,
