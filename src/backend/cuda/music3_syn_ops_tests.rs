@@ -941,6 +941,51 @@ mod e2e {
         Ok(())
     }
 
+    /// Generated stereo output is compared with the raw planar channels after PCM16 quantization.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_CHANNEL_OUTPUT"]
+    fn music3_interleaved_wav_gpu() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let model =
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL").context("model dir")?);
+        let input = load_inputs()?;
+        let out_dir = std::path::PathBuf::from(
+            std::env::var_os("FF_MUSIC3_CHANNEL_OUTPUT").context("channel output missing")?,
+        );
+        std::fs::create_dir(&out_dir)?;
+        let scratch = std::env::temp_dir().join(format!("ff-m3channels-{}", std::process::id()));
+        std::fs::create_dir(&scratch)?;
+        let (_codes, _latent, _features, output) = generate_inner(
+            &model,
+            &input.request,
+            &scratch,
+            Some(&input.codes),
+            Some(&input.initial),
+            None,
+        )?;
+        std::fs::remove_dir_all(&scratch)?;
+        let spec = crate::music3::SynSpec::read(&model)?;
+        let pcm = output.interleaved()?;
+        crate::media::write_wav(
+            std::fs::File::create(out_dir.join("stereo.wav"))?,
+            spec.output_rate as usize,
+            2,
+            &pcm,
+        )?;
+        let planar: Vec<u8> = output
+            .pcm
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        std::fs::write(out_dir.join("planar.f32"), planar)?;
+        println!(
+            "MUSIC3_CHANNEL_WAV path={} frames={}",
+            out_dir.join("stereo.wav").display(),
+            output.pcm.len() / 2
+        );
+        Ok(())
+    }
+
     fn statistical_median(values: &[f32], mean: bool) -> f32 {
         if values.is_empty() {
             return 0.0;
