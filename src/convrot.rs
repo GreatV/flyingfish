@@ -5,6 +5,7 @@
 //! back to bf16, `s_x = max(|xR|, 1e-12) / 127`, and `q` is ties-to-even of `xR / s_x`.
 //! At [`TENSOR_CORE_ROWS`] and above, the device kernel's dot is `mma.m16n8k16` (bf16 in, f32
 //! accumulator, K in groups of 16) and `q` is ties-to-even of `xR * (1/s_x)`.
+//! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 61440 bytes dynamic smem.
 //! [`linear`] is the below-[`TENSOR_CORE_ROWS`] form.
 #[cfg(feature = "cuda")]
 use anyhow::Context;
@@ -82,6 +83,24 @@ fn rotate_quant(x: &[f32], k: usize, group: usize) -> Result<(Vec<i8>, Vec<f32>)
     Ok((codes, scales))
 }
 
+fn write_product_row(
+    xq: &[i8],
+    qweight: &[i8],
+    k: usize,
+    sx: f32,
+    wscale: &[f32],
+    dst: &mut [bf16],
+) {
+    for (col, dst) in dst.iter_mut().enumerate() {
+        let weight = &qweight[col * k..(col + 1) * k];
+        let mut acc = 0i32;
+        for (a, b) in xq.iter().zip(weight) {
+            acc += i32::from(*a) * i32::from(*b);
+        }
+        *dst = bf16::from_f32(acc as f32 * sx * wscale[col]);
+    }
+}
+
 fn int8_product(
     codes: &[i8],
     scales: &[f32],
@@ -96,18 +115,16 @@ fn int8_product(
         "convrot product shape"
     );
     ensure!(wscale.iter().all(|v| v.is_finite()), "convrot wscale");
-    let mut y = Vec::with_capacity(rows * n);
+    let mut y = vec![bf16::ZERO; rows * n];
     for row in 0..rows {
-        let xq = &codes[row * k..(row + 1) * k];
-        let sx = scales[row];
-        for col in 0..n {
-            let mut acc = 0i32;
-            let weight = &qweight[col * k..(col + 1) * k];
-            for i in 0..k {
-                acc += i32::from(xq[i]) * i32::from(weight[i]);
-            }
-            y.push(bf16::from_f32(acc as f32 * sx * wscale[col]));
-        }
+        write_product_row(
+            &codes[row * k..(row + 1) * k],
+            qweight,
+            k,
+            scales[row],
+            wscale,
+            &mut y[row * n..(row + 1) * n],
+        );
     }
     Ok(y)
 }
@@ -282,13 +299,27 @@ pub struct ConvrotArgs {
 }
 
 #[cfg(feature = "cuda")]
+const PRODUCT_THREADS: u32 = 512;
+#[cfg(feature = "cuda")]
+const PRODUCT_BM: u32 = 128;
+#[cfg(feature = "cuda")]
+const PRODUCT_BN: u32 = 256;
+#[cfg(feature = "cuda")]
+const PRODUCT_SMEM: u32 = 61_440;
+
+#[cfg(feature = "cuda")]
 pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
     let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
+    let product = module.load_function("convrot_product")?;
+    product.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        i32::try_from(PRODUCT_SMEM)?,
+    )?;
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
         group_dot: module.load_function("convrot_group_dot")?,
         quantize: module.load_function("convrot_quantize")?,
-        product: module.load_function("convrot_product")?,
+        product,
     })
 }
 
@@ -309,7 +340,7 @@ pub fn launch_device(
     if args.rows < i32::try_from(TENSOR_CORE_ROWS)? {
         launch_rows(stream, &fns.linear, args, total)
     } else {
-        launch_groups(stream, fns, args, total)
+        launch_groups(stream, fns, args)
     }
 }
 
@@ -343,11 +374,43 @@ fn launch_rows(
 }
 
 #[cfg(feature = "cuda")]
+fn launch_product(
+    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    fns: &ConvrotFns,
+    args: &ConvrotArgs,
+) -> Result<()> {
+    use crate::backend::gpu::{LaunchConfig, PushKernelArg};
+    ensure!(
+        args.rows > 0 && args.n > 0 && args.k > 0 && args.k % 64 == 0,
+        "convrot product shape"
+    );
+    let rows = args.rows as u32;
+    let n = args.n as u32;
+    unsafe {
+        stream
+            .launch_builder(&fns.product)
+            .arg(&args.codes)
+            .arg(&args.scales)
+            .arg(&args.qweight)
+            .arg(&args.wscale)
+            .arg(&args.y)
+            .arg(&args.rows)
+            .arg(&args.k)
+            .arg(&args.n)
+            .launch(LaunchConfig {
+                grid_dim: (n.div_ceil(PRODUCT_BN), rows.div_ceil(PRODUCT_BM), 1),
+                block_dim: (PRODUCT_THREADS, 1, 1),
+                shared_mem_bytes: PRODUCT_SMEM,
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn launch_groups(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
     args: &ConvrotArgs,
-    total: i32,
 ) -> Result<()> {
     use crate::backend::gpu::{LaunchConfig, PushKernelArg};
     ensure!(
@@ -386,25 +449,7 @@ fn launch_groups(
                 shared_mem_bytes: 0,
             })?;
     }
-    let threads = 128u32;
-    unsafe {
-        stream
-            .launch_builder(&fns.product)
-            .arg(&args.codes)
-            .arg(&args.scales)
-            .arg(&args.qweight)
-            .arg(&args.wscale)
-            .arg(&args.y)
-            .arg(&args.rows)
-            .arg(&args.k)
-            .arg(&args.n)
-            .launch(LaunchConfig {
-                grid_dim: ((total as u32).div_ceil(threads), 1, 1),
-                block_dim: (threads, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
-    }
-    Ok(())
+    launch_product(stream, fns, args)
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -662,6 +707,230 @@ mod device {
                 ) > 0,
             "omitting the rotation reproduced the definition bits"
         );
+        Ok(())
+    }
+
+    fn pattern_i8(a: usize, b: usize, p: usize, q: usize) -> i8 {
+        (((a * p + b * q) % 251) as i32 - 125) as i8
+    }
+
+    fn fixture(rows: usize, k: usize, n: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<f32>) {
+        let mut codes = vec![0i8; rows * k];
+        for row in 0..rows {
+            for i in 0..k {
+                codes[row * k + i] = pattern_i8(row, i, 17, 3);
+            }
+        }
+        let mut qweight = vec![0i8; n * k];
+        for col in 0..n {
+            for i in 0..k {
+                qweight[col * k + i] = pattern_i8(col, i, 23, 13);
+            }
+        }
+        let scales = (0..rows)
+            .map(|row| ((row * 5) % 7 + 1) as f32 * 1.0e-3)
+            .collect();
+        let wscale = (0..n).map(|col| (col % 5 + 1) as f32 * 1.0e-2).collect();
+        (codes, scales, qweight, wscale)
+    }
+
+    fn bit_diff(got: &[bf16], expected: &[bf16]) -> usize {
+        got.iter()
+            .zip(expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
+            + got.len().abs_diff(expected.len())
+    }
+
+    fn host_product(
+        codes: &[i8],
+        scales: &[f32],
+        k: usize,
+        qweight: &[i8],
+        n: usize,
+        wscale: &[f32],
+    ) -> Result<Vec<bf16>> {
+        let rows = scales.len();
+        ensure!(
+            codes.len() == rows * k && qweight.len() == n * k && wscale.len() == n && n > 0,
+            "convrot product shape"
+        );
+        let mut y = vec![bf16::ZERO; rows * n];
+        let threads = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(rows);
+        let rows_per = rows.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut row0 = 0usize;
+            for part in y.chunks_mut(rows_per * n) {
+                let rows_here = part.len() / n;
+                let start = row0;
+                row0 += rows_here;
+                scope.spawn(move || {
+                    for r in 0..rows_here {
+                        let row = start + r;
+                        super::write_product_row(
+                            &codes[row * k..(row + 1) * k],
+                            qweight,
+                            k,
+                            scales[row],
+                            wscale,
+                            &mut part[r * n..(r + 1) * n],
+                        );
+                    }
+                });
+            }
+        });
+        Ok(y)
+    }
+
+    fn launch_product_at(
+        device: &Device,
+        codes: &[i8],
+        scales: &[f32],
+        qweight: &[i8],
+        wscale: &[f32],
+        k: usize,
+        weight_off: u64,
+    ) -> Result<Vec<bf16>> {
+        let n = wscale.len();
+        let rows = scales.len();
+        ensure!(
+            rows > 0
+                && k > 0
+                && n > 0
+                && codes.len() == rows * k
+                && qweight.len() == n * k + weight_off as usize,
+            "convrot product shape"
+        );
+        let off = usize::try_from(weight_off)?;
+        let stream = &device.stream;
+        let codes_d = stream.clone_htod(codes)?;
+        let scales_d = stream.clone_htod(scales)?;
+        let weight_d = stream.clone_htod(&qweight[off..off + n * k])?;
+        let wscale_d = stream.clone_htod(wscale)?;
+        let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
+        let fns = load_convrot(&device.ctx)?;
+        super::launch_product(
+            stream,
+            &fns,
+            &ConvrotArgs {
+                x: 0,
+                qweight: weight_d.device_ptr(stream).0,
+                wscale: wscale_d.device_ptr(stream).0,
+                y: y_d.device_ptr(stream).0,
+                rotated: 0,
+                codes: codes_d.device_ptr(stream).0,
+                scales: scales_d.device_ptr(stream).0,
+                rows: i32::try_from(rows)?,
+                k: i32::try_from(k)?,
+                n: i32::try_from(n)?,
+                group: 256,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(stream.clone_dtoh(&y_d)?)
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn convrot_product_matches_host_int8() -> Result<()> {
+        let device = Device::new(0)?;
+        for rows in [17usize, 20, 42] {
+            for n in [2usize, 40] {
+                let k = 256usize;
+                let (codes, scales, qweight, wscale) = fixture(rows, k, n);
+                let host = host_product(&codes, &scales, k, &qweight, n, &wscale)?;
+                let serial = super::int8_product(&codes, &scales, k, &qweight, n, &wscale)?;
+                let host_diff = bit_diff(&host, &serial);
+                ensure!(
+                    host_diff == 0,
+                    "host product rows={rows} n={n} differ {host_diff}"
+                );
+                let got = launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, 0)?;
+                let differ = bit_diff(&got, &host);
+                println!("CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ}");
+                ensure!(
+                    differ == 0,
+                    "convrot product rows={rows} n={n} differ {differ}"
+                );
+            }
+        }
+        let rows = 41_770usize;
+        let k = 14_336usize;
+        let n = 40usize;
+        let (codes, scales, qweight, wscale) = fixture(rows, k, n);
+        let host = host_product(&codes, &scales, k, &qweight, n, &wscale)?;
+        let got = launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, 0)?;
+        let differ = bit_diff(&got, &host);
+        println!(
+            "CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ} macs={}",
+            rows * k * n
+        );
+        ensure!(differ == 0, "convrot product production differ {differ}");
+        let mut extended = qweight;
+        extended.push(0x5a);
+        let shifted = launch_product_at(&device, &codes, &scales, &extended, &wscale, k, 1)?;
+        let moved = bit_diff(&shifted, &host);
+        println!("CONVROT_PRODUCT_K_OFFSET differ={moved}");
+        ensure!(
+            moved > 0,
+            "one-int8 K offset matched the unshifted host product"
+        );
+        Ok(())
+    }
+
+    fn cuobjdump_bin() -> std::path::PathBuf {
+        if let Some(home) = std::env::var_os("CUDA_HOME") {
+            let candidate = std::path::Path::new(&home).join("bin/cuobjdump");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        std::path::PathBuf::from("cuobjdump")
+    }
+
+    fn function_sass<'a>(dump: &'a str, name: &str) -> Option<&'a str> {
+        let marker = format!("Function : {name}");
+        let start = dump.find(&marker)? + marker.len();
+        let rest = &dump[start..];
+        let end = rest.find("Function :").unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    #[test]
+    fn convrot_product_sass_is_imma16832() -> Result<()> {
+        let sms = crate::backend::cuda::cubin::arches();
+        ensure!(!sms.is_empty(), "convrot cubin missing");
+        for &sm in sms {
+            let bytes = crate::backend::cuda::cubin::bytes("convrot", sm)
+                .with_context(|| format!("convrot cubin sm_{sm}"))?;
+            let path = std::env::temp_dir()
+                .join(format!("convrot-product-{}-{sm}.cubin", std::process::id()));
+            std::fs::write(&path, bytes).context("convrot cubin")?;
+            let output = std::process::Command::new(cuobjdump_bin())
+                .arg("-sass")
+                .arg(&path)
+                .output()
+                .context("cuobjdump")?;
+            let _ = std::fs::remove_file(&path);
+            let text = String::from_utf8_lossy(&output.stdout);
+            let err = String::from_utf8_lossy(&output.stderr);
+            ensure!(
+                output.status.success(),
+                "cuobjdump sm_{sm} status {} {err}",
+                output.status
+            );
+            let body = function_sass(&text, "convrot_product")
+                .context("convrot_product missing from cuobjdump")?;
+            ensure!(
+                body.contains("IMMA.16832.S8.S8"),
+                "sm_{sm} convrot_product lacks IMMA.16832.S8.S8"
+            );
+            println!("CONVROT_PRODUCT_SASS sm_{sm} IMMA.16832.S8.S8");
+        }
         Ok(())
     }
 }

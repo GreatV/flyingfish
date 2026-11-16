@@ -155,18 +155,173 @@ extern "C" __global__ void convrot_quantize(const float* __restrict__ xr, int8_t
     }
 }
 
-extern "C" __global__ void convrot_product(const int8_t* __restrict__ codes, const float* __restrict__ scales,
+// m16n8k32.row.col.s32.s8.s8. BM 128, BN 256, BK 64, stride 80, 2 stages, 512 threads.
+// Dynamic smem 61440. grid (ceil(n/256), ceil(rows/128)).
+constexpr int CONVROT_BM = 128;
+constexpr int CONVROT_BN = 256;
+constexpr int CONVROT_BK = 64;
+constexpr int CONVROT_STRIDE = 80;
+constexpr int CONVROT_STAGE = (CONVROT_BM + CONVROT_BN) * CONVROT_STRIDE;
+static_assert(CONVROT_STAGE * 2 == 61440, "convrot product smem");
+
+__device__ __forceinline__ void convrot_cp16(void* dst, const void* src, int sz) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(convrot_smem(dst)), "l"(src), "r"(sz));
+}
+
+__device__ __forceinline__ void convrot_cp_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <int PENDING>
+__device__ __forceinline__ void convrot_cp_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(PENDING) : "memory");
+}
+
+__device__ __forceinline__ unsigned convrot_lds(const int8_t* p) {
+    unsigned v;
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(v) : "r"(convrot_smem(p)));
+    return v;
+}
+
+__device__ __forceinline__ void convrot_mma_s8(int& d0, int& d1, int& d2, int& d3, unsigned a0, unsigned a1,
+                                               unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// One 16-byte cp.async per A row segment and two per B row. srcSize 0 zero-fills an OOB row.
+__device__ __forceinline__ void convrot_stage(int8_t* smem, const int8_t* __restrict__ codes,
+                                              const int8_t* __restrict__ qweight, int rows, int k, int n, int m0,
+                                              int n0, int k0, int stage) {
+    int8_t* a = smem + stage * CONVROT_STAGE;
+    int8_t* b = a + CONVROT_BM * CONVROT_STRIDE;
+    const int t = static_cast<int>(threadIdx.x);
+    const int ar = t >> 2;
+    const int aseg = t & 3;
+    const int gr = m0 + ar;
+    const int8_t* asrc = codes;
+    int asz = 0;
+    if (gr < rows) {
+        asrc = codes + (static_cast<long long>(gr) * k + k0 + aseg * 16);
+        asz = 16;
+    }
+    convrot_cp16(a + ar * CONVROT_STRIDE + aseg * 16, asrc, asz);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int linear = t + i * 512;
+        const int bc = linear >> 2;
+        const int bseg = linear & 3;
+        const int gc = n0 + bc;
+        const int8_t* bsrc = qweight;
+        int bsz = 0;
+        if (gc < n) {
+            bsrc = qweight + (static_cast<long long>(gc) * k + k0 + bseg * 16);
+            bsz = 16;
+        }
+        convrot_cp16(b + bc * CONVROT_STRIDE + bseg * 16, bsrc, bsz);
+    }
+}
+
+// Lane groupID = lane>>2, thread = lane&3. A u32 at (group, thread*4), (group+8, thread*4),
+// (group, thread*4+16), (group+8, thread*4+16). B u32 at column group, K thread*4 and +16.
+__device__ __forceinline__ void convrot_mma_tile(const int8_t* stage, int (&acc)[2][8][4], int warp_m, int warp_n,
+                                                 int group, int t4) {
+    const int8_t* a = stage;
+    const int8_t* b = stage + CONVROT_BM * CONVROT_STRIDE;
+    const int row_base = warp_m * 32;
+    const int col_base = warp_n * 64;
+#pragma unroll
+    for (int ki = 0; ki < 2; ++ki) {
+        const int kbase = ki * 32 + t4;
+        unsigned af[2][4];
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            const int r = row_base + mi * 16 + group;
+            af[mi][0] = convrot_lds(a + (r * CONVROT_STRIDE + kbase));
+            af[mi][1] = convrot_lds(a + ((r + 8) * CONVROT_STRIDE + kbase));
+            af[mi][2] = convrot_lds(a + (r * CONVROT_STRIDE + kbase + 16));
+            af[mi][3] = convrot_lds(a + ((r + 8) * CONVROT_STRIDE + kbase + 16));
+        }
+        unsigned bf[8][2];
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+            const int c = col_base + ni * 8 + group;
+            bf[ni][0] = convrot_lds(b + (c * CONVROT_STRIDE + kbase));
+            bf[ni][1] = convrot_lds(b + (c * CONVROT_STRIDE + kbase + 16));
+        }
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+            for (int ni = 0; ni < 8; ++ni) {
+                convrot_mma_s8(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3], af[mi][0],
+                               af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void convrot_store_one(__nv_bfloat16* __restrict__ y, const float* __restrict__ scales,
+                                                  const float* __restrict__ wscale, int rows, int n, int r, int c,
+                                                  int acc) {
+    if (r < rows && c < n) {
+        const float v = __fmul_rn(__fmul_rn(static_cast<float>(acc), scales[r]), wscale[c]);
+        y[static_cast<long long>(r) * n + c] = __float2bfloat16(v);
+    }
+}
+
+// ptxas sm_89: 124 registers, 0 spills.
+extern "C" __global__ void __maxnreg__(124) convrot_product(const int8_t* __restrict__ codes, const float* __restrict__ scales,
                                            const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
                                            __nv_bfloat16* __restrict__ y, int rows, int k, int n) {
-    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (idx >= rows * n) return;
-    const int row = idx / n;
-    const int col = idx - row * n;
-    const int8_t* xq = codes + static_cast<long long>(row) * k;
-    const int8_t* weight = qweight + static_cast<long long>(col) * k;
-    int acc = 0;
-    for (int i = 0; i < k; ++i) acc += static_cast<int>(xq[i]) * static_cast<int>(weight[i]);
-    const float scale = scales[row];
-    y[static_cast<long long>(row) * n + col] =
-        __float2bfloat16(__fmul_rn(__fmul_rn(static_cast<float>(acc), scale), wscale[col]));
+    if (rows <= 0 || n <= 0 || k <= 0 || (k & (CONVROT_BK - 1))) __trap();
+    extern __shared__ __align__(16) int8_t smem[];
+    const int m0 = static_cast<int>(blockIdx.y) * CONVROT_BM;
+    const int n0 = static_cast<int>(blockIdx.x) * CONVROT_BN;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int warp_m = warp >> 2;
+    const int warp_n = warp & 3;
+    const int group = lane >> 2;
+    const int t4 = (lane & 3) << 2;
+    const int t2 = (lane & 3) << 1;
+    int acc[2][8][4];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[mi][ni][e] = 0;
+        }
+    }
+    const int tiles = k >> 6;
+    int stage = 0;
+    convrot_stage(smem, codes, qweight, rows, k, n, m0, n0, 0, 0);
+    convrot_cp_commit();
+    for (int kt = 0; kt < tiles; ++kt) {
+        if (kt + 1 < tiles) {
+            convrot_stage(smem, codes, qweight, rows, k, n, m0, n0, (kt + 1) * CONVROT_BK, stage ^ 1);
+            convrot_cp_commit();
+            convrot_cp_wait<1>();
+        } else {
+            convrot_cp_wait<0>();
+        }
+        __syncthreads();
+        convrot_mma_tile(smem + stage * CONVROT_STAGE, acc, warp_m, warp_n, group, t4);
+        __syncthreads();
+        stage ^= 1;
+    }
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+            const int r0 = m0 + warp_m * 32 + mi * 16 + group;
+            const int c0 = n0 + warp_n * 64 + ni * 8 + t2;
+            convrot_store_one(y, scales, wscale, rows, n, r0, c0, acc[mi][ni][0]);
+            convrot_store_one(y, scales, wscale, rows, n, r0, c0 + 1, acc[mi][ni][1]);
+            convrot_store_one(y, scales, wscale, rows, n, r0 + 8, c0, acc[mi][ni][2]);
+            convrot_store_one(y, scales, wscale, rows, n, r0 + 8, c0 + 1, acc[mi][ni][3]);
+        }
+    }
 }
