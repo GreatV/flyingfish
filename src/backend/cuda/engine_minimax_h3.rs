@@ -5756,7 +5756,7 @@ mod tests {
         work.prepare::<true>(&blas, &spec)?;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
-        let hidden = spec.hidden as usize;
+        let hidden = spec.hidden;
         let input: Vec<bf16> = (0..rows * hidden)
             .map(|i| bf16::from_f32(((i * 17 + 3) % 251) as f32 / 17.0 - 7.0))
             .collect();
@@ -5778,7 +5778,7 @@ mod tests {
             entries: 1,
             index: &index,
         };
-        let rotary = s.alloc_zeros::<bf16>(rows * 6 * spec.rope_freq_dim as usize)?;
+        let rotary = s.alloc_zeros::<bf16>(rows * 6 * spec.rope_freq_dim)?;
         let mut x = s.clone_htod(&input)?;
         let context = BlockContext {
             s,
