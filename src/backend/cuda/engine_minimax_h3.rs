@@ -5699,6 +5699,153 @@ mod tests {
         Ok(())
     }
 
+    /// Engine-level norm control: `block_forward` on the MiniMax-H3
+    /// (non-hyperflow) path with both modulation gates zero, so the residual
+    /// passes attention and the FFN unchanged and `work.normed` holds exactly
+    /// the modulated norm2 of the input rows. The definition rounds once,
+    /// after the RMS weight; this path launched the pre-weight round before
+    /// this branch.
+    #[test]
+    #[ignore = "GPU; FF_MODEL, FF_H3_LORA"]
+    fn h3_block_norm_matches_the_post_weight_round_gpu() -> Result<()> {
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let lora_path = path("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        ensure!(!spec.is_hyperflow()?, "control needs the MiniMax-H3 path");
+        let transformer = model.join("transformer");
+        let manifest = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-normctl-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 block norm control".into())),
+        )?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let mut base = Source::new(&transformer, &manifest);
+        let mut lora = Source::new(&lora_dir, &lora_manifest);
+        let weights = BlockWeights::resident::<true>(
+            s,
+            &spec,
+            adapter.rank,
+            "transformer_blocks.0",
+            &mut base,
+            &mut lora,
+        )?;
+        let rows = 1usize;
+        let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
+        work.prepare::<true>(&blas, &spec)?;
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
+        let hidden = spec.hidden as usize;
+        let input: Vec<bf16> = (0..rows * hidden)
+            .map(|i| bf16::from_f32(((i * 17 + 3) % 251) as f32 / 17.0 - 7.0))
+            .collect();
+        let pattern = |d: usize, m: usize| bf16::from_f32(((d * m + 5) % 251) as f32 / 256.0 - 0.5);
+        let mut table = vec![bf16::from_f32(0.0); 6 * hidden];
+        for d in 0..hidden {
+            table[d] = pattern(d, 37);
+            table[hidden + d] = pattern(d, 19);
+            table[2 * hidden + d] = bf16::from_f32(0.0);
+            table[3 * hidden + d] = pattern(d, 53);
+            table[4 * hidden + d] = pattern(d, 29);
+            table[5 * hidden + d] = bf16::from_f32(0.0);
+        }
+        let modulation_table = s.clone_htod(&table)?;
+        let index = s.clone_htod(&vec![0u32; rows])?;
+        let modulation = Modulation {
+            table: &modulation_table,
+            offset: 0,
+            entries: 1,
+            index: &index,
+        };
+        let rotary = s.alloc_zeros::<bf16>(rows * 6 * spec.rope_freq_dim as usize)?;
+        let mut x = s.clone_htod(&input)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: adapter.scale,
+        };
+        block_forward::<true>(
+            &context,
+            &mut flash,
+            &weights,
+            &Conditioning::Modulated {
+                rotary: &rotary,
+                modulation: &modulation,
+            },
+            &mut x,
+            &mut work,
+        )?;
+        let output = s.clone_dtoh(&x)?;
+        ensure!(
+            output
+                .iter()
+                .zip(&input)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "zero gates must leave the residual untouched"
+        );
+        let normed = s.clone_dtoh(&work.normed)?;
+        let norm2 = s.clone_dtoh(&weights.norm2)?;
+        let shift_mlp = &table[3 * hidden..4 * hidden];
+        let scale_mlp = &table[4 * hidden..5 * hidden];
+        let pre = modulate_rows(
+            &input,
+            &norm2,
+            shift_mlp,
+            scale_mlp,
+            hidden,
+            spec.norm_eps,
+            true,
+        );
+        let post = modulate_rows(
+            &input,
+            &norm2,
+            shift_mlp,
+            scale_mlp,
+            hidden,
+            spec.norm_eps,
+            false,
+        );
+        let (pre_n, pre_max) = f32_abs_diff(&normed, &pre);
+        let (post_n, post_max) = f32_abs_diff(&normed, &post);
+        println!(
+            "H3_BLOCK_NORM_CONTROL pre_diff={pre_n} pre_max={pre_max:.8} post_diff={post_n} post_max={post_max:.8}"
+        );
+        ensure!(
+            post_n * 10 < pre_n,
+            "block normed output matches the pre-weight round pre_diff={pre_n} post_diff={post_n}"
+        );
+        ensure!(
+            pre_n > 0 && pre_max >= 0.015625,
+            "pre-weight composition not separated"
+        );
+        fs::remove_dir_all(&runtime).ok();
+        println!("PASS h3_block_norm post_weight=true path=block_forward");
+        Ok(())
+    }
+
     fn modulate_rows(
         x: &[bf16],
         weight: &[bf16],
