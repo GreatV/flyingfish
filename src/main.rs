@@ -1346,31 +1346,72 @@ fn run() -> Result<()> {
                         let fov = camera["camera_angle_x"]
                             .as_f64()
                             .context("camera_angle_x")?;
-                        let distance = camera["distance"].as_f64().context("distance")?;
                         let scale = camera["mesh_scale"].as_f64().unwrap_or(1.0);
-                        // The publisher places the camera at (0, 0, distance)
-                        // looking at the origin with up (0, 1, 0)
-                        // (structured_latent_shape.py:135-138); that look-at
-                        // extrinsic is the row-major
+                        // The camera JSON may carry the publisher's
+                        // world_to_camera extrinsic directly - a flat
+                        // 12-float row-major 3x4, or the 4x4 nested form the
+                        // fixture files store (top three rows taken). It is
+                        // required for multiview, where a shared look-at
+                        // would project every view from one direction;
+                        // without it the single-view camera sits at
+                        // (0, 0, distance) looking at the origin with up
+                        // (0, 1, 0) (structured_latent_shape.py:135-138),
+                        // the row-major
                         // [[1,0,0,0],[0,1,0,0],[0,0,1,distance]].
+                        let world_to_camera: [f32; 12] = if let Some(matrix) =
+                            camera["world_to_camera"].as_array()
+                        {
+                            let flat: Vec<f64> = if matrix.len() == 12 {
+                                matrix
+                                    .iter()
+                                    .map(|value| value.as_f64().context("world_to_camera entry"))
+                                    .collect::<Result<_>>()?
+                            } else {
+                                ensure!(
+                                    matrix.len() == 4
+                                        && matrix.iter().all(|row| row
+                                            .as_array()
+                                            .is_some_and(|row| row.len() == 4)),
+                                    "world_to_camera must be 12 floats or a 4x4 matrix"
+                                );
+                                matrix
+                                    .iter()
+                                    .take(3)
+                                    .flat_map(|row| row.as_array().expect("checked"))
+                                    .map(|value| value.as_f64().context("world_to_camera entry"))
+                                    .collect::<Result<_>>()?
+                            };
+                            let values: Vec<f32> =
+                                flat.into_iter().map(|value| value as f32).collect();
+                            values
+                                .try_into()
+                                .map_err(|_| anyhow::anyhow!("world_to_camera needs 12 entries"))?
+                        } else if multiview {
+                            bail!(
+                                "multiview requires per-view world_to_camera in each camera JSON"
+                            );
+                        } else {
+                            let distance = camera["distance"].as_f64().context("distance")?;
+                            [
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                distance as f32,
+                            ]
+                        };
                         views.push(flyingfish::backend::PixalView {
                             rgba,
                             dimensions: [*height, *width],
                             camera: flyingfish::backend::ProjectionCamera {
-                                world_to_camera: [
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    1.0,
-                                    distance as f32,
-                                ],
+                                world_to_camera,
                                 horizontal_fov: fov as f32,
                                 mesh_scale: scale as f32,
                             },

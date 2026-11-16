@@ -994,6 +994,10 @@ fn read_obj(bytes: &[u8]) -> Result<MeshRead> {
                 positions.extend(values);
             }
             Some("f") => {
+                // Positive indices are 1-based; negative indices count back
+                // from the vertex count at this face (OBJ relative
+                // references).
+                let rows = positions.len() / 3;
                 let indices: Vec<i32> = words
                     .take(3)
                     .map(|word| {
@@ -1003,7 +1007,22 @@ fn read_obj(bytes: &[u8]) -> Result<MeshRead> {
                             .context("OBJ face index")
                     })
                     .collect::<Result<_, _>>()?;
-                triangles.extend(indices.iter().map(|index| index - 1));
+                let resolved: Vec<i32> = indices
+                    .iter()
+                    .map(|index| {
+                        let zero_based = if *index > 0 {
+                            index - 1
+                        } else {
+                            rows as i32 + *index
+                        };
+                        ensure!(
+                            zero_based >= 0 && (zero_based as usize) < rows,
+                            "OBJ face index {index} outside the {rows} defined vertices"
+                        );
+                        Ok(zero_based)
+                    })
+                    .collect::<Result<_>>()?;
+                triangles.extend(resolved);
             }
             _ => {}
         }
@@ -1050,6 +1069,17 @@ mod tests {
         }
         let truncated = read_mesh(&positions_f32_bytes(), "ply");
         assert!(truncated.is_err(), "truncated PLY accepted");
+        // Relative indices: f -3 -2 -1 after the rows so far addresses the
+        // last three vertices; an index past the defined range errors.
+        let relative = "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nf -3 -2 -1\nf 1 2 -4\n";
+        let read = read_mesh(relative.as_bytes(), "obj")?;
+        assert_eq!(read.positions.len(), 12, "relative OBJ positions");
+        assert_eq!(read.triangles, vec![1, 2, 3, 0, 1, 0]);
+        let out_of_range = read_mesh("v 0 0 0\nf 1 2 -3\n".as_bytes(), "obj");
+        assert!(
+            out_of_range.is_err(),
+            "relative index past the vertices accepted"
+        );
         Ok(())
     }
 

@@ -102,18 +102,29 @@ fn to3d_pixal_cli_equals_the_library_entry() -> Result<()> {
     );
     let cli_mesh = read_mesh(&out)?;
 
-    // Library arm: the same construction the command performs.
+    // Library arm: the same construction the command performs — the
+    // fixture's nested 4x4 world_to_camera taken through its top rows.
     let (rgba, width, height) =
         flyingfish::serve::image::decode_image_rgba(&std::fs::read(&image)?, None)?;
     let camera: serde_json::Value = serde_json::from_slice(&std::fs::read(&camera_json)?)?;
-    let distance = camera["distance"].as_f64().context("distance")? as f32;
+    let matrix = camera["world_to_camera"]
+        .as_array()
+        .context("world_to_camera")?;
+    ensure!(matrix.len() == 4, "fixture world_to_camera is 4x4");
+    let mut world_to_camera = [0.0f32; 12];
+    for (row, values) in matrix.iter().take(3).enumerate() {
+        let values = values.as_array().context("world_to_camera row")?;
+        ensure!(values.len() == 4, "world_to_camera row width");
+        for (column, value) in values.iter().enumerate() {
+            world_to_camera[row * 4 + column] =
+                value.as_f64().context("world_to_camera entry")? as f32;
+        }
+    }
     let views = [flyingfish::backend::PixalView {
         rgba: &rgba,
         dimensions: [height, width],
         camera: flyingfish::backend::ProjectionCamera {
-            world_to_camera: [
-                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, distance,
-            ],
+            world_to_camera,
             horizontal_fov: camera["camera_angle_x"].as_f64().context("fov")? as f32,
             mesh_scale: camera["mesh_scale"].as_f64().unwrap_or(1.0) as f32,
         },
