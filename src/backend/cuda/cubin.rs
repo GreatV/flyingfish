@@ -16,6 +16,11 @@ pub fn bytes(name: &str, sm: u32) -> Option<&'static [u8]> {
 }
 
 #[cfg(feature = "cuda")]
+pub fn arches() -> &'static [u32] {
+    binaries::ARCHES
+}
+
+#[cfg(feature = "cuda")]
 pub fn check(sm: u32) -> Result<()> {
     ensure!(
         binaries::ARCHES.contains(&sm),

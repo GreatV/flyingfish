@@ -805,10 +805,11 @@ mod device {
                 && qweight.len() == n * k + weight_off as usize,
             "convrot product shape"
         );
+        let off = usize::try_from(weight_off)?;
         let stream = &device.stream;
         let codes_d = stream.clone_htod(codes)?;
         let scales_d = stream.clone_htod(scales)?;
-        let weight_d = stream.clone_htod(qweight)?;
+        let weight_d = stream.clone_htod(&qweight[off..off + n * k])?;
         let wscale_d = stream.clone_htod(wscale)?;
         let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
         let fns = load_convrot(&device.ctx)?;
@@ -817,7 +818,7 @@ mod device {
             &fns,
             &ConvrotArgs {
                 x: 0,
-                qweight: weight_d.device_ptr(stream).0 + weight_off,
+                qweight: weight_d.device_ptr(stream).0,
                 wscale: wscale_d.device_ptr(stream).0,
                 y: y_d.device_ptr(stream).0,
                 rotated: 0,
@@ -901,13 +902,11 @@ mod device {
 
     #[test]
     fn convrot_product_sass_is_imma16832() -> Result<()> {
-        let sms = [75u32, 80, 86, 89, 90, 100, 103, 120];
-        let mut saw = false;
-        for sm in sms {
-            let Some(bytes) = crate::backend::cuda::cubin::bytes("convrot", sm) else {
-                continue;
-            };
-            saw = true;
+        let sms = crate::backend::cuda::cubin::arches();
+        ensure!(!sms.is_empty(), "convrot cubin missing");
+        for &sm in sms {
+            let bytes = crate::backend::cuda::cubin::bytes("convrot", sm)
+                .with_context(|| format!("convrot cubin sm_{sm}"))?;
             let path = std::env::temp_dir()
                 .join(format!("convrot-product-{}-{sm}.cubin", std::process::id()));
             std::fs::write(&path, bytes).context("convrot cubin")?;
@@ -932,7 +931,6 @@ mod device {
             );
             println!("CONVROT_PRODUCT_SASS sm_{sm} IMMA.16832.S8.S8");
         }
-        ensure!(saw, "convrot cubin missing");
         Ok(())
     }
 }
