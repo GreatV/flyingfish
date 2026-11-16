@@ -66,22 +66,6 @@ pub(crate) fn glm_mtp_draft_step_config(
     })
 }
 
-pub(crate) fn top1_and_margin(logits: &[f32]) -> (u32, f32) {
-    let mut top1_id = 0u32;
-    let mut top1_val = f32::NEG_INFINITY;
-    let mut top2_val = f32::NEG_INFINITY;
-    for (i, &val) in logits.iter().enumerate() {
-        if val > top1_val {
-            top2_val = top1_val;
-            top1_val = val;
-            top1_id = i as u32;
-        } else if val > top2_val {
-            top2_val = val;
-        }
-    }
-    (top1_id, top1_val - top2_val)
-}
-
 pub(crate) struct Chain {
     pub(crate) options: MtpOptions,
     pub(crate) runtime: Option<MtpRuntime>,
@@ -1015,13 +999,17 @@ impl Engine {
         let row1_logits = verify_logits_raw[vocab..2 * vocab].to_vec();
 
         #[cfg(test)]
-        let (v0, v0_margin) = top1_and_margin(&row0_logits);
+        let (v0, v0_margin_exact) = crate::verify::top_two("glm.mtp.verify.row0", &row0_logits)?;
         #[cfg(test)]
-        let (v1, v1_margin) = top1_and_margin(&row1_logits);
+        let v0_margin = v0_margin_exact as f32;
+        #[cfg(test)]
+        let (v1, v1_margin_exact) = crate::verify::top_two("glm.mtp.verify.row1", &row1_logits)?;
+        #[cfg(test)]
+        let v1_margin = v1_margin_exact as f32;
         #[cfg(not(test))]
-        let (v0, _) = top1_and_margin(&row0_logits);
+        let (v0, _) = crate::verify::top_two("glm.mtp.verify.row0", &row0_logits)?;
         #[cfg(not(test))]
-        let (v1, _) = top1_and_margin(&row1_logits);
+        let (v1, _) = crate::verify::top_two("glm.mtp.verify.row1", &row1_logits)?;
 
         #[cfg(test)]
         let expert_union_count = self

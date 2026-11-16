@@ -670,19 +670,6 @@ mod tests {
         f64::from_bits(((exponent + 1023) as u64) << 52)
     }
 
-    /// Distance in representable BF16 values between two outputs.
-    fn bf16_ulp_distance(a: bf16, b: bf16) -> u32 {
-        fn key(value: bf16) -> u32 {
-            let bits = u32::from(value.to_bits());
-            if bits & 0x8000 != 0 {
-                (!bits) & 0xffff
-            } else {
-                bits | 0x8000
-            }
-        }
-        key(a).abs_diff(key(b))
-    }
-
     /// One call of the op.
     #[derive(Clone, Debug)]
     struct Fixture {
@@ -1501,31 +1488,44 @@ mod tests {
                 for d in 0..HEAD_DIM {
                     let got = host[head * HEAD_DIM + d];
                     let want = expected[head * HEAD_DIM + d];
-                    let distance = bf16_ulp_distance(got, want);
-                    let abs = (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs();
+                    let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                        &format!("latent.window.h{head}.d{d}"),
+                        &[got],
+                        &[want],
+                        None,
+                    )?;
+                    let distance = u32::from(distance);
                     ensure!(
                         distance <= OUTPUT_ULP_TOL || abs <= OUTPUT_ABS_TOL,
                         "latent window attention head {head} dim {d} bf16 ulp distance {distance} abs {abs}"
                     );
                 }
             }
-            let omitted_store_mismatches = host
-                .iter()
-                .zip(&omitted)
-                .filter(|(actual, mutant)| {
-                    bf16_ulp_distance(**actual, **mutant) > OUTPUT_ULP_TOL
-                        && (f64::from(actual.to_f32()) - f64::from(mutant.to_f32())).abs()
-                            > OUTPUT_ABS_TOL
-                })
-                .count();
+            let mut omitted_store_mismatches = 0usize;
+            for (index, (actual, mutant)) in host.iter().zip(&omitted).enumerate() {
+                let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                    &format!("latent.window.omitted[{index}]"),
+                    &[*actual],
+                    &[*mutant],
+                    None,
+                )?;
+                if u32::from(distance) > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
+                    omitted_store_mismatches += 1;
+                }
+            }
             omitted_store_controls += omitted_store_mismatches;
             let mut caught = 0usize;
             for head in 0..HEADS {
                 for d in 0..HEAD_DIM {
                     let got = host[head * HEAD_DIM + d];
                     let wrong = wrong_host[head * HEAD_DIM + d];
-                    let distance = bf16_ulp_distance(got, wrong);
-                    let abs = (f64::from(got.to_f32()) - f64::from(wrong.to_f32())).abs();
+                    let (distance, abs, _) = crate::verify::bf16_ulp_max(
+                        &format!("latent.window.wrong.h{head}.d{d}"),
+                        &[got],
+                        &[wrong],
+                        None,
+                    )?;
+                    let distance = u32::from(distance);
                     if distance > OUTPUT_ULP_TOL && abs > OUTPUT_ABS_TOL {
                         caught += 1;
                     }
@@ -1676,15 +1676,16 @@ mod indexed_tests {
             record.output.len() == 64 * 512 && record.bound == 3.0 * record.spread,
             "indexed reference extent/freeze formula"
         );
-        let mut defects = 0;
-        let mut maximum = 0.0f64;
-        for (actual, reference) in got.iter().zip(&record.output) {
-            ensure!(actual.is_finite(), "indexed attention nonfinite output");
-            let difference =
-                f64::from((actual.to_f32() - bf16::from_bits(*reference).to_f32()).abs());
-            maximum = maximum.max(difference);
-            defects += usize::from(difference > record.bound);
-        }
+        let reference: Vec<bf16> = record.output.iter().copied().map(bf16::from_bits).collect();
+        let (maximum, _) =
+            crate::verify::max_abs_rmse("latent.indexed", &got[..reference.len()], &reference)?;
+        let defects = got[..reference.len()]
+            .iter()
+            .zip(&reference)
+            .filter(|(actual, reference)| {
+                (f64::from(actual.to_f32()) - f64::from(reference.to_f32())).abs() > record.bound
+            })
+            .count();
         let trace = s.clone_htod(&vec![f32::NAN; certificate::TRACE_LEN])?;
         let kernel = cubin::module(ctx, "latent_window_attention")?
             .load_function("latent_indexed_attention_trace")?;

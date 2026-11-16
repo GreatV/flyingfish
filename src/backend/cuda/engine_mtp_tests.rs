@@ -341,7 +341,7 @@ fn score(candidate: &[bf16], reference: &[bf16], epsilon: f32) -> Result<serde_j
     let mut exact = 0;
     let mut near = 0;
     let mut defects = Vec::new();
-    let mut max_abs = 0f32;
+    let mut max_abs = 0f64;
     let argmax = |row: &[bf16]| {
         let mut best = 0;
         for i in 1..row.len() {
@@ -358,20 +358,13 @@ fn score(candidate: &[bf16], reference: &[bf16], epsilon: f32) -> Result<serde_j
         .zip(reference.as_chunks::<VOCAB>().0.iter())
         .enumerate()
     {
-        ensure!(
-            c.iter().chain(t).all(|x| x.is_finite()),
-            "nonfinite logits row {r}"
-        );
-        let row_abs = c
-            .iter()
-            .zip(t)
-            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-            .fold(0f32, f32::max);
+        let (row_abs, _) =
+            crate::verify::max_abs_rmse(&format!("mtp.score.r{r}"), c.as_slice(), t.as_slice())?;
         max_abs = max_abs.max(row_abs);
         let ci = argmax(c);
         let ti = argmax(t);
         let margin = t[ti].to_f32() - t[ci].to_f32();
-        if row_abs > epsilon {
+        if row_abs > f64::from(epsilon) {
             defects.push(serde_json::json!({"row":r,"candidate":ci,"reference":ti,"margin":margin,"max_abs":row_abs}));
         } else if ci == ti {
             exact += 1;
@@ -1295,11 +1288,8 @@ fn q38_mtp_recursive_fixture_gpu() -> Result<()> {
             ] {
                 let a = values(&dump, actual)?;
                 let r = read(&format!("{prefix}.{key}"), HIDDEN)?;
-                let max_abs = a
-                    .iter()
-                    .zip(&r)
-                    .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-                    .fold(0.0f32, f32::max);
+                let (max_abs, _) =
+                    crate::verify::max_abs_rmse(&format!("{prefix}.{actual}"), &a, &r)?;
                 diagnostic.insert(actual.into(),serde_json::json!({"max_abs":max_abs,"numeric_opref":"informational; whole-head gate governs"}));
             }
             std::fs::write(

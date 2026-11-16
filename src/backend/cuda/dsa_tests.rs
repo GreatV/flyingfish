@@ -298,25 +298,6 @@ fn dsa_definition_reference_cpu() -> Result<()> {
     Ok(())
 }
 
-fn attention_error(actual: &[bf16], expected: &[bf16]) -> Result<(f64, f64)> {
-    ensure!(
-        actual.len() == expected.len(),
-        "Runner FAIL attention extent"
-    );
-    let mut maximum = 0.0f64;
-    let mut square = 0.0;
-    for (a, b) in actual.iter().zip(expected) {
-        ensure!(
-            a.is_finite() && b.is_finite(),
-            "Runner FAIL nonfinite attention"
-        );
-        let delta = a.to_f64() - b.to_f64();
-        maximum = maximum.max(delta.abs());
-        square += delta * delta;
-    }
-    Ok((maximum, (square / actual.len() as f64).sqrt()))
-}
-
 fn projected_reference(
     q: &[bf16],
     latent: &[bf16],
@@ -387,7 +368,11 @@ fn dsa_attention_reference_cpu() -> Result<()> {
             &weights,
             &stored_i32(&stored, "indices")?,
         );
-        let (maximum, rms) = attention_error(&actual, &stored_bf16(&stored, "attention")?)?;
+        let (maximum, rms) = crate::verify::max_abs_rmse(
+            &format!("dsa.attention.{name}"),
+            &actual,
+            &stored_bf16(&stored, "attention")?,
+        )?;
         println!("DSA_ATTENTION_REFERENCE case={name} max_abs={maximum:e} rms={rms:e} oracle=fp64");
         ensure!(
             maximum <= 3.0517578125e-5 && rms <= 2.0e-7,
@@ -473,7 +458,11 @@ fn dsa_attention_gpu() -> Result<()> {
             } else {
                 bound.attention(&state, &input, s)?;
             }
-            let (maximum, rms) = attention_error(&s.clone_dtoh(&output)?, &expected)?;
+            let (maximum, rms) = crate::verify::max_abs_rmse(
+                &format!("dsa.attention.{name}"),
+                &s.clone_dtoh(&output)?,
+                &expected,
+            )?;
             let pass = maximum <= 3.0517578125e-5 && rms <= 2.0e-7;
             defects += usize::from(!pass);
             println!(
@@ -490,7 +479,11 @@ fn dsa_attention_gpu() -> Result<()> {
                 ..input
             };
             bound.attention(&state, &wrong_input, s)?;
-            let (maximum, _) = attention_error(&s.clone_dtoh(&output)?, &expected)?;
+            let (maximum, _) = crate::verify::max_abs_rmse(
+                "dsa.attention.wrong_id",
+                &s.clone_dtoh(&output)?,
+                &expected,
+            )?;
             println!("DSA_ATTENTION_WRONG_ID max_abs={maximum:e}");
             defects += usize::from(maximum <= 3.0517578125e-5);
         }
@@ -908,7 +901,11 @@ fn dsa_direct_reference_cpu() -> Result<()> {
             &stored_f32(&f, "sinks")?,
             &stored_i32(&f, "indices")?,
         );
-        let (maximum, rms) = attention_error(&result, &stored_bf16(&f, "fp64")?)?;
+        let (maximum, rms) = crate::verify::max_abs_rmse(
+            &format!("dsa.direct.{name}"),
+            &result,
+            &stored_bf16(&f, "fp64")?,
+        )?;
         println!("DSA_DIRECT_REFERENCE case={name} max_abs={maximum:e} rms={rms:e}");
         ensure!(
             maximum <= 9.765625e-4 && rms <= 8.0e-6,
@@ -1004,7 +1001,11 @@ fn dsa_direct_gpu() -> Result<()> {
             } else {
                 bound.attention(&state, &input, s)?;
             }
-            let (maximum, rms) = attention_error(&s.clone_dtoh(&output)?, &expected)?;
+            let (maximum, rms) = crate::verify::max_abs_rmse(
+                &format!("dsa.direct.{name}"),
+                &s.clone_dtoh(&output)?,
+                &expected,
+            )?;
             let pass = maximum <= 9.765625e-4 && rms <= 8.0e-6;
             defects += usize::from(!pass);
             println!(

@@ -989,4 +989,4 @@ pub(super) use glm::{GlmMtpRuntime, GlmMtpShared};
 mod chain;
 pub(super) use chain::Chain;
 #[cfg(test)]
-pub(super) use chain::{glm_mtp_draft_step_config, top1_and_margin};
+pub(super) use chain::glm_mtp_draft_step_config;

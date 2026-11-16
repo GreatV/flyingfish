@@ -2590,12 +2590,11 @@ mod tests {
                 }
             }
         }
-        let shift = media_outputs[0]
-            .0
-            .iter()
-            .zip(&media_outputs[2].0)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let (shift, _) = crate::verify::max_abs_rmse(
+            "loopvl.same_grid.shift",
+            &media_outputs[0].0,
+            &media_outputs[2].0,
+        )?;
         let distinct = media_outputs
             .iter()
             .enumerate()

@@ -417,7 +417,7 @@ impl Differences {
         expected: &crate::backend::Top4,
         context: &str,
         request: (u8, u32),
-    ) {
+    ) -> Result<()> {
         self.tokens += usize::from(actual.tokens != expected.tokens);
         self.logp += usize::from(actual.logp.map(f32::to_bits) != expected.logp.map(f32::to_bits));
         self.lse += usize::from(actual.lse.to_bits() != expected.lse.to_bits());
@@ -430,12 +430,18 @@ impl Differences {
         self.mass_over_bound_max = self
             .mass_over_bound_max
             .max(mass / crate::tree::f32_mass_bound(actual.vocab, max_abs));
-        for (&a, &b) in actual.logp.iter().zip(&expected.logp) {
-            self.max_logp_abs = self.max_logp_abs.max((f64::from(a) - f64::from(b)).abs());
-        }
-        self.max_lse_abs = self
-            .max_lse_abs
-            .max((f64::from(actual.lse) - f64::from(expected.lse)).abs());
+        let (pair, _) = crate::verify::max_abs_rmse(
+            &format!("markov.logp.{context}"),
+            &actual.logp,
+            &expected.logp,
+        )?;
+        self.max_logp_abs = self.max_logp_abs.max(pair);
+        let (lse_abs, _) = crate::verify::max_abs_rmse(
+            &format!("markov.lse.{context}"),
+            &[actual.lse],
+            &[expected.lse],
+        )?;
+        self.max_lse_abs = self.max_lse_abs.max(lse_abs);
         if !actual.bits_equal(expected) {
             self.requests += 1;
             if self.requests <= 8 {
@@ -447,11 +453,12 @@ impl Differences {
                 );
             }
         }
+        Ok(())
     }
 }
 
 #[test]
-fn bit_diagnostics_keep_float_and_token_differences_separate() {
+fn bit_diagnostics_keep_float_and_token_differences_separate() -> Result<()> {
     let expected = crate::backend::Top4 {
         tokens: [0, 1, 2, 3],
         logp: [-4.0, -5.0, -6.0, -7.0],
@@ -461,7 +468,7 @@ fn bit_diagnostics_keep_float_and_token_differences_separate() {
     let mut actual = expected.clone();
     actual.logp[0] = f32::from_bits(actual.logp[0].to_bits() + 1);
     let mut stats = Differences::default();
-    stats.track(&actual, &expected, "one-ulp test", (0, 0));
+    stats.track(&actual, &expected, "one-ulp test", (0, 0))?;
     assert_eq!(
         (stats.requests, stats.tokens, stats.logp, stats.lse),
         (1, 0, 1, 0)
@@ -473,11 +480,12 @@ fn bit_diagnostics_keep_float_and_token_differences_separate() {
     actual = expected.clone();
     actual.tokens[0] = 4;
     actual.lse = f32::from_bits(actual.lse.to_bits() + 1);
-    stats.track(&actual, &expected, "token and lse test", (0, 0));
+    stats.track(&actual, &expected, "token and lse test", (0, 0))?;
     assert_eq!(
         (stats.requests, stats.tokens, stats.logp, stats.lse),
         (2, 1, 1, 1)
     );
+    Ok(())
 }
 
 fn chain_requests(path: &Path) -> Result<Vec<(u8, u32)>> {
@@ -622,7 +630,7 @@ fn batch_matches_single() -> Result<()> {
                 &single[0],
                 &format!("{file} chain row{index}"),
                 *request,
-            );
+            )?;
             compared += 1;
         }
         for p in BATCH_COUNTS {
@@ -641,7 +649,7 @@ fn batch_matches_single() -> Result<()> {
                     &single[0],
                     &format!("{file} P{p} index{i}"),
                     *request,
-                );
+                )?;
                 compared += 1;
             }
             println!(
@@ -697,7 +705,7 @@ fn top4_matches_reference() -> Result<()> {
         let got = markov.distributions_batch(&base, &w1, &w2, &req)?;
         let expected = reference.batch(&base, &w1, &w2, &req)?;
         for (index, (actual, old)) in got.iter().zip(&expected).enumerate() {
-            differences.track(actual, old, &format!("{file} chain row{index}"), req[index]);
+            differences.track(actual, old, &format!("{file} chain row{index}"), req[index])?;
             compared += 1;
         }
         for p in BATCH_COUNTS {
@@ -720,7 +728,7 @@ fn top4_matches_reference() -> Result<()> {
                     old,
                     &format!("{file} P{p} index{index}"),
                     req[index],
-                );
+                )?;
                 compared += 1;
             }
             println!(

@@ -770,17 +770,13 @@ pub fn verify_greedy(
         );
         let a = spec.kv_snapshot(start, committed)?;
         let b = plain.kv_snapshot(start, committed)?;
+        let (max, _) = crate::verify::max_abs_rmse(&format!("spec.kv.round{rounds}"), &a, &b)?;
         let error = a
             .iter()
             .zip(&b)
             .map(|(&a, &b)| ((a - b) as f64).powi(2))
             .sum::<f64>();
         let scale = b.iter().map(|&b| (b as f64).powi(2)).sum::<f64>();
-        let max = a
-            .iter()
-            .zip(&b)
-            .map(|(&a, &b)| ((a - b) as f64).abs())
-            .fold(0.0f64, f64::max);
         println!(
             "{}",
             serde_json::json!({"spec_kv_round":rounds,"position":spec.position(),"rows":committed,"rel_rmse":(error/scale.max(f64::MIN_POSITIVE)).sqrt(),"max_abs":max,"gate":"diagnostic; peer numerical thresholds pending"})
@@ -812,32 +808,20 @@ pub struct ReplayRound {
     pub inject: std::path::PathBuf,
 }
 
-fn errors(a: &[f32], b: &[f32]) -> Result<(f64, f64, f64)> {
-    ensure!(
-        !a.is_empty() && a.len() == b.len(),
-        "replay tensor sizes differ"
-    );
-    ensure!(
-        a.iter().chain(b).all(|v| v.is_finite()),
-        "nonfinite replay tensor"
-    );
-    let max = a
-        .iter()
-        .zip(b)
-        .map(|(&a, &b)| (a - b).abs() as f64)
-        .fold(0.0f64, f64::max);
+fn errors(cell: &str, a: &[f32], b: &[f32]) -> Result<(f64, f64, f64)> {
+    let (max, _) = crate::verify::max_abs_rmse(cell, a, b)?;
     let mean = a
         .iter()
         .zip(b)
-        .map(|(&a, &b)| (a - b).abs() as f64)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
         .sum::<f64>()
         / a.len() as f64;
     let square = a
         .iter()
         .zip(b)
-        .map(|(&a, &b)| ((a - b) as f64).powi(2))
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
         .sum::<f64>();
-    let norm = b.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
+    let norm = b.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
     Ok((mean, max, (square / norm.max(f64::MIN_POSITIVE)).sqrt()))
 }
 
@@ -879,7 +863,11 @@ fn inject_reference(m: &mut Model, path: &Path, rules: &crate::dspark::Rules) ->
                     expected.len() >= commit * 256,
                     "reference {name} is shorter than committed rows"
                 );
-                let (mean, max, rel) = errors(&actual.values(&name)?, &expected[..commit * 256])?;
+                let (mean, max, rel) = errors(
+                    &format!("spec.kv.{name}"),
+                    &actual.values(&name)?,
+                    &expected[..commit * 256],
+                )?;
                 let pass = rel <= rules.kv_rel;
                 println!(
                     "{}",
@@ -942,7 +930,11 @@ pub fn replay(
         for (name, reference) in [("H", "draft_hidden"), ("B", "B"), ("s", "s")] {
             let actual_values = actual.values(&format!("draft.{name}"))?;
             let expected_values = expected.values(reference)?;
-            let (mean, max, rel) = errors(&actual_values, &expected_values)?;
+            let (mean, max, rel) = errors(
+                &format!("spec.draft.{name}.r{index}"),
+                &actual_values,
+                &expected_values,
+            )?;
             let peak = actual_values
                 .iter()
                 .zip(&expected_values)
