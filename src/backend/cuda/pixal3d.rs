@@ -4238,6 +4238,90 @@ pub struct Hi3DGeneration<'a> {
     pub seed: u64,
 }
 
+/// Philox counter-stream ids for the four Pixal3D stage noise draws (ss, lr,
+/// hr, tex) of one request. This is flyingfish's seeded-noise convention for
+/// the CLI, not the publisher's torch global RNG.
+pub const PIXAL_NOISE_STREAMS: [u64; 4] = [1, 2, 3, 4];
+
+/// A seeded Pixal3D request for the CLI: the four stage noise domains are
+/// drawn from the philox counter streams at the shapes the run gathers. The
+/// ss and lr domain sides are the flow checkpoints' published resolutions;
+/// the hr/tex sides are `requested_resolution / 16`, the cascade grid side.
+/// Channel counts are the flow checkpoints' output channels.
+pub struct PixalSeededRequest<'a> {
+    pub model: &'a Path,
+    pub dino: &'a Path,
+    pub naf: &'a Path,
+    pub runtime: &'a Path,
+    pub views: &'a [PixalView<'a>],
+    pub multiview: bool,
+    pub requested_resolution: u32,
+}
+
+impl PixalSeededRequest<'_> {
+    pub fn run(&self, seed: u64, device: &Device) -> Result<PixalOutput> {
+        let pipeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.model.join(if self.multiview {
+                "pipeline_mv.json"
+            } else {
+                "pipeline.json"
+            }))?)?;
+        let keys = [
+            "sparse_structure_flow_model",
+            "shape_slat_flow_model_512",
+            "shape_slat_flow_model_1024",
+            "tex_slat_flow_model_1024",
+        ];
+        let ckpts = self.model.join("ckpts");
+        let mut stages: Vec<(Vec<f32>, [usize; 5])> = Vec::with_capacity(4);
+        for (index, key) in keys.iter().enumerate() {
+            let stem = pipeline["args"]["models"][key]
+                .as_str()
+                .with_context(|| format!("{key} component missing"))?
+                .strip_prefix("ckpts/")
+                .context("flow checkpoint component path")?;
+            let spec = crate::pixal3d::FlowSpec::read(&ckpts, stem)?;
+            let side = match index {
+                0 | 1 => spec.resolution,
+                _ => (self.requested_resolution / 16) as usize,
+            };
+            let shape = [1, side, side, side, spec.out_channels];
+            let count = shape
+                .iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .context("noise domain extent overflow")?;
+            let values = super::engine_trellis2::philox_normals(
+                device,
+                seed,
+                PIXAL_NOISE_STREAMS[index],
+                count,
+            )?;
+            stages.push((values, shape));
+        }
+        let noise: [CoordinateNoise<'_>; 4] = stages
+            .iter()
+            .map(|(values, shape)| CoordinateNoise {
+                values,
+                shape: *shape,
+                batch: 0,
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("noise stage count"))?;
+        PixalGeneration {
+            model: self.model,
+            dino: self.dino,
+            naf: self.naf,
+            runtime: self.runtime,
+            views: self.views,
+            multiview: self.multiview,
+            requested_resolution: self.requested_resolution,
+            noise,
+        }
+        .run(device)
+    }
+}
+
 impl Hi3DGeneration<'_> {
     /// Final filled, component-filtered, simplified and unit-radius mesh, with its resolution.
     pub fn run_processed(&self, device: &Device) -> Result<(crate::sparse::SparseMesh, u32)> {

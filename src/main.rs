@@ -212,11 +212,31 @@ enum Command {
         )]
         image: PathBuf,
         #[arg(long, help = "DINOv3 encoder directory")]
-        dino: PathBuf,
+        dino: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "IMAGE",
+            help = "extra Pixal3D multiview RGBA input"
+        )]
+        view: Vec<PathBuf>,
+        #[arg(
+            long,
+            value_name = "JSON",
+            help = "camera JSON per view with camera_angle_x, distance and mesh_scale (MoGe-2 estimation is not integrated)"
+        )]
+        camera: Vec<PathBuf>,
+        #[arg(long, help = "NAF feature extractor directory (Pixal3D)")]
+        naf: Option<PathBuf>,
         #[arg(
             long,
             default_value_t = 0,
-            help = "request seed for the four stage noise draws"
+            help = "requested resolution; 0 selects the model default (Pixal3D 1536)"
+        )]
+        resolution: u32,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "request seed for the stage noise draws"
         )]
         seed: u64,
         #[arg(
@@ -1359,48 +1379,62 @@ fn run() -> Result<()> {
         Command::To3d {
             image,
             dino,
+            view,
+            camera,
+            naf,
+
+            resolution,
+
             seed,
             output,
         } => {
-            let (rgba, width, height) =
-                flyingfish::serve::image::decode_image_rgba(&fs::read(image)?, None)?;
             let runtime_dir = cli
                 .kernels
                 .runtime_dir
                 .clone()
                 .context("--runtime-dir is required for to-3d")?;
-            let request = flyingfish::backend::TrellisTo3d {
-                model: &cli.model,
-                dino,
-                runtime: &runtime_dir,
-                rgba: &rgba,
-                dimensions: [height, width],
-                seed: *seed,
-                device: cli.device,
-            };
-            let mesh = request.run()?;
-            let rgb: Vec<u8> = mesh
-                .material
-                .chunks(6)
-                .flat_map(|row| {
-                    [row[0], row[1], row[2]]
-                        .iter()
-                        .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
-                        .collect::<Vec<u8>>()
-                })
-                .collect();
-            let metallic: Vec<f32> = mesh.material.chunks(6).map(|row| row[3]).collect();
-            let roughness: Vec<f32> = mesh.material.chunks(6).map(|row| row[4]).collect();
-            let alpha: Vec<f32> = mesh.material.chunks(6).map(|row| row[5]).collect();
-            let view = flyingfish::media::MeshWrite {
-                positions: &mesh.vertices,
-                triangles: &mesh.faces,
-                rgb: Some(&rgb),
-                extras: &[
-                    ("metallic", &metallic),
-                    ("roughness", &roughness),
-                    ("alpha", &alpha),
-                ],
+            // Model-class dispatch on the published configs: a diffusers-style
+            // model_index.json is not to-3d input; the Trellis2
+            // pipelines ship pipeline.json, and Pixal3D's single-view pipeline
+            // carries the sparse_structure_decoder key TRELLIS.2 lacks.
+            let index: Option<serde_json::Value> =
+                match fs::read(cli.model.join("model_index.json")) {
+                    Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+            let pipeline: Option<serde_json::Value> =
+                match fs::read(cli.model.join("pipeline.json")) {
+                    Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+            if let Some(index) = &index {
+                bail!(
+                    "unsupported model_index class {:?}: Hi3D is not enabled from to-3d yet",
+                    index["_class_name"].as_str()
+                );
+            }
+            enum Class {
+                Trellis,
+                Pixal { multiview: bool },
+            }
+            let class = if let Some(pipeline) = &pipeline {
+                match pipeline["name"].as_str() {
+                    Some("Trellis2ImageTo3DPipeline") => {
+                        if pipeline["args"]["models"]["sparse_structure_decoder"].is_string() {
+                            Class::Pixal {
+                                multiview: !view.is_empty(),
+                            }
+                        } else {
+                            Class::Trellis
+                        }
+                    }
+                    Some("Pixal3DMVImageTo3DPipeline") => Class::Pixal { multiview: true },
+                    other => bail!("unsupported pipeline class {other:?}"),
+                }
+            } else {
+                bail!("model directory carries neither model_index.json nor pipeline.json");
             };
             let extension = output
                 .extension()
@@ -1410,22 +1444,239 @@ fn run() -> Result<()> {
                 matches!(extension.as_deref(), Some("ply") | Some("obj")),
                 "output must be .ply or .obj, got {extension:?}"
             );
-            let mut buffered = std::io::BufWriter::new(fs::File::create(output)?);
-            use std::io::Write as _;
-            match extension.as_deref() {
-                Some("ply") => flyingfish::media::write_ply(&mut buffered, &view)?,
-                Some("obj") => flyingfish::media::write_obj(&mut buffered, &view)?,
-                _ => unreachable!(),
+            let write = |mesh: &flyingfish::sparse::SparseMesh,
+                         rgb: Option<&[u8]>,
+                         extras: &[(&str, &[f32])],
+                         resolution: u32|
+             -> Result<()> {
+                let view = flyingfish::media::MeshWrite {
+                    positions: &mesh.vertices,
+                    triangles: &mesh.faces,
+                    rgb,
+                    extras,
+                };
+                let mut buffered = std::io::BufWriter::new(fs::File::create(output)?);
+                use std::io::Write as _;
+                match extension.as_deref() {
+                    Some("ply") => flyingfish::media::write_ply(&mut buffered, &view)?,
+                    Some("obj") => flyingfish::media::write_obj(&mut buffered, &view)?,
+                    _ => unreachable!(),
+                }
+                buffered.flush()?;
+                println!(
+                    "wrote {} vertices {} faces resolution {resolution} to {}",
+                    mesh.vertices.len() / 3,
+                    mesh.faces.len() / 3,
+                    output.display()
+                );
+                Ok(())
+            };
+            match class {
+                Class::Pixal { multiview } => {
+                    let naf = naf
+                        .as_ref()
+                        .context("Pixal3D requires --naf (the NAF directory)")?;
+                    let dino = dino
+                        .as_ref()
+                        .context("Pixal3D requires --dino (the DINOv3 directory)")?;
+                    let mut paths = vec![image.clone()];
+                    paths.extend(view.iter().cloned());
+                    ensure!(
+                        camera.len() == paths.len(),
+                        "Pixal3D needs one --camera JSON per view ({} given for {} views)",
+                        camera.len(),
+                        paths.len()
+                    );
+                    let mut decoded = Vec::with_capacity(paths.len());
+                    for path in &paths {
+                        let (rgba, width, height) =
+                            flyingfish::serve::image::decode_image_rgba(&fs::read(path)?, None)?;
+                        decoded.push((rgba, width, height));
+                    }
+                    let mut views = Vec::with_capacity(paths.len());
+                    for ((rgba, width, height), camera_path) in decoded.iter().zip(camera) {
+                        let camera: serde_json::Value =
+                            serde_json::from_slice(&fs::read(camera_path)?)?;
+                        let fov = camera["camera_angle_x"]
+                            .as_f64()
+                            .context("camera_angle_x")?;
+                        let scale = camera["mesh_scale"].as_f64().unwrap_or(1.0);
+                        // The camera JSON may carry the publisher's
+                        // world_to_camera extrinsic directly - a flat
+                        // 12-float row-major 3x4, or the 4x4 nested form the
+                        // fixture files store (top three rows taken). It is
+                        // required for multiview, where a shared look-at
+                        // would project every view from one direction;
+                        // without it the single-view camera sits at
+                        // (0, 0, distance) looking at the origin with up
+                        // (0, 1, 0) (structured_latent_shape.py:135-138),
+                        // the row-major
+                        // [[1,0,0,0],[0,1,0,0],[0,0,1,distance]].
+                        let world_to_camera: [f32; 12] = if let Some(matrix) =
+                            camera["world_to_camera"].as_array()
+                        {
+                            let flat: Vec<f64> = if matrix.len() == 12 {
+                                matrix
+                                    .iter()
+                                    .map(|value| value.as_f64().context("world_to_camera entry"))
+                                    .collect::<Result<_>>()?
+                            } else {
+                                ensure!(
+                                    matrix.len() == 4
+                                        && matrix.iter().all(|row| row
+                                            .as_array()
+                                            .is_some_and(|row| row.len() == 4)),
+                                    "world_to_camera must be 12 floats or a 4x4 matrix"
+                                );
+                                matrix
+                                    .iter()
+                                    .take(3)
+                                    .flat_map(|row| row.as_array().expect("checked"))
+                                    .map(|value| value.as_f64().context("world_to_camera entry"))
+                                    .collect::<Result<_>>()?
+                            };
+                            let values: Vec<f32> =
+                                flat.into_iter().map(|value| value as f32).collect();
+                            values
+                                .try_into()
+                                .map_err(|_| anyhow::anyhow!("world_to_camera needs 12 entries"))?
+                        } else if multiview {
+                            bail!(
+                                "multiview requires per-view world_to_camera in each camera JSON"
+                            );
+                        } else {
+                            let distance = camera["distance"].as_f64().context("distance")?;
+                            [
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                distance as f32,
+                            ]
+                        };
+                        views.push(flyingfish::backend::PixalView {
+                            rgba,
+                            dimensions: [*height, *width],
+                            camera: flyingfish::backend::ProjectionCamera {
+                                world_to_camera,
+                                horizontal_fov: fov as f32,
+                                mesh_scale: scale as f32,
+                            },
+                        });
+                    }
+                    let requested_resolution = match *resolution {
+                        0 => 1536,
+                        value => value,
+                    };
+                    let device = flyingfish::backend::BackendDevice::new(cli.device)?;
+                    let output = flyingfish::backend::PixalSeededRequest {
+                        model: &cli.model,
+                        dino,
+                        naf,
+                        runtime: &runtime_dir,
+                        views: &views,
+                        multiview,
+                        requested_resolution,
+                    }
+                    .run(*seed, &device)?;
+                    let rgb: Vec<u8> = output
+                        .material
+                        .features
+                        .chunks(output.material.channels)
+                        .flat_map(|row| {
+                            [row[0], row[1], row[2]]
+                                .iter()
+                                .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
+                                .collect::<Vec<u8>>()
+                        })
+                        .collect();
+                    let metallic: Vec<f32> = output
+                        .material
+                        .features
+                        .chunks(output.material.channels)
+                        .map(|row| row[3])
+                        .collect();
+                    let roughness: Vec<f32> = output
+                        .material
+                        .features
+                        .chunks(output.material.channels)
+                        .map(|row| row[4])
+                        .collect();
+                    let alpha: Vec<f32> = output
+                        .material
+                        .features
+                        .chunks(output.material.channels)
+                        .map(|row| row[5])
+                        .collect();
+                    write(
+                        &output.mesh,
+                        Some(&rgb),
+                        &[
+                            ("metallic", &metallic),
+                            ("roughness", &roughness),
+                            ("alpha", &alpha),
+                        ],
+                        output.resolution,
+                    )?;
+                    Ok(())
+                }
+                Class::Trellis => {
+                    ensure!(
+                        view.is_empty() && camera.is_empty() && naf.is_none() && *resolution == 0,
+                        "--view/--camera/--naf/--resolution serve Pixal3D"
+                    );
+                    let dino = dino
+                        .as_ref()
+                        .context("TRELLIS.2 requires --dino (the DINOv3 directory)")?;
+                    let (rgba, width, height) =
+                        flyingfish::serve::image::decode_image_rgba(&fs::read(image)?, None)?;
+                    let request = flyingfish::backend::TrellisTo3d {
+                        model: &cli.model,
+                        dino,
+                        runtime: &runtime_dir,
+                        rgba: &rgba,
+                        dimensions: [height, width],
+                        seed: *seed,
+                        device: cli.device,
+                    };
+                    let mesh = request.run()?;
+                    let rgb: Vec<u8> = mesh
+                        .material
+                        .chunks(6)
+                        .flat_map(|row| {
+                            [row[0], row[1], row[2]]
+                                .iter()
+                                .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
+                                .collect::<Vec<u8>>()
+                        })
+                        .collect();
+                    let metallic: Vec<f32> = mesh.material.chunks(6).map(|row| row[3]).collect();
+                    let roughness: Vec<f32> = mesh.material.chunks(6).map(|row| row[4]).collect();
+                    let alpha: Vec<f32> = mesh.material.chunks(6).map(|row| row[5]).collect();
+                    let mesh_view = flyingfish::sparse::SparseMesh {
+                        vertices: mesh.vertices,
+                        faces: mesh.faces,
+                    };
+                    write(
+                        &mesh_view,
+                        Some(&rgb),
+                        &[
+                            ("metallic", &metallic),
+                            ("roughness", &roughness),
+                            ("alpha", &alpha),
+                        ],
+                        mesh.resolution,
+                    )?;
+                    Ok(())
+                }
             }
-            buffered.flush()?;
-            println!(
-                "wrote {} vertices {} faces resolution {} to {}",
-                mesh.vertices.len() / 3,
-                mesh.faces.len() / 3,
-                mesh.resolution,
-                output.display()
-            );
-            Ok(())
         }
         #[cfg(not(feature = "cuda"))]
         Command::To3d { .. } => bail!("to-3d requires CUDA"),
