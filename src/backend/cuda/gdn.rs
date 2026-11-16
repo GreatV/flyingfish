@@ -4536,11 +4536,13 @@ mod tests {
                             false,
                             GeometryControl::StrongDecay,
                         )?;
-                        let out = &candidate.out[..valid as usize * 8192];
-                        crate::verify::max_abs_rmse("gdn.key_decay.out", out, &reference.out)?;
+                        let extent = valid as usize * 8192;
+                        let out = &candidate.out[..extent];
+                        let reference_out = &reference.out[..extent];
+                        crate::verify::max_abs_rmse("gdn.key_decay.out", out, reference_out)?;
                         candidate.oracle_out = reference.oracle_out.max(
                             out.iter()
-                                .zip(&reference.out)
+                                .zip(reference_out)
                                 .map(|(a, b)| {
                                     let (a, b) = (f64::from(a.to_f32()), f64::from(b.to_f32()));
                                     (a - b).abs() / (1e-4 + b.abs())
