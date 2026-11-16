@@ -890,18 +890,8 @@ mod gate_tests {
         flat
     }
 
-    /// NaN on either side is an infinite difference (f32::max ignores NaN).
-    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| {
-                if x.is_nan() || y.is_nan() {
-                    f32::INFINITY
-                } else {
-                    (x - y).abs()
-                }
-            })
-            .fold(0.0f32, f32::max)
+    fn max_abs(cell: &str, a: &[f32], b: &[f32]) -> Result<f64> {
+        Ok(crate::verify::max_abs_rmse(cell, a, b)?.0)
     }
 
     /// Transposed `[lanes, hidden, rows]` view of a `[lanes, rows, hidden]` slice.
@@ -949,15 +939,19 @@ mod gate_tests {
         let frames = ours.len() / 128;
         // The fixture stores the reference mel bin-major `[128, frames]`.
         let ref_frames = reference.len() / 128;
-        let per_frame: Vec<f32> = (0..frames.min(ref_frames))
+        let per_frame: Vec<f64> = (0..frames.min(ref_frames))
             .map(|frame| {
-                ours[frame * 128..(frame + 1) * 128]
-                    .iter()
-                    .enumerate()
-                    .map(|(bin, x)| (x - reference[bin * ref_frames + frame]).abs())
-                    .fold(0.0f32, f32::max)
+                let want: Vec<f32> = (0..128)
+                    .map(|bin| reference[bin * ref_frames + frame])
+                    .collect();
+                crate::verify::max_abs_rmse(
+                    &format!("multitalker.mel.f{frame}"),
+                    &ours[frame * 128..(frame + 1) * 128],
+                    &want,
+                )
+                .map(|(max_abs, _)| max_abs)
             })
-            .collect();
+            .collect::<Result<_>>()?;
         println!(
             "MEL frames ours={frames} ref={ref_frames} first16_max={:?}",
             &per_frame[..16.min(per_frame.len())]
@@ -978,34 +972,45 @@ mod gate_tests {
                 while let Some(result) = model.stream_step(&mut session, &mut stream)? {
                     let key = format!("{mode}/{}/step{step}", input.name);
                     if let Some(cell) = cells.get(&key) {
-                        let diff = max_abs(&result.layer0_in, &cell_values(cell, "x0_in"));
+                        let diff = max_abs(
+                            &format!("{key}.x0_in"),
+                            &result.layer0_in,
+                            &cell_values(cell, "x0_in"),
+                        )?;
                         let tau = tau_of(&taus, &key, "x0_in");
                         let cell_x0 = cell_values(cell, "x0_in");
                         let flat = argmax_flat(&result.layer0_in, &cell_x0);
                         let rows = result.layer0_in.len() / (1024 * input.lanes as usize);
-                        let per_row = (0..rows)
-                            .map(|row| {
-                                (0..input.lanes as usize)
-                                    .map(|lane| {
-                                        let base = (lane * rows + row) * 1024;
-                                        result.layer0_in[base..base + 1024]
-                                            .iter()
-                                            .zip(&cell_x0[base..base + 1024])
-                                            .map(|(x, y)| (x - y).abs())
-                                            .fold(0.0f32, f32::max)
-                                    })
-                                    .collect::<Vec<f32>>()
-                            })
-                            .collect::<Vec<Vec<f32>>>();
+                        let mut per_row = Vec::with_capacity(rows);
+                        for row in 0..rows {
+                            let mut lanes = Vec::with_capacity(input.lanes as usize);
+                            for lane in 0..input.lanes as usize {
+                                let base = (lane * rows + row) * 1024;
+                                let (lane_max, _) = crate::verify::max_abs_rmse(
+                                    &format!("{key}.x0_in.r{row}.l{lane}"),
+                                    &result.layer0_in[base..base + 1024],
+                                    &cell_x0[base..base + 1024],
+                                )?;
+                                lanes.push(lane_max);
+                            }
+                            per_row.push(lanes);
+                        }
                         ensure!(
-                            diff <= tau,
+                            diff <= f64::from(tau),
                             "{key} x0_in diff {diff:.3e} > tau {tau:.3e} at flat {flat} ours={} cell={} per_row_max={per_row:?}",
                             result.layer0_in[flat],
                             cell_x0[flat]
                         );
-                        let diff = max_abs(&result.layer0_post, &cell_values(cell, "x0_post"));
+                        let diff = max_abs(
+                            &format!("{key}.x0_post"),
+                            &result.layer0_post,
+                            &cell_values(cell, "x0_post"),
+                        )?;
                         let tau = tau_of(&taus, &key, "x0_post");
-                        ensure!(diff <= tau, "{key} x0_post diff {diff:.3e} > tau {tau:.3e}");
+                        ensure!(
+                            diff <= f64::from(tau),
+                            "{key} x0_post diff {diff:.3e} > tau {tau:.3e}"
+                        );
                         let out_rows = result.rows.len() / (input.lanes as usize * 1024);
                         // Mid-stream steps trim the encoder rows to the valid
                         // 14 (keep_all only on the final step), so the returned
@@ -1017,9 +1022,12 @@ mod gate_tests {
                             "{key} rows {out_rows} vs cell enc rows {cell_rows}"
                         );
                         let enc = transposed(&result.rows, input.lanes as usize, out_rows, 1024);
-                        let diff = max_abs(&enc, &cell_values(cell, "enc"));
+                        let diff = max_abs(&format!("{key}.enc"), &enc, &cell_values(cell, "enc"))?;
                         let tau = tau_of(&taus, &key, "enc");
-                        ensure!(diff <= tau, "{key} enc diff {diff:.3e} > tau {tau:.3e}");
+                        ensure!(
+                            diff <= f64::from(tau),
+                            "{key} enc diff {diff:.3e} > tau {tau:.3e}"
+                        );
                         println!("CELL {key} x0_in={diff:.3e} within tau");
                         checked += 3;
                     }
@@ -1052,15 +1060,19 @@ mod gate_tests {
             .stream_step(&mut session, &mut stream)?
             .context("control step")?;
         let cell = cells.get("masked/meeting/step0").context("control cell")?;
-        let x0 = max_abs(&step.layer0_in, &cell_values(cell, "x0_in"));
+        let x0 = max_abs(
+            "multitalker.control.x0_in",
+            &step.layer0_in,
+            &cell_values(cell, "x0_in"),
+        )?;
         let tau_x0 = tau_of(&taus, "masked/meeting/step0", "x0_in");
         ensure!(
-            x0 > 10.0 * tau_x0,
+            x0 > f64::from(10.0 * tau_x0),
             "control x0_in {x0:.3e} did not clear 10x tau {tau_x0:.3e}"
         );
         let rows = step.rows.len() / (4 * 1024);
         let enc = transposed(&step.rows, 4, rows, 1024);
-        let enc_diff = max_abs(&enc, &cell_values(cell, "enc"));
+        let enc_diff = max_abs("multitalker.control.enc", &enc, &cell_values(cell, "enc"))?;
         let tau_enc = tau_of(&taus, "masked/meeting/step0", "enc");
         let cell_enc = cell_values(cell, "enc");
         let mut nan_stage = None;
@@ -1092,7 +1104,7 @@ mod gate_tests {
             &cell_enc[..4]
         );
         ensure!(
-            enc_diff > 10.0 * tau_enc,
+            enc_diff > f64::from(10.0 * tau_enc),
             "control enc {enc_diff:.3e} did not clear 10x tau {tau_enc:.3e}"
         );
         println!("PASS multitalker_cells_control swapped_speakers x0={x0:.3e} enc={enc_diff:.3e}");
@@ -1358,8 +1370,8 @@ mod gate_tests {
                 .map(|value| Ok(value.as_u64().context("active lane")? as usize))
                 .collect()
         }
-        let mut pair = 0.0f32;
-        let mut worst = 0.0f32;
+        let mut pair = 0.0f64;
+        let mut worst = 0.0f64;
         let mut worst_where = String::new();
         for case in [
             "masked/meeting",
@@ -1440,11 +1452,11 @@ mod gate_tests {
                             && gpu_decisions[index]["token"] == decision["token"],
                         "{case} speaker {speaker} decision {index} arms disagree"
                     );
-                    let arm_pair = reference[index]
-                        .iter()
-                        .zip(&gpu_logits[index])
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0f32, f32::max);
+                    let (arm_pair, _) = crate::verify::max_abs_rmse(
+                        &format!("{case}.speaker{speaker}.d{index}.arms"),
+                        &reference[index],
+                        &gpu_logits[index],
+                    )?;
                     pair = pair.max(arm_pair);
                 }
                 let decision_rows: Vec<&[f32]> = decisions
@@ -1464,11 +1476,11 @@ mod gate_tests {
                 )?;
                 ensure!(candidate.len() == reference.len(), "candidate decisions");
                 for (index, logits) in candidate.iter().enumerate() {
-                    let diff = logits
-                        .iter()
-                        .zip(&reference[index])
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0f32, f32::max);
+                    let (diff, _) = crate::verify::max_abs_rmse(
+                        &format!("{case}.speaker{speaker}.d{index}"),
+                        logits,
+                        &reference[index],
+                    )?;
                     if diff > worst {
                         worst = diff;
                         worst_where = format!("{case} speaker {speaker} decision {index}");
@@ -1476,10 +1488,11 @@ mod gate_tests {
                     // Ruling 2026-11-13T15:38:10Z: argmax equality is
                     // required at every decision whose reference margin
                     // exceeds 2 x tau.
-                    let mut sorted = reference[index].clone();
-                    sorted.sort_by(|a, b| b.total_cmp(a));
-                    let margin = sorted[0] - sorted[1];
-                    if margin > 2.0 * TAU {
+                    let (_, margin) = crate::verify::top_two(
+                        &format!("{case}.speaker{speaker}.d{index}.margin"),
+                        &reference[index],
+                    )?;
+                    if margin > f64::from(2.0 * TAU) {
                         let argmax = logits
                             .iter()
                             .enumerate()
@@ -1501,18 +1514,18 @@ mod gate_tests {
             }
         }
         ensure!(
-            pair * 2.0 <= TAU,
+            pair * 2.0 <= f64::from(TAU),
             "arm pair {pair:.3e} exceeds half the frozen tau"
         );
         ensure!(
-            worst <= TAU,
+            worst <= f64::from(TAU),
             "teacher-forced logits diff {worst:.3e} > tau {TAU:.3e} at {worst_where}"
         );
         // Slot-carry control (ruling 2026-11-13T15:38:10Z): feeding the
         // other speaker's token history with this lane's rows - the
         // logits a slot-keyed carry would produce at the rotation - must
         // differ from the reference beyond tau somewhere.
-        let mut control_diff = 0.0f32;
+        let mut control_diff = 0.0f64;
         let mut control_where = String::new();
         for case in ["masked/arrival", "kernel/arrival"] {
             let speakers: Vec<usize> = cpu[case]["cells"]
@@ -1596,11 +1609,11 @@ mod gate_tests {
                 &other_tokens[..count],
             )?;
             for index in 0..count {
-                let diff = control[index]
-                    .iter()
-                    .zip(&this_reference[index])
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max);
+                let (diff, _) = crate::verify::max_abs_rmse(
+                    &format!("{case}.control.d{index}"),
+                    &control[index],
+                    &this_reference[index],
+                )?;
                 if diff > control_diff {
                     control_diff = diff;
                     control_where = format!("{case} decision {index}");
@@ -1609,7 +1622,7 @@ mod gate_tests {
             let _ = this_tokens;
         }
         ensure!(
-            control_diff > TAU,
+            control_diff > f64::from(TAU),
             "slot-carry control diff {control_diff:.3e} <= tau {TAU:.3e} at {control_where}"
         );
         println!(
@@ -1825,11 +1838,8 @@ mod trace_tests {
                 flatten(capture, &mut flat);
                 flat
             };
-            let diff = ours
-                .iter()
-                .zip(&theirs)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max);
+            let (diff, _) =
+                crate::verify::max_abs_rmse(&format!("multitalker.layer.{index}"), ours, &theirs)?;
             println!("LAYER {index:02} maxdiff {diff:.3e}");
             if diff > 1.0 && named.is_none() {
                 named = Some((index, diff));
@@ -1894,11 +1904,11 @@ mod inject_tests {
                 .encoder
                 .multitalker_inject_layer(index, &input_dev, &mut session)?;
             let ours = model.encoder.stream.clone_dtoh(&output)?;
-            let diff = ours
-                .iter()
-                .zip(&expected)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max);
+            let (diff, _) = crate::verify::max_abs_rmse(
+                &format!("multitalker.common.{index}"),
+                &ours,
+                &expected,
+            )?;
             println!("COMMON_INPUT layer {index:02} maxdiff {diff:.3e}");
             if index == 0 {
                 let submodules = cells["kernel/step0"]["layer0_submodules"]

@@ -11267,15 +11267,7 @@ mod tests {
             read_f32_tensor(&st, key)
         };
         let metric = |a: &[f32], b: &[f32]| -> Result<(f64, f64)> {
-            ensure!(a.len() == b.len() && !a.is_empty(), "cell extent mismatch");
-            let mut maximum = 0.0f64;
-            let mut square = 0.0f64;
-            for (x, y) in a.iter().zip(b) {
-                let d = f64::from(*x) - f64::from(*y);
-                maximum = maximum.max(d.abs());
-                square += d * d;
-            }
-            Ok((maximum, (square / a.len() as f64).sqrt()))
+            crate::verify::max_abs_rmse("vision.conditioning", a, b)
         };
         fn other_case(fixture: &str, side: u32) -> String {
             let other = if fixture == "cottage" {
@@ -11782,24 +11774,9 @@ mod tests {
                          comparison: &str,
                          gated: bool|
          -> Result<()> {
-            ensure!(
-                candidate.len() == reference.len()
-                    && !candidate.is_empty()
-                    && candidate.iter().chain(reference).all(|x| x.is_finite()),
-                "image candidate extent/value failure"
-            );
-            let (max, sum) =
-                candidate
-                    .iter()
-                    .zip(reference)
-                    .fold((0f64, 0f64), |(max, sum), (&a, &b)| {
-                        let d = f64::from(a) - f64::from(b);
-                        (max.max(d.abs()), sum + d * d)
-                    });
-            for (metric, value) in [
-                ("max_abs", max),
-                ("rmse", (sum / candidate.len() as f64).sqrt()),
-            ] {
+            let (max, rmse) =
+                crate::verify::max_abs_rmse(&format!("vision.image.{name}"), candidate, reference)?;
+            for (metric, value) in [("max_abs", max), ("rmse", rmse)] {
                 let bound = cells[name]["bounds"][metric]
                     .as_f64()
                     .context("image bound missing")?;
@@ -12344,37 +12321,20 @@ mod tests {
 
     /// Metrics of one candidate/reference tap: max and mean absolute difference, p99, and cosine.
     fn tap_metrics(candidate: &[f32], reference: &[f32]) -> Result<serde_json::Value> {
-        ensure!(
-            candidate.len() == reference.len() && !candidate.is_empty(),
-            "tap extent mismatch"
-        );
-        ensure!(
-            candidate.iter().all(|v| v.is_finite()) && reference.iter().all(|v| v.is_finite()),
-            "non-finite tap value"
-        );
-        let mut worst = 0f32;
-        let mut sum = 0f64;
-        let mut dot = 0f64;
-        let mut norm_c = 0f64;
-        let mut norm_r = 0f64;
-        let mut diffs = Vec::with_capacity(candidate.len());
-        for (&c, &r) in candidate.iter().zip(reference) {
-            let diff = (c - r).abs();
-            worst = worst.max(diff);
-            sum += f64::from(diff);
-            diffs.push(diff);
-            dot += f64::from(c) * f64::from(r);
-            norm_c += f64::from(c) * f64::from(c);
-            norm_r += f64::from(r) * f64::from(r);
-        }
-        diffs.sort_by(f32::total_cmp);
+        let measured = crate::verify::metrics("minicpm.vision.tap", candidate, reference)?;
+        let mut diffs: Vec<f64> = candidate
+            .iter()
+            .zip(reference)
+            .map(|(&c, &r)| (f64::from(c) - f64::from(r)).abs())
+            .collect();
+        diffs.sort_by(f64::total_cmp);
         let p99 = diffs[(diffs.len() - 1) * 99 / 100];
         Ok(serde_json::json!({
             "elements": candidate.len(),
-            "max_abs": worst,
-            "mean_abs": sum / candidate.len() as f64,
+            "max_abs": measured.max_abs,
+            "mean_abs": measured.mean_abs,
             "p99_abs": p99,
-            "cosine": dot / (norm_c.sqrt() * norm_r.sqrt()),
+            "cosine": measured.cosine,
         }))
     }
 
@@ -13785,23 +13745,7 @@ mod tests {
     }
 
     fn max_abs_and_rmse(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
-        ensure!(
-            actual.len() == expected.len() && !actual.is_empty(),
-            "metric length mismatch: {} vs {}",
-            actual.len(),
-            expected.len()
-        );
-        let mut max_abs = 0.0f64;
-        let mut sum_sq = 0.0f64;
-        for (&a, &e) in actual.iter().zip(expected) {
-            ensure!(a.is_finite() && e.is_finite(), "non-finite tensor value");
-            let d = (f64::from(a) - f64::from(e)).abs();
-            if d > max_abs {
-                max_abs = d;
-            }
-            sum_sq += d * d;
-        }
-        Ok((max_abs, (sum_sq / actual.len() as f64).sqrt()))
+        crate::verify::max_abs_rmse("vision.metric", actual, expected)
     }
 
     fn read_f32_tensor(st: &safetensors::SafeTensors<'_>, key: &str) -> Result<Vec<f32>> {
@@ -14164,7 +14108,10 @@ mod tests {
                 };
                 let e =
                     f32::from_le_bytes(expected.data()[logical * 4..logical * 4 + 4].try_into()?);
-                ensure!(a.is_finite() && e.is_finite(), "nonfinite value {tag}");
+                ensure!(
+                    a.is_finite() && e.is_finite(),
+                    "Runner FAIL {tag}: non-finite at [{index}]"
+                );
                 let d = f64::from(a) - f64::from(e);
                 maximum = maximum.max(d.abs());
                 squares += d * d;

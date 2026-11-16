@@ -5230,16 +5230,9 @@ mod tests {
     }
 
     /// `[max_abs, rel_rms, cosine]` of `candidate` against `reference`.
-    fn distance(candidate: &[f64], reference: &[f64]) -> [f64; 3] {
-        let (mut max_abs, mut diff, mut cc, mut rr, mut cr) = (0f64, 0f64, 0f64, 0f64, 0f64);
-        for (&c, &r) in candidate.iter().zip(reference) {
-            max_abs = max_abs.max((c - r).abs());
-            diff += (c - r) * (c - r);
-            cc += c * c;
-            rr += r * r;
-            cr += c * r;
-        }
-        [max_abs, (diff / rr).sqrt(), cr / (cc.sqrt() * rr.sqrt())]
+    fn distance(candidate: &[f64], reference: &[f64]) -> Result<[f64; 3]> {
+        let measured = crate::verify::metrics("h3.distance", candidate, reference)?;
+        Ok([measured.max_abs, measured.rel_rmse, measured.cosine])
     }
 
     fn within(d: [f64; 3], threshold: &serde_json::Value) -> Result<bool> {
@@ -5379,13 +5372,13 @@ mod tests {
                     }
                 }
                 let threshold = &thresholds[format!("A.{name}")];
-                let d = distance(&candidate, &expected);
+                let d = distance(&candidate, &expected)?;
                 ensure!(within(d, threshold)?, "{name} {d:?} outside {threshold}");
                 let (c, r): (Vec<f64>, Vec<f64>) = swapped
                     .iter()
                     .flat_map(|(c, r)| c.iter().copied().zip(r.iter().copied()))
                     .unzip();
-                control_failed |= !within(distance(&c, &r), threshold)?;
+                control_failed |= !within(distance(&c, &r)?, threshold)?;
                 worst = [worst[0].max(d[0]), worst[1].max(d[1]), worst[2].min(d[2])];
                 checked += 1;
             }
@@ -5400,7 +5393,7 @@ mod tests {
                 candidate.extend_from_slice(&norm_out[g * norm..][..norm]);
                 expected.extend_from_slice(&reference[t as usize * norm..][..norm]);
             }
-            let d = distance(&candidate, &expected);
+            let d = distance(&candidate, &expected)?;
             let threshold = &thresholds[format!("A.{name}")];
             ensure!(within(d, threshold)?, "{name} {d:?} outside {threshold}");
             checked += 1;
@@ -6484,9 +6477,9 @@ mod tests {
             candidate.iter().all(|v| v.is_finite()),
             "non-finite block output"
         );
-        let d = distance(&candidate, &reference);
-        let d_capture = distance(&candidate, &captured);
-        let d_control = distance(&control, &reference);
+        let d = distance(&candidate, &reference)?;
+        let d_capture = distance(&candidate, &captured)?;
+        let d_control = distance(&control, &reference)?;
         println!(
             "H3_BLOCK0 candidate_vs_fp32={d:?} candidate_vs_bf16_capture={d_capture:?} lora0_vs_fp32={d_control:?} rotary_bf16_differs={rotary_differs}/{} threshold={threshold}",
             rows * rotary_width
@@ -6724,27 +6717,27 @@ mod tests {
         // block-vs-definition arithmetic spread measured here with the official BF16 weights on the same
         // conditioning (the `official` arm shares the GGUF temb/rotary and the GGUF AdaLN table).
         let arm_pairs = [
-            ("bf16_vs_fp32", distance(&reference_bf16, &reference_fp32)),
+            ("bf16_vs_fp32", distance(&reference_bf16, &reference_fp32)?),
             (
                 "bf16_vs_bf16_strict",
-                distance(&reference_bf16, &reference_bf16_strict),
+                distance(&reference_bf16, &reference_bf16_strict)?,
             ),
             (
                 "fp32_vs_bf16_strict",
-                distance(&reference_fp32, &reference_bf16_strict),
+                distance(&reference_fp32, &reference_bf16_strict)?,
             ),
         ];
         let arm_floor = arm_pairs.iter().fold([0.0f64, 0.0, 2.0], |floor, (_, d)| {
             [floor[0].max(d[0]), floor[1].max(d[1]), floor[2].min(d[2])]
         });
-        let engine_floor = distance(&engine_official, &reference_official);
+        let engine_floor = distance(&engine_official, &reference_official)?;
         let floor = [
             arm_floor[0].max(engine_floor[0]),
             arm_floor[1].max(engine_floor[1]),
             arm_floor[2].min(engine_floor[2]),
         ];
-        let d = distance(&candidate, &reference_bf16);
-        let d_control = distance(&control, &reference_bf16);
+        let d = distance(&candidate, &reference_bf16)?;
+        let d_control = distance(&control, &reference_bf16)?;
         let abs_tau = (2.0 * floor[0]).max(1e-5);
         let rel_tau = (2.0 * floor[1]).max(1e-6);
         let cos_tau = 1.0 - 2.0 * (1.0 - floor[2]);
@@ -6963,7 +6956,7 @@ mod tests {
         };
         let expected_bf16 = to_f64(&modulation("bf16")?);
         let expected_fp32 = to_f64(&modulation("fp32")?);
-        let floor = distance(&expected_bf16, &expected_fp32);
+        let floor = distance(&expected_bf16, &expected_fp32)?;
 
         let pairs: Vec<(u32, u8)> = (0..timesteps.len() as u32)
             .flat_map(|t| (0..MODALITIES).map(move |tag| (t, tag as u8)))
@@ -7016,8 +7009,8 @@ mod tests {
                 }
             }
         }
-        let d = distance(&candidate, &expected);
-        let d_control = distance(&control_candidate, &control_expected);
+        let d = distance(&candidate, &expected)?;
+        let d_control = distance(&control_candidate, &control_expected)?;
         let abs_tau = (2.0 * floor[0]).max(1e-5);
         let rel_tau = (2.0 * floor[1]).max(1e-6);
         let cos_tau = 1.0 - 2.0 * (1.0 - floor[2]);
@@ -7222,8 +7215,8 @@ mod tests {
             );
             let (reference, _) = decoded(&replay, &format!("step{k}.noise_pred"))?;
             let (audio_reference, _) = decoded(&replay, &format!("step{k}.audio_noise_pred"))?;
-            let d_video = distance(&candidate[0], &reference[condition * patch..]);
-            let d_audio = distance(&candidate[1], &audio_reference);
+            let d_video = distance(&candidate[0], &reference[condition * patch..])?;
+            let d_audio = distance(&candidate[1], &audio_reference)?;
             let video_threshold = &thresholds[format!("{cell}.step{k}.noise_pred")];
             let audio_threshold = &thresholds[format!("{cell}.step{k}.audio_noise_pred")];
             let verdict = [
@@ -7244,8 +7237,8 @@ mod tests {
                     "rotated-text"
                 };
                 let control = evaluate(control_text, chunked_control)?;
-                let c_video = distance(&control[0], &reference[condition * patch..]);
-                let c_audio = distance(&control[1], &audio_reference);
+                let c_video = distance(&control[0], &reference[condition * patch..])?;
+                let c_audio = distance(&control[1], &audio_reference)?;
                 println!("H3_DIT step{k} {kind} control video={c_video:?} audio={c_audio:?}");
                 control_failed =
                     !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?;
@@ -7452,16 +7445,16 @@ mod tests {
             .sum();
         drop(serial);
         println!("H3_CHAIN_MODULATION_IDENTITY cell={cell} bit_differences={bits} limit=0");
-        let d_video = distance(&candidate[0][condition..], &final_video_rows);
-        let d_audio = distance(&candidate[1], &final_audio_rows);
+        let d_video = distance(&candidate[0][condition..], &final_video_rows)?;
+        let d_audio = distance(&candidate[1], &final_audio_rows)?;
         let video_threshold = &thresholds[format!("{cell}.final.latents")];
         let audio_threshold = &thresholds[format!("{cell}.final.audio_latents")];
         println!(
             "H3_CHAIN video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold}"
         );
         let control = chain((&audio_grid, &video_grid))?;
-        let c_video = distance(&control[0][condition..], &final_video_rows);
-        let c_audio = distance(&control[1], &final_audio_rows);
+        let c_video = distance(&control[0][condition..], &final_video_rows)?;
+        let c_audio = distance(&control[1], &final_audio_rows)?;
         println!("H3_CHAIN swapped-grid control video={c_video:?} audio={c_audio:?}");
         fs::remove_dir(&runtime)?;
         ensure!(
@@ -7654,7 +7647,7 @@ mod tests {
                     got.iter().all(|v| v.is_finite()),
                     "cell {cell} {name}: non-finite output"
                 );
-                let d = distance(got, want);
+                let d = distance(got, want)?;
                 let ok = within(d, &frozen["thresholds"][format!("{cell}.vision.{name}")])?;
                 println!("H3_VISION cell={cell} {name}={d:?} within={ok}");
                 if !ok {
@@ -7667,7 +7660,7 @@ mod tests {
         let shifted = run(&tower, a)?;
         let expected = reference("A")?;
         for (k, name) in names.iter().enumerate().skip(1) {
-            let d = distance(&shifted[k], &expected[k]);
+            let d = distance(&shifted[k], &expected[k])?;
             println!("H3_VISION shifted-taps control cell=A {name}={d:?}");
             ensure!(
                 !within(d, &frozen["thresholds"][format!("A.vision.{name}")])?,
@@ -7717,7 +7710,7 @@ mod tests {
         let mut ok = inter.is_subset(&candidate) && candidate.is_subset(&union);
         let mut sink_rows = Vec::new();
         for &r in &inter {
-            let d = distance(&row(got, r), &row(want, r));
+            let d = distance(&row(got, r), &row(want, r))?;
             let bound = &cell["rows"][r.to_string()];
             let within_row = d[1] <= number(bound, "rel_max")? && d[2] >= number(bound, "cos_min")?;
             ok &= within_row;
@@ -7725,7 +7718,7 @@ mod tests {
         }
         let keep: Vec<usize> = (0..rows).filter(|r| !union.contains(r)).collect();
         let gather = |v: &[f64]| keep.iter().flat_map(|&r| row(v, r)).collect::<Vec<_>>();
-        let aggregate = distance(&gather(got), &gather(want));
+        let aggregate = distance(&gather(got), &gather(want))?;
         ok &= within(aggregate, &cell["aggregate"])?;
         Ok((
             ok,
@@ -8143,7 +8136,8 @@ mod tests {
             reference.len()
         );
         let all: Vec<usize> = (0..total).collect();
-        let (mut dd, mut rr, mut cc, mut cr, mut max) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        let mut got = Vec::new();
+        let mut want = Vec::new();
         for c in 0..channels {
             for &f in frames.unwrap_or(&all) {
                 let base = (c * total + f) * plane;
@@ -8151,17 +8145,13 @@ mod tests {
                     .iter()
                     .zip(reference[4 * base..4 * (base + plane)].as_chunks::<4>().0)
                 {
-                    let (x, r) = (f64::from(x.to_f32()), f64::from(f32::from_le_bytes(*r)));
-                    let d = x - r;
-                    max = max.max(d.abs());
-                    dd += d * d;
-                    rr += r * r;
-                    cc += x * x;
-                    cr += x * r;
+                    got.push(f64::from(x.to_f32()));
+                    want.push(f64::from(f32::from_le_bytes(*r)));
                 }
             }
         }
-        Ok([max, (dd / rr).sqrt(), cr / (cc * rr).sqrt()])
+        let measured = crate::verify::metrics("h3.video", &got, &want)?;
+        Ok([measured.max_abs, measured.rel_rmse, measured.cosine])
     }
 
     #[test]
@@ -8675,7 +8665,7 @@ mod tests {
                     reference.dtype(),
                     reference.shape()
                 );
-                let d = distance(&as64(candidate), &as64(&f32s(reference.data())));
+                let d = distance(&as64(candidate), &as64(&f32s(reference.data())))?;
                 let name = format!("{cell}.keyframe.k0.{key}");
                 let ok = within(d, &frozen["cells"][&name])?;
                 println!("H3_VAE_KEYFRAME cell={cell} {key}={d:?} within={ok}");
@@ -8686,7 +8676,7 @@ mod tests {
             if cell == "A" {
                 let untiled = encode(&crate::minimax_h3::VaeTiles::whole(height, width))?;
                 let reference = f32s(file.tensor("k0.latents")?.data());
-                let d = distance(&as64(&untiled[2]), &as64(&reference));
+                let d = distance(&as64(&untiled[2]), &as64(&reference))?;
                 let failed = !within(d, &frozen["cells"]["A.keyframe.k0.latents"])?;
                 println!("H3_VAE_KEYFRAME tiling-off control cell=A latents={d:?} fails={failed}");
                 tiling_off = Some(failed);
@@ -8783,7 +8773,7 @@ mod tests {
         let mut defects = Vec::new();
         for cell in ["A", "P"] {
             let (candidate, reference) = decode(&decoder, cell)?;
-            let d = distance(&candidate, &reference);
+            let d = distance(&candidate, &reference)?;
             let key = format!("{cell}.decode.audio_decoder_output");
             let ok = within(d, &frozen["cells"][&key])?;
             println!("H3_AUDIO cell={cell} pcm={d:?} within={ok}");
@@ -8793,7 +8783,7 @@ mod tests {
         }
         let control = decoder.without_resampling();
         let (candidate, reference) = decode(&control, "A")?;
-        let d = distance(&candidate, &reference);
+        let d = distance(&candidate, &reference)?;
         let failed = !within(d, &frozen["cells"]["A.decode.audio_decoder_output"])?;
         println!("H3_AUDIO fir-off control cell=A pcm={d:?} fails={failed}");
         ensure!(failed, "FIR-off control passed the A audio bound");
@@ -9202,8 +9192,8 @@ mod tests {
         let video_b: Vec<f64> = b.video.iter().map(|&v| f64::from(v)).collect();
         let pcm: Vec<f64> = a.audio.iter().map(|&v| f64::from(v)).collect();
         let pcm_b: Vec<f64> = b.audio.iter().map(|&v| f64::from(v)).collect();
-        let video_d = distance(&video, &video_b);
-        let pcm_d = distance(&pcm, &pcm_b);
+        let video_d = distance(&video, &video_b)?;
+        let pcm_d = distance(&pcm, &pcm_b)?;
         ensure!(
             a.video != b.video || a.audio != b.audio,
             "the GGUF arm left the output unchanged"
@@ -9324,7 +9314,7 @@ mod tests {
                     .map(|v| f64::from(f32::from_le_bytes(*v)))
                     .collect::<Vec<_>>()
             };
-            let d = distance(&as64(pcm.data()), &as64(want.data()));
+            let d = distance(&as64(pcm.data()), &as64(want.data()))?;
             let key = format!("{cell}.decode.audio_decoder_output");
             let ok = within(d, &frozen["cells"][&key])?;
             println!("H3_SPLICE cell={cell} pcm={d:?} within={ok}");
@@ -9417,20 +9407,7 @@ mod tests {
     }
 
     fn image_max_rmse(candidate: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
-        ensure!(
-            candidate.len() == reference.len() && !candidate.is_empty(),
-            "cell length {} {}",
-            candidate.len(),
-            reference.len()
-        );
-        let mut max_abs = 0f64;
-        let mut sum = 0f64;
-        for (&x, &y) in candidate.iter().zip(reference) {
-            let delta = f64::from(x) - f64::from(y);
-            max_abs = max_abs.max(delta.abs());
-            sum += delta * delta;
-        }
-        Ok((max_abs, (sum / candidate.len() as f64).sqrt()))
+        crate::verify::max_abs_rmse("h3.image", candidate, reference)
     }
 
     /// Blocks placed per `FF_H3_PLACEMENT`, eager. Step 0 and step 5 are separate forwards on the same patchified
@@ -11100,24 +11077,7 @@ mod tests {
 
     /// `(max_abs, rmse)` in f64. Reference pairs were measured in f32; these taus are that measurement.
     fn max_rmse(candidate: &[f64], reference: &[f64]) -> Result<(f64, f64)> {
-        ensure!(
-            !candidate.is_empty() && candidate.len() == reference.len(),
-            "metric extent {} {}",
-            candidate.len(),
-            reference.len()
-        );
-        let mut max_abs = 0f64;
-        let mut square = 0f64;
-        for (&left, &right) in candidate.iter().zip(reference) {
-            ensure!(
-                left.is_finite() && right.is_finite(),
-                "non-finite metric input"
-            );
-            let delta = (left - right).abs();
-            max_abs = max_abs.max(delta);
-            square += delta * delta;
-        }
-        Ok((max_abs, (square / candidate.len() as f64).sqrt()))
+        crate::verify::max_abs_rmse("h3.max_rmse", candidate, reference)
     }
 
     fn f64_of_bf16(values: &[bf16]) -> Vec<f64> {

@@ -155,30 +155,11 @@ fn read_items(path: &Path, with_mel: bool) -> Result<Vec<Item>> {
 }
 
 fn difference(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
-    ensure!(
-        actual.len() == expected.len(),
-        "reference element count mismatch"
-    );
-    ensure!(
-        actual.iter().all(|value| value.is_finite()),
-        "non-finite candidate"
-    );
-    let mut maximum = 0.0f64;
-    let mut squares = 0.0f64;
-    for (&left, &right) in actual.iter().zip(expected) {
-        let error = f64::from(left - right).abs();
-        maximum = maximum.max(error);
-        squares += error * error;
-    }
-    Ok((maximum, (squares / actual.len() as f64).sqrt()))
+    crate::verify::max_abs_rmse("canary.difference", actual, expected)
 }
 
-fn bit_equal(left: &[f32], right: &[f32]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(a, b)| a.to_bits() == b.to_bits())
+fn bit_equal(left: &[f32], right: &[f32]) -> Result<bool> {
+    Ok(crate::verify::bit_mismatches("canary.bits", left, right)? == 0)
 }
 
 fn perturb_row(row: &mut [f32]) {
@@ -237,23 +218,14 @@ fn far(
     Ok(())
 }
 
-fn argmax_rows(logits: &[f32]) -> Vec<(usize, f32)> {
+fn argmax_rows(logits: &[f32]) -> Result<Vec<(usize, f64)>> {
     logits
         .chunks(VOCAB)
-        .map(|row| {
-            let mut best = 0usize;
-            let mut top = f32::NEG_INFINITY;
-            let mut second = f32::NEG_INFINITY;
-            for (index, &value) in row.iter().enumerate() {
-                if value > top {
-                    second = top;
-                    top = value;
-                    best = index;
-                } else if value > second {
-                    second = value;
-                }
-            }
-            (best, top - second)
+        .enumerate()
+        .map(|(row, row_logits)| {
+            let (id, margin) =
+                crate::verify::top_two(&format!("canary.argmax.r{row}"), row_logits)?;
+            Ok((id as usize, margin))
         })
         .collect()
 }
@@ -270,7 +242,7 @@ fn check_ids(defects: &mut Vec<String>, label: &str, logits: &[f32], spec: &Valu
         .as_array()
         .with_context(|| format!("missing {label} ids"))?;
     ensure!(expected.len() == SEQUENCE, "{label} id count");
-    let actual = argmax_rows(logits);
+    let actual = argmax_rows(logits)?;
     for (row, (expected_id, (actual_id, margin))) in expected.iter().zip(actual).enumerate() {
         let expected_id = expected_id
             .as_u64()
@@ -302,8 +274,8 @@ fn check_mask(
     let (max_bound, rmse_bound) = layer_bound;
     let (logit_max, logit_rmse) = logit_bound;
     ensure!(
-        bit_equal(&item.layer0_padded, &item.layer0)
-            && bit_equal(&item.logits_padded, &item.logits),
+        bit_equal(&item.layer0_padded, &item.layer0)?
+            && bit_equal(&item.logits_padded, &item.logits)?,
         "{label} padded-row fixture is not bit-equal"
     );
     let clean = engine.decode(&item.encoder, item.valid_rows, &item.tokens)?;
@@ -312,9 +284,9 @@ fn check_mask(
         let start = item.valid_rows * HIDDEN;
         perturb_row(&mut changed[start..start + HIDDEN]);
         let perturbed = engine.decode(&changed, item.valid_rows, &item.tokens)?;
-        if bit_equal(&clean.0, &perturbed.0)
-            && bit_equal(&clean.1, &perturbed.1)
-            && bit_equal(&clean.2, &perturbed.2)
+        if bit_equal(&clean.0, &perturbed.0)?
+            && bit_equal(&clean.1, &perturbed.1)?
+            && bit_equal(&clean.2, &perturbed.2)?
         {
             println!("{label} padded-row bit-equal PASS");
         } else {
@@ -894,7 +866,7 @@ fn compare_cached(
     engine.set_graph(false);
     let eager = engine.cached_logits(encoder, valid, tokens, PREFILL)?;
     ensure!(
-        bit_equal(&graph, &eager),
+        bit_equal(&graph, &eager)?,
         "{label} graph/eager logit mismatch at {}",
         first_mismatch(&graph, &eager)
     );
@@ -1082,7 +1054,7 @@ fn match_greedy(engine: &Canary, fixtures: &Path, floors: &Value, model: &Path) 
                 "{case}/{index} eager cross writes"
             );
             ensure!(
-                bit_equal(&logits, &eager),
+                bit_equal(&logits, &eager)?,
                 "{case}/{index} graph/eager logit mismatch at {}",
                 first_mismatch(&logits, &eager)
             );

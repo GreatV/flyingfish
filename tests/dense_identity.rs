@@ -309,10 +309,7 @@ fn hybrid_model_reference_outputs() -> Result<()> {
             .iter()
             .map(|&x| f32::from_le_bytes(x))
             .collect();
-        ensure!(
-            expected.iter().all(|v| v.is_finite()),
-            "RUNNER_FAIL nonfinite hybrid reference"
-        );
+        ensure!(!expected.is_empty(), "RUNNER_FAIL empty hybrid reference");
         for (repeat, graph) in [false, true, false].into_iter().enumerate() {
             let actual =
                 std::fs::read(output.join(format!("text{rows}-repeat{repeat}-graph{graph}.bin")))?;
@@ -334,19 +331,19 @@ fn hybrid_model_reference_outputs() -> Result<()> {
                     scale.is_finite() && scale > 0.0,
                     "RUNNER_FAIL hybrid reference RMS"
                 );
-                let (mut max_error, mut sum_error) = (0.0f64, 0.0f64);
-                for (&word, &value) in record[4..].as_chunks::<4>().0.iter().zip(expected) {
-                    let observed = f32::from_le_bytes(word);
-                    ensure!(
-                        observed.is_finite(),
-                        "RUNNER_FAIL hybrid candidate nonfinite"
-                    );
-                    let error = f64::from(observed) - f64::from(value);
-                    max_error = max_error.max(error.abs());
-                    sum_error += error * error;
-                }
+                let observed: Vec<f32> = record[4..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| f32::from_le_bytes(*word))
+                    .collect();
+                let (max_error, step_rmse) = flyingfish::verify::max_abs_rmse(
+                    &format!("dense.hybrid.r{rows}.s{step}"),
+                    &observed,
+                    expected,
+                )?;
                 maximum = maximum.max(max_error / scale);
-                rms = rms.max((sum_error / vocab as f64).sqrt() / scale);
+                rms = rms.max(step_rmse / scale);
                 let mut order: Vec<_> = (0..vocab).collect();
                 order
                     .sort_unstable_by(|&a, &b| expected[b].total_cmp(&expected[a]).then(a.cmp(&b)));

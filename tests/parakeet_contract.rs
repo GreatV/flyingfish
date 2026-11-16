@@ -104,18 +104,7 @@ fn i64_values(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<i64>> {
 }
 
 fn difference(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
-    ensure!(
-        actual.len() == expected.len(),
-        "reference element count mismatch"
-    );
-    let mut maximum = 0.0f64;
-    let mut squares = 0.0f64;
-    for (&a, &b) in actual.iter().zip(expected) {
-        let error = f64::from(a - b).abs();
-        maximum = maximum.max(error);
-        squares += error * error;
-    }
-    Ok((maximum, (squares / actual.len() as f64).sqrt()))
+    flyingfish::verify::max_abs_rmse("parakeet.contract", actual, expected)
 }
 
 struct ReferenceFeatures {

@@ -4391,27 +4391,11 @@ fn hi3d_cascade_heun_updates_gpu() -> Result<()> {
     gate.finish()
 }
 fn metrics(x: &[f64], y: &[f64]) -> Result<BTreeMap<&'static str, f64>> {
-    ensure!(!x.is_empty() && x.len() == y.len(), "metric shape mismatch");
-    let (mut max, mut square, mut dot, mut xx, mut yy) = (0f64, 0f64, 0f64, 0f64, 0f64);
-    for (&a, &b) in x.iter().zip(y) {
-        ensure!(a.is_finite() && b.is_finite(), "non-finite gate input");
-        let d = a - b;
-        max = max.max(d.abs());
-        square += d * d;
-        dot += a * b;
-        xx += a * a;
-        yy += b * b;
-    }
-    let cosine = if xx > 0.0 && yy > 0.0 {
-        (1.0 - dot / (xx * yy).sqrt()).clamp(0.0, 2.0)
-    } else if xx == yy {
-        0.0
-    } else {
-        1.0
-    };
+    let measured = crate::verify::metrics("pixal3d", x, y)?;
+    let cosine = (1.0 - measured.cosine).clamp(0.0, 2.0);
     Ok(BTreeMap::from([
-        ("max_abs", max),
-        ("rmse", (square / x.len() as f64).sqrt()),
+        ("max_abs", measured.max_abs),
+        ("rmse", measured.rmse),
         ("cosine_error", cosine),
     ]))
 }
@@ -10534,7 +10518,8 @@ fn surface_divergence(
     );
     let mut flips = 0;
     let mut missing = 0;
-    let mut maximum = 0.0f32;
+    let mut got = Vec::new();
+    let mut want = Vec::new();
     for (point, values) in coordinates.iter().zip(reference.as_chunks::<8>().0) {
         let Some(row) = parents.row(*point) else {
             missing += 1;
@@ -10542,7 +10527,8 @@ fn surface_divergence(
         };
         for (bit, &expected) in values.iter().enumerate() {
             let actual = logits[row as usize * 8 + bit];
-            maximum = maximum.max((actual - expected).abs());
+            got.push(actual);
+            want.push(expected);
             if (actual > 0.0) != (expected > 0.0) {
                 if flips < 4 {
                     println!(
@@ -10554,6 +10540,16 @@ fn surface_divergence(
             }
         }
     }
+    let maximum = if got.is_empty() {
+        0.0
+    } else {
+        crate::verify::max_abs_rmse(
+            &format!("pixal3d.branch.{case}.{phase}.l{level}"),
+            &got,
+            &want,
+        )?
+        .0
+    };
     println!(
         "P1_M4A_BRANCH_MEASUREMENT {}",
         serde_json::json!({"case":case,"phase":phase,"level":level,"r0a_parents":coordinates.len(),"missing_parents":missing,"common_parent_max_abs":maximum,"sign_flips":flips,"gating":false})
@@ -12503,30 +12499,29 @@ fn generation_measurement(
     let expected = f32_tensor(path, "physical")?;
     let sites = SparseSites::new(expected_coordinates)?;
     let mut common = 0;
-    let mut maximum = 0.0f64;
-    let mut squares = 0.0f64;
+    let mut got = Vec::new();
+    let mut want = Vec::new();
     for (row, p) in coordinates.iter().enumerate() {
         if let Some(index) = sites.row([0, p[0], p[1], p[2]]) {
             common += 1;
             for channel in 0..32 {
-                let delta = f64::from(actual[row * 32 + channel])
-                    - f64::from(expected[index as usize * 32 + channel]);
-                maximum = maximum.max(delta.abs());
-                squares += delta * delta;
+                got.push(actual[row * 32 + channel]);
+                want.push(expected[index as usize * 32 + channel]);
             }
         }
     }
+    let (maximum, common_rmse) = if common == 0 {
+        (0.0, f64::NAN)
+    } else {
+        crate::verify::max_abs_rmse(&format!("pixal3d.chain.{name}"), &got, &want)?
+    };
     let union = coordinates.len() + sites.coordinates().len() - common;
     println!(
         "P1_M4C_CHAIN_MEASUREMENT name={name} native_rows={} reference_rows={} common={common} jaccard_disagreement={} prior_decoder_full_grid_reference_pair_jaccard_disagreement=0.5926020937353391 common_max_abs={maximum} common_rmse={} gating=false",
         coordinates.len(),
         sites.coordinates().len(),
         1.0 - common as f64 / union as f64,
-        if common > 0 {
-            (squares / (common * 32) as f64).sqrt()
-        } else {
-            f64::NAN
-        }
+        common_rmse
     );
     Ok(())
 }

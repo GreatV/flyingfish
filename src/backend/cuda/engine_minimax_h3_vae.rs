@@ -1077,17 +1077,7 @@ mod image_tests {
             !actual.is_empty() && actual.len() == reference.len(),
             "RUNNER_FAIL {label} lengths"
         );
-        ensure!(
-            actual.iter().chain(reference).all(|x| x.is_finite()),
-            "RUNNER_FAIL {label} nonfinite"
-        );
-        let (mut max_abs, mut squares) = (0f64, 0f64);
-        for (&a, &b) in actual.iter().zip(reference) {
-            let delta = f64::from(a) - f64::from(b);
-            max_abs = max_abs.max(delta.abs());
-            squares += delta * delta;
-        }
-        let rmse = (squares / actual.len() as f64).sqrt();
+        let (max_abs, rmse) = crate::verify::max_abs_rmse(label, actual, reference)?;
         let max_tau = threshold["max_abs"]
             .as_f64()
             .context("RUNNER_FAIL missing max_abs tau")?;
@@ -1968,7 +1958,7 @@ impl TileBatch {
 }
 
 #[cfg(test)]
-fn tile_bit_differences<T: super::Element + Copy>(
+fn tile_bit_differences<T: super::Element + Copy + PartialEq + 'static>(
     s: &Arc<CudaStream>,
     name: &str,
     serial: &CudaSlice<T>,
@@ -1982,23 +1972,34 @@ fn tile_bit_differences<T: super::Element + Copy>(
         let b = (head * capacity + tile * rows) * columns;
         let expected = s.clone_dtoh(&serial.slice(a..a + rows * columns))?;
         let actual = s.clone_dtoh(&grouped.slice(b..b + rows * columns))?;
-        let bytes = rows * columns * std::mem::size_of::<T>();
-        // Element implementations are BF16 and F32 scalars.
-        let (expected, actual) = unsafe {
-            (
-                std::slice::from_raw_parts(expected.as_ptr().cast::<u8>(), bytes),
-                std::slice::from_raw_parts(actual.as_ptr().cast::<u8>(), bytes),
-            )
+        let cell = format!("h3.vae.{name}.t{tile}.h{head}");
+        differences += if std::any::TypeId::of::<T>() == std::any::TypeId::of::<bf16>() {
+            let actual =
+                unsafe { std::slice::from_raw_parts(actual.as_ptr().cast::<bf16>(), actual.len()) };
+            let expected = unsafe {
+                std::slice::from_raw_parts(expected.as_ptr().cast::<bf16>(), expected.len())
+            };
+            crate::verify::bit_mismatches(&cell, actual, expected)?
+        } else if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+            let actual =
+                unsafe { std::slice::from_raw_parts(actual.as_ptr().cast::<f32>(), actual.len()) };
+            let expected = unsafe {
+                std::slice::from_raw_parts(expected.as_ptr().cast::<f32>(), expected.len())
+            };
+            crate::verify::bit_mismatches(&cell, actual, expected)?
+        } else if std::any::TypeId::of::<T>() == std::any::TypeId::of::<i8>() {
+            ensure!(
+                !actual.is_empty() && actual.len() == expected.len(),
+                "Runner FAIL {cell}: length mismatch"
+            );
+            actual
+                .iter()
+                .zip(&expected)
+                .filter(|(left, right)| left != right)
+                .count()
+        } else {
+            anyhow::bail!("Runner FAIL {cell}: unsupported element");
         };
-        ensure!(
-            T::finite(expected) && T::finite(actual),
-            "RUNNER_FAIL {name} nonfinite tile={tile}"
-        );
-        differences += expected
-            .chunks_exact(std::mem::size_of::<T>())
-            .zip(actual.chunks_exact(std::mem::size_of::<T>()))
-            .filter(|(a, b)| a != b)
-            .count();
     }
     println!(
         "H3_VAE_GROUP_OP name={name} tile={tile} bit_differences={differences} status={}",

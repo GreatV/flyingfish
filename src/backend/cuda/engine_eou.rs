@@ -272,16 +272,8 @@ impl Eou {
     /// Top1-top2 gap of the current joint logits, in logit units.
     fn joint_margin(&self) -> Result<f32> {
         let logits = self.encoder.stream.clone_dtoh(&self.joint_logits)?;
-        let (mut top1, mut top2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for &value in &logits {
-            if value > top1 {
-                top2 = top1;
-                top1 = value;
-            } else if value > top2 {
-                top2 = value;
-            }
-        }
-        Ok(top1 - top2)
+        let (_, margin) = crate::verify::top_two("eou.joint", &logits)?;
+        Ok(margin as f32)
     }
 
     /// Greedy RNNT decode over the offline encoder output; emits non-blank token indices.
@@ -387,16 +379,8 @@ pub(crate) mod tests {
             .collect())
     }
 
-    fn metrics(candidate: &[f32], reference: &[f32]) -> (f64, f64) {
-        assert_eq!(candidate.len(), reference.len());
-        let mut max_abs = 0f64;
-        let mut squares = 0f64;
-        for (left, right) in candidate.iter().zip(reference) {
-            let diff = f64::from(*left) - f64::from(*right);
-            max_abs = max_abs.max(diff.abs());
-            squares += diff * diff;
-        }
-        (max_abs, (squares / candidate.len() as f64).sqrt())
+    fn metrics(candidate: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
+        crate::verify::max_abs_rmse("eou.metrics", candidate, reference)
     }
 
     #[test]
@@ -425,8 +409,8 @@ pub(crate) mod tests {
             let reference_encoded = read_f32(&st, "encoder_out")?;
             assert_eq!(features.len(), reference_features.len());
             assert_eq!(encoded.len(), reference_encoded.len());
-            let (feature_abs, feature_rmse) = metrics(&features, &reference_features);
-            let (encode_abs, encode_rmse) = metrics(&encoded, &reference_encoded);
+            let (feature_abs, feature_rmse) = metrics(&features, &reference_features)?;
+            let (encode_abs, encode_rmse) = metrics(&encoded, &reference_encoded)?;
             let feature_tau =
                 &floors["metrics"][format!("media/{clip}.safetensors/features")]["tau"];
             let encode_tau =
@@ -668,16 +652,8 @@ mod stream_tests {
             .collect())
     }
 
-    fn metrics(candidate: &[f32], reference: &[f32]) -> (f64, f64) {
-        assert_eq!(candidate.len(), reference.len());
-        let mut max_abs = 0f64;
-        let mut squares = 0f64;
-        for (left, right) in candidate.iter().zip(reference) {
-            let diff = f64::from(*left) - f64::from(*right);
-            max_abs = max_abs.max(diff.abs());
-            squares += diff * diff;
-        }
-        (max_abs, (squares / candidate.len() as f64).sqrt())
+    fn metrics(candidate: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
+        crate::verify::max_abs_rmse("eou.metrics", candidate, reference)
     }
 
     #[test]
@@ -714,8 +690,8 @@ mod stream_tests {
             let cell_st = SafeTensors::deserialize(&cell_bytes)?;
             let ref0 = read_f32(&cell_st, "stream_step0_enc_out")?;
             let ref1 = read_f32(&cell_st, "stream_step1_enc_out")?;
-            let (m0, r0) = metrics(&s0.rows, &ref0);
-            let (m1, r1) = metrics(&s1.rows, &ref1);
+            let (m0, r0) = metrics(&s0.rows, &ref0)?;
+            let (m1, r1) = metrics(&s1.rows, &ref1)?;
             println!(
                 "EOU_S3_STEP step0 max_abs={m0:e} rmse={r0:e} step1 max_abs={m1:e} rmse={r1:e} s1_head={:?} ref1_head={:?}",
                 &s1.rows[..4],

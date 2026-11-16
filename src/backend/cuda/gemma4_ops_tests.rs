@@ -1142,9 +1142,8 @@ fn media_prefill_attention_gpu() -> Result<()> {
                 && fixture["k"].0 == [kv_heads, capacity, dim]
                 && fixture["v"].0 == fixture["k"].0
                 && fixture["oracle"].0 == [rows, heads, dim]
-                && expected.len() == count
-                && expected.iter().all(|v| v.is_finite()),
-            "RUNNER_FAIL attention fixture extents/finiteness"
+                && expected.len() == count,
+            "RUNNER_FAIL attention fixture extents"
         );
         let mut out = stream.clone_htod(&vec![bf16::from_bits(0x7fc1); count + 32])?;
         let run =
@@ -1198,18 +1197,11 @@ fn media_prefill_attention_gpu() -> Result<()> {
             )?;
             run(&mut op, &mut out, control)?;
             let actual = stream.clone_dtoh(&out)?;
-            ensure!(
-                actual[..count].iter().all(|v| v.is_finite()),
-                "RUNNER_FAIL attention nonfinite"
-            );
-            let mut maximum = 0.0f64;
-            let mut squared = 0.0;
-            for (actual, expected) in actual[..count].iter().zip(&expected) {
-                let error = actual.to_f64() - f64::from(*expected);
-                maximum = maximum.max(error.abs());
-                squared += error * error;
-            }
-            let rmse = (squared / count as f64).sqrt();
+            let (maximum, rmse) = crate::verify::max_abs_rmse(
+                &format!("gemma4.media_attention.{name}"),
+                &actual[..count],
+                &expected,
+            )?;
             let within = maximum <= max_limit && rmse <= rmse_limit;
             let guard = actual[count..].iter().all(|v| v.to_bits() == 0x7fc1);
             let pass = within != control && guard;
@@ -2406,24 +2398,19 @@ fn oracle_layer_distance(
             && candidate_values.len() == reference_values.len(),
         "oracle layer extent mismatch at layer {layer}"
     );
-    let (mut candidate_max, mut reference_max) = (0.0f64, 0.0f64);
-    let (mut candidate_sq, mut reference_sq) = (0.0f64, 0.0f64);
-    for ((candidate, oracle), reference) in candidate_values
-        .iter()
-        .zip(oracle_values)
-        .zip(reference_values)
-    {
-        let candidate_delta = f64::from(*candidate - *oracle);
-        let reference_delta = f64::from(*reference - *oracle);
-        candidate_max = candidate_max.max(candidate_delta.abs());
-        reference_max = reference_max.max(reference_delta.abs());
-        candidate_sq += candidate_delta * candidate_delta;
-        reference_sq += reference_delta * reference_delta;
-    }
-    let candidate_rmse = (candidate_sq / candidate_values.len() as f64).sqrt();
-    let reference_rmse = (reference_sq / reference_values.len() as f64).sqrt();
-    let beyond = candidate_max > 2.0 * reference_max || candidate_rmse > 2.0 * reference_rmse;
     let row = row.map_or_else(|| "all".to_owned(), |row| row.to_string());
+    let cell = format!("gemma4.oracle.{family}.{mode}.l{layer}.r{row}");
+    let (candidate_max, candidate_rmse) = crate::verify::max_abs_rmse(
+        &format!("{cell}.candidate"),
+        candidate_values,
+        oracle_values,
+    )?;
+    let (reference_max, reference_rmse) = crate::verify::max_abs_rmse(
+        &format!("{cell}.reference"),
+        reference_values,
+        oracle_values,
+    )?;
+    let beyond = candidate_max > 2.0 * reference_max || candidate_rmse > 2.0 * reference_rmse;
     println!(
         "GEMMA4_ORACLE_LAYER row={row} rows={} layer={layer} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} beyond_2x={beyond}",
         candidate_values.len() / hidden
@@ -2458,11 +2445,21 @@ fn oracle_store_distance(
     };
     let reference_values = &reference_values[row * width..(row + 1) * width];
     let oracle_values = &oracle_values[row * width..(row + 1) * width];
-    let (mut candidate_max, mut reference_max) = (0.0f64, 0.0f64);
-    let (mut candidate_sq, mut reference_sq) = (0.0f64, 0.0f64);
+    let cell = format!("gemma4.oracle_store.{channel}.{store}.r{row}");
+    let (candidate_max, candidate_rmse) = crate::verify::max_abs_rmse(
+        &format!("{cell}.candidate"),
+        candidate_values,
+        oracle_values,
+    )?;
+    let (reference_max, reference_rmse) = crate::verify::max_abs_rmse(
+        &format!("{cell}.reference"),
+        reference_values,
+        oracle_values,
+    )?;
     let mut reference_bit_equal = 0usize;
     let mut oracle_rounded_bit_equal = 0usize;
     let mut max_index = 0usize;
+    let mut seen = 0.0f64;
     let (mut candidate_at_max, mut reference_at_max, mut oracle_at_max) = (0.0f64, 0.0f64, 0.0f64);
     for (index, ((candidate, reference), oracle)) in candidate_values
         .iter()
@@ -2470,24 +2467,18 @@ fn oracle_store_distance(
         .zip(oracle_values)
         .enumerate()
     {
-        let candidate_delta = f64::from(*candidate - *oracle);
-        let reference_delta = f64::from(*reference - *oracle);
-        if candidate_delta.abs() > candidate_max {
+        let candidate_delta = f64::from(*candidate) - f64::from(*oracle);
+        if candidate_delta.abs() > seen {
+            seen = candidate_delta.abs();
             max_index = index;
             candidate_at_max = f64::from(*candidate);
             reference_at_max = f64::from(*reference);
             oracle_at_max = f64::from(*oracle);
         }
-        candidate_max = candidate_max.max(candidate_delta.abs());
-        reference_max = reference_max.max(reference_delta.abs());
-        candidate_sq += candidate_delta * candidate_delta;
-        reference_sq += reference_delta * reference_delta;
         reference_bit_equal += usize::from(candidate.to_bits() == reference.to_bits());
         oracle_rounded_bit_equal +=
             usize::from(candidate.to_bits() == bf16::from_f32(*oracle).to_f32().to_bits());
     }
-    let candidate_rmse = (candidate_sq / width as f64).sqrt();
-    let reference_rmse = (reference_sq / width as f64).sqrt();
     let beyond = candidate_max > 2.0 * reference_max || candidate_rmse > 2.0 * reference_rmse;
     let interval = 2.0 * (reference_at_max - oracle_at_max).abs();
     let interval_low = oracle_at_max - interval;
@@ -2613,18 +2604,16 @@ fn oracle_token_metrics(
         actual.len() == reference.len() && actual.len() == oracle.len(),
         "oracle token logit extent mismatch"
     );
-    let (mut candidate_max, mut reference_max) = (0.0f64, 0.0f64);
-    let (mut candidate_sq, mut reference_sq) = (0.0f64, 0.0f64);
-    for ((candidate, reference), oracle) in actual.iter().zip(reference).zip(oracle) {
-        let candidate_delta = f64::from(candidate.to_f32() - *oracle);
-        let reference_delta = f64::from(reference.to_f32() - *oracle);
-        candidate_max = candidate_max.max(candidate_delta.abs());
-        reference_max = reference_max.max(reference_delta.abs());
-        candidate_sq += candidate_delta * candidate_delta;
-        reference_sq += reference_delta * reference_delta;
-    }
-    let candidate_rmse = (candidate_sq / actual.len() as f64).sqrt();
-    let reference_rmse = (reference_sq / actual.len() as f64).sqrt();
+    let (candidate_max, candidate_rmse) = crate::verify::max_abs_rmse(
+        &format!("gemma4.oracle_token.{channel}.r{row}.candidate"),
+        actual,
+        oracle,
+    )?;
+    let (reference_max, reference_rmse) = crate::verify::max_abs_rmse(
+        &format!("gemma4.oracle_token.{channel}.r{row}.reference"),
+        reference,
+        oracle,
+    )?;
     let mut best = [f32::NEG_INFINITY; 2];
     for &score in oracle {
         if score > best[0] {
@@ -3141,17 +3130,12 @@ fn model_metrics(
         "model logit extent mismatch"
     );
     ensure!(!ids.is_empty(), "model metric requires rows");
-    ensure!(
-        actual.iter().all(|v| v.to_f32().is_finite()) && expected.iter().all(|v| v.is_finite()),
-        "Runner FAIL non-finite model logits"
-    );
     let vocab = expected.len() / ids.len();
     ensure!(
         expected.len() == ids.len() * vocab,
         "model logit rows mismatch"
     );
-    let mut maximum = 0.0f64;
-    let mut squared = 0.0f64;
+    let (maximum, rmse) = crate::verify::max_abs_rmse("gemma4.model", actual, expected)?;
     let mut losses = [0.0f64; 2];
     let mut qualified = 0usize;
     let mut id_defects = 0usize;
@@ -3160,11 +3144,6 @@ fn model_metrics(
         let a = &actual[row * vocab..(row + 1) * vocab];
         let b = &expected[row * vocab..(row + 1) * vocab];
         let mut reference_best = 0usize;
-        for (a, b) in a.iter().zip(b) {
-            let delta = f64::from(a.to_f32() - *b);
-            maximum = maximum.max(delta.abs());
-            squared += delta * delta;
-        }
         let mut best = [f32::NEG_INFINITY; 2];
         let mut candidate = 0usize;
         let mut candidate_best = f32::NEG_INFINITY;
@@ -3194,7 +3173,6 @@ fn model_metrics(
     }
     let count = ids.len().saturating_sub(1).max(1) as f64;
     let nll_delta = (losses[0] / count - losses[1] / count).abs();
-    let rmse = (squared / actual.len() as f64).sqrt();
     let pass = maximum <= bounds["output_max"].as_f64().context("output max")?
         && rmse <= bounds["output_rmse"].as_f64().context("output rmse")?
         && nll_delta <= bounds["nll_max"].as_f64().context("NLL max")?
@@ -3297,25 +3275,7 @@ fn native_path(
 }
 
 fn vision_distance(actual: &[f32], expected: &[f32], bounds: &serde_json::Value) -> Result<bool> {
-    let nonfinite = actual
-        .iter()
-        .chain(expected)
-        .filter(|value| !value.is_finite())
-        .count();
-    ensure!(
-        actual.len() == expected.len() && !actual.is_empty() && nonfinite == 0,
-        "Runner FAIL vision comparison extent actual={} expected={} nonfinite={nonfinite}",
-        actual.len(),
-        expected.len()
-    );
-    let mut maximum = 0.0f64;
-    let mut squared = 0.0f64;
-    for (a, b) in actual.iter().zip(expected) {
-        let delta = f64::from(*a) - f64::from(*b);
-        maximum = maximum.max(delta.abs());
-        squared += delta * delta;
-    }
-    let rmse = (squared / actual.len() as f64).sqrt();
+    let (maximum, rmse) = crate::verify::max_abs_rmse("gemma4.vision", actual, expected)?;
     let pass = maximum <= bounds["output_max"].as_f64().context("vision max")?
         && rmse <= bounds["output_rmse"].as_f64().context("vision RMSE")?;
     println!("vision_distance max={maximum} rmse={rmse} pass={pass}");
@@ -5120,21 +5080,10 @@ fn embedding_vector_distance(
         actual.len() == expected.len(),
         "embedding vector shape differs"
     );
-    ensure!(
-        actual.iter().all(|value| value.is_finite()),
-        "nonfinite embedding vector"
-    );
-    let (mut maximum, mut squared, mut dot, mut a, mut b) = (0f64, 0f64, 0f64, 0f64, 0f64);
-    for (&actual, &expected) in actual.iter().zip(expected) {
-        let (actual, expected) = (f64::from(actual), f64::from(expected));
-        maximum = maximum.max((actual - expected).abs());
-        squared += (actual - expected).powi(2);
-        dot += actual * expected;
-        a += actual * actual;
-        b += expected * expected;
-    }
-    let rmse = (squared / actual.len() as f64).sqrt();
-    let cosine = 1.0 - dot / (a.sqrt() * b.sqrt());
+    let measured = crate::verify::metrics("gemma4.embedding_vector", actual, expected)?;
+    let maximum = measured.max_abs;
+    let rmse = measured.rmse;
+    let cosine = 1.0 - measured.cosine;
     let pass = maximum <= bounds["output_max"].as_f64().context("vector max")?
         && rmse <= bounds["output_rmse"].as_f64().context("vector RMSE")?
         && cosine
@@ -5543,13 +5492,8 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         let probe_input = reference_bf16(&data, "stage.a.input_layernorm")?;
         let projected = engine.gemma_linear_probe("self_attn.q_proj.weight", probe_input)?;
         let expected = reference_bf16(&data, "stage.a.q_proj")?;
-        let delta: Vec<f32> = projected
-            .iter()
-            .zip(expected)
-            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-            .collect();
-        let maximum = delta.iter().copied().fold(0.0f32, f32::max);
-        let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+        let (maximum, rmse) =
+            crate::verify::max_abs_rmse("gemma4.linear_probe.q_proj", &projected, expected)?;
         println!("GEMMA4_LINEAR_PROBE output_max={maximum} output_rmse={rmse}");
         let first_ids: Vec<u32> = serde_json::from_value(ids["short"][0].clone())?;
         let mut trace = crate::trace::Trace::all_layers();
@@ -5579,26 +5523,19 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             .copied()
             .collect();
         let k_raw = &raw[rows * qv_stride..rows * (qv_stride + kv_width)];
-        let delta: Vec<f32> = native_projected
-            .iter()
-            .zip(&q_raw)
-            .map(|(a, b)| (a.to_f32() - b).abs())
-            .collect();
-        let maximum = delta.iter().copied().fold(0.0f32, f32::max);
-        let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+        let (maximum, rmse) =
+            crate::verify::max_abs_rmse("gemma4.linear_native.q", &native_projected, &q_raw)?;
         println!("GEMMA4_LINEAR_NATIVE_PROBE output_max={maximum} output_rmse={rmse}");
         for (role, slice) in [
             ("self_attn.k_proj.weight", k_raw),
             ("self_attn.v_proj.weight", v_raw.as_slice()),
         ] {
             let projected = engine.gemma_linear_probe(role, &native_input)?;
-            let delta: Vec<f32> = projected
-                .iter()
-                .zip(slice)
-                .map(|(a, b)| (a.to_f32() - b).abs())
-                .collect();
-            let maximum = delta.iter().copied().fold(0.0f32, f32::max);
-            let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+            let (maximum, rmse) = crate::verify::max_abs_rmse(
+                &format!("gemma4.linear_native.{role}"),
+                &projected,
+                slice,
+            )?;
             println!("GEMMA4_LINEAR_NATIVE_PROBE {role} output_max={maximum} output_rmse={rmse}");
         }
         let (native_k, native_v) = engine.gemma_kv_rows(0, first_ids.len())?;
@@ -6644,21 +6581,7 @@ fn gemma4_causal_decode_d512_gpu() -> Result<()> {
         .context("e512-unit lse_max missing")?;
 
     let error_pair = |actual: &[f64], expected: &[f64]| -> Result<(f64, f64)> {
-        ensure!(
-            !actual.is_empty() && actual.len() == expected.len(),
-            "error slice length mismatch {} vs {}",
-            actual.len(),
-            expected.len()
-        );
-        let mut peak = 0.0f64;
-        let mut sum_sq = 0.0f64;
-        for (&a, &e) in actual.iter().zip(expected) {
-            ensure!(a.is_finite() && e.is_finite(), "non-finite attention value");
-            let diff = (a - e).abs();
-            peak = peak.max(diff);
-            sum_sq += diff * diff;
-        }
-        Ok((peak, (sum_sq / actual.len() as f64).sqrt()))
+        crate::verify::max_abs_rmse("gemma4.attention", actual, expected)
     };
 
     let capacity = 8208usize;

@@ -1695,27 +1695,12 @@ mod tests {
             actual.len() == expected.len() && actual.len() == control.len() && !actual.is_empty(),
             "quadric field extent mismatch"
         );
-        ensure!(
-            actual
-                .iter()
-                .chain(expected)
-                .chain(control)
-                .all(|v| v.is_finite()),
-            "nonfinite quadric field"
-        );
-        let stats = |values: &[f64]| {
-            let delta: Vec<_> = values
-                .iter()
-                .zip(expected)
-                .map(|(a, b)| (a - b).abs())
-                .collect();
-            [
-                delta.iter().copied().fold(0.0, f64::max),
-                (delta.iter().map(|v| v * v).sum::<f64>() / delta.len() as f64).sqrt(),
-            ]
-        };
-        let error = stats(actual);
-        let bad = stats(control);
+        let error_pair =
+            crate::verify::max_abs_rmse(&format!("sparse.qem.{name}"), actual, expected)?;
+        let bad_pair =
+            crate::verify::max_abs_rmse(&format!("sparse.qem.{name}.control"), control, expected)?;
+        let error = [error_pair.0, error_pair.1];
+        let bad = [bad_pair.0, bad_pair.1];
         let tau = [
             field["tau"]["max_abs"]
                 .as_f64()
@@ -3055,16 +3040,16 @@ mod tests {
             radius > 0.0 && radius.is_finite(),
             "normalization definition radius invalid"
         );
-        let mut maximum = 0.0f64;
-        let mut sum = 0.0;
+        let mut scaled = Vec::with_capacity(normalized.len());
+        let mut rows = Vec::with_capacity(normalized.len());
         for (&point, row) in mesh.points.iter().zip(normalized.as_chunks::<3>().0) {
             for axis in 0..3 {
-                let error = ((point[axis] - mean[axis]) / radius - row[axis]).abs();
-                maximum = maximum.max(error);
-                sum += error * error;
+                scaled.push((point[axis] - mean[axis]) / radius);
+                rows.push(row[axis]);
             }
         }
-        let rms = (sum / normalized.len() as f64).sqrt();
+        let (maximum, rms) =
+            crate::verify::max_abs_rmse(&format!("sparse.norm.final.{case}"), &scaled, &rows)?;
         let defects = usize::from(
             maximum
                 > bounds["max_abs"]
@@ -3527,32 +3512,21 @@ mod tests {
         );
         let max_bound = bounds["max_abs"].as_f64().context("max bound missing")?;
         let rms_bound = bounds["RMS"].as_f64().context("RMS bound missing")?;
-        let measure = |actual: &[f64]| {
-            let mut max = 0.0f64;
-            let mut squared = 0.0;
-            for (&a, &b) in actual.iter().zip(&expected) {
-                let delta = a - b;
-                max = max.max(delta.abs());
-                squared += delta * delta;
-            }
-            (max, (squared / actual.len() as f64).sqrt())
+        let measure = |cell: &str, actual: &[f64]| -> Result<(f64, f64)> {
+            crate::verify::max_abs_rmse(cell, actual, &expected)
         };
-        ensure!(
-            vertices.iter().all(|v| v.is_finite()),
-            "nonfinite normalized mesh"
-        );
-        let (max, rms) = measure(&vertices);
+        let (max, rms) = measure("sparse.norm.vertices", &vertices)?;
         let boundary = vertices
             .iter()
             .map(|&v| f64::from(v as f32))
             .collect::<Vec<_>>();
-        let (boundary_max, boundary_rms) = measure(&boundary);
+        let (boundary_max, boundary_rms) = measure("sparse.norm.boundary", &boundary)?;
         let control = mesh_values(&reference, "aabb_control")?;
         ensure!(
             control.len() == expected.len(),
             "normalization control extent differs"
         );
-        let (control_max, control_rms) = measure(&control);
+        let (control_max, control_rms) = measure("sparse.norm.control", &control)?;
         ensure!(
             control_max > 10.0 * max_bound && control_rms > 10.0 * rms_bound,
             "normalization control does not discriminate"
