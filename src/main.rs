@@ -1053,11 +1053,13 @@ fn music(
                 prompt_ids,
                 frames,
                 seed,
+                device: cli.device,
             },
             &runtime_dir,
         )?;
+        let pcm = result.interleaved()?;
         let mut bytes = Vec::new();
-        flyingfish::media::write_wav(&mut bytes, spec.output_rate as usize, 2, &result.pcm)?;
+        flyingfish::media::write_wav(&mut bytes, spec.output_rate as usize, 2, &pcm)?;
         if let Some(output) = output {
             ensure!(
                 output.extension().is_some_and(|value| value == "wav"),

@@ -670,6 +670,7 @@ mod e2e {
                 prompt_ids: ids,
                 frames,
                 seed: 7,
+                device: 0,
             },
             codes,
             initial,

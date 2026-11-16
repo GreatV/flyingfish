@@ -257,13 +257,24 @@ impl Runtime {
         frames: usize,
         device_limit: usize,
     ) -> Result<Self> {
+        Self::load_on(model, runtime, prompt, frames, device_limit, 0)
+    }
+
+    pub fn load_on(
+        model: &Path,
+        runtime: &Path,
+        prompt: usize,
+        frames: usize,
+        device_limit: usize,
+        ordinal: usize,
+    ) -> Result<Self> {
         let ar = ArCheckpoint::open(model)?;
         ensure!(
             (1..=5000).contains(&prompt) && (1..=9000).contains(&frames),
             "AR request capacity"
         );
         let capacity = prompt + frames;
-        let device = Device::new(0)?;
+        let device = Device::new(ordinal)?;
         let (free, total) = device.ctx.mem_get_info()?;
         let initial_free = free;
         ensure!(
@@ -1404,14 +1415,15 @@ pub(crate) fn generate_inner(
     let handoff_width = spec.cond_layers as usize * spec.cond_hidden as usize;
     let total: usize = spec.upsampling.iter().map(|r| *r as usize).product();
 
-    let device_ctx = Device::new(0)?;
+    let device_ctx = Device::new(request.device)?;
     let (free, _t) = device_ctx.ctx.mem_get_info()?;
-    let mut ar = Runtime::load(
+    let mut ar = Runtime::load_on(
         model,
         runtime,
         request.prompt_ids.len() / 2,
         request.frames,
         free,
+        request.device,
     )?;
     let (features, codes) = match (recorded, margins_out) {
         (None, Some(margins)) => {

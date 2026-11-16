@@ -231,11 +231,25 @@ pub struct Music3Request {
     pub prompt_ids: Vec<u32>,
     pub frames: usize,
     pub seed: u64,
+    pub device: usize,
 }
 
 /// Synthesis output: stereo PCM [2, latent_length(frames) * upsampling].
 pub struct Music3Output {
     pub pcm: Vec<f32>,
+}
+
+impl Music3Output {
+    pub fn interleaved(&self) -> Result<Vec<f32>> {
+        ensure!(self.pcm.len().is_multiple_of(2), "stereo PCM extent");
+        let per_channel = self.pcm.len() / 2;
+        let mut interleaved = Vec::with_capacity(self.pcm.len());
+        for index in 0..per_channel {
+            interleaved.push(self.pcm[index]);
+            interleaved.push(self.pcm[per_channel + index]);
+        }
+        Ok(interleaved)
+    }
 }
 
 /// Synthesis-stage geometry from the per-component configs.
@@ -990,6 +1004,16 @@ mod tests {
                 case["name"]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stereo_interleaving_preserves_channel_order() -> Result<()> {
+        let output = Music3Output {
+            pcm: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        };
+        assert_eq!(output.interleaved()?, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert!(Music3Output { pcm: vec![1.0] }.interleaved().is_err());
         Ok(())
     }
 }
