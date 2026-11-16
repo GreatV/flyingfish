@@ -88,51 +88,63 @@ extern "C" __global__ void convrot_linear(
         __float2bfloat16(__fmul_rn(__fmul_rn(static_cast<float>(acc), scale), wscale[col]));
 }
 
-// 17 rows and above. One warp owns a 16x8 tile of one group.
+// 17 rows and above. One block owns 16 rows and one group.
 // The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
-// grid: (ceil(rows/16), group/8, k/group). block: 32.
+// grid: (ceil(rows/16), 1, k/group). block: 256.
+// A tile is 16*256 bf16. Each warp stages its own 8*16 bf16 Hadamard tile.
 extern "C" __global__ void convrot_group_dot(const float* __restrict__ x, float* __restrict__ y, int rows, int k,
                                              int group) {
-    if (rows < 17 || group < 16 || (group & 15) || (k % group)) __trap();
+    if (rows < 17 || group < 16 || group > 256 || (group & 15) || (k % group)) __trap();
     constexpr int STRIDE = 16;
-    __shared__ __nv_bfloat16 asmem[16 * STRIDE];
-    __shared__ __nv_bfloat16 bsmem[8 * STRIDE];
-    const int lane = threadIdx.x;
-    const int row0 = blockIdx.x * 16;
-    const int n0 = blockIdx.y * 8;
-    const int x_col0 = blockIdx.z * group;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int k0 = 0; k0 < group; k0 += 16) {
-        for (int i = lane; i < 16 * 16; i += 32) {
-            const int r = i >> 4;
-            const int c = i & 15;
-            const int gr = row0 + r;
-            float v = 0.f;
-            if (gr < rows) v = x[static_cast<long long>(gr) * k + x_col0 + k0 + c];
-            asmem[r * STRIDE + c] = __float2bfloat16(v);
-        }
-        for (int i = lane; i < 8 * 16; i += 32) {
-            const int n = i >> 4;
-            const int c = i & 15;
-            bsmem[n * STRIDE + c] = __float2bfloat16(convrot_hadamard(group, k0 + c, n0 + n));
-        }
-        __syncwarp();
-        unsigned a[4];
-        convrot_ldsm_x4(a, asmem + (lane & 15) * STRIDE + (lane >> 4) * 8);
-        unsigned b[2];
-        convrot_ldsm_x2(b, bsmem + (lane & 7) * STRIDE + ((lane >> 3) & 1) * 8);
-        convrot_mma_16816(acc, a, b);
-        __syncwarp();
+    constexpr int GROUP_MAX = 256;
+    __shared__ __nv_bfloat16 atile[16 * GROUP_MAX];
+    __shared__ __nv_bfloat16 bsmem[8 * 8 * STRIDE];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row0 = static_cast<int>(blockIdx.x) * 16;
+    const int x_col0 = static_cast<int>(blockIdx.z) * group;
+    const int tile = 16 * group;
+    for (int i = static_cast<int>(threadIdx.x); i < tile; i += static_cast<int>(blockDim.x)) {
+        const int r = i / group;
+        const int c = i - r * group;
+        const int gr = row0 + r;
+        float v = 0.f;
+        if (gr < rows) v = x[static_cast<long long>(gr) * k + x_col0 + c];
+        const int panel = c >> 4;
+        const int local = c & 15;
+        atile[panel * (16 * STRIDE) + r * STRIDE + local] = __float2bfloat16(v);
     }
-    const int rbase = lane >> 2;
-    const int cbase = (lane & 3) * 2;
-    const int rows_out[4] = {rbase, rbase, rbase + 8, rbase + 8};
-    const int cols_out[4] = {cbase, cbase + 1, cbase, cbase + 1};
-    for (int t = 0; t < 4; ++t) {
-        const int r = rows_out[t];
-        const int c = cols_out[t];
-        if (row0 + r < rows && n0 + c < group)
-            y[static_cast<long long>(row0 + r) * k + x_col0 + n0 + c] = acc[t];
+    __syncthreads();
+    __nv_bfloat16* bt = bsmem + warp * (8 * STRIDE);
+    const int nsub = group >> 3;
+    for (int sub = warp; sub < nsub; sub += 8) {
+        const int n0 = sub << 3;
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int k0 = 0; k0 < group; k0 += 16) {
+            for (int i = lane; i < 8 * 16; i += 32) {
+                const int n = i >> 4;
+                const int c = i & 15;
+                bt[n * STRIDE + c] = __float2bfloat16(convrot_hadamard(group, k0 + c, n0 + n));
+            }
+            __syncwarp();
+            unsigned a[4];
+            const __nv_bfloat16* ap = atile + (k0 >> 4) * (16 * STRIDE);
+            convrot_ldsm_x4(a, ap + (lane & 15) * STRIDE + (lane >> 4) * 8);
+            unsigned b[2];
+            convrot_ldsm_x2(b, bt + (lane & 7) * STRIDE + ((lane >> 3) & 1) * 8);
+            convrot_mma_16816(acc, a, b);
+            __syncwarp();
+        }
+        const int rbase = lane >> 2;
+        const int cbase = (lane & 3) * 2;
+        const int rows_out[4] = {rbase, rbase, rbase + 8, rbase + 8};
+        const int cols_out[4] = {cbase, cbase + 1, cbase, cbase + 1};
+        for (int t = 0; t < 4; ++t) {
+            const int r = rows_out[t];
+            const int c = cols_out[t];
+            if (row0 + r < rows && n0 + c < group)
+                y[static_cast<long long>(row0 + r) * k + x_col0 + n0 + c] = acc[t];
+        }
     }
 }
 
