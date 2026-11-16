@@ -648,8 +648,49 @@ fn breeze_sampling_ops_gpu() -> Result<()> {
         .map(|(got, want)| (got - want).abs())
         .fold(0.0f32, f32::max);
     ensure!(detected > 0.001, "omit-penalty GPU control max={detected}");
+    let tie_logits = [
+        4.0f32, 4.0, 4.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0,
+    ];
+    let d_tie_logits = s.clone_htod(
+        &tie_logits
+            .iter()
+            .map(|value| bf16::from_f32(*value))
+            .collect::<Vec<_>>(),
+    )?;
+    let d_tie_probs = s.alloc_zeros::<f32>(tie_logits.len())?;
+    unsafe {
+        s.launch_builder(&distribution)
+            .arg(&d_tie_logits)
+            .arg(&d_tie_probs)
+            .arg(&1i32)
+            .arg(&(tie_logits.len() as i64))
+            .arg(&1.0f32)
+            .arg(&2i32)
+            .arg(&1.0f32)
+            .arg(&d_history)
+            .arg(&1.0f32)
+            .arg(&14i32)
+            .arg(&14i32)
+            .arg(&15i32)
+            .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
+    }
+    let expected_tie = crate::sampling::Sampling::new(1.0, 2, 1.0, 1.0)?.probabilities(
+        &tie_logits,
+        &[],
+        (14, 14),
+        Some(15),
+    )?;
+    let actual_tie = s.clone_dtoh(&d_tie_probs)?;
+    let tie_maximum = actual_tie
+        .iter()
+        .zip(&expected_tie)
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(tie_maximum <= 1e-5, "top-k tie max={tie_maximum}");
+    ensure!(actual_tie[2] > 0.001, "exact-k GPU control");
     println!(
-        "BREEZE_SAMPLER PASS rows=64 top_k=3 top_p=0.8 reserved=6 allow=6 same_seed=exact seed_plus_one=different repetition_max={maximum} omit_penalty={detected}"
+        "BREEZE_SAMPLER PASS rows=64 top_k=3 top_p=0.8 reserved=6 allow=6 same_seed=exact seed_plus_one=different repetition_max={maximum} omit_penalty={detected} tie_max={tie_maximum} exact_k_tie_probability={}",
+        actual_tie[2]
     );
     Ok(())
 }

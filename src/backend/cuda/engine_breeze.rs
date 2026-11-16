@@ -102,7 +102,6 @@ const AUDIO: i32 = 262_144;
 #[cfg(test)]
 const AUDIO_EOS: i32 = 262_145;
 
-const MLP_ELEMS: usize = TEXT_MAX * TEXT_I;
 const EMBED_WS: usize = 17 * BB_H;
 
 pub fn gemm_rows(logical: usize, input: usize) -> usize {
@@ -1209,6 +1208,7 @@ fn load_matrix(
 
 fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
     let workspace_rows = geometry.backbone.max(17);
+    let mlp_elems = workspace_rows * BB_I;
     let h_elems = workspace_rows * BB_H;
     let kv_elems = BB_KV * geometry.backbone * BB_DIM;
     let mut lk = Vec::with_capacity(BB_LAYERS);
@@ -1230,9 +1230,9 @@ fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
         h: stream.alloc_zeros(h_elems)?,
         n: stream.alloc_zeros(h_elems)?,
         d: stream.alloc_zeros(workspace_rows * BB_VOCAB)?,
-        gate: stream.alloc_zeros(MLP_ELEMS)?,
-        up: stream.alloc_zeros(MLP_ELEMS)?,
-        act: stream.alloc_zeros(MLP_ELEMS)?,
+        gate: stream.alloc_zeros(mlp_elems)?,
+        up: stream.alloc_zeros(mlp_elems)?,
+        act: stream.alloc_zeros(mlp_elems)?,
         qkv: stream.alloc_zeros(workspace_rows * (BB_Q + BB_KVW + BB_KVW))?,
         k: stream.alloc_zeros(kv_elems)?,
         v: stream.alloc_zeros(kv_elems)?,
@@ -4438,6 +4438,41 @@ mod tests {
             .is_err(),
             "65 frames"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_backbone_full_sequence_max_geometry() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let prompt = [2, 262146, 9259];
+        let runtime = RuntimeDir::with_prefix("n8-full-sequence")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 750)?;
+        model.set_graph(false);
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let audio = 750;
+        let positions = super::Positions {
+            text: (0..prompt.len()).collect(),
+            audio: (prompt.len()..prompt.len() + audio).collect(),
+            eos: Vec::new(),
+            seq: prompt.len() + audio,
+        };
+        let codes = vec![0i32; audio * super::BOOKS];
+        let logits = model.backbone(&projected, &positions, &codes, false)?;
+        ensure!(
+            logits.len() == (prompt.len() + audio) * super::BB_VOCAB,
+            "full-sequence logits extent"
+        );
+        ensure!(
+            logits.iter().all(|value| value.is_finite()),
+            "full-sequence logits"
+        );
+        println!("BREEZE_FULL_SEQUENCE PASS text_rows=3 audio_frames=750");
         Ok(())
     }
 

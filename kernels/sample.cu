@@ -717,9 +717,10 @@ extern "C" __global__ void __launch_bounds__(256) distribution_rows_bf16(
   if (threadIdx.x == 0) {
     const int k = top_k < vocab ? top_k : (int)vocab;
     const float max_logit = values[0];
+    const float kth_logit = values[k - 1];
     float total = 0.0f;
     int candidates = 0;
-    for (int i = 0; i < k && isfinite(values[i]); ++i) {
+    for (int i = 0; i < vocab && isfinite(values[i]) && values[i] >= kth_logit; ++i) {
       values[i] = expf(values[i] - max_logit);
       total = __fadd_rn(total, values[i]);
       ++candidates;

@@ -73,7 +73,8 @@ impl Sampling {
         }
         ensure!(!ranked.is_empty(), "sampling vocabulary is fully masked");
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked.truncate(self.top_k.min(ranked.len()));
+        let cutoff = ranked[self.top_k.min(ranked.len()) - 1].1;
+        ranked.truncate(ranked.partition_point(|&(_, score)| score >= cutoff));
         let max = ranked[0].1;
         let mut weights: Vec<(u32, f64)> = ranked
             .into_iter()
@@ -190,7 +191,9 @@ mod tests {
                 .map(|value| value.as_f64().context("probability").map(|v| v as f32))
                 .collect::<Result<Vec<_>>>()?;
             let penalty = if name == "depth_repeats" { 1.0 } else { 1.1 };
-            let sampling = Sampling::new(0.9, 6, 0.9, penalty)?;
+            let top_k = case["top_k"].as_u64().unwrap_or(6) as usize;
+            let top_p = case["top_p"].as_f64().unwrap_or(0.9) as f32;
+            let sampling = Sampling::new(0.9, top_k, top_p, penalty)?;
             let actual = sampling.probabilities(&logits, &history, (14, 14), Some(15))?;
             let maximum = actual
                 .iter()
@@ -229,6 +232,23 @@ mod tests {
                 ensure!(
                     f64::from(detected) > mutant_limit,
                     "omit-penalty mutant max={detected} bar={mutant_limit}"
+                );
+            }
+            if name == "backbone_kth_tie" {
+                let mut exact_k = actual.clone();
+                exact_k[2] = 0.0;
+                let retained: f32 = exact_k.iter().sum();
+                for value in &mut exact_k {
+                    *value /= retained;
+                }
+                let detected = exact_k
+                    .iter()
+                    .zip(&expected)
+                    .map(|(got, want)| (got - want).abs())
+                    .fold(0.0f32, f32::max);
+                ensure!(
+                    f64::from(detected) > mutant_limit,
+                    "exact-k mutant max={detected} bar={mutant_limit}"
                 );
             }
         }
