@@ -5231,6 +5231,65 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
     Ok(())
 }
 
+/// Run-stability probe: two full generations of the same case in ONE
+/// process, same seed. Distinguishes kernel nondeterminism (differs
+/// in-process) from free-memory-dependent placement (stable in-process).
+#[test]
+#[ignore = "GPU + published models; set FF_HI3D_MODEL, FF_DINOV2_MODEL, FF_CLIP_MODEL, FF_HI3D_GENERATION_REFERENCE, FF_HI3D_IMAGE_PREPARATION_REFERENCE, FLYINGFISH_RUNTIME_DIR"]
+fn hi3d_generation_run_stability_probe() -> Result<()> {
+    let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
+    let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+    let case = freeze["initial"]
+        .as_object()
+        .context("initial cases")?
+        .keys()
+        .next()
+        .context("no initial case")?
+        .to_owned();
+    let source = freeze["initial"][&case]["input_mesh"]
+        .as_str()
+        .context("initial mesh anchor missing")?;
+    let mesh = crate::sparse::SparseMesh {
+        vertices: f32_tensor(Path::new(source), "vertices")?,
+        faces: tensor(Path::new(source), "faces")?
+            .values
+            .into_iter()
+            .map(|v| v as i32)
+            .collect(),
+    };
+    let bytes =
+        std::fs::read(env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("inputs.safetensors"))?;
+    let images = safetensors::SafeTensors::deserialize(&bytes)?;
+    let rgba = images.tensor(&format!("{case}.rgba"))?;
+    let orientation = images.tensor(&format!("{case}.orientation"))?;
+    let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
+    let device = Device::new(0)?;
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let generation = Hi3DGeneration {
+            model: &env_path("FF_HI3D_MODEL")?,
+            dino: &env_path("FF_DINOV2_MODEL")?,
+            clip: &env_path("FF_CLIP_MODEL")?,
+            runtime: &env_path("FLYINGFISH_RUNTIME_DIR")?,
+            rgba: rgba.data(),
+            dimensions: [rgba.shape()[0], rgba.shape()[1]],
+            orientation,
+            mesh: &mesh,
+            requested_resolution: 512,
+            seed: 0,
+        };
+        let (raw, _) = generation.run(&device)?;
+        runs.push((raw.vertices, raw.faces));
+    }
+    let same = runs[0].0 == runs[1].0 && runs[0].1 == runs[1].1;
+    println!(
+        "HI3D_RUN_STABILITY in_process_runs=2 raw_equal={same} vertices={}",
+        runs[0].0.len() / 3
+    );
+    ensure!(same, "in-process reruns differ: kernel nondeterminism");
+    Ok(())
+}
+
 fn linked_image_cascade(case: &str, requested: u32, processed: bool) -> Result<()> {
     let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
     let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
