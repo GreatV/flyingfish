@@ -376,6 +376,21 @@ __global__ __launch_bounds__(768, 2) void rms_norm_modulate_bf16(
                                   shift + param, scale + param);
 }
 
+// Weight multiplies in f32. Stores round the weighted value, 1+scale, that product, and the shift add to BF16.
+__global__ __launch_bounds__(768, 2) void rms_norm_modulate(
+    const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y,
+    const __nv_bfloat16* shift, const __nv_bfloat16* scale, const unsigned* index,
+    int rows, int dim, float eps, unsigned long long stride, unsigned entries) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned p = index[row];
+  if (p >= entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  const size_t param = (size_t)p * stride;
+  rmsnorm_row<8, false, true, true>(x + off, w, y + off, dim, eps,
+                                   shift + param, scale + param);
+}
+
 __global__ __launch_bounds__(1024) void add_rmsnorm_bf16(const __nv_bfloat16* x,
                                                        const __nv_bfloat16* res,
                                                        const __nv_bfloat16* w,
