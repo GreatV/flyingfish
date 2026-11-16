@@ -362,7 +362,9 @@ fn to3d_hi3d_cli_equals_the_library_entry() -> Result<()> {
             || control_mesh.triangles != cli_mesh.triangles,
         "the shifted coarse mesh reproduced the original output"
     );
-    std::fs::remove_dir_all(&runtime).ok();
+    if std::env::var_os("FF_TO3D_KEEP").is_none() {
+        std::fs::remove_dir_all(&runtime).ok();
+    }
     println!(
         "PASS to3d_hi3d_cli vertices={} faces={} mesh_control=different",
         cli_mesh.positions.len() / 3,
