@@ -38,9 +38,9 @@ Speech (library entry points and CLI):
 
 | Model | Notes | Backends |
 |---|---|---|
-| Parakeet TDT | Log-mel frontend, 24-layer FastConformer encoder, greedy TDT decode with one CUDA graph per decode step; `flyingfish::parakeet::ParakeetTdt` and `transcribe`; txt/json/srt/vtt output with duration-derived cues | CUDA |
-| Canary-1B-v2 | FastConformer encoder, AED decoder, greedy decode with cached attention and one CUDA graph per decode step; `flyingfish::canary::Canary` and `transcribe` with published language/punctuation prompts; Canary subtitles are whole-clip only | CUDA |
-| Nemotron 3.5 ASR streaming 0.6B | Full-clip and cache-aware chunked-stream FastConformer encoding with shared greedy RNNT prediction/joint decode; blank 13087 and at most 10 symbols per step; `transcribe` outputs txt/json and whole-clip srt/vtt cues; `flyingfish::nemotron::transcribe` | CUDA |
+| Parakeet TDT | Log-mel frontend, 24-layer FastConformer encoder, greedy TDT decode with one CUDA graph per decode step; `flyingfish::parakeet::ParakeetTdt` and `transcribe`; txt, json, srt and vtt output with duration-derived cues | CUDA |
+| Canary-1B-v2 | FastConformer encoder, AED decoder, greedy decode with cached attention and one CUDA graph per decode step; `flyingfish::canary::Canary` and `transcribe` with published language and punctuation prompts; Canary subtitles are whole-clip only | CUDA |
+| Nemotron 3.5 ASR streaming 0.6B | Full-clip and cache-aware chunked-stream FastConformer encoding with shared greedy RNNT prediction and joint decode; blank 13087 and at most 10 symbols per step; `transcribe` outputs txt and json and whole-clip srt and vtt cues; `flyingfish::nemotron::transcribe` | CUDA |
 | parakeet realtime EOU 120M | Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware streaming with a reset on end-of-utterance; `flyingfish::eou::Eou` and `transcribe`; offline subtitles are whole-clip only, streaming subtitles are per utterance | CUDA |
 | Nemotron-3-Diarization | Offline and streaming speaker diarization with an arrival-order speaker cache; `flyingfish::diarization::Diarization` and `diarize`; RTTM output with overlaps preserved | CUDA |
 | Multitalker Parakeet streaming 0.6B | Reads the `.nemo` container in place; 1-4 speaker lanes through the pre-encode, layer-0 speaker and background kernels, and 24 conformer layers with block-anchored attention windows; greedy RNNT decode over speaker-keyed hypotheses with per-lane prediction state; `transcribe --diar-model` runs it end to end (Nemotron-3-Diarization arrival-order channels 0-3 as the lanes, speaker kernels by default, `--masked` for lane masking, per-speaker text with word timestamps); a fifth active diarization channel errors instead of being dropped; kernel-mode free running diverges from the published wrapper's batch-1 pre-encode (measured 4.272e-4); `flyingfish::multitalker::Multitalker` | CUDA |
@@ -51,18 +51,18 @@ Media generation (library entry points and CLI):
 | Model | Notes | Backends |
 |---|---|---|
 | MiniMax-H3 | Image-to-video with audio: Qwen3-VL conditioner, streamed diffusion transformer with Turbo LoRA, video and audio decoders, native prompt, canvas and keyframe producers, noise drawn from the request seed; the diffusion transformer also loads from a GGUF Q4_0 file; `flyingfish::minimax_h3::run_minimax_h3_i2va`; the `video` command writes MP4 or Y4M+WAV | CUDA |
-| HyperFlow H3 Flash | Usable through `video`: published fl2va INT8 convrot and low-rank diffusion transformer; six-step text-to-video with audio, optional first/last keyframes, MiniMax-H3 companion conditioner and VAEs; `flyingfish::minimax_h3::run_hyperflow_h3_video`; the `video` command writes MP4 or Y4M+WAV | CUDA |
+| HyperFlow H3 Flash | Usable through `video`: published fl2va INT8 convrot and low-rank diffusion transformer; six-step text-to-video with audio, optional first or last keyframes, MiniMax-H3 companion conditioner and VAEs; `flyingfish::minimax_h3::run_hyperflow_h3_video`; the `video` command writes MP4 or Y4M+WAV | CUDA |
 | MiniMax-H3-Image | Prompt-to-image is usable. A prompt and optional upright RGB8 references become RGB8 through the Qwen3-VL conditioner, native VAE encode, six-step Euler under a derived placement, native VAE decode, truncation toward zero and Lanczos-3; one Philox draw from the request seed; `flyingfish::minimax_h3::image_latents`, `flyingfish::minimax_h3::image_encode`, `flyingfish::minimax_h3::image_decode` and the `image` command writes PNG. `image_sample` runs the six evaluations on supplied embeddings and latent rows | CUDA |
-| MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) in one entry from token ids and a seed to stereo PCM; published caption/lyrics prompt construction with paired conditional/unconditional ids and the `music` command writing 44.1 kHz stereo WAV; `flyingfish::music3::generate` | CUDA |
+| MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) in one entry from token ids and a seed to stereo PCM; published caption and lyrics prompt construction with paired conditional and unconditional ids and the `music` command writing 44.1 kHz stereo WAV; `flyingfish::music3::generate` | CUDA |
 
 Image to 3D (library entry points and CLI):
 
 | Model | Notes | Backends |
 |---|---|---|
 | Idol | DINOv3 and FLUX.2 VAE encoders, latent flow denoiser, octree and Gaussian decoders: a preprocessed 1024 px image to a Gaussian splat and a camera; `flyingfish::backend::IdolPipelineRuntime` | CUDA |
-| Pixal3D | Single-view and multiview: RGBA views with camera parameters, through sparse-structure, shape and texture flows, to a raw mesh with six material channels; CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --naf <dir> --camera <cam.json> [--view <image2.png> --camera <cam2.json> ...] [--resolution 1024|1536] --seed 42 -o mesh.ply`; the camera JSON carries camera_angle_x, mesh_scale and a world_to_camera extrinsic (flat 12 floats or the 4x4 nested form; required for multiview, where a shared look-at would project every view from one direction; without it the single view uses the look-at at (0,0,distance)); MoGe-2 estimation is not integrated and a missing camera errors; the four stage noise draws are flyingfish's philox counter-stream convention (streams 1-4), not the publisher's torch RNG; `flyingfish::backend::PixalGeneration` and `PixalSeededRequest` | CUDA |
+| Pixal3D | Single-view and multiview: RGBA views with camera parameters, through sparse-structure, shape and texture flows, to a raw mesh with six material channels; CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --naf <dir> --camera <cam.json> [--view <image2.png> --camera <cam2.json> ...] [--resolution 1024|1536] --seed 42 -o <mesh.ply>`; the camera JSON carries camera_angle_x, mesh_scale and a world_to_camera extrinsic (flat 12 floats or the 4x4 nested form; required for multiview, where a shared look-at would project every view from one direction; without it the single view uses the look-at at (0,0,distance)); MoGe-2 estimation is not integrated and a missing camera errors; the four stage noise draws are flyingfish's philox counter-stream convention (streams 1-4), not the publisher's torch RNG; `flyingfish::backend::PixalGeneration` and `PixalSeededRequest` | CUDA |
 | Hi3D | DINOv2 and CLIP image conditioning, sparse flow and sparse VAE decoder at 512, 1024 or 1536, refining a supplied coarse mesh; raw mesh or a hole-filled, simplified and normalized mesh; `flyingfish::backend::Hi3DGeneration` | CUDA |
-| TRELLIS.2-4B | Image to a textured mesh on the default 1024-cascade pipeline: DINOv3 conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders, seeded stage noise; raw mesh only (no fill, simplify, UV, bake or render), RGBA input with the background already removed, and the decoder and structure-latent outputs differ from the reference at F16 quanta; `flyingfish::backend::TrellisTo3d`, CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --seed 42 -o mesh.ply` | CUDA |
+| TRELLIS.2-4B | Image to a textured mesh on the default 1024-cascade pipeline: DINOv3 conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders, seeded stage noise; raw mesh only (no fill, simplify, UV, bake or render), RGBA input with the background already removed, and the decoder and structure-latent outputs differ from the reference at F16 quanta; `flyingfish::backend::TrellisTo3d`, CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --seed 42 -o <mesh.ply>` | CUDA |
 
 In progress: TRELLIS.2 image-to-3D (flow sampling and the structured-latent, mesh and texture stages landed; remaining: render, GLB and bake, the shape and texture encoders, and closing the decoder and structure-latent differences from the reference).
 
@@ -73,7 +73,7 @@ Library callers use two entry layers:
 | Layer | Public surface | Backends | Resource contract |
 |---|---|---|---|
 | Model request | `RunOptions` with `minimax_h3::run_minimax_h3_i2va`; family types such as `minimax_h3::ImageRunOptions` and `music3::Music3Request` | CUDA for these examples; other families follow the model tables above | The caller supplies request inputs, device ordinal and runtime directory through the entry's arguments. The entry constructs and manages the stages for that request. |
-| Stage | `backend::BackendDevice` and the encoder, flow, decoder and workspace types exported by `backend` | `BackendDevice` is exported with CUDA or ROCm; individual stages retain their model/backend restrictions | The caller constructs the device and stage objects, supplies stage inputs, and owns the runtime/workspace lifetimes. The device carries GPU identity, context, execution stream and upload stream. |
+| Stage | `backend::BackendDevice` and the encoder, flow, decoder and workspace types exported by `backend` | `BackendDevice` is exported with CUDA or ROCm; individual stages retain their model and backend restrictions | The caller constructs the device and stage objects, supplies stage inputs, and owns the runtime and workspace lifetimes. The device carries GPU identity, context, execution stream and upload stream. |
 
 The generic `backend::Backend` loader and the autoregressive `model::layer_program` walker have these execution-domain errors:
 
@@ -90,8 +90,8 @@ Clover and DiffusionGemma load on the separate eager canvas path. Their graph ca
 
 | Platform | Backend | Status |
 |---|---|---|
-| NVIDIA Ampere / Ada (sm_86, sm_89) | CUDA | Supported |
-| AMD RDNA3 (gfx1100) | ROCm / HIP | Supported for the models marked ROCm above |
+| NVIDIA Ampere and Ada (sm_86, sm_89) | CUDA | Supported |
+| AMD RDNA3 (gfx1100) | ROCm and HIP | Supported for the models marked ROCm above |
 | NVIDIA Blackwell (sm_120) | CUDA | In progress |
 | Apple Silicon | Metal | Planned |
 
@@ -100,7 +100,7 @@ Two-GPU MoE expert residency with peer compute is supported.
 ## Build
 
 Requirements:
-- the Rust toolchain pinned in `rust-toolchain.toml`;
+- the Rust toolchain pinned in `<rust-toolchain.toml>`;
 - a CUDA toolkit with `nvcc` on `PATH` or under `CUDA_HOME`;
 - an NVIDIA driver;
 - ffmpeg on `PATH` for MP4 output. Y4M+WAV output does not require it.
@@ -108,11 +108,11 @@ Requirements:
 CUDA builds also require the device-only `nightly-2026-10-06` toolchain, with
 `rust-src`, `llvm-tools`, `llvm-bitcode-linker`, and the `nvptx64-nvidia-cuda`
 target. Install it and populate its core-build dependencies before the first
-host build:
+host build. Replace `<device-manifest>` with the device crate's `<Cargo.toml>` file:
 
 ```sh
 rustup toolchain install nightly-2026-10-06 --profile minimal --component rust-src,llvm-tools,llvm-bitcode-linker,rustfmt,clippy --target nvptx64-nvidia-cuda
-RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 build --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release
+RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 build --manifest-path <device-manifest> --target nvptx64-nvidia-cuda -Z build-std=core --release
 ```
 
 The host build uses the stable pin and builds native attention cubins for each
@@ -140,7 +140,7 @@ It needs `hipcc` (found through `HIP_HOME`, `ROCM_PATH` or `PATH`) and the hipBL
 
 ## Usage
 
-See [CLI usage by model](docs/usage.md) for required inputs, options, defaults and output formats.
+See [CLI usage by model](https://github.com/GreatV/flyingfish/blob/main/docs/usage.md) for required inputs, options, defaults and output formats.
 
 ```sh
 # One-time per machine and model: measure kernels and transfer rates.
@@ -150,43 +150,43 @@ flyingfish --model <model-dir> --runtime-dir <dir> calibrate
 flyingfish --model <model-dir> --runtime-dir <dir> generate --prompt "Hello" --max-new-tokens 64 --graph
 
 # Transcribe a 16 kHz WAV (PCM16, PCM24 or F32) with duration-derived SRT cues.
-flyingfish --model <parakeet-dir> --runtime-dir <dir> transcribe clip.wav --format srt
+flyingfish --model <parakeet-dir> --runtime-dir <dir> transcribe <clip.wav> --format srt
 
 # Write speaker segments as RTTM.
-flyingfish --model <diarization-dir> --runtime-dir <dir> diarize meeting.wav -o meeting.rttm
+flyingfish --model <diarization-dir> --runtime-dir <dir> diarize <meeting.wav> -o <meeting.rttm>
 
 # Embed raw text as a 768-value JSON vector.
 flyingfish --model <EmbeddingGemma-2-dir> --runtime-dir <dir> embed --text "a red cube"
 
-# OpenAI-compatible server: /v1/completions and /v1/chat/completions.
+# OpenAI-compatible server: http://<host>:<port>/v1/completions and http://<host>:<port>/v1/chat/completions.
 flyingfish --model <model-dir> --runtime-dir <dir> serve --port 8080
 
 # Generate MiniMax-H3 video and audio from a keyframe.
-flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image keyframe.png --frames 136 --seed 42 --lora minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors -o out.mp4
+flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.mp4>
 
-# Raw output: out.y4m and out.wav. Add --json to print output metadata as JSON.
-flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image keyframe.png --frames 136 --seed 42 --lora minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors -o out.y4m --json
+# Raw output: <out.y4m> and <out.wav>. Add --json to print output metadata as JSON.
+flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.y4m> --json
 
 # Generate a MiniMax-H3-Image PNG, optionally with --expand or repeated --edit references.
-flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o cube.png --json
+flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o <cube.png> --json
 
 # Synthesize Breeze-TTS-2 speech with the published sampling configuration.
-flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o speech.wav
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o <speech.wav>
 
 # Generate MiniMax-Music3 stereo audio from a caption and lyrics.
-flyingfish --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o song.wav
+flyingfish --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o <song.wav>
 
 # Generate HyperFlow video and audio; either keyframe option can be omitted.
-flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image first.png --last-image last.png --frames 124 --seed 42 -o out.mp4
+flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o <out.mp4>
 ```
 
 Common options:
 - MiniMax-H3 video requires a keyframe, a frame count and a seed. Requested frames round up to `17n+5`, so 136 resolves to 141; the published duration is 5-15 seconds at 24 fps. No documented frame-count or seed defaults exist.
-- HyperFlow uses the published `fl2va_int8_convrot` component and MiniMax-H3 companion files supplied by `--base-model`, without an external LoRA or GGUF replacement. It supports text-only, first, last and first+last keyframes; ref2va media inputs are not supported. Frames round up to `17n+5`, within 124-362 aligned frames at 24 fps. The sampler uses the published six-step grid with video/audio shifts 12/3.
+- HyperFlow uses the published `fl2va_int8_convrot` component and MiniMax-H3 companion files supplied by `--base-model`, without an external LoRA or GGUF replacement. It supports text-only, first, last and first+last keyframes; ref2va media inputs are not supported. Frames round up to `17n+5`, within 124-362 aligned frames at 24 fps. The sampler uses the published six-step grid with video and audio shifts 12 and 3, respectively.
 - MiniMax-H3-Image `image` requires a prompt, `WIDTHxHEIGHT` size and seed. `--expand <dir>` replaces the prompt through the expander; repeated `--edit <image>` supplies upright RGB8 references. Output is PNG at the requested size, and `--json` reports size, seed and reference count.
 - MiniMax-Music3 `music` requires a caption, lyrics and seed. `--frames` defaults to 1500 (60 seconds at 25 fps); output is stereo 44.1 kHz PCM16 WAV, or WAV bytes to stdout when `-o` is omitted.
 - Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video, image, speak, music, transcribe, diarize and embed default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
-- Breeze-TTS-2 `speak` uses the plain `[S0]` prompt and reads `generation_config.json`: temperature 0.9 for backbone and depth, top-k 50 and top-p 1.0 from the omitted library defaults, repetition penalty 1.1 on generated backbone codebook-0 tokens, at most 750 frames, and backbone EOS 2051. The default seed is 42. Output is mono 24 kHz PCM16 WAV; omit `-o` to write WAV bytes to stdout.
+- Breeze-TTS-2 `speak` uses the plain `[S0]` prompt and reads `<generation_config.json>`: temperature 0.9 for backbone and depth, top-k 50 and top-p 1.0 from the omitted library defaults, repetition penalty 1.1 on generated backbone codebook-0 tokens, at most 750 frames, and backbone EOS 2051. The default seed is 42. Output is mono 24 kHz PCM16 WAV; omit `-o` to write WAV bytes to stdout.
 - `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
 - `--draft-model <dir>` enables a DSpark draft model.
 - `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8, GLM-5.3-Flash); 0 selects plain decoding. GLM-5.3-Flash drafts one token per round at any nonzero depth. MTP decode is CUDA-only, so ROCm builds need `--mtp 0` for such checkpoints.
