@@ -192,23 +192,70 @@ pub(crate) fn group_dot_smem(group: u32) -> u32 {
     32 * group + 2048
 }
 
-/// Issued net is 32768 FLOP per 381 bytes. True when that is strictly under the setup peak.
+/// Issued net is `2 * group` FLOP per `(6 * group - 12) / group` bytes. True when that is strictly under the setup peak.
 #[cfg(any(test, feature = "cuda"))]
 pub(crate) fn recompute_saves_at_peaks(
     sms: u64,
     flop_per_sm_clock: u64,
     clock_hz: u64,
     bandwidth: u64,
+    group: u32,
 ) -> Option<bool> {
-    if sms == 0 || flop_per_sm_clock == 0 || clock_hz == 0 || bandwidth == 0 {
+    if sms == 0 || flop_per_sm_clock == 0 || clock_hz == 0 || bandwidth == 0 || group == 0 {
+        return None;
+    }
+    let width = u128::from(group);
+    let bytes = width.checked_mul(3)?.checked_sub(6)?;
+    if bytes == 0 {
         return None;
     }
     let peak = u128::from(sms)
         .checked_mul(u128::from(flop_per_sm_clock))?
         .checked_mul(u128::from(clock_hz))?;
-    let left = 32_768u128.checked_mul(u128::from(bandwidth))?;
-    let right = 381u128.checked_mul(peak)?;
+    let left = width
+        .checked_mul(width)?
+        .checked_mul(u128::from(bandwidth))?;
+    let right = bytes.checked_mul(peak)?;
     Some(left < right)
+}
+
+/// One flag per multiple of 16 from 16 through `max_group`. Index is `group / 16 - 1`.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn ridge_by_group(
+    sms: u64,
+    flop_per_sm_clock: u64,
+    clock_hz: u64,
+    bandwidth: u64,
+    max_group: u32,
+) -> Option<Vec<bool>> {
+    if max_group < 16 || !max_group.is_multiple_of(16) {
+        return None;
+    }
+    let mut table = Vec::with_capacity(usize::try_from(max_group / 16).ok()?);
+    let mut group = 16u32;
+    loop {
+        table.push(recompute_saves_at_peaks(
+            sms,
+            flop_per_sm_clock,
+            clock_hz,
+            bandwidth,
+            group,
+        )?);
+        if group == max_group {
+            return Some(table);
+        }
+        group = group.checked_add(16)?;
+    }
+}
+
+/// Setup flag for `group`. None when `group` is outside the table.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn ridge_at(table: &[bool], group: u32) -> Option<bool> {
+    if group < 16 || !group.is_multiple_of(16) {
+        return None;
+    }
+    let index = usize::try_from(group / 16).ok()?.checked_sub(1)?;
+    table.get(index).copied()
 }
 
 /// True when `rows * k * 4` exceeds `l2_bytes` and `saves` is the setup ridge.
@@ -392,13 +439,20 @@ mod tests {
             "m16n8k16 f32-accumulate rate {flop}"
         );
         let saves_4090 =
-            super::recompute_saves_at_peaks(128, flop, 2_520_000_000, 1_008_000_000_000)
+            super::recompute_saves_at_peaks(128, flop, 2_520_000_000, 1_008_000_000_000, 256)
                 .context("4090 ridge")?;
-        let saves_a4000 = super::recompute_saves_at_peaks(48, flop, 1_560_000_000, 448_064_000_000)
-            .context("A4000 ridge")?;
+        let saves_a4000 =
+            super::recompute_saves_at_peaks(48, flop, 1_560_000_000, 448_064_000_000, 256)
+                .context("A4000 ridge")?;
+        let saves_4090_1024 =
+            super::recompute_saves_at_peaks(128, flop, 2_520_000_000, 1_008_000_000_000, 1024)
+                .context("4090 group 1024")?;
+        let saves_a4000_1024 =
+            super::recompute_saves_at_peaks(48, flop, 1_560_000_000, 448_064_000_000, 1024)
+                .context("A4000 group 1024")?;
         ensure!(
-            saves_4090 && !saves_a4000,
-            "ridge 4090 {saves_4090} A4000 {saves_a4000}"
+            saves_4090 && !saves_a4000 && !saves_4090_1024 && !saves_a4000_1024,
+            "ridge 4090 {saves_4090} A4000 {saves_a4000} 4090-1024 {saves_4090_1024} A4000-1024 {saves_a4000_1024}"
         );
         println!(
             "CONVROT_RIDGE_CPU sms=128 flop_per_sm_clock={flop} clock_hz=2520000000 bandwidth=1008000000000 l2={L2_4090} saves={saves_4090}"
@@ -407,11 +461,30 @@ mod tests {
             "CONVROT_RIDGE_CPU sms=48 flop_per_sm_clock={flop} clock_hz=1560000000 bandwidth=448064000000 l2={L2_A4000} saves={saves_a4000}"
         );
         ensure!(
-            !super::recompute_saves_at_peaks(1, 1, 32_768, 381).context("tie")?
-                && super::recompute_saves_at_peaks(1, 1, 32_769, 381).context("under")?
-                && !super::recompute_saves_at_peaks(1, 1, 32_768, 382).context("over")?
-                && super::recompute_saves_at_peaks(0, flop, 1, 1).is_none(),
+            !super::recompute_saves_at_peaks(1, 1, 32_768, 381, 256).context("tie")?
+                && super::recompute_saves_at_peaks(1, 1, 32_769, 381, 256).context("under")?
+                && !super::recompute_saves_at_peaks(1, 1, 32_768, 382, 256).context("over")?
+                && super::recompute_saves_at_peaks(0, flop, 1, 1, 256).is_none()
+                && super::recompute_saves_at_peaks(1, 1, 1, 1, 2).is_none()
+                && !super::recompute_saves_at_peaks(1, 1, 1_048_576, 3066, 1024)
+                    .context("tie 1024")?
+                && super::recompute_saves_at_peaks(1, 1, 1_048_577, 3066, 1024)
+                    .context("under 1024")?
+                && !super::recompute_saves_at_peaks(1, 1, 1_048_576, 3067, 1024)
+                    .context("over 1024")?,
             "ridge inequality"
+        );
+        let table = super::ridge_by_group(128, flop, 2_520_000_000, 1_008_000_000_000, 1024)
+            .context("4090 groups")?;
+        ensure!(
+            table.len() == 64
+                && super::ridge_at(&table, 256) == Some(true)
+                && super::ridge_at(&table, 1024) == Some(false)
+                && super::ridge_at(&table, 8).is_none()
+                && super::ridge_at(&table, 2048).is_none()
+                && super::ridge_by_group(128, flop, 2_520_000_000, 1_008_000_000_000, 1000)
+                    .is_none(),
+            "group table"
         );
         let ks = [5_376u32, 7_168, 14_336];
         for k in ks {
@@ -440,7 +513,18 @@ mod tests {
                 "CONVROT_RIDGE_CPU rows=41770 k={k} l2={L2_A4000} saves={saves_a4000} recompute={a4000_large}"
             );
             ensure!(!a4000_large, "A4000 rows 41770 k {k}");
+            let wide = decide(41_770, k, L2_4090, saves_4090_1024)?;
+            println!(
+                "CONVROT_RIDGE_CPU rows=41770 k={k} l2={L2_4090} group=1024 saves={saves_4090_1024} recompute={wide}"
+            );
+            ensure!(!wide, "4090 group 1024 rows 41770 k {k}");
         }
+        println!(
+            "CONVROT_RIDGE_CPU group=1024 sms=128 flop_per_sm_clock={flop} clock_hz=2520000000 bandwidth=1008000000000 l2={L2_4090} saves={saves_4090_1024}"
+        );
+        println!(
+            "CONVROT_RIDGE_CPU group=1024 sms=48 flop_per_sm_clock={flop} clock_hz=1560000000 bandwidth=448064000000 l2={L2_A4000} saves={saves_a4000_1024}"
+        );
         ensure!(
             !decide(3510, 5376, L2_4090, saves_4090)?
                 && decide(3511, 5376, L2_4090, saves_4090)?
@@ -484,7 +568,7 @@ pub struct ConvrotFns {
     max_group: u32,
     optin: usize,
     l2_bytes: u64,
-    ridge_saves: bool,
+    ridge_by_group: Vec<bool>,
 }
 
 #[cfg(feature = "cuda")]
@@ -514,7 +598,7 @@ const PRODUCT_SMEM: u32 = 61_440;
 #[cfg(feature = "cuda")]
 fn sensed_ridge(
     ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>,
-) -> Result<(bool, u64, u64, u64, u64)> {
+) -> Result<(u64, u64, u64, u64)> {
     use cudarc::driver::sys::CUdevice_attribute as A;
     let sm = crate::backend::cuda::cubin::capability(ctx)?;
     let flop = u64::from(crate::linear_plan::tc_flops_per_sm_clock(sm)?);
@@ -531,9 +615,7 @@ fn sensed_ridge(
         .checked_mul(250)
         .and_then(|value| value.checked_mul(bus_bits))
         .context("convrot bandwidth")?;
-    let saves =
-        recompute_saves_at_peaks(sms, flop, clock_hz, bandwidth).context("convrot ridge")?;
-    Ok((saves, sms, flop, clock_hz, bandwidth))
+    Ok((sms, flop, clock_hz, bandwidth))
 }
 
 #[cfg(feature = "cuda")]
@@ -553,8 +635,10 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     let l2_bytes = u64::try_from(
         ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
     )?;
-    let (ridge_saves, _, _, _, _) = sensed_ridge(ctx)?;
     let max_group = max_group(optin)?;
+    let (sms, flop, clock_hz, bandwidth) = sensed_ridge(ctx)?;
+    let ridge_by_group =
+        ridge_by_group(sms, flop, clock_hz, bandwidth, max_group).context("convrot ridge")?;
     let tile_limit = i32::try_from(group_dot_smem(max_group))?;
     for function in [&group_dot, &group_peak, &group_quant] {
         function.set_attribute(
@@ -579,7 +663,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         max_group,
         optin,
         l2_bytes,
-        ridge_saves,
+        ridge_by_group,
     })
 }
 
@@ -808,7 +892,7 @@ fn launch_group_quant(
     Ok(())
 }
 
-/// Store path when the f32 row fits in L2 or the setup ridge does not save. Otherwise recompute.
+/// Store path when the f32 row fits in L2 or this group's setup flag does not save. Otherwise recompute.
 #[cfg(feature = "cuda")]
 pub(crate) fn launch_rotate_quant(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
@@ -816,8 +900,9 @@ pub(crate) fn launch_rotate_quant(
     args: &ConvrotArgs,
 ) -> Result<()> {
     let (rows, k, group) = rotated_shape(fns, args)?;
-    let recompute = recompute_rotated(rows, k, fns.l2_bytes, fns.ridge_saves)
-        .context("convrot rotated bytes")?;
+    let saves = ridge_at(&fns.ridge_by_group, group).context("convrot ridge group")?;
+    let recompute =
+        recompute_rotated(rows, k, fns.l2_bytes, saves).context("convrot rotated bytes")?;
     if recompute {
         launch_recompute_rotate_quant(stream, fns, args, rows, k, group)
     } else {
@@ -2313,13 +2398,10 @@ mod device {
     ) -> Result<()> {
         let group = 256usize;
         let n = 40usize;
-        let recompute = super::recompute_rotated(
-            u32::try_from(rows)?,
-            u32::try_from(k)?,
-            fns.l2_bytes,
-            fns.ridge_saves,
-        )
-        .context("convrot rotated bytes")?;
+        let saves = super::ridge_at(&fns.ridge_by_group, 256).context("convrot ridge group")?;
+        let recompute =
+            super::recompute_rotated(u32::try_from(rows)?, u32::try_from(k)?, fns.l2_bytes, saves)
+                .context("convrot rotated bytes")?;
         ensure!(recompute, "rows {rows} k {k} stayed on the store path");
         let x_f32 = activation(rows, k);
         let x_bf16: Vec<bf16> = x_f32.iter().copied().map(bf16::from_f32).collect();
@@ -2409,13 +2491,10 @@ mod device {
         k: usize,
     ) -> Result<()> {
         let group = 256usize;
-        let recompute = super::recompute_rotated(
-            u32::try_from(rows)?,
-            u32::try_from(k)?,
-            fns.l2_bytes,
-            fns.ridge_saves,
-        )
-        .context("convrot rotated bytes")?;
+        let saves = super::ridge_at(&fns.ridge_by_group, 256).context("convrot ridge group")?;
+        let recompute =
+            super::recompute_rotated(u32::try_from(rows)?, u32::try_from(k)?, fns.l2_bytes, saves)
+                .context("convrot rotated bytes")?;
         ensure!(!recompute, "rows {rows} k {k} recomputed");
         let x_f32 = activation(rows, k);
         let x_bf16: Vec<bf16> = x_f32.iter().copied().map(bf16::from_f32).collect();
@@ -2475,8 +2554,10 @@ mod device {
             fns.l2_bytes,
             device.info.l2_bytes
         );
-        let (saves, sms, flop, clock_hz, bandwidth) = super::sensed_ridge(&device.ctx)?;
-        let stored = fns.ridge_saves;
+        let (sms, flop, clock_hz, bandwidth) = super::sensed_ridge(&device.ctx)?;
+        let saves = super::recompute_saves_at_peaks(sms, flop, clock_hz, bandwidth, 256)
+            .context("convrot ridge")?;
+        let stored = super::ridge_at(&fns.ridge_by_group, 256).context("stored ridge")?;
         let info_sms = device.info.sms;
         let info_bandwidth = device.info.memory_bytes_per_second;
         ensure!(
