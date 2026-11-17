@@ -2,7 +2,7 @@
 
 `flyingfish` and `ff` take the same commands and options. Keep both binaries in the same directory. The [model table](../README.md#models) lists supported weight formats and backends; commands below use the published model directories without converting their weights.
 
-Replace `<model-dir>` and the other placeholders with your files and directories. Put `--model` before the command. Keep runtime data and output files outside model directories; output parent directories must exist, and media/text output files must not already exist.
+Replace `<model-dir>` and the other placeholders with your files and directories. Put `--model` before the command. EOU and Multitalker transcription take the actual `<model.nemo>` archive instead of a directory. Keep runtime data and output files outside model directories; output parent directories must exist, and media/text output files must not already exist.
 
 ```sh
 flyingfish --help
@@ -17,11 +17,11 @@ flyingfish --version
 flyingfish --model <model-dir> --runtime-dir <runtime-dir> calibrate
 ```
 
-`calibrate` measures kernels and transfer rates for a machine and model and writes calibration into the runtime directory. MoE models require it. `--runtime-dir` must be outside any model directory. The speech, embedding, media and image-to-3D commands below also require a runtime directory.
+`calibrate` measures kernels and transfer rates for a machine and model and writes calibration into the runtime directory. MoE models require it. DeepSeek generation and serving additionally require the [Engram hash record](#deepseek-v41-flash-runtime-setup); `calibrate` does not create it. `--runtime-dir` must be outside any model directory. The speech, embedding, media and image-to-3D commands below also require a runtime directory.
 
 | Option | Default / accepted values | Use |
 |---|---|---|
-| `--model <MODEL>` | Required, or `FLYINGFISH_MODEL` | Published model directory; before the command |
+| `--model <MODEL>` | Required, or `FLYINGFISH_MODEL` | Published model directory, or EOU/Multitalker `.nemo` archive; before the command |
 | `--runtime-dir <RUNTIME_DIR>` | Unset, or `FLYINGFISH_RUNTIME_DIR` | Per-machine calibration |
 | `--device <DEVICE>` | `0` | GPU index |
 | `--verbose` | Flag | Print placement, Lt and decode-plan diagnostics |
@@ -97,6 +97,37 @@ DSpark `--dump` requires `--spec-graph false`; DSpark does not support `--trace-
 | clef-flash | Hybrid linear-attention and full-attention text tower with plain decode; the vision tower and MTP layers are not run; the joint schema head scoring path is gated, with no CLI or library entry |
 | MiniMax-H3-Image-PE | ModelOpt NVFP4 projections executed as W4A16 (weights decoded to BF16, no FP4 tensor-core path); image input |
 
+### DeepSeek-V4.1-Flash runtime setup
+
+Generation and serving read `<runtime-dir>/engram-hash-v1.json`. This record supplies the model's compressed-token map, per-layer n-gram hash multipliers and bucket primes, plus model-definition sample hashes. It is tied to the exact checkpoint's `config.json` and `tokenizer.json`. A fresh runtime directory and `calibrate` alone are insufficient: the CLI has no producer for this record.
+
+Provision a record exported from the matching model definition before generating or serving:
+
+1. Use that checkpoint's `inference/config.json` to construct the model definition's `ModelArgs` and `EngramLayout.from_args`. Load its tokenizer and construct `NgramHashState` on the CPU; full-model inference and weight conversion are not needed.
+2. Export `layer_ids` from the layout and `token_map`, `multipliers`, `primes` and `pad_id` from that hash state. Record the tokenizer vocabulary size, compressed vocabulary size, and SHA-256 of the raw `config.json` and `tokenizer.json` bytes. Include sample token IDs, masks and the model definition's resulting per-layer hash rows, using a fresh state starting at position 0 for each sample.
+3. Serialize the schema below to a file outside the model directory, then copy the validated, checkpoint-matching record into the runtime directory. An existing record can be reused only for the matching config and tokenizer.
+
+```sh
+mkdir -p <runtime-dir>
+cp <validated-engram-hash-v1.json> <runtime-dir>/engram-hash-v1.json
+flyingfish --model <DeepSeek-V4.1-Flash-dir> --runtime-dir <runtime-dir> generate --prompt "Hello" --max-new-tokens 64
+```
+
+The JSON fields are defined by [`EngramHashSetup` and `EngramHashSample`](../src/engram.rs#L21). Let `L` be the number of Engram layers, `N` the maximum n-gram size, `H` the heads per size, and `T` the sample's token count:
+
+| Field | Stored JSON value |
+|---|---|
+| `schema` | Integer `1` |
+| `layer_ids` | `L` integer layer IDs in model order |
+| `config_sha256`, `tokenizer_sha256` | 64-character lowercase SHA-256 strings for the raw checkpoint files |
+| `tokenizer_vocab`, `compressed_vocab`, `pad_id` | Integer vocabulary extents and compressed padding ID |
+| `token_map` | `tokenizer_vocab` compressed integer IDs |
+| `multipliers` | Signed integer array `[L, N]` |
+| `primes` | Unsigned integer array `[L, N-1, H]` |
+| `samples` | Array of objects with `input_ids` (integer IDs), `start_position` (integer), `text_mask` (boolean array or `null`) and `hashes` (unsigned integer array `[L, T*(N-1)*H]`) |
+
+At load, [`DeepseekEngram::new`](../src/backend/cuda/engine_deepseek.rs#L110) reads the file, calls `setup.validate_model(model)?` and `setup.validate_samples(model)?`, and checks the layer IDs, per-layer table rows, n-gram size, head count and head dimension against the checkpoint. [`validate`](../src/engram.rs#L71) checks schema/fingerprints, array extents, token-map bounds, distinct prime moduli and multiplier overflow bounds; [`validate_samples`](../src/engram.rs#L219) recomputes each sample's hash rows. A missing or mismatched record errors at setup.
+
 ### Serving and multimodal input
 
 ```sh
@@ -128,7 +159,12 @@ Clover uses canvas inference with tiered experts; DiffusionGemma uses canvas inf
 
 ## Speech
 
-All speech commands below use CUDA. Audio input is mono 16 kHz WAV, PCM16, PCM24 or F32; `-` as the positional input reads WAV bytes from stdin. Output goes to stdout unless `-o, --output <OUTPUT>` names a file with the matching extension.
+All speech commands below use CUDA. Transcription and diarization input is mono 16 kHz WAV, PCM16, PCM24 or F32; `-` as the positional input reads WAV bytes from stdin. `speak` takes text. Output goes to stdout unless `-o, --output <OUTPUT>` names a file with the matching extension.
+
+| Transcription model | `--model` input |
+|---|---|
+| Parakeet TDT, Canary-1B-v2, Nemotron 3.5 ASR | Published directory containing `config.json` and safetensors |
+| Parakeet realtime EOU, Multitalker Parakeet | Actual `<model.nemo>` archive file; its containing directory is not accepted |
 
 ### Parakeet TDT
 
@@ -146,11 +182,20 @@ flyingfish --model <Canary-1B-v2-dir> --runtime-dir <runtime-dir> transcribe <au
 
 `--source-lang <SOURCE_LANG>` and `--target-lang <TARGET_LANG>` both default to `en`. `--pnc` and `--no-pnc` are mutually exclusive; punctuation/capitalization is enabled unless `--no-pnc` is given. Canary uses published language/punctuation prompts; Canary subtitles are whole-clip only. `--stream` is not supported for Canary.
 
+### Nemotron 3.5 ASR streaming 0.6B
+
+```sh
+flyingfish --model <Nemotron-3.5-ASR-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --format txt -o transcript.txt
+flyingfish --model <Nemotron-3.5-ASR-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --stream --format json -o transcript.json
+```
+
+`--stream` selects cache-aware chunked-stream FastConformer encoding with shared greedy RNNT prediction/joint decode; omitted, it encodes the full clip. Both modes consume the supplied WAV. `--format <FORMAT>` defaults to `txt`; accepted values are `txt`, `json`, `srt`, `vtt`. Subtitle cues are whole-clip in both modes. The decoder uses blank 13087 and at most 10 symbols per step.
+
 ### Parakeet realtime EOU 120M
 
 ```sh
-flyingfish --model <Parakeet-EOU-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --format txt -o transcript.txt
-flyingfish --model <Parakeet-EOU-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --stream --format vtt -o transcript.vtt
+flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <audio.wav> --format txt -o transcript.txt
+flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <audio.wav> --stream --format vtt -o transcript.vtt
 ```
 
 Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware streaming with a reset on end-of-utterance. Offline subtitles are whole-clip only, streaming subtitles are per utterance. `--stream` selects the streaming path over the supplied clip.
@@ -167,16 +212,22 @@ flyingfish --model <Nemotron-3-Diarization-dir> --runtime-dir <runtime-dir> diar
 ### Multitalker Parakeet streaming 0.6B
 
 ```sh
-flyingfish --model <Multitalker-Parakeet-dir> --runtime-dir <runtime-dir> transcribe <meeting.wav> --diar-model <Nemotron-3-Diarization-dir> --format json -o speakers.json
+flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <meeting.wav> --diar-model <Nemotron-3-Diarization-dir> --format json -o speakers.json
 ```
 
 `--diar-model <DIAR_MODEL>` is required to select the multitalker path. The `.nemo` container is read in place. Nemotron-3-Diarization arrival-order channels 0-3 are the lanes; speaker kernels run by default. `--masked` selects masked-ASR lane masking and requires `--diar-model`. `--stream` selects streaming diarization for the masks. A fifth active diarization channel errors instead of being dropped.
 
 Output contains per-speaker text with word timestamps; `txt`, `json`, `srt` and `vtt` are accepted, with speaker-prefixed word cues for subtitles. Kernel-mode free running diverges from the published wrapper's batch-1 pre-encode (measured 4.272e-4).
 
-### Library-only speech entries
+### Breeze-TTS-2
 
-Breeze-TTS-2 has greedy decode over supplied audio-code frames and audio tokenizer decode to a 24 kHz waveform through `flyingfish::backend::{Breeze, BreezeTokenizer}`. There is no free-running text-to-speech CLI entry in this command set.
+```sh
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak "Hello, world." --seed 42 -o speech.wav
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak - -o speech.wav < text.txt
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak "Hello, world." > speech.wav
+```
+
+The positional `<TEXT>` is required; `-` reads UTF-8 text from stdin. `--seed <SEED>` defaults to `42`. `-o, --output <OUTPUT>` writes mono 24 kHz PCM16 WAV; omitted output writes WAV bytes to stdout. The command runs free-running text-to-speech with published-config sampling and seeded Philox draws, followed by audio tokenizer decode. Greedy decode over supplied audio-code frames remains available through the library.
 
 ## Media generation
 
@@ -203,6 +254,28 @@ MiniMax-H3 video requires a keyframe, a frame count and a seed. Requested frames
 | `--json` | Print resolved output metadata, including aligned frame count, as JSON |
 
 MP4 output requires ffmpeg on `PATH`. Y4M+WAV output does not require it. Without `--json`, stdout lists the written output paths.
+
+### HyperFlow H3 Flash video with audio
+
+```sh
+flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <runtime-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --frames 124 --seed 42 -o out.mp4
+flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <runtime-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o out.y4m --json
+```
+
+HyperFlow uses the published `fl2va_int8_convrot` component and MiniMax-H3 companion files supplied by `--base-model`, without an external LoRA or GGUF replacement. It supports text-only, first, last and first+last keyframes; ref2va media inputs are not supported. Frames round up to `17n+5`, within 124-362 aligned frames at 24 fps. The sampler uses the published six-step grid with video/audio shifts 12/3.
+
+| HyperFlow video option | Required input / behavior |
+|---|---|
+| `--prompt <PROMPT>` | Required video description |
+| `--base-model <BASE_MODEL>` | Required MiniMax-H3 companion checkpoint for the text encoder and VAEs |
+| `--frames <FRAMES>` | Required frame count; no default |
+| `--seed <SEED>` | Required noise seed; no documented default |
+| `--image <IMAGE>` | Optional first keyframe |
+| `--last-image <LAST_IMAGE>` | Optional final keyframe, alone or with `--image` |
+| `-o, --output <OUTPUT>` | Required `.mp4`, or `.y4m` with a sibling `.wav` |
+| `--json` | Print resolved output metadata, including aligned frame count, as JSON |
+
+Omit both keyframes for text-to-video; provide either one for a single anchor, or both for first+last conditioning. `--lora` and `--gguf` are invalid for HyperFlow. `--base-model` and `--last-image` are HyperFlow-only; MiniMax-H3 still requires its first keyframe and Turbo LoRA. MP4 requires ffmpeg on `PATH`; Y4M+WAV does not.
 
 ### MiniMax-H3-Image
 
