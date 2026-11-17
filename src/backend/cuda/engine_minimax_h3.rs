@@ -1815,20 +1815,26 @@ fn apply_int8(
             && k <= ptrs.k,
         "convrot shape"
     );
-    let count = rows * k;
     let launch = c.kernels.stored_launch(c.s.context())?;
-    unsafe {
-        c.s.launch_builder(&launch.upcast)
-            .arg(&x.ptr)
-            .arg(&ptrs.x)
-            .arg(&u32::try_from(count)?)
-            .launch(flat(count))?;
-    }
+    // group_dot reads bf16. linear reads the upcast f32.
+    let x_ptr = if rows >= crate::convrot::TENSOR_CORE_ROWS {
+        x.ptr
+    } else {
+        let count = rows * k;
+        unsafe {
+            c.s.launch_builder(&launch.upcast)
+                .arg(&x.ptr)
+                .arg(&ptrs.x)
+                .arg(&u32::try_from(count)?)
+                .launch(flat(count))?;
+        }
+        ptrs.x
+    };
     crate::convrot::launch_device(
         c.s,
         &launch.convrot,
         &crate::convrot::ConvrotArgs {
-            x: ptrs.x,
+            x: x_ptr,
             qweight: qweight.ptr,
             wscale: wscale.tensor.ptr,
             y: y.ptr,
@@ -1855,7 +1861,7 @@ fn int8_linear(linear: &BlockLinear) -> Option<(Tensor<i8, 2>, Tensor<f32, 1>, u
     }
 }
 
-/// Int8 Q, K, and V at or above [`crate::convrot::TENSOR_CORE_ROWS`] share one rotate-quant.
+/// Int8 Q, K, and V at or above [`crate::convrot::TENSOR_CORE_ROWS`] share one rotate-quant of the bf16 norm.
 fn apply_shared_qkv(
     c: &BlockContext<'_>,
     w: &BlockWeights,
@@ -1896,16 +1902,8 @@ fn apply_shared_qkv(
             && kdim <= ptrs.k,
         "convrot shape"
     );
-    let count = rows * kdim;
     let launch = c.kernels.stored_launch(c.s.context())?;
     let x = rows_view(&work.normed, c.s, 0, rows, h, h)?;
-    unsafe {
-        c.s.launch_builder(&launch.upcast)
-            .arg(&x.ptr)
-            .arg(&ptrs.x)
-            .arg(&u32::try_from(count)?)
-            .launch(flat(count))?;
-    }
     let group = i32::try_from(q.2)?;
     let rows_i = i32::try_from(rows)?;
     let k_i = i32::try_from(kdim)?;
@@ -1913,7 +1911,7 @@ fn apply_shared_qkv(
         c.s,
         &launch.convrot,
         &crate::convrot::ConvrotArgs {
-            x: ptrs.x,
+            x: x.ptr,
             qweight: 0,
             wscale: 0,
             y: 0,
