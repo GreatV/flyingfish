@@ -319,11 +319,18 @@ __device__ __forceinline__ void convrot_mma_tile(const int8_t* stage, int (&acc)
     }
 }
 
-__device__ __forceinline__ void convrot_store_one(__nv_bfloat16* __restrict__ y, const float* __restrict__ scales,
-                                                  const float* __restrict__ wscale, int rows, int n, int r, int c,
-                                                  int acc) {
+__device__ __forceinline__ float convrot_ldg_f32(const float* p, bool live) {
+    float v = 0.f;
+    if (live) {
+        asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    }
+    return v;
+}
+
+__device__ __forceinline__ void convrot_store_one(__nv_bfloat16* __restrict__ y, int rows, int n, int r, int c, int acc,
+                                                  float sx, float sw) {
     if (r < rows && c < n) {
-        const float v = __fmul_rn(__fmul_rn(static_cast<float>(acc), scales[r]), wscale[c]);
+        const float v = __fmul_rn(__fmul_rn(static_cast<float>(acc), sx), sw);
         y[static_cast<long long>(r) * n + c] = __float2bfloat16(v);
     }
 }
@@ -369,16 +376,31 @@ extern "C" __global__ void __maxnreg__(124) convrot_product(const int8_t* __rest
         __syncthreads();
         stage ^= 1;
     }
+    // 4 row scales and 16 column scales, one global load each.
+    float sx[2][2];
+    float sw[8][2];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+        const int r0 = m0 + warp_m * 32 + mi * 16 + group;
+        sx[mi][0] = convrot_ldg_f32(scales + r0, r0 < rows);
+        sx[mi][1] = convrot_ldg_f32(scales + (r0 + 8), (r0 + 8) < rows);
+    }
+#pragma unroll
+    for (int ni = 0; ni < 8; ++ni) {
+        const int c0 = n0 + warp_n * 64 + ni * 8 + t2;
+        sw[ni][0] = convrot_ldg_f32(wscale + c0, c0 < n);
+        sw[ni][1] = convrot_ldg_f32(wscale + (c0 + 1), (c0 + 1) < n);
+    }
 #pragma unroll
     for (int mi = 0; mi < 2; ++mi) {
 #pragma unroll
         for (int ni = 0; ni < 8; ++ni) {
             const int r0 = m0 + warp_m * 32 + mi * 16 + group;
             const int c0 = n0 + warp_n * 64 + ni * 8 + t2;
-            convrot_store_one(y, scales, wscale, rows, n, r0, c0, acc[mi][ni][0]);
-            convrot_store_one(y, scales, wscale, rows, n, r0, c0 + 1, acc[mi][ni][1]);
-            convrot_store_one(y, scales, wscale, rows, n, r0 + 8, c0, acc[mi][ni][2]);
-            convrot_store_one(y, scales, wscale, rows, n, r0 + 8, c0 + 1, acc[mi][ni][3]);
+            convrot_store_one(y, rows, n, r0, c0, acc[mi][ni][0], sx[mi][0], sw[ni][0]);
+            convrot_store_one(y, rows, n, r0, c0 + 1, acc[mi][ni][1], sx[mi][0], sw[ni][1]);
+            convrot_store_one(y, rows, n, r0 + 8, c0, acc[mi][ni][2], sx[mi][1], sw[ni][0]);
+            convrot_store_one(y, rows, n, r0 + 8, c0 + 1, acc[mi][ni][3], sx[mi][1], sw[ni][1]);
         }
     }
 }
