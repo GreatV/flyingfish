@@ -157,6 +157,28 @@ struct EntryReader {
     align: Option<usize>,
 }
 
+    /// One batched direct-read destination: tensor identity plus a disjoint aligned
+/// writable window of the pinned arena. `dest` must be aligned and hold the padded
+/// file span; only the owning worker thread dereferences it.
+struct DirectRead<'a> {
+    name: &'a str,
+    entry: &'a TensorEntry,
+    dest: *mut u8,
+    dest_len: usize,
+}
+
+/// The batch base pointer, Send by the disjoint-index discipline of `read_many_direct`.
+struct DirectBatch(*mut DirectRead<'static>);
+impl Copy for DirectBatch {}
+impl Clone for DirectBatch {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+unsafe impl Send for DirectBatch {}
+unsafe impl Sync for DirectBatch {}
+
+
 impl EntryReader {
     fn new(dir: &Path) -> Self {
         Self {
@@ -248,6 +270,64 @@ impl EntryReader {
         self.read_range(name, entry, 0, entry.bytes)
     }
 
+    /// Fills the pinned windows with one aligned direct read each, four shards in flight.
+    /// Readers are opened first on this thread; each worker then owns whole shard queues,
+    /// so every destination is touched by exactly one thread.
+    fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>]) -> Result<()> {
+        ensure!(!requests.is_empty(), "empty direct batch");
+        for request in requests.iter() {
+            if !self.readers.contains_key(&request.entry.shard) {
+                let reader = SpanReader::open(&self.dir.join(&request.entry.shard), true)?;
+                self.readers.insert(request.entry.shard.clone(), reader);
+            }
+        }
+        let readers = &self.readers;
+        let mut queues: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, request) in requests.iter().enumerate() {
+            queues
+                .entry(request.entry.shard.clone())
+                .or_default()
+                .push(index);
+        }
+        let queues: Vec<Vec<usize>> = queues.into_values().collect();
+        let in_flight = queues.len().min(4).max(1);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let batch = DirectBatch(requests.as_mut_ptr() as *mut DirectRead<'static>);
+        let batch = &batch;
+        std::thread::scope(|scope| -> Result<()> {
+            let handles: Vec<_> = (0..in_flight)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        loop {
+                            let queue = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let Some(queue) = queues.get(queue) else {
+                                return Ok(());
+                            };
+                            for &index in queue {
+                                // SAFETY: each index is owned by exactly one queue and
+                                // therefore one worker; the window is within the arena.
+                                let request = unsafe { &mut *batch.0.add(index) };
+                                let destination = unsafe {
+                                    std::slice::from_raw_parts_mut(request.dest, request.dest_len)
+                                };
+                                Self::read_pinned(
+                                    readers,
+                                    request.name,
+                                    request.entry,
+                                    destination,
+                                )?;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().map_err(|_| anyhow::anyhow!("direct batch worker panicked"))??;
+            }
+            Ok(())
+        })
+    }
+
     /// One aligned direct read into a caller-owned pinned destination, planned from the
     /// tensor's file span. The destination slice must start aligned and hold the padded span.
     fn read_pinned(
@@ -288,12 +368,29 @@ impl EntryReader {
     /// checkpoint directory shares the filesystem, so the first reader's alignment stands.
     fn align_elements(&mut self) -> Result<usize> {
         if self.align.is_none() {
-            let mut names = self.readers.keys().cloned().collect::<Vec<_>>();
-            names.sort();
-            let shard = names
-                .first()
+            let shard = self
+                .readers
+                .keys()
+                .next()
                 .cloned()
-                .map_or_else(|| "model.safetensors".to_owned(), std::convert::identity);
+                .map_or_else(
+                    || {
+                        let mut first = self
+                            .dir
+                            .read_dir()
+                            .with_context(|| format!("read {}", self.dir.display()))?
+                            .filter_map(std::result::Result::ok)
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .filter(|name| !name.starts_with('.'))
+                            .collect::<Vec<_>>();
+                        first.sort();
+                        anyhow::Ok(first
+                            .into_iter()
+                            .next()
+                            .context("checkpoint directory is empty")?)
+                    },
+                    Ok,
+                )?;
             if !self.readers.contains_key(&shard) {
                 let reader = SpanReader::open(&self.dir.join(&shard), true)?;
                 self.readers.insert(shard.clone(), reader);
@@ -14083,5 +14180,72 @@ mod tests {
             println!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}");
             bail!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}")
         }
+    }
+}
+
+#[cfg(test)]
+mod h3_direct_batch_tests {
+    use super::*;
+
+    #[test]
+    fn direct_batch_matches_the_serial_read() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-direct-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let shard = dir.join("shard.bin");
+        let align = 4096usize;
+        let len = 64 * align;
+        let file: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&shard, &file)?;
+        let entry = |start: u64, bytes: usize| TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![bytes / 2],
+            shard: "shard.bin".to_owned(),
+            bytes,
+            load: true,
+            data_start: start,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let entries = [
+            entry(align as u64 + 96, 5 * align / 2),
+            entry(32 * align as u64 + 33, 3 * align),
+        ];
+        let mut reader = EntryReader::new(&dir);
+        ensure!(reader.align_elements()? == align / 2, "sensed alignment");
+        // One pinned arena; each tensor's data offset is aligned with a full
+        // alignment of head slack after the previous tensor's data.
+        let mut offsets = [0usize; 2];
+        let mut cursor = 0usize;
+        for (index, entry) in entries.iter().enumerate() {
+            cursor = (cursor + align).next_multiple_of(align);
+            offsets[index] = cursor;
+            cursor += entry.bytes;
+        }
+        let total = cursor + 2 * align;
+        let mut arena = AlignedBytes::new(total, align)?;
+        let mut requests = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            requests.push(DirectRead {
+                name: "t",
+                entry,
+                dest: unsafe { arena.as_mut().as_mut_ptr().add(offsets[index]) },
+                dest_len: total - offsets[index],
+            });
+        }
+        reader.read_many_direct(&mut requests)?;
+        for (index, entry) in entries.iter().enumerate() {
+            let head = (entry.data_start as usize) % align;
+            let got = &arena.as_mut()[offsets[index] + head..offsets[index] + head + entry.bytes];
+            let want =
+                &file[entry.data_start as usize..entry.data_start as usize + entry.bytes];
+            ensure!(got == want, "tensor {index}: batch bytes differ");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }
