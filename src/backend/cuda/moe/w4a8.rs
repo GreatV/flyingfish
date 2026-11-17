@@ -90,6 +90,8 @@ pub struct W4A8Dispatch<'a> {
     pub swiglu_limit: f32,
     /// `[rows, top_k, hidden]` BF16 contributions out.
     pub contributions: &'a mut TensorMut<bf16, 3>,
+    #[cfg(test)]
+    pub projection_capture: Option<Tensor<bf16, 4>>,
 }
 
 /// Derived extents of one call.
@@ -239,8 +241,8 @@ pub struct MoeExpertW4A8 {
     gate_up: CudaFunction,
     #[cfg(test)]
     down: CudaFunction,
-    dispatch_gate_up: CudaFunction,
-    dispatch_down: CudaFunction,
+    dispatch_gate_up: [CudaFunction; 2],
+    dispatch_down: [CudaFunction; 2],
 }
 
 impl MoeExpertW4A8 {
@@ -252,8 +254,14 @@ impl MoeExpertW4A8 {
             gate_up: module.load_function("moe_ffn_gate_up_e2m1_e8m0")?,
             #[cfg(test)]
             down: module.load_function("moe_ffn_down_e2m1_e8m0")?,
-            dispatch_gate_up: module.load_function("moe_ffn_dispatch_gate_up_e2m1_e8m0")?,
-            dispatch_down: module.load_function("moe_ffn_dispatch_down_e2m1_e8m0")?,
+            dispatch_gate_up: [
+                module.load_function("moe_ffn_dispatch_gate_up_e2m1_e8m0")?,
+                module.load_function("moe_ffn_dispatch_gate_up_e2m1_e8m0_exact")?,
+            ],
+            dispatch_down: [
+                module.load_function("moe_ffn_dispatch_down_e2m1_e8m0")?,
+                module.load_function("moe_ffn_dispatch_down_e2m1_e8m0_exact")?,
+            ],
         })
     }
 
@@ -346,7 +354,7 @@ impl MoeExpertW4A8 {
     /// gate_up, the down-input quantization and the down launch, each reading
     /// its expert id, routed weight and weight addresses from device memory.
     /// Stream order serializes the shared scratch reuse.
-    pub fn run_dispatch(
+    pub fn run_dispatch<const ACCURATE: bool>(
         &self,
         stream: &Arc<CudaStream>,
         input: W4A8Dispatch<'_>,
@@ -355,6 +363,8 @@ impl MoeExpertW4A8 {
         let dims = validate_dispatch(&input, scratch)?;
         let (rows, top_k, experts) = (dims.rows, dims.top_k, dims.experts);
         let (hidden, intermediate) = (dims.hidden, dims.intermediate);
+        let (hidden_i32, intermediate_i32, experts_i32) =
+            (hidden as i32, intermediate as i32, experts as i32);
         let (offsets, _) = scratch_layout(hidden, intermediate);
         let codes = scratch.ptr + offsets[0];
         let scales = scratch.ptr + offsets[1];
@@ -383,26 +393,34 @@ impl MoeExpertW4A8 {
             }
             for k in 0..top_k {
                 let index = u64::from(row) * u64::from(top_k) + u64::from(k);
+                let projected = 0u64;
+                #[cfg(test)]
+                let projected = input.projection_capture.map_or(projected, |capture| {
+                    capture.ptr + index * u64::from(intermediate) * 6
+                });
                 unsafe {
-                    stream
-                        .launch_builder(&self.dispatch_gate_up)
-                        .arg(&codes)
+                    let mut gate =
+                        stream.launch_builder(&self.dispatch_gate_up[usize::from(ACCURATE)]);
+                    gate.arg(&codes)
                         .arg(&scales)
                         .arg(&input.slots.ptr)
                         .arg(&input.slot_valid.ptr)
                         .arg(&input.ids.ptr)
                         .arg(&input.route_weights.ptr)
                         .arg(&index)
-                        .arg(&(experts as i32))
+                        .arg(&experts_i32)
                         .arg(&state)
-                        .arg(&(hidden as i32))
-                        .arg(&(intermediate as i32))
-                        .arg(&input.swiglu_limit)
-                        .launch(LaunchConfig {
-                            grid_dim: (intermediate.div_ceil(W4A8_ROWS), 1, 1),
-                            block_dim: (W4A8_THREADS, 1, 1),
-                            shared_mem_bytes: shared_gate_up as u32,
-                        })?;
+                        .arg(&hidden_i32)
+                        .arg(&intermediate_i32)
+                        .arg(&input.swiglu_limit);
+                    if ACCURATE {
+                        gate.arg(&projected);
+                    }
+                    gate.launch(LaunchConfig {
+                        grid_dim: (intermediate.div_ceil(W4A8_ROWS), 1, 1),
+                        block_dim: (W4A8_THREADS, 1, 1),
+                        shared_mem_bytes: shared_gate_up as u32,
+                    })?;
                     stream
                         .launch_builder(&self.act_quant)
                         .arg(&state)
@@ -416,7 +434,7 @@ impl MoeExpertW4A8 {
                         })?;
                     let out = contributions.ptr + index * u64::from(hidden) * 2;
                     stream
-                        .launch_builder(&self.dispatch_down)
+                        .launch_builder(&self.dispatch_down[usize::from(ACCURATE)])
                         .arg(&down_codes)
                         .arg(&down_scales)
                         .arg(&input.slots.ptr)
@@ -510,6 +528,24 @@ fn validate_dispatch(
     );
     scratch.validate()?;
     let intermediate = input.intermediate;
+    #[cfg(test)]
+    if let Some(capture) = input.projection_capture {
+        capture.validate()?;
+        ensure!(
+            capture.shape == [rows, top_k, 3, intermediate]
+                && capture.stride
+                    == [
+                        u64::from(top_k) * 3 * u64::from(intermediate),
+                        3 * u64::from(intermediate),
+                        u64::from(intermediate),
+                        1,
+                    ],
+            "W4A8 projection capture extent"
+        );
+        no_overlap(&capture, &contributions, "capture", "contributions")?;
+        no_overlap(&capture, scratch, "capture", "scratch")?;
+        no_overlap(&capture, &input.x, "capture", "x")?;
+    }
     ensure!(
         hidden >= W4A8_SCALE_BLOCK && hidden.is_multiple_of(W4A8_SCALE_BLOCK),
         "w4a8 dispatch hidden {hidden} must be a positive multiple of {W4A8_SCALE_BLOCK}"

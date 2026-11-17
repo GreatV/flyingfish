@@ -92,9 +92,22 @@ pub struct HcRuntime {
     /// `[rows, mult*mult]` f32 combination matrix, rows indexed `[j=out, k=in]`.
     pub(crate) mix_comb: CudaSlice<f32>,
     mix_partials: Option<CudaSlice<f32>>,
+    mix_f32: Option<CudaSlice<f32>>,
     /// `[rows, mult]` f32 constant one-hot on copy 0: the carried pre-mix of
     /// the first layer of a forward; bound with the carry.
     one_hot: Option<CudaSlice<f32>>,
+}
+
+pub(crate) struct HcCheckpoint {
+    stream: CudaSlice<bf16>,
+    mixes: Vec<CudaSlice<f32>>,
+    rows: usize,
+}
+
+impl HcCheckpoint {
+    pub(crate) fn bytes(&self) -> usize {
+        self.stream.len() * 2 + self.mixes.iter().map(|v| v.len() * 4).sum::<usize>()
+    }
 }
 
 /// Dense view over one owned weight-byte allocation.
@@ -129,6 +142,68 @@ fn alloc_one_hot(s: &Arc<CudaStream>, rows: usize, mult: usize) -> Result<CudaSl
 }
 
 impl HcRuntime {
+    fn state_f32(&self) -> impl Iterator<Item = &CudaSlice<f32>> {
+        self.carry.iter().chain(self.attn_pre.iter()).chain([
+            &self.mix_pre,
+            &self.mix_post,
+            &self.mix_comb,
+        ])
+    }
+
+    fn state_f32_mut(&mut self) -> impl Iterator<Item = &mut CudaSlice<f32>> {
+        self.carry
+            .iter_mut()
+            .chain(self.attn_pre.iter_mut())
+            .chain([&mut self.mix_pre, &mut self.mix_post, &mut self.mix_comb])
+    }
+
+    pub(crate) fn checkpoint(&self, rows: usize, s: &Arc<CudaStream>) -> Result<HcCheckpoint> {
+        self.check_rows(rows)?;
+        Ok(HcCheckpoint {
+            stream: s.alloc_zeros(rows * self.stream.len() / self.rows)?,
+            mixes: self
+                .state_f32()
+                .map(|v| Ok(s.alloc_zeros(rows * v.len() / self.rows)?))
+                .collect::<Result<_>>()?,
+            rows,
+        })
+    }
+
+    pub(crate) fn save_checkpoint(
+        &self,
+        saved: &mut HcCheckpoint,
+        s: &Arc<CudaStream>,
+    ) -> Result<()> {
+        self.check_rows(saved.rows)?;
+        s.memcpy_dtod(&self.stream.slice(..saved.stream.len()), &mut saved.stream)?;
+        for (live, saved) in self.state_f32().zip(&mut saved.mixes) {
+            s.memcpy_dtod(&live.slice(..saved.len()), saved)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn select_checkpoint(
+        &mut self,
+        saved: &HcCheckpoint,
+        accepted: usize,
+        s: &Arc<CudaStream>,
+    ) -> Result<()> {
+        ensure!(accepted <= saved.rows, "mHC prefix outside checkpoint");
+        copy::select_prefix_row(
+            s,
+            &mut self.stream,
+            &saved.stream,
+            self.binding.params.mult as usize * self.binding.params.hidden as usize,
+            accepted,
+        )?;
+        let live_rows = self.rows;
+        for (live, saved_mix) in self.state_f32_mut().zip(&saved.mixes) {
+            let width = live.len() / live_rows;
+            copy::select_prefix_row(s, live, saved_mix, width, accepted)?;
+        }
+        Ok(())
+    }
+
     /// Allocates the runtime state for `layers` layers and `rows` rows under
     /// one fixed binding; the per-layer weights are bound separately.
     pub fn new(
@@ -181,12 +256,69 @@ impl HcRuntime {
             } else {
                 None
             },
+            mix_f32: None,
             one_hot: if carries {
                 Some(alloc_one_hot(s, rows, mult)?)
             } else {
                 None
             },
         })
+    }
+
+    pub(crate) fn prepare_f32_blas(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &super::blas::Blas,
+    ) -> Result<()> {
+        ensure!(
+            self.binding.fn_dtype == HcFnDtype::F32
+                && self.binding.params.mult == 4
+                && self.mix_f32.is_none()
+                && self.mix_partials.is_none(),
+            "mHC F32 preparation requires an unprepared four-stream F32 runtime"
+        );
+        let width = self.binding.params.mult as usize * self.binding.params.hidden as usize;
+        ensure!(
+            self.rows <= i32::MAX as usize && width <= i32::MAX as usize,
+            "mHC F32 shape exceeds kernel dimensions"
+        );
+        self.mix_f32 = Some(
+            s.alloc_zeros(
+                self.rows
+                    .checked_mul(width)
+                    .context("mHC F32 input capacity overflow")?,
+            )?,
+        );
+        self.mix_partials = Some(
+            s.alloc_zeros(
+                self.rows
+                    .checked_mul(25)
+                    .context("mHC F32 partial capacity overflow")?,
+            )?,
+        );
+        let weights = self.hc_weights(s, 0, HcSublayer::Attention)?;
+        let HcFnW::F32(weight) = weights.fn_w else {
+            anyhow::bail!("mHC F32 weights missing")
+        };
+        blas.linear_f32(
+            weight,
+            view(
+                self.mix_f32.as_ref().context("mHC F32 input missing")?,
+                s,
+                0,
+                [self.rows as u32, width as u32],
+                [width as u64, 1],
+            )?,
+            &mut TensorMut(view(
+                self.mix_partials
+                    .as_ref()
+                    .context("mHC F32 partials missing")?,
+                s,
+                0,
+                [self.rows as u32, 24],
+                [24, 1],
+            )?),
+        )
     }
 
     /// Binds the weight bytes of one backbone layer.
@@ -353,6 +485,73 @@ impl HcRuntime {
                 comb: &mut TensorMut(comb),
             },
         )?;
+        self.collapse_pre(s, sublayer, source, rows, x)
+    }
+
+    pub(crate) fn hc_pre_blas(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &super::blas::Blas,
+        stage: (usize, HcSublayer, HcPreSource),
+        rows: usize,
+        x: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        let (layer, sublayer, source) = stage;
+        self.check_rows(rows)?;
+        let weights = self.hc_weights(s, layer, sublayer)?;
+        let HcFnW::F32(weight) = weights.fn_w else {
+            anyhow::bail!("mHC F32 weights missing")
+        };
+        let width = self.binding.params.mult * self.binding.params.hidden;
+        let prepared = view(
+            self.mix_f32.as_ref().context("mHC F32 input missing")?,
+            s,
+            0,
+            [rows as u32, width],
+            [u64::from(width), 1],
+        )?;
+        let partials = self
+            .mix_partials
+            .as_ref()
+            .context("mHC F32 partials missing")?;
+        self.ops.prepare_f32(
+            s,
+            self.stream_view(s, rows)?,
+            &self.binding.params,
+            (
+                &mut TensorMut(prepared),
+                &mut TensorMut(view(partials, s, rows * 24, [rows as u32], [1])?),
+            ),
+        )?;
+        blas.linear_f32(
+            weight,
+            prepared,
+            &mut TensorMut(view(partials, s, 0, [rows as u32, 24], [24, 1])?),
+        )?;
+        let (pre, post, comb) = self.mix_views(s, rows)?;
+        self.ops.finish_f32(
+            s,
+            &weights,
+            &self.binding.params,
+            HcMixes {
+                partials: Some(TensorMut(view(partials, s, 0, [rows as u32, 25], [25, 1])?)),
+                pre: &mut TensorMut(pre),
+                post: &mut TensorMut(post),
+                comb: &mut TensorMut(comb),
+            },
+        )?;
+        self.collapse_pre(s, sublayer, source, rows, x)
+    }
+
+    #[inline(always)]
+    fn collapse_pre(
+        &mut self,
+        s: &Arc<CudaStream>,
+        sublayer: HcSublayer,
+        source: HcPreSource,
+        rows: usize,
+        x: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
         let mult = self.binding.params.mult;
         let pre_source = match source {
             HcPreSource::Carried => self
@@ -377,6 +576,7 @@ impl HcRuntime {
                 [rows as u32, self.binding.params.hidden],
                 [u64::from(self.binding.params.hidden), 1],
             )?),
+            self.binding.rounding == HcRounding::Fp32ResidualSum,
         )?;
         let count = rows * mult as usize;
         match sublayer {
@@ -428,6 +628,24 @@ impl HcRuntime {
                 [rows as u32, self.binding.params.hidden],
                 [u64::from(self.binding.params.hidden), 1],
             )?),
+            self.binding.rounding == HcRounding::Fp32ResidualSum,
+        )
+    }
+
+    pub(crate) fn mean(
+        &self,
+        s: &Arc<CudaStream>,
+        rows: usize,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        self.check_rows(rows)?;
+        let (m, h) = (self.binding.params.mult, self.binding.params.hidden);
+        self.ops.collapse(
+            s,
+            self.stream_view(s, rows)?,
+            view(&self.head_pre, s, 0, [rows as u32, m], [u64::from(m), 1])?,
+            &mut TensorMut(view(out, s, 0, [rows as u32, h], [u64::from(h), 1])?),
+            self.binding.rounding == HcRounding::Fp32ResidualSum,
         )
     }
 

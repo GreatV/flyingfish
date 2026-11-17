@@ -16,6 +16,13 @@ use std::sync::mpsc;
 /// Alignment of a ring slot; one slot holds one expert's gate-up then down bytes.
 const RING_ALIGN: usize = 4096;
 
+#[cfg(all(test, feature = "cuda"))]
+thread_local! {
+    pub(crate) static READ_CENSUS: std::cell::RefCell<Option<Vec<serde_json::Value>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// An aligned, zeroed, caller-sized buffer. The one aligned allocation both the expert ring and
 /// the Engram row reader use.
 pub(crate) struct AlignedBytes {
@@ -633,6 +640,8 @@ struct FillJob {
     slot: *const AlignedSlot,
     plan: *const SlotPlan,
     parts: Vec<(u64, NativeRange)>,
+    #[cfg(all(test, feature = "cuda"))]
+    census: bool,
 }
 
 // SAFETY: `slot` and `plan` stay in the owning `DiskReader` until this job's reply is received.
@@ -647,6 +656,8 @@ enum ReadCmd {
 struct Done {
     id: usize,
     result: Result<()>,
+    #[cfg(all(test, feature = "cuda"))]
+    reads: Vec<serde_json::Value>,
 }
 
 /// `open` starts one thread per ring slot. The thread blocks in `read_at` into that slot.
@@ -723,15 +734,25 @@ fn reader_loop(
         match job {
             ReadCmd::Stop => break,
             ReadCmd::Fill(fill) => {
+                #[cfg(all(test, feature = "cuda"))]
+                READ_CENSUS.with(|records| {
+                    *records.borrow_mut() = fill.census.then(Vec::new);
+                });
                 #[cfg(test)]
                 flight::enter();
                 let result = fill_job(&shards, &fill);
+                #[cfg(all(test, feature = "cuda"))]
+                let reads = READ_CENSUS
+                    .with(|records| records.borrow_mut().take())
+                    .unwrap_or_default();
                 #[cfg(test)]
                 flight::leave();
                 if done
                     .send(Done {
                         id: fill.id,
                         result,
+                        #[cfg(all(test, feature = "cuda"))]
+                        reads,
                     })
                     .is_err()
                 {
@@ -1000,6 +1021,18 @@ fn fill_slot(
                     let buffer =
                         unsafe { std::slice::from_raw_parts_mut(ring_ptr.add(dest), requested) };
                     shard.read_direct(begin, width, buffer)?;
+                    #[cfg(all(test, feature = "cuda"))]
+                    READ_CENSUS.with(|records| {
+                        if let Some(records) = records.borrow_mut().as_mut() {
+                            records.push(serde_json::json!({
+                                "layer": layer, "expert": expert,
+                                "shard": native.shard.as_ref(), "direct": true,
+                                "logical_bytes": native.len, "span_bytes": width,
+                                "requested_bytes": requested, "spans": [[begin, end]],
+                                "requests": [[native.offset, native.len]], "chunk_bytes": requested,
+                            }));
+                        }
+                    });
                     residues.push(u32::try_from(residue).context("window residue exceeds u32")?);
                 } else {
                     let begin = native.offset & !(alignment - 1);
@@ -1030,6 +1063,19 @@ fn fill_slot(
                         alignment,
                         staging.as_mut().context("native staging missing")?,
                     )?;
+                    #[cfg(all(test, feature = "cuda"))]
+                    READ_CENSUS.with(|records| {
+                        if let Some(records) = records.borrow_mut().as_mut() {
+                            records.push(serde_json::json!({
+                                "layer": layer, "expert": expert,
+                                "shard": native.shard.as_ref(), "direct": true,
+                                "logical_bytes": native.len, "span_bytes": end - begin,
+                                "requested_bytes": (end - begin).div_ceil(alignment) * alignment,
+                                "spans": [[begin, end]], "requests": [[native.offset, native.len]],
+                                "chunk_bytes": alignment,
+                            }));
+                        }
+                    });
                     let from = usize::try_from(native.offset - begin)?;
                     let len = usize::try_from(native.len)?;
                     ensure!(from + len <= bytes.len(), "staged slice exceeds its span");
@@ -1427,6 +1473,8 @@ impl DiskReader {
         chunk_bytes: u64,
     ) -> Result<()> {
         self.reset_view(slot);
+        #[cfg(all(test, feature = "cuda"))]
+        let census_start = READ_CENSUS.with(|records| records.borrow().as_ref().map(Vec::len));
         let owned = owned_parts(catalogue, layer, expert)?;
         let parts: Vec<(u64, &NativeRange)> = owned
             .iter()
@@ -1440,6 +1488,21 @@ impl DiskReader {
             // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
             let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
             self.read_parts(&parts, buffer, chunk_bytes)?;
+        }
+        #[cfg(all(test, feature = "cuda"))]
+        if let Some(start) = census_start {
+            READ_CENSUS.with(|records| -> Result<()> {
+                let mut records = records.borrow_mut();
+                let records = records
+                    .as_mut()
+                    .context("file census ended during a disk read")?;
+                for read in &mut records[start..] {
+                    read["catalogue_experts"] = catalogue.geometry().experts.into();
+                    read["layer"] = layer.into();
+                    read["expert"] = expert.into();
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -1530,6 +1593,8 @@ impl DiskReader {
                 slot: &self.ring[slot] as *const AlignedSlot,
                 plan,
                 parts: owned_parts(catalogue, layer, expert)?,
+                #[cfg(all(test, feature = "cuda"))]
+                census: READ_CENSUS.with(|records| records.borrow().is_some()),
             });
         }
         for (sent, job) in jobs.into_iter().enumerate() {
@@ -1551,6 +1616,20 @@ impl DiskReader {
                 .done
                 .recv()
                 .with_context(|| format!("layer {layer} disk reader dropped a reply"))?;
+            #[cfg(all(test, feature = "cuda"))]
+            READ_CENSUS.with(|records| -> Result<()> {
+                if !done.reads.is_empty() {
+                    let mut records = records.borrow_mut();
+                    let records = records
+                        .as_mut()
+                        .context("file census ended before disk replies")?;
+                    for mut read in done.reads {
+                        read["catalogue_experts"] = catalogue.geometry().experts.into();
+                        records.push(read);
+                    }
+                }
+                Ok(())
+            })?;
             if let Err(error) = done.result
                 && first.as_ref().is_none_or(|(id, _)| done.id < *id)
             {
@@ -1622,6 +1701,19 @@ impl DiskReader {
                     chunk_bytes
                 };
                 let spans = shard.plan(&requests, chunk)?;
+                #[cfg(all(test, feature = "cuda"))]
+                let census_read = serde_json::json!({
+                    "shard": shard_name, "direct": shard.direct,
+                    "logical_bytes": requests.iter().map(|(_, len)| *len).sum::<u64>(),
+                    "span_bytes": spans.iter().map(|span| span.end - span.begin).sum::<u64>(),
+                    "requested_bytes": spans.iter().map(|span| {
+                        let bytes = span.end - span.begin;
+                        if shard.direct { bytes.div_ceil(shard.alignment) * shard.alignment } else { bytes }
+                    }).sum::<u64>(),
+                    "spans": spans.iter().map(|span| [span.begin, span.end]).collect::<Vec<_>>(),
+                    "requests": requests,
+                    "chunk_bytes": chunk,
+                });
                 let mut needed = 0;
                 for span in &spans {
                     if shard.direct || span.last > span.first + 1 {
@@ -1672,6 +1764,12 @@ impl DiskReader {
                         }
                     }
                 }
+                #[cfg(all(test, feature = "cuda"))]
+                READ_CENSUS.with(|records| {
+                    if let Some(records) = records.borrow_mut().as_mut() {
+                        records.push(census_read);
+                    }
+                });
             }
             Ok(())
         })();
@@ -2410,6 +2508,8 @@ mod tests {
         struct ResetFlight;
         impl Drop for ResetFlight {
             fn drop(&mut self) {
+                #[cfg(feature = "cuda")]
+                super::READ_CENSUS.with(|records| *records.borrow_mut() = None);
                 super::flight::force_serial(false);
                 super::flight::hold(0);
                 super::flight::reset();
@@ -2423,7 +2523,30 @@ mod tests {
         super::flight::reset();
         super::flight::hold(2);
         super::flight::force_serial(false);
+        #[cfg(feature = "cuda")]
+        super::READ_CENSUS.with(|records| *records.borrow_mut() = Some(Vec::new()));
         let slots = reader.read_experts(0, &[0, 1], &catalogue)?;
+        #[cfg(feature = "cuda")]
+        {
+            let reads = super::READ_CENSUS
+                .with(|records| records.borrow_mut().take())
+                .context("worker file census missing")?;
+            let bytes: u64 = reads
+                .iter()
+                .map(|read| read["logical_bytes"].as_u64().expect("read bytes"))
+                .sum();
+            assert_eq!(bytes, 2 * catalogue.slot_bytes());
+            assert!(reads.iter().all(|read| read["catalogue_experts"]
+                == catalogue.geometry().experts
+                && read["layer"] == 0));
+            for expert in [0, 1] {
+                assert!(reads.iter().any(|read| read["expert"] == expert));
+            }
+            println!(
+                "PASS native_worker_census reads={} logical_bytes={bytes} calling_thread_collected=true",
+                reads.len()
+            );
+        }
         let together = super::flight::max_in_flight();
         require_outstanding(together, 2)?;
         expert_bytes(&reader, slots[0], &file, 0, 0)?;

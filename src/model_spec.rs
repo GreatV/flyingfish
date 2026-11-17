@@ -23,7 +23,7 @@ pub enum Architecture {
 impl Architecture {
     /// Architectures with a bound MTP decode path.
     pub fn mtp_decode(self) -> bool {
-        self == Self::Qwen35Text || self == Self::Glm5Next
+        matches!(self, Self::Qwen35Text | Self::Glm5Next | Self::DeepseekV41)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,6 +181,10 @@ pub struct DeepseekV41Config {
     pub engram_head_dim: u32,
     pub nextn_layers: u32,
     pub dspark_experts: u32,
+    pub dspark_experts_per_tok: u32,
+    pub dspark_block_size: u32,
+    pub dspark_noise_token_id: u32,
+    pub dspark_target_layer_ids: Vec<u32>,
     pub dspark_markov_rank: u32,
     pub vision_layers: u32,
     pub vision_hidden: u32,
@@ -4352,13 +4356,13 @@ impl ModelSpec {
             "dspark_num_experts_per_tok exceeds dspark_n_routed_experts"
         );
         let dspark_markov_rank = positive(t, "dspark_markov_rank")?;
-        positive(t, "dspark_block_size")?;
+        let dspark_block_size = positive(t, "dspark_block_size")?;
         let dspark_noise_token_id = integer(t, "dspark_noise_token_id")?;
         ensure!(
             dspark_noise_token_id < vocab,
             "dspark_noise_token_id outside vocabulary"
         );
-        integer_array(t, "dspark_target_layer_ids", depth)?;
+        let dspark_target_layer_ids = integer_array(t, "dspark_target_layer_ids", depth)?;
         let ratios = t
             .get("compress_ratios")
             .and_then(Value::as_array)
@@ -4499,6 +4503,10 @@ impl ModelSpec {
                 engram_head_dim,
                 nextn_layers,
                 dspark_experts,
+                dspark_experts_per_tok,
+                dspark_block_size,
+                dspark_noise_token_id,
+                dspark_target_layer_ids,
                 dspark_markov_rank,
                 vision_layers,
                 vision_hidden,

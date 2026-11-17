@@ -184,7 +184,7 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long)]
         graph: bool,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights for an architecture with MTP decode; 0 selects plain generation")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 0 (plain) for DeepSeek-V4.1 and 4 for other bound MTP architectures; DeepSeek-V4.1 accepts explicit depths 1 to 3; 0 selects plain generation")]
         mtp: Option<u8>,
         #[arg(long)]
         dump: Option<PathBuf>,
@@ -350,7 +350,7 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights for an architecture with MTP decode; 0 selects plain serving")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 0 (plain) for DeepSeek-V4.1 and 4 for other bound MTP architectures; DeepSeek-V4.1 accepts explicit depths 1 to 3; 0 selects plain serving")]
         mtp: Option<u8>,
     },
     Bench {
@@ -761,6 +761,18 @@ fn checkpoint_mtp(dir: &Path, requested: Option<u8>, plain_selected: bool) -> Re
         false
     } else {
         flyingfish::checkpoint::has_mtp_component(dir)?
+    };
+    let requested = if requested.is_none() && component && !plain_selected {
+        let architecture = flyingfish::model_spec::ModelSpec::read(dir)?.architecture;
+        Some(
+            if architecture == flyingfish::model_spec::Architecture::DeepseekV41 {
+                0
+            } else {
+                4
+            },
+        )
+    } else {
+        requested
     };
     resolve_mtp(requested, component, plain_selected)
 }

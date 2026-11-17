@@ -50,6 +50,56 @@ __device__ __forceinline__ float e4m3_decode(uint8_t code) {
     return __uint_as_float(sign | ((e + 120) << 23) | (m << 20));
 }
 
+template <bool PACKED>
+__device__ __forceinline__ double scaled_e4m3_dot_exact(
+    const uint8_t* w, const uint8_t* sw, const uint8_t* x,
+    const uint8_t* sx, int k) {
+    const int lane = threadIdx.x & 31;
+    double total = 0.;
+    for (int group = 0; group < k / 32; ++group) {
+        const int inner = group * 32 + lane;
+        const uint8_t a = x[inner];
+        if ((a & 127) == 127) __trap();
+        const uint32_t ae = (a >> 3) & 15;
+        const uint32_t av = ae ? (8 + (a & 7)) << (ae - 1) : (a & 7);
+        uint32_t bv, sign;
+        if constexpr (PACKED) {
+            const uint8_t b = (w[inner / 2] >> (4 * (inner & 1))) & 15;
+            const uint32_t magnitude = b & 7;
+            bv = magnitude < 4 ? magnitude : magnitude == 4 ? 4
+                : magnitude == 5 ? 6 : magnitude == 6 ? 8 : 12;
+            sign = (a >> 7) ^ (b >> 3);
+        } else {
+            const uint8_t b = w[inner];
+            if ((b & 127) == 127) __trap();
+            const uint32_t be = (b >> 3) & 15;
+            bv = be ? (8 + (b & 7)) << (be - 1) : (b & 7);
+            sign = (a ^ b) >> 7;
+        }
+        long long sum = static_cast<long long>(uint64_t(av) * bv);
+        if (sign) sum = -sum;
+        #pragma unroll
+        for (int shift = 16; shift > 0; shift >>= 1)
+            sum += __shfl_down_sync(FF_WARP_MASK, sum, shift);
+        if (lane == 0) {
+            const uint8_t sa = sx[group], sb = sw[group];
+            if (sa == 255 || sb == 255) __trap();
+            const int exponent = int(sa) + int(sb) - (PACKED ? 264 : 272);
+            const double scale = __longlong_as_double(
+                static_cast<long long>(uint64_t(exponent + 1023) << 52));
+            total = fma(static_cast<double>(sum), scale, total);
+        }
+    }
+    return total;
+}
+
+__device__ __forceinline__ __nv_bfloat16 bf16_round_f64(double value) {
+    float rounded = static_cast<float>(value);
+    if ((__float_as_uint(rounded) & 65535) == 32768 && double(rounded) != value)
+        rounded = nextafterf(rounded, value < double(rounded) ? -INFINITY : INFINITY);
+    return __float2bfloat16_rn(rounded);
+}
+
 #if defined(__HIP__)
 // BF16-rounded channel weights below 2^-64 are scaled by 2^64 inside WMMA tiles.
 __device__ __forceinline__ __nv_bfloat16 fp8_channel_tile_weight(
@@ -186,7 +236,7 @@ __device__ __forceinline__ float2 e4m3_decode_pair(uint16_t packed) {
 __device__ __forceinline__ float fp8_block_scale(float value) { return value; }
 __device__ __forceinline__ float fp8_block_scale(uint8_t value) { return e8m0_decode(value); }
 
-template <typename Scale, int BLOCK>
+template <typename Scale, int BLOCK, bool Compensated = false>
 __device__ __forceinline__ void fp8_block_decode(
         const uint8_t* w, const Scale* sw, const uint8_t* x, const Scale* sx,
         __nv_bfloat16* y, int m, int n, int k, uint64_t tile) {
@@ -196,7 +246,7 @@ __device__ __forceinline__ void fp8_block_decode(
     const int lane = threadIdx.x & 31;
     if (row >= uint64_t(m) || col >= uint64_t(n)) return;
     const uint64_t groups = (uint64_t(k) + BLOCK - 1) / BLOCK;
-    float total = 0.0f;
+    float total = 0.0f, correction = 0.0f;
     for (uint64_t group = 0; group < groups; ++group) {
         float sum = 0.0f;
         #pragma unroll
@@ -215,7 +265,14 @@ __device__ __forceinline__ void fp8_block_decode(
         if (lane == 0) {
             const float scale = fp8_block_scale(sw[(col / BLOCK) * groups + group]) *
                                 fp8_block_scale(sx[row * groups + group]);
-            total = fmaf(sum, scale, total);
+            if constexpr (Compensated) {
+                const float adjusted = __fsub_rn(__fmul_rn(sum, scale), correction);
+                const float next = __fadd_rn(total, adjusted);
+                correction = __fsub_rn(__fsub_rn(next, total), adjusted);
+                total = next;
+            } else {
+                total = fmaf(sum, scale, total);
+            }
         }
     }
     if (lane == 0) y[row * n + col] = __float2bfloat16_rn(total);

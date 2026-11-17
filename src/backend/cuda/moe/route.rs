@@ -213,7 +213,7 @@ pub(crate) struct RouteOps {
     topk: CudaFunction,
     sigmoid_topk: CudaFunction,
     noaux_topk: CudaFunction,
-    noaux_topk_f32: CudaFunction,
+    noaux_topk_f32: [CudaFunction; 2],
     blas: CudaBlas,
     #[cfg(feature = "cuda")]
     logits_gemm: Option<super::super::blas::RouteLogits>,
@@ -335,7 +335,10 @@ impl RouteOps {
             topk: module.load_function("moe_route_topk")?,
             sigmoid_topk: module.load_function("moe_route_topk_sigmoid")?,
             noaux_topk: module.load_function("moe_route_topk_noaux")?,
-            noaux_topk_f32: module.load_function("moe_route_topk_noaux_f32")?,
+            noaux_topk_f32: [
+                module.load_function("moe_route_topk_noaux_f32")?,
+                module.load_function("moe_route_topk_sqrtsoftplus_f32")?,
+            ],
             blas,
             #[cfg(feature = "cuda")]
             logits_gemm: None,
@@ -726,7 +729,7 @@ impl RouteOps {
 
     /// The same noaux selection writing FP32 routed weights (model definition
     /// Gate.forward FP32 scores applied by Expert.forward in FP32).
-    pub fn topk_noaux_f32<T: DeviceRepr + Copy + 'static>(
+    pub fn topk_noaux_f32<T: DeviceRepr + Copy + 'static, const LITERAL_THREE: bool>(
         &self,
         logits: Tensor<T, 2>,
         bias: Option<Tensor<f32, 2>>,
@@ -735,12 +738,24 @@ impl RouteOps {
         score: crate::model_spec::RouterScore,
         routed_scaling: f32,
     ) -> Result<()> {
+        ensure!(
+            !LITERAL_THREE
+                || (TypeId::of::<T>() == TypeId::of::<f32>()
+                    && ids.0.shape[1] == 3
+                    && score == crate::model_spec::RouterScore::SqrtSoftplus
+                    && bias.is_some()),
+            "literal sqrtsoftplus selection requires F32 logits, bias and three routes"
+        );
         self.noaux(
             logits,
             bias,
             ids,
             weights,
-            (&self.noaux_topk_f32, score, routed_scaling),
+            (
+                &self.noaux_topk_f32[usize::from(LITERAL_THREE)],
+                score,
+                routed_scaling,
+            ),
         )
     }
 

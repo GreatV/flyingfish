@@ -2,7 +2,7 @@ use crate::backend::gpu::CudaSlice;
 use crate::backend::gpu::{
     CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 #[cfg(feature = "cuda")]
 use cudarc::driver::sys;
 use half::bf16;
@@ -159,6 +159,40 @@ pub fn bits(s: &Arc<CudaStream>, src: &impl DevicePtr<bf16>, dst: &mut Vec<u8>) 
     Ok(())
 }
 
+pub(crate) fn select_prefix_row<T: DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    live: &mut CudaSlice<T>,
+    saved: &CudaSlice<T>,
+    width: usize,
+    accepted: usize,
+) -> Result<()> {
+    ensure!(
+        width > 0
+            && saved.len().is_multiple_of(width)
+            && live.len() >= saved.len()
+            && accepted <= saved.len() / width,
+        "prefix row checkpoint extent"
+    );
+    if accepted > 1 {
+        let bytes = width
+            .checked_mul(size_of::<T>())
+            .context("prefix row byte count overflow")?;
+        let ptr = live.device_ptr(stream).0;
+        // Source and destination are disjoint rows of the owned allocation.
+        unsafe {
+            dtod_raw(ptr, ptr + ((accepted - 1) * bytes) as u64, bytes, stream)?;
+        }
+    }
+    let first = usize::from(accepted > 0) * width;
+    if first < saved.len() {
+        stream.memcpy_dtod(
+            &saved.slice(first..),
+            &mut live.slice_mut(first..saved.len()),
+        )?;
+    }
+    Ok(())
+}
+
 pub struct Rect {
     pub rows: usize,
     pub width: usize,
@@ -206,10 +240,16 @@ pub fn columns_from(
     );
     s.context().bind_to_thread()?;
     let (dst, _dst) = dst.device_ptr_mut(s);
-    columns_raw(s, src, dst, r)
+    columns_raw(s, src, dst, r, 2)
 }
 
-fn columns_raw(s: &Arc<CudaStream>, src: u64, dst: u64, r: Rect) -> Result<()> {
+fn columns_raw(
+    s: &Arc<CudaStream>,
+    src: u64,
+    dst: u64,
+    r: Rect,
+    element_bytes: usize,
+) -> Result<()> {
     ensure!(
         r.rows > 0
             && r.width > 0
@@ -219,21 +259,21 @@ fn columns_raw(s: &Arc<CudaStream>, src: u64, dst: u64, r: Rect) -> Result<()> {
     );
     #[cfg(feature = "cuda")]
     let params = sys::CUDA_MEMCPY2D {
-        srcXInBytes: r.src_col * 2,
+        srcXInBytes: r.src_col * element_bytes,
         srcY: 0,
         srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
         srcHost: std::ptr::null(),
         srcDevice: src,
         srcArray: std::ptr::null_mut(),
-        srcPitch: r.src_pitch * 2,
-        dstXInBytes: r.dst_col * 2,
+        srcPitch: r.src_pitch * element_bytes,
+        dstXInBytes: r.dst_col * element_bytes,
         dstY: 0,
         dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
         dstHost: std::ptr::null_mut(),
         dstDevice: dst,
         dstArray: std::ptr::null_mut(),
-        dstPitch: r.dst_pitch * 2,
-        WidthInBytes: r.width * 2,
+        dstPitch: r.dst_pitch * element_bytes,
+        WidthInBytes: r.width * element_bytes,
         Height: r.rows,
     };
     unsafe {
@@ -241,19 +281,19 @@ fn columns_raw(s: &Arc<CudaStream>, src: u64, dst: u64, r: Rect) -> Result<()> {
         sys::cuMemcpy2DAsync_v2(&params, s.cu_stream()).result()?;
         #[cfg(feature = "rocm")]
         s.copy_2d(
-            dst + (r.dst_col * 2) as u64,
-            src + (r.src_col * 2) as u64,
-            (r.dst_pitch * 2, r.src_pitch * 2),
-            (r.width * 2, r.rows),
+            dst + (r.dst_col * element_bytes) as u64,
+            src + (r.src_col * element_bytes) as u64,
+            (r.dst_pitch * element_bytes, r.src_pitch * element_bytes),
+            (r.width * element_bytes, r.rows),
         )?;
     }
     Ok(())
 }
 
-pub struct RingCopy<'a> {
+pub struct RingCopy<'a, T: DeviceRepr = bf16> {
     pub stream: &'a Arc<CudaStream>,
-    pub source: &'a CudaSlice<bf16>,
-    pub target: &'a mut CudaSlice<bf16>,
+    pub source: &'a CudaSlice<T>,
+    pub target: &'a mut CudaSlice<T>,
     pub source_capacity: usize,
     pub target_capacity: usize,
     pub heads: usize,
@@ -270,7 +310,7 @@ pub(crate) struct RingCopyCall {
     pub(crate) wrap_target: bool,
 }
 
-impl RingCopy<'_> {
+impl<T: DeviceRepr> RingCopy<'_, T> {
     pub fn run(
         self,
         source_start: usize,
@@ -296,7 +336,7 @@ impl RingCopy<'_> {
             self.stream,
             [self.source_capacity, self.target_capacity],
             lengths,
-            [self.heads, self.head_dim],
+            [self.heads, self.head_dim, size_of::<T>()],
         )
     }
     #[cfg(all(test, feature = "cuda"))]
@@ -306,7 +346,7 @@ impl RingCopy<'_> {
             self.stream,
             [self.source_capacity, self.target_capacity],
             lengths,
-            [self.heads, self.head_dim],
+            [self.heads, self.head_dim, size_of::<T>()],
         )
     }
 }
@@ -317,10 +357,10 @@ impl RingCopyCall {
         stream: &Arc<CudaStream>,
         capacities: [usize; 2],
         lengths: [usize; 2],
-        geometry: [usize; 2],
+        geometry: [usize; 3],
     ) -> Result<()> {
         let [source_capacity, target_capacity] = capacities;
-        let [heads, head_dim] = geometry;
+        let [heads, head_dim, element_bytes] = geometry;
         let RingCopyCall {
             src,
             dst,
@@ -343,7 +383,9 @@ impl RingCopyCall {
                 capacity
                     .checked_mul(head_dim)
                     .and_then(|n| n.checked_mul(heads))
-                    .is_some_and(|n| n <= len && n <= usize::MAX / 2),
+                    .is_some_and(|n| n <= len
+                        && element_bytes > 0
+                        && n <= usize::MAX / element_bytes),
                 "ring row copy geometry exceeds buffer"
             );
         }
@@ -378,6 +420,7 @@ impl RingCopyCall {
                     dst_pitch: target_capacity * head_dim,
                     dst_col: target_row * head_dim,
                 },
+                element_bytes,
             )?;
             remaining -= count;
             source_row = (source_row + count) % source_capacity;

@@ -462,8 +462,95 @@ pub fn staging_capacity_ring(
         device_bytes,
         host_bytes,
         (copy_engines, disk_ring.0, disk_ring.1),
-        false,
+        (false, 0),
     )
+}
+
+pub fn joint_staging_capacity(
+    geometry: [ExpertGeometry; 2],
+    layout: crate::experts::catalogue::ExpertLayout,
+    rows: [u32; 2],
+    device_bytes: u64,
+    host_bytes: u64,
+    copy_engines: u32,
+    disk_rings: [(u32, u64); 2],
+) -> Result<[(Capacity, Admission); 2]> {
+    ensure!(
+        geometry[0].hidden == geometry[1].hidden
+            && geometry[0].intermediate == geometry[1].intermediate,
+        "joint expert tensor geometry differs"
+    );
+    let slot = layout.slot_bytes();
+    let mut live = [0; 2];
+    for i in 0..2 {
+        ensure!(
+            rows[i] > 0 && geometry[i].layers > 0 && geometry[i].experts > 0,
+            "empty joint geometry"
+        );
+        live[i] = rows[i]
+            .checked_mul(geometry[i].top_k)
+            .context("joint live union overflow")?
+            .min(geometry[i].experts);
+    }
+    ensure!(live[0] >= live[1], "draft live union exceeds target pool");
+    let copies = u64::from(copy_engines.min(2));
+    let mut minimum = [0; 2];
+    for i in 0..2 {
+        let (depth, ring) = disk_rings[i];
+        ensure!(depth > 0, "joint disk ring depth is zero");
+        let added = u64::from(depth).saturating_sub(copies);
+        ensure!(added == 0 || ring > 0, "joint disk ring slot is zero");
+        let ring_bytes = added
+            .checked_mul(ring)
+            .context("joint disk ring reserve overflow")?;
+        minimum[i] = (u64::from(live[i]) + 1 + 3 * copies)
+            .checked_mul(slot)
+            .and_then(|bytes| bytes.checked_add(ring_bytes))
+            .context("joint native host minimum overflow")?;
+    }
+    let remaining = host_bytes
+        .checked_sub(minimum[0])
+        .and_then(|n| n.checked_sub(minimum[1]))
+        .context("joint native host budget cannot hold bounded copy and swap stages")?;
+    let experts = geometry.map(|g| u64::from(g.layers) * u64::from(g.experts));
+    let extra = remaining
+        .checked_mul(experts[1])
+        .context("joint host share overflow")?
+        / experts[0]
+            .checked_add(experts[1])
+            .context("joint catalogue extent overflow")?;
+    let draft_host = minimum[1]
+        .checked_add(extra)
+        .context("joint draft host budget overflow")?;
+    let target_plan = native_staging_capacity(
+        geometry[0],
+        layout.clone(),
+        rows[0],
+        device_bytes,
+        host_bytes - draft_host,
+        (copy_engines, disk_rings[0].0, disk_rings[0].1),
+        (false, live[1]),
+    )?;
+    ensure!(
+        target_plan.0.prefill_staging_slots >= live[1],
+        "joint target plan has no reusable draft pool"
+    );
+    let (mut draft_plan, admission) = staging_capacity_ring(
+        geometry[1],
+        layout,
+        rows[1],
+        u64::from(live[1]) * slot,
+        draft_host,
+        copy_engines,
+        disk_rings[1],
+    )?;
+    ensure!(
+        draft_plan.slots_total() == 0 && draft_plan.prefill_staging_slots == live[1],
+        "joint draft plan allocated a resident bank"
+    );
+    draft_plan.device_expert_bytes = 0;
+    draft_plan.prefill_staging_slots = 0;
+    Ok([target_plan, (draft_plan, admission)])
 }
 
 /// Expert cohorts retain the whole block's FP32 routes and bounded native slots.
@@ -506,7 +593,7 @@ pub fn cohort_capacity(
         device_bytes - staging * slot,
         host_bytes,
         (copy_engines, copy_engines.min(2), 0),
-        true,
+        (true, 0),
     )?;
     capacity.prefill_staging_slots = u32::try_from(staging)?;
     capacity.device_expert_bytes = device_bytes;
@@ -524,9 +611,10 @@ fn native_staging_capacity(
     device_bytes: u64,
     host_bytes: u64,
     copy: (u32, u32, u64),
-    cohorts: bool,
+    strategy: (bool, u32),
 ) -> Result<(Capacity, Admission)> {
     let (copy_engines, disk_depth, ring_slot_bytes) = copy;
+    let (cohorts, minimum_pool) = strategy;
     ensure!(
         rows > 0 && geometry.layers > 0 && geometry.top_k > 0,
         "zero native staging extent"
@@ -551,6 +639,34 @@ fn native_staging_capacity(
                 .map(|layer| if layer < resident { live } else { 0 })
                 .collect();
             pool = live;
+        }
+    }
+    if minimum_pool > pool {
+        ensure!(
+            !cohorts && minimum_pool <= live,
+            "joint pool exceeds live target bound"
+        );
+        pool = minimum_pool;
+        let available = device_bytes / slot;
+        slots = available
+            .checked_sub(u64::from(pool))
+            .context("joint native pool exceeds device budget")?
+            .min(total);
+        slots_per_layer = equal_slots(slots, geometry.layers)?;
+        if slots_per_layer.iter().any(|&count| count < live) {
+            pool = live;
+            let banks = (available / u64::from(live)).min(u64::from(geometry.layers));
+            ensure!(banks > 0, "joint native pool cannot fit a live union");
+            slots = (banks - 1) * u64::from(live);
+            slots_per_layer = (0..geometry.layers)
+                .map(|layer| {
+                    if u64::from(layer) < banks - 1 {
+                        live
+                    } else {
+                        0
+                    }
+                })
+                .collect();
         }
     }
     if cohorts {
@@ -2287,6 +2403,85 @@ mod tests {
             4 * ring
         );
         assert_eq!(capacity.host_blocks - deeper.host_blocks, 4);
+        let suffix = ExpertGeometry {
+            layers: 3,
+            experts: 128,
+            top_k: 3,
+            ..geometry
+        };
+        for rings in [[(2, 0); 2], [(6, ring), (3, ring)]] {
+            let added_ring_bytes: u64 = rings
+                .iter()
+                .map(|&(depth, bytes)| u64::from(depth - 2) * bytes)
+                .sum();
+            for bytes in [48 * slot, 96 * slot, 16 << 30, 80 << 30, 400 << 30] {
+                let [(target, _), (draft, _)] = joint_staging_capacity(
+                    [geometry, suffix],
+                    layout.clone(),
+                    [8, 5],
+                    bytes,
+                    24 << 30,
+                    2,
+                    rings,
+                )?;
+                assert!(target.prefill_staging_slots >= 15);
+                assert_eq!(draft.slots_total(), 0);
+                assert_eq!(draft.prefill_staging_slots, 0);
+                assert_eq!(draft.device_expert_bytes, 0);
+                let draft_layout = SlotLayout::new(suffix, &draft)?;
+                assert_eq!(draft_layout.allocation_bytes()?, 0);
+                assert!(draft_layout.resident_slot(0, 0).is_err());
+                assert!(draft_layout.staging_slot(0).is_err());
+                let initial = vec![Vec::new(); suffix.layers as usize];
+                TierLedger::new(draft_layout, draft.host_blocks, &initial)?.check()?;
+                assert!(
+                    u64::from(target.slots_total() + target.prefill_staging_slots) * slot <= bytes
+                );
+                assert!(
+                    u64::from(
+                        target.host_blocks
+                            + target.spare_blocks
+                            + draft.host_blocks
+                            + draft.spare_blocks
+                            + 12
+                    ) * slot
+                        + added_ring_bytes
+                        <= 24 << 30
+                );
+                assert_eq!(
+                    draft.disk_bytes,
+                    (384 - u64::from(draft.host_blocks)) * slot
+                );
+            }
+            let required = 77 * slot + added_ring_bytes;
+            for (host, fits) in [(required, true), (required - 1, false)] {
+                assert_eq!(
+                    joint_staging_capacity(
+                        [geometry, suffix],
+                        layout.clone(),
+                        [8, 5],
+                        48 * slot,
+                        host,
+                        2,
+                        rings,
+                    )
+                    .is_ok(),
+                    fits
+                );
+            }
+            assert!(
+                joint_staging_capacity(
+                    [geometry, suffix],
+                    layout.clone(),
+                    [8, 5],
+                    48 * slot - 1,
+                    24 << 30,
+                    2,
+                    rings,
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 

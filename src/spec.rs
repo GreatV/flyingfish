@@ -432,6 +432,7 @@ mod tests {
                 rope_type: "default".into(),
                 rope_dim: None,
             },
+            staged: None,
         }
     }
     #[test]

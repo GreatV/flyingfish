@@ -203,6 +203,51 @@ FP8_BLOCK_ENTRY(fp8_block_e8m0_32_decode, uint8_t, 32, false)
 FP8_BLOCK_ENTRY(fp8_block_e8m0_32_mma, uint8_t, 32, true)
 #undef FP8_BLOCK_ENTRY
 
+extern "C" __global__ void fp8_block_e8m0_32_compensated(
+        const uint8_t* w, const uint8_t* sw, const uint8_t* x, const uint8_t* sx,
+        __nv_bfloat16* y, int m, int n, int k) {
+    if (m <= 0 || n <= 0 || k <= 0 || blockDim.x != 256 || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    fp8_block_decode<uint8_t, 32, true>(w, sw, x, sx, y, m, n, k, blockIdx.x);
+}
+
+template <bool GROUPED>
+__device__ __forceinline__ void fp8_block_e8m0_exact(
+        const uint8_t* w, const uint8_t* sw, const uint8_t* x, const uint8_t* sx,
+        __nv_bfloat16* y, int m, int n, int k, int group_count) {
+    if (m <= 0 || n <= 0 || k <= 0 || k % 32 || blockDim.x != 256 ||
+        blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) {
+        __trap(); return;
+    }
+    const uint64_t tiles = (uint64_t(n) + 7) / 8;
+    const uint64_t row = blockIdx.x / tiles;
+    const uint64_t col = (blockIdx.x % tiles) * 8 + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= uint64_t(m) || col >= uint64_t(n)) return;
+    const uint64_t activation_row = GROUPED
+        ? row * group_count + col / (n / group_count) : row;
+    const int groups = k / 32;
+    const double total = scaled_e4m3_dot_exact<false>(
+        w + col * k, sw + (col / 32) * groups,
+        x + activation_row * k, sx + activation_row * groups, k);
+    if (lane == 0) y[row * n + col] = bf16_round_f64(total);
+}
+
+extern "C" __global__ void fp8_block_e8m0_32_exact(
+        const uint8_t* w, const uint8_t* sw, const uint8_t* x, const uint8_t* sx,
+        __nv_bfloat16* y, int m, int n, int k) {
+    fp8_block_e8m0_exact<false>(w, sw, x, sx, y, m, n, k, 1);
+}
+
+extern "C" __global__ void fp8_block_grouped_e8m0_32_exact(
+        const uint8_t* x, const uint8_t* sx, const uint8_t* w, const uint8_t* sw,
+        __nv_bfloat16* y, int m, int groups, int rank, int k) {
+    if (groups <= 0 || rank <= 0 || rank % 32 || rank > INT32_MAX / groups) {
+        __trap(); return;
+    }
+    fp8_block_e8m0_exact<true>(w, sw, x, sx, y, m, groups * rank, k, groups);
+}
+
 template <bool PER_CHANNEL>
 __device__ __forceinline__ __nv_bfloat16 weight_at(
         const uint8_t* w, const __nv_bfloat16* scales, uint64_t n,

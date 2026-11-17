@@ -97,6 +97,7 @@ pub struct LatentCompressPlan {
     rows: i32,
     channels: i32,
     blocks: u32,
+    prefixes: Option<(CudaFunction, [Tensor<f32, 3>; 2])>,
 }
 
 impl LatentCompressPlan {
@@ -115,7 +116,53 @@ impl LatentCompressPlan {
             rows: rows as i32,
             channels: channels as i32,
             blocks,
+            prefixes: None,
         })
+    }
+
+    pub(crate) fn bind_prefixes(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        prefixes: [Tensor<f32, 3>; 2],
+    ) -> Result<()> {
+        for p in prefixes {
+            dense(p)?;
+            ensure!(
+                p.shape[0] >= self.rows as u32 && p.shape[1..] == [2, self.channels as u32],
+                "compression prefix extent"
+            );
+            for (ptr, bytes) in [
+                (self.inputs.values.ptr, self.inputs.values.span_bytes),
+                (self.inputs.scores.ptr, self.inputs.scores.span_bytes),
+                (
+                    self.buffers.tail_values.ptr,
+                    self.buffers.tail_values.span_bytes,
+                ),
+                (
+                    self.buffers.tail_scores.ptr,
+                    self.buffers.tail_scores.span_bytes,
+                ),
+            ] {
+                ensure!(
+                    spans_disjoint(p.ptr, p.span_bytes, ptr, bytes)?,
+                    "compression prefix aliases live state"
+                );
+            }
+        }
+        ensure!(
+            spans_disjoint(
+                prefixes[0].ptr,
+                prefixes[0].span_bytes,
+                prefixes[1].ptr,
+                prefixes[1].span_bytes
+            )?,
+            "compression prefix outputs overlap"
+        );
+        self.prefixes = Some((
+            cubin::module(ctx, "latent_compress")?.load_function("latent_prefix_tails")?,
+            prefixes,
+        ));
+        Ok(())
     }
 
     /// The caller initializes cursor to zero and includes cursor/tails in request snapshots.
@@ -123,6 +170,24 @@ impl LatentCompressPlan {
         let i = self.inputs;
         let b = self.buffers;
         unsafe {
+            if let Some((function, prefixes)) = &self.prefixes {
+                stream
+                    .launch_builder(function)
+                    .arg(&i.values.ptr)
+                    .arg(&i.scores.ptr)
+                    .arg(&b.tail_values.ptr)
+                    .arg(&b.tail_scores.ptr)
+                    .arg(&prefixes[0].ptr)
+                    .arg(&prefixes[1].ptr)
+                    .arg(&i.sequence.ptr)
+                    .arg(&self.rows)
+                    .arg(&self.channels)
+                    .launch(LaunchConfig {
+                        grid_dim: (self.rows as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
             stream
                 .launch_builder(&self.pool)
                 .arg(&i.values.ptr)

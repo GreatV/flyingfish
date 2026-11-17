@@ -239,6 +239,78 @@ extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_mixes_finish(
   mhc_finish(s_mix, s_comb, base, scale, mult, iters, eps, pre, post, comb, row);
 }
 
+extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_prepare_f32(
+    const __nv_bfloat16* stream, float* prepared, float* inverse,
+    int mult, int hidden, float norm_eps, int rows) {
+  if (blockIdx.x >= (unsigned)rows || mult != 4 || hidden < 1 || rows < 1 ||
+      !(norm_eps > 0.0f) || blockDim.x != MHC_THREADS) __trap();
+  if ((hidden & 3) != 0 || rows != 5) __trap();
+  __shared__ float reduction[512];
+  const int width = mult * hidden, row = blockIdx.x;
+  for (int half = 0; half < 2; ++half) {
+    const int lane = threadIdx.x + half * MHC_THREADS;
+    float accum[4] = {};
+    for (int index = lane * 4; index < width; index += 2048) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float value = __bfloat162float(stream[(size_t)row * width + index + j]);
+        prepared[(size_t)row * width + index + j] = value;
+        accum[j] = __fadd_rn(accum[j], __fmul_rn(value, value));
+      }
+    }
+    reduction[lane] = __fadd_rn(__fadd_rn(__fadd_rn(accum[0], accum[1]), accum[2]), accum[3]);
+  }
+  __syncthreads();
+  for (int stride = 64; stride > 0; stride >>= 1) {
+    for (int half = 0; half < 2; ++half) {
+      const int lane = threadIdx.x + half * MHC_THREADS;
+      if ((lane & 127) < stride)
+        reduction[lane] = __fadd_rn(reduction[lane], reduction[lane + stride]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float sum = __fadd_rn(__fadd_rn(reduction[0], reduction[256]),
+                               __fadd_rn(reduction[128], reduction[384]));
+    const float mean = __fmul_rn(sum, 1.0f / float(width));
+    inverse[row] = rsqrtf(__fadd_rn(mean, norm_eps));
+  }
+}
+
+__device__ __forceinline__ float mhc_four_sum(float value, int stride) {
+  value += __shfl_xor_sync(FF_WARP_MASK, value, 2 * stride);
+  return value + __shfl_xor_sync(FF_WARP_MASK, value, stride);
+}
+
+extern "C" __global__ void mhc_finish_f32(
+    const float* partials, const float* base, const float* scale,
+    int mult, int iters, float eps, float* pre, float* post, float* comb, int rows) {
+  if (blockIdx.x >= (unsigned)rows || mult != 4 || iters < 1 || rows < 1 ||
+      !(eps > 0.0f) || blockDim.x != 32) __trap();
+  const int row = blockIdx.x, lane = threadIdx.x;
+  const float* dot = partials + (size_t)row * 24;
+  const float inverse = partials[(size_t)rows * 24 + row];
+  if (lane < 4) {
+    const float before = __fmul_rn(dot[lane], inverse);
+    const float after = __fmul_rn(dot[4 + lane], inverse);
+    pre[(size_t)row * 4 + lane] = 1.0f / (1.0f + expf(-(before * scale[0] + base[lane]))) + eps;
+    post[(size_t)row * 4 + lane] = 2.0f * (1.0f / (1.0f + expf(-(after * scale[1] + base[4 + lane]))));
+  }
+  const int index = lane & 15;
+  const float normalized = __fmul_rn(dot[8 + index], inverse);
+  float value = normalized * scale[2] + base[8 + index];
+  float maximum = fmaxf(value, __shfl_xor_sync(FF_WARP_MASK, value, 2));
+  maximum = fmaxf(maximum, __shfl_xor_sync(FF_WARP_MASK, maximum, 1));
+  value = expf(value - maximum);
+  value = value / mhc_four_sum(value, 1) + eps;
+  value /= mhc_four_sum(value, 4) + eps;
+  for (int iteration = 1; iteration < iters; ++iteration) {
+    value /= mhc_four_sum(value, 1) + eps;
+    value /= mhc_four_sum(value, 4) + eps;
+  }
+  if (lane < 16) comb[(size_t)row * 16 + index] = value;
+}
+
 extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_collapse(
     const __nv_bfloat16* __restrict__ stream, const float* __restrict__ pre,
     int mult, int hidden, __nv_bfloat16* __restrict__ out, int rows) {
@@ -255,6 +327,28 @@ extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_collapse(
     for (int j = 0; j < mult; ++j)
       acc = fmaf(pre[(size_t)row * mult + j],
                  __bfloat162float(x_row[(size_t)j * hidden + h]), acc);
+    out_row[h] = __float2bfloat16_rn(acc);
+  }
+}
+
+extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_collapse_separate_products(
+    const __nv_bfloat16* __restrict__ stream, const float* __restrict__ pre,
+    int mult, int hidden, __nv_bfloat16* __restrict__ out, int rows) {
+  if ((int)blockIdx.x >= rows || mult < 2 || hidden <= 0 || blockDim.x != MHC_THREADS)
+    __trap();
+
+  const int tid = threadIdx.x;
+  const int nthr = (int)blockDim.x;
+  const int row = (int)blockIdx.x;
+  const __nv_bfloat16* x_row = stream + (size_t)row * mult * hidden;
+  __nv_bfloat16* out_row = out + (size_t)row * hidden;
+  for (int h = tid; h < hidden; h += nthr) {
+    float acc = 0.0f;
+    for (int j = 0; j < mult; ++j) {
+      const float product = __fmul_rn(pre[(size_t)row * mult + j],
+                                    __bfloat162float(x_row[(size_t)j * hidden + h]));
+      acc = __fadd_rn(acc, product);
+    }
     out_row[h] = __float2bfloat16_rn(acc);
   }
 }
@@ -314,6 +408,31 @@ extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_update(
             __fmul_rn(c, __bfloat162float(res_row[(size_t)k * hidden + h])));
       }
       out_row[(size_t)j * hidden + h] = __float2bfloat16_rn(acc);
+    }
+  }
+}
+
+extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_update_residual_sum(
+    const __nv_bfloat16* sublayer_out, const __nv_bfloat16* residual,
+    const float* post, const float* comb, int mult, int hidden, int rounding,
+    int orientation, __nv_bfloat16* out, int rows) {
+  if ((int)blockIdx.x >= rows || mult < 2 || hidden <= 0 || rounding != 0 ||
+      (unsigned)orientation > 1u || blockDim.x != MHC_THREADS)
+    __trap();
+  const int row = blockIdx.x;
+  for (int h = threadIdx.x; h < hidden; h += MHC_THREADS) {
+    const float sub = __bfloat162float(sublayer_out[(size_t)row * hidden + h]);
+    for (int j = 0; j < mult; ++j) {
+      float sum = 0.0f;
+      for (int k = 0; k < mult; ++k) {
+        const int coefficient = orientation == 0 ? j * mult + k : k * mult + j;
+        const float product = __fmul_rn(comb[(size_t)row * mult * mult + coefficient],
+            __bfloat162float(residual[((size_t)row * mult + k) * hidden + h]));
+        sum = __fadd_rn(sum, product);
+      }
+      const float product = __fmul_rn(post[(size_t)row * mult + j], sub);
+      out[((size_t)row * mult + j) * hidden + h] =
+          __float2bfloat16_rn(__fadd_rn(product, sum));
     }
   }
 }

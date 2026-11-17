@@ -18,26 +18,12 @@ pub(in crate::backend::cuda::engine) fn record(
         engine.capture_fail_stage != Some(CaptureFault::Begin),
         "injected capture begin failure"
     );
-    #[cfg(feature = "cuda")]
-    stream
-        .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-        .context("cuStreamBeginCapture")?;
-    #[cfg(feature = "rocm")]
-    let capture = stream.begin_capture()?;
-    let launched = launch(engine);
-    #[cfg(feature = "cuda")]
-    let captured = stream
-        .end_capture(sys::CUgraphInstantiate_flags(0))
-        .context("cuStreamEndCapture");
-    #[cfg(feature = "rocm")]
-    let captured = capture.finish().map(Some);
-    launched?;
+    let graph = record_stream(&stream, || launch(engine))?;
     #[cfg(test)]
     ensure!(
         engine.capture_fail_stage != Some(CaptureFault::End),
         "injected capture end failure"
     );
-    let graph = captured?.context("empty MoE decode segment")?;
     #[cfg(test)]
     ensure!(
         engine.capture_fail_stage != Some(CaptureFault::Instantiate),
@@ -46,6 +32,27 @@ pub(in crate::backend::cuda::engine) fn record(
     graph.upload().context("cuGraphUpload")?;
     stream.synchronize().context("cuStreamSynchronize")?;
     Ok(graph)
+}
+
+pub(in crate::backend::cuda::engine) fn record_stream(
+    stream: &Arc<CudaStream>,
+    launch: impl FnOnce() -> Result<()>,
+) -> Result<CudaGraph> {
+    #[cfg(feature = "cuda")]
+    stream
+        .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        .context("cuStreamBeginCapture")?;
+    #[cfg(feature = "rocm")]
+    let capture = stream.begin_capture()?;
+    let launched = launch();
+    #[cfg(feature = "cuda")]
+    let captured = stream
+        .end_capture(sys::CUgraphInstantiate_flags(0))
+        .context("cuStreamEndCapture");
+    #[cfg(feature = "rocm")]
+    let captured = capture.finish().map(Some);
+    launched?;
+    captured?.context("empty captured segment")
 }
 
 impl Decode {

@@ -447,21 +447,29 @@ impl Engine {
         self.mtp_enable_bound(options)
     }
     pub fn mtp_graph_mode(&self) -> bool {
+        if let Some(native) = self.spec.as_ref().and_then(|s| s.staged.as_ref()) {
+            return native.options.graph;
+        }
         self.mtp.as_ref().map(|m| m.options.graph).unwrap_or(false)
     }
     pub(in crate::backend::cuda::engine) fn check_mtp_mode(&self, graph: bool) -> Result<()> {
         ensure!(
-            self.mtp
-                .as_ref()
-                .context("MTP not configured")?
-                .options
-                .graph
-                == graph,
+            self.mtp.is_some() || self.spec.as_ref().is_some_and(|s| s.staged.is_some()),
+            "MTP not configured"
+        );
+        ensure!(
+            self.mtp_graph_mode() == graph,
             "MTP graph mode differs from setup"
         );
         Ok(())
     }
     pub(crate) fn reset_mtp(&mut self) -> Result<()> {
+        if self.spec.as_ref().is_some_and(|s| s.staged.is_some()) {
+            self.reset()?;
+            let spec = self.spec.as_mut().context("staged attachment missing")?;
+            spec.draft.reset_setup()?;
+            return Ok(());
+        }
         let mut chain = self.mtp.take().context("MTP not configured")?;
         let result = (|| -> Result<()> {
             self.reset()?;
@@ -719,6 +727,9 @@ impl Engine {
             !ids.is_empty() && ids.len() < self.capacity,
             "MTP prefill needs room for decode"
         );
+        if self.spec.as_ref().is_some_and(|s| s.staged.is_some()) {
+            return self.staged_prefill(ids);
+        }
         let mut chain = self.mtp.take().context("MTP not enabled")?;
         let result = (|| -> Result<u32> {
             self.reset()?;

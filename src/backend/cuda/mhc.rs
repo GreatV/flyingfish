@@ -21,6 +21,8 @@ const MHC_SHARED_LIMIT: u64 = 48 * 1024 - 1024;
 pub enum HcRounding {
     /// FP32 coefficients, FP32 accumulation, one BF16 rounding at the output.
     Fp32,
+    /// FP32 residual sum, then FP32 post product addition and BF16 output.
+    Fp32ResidualSum,
     /// 50e35cc0:1335-1337,1346-1348: post and comb rounded to BF16, BF16
     /// product, comb^T@residual with FP32 accumulation and one BF16 round,
     /// BF16 add.
@@ -31,7 +33,7 @@ impl HcRounding {
     /// Kernel argument of the update rounding mode.
     pub fn kernel_arg(self) -> i32 {
         match self {
-            HcRounding::Fp32 => 0,
+            HcRounding::Fp32 | HcRounding::Fp32ResidualSum => 0,
             HcRounding::PostCombBf16 => 1,
         }
     }
@@ -196,9 +198,11 @@ pub struct MhcOps {
     mixes_bf16: CudaFunction,
     partials_bf16: CudaFunction,
     finish: CudaFunction,
+    prepare_f32: CudaFunction,
+    finish_f32: CudaFunction,
     sms: u32,
-    collapse: CudaFunction,
-    update: CudaFunction,
+    collapse: [CudaFunction; 2],
+    update: [CudaFunction; 2],
 }
 
 impl MhcOps {
@@ -216,10 +220,141 @@ impl MhcOps {
             mixes_bf16: module.load_function("mhc_mixes_bf16")?,
             partials_bf16: module.load_function("mhc_mixes_bf16_partials")?,
             finish: module.load_function("mhc_mixes_finish")?,
+            prepare_f32: module.load_function("mhc_prepare_f32")?,
+            finish_f32: module.load_function("mhc_finish_f32")?,
             sms,
-            collapse: module.load_function("mhc_collapse")?,
-            update: module.load_function("mhc_update")?,
+            collapse: [
+                module.load_function("mhc_collapse")?,
+                module.load_function("mhc_collapse_separate_products")?,
+            ],
+            update: [
+                module.load_function("mhc_update")?,
+                module.load_function("mhc_update_residual_sum")?,
+            ],
         })
+    }
+
+    pub(crate) fn prepare_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 3>,
+        params: &HcParams,
+        output: (&mut TensorMut<f32, 2>, &mut TensorMut<f32, 1>),
+    ) -> Result<()> {
+        let (prepared, inverse) = output;
+        let rows = x.shape[0];
+        let width = params
+            .mult
+            .checked_mul(params.hidden)
+            .context("mHC width overflow")?;
+        require_dense(&x, "F32 source")?;
+        require_dense(&prepared.0, "F32 prepared")?;
+        require_dense(&inverse.0, "F32 inverse")?;
+        ensure!(
+            params.mult == 4
+                && x.shape == [rows, 4, params.hidden]
+                && prepared.0.shape == [rows, width]
+                && inverse.0.shape == [rows]
+                && rows == 5
+                && params.hidden.is_multiple_of(4)
+                && width <= i32::MAX as u32
+                && params.norm_eps.is_finite()
+                && params.norm_eps > 0.0,
+            "mHC F32 preparation geometry"
+        );
+        no_overlap(&x, &prepared.0, "source", "prepared")?;
+        no_overlap(&x, &inverse.0, "source", "inverse")?;
+        no_overlap(&prepared.0, &inverse.0, "prepared", "inverse")?;
+        let (mult, hidden, rows) = (
+            i32::try_from(params.mult)?,
+            i32::try_from(params.hidden)?,
+            i32::try_from(rows)?,
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.prepare_f32)
+                .arg(&x.ptr)
+                .arg(&prepared.0.ptr)
+                .arg(&inverse.0.ptr)
+                .arg(&mult)
+                .arg(&hidden)
+                .arg(&params.norm_eps)
+                .arg(&rows)
+                .launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (MHC_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        weights: &HcWeights,
+        params: &HcParams,
+        output: HcMixes<'_>,
+    ) -> Result<()> {
+        let HcMixes {
+            partials,
+            pre,
+            post,
+            comb,
+        } = output;
+        let partials = partials.context("mHC F32 partials missing")?;
+        let rows = pre.0.shape[0];
+        require_dense(&partials.0, "F32 partials")?;
+        require_dense(&pre.0, "F32 pre")?;
+        require_dense(&post.0, "F32 post")?;
+        require_dense(&comb.0, "F32 comb")?;
+        require_dense(&weights.base, "F32 base")?;
+        require_dense(&weights.scale, "F32 scale")?;
+        ensure!(
+            params.mult == 4
+                && rows > 0
+                && params.iters > 0
+                && params.eps.is_finite()
+                && params.eps > 0.0
+                && partials.0.shape == [rows, 25]
+                && pre.0.shape == [rows, 4]
+                && post.0.shape == [rows, 4]
+                && comb.0.shape == [rows, 4, 4]
+                && weights.base.shape == [24]
+                && weights.scale.shape == [3],
+            "mHC F32 finish geometry"
+        );
+        for out in [&pre.0, &post.0] {
+            no_overlap(out, &partials.0, "output", "partials")?;
+            no_overlap(out, &weights.base, "output", "base")?;
+            no_overlap(out, &weights.scale, "output", "scale")?;
+            no_overlap(out, &comb.0, "output", "comb")?;
+        }
+        no_overlap(&pre.0, &post.0, "pre", "post")?;
+        no_overlap(&comb.0, &partials.0, "comb", "partials")?;
+        no_overlap(&comb.0, &weights.base, "comb", "base")?;
+        no_overlap(&comb.0, &weights.scale, "comb", "scale")?;
+        let (mult, iters, rows) = (4i32, i32::try_from(params.iters)?, i32::try_from(rows)?);
+        unsafe {
+            stream
+                .launch_builder(&self.finish_f32)
+                .arg(&partials.0.ptr)
+                .arg(&weights.base.ptr)
+                .arg(&weights.scale.ptr)
+                .arg(&mult)
+                .arg(&iters)
+                .arg(&params.eps)
+                .arg(&pre.0.ptr)
+                .arg(&post.0.ptr)
+                .arg(&comb.0.ptr)
+                .arg(&rows)
+                .launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
     }
 
     /// Mixer coefficients of every row: pre, post and the combination matrix.
@@ -450,6 +585,7 @@ impl MhcOps {
         x: Tensor<bf16, 3>,
         pre: Tensor<f32, 2>,
         out: &mut TensorMut<bf16, 2>,
+        separate_products: bool,
     ) -> Result<()> {
         let rows = x.shape[0];
         let (mult, hidden) = (x.shape[1], x.shape[2]);
@@ -471,7 +607,7 @@ impl MhcOps {
         let (rows, mult, hidden) = (i32::try_from(rows)?, mult as i32, hidden as i32);
         unsafe {
             stream
-                .launch_builder(&self.collapse)
+                .launch_builder(&self.collapse[usize::from(separate_products)])
                 .arg(&x.ptr)
                 .arg(&pre.ptr)
                 .arg(&mult)
@@ -537,7 +673,7 @@ impl MhcOps {
         let (rows, mult, hidden) = (i32::try_from(rows)?, mult as i32, hidden as i32);
         unsafe {
             stream
-                .launch_builder(&self.update)
+                .launch_builder(&self.update[usize::from(rounding == HcRounding::Fp32ResidualSum)])
                 .arg(&sublayer_out.ptr)
                 .arg(&residual.ptr)
                 .arg(&post.ptr)
@@ -1466,6 +1602,7 @@ mod tests {
                     [ROWS, hidden],
                     [u64::from(hidden), 1],
                 )?),
+                false,
             )?;
             ops.update(
                 s,
@@ -1485,7 +1622,7 @@ mod tests {
                 )?),
             )?;
             let other_rounding = match rounding {
-                HcRounding::Fp32 => HcRounding::PostCombBf16,
+                HcRounding::Fp32 | HcRounding::Fp32ResidualSum => HcRounding::PostCombBf16,
                 HcRounding::PostCombBf16 => HcRounding::Fp32,
             };
             ops.update(

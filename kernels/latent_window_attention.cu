@@ -43,7 +43,13 @@ __device__ __forceinline__ float lwa_value(uint8_t code, uint8_t scale) {
   return e4m3_decode(code) * e8m0_decode(scale);
 }
 
-extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attention(
+__device__ __forceinline__ uint32_t lwa_bf16_pair(float a, float b) {
+  return uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(a))) |
+         (uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(b))) << 16);
+}
+
+template <bool MMA>
+__device__ __forceinline__ void latent_window_attention_core(
     const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ k_codes,
     const uint8_t* __restrict__ k_scales, const int* __restrict__ slot_ids,
     const float* __restrict__ sink, const float* __restrict__ inv_rotary,
@@ -84,9 +90,8 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
   // Every thread writes its own s_q elements and then reads all of them in the score loop.
   __syncthreads();
 
-  // One warp per key row: lane `l` sums dims l, l+32, ... (one E8M0 scale block per
-  // step), then a 32-lane shuffle tree gives the score. No shared staging and no
-  // barrier inside the loop; warps take keys r, r+nwarp, ... .
+  if constexpr (MMA) { if (head_dim % 64 || p_mode != 0) __trap(); }
+  if constexpr (!MMA) {
   for (int s = warp; s < slots; s += nwarp) {
     const int row = slot_ids[s];
     const uint8_t* k_row = k_codes + (size_t)row * head_dim;
@@ -100,8 +105,38 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
       acc += __shfl_down_sync(FF_WARP_MASK, acc, off);
     if (lane == 0) s_scores[s] = acc * scale;
   }
+  } else {
+    const int group = lane / 4;
+    const int part = lane % 4;
+    for (int first = warp * 8; first < slots; first += nwarp * 8) {
+      const int key = first + group;
+      const int key_row = key < slots ? slot_ids[key] : 0;
+      float accum[4] = {};
+      for (int inner = 0; inner < head_dim; inner += 16) {
+        const int d = inner + part * 2;
+        const uint32_t a0 = *reinterpret_cast<const uint32_t*>(q_row + d);
+        const uint32_t a1 = *reinterpret_cast<const uint32_t*>(q_row + d + 8);
+        const uint32_t b0 = key < slots ? lwa_bf16_pair(
+            lwa_value(k_codes[key_row * head_dim + d], k_scales[key_row * nblocks + d / 32]),
+            lwa_value(k_codes[key_row * head_dim + d + 1], k_scales[key_row * nblocks + (d + 1) / 32])) : 0;
+        const uint32_t b1 = key < slots ? lwa_bf16_pair(
+            lwa_value(k_codes[key_row * head_dim + d + 8], k_scales[key_row * nblocks + (d + 8) / 32]),
+            lwa_value(k_codes[key_row * head_dim + d + 9], k_scales[key_row * nblocks + (d + 9) / 32])) : 0;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%4,%5,%5}, {%6,%7}, {%0,%1,%2,%3};"
+                     : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3])
+                     : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+      }
+      if (group == 0) {
+        if (first + part * 2 < slots) s_scores[first + part * 2] = accum[0] * scale;
+        if (first + part * 2 + 1 < slots) s_scores[first + part * 2 + 1] = accum[1] * scale;
+      }
+    }
+  }
   __syncthreads();
-
+  float* softmax_probabilities = s_acc + head_dim;
+  float* denominator_parts = softmax_probabilities + 64;
+  __nv_bfloat16* probabilities = reinterpret_cast<__nv_bfloat16*>(denominator_parts + 32);
   const float sk = sink[head];
   // The definition's blocked softmax (inference/kernel.py sparse_attn_kernel): the visible
   // keys form blocks of LWA_PUB_BLOCK; each block rescales the FP32 accumulator and the
@@ -115,10 +150,20 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
     const int hi = t + LWA_PUB_BLOCK < slots ? t + LWA_PUB_BLOCK : slots;
     float bmax = m_run;
     for (int s = t; s < hi; ++s) bmax = fmaxf(bmax, s_scores[s]);
+    float denominator_rescale = 1.0f;
     if (t > 0) {
       const float rescale = expf(m_run - bmax);
       for (int d = tid; d < head_dim; d += nthr) s_acc[d] *= rescale;
-      sum_exp *= rescale;
+      if constexpr (MMA) denominator_rescale = rescale;
+      else sum_exp *= rescale;
+    }
+    if constexpr (MMA) {
+      if (tid < 64) softmax_probabilities[tid] = 0.0f;
+      __syncthreads();
+    }
+    if constexpr (MMA) {
+      if (tid < 64) probabilities[tid] = __float2bfloat16_rn(0.0f);
+      __syncthreads();
     }
     float bsum = 0.0f;
     for (int s = t; s < hi; ++s) {
@@ -127,11 +172,70 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
       const uint8_t* sc_row = k_scales + (size_t)row * nblocks;
       const float p = expf(s_scores[s] - bmax);
       bsum += p;
+      if (MMA && tid == 0) softmax_probabilities[s - t] = p;
       const float w = p_mode == 1 ? p : __bfloat162float(__float2bfloat16_rn(p));
+      if constexpr (MMA) {
+        if (tid == 0) probabilities[s - t] = __float2bfloat16_rn(w);
+      } else {
       for (int d = tid; d < head_dim; d += nthr)
         s_acc[d] = fmaf(w, lwa_value(k_row[d], sc_row[d / LWA_SCALE_BLOCK]), s_acc[d]);
+      }
     }
-    sum_exp += bsum;
+    if constexpr (MMA) {
+      __syncthreads();
+      const int group = lane / 4;
+      const int part = lane % 4;
+      for (int tile = 0; tile < head_dim; tile += nwarp * 8) {
+        const int first = tile + warp * 8;
+        const int column = first + group;
+        float accum[4] = {s_acc[first + part * 2], s_acc[first + part * 2 + 1],
+                          s_acc[first + part * 2], s_acc[first + part * 2 + 1]};
+        for (int inner = 0; inner < 64; inner += 16) {
+          const int key = t + inner + part * 2;
+          const int row0 = key < hi ? slot_ids[key] : 0;
+          const int row1 = key + 1 < hi ? slot_ids[key + 1] : 0;
+          const int row8 = key + 8 < hi ? slot_ids[key + 8] : 0;
+          const int row9 = key + 9 < hi ? slot_ids[key + 9] : 0;
+          const uint32_t a0 = *reinterpret_cast<const uint32_t*>(probabilities + inner + part * 2);
+          const uint32_t a1 = *reinterpret_cast<const uint32_t*>(probabilities + inner + part * 2 + 8);
+          const uint32_t b0 = lwa_bf16_pair(
+              key < hi ? lwa_value(k_codes[row0 * head_dim + column], k_scales[row0 * nblocks + column / 32]) : 0.0f,
+              key + 1 < hi ? lwa_value(k_codes[row1 * head_dim + column], k_scales[row1 * nblocks + column / 32]) : 0.0f);
+          const uint32_t b1 = lwa_bf16_pair(
+              key + 8 < hi ? lwa_value(k_codes[row8 * head_dim + column], k_scales[row8 * nblocks + column / 32]) : 0.0f,
+              key + 9 < hi ? lwa_value(k_codes[row9 * head_dim + column], k_scales[row9 * nblocks + column / 32]) : 0.0f);
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                       "{%0,%1,%2,%3}, {%4,%4,%5,%5}, {%6,%7}, {%0,%1,%2,%3};"
+                       : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3])
+                       : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+        }
+        if (group == 0) {
+          s_acc[first + part * 2] = accum[0];
+          s_acc[first + part * 2 + 1] = accum[1];
+        }
+      }
+      __syncthreads();
+    }
+    if constexpr (MMA) {
+      __syncthreads();
+      if (tid < 32) {
+        const int i = (tid / 4) * 8 + (tid % 4) * 2;
+        denominator_parts[tid] = softmax_probabilities[i] + softmax_probabilities[i + 1];
+      }
+      __syncthreads();
+      for (int distance = 4; distance; distance >>= 1) {
+        if (tid < distance * 4)
+          denominator_parts[tid] += denominator_parts[tid + distance * 4];
+        __syncthreads();
+      }
+      for (int distance = 2; distance; distance >>= 1) {
+        if (tid < distance) denominator_parts[tid] += denominator_parts[tid + distance];
+        __syncthreads();
+      }
+      bsum = denominator_parts[0];
+    }
+    if constexpr (MMA) sum_exp = fmaf(sum_exp, denominator_rescale, bsum);
+    else sum_exp += bsum;
     m_run = bmax;
   }
   const float denom = sum_exp + expf(sk - m_run);
@@ -149,6 +253,27 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
   __syncthreads();
   __nv_bfloat16* out_row = out + (size_t)head * head_dim;
   for (int d = tid; d < head_dim; d += nthr) out_row[d] = __float2bfloat16_rn(s_acc[d]);
+}
+
+
+extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attention(
+    const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ k_codes,
+    const uint8_t* __restrict__ k_scales, const int* __restrict__ slot_ids,
+    const float* __restrict__ sink, const float* __restrict__ inv_rotary,
+    __nv_bfloat16* __restrict__ out, int heads, int head_dim, int window,
+    int slots, int rope_tail, float scale, int p_mode,
+    const Q38SequenceMeta* __restrict__ seq, int position) {
+  latent_window_attention_core<false>(q, k_codes, k_scales, slot_ids, sink, inv_rotary, out, heads, head_dim, window, slots, rope_tail, scale, p_mode, seq, position);
+}
+
+extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attention_mma(
+    const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ k_codes,
+    const uint8_t* __restrict__ k_scales, const int* __restrict__ slot_ids,
+    const float* __restrict__ sink, const float* __restrict__ inv_rotary,
+    __nv_bfloat16* __restrict__ out, int heads, int head_dim, int window,
+    int slots, int rope_tail, float scale, int p_mode,
+    const Q38SequenceMeta* __restrict__ seq, int position) {
+  latent_window_attention_core<true>(q, k_codes, k_scales, slot_ids, sink, inv_rotary, out, heads, head_dim, window, slots, rope_tail, scale, p_mode, seq, position);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +341,16 @@ extern "C" __global__ void latent_window_slots(int* slot_ids, int position,
   const int count = position + 1 < window ? position + 1 : window;
   if (i >= count) return;
   slot_ids[i] = (position + 1 - count + i) % window;
+}
+
+extern "C" __global__ void latent_block_slots(int* slot_ids,
+    const Q38SequenceMeta* sequence, int window, int rows) {
+  if (!sequence || sequence->prefix < 1 || window < 1 || rows < 1 ||
+      sequence->valid_rows != rows) __trap();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int committed = min(sequence->prefix, window);
+  if (i < committed) slot_ids[i] = i;
+  else if (i < committed + rows) slot_ids[i] = window + i - committed;
 }
 
 // Block-diagonal group projection of the quantized attention output (model

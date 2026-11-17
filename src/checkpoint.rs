@@ -4848,8 +4848,8 @@ mod component_tests {
             include_str!("../tests/data/deepseek41-flash-config.json"),
         )?;
         assert!(
-            !has_mtp_component(&root)?,
-            "DeepSeek-V4.1 mtp.* tensors selected an unbound MTP decode"
+            has_mtp_component(&root)?,
+            "DeepSeek-V4.1 mtp.* tensors did not select the native MTP decode"
         );
         std::fs::write(
             &path,

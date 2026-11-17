@@ -898,9 +898,10 @@ extern "C" __global__ void __launch_bounds__(MK2_NT) markov2_top4_phase2(
   markov2_p2_body(scratch_top4, scratch_lse, top4, logp, lse, P, PT, V);
 }
 
-extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
-                                       void* scores, unsigned* token,
-                                       int vocab, int rounding) {
+template <typename T>
+__device__ __forceinline__ void sum_argmax_body(const T* base, const T* bias,
+                                               void* scores, unsigned* token,
+                                               int vocab, int rounding) {
   if (blockDim.x != 1024 || vocab < 4 || rounding < 0 || rounding > 1) __trap();
   __shared__ float values[32];
   __shared__ unsigned ids[32];
@@ -911,31 +912,40 @@ extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
                          reinterpret_cast<size_t>(scores)) & 15u) == 0;
   size_t scalar_begin = 0;
   if (aligned) {
-    union Pack { uint4 words; bf16 values[8]; };
-    const int vectors = vocab / 8;
+    constexpr int count = 16 / sizeof(T);
+    union Pack { uint4 words; T values[count]; };
+    const int vectors = vocab / count;
     for (int i = tid; i < vectors; i += 1024) {
       Pack a, b, rounded;
       a.words = reinterpret_cast<const uint4*>(base)[i];
       b.words = reinterpret_cast<const uint4*>(bias)[i];
-      float combined[8];
+      float combined[count];
       #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const unsigned token_id = unsigned(i) * 8u + unsigned(j);
-        const float score = markov_score(__bfloat162float(b.values[j]), a.values[j], rounding);
+      for (int j = 0; j < count; ++j) {
+        const unsigned token_id = unsigned(i) * unsigned(count) + unsigned(j);
+        float score;
+        if constexpr (sizeof(T) == 2) score = markov_score(__bfloat162float(b.values[j]), a.values[j], rounding);
+        else score = a.values[j] + b.values[j];
         combined[j] = score;
-        rounded.values[j] = __float2bfloat16(score);
+        if constexpr (sizeof(T) == 2) rounded.values[j] = __float2bfloat16(score);
         if (score > best || (score == best && token_id < id)) { best = score; id = token_id; }
       }
-      if (scores && rounding == 0) reinterpret_cast<uint4*>(scores)[i] = rounded.words;
-      else if (scores) {
-        reinterpret_cast<float4*>(scores)[2 * i] = make_float4(combined[0],combined[1],combined[2],combined[3]);
-        reinterpret_cast<float4*>(scores)[2 * i + 1] = make_float4(combined[4],combined[5],combined[6],combined[7]);
+      if constexpr (sizeof(T) == 2) {
+        if (scores && rounding == 0) reinterpret_cast<uint4*>(scores)[i] = rounded.words;
+        else if (scores) {
+          reinterpret_cast<float4*>(scores)[2 * i] = make_float4(combined[0],combined[1],combined[2],combined[3]);
+          reinterpret_cast<float4*>(scores)[2 * i + 1] = make_float4(combined[4],combined[5],combined[6],combined[7]);
+        }
+      } else if (scores) {
+        reinterpret_cast<float4*>(scores)[i] = make_float4(combined[0],combined[1],combined[2],combined[3]);
       }
     }
-    scalar_begin = size_t(vectors) * 8;
+    scalar_begin = size_t(vectors) * count;
   }
   for (size_t v = scalar_begin + tid; v < size_t(vocab); v += 1024) {
-    const float score = markov_score(__bfloat162float(bias[v]), base[v], rounding);
+    float score;
+    if constexpr (sizeof(T) == 2) score = markov_score(__bfloat162float(bias[v]), base[v], rounding);
+    else score = base[v] + bias[v];
     if (scores && rounding == 0) static_cast<bf16*>(scores)[v] = __float2bfloat16(score);
     else if (scores) static_cast<float*>(scores)[v] = score;
     if (score > best || (score == best && (unsigned)v < id)) { best = score; id = unsigned(v); }
@@ -958,7 +968,19 @@ extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
   }
 }
 
-extern "C" __global__ void concat_dot_sigmoid(const bf16* hidden, const bf16* embeddings,
+extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
+                                       void* scores, unsigned* token,
+                                       int vocab, int rounding) {
+  sum_argmax_body(base, bias, scores, token, vocab, rounding);
+}
+
+extern "C" __global__ void sum_argmax_f32(const float* base, const float* bias,
+                                         float* scores, unsigned* token, int vocab) {
+  sum_argmax_body(base, bias, scores, token, vocab, 1);
+}
+
+template <bool Raw>
+__device__ __forceinline__ void concat_dot_body(const bf16* hidden, const bf16* embeddings,
                                                const unsigned* anchor, const unsigned* previous,
                                                const bf16* weight, const bf16* bias,
                                                float* output, int rows, int width, int rank,
@@ -982,8 +1004,28 @@ extern "C" __global__ void concat_dot_sigmoid(const bf16* hidden, const bf16* em
     sum = lane < 8 ? partials[lane] : 0.0f;
     for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(FF_WARP_MASK,sum,offset);
     if (lane == 0) {
-      const float logit = __bfloat162float(__float2bfloat16(sum + __bfloat162float(*bias)));
-      output[row] = __bfloat162float(__float2bfloat16(1.0f / (1.0f + expf(-logit))));
+      if constexpr (Raw) output[row] = sum;
+      else {
+        const float logit = __bfloat162float(__float2bfloat16(sum + __bfloat162float(*bias)));
+        output[row] = __bfloat162float(__float2bfloat16(1.0f / (1.0f + expf(-logit))));
+      }
     }
   }
+}
+
+extern "C" __global__ void concat_dot_sigmoid(const bf16* hidden, const bf16* embeddings,
+                                               const unsigned* anchor, const unsigned* previous,
+                                               const bf16* weight, const bf16* bias,
+                                               float* output, int rows, int width, int rank,
+                                               int vocab) {
+  concat_dot_body<false>(hidden, embeddings, anchor, previous, weight, bias,
+                         output, rows, width, rank, vocab);
+}
+
+extern "C" __global__ void concat_dot(const bf16* hidden, const bf16* embeddings,
+                                      const unsigned* anchor, const unsigned* previous,
+                                      const bf16* weight, float* output,
+                                      int rows, int width, int rank, int vocab) {
+  concat_dot_body<true>(hidden, embeddings, anchor, previous, weight, nullptr,
+                        output, rows, width, rank, vocab);
 }

@@ -424,6 +424,7 @@ pub(crate) struct LatentCompressedKv {
     pub cursor: CudaSlice<u32>,
     pub tail_values: CudaSlice<f32>,
     pub tail_scores: CudaSlice<f32>,
+    pub prefixes: Option<[CudaSlice<f32>; 2]>,
 }
 
 pub(crate) struct LatentSelection {
@@ -445,6 +446,228 @@ pub(crate) struct LatentCompressedState {
 }
 
 impl LatentCompressedState {
+    fn journal(&self, rows: usize, s: &Arc<CudaStream>) -> Result<Self> {
+        ensure!(rows > 0 && rows <= self.rows, "latent journal rows");
+        let kv = self
+            .kv
+            .iter()
+            .map(|v| {
+                let entries = rows.div_ceil(v.ratio);
+                Ok(LatentCompressedKv {
+                    owner: v.owner,
+                    ratio: v.ratio,
+                    codes: s.alloc_zeros(entries * 256)?,
+                    scales: s.alloc_zeros(entries * 32)?,
+                    index_codes: s.alloc_zeros(entries * 64)?,
+                    index_scales: s.alloc_zeros(entries * 4)?,
+                    count: s.alloc_zeros(1)?,
+                    ticket: s.alloc_zeros(4)?,
+                    cursor: s.alloc_zeros(1)?,
+                    tail_values: s.alloc_zeros(v.tail_values.len())?,
+                    tail_scores: s.alloc_zeros(v.tail_scores.len())?,
+                    prefixes: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let index = self
+            .index
+            .iter()
+            .map(|v| {
+                Ok(LatentSelection {
+                    owner: v.owner,
+                    positions: s.alloc_zeros(rows * v.positions.len() / self.rows)?,
+                    ticket: s.alloc_zeros(5)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            owners: self.owners.clone(),
+            kv,
+            index,
+            candidates: s.alloc_zeros(rows * self.candidates.len() / self.rows)?,
+            candidate_ticket: s.alloc_zeros(5)?,
+            generation: s.alloc_zeros(1)?,
+            generation_value: self.generation_value,
+            rows,
+        })
+    }
+
+    fn save_journal(
+        &self,
+        saved: &mut Self,
+        prefix: usize,
+        rows: usize,
+        s: &Arc<CudaStream>,
+    ) -> Result<()> {
+        ensure!(
+            self.owners == saved.owners && rows <= saved.rows,
+            "latent journal geometry"
+        );
+        for (live, saved) in self.kv.iter().zip(&mut saved.kv) {
+            let first = prefix / live.ratio;
+            let count = (prefix + rows) / live.ratio - first;
+            for (source, target, width) in [
+                (&live.codes, &mut saved.codes, 256),
+                (&live.scales, &mut saved.scales, 32),
+                (&live.index_codes, &mut saved.index_codes, 64),
+                (&live.index_scales, &mut saved.index_scales, 4),
+            ] {
+                if count > 0 {
+                    s.memcpy_dtod(
+                        &source.slice(first * width..(first + count) * width),
+                        &mut target.slice_mut(..count * width),
+                    )?;
+                }
+            }
+            for (source, target) in [
+                (&live.count, &mut saved.count),
+                (&live.ticket, &mut saved.ticket),
+                (&live.cursor, &mut saved.cursor),
+            ] {
+                s.memcpy_dtod(source, target)?;
+            }
+            s.memcpy_dtod(&live.tail_values, &mut saved.tail_values)?;
+            s.memcpy_dtod(&live.tail_scores, &mut saved.tail_scores)?;
+        }
+        for (live, saved) in self.index.iter().zip(&mut saved.index) {
+            s.memcpy_dtod(
+                &live.positions.slice(..saved.positions.len()),
+                &mut saved.positions,
+            )?;
+            s.memcpy_dtod(&live.ticket, &mut saved.ticket)?;
+        }
+        s.memcpy_dtod(
+            &self.candidates.slice(..saved.candidates.len()),
+            &mut saved.candidates,
+        )?;
+        s.memcpy_dtod(&self.candidate_ticket, &mut saved.candidate_ticket)?;
+        s.memcpy_dtod(&self.generation, &mut saved.generation)?;
+        saved.generation_value = self.generation_value;
+        Ok(())
+    }
+
+    fn select_journal(
+        &mut self,
+        saved: &Self,
+        range: (usize, usize, usize),
+        s: &Arc<CudaStream>,
+    ) -> Result<()> {
+        let (prefix, rows, accepted) = range;
+        ensure!(
+            self.owners == saved.owners
+                && accepted <= rows
+                && rows <= saved.rows
+                && self.generation_value == saved.generation_value,
+            "stale latent prefix journal"
+        );
+        for (live, saved) in self.kv.iter_mut().zip(&saved.kv) {
+            let first = prefix / live.ratio;
+            let kept = (prefix + accepted) / live.ratio;
+            let end = (prefix + rows) / live.ratio;
+            for (source, target, width) in [
+                (&saved.codes, &mut live.codes, 256),
+                (&saved.scales, &mut live.scales, 32),
+                (&saved.index_codes, &mut live.index_codes, 64),
+                (&saved.index_scales, &mut live.index_scales, 4),
+            ] {
+                if end > kept {
+                    s.memcpy_dtod(
+                        &source.slice((kept - first) * width..(end - first) * width),
+                        &mut target.slice_mut(kept * width..end * width),
+                    )?;
+                }
+            }
+            if accepted == 0 {
+                for (source, target) in [
+                    (&saved.count, &mut live.count),
+                    (&saved.ticket, &mut live.ticket),
+                    (&saved.cursor, &mut live.cursor),
+                ] {
+                    s.memcpy_dtod(source, target)?;
+                }
+                s.memcpy_dtod(&saved.tail_values, &mut live.tail_values)?;
+                s.memcpy_dtod(&saved.tail_scores, &mut live.tail_scores)?;
+            } else {
+                if live.ratio == 2 {
+                    let images = live
+                        .prefixes
+                        .as_ref()
+                        .context("latent prefix tails are not bound")?;
+                    for (images, target) in [
+                        (&images[0], &mut live.tail_values),
+                        (&images[1], &mut live.tail_scores),
+                    ] {
+                        let n = target.len();
+                        s.memcpy_dtod(&images.slice((accepted - 1) * n..accepted * n), target)?;
+                    }
+                }
+                s.memcpy_htod(&[u32::try_from(kept)?], &mut live.count)?;
+                s.memcpy_htod(&[u32::try_from(prefix + accepted)?], &mut live.cursor)?;
+                s.memcpy_htod(
+                    &[
+                        u32::try_from(live.owner)?,
+                        self.generation_value,
+                        u32::try_from(prefix + accepted)?,
+                        u32::try_from(kept)?,
+                    ],
+                    &mut live.ticket,
+                )?;
+            }
+        }
+        for (live, saved_index) in self.index.iter_mut().zip(&saved.index) {
+            let width = saved_index.positions.len() / saved.rows;
+            super::copy::select_prefix_row(
+                s,
+                &mut live.positions,
+                &saved_index.positions,
+                width,
+                accepted,
+            )?;
+            if accepted == 0 {
+                s.memcpy_dtod(&saved_index.ticket, &mut live.ticket)?;
+            } else {
+                s.memcpy_htod(
+                    &[(prefix + accepted - 1) as u32, (prefix + accepted) as u32],
+                    &mut live.ticket.slice_mut(3..5),
+                )?;
+            }
+        }
+        let width = saved.candidates.len() / saved.rows;
+        super::copy::select_prefix_row(
+            s,
+            &mut self.candidates,
+            &saved.candidates,
+            width,
+            accepted,
+        )?;
+        if accepted == 0 {
+            s.memcpy_dtod(&saved.candidate_ticket, &mut self.candidate_ticket)?;
+        } else {
+            s.memcpy_htod(
+                &[(prefix + accepted - 1) as u32, (prefix + accepted) as u32],
+                &mut self.candidate_ticket.slice_mut(3..5),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enable_prefixes(&mut self, rows: usize, s: &Arc<CudaStream>) -> Result<()> {
+        ensure!(
+            (1..=4).contains(&rows) && rows <= self.rows,
+            "latent prefix row capacity"
+        );
+        for kv in &mut self.kv {
+            ensure!(kv.prefixes.is_none(), "latent prefix storage already bound");
+            if kv.ratio == 2 {
+                kv.prefixes = Some([
+                    s.alloc_zeros(rows * 2 * 512)?,
+                    s.alloc_zeros(rows * 2 * 512)?,
+                ]);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         spec: &ModelSpec,
         capacity: usize,
@@ -484,6 +707,7 @@ impl LatentCompressedState {
                     cursor: s.alloc_zeros(1)?,
                     tail_values: s.alloc_zeros(2 * 512)?,
                     tail_scores: s.clone_htod(&vec![f32::NEG_INFINITY; 2 * 512])?,
+                    prefixes: None,
                 });
             }
             if mapping.index == layer {
@@ -544,6 +768,9 @@ impl LatentCompressedState {
                         + v.cursor.len()
                         + v.tail_values.len()
                         + v.tail_scores.len())
+                    + v.prefixes
+                        .as_ref()
+                        .map_or(0, |p| 4 * (p[0].len() + p[1].len()))
             })
             .sum::<usize>()
             + 4 * (self
@@ -995,6 +1222,8 @@ pub struct StateCheckpoint {
     kv: Vec<Kv>,
     gdn: Vec<GdnState>,
     dsa: Vec<DsaCheckpointState>,
+    latent: Vec<LatentRing>,
+    compressed: Option<LatentCompressedState>,
     sequence: Option<CudaSlice<i32>>,
     token: CudaSlice<u32>,
     prefix: usize,
@@ -1020,7 +1249,7 @@ impl StateCheckpoint {
         let mut kv_dims = Vec::new();
         let mut gdn = Vec::new();
         for layer in &spec.layers {
-            if spec.architecture == crate::model_spec::Architecture::Glm5Next {
+            if store.kv.is_empty() {
                 continue;
             }
             if layer.mixer != Mixer::FullAttention {
@@ -1067,6 +1296,26 @@ impl StateCheckpoint {
             kv,
             gdn,
             dsa,
+            latent: store
+                .latent
+                .iter()
+                .map(|ring| {
+                    ensure!(
+                        ring.codes.len().is_multiple_of(512)
+                            && ring.scales.len() * 32 == ring.codes.len(),
+                        "latent journal ring geometry"
+                    );
+                    Ok(LatentRing {
+                        codes: stream.alloc_zeros(rows * 512)?,
+                        scales: stream.alloc_zeros(rows * 16)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            compressed: store
+                .compressed
+                .as_ref()
+                .map(|c| c.journal(rows, stream))
+                .transpose()?,
             sequence: store
                 .sequence
                 .as_ref()
@@ -1082,11 +1331,82 @@ impl StateCheckpoint {
             valid: false,
         })
     }
+    fn save_latent(
+        &mut self,
+        store: &StateStore,
+        prefix: usize,
+        rows: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<()> {
+        for (source, saved) in store.latent.iter().zip(&mut self.latent) {
+            let capacity = source.codes.len() / 512;
+            for (source, target, width) in [
+                (&source.codes, &mut saved.codes, 512),
+                (&source.scales, &mut saved.scales, 16),
+            ] {
+                super::copy::RingCopy {
+                    stream,
+                    source,
+                    target,
+                    source_capacity: capacity,
+                    target_capacity: self.rows,
+                    heads: 1,
+                    head_dim: width,
+                }
+                .run(prefix % capacity, 0, rows, true, false)?;
+            }
+        }
+        if let (Some(live), Some(saved)) = (&store.compressed, &mut self.compressed) {
+            live.save_journal(saved, prefix, rows, stream)?;
+        }
+        Ok(())
+    }
+
+    fn select_latent(
+        &self,
+        store: &mut StateStore,
+        accepted: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<()> {
+        if accepted < self.active_rows {
+            for (saved, target) in self.latent.iter().zip(&mut store.latent) {
+                let capacity = target.codes.len() / 512;
+                for (source, target, width) in [
+                    (&saved.codes, &mut target.codes, 512),
+                    (&saved.scales, &mut target.scales, 16),
+                ] {
+                    super::copy::RingCopy {
+                        stream,
+                        source,
+                        target,
+                        source_capacity: self.rows,
+                        target_capacity: capacity,
+                        heads: 1,
+                        head_dim: width,
+                    }
+                    .run(
+                        accepted,
+                        (self.prefix + accepted) % capacity,
+                        self.active_rows - accepted,
+                        false,
+                        true,
+                    )?;
+                }
+            }
+        }
+        if let (Some(live), Some(saved)) = (&mut store.compressed, &self.compressed) {
+            live.select_journal(saved, (self.prefix, self.active_rows, accepted), stream)?;
+        }
+        Ok(())
+    }
+
     fn check(&self, store: &StateStore) -> Result<()> {
         ensure!(
             self.kv.len() == store.kv.len()
                 && self.gdn.len() == store.gdn.len()
                 && self.dsa.len() == store.dsa.len()
+                && self.latent.len() == store.latent.len()
+                && self.compressed.is_some() == store.compressed.is_some()
                 && self.sequence.is_some() == store.sequence.is_some()
                 && self.capacity == store.capacity as usize
                 && self.kv_rings == store.kv_rings,
@@ -1202,6 +1522,7 @@ impl StateCheckpoint {
                 .validate(store.capacity, rows as u32)?;
             }
         }
+        self.save_latent(store, prefix, active_rows, stream)?;
         for (src, dst) in store.gdn.iter().zip(&mut self.gdn) {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
@@ -1288,6 +1609,7 @@ impl StateCheckpoint {
     ) -> Result<()> {
         ensure!(self.valid, "checkpoint has no valid snapshot");
         self.check(store)?;
+        self.select_latent(store, 0, stream)?;
         ensure!(token.len() == 1, "checkpoint token extent mismatch");
         for (src, dst) in self.gdn.iter().zip(&mut store.gdn) {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
@@ -1433,6 +1755,7 @@ impl StateCheckpoint {
                 }
             }
         }
+        self.select_latent(store, accepted, stream)?;
         self.restore_kv_rows(store, accepted, self.active_rows, stream)
     }
     pub(crate) fn restore_for_replay(
@@ -1449,6 +1772,7 @@ impl StateCheckpoint {
             "checkpoint committed={committed} verified_rows={verified_rows} exceeds active_rows={}",
             self.active_rows
         );
+        self.select_latent(store, committed, stream)?;
         if committed < verified_rows {
             for (saved, state) in self.gdn.iter().zip(&mut store.gdn) {
                 stream.memcpy_dtod(&saved.s, &mut state.s)?;
@@ -1550,6 +1874,15 @@ impl StateCheckpoint {
                         + (d.token_ids.len() + d.pool_ids.len() + d.meta.len()) * 4
                 })
                 .sum::<usize>()
+            + self
+                .latent
+                .iter()
+                .map(|v| v.codes.len() + v.scales.len())
+                .sum::<usize>()
+            + self
+                .compressed
+                .as_ref()
+                .map_or(0, LatentCompressedState::bytes)
             + 4
             + self.sequence.as_ref().map_or(0, |s| s.len() * 4)
     }

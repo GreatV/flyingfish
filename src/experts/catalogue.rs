@@ -527,12 +527,53 @@ impl ExpertCatalogue {
         geometry: ExpertGeometry,
         format: ExpertFormat,
     ) -> Result<Self> {
+        Self::from_scope(
+            manifest,
+            geometry,
+            format,
+            crate::checkpoint::TensorScope::Text,
+        )
+    }
+
+    pub fn from_draft_manifest(manifest: &TensorManifest, target: &ModelSpec) -> Result<Self> {
+        let ds = target
+            .deepseek_v41
+            .as_ref()
+            .context("staged expert geometry missing")?;
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: ds.nextn_layers,
+            experts: ds.dspark_experts,
+            top_k: ds.dspark_experts_per_tok,
+            ..ExpertGeometry::from_model(target)?
+        };
+        let format = target
+            .expert_format
+            .context("staged native expert format missing")?;
+        ensure!(
+            matches!(format, ExpertFormat::Fp4E2m1Block { .. }),
+            "staged expert catalogue requires native E2M1"
+        );
+        Self::from_scope(
+            manifest,
+            geometry,
+            format,
+            crate::checkpoint::TensorScope::Mtp,
+        )
+    }
+
+    fn from_scope(
+        manifest: &TensorManifest,
+        geometry: ExpertGeometry,
+        format: ExpertFormat,
+        scope: crate::checkpoint::TensorScope,
+    ) -> Result<Self> {
         let layout = ExpertLayout::new(format, &geometry)?;
         let mut routed = manifest
             .entries
             .iter()
             .filter(|(name, entry)| {
-                entry.scope == crate::checkpoint::TensorScope::Text
+                entry.scope == scope
                     && (name.contains(".mlp.experts.") || name.contains(".ffn.experts."))
             })
             .peekable();
@@ -540,7 +581,13 @@ impl ExpertCatalogue {
             .peek()
             .context("manifest has no routed expert tensors")?
             .0;
-        let prefix = if let Some((prefix, _)) = first.split_once(".layers.") {
+        let prefix = if scope == crate::checkpoint::TensorScope::Mtp {
+            ensure!(
+                first.starts_with("mtp."),
+                "invalid staged expert namespace {first}"
+            );
+            "mtp"
+        } else if let Some((prefix, _)) = first.split_once(".layers.") {
             ensure!(
                 ["model", "model.language_model"].contains(&prefix),
                 "unsupported expert namespace {prefix}"
@@ -553,7 +600,9 @@ impl ExpertCatalogue {
             );
             ""
         };
-        let layer_prefix = if prefix.is_empty() {
+        let layer_prefix = if scope == crate::checkpoint::TensorScope::Mtp {
+            "mtp.".to_owned()
+        } else if prefix.is_empty() {
             "layers.".to_owned()
         } else {
             format!("{prefix}.layers.")
@@ -697,7 +746,7 @@ impl ExpertCatalogue {
                         let native =
                             |role: &str, dtype: safetensors::Dtype, rows: usize, cols: usize| {
                                 let name = format!(
-                                    "layers.{checkpoint_layer}.ffn.experts.{expert}.{role}"
+                                    "{layer_prefix}{checkpoint_layer}.ffn.experts.{expert}.{role}"
                                 );
                                 native_entry(
                                     manifest.entries.get(&name).with_context(|| {
@@ -1261,6 +1310,33 @@ mod tests {
         let error =
             ExpertCatalogue::from_manifest(&e2m1_manifest(), geometry, wrong_block).unwrap_err();
         assert!(format!("{error:#}").contains("E8M0"), "{error}");
+        let mut combined = e2m1_manifest();
+        let staged = combined
+            .entries
+            .iter()
+            .map(|(name, entry)| {
+                let mut entry = entry.clone();
+                entry.scope = crate::checkpoint::TensorScope::Mtp;
+                entry.data_start += 10_000;
+                (name.replacen("layers.", "mtp.", 1), entry)
+            })
+            .collect::<Vec<_>>();
+        combined.entries.extend(staged);
+        let staged = ExpertCatalogue::from_scope(
+            &combined,
+            geometry,
+            format,
+            crate::checkpoint::TensorScope::Mtp,
+        )?;
+        let ExpertRange::E2m1 { gate, .. } = staged.range(1, 2)? else {
+            bail!("staged E2M1 range expected");
+        };
+        assert_eq!(gate.offset, base + 10_000);
+        let target = ExpertCatalogue::from_manifest(&combined, geometry, format)?;
+        let ExpertRange::E2m1 { gate, .. } = target.range(1, 2)? else {
+            bail!("target E2M1 range expected");
+        };
+        assert_eq!(gate.offset, base);
         Ok(())
     }
 

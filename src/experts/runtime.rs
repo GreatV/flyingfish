@@ -951,7 +951,7 @@ impl Residency {
 
     /// Sources of the experts one layer without resident slots routes this token; each is read
     /// into a pool slot for the layer step and keeps its host or disk tier.
-    pub fn lease(&mut self, layer: u32, experts: &[u32]) -> Result<Vec<Leased>> {
+    pub fn lease(&mut self, layer: u32, experts: &[u32], pool_slots: usize) -> Result<Vec<Leased>> {
         ensure!(self.token_open, "lease outside a token");
         let l = layer as usize;
         ensure!(
@@ -963,10 +963,10 @@ impl Residency {
         unique.sort_unstable();
         unique.dedup();
         ensure!(
-            unique.len() <= self.capacity.prefill_staging_slots as usize,
+            unique.len() <= pool_slots,
             "layer {layer} routes {} experts; the pool holds {}",
             unique.len(),
-            self.capacity.prefill_staging_slots
+            pool_slots
         );
         let mut leased = Vec::with_capacity(unique.len());
         for expert in unique {
@@ -2081,8 +2081,8 @@ mod tests {
             .collect::<Result<_>>()?;
         assert!(tiers.iter().all(|&tier| tier != Tier::Gpu));
         residency.dispatch(1, &routes)?;
-        assert!(residency.lease(0, &[3]).is_err());
-        let leased = residency.lease(1, &[5, 3, 5])?;
+        assert!(residency.lease(0, &[3], 2).is_err());
+        let leased = residency.lease(1, &[5, 3, 5], 2)?;
         assert_eq!(leased.iter().map(|l| l.expert).collect::<Vec<_>>(), [3, 5]);
         assert!(leased[0].generation < leased[1].generation);
         for (lease, &tier) in leased.iter().zip(&tiers) {
@@ -2091,7 +2091,21 @@ mod tests {
             assert_eq!(residency.generation(1, lease.expert)?, lease.generation);
         }
         residency.dispatch(2, &[route(0, 0, 1), route(0, 1, 2), route(1, 2, 4)])?;
-        assert!(residency.lease(2, &[1, 2, 4]).is_err());
+        assert!(residency.lease(2, &[1, 2, 4], 2).is_err());
+        residency.capacity.prefill_staging_slots = 0;
+        residency.capacity.device_expert_bytes -= 2 * slot;
+        assert!(residency.lease(1, &[3, 5], 0).is_err());
+        assert!(residency.lease(1, &[3, 5], 1).is_err());
+        let borrowed = residency.lease(1, &[5, 3, 5], 2)?;
+        assert_eq!(
+            borrowed.iter().map(|v| v.expert).collect::<Vec<_>>(),
+            [3, 5]
+        );
+        assert_eq!(residency.capacity.prefill_staging_slots, 0);
+        for (lease, &tier) in borrowed.iter().zip(&tiers) {
+            assert_eq!(lease.source_block.is_some(), tier == Tier::Host);
+            assert_eq!(residency.ledger().tier(1, lease.expert)?, tier);
+        }
         assert!(residency.finish_token()?.is_empty());
         Ok(())
     }

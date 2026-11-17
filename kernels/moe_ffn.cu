@@ -598,6 +598,107 @@ extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_down_e2m1_e8m
                 inter);
 }
 
+template <bool PACKED>
+__device__ __forceinline__ void moe_gate_up_exact(
+    const uint8_t* act_codes, const uint8_t* act_scales,
+    const uint8_t* gate_codes, const uint8_t* gate_scales,
+    const uint8_t* up_codes, const uint8_t* up_scales,
+    bf16* h, int hidden, int inter, float limit, float route_weight, bf16* projected) {
+  if (blockDim.x != W4A8_THREADS || hidden <= 0 || inter <= 0 ||
+      hidden % 32 || !(limit > 0.f) || !isfinite(route_weight) ||
+      gridDim.x != (unsigned)((inter + W4A8_WARPS - 1) / W4A8_WARPS))
+    __trap();
+  extern __shared__ __align__(16) uint8_t exact_act[];
+  for (int i = threadIdx.x; i < hidden + hidden / 32; i += W4A8_THREADS)
+    exact_act[i] = i < hidden ? act_codes[i] : act_scales[i - hidden];
+  __syncthreads();
+  const int row = blockIdx.x * W4A8_WARPS + threadIdx.x / 32;
+  if (row >= inter) return;
+  const int scale_row = PACKED ? row : row / 32;
+  const int stride = hidden / (PACKED ? 2 : 1), groups = hidden / 32;
+  const double gate = scaled_e4m3_dot_exact<PACKED>(
+      gate_codes + (size_t)row * stride, gate_scales + (size_t)scale_row * groups,
+      exact_act, exact_act + hidden, hidden);
+  const double up = scaled_e4m3_dot_exact<PACKED>(
+      up_codes + (size_t)row * stride, up_scales + (size_t)scale_row * groups,
+      exact_act, exact_act + hidden, hidden);
+  if ((threadIdx.x & 31) == 0) {
+    const bf16 gate_value = bf16_round_f64(gate), up_value = bf16_round_f64(up);
+    const float g = fminf(__bfloat162float(gate_value), limit);
+    const float u = fmaxf(fminf(__bfloat162float(up_value), limit), -limit);
+    h[row] = __float2bfloat16_rn(((g / (1.f + expf(-g))) * u) * route_weight);
+    if (projected) {
+      projected[row] = gate_value;
+      projected[inter + row] = up_value;
+      projected[2 * inter + row] = h[row];
+    }
+  }
+}
+
+template <bool PACKED>
+__device__ __forceinline__ void moe_down_exact(
+    const uint8_t* act_codes, const uint8_t* act_scales,
+    const uint8_t* down_codes, const uint8_t* down_scales,
+    bf16* out, int hidden, int inter) {
+  if (blockDim.x != W4A8_THREADS || hidden <= 0 || inter <= 0 || inter % 32 ||
+      gridDim.x != (unsigned)((hidden + W4A8_WARPS - 1) / W4A8_WARPS))
+    __trap();
+  extern __shared__ __align__(16) uint8_t exact_act[];
+  for (int i = threadIdx.x; i < inter + inter / 32; i += W4A8_THREADS)
+    exact_act[i] = i < inter ? act_codes[i] : act_scales[i - inter];
+  __syncthreads();
+  const int row = blockIdx.x * W4A8_WARPS + threadIdx.x / 32;
+  if (row >= hidden) return;
+  const int scale_row = PACKED ? row : row / 32;
+  const double total = scaled_e4m3_dot_exact<PACKED>(
+      down_codes + (size_t)row * (inter / (PACKED ? 2 : 1)),
+      down_scales + (size_t)scale_row * (inter / 32), exact_act, exact_act + inter, inter);
+  if ((threadIdx.x & 31) == 0) out[row] = bf16_round_f64(total);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_dispatch_gate_up_e2m1_e8m0_exact(
+    const uint8_t* act_codes, const uint8_t* act_scales,
+    const unsigned long long* slots, const unsigned* valid,
+    const int* ids, const float* weights, unsigned long long index,
+    int experts, bf16* h, int hidden, int inter, float limit, bf16* projected) {
+  const int expert = ids[index];
+  if ((unsigned)expert >= (unsigned)experts || valid[expert] == 0u) __trap();
+  const unsigned long long* slot = slots + (size_t)expert * 6;
+  moe_gate_up_exact<true>(act_codes, act_scales,
+      reinterpret_cast<const uint8_t*>(slot[0]), reinterpret_cast<const uint8_t*>(slot[1]),
+      reinterpret_cast<const uint8_t*>(slot[2]), reinterpret_cast<const uint8_t*>(slot[3]),
+      h, hidden, inter, limit, weights[index], projected);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_dispatch_down_e2m1_e8m0_exact(
+    const uint8_t* act_codes, const uint8_t* act_scales,
+    const unsigned long long* slots, const unsigned* valid,
+    const int* ids, unsigned long long index, int experts,
+    bf16* out, int hidden, int inter) {
+  const int expert = ids[index];
+  if ((unsigned)expert >= (unsigned)experts || valid[expert] == 0u) __trap();
+  const unsigned long long* slot = slots + (size_t)expert * 6;
+  moe_down_exact<true>(act_codes, act_scales,
+      reinterpret_cast<const uint8_t*>(slot[4]), reinterpret_cast<const uint8_t*>(slot[5]),
+      out, hidden, inter);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_gate_up_e4m3_block32_exact(
+    const uint8_t* act_codes, const uint8_t* act_scales,
+    const uint8_t* gate_codes, const uint8_t* gate_scales,
+    const uint8_t* up_codes, const uint8_t* up_scales,
+    bf16* h, int hidden, int inter, float limit, bf16* projected) {
+  moe_gate_up_exact<false>(act_codes, act_scales, gate_codes, gate_scales,
+      up_codes, up_scales, h, hidden, inter, limit, 1.f, projected);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_down_e4m3_block32_exact(
+    const uint8_t* act_codes, const uint8_t* act_scales,
+    const uint8_t* down_codes, const uint8_t* down_scales,
+    bf16* out, int hidden, int inter) {
+  moe_down_exact<false>(act_codes, act_scales, down_codes, down_scales, out, hidden, inter);
+}
+
 // Device-side routed dispatch: the id and the routed weight are read from
 // device memory; `slots` holds six addresses per expert in the order
 // gate_codes, gate_scales, up_codes, up_scales, down_codes, down_scales. An

@@ -51,6 +51,24 @@ extern "C" __global__ void latent_compress_tail(
     if (threadIdx.x == 0) *cursor = sequence->key_count;
 }
 
+extern "C" __global__ void latent_prefix_tails(
+    const float* values, const float* scores, const float* tail_values,
+    const float* tail_scores, float* prefix_values, float* prefix_scores,
+    const Q38SequenceMeta* sequence, int rows, int channels) {
+    q38_meta_guard(sequence);
+    const int prefix = blockIdx.x + 1;
+    if (sequence->valid_rows > rows || prefix > sequence->valid_rows) return;
+    for (int item = threadIdx.x; item < 2 * channels; item += blockDim.x) {
+        const int parity = item / channels;
+        int row = prefix - 1;
+        row -= ((sequence->prefix + row) & 1) != parity;
+        const int64_t output = int64_t(prefix - 1) * 2 * channels + item;
+        const int64_t source = int64_t(row) * channels + item % channels;
+        prefix_values[output] = row < 0 ? tail_values[item] : values[source];
+        prefix_scores[output] = row < 0 ? tail_scores[item] : scores[source];
+    }
+}
+
 // Tickets are [owner, generation, next input position, committed rows].
 extern "C" __global__ void latent_publication_begin(
     const Q38SequenceMeta* sequence, const uint32_t* generation,
