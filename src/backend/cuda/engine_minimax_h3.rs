@@ -662,6 +662,11 @@ impl AdalnTable {
 /// Initial FFN chunk ceiling before weight placement.
 const FFN_CHUNK_ROWS: usize = 1024;
 
+/// Live bytes still reserved for the image FFN workspace. Placement's device budget already reserved `total / 16`.
+fn ffn_live_reserve(transient: usize) -> usize {
+    transient
+}
+
 /// Rows per FFN chunk: `rows` split evenly over `ceil(rows / FFN_CHUNK_ROWS)` chunks, so the tail chunk holds at
 /// least `chunk - (chunks - 1)` rows.
 fn ffn_chunk(rows: usize) -> usize {
@@ -1809,6 +1814,16 @@ impl BlockWork {
         );
         self.fixed_lora = true;
         self.prepare::<LORA>(blas, spec)?;
+        for rows in [self.chunk, self.rows % self.chunk]
+            .into_iter()
+            .filter(|&rows| rows > 0)
+        {
+            blas.bind_lower_wave(crate::backend::setup::LinearShape {
+                rows,
+                output: spec.hidden,
+                input: spec.ffn,
+            })?;
+        }
         if self.rows > FFN_CHUNK_ROWS {
             self.ffn_cost::<LORA>(blas, spec, self.chunk, true)?;
         }
@@ -4551,10 +4566,8 @@ impl ImageDit {
                 None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, None)?,
             });
         }
-        let (free, total) = d.ctx.mem_get_info()?;
-        let reserve = (total / 16)
-            .checked_add(sizing.transient)
-            .context("FFN live reserve overflow")?;
+        let (free, _) = d.ctx.mem_get_info()?;
+        let reserve = ffn_live_reserve(sizing.transient);
         let budget = d.workspace_budget(free, free, reserve)?;
         let choices = work.ffn_choices::<false>(blas, spec, budget)?;
         let owned_plan = FfnPlan::select(&choices, budget)?;
@@ -5833,6 +5846,42 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    /// Image FFN live reserve is the transient only. At the logged free of 1_683_750_912 the selector takes chunk 2052;
+    /// subtracting `total / 16` again leaves 105_455_616 and takes chunk 1026.
+    #[test]
+    fn image_ffn_reserve_is_subtracted_once() -> Result<()> {
+        let rows = 4_103usize;
+        let initial = 821usize;
+        let element = 86_016usize;
+        let plan = |chunk: usize, tensor_cost: f64| FfnPlan {
+            chunk,
+            borrowed: false,
+            allocation: if chunk == initial { 0 } else { chunk * element },
+            workspace: 0,
+            tensor_cost,
+            launches: rows.div_ceil(chunk),
+        };
+        let choices = [
+            plan(4_103, 256.0 / 231.0),
+            plan(2_052, 128.0 / 119.0),
+            plan(1_368, 256.0 / 231.0),
+            plan(1_026, 256.0 / 189.0),
+            plan(821, 256.0 / 147.0),
+        ];
+        assert_eq!(ffn_live_reserve(0), 0);
+        assert_eq!(ffn_live_reserve(12), 12);
+        let logged_free = 1_683_750_912usize;
+        let total = 25_252_724_736usize;
+        let budget = logged_free - ffn_live_reserve(0);
+        assert_eq!(FfnPlan::select(&choices, budget)?.chunk, 2_052);
+        let doubled = logged_free - total / 16;
+        assert_eq!(doubled, 105_455_616);
+        assert_eq!(FfnPlan::select(&choices, doubled)?.chunk, 1_026);
+        assert!(choices[1].allocation <= budget);
+        assert!(choices[3].allocation <= doubled && choices[2].allocation > doubled);
         Ok(())
     }
 
