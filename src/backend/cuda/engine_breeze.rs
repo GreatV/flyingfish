@@ -1212,8 +1212,9 @@ fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
     let mlp_elems = (gemm_rows(text_rows, TEXT_H) * TEXT_I)
         .max(gemm_rows(geometry.backbone, BB_H) * BB_I)
         .max(gemm_rows(geometry.frames, DP_H) * DP_I);
-    let h_elems = workspace_rows * BB_H;
-    let kv_elems = BB_KV * geometry.backbone * BB_DIM;
+    let h_elems = (workspace_rows * BB_H).max(DP_ROWS * DP_H);
+    let kv_elems = (BB_KV * geometry.backbone * BB_DIM).max(DP_KV * DP_ROWS * DP_DIM);
+    let qkv_elems = (workspace_rows * (BB_Q + 2 * BB_KVW)).max(DP_ROWS * (DP_Q + 2 * DP_KVW));
     let mut lk = Vec::with_capacity(BB_LAYERS);
     let mut lv = Vec::with_capacity(BB_LAYERS);
     for _ in 0..BB_LAYERS {
@@ -1236,7 +1237,7 @@ fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
         gate: stream.alloc_zeros(mlp_elems)?,
         up: stream.alloc_zeros(mlp_elems)?,
         act: stream.alloc_zeros(mlp_elems)?,
-        qkv: stream.alloc_zeros(workspace_rows * (BB_Q + BB_KVW + BB_KVW))?,
+        qkv: stream.alloc_zeros(qkv_elems)?,
         k: stream.alloc_zeros(kv_elems)?,
         v: stream.alloc_zeros(kv_elems)?,
         lk,
@@ -3442,6 +3443,13 @@ impl Breeze {
             ref blas,
             ..
         } = *self;
+        let required_kv = DP_KV * DP_ROWS * DP_DIM;
+        ensure!(
+            buf.k.len() >= required_kv && buf.v.len() >= required_kv,
+            "shared depth KV capacity {}/{} below {required_kv}",
+            buf.k.len(),
+            buf.v.len()
+        );
         set_meta(k, &mut buf.meta, DP_ROWS)?;
         for frame in 0..frames {
             let cond_row = &cond[frame * BB_H..(frame + 1) * BB_H];
@@ -4483,6 +4491,29 @@ mod tests {
             "text output"
         );
         println!("BREEZE_DEFAULT_TEXT_SCRATCH PASS text_rows=652");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_depth_one_text_one_frame_shared_kv() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let runtime = RuntimeDir::with_prefix("n8-depth-shared-kv")?;
+        let mut model = super::Breeze::load_for_generation(&weights, &runtime.0, 0, 1, 1)?;
+        model.set_graph(false);
+        let cond = vec![0.0f32; super::BB_H];
+        let codes = vec![0i32; super::DP_ROWS];
+        let scores = model.depth(&cond, &codes, 1, false)?;
+        ensure!(scores.len() == super::HEAD_N * super::CODEBOOK as usize);
+        ensure!(scores.iter().all(|value| value.is_finite()), "depth scores");
+        println!(
+            "BREEZE_DEPTH_SHARED_KV PASS text_rows=1 frames=1 kv_elems={}",
+            super::DP_KV * super::DP_ROWS * super::DP_DIM
+        );
         Ok(())
     }
 
