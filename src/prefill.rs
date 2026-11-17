@@ -234,7 +234,6 @@ impl DensePlacement {
 /// At 8.0 GT/s and above the encoding is 128/130; below it is 8/10.
 pub(crate) fn pcie_payload_bytes_per_second(max_link_speed: &str, width: usize) -> Result<f64> {
     let head = max_link_speed
-        .trim()
         .split_whitespace()
         .next()
         .context("empty PCIe link speed")?;
@@ -389,11 +388,9 @@ mod tests {
         assert_eq!(two.resident_bytes + 2 * two.slot_bytes, 800);
         assert_eq!(three.resident_bytes + 3 * three.slot_bytes, 800);
         let mut sequence = 0usize;
-        for slot in &three.slots {
-            if let Some(slot) = slot {
-                assert_eq!(*slot, sequence % 3);
-                sequence += 1;
-            }
+        for slot in three.slots.iter().flatten() {
+            assert_eq!(*slot, sequence % 3);
+            sequence += 1;
         }
         assert_eq!(sequence, 5);
         Ok(())
