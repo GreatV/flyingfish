@@ -386,7 +386,7 @@ mod tests {
         assert!(diagnostics_enabled());
         with_verbose(true, || assert!(diagnostics_enabled()));
         assert!(diagnostics_enabled());
-        for _command in ["transcribe", "diarize", "embed"] {
+        for _command in ["transcribe", "diarize", "embed", "speak"] {
             with_verbose(false, || assert!(!diagnostics_enabled()));
             assert!(diagnostics_enabled());
         }

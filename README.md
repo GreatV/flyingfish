@@ -44,7 +44,7 @@ Speech (library entry points and CLI):
 | parakeet realtime EOU 120M | Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware streaming with a reset on end-of-utterance; `flyingfish::eou::Eou` and `transcribe`; offline subtitles are whole-clip only, streaming subtitles are per utterance | CUDA |
 | Nemotron-3-Diarization | Offline and streaming speaker diarization with an arrival-order speaker cache; `flyingfish::diarization::Diarization` and `diarize`; RTTM output with overlaps preserved | CUDA |
 | Multitalker Parakeet streaming 0.6B | Reads the `.nemo` container in place; 1-4 speaker lanes through the pre-encode, layer-0 speaker and background kernels, and 24 conformer layers with block-anchored attention windows; greedy RNNT decode over speaker-keyed hypotheses with per-lane prediction state; `transcribe --diar-model` runs it end to end (Nemotron-3-Diarization arrival-order channels 0-3 as the lanes, speaker kernels by default, `--masked` for lane masking, per-speaker text with word timestamps); a fifth active diarization channel errors instead of being dropped; kernel-mode free running diverges from the published wrapper's batch-1 pre-encode (measured 4.272e-4); `flyingfish::multitalker::Multitalker` | CUDA |
-| Breeze-TTS-2 | Text encoder, backbone and depth decoder; greedy decode over supplied audio-code frames with per-layer KV caches and CUDA-graph replay; audio tokenizer decode to a 24 kHz waveform; `flyingfish::backend::{Breeze, BreezeTokenizer}`. No sampling and no free-running text-to-speech entry | CUDA |
+| Breeze-TTS-2 | Text encoder, backbone and depth decoder; greedy decode over supplied audio-code frames with per-layer KV caches and CUDA-graph replay; published-config sampling for free-running text-to-speech with seeded Philox draws; audio tokenizer decode to a 24 kHz waveform; `flyingfish::breeze::speak` and the `speak` command | CUDA |
 
 Media generation (library entry points and CLI):
 
@@ -148,6 +148,9 @@ flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat c
 # Generate a MiniMax-H3-Image PNG, optionally with --expand or repeated --edit references.
 flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o cube.png --json
 
+# Synthesize Breeze-TTS-2 speech with the published sampling configuration.
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o speech.wav
+
 # Generate MiniMax-Music3 stereo audio from a caption and lyrics.
 flyingfish --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o song.wav
 ```
@@ -156,7 +159,8 @@ Common options:
 - MiniMax-H3 video requires a keyframe, a frame count and a seed. Requested frames round up to `17n+5`, so 136 resolves to 141; the published duration is 5-15 seconds at 24 fps. No documented frame-count or seed defaults exist.
 - MiniMax-H3-Image `image` requires a prompt, `WIDTHxHEIGHT` size and seed. `--expand <dir>` replaces the prompt through the expander; repeated `--edit <image>` supplies upright RGB8 references. Output is PNG at the requested size, and `--json` reports size, seed and reference count.
 - MiniMax-Music3 `music` requires a caption, lyrics and seed. `--frames` defaults to 1500 (60 seconds at 25 fps); output is stereo 44.1 kHz PCM16 WAV, or WAV bytes to stdout when `-o` is omitted.
-- Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video, image, music, transcribe, diarize and embed default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
+- Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video, image, speak, music, transcribe, diarize and embed default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
+- Breeze-TTS-2 `speak` uses the plain `[S0]` prompt and reads `generation_config.json`: temperature 0.9 for backbone and depth, top-k 50 and top-p 1.0 from the omitted library defaults, repetition penalty 1.1 on generated backbone codebook-0 tokens, at most 750 frames, and backbone EOS 2051. The default seed is 42. Output is mono 24 kHz PCM16 WAV; omit `-o` to write WAV bytes to stdout.
 - `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
 - `--draft-model <dir>` enables a DSpark draft model.
 - `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8, GLM-5.3-Flash); 0 selects plain decoding. GLM-5.3-Flash drafts one token per round at any nonzero depth. MTP decode is CUDA-only, so ROCm builds need `--mtp 0` for such checkpoints.

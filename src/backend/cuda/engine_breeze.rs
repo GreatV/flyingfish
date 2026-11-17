@@ -20,7 +20,7 @@ use crate::backend::gpu::{
 };
 use crate::backend::setup::LinearShape;
 use crate::checkpoint::MappedCheckpoint;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use safetensors::Dtype;
 use std::cell::{Cell, RefCell};
@@ -53,6 +53,33 @@ const BB_DIM: usize = 128;
 const BB_Q: usize = BB_HEADS * BB_DIM;
 const BB_KVW: usize = BB_KV * BB_DIM;
 const BB_MAX: usize = 716;
+const BB_POSITION_MAX: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct Geometry {
+    backbone: usize,
+    frames: usize,
+}
+
+const GREEDY_GEOMETRY: Geometry = Geometry {
+    backbone: BB_MAX,
+    frames: DP_FRAMES,
+};
+
+fn generation_geometry(text_rows: usize, max_new_tokens: usize) -> Result<Geometry> {
+    ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
+    ensure!(max_new_tokens > 0, "generation token limit is zero");
+    let available = BB_POSITION_MAX
+        .checked_sub(text_rows)
+        .context("text prompt exceeds backbone positions")?;
+    let frames = max_new_tokens.min(available);
+    ensure!(frames > 0, "no generation frames remain");
+    Ok(Geometry {
+        backbone: text_rows + frames,
+        frames,
+    })
+}
+
 const BB_EPS: f32 = 1e-6;
 const BB_VOCAB: usize = 2052;
 
@@ -75,18 +102,7 @@ const AUDIO: i32 = 262_144;
 #[cfg(test)]
 const AUDIO_EOS: i32 = 262_145;
 
-const H_ELEMS: usize = BB_MAX * BB_H;
-const D_ELEMS: usize = BB_MAX * BB_VOCAB;
-const MLP_ELEMS: usize = TEXT_MAX * TEXT_I;
-const QKV_ELEMS: usize = BB_MAX * (BB_Q + BB_KVW + BB_KVW);
-const KV_ELEMS: usize = BB_KV * BB_MAX * BB_DIM;
-const ATTN_ELEMS: usize = H_ELEMS;
-const AUDIO_ELEMS: usize = DP_FRAMES * BB_H;
-const STACK_ELEMS: usize = DP_FRAMES * DP_ROWS * DP_H;
-const HEAD_IN_ELEMS: usize = DP_FRAMES * DP_H;
-const HEAD_OUT_ELEMS: usize = DP_FRAMES * (CODEBOOK as usize);
 const EMBED_WS: usize = 17 * BB_H;
-const IDS_ELEMS: usize = DP_FRAMES * BOOKS;
 
 pub fn gemm_rows(logical: usize, input: usize) -> usize {
     if super::linear_calibrate::supports(LinearShape {
@@ -239,18 +255,25 @@ struct Weights {
 
 struct Kern {
     stream: Arc<CudaStream>,
+    geometry: Geometry,
     ops: Ops,
     common: CommonOpsRef,
     rope_one_plus: CudaFunction,
     rope_cast: CudaFunction,
     rope_skip: CudaFunction,
     embed_rows_sum: CudaFunction,
+    embed_code: CudaFunction,
     residual_scale: CudaFunction,
+    distribution: CudaFunction,
+    categorical: CudaFunction,
     table_slide: CudaSlice<bf16>,
     table_full: CudaSlice<bf16>,
     table_identity: CudaSlice<bf16>,
     table_backbone: CudaSlice<bf16>,
     table_depth: CudaSlice<bf16>,
+    depth_starts: CudaSlice<i32>,
+    depth_meta_one: CudaSlice<i32>,
+    depth_meta_two: CudaSlice<i32>,
     drains: Cell<u64>,
     h2d: Cell<u64>,
     d2h: Cell<u64>,
@@ -271,6 +294,7 @@ struct Kern {
 enum Replay {
     Step,
     Depth,
+    DepthSample,
     Prefill(usize),
     Text(usize),
 }
@@ -278,6 +302,7 @@ enum Replay {
 struct Captured {
     step: Option<CudaGraph>,
     depth: Option<CudaGraph>,
+    depth_sample: Option<CudaGraph>,
     prefill: Vec<(usize, CudaGraph)>,
     text: Vec<(usize, CudaGraph)>,
 }
@@ -287,6 +312,7 @@ impl Captured {
         match kind {
             Replay::Step => self.step.is_some(),
             Replay::Depth => self.depth.is_some(),
+            Replay::DepthSample => self.depth_sample.is_some(),
             Replay::Prefill(rows) => self.prefill.iter().any(|(n, _)| *n == rows),
             Replay::Text(rows) => self.text.iter().any(|(n, _)| *n == rows),
         }
@@ -296,6 +322,7 @@ impl Captured {
         match kind {
             Replay::Step => self.step.as_ref(),
             Replay::Depth => self.depth.as_ref(),
+            Replay::DepthSample => self.depth_sample.as_ref(),
             Replay::Prefill(rows) => self
                 .prefill
                 .iter()
@@ -309,6 +336,7 @@ impl Captured {
         match kind {
             Replay::Step => self.step = Some(graph),
             Replay::Depth => self.depth = Some(graph),
+            Replay::DepthSample => self.depth_sample = Some(graph),
             Replay::Prefill(rows) => self.prefill.push((rows, graph)),
             Replay::Text(rows) => self.text.push((rows, graph)),
         }
@@ -329,6 +357,8 @@ struct Buf {
     lv: Vec<CudaSlice<bf16>>,
     dk: CudaSlice<bf16>,
     dv: CudaSlice<bf16>,
+    ldk: Vec<CudaSlice<bf16>>,
+    ldv: Vec<CudaSlice<bf16>>,
     attn: CudaSlice<bf16>,
     audio: CudaSlice<bf16>,
     stack: CudaSlice<bf16>,
@@ -340,6 +370,9 @@ struct Buf {
     tok: CudaSlice<u32>,
     ids: CudaSlice<i32>,
     picked: CudaSlice<u32>, // slot 0 backbone, slots 1..15 depth heads
+    probabilities: CudaSlice<f32>,
+    backbone_history: CudaSlice<i32>,
+    sample_counters: CudaSlice<u64>,
 }
 
 struct Flashes {
@@ -351,7 +384,6 @@ struct Flashes {
 }
 
 pub struct Breeze {
-    device: Device,
     w: Weights,
     k: Kern,
     flash: Flashes,
@@ -371,6 +403,7 @@ enum RopeKind {
 enum KvSlot {
     Shared,
     Depth,
+    DepthLayer(usize),
     Layer(usize),
 }
 
@@ -473,6 +506,7 @@ fn replay_d2d(kind: Replay) -> u64 {
     match kind {
         Replay::Step => (BB_H * 2) as u64,
         Replay::Depth => depth_d2d_bytes(),
+        Replay::DepthSample => depth_sample_d2d_bytes(),
         Replay::Prefill(_) | Replay::Text(_) => 0,
     }
 }
@@ -741,6 +775,29 @@ fn rope(
             },
             g,
         ),
+        KvSlot::DepthLayer(index) => {
+            let Buf {
+                qkv,
+                ldk,
+                ldv,
+                start,
+                ..
+            } = buf;
+            ensure!(index < ldk.len() && index < ldv.len(), "depth layer cache");
+            rope_launch(
+                k,
+                RopeBind {
+                    qkv,
+                    cache_k: &mut ldk[index],
+                    cache_v: &mut ldv[index],
+                    start,
+                    qn,
+                    kn,
+                    table,
+                },
+                g,
+            )
+        }
         KvSlot::Layer(index) => {
             let Buf {
                 qkv, lk, lv, start, ..
@@ -928,6 +985,98 @@ fn argmax_heads(k: &Kern, buf: &mut Buf) -> Result<()> {
     Ok(())
 }
 
+fn depth_sample_counter(frame: usize) -> u64 {
+    frame as u64 * HEAD_N as u64
+}
+
+struct SampleRequest {
+    source_start: usize,
+    picked_start: usize,
+    rows: usize,
+    vocab: usize,
+    sampling: crate::sampling::Sampling,
+    seed: u64,
+    stream: u64,
+    counter_index: usize,
+    allow: i32,
+    repetition: bool,
+}
+
+fn sample_rows(
+    k: &Kern,
+    logits: &CudaSlice<bf16>,
+    probabilities: &mut CudaSlice<f32>,
+    picked: &mut CudaSlice<u32>,
+    backbone_history: &mut CudaSlice<i32>,
+    sample_counters: &CudaSlice<u64>,
+    request: SampleRequest,
+) -> Result<()> {
+    let elements = request
+        .rows
+        .checked_mul(request.vocab)
+        .context("sampling rows")?;
+    ensure!(
+        request.source_start + elements <= logits.len() && elements <= probabilities.len(),
+        "sampling logits extent"
+    );
+    ensure!(
+        request.picked_start + request.rows <= picked.len(),
+        "sampling token extent"
+    );
+    ensure!(
+        backbone_history.len() >= request.vocab,
+        "sampling history extent"
+    );
+    ensure!(
+        request.counter_index + request.rows <= sample_counters.len(),
+        "sampling counter extent"
+    );
+    let counter = sample_counters.slice(request.counter_index..request.counter_index + 1);
+    let source = logits.slice(request.source_start..request.source_start + elements);
+    let mut probs = probabilities.slice_mut(..elements);
+    let mut out = picked.slice_mut(request.picked_start..request.picked_start + request.rows);
+    let rows_i = i32::try_from(request.rows)?;
+    let vocab_i = i64::try_from(request.vocab)?;
+    let top_k = i32::try_from(request.sampling.top_k)?;
+    let repetition_penalty = if request.repetition {
+        request.sampling.repetition_penalty
+    } else {
+        1.0
+    };
+    let track_history = request.repetition as i32;
+    unsafe {
+        k.stream
+            .launch_builder(&k.distribution)
+            .arg(&source)
+            .arg(&mut probs)
+            .arg(&rows_i)
+            .arg(&vocab_i)
+            .arg(&request.sampling.temperature)
+            .arg(&top_k)
+            .arg(&request.sampling.top_p)
+            .arg(&*backbone_history)
+            .arg(&repetition_penalty)
+            .arg(&2048i32)
+            .arg(&2050i32)
+            .arg(&request.allow)
+            .launch(ops::grid(request.rows, 256u32))?;
+        k.stream
+            .launch_builder(&k.categorical)
+            .arg(&mut probs)
+            .arg(&mut out)
+            .arg(&rows_i)
+            .arg(&vocab_i)
+            .arg(&request.seed)
+            .arg(&request.stream)
+            .arg(&counter)
+            .arg(&256i32)
+            .arg(backbone_history)
+            .arg(&track_history)
+            .launch(ops::grid(request.rows, 256u32))?;
+    }
+    Ok(())
+}
+
 fn take_backbone_id(ids: &mut Vec<u32>, id: u32) -> Result<()> {
     ensure!((id as usize) < BB_VOCAB, "backbone id {id}");
     ids.push(id);
@@ -1057,38 +1206,60 @@ fn load_matrix(
     upload(stream, &host, bytes)
 }
 
-fn alloc_buf(stream: &Arc<CudaStream>) -> Result<Buf> {
+fn alloc_buf(stream: &Arc<CudaStream>, geometry: Geometry) -> Result<Buf> {
+    let workspace_rows = geometry.backbone.max(17);
+    let text_rows = geometry.backbone - geometry.frames;
+    let mlp_elems = (gemm_rows(text_rows, TEXT_H) * TEXT_I)
+        .max(gemm_rows(geometry.backbone, BB_H) * BB_I)
+        .max(gemm_rows(geometry.frames, DP_H) * DP_I);
+    let h_elems = (workspace_rows * BB_H).max(DP_ROWS * DP_H);
+    let kv_elems = (BB_KV * geometry.backbone * BB_DIM).max(DP_KV * DP_ROWS * DP_DIM);
+    let qkv_elems = (workspace_rows * (BB_Q + 2 * BB_KVW)).max(DP_ROWS * (DP_Q + 2 * DP_KVW));
     let mut lk = Vec::with_capacity(BB_LAYERS);
     let mut lv = Vec::with_capacity(BB_LAYERS);
     for _ in 0..BB_LAYERS {
-        lk.push(stream.alloc_zeros(KV_ELEMS)?);
-        lv.push(stream.alloc_zeros(KV_ELEMS)?);
+        lk.push(stream.alloc_zeros(kv_elems)?);
+        lv.push(stream.alloc_zeros(kv_elems)?);
     }
+    let depth_kv_elems = DP_KV * DP_ROWS * DP_DIM;
+    let mut ldk = Vec::with_capacity(DP_LAYERS);
+    let mut ldv = Vec::with_capacity(DP_LAYERS);
+    for _ in 0..DP_LAYERS {
+        ldk.push(stream.alloc_zeros(depth_kv_elems)?);
+        ldv.push(stream.alloc_zeros(depth_kv_elems)?);
+    }
+    let head_in_rows = geometry.frames.max(gemm_rows(1, DP_H));
+    let head_out_rows = geometry.frames.max(gemm_rows(1, DP_H) + HEAD_N);
     Ok(Buf {
-        h: stream.alloc_zeros(H_ELEMS)?,
-        n: stream.alloc_zeros(H_ELEMS)?,
-        d: stream.alloc_zeros(D_ELEMS)?,
-        gate: stream.alloc_zeros(MLP_ELEMS)?,
-        up: stream.alloc_zeros(MLP_ELEMS)?,
-        act: stream.alloc_zeros(MLP_ELEMS)?,
-        qkv: stream.alloc_zeros(QKV_ELEMS)?,
-        k: stream.alloc_zeros(KV_ELEMS)?,
-        v: stream.alloc_zeros(KV_ELEMS)?,
+        h: stream.alloc_zeros(h_elems)?,
+        n: stream.alloc_zeros(h_elems)?,
+        d: stream.alloc_zeros(workspace_rows * BB_VOCAB)?,
+        gate: stream.alloc_zeros(mlp_elems)?,
+        up: stream.alloc_zeros(mlp_elems)?,
+        act: stream.alloc_zeros(mlp_elems)?,
+        qkv: stream.alloc_zeros(qkv_elems)?,
+        k: stream.alloc_zeros(kv_elems)?,
+        v: stream.alloc_zeros(kv_elems)?,
         lk,
         lv,
         dk: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
         dv: stream.alloc_zeros(DP_KV * DP_ROWS * DP_DIM)?,
-        attn: stream.alloc_zeros(ATTN_ELEMS)?,
-        audio: stream.alloc_zeros(AUDIO_ELEMS)?,
-        stack: stream.alloc_zeros(STACK_ELEMS)?,
-        head_in: stream.alloc_zeros(HEAD_IN_ELEMS)?,
-        head_out: stream.alloc_zeros(HEAD_OUT_ELEMS)?,
+        ldk,
+        ldv,
+        attn: stream.alloc_zeros(h_elems)?,
+        audio: stream.alloc_zeros(geometry.frames * BB_H)?,
+        stack: stream.alloc_zeros(geometry.frames * DP_ROWS * DP_H)?,
+        head_in: stream.alloc_zeros(head_in_rows * DP_H)?,
+        head_out: stream.alloc_zeros(head_out_rows * (CODEBOOK as usize))?,
         embed_ws: stream.alloc_zeros(EMBED_WS)?,
         meta: stream.alloc_zeros(8)?,
         start: stream.alloc_zeros(1)?,
         tok: stream.alloc_zeros(TEXT_MAX)?,
-        ids: stream.alloc_zeros(IDS_ELEMS)?,
+        ids: stream.alloc_zeros(geometry.frames * BOOKS)?,
         picked: stream.alloc_zeros(BOOKS)?,
+        probabilities: stream.alloc_zeros(BOOKS * BB_VOCAB)?,
+        backbone_history: stream.alloc_zeros(BB_VOCAB)?,
+        sample_counters: stream.alloc_zeros(HEAD_N)?,
     })
 }
 
@@ -1605,6 +1776,18 @@ fn attend(k: &Kern, buf: &mut Buf, blas: &Blas, call: Attn<'_>) -> Result<()> {
             call.flash
                 .run(&buf.qkv, q_width, &buf.dk, &buf.dv, &mut buf.attn, shape)?;
         }
+        KvSlot::DepthLayer(index) => {
+            let Buf {
+                qkv,
+                ldk,
+                ldv,
+                attn,
+                ..
+            } = buf;
+            ensure!(index < ldk.len() && index < ldv.len(), "depth layer cache");
+            call.flash
+                .run(qkv, q_width, &ldk[index], &ldv[index], attn, shape)?;
+        }
         KvSlot::Layer(index) => {
             let Buf {
                 qkv, lk, lv, attn, ..
@@ -1947,7 +2130,7 @@ fn sum_audio(
     rows: usize,
 ) -> Result<Vec<bf16>> {
     ensure!(codes.len() == rows * BOOKS, "audio code length");
-    ensure!(rows > 0 && rows <= DP_FRAMES, "audio rows {rows}");
+    ensure!(rows > 0 && rows <= k.geometry.frames, "audio rows {rows}");
     for &id in codes {
         ensure!((0..CODEBOOK).contains(&id), "audio code {id}");
     }
@@ -1957,16 +2140,16 @@ fn sum_audio(
     Ok(wide.into_iter().map(bf16::from_f32).collect())
 }
 
-fn check_positions(positions: &Positions) -> Result<()> {
+fn check_positions(positions: &Positions, geometry: Geometry) -> Result<()> {
     let Positions {
         text,
         audio,
         eos,
         seq,
     } = positions;
-    ensure!((1..=BB_MAX).contains(seq), "seq {seq}");
+    ensure!((1..=geometry.backbone).contains(seq), "seq {seq}");
     ensure!(
-        text.len() <= TEXT_MAX && audio.len() <= DP_FRAMES,
+        text.len() <= TEXT_MAX && audio.len() <= geometry.frames,
         "position counts"
     );
     let mut seen = vec![0u8; *seq];
@@ -2284,7 +2467,7 @@ fn backbone_rows(
     let end = usize::try_from(pass.origin)?
         .checked_add(pass.rows)
         .context("backbone cache")?;
-    ensure!(end <= BB_MAX, "backbone cache");
+    ensure!(end <= k.geometry.backbone, "backbone cache");
     ensure!(pass.layers.len() == BB_LAYERS, "backbone layers");
     set_meta(k, &mut buf.meta, pass.rows)?;
     upload_origin(k, &mut buf.start, pass.origin)?;
@@ -2318,7 +2501,7 @@ fn backbone_rows(
                     kind: RopeKind::Cast,
                     geom,
                     origin: pass.origin,
-                    capacity: BB_MAX,
+                    capacity: k.geometry.backbone,
                     slot: KvSlot::Layer(index),
                 },
             )?;
@@ -2509,12 +2692,280 @@ fn depth_step(
     download_elems(k, &buf.head_out, pack, packed)
 }
 
+fn depth_sample_d2d_bytes() -> u64 {
+    (HEAD_N * 9 * 4) as u64
+}
+
+fn stage_depth_runtime(k: &Kern, buf: &mut Buf, rows: usize, start: usize) -> Result<()> {
+    if k.graph_on.get() {
+        let meta = match rows {
+            1 => &k.depth_meta_one,
+            2 => &k.depth_meta_two,
+            _ => bail!("depth sample rows {rows}"),
+        };
+        copy_d2d(k, meta, &mut buf.meta)?;
+        copy_d2d(k, &k.depth_starts.slice(start..start + 1), &mut buf.start)
+    } else {
+        set_meta(k, &mut buf.meta, rows)?;
+        upload_origin(k, &mut buf.start, i32::try_from(start)?)
+    }
+}
+
+struct DepthSampleRun<'a> {
+    layers: &'a [DecoderLayer],
+    norm: &'a CudaSlice<bf16>,
+    projector: &'a CudaSlice<bf16>,
+    table: &'a CudaSlice<bf16>,
+    flash: &'a mut Flash,
+    rows: usize,
+    start: usize,
+}
+
+fn depth_sample_transform(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    run: DepthSampleRun<'_>,
+) -> Result<()> {
+    let DepthSampleRun {
+        layers,
+        norm,
+        projector,
+        table,
+        flash,
+        rows,
+        start,
+    } = run;
+    gemm(
+        k,
+        blas,
+        Gemm {
+            w: projector,
+            x: &mut buf.embed_ws,
+            y: &mut buf.h,
+            x_off: 0,
+            y_off: 0,
+            logical: rows,
+            output: DP_H,
+            input: BB_H,
+        },
+    )?;
+    let geom = DecGeom {
+        rows,
+        hidden: DP_H,
+        intermediate: DP_I,
+        q_heads: DP_HEADS,
+        kv_heads: DP_KV,
+        dim: DP_DIM,
+        eps: DP_EPS,
+    };
+    for (index, layer) in layers.iter().enumerate() {
+        decoder_layer(
+            k,
+            buf,
+            blas,
+            DecPass {
+                layer,
+                table,
+                flash: &mut *flash,
+                kind: RopeKind::Skip,
+                geom,
+                origin: i32::try_from(start)?,
+                capacity: DP_ROWS,
+                slot: KvSlot::DepthLayer(index),
+            },
+        )?;
+    }
+    rms(
+        k,
+        &buf.meta,
+        Rms {
+            x: &buf.h,
+            y: &mut buf.n,
+            w: norm,
+            rows,
+            width: DP_H,
+            mode: RmsMode::Standard,
+            eps: DP_EPS,
+        },
+    )
+}
+
+struct DepthSampleHead<'a> {
+    weight: &'a CudaSlice<bf16>,
+    head: usize,
+    hidden_row: usize,
+    counter_index: usize,
+    sampling: crate::sampling::Sampling,
+    seed: u64,
+}
+
+fn depth_sample_head(
+    k: &Kern,
+    buf: &mut Buf,
+    blas: &Blas,
+    call: DepthSampleHead<'_>,
+) -> Result<()> {
+    ensure!(
+        call.head < HEAD_N && call.hidden_row < DP_ROWS,
+        "depth sample head"
+    );
+    gemm(
+        k,
+        blas,
+        Gemm {
+            w: call.weight,
+            x: &mut buf.n,
+            y: &mut buf.head_out,
+            x_off: call.hidden_row * DP_H,
+            y_off: 0,
+            logical: 1,
+            output: CODEBOOK as usize,
+            input: DP_H,
+        },
+    )?;
+    sample_rows(
+        k,
+        &buf.head_out,
+        &mut buf.probabilities,
+        &mut buf.picked,
+        &mut buf.backbone_history,
+        &buf.sample_counters,
+        SampleRequest {
+            source_start: 0,
+            picked_start: call.head + 1,
+            rows: 1,
+            vocab: CODEBOOK as usize,
+            sampling: call.sampling,
+            seed: call.seed,
+            stream: 1,
+            counter_index: call.counter_index,
+            allow: -1,
+            repetition: false,
+        },
+    )
+}
+
+fn embed_sampled(
+    k: &Kern,
+    buf: &mut Buf,
+    weight: &CudaSlice<bf16>,
+    code_slot: usize,
+    book: usize,
+    row: usize,
+) -> Result<()> {
+    ensure!(
+        code_slot < BOOKS && book < HEAD_N && row < DP_ROWS,
+        "sampled embed"
+    );
+    let code = buf.picked.slice(code_slot..code_slot + 1);
+    let mut out = buf.embed_ws.slice_mut(row * BB_H..(row + 1) * BB_H);
+    let offset = i32::try_from(book * CODEBOOK as usize)?;
+    unsafe {
+        k.stream
+            .launch_builder(&k.embed_code)
+            .arg(weight)
+            .arg(&code)
+            .arg(&mut out)
+            .arg(&offset)
+            .arg(&CODEBOOK)
+            .arg(&(BB_H as i32))
+            .arg(&1i32)
+            .launch(ops::flat(BB_H))?;
+    }
+    Ok(())
+}
+
+struct DepthSample<'a> {
+    w: &'a Weights,
+    flash: &'a mut Flash,
+    cond: &'a [f32],
+    frame: usize,
+    sampling: crate::sampling::Sampling,
+    seed: u64,
+}
+
+fn sample_depth(k: &Kern, buf: &mut Buf, blas: &Blas, step: DepthSample<'_>) -> Result<()> {
+    stage_depth_cond(k, buf, step.cond)?;
+    let flash = &mut *step.flash;
+    let counters = (0..HEAD_N)
+        .map(|head| depth_sample_counter(step.frame) + head as u64)
+        .collect::<Vec<_>>();
+    k.stream.memcpy_htod(&counters, &mut buf.sample_counters)?;
+    k.h2d
+        .set(k.h2d.get() + (HEAD_N * std::mem::size_of::<u64>()) as u64);
+    with_graph(k, Replay::DepthSample, || {
+        embed_sampled(k, buf, &step.w.audio, 0, 0, 1)?;
+        stage_depth_runtime(k, buf, 2, 0)?;
+        depth_sample_transform(
+            k,
+            buf,
+            blas,
+            DepthSampleRun {
+                layers: &step.w.depth,
+                norm: &step.w.depth_norm,
+                projector: &step.w.projector,
+                table: &k.table_depth,
+                flash: &mut *flash,
+                rows: 2,
+                start: 0,
+            },
+        )?;
+        depth_sample_head(
+            k,
+            buf,
+            blas,
+            DepthSampleHead {
+                weight: &step.w.heads[0],
+                head: 0,
+                hidden_row: 1,
+                counter_index: 0,
+                sampling: step.sampling,
+                seed: step.seed,
+            },
+        )?;
+        for head in 1..HEAD_N {
+            embed_sampled(k, buf, &step.w.audio, head, head, 0)?;
+            stage_depth_runtime(k, buf, 1, head + 1)?;
+            depth_sample_transform(
+                k,
+                buf,
+                blas,
+                DepthSampleRun {
+                    layers: &step.w.depth,
+                    norm: &step.w.depth_norm,
+                    projector: &step.w.projector,
+                    table: &k.table_depth,
+                    flash: &mut *flash,
+                    rows: 1,
+                    start: head + 1,
+                },
+            )?;
+            depth_sample_head(
+                k,
+                buf,
+                blas,
+                DepthSampleHead {
+                    weight: &step.w.heads[head],
+                    head,
+                    hidden_row: 0,
+                    counter_index: head,
+                    sampling: step.sampling,
+                    seed: step.seed,
+                },
+            )?;
+        }
+        Ok(())
+    })
+}
+
 fn decode_shape(
     projected: &[f32],
     cond: &[f32],
     text_rows: usize,
     fed: &[i32],
     frames: &[i32],
+    geometry: Geometry,
 ) -> Result<(usize, usize)> {
     ensure!(fed.len().is_multiple_of(BOOKS), "fed codes");
     ensure!(frames.len().is_multiple_of(BOOKS), "depth codes");
@@ -2522,7 +2973,7 @@ fn decode_shape(
     let audio_steps = fed.len() / BOOKS;
     let depth_frames = frames.len() / BOOKS;
     ensure!(
-        (1..=DP_FRAMES).contains(&depth_frames),
+        (1..=geometry.frames).contains(&depth_frames),
         "frames {depth_frames}"
     );
     ensure!(cond.len() == depth_frames * BB_H, "cond length");
@@ -2531,7 +2982,10 @@ fn decode_shape(
         audio_steps >= 1 && depth_frames >= audio_steps,
         "decode steps"
     );
-    ensure!(text_rows + audio_steps <= BB_MAX, "decode length");
+    ensure!(
+        text_rows + audio_steps <= geometry.backbone,
+        "decode length"
+    );
     ensure!(projected.len() == text_rows * BB_H, "projected length");
     ensure!(
         projected.iter().all(|value| value.is_finite()),
@@ -2562,14 +3016,29 @@ struct GreedyOut {
 }
 
 impl Breeze {
-    fn bound_device(&self) -> Result<()> {
-        ensure!(self.device.ctx.ordinal() == 0, "device ordinal");
-        Ok(())
+    pub fn load(weights: &Path, runtime: &Path) -> Result<Self> {
+        Self::load_geometry(weights, runtime, GREEDY_GEOMETRY, 0)
     }
 
-    pub fn load(weights: &Path, runtime: &Path) -> Result<Self> {
+    pub fn load_for_generation(
+        weights: &Path,
+        runtime: &Path,
+        ordinal: usize,
+        text_rows: usize,
+        max_new_tokens: usize,
+    ) -> Result<Self> {
+        let geometry = generation_geometry(text_rows, max_new_tokens)?;
+        Self::load_geometry(weights, runtime, geometry, ordinal)
+    }
+
+    fn load_geometry(
+        weights: &Path,
+        runtime: &Path,
+        geometry: Geometry,
+        ordinal: usize,
+    ) -> Result<Self> {
         ensure!(runtime.is_dir(), "runtime directory");
-        let device = Device::new(0)?;
+        let device = Device::new(ordinal)?;
         // Two streams enable event waits. Capture rejects a wait recorded outside it.
         unsafe {
             device.ctx.disable_event_tracking();
@@ -2579,11 +3048,15 @@ impl Breeze {
         let rope_module = cubin::module(&device.ctx, "rope")?;
         let embed_module = cubin::module(&device.ctx, "embed")?;
         let act_module = cubin::module(&device.ctx, "act")?;
+        let sample_module = cubin::module(&device.ctx, "sample")?;
         let rope_one_plus = rope_module.load_function("qknorm_rope_table_kv_one_plus")?;
         let rope_cast = rope_module.load_function("qknorm_rope_table_kv_cast")?;
         let rope_skip = rope_module.load_function("qknorm_rope_table_kv_skip")?;
         let embed_rows_sum = embed_module.load_function("embed_rows_sum")?;
+        let embed_code = embed_module.load_function("embed_code_broadcast")?;
         let residual_scale = act_module.load_function("residual_scale")?;
+        let distribution = sample_module.load_function("distribution_rows_bf16")?;
+        let categorical = sample_module.load_function("categorical_sample_rows")?;
         let stream = device.stream.clone();
         let table_slide = upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(false))?;
         let table_full = upload_table(&stream, TEXT_POSITIONS, TEXT_DIM, text_rope_law(true))?;
@@ -2592,7 +3065,7 @@ impl Breeze {
         stream.synchronize()?;
         let table_backbone = upload_table(
             &stream,
-            BB_MAX,
+            geometry.backbone,
             BB_DIM,
             RopeLaw::Plain {
                 theta: 1_000_000.0,
@@ -2600,6 +3073,10 @@ impl Breeze {
             },
         )?;
         let table_depth = upload_table(&stream, DP_ROWS, DP_DIM, RopeLaw::Llama3)?;
+        let depth_starts = stream.clone_htod(&(0..i32::try_from(DP_ROWS)?).collect::<Vec<_>>())?;
+        let depth_meta_one = stream.clone_htod(&[0, 1, 1, 1, 1, 0, 0, 0])?;
+        let depth_meta_two = stream.clone_htod(&[0, 2, 2, 2, 1, 0, 0, 0])?;
+        stream.synchronize()?;
         let (slide_left, slide_right) = flash::window_radii(512);
         ensure!(slide_left == 255 && slide_right == 256, "window radii");
         let text_full = Flash::new(stream.clone(), TEXT_MAX, TEXT_HEADS, TEXT_KV, TEXT_DIM)
@@ -2618,12 +3095,13 @@ impl Breeze {
             TEXT_MAX,
         )
         .context("text sliding attention")?;
-        let mut backbone_flash = Flash::new(stream.clone(), BB_MAX, BB_HEADS, BB_KV, BB_DIM)
-            .context("backbone attention")?;
+        let mut backbone_flash =
+            Flash::new(stream.clone(), geometry.backbone, BB_HEADS, BB_KV, BB_DIM)
+                .context("backbone attention")?;
         let mut depth_flash = Flash::new(stream.clone(), DP_ROWS, DP_HEADS, DP_KV, DP_DIM)
             .context("depth attention")?;
-        let buf = alloc_buf(&stream)?;
-        backbone_flash.bind_position(&buf.start, BB_MAX - 1)?;
+        let buf = alloc_buf(&stream, geometry)?;
+        backbone_flash.bind_position(&buf.start, geometry.backbone - 1)?;
         depth_flash.bind_position(&buf.start, DP_ROWS - 1)?;
         let closure = Rc::new(Closure::new(false, "breeze-m0".to_string()));
         let mut blas = Blas::new(&device, &ops, runtime, Rc::clone(&closure))?;
@@ -2634,22 +3112,28 @@ impl Breeze {
         drop(ckpt);
         eprintln!("weight_bytes={weight_bytes}");
         Ok(Self {
-            device,
             w,
             k: Kern {
                 stream,
+                geometry,
                 ops,
                 common,
                 rope_one_plus,
                 rope_cast,
                 rope_skip,
                 embed_rows_sum,
+                embed_code,
                 residual_scale,
+                distribution,
+                categorical,
                 table_slide,
                 table_full,
                 table_identity,
                 table_backbone,
                 table_depth,
+                depth_starts,
+                depth_meta_one,
+                depth_meta_two,
                 drains: Cell::new(0),
                 h2d: Cell::new(0),
                 d2h: Cell::new(0),
@@ -2659,6 +3143,7 @@ impl Breeze {
                 captured: RefCell::new(Captured {
                     step: None,
                     depth: None,
+                    depth_sample: None,
                     prefill: Vec::new(),
                     text: Vec::new(),
                 }),
@@ -2684,7 +3169,6 @@ impl Breeze {
     }
 
     pub fn text(&mut self, token_ids: &[u32], plant: TextPlant) -> Result<Vec<f32>> {
-        self.bound_device()?;
         let rows = token_ids.len();
         ensure!((1..=TEXT_MAX).contains(&rows), "text rows {rows}");
         ensure!(
@@ -2779,7 +3263,6 @@ impl Breeze {
     }
 
     pub fn sliding_layer(&mut self, hidden: &[f32], plant: TextPlant) -> Result<Vec<f32>> {
-        self.bound_device()?;
         ensure!(
             matches!(plant, TextPlant::Nominal | TextPlant::WindowIgnored),
             "sliding plant"
@@ -2828,8 +3311,7 @@ impl Breeze {
         codes: &[i32],
         plant_audio: bool,
     ) -> Result<Vec<f32>> {
-        self.bound_device()?;
-        check_positions(positions)?;
+        check_positions(positions, self.k.geometry)?;
         ensure!(
             projected.len() == positions.text.len() * BB_H,
             "projected length"
@@ -2938,8 +3420,10 @@ impl Breeze {
         frames: usize,
         plant_head: bool,
     ) -> Result<Vec<f32>> {
-        self.bound_device()?;
-        ensure!((1..=DP_FRAMES).contains(&frames), "frames {frames}");
+        ensure!(
+            (1..=self.k.geometry.frames).contains(&frames),
+            "frames {frames}"
+        );
         ensure!(cond.len() == frames * BB_H, "cond length");
         ensure!(codes.len() == frames * DP_ROWS, "depth code length");
         ensure!(
@@ -2959,6 +3443,13 @@ impl Breeze {
             ref blas,
             ..
         } = *self;
+        let required_kv = DP_KV * DP_ROWS * DP_DIM;
+        ensure!(
+            buf.k.len() >= required_kv && buf.v.len() >= required_kv,
+            "shared depth KV capacity {}/{} below {required_kv}",
+            buf.k.len(),
+            buf.v.len()
+        );
         set_meta(k, &mut buf.meta, DP_ROWS)?;
         for frame in 0..frames {
             let cond_row = &cond[frame * BB_H..(frame + 1) * BB_H];
@@ -2981,6 +3472,114 @@ impl Breeze {
             )?;
         }
         depth_heads(k, buf, blas, &w.heads, frames, plant_head)
+    }
+
+    pub fn sample_decode(
+        &mut self,
+        projected: &[f32],
+        text_rows: usize,
+        sampling: crate::sampling::Sampling,
+        seed: u64,
+    ) -> Result<Vec<i32>> {
+        ensure!((1..=TEXT_MAX).contains(&text_rows), "text rows {text_rows}");
+        ensure!(
+            projected.len() == text_rows * BB_H && projected.iter().all(|value| value.is_finite()),
+            "sampled projected text"
+        );
+        ensure!(
+            self.k.geometry.backbone == text_rows + self.k.geometry.frames,
+            "sampled generation geometry"
+        );
+        let Breeze {
+            ref w,
+            ref k,
+            ref mut flash,
+            ref mut buf,
+            ref blas,
+            ..
+        } = *self;
+        k.stream.memset_zeros(&mut buf.backbone_history)?;
+        k.captured.borrow_mut().depth_sample = None;
+        upload_hidden(k, buf, projected)?;
+        let mut output = Vec::new();
+        for frame in 0..k.geometry.frames {
+            let prefill = frame == 0;
+            let rows = if prefill { text_rows } else { 1 };
+            let origin = if prefill { 0 } else { text_rows + frame - 1 };
+            let score_row = if prefill { text_rows - 1 } else { 0 };
+            backbone_rows(
+                k,
+                buf,
+                blas,
+                ScorePass {
+                    layers: &w.backbone,
+                    norm: &w.backbone_norm,
+                    lm: &w.lm,
+                    table: &k.table_backbone,
+                    flash: &mut flash.backbone,
+                    rows,
+                    origin: i32::try_from(origin)?,
+                    score_row,
+                },
+                (!prefill).then_some(&w.audio),
+                false,
+            )?;
+            k.stream
+                .memcpy_htod(&[frame as u64], &mut buf.sample_counters.slice_mut(0..1))?;
+            k.h2d.set(k.h2d.get() + std::mem::size_of::<u64>() as u64);
+            sample_rows(
+                k,
+                &buf.d,
+                &mut buf.probabilities,
+                &mut buf.picked,
+                &mut buf.backbone_history,
+                &buf.sample_counters,
+                SampleRequest {
+                    source_start: score_row * BB_VOCAB,
+                    picked_start: 0,
+                    rows: 1,
+                    vocab: BB_VOCAB,
+                    sampling,
+                    seed,
+                    stream: 0,
+                    counter_index: 0,
+                    allow: 2051,
+                    repetition: true,
+                },
+            )?;
+            let backbone = download_u32(k, &buf.picked, 0, 1)?[0];
+            if backbone == 2051 {
+                break;
+            }
+            ensure!(backbone < 2048, "reserved backbone token {backbone}");
+            let cond = download_row(k, &buf.n, score_row, BB_H)?;
+            let mut codes = [0i32; BOOKS];
+            codes[0] = i32::try_from(backbone)?;
+            sample_depth(
+                k,
+                buf,
+                blas,
+                DepthSample {
+                    w,
+                    flash: &mut flash.depth,
+                    cond: &cond,
+                    frame,
+                    sampling,
+                    seed,
+                },
+            )?;
+            let depth = download_u32(k, &buf.picked, 1, HEAD_N)?;
+            for (book, id) in depth.into_iter().enumerate() {
+                ensure!(id < 2048, "reserved depth token {id}");
+                codes[book + 1] = i32::try_from(id)?;
+            }
+            output.extend_from_slice(&codes);
+            if frame + 1 < k.geometry.frames {
+                stage_audio_codes(k, buf, &codes)?;
+            }
+        }
+        ensure!(!output.is_empty(), "Breeze generated no audio frames");
+        Ok(output)
     }
 
     /// Backbone KV is one BB_MAX cache per layer. Depth KV is DP_KV by DP_ROWS by DP_DIM, rewritten at positions 0..DP_ROWS before each depth attention.
@@ -3036,8 +3635,8 @@ impl Breeze {
             ids_only,
         } = input;
         let keep_scores = !ids_only;
-        let (audio_steps, depth_frames) = decode_shape(projected, cond, text_rows, fed, frames)?;
-        self.bound_device()?;
+        let (audio_steps, depth_frames) =
+            decode_shape(projected, cond, text_rows, fed, frames, self.k.geometry)?;
         let Breeze {
             ref w,
             ref k,
@@ -3824,8 +4423,14 @@ mod tests {
         let fed = vec![0i32; audio_steps * super::BOOKS];
         let frames_64 = vec![0i32; super::DP_FRAMES * super::BOOKS];
         let cond_64 = vec![0f32; super::DP_FRAMES * super::BB_H];
-        let (steps, depth) =
-            super::decode_shape(&projected, &cond_64, text_rows, &fed, &frames_64)?;
+        let (steps, depth) = super::decode_shape(
+            &projected,
+            &cond_64,
+            text_rows,
+            &fed,
+            &frames_64,
+            super::GREEDY_GEOMETRY,
+        )?;
         ensure!(
             steps == audio_steps && depth == super::DP_FRAMES,
             "64 frames"
@@ -3833,8 +4438,491 @@ mod tests {
         let frames_65 = vec![0i32; (super::DP_FRAMES + 1) * super::BOOKS];
         let cond_65 = vec![0f32; (super::DP_FRAMES + 1) * super::BB_H];
         ensure!(
-            super::decode_shape(&projected, &cond_65, text_rows, &fed, &frames_65).is_err(),
+            super::decode_shape(
+                &projected,
+                &cond_65,
+                text_rows,
+                &fed,
+                &frames_65,
+                super::GREEDY_GEOMETRY
+            )
+            .is_err(),
             "65 frames"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_depth_min_generation_mlp_scratch() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let runtime = RuntimeDir::with_prefix("n8-depth-min")?;
+        let mut model = super::Breeze::load_for_generation(&weights, &runtime.0, 0, 3, 1)?;
+        model.set_graph(false);
+        let cond = vec![0.0f32; super::BB_H];
+        let codes = vec![0i32; super::DP_ROWS];
+        let scores = model.depth(&cond, &codes, 1, false)?;
+        ensure!(scores.len() == super::HEAD_N * super::CODEBOOK as usize);
+        ensure!(scores.iter().all(|value| value.is_finite()), "depth scores");
+        println!("BREEZE_DEPTH_MIN_SCRATCH PASS frames=1");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_default_text_max_mlp_scratch() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let runtime = RuntimeDir::with_prefix("n8-text-max")?;
+        let mut model = super::Breeze::load(&weights, &runtime.0)?;
+        model.set_graph(false);
+        let ids = vec![2u32; super::TEXT_MAX];
+        let projected = model.text(&ids, super::TextPlant::Nominal)?;
+        ensure!(projected.len() == super::TEXT_MAX * super::BB_H);
+        ensure!(
+            projected.iter().all(|value| value.is_finite()),
+            "text output"
+        );
+        println!("BREEZE_DEFAULT_TEXT_SCRATCH PASS text_rows=652");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_depth_one_text_one_frame_shared_kv() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let runtime = RuntimeDir::with_prefix("n8-depth-shared-kv")?;
+        let mut model = super::Breeze::load_for_generation(&weights, &runtime.0, 0, 1, 1)?;
+        model.set_graph(false);
+        let cond = vec![0.0f32; super::BB_H];
+        let codes = vec![0i32; super::DP_ROWS];
+        let scores = model.depth(&cond, &codes, 1, false)?;
+        ensure!(scores.len() == super::HEAD_N * super::CODEBOOK as usize);
+        ensure!(scores.iter().all(|value| value.is_finite()), "depth scores");
+        println!(
+            "BREEZE_DEPTH_SHARED_KV PASS text_rows=1 frames=1 kv_elems={}",
+            super::DP_KV * super::DP_ROWS * super::DP_DIM
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and Breeze weights"]
+    fn breeze_backbone_full_sequence_max_geometry() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let prompt = [2, 262146, 9259];
+        let runtime = RuntimeDir::with_prefix("n8-full-sequence")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 750)?;
+        model.set_graph(false);
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let audio = 750;
+        let positions = super::Positions {
+            text: (0..prompt.len()).collect(),
+            audio: (prompt.len()..prompt.len() + audio).collect(),
+            eos: Vec::new(),
+            seq: prompt.len() + audio,
+        };
+        let codes = vec![0i32; audio * super::BOOKS];
+        let logits = model.backbone(&projected, &positions, &codes, false)?;
+        ensure!(
+            logits.len() == (prompt.len() + audio) * super::BB_VOCAB,
+            "full-sequence logits extent"
+        );
+        ensure!(
+            logits.iter().all(|value| value.is_finite()),
+            "full-sequence logits"
+        );
+        println!("BREEZE_FULL_SEQUENCE PASS text_rows=3 audio_frames=750");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher prompt fixture"]
+    fn breeze_repeated_generation_resets_history() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let runtime = RuntimeDir::with_prefix("n8-history-reset")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 64)?;
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let sampling = crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?;
+        let first = model.sample_decode(&projected, prompt.len(), sampling, 18)?;
+        let second = model.sample_decode(&projected, prompt.len(), sampling, 18)?;
+        ensure!(first == second, "repeated generation history differs");
+        println!(
+            "BREEZE_HISTORY_RESET PASS frames={}",
+            first.len() / super::BOOKS
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher prompt fixture"]
+    fn breeze_generation_graph_tracks_seed_and_sampling() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let initial = crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?;
+        let changed = crate::sampling::Sampling::new(1.2, 7, 0.75, 1.1)?;
+        let runtime = RuntimeDir::with_prefix("n8-generation-state")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 64)?;
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let first = model.sample_decode(&projected, prompt.len(), initial, 18)?;
+        let second = model.sample_decode(&projected, prompt.len(), changed, 19)?;
+        let fresh_runtime = RuntimeDir::with_prefix("n8-generation-fresh")?;
+        let mut fresh =
+            super::Breeze::load_for_generation(&weights, &fresh_runtime.0, 0, prompt.len(), 64)?;
+        let fresh_projected = fresh.text(&prompt, super::TextPlant::Nominal)?;
+        let expected = fresh.sample_decode(&fresh_projected, prompt.len(), changed, 19)?;
+        ensure!(first != second, "changed generation did not differ");
+        ensure!(second == expected, "second generation reused graph inputs");
+        println!(
+            "BREEZE_GENERATION_STATE PASS frames={}",
+            second.len() / super::BOOKS
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease"]
+    fn breeze_head_in_covers_padded_gemm_rows() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let device = super::Device::new(0)?;
+        for max_new_tokens in 1..=16 {
+            let geometry = super::generation_geometry(13, max_new_tokens)?;
+            let buf = super::alloc_buf(&device.stream, geometry)?;
+            ensure!(
+                buf.head_in.len()
+                    == geometry.frames.max(super::gemm_rows(1, super::DP_H)) * super::DP_H,
+                "head_in rows for max_new_tokens={max_new_tokens}"
+            );
+        }
+        println!("BREEZE_HEAD_IN PASS max_new_tokens=1..16");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher prompt fixture"]
+    fn breeze_sample_decode_eager_graph_match() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let run = |graph| -> Result<Vec<i32>> {
+            let runtime = RuntimeDir::with_prefix("n8-depth-counter")?;
+            let mut model =
+                super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 750)?;
+            model.set_graph(graph);
+            let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+            model.sample_decode(
+                &projected,
+                prompt.len(),
+                crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?,
+                18,
+            )
+        };
+        let eager = run(false)?;
+        let graph = run(true)?;
+        let mismatch = eager
+            .iter()
+            .zip(&graph)
+            .position(|(a, b)| a != b)
+            .map(|index| index / super::BOOKS);
+        println!(
+            "BREEZE_DEPTH_COUNTER_CONTROL eager_frames={} graph_frames={} first_mismatch={:?}",
+            eager.len() / super::BOOKS,
+            graph.len() / super::BOOKS,
+            mismatch
+        );
+        ensure!(eager.len() == 50 * super::BOOKS, "eager trajectory length");
+        ensure!(eager == graph, "eager/graph sampled trajectories differ");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher Philox fixture"]
+    fn breeze_sample_prefix_matches_publisher_philox() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let fixture = env_path("N8_SAMPLE_PREFIX", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(fixture)?)?;
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let expected = doc["expected_codes"]
+            .as_array()
+            .context("expected codes")?
+            .iter()
+            .map(|value| {
+                i32::try_from(value.as_i64().context("expected code")?).context("expected code")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(expected.len() == super::BOOKS, "expected frame");
+        let runtime = RuntimeDir::with_prefix("n8-sample-prefix")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, prompt.len(), 1)?;
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let codes = model.sample_decode(
+            &projected,
+            prompt.len(),
+            crate::sampling::Sampling::new(0.9, 50, 1.0, 1.1)?,
+            42,
+        )?;
+        ensure!(
+            codes[..6] == expected[..6],
+            "sampled prefix {codes:?} != {expected:?}"
+        );
+        ensure!(
+            codes.iter().all(|id| (0..2048).contains(id)),
+            "reserved sampled token {codes:?}"
+        );
+        println!("BREEZE_SAMPLE_PREFIX PASS frames=1 prefix_books=6 seed=42");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU lease and publisher teacher trace"]
+    fn breeze_teacher_eos_matches_publisher_frames() -> Result<()> {
+        const TRANSFORM_MAX: f32 = 1e-5;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let trace = env_path("N8_TRACE", false)?;
+        let weights = env_path("N8_WEIGHTS", true)?;
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(trace)?)?;
+        let (row_limit, eos_limit, probability_limit) = match (
+            doc["text"].as_str().context("trace text")?,
+            doc["seed"].as_u64().context("trace seed")?,
+        ) {
+            ("Hello", 7) => (0.25, 0.125, 0.00012043921742588282),
+            ("Hello", 42) => (0.25, 0.125, 0.00008791335858404636),
+            ("(sigh) Welcome aboard. Your journey begins now.", 12345) => {
+                (0.5, 0.5, 0.0026555173099040986)
+            }
+            (text, seed) => bail!("no frozen EOS bars for {text} seed {seed}"),
+        };
+        let prompt = doc["prompt_ids"]
+            .as_array()
+            .context("prompt ids")?
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().context("prompt id")?).context("prompt id"))
+            .collect::<Result<Vec<_>>>()?;
+        let codes = doc["codes"]
+            .as_array()
+            .context("codes")?
+            .iter()
+            .flat_map(|frame| frame.as_array().into_iter().flatten())
+            .map(|value| i32::try_from(value.as_i64().context("code")?).context("code"))
+            .collect::<Result<Vec<_>>>()?;
+        let expected = doc["frames"]
+            .as_array()
+            .context("frames")?
+            .iter()
+            .map(|frame| {
+                frame["raw_logits"]
+                    .as_array()
+                    .context("raw logits")?
+                    .iter()
+                    .map(|value| value.as_f64().context("logit").map(|v| v as f32))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(codes.len().is_multiple_of(super::BOOKS), "trace code rows");
+        let text_rows = prompt.len();
+        let audio = codes.len() / super::BOOKS;
+        ensure!(expected.len() == audio + 1, "trace EOS row");
+        let runtime = RuntimeDir::with_prefix("n8-teacher-eos")?;
+        let mut model =
+            super::Breeze::load_for_generation(&weights, &runtime.0, 0, text_rows, audio + 1)?;
+        model.set_graph(false);
+        let projected = model.text(&prompt, super::TextPlant::Nominal)?;
+        let positions = super::Positions {
+            text: (0..text_rows).collect(),
+            audio: (text_rows..text_rows + audio).collect(),
+            eos: Vec::new(),
+            seq: text_rows + audio,
+        };
+        let logits = model.backbone(&projected, &positions, &codes, false)?;
+        let sampling = crate::sampling::Sampling::new(0.9, 50, 1.0, 1.0)?;
+        let mut worst_row = 0.0f32;
+        let mut worst_eos = 0.0f32;
+        let mut worst_probability = 0.0f64;
+        let mut worst_transform = 0.0f32;
+        for (frame, expected) in expected.iter().enumerate() {
+            let start = (text_rows - 1 + frame) * super::BB_VOCAB;
+            let row = &logits[start..start + super::BB_VOCAB];
+            ensure!(row.len() == expected.len(), "trace vocabulary");
+            let row_max = row
+                .iter()
+                .zip(expected)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0f32, f32::max);
+            let eos_max = (row[2051] - expected[2051]).abs();
+            let probabilities = sampling.probabilities(row, &[], (2048, 2050), Some(2051))?;
+            let publisher_probability = doc["frames"][frame]["eos_top_k_probability"]
+                .as_f64()
+                .context("publisher probability")?;
+            let probability_max = (f64::from(probabilities[2051]) - publisher_probability).abs();
+            super::copy_h2d(
+                &model.k,
+                &[frame as u64],
+                &mut model.buf.sample_counters.slice_mut(0..1),
+            )?;
+            super::sample_rows(
+                &model.k,
+                &model.buf.d,
+                &mut model.buf.probabilities,
+                &mut model.buf.picked,
+                &mut model.buf.backbone_history,
+                &model.buf.sample_counters,
+                super::SampleRequest {
+                    source_start: start,
+                    picked_start: 0,
+                    rows: 1,
+                    vocab: super::BB_VOCAB,
+                    sampling,
+                    seed: 42,
+                    stream: 0,
+                    counter_index: 0,
+                    allow: 2051,
+                    repetition: false,
+                },
+            )?;
+            let gpu = model
+                .k
+                .stream
+                .clone_dtoh(&model.buf.probabilities.slice(..super::BB_VOCAB))?;
+            model.k.stream.synchronize()?;
+            let transform_max = gpu
+                .iter()
+                .zip(&probabilities)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0f32, f32::max);
+            ensure!(
+                row_max <= row_limit,
+                "teacher row {frame} max={row_max} bar={row_limit}"
+            );
+            ensure!(
+                eos_max <= eos_limit,
+                "teacher EOS {frame} max={eos_max} bar={eos_limit}"
+            );
+            ensure!(
+                probability_max <= probability_limit,
+                "teacher EOS probability {frame} max={probability_max} bar={probability_limit}"
+            );
+            ensure!(
+                transform_max <= TRANSFORM_MAX,
+                "CUDA distribution {frame} max={transform_max}"
+            );
+            worst_row = worst_row.max(row_max);
+            worst_eos = worst_eos.max(eos_max);
+            worst_probability = worst_probability.max(probability_max);
+            worst_transform = worst_transform.max(transform_max);
+        }
+        println!(
+            "BREEZE_TEACHER_EOS PASS frames={} row_max={} eos_logit_max={} eos_prob_max={} transform_max={} thresholds={}/{}/{}/{}",
+            expected.len(),
+            worst_row,
+            worst_eos,
+            worst_probability,
+            worst_transform,
+            row_limit,
+            eos_limit,
+            probability_limit,
+            TRANSFORM_MAX
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn depth_sample_counters_are_disjoint_across_frames() {
+        let mut seen = std::collections::BTreeSet::new();
+        for frame in 0..750 {
+            for head in 0..super::HEAD_N {
+                let counter = super::depth_sample_counter(frame) + head as u64;
+                assert!(seen.insert(counter), "duplicate frame={frame} head={head}");
+            }
+        }
+        assert_eq!(seen.len(), 750 * super::HEAD_N);
+    }
+
+    #[test]
+    fn generation_geometry_spans_fixture_limits_and_position_bound() -> Result<()> {
+        let generation = super::generation_geometry(3, 750)?;
+        ensure!(
+            generation.frames == 750 && generation.backbone == 753,
+            "750 frames"
+        );
+        ensure!(generation.frames > 256, "fixture limits");
+        let bounded = super::generation_geometry(652, 1500)?;
+        ensure!(
+            bounded.frames == 1396 && bounded.backbone == 2048,
+            "position bound"
+        );
+        ensure!(
+            super::generation_geometry(2048, 750).is_err(),
+            "no audio positions"
+        );
+        ensure!(
+            super::generation_geometry(3, 0).is_err(),
+            "zero generation limit"
         );
         Ok(())
     }

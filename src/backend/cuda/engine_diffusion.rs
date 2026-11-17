@@ -179,6 +179,8 @@ pub(crate) struct GemmaState {
     pub(crate) logits: CudaSlice<f32>,
     processed: CudaSlice<f32>,
     probs: CudaSlice<f32>,
+    categorical_counter: CudaSlice<u64>,
+    categorical_history: CudaSlice<i32>,
     pub(crate) soft: CudaSlice<bf16>,
     sc_pre: CudaSlice<bf16>,
     sc_emb: CudaSlice<bf16>,
@@ -1244,6 +1246,8 @@ impl Engine {
             logits: s.alloc_zeros(canvas * vocab)?,
             processed: s.alloc_zeros(canvas * vocab)?,
             probs: s.alloc_zeros(canvas * vocab)?,
+            categorical_counter: s.alloc_zeros(1)?,
+            categorical_history: s.alloc_zeros(vocab)?,
             soft: s.alloc_zeros(canvas * vocab)?,
             sc_pre: s.alloc_zeros(canvas * hidden)?,
             sc_emb: s.alloc_zeros(canvas * hidden)?,
@@ -2075,6 +2079,28 @@ impl Engine {
             .context("diffusion runtime missing")
             .unwrap();
         (runtime.canvas, runtime.gemma_mut().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diffusion_sample_for_test(&mut self, cur_step: u32) -> Result<Vec<i32>> {
+        let canvas = self
+            .diffusion
+            .as_ref()
+            .context("diffusion runtime missing")?
+            .canvas;
+        let vocab = self.model_spec.vocab as usize;
+        let stream = self.device.stream.clone();
+        {
+            let (_, runtime) = self.diffusion_runtime_public();
+            for row in 0..canvas {
+                let token = (row * 37 + 11) % vocab;
+                let offset = row * vocab + token;
+                stream.memcpy_htod(&[1.0f32], &mut runtime.logits.slice_mut(offset..offset + 1))?;
+            }
+        }
+        self.canvas_sample_draws(cur_step, None)?;
+        let (_, runtime) = self.diffusion_runtime_public();
+        Ok(stream.clone_dtoh(&runtime.picks)?)
     }
 
     #[cfg(test)]
@@ -3214,7 +3240,10 @@ impl Engine {
                     .arg(&(vocab as i64))
                     .arg(&r.seed)
                     .arg(&(counter * 2))
+                    .arg(&r.categorical_counter)
                     .arg(&1024i32)
+                    .arg(&mut r.categorical_history)
+                    .arg(&0i32)
                     .launch(grid(canvas, 1024))?;
                 s.launch_builder(&r.philox)
                     .arg(&r.seed)

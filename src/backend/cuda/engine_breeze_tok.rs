@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::{path::Path, sync::Arc};
 
 const MAX_FRAMES: usize = 256;
+const CODEC_MAX_FRAMES: usize = 750;
 const FRAME_SAMPLES: usize = 1920;
 const BOOKS: usize = 16;
 const CODE_MAX: i32 = 2047;
@@ -32,19 +33,23 @@ const MLP: usize = 1024;
 const WINDOW: i32 = 72;
 const LAYERS: usize = 8;
 const Q_WIDTH: usize = (HEADS as usize) * (HEAD_DIM as usize);
-const PEAK: usize = MAX_FRAMES * FRAME_SAMPLES * 96;
 const RMS_EPS: f32 = 1e-5;
 const LN_EPS: f32 = 1e-6;
 
-pub fn check_codes(codes: &[i32]) -> Result<usize> {
+pub fn check_codes_for(codes: &[i32], capacity: usize) -> Result<usize> {
     ensure!(!codes.is_empty(), "codes length");
     ensure!(codes.len().is_multiple_of(BOOKS), "codes length");
     let frames = codes.len() / BOOKS;
-    ensure!((1..=MAX_FRAMES).contains(&frames), "codes length");
+    ensure!((1..=capacity).contains(&frames), "codes length");
     for (index, code) in codes.iter().enumerate() {
         ensure!((0..=CODE_MAX).contains(code), "code {code} at {index}");
     }
     Ok(frames)
+}
+
+#[cfg(test)]
+pub fn check_codes(codes: &[i32]) -> Result<usize> {
+    check_codes_for(codes, MAX_FRAMES)
 }
 
 #[cfg(test)]
@@ -174,6 +179,7 @@ impl Op<'_> {
 }
 
 pub struct Tokenizer {
+    capacity: usize,
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     kernels: Kernels,
@@ -267,6 +273,11 @@ impl Tokenizer {
     }
 
     pub fn load(path: &Path, device: &Device) -> Result<Self> {
+        Self::load_for_frames(path, device, MAX_FRAMES)
+    }
+
+    pub fn load_for_frames(path: &Path, device: &Device, capacity: usize) -> Result<Self> {
+        ensure!((1..=CODEC_MAX_FRAMES).contains(&capacity), "codec capacity");
         // Two streams enable event waits. Capture rejects a wait recorded outside it.
         unsafe {
             device.ctx.disable_event_tracking();
@@ -308,8 +319,8 @@ impl Tokenizer {
         };
         let geometry = [
             u32::try_from(HEADS)?,
-            u32::try_from(MAX_FRAMES)?,
-            u32::try_from(MAX_FRAMES)?,
+            u32::try_from(capacity)?,
+            u32::try_from(capacity)?,
             u32::try_from(HEAD_DIM)?,
             u32::try_from(HEAD_DIM)?,
         ];
@@ -486,31 +497,32 @@ impl Tokenizer {
             },
         )?;
         let zeros = |n: usize| stream.alloc_zeros::<f32>(n).context("activation buffer");
+        let peak = capacity * FRAME_SAMPLES * 96;
         let work = Work {
             codes: stream
-                .alloc_zeros::<i32>(BOOKS * MAX_FRAMES)
+                .alloc_zeros::<i32>(BOOKS * capacity)
                 .context("code buffer")?,
-            e0: zeros(MAX_FRAMES * CODE_DIM)?,
-            e1: zeros(MAX_FRAMES * CODE_DIM)?,
-            s0: zeros(MAX_FRAMES * QUANT_DIM)?,
-            s1: zeros(MAX_FRAMES * QUANT_DIM)?,
-            wide: zeros(MAX_FRAMES * LATENT)?,
-            h0: zeros(MAX_FRAMES * HIDDEN)?,
-            h1: zeros(MAX_FRAMES * HIDDEN)?,
-            norm: zeros(MAX_FRAMES * HIDDEN)?,
-            proj: zeros(MAX_FRAMES * HIDDEN)?,
-            q: zeros(MAX_FRAMES * Q_WIDTH)?,
-            k: zeros(MAX_FRAMES * Q_WIDTH)?,
-            v: zeros(MAX_FRAMES * Q_WIDTH)?,
-            attn: zeros(MAX_FRAMES * Q_WIDTH)?,
-            gate: zeros(MAX_FRAMES * MLP)?,
-            upw: zeros(MAX_FRAMES * MLP)?,
-            cos: zeros(MAX_FRAMES * HEAD_DIM as usize)?,
-            sin: zeros(MAX_FRAMES * HEAD_DIM as usize)?,
-            a: zeros(PEAK)?,
-            b: zeros(PEAK)?,
-            c: zeros(PEAK)?,
-            d: zeros(PEAK)?,
+            e0: zeros(capacity * CODE_DIM)?,
+            e1: zeros(capacity * CODE_DIM)?,
+            s0: zeros(capacity * QUANT_DIM)?,
+            s1: zeros(capacity * QUANT_DIM)?,
+            wide: zeros(capacity * LATENT)?,
+            h0: zeros(capacity * HIDDEN)?,
+            h1: zeros(capacity * HIDDEN)?,
+            norm: zeros(capacity * HIDDEN)?,
+            proj: zeros(capacity * HIDDEN)?,
+            q: zeros(capacity * Q_WIDTH)?,
+            k: zeros(capacity * Q_WIDTH)?,
+            v: zeros(capacity * Q_WIDTH)?,
+            attn: zeros(capacity * Q_WIDTH)?,
+            gate: zeros(capacity * MLP)?,
+            upw: zeros(capacity * MLP)?,
+            cos: zeros(capacity * HEAD_DIM as usize)?,
+            sin: zeros(capacity * HEAD_DIM as usize)?,
+            a: zeros(peak)?,
+            b: zeros(peak)?,
+            c: zeros(peak)?,
+            d: zeros(peak)?,
         };
         let blas = CudaBlas::new(Arc::clone(&stream)).context("cublas")?;
         stream.synchronize().context("tokenizer load")?;
@@ -518,6 +530,7 @@ impl Tokenizer {
         let [next0, next1] = nexts.try_into().ok().context("convnext count")?;
         let [b0, b1, b2, b3] = blocks.try_into().ok().context("decoder block count")?;
         Ok(Self {
+            capacity,
             stream,
             blas,
             kernels,
@@ -550,12 +563,12 @@ impl Tokenizer {
     }
 
     pub fn decode(&mut self, codes: &[i32]) -> Result<Vec<f32>> {
-        let frames_usize = check_codes(codes)?;
+        let frames_usize = check_codes_for(codes, self.capacity)?;
         let frames = i32::try_from(frames_usize).context("frames")?;
-        let mut packed = vec![0i32; BOOKS * MAX_FRAMES];
+        let mut packed = vec![0i32; BOOKS * self.capacity];
         for frame in 0..frames_usize {
             for book in 0..BOOKS {
-                packed[book * MAX_FRAMES + frame] = codes[frame * BOOKS + book];
+                packed[book * self.capacity + frame] = codes[frame * BOOKS + book];
             }
         }
         self.stream
@@ -1439,8 +1452,8 @@ fn clamp_wave(op: &mut Op<'_>, x: &CudaSlice<f32>, count: i64) -> Result<()> {
     Ok(())
 }
 
-fn code_ptr(codes: &CudaSlice<i32>, stream: &CudaStream, book: usize) -> u64 {
-    dev(codes, stream) + (book * MAX_FRAMES * 4) as u64
+fn code_ptr(codes: &CudaSlice<i32>, stream: &CudaStream, book: usize, capacity: usize) -> u64 {
+    dev(codes, stream) + (book * capacity * 4) as u64
 }
 
 fn forward(tok: &Tokenizer, frames: i32) -> Result<u64> {
@@ -1459,13 +1472,13 @@ fn forward(tok: &Tokenizer, frames: i32) -> Result<u64> {
     let s0 = dev(&w.s0, op.stream);
     let s1 = dev(&w.s1, op.stream);
     let wide = dev(&w.wide, op.stream);
-    let code0 = code_ptr(&w.codes, op.stream, 0);
+    let code0 = code_ptr(&w.codes, op.stream, 0, tok.capacity);
     gather(&mut op, &tok.books[0], code0, &w.e0, frames)?;
     causal(&mut op, &tok.quant_first, e0, s0, frames, 0)?;
-    let code1 = code_ptr(&w.codes, op.stream, 1);
+    let code1 = code_ptr(&w.codes, op.stream, 1, tok.capacity);
     gather(&mut op, &tok.books[1], code1, &w.e1, frames)?;
     for book in 2..BOOKS {
-        let code = code_ptr(&w.codes, op.stream, book);
+        let code = code_ptr(&w.codes, op.stream, book, tok.capacity);
         gather(&mut op, &tok.books[book], code, &w.e0, frames)?;
         add_rows(&mut op, &w.e1, &w.e0, frames)?;
     }
@@ -1621,7 +1634,9 @@ fn unit(
 
 #[cfg(test)]
 mod gate {
-    use super::{BOOKS, CODE_MAX, FRAME_SAMPLES, MAX_FRAMES, check_codes, slide_keeps};
+    use super::{
+        BOOKS, CODE_MAX, FRAME_SAMPLES, MAX_FRAMES, check_codes, check_codes_for, slide_keeps,
+    };
     use anyhow::{Context, Result, bail, ensure};
     use safetensors::{Dtype, SafeTensors};
     use serde_json::Value;
@@ -1924,6 +1939,15 @@ mod gate {
         ensure!(check_codes(&cap)? == MAX_FRAMES, "max frames");
         let over = vec![0i32; (MAX_FRAMES + 1) * BOOKS];
         ensure!(check_codes(&over).is_err(), "frames above cap");
+        ensure!(
+            check_codes_for(&over, 750)? == MAX_FRAMES + 1,
+            "derived codec capacity"
+        );
+        let above_generation = vec![0i32; 751 * BOOKS];
+        ensure!(
+            check_codes_for(&above_generation, 750).is_err(),
+            "above generation cap"
+        );
         Ok(())
     }
 
