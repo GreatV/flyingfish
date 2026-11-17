@@ -192,8 +192,8 @@ extern "C" __global__ void vision_affine_cast_bf16(
 }
 
 // Input [3, allocated_frames, pixels], output [frames * pixels, 3].
-extern "C" __global__ void planar_bf16_to_rgb_u8(
-    const __nv_bfloat16* input, uint8_t* output, uint64_t allocated_frames, uint64_t frames,
+extern "C" __global__ void planar_f32_to_rgb_u8(
+    const float* input, uint8_t* output, uint64_t allocated_frames, uint64_t frames,
     uint64_t pixels, float mean0, float mean1, float mean2, float std0, float std1, float std2) {
     if (!vision_flat_launch() || !input || !output || !frames || frames > allocated_frames || !pixels ||
         !isfinite(mean0) || !isfinite(mean1) || !isfinite(mean2) ||
@@ -204,7 +204,7 @@ extern "C" __global__ void planar_bf16_to_rgb_u8(
          i += uint64_t(gridDim.x) * 256) {
         #pragma unroll
         for (uint32_t c = 0; c < 3; ++c) {
-            const float value = __fadd_rn(__fmul_rn(__bfloat162float(input[uint64_t(c) * plane + i]), scale[c]), mean[c]);
+            const float value = __fadd_rn(__fmul_rn(input[uint64_t(c) * plane + i], scale[c]), mean[c]);
             const float clamped = fminf(1.0f, fmaxf(0.0f, value));
             output[3 * i + c] = isnan(value) ? 0 : uint8_t(__float2uint_rn(__fmul_rn(clamped, 255.0f)));
         }
@@ -558,11 +558,6 @@ __device__ __forceinline__ void unpatchify(
     }
 }
 
-extern "C" __global__ void unpatchify_bf16(
-    const __nv_bfloat16* rows, __nv_bfloat16* pixels, uint32_t frames, uint32_t height,
-    uint32_t width, uint32_t channels, uint32_t pt, uint32_t p) {
-    unpatchify(rows, pixels, frames, height, width, channels, pt, p);
-}
 
 extern "C" __global__ void unpatchify_f32(
     const float* rows, float* pixels, uint32_t frames, uint32_t height,
@@ -674,16 +669,6 @@ __device__ __forceinline__ float blend_weight(uint32_t position, uint32_t extent
     return __fmul_rn(float(position), __frcp_rn(float(extent)));
 }
 
-// bf16(bf16(a * bf16(1 - w)) + bf16(b * w)) with w = bf16(blend_weight): one element of a linear tile blend.
-__device__ __forceinline__ __nv_bfloat16 linear_blend(
-    __nv_bfloat16 a, __nv_bfloat16 b, uint32_t position, uint32_t extent) {
-    const float w = __bfloat162float(__float2bfloat16_rn(blend_weight(position, extent)));
-    const float wa = __bfloat162float(__float2bfloat16_rn(__fsub_rn(1.0f, w)));
-    const float pa = __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(a), wa)));
-    const float pb = __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(b), w)));
-    return __float2bfloat16_rn(__fadd_rn(pa, pb));
-}
-
 // a * (1 - w) + b * w in F32, each operation rounded, with w = blend_weight.
 __device__ __forceinline__ float linear_blend(float a, float b, uint32_t position, uint32_t extent) {
     const float w = blend_weight(position, extent);
@@ -730,12 +715,6 @@ __device__ __forceinline__ void tile_stitch(
     }
 }
 
-extern "C" __global__ void tile_stitch_bf16(
-    const __nv_bfloat16* tiles, __nv_bfloat16* canvas, const uint32_t* grid, uint32_t rows,
-    uint32_t cols, uint32_t planes, uint32_t tile_h, uint32_t tile_w, uint32_t canvas_h,
-    uint32_t canvas_w) {
-    tile_stitch(tiles, canvas, grid, rows, cols, planes, tile_h, tile_w, canvas_h, canvas_w);
-}
 
 extern "C" __global__ void tile_stitch_f32(
     const float* tiles, float* canvas, const uint32_t* grid, uint32_t rows, uint32_t cols,
@@ -745,8 +724,8 @@ extern "C" __global__ void tile_stitch_f32(
 
 // out[c, out_first + k, :] = linear blend of a[c, a_first + k, :] and b[c, b_first + k, :] at position k of extent
 // frames; a, b and out are [channels, frames, plane] with their own frame counts.
-extern "C" __global__ void frame_blend_bf16(
-    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint32_t channels,
+extern "C" __global__ void frame_blend_f32(
+    const float* a, const float* b, float* out, uint32_t channels,
     uint32_t extent, uint64_t plane, uint32_t a_frames, uint32_t a_first, uint32_t b_frames,
     uint32_t b_first, uint32_t out_frames, uint32_t out_first) {
     if (!vision_flat_launch() || !a || !b || !out || !channels || !extent || !plane ||
@@ -756,16 +735,16 @@ extern "C" __global__ void frame_blend_bf16(
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const uint64_t px = i % plane, k = (i / plane) % extent, c = i / (plane * extent);
-        const __nv_bfloat16 va = a[(c * a_frames + a_first + k) * plane + px];
-        const __nv_bfloat16 vb = b[(c * b_frames + b_first + k) * plane + px];
+        const float va = a[(c * a_frames + a_first + k) * plane + px];
+        const float vb = b[(c * b_frames + b_first + k) * plane + px];
         out[(c * out_frames + out_first + k) * plane + px] = linear_blend(va, vb, uint32_t(k), extent);
     }
 }
 
-// F32 latents [channels, frames, height, width] -> BF16 rows [n_frames * n_height * n_width, channels] of the window
+// F32 latents [channels, frames, height, width] -> F32 rows [n_frames * n_height * n_width, channels] of the window
 // starting at (first_frame, first_row, first_col).
-extern "C" __global__ void latent_rows_bf16(
-    const float* latents, __nv_bfloat16* rows, uint32_t channels, uint32_t frames, uint32_t height,
+extern "C" __global__ void latent_rows_f32(
+    const float* latents, float* rows, uint32_t channels, uint32_t frames, uint32_t height,
     uint32_t width, uint32_t first_frame, uint32_t first_row, uint32_t first_col, uint32_t n_frames,
     uint32_t n_height, uint32_t n_width) {
     if (!vision_flat_launch() || !latents || !rows || !channels || !n_frames || !n_height ||
@@ -779,7 +758,7 @@ extern "C" __global__ void latent_rows_bf16(
                        t = token / (uint64_t(n_width) * n_height);
         const uint64_t source =
             ((c * frames + first_frame + t) * height + first_row + y) * uint64_t(width) + first_col + x;
-        rows[i] = __float2bfloat16_rn(latents[source]);
+        rows[i] = latents[source];
     }
 }
 

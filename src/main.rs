@@ -274,6 +274,13 @@ enum Command {
         prompt: String,
         #[arg(long, help = "Keyframe image (required for MiniMax-H3)")]
         image: Option<PathBuf>,
+        #[arg(long, help = "Final keyframe for HyperFlow; alone or with --image")]
+        last_image: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "MiniMax-H3 companion checkpoint for HyperFlow text encoder and VAEs"
+        )]
+        base_model: Option<PathBuf>,
         #[arg(
             long,
             help = "Requested frame count; rounds up to 17n+5 (136 -> 141), published duration 5-15 s at 24 fps"
@@ -283,9 +290,9 @@ enum Command {
         seed: u64,
         #[arg(
             long,
-            help = "Turbo LoRA safetensors (e.g. minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors)"
+            help = "Turbo LoRA safetensors, required for MiniMax-H3 and invalid for HyperFlow (e.g. minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors)"
         )]
-        lora: PathBuf,
+        lora: Option<PathBuf>,
         #[arg(
             long,
             help = "Use a GGUF Q4_0 transformer instead of transformer safetensors"
@@ -1237,42 +1244,55 @@ fn music(
     })
 }
 
-fn video(
-    cli: &Cli,
-    request: flyingfish::minimax_h3::MiniMaxH3I2vaRequest,
-    output: &Path,
-    json: bool,
-) -> Result<()> {
-    let _ = (cli, &request, output, json);
+fn video(cli: &Cli) -> Result<()> {
+    let _ = cli;
     #[cfg(not(feature = "cuda"))]
     bail!("video requires CUDA");
     #[cfg(feature = "cuda")]
     flyingfish::backend::with_verbose(cli.verbose, || {
+        let Command::Video {
+            prompt,
+            image,
+            last_image,
+            base_model,
+            frames,
+            seed,
+            lora,
+            gguf,
+            output,
+            json,
+        } = &cli.command
+        else {
+            bail!("video requires the video subcommand");
+        };
+        let hyperflow = flyingfish::minimax_h3::is_hyperflow_model(&cli.model)?;
+        ensure!(
+            hyperflow || (last_image.is_none() && base_model.is_none()),
+            "--last-image and --base-model require HyperFlow"
+        );
+        ensure!(
+            !hyperflow || (lora.is_none() && gguf.is_none()),
+            "HyperFlow uses fused fl2va weights; --lora and --gguf are invalid"
+        );
+        let resolve = |path: &Path, role: &str| {
+            path.canonicalize()
+                .with_context(|| format!("resolve {role} {}", path.display()))
+        };
+        let base = if hyperflow {
+            Some(resolve(
+                base_model
+                    .as_deref()
+                    .context("--base-model is required for HyperFlow")?,
+                "base model",
+            )?)
+        } else {
+            None
+        };
         let mp4 = mp4_output(output)?;
         let output = output_path(output, &cli.model)?;
-        let keyframe = request
-            .keyframe
-            .canonicalize()
-            .with_context(|| format!("resolve keyframe {}", request.keyframe.display()))?;
-        let lora = request
-            .lora
-            .canonicalize()
-            .with_context(|| format!("resolve LoRA {}", request.lora.display()))?;
-        let gguf = request
-            .gguf
-            .as_ref()
-            .map(|path| {
-                path.canonicalize()
-                    .with_context(|| format!("resolve GGUF {}", path.display()))
-            })
-            .transpose()?;
-        let request = flyingfish::minimax_h3::MiniMaxH3I2vaRequest {
-            model: cli.model.clone(),
-            lora,
-            keyframe,
-            gguf,
-            ..request
-        };
+        if let Some(base) = &base {
+            output_path(&output, base)?;
+        }
         let options = flyingfish::RunOptions {
             device: cli.device,
             runtime_dir: cli
@@ -1282,7 +1302,44 @@ fn video(
                 .context("--runtime-dir is required for video")?,
             verbose: cli.verbose,
         };
-        let generated = flyingfish::minimax_h3::run_minimax_h3_i2va(&request, options)?;
+        let generated = if let Some(base_model) = &base {
+            let request = flyingfish::minimax_h3::HyperFlowH3Request {
+                model: cli.model.clone(),
+                base_model: base_model.clone(),
+                first_frame: image
+                    .as_ref()
+                    .map(|p| resolve(p, "first image"))
+                    .transpose()?,
+                last_frame: last_image
+                    .as_ref()
+                    .map(|p| resolve(p, "last image"))
+                    .transpose()?,
+                prompt: prompt.clone(),
+                frames: *frames,
+                seed: *seed,
+            };
+            flyingfish::minimax_h3::run_hyperflow_h3_video(&request, options)
+        } else {
+            let request = flyingfish::minimax_h3::MiniMaxH3I2vaRequest {
+                model: cli.model.clone(),
+                lora: resolve(
+                    lora.as_deref()
+                        .context("--lora is required for MiniMax-H3")?,
+                    "LoRA",
+                )?,
+                keyframe: resolve(
+                    image
+                        .as_deref()
+                        .context("--image is required for MiniMax-H3 image-to-video+audio")?,
+                    "keyframe",
+                )?,
+                gguf: gguf.as_ref().map(|p| resolve(p, "GGUF")).transpose()?,
+                prompt: prompt.clone(),
+                frames: *frames,
+                seed: *seed,
+            };
+            flyingfish::minimax_h3::run_minimax_h3_i2va(&request, options)
+        }?;
         let flyingfish::minimax_h3::H3Output {
             frames,
             height,
@@ -1317,6 +1374,9 @@ fn video(
             outputs.push(output);
         } else {
             let wav = output_path(&output.with_extension("wav"), &cli.model)?;
+            if let Some(base) = &base {
+                output_path(&wav, base)?;
+            }
             let result = (|| -> Result<()> {
                 flyingfish::media::write_y4m(
                     fs::File::create(&output)?,
@@ -1342,7 +1402,7 @@ fn video(
             outputs.push(output);
             outputs.push(wav);
         }
-        if json {
+        if *json {
             let outputs: Vec<_> = outputs
                 .iter()
                 .map(|path| path.display().to_string())
@@ -1356,7 +1416,7 @@ fn video(
                     "height": height,
                     "samples": samples,
                     "sampling_rate": sampling_rate,
-                    "seed": request.seed,
+                    "seed": seed,
                 }})
             );
         } else {
@@ -1740,30 +1800,7 @@ fn run() -> Result<()> {
         }
         #[cfg(not(feature = "cuda"))]
         Command::To3d { .. } => bail!("to-3d requires CUDA"),
-        Command::Video {
-            prompt,
-            image,
-            frames,
-            seed,
-            lora,
-            gguf,
-            output,
-            json,
-        } => {
-            let keyframe = image
-                .clone()
-                .context("--image is required for MiniMax-H3 image-to-video+audio")?;
-            let request = flyingfish::minimax_h3::MiniMaxH3I2vaRequest {
-                model: cli.model.clone(),
-                lora: lora.clone(),
-                keyframe,
-                prompt: prompt.clone(),
-                frames: *frames,
-                seed: *seed,
-                gguf: gguf.clone(),
-            };
-            video(&cli, request, output, *json)
-        }
+        Command::Video { .. } => video(&cli),
         Command::Speak { text, seed, output } => speak(&cli, text, *seed, output.as_deref()),
         Command::Music {
             prompt,
@@ -2382,6 +2419,8 @@ mod tests {
             Command::Video {
                 prompt,
                 image,
+                last_image,
+                base_model,
                 frames,
                 seed,
                 lora,
@@ -2393,7 +2432,8 @@ mod tests {
                 assert_eq!(image, Some(PathBuf::from("keyframe.png")));
                 assert_eq!(frames, 121);
                 assert_eq!(seed, 42);
-                assert_eq!(lora, PathBuf::from("turbo.safetensors"));
+                assert_eq!(lora, Some(PathBuf::from("turbo.safetensors")));
+                assert!(last_image.is_none() && base_model.is_none());
                 assert_eq!(gguf, Some(PathBuf::from("transformer.gguf")));
                 assert_eq!(output, PathBuf::from("out.y4m"));
                 assert!(json);

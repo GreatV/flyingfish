@@ -1816,6 +1816,14 @@ pub(crate) fn device_slot_bytes(name: &str, entry: &TensorEntry) -> Result<usize
 #[cfg(feature = "cuda")]
 pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8]) -> Result<()> {
     match entry.quant {
+        None if entry.dtype == safetensors::Dtype::F32 => {
+            let (words, rest) = bytes.as_chunks::<4>();
+            ensure!(
+                rest.is_empty() && words.iter().all(|v| f32::from_le_bytes(*v).is_finite()),
+                "{name}: nonfinite or partial F32 source"
+            );
+        }
+
         Some(GgmlType::F16) => {
             let (words, rest) = bytes.as_chunks::<2>();
             ensure!(
@@ -1986,7 +1994,11 @@ impl DenseStreaming {
                             && entry.shape.len() == 2
                             && entry.role.ends_with(".qweight"));
                     ensure!(
-                        stored && entry.layer == Some(layer_index as u32),
+                        (stored && entry.layer == Some(layer_index as u32))
+                            || (entry.load
+                                && entry.layer.is_none()
+                                && entry.quant.is_none()
+                                && entry.dtype == safetensors::Dtype::F32),
                         "dense ordered tensor {name} is outside layer {layer_index}"
                     );
                     add(name, layer_index, entry)?;
@@ -2026,10 +2038,29 @@ impl DenseStreaming {
                 }
             }
         }
+        #[cfg(test)]
+        let mut allocation_before = d.ctx.mem_get_info()?.0;
+        #[cfg(test)]
+        let mut allocation_record =
+            |phase: &str, logical_bytes: usize, host_bytes: usize| -> Result<()> {
+                let after = d.ctx.mem_get_info()?.0;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"dense_allocation": {
+                        "phase": phase, "logical_bytes": logical_bytes, "host_bytes": host_bytes,
+                        "free_before": allocation_before, "free_after": after,
+                        "synchronized": false
+                    }})
+                );
+                allocation_before = after;
+                Ok(())
+            };
         for (index, layer) in layers.iter_mut().enumerate() {
             if plan.host[index] {
                 layer.host =
                     Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.source_bytes, 0)? });
+                #[cfg(test)]
+                allocation_record(&format!("pinned_layer{index}"), 0, layer.source_bytes)?;
             }
         }
         let (disk, events, read_ahead) = if plan.disk_bytes > 0 {
@@ -2042,16 +2073,27 @@ impl DenseStreaming {
         } else {
             (None, None, super::engine::ReadAhead::new(2, 0, 1)?)
         };
+        #[cfg(test)]
+        allocation_record("disk_reader_events", 0, 0)?;
         let slots = (0..2)
             .map(|_| {
+                let device = d.upload.alloc_zeros::<u8>(plan.slot_bytes)?;
+                #[cfg(test)]
+                allocation_record("slot_tensor", plan.slot_bytes, 0)?;
+                let ready = d
+                    .ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+                #[cfg(test)]
+                allocation_record("slot_ready_event", 0, 0)?;
+                let retired = d
+                    .ctx
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+                #[cfg(test)]
+                allocation_record("slot_retired_event", 0, 0)?;
                 Ok(DenseSlot {
-                    device: d.upload.alloc_zeros::<u8>(plan.slot_bytes)?,
-                    ready: d
-                        .ctx
-                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
-                    retired: d
-                        .ctx
-                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
+                    device,
+                    ready,
+                    retired,
                     retired_valid: false,
                     loaded: None,
                 })
@@ -2063,6 +2105,8 @@ impl DenseStreaming {
         let quant = (staging_bytes > 0)
             .then(|| QuantKernels::new(&d.ctx))
             .transpose()?;
+        #[cfg(test)]
+        allocation_record("staging_and_quant_modules", staging_bytes, 0)?;
         Ok(Self {
             layers,
             slots,
@@ -4221,6 +4265,19 @@ mod tests {
                 "{quant:?} has no device path"
             );
         }
+        let mut native = entry(vec![2], 8, None);
+        native.dtype = safetensors::Dtype::F32;
+        let finite: Vec<_> = [0.15625001f32, -1.0000001]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert!(quant_source_finite("f32", &native, &finite).is_ok());
+        let invalid: Vec<_> = [1.0f32, f32::NAN]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert!(quant_source_finite("f32", &native, &invalid).is_err());
+        assert!(quant_source_finite("f32", &native, &finite[..7]).is_err());
         let nan = 0x7e00u16.to_le_bytes();
         let mut f16 = vec![0u8; 8];
         f16[2..4].copy_from_slice(&nan);

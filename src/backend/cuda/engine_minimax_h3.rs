@@ -209,17 +209,22 @@ impl EntryReader {
         Ok(buffer)
     }
 
-    /// Copies a finite BF16 tensor into host memory of exactly its size.
+    /// Copies a finite BF16 or F32 tensor into host memory of exactly its size.
     fn read_into(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
         ensure!(
-            entry.dtype == Dtype::BF16 && entry.bytes == destination.len(),
+            matches!(entry.dtype, Dtype::BF16 | Dtype::F32) && entry.bytes == destination.len(),
             "{name}: {:?} {} B does not fill {} B",
             entry.dtype,
             entry.bytes,
             destination.len()
         );
         let bytes = self.read(name, entry)?;
-        ensure!(<bf16 as Element>::finite(bytes), "{name}: nonfinite value");
+        let finite = if entry.dtype == Dtype::F32 {
+            <f32 as Element>::finite(bytes)
+        } else {
+            <bf16 as Element>::finite(bytes)
+        };
+        ensure!(finite, "{name}: nonfinite value");
         destination.copy_from_slice(bytes);
         Ok(())
     }
@@ -296,7 +301,10 @@ fn matrix<T: crate::backend::gpu::DeviceRepr + Copy>(
     )
 }
 
-fn vector(b: &CudaSlice<bf16>, s: &Arc<CudaStream>) -> Result<Tensor<bf16, 1>> {
+fn vector<T: crate::backend::gpu::DeviceRepr + Copy>(
+    b: &CudaSlice<T>,
+    s: &Arc<CudaStream>,
+) -> Result<Tensor<T, 1>> {
     view(b, s, 0, [u32::try_from(b.len())?], [1])
 }
 
@@ -506,6 +514,13 @@ const HIDDEN_NORM_THREADS: u32 = 768;
 /// Threads per head-width RMSNorm row.
 const HEAD_NORM_THREADS: u32 = 32;
 
+/// A vector view and its owned allocation or shared byte arena.
+struct VectorWeight<T> {
+    tensor: Tensor<T, 1>,
+    _owned: Option<CudaSlice<T>>,
+    _arena: Option<Arc<CudaSlice<u8>>>,
+}
+
 /// One base linear: dense BF16, int8 convrot (`qweight` `[out, in]`, `wscale` `[out]`), or `up(down(x))`.
 enum BlockLinear {
     Dense {
@@ -514,7 +529,7 @@ enum BlockLinear {
     },
     Int8 {
         qweight: Tensor<i8, 2>,
-        wscale: CudaSlice<f32>,
+        wscale: VectorWeight<f32>,
         group: u32,
         owned: Option<CudaSlice<i8>>,
     },
@@ -526,12 +541,12 @@ enum BlockLinear {
 }
 
 /// One block's weights. `linears` is `LINEAR_ROLES` order. Dense MiniMax views point into `storage` or a streaming
-/// slot. A dropped block's `linears` are 1×1 views of `storage` and `dropped` is set.
+/// slot. A dropped block's `linears` are 1×1 views of the vector arena and `dropped` is set.
 pub(crate) struct BlockWeights {
-    norm1: CudaSlice<bf16>,
-    norm2: CudaSlice<bf16>,
-    norm_q: CudaSlice<bf16>,
-    norm_k: CudaSlice<bf16>,
+    norm1: VectorWeight<bf16>,
+    norm2: VectorWeight<bf16>,
+    norm_q: VectorWeight<bf16>,
+    norm_k: VectorWeight<bf16>,
     linears: [BlockLinear; 6],
     storage: Option<CudaSlice<bf16>>,
     dropped: bool,
@@ -553,6 +568,9 @@ pub(crate) struct Source<'a> {
     reader: EntryReader,
     manifest: &'a TensorManifest,
     quant: OnceLock<QuantKernels>,
+    vectors: Option<(VectorArenaLayout, Arc<CudaSlice<u8>>)>,
+    #[cfg(test)]
+    vector_bytes: Option<Vec<u8>>,
 }
 
 impl<'a> Source<'a> {
@@ -561,6 +579,9 @@ impl<'a> Source<'a> {
             reader: EntryReader::new(dir),
             manifest,
             quant: OnceLock::new(),
+            vectors: None,
+            #[cfg(test)]
+            vector_bytes: None,
         }
     }
 
@@ -618,14 +639,98 @@ impl<'a> Source<'a> {
         name: &str,
         elements: usize,
     ) -> Result<CudaSlice<T>> {
+        #[cfg(test)]
+        let free_before = s.context().mem_get_info()?.0;
         let mut buffer = s.alloc_zeros::<T>(elements)?;
         self.fill(s, name, &mut buffer.slice_mut(..))?;
+        #[cfg(test)]
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_allocation_tensor": {
+                "name": name, "dtype": format!("{:?}", T::DTYPE),
+                "logical_bytes": elements * std::mem::size_of::<T>(),
+                "free_before": free_before, "free_after": s.context().mem_get_info()?.0,
+                "synchronized": false
+            }})
+        );
         Ok(buffer)
     }
 
     fn host_f32(&mut self, s: &Arc<CudaStream>, name: &str, elements: usize) -> Result<Vec<f32>> {
         let tensor = self.tensor::<f32>(s, name, elements)?;
         Ok(s.clone_dtoh(&tensor)?)
+    }
+
+    fn vector<T: Element + crate::backend::gpu::ValidAsZeroBits + Copy>(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        elements: usize,
+    ) -> Result<VectorWeight<T>> {
+        if let Some((layout, buffer)) = &self.vectors {
+            let &(offset, bytes, dtype) = layout
+                .offsets
+                .get(name)
+                .with_context(|| format!("vector arena lacks {name}"))?;
+            ensure!(
+                dtype == T::DTYPE && bytes == elements * std::mem::size_of::<T>(),
+                "{name}: vector arena type or extent"
+            );
+            let ptr = pointer(buffer, s)
+                .checked_add(u64::try_from(offset)?)
+                .context("vector arena address overflow")?;
+            return Ok(VectorWeight {
+                tensor: unsafe {
+                    Tensor::new(ptr, [u32::try_from(elements)?], [1], u64::try_from(bytes)?)?
+                },
+                _owned: None,
+                _arena: Some(buffer.clone()),
+            });
+        }
+        let owned = self.tensor::<T>(s, name, elements)?;
+        let tensor = view(&owned, s, 0, [u32::try_from(elements)?], [1])?;
+        Ok(VectorWeight {
+            tensor,
+            _owned: Some(owned),
+            _arena: None,
+        })
+    }
+
+    fn pack_vectors(&mut self, s: &Arc<CudaStream>, spec: &H3Spec) -> Result<()> {
+        ensure!(self.vectors.is_none(), "vector arena already loaded");
+        let layout = VectorArenaLayout::new(self.manifest, spec)?;
+        let dropped = spec
+            .dropped_blocks
+            .as_deref()
+            .context("HyperFlow dropped blocks")?;
+        let mut bytes = vec![0u8; layout.bytes];
+        for (name, &(offset, len, dtype)) in &layout.offsets {
+            if let Some(entry) = self.manifest.entries.get(name) {
+                ensure!(
+                    entry.load
+                        && entry.dtype == dtype
+                        && entry.bytes == len
+                        && entry.quant.is_none(),
+                    "{name}: vector arena manifest extent or type"
+                );
+                self.reader
+                    .read_into(name, entry, &mut bytes[offset..offset + len])?;
+            } else {
+                ensure!(
+                    dropped
+                        .iter()
+                        .any(|layer| name.starts_with(&format!("transformer_blocks.{layer}."))),
+                    "manifest lacks vector arena tensor {name}"
+                );
+            }
+        }
+        let buffer = Arc::new(s.clone_htod(&bytes)?);
+        #[cfg(test)]
+        {
+            self.vector_bytes = Some(bytes);
+        }
+        self.vectors = Some((layout, buffer));
+        Ok(())
     }
 }
 
@@ -693,7 +798,7 @@ impl BlockWeights {
         rank: usize,
         block: &str,
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
         let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         let mut storage = s.alloc_zeros::<bf16>(elements)?;
@@ -720,7 +825,7 @@ impl BlockWeights {
         block: &str,
         slot: u64,
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
         let (layout, _) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         Self::with_linears::<LORA>(s, spec, rank, block, (slot, &layout), base, lora)
@@ -733,7 +838,7 @@ impl BlockWeights {
         block: &str,
         (at, layout): (u64, &MatrixLayout),
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
         let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
         for role in LINEAR_ROLES {
@@ -764,17 +869,22 @@ impl BlockWeights {
         block: &str,
         linears: [BlockLinear; 6],
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
+        lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
+        ensure!(
+            LORA == lora.is_some(),
+            "{block}: LoRA source does not match the block mode"
+        );
         let (h, w, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
         let mut n =
-            |name: &str, count: usize| base.tensor(s, &format!("{block}.{name}.weight"), count);
+            |name: &str, count: usize| base.vector(s, &format!("{block}.{name}.weight"), count);
         let (norm1, norm2) = (n("norm1", h)?, n("norm2", h)?);
         let (norm_q, norm_k) = (
             n("attn.norm_q", spec.head_dim)?,
             n("attn.norm_k", spec.head_dim)?,
         );
         let (qkv_a, q_b, k_b, v_b, out_a, out_b, in_a, in_b, ffo_a, ffo_b, rank) = if LORA {
+            let lora = lora.context("LoRA block without a source")?;
             let r = rank;
             let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
             for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
@@ -847,21 +957,27 @@ impl BlockWeights {
     }
 
     /// No checkpoint tensors. `block_forward` returns the input.
-    fn identity(s: &Arc<CudaStream>, spec: &H3Spec) -> Result<Self> {
-        let storage = s.alloc_zeros::<bf16>(1)?;
-        let weight = unsafe { Tensor::new(pointer(&storage, s), [1, 1], [1, 1], 2)? };
+    fn identity(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        base: &mut Source<'_>,
+        layer: usize,
+    ) -> Result<Self> {
+        let block = format!("transformer_blocks.{layer}");
+        let storage = base.vector::<bf16>(s, &format!("{block}.identity"), 1)?;
+        let weight = unsafe { Tensor::new(storage.tensor.ptr, [1, 1], [1, 1], 2)? };
         let linears = std::array::from_fn(|_| BlockLinear::Dense {
             weight,
             owned: None,
         });
         let empty = || s.alloc_zeros::<bf16>(0);
         Ok(Self {
-            norm1: s.alloc_zeros::<bf16>(spec.hidden)?,
-            norm2: s.alloc_zeros::<bf16>(spec.hidden)?,
-            norm_q: s.alloc_zeros::<bf16>(spec.head_dim)?,
-            norm_k: s.alloc_zeros::<bf16>(spec.head_dim)?,
+            norm1: base.vector(s, &format!("{block}.norm1.weight"), spec.hidden)?,
+            norm2: base.vector(s, &format!("{block}.norm2.weight"), spec.hidden)?,
+            norm_q: base.vector(s, &format!("{block}.attn.norm_q.weight"), spec.head_dim)?,
+            norm_k: base.vector(s, &format!("{block}.attn.norm_k.weight"), spec.head_dim)?,
             linears,
-            storage: Some(storage),
+            storage: None,
             dropped: true,
             qkv_a: empty()?,
             q_b: empty()?,
@@ -883,7 +999,6 @@ impl BlockWeights {
         spec: &H3Spec,
         block: &str,
         base: &mut Source<'_>,
-        lora: &mut Source<'_>,
         slot: Option<(u64, &[(String, usize)])>,
     ) -> Result<Self> {
         let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
@@ -899,7 +1014,7 @@ impl BlockWeights {
         let linears: [BlockLinear; 6] = linears
             .try_into()
             .map_err(|_| anyhow::anyhow!("block linear count"))?;
-        Self::with_linears_ready::<false>(s, spec, 0, block, linears, base, lora)
+        Self::with_linears_ready::<false>(s, spec, 0, block, linears, base, None)
     }
 }
 
@@ -986,7 +1101,7 @@ fn int8_factor(
         cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
     )?)?;
     crate::convrot::ensure_group(group, optin).with_context(|| format!("{name} convrot group"))?;
-    let wscale = base.tensor::<f32>(s, &format!("{name}.wscale"), rows)?;
+    let wscale = base.vector::<f32>(s, &format!("{name}.wscale"), rows)?;
     let (qweight, owned) = if let Some((ptr, packed)) = slot {
         (
             view_at(ptr, packed_offset(packed, &qname)?, rows, cols)?,
@@ -1682,7 +1797,7 @@ fn apply_linear(
 fn apply_int8(
     c: &BlockContext<'_>,
     qweight: Tensor<i8, 2>,
-    wscale: &CudaSlice<f32>,
+    wscale: &VectorWeight<f32>,
     group: u32,
     x: Tensor<bf16, 2>,
     y: Tensor<bf16, 2>,
@@ -1694,7 +1809,7 @@ fn apply_int8(
     let n = y.shape[1] as usize;
     ensure!(
         qweight.shape == [u32::try_from(n)?, u32::try_from(k)?]
-            && wscale.len() == n
+            && wscale.tensor.shape == [u32::try_from(n)?]
             && y.shape[0] as usize == rows
             && rows <= ptrs.rows
             && k <= ptrs.k,
@@ -1715,7 +1830,7 @@ fn apply_int8(
         &crate::convrot::ConvrotArgs {
             x: ptrs.x,
             qweight: qweight.ptr,
-            wscale: pointer(wscale, c.s),
+            wscale: wscale.tensor.ptr,
             y: y.ptr,
             rotated: ptrs.rotated,
             codes: ptrs.codes,
@@ -1728,14 +1843,14 @@ fn apply_int8(
     )
 }
 
-fn int8_linear(linear: &BlockLinear) -> Option<(Tensor<i8, 2>, &CudaSlice<f32>, u32)> {
+fn int8_linear(linear: &BlockLinear) -> Option<(Tensor<i8, 2>, Tensor<f32, 1>, u32)> {
     match linear {
         BlockLinear::Int8 {
             qweight,
             wscale,
             group,
             ..
-        } => Some((*qweight, wscale, *group)),
+        } => Some((*qweight, wscale.tensor, *group)),
         _ => None,
     }
 }
@@ -1774,9 +1889,9 @@ fn apply_shared_qkv(
             && v.0.shape[0] == q.0.shape[0]
             && kdim == h
             && n == width
-            && q.1.len() == n
-            && k.1.len() == n
-            && v.1.len() == n
+            && q.1.shape[0] == q.0.shape[0]
+            && k.1.shape[0] == k.0.shape[0]
+            && v.1.shape[0] == v.0.shape[0]
             && rows <= ptrs.rows
             && kdim <= ptrs.k,
         "convrot shape"
@@ -1822,7 +1937,7 @@ fn apply_shared_qkv(
             &crate::convrot::ConvrotArgs {
                 x: ptrs.x,
                 qweight: qweight.ptr,
-                wscale: pointer(wscale, c.s),
+                wscale: wscale.ptr,
                 y: y.ptr,
                 rotated: ptrs.rotated,
                 codes: ptrs.codes,
@@ -1953,10 +2068,10 @@ pub(crate) fn block_forward<const LORA: bool>(
     };
     let xp = pointer(x, s);
     let normed = pointer(&work.normed, s);
-    let hidden_norm = |weight: &CudaSlice<bf16>, shift: usize, scale: usize| -> Result<()> {
+    let hidden_norm = |weight: &VectorWeight<bf16>, shift: usize, scale: usize| -> Result<()> {
         let n = NormRows {
             input: xp,
-            weight: pointer(weight, s),
+            weight: weight.tensor.ptr,
             output: normed,
             rows,
             dim: h,
@@ -2044,7 +2159,7 @@ pub(crate) fn block_forward<const LORA: bool>(
     let head_rows = rows * spec.heads;
     norm(
         pointer(&work.q_raw, s),
-        pointer(&w.norm_q, s),
+        w.norm_q.tensor.ptr,
         pointer(&work.q, s),
         head_rows,
         spec.head_dim,
@@ -2053,7 +2168,7 @@ pub(crate) fn block_forward<const LORA: bool>(
     )?;
     norm(
         pointer(&work.k_raw, s),
-        pointer(&w.norm_k, s),
+        w.norm_k.tensor.ptr,
         pointer(&work.k, s),
         head_rows,
         spec.head_dim,
@@ -2727,8 +2842,161 @@ fn place_layers(
 
 type StoredOffsets = Vec<Vec<(String, usize)>>;
 
+struct VectorArenaLayout {
+    offsets: BTreeMap<String, (usize, usize, Dtype)>,
+    bytes: usize,
+}
+
+impl VectorArenaLayout {
+    fn new(manifest: &TensorManifest, spec: &H3Spec) -> Result<Self> {
+        let dropped = spec
+            .dropped_blocks
+            .as_deref()
+            .context("HyperFlow dropped blocks")?;
+        let mut offsets = BTreeMap::new();
+        let mut bytes = 0usize;
+        let mut add = |name: String, len: usize, dtype: Dtype| -> Result<()> {
+            ensure!(len > 0, "{name}: empty vector arena tensor");
+            let offset = bytes;
+            bytes = bytes
+                .checked_add(stored_allocation_bytes(len, 256)?)
+                .context("vector arena extent overflow")?;
+            ensure!(
+                offsets.insert(name.clone(), (offset, len, dtype)).is_none(),
+                "duplicate vector arena tensor {name}"
+            );
+            Ok(())
+        };
+        for layer in 0..spec.layers {
+            for (role, width) in [
+                ("norm1", spec.hidden),
+                ("norm2", spec.hidden),
+                ("attn.norm_q", spec.head_dim),
+                ("attn.norm_k", spec.head_dim),
+            ] {
+                add(
+                    format!("transformer_blocks.{layer}.{role}.weight"),
+                    width.checked_mul(2).context("norm extent overflow")?,
+                    Dtype::BF16,
+                )?;
+            }
+            if dropped.contains(&layer) {
+                add(
+                    format!("transformer_blocks.{layer}.identity"),
+                    2,
+                    Dtype::BF16,
+                )?;
+            }
+        }
+        for (name, entry) in &manifest.entries {
+            if entry.load && entry.layer.is_some() && name.ends_with(".wscale") {
+                ensure!(
+                    entry.dtype == Dtype::F32 && entry.shape.len() == 1,
+                    "{name}: vector arena scale layout"
+                );
+                add(name.clone(), entry.bytes, Dtype::F32)?;
+            }
+        }
+        Ok(Self { offsets, bytes })
+    }
+}
+
+fn stored_allocation_granularity(d: &Device) -> Result<usize> {
+    use cudarc::driver::sys::{self, CUmemAllocationGranularity_flags as G};
+    let mut properties: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+    properties.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+    properties.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+    properties.location.__bindgen_anon_1.id = d.ctx.cu_device();
+    let mut granularity = 0;
+    unsafe {
+        sys::cuMemGetAllocationGranularity(
+            &mut granularity,
+            &properties,
+            G::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+        )
+        .result()?;
+    }
+    ensure!(granularity > 0, "zero stored allocation granularity");
+    Ok(granularity)
+}
+
+fn stored_allocation_bytes(bytes: usize, granularity: usize) -> Result<usize> {
+    ensure!(granularity > 0, "zero stored allocation granularity");
+    bytes
+        .div_ceil(granularity)
+        .checked_mul(granularity)
+        .context("stored allocation extent overflow")
+}
+
+fn stored_allocation_costs(
+    manifest: &TensorManifest,
+    spec: &H3Spec,
+    granularity: usize,
+    owned: usize,
+) -> Result<(Vec<usize>, usize)> {
+    let mut layers = vec![0usize; spec.layers];
+    let arena = VectorArenaLayout::new(manifest, spec)?;
+    let logical_metadata = arena
+        .offsets
+        .iter()
+        .filter(|(name, _)| !name.ends_with(".identity"))
+        .try_fold(0usize, |sum, (_, (_, bytes, _))| {
+            sum.checked_add(*bytes).context("stored metadata extent")
+        })?;
+    for (name, entry) in &manifest.entries {
+        let Some(layer) = entry.layer else { continue };
+        if !entry.load {
+            continue;
+        }
+        let layer = layer as usize;
+        ensure!(layer < spec.layers, "{name}: stored allocation layer");
+        if entry.shape.len() == 2 {
+            layers[layer] = layers[layer]
+                .checked_add(stored_allocation_bytes(entry.bytes, granularity)?)
+                .context("stored layer allocation extent")?;
+        }
+    }
+    let arena_bytes = stored_allocation_bytes(arena.bytes, granularity)?;
+    let owned = owned
+        .checked_sub(logical_metadata)
+        .and_then(|n| n.checked_add(arena_bytes))
+        .context("stored owned allocation extent")?;
+    Ok((layers, owned))
+}
+
+#[cfg(test)]
+fn trace_placement_pool(d: &Device, phase: &str) -> Result<()> {
+    use cudarc::driver::sys::{self, CUmemPool_attribute};
+    let mut pool = std::ptr::null_mut();
+    let (mut reserved, mut used) = (0u64, 0u64);
+    unsafe {
+        sys::cuDeviceGetDefaultMemPool(&mut pool, d.ctx.cu_device()).result()?;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            (&mut reserved as *mut u64).cast(),
+        )
+        .result()?;
+        sys::cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            (&mut used as *mut u64).cast(),
+        )
+        .result()?;
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_placement_pool": {
+            "phase": phase, "reserved_bytes": reserved, "used_bytes": used,
+            "free_bytes": d.ctx.mem_get_info()?.0,
+            "event_tracking": d.ctx.is_event_tracking(), "synchronized": false
+        }})
+    );
+    Ok(())
+}
+
 /// HyperFlow transformer blocks. Dropped layers stay out of `DensePlacement` and come back as empty slots.
-/// A kept layer's device bytes equal its stored bytes. `packed` is `(name, byte offset)` in manifest order.
+/// `packed` contains stored byte offsets; placement prices allocations at the reported granularity.
 fn place_stored_layers(
     d: &Device,
     base: &mut Source<'_>,
@@ -2802,10 +3070,22 @@ fn place_stored_layers(
         kept_index.push(layer);
     }
     ensure!(!kept_device.is_empty(), "no stored transformer block");
+    let granularity = stored_allocation_granularity(d)?;
+    let (charged_layers, owned) = stored_allocation_costs(base.manifest, spec, granularity, owned)?;
+    let charged_device: Vec<_> = kept_index
+        .iter()
+        .map(|&layer| charged_layers[layer])
+        .collect();
+    let charged_slots: Vec<_> = kept_device
+        .iter()
+        .map(|&bytes| stored_allocation_bytes(bytes, granularity))
+        .collect::<Result<_>>()?;
+    #[cfg(test)]
+    trace_placement_pool(d, "before_placement")?;
     let (free, total) = d.ctx.mem_get_info()?;
     let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
     if placement != Placement::Derived {
-        let slots = 2 * kept_device
+        let slots = 2 * charged_slots
             .iter()
             .copied()
             .max()
@@ -2814,9 +3094,22 @@ fn place_stored_layers(
             slots <= device_budget,
             "two block slots exceed the device budget"
         );
-        device_budget = slots;
+        device_budget = slots
+            .checked_add(kept_device.len() * granularity)
+            .context("stored streaming setup extent")?;
+        ensure!(
+            device_budget <= DensePlacement::device_budget(free, total, owned, 0, 0)?,
+            "stored streaming setup exceeds the device budget"
+        );
     }
-    let probe = DensePlacement::new(&kept_device, Some(&kept_source), device_budget, 0)?;
+    let probe = DensePlacement::with_allocations(
+        &charged_device,
+        &charged_slots,
+        Some(&kept_source),
+        device_budget,
+        0,
+        granularity,
+    )?;
     let host_available = if probe.slot_bytes > 0 {
         Some(usize::try_from(
             crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
@@ -2824,11 +3117,38 @@ fn place_stored_layers(
     } else {
         None
     };
-    let (compact, facts) = plan_dense_layers(
-        (&kept_device, &kept_source, sizing.largest, owned, 0),
-        placement,
-        (free, total, host_available),
+    let host_budget = if let Some(available) = host_available {
+        let reserve = 2 * probe.slot_bytes + sizing.largest + (4 << 30);
+        let budget = available
+            .checked_sub(reserve)
+            .context("stored pinned staging and host reserve exceed available RAM")?;
+        match placement {
+            Placement::Derived => budget,
+            #[cfg(test)]
+            Placement::Streamed => budget,
+            #[cfg(test)]
+            Placement::StreamedDisk => 0,
+        }
+    } else {
+        0
+    };
+    let compact = DensePlacement::with_allocations(
+        &charged_device,
+        &charged_slots,
+        Some(&kept_source),
+        device_budget,
+        host_budget,
+        granularity,
     )?;
+    let facts = PlacementFacts {
+        free_bytes: free,
+        total_bytes: total,
+        owned_bytes: owned,
+        largest_bytes: sizing.largest,
+        host_available_bytes: host_available,
+        device_budget,
+        host_budget,
+    };
     ensure!(
         compact.slots.len() == kept_index.len() && compact.host.len() == kept_index.len(),
         "stored placement extent"
@@ -2839,17 +3159,39 @@ fn place_stored_layers(
         slots[layer] = compact.slots[index];
         host_flags[layer] = compact.host[index];
     }
+    let slot_bytes = kept_device
+        .iter()
+        .zip(&compact.slots)
+        .filter_map(|(&bytes, slot)| slot.is_some().then_some(bytes))
+        .max()
+        .unwrap_or(0);
+    let resident_bytes = kept_device
+        .iter()
+        .zip(&compact.slots)
+        .filter_map(|(&bytes, slot)| slot.is_none().then_some(bytes))
+        .sum();
     let plan = DensePlacement {
         slots,
         host: host_flags,
-        slot_bytes: compact.slot_bytes,
-        resident_bytes: compact.resident_bytes,
+        slot_bytes,
+        resident_bytes,
         host_bytes: compact.host_bytes,
         disk_bytes: compact.disk_bytes,
     };
+    let predicted_free = facts
+        .free_bytes
+        .checked_sub(facts.owned_bytes)
+        .and_then(|bytes| bytes.checked_sub(compact.resident_bytes))
+        .and_then(|bytes| bytes.checked_sub(2 * compact.slot_bytes))
+        .and_then(|bytes| {
+            bytes.checked_sub(
+                compact.slots.iter().filter(|slot| slot.is_some()).count() * granularity,
+            )
+        })
+        .context("stored placement physical extent exceeds free VRAM")?;
     eprintln!(
         "{}",
-        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
+        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes, "allocation_granularity": granularity, "charged_resident_bytes": compact.resident_bytes, "charged_slot_bytes": compact.slot_bytes, "predicted_min_driver_free_after_placement": predicted_free})
     );
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
@@ -2914,6 +3256,14 @@ fn forward_block<const LORA: bool>(
     block_forward::<LORA>(c, flash, weights, conditioning, x, work)
 }
 
+#[cfg(test)]
+struct SampleTrace {
+    video: Vec<f32>,
+    audio: Vec<f32>,
+    video_velocity: Vec<f32>,
+    audio_velocity: Vec<f32>,
+}
+
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
 /// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
@@ -2946,6 +3296,15 @@ pub(crate) struct Dit {
     pub video: CudaSlice<f32>,
     /// Velocity of the audio rows, `[audio rows, 32]`.
     pub audio: CudaSlice<f32>,
+    #[cfg(test)]
+    trace: Option<Vec<SampleTrace>>,
+    #[cfg(test)]
+    trace_gate: Option<(
+        &'static str,
+        Rc<std::cell::RefCell<pipeline::CompositionGate>>,
+    )>,
+    #[cfg(test)]
+    refiner_trace: Option<Vec<bf16>>,
 }
 
 impl Dit {
@@ -2955,13 +3314,17 @@ impl Dit {
         spec: &H3Spec,
         (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
         mut base: Source<'_>,
-        mut lora: Source<'_>,
+        mut lora: Option<Source<'_>>,
         placement: Placement,
     ) -> Result<Self> {
         let hyperflow = spec.is_hyperflow()?;
         ensure!(
-            !hyperflow || rank == 0,
-            "HyperFlow weights have no LoRA adapter"
+            if hyperflow {
+                rank == 0 && lora.is_none()
+            } else {
+                lora.is_some()
+            },
+            "HyperFlow requires no LoRA and rank0; MiniMax-H3 requires a LoRA source"
         );
         let s = &d.stream;
         let ranges = Ranges::of(layout)?;
@@ -2992,7 +3355,7 @@ impl Dit {
                         r,
                         &format!("token_refiner.refiner_blocks.{i}"),
                         &mut base,
-                        &mut lora,
+                        None,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -3005,7 +3368,7 @@ impl Dit {
                         r,
                         &format!("token_refiner.refiner_blocks.{i}"),
                         &mut base,
-                        &mut lora,
+                        lora.as_mut(),
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -3055,7 +3418,9 @@ impl Dit {
         let lora_bytes = if hyperflow {
             0
         } else {
-            lora.manifest
+            lora.as_ref()
+                .context("MiniMax-H3 LoRA source")?
+                .manifest
                 .entries
                 .iter()
                 .filter(|(name, _)| name.starts_with("transformer_blocks."))
@@ -3087,14 +3452,29 @@ impl Dit {
         let (dense, blocks) = if hyperflow {
             let (dense, packed) =
                 place_stored_layers(d, &mut base, spec, &sizing, owned, placement)?;
+            #[cfg(test)]
+            trace_placement_pool(d, "after_streaming_slots")?;
+            base.pack_vectors(s, spec)?;
             let dropped = spec
                 .dropped_blocks
                 .as_deref()
                 .context("HyperFlow dropped blocks")?;
             let mut blocks = Vec::with_capacity(spec.layers);
             for (layer, factors) in packed.iter().enumerate() {
+                #[cfg(test)]
+                let allocation_before = d.ctx.mem_get_info()?.0;
                 if dropped.contains(&layer) {
-                    blocks.push(BlockWeights::identity(s, spec)?);
+                    blocks.push(BlockWeights::identity(s, spec, &mut base, layer)?);
+                    #[cfg(test)]
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"h3_allocation_block": {
+                            "layer": layer, "dropped": true,
+                            "free_before": allocation_before,
+                            "free_after": d.ctx.mem_get_info()?.0,
+                            "synchronized": false
+                        }})
+                    );
                     continue;
                 }
                 let name = format!("transformer_blocks.{layer}");
@@ -3105,10 +3485,21 @@ impl Dit {
                     }
                     _ => None,
                 };
-                blocks.push(BlockWeights::stored(
-                    s, spec, &name, &mut base, &mut lora, slot,
-                )?);
+                blocks.push(BlockWeights::stored(s, spec, &name, &mut base, slot)?);
+                #[cfg(test)]
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"h3_allocation_block": {
+                        "layer": layer, "dropped": false,
+                        "resident": slot.is_none(), "logical_matrix_bytes": bytes,
+                        "free_before": allocation_before,
+                        "free_after": d.ctx.mem_get_info()?.0,
+                        "synchronized": false
+                    }})
+                );
             }
+            #[cfg(test)]
+            trace_placement_pool(d, "after_stored_blocks")?;
             (dense, blocks)
         } else {
             let dense = place_layers(
@@ -3137,10 +3528,16 @@ impl Dit {
                 };
                 blocks.push(match slot {
                     Some(slot) => BlockWeights::streamed::<true>(
-                        s, spec, r, &name, slot, &mut base, &mut lora,
+                        s,
+                        spec,
+                        r,
+                        &name,
+                        slot,
+                        &mut base,
+                        lora.as_mut(),
                     )?,
                     None => {
-                        BlockWeights::resident::<true>(s, spec, r, &name, &mut base, &mut lora)?
+                        BlockWeights::resident::<true>(s, spec, r, &name, &mut base, lora.as_mut())?
                     }
                 });
             }
@@ -3226,6 +3623,25 @@ impl Dit {
             );
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
+        #[cfg(test)]
+        if let Some((layout, buffer)) = &base.vectors {
+            let expected = base
+                .vector_bytes
+                .as_ref()
+                .context("vector arena upload bytes missing")?;
+            ensure!(
+                s.clone_dtoh(buffer.as_ref())?.as_slice() == expected.as_slice(),
+                "RUNNER_FAIL vector arena upload changed a byte"
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_vector_arena": {
+                    "tensors": layout.offsets.len(), "storage_bytes": layout.bytes,
+                    "logical_bytes": layout.offsets.values().map(|(_, bytes, _)| bytes).sum::<usize>(),
+                    "alignment": 256, "device_allocations": 1, "upload_byte_differences": 0
+                }})
+            );
+        }
         Ok(Self {
             ranges,
             proj_in,
@@ -3252,6 +3668,12 @@ impl Dit {
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
             video,
             audio,
+            #[cfg(test)]
+            trace: None,
+            #[cfg(test)]
+            trace_gate: None,
+            #[cfg(test)]
+            refiner_trace: None,
         })
     }
 
@@ -3386,6 +3808,13 @@ impl Dit {
         let condition = self.ranges.condition;
         let generated = self.ranges.rows - self.ranges.video_start;
         for k in 0..plan.row_pairs.len() {
+            #[cfg(test)]
+            if let Some((case, _)) = &self.trace_gate {
+                println!(
+                    "HYPERFLOW_FORWARD case={case} phase=free step={k} state=START utc={}",
+                    pipeline::composition_stamp()?
+                );
+            }
             let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
             let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
             self.step(
@@ -3408,6 +3837,22 @@ impl Dit {
                 k,
             )?;
             self.euler(s, (audio, 0, audio.len()), &self.audio, audio_grid, k)?;
+            #[cfg(test)]
+            if let Some(trace) = &mut self.trace {
+                trace.push(SampleTrace {
+                    video: s.clone_dtoh(video)?,
+                    audio: s.clone_dtoh(audio)?,
+                    video_velocity: s.clone_dtoh(&self.video)?,
+                    audio_velocity: s.clone_dtoh(&self.audio)?,
+                });
+                if let Some((case, gate)) = &self.trace_gate {
+                    gate.borrow_mut().sample_step(
+                        case,
+                        k,
+                        trace.last().context("Runner FAIL free trace missing")?,
+                    )?;
+                }
+            }
         }
         s.synchronize()?;
         Ok(())
@@ -3477,6 +3922,10 @@ impl Dit {
         {
             let count = r.text * h;
             s.memcpy_dtod(&self.x.slice(..count), &mut self.text.slice_mut(..count))?;
+        }
+        #[cfg(test)]
+        if self.trace.as_ref().is_some_and(Vec::is_empty) && self.refiner_trace.is_none() {
+            self.refiner_trace = Some(s.clone_dtoh(&self.x.slice(..r.text * h))?);
         }
         self.projection(
             c,
@@ -3699,7 +4148,6 @@ impl ImageDit {
             "image layout is not [text | reference | generated]"
         );
         let mut base = Source::new(dir, manifest);
-        let mut unused = Source::new(dir, manifest);
         let (h, row_width) = (spec.hidden, image.row_width());
         let proj_in = [
             base.tensor(s, "proj_in.weight", h * row_width)?,
@@ -3727,7 +4175,7 @@ impl ImageDit {
                     0,
                     &format!("token_refiner.refiner_blocks.{i}"),
                     &mut base,
-                    &mut unused,
+                    None,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3785,16 +4233,10 @@ impl ImageDit {
                 _ => None,
             };
             blocks.push(match slot {
-                Some(slot) => BlockWeights::streamed::<false>(
-                    s,
-                    spec,
-                    0,
-                    &name,
-                    slot,
-                    &mut base,
-                    &mut unused,
-                )?,
-                None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, &mut unused)?,
+                Some(slot) => {
+                    BlockWeights::streamed::<false>(s, spec, 0, &name, slot, &mut base, None)?
+                }
+                None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, None)?,
             });
         }
         let (free, total) = d.ctx.mem_get_info()?;
@@ -4558,6 +5000,15 @@ impl Conditioner {
                     .launch(cfg)?;
             }
             linear(layer.down, &self.gated, self.ffn, &self.normed, h)?;
+            #[cfg(test)]
+            if index == 43 && rows > 20 && h > 731 {
+                let coordinate = s.clone_dtoh(&self.normed.slice(20 * h + 731..20 * h + 732))?[0];
+                println!(
+                    "H3_CONDITIONER_MLP layer=43 row=20 column=731 value={coordinate} finite={} utc={}",
+                    coordinate.is_finite(),
+                    pipeline::composition_stamp()?
+                );
+            }
             residual(x, normed, rows * h)?;
             if let Some(features) = input.deepstack.get(index) {
                 let mut feature = 0usize;
@@ -4665,6 +5116,15 @@ pub fn generate(
     gguf: Option<&Path>,
 ) -> Result<crate::minimax_h3::H3Output> {
     Ok(pipeline::run(model, lora, request, (device, runtime), gguf)?.output)
+}
+
+pub(crate) fn generate_hyperflow(
+    model: &Path,
+    transformer: &Path,
+    request: &crate::minimax_h3::H3Request,
+    device: (usize, &Path),
+) -> Result<crate::minimax_h3::H3Output> {
+    Ok(pipeline::run_hyperflow((model, transformer), request, device)?.output)
 }
 
 /// Six published image evaluations. `rows` is `[image rows, 96]`, references first. The returned buffer is those
@@ -4844,6 +5304,122 @@ mod tests {
     use safetensors::SafeTensors;
     use std::{collections::BTreeMap, fs, rc::Rc};
 
+    #[test]
+    fn stored_placement_preserves_the_physical_reserve() -> Result<()> {
+        use crate::checkpoint::TensorScope;
+        use crate::prefill::DensePlacement;
+        let mut spec = H3Spec::parse(&serde_json::from_str(include_str!(
+            "../../../tests/data/minimax-h3-transformer-config.json"
+        ))?)?;
+        spec.layers = 3;
+        spec.hidden = 3;
+        spec.head_dim = 2;
+        spec.dropped_blocks = Some(vec![1]);
+        let mut entries = BTreeMap::new();
+        for (name, layer, bytes, shape) in [
+            ("transformer_blocks.0.a.weight", 0, 33, vec![3, 11]),
+            ("transformer_blocks.0.b.weight", 0, 17, vec![1, 17]),
+            ("transformer_blocks.2.a.weight", 2, 33, vec![3, 11]),
+            ("transformer_blocks.2.b.weight", 2, 17, vec![1, 17]),
+            ("transformer_blocks.2.a.wscale", 2, 4, vec![1]),
+        ] {
+            entries.insert(
+                name.to_owned(),
+                TensorEntry {
+                    dtype: if name.ends_with(".wscale") {
+                        Dtype::F32
+                    } else {
+                        Dtype::I8
+                    },
+                    shape,
+                    shard: String::new(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope: TensorScope::Text,
+                    layer: Some(layer),
+                    role: name.to_owned(),
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                },
+            );
+        }
+        let manifest = TensorManifest {
+            entries,
+            resident_bytes: 104,
+        };
+        let (layers, owned) = stored_allocation_costs(&manifest, &spec, 16, 64)?;
+        assert_eq!(layers, [80, 0, 80]);
+        assert_eq!(owned, 3_584);
+        let arena = VectorArenaLayout::new(&manifest, &spec)?;
+        assert_eq!(arena.offsets.len(), 14);
+        assert_eq!(arena.bytes, 3_584);
+        let mut spans: Vec<_> = arena.offsets.values().copied().collect();
+        spans.sort_unstable_by_key(|&(offset, _, _)| offset);
+        for (index, &(offset, bytes, _)) in spans.iter().enumerate() {
+            assert_eq!(offset % 256, 0);
+            assert!(bytes > 0 && offset + bytes <= arena.bytes);
+            if let Some(&(next, _, _)) = spans.get(index + 1) {
+                assert!(offset + bytes <= next);
+            }
+        }
+        let &(offset, bytes, _) = spans.last().context("arena is empty")?;
+        assert_eq!(offset + stored_allocation_bytes(bytes, 256)?, arena.bytes);
+        let total = 65_536;
+        let reserve = total / 16;
+        let exact = reserve + owned + 160;
+        let budget = DensePlacement::device_budget(exact, total, owned, 0, 0)?;
+        let plan = DensePlacement::new(&[layers[0], layers[2]], Some(&[50, 50]), budget, 0)?;
+        assert_eq!(plan.resident_bytes, 160);
+        assert_eq!(
+            exact.checked_sub(reserve + owned + plan.resident_bytes),
+            Some(0)
+        );
+        let short = DensePlacement::device_budget(exact - 1, total, owned, 0, 0)?;
+        assert!(DensePlacement::new(&[layers[0], layers[2]], Some(&[50, 50]), short, 0).is_err());
+        assert!(DensePlacement::new(&[50, 50], None, exact - 1 - reserve - 64, 0).is_ok());
+        assert_eq!(
+            DensePlacement::device_budget(reserve + owned, total, owned, 0, 0)?,
+            0
+        );
+        assert!(DensePlacement::device_budget(reserve + owned - 1, total, owned, 0, 0).is_err());
+        let streamed = DensePlacement::with_allocations(
+            &[96, 80, 80, 80],
+            &[64, 64, 64, 64],
+            Some(&[50, 50, 50, 50]),
+            256,
+            150,
+            16,
+        )?;
+        let streamed_count = streamed.slots.iter().filter(|slot| slot.is_some()).count();
+        assert_eq!(
+            streamed.resident_bytes + 2 * streamed.slot_bytes + streamed_count * 16,
+            256
+        );
+        assert_eq!(streamed_count, 3);
+        assert_eq!(streamed.host_bytes, 150);
+        assert_eq!(streamed.disk_bytes, 0);
+        assert!(
+            DensePlacement::with_allocations(
+                &[96, 80, 80, 80],
+                &[64, 64, 64, 64],
+                Some(&[50, 50, 50, 50]),
+                191,
+                150,
+                16
+            )
+            .is_err()
+        );
+        assert!(stored_allocation_bytes(usize::MAX, 2).is_err());
+        assert!(stored_allocation_bytes(1, 0).is_err());
+        println!(
+            "PASS STORED_PHYSICAL_RESERVE arena_tensors=14 aligned_disjoint=true exact_headroom=0 one_byte_short=ERROR logical_only_control=FAIL_AS_REQUIRED"
+        );
+        Ok(())
+    }
+
     /// Initial chunks avoid skinny tails; selection counts scratch and workspace replacements.
     #[test]
     fn ffn_chunks_leave_no_skinny_tail() -> Result<()> {
@@ -4996,7 +5572,7 @@ mod tests {
             adapter.rank,
             "token_refiner.refiner_blocks.0",
             &mut Source::new(&transformer, &manifest),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         for rows in [1usize, 12, 16, 17] {
             let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
@@ -5043,13 +5619,13 @@ mod tests {
         let s = &device.stream;
         device.finish_upload()?;
         let kernel =
-            cubin::module(&device.ctx, "vision_ops")?.load_function("planar_bf16_to_rgb_u8")?;
+            cubin::module(&device.ctx, "vision_ops")?.load_function("planar_f32_to_rgb_u8")?;
         let (mean, std) = (
             crate::minimax_h3::VAE_PIXEL_MEAN.map(|v| v as f32),
             crate::minimax_h3::VAE_PIXEL_STD.map(|v| v as f32),
         );
         let convert = |input, output, shape, affine| {
-            super::vae::planar_bf16_to_rgb_u8(&device, &kernel, input, output, shape, affine)
+            super::vae::planar_f32_to_rgb_u8(&device, &kernel, input, output, shape, affine)
         };
         let mut cells = 0;
         let mut defects = 0;
@@ -5064,22 +5640,20 @@ mod tests {
         ] {
             let plane = allocated * pixels;
             let count = 3 * frames * pixels;
-            let guard = bf16::from_f32(-23.0);
+            let guard = -23.0f32;
             let mut host = vec![guard; 3 * plane + 6];
             for c in 0..3 {
                 for i in 0..plane {
                     host[3 + c * plane + i] = if pixels == 65536 {
-                        bf16::from_bits(((i * 73 + c * 1009) % 65536) as u16)
+                        f32::from_bits((((i * 73 + c * 1009) % 65536) as u32) << 16)
                     } else {
-                        bf16::from_f32(
-                            ((i * 73 + i / pixels * 37 + c * 101) % 251) as f32 / 31.0 - 4.0,
-                        )
+                        ((i * 73 + i / pixels * 37 + c * 101) % 251) as f32 / 31.0 - 4.0
                     };
                 }
             }
             let input = s.clone_htod(&host)?;
             let output = s.clone_htod(&vec![0xa5u8; count + 14])?;
-            super::vae::planar_bf16_to_rgb_u8(
+            super::vae::planar_f32_to_rgb_u8(
                 &device,
                 &kernel,
                 &input.slice(3..3 + 3 * plane),
@@ -5103,8 +5677,7 @@ mod tests {
             let mut differences = 0usize;
             for (i, &actual) in observed[7..7 + count].iter().enumerate() {
                 let c = i % 3;
-                let v = (host[3 + c * plane + i / 3].to_f32() * std[c] + mean[c]).clamp(0.0, 1.0)
-                    * 255.0;
+                let v = (host[3 + c * plane + i / 3] * std[c] + mean[c]).clamp(0.0, 1.0) * 255.0;
                 let expected = v.round_ties_even() as u8;
                 differences += usize::from(actual != expected);
                 if pixels == 65536 {
@@ -5117,8 +5690,17 @@ mod tests {
                 "H3_RGB_IDENTITY frames={frames} allocated_frames={allocated} pixels={pixels} elements={count} byte_differences={differences} byte_limit=0 guards=true"
             );
         }
-        let input = s.alloc_zeros::<bf16>(9)?;
+        let input = s.alloc_zeros::<f32>(9)?;
         let output = s.alloc_zeros::<u8>(9)?;
+        convert(&input, &output, (1, 1, 1), (mean, std))?;
+        let zero = s.clone_dtoh(&output.slice(..3))?;
+        let zero_pass = zero == [124, 116, 104];
+        defects += usize::from(!zero_pass);
+        cells += 1;
+        println!(
+            "H3_RGB_IDENTITY decoded_zero={zero:?} expected=[124,116,104] byte_limit=0 {}",
+            if zero_pass { "PASS" } else { "DEFECT" }
+        );
         let invalid = [
             (0, 1, 1),
             (2, 1, 1),
@@ -5134,7 +5716,7 @@ mod tests {
             );
         }
         ensure!(
-            super::vae::planar_bf16_to_rgb_u8(
+            super::vae::planar_f32_to_rgb_u8(
                 &device,
                 &kernel,
                 &input,
@@ -5767,7 +6349,7 @@ mod tests {
             adapter.rank,
             "transformer_blocks.0",
             &mut base,
-            &mut lora,
+            Some(&mut lora),
         )?;
         let rows = 1usize;
         let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
@@ -5826,7 +6408,13 @@ mod tests {
             "zero gates must leave the residual untouched"
         );
         let normed = std::mem::take(&mut work.normed_probe);
-        let norm2 = s.clone_dtoh(&weights.norm2)?;
+        let norm2 = s.clone_dtoh(
+            weights
+                .norm2
+                ._owned
+                .as_ref()
+                .context("resident norm2 allocation")?,
+        )?;
         let shift_mlp = &table[3 * hidden..4 * hidden];
         let scale_mlp = &table[4 * hidden..5 * hidden];
         let pre = modulate_rows(
@@ -6688,7 +7276,7 @@ mod tests {
                     adapter.rank,
                     &format!("transformer_blocks.{layer}"),
                     &mut Source::new(&transformer, &manifest),
-                    &mut Source::new(lora_dir, &lora_manifest),
+                    Some(&mut Source::new(lora_dir, &lora_manifest)),
                 )
             })
             .collect::<Result<_>>()?;
@@ -7013,7 +7601,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(&transformer, &manifest),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
@@ -7067,7 +7655,7 @@ mod tests {
                 (
                     "norm1",
                     &hidden,
-                    &weights.norm1,
+                    weights.norm1.tensor,
                     &table,
                     &index,
                     6 * spec.hidden,
@@ -7079,7 +7667,7 @@ mod tests {
                 (
                     "norm2",
                     &hidden,
-                    &weights.norm2,
+                    weights.norm2.tensor,
                     &table,
                     &index,
                     6 * spec.hidden,
@@ -7091,7 +7679,7 @@ mod tests {
                 (
                     "norm_out",
                     &final_hidden,
-                    &final_weight,
+                    vector(&final_weight, s)?,
                     &final_table,
                     &final_index,
                     2 * spec.hidden,
@@ -7103,7 +7691,7 @@ mod tests {
             ] {
                 let n = NormRows {
                     input: pointer(x, s),
-                    weight: pointer(weight, s),
+                    weight: weight.ptr,
                     output: pointer(&work.normed, s),
                     rows,
                     dim: spec.hidden,
@@ -7362,7 +7950,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(gguf_dir, &manifest),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let mut wrong = manifest.clone();
         wrong
@@ -7376,7 +7964,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(gguf_dir, &wrong),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let official_weights = BlockWeights::resident::<true>(
             s,
@@ -7384,7 +7972,7 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(&transformer, &official),
-            &mut Source::new(&lora_dir, &lora_manifest),
+            Some(&mut Source::new(&lora_dir, &lora_manifest)),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
@@ -7560,7 +8148,7 @@ mod tests {
                         adapter.rank,
                         &name,
                         &mut Source::new(&gguf_dir, &manifest),
-                        &mut Source::new(&lora_dir, &lora_manifest),
+                        Some(&mut Source::new(&lora_dir, &lora_manifest)),
                     )?;
                     let expected = stream
                         .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
@@ -7845,7 +8433,7 @@ mod tests {
             &spec,
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
-            Source::new(&lora_dir, &lora_manifest),
+            Some(Source::new(&lora_dir, &lora_manifest)),
             Placement::from_env()?,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
@@ -8118,7 +8706,7 @@ mod tests {
             &spec,
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
-            Source::new(&lora_dir, &lora_manifest),
+            Some(Source::new(&lora_dir, &lora_manifest)),
             Placement::from_env()?,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
@@ -8845,149 +9433,33 @@ mod tests {
         Ok(())
     }
 
-    /// `[max_abs, rel_rms, cosine]` of BF16 decoder output `[channels, frames, plane]` against the F32 reference bytes of
-    /// the same layout, over the listed frames (all frames when `frames` is None), accumulated in f64.
     fn video_distance(
-        candidate: &[bf16],
+        candidate: &[f32],
         reference: &[u8],
         (channels, total, plane): (usize, usize, usize),
         frames: Option<&[usize]>,
     ) -> Result<[f64; 3]> {
         ensure!(
             candidate.len() == channels * total * plane && reference.len() == 4 * candidate.len(),
-            "video extents differ: {} vs {} B",
-            candidate.len(),
-            reference.len()
+            "video comparison extent"
         );
-        let all: Vec<usize> = (0..total).collect();
+        let all: Vec<_> = (0..total).collect();
         let mut got = Vec::new();
         let mut want = Vec::new();
         for c in 0..channels {
             for &f in frames.unwrap_or(&all) {
-                let base = (c * total + f) * plane;
-                for (x, r) in candidate[base..base + plane]
+                let start = (c * total + f) * plane;
+                for (&v, r) in candidate[start..start + plane]
                     .iter()
-                    .zip(reference[4 * base..4 * (base + plane)].as_chunks::<4>().0)
+                    .zip(reference[4 * start..4 * (start + plane)].as_chunks::<4>().0)
                 {
-                    got.push(f64::from(x.to_f32()));
+                    got.push(f64::from(v));
                     want.push(f64::from(f32::from_le_bytes(*r)));
                 }
             }
         }
         let measured = crate::verify::metrics("h3.video", &got, &want)?;
         Ok([measured.max_abs, measured.rel_rmse, measured.cosine])
-    }
-
-    #[test]
-    #[ignore = "GPU; FF_Q38_GPU_WINDOW, FF_MODEL, FF_H3_CAPTURE (frozen setup directory)"]
-    fn video_decoder_biased_rows_are_bitwise_invariant() -> Result<()> {
-        ensure!(
-            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
-            "GPU window missing"
-        );
-        let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
-        let capture =
-            PathBuf::from(std::env::var_os("FF_H3_CAPTURE").context("FF_H3_CAPTURE missing")?);
-        let frozen: serde_json::Value =
-            serde_json::from_slice(&fs::read(capture.join("freeze.json"))?)?;
-        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
-        let dir = model.join("vae");
-        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
-            .minimax_h3_vae_manifest(&spec)?;
-        let device = Device::new(0)?;
-        let ops = Ops::new(&device.ctx)?;
-        device.finish_upload()?;
-        let runtime =
-            std::env::temp_dir().join(format!("ff-h3-biased-rows-{}", std::process::id()));
-        fs::create_dir(&runtime)?;
-        let result = (|| -> Result<()> {
-            let mut blas = Blas::new(
-                &device,
-                &ops,
-                &runtime,
-                Rc::new(Closure::new(true, "VAE biased row gate".into())),
-            )?;
-            let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
-            decoder.biased_row_gate(&device, &mut blas, &frozen)
-        })();
-        let cleanup = fs::remove_dir_all(&runtime);
-        result?;
-        cleanup?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "GPU; FF_Q38_GPU_WINDOW, FF_MODEL, FF_H3_CAPTURE (frozen setup), FF_H3_S0"]
-    fn video_decoder_spatial_groups_are_bitwise_invariant() -> Result<()> {
-        ensure!(
-            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
-            "GPU window missing"
-        );
-        let path = |key| {
-            std::env::var_os(key)
-                .map(PathBuf::from)
-                .with_context(|| format!("{key} missing"))
-        };
-        let model = path("FF_MODEL")?;
-        let frozen: serde_json::Value =
-            serde_json::from_slice(&fs::read(path("FF_H3_CAPTURE")?.join("freeze.json"))?)?;
-        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
-        let mut inputs = Vec::new();
-        for cell in ["A", "P"] {
-            let map = mapped(&path("FF_H3_S0")?.join(format!("{cell}-bf16/decode.safetensors")))?;
-            let file = SafeTensors::deserialize(&map)?;
-            let input = file.tensor("video_decoder_input")?;
-            let shape = input.shape();
-            ensure!(
-                input.dtype() == Dtype::F32
-                    && shape.len() == 5
-                    && shape[0] == 1
-                    && shape[1] == spec.latent_channels,
-                "group latent layout"
-            );
-            let values = input
-                .data()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|x| f32::from_le_bytes(*x))
-                .collect::<Vec<_>>();
-            inputs.push((values, [shape[2], shape[3], shape[4]]));
-        }
-        let tiles = crate::minimax_h3::VaeTiles::released(
-            &spec,
-            inputs[0].1[1] * spec.spatial_ratio,
-            inputs[0].1[2] * spec.spatial_ratio,
-        )?;
-        let dir = model.join("vae");
-        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
-            .minimax_h3_vae_manifest(&spec)?;
-        let device = Device::new(0)?;
-        let ops = Ops::new(&device.ctx)?;
-        device.finish_upload()?;
-        let runtime = std::env::temp_dir().join(format!("ff-h3-group-gate-{}", std::process::id()));
-        fs::create_dir(&runtime)?;
-        let result = (|| -> Result<()> {
-            let mut blas = Blas::new(
-                &device,
-                &ops,
-                &runtime,
-                Rc::new(Closure::new(true, "VAE spatial group gate".into())),
-            )?;
-            let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
-            decoder.batch_identity_gate(
-                &device,
-                &mut blas,
-                &tiles,
-                inputs.into_iter(),
-                &frozen,
-                &runtime,
-            )
-        })();
-        let cleanup = fs::remove_dir_all(&runtime);
-        result?;
-        cleanup?;
-        Ok(())
     }
 
     #[test]
@@ -9025,11 +9497,11 @@ mod tests {
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 3, 28)?,
-            630_933_552
+            1_320_059_200
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 28, 28)?,
-            5_885_131_636
+            8_873_185_600
         );
         assert!(vae::TileWork::batch_bytes(&spec, shape, 0, 28).is_err());
         assert!(vae::TileWork::batch_bytes(&spec, shape, 29, 28).is_err());
@@ -9037,6 +9509,25 @@ mod tests {
             assert!(vae::TileWork::batch_bytes(&spec, shape, 1, 28).is_err());
         }
         assert!(vae::TileWork::batch_bytes(&spec, (usize::MAX, 16, 16), 1, 28).is_err());
+        let block = 268_574_720;
+        let fixed = 25_434_464;
+        let future = 9_293_928_100;
+        let total = 16_000_000_000;
+        let budget = crate::prefill::DensePlacement::device_budget(total, total, fixed, 0, future)?;
+        let plan = crate::prefill::DensePlacement::new(&[block; 36], None, budget, 10_000_000_000)?;
+        assert_eq!(plan.resident_bytes, 19 * block);
+        assert_eq!(plan.slot_bytes, block);
+        assert_eq!(plan.host_bytes, 17 * block);
+        assert_eq!(plan.disk_bytes, 0);
+        assert!(fixed + future + plan.resident_bytes + 2 * plan.slot_bytes + total / 16 <= total);
+        let streamed =
+            crate::prefill::DensePlacement::new(&[block; 36], None, 2 * block, 10_000_000_000)?;
+        assert_eq!(streamed.resident_bytes, 0);
+        assert_eq!(streamed.host_bytes, 36 * block);
+        assert!(
+            crate::prefill::DensePlacement::new(&[block; 36], None, 2 * block - 1, 10_000_000_000)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -9087,7 +9578,13 @@ mod tests {
                         &runtime,
                         Rc::new(Closure::new(true, "VAE setup gate".into())),
                     )?;
-                    let decoder = vae::VideoDecoder::new(&device, &spec, &dir, &manifest)?;
+                    let decoder = vae::VideoDecoder::new(
+                        &device,
+                        &spec,
+                        &dir,
+                        &manifest,
+                        (0, Placement::Derived),
+                    )?;
                     let tiles = crate::minimax_h3::VaeTiles::released(
                         &spec,
                         shape[3] * spec.spatial_ratio,
@@ -9120,184 +9617,6 @@ mod tests {
         println!(
             "H3_VAE_BATCH_SETUP_GATE PASS cell={cell} placement={placement} numerical_candidate_executed=false model_cells_scored=0"
         );
-        Ok(())
-    }
-
-    /// N7a gate: the native video VAE decoder on the Stage 0 captured decoder input of cells A and P against the CUDA
-    /// FP32 replay, whole video and the temporally cross-faded frames, under the frozen thresholds-n7n8.json bounds;
-    /// the engine's BF16 cast set equals the reference load's dtype dump; tiling off must fail.
-    #[test]
-    #[ignore = "requires FF_MODEL, FF_H3_S0, FF_H3_N7_THRESHOLDS, FF_H3_VAE_DTYPES and the GPU"]
-    fn video_decoder_matches_the_fp32_replay() -> Result<()> {
-        use super::vae::{LatentVideo, VideoDecoder, bf16_parameter};
-        let var = |key: &str| -> Result<PathBuf> {
-            Ok(PathBuf::from(
-                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
-            ))
-        };
-        let (model, s0) = (var("FF_MODEL")?, var("FF_H3_S0")?);
-        let frozen: serde_json::Value =
-            serde_json::from_slice(&fs::read(var("FF_H3_N7_THRESHOLDS")?)?)?;
-        let dtypes: serde_json::Value =
-            serde_json::from_slice(&fs::read(var("FF_H3_VAE_DTYPES")?)?)?;
-        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
-        let vae_dir = model.join("vae");
-        let checkpoint = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?;
-        let manifest = checkpoint.minimax_h3_vae_manifest(&spec)?;
-        let dumped = dtypes["vae"]["parameters"]
-            .as_object()
-            .context("dtype dump lacks vae parameters")?;
-        ensure!(
-            dumped.len() == manifest.entries.len(),
-            "dtype dump lists {} parameters, the manifest {}",
-            dumped.len(),
-            manifest.entries.len()
-        );
-        for name in manifest.entries.keys() {
-            let reference = dumped
-                .get(name)
-                .and_then(|v| v.as_str())
-                .with_context(|| format!("dtype dump lacks {name}"))?;
-            ensure!(
-                bf16_parameter(name) == (reference == "torch.bfloat16"),
-                "{name}: engine BF16 {} vs reference {reference}",
-                bf16_parameter(name)
-            );
-        }
-        println!("H3_VAE_DTYPE_MAP PASS parameters={}", dumped.len());
-        let device = Device::new(0)?;
-        let s = &device.stream;
-        let ops = Ops::new(&device.ctx)?;
-        let runtime = std::env::temp_dir().join(format!("ff-h3-vae-{}", std::process::id()));
-        fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
-            &device,
-            &ops,
-            &runtime,
-            Rc::new(Closure::new(true, "MiniMax-H3 video decoder gate".into())),
-        )?;
-        let decoder = VideoDecoder::new(&device, &spec, &vae_dir, &manifest)?;
-        let clip = spec.chunk_latents() + spec.overlap_latents();
-        let r = spec.spatial_ratio;
-        let decode = |blas: &mut Blas,
-                      cell: &str,
-                      tiles: &crate::minimax_h3::VaeTiles|
-         -> Result<(Vec<bf16>, usize, usize)> {
-            let map = mapped(&s0.join(format!("{cell}-bf16")).join("decode.safetensors"))?;
-            let file = SafeTensors::deserialize(&map)?;
-            let input = file.tensor("video_decoder_input")?;
-            ensure!(
-                input.dtype() == Dtype::F32,
-                "decoder input dtype {:?}",
-                input.dtype()
-            );
-            let shape = input.shape().to_vec();
-            ensure!(
-                shape.len() == 5 && shape[0] == 1 && shape[1] == spec.latent_channels,
-                "decoder input shape {shape:?}"
-            );
-            let (frames, height, width) = (shape[2], shape[3], shape[4]);
-            let mut work = decoder.work(&device, blas, tiles, (frames, height, width))?;
-            let z = s.clone_htod(
-                &input
-                    .data()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|v| f32::from_le_bytes(*v))
-                    .collect::<Vec<_>>(),
-            )?;
-            let plan = crate::minimax_h3::DecodePlan::new(&spec, frames)?;
-            let (lead, pre) = (
-                spec.chunk_latents() * spec.temporal_ratio,
-                spec.frame_pre_padding(),
-            );
-            let total = plan.chunks * (lead - pre) + clip * spec.temporal_ratio - lead - pre;
-            let mut out =
-                s.alloc_zeros::<bf16>(spec.out_channels * total * height * r * width * r)?;
-            decoder.decode(
-                s,
-                blas,
-                &mut work,
-                tiles,
-                LatentVideo {
-                    data: &z,
-                    frames,
-                    height,
-                    width,
-                },
-                &mut out,
-            )?;
-            s.synchronize()?;
-            Ok((s.clone_dtoh(&out)?, total, height * r * width * r))
-        };
-        let mut defects = Vec::new();
-        let mut tiling_off = None;
-        for cell in ["A", "P"] {
-            let reference_map = mapped(
-                &s0.join(format!("{cell}-fp32-replay"))
-                    .join("replay.safetensors"),
-            )?;
-            let reference_file = SafeTensors::deserialize(&reference_map)?;
-            let reference = reference_file.tensor("decode.video_decoder_output")?;
-            ensure!(
-                reference.dtype() == Dtype::F32,
-                "reference dtype {:?}",
-                reference.dtype()
-            );
-            let tiles = crate::minimax_h3::VaeTiles::released(
-                &spec,
-                reference.shape()[3],
-                reference.shape()[4],
-            )?;
-            let (video, frames, plane) = decode(&mut blas, cell, &tiles)?;
-            ensure!(
-                frames == reference.shape()[2],
-                "decoded {frames} frames, reference {}",
-                reference.shape()[2]
-            );
-            let extents = (spec.out_channels, frames, plane);
-            let whole = video_distance(&video, reference.data(), extents, None)?;
-            let key = format!("{cell}.decode.video_decoder_output");
-            let ok = within(whole, &frozen["cells"][&key])?;
-            println!("H3_VAE cell={cell} video={whole:?} within={ok}");
-            if !ok {
-                defects.push(key.clone());
-            }
-            let fade_key = format!("{key}.crossfade_frames");
-            let fade: Vec<usize> = frozen["cells"][&fade_key]["frames"]
-                .as_array()
-                .context("crossfade frame list missing")?
-                .iter()
-                .map(|v| v.as_u64().map(|v| v as usize).context("crossfade frame"))
-                .collect::<Result<_>>()?;
-            let faded = video_distance(&video, reference.data(), extents, Some(&fade))?;
-            let ok = within(faded, &frozen["cells"][&fade_key])?;
-            println!(
-                "H3_VAE cell={cell} crossfade_frames={faded:?} frames={} within={ok}",
-                fade.len()
-            );
-            if !ok {
-                defects.push(fade_key);
-            }
-            if cell == "A" {
-                let whole_frame =
-                    crate::minimax_h3::VaeTiles::whole(reference.shape()[3], reference.shape()[4]);
-                let (untiled, _, _) = decode(&mut blas, cell, &whole_frame)?;
-                let d = video_distance(&untiled, reference.data(), extents, None)?;
-                let failed = !within(d, &frozen["cells"][&key])?;
-                println!("H3_VAE tiling-off control cell=A video={d:?} fails={failed}");
-                tiling_off = Some(failed);
-            }
-        }
-        ensure!(
-            tiling_off == Some(true),
-            "tiling-off control passed the A bound"
-        );
-        if !defects.is_empty() {
-            bail!("H3_VAE_DECODE_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
-        }
-        println!("H3_VAE_DECODE_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
         Ok(())
     }
 
@@ -9566,7 +9885,10 @@ mod tests {
             text_tags,
             grids,
             pixel_values,
-            keyframe: pixels.data().to_vec(),
+            keyframes: vec![(
+                crate::minimax_h3::KeyframeAnchor::First,
+                pixels.data().to_vec(),
+            )],
             height: shape[3],
             width: shape[4],
             frames: meta["cell"]["frames"].as_u64().context("meta frames")? as usize,
@@ -9631,7 +9953,7 @@ mod tests {
                 generated.audio_latents.0.clone(),
                 &generated.audio_latents.1,
             )?;
-            t.bf16(
+            t.f32(
                 "video_decoded".into(),
                 generated.video_decoded.0.clone(),
                 &generated.video_decoded.1,
@@ -9970,7 +10292,7 @@ mod tests {
             let video = native.tensor("video_decoded")?;
             let want = reference.tensor("video_decoder_output")?;
             ensure!(
-                video.dtype() == Dtype::BF16
+                video.dtype() == Dtype::F32
                     && want.dtype() == Dtype::F32
                     && video.shape() == want.shape(),
                 "splice video {:?} {:?} vs {:?} {:?}",
@@ -9981,12 +10303,12 @@ mod tests {
             );
             let shape = video.shape().to_vec();
             let extents = (shape[1], shape[2], shape[3] * shape[4]);
-            let candidate: Vec<bf16> = video
+            let candidate: Vec<f32> = video
                 .data()
-                .as_chunks::<2>()
+                .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|b| bf16::from_le_bytes(*b))
+                .map(|b| f32::from_le_bytes(*b))
                 .collect();
             let key = format!("{cell}.decode.video_decoder_output");
             let whole = video_distance(&candidate, want.data(), extents, None)?;
@@ -12083,6 +12405,7 @@ mod tests {
             Rc::new(Closure::new(true, "HyperFlow block cells".into())),
         )?;
         let mut source = Source::new(&model, &manifest);
+        source.pack_vectors(s, &spec)?;
         let current = time_embedder(&mut source, s, &spec, "time_embedder")?;
         let endpoint = time_embedder(&mut source, s, &spec, "endpoint_time_embedder")?;
         let gate = spec.hyperflow_gate.context("HyperFlow gate")?;
@@ -12157,13 +12480,11 @@ mod tests {
             (0usize, BLOCK0_TAU, block0_ref),
             (1, BLOCK1_TAU, block1_ref),
         ] {
-            let mut lora = Source::new(&model, &manifest);
             let weights = BlockWeights::stored(
                 s,
                 &spec,
                 &format!("transformer_blocks.{block}"),
                 &mut source,
-                &mut lora,
                 None,
             )?;
             let name = format!("transformer_blocks.{block}.adaln_proj.linear");
@@ -12226,7 +12547,7 @@ mod tests {
                 &mut control_fail,
             );
         }
-        let identity = BlockWeights::identity(s, &spec)?;
+        let identity = BlockWeights::identity(s, &spec, &mut source, 6)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -12302,13 +12623,11 @@ mod tests {
             (0usize, RAGGED_BLOCK0_TAU, ragged_block0),
             (1, RAGGED_BLOCK1_TAU, ragged_block1),
         ] {
-            let mut lora = Source::new(&model, &manifest);
             let weights = BlockWeights::stored(
                 s,
                 &spec,
                 &format!("transformer_blocks.{block}"),
                 &mut source,
-                &mut lora,
                 None,
             )?;
             let name = format!("transformer_blocks.{block}.adaln_proj.linear");
@@ -12943,7 +13262,7 @@ mod tests {
             &spec,
             (0, &layout),
             Source::new(&model, &manifest),
-            Source::new(&model, &manifest),
+            None,
             Placement::Derived,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
