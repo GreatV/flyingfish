@@ -734,7 +734,7 @@ fn hi3d_decoder_production_norm_gpu() -> Result<()> {
             } else {
                 vec![0, n as u32]
             };
-            let plan = BatchGroupNorm::new(&d, &offsets, c, 32, 1e-6, 64 << 20)?;
+            let plan = BatchGroupNorm::new(&d, &offsets, c, 32, 1e-6, 128 << 20)?;
             let x = half_tensor(&bank, "feat")?;
             ensure!(x.len() == n * c, "actual support feature count mismatch");
             let values = if name.ends_with(".field") {
@@ -5228,6 +5228,65 @@ fn hi3d_linked_image_mesh_gpu() -> Result<()> {
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(defects == 0, "finite linked pipeline candidate defects");
+    Ok(())
+}
+
+/// Rerun stability: two full generations of the same case in ONE process,
+/// same seed, must produce the bit-identical raw mesh. Guards the group
+/// norm's fixed-order moment reduction (and any later ordering regression).
+#[test]
+#[ignore = "GPU + published models; set FF_HI3D_MODEL, FF_DINOV2_MODEL, FF_CLIP_MODEL, FF_HI3D_GENERATION_REFERENCE, FF_HI3D_IMAGE_PREPARATION_REFERENCE, FLYINGFISH_RUNTIME_DIR"]
+fn hi3d_generation_rerun_stability_gpu() -> Result<()> {
+    let root = env_path("FF_HI3D_GENERATION_REFERENCE")?;
+    let freeze: Value = serde_json::from_slice(&std::fs::read(root.join("FROZEN.json"))?)?;
+    let case = freeze["initial"]
+        .as_object()
+        .context("initial cases")?
+        .keys()
+        .next()
+        .context("no initial case")?
+        .to_owned();
+    let source = freeze["initial"][&case]["input_mesh"]
+        .as_str()
+        .context("initial mesh anchor missing")?;
+    let mesh = crate::sparse::SparseMesh {
+        vertices: f32_tensor(Path::new(source), "vertices")?,
+        faces: tensor(Path::new(source), "faces")?
+            .values
+            .into_iter()
+            .map(|v| v as i32)
+            .collect(),
+    };
+    let bytes =
+        std::fs::read(env_path("FF_HI3D_IMAGE_PREPARATION_REFERENCE")?.join("inputs.safetensors"))?;
+    let images = safetensors::SafeTensors::deserialize(&bytes)?;
+    let rgba = images.tensor(&format!("{case}.rgba"))?;
+    let orientation = images.tensor(&format!("{case}.orientation"))?;
+    let orientation = u8::try_from(i32::from_le_bytes(orientation.data().try_into()?))?;
+    let device = Device::new(0)?;
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let generation = Hi3DGeneration {
+            model: &env_path("FF_HI3D_MODEL")?,
+            dino: &env_path("FF_DINOV2_MODEL")?,
+            clip: &env_path("FF_CLIP_MODEL")?,
+            runtime: &env_path("FLYINGFISH_RUNTIME_DIR")?,
+            rgba: rgba.data(),
+            dimensions: [rgba.shape()[0], rgba.shape()[1]],
+            orientation,
+            mesh: &mesh,
+            requested_resolution: 512,
+            seed: 0,
+        };
+        let (raw, _) = generation.run(&device)?;
+        runs.push((raw.vertices, raw.faces));
+    }
+    let same = runs[0].0 == runs[1].0 && runs[0].1 == runs[1].1;
+    println!(
+        "HI3D_RERUN_STABILITY in_process_runs=2 raw_equal={same} vertices={}",
+        runs[0].0.len() / 3
+    );
+    ensure!(same, "in-process reruns differ: kernel nondeterminism");
     Ok(())
 }
 

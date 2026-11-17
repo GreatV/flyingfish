@@ -1661,57 +1661,103 @@ extern "C" __global__ void sparse_conv_store_f16(
 
 template<class T>
 __device__ __forceinline__ void batch_group_moments_scatter(
-    const T* input, const uint32_t* offsets, float* sums,
+    const T* input, const uint32_t* offsets, float* partials,
     uint32_t batches, uint32_t channels, uint32_t groups,
-    uint32_t group_first, uint32_t group_count) {
+    uint32_t group_first, uint32_t group_count, uint32_t tiles, uint32_t tile) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
-        gridDim.y != batches || gridDim.z != 1 || !input || !offsets || !sums ||
-        !channels || !groups || channels % groups || !group_count || group_first + group_count > groups) { __trap(); return; }
+        gridDim.y != batches || gridDim.z != 1 || !input || !offsets || !partials ||
+        !channels || !groups || channels % groups || !group_count || group_count > 8 ||
+        group_first + group_count > groups || tile >= tiles) { __trap(); return; }
     const uint32_t batch = blockIdx.y, first = offsets[batch], end = offsets[batch + 1];
     const uint32_t width = channels / groups;
     const uint64_t count = uint64_t(end - first) * group_count;
+    // Per-thread per-group partials, accumulated in ascending element order;
+    // slot layout partials[2 * ((bg * tiles + tile) * gridDim.x + blockIdx.x)].
+    float sums[8] = {}, squares[8] = {};
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
-        const uint32_t group = group_first + i % group_count;
+        const uint32_t local = uint32_t(i % group_count);
+        const uint32_t group = group_first + local;
         const uint64_t at = uint64_t(first + i / group_count) * channels + group * width;
-        float sum = 0.0f, squares = 0.0f;
+        float sum = 0.0f, square = 0.0f;
         for (uint32_t channel = 0; channel < width; ++channel) {
             const float x = float(input[at + channel]);
             sum = __fadd_rn(sum, x);
-            squares = __fadd_rn(squares, __fmul_rn(x, x));
+            square = __fadd_rn(square, __fmul_rn(x, x));
         }
-        const uint64_t bg = uint64_t(batch) * groups + group;
-        atomicAdd(sums + 2 * bg, sum);
-        atomicAdd(sums + 2 * bg + 1, squares);
+        sums[local] = __fadd_rn(sums[local], sum);
+        squares[local] = __fadd_rn(squares[local], square);
+    }
+    __shared__ float staged[2][8][256];
+    for (uint32_t local = 0; local < group_count; ++local) {
+        staged[0][local][threadIdx.x] = sums[local];
+        staged[1][local][threadIdx.x] = squares[local];
+    }
+    __syncthreads();
+    if (threadIdx.x < group_count) {
+        double sum = 0.0, square = 0.0;
+        for (uint32_t thread = 0; thread < 256; ++thread) {
+            sum += double(staged[0][threadIdx.x][thread]);
+            square += double(staged[1][threadIdx.x][thread]);
+        }
+        const uint64_t bg = uint64_t(batch) * groups + group_first + threadIdx.x;
+        const uint64_t slot = (bg * tiles + tile) * gridDim.x + blockIdx.x;
+        partials[2 * slot] = float(sum);
+        partials[2 * slot + 1] = float(square);
     }
 }
 
 extern "C" __global__ void batch_group_moments_scatter_f32(
-    const float* input, const uint32_t* offsets, float* sums,
+    const float* input, const uint32_t* offsets, float* partials,
     uint32_t batches, uint32_t channels, uint32_t groups,
-    uint32_t group_first, uint32_t group_count) {
-    batch_group_moments_scatter(input, offsets, sums, batches, channels, groups, group_first, group_count);
+    uint32_t group_first, uint32_t group_count, uint32_t tiles, uint32_t tile) {
+    batch_group_moments_scatter(input, offsets, partials, batches, channels, groups,
+                                group_first, group_count, tiles, tile);
 }
 
 extern "C" __global__ void batch_group_moments_scatter_f16(
-    const __half* input, const uint32_t* offsets, float* sums,
+    const __half* input, const uint32_t* offsets, float* partials,
     uint32_t batches, uint32_t channels, uint32_t groups,
-    uint32_t group_first, uint32_t group_count) {
-    batch_group_moments_scatter(input, offsets, sums, batches, channels, groups, group_first, group_count);
+    uint32_t group_first, uint32_t group_count, uint32_t tiles, uint32_t tile) {
+    batch_group_moments_scatter(input, offsets, partials, batches, channels, groups,
+                                group_first, group_count, tiles, tile);
 }
 
 extern "C" __global__ void batch_group_moments_finish_f32(
-    const float* sums, const uint32_t* offsets, float* moments,
-    uint32_t batches, uint32_t channels, uint32_t groups, float eps) {
-    if (!vision_flat_launch() || !sums || !offsets || !moments || !channels || !groups ||
-        channels % groups || !(eps > 0.0f)) { __trap(); return; }
-    for (uint64_t bg = uint64_t(blockIdx.x) * 256 + threadIdx.x; bg < uint64_t(batches) * groups;
-         bg += uint64_t(gridDim.x) * 256) {
-        const uint32_t batch = bg / groups;
-        const uint64_t count = uint64_t(offsets[batch + 1] - offsets[batch]) * (channels / groups);
+    const float* partials, const uint32_t* offsets, float* moments,
+    uint32_t batches, uint32_t channels, uint32_t groups, float eps,
+    uint32_t tiles, uint32_t reduce_blocks) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 ||
+        gridDim.y != 1 || !partials || !offsets || !moments || !channels || !groups ||
+        channels % groups || !(eps > 0.0f) || !tiles || !reduce_blocks) { __trap(); return; }
+    const uint64_t bg = blockIdx.x;
+    const uint32_t batch = uint32_t(bg / groups);
+    const uint64_t count = uint64_t(offsets[batch + 1] - offsets[batch]) * (channels / groups);
+    // Fixed-order merge: each thread sums one contiguous slot range in
+    // ascending slot order, thread 0 merges the thread partials ascending.
+    const uint64_t slots = uint64_t(tiles) * reduce_blocks;
+    const uint32_t lane_count = uint32_t((slots + 255) / 256);
+    const uint64_t begin = uint64_t(threadIdx.x) * lane_count;
+    const uint64_t end = min(uint64_t(begin + lane_count), slots);
+    double sum = 0.0, squares = 0.0;
+    for (uint64_t slot = begin; slot < end; ++slot) {
+        const uint64_t at = (bg * tiles) * reduce_blocks + slot;
+        sum += double(partials[2 * at]);
+        squares += double(partials[2 * at + 1]);
+    }
+    __shared__ double staged[2][256];
+    staged[0][threadIdx.x] = sum;
+    staged[1][threadIdx.x] = squares;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (uint32_t thread = 1; thread < 256; ++thread) {
+            sum += staged[0][thread];
+            squares += staged[1][thread];
+        }
         const float denominator = __fadd_rn(float(count), eps);
-        const float mean = __fdiv_rn(sums[2 * bg], denominator);
-        const float variance = __fsub_rn(__fdiv_rn(sums[2 * bg + 1], denominator), __fmul_rn(mean, mean));
+        const float mean = float(sum / double(denominator));
+        const float variance =
+            float(squares / double(denominator) - double(mean) * double(mean));
         moments[2 * bg] = mean;
         moments[2 * bg + 1] = rsqrtf(__fadd_rn(variance, eps));
     }
