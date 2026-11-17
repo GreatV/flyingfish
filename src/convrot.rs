@@ -7,7 +7,7 @@
 //! accumulator, K in groups of 16) and `q` is ties-to-even of `xR * (1/s_x)`.
 //! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 61440 bytes dynamic smem.
 //! [`linear`] is the below-[`TENSOR_CORE_ROWS`] form.
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 use anyhow::Context;
 use anyhow::{Result, ensure};
 use half::bf16;
@@ -186,6 +186,38 @@ fn linear_omitting_rotation(
     int8_product(&codes, &scales, k, qweight, n, wscale)
 }
 
+/// Dynamic shared bytes of one group: a 16-row bf16 tile plus eight 8×16 bf16 Hadamard tiles.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn group_dot_smem(group: u32) -> u32 {
+    32 * group + 2048
+}
+
+/// Largest multiple of 16 whose [`group_dot_smem`] fits in `optin` bytes.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn max_group(optin: usize) -> Result<u32> {
+    let bytes = u32::try_from(optin).context("convrot opt-in shared memory")?;
+    ensure!(bytes >= 2048 + 512, "convrot opt-in shared memory {optin}");
+    let raw = (bytes - 2048) / 32;
+    let group = raw / 16 * 16;
+    ensure!(group >= 16, "convrot opt-in shared memory {optin}");
+    ensure!(
+        group_dot_smem(group) <= bytes,
+        "convrot group {group} tile exceeds opt-in {optin}"
+    );
+    Ok(group)
+}
+
+/// `group` fits the tile derived from `optin`. Returns that tile.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn ensure_group(group: u32, optin: usize) -> Result<u32> {
+    let max = max_group(optin)?;
+    ensure!(
+        group <= max,
+        "convrot group {group} exceeds device tile {max}"
+    );
+    Ok(max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{hadamard, linear, linear_omitting_rotation};
@@ -273,6 +305,24 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn group_tile_fits_the_optin() -> Result<()> {
+        let optin = 99usize << 10;
+        let max = super::max_group(optin)?;
+        ensure!(
+            max >= 1024
+                && super::group_dot_smem(1024) == 34_816
+                && usize::try_from(super::group_dot_smem(max))? <= optin
+                && super::ensure_group(1024, optin)? == max,
+            "group tile optin={optin} max={max}"
+        );
+        ensure!(
+            super::ensure_group(max + 16, optin).is_err(),
+            "group above the tile was accepted"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -281,6 +331,7 @@ pub struct ConvrotFns {
     group_dot: crate::backend::gpu::CudaFunction,
     quantize: crate::backend::gpu::CudaFunction,
     product: crate::backend::gpu::CudaFunction,
+    max_group: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -315,11 +366,21 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         i32::try_from(PRODUCT_SMEM)?,
     )?;
+    let group_dot = module.load_function("convrot_group_dot")?;
+    let optin = usize::try_from(ctx.attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    )?)?;
+    let max_group = max_group(optin)?;
+    group_dot.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        i32::try_from(group_dot_smem(max_group))?,
+    )?;
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
-        group_dot: module.load_function("convrot_group_dot")?,
+        group_dot,
         quantize: module.load_function("convrot_quantize")?,
         product,
+        max_group,
     })
 }
 
@@ -406,6 +467,12 @@ pub(crate) fn launch_product(
     Ok(())
 }
 
+/// Grid of `convrot_group_dot`: one block owns 16 rows and one whole group.
+#[cfg(feature = "cuda")]
+pub(crate) fn group_dot_grid(rows: u32, k: u32, group: u32) -> (u32, u32, u32) {
+    (rows.div_ceil(16), 1, k / group)
+}
+
 /// `convrot_group_dot` then `convrot_quantize`. The product is a separate launch.
 #[cfg(feature = "cuda")]
 pub(crate) fn launch_rotate_quant(
@@ -421,6 +488,11 @@ pub(crate) fn launch_rotate_quant(
     let rows = args.rows as u32;
     let group = args.group as u32;
     let k = args.k as u32;
+    ensure!(
+        group <= fns.max_group,
+        "convrot group {group} exceeds device tile {}",
+        fns.max_group
+    );
     unsafe {
         stream
             .launch_builder(&fns.group_dot)
@@ -430,9 +502,9 @@ pub(crate) fn launch_rotate_quant(
             .arg(&args.k)
             .arg(&args.group)
             .launch(LaunchConfig {
-                grid_dim: (rows.div_ceil(16), group / 8, k / group),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
+                grid_dim: group_dot_grid(rows, k, group),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: group_dot_smem(group),
             })?;
     }
     let quant_threads = 128u32;
@@ -663,9 +735,355 @@ mod device {
         Ok(stream.clone_dtoh(&y_d)?)
     }
 
+    fn exp2i(exp: i32) -> f64 {
+        if (-1022..=1023).contains(&exp) {
+            f64::from_bits(((exp + 1023) as u64) << 52)
+        } else if (-1074..-1022).contains(&exp) {
+            f64::from_bits(1u64 << (exp + 1074) as u32)
+        } else if exp < -1074 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn frexp_half(x: f64) -> (f64, i32) {
+        let bits = x.to_bits();
+        let exp_field = ((bits >> 52) & 0x7ff) as i32;
+        if exp_field == 0 {
+            if bits & 0x000f_ffff_ffff_ffff == 0 {
+                return (0.0, 0);
+            }
+            let (mag, exp) = frexp_half(x * exp2i(54));
+            return (mag, exp - 54);
+        }
+        let mag = (bits & 0x000f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000;
+        (f64::from_bits(mag).copysign(x), exp_field - 1022)
+    }
+
+    fn sig_exp(x: f64) -> (f64, i32) {
+        if x.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
+            return (0.0, -126);
+        }
+        let (mag, exp) = frexp_half(x);
+        let mut significand = mag * 2.0;
+        let mut exponent = exp - 1;
+        if exponent < -126 {
+            significand *= exp2i(exponent + 126);
+            exponent = -126;
+        }
+        if significand.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
+            exponent = -126;
+        }
+        (significand, exponent)
+    }
+
+    fn rz_f32(sum: f64, e_max: i32) -> f32 {
+        let (mut significand, exp) = sig_exp(sum * exp2i(e_max));
+        significand = (significand * exp2i(23)).trunc() * exp2i(-23);
+        let out = (significand * exp2i(exp)) as f32;
+        if out.to_bits() & 0x7fff_ffff == 0 {
+            0.0
+        } else {
+            out
+        }
+    }
+
+    // m16n8k16 f32 accumulator: T-FDPA length 8, F=24, e_zero=-132, round toward zero to f32.
+    // k = 0..7, then k = 8..15, each consuming the running accumulator.
+    fn t_fdpa8(a: &[(f64, i32)], b: &[(f64, i32)], c: f32) -> f32 {
+        const F: i32 = 24;
+        const E_ZERO: i32 = -132;
+        let mut s = [0.0f64; 9];
+        let mut e = [0i32; 9];
+        for i in 0..8 {
+            let prod = a[i].0 * b[i].0;
+            s[i] = prod;
+            e[i] = if prod.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
+                E_ZERO
+            } else {
+                a[i].1 + b[i].1
+            };
+        }
+        let (sc, ec) = sig_exp(f64::from(c));
+        s[8] = sc;
+        e[8] = if sc.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
+            E_ZERO
+        } else {
+            ec
+        };
+        let mut e_max = e[0];
+        for &value in &e[1..] {
+            e_max = e_max.max(value);
+        }
+        let mut sum = 0.0f64;
+        for i in 0..9 {
+            sum += (s[i] * exp2i(e[i] - e_max + F)).trunc() * exp2i(-F);
+        }
+        rz_f32(sum, e_max)
+    }
+
+    fn mma_k16(a: &[f32; 16], b: &[f32; 16], c: f32) -> f32 {
+        let mut at = [(0.0f64, 0i32); 16];
+        let mut bt = [(0.0f64, 0i32); 16];
+        for i in 0..16 {
+            at[i] = sig_exp(f64::from(a[i]));
+            bt[i] = sig_exp(f64::from(b[i]));
+        }
+        let mid = t_fdpa8(&at[..8], &bt[..8], c);
+        t_fdpa8(&at[8..], &bt[8..], mid)
+    }
+
+    fn mma_k16_points() -> (f32, f32, f32) {
+        let mut a = [0.0f32; 16];
+        let mut b = [0.0f32; 16];
+        a[0] = -8192.0;
+        a[1] = -0.5;
+        a[2] = -0.25;
+        a[3] = -0.125;
+        b[0] = 1024.0;
+        b[1] = 1.0;
+        b[2] = 1.0;
+        b[3] = 1.0;
+        let paper = mma_k16(&a, &b, 8_388_608.0);
+        a = [0.0; 16];
+        b = [0.0; 16];
+        a[0] = 1.0;
+        b[0] = 1.0;
+        let one = mma_k16(&a, &b, 0.0);
+        a[1] = 1.0;
+        b[1] = 1.0;
+        let two = mma_k16(&a, &b, 0.0);
+        (paper, one, two)
+    }
+
+    fn hadamard_terms(group: usize) -> Vec<(f64, i32)> {
+        let mut terms = vec![(0.0f64, 0i32); group * group];
+        for col in 0..group {
+            for k_index in 0..group {
+                let value = bf16::from_f32(super::hadamard(group, k_index, col)).to_f32();
+                terms[col * group + k_index] = sig_exp(f64::from(value));
+            }
+        }
+        terms
+    }
+
+    fn mma_quantize_row(
+        src: &[f32],
+        group: usize,
+        h: &[(f64, i32)],
+        terms: &mut Vec<(f64, i32)>,
+        xr: &mut Vec<f32>,
+        codes: &mut [i8],
+        scale_out: &mut f32,
+    ) {
+        let k = src.len();
+        terms.clear();
+        xr.clear();
+        terms.resize(k, (0.0, 0));
+        xr.resize(k, 0.0);
+        for (i, &value) in src.iter().enumerate() {
+            let rounded = bf16::from_f32(value).to_f32();
+            terms[i] = sig_exp(f64::from(rounded));
+        }
+        let mut peak = 0.0f32;
+        let groups = k / group;
+        for g in 0..groups {
+            let base = g * group;
+            for col in 0..group {
+                let mut acc = 0.0f32;
+                let b_col = &h[col * group..(col + 1) * group];
+                let mut k0 = 0;
+                while k0 < group {
+                    acc = t_fdpa8(&terms[base + k0..base + k0 + 8], &b_col[k0..k0 + 8], acc);
+                    acc = t_fdpa8(
+                        &terms[base + k0 + 8..base + k0 + 16],
+                        &b_col[k0 + 8..k0 + 16],
+                        acc,
+                    );
+                    k0 += 16;
+                }
+                xr[base + col] = acc;
+                peak = peak.max(acc.abs());
+            }
+        }
+        let scale = peak.max(1e-12) / 127.0;
+        *scale_out = scale;
+        let inv = 1.0 / scale;
+        for i in 0..k {
+            let quantized = (xr[i] * inv).round_ties_even().clamp(-127.0, 127.0);
+            codes[i] = quantized as i8;
+        }
+    }
+
+    fn mma_rotate_quant(x: &[f32], k: usize, group: usize) -> Result<(Vec<i8>, Vec<f32>)> {
+        ensure!(
+            k > 0
+                && group >= 16
+                && group.is_multiple_of(16)
+                && k.is_multiple_of(group)
+                && x.len().is_multiple_of(k),
+            "convrot mma shape"
+        );
+        let rows = x.len() / k;
+        let mut codes = vec![0i8; rows * k];
+        let mut scales = vec![0.0f32; rows];
+        if rows == 0 {
+            return Ok((codes, scales));
+        }
+        let h = hadamard_terms(group);
+        let threads = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(rows);
+        let rows_per = rows.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut row0 = 0usize;
+            for (code_rows, scale_rows) in codes
+                .chunks_mut(rows_per * k)
+                .zip(scales.chunks_mut(rows_per))
+            {
+                let rows_here = scale_rows.len();
+                let start = row0;
+                row0 += rows_here;
+                let x_rows = &x[start * k..(start + rows_here) * k];
+                let h = h.as_slice();
+                scope.spawn(move || {
+                    let mut terms = Vec::new();
+                    let mut xr = Vec::new();
+                    for r in 0..rows_here {
+                        mma_quantize_row(
+                            &x_rows[r * k..(r + 1) * k],
+                            group,
+                            h,
+                            &mut terms,
+                            &mut xr,
+                            &mut code_rows[r * k..(r + 1) * k],
+                            &mut scale_rows[r],
+                        );
+                    }
+                });
+            }
+        });
+        Ok((codes, scales))
+    }
+
+    fn emit(line: &str) {
+        println!("{line}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    fn check_group_dot_tiles(device: &Device) -> Result<()> {
+        let group = 256usize;
+        let n = 40usize;
+        for rows in [20usize, 42, 41770] {
+            for k in [5376usize, 7168, 14336] {
+                let (gx, gy, gz) = super::group_dot_grid(
+                    u32::try_from(rows)?,
+                    u32::try_from(k)?,
+                    u32::try_from(group)?,
+                );
+                ensure!(
+                    gx == u32::try_from(rows)?.div_ceil(16)
+                        && gy == 1
+                        && gz == u32::try_from(k)? / u32::try_from(group)?
+                        && gy != u32::try_from(group)? / 8,
+                    "group_dot grid rows={rows} k={k} got {gx},{gy},{gz}"
+                );
+                emit(&format!("CONVROT_MMA rows={rows} k={k} n={n} begin"));
+                let x = activation(rows, k);
+                let qweight = weight(n, k);
+                let wscale = wscale_row(n);
+                let host = {
+                    let (codes, scales) = mma_rotate_quant(&x, k, group)?;
+                    host_product(&codes, &scales, k, &qweight, n, &wscale)?
+                };
+                let y = launch(device, &x, k, group, &qweight, n, &wscale)?;
+                let mismatched = bit_diff(&y, &host);
+                emit(&format!(
+                    "CONVROT_MMA rows={rows} k={k} n={n} differ={mismatched}"
+                ));
+                ensure!(
+                    mismatched == 0,
+                    "convrot mma rows={rows} k={k} n={n} differing bits {mismatched}"
+                );
+                if rows == 20 && k == 5376 {
+                    let (seq_codes, seq_scales) = super::rotate_quant(&x, k, group)?;
+                    let sequential =
+                        super::int8_product(&seq_codes, &seq_scales, k, &qweight, n, &wscale)?;
+                    let seq_diff = bit_diff(&y, &sequential);
+                    emit(&format!(
+                        "CONVROT_SEQUENTIAL rows=20 k=5376 n=40 differ={seq_diff}"
+                    ));
+                    ensure!(seq_diff > 0, "sequential quantize matched the device");
+                }
+                if rows == 41770 && k == 5376 {
+                    let mut swapped = x;
+                    swapped.swap(0, 16);
+                    let mutant = launch(device, &swapped, k, group, &qweight, n, &wscale)?;
+                    let mut_diff = bit_diff(&mutant, &y);
+                    emit(&format!("CONVROT_GROUP_DOT_MUTANT differ={mut_diff}"));
+                    ensure!(mut_diff > 0, "column swap reproduced the device product");
+                }
+            }
+        }
+        let wide = 1024usize;
+        let rows = 20usize;
+        let k = 7168usize;
+        let max = super::max_group(device.info.optin_shared_bytes)?;
+        ensure!(
+            u32::try_from(wide)? <= max,
+            "device tile {max} excludes group {wide}"
+        );
+        emit(&format!(
+            "CONVROT_MAX_GROUP optin={} max={max}",
+            device.info.optin_shared_bytes
+        ));
+        let (gx, gy, gz) = super::group_dot_grid(
+            u32::try_from(rows)?,
+            u32::try_from(k)?,
+            u32::try_from(wide)?,
+        );
+        ensure!(
+            gx == u32::try_from(rows)?.div_ceil(16)
+                && gy == 1
+                && gz == u32::try_from(k)? / u32::try_from(wide)?
+                && gy != u32::try_from(wide)? / 8,
+            "group_dot grid rows={rows} k={k} group={wide} got {gx},{gy},{gz}"
+        );
+        emit(&format!(
+            "CONVROT_MMA rows={rows} k={k} n={n} group={wide} begin"
+        ));
+        let x = activation(rows, k);
+        let qweight = weight(n, k);
+        let wscale = wscale_row(n);
+        let host = {
+            let (codes, scales) = mma_rotate_quant(&x, k, wide)?;
+            host_product(&codes, &scales, k, &qweight, n, &wscale)?
+        };
+        let y = launch(device, &x, k, wide, &qweight, n, &wscale)?;
+        let mismatched = bit_diff(&y, &host);
+        emit(&format!(
+            "CONVROT_MMA rows={rows} k={k} n={n} group={wide} differ={mismatched}"
+        ));
+        ensure!(
+            mismatched == 0,
+            "convrot mma rows={rows} k={k} n={n} group={wide} differing bits {mismatched}"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn convrot_kernel_matches_the_definition() -> Result<()> {
+        let (paper, one, two) = mma_k16_points();
+        ensure!(
+            paper.to_bits() == (-0.5f32).to_bits()
+                && one.to_bits() == 1.0f32.to_bits()
+                && two.to_bits() == 2.0f32.to_bits(),
+            "mma k16 self-check paper={paper} one={one} two={two}"
+        );
         let device = Device::new(0)?;
         let group = 256usize;
         let shapes = [
@@ -695,6 +1113,7 @@ mod device {
                 "convrot kernel M={rows} K={k} N={n} differing bits {mismatched}"
             );
         }
+        check_group_dot_tiles(&device)?;
         let rows = 17usize;
         let k = 256usize;
         let n = 2usize;

@@ -11,6 +11,8 @@ pub mod hip;
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) mod cuda;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub use cuda::Device as BackendDevice;
 #[cfg(feature = "cuda")]
 pub use cuda::cubin::bytes as kernel_cubin;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -367,9 +369,9 @@ pub struct TreeMetadata {
 
 #[cfg(feature = "cuda")]
 pub use cuda::pixal3d::{
-    CoordinateNoise, CornerDecoderOutput, Hi3DGeneration, PixalDecoder, PixalGeneration,
-    PixalOutput, PixalView, SparseDecoderOutput, TriangleVoxels, adaptive_mesh_support,
-    triangle_voxels,
+    CoordinateNoise, CornerDecoderOutput, Hi3DGeneration, PIXAL_NOISE_STREAMS, PixalDecoder,
+    PixalGeneration, PixalOutput, PixalSeededRequest, PixalView, SparseDecoderOutput,
+    TriangleVoxels, adaptive_mesh_support, triangle_voxels,
 };
 
 #[cfg(test)]

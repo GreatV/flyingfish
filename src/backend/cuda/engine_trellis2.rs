@@ -1021,7 +1021,7 @@ pub struct TrellisMesh {
     pub resolution: u32,
 }
 
-fn philox_normals(
+pub(crate) fn philox_normals(
     device: &super::Device,
     seed: u64,
     stream: u64,
