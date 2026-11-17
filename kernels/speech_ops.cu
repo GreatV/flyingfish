@@ -269,35 +269,6 @@ extern "C" __global__ void speech_relative_attention_f32(
     }
 }
 
-// Masked-asr feature mask: input/output [lanes, frequency, time] mel features.
-// speaker_masks [lanes, mask_frames] diar frames binarized at 0.5 and repeated
-// 8x over time; a mask wider than the window is trimmed from the front, a
-// narrower mask left-pads zeros. Frames where the original feature is exactly
-// zero take the log floor.
-extern "C" __global__ void speech_feature_speaker_mask_f32(
-    const float* input, const float* speaker_masks, float* output,
-    uint32_t frequency, uint32_t time, uint32_t mask_frames, uint32_t lanes, float mask_value) {
-    if (blockDim.x != 256 || !input || !speaker_masks || !output || !frequency || !time ||
-        !mask_frames || !lanes || lanes > 4 || !isfinite(mask_value)) {
-        __trap(); return;
-    }
-    const uint64_t count = uint64_t(lanes) * frequency * time;
-    const uint32_t mask_mel = 8u * mask_frames;
-    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
-         i += uint64_t(gridDim.x) * 256) {
-        const uint64_t lane = i / (uint64_t(frequency) * time);
-        const uint64_t local = i - lane * uint64_t(frequency) * time;
-        const uint32_t t = uint32_t(local % time);
-        const float mask = mask_mel >= time
-            ? (speaker_masks[lane * mask_frames + t / 8] > 0.5f ? 1.0f : 0.0f)
-            : (t < time - mask_mel || (t - (time - mask_mel)) / 8 >= mask_frames
-                   ? 0.0f
-                   : (speaker_masks[lane * mask_frames + (t - (time - mask_mel)) / 8] > 0.5f ? 1.0f : 0.0f));
-        const float value = input[i] * mask;
-        output[i] = input[i] == 0.0f ? mask_value : value;
-    }
-}
-
 // Rowwise scale for the layer-0 speaker kernels: input/output [lanes*rows, width],
 // scale [lanes*rows] one factor per row. Per-row arithmetic is lane-count invariant.
 extern "C" __global__ void speech_row_scale_f32(
