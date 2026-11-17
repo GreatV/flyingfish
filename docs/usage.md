@@ -1,8 +1,8 @@
 # CLI usage by model
 
-`flyingfish` and `ff` take the same commands and options. Keep both binaries in the same directory. The [model table](../README.md#models) lists supported weight formats and backends; commands below use the published model directories without converting their weights.
+`flyingfish` and `ff` take the same commands and options. Keep both binaries in the same directory. The README model table lists supported weight formats and backends; commands below use the published model directories without converting their weights.
 
-Replace `<model-dir>` and the other placeholders with your files and directories. Put `--model` before the command. EOU and Multitalker transcription take the actual `<model.nemo>` archive instead of a directory. Keep runtime data and output files outside model directories; output parent directories must exist, and media/text output files must not already exist.
+Replace `<model-dir>` and the other placeholders with your files and directories. Put `--model` before the command. EOU and Multitalker transcription take the actual `<model.nemo>` archive instead of a directory. Keep runtime data and output files outside model directories; output parent directories must exist, and media and text output files must not already exist.
 
 ```sh
 flyingfish --help
@@ -19,13 +19,13 @@ flyingfish --model <model-dir> --runtime-dir <runtime-dir> calibrate
 
 `calibrate` measures kernels and transfer rates for a machine and model and writes calibration into the runtime directory. MoE models other than DeepSeek-V4.1-Flash require it; DeepSeek uses fixed execution plans. `--runtime-dir` must be outside any model directory. The speech, embedding, media and image-to-3D commands below also require a runtime directory.
 
-| Option | Default / accepted values | Use |
+| Option | Default and accepted values | Use |
 |---|---|---|
-| `--model <MODEL>` | Required, or `FLYINGFISH_MODEL` | Published model directory, or EOU/Multitalker `.nemo` archive; before the command |
+| `--model <MODEL>` | Required, or `FLYINGFISH_MODEL` | Published model directory, or EOU and Multitalker `.nemo` archive; before the command |
 | `--runtime-dir <RUNTIME_DIR>` | Unset, or `FLYINGFISH_RUNTIME_DIR` | Per-machine calibration |
 | `--device <DEVICE>` | `0` | GPU index |
 | `--verbose` | Flag | Print placement, Lt and decode-plan diagnostics |
-| `--capacity <CAPACITY>` | `4096` | Token workspace / KV capacity |
+| `--capacity <CAPACITY>` | `4096` | Token workspace and KV capacity |
 | `--chunk <CHUNK>` | Derived from VRAM budget and tile shapes | Prefill chunk override |
 | `--device-budget-gib <DEVICE_BUDGET_GIB>` | Unset senses free device memory at setup | Declared device budget in GiB for expert-tier derivation |
 | `--draft-model <DRAFT_MODEL>` | Unset, or `FLYINGFISH_DRAFT_MODEL` | DSpark draft directory |
@@ -34,12 +34,12 @@ flyingfish --model <model-dir> --runtime-dir <runtime-dir> calibrate
 | `--spec-graph <SPEC_GRAPH>` | `true`; `true`, `false` | Speculative graph execution |
 | `--prefix-cache <PREFIX_CACHE>` | `false`; `true`, `false` | Prefix cache |
 | `--kv-format <KV_FORMAT>` | `bf16`; `bf16`, `affine8` | `affine8` stores an 8-bit KV cache for long contexts |
-| `--dram-gb-s <DRAM_GB_S>` | `958` | DRAM reference denominator in GB/s; default is an RTX 4090 reference value |
-| `--gemm-tflops <GEMM_TFLOPS>` | `166.06` | GEMM reference denominator in TFLOP/s; default is an RTX 4090 reference value |
+| `--dram-gb-s <DRAM_GB_S>` | `958` | DRAM reference denominator in GB per second; default is an RTX 4090 reference value |
+| `--gemm-tflops <GEMM_TFLOPS>` | `166.06` | GEMM reference denominator in TFLOP per second; default is an RTX 4090 reference value |
 | `-h`, `--help` | Flag | Print help |
 | `-V`, `--version` | Root flag | Print version |
 
-Shared options other than `--model` can also follow the command. The CLI exposes generation/speculation options globally; media and speech commands use their family-specific request paths.
+Shared options other than `--model` can also follow the command. The CLI exposes generation and speculation options globally; media and speech commands use their family-specific request paths.
 
 ## Language and multimodal models
 
@@ -63,7 +63,7 @@ flyingfish --model <MiniMax-H3-Image-PE-dir> --runtime-dir <runtime-dir> generat
 
 Exactly one input is required: `--prompt <PROMPT>` for raw text, `--tokens <TOKENS>` for comma-separated token IDs, or `--tokens-file <TOKENS_FILE>` for JSON. A tokens file accepts an ID array, an `input_ids` array, or the first row of nested `input_ids`. Generation prints JSON with input IDs, generated IDs and decoded text.
 
-| Generate option | Default / requirement |
+| Generate option | Default and requirement |
 |---|---|
 | `--max-new-tokens <MAX_NEW_TOKENS>` | `32` |
 | `--graph` | Enable graph decode |
@@ -108,15 +108,15 @@ flyingfish --model <model-dir> --runtime-dir <runtime-dir> serve --port 8080
 flyingfish --model <MiniCPM-V-4.7-dir> --draft-model <DSpark-dir> --runtime-dir <runtime-dir> serve --port 8080
 ```
 
-`serve` exposes `/v1/completions` and `/v1/chat/completions`. `--port <PORT>` defaults to `8080`. `--mtp <MTP>` has the same checkpoint-dependent default as generation; `0` selects plain serving.
+`serve` exposes `http://<host>:<port>/v1/completions` and `http://<host>:<port>/v1/chat/completions`. `--port <PORT>` defaults to `8080`. `--mtp <MTP>` has the same checkpoint-dependent default as generation; `0` selects plain serving.
 
-For image-capable models, chat messages accept `image_url` content parts with a base64 PNG or JPEG data URL. Raw image filenames are not `generate --prompt` inputs; `generate --image-tensors` consumes a processor-packed trace. The model table's image/audio capabilities include library entry points; they do not imply a CLI flag for each modality.
+For image-capable models, chat messages accept `image_url` content parts with a base64 PNG or JPEG data URL. Raw image filenames are not `generate --prompt` inputs; `generate --image-tensors` consumes a processor-packed trace. The model table's image and audio capabilities include library entry points; they do not imply a CLI flag for each modality.
 
 ### EmbeddingGemma-2
 
 ```sh
-flyingfish --model <EmbeddingGemma-2-dir> --runtime-dir <runtime-dir> embed --text "a red cube" -o embedding.json
-flyingfish --model <EmbeddingGemma-2-dir> --runtime-dir <runtime-dir> embed --input <text-file> -o embedding.json
+flyingfish --model <EmbeddingGemma-2-dir> --runtime-dir <runtime-dir> embed --text "a red cube" -o <embedding.json>
+flyingfish --model <EmbeddingGemma-2-dir> --runtime-dir <runtime-dir> embed --input <text-file> -o <embedding.json>
 ```
 
 Exactly one of `--text <TEXT>` and `--input <INPUT>` is required. File input is UTF-8; `--input -` reads stdin. Output is JSON with a 768-value `embedding` and `dimension`. `-o, --output <OUTPUT>` selects a `.json` file; omitted output writes JSON to stdout. Image and audio embeddings remain library-only.
@@ -136,13 +136,13 @@ All speech commands below use CUDA. Transcription and diarization input is mono 
 
 | Transcription model | `--model` input |
 |---|---|
-| Parakeet TDT, Canary-1B-v2, Nemotron 3.5 ASR | Published directory containing `config.json` and safetensors |
+| Parakeet TDT, Canary-1B-v2, Nemotron 3.5 ASR | Published directory containing `<config.json>` and safetensors |
 | Parakeet realtime EOU, Multitalker Parakeet | Actual `<model.nemo>` archive file; its containing directory is not accepted |
 
 ### Parakeet TDT
 
 ```sh
-flyingfish --model <Parakeet-TDT-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --format srt -o transcript.srt
+flyingfish --model <Parakeet-TDT-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --format srt -o <transcript.srt>
 ```
 
 `--format <FORMAT>` defaults to `txt`; accepted values are `txt`, `json`, `srt`, `vtt`. Parakeet produces greedy TDT text and duration-derived subtitle cues. This path is offline; `--stream` is not supported for Parakeet TDT.
@@ -150,25 +150,25 @@ flyingfish --model <Parakeet-TDT-dir> --runtime-dir <runtime-dir> transcribe <au
 ### Canary-1B-v2
 
 ```sh
-flyingfish --model <Canary-1B-v2-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --source-lang en --target-lang en --pnc --format json -o transcript.json
+flyingfish --model <Canary-1B-v2-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --source-lang en --target-lang en --pnc --format json -o <transcript.json>
 ```
 
-`--source-lang <SOURCE_LANG>` and `--target-lang <TARGET_LANG>` both default to `en`. `--pnc` and `--no-pnc` are mutually exclusive; punctuation/capitalization is enabled unless `--no-pnc` is given. Canary uses published language/punctuation prompts; Canary subtitles are whole-clip only. `--stream` is not supported for Canary.
+`--source-lang <SOURCE_LANG>` and `--target-lang <TARGET_LANG>` both default to `en`. `--pnc` and `--no-pnc` are mutually exclusive; punctuation and capitalization are enabled unless `--no-pnc` is given. Canary uses published language and punctuation prompts; Canary subtitles are whole-clip only. `--stream` is not supported for Canary.
 
 ### Nemotron 3.5 ASR streaming 0.6B
 
 ```sh
-flyingfish --model <Nemotron-3.5-ASR-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --format txt -o transcript.txt
-flyingfish --model <Nemotron-3.5-ASR-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --stream --format json -o transcript.json
+flyingfish --model <Nemotron-3.5-ASR-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --format txt -o <transcript.txt>
+flyingfish --model <Nemotron-3.5-ASR-dir> --runtime-dir <runtime-dir> transcribe <audio.wav> --stream --format json -o <transcript.json>
 ```
 
-`--stream` selects cache-aware chunked-stream FastConformer encoding with shared greedy RNNT prediction/joint decode; omitted, it encodes the full clip. Both modes consume the supplied WAV. `--format <FORMAT>` defaults to `txt`; accepted values are `txt`, `json`, `srt`, `vtt`. Subtitle cues are whole-clip in both modes. The decoder uses blank 13087 and at most 10 symbols per step.
+`--stream` selects cache-aware chunked-stream FastConformer encoding with shared greedy RNNT prediction and joint decode; omitted, it encodes the full clip. Both modes consume the supplied WAV. `--format <FORMAT>` defaults to `txt`; accepted values are `txt`, `json`, `srt`, `vtt`. Subtitle cues are whole-clip in both modes. The decoder uses blank 13087 and at most 10 symbols per step.
 
 ### Parakeet realtime EOU 120M
 
 ```sh
-flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <audio.wav> --format txt -o transcript.txt
-flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <audio.wav> --stream --format vtt -o transcript.vtt
+flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <audio.wav> --format txt -o <transcript.txt>
+flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <audio.wav> --stream --format vtt -o <transcript.vtt>
 ```
 
 Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware streaming with a reset on end-of-utterance. Offline subtitles are whole-clip only, streaming subtitles are per utterance. `--stream` selects the streaming path over the supplied clip.
@@ -176,8 +176,8 @@ Reads the `.nemo` container in place; offline greedy RNNT decode and cache-aware
 ### Nemotron-3-Diarization
 
 ```sh
-flyingfish --model <Nemotron-3-Diarization-dir> --runtime-dir <runtime-dir> diarize <meeting.wav> -o meeting.rttm
-flyingfish --model <Nemotron-3-Diarization-dir> --runtime-dir <runtime-dir> diarize <meeting.wav> --stream --threshold 0.5 -o meeting.rttm
+flyingfish --model <Nemotron-3-Diarization-dir> --runtime-dir <runtime-dir> diarize <meeting.wav> -o <meeting.rttm>
+flyingfish --model <Nemotron-3-Diarization-dir> --runtime-dir <runtime-dir> diarize <meeting.wav> --stream --threshold 0.5 -o <meeting.rttm>
 ```
 
 `--threshold <THRESHOLD>` defaults to `0.5`; `--stream` selects streaming speaker diarization. RTTM output preserves overlaps and uses arrival-order speaker channels.
@@ -185,7 +185,7 @@ flyingfish --model <Nemotron-3-Diarization-dir> --runtime-dir <runtime-dir> diar
 ### Multitalker Parakeet streaming 0.6B
 
 ```sh
-flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <meeting.wav> --diar-model <Nemotron-3-Diarization-dir> --format json -o speakers.json
+flyingfish --model <model.nemo> --runtime-dir <runtime-dir> transcribe <meeting.wav> --diar-model <Nemotron-3-Diarization-dir> --format json -o <speakers.json>
 ```
 
 `--diar-model <DIAR_MODEL>` is required to select the multitalker path. The `.nemo` container is read in place. Nemotron-3-Diarization arrival-order channels 0-3 are the lanes; speaker kernels run by default. `--masked` selects masked-ASR lane masking and requires `--diar-model`. `--stream` selects streaming diarization for the masks. A fifth active diarization channel errors instead of being dropped.
@@ -195,9 +195,9 @@ Output contains per-speaker text with word timestamps; `txt`, `json`, `srt` and 
 ### Breeze-TTS-2
 
 ```sh
-flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak "Hello, world." --seed 42 -o speech.wav
-flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak - -o speech.wav < text.txt
-flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak "Hello, world." > speech.wav
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak "Hello, world." --seed 42 -o <speech.wav>
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak - -o <speech.wav> < <text.txt>
+flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <runtime-dir> speak "Hello, world." > <speech.wav>
 ```
 
 The positional `<TEXT>` is required; `-` reads UTF-8 text from stdin. `--seed <SEED>` defaults to `42`. `-o, --output <OUTPUT>` writes mono 24 kHz PCM16 WAV; omitted output writes WAV bytes to stdout. The command runs free-running text-to-speech with published-config sampling and seeded Philox draws, followed by audio tokenizer decode. Greedy decode over supplied audio-code frames remains available through the library.
@@ -209,19 +209,19 @@ These commands use CUDA. Default stderr contains progress and errors only, with 
 ### MiniMax-H3 image-to-video with audio
 
 ```sh
-flyingfish --model <MiniMax-H3-dir> --runtime-dir <runtime-dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <turbo-lora.safetensors> -o out.mp4
-flyingfish --model <MiniMax-H3-dir> --runtime-dir <runtime-dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <turbo-lora.safetensors> --gguf <transformer.gguf> -o out.y4m --json
+flyingfish --model <MiniMax-H3-dir> --runtime-dir <runtime-dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <turbo-lora.safetensors> -o <out.mp4>
+flyingfish --model <MiniMax-H3-dir> --runtime-dir <runtime-dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <turbo-lora.safetensors> --gguf <transformer.gguf> -o <out.y4m> --json
 ```
 
 MiniMax-H3 video requires a keyframe, a frame count and a seed. Requested frames round up to `17n+5`, so 136 resolves to 141; the published duration is 5-15 seconds at 24 fps. No documented frame-count or seed defaults exist.
 
-| Video option | Required input / behavior |
+| Video option | Required input and behavior |
 |---|---|
 | `--prompt <PROMPT>` | Required video description |
 | `--image <IMAGE>` | Keyframe image, required for MiniMax-H3 |
 | `--frames <FRAMES>` | Required frame count; aligned as above |
 | `--seed <SEED>` | Required noise seed |
-| `--lora <LORA>` | Required Turbo LoRA safetensors, for example `minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors` |
+| `--lora <LORA>` | Required Turbo LoRA safetensors, for example `<minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors>` |
 | `--gguf <GGUF>` | Optional GGUF Q4_0 transformer instead of transformer safetensors; the model directory still supplies the other components |
 | `-o, --output <OUTPUT>` | Required `.mp4`, or `.y4m` with a sibling `.wav` |
 | `--json` | Print resolved output metadata, including aligned frame count, as JSON |
@@ -231,13 +231,13 @@ MP4 output requires ffmpeg on `PATH`. Y4M+WAV output does not require it. Withou
 ### HyperFlow H3 Flash video with audio
 
 ```sh
-flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <runtime-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --frames 124 --seed 42 -o out.mp4
-flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <runtime-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o out.y4m --json
+flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <runtime-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --frames 124 --seed 42 -o <out.mp4>
+flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <runtime-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o <out.y4m> --json
 ```
 
-HyperFlow uses the published `fl2va_int8_convrot` component and MiniMax-H3 companion files supplied by `--base-model`, without an external LoRA or GGUF replacement. It supports text-only, first, last and first+last keyframes; ref2va media inputs are not supported. Frames round up to `17n+5`, within 124-362 aligned frames at 24 fps. The sampler uses the published six-step grid with video/audio shifts 12/3.
+HyperFlow uses the published `fl2va_int8_convrot` component and MiniMax-H3 companion files supplied by `--base-model`, without an external LoRA or GGUF replacement. It supports text-only, first, last and first+last keyframes; ref2va media inputs are not supported. Frames round up to `17n+5`, within 124-362 aligned frames at 24 fps. The sampler uses the published six-step grid with video and audio shifts 12 and 3, respectively.
 
-| HyperFlow video option | Required input / behavior |
+| HyperFlow video option | Required input and behavior |
 |---|---|
 | `--prompt <PROMPT>` | Required video description |
 | `--base-model <BASE_MODEL>` | Required MiniMax-H3 companion checkpoint for the text encoder and VAEs |
@@ -253,8 +253,8 @@ Omit both keyframes for text-to-video; provide either one for a single anchor, o
 ### MiniMax-H3-Image
 
 ```sh
-flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <runtime-dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o cube.png --json
-flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <runtime-dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 --expand <prompt-expander-dir> --edit <reference.png> --edit <second-reference.png> -o edited.png
+flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <runtime-dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o <cube.png> --json
+flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <runtime-dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 --expand <prompt-expander-dir> --edit <reference.png> --edit <second-reference.png> -o <edited.png>
 ```
 
 `image` requires `--prompt <PROMPT>`, `--size <SIZE>` in `WIDTHxHEIGHT` form, `--seed <SEED>` and `-o, --output <OUTPUT>`. No seed default is documented. `--expand <EXPAND>` replaces the prompt through the expander; repeated `--edit <EDIT>` supplies upright RGB8 references. Output is PNG at the requested size, and `--json` reports size, seed and reference count. Without it, stdout prints the output path.
@@ -264,11 +264,11 @@ Prompt-to-image is usable. Native generation uses six-step Euler under a derived
 ### MiniMax-Music3
 
 ```sh
-flyingfish --model <MiniMax-Music3-dir> --runtime-dir <runtime-dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse] Morning light" --seed 7 --frames 25 -o song.wav
-flyingfish --model <MiniMax-Music3-dir> --runtime-dir <runtime-dir> music --prompt "A warm acoustic pop song" --lyrics - --seed 7 -o song.wav < lyrics.txt
+flyingfish --model <MiniMax-Music3-dir> --runtime-dir <runtime-dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse] Morning light" --seed 7 --frames 25 -o <song.wav>
+flyingfish --model <MiniMax-Music3-dir> --runtime-dir <runtime-dir> music --prompt "A warm acoustic pop song" --lyrics - --seed 7 -o <song.wav> < <lyrics.txt>
 ```
 
-`music` requires `--prompt <PROMPT>` (caption), `--lyrics <LYRICS>` and `--seed <SEED>`. Lyrics accept optional section tags; `--lyrics -` reads stdin. `--frames <FRAMES>` defaults to `1500` (60 seconds at 25 fps). `-o, --output <OUTPUT>` writes stereo 44.1 kHz PCM16 WAV; omitted output writes WAV bytes to stdout. The command uses published caption/lyrics prompt construction with paired conditional/unconditional IDs, the autoregressive stage and synthesis stage.
+`music` requires `--prompt <PROMPT>` (caption), `--lyrics <LYRICS>` and `--seed <SEED>`. Lyrics accept optional section tags; `--lyrics -` reads stdin. `--frames <FRAMES>` defaults to `1500` (60 seconds at 25 fps). `-o, --output <OUTPUT>` writes stereo 44.1 kHz PCM16 WAV; omitted output writes WAV bytes to stdout. The command uses published caption and lyrics prompt construction with paired conditional and unconditional IDs, the autoregressive stage and synthesis stage.
 
 ## Image to 3D
 
@@ -277,8 +277,8 @@ flyingfish --model <MiniMax-Music3-dir> --runtime-dir <runtime-dir> music --prom
 ### Pixal3D
 
 ```sh
-flyingfish --model <Pixal3D-dir> --runtime-dir <runtime-dir> to-3d <image.png> --dino <DINOv3-dir> --naf <NAF-dir> --camera <camera.json> --resolution 1536 --seed 42 -o mesh.ply
-flyingfish --model <Pixal3D-MV-dir> --runtime-dir <runtime-dir> to-3d <front.png> --view <back.png> --dino <DINOv3-dir> --naf <NAF-dir> --camera <front-camera.json> --camera <back-camera.json> --resolution 1024 --seed 42 -o mesh.ply
+flyingfish --model <Pixal3D-dir> --runtime-dir <runtime-dir> to-3d <image.png> --dino <DINOv3-dir> --naf <NAF-dir> --camera <camera.json> --resolution 1536 --seed 42 -o <mesh.ply>
+flyingfish --model <Pixal3D-MV-dir> --runtime-dir <runtime-dir> to-3d <front.png> --view <back.png> --dino <DINOv3-dir> --naf <NAF-dir> --camera <front-camera.json> --camera <back-camera.json> --resolution 1024 --seed 42 -o <mesh.ply>
 ```
 
 Pixal3D requires `--dino <DINO>`, `--naf <NAF>` and one `--camera <JSON>` per view. Repeated `--view <IMAGE>` adds RGBA views; cameras are paired in input order, starting with the positional image. `--resolution <RESOLUTION>` defaults to `0`, selecting the model default (Pixal3D `1536`); Pixal3D accepts `1024` or `1536`. `--seed <SEED>` defaults to `0`.
@@ -294,7 +294,7 @@ MoGe-2 estimation is not integrated and a missing camera errors. The four stage 
 ### TRELLIS.2-4B
 
 ```sh
-flyingfish --model <TRELLIS.2-4B-dir> --runtime-dir <runtime-dir> to-3d <image.png> --dino <DINOv3-dir> --seed 42 -o mesh.ply
+flyingfish --model <TRELLIS.2-4B-dir> --runtime-dir <runtime-dir> to-3d <image.png> --dino <DINOv3-dir> --seed 42 -o <mesh.ply>
 ```
 
 TRELLIS.2 requires `--dino <DINO>`. `--seed <SEED>` defaults to `0`. It uses the default 1024-cascade pipeline; `--view`, `--camera`, `--naf` and a nonzero `--resolution` are Pixal3D options and are rejected for TRELLIS.2.
@@ -307,9 +307,9 @@ Idol uses `flyingfish::backend::IdolPipelineRuntime`: a preprocessed 1024 px ima
 
 ## Inspection, verification and profiling commands
 
-These commands share the model/runtime options above. In the command lines below, prepend `flyingfish --model <model-dir> --runtime-dir <runtime-dir>`. Input-based commands accept exactly one of `--prompt`, `--tokens` and `--tokens-file`, as in generation. Fixture, plan and limits files must match the model and the corresponding acceptance gate.
+These commands share the model and runtime options above. In the command lines below, prepend `flyingfish --model <model-dir> --runtime-dir <runtime-dir>`. Input-based commands accept exactly one of `--prompt`, `--tokens` and `--tokens-file`, as in generation. Fixture, plan and limits files must match the model and the corresponding acceptance gate.
 
-| Command and required arguments | Optional arguments / defaults | Input / output |
+| Command and required arguments | Optional arguments and defaults | Input and output |
 |---|---|---|
 | `inspect` | Shared options | Reads model config; prints the parsed config |
 | `tokenize --prompt "Hello"` | Shared options | Raw text to a JSON token-ID array |
@@ -322,7 +322,7 @@ These commands share the model/runtime options above. In the command lines below
 | `bench-spec --prompt "Hello"` | `--steps 256`, `--runs 3` | DSpark benchmark |
 | `verify-spec --prompt "Hello" --strict` | `--steps 64`, `--reference <reference>`; replace `--strict` with `--logit-limits <limits.json> --prompt-name <name>` for bounded comparison | DSpark greedy comparison |
 | `replay-draft --plan <plan> --thresholds <thresholds>` | Shared options | Supplied draft replay plan and thresholds |
-| `compare-spec-graph --prompt "Hello"` | `--steps 64` | Eager/graph DSpark comparison |
+| `compare-spec-graph --prompt "Hello"` | `--steps 64` | Eager and graph DSpark comparison |
 | `compare-tree-padding --prompt "Hello"` | `--nodes 9` | Tree padding comparison |
 | `compare-tree-builders --prompt "Hello"` | `--steps 256` | Tree builder comparison |
 | `replay-tree --plan <plan> --dump <dump> --commit-policy fixture --reset-each-round` | Shared options | Replay fixture commits and write a dump |
