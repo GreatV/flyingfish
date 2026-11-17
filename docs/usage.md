@@ -301,9 +301,19 @@ TRELLIS.2 requires `--dino <DINO>`. `--seed <SEED>` defaults to `0`. It uses the
 
 Raw mesh only (no fill, simplify, UV, bake or render), RGBA input with the background already removed, and the decoder and structure-latent outputs differ from the reference at F16 quanta. Remaining work includes render, GLB and bake, the shape and texture encoders, and closing those differences.
 
+### Hi3D
+
+```sh
+flyingfish --model <Hi3D-dir> --runtime-dir <runtime-dir> to-3d <image.png> --dino <DINOv2-dir> --clip <CLIP-dir> --mesh <coarse.ply> --resolution 512 --seed 42 -o <mesh.ply>
+```
+
+Hi3D requires `--dino <DINOv2>`, `--clip <CLIP>` and `--mesh <PLY>`, a coarse mesh to refine. `--orientation <N>` defaults to `1`; `--resolution <RESOLUTION>` defaults to `0`, selecting the model default (Hi3D `512`); Hi3D accepts `512`, `1024` or `1536`. `--seed <SEED>` defaults to `0`. `--view`, `--camera` and `--naf` are Pixal3D options and are rejected for Hi3D.
+
+The result is a hole-filled, simplified and normalized mesh, and same-seed reruns are bit-stable.
+
 ### Library-only image-to-3D entries
 
-Idol uses `flyingfish::backend::IdolPipelineRuntime`: a preprocessed 1024 px image to a Gaussian splat and a camera. Hi3D uses `flyingfish::backend::Hi3DGeneration`: DINOv2 and CLIP image conditioning, sparse flow and sparse VAE decoder at 512, 1024 or 1536, refining a supplied coarse mesh. Neither is selected by the current `to-3d` command.
+Idol uses `flyingfish::backend::IdolPipelineRuntime`: a preprocessed 1024 px image to a Gaussian splat and a camera. It is not selected by the current `to-3d` command.
 
 ## Inspection, verification and profiling commands
 
