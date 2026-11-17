@@ -1756,8 +1756,11 @@ extern "C" __global__ void batch_group_moments_finish_f32(
         }
         const float denominator = __fadd_rn(float(count), eps);
         const float mean = float(sum / double(denominator));
-        const float variance =
-            float(squares / double(denominator) - double(mean) * double(mean));
+        // The per-element squares are F32-rounded, so for constant inputs the
+        // second moment can sit below the double mean square; clamp before eps.
+        const double centered =
+            squares / double(denominator) - double(mean) * double(mean);
+        const float variance = float(centered < 0.0 ? 0.0 : centered);
         moments[2 * bg] = mean;
         moments[2 * bg + 1] = rsqrtf(__fadd_rn(variance, eps));
     }
