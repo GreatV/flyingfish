@@ -1433,6 +1433,42 @@ fn hi3d_decoder_complete_gpu() -> Result<()> {
     Ok(())
 }
 
+/// Constant features make the F32-rounded second moment sit below the
+/// double mean square; the variance must clamp to zero, not go negative
+/// through the reciprocal square root.
+#[test]
+#[ignore = "requires admitted GPU; no published weights"]
+fn batch_group_norm_constant_features_stay_finite() -> Result<()> {
+    use crate::backend::cuda::sparse::BatchGroupNorm;
+    let d = Device::new(0)?;
+    let offsets = vec![0u32, 32];
+    let plan = BatchGroupNorm::new(&d, &offsets, 1024, 32, 1e-6, 16 << 20)?;
+    let input = d.stream.clone_htod(&vec![8.001_953f32; 32 * 1024])?;
+    let ones = d.stream.clone_htod(&vec![1.0f32; 1024])?;
+    let zeros = d.stream.clone_htod(&vec![0.0f32; 1024])?;
+    let output = d.stream.alloc_zeros::<f32>(32 * 1024)?;
+    plan.run::<f32, f32>(
+        matrix(ptr(&input, &d), 32, 1024)?,
+        [
+            view(&ones, &d.stream, 0, [1024], [1])?,
+            view(&zeros, &d.stream, 0, [1024], [1])?,
+        ],
+        &mut TensorMut(matrix(ptr(&output, &d), 32, 1024)?),
+    )?;
+    let values = d.stream.clone_dtoh(&output)?;
+    ensure!(
+        values.iter().all(|v| v.is_finite()),
+        "constant features produced non-finite normalized values"
+    );
+    println!(
+        "PASS GROUP_NORM_CONSTANT max_abs={} finite=true",
+        values
+            .iter()
+            .fold(0.0f64, |m, v| m.max((f64::from(*v)).abs()))
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires admitted GPU, published decoder and frozen reference inputs"]
 fn hi3d_decoder_norm_activation_gpu() -> Result<()> {
