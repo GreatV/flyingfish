@@ -89,11 +89,11 @@ extern "C" __global__ void convrot_linear(
 }
 
 // 17 rows and above. One block owns 16 rows and one group.
-// The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
+// The activation is bf16. The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
 // grid: (ceil(rows/16), 1, k/group). block: 256.
 // Dynamic smem is 16*group bf16, then 8*8*16 bf16. Bytes are 32*group+2048.
-extern "C" __global__ void convrot_group_dot(const float* __restrict__ x, float* __restrict__ y, int rows, int k,
-                                             int group) {
+extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x, float* __restrict__ y, int rows,
+                                             int k, int group) {
     if (rows < 17 || group < 16 || (group & 15) || (k % group)) __trap();
     constexpr int STRIDE = 16;
     extern __shared__ __align__(16) __nv_bfloat16 tile[];
@@ -108,11 +108,11 @@ extern "C" __global__ void convrot_group_dot(const float* __restrict__ x, float*
         const int r = i / group;
         const int c = i - r * group;
         const int gr = row0 + r;
-        float v = 0.f;
+        __nv_bfloat16 v = __float2bfloat16(0.f);
         if (gr < rows) v = x[static_cast<long long>(gr) * k + x_col0 + c];
         const int panel = c >> 4;
         const int local = c & 15;
-        atile[panel * (16 * STRIDE) + r * STRIDE + local] = __float2bfloat16(v);
+        atile[panel * (16 * STRIDE) + r * STRIDE + local] = v;
     }
     __syncthreads();
     __nv_bfloat16* bt = bsmem + warp * (8 * STRIDE);

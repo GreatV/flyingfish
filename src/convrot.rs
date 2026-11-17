@@ -1,9 +1,9 @@
 //! Int8 linear with a block-diagonal regular Hadamard rotate-quant prologue.
 //! `y = bf16((q(x R) @ qweight^T) * s_x * wscale)`, int32 products.
 //! `R` is `kron(H4 / 2, ...)` of `group` (a power of 4), not stored.
-//! Below [`TENSOR_CORE_ROWS`], `x` is cast to bf16, each rotated group is an f32 dot rounded
+//! Below [`TENSOR_CORE_ROWS`], `x` is f32 cast to bf16, each rotated group is an f32 dot rounded
 //! back to bf16, `s_x = max(|xR|, 1e-12) / 127`, and `q` is ties-to-even of `xR / s_x`.
-//! At [`TENSOR_CORE_ROWS`] and above, the device kernel's dot is `mma.m16n8k16` (bf16 in, f32
+//! At [`TENSOR_CORE_ROWS`] and above, `x` is bf16. The device kernel's dot is `mma.m16n8k16` (bf16 in, f32
 //! accumulator, K in groups of 16) and `q` is ties-to-even of `xR * (1/s_x)`.
 //! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 61440 bytes dynamic smem.
 //! [`linear`] is the below-[`TENSOR_CORE_ROWS`] form.
@@ -785,6 +785,37 @@ mod device {
         Ok(())
     }
 
+    fn rotated_mismatch(x: &[f32], got: &[f32], k: usize, group: usize) -> Result<usize> {
+        ensure!(
+            k > 0 && x.len() == got.len() && x.len().is_multiple_of(k),
+            "convrot rotated shape"
+        );
+        let rows = x.len() / k;
+        let h = hadamard_terms(group);
+        let mut terms = Vec::new();
+        let mut xr = Vec::new();
+        let mut codes = vec![0i8; k];
+        let mut scale = 0.0f32;
+        let mut differ = 0usize;
+        for r in 0..rows {
+            mma_quantize_row(
+                &x[r * k..(r + 1) * k],
+                group,
+                &h,
+                &mut terms,
+                &mut xr,
+                &mut codes,
+                &mut scale,
+            );
+            differ += xr
+                .iter()
+                .zip(&got[r * k..(r + 1) * k])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+        }
+        Ok(differ)
+    }
+
     fn tile_row_offset_diff(rotated: &[f32], codes: &[i8], k: usize) -> usize {
         let rows = codes.len() / k;
         let mut differ = 0usize;
@@ -831,6 +862,55 @@ mod device {
         .y)
     }
 
+    struct HeldActivation {
+        ptr: u64,
+        host_bf16: Option<Vec<bf16>>,
+        dev_f32: Option<crate::backend::gpu::CudaSlice<f32>>,
+        dev_bf16: Option<crate::backend::gpu::CudaSlice<bf16>>,
+    }
+
+    impl HeldActivation {
+        fn release(self) {
+            let HeldActivation {
+                host_bf16,
+                dev_f32,
+                dev_bf16,
+                ptr: _,
+            } = self;
+            drop(host_bf16);
+            drop(dev_f32);
+            drop(dev_bf16);
+        }
+    }
+
+    // At TENSOR_CORE_ROWS and above, the device bytes are bf16::from_f32 of x.
+    fn upload_activation(
+        stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+        x: &[f32],
+        rows: usize,
+    ) -> Result<HeldActivation> {
+        if rows >= super::TENSOR_CORE_ROWS {
+            let values: Vec<bf16> = x.iter().copied().map(bf16::from_f32).collect();
+            let slice = stream.clone_htod(&values)?;
+            let ptr = slice.device_ptr(stream).0;
+            Ok(HeldActivation {
+                ptr,
+                host_bf16: Some(values),
+                dev_f32: None,
+                dev_bf16: Some(slice),
+            })
+        } else {
+            let slice = stream.clone_htod(x)?;
+            let ptr = slice.device_ptr(stream).0;
+            Ok(HeldActivation {
+                ptr,
+                host_bf16: None,
+                dev_f32: Some(slice),
+                dev_bf16: None,
+            })
+        }
+    }
+
     fn launch_kept(device: &Device, input: HostLaunch<'_>) -> Result<Ran> {
         let HostLaunch {
             x,
@@ -854,7 +934,7 @@ mod device {
             "convrot launch extent"
         );
         let stream = &device.stream;
-        let x_d = stream.clone_htod(x)?;
+        let held = upload_activation(stream, x, rows)?;
         let weight_d = stream.clone_htod(qweight)?;
         let scale_d = stream.clone_htod(wscale)?;
         let y_d = stream.alloc_zeros::<bf16>(total)?;
@@ -866,7 +946,7 @@ mod device {
             stream,
             &fns,
             &ConvrotArgs {
-                x: x_d.device_ptr(stream).0,
+                x: held.ptr,
                 qweight: weight_d.device_ptr(stream).0,
                 wscale: scale_d.device_ptr(stream).0,
                 y: y_d.device_ptr(stream).0,
@@ -880,6 +960,7 @@ mod device {
             },
         )?;
         stream.synchronize()?;
+        held.release();
         let y = stream.clone_dtoh(&y_d)?;
         let (rotated, codes, scales) = if keep {
             (
@@ -1140,7 +1221,7 @@ mod device {
     fn check_group_dot_tiles(device: &Device) -> Result<()> {
         let group = 256usize;
         let n = 40usize;
-        for rows in [20usize, 42, 41770] {
+        for rows in [17usize, 20, 42, 41770] {
             for k in [5376usize, 7168, 14336] {
                 let (gx, gy, gz) = super::group_dot_grid(
                     u32::try_from(rows)?,
@@ -1158,11 +1239,9 @@ mod device {
                 let x = activation(rows, k);
                 let qweight = weight(n, k);
                 let wscale = wscale_row(n);
-                let host = {
-                    let (codes, scales) = mma_rotate_quant(&x, k, group)?;
-                    host_product(&codes, &scales, k, &qweight, n, &wscale)?
-                };
-                let quant = rows == 20 || rows == 42;
+                let (host_codes, host_scales) = mma_rotate_quant(&x, k, group)?;
+                let host = host_product(&host_codes, &host_scales, k, &qweight, n, &wscale)?;
+                let quant = rows == 17 || rows == 20 || rows == 42;
                 let ran = launch_kept(
                     device,
                     HostLaunch {
@@ -1185,6 +1264,23 @@ mod device {
                 );
                 if quant {
                     check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
+                    let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
+                    emit(&format!(
+                        "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
+                    ));
+                    ensure!(
+                        rotated_diff == 0,
+                        "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
+                    );
+                    let host_code_diff = count_i8(&host_codes, &ran.codes);
+                    let host_scale_diff = count_f32(&host_scales, &ran.scales);
+                    emit(&format!(
+                        "CONVROT_HOST rows={rows} k={k} codes={host_code_diff} scales={host_scale_diff}"
+                    ));
+                    ensure!(
+                        host_code_diff == 0 && host_scale_diff == 0,
+                        "convrot host rows={rows} k={k} codes {host_code_diff} scales {host_scale_diff}"
+                    );
                 }
                 if rows == 20 && k == 5376 {
                     let (seq_codes, seq_scales) = super::rotate_quant(&x, k, group)?;
@@ -1200,6 +1296,21 @@ mod device {
                         "CONVROT_TILE_ROW rows=20 k=5376 differ={tile_diff}"
                     ));
                     ensure!(tile_diff > 0, "tile row offset reproduced the device codes");
+                    let mut shifted = vec![0.0f32; rows * k];
+                    for r in 0..rows {
+                        for c in 0..k {
+                            shifted[r * k + c] = x[r * k + (c + 1) % k];
+                        }
+                    }
+                    let (shift_codes, _) = mma_rotate_quant(&shifted, k, group)?;
+                    let col_diff = count_i8(&shift_codes, &ran.codes);
+                    emit(&format!(
+                        "CONVROT_BF16_COL rows=20 k=5376 differ={col_diff}"
+                    ));
+                    ensure!(
+                        col_diff > 0,
+                        "bf16 column offset reproduced the device codes"
+                    );
                 }
                 if rows == 41770 && k == 5376 {
                     let mut swapped = x;
@@ -1282,10 +1393,11 @@ mod device {
         for (rows, k, n) in shapes {
             let expected = definition_bits(rows, k, n)?;
             let quant = rows == 17 && k != 256;
+            let x = activation(rows, k);
             let ran = launch_kept(
                 &device,
                 HostLaunch {
-                    x: &activation(rows, k),
+                    x: &x,
                     k,
                     group,
                     qweight: &weight(n, k),
@@ -1301,6 +1413,14 @@ mod device {
             );
             if quant {
                 check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
+                let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
+                emit(&format!(
+                    "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
+                ));
+                ensure!(
+                    rotated_diff == 0,
+                    "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
+                );
             }
         }
         check_group_dot_tiles(&device)?;
@@ -1591,7 +1711,7 @@ mod device {
         let n = wscale.len();
         let rows = x.len() / k;
         let stream = &device.stream;
-        let x_d = stream.clone_htod(x)?;
+        let held = upload_activation(stream, x, rows)?;
         let weight_d = stream.clone_htod(qweight)?;
         let scale_d = stream.clone_htod(wscale)?;
         let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
@@ -1602,7 +1722,7 @@ mod device {
             stream,
             fns,
             &ConvrotArgs {
-                x: x_d.device_ptr(stream).0,
+                x: held.ptr,
                 qweight: weight_d.device_ptr(stream).0,
                 wscale: scale_d.device_ptr(stream).0,
                 y: y_d.device_ptr(stream).0,
@@ -1616,6 +1736,7 @@ mod device {
             },
         )?;
         stream.synchronize()?;
+        held.release();
         Ok((
             stream.clone_dtoh(&codes)?,
             stream.clone_dtoh(&scales)?,
@@ -1634,7 +1755,7 @@ mod device {
         let group = 256usize;
         let x = activation(rows, k);
         let stream = &device.stream;
-        let x_d = stream.clone_htod(&x)?;
+        let held = upload_activation(stream, &x, rows)?;
         let rotated = stream.alloc_zeros::<f32>(rows * k)?;
         let codes_d = stream.alloc_zeros::<i8>(rows * k)?;
         let scales_d = stream.alloc_zeros::<f32>(rows)?;
@@ -1642,7 +1763,7 @@ mod device {
             stream,
             fns,
             &ConvrotArgs {
-                x: x_d.device_ptr(stream).0,
+                x: held.ptr,
                 qweight: 0,
                 wscale: 0,
                 y: 0,
@@ -1656,8 +1777,8 @@ mod device {
             },
         )?;
         stream.synchronize()?;
+        held.release();
         drop(rotated);
-        drop(x_d);
         let shared_codes: Vec<i8> = stream.clone_dtoh(&codes_d)?;
         let shared_scales: Vec<f32> = stream.clone_dtoh(&scales_d)?;
         let mut codes_differ = 0usize;
