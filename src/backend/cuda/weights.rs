@@ -2668,10 +2668,12 @@ pub(crate) fn sense_pcie(d: &Device) -> Result<PcieLink> {
         width > 0 && !max_speed.is_empty(),
         "invalid dense PCIe capability"
     );
+    let payload_bytes_per_second =
+        crate::prefill::pcie_payload_bytes_per_second(&max_speed, width)?;
     Ok(PcieLink {
         width,
         max_speed,
-        payload_bytes_per_second: crate::prefill::pcie_payload_bytes_per_second(&max_speed, width)?,
+        payload_bytes_per_second,
     })
 }
 

@@ -1306,7 +1306,7 @@ pub(crate) fn lower_wave_index(waves: &[f64]) -> Result<usize> {
 impl Blas {
     /// Stores the lower whole-wave heuristic of this down shape at plan index 0. A tie, or a missing index 1, keeps 0.
     pub(crate) fn bind_lower_wave(&self, shape: LinearShape) -> Result<()> {
-        let key = (shape.rows, shape.output, shape.input, 0usize, false);
+        let key = (shape.rows, shape.output, shape.input, 0u32, false);
         let (waves, algo_count) = {
             let plans = self.plans.borrow();
             let plan = plans.get(&key).context("fixed linear cost plan missing")?;
