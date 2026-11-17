@@ -140,6 +140,8 @@ It needs `hipcc` (found through `HIP_HOME`, `ROCM_PATH` or `PATH`) and the hipBL
 
 ## Usage
 
+See [CLI usage by model](docs/usage.md) for required inputs, options, defaults and output formats.
+
 ```sh
 # One-time per machine and model: measure kernels and transfer rates.
 flyingfish --model <model-dir> --runtime-dir <dir> calibrate
