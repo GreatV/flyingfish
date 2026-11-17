@@ -232,6 +232,7 @@ impl DensePlacement {
 
 /// Payload bytes per second of a sysfs `max_link_speed` (`"16.0 GT/s"`) at `width` lanes.
 /// At 8.0 GT/s and above the encoding is 128/130; below it is 8/10.
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) fn pcie_payload_bytes_per_second(max_link_speed: &str, width: usize) -> Result<f64> {
     let head = max_link_speed
         .split_whitespace()
@@ -253,6 +254,7 @@ pub(crate) fn pcie_payload_bytes_per_second(max_link_speed: &str, width: usize) 
 }
 
 /// Two streaming slots when one copy finishes within one peak layer, otherwise three.
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) fn streaming_slot_count(
     copy_bytes: u64,
     pcie_bps: f64,
