@@ -150,6 +150,7 @@ flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A 
 
 # Synthesize Breeze-TTS-2 speech with the published sampling configuration.
 flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o speech.wav
+
 # Generate MiniMax-Music3 stereo audio from a caption and lyrics.
 flyingfish --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o song.wav
 ```
