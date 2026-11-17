@@ -207,11 +207,12 @@ impl Nemotron {
         let mel = self.frontend.extract(&[waveform], false, true, false)?;
         let valid = mel.mask.iter().filter(|flag| **flag).count();
         let (rows, _, count) = self.encoder.encode(&mel.features, valid)?;
+        let width = self.spec.hidden as usize;
         ensure!(
-            rows.len() == count * self.spec.hidden as usize,
+            rows.len() >= count * width,
             "Nemotron full-clip encoder extent"
         );
-        self.decode_rows(&rows, 0, dstream, hypothesis)
+        self.decode_rows(&rows[..count * width], 0, dstream, hypothesis)
     }
 
     fn decode_streaming(
@@ -243,18 +244,12 @@ impl Nemotron {
         while start < waveform.len() {
             let end = start.saturating_add(chunk_samples);
             let last = end >= waveform.len();
-            let mut samples = waveform[start..end.min(waveform.len())].to_vec();
-            samples.resize(chunk_samples, 0.0);
-            let mel = self
-                .frontend
-                .extract(&[samples.as_slice()], false, false, last)?;
-            ensure!(
-                mel.features.len() >= 32 * 128,
-                "Nemotron stream chunk extent"
-            );
-            let chunk = self
-                .encoder
-                .encode_chunk(&mut session, &mel.features[..32 * 128])?;
+            let samples = &waveform[start..end.min(waveform.len())];
+            let mel = self.frontend.extract(&[samples], false, false, last)?;
+            ensure!(mel.frames <= 32, "Nemotron stream chunk extent");
+            let mut features = vec![0.0f32; 32 * 128];
+            features[..mel.frames * 128].copy_from_slice(&mel.features);
+            let chunk = self.encoder.encode_chunk(&mut session, &features)?;
             self.decode_rows(&chunk.encoder, row_base, dstream, hypothesis)?;
             row_base += 4;
             start = start.saturating_add(stride);
@@ -298,8 +293,8 @@ mod tests {
         pcm: &[f32],
         expected: &Value,
         streaming: bool,
+        mode: &str,
     ) -> Result<RnntHypothesis> {
-        let mode = if streaming { "stream" } else { "full" };
         let hypothesis = model.decode(pcm, streaming)?;
         let expected_tokens: Vec<u32> = expected["tokens"]
             .as_array()
@@ -370,8 +365,15 @@ mod tests {
         ))?)?;
         let device = Device::new(0)?;
         let mut model = Nemotron::load(&directory, &device)?;
-        let full = check_mode(&model, &directory, &pcm, &expected["full"], false)?;
-        check_mode(&model, &directory, &pcm, &expected["stream"], true)?;
+        let full = check_mode(&model, &directory, &pcm, &expected["full"], false, "full")?;
+        check_mode(
+            &model,
+            &directory,
+            &pcm,
+            &expected["stream"],
+            true,
+            "stream",
+        )?;
         model.rnnt.config.blank -= 1;
         let mutant = model.decode(&pcm, false)?;
         ensure!(
@@ -383,6 +385,35 @@ mod tests {
             model.rnnt.config.blank + 1,
             model.rnnt.config.blank
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window and publisher decode fixture"]
+    fn nemotron_full_trims_physical_padding() -> Result<()> {
+        ensure!(
+            std::env::var("FF_NEMOTRON_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let directory = PathBuf::from(
+            std::env::var_os("FF_NEMOTRON_MODEL").context("FF_NEMOTRON_MODEL missing")?,
+        );
+        let pcm = fixture_pcm(&PathBuf::from(
+            std::env::var_os("FF_NEMOTRON_DECODE_PCM").context("decode PCM missing")?,
+        ))?;
+        let expected: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
+            std::env::var_os("FF_NEMOTRON_DECODE_FIXTURE").context("decode fixture missing")?,
+        ))?)?;
+        let device = Device::new(0)?;
+        let model = Nemotron::load(&directory, &device)?;
+        check_mode(
+            &model,
+            &directory,
+            &pcm[..15520],
+            &expected["boundary"],
+            false,
+            "boundary",
+        )?;
         Ok(())
     }
 }

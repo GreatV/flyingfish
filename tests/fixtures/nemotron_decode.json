@@ -945,6 +945,53 @@
     ],
     "text": "Yeah, well your version, yeah.  Have you done that now?  Well, no, I didn't my directory just to do.  Okay, so not the actual one, but a copy of it.  I have a copy.  Yes, okay, but I will yeah I was going to update that one just because yeah it just makes sense that well just tell me when because I usually I usually work. "
   },
+  "boundary": {
+    "tokens": [
+      2820,
+      4,
+      2,
+      2947
+    ],
+    "emitted": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false
+    ],
+    "decisions": [
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      13087,
+      2820,
+      4,
+      2,
+      2947,
+      13087
+    ],
+    "text": "Yeah. "
+  },
   "stream": {
     "tokens": [
       2820,
@@ -1481,8 +1528,8 @@
       true,
       false,
       false,
-      true,
       false,
+      true,
       false,
       false
     ],
@@ -1877,8 +1924,8 @@
       2966,
       13087,
       13087,
-      2933,
       13087,
+      2933,
       13087,
       13087
     ],
