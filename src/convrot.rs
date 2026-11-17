@@ -218,6 +218,18 @@ pub(crate) fn ensure_group(group: u32, optin: usize) -> Result<u32> {
     Ok(max)
 }
 
+/// Rows in one `convrot_quantize` tile: `optin / (k * 4)`.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn quantize_rows(optin: usize, k: u32) -> Result<u32> {
+    let bytes = u32::try_from(optin).context("convrot opt-in shared memory")?;
+    let width = k.checked_mul(4).context("convrot quantize row")?;
+    ensure!(
+        width > 0 && width <= bytes,
+        "convrot quantize k {k} exceeds opt-in {optin}"
+    );
+    Ok(bytes / width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{hadamard, linear, linear_omitting_rotation};
@@ -323,6 +335,22 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn quantize_rows_fit_the_optin() -> Result<()> {
+        let optin = 99usize << 10;
+        ensure!(
+            super::quantize_rows(optin, 5376)? == 4
+                && super::quantize_rows(optin, 7168)? == 3
+                && super::quantize_rows(optin, 14336)? == 1,
+            "quantize rows optin={optin}"
+        );
+        ensure!(
+            super::quantize_rows(57_343, 14336).is_err(),
+            "k above the opt-in was accepted"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -332,6 +360,7 @@ pub struct ConvrotFns {
     quantize: crate::backend::gpu::CudaFunction,
     product: crate::backend::gpu::CudaFunction,
     max_group: u32,
+    optin: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -375,12 +404,19 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         i32::try_from(group_dot_smem(max_group))?,
     )?;
+    let quantize = module.load_function("convrot_quantize")?;
+    let quant_dyn = optin / 4 * 4;
+    quantize.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        i32::try_from(quant_dyn).context("convrot quantize opt-in")?,
+    )?;
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
         group_dot,
-        quantize: module.load_function("convrot_quantize")?,
+        quantize,
         product,
         max_group,
+        optin,
     })
 }
 
@@ -507,7 +543,10 @@ pub(crate) fn launch_rotate_quant(
                 shared_mem_bytes: group_dot_smem(group),
             })?;
     }
-    let quant_threads = 128u32;
+    let tile_rows = quantize_rows(fns.optin, k)?;
+    let tile = i32::try_from(tile_rows)?;
+    let smem =
+        u32::try_from(u64::from(tile_rows) * u64::from(k) * 4).context("convrot quantize tile")?;
     unsafe {
         stream
             .launch_builder(&fns.quantize)
@@ -516,10 +555,11 @@ pub(crate) fn launch_rotate_quant(
             .arg(&args.scales)
             .arg(&args.rows)
             .arg(&args.k)
+            .arg(&tile)
             .launch(LaunchConfig {
-                grid_dim: (rows.div_ceil(quant_threads), 1, 1),
-                block_dim: (quant_threads, 1, 1),
-                shared_mem_bytes: 0,
+                grid_dim: (rows.div_ceil(tile_rows), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smem,
             })?;
     }
     Ok(())
@@ -684,6 +724,89 @@ mod device {
         mismatched + y.len().abs_diff(expected.len())
     }
 
+    struct Ran {
+        y: Vec<bf16>,
+        rotated: Vec<f32>,
+        codes: Vec<i8>,
+        scales: Vec<f32>,
+    }
+
+    /// fmax of fabs, f32 round-to-nearest division, `rintf`, clamp [-127, 127].
+    fn quantize_current(src: &[f32]) -> (Vec<i8>, f32) {
+        let mut peak = 0.0f32;
+        for &value in src {
+            peak = peak.max(value.abs());
+        }
+        let scale = peak.max(1.0e-12f32) / 127.0f32;
+        let inv = 1.0f32 / scale;
+        let codes = src
+            .iter()
+            .map(|&value| {
+                let q = (value * inv).round_ties_even().clamp(-127.0f32, 127.0f32);
+                q as i8
+            })
+            .collect();
+        (codes, scale)
+    }
+
+    fn code_scale_diff(rotated: &[f32], codes: &[i8], scales: &[f32], k: usize) -> (usize, usize) {
+        let mut code_diff = 0usize;
+        let mut scale_diff = 0usize;
+        for (r, scale) in scales.iter().enumerate() {
+            let (want, got_scale) = quantize_current(&rotated[r * k..(r + 1) * k]);
+            let got = &codes[r * k..(r + 1) * k];
+            code_diff += want.iter().zip(got).filter(|(a, b)| a != b).count();
+            if got_scale.to_bits() != scale.to_bits() {
+                scale_diff += 1;
+            }
+        }
+        (code_diff, scale_diff)
+    }
+
+    fn check_codes(
+        rotated: &[f32],
+        codes: &[i8],
+        scales: &[f32],
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        ensure!(
+            rotated.len() == rows * k && codes.len() == rows * k && scales.len() == rows,
+            "convrot quantize download rows={rows} k={k}"
+        );
+        let (code_diff, scale_diff) = code_scale_diff(rotated, codes, scales, k);
+        emit(&format!(
+            "CONVROT_QUANT rows={rows} k={k} codes={code_diff} scales={scale_diff}"
+        ));
+        ensure!(
+            code_diff == 0 && scale_diff == 0,
+            "convrot quantize rows={rows} k={k} codes {code_diff} scales {scale_diff}"
+        );
+        Ok(())
+    }
+
+    fn tile_row_offset_diff(rotated: &[f32], codes: &[i8], k: usize) -> usize {
+        let rows = codes.len() / k;
+        let mut differ = 0usize;
+        for r in 0..rows {
+            let src = (r + 1) % rows;
+            let (want, _) = quantize_current(&rotated[src * k..(src + 1) * k]);
+            let got = &codes[r * k..(r + 1) * k];
+            differ += want.iter().zip(got).filter(|(a, b)| a != b).count();
+        }
+        differ
+    }
+
+    struct HostLaunch<'a> {
+        x: &'a [f32],
+        k: usize,
+        group: usize,
+        qweight: &'a [i8],
+        n: usize,
+        wscale: &'a [f32],
+        keep: bool,
+    }
+
     fn launch(
         device: &Device,
         x: &[f32],
@@ -693,6 +816,31 @@ mod device {
         n: usize,
         wscale: &[f32],
     ) -> Result<Vec<bf16>> {
+        Ok(launch_kept(
+            device,
+            HostLaunch {
+                x,
+                k,
+                group,
+                qweight,
+                n,
+                wscale,
+                keep: false,
+            },
+        )?
+        .y)
+    }
+
+    fn launch_kept(device: &Device, input: HostLaunch<'_>) -> Result<Ran> {
+        let HostLaunch {
+            x,
+            k,
+            group,
+            qweight,
+            n,
+            wscale,
+            keep,
+        } = input;
         ensure!(
             k > 0 && n > 0 && group > 0 && x.len().is_multiple_of(k),
             "convrot launch shape"
@@ -732,7 +880,22 @@ mod device {
             },
         )?;
         stream.synchronize()?;
-        Ok(stream.clone_dtoh(&y_d)?)
+        let y = stream.clone_dtoh(&y_d)?;
+        let (rotated, codes, scales) = if keep {
+            (
+                stream.clone_dtoh(&rotated)?,
+                stream.clone_dtoh(&codes)?,
+                stream.clone_dtoh(&scales)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        Ok(Ran {
+            y,
+            rotated,
+            codes,
+            scales,
+        })
     }
 
     fn exp2i(exp: i32) -> f64 {
@@ -999,8 +1162,20 @@ mod device {
                     let (codes, scales) = mma_rotate_quant(&x, k, group)?;
                     host_product(&codes, &scales, k, &qweight, n, &wscale)?
                 };
-                let y = launch(device, &x, k, group, &qweight, n, &wscale)?;
-                let mismatched = bit_diff(&y, &host);
+                let quant = rows == 20 || rows == 42;
+                let ran = launch_kept(
+                    device,
+                    HostLaunch {
+                        x: &x,
+                        k,
+                        group,
+                        qweight: &qweight,
+                        n,
+                        wscale: &wscale,
+                        keep: quant,
+                    },
+                )?;
+                let mismatched = bit_diff(&ran.y, &host);
                 emit(&format!(
                     "CONVROT_MMA rows={rows} k={k} n={n} differ={mismatched}"
                 ));
@@ -1008,21 +1183,29 @@ mod device {
                     mismatched == 0,
                     "convrot mma rows={rows} k={k} n={n} differing bits {mismatched}"
                 );
+                if quant {
+                    check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
+                }
                 if rows == 20 && k == 5376 {
                     let (seq_codes, seq_scales) = super::rotate_quant(&x, k, group)?;
                     let sequential =
                         super::int8_product(&seq_codes, &seq_scales, k, &qweight, n, &wscale)?;
-                    let seq_diff = bit_diff(&y, &sequential);
+                    let seq_diff = bit_diff(&ran.y, &sequential);
                     emit(&format!(
                         "CONVROT_SEQUENTIAL rows=20 k=5376 n=40 differ={seq_diff}"
                     ));
                     ensure!(seq_diff > 0, "sequential quantize matched the device");
+                    let tile_diff = tile_row_offset_diff(&ran.rotated, &ran.codes, k);
+                    emit(&format!(
+                        "CONVROT_TILE_ROW rows=20 k=5376 differ={tile_diff}"
+                    ));
+                    ensure!(tile_diff > 0, "tile row offset reproduced the device codes");
                 }
                 if rows == 41770 && k == 5376 {
                     let mut swapped = x;
                     swapped.swap(0, 16);
                     let mutant = launch(device, &swapped, k, group, &qweight, n, &wscale)?;
-                    let mut_diff = bit_diff(&mutant, &y);
+                    let mut_diff = bit_diff(&mutant, &ran.y);
                     emit(&format!("CONVROT_GROUP_DOT_MUTANT differ={mut_diff}"));
                     ensure!(mut_diff > 0, "column swap reproduced the device product");
                 }
@@ -1098,20 +1281,27 @@ mod device {
         ];
         for (rows, k, n) in shapes {
             let expected = definition_bits(rows, k, n)?;
-            let y = launch(
+            let quant = rows == 17 && k != 256;
+            let ran = launch_kept(
                 &device,
-                &activation(rows, k),
-                k,
-                group,
-                &weight(n, k),
-                n,
-                &wscale_row(n),
+                HostLaunch {
+                    x: &activation(rows, k),
+                    k,
+                    group,
+                    qweight: &weight(n, k),
+                    n,
+                    wscale: &wscale_row(n),
+                    keep: quant,
+                },
             )?;
-            let mismatched = differ(&y, &expected);
+            let mismatched = differ(&ran.y, &expected);
             ensure!(
                 mismatched == 0,
                 "convrot kernel M={rows} K={k} N={n} differing bits {mismatched}"
             );
+            if quant {
+                check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
+            }
         }
         check_group_dot_tiles(&device)?;
         let rows = 17usize;
