@@ -148,6 +148,146 @@ extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x
     }
 }
 
+// Same m16n8k16 sequence as convrot_group_dot. QUANT 0 writes one f32 abs-max per live row
+// at partials[row * (k/group) + blockIdx.z]. QUANT 1 writes int8 from scales[row].
+// Dynamic smem is 32*group+2048.
+template <int QUANT>
+__device__ __forceinline__ void convrot_group_rows(const __nv_bfloat16* __restrict__ x, float* __restrict__ partials,
+                                                    const float* __restrict__ scales, int8_t* __restrict__ codes, int rows,
+                                                    int k, int group) {
+    if (rows < 17 || group < 16 || (group & 15) || (k % group)) __trap();
+    constexpr int STRIDE = 16;
+    extern __shared__ __align__(16) __nv_bfloat16 re_tile[];
+    __nv_bfloat16* atile = re_tile;
+    __nv_bfloat16* bsmem = re_tile + 16 * group;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row0 = static_cast<int>(blockIdx.x) * 16;
+    const int x_col0 = static_cast<int>(blockIdx.z) * group;
+    const int count = 16 * group;
+    for (int i = static_cast<int>(threadIdx.x); i < count; i += static_cast<int>(blockDim.x)) {
+        const int r = i / group;
+        const int c = i - r * group;
+        const int gr = row0 + r;
+        __nv_bfloat16 v = __float2bfloat16(0.f);
+        if (gr < rows) v = x[static_cast<long long>(gr) * k + x_col0 + c];
+        const int panel = c >> 4;
+        const int local = c & 15;
+        atile[panel * (16 * STRIDE) + r * STRIDE + local] = v;
+    }
+    __syncthreads();
+    __nv_bfloat16* bt = bsmem + warp * (8 * STRIDE);
+    const int nsub = group >> 3;
+    const int rbase = lane >> 2;
+    if constexpr (QUANT == 0) {
+        float peak_lo = 0.f;
+        float peak_hi = 0.f;
+        for (int sub = warp; sub < nsub; sub += 8) {
+            const int n0 = sub << 3;
+            float acc[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int k0 = 0; k0 < group; k0 += 16) {
+                for (int i = lane; i < 8 * 16; i += 32) {
+                    const int n = i >> 4;
+                    const int c = i & 15;
+                    bt[n * STRIDE + c] = __float2bfloat16(convrot_hadamard(group, k0 + c, n0 + n));
+                }
+                __syncwarp();
+                unsigned a[4];
+                const __nv_bfloat16* ap = atile + (k0 >> 4) * (16 * STRIDE);
+                convrot_ldsm_x4(a, ap + (lane & 15) * STRIDE + (lane >> 4) * 8);
+                unsigned b[2];
+                convrot_ldsm_x2(b, bt + (lane & 7) * STRIDE + ((lane >> 3) & 1) * 8);
+                convrot_mma_16816(acc, a, b);
+                __syncwarp();
+            }
+            peak_lo = fmaxf(peak_lo, fmaxf(fabsf(acc[0]), fabsf(acc[1])));
+            peak_hi = fmaxf(peak_hi, fmaxf(fabsf(acc[2]), fabsf(acc[3])));
+        }
+        peak_lo = fmaxf(peak_lo, __shfl_xor_sync(0xffffffffu, peak_lo, 1));
+        peak_lo = fmaxf(peak_lo, __shfl_xor_sync(0xffffffffu, peak_lo, 2));
+        peak_hi = fmaxf(peak_hi, __shfl_xor_sync(0xffffffffu, peak_hi, 1));
+        peak_hi = fmaxf(peak_hi, __shfl_xor_sync(0xffffffffu, peak_hi, 2));
+        __syncthreads();
+        float* red = reinterpret_cast<float*>(atile);
+        if ((lane & 3) == 0) {
+            red[warp * 16 + rbase] = peak_lo;
+            red[warp * 16 + 8 + rbase] = peak_hi;
+        }
+        __syncthreads();
+        if (warp == 0 && lane < 16) {
+            float peak = 0.f;
+            for (int w = 0; w < 8; ++w) peak = fmaxf(peak, red[w * 16 + lane]);
+            const int row = row0 + lane;
+            if (row < rows) {
+                const int groups = k / group;
+                partials[static_cast<long long>(row) * groups + static_cast<int>(blockIdx.z)] = peak;
+            }
+        }
+    } else {
+        float inv_lo = 0.f;
+        float inv_hi = 0.f;
+        if ((lane & 3) == 0) {
+            if (row0 + rbase < rows) inv_lo = __fdiv_rn(1.f, scales[row0 + rbase]);
+            if (row0 + rbase + 8 < rows) inv_hi = __fdiv_rn(1.f, scales[row0 + rbase + 8]);
+        }
+        inv_lo = __shfl_sync(0xffffffffu, inv_lo, lane & ~3);
+        inv_hi = __shfl_sync(0xffffffffu, inv_hi, lane & ~3);
+        for (int sub = warp; sub < nsub; sub += 8) {
+            const int n0 = sub << 3;
+            float acc[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int k0 = 0; k0 < group; k0 += 16) {
+                for (int i = lane; i < 8 * 16; i += 32) {
+                    const int n = i >> 4;
+                    const int c = i & 15;
+                    bt[n * STRIDE + c] = __float2bfloat16(convrot_hadamard(group, k0 + c, n0 + n));
+                }
+                __syncwarp();
+                unsigned a[4];
+                const __nv_bfloat16* ap = atile + (k0 >> 4) * (16 * STRIDE);
+                convrot_ldsm_x4(a, ap + (lane & 15) * STRIDE + (lane >> 4) * 8);
+                unsigned b[2];
+                convrot_ldsm_x2(b, bt + (lane & 7) * STRIDE + ((lane >> 3) & 1) * 8);
+                convrot_mma_16816(acc, a, b);
+                __syncwarp();
+            }
+            const int cbase = (lane & 3) * 2;
+            const float invs[4] = {inv_lo, inv_lo, inv_hi, inv_hi};
+            const int rows_out[4] = {rbase, rbase, rbase + 8, rbase + 8};
+            const int cols_out[4] = {cbase, cbase + 1, cbase, cbase + 1};
+            for (int t = 0; t < 4; ++t) {
+                const int r = rows_out[t];
+                const int c = cols_out[t];
+                if (row0 + r < rows && n0 + c < group) {
+                    float q = rintf(__fmul_rn(acc[t], invs[t]));
+                    q = fminf(fmaxf(q, -127.f), 127.f);
+                    codes[static_cast<long long>(row0 + r) * k + x_col0 + n0 + c] =
+                        static_cast<int8_t>(static_cast<int>(q));
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void convrot_group_peak(const __nv_bfloat16* __restrict__ x, float* __restrict__ partials, int rows,
+                                              int k, int group) {
+    convrot_group_rows<0>(x, partials, nullptr, nullptr, rows, k, group);
+}
+
+extern "C" __global__ void convrot_reduce_peaks(const float* __restrict__ partials, float* __restrict__ scales, int rows,
+                                                int groups) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= rows) return;
+    const float* src = partials + static_cast<long long>(row) * groups;
+    float peak = 0.f;
+    for (int g = 0; g < groups; ++g) peak = fmaxf(peak, src[g]);
+    scales[row] = __fdiv_rn(fmaxf(peak, 1e-12f), 127.f);
+}
+
+extern "C" __global__ void convrot_group_quant(const __nv_bfloat16* __restrict__ x, const float* __restrict__ scales,
+                                               int8_t* __restrict__ codes, int rows, int k, int group) {
+    convrot_group_rows<1>(x, nullptr, scales, codes, rows, k, group);
+}
+
 // Block 256. Dynamic smem is tile_rows * k f32. Each live row is loaded once, coalesced.
 // Warp peaks reuse that row's first 8 floats, then the reciprocal does. k >= 8.
 // s = max(peak, 1e-12) / 127. q = rint(v * (1/s)), clamped to [-127, 127].
