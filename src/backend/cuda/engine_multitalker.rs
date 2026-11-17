@@ -122,6 +122,8 @@ fn load_rnnt(
             vocab: vocab_blank,
             blank: spec.vocab_size as usize,
             max_symbols: spec.max_symbols as usize,
+            lanes: 4,
+            stride: 4,
         },
         embedding,
         layers,
@@ -1114,6 +1116,20 @@ mod gate_tests {
         let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&m2b)?)?;
         let device = Device::new(0)?;
         let model = Multitalker::load(Path::new(&nemo), &device)?;
+        let layout = model.rnnt.decode_stream(&model.encoder)?;
+        ensure!(
+            layout.allocated_bytes() == 272400 && layout.joint_bytes() == 16400,
+            "Multitalker RNNT lane layout bytes {}/{}",
+            layout.allocated_bytes(),
+            layout.joint_bytes()
+        );
+        println!(
+            "MULTITALKER_RNNT_LAYOUT lanes={} stride={} state_bytes={} joint_bytes={}",
+            model.rnnt.config.lanes,
+            model.rnnt.config.stride,
+            layout.allocated_bytes(),
+            layout.joint_bytes()
+        );
         let blank = model.blank() as usize;
         let argmax = |logits: &[f32]| -> usize {
             logits

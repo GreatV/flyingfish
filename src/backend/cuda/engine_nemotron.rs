@@ -71,6 +71,8 @@ fn load_rnnt(
             vocab,
             blank: spec.blank as usize,
             max_symbols: spec.max_symbols as usize,
+            lanes: 1,
+            stride: 1,
         },
         embedding,
         layers,
@@ -168,15 +170,11 @@ impl Nemotron {
         let conditioned =
             self.encoder
                 .linear(&activated, u32::try_from(count)?, &self.prompt_down)?;
-        let projected = self.encoder.linear(
+        self.encoder.linear(
             &conditioned,
             u32::try_from(count)?,
             &self.rnnt.enc_projection,
-        )?;
-        let joint_hidden = self.spec.decoder_hidden as usize;
-        let mut padded = stream.alloc_zeros(4 * count * joint_hidden)?;
-        stream.memcpy_dtod(&projected, &mut padded.slice_mut(0..count * joint_hidden))?;
-        Ok(padded)
+        )
     }
 
     fn decode_rows(
@@ -368,6 +366,20 @@ mod tests {
         ))?)?;
         let device = Device::new(0)?;
         let mut model = Nemotron::load(&directory, &device)?;
+        let layout = model.rnnt.decode_stream(&model.encoder)?;
+        ensure!(
+            layout.allocated_bytes() == 116352 && layout.joint_bytes() == 52352,
+            "Nemotron RNNT lane layout bytes {}/{}",
+            layout.allocated_bytes(),
+            layout.joint_bytes()
+        );
+        println!(
+            "NEMOTRON_RNNT_LAYOUT lanes={} stride={} state_bytes={} joint_bytes={}",
+            model.rnnt.config.lanes,
+            model.rnnt.config.stride,
+            layout.allocated_bytes(),
+            layout.joint_bytes()
+        );
         let full = check_mode(&model, &directory, &pcm, &expected["full"], false, "full")?;
         check_mode(
             &model,
