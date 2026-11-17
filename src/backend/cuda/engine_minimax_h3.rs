@@ -5519,6 +5519,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_MODEL and FF_H3_LORA"]
     fn refiner_block_runs_on_skinny_text_rows_gpu() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         let path = |key: &str| {
             std::env::var_os(key)
                 .map(PathBuf::from)
@@ -5593,6 +5594,7 @@ mod tests {
             );
             println!("H3_REFINER_SKINNY rows={rows} finite=true");
         }
+        crate::backend::cuda::flash::full_query_identity(true)?;
         Ok(())
     }
 
@@ -6296,6 +6298,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_MODEL, FF_H3_LORA"]
     fn h3_block_norm_matches_the_post_weight_round_gpu() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         let path = |key: &str| {
             std::env::var_os(key)
                 .map(PathBuf::from)
@@ -6437,6 +6440,7 @@ mod tests {
             "pre-weight composition not separated"
         );
         fs::remove_dir_all(&runtime).ok();
+        crate::backend::cuda::flash::full_query_identity(true)?;
         println!("PASS h3_block_norm post_weight=true path=block_forward");
         Ok(())
     }
@@ -7555,6 +7559,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run, --capture-block-io --capture-adaln), FF_H3_REPLAY (FP32 replay with the block0 stage), FF_H3_THRESHOLDS"]
     fn block0_matches_the_fp32_replay() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -7857,6 +7862,7 @@ mod tests {
             !within(d_control, threshold)?,
             "LoRA-scale-0 control stayed within {threshold}"
         );
+        crate::backend::cuda::flash::full_query_identity(true)?;
         println!("H3_BLOCK0_GATE PASS control=FAIL_AS_REQUIRED");
         Ok(())
     }
@@ -7874,6 +7880,7 @@ mod tests {
     #[test]
     #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_BLOCK_OUT, FF_H3_LORA"]
     fn gguf_block_matches_the_definition_reference() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         let var = |key: &str| {
             std::env::var_os(key)
                 .map(PathBuf::from)
@@ -8125,6 +8132,7 @@ mod tests {
         );
         fs::remove_dir(&runtime)?;
         ensure!(bits == 0, "DEFECT GGUF norm/modulation identity");
+        crate::backend::cuda::flash::full_query_identity(true)?;
         println!("H3_GGUF_BLOCK_GATE PASS control=FAIL_AS_REQUIRED");
         Ok(())
     }
@@ -8403,6 +8411,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_REPLAY (the replay the frozen step thresholds were measured against), FF_H3_THRESHOLDS, FF_H3_CELL, FF_H3_PLACEMENT, FF_H3_STEPS"]
     fn dit_steps_match_the_fp32_replay() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -8614,6 +8623,7 @@ mod tests {
             defects.is_empty(),
             "H3_DIT_GATE DEFECT cell={cell} step identity or frozen thresholds: {defects:?} of {steps:?}"
         );
+        crate::backend::cuda::flash::full_query_identity(true)?;
         println!("H3_DIT_GATE PASS cell={cell} steps={steps:?} control=FAIL_AS_REQUIRED");
         Ok(())
     }
@@ -8626,6 +8636,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_THRESHOLDS, FF_H3_CELL, FF_H3_PLACEMENT"]
     fn dit_chain_matches_the_reference_final_latents() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -8829,6 +8840,7 @@ mod tests {
             bits == 0 && within(d_video, video_threshold)? && within(d_audio, audio_threshold)?,
             "DEFECT chain identity or final latents outside the frozen thresholds"
         );
+        crate::backend::cuda::flash::full_query_identity(true)?;
         println!("H3_CHAIN_GATE PASS cell={cell} control=FAIL_AS_REQUIRED");
         Ok(())
     }
@@ -10516,6 +10528,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_DEVICE0, FF_H3_PLACEMENT"]
     fn image_dit_512_matches_the_frozen_cells() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -10889,6 +10902,7 @@ mod tests {
             defects.is_empty(),
             "H3_IMAGE_DIT_GATE DEFECT cells outside the frozen taus: {defects:?}"
         );
+        crate::backend::cuda::flash::full_query_identity(true)?;
         println!("H3_IMAGE_DIT_GATE PASS cells=5 control=FAIL_AS_REQUIRED");
         Ok(())
     }
@@ -10946,6 +10960,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_4096"]
     fn image_dit_4096_matches_the_frozen_cells() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -11239,6 +11254,7 @@ mod tests {
             defects.is_empty(),
             "H3_IMAGE_4096_GATE DEFECT cells outside the frozen taus: {defects:?}"
         );
+        crate::backend::cuda::flash::full_query_identity(true)?;
         println!("H3_IMAGE_4096_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
         Ok(())
     }
@@ -12088,6 +12104,7 @@ mod tests {
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_E2E"]
     fn image_e2e_matches_the_frozen_cells() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -12109,6 +12126,7 @@ mod tests {
         let t2i_decision = image_e2e_rgb_decision(&mut defects, "t2i_rgb", t2i_rgb, t2i_control)?;
         let edit_decision =
             image_e2e_rgb_decision(&mut defects, "edit_rgb", edit_rgb, edit_control)?;
+        crate::backend::cuda::flash::full_query_identity(true)?;
         ensure!(
             defects.is_empty(),
             "H3_IMAGE_E2E_GATE DEFECT cells outside the frozen taus: {defects:?}"
@@ -12299,6 +12317,7 @@ mod tests {
     #[test]
     #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_BLOCK_REF, FF_HYPERFLOW_BLOCK_REF_RAGGED"]
     fn hyperflow_block_cells_match_the_definition() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         let model = env_dir("FF_HYPERFLOW_MODEL")?;
         let reference = env_dir("FF_HYPERFLOW_BLOCK_REF")?;
         let arm = reference
@@ -12751,6 +12770,7 @@ mod tests {
             control_fail.is_empty(),
             "control stayed within 10x tau: {control_fail:?}"
         );
+        crate::backend::cuda::flash::full_query_identity(true)?;
         if defects.is_empty() {
             println!("HYPERFLOW_BLOCK_GATE PASS cells=6 controls=FAIL_AS_REQUIRED");
         } else {
@@ -13228,6 +13248,7 @@ mod tests {
     #[test]
     #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_HYPERFLOW_STEP_REF"]
     fn hyperflow_step_cells_match_the_definition() -> Result<()> {
+        crate::backend::cuda::flash::full_query_identity(false)?;
         let model = env_dir("FF_HYPERFLOW_MODEL")?;
         let reference = env_dir("FF_HYPERFLOW_STEP_REF")?;
         let arm = reference
@@ -13495,6 +13516,7 @@ mod tests {
             scored.len(),
             STEP_TAUS.len()
         );
+        crate::backend::cuda::flash::full_query_identity(true)?;
         if defects.is_empty() {
             println!("HYPERFLOW_STEP_GATE PASS cells={}", STEP_TAUS.len());
             Ok(())
