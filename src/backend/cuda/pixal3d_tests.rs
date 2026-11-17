@@ -1443,9 +1443,7 @@ fn batch_group_norm_constant_features_stay_finite() -> Result<()> {
     let d = Device::new(0)?;
     let offsets = vec![0u32, 32];
     let plan = BatchGroupNorm::new(&d, &offsets, 1024, 32, 1e-6, 16 << 20)?;
-    let input = d
-        .stream
-        .clone_htod(&vec![8.001_953_125f32; 32 * 1024])?;
+    let input = d.stream.clone_htod(&vec![8.001_953f32; 32 * 1024])?;
     let ones = d.stream.clone_htod(&vec![1.0f32; 1024])?;
     let zeros = d.stream.clone_htod(&vec![0.0f32; 1024])?;
     let output = d.stream.alloc_zeros::<f32>(32 * 1024)?;

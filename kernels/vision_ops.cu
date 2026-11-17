@@ -1754,14 +1754,13 @@ extern "C" __global__ void batch_group_moments_finish_f32(
             sum += staged[0][thread];
             squares += staged[1][thread];
         }
-        const float denominator = __fadd_rn(float(count), eps);
-        const float mean = float(sum / double(denominator));
+        const double denominator = double(__fadd_rn(float(count), eps));
+        const double mean = sum / denominator;
         // The per-element squares are F32-rounded, so for constant inputs the
         // second moment can sit below the double mean square; clamp before eps.
-        const double centered =
-            squares / double(denominator) - double(mean) * double(mean);
+        const double centered = squares / denominator - mean * mean;
         const float variance = float(centered < 0.0 ? 0.0 : centered);
-        moments[2 * bg] = mean;
+        moments[2 * bg] = float(mean);
         moments[2 * bg + 1] = rsqrtf(__fadd_rn(variance, eps));
     }
 }
