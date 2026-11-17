@@ -66,6 +66,26 @@ Image to 3D (library entry points and CLI):
 
 In progress: TRELLIS.2 image-to-3D (flow sampling and the structured-latent, mesh and texture stages landed; remaining: render, GLB and bake, the shape and texture encoders, and closing the decoder and structure-latent differences from the reference).
 
+## Library entry points
+
+Library callers use two entry layers:
+
+| Layer | Public surface | Backends | Resource contract |
+|---|---|---|---|
+| Model request | `RunOptions` with `minimax_h3::run_minimax_h3_i2va`; family types such as `minimax_h3::ImageRunOptions` and `music3::Music3Request` | CUDA for these examples; other families follow the model tables above | The caller supplies request inputs, device ordinal and runtime directory through the entry's arguments. The entry constructs and manages the stages for that request. |
+| Stage | `backend::BackendDevice` and the encoder, flow, decoder and workspace types exported by `backend` | `BackendDevice` is exported with CUDA or ROCm; individual stages retain their model/backend restrictions | The caller constructs the device and stage objects, supplies stage inputs, and owns the runtime/workspace lifetimes. The device carries GPU identity, context, execution stream and upload stream. |
+
+The generic `backend::Backend` loader and the autoregressive `model::layer_program` walker have these execution-domain errors:
+
+| `Architecture` | Entry | Exact error |
+|---|---|---|
+| `Qwen3` | `Backend` load | `Qwen3 AR execution is not bound` |
+| `Qwen3Vl` | `Backend` load and AR layer walker | `Qwen3-VL runs only as the MiniMax-H3 conditioner` |
+| `Clover` | AR layer walker | `Clover canvas execution is not bound` |
+| `DiffusionGemma` | AR layer walker | `DiffusionGemma layer program is not bound yet` |
+
+Clover and DiffusionGemma load on the separate eager canvas path. Their graph capture returns `canvas graph execution is not bound`.
+
 ## Platforms
 
 | Platform | Backend | Status |

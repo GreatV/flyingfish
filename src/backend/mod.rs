@@ -1,3 +1,7 @@
+//! Model requests use `crate::RunOptions` or family request/options types.
+//! Stage construction uses `BackendDevice`; callers own stage runtimes and workspaces.
+//! `Backend` has separate autoregressive and eager canvas execution domains.
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use anyhow::Context;
 use anyhow::Result;
@@ -11,6 +15,7 @@ pub mod hip;
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) mod cuda;
+/// GPU identity, context, execution stream and upload stream for stage construction.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use cuda::Device as BackendDevice;
 #[cfg(feature = "cuda")]
