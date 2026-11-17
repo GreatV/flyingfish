@@ -6612,6 +6612,206 @@ mod tests {
         Ok(d[0] <= get("max_abs")? && d[1] <= get("rel_rms")? && d[2] >= get("cosine_min")?)
     }
 
+    fn n6_require_finite(number: f64, key: &str) -> Result<()> {
+        ensure!(number.is_finite(), "Runner FAIL non-finite {key}");
+        Ok(())
+    }
+
+    fn n6_finite(value: &serde_json::Value, key: &str) -> Result<f64> {
+        let number = value
+            .get(key)
+            .with_context(|| format!("Runner FAIL missing {key}"))?
+            .as_f64()
+            .with_context(|| format!("Runner FAIL {key} not a number"))?;
+        n6_require_finite(number, key)?;
+        Ok(number)
+    }
+
+    fn n6_measured_arms(cell: &serde_json::Value, name: &str) -> Result<()> {
+        let measured = cell
+            .get("measured")
+            .with_context(|| format!("Runner FAIL missing {name} measured"))?;
+        for arm in ["bf16", "bf16strict"] {
+            ensure!(
+                measured.get(arm).is_some_and(|value| !value.is_null()),
+                "Runner FAIL unqualified cell {name} missing {arm}"
+            );
+        }
+        Ok(())
+    }
+
+    fn admit_n6_thresholds(frozen: &serde_json::Value) -> Result<()> {
+        let thresholds = frozen
+            .get("thresholds")
+            .context("Runner FAIL missing thresholds")?;
+        for cell_name in ["A", "D", "E"] {
+            for output in ["merged", "deepstack0", "deepstack1", "deepstack2"] {
+                let name = format!("{cell_name}.vision.{output}");
+                let cell = thresholds
+                    .get(&name)
+                    .with_context(|| format!("Runner FAIL missing {name}"))?;
+                for key in ["max_abs", "rel_rms", "cosine_min"] {
+                    n6_finite(cell, key)?;
+                }
+                n6_measured_arms(cell, &name)?;
+                ensure!(
+                    cell.get("gating").and_then(|value| value.as_bool()) == Some(true),
+                    "Runner FAIL unqualified cell {name}"
+                );
+            }
+            for kind in ["text", "composition"] {
+                for tap in TEXT_TAPS {
+                    let name = format!("{cell_name}.{kind}.hidden_states_{tap}");
+                    let cell = thresholds
+                        .get(&name)
+                        .with_context(|| format!("Runner FAIL missing {name}"))?;
+                    n6_finite(cell, "median_norm_fp32")?;
+                    n6_finite(cell, "sink_factor")?;
+                    for key in ["I", "U"] {
+                        ensure!(
+                            cell.get(key).and_then(|value| value.as_array()).is_some(),
+                            "Runner FAIL missing {name} {key}"
+                        );
+                    }
+                    let aggregate = cell
+                        .get("aggregate")
+                        .with_context(|| format!("Runner FAIL missing {name} aggregate"))?;
+                    for key in ["max_abs", "rel_rms", "cosine_min"] {
+                        n6_finite(aggregate, key)?;
+                    }
+                    n6_measured_arms(cell, &name)?;
+                    ensure!(
+                        cell.get("gating").and_then(|value| value.as_bool()) == Some(tap == 50),
+                        "Runner FAIL unqualified cell {name}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_tensor_names(file: &SafeTensors<'_>, names: &[&str]) -> Result<()> {
+        for name in names {
+            file.tensor(name)
+                .with_context(|| format!("Runner FAIL missing tensor {name}"))?;
+        }
+        Ok(())
+    }
+
+    fn admit_conditioner_tensors(path: &Path, names: &[&str]) -> Result<()> {
+        let map = mapped(path)?;
+        admit_tensor_names(&SafeTensors::deserialize(&map)?, names)
+    }
+
+    fn conditioner_named_f64(path: &Path, names: &[&str]) -> Result<Vec<Vec<f64>>> {
+        admit_conditioner_tensors(path, names)?;
+        let map = mapped(path)?;
+        let file = SafeTensors::deserialize(&map)?;
+        names
+            .iter()
+            .map(|name| Ok(decoded(&file, name)?.0))
+            .collect()
+    }
+
+    fn conditioner_text_references(path: &Path) -> Result<Vec<Vec<f64>>> {
+        let names: Vec<String> = TEXT_TAPS
+            .iter()
+            .map(|tap| format!("text.hidden_states_{tap}"))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        conditioner_named_f64(path, &refs)
+    }
+
+    const VISION_TENSORS: [&str; 4] = [
+        "vision.merged",
+        "vision.deepstack0",
+        "vision.deepstack1",
+        "vision.deepstack2",
+    ];
+
+    fn n6_qualified_thresholds() -> serde_json::Value {
+        let mut thresholds = serde_json::Map::new();
+        let vision = serde_json::json!({
+            "max_abs": 1.0,
+            "rel_rms": 0.1,
+            "cosine_min": 0.9,
+            "measured": {"bf16": {}, "bf16strict": {}},
+            "gating": true
+        });
+        for cell_name in ["A", "D", "E"] {
+            for output in ["merged", "deepstack0", "deepstack1", "deepstack2"] {
+                thresholds.insert(format!("{cell_name}.vision.{output}"), vision.clone());
+            }
+            for kind in ["text", "composition"] {
+                for tap in TEXT_TAPS {
+                    thresholds.insert(
+                        format!("{cell_name}.{kind}.hidden_states_{tap}"),
+                        serde_json::json!({
+                            "median_norm_fp32": 1.0,
+                            "sink_factor": 5.0,
+                            "I": [],
+                            "U": [],
+                            "aggregate": {"max_abs": 1.0, "rel_rms": 0.1, "cosine_min": 0.9},
+                            "measured": {"bf16": {}, "bf16strict": {}},
+                            "gating": tap == 50
+                        }),
+                    );
+                }
+            }
+        }
+        serde_json::json!({"thresholds": thresholds})
+    }
+
+    #[test]
+    fn h3_n6_admission_rejects_missing_threshold_field() -> Result<()> {
+        admit_n6_thresholds(&n6_qualified_thresholds())?;
+        let mut missing = n6_qualified_thresholds();
+        missing["thresholds"]["A.vision.merged"]
+            .as_object_mut()
+            .context("vision cell")?
+            .remove("max_abs");
+        ensure!(admit_n6_thresholds(&missing).is_err());
+        ensure!(n6_finite(&serde_json::json!({"max_abs": null}), "max_abs").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn h3_n6_admission_rejects_nonfinite_floor() -> Result<()> {
+        ensure!(n6_finite(&serde_json::json!({"max_abs": 1.0}), "max_abs")? == 1.0);
+        ensure!(n6_require_finite(f64::NAN, "max_abs").is_err());
+        ensure!(n6_require_finite(f64::INFINITY, "max_abs").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn h3_n6_admission_rejects_missing_tensor() -> Result<()> {
+        use safetensors::tensor::TensorView;
+        let bytes = [0u8; 4];
+        let present = TensorView::new(Dtype::F32, vec![1], &bytes)?;
+        let buffer = safetensors::serialize([("present", present)], None)?;
+        let file = SafeTensors::deserialize(&buffer)?;
+        admit_tensor_names(&file, &["present"])?;
+        ensure!(admit_tensor_names(&file, &["vision.merged"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn h3_n6_admission_rejects_unqualified_cell() -> Result<()> {
+        let mut gating = n6_qualified_thresholds();
+        gating["thresholds"]["A.vision.merged"]["gating"] = serde_json::json!(false);
+        ensure!(admit_n6_thresholds(&gating).is_err());
+        let mut tap = n6_qualified_thresholds();
+        tap["thresholds"]["A.text.hidden_states_50"]["gating"] = serde_json::json!(false);
+        ensure!(admit_n6_thresholds(&tap).is_err());
+        let mut arm = n6_qualified_thresholds();
+        arm["thresholds"]["A.text.hidden_states_50"]["measured"]
+            .as_object_mut()
+            .context("measured")?
+            .remove("bf16");
+        ensure!(admit_n6_thresholds(&arm).is_err());
+        Ok(())
+    }
+
     fn mapped(path: &Path) -> Result<memmap2::Mmap> {
         let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(unsafe { memmap2::Mmap::map(&file)? })
@@ -6670,6 +6870,34 @@ mod tests {
         let plan: Vec<RowTimesteps> =
             row_timestep_plan(&layout, &Schedule::new(9, 6.0)?, &Schedule::new(9, 3.0)?)?;
         let adaln = AdalnPlan::build(&layout, &plan)?;
+        let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
+        let replay = SafeTensors::deserialize(&replay_map)?;
+        let width = 6 * spec.hidden;
+        let norm = 2 * spec.hidden;
+        for (k, step) in plan.iter().enumerate() {
+            for layer in 0..spec.layers {
+                let name = format!("adaln.block{layer}.step{k}");
+                let view = replay
+                    .tensor(&name)
+                    .with_context(|| format!("lacks {name}"))?;
+                ensure!(
+                    matches!(view.dtype(), Dtype::BF16 | Dtype::F32 | Dtype::I64)
+                        && view.shape() == [step.timesteps.len() * 3, width],
+                    "{name} shape {:?} {:?}",
+                    view.dtype(),
+                    view.shape()
+                );
+            }
+            let name = format!("adaln.norm_out.step{k}");
+            let view = replay
+                .tensor(&name)
+                .with_context(|| format!("lacks {name}"))?;
+            ensure!(
+                matches!(view.dtype(), Dtype::BF16 | Dtype::F32 | Dtype::I64),
+                "{name}: unsupported dtype {:?}",
+                view.dtype()
+            );
+        }
 
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -6697,10 +6925,6 @@ mod tests {
             .collect();
         fs::remove_dir(&runtime)?;
 
-        let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
-        let replay = SafeTensors::deserialize(&replay_map)?;
-        let width = 6 * spec.hidden;
-        let norm = 2 * spec.hidden;
         let global = |t: f32| adaln.timesteps.partition_point(|&v| v < t);
         let (mut checked, mut worst, mut control_failed) = (0usize, [0f64, 0f64, 1f64], false);
         for (k, step) in plan.iter().enumerate() {
@@ -6719,11 +6943,7 @@ mod tests {
             };
             for layer in 0..spec.layers {
                 let name = format!("adaln.block{layer}.step{k}");
-                let (reference, shape) = decoded(&replay, &name)?;
-                ensure!(
-                    shape == [step.timesteps.len() * 3, width],
-                    "{name} shape {shape:?}"
-                );
+                let (reference, _) = decoded(&replay, &name)?;
                 let (mut candidate, mut expected, mut swapped) = (vec![], vec![], vec![]);
                 for &row in &rows {
                     let p = pair(row).with_context(|| format!("{name} row {row} has no pair"))?;
@@ -7635,6 +7855,60 @@ mod tests {
             .iter()
             .map(|b| bf16::from_le_bytes(*b))
             .collect();
+        let (
+            final_index_host,
+            final_hidden_host,
+            final_entries,
+            final_table_host,
+            reference,
+            captured,
+        ) = {
+            let step_map = mapped(&capture.join("step0.safetensors"))?;
+            let step = SafeTensors::deserialize(&step_map)?;
+            let timestep_indices = step.tensor("timestep_indices")?;
+            ensure!(
+                timestep_indices.dtype() == Dtype::I64 && timestep_indices.shape() == [rows],
+                "captured final norm index extent"
+            );
+            let final_index_host: Vec<u32> = timestep_indices
+                .data()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| u32::try_from(i64::from_le_bytes(*v)))
+                .collect::<std::result::Result<_, _>>()?;
+            let block49 = io.tensor("block49.output")?;
+            ensure!(
+                block49.dtype() == Dtype::BF16 && block49.shape() == [1, rows, spec.hidden],
+                "captured final norm input extent"
+            );
+            let final_hidden_host = bf16_of(&io, "block49.output")?;
+            let norm_out = adaln.tensor("norm_out.step0")?;
+            ensure!(
+                norm_out.dtype() == Dtype::BF16
+                    && norm_out.shape().len() == 2
+                    && norm_out.shape()[1] == 2 * spec.hidden,
+                "captured final modulation extent"
+            );
+            let final_entries = u32::try_from(norm_out.shape()[0])?;
+            let final_table_host = bf16_of(&adaln, "norm_out.step0")?;
+            ensure!(
+                final_index_host.iter().all(|&v| v < final_entries),
+                "captured final norm index bound"
+            );
+            let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
+            let replay = SafeTensors::deserialize(&replay_map)?;
+            let (reference, _) = decoded(&replay, "block0.output")?;
+            let (captured, _) = decoded(&io, "block0.output")?;
+            (
+                final_index_host,
+                final_hidden_host,
+                final_entries,
+                final_table_host,
+                reference,
+                captured,
+            )
+        };
 
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -7667,46 +7941,15 @@ mod tests {
         let index = s.clone_htod(&index)?;
         let mut captured_norm_defects = 0;
         {
-            let last = io.tensor("block49.output")?;
-            ensure!(
-                last.dtype() == Dtype::BF16 && last.shape() == [1, rows, spec.hidden],
-                "captured final norm input extent"
-            );
             let hidden = s.clone_htod(&input)?;
-            let final_hidden = s.clone_htod(&bf16_of(&io, "block49.output")?)?;
+            let final_hidden = s.clone_htod(&final_hidden_host)?;
             let final_weight = Source::new(&transformer, &manifest).tensor::<bf16>(
                 s,
                 "norm_out.norm.weight",
                 spec.hidden,
             )?;
-            let final_table = adaln.tensor("norm_out.step0")?;
-            ensure!(
-                final_table.dtype() == Dtype::BF16
-                    && final_table.shape().len() == 2
-                    && final_table.shape()[1] == 2 * spec.hidden,
-                "captured final modulation extent"
-            );
-            let final_entries = u32::try_from(final_table.shape()[0])?;
-            let final_table = s.clone_htod(&bf16_of(&adaln, "norm_out.step0")?)?;
-            let step_map = mapped(&capture.join("step0.safetensors"))?;
-            let step = SafeTensors::deserialize(&step_map)?;
-            let final_index = step.tensor("timestep_indices")?;
-            ensure!(
-                final_index.dtype() == Dtype::I64 && final_index.shape() == [rows],
-                "captured final norm index extent"
-            );
-            let final_index: Vec<u32> = final_index
-                .data()
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|v| u32::try_from(i64::from_le_bytes(*v)))
-                .collect::<std::result::Result<_, _>>()?;
-            ensure!(
-                final_index.iter().all(|&v| v < final_entries),
-                "captured final norm index bound"
-            );
-            let final_index = s.clone_htod(&final_index)?;
+            let final_table = s.clone_htod(&final_table_host)?;
+            let final_index = s.clone_htod(&final_index_host)?;
             let reference = s.alloc_zeros::<bf16>(rows * spec.hidden)?;
             for (name, x, weight, params, indices, stride, shift, scale, entries, eps) in [
                 (
@@ -7838,10 +8081,6 @@ mod tests {
         let control = run(0.0)?;
         fs::remove_dir(&runtime)?;
 
-        let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
-        let replay = SafeTensors::deserialize(&replay_map)?;
-        let (reference, _) = decoded(&replay, "block0.output")?;
-        let (captured, _) = decoded(&io, "block0.output")?;
         ensure!(
             candidate.iter().all(|v| v.is_finite()),
             "non-finite block output"
@@ -8467,6 +8706,19 @@ mod tests {
             .iter()
             .map(|b| bf16::from_le_bytes(*b))
             .collect();
+        let mut step_hosts = Vec::new();
+        for &k in &steps {
+            let step_map = mapped(&capture.join(format!("step{k}.safetensors")))?;
+            let step_file = SafeTensors::deserialize(&step_map)?;
+            let host = |name: &str| -> Result<Vec<f32>> {
+                Ok(decoded(&step_file, name)?
+                    .0
+                    .into_iter()
+                    .map(|v| v as f32)
+                    .collect())
+            };
+            step_hosts.push((host("hidden_states")?, host("audio_hidden_states")?));
+        }
 
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -8519,18 +8771,9 @@ mod tests {
         let condition = layout.condition_video_rows;
         let patch = spec.video_row_width();
         let (mut control_failed, mut defects) = (false, vec![]);
-        for &k in &steps {
-            let step_map = mapped(&capture.join(format!("step{k}.safetensors")))?;
-            let step_file = SafeTensors::deserialize(&step_map)?;
-            let to_f32 = |name: &str| -> Result<Vec<f32>> {
-                Ok(decoded(&step_file, name)?
-                    .0
-                    .into_iter()
-                    .map(|v| v as f32)
-                    .collect())
-            };
-            let video = s.clone_htod(&to_f32("hidden_states")?)?;
-            let audio = s.clone_htod(&to_f32("audio_hidden_states")?)?;
+        for (hosts, &k) in step_hosts.iter().zip(&steps) {
+            let video = s.clone_htod(&hosts.0)?;
+            let audio = s.clone_htod(&hosts.1)?;
             let row_pairs = s.clone_htod(&adaln_plan.row_pairs[k])?;
             let row_timesteps = s.clone_htod(&adaln_plan.row_timesteps[k])?;
             let chunked_control = dit.work.chunk < dit.work.rows;
@@ -8929,6 +9172,18 @@ mod tests {
             spec.architecture
         );
         let image_token = spec.vision.as_ref().context("vision missing")?.image_token;
+        admit_n6_thresholds(&frozen)?;
+        let cells = conditioner_cells(&s0, image_token)?;
+        let names = ["merged", "deepstack0", "deepstack1", "deepstack2"];
+        let mut references = Vec::new();
+        for (cell, _) in &cells {
+            references.push(conditioner_named_f64(
+                &legs
+                    .join(format!("C-{cell}-fp32"))
+                    .join("conditioner.safetensors"),
+                &VISION_TENSORS,
+            )?);
+        }
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
         let common = CommonOpsRef::new(&device.ctx)?;
@@ -8965,7 +9220,6 @@ mod tests {
                 "MiniMax-H3 conditioner vision gate".into(),
             )),
         )?;
-        let cells = conditioner_cells(&s0, image_token)?;
         let mut run = |tower: &super::super::vision_runtime::LayerNormTower,
                        cell: &ConditionerPrompt|
          -> Result<Vec<Vec<f64>>> {
@@ -8990,29 +9244,15 @@ mod tests {
                 })
                 .collect()
         };
-        let names = ["merged", "deepstack0", "deepstack1", "deepstack2"];
-        let reference = |cell: &str| -> Result<Vec<Vec<f64>>> {
-            let map = mapped(
-                &legs
-                    .join(format!("C-{cell}-fp32"))
-                    .join("conditioner.safetensors"),
-            )?;
-            let file = SafeTensors::deserialize(&map)?;
-            names
-                .iter()
-                .map(|n| Ok(decoded(&file, &format!("vision.{n}"))?.0))
-                .collect()
-        };
         let mut defects = Vec::new();
-        for (cell, inputs) in &cells {
+        for ((cell, inputs), expected) in cells.iter().zip(&references) {
             let outputs = run(&tower, inputs)?;
-            let expected = reference(cell)?;
             ensure!(
                 outputs.len() == names.len(),
                 "cell {cell}: {} outputs",
                 outputs.len()
             );
-            for ((name, got), want) in names.iter().zip(&outputs).zip(&expected) {
+            for ((name, got), want) in names.iter().zip(&outputs).zip(expected.iter()) {
                 ensure!(
                     got.len() == want.len(),
                     "cell {cell} {name}: {} vs {}",
@@ -9034,7 +9274,7 @@ mod tests {
         tower.shift_deepstack_taps()?;
         let (_, a) = cells.first().context("cell A missing")?;
         let shifted = run(&tower, a)?;
-        let expected = reference("A")?;
+        let expected = references.first().context("cell A missing")?;
         for (k, name) in names.iter().enumerate().skip(1) {
             let d = distance(&shifted[k], &expected[k])?;
             println!("H3_VISION shifted-taps control cell=A {name}={d:?}");
@@ -9138,6 +9378,7 @@ mod tests {
                 var("FF_H3_N6_LEGS")?,
             );
             let frozen = serde_json::from_slice(&fs::read(var("FF_H3_N6_THRESHOLDS")?)?)?;
+            admit_n6_thresholds(&frozen)?;
             let spec = crate::model_spec::ModelSpec::read(&encoder)?;
             let image_token = spec.vision.as_ref().context("vision missing")?.image_token;
             let manifest = MappedCheckpoint::open_component(&encoder, "model")?
@@ -9186,26 +9427,22 @@ mod tests {
                 .image_token)
         }
 
-        /// Scores `taps` (hidden_states indices) of one cell against `{kind}-{cell}-fp32` and the frozen `{cell}.{label}` cells;
-        /// returns whether the gating hidden_states[50] passed.
+        /// Scores `taps` against `references` and the frozen `{cell}.{label}` cells. Returns whether hidden_states[50] passed.
         fn score(
             &self,
             cell: &str,
-            (kind, label): (&str, &str),
+            label: &str,
             outputs: &[Vec<bf16>],
             taps: &[usize],
+            references: &[Vec<f64>],
         ) -> Result<bool> {
-            let map = mapped(
-                &self
-                    .legs
-                    .join(format!("{kind}-{cell}-fp32"))
-                    .join("conditioner.safetensors"),
-            )?;
-            let file = SafeTensors::deserialize(&map)?;
+            ensure!(
+                outputs.len() == taps.len() && references.len() == taps.len(),
+                "cell {cell} tap reference extent"
+            );
             let mut gating = true;
-            for (output, &tap) in outputs.iter().zip(taps) {
+            for ((output, &tap), want) in outputs.iter().zip(taps).zip(references) {
                 let got: Vec<f64> = output.iter().map(|v| f64::from(v.to_f32())).collect();
-                let want = decoded(&file, &format!("text.hidden_states_{tap}"))?.0;
                 ensure!(
                     got.len() == want.len(),
                     "cell {cell} hidden_states[{tap}] extent"
@@ -9216,7 +9453,7 @@ mod tests {
                 );
                 let (ok, summary) = sink_rule(
                     &got,
-                    &want,
+                    want,
                     self.spec.hidden as usize,
                     &self.frozen["thresholds"][format!("{cell}.{label}.hidden_states_{tap}")],
                 )?;
@@ -9262,6 +9499,32 @@ mod tests {
         fs::create_dir(&runtime)?;
         let outcome = (|| -> Result<()> {
             let gate = TextGate::new(layers)?;
+            let mut text_refs = Vec::new();
+            let mut vision_bf16 = Vec::new();
+            for (cell, _) in &gate.cells {
+                text_refs.push(conditioner_text_references(
+                    &gate
+                        .legs
+                        .join(format!("T-{cell}-fp32"))
+                        .join("conditioner.safetensors"),
+                )?);
+                vision_bf16.push(
+                    conditioner_named_f64(
+                        &gate
+                            .legs
+                            .join(format!("C-{cell}-fp32"))
+                            .join("conditioner.safetensors"),
+                        &VISION_TENSORS,
+                    )?
+                    .into_iter()
+                    .map(|values| values.into_iter().map(bf16::from_f64).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                );
+            }
+            let tap50 = TEXT_TAPS
+                .iter()
+                .position(|&tap| tap == 50)
+                .context("hidden_states_50")?;
             let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
             let device = Device::new(0)?;
             let ops = Ops::new(&device.ctx)?;
@@ -9289,24 +9552,15 @@ mod tests {
                 Placement::from_env()?,
             )?;
             let mut defects = Vec::new();
-            for (cell, inputs) in &gate.cells {
+            for (((cell, inputs), text_ref), vision) in
+                gate.cells.iter().zip(&text_refs).zip(&vision_bf16)
+            {
                 conditioner.prepare(&blas, inputs.tokens.len())?;
-                let map = mapped(
-                    &gate
-                        .legs
-                        .join(format!("C-{cell}-fp32"))
-                        .join("conditioner.safetensors"),
-                )?;
-                let reference = SafeTensors::deserialize(&map)?;
-                let merged = bf16_of(&reference, "vision.merged")?;
                 let deepstack = (0..3)
-                    .map(|k| {
-                        Ok(device
-                            .stream
-                            .clone_htod(&bf16_of(&reference, &format!("vision.deepstack{k}"))?)?)
-                    })
+                    .map(|k| Ok(device.stream.clone_htod(&vision[k + 1])?))
                     .collect::<Result<Vec<_>>>()?;
-                let embeds = conditioner_embeds(inputs, image_token, &gate.table, &merged, hidden)?;
+                let embeds =
+                    conditioner_embeds(inputs, image_token, &gate.table, &vision[0], hidden)?;
                 let runs = image_runs(&inputs.tokens, image_token);
                 let rope = conditioner_rope(&gate.spec, inputs)?;
                 let input = ConditionerInput {
@@ -9320,7 +9574,7 @@ mod tests {
                     taps.push(51);
                 }
                 let outputs = conditioner.forward(&device.stream, &blas, &input, &taps)?;
-                if !gate.score(cell, ("T", "text"), &outputs[..4], &TEXT_TAPS)? {
+                if !gate.score(cell, "text", &outputs[..4], &TEXT_TAPS, text_ref)? {
                     defects.push(*cell);
                 }
                 if let Some(root) = std::env::var_os("FF_H3_CAPTURE") {
@@ -9357,7 +9611,13 @@ mod tests {
                 if *cell == "A" {
                     if layers == 51 {
                         ensure!(
-                            !gate.score(cell, ("T", "text"), &outputs[4..], &[50])?,
+                            !gate.score(
+                                cell,
+                                "text",
+                                &outputs[4..],
+                                &[50],
+                                std::slice::from_ref(&text_ref[tap50])
+                            )?,
                             "hidden_states[51] passed the hidden_states[50] cell"
                         );
                     }
@@ -9367,7 +9627,13 @@ mod tests {
                     };
                     let outputs = conditioner.forward(&device.stream, &blas, &flat, &[50])?;
                     ensure!(
-                        !gate.score(cell, ("T", "text"), &outputs, &[50])?,
+                        !gate.score(
+                            cell,
+                            "text",
+                            &outputs,
+                            &[50],
+                            std::slice::from_ref(&text_ref[tap50])
+                        )?,
                         "deepstack-off control passed cell A"
                     );
                     println!(
@@ -9399,6 +9665,15 @@ mod tests {
     fn conditioner_composition_matches_the_fp32_reference() -> Result<()> {
         use crate::backend::cuda::{ops::CommonOpsRef, weights::WeightCatalog};
         let gate = TextGate::new(50)?;
+        let mut text_refs = Vec::new();
+        for (cell, _) in &gate.cells {
+            text_refs.push(conditioner_text_references(
+                &gate
+                    .legs
+                    .join(format!("C-{cell}-fp32"))
+                    .join("conditioner.safetensors"),
+            )?);
+        }
         let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -9460,7 +9735,7 @@ mod tests {
             Placement::from_env()?,
         )?;
         let mut defects = Vec::new();
-        for (cell, inputs) in &gate.cells {
+        for ((cell, inputs), text_ref) in gate.cells.iter().zip(&text_refs) {
             let input = crate::vision_input::MultimodalInput {
                 input_ids: &inputs.tokens,
                 modality_ids: &inputs.modality,
@@ -9486,7 +9761,7 @@ mod tests {
                 },
                 &TEXT_TAPS,
             )?;
-            if !gate.score(cell, ("C", "composition"), &outputs, &TEXT_TAPS)? {
+            if !gate.score(cell, "composition", &outputs, &TEXT_TAPS, text_ref)? {
                 defects.push(*cell);
             }
         }
@@ -9703,6 +9978,28 @@ mod tests {
         let vae_dir = model.join("vae");
         let checkpoint = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?;
         let manifest = checkpoint.minimax_h3_vae_manifest(&spec)?;
+        for cell in ["A", "P"] {
+            let map = mapped(
+                &s0.join(format!("{cell}-bf16"))
+                    .join("keyframes.safetensors"),
+            )?;
+            let file = SafeTensors::deserialize(&map)?;
+            let pixels = file.tensor("k0.pixels")?;
+            let shape = pixels.shape();
+            ensure!(
+                pixels.dtype() == Dtype::U8
+                    && shape.len() == 5
+                    && shape[..3] == [1, spec.in_channels, 1],
+                "keyframe pixels {:?} {shape:?}",
+                pixels.dtype()
+            );
+            let eps = file.tensor("k0.posterior_eps")?;
+            ensure!(
+                eps.dtype() == Dtype::F32,
+                "posterior noise dtype {:?}",
+                eps.dtype()
+            );
+        }
         let device = Device::new(0)?;
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
@@ -9819,6 +10116,30 @@ mod tests {
         let audio_dir = model.join("audio_vae");
         let checkpoint = MappedCheckpoint::open_component(&audio_dir, "diffusion_pytorch_model")?;
         let manifest = checkpoint.minimax_h3_audio_vae_manifest(&spec)?;
+        for cell in ["A", "P"] {
+            let map = mapped(&s0.join(format!("{cell}-bf16")).join("decode.safetensors"))?;
+            let file = SafeTensors::deserialize(&map)?;
+            let input = file.tensor("audio_decoder_input")?;
+            let shape = input.shape();
+            ensure!(
+                input.dtype() == Dtype::F32 && shape.len() == 3 && shape[1] == spec.latent_channels,
+                "audio decoder input {:?} {shape:?}",
+                input.dtype()
+            );
+            let reference_map = mapped(
+                &s0.join(format!("{cell}-fp32-replay"))
+                    .join("replay.safetensors"),
+            )?;
+            let reference_file = SafeTensors::deserialize(&reference_map)?;
+            let reference = reference_file.tensor("decode.audio_decoder_output")?;
+            ensure!(
+                reference.dtype() == Dtype::F32
+                    && reference.shape() == [shape[0], 1, shape[2] * spec.hop()],
+                "reference audio {:?} {:?}",
+                reference.dtype(),
+                reference.shape()
+            );
+        }
         let device = Device::new(0)?;
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
