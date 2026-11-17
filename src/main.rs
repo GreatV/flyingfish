@@ -807,8 +807,10 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
     flyingfish::backend::with_verbose(cli.verbose, || {
         let waveform = flyingfish::media::read_wav(input_bytes(&args.input)?.as_slice(), 16000)?;
         let class = model_class(&cli.model)?;
-        if args.stream && class != "nemo" {
-            bail!("streaming transcription is supported only for parakeet realtime EOU");
+        if args.stream && class != "nemo" && class != "Nemotron3_5AsrForRNNT" {
+            bail!(
+                "streaming transcription is supported only for parakeet realtime EOU and Nemotron 3.5 ASR"
+            );
         }
         let options = flyingfish::RunOptions {
             device: cli.device,
@@ -897,6 +899,9 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
                     options,
                 )?,
                 "nemo" => flyingfish::eou::transcribe(&cli.model, &waveform, args.stream, options)?,
+                "Nemotron3_5AsrForRNNT" => {
+                    flyingfish::nemotron::transcribe(&cli.model, &waveform, args.stream, options)?
+                }
                 _ => bail!("unsupported transcription architecture {class}"),
             };
             match args.format {
