@@ -1371,9 +1371,14 @@ impl LoopvlVisionWeights {
                         .map(|role| (format!("{p}.mlp.{role}_proj.weight"), vec![3072, 1024])),
                 )?;
                 layers.push(LoopvlVisionLayer {
-                    input_norm: l.load(&[(format!("{p}.input_layernorm.weight"), vec![1024])])?,
-                    post_norm: l
-                        .load(&[(format!("{p}.post_attention_layernorm.weight"), vec![1024])])?,
+                    input_norm: l.load(&[(
+                        format!("{p}.{}", crate::checkpoint::GLM_INPUT_LAYERNORM),
+                        vec![1024],
+                    )])?,
+                    post_norm: l.load(&[(
+                        format!("{p}.{}", crate::checkpoint::GLM_POST_ATTENTION_LAYERNORM),
+                        vec![1024],
+                    )])?,
                     q_norm: l.load(&[(format!("{p}.self_attn.q_norm.weight"), vec![128])])?,
                     k_norm: l.load(&[(format!("{p}.self_attn.k_norm.weight"), vec![128])])?,
                     qkv,
@@ -2467,8 +2472,13 @@ impl StoredTensor {
             && a.shape[1] == b.shape[1]
             && matches!(
                 (a.role.as_str(), b.role.as_str()),
-                ("mlp.gate_proj.weight", "mlp.up_proj.weight")
-                    | ("self_attn.q_proj.weight", "self_attn.v_proj.weight")
+                (
+                    crate::checkpoint::GLM_MLP_GATE_PROJ,
+                    crate::checkpoint::GLM_MLP_UP_PROJ
+                ) | (
+                    crate::checkpoint::GLM_ATTN_Q_PROJ,
+                    crate::checkpoint::GLM_ATTN_V_PROJ
+                )
             )
     }
 
@@ -2899,9 +2909,9 @@ impl WeightCatalog {
     pub fn take_globals(&mut self) -> Result<Weights> {
         let embed_name = if self
             .tensors
-            .contains_key("model.language_model.embed_tokens.weight")
+            .contains_key(crate::checkpoint::GLM_EMBED_TOKENS)
         {
-            "model.language_model.embed_tokens.weight"
+            crate::checkpoint::GLM_EMBED_TOKENS
         } else if self.tensors.contains_key("model.embed_tokens.weight") {
             "model.embed_tokens.weight"
         } else {
@@ -2909,15 +2919,15 @@ impl WeightCatalog {
         };
         let norm_name = if self
             .tensors
-            .contains_key("model.language_model.norm.weight")
+            .contains_key(crate::checkpoint::GLM_LANGUAGE_NORM)
         {
-            "model.language_model.norm.weight"
+            crate::checkpoint::GLM_LANGUAGE_NORM
         } else if self.tensors.contains_key("model.norm.weight") {
             "model.norm.weight"
         } else {
             "language_model.norm.weight"
         };
-        let head_entry = self.tensors.get("lm_head.weight");
+        let head_entry = self.tensors.get(crate::checkpoint::GLM_LM_HEAD);
         let native_head = matches!(head_entry, Some(StoredTensor::Bytes(_)));
         let has_head = head_entry.is_some();
         let mut take = |name: &str| match self.tensors.remove(name) {
@@ -2929,7 +2939,10 @@ impl WeightCatalog {
             let empty = embed.stream().alloc_zeros::<bf16>(0)?;
             (Some(embed), empty)
         } else if has_head {
-            (Some(take(embed_name)?), take("lm_head.weight")?)
+            (
+                Some(take(embed_name)?),
+                take(crate::checkpoint::GLM_LM_HEAD)?,
+            )
         } else {
             (None, take(embed_name)?)
         };
@@ -4068,7 +4081,10 @@ mod tests {
                 "F32 native upload changed the published bytes"
             );
             println!("PASS native_f32_upload shape=[2,2] bytes=16");
-            for role in ["hc_attn_fn", "hc_ffn_fn"] {
+            for role in [
+                crate::checkpoint::GLM_HC_ATTN_FN,
+                crate::checkpoint::GLM_HC_FFN_FN,
+            ] {
                 let model = crate::model_spec::ModelSpec::glm5_next(
                     &serde_json::from_str(include_str!(
                         "../../../tests/data/glm53-flash-config.json"
@@ -4178,7 +4194,12 @@ mod tests {
                 true,
                 Dtype::BF16,
             ),
-            ("mlp.gate.weight", vec![2, 4], true, Dtype::BF16),
+            (
+                crate::checkpoint::GLM_MLP_GATE,
+                vec![2, 4],
+                true,
+                Dtype::BF16,
+            ),
             ("vision.projection.weight", vec![4, 4], false, Dtype::BF16),
         ]
         .map(|(role, shape, load, dtype)| TensorEntry {
@@ -4206,7 +4227,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.role.as_str())
                 .collect::<Vec<_>>(),
-            ["linear_attn.conv1d.weight", "mlp.gate.weight"]
+            ["linear_attn.conv1d.weight", crate::checkpoint::GLM_MLP_GATE]
         );
         assert_eq!(
             entries
@@ -4239,7 +4260,7 @@ mod tests {
             data_offsets: [0, 0],
             scope: crate::checkpoint::TensorScope::Text,
             layer: Some(0),
-            role: "mlp.gate_proj.weight".into(),
+            role: crate::checkpoint::GLM_MLP_GATE_PROJ.into(),
             scale_name: None,
             quant,
             swap_halves: false,
@@ -4556,9 +4577,14 @@ impl DiffusionWeights {
                     q_norm: l.load(&[(format!("{p}.self_attn.q_norm.weight"), vec![dim])])?,
                     k_norm: l.load(&[(format!("{p}.self_attn.k_norm.weight"), vec![dim])])?,
                     o: l.load(&[(format!("{p}.self_attn.o_proj.weight"), vec![h, qh * dim])])?,
-                    input_norm: l.load(&[(format!("{p}.input_layernorm.weight"), vec![h])])?,
-                    post_attn: l
-                        .load(&[(format!("{p}.post_attention_layernorm.weight"), vec![h])])?,
+                    input_norm: l.load(&[(
+                        format!("{p}.{}", crate::checkpoint::GLM_INPUT_LAYERNORM),
+                        vec![h],
+                    )])?,
+                    post_attn: l.load(&[(
+                        format!("{p}.{}", crate::checkpoint::GLM_POST_ATTENTION_LAYERNORM),
+                        vec![h],
+                    )])?,
                     pre_ffn: l
                         .load(&[(format!("{p}.pre_feedforward_layernorm.weight"), vec![h])])?,
                     pre_ffn2: l

@@ -502,17 +502,25 @@ fn take_glm_hc_weights(
         let mut sublayer = |base: &str| -> Result<HcSublayerWeights> {
             Ok(HcSublayerWeights {
                 fn_w: take(
-                    &format!("{base}_fn"),
+                    &format!("{base}{}", crate::checkpoint::GLM_HC_FN_SUFFIX),
                     safetensors::Dtype::BF16,
                     &[24, 4 * hidden],
                 )?,
-                base: take(&format!("{base}_base"), safetensors::Dtype::F32, &[24])?,
-                scale: take(&format!("{base}_scale"), safetensors::Dtype::F32, &[3])?,
+                base: take(
+                    &format!("{base}{}", crate::checkpoint::GLM_HC_BASE_SUFFIX),
+                    safetensors::Dtype::F32,
+                    &[24],
+                )?,
+                scale: take(
+                    &format!("{base}{}", crate::checkpoint::GLM_HC_SCALE_SUFFIX),
+                    safetensors::Dtype::F32,
+                    &[3],
+                )?,
             })
         };
         weights.push(HcLayerWeights {
-            attn: sublayer("hc_attn")?,
-            ffn: sublayer("hc_ffn")?,
+            attn: sublayer(crate::checkpoint::GLM_HC_ATTN)?,
+            ffn: sublayer(crate::checkpoint::GLM_HC_FFN)?,
         });
     }
     Ok(weights)
@@ -761,7 +769,10 @@ impl NativeFfn {
             .context("GLM configuration missing")?;
         let stream = &engine.device.stream;
         let experts = moe.experts as usize;
-        let name = format!("model.language_model.layers.{layer}.mlp.gate.e_score_correction_bias");
+        let name = format!(
+            "model.language_model.layers.{layer}.{}",
+            crate::checkpoint::GLM_MLP_SCORE_BIAS
+        );
         let geometry = crate::experts::catalogue::ExpertGeometry::from_model(spec)?;
         let slot_layer = u32::try_from(layer)?
             .checked_sub(geometry.first_layer)
@@ -992,9 +1003,9 @@ fn project_kda(
     let mw = w.mixer.as_ref().context("KDA mixer workspace missing")?;
     let input = matrix(&w.n, s, 0, linear_rows, hidden)?;
     for (part, role) in [
-        "self_attn.q_proj.weight",
-        "self_attn.k_proj.weight",
-        "self_attn.v_proj.weight",
+        crate::checkpoint::GLM_ATTN_Q_PROJ,
+        crate::checkpoint::GLM_ATTN_K_PROJ,
+        crate::checkpoint::GLM_ATTN_V_PROJ,
     ]
     .into_iter()
     .enumerate()
@@ -1022,13 +1033,13 @@ fn project_kda(
     }
     for (low_role, expand_role, output) in [
         (
-            "self_attn.f_a_proj.weight",
-            "self_attn.f_b_proj.weight",
+            crate::checkpoint::GLM_ATTN_F_A_PROJ,
+            crate::checkpoint::GLM_ATTN_F_B_PROJ,
             &mw.ab,
         ),
         (
-            "self_attn.g_a_proj.weight",
-            "self_attn.g_b_proj.weight",
+            crate::checkpoint::GLM_ATTN_G_A_PROJ,
+            crate::checkpoint::GLM_ATTN_G_B_PROJ,
             &mw.gate,
         ),
     ] {
@@ -1049,7 +1060,7 @@ fn project_kda(
     }
     linear.run(
         blas,
-        "self_attn.b_proj.weight",
+        crate::checkpoint::GLM_ATTN_B_PROJ,
         phase,
         input,
         &mut TensorMut(matrix(&mw.ab, s, capacity * a_width, linear_rows, hv)?),
@@ -1718,17 +1729,17 @@ impl Runtime {
                 linear.fuse_pair(
                     &plan,
                     &catalog.manifest,
-                    "mlp.gate_proj.weight",
-                    "mlp.up_proj.weight",
-                    "mlp.gate_up_proj.weight",
+                    crate::checkpoint::GLM_MLP_GATE_PROJ,
+                    crate::checkpoint::GLM_MLP_UP_PROJ,
+                    crate::checkpoint::GLM_MLP_GATE_UP_PROJ,
                 )?;
                 if !geometry.kv_reader && !shared_projection {
                     linear.fuse_pair(
                         &plan,
                         &catalog.manifest,
-                        "self_attn.q_proj.weight",
-                        "self_attn.v_proj.weight",
-                        "self_attn.qv_proj.weight",
+                        crate::checkpoint::GLM_ATTN_Q_PROJ,
+                        crate::checkpoint::GLM_ATTN_V_PROJ,
+                        crate::checkpoint::GLM_ATTN_QV_PROJ,
                     )?;
                 }
             }
@@ -1758,7 +1769,10 @@ impl Runtime {
                             vector(catalog.bf16(&format!("{prefix}self_attn.{name}"))?, s)
                         };
                         let kv_b = matrix(
-                            catalog.bf16(&format!("{prefix}self_attn.kv_b_proj.weight"))?,
+                            catalog.bf16(&format!(
+                                "{prefix}{}",
+                                crate::checkpoint::GLM_DSA_KV_B_PROJ
+                            ))?,
                             s,
                             0,
                             32_768,
@@ -1766,7 +1780,8 @@ impl Runtime {
                         )?;
                         let ape = matrix(
                             catalog.bf16(&format!(
-                                "{prefix}self_attn.indexer.index_kpool_compress_ape"
+                                "{prefix}{}",
+                                crate::checkpoint::GLM_DSA_INDEX_APE
                             ))?,
                             s,
                             0,
@@ -1774,10 +1789,10 @@ impl Runtime {
                             128,
                         )?;
                         BoundMixer::Dsa {
-                            q_norm: aux("q_a_layernorm.weight")?,
-                            kv_norm: aux("kv_a_layernorm.weight")?,
-                            k_norm: aux("indexer.k_norm.weight")?,
-                            k_bias: aux("indexer.k_norm.bias")?,
+                            q_norm: aux(crate::checkpoint::GLM_DSA_Q_A_NORM)?,
+                            kv_norm: aux(crate::checkpoint::GLM_DSA_KV_A_NORM)?,
+                            k_norm: aux(crate::checkpoint::GLM_DSA_INDEX_K_NORM)?,
+                            k_bias: aux(crate::checkpoint::GLM_DSA_INDEX_K_BIAS)?,
                             ape,
                             kv_b,
                             prefill,
@@ -2141,7 +2156,7 @@ impl Runtime {
                     };
                     BoundMixer::Gdn {
                         norm: weight(if native_kda {
-                            "self_attn.o_norm.weight"
+                            crate::checkpoint::GLM_ATTN_O_NORM
                         } else {
                             "linear_attn.norm.weight"
                         })?,
@@ -2175,8 +2190,8 @@ impl Runtime {
                 linear,
                 ffn,
                 native,
-                input_norm: weight("input_layernorm.weight")?,
-                post_norm: weight("post_attention_layernorm.weight")?,
+                input_norm: weight(crate::checkpoint::GLM_INPUT_LAYERNORM)?,
+                post_norm: weight(crate::checkpoint::GLM_POST_ATTENTION_LAYERNORM)?,
                 pre_ffn_norm: gemma
                     .then(|| weight("pre_feedforward_layernorm.weight"))
                     .transpose()?,
@@ -2320,10 +2335,14 @@ impl Runtime {
                     }
                     BoundMixer::Attention { .. } => {
                         for (role, width, offset) in [
-                            ("self_attn.q_proj.weight", 2 * q_width, 0),
-                            ("self_attn.k_proj.weight", kv_width, extent * 2 * q_width),
+                            (crate::checkpoint::GLM_ATTN_Q_PROJ, 2 * q_width, 0),
                             (
-                                "self_attn.v_proj.weight",
+                                crate::checkpoint::GLM_ATTN_K_PROJ,
+                                kv_width,
+                                extent * 2 * q_width,
+                            ),
+                            (
+                                crate::checkpoint::GLM_ATTN_V_PROJ,
                                 kv_width,
                                 extent * (2 * q_width + kv_width),
                             ),
@@ -2336,7 +2355,7 @@ impl Runtime {
                                 invariant,
                             )?;
                         }
-                        ("self_attn.o_proj.weight", q_width)
+                        (crate::checkpoint::GLM_ATTN_O_PROJ, q_width)
                     }
                     BoundMixer::Gdn { .. } => {
                         let spec = self.gdn.as_ref().context("HIP GDN shape missing")?;
@@ -2379,8 +2398,8 @@ impl Runtime {
                 if matches!(layer.ffn, BoundFfn::Dense) {
                     let intermediate = engine.model_spec.intermediate as usize;
                     for (role, offset) in [
-                        ("mlp.gate_proj.weight", 0),
-                        ("mlp.up_proj.weight", extent * intermediate),
+                        (crate::checkpoint::GLM_MLP_GATE_PROJ, 0),
+                        (crate::checkpoint::GLM_MLP_UP_PROJ, extent * intermediate),
                     ] {
                         layer.linear.bind_call(
                             ops,
@@ -2392,7 +2411,7 @@ impl Runtime {
                     }
                     layer.linear.bind_call(
                         ops,
-                        "mlp.down_proj.weight",
+                        crate::checkpoint::GLM_MLP_DOWN_PROJ,
                         matrix(&work.act, stream, 0, rows, intermediate)?,
                         &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
                         invariant,
@@ -5164,7 +5183,7 @@ impl Engine {
         let input = matrix(&w.n, s, 0, linear_rows, hidden)?;
         layer.linear.run(
             &self.blas,
-            "self_attn.q_a_proj.weight",
+            crate::checkpoint::GLM_DSA_Q_A_PROJ,
             phase,
             input,
             &mut TensorMut(matrix(
@@ -5177,7 +5196,7 @@ impl Engine {
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.kv_a_proj_with_mqa.weight",
+            crate::checkpoint::GLM_DSA_KV_A_PROJ,
             phase,
             input,
             &mut TensorMut(matrix(&w.qkv, s, layout.latent.start, linear_rows, 512)?),
@@ -5228,14 +5247,14 @@ impl Engine {
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.q_b_proj.weight",
+            crate::checkpoint::GLM_DSA_Q_B_PROJ,
             phase,
             matrix(&w.qkv, s, layout.query_residual.start, linear_rows, 1536)?,
             &mut TensorMut(matrix(&w.qkv, s, layout.query.start, linear_rows, 16_384)?),
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.indexer.wq_b.weight",
+            crate::checkpoint::GLM_DSA_INDEX_WQ_B,
             phase,
             matrix(&w.qkv, s, layout.query_residual.start, linear_rows, 1536)?,
             &mut TensorMut(matrix(
@@ -5248,14 +5267,14 @@ impl Engine {
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.indexer.wk.weight",
+            crate::checkpoint::GLM_DSA_INDEX_WK,
             phase,
             input,
             &mut TensorMut(matrix(&w.qkv, s, layout.packed.start, linear_rows, 128)?),
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.indexer.index_kpool_compress_gate",
+            crate::checkpoint::GLM_DSA_INDEX_GATE,
             phase,
             input,
             &mut TensorMut(matrix(
@@ -5268,7 +5287,7 @@ impl Engine {
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.indexer.weights_proj.weight",
+            crate::checkpoint::GLM_DSA_INDEX_WEIGHTS_PROJ,
             phase,
             input,
             &mut TensorMut(matrix(
@@ -5380,7 +5399,7 @@ impl Engine {
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.o_proj.weight",
+            crate::checkpoint::GLM_ATTN_O_PROJ,
             phase,
             matrix(&w.attn, s, 0, linear_rows, 16_384)?,
             &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
@@ -5461,14 +5480,14 @@ impl Engine {
                 nope,
             } => {
                 for (role, width, offset) in [
-                    ("self_attn.q_proj.weight", q_width as usize, 0),
+                    (crate::checkpoint::GLM_ATTN_Q_PROJ, q_width as usize, 0),
                     (
-                        "self_attn.k_proj.weight",
+                        crate::checkpoint::GLM_ATTN_K_PROJ,
                         kv_width as usize,
                         linear_rows * q_width as usize,
                     ),
                     (
-                        "self_attn.v_proj.weight",
+                        crate::checkpoint::GLM_ATTN_V_PROJ,
                         kv_width as usize,
                         linear_rows * (q_width as usize + kv_width as usize),
                     ),
@@ -5764,7 +5783,7 @@ impl Engine {
                 }
                 layer.linear.run(
                     &self.blas,
-                    "self_attn.o_proj.weight",
+                    crate::checkpoint::GLM_ATTN_O_PROJ,
                     phase,
                     matrix(&w.attn, s, 0, linear_rows, q_width as usize)?,
                     &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
@@ -5796,15 +5815,19 @@ impl Engine {
                 if reader {
                     layer.linear.run(
                         &self.blas,
-                        "self_attn.q_proj.weight",
+                        crate::checkpoint::GLM_ATTN_Q_PROJ,
                         phase,
                         matrix(&w.n, s, 0, linear_rows, hidden)?,
                         &mut TensorMut(matrix(&w.qkv, s, 0, linear_rows, q_width)?),
                     )?;
                 } else if shared_projection {
                     for (role, width, offset) in [
-                        ("self_attn.q_proj.weight", q_width, 0),
-                        ("self_attn.k_proj.weight", kv_width, linear_rows * q_width),
+                        (crate::checkpoint::GLM_ATTN_Q_PROJ, q_width, 0),
+                        (
+                            crate::checkpoint::GLM_ATTN_K_PROJ,
+                            kv_width,
+                            linear_rows * q_width,
+                        ),
                     ] {
                         layer.linear.run(
                             &self.blas,
@@ -5816,9 +5839,9 @@ impl Engine {
                     }
                 } else {
                     for (role, width, offset) in [
-                        ("self_attn.qv_proj.weight", q_width + kv_width, 0),
+                        (crate::checkpoint::GLM_ATTN_QV_PROJ, q_width + kv_width, 0),
                         (
-                            "self_attn.k_proj.weight",
+                            crate::checkpoint::GLM_ATTN_K_PROJ,
                             kv_width,
                             linear_rows * (q_width + kv_width),
                         ),
@@ -6083,7 +6106,7 @@ impl Engine {
                 }
                 layer.linear.run(
                     &self.blas,
-                    "self_attn.o_proj.weight",
+                    crate::checkpoint::GLM_ATTN_O_PROJ,
                     phase,
                     matrix(&w.attn, s, 0, linear_rows, q_width)?,
                     &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
@@ -6109,14 +6132,14 @@ impl Engine {
                     )?;
                 }
                 for (role, width, offset) in [
-                    ("self_attn.q_proj.weight", 2 * q_width as usize, 0),
+                    (crate::checkpoint::GLM_ATTN_Q_PROJ, 2 * q_width as usize, 0),
                     (
-                        "self_attn.k_proj.weight",
+                        crate::checkpoint::GLM_ATTN_K_PROJ,
                         kv_width as usize,
                         self.workspace_rows * 2 * q_width as usize,
                     ),
                     (
-                        "self_attn.v_proj.weight",
+                        crate::checkpoint::GLM_ATTN_V_PROJ,
                         kv_width as usize,
                         self.workspace_rows * (2 * q_width as usize + kv_width as usize),
                     ),
@@ -6297,7 +6320,7 @@ impl Engine {
                 }
                 layer.linear.run(
                     &self.blas,
-                    "self_attn.o_proj.weight",
+                    crate::checkpoint::GLM_ATTN_O_PROJ,
                     phase,
                     matrix(&w.attn, s, 0, quant_rows, q_width as usize)?,
                     &mut TensorMut(matrix(&w.out, s, 0, quant_rows, hidden)?),
@@ -6452,7 +6475,7 @@ impl Engine {
                         spec.gate_mode,
                         crate::op_contract::GdnGateMode::PerChannel { .. }
                     ) {
-                        "self_attn.o_proj.weight"
+                        crate::checkpoint::GLM_ATTN_O_PROJ
                     } else {
                         "linear_attn.out_proj.weight"
                     },
@@ -6799,8 +6822,8 @@ impl Engine {
             .context("Gemma 4 FFN geometry missing")?
             .intermediate as usize;
         let (input_width, output_width) = match role {
-            "self_attn.q_proj.weight" => (hidden, self.model_spec.q_width as usize),
-            "self_attn.k_proj.weight" | "self_attn.v_proj.weight" => (
+            crate::checkpoint::GLM_ATTN_Q_PROJ => (hidden, self.model_spec.q_width as usize),
+            crate::checkpoint::GLM_ATTN_K_PROJ | crate::checkpoint::GLM_ATTN_V_PROJ => (
                 hidden,
                 self.model_spec.kv_heads as usize
                     * self.model_spec.layers[0]
@@ -6808,8 +6831,10 @@ impl Engine {
                         .context("Gemma 4 attention geometry missing")?
                         .head_dim as usize,
             ),
-            "mlp.gate_proj.weight" | "mlp.up_proj.weight" => (hidden, intermediate),
-            "mlp.down_proj.weight" => (intermediate, hidden),
+            crate::checkpoint::GLM_MLP_GATE_PROJ | crate::checkpoint::GLM_MLP_UP_PROJ => {
+                (hidden, intermediate)
+            }
+            crate::checkpoint::GLM_MLP_DOWN_PROJ => (intermediate, hidden),
             _ => anyhow::bail!("unsupported Gemma linear probe role {role}"),
         };
         ensure!(
@@ -7497,15 +7522,15 @@ impl Engine {
                 if gemma {
                     layer.linear.run(
                         &self.blas,
-                        "mlp.gate_up_proj.weight",
+                        crate::checkpoint::GLM_MLP_GATE_UP_PROJ,
                         phase,
                         matrix(&w.n, s, 0, linear_rows, h)?,
                         &mut TensorMut(matrix(&w.gu, s, 0, linear_rows, 2 * f)?),
                     )?;
                 } else {
                     for (role, offset) in [
-                        ("mlp.gate_proj.weight", 0),
-                        ("mlp.up_proj.weight", self.workspace_rows * f),
+                        (crate::checkpoint::GLM_MLP_GATE_PROJ, 0),
+                        (crate::checkpoint::GLM_MLP_UP_PROJ, self.workspace_rows * f),
                     ] {
                         layer.linear.run(
                             &self.blas,
@@ -7617,7 +7642,7 @@ impl Engine {
             O::Down => {
                 layer.linear.run(
                     &self.blas,
-                    "mlp.down_proj.weight",
+                    crate::checkpoint::GLM_MLP_DOWN_PROJ,
                     phase,
                     matrix(&w.act, s, 0, quant_rows, f)?,
                     &mut TensorMut(matrix(&w.out, s, 0, quant_rows, h)?),

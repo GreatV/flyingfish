@@ -14,6 +14,66 @@ use std::{
     path::{Component, Path},
 };
 
+#[cfg(any(feature = "cuda", test))]
+mod glm_roles {
+    pub const GLM_INPUT_LAYERNORM: &str = "input_layernorm.weight";
+    pub(crate) const GLM_POST_ATTENTION_LAYERNORM: &str = "post_attention_layernorm.weight";
+    pub(crate) const GLM_HC_ATTN: &str = "hc_attn";
+    pub(crate) const GLM_HC_FFN: &str = "hc_ffn";
+    pub(crate) const GLM_HC_FN_SUFFIX: &str = "_fn";
+    pub(crate) const GLM_HC_BASE_SUFFIX: &str = "_base";
+    pub(crate) const GLM_HC_SCALE_SUFFIX: &str = "_scale";
+    pub(crate) const GLM_MLP_GATE: &str = "mlp.gate.weight";
+    pub(crate) const GLM_MLP_SCORE_BIAS: &str = "mlp.gate.e_score_correction_bias";
+    pub(crate) const GLM_MLP_SHARED_GATE: &str = "mlp.shared_experts.gate_proj.weight";
+    pub(crate) const GLM_MLP_SHARED_UP: &str = "mlp.shared_experts.up_proj.weight";
+    pub(crate) const GLM_MLP_SHARED_DOWN: &str = "mlp.shared_experts.down_proj.weight";
+    pub(crate) const GLM_MLP_GATE_PROJ: &str = "mlp.gate_proj.weight";
+    pub(crate) const GLM_MLP_UP_PROJ: &str = "mlp.up_proj.weight";
+    pub(crate) const GLM_MLP_DOWN_PROJ: &str = "mlp.down_proj.weight";
+    pub(crate) const GLM_MLP_GATE_UP_PROJ: &str = "mlp.gate_up_proj.weight";
+    pub(crate) const GLM_ATTN_Q_PROJ: &str = "self_attn.q_proj.weight";
+    pub(crate) const GLM_ATTN_K_PROJ: &str = "self_attn.k_proj.weight";
+    pub(crate) const GLM_ATTN_V_PROJ: &str = "self_attn.v_proj.weight";
+    pub(crate) const GLM_ATTN_QV_PROJ: &str = "self_attn.qv_proj.weight";
+    pub(crate) const GLM_ATTN_O_PROJ: &str = "self_attn.o_proj.weight";
+    pub(crate) const GLM_ATTN_O_NORM: &str = "self_attn.o_norm.weight";
+    pub(crate) const GLM_ATTN_A_LOG: &str = "A_log";
+    pub(crate) const GLM_ATTN_DT_BIAS: &str = "dt_bias";
+    pub(crate) const GLM_ATTN_B_PROJ: &str = "self_attn.b_proj.weight";
+    pub(crate) const GLM_ATTN_F_A_PROJ: &str = "self_attn.f_a_proj.weight";
+    pub(crate) const GLM_ATTN_F_B_PROJ: &str = "self_attn.f_b_proj.weight";
+    pub(crate) const GLM_ATTN_G_A_PROJ: &str = "self_attn.g_a_proj.weight";
+    pub(crate) const GLM_ATTN_G_B_PROJ: &str = "self_attn.g_b_proj.weight";
+    pub(crate) const GLM_ATTN_Q_CONV: &str = "q_conv1d";
+    pub(crate) const GLM_ATTN_K_CONV: &str = "k_conv1d";
+    pub(crate) const GLM_ATTN_V_CONV: &str = "v_conv1d";
+    pub(crate) const GLM_DSA_Q_A_PROJ: &str = "self_attn.q_a_proj.weight";
+    pub(crate) const GLM_DSA_Q_A_NORM: &str = "q_a_layernorm.weight";
+    pub(crate) const GLM_DSA_Q_B_PROJ: &str = "self_attn.q_b_proj.weight";
+    pub(crate) const GLM_DSA_KV_A_PROJ: &str = "self_attn.kv_a_proj_with_mqa.weight";
+    pub(crate) const GLM_DSA_KV_A_NORM: &str = "kv_a_layernorm.weight";
+    pub(crate) const GLM_DSA_KV_B_PROJ: &str = "self_attn.kv_b_proj.weight";
+    pub(crate) const GLM_DSA_INDEX_APE: &str = "self_attn.indexer.index_kpool_compress_ape";
+    pub(crate) const GLM_DSA_INDEX_K_BIAS: &str = "indexer.k_norm.bias";
+    pub(crate) const GLM_DSA_INDEX_K_NORM: &str = "indexer.k_norm.weight";
+    pub(crate) const GLM_DSA_INDEX_WEIGHTS_PROJ: &str = "self_attn.indexer.weights_proj.weight";
+    pub(crate) const GLM_DSA_INDEX_WK: &str = "self_attn.indexer.wk.weight";
+    pub(crate) const GLM_DSA_INDEX_WQ_B: &str = "self_attn.indexer.wq_b.weight";
+    pub(crate) const GLM_EMBED_TOKENS: &str = "model.language_model.embed_tokens.weight";
+    pub(crate) const GLM_LANGUAGE_NORM: &str = "model.language_model.norm.weight";
+    pub const GLM_LM_HEAD: &str = "lm_head.weight";
+}
+pub(crate) const GLM_HC_ATTN_FN: &str = "hc_attn_fn";
+pub(crate) const GLM_HC_ATTN_BASE: &str = "hc_attn_base";
+pub(crate) const GLM_HC_ATTN_SCALE: &str = "hc_attn_scale";
+pub(crate) const GLM_HC_FFN_FN: &str = "hc_ffn_fn";
+pub(crate) const GLM_HC_FFN_BASE: &str = "hc_ffn_base";
+pub(crate) const GLM_HC_FFN_SCALE: &str = "hc_ffn_scale";
+pub(crate) const GLM_DSA_INDEX_GATE: &str = "self_attn.indexer.index_kpool_compress_gate";
+#[cfg(any(feature = "cuda", test))]
+pub(crate) use glm_roles::*;
+
 fn unique_map<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
 ) -> std::result::Result<BTreeMap<String, T>, D::Error> {
@@ -1652,7 +1712,7 @@ impl MappedCheckpoint {
                     scope,
                 );
             }
-            for name in ["hc_attn_base", "hc_ffn_base"] {
+            for name in [GLM_HC_ATTN_BASE, GLM_HC_FFN_BASE] {
                 put(
                     expected,
                     format!("{prefix}.{name}"),
@@ -1661,7 +1721,7 @@ impl MappedCheckpoint {
                     scope,
                 );
             }
-            for name in ["hc_attn_scale", "hc_ffn_scale"] {
+            for name in [GLM_HC_ATTN_SCALE, GLM_HC_FFN_SCALE] {
                 put(
                     expected,
                     format!("{prefix}.{name}"),
@@ -1670,7 +1730,7 @@ impl MappedCheckpoint {
                     scope,
                 );
             }
-            for name in ["hc_attn_fn", "hc_ffn_fn"] {
+            for name in [GLM_HC_ATTN_FN, GLM_HC_FFN_FN] {
                 put(
                     expected,
                     format!("{prefix}.{name}"),
@@ -2041,7 +2101,7 @@ impl MappedCheckpoint {
                 );
             }
             if i < depth {
-                for name in ["hc_attn_base", "hc_ffn_base"] {
+                for name in [GLM_HC_ATTN_BASE, GLM_HC_FFN_BASE] {
                     put(
                         expected,
                         format!("{p}.{name}"),
@@ -2050,10 +2110,10 @@ impl MappedCheckpoint {
                         scope,
                     );
                 }
-                for name in ["hc_attn_scale", "hc_ffn_scale"] {
+                for name in [GLM_HC_ATTN_SCALE, GLM_HC_FFN_SCALE] {
                     put(expected, format!("{p}.{name}"), Dtype::F32, vec![3], scope);
                 }
-                for name in ["hc_attn_fn", "hc_ffn_fn"] {
+                for name in [GLM_HC_ATTN_FN, GLM_HC_FFN_FN] {
                     put(
                         expected,
                         format!("{p}.{name}"),
@@ -3966,14 +4026,13 @@ impl TensorEntry {
     pub(crate) fn native_byte_storage(&self) -> bool {
         matches!(self.dtype, Dtype::F8_E4M3 | Dtype::U8 | Dtype::F32)
             || (self.dtype == Dtype::BF16
-                && matches!(self.role.as_str(), "hc_attn_fn" | "hc_ffn_fn"))
+                && matches!(self.role.as_str(), GLM_HC_ATTN_FN | GLM_HC_FFN_FN))
     }
 
     pub(crate) fn is_linear_projection(&self) -> bool {
         self.is_non_expert_loaded()
             && self.shape.len() == 2
-            && (self.role.ends_with(".weight")
-                || self.role == "self_attn.indexer.index_kpool_compress_gate")
+            && (self.role.ends_with(".weight") || self.role == GLM_DSA_INDEX_GATE)
     }
 
     pub(crate) fn is_routed_expert(&self) -> bool {
@@ -4288,114 +4347,108 @@ mod component_tests {
         Ok(())
     }
 
-    fn binding_literals<'a>(source: &'a str, begin: &str, end: &str) -> Result<Vec<&'a str>> {
-        let body = source
-            .split_once(begin)
-            .with_context(|| format!("binding census scope missing: {begin}"))?
-            .1
-            .split_once(end)
-            .with_context(|| format!("binding census scope end missing: {end}"))?
-            .0;
-        Ok(body.split('"').skip(1).step_by(2).collect())
-    }
-
     fn glm_consumer_roles(
         mixer: crate::model_spec::Mixer,
         dense: bool,
     ) -> Result<BTreeSet<String>> {
-        let engine = include_str!("backend/cuda/engine_qwen.rs");
-        let linear = include_str!("backend/cuda/linear.rs");
-        let gdn = include_str!("backend/cuda/gdn.rs");
-        let mut roles = BTreeSet::new();
-        for role in binding_literals(engine, "layers.push(Layer {", "pre_ffn_norm: gemma")? {
-            if role.ends_with(".weight") {
-                roles.insert(role.to_owned());
+        let mut roles = BTreeSet::from([
+            GLM_INPUT_LAYERNORM.to_owned(),
+            GLM_POST_ATTENTION_LAYERNORM.to_owned(),
+            format!("{GLM_HC_ATTN}{GLM_HC_FN_SUFFIX}"),
+            format!("{GLM_HC_ATTN}{GLM_HC_BASE_SUFFIX}"),
+            format!("{GLM_HC_ATTN}{GLM_HC_SCALE_SUFFIX}"),
+            format!("{GLM_HC_FFN}{GLM_HC_FN_SUFFIX}"),
+            format!("{GLM_HC_FFN}{GLM_HC_BASE_SUFFIX}"),
+            format!("{GLM_HC_FFN}{GLM_HC_SCALE_SUFFIX}"),
+        ]);
+        match mixer {
+            crate::model_spec::Mixer::FullAttention => roles.extend([
+                GLM_DSA_Q_A_PROJ.to_owned(),
+                format!("self_attn.{GLM_DSA_Q_A_NORM}"),
+                GLM_DSA_Q_B_PROJ.to_owned(),
+                GLM_DSA_KV_A_PROJ.to_owned(),
+                format!("self_attn.{GLM_DSA_KV_A_NORM}"),
+                GLM_DSA_KV_B_PROJ.to_owned(),
+                GLM_ATTN_O_PROJ.to_owned(),
+                GLM_DSA_INDEX_APE.to_owned(),
+                GLM_DSA_INDEX_GATE.to_owned(),
+                format!("self_attn.{GLM_DSA_INDEX_K_BIAS}"),
+                format!("self_attn.{GLM_DSA_INDEX_K_NORM}"),
+                GLM_DSA_INDEX_WEIGHTS_PROJ.to_owned(),
+                GLM_DSA_INDEX_WK.to_owned(),
+                GLM_DSA_INDEX_WQ_B.to_owned(),
+            ]),
+            crate::model_spec::Mixer::Gdn => {
+                roles.extend([
+                    format!("self_attn.{GLM_ATTN_A_LOG}"),
+                    format!("self_attn.{GLM_ATTN_DT_BIAS}"),
+                    GLM_ATTN_B_PROJ.to_owned(),
+                    GLM_ATTN_F_A_PROJ.to_owned(),
+                    GLM_ATTN_F_B_PROJ.to_owned(),
+                    GLM_ATTN_G_A_PROJ.to_owned(),
+                    GLM_ATTN_G_B_PROJ.to_owned(),
+                    format!("self_attn.{}.weight", GLM_ATTN_K_CONV),
+                    GLM_ATTN_K_PROJ.to_owned(),
+                    GLM_ATTN_O_NORM.to_owned(),
+                    GLM_ATTN_O_PROJ.to_owned(),
+                    format!("self_attn.{}.weight", GLM_ATTN_Q_CONV),
+                    GLM_ATTN_Q_PROJ.to_owned(),
+                    GLM_ATTN_QV_PROJ.to_owned(),
+                    format!("self_attn.{}.weight", GLM_ATTN_V_CONV),
+                    GLM_ATTN_V_PROJ.to_owned(),
+                ]);
             }
         }
-        let hc = binding_literals(
-            engine,
-            "fn take_glm_hc_weights(",
-            "pub(super) struct GlmDsaOutputs",
-        )?;
-        for base in hc.iter().filter(|name| name.starts_with("hc_")) {
-            for suffix in hc.iter().filter_map(|name| name.strip_prefix("{base}")) {
-                roles.insert(format!("{base}{suffix}"));
-            }
-        }
-        let (begin, end) = if mixer == crate::model_spec::Mixer::FullAttention {
-            ("fn glm_dsa_mixer(", "pub(super) fn qwen_mixer(")
+        if dense {
+            roles.extend([
+                GLM_MLP_DOWN_PROJ.to_owned(),
+                GLM_MLP_GATE_PROJ.to_owned(),
+                GLM_MLP_GATE_UP_PROJ.to_owned(),
+                GLM_MLP_UP_PROJ.to_owned(),
+            ]);
         } else {
-            ("fn project_kda(", "pub(super) fn matrix(")
-        };
-        for role in binding_literals(engine, begin, end)? {
-            if role.starts_with("self_attn.") {
-                roles.insert(role.to_owned());
-            }
-        }
-        if mixer == crate::model_spec::Mixer::FullAttention {
-            let aux = binding_literals(engine, "let aux = |name: &str|", "} else if flint {")?;
-            for role in aux {
-                if let Some(role) = role.strip_prefix("{prefix}") {
-                    if role != "self_attn.{name}" {
-                        roles.insert(role.to_owned());
-                    }
-                } else if role.ends_with(".weight") || role.ends_with(".bias") {
-                    roles.insert(format!("self_attn.{role}"));
-                }
-            }
-        } else {
-            for role in binding_literals(
-                engine,
-                "pub(super) fn qwen_mixer(",
-                "pub(super) fn run_moe_if_bound(",
-            )? {
-                if role.starts_with("self_attn.") {
-                    roles.insert(role.to_owned());
-                }
-            }
-            for role in binding_literals(engine, "Mixer::Gdn => {", "layers.push(Layer {")? {
-                if role.starts_with("self_attn.") && role.ends_with(".weight") {
-                    roles.insert(role.to_owned());
-                }
-            }
-            for role in binding_literals(
-                gdn,
-                "impl GdnDecayWeights {",
-                "pub(crate) enum GdnConvWeights",
-            )? {
-                if let Some(role) = role.strip_prefix("{prefix}") {
-                    roles.insert(format!("self_attn.{role}"));
-                }
-            }
-            for role in binding_literals(
-                gdn,
-                "impl GdnConvWeights {",
-                "pub(crate) struct GdnBindings",
-            )? {
-                if role.ends_with("_conv1d") {
-                    roles.insert(format!("self_attn.{role}.weight"));
-                }
-            }
-        }
-        let ffn = if dense {
-            binding_literals(engine, "O::GateUp => {", "O::Head => {")?
-        } else {
-            binding_literals(linear, "pub fn bind(spec:", "let shared =")?
-        };
-        for role in ffn {
-            if role.starts_with("mlp.") {
-                roles.insert(role.to_owned());
-            }
-        }
-        if !dense {
-            for role in binding_literals(engine, "impl NativeFfn {", "enum BoundMixer")? {
-                if let Some(role) = role.strip_prefix("model.language_model.layers.{layer}.") {
-                    roles.insert(role.to_owned());
-                }
-            }
+            roles.extend([
+                GLM_MLP_GATE.to_owned(),
+                GLM_MLP_SCORE_BIAS.to_owned(),
+                GLM_MLP_SHARED_DOWN.to_owned(),
+                GLM_MLP_SHARED_GATE.to_owned(),
+                GLM_MLP_SHARED_UP.to_owned(),
+            ]);
         }
         ensure!(!roles.is_empty(), "empty GLM consumer role census");
         Ok(roles)
+    }
+
+    fn validate_glm_roles(
+        mixer: crate::model_spec::Mixer,
+        dense: bool,
+        roles: &BTreeSet<String>,
+    ) -> Result<()> {
+        let expected = match (mixer, dense) {
+            (crate::model_spec::Mixer::FullAttention, false) => 27,
+            (crate::model_spec::Mixer::FullAttention, true) => 26,
+            (crate::model_spec::Mixer::Gdn, false) => 29,
+            (crate::model_spec::Mixer::Gdn, true) => 28,
+        };
+        ensure!(
+            roles.len() == expected,
+            "GLM role count mixer={mixer:?} dense={dense}: {} != {expected}; roles={roles:?}",
+            roles.len()
+        );
+        for role in [GLM_INPUT_LAYERNORM, GLM_POST_ATTENTION_LAYERNORM] {
+            ensure!(roles.contains(role), "GLM norm role missing: {role}");
+        }
+        for role in [
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+            "post_per_layer_input_norm.weight",
+        ] {
+            ensure!(
+                !roles.contains(role),
+                "Gemma-only norm in GLM census: {role}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -4404,21 +4457,18 @@ mod component_tests {
         for mixer in [Mixer::FullAttention, Mixer::Gdn] {
             for dense in [false, true] {
                 let roles = glm_consumer_roles(mixer, dense)?;
-                for role in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
-                    ensure!(roles.contains(role), "GLM norm role missing: {role}");
-                }
-                for role in [
-                    "pre_feedforward_layernorm.weight",
-                    "post_feedforward_layernorm.weight",
-                    "post_per_layer_input_norm.weight",
-                ] {
-                    ensure!(
-                        !roles.contains(role),
-                        "Gemma-only norm in GLM census: {role}"
-                    );
-                }
+                println!("GLM_ROLE_CENSUS mixer={mixer:?} dense={dense} roles={roles:?}");
+                validate_glm_roles(mixer, dense, &roles)?;
             }
         }
+        let mut mutant = glm_consumer_roles(Mixer::FullAttention, true)?;
+        mutant.remove(GLM_INPUT_LAYERNORM);
+        mutant.insert("input_layernorm.weighX".to_owned());
+        ensure!(
+            validate_glm_roles(Mixer::FullAttention, true, &mutant).is_err(),
+            "changed GLM suffix was accepted"
+        );
+        println!("GLM_ROLE_MUTANT changed_suffix=rejected");
         Ok(())
     }
 
@@ -4440,18 +4490,26 @@ mod component_tests {
         let mut requested = BTreeSet::new();
         let mut missing = Vec::new();
         let mut resolve = |name: String| {
-            if requested.insert(name.clone()) && !index.weight_map.contains_key(&name) {
+            let fused = (name.ends_with(GLM_MLP_GATE_UP_PROJ)
+                && index
+                    .weight_map
+                    .contains_key(&name.replace(GLM_MLP_GATE_UP_PROJ, GLM_MLP_GATE_PROJ))
+                && index
+                    .weight_map
+                    .contains_key(&name.replace(GLM_MLP_GATE_UP_PROJ, GLM_MLP_UP_PROJ)))
+                || (name.ends_with(GLM_ATTN_QV_PROJ)
+                    && index
+                        .weight_map
+                        .contains_key(&name.replace(GLM_ATTN_QV_PROJ, GLM_ATTN_Q_PROJ))
+                    && index
+                        .weight_map
+                        .contains_key(&name.replace(GLM_ATTN_QV_PROJ, GLM_ATTN_V_PROJ)));
+            if requested.insert(name.clone()) && !index.weight_map.contains_key(&name) && !fused {
                 missing.push(name);
             }
         };
-        for role in binding_literals(
-            include_str!("backend/cuda/weights.rs"),
-            "pub fn take_globals(",
-            "pub fn load(",
-        )? {
-            if role.starts_with("model.language_model.") || role == "lm_head.weight" {
-                resolve(role.to_owned());
-            }
+        for role in [GLM_EMBED_TOKENS, GLM_LANGUAGE_NORM, GLM_LM_HEAD] {
+            resolve(role.to_owned());
         }
         for (layer, plan) in spec.layers.iter().enumerate() {
             let prefix = format!("model.language_model.layers.{layer}.");

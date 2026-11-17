@@ -394,8 +394,8 @@ impl GdnDecayWeights {
         use crate::backend::gpu::DevicePtr;
         use safetensors::Dtype;
         spec.validate()?;
-        let name_a = format!("{prefix}A_log");
-        let name_dt = format!("{prefix}dt_bias");
+        let name_a = format!("{prefix}{}", crate::checkpoint::GLM_ATTN_A_LOG);
+        let name_dt = format!("{prefix}{}", crate::checkpoint::GLM_ATTN_DT_BIAS);
         match spec.gate_mode {
             GdnGateMode::PerHead => Ok(Self::Bf16 {
                 a_log: super::contracts::view(catalog.bf16(&name_a)?, stream, 0, [spec.hv], [1])?,
@@ -464,9 +464,9 @@ impl GdnConvWeights {
         match spec.gate_mode {
             GdnGateMode::PerHead => Ok(Self::Fused(bind("conv1d", spec.conv_dim()?)?)),
             GdnGateMode::PerChannel { .. } => Ok(Self::Separate([
-                bind("q_conv1d", spec.hk * DK)?,
-                bind("k_conv1d", spec.hk * DK)?,
-                bind("v_conv1d", spec.hv * DV)?,
+                bind(crate::checkpoint::GLM_ATTN_Q_CONV, spec.hk * DK)?,
+                bind(crate::checkpoint::GLM_ATTN_K_CONV, spec.hk * DK)?,
+                bind(crate::checkpoint::GLM_ATTN_V_CONV, spec.hv * DV)?,
             ])),
         }
     }
