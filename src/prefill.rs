@@ -375,7 +375,11 @@ mod tests {
         assert!((rate - 31_507_692_307.692).abs() < 1e-3);
         assert_eq!(
             pcie_payload_bytes_per_second("8.0 GT/s", 16)?,
-            12_800_000_000.0
+            8.0e9 * 16.0 / 8.0 * (128.0 / 130.0)
+        );
+        assert_eq!(
+            pcie_payload_bytes_per_second("5.0 GT/s", 16)?,
+            8_000_000_000.0
         );
         let layer = 3_644_877_795_328.0 / 165.2e12;
         assert_eq!(streaming_slot_count(770_703_360, rate, layer)?, 3);
