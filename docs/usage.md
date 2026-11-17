@@ -17,7 +17,7 @@ flyingfish --version
 flyingfish --model <model-dir> --runtime-dir <runtime-dir> calibrate
 ```
 
-`calibrate` measures kernels and transfer rates for a machine and model and writes calibration into the runtime directory. MoE models require it. DeepSeek generation and serving additionally require the [Engram hash record](#deepseek-v41-flash-runtime-setup); `calibrate` does not create it. `--runtime-dir` must be outside any model directory. The speech, embedding, media and image-to-3D commands below also require a runtime directory.
+`calibrate` measures kernels and transfer rates for a machine and model and writes calibration into the runtime directory. MoE models other than DeepSeek-V4.1-Flash require it; DeepSeek uses fixed execution plans. `--runtime-dir` must be outside any model directory. The speech, embedding, media and image-to-3D commands below also require a runtime directory.
 
 | Option | Default / accepted values | Use |
 |---|---|---|
@@ -99,34 +99,7 @@ DSpark `--dump` requires `--spec-graph false`; DSpark does not support `--trace-
 
 ### DeepSeek-V4.1-Flash runtime setup
 
-Generation and serving read `<runtime-dir>/engram-hash-v1.json`. This record supplies the model's compressed-token map, per-layer n-gram hash multipliers and bucket primes, plus model-definition sample hashes. It is tied to the exact checkpoint's `config.json` and `tokenizer.json`. A fresh runtime directory and `calibrate` alone are insufficient: the CLI has no producer for this record.
-
-Provision a record exported from the matching model definition before generating or serving:
-
-1. Use that checkpoint's `inference/config.json` to construct the model definition's `ModelArgs` and `EngramLayout.from_args`. Load its tokenizer and construct `NgramHashState` on the CPU; full-model inference and weight conversion are not needed.
-2. Export `layer_ids` from the layout and `token_map`, `multipliers`, `primes` and `pad_id` from that hash state. Record the tokenizer vocabulary size, compressed vocabulary size, and SHA-256 of the raw `config.json` and `tokenizer.json` bytes. Include sample token IDs, masks and the model definition's resulting per-layer hash rows, using a fresh state starting at position 0 for each sample.
-3. Serialize the schema below to a file outside the model directory, then copy the validated, checkpoint-matching record into the runtime directory. An existing record can be reused only for the matching config and tokenizer.
-
-```sh
-mkdir -p <runtime-dir>
-cp <validated-engram-hash-v1.json> <runtime-dir>/engram-hash-v1.json
-flyingfish --model <DeepSeek-V4.1-Flash-dir> --runtime-dir <runtime-dir> generate --prompt "Hello" --max-new-tokens 64
-```
-
-The JSON fields are defined by [`EngramHashSetup` and `EngramHashSample`](../src/engram.rs#L21). Let `L` be the number of Engram layers, `N` the maximum n-gram size, `H` the heads per size, and `T` the sample's token count:
-
-| Field | Stored JSON value |
-|---|---|
-| `schema` | Integer `1` |
-| `layer_ids` | `L` integer layer IDs in model order |
-| `config_sha256`, `tokenizer_sha256` | 64-character lowercase SHA-256 strings for the raw checkpoint files |
-| `tokenizer_vocab`, `compressed_vocab`, `pad_id` | Integer vocabulary extents and compressed padding ID |
-| `token_map` | `tokenizer_vocab` compressed integer IDs |
-| `multipliers` | Signed integer array `[L, N]` |
-| `primes` | Unsigned integer array `[L, N-1, H]` |
-| `samples` | Array of objects with `input_ids` (integer IDs), `start_position` (integer), `text_mask` (boolean array or `null`) and `hashes` (unsigned integer array `[L, T*(N-1)*H]`) |
-
-At load, [`DeepseekEngram::new`](../src/backend/cuda/engine_deepseek.rs#L110) reads the file, calls `setup.validate_model(model)?` and `setup.validate_samples(model)?`, and checks the layer IDs, per-layer table rows, n-gram size, head count and head dimension against the checkpoint. [`validate`](../src/engram.rs#L71) checks schema/fingerprints, array extents, token-map bounds, distinct prime moduli and multiplier overflow bounds; [`validate_samples`](../src/engram.rs#L219) recomputes each sample's hash rows. A missing or mismatched record errors at setup.
+DeepSeek derives its Engram token map, hash multipliers and bucket primes at load from the `config.json` in the checkpoint's `inference` directory and the checkpoint's `tokenizer.json`. The inferred geometry must match `config.json`. Generation and serving require no external hash record or Python setup step; the runtime directory can start empty.
 
 ### Serving and multimodal input
 

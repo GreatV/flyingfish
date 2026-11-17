@@ -17,7 +17,7 @@ pub const ENGRAM_NATIVE_ROW_BYTES: usize = ENGRAM_HEAD_DIM + ENGRAM_SCALES;
 const HASH_SCHEMA: u32 = 1;
 const DEAD_TOKEN: i64 = -1;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngramHashSetup {
     pub schema: u32,
     pub layer_ids: Vec<u32>,
@@ -32,7 +32,7 @@ pub struct EngramHashSetup {
     pub samples: Vec<EngramHashSample>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngramHashSample {
     pub input_ids: Vec<u32>,
     pub start_position: u32,
@@ -41,7 +41,128 @@ pub struct EngramHashSample {
 }
 
 impl EngramHashSetup {
-    pub fn read(path: &Path, config_sha256: &str, tokenizer_sha256: &str) -> Result<Self> {
+    pub fn derive(model: &Path) -> Result<Self> {
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(model.join("inference/config.json"))
+                .context("read Engram inference/config.json")?,
+        )
+        .context("decode Engram inference/config.json")?;
+        let root: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(model.join("config.json")).context("read Engram config.json")?,
+        )?;
+        let text = root
+            .get("text_config")
+            .context("Engram config.json text_config missing")?;
+        for (inference, published) in [
+            ("vocab_size", "vocab_size"),
+            ("engram_layer_ids", "engram_layer_ids"),
+            ("engram_num_embeddings", "engram_num_embeddings"),
+            ("engram_vocab_size", "engram_vocab_size"),
+            (
+                "engram_compressed_vocab_size",
+                "engram_compressed_vocab_size",
+            ),
+            ("engram_max_ngram_size", "engram_max_ngram_size"),
+            ("engram_n_heads", "engram_n_heads"),
+            ("engram_head_dim", "engram_head_dim"),
+            ("engram_pad_id", "engram_pad_token_id"),
+        ] {
+            ensure!(
+                config
+                    .get(inference)
+                    .is_some_and(|v| !v.is_null() && text.get(published) == Some(v)),
+                "Engram inference/config.json {inference} differs from config.json text_config.{published}"
+            );
+        }
+        let number = |name: &str| -> Result<u32> {
+            u32::try_from(
+                config[name]
+                    .as_u64()
+                    .with_context(|| format!("Engram {name} missing or not unsigned"))?,
+            )
+            .with_context(|| format!("Engram {name} exceeds u32"))
+        };
+        let layer_ids: Vec<u32> = serde_json::from_value(config["engram_layer_ids"].clone())?;
+        let expected_rows: Vec<u32> =
+            serde_json::from_value(config["engram_num_embeddings"].clone())?;
+        let ngram = number("engram_max_ngram_size")? as usize;
+        let heads = number("engram_n_heads")? as usize;
+        let base = u64::from(number("engram_vocab_size")?);
+        ensure!(
+            ngram >= 2 && heads > 0 && base > 1,
+            "invalid Engram hash dimensions"
+        );
+        ensure!(
+            number("engram_head_dim")? as usize == ENGRAM_HEAD_DIM,
+            "Engram head dimension differs"
+        );
+        let (token_map, compressed_vocab) = compressed_token_map(model)?;
+        ensure!(
+            token_map.len() == number("vocab_size")? as usize,
+            "Engram tokenizer vocabulary differs"
+        );
+        ensure!(
+            compressed_vocab == number("engram_compressed_vocab_size")?,
+            "Engram compressed vocabulary differs"
+        );
+        let pad_id = *token_map
+            .get(number("engram_pad_id")? as usize)
+            .context("Engram padding token outside vocabulary")?;
+        let mut seen = BTreeSet::new();
+        let mut primes = Vec::with_capacity(layer_ids.len());
+        let mut multipliers = Vec::with_capacity(layer_ids.len());
+        let bound = ((i64::MAX as u64 / u64::from(compressed_vocab)) / 2).max(1);
+        for &layer in &layer_ids {
+            let mut sizes = Vec::with_capacity(ngram - 1);
+            for _ in 1..ngram {
+                let mut prime = base - 1;
+                let mut row = Vec::with_capacity(heads);
+                for _ in 0..heads {
+                    loop {
+                        prime = prime
+                            .checked_add(1)
+                            .context("Engram prime search overflow")?;
+                        if !seen.contains(&prime) && is_prime(prime) {
+                            break;
+                        }
+                    }
+                    seen.insert(prime);
+                    row.push(prime);
+                }
+                sizes.push(row);
+            }
+            primes.push(sizes);
+            let mut stream = EngramMultiplierStream::new(10007 * u64::from(layer));
+            multipliers.push(
+                (0..ngram)
+                    .map(|_| (2 * stream.bounded(bound) + 1) as i64)
+                    .collect(),
+            );
+        }
+        let (config_sha256, tokenizer_sha256) = Self::model_fingerprints(model)?;
+        let setup = Self {
+            schema: HASH_SCHEMA,
+            layer_ids,
+            config_sha256,
+            tokenizer_sha256,
+            tokenizer_vocab: u32::try_from(token_map.len())?,
+            compressed_vocab,
+            pad_id,
+            token_map,
+            multipliers,
+            primes,
+            samples: Vec::new(),
+        };
+        setup.validate(&setup.config_sha256, &setup.tokenizer_sha256)?;
+        ensure!(
+            setup.layer_rows()? == expected_rows,
+            "Engram derived table row counts differ"
+        );
+        Ok(setup)
+    }
+
+    #[cfg(test)]
+    fn read(path: &Path, config_sha256: &str, tokenizer_sha256: &str) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("read engram hash setup {}", path.display()))?;
         let setup: Self = serde_json::from_slice(&bytes)
@@ -237,6 +358,119 @@ impl EngramHashSetup {
             hasher.reset();
         }
         Ok(())
+    }
+}
+
+fn compressed_token_map(model: &Path) -> Result<(Vec<u32>, u32)> {
+    use tokenizers::{NormalizedString, Normalizer, Tokenizer};
+    let tokenizer = Tokenizer::from_file(model.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("Engram tokenizer load: {e}"))?;
+    let normalizer: tokenizers::normalizers::NormalizerWrapper =
+        serde_json::from_value(serde_json::json!({
+            "type": "Sequence", "normalizers": [
+                {"type":"NFKC"}, {"type":"NFD"}, {"type":"StripAccents"}, {"type":"Lowercase"},
+                {"type":"Replace", "pattern":{"Regex":"[ \\t\\r\\n]+"}, "content":" "},
+                {"type":"Replace", "pattern":{"Regex":"^ $"}, "content":"\u{e000}"},
+                {"type":"Strip", "strip_left":true, "strip_right":true},
+                {"type":"Replace", "pattern":{"String":"\u{e000}"}, "content":" "}
+            ]
+        }))?;
+    let mut keys = HashMap::new();
+    let mut map = Vec::with_capacity(tokenizer.get_vocab_size(true));
+    for id in 0..u32::try_from(tokenizer.get_vocab_size(true))? {
+        let text = tokenizer
+            .decode(&[id], false)
+            .map_err(|e| anyhow::anyhow!("Engram token {id} decode: {e}"))?;
+        let key = if text.contains('\u{fffd}') {
+            tokenizer
+                .id_to_token(id)
+                .with_context(|| format!("Engram token {id} has no raw form"))?
+        } else {
+            let mut normalized = NormalizedString::from(text.as_str());
+            normalizer
+                .normalize(&mut normalized)
+                .map_err(|e| anyhow::anyhow!("Engram token {id} normalization: {e}"))?;
+            if normalized.get().is_empty() {
+                text
+            } else {
+                normalized.get().to_owned()
+            }
+        };
+        let next = u32::try_from(keys.len())?;
+        map.push(*keys.entry(key).or_insert(next));
+    }
+    Ok((map, u32::try_from(keys.len())?))
+}
+
+fn engram_seed_words(seed: u64) -> ([u32; 4], [u64; 4]) {
+    let mut factor = 0x43b0_d7e5u32;
+    let mut mix = |value: u32| {
+        let input = value ^ factor;
+        factor = factor.wrapping_mul(0x931e_8875);
+        let product = input.wrapping_mul(factor);
+        product ^ (product >> 16)
+    };
+    let mut pool = [mix(seed as u32), mix((seed >> 32) as u32), mix(0), mix(0)];
+    for source in 0..4 {
+        for destination in 0..4 {
+            if source != destination {
+                let product = pool[destination]
+                    .wrapping_mul(0xca01_f9dd)
+                    .wrapping_sub(mix(pool[source]).wrapping_mul(0x4973_f715));
+                pool[destination] = product ^ (product >> 16);
+            }
+        }
+    }
+    let mut output_factor = 0x8b51_f9ddu32;
+    let mut words = [0u64; 4];
+    for index in 0..8 {
+        let input = pool[index % 4] ^ output_factor;
+        output_factor = output_factor.wrapping_mul(0x58f3_8ded);
+        let product = input.wrapping_mul(output_factor);
+        words[index / 2] |= u64::from(product ^ (product >> 16)) << (32 * (index % 2));
+    }
+    (pool, words)
+}
+
+struct EngramMultiplierStream {
+    state: u128,
+    increment: u128,
+}
+
+impl EngramMultiplierStream {
+    fn new(seed: u64) -> Self {
+        let (_, words) = engram_seed_words(seed);
+        let initial = (u128::from(words[0]) << 64) | u128::from(words[1]);
+        let stream = (u128::from(words[2]) << 64) | u128::from(words[3]);
+        let increment = (stream << 1) | 1;
+        let mut result = Self {
+            state: increment.wrapping_add(initial),
+            increment,
+        };
+        result.advance();
+        result
+    }
+
+    fn advance(&mut self) {
+        self.state = self
+            .state
+            .wrapping_mul(0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645)
+            .wrapping_add(self.increment);
+    }
+
+    fn next_word(&mut self) -> u64 {
+        self.advance();
+        ((self.state >> 64) as u64 ^ self.state as u64).rotate_right((self.state >> 122) as u32)
+    }
+
+    fn bounded(&mut self, bound: u64) -> u64 {
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let product = u128::from(self.next_word()) * u128::from(bound);
+            if product as u64 >= threshold {
+                return (product >> 64) as u64;
+            }
+        }
     }
 }
 
@@ -1384,8 +1618,67 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads the generated engram-hash-v1 record; set F3_HASH"]
+    #[ignore = "publisher setup and RNG fixtures; set F3_HASH, F3_MODEL and F3_RNG"]
     fn hash_record_reproduces_the_publisher_samples() -> Result<()> {
+        #[derive(Deserialize)]
+        struct MultiplierVector {
+            seed: u64,
+            bound: u64,
+            pool: [u32; 4],
+            seed_words: [u64; 4],
+            state: String,
+            increment: String,
+            raw: Vec<u64>,
+            bounded: Vec<u64>,
+            consumed: usize,
+            rejected: usize,
+        }
+        let rng = PathBuf::from(std::env::var("F3_RNG").context("F3_RNG is not set")?);
+        let rng: serde_json::Value = serde_json::from_slice(&std::fs::read(rng)?)?;
+        let vectors: Vec<MultiplierVector> = serde_json::from_value(rng["cases"].clone())?;
+        ensure!(!vectors.is_empty(), "no multiplier reference vectors");
+        let mut rejections = 0;
+        for vector in vectors {
+            ensure!(vector.bound > 0, "zero reference bound");
+            ensure!(
+                engram_seed_words(vector.seed) == (vector.pool, vector.seed_words),
+                "Engram seed expansion differs for {}",
+                vector.seed
+            );
+            let mut raw = EngramMultiplierStream::new(vector.seed);
+            ensure!(
+                raw.state == vector.state.parse::<u128>()?
+                    && raw.increment == vector.increment.parse::<u128>()?,
+                "Engram initial multiplier state differs"
+            );
+            for word in &vector.raw {
+                ensure!(
+                    raw.next_word() == *word,
+                    "Engram raw multiplier stream differs"
+                );
+            }
+            let mut bounded = EngramMultiplierStream::new(vector.seed);
+            for value in &vector.bounded {
+                ensure!(
+                    bounded.bounded(vector.bound) == *value,
+                    "Engram bounded multiplier stream differs"
+                );
+            }
+            let mut consumed = EngramMultiplierStream::new(vector.seed);
+            for _ in 0..vector.consumed {
+                consumed.next_word();
+            }
+            ensure!(
+                bounded.state == consumed.state
+                    && vector.consumed == vector.bounded.len() + vector.rejected,
+                "Engram rejected-draw consumption differs"
+            );
+            rejections += vector.rejected;
+        }
+        ensure!(
+            rejections > 0,
+            "multiplier reference did not exercise rejection"
+        );
         let path = PathBuf::from(std::env::var("F3_HASH").context("F3_HASH is not set")?);
         let model = PathBuf::from(std::env::var("F3_MODEL").context("F3_MODEL is not set")?);
         let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
@@ -1398,6 +1691,39 @@ mod tests {
         )?;
         setup.validate_model(&model)?;
         setup.validate_samples(&model)?;
+        let mut derived = EngramHashSetup::derive(&model)?;
+        let mut history = NgramHistory::new_for_model(derived.clone(), 40, &model)?;
+        for sample in &setup.samples {
+            history.reset();
+            let hashes = history.prepare(
+                &sample.input_ids,
+                sample.start_position,
+                sample.text_mask.as_deref(),
+            )?;
+            derived.samples.push(EngramHashSample {
+                input_ids: sample.input_ids.clone(),
+                start_position: sample.start_position,
+                text_mask: sample.text_mask.clone(),
+                hashes,
+            });
+        }
+        let observed = serde_json::to_value(&derived)?;
+        let expected = serde_json::to_value(&setup)?;
+        for (field, value) in expected.as_object().context("setup is not an object")? {
+            ensure!(
+                observed.get(field) == Some(value),
+                "derived Engram field {field} differs"
+            );
+        }
+        derived.validate_samples(&model)?;
+        let mut wrong_prime = derived.clone();
+        wrong_prime.primes[0][0][0] += 1;
+        ensure!(
+            wrong_prime != derived
+                && wrong_prime.validate_model(&model).is_err()
+                && wrong_prime.validate_samples(&model).is_err(),
+            "prime+1 control escaped Engram validation"
+        );
         let rows = setup.layer_rows()?;
         for sample in &setup.samples {
             for (layer, hashes) in sample.hashes.iter().enumerate() {
@@ -1413,6 +1739,18 @@ mod tests {
         ensure!(
             mutant.validate_samples(&model).is_err(),
             "a mutated sample escaped validate_samples"
+        );
+        println!(
+            "PASS ENGRAM_DERIVATION exact_fields=true token_map={} multipliers={} primes={} samples={} rejected_draws={rejections} prime_mutant_rejected=true",
+            derived.token_map.len(),
+            derived.multipliers.iter().map(Vec::len).sum::<usize>(),
+            derived
+                .primes
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(Vec::len)
+                .sum::<usize>(),
+            derived.samples.len()
         );
         Ok(())
     }
