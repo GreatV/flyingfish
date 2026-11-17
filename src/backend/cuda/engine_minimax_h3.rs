@@ -248,6 +248,42 @@ impl EntryReader {
         self.read_range(name, entry, 0, entry.bytes)
     }
 
+    /// One aligned direct read into a caller-owned pinned destination, planned from the
+    /// tensor's file span. The destination slice must start aligned and hold the padded span.
+    fn read_pinned(
+        readers: &BTreeMap<String, SpanReader>,
+        name: &str,
+        entry: &TensorEntry,
+        destination: &mut [u8],
+    ) -> Result<()> {
+        let reader = readers
+            .get(&entry.shard)
+            .with_context(|| format!("{name}: shard {} not open", entry.shard))?;
+        let start = entry
+            .data_start
+            .checked_add(entry.data_offsets[0])
+            .context("tensor offset overflow")?;
+        let align = reader.alignment as usize;
+        let head = start as usize % align;
+        let begin = start - head as u64;
+        let width = entry
+            .bytes
+            .checked_add(head)
+            .and_then(|v| v.checked_add(align - 1))
+            .context("pinned span overflow")?
+            & !(align - 1);
+        ensure!(
+            destination.len() >= width,
+            "{name}: pinned slot holds {} of {width}",
+            destination.len()
+        );
+        // SAFETY: the destination is a disjoint aligned sub-range of the pinned arena
+        // and `width` is within its bounds, checked above.
+        let span = unsafe { std::slice::from_raw_parts_mut(destination.as_mut_ptr(), width) };
+        reader.read_direct(begin, width as u64, span)?;
+        Ok(())
+    }
+
     /// Direct-IO alignment of this checkpoint's shards in BF16 elements; every shard of one
     /// checkpoint directory shares the filesystem, so the first reader's alignment stands.
     fn align_elements(&mut self) -> Result<usize> {

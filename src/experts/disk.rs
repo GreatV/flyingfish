@@ -544,7 +544,7 @@ impl SpanReader {
 
     /// Direct read of `[begin, begin+width)` into `dest`. `dest` holds the next multiple of the
     /// alignment. A short read is accepted when `got == width`.
-    fn read_direct(&self, begin: u64, width: u64, dest: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_direct(&self, begin: u64, width: u64, dest: &mut [u8]) -> Result<()> {
         ensure!(self.direct, "buffered reader issued a direct window");
         let align = self.alignment;
         ensure!(
