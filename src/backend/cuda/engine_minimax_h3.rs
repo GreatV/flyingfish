@@ -2620,6 +2620,89 @@ fn cast_rows(
     Ok(())
 }
 
+/// `y [rows, n] = x [rows, k] * w^T + b` in F32 on rows starting at element `x_offset` of `x`.
+fn projection(
+    s: &Arc<CudaStream>,
+    blas: &Blas,
+    bias: &CudaFunction,
+    [w, b]: &[CudaSlice<f32>; 2],
+    (x, x_offset): (&CudaSlice<f32>, usize),
+    (y, rows): (&CudaSlice<f32>, usize),
+) -> Result<()> {
+    let (n, k) = (b.len(), w.len() / b.len());
+    blas.linear_f32(
+        view(
+            w,
+            s,
+            0,
+            [u32::try_from(n)?, u32::try_from(k)?],
+            [k as u64, 1],
+        )?,
+        view(
+            x,
+            s,
+            x_offset,
+            [u32::try_from(rows)?, u32::try_from(k)?],
+            [k as u64, 1],
+        )?,
+        &mut TensorMut(view(
+            y,
+            s,
+            0,
+            [u32::try_from(rows)?, u32::try_from(n)?],
+            [n as u64, 1],
+        )?),
+    )?;
+    let out = pointer(y, s);
+    unsafe {
+        s.launch_builder(bias)
+            .arg(&out)
+            .arg(&pointer(b, s))
+            .arg(&out)
+            .arg(&u32::try_from(rows)?)
+            .arg(&u32::try_from(n)?)
+            .launch(flat(rows * n))?;
+    }
+    Ok(())
+}
+
+/// Rounds `count` F32 values to BF16 sequence rows starting at element `target` of the hidden state.
+fn round_into(
+    s: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    hidden: &CudaSlice<bf16>,
+    source: u64,
+    target: usize,
+    count: usize,
+) -> Result<()> {
+    cast_rows(
+        s,
+        kernel,
+        source,
+        pointer(hidden, s) + 2 * target as u64,
+        count,
+    )
+}
+
+/// Widens `count` BF16 values starting at element `source` of `normed` into the F32 scratch.
+fn upcast_from(
+    s: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    normed: &CudaSlice<bf16>,
+    scratch: &CudaSlice<f32>,
+    source: usize,
+    count: usize,
+) -> Result<()> {
+    unsafe {
+        s.launch_builder(kernel)
+            .arg(&(pointer(normed, s) + 2 * source as u64))
+            .arg(&pointer(scratch, s))
+            .arg(&u32::try_from(count)?)
+            .launch(flat(count))?;
+    }
+    Ok(())
+}
+
 /// Per-layer device slot bytes, stored source bytes, the largest slot and the staging/transient bytes of a
 /// manifest's dense linears.
 struct DenseSizing {
@@ -3675,82 +3758,6 @@ impl Dit {
         })
     }
 
-    /// `y [rows, n] = x [rows, k] * w^T + b` in F32 on rows starting at element `x_offset` of `x`.
-    fn projection(
-        &self,
-        c: &BlockContext<'_>,
-        [w, b]: &[CudaSlice<f32>; 2],
-        (x, x_offset): (&CudaSlice<f32>, usize),
-        y: &CudaSlice<f32>,
-        rows: usize,
-    ) -> Result<()> {
-        let s = c.s;
-        let (n, k) = (b.len(), w.len() / b.len());
-        c.blas.linear_f32(
-            view(
-                w,
-                s,
-                0,
-                [u32::try_from(n)?, u32::try_from(k)?],
-                [k as u64, 1],
-            )?,
-            view(
-                x,
-                s,
-                x_offset,
-                [u32::try_from(rows)?, u32::try_from(k)?],
-                [k as u64, 1],
-            )?,
-            &mut TensorMut(view(
-                y,
-                s,
-                0,
-                [u32::try_from(rows)?, u32::try_from(n)?],
-                [n as u64, 1],
-            )?),
-        )?;
-        let out = pointer(y, s);
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&out)
-                .arg(&pointer(b, s))
-                .arg(&out)
-                .arg(&u32::try_from(rows)?)
-                .arg(&u32::try_from(n)?)
-                .launch(flat(rows * n))?;
-        }
-        Ok(())
-    }
-
-    /// Rounds `count` F32 values to BF16 sequence rows starting at element `target` of the hidden state.
-    fn round_into(
-        &self,
-        s: &Arc<CudaStream>,
-        source: u64,
-        target: usize,
-        count: usize,
-    ) -> Result<()> {
-        cast_rows(
-            s,
-            &self.round,
-            source,
-            pointer(&self.x, s) + 2 * target as u64,
-            count,
-        )
-    }
-
-    /// Widens `count` BF16 values starting at element `source` of `normed` into the F32 scratch.
-    fn upcast_from(&self, s: &Arc<CudaStream>, source: usize, count: usize) -> Result<()> {
-        unsafe {
-            s.launch_builder(&self.upcast)
-                .arg(&(pointer(&self.work.normed, s) + 2 * source as u64))
-                .arg(&pointer(&self.scratch, s))
-                .arg(&u32::try_from(count)?)
-                .launch(flat(count))?;
-        }
-        Ok(())
-    }
-
     /// `x = r * x + (1 - r) * (x + (1 - t) * v)` over `count` F32 latents at element `offset` of `x`, from grid
     /// points `k` and `k + 1`.
     fn euler(
@@ -3925,29 +3932,47 @@ impl Dit {
         if self.trace.as_ref().is_some_and(Vec::is_empty) && self.refiner_trace.is_none() {
             self.refiner_trace = Some(s.clone_dtoh(&self.x.slice(..r.text * h))?);
         }
-        self.projection(
-            c,
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
             &self.proj_in,
             (inputs.video, 0),
-            &self.scratch,
-            video_rows,
+            (&self.scratch, video_rows),
         )?;
         let scratch = pointer(&self.scratch, s);
-        self.round_into(s, scratch, r.text * h, r.condition * h)?;
-        self.round_into(
+        round_into(
             s,
+            &self.round,
+            &self.x,
+            scratch,
+            r.text * h,
+            r.condition * h,
+        )?;
+        round_into(
+            s,
+            &self.round,
+            &self.x,
             scratch + 4 * (r.condition * h) as u64,
             r.video_start * h,
             (video_rows - r.condition) * h,
         )?;
-        self.projection(
-            c,
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
             &self.audio_proj_in,
             (inputs.audio, 0),
-            &self.scratch,
-            r.audio,
+            (&self.scratch, r.audio),
         )?;
-        self.round_into(s, scratch, r.audio_start * h, r.audio * h)?;
+        round_into(
+            s,
+            &self.round,
+            &self.x,
+            scratch,
+            r.audio_start * h,
+            r.audio * h,
+        )?;
 
         let block_rows = 6 * h * pairs as usize;
         for (layer, block) in self.blocks.iter().enumerate() {
@@ -4018,21 +4043,37 @@ impl Dit {
             },
         )?;
         let generated = r.rows - r.video_start;
-        self.upcast_from(s, r.video_start * h, generated * h)?;
-        self.projection(
-            c,
+        upcast_from(
+            s,
+            &self.upcast,
+            &self.work.normed,
+            &self.scratch,
+            r.video_start * h,
+            generated * h,
+        )?;
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
             &self.proj_out,
             (&self.scratch, 0),
-            &self.video,
-            generated,
+            (&self.video, generated),
         )?;
-        self.upcast_from(s, r.audio_start * h, r.audio * h)?;
-        self.projection(
-            c,
+        upcast_from(
+            s,
+            &self.upcast,
+            &self.work.normed,
+            &self.scratch,
+            r.audio_start * h,
+            r.audio * h,
+        )?;
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
             &self.audio_proj_out,
             (&self.scratch, 0),
-            &self.audio,
-            r.audio,
+            (&self.audio, r.audio),
         )?;
         Ok(())
     }
@@ -4294,79 +4335,6 @@ impl ImageDit {
         })
     }
 
-    fn projection(
-        &self,
-        c: &BlockContext<'_>,
-        [w, b]: &[CudaSlice<f32>; 2],
-        x: &CudaSlice<f32>,
-        y: &CudaSlice<f32>,
-        rows: usize,
-    ) -> Result<()> {
-        let s = c.s;
-        let (n, k) = (b.len(), w.len() / b.len());
-        c.blas.linear_f32(
-            view(
-                w,
-                s,
-                0,
-                [u32::try_from(n)?, u32::try_from(k)?],
-                [k as u64, 1],
-            )?,
-            view(
-                x,
-                s,
-                0,
-                [u32::try_from(rows)?, u32::try_from(k)?],
-                [k as u64, 1],
-            )?,
-            &mut TensorMut(view(
-                y,
-                s,
-                0,
-                [u32::try_from(rows)?, u32::try_from(n)?],
-                [n as u64, 1],
-            )?),
-        )?;
-        let out = pointer(y, s);
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&out)
-                .arg(&pointer(b, s))
-                .arg(&out)
-                .arg(&u32::try_from(rows)?)
-                .arg(&u32::try_from(n)?)
-                .launch(flat(rows * n))?;
-        }
-        Ok(())
-    }
-
-    fn round_into(
-        &self,
-        s: &Arc<CudaStream>,
-        source: u64,
-        target: usize,
-        count: usize,
-    ) -> Result<()> {
-        cast_rows(
-            s,
-            &self.round,
-            source,
-            pointer(&self.x, s) + 2 * target as u64,
-            count,
-        )
-    }
-
-    fn upcast_from(&self, s: &Arc<CudaStream>, source: usize, count: usize) -> Result<()> {
-        unsafe {
-            s.launch_builder(&self.upcast)
-                .arg(&(pointer(&self.work.normed, s) + 2 * source as u64))
-                .arg(&pointer(&self.scratch, s))
-                .arg(&u32::try_from(count)?)
-                .launch(flat(count))?;
-        }
-        Ok(())
-    }
-
     /// `x = r * x + (1 - r) * (x + sigma * v)` on the generated image rows. Reference rows stay put.
     fn euler(
         &self,
@@ -4454,8 +4422,22 @@ impl ImageDit {
                 eps: spec.final_norm_eps,
             },
         )?;
-        self.projection(c, &self.proj_in, inputs.image, &self.scratch, image_rows)?;
-        self.round_into(s, pointer(&self.scratch, s), text_rows * h, image_rows * h)?;
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
+            &self.proj_in,
+            (inputs.image, 0),
+            (&self.scratch, image_rows),
+        )?;
+        round_into(
+            s,
+            &self.round,
+            &self.x,
+            pointer(&self.scratch, s),
+            text_rows * h,
+            image_rows * h,
+        )?;
         let block_rows = 6 * h * pairs as usize;
         for (layer, block) in self.blocks.iter().enumerate() {
             if let Some(dense) = self.dense.as_mut() {
@@ -4510,13 +4492,21 @@ impl ImageDit {
                 entries: timesteps,
             },
         )?;
-        self.upcast_from(s, text_rows * h, image_rows * h)?;
-        self.projection(
-            c,
-            &self.heads[head],
+        upcast_from(
+            s,
+            &self.upcast,
+            &self.work.normed,
             &self.scratch,
-            &self.velocity,
-            image_rows,
+            text_rows * h,
+            image_rows * h,
+        )?;
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
+            &self.heads[head],
+            (&self.scratch, 0),
+            (&self.velocity, image_rows),
         )?;
         Ok(())
     }
@@ -6507,6 +6497,70 @@ mod tests {
                 .all(|(got, &v)| got.to_bits() == bf16::from_f32(v).to_bits()),
             "cast differs from BF16 rounding"
         );
+        Ok(())
+    }
+
+    /// Rows 4, k 16, n 8. `x` has 8 rows. Element `(r, c)` is `((r * 16 + c) * 3 + 1) % 17`.
+    /// Weight `(i, j)` is `((i * 8 + j) * 5 + 1) % 13`. Bias `i` is `i + 1`.
+    #[test]
+    #[ignore = "GPU test"]
+    fn projection_offset_matches_a_copied_window() -> Result<()> {
+        let rows = 4usize;
+        let k = 16usize;
+        let n = 8usize;
+        let mut x = vec![0.0f32; 8 * k];
+        for r in 0..8 {
+            for c in 0..k {
+                x[r * k + c] = (((r * 16 + c) * 3 + 1) % 17) as f32;
+            }
+        }
+        let mut weight = vec![0.0f32; n * k];
+        for i in 0..n {
+            for j in 0..k {
+                weight[i * k + j] = (((i * 8 + j) * 5 + 1) % 13) as f32;
+            }
+        }
+        let bias_row: Vec<f32> = (0..n).map(|i| (i + 1) as f32).collect();
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        device.finish_upload()?;
+        let ops = Ops::new(&device.ctx)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &std::env::temp_dir(),
+            Rc::new(Closure::new(true, "projection offset".into())),
+        )?;
+        let bias = cubin::module(s.context(), "vision_ops")?.load_function("vision_bias_f32")?;
+        let x_d = s.clone_htod(&x)?;
+        let stored = [s.clone_htod(&weight)?, s.clone_htod(&bias_row)?];
+        let y0 = s.alloc_zeros::<f32>(rows * n)?;
+        let y64 = s.alloc_zeros::<f32>(rows * n)?;
+        projection(s, &blas, &bias, &stored, (&x_d, 0), (&y0, rows))?;
+        projection(s, &blas, &bias, &stored, (&x_d, 64), (&y64, rows))?;
+        s.synchronize()?;
+        let at_zero = s.clone_dtoh(&y0)?;
+        let at_sixty_four = s.clone_dtoh(&y64)?;
+        let offset_diff = at_zero
+            .iter()
+            .zip(&at_sixty_four)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("PROJECTION_OFFSET differ={offset_diff}");
+        ensure!(offset_diff > 0, "projection offset 0 matched offset 64");
+        let copied = x[64..64 + rows * k].to_vec();
+        let copied_d = s.clone_htod(&copied)?;
+        let y_copy = s.alloc_zeros::<f32>(rows * n)?;
+        projection(s, &blas, &bias, &stored, (&copied_d, 0), (&y_copy, rows))?;
+        s.synchronize()?;
+        let at_copy = s.clone_dtoh(&y_copy)?;
+        let copy_diff = at_copy
+            .iter()
+            .zip(&at_sixty_four)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("PROJECTION_OFFSET_COPY differ={copy_diff}");
+        ensure!(copy_diff == 0, "copied window differed in {copy_diff} bits");
         Ok(())
     }
 
