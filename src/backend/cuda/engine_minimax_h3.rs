@@ -355,6 +355,9 @@ impl EntryReader {
             .and_then(|v| v.checked_add(align - 1))
             .context("pinned span overflow")?
             & !(align - 1);
+        let width = width
+            .min(usize::try_from(reader.file_len() - begin)?)
+            .max(entry.bytes + head);
         ensure!(
             destination.len() >= width,
             "{name}: pinned slot holds {} of {width}",

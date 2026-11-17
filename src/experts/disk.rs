@@ -470,6 +470,10 @@ impl SpanReader {
         })
     }
 
+    pub(crate) fn file_len(&self) -> u64 {
+        self.len
+    }
+
     pub(crate) fn plan(&self, requests: &[(u64, u64)], chunk: u64) -> Result<Vec<ReadSpan>> {
         plan_spans(
             requests,
