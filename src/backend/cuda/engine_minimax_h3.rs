@@ -154,6 +154,7 @@ struct EntryReader {
     dir: PathBuf,
     readers: BTreeMap<String, SpanReader>,
     staging: Option<AlignedBytes>,
+    align: Option<usize>,
 }
 
 impl EntryReader {
@@ -162,6 +163,7 @@ impl EntryReader {
             dir: dir.to_owned(),
             readers: BTreeMap::new(),
             staging: None,
+            align: None,
         }
     }
 
@@ -244,6 +246,30 @@ impl EntryReader {
     /// The tensor's bytes, read with O_DIRECT into the reusable aligned staging buffer.
     fn read(&mut self, name: &str, entry: &TensorEntry) -> Result<&[u8]> {
         self.read_range(name, entry, 0, entry.bytes)
+    }
+
+    /// Direct-IO alignment of this checkpoint's shards in BF16 elements; every shard of one
+    /// checkpoint directory shares the filesystem, so the first reader's alignment stands.
+    fn align_elements(&mut self) -> Result<usize> {
+        if self.align.is_none() {
+            let mut names = self.readers.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            let shard = names
+                .first()
+                .cloned()
+                .map_or_else(|| "model.safetensors".to_owned(), std::convert::identity);
+            if !self.readers.contains_key(&shard) {
+                let reader = SpanReader::open(&self.dir.join(&shard), true)?;
+                self.readers.insert(shard.clone(), reader);
+            }
+            let alignment = self.readers[&shard].alignment;
+            ensure!(
+                alignment.is_multiple_of(2) && alignment <= usize::MAX as u64 / 2,
+                "direct alignment {alignment} is not a whole BF16 element multiple"
+            );
+            self.align = Some(alignment as usize / 2);
+        }
+        Ok(self.align.unwrap_or(0))
     }
 
     /// Bytes `start..start + bytes` of the tensor, read with O_DIRECT into the reusable aligned staging buffer.
@@ -758,6 +784,7 @@ fn matrix_layout(
     manifest: &TensorManifest,
     block: &str,
     roles: &[&str],
+    align_elements: usize,
 ) -> Result<(MatrixLayout, usize)> {
     let prefix = format!("{block}.");
     let mut layout = BTreeMap::new();
@@ -770,6 +797,9 @@ fn matrix_layout(
             continue;
         }
         ensure!(entry.dtype == Dtype::BF16, "{name} is not BF16");
+        if align_elements > 0 {
+            elements = elements.next_multiple_of(align_elements).max(elements + align_elements);
+        }
         layout.insert(
             role.to_owned(),
             (
@@ -800,7 +830,7 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
-        let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
+        let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES, 0)?;
         let mut storage = s.alloc_zeros::<bf16>(elements)?;
         for (role, (offset, shape)) in &layout {
             let count = shape[0] as usize * shape[1] as usize;
@@ -827,7 +857,12 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
-        let (layout, _) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
+        let (layout, _) = matrix_layout(
+            base.manifest,
+            block,
+            &LINEAR_ROLES,
+            base.reader.align_elements()?,
+        )?;
         Self::with_linears::<LORA>(s, spec, rank, block, (slot, &layout), base, lora)
     }
 
@@ -2865,7 +2900,7 @@ fn place_layers(
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
-            let (layout, _) = matrix_layout(base.manifest, &name, roles)?;
+            let (layout, _) = matrix_layout(base.manifest, &name, roles, base.reader.align_elements()?)?;
             let host = dense
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
@@ -4603,7 +4638,16 @@ impl TextLayer {
         slot: Option<u64>,
         base: &mut Source<'_>,
     ) -> Result<Self> {
-        let (layout, elements) = matrix_layout(base.manifest, block, &TEXT_ROLES)?;
+        let (layout, elements) = matrix_layout(
+            base.manifest,
+            block,
+            &TEXT_ROLES,
+            if slot.is_some() {
+                base.reader.align_elements()?
+            } else {
+                0
+            },
+        )?;
         let mut storage = None;
         let at = match slot {
             Some(slot) => slot,
