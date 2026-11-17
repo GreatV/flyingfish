@@ -13,6 +13,8 @@ pub(crate) struct RnntConfig {
     pub(crate) vocab: usize,
     pub(crate) blank: usize,
     pub(crate) max_symbols: usize,
+    pub(crate) lanes: usize,
+    pub(crate) stride: usize,
 }
 
 pub(crate) struct RnntLayer {
@@ -48,6 +50,29 @@ pub struct RnntDecodeStream {
     joint_logits: CudaSlice<f32>,
 }
 
+#[cfg(test)]
+impl RnntDecodeStream {
+    pub(crate) fn joint_bytes(&self) -> usize {
+        self.joint_logits.len() * 4
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        let mut elements = self.embed_input.len()
+            + self.prediction.len()
+            + self.joint_frame.len()
+            + self.joint_sum.len()
+            + self.joint_activated.len()
+            + self.joint_logits.len();
+        for layer in &self.layers {
+            elements += layer.hidden.len()
+                + layer.cell.len()
+                + layer.input_gates.len()
+                + layer.recurrent_gates.len();
+        }
+        elements * 4
+    }
+}
+
 #[derive(Default)]
 pub struct RnntHypothesis {
     pub tokens: Vec<u32>,
@@ -64,25 +89,32 @@ impl RnntDecoder {
 
     pub fn decode_stream(&self, encoder: &ParakeetEncoder) -> Result<RnntDecodeStream> {
         let stream = &encoder.stream;
+        let stride = self.config.stride;
+        ensure!(
+            self.config.lanes > 0 && stride >= self.config.lanes && stride <= 4,
+            "RNNT lane/stride setup {}/{}",
+            self.config.lanes,
+            stride
+        );
         let hidden = self.config.prediction_hidden;
         let gate = 4 * hidden;
         let mut layers = Vec::with_capacity(self.config.layers);
         for _ in 0..self.config.layers {
             layers.push(LayerState {
-                hidden: stream.alloc_zeros(4 * hidden)?,
-                cell: stream.alloc_zeros(4 * hidden)?,
-                input_gates: stream.alloc_zeros(4 * gate)?,
-                recurrent_gates: stream.alloc_zeros(4 * gate)?,
+                hidden: stream.alloc_zeros(stride * hidden)?,
+                cell: stream.alloc_zeros(stride * hidden)?,
+                input_gates: stream.alloc_zeros(stride * gate)?,
+                recurrent_gates: stream.alloc_zeros(stride * gate)?,
             });
         }
         Ok(RnntDecodeStream {
-            embed_input: stream.alloc_zeros(4 * hidden)?,
+            embed_input: stream.alloc_zeros(stride * hidden)?,
             layers,
-            prediction: stream.alloc_zeros(4 * hidden)?,
-            joint_frame: stream.alloc_zeros(4 * hidden)?,
-            joint_sum: stream.alloc_zeros(4 * hidden)?,
-            joint_activated: stream.alloc_zeros(4 * hidden)?,
-            joint_logits: stream.alloc_zeros(4 * self.config.vocab)?,
+            prediction: stream.alloc_zeros(stride * hidden)?,
+            joint_frame: stream.alloc_zeros(stride * hidden)?,
+            joint_sum: stream.alloc_zeros(stride * hidden)?,
+            joint_activated: stream.alloc_zeros(stride * hidden)?,
+            joint_logits: stream.alloc_zeros(stride * self.config.vocab)?,
         })
     }
 
@@ -95,8 +127,12 @@ impl RnntDecoder {
         initialized: &mut bool,
     ) -> Result<()> {
         let stream = &encoder.stream;
+        let stride = self.config.stride;
         let hidden = self.config.prediction_hidden;
-        ensure!(lane < 4, "prediction lane {lane} outside the 4-slot stride");
+        ensure!(
+            lane < stride,
+            "prediction lane {lane} outside the {stride}-slot stride"
+        );
         ensure!(
             (label as usize) < self.config.vocab,
             "RNNT label outside vocabulary"
@@ -125,8 +161,20 @@ impl RnntDecoder {
                 &previous[index - 1].hidden
             };
             let layer = &self.layers[index];
-            encoder.lane_linear_into(input, 4, 4, &layer.input, input_gates)?;
-            encoder.lane_linear_into(state_hidden, 4, 4, &layer.recurrent, recurrent_gates)?;
+            encoder.lane_linear_into(
+                input,
+                stride as u32,
+                stride as u32,
+                &layer.input,
+                input_gates,
+            )?;
+            encoder.lane_linear_into(
+                state_hidden,
+                stride as u32,
+                stride as u32,
+                &layer.recurrent,
+                recurrent_gates,
+            )?;
             unsafe {
                 stream
                     .launch_builder(&encoder.ops.lstm)
@@ -146,8 +194,8 @@ impl RnntDecoder {
             .context("prediction LSTM stack empty")?;
         encoder.lane_linear_into(
             &last.hidden,
-            4,
-            4,
+            stride as u32,
+            stride as u32,
             &self.pred_projection,
             &mut dstream.prediction,
         )?;
@@ -163,8 +211,9 @@ impl RnntDecoder {
         row_offsets: &[usize; 4],
     ) -> Result<Vec<f32>> {
         let stream = &encoder.stream;
+        let stride = self.config.stride;
         let hidden = self.config.prediction_hidden;
-        for (lane, &start) in row_offsets.iter().enumerate() {
+        for (lane, &start) in row_offsets.iter().take(stride).enumerate() {
             stream.memcpy_dtod(
                 &projected.slice(start..start + hidden),
                 &mut dstream
@@ -176,15 +225,15 @@ impl RnntDecoder {
         encoder.residual(&mut dstream.joint_sum, &dstream.joint_frame, 1.0)?;
         encoder.activate_into(
             &dstream.joint_sum,
-            4,
+            stride as u32,
             self.config.prediction_hidden as u32,
             0,
             &mut dstream.joint_activated,
         )?;
         encoder.lane_linear_into(
             &dstream.joint_activated,
-            4,
-            4,
+            stride as u32,
+            stride as u32,
             &self.joint_head,
             &mut dstream.joint_logits,
         )?;
@@ -201,13 +250,17 @@ impl RnntDecoder {
         row_bases: &[usize; 4],
     ) -> Result<()> {
         let hidden = self.config.prediction_hidden;
+        let stride = self.config.stride;
         ensure!(
-            projected.len().is_multiple_of(4 * hidden),
+            projected.len().is_multiple_of(stride * hidden),
             "RNNT projected row extent"
         );
-        let out_rows = projected.len() / (4 * hidden);
+        let out_rows = projected.len() / (stride * hidden);
         ensure!(out_rows > 0, "decode step with zero rows");
-        ensure!(hypotheses.len() <= 4, "RNNT lane count exceeds four");
+        ensure!(
+            hypotheses.len() <= self.config.lanes,
+            "RNNT lane count exceeds setup"
+        );
         let mut cursor = [0usize; 4];
         let mut symbols = [0usize; 4];
         let mut live = [false; 4];
@@ -223,7 +276,7 @@ impl RnntDecoder {
         }
         while live.iter().any(|value| *value) {
             let mut row_offsets = [0usize; 4];
-            for lane in 0..4 {
+            for lane in 0..stride {
                 let row = cursor[lane].min(out_rows - 1);
                 row_offsets[lane] = (lane * out_rows + row) * hidden;
             }

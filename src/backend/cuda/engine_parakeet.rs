@@ -833,11 +833,9 @@ impl ParakeetEncoder {
         )
     }
 
-    /// Row-invariant GEMM for the multitalker lane stack: every lane count
-    /// runs the identical GEMM shape — rows below the 4-lane canonical count
-    /// are zero-padded to it — so a lane's rows are bitwise-identical whether
-    /// it runs alone or stacked. The pad is performance-neutral: these GEMMs
-    /// are weight-traffic-bound at every lane count.
+    /// Row-invariant GEMM for the multitalker lane stack and shared RNNT:
+    /// Multitalker pads below the canonical four-lane count; single-lane callers
+    /// use one row with no padding.
     pub(crate) fn lane_linear_into(
         &self,
         input: &CudaSlice<f32>,
@@ -847,7 +845,7 @@ impl ParakeetEncoder {
         output: &mut CudaSlice<f32>,
     ) -> Result<()> {
         ensure!(
-            rows > 0 && canonical >= rows && canonical.is_multiple_of(4),
+            rows > 0 && canonical >= rows && (canonical == rows || canonical.is_multiple_of(4)),
             "lane GEMM rows {rows} vs canonical {canonical}"
         );
         if canonical == rows {
