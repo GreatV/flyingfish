@@ -157,7 +157,7 @@ struct EntryReader {
     align: Option<usize>,
 }
 
-    /// One batched direct-read destination: tensor identity plus a disjoint aligned
+/// One batched direct-read destination: tensor identity plus a disjoint aligned
 /// writable window of the pinned arena. `dest` must be aligned and hold the padded
 /// file span; only the owning worker thread dereferences it.
 struct DirectRead<'a> {
@@ -168,7 +168,8 @@ struct DirectRead<'a> {
 }
 
 /// The batch base pointer, Send by the disjoint-index discipline of `read_many_direct`.
-struct DirectBatch(*mut DirectRead<'static>);
+struct DirectBatch(*mut u8);
+
 impl Copy for DirectBatch {}
 impl Clone for DirectBatch {
     fn clone(&self) -> Self {
@@ -177,7 +178,6 @@ impl Clone for DirectBatch {
 }
 unsafe impl Send for DirectBatch {}
 unsafe impl Sync for DirectBatch {}
-
 
 impl EntryReader {
     fn new(dir: &Path) -> Self {
@@ -290,9 +290,9 @@ impl EntryReader {
                 .push(index);
         }
         let queues: Vec<Vec<usize>> = queues.into_values().collect();
-        let in_flight = queues.len().min(4).max(1);
+        let in_flight = queues.len().clamp(1, 4);
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let batch = DirectBatch(requests.as_mut_ptr() as *mut DirectRead<'static>);
+        let batch = DirectBatch(requests.as_mut_ptr().cast::<u8>());
         let batch = &batch;
         std::thread::scope(|scope| -> Result<()> {
             let handles: Vec<_> = (0..in_flight)
@@ -306,7 +306,8 @@ impl EntryReader {
                             for &index in queue {
                                 // SAFETY: each index is owned by exactly one queue and
                                 // therefore one worker; the window is within the arena.
-                                let request = unsafe { &mut *batch.0.add(index) };
+                                let request =
+                                    unsafe { &mut *(batch.0 as *mut DirectRead).add(index) };
                                 let destination = unsafe {
                                     std::slice::from_raw_parts_mut(request.dest, request.dest_len)
                                 };
@@ -322,7 +323,9 @@ impl EntryReader {
                 })
                 .collect();
             for handle in handles {
-                handle.join().map_err(|_| anyhow::anyhow!("direct batch worker panicked"))??;
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("direct batch worker panicked"))??;
             }
             Ok(())
         })
@@ -368,29 +371,26 @@ impl EntryReader {
     /// checkpoint directory shares the filesystem, so the first reader's alignment stands.
     fn align_elements(&mut self) -> Result<usize> {
         if self.align.is_none() {
-            let shard = self
-                .readers
-                .keys()
-                .next()
-                .cloned()
-                .map_or_else(
-                    || {
-                        let mut first = self
-                            .dir
-                            .read_dir()
-                            .with_context(|| format!("read {}", self.dir.display()))?
-                            .filter_map(std::result::Result::ok)
-                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                            .filter(|name| !name.starts_with('.'))
-                            .collect::<Vec<_>>();
-                        first.sort();
-                        anyhow::Ok(first
+            let shard = self.readers.keys().next().cloned().map_or_else(
+                || {
+                    let mut first = self
+                        .dir
+                        .read_dir()
+                        .with_context(|| format!("read {}", self.dir.display()))?
+                        .filter_map(std::result::Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| !name.starts_with('.'))
+                        .collect::<Vec<_>>();
+                    first.sort();
+                    anyhow::Ok(
+                        first
                             .into_iter()
                             .next()
-                            .context("checkpoint directory is empty")?)
-                    },
-                    Ok,
-                )?;
+                            .context("checkpoint directory is empty")?,
+                    )
+                },
+                Ok,
+            )?;
             if !self.readers.contains_key(&shard) {
                 let reader = SpanReader::open(&self.dir.join(&shard), true)?;
                 self.readers.insert(shard.clone(), reader);
@@ -931,7 +931,9 @@ fn matrix_layout(
         }
         ensure!(entry.dtype == Dtype::BF16, "{name} is not BF16");
         if align_elements > 0 {
-            elements = elements.next_multiple_of(align_elements).max(elements + align_elements);
+            elements = elements
+                .next_multiple_of(align_elements)
+                .max(elements + align_elements);
         }
         layout.insert(
             role.to_owned(),
@@ -3059,12 +3061,7 @@ fn place_layers(
                 );
                 requests.push((
                     tensor.clone(),
-                    (
-                        entry.clone(),
-                        host.as_mut_ptr() as *mut u8,
-                        host.len(),
-                        at,
-                    ),
+                    (entry.clone(), host.as_mut_ptr(), host.len(), at),
                 ));
                 checks.push((layer, tensor, entry.clone(), at));
                 source_offset += entry.bytes;
@@ -14279,8 +14276,7 @@ mod h3_direct_batch_tests {
         for (index, entry) in entries.iter().enumerate() {
             let head = (entry.data_start as usize) % align;
             let got = &arena.as_mut()[offsets[index] + head..offsets[index] + head + entry.bytes];
-            let want =
-                &file[entry.data_start as usize..entry.data_start as usize + entry.bytes];
+            let want = &file[entry.data_start as usize..entry.data_start as usize + entry.bytes];
             ensure!(got == want, "tensor {index}: batch bytes differ");
         }
         std::fs::remove_dir_all(&dir).ok();
