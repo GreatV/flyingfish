@@ -99,7 +99,7 @@ impl DensePlacement {
         device_bytes: usize,
         host_bytes: usize,
     ) -> Result<Self> {
-        Self::with_allocations(layers, layers, host_layers, device_bytes, host_bytes, 0)
+        Self::with_allocations(layers, layers, host_layers, device_bytes, host_bytes, 0, 2)
     }
 
     pub(crate) fn with_allocations(
@@ -109,7 +109,12 @@ impl DensePlacement {
         device_bytes: usize,
         host_bytes: usize,
         streamed_overhead: usize,
+        slot_count: usize,
     ) -> Result<Self> {
+        ensure!(
+            matches!(slot_count, 2 | 3),
+            "dense streaming slot count {slot_count}"
+        );
         ensure!(
             !layers.is_empty() && layers.iter().all(|&n| n > 0 && n >= streamed_overhead),
             "empty dense layer extent"
@@ -144,7 +149,9 @@ impl DensePlacement {
         order.sort_by_key(|&i| std::cmp::Reverse(layers[i]));
         let mut best = None;
         for slot in sizes {
-            let slots = slot.checked_mul(2).context("dense slots overflow")?;
+            let slots = slot
+                .checked_mul(slot_count)
+                .context("dense slots overflow")?;
             let setup = layers
                 .len()
                 .checked_mul(streamed_overhead)
@@ -183,14 +190,15 @@ impl DensePlacement {
                 best = Some((slot, resident, kept));
             }
         }
-        let (slot, resident, kept) =
-            best.context("dense fixed tensors and two layer slots exceed VRAM")?;
+        let (slot, resident, kept) = best.with_context(|| {
+            format!("dense fixed tensors and {slot_count} layer slots exceed VRAM")
+        })?;
         plan.slot_bytes = slot;
         plan.resident_bytes = kept;
         let mut index = 0;
         for (i, &resident) in resident.iter().enumerate() {
             if !resident {
-                plan.slots[i] = Some(index % 2);
+                plan.slots[i] = Some(index % slot_count);
                 index += 1;
             }
         }
@@ -220,6 +228,48 @@ impl DensePlacement {
         );
         Ok(plan)
     }
+}
+
+/// Payload bytes per second of a sysfs `max_link_speed` (`"16.0 GT/s"`) at `width` lanes.
+/// At 8.0 GT/s and above the encoding is 128/130; below it is 8/10.
+pub(crate) fn pcie_payload_bytes_per_second(max_link_speed: &str, width: usize) -> Result<f64> {
+    let head = max_link_speed
+        .trim()
+        .split_whitespace()
+        .next()
+        .context("empty PCIe link speed")?;
+    let gt_per_second: f64 = head.parse().context("PCIe link speed")?;
+    ensure!(
+        gt_per_second.is_finite() && gt_per_second > 0.0 && width > 0,
+        "invalid PCIe link"
+    );
+    let encoding = if gt_per_second >= 8.0 {
+        128.0 / 130.0
+    } else {
+        8.0 / 10.0
+    };
+    let payload = gt_per_second * 1.0e9 * (width as f64) / 8.0 * encoding;
+    ensure!(payload.is_finite() && payload > 0.0, "PCIe payload rate");
+    Ok(payload)
+}
+
+/// Two streaming slots when one copy finishes within one peak layer, otherwise three.
+pub(crate) fn streaming_slot_count(
+    copy_bytes: u64,
+    pcie_bps: f64,
+    layer_seconds: f64,
+) -> Result<usize> {
+    ensure!(
+        copy_bytes > 0
+            && pcie_bps.is_finite()
+            && pcie_bps > 0.0
+            && layer_seconds.is_finite()
+            && layer_seconds > 0.0,
+        "invalid streaming slot inputs"
+    );
+    let copy_seconds = (copy_bytes as f64) / pcie_bps;
+    ensure!(copy_seconds.is_finite(), "streaming copy time overflow");
+    Ok(if copy_seconds <= layer_seconds { 2 } else { 3 })
 }
 
 #[derive(Debug, Serialize)]
@@ -313,8 +363,41 @@ impl Plan {
 mod tests {
     use super::{
         Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes,
-        prompt_direct_max_rows,
+        pcie_payload_bytes_per_second, prompt_direct_max_rows, streaming_slot_count,
     };
+
+    #[test]
+    fn streaming_slots_cover_one_copy_at_the_payload_rate() -> anyhow::Result<()> {
+        use super::DensePlacement;
+        let rate = pcie_payload_bytes_per_second("16.0 GT/s", 16)?;
+        assert_eq!(rate, 16.0e9 * 16.0 / 8.0 * (128.0 / 130.0));
+        assert!((rate - 31_507_692_307.692).abs() < 1e-3);
+        assert_eq!(
+            pcie_payload_bytes_per_second("8.0 GT/s", 16)?,
+            12_800_000_000.0
+        );
+        let layer = 3_644_877_795_328.0 / 165.2e12;
+        assert_eq!(streaming_slot_count(770_703_360, rate, layer)?, 3);
+        let covered = (layer * rate) as u64;
+        assert_eq!(streaming_slot_count(covered, rate, layer)?, 2);
+        assert!(streaming_slot_count(0, rate, layer).is_err());
+        assert!(pcie_payload_bytes_per_second("fast", 16).is_err());
+        let two = DensePlacement::with_allocations(&[100; 10], &[100; 10], None, 800, 0, 0, 2)?;
+        let three = DensePlacement::with_allocations(&[100; 10], &[100; 10], None, 800, 0, 0, 3)?;
+        assert_eq!(two.resident_bytes, 600);
+        assert_eq!(three.resident_bytes, 500);
+        assert_eq!(two.resident_bytes + 2 * two.slot_bytes, 800);
+        assert_eq!(three.resident_bytes + 3 * three.slot_bytes, 800);
+        let mut sequence = 0usize;
+        for slot in &three.slots {
+            if let Some(slot) = slot {
+                assert_eq!(*slot, sequence % 3);
+                sequence += 1;
+            }
+        }
+        assert_eq!(sequence, 5);
+        Ok(())
+    }
 
     #[test]
     fn dense_media_reservation_preserves_device_capacity() -> anyhow::Result<()> {
