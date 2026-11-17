@@ -192,11 +192,30 @@ pub(crate) fn group_dot_smem(group: u32) -> u32 {
     32 * group + 2048
 }
 
-/// True when the f32 rotated buffer, `rows * k * 4` bytes, exceeds `l2_bytes`.
+/// Issued net is 32768 FLOP per 381 bytes. True when that is strictly under the setup peak.
 #[cfg(any(test, feature = "cuda"))]
-pub(crate) fn recompute_rotated(rows: u32, k: u32, l2_bytes: u64) -> Option<bool> {
+pub(crate) fn recompute_saves_at_peaks(
+    sms: u64,
+    flop_per_sm_clock: u64,
+    clock_hz: u64,
+    bandwidth: u64,
+) -> Option<bool> {
+    if sms == 0 || flop_per_sm_clock == 0 || clock_hz == 0 || bandwidth == 0 {
+        return None;
+    }
+    let peak = u128::from(sms)
+        .checked_mul(u128::from(flop_per_sm_clock))?
+        .checked_mul(u128::from(clock_hz))?;
+    let left = 32_768u128.checked_mul(u128::from(bandwidth))?;
+    let right = 381u128.checked_mul(peak)?;
+    Some(left < right)
+}
+
+/// True when `rows * k * 4` exceeds `l2_bytes` and `saves` is the setup ridge.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn recompute_rotated(rows: u32, k: u32, l2_bytes: u64, saves: bool) -> Option<bool> {
     let bytes = u64::from(rows).checked_mul(u64::from(k))?.checked_mul(4)?;
-    Some(bytes > l2_bytes)
+    Some(bytes > l2_bytes && saves)
 }
 
 /// Largest multiple of 16 whose [`group_dot_smem`] fits in `optin` bytes.
@@ -359,40 +378,88 @@ mod tests {
         Ok(())
     }
 
-    fn l2_recomputes(rows: u32, k: u32, l2_bytes: u64) -> Result<bool> {
-        super::recompute_rotated(rows, k, l2_bytes).context("rotated bytes")
+    fn decide(rows: u32, k: u32, l2_bytes: u64, saves: bool) -> Result<bool> {
+        super::recompute_rotated(rows, k, l2_bytes, saves).context("rotated bytes")
     }
 
     #[test]
     fn rotated_recompute_follows_l2() -> Result<()> {
         const L2_4090: u64 = 75_497_472;
         const L2_A4000: u64 = 6 * 1024 * 1024;
+        let flop = u64::from(crate::linear_plan::tc_flops_per_sm_clock(89)?);
+        ensure!(
+            flop == u64::from(crate::linear_plan::tc_flops_per_sm_clock(86)?) && flop == 512,
+            "m16n8k16 f32-accumulate rate {flop}"
+        );
+        let saves_4090 =
+            super::recompute_saves_at_peaks(128, flop, 2_520_000_000, 1_008_000_000_000)
+                .context("4090 ridge")?;
+        let saves_a4000 = super::recompute_saves_at_peaks(48, flop, 1_560_000_000, 448_064_000_000)
+            .context("A4000 ridge")?;
+        ensure!(
+            saves_4090 && !saves_a4000,
+            "ridge 4090 {saves_4090} A4000 {saves_a4000}"
+        );
+        println!(
+            "CONVROT_RIDGE_CPU sms=128 flop_per_sm_clock={flop} clock_hz=2520000000 bandwidth=1008000000000 l2={L2_4090} saves={saves_4090}"
+        );
+        println!(
+            "CONVROT_RIDGE_CPU sms=48 flop_per_sm_clock={flop} clock_hz=1560000000 bandwidth=448064000000 l2={L2_A4000} saves={saves_a4000}"
+        );
+        ensure!(
+            !super::recompute_saves_at_peaks(1, 1, 32_768, 381).context("tie")?
+                && super::recompute_saves_at_peaks(1, 1, 32_769, 381).context("under")?
+                && !super::recompute_saves_at_peaks(1, 1, 32_768, 382).context("over")?
+                && super::recompute_saves_at_peaks(0, flop, 1, 1).is_none(),
+            "ridge inequality"
+        );
         let ks = [5_376u32, 7_168, 14_336];
         for k in ks {
-            ensure!(!l2_recomputes(1000, k, L2_4090)?, "4090 rows 1000 k {k}");
-            ensure!(l2_recomputes(1000, k, L2_A4000)?, "A4000 rows 1000 k {k}");
             ensure!(
-                !l2_recomputes(1019, k, L2_4090)? && !l2_recomputes(1010, k, L2_4090)?,
+                !decide(1000, k, L2_4090, saves_4090)?,
+                "4090 rows 1000 k {k}"
+            );
+            ensure!(
+                !decide(1000, k, L2_A4000, saves_a4000)?,
+                "A4000 rows 1000 k {k}"
+            );
+            ensure!(
+                decide(1000, k, L2_A4000, true)?,
+                "A4000 L2 alone rows 1000 k {k}"
+            );
+            ensure!(
+                !decide(1019, k, L2_4090, saves_4090)? && !decide(1010, k, L2_4090, saves_4090)?,
                 "4090 chunk k {k}"
             );
-            ensure!(l2_recomputes(41_770, k, L2_4090)?, "4090 rows 41770 k {k}");
+            ensure!(
+                decide(41_770, k, L2_4090, saves_4090)?,
+                "4090 rows 41770 k {k}"
+            );
+            let a4000_large = decide(41_770, k, L2_A4000, saves_a4000)?;
+            println!(
+                "CONVROT_RIDGE_CPU rows=41770 k={k} l2={L2_A4000} saves={saves_a4000} recompute={a4000_large}"
+            );
+            ensure!(!a4000_large, "A4000 rows 41770 k {k}");
         }
         ensure!(
-            !l2_recomputes(3510, 5376, L2_4090)?
-                && l2_recomputes(3511, 5376, L2_4090)?
-                && !l2_recomputes(2633, 7168, L2_4090)?
-                && l2_recomputes(2634, 7168, L2_4090)?
-                && !l2_recomputes(1316, 14336, L2_4090)?
-                && l2_recomputes(1317, 14336, L2_4090)?,
+            !decide(3510, 5376, L2_4090, saves_4090)?
+                && decide(3511, 5376, L2_4090, saves_4090)?
+                && !decide(2633, 7168, L2_4090, saves_4090)?
+                && decide(2634, 7168, L2_4090, saves_4090)?
+                && !decide(1316, 14336, L2_4090, saves_4090)?
+                && decide(1317, 14336, L2_4090, saves_4090)?,
             "4090 cutover"
         );
         ensure!(
-            !l2_recomputes(292, 5376, L2_A4000)?
-                && l2_recomputes(293, 5376, L2_A4000)?
-                && !l2_recomputes(219, 7168, L2_A4000)?
-                && l2_recomputes(220, 7168, L2_A4000)?
-                && !l2_recomputes(109, 14336, L2_A4000)?
-                && l2_recomputes(110, 14336, L2_A4000)?,
+            !decide(292, 5376, L2_A4000, true)?
+                && decide(293, 5376, L2_A4000, true)?
+                && !decide(219, 7168, L2_A4000, true)?
+                && decide(220, 7168, L2_A4000, true)?
+                && !decide(109, 14336, L2_A4000, true)?
+                && decide(110, 14336, L2_A4000, true)?
+                && !decide(293, 5376, L2_A4000, saves_a4000)?
+                && !decide(220, 7168, L2_A4000, saves_a4000)?
+                && !decide(110, 14336, L2_A4000, saves_a4000)?,
             "A4000 cutover"
         );
         ensure!(
@@ -417,6 +484,7 @@ pub struct ConvrotFns {
     max_group: u32,
     optin: usize,
     l2_bytes: u64,
+    ridge_saves: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -444,6 +512,31 @@ const PRODUCT_BN: u32 = 256;
 const PRODUCT_SMEM: u32 = 61_440;
 
 #[cfg(feature = "cuda")]
+fn sensed_ridge(
+    ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>,
+) -> Result<(bool, u64, u64, u64, u64)> {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let sm = crate::backend::cuda::cubin::capability(ctx)?;
+    let flop = u64::from(crate::linear_plan::tc_flops_per_sm_clock(sm)?);
+    let sms = u64::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)
+        .context("convrot SM count")?;
+    let clock_khz = u64::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE)?)
+        .context("convrot clock")?;
+    let memory_clock_khz = u64::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?)
+        .context("convrot memory clock")?;
+    let bus_bits = u64::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?)
+        .context("convrot bus width")?;
+    let clock_hz = clock_khz.checked_mul(1000).context("convrot clock")?;
+    let bandwidth = memory_clock_khz
+        .checked_mul(250)
+        .and_then(|value| value.checked_mul(bus_bits))
+        .context("convrot bandwidth")?;
+    let saves =
+        recompute_saves_at_peaks(sms, flop, clock_hz, bandwidth).context("convrot ridge")?;
+    Ok((saves, sms, flop, clock_hz, bandwidth))
+}
+
+#[cfg(feature = "cuda")]
 pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
     let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
     let product = module.load_function("convrot_product")?;
@@ -460,6 +553,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     let l2_bytes = u64::try_from(
         ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
     )?;
+    let (ridge_saves, _, _, _, _) = sensed_ridge(ctx)?;
     let max_group = max_group(optin)?;
     let tile_limit = i32::try_from(group_dot_smem(max_group))?;
     for function in [&group_dot, &group_peak, &group_quant] {
@@ -485,6 +579,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         max_group,
         optin,
         l2_bytes,
+        ridge_saves,
     })
 }
 
@@ -713,7 +808,7 @@ fn launch_group_quant(
     Ok(())
 }
 
-/// Store path when `rows * k * 4` fits in the L2 read by [`load_convrot`]. Otherwise recompute.
+/// Store path when the f32 row fits in L2 or the setup ridge does not save. Otherwise recompute.
 #[cfg(feature = "cuda")]
 pub(crate) fn launch_rotate_quant(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
@@ -721,7 +816,8 @@ pub(crate) fn launch_rotate_quant(
     args: &ConvrotArgs,
 ) -> Result<()> {
     let (rows, k, group) = rotated_shape(fns, args)?;
-    let recompute = recompute_rotated(rows, k, fns.l2_bytes).context("convrot rotated bytes")?;
+    let recompute = recompute_rotated(rows, k, fns.l2_bytes, fns.ridge_saves)
+        .context("convrot rotated bytes")?;
     if recompute {
         launch_recompute_rotate_quant(stream, fns, args, rows, k, group)
     } else {
@@ -2217,9 +2313,13 @@ mod device {
     ) -> Result<()> {
         let group = 256usize;
         let n = 40usize;
-        let recompute =
-            super::recompute_rotated(u32::try_from(rows)?, u32::try_from(k)?, fns.l2_bytes)
-                .context("convrot rotated bytes")?;
+        let recompute = super::recompute_rotated(
+            u32::try_from(rows)?,
+            u32::try_from(k)?,
+            fns.l2_bytes,
+            fns.ridge_saves,
+        )
+        .context("convrot rotated bytes")?;
         ensure!(recompute, "rows {rows} k {k} stayed on the store path");
         let x_f32 = activation(rows, k);
         let x_bf16: Vec<bf16> = x_f32.iter().copied().map(bf16::from_f32).collect();
@@ -2309,9 +2409,13 @@ mod device {
         k: usize,
     ) -> Result<()> {
         let group = 256usize;
-        let recompute =
-            super::recompute_rotated(u32::try_from(rows)?, u32::try_from(k)?, fns.l2_bytes)
-                .context("convrot rotated bytes")?;
+        let recompute = super::recompute_rotated(
+            u32::try_from(rows)?,
+            u32::try_from(k)?,
+            fns.l2_bytes,
+            fns.ridge_saves,
+        )
+        .context("convrot rotated bytes")?;
         ensure!(!recompute, "rows {rows} k {k} recomputed");
         let x_f32 = activation(rows, k);
         let x_bf16: Vec<bf16> = x_f32.iter().copied().map(bf16::from_f32).collect();
@@ -2370,6 +2474,19 @@ mod device {
             "setup L2 {} device L2 {}",
             fns.l2_bytes,
             device.info.l2_bytes
+        );
+        let (saves, sms, flop, clock_hz, bandwidth) = super::sensed_ridge(&device.ctx)?;
+        let stored = fns.ridge_saves;
+        let info_sms = device.info.sms;
+        let info_bandwidth = device.info.memory_bytes_per_second;
+        ensure!(
+            saves == stored
+                && sms == u64::try_from(info_sms)?
+                && info_bandwidth == bandwidth as f64,
+            "setup ridge {saves} stored {stored} sms {sms} info {info_sms} bandwidth {bandwidth} info {info_bandwidth}"
+        );
+        println!(
+            "CONVROT_RIDGE saves={saves} sms={sms} flop_per_sm_clock={flop} clock_hz={clock_hz} bandwidth={bandwidth}"
         );
         println!("CONVROT_L2 bytes={}", fns.l2_bytes);
         production_store_matches_group_dot(&device, &fns, 1000, 14_336)?;
