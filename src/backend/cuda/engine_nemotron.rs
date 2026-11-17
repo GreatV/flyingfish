@@ -251,6 +251,9 @@ impl Nemotron {
             features[..mel.frames * 128].copy_from_slice(&mel.features);
             let chunk = self.encoder.encode_chunk(&mut session, &features)?;
             self.decode_rows(&chunk.encoder, row_base, dstream, hypothesis)?;
+            if last {
+                break;
+            }
             row_base += 4;
             start = start.saturating_add(stride);
         }
@@ -413,6 +416,43 @@ mod tests {
             &expected["boundary"],
             false,
             "boundary",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window and publisher decode fixture"]
+    fn nemotron_stream_stops_after_last_chunk() -> Result<()> {
+        ensure!(
+            std::env::var("FF_NEMOTRON_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let directory = PathBuf::from(
+            std::env::var_os("FF_NEMOTRON_MODEL").context("FF_NEMOTRON_MODEL missing")?,
+        );
+        let pcm = fixture_pcm(&PathBuf::from(
+            std::env::var_os("FF_NEMOTRON_DECODE_PCM").context("decode PCM missing")?,
+        ))?;
+        let expected: Value = serde_json::from_slice(&std::fs::read(PathBuf::from(
+            std::env::var_os("FF_NEMOTRON_DECODE_FIXTURE").context("decode fixture missing")?,
+        ))?)?;
+        let device = Device::new(0)?;
+        let model = Nemotron::load(&directory, &device)?;
+        check_mode(
+            &model,
+            &directory,
+            &pcm[..9000],
+            &expected["stream_9000"],
+            true,
+            "stream_9000",
+        )?;
+        check_mode(
+            &model,
+            &directory,
+            &pcm[..2000],
+            &expected["stream_first"],
+            true,
+            "stream_first",
         )?;
         Ok(())
     }
