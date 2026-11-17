@@ -3031,9 +3031,12 @@ fn place_layers(
         let host_tier = plan.host.clone();
         let mut dense =
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
+        let align_elements = base.reader.align_elements()?;
+        let mut requests = Vec::new();
+        let mut checks = Vec::new();
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
-            let (layout, _) = matrix_layout(base.manifest, &name, roles, base.reader.align_elements()?)?;
+            let (layout, _) = matrix_layout(base.manifest, &name, roles, align_elements)?;
             let host = dense
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
@@ -3045,20 +3048,55 @@ fn place_layers(
             for (role, (offset, _)) in &layout {
                 let tensor = format!("{name}.{role}");
                 let entry = &base.manifest.entries[&tensor];
-                if entry.quant.is_some() {
-                    base.reader.read_raw(
-                        &tensor,
-                        entry,
-                        &mut host[source_offset..source_offset + entry.bytes],
-                    )?;
+                let at = if entry.quant.is_some() {
+                    source_offset
                 } else {
-                    base.reader.read_into(
-                        &tensor,
-                        entry,
-                        &mut host[2 * offset..2 * offset + entry.bytes],
-                    )?;
-                }
+                    2 * offset
+                };
+                ensure!(
+                    at.is_multiple_of(2 * align_elements),
+                    "{tensor}: dense slot offset {at} is unaligned"
+                );
+                requests.push((
+                    tensor.clone(),
+                    (
+                        entry.clone(),
+                        host.as_mut_ptr() as *mut u8,
+                        host.len(),
+                        at,
+                    ),
+                ));
+                checks.push((layer, tensor, entry.clone(), at));
                 source_offset += entry.bytes;
+            }
+        }
+        let mut batch = requests
+            .iter_mut()
+            .map(|(tensor, (entry, base, len, at))| DirectRead {
+                name: tensor,
+                entry,
+                dest: unsafe { base.add(*at) },
+                dest_len: *len - *at,
+            })
+            .collect::<Vec<_>>();
+        base.reader.read_many_direct(&mut batch)?;
+        for (layer, tensor, entry, at) in &checks {
+            let host = dense
+                .host_layer(*layer)?
+                .with_context(|| format!("{tensor}: host tier vanished"))?;
+            let filled = &host[*at..*at + entry.bytes];
+            if entry.quant.is_none() {
+                ensure!(
+                    matches!(entry.dtype, Dtype::BF16 | Dtype::F32),
+                    "{tensor}: {:?} is not a finite-checkable dtype",
+                    entry.dtype
+                );
+                let finite = if entry.dtype == Dtype::F32 {
+                    <f32 as Element>::finite(filled)
+                } else {
+                    <bf16 as Element>::finite(filled)
+                };
+                ensure!(finite, "{tensor}: nonfinite value");
             }
         }
         Some(dense)
