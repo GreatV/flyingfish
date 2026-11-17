@@ -3047,7 +3047,8 @@ fn place_layers(
         let mut checks = Vec::new();
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
-            let (layout, _) = matrix_layout(base.manifest, &name, roles, align_elements)?;
+            let (layout, padded_elements) =
+                matrix_layout(base.manifest, &name, roles, align_elements)?;
             let host = dense
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
@@ -3055,13 +3056,14 @@ fn place_layers(
                 host.len() >= source_layers[layer],
                 "{name}: pinned copy size"
             );
-            let mut source_offset = 0usize;
+            let mut source_offset = 2 * padded_elements;
             for (role, (offset, _)) in &layout {
                 let tensor = format!("{name}.{role}");
                 let entry = &base.manifest.entries[&tensor];
                 if entry.quant.is_some() {
-                    source_offset =
-                        (source_offset + 2 * align_elements).next_multiple_of(2 * align_elements);
+                    source_offset = source_offset
+                        .max(source_layers[layer] - entry.bytes)
+                        .next_multiple_of(2 * align_elements);
                 }
                 let at = if entry.quant.is_some() {
                     source_offset
