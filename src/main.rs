@@ -211,7 +211,10 @@ enum Command {
             help = "input PNG with alpha; the background must already be removed (RMBG-2.0 integration is pending)"
         )]
         image: PathBuf,
-        #[arg(long, help = "DINOv3 encoder directory")]
+        #[arg(
+            long,
+            help = "DINOv3 (TRELLIS.2, Pixal3D) or DINOv2 (Hi3D) encoder directory"
+        )]
         dino: Option<PathBuf>,
         #[arg(
             long,
@@ -227,12 +230,18 @@ enum Command {
         camera: Vec<PathBuf>,
         #[arg(long, help = "NAF feature extractor directory (Pixal3D)")]
         naf: Option<PathBuf>,
+        #[arg(long, help = "CLIP encoder directory (Hi3D)")]
+        clip: Option<PathBuf>,
+        #[arg(long, help = "coarse input mesh .ply/.obj to refine (Hi3D)")]
+        mesh: Option<PathBuf>,
         #[arg(
             long,
             default_value_t = 0,
-            help = "requested resolution; 0 selects the model default (Pixal3D 1536)"
+            help = "requested resolution; 0 selects the model default (Pixal3D 1536, Hi3D 512)"
         )]
         resolution: u32,
+        #[arg(long, default_value_t = 1, help = "Hi3D orientation byte")]
+        orientation: u8,
         #[arg(
             long,
             default_value_t = 0,
@@ -1502,9 +1511,10 @@ fn run() -> Result<()> {
             view,
             camera,
             naf,
-
+            clip,
+            mesh,
             resolution,
-
+            orientation,
             seed,
             output,
         } => {
@@ -1513,8 +1523,8 @@ fn run() -> Result<()> {
                 .runtime_dir
                 .clone()
                 .context("--runtime-dir is required for to-3d")?;
-            // Model-class dispatch on the published configs: a diffusers-style
-            // model_index.json is not to-3d input; the Trellis2
+            // Model-class dispatch on the published configs: Hi3D ships a
+            // diffusers-style model_index.json (Sparc3DPipeline); the Trellis2
             // pipelines ship pipeline.json, and Pixal3D's single-view pipeline
             // carries the sparse_structure_decoder key TRELLIS.2 lacks.
             let index: Option<serde_json::Value> =
@@ -1529,17 +1539,17 @@ fn run() -> Result<()> {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                     Err(error) => return Err(error.into()),
                 };
-            if let Some(index) = &index {
-                bail!(
-                    "unsupported model_index class {:?}: Hi3D is not enabled from to-3d yet",
-                    index["_class_name"].as_str()
-                );
-            }
             enum Class {
                 Trellis,
                 Pixal { multiview: bool },
+                Hi3D,
             }
-            let class = if let Some(pipeline) = &pipeline {
+            let class = if let Some(index) = &index {
+                match index["_class_name"].as_str() {
+                    Some("Sparc3DPipeline") => Class::Hi3D,
+                    other => bail!("unsupported model_index class {other:?}"),
+                }
+            } else if let Some(pipeline) = &pipeline {
                 match pipeline["name"].as_str() {
                     Some("Trellis2ImageTo3DPipeline") => {
                         if pipeline["args"]["models"]["sparse_structure_decoder"].is_string() {
@@ -1592,10 +1602,58 @@ fn run() -> Result<()> {
                 Ok(())
             };
             match class {
+                Class::Hi3D => {
+                    ensure!(
+                        view.is_empty() && camera.is_empty(),
+                        "--view/--camera serve Pixal3D"
+                    );
+                    let mesh_path = mesh
+                        .as_ref()
+                        .context("Hi3D requires --mesh (the coarse mesh to refine)")?;
+                    let mesh_extension = mesh_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or_default();
+                    let coarse =
+                        flyingfish::media::read_mesh(&fs::read(mesh_path)?, mesh_extension)?;
+                    let coarse = flyingfish::sparse::SparseMesh {
+                        vertices: coarse.positions,
+                        faces: coarse.triangles,
+                    };
+                    let dino = dino
+                        .as_ref()
+                        .context("Hi3D requires --dino (the DINOv2 directory)")?;
+                    let clip = clip
+                        .as_ref()
+                        .context("Hi3D requires --clip (the CLIP directory)")?;
+                    ensure!(naf.is_none(), "--naf serves Pixal3D");
+                    let (rgba, width, height) =
+                        flyingfish::serve::image::decode_image_rgba(&fs::read(image)?, None)?;
+                    let request = flyingfish::backend::Hi3DGeneration {
+                        model: &cli.model,
+                        dino,
+                        clip,
+                        runtime: &runtime_dir,
+                        rgba: &rgba,
+                        dimensions: [height, width],
+                        orientation: *orientation,
+                        mesh: &coarse,
+                        requested_resolution: match *resolution {
+                            0 => 512,
+                            value => value,
+                        },
+                        seed: *seed,
+                    };
+                    let device = flyingfish::backend::BackendDevice::new(cli.device)?;
+                    let (mesh, resolution) = request.run_processed(&device)?;
+                    write(&mesh, None, &[], resolution)?;
+                    Ok(())
+                }
                 Class::Pixal { multiview } => {
                     let naf = naf
                         .as_ref()
                         .context("Pixal3D requires --naf (the NAF directory)")?;
+                    ensure!(clip.is_none() && mesh.is_none(), "--clip/--mesh serve Hi3D");
                     let dino = dino
                         .as_ref()
                         .context("Pixal3D requires --dino (the DINOv3 directory)")?;
@@ -1749,8 +1807,14 @@ fn run() -> Result<()> {
                 }
                 Class::Trellis => {
                     ensure!(
-                        view.is_empty() && camera.is_empty() && naf.is_none() && *resolution == 0,
-                        "--view/--camera/--naf/--resolution serve Pixal3D"
+                        view.is_empty()
+                            && camera.is_empty()
+                            && naf.is_none()
+                            && clip.is_none()
+                            && mesh.is_none()
+                            && *resolution == 0
+                            && *orientation == 1,
+                        "--view/--camera/--naf/--clip/--mesh/--resolution/--orientation serve Pixal3D and Hi3D"
                     );
                     let dino = dino
                         .as_ref()

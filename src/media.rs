@@ -293,6 +293,12 @@ pub fn write_png(writer: impl Write, width: usize, height: usize, rgb: &[u8]) ->
     write_png_color(writer, width, height, rgb, png::ColorType::Rgb)
 }
 
+/// RGBA PNG with the alpha channel retained (image-to-3D inputs carry the
+/// removed background in alpha).
+pub fn write_png_rgba(writer: impl Write, width: usize, height: usize, rgba: &[u8]) -> Result<()> {
+    write_png_color(writer, width, height, rgba, png::ColorType::Rgba)
+}
+
 fn write_png_color(
     writer: impl Write,
     width: usize,
@@ -1037,8 +1043,10 @@ fn read_obj(bytes: &[u8]) -> Result<MeshRead> {
         triangles,
     })
 }
+
 #[cfg(test)]
 mod tests {
+
     #[test]
     fn mesh_reader_round_trips_both_writers() -> Result<()> {
         // Same discriminating pattern as mesh_writers_round_trip: the RGB and
