@@ -192,6 +192,13 @@ pub(crate) fn group_dot_smem(group: u32) -> u32 {
     32 * group + 2048
 }
 
+/// True when the f32 rotated buffer, `rows * k * 4` bytes, exceeds `l2_bytes`.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn recompute_rotated(rows: u32, k: u32, l2_bytes: u64) -> Option<bool> {
+    let bytes = u64::from(rows).checked_mul(u64::from(k))?.checked_mul(4)?;
+    Some(bytes > l2_bytes)
+}
+
 /// Largest multiple of 16 whose [`group_dot_smem`] fits in `optin` bytes.
 #[cfg(any(test, feature = "cuda"))]
 pub(crate) fn max_group(optin: usize) -> Result<u32> {
@@ -233,7 +240,7 @@ pub(crate) fn quantize_rows(optin: usize, k: u32) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::{hadamard, linear, linear_omitting_rotation};
-    use anyhow::{Result, ensure};
+    use anyhow::{Context, Result, ensure};
     use half::bf16;
 
     fn row(r: usize, i: usize) -> f32 {
@@ -351,16 +358,65 @@ mod tests {
         );
         Ok(())
     }
+
+    fn l2_recomputes(rows: u32, k: u32, l2_bytes: u64) -> Result<bool> {
+        super::recompute_rotated(rows, k, l2_bytes).context("rotated bytes")
+    }
+
+    #[test]
+    fn rotated_recompute_follows_l2() -> Result<()> {
+        const L2_4090: u64 = 75_497_472;
+        const L2_A4000: u64 = 6 * 1024 * 1024;
+        let ks = [5_376u32, 7_168, 14_336];
+        for k in ks {
+            ensure!(!l2_recomputes(1000, k, L2_4090)?, "4090 rows 1000 k {k}");
+            ensure!(l2_recomputes(1000, k, L2_A4000)?, "A4000 rows 1000 k {k}");
+            ensure!(
+                !l2_recomputes(1019, k, L2_4090)? && !l2_recomputes(1010, k, L2_4090)?,
+                "4090 chunk k {k}"
+            );
+            ensure!(l2_recomputes(41_770, k, L2_4090)?, "4090 rows 41770 k {k}");
+        }
+        ensure!(
+            !l2_recomputes(3510, 5376, L2_4090)?
+                && l2_recomputes(3511, 5376, L2_4090)?
+                && !l2_recomputes(2633, 7168, L2_4090)?
+                && l2_recomputes(2634, 7168, L2_4090)?
+                && !l2_recomputes(1316, 14336, L2_4090)?
+                && l2_recomputes(1317, 14336, L2_4090)?,
+            "4090 cutover"
+        );
+        ensure!(
+            !l2_recomputes(292, 5376, L2_A4000)?
+                && l2_recomputes(293, 5376, L2_A4000)?
+                && !l2_recomputes(219, 7168, L2_A4000)?
+                && l2_recomputes(220, 7168, L2_A4000)?
+                && !l2_recomputes(109, 14336, L2_A4000)?
+                && l2_recomputes(110, 14336, L2_A4000)?,
+            "A4000 cutover"
+        );
+        ensure!(
+            u64::from(1000u32) * 14_336 * 4 > L2_A4000 && super::group_dot_smem(256) == 10_240,
+            "A4000 rows 1000 k 14336 bytes {} smem {}",
+            u64::from(1000u32) * 14_336 * 4,
+            super::group_dot_smem(256)
+        );
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
 pub struct ConvrotFns {
     linear: crate::backend::gpu::CudaFunction,
     group_dot: crate::backend::gpu::CudaFunction,
+    group_peak: crate::backend::gpu::CudaFunction,
+    reduce_peaks: crate::backend::gpu::CudaFunction,
+    group_quant: crate::backend::gpu::CudaFunction,
     quantize: crate::backend::gpu::CudaFunction,
     product: crate::backend::gpu::CudaFunction,
     max_group: u32,
     optin: usize,
+    l2_bytes: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -396,14 +452,22 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         i32::try_from(PRODUCT_SMEM)?,
     )?;
     let group_dot = module.load_function("convrot_group_dot")?;
+    let group_peak = module.load_function("convrot_group_peak")?;
+    let group_quant = module.load_function("convrot_group_quant")?;
     let optin = usize::try_from(ctx.attribute(
         cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
     )?)?;
-    let max_group = max_group(optin)?;
-    group_dot.set_attribute(
-        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        i32::try_from(group_dot_smem(max_group))?,
+    let l2_bytes = u64::try_from(
+        ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
     )?;
+    let max_group = max_group(optin)?;
+    let tile_limit = i32::try_from(group_dot_smem(max_group))?;
+    for function in [&group_dot, &group_peak, &group_quant] {
+        function.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            tile_limit,
+        )?;
+    }
     let quantize = module.load_function("convrot_quantize")?;
     let quant_dyn = optin / 4 * 4;
     quantize.set_attribute(
@@ -413,10 +477,14 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
         group_dot,
+        group_peak,
+        reduce_peaks: module.load_function("convrot_reduce_peaks")?,
+        group_quant,
         quantize,
         product,
         max_group,
         optin,
+        l2_bytes,
     })
 }
 
@@ -509,14 +577,8 @@ pub(crate) fn group_dot_grid(rows: u32, k: u32, group: u32) -> (u32, u32, u32) {
     (rows.div_ceil(16), 1, k / group)
 }
 
-/// `convrot_group_dot` then `convrot_quantize`. The product is a separate launch.
 #[cfg(feature = "cuda")]
-pub(crate) fn launch_rotate_quant(
-    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
-    fns: &ConvrotFns,
-    args: &ConvrotArgs,
-) -> Result<()> {
-    use crate::backend::gpu::{LaunchConfig, PushKernelArg};
+fn rotated_shape(fns: &ConvrotFns, args: &ConvrotArgs) -> Result<(u32, u32, u32)> {
     ensure!(
         args.group > 0 && args.group % 16 == 0 && args.k % args.group == 0,
         "convrot tensor-core shape"
@@ -529,6 +591,20 @@ pub(crate) fn launch_rotate_quant(
         "convrot group {group} exceeds device tile {}",
         fns.max_group
     );
+    Ok((rows, k, group))
+}
+
+/// `convrot_group_dot` then `convrot_quantize`.
+#[cfg(feature = "cuda")]
+fn launch_stored_rotate_quant(
+    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    fns: &ConvrotFns,
+    args: &ConvrotArgs,
+    rows: u32,
+    k: u32,
+    group: u32,
+) -> Result<()> {
+    use crate::backend::gpu::{LaunchConfig, PushKernelArg};
     unsafe {
         stream
             .launch_builder(&fns.group_dot)
@@ -563,6 +639,94 @@ pub(crate) fn launch_rotate_quant(
             })?;
     }
     Ok(())
+}
+
+/// Pass 1 abs-max, full-row scale, pass 2 int8. Partials occupy `args.rotated`.
+#[cfg(feature = "cuda")]
+fn launch_recompute_rotate_quant(
+    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    fns: &ConvrotFns,
+    args: &ConvrotArgs,
+    rows: u32,
+    k: u32,
+    group: u32,
+) -> Result<()> {
+    use crate::backend::gpu::{LaunchConfig, PushKernelArg};
+    let grid = group_dot_grid(rows, k, group);
+    let smem = group_dot_smem(group);
+    unsafe {
+        stream
+            .launch_builder(&fns.group_peak)
+            .arg(&args.x)
+            .arg(&args.rotated)
+            .arg(&args.rows)
+            .arg(&args.k)
+            .arg(&args.group)
+            .launch(LaunchConfig {
+                grid_dim: grid,
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: smem,
+            })?;
+    }
+    let groups = i32::try_from(k / group)?;
+    unsafe {
+        stream
+            .launch_builder(&fns.reduce_peaks)
+            .arg(&args.rotated)
+            .arg(&args.scales)
+            .arg(&args.rows)
+            .arg(&groups)
+            .launch(LaunchConfig {
+                grid_dim: (rows.div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    launch_group_quant(stream, fns, args, rows, k, group)
+}
+
+#[cfg(feature = "cuda")]
+fn launch_group_quant(
+    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    fns: &ConvrotFns,
+    args: &ConvrotArgs,
+    rows: u32,
+    k: u32,
+    group: u32,
+) -> Result<()> {
+    use crate::backend::gpu::{LaunchConfig, PushKernelArg};
+    unsafe {
+        stream
+            .launch_builder(&fns.group_quant)
+            .arg(&args.x)
+            .arg(&args.scales)
+            .arg(&args.codes)
+            .arg(&args.rows)
+            .arg(&args.k)
+            .arg(&args.group)
+            .launch(LaunchConfig {
+                grid_dim: group_dot_grid(rows, k, group),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: group_dot_smem(group),
+            })?;
+    }
+    Ok(())
+}
+
+/// Store path when `rows * k * 4` fits in the L2 read by [`load_convrot`]. Otherwise recompute.
+#[cfg(feature = "cuda")]
+pub(crate) fn launch_rotate_quant(
+    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    fns: &ConvrotFns,
+    args: &ConvrotArgs,
+) -> Result<()> {
+    let (rows, k, group) = rotated_shape(fns, args)?;
+    let recompute = recompute_rotated(rows, k, fns.l2_bytes).context("convrot rotated bytes")?;
+    if recompute {
+        launch_recompute_rotate_quant(stream, fns, args, rows, k, group)
+    } else {
+        launch_stored_rotate_quant(stream, fns, args, rows, k, group)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1937,6 +2101,285 @@ mod device {
             check_shared(&device, &fns, rows, k, n, false)?;
         }
         check_shared(&device, &fns, 41_770, k, n, true)?;
+        Ok(())
+    }
+
+    fn opcode_count(body: &str, op: &str) -> usize {
+        body.lines()
+            .filter(|line| {
+                line.split_whitespace().any(|token| {
+                    let start = token.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(0);
+                    let word = &token[start..];
+                    word.starts_with(op)
+                        && (word.len() == op.len() || word.as_bytes().get(op.len()) == Some(&b'.'))
+                })
+            })
+            .count()
+    }
+
+    fn resource_block<'a>(dump: &'a str, name: &str) -> Option<&'a str> {
+        let marker = format!("Function {name}:");
+        let rest = dump
+            .find(&marker)
+            .map(|start| &dump[start + marker.len()..])?;
+        let end = rest.find("Function ").unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    fn resource_u32(block: &str, name: &str) -> Result<u32> {
+        block
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(name)?.parse().ok())
+            .with_context(|| format!("missing {name}"))
+    }
+
+    #[test]
+    fn convrot_recompute_pass_reports_no_spills() -> Result<()> {
+        ensure!(
+            super::group_dot_smem(256) == 10_240,
+            "group 256 dynamic smem {}",
+            super::group_dot_smem(256)
+        );
+        let sms = crate::backend::cuda::cubin::arches();
+        ensure!(!sms.is_empty(), "convrot cubin missing");
+        for &sm in sms {
+            let bytes = crate::backend::cuda::cubin::bytes("convrot", sm)
+                .with_context(|| format!("convrot cubin sm_{sm}"))?;
+            let path = std::env::temp_dir().join(format!(
+                "convrot-recompute-{}-{sm}.cubin",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).context("convrot cubin")?;
+            let output = std::process::Command::new(cuobjdump_bin())
+                .arg("-sass")
+                .arg(&path)
+                .output()
+                .context("cuobjdump")?;
+            let resources = std::process::Command::new(cuobjdump_bin())
+                .arg("-res-usage")
+                .arg(&path)
+                .output()
+                .context("cuobjdump resources")?;
+            let _ = std::fs::remove_file(&path);
+            let text = String::from_utf8_lossy(&output.stdout);
+            let err = String::from_utf8_lossy(&output.stderr);
+            ensure!(
+                output.status.success(),
+                "cuobjdump sm_{sm} status {} {err}",
+                output.status
+            );
+            let body = function_sass(&text, "convrot_group_quant")
+                .context("convrot_group_quant missing from cuobjdump")?;
+            let stl = opcode_count(body, "STL");
+            let ldl = opcode_count(body, "LDL");
+            let usage = String::from_utf8_lossy(&resources.stdout);
+            let usage_err = String::from_utf8_lossy(&resources.stderr);
+            ensure!(
+                resources.status.success(),
+                "cuobjdump resources sm_{sm} status {} {usage_err}",
+                resources.status
+            );
+            let block = resource_block(&usage, "convrot_group_quant")
+                .context("convrot_group_quant resources")?;
+            let stack = resource_u32(block, "STACK:")?;
+            let shared = resource_u32(block, "SHARED:")?;
+            let local = resource_u32(block, "LOCAL:")?;
+            println!(
+                "CONVROT_RECOMPUTE_PASS2 sm_{sm} STL={stl} LDL={ldl} STACK={stack} SHARED={shared} LOCAL={local} LAUNCH_SMEM=10240"
+            );
+            ensure!(
+                stl == 0 && ldl == 0 && stack == 0 && local == 0 && shared == 0,
+                "sm_{sm} convrot_group_quant STL={stl} LDL={ldl} STACK={stack} SHARED={shared} LOCAL={local}"
+            );
+        }
+        Ok(())
+    }
+
+    fn scales_dropping_group_zero(partials: &[f32], rows: usize, groups: usize) -> Vec<f32> {
+        let mut scales = vec![0.0f32; rows];
+        for (row, scale) in scales.iter_mut().enumerate() {
+            let src = &partials[row * groups..(row + 1) * groups];
+            let mut peak = 0.0f32;
+            for value in &src[1..] {
+                peak = peak.max(*value);
+            }
+            *scale = peak.max(1.0e-12) / 127.0;
+        }
+        scales
+    }
+
+    fn compare_stored_and_recompute(
+        device: &Device,
+        fns: &super::ConvrotFns,
+        rows: usize,
+        k: usize,
+        mutant: bool,
+    ) -> Result<()> {
+        let group = 256usize;
+        let n = 40usize;
+        let recompute =
+            super::recompute_rotated(u32::try_from(rows)?, u32::try_from(k)?, fns.l2_bytes)
+                .context("convrot rotated bytes")?;
+        ensure!(recompute, "rows {rows} k {k} stayed on the store path");
+        let x_f32 = activation(rows, k);
+        let x_bf16: Vec<bf16> = x_f32.iter().copied().map(bf16::from_f32).collect();
+        drop(x_f32);
+        let qweight = weight(n, k);
+        let wscale = wscale_row(n);
+        let stream = &device.stream;
+        let x_d = stream.clone_htod(&x_bf16)?;
+        drop(x_bf16);
+        let weight_d = stream.clone_htod(&qweight)?;
+        let wscale_d = stream.clone_htod(&wscale)?;
+        let rotated = stream.alloc_zeros::<f32>(rows * k)?;
+        let codes = stream.alloc_zeros::<i8>(rows * k)?;
+        let scales = stream.alloc_zeros::<f32>(rows)?;
+        let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
+        let args = super::ConvrotArgs {
+            x: x_d.device_ptr(stream).0,
+            qweight: weight_d.device_ptr(stream).0,
+            wscale: wscale_d.device_ptr(stream).0,
+            y: y_d.device_ptr(stream).0,
+            rotated: rotated.device_ptr(stream).0,
+            codes: codes.device_ptr(stream).0,
+            scales: scales.device_ptr(stream).0,
+            rows: i32::try_from(rows)?,
+            k: i32::try_from(k)?,
+            n: i32::try_from(n)?,
+            group: i32::try_from(group)?,
+        };
+        super::launch_stored_rotate_quant(
+            stream,
+            fns,
+            &args,
+            u32::try_from(rows)?,
+            u32::try_from(k)?,
+            u32::try_from(group)?,
+        )?;
+        super::launch_product(stream, fns, &args)?;
+        stream.synchronize()?;
+        let stored_codes: Vec<i8> = stream.clone_dtoh(&codes)?;
+        let stored_scales: Vec<f32> = stream.clone_dtoh(&scales)?;
+        let stored_y: Vec<bf16> = stream.clone_dtoh(&y_d)?;
+        super::launch_rotate_quant(stream, fns, &args)?;
+        super::launch_product(stream, fns, &args)?;
+        stream.synchronize()?;
+        let got_codes: Vec<i8> = stream.clone_dtoh(&codes)?;
+        let got_scales: Vec<f32> = stream.clone_dtoh(&scales)?;
+        let got_y: Vec<bf16> = stream.clone_dtoh(&y_d)?;
+        let code_diff = count_i8(&got_codes, &stored_codes);
+        let scale_diff = count_f32(&got_scales, &stored_scales);
+        let product_diff = bit_diff(&got_y, &stored_y);
+        println!(
+            "CONVROT_RECOMPUTE rows={rows} k={k} n={n} codes={code_diff} scales={scale_diff} product={product_diff}"
+        );
+        ensure!(
+            code_diff == 0 && scale_diff == 0 && product_diff == 0,
+            "recompute rows={rows} k={k} codes {code_diff} scales {scale_diff} product {product_diff}"
+        );
+        if !mutant {
+            return Ok(());
+        }
+        let partials: Vec<f32> = stream.clone_dtoh(&rotated)?;
+        let groups = k / group;
+        let biased = scales_dropping_group_zero(&partials, rows, groups);
+        let biased_d = stream.clone_htod(&biased)?;
+        let mut biased_args = args;
+        biased_args.scales = biased_d.device_ptr(stream).0;
+        super::launch_group_quant(
+            stream,
+            fns,
+            &biased_args,
+            u32::try_from(rows)?,
+            u32::try_from(k)?,
+            u32::try_from(group)?,
+        )?;
+        stream.synchronize()?;
+        let mutant_codes: Vec<i8> = stream.clone_dtoh(&codes)?;
+        let moved = count_i8(&mutant_codes, &got_codes);
+        println!("CONVROT_GROUP_INDEX rows={rows} k={k} differ={moved}");
+        ensure!(moved > 0, "off-by-one group index reproduced the codes");
+        Ok(())
+    }
+
+    fn production_store_matches_group_dot(
+        device: &Device,
+        fns: &super::ConvrotFns,
+        rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        let group = 256usize;
+        let recompute =
+            super::recompute_rotated(u32::try_from(rows)?, u32::try_from(k)?, fns.l2_bytes)
+                .context("convrot rotated bytes")?;
+        ensure!(!recompute, "rows {rows} k {k} recomputed");
+        let x_f32 = activation(rows, k);
+        let x_bf16: Vec<bf16> = x_f32.iter().copied().map(bf16::from_f32).collect();
+        drop(x_f32);
+        let stream = &device.stream;
+        let x_d = stream.clone_htod(&x_bf16)?;
+        drop(x_bf16);
+        let rotated = stream.alloc_zeros::<f32>(rows * k)?;
+        let codes = stream.alloc_zeros::<i8>(rows * k)?;
+        let scales = stream.alloc_zeros::<f32>(rows)?;
+        let args = super::ConvrotArgs {
+            x: x_d.device_ptr(stream).0,
+            qweight: 0,
+            wscale: 0,
+            y: 0,
+            rotated: rotated.device_ptr(stream).0,
+            codes: codes.device_ptr(stream).0,
+            scales: scales.device_ptr(stream).0,
+            rows: i32::try_from(rows)?,
+            k: i32::try_from(k)?,
+            n: 40,
+            group: i32::try_from(group)?,
+        };
+        super::launch_rotate_quant(stream, fns, &args)?;
+        stream.synchronize()?;
+        let produced: Vec<f32> = stream.clone_dtoh(&rotated)?;
+        let direct = stream.alloc_zeros::<f32>(rows * k)?;
+        let mut direct_args = args;
+        direct_args.rotated = direct.device_ptr(stream).0;
+        super::launch_stored_rotate_quant(
+            stream,
+            fns,
+            &direct_args,
+            u32::try_from(rows)?,
+            u32::try_from(k)?,
+            u32::try_from(group)?,
+        )?;
+        stream.synchronize()?;
+        let stored: Vec<f32> = stream.clone_dtoh(&direct)?;
+        let differ = count_f32(&produced, &stored);
+        println!(
+            "CONVROT_STORE rows={rows} k={k} rotated={differ} l2={}",
+            fns.l2_bytes
+        );
+        ensure!(differ == 0, "rows {rows} k {k} rotated differ {differ}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn convrot_recompute_matches_the_stored_path() -> Result<()> {
+        let device = Device::new(0)?;
+        let fns = load_convrot(&device.ctx)?;
+        ensure!(
+            fns.l2_bytes == u64::try_from(device.info.l2_bytes)?,
+            "setup L2 {} device L2 {}",
+            fns.l2_bytes,
+            device.info.l2_bytes
+        );
+        println!("CONVROT_L2 bytes={}", fns.l2_bytes);
+        production_store_matches_group_dot(&device, &fns, 1000, 14_336)?;
+        for (rows, k, mutant) in [
+            (41_770usize, 5_376usize, true),
+            (41_770, 7_168, false),
+            (41_770, 14_336, false),
+        ] {
+            compare_stored_and_recompute(&device, &fns, rows, k, mutant)?;
+        }
         Ok(())
     }
 }
