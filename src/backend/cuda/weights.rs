@@ -1932,6 +1932,7 @@ impl DenseStreaming {
         plan: crate::prefill::DensePlacement,
         d: &Device,
         order: Option<&[Vec<String>]>,
+        align_elements: usize,
     ) -> Result<Self> {
         use crate::experts::{catalogue::NativeRange, disk::DiskReader};
         let mut layers: Vec<_> = plan
@@ -1955,14 +1956,17 @@ impl DenseStreaming {
                 return Ok(());
             }
             let device_offset = layer.bytes;
-            let source_offset = layer.source_bytes;
+            let source_offset = if align_elements > 0 {
+                (layer.source_bytes + 2 * align_elements).next_multiple_of(2 * align_elements)
+            } else {
+                layer.source_bytes
+            };
             let device_bytes = device_slot_bytes(name, entry)?;
             layer.bytes = layer
                 .bytes
                 .checked_add(device_bytes)
                 .context("dense layer bytes overflow")?;
-            layer.source_bytes = layer
-                .source_bytes
+            layer.source_bytes = source_offset
                 .checked_add(entry.bytes)
                 .context("dense layer source bytes overflow")?;
             layer.entries.push(DenseEntry {
@@ -2062,8 +2066,12 @@ impl DenseStreaming {
             };
         for (index, layer) in layers.iter_mut().enumerate() {
             if plan.host[index] {
-                layer.host =
-                    Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.source_bytes, 0)? });
+                let held = if align_elements > 0 {
+                    layer.source_bytes + 4 * align_elements
+                } else {
+                    layer.source_bytes
+                };
+                layer.host = Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(held, 0)? });
                 #[cfg(test)]
                 allocation_record(&format!("pinned_layer{index}"), 0, layer.source_bytes)?;
             }
@@ -2781,7 +2789,7 @@ impl WeightCatalog {
             );
         }
         let started = Instant::now();
-        let mut dense = DenseStreaming::new(dir, &manifest, plan, d, order.as_deref())?;
+        let mut dense = DenseStreaming::new(dir, &manifest, plan, d, order.as_deref(), 0)?;
         let mut offsets = vec![0; layers.len()];
         let gemma = matches!(
             spec.architecture,
@@ -3679,7 +3687,7 @@ mod tests {
                     plan.slots.iter().all(Option::is_some),
                     "streaming gate has a resident layer"
                 );
-                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
+                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None, 0)?;
                 if host_layers == 4 {
                     ensure!(
                         dense.disk.is_none() && dense.events.is_none(),
@@ -3767,7 +3775,7 @@ mod tests {
             for skip_reclaim in [false, true] {
                 let plan =
                     crate::prefill::DensePlacement::new(&[per_layer; 4], None, 2 * per_layer, 0)?;
-                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
+                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None, 0)?;
                 populate(&mut dense)?;
                 dense.skip_reclaim = skip_reclaim;
                 let gate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));

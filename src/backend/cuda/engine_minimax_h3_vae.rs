@@ -404,6 +404,7 @@ impl ImageDecoder {
                     plan,
                     device,
                     Some(&order),
+                    0,
                 )?)
             } else {
                 None

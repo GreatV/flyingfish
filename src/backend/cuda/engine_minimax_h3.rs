@@ -3031,8 +3031,14 @@ fn place_layers(
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
-        let mut dense =
-            crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
+        let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
+            &dir,
+            base.manifest,
+            plan,
+            d,
+            None,
+            base.reader.align_elements()?,
+        )?;
         let align_elements = base.reader.align_elements()?;
         let mut requests = Vec::new();
         let mut checks = Vec::new();
@@ -3043,13 +3049,17 @@ fn place_layers(
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
             ensure!(
-                host.len() == source_layers[layer],
+                host.len() >= source_layers[layer],
                 "{name}: pinned copy size"
             );
             let mut source_offset = 0usize;
             for (role, (offset, _)) in &layout {
                 let tensor = format!("{name}.{role}");
                 let entry = &base.manifest.entries[&tensor];
+                if entry.quant.is_some() {
+                    source_offset =
+                        (source_offset + 2 * align_elements).next_multiple_of(2 * align_elements);
+                }
                 let at = if entry.quant.is_some() {
                     source_offset
                 } else {
@@ -3471,6 +3481,7 @@ fn place_stored_layers(
             plan,
             d,
             Some(&order),
+            base.reader.align_elements()?,
         )?;
         for (layer, names) in order.iter().enumerate() {
             if !dense.plan.host[layer] {
