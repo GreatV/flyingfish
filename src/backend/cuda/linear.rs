@@ -1380,15 +1380,16 @@ pub(crate) enum BoundFfn {
 
 impl BoundFfn {
     pub fn bind(spec: &crate::model_spec::ModelSpec, linear: &mut LayerLinearPlan) -> Result<Self> {
-        let Some(moe) = spec
-            .moe
-            .filter(|_| linear.projections.contains_key("mlp.gate.weight"))
-        else {
+        let Some(moe) = spec.moe.filter(|_| {
+            linear
+                .projections
+                .contains_key(crate::checkpoint::GLM_MLP_GATE)
+        }) else {
             return Ok(Self::Dense);
         };
         let h = spec.hidden;
         let i = moe.shared_intermediate;
-        let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
+        let router = linear.take_bf16(crate::checkpoint::GLM_MLP_GATE, [moe.experts, h])?;
         if spec.architecture == crate::model_spec::Architecture::Glm5Next {
             let mut take = |role: &str| -> Result<LinearWeightRef> {
                 let projection = linear
@@ -1410,9 +1411,9 @@ impl BoundFfn {
             return Ok(Self::Native {
                 router,
                 shared: Box::new([
-                    take("mlp.shared_experts.gate_proj.weight")?,
-                    take("mlp.shared_experts.up_proj.weight")?,
-                    take("mlp.shared_experts.down_proj.weight")?,
+                    take(crate::checkpoint::GLM_MLP_SHARED_GATE)?,
+                    take(crate::checkpoint::GLM_MLP_SHARED_UP)?,
+                    take(crate::checkpoint::GLM_MLP_SHARED_DOWN)?,
                 ]),
             });
         }
@@ -3347,7 +3348,7 @@ mod tests {
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
         let shapes = [
-            ("mlp.gate.weight", [256, 2048]),
+            (crate::checkpoint::GLM_MLP_GATE, [256, 2048]),
             ("mlp.shared_expert.gate_proj.weight", [512, 2048]),
             ("mlp.shared_expert.up_proj.weight", [512, 2048]),
             ("mlp.shared_expert.down_proj.weight", [2048, 512]),
@@ -3591,7 +3592,7 @@ mod tests {
                         data_offsets: [0, q_bytes as u64],
                         scope: TensorScope::Text,
                         layer: Some(5),
-                        role: "self_attn.q_proj.weight".into(),
+                        role: crate::checkpoint::GLM_ATTN_Q_PROJ.into(),
                         scale_name: None,
                         quant: None,
                         swap_halves: false,
@@ -3609,7 +3610,7 @@ mod tests {
                         data_offsets: [q_bytes as u64, (q_bytes + v_bytes) as u64],
                         scope: TensorScope::Text,
                         layer: Some(5),
-                        role: "self_attn.v_proj.weight".into(),
+                        role: crate::checkpoint::GLM_ATTN_V_PROJ.into(),
                         scale_name: None,
                         quant: None,
                         swap_halves: false,
@@ -3626,7 +3627,7 @@ mod tests {
             Ok(LayerLinearPlan {
                 projections: [
                     (
-                        "self_attn.q_proj.weight".to_owned(),
+                        crate::checkpoint::GLM_ATTN_Q_PROJ.to_owned(),
                         BoundProjection {
                             resident: LinearWeightRef::Bf16(tq),
                             #[cfg(feature = "cuda")]
@@ -3638,7 +3639,7 @@ mod tests {
                         },
                     ),
                     (
-                        "self_attn.v_proj.weight".to_owned(),
+                        crate::checkpoint::GLM_ATTN_V_PROJ.to_owned(),
                         BoundProjection {
                             resident: LinearWeightRef::Bf16(tv),
                             #[cfg(feature = "cuda")]
@@ -3659,22 +3660,22 @@ mod tests {
         contiguous.fuse_pair(
             &dequant,
             &manifest,
-            "self_attn.q_proj.weight",
-            "self_attn.v_proj.weight",
-            "self_attn.qv_proj.weight",
+            crate::checkpoint::GLM_ATTN_Q_PROJ,
+            crate::checkpoint::GLM_ATTN_V_PROJ,
+            crate::checkpoint::GLM_ATTN_QV_PROJ,
         )?;
         assert!(
             !contiguous
                 .projections
-                .contains_key("self_attn.q_proj.weight")
+                .contains_key(crate::checkpoint::GLM_ATTN_Q_PROJ)
         );
         assert!(
             !contiguous
                 .projections
-                .contains_key("self_attn.v_proj.weight")
+                .contains_key(crate::checkpoint::GLM_ATTN_V_PROJ)
         );
         let LinearWeightRef::Bf16(fused) =
-            contiguous.projections["self_attn.qv_proj.weight"].resident
+            contiguous.projections[crate::checkpoint::GLM_ATTN_QV_PROJ].resident
         else {
             panic!("expected BF16 fused projection");
         };
@@ -3687,9 +3688,9 @@ mod tests {
             .fuse_pair(
                 &dequant,
                 &manifest,
-                "self_attn.q_proj.weight",
-                "self_attn.v_proj.weight",
-                "self_attn.qv_proj.weight",
+                crate::checkpoint::GLM_ATTN_Q_PROJ,
+                crate::checkpoint::GLM_ATTN_V_PROJ,
+                crate::checkpoint::GLM_ATTN_QV_PROJ,
             )
             .unwrap_err()
             .to_string();
@@ -4298,7 +4299,7 @@ mod tests {
                             safetensors::Dtype::U8,
                             vec![n, k / 2],
                             codes_host.len(),
-                            "mlp.gate_proj.weight",
+                            crate::checkpoint::GLM_MLP_GATE_PROJ,
                             Some(scale_name.clone()),
                         ),
                     ),
@@ -4393,7 +4394,7 @@ mod tests {
                 )?);
                 layer.run(
                     &blas,
-                    "mlp.gate_proj.weight",
+                    crate::checkpoint::GLM_MLP_GATE_PROJ,
                     if m == 1 {
                         ExecutionPhase::Decode
                     } else {
@@ -5069,7 +5070,7 @@ mod tests {
                 layer_no_arena.prepare(&blas, m_below as u32)?;
                 layer_no_arena.run(
                     &blas,
-                    "mlp.gate_proj.weight",
+                    crate::checkpoint::GLM_MLP_GATE_PROJ,
                     ExecutionPhase::Prefill,
                     view(
                         &x_bound_dev,
@@ -5103,7 +5104,7 @@ mod tests {
                     layer_no_arena
                         .run(
                             &blas,
-                            "mlp.gate_proj.weight",
+                            crate::checkpoint::GLM_MLP_GATE_PROJ,
                             ExecutionPhase::Prefill,
                             view(
                                 &x_bound_dev,
@@ -5174,7 +5175,7 @@ mod tests {
                 layer_zero.prepare(&blas, m_at as u32)?;
                 layer_zero.run(
                     &blas,
-                    "mlp.gate_proj.weight",
+                    crate::checkpoint::GLM_MLP_GATE_PROJ,
                     ExecutionPhase::Prefill,
                     view(
                         &x_bound_dev,
@@ -5207,7 +5208,7 @@ mod tests {
 
                 layer_zero.run(
                     &blas,
-                    "mlp.gate_proj.weight",
+                    crate::checkpoint::GLM_MLP_GATE_PROJ,
                     ExecutionPhase::Prefill,
                     view(
                         &x_bound_dev,
@@ -5233,7 +5234,7 @@ mod tests {
                 layer_zero.materialize(&blas, stream)?;
                 layer_zero.run(
                     &blas,
-                    "mlp.gate_proj.weight",
+                    crate::checkpoint::GLM_MLP_GATE_PROJ,
                     ExecutionPhase::Prefill,
                     view(
                         &x_bound_dev,
