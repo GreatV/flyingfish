@@ -120,25 +120,14 @@ impl DeepseekEngram {
             .deepseek_v41
             .as_ref()
             .context("Engram model geometry missing")?;
-        let runtime = settings
-            .runtime_dir
-            .as_ref()
-            .context("DeepSeek Engram requires runtime_dir with engram-hash-v1.json")?;
-        let path = runtime.join("engram-hash-v1.json");
-        let setup: EngramHashSetup = serde_json::from_slice(
-            &std::fs::read(&path)
-                .with_context(|| format!("read Engram hash record {}", path.display()))?,
-        )
-        .context("decode Engram hash record")?;
-        setup.validate_model(model)?;
-        setup.validate_samples(model)?;
+        let setup = EngramHashSetup::derive(model)?;
         ensure!(
             setup.layer_ids == ds.engram_layer_ids
                 && setup.layer_rows()? == ds.engram_num_embeddings
                 && setup.ngram() == ds.engram_max_ngram_size as usize
                 && setup.heads() == ds.engram_n_heads as usize
                 && ds.engram_head_dim as usize == crate::engram::ENGRAM_HEAD_DIM,
-            "Engram hash record differs from model geometry"
+            "Engram derived setup differs from model geometry"
         );
         let rows = settings.spec_budget.rows().min(capacity);
         let width = setup.hash_width();
@@ -5526,7 +5515,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the DeepSeek checkpoint, runtime hash record and frozen Engram reference"]
+    #[ignore = "requires the DeepSeek checkpoint and frozen Engram reference"]
     fn deepseek_engram_matches_model_definition() -> Result<()> {
         ensure!(
             std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -6897,11 +6886,6 @@ mod tests {
         let runtime_dir =
             std::env::temp_dir().join(format!("flyingfish-deepseek-layers-{}", std::process::id()));
         std::fs::create_dir_all(&runtime_dir)?;
-        let hash_record = PathBuf::from(std::env::var_os("FF_DS41_ENGRAM_HASH").context(
-            "FF_DS41_ENGRAM_HASH missing: the accepted engram-hash-v1 record is required",
-        )?);
-        std::fs::copy(&hash_record, runtime_dir.join("engram-hash-v1.json"))
-            .with_context(|| format!("copy {}", hash_record.display()))?;
         let settings = Settings {
             tree_builder: TreeBuilder::Waves,
             spec_budget: SpecBudget::Chain,
@@ -7503,7 +7487,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "cuda")]
-    #[ignore = "GPU lease; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL, FF_DS41_ENGRAM_HASH"]
+    #[ignore = "GPU lease; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL"]
     fn deepseek_expert_waves_match_gpu() -> Result<()> {
         use super::super::moe::{PoolControl, delay_stream};
 
@@ -7680,10 +7664,6 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&runtime_dir)?;
-        let hash_record = PathBuf::from(std::env::var_os("FF_DS41_ENGRAM_HASH").context(
-            "FF_DS41_ENGRAM_HASH missing: the accepted engram-hash-v1 record is required",
-        )?);
-        std::fs::copy(&hash_record, runtime_dir.join("engram-hash-v1.json"))?;
         let load = |forced: Option<u64>, capacity: usize| -> Result<Engine> {
             crate::experts::plan::FORCED_WAVES.set(forced);
             let loaded = Engine::load(
@@ -7839,7 +7819,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GPU lease; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL, FF_DS41_ENGRAM_HASH"]
+    #[ignore = "GPU lease; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL"]
     fn deepseek_expert_tier_miss_eviction_refill_gpu() -> Result<()> {
         use crate::experts::plan::Tier;
 
@@ -7887,10 +7867,6 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&runtime_dir)?;
-        let hash_record = PathBuf::from(std::env::var_os("FF_DS41_ENGRAM_HASH").context(
-            "FF_DS41_ENGRAM_HASH missing: the accepted engram-hash-v1 record is required",
-        )?);
-        std::fs::copy(&hash_record, runtime_dir.join("engram-hash-v1.json"))?;
         let settings = Settings {
             tree_builder: TreeBuilder::Waves,
             spec_budget: SpecBudget::Chain,
@@ -11630,11 +11606,6 @@ mod tests {
         let runtime_dir =
             std::env::temp_dir().join(format!("flyingfish-deepseek-layer0-{}", std::process::id()));
         std::fs::create_dir_all(&runtime_dir)?;
-        let hash_record = PathBuf::from(std::env::var_os("FF_DS41_ENGRAM_HASH").context(
-            "FF_DS41_ENGRAM_HASH missing: the accepted engram-hash-v1 record is required",
-        )?);
-        std::fs::copy(&hash_record, runtime_dir.join("engram-hash-v1.json"))
-            .with_context(|| format!("copy {}", hash_record.display()))?;
         let settings = Settings {
             tree_builder: TreeBuilder::Waves,
             spec_budget: SpecBudget::Chain,
