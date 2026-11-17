@@ -12252,6 +12252,15 @@ mod tests {
                 facts.host_available_bytes.is_some() && dense.plan.slot_bytes > 0,
                 "4096 placement kept every block resident"
             );
+            let slot_count = dense
+                .plan
+                .slots
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .map(|index| index + 1)
+                .context("4096 placement kept every block resident")?;
             let (plan, again) = super::plan_dense_layers(
                 (
                     &sizing.layers,
@@ -12266,6 +12275,7 @@ mod tests {
                     facts.total_bytes,
                     facts.host_available_bytes,
                 ),
+                slot_count,
             )?;
             let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
             let host = plan.host.iter().filter(|flag| **flag).count();
