@@ -350,10 +350,12 @@ fn to3d_hi3d_cli_equals_the_library_entry() -> Result<()> {
     ensure!(resolution == 512, "library resolution {resolution}");
     assert_mesh_equal("hi3d seed 0", &cli_mesh, &library_mesh)?;
 
-    // Control: a different coarse mesh must change the output.
+    // Control: a deformed coarse mesh must change the output. The
+    // voxelizer normalizes by the mesh's own bounding box, so a uniform
+    // translation is absorbed; every 7th vertex is moved instead.
     let mut shifted = vertices.clone();
-    for value in shifted.iter_mut().step_by(3) {
-        *value += 0.125;
+    for vertex in shifted.as_chunks_mut::<3>().0.iter_mut().step_by(7) {
+        vertex[2] += 0.5;
     }
     let shifted_mesh = flyingfish::sparse::SparseMesh {
         vertices: shifted,
