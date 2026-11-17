@@ -310,6 +310,18 @@ enum Command {
         )]
         json: bool,
     },
+    Speak {
+        #[arg(value_name = "TEXT", help = "Text to synthesize, or - to read stdin")]
+        text: String,
+        #[arg(long, default_value_t = 42, help = "Sampling seed")]
+        seed: u64,
+        #[arg(
+            short = 'o',
+            long = "output",
+            help = "Output mono 24 kHz WAV; stdout if omitted"
+        )]
+        output: Option<PathBuf>,
+    },
     Music {
         #[arg(long, help = "Music description in natural language")]
         prompt: String,
@@ -802,8 +814,10 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
     flyingfish::backend::with_verbose(cli.verbose, || {
         let waveform = flyingfish::media::read_wav(input_bytes(&args.input)?.as_slice(), 16000)?;
         let class = model_class(&cli.model)?;
-        if args.stream && class != "nemo" {
-            bail!("streaming transcription is supported only for parakeet realtime EOU");
+        if args.stream && class != "nemo" && class != "Nemotron3_5AsrForRNNT" {
+            bail!(
+                "streaming transcription is supported only for parakeet realtime EOU and Nemotron 3.5 ASR"
+            );
         }
         let options = flyingfish::RunOptions {
             device: cli.device,
@@ -892,6 +906,9 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
                     options,
                 )?,
                 "nemo" => flyingfish::eou::transcribe(&cli.model, &waveform, args.stream, options)?,
+                "Nemotron3_5AsrForRNNT" => {
+                    flyingfish::nemotron::transcribe(&cli.model, &waveform, args.stream, options)?
+                }
                 _ => bail!("unsupported transcription architecture {class}"),
             };
             match args.format {
@@ -1120,6 +1137,49 @@ fn image(cli: &Cli, request: ImageCliRequest, output: &Path, json: bool) -> Resu
             );
         } else {
             println!("{}", output.display());
+        }
+        Ok(())
+    })
+}
+
+fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> {
+    let _ = (cli, text, seed, output);
+    #[cfg(not(feature = "cuda"))]
+    bail!("speak requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        let text = if text == "-" {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            input
+        } else {
+            text.to_owned()
+        };
+        let options = flyingfish::RunOptions {
+            device: cli.device,
+            runtime_dir: cli
+                .kernels
+                .runtime_dir
+                .clone()
+                .context("--runtime-dir is required for speak")?,
+            verbose: cli.verbose,
+        };
+        let speech = flyingfish::breeze::speak(&cli.model, &text, seed, options)?;
+        let mut bytes = Vec::new();
+        flyingfish::media::write_wav(&mut bytes, speech.sampling_rate, 1, &speech.samples)?;
+        if let Some(output) = output {
+            ensure!(
+                output.extension().is_some_and(|value| value == "wav"),
+                "speak output must end in .wav"
+            );
+            let output = output_path(output, &cli.model)?;
+            if let Err(error) = fs::write(&output, bytes) {
+                let _ = fs::remove_file(&output);
+                return Err(error.into());
+            }
+            println!("{}", output.display());
+        } else {
+            std::io::stdout().write_all(&bytes)?;
         }
         Ok(())
     })
@@ -1741,6 +1801,7 @@ fn run() -> Result<()> {
         #[cfg(not(feature = "cuda"))]
         Command::To3d { .. } => bail!("to-3d requires CUDA"),
         Command::Video { .. } => video(&cli),
+        Command::Speak { text, seed, output } => speak(&cli, text, *seed, output.as_deref()),
         Command::Music {
             prompt,
             lyrics,
@@ -2393,6 +2454,41 @@ mod tests {
             ])
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn speak_parse_covers_text_stdin_seed_and_wav_output() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "flyingfish",
+            "--model",
+            "model",
+            "--runtime-dir",
+            "runtime",
+            "speak",
+            "-",
+            "--seed",
+            "7",
+            "-o",
+            "speech.wav",
+        ])?;
+        match cli.command {
+            Command::Speak { text, seed, output } => {
+                assert_eq!(text, "-");
+                assert_eq!(seed, 7);
+                assert_eq!(output, Some(PathBuf::from("speech.wav")));
+            }
+            _ => panic!("speak subcommand was not selected"),
+        }
+        let default = Cli::try_parse_from(["flyingfish", "--model", "model", "speak", "Hello"])?;
+        assert!(matches!(
+            default.command,
+            Command::Speak {
+                seed: 42,
+                output: None,
+                ..
+            }
+        ));
         Ok(())
     }
 

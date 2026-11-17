@@ -59,7 +59,7 @@ jobs:
         with:
           toolchain: 1.99.0
           components: rustfmt, clippy
-      - run: cargo fmt --all --check
+      - run: cargo --locked fmt --all --check
 
   clippy-no-cuda:
     needs: changes
@@ -74,8 +74,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: no-cuda
-      - run: cargo clippy --no-default-features --all-targets -- -D warnings
-      - run: cargo test --no-default-features --all-targets
+      - run: cargo --locked clippy --no-default-features --all-targets -- -D warnings
+      - run: cargo --locked test --no-default-features --all-targets
 
   clippy-cuda:
     needs: changes
@@ -101,10 +101,10 @@ jobs:
       - name: Install pinned native device toolchain
         run: |
           rustup toolchain install nightly-2026-10-06 --profile minimal --component rust-src,llvm-tools,llvm-bitcode-linker,rustfmt,clippy --target nvptx64-nvidia-cuda
-          RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 build --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release
+          RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 --locked build --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release
       - name: Check native device source
         run: |
-          cargo +nightly-2026-10-06 fmt --manifest-path device/Cargo.toml --all --check
-          RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 clippy --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release --offline -- -D warnings
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
+          cargo +nightly-2026-10-06 --locked fmt --manifest-path device/Cargo.toml --all --check
+          RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 --locked clippy --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release --offline -- -D warnings
+      - run: cargo --locked clippy --all-targets -- -D warnings
+      - run: cargo --locked test --workspace --all-targets

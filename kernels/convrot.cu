@@ -148,22 +148,67 @@ extern "C" __global__ void convrot_group_dot(const float* __restrict__ x, float*
     }
 }
 
-// s_x = max(|dot|, 1e-12) / 127. q = rint(dot * (1/s_x)), clamped to [-127, 127].
+// Block 256. Dynamic smem is tile_rows * k f32. Each live row is loaded once, coalesced.
+// Warp peaks reuse that row's first 8 floats, then the reciprocal does. k >= 8.
+// s = max(peak, 1e-12) / 127. q = rint(v * (1/s)), clamped to [-127, 127].
+constexpr int CONVROT_QUANT_THREADS = 256;
+
 extern "C" __global__ void convrot_quantize(const float* __restrict__ xr, int8_t* __restrict__ codes,
-                                            float* __restrict__ scales, int rows, int k) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= rows) return;
-    const float* src = xr + static_cast<long long>(row) * k;
-    float peak = 0.f;
-    for (int i = 0; i < k; ++i) peak = fmaxf(peak, fabsf(src[i]));
-    const float scale = __fdiv_rn(fmaxf(peak, 1e-12f), 127.f);
-    scales[row] = scale;
-    const float inv = __fdiv_rn(1.f, scale);
-    int8_t* dst = codes + static_cast<long long>(row) * k;
-    for (int i = 0; i < k; ++i) {
-        float q = rintf(__fmul_rn(src[i], inv));
-        q = fminf(fmaxf(q, -127.f), 127.f);
-        dst[i] = static_cast<int8_t>(static_cast<int>(q));
+                                            float* __restrict__ scales, int rows, int k, int tile_rows) {
+    extern __shared__ float quant_tile[];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    const int row0 = static_cast<int>(blockIdx.x) * tile_rows;
+    for (int r = 0; r < tile_rows; ++r) {
+        const int row = row0 + r;
+        if (row < rows) {
+            const float* src = xr + static_cast<long long>(row) * k;
+            float* dst = quant_tile + static_cast<long long>(r) * k;
+            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS) dst[col] = src[col];
+        }
+    }
+    __syncthreads();
+    for (int r = 0; r < tile_rows; ++r) {
+        const int row = row0 + r;
+        const bool live = row < rows;
+        float* row_tile = quant_tile + static_cast<long long>(r) * k;
+        float peak = 0.f;
+        if (live) {
+            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS)
+                peak = fmaxf(peak, fabsf(row_tile[col]));
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, off));
+        __syncthreads();
+        float saved = 0.f;
+        if (live && tid < 8) saved = row_tile[tid];
+        __syncthreads();
+        if (live && lane == 0) row_tile[wid] = peak;
+        __syncthreads();
+        if (live && tid == 0) {
+            float reduced = 0.f;
+            for (int w = 0; w < 8; ++w) reduced = fmaxf(reduced, row_tile[w]);
+            const float scale = __fdiv_rn(fmaxf(reduced, 1e-12f), 127.f);
+            scales[row] = scale;
+            row_tile[0] = __fdiv_rn(1.f, scale);
+        }
+        __syncthreads();
+        float inv = 0.f;
+        if (live) inv = row_tile[0];
+        __syncthreads();
+        if (live && tid < 8) row_tile[tid] = saved;
+        __syncthreads();
+        if (live) {
+            int8_t* dst = codes + static_cast<long long>(row) * k;
+            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS) {
+                float q = rintf(__fmul_rn(row_tile[col], inv));
+                q = fminf(fmaxf(q, -127.f), 127.f);
+                dst[col] = static_cast<int8_t>(static_cast<int>(q));
+            }
+        }
+        __syncthreads();
     }
 }
 

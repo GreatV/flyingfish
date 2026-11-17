@@ -442,6 +442,8 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
     }
     let d_probs = s.clone_htod(&probs)?;
     let d_pick = s.clone_htod(&vec![-1i32; srows])?;
+    let mut d_categorical_history = s.alloc_zeros::<i32>(svocab)?;
+    let d_counter_zero = s.clone_htod(&[0u64])?;
     unsafe {
         s.launch_builder(&categorical)
             .arg(&d_probs)
@@ -450,7 +452,10 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&1234u64)
             .arg(&9u64)
+            .arg(&d_counter_zero)
             .arg(&256i32)
+            .arg(&mut d_categorical_history)
+            .arg(&0i32)
             .launch(crate::backend::cuda::ops::grid(srows, 256u32))?;
     }
     let picks = s.clone_dtoh(&d_pick)?;
@@ -468,7 +473,10 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&1234u64)
             .arg(&9u64)
+            .arg(&d_counter_zero)
             .arg(&256i32)
+            .arg(&mut d_categorical_history)
+            .arg(&0i32)
             .launch(crate::backend::cuda::ops::grid(srows, 256u32))?;
     }
     let repeat = s.clone_dtoh(&d_pick2)?;
@@ -488,7 +496,10 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
             .arg(&(svocab as i64))
             .arg(&0u64)
             .arg(&38471471u64)
+            .arg(&d_counter_zero)
             .arg(&256i32)
+            .arg(&mut d_categorical_history)
+            .arg(&0i32)
             .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
     }
     let gap_pick = s.clone_dtoh(&d_gap_pick)?[0];
@@ -497,6 +508,189 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
     let _ = bf16::ZERO;
     println!(
         "DIFFUSION_SAMPLER temperature=bitexact entropy_rel={worst}/{worst_prod} accept=exact argmax=exact philox_4sigma_ok categorical_hits={hits}/{srows}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
+fn breeze_sampling_ops_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let sample = crate::backend::cuda::cubin::module(&device.ctx, "sample")?;
+    let distribution = sample.load_function("distribution_rows_bf16")?;
+    let categorical = sample.load_function("categorical_sample_rows")?;
+    let sampling = crate::sampling::Sampling::new(2.0, 3, 0.8, 1.0)?;
+    let logits = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+    let rows = 64usize;
+    let vocab = logits.len();
+    let host: Vec<bf16> = logits
+        .iter()
+        .cycle()
+        .take(rows * vocab)
+        .map(|value| bf16::from_f32(*value))
+        .collect();
+    let d_logits = s.clone_htod(&host)?;
+    let d_probs = s.alloc_zeros::<f32>(rows * vocab)?;
+    let mut d_history = s.alloc_zeros::<i32>(vocab)?;
+    let d_counter_three = s.clone_htod(&[3u64])?;
+    let run_distribution =
+        |history: &cudarc::driver::CudaSlice<i32>, allow: i32, penalty: f32| -> Result<()> {
+            unsafe {
+                s.launch_builder(&distribution)
+                    .arg(&d_logits)
+                    .arg(&d_probs)
+                    .arg(&(rows as i32))
+                    .arg(&(vocab as i64))
+                    .arg(&2.0f32)
+                    .arg(&3i32)
+                    .arg(&0.8f32)
+                    .arg(history)
+                    .arg(&penalty)
+                    .arg(&6i32)
+                    .arg(&6i32)
+                    .arg(&allow)
+                    .launch(crate::backend::cuda::ops::grid(rows, 256u32))?;
+            }
+            Ok(())
+        };
+    run_distribution(&d_history, -1, 1.0)?;
+    let expected = sampling.probabilities(&logits, &[], (6, 6), None)?;
+    let got = s.clone_dtoh(&d_probs)?;
+    for row in got.chunks_exact(vocab) {
+        for (actual, expected) in row.iter().zip(&expected) {
+            ensure!(
+                (actual - expected).abs() <= 1e-5,
+                "distribution mismatch actual={actual} expected={expected}"
+            );
+        }
+        ensure!(row[6] == 0.0 && row[4] == 0.0, "top-k/reserved mask");
+    }
+    run_distribution(&d_history, 6, 1.0)?;
+    let allowed = s.clone_dtoh(&d_probs)?;
+    ensure!(allowed[6] > 0.0, "reserved allow token");
+    run_distribution(&d_history, -1, 1.0)?;
+    let sample_with = |seed: u64| -> Result<Vec<i32>> {
+        let out = s.alloc_zeros::<i32>(rows)?;
+        let mut untracked = s.alloc_zeros::<i32>(vocab)?;
+        unsafe {
+            s.launch_builder(&categorical)
+                .arg(&d_probs)
+                .arg(&out)
+                .arg(&(rows as i32))
+                .arg(&(vocab as i64))
+                .arg(&seed)
+                .arg(&1u64)
+                .arg(&d_counter_three)
+                .arg(&256i32)
+                .arg(&mut untracked)
+                .arg(&0i32)
+                .launch(crate::backend::cuda::ops::grid(rows, 256u32))?;
+        }
+        Ok(s.clone_dtoh(&out)?)
+    };
+    let first = sample_with(7)?;
+    let repeat = sample_with(7)?;
+    ensure!(first == repeat, "same-seed categorical replay");
+    let changed = sample_with(8)?;
+    ensure!(
+        first.iter().zip(&changed).filter(|(a, b)| a != b).count() > 0,
+        "seed+1 control"
+    );
+    ensure!(
+        first
+            .iter()
+            .all(|id| (0..vocab as i32).contains(id) && *id != 6 && *id != 4),
+        "sampled masked token"
+    );
+    let tracked = s.alloc_zeros::<i32>(1)?;
+    unsafe {
+        s.launch_builder(&categorical)
+            .arg(&d_probs)
+            .arg(&tracked)
+            .arg(&1i32)
+            .arg(&(vocab as i64))
+            .arg(&7u64)
+            .arg(&1u64)
+            .arg(&d_counter_three)
+            .arg(&256i32)
+            .arg(&mut d_history)
+            .arg(&1i32)
+            .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
+    }
+    let tracked = s.clone_dtoh(&tracked)?[0];
+    let history = s.clone_dtoh(&d_history)?;
+    ensure!(
+        history.iter().sum::<i32>() == 1 && history[tracked as usize] == 1,
+        "tracked history pick={tracked} state={history:?}"
+    );
+    let penalized = crate::sampling::Sampling::new(2.0, 3, 0.8, 1.1)?.probabilities(
+        &logits,
+        &[tracked as u32],
+        (6, 6),
+        None,
+    )?;
+    run_distribution(&d_history, -1, 1.1)?;
+    let actual = s.clone_dtoh(&d_probs)?;
+    let maximum = actual
+        .iter()
+        .zip(penalized.iter().cycle())
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(maximum <= 1e-5, "repetition distribution max={maximum}");
+    let detected = actual
+        .iter()
+        .zip(expected.iter().cycle())
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(detected > 0.001, "omit-penalty GPU control max={detected}");
+    let tie_logits = [
+        4.0f32, 4.0, 4.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0,
+    ];
+    let d_tie_logits = s.clone_htod(
+        &tie_logits
+            .iter()
+            .map(|value| bf16::from_f32(*value))
+            .collect::<Vec<_>>(),
+    )?;
+    let d_tie_probs = s.alloc_zeros::<f32>(tie_logits.len())?;
+    unsafe {
+        s.launch_builder(&distribution)
+            .arg(&d_tie_logits)
+            .arg(&d_tie_probs)
+            .arg(&1i32)
+            .arg(&(tie_logits.len() as i64))
+            .arg(&1.0f32)
+            .arg(&2i32)
+            .arg(&1.0f32)
+            .arg(&d_history)
+            .arg(&1.0f32)
+            .arg(&14i32)
+            .arg(&14i32)
+            .arg(&15i32)
+            .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
+    }
+    let expected_tie = crate::sampling::Sampling::new(1.0, 2, 1.0, 1.0)?.probabilities(
+        &tie_logits,
+        &[],
+        (14, 14),
+        Some(15),
+    )?;
+    let actual_tie = s.clone_dtoh(&d_tie_probs)?;
+    let tie_maximum = actual_tie
+        .iter()
+        .zip(&expected_tie)
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(tie_maximum <= 1e-5, "top-k tie max={tie_maximum}");
+    ensure!(actual_tie[2] > 0.001, "exact-k GPU control");
+    println!(
+        "BREEZE_SAMPLER PASS rows=64 top_k=3 top_p=0.8 reserved=6 allow=6 same_seed=exact seed_plus_one=different repetition_max={maximum} omit_penalty={detected} tie_max={tie_maximum} exact_k_tie_probability={}",
+        actual_tie[2]
     );
     Ok(())
 }
@@ -2393,6 +2587,47 @@ fn diffusion_real_load_gpu() -> Result<()> {
                 .is_err_and(|e| e.to_string().contains("exceed KV capacity")),
             "overflowing count must error at request time"
         );
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    anyhow::bail!("CUDA feature required");
+}
+
+/// Native categorical/renoise calls through the real DiffusionGemma engine.
+#[test]
+#[ignore = "requires coordinator-granted GPU window and FF_MODEL"]
+fn diffusion_native_sampling_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    #[cfg(feature = "cuda")]
+    {
+        use crate::backend::{Settings, SpecBudget, TreeBuilder};
+        let target =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let settings = Settings {
+            tree_builder: TreeBuilder::Waves,
+            spec_budget: SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            runtime_dir: None,
+            prefix_cache: false,
+            device_budget_gib: Some(14),
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let mut model =
+            crate::backend::cuda::engine::Engine::load(&target, 0, 4096, None, settings)?;
+        model.check_ready()?;
+        model.reset()?;
+        let first = model.diffusion_sample_for_test(1)?;
+        let second = model.diffusion_sample_for_test(2)?;
+        ensure!(first.len() == 256 && second.len() == 256, "sampling canvas");
+        ensure!(
+            first.iter().chain(&second).all(|id| *id >= 0),
+            "negative sampled id"
+        );
+        println!("DIFFUSION_NATIVE_PICKS step1={first:?} step2={second:?}");
         Ok(())
     }
     #[cfg(not(feature = "cuda"))]

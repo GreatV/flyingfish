@@ -69,6 +69,8 @@ struct Policy {
     thresholds: CudaSlice<f32>,
     keep: CudaSlice<u8>,
     codes: CudaSlice<u32>,
+    counter_base: CudaSlice<u64>,
+    history: CudaSlice<i32>,
     features: CudaSlice<bf16>,
     host_features: PinnedHostSlice<bf16>,
 }
@@ -81,6 +83,8 @@ impl Policy {
             thresholds: d.stream.alloc_zeros(2)?,
             keep: d.stream.alloc_zeros(200000)?,
             codes: d.stream.alloc_zeros(8)?,
+            counter_base: d.stream.alloc_zeros(1)?,
+            history: d.stream.alloc_zeros(200000)?,
             features: d.stream.alloc_zeros(32768)?,
             host_features: pinned_zeros(&d.ctx, 32768)?,
         })
@@ -597,7 +601,10 @@ impl Runtime {
                 .arg(&vocab)
                 .arg(&seed)
                 .arg(&draw)
+                .arg(&ptr(&self.policy.counter_base, &self.device))
                 .arg(&256i32)
+                .arg(&ptr(&self.policy.history, &self.device))
+                .arg(&0i32)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
                     block_dim: (256, 1, 1),
@@ -1597,6 +1604,51 @@ mod tests {
             "DEFECT paired CFG alias control isolated={isolated} detected={detected}"
         );
         println!("PASS music3_cfg_cache_control branch1_bits=0 branch0_perturbation_detected=true");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a GPU lease and the published Music3 checkpoint"]
+    fn music3_native_sampling_gpu() -> Result<()> {
+        let model =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let scratch = std::env::temp_dir().join(format!("ff-music3-draws-{}", std::process::id()));
+        std::fs::create_dir(&scratch)?;
+        let mut ar = Runtime::load(&model, &scratch, 1, 25, 22000000000, 0)?;
+        let mut records = Vec::new();
+        for codebook in 0..2 {
+            ar.device
+                .stream
+                .memset_zeros(&mut ar.policy.probabilities)?;
+            let (base, probabilities) = if codebook == 0 {
+                (151675, [0.2, 0.3, 0.25, 0.25])
+            } else {
+                (17, [0.1, 0.2, 0.3, 0.4])
+            };
+            for (offset, probability) in probabilities.into_iter().enumerate() {
+                ar.device.stream.memcpy_htod(
+                    &[probability],
+                    &mut ar
+                        .policy
+                        .probabilities
+                        .slice_mut(base + offset..base + offset + 1),
+                )?;
+            }
+            for seed in [42, 7] {
+                for draw in [0, 1, 17, 38471471] {
+                    ar.draw(codebook, seed, draw, None)?;
+                    let code = ar
+                        .device
+                        .stream
+                        .clone_dtoh(&ar.policy.codes.slice(codebook..codebook + 1))?[0];
+                    records.push((codebook, seed, draw, code));
+                }
+            }
+        }
+        ensure!(records.len() == 16, "draw count");
+        println!("MUSIC3_NATIVE_DRAWS {records:?}");
+        drop(ar);
+        std::fs::remove_dir_all(scratch)?;
         Ok(())
     }
 

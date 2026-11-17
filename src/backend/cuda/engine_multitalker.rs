@@ -2,14 +2,13 @@
 //! and the RNNT prediction/joint weights, loaded in place from the `.nemo` archive.
 
 use crate::{audio::LogMel, checkpoint::MappedCheckpoint, multitalker::MultitalkerSpec};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use std::{path::Path, sync::Arc};
 
 use super::Device;
 use super::engine_parakeet::{Linear, MultitalkerStep, ParakeetEncoder, linear, tensor};
-use super::ops::flat;
+use super::engine_rnnt::{RnntConfig, RnntDecodeStream, RnntDecoder, RnntHypothesis, RnntLayer};
 use crate::backend::gpu::{CudaSlice, CudaStream};
-use cudarc::driver::PushKernelArg;
 
 /// Layer-0 speaker kernel: Linear(d, d) -> ReLU -> Linear(d, d), applied to the
 /// mask-multiplied layer-0 input with a residual add, per speaker lane.
@@ -46,141 +45,90 @@ impl SpeakerFf {
     }
 }
 
-/// One prediction-network LSTM layer: gate weights `[4h, h]` with separate
-/// input/recurrent biases, published as `dec_rnn.lstm.*_l{index}`.
-struct RnntLayer {
-    input: Linear,
-    recurrent: Linear,
-    bias_ih: CudaSlice<f32>,
-    bias_hh: CudaSlice<f32>,
-}
-
-/// RNNT prediction and joint weights: embedding `[vocab+1, h]` (the blank row
-/// doubles as SOS), a 2-layer LSTM, `joint.pred`/`joint.enc` projections and
-/// the `joint.joint_net.2` head over `relu(enc_proj + pred_proj)`.
-struct MultitalkerRnnt {
-    embedding: CudaSlice<f32>,
-    layers: Vec<RnntLayer>,
-    pred_projection: Linear,
-    enc_projection: Linear,
-    joint_head: Linear,
-}
-
-impl MultitalkerRnnt {
-    fn load(
-        checkpoint: &MappedCheckpoint,
-        stream: &Arc<CudaStream>,
-        spec: &MultitalkerSpec,
-    ) -> Result<Self> {
-        let hidden = spec.pred_hidden as usize;
-        let vocab_blank = spec.vocab_size as usize + 1;
-        let gate = 4 * hidden;
-        let embedding = tensor(
-            checkpoint,
-            stream,
-            "decoder.prediction.embed.weight",
-            &[vocab_blank, hidden],
-        )?;
-        let mut layers = Vec::with_capacity(spec.pred_rnn_layers as usize);
-        for index in 0..spec.pred_rnn_layers as usize {
-            // The published prednet stores raw nn.LSTM tensor names (no
-            // `.weight` suffix), unlike the wrapped parakeet-TDT decoder.
-            let gate_linear = |suffix: &str| -> Result<Linear> {
-                Ok(Linear {
-                    weight: tensor(
-                        checkpoint,
-                        stream,
-                        &format!("decoder.prediction.dec_rnn.lstm.{suffix}_l{index}"),
-                        &[gate, hidden],
-                    )?,
-                    bias: None,
-                    output: gate as u32,
-                    input: spec.pred_hidden,
-                })
-            };
-            layers.push(RnntLayer {
-                input: gate_linear("weight_ih")?,
-                recurrent: gate_linear("weight_hh")?,
-                bias_ih: tensor(
+fn load_rnnt(
+    checkpoint: &MappedCheckpoint,
+    stream: &Arc<CudaStream>,
+    spec: &MultitalkerSpec,
+) -> Result<RnntDecoder> {
+    let hidden = spec.pred_hidden as usize;
+    let vocab_blank = spec.vocab_size as usize + 1;
+    let gate = 4 * hidden;
+    let embedding = tensor(
+        checkpoint,
+        stream,
+        "decoder.prediction.embed.weight",
+        &[vocab_blank, hidden],
+    )?;
+    let mut layers = Vec::with_capacity(spec.pred_rnn_layers as usize);
+    for index in 0..spec.pred_rnn_layers as usize {
+        let gate_linear = |suffix: &str| -> Result<Linear> {
+            Ok(Linear {
+                weight: tensor(
                     checkpoint,
                     stream,
-                    &format!("decoder.prediction.dec_rnn.lstm.bias_ih_l{index}"),
-                    &[gate],
+                    &format!("decoder.prediction.dec_rnn.lstm.{suffix}_l{index}"),
+                    &[gate, hidden],
                 )?,
-                bias_hh: tensor(
-                    checkpoint,
-                    stream,
-                    &format!("decoder.prediction.dec_rnn.lstm.bias_hh_l{index}"),
-                    &[gate],
-                )?,
-            });
-        }
-        let pred_projection = linear(
-            checkpoint,
-            stream,
-            "joint.pred",
-            spec.pred_hidden,
-            spec.pred_hidden,
-            true,
-        )?;
-        let enc_projection = linear(
-            checkpoint,
-            stream,
-            "joint.enc",
-            spec.joint_hidden,
-            spec.d_model,
-            true,
-        )?;
-        let joint_head = linear(
-            checkpoint,
-            stream,
-            "joint.joint_net.2",
-            vocab_blank as u32,
-            spec.joint_hidden,
-            true,
-        )?;
-        Ok(Self {
-            embedding,
-            layers,
-            pred_projection,
-            enc_projection,
-            joint_head,
-        })
+                bias: None,
+                output: gate as u32,
+                input: spec.pred_hidden,
+            })
+        };
+        layers.push(RnntLayer {
+            input: gate_linear("weight_ih")?,
+            recurrent: gate_linear("weight_hh")?,
+            bias_ih: tensor(
+                checkpoint,
+                stream,
+                &format!("decoder.prediction.dec_rnn.lstm.bias_ih_l{index}"),
+                &[gate],
+            )?,
+            bias_hh: tensor(
+                checkpoint,
+                stream,
+                &format!("decoder.prediction.dec_rnn.lstm.bias_hh_l{index}"),
+                &[gate],
+            )?,
+        });
     }
-}
-
-/// Per-session decode state: prediction hidden/cell and gate scratch at the
-/// fixed 4-slot lane stride, the carried projected prediction output, and
-/// joint scratch. Device buffers only; hypotheses live on the host session.
-pub struct MultitalkerDecodeStream {
-    embed_input: CudaSlice<f32>,
-    layers: Vec<LayerState>,
-    prediction: CudaSlice<f32>,
-    joint_frame: CudaSlice<f32>,
-    joint_sum: CudaSlice<f32>,
-    joint_activated: CudaSlice<f32>,
-    joint_logits: CudaSlice<f32>,
-}
-
-impl MultitalkerDecodeStream {}
-
-/// One speaker lane's decode carry: the greedy hypothesis, the per-decision
-/// joint margins (top1 - top2 over the 1025 raw logits) and the global row
-/// ordinal of every emitted token.
-pub struct MultitalkerHypothesis {
-    pub tokens: Vec<u32>,
-    /// Per-decision top1-top2 margin and whether the decision emitted.
-    pub margins: Vec<f32>,
-    pub emitted: Vec<bool>,
-    pub timestamps: Vec<u32>,
-    initialized: bool,
-}
-
-struct LayerState {
-    hidden: CudaSlice<f32>,
-    cell: CudaSlice<f32>,
-    input_gates: CudaSlice<f32>,
-    recurrent_gates: CudaSlice<f32>,
+    let pred_projection = linear(
+        checkpoint,
+        stream,
+        "joint.pred",
+        spec.pred_hidden,
+        spec.pred_hidden,
+        true,
+    )?;
+    let enc_projection = linear(
+        checkpoint,
+        stream,
+        "joint.enc",
+        spec.joint_hidden,
+        spec.d_model,
+        true,
+    )?;
+    let joint_head = linear(
+        checkpoint,
+        stream,
+        "joint.joint_net.2",
+        vocab_blank as u32,
+        spec.joint_hidden,
+        true,
+    )?;
+    Ok(RnntDecoder {
+        config: RnntConfig {
+            prediction_hidden: hidden,
+            layers: spec.pred_rnn_layers as usize,
+            vocab: vocab_blank,
+            blank: spec.vocab_size as usize,
+            max_symbols: spec.max_symbols as usize,
+        },
+        embedding,
+        layers,
+        pred_projection,
+        enc_projection,
+        joint_head,
+    })
 }
 
 pub struct Multitalker {
@@ -189,7 +137,7 @@ pub struct Multitalker {
     pub spec: MultitalkerSpec,
     speaker: SpeakerFf,
     background: SpeakerFf,
-    rnnt: MultitalkerRnnt,
+    rnnt: RnntDecoder,
 }
 
 impl Multitalker {
@@ -209,7 +157,7 @@ impl Multitalker {
         );
         let speaker = SpeakerFf::load(&checkpoint, &stream, "spk_kernels.0", hidden)?;
         let background = SpeakerFf::load(&checkpoint, &stream, "bg_spk_kernels.0", hidden)?;
-        let rnnt = MultitalkerRnnt::load(&checkpoint, &stream, &spec)?;
+        let rnnt = load_rnnt(&checkpoint, &stream, &spec)?;
 
         stream.synchronize()?;
         Ok(Self {
@@ -235,101 +183,8 @@ impl Multitalker {
     }
 
     /// Allocates the per-session decode state at the fixed 4-slot lane stride.
-    pub fn decode_stream(&self) -> Result<MultitalkerDecodeStream> {
-        let stream = &self.encoder.stream;
-        let hidden = self.spec.pred_hidden as usize;
-        let gate = 4 * hidden;
-        let logits = (self.spec.vocab_size as usize + 1) * 4;
-        let mut layers = Vec::with_capacity(self.spec.pred_rnn_layers as usize);
-        for _ in 0..self.spec.pred_rnn_layers {
-            layers.push(LayerState {
-                hidden: stream.alloc_zeros(4 * hidden)?,
-                cell: stream.alloc_zeros(4 * hidden)?,
-                input_gates: stream.alloc_zeros(4 * gate)?,
-                recurrent_gates: stream.alloc_zeros(4 * gate)?,
-            });
-        }
-        Ok(MultitalkerDecodeStream {
-            embed_input: stream.alloc_zeros(4 * hidden)?,
-            layers,
-            prediction: stream.alloc_zeros(4 * hidden)?,
-            joint_frame: stream.alloc_zeros(4 * hidden)?,
-            joint_sum: stream.alloc_zeros(4 * hidden)?,
-            joint_activated: stream.alloc_zeros(4 * hidden)?,
-            joint_logits: stream.alloc_zeros(logits)?,
-        })
-    }
-
-    /// Advances one lane's prediction network over `label` at the fixed
-    /// 4-slot GEMM shapes: embedding row copy, per-layer gate GEMMs and the
-    /// `joint.pred` projection into the carried prediction output. A blank
-    /// after the lane's first (SOS) step is a no-op, matching the published
-    /// loop's commit-on-emit state rule.
-    fn predict_lane(
-        &self,
-        dstream: &mut MultitalkerDecodeStream,
-        lane: usize,
-        label: u32,
-        initialized: &mut bool,
-    ) -> Result<()> {
-        let stream = &self.encoder.stream;
-        let hidden = self.spec.pred_hidden as usize;
-        ensure!(lane < 4, "prediction lane {lane} outside the 4-slot stride");
-        if *initialized && label == self.blank() {
-            return Ok(());
-        }
-        let start = label as usize * hidden;
-        stream.memcpy_dtod(
-            &self.rnnt.embedding.slice(start..start + hidden),
-            &mut dstream
-                .embed_input
-                .slice_mut(lane * hidden..(lane + 1) * hidden),
-        )?;
-        for index in 0..self.rnnt.layers.len() {
-            let (previous, rest) = dstream.layers.split_at_mut(index);
-            let LayerState {
-                hidden: state_hidden,
-                cell: state_cell,
-                input_gates,
-                recurrent_gates,
-            } = &mut rest[0];
-            let input: &CudaSlice<f32> = if index == 0 {
-                &dstream.embed_input
-            } else {
-                &previous[index - 1].hidden
-            };
-            let layer = &self.rnnt.layers[index];
-            self.encoder
-                .lane_linear_into(input, 4, 4, &layer.input, input_gates)?;
-            // The recurrent input is the layer's own carried hidden state.
-            self.encoder
-                .lane_linear_into(state_hidden, 4, 4, &layer.recurrent, recurrent_gates)?;
-            unsafe {
-                stream
-                    .launch_builder(&self.encoder.ops.lstm)
-                    .arg(&input_gates.slice(lane * 4 * hidden..(lane + 1) * 4 * hidden))
-                    .arg(&recurrent_gates.slice(lane * 4 * hidden..(lane + 1) * 4 * hidden))
-                    .arg(&layer.bias_ih)
-                    .arg(&layer.bias_hh)
-                    .arg(&state_cell.slice(lane * hidden..(lane + 1) * hidden))
-                    .arg(&mut state_hidden.slice_mut(lane * hidden..(lane + 1) * hidden))
-                    .arg(&self.spec.pred_hidden)
-                    .launch(flat(hidden))?;
-            }
-        }
-        let last = dstream
-            .layers
-            .last()
-            .context("prediction LSTM stack empty")?;
-        self.encoder.lane_linear_into(
-            &last.hidden,
-            4,
-            4,
-            &self.rnnt.pred_projection,
-            &mut dstream.prediction,
-        )?;
-        *initialized = true;
-        Ok(())
+    pub fn decode_stream(&self) -> Result<RnntDecodeStream> {
+        self.rnnt.decode_stream(&self.encoder)
     }
 
     /// Projects the step's encoder rows `[lanes, rows, d_model]` into
@@ -352,45 +207,6 @@ impl Multitalker {
         )
     }
 
-    /// One joint evaluation for every lane's current row: gathers the
-    /// projected row into the lane slot, adds the carried prediction output,
-    /// relu, head GEMM, and reads the `[4, vocab+1]` logits back.
-    fn joint_rows(
-        &self,
-        dstream: &mut MultitalkerDecodeStream,
-        projected: &CudaSlice<f32>,
-        row_offsets: &[usize; 4],
-    ) -> Result<Vec<f32>> {
-        let stream = &self.encoder.stream;
-        let hidden = self.spec.pred_hidden as usize;
-        for (lane, &start) in row_offsets.iter().enumerate() {
-            stream.memcpy_dtod(
-                &projected.slice(start..start + hidden),
-                &mut dstream
-                    .joint_frame
-                    .slice_mut(lane * hidden..(lane + 1) * hidden),
-            )?;
-        }
-        stream.memcpy_dtod(&dstream.prediction, &mut dstream.joint_sum)?;
-        self.encoder
-            .residual(&mut dstream.joint_sum, &dstream.joint_frame, 1.0)?;
-        self.encoder.activate_into(
-            &dstream.joint_sum,
-            4,
-            self.spec.pred_hidden,
-            0,
-            &mut dstream.joint_activated,
-        )?;
-        self.encoder.lane_linear_into(
-            &dstream.joint_activated,
-            4,
-            4,
-            &self.rnnt.joint_head,
-            &mut dstream.joint_logits,
-        )?;
-        Ok(stream.clone_dtoh(&dstream.joint_logits)?)
-    }
-
     /// Greedy RNNT decode of the step `stream_step` just returned: per row,
     /// joint evaluations until blank with at most `max_symbols` emissions
     /// (forced advance, no trailing blank evaluation), the prediction state
@@ -399,12 +215,10 @@ impl Multitalker {
     pub fn decode_step(
         &self,
         session: &mut MultitalkerSession,
-        dstream: &mut MultitalkerDecodeStream,
+        dstream: &mut RnntDecodeStream,
         step: &MultitalkerStep,
     ) -> Result<Vec<usize>> {
         let hidden = self.spec.d_model as usize;
-        let joint_hidden = self.spec.pred_hidden as usize;
-        let vocab_blank = self.spec.vocab_size as usize + 1;
         let out_rows = step.rows.len() / (hidden * session.lanes as usize);
         ensure!(out_rows > 0, "decode step with zero rows");
         ensure!(session.step > 0, "decode_step before stream_step");
@@ -416,77 +230,23 @@ impl Multitalker {
         if active.is_empty() {
             return Ok(active);
         }
-        let projected = self.project_step_rows(step, out_rows)?;
-        let mut cursor = [0usize; 4];
-        let mut symbols = [0u32; 4];
-        let mut live = [false; 4];
         for &lane in &active {
             ensure!(
                 lane * out_rows * hidden + out_rows * hidden <= step.rows.len(),
                 "decode row extent for lane {lane}"
             );
-            live[lane] = true;
-            let hypothesis = &mut session.hypotheses[lane];
-            if !hypothesis.initialized {
-                let mut initialized = hypothesis.initialized;
-                self.predict_lane(dstream, lane, self.blank(), &mut initialized)?;
-                hypothesis.initialized = initialized;
-            }
         }
-        while live.iter().any(|value| *value) {
-            let mut row_offsets = [0usize; 4];
-            for lane in 0..4 {
-                // Completed lanes re-read their last row; their logits are
-                // discarded with the lane.
-                let row = cursor[lane].min(out_rows - 1);
-                row_offsets[lane] = (lane * out_rows + row) * joint_hidden;
-            }
-            let logits = self.joint_rows(dstream, &projected, &row_offsets)?;
-            for &lane in &active {
-                if !live[lane] {
-                    continue;
-                }
-                let slice = &logits[lane * vocab_blank..(lane + 1) * vocab_blank];
-                let (mut best, mut next) = (0usize, 1usize);
-                if slice[1] > slice[0] {
-                    best = 1;
-                    next = 0;
-                }
-                for (index, value) in slice.iter().enumerate().skip(2) {
-                    if *value > slice[best] {
-                        next = best;
-                        best = index;
-                    } else if *value > slice[next] {
-                        next = index;
-                    }
-                }
-                let margin = slice[best] - slice[next];
-                let label = best as u32;
-                let hypothesis = &mut session.hypotheses[lane];
-                hypothesis.margins.push(margin);
-                hypothesis.emitted.push(label != self.blank());
-                if label == self.blank() {
-                    cursor[lane] += 1;
-                    symbols[lane] = 0;
-                } else {
-                    hypothesis.tokens.push(label);
-                    hypothesis
-                        .timestamps
-                        .push((session.decoded_rows[lane] + cursor[lane]) as u32);
-                    symbols[lane] += 1;
-                    let mut initialized = hypothesis.initialized;
-                    self.predict_lane(dstream, lane, label, &mut initialized)?;
-                    hypothesis.initialized = initialized;
-                    if symbols[lane] >= self.spec.max_symbols {
-                        cursor[lane] += 1;
-                        symbols[lane] = 0;
-                    }
-                }
-                if cursor[lane] >= out_rows {
-                    live[lane] = false;
-                }
-            }
-        }
+        let projected = self.project_step_rows(step, out_rows)?;
+        let mut row_bases = [0usize; 4];
+        row_bases[..session.decoded_rows.len()].copy_from_slice(&session.decoded_rows);
+        self.rnnt.decode_rows(
+            &self.encoder,
+            dstream,
+            &projected,
+            &mut session.hypotheses,
+            &active,
+            &row_bases,
+        )?;
         for &lane in &active {
             session.decoded_rows[lane] += out_rows;
         }
@@ -499,7 +259,7 @@ impl Multitalker {
     /// logits per decision.
     pub fn decode_teacher_forced(
         &self,
-        dstream: &mut MultitalkerDecodeStream,
+        dstream: &mut RnntDecodeStream,
         lane: usize,
         rows: &[&[f32]],
         emits: &[bool],
@@ -515,7 +275,8 @@ impl Multitalker {
             "teacher-forced decision extents"
         );
         let mut initialized = false;
-        self.predict_lane(dstream, lane, self.blank(), &mut initialized)?;
+        self.rnnt
+            .predict_lane(&self.encoder, dstream, lane, self.blank(), &mut initialized)?;
         let mut projected = self.encoder.stream.alloc_zeros(4 * joint_hidden)?;
         let mut out = Vec::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
@@ -531,10 +292,18 @@ impl Multitalker {
             )?;
             let mut offsets = [0usize; 4];
             offsets[lane] = lane * joint_hidden;
-            let logits = self.joint_rows(dstream, &projected, &offsets)?;
+            let logits = self
+                .rnnt
+                .joint_rows(&self.encoder, dstream, &projected, &offsets)?;
             out.push(logits[lane * vocab_blank..(lane + 1) * vocab_blank].to_vec());
             if emits[index] {
-                self.predict_lane(dstream, lane, tokens[index], &mut initialized)?;
+                self.rnnt.predict_lane(
+                    &self.encoder,
+                    dstream,
+                    lane,
+                    tokens[index],
+                    &mut initialized,
+                )?;
             }
         }
         Ok(out)
@@ -575,15 +344,7 @@ impl Multitalker {
             gating,
             buffer_idx: 0,
             step: 0,
-            hypotheses: (0..lane_count)
-                .map(|_| MultitalkerHypothesis {
-                    tokens: Vec::new(),
-                    margins: Vec::new(),
-                    emitted: Vec::new(),
-                    timestamps: Vec::new(),
-                    initialized: false,
-                })
-                .collect(),
+            hypotheses: (0..lane_count).map(|_| RnntHypothesis::default()).collect(),
             decoded_rows: vec![0usize; lane_count],
         })
     }
@@ -707,7 +468,7 @@ pub struct MultitalkerSession {
     buffer_idx: usize,
     step: usize,
     /// Per-speaker greedy hypotheses; index is the speaker lane.
-    pub hypotheses: Vec<MultitalkerHypothesis>,
+    pub hypotheses: Vec<RnntHypothesis>,
     decoded_rows: Vec<usize>,
 }
 

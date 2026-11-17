@@ -660,13 +660,97 @@ extern "C" __global__ void philox_normal_bf16(
   philox_normal_impl<__nv_bfloat16>(seed, stream, out, count);
 }
 
+// Generated-token repetition penalty, temperature, top-k, top-p and softmax.
+extern "C" __global__ void __launch_bounds__(256) distribution_rows_bf16(
+    const __nv_bfloat16* __restrict__ logits, float* __restrict__ probs,
+    int rows, long long vocab, float temperature, int top_k, float top_p,
+    const int* __restrict__ history, float repetition_penalty,
+    int reserved_first, int reserved_last, int allow_token) {
+  __shared__ float values[4096];
+  __shared__ int ids[4096];
+  if (rows < 1 || vocab < 1 || vocab > 4096 || blockDim.x != 256 ||
+      !isfinite(temperature) || temperature <= 0.0f || top_k < 1 ||
+      !isfinite(top_p) || top_p <= 0.0f || top_p > 1.0f ||
+      !isfinite(repetition_penalty) || repetition_penalty <= 0.0f) {
+    __trap(); return;
+  }
+  const int row = blockIdx.x;
+  int padded = 1;
+  while (padded < vocab) padded <<= 1;
+  for (int i = threadIdx.x; i < padded; i += 256) {
+    ids[i] = i;
+    if (i >= vocab) {
+      values[i] = -INFINITY;
+      continue;
+    }
+    float logit = __bfloat162float(logits[(long long)row * vocab + i]);
+    if (!isfinite(logit)) { __trap(); return; }
+    if (repetition_penalty != 1.0f && history[i] != 0) {
+      logit = logit < 0.0f ? logit * repetition_penalty
+                           : logit / repetition_penalty;
+    }
+    const bool reserved = i >= reserved_first && i <= reserved_last && i != allow_token;
+    values[i] = reserved ? -INFINITY : logit / temperature;
+  }
+  __syncthreads();
+  for (int size = 2; size <= padded; size <<= 1) {
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      for (int i = threadIdx.x; i < padded; i += 256) {
+        const int j = i ^ stride;
+        if (j > i) {
+          const bool descending = (i & size) == 0;
+          const float a = values[i];
+          const float b = values[j];
+          const bool after = a < b || (a == b && ids[i] > ids[j]);
+          const bool before = a > b || (a == b && ids[i] < ids[j]);
+          if ((descending && after) || (!descending && before)) {
+            values[i] = b; values[j] = a;
+            const int id = ids[i]; ids[i] = ids[j]; ids[j] = id;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+  for (int i = threadIdx.x; i < vocab; i += 256) probs[(long long)row * vocab + i] = 0.0f;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const int k = top_k < vocab ? top_k : (int)vocab;
+    const float max_logit = values[0];
+    const float kth_logit = values[k - 1];
+    float total = 0.0f;
+    int candidates = 0;
+    for (int i = 0; i < vocab && isfinite(values[i]) && values[i] >= kth_logit; ++i) {
+      values[i] = expf(values[i] - max_logit);
+      total = __fadd_rn(total, values[i]);
+      ++candidates;
+    }
+    if (candidates == 0 || !isfinite(total) || !(total > 0.0f)) { __trap(); return; }
+    float cumulative = 0.0f;
+    int keep = 0;
+    for (int i = 0; i < candidates; ++i) {
+      cumulative = __fadd_rn(cumulative, values[i] / total);
+      ++keep;
+      if (cumulative > top_p) break;
+    }
+    float retained = 0.0f;
+    for (int i = 0; i < keep; ++i) retained = __fadd_rn(retained, values[i]);
+    if (!isfinite(retained) || !(retained > 0.0f)) { __trap(); return; }
+    for (int i = 0; i < keep; ++i) {
+      probs[(long long)row * vocab + ids[i]] = values[i] / retained;
+    }
+  }
+}
+
 // Samples contiguous F32 CDF intervals from one Philox draw per row.
 extern "C" __global__ void categorical_sample_rows(
     const float* __restrict__ probs, int* __restrict__ out, int rows,
     long long vocab, unsigned long long seed, unsigned long long stream,
-    int vocab_threads) {
+    const unsigned long long* __restrict__ counter_base, int vocab_threads,
+    int* __restrict__ history, int track_history) {
   if (rows < 1 || vocab < 1 || vocab_threads < 1 || (blockDim.x & 31) != 0 ||
-      (int)blockDim.x != vocab_threads || vocab_threads > 1024)
+      (int)blockDim.x != vocab_threads || vocab_threads > 1024 ||
+      (track_history != 0 && track_history != 1))
     __trap();
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
@@ -674,9 +758,10 @@ extern "C" __global__ void categorical_sample_rows(
   const int warp = tid >> 5;
   const uint2 key =
       make_uint2((unsigned)(seed & 0xffffffffu), (unsigned)(seed >> 32));
+  const unsigned long long draw = counter_base[0] + (unsigned long long)row;
   const uint4 counter =
       make_uint4((unsigned)(stream & 0xffffffffu), (unsigned)(stream >> 32),
-                 (unsigned)row, 0u);
+                 (unsigned)(draw & 0xffffffffu), (unsigned)(draw >> 32));
   const float u = fminf(
       (float)(philox4_32_10(counter, key).x * (1.0 / 4294967296.0)),
       0x1.fffffep-1f);
@@ -737,6 +822,7 @@ extern "C" __global__ void categorical_sample_rows(
     if (lane == 0) {
       if (mine == 0x7fffffff) { __trap(); return; }
       out[row] = mine;
+      if (track_history) history[mine] = 1;
     }
   }
 }
