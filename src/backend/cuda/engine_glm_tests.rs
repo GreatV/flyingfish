@@ -1763,9 +1763,350 @@ fn glm_mtp_census_gpu() -> Result<()> {
     Ok(())
 }
 
+struct Layer45RouterArm {
+    ids: Vec<i32>,
+    weights: Vec<f32>,
+    min_margin: f32,
+    expert_set: Vec<i32>,
+}
+
+struct Layer45Thresholds {
+    tau_max_abs: f32,
+    tau_rmse: f32,
+    tau_weights_max_abs: f32,
+    tau_weights_rmse: f32,
+    synthetic: Layer45RouterArm,
+    production: Layer45RouterArm,
+}
+
+struct VerifyAdmission {
+    tau_max_abs: Vec<f32>,
+    tau_rmse: Vec<f32>,
+    gated_positions: std::collections::BTreeSet<usize>,
+}
+
+const LAYER45_INTERMEDIATE_DTYPES: &[(&str, safetensors::Dtype)] = &[
+    ("enorm_out", safetensors::Dtype::BF16),
+    ("hnorm_out", safetensors::Dtype::BF16),
+    ("eh_in", safetensors::Dtype::BF16),
+    ("x", safetensors::Dtype::BF16),
+    ("x_norm1", safetensors::Dtype::BF16),
+    ("kv_latent", safetensors::Dtype::BF16),
+    ("q_a", safetensors::Dtype::BF16),
+    ("o_out", safetensors::Dtype::BF16),
+    ("x_curr", safetensors::Dtype::BF16),
+    ("x_norm2", safetensors::Dtype::BF16),
+    ("q_out", safetensors::Dtype::F32),
+    ("attn_out", safetensors::Dtype::F32),
+    ("router_logits", safetensors::Dtype::F32),
+];
+
+fn require_f32(json: &serde_json::Value, pointer: &str) -> Result<f32> {
+    let number = json
+        .pointer(pointer)
+        .with_context(|| format!("Runner FAIL missing {pointer}"))?
+        .as_f64()
+        .with_context(|| format!("Runner FAIL {pointer} not a number"))?;
+    let scored = number as f32;
+    ensure!(
+        number.is_finite() && scored.is_finite(),
+        "Runner FAIL non-finite {pointer}"
+    );
+    Ok(scored)
+}
+
+fn require_f32_values(value: &serde_json::Value, name: &str) -> Result<Vec<f32>> {
+    let array = value
+        .as_array()
+        .with_context(|| format!("Runner FAIL missing {name}"))?;
+    array
+        .iter()
+        .map(|value| {
+            let number = value
+                .as_f64()
+                .with_context(|| format!("Runner FAIL {name} element"))?;
+            let scored = number as f32;
+            ensure!(
+                number.is_finite() && scored.is_finite(),
+                "Runner FAIL non-finite {name}"
+            );
+            Ok(scored)
+        })
+        .collect()
+}
+
+fn require_f32_at(json: &serde_json::Value, pointer: &str) -> Result<Vec<f32>> {
+    require_f32_values(
+        json.pointer(pointer)
+            .with_context(|| format!("Runner FAIL missing {pointer}"))?,
+        pointer,
+    )
+}
+
+fn require_i32_at(json: &serde_json::Value, pointer: &str) -> Result<Vec<i32>> {
+    let array = json
+        .pointer(pointer)
+        .with_context(|| format!("Runner FAIL missing {pointer}"))?
+        .as_array()
+        .with_context(|| format!("Runner FAIL {pointer} array"))?;
+    array
+        .iter()
+        .map(|value| {
+            Ok(value
+                .as_i64()
+                .with_context(|| format!("Runner FAIL {pointer} element"))? as i32)
+        })
+        .collect()
+}
+
+fn admit_layer45_arm(
+    json: &serde_json::Value,
+    arm: &str,
+    expert_set: bool,
+) -> Result<Layer45RouterArm> {
+    let ids = require_i32_at(json, &format!("/router_tap/{arm}/normal_ids"))?;
+    let weights = require_f32_at(json, &format!("/router_tap/{arm}/normal_weights"))?;
+    let min_margin = require_f32(json, &format!("/router_tap/{arm}/min_margin_8_vs_9"))?;
+    let spread = require_f32(
+        json,
+        &format!("/router_tap/{arm}/cross_arm_selection_scores_max_abs"),
+    )?;
+    let exceeds = json
+        .pointer(&format!("/router_tap/{arm}/margin_exceeds_spread"))
+        .with_context(|| format!("Runner FAIL missing /router_tap/{arm}/margin_exceeds_spread"))?
+        .as_bool()
+        .with_context(|| format!("Runner FAIL /router_tap/{arm}/margin_exceeds_spread"))?;
+    ensure!(
+        exceeds && min_margin > spread,
+        "Runner FAIL unqualified floor {arm}"
+    );
+    let expert_set = if expert_set {
+        let set = require_i32_at(json, "/router_tap/production/expected_expert_set")?;
+        ensure!(
+            set.len() == 8,
+            "Runner FAIL expected_expert_set length {}",
+            set.len()
+        );
+        set
+    } else {
+        Vec::new()
+    };
+    Ok(Layer45RouterArm {
+        ids,
+        weights,
+        min_margin,
+        expert_set,
+    })
+}
+
+fn admit_layer45_thresholds(json: &serde_json::Value) -> Result<Layer45Thresholds> {
+    Ok(Layer45Thresholds {
+        tau_max_abs: require_f32(json, "/logits/unified/tau_max_abs")?,
+        tau_rmse: require_f32(json, "/logits/unified/tau_rmse")?,
+        tau_weights_max_abs: require_f32(json, "/router_tap/tau_weights_max_abs")?,
+        tau_weights_rmse: require_f32(json, "/router_tap/tau_weights_rmse")?,
+        synthetic: admit_layer45_arm(json, "synthetic", false)?,
+        production: admit_layer45_arm(json, "production", true)?,
+    })
+}
+
+fn admit_layer45_intermediates(file: &safetensors::SafeTensors<'_>) -> Result<()> {
+    for (name, dtype) in LAYER45_INTERMEDIATE_DTYPES {
+        let tensor = file
+            .tensor(name)
+            .with_context(|| format!("Runner FAIL missing tensor {name}"))?;
+        ensure!(tensor.dtype() == *dtype, "Runner FAIL tensor {name} dtype");
+    }
+    Ok(())
+}
+
+fn admit_verify_thresholds(
+    thresholds: &serde_json::Value,
+    control: &serde_json::Value,
+) -> Result<VerifyAdmission> {
+    let count = usize::try_from(
+        thresholds
+            .get("positions_count")
+            .context("Runner FAIL missing positions_count")?
+            .as_u64()
+            .context("Runner FAIL positions_count")?,
+    )?;
+    let tau_max_abs = require_f32_values(
+        &thresholds["tau_max_abs_per_position"],
+        "tau_max_abs_per_position",
+    )?;
+    let tau_rmse = require_f32_values(
+        &thresholds["tau_rmse_per_position"],
+        "tau_rmse_per_position",
+    )?;
+    ensure!(
+        tau_max_abs.len() == tau_rmse.len() && tau_max_abs.len() == count,
+        "Runner FAIL verify tau length {} {} {count}",
+        tau_max_abs.len(),
+        tau_rmse.len()
+    );
+    let gated_positions = control
+        .get("gated_positions")
+        .context("Runner FAIL missing gated_positions")?
+        .as_array()
+        .context("Runner FAIL gated_positions")?
+        .iter()
+        .map(|value| {
+            usize::try_from(value.as_u64().context("Runner FAIL gated position")?)
+                .context("Runner FAIL gated position")
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    ensure!(
+        gated_positions.iter().all(|position| *position < count),
+        "Runner FAIL gated position outside the array"
+    );
+    Ok(VerifyAdmission {
+        tau_max_abs,
+        tau_rmse,
+        gated_positions,
+    })
+}
+
+fn verify_position_tau(values: &[f32], position: usize) -> Result<f32> {
+    values
+        .get(position)
+        .copied()
+        .context("Runner FAIL verify position outside tau array")
+}
+
+fn layer45_qualified_json() -> serde_json::Value {
+    serde_json::json!({
+        "logits": {
+            "unified": {
+                "tau_max_abs": 0.20562434196472168,
+                "tau_rmse": 0.04017127677798271
+            }
+        },
+        "router_tap": {
+            "tau_weights_max_abs": 0.0028,
+            "tau_weights_rmse": 0.0016,
+            "synthetic": {
+                "normal_ids": [182, 51, 131, 78, 146, 15, 76, 0],
+                "normal_weights": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+                "min_margin_8_vs_9": 0.011381149291992188,
+                "cross_arm_selection_scores_max_abs": 0.005793,
+                "margin_exceeds_spread": true
+            },
+            "production": {
+                "normal_ids": [102, 55, 138, 278, 145, 190, 249, 219],
+                "normal_weights": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+                "expected_expert_set": [55, 102, 138, 145, 190, 219, 249, 278],
+                "min_margin_8_vs_9": 0.01715850830078125,
+                "cross_arm_selection_scores_max_abs": 0.003126,
+                "margin_exceeds_spread": true
+            }
+        }
+    })
+}
+
+fn verify_qualified_json() -> (serde_json::Value, serde_json::Value) {
+    (
+        serde_json::json!({
+            "positions_count": 2,
+            "tau_max_abs_per_position": [0.26171875, 0.75],
+            "tau_rmse_per_position": [0.04800696671009064, 0.13747455179691315]
+        }),
+        serde_json::json!({"gated_positions": [0, 1]}),
+    )
+}
+
+#[test]
+fn glm_fixture_admission_rejects_missing_field() -> Result<()> {
+    let admitted = admit_layer45_thresholds(&layer45_qualified_json())?;
+    ensure!(
+        admitted.tau_max_abs.to_bits() == (0.20562434196472168f64 as f32).to_bits()
+            && admitted.tau_rmse.to_bits() == (0.04017127677798271f64 as f32).to_bits()
+            && admitted.synthetic.min_margin.to_bits()
+                == (0.011381149291992188f64 as f32).to_bits()
+            && admitted.production.min_margin.to_bits()
+                == (0.01715850830078125f64 as f32).to_bits()
+            && admitted.synthetic.ids.len() == 8
+            && admitted.production.expert_set.len() == 8
+    );
+    let mut old_key = layer45_qualified_json();
+    let unified = old_key
+        .pointer_mut("/logits/unified")
+        .context("unified")?
+        .take();
+    old_key["unified"] = unified;
+    ensure!(admit_layer45_thresholds(&old_key).is_err());
+    let mut missing_set = layer45_qualified_json();
+    missing_set
+        .pointer_mut("/router_tap/production")
+        .context("production")?
+        .as_object_mut()
+        .context("production object")?
+        .remove("expected_expert_set");
+    ensure!(admit_layer45_thresholds(&missing_set).is_err());
+    let mut missing_margin = layer45_qualified_json();
+    missing_margin
+        .pointer_mut("/router_tap/synthetic")
+        .context("synthetic")?
+        .as_object_mut()
+        .context("synthetic object")?
+        .remove("min_margin_8_vs_9");
+    ensure!(admit_layer45_thresholds(&missing_margin).is_err());
+    let (mut thresholds, control) = verify_qualified_json();
+    admit_verify_thresholds(&thresholds, &control)?;
+    thresholds
+        .as_object_mut()
+        .context("thresholds")?
+        .remove("positions_count");
+    ensure!(admit_verify_thresholds(&thresholds, &control).is_err());
+    Ok(())
+}
+
+#[test]
+fn glm_fixture_admission_rejects_gated_position_outside_array() -> Result<()> {
+    let (thresholds, mut control) = verify_qualified_json();
+    let admitted = admit_verify_thresholds(&thresholds, &control)?;
+    ensure!(admitted.gated_positions.len() == 2 && admitted.tau_max_abs.len() == 2);
+    ensure!(verify_position_tau(&admitted.tau_max_abs, 2).is_err());
+    ensure!(verify_position_tau(&admitted.tau_max_abs, 0)? == admitted.tau_max_abs[0]);
+    control["gated_positions"] = serde_json::json!([0, 2]);
+    ensure!(admit_verify_thresholds(&thresholds, &control).is_err());
+    let mut short = thresholds.clone();
+    short["positions_count"] = serde_json::json!(3);
+    ensure!(admit_verify_thresholds(&short, &verify_qualified_json().1).is_err());
+    Ok(())
+}
+
+#[test]
+fn glm_fixture_admission_rejects_nonfinite_number() -> Result<()> {
+    let mut layer45 = layer45_qualified_json();
+    layer45["logits"]["unified"]["tau_rmse"] = serde_json::json!(1.0e39);
+    ensure!(admit_layer45_thresholds(&layer45).is_err());
+    let (mut thresholds, control) = verify_qualified_json();
+    thresholds["tau_max_abs_per_position"][0] = serde_json::json!(1.0e39);
+    ensure!(admit_verify_thresholds(&thresholds, &control).is_err());
+    thresholds = verify_qualified_json().0;
+    thresholds["tau_rmse_per_position"][1] = serde_json::json!(-1.0e39);
+    ensure!(admit_verify_thresholds(&thresholds, &control).is_err());
+    Ok(())
+}
+
+#[test]
+fn glm_fixture_admission_rejects_unqualified_floor() -> Result<()> {
+    let mut flag = layer45_qualified_json();
+    flag["router_tap"]["synthetic"]["margin_exceeds_spread"] = serde_json::json!(false);
+    ensure!(admit_layer45_thresholds(&flag).is_err());
+    let mut tied = layer45_qualified_json();
+    let spread = tied["router_tap"]["production"]["cross_arm_selection_scores_max_abs"].clone();
+    tied["router_tap"]["production"]["min_margin_8_vs_9"] = spread;
+    ensure!(admit_layer45_thresholds(&tied).is_err());
+    tied["router_tap"]["production"]["min_margin_8_vs_9"] = serde_json::json!(0.0);
+    ensure!(admit_layer45_thresholds(&tied).is_err());
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "GPU GLM Layer 45 diagnostic residuals against frozen reference; swap controls remain required"]
+#[ignore = "GPU GLM Layer 45; FF_Q38_GPU_WINDOW=granted, FF_GLM_MODEL, FF_GLM_MTP_REF_DIR"]
 fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1777,29 +2118,22 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         std::env::var_os("FF_GLM_MTP_REF_DIR").context("FF_GLM_MTP_REF_DIR missing")?,
     );
 
-    let thresholds_file = ref_dir.join("layer45_thresholds.json");
-    let thresholds_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&thresholds_file)?)?;
-    let tau_max_abs = thresholds_json
-        .pointer("/logits/unified/tau_max_abs")
-        .or_else(|| thresholds_json.pointer("/unified/tau_max_abs"))
-        .context("tau_max_abs missing")?
-        .as_f64()
-        .context("tau_max_abs not a number")? as f32;
-    let tau_rmse = thresholds_json
-        .pointer("/logits/unified/tau_rmse")
-        .or_else(|| thresholds_json.pointer("/unified/tau_rmse"))
-        .context("tau_rmse missing")?
-        .as_f64()
-        .context("tau_rmse not a number")? as f32;
-    let tau_weights_max_abs = thresholds_json
-        .pointer("/router_tap/tau_weights_max_abs")
-        .map(|v| v.as_f64().unwrap() as f32)
-        .unwrap_or(0.0028);
-    let tau_weights_rmse = thresholds_json
-        .pointer("/router_tap/tau_weights_rmse")
-        .map(|v| v.as_f64().unwrap() as f32)
-        .unwrap_or(0.0016);
+    let thresholds = admit_layer45_thresholds(&serde_json::from_slice(&std::fs::read(
+        ref_dir.join("layer45_thresholds.json"),
+    )?)?)?;
+    let synth_inputs = std::fs::read(ref_dir.join("common_inputs.safetensors"))?;
+    let synth_st = safetensors::SafeTensors::deserialize(&synth_inputs)?;
+    let prod_inputs = std::fs::read(ref_dir.join("common_inputs_production.safetensors"))?;
+    let prod_st = safetensors::SafeTensors::deserialize(&prod_inputs)?;
+    let synth_ref_bytes = std::fs::read(ref_dir.join("logits_cpu.fp32"))?;
+    let prod_ref_bytes = std::fs::read(ref_dir.join("logits_production_cpu.fp32"))?;
+    let inter_bytes = std::fs::read(ref_dir.join("ref_intermediates.safetensors"))?;
+    let inter_st = safetensors::SafeTensors::deserialize(&inter_bytes)?;
+    admit_layer45_intermediates(&inter_st)?;
+    let tau_max_abs = thresholds.tau_max_abs;
+    let tau_rmse = thresholds.tau_rmse;
+    let tau_weights_max_abs = thresholds.tau_weights_max_abs;
+    let tau_weights_rmse = thresholds.tau_weights_rmse;
 
     let device = Device::new(0)?;
     unsafe {
@@ -1814,8 +2148,6 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     let mut runtime = GlmMtpRuntime::load(&model_dir, &device, &blas, true, 4096)?;
 
     // 1. Synthetic case
-    let synth_inputs = std::fs::read(ref_dir.join("common_inputs.safetensors"))?;
-    let synth_st = safetensors::SafeTensors::deserialize(&synth_inputs)?;
     let synth_tokens: Vec<u32> = synth_st
         .tensor("history_tokens")?
         .data()
@@ -1832,7 +2164,6 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .iter()
         .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
         .collect();
-    let synth_ref_bytes = std::fs::read(ref_dir.join("logits_cpu.fp32"))?;
     let synth_ref_logits: Vec<f32> = synth_ref_bytes
         .as_chunks::<4>()
         .0
@@ -1854,11 +2185,7 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
 
     let mut defects = Vec::new();
     let stage_taps = runtime.read_stage_taps()?;
-    let inter_file = ref_dir.join("ref_intermediates.safetensors");
-    if inter_file.exists() {
-        let inter_bytes = std::fs::read(&inter_file)?;
-        let inter_st = safetensors::SafeTensors::deserialize(&inter_bytes)?;
-
+    {
         let read_bf16 = |name: &str| -> Result<Vec<f32>> {
             let t = inter_st.tensor(name)?;
             Ok(t.data()
@@ -1900,45 +2227,47 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
 
         let to_f32 = |v: &[bf16]| -> Vec<f32> { v.iter().map(|x| x.to_f32()).collect() };
 
-        if let Ok(ref_t) = read_bf16("enorm_out") {
-            diff_stat("enorm_out", &to_f32(&stage_taps.enorm), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("hnorm_out") {
-            diff_stat("hnorm_out", &to_f32(&stage_taps.hnorm), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("eh_in") {
-            diff_stat("eh_in", &to_f32(&stage_taps.eh_in), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("x") {
-            diff_stat("x", &to_f32(&stage_taps.x_init), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("x_norm1") {
-            diff_stat("x_norm1", &to_f32(&stage_taps.x_norm1), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("kv_latent") {
-            diff_stat("kv_latent", &to_f32(&stage_taps.kv_latent), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("q_a") {
-            diff_stat("q_a", &to_f32(&stage_taps.q_a), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_f32("q_out") {
-            diff_stat("q_out", &to_f32(&stage_taps.q_out), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_f32("attn_out") {
-            diff_stat("attn_out", &to_f32(&stage_taps.attn_out), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("o_out") {
-            diff_stat("o_out", &to_f32(&stage_taps.o_out), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("x_curr") {
-            diff_stat("x_curr", &to_f32(&stage_taps.x_curr), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_bf16("x_norm2") {
-            diff_stat("x_norm2", &to_f32(&stage_taps.x_norm2), &ref_t)?;
-        }
-        if let Ok(ref_t) = read_f32("router_logits") {
-            diff_stat("router_logits", &stage_taps.router_logits, &ref_t)?;
-        }
+        diff_stat(
+            "enorm_out",
+            &to_f32(&stage_taps.enorm),
+            &read_bf16("enorm_out")?,
+        )?;
+        diff_stat(
+            "hnorm_out",
+            &to_f32(&stage_taps.hnorm),
+            &read_bf16("hnorm_out")?,
+        )?;
+        diff_stat("eh_in", &to_f32(&stage_taps.eh_in), &read_bf16("eh_in")?)?;
+        diff_stat("x", &to_f32(&stage_taps.x_init), &read_bf16("x")?)?;
+        diff_stat(
+            "x_norm1",
+            &to_f32(&stage_taps.x_norm1),
+            &read_bf16("x_norm1")?,
+        )?;
+        diff_stat(
+            "kv_latent",
+            &to_f32(&stage_taps.kv_latent),
+            &read_bf16("kv_latent")?,
+        )?;
+        diff_stat("q_a", &to_f32(&stage_taps.q_a), &read_bf16("q_a")?)?;
+        diff_stat("q_out", &to_f32(&stage_taps.q_out), &read_f32("q_out")?)?;
+        diff_stat(
+            "attn_out",
+            &to_f32(&stage_taps.attn_out),
+            &read_f32("attn_out")?,
+        )?;
+        diff_stat("o_out", &to_f32(&stage_taps.o_out), &read_bf16("o_out")?)?;
+        diff_stat("x_curr", &to_f32(&stage_taps.x_curr), &read_bf16("x_curr")?)?;
+        diff_stat(
+            "x_norm2",
+            &to_f32(&stage_taps.x_norm2),
+            &read_bf16("x_norm2")?,
+        )?;
+        diff_stat(
+            "router_logits",
+            &stage_taps.router_logits,
+            &read_f32("router_logits")?,
+        )?;
         println!("STAGE_DIAG cand_routing_ids: {:?}", stage_taps.routing_ids);
         println!(
             "STAGE_DIAG cand_routing_weights: {:?}",
@@ -1951,59 +2280,41 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
             .sqrt();
         println!("STAGE_DIAG cand_moe_out norm: {moe_norm:.6}");
 
-        if let Ok(t) = inter_st.tensor("x_norm2") {
-            let ref_norm2: Vec<bf16> = t
-                .data()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
-                .collect();
-            let (ctrl_logits, ctrl_ids, ctrl_weights) =
-                runtime.test_route_custom_norm(&ref_norm2)?;
-            if let Ok(ref_t) = read_f32("router_logits") {
-                diff_stat("ctrl_router_logits", &ctrl_logits, &ref_t)?;
-            }
-            println!("STAGE_DIAG ctrl_router_ids (from ref x_norm2): got {ctrl_ids:?}");
-            println!("STAGE_DIAG ctrl_router_weights: {ctrl_weights:?}");
-        }
+        let ref_norm2: Vec<bf16> = inter_st
+            .tensor("x_norm2")?
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+            .collect();
+        let (ctrl_logits, ctrl_ids, ctrl_weights) = runtime.test_route_custom_norm(&ref_norm2)?;
+        diff_stat(
+            "ctrl_router_logits",
+            &ctrl_logits,
+            &read_f32("router_logits")?,
+        )?;
+        println!("STAGE_DIAG ctrl_router_ids (from ref x_norm2): got {ctrl_ids:?}");
+        println!("STAGE_DIAG ctrl_router_weights: {ctrl_weights:?}");
     }
 
     let (synth_cand_ids, synth_cand_weights) = runtime
         .last_route()
         .context("synthetic router tap missing")?
         .clone();
-    let synth_expected_ids: Vec<i32> = thresholds_json
-        .pointer("/router_tap/synthetic/normal_ids")
-        .context("synthetic normal_ids missing")?
-        .as_array()
-        .context("normal_ids array missing")?
-        .iter()
-        .map(|v| v.as_i64().unwrap() as i32)
-        .collect();
-    let synth_expected_weights: Vec<f32> = thresholds_json
-        .pointer("/router_tap/synthetic/normal_weights")
-        .context("synthetic normal_weights missing")?
-        .as_array()
-        .context("normal_weights array missing")?
-        .iter()
-        .map(|v| v.as_f64().unwrap() as f32)
-        .collect();
-    let synth_min_margin = thresholds_json
-        .pointer("/router_tap/synthetic/min_margin_8_vs_9")
-        .map(|v| v.as_f64().unwrap() as f32)
-        .unwrap_or(0.011381);
-    let synth_spread = thresholds_json
-        .pointer("/router_tap/synthetic/cross_arm_selection_scores_max_abs")
-        .map(|v| v.as_f64().unwrap() as f32)
-        .unwrap_or(0.005793);
-    if synth_min_margin > synth_spread && synth_cand_ids != synth_expected_ids {
+    if synth_cand_ids != thresholds.synthetic.ids {
         defects.push(format!(
-            "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {synth_expected_ids:?}"
+            "DEFECT synthetic router IDs mismatch: got {synth_cand_ids:?}, expected {:?}",
+            thresholds.synthetic.ids
         ));
     }
     let mut synth_exp_map = std::collections::BTreeMap::new();
-    for (&id, &w) in synth_expected_ids.iter().zip(&synth_expected_weights) {
+    for (&id, &w) in thresholds
+        .synthetic
+        .ids
+        .iter()
+        .zip(&thresholds.synthetic.weights)
+    {
         synth_exp_map.insert(id, w);
     }
     let mut synth_w_max_abs = 0.0f32;
@@ -2069,8 +2380,6 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
     let synth_swap_rmse = (synth_swap_sum_sq / synth_swapped.len() as f32).sqrt();
 
     // 2. Production case
-    let prod_inputs = std::fs::read(ref_dir.join("common_inputs_production.safetensors"))?;
-    let prod_st = safetensors::SafeTensors::deserialize(&prod_inputs)?;
     let prod_tokens: Vec<u32> = prod_st
         .tensor("history_tokens")?
         .data()
@@ -2087,7 +2396,6 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .iter()
         .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
         .collect();
-    let prod_ref_bytes = std::fs::read(ref_dir.join("logits_production_cpu.fp32"))?;
     let prod_ref_logits: Vec<f32> = prod_ref_bytes
         .as_chunks::<4>()
         .0
@@ -2112,51 +2420,21 @@ fn glm_mtp_layer45_numerics_gpu() -> Result<()> {
         .last_route()
         .context("production router tap missing")?
         .clone();
-    let prod_expected_ids: Vec<i32> = thresholds_json
-        .pointer("/router_tap/production/normal_ids")
-        .context("production normal_ids missing")?
-        .as_array()
-        .context("normal_ids array missing")?
-        .iter()
-        .map(|v| v.as_i64().unwrap() as i32)
-        .collect();
-    let prod_expected_weights: Vec<f32> = thresholds_json
-        .pointer("/router_tap/production/normal_weights")
-        .context("production normal_weights missing")?
-        .as_array()
-        .context("normal_weights array missing")?
-        .iter()
-        .map(|v| v.as_f64().unwrap() as f32)
-        .collect();
-    let prod_expected_set: std::collections::BTreeSet<i32> = thresholds_json
-        .pointer("/router_tap/production/expected_expert_set")
-        .map(|v| {
-            v.as_array()
-                .unwrap()
-                .iter()
-                .map(|x| x.as_i64().unwrap() as i32)
-                .collect()
-        })
-        .unwrap_or_else(|| prod_expected_ids.iter().copied().collect());
-    let prod_min_margin = thresholds_json
-        .pointer("/router_tap/production/min_margin_8_vs_9")
-        .map(|v| v.as_f64().unwrap() as f32)
-        .unwrap_or(0.017159);
-    let prod_spread = thresholds_json
-        .pointer("/router_tap/production/cross_arm_selection_scores_max_abs")
-        .map(|v| v.as_f64().unwrap() as f32)
-        .unwrap_or(0.003126);
-    if prod_min_margin > prod_spread {
-        let prod_cand_set: std::collections::BTreeSet<i32> =
-            prod_cand_ids.iter().copied().collect();
-        if prod_cand_set != prod_expected_set {
-            defects.push(format!(
-                "DEFECT production router expert set mismatch: got {prod_cand_set:?}, expected {prod_expected_set:?}"
-            ));
-        }
+    let prod_expected_set: std::collections::BTreeSet<i32> =
+        thresholds.production.expert_set.iter().copied().collect();
+    let prod_cand_set: std::collections::BTreeSet<i32> = prod_cand_ids.iter().copied().collect();
+    if prod_cand_set != prod_expected_set {
+        defects.push(format!(
+            "DEFECT production router expert set mismatch: got {prod_cand_set:?}, expected {prod_expected_set:?}"
+        ));
     }
     let mut prod_exp_map = std::collections::BTreeMap::new();
-    for (&id, &w) in prod_expected_ids.iter().zip(&prod_expected_weights) {
+    for (&id, &w) in thresholds
+        .production
+        .ids
+        .iter()
+        .zip(&thresholds.production.weights)
+    {
         prod_exp_map.insert(id, w);
     }
     let mut prod_w_max_abs = 0.0f32;
@@ -2779,12 +3057,25 @@ fn glm_mtp_rollback_transaction_gpu() -> Result<()> {
 
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "GPU GLM-5.3-Flash speculative verification gate (G-MTP4) with counted proof"]
+#[ignore = "GPU GLM-5.3-Flash speculative verification gate (G-MTP4); FF_Q38_GPU_WINDOW=granted, FF_GLM_MODEL, FF_GLM_MTP_REF_DIR, G1_COMPOSITION_REFERENCE"]
 fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window required"
     );
+    let ref_dir = PathBuf::from(
+        std::env::var_os("FF_GLM_MTP_REF_DIR").context("FF_GLM_MTP_REF_DIR missing")?,
+    );
+    let VerifyAdmission {
+        tau_max_abs: tau_max_abs_per_pos,
+        tau_rmse: tau_rmse_per_pos,
+        gated_positions,
+    } = admit_verify_thresholds(
+        &serde_json::from_slice(&std::fs::read(ref_dir.join("verify_thresholds.json"))?)?,
+        &serde_json::from_slice(&std::fs::read(
+            ref_dir.join("verify_control_positions_r1.json"),
+        )?)?,
+    )?;
     let root =
         PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
     let reference = Reference::load(&root)?;
@@ -2800,36 +3091,6 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
     let eos_ids = engine.model_spec.eos.clone();
     ensure!(!eos_ids.is_empty(), "Runner FAIL GLM EOS ids missing");
 
-    // Read frozen verify thresholds (tau)
-    let ref_dir = PathBuf::from(
-        std::env::var_os("FF_GLM_MTP_REF_DIR").context("FF_GLM_MTP_REF_DIR missing")?,
-    );
-    let tau_path = ref_dir.join("verify_thresholds.json");
-    let thresholds_raw = std::fs::read_to_string(tau_path)?;
-    let thresholds: serde_json::Value = serde_json::from_str(&thresholds_raw)?;
-    let tau_max_abs_per_pos: Vec<f32> = thresholds["tau_max_abs_per_position"]
-        .as_array()
-        .context("tau_max_abs_per_position missing")?
-        .iter()
-        .map(|v| v.as_f64().unwrap() as f32)
-        .collect();
-    let tau_rmse_per_pos: Vec<f32> = thresholds["tau_rmse_per_position"]
-        .as_array()
-        .context("tau_rmse_per_position missing")?
-        .iter()
-        .map(|v| v.as_f64().unwrap() as f32)
-        .collect();
-
-    let control_path = ref_dir.join("verify_control_positions_r1.json");
-    let control_raw = std::fs::read_to_string(control_path)?;
-    let control_json: serde_json::Value = serde_json::from_str(&control_raw)?;
-    let gated_positions: std::collections::BTreeSet<usize> = control_json["gated_positions"]
-        .as_array()
-        .context("gated_positions missing")?
-        .iter()
-        .map(|v| v.as_u64().unwrap() as usize)
-        .collect();
-
     let mut verify_compared_count = 0usize;
     let mut verify_gated_count = 0usize;
     let mut defects: Vec<String> = Vec::new();
@@ -2841,14 +3102,8 @@ fn glm_mtp_speculative_verification_gpu() -> Result<()> {
                              compared_out: &mut usize,
                              gated_out: &mut usize|
      -> Result<(f64, f64)> {
-        let tau_max_abs = tau_max_abs_per_pos
-            .get(p)
-            .copied()
-            .unwrap_or(tau_max_abs_per_pos[0]);
-        let tau_rmse = tau_rmse_per_pos
-            .get(p)
-            .copied()
-            .unwrap_or(tau_rmse_per_pos[0]);
+        let tau_max_abs = verify_position_tau(&tau_max_abs_per_pos, p)?;
+        let tau_rmse = verify_position_tau(&tau_rmse_per_pos, p)?;
         let (row0_max_abs, row0_rmse) =
             crate::verify::max_abs_rmse(&format!("{label}.p{p}"), verify_logits, ref_logits)?;
         if gated_positions.contains(&p) {
