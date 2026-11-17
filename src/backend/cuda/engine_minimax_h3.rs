@@ -154,7 +154,6 @@ struct EntryReader {
     dir: PathBuf,
     readers: BTreeMap<String, SpanReader>,
     staging: Option<AlignedBytes>,
-    align: Option<usize>,
 }
 
 /// One batched direct-read destination: tensor identity plus a disjoint aligned
@@ -165,6 +164,10 @@ struct DirectRead<'a> {
     entry: &'a TensorEntry,
     dest: *mut u8,
     dest_len: usize,
+}
+
+fn align_min() -> usize {
+    4096
 }
 
 /// The batch base pointer, Send by the disjoint-index discipline of `read_many_direct`.
@@ -185,7 +188,6 @@ impl EntryReader {
             dir: dir.to_owned(),
             readers: BTreeMap::new(),
             staging: None,
-            align: None,
         }
     }
 
@@ -303,6 +305,7 @@ impl EntryReader {
                             let Some(queue) = queues.get(queue) else {
                                 return Ok(());
                             };
+                            let mut bounce = AlignedBytes::new(align_min(), align_min())?;
                             for &index in queue {
                                 // SAFETY: each index is owned by exactly one queue and
                                 // therefore one worker; the window is within the arena.
@@ -311,11 +314,12 @@ impl EntryReader {
                                 let destination = unsafe {
                                     std::slice::from_raw_parts_mut(request.dest, request.dest_len)
                                 };
-                                Self::read_pinned(
+                                Self::read_bounced(
                                     readers,
                                     request.name,
                                     request.entry,
                                     destination,
+                                    &mut bounce,
                                 )?;
                             }
                         }
@@ -331,13 +335,13 @@ impl EntryReader {
         })
     }
 
-    /// One aligned direct read into a caller-owned pinned destination, planned from the
-    /// tensor's file span. The destination slice must start aligned and hold the padded span.
-    fn read_pinned(
+    /// One tensor through an aligned worker bounce into its packed destination.
+    fn read_bounced(
         readers: &BTreeMap<String, SpanReader>,
         name: &str,
         entry: &TensorEntry,
         destination: &mut [u8],
+        bounce: &mut AlignedBytes,
     ) -> Result<()> {
         let reader = readers
             .get(&entry.shard)
@@ -359,21 +363,25 @@ impl EntryReader {
             .min(usize::try_from(reader.file_len() - begin)?)
             .max(entry.bytes + head);
         ensure!(
-            destination.len() >= width,
-            "{name}: pinned slot holds {} of {width}",
-            destination.len()
+            destination.len() >= entry.bytes,
+            "{name}: dense slot holds {} of {}",
+            destination.len(),
+            entry.bytes
         );
-        // SAFETY: the destination is a disjoint aligned sub-range of the pinned arena
-        // and `width` is within its bounds, checked above.
-        let span = unsafe { std::slice::from_raw_parts_mut(destination.as_mut_ptr(), width) };
+        if bounce.len() < width + align {
+            *bounce = AlignedBytes::new(width + align, align)?;
+        }
+        let span = bounce.as_mut();
         reader.read_direct(begin, width as u64, span)?;
+        destination[..entry.bytes].copy_from_slice(&span[head..head + entry.bytes]);
         Ok(())
     }
 
     /// Direct-IO alignment of this checkpoint's shards in BF16 elements; every shard of one
     /// checkpoint directory shares the filesystem, so the first reader's alignment stands.
+    #[cfg(test)]
     fn align_elements(&mut self) -> Result<usize> {
-        if self.align.is_none() {
+        {
             let shard = self.readers.keys().next().cloned().map_or_else(
                 || {
                     let mut first = self
@@ -403,9 +411,8 @@ impl EntryReader {
                 alignment.is_multiple_of(2) && alignment <= usize::MAX as u64 / 2,
                 "direct alignment {alignment} is not a whole BF16 element multiple"
             );
-            self.align = Some(alignment as usize / 2);
+            Ok(alignment as usize / 2)
         }
-        Ok(self.align.unwrap_or(0))
     }
 
     /// Bytes `start..start + bytes` of the tensor, read with O_DIRECT into the reusable aligned staging buffer.
@@ -920,7 +927,6 @@ fn matrix_layout(
     manifest: &TensorManifest,
     block: &str,
     roles: &[&str],
-    align_elements: usize,
 ) -> Result<(MatrixLayout, usize)> {
     let prefix = format!("{block}.");
     let mut layout = BTreeMap::new();
@@ -933,11 +939,6 @@ fn matrix_layout(
             continue;
         }
         ensure!(entry.dtype == Dtype::BF16, "{name} is not BF16");
-        if align_elements > 0 {
-            elements = elements
-                .next_multiple_of(align_elements)
-                .max(elements + align_elements);
-        }
         layout.insert(
             role.to_owned(),
             (
@@ -968,7 +969,7 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
-        let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES, 0)?;
+        let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         let mut storage = s.alloc_zeros::<bf16>(elements)?;
         for (role, (offset, shape)) in &layout {
             let count = shape[0] as usize * shape[1] as usize;
@@ -995,12 +996,7 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: Option<&mut Source<'_>>,
     ) -> Result<Self> {
-        let (layout, _) = matrix_layout(
-            base.manifest,
-            block,
-            &LINEAR_ROLES,
-            base.reader.align_elements()?,
-        )?;
+        let (layout, _) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         Self::with_linears::<LORA>(s, spec, rank, block, (slot, &layout), base, lora)
     }
 
@@ -3040,15 +3036,13 @@ fn place_layers(
             plan,
             d,
             None,
-            base.reader.align_elements()?,
+            0,
         )?;
-        let align_elements = base.reader.align_elements()?;
         let mut requests = Vec::new();
         let mut checks = Vec::new();
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
-            let (layout, padded_elements) =
-                matrix_layout(base.manifest, &name, roles, align_elements)?;
+            let (layout, _) = matrix_layout(base.manifest, &name, roles)?;
             let host = dense
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
@@ -3056,24 +3050,16 @@ fn place_layers(
                 host.len() >= source_layers[layer],
                 "{name}: pinned copy size"
             );
-            let mut source_offset = 2 * padded_elements;
+            let mut source_offset = 0usize;
             for (role, (offset, _)) in &layout {
                 let tensor = format!("{name}.{role}");
                 let entry = &base.manifest.entries[&tensor];
-                if entry.quant.is_some() {
-                    source_offset = source_offset
-                        .max(source_layers[layer] - entry.bytes)
-                        .next_multiple_of(2 * align_elements);
-                }
+
                 let at = if entry.quant.is_some() {
                     source_offset
                 } else {
                     2 * offset
                 };
-                ensure!(
-                    at.is_multiple_of(2 * align_elements),
-                    "{tensor}: dense slot offset {at} is unaligned"
-                );
                 requests.push((
                     tensor.clone(),
                     (entry.clone(), host.as_mut_ptr(), host.len(), at),
@@ -3486,7 +3472,7 @@ fn place_stored_layers(
             plan,
             d,
             Some(&order),
-            base.reader.align_elements()?,
+            0,
         )?;
         for (layer, names) in order.iter().enumerate() {
             if !dense.plan.host[layer] {
@@ -4822,16 +4808,7 @@ impl TextLayer {
         slot: Option<u64>,
         base: &mut Source<'_>,
     ) -> Result<Self> {
-        let (layout, elements) = matrix_layout(
-            base.manifest,
-            block,
-            &TEXT_ROLES,
-            if slot.is_some() {
-                base.reader.align_elements()?
-            } else {
-                0
-            },
-        )?;
+        let (layout, elements) = matrix_layout(base.manifest, block, &TEXT_ROLES)?;
         let mut storage = None;
         let at = match slot {
             Some(slot) => slot,
@@ -14268,14 +14245,12 @@ mod h3_direct_batch_tests {
         ];
         let mut reader = EntryReader::new(&dir);
         ensure!(reader.align_elements()? == align / 2, "sensed alignment");
-        // One pinned arena; each tensor's data offset is aligned with a full
-        // alignment of head slack after the previous tensor's data.
+        // Packed destinations at arbitrary offsets, as the dense fill produces.
         let mut offsets = [0usize; 2];
         let mut cursor = 0usize;
         for (index, entry) in entries.iter().enumerate() {
-            cursor = (cursor + align).next_multiple_of(align);
-            offsets[index] = cursor;
-            cursor += entry.bytes;
+            offsets[index] = cursor + 123;
+            cursor += entry.bytes + 123;
         }
         let total = cursor + 2 * align;
         let mut arena = AlignedBytes::new(total, align)?;
@@ -14290,8 +14265,7 @@ mod h3_direct_batch_tests {
         }
         reader.read_many_direct(&mut requests)?;
         for (index, entry) in entries.iter().enumerate() {
-            let head = (entry.data_start as usize) % align;
-            let got = &arena.as_mut()[offsets[index] + head..offsets[index] + head + entry.bytes];
+            let got = &arena.as_mut()[offsets[index]..offsets[index] + entry.bytes];
             let want = &file[entry.data_start as usize..entry.data_start as usize + entry.bytes];
             ensure!(got == want, "tensor {index}: batch bytes differ");
         }
