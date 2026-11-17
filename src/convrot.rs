@@ -1533,8 +1533,9 @@ mod device {
         qweight: &[i8],
         wscale: &[f32],
         k: usize,
-        weight_off: u64,
+        window: (u64, u64),
     ) -> Result<Vec<bf16>> {
+        let (weight_off, scale_off) = window;
         let n = wscale.len();
         let rows = scales.len();
         ensure!(
@@ -1546,9 +1547,20 @@ mod device {
             "convrot product shape"
         );
         let off = usize::try_from(weight_off)?;
+        let scale_extra = usize::try_from(scale_off)?;
         let stream = &device.stream;
         let codes_d = stream.clone_htod(codes)?;
-        let scales_d = stream.clone_htod(scales)?;
+        let scales_d = if scale_extra == 0 {
+            stream.clone_htod(scales)?
+        } else {
+            let mut scale_buf = Vec::with_capacity(rows + scale_extra);
+            scale_buf.extend_from_slice(scales);
+            for i in 0..scale_extra {
+                let row = rows + i;
+                scale_buf.push(((row * 5) % 7 + 1) as f32 * 1.0e-3);
+            }
+            stream.clone_htod(&scale_buf)?
+        };
         let weight_d = stream.clone_htod(&qweight[off..off + n * k])?;
         let wscale_d = stream.clone_htod(wscale)?;
         let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
@@ -1563,7 +1575,7 @@ mod device {
                 y: y_d.device_ptr(stream).0,
                 rotated: 0,
                 codes: codes_d.device_ptr(stream).0,
-                scales: scales_d.device_ptr(stream).0,
+                scales: scales_d.device_ptr(stream).0 + scale_off * 4,
                 rows: i32::try_from(rows)?,
                 k: i32::try_from(k)?,
                 n: i32::try_from(n)?,
@@ -1589,7 +1601,8 @@ mod device {
                     host_diff == 0,
                     "host product rows={rows} n={n} differ {host_diff}"
                 );
-                let got = launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, 0)?;
+                let got =
+                    launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, (0, 0))?;
                 let differ = bit_diff(&got, &host);
                 println!("CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ}");
                 ensure!(
@@ -1603,21 +1616,29 @@ mod device {
         let n = 40usize;
         let (codes, scales, qweight, wscale) = fixture(rows, k, n);
         let host = host_product(&codes, &scales, k, &qweight, n, &wscale)?;
-        let got = launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, 0)?;
+        let got = launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, (0, 0))?;
         let differ = bit_diff(&got, &host);
         println!(
             "CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ} macs={}",
             rows * k * n
         );
         ensure!(differ == 0, "convrot product production differ {differ}");
-        let mut extended = qweight;
+        let mut extended = qweight.clone();
         extended.push(0x5a);
-        let shifted = launch_product_at(&device, &codes, &scales, &extended, &wscale, k, 1)?;
+        let shifted = launch_product_at(&device, &codes, &scales, &extended, &wscale, k, (1, 0))?;
         let moved = bit_diff(&shifted, &host);
         println!("CONVROT_PRODUCT_K_OFFSET differ={moved}");
         ensure!(
             moved > 0,
             "one-int8 K offset matched the unshifted host product"
+        );
+        let scale_shifted =
+            launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, (0, 1))?;
+        let scale_moved = bit_diff(&scale_shifted, &host);
+        println!("CONVROT_PRODUCT_SCALE_INDEX differ={scale_moved}");
+        ensure!(
+            scale_moved > 0,
+            "scale index off by one matched the host product"
         );
         Ok(())
     }
@@ -1655,6 +1676,11 @@ mod device {
                 .arg(&path)
                 .output()
                 .context("cuobjdump")?;
+            let resources = std::process::Command::new(cuobjdump_bin())
+                .arg("-res-usage")
+                .arg(&path)
+                .output()
+                .context("cuobjdump resources")?;
             let _ = std::fs::remove_file(&path);
             let text = String::from_utf8_lossy(&output.stdout);
             let err = String::from_utf8_lossy(&output.stderr);
@@ -1669,9 +1695,46 @@ mod device {
                 body.contains("IMMA.16832.S8.S8"),
                 "sm_{sm} convrot_product lacks IMMA.16832.S8.S8"
             );
-            println!("CONVROT_PRODUCT_SASS sm_{sm} IMMA.16832.S8.S8");
+            let ldg = body.matches("LDG.E.CONSTANT").count();
+            ensure!(
+                ldg == 20,
+                "sm_{sm} convrot_product scale LDG.E.CONSTANT {ldg}"
+            );
+            let usage = String::from_utf8_lossy(&resources.stdout);
+            let usage_err = String::from_utf8_lossy(&resources.stderr);
+            ensure!(
+                resources.status.success(),
+                "cuobjdump resources sm_{sm} status {} {usage_err}",
+                resources.status
+            );
+            let (reg, stack, local) = product_resources(&usage)
+                .with_context(|| format!("sm_{sm} convrot_product resources"))?;
+            ensure!(
+                reg <= 124 && stack == 0 && local == 0,
+                "sm_{sm} convrot_product REG={reg} STACK={stack} LOCAL={local}"
+            );
+            println!(
+                "CONVROT_PRODUCT_SASS sm_{sm} IMMA.16832.S8.S8 LDG={ldg} REG={reg} STACK={stack} LOCAL={local}"
+            );
         }
         Ok(())
+    }
+
+    fn product_resources(dump: &str) -> Result<(u32, u32, u32)> {
+        let marker = "Function convrot_product:";
+        let rest = dump
+            .find(marker)
+            .map(|start| &dump[start + marker.len()..])
+            .context("convrot_product resources")?;
+        let end = rest.find("Function ").unwrap_or(rest.len());
+        let block = &rest[..end];
+        let field = |name: &str| -> Result<u32> {
+            block
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix(name)?.parse().ok())
+                .with_context(|| format!("missing {name}"))
+        };
+        Ok((field("REG:")?, field("STACK:")?, field("LOCAL:")?))
     }
 
     fn count_i8(got: &[i8], expected: &[i8]) -> usize {
@@ -1855,7 +1918,7 @@ mod device {
             &kept_weight,
             &kept_wscale,
             k,
-            0,
+            (0, 0),
         )?;
         let moved = bit_diff(&shifted, &kept_y);
         println!("CONVROT_SHARED_MUTANT differ={moved}");
