@@ -1881,7 +1881,6 @@ struct DenseEntry {
 #[cfg(feature = "cuda")]
 struct DenseLayer {
     slot: Option<usize>,
-    next: Option<usize>,
     next_disk: Option<usize>,
     bytes: usize,
     source_bytes: usize,
@@ -1962,7 +1961,6 @@ impl DenseStreaming {
             .iter()
             .map(|&slot| DenseLayer {
                 slot,
-                next: None,
                 next_disk: None,
                 bytes: 0,
                 source_bytes: 0,
@@ -2064,16 +2062,11 @@ impl DenseStreaming {
             .max()
             .unwrap_or(0);
         let first_disk = (0..layers.len()).find(|&i| layers[i].slot.is_some() && !plan.host[i]);
-        let mut next = None;
         let mut next_disk = first_disk;
         for (index, layer) in layers.iter_mut().enumerate().rev() {
-            layer.next = next;
             layer.next_disk = next_disk;
-            if layer.slot.is_some() {
-                next = Some(index);
-                if !plan.host[index] {
-                    next_disk = Some(index);
-                }
+            if layer.slot.is_some() && !plan.host[index] {
+                next_disk = Some(index);
             }
         }
         #[cfg(test)]
@@ -2244,17 +2237,20 @@ impl DenseStreaming {
         Ok(())
     }
 
-    fn prime(&mut self) -> Result<()> {
-        for slot in 0..self.slots.len() {
-            if let Some(first) = self
-                .layers
-                .iter()
-                .position(|layer| layer.slot == Some(slot))
-            {
-                self.prefetch(first)?;
-            }
+    pub(crate) fn prime(&mut self) -> Result<()> {
+        for layer in crate::prefill::streaming_prime_layers(&self.plan.slots, self.slots.len()) {
+            self.prefetch(layer)?;
         }
         self.pump_disk()
+    }
+
+    fn prefetch_lookahead(&mut self, layer: usize) -> Result<()> {
+        if let Some(ahead) =
+            crate::prefill::streaming_lookahead(&self.plan.slots, layer, self.slots.len())
+        {
+            self.prefetch(ahead)?;
+        }
+        Ok(())
     }
 
     fn pump_disk(&mut self) -> Result<()> {
@@ -2465,6 +2461,7 @@ impl DenseStreaming {
 
     pub(crate) fn begin(&mut self, layer: usize, stream: &Arc<CudaStream>) -> Result<()> {
         self.prefetch(layer)?;
+        self.prefetch_lookahead(layer)?;
         if let Some(slot) = self.layers[layer].slot {
             stream.wait(&self.slots[slot].ready)?;
         }
@@ -2475,9 +2472,7 @@ impl DenseStreaming {
         if let Some(slot) = self.layers[layer].slot {
             self.slots[slot].retired.record(stream)?;
             self.slots[slot].retired_valid = true;
-            if let Some(next) = self.layers[layer].next {
-                self.prefetch(next)?;
-            }
+            self.prefetch_lookahead(layer)?;
         }
         Ok(())
     }

@@ -347,6 +347,38 @@ pub(crate) fn streaming_slot_count(
     Ok(if copy_seconds <= layer_seconds { 2 } else { 3 })
 }
 
+/// Streamed layers in execution order.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn streamed_layers(slots: &[Option<usize>]) -> Vec<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| slot.map(|_| index))
+        .collect()
+}
+
+/// The first `slot_count - 1` streamed layers, issued at setup.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn streaming_prime_layers(slots: &[Option<usize>], slot_count: usize) -> Vec<usize> {
+    streamed_layers(slots)
+        .into_iter()
+        .take(slot_count.saturating_sub(1))
+        .collect()
+}
+
+/// Streamed layer `slot_count - 1` positions after `layer`.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn streaming_lookahead(
+    slots: &[Option<usize>],
+    layer: usize,
+    slot_count: usize,
+) -> Option<usize> {
+    let depth = slot_count.checked_sub(1)?;
+    let order = streamed_layers(slots);
+    let position = order.iter().position(|&index| index == layer)?;
+    order.get(position.checked_add(depth)?).copied()
+}
+
 #[derive(Debug, Serialize)]
 pub struct Plan {
     pub chunk: usize,
@@ -438,8 +470,8 @@ impl Plan {
 mod tests {
     use super::{
         Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes, fitting_slot_bytes,
-        host_staging_fits, pcie_payload_bytes_per_second, prompt_direct_max_rows,
-        streaming_slot_count,
+        host_staging_fits, pcie_payload_bytes_per_second, prompt_direct_max_rows, streamed_layers,
+        streaming_lookahead, streaming_prime_layers, streaming_slot_count,
     };
 
     #[test]
@@ -484,6 +516,131 @@ mod tests {
             sequence += 1;
         }
         assert_eq!(sequence, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn three_slot_lookahead_is_issued_before_compute() -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+        let bytes = 100usize;
+        let width = vec![bytes; 50];
+        let plan =
+            super::DensePlacement::with_allocations(&width, &width, None, 27 * bytes, 0, 0, 3)?;
+        let order = streamed_layers(&plan.slots);
+        assert_eq!(order.len(), 26);
+        assert_eq!(streaming_prime_layers(&plan.slots, 3), order[..2]);
+        assert_eq!(
+            streaming_lookahead(&plan.slots, order[0], 3),
+            Some(order[2])
+        );
+        assert_eq!(
+            streaming_lookahead(&plan.slots, order[0], 2),
+            Some(order[1])
+        );
+        let run = |prime: &[usize], ahead: &dyn Fn(usize) -> Option<usize>, begin_ahead: bool| {
+            fn issue(
+                layer: usize,
+                slots: &[Option<usize>],
+                issued: &mut BTreeSet<usize>,
+                live: &mut BTreeSet<usize>,
+                holder: &mut [Option<usize>],
+                max_live: &mut usize,
+                reused_before_retire: &mut bool,
+            ) {
+                if !issued.insert(layer) {
+                    return;
+                }
+                let slot = slots[layer].expect("streamed");
+                if let Some(previous) = holder[slot]
+                    && live.contains(&previous)
+                {
+                    *reused_before_retire = true;
+                }
+                holder[slot] = Some(layer);
+                live.insert(layer);
+                *max_live = (*max_live).max(live.len());
+            }
+            let mut issued = BTreeSet::new();
+            let mut live = BTreeSet::new();
+            let mut holder = vec![None; 3];
+            let mut max_live = 0usize;
+            let mut reused_before_retire = false;
+            let mut before_compute = Vec::new();
+            for &layer in prime {
+                issue(
+                    layer,
+                    &plan.slots,
+                    &mut issued,
+                    &mut live,
+                    &mut holder,
+                    &mut max_live,
+                    &mut reused_before_retire,
+                );
+            }
+            for layer in 0..width.len() {
+                if plan.slots[layer].is_none() {
+                    continue;
+                }
+                issue(
+                    layer,
+                    &plan.slots,
+                    &mut issued,
+                    &mut live,
+                    &mut holder,
+                    &mut max_live,
+                    &mut reused_before_retire,
+                );
+                if begin_ahead && let Some(target) = ahead(layer) {
+                    issue(
+                        target,
+                        &plan.slots,
+                        &mut issued,
+                        &mut live,
+                        &mut holder,
+                        &mut max_live,
+                        &mut reused_before_retire,
+                    );
+                }
+                before_compute.push(issued.clone());
+                live.remove(&layer);
+                if let Some(target) = ahead(layer) {
+                    issue(
+                        target,
+                        &plan.slots,
+                        &mut issued,
+                        &mut live,
+                        &mut holder,
+                        &mut max_live,
+                        &mut reused_before_retire,
+                    );
+                }
+            }
+            (before_compute, max_live, reused_before_retire)
+        };
+        let next = |layer: usize| {
+            let position = order.iter().position(|&index| index == layer)?;
+            order.get(position + 1).copied()
+        };
+        let (old, _, _) = run(&[], &next, false);
+        assert!(
+            !old[0].contains(&order[1]) || !old[0].contains(&order[2]),
+            "one-ahead schedule already issued both lookahead layers"
+        );
+        let (scheduled, max_live, reused_before_retire) = run(
+            &streaming_prime_layers(&plan.slots, 3),
+            &|layer| streaming_lookahead(&plan.slots, layer, 3),
+            true,
+        );
+        for position in 0..order.len().saturating_sub(2) {
+            assert!(
+                scheduled[position].contains(&order[position + 1])
+                    && scheduled[position].contains(&order[position + 2]),
+                "layer {} compute started without both lookahead copies",
+                order[position]
+            );
+        }
+        assert!(max_live <= 3, "in flight {max_live}");
+        assert!(!reused_before_retire);
         Ok(())
     }
 

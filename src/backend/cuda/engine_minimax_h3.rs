@@ -3331,6 +3331,7 @@ fn place_layers(
                 ensure!(finite, "{tensor}: nonfinite value");
             }
         }
+        dense.prime()?;
         Some(dense)
     } else {
         None
@@ -3802,6 +3803,7 @@ fn place_stored_layers(
                 "transformer_blocks.{layer}: pinned copy size"
             );
         }
+        dense.prime()?;
         Some(dense)
     } else {
         None
