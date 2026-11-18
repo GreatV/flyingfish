@@ -62,22 +62,57 @@ fn compile_device(
             "cargo:warning=device {pin} sm_{sm}: {}",
             String::from_utf8_lossy(&result.stderr).replace('\n', " | ")
         );
+        let ptx_path = target.join("nvptx64-nvidia-cuda/release/flyingfish_device.ptx");
+        let ptx = fs::read_to_string(&ptx_path).expect("read native attention PTX");
+        let (prefix, declared, suffix) = ptx
+            .split_once("\n.version ")
+            .and_then(|(prefix, rest)| {
+                rest.split_once('\n')
+                    .map(|(version, suffix)| (prefix, version, suffix))
+            })
+            .unwrap_or_else(|| panic!("native attention sm_{sm} PTX has no .version"));
+        let version = declared
+            .split_once('.')
+            .and_then(|(major, minor)| {
+                Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?))
+            })
+            .unwrap_or_else(|| panic!("invalid native attention sm_{sm} PTX version: {declared}"));
+        // cvt.f32.bf16 requires PTX 7.1 on sm_80 and later.
+        let (major, minor) = if ptx
+            .split_ascii_whitespace()
+            .any(|word| word == "cvt.f32.bf16")
+        {
+            version.max((7, 1))
+        } else {
+            version
+        };
+        let ptx_path = if (major, minor) != version {
+            let assembler_input = target.join("attention_native.ptx");
+            fs::write(
+                &assembler_input,
+                format!("{prefix}\n.version {major}.{minor}\n{suffix}"),
+            )
+            .expect("set native attention PTX ISA");
+            assembler_input
+        } else {
+            ptx_path
+        };
         let filename = format!("attention_native_sm{sm}.cubin");
         let result = Command::new(&ptxas)
             .args(["-O3", "-v"])
             .arg(format!("-arch=sm_{sm}"))
-            .arg(target.join("nvptx64-nvidia-cuda/release/flyingfish_device.ptx"))
+            .arg(&ptx_path)
             .arg("-o")
             .arg(out.join(&filename))
             .output()
             .expect("cannot assemble native Rust attention");
         assert!(
             result.status.success(),
-            "native attention ptxas sm_{sm} failed:\n{}",
+            "native attention ptxas sm_{sm} with PTX {major}.{minor} failed:\n{}",
             String::from_utf8_lossy(&result.stderr)
         );
         println!(
-            "cargo:warning=native attention sm_{sm}: {}",
+            "cargo:warning=native attention sm_{sm} PTX {major}.{minor}: {}",
             String::from_utf8_lossy(&result.stderr).replace('\n', " | ")
         );
         index.push_str(&format!("(\"attention_native\", {sm}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
