@@ -157,8 +157,8 @@ struct EntryReader {
 }
 
 /// One batched direct-read destination: tensor identity plus a disjoint writable
-/// window of the pinned arena at the tensor's packed offset; only the owning worker
-/// thread dereferences it.
+/// window of the pinned arena at the tensor's packed offset, exactly its
+/// `entry.bytes`; only the owning worker thread dereferences it.
 struct DirectRead<'a> {
     name: &'a str,
     entry: &'a TensorEntry,
@@ -276,7 +276,17 @@ impl EntryReader {
     /// Readers are opened first on this thread; each worker then owns whole shard queues,
     /// so every destination is touched by exactly one thread.
     fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>]) -> Result<()> {
-        ensure!(!requests.is_empty(), "empty direct batch");
+        let mut spans: Vec<(*mut u8, usize)> = requests
+            .iter()
+            .map(|request| (request.dest, request.dest_len))
+            .collect();
+        spans.sort_unstable();
+        for window in spans.windows(2) {
+            ensure!(
+                window[0].0.wrapping_add(window[0].1) <= window[1].0,
+                "direct batch destination windows overlap"
+            );
+        }
         for request in requests.iter() {
             if !self.readers.contains_key(&request.entry.shard) {
                 let reader = SpanReader::open(&self.dir.join(&request.entry.shard), true)?;
@@ -3016,21 +3026,18 @@ fn place_layers(
                 } else {
                     2 * offset
                 };
-                requests.push((
-                    tensor.clone(),
-                    (entry.clone(), host.as_mut_ptr(), host.len(), at),
-                ));
+                requests.push((tensor.clone(), (entry.clone(), host.as_mut_ptr(), at)));
                 checks.push((layer, tensor, entry.clone(), at));
                 source_offset += entry.bytes;
             }
         }
         let mut batch = requests
             .iter_mut()
-            .map(|(tensor, (entry, base, len, at))| DirectRead {
+            .map(|(tensor, (entry, base, at))| DirectRead {
                 name: tensor,
                 entry,
                 dest: unsafe { base.add(*at) },
-                dest_len: *len - *at,
+                dest_len: entry.bytes,
             })
             .collect::<Vec<_>>();
         base.reader.read_many_direct(&mut batch)?;
@@ -14214,7 +14221,7 @@ mod h3_direct_batch_tests {
                 name: "t",
                 entry,
                 dest: unsafe { arena.as_mut().as_mut_ptr().add(offsets[index]) },
-                dest_len: total - offsets[index],
+                dest_len: entry.bytes,
             });
         }
         reader.read_many_direct(&mut requests)?;
@@ -14223,6 +14230,26 @@ mod h3_direct_batch_tests {
             let want = &file[entry.data_start as usize..entry.data_start as usize + entry.bytes];
             ensure!(got == want, "tensor {index}: batch bytes differ");
         }
+        reader.read_many_direct(&mut [])?;
+        let entry = &entries[0];
+        let mut overlap = [
+            DirectRead {
+                name: "t",
+                entry,
+                dest: arena.as_mut().as_mut_ptr(),
+                dest_len: total,
+            },
+            DirectRead {
+                name: "t",
+                entry,
+                dest: unsafe { arena.as_mut().as_mut_ptr().add(offsets[0]) },
+                dest_len: entry.bytes,
+            },
+        ];
+        ensure!(
+            reader.read_many_direct(&mut overlap).is_err(),
+            "overlapping destination windows accepted"
+        );
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
