@@ -944,6 +944,43 @@ __device__ __forceinline__ void frame_im2col(
         (volume && (first + rows > uint64_t(depth) * height * width || !(k & 1)))) { __trap(); return; }
     const uint32_t taps = k * k, frame_cols = kt * taps;
     const uint64_t cols = uint64_t(channels) * frame_cols, count = uint64_t(rows) * cols;
+    if (!volume && taps <= 9 && sizeof(T) == 4) {
+        if (cols % 4 == 0 && (reinterpret_cast<uintptr_t>(a) & 15)) { __trap(); return; }
+        __shared__ uint64_t source[9];
+        for (uint64_t r = blockIdx.x; r < rows; r += gridDim.x) {
+            const uint64_t p = first + r;
+            const int oy = int(p / out_w), ox = int(p % out_w);
+            if (threadIdx.x == 0) {
+                for (uint32_t j = 0; j < taps; ++j) {
+                    const int iy = reflect_index(oy * int(stride) + int(j / k) - int(pad), int(height));
+                    const int ix = reflect_index(ox * int(stride) + int(j % k) - int(pad), int(width));
+                    source[j] = uint64_t(iy) * width + uint64_t(ix);
+                }
+            }
+            __syncthreads();
+            for (uint64_t col = threadIdx.x * 4; col < cols; col += uint64_t(blockDim.x) * 4) {
+                auto value_at = [&](uint64_t index) -> float {
+                    const uint32_t c = index / frame_cols, rem = index % frame_cols;
+                    if (rem / taps + 1 < kt) return 0.0f;
+                    return float(x[layout ? uint64_t(c) * height * width + source[rem % taps]
+                                         : source[rem % taps] * channels + c]);
+                };
+                if (cols % 4 == 0) {
+                    float4 value;
+                    value.x = value_at(col);
+                    value.y = value_at(col + 1);
+                    value.z = value_at(col + 2);
+                    value.w = value_at(col + 3);
+                    *reinterpret_cast<float4*>(a + r * cols + col) = value;
+                } else {
+                    const uint64_t end = col + 4 < cols ? col + 4 : cols;
+                    for (uint64_t index = col; index < end; ++index) a[r * cols + index] = T(value_at(index));
+                }
+            }
+            __syncthreads();
+        }
+        return;
+    }
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const uint64_t r = i / cols;

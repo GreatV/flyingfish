@@ -3725,6 +3725,207 @@ mod image_tests {
         result
     }
 
+    #[test]
+    #[ignore = "GPU; production and ragged im2col indexing"]
+    fn causal_frame_im2col_matches_cpu_indexing_gpu() -> Result<()> {
+        struct Case {
+            name: &'static str,
+            channels: usize,
+            height: usize,
+            width: usize,
+            out_w: usize,
+            kt: usize,
+            k: usize,
+            stride: usize,
+            pad: usize,
+            first: usize,
+            rows: usize,
+            layout: u32,
+        }
+        fn expected(case: &Case, x: &[f32]) -> Vec<f32> {
+            let taps = case.k * case.k;
+            let frame_cols = case.kt * taps;
+            let cols = case.channels * frame_cols;
+            let reflect = |i: isize, n: usize| {
+                let n = n as isize;
+                if i < 0 {
+                    -i
+                } else if i >= n {
+                    2 * (n - 1) - i
+                } else {
+                    i
+                }
+            };
+            let mut out = vec![0.0f32; case.rows * cols];
+            for (i, value) in out.iter_mut().enumerate() {
+                let r = i / cols;
+                let col = i - r * cols;
+                let c = col / frame_cols;
+                let rem = col - c * frame_cols;
+                if rem / taps + 1 < case.kt {
+                    continue;
+                }
+                let j = rem % taps;
+                let p = case.first + r;
+                let (oy, ox) = (p / case.out_w, p % case.out_w);
+                let iy = reflect(
+                    (oy * case.stride + j / case.k) as isize - case.pad as isize,
+                    case.height,
+                ) as usize;
+                let ix = reflect(
+                    (ox * case.stride + j % case.k) as isize - case.pad as isize,
+                    case.width,
+                ) as usize;
+                let pixel = iy * case.width + ix;
+                *value = x[if case.layout == 1 {
+                    c * case.height * case.width + pixel
+                } else {
+                    pixel * case.channels + c
+                }];
+            }
+            out
+        }
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let kernel =
+            cubin::module(&device.ctx, "vision_ops")?.load_function("causal_frame_im2col_f32")?;
+        let run = |case: &Case, negative: bool| -> Result<(Vec<f32>, Vec<f32>)> {
+            let taps = case.k * case.k;
+            let cols = case.channels * case.kt * taps;
+            let count = case.rows * cols;
+            let mut x: Vec<f32> = (0..case.channels * case.height * case.width)
+                .map(|i| ((i * 37 % 251) as f32 - 125.0) / 17.0)
+                .collect();
+            if negative {
+                let center = 2 * case.channels;
+                x[center] += 1.0;
+            }
+            let want = expected(case, &x);
+            let input = s.clone_htod(&x)?;
+            let mut output = s.clone_htod(&vec![-12345.5f32; count + 16])?;
+            unsafe {
+                s.launch_builder(&kernel)
+                    .arg(&input)
+                    .arg(&mut output)
+                    .arg(&(case.channels as u32))
+                    .arg(&(case.height as u32))
+                    .arg(&(case.width as u32))
+                    .arg(&(case.out_w as u32))
+                    .arg(&(case.kt as u32))
+                    .arg(&(case.k as u32))
+                    .arg(&(case.stride as u32))
+                    .arg(&(case.pad as u32))
+                    .arg(&(case.first as u64))
+                    .arg(&(case.rows as u32))
+                    .arg(&case.layout)
+                    .launch(flat(count))?;
+            }
+            let got = s.clone_dtoh(&output)?;
+            ensure!(
+                got[count..].iter().all(|&v| v == -12345.5),
+                "guard overwrite"
+            );
+            let got = got[..count].to_vec();
+            if got != want {
+                let differences: Vec<usize> = got
+                    .iter()
+                    .zip(&want)
+                    .enumerate()
+                    .filter_map(|(i, (a, b))| (a.to_bits() != b.to_bits()).then_some(i))
+                    .take(8)
+                    .collect();
+                anyhow::bail!(
+                    "{} mismatches in {} at {differences:?}",
+                    got.len(),
+                    case.name
+                );
+            }
+            Ok((got, want))
+        };
+        for (name, layout) in [("production", 0), ("production-layout1", 1)] {
+            run(
+                &Case {
+                    name,
+                    channels: 512,
+                    height: 256,
+                    width: 256,
+                    out_w: 256,
+                    kt: 3,
+                    k: 3,
+                    stride: 1,
+                    pad: 1,
+                    first: 0,
+                    rows: 1024,
+                    layout,
+                },
+                false,
+            )?;
+        }
+        for layout in [0, 1] {
+            let ragged = Case {
+                name: "ragged",
+                channels: 3,
+                height: 5,
+                width: 7,
+                out_w: 7,
+                kt: 3,
+                k: 3,
+                stride: 1,
+                pad: 1,
+                first: 2,
+                rows: 5,
+                layout,
+            };
+            let (base, _) = run(&ragged, false)?;
+            let (negative, _) = run(&ragged, true)?;
+            ensure!(
+                base != negative,
+                "one-pixel control did not change the output"
+            );
+        }
+        for layout in [0, 1] {
+            run(
+                &Case {
+                    name: "stride2",
+                    channels: 5,
+                    height: 6,
+                    width: 8,
+                    out_w: 4,
+                    kt: 3,
+                    k: 3,
+                    stride: 2,
+                    pad: 0,
+                    first: 0,
+                    rows: 12,
+                    layout,
+                },
+                false,
+            )?;
+        }
+        run(
+            &Case {
+                name: "pointwise",
+                channels: 7,
+                height: 5,
+                width: 7,
+                out_w: 7,
+                kt: 1,
+                k: 1,
+                stride: 1,
+                pad: 0,
+                first: 0,
+                rows: 5,
+                layout: 0,
+            },
+            false,
+        )?;
+        println!(
+            "CAUSAL_FRAME_IM2COL_GATE PASS production=2 layouts=4 edge_cases=5 control=DIFFERS"
+        );
+        Ok(())
+    }
+
     fn encoder_layouts(device: &Device, encoder: &KeyframeEncoder) -> Result<usize> {
         let s = &device.stream;
         let rgb: Vec<f32> = (0..60).map(|i| ((i * 37) % 251) as f32 / 8.0).collect();
