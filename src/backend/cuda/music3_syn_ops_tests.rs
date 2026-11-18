@@ -1137,10 +1137,9 @@ mod pair_flow {
     }
 
     /// Pair flow, teacher-forced: one batched call on captured x_t/cond must
-    /// reproduce both captured branch velocities. Also the fused guided
-    /// update on captured tensors vs the captured next x_t.
+    /// reproduce both captured branch velocities within the BF16 frozen cells.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN"]
     fn music3_syn_pair_flow_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
@@ -1156,6 +1155,15 @@ mod pair_flow {
             "FF_MUSIC3_CAPTURE",
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
+        let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN")?),
+        )?)?;
+        let bound_c = frozen["cells"]["flow_velocity_cond"]["bound"]
+            .as_f64()
+            .context("pair cond bound missing")?;
+        let bound_u = frozen["cells"]["flow_velocity_uncond"]["bound"]
+            .as_f64()
+            .context("pair uncond bound missing")?;
         let s = engine.stream.clone();
         let channels = engine.spec.in_channels as usize;
         let cond_dim = engine.spec.cond_out as usize;
@@ -1185,14 +1193,14 @@ mod pair_flow {
             .map(|(a, b)| (a - b).abs() as f64)
             .fold(0.0, f64::max);
         println!(
-            "PAIR_FLOW cond max_abs={dc:.6e} uncond max_abs={du:.6e} (FF_MUSIC3_FROZEN cells: cond 9.796142e-03, uncond 2.662754e-02)"
+            "PAIR_FLOW cond max_abs={dc:.6e} (bound {bound_c:.6e}) uncond max_abs={du:.6e} (bound {bound_u:.6e})"
         );
         ensure!(
-            dc <= 9.796142e-3,
+            dc <= bound_c,
             "pair cond velocity exceeds the FF_MUSIC3_FROZEN cell"
         );
         ensure!(
-            du <= 2.662754e-2,
+            du <= bound_u,
             "pair uncond velocity exceeds the FF_MUSIC3_FROZEN cell"
         );
         Ok(())
