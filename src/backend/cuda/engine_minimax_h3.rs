@@ -1591,11 +1591,24 @@ struct StoredPtrs {
 }
 
 impl BlockWork {
-    #[cfg(test)]
-    fn force_qualified_rotation(&mut self, device: &Device) -> Result<()> {
-        let [ordinary, fused] = crate::convrot::group_dot_32_orders(device)?;
-        self.rotate_32.fill([ordinary; 2]);
-        self.rotate_32[FF_OUT] = [fused; 2];
+    fn plan_rotation(&mut self, device: &Device, spec: &H3Spec) -> Result<()> {
+        use crate::convrot::{group_dot_32_fills_wave, group_dot_32_wave_sizes};
+        if !matches!(spec.int8_convrot.as_ref(), Some((256, _))) {
+            return Ok(());
+        }
+        let [ordinary, fused] = group_dot_32_wave_sizes(device)?;
+        let h = spec.hidden;
+        let width = spec.heads * spec.head_dim;
+        if (h, width) == (5376, 7168) {
+            self.rotate_32[..OUT].fill([group_dot_32_fills_wave(self.rows, h, ordinary); 2]);
+            self.rotate_32[OUT] = [group_dot_32_fills_wave(self.rows, width, ordinary); 2];
+        }
+        if (h, spec.ffn) == (5376, 14336) {
+            let chunks = [self.chunk, self.rows % self.chunk];
+            self.rotate_32[FF_IN] = chunks.map(|rows| group_dot_32_fills_wave(rows, h, ordinary));
+            self.rotate_32[FF_OUT] =
+                chunks.map(|rows| group_dot_32_fills_wave(rows, spec.ffn, fused));
+        }
         Ok(())
     }
 
@@ -4384,15 +4397,7 @@ impl Dit {
                 (h, 2 * spec.ffn),
             )?;
             let width = spec.heads * spec.head_dim;
-            let [ordinary, fused] = crate::convrot::group_dot_32_orders(d)?;
-            if (h, width, work.rows) == (5376, 7168, 37717) {
-                work.rotate_32[..=OUT].fill([ordinary; 2]);
-            }
-            if (h, spec.ffn) == (5376, 14336) {
-                let chunks = [work.chunk, work.rows % work.chunk];
-                work.rotate_32[FF_IN] = chunks.map(|m| ordinary && matches!(m, 1509 | 1501));
-                work.rotate_32[FF_OUT] = chunks.map(|m| fused && matches!(m, 1509 | 1501));
-            }
+            work.plan_rotation(d, spec)?;
             if d.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(89)
                 && work.rows >= crate::convrot::TENSOR_CORE_ROWS
                 && (h, width) == (5376, 7168)
@@ -14442,7 +14447,7 @@ mod tests {
             .with_full_single_probability()?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let mut work = BlockWork::new(s, &spec, 0, rows)?;
-        work.force_qualified_rotation(&device)?;
+        work.plan_rotation(&device, &spec)?;
         work.prepare::<false>(&blas, &spec)?;
         let modulation_width = 6 * spec.hidden * MODALITIES as usize;
         let mut weight = s.alloc_zeros::<bf16>(modulation_width * spec.time_dim)?;
@@ -14599,7 +14604,7 @@ mod tests {
         )?
         .with_full_single_probability()?;
         let mut work = BlockWork::new(s, &spec, 0, RAGGED_ROWS)?;
-        work.force_qualified_rotation(&device)?;
+        work.plan_rotation(&device, &spec)?;
         work.prepare::<false>(&blas, &spec)?;
         let ragged_rotary = s.clone_htod(&ragged_rotary_host)?;
         let ragged_index = s.clone_htod(&ragged_adaln)?;
@@ -15250,7 +15255,6 @@ mod tests {
             None,
             Placement::Derived,
         )?;
-        dit.work.force_qualified_rotation(&device)?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
             s,
