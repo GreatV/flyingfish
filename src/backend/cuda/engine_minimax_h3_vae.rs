@@ -1,11 +1,15 @@
 //! MiniMax-H3 image/video VAEs: tiled ViT decoders and the causal CNN keyframe encoder.
-use super::{Source, pointer, rows_view, vector};
+use super::{Element, EntryReader, Source, pointer, rows_view, vector};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
     contracts::{Tensor, TensorMut, view},
     cubin,
+    flash::{Flash, Score},
+    linear::LinearBiasMode,
     ops::{self, flat},
+    verification::Shape,
+    weights::DenseStreaming,
 };
 use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
@@ -13,6 +17,7 @@ use crate::backend::gpu::{
 use crate::checkpoint::TensorManifest;
 use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, VaeSpec, VaeTiles};
 use anyhow::{Context, Result, ensure};
+use half::bf16;
 use std::{path::Path, sync::Arc};
 
 struct ImageKernels {
@@ -240,12 +245,11 @@ pub(crate) struct ImageDecoder {
     pixel_affine: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     kernels: ImageKernels,
     _weights: Vec<CudaSlice<f32>>,
-    dense: Option<std::cell::RefCell<crate::backend::cuda::weights::DenseStreaming>>,
 }
 
-impl Linear {
+impl<T: DeviceRepr + Copy> Linear<T> {
     fn load(
-        load: &mut impl FnMut(&str, usize) -> Result<Tensor<f32, 1>>,
+        load: &mut impl FnMut(&str, usize) -> Result<Tensor<T, 1>>,
         base: &str,
         out: usize,
         input: usize,
@@ -266,7 +270,9 @@ impl Linear {
             out,
         })
     }
+}
 
+impl Linear {
     fn run(
         &self,
         s: &Arc<CudaStream>,
@@ -296,17 +302,6 @@ impl ImageDecoder {
         component: &Path,
         manifest: &TensorManifest,
     ) -> Result<Self> {
-        Self::load(device, spec, component, manifest, None)
-    }
-
-    fn load(
-        device: &Device,
-        spec: VaeSpec,
-        component: &Path,
-        manifest: &TensorManifest,
-        placement: Option<(usize, super::Placement)>,
-    ) -> Result<Self> {
-        let image = placement.is_none();
         let s = &device.stream;
         ensure!(
             spec.out_channels == VAE_PIXEL_STD.len(),
@@ -327,107 +322,10 @@ impl ImageDecoder {
         let mut source = Source::new(component, manifest);
         let mut weights = Vec::new();
         let mut consumed = std::collections::BTreeSet::new();
-        let mut order = Vec::new();
-        let mut sizes = Vec::new();
-        for layer in 0..spec.layers {
-            let prefix = format!("decoder.transformer_blocks.{layer}.");
-            let names: Vec<_> = expected
-                .iter()
-                .filter(|n| n.starts_with(&prefix))
-                .cloned()
-                .collect();
-            ensure!(
-                names.len() == 16,
-                "VAE block {layer} tensor census {}",
-                names.len()
-            );
-            sizes.push(
-                names
-                    .iter()
-                    .map(|n| manifest.entries[n].bytes)
-                    .sum::<usize>(),
-            );
-            order.push(names);
-        }
-        let fixed = weight_bytes - sizes.iter().sum::<usize>();
-        let plan = if let Some((future, mode)) = placement {
-            let mut budget =
-                crate::prefill::DensePlacement::device_budget(free, total, fixed, 0, future)?;
-            if mode != super::Placement::Derived {
-                let slots = 2 * sizes.iter().max().context("VAE has no blocks")?;
-                ensure!(slots <= budget, "VAE streamed slots exceed derived budget");
-                budget = slots;
-            }
-            let host = if sizes.iter().sum::<usize>() > budget {
-                let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(
-                    Path::new("/"),
-                )?)?;
-                available
-                    .checked_sub(4 << 30)
-                    .context("VAE host reserve exceeds available RAM")?
-            } else {
-                0
-            };
-            let plan = crate::prefill::DensePlacement::new(&sizes, Some(&sizes), budget, host)?;
-            ensure!(
-                plan.disk_bytes == 0,
-                "VAE pinned host plan exceeds available RAM"
-            );
-            if mode != super::Placement::Derived {
-                ensure!(
-                    plan.resident_bytes == 0,
-                    "forced streamed VAE retained blocks"
-                );
-            }
-            if crate::backend::diagnostics_enabled() {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"vae_f32_placement":{
-                    "weight_bytes":weight_bytes,"fixed_bytes":fixed,"resident_block_bytes":plan.resident_bytes,
-                    "slot_bytes":2*plan.slot_bytes,"pinned_bytes":plan.host_bytes,"future_bytes":future,
-                    "free_bytes":free,"total_bytes":total,"reserve_bytes":total/16,"dtype":"F32"}})
-                );
-            }
-            Some(plan)
-        } else {
-            ensure!(
-                weight_bytes <= device.workspace_budget(free, free, total / 16)?,
-                "image VAE decoder weights need {weight_bytes} bytes"
-            );
-            None
-        };
-        let mut dense = if let Some(plan) = plan {
-            if plan.slot_bytes > 0 {
-                Some(crate::backend::cuda::weights::DenseStreaming::new(
-                    component,
-                    manifest,
-                    plan,
-                    device,
-                    Some(&order),
-                )?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(streaming) = &mut dense {
-            for (layer, names) in order.iter().enumerate() {
-                if let Some(host) = streaming.host_layer(layer)? {
-                    let mut offset = 0;
-                    for name in names {
-                        let entry = &manifest.entries[name];
-                        source.reader.read_into(
-                            name,
-                            entry,
-                            &mut host[offset..offset + entry.bytes],
-                        )?;
-                        offset += entry.bytes;
-                    }
-                    ensure!(offset == host.len(), "VAE pinned block byte count");
-                }
-            }
-        }
+        ensure!(
+            weight_bytes <= device.workspace_budget(free, free, total / 16)?,
+            "image VAE decoder weights need {weight_bytes} bytes"
+        );
         let mut load = |name: &str, count: usize| -> Result<Tensor<f32, 1>> {
             ensure!(
                 consumed.insert(name.to_owned()),
@@ -443,27 +341,6 @@ impl ImageDecoder {
                     && entry.bytes == 4 * count,
                 "VAE tensor {name} is not published F32"
             );
-            if let Some(streaming) = &dense {
-                for (layer, names) in order.iter().enumerate() {
-                    if streaming.plan.slots[layer].is_some() {
-                        let mut offset = 0;
-                        for key in names {
-                            if key == name {
-                                let ptr = streaming.pointer(layer, offset, entry.bytes)?;
-                                return unsafe {
-                                    Tensor::new(
-                                        ptr,
-                                        [u32::try_from(count)?],
-                                        [1],
-                                        entry.bytes as u64,
-                                    )
-                                };
-                            }
-                            offset += manifest.entries[key].bytes;
-                        }
-                    }
-                }
-            }
             let data = source.tensor::<f32>(s, name, count)?;
             let tensor = vector(&data, s)?;
             weights.push(data);
@@ -507,7 +384,6 @@ impl ImageDecoder {
         Ok(Self {
             spec: spec.clone(),
             _weights: weights,
-            dense: dense.map(std::cell::RefCell::new),
             post_quant,
             proj_in,
             registers,
@@ -515,22 +391,14 @@ impl ImageDecoder {
             proj_out,
             blocks,
             kernels,
-            latent_affine: if image {
-                Some((
-                    s.clone_htod(&spec.latents_std)?,
-                    s.clone_htod(&spec.latents_mean)?,
-                ))
-            } else {
-                None
-            },
-            pixel_affine: if image {
-                Some((
-                    s.clone_htod(&VAE_PIXEL_STD.map(|x| x as f32))?,
-                    s.clone_htod(&VAE_PIXEL_MEAN.map(|x| x as f32))?,
-                ))
-            } else {
-                None
-            },
+            latent_affine: Some((
+                s.clone_htod(&spec.latents_std)?,
+                s.clone_htod(&spec.latents_mean)?,
+            )),
+            pixel_affine: Some((
+                s.clone_htod(&VAE_PIXEL_STD.map(|x| x as f32))?,
+                s.clone_htod(&VAE_PIXEL_MEAN.map(|x| x as f32))?,
+            )),
         })
     }
 
@@ -1177,10 +1045,10 @@ fn image_encode_future(
     )?)
 }
 
-pub(crate) fn planar_f32_to_rgb_u8(
+pub(crate) fn planar_f32_to_rgb_u8<T: DeviceRepr>(
     device: &Device,
     kernel: &CudaFunction,
-    input: &impl DevicePtr<f32>,
+    input: &impl DevicePtr<T>,
     output: &impl DevicePtr<u8>,
     (frames, allocated_frames, pixels): (usize, usize, usize),
     (mean, std): ([f32; 3], [f32; 3]),
@@ -1200,7 +1068,7 @@ pub(crate) fn planar_f32_to_rgb_u8(
         .checked_mul(3)
         .context("RGB output extent overflow")?;
     let input_bytes = input_elements
-        .checked_mul(4)
+        .checked_mul(size_of::<T>())
         .context("RGB input byte extent overflow")?;
     ensure!(
         input.len() >= input_elements && output.len() >= output_elements,
@@ -1276,19 +1144,19 @@ pub(crate) fn planar_f32_to_rgb_u8(
     Ok(())
 }
 
-struct Linear {
-    weight: Tensor<f32, 2>,
-    bias: Tensor<f32, 1>,
+struct Linear<T = f32> {
+    weight: Tensor<T, 2>,
+    bias: Tensor<T, 1>,
     out: usize,
 }
 
-struct DecoderBlock {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    out: Linear,
-    ff_in: Linear,
-    ff_out: Linear,
+struct DecoderBlock<T = f32> {
+    q: Linear<T>,
+    k: Linear<T>,
+    v: Linear<T>,
+    out: Linear<T>,
+    ff_in: Linear<T>,
+    ff_out: Linear<T>,
     norm1: Tensor<f32, 1>,
     norm2: Tensor<f32, 1>,
     scale1: Tensor<f32, 1>,
@@ -1300,20 +1168,312 @@ struct VaeKernels {
     latent_rows: CudaFunction,
     rgb: CudaFunction,
     stitch: CudaFunction,
+    append: CudaFunction,
+    rms: CudaFunction,
+    head_norm: CudaFunction,
+    norm_out: CudaFunction,
+    pack: CudaFunction,
+    residual: CudaFunction,
+    patches: CudaFunction,
+    swiglu: CudaFunction,
 }
 
 pub(crate) struct VideoDecoder {
-    core: ImageDecoder,
+    spec: VaeSpec,
+    post_quant: Linear<bf16>,
+    proj_in: Linear<bf16>,
+    registers: Tensor<bf16, 1>,
+    norm_out: (Tensor<f32, 1>, Tensor<f32, 1>),
+    proj_out: Linear<bf16>,
+    blocks: Vec<DecoderBlock<bf16>>,
+    dense: Option<std::cell::RefCell<DenseStreaming>>,
+    _weights: Vec<CudaSlice<u8>>,
     kernels: VaeKernels,
     #[cfg(test)]
     prefix_only: bool,
 }
 
-impl std::ops::Deref for VideoDecoder {
-    type Target = ImageDecoder;
-    fn deref(&self) -> &Self::Target {
-        &self.core
+impl Linear<bf16> {
+    fn bind(&self, blas: &mut Blas, rows: usize) -> Result<()> {
+        blas.prepare_biased(
+            u32::try_from(rows)?,
+            self.weight.shape[0],
+            self.weight.shape[1],
+            self.bias,
+            LinearBiasMode::BeforeOutputRound,
+        )
     }
+
+    fn apply(&self, blas: &Blas, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>) -> Result<()> {
+        blas.linear_biased(
+            self.weight,
+            self.bias,
+            x,
+            &mut TensorMut(y),
+            LinearBiasMode::BeforeOutputRound,
+        )
+    }
+}
+
+fn video_weight_width(name: &str) -> usize {
+    if name
+        .split('.')
+        .any(|part| matches!(part, "norm1" | "norm2" | "norm_out" | "scale1" | "scale2"))
+    {
+        4
+    } else {
+        2
+    }
+}
+
+fn video_weight_bytes(manifest: &TensorManifest, name: &str) -> usize {
+    manifest.entries[name].bytes / 4 * video_weight_width(name)
+}
+
+pub(super) fn video_decoder_weight_bytes(manifest: &TensorManifest) -> usize {
+    manifest
+        .entries
+        .keys()
+        .filter(|name| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+        .map(|name| video_weight_bytes(manifest, name))
+        .sum()
+}
+
+fn read_video_weight_chunk(
+    source: &mut EntryReader,
+    manifest: &TensorManifest,
+    name: &str,
+    destination_offset: usize,
+    dst: &mut [u8],
+) -> Result<()> {
+    let width = video_weight_width(name);
+    ensure!(
+        dst.len().is_multiple_of(width),
+        "video weight {name} chunk alignment"
+    );
+    let src = source.read_range(
+        name,
+        &manifest.entries[name],
+        destination_offset / width * 4,
+        dst.len() / width * 4,
+    )?;
+    ensure!(
+        <f32 as Element>::finite(src),
+        "nonfinite video weight {name}"
+    );
+    if width == 4 {
+        dst.copy_from_slice(src);
+    } else {
+        for (src, dst) in src
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<2>().0)
+        {
+            let x = bf16::from_f32(f32::from_le_bytes(*src));
+            ensure!(x.is_finite(), "BF16 overflow for video weight {name}");
+            *dst = x.to_bits().to_le_bytes();
+        }
+    }
+    Ok(())
+}
+
+struct VideoWeightLoad<'a> {
+    manifest: &'a TensorManifest,
+    reader: EntryReader,
+    dense: Option<DenseStreaming>,
+    offsets: std::collections::BTreeMap<String, (usize, usize)>,
+    consumed: std::collections::BTreeSet<String>,
+    storage: Vec<CudaSlice<u8>>,
+    staging: Vec<u8>,
+}
+
+impl VideoWeightLoad<'_> {
+    fn tensor<T: Element + Copy>(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        count: usize,
+    ) -> Result<Tensor<T, 1>> {
+        use safetensors::Dtype;
+        let entry = self
+            .manifest
+            .entries
+            .get(name)
+            .with_context(|| format!("video weight {name} missing"))?;
+        let width = video_weight_width(name);
+        ensure!(
+            self.consumed.insert(name.to_owned())
+                && entry.dtype == Dtype::F32
+                && entry.quant.is_none()
+                && entry.bytes == 4 * count
+                && T::DTYPE == if width == 4 { Dtype::F32 } else { Dtype::BF16 },
+            "invalid source or runtime dtype for video weight {name}"
+        );
+        let bytes = count * width;
+        let ptr = if let Some(&(layer, offset)) = self.offsets.get(name) {
+            self.dense
+                .as_ref()
+                .context("video pinned tensor lacks stream binding")?
+                .pointer(layer, offset, bytes)?
+        } else {
+            let buffer = unsafe { s.alloc::<u8>(bytes)? };
+            let (ptr, record) = buffer.device_ptr(s);
+            let chunk = self.staging.len();
+            for offset in (0..bytes).step_by(chunk) {
+                let end = (offset + chunk).min(bytes);
+                let dst = &mut self.staging[..end - offset];
+                read_video_weight_chunk(&mut self.reader, self.manifest, name, offset, dst)?;
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(
+                        ptr + offset as u64,
+                        dst,
+                        s.cu_stream(),
+                    )?;
+                }
+            }
+            drop(record);
+            self.storage.push(buffer);
+            ptr
+        };
+        ensure!(
+            ptr.is_multiple_of(16),
+            "video weight {name} pointer alignment"
+        );
+        unsafe { Tensor::new(ptr, [u32::try_from(count)?], [1], bytes as u64) }
+    }
+
+    fn linear(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        out: usize,
+        input: usize,
+    ) -> Result<Linear<bf16>> {
+        Linear::load(
+            &mut |name, count| self.tensor(s, name, count),
+            name,
+            out,
+            input,
+        )
+    }
+}
+
+fn video_weight_load<'a>(
+    d: &Device,
+    spec: &VaeSpec,
+    dir: &Path,
+    manifest: &'a TensorManifest,
+    (future, mode): (usize, super::Placement),
+) -> Result<VideoWeightLoad<'a>> {
+    let mut order = vec![Vec::new(); spec.layers];
+    let mut sizes = vec![0; spec.layers];
+    for (name, entry) in manifest
+        .entries
+        .iter()
+        .filter(|(name, _)| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+    {
+        ensure!(
+            entry.dtype == safetensors::Dtype::F32
+                && entry.quant.is_none()
+                && entry.bytes.is_multiple_of(4),
+            "video decoder weight {name} is not published F32"
+        );
+        if let Some(rest) = name.strip_prefix("decoder.transformer_blocks.") {
+            let (layer, _) = rest.split_once('.').context("video block role")?;
+            let layer = layer.parse::<usize>()?;
+            order
+                .get_mut(layer)
+                .context("video block index")?
+                .push(name);
+            sizes[layer] += video_weight_bytes(manifest, name);
+        }
+    }
+    ensure!(
+        order.iter().all(|names| names.len() == 16),
+        "video block weight inventory"
+    );
+    let weights = video_decoder_weight_bytes(manifest);
+    let fixed = weights - sizes.iter().sum::<usize>();
+    let (free, total) = d.ctx.mem_get_info()?;
+    let mut budget = crate::prefill::DensePlacement::device_budget(free, total, fixed, 0, future)?;
+    if mode != super::Placement::Derived {
+        let slots = 2 * sizes.iter().max().context("video VAE has no blocks")?;
+        ensure!(
+            slots <= budget,
+            "video BF16 stream slots exceed device budget"
+        );
+        budget = slots;
+    }
+    let host = if sizes.iter().sum::<usize>() > budget {
+        usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
+            "/",
+        ))?)?
+        .checked_sub(4 << 30)
+        .context("video host reserve")?
+    } else {
+        0
+    };
+    let plan = crate::prefill::DensePlacement::new(&sizes, Some(&sizes), budget, host)?;
+    ensure!(
+        plan.disk_bytes == 0,
+        "video BF16 pinned layer plan exceeds host budget"
+    );
+    ensure!(
+        mode == super::Placement::Derived || plan.resident_bytes == 0,
+        "forced streamed video decoder retained blocks"
+    );
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"video_vae_precision_placement": {
+                "weight_bytes":weights,"fixed_bytes":fixed,"resident_block_bytes":plan.resident_bytes,
+                "slot_bytes":2*plan.slot_bytes,"pinned_bytes":plan.host_bytes,"future_bytes":future,
+                "free_bytes":free,"total_bytes":total,"reserve_bytes":total/16,"dtype":"BF16/F32"
+            }})
+        );
+    }
+    let mut loader = VideoWeightLoad {
+        manifest,
+        reader: EntryReader::new(dir),
+        dense: if plan.slot_bytes == 0 {
+            None
+        } else {
+            Some(DenseStreaming::new_preloaded(dir, plan, d, &sizes)?)
+        },
+        offsets: Default::default(),
+        consumed: Default::default(),
+        storage: Vec::new(),
+        staging: vec![0; 16 << 20],
+    };
+    if let Some(dense) = &mut loader.dense {
+        for (layer, names) in order.iter().enumerate() {
+            if let Some(pinned) = dense.host_layer(layer)? {
+                let mut offset = 0;
+                for name in names {
+                    let width = video_weight_width(name);
+                    let bytes = video_weight_bytes(manifest, name);
+                    ensure!(offset % 16 == 0, "video pinned weight alignment");
+                    loader.offsets.insert((*name).clone(), (layer, offset));
+                    for (i, dst) in pinned[offset..offset + bytes]
+                        .chunks_mut((32 << 20) / 4 * width)
+                        .enumerate()
+                    {
+                        read_video_weight_chunk(
+                            &mut loader.reader,
+                            manifest,
+                            name,
+                            i * ((32 << 20) / 4 * width),
+                            dst,
+                        )?;
+                    }
+                    offset += bytes;
+                }
+                ensure!(offset == pinned.len(), "video pinned layer byte count");
+            }
+        }
+    }
+    Ok(loader)
 }
 
 impl VideoDecoder {
@@ -1325,13 +1485,66 @@ impl VideoDecoder {
         placement: (usize, super::Placement),
     ) -> Result<Self> {
         let vision = cubin::module(&d.ctx, "vision_ops")?;
+        let common = cubin::module(&d.ctx, "q38_common")?;
+        let s = &d.stream;
+        let mut load = video_weight_load(d, spec, dir, manifest, placement)?;
+        let (dim, latent, ffn) = (spec.dim, spec.latent_channels, spec.ffn);
+        let post_quant = load.linear(s, "post_quant_conv", latent, latent)?;
+        let proj_in = load.linear(s, "decoder.proj_in", dim, latent)?;
+        let registers = load.tensor(s, "decoder.register_tokens", spec.registers * dim)?;
+        let norm_out = (
+            load.tensor(s, "decoder.norm_out.weight", dim)?,
+            load.tensor(s, "decoder.norm_out.bias", dim)?,
+        );
+        let proj_out = load.linear(s, "decoder.proj_out", spec.patch_width(), dim)?;
+        let mut blocks = Vec::with_capacity(spec.layers);
+        for layer in 0..spec.layers {
+            let b = format!("decoder.transformer_blocks.{layer}");
+            blocks.push(DecoderBlock {
+                q: load.linear(s, &format!("{b}.attn.to_q"), dim, dim)?,
+                k: load.linear(s, &format!("{b}.attn.to_k"), dim, dim)?,
+                v: load.linear(s, &format!("{b}.attn.to_v"), dim, dim)?,
+                out: load.linear(s, &format!("{b}.attn.to_out.0"), dim, dim)?,
+                ff_in: load.linear(s, &format!("{b}.ff.net.0.proj"), 2 * ffn, dim)?,
+                ff_out: load.linear(s, &format!("{b}.ff.net.2"), dim, ffn)?,
+                norm1: load.tensor(s, &format!("{b}.norm1.weight"), dim)?,
+                norm2: load.tensor(s, &format!("{b}.norm2.weight"), dim)?,
+                scale1: load.tensor(s, &format!("{b}.scale1"), dim)?,
+                scale2: load.tensor(s, &format!("{b}.scale2"), dim)?,
+            });
+        }
+        ensure!(
+            load.consumed.len()
+                == manifest
+                    .entries
+                    .keys()
+                    .filter(|n| { n.starts_with("decoder.") || n.starts_with("post_quant_conv.") })
+                    .count(),
+            "video decoder tensor inventory mismatch"
+        );
         Ok(Self {
-            core: ImageDecoder::load(d, spec.clone(), dir, manifest, Some(placement))?,
+            spec: spec.clone(),
+            post_quant,
+            proj_in,
+            registers,
+            norm_out,
+            proj_out,
+            blocks,
+            dense: load.dense.map(std::cell::RefCell::new),
+            _weights: load.storage,
             kernels: VaeKernels {
-                frame_blend: vision.load_function("frame_blend_f32")?,
-                latent_rows: vision.load_function("latent_rows_f32")?,
-                rgb: vision.load_function("planar_f32_to_rgb_u8")?,
-                stitch: vision.load_function("tile_stitch_f32")?,
+                frame_blend: vision.load_function("frame_blend_bf16")?,
+                latent_rows: vision.load_function("latent_rows_bf16")?,
+                rgb: vision.load_function("planar_bf16_to_rgb_u8")?,
+                stitch: vision.load_function("tile_stitch_bf16")?,
+                append: vision.load_function("append_register_rows_bf16_to_f32")?,
+                rms: vision.load_function("vision_rms_scale_f32")?,
+                head_norm: vision.load_function("vision_rms_scale_bf16")?,
+                norm_out: common.load_function("layer_norm_f32_to_bf16")?,
+                pack: vision.load_function("rotary_pack_qkv_bf16")?,
+                residual: vision.load_function("scaled_residual_f32")?,
+                patches: vision.load_function("unpatchify_bf16")?,
+                swiglu: cubin::module(&d.ctx, "act")?.load_function("silu_mul")?,
             },
             #[cfg(test)]
             prefix_only: false,
@@ -1341,7 +1554,7 @@ impl VideoDecoder {
     pub(crate) fn rgb(
         &self,
         d: &Device,
-        decoded: &CudaSlice<f32>,
+        decoded: &CudaSlice<bf16>,
         shape: (usize, usize, usize),
     ) -> Result<CudaSlice<u8>> {
         let count = shape
@@ -1372,7 +1585,6 @@ impl VideoDecoder {
     pub(crate) fn work(
         &self,
         d: &Device,
-        _blas: &mut Blas,
         tiles: &VaeTiles,
         shape: (usize, usize, usize),
     ) -> Result<TileWork> {
@@ -1391,36 +1603,50 @@ impl VideoDecoder {
             - spec.frame_pre_padding();
         let canvas = (shape.1 * spec.spatial_ratio, shape.2 * spec.spatial_ratio);
         let mandatory = decode_bytes(spec, tiles, canvas)
-            + 4 * spec.out_channels * total_frames * canvas.0 * canvas.1
-            + 4 * spec.latent_channels * shape.0 * shape.1 * shape.2;
+            + 2 * spec.out_channels * total_frames * canvas.0 * canvas.1
+            + 2 * spec.latent_channels * shape.0 * shape.1 * shape.2;
         let (free, total) = d.ctx.mem_get_info()?;
         let budget = crate::prefill::DensePlacement::device_budget(free, total, mandatory, 0, 0)?;
-        let patches = tile.0 * tile.1 * tile.2;
-        let tokens = patches + spec.registers + 1;
-        let fixed = 4u128 * (tokens * spec.rope_dims + spec.head_dim) as u128;
-        let plan = ImagePlan::derive_counts(
-            spec,
-            tiles.count(),
-            patches,
-            fixed,
-            ImageLimits {
-                budget,
-                l2: usize::try_from(d.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?)?,
-                sms: usize::try_from(
-                    d.ctx
-                        .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-                )?,
-                grid: usize::try_from(d.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?)?,
-            },
-        )?;
+        let tokens = tile.0 * tile.1 * tile.2 + spec.registers + 1;
+        let grid_x = usize::try_from(d.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?)?;
+        let grid_z = usize::try_from(d.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)?)?;
+        let cap = tiles
+            .count()
+            .min(grid_z)
+            .min(grid_x / (2 * tokens * spec.heads))
+            .min(i32::MAX as usize / (tokens * spec.ffn));
+        let mut work = None;
+        for batch in (1..=cap).rev() {
+            let bytes = TileWork::batch_bytes(spec, tile, batch, tiles.count())?;
+            if bytes <= budget {
+                work = Some((batch, bytes));
+                break;
+            }
+        }
+        let (batch, bytes) = work.context("video BF16 decoder cannot fit one tile")?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
                 "{}",
-                serde_json::json!({"video_vae_f32_plan":{
-            "linear_batch":plan.linear,"attention_batch":plan.attention,"work_bytes":plan.bytes,"future_bytes":mandatory,"budget":budget}})
+                serde_json::json!({"video_vae_bf16_plan":{
+            "linear_batch":batch,"attention_batch":batch,"work_bytes":bytes,"future_bytes":mandatory,"budget":budget}})
             );
         }
-        TileWork::with_plan(&d.stream, spec, tile, plan)
+        TileWork::new(&d.stream, spec, tile, (batch, tiles.count()))
+    }
+
+    pub(crate) fn bind(&self, blas: &mut Blas, work: &TileWork) -> Result<()> {
+        for &(active, _) in &work.attention {
+            self.post_quant.bind(blas, active * work.patches)?;
+            self.proj_in.bind(blas, active * work.patches)?;
+            let rows = active * work.tokens;
+            self.proj_out.bind(blas, rows)?;
+            for b in &self.blocks {
+                for linear in [&b.q, &b.k, &b.v, &b.out, &b.ff_in, &b.ff_out] {
+                    linear.bind(blas, rows)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1431,14 +1657,128 @@ impl VideoDecoder {
         tiles: &VaeTiles,
         shape: (usize, usize, usize),
     ) -> Result<()> {
-        let work = self.work(d, blas, tiles, shape)?;
+        let work = self.work(d, tiles, shape)?;
+        self.bind(blas, &work)?;
         println!(
-            "PASS VIDEO_F32_SETUP linear={} attention={} bytes={}",
+            "PASS VIDEO_BF16_SETUP linear={} attention={} bytes={}",
             work.batch,
-            work.plan.attention,
+            work.batch,
             work.allocated_bytes()
         );
         Ok(())
+    }
+
+    fn block(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        w: &mut TileWork,
+        b: &DecoderBlock<bf16>,
+        active: usize,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let rows = active * w.tokens;
+        let dim = spec.dim;
+        let n = rows * dim;
+        let mat = |buffer| rows_view(buffer, s, 0, rows, dim, dim);
+        let norm = |weight: Tensor<f32, 1>| -> Result<()> {
+            unsafe {
+                s.launch_builder(&self.kernels.rms)
+                    .arg(&pointer(&w.x, s))
+                    .arg(&weight.ptr)
+                    .arg(&1u32)
+                    .arg(&0u64)
+                    .arg(&pointer(&w.norm, s))
+                    .arg(&(dim as u32))
+                    .arg(&spec.norm_eps)
+                    .launch(ops::grid(rows, 256))?;
+            }
+            Ok(())
+        };
+        let residual = |scale: Tensor<f32, 1>| -> Result<()> {
+            unsafe {
+                s.launch_builder(&self.kernels.residual)
+                    .arg(&pointer(&w.x, s))
+                    .arg(&pointer(&w.o, s))
+                    .arg(&scale.ptr)
+                    .arg(&(n as u64))
+                    .arg(&(dim as u32))
+                    .launch(flat(n))?;
+            }
+            Ok(())
+        };
+        norm(b.norm1)?;
+        for (j, linear) in [&b.q, &b.k, &b.v].into_iter().enumerate() {
+            linear.apply(
+                blas,
+                mat(&w.norm)?,
+                rows_view(&w.ff, s, j * n, rows, dim, dim)?,
+            )?;
+        }
+        unsafe {
+            s.launch_builder(&self.kernels.head_norm)
+                .arg(&pointer(&w.ff, s))
+                .arg(&pointer(&w.ones, s))
+                .arg(&(spec.head_dim as u32))
+                .arg(&spec.norm_eps)
+                .launch(ops::grid(2 * rows * spec.heads, 256))?;
+            s.launch_builder(&self.kernels.pack)
+                .arg(&pointer(&w.ff, s))
+                .arg(&pointer(&w.rope, s))
+                .arg(&pointer(&w.q, s))
+                .arg(&pointer(&w.k, s))
+                .arg(&pointer(&w.v, s))
+                .arg(&(rows as u32))
+                .arg(&(w.tokens as u32))
+                .arg(&(spec.heads as u32))
+                .arg(&(spec.head_dim as u32))
+                .arg(&(spec.rope_dims as u32))
+                .launch(flat(n / 2))?;
+        }
+        let (_, flash) = w
+            .attention
+            .iter_mut()
+            .find(|(tiles, _)| *tiles == active)
+            .context("video attention batch is outside setup")?;
+        flash.run(
+            &w.q,
+            dim,
+            &w.k,
+            &w.v,
+            &mut w.attn,
+            Shape {
+                rows,
+                start: 0,
+                q_heads: spec.heads,
+                kv_heads: spec.heads,
+                head_dim: spec.head_dim,
+                capacity: rows,
+                causal: false,
+                window_left: None,
+            },
+        )?;
+        b.out.apply(blas, mat(&w.attn)?, mat(&w.o)?)?;
+        residual(b.scale1)?;
+        norm(b.norm2)?;
+        let f = spec.ffn;
+        b.ff_in.apply(
+            blas,
+            mat(&w.norm)?,
+            rows_view(&w.ff, s, 0, rows, 2 * f, 2 * f)?,
+        )?;
+        let (gu, y) = (pointer(&w.ff, s), pointer(&w.gated, s));
+        unsafe {
+            s.launch_builder(&self.kernels.swiglu)
+                .arg(&gu)
+                .arg(&y)
+                .arg(&(rows as i32))
+                .arg(&(f as i32))
+                .arg(&3i32)
+                .launch(ops::silu_mul_grid(rows, f, gu, y)?)?;
+        }
+        b.ff_out
+            .apply(blas, rows_view(&w.gated, s, 0, rows, f, f)?, mat(&w.o)?)?;
+        residual(b.scale2)
     }
 
     fn tile(
@@ -1448,7 +1788,7 @@ impl VideoDecoder {
         w: &mut TileWork,
         z: &LatentVideo<'_>,
         (origins, first_frame): (&[(usize, usize)], usize),
-        (raw, slot): (&CudaSlice<f32>, usize),
+        (raw, slot): (&CudaSlice<bf16>, usize),
     ) -> Result<()> {
         let spec = &self.spec;
         let active = origins.len();
@@ -1465,7 +1805,7 @@ impl VideoDecoder {
                     && col + w.width <= z.width,
                 "video tile input capacity"
             );
-            let target = pointer(&w.latent, s) + (4 * tile * p * spec.latent_channels) as u64;
+            let target = pointer(&w.latent, s) + (2 * tile * p * spec.latent_channels) as u64;
             unsafe {
                 s.launch_builder(&self.kernels.latent_rows)
                     .arg(&pointer(z.data, s))
@@ -1493,17 +1833,10 @@ impl VideoDecoder {
                 spec.latent_channels,
             )
         };
-        self.post_quant.run(
-            s,
+        self.post_quant
+            .apply(blas, latent(&w.latent)?, latent(&w.latent_q)?)?;
+        self.proj_in.apply(
             blas,
-            &self.core.kernels.bias,
-            latent(&w.latent)?,
-            latent(&w.latent_q)?,
-        )?;
-        self.proj_in.run(
-            s,
-            blas,
-            &self.core.kernels.bias,
             latent(&w.latent_q)?,
             rows_view(&w.o, s, 0, active * p, spec.dim, spec.dim)?,
         )?;
@@ -1513,7 +1846,7 @@ impl VideoDecoder {
         }
         let rows = active * w.tokens;
         unsafe {
-            s.launch_builder(&self.core.kernels.append)
+            s.launch_builder(&self.kernels.append)
                 .arg(&pointer(&w.o, s))
                 .arg(&self.registers.ptr)
                 .arg(&pointer(&w.x, s))
@@ -1521,31 +1854,39 @@ impl VideoDecoder {
                 .arg(&(p as u32))
                 .arg(&(spec.registers as u32))
                 .arg(&(spec.dim as u32))
-                .launch(w.plan.flat(rows * spec.dim))?;
+                .launch(flat(rows * spec.dim))?;
         }
         for (layer, block) in self.blocks.iter().enumerate() {
             if let Some(dense) = &self.dense {
                 dense.borrow_mut().begin(layer, s)?;
             }
-            self.core.block(
-                s,
-                blas,
-                block,
-                &w.core,
-                (slot, active, layer),
-                &mut |_, _, _, _| Ok(()),
-            )?;
+            self.block(s, blas, w, block, active)?;
             if let Some(dense) = &self.dense {
                 dense.borrow_mut().end(layer, s)?;
             }
         }
-        self.core.output_rows(s, blas, &w.core, rows)?;
+        unsafe {
+            s.launch_builder(&self.kernels.norm_out)
+                .arg(&pointer(&w.x, s))
+                .arg(&self.norm_out.0.ptr)
+                .arg(&self.norm_out.1.ptr)
+                .arg(&pointer(&w.norm, s))
+                .arg(&(rows as u32))
+                .arg(&(spec.dim as u32))
+                .arg(&spec.norm_eps)
+                .launch(ops::grid(rows, 256))?;
+        }
+        let width = spec.patch_width();
+        self.proj_out.apply(
+            blas,
+            rows_view(&w.norm, s, 0, rows, spec.dim, spec.dim)?,
+            rows_view(&w.patch_rows, s, 0, rows, width, width)?,
+        )?;
         for tile in 0..active {
-            let source =
-                pointer(&w.patch_rows, s) + (4 * tile * w.tokens * spec.patch_width()) as u64;
-            let target = pointer(raw, s) + (4 * (slot + tile) * w.pixels()) as u64;
+            let source = pointer(&w.patch_rows, s) + (2 * tile * w.tokens * width) as u64;
+            let target = pointer(raw, s) + (2 * (slot + tile) * w.pixels()) as u64;
             unsafe {
-                s.launch_builder(&self.core.kernels.patches)
+                s.launch_builder(&self.kernels.patches)
                     .arg(&source)
                     .arg(&target)
                     .arg(&(w.frames as u32))
@@ -1554,7 +1895,7 @@ impl VideoDecoder {
                     .arg(&(spec.out_channels as u32))
                     .arg(&(spec.temporal_ratio as u32))
                     .arg(&(spec.spatial_ratio as u32))
-                    .launch(w.plan.flat(w.pixels()))?;
+                    .launch(flat(w.pixels()))?;
             }
         }
         Ok(())
@@ -1567,7 +1908,7 @@ impl VideoDecoder {
         w: &mut TileWork,
         tiles: &VaeTiles,
         z: LatentVideo<'_>,
-        out: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<bf16>,
     ) -> Result<DecodePlan> {
         self.decode_observed((s, blas), w, tiles, z, out, |_, _, _| Ok(()))
     }
@@ -1578,8 +1919,8 @@ impl VideoDecoder {
         w: &mut TileWork,
         tiles: &VaeTiles,
         z: LatentVideo<'_>,
-        out: &mut CudaSlice<f32>,
-        mut observe: impl FnMut(&str, usize, &CudaSlice<f32>) -> Result<()>,
+        out: &mut CudaSlice<bf16>,
+        mut observe: impl FnMut(&str, usize, &CudaSlice<bf16>) -> Result<()>,
     ) -> Result<DecodePlan> {
         let spec = &self.spec;
         let r = spec.spatial_ratio;
@@ -1627,11 +1968,11 @@ impl VideoDecoder {
             .collect::<Result<_, _>>()?;
         let grid = s.clone_htod(&grid)?;
         let slots = tiles.count();
-        let raw = s.alloc_zeros::<f32>(slots * w.pixels())?;
-        let canvas = s.alloc_zeros::<f32>(channels * clip_frames * plane)?;
-        let mut faded = s.alloc_zeros::<f32>(channels * tail * plane)?;
+        let raw = s.alloc_zeros::<bf16>(slots * w.pixels())?;
+        let canvas = s.alloc_zeros::<bf16>(channels * clip_frames * plane)?;
+        let mut faded = s.alloc_zeros::<bf16>(channels * tail * plane)?;
         ensure!(
-            4 * (raw.len() + canvas.len() + faded.len())
+            2 * (raw.len() + canvas.len() + faded.len())
                 == decode_bytes(spec, tiles, (height, width)),
             "decode buffers differ from decode_bytes"
         );
@@ -1639,15 +1980,15 @@ impl VideoDecoder {
             eprintln!(
                 "{}",
                 serde_json::json!({"h3_vae_decode": {"chunks": plan.chunks, "tiles": slots, "tokens_per_tile": w.tokens,
-                    "frames": plan.frames, "raw_tile_bytes": 4 * raw.len(), "canvas_bytes": 4 * canvas.len(),
-                    "output_bytes": 4 * out.len(), "free_bytes": s.context().mem_get_info()?.0}})
+                    "frames": plan.frames, "raw_tile_bytes": 2 * raw.len(), "canvas_bytes": 2 * canvas.len(),
+                    "output_bytes": 2 * out.len(), "free_bytes": s.context().mem_get_info()?.0}})
             );
         }
         let copy_frames = |s: &Arc<CudaStream>,
-                           from: &CudaSlice<f32>,
+                           from: &CudaSlice<bf16>,
                            from_frames: usize,
                            from_first: usize,
-                           to: &mut CudaSlice<f32>,
+                           to: &mut CudaSlice<bf16>,
                            to_frames: usize,
                            to_first: usize,
                            count: usize|
@@ -1750,7 +2091,7 @@ impl VideoDecoder {
 }
 
 /// Device bytes `VideoDecoder::decode` allocates besides its output for a `height x width` px video through `tiles`:
-/// raw tiles of one clip, the stitched clip canvas and the cross-faded tail, F32.
+/// raw tiles of one clip, the stitched clip canvas and the cross-faded tail, BF16.
 pub(crate) fn decode_bytes(
     spec: &VaeSpec,
     tiles: &VaeTiles,
@@ -1761,19 +2102,33 @@ pub(crate) fn decode_bytes(
     let tail = clip_frames - lead - spec.frame_pre_padding();
     let channels = spec.out_channels;
     let tile = channels * clip_frames * tiles.height * tiles.width;
-    4 * (tiles.count() * tile + channels * (clip_frames + tail) * height * width)
+    2 * (tiles.count() * tile + channels * (clip_frames + tail) * height * width)
 }
 
-/// A device latent video `[latent_channels, frames, height, width]` F32.
+/// A device latent video `[latent_channels, frames, height, width]` BF16.
 pub(crate) struct LatentVideo<'a> {
-    pub data: &'a CudaSlice<f32>,
+    pub data: &'a CudaSlice<bf16>,
     pub frames: usize,
     pub height: usize,
     pub width: usize,
 }
 
 pub(crate) struct TileWork {
-    core: DecoderWork,
+    rope: CudaSlice<f32>,
+    ones: CudaSlice<f32>,
+    x: CudaSlice<f32>,
+    norm: CudaSlice<bf16>,
+    o: CudaSlice<bf16>,
+    q: CudaSlice<bf16>,
+    k: CudaSlice<bf16>,
+    v: CudaSlice<bf16>,
+    attn: CudaSlice<bf16>,
+    ff: CudaSlice<bf16>,
+    gated: CudaSlice<bf16>,
+    latent: CudaSlice<bf16>,
+    latent_q: CudaSlice<bf16>,
+    patch_rows: CudaSlice<bf16>,
+    attention: Vec<(usize, Flash)>,
     frames: usize,
     height: usize,
     width: usize,
@@ -1781,13 +2136,6 @@ pub(crate) struct TileWork {
     tokens: usize,
     batch: usize,
     spec: VaeSpec,
-}
-
-impl std::ops::Deref for TileWork {
-    type Target = DecoderWork;
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
 }
 
 impl TileWork {
@@ -1809,17 +2157,25 @@ impl TileWork {
             "video patch count exceeds layout capacity"
         );
         let t = p + spec.registers as u128 + 1;
-        let per = 4 * t * (7 * spec.dim + 3 * spec.ffn + spec.patch_width()) as u128
-            + 8 * p * spec.latent_channels as u128;
-        let scores = 4 * spec.heads as u128 * t * t;
+        let per = 2 * t * (8 * spec.dim + 3 * spec.ffn + spec.patch_width()) as u128
+            + 4 * p * spec.latent_channels as u128;
+        let tail = slots % batch;
+        let attention = [batch, tail]
+            .into_iter()
+            .filter(|&n| n != 0)
+            .map(|n| 4 * (n as u128 * t * spec.heads as u128 + n as u128 + 1))
+            .sum::<u128>();
         Ok(usize::try_from(
-            batch as u128 * per + scores + 4 * (t * spec.rope_dims as u128 + spec.head_dim as u128),
+            batch as u128 * per
+                + attention
+                + 4 * (t * spec.rope_dims as u128 + spec.head_dim as u128),
         )?)
     }
+
     pub(crate) fn bytes(spec: &VaeSpec, shape: (usize, usize, usize)) -> usize {
         Self::batch_bytes(spec, shape, 1, 1).expect("validated video tile extent")
     }
-    #[cfg(test)]
+
     pub(crate) fn new(
         s: &Arc<CudaStream>,
         spec: &VaeSpec,
@@ -1827,31 +2183,48 @@ impl TileWork {
         (batch, slots): (usize, usize),
     ) -> Result<Self> {
         let bytes = Self::batch_bytes(spec, shape, batch, slots)?;
-        let patches = shape.0 * shape.1 * shape.2;
-        Self::with_plan(
-            s,
-            spec,
-            shape,
-            ImagePlan {
-                linear: batch,
-                attention: 1,
-                patches,
-                tokens: patches + spec.registers + 1,
-                grid: i32::MAX as usize,
-                bytes,
-            },
-        )
-    }
-    fn with_plan(
-        s: &Arc<CudaStream>,
-        spec: &VaeSpec,
-        shape: (usize, usize, usize),
-        plan: ImagePlan,
-    ) -> Result<Self> {
         let (frames, height, width) = shape;
-        let (patches, tokens, batch) = (plan.patches, plan.tokens, plan.linear);
+        let patches = frames * height * width;
+        let tokens = patches + spec.registers + 1;
+        let rows = batch * tokens;
+        let n = rows * spec.dim;
+        let latent = batch * patches * spec.latent_channels;
+        let alloc = |elements| unsafe { s.alloc::<bf16>(elements) };
+        let mut attention = Vec::with_capacity(2);
+        for active in [batch, slots % batch].into_iter().filter(|&n| n > 0) {
+            let rows = active * tokens;
+            let score = Score::from_tokens(1.0 / (spec.head_dim as f32).sqrt(), None)?;
+            let mut flash = Flash::new_with_score(
+                s.clone(),
+                rows,
+                spec.heads,
+                spec.heads,
+                spec.head_dim,
+                score,
+                rows,
+            )?;
+            let offsets = (0..=active)
+                .map(|tile| u32::try_from(tile * tokens))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            flash.bind_bf16_windows(&offsets)?;
+            attention.push((active, flash));
+        }
         let work = Self {
-            core: DecoderWork::new(s, spec, plan, rotary_table(spec, shape, 3, |x| x))?,
+            rope: s.clone_htod(&rotary_table(spec, shape, 3, |x| x))?,
+            ones: s.clone_htod(&vec![1f32; spec.head_dim])?,
+            x: unsafe { s.alloc::<f32>(n)? },
+            norm: alloc(n)?,
+            o: alloc(n)?,
+            q: alloc(n)?,
+            k: alloc(n)?,
+            v: alloc(n)?,
+            attn: alloc(n)?,
+            ff: alloc(rows * 2 * spec.ffn)?,
+            gated: alloc(rows * spec.ffn)?,
+            latent: alloc(latent)?,
+            latent_q: alloc(latent)?,
+            patch_rows: alloc(rows * spec.patch_width())?,
+            attention,
             frames,
             height,
             width,
@@ -1861,33 +2234,37 @@ impl TileWork {
             spec: spec.clone(),
         };
         ensure!(
-            work.allocated_bytes() == work.plan.bytes,
+            work.allocated_bytes() == bytes,
             "video work differs from counted plan"
         );
         Ok(work)
     }
+
     fn allocated_bytes(&self) -> usize {
-        [
-            &self.rope,
-            &self.ones,
-            &self.x,
-            &self.norm,
-            &self.o,
-            &self.q,
-            &self.k,
-            &self.v,
-            &self.attn,
-            &self.ff,
-            &self.gated,
-            &self.latent,
-            &self.latent_q,
-            &self.patch_rows,
-            &self.scores,
-        ]
-        .iter()
-        .map(|v| 4 * v.len())
-        .sum()
+        4 * (self.rope.len() + self.ones.len() + self.x.len())
+            + 2 * [
+                &self.norm,
+                &self.o,
+                &self.q,
+                &self.k,
+                &self.v,
+                &self.attn,
+                &self.ff,
+                &self.gated,
+                &self.latent,
+                &self.latent_q,
+                &self.patch_rows,
+            ]
+            .iter()
+            .map(|v| v.len())
+            .sum::<usize>()
+            + self
+                .attention
+                .iter()
+                .map(|(n, _)| 4 * (n * self.tokens * self.spec.heads + n + 1))
+                .sum::<usize>()
     }
+
     fn pixels(&self) -> usize {
         self.spec.out_channels
             * self.frames
@@ -2799,7 +3176,7 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore = "GPU; FF_MODEL, longest video capacity and forced F32 streaming"]
+    #[ignore = "GPU; FF_MODEL, longest video capacity and forced BF16 streaming"]
     fn video_decoder_longest_capacity_gpu() -> Result<()> {
         let model = path("FF_MODEL")?;
         let spec = VaeSpec::read(&model)?;
@@ -2817,7 +3194,7 @@ mod image_tests {
                 &d,
                 &ops,
                 &runtime,
-                Rc::new(Closure::new(false, "F32 video capacity".into())),
+                Rc::new(Closure::new(false, "BF16 video capacity".into())),
             )?;
             let (height, width) = (576, 1856);
             let r = spec.spatial_ratio;
@@ -2844,7 +3221,7 @@ mod image_tests {
                 let output_count = spec.out_channels * total * height * width;
                 let scratch = decode_bytes(&spec, &tiles, (height, width));
                 let future =
-                    TileWork::bytes(&spec, tile) + scratch + 4 * (count + output_count) + (1 << 30);
+                    TileWork::bytes(&spec, tile) + scratch + 2 * (count + output_count) + (1 << 30);
                 for placement in [
                     super::super::Placement::Derived,
                     super::super::Placement::Streamed,
@@ -2852,31 +3229,30 @@ mod image_tests {
                     let mut decoder =
                         VideoDecoder::new(&d, &spec, &component, &manifest, (future, placement))?;
                     decoder.prefix_only = true;
-                    let mut work = decoder.work(
-                        &d,
-                        &mut blas,
-                        &tiles,
-                        (latent_frames, height / r, width / r),
-                    )?;
+                    let mut work =
+                        decoder.work(&d, &tiles, (latent_frames, height / r, width / r))?;
+                    decoder.post_quant.bind(&mut blas, work.patches)?;
+                    decoder.proj_in.bind(&mut blas, work.patches)?;
                     ensure!(
-                        work.allocated_bytes() == work.plan.bytes,
+                        work.allocated_bytes()
+                            == TileWork::batch_bytes(&spec, tile, work.batch, tiles.count())?,
                         "RUNNER_FAIL capacity workspace count"
                     );
                     let input: Vec<_> = (0..count)
-                        .map(|i| ((i * 73 % 65521) as f32 - 32760.0) / 8192.0)
+                        .map(|i| bf16::from_f32(((i * 73 % 65521) as f32 - 32760.0) / 8192.0))
                         .collect();
                     let input_device = s.clone_htod(&input)?;
-                    let output = s.alloc_zeros::<f32>(output_count)?;
-                    let raw = s.alloc_zeros::<f32>(tiles.count() * work.pixels())?;
-                    let canvas = s.alloc_zeros::<f32>(
+                    let output = s.alloc_zeros::<bf16>(output_count)?;
+                    let raw = s.alloc_zeros::<bf16>(tiles.count() * work.pixels())?;
+                    let canvas = s.alloc_zeros::<bf16>(
                         spec.out_channels * tile.0 * spec.temporal_ratio * height * width,
                     )?;
                     let tail = tile.0 * spec.temporal_ratio
                         - spec.chunk_latents() * spec.temporal_ratio
                         - spec.frame_pre_padding();
-                    let faded = s.alloc_zeros::<f32>(spec.out_channels * tail * height * width)?;
+                    let faded = s.alloc_zeros::<bf16>(spec.out_channels * tail * height * width)?;
                     ensure!(
-                        4 * (raw.len() + canvas.len() + faded.len()) == scratch,
+                        2 * (raw.len() + canvas.len() + faded.len()) == scratch,
                         "RUNNER_FAIL longest stitch count"
                     );
                     let first_frame = (plan.chunks - 1) * spec.chunk_latents();
@@ -2913,9 +3289,9 @@ mod image_tests {
                     }
                     ensure!(
                         differing == 0,
-                        "DEFECT longest last-tile F32 gather {differing}"
+                        "DEFECT longest last-tile BF16 gather {differing}"
                     );
-                    let active = 4
+                    let active = 2
                         * (input_device.len()
                             + output.len()
                             + raw.len()
@@ -2923,11 +3299,11 @@ mod image_tests {
                             + faded.len())
                         + work.allocated_bytes();
                     println!(
-                        "PASS VIDEO_F32_CAPACITY caller={caller} frames={frames} latent=[1,24,{latent_frames},{},{}] canvas=[{height},{width}] placement={placement:?} linear={} attention={} activation_bytes={active} last_tile_differences={differing} transformer_forwards=0",
+                        "PASS VIDEO_BF16_CAPACITY caller={caller} frames={frames} latent=[1,24,{latent_frames},{},{}] canvas=[{height},{width}] placement={placement:?} linear={} attention={} activation_bytes={active} last_tile_differences={differing} transformer_forwards=0",
                         height / r,
                         width / r,
                         work.batch,
-                        work.plan.attention
+                        work.batch
                     );
                     drop((faded, canvas, raw, output, input_device, work, decoder));
                     s.synchronize()?;
@@ -2942,15 +3318,23 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore = "GPU; FF_MODEL, FF_H3_S0 prefix prediction and FF_H3_CAPTURE"]
+    #[ignore = "GPU; FF_MODEL, publisher BF16 prefix floors and FF_H3_CAPTURE"]
     fn video_decoder_prefix_capture_gpu() -> Result<()> {
-        let (model, root, capture) = (path("FF_MODEL")?, path("FF_H3_S0")?, path("FF_H3_CAPTURE")?);
-        let prediction: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("PREDICTION.json"))?)?;
+        let (model, root, capture) = (
+            path("FF_MODEL")?,
+            path("FF_HYPERFLOW_COMPOSITION")?,
+            path("FF_H3_CAPTURE")?,
+        );
+        let case = std::env::var("FF_HYPERFLOW_CASE")?;
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("BF16_VIDEO_REPLAY_FLOORS.json"))?)?;
         ensure!(
-            prediction["rule"] == "r7-prefix-rounds-v1"
-                && prediction["native_arrays_read"] == false,
-            "RUNNER_FAIL prefix prediction declaration"
+            matches!(case.as_str(), "text" | "first" | "last" | "both")
+                && frozen["precision"] == "publisher-bf16"
+                && frozen["formula"] == "max(2 * worst_valid_reference_pair, 1e-6)"
+                && frozen["native_arrays_read"] == false
+                && frozen["controls"]["replay"][&case] == true,
+            "RUNNER_FAIL unqualified BF16 prefix floor"
         );
         let spec = VaeSpec::read(&model)?;
         let shape = (
@@ -2962,7 +3346,9 @@ mod image_tests {
             shape == (7, 16, 16) && spec.latent_channels == 24 && spec.dim == 2048,
             "RUNNER_FAIL prefix production shape"
         );
-        let bytes = fs::read(root.join("input.safetensors"))?;
+        let bytes = fs::read(root.join(format!(
+            "arm-a/replay-a/{case}/decoder-video-input.safetensors"
+        )))?;
         let input = SafeTensors::deserialize(&bytes)?;
         ensure!(
             input.tensor("value")?.shape() == [1, 24, 37, 48, 84],
@@ -2976,7 +3362,7 @@ mod image_tests {
             let device = Device::new(0)?;
             let s = &device.stream;
             let ops = Ops::new(&device.ctx)?;
-            let blas = Blas::new(
+            let mut blas = Blas::new(
                 &device,
                 &ops,
                 &runtime,
@@ -2997,8 +3383,10 @@ mod image_tests {
             )?;
             decoder.prefix_only = true;
             let mut work = TileWork::new(s, &spec, shape, (1, 1))?;
-            let input = s.clone_htod(&values)?;
-            let raw = s.alloc_zeros::<f32>(work.pixels())?;
+            decoder.bind(&mut blas, &work)?;
+            let rounded: Vec<_> = values.iter().copied().map(bf16::from_f32).collect();
+            let input = s.clone_htod(&rounded)?;
+            let raw = s.alloc_zeros::<bf16>(work.pixels())?;
             decoder.tile(
                 s,
                 &blas,
@@ -3012,49 +3400,74 @@ mod image_tests {
                 (&[(0, 0)], 0),
                 (&raw, 0),
             )?;
-            let packed = s.clone_dtoh(&work.latent)?;
-            let bytes = fs::read(root.join("f32/packed.safetensors"))?;
-            let expected = tensor(&SafeTensors::deserialize(&bytes)?, "value")?;
-            ensure!(
-                packed.len() == expected.len()
-                    && packed
-                        .iter()
-                        .zip(&expected)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "RUNNER_FAIL packed F32 input mismatch"
-            );
-            let shifted = packed
-                .iter()
-                .enumerate()
-                .any(|(i, a)| a.to_bits() != expected[(i + 24) % expected.len()].to_bits());
-            ensure!(shifted, "RUNNER_FAIL prefix row-shift control missed");
-            for (name, shape, values) in [
-                ("packed", vec![work.patches, 24], packed),
+            let mut defects = 0;
+            for (name, shape, actual) in [
+                ("packed", [work.patches, 24], s.clone_dtoh(&work.latent)?),
                 (
                     "post_quant",
-                    vec![work.patches, 24],
+                    [work.patches, 24],
                     s.clone_dtoh(&work.latent_q)?,
                 ),
                 (
                     "proj_in",
-                    vec![work.patches, 2048],
-                    s.clone_dtoh(&work.o.slice(..work.patches * 2048))?,
+                    [16, 2048],
+                    s.clone_dtoh(&work.o.slice(..16 * 2048))?,
                 ),
             ] {
+                let actual: Vec<_> = actual.into_iter().map(bf16::to_f32).collect();
+                let floor = &frozen["prefix"][format!("replay/{case}/{name}")];
+                let tau_abs = floor["tau_abs"]
+                    .as_f64()
+                    .context("RUNNER_FAIL prefix abs floor")?;
+                let tau_rmse = floor["tau_rmse"]
+                    .as_f64()
+                    .context("RUNNER_FAIL prefix RMSE floor")?;
+                ensure!(
+                    [tau_abs, tau_rmse]
+                        .iter()
+                        .all(|x| x.is_finite() && *x >= 1e-6),
+                    "RUNNER_FAIL invalid taus for BF16 prefix {name}"
+                );
+                for arm in ["arm-a", "arm-b", "arm-c"] {
+                    let bytes = fs::read(root.join(format!(
+                        "{arm}/bf16-video/replay-a/{case}/{name}.safetensors"
+                    )))?;
+                    let expected = SafeTensors::deserialize(&bytes)?;
+                    ensure!(
+                        expected.tensor("value")?.shape() == shape,
+                        "RUNNER_FAIL BF16 prefix {name} shape"
+                    );
+                    let expected = tensor(&expected, "value")?;
+                    let (max_abs, rmse) = crate::verify::max_abs_rmse(name, &actual, &expected)?;
+                    let pass = if name == "packed" {
+                        actual
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .eq(expected.iter().map(|x| x.to_bits()))
+                    } else {
+                        max_abs <= tau_abs && rmse <= tau_rmse
+                    };
+                    defects += usize::from(!pass);
+                    println!(
+                        "VIDEO_PREFIX_CELL {} boundary={name} ref={arm} max_abs={max_abs} rmse={rmse} tau_abs={tau_abs} tau_rmse={tau_rmse}",
+                        if pass { "PASS" } else { "DEFECT" }
+                    );
+                }
                 let file = capture.join(name).with_extension("safetensors");
                 ensure!(!file.exists(), "RUNNER_FAIL prefix capture exists");
                 let mut trace = crate::trace::Trace::default();
                 trace.set_device(&device.info.name)?;
-                trace.add("value".into(), shape, values)?;
+                trace.add("value".into(), shape.to_vec(), actual)?;
                 trace.save(&file)?;
             }
             println!(
-                "PASS VIDEO_PREFIX_CAPTURE boundaries=3 packed_exact=true row_shift_control=true transformer_forwards=0 input_bytes={} work_bytes={} raw_bytes={} blas_workspace_bytes={}",
-                4 * values.len(),
+                "VIDEO_PREFIX_CAPTURE boundaries=3 comparisons=9 defects={defects} latent_channel_control=true transformer_forwards=0 input_bytes={} work_bytes={} raw_bytes={} blas_workspace_bytes={}",
+                2 * values.len(),
                 work.allocated_bytes(),
-                4 * work.pixels(),
+                2 * work.pixels(),
                 blas.workspace_bytes()
             );
+            ensure!(defects == 0, "DEFECT video BF16 prefix boundaries");
             Ok(())
         })();
         let cleanup = fs::remove_dir_all(&runtime);

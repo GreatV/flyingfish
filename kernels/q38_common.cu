@@ -722,6 +722,12 @@ extern "C" __global__ void q38_layer_norm_f32(
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
     q38_layer_norm_f32_impl<float, float>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
+extern "C" __global__ void layer_norm_f32_to_bf16(
+    const float* x, const float* weight, const float* bias, __nv_bfloat16* y,
+    uint32_t rows, uint32_t width, float eps) {
+    q38_layer_norm_f32_impl<float, __nv_bfloat16>(x, weight, bias, y, rows, 1, width,
+        width, 0, 1, width, 0, 1, eps);
+}
 extern "C" __global__ void q38_layer_norm_f16(
     const __half* x,const float* weight,const float* bias,__half* y,
     uint32_t rows,uint32_t heads,uint32_t width,

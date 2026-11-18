@@ -10161,11 +10161,11 @@ mod tests {
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 3, 28)?,
-            1_320_059_200
+            476_534_488
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 28, 28)?,
-            8_873_185_600
+            4_442_630_964
         );
         assert!(vae::TileWork::batch_bytes(&spec, shape, 0, 28).is_err());
         assert!(vae::TileWork::batch_bytes(&spec, shape, 29, 28).is_err());
@@ -10173,17 +10173,24 @@ mod tests {
             assert!(vae::TileWork::batch_bytes(&spec, shape, 1, 28).is_err());
         }
         assert!(vae::TileWork::batch_bytes(&spec, (usize::MAX, 16, 16), 1, 28).is_err());
-        let block = 268_574_720;
-        let fixed = 25_434_464;
-        let future = 9_293_928_100;
+        let block = 134_303_744;
+        let fixed = 12_725_424;
+        let future = 7_192_309_556;
         let total = 16_000_000_000;
         let budget = crate::prefill::DensePlacement::device_budget(total, total, fixed, 0, future)?;
         let plan = crate::prefill::DensePlacement::new(&[block; 36], None, budget, 10_000_000_000)?;
-        assert_eq!(plan.resident_bytes, 19 * block);
+        assert_eq!(plan.resident_bytes, 36 * block);
+        assert_eq!(plan.slot_bytes, 0);
+        assert_eq!(plan.host_bytes, 0);
+        assert!(fixed + future + plan.resident_bytes + total / 16 <= total);
+        let free = 12_000_000_000;
+        let budget = crate::prefill::DensePlacement::device_budget(free, total, fixed, 0, future)?;
+        let plan = crate::prefill::DensePlacement::new(&[block; 36], None, budget, 10_000_000_000)?;
+        assert_eq!(plan.resident_bytes, 26 * block);
         assert_eq!(plan.slot_bytes, block);
-        assert_eq!(plan.host_bytes, 17 * block);
+        assert_eq!(plan.host_bytes, 10 * block);
         assert_eq!(plan.disk_bytes, 0);
-        assert!(fixed + future + plan.resident_bytes + 2 * plan.slot_bytes + total / 16 <= total);
+        assert!(fixed + future + plan.resident_bytes + 2 * plan.slot_bytes + total / 16 <= free);
         let streamed =
             crate::prefill::DensePlacement::new(&[block; 36], None, 2 * block, 10_000_000_000)?;
         assert_eq!(streamed.resident_bytes, 0);

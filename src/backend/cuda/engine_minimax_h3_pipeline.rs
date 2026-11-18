@@ -2,7 +2,10 @@
 //! decoders after the transformer and conditioner are released. Stages run in that order and each stage's weights are
 //! dropped before the next stage's placement is derived from the then-free device memory.
 use super::audio::AudioDecoder;
-use super::vae::{EncodeWork, KeyframeEncoder, LatentVideo, TileWork, VideoDecoder, decode_bytes};
+use super::vae::{
+    EncodeWork, KeyframeEncoder, LatentVideo, TileWork, VideoDecoder, decode_bytes,
+    video_decoder_weight_bytes,
+};
 use super::{
     AdalnTable, BlockContext, BlockKernels, Conditioner, ConditionerInput, ConditionerPrompt, Dit,
     Placement, Source, conditioner_embeds, conditioner_rope, embedding_rows, image_runs,
@@ -263,18 +266,9 @@ fn keyframes(
     Ok(anchors)
 }
 
-/// Bytes the decoders hold resident: the video decoder side of `video` (BF16 set at two bytes per element) and every
-/// loaded audio decoder tensor.
+/// Resident BF16 and F32 video weights plus the published F32 audio weights.
 fn decoder_bytes(video: &TensorManifest, audio: &TensorManifest) -> usize {
-    let video_bytes: usize = video
-        .entries
-        .iter()
-        .filter(|(name, e)| {
-            e.load && !name.starts_with("encoder.") && !name.starts_with("quant_conv.")
-        })
-        .map(|(_, e)| e.bytes)
-        .sum();
-    video_bytes
+    video_decoder_weight_bytes(video)
         + audio
             .entries
             .values()
@@ -683,8 +677,9 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
     let weights = decoder_bytes(&vae_manifest, &audio_manifest);
     let work_bytes = TileWork::bytes(vae, tile)
         + decode_bytes(vae, &tiles, (request.height, request.width))
-        + 4 * vae.out_channels * total_frames * pixels
-        + 4 * (video_latents.len() + audio_latents.len())
+        + 2 * vae.out_channels * total_frames * pixels
+        + 2 * video_latents.len()
+        + 4 * audio_latents.len()
         + AudioDecoder::work_bytes(audio_spec, (2, latents))?;
     let planned = weights + work_bytes;
     let (free_after, total) = device.ctx.mem_get_info()?;
@@ -694,15 +689,10 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
             serde_json::json!({"h3_release": {"free_before_release_bytes": free_before,
                 "free_after_release_bytes": free_after,
                 "decoder_weight_bytes": weights, "decode_work_bytes": work_bytes,
-                "planned_bytes": planned, "total_bytes": total, "placement": "resident"}})
+                "planned_bytes": planned, "total_bytes": total}})
         );
     }
-    let decoder_weights: usize = vae_manifest
-        .entries
-        .iter()
-        .filter(|(n, _)| n.starts_with("decoder.") || n.starts_with("post_quant_conv."))
-        .map(|(_, e)| e.bytes)
-        .sum();
+    let decoder_weights = video_decoder_weight_bytes(&vae_manifest);
     let future =
         work_bytes + weights - decoder_weights + 3 * decode_plan.frames * pixels + (1 << 30);
     let decoder = VideoDecoder::new(device, vae, &vae_dir, &vae_manifest, (future, placement))?;
@@ -711,14 +701,21 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
         decoder.batch_setup(device, blas, &tiles, (latent_frames, lh, lw))?;
         anyhow::bail!("H3_VAE_SETUP_COMPLETE");
     }
-    let mut work = decoder.work(device, blas, &tiles, (latent_frames, lh, lw))?;
+    let mut work = decoder.work(device, &tiles, (latent_frames, lh, lw))?;
     #[cfg(test)]
     if SERIAL {
         drop(work);
         work = TileWork::new(s, vae, tile, (1, tiles.count()))?;
     }
-    let mut decoded = s.alloc_zeros::<f32>(vae.out_channels * total_frames * pixels)?;
-    let latents_device = s.clone_htod(&video_latents)?;
+    decoder.bind(blas, &work)?;
+    let mut decoded = s.alloc_zeros::<bf16>(vae.out_channels * total_frames * pixels)?;
+    let rounded: Vec<_> = video_latents.iter().copied().map(bf16::from_f32).collect();
+    ensure!(
+        rounded.iter().all(|x| x.is_finite()),
+        "video latent input is nonfinite after BF16 entry cast"
+    );
+    let latents_device = s.clone_htod(&rounded)?;
+    drop(rounded);
     let decode_plan = decoder.decode(
         s,
         blas,
@@ -740,7 +737,11 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
     );
     drop((work, latents_device));
     #[cfg(test)]
-    let video_decoded = s.clone_dtoh(&decoded)?;
+    let video_decoded = s
+        .clone_dtoh(&decoded)?
+        .into_iter()
+        .map(bf16::to_f32)
+        .collect();
     let rgb = decoder.rgb(device, &decoded, (frames, total_frames, pixels))?;
     let video_u8 = s.clone_dtoh(&rgb)?;
     drop((rgb, decoded, decoder));
@@ -1269,6 +1270,13 @@ fn composition_values(root: &Path, relative: &str, shape: &[usize]) -> Result<Ve
         value.shape()
     );
     let values: Vec<f64> = match value.dtype() {
+        Dtype::BF16 => value
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| f64::from(bf16::from_bits(u16::from_le_bytes(*b)).to_f32()))
+            .collect(),
         Dtype::F32 => value
             .data()
             .as_chunks::<4>()
@@ -1396,9 +1404,9 @@ impl CompositionGate {
         );
         if conv_only {
             let cells = match case {
-                "text" => 3,
-                "first" | "last" => 4,
-                "both" => 5,
+                "text" => 4,
+                "first" | "last" => 5,
+                "both" => 6,
                 _ => anyhow::bail!("Runner FAIL unknown conv case {case}"),
             };
             ensure!(
@@ -1406,7 +1414,11 @@ impl CompositionGate {
                     && expected
                         .iter()
                         .all(|key| self.floors.cells[key].reference_arms
-                            == ["arm-a", "arm-b", "arm-f"])
+                            == if key.contains("/decoded-video-") {
+                                ["arm-a", "arm-b", "arm-c"]
+                            } else {
+                                ["arm-a", "arm-b", "arm-f"]
+                            })
                     && self.gating == cells * 3
                     && self.controls == 0
                     && !self.control_failed,
@@ -1474,6 +1486,42 @@ impl CompositionGate {
         Ok(())
     }
 
+    fn bf16_video_floors(&mut self, case: &str, mode: &str) -> Result<()> {
+        let file = format!("BF16_VIDEO_{}_FLOORS.json", mode.to_ascii_uppercase());
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.root.join(file)).with_context(|| {
+                format!("Runner FAIL missing publisher BF16 video freeze {mode}")
+            })?)?;
+        ensure!(
+            frozen["precision"] == "publisher-bf16"
+                && frozen["formula"] == "max(2 * worst_valid_reference_pair, 1e-6)"
+                && frozen["native_arrays_read"] == false
+                && frozen["controls"][mode][case] == true,
+            "Runner FAIL unqualified BF16 video floor {mode}/{case}"
+        );
+        for (role, shape) in [
+            ("decoded-video-sample", vec![1, 3, 5, 768, 1344]),
+            ("decoded-video-stats", vec![124, 3, 4]),
+            ("decoded-video-seams", vec![3, 14, 96, 168]),
+        ] {
+            let key = format!("{mode}/{case}/{role}");
+            let cell: CompositionCell = serde_json::from_value(frozen["cells"][&key].clone())
+                .with_context(|| format!("Runner FAIL absent BF16 floor {key}"))?;
+            ensure!(
+                cell.shape == shape
+                    && cell.gating
+                    && cell.gating_metrics == ["max_abs", "rmse"]
+                    && cell.reference_arms == ["arm-a", "arm-b", "arm-c"]
+                    && [cell.tau_abs, cell.tau_rmse]
+                        .iter()
+                        .all(|v| v.is_finite() && *v >= 1e-6),
+                "Runner FAIL malformed BF16 floor {key}"
+            );
+            self.floors.cells.insert(key, cell);
+        }
+        Ok(())
+    }
+
     fn media(&mut self, case: &str, mode: &str, generated: &Generated) -> Result<()> {
         let (shape, decoded) = &generated.video_decoded;
         ensure!(
@@ -1521,6 +1569,20 @@ impl CompositionGate {
             }
         }
         let source = if mode == "replay" { "replay-a" } else { "a" };
+        let mut seams = Vec::with_capacity(3 * 14 * 96 * 168);
+        for channel in 0..3 {
+            for frame in [16, 17, 33, 34, 50, 51, 67, 68, 84, 85, 101, 102, 118, 119] {
+                let start = (channel * shape[2] + frame) * pixels;
+                for y in (0..768).step_by(8) {
+                    seams.extend(
+                        decoded[start + y * 1344..start + (y + 1) * 1344]
+                            .iter()
+                            .step_by(8)
+                            .map(|&v| f64::from(v)),
+                    );
+                }
+            }
+        }
         for (role, values, extent) in [
             (
                 "decoded-video-sample",
@@ -1528,6 +1590,7 @@ impl CompositionGate {
                 vec![1, 3, 5, 768, 1344],
             ),
             ("decoded-video-stats", statistics, vec![124, 3, 4]),
+            ("decoded-video-seams", seams, vec![3, 14, 96, 168]),
             (
                 "decoded-audio",
                 generated
@@ -1539,9 +1602,14 @@ impl CompositionGate {
                 vec![2, 165600],
             ),
         ] {
+            let relative = if role.starts_with("decoded-video-") {
+                format!("bf16-video/{source}/{case}/{role}")
+            } else {
+                format!("{source}/{case}/{role}")
+            };
             self.score(
                 &format!("{mode}/{case}/{role}"),
-                &format!("{source}/{case}/{role}"),
+                &relative,
                 &values,
                 &extent,
             )?;
@@ -1853,28 +1921,28 @@ fn hyperflow_anchor_and_decoders_match_frozen_references() -> Result<()> {
 
 #[cfg(test)]
 #[test]
-#[ignore = "GPU; published F32 decoder references and capture directory"]
+#[ignore = "GPU; publisher BF16 video / F32 audio references and capture directory"]
 fn minimax_video_decoder_matches_frozen_references() -> Result<()> {
     conv_decoder_gate::<false>(false, super::Placement::Derived)
 }
 
 #[cfg(test)]
 #[test]
-#[ignore = "GPU; published F32 decoder references and capture directory"]
+#[ignore = "GPU; publisher BF16 video / F32 audio references and capture directory"]
 fn hyperflow_streamed_decoder_matches_frozen_references() -> Result<()> {
     conv_decoder_gate::<false>(true, super::Placement::Streamed)
 }
 
 #[cfg(test)]
 #[test]
-#[ignore = "GPU; published F32 decoder references and capture directory"]
+#[ignore = "GPU; publisher BF16 video / F32 audio references and capture directory"]
 fn minimax_streamed_decoder_matches_frozen_references() -> Result<()> {
     conv_decoder_gate::<false>(false, super::Placement::Streamed)
 }
 
 #[cfg(test)]
 #[test]
-#[ignore = "GPU; published F32 decoder references and capture directory"]
+#[ignore = "GPU; publisher BF16 video / F32 audio references and capture directory"]
 fn hyperflow_serial_decoder_matches_frozen_references() -> Result<()> {
     conv_decoder_gate::<true>(true, super::Placement::Derived)
 }
@@ -1906,6 +1974,7 @@ fn conv_decoder_gate<const SERIAL: bool>(
         "Runner FAIL HyperFlow component required"
     );
     let mut gate = CompositionGate::read(&path("FF_HYPERFLOW_COMPOSITION")?)?;
+    gate.bf16_video_floors(&case, "replay")?;
     let out = path("FF_H3_CAPTURE")?;
     std::fs::create_dir_all(&out)?;
     let image = |height, width, offset| RgbImage {
@@ -2080,6 +2149,12 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
     let shared_gate = Rc::new(std::cell::RefCell::new(CompositionGate::read(&path(
         "FF_HYPERFLOW_COMPOSITION",
     )?)?));
+    shared_gate
+        .borrow_mut()
+        .bf16_video_floors(&selected, "replay")?;
+    shared_gate
+        .borrow_mut()
+        .bf16_video_floors(&selected, "free")?;
     let vae = VaeSpec::read(&model)?;
     let audio_spec = AudioVaeSpec::read(&model)?;
     let image = |height, width, offset| RgbImage {
@@ -2635,6 +2710,7 @@ fn composition_case_completion_retains_defects_and_rejects_missing_cells() -> Re
         "producer/first/anchor-0",
         "replay/first/decoded-video-sample",
         "replay/first/decoded-video-stats",
+        "replay/first/decoded-video-seams",
         "replay/first/decoded-audio",
     ];
     let cell = gate.floors.cells[keys[0]].clone();
@@ -2642,12 +2718,20 @@ fn composition_case_completion_retains_defects_and_rejects_missing_cells() -> Re
         .iter()
         .map(|key| {
             let mut cell = cell.clone();
-            cell.reference_arms = vec!["arm-a".into(), "arm-b".into(), "arm-f".into()];
+            cell.reference_arms = vec![
+                "arm-a".into(),
+                "arm-b".into(),
+                if key.contains("/decoded-video-") {
+                    "arm-c".into()
+                } else {
+                    "arm-f".into()
+                },
+            ];
             ((*key).into(), cell)
         })
         .collect();
     gate.seen = conv.iter().map(|key| (*key).to_owned()).collect();
-    gate.gating = 12;
+    gate.gating = 15;
     gate.complete("first", true)?;
     assert!(!gate.defects.is_empty());
     gate.seen.remove(conv[0]);
