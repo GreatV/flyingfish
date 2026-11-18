@@ -662,11 +662,6 @@ impl AdalnTable {
 /// Initial FFN chunk ceiling before weight placement.
 const FFN_CHUNK_ROWS: usize = 1024;
 
-/// Live bytes still reserved for the image FFN workspace. Placement's device budget already reserved `total / 16`.
-fn ffn_live_reserve(transient: usize) -> usize {
-    transient
-}
-
 /// Rows per FFN chunk: `rows` split evenly over `ceil(rows / FFN_CHUNK_ROWS)` chunks, so the tail chunk holds at
 /// least `chunk - (chunks - 1)` rows.
 fn ffn_chunk(rows: usize) -> usize {
@@ -3032,10 +3027,18 @@ struct PlacedLayers {
     facts: PlacementFacts,
 }
 
-/// Published dense BF16 tensor peak: 165.2 TFLOP/s at 128 SMs, scaled by the device SM count.
-fn dense_bf16_peak(sms: usize) -> Result<f64> {
-    ensure!(sms > 0, "zero SM count");
-    let peak = 165.2e12 * (sms as f64) / 128.0;
+/// Dense BF16-input FP32-accumulate FLOPs per second: `sms * tc_flops_per_sm_clock(sm) * clock_hz`.
+/// `clock_khz` is `CU_DEVICE_ATTRIBUTE_CLOCK_RATE`.
+/// sm_80 is 2048 FLOP/SM/clock: NVIDIA Ampere Architecture In-Depth, 1024 dense BF16 FMA per SM per clock.
+/// sm_86, sm_87, sm_89 and sm_120 are 512 FLOP/SM/clock. 128 SM at 2520 MHz is 165.15072e12 FLOP/s.
+/// sm_90 is 2048 FLOP/SM/clock. sm_100 is 4096 FLOP/SM/clock. Any other capability errors.
+fn dense_bf16_peak_from(sm: u32, sms: usize, clock_khz: i32) -> Result<f64> {
+    let rate = crate::linear_plan::tc_flops_per_sm_clock(sm).context("dense BF16 peak")?;
+    ensure!(
+        sms > 0 && clock_khz > 0,
+        "invalid dense BF16 peak inputs sms={sms} clock_khz={clock_khz}"
+    );
+    let peak = (sms as f64) * f64::from(rate) * (f64::from(clock_khz) * 1000.0);
     ensure!(peak.is_finite() && peak > 0.0, "invalid dense BF16 peak");
     Ok(peak)
 }
@@ -3061,6 +3064,23 @@ fn block_flops(spec: &H3Spec, rows: usize) -> Result<f64> {
     Ok(total)
 }
 
+/// Largest of {3, 2} that `fits` when `desired` is 3. An error from `fits` propagates. Any other `desired` is returned.
+fn slot_count_that_fits(
+    desired: usize,
+    mut fits: impl FnMut(usize) -> Result<bool>,
+) -> Result<usize> {
+    if desired != 3 {
+        return Ok(desired);
+    }
+    if fits(3)? {
+        return Ok(3);
+    }
+    if fits(2)? {
+        return Ok(2);
+    }
+    bail!("dense streaming slots 3 and 2 exceed capacity")
+}
+
 /// `Derived` placement returns 2 or 3. Forced placement and a fully resident plan return 2.
 fn streaming_slots(
     d: &Device,
@@ -3075,8 +3095,16 @@ fn streaming_slots(
     let Some(flops) = layer_flops else {
         return Ok(2);
     };
+    let sm = match d.info.arch {
+        crate::backend::setup::DeviceArchitecture::Cuda(sm) => sm,
+        crate::backend::setup::DeviceArchitecture::Hip(_) => {
+            bail!("dense BF16 peak requires a CUDA device")
+        }
+    };
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let clock_khz = d.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE)?;
     let pcie = crate::backend::cuda::weights::sense_pcie(d)?;
-    let layer_seconds = flops / dense_bf16_peak(d.info.sms)?;
+    let layer_seconds = flops / dense_bf16_peak_from(sm, d.info.sms, clock_khz)?;
     crate::prefill::streaming_slot_count(
         u64::try_from(copy_bytes)?,
         pcie.payload_bytes_per_second,
@@ -3203,19 +3231,31 @@ fn place_layers(
     } else {
         None
     };
-    let place = |slot_count: usize| {
-        plan_dense_layers(
-            (layers, source_layers, largest, owned, media),
-            placement,
-            (free, total, host_available),
-            slot_count,
-        )
-    };
-    let (plan, facts) = match place(desired) {
-        Ok(plan) => plan,
-        Err(_) if desired == 3 => place(2)?,
-        Err(error) => return Err(error),
-    };
+    let chosen =
+        slot_count_that_fits(
+            desired,
+            |slot_count| match crate::prefill::fitting_slot_bytes(
+                layers,
+                layers,
+                device_budget,
+                0,
+                slot_count,
+            )? {
+                None => Ok(false),
+                Some(0) => Ok(true),
+                Some(slot_bytes) => {
+                    let available =
+                        host_available.context("host tier without a measured host budget")?;
+                    crate::prefill::host_staging_fits(available, slot_count, slot_bytes, largest)
+                }
+            },
+        )?;
+    let (plan, facts) = plan_dense_layers(
+        (layers, source_layers, largest, owned, media),
+        placement,
+        (free, total, host_available),
+        chosen,
+    )?;
     let used_slots = plan
         .slots
         .iter()
@@ -3627,11 +3667,32 @@ fn place_stored_layers(
         )?;
         Ok((compact, host_budget, host_available))
     };
-    let (compact, host_budget, host_available) = match attempt(desired) {
-        Ok(plan) => plan,
-        Err(_) if desired == 3 => attempt(2)?,
-        Err(error) => return Err(error),
-    };
+    let chosen =
+        slot_count_that_fits(
+            desired,
+            |slot_count| match crate::prefill::fitting_slot_bytes(
+                &charged_device,
+                &charged_slots,
+                device_budget,
+                granularity,
+                slot_count,
+            )? {
+                None => Ok(false),
+                Some(0) => Ok(true),
+                Some(slot_bytes) => {
+                    let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(
+                        Path::new("/"),
+                    )?)?;
+                    crate::prefill::host_staging_fits(
+                        available,
+                        slot_count,
+                        slot_bytes,
+                        sizing.largest,
+                    )
+                }
+            },
+        )?;
+    let (compact, host_budget, host_available) = attempt(chosen)?;
     let facts = PlacementFacts {
         free_bytes: free,
         total_bytes: total,
@@ -4715,8 +4776,7 @@ impl ImageDit {
             });
         }
         let (free, _) = d.ctx.mem_get_info()?;
-        let reserve = ffn_live_reserve(sizing.transient);
-        let budget = d.workspace_budget(free, free, reserve)?;
+        let budget = d.workspace_budget(free, free, sizing.transient)?;
         let choices = work.ffn_choices::<false>(blas, spec, budget)?;
         let owned_plan = FfnPlan::select(&choices, budget)?;
         let aliases = work.alias_choices::<false>(blas, spec, owned_plan)?;
@@ -6000,8 +6060,8 @@ mod tests {
         Ok(())
     }
 
-    /// Image FFN live reserve is the transient only. At the logged free of 1_683_750_912 the selector takes chunk 2052;
-    /// subtracting `total / 16` again leaves 105_455_616 and takes chunk 1026.
+    /// At the logged free of 1_683_750_912 the selector takes chunk 2052. Subtracting `total / 16` again leaves
+    /// 105_455_616 and takes chunk 1026.
     #[test]
     fn image_ffn_reserve_is_subtracted_once() -> Result<()> {
         let rows = 4_103usize;
@@ -6022,21 +6082,34 @@ mod tests {
             plan(1_026, 256.0 / 189.0),
             plan(821, 256.0 / 147.0),
         ];
-        assert_eq!(ffn_live_reserve(0), 0);
-        assert_eq!(ffn_live_reserve(12), 12);
         let logged_free = 1_683_750_912usize;
         let total = 25_252_724_736usize;
-        let budget = logged_free - ffn_live_reserve(0);
-        assert_eq!(FfnPlan::select(&choices, budget)?.chunk, 2_052);
+        assert_eq!(FfnPlan::select(&choices, logged_free)?.chunk, 2_052);
         let doubled = logged_free - total / 16;
         assert_eq!(doubled, 105_455_616);
         assert_eq!(FfnPlan::select(&choices, doubled)?.chunk, 1_026);
-        assert!(choices[1].allocation <= budget);
+        assert!(choices[1].allocation <= logged_free);
         assert!(choices[3].allocation <= doubled && choices[2].allocation > doubled);
+        let mut probes = Vec::new();
+        let error = slot_count_that_fits(3, |count| -> Result<bool> {
+            probes.push(count);
+            bail!("placement probe failed")
+        });
+        ensure!(
+            error.is_err() && probes == [3],
+            "probes={probes:?} error={error:?}"
+        );
+        assert_eq!(slot_count_that_fits(3, |count| Ok(count == 2))?, 2);
+        assert!(slot_count_that_fits(3, |_| Ok(false)).is_err());
+        assert_eq!(
+            slot_count_that_fits(2, |_| -> Result<bool> { bail!("not consulted") })?,
+            2
+        );
         Ok(())
     }
 
-    /// 4103-row image block FLOPs at the published 128-SM peak leave one layer copy exposed, so the slot count is 3.
+    /// 4103-row image block FLOPs at sm_89, 128 SM, 2520 MHz leave one layer copy exposed, so the slot count is 3.
+    /// sm_86 at 48 SM and 1560 MHz is not the 4090 peak scaled by SM count.
     #[test]
     fn image_block_flops_need_three_streaming_slots() -> Result<()> {
         let spec = H3Spec::parse(&serde_json::from_str(include_str!(
@@ -6044,12 +6117,28 @@ mod tests {
         ))?)?;
         let flops = block_flops(&spec, 4_103)?;
         assert_eq!(flops, 3_644_877_795_328.0);
-        assert_eq!(dense_bf16_peak(128)?, 165.2e12);
-        let layer = flops / dense_bf16_peak(128)?;
+        let peak = dense_bf16_peak_from(89, 128, 2_520_000)?;
+        assert_eq!(peak, 128.0 * 512.0 * 2_520_000_000.0);
+        let a4000 = dense_bf16_peak_from(86, 48, 1_560_000)?;
+        assert_eq!(a4000, 48.0 * 512.0 * 1_560_000_000.0);
+        assert_ne!(a4000, 165.2e12 * 48.0 / 128.0);
+        assert!(dense_bf16_peak_from(75, 128, 2_520_000).is_err());
         let rate = crate::prefill::pcie_payload_bytes_per_second("16.0 GT/s", 16)?;
+        let layer = flops / peak;
         assert_eq!(
             crate::prefill::streaming_slot_count(770_703_360, rate, layer)?,
             3
+        );
+        let sensed = dense_bf16_peak_from(89, 128, 2_595_000)?;
+        assert_eq!(sensed, 128.0 * 512.0 * 2_595_000_000.0);
+        assert_eq!(
+            crate::prefill::streaming_slot_count(770_703_360, rate, flops / sensed)?,
+            3
+        );
+        let slow = dense_bf16_peak_from(89, 128, 2_230_000)?;
+        assert_eq!(
+            crate::prefill::streaming_slot_count(770_703_360, rate, flops / slow)?,
+            2
         );
         let covered = (layer * rate) as u64;
         assert_eq!(

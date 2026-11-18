@@ -142,59 +142,18 @@ impl DensePlacement {
         if total <= device_bytes {
             return Ok(plan);
         }
-        let mut sizes = slot_layers.to_vec();
-        sizes.sort_unstable();
-        sizes.dedup();
-        let mut order: Vec<_> = (0..layers.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(layers[i]));
-        let mut best = None;
-        for slot in sizes {
-            let slots = slot
-                .checked_mul(slot_count)
-                .context("dense slots overflow")?;
-            let setup = layers
-                .len()
-                .checked_mul(streamed_overhead)
-                .and_then(|n| n.checked_add(slots))
-                .context("dense streaming setup overflow")?;
-            let Some(mut remaining) = device_bytes.checked_sub(setup) else {
-                continue;
-            };
-            let mut resident = vec![false; layers.len()];
-            let mut required = 0usize;
-            for &i in &order {
-                if slot_layers[i] > slot {
-                    required += layers[i] - streamed_overhead;
-                    resident[i] = true;
-                }
-            }
-            let Some(available) = remaining.checked_sub(required) else {
-                continue;
-            };
-            remaining = available;
-            for &i in &order {
-                if !resident[i] && layers[i] - streamed_overhead <= remaining {
-                    resident[i] = true;
-                    remaining -= layers[i] - streamed_overhead;
-                }
-            }
-            let kept = layers
-                .iter()
-                .zip(&resident)
-                .filter_map(|(&bytes, &kept)| kept.then_some(bytes))
-                .sum::<usize>();
-            if best
-                .as_ref()
-                .is_none_or(|(_, _, previous)| kept > *previous)
-            {
-                best = Some((slot, resident, kept));
-            }
-        }
-        let (slot, resident, kept) = best.with_context(|| {
-            format!("dense fixed tensors and {slot_count} layer slots exceed VRAM")
-        })?;
+        let (slot, resident, kept) = select_slot(
+            layers,
+            slot_layers,
+            device_bytes,
+            streamed_overhead,
+            slot_count,
+        )?
+        .with_context(|| format!("dense fixed tensors and {slot_count} layer slots exceed VRAM"))?;
         plan.slot_bytes = slot;
         plan.resident_bytes = kept;
+        let mut order: Vec<_> = (0..layers.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(layers[i]));
         let mut index = 0;
         for (i, &resident) in resident.iter().enumerate() {
             if !resident {
@@ -228,6 +187,121 @@ impl DensePlacement {
         );
         Ok(plan)
     }
+}
+
+/// `Some(slot_bytes)` when a placement fits in `device_bytes`, including `Some(0)` when every layer is resident.
+/// `None` when no slot size fits. Overflow and an invalid extent are errors.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn fitting_slot_bytes(
+    layers: &[usize],
+    slot_layers: &[usize],
+    device_bytes: usize,
+    streamed_overhead: usize,
+    slot_count: usize,
+) -> Result<Option<usize>> {
+    ensure!(
+        matches!(slot_count, 2 | 3),
+        "dense streaming slot count {slot_count}"
+    );
+    ensure!(
+        !layers.is_empty() && layers.iter().all(|&n| n > 0 && n >= streamed_overhead),
+        "empty dense layer extent"
+    );
+    ensure!(
+        slot_layers.len() == layers.len() && slot_layers.iter().all(|&n| n > 0),
+        "dense slot layer extent differs from resident layers"
+    );
+    let total = layers.iter().try_fold(0usize, |sum, &n| {
+        sum.checked_add(n).context("dense weight extent overflow")
+    })?;
+    if total <= device_bytes {
+        return Ok(Some(0));
+    }
+    Ok(select_slot(
+        layers,
+        slot_layers,
+        device_bytes,
+        streamed_overhead,
+        slot_count,
+    )?
+    .map(|(slot, _, _)| slot))
+}
+
+/// `slot_count * slot_bytes + largest + 4 GiB` fits in `available`. `slot_bytes == 0` fits. Overflow is an error.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn host_staging_fits(
+    available: usize,
+    slot_count: usize,
+    slot_bytes: usize,
+    largest: usize,
+) -> Result<bool> {
+    if slot_bytes == 0 {
+        return Ok(true);
+    }
+    let reserved = slot_count
+        .checked_mul(slot_bytes)
+        .and_then(|bytes| bytes.checked_add(largest))
+        .and_then(|bytes| bytes.checked_add(4 << 30))
+        .context("dense host reserve overflow")?;
+    Ok(available >= reserved)
+}
+
+fn select_slot(
+    layers: &[usize],
+    slot_layers: &[usize],
+    device_bytes: usize,
+    streamed_overhead: usize,
+    slot_count: usize,
+) -> Result<Option<(usize, Vec<bool>, usize)>> {
+    let mut sizes = slot_layers.to_vec();
+    sizes.sort_unstable();
+    sizes.dedup();
+    let mut order: Vec<_> = (0..layers.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(layers[i]));
+    let mut best = None;
+    for slot in sizes {
+        let slots = slot
+            .checked_mul(slot_count)
+            .context("dense slots overflow")?;
+        let setup = layers
+            .len()
+            .checked_mul(streamed_overhead)
+            .and_then(|n| n.checked_add(slots))
+            .context("dense streaming setup overflow")?;
+        let Some(mut remaining) = device_bytes.checked_sub(setup) else {
+            continue;
+        };
+        let mut resident = vec![false; layers.len()];
+        let mut required = 0usize;
+        for &i in &order {
+            if slot_layers[i] > slot {
+                required += layers[i] - streamed_overhead;
+                resident[i] = true;
+            }
+        }
+        let Some(available) = remaining.checked_sub(required) else {
+            continue;
+        };
+        remaining = available;
+        for &i in &order {
+            if !resident[i] && layers[i] - streamed_overhead <= remaining {
+                resident[i] = true;
+                remaining -= layers[i] - streamed_overhead;
+            }
+        }
+        let kept = layers
+            .iter()
+            .zip(&resident)
+            .filter_map(|(&bytes, &kept)| kept.then_some(bytes))
+            .sum::<usize>();
+        if best
+            .as_ref()
+            .is_none_or(|(_, _, previous)| kept > *previous)
+        {
+            best = Some((slot, resident, kept));
+        }
+    }
+    Ok(best)
 }
 
 /// Payload bytes per second of a sysfs `max_link_speed` (`"16.0 GT/s"`) at `width` lanes.
@@ -363,8 +437,9 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::{
-        Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes,
-        pcie_payload_bytes_per_second, prompt_direct_max_rows, streaming_slot_count,
+        Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes, fitting_slot_bytes,
+        host_staging_fits, pcie_payload_bytes_per_second, prompt_direct_max_rows,
+        streaming_slot_count,
     };
 
     #[test]
@@ -381,8 +456,18 @@ mod tests {
             pcie_payload_bytes_per_second("5.0 GT/s", 16)?,
             8_000_000_000.0
         );
-        let layer = 3_644_877_795_328.0 / 165.2e12;
+        let layer = 3_644_877_795_328.0 / (128.0 * 512.0 * 2_520_000_000.0);
         assert_eq!(streaming_slot_count(770_703_360, rate, layer)?, 3);
+        assert!(fitting_slot_bytes(&[100; 10], &[100; 10], 200, 0, 3)?.is_none());
+        assert_eq!(
+            fitting_slot_bytes(&[100; 10], &[100; 10], 200, 0, 2)?,
+            Some(100)
+        );
+        assert!(fitting_slot_bytes(&[100; 10], &[100; 10], 200, 0, 4).is_err());
+        let reserved = 2 * 100 + 10 + (4 << 30);
+        assert!(host_staging_fits(reserved, 2, 100, 10)?);
+        assert!(!host_staging_fits(reserved - 1, 2, 100, 10)?);
+        assert!(host_staging_fits(0, 3, 0, 10)?);
         let covered = (layer * rate) as u64;
         assert_eq!(streaming_slot_count(covered, rate, layer)?, 2);
         assert!(streaming_slot_count(0, rate, layer).is_err());

@@ -1304,7 +1304,7 @@ pub(crate) fn lower_wave_index(waves: &[f64]) -> Result<usize> {
 }
 
 impl Blas {
-    /// Stores the lower whole-wave heuristic of this down shape at plan index 0. A tie, or a missing index 1, keeps 0.
+    /// Stores the lower whole-wave heuristic of this down shape at plan index 0. A tie keeps 0. `algo_count < 2` keeps 0.
     pub(crate) fn bind_lower_wave(&self, shape: LinearShape) -> Result<()> {
         let key = (shape.rows, shape.output, shape.input, 0u32, false);
         let (waves, algo_count) = {
@@ -1315,18 +1315,25 @@ impl Blas {
         if algo_count < 2 {
             return Ok(());
         }
-        let alternative = match Plan::new(
+        let alternative = Plan::new(
             self.handle,
             shape.rows,
             shape.output,
             shape.input,
             self.workspace.borrow().len(),
             1,
-        ) {
-            Ok(plan) => plan,
-            Err(_) => return Ok(()),
-        };
-        if lower_wave_index(&[waves, f64::from(alternative.waves)])? == 0 {
+        )?;
+        let index = lower_wave_index(&[waves, f64::from(alternative.waves)])?;
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_down_wave":{
+                    "rows": shape.rows, "output": shape.output, "input": shape.input,
+                    "waves0": waves, "waves1": alternative.waves, "index": index
+                }})
+            );
+        }
+        if index == 0 {
             return Ok(());
         }
         self.bind_workspace(alternative.workspace)?;
