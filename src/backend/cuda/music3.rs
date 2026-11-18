@@ -1448,8 +1448,8 @@ pub(crate) fn generate_inner(
     let syn_bytes = syn_resident_bytes(model)?;
     let reserve = 1usize << 30;
     ensure!(
-        post_release > syn_bytes + reserve,
-        "synthesis weights {} + {} reserve exceed free {} after AR release and workspace; the check covers weights only",
+        synthesis_fits(post_release, syn_bytes),
+        "synthesis BF16 weights, folds and conversion peak {} + {} reserve exceed free {} after AR release and workspace",
         syn_bytes,
         reserve,
         post_release
@@ -1532,26 +1532,61 @@ pub(crate) fn generate_inner(
 /// categorical draw whose counter is (draw, 0, 0, 0).
 pub(crate) const MUSIC3_NORMAL_STREAM: u64 = 1 << 32;
 
-/// Sum of the three synthesis component safetensors: the F32 resident
-/// weight estimate for the release assert.
+/// BF16 resident weights, vocoder folds, and the largest F32 tensor
+/// temporarily resident during in-memory conversion.
 fn syn_resident_bytes(model: &Path) -> Result<usize> {
-    let mut bytes = 0usize;
+    let spec = crate::music3::SynSpec::read(model)?;
+    let mut tensors = Vec::new();
     for component in ["transformer", "condition_encoder", "vocoder"] {
-        for entry in std::fs::read_dir(model.join(component))
-            .with_context(|| format!("synthesis component dir {component}"))?
-        {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".safetensors") {
-                bytes += entry
-                    .metadata()
-                    .with_context(|| format!("component file {name}"))?
-                    .len() as usize;
+        let mapped = crate::checkpoint::MappedCheckpoint::open_component(
+            &model.join(component),
+            "diffusion_pytorch_model",
+        )?;
+        let manifest = match component {
+            "transformer" => spec.manifest_transformer(&mapped)?,
+            "condition_encoder" => spec.manifest_condition(&mapped)?,
+            "vocoder" => spec.manifest_vocoder(&mapped)?,
+            _ => unreachable!(),
+        };
+        for (name, entry) in &manifest.entries {
+            if entry.load {
+                ensure!(
+                    entry.dtype == safetensors::Dtype::F32,
+                    "synthesis source {name} is not F32"
+                );
+                tensors.push((component, name.clone(), entry.bytes));
             }
         }
     }
-    Ok(bytes)
+    synthesis_bytes(&tensors)
+}
+
+fn synthesis_bytes(tensors: &[(&str, String, usize)]) -> Result<usize> {
+    let mut resident = 0usize;
+    let mut folds = 0usize;
+    let mut conversion_peak = 0usize;
+    for (component, name, bytes) in tensors {
+        ensure!(bytes % 2 == 0, "odd synthesis tensor byte count {name}");
+        resident = resident
+            .checked_add(bytes / 2)
+            .context("synthesis BF16 byte count overflow")?;
+        if *component == "vocoder" && name.ends_with(".weight_v") {
+            folds = folds
+                .checked_add(bytes / 2)
+                .context("vocoder fold byte count overflow")?;
+        }
+        conversion_peak = conversion_peak.max(*bytes);
+    }
+    resident
+        .checked_add(folds)
+        .and_then(|bytes| bytes.checked_add(conversion_peak))
+        .context("synthesis loading peak overflow")
+}
+
+fn synthesis_fits(free: usize, syn_bytes: usize) -> bool {
+    syn_bytes
+        .checked_add(1 << 30)
+        .is_some_and(|required| free > required)
 }
 
 #[cfg(test)]
@@ -1600,6 +1635,25 @@ mod tests {
             cell.squared += delta * delta;
             cell.count += 1;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn synthesis_capacity_uses_bf16_loading_peak() -> Result<()> {
+        let tensors = vec![
+            ("transformer", "a".to_owned(), 400),
+            ("transformer", "b".to_owned(), 400),
+            ("condition_encoder", "c".to_owned(), 40),
+            ("vocoder", "x.weight_v".to_owned(), 80),
+            ("vocoder", "bias".to_owned(), 4),
+        ];
+        let required = synthesis_bytes(&tensors)?;
+        assert_eq!(required, 902);
+        let f32_file_bytes = 924;
+        let free = required + (1 << 30) + 1;
+        assert!(synthesis_fits(free, required));
+        assert!(!synthesis_fits(free, f32_file_bytes));
+        assert!(!synthesis_fits(free - 1, required));
         Ok(())
     }
 
