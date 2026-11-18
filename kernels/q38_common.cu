@@ -1338,6 +1338,198 @@ extern "C" __global__ void q38_layer_norm_f16_fma(
     q38_layer_norm_f32_impl<__half, __half, true>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
 
+extern "C" __global__ void concat_channels_bf16(const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ cond, __nv_bfloat16* __restrict__ out,
+    long long length, int channels, int cond_dim) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = 2 * channels + cond_dim;
+    if (i >= length * width) return;
+    const long long t = i / width;
+    const int c = (int)(i - t * width);
+    __nv_bfloat16 v = __float2bfloat16_rn(0.0f);
+    if (c < channels) v = x[(long long)c * length + t];
+    else if (c >= 2 * channels) v = cond[t * cond_dim + (c - 2 * channels)];
+    out[i] = v;
+}
+
+extern "C" __global__ void transpose_residual_bf16(const __nv_bfloat16* __restrict__ post,
+    const __nv_bfloat16* __restrict__ proj, __nv_bfloat16* __restrict__ velocity,
+    long long length, int channels) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)channels * length) return;
+    const long long c = i / length;
+    const long long t = i - c * length;
+    const long long rm = t * channels + c;
+    velocity[i] = __hadd(post[rm], proj[rm]);
+}
+
+extern "C" __global__ void add_scale_bf16(__nv_bfloat16* __restrict__ y,
+    const __nv_bfloat16* __restrict__ x, long long count, float scale) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    y[i] = __float2bfloat16_rn(__fmul_rn(__fadd_rn(__bfloat162float(y[i]), __bfloat162float(x[i])), scale));
+}
+
+extern "C" __global__ void fourier_time_bf16(float t,
+    const __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ out, uint32_t n) {
+    if(!weight || !out || !n) {__trap();return;}
+    const float t32 = __bfloat162float(__float2bfloat16_rn(t));
+    for(uint32_t i=blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float angle = __bfloat162float(__float2bfloat16_rn(__fmul_rn(6.283185307179586f * t32, __bfloat162float(weight[i]))));
+        out[i] = __float2bfloat16_rn(cosf(angle));
+        out[n + i] = __float2bfloat16_rn(sinf(angle));
+    }
+}
+
+extern "C" __global__ void weighted_layer_sum_bf16(const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w, float scale, __nv_bfloat16* __restrict__ out,
+    long long frames, int layers, int width) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= frames * width) return;
+    const long long t = i / width;
+    const int h = (int)(i - t * width);
+    float sum = 0.0f;
+    for (int l = 0; l < layers; l++)
+        sum = __fadd_rn(sum, __fmul_rn(__bfloat162float(w[l]), __bfloat162float(x[t * layers * width + (long long)l * width + h])));
+    out[i] = __float2bfloat16_rn(__fmul_rn(scale, sum));
+}
+
+extern "C" __global__ void nearest_rows_bf16(const __nv_bfloat16* __restrict__ in,
+    const unsigned int* __restrict__ map, __nv_bfloat16* __restrict__ out,
+    long long out_rows, long long width) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_rows * width) return;
+    const long long j = i / width;
+    out[i] = in[(long long)map[j] * width + (i - j * width)];
+}
+
+extern "C" __global__ void snake_rows_bf16(const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ alpha, __nv_bfloat16* __restrict__ y,
+    long long count, int channels) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float a = __bfloat162float(alpha[i % channels]);
+    const float v = __bfloat162float(x[i]);
+    const float s = sinf(a * v);
+    y[i] = __float2bfloat16_rn(v + __frcp_rn(a + 1e-9f) * s * s);
+}
+
+extern "C" __global__ void tanh_bf16(__nv_bfloat16* __restrict__ x, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    x[i] = __float2bfloat16_rn(tanhf(__bfloat162float(x[i])));
+}
+
+extern "C" __global__ void guided_euler_bf16(__nv_bfloat16* x,
+    const __nv_bfloat16* c, const __nv_bfloat16* u, float scale, float dt, long long count,
+    int form, __nv_bfloat16* velocity) {
+    if ((!x && !velocity) || !c || !u || count < 1 || form < 0 || form > 1) { __trap(); return; }
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float cf = __bfloat162float(c[i]);
+    const float uf = __bfloat162float(u[i]);
+    const float guided = form == 0
+        ? __fadd_rn(uf, __fmul_rn(scale, __fsub_rn(cf, uf)))
+        : __fadd_rn(__fmul_rn(scale, cf), __fmul_rn(__fsub_rn(1.0f, scale), uf));
+    if (velocity) velocity[i] = __float2bfloat16_rn(guided);
+    if (x) x[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(x[i]), __fmul_rn(dt, guided)));
+}
+
+extern "C" __global__ void transpose_bf16(const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out, long long channels, long long length) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= channels * length) return;
+    const long long c = i / length;
+    const long long t = i - c * length;
+    out[t * channels + c] = in[i];
+}
+
+extern "C" __global__ void pack_heads_bf16(const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16* __restrict__ out, long long tokens, long long heads, long long head_dim) {
+    const long long dim = heads * head_dim;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tokens * dim) return;
+    const long long t = i / dim;
+    const long long c = i - t * dim;
+    const long long h = c / head_dim;
+    const long long d = c - h * head_dim;
+    out[h * tokens * head_dim + t * head_dim + d] = in[i];
+}
+
+extern "C" __global__ void pad_rows_n_bf16(const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ out, long long rows, long long pad, long long width) {
+    const long long total = (rows + 2 * pad) * width;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const long long row = i / width;
+    out[i] = (row < pad || row >= pad + rows) ? __float2bfloat16_rn(0.0f) : x[i - pad * width];
+}
+
+extern "C" __global__ void conv_im2col_bf16(const __nv_bfloat16* __restrict__ padded,
+    __nv_bfloat16* __restrict__ a, long long rows, int width, int kernel, int dilation) {
+    if (!padded || !a || !rows || !width || !kernel || !dilation) { __trap(); return; }
+    const long long cols = (long long)width * kernel;
+    const long long total = rows * cols;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long)gridDim.x * blockDim.x) {
+        const long long t = i / cols;
+        const int col = (int)(i - t * cols);
+        const int c = col / kernel;
+        const int k = col - c * kernel;
+        a[i] = padded[(t + (long long)k * dilation) * width + c];
+    }
+}
+
+extern "C" __global__ void conv_transpose_rows_bf16(const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ bias, __nv_bfloat16* __restrict__ out,
+    int rows, int in_dim, int out_dim, int kernel, int stride, int pad) {
+    if (!x || !w || !bias || !out || rows <= 0 || in_dim <= 0 || out_dim <= 0 || stride <= 0 ||
+        pad < 0 || kernel - 2 * pad != stride || blockDim.x != 256 || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    const long long out_rows = (long long)rows * stride;
+    for (long long t = (long long)blockIdx.x; t < out_rows; t += gridDim.x) {
+        for (int o = threadIdx.x; o < out_dim; o += blockDim.x) {
+            float acc = 0.0f;
+            for (int k = (int)((t + pad) % stride); k < kernel; k += stride) {
+                const long long j = (t + pad - k) / stride;
+                if (j < 0 || j >= rows) continue;
+                const __nv_bfloat16* xr = x + j * in_dim;
+                const __nv_bfloat16* wr = w + (long long)o * kernel + k;
+                for (int c = 0; c < in_dim; c++)
+                    acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(xr[c]), __bfloat162float(wr[(long long)c * out_dim * kernel])));
+            }
+            out[t * out_dim + o] = __float2bfloat16_rn(__fadd_rn(acc, __bfloat162float(bias[o])));
+        }
+    }
+}
+
+extern "C" __global__ void weight_norm_fold_bf16(const __nv_bfloat16* __restrict__ g,
+    const __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ out,
+    long long channels, long long rest) {
+    const long long c = (long long)blockIdx.x;
+    if (c >= channels) return;
+    float sum = 0.0f;
+    for (long long r = threadIdx.x; r < rest; r += blockDim.x) {
+        const float e = __bfloat162float(v[c * rest + r]);
+        sum = __fadd_rn(sum, __fmul_rn(e, e));
+    }
+    __shared__ float scratch[8];
+    for (int delta = 16; delta; delta /= 2)
+        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+    if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = sum;
+    __syncthreads();
+    sum = threadIdx.x < 8 ? scratch[threadIdx.x] : 0.0f;
+    if (threadIdx.x < 32) {
+        for (int delta = 16; delta; delta /= 2)
+            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+        if (threadIdx.x == 0) scratch[0] = sum;
+    }
+    __syncthreads();
+    const float norm = sqrtf(scratch[0] + 1e-12f);
+    for (long long r = threadIdx.x; r < rest; r += blockDim.x)
+        out[c * rest + r] = __float2bfloat16_rn(__fmul_rn(__fdiv_rn(__bfloat162float(g[c]), norm), __bfloat162float(v[c * rest + r])));
+}
+
 extern "C" __global__ __launch_bounds__(256) void layer_norm_silu_f16(
     const __half* x, const float* weight, const float* bias, __half* y,
     uint32_t rows, uint32_t width, float eps) {

@@ -196,3 +196,10 @@ extern "C" __global__ void silu_f32(float* __restrict__ x, long long count) {
     const float v = x[i];
     x[i] = v / (1.0f + expf(-v));
 }
+
+extern "C" __global__ void silu_bf16(__nv_bfloat16* __restrict__ x, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = __bfloat162float(x[i]);
+    x[i] = __float2bfloat16_rn(v / (1.0f + expf(-v)));
+}

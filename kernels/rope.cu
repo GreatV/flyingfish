@@ -771,6 +771,30 @@ extern "C" __global__ void partial_rotary_f32(float* __restrict__ q,
     }
 }
 
+extern "C" __global__ void partial_rotary_bf16(__nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ cos, const __nv_bfloat16* __restrict__ sin,
+    int rows, int heads, int head_dim, int rotary_dim) {
+    if (!q || !cos || !sin || !rows || !heads || head_dim < rotary_dim ||
+        rotary_dim % 2 || blockDim.x != 256 || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    const int half = rotary_dim / 2;
+    const long long pairs = (long long)rows * heads * half;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < pairs;
+         i += (long long)gridDim.x * blockDim.x) {
+        const int d = (int)(i % half);
+        const long long base = (i / half) * head_dim;
+        const long long row = i / ((long long)heads * half);
+        const __nv_bfloat16 c0 = cos[row * rotary_dim + d];
+        const __nv_bfloat16 s0 = sin[row * rotary_dim + d];
+        const __nv_bfloat16 c1 = cos[row * rotary_dim + half + d];
+        const __nv_bfloat16 s1 = sin[row * rotary_dim + half + d];
+        const __nv_bfloat16 a = q[base + d];
+        const __nv_bfloat16 b = q[base + half + d];
+        q[base + d] = __hsub(__hmul(a, c0), __hmul(b, s0));
+        q[base + half + d] = __hadd(__hmul(a, s1), __hmul(b, c1));
+    }
+}
+
 extern "C" __global__ void rope_pair_tail_rn(
     __nv_bfloat16* x, const float* __restrict__ rotary, int rows, int n,
     int width, int tail) {

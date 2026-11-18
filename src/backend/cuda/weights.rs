@@ -1454,46 +1454,46 @@ impl Music3SynWeights {
             Some(&manifest_transformer),
             false,
             |l| {
-                let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
-                    l.load_bytes(name, shape, Dtype::F32)
+                let bf16 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
+                    l.load_bytes_bf16_from_f32(name, shape)
                 };
                 let mut blocks = Vec::with_capacity(spec.flow_layers as usize);
                 for i in 0..spec.flow_layers as usize {
                     let p = format!("transformer_blocks.{i}");
                     blocks.push(Music3FlowBlock {
-                        to_q: f32(l, &format!("{p}.attn.to_q.weight"), &[dim, dim])?,
-                        to_k: f32(l, &format!("{p}.attn.to_k.weight"), &[dim, dim])?,
-                        to_v: f32(l, &format!("{p}.attn.to_v.weight"), &[dim, dim])?,
-                        to_out: f32(l, &format!("{p}.attn.to_out.0.weight"), &[dim, dim])?,
-                        norm1_w: f32(l, &format!("{p}.norm1.weight"), &[dim])?,
-                        norm1_b: f32(l, &format!("{p}.norm1.bias"), &[dim])?,
-                        norm2_w: f32(l, &format!("{p}.norm2.weight"), &[dim])?,
-                        norm2_b: f32(l, &format!("{p}.norm2.bias"), &[dim])?,
-                        ff_in_w: f32(l, &format!("{p}.ff_in.weight"), &[2 * ff, dim])?,
-                        ff_in_b: f32(l, &format!("{p}.ff_in.bias"), &[2 * ff])?,
-                        ff_out_w: f32(l, &format!("{p}.ff_out.weight"), &[dim, ff])?,
-                        ff_out_b: f32(l, &format!("{p}.ff_out.bias"), &[dim])?,
+                        to_q: bf16(l, &format!("{p}.attn.to_q.weight"), &[dim, dim])?,
+                        to_k: bf16(l, &format!("{p}.attn.to_k.weight"), &[dim, dim])?,
+                        to_v: bf16(l, &format!("{p}.attn.to_v.weight"), &[dim, dim])?,
+                        to_out: bf16(l, &format!("{p}.attn.to_out.0.weight"), &[dim, dim])?,
+                        norm1_w: bf16(l, &format!("{p}.norm1.weight"), &[dim])?,
+                        norm1_b: bf16(l, &format!("{p}.norm1.bias"), &[dim])?,
+                        norm2_w: bf16(l, &format!("{p}.norm2.weight"), &[dim])?,
+                        norm2_b: bf16(l, &format!("{p}.norm2.bias"), &[dim])?,
+                        ff_in_w: bf16(l, &format!("{p}.ff_in.weight"), &[2 * ff, dim])?,
+                        ff_in_b: bf16(l, &format!("{p}.ff_in.bias"), &[2 * ff])?,
+                        ff_out_w: bf16(l, &format!("{p}.ff_out.weight"), &[dim, ff])?,
+                        ff_out_b: bf16(l, &format!("{p}.ff_out.bias"), &[dim])?,
                     });
                 }
                 Ok(Music3FlowWeights {
                     blocks,
-                    preprocess: f32(l, "preprocess_conv.weight", &[concat, concat, 1])?,
-                    postprocess: f32(
+                    preprocess: bf16(l, "preprocess_conv.weight", &[concat, concat, 1])?,
+                    postprocess: bf16(
                         l,
                         "postprocess_conv.weight",
                         &[spec.in_channels as usize, spec.in_channels as usize, 1],
                     )?,
-                    proj_in: f32(l, "proj_in.weight", &[dim, concat])?,
-                    proj_out: f32(l, "proj_out.weight", &[spec.in_channels as usize, dim])?,
-                    time_proj: f32(l, "time_proj.weight", &[spec.fourier_dim as usize / 2, 1])?,
-                    time_l1_w: f32(
+                    proj_in: bf16(l, "proj_in.weight", &[dim, concat])?,
+                    proj_out: bf16(l, "proj_out.weight", &[spec.in_channels as usize, dim])?,
+                    time_proj: bf16(l, "time_proj.weight", &[spec.fourier_dim as usize / 2, 1])?,
+                    time_l1_w: bf16(
                         l,
                         "time_embed.linear_1.weight",
                         &[dim, spec.fourier_dim as usize],
                     )?,
-                    time_l1_b: f32(l, "time_embed.linear_1.bias", &[dim])?,
-                    time_l2_w: f32(l, "time_embed.linear_2.weight", &[dim, dim])?,
-                    time_l2_b: f32(l, "time_embed.linear_2.bias", &[dim])?,
+                    time_l1_b: bf16(l, "time_embed.linear_1.bias", &[dim])?,
+                    time_l2_w: bf16(l, "time_embed.linear_2.weight", &[dim, dim])?,
+                    time_l2_b: bf16(l, "time_embed.linear_2.bias", &[dim])?,
                 })
             },
         )?;
@@ -1511,14 +1511,14 @@ impl Music3SynWeights {
             Some(&manifest_condition_encoder),
             false,
             |l| {
-                let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
-                    l.load_bytes(name, shape, Dtype::F32)
+                let bf16 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
+                    l.load_bytes_bf16_from_f32(name, shape)
                 };
                 Ok(Music3CondWeights {
-                    proj_w: f32(l, "proj.weight", &[spec.cond_out as usize, cond_hidden, 3])?,
-                    proj_b: f32(l, "proj.bias", &[spec.cond_out as usize])?,
-                    layer_weight_logits: f32(l, "layer_weight_logits", &[layers])?,
-                    layer_scale: f32(l, "layer_scale", &[1])?,
+                    proj_w: bf16(l, "proj.weight", &[spec.cond_out as usize, cond_hidden, 3])?,
+                    proj_b: bf16(l, "proj.bias", &[spec.cond_out as usize])?,
+                    layer_weight_logits: bf16(l, "layer_weight_logits", &[layers])?,
+                    layer_scale: bf16(l, "layer_scale", &[1])?,
                 })
             },
         )?;
@@ -1541,8 +1541,8 @@ impl Music3SynWeights {
         let manifest_vocoder = spec.manifest_vocoder(&mapped_vocoder)?;
         let (vocoder, _) =
             checkpoint_mapped(&mapped_vocoder, d, Some(&manifest_vocoder), false, |l| {
-                let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
-                    l.load_bytes(name, shape, Dtype::F32)
+                let bf16 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
+                    l.load_bytes_bf16_from_f32(name, shape)
                 };
                 let mut blocks = Vec::with_capacity(block_dims.len());
                 for (i, &(in_dim, out_dim, stride)) in block_dims.iter().enumerate() {
@@ -1552,30 +1552,30 @@ impl Music3SynWeights {
                     for u in 1..=3 {
                         let ru = format!("{b}.res_unit{u}");
                         units.push(Music3VocoderResUnit {
-                            snake1_alpha: f32(l, &format!("{ru}.snake1.alpha"), &[1, out_dim, 1])?,
-                            snake2_alpha: f32(l, &format!("{ru}.snake2.alpha"), &[1, out_dim, 1])?,
-                            c1_g: f32(l, &format!("{ru}.conv1.weight_g"), &[out_dim, 1, 1])?,
-                            c1_v: f32(l, &format!("{ru}.conv1.weight_v"), &[out_dim, out_dim, 7])?,
-                            c1_b: f32(l, &format!("{ru}.conv1.bias"), &[out_dim])?,
-                            c2_g: f32(l, &format!("{ru}.conv2.weight_g"), &[out_dim, 1, 1])?,
-                            c2_v: f32(l, &format!("{ru}.conv2.weight_v"), &[out_dim, out_dim, 1])?,
-                            c2_b: f32(l, &format!("{ru}.conv2.bias"), &[out_dim])?,
+                            snake1_alpha: bf16(l, &format!("{ru}.snake1.alpha"), &[1, out_dim, 1])?,
+                            snake2_alpha: bf16(l, &format!("{ru}.snake2.alpha"), &[1, out_dim, 1])?,
+                            c1_g: bf16(l, &format!("{ru}.conv1.weight_g"), &[out_dim, 1, 1])?,
+                            c1_v: bf16(l, &format!("{ru}.conv1.weight_v"), &[out_dim, out_dim, 7])?,
+                            c1_b: bf16(l, &format!("{ru}.conv1.bias"), &[out_dim])?,
+                            c2_g: bf16(l, &format!("{ru}.conv2.weight_g"), &[out_dim, 1, 1])?,
+                            c2_v: bf16(l, &format!("{ru}.conv2.weight_v"), &[out_dim, out_dim, 1])?,
+                            c2_b: bf16(l, &format!("{ru}.conv2.bias"), &[out_dim])?,
                         });
                     }
                     blocks.push(Music3VocoderBlock {
-                        snake1_alpha: f32(l, &format!("{b}.snake1.alpha"), &[1, in_dim, 1])?,
-                        conv_t_g: f32(l, &format!("{b}.conv_t1.weight_g"), &[in_dim, 1, 1])?,
-                        conv_t_v: f32(
+                        snake1_alpha: bf16(l, &format!("{b}.snake1.alpha"), &[1, in_dim, 1])?,
+                        conv_t_g: bf16(l, &format!("{b}.conv_t1.weight_g"), &[in_dim, 1, 1])?,
+                        conv_t_v: bf16(
                             l,
                             &format!("{b}.conv_t1.weight_v"),
                             &[in_dim, out_dim, kernel],
                         )?,
-                        conv_t_b: f32(l, &format!("{b}.conv_t1.bias"), &[out_dim])?,
+                        conv_t_b: bf16(l, &format!("{b}.conv_t1.bias"), &[out_dim])?,
                         units,
                     });
                 }
                 Ok(Music3VocoderWeights {
-                    dec_in_proj_w: f32(
+                    dec_in_proj_w: bf16(
                         l,
                         "dec_in_proj.weight",
                         &[
@@ -1584,19 +1584,19 @@ impl Music3SynWeights {
                             1,
                         ],
                     )?,
-                    dec_in_proj_b: f32(l, "dec_in_proj.bias", &[spec.decoder_input as usize])?,
-                    conv_in_g: f32(l, "conv_in.weight_g", &[hidden, 1, 1])?,
-                    conv_in_v: f32(
+                    dec_in_proj_b: bf16(l, "dec_in_proj.bias", &[spec.decoder_input as usize])?,
+                    conv_in_g: bf16(l, "conv_in.weight_g", &[hidden, 1, 1])?,
+                    conv_in_v: bf16(
                         l,
                         "conv_in.weight_v",
                         &[hidden, spec.decoder_input as usize, 7],
                     )?,
-                    conv_in_b: f32(l, "conv_in.bias", &[hidden])?,
+                    conv_in_b: bf16(l, "conv_in.bias", &[hidden])?,
                     blocks,
-                    snake_out_alpha: f32(l, "snake_out.alpha", &[1, tail, 1])?,
-                    conv_out_g: f32(l, "conv_out.weight_g", &[1, 1, 1])?,
-                    conv_out_v: f32(l, "conv_out.weight_v", &[1, tail, 7])?,
-                    conv_out_b: f32(l, "conv_out.bias", &[1])?,
+                    snake_out_alpha: bf16(l, "snake_out.alpha", &[1, tail, 1])?,
+                    conv_out_g: bf16(l, "conv_out.weight_g", &[1, 1, 1])?,
+                    conv_out_v: bf16(l, "conv_out.weight_v", &[1, tail, 7])?,
+                    conv_out_b: bf16(l, "conv_out.bias", &[1])?,
                 })
             })?;
         Ok(Self {
@@ -1688,6 +1688,21 @@ impl Loader<'_> {
         #[cfg(feature = "rocm")]
         dst.handoff(&self.compute)?;
         Ok(dst)
+    }
+    pub(super) fn load_bytes_bf16_from_f32(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+    ) -> Result<CudaSlice<u8>> {
+        let source = self.load_bytes(name, shape, Dtype::F32)?;
+        let host = self.stream.clone_dtoh(&source)?;
+        ensure!(host.len() % 4 == 0, "F32 source extent for {name}");
+        let mut converted = Vec::with_capacity(host.len() / 2);
+        for bytes in host.as_chunks::<4>().0 {
+            let value = f32::from_le_bytes(*bytes);
+            converted.extend_from_slice(&bf16::from_f32(value).to_le_bytes());
+        }
+        Ok(self.stream.clone_htod(&converted)?)
     }
 }
 

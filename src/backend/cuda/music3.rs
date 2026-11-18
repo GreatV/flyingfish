@@ -1454,11 +1454,21 @@ pub(crate) fn generate_inner(
         reserve,
         post_release
     );
-    let engine = Music3Syn::load(model, &device_ctx, length)?;
+    let mut engine = Music3Syn::load(model, &device_ctx, length)?;
     let s = &device_ctx.stream;
-    let d_features = s.clone_htod(&features)?;
-    let d_initial: CudaSlice<f32> = match initial {
-        Some(initial) => s.clone_htod(initial)?,
+    let d_features = s.clone_htod(
+        &features
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect::<Vec<_>>(),
+    )?;
+    let d_initial: CudaSlice<bf16> = match initial {
+        Some(initial) => s.clone_htod(
+            &initial
+                .iter()
+                .map(|v| bf16::from_f32(*v))
+                .collect::<Vec<_>>(),
+        )?,
         None => {
             let count = channels * length;
             let drawn = unsafe { s.alloc::<f32>(count)? };
@@ -1475,13 +1485,41 @@ pub(crate) fn generate_inner(
                         256,
                     ))?;
             }
-            drawn
+            let vision = super::cubin::module(&device_ctx.ctx, "vision_ops")?;
+            let cast = vision.load_function("vision_affine_cast_bf16")?;
+            let mut converted = s.alloc_zeros::<bf16>(count)?;
+            unsafe {
+                s.launch_builder(&cast)
+                    .arg(&drawn)
+                    .arg(&mut converted)
+                    .arg(&(count as u64))
+                    .arg(&0.0f32)
+                    .arg(&1.0f32)
+                    .launch(super::ops::flat(count))?;
+            }
+            converted
         }
     };
-    let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
+    let mut audio = unsafe { s.alloc::<bf16>(2 * length * total)? };
     engine.synthesize(&mut ws, &d_features, request.frames, &d_initial, &mut audio)?;
-    let pcm = s.clone_dtoh(&audio)?;
-    let drawn_latent = s.clone_dtoh(&d_initial)?;
+    let vision = super::cubin::module(&device_ctx.ctx, "vision_ops")?;
+    let upcast = vision.load_function("vision_upcast_f32")?;
+    let mut pcm = s.alloc_zeros::<f32>(audio.len())?;
+    let mut latent = s.alloc_zeros::<f32>(d_initial.len())?;
+    unsafe {
+        s.launch_builder(&upcast)
+            .arg(&audio)
+            .arg(&mut pcm)
+            .arg(&(audio.len() as u32))
+            .launch(super::ops::flat(audio.len()))?;
+        s.launch_builder(&upcast)
+            .arg(&d_initial)
+            .arg(&mut latent)
+            .arg(&(d_initial.len() as u32))
+            .launch(super::ops::flat(d_initial.len()))?;
+    }
+    let pcm = s.clone_dtoh(&pcm)?;
+    let drawn_latent = s.clone_dtoh(&latent)?;
     Ok((
         codes,
         drawn_latent,

@@ -1115,6 +1115,22 @@ impl Flash {
 
     /// `keys` is the populated sequence extent; `prefix` enables bidirectional prefix rows.
     pub fn run_masked(&mut self, query: Query<'_>) -> Result<()> {
+        self.run_masked_impl(query, 0, 0, 0, 0)
+    }
+
+    /// Offset order is Q, K, V and output elements.
+    pub fn run_masked_with_offsets(&mut self, query: Query<'_>, offsets: [usize; 4]) -> Result<()> {
+        self.run_masked_impl(query, offsets[0], offsets[1], offsets[2], offsets[3])
+    }
+
+    fn run_masked_impl(
+        &mut self,
+        query: Query<'_>,
+        q_offset: usize,
+        k_offset: usize,
+        v_offset: usize,
+        out_offset: usize,
+    ) -> Result<()> {
         let Query {
             q,
             q_row_stride,
@@ -1241,18 +1257,33 @@ impl Flash {
             .checked_mul(q_row_stride)
             .and_then(|span| span.checked_add(shape.q_heads * shape.head_dim))
             .context("prefill Q extent overflow")?;
-        ensure!(q_span <= q.len(), "prefill Q buffer is too small");
+        ensure!(
+            q_span
+                .checked_add(q_offset)
+                .is_some_and(|span| span <= q.len()),
+            "prefill Q buffer is too small"
+        );
         let cache_span = shape
             .capacity
             .checked_mul(shape.kv_heads)
             .and_then(|x| x.checked_mul(shape.head_dim))
             .ok_or_else(|| anyhow::anyhow!("prefill cache span overflow"))?;
         ensure!(
-            cache_span <= k.len() && cache_span <= v.len(),
+            cache_span
+                .checked_add(k_offset)
+                .is_some_and(|span| span <= k.len())
+                && cache_span
+                    .checked_add(v_offset)
+                    .is_some_and(|span| span <= v.len()),
             "prefill KV buffers are too small"
         );
         ensure!(
-            shape.rows * shape.q_heads * shape.head_dim <= out.len(),
+            shape
+                .rows
+                .checked_mul(shape.q_heads)
+                .and_then(|n| n.checked_mul(shape.head_dim))
+                .and_then(|n| n.checked_add(out_offset))
+                .is_some_and(|span| span <= out.len()),
             "prefill output buffer is too small"
         );
         let windows = self.windows.as_ref();
@@ -1272,6 +1303,10 @@ impl Flash {
         let (k, _k) = k.device_ptr(&self.stream);
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
+        let q = q + (q_offset * 2) as u64;
+        let k = k + (k_offset * 2) as u64;
+        let v = v + (v_offset * 2) as u64;
+        let out = out + (out_offset * 2) as u64;
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
         if !self.native.is_empty() {
             ensure!(
