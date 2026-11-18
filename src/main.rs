@@ -295,8 +295,12 @@ enum Command {
         json: bool,
     },
     Video {
-        #[arg(long, help = "Video description in natural language")]
-        prompt: String,
+        #[arg(
+            long,
+            required_unless_present = "requests",
+            help = "Video description in natural language"
+        )]
+        prompt: Option<String>,
         #[arg(long, help = "Keyframe image (required for MiniMax-H3)")]
         image: Option<PathBuf>,
         #[arg(long, help = "Final keyframe for HyperFlow; alone or with --image")]
@@ -311,8 +315,12 @@ enum Command {
             help = "Requested frame count; rounds up to 17n+5 (136 -> 141), published duration 5-15 s at 24 fps"
         )]
         frames: usize,
-        #[arg(long, help = "Noise seed (required; no documented default)")]
-        seed: u64,
+        #[arg(
+            long,
+            required_unless_present = "requests",
+            help = "Noise seed (required; no documented default)"
+        )]
+        seed: Option<u64>,
         #[arg(
             long,
             help = "Turbo LoRA safetensors, required for MiniMax-H3 and invalid for HyperFlow (e.g. minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors)"
@@ -326,9 +334,16 @@ enum Command {
         #[arg(
             short = 'o',
             long = "output",
+            required_unless_present = "requests",
             help = "Output .mp4 (requires ffmpeg on PATH) or .y4m with a sibling .wav"
         )]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with_all = ["prompt", "seed", "output", "image", "last_image"],
+            help = "Video requests as JSONL with prompt, seed, output, and optional image and last_image paths"
+        )]
+        requests: Option<PathBuf>,
         #[arg(
             long,
             help = "Print resolved output metadata, including the aligned frame count, as JSON"
@@ -1184,6 +1199,24 @@ fn write_image(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+fn read_request_lines<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    medium: &'static str,
+) -> Result<impl Iterator<Item = Result<T>>> {
+    use std::io::BufRead;
+    let file = fs::File::open(path)
+        .with_context(|| format!("open {medium} requests {}", path.display()))?;
+    Ok(std::io::BufReader::new(file)
+        .lines()
+        .enumerate()
+        .map(move |(index, line)| {
+            let line = line.with_context(|| format!("read {medium} request {}", index + 1))?;
+            serde_json::from_str(&line)
+                .with_context(|| format!("parse {medium} request {}", index + 1))
+        }))
+}
+
 fn image_requests(
     cli: &Cli,
     path: &Path,
@@ -1195,7 +1228,6 @@ fn image_requests(
     bail!("image requires CUDA");
     #[cfg(feature = "cuda")]
     flyingfish::backend::with_verbose(cli.verbose, || {
-        use std::io::BufRead;
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Request {
@@ -1208,25 +1240,18 @@ fn image_requests(
             expand: Option<PathBuf>,
         }
         let read_requests = || -> Result<_> {
-            let file = fs::File::open(path)
-                .with_context(|| format!("open image requests {}", path.display()))?;
-            Ok(std::io::BufReader::new(file)
-                .lines()
-                .enumerate()
-                .map(|(index, line)| {
-                    let line = line.with_context(|| format!("read image request {}", index + 1))?;
-                    let record: Request = serde_json::from_str(&line)
-                        .with_context(|| format!("parse image request {}", index + 1))?;
-                    let request = ImageCliRequest {
-                        prompt: record.prompt,
-                        width,
-                        height,
-                        seed: record.seed,
-                        expander: record.expand,
-                        references: record.edit,
-                    };
-                    Ok::<_, anyhow::Error>((request, record.output))
-                }))
+            Ok(read_request_lines::<Request>(path, "image")?.map(|record| {
+                let record = record?;
+                let request = ImageCliRequest {
+                    prompt: record.prompt,
+                    width,
+                    height,
+                    seed: record.seed,
+                    expander: record.expand,
+                    references: record.edit,
+                };
+                Ok::<_, anyhow::Error>((request, record.output))
+            }))
         };
         let mut inputs = read_requests()?;
         let (request, output) = inputs.next().context("image requests file is empty")??;
@@ -1351,12 +1376,101 @@ fn music(
     })
 }
 
+#[cfg(feature = "cuda")]
+fn write_video(
+    (output, wav): (PathBuf, Option<PathBuf>),
+    generated: flyingfish::minimax_h3::H3Output,
+    seed: u64,
+    json: bool,
+) -> Result<()> {
+    let flyingfish::minimax_h3::H3Output {
+        frames,
+        height,
+        width,
+        video,
+        samples,
+        sampling_rate,
+        audio,
+    } = generated;
+    ensure!(
+        audio.len() == samples.checked_mul(2).context("audio extent overflow")?,
+        "MiniMax-H3 audio extent"
+    );
+    let mut interleaved = Vec::with_capacity(audio.len());
+    for index in 0..samples {
+        interleaved.push(audio[index]);
+        interleaved.push(audio[samples + index]);
+    }
+    let mut outputs = Vec::new();
+    if wav.is_none() {
+        flyingfish::media::mux_mp4(
+            &output,
+            flyingfish::media::Y4mVideo {
+                width,
+                height,
+                fps: (flyingfish::minimax_h3::FPS, 1),
+                frames,
+                video,
+            },
+            Some((sampling_rate, 2, &interleaved)),
+        )?;
+        outputs.push(output);
+    } else if let Some(wav) = wav {
+        let result = (|| -> Result<()> {
+            flyingfish::media::write_y4m(
+                fs::File::create(&output)?,
+                width,
+                height,
+                (flyingfish::minimax_h3::FPS, 1),
+                frames,
+                &video,
+            )?;
+            flyingfish::media::write_wav(fs::File::create(&wav)?, sampling_rate, 2, &interleaved)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&output);
+            let _ = fs::remove_file(&wav);
+            return Err(error);
+        }
+        outputs.push(output);
+        outputs.push(wav);
+    }
+    if json {
+        let outputs: Vec<_> = outputs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"video": {
+                "outputs": outputs,
+                "frames": frames,
+                "width": width,
+                "height": height,
+                "samples": samples,
+                "sampling_rate": sampling_rate,
+                "seed": seed,
+            }})
+        );
+    } else {
+        for path in outputs {
+            println!("{}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn video(cli: &Cli) -> Result<()> {
     let _ = cli;
     #[cfg(not(feature = "cuda"))]
     bail!("video requires CUDA");
     #[cfg(feature = "cuda")]
     flyingfish::backend::with_verbose(cli.verbose, || {
+        use flyingfish::minimax_h3::{
+            HyperFlowH3Request, MiniMaxH3I2vaRequest, VideoSession, run_hyperflow_h3_video,
+            run_minimax_h3_i2va,
+        };
         let Command::Video {
             prompt,
             image,
@@ -1367,6 +1481,7 @@ fn video(cli: &Cli) -> Result<()> {
             lora,
             gguf,
             output,
+            requests,
             json,
         } = &cli.command
         else {
@@ -1395,137 +1510,142 @@ fn video(cli: &Cli) -> Result<()> {
         } else {
             None
         };
-        let mp4 = mp4_output(output)?;
-        let output = output_path(output, &cli.model)?;
-        if let Some(base) = &base {
-            output_path(&output, base)?;
-        }
+        let lora = if hyperflow {
+            None
+        } else {
+            Some(resolve(
+                lora.as_deref()
+                    .context("--lora is required for MiniMax-H3")?,
+                "LoRA",
+            )?)
+        };
+        let gguf = gguf
+            .as_deref()
+            .map(|path| resolve(path, "GGUF"))
+            .transpose()?;
         let options = flyingfish::RunOptions {
             device: cli.device,
             runtime_dir: cli.runtime_dir(),
             verbose: cli.verbose,
         };
-        let generated = if let Some(base_model) = &base {
-            let request = flyingfish::minimax_h3::HyperFlowH3Request {
-                model: cli.model.clone(),
-                base_model: base_model.clone(),
-                first_frame: image
-                    .as_ref()
-                    .map(|p| resolve(p, "first image"))
-                    .transpose()?,
-                last_frame: last_image
-                    .as_ref()
-                    .map(|p| resolve(p, "last image"))
-                    .transpose()?,
-                prompt: prompt.clone(),
-                frames: *frames,
-                seed: *seed,
-            };
-            flyingfish::minimax_h3::run_hyperflow_h3_video(&request, options)
-        } else {
-            let request = flyingfish::minimax_h3::MiniMaxH3I2vaRequest {
-                model: cli.model.clone(),
-                lora: resolve(
-                    lora.as_deref()
-                        .context("--lora is required for MiniMax-H3")?,
-                    "LoRA",
-                )?,
-                keyframe: resolve(
-                    image
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            prompt: String,
+            seed: u64,
+            image: Option<PathBuf>,
+            last_image: Option<PathBuf>,
+            output: PathBuf,
+        }
+        enum ModelRequest {
+            MiniMax(MiniMaxH3I2vaRequest),
+            HyperFlow(HyperFlowH3Request),
+        }
+        let model_request = |request: &Request| -> Result<_> {
+            if let Some(base_model) = &base {
+                Ok(ModelRequest::HyperFlow(HyperFlowH3Request {
+                    model: cli.model.clone(),
+                    base_model: base_model.clone(),
+                    first_frame: request
+                        .image
                         .as_deref()
-                        .context("--image is required for MiniMax-H3 image-to-video+audio")?,
-                    "keyframe",
-                )?,
-                gguf: gguf.as_ref().map(|p| resolve(p, "GGUF")).transpose()?,
-                prompt: prompt.clone(),
-                frames: *frames,
-                seed: *seed,
-            };
-            flyingfish::minimax_h3::run_minimax_h3_i2va(&request, options)
-        }?;
-        let flyingfish::minimax_h3::H3Output {
-            frames,
-            height,
-            width,
-            video,
-            samples,
-            sampling_rate,
-            audio,
-        } = generated;
-        ensure!(
-            audio.len() == samples.checked_mul(2).context("audio extent overflow")?,
-            "MiniMax-H3 audio extent"
-        );
-        let mut interleaved = Vec::with_capacity(audio.len());
-        for index in 0..samples {
-            interleaved.push(audio[index]);
-            interleaved.push(audio[samples + index]);
-        }
-        let mut outputs = Vec::new();
-        if mp4 {
-            flyingfish::media::mux_mp4(
-                &output,
-                flyingfish::media::Y4mVideo {
-                    width,
-                    height,
-                    fps: (flyingfish::minimax_h3::FPS, 1),
-                    frames,
-                    video,
-                },
-                Some((sampling_rate, 2, &interleaved)),
-            )?;
-            outputs.push(output);
-        } else {
-            let wav = output_path(&output.with_extension("wav"), &cli.model)?;
+                        .map(|p| resolve(p, "first image"))
+                        .transpose()?,
+                    last_frame: request
+                        .last_image
+                        .as_deref()
+                        .map(|p| resolve(p, "last image"))
+                        .transpose()?,
+                    prompt: request.prompt.clone(),
+                    frames: *frames,
+                    seed: request.seed,
+                }))
+            } else {
+                ensure!(
+                    request.last_image.is_none(),
+                    "last image requires HyperFlow"
+                );
+                Ok(ModelRequest::MiniMax(MiniMaxH3I2vaRequest {
+                    model: cli.model.clone(),
+                    lora: lora.clone().context("MiniMax-H3 needs LoRA")?,
+                    keyframe: resolve(
+                        request
+                            .image
+                            .as_deref()
+                            .context("--image is required for MiniMax-H3 image-to-video+audio")?,
+                        "keyframe",
+                    )?,
+                    gguf: gguf.clone(),
+                    prompt: request.prompt.clone(),
+                    frames: *frames,
+                    seed: request.seed,
+                }))
+            }
+        };
+        let validate_output = |path: &Path| -> Result<_> {
+            let mp4 = mp4_output(path)?;
+            let output = output_path(path, &cli.model)?;
             if let Some(base) = &base {
-                output_path(&wav, base)?;
+                output_path(&output, base)?;
             }
-            let result = (|| -> Result<()> {
-                flyingfish::media::write_y4m(
-                    fs::File::create(&output)?,
-                    width,
-                    height,
-                    (flyingfish::minimax_h3::FPS, 1),
-                    frames,
-                    &video,
-                )?;
-                flyingfish::media::write_wav(
-                    fs::File::create(&wav)?,
-                    sampling_rate,
-                    2,
-                    &interleaved,
-                )?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                let _ = fs::remove_file(&output);
-                let _ = fs::remove_file(&wav);
-                return Err(error);
-            }
-            outputs.push(output);
-            outputs.push(wav);
-        }
-        if *json {
-            let outputs: Vec<_> = outputs
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect();
-            println!(
-                "{}",
-                serde_json::json!({"video": {
-                    "outputs": outputs,
-                    "frames": frames,
-                    "width": width,
-                    "height": height,
-                    "samples": samples,
-                    "sampling_rate": sampling_rate,
-                    "seed": seed,
-                }})
-            );
-        } else {
-            for path in outputs {
-                println!("{}", path.display());
-            }
+            let wav = if mp4 {
+                None
+            } else {
+                let wav = output_path(&output.with_extension("wav"), &cli.model)?;
+                if let Some(base) = &base {
+                    output_path(&wav, base)?;
+                }
+                Some(wav)
+            };
+            Ok((output, wav))
+        };
+        let prepare = |request: &Request| match model_request(request)? {
+            ModelRequest::MiniMax(request) => request.prepare(),
+            ModelRequest::HyperFlow(request) => request.prepare(),
+        };
+        let once = |record: Request| -> Result<()> {
+            let paths = validate_output(&record.output)?;
+            let generated = match model_request(&record)? {
+                ModelRequest::MiniMax(request) => run_minimax_h3_i2va(&request, options.clone()),
+                ModelRequest::HyperFlow(request) => {
+                    run_hyperflow_h3_video(&request, options.clone())
+                }
+            }?;
+            write_video(paths, generated, record.seed, *json)
+        };
+        let Some(path) = requests else {
+            return once(Request {
+                prompt: prompt.clone().context("video requires --prompt")?,
+                seed: seed.context("video requires --seed")?,
+                image: image.clone(),
+                last_image: last_image.clone(),
+                output: output.clone().context("video requires --output")?,
+            });
+        };
+        let mut inputs = read_request_lines::<Request>(path, "video")?;
+        let first = inputs.next().context("video requests file is empty")??;
+        let Some(second) = inputs.next().transpose()? else {
+            return once(first);
+        };
+        let check_requests = [Ok(first), Ok(second)]
+            .into_iter()
+            .chain(inputs)
+            .map(|record| {
+                let record = record?;
+                validate_output(&record.output)?;
+                prepare(&record)
+            });
+        let mut session = VideoSession::open(
+            (&cli.model, base.as_deref()),
+            (lora.as_deref(), gguf.as_deref()),
+            &options,
+            check_requests,
+        )?;
+        for record in read_request_lines::<Request>(path, "video")? {
+            let record = record?;
+            let paths = validate_output(&record.output)?;
+            let output = session.render(&prepare(&record)?)?;
+            write_video(paths, output, record.seed, *json)?;
         }
         Ok(())
     })
@@ -2616,16 +2736,18 @@ mod tests {
                 lora,
                 gguf,
                 output,
+                requests,
                 json,
             } => {
-                assert_eq!(prompt, "a boat");
+                assert_eq!(prompt.as_deref(), Some("a boat"));
                 assert_eq!(image, Some(PathBuf::from("keyframe.png")));
                 assert_eq!(frames, 121);
-                assert_eq!(seed, 42);
+                assert_eq!(seed, Some(42));
                 assert_eq!(lora, Some(PathBuf::from("turbo.safetensors")));
                 assert!(last_image.is_none() && base_model.is_none());
                 assert_eq!(gguf, Some(PathBuf::from("transformer.gguf")));
-                assert_eq!(output, PathBuf::from("out.y4m"));
+                assert_eq!(output, Some(PathBuf::from("out.y4m")));
+                assert!(requests.is_none());
                 assert!(json);
             }
             _ => panic!("video subcommand was not selected"),

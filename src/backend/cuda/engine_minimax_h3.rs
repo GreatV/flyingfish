@@ -39,7 +39,7 @@ use std::{
 mod audio;
 #[path = "engine_minimax_h3_pipeline.rs"]
 mod pipeline;
-pub use pipeline::{ImageSession, image_latents};
+pub use pipeline::{ImageSession, VideoSession, image_latents};
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
@@ -4541,8 +4541,7 @@ fn place_stored_layers(
     spec: &H3Spec,
     sizing: &DenseSizing,
     owned: usize,
-    placement: Placement,
-    visits: usize,
+    (placement, visits, selected): (Placement, usize, Option<crate::prefill::DensePlacement>),
 ) -> Result<(Option<DenseTier>, StoredOffsets)> {
     use crate::prefill::DensePlacement;
     let dropped = spec
@@ -4607,15 +4606,6 @@ fn place_stored_layers(
     }
     ensure!(!kept_device.is_empty(), "no stored transformer block");
     let granularity = stored_allocation_granularity(d)?;
-    let (charged_layers, owned) = stored_allocation_costs(base.manifest, spec, granularity, owned)?;
-    let charged_device: Vec<_> = kept_index
-        .iter()
-        .map(|&layer| charged_layers[layer])
-        .collect();
-    let charged_slots: Vec<_> = kept_device
-        .iter()
-        .map(|&bytes| stored_allocation_bytes(bytes, granularity))
-        .collect::<Result<_>>()?;
     let mut last_short_overread = 0usize;
     let mut max_past_end = 0usize;
     let mut layer_tails = vec![0usize; spec.layers];
@@ -4641,34 +4631,58 @@ fn place_stored_layers(
         .collect::<Result<Vec<_>>>()?;
     #[cfg(test)]
     trace_placement_pool(d, "before_placement")?;
-    let (free, total) = d.ctx.mem_get_info()?;
-    let device_cap = DensePlacement::device_budget(free, total, owned, 0, 0)?;
-    let (before, ..) = stored_compact(
-        (placement, visits),
-        &charged_device,
-        &charged_slots,
-        &kept_source,
-        device_cap,
-        sizing.largest,
-        granularity,
-    )?;
-    let (compact, device_budget, host_budget, host_available) = stored_compact(
-        (placement, visits),
-        &charged_device_after,
-        &charged_slots_after,
-        &kept_source,
-        device_cap,
-        sizing.largest,
-        granularity,
-    )?;
-    let facts = PlacementFacts {
-        free_bytes: free,
-        total_bytes: total,
-        owned_bytes: owned,
-        largest_bytes: sizing.largest,
-        host_available_bytes: host_available,
-        device_budget,
-        host_budget,
+    let (compact, cold) = if let Some(selected) = selected {
+        ensure!(
+            selected.slots.len() == kept_index.len()
+                && selected
+                    .slots
+                    .iter()
+                    .zip(&charged_slots_after)
+                    .all(|(slot, &bytes)| slot.is_none() || bytes <= selected.slot_bytes),
+            "resident HyperFlow plan cannot hold padded stored slots"
+        );
+        (selected, None)
+    } else {
+        let (charged_layers, owned) =
+            stored_allocation_costs(base.manifest, spec, granularity, owned)?;
+        let charged_device: Vec<_> = kept_index
+            .iter()
+            .map(|&layer| charged_layers[layer])
+            .collect();
+        let charged_slots: Vec<_> = kept_device
+            .iter()
+            .map(|&bytes| stored_allocation_bytes(bytes, granularity))
+            .collect::<Result<_>>()?;
+        let (free, total) = d.ctx.mem_get_info()?;
+        let device_cap = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+        let (before, ..) = stored_compact(
+            (placement, visits),
+            &charged_device,
+            &charged_slots,
+            &kept_source,
+            device_cap,
+            sizing.largest,
+            granularity,
+        )?;
+        let (compact, device_budget, host_budget, host_available) = stored_compact(
+            (placement, visits),
+            &charged_device_after,
+            &charged_slots_after,
+            &kept_source,
+            device_cap,
+            sizing.largest,
+            granularity,
+        )?;
+        let facts = PlacementFacts {
+            free_bytes: free,
+            total_bytes: total,
+            owned_bytes: owned,
+            largest_bytes: sizing.largest,
+            host_available_bytes: host_available,
+            device_budget,
+            host_budget,
+        };
+        (compact, Some((before, facts)))
     };
     ensure!(
         compact.slots.len() == kept_index.len() && compact.host.len() == kept_index.len(),
@@ -4679,12 +4693,6 @@ fn place_stored_layers(
     for (index, &layer) in kept_index.iter().enumerate() {
         slots[layer] = compact.slots[index];
         host_flags[layer] = compact.host[index];
-    }
-    let mut before_slot_bytes = 0usize;
-    for (&layer, slot) in kept_index.iter().zip(&before.slots) {
-        if slot.is_some() {
-            before_slot_bytes = before_slot_bytes.max(cursor[layer]);
-        }
     }
     let mut slot_bytes = 0usize;
     for (&layer, slot) in kept_index.iter().zip(&compact.slots) {
@@ -4708,38 +4716,46 @@ fn place_stored_layers(
         host_bytes: compact.host_bytes,
         disk_bytes: compact.disk_bytes,
     };
-    let used_slots = compact
-        .slots
-        .iter()
-        .flatten()
-        .copied()
-        .max()
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let charged_slot_bytes = used_slots
-        .checked_mul(compact.slot_bytes)
-        .context("stored slot bytes")?;
-    let predicted_free = facts
-        .free_bytes
-        .checked_sub(facts.owned_bytes)
-        .and_then(|bytes| bytes.checked_sub(compact.resident_bytes))
-        .and_then(|bytes| bytes.checked_sub(charged_slot_bytes))
-        .and_then(|bytes| {
-            bytes.checked_sub(
-                compact.slots.iter().filter(|slot| slot.is_some()).count() * granularity,
-            )
-        })
-        .context("stored placement physical extent exceeds free VRAM")?;
-    let (before_resident, before_host, before_slots) = placement_counts(&before);
-    let (after_resident, after_host, after_slots) = placement_counts(&compact);
-    eprintln!(
-        "{}",
-        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "streaming_slots": used_slots, "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes, "allocation_granularity": granularity, "charged_resident_bytes": compact.resident_bytes, "charged_slot_bytes": compact.slot_bytes, "predicted_min_driver_free_after_placement": predicted_free})
-    );
-    eprintln!(
-        "{}",
-        serde_json::json!({"h3_dense_placement_tail": {"before_resident": before_resident, "before_host": before_host, "before_slots": before_slots, "before_slot_bytes": before_slot_bytes, "after_resident": after_resident, "after_host": after_host, "after_slots": after_slots, "after_slot_bytes": slot_bytes, "last_short_overread_bytes": last_short_overread, "max_past_end_bytes": max_past_end, "layer_tail_bytes": layer_tail_bytes}})
-    );
+    if let Some((before, facts)) = cold {
+        let mut before_slot_bytes = 0usize;
+        for (&layer, slot) in kept_index.iter().zip(&before.slots) {
+            if slot.is_some() {
+                before_slot_bytes = before_slot_bytes.max(cursor[layer]);
+            }
+        }
+        let used_slots = compact
+            .slots
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let charged_slot_bytes = used_slots
+            .checked_mul(compact.slot_bytes)
+            .context("stored slot bytes")?;
+        let predicted_free = facts
+            .free_bytes
+            .checked_sub(facts.owned_bytes)
+            .and_then(|bytes| bytes.checked_sub(compact.resident_bytes))
+            .and_then(|bytes| bytes.checked_sub(charged_slot_bytes))
+            .and_then(|bytes| {
+                bytes.checked_sub(
+                    compact.slots.iter().filter(|slot| slot.is_some()).count() * granularity,
+                )
+            })
+            .context("stored placement physical extent exceeds free VRAM")?;
+        let (before_resident, before_host, before_slots) = placement_counts(&before);
+        let (after_resident, after_host, after_slots) = placement_counts(&compact);
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "streaming_slots": used_slots, "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes, "allocation_granularity": granularity, "charged_resident_bytes": compact.resident_bytes, "charged_slot_bytes": compact.slot_bytes, "predicted_min_driver_free_after_placement": predicted_free})
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_dense_placement_tail": {"before_resident": before_resident, "before_host": before_host, "before_slots": before_slots, "before_slot_bytes": before_slot_bytes, "after_resident": after_resident, "after_host": after_host, "after_slots": after_slots, "after_slot_bytes": slot_bytes, "last_short_overread_bytes": last_short_overread, "max_past_end_bytes": max_past_end, "layer_tail_bytes": layer_tail_bytes}})
+        );
+    }
     let mut tier = None;
     if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
@@ -4970,15 +4986,157 @@ pub(crate) struct Dit {
     refiner_trace: Option<Vec<bf16>>,
 }
 
+fn bind_video_ffn(
+    (d, blas): (&Device, &mut Blas),
+    (spec, r): (&H3Spec, usize),
+    (work, text_work, x): (&mut BlockWork, &BlockWork, &CudaSlice<bf16>),
+    (transient, pending): (usize, usize),
+) -> Result<()> {
+    let s = &d.stream;
+    let h = spec.hidden;
+    let hyperflow = spec.is_hyperflow()?;
+    let (free, total) = d.ctx.mem_get_info()?;
+    let reserve = (total / 16)
+        .checked_add(transient)
+        .and_then(|bytes| bytes.checked_add(pending))
+        .context("FFN live reserve overflow")?;
+    if !hyperflow {
+        for (output, input) in [(r, h), (r, spec.ffn), (2 * spec.ffn, r), (h, r)] {
+            blas.bind_row_family(crate::backend::setup::LinearShape {
+                rows: FFN_CHUNK_ROWS,
+                output,
+                input,
+            })?;
+        }
+    }
+    let budget = d.workspace_budget(free, free, reserve)?;
+    let (choices, owned, chosen) = if hyperflow {
+        let choices = work.ffn_choices::<false>(blas, spec, budget)?;
+        let owned = FfnPlan::select(&choices, budget)?;
+        let aliases = work.alias_choices::<false>(blas, spec, owned)?;
+        let chosen = FfnPlan::select(&aliases, budget)?;
+        (choices, owned, chosen)
+    } else {
+        let choices = work.ffn_choices::<true>(blas, spec, budget)?;
+        let owned = FfnPlan::select(&choices, budget)?;
+        let aliases = work.alias_choices::<true>(blas, spec, owned)?;
+        let chosen = FfnPlan::select(&aliases, budget)?;
+        (choices, owned, chosen)
+    };
+    let previous = *choices
+        .iter()
+        .find(|p| p.chunk == work.chunk)
+        .context("main FFN baseline missing")?;
+    if work.rows > FFN_CHUNK_ROWS {
+        if hyperflow {
+            work.ffn_cost::<false>(blas, spec, work.chunk, true)?;
+        } else {
+            work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
+        }
+    }
+    let description = |plan: FfnPlan| {
+        serde_json::json!({
+            "rows":work.rows,"previous_chunk":work.chunk,"chunk":plan.chunk,
+            "storage":if plan.borrowed {"attention_scratch"} else {"owned"},
+            "chunks":work.rows.div_ceil(plan.chunk),"tail":work.rows%plan.chunk,
+            "new_allocation_bytes":plan.allocation,"estimated_tensor_cost":plan.tensor_cost,
+            "estimated_launches_per_block":plan.launches,"previous_tensor_cost":previous.tensor_cost,
+            "previous_launches_per_block":previous.launches})
+    };
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_ffn_plan":{
+                "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
+                "peak_additional_bytes":chosen.allocation+chosen.workspace,
+                "lt_workspace_replacement_bytes":chosen.workspace,"main":description(chosen),
+                "owned_alternative":description(owned),
+                "alias_capacity_rows":FfnPlan::alias_capacity((work.q_raw.len(),work.k_raw.len()),spec.ffn)?,
+                "refiner":{"rows":text_work.rows,"previous_chunk":text_work.chunk,"chunk":text_work.chunk,
+                    "chunks":text_work.rows.div_ceil(text_work.chunk),"tail":text_work.rows%text_work.chunk,
+                    "new_allocation_bytes":0,"ordinary_plans":true}}})
+        );
+    }
+    blas.bind_workspace(chosen.workspace)?;
+    if hyperflow {
+        work.bind_ffn::<false>(s, blas, spec, chosen, x)?;
+        if spec.int8_convrot.is_some() {
+            work.product[FF_IN] = crate::convrot::gate_up_product_order(
+                d,
+                [work.chunk, work.rows % work.chunk],
+                (h, 2 * spec.ffn),
+            )?;
+            let width = spec.heads * spec.head_dim;
+            work.plan_rotation(d, spec)?;
+            work.qkv_product = crate::convrot::n_fast_product(d, work.rows, (h, width))?;
+            if d.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120) {
+                work.product[OUT][0] =
+                    crate::convrot::n_fast_product(d, work.rows, (width, h))?;
+                for (i, rows) in [work.chunk, work.rows % work.chunk].into_iter().enumerate() {
+                    work.product[FF_OUT][i] =
+                        crate::convrot::n_fast_product(d, rows, (spec.ffn, h))?;
+                }
+            }
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "CONVROT_QKV_PRODUCT_SELECT rows={} k={h} n={width} l2_bytes={} kernel={}",
+                    work.rows,
+                    d.info.l2_bytes,
+                    work.qkv_product.symbol_name()
+                );
+                eprintln!(
+                    "CONVROT_N_FAST_PRODUCTS out={:?} down={:?}",
+                    work.product[OUT][0], work.product[FF_OUT]
+                );
+            }
+        }
+    } else {
+        work.bind_ffn::<true>(s, blas, spec, chosen, x)?;
+    }
+    s.synchronize()?;
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_ffn_storage":{
+                "hidden_ptr":work.hidden.ptr,"hidden_shape":work.hidden.shape,"hidden_span_bytes":work.hidden.span_bytes,
+                "gated_ptr":work.gated.ptr,"gated_shape":work.gated.shape,"gated_span_bytes":work.gated.span_bytes,
+                "q_raw_ptr":pointer(&work.q_raw,s),"q_raw_bytes":2*work.q_raw.len(),
+                "k_raw_ptr":pointer(&work.k_raw,s),"k_raw_bytes":2*work.k_raw.len(),
+                "owned":work.ffn_owned.is_some(),"free_after_binding":d.ctx.mem_get_info()?.0}})
+        );
+    }
+    Ok(())
+}
+
+type VideoPlacementChooser<'a> = dyn FnMut(
+        &DenseSizing,
+        &[usize],
+        usize,
+        &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<crate::prefill::DensePlacement>
+    + 'a;
+
 impl Dit {
     pub(crate) fn new(
+        d: &Device,
+        blas: &mut Blas,
+        spec: &H3Spec,
+        layout: (usize, &crate::minimax_h3::PackedLayout),
+        base: Source<'_>,
+        lora: Option<Source<'_>>,
+        (placement, visits): (Placement, usize),
+    ) -> Result<Self> {
+        Self::with_placement(d, blas, spec, layout, base, lora, (placement, visits, None))
+    }
+
+    fn with_placement(
         d: &Device,
         blas: &mut Blas,
         spec: &H3Spec,
         (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
         mut base: Source<'_>,
         mut lora: Option<Source<'_>>,
-        (placement, visits): (Placement, usize),
+        (placement, visits, choose): (Placement, usize, Option<&mut VideoPlacementChooser<'_>>),
     ) -> Result<Self> {
         let hyperflow = spec.is_hyperflow()?;
         ensure!(
@@ -5112,9 +5270,32 @@ impl Dit {
                 .checked_add(wscale)
                 .context("HyperFlow wscale bytes")?;
         }
+        let selected = if let Some(choose) = choose {
+            let mut bind_work = |pending| {
+                bind_video_ffn(
+                    (d, blas),
+                    (spec, r),
+                    (&mut work, &text_work, &x),
+                    (0, pending),
+                )
+            };
+            Some(if hyperflow {
+                let page = stored_allocation_granularity(d)?;
+                let (_, owned) = stored_allocation_costs(base.manifest, spec, page, owned)?;
+                let charged = (0..spec.layers)
+                    .map(|layer| stored_layer_charge(base.manifest, layer, page))
+                    .collect::<Result<Vec<_>>>()?;
+                choose(&sizing, &charged, owned, &mut bind_work)?
+            } else {
+                choose(&sizing, &sizing.layers, owned, &mut bind_work)?
+            })
+        } else {
+            None
+        };
+        let resident = selected.is_some();
         let (tier, blocks) = if hyperflow {
             let (tier, packed) =
-                place_stored_layers(d, &mut base, spec, &sizing, owned, placement, visits)?;
+                place_stored_layers(d, &mut base, spec, &sizing, owned, (placement, visits, selected))?;
             #[cfg(test)]
             trace_placement_pool(d, "after_streaming_slots")?;
             base.pack_vectors(s, spec)?;
@@ -5167,22 +5348,34 @@ impl Dit {
             trace_placement_pool(d, "after_stored_blocks")?;
             (tier, blocks)
         } else {
-            let placed = place_layers(
-                "dit",
-                d,
-                &mut base,
-                (
-                    &sizing.layers,
+            let tier = if let Some(selected) = selected {
+                bind_layers(
+                    "dit",
+                    d,
+                    &mut base,
                     &sizing.source_layers,
-                    sizing.largest,
-                    owned,
-                    0,
-                ),
-                (placement, visits),
-                |layer| format!("transformer_blocks.{layer}"),
-                &LINEAR_ROLES,
-            )?;
-            let tier = placed.tier;
+                    selected,
+                    |layer| format!("transformer_blocks.{layer}"),
+                    &LINEAR_ROLES,
+                )?
+            } else {
+                place_layers(
+                    "dit",
+                    d,
+                    &mut base,
+                    (
+                        &sizing.layers,
+                        &sizing.source_layers,
+                        sizing.largest,
+                        owned,
+                        0,
+                    ),
+                    (placement, visits),
+                    |layer| format!("transformer_blocks.{layer}"),
+                    &LINEAR_ROLES,
+                )?
+                .tier
+            };
             let mut blocks = Vec::with_capacity(spec.layers);
             for (layer, &bytes) in sizing.layers.iter().enumerate() {
                 let name = format!("transformer_blocks.{layer}");
@@ -5209,114 +5402,13 @@ impl Dit {
             }
             (tier, blocks)
         };
-        let (free, total) = d.ctx.mem_get_info()?;
-        let reserve = (total / 16)
-            .checked_add(sizing.transient)
-            .context("FFN live reserve overflow")?;
-        if !hyperflow {
-            for (output, input) in [(r, h), (r, spec.ffn), (2 * spec.ffn, r), (h, r)] {
-                blas.bind_row_family(crate::backend::setup::LinearShape {
-                    rows: FFN_CHUNK_ROWS,
-                    output,
-                    input,
-                })?;
-            }
-        }
-        let budget = d.workspace_budget(free, free, reserve)?;
-        let (choices, owned, chosen) = if hyperflow {
-            let choices = work.ffn_choices::<false>(blas, spec, budget)?;
-            let owned = FfnPlan::select(&choices, budget)?;
-            let aliases = work.alias_choices::<false>(blas, spec, owned)?;
-            let chosen = FfnPlan::select(&aliases, budget)?;
-            (choices, owned, chosen)
-        } else {
-            let choices = work.ffn_choices::<true>(blas, spec, budget)?;
-            let owned = FfnPlan::select(&choices, budget)?;
-            let aliases = work.alias_choices::<true>(blas, spec, owned)?;
-            let chosen = FfnPlan::select(&aliases, budget)?;
-            (choices, owned, chosen)
-        };
-        let previous = *choices
-            .iter()
-            .find(|p| p.chunk == work.chunk)
-            .context("main FFN baseline missing")?;
-        if work.rows > FFN_CHUNK_ROWS {
-            if hyperflow {
-                work.ffn_cost::<false>(blas, spec, work.chunk, true)?;
-            } else {
-                work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
-            }
-        }
-        let description = |plan: FfnPlan| {
-            serde_json::json!({
-            "rows":work.rows,"previous_chunk":work.chunk,"chunk":plan.chunk,
-            "storage":if plan.borrowed {"attention_scratch"} else {"owned"},
-            "chunks":work.rows.div_ceil(plan.chunk),"tail":work.rows%plan.chunk,
-            "new_allocation_bytes":plan.allocation,"estimated_tensor_cost":plan.tensor_cost,
-            "estimated_launches_per_block":plan.launches,"previous_tensor_cost":previous.tensor_cost,
-            "previous_launches_per_block":previous.launches})
-        };
-        if crate::backend::diagnostics_enabled() {
-            eprintln!(
-                "{}",
-                serde_json::json!({"h3_ffn_plan":{
-                "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
-                "peak_additional_bytes":chosen.allocation+chosen.workspace,
-                "lt_workspace_replacement_bytes":chosen.workspace,"main":description(chosen),
-                "owned_alternative":description(owned),
-                "alias_capacity_rows":FfnPlan::alias_capacity((work.q_raw.len(),work.k_raw.len()),spec.ffn)?,
-                "refiner":{"rows":text_work.rows,"previous_chunk":text_work.chunk,"chunk":text_work.chunk,
-                    "chunks":text_work.rows.div_ceil(text_work.chunk),"tail":text_work.rows%text_work.chunk,
-                    "new_allocation_bytes":0,"ordinary_plans":true}}})
-            );
-        }
-        blas.bind_workspace(chosen.workspace)?;
-        if hyperflow {
-            work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
-            if spec.int8_convrot.is_some() {
-                work.product[FF_IN] = crate::convrot::gate_up_product_order(
-                    d,
-                    [work.chunk, work.rows % work.chunk],
-                    (h, 2 * spec.ffn),
-                )?;
-                let width = spec.heads * spec.head_dim;
-                work.plan_rotation(d, spec)?;
-                work.qkv_product = crate::convrot::n_fast_product(d, work.rows, (h, width))?;
-                if d.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120) {
-                    work.product[OUT][0] =
-                        crate::convrot::n_fast_product(d, work.rows, (width, h))?;
-                    for (i, rows) in [work.chunk, work.rows % work.chunk].into_iter().enumerate() {
-                        work.product[FF_OUT][i] =
-                            crate::convrot::n_fast_product(d, rows, (spec.ffn, h))?;
-                    }
-                }
-                if crate::backend::diagnostics_enabled() {
-                    eprintln!(
-                        "CONVROT_QKV_PRODUCT_SELECT rows={} k={h} n={width} l2_bytes={} kernel={}",
-                        work.rows,
-                        d.info.l2_bytes,
-                        work.qkv_product.symbol_name()
-                    );
-                    eprintln!(
-                        "CONVROT_N_FAST_PRODUCTS out={:?} down={:?}",
-                        work.product[OUT][0], work.product[FF_OUT]
-                    );
-                }
-            }
-        } else {
-            work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
-        }
-        s.synchronize()?;
-        if crate::backend::diagnostics_enabled() {
-            eprintln!(
-                "{}",
-                serde_json::json!({"h3_ffn_storage":{
-                "hidden_ptr":work.hidden.ptr,"hidden_shape":work.hidden.shape,"hidden_span_bytes":work.hidden.span_bytes,
-                "gated_ptr":work.gated.ptr,"gated_shape":work.gated.shape,"gated_span_bytes":work.gated.span_bytes,
-                "q_raw_ptr":pointer(&work.q_raw,s),"q_raw_bytes":2*work.q_raw.len(),
-                "k_raw_ptr":pointer(&work.k_raw,s),"k_raw_bytes":2*work.k_raw.len(),
-                "owned":work.ffn_owned.is_some(),"free_after_binding":d.ctx.mem_get_info()?.0}})
-            );
+        if !resident {
+            bind_video_ffn(
+                (d, blas),
+                (spec, r),
+                (&mut work, &text_work, &x),
+                (sizing.transient, 0),
+            )?;
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
         #[cfg(test)]
@@ -15576,6 +15668,205 @@ mod tests {
                     "H3_IMAGE_RESIDENT PASS edit={edit} requests=8 request2_rgb_exact=true latent_bits_exact={latent_bits_exact} control=distinct"
                 );
             }
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(runtime);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_VIDEO_MODEL, FF_H3_VIDEO_MODE, FF_H3_LORA or FF_HYPERFLOW_MODEL"]
+    fn resident_video_requests_match_fresh_and_bound_allocations() -> Result<()> {
+        use crate::minimax_h3::{H3Output, H3Request, KeyframeAnchor, prepare_video};
+        use cudarc::driver::sys::{self, CUmemPool_attribute as A};
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let base = image_e2e_env("FF_H3_VIDEO_MODEL")?;
+        let mode = std::env::var("FF_H3_VIDEO_MODE")?;
+        let (model, companion, lora, schedule, spec) = match mode.as_str() {
+            "minimax" => (
+                base.clone(),
+                None,
+                Some(image_e2e_env("FF_H3_LORA")?),
+                (8, (6.0, 3.0)),
+                H3Spec::read(&base)?,
+            ),
+            "hyperflow" => {
+                let component = image_e2e_env("FF_HYPERFLOW_MODEL")?;
+                let spec = H3Spec::parse(&serde_json::from_slice(&std::fs::read(
+                    component.join("config.json"),
+                )?)?)?;
+                (
+                    component
+                        .parent()
+                        .context("HyperFlow model root")?
+                        .to_path_buf(),
+                    Some(base.clone()),
+                    None,
+                    (6, (12.0, 3.0)),
+                    spec,
+                )
+            }
+            _ => anyhow::bail!("FF_H3_VIDEO_MODE must be minimax or hyperflow"),
+        };
+        let make = |phase: usize, seed| -> Result<H3Request> {
+            let (width, height) = (1344, 768);
+            let image = crate::serve::image::RgbImage {
+                width,
+                height,
+                pixels: (0..width * height)
+                    .flat_map(|i| {
+                        let (x, y) = (i % width, i / width);
+                        [
+                            ((3 * x + y + phase) % 251) as u8,
+                            ((x + 5 * y) % 253) as u8,
+                            ((7 * x + 11 * y) % 255) as u8,
+                        ]
+                    })
+                    .collect(),
+            };
+            prepare_video(
+                &base,
+                &spec,
+                "a boat passing a stone pier",
+                &[(KeyframeAnchor::First, &image)],
+                ((124, seed), schedule),
+            )
+        };
+        let request_a = make(0, 271)?;
+        let request_b = make(47, 379)?;
+        let media_control = make(0, 379)?;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-video-resident-{}", std::process::id()));
+        std::fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            let options = crate::RunOptions {
+                device: 0,
+                runtime_dir: runtime.clone(),
+                verbose: true,
+            };
+            let mut reference = if let Some(lora) = &lora {
+                pipeline::run(&model, lora, &request_b, (0, &runtime), None)?
+            } else {
+                pipeline::run_hyperflow(
+                    (&base, &model.join("fl2va_int8_convrot")),
+                    &request_b,
+                    (0, &runtime),
+                )?
+            };
+            reference.video_decoded = Default::default();
+            let fresh = &reference.output;
+            ensure!(
+                (fresh.frames, fresh.height, fresh.width) == (124, 768, 1344)
+                    && fresh.video.len() == 124 * 768 * 1344 * 3
+                    && fresh.audio.len() == 2 * fresh.samples
+                    && fresh.audio.iter().all(|&sample| sample.is_finite()),
+                "fresh video extent or PCM"
+            );
+            let mut session = VideoSession::open(
+                (&model, companion.as_deref()),
+                (lora.as_deref(), None),
+                &options,
+                [Ok(request_a.clone()), Ok(request_b.clone())],
+            )?;
+            ensure!(
+                session.render(&request_a)?.video != fresh.video,
+                "stale video request control"
+            );
+            let ctx = crate::backend::cuda::Device::new(0)?.ctx;
+            let mut pool = std::ptr::null_mut();
+            unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()).result()? };
+            let mut bytes = None;
+            for request in 2..=8 {
+                let mut peak = 0u64;
+                unsafe {
+                    sys::cuMemPoolSetAttribute(
+                        pool,
+                        A::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                        (&mut peak as *mut u64).cast(),
+                    )
+                    .result()?;
+                }
+                let H3Output { video, audio, .. } = match request {
+                    2 => session.render_with_reference(&request_b, &reference)?,
+                    3 => session.render(&media_control)?,
+                    _ => session.render(&request_b)?,
+                };
+                ensure!(
+                    video.len() == fresh.video.len()
+                        && audio.len() == fresh.audio.len()
+                        && audio.iter().all(|&sample| sample.is_finite()),
+                    "resident video request {request} extent or PCM"
+                );
+                if request == 3 {
+                    ensure!(video != fresh.video, "video ignored changed reference");
+                } else {
+                    let rgb = video == fresh.video;
+                    let pcm = pipeline::same_f32_bits(&audio, &fresh.audio);
+                    if !rgb || !pcm {
+                        let rgb_diff = video
+                            .iter()
+                            .zip(&fresh.video)
+                            .filter(|(a, b)| a != b)
+                            .count();
+                        let pcm_diff = audio
+                            .iter()
+                            .zip(&fresh.audio)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        anyhow::bail!(
+                            "resident video request {request} differs from fresh: RGB {rgb_diff}/{} PCM {pcm_diff}/{}",
+                            video.len(),
+                            audio.len()
+                        );
+                    }
+                }
+                drop((video, audio));
+                ctx.synchronize()?;
+                let (free, total) = ctx.mem_get_info()?;
+                let mut used = 0u64;
+                unsafe {
+                    sys::cuMemPoolGetAttribute(
+                        pool,
+                        A::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                        (&mut used as *mut u64).cast(),
+                    )
+                    .result()?;
+                    sys::cuMemPoolGetAttribute(
+                        pool,
+                        A::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                        (&mut peak as *mut u64).cast(),
+                    )
+                    .result()?;
+                }
+                let host = crate::backend::cuda::calibrate::host_memory(Path::new("/"))?;
+                ensure!(
+                    free >= total / 16
+                        && peak <= u64::try_from(total - total / 16)?
+                        && bytes.is_none_or(|before| used == before)
+                        && host >= 4 << 30,
+                    "resident video request {request} memory boundary: free={free} used={used} peak={peak} host={host}"
+                );
+                bytes = Some(used);
+                println!(
+                    "H3_VIDEO_RESIDENT_BOUNDARY mode={mode} request={request} used={used} peak={peak} host={host}"
+                );
+                if request == 3 {
+                    let mut different = request_b.clone();
+                    different.frames += 17;
+                    ensure!(
+                        session.render(&different).is_err(),
+                        "resident video admitted changed geometry"
+                    );
+                }
+            }
+            println!(
+                "H3_VIDEO_RESIDENT PASS mode={mode} requests=8 rgb_exact=true pcm_bits_exact=true media_control=distinct"
+            );
             Ok(())
         })();
         let cleanup = std::fs::remove_dir_all(runtime);
