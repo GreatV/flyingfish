@@ -930,7 +930,8 @@ __device__ __forceinline__ void frame_im2col(
                     value.w = value_at(col + 3);
                     *reinterpret_cast<float4*>(a + r * cols + col) = value;
                 } else {
-                    for (uint64_t index = col; index < cols; ++index) a[r * cols + index] = T(value_at(index));
+                    const uint64_t end = (col + 4).min(cols);
+                    for (uint64_t index = col; index < end; ++index) a[r * cols + index] = T(value_at(index));
                 }
             }
             __syncthreads();
