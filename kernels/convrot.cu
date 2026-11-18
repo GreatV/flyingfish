@@ -46,6 +46,14 @@ __device__ __forceinline__ void convrot_mma_16816(float (&d)[4], const unsigned 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
+__device__ __forceinline__ uint4 convrot_load_u128(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
 // Below 17 rows: one thread writes one output. The rotated group is an f32 dot of bf16
 // values, rounded back to bf16. s_x = max(|xR|, 1e-12) / 127. q is rint(xR / s_x).
 extern "C" __global__ void convrot_linear(
@@ -88,14 +96,46 @@ extern "C" __global__ void convrot_linear(
         __float2bfloat16(__fmul_rn(__fmul_rn(static_cast<float>(acc), scale), wscale[col]));
 }
 
-// 17 rows and above. One block owns 16 rows and one group.
-// The activation is bf16. The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
-// grid: (ceil(rows/16), 1, k/group). block: 256.
+__device__ __forceinline__ __nv_bfloat16 convrot_xor_low_bit(__nv_bfloat16 value) {
+    union {
+        __nv_bfloat16 value;
+        unsigned short bits;
+    } bits;
+    static_assert(sizeof(bits.value) == sizeof(bits.bits), "bf16 is 16 bits");
+    bits.value = value;
+    bits.bits ^= 1u;
+    return bits.value;
+}
+
+// table[col * group + row] = bf16(hadamard(group, row, col)). entries = group * group.
+// flip >= 0 xors the low bit of entry flip. Block 256.
+extern "C" __global__ void convrot_hadamard_table(__nv_bfloat16* table, int group, int flip) {
+    if (group < 16 || (group & 15)) __trap();
+    const long long entries = static_cast<long long>(group) * group;
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= entries) return;
+    const int col = static_cast<int>(idx / group);
+    const int row = static_cast<int>(idx - static_cast<long long>(col) * group);
+    __nv_bfloat16 value = __float2bfloat16(convrot_hadamard(group, row, col));
+    if (idx == flip) value = convrot_xor_low_bit(value);
+    table[idx] = value;
+}
+
+// 17 rows and above. One block owns 16 rows and one group. Block is 256.
+// group is a power of 4 and k is a multiple of group.
+// Activations and table[col * group + row] are ld.global.v4.u32.
+// The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
+// grid: (ceil(rows/16), 1, k/group).
 // Dynamic smem is 16*group bf16, then 8*8*16 bf16. Bytes are 32*group+2048.
-extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x, float* __restrict__ y, int rows,
-                                             int k, int group) {
-    if (rows < 17 || group < 16 || (group & 15) || (k % group)) __trap();
+extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x, float* __restrict__ y,
+                                             const __nv_bfloat16* __restrict__ table, int rows, int k, int group) {
+    constexpr int THREADS = 256;
     constexpr int STRIDE = 16;
+    const unsigned real = static_cast<unsigned>(group);
+    const unsigned exp = 31u - __clz(real | 16u);
+    if (blockDim.x != THREADS || rows < 17 || real < 16u || (real & (real - 1u)) || ((__ffs(real) - 1) & 1) ||
+        (static_cast<unsigned>(k) & (real - 1u)))
+        __trap();
     extern __shared__ __align__(16) __nv_bfloat16 tile[];
     __nv_bfloat16* atile = tile;
     __nv_bfloat16* bsmem = tile + 16 * group;
@@ -103,28 +143,36 @@ extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int row0 = static_cast<int>(blockIdx.x) * 16;
     const int x_col0 = static_cast<int>(blockIdx.z) * group;
-    const int count = 16 * group;
-    for (int i = static_cast<int>(threadIdx.x); i < count; i += static_cast<int>(blockDim.x)) {
-        const int r = i / group;
-        const int c = i - r * group;
+    const int vshift = static_cast<int>(exp) - 3;
+    const int vecs_per_row = static_cast<int>(real >> 3);
+    const int vectors = 16 * vecs_per_row;
+    for (int i = static_cast<int>(threadIdx.x); i < vectors; i += THREADS) {
+        const int r = i >> vshift;
+        const int c = (i & (vecs_per_row - 1)) << 3;
         const int gr = row0 + r;
-        __nv_bfloat16 v = __float2bfloat16(0.f);
-        if (gr < rows) v = x[static_cast<long long>(gr) * k + x_col0 + c];
+        uint4 packed = make_uint4(0u, 0u, 0u, 0u);
+        if (gr < rows) {
+            const __nv_bfloat16* src = x + static_cast<long long>(gr) * k + x_col0 + c;
+            packed = convrot_load_u128(src);
+        }
         const int panel = c >> 4;
         const int local = c & 15;
-        atile[panel * (16 * STRIDE) + r * STRIDE + local] = v;
+        *reinterpret_cast<uint4*>(atile + panel * (16 * STRIDE) + r * STRIDE + local) = packed;
     }
     __syncthreads();
     __nv_bfloat16* bt = bsmem + warp * (8 * STRIDE);
-    const int nsub = group >> 3;
+    const int nsub = static_cast<int>(real >> 3);
+    const int ksteps = static_cast<int>(real >> 4);
     for (int sub = warp; sub < nsub; sub += 8) {
         const int n0 = sub << 3;
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
-        for (int k0 = 0; k0 < group; k0 += 16) {
-            for (int i = lane; i < 8 * 16; i += 32) {
-                const int n = i >> 4;
-                const int c = i & 15;
-                bt[n * STRIDE + c] = __float2bfloat16(convrot_hadamard(group, k0 + c, n0 + n));
+        for (int step = 0; step < ksteps; ++step) {
+            const int k0 = step << 4;
+            if (lane < 16) {
+                const int n = lane & 7;
+                const int c0 = lane & 8;
+                const __nv_bfloat16* src = table + static_cast<long long>(n0 + n) * group + (k0 + c0);
+                *reinterpret_cast<uint4*>(bt + n * STRIDE + c0) = convrot_load_u128(src);
             }
             __syncwarp();
             unsigned a[4];

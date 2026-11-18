@@ -1,6 +1,7 @@
 //! Int8 linear with a block-diagonal regular Hadamard rotate-quant prologue.
 //! `y = bf16((q(x R) @ qweight^T) * s_x * wscale)`, int32 products.
-//! `R` is `kron(H4 / 2, ...)` of `group` (a power of 4), not stored.
+//! `R` is `kron(H4 / 2, ...)` of `group` (a power of 4). At [`TENSOR_CORE_ROWS`] the device holds
+//! `group * group` bf16 entries, `table[col * group + row]`.
 //! Below [`TENSOR_CORE_ROWS`], `x` is f32 cast to bf16, each rotated group is an f32 dot rounded
 //! back to bf16, `s_x = max(|xR|, 1e-12) / 127`, and `q` is ties-to-even of `xR / s_x`.
 //! At [`TENSOR_CORE_ROWS`] and above, `x` is bf16. The device kernel's dot is `mma.m16n8k16` (bf16 in, f32
@@ -356,11 +357,32 @@ mod tests {
 #[cfg(feature = "cuda")]
 pub struct ConvrotFns {
     linear: crate::backend::gpu::CudaFunction,
+    hadamard: crate::backend::gpu::CudaFunction,
     group_dot: crate::backend::gpu::CudaFunction,
     quantize: crate::backend::gpu::CudaFunction,
     product: crate::backend::gpu::CudaFunction,
+    table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
     optin: usize,
+}
+
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static HADAMARD_FLIP: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
+    struct Restore(i32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HADAMARD_FLIP.with(|cell| cell.set(self.0));
+        }
+    }
+    let restore = Restore(HADAMARD_FLIP.with(|cell| cell.replace(index)));
+    let result = body();
+    drop(restore);
+    result
 }
 
 #[cfg(feature = "cuda")]
@@ -395,6 +417,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         i32::try_from(PRODUCT_SMEM)?,
     )?;
+    let hadamard = module.load_function("convrot_hadamard_table")?;
     let group_dot = module.load_function("convrot_group_dot")?;
     let optin = usize::try_from(ctx.attribute(
         cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
@@ -412,9 +435,11 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     )?;
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
+        hadamard,
         group_dot,
         quantize,
         product,
+        table: std::sync::Mutex::new(None),
         max_group,
         optin,
     })
@@ -509,6 +534,65 @@ pub(crate) fn group_dot_grid(rows: u32, k: u32, group: u32) -> (u32, u32, u32) {
     (rows.div_ceil(16), 1, k / group)
 }
 
+#[cfg(feature = "cuda")]
+fn launch_group_dot(
+    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    fns: &ConvrotFns,
+    args: &ConvrotArgs,
+    rows: u32,
+    k: u32,
+    group: u32,
+) -> Result<()> {
+    use crate::backend::gpu::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+    let flip = HADAMARD_FLIP.with(|cell| cell.get());
+    let mut slot = fns.table.lock().unwrap_or_else(|err| err.into_inner());
+    let hit = slot.as_ref().is_some_and(|(cached_group, cached_flip, _)| {
+        *cached_group == group && *cached_flip == flip
+    });
+    if !hit {
+        let entries = u64::from(group) * u64::from(group);
+        let count = u32::try_from(entries).context("convrot hadamard table")?;
+        let mut table = stream.alloc_zeros::<u16>(usize::try_from(count)?)?;
+        let group_i = i32::try_from(group)?;
+        let (ptr, wrote) = table.device_ptr_mut(stream);
+        let threads = 256u32;
+        unsafe {
+            stream
+                .launch_builder(&fns.hadamard)
+                .arg(&ptr)
+                .arg(&group_i)
+                .arg(&flip)
+                .launch(LaunchConfig {
+                    grid_dim: (count.div_ceil(threads), 1, 1),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        drop(wrote);
+        *slot = Some((group, flip, table));
+    }
+    let cached = slot.as_ref().context("convrot hadamard table")?;
+    let read = cached.2.device_ptr(stream);
+    let table_ptr = read.0;
+    unsafe {
+        stream
+            .launch_builder(&fns.group_dot)
+            .arg(&args.x)
+            .arg(&args.rotated)
+            .arg(&table_ptr)
+            .arg(&args.rows)
+            .arg(&args.k)
+            .arg(&args.group)
+            .launch(LaunchConfig {
+                grid_dim: group_dot_grid(rows, k, group),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: group_dot_smem(group),
+            })?;
+    }
+    drop(read);
+    Ok(())
+}
+
 /// `convrot_group_dot` then `convrot_quantize`. The product is a separate launch.
 #[cfg(feature = "cuda")]
 pub(crate) fn launch_rotate_quant(
@@ -529,20 +613,7 @@ pub(crate) fn launch_rotate_quant(
         "convrot group {group} exceeds device tile {}",
         fns.max_group
     );
-    unsafe {
-        stream
-            .launch_builder(&fns.group_dot)
-            .arg(&args.x)
-            .arg(&args.rotated)
-            .arg(&args.rows)
-            .arg(&args.k)
-            .arg(&args.group)
-            .launch(LaunchConfig {
-                grid_dim: group_dot_grid(rows, k, group),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: group_dot_smem(group),
-            })?;
-    }
+    launch_group_dot(stream, fns, args, rows, k, group)?;
     let tile_rows = quantize_rows(fns.optin, k)?;
     let tile = i32::try_from(tile_rows)?;
     let smem =
@@ -1218,7 +1289,36 @@ mod device {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
+    fn check_hadamard_table_mutant(device: &Device) -> Result<()> {
+        let rows = 17usize;
+        let k = 256usize;
+        let group = 256usize;
+        let n = 2usize;
+        let x = activation(rows, k);
+        let qweight = weight(n, k);
+        let wscale = wscale_row(n);
+        let input = || HostLaunch {
+            x: &x,
+            k,
+            group,
+            qweight: &qweight,
+            n,
+            wscale: &wscale,
+            keep: true,
+        };
+        let base = launch_kept(device, input())?;
+        let flipped = super::with_hadamard_flip(0, || launch_kept(device, input()))?;
+        let differ = count_f32(&flipped.rotated, &base.rotated);
+        emit(&format!("CONVROT_TABLE_MUTANT differ={differ}"));
+        ensure!(
+            differ > 0,
+            "one hadamard table entry matched the unflipped tile"
+        );
+        Ok(())
+    }
+
     fn check_group_dot_tiles(device: &Device) -> Result<()> {
+        check_hadamard_table_mutant(device)?;
         let group = 256usize;
         let n = 40usize;
         for rows in [17usize, 20, 42, 41770] {
@@ -1720,12 +1820,95 @@ mod device {
         Ok(())
     }
 
+    fn sass_ops(body: &str) -> Vec<&str> {
+        body.split_whitespace()
+            .map(|word| word.trim_end_matches(';'))
+            .filter(|word| word.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+            .collect()
+    }
+
+    #[test]
+    fn convrot_group_dot_sass_loads_the_table() -> Result<()> {
+        let sms = crate::backend::cuda::cubin::arches();
+        ensure!(!sms.is_empty(), "convrot cubin missing");
+        for &sm in sms {
+            let bytes = crate::backend::cuda::cubin::bytes("convrot", sm)
+                .with_context(|| format!("convrot cubin sm_{sm}"))?;
+            let path = std::env::temp_dir().join(format!(
+                "convrot-group-dot-{}-{sm}.cubin",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).context("convrot cubin")?;
+            let output = std::process::Command::new(cuobjdump_bin())
+                .arg("-sass")
+                .arg(&path)
+                .output()
+                .context("cuobjdump")?;
+            let resources = std::process::Command::new(cuobjdump_bin())
+                .arg("-res-usage")
+                .arg(&path)
+                .output()
+                .context("cuobjdump resources")?;
+            let _ = std::fs::remove_file(&path);
+            let text = String::from_utf8_lossy(&output.stdout);
+            let err = String::from_utf8_lossy(&output.stderr);
+            ensure!(
+                output.status.success(),
+                "cuobjdump sm_{sm} status {} {err}",
+                output.status
+            );
+            let body = function_sass(&text, "convrot_group_dot")
+                .context("convrot_group_dot missing from cuobjdump")?;
+            let ops = sass_ops(body);
+            let ldg128 = ops.iter().filter(|op| **op == "LDG.E.128").count();
+            let u16 = ops.iter().filter(|op| op.starts_with("LDG.E.U16")).count();
+            let e64 = ops.iter().filter(|op| op.starts_with("LDG.E.64")).count();
+            let constant = ops.iter().filter(|op| op.contains("CONSTANT")).count();
+            let hmma = ops
+                .iter()
+                .filter(|op| **op == "HMMA.16816.F32.BF16")
+                .count();
+            let ldsm2 = ops.iter().filter(|op| **op == "LDSM.16.M88.2").count();
+            let ldsm4 = ops.iter().filter(|op| **op == "LDSM.16.M88.4").count();
+            let mufu = ops.iter().filter(|op| op.starts_with("MUFU")).count();
+            let usage = String::from_utf8_lossy(&resources.stdout);
+            let usage_err = String::from_utf8_lossy(&resources.stderr);
+            ensure!(
+                resources.status.success(),
+                "cuobjdump resources sm_{sm} status {} {usage_err}",
+                resources.status
+            );
+            let (reg, stack, local) = function_resources(&usage, "convrot_group_dot")?;
+            println!(
+                "CONVROT_GROUP_DOT_SASS sm_{sm} LDG.E.128={ldg128} U16={u16} E64={e64} CONSTANT={constant} HMMA={hmma} LDSM2={ldsm2} LDSM4={ldsm4} MUFU={mufu} REG={reg} STACK={stack} LOCAL={local}"
+            );
+            ensure!(
+                ldg128 >= 2
+                    && u16 == 0
+                    && e64 == 0
+                    && constant == 0
+                    && hmma >= 1
+                    && ldsm2 >= 1
+                    && ldsm4 >= 1
+                    && mufu == 0
+                    && stack == 0
+                    && local == 0,
+                "sm_{sm} convrot_group_dot LDG.E.128={ldg128} U16={u16} E64={e64} CONSTANT={constant} HMMA={hmma} LDSM2={ldsm2} LDSM4={ldsm4} MUFU={mufu} STACK={stack} LOCAL={local}"
+            );
+        }
+        Ok(())
+    }
+
     fn product_resources(dump: &str) -> Result<(u32, u32, u32)> {
-        let marker = "Function convrot_product:";
+        function_resources(dump, "convrot_product")
+    }
+
+    fn function_resources(dump: &str, function: &str) -> Result<(u32, u32, u32)> {
+        let marker = format!("Function {function}:");
         let rest = dump
-            .find(marker)
+            .find(&marker)
             .map(|start| &dump[start + marker.len()..])
-            .context("convrot_product resources")?;
+            .with_context(|| format!("{function} resources"))?;
         let end = rest.find("Function ").unwrap_or(rest.len());
         let block = &rest[..end];
         let field = |name: &str| -> Result<u32> {
