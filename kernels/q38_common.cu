@@ -1374,8 +1374,9 @@ extern "C" __global__ void fourier_time_bf16(float t,
     const __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ out, uint32_t n) {
     if(!weight || !out || !n) {__trap();return;}
     const float t32 = __bfloat162float(__float2bfloat16_rn(t));
+    const __nv_bfloat16 time_value = __float2bfloat16_rn(__fmul_rn(6.283185307179586f, t32));
     for(uint32_t i=blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        const float angle = __bfloat162float(__float2bfloat16_rn(__fmul_rn(6.283185307179586f * t32, __bfloat162float(weight[i]))));
+        const float angle = __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(time_value), __bfloat162float(weight[i]))));
         out[i] = __float2bfloat16_rn(cosf(angle));
         out[n + i] = __float2bfloat16_rn(sinf(angle));
     }
@@ -1391,7 +1392,8 @@ extern "C" __global__ void weighted_layer_sum_bf16(const __nv_bfloat16* __restri
     float sum = 0.0f;
     for (int l = 0; l < layers; l++)
         sum = __fadd_rn(sum, __fmul_rn(__bfloat162float(w[l]), __bfloat162float(x[t * layers * width + (long long)l * width + h])));
-    out[i] = __float2bfloat16_rn(__fmul_rn(scale, sum));
+    const __nv_bfloat16 mixed = __float2bfloat16_rn(sum);
+    out[i] = __hmul(__float2bfloat16_rn(scale), mixed);
 }
 
 extern "C" __global__ void nearest_rows_bf16(const __nv_bfloat16* __restrict__ in,
@@ -1408,10 +1410,11 @@ extern "C" __global__ void snake_rows_bf16(const __nv_bfloat16* __restrict__ x,
     long long count, int channels) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const float a = __bfloat162float(alpha[i % channels]);
-    const float v = __bfloat162float(x[i]);
-    const float s = sinf(a * v);
-    y[i] = __float2bfloat16_rn(v + __frcp_rn(a + 1e-9f) * s * s);
+    const __nv_bfloat16 a = alpha[i % channels];
+    const __nv_bfloat16 a_eps = __float2bfloat16_rn(__fadd_rn(__bfloat162float(a), 1e-9f));
+    const __nv_bfloat16 reciprocal = __float2bfloat16_rn(__frcp_rn(__bfloat162float(a_eps)));
+    const __nv_bfloat16 s = __float2bfloat16_rn(sinf(__bfloat162float(__hmul(a, x[i]))));
+    y[i] = __hadd(x[i], __hmul(reciprocal, __hmul(s, s)));
 }
 
 extern "C" __global__ void tanh_bf16(__nv_bfloat16* __restrict__ x, long long count) {
@@ -1426,11 +1429,11 @@ extern "C" __global__ void guided_euler_bf16(__nv_bfloat16* x,
     if ((!x && !velocity) || !c || !u || count < 1 || form < 0 || form > 1) { __trap(); return; }
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const __nv_bfloat16 scale_bf16 = __float2bfloat16_rn(scale);
+    const __nv_bfloat16 shift = __hsub(c[i], u[i]);
     const __nv_bfloat16 guided = form == 0
-        ? __hadd(u[i], __hmul(scale_bf16, __hsub(c[i], u[i])))
-        : __hadd(__hmul(scale_bf16, c[i]),
-            __hmul(__float2bfloat16_rn(1.0f - scale), u[i]));
+        ? __hadd(u[i], __float2bfloat16_rn(__fmul_rn(scale, __bfloat162float(shift))))
+        : __hadd(__float2bfloat16_rn(__fmul_rn(scale, __bfloat162float(c[i]))),
+            __float2bfloat16_rn(__fmul_rn(1.0f - scale, __bfloat162float(u[i]))));
     if (velocity) velocity[i] = guided;
     // Euler upcasts the BF16 velocity and sample to F32, then rounds once.
     if (x) x[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(x[i]),

@@ -418,15 +418,6 @@ extern "C" __global__ void vision_bias_f32(
     }
 }
 
-extern "C" __global__ void vision_bias_bf16(
-    const __nv_bfloat16* input, const __nv_bfloat16* bias, __nv_bfloat16* output, uint32_t rows, uint32_t width) {
-    if (!vision_flat_launch() || !input || !bias || !output || !rows || !width) { __trap(); return; }
-    uint32_t count = rows * width;
-    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        output[i] = __hadd(input[i], bias[i % width]);
-    }
-}
-
 extern "C" __global__ void vision_bias_gelu_f32(
     const float* input, const float* bias, float* output, uint32_t rows, uint32_t width) {
     if (!vision_flat_launch() || !input || !output || !rows || !width) { __trap(); return; }

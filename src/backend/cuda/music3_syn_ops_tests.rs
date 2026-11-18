@@ -162,8 +162,7 @@ mod velocity {
                 .zip(&want)
                 .map(|((a, b), w)| {
                     let shift = half::bf16::from_f32(a - b);
-                    let scale = half::bf16::from_f32(1.7);
-                    let scaled = half::bf16::from_f32(scale.to_f32() * shift.to_f32());
+                    let scaled = half::bf16::from_f32(1.7 * shift.to_f32());
                     let guided = half::bf16::from_f32(b + scaled.to_f32()).to_f32();
                     (guided - w).abs() as f64
                 })

@@ -24,7 +24,6 @@ pub struct Music3Syn {
     rotary: CudaFunction,
     silu: CudaFunction,
     silu_mul: CudaFunction,
-    bias: CudaFunction,
     add_scale: CudaFunction,
     cond_sum: CudaFunction,
     pad_rows_n: CudaFunction,
@@ -66,6 +65,7 @@ struct K3Site<'a> {
     in_dim: usize,
     out_dim: usize,
     out: &'a mut CudaSlice<bf16>,
+    bias: &'a CudaSlice<u8>,
     padded: &'a mut CudaSlice<bf16>,
     cols: &'a mut CudaSlice<bf16>,
 }
@@ -133,6 +133,15 @@ fn bf16_matrix(
     }
 }
 
+fn bf16_bias(
+    bytes: &CudaSlice<u8>,
+    s: &Arc<cudarc::driver::CudaStream>,
+    len: usize,
+) -> Result<Tensor<bf16, 1>> {
+    ensure!(bytes.len() == len * 2, "BF16 bias byte extent mismatch");
+    unsafe { Tensor::new(bytes.device_ptr(s).0, [len as u32], [1], (len * 2) as u64) }
+}
+
 impl Music3Syn {
     pub fn load(dir: &std::path::Path, d: &Device, max_length: usize) -> Result<Self> {
         let spec = crate::music3::SynSpec::read(dir)?;
@@ -142,7 +151,7 @@ impl Music3Syn {
             false,
             "Music3Syn setup".into(),
         ));
-        let blas = super::blas::Blas::new(d, &ops, std::path::Path::new(""), closure)?;
+        let mut blas = super::blas::Blas::new(d, &ops, std::path::Path::new(""), closure)?;
         // All BF16 GEMMs share the Blas handle and accumulate in F32.
         let common = super::cubin::module(&d.ctx, "q38_common")?;
         let act = super::cubin::module(&d.ctx, "act")?;
@@ -205,7 +214,6 @@ impl Music3Syn {
             blocks,
             conv_out_w,
         };
-        let vision = super::cubin::module(&d.ctx, "vision_ops")?;
         let flow_heads = spec.flow_heads as usize;
         let flow_head_dim = spec.flow_head_dim as usize;
         let attention = super::flash::Flash::new_with_score(
@@ -217,6 +225,53 @@ impl Music3Syn {
             super::flash::Score::from_tokens(1.0 / (flow_head_dim as f32).sqrt(), None)?,
             2 * (max_length + 1),
         )?;
+        let mut prepare = |rows: usize, output: usize, input: usize, bias: &CudaSlice<u8>| {
+            blas.prepare_biased(
+                u32::try_from(rows)?,
+                u32::try_from(output)?,
+                u32::try_from(input)?,
+                bf16_bias(bias, &d.stream, output)?,
+                super::linear::LinearBiasMode::BeforeOutputRound,
+            )
+        };
+        let dim = spec.flow_dim() as usize;
+        let ff = spec.flow_ff_inner as usize;
+        prepare(1, dim, spec.fourier_dim as usize, &weights.flow.time_l1_b)?;
+        prepare(1, dim, dim, &weights.flow.time_l2_b)?;
+        for block in &weights.flow.blocks {
+            for rows in [max_length + 1, 2 * (max_length + 1)] {
+                prepare(rows, 2 * ff, dim, &block.ff_in_b)?;
+                prepare(rows, dim, ff, &block.ff_out_b)?;
+            }
+        }
+        let mut condition_plans = 0usize;
+        for frames in 1..=max_length {
+            if spec.latent_length(frames) == max_length {
+                prepare(
+                    frames,
+                    spec.cond_out as usize,
+                    spec.cond_hidden as usize * 3,
+                    &weights.cond.proj_b,
+                )?;
+                condition_plans += 1;
+            }
+        }
+        ensure!(condition_plans > 0, "no condition shape for BF16 plans");
+        let streams = spec.vocoder_stream_channels() as usize;
+        let input_dim = spec.decoder_input as usize;
+        let mut rows = max_length;
+        let mut voc_dim = spec.decoder_hidden as usize;
+        prepare(rows, input_dim, streams, &weights.vocoder.dec_in_proj_b)?;
+        prepare(rows, voc_dim, input_dim * 7, &weights.vocoder.conv_in_b)?;
+        for (index, ratio) in spec.upsampling.iter().enumerate() {
+            rows *= *ratio as usize;
+            voc_dim /= 2;
+            for unit in &weights.vocoder.blocks[index].units {
+                prepare(rows, voc_dim, voc_dim * 7, &unit.c1_b)?;
+                prepare(rows, voc_dim, voc_dim, &unit.c2_b)?;
+            }
+        }
+        prepare(rows, 1, voc_dim * 7, &weights.vocoder.conv_out_b)?;
         Ok(Self {
             spec,
             weights,
@@ -229,7 +284,6 @@ impl Music3Syn {
             rotary: kernel(&rope, "partial_rotary_bf16")?,
             silu: kernel(&act, "silu_bf16")?,
             silu_mul: kernel(&act, "silu_mul")?,
-            bias: kernel(&vision, "vision_bias_bf16")?,
             add_scale: kernel(&common, "add_scale_bf16")?,
             cond_sum: kernel(&common, "weighted_layer_sum_bf16")?,
             pad_rows_n: kernel(&common, "pad_rows_n_bf16")?,
@@ -261,6 +315,32 @@ impl Music3Syn {
         rows: usize,
         out: &mut CudaViewMut<bf16>,
     ) -> Result<()> {
+        self.linear_impl(weight, out_rows, in_cols, input, rows, out, None)
+    }
+
+    fn linear_biased(
+        &self,
+        weight: &CudaSlice<u8>,
+        out_rows: usize,
+        in_cols: usize,
+        input: &CudaView<bf16>,
+        rows: usize,
+        out: &mut CudaViewMut<bf16>,
+        bias: &CudaSlice<u8>,
+    ) -> Result<()> {
+        self.linear_impl(weight, out_rows, in_cols, input, rows, out, Some(bias))
+    }
+
+    fn linear_impl(
+        &self,
+        weight: &CudaSlice<u8>,
+        out_rows: usize,
+        in_cols: usize,
+        input: &CudaView<bf16>,
+        rows: usize,
+        out: &mut CudaViewMut<bf16>,
+        bias: Option<&CudaSlice<u8>>,
+    ) -> Result<()> {
         let mut view = TensorMut(unsafe {
             Tensor::new(
                 out.device_ptr_mut(&self.stream).0,
@@ -269,18 +349,25 @@ impl Music3Syn {
                 (rows * out_rows * 2) as u64,
             )?
         });
-        self.blas.linear_bf16(
-            bf16_matrix(weight, &self.stream, out_rows, in_cols)?,
-            unsafe {
-                Tensor::new(
-                    input.device_ptr(&self.stream).0,
-                    [rows as u32, in_cols as u32],
-                    [in_cols as u64, 1],
-                    (rows * in_cols * 2) as u64,
-                )?
-            },
-            &mut view,
-        )
+        let weight = bf16_matrix(weight, &self.stream, out_rows, in_cols)?;
+        let input = unsafe {
+            Tensor::new(
+                input.device_ptr(&self.stream).0,
+                [rows as u32, in_cols as u32],
+                [in_cols as u64, 1],
+                (rows * in_cols * 2) as u64,
+            )?
+        };
+        match bias {
+            Some(bias) => self.blas.linear_biased(
+                weight,
+                bf16_bias(bias, &self.stream, out_rows)?,
+                input,
+                &mut view,
+                super::linear::LinearBiasMode::BeforeOutputRound,
+            ),
+            None => self.blas.linear_bf16(weight, input, &mut view),
+        }
     }
 
     /// One flow-transformer call: `x_t` and `velocity` are channel-major
@@ -356,8 +443,6 @@ impl Music3Syn {
             length,
             &mut wide.slice_mut(dim..dim + length * dim),
         )?;
-        let temb_ptr = ws.temb.device_ptr(s).0;
-        let l2b_ptr = self.weights.flow.time_l2_b.device_ptr(s).0;
         let mut temb = ws.temb.slice_mut(0..ws.temb.len());
         let mut fourier = ws.fourier.slice_mut(0..ws.fourier.len());
         unsafe {
@@ -368,52 +453,34 @@ impl Music3Syn {
                 .arg(&((fourier_dim / 2) as u32))
                 .launch(super::ops::flat(fourier_dim / 2))?;
         }
-        let t1_ptr = ws.t1.device_ptr(s).0;
-        let l1b_ptr = self.weights.flow.time_l1_b.device_ptr(s).0;
         let mut t1 = ws.t1.slice_mut(0..ws.t1.len());
-        self.linear(
+        self.linear_biased(
             &self.weights.flow.time_l1_w,
             dim,
             fourier_dim,
             &fourier.slice(0..fourier_dim),
             1,
             &mut t1.slice_mut(0..dim),
+            &self.weights.flow.time_l1_b,
         )?;
         unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&t1_ptr)
-                .arg(&l1b_ptr)
-                .arg(&t1_ptr)
-                .arg(&1u32)
-                .arg(&(dim as u32))
-                .launch(super::ops::flat(dim))?;
             s.launch_builder(&self.silu)
                 .arg(&mut t1)
                 .arg(&(dim as i64))
                 .launch(super::ops::flat(dim))?;
         }
-        self.linear(
+        self.linear_biased(
             &self.weights.flow.time_l2_w,
             dim,
             dim,
             &t1.slice(0..dim),
             1,
             &mut temb.slice_mut(0..dim),
+            &self.weights.flow.time_l2_b,
         )?;
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&temb_ptr)
-                .arg(&l2b_ptr)
-                .arg(&temb_ptr)
-                .arg(&1u32)
-                .arg(&(dim as u32))
-                .launch(super::ops::flat(dim))?;
-        }
         s.memcpy_dtod(&temb, &mut wide)?;
 
-        let ffb_ptr = ws.ff_buf.device_ptr(s).0;
         let mut ff_gated = ws.ff_gated.slice_mut(0..ws.ff_gated.len());
-        let ffo_ptr = ws.ff_out.device_ptr(s).0;
         let mut ff_out = ws.ff_out.slice_mut(0..ws.ff_out.len());
         for block in &self.weights.flow.blocks {
             {
@@ -530,23 +597,16 @@ impl Music3Syn {
                 dim,
                 ws.norm.device_ptr_mut(s).0,
             )?;
-            self.linear(
+            self.linear_biased(
                 &block.ff_in_w,
                 2 * ff,
                 dim,
                 &ws.norm.slice(0..dim * tokens),
                 tokens,
                 &mut ws.ff_buf.slice_mut(0..2 * ff * tokens),
+                &block.ff_in_b,
             )?;
             unsafe {
-                let ffinb_ptr = block.ff_in_b.device_ptr(s).0;
-                s.launch_builder(&self.bias)
-                    .arg(&ffb_ptr)
-                    .arg(&ffinb_ptr)
-                    .arg(&ffb_ptr)
-                    .arg(&(tokens as u32))
-                    .arg(&((2 * ff) as u32))
-                    .launch(super::ops::flat(2 * ff * tokens))?;
                 s.launch_builder(&self.silu_mul)
                     .arg(&mut ws.ff_buf)
                     .arg(&mut ff_gated)
@@ -555,23 +615,16 @@ impl Music3Syn {
                     .arg(&3i32)
                     .launch(super::ops::flat(ff * tokens))?;
             }
-            self.linear(
+            self.linear_biased(
                 &block.ff_out_w,
                 dim,
                 ff,
                 &ff_gated.slice(0..ff * tokens),
                 tokens,
                 &mut ff_out.slice_mut(0..dim * tokens),
+                &block.ff_out_b,
             )?;
             unsafe {
-                let ffob_ptr = block.ff_out_b.device_ptr(s).0;
-                s.launch_builder(&self.bias)
-                    .arg(&ffo_ptr)
-                    .arg(&ffob_ptr)
-                    .arg(&ffo_ptr)
-                    .arg(&(tokens as u32))
-                    .arg(&(dim as u32))
-                    .launch(super::ops::flat(dim * tokens))?;
                 s.launch_builder(&self.add_scale)
                     .arg(&mut wide)
                     .arg(&mut ff_out)
@@ -718,24 +771,17 @@ impl Music3Syn {
         }
         let fourier_ro = ws.fourier.slice(0..fourier_dim);
         let mut t1 = ws.t1.slice_mut(0..dim);
-        self.linear(
+        self.linear_biased(
             &self.weights.flow.time_l1_w,
             dim,
             fourier_dim,
             &fourier_ro,
             1,
             &mut t1,
+            &self.weights.flow.time_l1_b,
         )?;
         let t1_ptr = ws.t1.device_ptr(s).0;
-        let l1b_ptr = self.weights.flow.time_l1_b.device_ptr(s).0;
         unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&t1_ptr)
-                .arg(&l1b_ptr)
-                .arg(&t1_ptr)
-                .arg(&1u32)
-                .arg(&(dim as u32))
-                .launch(super::ops::flat(dim))?;
             s.launch_builder(&self.silu)
                 .arg(&t1_ptr)
                 .arg(&(dim as i64))
@@ -743,25 +789,15 @@ impl Music3Syn {
         }
         let t1_ro = ws.t1.slice(0..dim);
         let mut temb_out = ws.temb.slice_mut(0..dim);
-        self.linear(
+        self.linear_biased(
             &self.weights.flow.time_l2_w,
             dim,
             dim,
             &t1_ro,
             1,
             &mut temb_out,
+            &self.weights.flow.time_l2_b,
         )?;
-        let temb_ptr = ws.temb.device_ptr(s).0;
-        let l2b_ptr = self.weights.flow.time_l2_b.device_ptr(s).0;
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&temb_ptr)
-                .arg(&l2b_ptr)
-                .arg(&temb_ptr)
-                .arg(&1u32)
-                .arg(&(dim as u32))
-                .launch(super::ops::flat(dim))?;
-        }
         let wide_ptr = ws.wide.device_ptr(s).0;
         let temb_ro = ws.temb.slice(0..dim);
         for branch in 0..2 {
@@ -881,25 +917,17 @@ impl Music3Syn {
             )?;
             let norm_ro = ws.norm.slice(0..pair_tokens * dim);
             let mut ff_buf = ws.ff_buf.slice_mut(0..pair_tokens * 2 * ff);
-            self.linear(
+            self.linear_biased(
                 &block.ff_in_w,
                 2 * ff,
                 dim,
                 &norm_ro,
                 pair_tokens,
                 &mut ff_buf,
+                &block.ff_in_b,
             )?;
-            let count_ff = pair_tokens * 2 * ff;
             let ffb_ptr = ws.ff_buf.device_ptr(s).0;
-            let ffinb_ptr = block.ff_in_b.device_ptr(s).0;
             unsafe {
-                s.launch_builder(&self.bias)
-                    .arg(&ffb_ptr)
-                    .arg(&ffinb_ptr)
-                    .arg(&ffb_ptr)
-                    .arg(&(pair_tokens as u32))
-                    .arg(&((2 * ff) as u32))
-                    .launch(super::ops::flat(count_ff))?;
                 let gated_ptr = ws.ff_gated.device_ptr_mut(s).0;
                 s.launch_builder(&self.silu_mul)
                     .arg(&ffb_ptr)
@@ -911,25 +939,18 @@ impl Music3Syn {
             }
             let gated_ro = ws.ff_gated.slice(0..pair_tokens * ff);
             let mut ff_out2 = ws.ff_out.slice_mut(0..pair_tokens * dim);
-            self.linear(
+            self.linear_biased(
                 &block.ff_out_w,
                 dim,
                 ff,
                 &gated_ro,
                 pair_tokens,
                 &mut ff_out2,
+                &block.ff_out_b,
             )?;
             let count2 = pair_tokens * dim;
             let ffo2 = ws.ff_out.device_ptr(s).0;
-            let ffob_ptr = block.ff_out_b.device_ptr(s).0;
             unsafe {
-                s.launch_builder(&self.bias)
-                    .arg(&ffo2)
-                    .arg(&ffob_ptr)
-                    .arg(&ffo2)
-                    .arg(&(pair_tokens as u32))
-                    .arg(&(dim as u32))
-                    .launch(super::ops::flat(count2))?;
                 s.launch_builder(&self.add_scale)
                     .arg(&wide2)
                     .arg(&ffo2)
@@ -1103,20 +1124,10 @@ impl Music3Syn {
             in_dim: cond_hidden,
             out_dim: cond_out,
             out: &mut ws.cond_conv,
+            bias: &self.weights.cond.proj_b,
             padded: &mut ws.cond_pad,
             cols: &mut ws.cond_cols,
         })?;
-        let conv_ptr = ws.cond_conv.device_ptr(s).0;
-        let conv_bias = self.weights.cond.proj_b.device_ptr(s).0;
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&conv_ptr)
-                .arg(&conv_bias)
-                .arg(&conv_ptr)
-                .arg(&(frames as u32))
-                .arg(&(cond_out as u32))
-                .launch(super::ops::flat(frames * cond_out))?;
-        }
         let map: Vec<u32> = (0..length)
             .map(|j| u32::try_from(j * frames / length).context("map index overflow"))
             .collect::<Result<_>>()?;
@@ -1180,26 +1191,15 @@ impl Music3Syn {
                     .arg(&(dilation as i32))
                     .launch(super::ops::flat(rows * in_dim * kernel))?;
             }
-            self.linear_bytes(
+            self.linear_biased_bytes(
                 w,
                 out_dim,
                 in_dim * kernel,
                 &cols.slice(0..rows * in_dim * kernel),
                 rows,
                 out,
+                bias,
             )?;
-        }
-        let count = rows * out_dim;
-        let out_ptr = out.device_ptr(&self.stream).0;
-        let bias_ptr = bias.device_ptr(&self.stream).0;
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&out_ptr)
-                .arg(&bias_ptr)
-                .arg(&out_ptr)
-                .arg(&(rows as u32))
-                .arg(&(out_dim as u32))
-                .launch(super::ops::flat(count))?;
         }
         Ok(())
     }
@@ -1214,6 +1214,7 @@ impl Music3Syn {
             in_dim,
             out_dim,
             out,
+            bias,
             padded,
             cols,
         } = site;
@@ -1268,7 +1269,13 @@ impl Music3Syn {
                 (rows * in_dim * 3 * 2) as u64,
             )?
         };
-        self.blas.linear_bf16(w_tensor, x_tensor, &mut view)
+        self.blas.linear_biased(
+            w_tensor,
+            bf16_bias(bias, s, out_dim)?,
+            x_tensor,
+            &mut view,
+            super::linear::LinearBiasMode::BeforeOutputRound,
+        )
     }
 
     /// One vocoder stream over workspace scratch buffers; the residual
@@ -1289,25 +1296,15 @@ impl Music3Syn {
                 .arg(&(length as i64))
                 .launch(super::ops::flat(streams * length))?;
         }
-        self.linear(
+        self.linear_biased(
             &self.weights.vocoder.dec_in_proj_w,
             input_dim,
             streams,
             &ws.voc_x.slice(0..length * streams),
             length,
             &mut ws.voc_dec.slice_mut(0..length * input_dim),
+            &self.weights.vocoder.dec_in_proj_b,
         )?;
-        let dec_ptr = ws.voc_dec.device_ptr(s).0;
-        let dec_bias = self.weights.vocoder.dec_in_proj_b.device_ptr(s).0;
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&dec_ptr)
-                .arg(&dec_bias)
-                .arg(&dec_ptr)
-                .arg(&(length as u32))
-                .arg(&(input_dim as u32))
-                .launch(super::ops::flat(length * input_dim))?;
-        }
         self.conv1d(Conv1dSite {
             w: &self.vocoder_folds.conv_in_w,
             x: &ws.voc_dec,
@@ -1393,24 +1390,17 @@ impl Music3Syn {
                         .arg(&(dim as i32))
                         .launch(super::ops::flat(count))?;
                 }
-                self.linear_bytes(
+                self.linear_biased_bytes(
                     &unit.c2_w,
                     dim,
                     dim,
                     &ws.voc_sn2.slice(0..count),
                     rows,
                     &mut ws.voc_gated,
+                    &unit_weights.c2_b,
                 )?;
                 let gated_ptr = ws.voc_gated.device_ptr(s).0;
-                let gated_bias = unit_weights.c2_b.device_ptr(s).0;
                 unsafe {
-                    s.launch_builder(&self.bias)
-                        .arg(&gated_ptr)
-                        .arg(&gated_bias)
-                        .arg(&gated_ptr)
-                        .arg(&(rows as u32))
-                        .arg(&(dim as u32))
-                        .launch(super::ops::flat(count))?;
                     let cur_ptr = ws.voc_cur.device_ptr_mut(s).0;
                     s.launch_builder(&self.add_scale)
                         .arg(&cur_ptr)
@@ -1482,8 +1472,8 @@ impl Music3Syn {
         Ok(())
     }
 
-    /// `linear` for a dense F32 weight already on device.
-    fn linear_bytes(
+    /// Biased linear for a dense BF16 weight already on device.
+    fn linear_biased_bytes(
         &self,
         weight: &CudaSlice<bf16>,
         out_rows: usize,
@@ -1491,6 +1481,7 @@ impl Music3Syn {
         input: &CudaView<bf16>,
         rows: usize,
         out: &mut CudaSlice<bf16>,
+        bias: &CudaSlice<u8>,
     ) -> Result<()> {
         let mut view = TensorMut(unsafe {
             Tensor::new(
@@ -1508,8 +1499,9 @@ impl Music3Syn {
                 (out_rows * in_cols * 2) as u64,
             )?
         };
-        self.blas.linear_bf16(
+        self.blas.linear_biased(
             w,
+            bf16_bias(bias, &self.stream, out_rows)?,
             unsafe {
                 Tensor::new(
                     input.device_ptr(&self.stream).0,
@@ -1519,6 +1511,7 @@ impl Music3Syn {
                 )?
             },
             &mut view,
+            super::linear::LinearBiasMode::BeforeOutputRound,
         )
     }
 
