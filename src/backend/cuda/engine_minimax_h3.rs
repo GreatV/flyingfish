@@ -585,8 +585,9 @@ impl AdalnTable {
                     &format!("{base}.weight"),
                     first * weight_block,
                     weight_block,
-                    &mut weight.slice_mut(index * width * spec.time_dim
-                        ..(index + 1) * width * spec.time_dim),
+                    &mut weight.slice_mut(
+                        index * width * spec.time_dim..(index + 1) * width * spec.time_dim,
+                    ),
                 )?;
                 source.fill_span(
                     s,
@@ -5550,7 +5551,13 @@ mod tests {
     /// match the safetensors headers of `transformer_diffusers`.
     #[test]
     fn adaln_spans_read_only_the_addressed_modality_blocks() {
-        let pairs = [(0, TEXT_TAG), (0, IMAGE_TAG), (1, IMAGE_TAG), (1, TEXT_TAG), (5, TEXT_TAG)];
+        let pairs = [
+            (0, TEXT_TAG),
+            (0, IMAGE_TAG),
+            (1, IMAGE_TAG),
+            (1, TEXT_TAG),
+            (5, TEXT_TAG),
+        ];
         let tags = adaln_tags(&pairs);
         assert_eq!(tags, vec![IMAGE_TAG, TEXT_TAG]);
         let (rows, cols) = (96_768usize, 2_688usize);
@@ -5596,9 +5603,7 @@ mod tests {
             (0..timesteps)
                 .flat_map(|t| {
                     tags.iter().flat_map(move |&tag| {
-                        table
-                            [t * MODALITIES as usize * width + usize::from(tag) * width..]
-                            [..width]
+                        table[t * MODALITIES as usize * width + usize::from(tag) * width..][..width]
                             .to_vec()
                     })
                 })
