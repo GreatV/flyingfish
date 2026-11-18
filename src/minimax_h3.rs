@@ -10,7 +10,7 @@ use std::{
 
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::engine::minimax_h3::{
-    generate, image_decode, image_encode, image_latents, image_sample,
+    ImageSession, generate, image_decode, image_encode, image_latents, image_sample,
 };
 
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.

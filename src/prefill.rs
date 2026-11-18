@@ -66,7 +66,7 @@ pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize
     ensure!(end <= total, "prefill chunk exceeds the request");
     Ok(end)
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DensePlacement {
     pub slots: Vec<Option<usize>>,
     pub host: Vec<bool>,
@@ -354,8 +354,344 @@ impl Plan {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub(crate) struct DenseStage<'a> {
+    pub device: &'a [usize],
+    pub source: &'a [usize],
+    pub visits: usize,
+    pub load_scratch: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl DenseStage<'_> {
+    fn choices(self, limit: usize, page: usize) -> Result<Vec<(usize, DensePlacement)>> {
+        ensure!(
+            !self.device.is_empty()
+                && self.source.len() == self.device.len()
+                && self.visits > 0
+                && self.device.iter().chain(self.source).all(|&n| n > 0),
+            "invalid resident stage extent"
+        );
+        let mut order: Vec<_> = (0..self.device.len()).collect();
+        order.sort_by_key(|&index| std::cmp::Reverse(self.device[index]));
+        let mut out = Vec::new();
+        let mut resident_bytes = 0usize;
+        let mut resident_device = 0usize;
+        let charge = |bytes: usize| {
+            bytes
+                .div_ceil(page)
+                .checked_mul(page)
+                .context("resident stage device allocation overflow")
+        };
+        for first in 0..=order.len() {
+            let streamed = &order[first..];
+            let slot_bytes = streamed.first().map_or(0, |&index| self.device[index]);
+            let slots = charge(slot_bytes)?
+                .checked_add(if streamed.is_empty() { 0 } else { page })
+                .and_then(|n| n.checked_mul(2))
+                .context("resident upload and mapping slots overflow")?;
+            let device = slots
+                .checked_add(resident_device)
+                .context("resident stage device extent overflow")?;
+            if device <= limit {
+                let mut slots = vec![None; order.len()];
+                let mut slot = 0;
+                let mut disk_bytes = 0usize;
+                for (index, bytes) in self.source.iter().enumerate() {
+                    if streamed.contains(&index) {
+                        slots[index] = Some(slot % 2);
+                        slot += 1;
+                        disk_bytes = disk_bytes
+                            .checked_add(*bytes)
+                            .context("resident disk extent overflow")?;
+                    }
+                }
+                out.push((
+                    device,
+                    DensePlacement {
+                        host: vec![false; slots.len()],
+                        slots,
+                        slot_bytes,
+                        resident_bytes,
+                        host_bytes: 0,
+                        disk_bytes,
+                    },
+                ));
+            }
+            if let Some(&index) = order.get(first) {
+                resident_bytes = resident_bytes
+                    .checked_add(self.device[index])
+                    .context("resident stage weight extent overflow")?;
+                resident_device = resident_device
+                    .checked_add(charge(self.device[index])?)
+                    .context("resident stage device allocation overflow")?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn price(self, plan: &DensePlacement, (pcie, disk): (f64, f64)) -> f64 {
+        let mut read_at = 0.0f64;
+        let mut upload_at = 0.0f64;
+        let mut reusable = [0.0f64; 2];
+        let mut next = 0;
+        for (layer, slot) in plan.slots.iter().enumerate() {
+            if slot.is_none() {
+                continue;
+            }
+            let bytes = self.source[layer] as f64;
+            if plan.host[layer] {
+                upload_at += bytes / pcie;
+            } else {
+                read_at = read_at.max(reusable[next]) + bytes / disk;
+                upload_at = upload_at.max(read_at) + bytes / pcie;
+                reusable[next] = upload_at;
+                next ^= 1;
+            }
+        }
+        upload_at * self.visits as f64
+    }
+
+    fn pin(self, plan: &mut DensePlacement, layer: usize) {
+        let bytes = self.source[layer];
+        plan.host[layer] = true;
+        plan.host_bytes += bytes;
+        plan.disk_bytes -= bytes;
+    }
+
+    fn host_options(self, plan: &DensePlacement, rates: (f64, f64)) -> Vec<HostChoice> {
+        let mut plan = plan.clone();
+        let mut best = self.price(&plan, rates);
+        let mut choices = vec![HostChoice {
+            bytes: 0,
+            layers: 0,
+            seconds: best,
+        }];
+        let mut layers = 0;
+        for layer in 0..plan.slots.len() {
+            if plan.slots[layer].is_some() {
+                self.pin(&mut plan, layer);
+                layers += 1;
+                let seconds = self.price(&plan, rates);
+                if seconds < best {
+                    choices.push(HostChoice {
+                        bytes: plan.host_bytes,
+                        layers,
+                        seconds,
+                    });
+                    best = seconds;
+                }
+            }
+        }
+        choices
+    }
+
+    fn pin_layers(self, plan: &DensePlacement, count: usize) -> DensePlacement {
+        let mut plan = plan.clone();
+        let mut remaining = count;
+        for layer in 0..plan.slots.len() {
+            if remaining > 0 && plan.slots[layer].is_some() {
+                self.pin(&mut plan, layer);
+                remaining -= 1;
+            }
+        }
+        plan
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct HostChoice {
+    bytes: usize,
+    layers: usize,
+    seconds: f64,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct PricedDense {
+    pub plans: [DensePlacement; 3],
+    pub device_bytes: [usize; 3],
+    pub decoder_resident_seconds: Option<f64>,
+    pub decoder_streamed_seconds: Option<f64>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn price_dense_stages(
+    stages: [DenseStage<'_>; 3],
+    (device_limit, host_limit, device_page): (usize, usize, usize),
+    rates: (f64, f64),
+) -> Result<PricedDense> {
+    ensure!(
+        [rates.0, rates.1]
+            .into_iter()
+            .all(|n| n.is_finite() && n > 0.0),
+        "invalid resident placement transfer rates"
+    );
+    ensure!(device_page > 0, "invalid resident device page size");
+    let choices = [
+        stages[0].choices(device_limit, device_page)?,
+        stages[1].choices(device_limit, device_page)?,
+        stages[2].choices(device_limit, device_page)?,
+    ];
+    let host_choices = std::array::from_fn::<_, 3, _>(|index| {
+        choices[index]
+            .iter()
+            .map(|(_, plan)| stages[index].host_options(plan, rates))
+            .collect::<Vec<_>>()
+    });
+    let mut best = None;
+    let mut decoder_resident_seconds: Option<f64> = None;
+    let mut decoder_streamed_seconds: Option<f64> = None;
+    for (i, (d0, c0)) in choices[0].iter().enumerate() {
+        for (j, (d1, c1)) in choices[1].iter().enumerate() {
+            for (k, (d2, c2)) in choices[2].iter().enumerate() {
+                let Some(mapping_capacity) = d0
+                    .checked_add(*d1)
+                    .and_then(|n| n.checked_add(*d2))
+                    .and_then(|n| device_limit.checked_sub(n))
+                    .map(|room| room / device_page)
+                else {
+                    continue;
+                };
+                let plans = [c0, c1, c2];
+                let reserved =
+                    plans
+                        .iter()
+                        .zip(stages)
+                        .try_fold(0usize, |reserved, (plan, stage)| {
+                            if plan.slot_bytes == 0 {
+                                return Ok(reserved);
+                            }
+                            reserved
+                                .checked_add(2 * plan.slot_bytes)
+                                .and_then(|n| n.checked_add(stage.load_scratch))
+                                .context("resident host slot reserve overflow")
+                        })?;
+                let Some(room) = host_limit.checked_sub(reserved) else {
+                    continue;
+                };
+                let decoder_options = &host_choices[2][k];
+                for first in &host_choices[0][i] {
+                    let Some(rest) = room.checked_sub(first.bytes) else {
+                        break;
+                    };
+                    let Some(mappings) = mapping_capacity.checked_sub(first.layers) else {
+                        break;
+                    };
+                    for second in &host_choices[1][j] {
+                        let Some(rest) = rest.checked_sub(second.bytes) else {
+                            break;
+                        };
+                        let Some(mappings) = mappings.checked_sub(second.layers) else {
+                            break;
+                        };
+                        let last = &decoder_options[decoder_options.partition_point(|choice| {
+                            choice.bytes <= rest && choice.layers <= mappings
+                        }) - 1];
+                        let seconds = first.seconds + second.seconds + last.seconds;
+                        let alternative = if c2.slot_bytes == 0 {
+                            &mut decoder_resident_seconds
+                        } else {
+                            &mut decoder_streamed_seconds
+                        };
+                        if alternative.is_none_or(|other| seconds < other) {
+                            *alternative = Some(seconds);
+                        }
+                        if best
+                            .as_ref()
+                            .is_none_or(|(previous, _, _)| seconds < *previous)
+                        {
+                            best = Some((
+                                seconds,
+                                [
+                                    stages[0].pin_layers(c0, first.layers),
+                                    stages[1].pin_layers(c1, second.layers),
+                                    stages[2].pin_layers(c2, last.layers),
+                                ],
+                                [
+                                    d0 + first.layers * device_page,
+                                    d1 + second.layers * device_page,
+                                    d2 + last.layers * device_page,
+                                ],
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (_, plans, device_bytes) = best.with_context(|| {
+        format!(
+            "resident slots and weights cannot fit device={device_limit} host={host_limit} bytes"
+        )
+    })?;
+    Ok(PricedDense {
+        plans,
+        device_bytes,
+        decoder_resident_seconds,
+        decoder_streamed_seconds,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn resident_stage_rates_select_different_decoder_tiers() -> anyhow::Result<()> {
+        use super::{DenseStage, price_dense_stages};
+        let conditioner = [1200; 4];
+        let dit = [800; 5];
+        let decoder = [500; 4];
+        let stages = [
+            DenseStage {
+                device: &conditioner,
+                source: &conditioner,
+                visits: 1,
+                load_scratch: 1000,
+            },
+            DenseStage {
+                device: &dit,
+                source: &dit,
+                visits: 6,
+                load_scratch: 600,
+            },
+            DenseStage {
+                device: &decoder,
+                source: &decoder,
+                visits: 1,
+                load_scratch: 400,
+            },
+        ];
+        let slow_pcie = price_dense_stages(stages, (6032, 7000, 1), (1.0, 100.0))?;
+        assert!(slow_pcie.plans[2].slot_bytes > 0);
+        assert!(slow_pcie.decoder_streamed_seconds < slow_pcie.decoder_resident_seconds);
+        let slow_disk = price_dense_stages(stages, (6032, 7000, 1), (100.0, 1.0))?;
+        assert_eq!(slow_disk.plans[2].slot_bytes, 0);
+        assert!(slow_disk.decoder_resident_seconds < slow_disk.decoder_streamed_seconds);
+        assert!(price_dense_stages(stages, (1, 7000, 1), (1.0, 1.0)).is_err());
+        let layer_bytes = [8; 4];
+        let streamed = DenseStage {
+            device: &layer_bytes,
+            source: &layer_bytes,
+            visits: 1,
+            load_scratch: 0,
+        };
+        let full = price_dense_stages([streamed; 3], (72, 150, 4), (100.0, 1.0))?;
+        assert_eq!(full.device_bytes, [24; 3]);
+        assert!(full.plans.iter().all(|plan| plan.host_bytes == 0));
+        let mapped = price_dense_stages([streamed; 3], (76, 150, 4), (100.0, 1.0))?;
+        assert_eq!(mapped.device_bytes.iter().sum::<usize>(), 76);
+        assert_eq!(
+            mapped
+                .plans
+                .iter()
+                .map(|plan| plan.host_bytes)
+                .sum::<usize>(),
+            8
+        );
+        Ok(())
+    }
+
     use super::{
         Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes,
         pcie_payload_bytes_per_second, prompt_direct_max_rows,
