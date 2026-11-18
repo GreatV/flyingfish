@@ -1426,13 +1426,15 @@ extern "C" __global__ void guided_euler_bf16(__nv_bfloat16* x,
     if ((!x && !velocity) || !c || !u || count < 1 || form < 0 || form > 1) { __trap(); return; }
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const float cf = __bfloat162float(c[i]);
-    const float uf = __bfloat162float(u[i]);
-    const float guided = form == 0
-        ? __fadd_rn(uf, __fmul_rn(scale, __fsub_rn(cf, uf)))
-        : __fadd_rn(__fmul_rn(scale, cf), __fmul_rn(__fsub_rn(1.0f, scale), uf));
-    if (velocity) velocity[i] = __float2bfloat16_rn(guided);
-    if (x) x[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(x[i]), __fmul_rn(dt, guided)));
+    const __nv_bfloat16 scale_bf16 = __float2bfloat16_rn(scale);
+    const __nv_bfloat16 guided = form == 0
+        ? __hadd(u[i], __hmul(scale_bf16, __hsub(c[i], u[i])))
+        : __hadd(__hmul(scale_bf16, c[i]),
+            __hmul(__float2bfloat16_rn(1.0f - scale), u[i]));
+    if (velocity) velocity[i] = guided;
+    // Euler upcasts the BF16 velocity and sample to F32, then rounds once.
+    if (x) x[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(x[i]),
+        __fmul_rn(dt, __bfloat162float(guided))));
 }
 
 extern "C" __global__ void transpose_bf16(const __nv_bfloat16* __restrict__ in,

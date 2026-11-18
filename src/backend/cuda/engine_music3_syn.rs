@@ -143,8 +143,7 @@ impl Music3Syn {
             "Music3Syn setup".into(),
         ));
         let blas = super::blas::Blas::new(d, &ops, std::path::Path::new(""), closure)?;
-        // The attention GEMMs share the Blas handle: CUBLAS_COMPUTE_32F
-        // (no TF32) is the compute type of every F32 GEMM in this engine.
+        // All BF16 GEMMs share the Blas handle and accumulate in F32.
         let common = super::cubin::module(&d.ctx, "q38_common")?;
         let act = super::cubin::module(&d.ctx, "act")?;
         let rope = super::cubin::module(&d.ctx, "rope")?;
