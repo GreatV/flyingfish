@@ -353,8 +353,9 @@ __device__ __forceinline__ void convrot_stage(int8_t* smem, const int8_t* __rest
 
 // Lane groupID = lane>>2, thread = lane&3. A u32 at (group, thread*4), (group+8, thread*4),
 // (group, thread*4+16), (group+8, thread*4+16). B u32 at column group, K thread*4 and +16.
+template <bool MATRIX_LOAD>
 __device__ __forceinline__ void convrot_mma_tile(const int8_t* stage, int (&acc)[2][8][4], int warp_m, int warp_n,
-                                                 int group, int t4) {
+                                                 int group, int t4, int lane) {
     const int8_t* a = stage;
     const int8_t* b = stage + CONVROT_BM * CONVROT_STRIDE;
     const int row_base = warp_m * 32;
@@ -365,18 +366,38 @@ __device__ __forceinline__ void convrot_mma_tile(const int8_t* stage, int (&acc)
         unsigned af[2][4];
 #pragma unroll
         for (int mi = 0; mi < 2; ++mi) {
-            const int r = row_base + mi * 16 + group;
-            af[mi][0] = convrot_lds(a + (r * CONVROT_STRIDE + kbase));
-            af[mi][1] = convrot_lds(a + ((r + 8) * CONVROT_STRIDE + kbase));
-            af[mi][2] = convrot_lds(a + (r * CONVROT_STRIDE + kbase + 16));
-            af[mi][3] = convrot_lds(a + ((r + 8) * CONVROT_STRIDE + kbase + 16));
+            if constexpr (MATRIX_LOAD) {
+                const int r = row_base + mi * 16 + (lane & 15);
+                const int k_panel = ki * 32 + (lane >> 4) * 16;
+                convrot_ldsm_x4(af[mi], a + r * CONVROT_STRIDE + k_panel);
+            } else {
+                const int r = row_base + mi * 16 + group;
+                af[mi][0] = convrot_lds(a + (r * CONVROT_STRIDE + kbase));
+                af[mi][1] = convrot_lds(a + ((r + 8) * CONVROT_STRIDE + kbase));
+                af[mi][2] = convrot_lds(a + (r * CONVROT_STRIDE + kbase + 16));
+                af[mi][3] = convrot_lds(a + ((r + 8) * CONVROT_STRIDE + kbase + 16));
+            }
         }
         unsigned bf[8][2];
+        if constexpr (MATRIX_LOAD) {
 #pragma unroll
-        for (int ni = 0; ni < 8; ++ni) {
-            const int c = col_base + ni * 8 + group;
-            bf[ni][0] = convrot_lds(b + (c * CONVROT_STRIDE + kbase));
-            bf[ni][1] = convrot_lds(b + (c * CONVROT_STRIDE + kbase + 16));
+            for (int ni = 0; ni < 8; ni += 2) {
+                const int c = col_base + ni * 8 + (lane & 7) + (lane >> 4) * 8;
+                const int k_panel = ki * 32 + ((lane >> 3) & 1) * 16;
+                unsigned pair[4];
+                convrot_ldsm_x4(pair, b + c * CONVROT_STRIDE + k_panel);
+                bf[ni][0] = pair[0];
+                bf[ni][1] = pair[1];
+                bf[ni + 1][0] = pair[2];
+                bf[ni + 1][1] = pair[3];
+            }
+        } else {
+#pragma unroll
+            for (int ni = 0; ni < 8; ++ni) {
+                const int c = col_base + ni * 8 + group;
+                bf[ni][0] = convrot_lds(b + (c * CONVROT_STRIDE + kbase));
+                bf[ni][1] = convrot_lds(b + (c * CONVROT_STRIDE + kbase + 16));
+            }
         }
 #pragma unroll
         for (int mi = 0; mi < 2; ++mi) {
@@ -405,7 +426,7 @@ __device__ __forceinline__ void convrot_store_one(__nv_bfloat16* __restrict__ y,
     }
 }
 
-// ptxas sm_89: 124 registers, 0 spills.
+template <bool MATRIX_LOAD>
 __device__ __forceinline__ void convrot_product_tile(
     const int8_t* __restrict__ codes, const float* __restrict__ scales,
     const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
@@ -443,7 +464,7 @@ __device__ __forceinline__ void convrot_product_tile(
             convrot_cp_wait<0>();
         }
         __syncthreads();
-        convrot_mma_tile(smem + stage * CONVROT_STAGE, acc, warp_m, warp_n, group, t4);
+        convrot_mma_tile<MATRIX_LOAD>(smem + stage * CONVROT_STAGE, acc, warp_m, warp_n, group, t4, lane);
         __syncthreads();
         stage ^= 1;
     }
@@ -479,11 +500,11 @@ __device__ __forceinline__ void convrot_product_tile(
 extern "C" __global__ void __maxnreg__(124) convrot_product(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {
-    convrot_product_tile(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
+    convrot_product_tile<false>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
 }
 
 extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {
-    convrot_product_tile(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
+    convrot_product_tile<true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
 }

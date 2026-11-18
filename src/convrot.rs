@@ -1965,12 +1965,24 @@ mod device {
                 "cuobjdump resources sm_{sm} status {} {usage_err}",
                 resources.status
             );
-            for name in ["convrot_product", "convrot_product_m_fast"] {
+            for (name, want_lds, want_ldsm) in [
+                ("convrot_product", 54, 0),
+                ("convrot_product_m_fast", 6, 12),
+            ] {
                 let body = function_sass(&text, name)
                     .with_context(|| format!("{name} missing from cuobjdump"))?;
+                let ops = sass_ops(body);
+                let count = |op| ops.iter().filter(|&&code| code == op).count();
+                let imma = count("IMMA.16832.S8.S8");
+                let lds = count("LDS");
+                let ldsm = count("LDSM.16.M88.4");
+                let barriers = ops
+                    .iter()
+                    .filter(|code| code.starts_with("BAR.SYNC"))
+                    .count();
                 ensure!(
-                    body.contains("IMMA.16832.S8.S8"),
-                    "sm_{sm} {name} lacks IMMA.16832.S8.S8"
+                    imma == 32 && lds == want_lds && ldsm == want_ldsm && barriers == 2,
+                    "sm_{sm} {name} IMMA={imma} LDS={lds} LDSM={ldsm} BAR={barriers}"
                 );
                 let ldg = body.matches("LDG.E.CONSTANT").count();
                 ensure!(ldg == 20, "sm_{sm} {name} scale LDG.E.CONSTANT {ldg}");
@@ -1981,7 +1993,7 @@ mod device {
                     "sm_{sm} {name} REG={reg} STACK={stack} LOCAL={local}"
                 );
                 println!(
-                    "CONVROT_PRODUCT_SASS sm_{sm} {name} IMMA.16832.S8.S8 LDG={ldg} REG={reg} STACK={stack} LOCAL={local}"
+                    "CONVROT_PRODUCT_SASS sm_{sm} {name} IMMA={imma} LDS={lds} LDSM={ldsm} BAR={barriers} LDG={ldg} REG={reg} STACK={stack} LOCAL={local}"
                 );
             }
         }
