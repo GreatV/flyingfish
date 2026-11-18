@@ -127,8 +127,10 @@ extern "C" __global__ void convrot_hadamard_table(__nv_bfloat16* table, int grou
 // The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
 // grid: (ceil(rows/16), 1, k/group).
 // Dynamic smem is 16*group bf16, then 8*8*16 bf16. Bytes are 32*group+2048.
-extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x, float* __restrict__ y,
-                                             const __nv_bfloat16* __restrict__ table, int rows, int k, int group) {
+template <bool SILU>
+__device__ __forceinline__ void convrot_group_dot_tile(
+    const __nv_bfloat16* __restrict__ x, float* __restrict__ y,
+    const __nv_bfloat16* __restrict__ table, int rows, int k, int group) {
     constexpr int THREADS = 256;
     constexpr int STRIDE = 16;
     const unsigned real = static_cast<unsigned>(group);
@@ -152,8 +154,18 @@ extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x
         const int gr = row0 + r;
         uint4 packed = make_uint4(0u, 0u, 0u, 0u);
         if (gr < rows) {
-            const __nv_bfloat16* src = x + static_cast<long long>(gr) * k + x_col0 + c;
+            const __nv_bfloat16* src = x + static_cast<long long>(gr) * (SILU ? 2LL * k : k) + x_col0 + c;
             packed = convrot_load_u128(src);
+            if constexpr (SILU) {
+                const uint4 upper = convrot_load_u128(src + k);
+                auto* lower = reinterpret_cast<__nv_bfloat16*>(&packed);
+                const auto* up = reinterpret_cast<const __nv_bfloat16*>(&upper);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float u = __bfloat162float(up[j]);
+                    lower[j] = __hmul(__float2bfloat16(u / (1.0f + expf(-u))), lower[j]);
+                }
+            }
         }
         const int panel = c >> 4;
         const int local = c & 15;
@@ -194,6 +206,16 @@ extern "C" __global__ void convrot_group_dot(const __nv_bfloat16* __restrict__ x
                 y[static_cast<long long>(row0 + r) * k + x_col0 + n0 + c] = acc[t];
         }
     }
+}
+
+extern "C" __global__ void convrot_group_dot(
+    const __nv_bfloat16* x, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
+    convrot_group_dot_tile<false>(x, y, table, rows, k, group);
+}
+
+extern "C" __global__ void convrot_group_dot_silu(
+    const __nv_bfloat16* gu, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
+    convrot_group_dot_tile<true>(gu, y, table, rows, k, group);
 }
 
 // Block 256. Dynamic smem is tile_rows * k f32. Each live row is loaded once, coalesced.

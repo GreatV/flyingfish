@@ -358,7 +358,7 @@ mod tests {
 pub struct ConvrotFns {
     linear: crate::backend::gpu::CudaFunction,
     hadamard: crate::backend::gpu::CudaFunction,
-    group_dot: crate::backend::gpu::CudaFunction,
+    group_dot: [crate::backend::gpu::CudaFunction; 2],
     quantize: crate::backend::gpu::CudaFunction,
     product: [crate::backend::gpu::CudaFunction; 2],
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
@@ -399,6 +399,7 @@ pub struct ConvrotArgs {
     pub n: i32,
     pub group: i32,
     pub product_m_fast: bool,
+    pub fuse_silu: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -470,15 +471,20 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         product_function(&module, true)?,
     ];
     let hadamard = module.load_function("convrot_hadamard_table")?;
-    let group_dot = module.load_function("convrot_group_dot")?;
+    let group_dot = [
+        module.load_function("convrot_group_dot")?,
+        module.load_function("convrot_group_dot_silu")?,
+    ];
     let optin = usize::try_from(ctx.attribute(
         cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
     )?)?;
     let max_group = max_group(optin)?;
-    group_dot.set_attribute(
-        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        i32::try_from(group_dot_smem(max_group))?,
-    )?;
+    for function in &group_dot {
+        function.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            i32::try_from(group_dot_smem(max_group))?,
+        )?;
+    }
     let quantize = module.load_function("convrot_quantize")?;
     let quant_dyn = optin / 4 * 4;
     quantize.set_attribute(
@@ -512,6 +518,7 @@ pub fn launch_device(
         .checked_mul(args.n)
         .context("convrot output extent")?;
     if args.rows < i32::try_from(TENSOR_CORE_ROWS)? {
+        ensure!(!args.fuse_silu, "fused ConvRot requires tensor-core rows");
         launch_rows(stream, &fns.linear, args, total)
     } else {
         launch_groups(stream, fns, args)
@@ -633,7 +640,7 @@ fn launch_group_dot(
     let table_ptr = read.0;
     unsafe {
         stream
-            .launch_builder(&fns.group_dot)
+            .launch_builder(&fns.group_dot[usize::from(args.fuse_silu)])
             .arg(&args.x)
             .arg(&args.rotated)
             .arg(&table_ptr)
@@ -1086,6 +1093,7 @@ mod device {
                 n: i32::try_from(n)?,
                 group: i32::try_from(group)?,
                 product_m_fast: false,
+                fuse_silu: false,
             },
         )?;
         stream.synchronize()?;
@@ -1741,6 +1749,7 @@ mod device {
                 n: i32::try_from(n)?,
                 group: 256,
                 product_m_fast: m_fast,
+                fuse_silu: false,
             },
         )?;
         stream.synchronize()?;
@@ -2088,6 +2097,136 @@ mod device {
             + got.len().abs_diff(expected.len())
     }
 
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn convrot_silu_matches_separate_activation() -> Result<()> {
+        use crate::backend::gpu::PushKernelArg;
+
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let fns = load_convrot(&device.ctx)?;
+        let silu =
+            crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
+        let (k, n, group) = (14336usize, 5376usize, 256usize);
+        let weight = stream.clone_htod(&salted_weight(n, k, 0))?;
+        let scale = stream.clone_htod(&salted_wscale(n, 0))?;
+
+        for rows in [17usize, 1509, 1501] {
+            let mut gu = vec![bf16::ZERO; rows * 2 * k];
+            for (row, pair) in gu.chunks_exact_mut(2 * k).enumerate() {
+                let (lower, upper) = pair.split_at_mut(k);
+                for col in 0..k {
+                    lower[col] = bf16::from_f32(((row * 13 + col * 71) % 251) as f32 / 32.0 - 4.0);
+                    upper[col] = bf16::from_f32(((row * 37 + col * 41) % 127) as f32 / 16.0 - 4.0);
+                }
+            }
+            let control = (rows - 1) * k + k - group;
+            if rows == 1501 {
+                let last = &mut gu[(rows - 1) * 2 * k..];
+                last[k - group..k].fill(bf16::ZERO);
+                last[2 * k - group..].fill(bf16::ZERO);
+                last[k - group] = bf16::from_f32(3.25);
+                last[2 * k - group] = bf16::from_f32(0.75);
+            }
+
+            let input = stream.clone_htod(&gu)?;
+            let mut gated = stream.alloc_zeros::<bf16>(rows * k)?;
+            let (gup, gap) = (input.device_ptr(stream).0, gated.device_ptr(stream).0);
+            let cfg = crate::backend::cuda::ops::silu_mul_grid(rows, k, gup, gap)?;
+            let rows_i = i32::try_from(rows)?;
+            let k_i = i32::try_from(k)?;
+            unsafe {
+                stream
+                    .launch_builder(&silu)
+                    .arg(&gup)
+                    .arg(&gap)
+                    .arg(&rows_i)
+                    .arg(&k_i)
+                    .arg(&3i32)
+                    .launch(cfg)?;
+            }
+
+            let run = |x, fuse_silu| -> Result<Ran> {
+                let rotated = stream.alloc_zeros::<f32>((rows + 1) * k)?;
+                let codes = stream.alloc_zeros::<i8>((rows + 1) * k)?;
+                let scales = stream.alloc_zeros::<f32>(rows + 1)?;
+                let y = stream.alloc_zeros::<bf16>((rows + 1) * n)?;
+                launch_device(
+                    stream,
+                    &fns,
+                    &ConvrotArgs {
+                        x,
+                        qweight: weight.device_ptr(stream).0,
+                        wscale: scale.device_ptr(stream).0,
+                        y: y.device_ptr(stream).0,
+                        rotated: rotated.device_ptr(stream).0,
+                        codes: codes.device_ptr(stream).0,
+                        scales: scales.device_ptr(stream).0,
+                        rows: rows_i,
+                        k: k_i,
+                        n: i32::try_from(n)?,
+                        group: i32::try_from(group)?,
+                        product_m_fast: false,
+                        fuse_silu,
+                    },
+                )?;
+                stream.synchronize()?;
+                let ran = Ran {
+                    y: stream.clone_dtoh(&y)?,
+                    rotated: stream.clone_dtoh(&rotated)?,
+                    codes: stream.clone_dtoh(&codes)?,
+                    scales: stream.clone_dtoh(&scales)?,
+                };
+                ensure!(
+                    ran.rotated[rows * k..].iter().all(|v| v.to_bits() == 0)
+                        && ran.codes[rows * k..].iter().all(|&v| v == 0)
+                        && ran.scales[rows].to_bits() == 0
+                        && ran.y[rows * n..].iter().all(|v| v.to_bits() == 0),
+                    "ConvRot SiLU tail guard rows={rows} fused={fuse_silu}"
+                );
+                Ok(ran)
+            };
+
+            let separate = run(gap, false)?;
+            let fused = run(gup, true)?;
+            let xr = count_f32(&separate.rotated, &fused.rotated);
+            let codes = count_i8(&separate.codes, &fused.codes);
+            let scales = count_f32(&separate.scales, &fused.scales);
+            let y = bit_diff(&separate.y, &fused.y);
+            println!(
+                "CONVROT_SILU rows={rows} k={k} n={n} xr={xr} codes={codes} scales={scales} y={y}"
+            );
+            ensure!(
+                xr == 0 && codes == 0 && scales == 0 && y == 0,
+                "fused SiLU rows={rows} differs"
+            );
+
+            if rows == 1501 {
+                let actual = stream.clone_dtoh(&gated.slice(control..control + 1))?;
+                ensure!(
+                    actual == [bf16::from_f32(1.6484375)],
+                    "SiLU control two-round value"
+                );
+                stream.memcpy_htod(
+                    &[bf16::from_f32(1.65625)],
+                    &mut gated.slice_mut(control..control + 1),
+                )?;
+                let mutant = run(gap, false)?;
+                let differing = count_f32(&separate.rotated, &mutant.rotated);
+                let target = control..control + group;
+                let inside = count_f32(&separate.rotated[target.clone()], &mutant.rotated[target]);
+                println!(
+                    "CONVROT_SILU_ROUND_CONTROL rows={rows} differ={differing} inside={inside}"
+                );
+                ensure!(
+                    differing == group && inside == group,
+                    "one-round SiLU control escaped selected group"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn salted_weight(n: usize, k: usize, salt: usize) -> Vec<i8> {
         (0..n)
             .flat_map(|col| (0..k).map(move |i| code(col + salt * n, i)))
@@ -2135,6 +2274,7 @@ mod device {
                 n: i32::try_from(n)?,
                 group: i32::try_from(group)?,
                 product_m_fast: false,
+                fuse_silu: false,
             },
         )?;
         stream.synchronize()?;
@@ -2177,6 +2317,7 @@ mod device {
                 n: 0,
                 group: i32::try_from(group)?,
                 product_m_fast: false,
+                fuse_silu: false,
             },
         )?;
         stream.synchronize()?;
@@ -2215,6 +2356,7 @@ mod device {
                     n: i32::try_from(n)?,
                     group: i32::try_from(group)?,
                     product_m_fast: false,
+                    fuse_silu: false,
                 },
             )?;
             stream.synchronize()?;

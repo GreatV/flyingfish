@@ -2051,32 +2051,41 @@ fn apply_linear(
             wscale,
             group,
             ..
-        } => apply_int8(c, *qweight, wscale, *group, x, y, scratch),
+        } => apply_int8(c, (*qweight, wscale.tensor, *group), x, y, scratch, false),
         BlockLinear::LowRank { down, up, .. } => apply_low_rank(c, *down, *up, x, y, scratch),
     }
 }
 
 fn apply_int8(
     c: &BlockContext<'_>,
-    qweight: Tensor<i8, 2>,
-    wscale: &VectorWeight<f32>,
-    group: u32,
+    (qweight, wscale, group): (Tensor<i8, 2>, Tensor<f32, 1>, u32),
     x: Tensor<bf16, 2>,
     y: Tensor<bf16, 2>,
     scratch: Option<StoredPtrs>,
+    fuse_silu: bool,
 ) -> Result<()> {
     let ptrs = scratch.context("stored linear without scratch")?;
     let rows = x.shape[0] as usize;
-    let k = x.shape[1] as usize;
+    let k = qweight.shape[1] as usize;
     let n = y.shape[1] as usize;
     ensure!(
         qweight.shape == [u32::try_from(n)?, u32::try_from(k)?]
-            && wscale.tensor.shape == [u32::try_from(n)?]
+            && wscale.shape == [u32::try_from(n)?]
+            && x.shape[1] as usize == k * (1 + usize::from(fuse_silu))
             && y.shape[0] as usize == rows
             && rows <= ptrs.rows
             && k <= ptrs.k,
         "convrot shape"
     );
+    if fuse_silu {
+        ensure!(
+            rows >= crate::convrot::TENSOR_CORE_ROWS
+                && x.stride == [u64::from(x.shape[1]), 1]
+                && k.is_multiple_of(8),
+            "fused ConvRot input extent"
+        );
+        crate::backend::cuda::contracts::no_overlap(&x, &y, "gate/up", "ConvRot output")?;
+    }
     let launch = c.kernels.stored_launch(c.s.context())?;
     // group_dot reads bf16. linear reads the upcast f32.
     let x_ptr = if rows >= crate::convrot::TENSOR_CORE_ROWS {
@@ -2098,7 +2107,7 @@ fn apply_int8(
         &crate::convrot::ConvrotArgs {
             x: x_ptr,
             qweight: qweight.ptr,
-            wscale: wscale.tensor.ptr,
+            wscale: wscale.ptr,
             y: y.ptr,
             rotated: ptrs.rotated,
             codes: ptrs.codes,
@@ -2108,6 +2117,7 @@ fn apply_int8(
             n: i32::try_from(n)?,
             group: i32::try_from(group)?,
             product_m_fast: ptrs.product_m_fast,
+            fuse_silu,
         },
     )
 }
@@ -2186,6 +2196,7 @@ fn apply_shared_qkv(
             n: 0,
             group,
             product_m_fast: false,
+            fuse_silu: false,
         },
     )?;
     for ((qweight, wscale, _), out) in [(q.0, q.1, q.2), (k.0, k.1, k.2), (v.0, v.1, v.2)]
@@ -2209,6 +2220,7 @@ fn apply_shared_qkv(
                 n: i32::try_from(n)?,
                 group,
                 product_m_fast: false,
+                fuse_silu: false,
             },
         )?;
     }
@@ -2500,6 +2512,11 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
 ) -> Result<()> {
     let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
     let (chunk, gate_up_m_fast) = (work.chunk, work.gate_up_m_fast);
+    let fused_down = if !LORA && !SHIFT_INPUT {
+        int8_linear(&w.linears[FF_OUT])
+    } else {
+        None
+    };
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
         let scratch = scratch.map(|mut ptrs| {
             ptrs.product_m_fast =
@@ -2532,6 +2549,20 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
                 work.fixed_lora,
             )?;
         }
+        let output = rows_view(&work.normed, s, start * h, n, h, h)?;
+        if let Some(weights) = fused_down
+            && n >= crate::convrot::TENSOR_CORE_ROWS
+        {
+            apply_int8(
+                c,
+                weights,
+                work.hidden.prefix_rows(u32::try_from(n)?)?,
+                output,
+                scratch,
+                true,
+            )?;
+            continue;
+        }
         let hidden = work.hidden.ptr + if SHIFT_INPUT { 256 } else { 0 };
         let gated = work.gated.ptr;
         let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
@@ -2544,11 +2575,7 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
                 .arg(&3i32)
                 .launch(cfg)?;
         }
-        base(
-            FF_OUT,
-            work.gated.prefix_rows(u32::try_from(n)?)?,
-            rows_view(&work.normed, s, start * h, n, h, h)?,
-        )?;
+        base(FF_OUT, work.gated.prefix_rows(u32::try_from(n)?)?, output)?;
         if LORA {
             lora_pair(
                 c,
