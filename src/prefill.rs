@@ -66,6 +66,18 @@ pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize
     ensure!(end <= total, "prefill chunk exceeds the request");
     Ok(end)
 }
+/// Schedule visits of one component times the workload's request count. A one-shot request count is 1.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn placement_visits(per_request: usize, requests: usize) -> Result<usize> {
+    ensure!(
+        per_request > 0 && requests > 0,
+        "dense placement visit count"
+    );
+    per_request
+        .checked_mul(requests)
+        .context("dense placement visit count overflow")
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DensePlacement {
     pub slots: Vec<Option<usize>>,
@@ -100,6 +112,13 @@ impl DensePlacement {
         host_bytes: usize,
     ) -> Result<Self> {
         Self::with_allocations(layers, layers, host_layers, device_bytes, host_bytes, 0, 2)
+    }
+
+    /// Host bytes spent for `visits`. One visit spends none.
+    #[cfg(any(test, feature = "cuda"))]
+    pub(crate) fn host_budget_for_visits(host_bytes: usize, visits: usize) -> Result<usize> {
+        ensure!(visits > 0, "dense placement visit count");
+        Ok(if visits == 1 { 0 } else { host_bytes })
     }
 
     pub(crate) fn with_allocations(
@@ -871,6 +890,44 @@ mod tests {
         assert_eq!(plan.disk_bytes, 16);
         assert!(DensePlacement::new(&layers, Some(&host_layers[..3]), device, host).is_err());
         assert!(DensePlacement::new(&layers, Some(&[10, 9, 0, 5]), device, host).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dense_visit_count_keeps_a_reused_layer_on_the_host_tier() -> anyhow::Result<()> {
+        use super::{DensePlacement, placement_visits};
+        let layers = vec![100usize; 50];
+        let device = 200usize;
+        let host = 25 * 100;
+        let today = DensePlacement::new(&layers, None, device, host)?;
+        assert_eq!(today.host.iter().filter(|on| **on).count(), 25);
+        let streamed = today
+            .slots
+            .iter()
+            .zip(&layers)
+            .filter_map(|(slot, bytes)| slot.is_some().then_some(*bytes))
+            .sum::<usize>();
+        let once_budget = DensePlacement::host_budget_for_visits(host, placement_visits(1, 1)?)?;
+        let once = DensePlacement::new(&layers, None, device, once_budget)?;
+        assert_eq!(once_budget, 0);
+        assert_eq!(once.host_bytes, 0);
+        assert!(once.host.iter().all(|on| !on));
+        assert_eq!(once.disk_bytes, streamed);
+        assert_eq!(once.slots, today.slots);
+        let multi_budget = DensePlacement::host_budget_for_visits(host, placement_visits(6, 1)?)?;
+        let multi = DensePlacement::new(&layers, None, device, multi_budget)?;
+        assert_eq!(multi.host, today.host);
+        assert_eq!(multi.host_bytes, today.host_bytes);
+        assert_eq!(multi.disk_bytes, today.disk_bytes);
+        let resident_budget =
+            DensePlacement::host_budget_for_visits(host, placement_visits(1, 4)?)?;
+        let resident = DensePlacement::new(&layers, None, device, resident_budget)?;
+        assert_eq!(resident.host, today.host);
+        assert!(resident.host_bytes > 0);
+        eprintln!(
+            "PASS dense_visit_count once={} multi={} resident={}",
+            once.host_bytes, multi.host_bytes, resident.host_bytes
+        );
         Ok(())
     }
 

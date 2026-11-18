@@ -3855,14 +3855,16 @@ struct PlacedLayers {
 }
 
 /// Device budget and host budget for `layers`, then the `DensePlacement` those budgets produce. `host_available` is
-/// measured only when the layers do not all fit the device budget.
+/// measured only when the layers do not all fit the device budget. Visit count 1 spends no host budget.
 fn plan_dense_layers(
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
     (free, total, host_available): (usize, usize, Option<usize>),
     slot_count: usize,
+    visits: usize,
 ) -> Result<(crate::prefill::DensePlacement, PlacementFacts)> {
     use crate::prefill::DensePlacement;
+    DensePlacement::host_budget_for_visits(0, visits)?;
     let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, media)?;
     if placement != Placement::Derived {
         let slots = 2 * layers.iter().copied().max().context("no streamed layers")?;
@@ -3889,7 +3891,9 @@ fn plan_dense_layers(
             "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
         );
         let host_bytes = match placement {
-            Placement::Derived => available - reserved,
+            Placement::Derived => {
+                DensePlacement::host_budget_for_visits(available - reserved, visits)?
+            }
             #[cfg(test)]
             Placement::Streamed => available - reserved,
             #[cfg(test)]
@@ -3936,6 +3940,7 @@ fn place_layers(
     base: &mut Source<'_>,
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
+    visits: usize,
     name: impl Fn(usize) -> String,
     roles: &[&str],
 ) -> Result<PlacedLayers> {
@@ -3966,6 +3971,7 @@ fn place_layers(
         placement,
         (free, total, host_available),
         2,
+        visits,
     )?;
     let used_slots = plan
         .slots
@@ -4313,12 +4319,14 @@ fn stored_compact(
     device_cap: usize,
     largest: usize,
     granularity: usize,
+    visits: usize,
 ) -> Result<(crate::prefill::DensePlacement, usize, usize, Option<usize>)> {
     use crate::prefill::DensePlacement;
     ensure!(
         charged_device.len() == charged_slots.len() && charged_device.len() == kept_source.len(),
         "stored placement extent"
     );
+    DensePlacement::host_budget_for_visits(0, visits)?;
     let mut device_budget = device_cap;
     if placement != Placement::Derived {
         let slots = 2 * charged_slots
@@ -4369,7 +4377,7 @@ fn stored_compact(
             .checked_sub(reserve)
             .context("stored pinned staging and host reserve exceed available RAM")?;
         match placement {
-            Placement::Derived => budget,
+            Placement::Derived => DensePlacement::host_budget_for_visits(budget, visits)?,
             #[cfg(test)]
             Placement::Streamed => budget,
             #[cfg(test)]
@@ -4406,6 +4414,7 @@ fn place_stored_layers(
     sizing: &DenseSizing,
     owned: usize,
     placement: Placement,
+    visits: usize,
 ) -> Result<(Option<DenseTier>, StoredOffsets)> {
     use crate::prefill::DensePlacement;
     let dropped = spec
@@ -4514,6 +4523,7 @@ fn place_stored_layers(
         device_cap,
         sizing.largest,
         granularity,
+        visits,
     )?;
     let (compact, device_budget, host_budget, host_available) = stored_compact(
         placement,
@@ -4523,6 +4533,7 @@ fn place_stored_layers(
         device_cap,
         sizing.largest,
         granularity,
+        visits,
     )?;
     let facts = PlacementFacts {
         free_bytes: free,
@@ -4841,7 +4852,7 @@ impl Dit {
         (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
         mut base: Source<'_>,
         mut lora: Option<Source<'_>>,
-        placement: Placement,
+        (placement, visits): (Placement, usize),
     ) -> Result<Self> {
         let hyperflow = spec.is_hyperflow()?;
         ensure!(
@@ -4977,7 +4988,7 @@ impl Dit {
         }
         let (tier, blocks) = if hyperflow {
             let (tier, packed) =
-                place_stored_layers(d, &mut base, spec, &sizing, owned, placement)?;
+                place_stored_layers(d, &mut base, spec, &sizing, owned, placement, visits)?;
             #[cfg(test)]
             trace_placement_pool(d, "after_streaming_slots")?;
             base.pack_vectors(s, spec)?;
@@ -5042,6 +5053,7 @@ impl Dit {
                     0,
                 ),
                 placement,
+                visits,
                 |layer| format!("transformer_blocks.{layer}"),
                 &LINEAR_ROLES,
             )?;
@@ -5656,7 +5668,7 @@ type ImagePlacementChooser<'a> = dyn FnMut(
     + 'a;
 
 enum ImagePlacement<'a> {
-    Single(Placement),
+    Single(Placement, usize),
     Resident(&'a mut ImagePlacementChooser<'a>),
 }
 
@@ -5668,7 +5680,7 @@ impl ImageDit {
         layout: &ImageLayout,
         dir: &Path,
         manifest: &TensorManifest,
-        placement: Placement,
+        (placement, visits): (Placement, usize),
     ) -> Result<Self> {
         Self::with_placement(
             d,
@@ -5677,7 +5689,7 @@ impl ImageDit {
             layout,
             dir,
             manifest,
-            ImagePlacement::Single(placement),
+            ImagePlacement::Single(placement, visits),
         )
     }
 
@@ -5804,7 +5816,7 @@ impl ImageDit {
             Ok(plan)
         };
         let (placed, device_after, prepared_ffn) = match placement {
-            ImagePlacement::Single(mode) => (
+            ImagePlacement::Single(mode, visits) => (
                 place_layers(
                     "dit",
                     d,
@@ -5817,6 +5829,7 @@ impl ImageDit {
                         0,
                     ),
                     mode,
+                    visits,
                     name,
                     &LINEAR_ROLES,
                 )?,
@@ -6431,8 +6444,16 @@ impl Conditioner {
         (layers, capacity, media): (usize, usize, usize),
         base: Source<'_>,
         placement: Placement,
+        requests: usize,
     ) -> Result<Self> {
-        Self::with_plan(d, spec, (layers, capacity, media), base, (placement, None))
+        Self::with_plan(
+            d,
+            spec,
+            (layers, capacity, media),
+            base,
+            (placement, None),
+            requests,
+        )
     }
 
     pub(super) fn with_plan(
@@ -6441,6 +6462,7 @@ impl Conditioner {
         (layers, capacity, media): (usize, usize, usize),
         mut base: Source<'_>,
         (placement, plan): (Placement, Option<crate::prefill::DensePlacement>),
+        requests: usize,
     ) -> Result<Self> {
         ensure!(
             spec.architecture == crate::model_spec::Architecture::Qwen3Vl
@@ -6467,12 +6489,14 @@ impl Conditioner {
         let tier = if let Some(plan) = plan {
             bind_layers("conditioner", d, &mut base, &bytes, plan, name, &TEXT_ROLES)?
         } else {
+            let visits = crate::prefill::placement_visits(1, requests)?;
             place_layers(
                 "conditioner",
                 d,
                 &mut base,
                 (&bytes, &bytes, largest, owned, media),
                 placement,
+                visits,
                 name,
                 &TEXT_ROLES,
             )?
@@ -6888,7 +6912,10 @@ pub(crate) fn image_sample_trace(
         layout,
         &dir,
         &manifest,
-        Placement::Derived,
+        (
+            Placement::Derived,
+            crate::prefill::placement_visits(plan.len(), 1)?,
+        ),
     )?;
     let kernels = BlockKernels::new(&device.ctx)?;
     let s = &device.stream;
@@ -10895,6 +10922,7 @@ mod tests {
                         0,
                     ),
                     placement,
+                    crate::prefill::placement_visits(2, 1)?,
                     |layer| format!("transformer_blocks.{layer}"),
                     &LINEAR_ROLES,
                 )?;
@@ -11289,7 +11317,10 @@ mod tests {
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
             Some(Source::new(&lora_dir, &lora_manifest)),
-            Placement::from_env()?,
+            (
+                Placement::from_env()?,
+                crate::prefill::placement_visits(plan.len(), 1)?,
+            ),
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
@@ -11553,7 +11584,10 @@ mod tests {
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
             Some(Source::new(&lora_dir, &lora_manifest)),
-            Placement::from_env()?,
+            (
+                Placement::from_env()?,
+                crate::prefill::placement_visits(plan.len(), 1)?,
+            ),
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
@@ -12089,6 +12123,7 @@ mod tests {
                 (layers, capacity, 0),
                 Source::new(&gate.encoder, &gate.manifest),
                 Placement::from_env()?,
+                1,
             )?;
             let mut defects = Vec::new();
             for (((cell, inputs), text_ref), vision) in
@@ -12272,6 +12307,7 @@ mod tests {
             (50, capacity, media),
             Source::new(&gate.encoder, &gate.manifest),
             Placement::from_env()?,
+            1,
         )?;
         let mut defects = Vec::new();
         for ((cell, inputs), text_ref) in gate.cells.iter().zip(&text_refs) {
@@ -13582,7 +13618,10 @@ mod tests {
                 &t2i_layout,
                 &dir,
                 &manifest,
-                placement,
+                (
+                    placement,
+                    crate::prefill::placement_visits(schedule.timesteps.len(), 1)?,
+                ),
             )?;
             let kernels = BlockKernels::new(&device.ctx)?;
             let context = BlockContext {
@@ -13776,7 +13815,10 @@ mod tests {
                 &edit_layout,
                 &dir,
                 &manifest,
-                placement,
+                (
+                    placement,
+                    crate::prefill::placement_visits(schedule.timesteps.len(), 1)?,
+                ),
             )?;
             let kernels = BlockKernels::new(&device.ctx)?;
             let context = BlockContext {
@@ -14038,6 +14080,7 @@ mod tests {
             Rc::new(Closure::new(true, "MiniMax-H3-Image 4096 DiT gate".into())),
         )?;
         let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &row_plan)?;
+        let visits = crate::prefill::placement_visits(schedule.timesteps.len(), 1)?;
         let mut dit = ImageDit::new(
             &device,
             &mut blas,
@@ -14045,7 +14088,7 @@ mod tests {
             &layout,
             &dir,
             &manifest,
-            Placement::Derived,
+            (Placement::Derived, visits),
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
@@ -14094,6 +14137,7 @@ mod tests {
                     facts.host_available_bytes,
                 ),
                 slot_count,
+                visits,
             )?;
             let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
             let host = plan.host.iter().filter(|flag| **flag).count();
@@ -16484,7 +16528,10 @@ mod tests {
             (0, &layout),
             Source::new(&model, &manifest),
             None,
-            Placement::Derived,
+            (
+                Placement::Derived,
+                crate::prefill::placement_visits(video_grid.timesteps.len(), 1)?,
+            ),
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {

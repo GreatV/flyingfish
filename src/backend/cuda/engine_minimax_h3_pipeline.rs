@@ -161,6 +161,7 @@ fn condition_prompt(
                 (TEXT_ENCODER_LAYER, count, 0),
                 Source::new(&encoder, &manifest),
                 Placement::Derived,
+                1,
             )?,
             Vec::new(),
             None,
@@ -194,6 +195,7 @@ fn condition_prompt(
             (TEXT_ENCODER_LAYER, count, media),
             Source::new(&encoder, &manifest),
             Placement::Derived,
+            1,
         )?;
         let prepared = tower.prepare(device, blas, &input, count, 0)?;
         let encoded = tower.encode(&device.stream, blas, prepared, None)?;
@@ -476,7 +478,10 @@ fn prepare_transformer(
         adapter
             .as_ref()
             .map(|(dir, manifest, _)| Source::new(dir, manifest)),
-        Placement::Derived,
+        (
+            Placement::Derived,
+            crate::prefill::placement_visits(plan.len(), 1)?,
+        ),
     )?;
     Ok((dit, table, adaln_plan, video_grid, audio_grid, scale))
 }
@@ -1467,6 +1472,7 @@ impl ImageSession {
             (TEXT_ENCODER_LAYER, count, temporary),
             Source::new(&dir, &text_manifest),
             (Placement::Derived, Some(text_plan)),
+            count,
         )?;
         conditioner.prepare(&text_blas, count)?;
         let decode = ImageDecodeStage::bind(
