@@ -6000,7 +6000,7 @@ mod tests {
             let weight: Vec<bf16> = (0..dim)
                 .map(|i| bf16::from_f32(0.5 + (i * 13 % 29) as f32 / 29.0))
                 .collect();
-            let table: Vec<bf16> = (0..rows * rotary)
+            let table: Vec<bf16> = (0..=rows * rotary)
                 .map(|i| bf16::from_f32((i as f32 * 0.017).cos()))
                 .collect();
             let weight = s.clone_htod(&weight)?;

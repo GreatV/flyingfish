@@ -262,6 +262,7 @@ fn build_rocm(out: &std::path::Path) {
     println!("cargo:rerun-if-changed=kernels/gpu_compat.cuh");
     println!("cargo:rerun-if-changed=kernels/q38_contract.cuh");
     println!("cargo:rerun-if-changed=kernels/gdn/gdn_recurrent.cuh");
+    println!("cargo:rerun-if-changed=kernels/rotary.cuh");
     println!("cargo:rerun-if-env-changed=HIP_HOME");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=PATH");
