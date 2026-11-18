@@ -565,6 +565,7 @@ mod end_to_end {
         let mut audio = unsafe { s.alloc::<half::bf16>(2 * length * total)? };
         engine.synthesize(&mut workspace, &d_cond, 25, &d_init, &mut audio)?;
         let got = super::to_f32(s.clone_dtoh(&audio)?);
+        ensure!(got.iter().all(|v| v.is_finite()), "non-finite final audio");
         let max_abs = got
             .iter()
             .zip(&want)
@@ -586,7 +587,16 @@ mod end_to_end {
         let negated: Vec<half::bf16> = initial.iter().map(|v| -v).collect();
         let d_neg = s.clone_htod(&negated)?;
         engine.synthesize(&mut workspace, &d_cond, 25, &d_neg, &mut audio)?;
-        let control = super::to_f32(s.clone_dtoh(&audio)?)
+        let control_audio = super::to_f32(s.clone_dtoh(&audio)?);
+        ensure!(
+            control_audio.iter().all(|v| v.is_finite()),
+            "non-finite negated-input audio"
+        );
+        ensure!(
+            control_audio != got,
+            "distinct inputs produced identical audio"
+        );
+        let control = control_audio
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
