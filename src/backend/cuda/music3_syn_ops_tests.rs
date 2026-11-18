@@ -14,11 +14,33 @@ mod gates {
     }
 
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL=<dir>"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
     fn music3_syn_real_load_gpu() -> anyhow::Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
         let engine = Music3Syn::load(&model_dir()?, &device, 86)?;
+        let capture = std::fs::read(std::path::PathBuf::from(std::env::var(
+            "FF_MUSIC3_CAPTURE",
+        )?))?;
+        let view = safetensors::SafeTensors::deserialize(&capture)?;
+        let bias_input = super::tensor_bf16(&view, "bias_input")?;
+        let bias_want = super::tensor_bf16(&view, "bias_output")?;
+        let d_input = device.stream.clone_htod(&bias_input)?;
+        let dim = engine.spec.flow_dim() as usize;
+        let fourier_dim = engine.spec.fourier_dim as usize;
+        let mut d_output = device.stream.alloc_zeros::<half::bf16>(dim)?;
+        engine.linear_biased(
+            &engine.weights.flow.time_l1_w,
+            dim,
+            fourier_dim,
+            &d_input.slice(0..fourier_dim),
+            1,
+            &mut d_output.slice_mut(0..dim),
+            &engine.weights.flow.time_l1_b,
+        )?;
+        let bias_got = device.stream.clone_dtoh(&d_output)?;
+        anyhow::ensure!(bias_got == bias_want, "biased linear is not bit-exact");
+        println!("MUSIC3_BIAS bit_identical=true count={}", bias_got.len());
         assert_eq!(
             engine.weights.flow.blocks.len(),
             engine.spec.flow_layers as usize
@@ -319,6 +341,7 @@ mod vocoder_gate {
     use super::super::Device;
     use super::super::engine_music3_syn::Music3Syn;
     use anyhow::{Context, Result, ensure};
+    use cudarc::driver::PushKernelArg;
     use safetensors::SafeTensors;
 
     fn tensor_f32<'a>(view: &'a SafeTensors<'a>, name: &str) -> Result<Vec<f32>> {
@@ -350,6 +373,32 @@ mod vocoder_gate {
             "FF_MUSIC3_CAPTURE",
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
+        let snake_input = super::tensor_bf16(&view, "snake_input")?;
+        let snake_alpha = super::tensor_bf16(&view, "snake_alpha")?;
+        let snake_want = tensor_f32(&view, "snake_output")?;
+        ensure!(
+            snake_input.len() == snake_want.len() && snake_input.len() % snake_alpha.len() == 0,
+            "Snake fixture extent"
+        );
+        let snake_module = super::super::cubin::module(&device.ctx, "q38_common")?;
+        let snake = snake_module.load_function("snake_rows_bf16")?;
+        let d_snake_input = device.stream.clone_htod(&snake_input)?;
+        let d_snake_alpha = device.stream.clone_htod(&snake_alpha)?;
+        let mut d_snake_out = device.stream.alloc_zeros::<half::bf16>(snake_input.len())?;
+        unsafe {
+            device
+                .stream
+                .launch_builder(&snake)
+                .arg(&d_snake_input)
+                .arg(&d_snake_alpha)
+                .arg(&mut d_snake_out)
+                .arg(&(snake_input.len() as i64))
+                .arg(&(snake_alpha.len() as i32))
+                .launch(super::super::ops::flat(snake_input.len()))?;
+        }
+        let snake_got = super::to_f32(device.stream.clone_dtoh(&d_snake_out)?);
+        ensure!(snake_got == snake_want, "Snake output is not bit-exact");
+        println!("MUSIC3_SNAKE bit_identical=true count={}", snake_got.len());
         let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
             std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_SYN_OPS")?),
         )?)?;

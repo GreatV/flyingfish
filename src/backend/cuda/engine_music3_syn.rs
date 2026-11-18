@@ -7,6 +7,10 @@ use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 use half::bf16;
 use std::sync::Arc;
 
+/// Publisher Linear and Conv1d bias is added before the BF16 output round.
+pub(crate) const BIAS_MODE: super::linear::LinearBiasMode =
+    super::linear::LinearBiasMode::BeforeOutputRound;
+
 /// Native MiniMax-Music3 synthesis engine: condition encoder, BF16 flow
 /// transformer, FlowMatchEuler scheduler and vocoder, fed the condition
 /// stream produced by the autoregressive stage. Linears use the shared
@@ -231,7 +235,7 @@ impl Music3Syn {
                 u32::try_from(output)?,
                 u32::try_from(input)?,
                 bf16_bias(bias, &d.stream, output)?,
-                super::linear::LinearBiasMode::BeforeOutputRound,
+                BIAS_MODE,
             )
         };
         let dim = spec.flow_dim() as usize;
@@ -318,7 +322,7 @@ impl Music3Syn {
         self.linear_impl(weight, out_rows, in_cols, input, rows, out, None)
     }
 
-    fn linear_biased(
+    pub(crate) fn linear_biased(
         &self,
         weight: &CudaSlice<u8>,
         out_rows: usize,
@@ -364,7 +368,7 @@ impl Music3Syn {
                 bf16_bias(bias, &self.stream, out_rows)?,
                 input,
                 &mut view,
-                super::linear::LinearBiasMode::BeforeOutputRound,
+                BIAS_MODE,
             ),
             None => self.blas.linear_bf16(weight, input, &mut view),
         }
@@ -1274,7 +1278,7 @@ impl Music3Syn {
             bf16_bias(bias, s, out_dim)?,
             x_tensor,
             &mut view,
-            super::linear::LinearBiasMode::BeforeOutputRound,
+            BIAS_MODE,
         )
     }
 
@@ -1511,7 +1515,7 @@ impl Music3Syn {
                 )?
             },
             &mut view,
-            super::linear::LinearBiasMode::BeforeOutputRound,
+            BIAS_MODE,
         )
     }
 
