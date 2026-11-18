@@ -156,9 +156,9 @@ struct EntryReader {
     staging: Option<AlignedBytes>,
 }
 
-/// One batched direct-read destination: tensor identity plus a disjoint aligned
-/// writable window of the pinned arena. `dest` must be aligned and hold the padded
-/// file span; only the owning worker thread dereferences it.
+/// One batched direct-read destination: tensor identity plus a disjoint writable
+/// window of the pinned arena at the tensor's packed offset; only the owning worker
+/// thread dereferences it.
 struct DirectRead<'a> {
     name: &'a str,
     entry: &'a TensorEntry,
@@ -375,44 +375,6 @@ impl EntryReader {
         reader.read_direct(begin, width as u64, span)?;
         destination[..entry.bytes].copy_from_slice(&span[head..head + entry.bytes]);
         Ok(())
-    }
-
-    /// Direct-IO alignment of this checkpoint's shards in BF16 elements; every shard of one
-    /// checkpoint directory shares the filesystem, so the first reader's alignment stands.
-    #[cfg(test)]
-    fn align_elements(&mut self) -> Result<usize> {
-        {
-            let shard = self.readers.keys().next().cloned().map_or_else(
-                || {
-                    let mut first = self
-                        .dir
-                        .read_dir()
-                        .with_context(|| format!("read {}", self.dir.display()))?
-                        .filter_map(std::result::Result::ok)
-                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                        .filter(|name| !name.starts_with('.'))
-                        .collect::<Vec<_>>();
-                    first.sort();
-                    anyhow::Ok(
-                        first
-                            .into_iter()
-                            .next()
-                            .context("checkpoint directory is empty")?,
-                    )
-                },
-                Ok,
-            )?;
-            if !self.readers.contains_key(&shard) {
-                let reader = SpanReader::open(&self.dir.join(&shard), true)?;
-                self.readers.insert(shard.clone(), reader);
-            }
-            let alignment = self.readers[&shard].alignment;
-            ensure!(
-                alignment.is_multiple_of(2) && alignment <= usize::MAX as u64 / 2,
-                "direct alignment {alignment} is not a whole BF16 element multiple"
-            );
-            Ok(alignment as usize / 2)
-        }
     }
 
     /// Bytes `start..start + bytes` of the tensor, read with O_DIRECT into the reusable aligned staging buffer.
@@ -3030,14 +2992,8 @@ fn place_layers(
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
-        let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
-            &dir,
-            base.manifest,
-            plan,
-            d,
-            None,
-            0,
-        )?;
+        let mut dense =
+            crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         let mut requests = Vec::new();
         let mut checks = Vec::new();
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
@@ -3472,7 +3428,6 @@ fn place_stored_layers(
             plan,
             d,
             Some(&order),
-            0,
         )?;
         for (layer, names) in order.iter().enumerate() {
             if !dense.plan.host[layer] {
@@ -14244,7 +14199,6 @@ mod h3_direct_batch_tests {
             entry(32 * align as u64 + 33, 3 * align),
         ];
         let mut reader = EntryReader::new(&dir);
-        ensure!(reader.align_elements()? == align / 2, "sensed alignment");
         // Packed destinations at arbitrary offsets, as the dense fill produces.
         let mut offsets = [0usize; 2];
         let mut cursor = 0usize;
