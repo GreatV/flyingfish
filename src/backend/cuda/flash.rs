@@ -65,30 +65,6 @@ pub struct Query<'a> {
     pub image_blocks: Option<(&'a CudaSlice<u32>, usize)>,
 }
 
-#[cfg(all(test, feature = "cuda"))]
-thread_local! {
-    static FULL_QUERY_IDENTITY: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
-}
-
-#[cfg(all(test, feature = "cuda"))]
-pub(super) fn full_query_identity(finish: bool) -> Result<()> {
-    if finish {
-        let (calls, defects) = FULL_QUERY_IDENTITY
-            .with(|state| state.take())
-            .context("full-query identity scope missing")?;
-        println!("FULL_QUERY_GROUP_ENGINE calls={calls} defects={defects} bit_limit=0");
-        ensure!(defects == 0, "full-query engine identity DEFECT");
-    } else {
-        ensure!(
-            FULL_QUERY_IDENTITY
-                .with(|state| state.replace(Some((0, 0))))
-                .is_none(),
-            "full-query identity scope already active"
-        );
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 pub struct Score {
     pub scale: f32,
@@ -140,7 +116,6 @@ pub struct Flash {
     score: Option<Score>,
     tile: usize,
     shared: u32,
-    full_geometry: Option<[u32; 3]>,
     split: Option<Split>,
     windows: Option<Windows>,
     position: u64,
@@ -442,32 +417,15 @@ impl Flash {
             self.geometry[2] == 128 && self.score.is_none() && self.native.len() == 3,
             "single-probability attention requires the BF16 D128 full binding"
         );
-        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
-        let ctx = self.stream.context();
-        let major = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-        let minor = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-        if (major, minor) == (8, 9) {
-            let module = super::cubin::module(ctx, "attention_native")?;
-            let units =
-                usize::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
-            let optin = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?;
-            let rows = self.lse.len() / self.geometry[0];
-            let mut previous_warps = 0;
-            let mut previous_rows = 0;
-            for (tile, threads, dynamic, name) in [
-                (
-                    64u32,
-                    128u32,
-                    49152u32,
-                    "attention_prefill_d128_bidirectional_single_pv",
-                ),
-                (
-                    128,
-                    256,
-                    65536,
-                    "attention_prefill_d128_bidirectional_single_pv_128q",
-                ),
-            ] {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+            let ctx = self.stream.context();
+            let major = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+            let minor = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+            if (major, minor) == (8, 9) {
+                let name = "attention_prefill_d128_bidirectional_single_pv";
+                let module = super::cubin::module(ctx, "attention_native")?;
                 let function = module.load_function(name)?;
                 let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
                 let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
@@ -477,100 +435,53 @@ impl Flash {
                     "{name} registers={registers} local={local}"
                 );
                 ensure!(
-                    shared + dynamic as i32 <= optin
-                        && function.get_attribute(F::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?
-                            >= threads as i32,
-                    "{name} shared/thread resources exceed capacity"
+                    shared + self.shared as i32
+                        <= ctx
+                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    "single-probability attention shared memory exceeds capacity"
                 );
                 function.set_attribute(
                     F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    dynamic as i32,
+                    self.shared as i32,
                 )?;
                 let resident = function.occupancy_max_active_blocks_per_multiprocessor(
-                    threads,
-                    dynamic as usize,
+                    128,
+                    self.shared as usize,
                     None,
                 )?;
-                let warps = resident * (threads / 32);
-                let query_rows = resident * tile;
-                if tile == 64 {
-                    let previous = self.native[1].occupancy_max_active_blocks_per_multiprocessor(
-                        128,
-                        self.shared as usize,
-                        None,
-                    )?;
-                    ensure!(
-                        resident >= previous && resident > 0,
-                        "single-probability attention occupancy decreased"
-                    );
-                    previous_warps = warps;
-                    previous_rows = query_rows;
-                } else {
-                    ensure!(
-                        warps >= previous_warps && query_rows >= previous_rows && resident > 0,
-                        "{name} resident warps/query rows decreased"
-                    );
-                }
-                let grid = rows
-                    .div_ceil(tile as usize)
-                    .checked_mul(self.geometry[0])
-                    .context("full attention grid overflow")?;
-                let wave = units
-                    .checked_mul(resident as usize)
-                    .context("full attention resident grid overflow")?;
-                let selected =
-                    tile == 64 || (rows.div_ceil(64) > rows.div_ceil(128) && grid >= wave);
+                let previous = self.native[1].occupancy_max_active_blocks_per_multiprocessor(
+                    128,
+                    self.shared as usize,
+                    None,
+                )?;
+                ensure!(
+                    resident >= previous && resident > 0,
+                    "single-probability attention occupancy decreased"
+                );
                 if crate::backend::diagnostics_enabled() {
                     eprintln!(
                         "{}",
                         serde_json::json!({"attention_probability": {
                             "symbol":name,"registers":registers,"local_bytes":local,
-                            "static_shared_bytes":shared,"dynamic_shared_bytes":dynamic,
-                            "resident_blocks":resident,"resident_warps":warps,"resident_query_rows":query_rows,
-                            "tile":tile,"threads":threads,"rows":rows,"sm_count":units,"grid":grid,"selected":selected
+                            "dynamic_shared_bytes":self.shared,"resident_blocks":resident,
+                            "previous_resident_blocks":previous
                         }})
                     );
                 }
-                if selected {
-                    self.native[1] = function;
-                    self.full_geometry = Some([tile, threads, dynamic]);
+                self.native[1] = function;
+            } else {
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"attention_probability": {
+                            "symbol":"attention_prefill_d128_bidirectional",
+                            "capability":[major,minor],"form":"residual"
+                        }})
+                    );
                 }
             }
-        } else if crate::backend::diagnostics_enabled() {
-            eprintln!(
-                "{}",
-                serde_json::json!({"attention_probability": {
-                    "symbol":"attention_prefill_d128_bidirectional",
-                    "capability":[major,minor],"form":"residual"
-                }})
-            );
         }
         Ok(self)
-    }
-
-    #[cfg(all(test, feature = "cuda"))]
-    pub(super) fn force_full_query_groups(&mut self, groups: u32) -> Result<()> {
-        ensure!(
-            self.geometry[2] == 128 && self.score.is_none() && self.native.len() == 3,
-            "full-query test binding geometry"
-        );
-        let (name, geometry) = match groups {
-            1 => (
-                "attention_prefill_d128_bidirectional_single_pv",
-                [64, 128, 49152],
-            ),
-            2 => (
-                "attention_prefill_d128_bidirectional_single_pv_128q",
-                [128, 256, 65536],
-            ),
-            _ => anyhow::bail!("full-query test group count {groups}"),
-        };
-        let module = super::cubin::module(self.stream.context(), "attention_native")?;
-        let function = module.load_function(name)?;
-        function.set_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, geometry[2] as i32)?;
-        self.native[1] = function;
-        self.full_geometry = Some(geometry);
-        Ok(())
     }
 
     pub fn new_with_score(
@@ -839,7 +750,6 @@ impl Flash {
             score,
             tile,
             shared: dynamic_shared,
-            full_geometry: None,
             split,
             windows: None,
             position: 0,
@@ -927,7 +837,6 @@ impl Flash {
             score: Some(score),
             tile,
             shared: dynamic_shared,
-            full_geometry: None,
             split: None,
             windows: None,
             position: 0,
@@ -1221,95 +1130,6 @@ impl Flash {
             [shape.q_heads, shape.kv_heads, shape.head_dim] == self.geometry,
             "prefill geometry differs from setup binding"
         );
-        #[cfg(all(test, feature = "cuda"))]
-        if self.full_geometry.is_some()
-            && !shape.causal
-            && shape.window_left.is_none()
-            && prefix.is_none()
-            && image_blocks.is_none()
-            && FULL_QUERY_IDENTITY.with(|state| state.get().is_some())
-        {
-            let (calls, defects) = FULL_QUERY_IDENTITY
-                .with(|state| state.take())
-                .context("full-query identity scope missing")?;
-            let native = self.native[1].clone();
-            let geometry = self.full_geometry;
-            let result = (|| -> Result<(usize, usize)> {
-                self.force_full_query_groups(1)?;
-                self.run_masked(Query {
-                    q,
-                    q_row_stride,
-                    k,
-                    v,
-                    out: &mut *out,
-                    shape,
-                    keys,
-                    prefix,
-                    image_blocks,
-                })?;
-                let parent = self.stream.clone_dtoh(&*out)?;
-                let parent_lse = self.stream.clone_dtoh(&self.lse)?;
-                self.force_full_query_groups(2)?;
-                self.run_masked(Query {
-                    q,
-                    q_row_stride,
-                    k,
-                    v,
-                    out: &mut *out,
-                    shape,
-                    keys,
-                    prefix,
-                    image_blocks,
-                })?;
-                let candidate = self.stream.clone_dtoh(&*out)?;
-                let candidate_lse = self.stream.clone_dtoh(&self.lse)?;
-                let valid = shape.rows * shape.q_heads * shape.head_dim;
-                ensure!(
-                    parent[..valid]
-                        .iter()
-                        .chain(&candidate[..valid])
-                        .all(|x| x.is_finite())
-                        && parent_lse[..shape.rows * shape.q_heads]
-                            .iter()
-                            .chain(&candidate_lse[..shape.rows * shape.q_heads])
-                            .all(|x| x.is_finite()),
-                    "full-query identity non-finite output/LSE"
-                );
-                Ok((
-                    parent
-                        .iter()
-                        .zip(&candidate)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count(),
-                    parent_lse
-                        .iter()
-                        .zip(&candidate_lse)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count(),
-                ))
-            })();
-            self.native[1] = native;
-            self.full_geometry = geometry;
-            match result {
-                Ok((output_bits, lse_bits)) => {
-                    FULL_QUERY_IDENTITY.with(|state| {
-                        state.set(Some((
-                            calls + 1,
-                            defects + usize::from(output_bits != 0 || lse_bits != 0),
-                        )))
-                    });
-                    println!(
-                        "FULL_QUERY_GROUP_CALL rows={} heads={} keys={keys} output_bits={output_bits} lse_bits={lse_bits}",
-                        shape.rows, shape.q_heads
-                    );
-                    return Ok(());
-                }
-                Err(error) => {
-                    FULL_QUERY_IDENTITY.with(|state| state.set(Some((calls, defects))));
-                    return Err(error);
-                }
-            }
-        }
         let end = shape
             .start
             .checked_add(shape.rows)
@@ -1623,18 +1443,14 @@ impl Flash {
                         launch.arg(&extent);
                     }
                 }
-                let [tile, threads, shared] = match (mode, self.full_geometry) {
-                    (1, Some(geometry)) => geometry,
-                    _ => [self.tile as u32, 128, self.shared],
-                };
                 launch.launch(LaunchConfig {
                     grid_dim: (
-                        shape.rows.div_ceil(tile as usize) as u32,
+                        shape.rows.div_ceil(self.tile) as u32,
                         shape.q_heads as u32,
                         1,
                     ),
-                    block_dim: (threads, 1, 1),
-                    shared_mem_bytes: shared,
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: self.shared,
                 })?;
             }
             return Ok(());
@@ -3770,170 +3586,6 @@ mod tests {
         Ok(defects)
     }
 
-    #[cfg(feature = "cuda")]
-    fn full_query_group_cell(stream: &Arc<CudaStream>, case: &Case) -> Result<usize> {
-        let mut buffers = case.buffers(stream)?;
-        let mut op = case.binding(stream)?.with_full_single_probability()?;
-        let valid = case.rows * case.hq * case.d;
-        let lse_valid = case.rows * case.hq;
-        op.lse = stream.clone_htod(&vec![f32::from_bits(0x7fc00001); lse_valid + 32])?;
-        op.force_full_query_groups(1)?;
-        case.run(&mut op, &mut buffers)?;
-        let parent = stream.clone_dtoh(&buffers.out)?;
-        let parent_lse = stream.clone_dtoh(&op.lse)?;
-        ensure!(
-            parent[..valid].iter().all(|x| x.is_finite())
-                && parent_lse[..lse_valid].iter().all(|x| x.is_finite()),
-            "full-query parent contains non-finite output/LSE"
-        );
-        ensure!(
-            parent[valid..].iter().all(|x| x.to_bits() == 0x7fc1)
-                && parent_lse[lse_valid..]
-                    .iter()
-                    .all(|x| x.to_bits() == 0x7fc00001),
-            "full-query parent guard changed"
-        );
-        let differences = |output: &[bf16],
-                           lse: &[f32],
-                           expected: &[bf16],
-                           expected_lse: &[f32]|
-         -> Result<(usize, usize)> {
-            ensure!(
-                output.len() == expected.len() && lse.len() == expected_lse.len(),
-                "full-query comparison extent"
-            );
-            ensure!(
-                output[..valid].iter().all(|x| x.is_finite())
-                    && lse[..lse_valid].iter().all(|x| x.is_finite()),
-                "full-query candidate contains non-finite output/LSE"
-            );
-            Ok((
-                output
-                    .iter()
-                    .zip(expected)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count(),
-                lse.iter()
-                    .zip(expected_lse)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count(),
-            ))
-        };
-        let mut defects = 0;
-        for groups in [1, 2] {
-            op.force_full_query_groups(groups)?;
-            case.run(&mut op, &mut buffers)?;
-            let actual = stream.clone_dtoh(&buffers.out)?;
-            let lse = stream.clone_dtoh(&op.lse)?;
-            let (output_bits, lse_bits) = differences(&actual, &lse, &parent, &parent_lse)?;
-            defects += usize::from(output_bits != 0 || lse_bits != 0);
-            println!(
-                "FULL_QUERY_GROUP_CELL name={} rows={} heads={} kv_heads={} keys={} groups={groups} output_bits={output_bits} lse_bits={lse_bits} bit_limit=0",
-                case.name, case.rows, case.hq, case.hkv, case.keys
-            );
-            let _captured_function = op.native[1].clone();
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            case.run(&mut op, &mut buffers)?;
-            let graph = stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("full-query graph missing")?;
-            graph.launch()?;
-            let actual = stream.clone_dtoh(&buffers.out)?;
-            let lse = stream.clone_dtoh(&op.lse)?;
-            let (output_bits, lse_bits) = differences(&actual, &lse, &parent, &parent_lse)?;
-            defects += usize::from(output_bits != 0 || lse_bits != 0);
-            println!(
-                "FULL_QUERY_GROUP_GRAPH name={} groups={groups} output_bits={output_bits} lse_bits={lse_bits} bit_limit=0",
-                case.name
-            );
-            if groups == 2 && case.rows == 1000 && case.hq == 56 {
-                let original = stream.clone_dtoh(&buffers.v)?;
-                let changed: Vec<_> = original
-                    .iter()
-                    .map(|x| bf16::from_f32(x.to_f32() + 0.25))
-                    .collect();
-                stream.memcpy_htod(&changed, &mut buffers.v)?;
-                op.force_full_query_groups(1)?;
-                case.run(&mut op, &mut buffers)?;
-                let changed_parent = stream.clone_dtoh(&buffers.out)?;
-                let changed_lse = stream.clone_dtoh(&op.lse)?;
-                graph.launch()?;
-                let replay = stream.clone_dtoh(&buffers.out)?;
-                let replay_lse = stream.clone_dtoh(&op.lse)?;
-                let (output_bits, lse_bits) =
-                    differences(&replay, &replay_lse, &changed_parent, &changed_lse)?;
-                let changed_count = changed_parent[..valid]
-                    .iter()
-                    .zip(&parent[..valid])
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                defects += usize::from(output_bits != 0 || lse_bits != 0 || changed_count == 0);
-                println!(
-                    "FULL_QUERY_GROUP_LIVE changed={changed_count} graph_output_bits={output_bits} graph_lse_bits={lse_bits}"
-                );
-                stream.memcpy_htod(&original, &mut buffers.v)?;
-                op.force_full_query_groups(2)?;
-            }
-        }
-        if case.rows == 1000 && case.hq == 56 {
-            ensure!(case.capacity >= case.keys + 64, "K tile mutant padding");
-            let (q, _q) = buffers.q.device_ptr(stream);
-            let (k, _k) = buffers.k.device_ptr(stream);
-            let (v, _v) = buffers.v.device_ptr(stream);
-            let (out, _out) = buffers.out.device_ptr_mut(stream);
-            let (lse, _lse) = op.lse.device_ptr_mut(stream);
-            let args = Attention {
-                q,
-                k: k + (64 * case.d * 2) as u64,
-                v,
-                out,
-                lse,
-                rows: u32::try_from(case.rows)?,
-                capacity: u32::try_from(case.capacity)?,
-                q_stride: u32::try_from(case.pitch)?,
-                q_heads: u32::try_from(case.hq)?,
-                group: u32::try_from(case.hq / case.hkv)?,
-                start: u32::try_from(case.start)?,
-                position: 0,
-            };
-            let keys = u32::try_from(case.keys)?;
-            unsafe {
-                stream
-                    .launch_builder(&op.native[1])
-                    .arg(&args)
-                    .arg(&keys)
-                    .launch(LaunchConfig {
-                        grid_dim: (
-                            u32::try_from(case.rows.div_ceil(128))?,
-                            u32::try_from(case.hq)?,
-                            1,
-                        ),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 65536,
-                    })?;
-            }
-            drop((_q, _k, _v, _out, _lse));
-            let wrong = stream.clone_dtoh(&buffers.out)?;
-            let wrong_lse = stream.clone_dtoh(&op.lse)?;
-            let (output_bits, lse_bits) = differences(&wrong, &wrong_lse, &parent, &parent_lse)?;
-            let guards = wrong[valid..].iter().all(|x| x.to_bits() == 0x7fc1)
-                && wrong_lse[lse_valid..]
-                    .iter()
-                    .all(|x| x.to_bits() == 0x7fc00001);
-            println!(
-                "FULL_QUERY_GROUP_K_TILE_CONTROL output_bits={output_bits} lse_bits={lse_bits} guards={guards} detected={}",
-                output_bits > 0 && lse_bits > 0 && guards
-            );
-            ensure!(
-                output_bits > 0 && lse_bits > 0 && guards,
-                "K tile offset control not detected or guard changed"
-            );
-        }
-        Ok(defects)
-    }
-
     fn extended_margin(
         case: &Case,
         op: &Flash,
@@ -4662,8 +4314,6 @@ mod tests {
         let stream = ctx.new_stream()?;
         let mut defects = mask_controls(&stream, &limits)?;
         #[cfg(feature = "cuda")]
-        let mut full_cells = 0usize;
-        #[cfg(feature = "cuda")]
         {
             defects += bf16_disjoint_windows(&stream, &limits)?;
         }
@@ -4689,42 +4339,7 @@ mod tests {
                     && ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)? == 9
                 {
                     defects += cell(&stream, case, &root, bound, true)?;
-                    defects += full_query_group_cell(&stream, case)?;
-                    full_cells += 1;
                 }
-            }
-        }
-        #[cfg(feature = "cuda")]
-        {
-            use cudarc::driver::sys::CUdevice_attribute as A;
-            if ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)? == 8
-                && ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)? == 9
-            {
-                for rows in [
-                    1usize, 7, 12, 16, 17, 20, 63, 64, 65, 127, 128, 129, 255, 256, 257, 263, 1000,
-                    1038, 1327, 1557, 2318, 4103, 7189, 16391, 37722, 39746, 40045, 41770, 60431,
-                ] {
-                    let case = Case {
-                        name: format!("full-groups-{rows}"),
-                        d: 128,
-                        hq: 56,
-                        hkv: 56,
-                        mode: "bidirectional".into(),
-                        rows,
-                        start: 0,
-                        keys: rows,
-                        extent: 0,
-                        seed: 31,
-                        capacity: rows + 64,
-                        pitch: 56 * 128 + 128,
-                        scale: None,
-                    };
-                    defects += full_query_group_cell(&stream, &case)?;
-                    full_cells += 1;
-                }
-                println!(
-                    "FULL_QUERY_GROUP_IDENTITY cells={full_cells} forms=2 bit_limit=0 defects={defects}"
-                );
             }
         }
         println!(
