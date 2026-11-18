@@ -578,24 +578,43 @@ impl AdalnTable {
                 continue;
             }
             let base = format!("transformer_blocks.{layer}.adaln_proj.linear");
-            for (index, &tag) in tags.iter().enumerate() {
-                let first = usize::from(tag);
-                source.fill_span(
-                    s,
-                    &format!("{base}.weight"),
-                    first * weight_block,
-                    weight_block,
-                    &mut weight.slice_mut(
-                        index * width * spec.time_dim..(index + 1) * width * spec.time_dim,
-                    ),
-                )?;
-                source.fill_span(
-                    s,
-                    &format!("{base}.bias"),
-                    first * 2 * width,
-                    2 * width,
-                    &mut bias.slice_mut(index * width..(index + 1) * width),
-                )?;
+            let weight_name = format!("{base}.weight");
+            let quantized = manifest
+                .entries
+                .get(&weight_name)
+                .with_context(|| format!("manifest lacks {weight_name}"))?
+                .quant
+                .is_some();
+            if quantized {
+                // GGUF adaln tensors are single quantized tensors; every quantized plan addresses all
+                // modality blocks, so the compact buffers already span the whole tensor.
+                ensure!(
+                    tags.len() == MODALITIES as usize,
+                    "{weight_name}: quantized tensor with a {}-tag plan",
+                    tags.len()
+                );
+                source.fill(s, &weight_name, &mut weight.slice_mut(..))?;
+                source.fill(s, &format!("{base}.bias"), &mut bias.slice_mut(..))?;
+            } else {
+                for (index, &tag) in tags.iter().enumerate() {
+                    let first = usize::from(tag);
+                    source.fill_span(
+                        s,
+                        &weight_name,
+                        first * weight_block,
+                        weight_block,
+                        &mut weight.slice_mut(
+                            index * width * spec.time_dim..(index + 1) * width * spec.time_dim,
+                        ),
+                    )?;
+                    source.fill_span(
+                        s,
+                        &format!("{base}.bias"),
+                        first * 2 * width,
+                        2 * width,
+                        &mut bias.slice_mut(index * width..(index + 1) * width),
+                    )?;
+                }
             }
             blas.linear_biased(
                 matrix(&weight, s, compact, spec.time_dim)?,
@@ -9137,6 +9156,84 @@ mod tests {
         ensure!(ok, "GGUF AdaLN table {d:?} outside the arm floor {floor:?}");
         ensure!(caught, "tag-swap control stayed within 10x tau");
         println!("H3_GGUF_ADALN_GATE PASS control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// The quantized-manifest leg of the AdaLN build: the GGUF `adaln_proj` tensors (Q4_0, `quant` set on
+    /// every entry) build the table through the whole-tensor fill. Fails on a span-only reader, which rejects
+    /// every quantized entry on layer 0.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_CAPTURE, FF_Q38_GPU_WINDOW=granted"]
+    fn gguf_adaln_table_builds_from_the_quantized_manifest() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let var = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = var("FF_MODEL")?;
+        let gguf_path = var("FF_H3_GGUF")?;
+        let capture = var("FF_H3_CAPTURE")?;
+        let spec = H3Spec::read(&model)?;
+        let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let weight = "transformer_blocks.0.adaln_proj.linear.weight";
+        ensure!(
+            manifest.entries[weight].quant.is_some(),
+            "GGUF fixture {weight} is unquantized"
+        );
+        let layout = capture_layout(&spec, &capture)?;
+        let rows: Vec<RowTimesteps> =
+            row_timestep_plan(&layout, &Schedule::new(9, 6.0)?, &Schedule::new(9, 3.0)?)?;
+        let adaln = AdalnPlan::build(&layout, &rows)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-gguf-adaln-build-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(
+                true,
+                "MiniMax-H3 GGUF AdaLN build gate".into(),
+            )),
+        )?;
+        let table = AdalnTable::build(
+            &device,
+            &mut blas,
+            gguf_path.parent().context("GGUF directory")?,
+            &manifest,
+            &spec,
+            &adaln,
+        )?;
+        fs::remove_dir(&runtime)?;
+        let width = 6 * spec.hidden;
+        let blocks = s.clone_dtoh(&table.blocks)?;
+        let norm_out = s.clone_dtoh(&table.norm_out)?;
+        ensure!(
+            blocks.len() == spec.layers * adaln.pairs.len() * width
+                && blocks.iter().all(|v| v.to_f32().is_finite()),
+            "GGUF AdaLN blocks extent {}",
+            blocks.len()
+        );
+        ensure!(
+            norm_out.len() == adaln.timesteps.len() * 2 * spec.hidden
+                && norm_out.iter().all(|v| v.to_f32().is_finite()),
+            "GGUF AdaLN norm_out extent {}",
+            norm_out.len()
+        );
+        println!(
+            "H3_GGUF_ADALN_BUILD PASS blocks={} norm_out={}",
+            blocks.len(),
+            norm_out.len()
+        );
         Ok(())
     }
 
