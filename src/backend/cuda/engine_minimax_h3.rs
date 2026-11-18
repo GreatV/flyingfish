@@ -1504,6 +1504,7 @@ pub(crate) struct BlockWork {
     chunk: usize,
     fixed_lora: bool,
     gate_up_m_fast: [bool; 2],
+    qkv_product: crate::convrot::ProductKernel,
     #[cfg(test)]
     repeat_ffn_input: bool,
     /// When set, `block_forward` copies the modulated norm2 rows out right
@@ -1873,6 +1874,7 @@ impl BlockWork {
             normed_probe: Vec::new(),
             fixed_lora: false,
             gate_up_m_fast: [false; 2],
+            qkv_product: crate::convrot::ProductKernel::NFast,
             #[cfg(test)]
             repeat_ffn_input: false,
             normed,
@@ -2119,7 +2121,11 @@ fn apply_int8(
             k: i32::try_from(k)?,
             n: i32::try_from(n)?,
             group: i32::try_from(group)?,
-            product_m_fast: ptrs.product_m_fast,
+            product: if ptrs.product_m_fast {
+                crate::convrot::ProductKernel::MFastLdsm
+            } else {
+                crate::convrot::ProductKernel::NFast
+            },
             fuse_silu,
         },
     )
@@ -2198,7 +2204,7 @@ fn apply_shared_qkv(
             k: k_i,
             n: 0,
             group,
-            product_m_fast: false,
+            product: crate::convrot::ProductKernel::NFast,
             fuse_silu: false,
         },
     )?;
@@ -2222,7 +2228,7 @@ fn apply_shared_qkv(
                 k: k_i,
                 n: i32::try_from(n)?,
                 group,
-                product_m_fast: false,
+                product: work.qkv_product,
                 fuse_silu: false,
             },
         )?;
@@ -4052,6 +4058,14 @@ impl Dit {
                 [work.chunk, work.rows % work.chunk],
                 (h, 2 * spec.ffn),
             )?;
+            let width = spec.heads * spec.head_dim;
+            if d.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(89)
+                && work.rows >= crate::convrot::TENSOR_CORE_ROWS
+                && (h, width) == (5376, 7168)
+                && h * width <= d.info.l2_bytes
+            {
+                work.qkv_product = crate::convrot::ProductKernel::NFastLdsm;
+            }
         } else {
             work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
         }

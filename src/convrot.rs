@@ -360,7 +360,7 @@ pub struct ConvrotFns {
     hadamard: crate::backend::gpu::CudaFunction,
     group_dot: [crate::backend::gpu::CudaFunction; 2],
     quantize: crate::backend::gpu::CudaFunction,
-    product: [crate::backend::gpu::CudaFunction; 2],
+    product: [crate::backend::gpu::CudaFunction; 3],
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
     optin: usize,
@@ -386,6 +386,14 @@ pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub enum ProductKernel {
+    NFast,
+    MFastLdsm,
+    NFastLdsm,
+}
+
+#[cfg(feature = "cuda")]
 pub struct ConvrotArgs {
     pub x: u64,
     pub qweight: u64,
@@ -398,7 +406,7 @@ pub struct ConvrotArgs {
     pub k: i32,
     pub n: i32,
     pub group: i32,
-    pub product_m_fast: bool,
+    pub product: ProductKernel,
     pub fuse_silu: bool,
 }
 
@@ -414,12 +422,12 @@ const PRODUCT_SMEM: u32 = 61_440;
 #[cfg(feature = "cuda")]
 fn product_function(
     module: &std::sync::Arc<crate::backend::gpu::CudaModule>,
-    m_fast: bool,
+    product: ProductKernel,
 ) -> Result<crate::backend::gpu::CudaFunction> {
-    let name = if m_fast {
-        "convrot_product_m_fast"
-    } else {
-        "convrot_product"
+    let name = match product {
+        ProductKernel::NFast => "convrot_product",
+        ProductKernel::MFastLdsm => "convrot_product_m_fast",
+        ProductKernel::NFastLdsm => "convrot_product_n_fast_ldsm",
     };
     let product = module.load_function(name)?;
     product.set_attribute(
@@ -440,11 +448,12 @@ pub(crate) fn gate_up_product_order(
         return Ok([false; 2]);
     }
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
-    let active = product_function(&module, true)?.occupancy_max_active_blocks_per_multiprocessor(
-        PRODUCT_THREADS,
-        PRODUCT_SMEM as usize,
-        None,
-    )?;
+    let active = product_function(&module, ProductKernel::MFastLdsm)?
+        .occupancy_max_active_blocks_per_multiprocessor(
+            PRODUCT_THREADS,
+            PRODUCT_SMEM as usize,
+            None,
+        )?;
     ensure!(active > 0, "convrot M-fast product has no resident CTA");
     let wave = device.info.sms * active as usize;
     let (bm, bn) = (PRODUCT_BM as usize, PRODUCT_BN as usize);
@@ -467,8 +476,9 @@ pub(crate) fn gate_up_product_order(
 pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
     let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
     let product = [
-        product_function(&module, false)?,
-        product_function(&module, true)?,
+        product_function(&module, ProductKernel::NFast)?,
+        product_function(&module, ProductKernel::MFastLdsm)?,
+        product_function(&module, ProductKernel::NFastLdsm)?,
     ];
     let hadamard = module.load_function("convrot_hadamard_table")?;
     let group_dot = [
@@ -567,10 +577,11 @@ pub(crate) fn launch_product(
     );
     let m = (args.rows as u32).div_ceil(PRODUCT_BM);
     let n = (args.n as u32).div_ceil(PRODUCT_BN);
-    let (product, grid) = if args.product_m_fast {
-        (&fns.product[1], (m, n, 1))
+    let product = &fns.product[args.product as usize];
+    let grid = if matches!(args.product, ProductKernel::MFastLdsm) {
+        (m, n, 1)
     } else {
-        (&fns.product[0], (n, m, 1))
+        (n, m, 1)
     };
     unsafe {
         stream
@@ -714,7 +725,7 @@ fn launch_groups(
 mod device {
     use crate::backend::cuda::Device;
     use crate::backend::gpu::DevicePtr;
-    use crate::convrot::{ConvrotArgs, launch_device, load_convrot};
+    use crate::convrot::{ConvrotArgs, ProductKernel, launch_device, load_convrot};
     use anyhow::{Context, Result, ensure};
     use half::bf16;
 
@@ -1092,7 +1103,7 @@ mod device {
                 k: i32::try_from(k)?,
                 n: i32::try_from(n)?,
                 group: i32::try_from(group)?,
-                product_m_fast: false,
+                product: ProductKernel::NFast,
                 fuse_silu: false,
             },
         )?;
@@ -1701,9 +1712,9 @@ mod device {
         qweight: &[i8],
         wscale: &[f32],
         k: usize,
-        window: (u64, u64, bool),
+        window: (u64, u64, ProductKernel),
     ) -> Result<Vec<bf16>> {
-        let (weight_off, scale_off, m_fast) = window;
+        let (weight_off, scale_off, product) = window;
         let n = wscale.len();
         let rows = scales.len();
         ensure!(
@@ -1748,7 +1759,7 @@ mod device {
                 k: i32::try_from(k)?,
                 n: i32::try_from(n)?,
                 group: 256,
-                product_m_fast: m_fast,
+                product,
                 fuse_silu: false,
             },
         )?;
@@ -1798,7 +1809,15 @@ mod device {
                 &qweight,
                 &wscale,
                 k,
-                (0, 0, m_fast),
+                (
+                    0,
+                    0,
+                    if m_fast {
+                        ProductKernel::MFastLdsm
+                    } else {
+                        ProductKernel::NFast
+                    },
+                ),
             )?;
             ensure!(output.len() == rows * n, "convrot gate/up output extent");
             let differing = diff(&output);
@@ -1812,8 +1831,15 @@ mod device {
         }
         let mut shifted = wscale.clone();
         shifted.rotate_left(1);
-        let output =
-            launch_product_at(device, &codes, &scales, &qweight, &shifted, k, (0, 0, true))?;
+        let output = launch_product_at(
+            device,
+            &codes,
+            &scales,
+            &qweight,
+            &shifted,
+            k,
+            (0, 0, ProductKernel::MFastLdsm),
+        )?;
         ensure!(output.len() == rows * n, "convrot gate/up control extent");
         let differing = diff(&output);
         println!("CONVROT_PRODUCT_GATE_UP_SCALE_COLUMN_SHIFT differ={differing}");
@@ -1847,7 +1873,7 @@ mod device {
                     &qweight,
                     &wscale,
                     k,
-                    (0, 0, false),
+                    (0, 0, ProductKernel::NFast),
                 )?;
                 let differ = bit_diff(&got, &host);
                 println!("CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ}");
@@ -1869,7 +1895,7 @@ mod device {
             &qweight,
             &wscale,
             k,
-            (0, 0, false),
+            (0, 0, ProductKernel::NFast),
         )?;
         let differ = bit_diff(&got, &host);
         println!(
@@ -1886,7 +1912,7 @@ mod device {
             &extended,
             &wscale,
             k,
-            (1, 0, false),
+            (1, 0, ProductKernel::NFast),
         )?;
         let moved = bit_diff(&shifted, &host);
         println!("CONVROT_PRODUCT_K_OFFSET differ={moved}");
@@ -1901,7 +1927,7 @@ mod device {
             &qweight,
             &wscale,
             k,
-            (0, 1, false),
+            (0, 1, ProductKernel::NFast),
         )?;
         let scale_moved = bit_diff(&scale_shifted, &host);
         println!("CONVROT_PRODUCT_SCALE_INDEX differ={scale_moved}");
@@ -1968,6 +1994,7 @@ mod device {
             for (name, want_lds, want_ldsm) in [
                 ("convrot_product", 54, 0),
                 ("convrot_product_m_fast", 6, 12),
+                ("convrot_product_n_fast_ldsm", 6, 12),
             ] {
                 let body = function_sass(&text, name)
                     .with_context(|| format!("{name} missing from cuobjdump"))?;
@@ -2178,7 +2205,7 @@ mod device {
                         k: k_i,
                         n: i32::try_from(n)?,
                         group: i32::try_from(group)?,
-                        product_m_fast: false,
+                        product: ProductKernel::NFast,
                         fuse_silu,
                     },
                 )?;
@@ -2285,7 +2312,7 @@ mod device {
                 k: i32::try_from(k)?,
                 n: i32::try_from(n)?,
                 group: i32::try_from(group)?,
-                product_m_fast: false,
+                product: ProductKernel::NFast,
                 fuse_silu: false,
             },
         )?;
@@ -2304,6 +2331,7 @@ mod device {
         rows: usize,
         k: usize,
         n: usize,
+        product: ProductKernel,
         mutant: bool,
     ) -> Result<()> {
         let group = 256usize;
@@ -2328,7 +2356,7 @@ mod device {
                 k: i32::try_from(k)?,
                 n: 0,
                 group: i32::try_from(group)?,
-                product_m_fast: false,
+                product: ProductKernel::NFast,
                 fuse_silu: false,
             },
         )?;
@@ -2367,7 +2395,7 @@ mod device {
                     k: i32::try_from(k)?,
                     n: i32::try_from(n)?,
                     group: i32::try_from(group)?,
-                    product_m_fast: false,
+                    product,
                     fuse_silu: false,
                 },
             )?;
@@ -2403,9 +2431,12 @@ mod device {
         let kept_weight = kept_weight.context("shared weight")?;
         let kept_wscale = kept_wscale.context("shared wscale")?;
         let mut wrong = shared_codes;
-        let before = wrong[0];
-        wrong[0] = if before < 0 { 127 } else { -127 };
-        ensure!(wrong[0] != before, "shared mutant code was unchanged");
+        let packed = matches!(product, ProductKernel::NFastLdsm);
+        if packed {
+            wrong[..32].rotate_left(16);
+        } else {
+            wrong[0] = if wrong[0] < 0 { 127 } else { -127 };
+        }
         let shifted = launch_product_at(
             device,
             &wrong,
@@ -2413,11 +2444,20 @@ mod device {
             &kept_weight,
             &kept_wscale,
             k,
-            (0, 0, false),
+            (0, 0, product),
         )?;
         let moved = bit_diff(&shifted, &kept_y);
-        println!("CONVROT_SHARED_MUTANT differ={moved}");
-        ensure!(moved > 0, "one changed shared code matched the product");
+        if packed {
+            let row = bit_diff(&shifted[..n], &kept_y[..n]);
+            println!("CONVROT_SHARED_LDSM_K_HALF_CONTROL differ={moved} first_row={row}");
+            ensure!(
+                moved > 0 && moved == row,
+                "QKV K-half control must change only the first output row"
+            );
+        } else {
+            println!("CONVROT_SHARED_MUTANT differ={moved}");
+            ensure!(moved > 0, "one changed shared code matched the product");
+        }
         Ok(())
     }
 
@@ -2429,9 +2469,10 @@ mod device {
         let k = 5_376usize;
         let n = 7_168usize;
         for rows in [17usize, 20, 42] {
-            check_shared(&device, &fns, rows, k, n, false)?;
+            check_shared(&device, &fns, rows, k, n, ProductKernel::NFast, false)?;
         }
-        check_shared(&device, &fns, 41_770, k, n, true)?;
+        check_shared(&device, &fns, 41_770, k, n, ProductKernel::NFast, true)?;
+        check_shared(&device, &fns, 37_717, k, n, ProductKernel::NFastLdsm, true)?;
         Ok(())
     }
 }

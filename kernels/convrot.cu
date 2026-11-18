@@ -508,3 +508,9 @@ extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
     __nv_bfloat16* y, int rows, int k, int n) {
     convrot_product_tile<true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
 }
+
+extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_ldsm(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile<true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
+}
