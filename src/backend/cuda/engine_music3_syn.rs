@@ -319,32 +319,31 @@ impl Music3Syn {
         rows: usize,
         out: &mut CudaViewMut<bf16>,
     ) -> Result<()> {
-        self.linear_impl(weight, out_rows, in_cols, input, rows, out, None)
+        self.linear_impl(weight, [out_rows, in_cols], input, rows, out, None)
     }
 
     pub(crate) fn linear_biased(
         &self,
         weight: &CudaSlice<u8>,
-        out_rows: usize,
-        in_cols: usize,
+        shape: [usize; 2],
         input: &CudaView<bf16>,
         rows: usize,
         out: &mut CudaViewMut<bf16>,
         bias: &CudaSlice<u8>,
     ) -> Result<()> {
-        self.linear_impl(weight, out_rows, in_cols, input, rows, out, Some(bias))
+        self.linear_impl(weight, shape, input, rows, out, Some(bias))
     }
 
     fn linear_impl(
         &self,
         weight: &CudaSlice<u8>,
-        out_rows: usize,
-        in_cols: usize,
+        shape: [usize; 2],
         input: &CudaView<bf16>,
         rows: usize,
         out: &mut CudaViewMut<bf16>,
         bias: Option<&CudaSlice<u8>>,
     ) -> Result<()> {
+        let [out_rows, in_cols] = shape;
         let mut view = TensorMut(unsafe {
             Tensor::new(
                 out.device_ptr_mut(&self.stream).0,
@@ -460,8 +459,7 @@ impl Music3Syn {
         let mut t1 = ws.t1.slice_mut(0..ws.t1.len());
         self.linear_biased(
             &self.weights.flow.time_l1_w,
-            dim,
-            fourier_dim,
+            [dim, fourier_dim],
             &fourier.slice(0..fourier_dim),
             1,
             &mut t1.slice_mut(0..dim),
@@ -475,8 +473,7 @@ impl Music3Syn {
         }
         self.linear_biased(
             &self.weights.flow.time_l2_w,
-            dim,
-            dim,
+            [dim, dim],
             &t1.slice(0..dim),
             1,
             &mut temb.slice_mut(0..dim),
@@ -603,8 +600,7 @@ impl Music3Syn {
             )?;
             self.linear_biased(
                 &block.ff_in_w,
-                2 * ff,
-                dim,
+                [2 * ff, dim],
                 &ws.norm.slice(0..dim * tokens),
                 tokens,
                 &mut ws.ff_buf.slice_mut(0..2 * ff * tokens),
@@ -621,8 +617,7 @@ impl Music3Syn {
             }
             self.linear_biased(
                 &block.ff_out_w,
-                dim,
-                ff,
+                [dim, ff],
                 &ff_gated.slice(0..ff * tokens),
                 tokens,
                 &mut ff_out.slice_mut(0..dim * tokens),
@@ -777,8 +772,7 @@ impl Music3Syn {
         let mut t1 = ws.t1.slice_mut(0..dim);
         self.linear_biased(
             &self.weights.flow.time_l1_w,
-            dim,
-            fourier_dim,
+            [dim, fourier_dim],
             &fourier_ro,
             1,
             &mut t1,
@@ -795,8 +789,7 @@ impl Music3Syn {
         let mut temb_out = ws.temb.slice_mut(0..dim);
         self.linear_biased(
             &self.weights.flow.time_l2_w,
-            dim,
-            dim,
+            [dim, dim],
             &t1_ro,
             1,
             &mut temb_out,
@@ -923,8 +916,7 @@ impl Music3Syn {
             let mut ff_buf = ws.ff_buf.slice_mut(0..pair_tokens * 2 * ff);
             self.linear_biased(
                 &block.ff_in_w,
-                2 * ff,
-                dim,
+                [2 * ff, dim],
                 &norm_ro,
                 pair_tokens,
                 &mut ff_buf,
@@ -945,8 +937,7 @@ impl Music3Syn {
             let mut ff_out2 = ws.ff_out.slice_mut(0..pair_tokens * dim);
             self.linear_biased(
                 &block.ff_out_w,
-                dim,
-                ff,
+                [dim, ff],
                 &gated_ro,
                 pair_tokens,
                 &mut ff_out2,
@@ -1197,8 +1188,7 @@ impl Music3Syn {
             }
             self.linear_biased_bytes(
                 w,
-                out_dim,
-                in_dim * kernel,
+                [out_dim, in_dim * kernel],
                 &cols.slice(0..rows * in_dim * kernel),
                 rows,
                 out,
@@ -1302,8 +1292,7 @@ impl Music3Syn {
         }
         self.linear_biased(
             &self.weights.vocoder.dec_in_proj_w,
-            input_dim,
-            streams,
+            [input_dim, streams],
             &ws.voc_x.slice(0..length * streams),
             length,
             &mut ws.voc_dec.slice_mut(0..length * input_dim),
@@ -1396,8 +1385,7 @@ impl Music3Syn {
                 }
                 self.linear_biased_bytes(
                     &unit.c2_w,
-                    dim,
-                    dim,
+                    [dim, dim],
                     &ws.voc_sn2.slice(0..count),
                     rows,
                     &mut ws.voc_gated,
@@ -1480,13 +1468,13 @@ impl Music3Syn {
     fn linear_biased_bytes(
         &self,
         weight: &CudaSlice<bf16>,
-        out_rows: usize,
-        in_cols: usize,
+        shape: [usize; 2],
         input: &CudaView<bf16>,
         rows: usize,
         out: &mut CudaSlice<bf16>,
         bias: &CudaSlice<u8>,
     ) -> Result<()> {
+        let [out_rows, in_cols] = shape;
         let mut view = TensorMut(unsafe {
             Tensor::new(
                 out.device_ptr_mut(&self.stream).0,

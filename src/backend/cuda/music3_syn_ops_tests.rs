@@ -31,8 +31,7 @@ mod gates {
         let mut d_output = device.stream.alloc_zeros::<half::bf16>(dim)?;
         engine.linear_biased(
             &engine.weights.flow.time_l1_w,
-            dim,
-            fourier_dim,
+            [dim, fourier_dim],
             &d_input.slice(0..fourier_dim),
             1,
             &mut d_output.slice_mut(0..dim),
