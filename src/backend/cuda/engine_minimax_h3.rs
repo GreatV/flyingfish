@@ -56,14 +56,14 @@ pub fn image_decode(
     let device = Device::new(ordinal)?;
     let ops = ops::Ops::new(&device.ctx)?;
     device.finish_upload()?;
-    let blas = Blas::new(
+    let mut blas = Blas::new(
         &device,
         &ops,
         runtime,
         Rc::new(Closure::new(true, "image VAE".into())),
     )?;
     let input = device.stream.clone_htod(normalized)?;
-    let rgb = vae::decode_image_device(&device, &blas, model, &input, extent)?;
+    let rgb = vae::decode_image_device(&device, &mut blas, model, &input, extent)?;
     let output = device.stream.clone_dtoh(&rgb)?;
     ensure!(
         output.iter().all(|v| v.is_finite()),

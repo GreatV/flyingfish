@@ -1891,6 +1891,7 @@ struct DenseEntry {
     device_offset: usize,
     source_offset: usize,
     entry: TensorEntry,
+    narrow_f32: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -1900,6 +1901,7 @@ struct DenseLayer {
     next_disk: Option<usize>,
     bytes: usize,
     source_bytes: usize,
+    needs_staging: bool,
     entries: Vec<DenseEntry>,
     host: Option<PinnedHostSlice<u8>>,
     checked: bool,
@@ -1925,6 +1927,7 @@ pub(crate) struct DenseStreaming {
     upload: Arc<CudaStream>,
     staging: Option<CudaSlice<u8>>,
     quant: Option<QuantKernels>,
+    narrow_f32: Option<cudarc::driver::CudaFunction>,
     pub plan: crate::prefill::DensePlacement,
     #[cfg(test)]
     skip_reclaim: bool,
@@ -1948,7 +1951,25 @@ impl DenseStreaming {
         d: &Device,
         order: Option<&[Vec<String>]>,
     ) -> Result<Self> {
-        Self::allocate(dir, Some((manifest, order)), plan, d, None)
+        Self::allocate(dir, Some((manifest, order)), plan, d, None, None)
+    }
+
+    pub(crate) fn with_f32_cast(
+        dir: &Path,
+        manifest: &TensorManifest,
+        plan: crate::prefill::DensePlacement,
+        d: &Device,
+        order: &[Vec<String>],
+        narrow: fn(&str) -> bool,
+    ) -> Result<Self> {
+        Self::allocate(
+            dir,
+            Some((manifest, Some(order))),
+            plan,
+            d,
+            None,
+            Some(narrow),
+        )
     }
 
     pub(crate) fn new_preloaded(
@@ -1961,7 +1982,7 @@ impl DenseStreaming {
             plan.disk_bytes == 0 && layer_bytes.len() == plan.slots.len(),
             "preloaded layer layout differs from host placement"
         );
-        Self::allocate(dir, None, plan, d, Some(layer_bytes))
+        Self::allocate(dir, None, plan, d, Some(layer_bytes), None)
     }
 
     fn allocate(
@@ -1970,6 +1991,7 @@ impl DenseStreaming {
         plan: crate::prefill::DensePlacement,
         d: &Device,
         preloaded: Option<&[usize]>,
+        narrow: Option<fn(&str) -> bool>,
     ) -> Result<Self> {
         use crate::experts::{catalogue::NativeRange, disk::DiskReader};
         let mut layers: Vec<_> = plan
@@ -1981,6 +2003,7 @@ impl DenseStreaming {
                 next_disk: None,
                 bytes: 0,
                 source_bytes: 0,
+                needs_staging: false,
                 entries: Vec::new(),
                 host: None,
                 checked: false,
@@ -1994,7 +2017,19 @@ impl DenseStreaming {
             }
             let device_offset = layer.bytes;
             let source_offset = layer.source_bytes;
-            let device_bytes = device_slot_bytes(name, entry)?;
+            let narrow_f32 = narrow.is_some_and(|narrow| narrow(name));
+            let device_bytes = if narrow_f32 {
+                ensure!(
+                    entry.dtype == Dtype::F32
+                        && entry.quant.is_none()
+                        && entry.bytes.is_multiple_of(4),
+                    "{name}: F32 to BF16 stream source"
+                );
+                entry.bytes / 2
+            } else {
+                device_slot_bytes(name, entry)?
+            };
+            layer.needs_staging |= narrow_f32 || dequantizes(entry.quant);
             layer.bytes = layer
                 .bytes
                 .checked_add(device_bytes)
@@ -2007,6 +2042,7 @@ impl DenseStreaming {
                 device_offset,
                 source_offset,
                 entry: entry.clone(),
+                narrow_f32,
             });
             if !plan.host[layer_index] {
                 let offset = entry
@@ -2069,12 +2105,7 @@ impl DenseStreaming {
         }
         let staging_bytes = layers
             .iter()
-            .filter(|layer| {
-                layer
-                    .entries
-                    .iter()
-                    .any(|entry| dequantizes(entry.entry.quant))
-            })
+            .filter(|layer| layer.needs_staging)
             .map(|layer| layer.source_bytes)
             .max()
             .unwrap_or(0);
@@ -2126,7 +2157,14 @@ impl DenseStreaming {
             .context("dense streaming plan has no slot")?;
         let ring = u32::try_from(slot_count)?;
         let (disk, events, read_ahead) = if plan.disk_bytes > 0 {
-            let disk = DiskReader::open_ranges(&ranges, plan.slot_bytes, dir, ring)?;
+            let disk_slot_bytes = layers
+                .iter()
+                .enumerate()
+                .filter(|(index, layer)| layer.slot.is_some() && !plan.host[*index])
+                .map(|(_, layer)| layer.source_bytes)
+                .max()
+                .context("dense disk plan has no disk layers")?;
+            let disk = DiskReader::open_ranges(&ranges, disk_slot_bytes, dir, ring)?;
             let reader =
                 super::engine::Reader::new_ranges(d, disk, ranges, UPLOAD_CHUNK_BYTES as u64)?;
             let events = super::engine::Events::new(&d.ctx, (ring as usize) * 4)?;
@@ -2164,8 +2202,17 @@ impl DenseStreaming {
         let staging = (staging_bytes > 0)
             .then(|| d.upload.alloc_zeros::<u8>(staging_bytes))
             .transpose()?;
-        let quant = (staging_bytes > 0)
+        let entries = || layers.iter().flat_map(|layer| &layer.entries);
+        let quant = entries()
+            .any(|entry| dequantizes(entry.entry.quant))
             .then(|| QuantKernels::new(&d.ctx))
+            .transpose()?;
+        let narrow_f32 = entries()
+            .any(|entry| entry.narrow_f32)
+            .then(|| -> Result<_> {
+                Ok(super::cubin::module(&d.ctx, "vision_ops")?
+                    .load_function("vision_downcast_f32_to_bf16_checked")?)
+            })
             .transpose()?;
         #[cfg(test)]
         allocation_record("staging_and_quant_modules", staging_bytes, 0)?;
@@ -2179,6 +2226,7 @@ impl DenseStreaming {
             upload: d.upload.clone(),
             staging,
             quant,
+            narrow_f32,
             plan,
             #[cfg(test)]
             skip_reclaim: false,
@@ -2360,16 +2408,13 @@ impl DenseStreaming {
         }
         let source_bytes = self.layers[index].source_bytes;
         let check_source = !self.layers[index].checked;
-        let quantized = self.layers[index]
-            .entries
-            .iter()
-            .any(|entry| dequantizes(entry.entry.quant));
+        let needs_staging = self.layers[index].needs_staging;
         let pointer = self.slots[slot_index].device.device_ptr(&self.upload).0;
-        let staging = quantized
+        let staging = needs_staging
             .then(|| {
                 self.staging
                     .as_ref()
-                    .context("quantized layer without a staging buffer")
+                    .context("converted layer without a staging buffer")
                     .map(|staging| staging.device_ptr(&self.upload).0)
             })
             .transpose()?;
@@ -2441,14 +2486,25 @@ impl DenseStreaming {
         if check_source {
             self.layers[index].checked = true;
         }
-        if quantized {
-            let quant = self
-                .quant
-                .as_ref()
-                .context("quantized layer without dequant kernels")?;
+        if needs_staging {
             for entry in &self.layers[index].entries {
                 let destination = pointer + entry.device_offset as u64;
-                if dequantizes(entry.entry.quant) {
+                if entry.narrow_f32 {
+                    let count = u32::try_from(entry.entry.bytes / 4)?;
+                    unsafe {
+                        self.upload
+                            .launch_builder(
+                                self.narrow_f32
+                                    .as_ref()
+                                    .context("missing F32 cast kernel")?,
+                            )
+                            .arg(&(source_pointer + entry.source_offset as u64))
+                            .arg(&destination)
+                            .arg(&count)
+                            .launch(super::ops::flat(count as usize))?;
+                    }
+                } else if dequantizes(entry.entry.quant) {
+                    let quant = self.quant.as_ref().context("missing dequant kernels")?;
                     let elements = entry.entry.shape[0] * entry.entry.shape[1];
                     quant.dequant(
                         &self.upload,

@@ -1,5 +1,5 @@
 //! MiniMax-H3 image/video VAEs: tiled ViT decoders and the causal CNN keyframe encoder.
-use super::{Element, EntryReader, Source, pointer, rows_view, vector};
+use super::{Element, EntryReader, Source, pointer, rows_view};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
@@ -20,239 +20,37 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{path::Path, sync::Arc};
 
-struct ImageKernels {
-    bias: CudaFunction,
-    rms: CudaFunction,
-    residual: CudaFunction,
-    norm: CudaFunction,
-    softmax: CudaFunction,
-    silu: CudaFunction,
-    gather: CudaFunction,
-    append: CudaFunction,
-    pack: CudaFunction,
-    unpack: CudaFunction,
-    patches: CudaFunction,
-    stitch: CudaFunction,
-    pixels: CudaFunction,
-}
-
-impl ImageKernels {
-    fn new(s: &Arc<CudaStream>) -> Result<Self> {
-        let vision = cubin::module(s.context(), "vision_ops")?;
-        let common = cubin::module(s.context(), "q38_common")?;
-        Ok(Self {
-            bias: vision.load_function("vision_bias_f32")?,
-            rms: vision.load_function("vision_rms_scale_f32")?,
-            residual: common.load_function("channel_scale_residual_f32")?,
-            norm: common.load_function("q38_layer_norm_f32")?,
-            softmax: common.load_function("softmax_rows_f32")?,
-            silu: cubin::module(s.context(), "act")?.load_function("silu_mul_f32")?,
-            gather: vision.load_function("tile_rows_f32")?,
-            append: vision.load_function("append_register_rows_f32")?,
-            pack: vision.load_function("rotary_pack_qkv_f32")?,
-            unpack: vision.load_function("head_rows_f32")?,
-            patches: vision.load_function("unpatchify_f32")?,
-            stitch: vision.load_function("tile_stitch_f32")?,
-            pixels: vision.load_function("planar_affine_rows_f32")?,
-        })
-    }
-}
-
-struct ImageLimits {
-    budget: usize,
-    reserved: usize,
-    l2: usize,
-    sms: usize,
-    grid: usize,
-}
-
-#[derive(Debug)]
-struct ImagePlan {
-    linear: usize,
-    attention: usize,
-    patches: usize,
-    tokens: usize,
-    grid: usize,
-    bytes: usize,
-}
-
-impl ImagePlan {
-    fn sizing(spec: &VaeSpec, tiles: &VaeTiles, canvas: [usize; 2]) -> (usize, [u128; 3]) {
-        let slots = tiles.count();
-        let patches = tiles.height / spec.spatial_ratio * (tiles.width / spec.spatial_ratio);
-        let tokens = patches + spec.registers + 1;
-        let pixels = canvas[0] as u128 * canvas[1] as u128;
-        let grid_words = 2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2;
-        let fixed = 4u128
-            * slots as u128
-            * spec.out_channels as u128
-            * tiles.height as u128
-            * tiles.width as u128
-            + 8 * pixels * spec.out_channels as u128
-            + 4u128 * (grid_words + tokens * spec.rope_dims + spec.head_dim) as u128;
-        let per_tile = 4u128 * tokens as u128 * (7 * spec.dim + 3 * spec.ffn) as u128
-            + 4u128 * tokens as u128 * spec.patch_width() as u128
-            + 8u128 * patches as u128 * spec.latent_channels as u128;
-        let scores = 4u128 * spec.heads as u128 * (tokens as u128).pow(2);
-        (patches, [fixed, per_tile, scores])
-    }
-
-    fn derive(
-        spec: &VaeSpec,
-        tiles: &VaeTiles,
-        canvas: [usize; 2],
-        limits: ImageLimits,
-    ) -> Result<Self> {
-        let slots = tiles.count();
-        let (patches, [fixed, per_tile, p]) = Self::sizing(spec, tiles, canvas);
-        let tokens = patches + spec.registers + 1;
-        let s = 4u128 * tokens as u128 * spec.dim as u128;
-        let budget = limits
-            .budget
-            .checked_sub(limits.reserved)
-            .context("image VAE budget holds no space after pending stages")?;
-        ensure!(
-            slots > 0 && patches > 0 && limits.sms > 0 && limits.grid > 0,
-            "image VAE setup has an empty shape or device limit"
-        );
-        ensure!(
-            fixed + per_tile + p <= budget as u128,
-            "image VAE serial tile requires {} bytes; workspace budget {}",
-            fixed + per_tile + p,
-            budget
-        );
-        let cache_cap = (limits.l2 as u128 / (4 * s + p)).max(1) as usize;
-        let wave = limits.sms.div_ceil(spec.heads);
-        let cache_cap = if cache_cap >= wave {
-            cache_cap / wave * wave
-        } else {
-            cache_cap
-        };
-        let score_cap = ((budget as u128 - fixed - per_tile) / p) as usize;
-        let mut attention = cache_cap.min(slots).min(score_cap).max(1);
-        let launch_cap = (u32::MAX as usize / tokens / (2 * spec.ffn))
-            .min(i32::MAX as usize / tokens)
-            .min(limits.grid / tokens / spec.heads)
-            .min(limits.grid.saturating_mul(256) / tokens / (2 * spec.ffn));
-        loop {
-            let available = budget as u128 - fixed - attention as u128 * p;
-            let mut linear = (available / per_tile) as usize;
-            linear = linear.min(slots).min(launch_cap);
-            ensure!(
-                linear > 0,
-                "image VAE has no tile batch within device launch limits"
-            );
-            if linear < attention {
-                attention = linear;
-                continue;
-            }
-            if linear < slots {
-                linear = linear / attention * attention;
-            }
-            return Ok(Self {
-                linear,
-                attention,
-                patches,
-                tokens,
-                grid: limits.grid,
-                bytes: usize::try_from(fixed + linear as u128 * per_tile + attention as u128 * p)?,
-            });
-        }
-    }
-
-    fn flat(&self, count: usize) -> LaunchConfig {
-        LaunchConfig {
-            grid_dim: (count.div_ceil(256).min(self.grid) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        }
-    }
-}
-
-pub(crate) struct DecoderWork {
-    plan: ImagePlan,
-    rope: CudaSlice<f32>,
-    ones: CudaSlice<f32>,
-    x: CudaSlice<f32>,
-    norm: CudaSlice<f32>,
-    o: CudaSlice<f32>,
-    q: CudaSlice<f32>,
-    k: CudaSlice<f32>,
-    v: CudaSlice<f32>,
-    attn: CudaSlice<f32>,
-    ff: CudaSlice<f32>,
-    gated: CudaSlice<f32>,
-    latent: CudaSlice<f32>,
-    latent_q: CudaSlice<f32>,
-    patch_rows: CudaSlice<f32>,
-    scores: CudaSlice<f32>,
-}
-
-impl DecoderWork {
-    fn new(s: &Arc<CudaStream>, spec: &VaeSpec, plan: ImagePlan, rope: Vec<f32>) -> Result<Self> {
-        let n = plan.linear * plan.tokens * spec.dim;
-        let latent = plan.linear * plan.patches * spec.latent_channels;
-        // Every active element is written before it is read.
-        let alloc = |count| unsafe { s.alloc::<f32>(count) };
-        Ok(Self {
-            rope: s.clone_htod(&rope)?,
-            ones: s.clone_htod(&vec![1f32; spec.head_dim])?,
-            x: alloc(n)?,
-            norm: alloc(n)?,
-            o: alloc(n)?,
-            q: alloc(n)?,
-            k: alloc(n)?,
-            v: alloc(n)?,
-            attn: alloc(n)?,
-            ff: alloc(n * 2 * spec.ffn / spec.dim)?,
-            gated: alloc(n * spec.ffn / spec.dim)?,
-            latent: alloc(latent)?,
-            latent_q: alloc(latent)?,
-            patch_rows: alloc(plan.linear * plan.tokens * spec.patch_width())?,
-            scores: alloc(plan.attention * spec.heads * plan.tokens * plan.tokens)?,
-            plan,
-        })
-    }
-}
-
 pub(super) struct ImageWork {
-    core: DecoderWork,
+    core: TileWork,
     tiles: VaeTiles,
     canvas: [usize; 2],
     grid: CudaSlice<u32>,
-    raw: CudaSlice<f32>,
-    planar: CudaSlice<f32>,
+    raw: CudaSlice<bf16>,
+    planar: CudaSlice<bf16>,
     rgb: CudaSlice<f32>,
 }
 
 impl ImageWork {
     pub(super) fn visits(&self) -> usize {
-        self.tiles.count().div_ceil(self.plan.linear)
+        self.tiles.count().div_ceil(self.core.batch)
     }
 }
 
-impl std::ops::Deref for ImageWork {
-    type Target = DecoderWork;
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
+#[cfg(test)]
+enum DecoderRows<'a> {
+    Bf16(&'a CudaSlice<bf16>),
+    F32(&'a CudaSlice<f32>),
 }
 
-type ImageRows<'a> = (&'a CudaSlice<f32>, usize, usize, usize);
+#[cfg(test)]
+type ImageRows<'a> = (DecoderRows<'a>, usize, usize, usize);
 
-pub(crate) struct ImageDecoder {
-    spec: VaeSpec,
-    post_quant: Linear,
-    proj_in: Linear,
-    registers: Tensor<f32, 1>,
-    norm_out: (Tensor<f32, 1>, Tensor<f32, 1>),
-    proj_out: Linear,
-    blocks: Vec<DecoderBlock>,
-    latent_affine: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
-    pixel_affine: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
-    kernels: ImageKernels,
-    _weights: Vec<CudaSlice<f32>>,
-    dense: Option<std::cell::RefCell<crate::backend::cuda::weights::DenseStreaming>>,
+struct ImageDecoder {
+    core: VideoDecoder,
+    latent_affine: (CudaSlice<f32>, CudaSlice<f32>),
+    pixel_affine: (CudaSlice<f32>, CudaSlice<f32>),
+    gather: CudaFunction,
+    pixels: CudaFunction,
 }
 
 impl<T: DeviceRepr + Copy> Linear<T> {
@@ -275,214 +73,126 @@ impl<T: DeviceRepr + Copy> Linear<T> {
                 }
             },
             bias: load(&format!("{base}.bias"), out)?,
-            out,
         })
-    }
-}
-
-impl Linear {
-    fn run(
-        &self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
-        bias: &CudaFunction,
-        x: Tensor<f32, 2>,
-        y: Tensor<f32, 2>,
-    ) -> Result<()> {
-        blas.linear_f32(self.weight, x, &mut TensorMut(y))?;
-        unsafe {
-            s.launch_builder(bias)
-                .arg(&y.ptr)
-                .arg(&self.bias.ptr)
-                .arg(&y.ptr)
-                .arg(&y.shape[0])
-                .arg(&y.shape[1])
-                .launch(flat(y.shape[0] as usize * self.out))?;
-        }
-        Ok(())
     }
 }
 
 impl ImageDecoder {
     fn new(
         device: &Device,
-        spec: VaeSpec,
+        spec: &VaeSpec,
         component: &Path,
         manifest: &TensorManifest,
     ) -> Result<Self> {
-        Self::with_placement(device, spec, component, manifest, None)
+        let (free, total) = device.ctx.mem_get_info()?;
+        let bytes = decoder_weight_bytes(manifest);
+        ensure!(
+            bytes <= device.workspace_budget(free, free, total / 16)?,
+            "image VAE decoder weights need {bytes} bytes"
+        );
+        Self::from_weights(device, spec, DecoderWeightLoad::new(component, manifest))
     }
 
-    fn with_placement(
+    fn from_weights(
         device: &Device,
-        spec: VaeSpec,
-        component: &Path,
-        manifest: &TensorManifest,
-        placement: Option<crate::prefill::DensePlacement>,
+        spec: &VaeSpec,
+        loader: DecoderWeightLoad<'_>,
     ) -> Result<Self> {
-        let s = &device.stream;
         ensure!(
             spec.out_channels == VAE_PIXEL_STD.len(),
-            "image VAE pixel affine requires three channels"
+            "image VAE requires three channels"
         );
-        let kernels = ImageKernels::new(s)?;
-        let expected: std::collections::BTreeSet<_> = manifest
+        let s = &device.stream;
+        let vision = cubin::module(s.context(), "vision_ops")?;
+        let bytes = decoder_weight_bytes(loader.manifest);
+        let tensors = loader
+            .manifest
             .entries
             .keys()
             .filter(|name| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
-            .cloned()
-            .collect();
-        let weight_bytes: usize = expected
-            .iter()
-            .map(|name| manifest.entries[name].bytes)
-            .sum();
-        let (free, total) = device.ctx.mem_get_info()?;
-        let mut source = Source::new(component, manifest);
-        let mut weights = Vec::new();
-        let mut consumed = std::collections::BTreeSet::new();
-        let mut offsets = std::collections::BTreeMap::new();
-        let dense = match placement {
-            Some(plan) if plan.slot_bytes > 0 => {
-                let order = image_decoder_layer_names(manifest, spec.layers);
-                let keep = plan.slots.clone();
-                let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
-                    component,
-                    manifest,
-                    plan,
-                    device,
-                    Some(&order),
-                )?;
-                for (layer, names) in order.iter().enumerate() {
-                    if keep[layer].is_none() {
-                        continue;
-                    }
-                    let mut offset = 0;
-                    let mut host = dense.host_layer(layer)?;
-                    for name in names {
-                        let entry = &manifest.entries[name];
-                        offsets.insert(name.as_str().to_owned(), (layer, offset));
-                        if let Some(w) = host.as_deref_mut() {
-                            source.reader.read_into(
-                                name,
-                                entry,
-                                &mut w[offset..offset + entry.bytes],
-                            )?;
-                        }
-                        offset += entry.bytes;
-                    }
-                }
-                Some(dense)
-            }
-            _ => {
-                ensure!(
-                    weight_bytes <= device.workspace_budget(free, free, total / 16)?,
-                    "image VAE decoder weights need {weight_bytes} bytes"
-                );
-                None
-            }
-        };
-        let mut load = |name: &str, count: usize| -> Result<Tensor<f32, 1>> {
-            ensure!(
-                consumed.insert(name.to_owned()),
-                "VAE duplicate tensor {name}"
-            );
-            let entry = manifest
-                .entries
-                .get(name)
-                .with_context(|| format!("VAE tensor {name} missing"))?;
-            ensure!(
-                entry.dtype == safetensors::Dtype::F32
-                    && entry.quant.is_none()
-                    && entry.bytes == 4 * count,
-                "VAE tensor {name} is not published F32"
-            );
-            if let Some(&(layer, offset)) = offsets.get(name) {
-                let pointer = dense
-                    .as_ref()
-                    .context("image decoder weight slot missing")?
-                    .pointer(layer, offset, entry.bytes)?;
-                return unsafe {
-                    Tensor::new(
-                        pointer,
-                        [u32::try_from(count)?],
-                        [1],
-                        u64::try_from(entry.bytes)?,
-                    )
-                };
-            }
-            let data = source.tensor::<f32>(s, name, count)?;
-            let tensor = vector(&data, s)?;
-            weights.push(data);
-            Ok(tensor)
-        };
-        let (dim, latent, ffn) = (spec.dim, spec.latent_channels, spec.ffn);
-        let post_quant = Linear::load(&mut load, "post_quant_conv", latent, latent)?;
-        let proj_in = Linear::load(&mut load, "decoder.proj_in", dim, latent)?;
-        let registers = load("decoder.register_tokens", spec.registers * dim)?;
-        let norm_out = (
-            load("decoder.norm_out.weight", dim)?,
-            load("decoder.norm_out.bias", dim)?,
-        );
-        let proj_out = Linear::load(&mut load, "decoder.proj_out", spec.patch_width(), dim)?;
-        let mut blocks = Vec::with_capacity(spec.layers);
-        for layer in 0..spec.layers {
-            let b = format!("decoder.transformer_blocks.{layer}");
-            blocks.push(DecoderBlock {
-                q: Linear::load(&mut load, &format!("{b}.attn.to_q"), dim, dim)?,
-                k: Linear::load(&mut load, &format!("{b}.attn.to_k"), dim, dim)?,
-                v: Linear::load(&mut load, &format!("{b}.attn.to_v"), dim, dim)?,
-                out: Linear::load(&mut load, &format!("{b}.attn.to_out.0"), dim, dim)?,
-                ff_in: Linear::load(&mut load, &format!("{b}.ff.net.0.proj"), 2 * ffn, dim)?,
-                ff_out: Linear::load(&mut load, &format!("{b}.ff.net.2"), dim, ffn)?,
-                norm1: load(&format!("{b}.norm1.weight"), dim)?,
-                norm2: load(&format!("{b}.norm2.weight"), dim)?,
-                scale1: load(&format!("{b}.scale1"), dim)?,
-                scale2: load(&format!("{b}.scale2"), dim)?,
-            });
-        }
-        ensure!(
-            consumed == expected,
-            "image VAE partial loader does not cover the decoder tensor set"
-        );
+            .count();
+        let core = VideoDecoder::from_weights(device, spec, loader)?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
                 "{}",
-                serde_json::json!({"image_vae_decoder_load":{"tensors":consumed.len(),"weight_bytes":weight_bytes,"dtype":"F32"}})
+                serde_json::json!({"image_vae_decoder_load":{"tensors":tensors,"weight_bytes":bytes,"dtype":"BF16/F32"}})
             );
         }
         Ok(Self {
-            spec: spec.clone(),
-            _weights: weights,
-            dense: dense.map(std::cell::RefCell::new),
-            post_quant,
-            proj_in,
-            registers,
-            norm_out,
-            proj_out,
-            blocks,
-            kernels,
-            latent_affine: Some((
+            core,
+            latent_affine: (
                 s.clone_htod(&spec.latents_std)?,
                 s.clone_htod(&spec.latents_mean)?,
-            )),
-            pixel_affine: Some((
+            ),
+            pixel_affine: (
                 s.clone_htod(&VAE_PIXEL_STD.map(|x| x as f32))?,
                 s.clone_htod(&VAE_PIXEL_MEAN.map(|x| x as f32))?,
-            )),
+            ),
+            gather: vision.load_function("tile_rows_f32_to_bf16")?,
+            pixels: vision.load_function("planar_bf16_affine_rows_f32")?,
         })
     }
 
+    fn work_size(
+        spec: &VaeSpec,
+        tiles: &VaeTiles,
+        canvas: [usize; 2],
+        batch: usize,
+    ) -> Result<usize> {
+        let shape = (
+            1,
+            tiles.height / spec.spatial_ratio,
+            tiles.width / spec.spatial_ratio,
+        );
+        let grid_words = 2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2;
+        let fixed = 2u128
+            * tiles.count() as u128
+            * spec.out_channels as u128
+            * tiles.height as u128
+            * tiles.width as u128
+            + 6u128 * canvas[0] as u128 * canvas[1] as u128 * spec.out_channels as u128
+            + 4u128 * grid_words as u128;
+        Ok(usize::try_from(
+            fixed + TileWork::batch_bytes(spec, shape, batch, tiles.count())? as u128,
+        )?)
+    }
+
+    fn batch(
+        spec: &VaeSpec,
+        tiles: &VaeTiles,
+        canvas: [usize; 2],
+        budget: usize,
+        grid: usize,
+    ) -> Result<(usize, usize)> {
+        let tokens = tiles.height / spec.spatial_ratio * (tiles.width / spec.spatial_ratio)
+            + spec.registers
+            + 1;
+        let cap = (i32::MAX as usize / tokens / (2 * spec.ffn))
+            .min(grid / tokens / (2 * spec.heads))
+            .min(grid.saturating_mul(2048) / tokens / spec.ffn)
+            .min(tiles.count());
+        for batch in (1..=cap).rev() {
+            let bytes = Self::work_size(spec, tiles, canvas, batch)?;
+            if bytes <= budget {
+                return Ok((batch, bytes));
+            }
+        }
+        anyhow::bail!(
+            "image VAE serial tile requires {} bytes and a valid grid; workspace budget {budget}, grid limit {grid}",
+            Self::work_size(spec, tiles, canvas, 1)?
+        );
+    }
+
     fn work(&self, device: &Device, canvas: [usize; 2], budget: usize) -> Result<ImageWork> {
-        Self::work_for(device, &self.spec, canvas, (budget, 0))
+        Self::work_for(device, &self.core.spec, canvas, budget)
     }
 
     fn work_for(
         device: &Device,
         spec: &VaeSpec,
         canvas: [usize; 2],
-        (budget, reserved): (usize, usize),
+        budget: usize,
     ) -> Result<ImageWork> {
-        use cudarc::driver::sys::CUdevice_attribute as A;
         ensure!(
             canvas
                 .into_iter()
@@ -491,29 +201,13 @@ impl ImageDecoder {
         );
         ensure!(
             canvas[0] as u128 * canvas[1] as u128 * spec.out_channels as u128 <= u32::MAX as u128,
-            "image VAE canvas exceeds the F32 layout index range"
+            "image VAE canvas exceeds the layout index range"
         );
         let tiles = VaeTiles::released(spec, canvas[0], canvas[1])?;
-        let plan = ImagePlan::derive(
-            spec,
-            &tiles,
-            canvas,
-            ImageLimits {
-                budget,
-                reserved,
-                l2: usize::try_from(device.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?)?,
-                sms: usize::try_from(
-                    device
-                        .ctx
-                        .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-                )?,
-                grid: usize::try_from(
-                    device
-                        .ctx
-                        .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?,
-                )?,
-            },
-        )?;
+        let grid_limit = usize::try_from(device.ctx.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
+        )?)?;
+        let (batch, bytes) = Self::batch(spec, &tiles, canvas, budget, grid_limit)?;
         let s = &device.stream;
         let grid: Vec<u32> = tiles
             .rows
@@ -523,341 +217,57 @@ impl ImageDecoder {
             .chain(&tiles.cols.0)
             .chain(&tiles.cols.1)
             .map(|&v| u32::try_from(v))
-            .collect::<Result<_, _>>()?;
-        let rope = rotary_table(
-            spec,
-            (
-                1,
-                tiles.height / spec.spatial_ratio,
-                tiles.width / spec.spatial_ratio,
-            ),
-            2,
-            |x| x,
-        );
-        let raw = tiles.count() * spec.out_channels * tiles.height * tiles.width;
+            .collect::<std::result::Result<_, _>>()?;
         let pixels = spec.out_channels * canvas[0] * canvas[1];
-        // Every active element is written before it is read.
-        let alloc = |count| unsafe { s.alloc::<f32>(count) };
+        let raw = tiles.count() * spec.out_channels * tiles.height * tiles.width;
+        let tile = (
+            1,
+            tiles.height / spec.spatial_ratio,
+            tiles.width / spec.spatial_ratio,
+        );
         let work = ImageWork {
+            core: TileWork::with_rope_axes(s, spec, tile, (batch, tiles.count()), 2)?,
             grid: s.clone_htod(&grid)?,
-            core: DecoderWork::new(s, spec, plan, rope)?,
-            raw: alloc(raw)?,
-            planar: alloc(pixels)?,
-            rgb: alloc(pixels)?,
+            raw: unsafe { s.alloc(raw)? },
+            planar: unsafe { s.alloc(pixels)? },
+            rgb: unsafe { s.alloc(pixels)? },
             tiles,
             canvas,
         };
-        let actual = [
-            &work.rope,
-            &work.ones,
-            &work.x,
-            &work.norm,
-            &work.o,
-            &work.q,
-            &work.k,
-            &work.v,
-            &work.attn,
-            &work.ff,
-            &work.gated,
-            &work.latent,
-            &work.latent_q,
-            &work.patch_rows,
-            &work.scores,
-            &work.raw,
-            &work.planar,
-            &work.rgb,
-        ]
-        .iter()
-        .map(|b| 4 * b.len())
-        .sum::<usize>()
-            + 4 * work.grid.len();
+        let actual = work.core.allocated_bytes()
+            + 4 * (work.grid.len() + work.rgb.len())
+            + 2 * (work.raw.len() + work.planar.len());
         ensure!(
-            actual == work.plan.bytes,
-            "image VAE work differs from counted memory plan {actual}/{}",
-            work.plan.bytes
+            actual == bytes,
+            "image VAE workspace allocation {actual}/{bytes}"
         );
         if crate::backend::diagnostics_enabled() {
             eprintln!(
                 "{}",
-                serde_json::json!({"image_vae_plan":{"canvas":canvas,"tiles":work.tiles.count(),
-                "tokens":work.plan.tokens,"linear_batch":work.plan.linear,"attention_batch":work.plan.attention,
-                "bytes":actual,"workspace_budget":budget,"silu_grid":flat(work.plan.linear*work.plan.tokens*spec.ffn).grid_dim.0}})
+                serde_json::json!({"image_vae_plan":{
+                    "canvas":canvas,"tiles":work.tiles.count(),"tokens":work.core.tokens,
+                    "linear_batch":batch,"attention_batch":batch,"bytes":bytes,"workspace_budget":budget
+                }})
             );
         }
         Ok(work)
-    }
-
-    fn rms(
-        &self,
-        s: &Arc<CudaStream>,
-        input: Tensor<f32, 2>,
-        weight: Tensor<f32, 1>,
-        output: u64,
-    ) -> Result<()> {
-        unsafe {
-            s.launch_builder(&self.kernels.rms)
-                .arg(&input.ptr)
-                .arg(&weight.ptr)
-                .arg(&1u32)
-                .arg(&output)
-                .arg(&0u64)
-                .arg(&input.shape[1])
-                .arg(&self.spec.norm_eps)
-                .launch(ops::grid(input.shape[0] as usize, 256))?;
-        }
-        Ok(())
-    }
-
-    fn residual(
-        &self,
-        s: &Arc<CudaStream>,
-        w: &DecoderWork,
-        branch: &CudaSlice<f32>,
-        scale: Tensor<f32, 1>,
-        rows: usize,
-    ) -> Result<()> {
-        unsafe {
-            s.launch_builder(&self.kernels.residual)
-                .arg(&pointer(&w.x, s))
-                .arg(&pointer(branch, s))
-                .arg(&scale.ptr)
-                .arg(&pointer(&w.x, s))
-                .arg(&u32::try_from(rows)?)
-                .arg(&u32::try_from(self.spec.dim)?)
-                .launch(w.plan.flat(rows * self.spec.dim))?;
-        }
-        Ok(())
-    }
-
-    fn attention(
-        &self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
-        w: &DecoderWork,
-        active: usize,
-    ) -> Result<()> {
-        let spec = &self.spec;
-        let (t, dim) = (w.plan.tokens, spec.dim);
-        let shape = |batch, rows, width| -> Result<[u32; 3]> {
-            Ok([
-                u32::try_from(batch)?,
-                u32::try_from(rows)?,
-                u32::try_from(width)?,
-            ])
-        };
-        for first in (0..active).step_by(w.plan.attention) {
-            let batch = (active - first).min(w.plan.attention) * spec.heads;
-            let offset = first * t * dim;
-            let heads = |buffer: &CudaSlice<f32>| {
-                view(
-                    buffer,
-                    s,
-                    offset,
-                    shape(batch, t, spec.head_dim)?,
-                    [(t * spec.head_dim) as u64, spec.head_dim as u64, 1],
-                )
-            };
-            let scores = view(
-                &w.scores,
-                s,
-                0,
-                shape(batch, t, t)?,
-                [(t * t) as u64, t as u64, 1],
-            )?;
-            blas.batched_f32(
-                heads(&w.q)?,
-                heads(&w.k)?,
-                &mut TensorMut(scores),
-                [false, true],
-                (spec.head_dim as f32).sqrt().recip(),
-            )?;
-            unsafe {
-                s.launch_builder(&self.kernels.softmax)
-                    .arg(&scores.ptr)
-                    .arg(&u32::try_from(batch * t)?)
-                    .arg(&u32::try_from(t)?)
-                    .arg(&(t as u64))
-                    .launch(ops::grid(batch * t, 256))?;
-            }
-            blas.batched_f32(
-                scores,
-                heads(&w.v)?,
-                &mut TensorMut(heads(&w.attn)?),
-                [false, false],
-                1.0,
-            )?;
-        }
-        unsafe {
-            s.launch_builder(&self.kernels.unpack)
-                .arg(&pointer(&w.attn, s))
-                .arg(&pointer(&w.o, s))
-                .arg(&u32::try_from(active)?)
-                .arg(&u32::try_from(t)?)
-                .arg(&u32::try_from(spec.heads)?)
-                .arg(&u32::try_from(spec.head_dim)?)
-                .launch(w.plan.flat(active * t * dim))?;
-        }
-        Ok(())
-    }
-
-    fn block(
-        &self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
-        block: &DecoderBlock,
-        w: &DecoderWork,
-        group: (usize, usize, usize),
-        observe: &mut impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
-    ) -> Result<()> {
-        let spec = &self.spec;
-        let (first, active, layer) = group;
-        let rows = active * w.plan.tokens;
-        let n = rows * spec.dim;
-        let states = |data, offset| rows_view(data, s, offset, rows, spec.dim, spec.dim);
-        self.rms(s, states(&w.x, 0)?, block.norm1, pointer(&w.norm, s))?;
-        for (linear, offset) in [(&block.q, 0), (&block.k, n), (&block.v, 2 * n)] {
-            linear.run(
-                s,
-                blas,
-                &self.kernels.bias,
-                states(&w.norm, 0)?,
-                states(&w.ff, offset)?,
-            )?;
-        }
-        for (offset, name) in [(0, "q0"), (n, "k0")] {
-            let heads = rows_view(
-                &w.ff,
-                s,
-                offset,
-                rows * spec.heads,
-                spec.head_dim,
-                spec.head_dim,
-            )?;
-            self.rms(s, heads, vector(&w.ones, s)?, heads.ptr)?;
-            if layer == 0 {
-                observe(
-                    name,
-                    first,
-                    active,
-                    (&w.ff, offset, w.plan.tokens, spec.dim),
-                )?;
-            }
-        }
-        let q = pointer(&w.ff, s);
-        unsafe {
-            s.launch_builder(&self.kernels.pack)
-                .arg(&q)
-                .arg(&(q + (4 * n) as u64))
-                .arg(&(q + (8 * n) as u64))
-                .arg(&pointer(&w.rope, s))
-                .arg(&pointer(&w.q, s))
-                .arg(&pointer(&w.k, s))
-                .arg(&pointer(&w.v, s))
-                .arg(&u32::try_from(active)?)
-                .arg(&u32::try_from(w.plan.tokens)?)
-                .arg(&u32::try_from(spec.heads)?)
-                .arg(&u32::try_from(spec.head_dim)?)
-                .arg(&u32::try_from(spec.rope_dims)?)
-                .launch(w.plan.flat(n / 2))?;
-        }
-        self.attention(s, blas, w, active)?;
-        block.out.run(
-            s,
-            blas,
-            &self.kernels.bias,
-            states(&w.o, 0)?,
-            states(&w.ff, 0)?,
-        )?;
-        self.residual(s, w, &w.ff, block.scale1, rows)?;
-        self.rms(s, states(&w.x, 0)?, block.norm2, pointer(&w.norm, s))?;
-        block.ff_in.run(
-            s,
-            blas,
-            &self.kernels.bias,
-            states(&w.norm, 0)?,
-            rows_view(&w.ff, s, 0, rows, 2 * spec.ffn, 2 * spec.ffn)?,
-        )?;
-        let silu_grid = flat(rows * spec.ffn);
-        unsafe {
-            s.launch_builder(&self.kernels.silu)
-                .arg(&pointer(&w.ff, s))
-                .arg(&pointer(&w.gated, s))
-                .arg(&i64::try_from(rows)?)
-                .arg(&i32::try_from(spec.ffn)?)
-                .launch(silu_grid)?;
-        }
-        block.ff_out.run(
-            s,
-            blas,
-            &self.kernels.bias,
-            rows_view(&w.gated, s, 0, rows, spec.ffn, spec.ffn)?,
-            states(&w.o, 0)?,
-        )?;
-        self.residual(s, w, &w.o, block.scale2, rows)?;
-        if layer == 0 || layer + 1 == spec.layers {
-            observe(
-                if layer == 0 { "block0" } else { "block_last" },
-                first,
-                active,
-                (&w.x, 0, w.plan.tokens, spec.dim),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn output_rows(
-        &self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
-        w: &DecoderWork,
-        rows: usize,
-    ) -> Result<()> {
-        let spec = &self.spec;
-        let dim = spec.dim as u64;
-        unsafe {
-            s.launch_builder(&self.kernels.norm)
-                .arg(&pointer(&w.x, s))
-                .arg(&self.norm_out.0.ptr)
-                .arg(&self.norm_out.1.ptr)
-                .arg(&pointer(&w.norm, s))
-                .arg(&u32::try_from(rows)?)
-                .arg(&1u32)
-                .arg(&u32::try_from(spec.dim)?)
-                .arg(&dim)
-                .arg(&0u64)
-                .arg(&1u64)
-                .arg(&dim)
-                .arg(&0u64)
-                .arg(&1u64)
-                .arg(&spec.norm_eps)
-                .launch(ops::grid(rows, 256))?;
-        }
-        self.proj_out.run(
-            s,
-            blas,
-            &self.kernels.bias,
-            rows_view(&w.norm, s, 0, rows, spec.dim, spec.dim)?,
-            rows_view(
-                &w.patch_rows,
-                s,
-                0,
-                rows,
-                spec.patch_width(),
-                spec.patch_width(),
-            )?,
-        )?;
-        Ok(())
     }
 
     fn run(
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
-        w: ImageWork,
+        mut w: ImageWork,
         input: &CudaSlice<f32>,
-        observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
     ) -> Result<CudaSlice<f32>> {
-        self.launch(s, blas, &w, input, observe)?;
+        self.launch(
+            s,
+            blas,
+            &mut w,
+            input,
+            #[cfg(test)]
+            |_, _, _, _| Ok(()),
+        )?;
         s.synchronize()?;
         Ok(w.rgb)
     }
@@ -866,183 +276,72 @@ impl ImageDecoder {
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
-        w: &ImageWork,
+        w: &mut ImageWork,
         input: &CudaSlice<f32>,
-        observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
+        #[cfg(test)] mut observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
-        if self.dense.is_some() {
-            self.launch_inner::<true>(s, blas, w, input, observe)
-        } else {
-            self.launch_inner::<false>(s, blas, w, input, observe)
-        }
-    }
-
-    fn launch_inner<const STREAMED: bool>(
-        &self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
-        w: &ImageWork,
-        input: &CudaSlice<f32>,
-        mut observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
-    ) -> Result<()> {
-        let mut dense = if STREAMED {
-            Some(
-                self.dense
-                    .as_ref()
-                    .context("image decoder stream plan missing")?
-                    .borrow_mut(),
-            )
-        } else {
-            None
-        };
-        let latent_affine = self
-            .latent_affine
-            .as_ref()
-            .context("image VAE latent affine missing")?;
-        let pixel_affine = self
-            .pixel_affine
-            .as_ref()
-            .context("image VAE pixel affine missing")?;
-        let spec = &self.spec;
-        let (h, width) = (
-            w.canvas[0] / spec.spatial_ratio,
-            w.canvas[1] / spec.spatial_ratio,
-        );
+        let spec = &self.core.spec;
+        let [height, width] = w.canvas;
+        let latent = [height / spec.spatial_ratio, width / spec.spatial_ratio];
         ensure!(
-            input.len() == spec.latent_channels * h * width,
-            "image VAE normalized latent extent mismatch"
+            input.len() == latent[0] * latent[1] * spec.latent_channels,
+            "image VAE latent allocation differs from its canvas"
         );
-        let p = &w.plan;
-        for first in (0..w.tiles.count()).step_by(p.linear) {
-            let active = (w.tiles.count() - first).min(p.linear);
-            let rows = active * p.tokens;
+        let tiles = w.tiles.count();
+        for first in (0..tiles).step_by(w.core.batch) {
+            let active = (tiles - first).min(w.core.batch);
             unsafe {
-                s.launch_builder(&self.kernels.gather)
+                s.launch_builder(&self.gather)
                     .arg(&pointer(input, s))
-                    .arg(&pointer(&latent_affine.0, s))
-                    .arg(&pointer(&latent_affine.1, s))
+                    .arg(&pointer(&self.latent_affine.0, s))
+                    .arg(&pointer(&self.latent_affine.1, s))
                     .arg(&pointer(&w.grid, s))
-                    .arg(&pointer(&w.latent, s))
-                    .arg(&u32::try_from(spec.latent_channels)?)
-                    .arg(&u32::try_from(h)?)
-                    .arg(&u32::try_from(width)?)
-                    .arg(&u32::try_from(w.tiles.rows.0.len())?)
-                    .arg(&u32::try_from(w.tiles.cols.0.len())?)
-                    .arg(&u32::try_from(spec.spatial_ratio)?)
-                    .arg(&u32::try_from(w.tiles.height / spec.spatial_ratio)?)
-                    .arg(&u32::try_from(w.tiles.width / spec.spatial_ratio)?)
-                    .arg(&u32::try_from(first)?)
-                    .arg(&u32::try_from(active)?)
-                    .launch(p.flat(active * p.patches * spec.latent_channels))?;
+                    .arg(&pointer(&w.core.latent, s))
+                    .arg(&(spec.latent_channels as u32))
+                    .arg(&(latent[0] as u32))
+                    .arg(&(latent[1] as u32))
+                    .arg(&(w.tiles.rows.0.len() as u32))
+                    .arg(&(w.tiles.cols.0.len() as u32))
+                    .arg(&(spec.spatial_ratio as u32))
+                    .arg(&(w.core.height as u32))
+                    .arg(&(w.core.width as u32))
+                    .arg(&(first as u32))
+                    .arg(&(active as u32))
+                    .launch(flat(active * w.core.patches * spec.latent_channels))?;
             }
-            let latent = |buffer| {
-                rows_view(
-                    buffer,
-                    s,
-                    0,
-                    active * p.patches,
-                    spec.latent_channels,
-                    spec.latent_channels,
-                )
-            };
-            self.post_quant.run(
-                s,
-                blas,
-                &self.kernels.bias,
-                latent(&w.latent)?,
-                latent(&w.latent_q)?,
+            self.core.project_tiles(
+                (s, blas),
+                &mut w.core,
+                active,
+                (&w.raw, first),
+                #[cfg(test)]
+                |role, rows| observe(role, first, active, rows),
             )?;
-            self.proj_in.run(
-                s,
-                blas,
-                &self.kernels.bias,
-                latent(&w.latent_q)?,
-                rows_view(&w.o, s, 0, active * p.patches, spec.dim, spec.dim)?,
-            )?;
-            observe("proj_in", first, active, (&w.o, 0, p.patches, spec.dim))?;
-            unsafe {
-                s.launch_builder(&self.kernels.append)
-                    .arg(&pointer(&w.o, s))
-                    .arg(&self.registers.ptr)
-                    .arg(&pointer(&w.x, s))
-                    .arg(&u32::try_from(active)?)
-                    .arg(&u32::try_from(p.patches)?)
-                    .arg(&u32::try_from(spec.registers)?)
-                    .arg(&u32::try_from(spec.dim)?)
-                    .launch(p.flat(rows * spec.dim))?;
-            }
-            for (layer, block) in self.blocks.iter().enumerate() {
-                if let Some(dense) = &mut dense {
-                    dense.begin(layer, s)?;
-                }
-                self.block(s, blas, block, w, (first, active, layer), &mut observe)?;
-                if let Some(dense) = &mut dense {
-                    dense.end(layer, s)?;
-                }
-            }
-            self.output_rows(s, blas, w, rows)?;
-            observe("norm_out", first, active, (&w.norm, 0, p.tokens, spec.dim))?;
-            let pixels = spec.out_channels * w.tiles.height * w.tiles.width;
-            for tile in 0..active {
-                let source =
-                    pointer(&w.patch_rows, s) + (4 * tile * p.tokens * spec.patch_width()) as u64;
-                let target = pointer(&w.raw, s) + (4 * (first + tile) * pixels) as u64;
-                unsafe {
-                    s.launch_builder(&self.kernels.patches)
-                        .arg(&source)
-                        .arg(&target)
-                        .arg(&1u32)
-                        .arg(&u32::try_from(w.tiles.height / spec.spatial_ratio)?)
-                        .arg(&u32::try_from(w.tiles.width / spec.spatial_ratio)?)
-                        .arg(&u32::try_from(spec.out_channels)?)
-                        .arg(&1u32)
-                        .arg(&u32::try_from(spec.spatial_ratio)?)
-                        .launch(p.flat(pixels))?;
-                }
-            }
         }
         unsafe {
-            s.launch_builder(&self.kernels.stitch)
+            s.launch_builder(&self.core.kernels.stitch)
                 .arg(&pointer(&w.raw, s))
                 .arg(&pointer(&w.planar, s))
                 .arg(&pointer(&w.grid, s))
-                .arg(&u32::try_from(w.tiles.rows.0.len())?)
-                .arg(&u32::try_from(w.tiles.cols.0.len())?)
-                .arg(&u32::try_from(spec.out_channels)?)
-                .arg(&u32::try_from(w.tiles.height)?)
-                .arg(&u32::try_from(w.tiles.width)?)
-                .arg(&u32::try_from(w.canvas[0])?)
-                .arg(&u32::try_from(w.canvas[1])?)
-                .launch(p.flat(w.planar.len()))?;
-            s.launch_builder(&self.kernels.pixels)
+                .arg(&(w.tiles.rows.0.len() as u32))
+                .arg(&(w.tiles.cols.0.len() as u32))
+                .arg(&(spec.out_channels as u32))
+                .arg(&(w.tiles.height as u32))
+                .arg(&(w.tiles.width as u32))
+                .arg(&(height as u32))
+                .arg(&(width as u32))
+                .launch(flat(w.planar.len()))?;
+            s.launch_builder(&self.pixels)
                 .arg(&pointer(&w.planar, s))
-                .arg(&pointer(&pixel_affine.0, s))
-                .arg(&pointer(&pixel_affine.1, s))
+                .arg(&pointer(&self.pixel_affine.0, s))
+                .arg(&pointer(&self.pixel_affine.1, s))
                 .arg(&pointer(&w.rgb, s))
-                .arg(&u32::try_from(spec.out_channels)?)
-                .arg(&u64::try_from(w.canvas[0] * w.canvas[1])?)
-                .launch(p.flat(w.rgb.len()))?;
+                .arg(&(spec.out_channels as u32))
+                .arg(&((height * width) as u64))
+                .launch(flat(w.rgb.len()))?;
         }
         Ok(())
     }
-}
-
-pub(super) fn image_vae_manifest(
-    model: &Path,
-) -> Result<(
-    std::path::PathBuf,
-    crate::minimax_h3::ImageVaeSpec,
-    TensorManifest,
-)> {
-    let component = model.join("vae_diffusers");
-    let config = component.join("config.json");
-    let spec = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
-        &std::fs::read(&config).with_context(|| format!("read {}", config.display()))?,
-    )?)?;
-    let checkpoint =
-        crate::checkpoint::MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
-    let manifest = checkpoint.minimax_h3_image_vae_manifest(&spec)?;
-    Ok((component, spec, manifest))
 }
 
 fn image_decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec<String>> {
@@ -1062,26 +361,29 @@ fn image_decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec
 pub(super) fn image_decoder_sizes(
     manifest: &TensorManifest,
     depth: usize,
-) -> (Vec<usize>, usize, usize) {
+) -> ([Vec<usize>; 2], usize, usize) {
     let order = image_decoder_layer_names(manifest, depth);
-    let layers: Vec<_> = order
+    let device: Vec<_> = order
+        .iter()
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| decoder_tensor_bytes(manifest, name))
+                .sum()
+        })
+        .collect();
+    let source = order
         .iter()
         .map(|names| names.iter().map(|name| manifest.entries[name].bytes).sum())
         .collect();
-    let total: usize = manifest
-        .entries
-        .iter()
-        .filter(|(name, _)| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
-        .map(|(_, entry)| entry.bytes)
-        .sum();
-    let fixed = total - layers.iter().sum::<usize>();
+    let fixed = decoder_weight_bytes(manifest) - device.iter().sum::<usize>();
     let largest = order
         .iter()
         .flatten()
         .map(|name| manifest.entries[name].bytes)
         .max()
         .unwrap_or(0);
-    (layers, fixed, largest)
+    ([device, source], fixed, largest)
 }
 
 pub(super) struct ImageDecodeStage {
@@ -1092,12 +394,7 @@ pub(super) struct ImageDecodeStage {
 impl ImageDecodeStage {
     pub(super) fn minimum_work(spec: &VaeSpec, canvas: [usize; 2]) -> Result<usize> {
         let tiles = VaeTiles::released(spec, canvas[0], canvas[1])?;
-        Ok(usize::try_from(
-            ImagePlan::sizing(spec, &tiles, canvas)
-                .1
-                .into_iter()
-                .sum::<u128>(),
-        )?)
+        ImageDecoder::work_size(spec, &tiles, canvas, 1)
     }
 
     pub(super) fn prepare_work(
@@ -1108,29 +405,77 @@ impl ImageDecodeStage {
     ) -> Result<ImageWork> {
         let (free, total) = device.ctx.mem_get_info()?;
         let budget = device.workspace_budget(free, free, total / 16)?;
-        ImageDecoder::work_for(device, spec, canvas, (budget, later))
+        ImageDecoder::work_for(
+            device,
+            spec,
+            canvas,
+            budget
+                .checked_sub(later)
+                .context("image VAE workspace tier reserve")?,
+        )
     }
 
     pub(super) fn bind(
         device: &Device,
+        blas: &mut Blas,
         (dir, spec, manifest): (&Path, &VaeSpec, &TensorManifest),
         work: ImageWork,
         plan: crate::prefill::DensePlacement,
     ) -> Result<Self> {
-        let decoder =
-            ImageDecoder::with_placement(device, spec.clone(), dir, manifest, Some(plan))?;
+        let mut loader = DecoderWeightLoad::new(dir, manifest);
+        if plan.slot_bytes > 0 {
+            let order = image_decoder_layer_names(manifest, spec.layers);
+            let slots = plan.slots.clone();
+            let mut dense =
+                DenseStreaming::with_f32_cast(dir, manifest, plan, device, &order, |name| {
+                    decoder_weight_width(name) == 2
+                })?;
+            for (layer, names) in order
+                .iter()
+                .enumerate()
+                .filter(|(layer, _)| slots[*layer].is_some())
+            {
+                let mut pinned = dense.host_layer(layer)?;
+                let (mut source, mut runtime) = (0, 0);
+                for name in names {
+                    let entry = &manifest.entries[name];
+                    let end = source + entry.bytes;
+                    if let Some(bytes) = &mut pinned {
+                        loader
+                            .reader
+                            .read_into(name, entry, &mut bytes[source..end])?;
+                    }
+                    loader.offsets.insert(name.clone(), (layer, runtime));
+                    source = end;
+                    runtime += decoder_tensor_bytes(manifest, name);
+                }
+                ensure!(
+                    pinned.is_none_or(|pinned| pinned.len() == source),
+                    "image VAE pinned layer byte count"
+                );
+            }
+            loader.dense = Some(dense);
+        }
+        let decoder = ImageDecoder::from_weights(device, spec, loader)?;
+        decoder.core.bind(blas, &work.core)?;
         Ok(Self { decoder, work })
     }
 
-    pub(super) fn run(&self, device: &Device, blas: &Blas, latent: &[f32]) -> Result<Vec<f32>> {
+    pub(super) fn run(&mut self, device: &Device, blas: &Blas, latent: &[f32]) -> Result<Vec<f32>> {
         ensure!(
             latent.iter().all(|v| v.is_finite()),
             "image VAE input is nonfinite"
         );
         let s = &device.stream;
         let input = s.clone_htod(latent)?;
-        self.decoder
-            .launch(s, blas, &self.work, &input, |_, _, _, _| Ok(()))?;
+        self.decoder.launch(
+            s,
+            blas,
+            &mut self.work,
+            &input,
+            #[cfg(test)]
+            |_, _, _, _| Ok(()),
+        )?;
         s.synchronize()?;
         let output = s.clone_dtoh(&self.work.rgb)?;
         ensure!(
@@ -1139,6 +484,24 @@ impl ImageDecodeStage {
         );
         Ok(output)
     }
+}
+
+pub(super) fn image_vae_manifest(
+    model: &Path,
+) -> Result<(
+    std::path::PathBuf,
+    crate::minimax_h3::ImageVaeSpec,
+    TensorManifest,
+)> {
+    let component = model.join("vae_diffusers");
+    let config = component.join("config.json");
+    let spec = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
+        &std::fs::read(&config).with_context(|| format!("read {}", config.display()))?,
+    )?)?;
+    let checkpoint =
+        crate::checkpoint::MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
+    let manifest = checkpoint.minimax_h3_image_vae_manifest(&spec)?;
+    Ok((component, spec, manifest))
 }
 
 pub(super) struct ImageEncodeStage {
@@ -1263,12 +626,19 @@ impl ImageEncodeStage {
 /// Normalized F32 `[24, latent_h, latent_w]` to F32 `[height, width, 3]`, before clamp and quantization.
 pub(super) fn decode_image_device(
     device: &Device,
-    blas: &Blas,
+    blas: &mut Blas,
     model: &Path,
     latent: &CudaSlice<f32>,
     extent: [usize; 2],
 ) -> Result<CudaSlice<f32>> {
-    let (component, spec, manifest) = image_vae_manifest(model)?;
+    let component = model.join("vae_diffusers");
+    let config = component.join("config.json");
+    let spec = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
+        &std::fs::read(&config).with_context(|| format!("read {}", config.display()))?,
+    )?)?;
+    let checkpoint =
+        crate::checkpoint::MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
+    let manifest = checkpoint.minimax_h3_image_vae_manifest(&spec)?;
     let canvas = [
         extent[0]
             .checked_mul(spec.spatial_ratio)
@@ -1285,11 +655,12 @@ pub(super) fn decode_image_device(
         extent.into_iter().all(|n| n > 0) && latent.len() == elements,
         "image VAE normalized latent extent mismatch"
     );
-    let decoder = ImageDecoder::new(device, spec.single_frame(), &component, &manifest)?;
+    let decoder = ImageDecoder::new(device, &spec.single_frame(), &component, &manifest)?;
     let (free, total) = device.ctx.mem_get_info()?;
     let budget = device.workspace_budget(free, free, total / 16)?;
     let work = decoder.work(device, canvas, budget)?;
-    decoder.run(&device.stream, blas, work, latent, |_, _, _, _| Ok(()))
+    decoder.core.bind(blas, &work.core)?;
+    decoder.run(&device.stream, blas, work, latent)
 }
 
 /// F32 RGB `[height,width,3]` and F32 posterior noise `[1,24,height/16,width/16]` to cropped normalized latents.
@@ -1480,13 +851,12 @@ pub(crate) fn planar_f32_to_rgb_u8<T: DeviceRepr>(
     Ok(())
 }
 
-struct Linear<T = f32> {
+struct Linear<T> {
     weight: Tensor<T, 2>,
     bias: Tensor<T, 1>,
-    out: usize,
 }
 
-struct DecoderBlock<T = f32> {
+struct DecoderBlock<T> {
     q: Linear<T>,
     k: Linear<T>,
     v: Linear<T>,
@@ -1550,7 +920,7 @@ impl Linear<bf16> {
     }
 }
 
-fn video_weight_width(name: &str) -> usize {
+fn decoder_weight_width(name: &str) -> usize {
     if name
         .split('.')
         .any(|part| matches!(part, "norm1" | "norm2" | "norm_out" | "scale1" | "scale2"))
@@ -1561,27 +931,27 @@ fn video_weight_width(name: &str) -> usize {
     }
 }
 
-fn video_weight_bytes(manifest: &TensorManifest, name: &str) -> usize {
-    manifest.entries[name].bytes / 4 * video_weight_width(name)
+fn decoder_tensor_bytes(manifest: &TensorManifest, name: &str) -> usize {
+    manifest.entries[name].bytes / 4 * decoder_weight_width(name)
 }
 
-pub(super) fn video_decoder_weight_bytes(manifest: &TensorManifest) -> usize {
+pub(super) fn decoder_weight_bytes(manifest: &TensorManifest) -> usize {
     manifest
         .entries
         .keys()
         .filter(|name| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
-        .map(|name| video_weight_bytes(manifest, name))
+        .map(|name| decoder_tensor_bytes(manifest, name))
         .sum()
 }
 
-fn read_video_weight_chunk(
+fn read_decoder_weight_chunk(
     source: &mut EntryReader,
     manifest: &TensorManifest,
     name: &str,
     destination_offset: usize,
     dst: &mut [u8],
 ) -> Result<()> {
-    let width = video_weight_width(name);
+    let width = decoder_weight_width(name);
     ensure!(
         dst.len().is_multiple_of(width),
         "video weight {name} chunk alignment"
@@ -1613,7 +983,7 @@ fn read_video_weight_chunk(
     Ok(())
 }
 
-struct VideoWeightLoad<'a> {
+struct DecoderWeightLoad<'a> {
     manifest: &'a TensorManifest,
     reader: EntryReader,
     dense: Option<DenseStreaming>,
@@ -1623,7 +993,19 @@ struct VideoWeightLoad<'a> {
     staging: Vec<u8>,
 }
 
-impl VideoWeightLoad<'_> {
+impl<'a> DecoderWeightLoad<'a> {
+    fn new(dir: &Path, manifest: &'a TensorManifest) -> Self {
+        Self {
+            manifest,
+            reader: EntryReader::new(dir),
+            dense: None,
+            offsets: Default::default(),
+            consumed: Default::default(),
+            storage: Vec::new(),
+            staging: vec![0; 16 << 20],
+        }
+    }
+
     fn tensor<T: Element + Copy>(
         &mut self,
         s: &Arc<CudaStream>,
@@ -1636,7 +1018,7 @@ impl VideoWeightLoad<'_> {
             .entries
             .get(name)
             .with_context(|| format!("video weight {name} missing"))?;
-        let width = video_weight_width(name);
+        let width = decoder_weight_width(name);
         ensure!(
             self.consumed.insert(name.to_owned())
                 && entry.dtype == Dtype::F32
@@ -1658,7 +1040,7 @@ impl VideoWeightLoad<'_> {
             for offset in (0..bytes).step_by(chunk) {
                 let end = (offset + chunk).min(bytes);
                 let dst = &mut self.staging[..end - offset];
-                read_video_weight_chunk(&mut self.reader, self.manifest, name, offset, dst)?;
+                read_decoder_weight_chunk(&mut self.reader, self.manifest, name, offset, dst)?;
                 unsafe {
                     cudarc::driver::result::memcpy_htod_async(
                         ptr + offset as u64,
@@ -1700,7 +1082,7 @@ fn video_weight_load<'a>(
     dir: &Path,
     manifest: &'a TensorManifest,
     (future, mode): (usize, super::Placement),
-) -> Result<VideoWeightLoad<'a>> {
+) -> Result<DecoderWeightLoad<'a>> {
     let mut order = vec![Vec::new(); spec.layers];
     let mut sizes = vec![0; spec.layers];
     for (name, entry) in manifest
@@ -1721,14 +1103,14 @@ fn video_weight_load<'a>(
                 .get_mut(layer)
                 .context("video block index")?
                 .push(name);
-            sizes[layer] += video_weight_bytes(manifest, name);
+            sizes[layer] += decoder_tensor_bytes(manifest, name);
         }
     }
     ensure!(
         order.iter().all(|names| names.len() == 16),
         "video block weight inventory"
     );
-    let weights = video_decoder_weight_bytes(manifest);
+    let weights = decoder_weight_bytes(manifest);
     let fixed = weights - sizes.iter().sum::<usize>();
     let (free, total) = d.ctx.mem_get_info()?;
     let mut budget = crate::prefill::DensePlacement::device_budget(free, total, fixed, 0, future)?;
@@ -1768,33 +1150,24 @@ fn video_weight_load<'a>(
             }})
         );
     }
-    let mut loader = VideoWeightLoad {
-        manifest,
-        reader: EntryReader::new(dir),
-        dense: if plan.slot_bytes == 0 {
-            None
-        } else {
-            Some(DenseStreaming::new_preloaded(dir, plan, d, &sizes)?)
-        },
-        offsets: Default::default(),
-        consumed: Default::default(),
-        storage: Vec::new(),
-        staging: vec![0; 16 << 20],
-    };
+    let mut loader = DecoderWeightLoad::new(dir, manifest);
+    if plan.slot_bytes > 0 {
+        loader.dense = Some(DenseStreaming::new_preloaded(dir, plan, d, &sizes)?);
+    }
     if let Some(dense) = &mut loader.dense {
         for (layer, names) in order.iter().enumerate() {
             if let Some(pinned) = dense.host_layer(layer)? {
                 let mut offset = 0;
                 for name in names {
-                    let width = video_weight_width(name);
-                    let bytes = video_weight_bytes(manifest, name);
+                    let width = decoder_weight_width(name);
+                    let bytes = decoder_tensor_bytes(manifest, name);
                     ensure!(offset % 16 == 0, "video pinned weight alignment");
                     loader.offsets.insert((*name).clone(), (layer, offset));
                     for (i, dst) in pinned[offset..offset + bytes]
                         .chunks_mut((32 << 20) / 4 * width)
                         .enumerate()
                     {
-                        read_video_weight_chunk(
+                        read_decoder_weight_chunk(
                             &mut loader.reader,
                             manifest,
                             name,
@@ -1819,10 +1192,18 @@ impl VideoDecoder {
         manifest: &TensorManifest,
         placement: (usize, super::Placement),
     ) -> Result<Self> {
+        Self::from_weights(
+            d,
+            spec,
+            video_weight_load(d, spec, dir, manifest, placement)?,
+        )
+    }
+
+    fn from_weights(d: &Device, spec: &VaeSpec, mut load: DecoderWeightLoad<'_>) -> Result<Self> {
         let vision = cubin::module(&d.ctx, "vision_ops")?;
         let common = cubin::module(&d.ctx, "q38_common")?;
         let s = &d.stream;
-        let mut load = video_weight_load(d, spec, dir, manifest, placement)?;
+        let manifest = load.manifest;
         let (dim, latent, ffn) = (spec.dim, spec.latent_channels, spec.ffn);
         let post_quant = load.linear(s, "post_quant_conv", latent, latent)?;
         let proj_in = load.linear(s, "decoder.proj_in", dim, latent)?;
@@ -1855,7 +1236,7 @@ impl VideoDecoder {
                     .keys()
                     .filter(|n| { n.starts_with("decoder.") || n.starts_with("post_quant_conv.") })
                     .count(),
-            "video decoder tensor inventory mismatch"
+            "VAE decoder tensor inventory mismatch"
         );
         Ok(Self {
             spec: spec.clone(),
@@ -2007,8 +1388,9 @@ impl VideoDecoder {
         s: &Arc<CudaStream>,
         blas: &Blas,
         w: &mut TileWork,
-        b: &DecoderBlock<bf16>,
-        active: usize,
+        (b, active): (&DecoderBlock<bf16>, usize),
+        #[cfg(test)] capture: bool,
+        #[cfg(test)] observe: &mut impl FnMut(&str, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
         let spec = &self.spec;
         let rows = active * w.tokens;
@@ -2048,6 +1430,11 @@ impl VideoDecoder {
                 mat(&w.norm)?,
                 rows_view(&w.ff, s, j * n, rows, dim, dim)?,
             )?;
+        }
+        #[cfg(test)]
+        if capture {
+            observe("q0", (DecoderRows::Bf16(&w.ff), 0, w.tokens, dim))?;
+            observe("k0", (DecoderRows::Bf16(&w.ff), n, w.tokens, dim))?;
         }
         unsafe {
             s.launch_builder(&self.kernels.head_pack)
@@ -2152,6 +1539,26 @@ impl VideoDecoder {
                     .launch(flat(p * spec.latent_channels))?;
             }
         }
+        self.project_tiles(
+            (s, blas),
+            w,
+            active,
+            (raw, slot),
+            #[cfg(test)]
+            |_, _| Ok(()),
+        )
+    }
+
+    fn project_tiles(
+        &self,
+        (s, blas): (&Arc<CudaStream>, &Blas),
+        w: &mut TileWork,
+        active: usize,
+        (raw, slot): (&CudaSlice<bf16>, usize),
+        #[cfg(test)] mut observe: impl FnMut(&str, ImageRows<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let spec = &self.spec;
+        let p = w.patches;
         let latent = |data| {
             rows_view(
                 data,
@@ -2169,6 +1576,8 @@ impl VideoDecoder {
             latent(&w.latent_q)?,
             rows_view(&w.o, s, 0, active * p, spec.dim, spec.dim)?,
         )?;
+        #[cfg(test)]
+        observe("proj_in", (DecoderRows::Bf16(&w.o), 0, p, spec.dim))?;
         #[cfg(test)]
         if self.prefix_only {
             return Ok(());
@@ -2189,7 +1598,23 @@ impl VideoDecoder {
             if let Some(dense) = &self.dense {
                 dense.borrow_mut().begin(layer, s)?;
             }
-            self.block(s, blas, w, block, active)?;
+            #[cfg(test)]
+            let first_layer = layer == 0;
+            self.block(
+                s,
+                blas,
+                w,
+                (block, active),
+                #[cfg(test)]
+                first_layer,
+                #[cfg(test)]
+                &mut observe,
+            )?;
+            #[cfg(test)]
+            if layer == 0 || layer + 1 == spec.layers {
+                let role = if layer == 0 { "block0" } else { "block_last" };
+                observe(role, (DecoderRows::F32(&w.x), 0, w.tokens, spec.dim))?;
+            }
             if let Some(dense) = &self.dense {
                 dense.borrow_mut().end(layer, s)?;
             }
@@ -2508,6 +1933,16 @@ impl TileWork {
         shape: (usize, usize, usize),
         (batch, slots): (usize, usize),
     ) -> Result<Self> {
+        Self::with_rope_axes(s, spec, shape, (batch, slots), 3)
+    }
+
+    fn with_rope_axes(
+        s: &Arc<CudaStream>,
+        spec: &VaeSpec,
+        shape: (usize, usize, usize),
+        (batch, slots): (usize, usize),
+        axes: usize,
+    ) -> Result<Self> {
         let bytes = Self::batch_bytes(spec, shape, batch, slots)?;
         let (frames, height, width) = shape;
         let patches = frames * height * width;
@@ -2536,7 +1971,7 @@ impl TileWork {
             attention.push((active, flash));
         }
         let work = Self {
-            rope: s.clone_htod(&rotary_table(spec, shape, 3, |x| x))?,
+            rope: s.clone_htod(&rotary_table(spec, shape, axes, |x| x))?,
             x: unsafe { s.alloc::<f32>(n)? },
             norm: alloc(n)?,
             o: alloc(n)?,
@@ -3419,82 +2854,28 @@ mod image_tests {
     fn image_workspace_respects_memory_and_launch_limits() -> Result<()> {
         let spec = geometry()?;
         let tiles = VaeTiles::released(&spec, 4096, 4096)?;
-        let limits = |budget, grid| ImageLimits {
-            budget,
-            reserved: 0,
-            l2: 75_497_472,
-            sms: 128,
-            grid,
-        };
-        let plan = ImagePlan::derive(
-            &spec,
-            &tiles,
-            [4096, 4096],
-            limits(16 << 30, i32::MAX as usize),
-        )?;
-        assert_eq!((plan.linear, plan.attention, plan.tokens), (441, 8, 261));
+        let canvas = [4096, 4096];
+        let full = ImageDecoder::work_size(&spec, &tiles, canvas, tiles.count())?;
+        assert_eq!(tiles.count(), 441);
         assert_eq!(
-            flat(plan.linear * plan.tokens * spec.ffn).grid_dim.0,
-            1_841_616
+            ImageDecoder::batch(&spec, &tiles, canvas, full, i32::MAX as usize)?,
+            (441, full)
         );
-        let serial_bytes = 775_026_440;
+        let serial = ImageDecoder::work_size(&spec, &tiles, canvas, 1)?;
+        assert!(ImageDecoder::batch(&spec, &tiles, canvas, serial - 1, i32::MAX as usize).is_err());
         assert_eq!(
-            ImageDecodeStage::minimum_work(&spec, [4096, 4096])?,
-            serial_bytes
+            ImageDecoder::batch(&spec, &tiles, canvas, serial, i32::MAX as usize)?,
+            (1, serial)
         );
-        assert_eq!(plan.bytes, 10_117_268_168);
-        let available = 8 << 30;
-        let pending = 4 << 30;
-        let old = ImagePlan::derive(
-            &spec,
-            &tiles,
-            [4096, 4096],
-            limits(available, i32::MAX as usize),
-        )?;
+        assert!(ImageDecoder::batch(&spec, &tiles, canvas, full, 1).is_err());
+        let (bounded, _) = ImageDecoder::batch(&spec, &tiles, canvas, full, 65535)?;
+        assert_eq!(bounded, 7);
+        assert!(ImageDecoder::batch(&spec, &tiles, canvas, full, 8351).is_err());
         assert_eq!(
-            (old.linear, old.attention, old.bytes),
-            (368, 8, 8_572_368_584)
+            ImageDecoder::batch(&spec, &tiles, canvas, full, 8352)?,
+            (1, serial)
         );
-        assert!(old.bytes + pending > available);
-        let constrained = ImagePlan::derive(
-            &spec,
-            &tiles,
-            [4096, 4096],
-            ImageLimits {
-                reserved: pending,
-                ..limits(available, i32::MAX as usize)
-            },
-        )?;
-        assert_eq!(
-            (constrained.linear, constrained.attention, constrained.bytes),
-            (160, 8, 4_170_462_920)
-        );
-        assert!(constrained.bytes + pending <= available);
-        assert!(
-            ImagePlan::derive(
-                &spec,
-                &tiles,
-                [4096, 4096],
-                limits(serial_bytes - 1, i32::MAX as usize)
-            )
-            .is_err()
-        );
-        let serial = ImagePlan::derive(
-            &spec,
-            &tiles,
-            [4096, 4096],
-            limits(serial_bytes, i32::MAX as usize),
-        )?;
-        assert_eq!(
-            (serial.linear, serial.attention, serial.bytes),
-            (1, 1, serial_bytes)
-        );
-        assert!(ImagePlan::derive(&spec, &tiles, [4096, 4096], limits(16 << 30, 1)).is_err());
-        let bounded = ImagePlan::derive(&spec, &tiles, [4096, 4096], limits(16 << 30, 65_535))?;
-        assert!(
-            bounded.linear < plan.linear
-                && flat(bounded.linear * bounded.tokens * spec.ffn).grid_dim.0 <= 65_535
-        );
+
         Ok(())
     }
 
@@ -3907,31 +3288,33 @@ mod image_tests {
         let checkpoint = MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
         let manifest = checkpoint.minimax_h3_image_vae_manifest(&published)?;
         ensure!(
-            manifest.entries.len() == 511,
-            "RUNNER_FAIL full VAE tensor census"
+            manifest.entries.len() == 511 && decoder_weight_bytes(&manifest) == 807_981_744,
+            "RUNNER_FAIL VAE tensor census or decoder dtype inventory"
         );
         let frozen: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join("FROZEN_DECODER_FLOORS.json"))?)?;
         ensure!(
-            frozen["formula"] == "max(2*worst_valid_pair,1e-6)",
+            frozen["formula"] == "max(2*worst_valid_pair,1e-6)"
+                && frozen["dtype"] == "BF16/F32"
+                && frozen["precision_control"]["bf16_off_grid"] == 0
+                && frozen["precision_control"]["old_f32_off_grid"]
+                    .as_u64()
+                    .is_some_and(|n| n != 0),
             "RUNNER_FAIL decoder floor formula"
         );
         let device = Device::new(0)?;
         let sm = cubin::capability(&device.ctx)?;
-        ensure!(
-            [86, 89].contains(&sm),
-            "RUNNER_FAIL VAE fixture has no sm{sm} arm"
-        );
+        ensure!(sm == 89, "RUNNER_FAIL VAE fixture has no sm{sm} arm");
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
-        let blas = Blas::new(
+        let mut blas = Blas::new(
             &device,
             &ops,
             runtime,
             Rc::new(Closure::new(true, "image VAE gate".into())),
         )?;
-        let mut decoder = ImageDecoder::new(&device, spec.clone(), &component, &manifest)?;
+        let decoder = ImageDecoder::new(&device, &spec, &component, &manifest)?;
         let mut defects = 0;
         let mut cells = 0;
         for (name, canvas) in [
@@ -3950,27 +3333,15 @@ mod image_tests {
                 let live = device.workspace_budget(free, free, total / 16)?;
                 let budget = if low {
                     let tiles = VaeTiles::released(&spec, canvas[0], canvas[1])?;
-                    let tokens = tiles.height / spec.spatial_ratio
-                        * (tiles.width / spec.spatial_ratio)
-                        + spec.registers
-                        + 1;
-                    let (p, score) = (tokens * spec.dim * 4, tokens * tokens * spec.heads * 4);
-                    let base = tiles.count() * spec.out_channels * tiles.height * tiles.width * 4
-                        + canvas[0] * canvas[1] * spec.out_channels * 8
-                        + 4 * (2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2
-                            + tokens * spec.rope_dims
-                            + spec.head_dim);
-                    let per_tile = 19 * p
-                        + 4 * tokens * spec.patch_width()
-                        + 8 * (tokens - spec.registers - 1) * spec.latent_channels;
-                    live.min(base + per_tile + score)
+                    live.min(ImageDecoder::work_size(&spec, &tiles, canvas, 1)?)
                 } else {
                     live
                 };
-                let work = decoder.work(&device, canvas, budget)?;
+                let mut work = decoder.work(&device, canvas, budget)?;
+                decoder.core.bind(&mut blas, &work.core)?;
                 if low {
                     ensure!(
-                        work.plan.linear == 1 && work.plan.attention == 1,
+                        work.core.batch == 1,
                         "RUNNER_FAIL serial budget did not force serial tiles"
                     );
                 }
@@ -3982,7 +3353,7 @@ mod image_tests {
                 decoder.launch(
                     s,
                     &blas,
-                    &work,
+                    &mut work,
                     &z,
                     |role, first, active, (data, offset, rows, width)| {
                         let role = if role == "block_last" {
@@ -3993,8 +3364,31 @@ mod image_tests {
                         for &tile in &selected {
                             if (first..first + active).contains(&tile) {
                                 let start = offset + (tile - first) * rows * width;
-                                let value =
-                                    s.clone_dtoh(&data.slice(start..start + rows * width))?;
+                                let end = start + rows * width;
+                                let value: Vec<f32> = match data {
+                                    DecoderRows::Bf16(data) => {
+                                        let mut values = s.clone_dtoh(&data.slice(start..end))?;
+                                        if matches!(role, "q0" | "k0") {
+                                            for head in values.chunks_exact_mut(spec.head_dim) {
+                                                let rstd = cpu_rms_rstd(head, spec.norm_eps);
+                                                for value in head {
+                                                    *value = bf16::from_f32(value.to_f32() * rstd);
+                                                }
+                                            }
+                                        }
+                                        values.into_iter().map(bf16::to_f32).collect()
+                                    }
+                                    DecoderRows::F32(data) => {
+                                        s.clone_dtoh(&data.slice(start..end))?
+                                    }
+                                };
+                                if role == "proj_in" {
+                                    ensure!(
+                                        value.iter().all(|&x| x.is_finite()
+                                            && bf16::from_f32(x).to_f32().to_bits() == x.to_bits()),
+                                        "image decoder ingress precision control failed"
+                                    );
+                                }
                                 ensure!(
                                     taps.insert(format!("{role}.tile{tile}"), value).is_none(),
                                     "RUNNER_FAIL duplicate tap"
@@ -4006,7 +3400,12 @@ mod image_tests {
                 )?;
                 taps.insert("rgb".into(), s.clone_dtoh(&work.rgb)?);
                 ensure!(
-                    taps.len() == expected.names().len(),
+                    taps.len()
+                        == expected
+                            .names()
+                            .iter()
+                            .filter(|key| !key.starts_with("norm_out."))
+                            .count(),
                     "RUNNER_FAIL missing boundary tap"
                 );
                 for (key, actual) in &taps {
@@ -4025,7 +3424,7 @@ mod image_tests {
                 )?;
                 if name == "2048" && !low {
                     s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let launched = decoder.launch(s, &blas, &work, &z, |_, _, _, _| Ok(()));
+                    let launched = decoder.launch(s, &blas, &mut work, &z, |_, _, _, _| Ok(()));
                     let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
                     launched?;
                     graph?
@@ -4043,45 +3442,70 @@ mod image_tests {
                     );
                     println!(
                         "IMAGE_VAE_GRAPH case=2048 linear={} attention={} tail={} bit_differences={bits} status={}",
-                        work.plan.linear,
-                        work.plan.attention,
-                        work.tiles.count() % work.plan.attention,
+                        work.core.batch,
+                        work.core.batch,
+                        work.tiles.count() % work.core.batch,
                         if bits == 0 { "PASS" } else { "DEFECT" }
                     );
                     defects += usize::from(bits != 0);
                 }
             }
         }
-        let mut mean = spec.latents_mean.clone();
-        mean.rotate_right(1);
-        let mut std = spec.latents_std.clone();
-        std.rotate_right(1);
-        decoder.latent_affine = Some((s.clone_htod(&std)?, s.clone_htod(&mean)?));
-        let z = s.clone_htod(&input(root, "2048", [2048, 2048])?)?;
-        let (free, total) = device.ctx.mem_get_info()?;
-        let work = decoder.work(
-            &device,
-            [2048, 2048],
-            device.workspace_budget(free, free, total / 16)?,
-        )?;
-        let control = decoder.run(s, &blas, work, &z, |_, _, _, _| Ok(()))?;
-        let bytes = fs::read(root.join(format!(
-            "reference-sm{sm}/output/decode-2048-canonical0.safetensors"
-        )))?;
-        let reference = SafeTensors::deserialize(&bytes)?;
-        let detected = score(
-            "control=shift24",
-            &s.clone_dtoh(&control)?,
-            &tensor(&reference, "rgb")?,
-            &frozen["cases"]["2048"]["rgb"],
-        )?;
+        let canvas = [272, 304];
+        let latent = input(root, "overlap", canvas)?;
+        let z = s.clone_htod(&latent)?;
+        let mut work = decoder.work(&device, canvas, usize::MAX)?;
+        decoder.core.bind(&mut blas, &work.core)?;
+        decoder.launch(s, &blas, &mut work, &z, |_, _, _, _| Ok(()))?;
+        let resident = s.clone_dtoh(&work.rgb)?;
+        drop(work);
+        drop(decoder);
+        let ([device_layers, source_layers], _, _) = image_decoder_sizes(&manifest, spec.layers);
+        let slots = 2 * device_layers
+            .iter()
+            .max()
+            .context("RUNNER_FAIL no decoder layers")?;
+        let source_bytes: usize = source_layers.iter().sum();
+        for (name, host_bytes) in [("pinned", source_bytes), ("disk", 0)] {
+            let plan = crate::prefill::DensePlacement::new(
+                &device_layers,
+                Some(&source_layers),
+                slots,
+                host_bytes,
+            )?;
+            ensure!(
+                plan.resident_bytes == 0
+                    && plan.host_bytes == host_bytes
+                    && plan.disk_bytes == source_bytes - host_bytes,
+                "RUNNER_FAIL image VAE {name} tier not forced"
+            );
+            let work = ImageDecodeStage::prepare_work(&device, &spec, canvas, 0)?;
+            let mut stage = ImageDecodeStage::bind(
+                &device,
+                &mut blas,
+                (&component, &spec, &manifest),
+                work,
+                plan,
+            )?;
+            for request in 1..=2 {
+                let output = stage.run(&device, &blas, &latent)?;
+                ensure!(
+                    output.len() == resident.len(),
+                    "RUNNER_FAIL image VAE {name} output shape"
+                );
+                let diff = output
+                    .iter()
+                    .zip(&resident)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "IMAGE_VAE_TIER tier={name} request={request} bit_differences={diff} source_bytes={source_bytes}"
+                );
+                defects += usize::from(diff != 0);
+            }
+        }
         println!(
-            "IMAGE_VAE_CONTROL shift24_detected={detected} status={}",
-            if detected { "PASS" } else { "FAIL" }
-        );
-        ensure!(detected, "RUNNER_FAIL image VAE control not detected");
-        println!(
-            "{} IMAGE_VAE_DECODER cells={cells} graph_cells=1 control=FAIL_AS_REQUIRED defects={defects}",
+            "{} IMAGE_VAE_DECODER cells={cells} graph_cells=1 tier_cells=4 control=F32_OFF_GRID defects={defects}",
             if defects == 0 { "PASS" } else { "FAIL" }
         );
         ensure!(
@@ -4629,6 +4053,31 @@ mod image_tests {
         result
     }
 
+    fn cpu_rms_rstd(row: &[bf16], eps: f32) -> f32 {
+        let dim = row.len();
+        let active_warps = dim.div_ceil(32).min(8);
+        let mut partials = [0.0f32; 8];
+        for (w, partial) in partials.iter_mut().enumerate().take(active_warps) {
+            let mut warp = [0.0f32; 32];
+            for (lane, slot) in warp.iter_mut().enumerate() {
+                let idx = w * 32 + lane;
+                if idx < dim {
+                    let x = row[idx].to_f32();
+                    *slot = x * x;
+                }
+            }
+            for step in [16usize, 8, 4, 2, 1] {
+                for lane in 0..32 - step {
+                    warp[lane] += warp[lane + step];
+                }
+            }
+            *partial = warp[0];
+        }
+        let e0 = (partials[0] + partials[4]) + (partials[2] + partials[6]);
+        let e1 = (partials[1] + partials[5]) + (partials[3] + partials[7]);
+        1.0f32 / ((e0 + e1) / (dim as f32) + eps).sqrt()
+    }
+
     #[test]
     #[ignore = "GPU; CPU-reference parity (<=1 BF16 ULP Q/K, 0 ULP V) and negative control for rms_rotary_pack_qkv_bf16"]
     fn video_head_pack_fusion_matches_cpu_reference_bf16_gpu() -> Result<()> {
@@ -4673,30 +4122,6 @@ mod image_tests {
                     }
                 })
                 .collect()
-        }
-        fn cpu_rms_rstd(row: &[bf16], eps: f32) -> f32 {
-            let dim = row.len();
-            let active_warps = dim.div_ceil(32).min(8);
-            let mut partials = [0.0f32; 8];
-            for (w, partial) in partials.iter_mut().enumerate().take(active_warps) {
-                let mut warp = [0.0f32; 32];
-                for (lane, slot) in warp.iter_mut().enumerate() {
-                    let idx = w * 32 + lane;
-                    if idx < dim {
-                        let x = row[idx].to_f32();
-                        *slot = x * x;
-                    }
-                }
-                for step in [16usize, 8, 4, 2, 1] {
-                    for lane in 0..32 - step {
-                        warp[lane] += warp[lane + step];
-                    }
-                }
-                *partial = warp[0];
-            }
-            let e0 = (partials[0] + partials[4]) + (partials[2] + partials[6]);
-            let e1 = (partials[1] + partials[5]) + (partials[3] + partials[7]);
-            1.0f32 / ((e0 + e1) / (dim as f32) + eps).sqrt()
         }
         fn cpu_head_pack_reference(qkv: &[bf16], table: &[f32], c: &Case) -> [Vec<bf16>; 3] {
             let elements = c.rows * c.heads * c.dim;
