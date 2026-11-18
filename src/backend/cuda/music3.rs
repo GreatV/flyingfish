@@ -1448,17 +1448,27 @@ pub(crate) fn generate_inner(
     let syn_bytes = syn_resident_bytes(model)?;
     let reserve = 1usize << 30;
     ensure!(
-        post_release > syn_bytes + reserve,
-        "synthesis weights {} + {} reserve exceed free {} after AR release and workspace; the check covers weights only",
+        synthesis_fits(post_release, syn_bytes),
+        "synthesis BF16 weights, folds and conversion peak {} + {} reserve exceed free {} after AR release and workspace",
         syn_bytes,
         reserve,
         post_release
     );
-    let engine = Music3Syn::load(model, &device_ctx, length)?;
+    let mut engine = Music3Syn::load(model, &device_ctx, length)?;
     let s = &device_ctx.stream;
-    let d_features = s.clone_htod(&features)?;
-    let d_initial: CudaSlice<f32> = match initial {
-        Some(initial) => s.clone_htod(initial)?,
+    let d_features = s.clone_htod(
+        &features
+            .iter()
+            .map(|v| bf16::from_f32(*v))
+            .collect::<Vec<_>>(),
+    )?;
+    let d_initial: CudaSlice<bf16> = match initial {
+        Some(initial) => s.clone_htod(
+            &initial
+                .iter()
+                .map(|v| bf16::from_f32(*v))
+                .collect::<Vec<_>>(),
+        )?,
         None => {
             let count = channels * length;
             let drawn = unsafe { s.alloc::<f32>(count)? };
@@ -1475,13 +1485,41 @@ pub(crate) fn generate_inner(
                         256,
                     ))?;
             }
-            drawn
+            let vision = super::cubin::module(&device_ctx.ctx, "vision_ops")?;
+            let cast = vision.load_function("vision_affine_cast_bf16")?;
+            let mut converted = s.alloc_zeros::<bf16>(count)?;
+            unsafe {
+                s.launch_builder(&cast)
+                    .arg(&drawn)
+                    .arg(&mut converted)
+                    .arg(&(count as u64))
+                    .arg(&0.0f32)
+                    .arg(&1.0f32)
+                    .launch(super::ops::flat(count))?;
+            }
+            converted
         }
     };
-    let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
+    let mut audio = unsafe { s.alloc::<bf16>(2 * length * total)? };
     engine.synthesize(&mut ws, &d_features, request.frames, &d_initial, &mut audio)?;
-    let pcm = s.clone_dtoh(&audio)?;
-    let drawn_latent = s.clone_dtoh(&d_initial)?;
+    let vision = super::cubin::module(&device_ctx.ctx, "vision_ops")?;
+    let upcast = vision.load_function("vision_upcast_f32")?;
+    let mut pcm = s.alloc_zeros::<f32>(audio.len())?;
+    let mut latent = s.alloc_zeros::<f32>(d_initial.len())?;
+    unsafe {
+        s.launch_builder(&upcast)
+            .arg(&audio)
+            .arg(&mut pcm)
+            .arg(&(audio.len() as u32))
+            .launch(super::ops::flat(audio.len()))?;
+        s.launch_builder(&upcast)
+            .arg(&d_initial)
+            .arg(&mut latent)
+            .arg(&(d_initial.len() as u32))
+            .launch(super::ops::flat(d_initial.len()))?;
+    }
+    let pcm = s.clone_dtoh(&pcm)?;
+    let drawn_latent = s.clone_dtoh(&latent)?;
     Ok((
         codes,
         drawn_latent,
@@ -1494,26 +1532,61 @@ pub(crate) fn generate_inner(
 /// categorical draw whose counter is (draw, 0, 0, 0).
 pub(crate) const MUSIC3_NORMAL_STREAM: u64 = 1 << 32;
 
-/// Sum of the three synthesis component safetensors: the F32 resident
-/// weight estimate for the release assert.
+/// BF16 resident weights, vocoder folds, and the largest F32 tensor
+/// temporarily resident during in-memory conversion.
 fn syn_resident_bytes(model: &Path) -> Result<usize> {
-    let mut bytes = 0usize;
+    let spec = crate::music3::SynSpec::read(model)?;
+    let mut tensors = Vec::new();
     for component in ["transformer", "condition_encoder", "vocoder"] {
-        for entry in std::fs::read_dir(model.join(component))
-            .with_context(|| format!("synthesis component dir {component}"))?
-        {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".safetensors") {
-                bytes += entry
-                    .metadata()
-                    .with_context(|| format!("component file {name}"))?
-                    .len() as usize;
+        let mapped = crate::checkpoint::MappedCheckpoint::open_component(
+            &model.join(component),
+            "diffusion_pytorch_model",
+        )?;
+        let manifest = match component {
+            "transformer" => spec.manifest_transformer(&mapped)?,
+            "condition_encoder" => spec.manifest_condition(&mapped)?,
+            "vocoder" => spec.manifest_vocoder(&mapped)?,
+            _ => unreachable!(),
+        };
+        for (name, entry) in &manifest.entries {
+            if entry.load {
+                ensure!(
+                    entry.dtype == safetensors::Dtype::F32,
+                    "synthesis source {name} is not F32"
+                );
+                tensors.push((component, name.clone(), entry.bytes));
             }
         }
     }
-    Ok(bytes)
+    synthesis_bytes(&tensors)
+}
+
+fn synthesis_bytes(tensors: &[(&str, String, usize)]) -> Result<usize> {
+    let mut resident = 0usize;
+    let mut folds = 0usize;
+    let mut conversion_peak = 0usize;
+    for (component, name, bytes) in tensors {
+        ensure!(bytes % 2 == 0, "odd synthesis tensor byte count {name}");
+        resident = resident
+            .checked_add(bytes / 2)
+            .context("synthesis BF16 byte count overflow")?;
+        if *component == "vocoder" && name.ends_with(".weight_v") {
+            folds = folds
+                .checked_add(bytes / 2)
+                .context("vocoder fold byte count overflow")?;
+        }
+        conversion_peak = conversion_peak.max(*bytes);
+    }
+    resident
+        .checked_add(folds)
+        .and_then(|bytes| bytes.checked_add(conversion_peak))
+        .context("synthesis loading peak overflow")
+}
+
+fn synthesis_fits(free: usize, syn_bytes: usize) -> bool {
+    syn_bytes
+        .checked_add(1 << 30)
+        .is_some_and(|required| free > required)
 }
 
 #[cfg(test)]
@@ -1562,6 +1635,25 @@ mod tests {
             cell.squared += delta * delta;
             cell.count += 1;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn synthesis_capacity_uses_bf16_loading_peak() -> Result<()> {
+        let tensors = vec![
+            ("transformer", "a".to_owned(), 400),
+            ("transformer", "b".to_owned(), 400),
+            ("condition_encoder", "c".to_owned(), 40),
+            ("vocoder", "x.weight_v".to_owned(), 80),
+            ("vocoder", "bias".to_owned(), 4),
+        ];
+        let required = synthesis_bytes(&tensors)?;
+        assert_eq!(required, 902);
+        let f32_file_bytes = 924;
+        let free = required + (1 << 30) + 1;
+        assert!(synthesis_fits(free, required));
+        assert!(!synthesis_fits(free, f32_file_bytes));
+        assert!(!synthesis_fits(free - 1, required));
         Ok(())
     }
 

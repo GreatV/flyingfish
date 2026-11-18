@@ -7,18 +7,76 @@ mod gates {
     use super::super::Device;
     use super::super::engine_music3_syn::Music3Syn;
     use anyhow::Context;
-
+    use cudarc::driver::PushKernelArg;
     fn model_dir() -> anyhow::Result<std::path::PathBuf> {
         let dir = std::env::var("FF_MUSIC3_MODEL").context("FF_MUSIC3_MODEL not set")?;
         Ok(std::path::PathBuf::from(dir))
     }
 
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL=<dir>"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
     fn music3_syn_real_load_gpu() -> anyhow::Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
         let engine = Music3Syn::load(&model_dir()?, &device, 86)?;
+        let capture = std::fs::read(std::path::PathBuf::from(std::env::var(
+            "FF_MUSIC3_CAPTURE",
+        )?))?;
+        let view = safetensors::SafeTensors::deserialize(&capture)?;
+        let bias_input = super::tensor_bf16(&view, "bias_input")?;
+        let bias_want = super::tensor_bf16(&view, "bias_output")?;
+        let d_input = device.stream.clone_htod(&bias_input)?;
+        let dim = engine.spec.flow_dim() as usize;
+        let fourier_dim = engine.spec.fourier_dim as usize;
+        let mut d_output = device.stream.alloc_zeros::<half::bf16>(dim)?;
+        engine.linear_biased(
+            &engine.weights.flow.time_l1_w,
+            [dim, fourier_dim],
+            &d_input.slice(0..fourier_dim),
+            1,
+            &mut d_output.slice_mut(0..dim),
+            &engine.weights.flow.time_l1_b,
+        )?;
+        let bias_got = device.stream.clone_dtoh(&d_output)?;
+        anyhow::ensure!(bias_got == bias_want, "biased linear is not bit-exact");
+        println!("MUSIC3_BIAS bit_identical=true count={}", bias_got.len());
+        let rotary_input = super::tensor_bf16(&view, "rotary_input")?;
+        let rotary_want = super::tensor_bf16(&view, "rotary_output")?;
+        let rotary_cos = super::tensor_bf16(&view, "rotary_cos")?;
+        let rotary_sin = super::tensor_bf16(&view, "rotary_sin")?;
+        let rows = 87usize;
+        let heads = engine.spec.flow_heads as usize;
+        let head_dim = engine.spec.flow_head_dim as usize;
+        let rotary_dim = engine.spec.rotary_dim as usize;
+        anyhow::ensure!(
+            rotary_input.len() == rows * heads * head_dim
+                && rotary_want != rotary_input
+                && rotary_cos.len() == rows * rotary_dim
+                && rotary_sin.len() == rows * rotary_dim,
+            "rotary fixture extent or negative control"
+        );
+        let rope_module = super::super::cubin::module(&device.ctx, "rope")?;
+        let rope = rope_module.load_function("partial_rotary_bf16")?;
+        let mut d_query = device.stream.clone_htod(&rotary_input)?;
+        let d_cos = device.stream.clone_htod(&rotary_cos)?;
+        let d_sin = device.stream.clone_htod(&rotary_sin)?;
+        unsafe {
+            device
+                .stream
+                .launch_builder(&rope)
+                .arg(&mut d_query)
+                .arg(&d_cos)
+                .arg(&d_sin)
+                .arg(&(rows as i32))
+                .arg(&(heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rotary_dim as i32))
+                .launch(super::super::ops::flat(rows * heads * rotary_dim))?;
+        }
+        let rotary_got = device.stream.clone_dtoh(&d_query)?;
+        anyhow::ensure!(rotary_got != rotary_input, "rotary negative control");
+        anyhow::ensure!(rotary_got == rotary_want, "rotary output is not bit-exact");
+        println!("MUSIC3_ROPE bit_identical=true count={}", rotary_got.len());
         assert_eq!(
             engine.weights.flow.blocks.len(),
             engine.spec.flow_layers as usize
@@ -28,7 +86,7 @@ mod gates {
             engine.spec.upsampling.len()
         );
         println!(
-            "MUSIC3_SYN_LOAD ok flow={}x{}x{} cond={} vocoder_stages={} math=CUBLAS_DEFAULT_MATH",
+            "MUSIC3_SYN_LOAD ok flow={}x{}x{} cond={} vocoder_stages={} dtype=BF16 accumulation=F32",
             engine.spec.flow_layers,
             engine.spec.flow_heads,
             engine.spec.flow_head_dim,
@@ -37,6 +95,23 @@ mod gates {
         );
         Ok(())
     }
+}
+
+fn tensor_bf16(view: &safetensors::SafeTensors, name: &str) -> anyhow::Result<Vec<half::bf16>> {
+    let t = view.tensor(name)?;
+    anyhow::ensure!(t.dtype() == safetensors::Dtype::F32, "{name} not F32");
+    let bytes = t.data();
+    anyhow::ensure!(bytes.len() % 4 == 0, "{name} unaligned F32 bytes");
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect())
+}
+
+fn to_f32(values: Vec<half::bf16>) -> Vec<f32> {
+    values.into_iter().map(|v| v.to_f32()).collect()
 }
 
 #[cfg(feature = "cuda")]
@@ -80,7 +155,7 @@ mod velocity {
     fn music3_syn_flow_velocity_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
-        let engine = Music3Syn::load(&env_path("FF_MUSIC3_MODEL")?, &device, 86)?;
+        let mut engine = Music3Syn::load(&env_path("FF_MUSIC3_MODEL")?, &device, 86)?;
         let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
         let capture = std::fs::read(env_path("FF_MUSIC3_CAPTURE")?)?;
         let view = SafeTensors::deserialize(&capture)?;
@@ -97,20 +172,21 @@ mod velocity {
             .copied()
             .context("empty x_t shape")?;
         let timesteps = tensor_f32(&view, "syn_timesteps")?;
-        let s = &engine.stream;
+        let s = engine.stream.clone();
 
         let mut max_cond = 0.0f64;
         let mut max_uncond = 0.0f64;
         let mut engine_cond = Vec::new();
         let mut engine_uncond = Vec::new();
-        let mut velocity = unsafe { s.alloc::<f32>(engine.spec.in_channels as usize * length)? };
+        let mut velocity =
+            unsafe { s.alloc::<half::bf16>(engine.spec.in_channels as usize * length)? };
         for (index, t) in (0..60).zip(&timesteps) {
-            let x_t = tensor_f32(&view, &format!("syn_x_t_{index:03}"))?;
-            let cond = tensor_f32(&view, &format!("syn_cond_{index:03}"))?;
+            let x_t = super::tensor_bf16(&view, &format!("syn_x_t_{index:03}"))?;
+            let cond = super::tensor_bf16(&view, &format!("syn_cond_{index:03}"))?;
             let d_x = s.clone_htod(&x_t)?;
             let d_cond = s.clone_htod(&cond)?;
             engine.flow_velocity(&mut workspace, &d_x, *t, &d_cond, length, &mut velocity)?;
-            let got = s.clone_dtoh(&velocity)?;
+            let got = super::to_f32(s.clone_dtoh(&velocity)?);
             let want = tensor_f32(&view, &format!("syn_velocity_{index:03}"))?;
             let delta = got
                 .iter()
@@ -142,7 +218,12 @@ mod velocity {
                 .iter()
                 .zip(u)
                 .zip(&want)
-                .map(|((a, b), w)| (b + 1.7 * (a - b) - w).abs() as f64)
+                .map(|((a, b), w)| {
+                    let shift = half::bf16::from_f32(a - b);
+                    let scaled = half::bf16::from_f32(1.7 * shift.to_f32());
+                    let guided = half::bf16::from_f32(b + scaled.to_f32()).to_f32();
+                    (guided - w).abs() as f64
+                })
                 .fold(0.0f64, f64::max);
             max_guided = max_guided.max(delta);
         }
@@ -154,8 +235,8 @@ mod velocity {
 
         // Control: dropping the condition on a cond call must exceed the
         // frozen bound (the gate discriminates a silent condition loss).
-        let x_t = tensor_f32(&view, "syn_x_t_010")?;
-        let zeros = vec![0.0f32; length * engine.spec.condition_dim as usize];
+        let x_t = super::tensor_bf16(&view, "syn_x_t_010")?;
+        let zeros = vec![half::bf16::ZERO; length * engine.spec.condition_dim as usize];
         let d_x = s.clone_htod(&x_t)?;
         let d_zero = s.clone_htod(&zeros)?;
         engine.flow_velocity(
@@ -166,7 +247,7 @@ mod velocity {
             length,
             &mut velocity,
         )?;
-        let got = s.clone_dtoh(&velocity)?;
+        let got = super::to_f32(s.clone_dtoh(&velocity)?);
         let want = tensor_f32(&view, "syn_velocity_010")?;
         let control = got
             .iter()
@@ -202,8 +283,8 @@ mod encoder {
             .collect())
     }
 
-    /// Condition encoder against the frozen-r1 cell (max 0.12478924 /
-    /// rmse 0.01145017); layer-swap control must exceed the bound.
+    /// Condition encoder against the frozen BF16 reference cell;
+    /// layer-swap control must exceed the bound.
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CONDITION, FF_MUSIC3_FROZEN_SYN_OPS"]
     fn music3_syn_cond_encoder_gpu() -> Result<()> {
@@ -235,12 +316,12 @@ mod encoder {
         let want = tensor_f32(&view, "condition_encoder")?;
         ensure!(want.len() == length * cond_out, "condition_encoder extent");
 
-        let input = tensor_f32(&view, "condition_input")?;
-        let s = &engine.stream;
+        let input = super::tensor_bf16(&view, "condition_input")?;
+        let s = engine.stream.clone();
         let d_in = s.clone_htod(&input)?;
         let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
         engine.condition_encode(&mut workspace, &d_in, frames)?;
-        let got = s.clone_dtoh(&workspace.cond.slice(0..length * cond_out))?;
+        let got = super::to_f32(s.clone_dtoh(&workspace.cond.slice(0..length * cond_out))?);
         let max_abs = got
             .iter()
             .zip(&want)
@@ -277,8 +358,7 @@ mod encoder {
         }
         let d_swapped = s.clone_htod(&swapped)?;
         engine.condition_encode(&mut workspace, &d_swapped, frames)?;
-        let control = s
-            .clone_dtoh(&workspace.cond.slice(0..length * cond_out))?
+        let control = super::to_f32(s.clone_dtoh(&workspace.cond.slice(0..length * cond_out))?)
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
@@ -297,6 +377,7 @@ mod vocoder_gate {
     use super::super::Device;
     use super::super::engine_music3_syn::Music3Syn;
     use anyhow::{Context, Result, ensure};
+    use cudarc::driver::PushKernelArg;
     use safetensors::SafeTensors;
 
     fn tensor_f32<'a>(view: &'a SafeTensors<'a>, name: &str) -> Result<Vec<f32>> {
@@ -312,7 +393,7 @@ mod vocoder_gate {
             .collect())
     }
 
-    /// Vocoder against the frozen-r1 final_audio cell; negated-latent
+    /// Vocoder against the frozen BF16 reference vocoder cell; negated-latent
     /// control must exceed the bound.
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN_SYN_OPS"]
@@ -328,31 +409,57 @@ mod vocoder_gate {
             "FF_MUSIC3_CAPTURE",
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
+        let snake_input = super::tensor_bf16(&view, "snake_input")?;
+        let snake_alpha = super::tensor_bf16(&view, "snake_alpha")?;
+        let snake_want = tensor_f32(&view, "snake_output")?;
+        ensure!(
+            snake_input.len() == snake_want.len() && snake_input.len() % snake_alpha.len() == 0,
+            "Snake fixture extent"
+        );
+        let snake_module = super::super::cubin::module(&device.ctx, "q38_common")?;
+        let snake = snake_module.load_function("snake_rows_bf16")?;
+        let d_snake_input = device.stream.clone_htod(&snake_input)?;
+        let d_snake_alpha = device.stream.clone_htod(&snake_alpha)?;
+        let mut d_snake_out = device.stream.alloc_zeros::<half::bf16>(snake_input.len())?;
+        unsafe {
+            device
+                .stream
+                .launch_builder(&snake)
+                .arg(&d_snake_input)
+                .arg(&d_snake_alpha)
+                .arg(&mut d_snake_out)
+                .arg(&(snake_input.len() as i64))
+                .arg(&(snake_alpha.len() as i32))
+                .launch(super::super::ops::flat(snake_input.len()))?;
+        }
+        let snake_got = super::to_f32(device.stream.clone_dtoh(&d_snake_out)?);
+        ensure!(snake_got == snake_want, "Snake output is not bit-exact");
+        println!("MUSIC3_SNAKE bit_identical=true count={}", snake_got.len());
         let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
             std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_SYN_OPS")?),
         )?)?;
-        let bound_max = frozen["cells"]["final_audio"]["bound"]["max"]
+        let bound_max = frozen["cells"]["vocoder"]["bound"]["max"]
             .as_f64()
-            .context("final_audio max bound missing")?;
-        let bound_rmse = frozen["cells"]["final_audio"]["bound"]["rmse"]
+            .context("vocoder max bound missing")?;
+        let bound_rmse = frozen["cells"]["vocoder"]["bound"]["rmse"]
             .as_f64()
-            .context("final_audio rmse bound missing")?;
+            .context("vocoder rmse bound missing")?;
 
         let length = engine.spec.latent_length(25);
         let channels = engine.spec.in_channels as usize;
         let total: usize = engine.spec.upsampling.iter().map(|r| *r as usize).product();
-        let latent = tensor_f32(&view, "syn_vocoder_latent")?;
+        let latent = super::tensor_bf16(&view, "syn_vocoder_latent")?;
         ensure!(latent.len() == channels * length, "latent extent");
         let want = tensor_f32(&view, "final_audio")?;
         ensure!(want.len() == 2 * length * total, "final_audio extent");
 
-        let s = &engine.stream;
+        let s = engine.stream.clone();
         let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
         let d_latent = s.clone_htod(&latent)?;
-        let mut out = unsafe { s.alloc::<f32>(2 * length * total)? };
+        let mut out = unsafe { s.alloc::<half::bf16>(2 * length * total)? };
         s.memcpy_dtod(&d_latent, &mut workspace.x.slice_mut(0..channels * length))?;
         engine.vocoder(&mut workspace, length, &mut out)?;
-        let got = s.clone_dtoh(&out)?;
+        let got = super::to_f32(s.clone_dtoh(&out)?);
         let max_abs = got
             .iter()
             .zip(&want)
@@ -371,12 +478,11 @@ mod vocoder_gate {
         ensure!(max_abs <= bound_max, "vocoder max exceeds frozen bound");
         ensure!(rmse <= bound_rmse, "vocoder rmse exceeds frozen bound");
 
-        let negated: Vec<f32> = latent.iter().map(|v| -v).collect();
+        let negated: Vec<half::bf16> = latent.iter().map(|v| -v).collect();
         let d_neg = s.clone_htod(&negated)?;
         s.memcpy_dtod(&d_neg, &mut workspace.x.slice_mut(0..channels * length))?;
         engine.vocoder(&mut workspace, length, &mut out)?;
-        let control = s
-            .clone_dtoh(&out)?
+        let control = super::to_f32(s.clone_dtoh(&out)?)
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
@@ -411,10 +517,9 @@ mod euler {
     }
 
     /// Euler scheduler gate: derived sigma schedule within 2 ULP, and the
-    /// fused guided update chained over 30 teacher-forced transitions
-    /// (bound 1.0e-5).
+    /// fused guided update chained over 30 teacher-forced BF16 transitions.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN"]
     fn music3_syn_euler_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
@@ -427,6 +532,12 @@ mod euler {
             "FF_MUSIC3_CAPTURE",
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
+        let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN")?),
+        )?)?;
+        let bound_update = frozen["cells"]["euler_update"]["bound"]
+            .as_f64()
+            .context("frozen euler_update bound missing")?;
         let want_sigma = tensor_f32(&view, "syn_sigma_schedule")?;
         let derived = Music3Syn::sigma_schedule(30);
         ensure!(want_sigma.len() == 31 && derived.len() == 31);
@@ -438,22 +549,16 @@ mod euler {
             "sigma schedule exceeds the 2-ULP bound"
         );
 
-        let s = &engine.stream;
+        let s = engine.stream.clone();
         // Per-step guided update with the engine kernel on the captured
         // branch velocities.
         let mut max_update = 0.0f64;
-        let mut x: cudarc::driver::CudaSlice<f32> =
-            s.clone_htod(&tensor_f32(&view, "syn_x_t_000")?)?;
+        let mut x: cudarc::driver::CudaSlice<half::bf16> =
+            s.clone_htod(&super::tensor_bf16(&view, "syn_x_t_000")?)?;
         for step in 0..30 {
-            // Transition 29's output never appears as a call input; the
-            // vocoder latent is its only witness.
-            let want_next = if step == 29 {
-                tensor_f32(&view, "syn_vocoder_latent")?
-            } else {
-                tensor_f32(&view, &format!("syn_x_t_{:03}", 2 * (step + 1)))?
-            };
-            let c = tensor_f32(&view, &format!("syn_velocity_cond_{step:03}"))?;
-            let u = tensor_f32(&view, &format!("syn_velocity_uncond_{step:03}"))?;
+            let want_next = tensor_f32(&view, &format!("syn_euler_x_next_{step:03}"))?;
+            let c = super::tensor_bf16(&view, &format!("syn_velocity_cond_{step:03}"))?;
+            let u = super::tensor_bf16(&view, &format!("syn_velocity_uncond_{step:03}"))?;
             let d_c = s.clone_htod(&c)?;
             let d_u = s.clone_htod(&u)?;
             let count = x.len();
@@ -464,7 +569,7 @@ mod euler {
                 want_sigma[step + 1] - want_sigma[step],
                 count,
             )?;
-            let got = s.clone_dtoh(&x)?;
+            let got = super::to_f32(s.clone_dtoh(&x)?);
             let (delta, _) = crate::verify::max_abs_rmse(
                 &format!("music3.syn.euler.s{step}"),
                 &got,
@@ -472,9 +577,9 @@ mod euler {
             )?;
             max_update = max_update.max(delta);
         }
-        println!("MUSIC3_EULER update max_abs={max_update:.6e} (frozen bound 1.0e-05)");
+        println!("MUSIC3_EULER update max_abs={max_update:.6e} (frozen bound {bound_update:.6e})");
         ensure!(
-            max_update <= 1.0e-5,
+            max_update <= bound_update,
             "euler update exceeds the frozen bound"
         );
         Ok(())
@@ -501,7 +606,7 @@ mod end_to_end {
             .collect())
     }
 
-    /// Free-running synthesis end to end against the frozen-r1 final_audio
+    /// Free-running synthesis end to end against the frozen BF16 chain_audio
     /// cell: initial latent = captured step-0 noise, condition from the
     /// frozen capture, 30 CFG Euler steps, vocoder. Controls: the negated
     /// initial latent must exceed the bound; the zero condition input
@@ -511,7 +616,7 @@ mod end_to_end {
     fn music3_syn_end_to_end_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
-        let engine = Music3Syn::load(
+        let mut engine = Music3Syn::load(
             &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
             &device,
             86,
@@ -535,15 +640,16 @@ mod end_to_end {
 
         let length = engine.spec.latent_length(25);
         let total: usize = engine.spec.upsampling.iter().map(|r| *r as usize).product();
-        let initial = tensor_f32(&view, "syn_x_t_000")?;
-        let cond_input = tensor_f32(&view, "condition_input")?;
-        let want = tensor_f32(&view, "final_audio")?;
-        let s = &engine.stream;
+        let initial = super::tensor_bf16(&view, "syn_x_t_000")?;
+        let cond_input = super::tensor_bf16(&view, "condition_input")?;
+        let want = tensor_f32(&view, "chain_audio")?;
+        let s = engine.stream.clone();
         let d_init = s.clone_htod(&initial)?;
         let d_cond = s.clone_htod(&cond_input)?;
-        let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
+        let mut audio = unsafe { s.alloc::<half::bf16>(2 * length * total)? };
         engine.synthesize(&mut workspace, &d_cond, 25, &d_init, &mut audio)?;
-        let got = s.clone_dtoh(&audio)?;
+        let got = super::to_f32(s.clone_dtoh(&audio)?);
+        ensure!(got.iter().all(|v| v.is_finite()), "non-finite final audio");
         let max_abs = got
             .iter()
             .zip(&want)
@@ -562,11 +668,19 @@ mod end_to_end {
         ensure!(max_abs <= bound_max, "end-to-end max exceeds frozen bound");
         ensure!(rmse <= bound_rmse, "end-to-end rmse exceeds frozen bound");
 
-        let negated: Vec<f32> = initial.iter().map(|v| -v).collect();
+        let negated: Vec<half::bf16> = initial.iter().map(|v| -v).collect();
         let d_neg = s.clone_htod(&negated)?;
         engine.synthesize(&mut workspace, &d_cond, 25, &d_neg, &mut audio)?;
-        let control = s
-            .clone_dtoh(&audio)?
+        let control_audio = super::to_f32(s.clone_dtoh(&audio)?);
+        ensure!(
+            control_audio.iter().all(|v| v.is_finite()),
+            "non-finite negated-input audio"
+        );
+        ensure!(
+            control_audio != got,
+            "distinct inputs produced identical audio"
+        );
+        let control = control_audio
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
@@ -580,11 +694,10 @@ mod end_to_end {
 
         // Dropped condition: the zero condition input must move the output
         // by at least 10x the frozen max bound.
-        let dropped: Vec<f32> = vec![0.0f32; cond_input.len()];
+        let dropped: Vec<half::bf16> = vec![half::bf16::ZERO; cond_input.len()];
         let d_zero = s.clone_htod(&dropped)?;
         engine.synthesize(&mut workspace, &d_zero, 25, &d_init, &mut audio)?;
-        let dropped_err = s
-            .clone_dtoh(&audio)?
+        let dropped_err = super::to_f32(s.clone_dtoh(&audio)?)
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
@@ -681,7 +794,7 @@ mod e2e {
 
     /// Teacher-forced handoff cell (frozen bounds) plus the draw-wiring
     /// gate: a native-draw run's latent must be bit-identical to a direct
-    /// philox_normal_f32(seed, stream, count) launch, and the seed+1
+    /// philox_normal_bf16(seed, stream, count) launch, and the seed+1
     /// control must differ.
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_E2E_HANDOFF"]
@@ -741,9 +854,9 @@ mod e2e {
         let count = spec.in_channels as usize * spec.latent_length(25);
         ensure!(drawn_latent.len() == count, "drawn latent extent");
         let module = super::super::cubin::module(&device.ctx, "sample")?;
-        let philox = module.load_function("philox_normal_f32")?;
+        let philox = module.load_function("philox_normal_bf16")?;
         let s = &device.stream;
-        let direct = unsafe { s.alloc::<f32>(count)? };
+        let direct = unsafe { s.alloc::<half::bf16>(count)? };
         unsafe {
             s.launch_builder(&philox)
                 .arg(&input.request.seed)
@@ -755,13 +868,13 @@ mod e2e {
                     256,
                 ))?;
         }
-        let got_direct = s.clone_dtoh(&direct)?;
+        let got_direct = super::to_f32(s.clone_dtoh(&direct)?);
         ensure!(
             got_direct == drawn_latent,
-            "drawn latent differs from a direct philox_normal_f32 launch"
+            "drawn latent differs from a direct philox_normal_bf16 launch"
         );
         println!("M3E2E_DRAW_WIRING bit_identical=true count={count}");
-        let control = unsafe { s.alloc::<f32>(count)? };
+        let control = unsafe { s.alloc::<half::bf16>(count)? };
         unsafe {
             s.launch_builder(&philox)
                 .arg(&(input.request.seed + 1))
@@ -773,7 +886,7 @@ mod e2e {
                     256,
                 ))?;
         }
-        let got_control = s.clone_dtoh(&control)?;
+        let got_control = super::to_f32(s.clone_dtoh(&control)?);
         let differ = got_direct
             .iter()
             .zip(&got_control)
@@ -884,7 +997,7 @@ mod e2e {
         );
         let arm_bytes = std::fs::read(&arm_file)?;
         let view = SafeTensors::deserialize(&arm_bytes)?;
-        let want = tensor_f32(&view, "final_audio")?;
+        let want = tensor_f32(&view, "chain_audio")?;
         let got = &output.pcm;
         let c = &frozen["cells"]["final_audio"]["bound"];
         let bound = (
@@ -918,16 +1031,20 @@ mod e2e {
         let spec = crate::music3::SynSpec::read(&model)?;
         let length = spec.latent_length(25);
         let total: usize = spec.upsampling.iter().map(|r| *r as usize).product();
-        let engine = Music3Syn::load(&model, &device, length)?;
+        let mut engine = Music3Syn::load(&model, &device, length)?;
         let mut ws = Music3Syn::workspace(&engine.spec, &device, length)?;
         let s = &device.stream;
-        let zero_features = vec![0.0f32; input.condition_input.len()];
+        let zero_features = vec![half::bf16::ZERO; input.condition_input.len()];
         let d_zero = s.clone_htod(&zero_features)?;
-        let d_latent = s.clone_htod(&latent)?;
-        let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
+        let d_latent = s.clone_htod(
+            &latent
+                .iter()
+                .map(|v| half::bf16::from_f32(*v))
+                .collect::<Vec<_>>(),
+        )?;
+        let mut audio = unsafe { s.alloc::<half::bf16>(2 * length * total)? };
         engine.synthesize(&mut ws, &d_zero, 25, &d_latent, &mut audio)?;
-        let control = s
-            .clone_dtoh(&audio)?
+        let control = super::to_f32(s.clone_dtoh(&audio)?)
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
@@ -1020,14 +1137,13 @@ mod pair_flow {
     }
 
     /// Pair flow, teacher-forced: one batched call on captured x_t/cond must
-    /// reproduce both captured branch velocities. Also the fused guided
-    /// update on captured tensors vs the captured next x_t.
+    /// reproduce both captured branch velocities within the BF16 frozen cells.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN"]
     fn music3_syn_pair_flow_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
-        let engine = Music3Syn::load(
+        let mut engine = Music3Syn::load(
             &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
             &device,
             86,
@@ -1039,15 +1155,24 @@ mod pair_flow {
             "FF_MUSIC3_CAPTURE",
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
-        let s = &engine.stream;
+        let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN")?),
+        )?)?;
+        let bound_c = frozen["cells"]["flow_velocity_cond"]["bound"]
+            .as_f64()
+            .context("pair cond bound missing")?;
+        let bound_u = frozen["cells"]["flow_velocity_uncond"]["bound"]
+            .as_f64()
+            .context("pair uncond bound missing")?;
+        let s = engine.stream.clone();
         let channels = engine.spec.in_channels as usize;
         let cond_dim = engine.spec.cond_out as usize;
         let length = engine.spec.latent_length(25);
         let timesteps = tensor_f32(&view, "syn_timesteps")?;
 
         // Pair call on step 0 inputs: x_t_000 + cond_000, t = timesteps[0].
-        let x_t = tensor_f32(&view, "syn_x_t_000")?;
-        let cond = tensor_f32(&view, "syn_cond_000")?;
+        let x_t = super::tensor_bf16(&view, "syn_x_t_000")?;
+        let cond = super::tensor_bf16(&view, "syn_cond_000")?;
         let d_x = s.clone_htod(&x_t)?;
         let d_cond = s.clone_htod(&cond)?;
         let want_c = tensor_f32(&view, "syn_velocity_000")?;
@@ -1055,8 +1180,8 @@ mod pair_flow {
         s.memcpy_dtod(&d_x, &mut workspace.x.slice_mut(0..channels * length))?;
         s.memcpy_dtod(&d_cond, &mut workspace.cond.slice_mut(0..length * cond_dim))?;
         engine.flow_velocity_pair(&mut workspace, timesteps[0], length)?;
-        let got_c = s.clone_dtoh(&workspace.pair_v_c.slice(0..channels * length))?;
-        let got_u = s.clone_dtoh(&workspace.pair_v_u.slice(0..channels * length))?;
+        let got_c = super::to_f32(s.clone_dtoh(&workspace.pair_v_c.slice(0..channels * length))?);
+        let got_u = super::to_f32(s.clone_dtoh(&workspace.pair_v_u.slice(0..channels * length))?);
         let dc = got_c
             .iter()
             .zip(&want_c)
@@ -1068,14 +1193,14 @@ mod pair_flow {
             .map(|(a, b)| (a - b).abs() as f64)
             .fold(0.0, f64::max);
         println!(
-            "PAIR_FLOW cond max_abs={dc:.6e} uncond max_abs={du:.6e} (FF_MUSIC3_FROZEN cells: cond 9.796142e-03, uncond 2.662754e-02)"
+            "PAIR_FLOW cond max_abs={dc:.6e} (bound {bound_c:.6e}) uncond max_abs={du:.6e} (bound {bound_u:.6e})"
         );
         ensure!(
-            dc <= 9.796142e-3,
+            dc <= bound_c,
             "pair cond velocity exceeds the FF_MUSIC3_FROZEN cell"
         );
         ensure!(
-            du <= 2.662754e-2,
+            du <= bound_u,
             "pair uncond velocity exceeds the FF_MUSIC3_FROZEN cell"
         );
         Ok(())
