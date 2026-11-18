@@ -463,26 +463,6 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional_single_pv
 }
 
 /// # Safety
-/// BF16 D128 full attention uses 256 threads, 65536 shared bytes and disjoint declared buffers.
-#[unsafe(no_mangle)]
-pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional_single_pv_128q(
-    p: Attention,
-    keys: u32,
-) {
-    unsafe {
-        attention_two_groups::<128, 16, 1, 128, false, false, false>(
-            resolve_position(p),
-            keys,
-            0,
-            0,
-            core::f32::consts::FRAC_1_SQRT_2 / 8.0,
-            core::ptr::null(),
-            0,
-        );
-    }
-}
-
-/// # Safety
 /// All keys below `keys` are populated; launch uses 128 threads and 24576 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional(
@@ -772,24 +752,8 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, wi
     }
 }
 
-macro_rules! attention_form {
-    (1, $one:expr, $two:expr) => {
-        $one
-    };
-    (2, $one:expr, $two:expr) => {
-        $two
-    };
-}
-
-macro_rules! attention_phase {
-    (1, $active:expr, { $($body:tt)* }) => { $($body)* };
-    (2, $active:expr, { $($body:tt)* }) => { if $active { $($body)* } };
-}
-
-macro_rules! attention_body {
-    ($name:ident, $form:tt, $dollar:tt) => {
 #[inline(always)]
-unsafe fn $name<
+unsafe fn attention<
     const D: usize,
     const OUTPUT: usize,
     const MODE: u32,
@@ -812,10 +776,10 @@ unsafe fn $name<
             t=out(reg32) tid,b=out(reg32) tile,h=out(reg32) head,s=out(reg32) sm);
         let lane = tid & 31;
         let warp = tid >> 5;
-        let qstart = attention_form!($form, tile * 64, tile * 128);
+        let qstart = tile * 64;
         let diagonal = p.start + qstart;
-        let sk = sm + attention_form!($form, (128 * D) as u32, (256 * D) as u32);
-        let sv = sm + attention_form!($form, (256 * D) as u32, (384 * D) as u32);
+        let sk = sm + (128 * D) as u32;
+        let sv = sm + (256 * D) as u32;
         let stop = if MODE == 5 {
             block_bounds(p, (qstart + 63).min(p.rows - 1), prefix, blocks, origin)[1].min(end)
         } else if MODE == 1 {
@@ -839,8 +803,8 @@ unsafe fn $name<
             end.min(diagonal)
         };
         let copy_width = if D == 96 { 4 } else { D as u32 / 8 };
-        let copy_row = attention_form!($form, tid / copy_width, (tid & 127) / copy_width);
-        let copy_lane = attention_form!($form, tid % copy_width, (tid & 127) % copy_width);
+        let copy_row = tid / copy_width;
+        let copy_lane = tid % copy_width;
         let copy_col = copy_lane * 8;
         let copy_shared = [
             address(0, copy_row, copy_col, D as u32),
@@ -859,19 +823,19 @@ unsafe fn $name<
         let mut vp =
             p.v.wrapping_add(kv + (first + copy_row) as usize * L + copy_col as usize);
         macro_rules! copy_q {
-            ($dollar i:expr) => {{
-                let row = attention_form!($form, copy_row, copy_row + (tid >> 7) * 64)
+            ($i:expr) => {{
+                let row = copy_row
                     + if D == 96 {
-                        ($dollar i % 2) * 32
+                        ($i % 2) * 32
                     } else {
-                        $dollar i * (1024 / D as u32)
+                        $i * (1024 / D as u32)
                     };
-                let col = copy_col + if D == 96 { ($dollar i / 2) * 32 } else { 0 };
+                let col = copy_col + if D == 96 { ($i / 2) * 32 } else { 0 };
                 copy(
                     if D == 96 {
-                        attention_form!($form, sm, sm + (tid >> 7) * (128 * D) as u32) + copy_shared[0] + $dollar i * 2048
+                        sm + copy_shared[0] + $i * 2048
                     } else {
-                        attention_form!($form, sm, sm + (tid >> 7) * (128 * D) as u32) + copy_shared[$dollar i % 2] + ($dollar i / 2) * 4096
+                        sm + copy_shared[$i % 2] + ($i / 2) * 4096
                     },
                     p.q.wrapping_add(
                         (qstart + row) as usize * p.q_stride as usize
@@ -891,7 +855,6 @@ unsafe fn $name<
         } else {
             eight!(copy_q);
         }
-        attention_phase!($form, tid < 128, {
         copy_kv::<D, L, true>(
             [sk + copy_shared[0], sk + copy_shared[1]],
             kp,
@@ -899,7 +862,6 @@ unsafe fn $name<
             end,
             copy_col,
         );
-        });
         commit();
         wait();
         let qr = warp * 16 + (lane & 15);
@@ -942,47 +904,44 @@ unsafe fn $name<
         let r1 = r0 + 8;
         let mut key = first;
         macro_rules! tile_step {
-            ($dollar masked:expr) => {{
-                attention_phase!($form, tid < 128, {
-                copy_kv::<D, L, $dollar masked>(
+            ($masked:expr) => {{
+                copy_kv::<D, L, $masked>(
                     [sv + copy_shared[0], sv + copy_shared[1]],
                     vp,
                     key + copy_row,
                     end,
                     copy_col,
                 );
-                });
                 commit();
                 let mut scores = [[0.0f32; 4]; 8];
                 macro_rules! qk_step {
-                    ($dollar inner:expr) => {{
+                    ($inner:expr) => {{
                         let a = if REUSE_Q {
-                            queries[$dollar inner]
+                            queries[$inner]
                         } else if D == 96 {
-                            ld4::<{ ($dollar inner / 2) * 4096 }>(qb[$dollar inner % 2])
+                            ld4::<{ ($inner / 2) * 4096 }>(qb[$inner % 2])
                         } else {
-                            ld4::<{ ($dollar inner / 4) * 128 }>(qb[$dollar inner % 4])
+                            ld4::<{ ($inner / 4) * 128 }>(qb[$inner % 4])
                         };
                         macro_rules! qk_pair {
-                            ($dollar pair:expr) => {{
+                            ($pair:expr) => {{
                                 let b = if D == 256 {
-                                    ld4::<{ ($dollar inner / 4) * 128 + $dollar pair * 8192 }>(kb[$dollar inner % 4])
+                                    ld4::<{ ($inner / 4) * 128 + $pair * 8192 }>(kb[$inner % 4])
                                 } else if D == 64 {
-                                    ld4::<{ $dollar pair * 2048 }>(kb[$dollar inner % 4])
+                                    ld4::<{ $pair * 2048 }>(kb[$inner % 4])
                                 } else if D == 96 {
-                                    ld4::<{ ($dollar inner / 2) * 4096 + $dollar pair * 1024 }>(kb[$dollar inner % 2])
+                                    ld4::<{ ($inner / 2) * 4096 + $pair * 1024 }>(kb[$inner % 2])
                                 } else {
-                                    ld4::<{ ($dollar inner / 4) * 128 + $dollar pair * 4096 }>(kb[$dollar inner % 4])
+                                    ld4::<{ ($inner / 4) * 128 + $pair * 4096 }>(kb[$inner % 4])
                                 };
-                                scores[$dollar pair * 2] = mma::<F16>(a, [b[0], b[1]], scores[$dollar pair * 2]);
-                                scores[$dollar pair * 2 + 1] =
-                                    mma::<F16>(a, [b[2], b[3]], scores[$dollar pair * 2 + 1]);
+                                scores[$pair * 2] = mma::<F16>(a, [b[0], b[1]], scores[$pair * 2]);
+                                scores[$pair * 2 + 1] =
+                                    mma::<F16>(a, [b[2], b[3]], scores[$pair * 2 + 1]);
                             }};
                         }
                         four!(qk_pair);
                     }};
                 }
-                attention_phase!($form, qstart + (tid >> 7) * 64 < p.rows, {
                 if D == 256 {
                     sixteen!(qk_step);
                 } else if D == 64 {
@@ -992,13 +951,11 @@ unsafe fn $name<
                 } else {
                     eight!(qk_step);
                 }
-                });
                 wait();
                 let next_key = key + 64;
                 kp = kp.wrapping_add(64 * L);
                 if next_key < stop {
                     let destinations = [sk + copy_shared[0], sk + copy_shared[1]];
-                    attention_phase!($form, tid < 128, {
                     if next_key + 64 <= end {
                         copy_kv::<D, L, false>(
                             destinations,
@@ -1010,10 +967,8 @@ unsafe fn $name<
                     } else {
                         copy_kv::<D, L, true>(destinations, kp, next_key + copy_row, end, copy_col);
                     }
-                    });
                     commit();
                 }
-                attention_phase!($form, qstart + (tid >> 7) * 64 < p.rows, {
                 let mut next = peak;
                 let upper = |row: u32| {
                     if MODE == 5 {
@@ -1029,24 +984,24 @@ unsafe fn $name<
                     }
                 };
                 macro_rules! mask_max {
-                    ($dollar n:expr) => {{
-                        if $dollar masked || MODE == 3 || MODE == 5 {
-                            let col = key + $dollar n * 8 + (lane & 3) * 2;
+                    ($n:expr) => {{
+                        if $masked || MODE == 3 || MODE == 5 {
+                            let col = key + $n * 8 + (lane & 3) * 2;
                             if col >= upper(r0) {
-                                scores[$dollar n][0] = f32::NEG_INFINITY;
+                                scores[$n][0] = f32::NEG_INFINITY;
                             }
                             if col + 1 >= upper(r0) {
-                                scores[$dollar n][1] = f32::NEG_INFINITY;
+                                scores[$n][1] = f32::NEG_INFINITY;
                             }
                             if col >= upper(r1) {
-                                scores[$dollar n][2] = f32::NEG_INFINITY;
+                                scores[$n][2] = f32::NEG_INFINITY;
                             }
                             if col + 1 >= upper(r1) {
-                                scores[$dollar n][3] = f32::NEG_INFINITY;
+                                scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
                         if MODE == 3 || MODE == 5 || MODE == 6 {
-                            let col = key + $dollar n * 8 + (lane & 3) * 2;
+                            let col = key + $n * 8 + (lane & 3) * 2;
                             let lo0 = if MODE == 5 {
                                 block_bounds(p, qstart + r0, prefix, blocks, origin)[0]
                             } else {
@@ -1058,20 +1013,20 @@ unsafe fn $name<
                                 (diagonal + r1).saturating_sub(prefix)
                             };
                             if col < lo0 {
-                                scores[$dollar n][0] = f32::NEG_INFINITY;
+                                scores[$n][0] = f32::NEG_INFINITY;
                             }
                             if col + 1 < lo0 {
-                                scores[$dollar n][1] = f32::NEG_INFINITY;
+                                scores[$n][1] = f32::NEG_INFINITY;
                             }
                             if col < lo1 {
-                                scores[$dollar n][2] = f32::NEG_INFINITY;
+                                scores[$n][2] = f32::NEG_INFINITY;
                             }
                             if col + 1 < lo1 {
-                                scores[$dollar n][3] = f32::NEG_INFINITY;
+                                scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
-                        next[0] = maximum(next[0], maximum(scores[$dollar n][0], scores[$dollar n][1]));
-                        next[1] = maximum(next[1], maximum(scores[$dollar n][2], scores[$dollar n][3]));
+                        next[0] = maximum(next[0], maximum(scores[$n][0], scores[$n][1]));
+                        next[1] = maximum(next[1], maximum(scores[$n][2], scores[$n][3]));
                     }};
                 }
                 eight!(mask_max);
@@ -1099,20 +1054,20 @@ unsafe fn $name<
                 let mut packed = [[0u32; 4]; 4];
                 let mut residual = [[0u32; 4]; 4];
                 macro_rules! probabilities {
-                    ($dollar n:expr) => {{
-                        let a = probability::<{ D }>(scores[$dollar n][0], negative_peak[0], scale);
-                        let b = probability::<{ D }>(scores[$dollar n][1], negative_peak[0], scale);
-                        let c = probability::<{ D }>(scores[$dollar n][2], negative_peak[1], scale);
-                        let d = probability::<{ D }>(scores[$dollar n][3], negative_peak[1], scale);
+                    ($n:expr) => {{
+                        let a = probability::<{ D }>(scores[$n][0], negative_peak[0], scale);
+                        let b = probability::<{ D }>(scores[$n][1], negative_peak[0], scale);
+                        let c = probability::<{ D }>(scores[$n][2], negative_peak[1], scale);
+                        let d = probability::<{ D }>(scores[$n][3], negative_peak[1], scale);
                         sum[0] += a + b;
                         sum[1] += c + d;
-                        packed[$dollar n / 2][($dollar n % 2) * 2] = pack::<F16>(a, b);
-                        packed[$dollar n / 2][($dollar n % 2) * 2 + 1] = pack::<F16>(c, d);
+                        packed[$n / 2][($n % 2) * 2] = pack::<F16>(a, b);
+                        packed[$n / 2][($n % 2) * 2 + 1] = pack::<F16>(c, d);
                         if D <= 128 && RESIDUAL {
-                            residual[$dollar n / 2][($dollar n % 2) * 2] =
-                                pack_residual::<F16>(a, b, packed[$dollar n / 2][($dollar n % 2) * 2]);
-                            residual[$dollar n / 2][($dollar n % 2) * 2 + 1] =
-                                pack_residual::<F16>(c, d, packed[$dollar n / 2][($dollar n % 2) * 2 + 1]);
+                            residual[$n / 2][($n % 2) * 2] =
+                                pack_residual::<F16>(a, b, packed[$n / 2][($n % 2) * 2]);
+                            residual[$n / 2][($n % 2) * 2 + 1] =
+                                pack_residual::<F16>(c, d, packed[$n / 2][($n % 2) * 2 + 1]);
                         }
                     }};
                 }
@@ -1121,11 +1076,11 @@ unsafe fn $name<
                 denominator[1] = denominator[1] * alpha[1] + sum[1];
                 peak = next;
                 macro_rules! rescale {
-                    ($dollar n:expr) => {{
-                        output[$dollar n][0] *= alpha[0];
-                        output[$dollar n][1] *= alpha[0];
-                        output[$dollar n][2] *= alpha[1];
-                        output[$dollar n][3] *= alpha[1];
+                    ($n:expr) => {{
+                        output[$n][0] *= alpha[0];
+                        output[$n][1] *= alpha[0];
+                        output[$n][2] *= alpha[1];
+                        output[$n][3] *= alpha[1];
                     }};
                 }
                 if D == 256 {
@@ -1142,38 +1097,38 @@ unsafe fn $name<
                     sixteen!(rescale);
                 }
                 macro_rules! pv_step {
-                    ($dollar inner:expr) => {{
-                        let a = packed[$dollar inner];
+                    ($inner:expr) => {{
+                        let a = packed[$inner];
                         macro_rules! pv_pair {
-                            ($dollar pair:expr) => {{
+                            ($pair:expr) => {{
                                 let b = if D == 256 {
-                                    ld4_trans::<{ ($dollar pair / 4) * 128 + $dollar inner * 8192 }>(
-                                        vb[$dollar pair % 4],
+                                    ld4_trans::<{ ($pair / 4) * 128 + $inner * 8192 }>(
+                                        vb[$pair % 4],
                                     )
                                 } else if D == 64 {
-                                    ld4_trans::<{ $dollar inner * 2048 }>(vb[$dollar pair % 4])
+                                    ld4_trans::<{ $inner * 2048 }>(vb[$pair % 4])
                                 } else if D == 96 {
-                                    ld4_trans::<{ ($dollar pair / 2) * 4096 + $dollar inner * 1024 }>(
-                                        vb[$dollar pair % 2],
+                                    ld4_trans::<{ ($pair / 2) * 4096 + $inner * 1024 }>(
+                                        vb[$pair % 2],
                                     )
                                 } else {
-                                    ld4_trans::<{ ($dollar pair / 4) * 128 + $dollar inner * 4096 }>(
-                                        vb[$dollar pair % 4],
+                                    ld4_trans::<{ ($pair / 4) * 128 + $inner * 4096 }>(
+                                        vb[$pair % 4],
                                     )
                                 };
-                                output[$dollar pair * 2] = mma::<F16>(a, [b[0], b[1]], output[$dollar pair * 2]);
-                                output[$dollar pair * 2 + 1] =
-                                    mma::<F16>(a, [b[2], b[3]], output[$dollar pair * 2 + 1]);
+                                output[$pair * 2] = mma::<F16>(a, [b[0], b[1]], output[$pair * 2]);
+                                output[$pair * 2 + 1] =
+                                    mma::<F16>(a, [b[2], b[3]], output[$pair * 2 + 1]);
                                 if D <= 128 && RESIDUAL {
-                                    output[$dollar pair * 2] = mma::<F16>(
-                                        residual[$dollar inner],
+                                    output[$pair * 2] = mma::<F16>(
+                                        residual[$inner],
                                         [b[0], b[1]],
-                                        output[$dollar pair * 2],
+                                        output[$pair * 2],
                                     );
-                                    output[$dollar pair * 2 + 1] = mma::<F16>(
-                                        residual[$dollar inner],
+                                    output[$pair * 2 + 1] = mma::<F16>(
+                                        residual[$inner],
                                         [b[2], b[3]],
-                                        output[$dollar pair * 2 + 1],
+                                        output[$pair * 2 + 1],
                                     );
                                 }
                             }};
@@ -1190,7 +1145,6 @@ unsafe fn $name<
                     }};
                 }
                 four!(pv_step);
-                });
                 wait();
             }};
         }
@@ -1209,9 +1163,9 @@ unsafe fn $name<
             t=out(reg32) tid,b=out(reg32) tile,h=out(reg32) head,s=out(reg32) sm);
         let lane = tid & 31;
         let warp = tid >> 5;
-        let qstart = attention_form!($form, tile * 64, tile * 128);
-        let copy_row = attention_form!($form, tid / (D as u32 / 8), (tid & 127) / (D as u32 / 8) + (tid >> 7) * 64);
-        let copy_lane = attention_form!($form, tid % (D as u32 / 8), (tid & 127) % (D as u32 / 8));
+        let qstart = tile * 64;
+        let copy_row = tid / (D as u32 / 8);
+        let copy_lane = tid % (D as u32 / 8);
         let copy_col = copy_lane * 8;
         let r0 = warp * 16 + (lane >> 2);
         let r1 = r0 + 8;
@@ -1233,26 +1187,26 @@ unsafe fn $name<
             }
         }
         macro_rules! stage_output {
-            ($dollar group:expr) => {{
-                let base = sm + warp * (32 * D) as u32 + $dollar group * 1024 + (lane ^ $dollar group) * 16;
+            ($group:expr) => {{
+                let base = sm + warp * (32 * D) as u32 + $group * 1024 + (lane ^ $group) * 16;
                 store_shared4(
                     base,
                     [
                         pack::<F16>(
-                            output[$dollar group * 4][0] * norm[0],
-                            output[$dollar group * 4][1] * norm[0],
+                            output[$group * 4][0] * norm[0],
+                            output[$group * 4][1] * norm[0],
                         ),
                         pack::<F16>(
-                            output[$dollar group * 4 + 1][0] * norm[0],
-                            output[$dollar group * 4 + 1][1] * norm[0],
+                            output[$group * 4 + 1][0] * norm[0],
+                            output[$group * 4 + 1][1] * norm[0],
                         ),
                         pack::<F16>(
-                            output[$dollar group * 4 + 2][0] * norm[0],
-                            output[$dollar group * 4 + 2][1] * norm[0],
+                            output[$group * 4 + 2][0] * norm[0],
+                            output[$group * 4 + 2][1] * norm[0],
                         ),
                         pack::<F16>(
-                            output[$dollar group * 4 + 3][0] * norm[0],
-                            output[$dollar group * 4 + 3][1] * norm[0],
+                            output[$group * 4 + 3][0] * norm[0],
+                            output[$group * 4 + 3][1] * norm[0],
                         ),
                     ],
                 );
@@ -1260,20 +1214,20 @@ unsafe fn $name<
                     base + 512,
                     [
                         pack::<F16>(
-                            output[$dollar group * 4][2] * norm[1],
-                            output[$dollar group * 4][3] * norm[1],
+                            output[$group * 4][2] * norm[1],
+                            output[$group * 4][3] * norm[1],
                         ),
                         pack::<F16>(
-                            output[$dollar group * 4 + 1][2] * norm[1],
-                            output[$dollar group * 4 + 1][3] * norm[1],
+                            output[$group * 4 + 1][2] * norm[1],
+                            output[$group * 4 + 1][3] * norm[1],
                         ),
                         pack::<F16>(
-                            output[$dollar group * 4 + 2][2] * norm[1],
-                            output[$dollar group * 4 + 2][3] * norm[1],
+                            output[$group * 4 + 2][2] * norm[1],
+                            output[$group * 4 + 2][3] * norm[1],
                         ),
                         pack::<F16>(
-                            output[$dollar group * 4 + 3][2] * norm[1],
-                            output[$dollar group * 4 + 3][3] * norm[1],
+                            output[$group * 4 + 3][2] * norm[1],
+                            output[$group * 4 + 3][3] * norm[1],
                         ),
                     ],
                 );
@@ -1293,8 +1247,8 @@ unsafe fn $name<
         }
         barrier();
         macro_rules! write_compact_output {
-            ($dollar step:expr) => {{
-                let row = tid / 16 + $dollar step * 8;
+            ($step:expr) => {{
+                let row = tid / 16 + $step * 8;
                 let lane = tid % 16;
                 let col = lane * 8;
                 if qstart + row < p.rows && col < 96 {
@@ -1321,8 +1275,8 @@ unsafe fn $name<
             }};
         }
         macro_rules! write_output {
-            ($dollar step:expr) => {{
-                let row = copy_row + $dollar step * (1024 / D as u32);
+            ($step:expr) => {{
+                let row = copy_row + $step * (1024 / D as u32);
                 if qstart + row < p.rows && copy_col < L as u32 {
                     let base = sm
                         + (row / 16) * (32 * D) as u32
@@ -1355,12 +1309,6 @@ unsafe fn $name<
         }
     }
 }
-
-    };
-}
-
-attention_body!(attention, 1, $);
-attention_body!(attention_two_groups, 2, $);
 
 /// # Safety
 /// Launch uses 128 threads, 90112 shared bytes and buffers covering the declared extents.
