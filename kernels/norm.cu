@@ -30,6 +30,7 @@
 //     capturable.
 
 #include "gpu_compat.cuh"
+#include "rotary.cuh"
 
 namespace {
 
@@ -621,4 +622,115 @@ extern "C" __global__ __launch_bounds__(256) void sample_std_f32(
       : __fdiv_rn(total, (float)(count - 1));
   if (!(variance >= 0.0f) || !isfinite(variance)) { __trap(); return; }
   if (threadIdx.x == 0) *output = __fsqrt_rn(variance);
+}
+
+namespace {
+
+template<int VEC>
+__device__ __forceinline__ float rmsnorm_rstd(const __nv_bfloat16* x, int n, float eps) {
+  __shared__ float smem[32];
+  const int nthr = blockDim.x;
+  const int gid = threadIdx.x;
+  const int nv = n / VEC;
+  const bool cached = (nv <= nthr * (kMaxPerThread / VEC));
+  float r[kMaxPerThread];
+  float ssq = 0.0f;
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        ld_vec<VEC>(x + (size_t)c * VEC, r + i * VEC);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) ssq += r[i * VEC + j] * r[i * VEC + j];
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      ld_vec<VEC>(x + (size_t)c * VEC, r);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) ssq += r[j] * r[j];
+    }
+  }
+  return rsqrtf(block_reduce_sum(ssq, smem) / (float)n + eps);
+}
+
+__device__ __forceinline__ __nv_bfloat16 rmsnorm_value(float x, float rstd, float weight) {
+  const float value = norm_scale<false>(x, rstd, weight);
+  return __floats2bfloat162_rn(value, value).x;
+}
+
+template<int VEC>
+__device__ __forceinline__ void rmsnorm_rotary_q_row(
+    const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* q,
+    const __nv_bfloat16* table, int start, int rows, int q_heads, int dim,
+    int rotary, int capacity, float eps) {
+  rmsnorm_row<VEC>(x, w, q, dim, eps);
+  __syncthreads();
+  const int gid = threadIdx.x, nthr = blockDim.x;
+  __nv_bfloat16* base = q - (size_t)blockIdx.x * dim;
+  for (int d = gid; d < dim; d += nthr) {
+    rotary_element(base, base, base, base, base, table, start, rows, q_heads, 0, dim, rotary, capacity,
+                   blockIdx.x * dim + d);
+  }
+}
+
+template<int VEC>
+__device__ __forceinline__ void rmsnorm_rotary_kv_row(
+    const __nv_bfloat16* x, const __nv_bfloat16* w,
+    const __nv_bfloat16* value, __nv_bfloat16* k, __nv_bfloat16* v,
+    const __nv_bfloat16* table, int start, int rows, int kv_heads, int dim,
+    int rotary, int capacity, float eps) {
+  const float rstd = rmsnorm_rstd<VEC>(x, dim, eps);
+  const int gid = threadIdx.x, nthr = blockDim.x;
+  const int row = blockIdx.x / kv_heads;
+  const int head = blockIdx.x % kv_heads;
+  const int position = start + row;
+  if (position < 0 || position >= capacity) { __trap(); return; }
+  const size_t src = (size_t)blockIdx.x * dim;
+  const size_t dst = ((size_t)head * capacity + position) * dim;
+  const int half = rotary / 2;
+  for (int d = gid; d < dim; d += nthr) {
+    v[dst + d] = value[src + d];
+    if (d >= rotary) {
+      k[dst + d] = rmsnorm_value(x[d], rstd, w[d]);
+      continue;
+    }
+    if (d >= half) continue;
+    const __nv_bfloat16 a = rmsnorm_value(x[d], rstd, w[d]);
+    const __nv_bfloat16 b = rmsnorm_value(x[d + half], rstd, w[d + half]);
+    const __nv_bfloat16 c = table[(size_t)position * rotary + d];
+    const __nv_bfloat16 s = table[(size_t)position * rotary + d + half];
+    __nv_bfloat16 lo, hi;
+    rotary_pair(a, b, c, s, &lo, &hi);
+    k[dst + d] = lo;
+    k[dst + d + half] = hi;
+  }
+}
+
+}  // namespace
+
+extern "C" __global__ __launch_bounds__(1024) void rmsnorm_rotary_q(
+    const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* q,
+    const __nv_bfloat16* table, int start, int rows, int q_heads, int dim,
+    int rotary, int capacity, float eps) {
+  if (blockIdx.x >= rows * q_heads) return;
+  const size_t off = (size_t)blockIdx.x * dim;
+  if ((dim & 7) == 0)
+    rmsnorm_rotary_q_row<8>(x + off, w, q + off, table, start, rows, q_heads, dim, rotary, capacity, eps);
+  else
+    rmsnorm_rotary_q_row<1>(x + off, w, q + off, table, start, rows, q_heads, dim, rotary, capacity, eps);
+}
+
+extern "C" __global__ __launch_bounds__(1024) void rmsnorm_rotary_kv(
+    const __nv_bfloat16* x, const __nv_bfloat16* w,
+    const __nv_bfloat16* value, __nv_bfloat16* k, __nv_bfloat16* v,
+    const __nv_bfloat16* table, int start, int rows, int kv_heads, int dim,
+    int rotary, int capacity, float eps) {
+  if (blockIdx.x >= rows * kv_heads) return;
+  const size_t off = (size_t)blockIdx.x * dim;
+  if ((dim & 7) == 0)
+    rmsnorm_rotary_kv_row<8>(x + off, w, value, k, v, table, start, rows, kv_heads, dim, rotary, capacity, eps);
+  else
+    rmsnorm_rotary_kv_row<1>(x + off, w, value, k, v, table, start, rows, kv_heads, dim, rotary, capacity, eps);
 }

@@ -1172,6 +1172,8 @@ pub(crate) struct BlockKernels {
     norm_modulate: crate::backend::gpu::CudaFunction,
     norm_modulate_f32: crate::backend::gpu::CudaFunction,
     rotary: crate::backend::gpu::CudaFunction,
+    rotary_q: crate::backend::gpu::CudaFunction,
+    rotary_kv: crate::backend::gpu::CudaFunction,
     swiglu: crate::backend::gpu::CudaFunction,
     #[cfg(test)]
     modulate: crate::backend::gpu::CudaFunction,
@@ -1215,6 +1217,8 @@ impl BlockKernels {
             norm_modulate_f32,
             residual: norm.load_function("residual")?,
             rotary: cubin::module(ctx, "rope")?.load_function("rotary_prefix_kv")?,
+            rotary_q: norm.load_function("rmsnorm_rotary_q")?,
+            rotary_kv: norm.load_function("rmsnorm_rotary_kv")?,
             swiglu: cubin::module(ctx, "act")?.load_function("silu_mul")?,
             #[cfg(test)]
             modulate: modulate.load_function("row_modulate")?,
@@ -2045,25 +2049,6 @@ pub(crate) fn block_forward<const LORA: bool>(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let norm = |input: u64,
-                weight: u64,
-                output: u64,
-                rows: usize,
-                dim: usize,
-                threads: u32,
-                eps: f32|
-     -> Result<()> {
-        let n = NormRows {
-            input,
-            weight,
-            output,
-            rows,
-            dim,
-            threads,
-            eps,
-        };
-        kernels.rms_norm_f32(s, n)
-    };
     let xp = pointer(x, s);
     let normed = pointer(&work.normed, s);
     let hidden_norm = |weight: &VectorWeight<bf16>, shift: usize, scale: usize| -> Result<()> {
@@ -2155,48 +2140,49 @@ pub(crate) fn block_forward<const LORA: bool>(
         }
     }
     let head_rows = rows * spec.heads;
-    norm(
-        pointer(&work.q_raw, s),
-        w.norm_q.tensor.ptr,
-        pointer(&work.q, s),
-        head_rows,
-        spec.head_dim,
-        HEAD_NORM_THREADS,
-        spec.qk_norm_eps,
-    )?;
-    norm(
-        pointer(&work.k_raw, s),
-        w.norm_k.tensor.ptr,
-        pointer(&work.k, s),
-        head_rows,
-        spec.head_dim,
-        HEAD_NORM_THREADS,
-        spec.qk_norm_eps,
-    )?;
-    // q rotates in place; k and v land head-major [heads, rows, head_dim] in k_raw and q_raw.
-    let elements = rows * 2 * spec.heads * spec.head_dim;
     unsafe {
-        s.launch_builder(&kernels.rotary)
-            .arg(&pointer(&work.q, s))
-            .arg(&pointer(&work.k, s))
-            .arg(&pointer(&work.v_raw, s))
+        s.launch_builder(&kernels.rotary_q)
             .arg(&pointer(&work.q_raw, s))
-            .arg(&pointer(&work.k_raw, s))
+            .arg(&w.norm_q.tensor.ptr)
+            .arg(&pointer(&work.q, s))
             .arg(&rotary_table)
             .arg(&0i32)
             .arg(&rows_i)
             .arg(&i32::try_from(spec.heads)?)
+            .arg(&i32::try_from(spec.head_dim)?)
+            .arg(&i32::try_from(rotary_width)?)
+            .arg(&rows_i)
+            .arg(&spec.qk_norm_eps)
+            .launch(LaunchConfig {
+                grid_dim: (u32::try_from(head_rows)?, 1, 1),
+                block_dim: (HEAD_NORM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+        s.launch_builder(&kernels.rotary_kv)
+            .arg(&pointer(&work.k_raw, s))
+            .arg(&w.norm_k.tensor.ptr)
+            .arg(&pointer(&work.v_raw, s))
+            .arg(&pointer(&work.k, s))
+            .arg(&pointer(&work.q_raw, s))
+            .arg(&rotary_table)
+            .arg(&0i32)
+            .arg(&rows_i)
             .arg(&i32::try_from(spec.heads)?)
             .arg(&i32::try_from(spec.head_dim)?)
             .arg(&i32::try_from(rotary_width)?)
             .arg(&rows_i)
-            .launch(flat(elements))?;
+            .arg(&spec.qk_norm_eps)
+            .launch(LaunchConfig {
+                grid_dim: (u32::try_from(head_rows)?, 1, 1),
+                block_dim: (HEAD_NORM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
     }
     flash.run(
         &work.q,
         width,
+        &work.k,
         &work.q_raw,
-        &work.k_raw,
         &mut work.v_raw,
         Shape {
             rows,
@@ -5982,6 +5968,178 @@ mod tests {
             max = max.max(delta);
         }
         (n, max)
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn qk_rope_fusion_matches_parent_gpu() -> Result<()> {
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        for rows in [14usize, 1000] {
+            let heads = 56usize;
+            let dim = 128usize;
+            let rotary = 96usize;
+            let elements = rows * heads * dim;
+            let head_rows = rows * heads;
+            let rows_i = i32::try_from(rows)?;
+            let head_rows_i = i32::try_from(head_rows)?;
+            let dim_i = i32::try_from(dim)?;
+            let heads_i = i32::try_from(heads)?;
+            let rotary_i = i32::try_from(rotary)?;
+            let eps = 1.0e-5f32;
+            let start = 0i32;
+            let host = |offset: usize| -> Vec<bf16> {
+                (0..elements)
+                    .map(|i| bf16::from_f32((((i * 37 + offset) % 509) as f32 - 254.0) / 127.0))
+                    .collect()
+            };
+            let q = host(0);
+            let k = host(71);
+            let v = host(143);
+            let weight: Vec<bf16> = (0..dim)
+                .map(|i| bf16::from_f32(0.5 + (i * 13 % 29) as f32 / 29.0))
+                .collect();
+            let table: Vec<bf16> = (0..rows * rotary)
+                .map(|i| bf16::from_f32((i as f32 * 0.017).cos()))
+                .collect();
+            let weight = s.clone_htod(&weight)?;
+            let table = s.clone_htod(&table)?;
+            let mut q_parent = s.clone_htod(&q)?;
+            let mut k_parent = s.clone_htod(&k)?;
+            let v_parent = s.clone_htod(&v)?;
+            let mut q_norm_parent = s.alloc_zeros::<bf16>(elements)?;
+            let mut k_norm_parent = s.alloc_zeros::<bf16>(elements)?;
+            let norm_grid = LaunchConfig {
+                grid_dim: (u32::try_from(head_rows)?, 1, 1),
+                block_dim: (HEAD_NORM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                s.launch_builder(&kernels.norm_f32)
+                    .arg(&q_parent)
+                    .arg(&weight)
+                    .arg(&mut q_norm_parent)
+                    .arg(&head_rows_i)
+                    .arg(&dim_i)
+                    .arg(&eps)
+                    .launch(norm_grid)?;
+                s.launch_builder(&kernels.norm_f32)
+                    .arg(&k_parent)
+                    .arg(&weight)
+                    .arg(&mut k_norm_parent)
+                    .arg(&head_rows_i)
+                    .arg(&dim_i)
+                    .arg(&eps)
+                    .launch(norm_grid)?;
+                s.launch_builder(&kernels.rotary)
+                    .arg(&mut q_norm_parent)
+                    .arg(&k_norm_parent)
+                    .arg(&v_parent)
+                    .arg(&mut k_parent)
+                    .arg(&mut q_parent)
+                    .arg(&table)
+                    .arg(&start)
+                    .arg(&rows_i)
+                    .arg(&heads_i)
+                    .arg(&heads_i)
+                    .arg(&dim_i)
+                    .arg(&rotary_i)
+                    .arg(&rows_i)
+                    .launch(flat(2 * elements))?;
+            }
+            let q_fused = s.clone_htod(&q)?;
+            let k_fused = s.clone_htod(&k)?;
+            let v_fused = s.clone_htod(&v)?;
+            let mut q_norm_fused = s.alloc_zeros::<bf16>(elements)?;
+            let k_norm_fused = s.alloc_zeros::<bf16>(elements)?;
+            unsafe {
+                s.launch_builder(&kernels.rotary_q)
+                    .arg(&pointer(&q_fused, s))
+                    .arg(&weight)
+                    .arg(&mut q_norm_fused)
+                    .arg(&table)
+                    .arg(&start)
+                    .arg(&rows_i)
+                    .arg(&heads_i)
+                    .arg(&dim_i)
+                    .arg(&rotary_i)
+                    .arg(&rows_i)
+                    .arg(&eps)
+                    .launch(norm_grid)?;
+                s.launch_builder(&kernels.rotary_kv)
+                    .arg(&pointer(&k_fused, s))
+                    .arg(&weight)
+                    .arg(&v_fused)
+                    .arg(&pointer(&k_norm_fused, s))
+                    .arg(&pointer(&q_fused, s))
+                    .arg(&table)
+                    .arg(&start)
+                    .arg(&rows_i)
+                    .arg(&heads_i)
+                    .arg(&dim_i)
+                    .arg(&rotary_i)
+                    .arg(&rows_i)
+                    .arg(&eps)
+                    .launch(norm_grid)?;
+            }
+            let v_parent = s.clone_dtoh(&q_parent)?;
+            let q_parent = s.clone_dtoh(&q_norm_parent)?;
+            let k_parent = s.clone_dtoh(&k_parent)?;
+            let v_fused = s.clone_dtoh(&q_fused)?;
+            let q_fused = s.clone_dtoh(&q_norm_fused)?;
+            let k_fused = s.clone_dtoh(&k_norm_fused)?;
+            let q_mismatch = q_parent
+                .iter()
+                .zip(&q_fused)
+                .filter(|(a, b)| a != b)
+                .count();
+            let k_mismatch = k_parent
+                .iter()
+                .zip(&k_fused)
+                .filter(|(a, b)| a != b)
+                .count();
+            let v_mismatch = v_parent
+                .iter()
+                .zip(&v_fused)
+                .filter(|(a, b)| a != b)
+                .count();
+            ensure!(
+                q_mismatch == 0 && k_mismatch == 0 && v_mismatch == 0,
+                "Q/K/V fusion mismatches rows={rows}: {q_mismatch}/{k_mismatch}/{v_mismatch}"
+            );
+            let q_mutant = s.clone_htod(&q)?;
+            let mut q_norm_mutant = s.alloc_zeros::<bf16>(elements)?;
+            unsafe {
+                s.launch_builder(&kernels.rotary_q)
+                    .arg(&q_mutant)
+                    .arg(&weight)
+                    .arg(&mut q_norm_mutant)
+                    .arg(&(pointer(&table, s) + 2))
+                    .arg(&start)
+                    .arg(&rows_i)
+                    .arg(&heads_i)
+                    .arg(&dim_i)
+                    .arg(&rotary_i)
+                    .arg(&rows_i)
+                    .arg(&eps)
+                    .launch(norm_grid)?;
+            }
+            let q_mutant = s.clone_dtoh(&q_norm_mutant)?;
+            let mutant_mismatch = q_parent
+                .iter()
+                .zip(&q_mutant)
+                .filter(|(a, b)| a != b)
+                .count();
+            ensure!(
+                mutant_mismatch > 0,
+                "one-position RoPE mutant was not detected"
+            );
+            println!(
+                "H3_QK_ROPE_FUSION rows={rows} q_mismatch={q_mismatch} k_mismatch={k_mismatch} v_mismatch={v_mismatch} mutant_mismatch={mutant_mismatch}"
+            );
+        }
+        Ok(())
     }
 
     /// The f32-weight kernels match the post-weight cast and miss the pre-weight cast. The BF16 kernels do the opposite.

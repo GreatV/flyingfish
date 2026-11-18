@@ -554,6 +554,7 @@ fn main() {
     }
     let mut files = Vec::new();
     collect(std::path::Path::new("kernels"), &mut files);
+    println!("cargo:rerun-if-changed=kernels/rotary.cuh");
     files.sort();
     let mut index = format!(
         "pub const ARCHES: &[u32] = &{archs:?};\npub fn cubin(name: &str, sm: u32) -> Option<&'static [u8]> {{\nmatch (name, sm) {{\n"
