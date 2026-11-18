@@ -179,7 +179,7 @@ impl Plan {
     ) -> Result<Self> {
         Self::build(
             handle,
-            (rows, output, input),
+            (rows, output, input, input),
             workspace,
             bias,
             sys::cudaDataType_t::CUDA_R_16BF,
@@ -200,7 +200,7 @@ impl Plan {
     ) -> Result<Self> {
         Self::build(
             handle,
-            (rows, output, input),
+            (rows, output, input, input),
             workspace,
             None,
             sys::cudaDataType_t::CUDA_R_16F,
@@ -221,7 +221,7 @@ impl Plan {
     ) -> Result<Self> {
         Self::build(
             handle,
-            (rows, output, input),
+            (rows, output, input, input),
             workspace,
             None,
             sys::cudaDataType_t::CUDA_R_16BF,
@@ -230,17 +230,22 @@ impl Plan {
         )
     }
 
-    /// Geometry tuple is (rows, output, input).
+    /// Geometry tuple is `(rows, output, input, b_ld)`.
     fn build(
         handle: sys::cublasLtHandle_t,
-        geometry: (usize, usize, usize),
+        geometry: (usize, usize, usize, usize),
         workspace: usize,
         bias: Option<u64>,
         ab_dtype: sys::cudaDataType_t,
         c_dtype: sys::cudaDataType_t,
         select: PlanAlgo,
     ) -> Result<Self> {
-        let (rows, output, input) = geometry;
+        let (rows, output, input, b_ld) = geometry;
+        let b_ld = i64::try_from(b_ld).context("Lt B leading dimension")?;
+        ensure!(
+            b_ld >= i64::try_from(input).context("Lt K")?,
+            "Lt B leading dimension {b_ld} is below K {input}"
+        );
         let mut p = Self {
             desc: std::ptr::null_mut(),
             a: std::ptr::null_mut(),
@@ -291,7 +296,7 @@ impl Plan {
             }
         }
         p.a = lt::create_matrix_layout(dtype, input as u64, output as u64, input as i64)?;
-        p.b = lt::create_matrix_layout(dtype, input as u64, rows as u64, input as i64)?;
+        p.b = lt::create_matrix_layout(dtype, input as u64, rows as u64, b_ld)?;
         p.c = lt::create_matrix_layout(c_dtype, output as u64, rows as u64, output as i64)?;
         p.pref = lt::create_matmul_pref()?;
         unsafe {
@@ -507,6 +512,7 @@ pub struct Blas {
     skinny_plans: RefCell<BTreeMap<(usize, usize), (LaunchConfig, bool)>>,
     invariant_rows: usize,
     plans: LinearPlans,
+    pitched_b: RefCell<BTreeMap<(usize, usize, usize, usize), Plan>>,
     row_families: RefCell<BTreeMap<(usize, usize), (sys::cublasLtMatmulAlgo_t, usize)>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
     f16_reference: bool,
@@ -717,6 +723,7 @@ impl Blas {
             skinny_plans: RefCell::new(BTreeMap::new()),
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
+            pitched_b: RefCell::new(BTreeMap::new()),
             row_families: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
             f16_reference: false,
@@ -1069,6 +1076,7 @@ impl Drop for Blas {
         drop_result("synchronize BLAS stream", self.stream.synchronize());
         self.plans.borrow_mut().clear();
         self.biased_plans.borrow_mut().clear();
+        self.pitched_b.borrow_mut().clear();
         unsafe {
             drop_result("destroy Lt handle", lt::destroy_handle(self.handle));
         }
@@ -1185,6 +1193,43 @@ impl Blas {
         Ok(())
     }
 
+    /// B leading dimension `b_ld` with logical K = `input`. The plan is not the packed `(rows, output, input)` plan.
+    pub(crate) fn prepare_fixed_b_ld(
+        &self,
+        rows: u32,
+        output: u32,
+        input: u32,
+        b_ld: u32,
+    ) -> Result<()> {
+        ensure!(
+            [rows, output, input, b_ld]
+                .iter()
+                .all(|&n| n > 0 && n <= i32::MAX as u32)
+                && b_ld >= input,
+            "invalid pitched linear dimensions"
+        );
+        let key = (
+            rows as usize,
+            output as usize,
+            input as usize,
+            b_ld as usize,
+        );
+        if !self.pitched_b.borrow().contains_key(&key) {
+            self.closure.bind_fixed()?;
+            let plan = Plan::build(
+                self.handle,
+                (key.0, key.1, key.2, key.3),
+                self.workspace.borrow().len(),
+                None,
+                sys::cudaDataType_t::CUDA_R_16BF,
+                sys::cudaDataType_t::CUDA_R_16BF,
+                PlanAlgo::Heuristic(0),
+            )?;
+            self.pitched_b.borrow_mut().insert(key, plan);
+        }
+        Ok(())
+    }
+
     /// One opaque algorithm per (output,input) family, selected at the canonical row count.
     pub(crate) fn bind_row_family(&self, shape: LinearShape) -> Result<()> {
         let key = (shape.output, shape.input);
@@ -1220,7 +1265,7 @@ impl Blas {
                 .context("row family was not bound")?;
             let plan = Plan::build(
                 self.handle,
-                (shape.rows, shape.output, shape.input),
+                (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
                 None,
                 sys::cudaDataType_t::CUDA_R_16BF,
@@ -1990,6 +2035,79 @@ impl Blas {
                 Ok(())
             }
         }
+    }
+
+    /// BF16 Lt GEMM whose B leading dimension is `b_ld` and whose K stays `weight.shape[1]`.
+    pub(crate) fn linear_bf16_b_ld(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+        b_ld: usize,
+    ) -> Result<()> {
+        weight.validate()?;
+        x.validate()?;
+        y.0.validate()?;
+        ensure!(
+            weight.stride == [u64::from(weight.shape[1]), 1],
+            "BF16 linear requires row-major weight"
+        );
+        ensure!(
+            b_ld >= weight.shape[1] as usize
+                && x.shape[1] == weight.shape[1]
+                && y.0.shape == [x.shape[0], weight.shape[0]]
+                && x.stride == [u64::try_from(b_ld)?, 1]
+                && y.0.stride == [u64::from(weight.shape[0]), 1],
+            "pitched linear shape rows={} output={} input={} b_ld={b_ld}",
+            x.shape[0],
+            weight.shape[0],
+            weight.shape[1]
+        );
+        super::linear::disjoint(&weight, &y.0)?;
+        super::linear::disjoint(&x, &y.0)?;
+        let plans = self.pitched_b.borrow();
+        let p = plans
+            .get(&(
+                x.shape[0] as usize,
+                weight.shape[0] as usize,
+                weight.shape[1] as usize,
+                b_ld,
+            ))
+            .with_context(|| {
+                format!(
+                    "pitched Lt plan missing; bind before run rows={} output={} input={} b_ld={b_ld}",
+                    x.shape[0], weight.shape[0], weight.shape[1]
+                )
+            })?;
+        let alpha = 1f32;
+        let beta = 0f32;
+        let workspace_owner = self.workspace.borrow();
+        ensure!(
+            p.workspace <= workspace_owner.len(),
+            "pitched Lt workspace not bound"
+        );
+        let (workspace, _guard) = workspace_owner.device_ptr(&self.stream);
+        unsafe {
+            lt::matmul(
+                self.handle,
+                p.desc,
+                (&alpha as *const f32).cast(),
+                (&beta as *const f32).cast(),
+                weight.ptr as _,
+                p.a,
+                x.ptr as _,
+                p.b,
+                y.0.ptr as _,
+                p.c,
+                y.0.ptr as _,
+                p.c,
+                p.algo.as_ref().context("pitched Lt algo missing")?,
+                workspace as _,
+                self.workspace.borrow().len(),
+                self.stream.cu_stream() as _,
+            )?;
+        }
+        Ok(())
     }
 }
 

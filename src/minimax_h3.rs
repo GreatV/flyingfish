@@ -529,6 +529,15 @@ pub fn pad_lowrank(
     Ok((down_out, up_out))
 }
 
+/// BF16 mid columns of a stored rank: 1 when `low_rank` is 0, otherwise `low_rank` rounded up to a multiple of 8.
+pub fn stored_low_rank_pitch(low_rank: usize) -> usize {
+    if low_rank == 0 {
+        1
+    } else {
+        low_rank.div_ceil(8) * 8
+    }
+}
+
 /// `(k, low_rank)` of the HyperFlow convrot scratch one block workspace allocates. `k` is `max(hidden, width, ffn)`. `low_rank` is the maximum stored rank, or 0 when the rank map is empty. `None` when the spec is not HyperFlow.
 pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
     if !spec.is_hyperflow()? {
@@ -547,14 +556,14 @@ pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
     Ok(Some((k, low_rank)))
 }
 
-/// Bytes of one HyperFlow convrot scratch for `rows`: two f32 buffers of `rows * k`, one f32 scale per row, and `rows * max(low_rank, 1)` bf16 elements. Zero when the spec is not HyperFlow.
+/// Bytes of one HyperFlow convrot scratch for `rows`: two f32 buffers of `rows * k`, one f32 scale per row, and `rows * stored_low_rank_pitch(low_rank)` bf16 elements. Zero when the spec is not HyperFlow.
 pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
     let Some((k, low_rank)) = stored_scratch_extents(spec)? else {
         return Ok(0);
     };
     let rows = u64::try_from(rows)?;
     let k = u64::try_from(k)?;
-    let mid = u64::try_from(low_rank.max(1))?;
+    let mid = u64::try_from(stored_low_rank_pitch(low_rank))?;
     let f32_elems = rows
         .checked_mul(k)
         .and_then(|n| n.checked_mul(2))
