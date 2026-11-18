@@ -1933,6 +1933,29 @@ impl DenseStreaming {
         d: &Device,
         order: Option<&[Vec<String>]>,
     ) -> Result<Self> {
+        Self::allocate(dir, Some((manifest, order)), plan, d, None)
+    }
+
+    pub(crate) fn new_preloaded(
+        dir: &Path,
+        plan: crate::prefill::DensePlacement,
+        d: &Device,
+        layer_bytes: &[usize],
+    ) -> Result<Self> {
+        ensure!(
+            plan.disk_bytes == 0 && layer_bytes.len() == plan.slots.len(),
+            "preloaded layer layout differs from host placement"
+        );
+        Self::allocate(dir, None, plan, d, Some(layer_bytes))
+    }
+
+    fn allocate(
+        dir: &Path,
+        input: Option<(&TensorManifest, Option<&[Vec<String>]>)>,
+        plan: crate::prefill::DensePlacement,
+        d: &Device,
+        preloaded: Option<&[usize]>,
+    ) -> Result<Self> {
         use crate::experts::{catalogue::NativeRange, disk::DiskReader};
         let mut layers: Vec<_> = plan
             .slots
@@ -1987,7 +2010,7 @@ impl DenseStreaming {
             }
             Ok(())
         };
-        if let Some(order) = order {
+        if let Some((manifest, Some(order))) = input {
             for (layer_index, names) in order.iter().enumerate() {
                 for name in names {
                     let entry = manifest
@@ -2009,7 +2032,7 @@ impl DenseStreaming {
                     add(name, layer_index, entry)?;
                 }
             }
-        } else {
+        } else if let Some((manifest, None)) = input {
             for (name, entry) in manifest
                 .entries
                 .iter()
@@ -2017,6 +2040,17 @@ impl DenseStreaming {
             {
                 let layer_index = entry.layer.context("dense layer missing")? as usize;
                 add(name, layer_index, entry)?;
+            }
+        } else if let Some(sizes) = preloaded {
+            for (i, (layer, &bytes)) in layers.iter_mut().zip(sizes).enumerate() {
+                if layer.slot.is_some() {
+                    ensure!(
+                        plan.host[i] && bytes > 0 && bytes <= plan.slot_bytes,
+                        "preloaded layer {i} exceeds its pinned slot"
+                    );
+                    layer.bytes = bytes;
+                    layer.source_bytes = bytes;
+                }
             }
         }
         let staging_bytes = layers

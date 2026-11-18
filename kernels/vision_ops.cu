@@ -192,8 +192,9 @@ extern "C" __global__ void vision_affine_cast_bf16(
 }
 
 // Input [3, allocated_frames, pixels], output [frames * pixels, 3].
-extern "C" __global__ void planar_f32_to_rgb_u8(
-    const float* input, uint8_t* output, uint64_t allocated_frames, uint64_t frames,
+template<typename T>
+__device__ __forceinline__ void planar_to_rgb_u8(
+    const T* input, uint8_t* output, uint64_t allocated_frames, uint64_t frames,
     uint64_t pixels, float mean0, float mean1, float mean2, float std0, float std1, float std2) {
     if (!vision_flat_launch() || !input || !output || !frames || frames > allocated_frames || !pixels ||
         !isfinite(mean0) || !isfinite(mean1) || !isfinite(mean2) ||
@@ -204,11 +205,23 @@ extern "C" __global__ void planar_f32_to_rgb_u8(
          i += uint64_t(gridDim.x) * 256) {
         #pragma unroll
         for (uint32_t c = 0; c < 3; ++c) {
-            const float value = __fadd_rn(__fmul_rn(input[uint64_t(c) * plane + i], scale[c]), mean[c]);
+            const float value = __fadd_rn(__fmul_rn(float(input[uint64_t(c) * plane + i]), scale[c]), mean[c]);
             const float clamped = fminf(1.0f, fmaxf(0.0f, value));
             output[3 * i + c] = isnan(value) ? 0 : uint8_t(__float2uint_rn(__fmul_rn(clamped, 255.0f)));
         }
     }
+}
+
+extern "C" __global__ void planar_f32_to_rgb_u8(
+    const float* input, uint8_t* output, uint64_t allocated_frames, uint64_t frames,
+    uint64_t pixels, float mean0, float mean1, float mean2, float std0, float std1, float std2) {
+    planar_to_rgb_u8(input, output, allocated_frames, frames, pixels, mean0, mean1, mean2, std0, std1, std2);
+}
+
+extern "C" __global__ void planar_bf16_to_rgb_u8(
+    const __nv_bfloat16* input, uint8_t* output, uint64_t allocated_frames, uint64_t frames,
+    uint64_t pixels, float mean0, float mean1, float mean2, float std0, float std1, float std2) {
+    planar_to_rgb_u8(input, output, allocated_frames, frames, pixels, mean0, mean1, mean2, std0, std1, std2);
 }
 
 extern "C" __global__ void vision_clamp_bf16(
@@ -429,8 +442,9 @@ extern "C" __global__ void vision_bias_quick_gelu_f32(
 
 // One FP32 RMS normalization per row times scale[i * scale_stride] (stride 0: one scalar, 1: per element).
 // output_f32 and output_bf16 are each skipped when null. At least one is required.
-extern "C" __global__ void vision_rms_scale_f32(
-    const float* input, const float* scale, uint32_t scale_stride, float* output_f32,
+template<typename T>
+__device__ __forceinline__ void vision_rms_scale(
+    const T* input, const float* scale, uint32_t scale_stride, float* output_f32,
     __nv_bfloat16* output_bf16, uint32_t width, float eps) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.y != 1 || gridDim.z != 1 || !input || !scale || scale_stride > 1 ||
@@ -439,7 +453,7 @@ extern "C" __global__ void vision_rms_scale_f32(
     __shared__ float partial[8];
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < width; i += 256) {
-        float x = input[uint64_t(row) * width + i];
+        float x = float(input[uint64_t(row) * width + i]);
         sum = __fadd_rn(sum, __fmul_rn(x, x));
     }
     for (int delta = 16; delta; delta >>= 1)
@@ -455,11 +469,22 @@ extern "C" __global__ void vision_rms_scale_f32(
     __syncthreads();
     float rstd = partial[0];
     for (uint32_t i = threadIdx.x; i < width; i += 256) {
-        float normalized = __fmul_rn(input[uint64_t(row) * width + i], rstd);
+        float normalized = __fmul_rn(float(input[uint64_t(row) * width + i]), rstd);
         float scaled = __fmul_rn(normalized, scale[i * scale_stride]);
         if (output_f32) output_f32[uint64_t(row) * width + i] = scaled;
         if (output_bf16) output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
     }
+}
+
+extern "C" __global__ void vision_rms_scale_f32(
+    const float* input, const float* scale, uint32_t scale_stride, float* output_f32,
+    __nv_bfloat16* output_bf16, uint32_t width, float eps) {
+    vision_rms_scale(input, scale, scale_stride, output_f32, output_bf16, width, eps);
+}
+
+extern "C" __global__ void vision_rms_scale_bf16(
+    __nv_bfloat16* values, const float* one, uint32_t width, float eps) {
+    vision_rms_scale(values, one, 0, nullptr, values, width, eps);
 }
 
 extern "C" __global__ void vision_add_row_silu_f32(
@@ -565,6 +590,12 @@ extern "C" __global__ void unpatchify_f32(
     unpatchify(rows, pixels, frames, height, width, channels, pt, p);
 }
 
+extern "C" __global__ void unpatchify_bf16(
+    const __nv_bfloat16* rows, __nv_bfloat16* pixels, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t channels, uint32_t pt, uint32_t p) {
+    unpatchify(rows, pixels, frames, height, width, channels, pt, p);
+}
+
 // NCHW image tiles -> [batch, tile_h * tile_w, channels], with per-channel F32 affine.
 extern "C" __global__ void tile_rows_f32(
     const float* input, const float* scale, const float* bias, const uint32_t* grid, float* output,
@@ -589,8 +620,9 @@ extern "C" __global__ void tile_rows_f32(
 }
 
 // Dense row batches followed by shared register rows and one all-zero row.
-extern "C" __global__ void append_register_rows_f32(
-    const float* input, const float* registers, float* output,
+template<typename T>
+__device__ __forceinline__ void append_register_rows(
+    const T* input, const T* registers, float* output,
     uint32_t batch, uint32_t rows, uint32_t suffix, uint32_t width) {
     if (!vision_flat_launch() || !input || !registers || !output || !batch || !rows || !suffix || !width) { __trap(); return; }
     const uint64_t tokens = uint64_t(rows) + suffix + 1;
@@ -599,9 +631,21 @@ extern "C" __global__ void append_register_rows_f32(
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t channel = i % width;
         const uint64_t row = i / width, token = row % tokens;
-        output[i] = token < rows ? input[(row / tokens * rows + token) * width + channel]
-            : (token < rows + suffix ? registers[(token - rows) * width + channel] : 0.0f);
+        output[i] = token < rows ? float(input[(row / tokens * rows + token) * width + channel])
+            : (token < rows + suffix ? float(registers[(token - rows) * width + channel]) : 0.0f);
     }
+}
+
+extern "C" __global__ void append_register_rows_f32(
+    const float* input, const float* registers, float* output,
+    uint32_t batch, uint32_t rows, uint32_t suffix, uint32_t width) {
+    append_register_rows(input, registers, output, batch, rows, suffix, width);
+}
+
+extern "C" __global__ void append_register_rows_bf16_to_f32(
+    const __nv_bfloat16* input, const __nv_bfloat16* registers, float* output,
+    uint32_t batch, uint32_t rows, uint32_t suffix, uint32_t width) {
+    append_register_rows(input, registers, output, batch, rows, suffix, width);
 }
 
 // Q/K/V [batch, tokens, heads, dim] -> [batch, heads, tokens, dim], rotating a split-half prefix of Q/K.
@@ -639,6 +683,62 @@ extern "C" __global__ void rotary_pack_qkv_f32(
     }
 }
 
+__device__ __forceinline__ __nv_bfloat16 bf16_mul_round(__nv_bfloat16 a, __nv_bfloat16 b) {
+#if defined(__HIP__)
+    return __float2bfloat16_rn(__fmul_rn(float(a), float(b)));
+#else
+    return __hmul_rn(a, b);
+#endif
+}
+
+__device__ __forceinline__ __nv_bfloat16 bf16_add_round(__nv_bfloat16 a, __nv_bfloat16 b) {
+#if defined(__HIP__)
+    return __float2bfloat16_rn(__fadd_rn(float(a), float(b)));
+#else
+    return __hadd_rn(a, b);
+#endif
+}
+
+__device__ __forceinline__ __nv_bfloat16 bf16_sub_round(__nv_bfloat16 a, __nv_bfloat16 b) {
+#if defined(__HIP__)
+    return __float2bfloat16_rn(__fsub_rn(float(a), float(b)));
+#else
+    return __hsub_rn(a, b);
+#endif
+}
+
+// Q is row-major; K/V use [heads, batch * tokens, dim].
+extern "C" __global__ void rotary_pack_qkv_bf16(
+    const __nv_bfloat16* qkv, const float* table, __nv_bfloat16* q_out,
+    __nv_bfloat16* k_out, __nv_bfloat16* v_out,
+    uint32_t rows, uint32_t tokens, uint32_t heads, uint32_t dim, uint32_t rotary) {
+    if (!vision_flat_launch() || !qkv || !table || !q_out || !k_out || !v_out ||
+        !rows || !tokens || rows % tokens || !heads || !dim || dim % 2 ||
+        !rotary || rotary > dim || rotary % 2) { __trap(); return; }
+    const uint32_t pairs = dim / 2, half = rotary / 2;
+    const uint64_t elements = uint64_t(rows) * heads * dim;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < elements / 2;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t pair = i % pairs, head = (i / pairs) % heads;
+        const uint64_t row = i / (uint64_t(pairs) * heads);
+        const uint64_t src = (row * heads + head) * dim;
+        const uint64_t kv = (uint64_t(head) * rows + row) * dim;
+        const uint32_t d0 = pair < half ? pair : rotary + (pair - half) * 2;
+        const uint32_t d1 = pair < half ? pair + half : d0 + 1;
+        const uint64_t t = (row % tokens) * rotary + pair;
+        const auto c = pair < half ? __float2bfloat16_rn(table[t]) : __float2bfloat16_rn(1.0f);
+        const auto s = pair < half ? __float2bfloat16_rn(table[t + half]) : __float2bfloat16_rn(0.0f);
+        for (uint32_t j = 0; j < 2; ++j) {
+            const auto a = qkv[j * elements + src + d0], b = qkv[j * elements + src + d1];
+            auto* dst = j == 0 ? q_out + src : k_out + kv;
+            dst[d0] = pair < half ? bf16_sub_round(bf16_mul_round(a, c), bf16_mul_round(b, s)) : a;
+            dst[d1] = pair < half ? bf16_add_round(bf16_mul_round(b, c), bf16_mul_round(a, s)) : b;
+        }
+        v_out[kv + d0] = qkv[2 * elements + src + d0];
+        v_out[kv + d1] = qkv[2 * elements + src + d1];
+    }
+}
+
 // [batch, heads, tokens, dim] -> [batch * tokens, heads * dim].
 extern "C" __global__ void head_rows_f32(
     const float* input, float* output, uint32_t batch, uint32_t tokens, uint32_t heads, uint32_t dim) {
@@ -673,6 +773,14 @@ __device__ __forceinline__ float blend_weight(uint32_t position, uint32_t extent
 __device__ __forceinline__ float linear_blend(float a, float b, uint32_t position, uint32_t extent) {
     const float w = blend_weight(position, extent);
     return __fadd_rn(__fmul_rn(a, __fsub_rn(1.0f, w)), __fmul_rn(b, w));
+}
+
+__device__ __forceinline__ __nv_bfloat16 linear_blend(
+    __nv_bfloat16 a, __nv_bfloat16 b, uint32_t position, uint32_t extent) {
+    const float p = __bfloat162float(__float2bfloat16_rn(float(position)));
+    const auto w = __float2bfloat16_rn(__fdiv_rn(p, float(extent)));
+    const auto inv = bf16_sub_round(__float2bfloat16_rn(1.0f), w);
+    return bf16_add_round(bf16_mul_round(a, inv), bf16_mul_round(b, w));
 }
 
 // Raw tiles [rows * cols, planes, tile_h, tile_w] -> canvas [planes, canvas_h, canvas_w]. grid holds the row starts,
@@ -722,10 +830,16 @@ extern "C" __global__ void tile_stitch_f32(
     tile_stitch(tiles, canvas, grid, rows, cols, planes, tile_h, tile_w, canvas_h, canvas_w);
 }
 
+extern "C" __global__ void tile_stitch_bf16(
+    const __nv_bfloat16* tiles, __nv_bfloat16* canvas, const uint32_t* grid, uint32_t rows,
+    uint32_t cols, uint32_t planes, uint32_t tile_h, uint32_t tile_w, uint32_t canvas_h, uint32_t canvas_w) {
+    tile_stitch(tiles, canvas, grid, rows, cols, planes, tile_h, tile_w, canvas_h, canvas_w);
+}
+
 // out[c, out_first + k, :] = linear blend of a[c, a_first + k, :] and b[c, b_first + k, :] at position k of extent
 // frames; a, b and out are [channels, frames, plane] with their own frame counts.
-extern "C" __global__ void frame_blend_f32(
-    const float* a, const float* b, float* out, uint32_t channels,
+extern "C" __global__ void frame_blend_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint32_t channels,
     uint32_t extent, uint64_t plane, uint32_t a_frames, uint32_t a_first, uint32_t b_frames,
     uint32_t b_first, uint32_t out_frames, uint32_t out_first) {
     if (!vision_flat_launch() || !a || !b || !out || !channels || !extent || !plane ||
@@ -735,16 +849,16 @@ extern "C" __global__ void frame_blend_f32(
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const uint64_t px = i % plane, k = (i / plane) % extent, c = i / (plane * extent);
-        const float va = a[(c * a_frames + a_first + k) * plane + px];
-        const float vb = b[(c * b_frames + b_first + k) * plane + px];
+        const auto va = a[(c * a_frames + a_first + k) * plane + px];
+        const auto vb = b[(c * b_frames + b_first + k) * plane + px];
         out[(c * out_frames + out_first + k) * plane + px] = linear_blend(va, vb, uint32_t(k), extent);
     }
 }
 
-// F32 latents [channels, frames, height, width] -> F32 rows [n_frames * n_height * n_width, channels] of the window
+// BF16 latents [channels, frames, height, width] -> BF16 rows [n_frames * n_height * n_width, channels] of the window
 // starting at (first_frame, first_row, first_col).
-extern "C" __global__ void latent_rows_f32(
-    const float* latents, float* rows, uint32_t channels, uint32_t frames, uint32_t height,
+extern "C" __global__ void latent_rows_bf16(
+    const __nv_bfloat16* latents, __nv_bfloat16* rows, uint32_t channels, uint32_t frames, uint32_t height,
     uint32_t width, uint32_t first_frame, uint32_t first_row, uint32_t first_col, uint32_t n_frames,
     uint32_t n_height, uint32_t n_width) {
     if (!vision_flat_launch() || !latents || !rows || !channels || !n_frames || !n_height ||
