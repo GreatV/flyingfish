@@ -10427,11 +10427,11 @@ mod tests {
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 3, 28)?,
-            476_534_488
+            476_534_232
         );
         assert_eq!(
             vae::TileWork::batch_bytes(&spec, shape, 28, 28)?,
-            4_442_630_964
+            4_442_630_708
         );
         assert!(vae::TileWork::batch_bytes(&spec, shape, 0, 28).is_err());
         assert!(vae::TileWork::batch_bytes(&spec, shape, 29, 28).is_err());

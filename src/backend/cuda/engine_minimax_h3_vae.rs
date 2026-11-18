@@ -1170,9 +1170,8 @@ struct VaeKernels {
     stitch: CudaFunction,
     append: CudaFunction,
     rms: CudaFunction,
-    head_norm: CudaFunction,
+    head_pack: CudaFunction,
     norm_out: CudaFunction,
-    pack: CudaFunction,
     residual: CudaFunction,
     patches: CudaFunction,
     swiglu: CudaFunction,
@@ -1539,9 +1538,8 @@ impl VideoDecoder {
                 stitch: vision.load_function("tile_stitch_bf16")?,
                 append: vision.load_function("append_register_rows_bf16_to_f32")?,
                 rms: vision.load_function("vision_rms_scale_f32")?,
-                head_norm: vision.load_function("vision_rms_scale_bf16")?,
+                head_pack: vision.load_function("rms_rotary_pack_qkv_bf16")?,
                 norm_out: common.load_function("layer_norm_f32_to_bf16")?,
-                pack: vision.load_function("rotary_pack_qkv_bf16")?,
                 residual: vision.load_function("scaled_residual_f32")?,
                 patches: vision.load_function("unpatchify_bf16")?,
                 swiglu: cubin::module(&d.ctx, "act")?.load_function("silu_mul")?,
@@ -1716,13 +1714,7 @@ impl VideoDecoder {
             )?;
         }
         unsafe {
-            s.launch_builder(&self.kernels.head_norm)
-                .arg(&pointer(&w.ff, s))
-                .arg(&pointer(&w.ones, s))
-                .arg(&(spec.head_dim as u32))
-                .arg(&spec.norm_eps)
-                .launch(ops::grid(2 * rows * spec.heads, 256))?;
-            s.launch_builder(&self.kernels.pack)
+            s.launch_builder(&self.kernels.head_pack)
                 .arg(&pointer(&w.ff, s))
                 .arg(&pointer(&w.rope, s))
                 .arg(&pointer(&w.q, s))
@@ -1733,7 +1725,8 @@ impl VideoDecoder {
                 .arg(&(spec.heads as u32))
                 .arg(&(spec.head_dim as u32))
                 .arg(&(spec.rope_dims as u32))
-                .launch(flat(n / 2))?;
+                .arg(&spec.norm_eps)
+                .launch(ops::grid((rows * spec.heads).div_ceil(8), 256))?;
         }
         let (_, flash) = w
             .attention
@@ -2115,7 +2108,6 @@ pub(crate) struct LatentVideo<'a> {
 
 pub(crate) struct TileWork {
     rope: CudaSlice<f32>,
-    ones: CudaSlice<f32>,
     x: CudaSlice<f32>,
     norm: CudaSlice<bf16>,
     o: CudaSlice<bf16>,
@@ -2166,9 +2158,7 @@ impl TileWork {
             .map(|n| 4 * (n as u128 * t * spec.heads as u128 + n as u128 + 1))
             .sum::<u128>();
         Ok(usize::try_from(
-            batch as u128 * per
-                + attention
-                + 4 * (t * spec.rope_dims as u128 + spec.head_dim as u128),
+            batch as u128 * per + attention + 4 * (t * spec.rope_dims as u128),
         )?)
     }
 
@@ -2211,7 +2201,6 @@ impl TileWork {
         }
         let work = Self {
             rope: s.clone_htod(&rotary_table(spec, shape, 3, |x| x))?,
-            ones: s.clone_htod(&vec![1f32; spec.head_dim])?,
             x: unsafe { s.alloc::<f32>(n)? },
             norm: alloc(n)?,
             o: alloc(n)?,
@@ -2241,7 +2230,7 @@ impl TileWork {
     }
 
     fn allocated_bytes(&self) -> usize {
-        4 * (self.rope.len() + self.ones.len() + self.x.len())
+        4 * (self.rope.len() + self.x.len())
             + 2 * [
                 &self.norm,
                 &self.o,
@@ -4053,5 +4042,287 @@ mod image_tests {
         let result = encoder_reference_gate(&root, &model, &runtime, &capture);
         fs::remove_dir_all(&runtime)?;
         result
+    }
+
+    #[test]
+    #[ignore = "GPU; CPU-reference parity (<=1 BF16 ULP Q/K, 0 ULP V) and negative control for rms_rotary_pack_qkv_bf16"]
+    fn video_head_pack_fusion_matches_cpu_reference_bf16_gpu() -> Result<()> {
+        struct Case {
+            label: &'static str,
+            rows: usize,
+            tokens: usize,
+            heads: usize,
+            dim: usize,
+            rotary: usize,
+            eps: f32,
+        }
+        fn make_qkv(elements: usize) -> Vec<bf16> {
+            (0..3 * elements)
+                .map(|i| {
+                    let sign = if (i.wrapping_mul(29) ^ (i >> 4)) & 1 == 0 {
+                        1.0f32
+                    } else {
+                        -1.0f32
+                    };
+                    let mag = 1.0f32 + ((i.wrapping_mul(37).wrapping_add(11)) % 127) as f32 / 512.0;
+                    bf16::from_f32(sign * mag)
+                })
+                .collect()
+        }
+        fn make_table(tokens: usize, rotary: usize) -> Vec<f32> {
+            let half = rotary / 2;
+            (0..tokens * rotary)
+                .map(|i| {
+                    let p = i % half;
+                    let t = i / rotary;
+                    let sign = if (p + t).is_multiple_of(3) {
+                        -1.0f32
+                    } else {
+                        1.0f32
+                    };
+                    let angle = sign * ((((p * 17 + t * 13) % 37) + 1) as f32) * 0.005;
+                    if (i / half).is_multiple_of(2) {
+                        angle.cos()
+                    } else {
+                        angle.sin()
+                    }
+                })
+                .collect()
+        }
+        fn cpu_rms_rstd(row: &[bf16], eps: f32) -> f32 {
+            let dim = row.len();
+            let active_warps = dim.div_ceil(32).min(8);
+            let mut partials = [0.0f32; 8];
+            for (w, partial) in partials.iter_mut().enumerate().take(active_warps) {
+                let mut warp = [0.0f32; 32];
+                for (lane, slot) in warp.iter_mut().enumerate() {
+                    let idx = w * 32 + lane;
+                    if idx < dim {
+                        let x = row[idx].to_f32();
+                        *slot = x * x;
+                    }
+                }
+                for step in [16usize, 8, 4, 2, 1] {
+                    for lane in 0..32 - step {
+                        warp[lane] += warp[lane + step];
+                    }
+                }
+                *partial = warp[0];
+            }
+            let e0 = (partials[0] + partials[4]) + (partials[2] + partials[6]);
+            let e1 = (partials[1] + partials[5]) + (partials[3] + partials[7]);
+            1.0f32 / ((e0 + e1) / (dim as f32) + eps).sqrt()
+        }
+        fn cpu_head_pack_reference(qkv: &[bf16], table: &[f32], c: &Case) -> [Vec<bf16>; 3] {
+            let elements = c.rows * c.heads * c.dim;
+            let half = c.rotary / 2;
+            let mut q_ref = vec![bf16::ZERO; elements];
+            let mut k_ref = vec![bf16::ZERO; elements];
+            let mut v_ref = vec![bf16::ZERO; elements];
+            let mut norm = vec![bf16::ZERO; c.dim];
+            for row in 0..c.rows {
+                let t_row = &table[(row % c.tokens) * c.rotary..];
+                for head in 0..c.heads {
+                    let src = (row * c.heads + head) * c.dim;
+                    let kv = (head * c.rows + row) * c.dim;
+                    v_ref[kv..kv + c.dim]
+                        .copy_from_slice(&qkv[2 * elements + src..2 * elements + src + c.dim]);
+                    for (in_off, out, out_off) in
+                        [(src, &mut q_ref, src), (elements + src, &mut k_ref, kv)]
+                    {
+                        let rstd = cpu_rms_rstd(&qkv[in_off..in_off + c.dim], c.eps);
+                        for (dst, &src_v) in norm.iter_mut().zip(&qkv[in_off..in_off + c.dim]) {
+                            *dst = bf16::from_f32(src_v.to_f32() * rstd);
+                        }
+                        for pair in 0..half {
+                            let a = norm[pair].to_f32();
+                            let b = norm[pair + half].to_f32();
+                            let c_v = bf16::from_f32(t_row[pair]).to_f32();
+                            let s_v = bf16::from_f32(t_row[pair + half]).to_f32();
+                            let ac = bf16::from_f32(a * c_v).to_f32();
+                            let bs = bf16::from_f32(b * s_v).to_f32();
+                            let bc = bf16::from_f32(b * c_v).to_f32();
+                            let a_s = bf16::from_f32(a * s_v).to_f32();
+                            out[out_off + pair] = bf16::from_f32(ac - bs);
+                            out[out_off + pair + half] = bf16::from_f32(bc + a_s);
+                        }
+                        out[out_off + c.rotary..out_off + c.dim]
+                            .copy_from_slice(&norm[c.rotary..c.dim]);
+                    }
+                }
+            }
+            [q_ref, k_ref, v_ref]
+        }
+        fn bf16_ulp_diff(a: bf16, b: bf16) -> Result<u16> {
+            ensure!(
+                a.is_finite() && b.is_finite(),
+                "C1 parity FAIL non-finite bf16: a={a} b={b}"
+            );
+            let map = |x: bf16| -> i32 {
+                let bits = x.to_bits() as i32;
+                if bits & 0x8000 != 0 {
+                    0x8000 - (bits & 0x7fff)
+                } else {
+                    0x8000 + bits
+                }
+            };
+            Ok((map(a) - map(b)).unsigned_abs() as u16)
+        }
+        fn run_fused(
+            s: &Arc<CudaStream>,
+            head_pack: &CudaFunction,
+            c: &Case,
+            qkv_host: &[bf16],
+            table_host: &[f32],
+        ) -> Result<[Vec<bf16>; 3]> {
+            let elements = c.rows * c.heads * c.dim;
+            let table_dev = s.clone_htod(table_host)?;
+            let qkv_dev = s.clone_htod(qkv_host)?;
+            let q_dev = s.alloc_zeros::<bf16>(elements)?;
+            let k_dev = s.alloc_zeros::<bf16>(elements)?;
+            let v_dev = s.alloc_zeros::<bf16>(elements)?;
+            unsafe {
+                s.launch_builder(head_pack)
+                    .arg(&pointer(&qkv_dev, s))
+                    .arg(&pointer(&table_dev, s))
+                    .arg(&pointer(&q_dev, s))
+                    .arg(&pointer(&k_dev, s))
+                    .arg(&pointer(&v_dev, s))
+                    .arg(&(c.rows as u32))
+                    .arg(&(c.tokens as u32))
+                    .arg(&(c.heads as u32))
+                    .arg(&(c.dim as u32))
+                    .arg(&(c.rotary as u32))
+                    .arg(&c.eps)
+                    .launch(ops::grid((c.rows * c.heads).div_ceil(8), 256))?;
+            }
+            Ok([
+                s.clone_dtoh(&q_dev)?,
+                s.clone_dtoh(&k_dev)?,
+                s.clone_dtoh(&v_dev)?,
+            ])
+        }
+
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let head_pack =
+            cubin::module(&device.ctx, "vision_ops")?.load_function("rms_rotary_pack_qkv_bf16")?;
+        let cases = [
+            Case {
+                label: "prod",
+                rows: 50_316,
+                tokens: 1_797,
+                heads: 32,
+                dim: 64,
+                rotary: 48,
+                eps: 1.0e-5,
+            },
+            Case {
+                label: "ragged_tail_96",
+                rows: 91,
+                tokens: 13,
+                heads: 7,
+                dim: 96,
+                rotary: 64,
+                eps: 1.0e-6,
+            },
+        ];
+        let names = ["q_out", "k_out", "v_out"];
+        let max_ulps = [1u16, 1u16, 0u16];
+        for c in &cases {
+            let elements = c.rows * c.heads * c.dim;
+            let qkv_host = make_qkv(elements);
+            let table_host = make_table(c.tokens, c.rotary);
+            let expected = cpu_head_pack_reference(&qkv_host, &table_host, c);
+            let got = run_fused(s, &head_pack, c, &qkv_host, &table_host)?;
+            let mut worst = [0u16; 3];
+            let mut nz = [0usize; 3];
+            for (ti, ((tensor_name, a), b)) in names
+                .iter()
+                .zip(got.iter())
+                .zip(expected.iter())
+                .enumerate()
+            {
+                let mut bad = Vec::new();
+                for (i, (&ga, &eb)) in a.iter().zip(b.iter()).enumerate() {
+                    let ulp = if ti == 2 {
+                        u16::from(ga.to_bits() != eb.to_bits())
+                    } else {
+                        bf16_ulp_diff(ga, eb)?
+                    };
+                    if ulp > 0 {
+                        nz[ti] += 1;
+                        worst[ti] = worst[ti].max(ulp);
+                    }
+                    if ulp > max_ulps[ti] && bad.len() < 8 {
+                        bad.push((i, ulp, ga.to_bits(), eb.to_bits()));
+                    }
+                }
+                ensure!(
+                    bad.is_empty(),
+                    "C1 CPU-ref FAIL case={} tensor={} max_ulp={} limit={} first={:?}",
+                    c.label,
+                    tensor_name,
+                    worst[ti],
+                    max_ulps[ti],
+                    bad
+                );
+            }
+            println!(
+                "PASS C1_CPU_REF case={} rows={} tokens={} heads={} dim={} rotary={} max_ulp={:?} nonzero_ulp={:?}",
+                c.label, c.rows, c.tokens, c.heads, c.dim, c.rotary, worst, nz
+            );
+        }
+        let prod = &cases[0];
+        let elements = prod.rows * prod.heads * prod.dim;
+        let qkv_host = make_qkv(elements);
+        let table_host = make_table(prod.tokens, prod.rotary);
+        let expected = cpu_head_pack_reference(&qkv_host, &table_host, prod);
+        let mut perturbed = qkv_host;
+        let (bad_row, bad_head, bad_d) = (17usize, 5usize, 3usize);
+        let src_off = (bad_row * prod.heads + bad_head) * prod.dim + bad_d;
+        for j in 0..3 {
+            let idx = j * elements + src_off;
+            perturbed[idx] = bf16::from_f32(perturbed[idx].to_f32() + 1.0);
+        }
+        let got = run_fused(s, &head_pack, prod, &perturbed, &table_host)?;
+        let q_range = (bad_row * prod.heads + bad_head) * prod.dim
+            ..(bad_row * prod.heads + bad_head + 1) * prod.dim;
+        let kv_range = (bad_head * prod.rows + bad_row) * prod.dim
+            ..(bad_head * prod.rows + bad_row + 1) * prod.dim;
+        let ranges = [&q_range, &kv_range, &kv_range];
+        let mut bad_counts = [0usize; 3];
+        for (ti, ((tensor_name, a), b)) in names
+            .iter()
+            .zip(got.iter())
+            .zip(expected.iter())
+            .enumerate()
+        {
+            for (i, (&ga, &eb)) in a.iter().zip(b.iter()).enumerate() {
+                let ulp = if ti == 2 {
+                    u16::from(ga.to_bits() != eb.to_bits())
+                } else {
+                    bf16_ulp_diff(ga, eb)?
+                };
+                if ulp > max_ulps[ti] {
+                    ensure!(
+                        ranges[ti].contains(&i),
+                        "C1 negative control FAIL tensor={} spilled outside [{bad_row}, {bad_head}] at idx={i} ulp={ulp}",
+                        tensor_name
+                    );
+                    bad_counts[ti] += 1;
+                }
+            }
+            ensure!(
+                bad_counts[ti] > 0,
+                "C1 negative control FAIL tensor={} missed perturbation",
+                tensor_name
+            );
+        }
+        println!(
+            "PASS C1_NEGATIVE_CONTROL row={} head={} q_exceed={} k_exceed={} v_diff={}",
+            bad_row, bad_head, bad_counts[0], bad_counts[1], bad_counts[2]
+        );
+        Ok(())
     }
 }

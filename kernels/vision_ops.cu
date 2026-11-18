@@ -482,11 +482,6 @@ extern "C" __global__ void vision_rms_scale_f32(
     vision_rms_scale(input, scale, scale_stride, output_f32, output_bf16, width, eps);
 }
 
-extern "C" __global__ void vision_rms_scale_bf16(
-    __nv_bfloat16* values, const float* one, uint32_t width, float eps) {
-    vision_rms_scale(values, one, 0, nullptr, values, width, eps);
-}
-
 extern "C" __global__ void vision_add_row_silu_f32(
     const float* input, const float* row, float* output, uint32_t count, uint32_t width) {
     if (!vision_flat_launch() || !input || !output || !count || !width ||
@@ -707,35 +702,83 @@ __device__ __forceinline__ __nv_bfloat16 bf16_sub_round(__nv_bfloat16 a, __nv_bf
 #endif
 }
 
-// Q is row-major; K/V use [heads, batch * tokens, dim].
-extern "C" __global__ void rotary_pack_qkv_bf16(
+constexpr uint32_t kHeadPackSmemDim = 256u;
+
+__device__ __forceinline__ void head_pack_copy_bf16(
+    const __nv_bfloat16* src, __nv_bfloat16* dst, uint32_t pairs, uint32_t lane) {
+    const auto* s32 = reinterpret_cast<const uint32_t*>(src);
+    auto* d32 = reinterpret_cast<uint32_t*>(dst);
+    for (uint32_t i = lane; i < pairs; i += 32u) d32[i] = s32[i];
+}
+
+__device__ __forceinline__ void head_pack_smem_q_or_k(
+    const __nv_bfloat16* in_row, const float* t_row, __nv_bfloat16* warp_smem,
+    __nv_bfloat16* out_row, uint32_t lane, uint32_t dim, uint32_t pairs, uint32_t half,
+    float eps) {
+    head_pack_copy_bf16(in_row, warp_smem, pairs, lane);
+    __syncwarp();
+    float my_p = 0.0f;
+    const uint32_t active_warps = min(8u, (dim + 31u) >> 5);
+    for (uint32_t w = 0u; w < active_warps; ++w) {
+        const uint32_t i = w * 32u + lane;
+        const float x = i < dim ? float(warp_smem[i]) : 0.0f;
+        float acc = __fmul_rn(x, x);
+        for (int delta = 16; delta; delta >>= 1)
+            acc = __fadd_rn(acc, __shfl_down_sync(FF_WARP_MASK, acc, delta));
+        const float pw = __shfl_sync(FF_WARP_MASK, acc, 0);
+        if (lane == w) my_p = pw;
+    }
+    for (int delta = 16; delta; delta >>= 1)
+        my_p = __fadd_rn(my_p, __shfl_down_sync(FF_WARP_MASK, my_p, delta));
+    const float rstd = __shfl_sync(FF_WARP_MASK, rsqrtf(__fadd_rn(my_p / float(dim), eps)), 0);
+    for (uint32_t i = lane; i < dim; i += 32u) {
+        const float normalized = __fmul_rn(float(warp_smem[i]), rstd);
+        warp_smem[i] = __float2bfloat16_rn(__fmul_rn(normalized, 1.0f));
+    }
+    __syncwarp();
+    for (uint32_t pair = lane; pair < half; pair += 32u) {
+        const auto a = warp_smem[pair];
+        const auto b = warp_smem[pair + half];
+        const auto c = __float2bfloat16_rn(t_row[pair]);
+        const auto s = __float2bfloat16_rn(t_row[pair + half]);
+        warp_smem[pair] = bf16_sub_round(bf16_mul_round(a, c), bf16_mul_round(b, s));
+        warp_smem[pair + half] = bf16_add_round(bf16_mul_round(b, c), bf16_mul_round(a, s));
+    }
+    __syncwarp();
+    head_pack_copy_bf16(warp_smem, out_row, pairs, lane);
+    __syncwarp();
+}
+
+// Fused BF16 head RMSNorm (scale=1), split-half RoPE, and Q/K/V layout pack; 1 warp per [row, head].
+extern "C" __global__ __launch_bounds__(256, 6) void rms_rotary_pack_qkv_bf16(
     const __nv_bfloat16* qkv, const float* table, __nv_bfloat16* q_out,
     __nv_bfloat16* k_out, __nv_bfloat16* v_out,
-    uint32_t rows, uint32_t tokens, uint32_t heads, uint32_t dim, uint32_t rotary) {
-    if (!vision_flat_launch() || !qkv || !table || !q_out || !k_out || !v_out ||
-        !rows || !tokens || rows % tokens || !heads || !dim || dim % 2 ||
-        !rotary || rotary > dim || rotary % 2) { __trap(); return; }
-    const uint32_t pairs = dim / 2, half = rotary / 2;
-    const uint64_t elements = uint64_t(rows) * heads * dim;
-    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < elements / 2;
-         i += uint64_t(gridDim.x) * 256) {
-        const uint32_t pair = i % pairs, head = (i / pairs) % heads;
-        const uint64_t row = i / (uint64_t(pairs) * heads);
-        const uint64_t src = (row * heads + head) * dim;
+    uint32_t rows, uint32_t tokens, uint32_t heads, uint32_t dim, uint32_t rotary, float eps) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1 || !qkv || !table || !q_out || !k_out || !v_out ||
+        ((reinterpret_cast<uintptr_t>(qkv) | reinterpret_cast<uintptr_t>(q_out) |
+          reinterpret_cast<uintptr_t>(k_out) | reinterpret_cast<uintptr_t>(v_out)) & 3u) ||
+        !rows || !tokens || rows % tokens || !heads || !dim || (dim & 1u) ||
+        dim > kHeadPackSmemDim || !rotary || rotary > dim || (rotary & 1u) || !(eps > 0.0f)) {
+        __trap();
+        return;
+    }
+    __shared__ __align__(16) __nv_bfloat16 smem[8][kHeadPackSmemDim];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t pairs = dim / 2u, half = rotary / 2u;
+    const uint64_t total_head_rows = uint64_t(rows) * heads;
+    const uint64_t elements = total_head_rows * dim;
+    for (uint64_t hr = uint64_t(blockIdx.x) * 8u + warp; hr < total_head_rows;
+         hr += uint64_t(gridDim.x) * 8u) {
+        const uint64_t row = hr / heads;
+        const uint32_t head = uint32_t(hr % heads);
+        const uint64_t src = hr * dim;
         const uint64_t kv = (uint64_t(head) * rows + row) * dim;
-        const uint32_t d0 = pair < half ? pair : rotary + (pair - half) * 2;
-        const uint32_t d1 = pair < half ? pair + half : d0 + 1;
-        const uint64_t t = (row % tokens) * rotary + pair;
-        const auto c = pair < half ? __float2bfloat16_rn(table[t]) : __float2bfloat16_rn(1.0f);
-        const auto s = pair < half ? __float2bfloat16_rn(table[t + half]) : __float2bfloat16_rn(0.0f);
-        for (uint32_t j = 0; j < 2; ++j) {
-            const auto a = qkv[j * elements + src + d0], b = qkv[j * elements + src + d1];
-            auto* dst = j == 0 ? q_out + src : k_out + kv;
-            dst[d0] = pair < half ? bf16_sub_round(bf16_mul_round(a, c), bf16_mul_round(b, s)) : a;
-            dst[d1] = pair < half ? bf16_add_round(bf16_mul_round(b, c), bf16_mul_round(a, s)) : b;
-        }
-        v_out[kv + d0] = qkv[2 * elements + src + d0];
-        v_out[kv + d1] = qkv[2 * elements + src + d1];
+        const float* t_row = table + (row % tokens) * rotary;
+        head_pack_copy_bf16(qkv + 2 * elements + src, v_out + kv, pairs, lane);
+        head_pack_smem_q_or_k(qkv + src, t_row, smem[warp], q_out + src, lane, dim, pairs, half, eps);
+        head_pack_smem_q_or_k(qkv + elements + src, t_row, smem[warp], k_out + kv, lane, dim, pairs, half, eps);
     }
 }
 
