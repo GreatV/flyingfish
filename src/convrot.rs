@@ -360,7 +360,7 @@ pub struct ConvrotFns {
     hadamard: crate::backend::gpu::CudaFunction,
     group_dot: crate::backend::gpu::CudaFunction,
     quantize: crate::backend::gpu::CudaFunction,
-    product: crate::backend::gpu::CudaFunction,
+    product: [crate::backend::gpu::CudaFunction; 2],
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
     optin: usize,
@@ -398,6 +398,7 @@ pub struct ConvrotArgs {
     pub k: i32,
     pub n: i32,
     pub group: i32,
+    pub product_m_fast: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -410,13 +411,64 @@ const PRODUCT_BN: u32 = 256;
 const PRODUCT_SMEM: u32 = 61_440;
 
 #[cfg(feature = "cuda")]
-pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
-    let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
-    let product = module.load_function("convrot_product")?;
+fn product_function(
+    module: &std::sync::Arc<crate::backend::gpu::CudaModule>,
+    m_fast: bool,
+) -> Result<crate::backend::gpu::CudaFunction> {
+    let name = if m_fast {
+        "convrot_product_m_fast"
+    } else {
+        "convrot_product"
+    };
+    let product = module.load_function(name)?;
     product.set_attribute(
         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         i32::try_from(PRODUCT_SMEM)?,
     )?;
+    Ok(product)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gate_up_product_order(
+    device: &crate::backend::cuda::Device,
+    row_counts: [usize; 2],
+    (k, n): (usize, usize),
+) -> Result<[bool; 2]> {
+    let l2 = device.info.l2_bytes;
+    if device.info.arch != crate::backend::setup::DeviceArchitecture::Cuda(89) || n * k <= l2 {
+        return Ok([false; 2]);
+    }
+    let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
+    let active = product_function(&module, true)?.occupancy_max_active_blocks_per_multiprocessor(
+        PRODUCT_THREADS,
+        PRODUCT_SMEM as usize,
+        None,
+    )?;
+    ensure!(active > 0, "convrot M-fast product has no resident CTA");
+    let wave = device.info.sms * active as usize;
+    let (bm, bn) = (PRODUCT_BM as usize, PRODUCT_BN as usize);
+    let n_tiles = n.div_ceil(bn);
+    Ok(row_counts.map(|rows| {
+        let m_tiles = rows.div_ceil(bm);
+        if m_tiles < 2 {
+            return false;
+        }
+        let ctas = wave.min(m_tiles * n_tiles);
+        let columns = ((ctas + m_tiles - 1).div_ceil(m_tiles) * bn).min(n);
+        let output_bytes = ctas * bm * bn * 2;
+        let scale_bytes = (rows + columns) * size_of::<f32>();
+        let working_set = (rows + columns) * k + output_bytes + scale_bytes;
+        working_set < l2
+    }))
+}
+
+#[cfg(feature = "cuda")]
+pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
+    let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
+    let product = [
+        product_function(&module, false)?,
+        product_function(&module, true)?,
+    ];
     let hadamard = module.load_function("convrot_hadamard_table")?;
     let group_dot = module.load_function("convrot_group_dot")?;
     let optin = usize::try_from(ctx.attribute(
@@ -506,11 +558,16 @@ pub(crate) fn launch_product(
         args.rows > 0 && args.n > 0 && args.k > 0 && args.k % 64 == 0,
         "convrot product shape"
     );
-    let rows = args.rows as u32;
-    let n = args.n as u32;
+    let m = (args.rows as u32).div_ceil(PRODUCT_BM);
+    let n = (args.n as u32).div_ceil(PRODUCT_BN);
+    let (product, grid) = if args.product_m_fast {
+        (&fns.product[1], (m, n, 1))
+    } else {
+        (&fns.product[0], (n, m, 1))
+    };
     unsafe {
         stream
-            .launch_builder(&fns.product)
+            .launch_builder(product)
             .arg(&args.codes)
             .arg(&args.scales)
             .arg(&args.qweight)
@@ -520,7 +577,7 @@ pub(crate) fn launch_product(
             .arg(&args.k)
             .arg(&args.n)
             .launch(LaunchConfig {
-                grid_dim: (n.div_ceil(PRODUCT_BN), rows.div_ceil(PRODUCT_BM), 1),
+                grid_dim: grid,
                 block_dim: (PRODUCT_THREADS, 1, 1),
                 shared_mem_bytes: PRODUCT_SMEM,
             })?;
@@ -1028,6 +1085,7 @@ mod device {
                 k: i32::try_from(k)?,
                 n: i32::try_from(n)?,
                 group: i32::try_from(group)?,
+                product_m_fast: false,
             },
         )?;
         stream.synchronize()?;
@@ -1550,8 +1608,10 @@ mod device {
         Ok(())
     }
 
+    const PRODUCT_FIXTURE_PERIOD: usize = 251;
+
     fn pattern_i8(a: usize, b: usize, p: usize, q: usize) -> i8 {
-        (((a * p + b * q) % 251) as i32 - 125) as i8
+        (((a * p + b * q) % PRODUCT_FIXTURE_PERIOD) as i32 - 125) as i8
     }
 
     fn fixture(rows: usize, k: usize, n: usize) -> (Vec<i8>, Vec<f32>, Vec<i8>, Vec<f32>) {
@@ -1633,9 +1693,9 @@ mod device {
         qweight: &[i8],
         wscale: &[f32],
         k: usize,
-        window: (u64, u64),
+        window: (u64, u64, bool),
     ) -> Result<Vec<bf16>> {
-        let (weight_off, scale_off) = window;
+        let (weight_off, scale_off, m_fast) = window;
         let n = wscale.len();
         let rows = scales.len();
         ensure!(
@@ -1680,16 +1740,86 @@ mod device {
                 k: i32::try_from(k)?,
                 n: i32::try_from(n)?,
                 group: 256,
+                product_m_fast: m_fast,
             },
         )?;
         stream.synchronize()?;
         Ok(stream.clone_dtoh(&y_d)?)
     }
 
+    fn check_gate_up_product(device: &Device) -> Result<()> {
+        let (rows, k, n) = (1509, 5376, 28672);
+        let (codes, scales, qweight, wscale) = fixture(rows, k, n);
+        let period = PRODUCT_FIXTURE_PERIOD;
+        // Codes and weight rows have period 251; scales are indexed by the original coordinates.
+        let mut accumulators = Vec::with_capacity(period * period);
+        for x in codes.chunks_exact(k).take(period) {
+            for w in qweight.chunks_exact(k).take(period) {
+                accumulators.push(
+                    x.iter()
+                        .zip(w)
+                        .map(|(&a, &b)| i32::from(a) * i32::from(b))
+                        .sum::<i32>(),
+                );
+            }
+        }
+        let diff = |output: &[bf16]| {
+            output
+                .chunks_exact(n)
+                .enumerate()
+                .map(|(row, values)| {
+                    let accumulators = &accumulators[row % period * period..][..period];
+                    values
+                        .iter()
+                        .enumerate()
+                        .filter(|&(col, value)| {
+                            let acc = accumulators[col % period] as f32;
+                            let expected = bf16::from_f32(acc * scales[row] * wscale[col]);
+                            value.to_bits() != expected.to_bits()
+                        })
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        for (rows, m_fast) in [(rows, false), (rows, true), (1501, false), (1501, true)] {
+            let output = launch_product_at(
+                device,
+                &codes[..rows * k],
+                &scales[..rows],
+                &qweight,
+                &wscale,
+                k,
+                (0, 0, m_fast),
+            )?;
+            ensure!(output.len() == rows * n, "convrot gate/up output extent");
+            let differing = diff(&output);
+            println!(
+                "CONVROT_PRODUCT_GATE_UP rows={rows} k={k} n={n} m_fast={m_fast} differ={differing}"
+            );
+            ensure!(
+                differing == 0,
+                "convrot gate/up rows={rows} differs in {differing} elements"
+            );
+        }
+        let mut shifted = wscale.clone();
+        shifted.rotate_left(1);
+        let output =
+            launch_product_at(device, &codes, &scales, &qweight, &shifted, k, (0, 0, true))?;
+        ensure!(output.len() == rows * n, "convrot gate/up control extent");
+        let differing = diff(&output);
+        println!("CONVROT_PRODUCT_GATE_UP_SCALE_COLUMN_SHIFT differ={differing}");
+        ensure!(
+            differing > 0,
+            "shifted gate/up scales matched unshifted output"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn convrot_product_matches_host_int8() -> Result<()> {
         let device = Device::new(0)?;
+        check_gate_up_product(&device)?;
         for rows in [17usize, 20, 42] {
             for n in [2usize, 40] {
                 let k = 256usize;
@@ -1701,8 +1831,15 @@ mod device {
                     host_diff == 0,
                     "host product rows={rows} n={n} differ {host_diff}"
                 );
-                let got =
-                    launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, (0, 0))?;
+                let got = launch_product_at(
+                    &device,
+                    &codes,
+                    &scales,
+                    &qweight,
+                    &wscale,
+                    k,
+                    (0, 0, false),
+                )?;
                 let differ = bit_diff(&got, &host);
                 println!("CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ}");
                 ensure!(
@@ -1716,7 +1853,15 @@ mod device {
         let n = 40usize;
         let (codes, scales, qweight, wscale) = fixture(rows, k, n);
         let host = host_product(&codes, &scales, k, &qweight, n, &wscale)?;
-        let got = launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, (0, 0))?;
+        let got = launch_product_at(
+            &device,
+            &codes,
+            &scales,
+            &qweight,
+            &wscale,
+            k,
+            (0, 0, false),
+        )?;
         let differ = bit_diff(&got, &host);
         println!(
             "CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ} macs={}",
@@ -1725,15 +1870,30 @@ mod device {
         ensure!(differ == 0, "convrot product production differ {differ}");
         let mut extended = qweight.clone();
         extended.push(0x5a);
-        let shifted = launch_product_at(&device, &codes, &scales, &extended, &wscale, k, (1, 0))?;
+        let shifted = launch_product_at(
+            &device,
+            &codes,
+            &scales,
+            &extended,
+            &wscale,
+            k,
+            (1, 0, false),
+        )?;
         let moved = bit_diff(&shifted, &host);
         println!("CONVROT_PRODUCT_K_OFFSET differ={moved}");
         ensure!(
             moved > 0,
             "one-int8 K offset matched the unshifted host product"
         );
-        let scale_shifted =
-            launch_product_at(&device, &codes, &scales, &qweight, &wscale, k, (0, 1))?;
+        let scale_shifted = launch_product_at(
+            &device,
+            &codes,
+            &scales,
+            &qweight,
+            &wscale,
+            k,
+            (0, 1, false),
+        )?;
         let scale_moved = bit_diff(&scale_shifted, &host);
         println!("CONVROT_PRODUCT_SCALE_INDEX differ={scale_moved}");
         ensure!(
@@ -1754,7 +1914,7 @@ mod device {
     }
 
     fn function_sass<'a>(dump: &'a str, name: &str) -> Option<&'a str> {
-        let marker = format!("Function : {name}");
+        let marker = format!("Function : {name}\n");
         let start = dump.find(&marker)? + marker.len();
         let rest = &dump[start..];
         let end = rest.find("Function :").unwrap_or(rest.len());
@@ -1789,17 +1949,6 @@ mod device {
                 "cuobjdump sm_{sm} status {} {err}",
                 output.status
             );
-            let body = function_sass(&text, "convrot_product")
-                .context("convrot_product missing from cuobjdump")?;
-            ensure!(
-                body.contains("IMMA.16832.S8.S8"),
-                "sm_{sm} convrot_product lacks IMMA.16832.S8.S8"
-            );
-            let ldg = body.matches("LDG.E.CONSTANT").count();
-            ensure!(
-                ldg == 20,
-                "sm_{sm} convrot_product scale LDG.E.CONSTANT {ldg}"
-            );
             let usage = String::from_utf8_lossy(&resources.stdout);
             let usage_err = String::from_utf8_lossy(&resources.stderr);
             ensure!(
@@ -1807,15 +1956,25 @@ mod device {
                 "cuobjdump resources sm_{sm} status {} {usage_err}",
                 resources.status
             );
-            let (reg, stack, local) = product_resources(&usage)
-                .with_context(|| format!("sm_{sm} convrot_product resources"))?;
-            ensure!(
-                reg <= 124 && stack == 0 && local == 0,
-                "sm_{sm} convrot_product REG={reg} STACK={stack} LOCAL={local}"
-            );
-            println!(
-                "CONVROT_PRODUCT_SASS sm_{sm} IMMA.16832.S8.S8 LDG={ldg} REG={reg} STACK={stack} LOCAL={local}"
-            );
+            for name in ["convrot_product", "convrot_product_m_fast"] {
+                let body = function_sass(&text, name)
+                    .with_context(|| format!("{name} missing from cuobjdump"))?;
+                ensure!(
+                    body.contains("IMMA.16832.S8.S8"),
+                    "sm_{sm} {name} lacks IMMA.16832.S8.S8"
+                );
+                let ldg = body.matches("LDG.E.CONSTANT").count();
+                ensure!(ldg == 20, "sm_{sm} {name} scale LDG.E.CONSTANT {ldg}");
+                let (reg, stack, local) = function_resources(&usage, name)
+                    .with_context(|| format!("sm_{sm} {name} resources"))?;
+                ensure!(
+                    reg <= 124 && stack == 0 && local == 0,
+                    "sm_{sm} {name} REG={reg} STACK={stack} LOCAL={local}"
+                );
+                println!(
+                    "CONVROT_PRODUCT_SASS sm_{sm} {name} IMMA.16832.S8.S8 LDG={ldg} REG={reg} STACK={stack} LOCAL={local}"
+                );
+            }
         }
         Ok(())
     }
@@ -1899,10 +2058,6 @@ mod device {
         Ok(())
     }
 
-    fn product_resources(dump: &str) -> Result<(u32, u32, u32)> {
-        function_resources(dump, "convrot_product")
-    }
-
     fn function_resources(dump: &str, function: &str) -> Result<(u32, u32, u32)> {
         let marker = format!("Function {function}:");
         let rest = dump
@@ -1979,6 +2134,7 @@ mod device {
                 k: i32::try_from(k)?,
                 n: i32::try_from(n)?,
                 group: i32::try_from(group)?,
+                product_m_fast: false,
             },
         )?;
         stream.synchronize()?;
@@ -2020,6 +2176,7 @@ mod device {
                 k: i32::try_from(k)?,
                 n: 0,
                 group: i32::try_from(group)?,
+                product_m_fast: false,
             },
         )?;
         stream.synchronize()?;
@@ -2057,6 +2214,7 @@ mod device {
                     k: i32::try_from(k)?,
                     n: i32::try_from(n)?,
                     group: i32::try_from(group)?,
+                    product_m_fast: false,
                 },
             )?;
             stream.synchronize()?;
@@ -2101,7 +2259,7 @@ mod device {
             &kept_weight,
             &kept_wscale,
             k,
-            (0, 0),
+            (0, 0, false),
         )?;
         let moved = bit_diff(&shifted, &kept_y);
         println!("CONVROT_SHARED_MUTANT differ={moved}");

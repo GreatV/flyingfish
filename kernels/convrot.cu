@@ -384,13 +384,14 @@ __device__ __forceinline__ void convrot_store_one(__nv_bfloat16* __restrict__ y,
 }
 
 // ptxas sm_89: 124 registers, 0 spills.
-extern "C" __global__ void __maxnreg__(124) convrot_product(const int8_t* __restrict__ codes, const float* __restrict__ scales,
-                                           const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
-                                           __nv_bfloat16* __restrict__ y, int rows, int k, int n) {
+__device__ __forceinline__ void convrot_product_tile(
+    const int8_t* __restrict__ codes, const float* __restrict__ scales,
+    const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
+    __nv_bfloat16* __restrict__ y, int rows, int k, int n, int m_tile, int n_tile) {
     if (rows <= 0 || n <= 0 || k <= 0 || (k & (CONVROT_BK - 1))) __trap();
     extern __shared__ __align__(16) int8_t smem[];
-    const int m0 = static_cast<int>(blockIdx.y) * CONVROT_BM;
-    const int n0 = static_cast<int>(blockIdx.x) * CONVROT_BN;
+    const int m0 = m_tile * CONVROT_BM;
+    const int n0 = n_tile * CONVROT_BN;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int warp_m = warp >> 2;
@@ -451,4 +452,16 @@ extern "C" __global__ void __maxnreg__(124) convrot_product(const int8_t* __rest
             convrot_store_one(y, rows, n, r0 + 8, c0 + 1, acc[mi][ni][3], sx[mi][1], sw[ni][1]);
         }
     }
+}
+
+extern "C" __global__ void __maxnreg__(124) convrot_product(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
+}
+
+extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
 }

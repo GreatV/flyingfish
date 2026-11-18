@@ -1397,6 +1397,7 @@ pub(crate) struct BlockWork {
     rank: usize,
     chunk: usize,
     fixed_lora: bool,
+    gate_up_m_fast: [bool; 2],
     #[cfg(test)]
     repeat_ffn_input: bool,
     /// When set, `block_forward` copies the modulated norm2 rows out right
@@ -1438,6 +1439,7 @@ struct StoredPtrs {
     rows: usize,
     k: usize,
     rank: usize,
+    product_m_fast: bool,
 }
 
 impl BlockWork {
@@ -1754,6 +1756,7 @@ impl BlockWork {
             #[cfg(test)]
             normed_probe: Vec::new(),
             fixed_lora: false,
+            gate_up_m_fast: [false; 2],
             #[cfg(test)]
             repeat_ffn_input: false,
             normed,
@@ -1868,6 +1871,7 @@ fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
         rows: work.rows,
         k: scratch.k,
         rank: scratch.rank,
+        product_m_fast: false,
     })
 }
 
@@ -1990,6 +1994,7 @@ fn apply_int8(
             k: i32::try_from(k)?,
             n: i32::try_from(n)?,
             group: i32::try_from(group)?,
+            product_m_fast: ptrs.product_m_fast,
         },
     )
 }
@@ -2067,6 +2072,7 @@ fn apply_shared_qkv(
             k: k_i,
             n: 0,
             group,
+            product_m_fast: false,
         },
     )?;
     for ((qweight, wscale, _), out) in [(q.0, q.1, q.2), (k.0, k.1, k.2), (v.0, v.1, v.2)]
@@ -2089,6 +2095,7 @@ fn apply_shared_qkv(
                 k: k_i,
                 n: i32::try_from(n)?,
                 group,
+                product_m_fast: false,
             },
         )?;
     }
@@ -2379,10 +2386,15 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     scratch: Option<StoredPtrs>,
 ) -> Result<()> {
     let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
+    let (chunk, gate_up_m_fast) = (work.chunk, work.gate_up_m_fast);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
+        let scratch = scratch.map(|mut ptrs| {
+            ptrs.product_m_fast =
+                index == FF_IN && gate_up_m_fast[usize::from(x.shape[0] as usize != chunk)];
+            ptrs
+        });
         apply_linear(c, &w.linears[index], x, y, scratch)
     };
-    let chunk = work.chunk;
     for start in (0..rows).step_by(chunk) {
         let n = chunk.min(rows - start);
         let input_start = start;
@@ -3841,6 +3853,11 @@ impl Dit {
         blas.bind_workspace(chosen.workspace)?;
         if hyperflow {
             work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
+            work.gate_up_m_fast = crate::convrot::gate_up_product_order(
+                d,
+                [work.chunk, work.rows % work.chunk],
+                (h, 2 * spec.ffn),
+            )?;
         } else {
             work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
         }
