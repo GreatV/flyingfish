@@ -262,6 +262,7 @@ fn build_rocm(out: &std::path::Path) {
     println!("cargo:rerun-if-changed=kernels/gpu_compat.cuh");
     println!("cargo:rerun-if-changed=kernels/q38_contract.cuh");
     println!("cargo:rerun-if-changed=kernels/gdn/gdn_recurrent.cuh");
+    println!("cargo:rerun-if-changed=kernels/rotary.cuh");
     println!("cargo:rerun-if-env-changed=HIP_HOME");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=PATH");
@@ -554,6 +555,7 @@ fn main() {
     }
     let mut files = Vec::new();
     collect(std::path::Path::new("kernels"), &mut files);
+    println!("cargo:rerun-if-changed=kernels/rotary.cuh");
     files.sort();
     let mut index = format!(
         "pub const ARCHES: &[u32] = &{archs:?};\npub fn cubin(name: &str, sm: u32) -> Option<&'static [u8]> {{\nmatch (name, sm) {{\n"
