@@ -922,6 +922,11 @@ impl StagedDraft {
             rows >= config.block_size && capacity >= rows,
             "staged draft capacity"
         );
+        let target_capacity = capacity;
+        let capacity = target_capacity
+            .checked_add(config.block_size)
+            .filter(|&extent| i32::try_from(extent).is_ok())
+            .context("staged draft scratch position extent exceeds i32")?;
         let mut binding = deepseek_hc_binding(&spec)?;
         binding.rounding = HcRounding::Fp32ResidualSum;
         let mix = MixerGeometry::new(&spec)?;
@@ -1045,7 +1050,7 @@ impl StagedDraft {
             weights.8
         );
         eprintln!(
-            "PASS STAGED_NATIVE_BIND stages={stages} expert_catalogue={} active_nonexpert={active_nonexpert} text_vl_deferred={text_vl_deferred} uploaded_bytes={} tiered={tiered} missing=0 unexpected=0 initialized=0",
+            "PASS STAGED_NATIVE_BIND stages={stages} expert_catalogue={} active_nonexpert={active_nonexpert} text_vl_deferred={text_vl_deferred} uploaded_bytes={} tiered={tiered} target_capacity={target_capacity} draft_capacity={capacity} missing=0 unexpected=0 initialized=0",
             geometry.layers * geometry.experts,
             weights.8
         );
@@ -2659,6 +2664,75 @@ mod tests {
         println!(
             "PASS DSPARK_TARGET_PREFIX positions=127,537 widths=3 prefixes=18 eager_graph_bits=0 state_bits=0 wrong_prefix_detected=true"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU lease; FF_DS41_MODEL, D1_CENSUS_DOMAIN2, FLYINGFISH_RUNTIME_DIR"]
+    fn staged_capacity_boundary_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let path = PathBuf::from(std::env::var("FF_DS41_MODEL")?);
+        let tokens: Vec<u32> =
+            serde_json::from_slice(&std::fs::read(std::env::var("D1_CENSUS_DOMAIN2")?)?)?;
+        let capacity = 132;
+        let prompt = tokens
+            .get(..capacity - 4)
+            .context("boundary prompt missing")?;
+        crate::mtp::check_request(prompt.len(), 3, capacity)?;
+        for graph in [false, true] {
+            let options = crate::spec::Options {
+                device: 0,
+                capacity,
+                chunk: None,
+                count: 3,
+                ignore_eos: true,
+                backend: Settings {
+                    tree_builder: crate::backend::TreeBuilder::Waves,
+                    spec_budget: SpecBudget::Chain,
+                    spec_graph: graph,
+                    draft_model: None,
+                    prefix_cache: false,
+                    kv_format: crate::kv::KvFormat::Bf16,
+                    device_budget_gib: None,
+                    runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+                },
+            };
+            let mut engine = Engine::load_mtp(&path, &options, 3, graph)?;
+            ensure!(engine.capacity == capacity, "target capacity changed");
+            engine.reset()?;
+            let mut plain = vec![engine.prefill(prompt, None)?];
+            let mut margin = f64::INFINITY;
+            for row in 0..3 {
+                if row != 0 {
+                    plain.push(engine.decode(false, None)?);
+                }
+                let (id, gap) =
+                    crate::verify::top_two("staged.capacity.plain", &engine.decode_logits()?)?;
+                ensure!(Some(&id) == plain.last(), "plain prediction differs");
+                margin = margin.min(gap);
+            }
+            let output = engine.generate_mtp_prepared(
+                prompt,
+                3,
+                true,
+                crate::mtp::VerifyPolicy::Batched,
+                graph,
+                &mut |_, _| true,
+            )?;
+            ensure!(output.ids == plain, "boundary speculative tokens differ");
+            ensure!(
+                engine.position == prompt.len() + 2,
+                "boundary target position"
+            );
+            ensure!(margin > 0.0, "boundary prediction has no margin");
+            println!(
+                "PASS DSPARK_CAPACITY_BOUNDARY graph={graph} capacity={capacity} prompt={} count=3 depth=3 ids={plain:?} plain_min_margin={margin:e}",
+                prompt.len()
+            );
+        }
         Ok(())
     }
 
