@@ -1809,6 +1809,16 @@ impl BlockWork {
         );
         self.fixed_lora = true;
         self.prepare::<LORA>(blas, spec)?;
+        for rows in [self.chunk, self.rows % self.chunk]
+            .into_iter()
+            .filter(|&rows| rows > 0)
+        {
+            blas.bind_lower_wave(crate::backend::setup::LinearShape {
+                rows,
+                output: spec.hidden,
+                input: spec.ffn,
+            })?;
+        }
         if self.rows > FFN_CHUNK_ROWS {
             self.ffn_cost::<LORA>(blas, spec, self.chunk, true)?;
         }
@@ -2999,7 +3009,7 @@ fn dense_sizing(manifest: &TensorManifest, layers: usize) -> Result<DenseSizing>
 }
 
 /// Bytes the dense placer read at setup: device free and total, the owned reserve, the largest matrix, and the host
-/// budget after `2 * slot + largest + 4 GiB`.
+/// budget after `slot_count * slot + largest + 4 GiB`.
 #[derive(Clone, Copy)]
 struct PlacementFacts {
     free_bytes: usize,
@@ -3018,11 +3028,12 @@ struct PlacedLayers {
 }
 
 /// Device budget and host budget for `layers`, then the `DensePlacement` those budgets produce. `host_available` is
-/// measured only when the two slots do not hold every layer.
+/// measured only when the layers do not all fit the device budget.
 fn plan_dense_layers(
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
     (free, total, host_available): (usize, usize, Option<usize>),
+    slot_count: usize,
 ) -> Result<(crate::prefill::DensePlacement, PlacementFacts)> {
     use crate::prefill::DensePlacement;
     let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, media)?;
@@ -3034,10 +3045,22 @@ fn plan_dense_layers(
         );
         device_budget = slots;
     }
-    let probe = DensePlacement::new(layers, Some(source_layers), device_budget, 0)?;
+    let probe = DensePlacement::with_allocations(
+        layers,
+        layers,
+        Some(source_layers),
+        device_budget,
+        0,
+        0,
+        slot_count,
+    )?;
     let (host_budget, host_available) = if probe.slot_bytes > 0 {
         let available = host_available.context("host tier without a measured host budget")?;
-        let reserved = 2 * probe.slot_bytes + largest + (4 << 30);
+        let reserved = slot_count
+            .checked_mul(probe.slot_bytes)
+            .and_then(|bytes| bytes.checked_add(largest))
+            .and_then(|bytes| bytes.checked_add(4 << 30))
+            .context("dense host reserve overflow")?;
         ensure!(
             available >= reserved,
             "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
@@ -3053,7 +3076,15 @@ fn plan_dense_layers(
     } else {
         (0, None)
     };
-    let plan = DensePlacement::new(layers, Some(source_layers), device_budget, host_budget)?;
+    let plan = DensePlacement::with_allocations(
+        layers,
+        layers,
+        Some(source_layers),
+        device_budget,
+        host_budget,
+        0,
+        slot_count,
+    )?;
     ensure!(
         placement == Placement::Derived || plan.resident_bytes == 0,
         "{placement:?} placement kept a resident block"
@@ -3095,8 +3126,11 @@ fn place_layers(
         );
         device_budget = slots;
     }
-    let probe = DensePlacement::new(layers, Some(source_layers), device_budget, 0)?;
-    let host_available = if probe.slot_bytes > 0 {
+    let extent = layers
+        .iter()
+        .try_fold(0usize, |sum, &bytes| sum.checked_add(bytes))
+        .context("dense weight extent overflow")?;
+    let host_available = if extent > device_budget {
         Some(usize::try_from(
             crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
         )?)
@@ -3107,11 +3141,20 @@ fn place_layers(
         (layers, source_layers, largest, owned, media),
         placement,
         (free, total, host_available),
+        2,
     )?;
+    let used_slots = plan
+        .slots
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(0);
     if crate::backend::diagnostics_enabled() {
         eprintln!(
             "{}",
-            serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
+            serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "streaming_slots": used_slots, "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
         );
     }
     let dense = if plan.slot_bytes > 0 {
@@ -3451,44 +3494,54 @@ fn place_stored_layers(
             "stored streaming setup exceeds the device budget"
         );
     }
-    let probe = DensePlacement::with_allocations(
-        &charged_device,
-        &charged_slots,
-        Some(&kept_source),
-        device_budget,
-        0,
-        granularity,
-    )?;
-    let host_available = if probe.slot_bytes > 0 {
-        Some(usize::try_from(
-            crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
-        )?)
-    } else {
-        None
+    let attempt = |slot_count: usize| -> Result<(DensePlacement, usize, Option<usize>)> {
+        let probe = DensePlacement::with_allocations(
+            &charged_device,
+            &charged_slots,
+            Some(&kept_source),
+            device_budget,
+            0,
+            granularity,
+            slot_count,
+        )?;
+        let host_available = if probe.slot_bytes > 0 {
+            Some(usize::try_from(
+                crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+            )?)
+        } else {
+            None
+        };
+        let host_budget = if let Some(available) = host_available {
+            let reserve = slot_count
+                .checked_mul(probe.slot_bytes)
+                .and_then(|bytes| bytes.checked_add(sizing.largest))
+                .and_then(|bytes| bytes.checked_add(4 << 30))
+                .context("stored host reserve overflow")?;
+            let budget = available
+                .checked_sub(reserve)
+                .context("stored pinned staging and host reserve exceed available RAM")?;
+            match placement {
+                Placement::Derived => budget,
+                #[cfg(test)]
+                Placement::Streamed => budget,
+                #[cfg(test)]
+                Placement::StreamedDisk => 0,
+            }
+        } else {
+            0
+        };
+        let compact = DensePlacement::with_allocations(
+            &charged_device,
+            &charged_slots,
+            Some(&kept_source),
+            device_budget,
+            host_budget,
+            granularity,
+            slot_count,
+        )?;
+        Ok((compact, host_budget, host_available))
     };
-    let host_budget = if let Some(available) = host_available {
-        let reserve = 2 * probe.slot_bytes + sizing.largest + (4 << 30);
-        let budget = available
-            .checked_sub(reserve)
-            .context("stored pinned staging and host reserve exceed available RAM")?;
-        match placement {
-            Placement::Derived => budget,
-            #[cfg(test)]
-            Placement::Streamed => budget,
-            #[cfg(test)]
-            Placement::StreamedDisk => 0,
-        }
-    } else {
-        0
-    };
-    let compact = DensePlacement::with_allocations(
-        &charged_device,
-        &charged_slots,
-        Some(&kept_source),
-        device_budget,
-        host_budget,
-        granularity,
-    )?;
+    let (compact, host_budget, host_available) = attempt(2)?;
     let facts = PlacementFacts {
         free_bytes: free,
         total_bytes: total,
@@ -3527,11 +3580,22 @@ fn place_stored_layers(
         host_bytes: compact.host_bytes,
         disk_bytes: compact.disk_bytes,
     };
+    let used_slots = compact
+        .slots
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let charged_slot_bytes = used_slots
+        .checked_mul(compact.slot_bytes)
+        .context("stored slot bytes")?;
     let predicted_free = facts
         .free_bytes
         .checked_sub(facts.owned_bytes)
         .and_then(|bytes| bytes.checked_sub(compact.resident_bytes))
-        .and_then(|bytes| bytes.checked_sub(2 * compact.slot_bytes))
+        .and_then(|bytes| bytes.checked_sub(charged_slot_bytes))
         .and_then(|bytes| {
             bytes.checked_sub(
                 compact.slots.iter().filter(|slot| slot.is_some()).count() * granularity,
@@ -3540,7 +3604,7 @@ fn place_stored_layers(
         .context("stored placement physical extent exceeds free VRAM")?;
     eprintln!(
         "{}",
-        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes, "allocation_granularity": granularity, "charged_resident_bytes": compact.resident_bytes, "charged_slot_bytes": compact.slot_bytes, "predicted_min_driver_free_after_placement": predicted_free})
+        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "streaming_slots": used_slots, "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes, "allocation_granularity": granularity, "charged_resident_bytes": compact.resident_bytes, "charged_slot_bytes": compact.slot_bytes, "predicted_min_driver_free_after_placement": predicted_free})
     );
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
@@ -3615,7 +3679,7 @@ struct SampleTrace {
 
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
-/// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
+/// VRAM and host budgets (resident, or device slots fed from pinned host memory or the disk tier).
 /// A HyperFlow kept block loads its stored int8, low-rank, or dense factor. A dropped block is identity.
 pub(crate) struct Dit {
     ranges: Ranges,
@@ -4551,11 +4615,8 @@ impl ImageDit {
                 None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, None)?,
             });
         }
-        let (free, total) = d.ctx.mem_get_info()?;
-        let reserve = (total / 16)
-            .checked_add(sizing.transient)
-            .context("FFN live reserve overflow")?;
-        let budget = d.workspace_budget(free, free, reserve)?;
+        let (free, _) = d.ctx.mem_get_info()?;
+        let budget = d.workspace_budget(free, free, sizing.transient)?;
         let choices = work.ffn_choices::<false>(blas, spec, budget)?;
         let owned_plan = FfnPlan::select(&choices, budget)?;
         let aliases = work.alias_choices::<false>(blas, spec, owned_plan)?;
@@ -5733,6 +5794,7 @@ mod tests {
             256,
             150,
             16,
+            2,
         )?;
         let streamed_count = streamed.slots.iter().filter(|slot| slot.is_some()).count();
         assert_eq!(
@@ -5749,7 +5811,8 @@ mod tests {
                 Some(&[50, 50, 50, 50]),
                 191,
                 150,
-                16
+                16,
+                2,
             )
             .is_err()
         );
@@ -5833,6 +5896,39 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    /// At the logged free of 1_683_750_912 the selector takes chunk 2052. Subtracting `total / 16` again leaves
+    /// 105_455_616 and takes chunk 1026.
+    #[test]
+    fn image_ffn_reserve_is_subtracted_once() -> Result<()> {
+        let rows = 4_103usize;
+        let initial = 821usize;
+        let element = 86_016usize;
+        let plan = |chunk: usize, tensor_cost: f64| FfnPlan {
+            chunk,
+            borrowed: false,
+            allocation: if chunk == initial { 0 } else { chunk * element },
+            workspace: 0,
+            tensor_cost,
+            launches: rows.div_ceil(chunk),
+        };
+        let choices = [
+            plan(4_103, 256.0 / 231.0),
+            plan(2_052, 128.0 / 119.0),
+            plan(1_368, 256.0 / 231.0),
+            plan(1_026, 256.0 / 189.0),
+            plan(821, 256.0 / 147.0),
+        ];
+        let logged_free = 1_683_750_912usize;
+        let total = 25_252_724_736usize;
+        assert_eq!(FfnPlan::select(&choices, logged_free)?.chunk, 2_052);
+        let doubled = logged_free - total / 16;
+        assert_eq!(doubled, 105_455_616);
+        assert_eq!(FfnPlan::select(&choices, doubled)?.chunk, 1_026);
+        assert!(choices[1].allocation <= logged_free);
+        assert!(choices[3].allocation <= doubled && choices[2].allocation > doubled);
         Ok(())
     }
 
@@ -12028,6 +12124,15 @@ mod tests {
                 facts.host_available_bytes.is_some() && dense.plan.slot_bytes > 0,
                 "4096 placement kept every block resident"
             );
+            let slot_count = dense
+                .plan
+                .slots
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .map(|index| index + 1)
+                .context("4096 placement kept every block resident")?;
             let (plan, again) = super::plan_dense_layers(
                 (
                     &sizing.layers,
@@ -12042,6 +12147,7 @@ mod tests {
                     facts.total_bytes,
                     facts.host_available_bytes,
                 ),
+                slot_count,
             )?;
             let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
             let host = plan.host.iter().filter(|flag| **flag).count();

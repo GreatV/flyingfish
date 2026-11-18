@@ -2101,19 +2101,28 @@ impl DenseStreaming {
                 allocation_record(&format!("pinned_layer{index}"), 0, layer.source_bytes)?;
             }
         }
+        let slot_count = plan
+            .slots
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .map(|index| index + 1)
+            .context("dense streaming plan has no slot")?;
+        let ring = u32::try_from(slot_count)?;
         let (disk, events, read_ahead) = if plan.disk_bytes > 0 {
-            let disk = DiskReader::open_ranges(&ranges, plan.slot_bytes, dir, 2)?;
+            let disk = DiskReader::open_ranges(&ranges, plan.slot_bytes, dir, ring)?;
             let reader =
                 super::engine::Reader::new_ranges(d, disk, ranges, UPLOAD_CHUNK_BYTES as u64)?;
-            let events = super::engine::Events::new(&d.ctx, 8)?;
-            let read_ahead = super::engine::ReadAhead::new(2, 2, 1)?;
+            let events = super::engine::Events::new(&d.ctx, (ring as usize) * 4)?;
+            let read_ahead = super::engine::ReadAhead::new(ring, ring, 1)?;
             (Some(reader), Some(events), read_ahead)
         } else {
-            (None, None, super::engine::ReadAhead::new(2, 0, 1)?)
+            (None, None, super::engine::ReadAhead::new(ring, 0, 1)?)
         };
         #[cfg(test)]
         allocation_record("disk_reader_events", 0, 0)?;
-        let slots = (0..2)
+        let slots = (0..slot_count)
             .map(|_| {
                 let device = d.upload.alloc_zeros::<u8>(plan.slot_bytes)?;
                 #[cfg(test)]
@@ -2236,11 +2245,14 @@ impl DenseStreaming {
     }
 
     fn prime(&mut self) -> Result<()> {
-        if let Some(first) = self.layers.iter().position(|layer| layer.slot == Some(0)) {
-            self.prefetch(first)?;
-        }
-        if let Some(second) = self.layers.iter().position(|layer| layer.slot == Some(1)) {
-            self.prefetch(second)?;
+        for slot in 0..self.slots.len() {
+            if let Some(first) = self
+                .layers
+                .iter()
+                .position(|layer| layer.slot == Some(slot))
+            {
+                self.prefetch(first)?;
+            }
         }
         self.pump_disk()
     }
@@ -2625,6 +2637,40 @@ fn emit_classic_streamed(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+pub(crate) struct PcieLink {
+    pub width: usize,
+    pub max_speed: String,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn sense_pcie(d: &Device) -> Result<PcieLink> {
+    let mut pci_name = [0i8; 32];
+    unsafe {
+        sys::cuDeviceGetPCIBusId(
+            pci_name.as_mut_ptr(),
+            pci_name.len() as i32,
+            d.ctx.cu_device(),
+        )
+        .result()?;
+    }
+    let pci_name = unsafe { std::ffi::CStr::from_ptr(pci_name.as_ptr()) }.to_str()?;
+    let pci = Path::new("/sys/bus/pci/devices").join(pci_name);
+    let link_speed = std::fs::read_to_string(pci.join("max_link_speed"))
+        .context("probe dense PCIe link speed")?;
+    let width: usize = std::fs::read_to_string(pci.join("current_link_width"))
+        .context("probe dense PCIe link width")?
+        .trim()
+        .parse()?;
+    let max_speed = link_speed.trim().to_owned();
+    ensure!(
+        width > 0 && !max_speed.is_empty(),
+        "invalid dense PCIe capability"
+    );
+    crate::prefill::pcie_payload_bytes_per_second(&max_speed, width)?;
+    Ok(PcieLink { width, max_speed })
+}
+
 pub(crate) struct WeightCatalog {
     #[cfg(feature = "cuda")]
     pub dense: Option<DenseStreaming>,
@@ -2786,31 +2832,11 @@ impl WeightCatalog {
         let copy_engines = d
             .ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?;
-        let mut pci_name = [0i8; 32];
-        unsafe {
-            sys::cuDeviceGetPCIBusId(
-                pci_name.as_mut_ptr(),
-                pci_name.len() as i32,
-                d.ctx.cu_device(),
-            )
-            .result()?;
-        }
-        let pci_name = unsafe { std::ffi::CStr::from_ptr(pci_name.as_ptr()) }.to_str()?;
-        let pci = Path::new("/sys/bus/pci/devices").join(pci_name);
-        let link_speed = std::fs::read_to_string(pci.join("max_link_speed"))
-            .context("probe dense PCIe link speed")?;
-        let link_width: usize = std::fs::read_to_string(pci.join("current_link_width"))
-            .context("probe dense PCIe link width")?
-            .trim()
-            .parse()?;
-        ensure!(
-            link_width > 0 && !link_speed.trim().is_empty(),
-            "invalid dense PCIe capability"
-        );
+        let pcie = sense_pcie(d)?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
                 "{}",
-                serde_json::json!({"dense_placement": &plan, "fixed_bytes": fixed, "transient_bytes": transient_bytes, "host_available_bytes": available_host, "copy_engines": copy_engines, "memory_bus_bits": memory_bus_bits, "sms": d.info.sms, "pcie_link_width": link_width, "pcie_max_link_speed": link_speed.trim()})
+                serde_json::json!({"dense_placement": &plan, "fixed_bytes": fixed, "transient_bytes": transient_bytes, "host_available_bytes": available_host, "copy_engines": copy_engines, "memory_bus_bits": memory_bus_bits, "sms": d.info.sms, "pcie_link_width": pcie.width, "pcie_max_link_speed": pcie.max_speed})
             );
         }
         let started = Instant::now();

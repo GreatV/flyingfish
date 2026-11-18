@@ -1277,6 +1277,69 @@ impl Blas {
         }
         Ok(())
     }
+}
+
+/// `ceil(waves) / waves` for a positive finite wave count.
+pub(crate) fn wave_multiplier(waves: f64) -> Result<f64> {
+    ensure!(
+        waves.is_finite() && waves > 0.0,
+        "invalid Lt wave count {waves}"
+    );
+    Ok(waves.ceil() / waves)
+}
+
+/// Index of the strictly lower whole-wave multiplier. Equal multipliers keep index 0.
+pub(crate) fn lower_wave_index(waves: &[f64]) -> Result<usize> {
+    ensure!(!waves.is_empty(), "empty Lt wave list");
+    let mut best = 0usize;
+    let mut best_cost = wave_multiplier(waves[0])?;
+    for (index, &count) in waves.iter().enumerate().skip(1) {
+        let cost = wave_multiplier(count)?;
+        if cost < best_cost {
+            best = index;
+            best_cost = cost;
+        }
+    }
+    Ok(best)
+}
+
+impl Blas {
+    /// Stores the lower whole-wave heuristic of this down shape at plan index 0. A tie keeps 0. `algo_count < 2` keeps 0.
+    pub(crate) fn bind_lower_wave(&self, shape: LinearShape) -> Result<()> {
+        let key = (shape.rows, shape.output, shape.input, 0u32, false);
+        let (waves, algo_count) = {
+            let plans = self.plans.borrow();
+            let plan = plans.get(&key).context("fixed linear cost plan missing")?;
+            (f64::from(plan.waves), plan.algo_count)
+        };
+        if algo_count < 2 {
+            return Ok(());
+        }
+        let alternative = Plan::new(
+            self.handle,
+            shape.rows,
+            shape.output,
+            shape.input,
+            self.workspace.borrow().len(),
+            1,
+        )?;
+        let index = lower_wave_index(&[waves, f64::from(alternative.waves)])?;
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_down_wave":{
+                    "rows": shape.rows, "output": shape.output, "input": shape.input,
+                    "waves0": waves, "waves1": alternative.waves, "index": index
+                }})
+            );
+        }
+        if index == 0 {
+            return Ok(());
+        }
+        self.bind_workspace(alternative.workspace)?;
+        self.plans.borrow_mut().insert(key, alternative);
+        Ok(())
+    }
 
     /// Fixed Lt plan's whole-wave work multiplier and separate split-K reduction launch count.
     pub(crate) fn fixed_plan_cost(
@@ -1299,10 +1362,6 @@ impl Blas {
             .get(&(shape.rows, shape.output, shape.input, 0, family))
             .context("fixed linear cost plan missing")?;
         let waves = f64::from(plan.waves);
-        ensure!(
-            waves.is_finite() && waves > 0.0,
-            "invalid Lt wave count {waves}"
-        );
         if describe {
             plan.describe(shape.rows, shape.output, shape.input)?;
             if let Some(&(_, original_workspace)) = self
@@ -1334,7 +1393,7 @@ impl Blas {
         }
         let split =
             plan.attr(sys::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?;
-        Ok((waves.ceil() / waves, usize::from(split > 1)))
+        Ok((wave_multiplier(waves)?, usize::from(split > 1)))
     }
 
     /// Request-bound BF16 Lt plans have no measured choices or calibration files.
@@ -2342,6 +2401,20 @@ impl Blas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lower_wave_keeps_index_zero_on_a_tie() -> Result<()> {
+        let partial = 189.0 / 128.0;
+        assert_eq!(wave_multiplier(partial)?, 256.0 / 189.0);
+        assert_eq!(wave_multiplier(1.0)?, 1.0);
+        assert!(wave_multiplier(1.0)? < wave_multiplier(partial)?);
+        assert_eq!(lower_wave_index(&[partial, 1.0])?, 1);
+        assert_eq!(lower_wave_index(&[1.0, partial])?, 0);
+        assert_eq!(lower_wave_index(&[partial, partial])?, 0);
+        assert!(wave_multiplier(0.0).is_err());
+        assert!(wave_multiplier(f64::NAN).is_err());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "exclusive CUDA window and an empty FLYINGFISH_RUNTIME_DIR"]
