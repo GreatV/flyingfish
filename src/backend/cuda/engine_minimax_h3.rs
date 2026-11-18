@@ -456,9 +456,30 @@ pub(crate) struct AdalnTable {
     pub norm_out: CudaSlice<bf16>,
 }
 
+/// Sorted distinct modality tags the plan's pairs address; one AdaLN weight block is read per tag.
+fn adaln_tags(pairs: &[(u32, u8)]) -> Vec<u8> {
+    let mut tags: Vec<u8> = pairs.iter().map(|&(_, tag)| tag).collect();
+    tags.sort_unstable();
+    tags.dedup();
+    tags
+}
+
+/// Compact block index of `tag` among the plan's `tags`, erroring by name.
+fn adaln_block(tags: &[u8], tag: u8) -> Result<usize> {
+    tags.iter()
+        .position(|&candidate| candidate == tag)
+        .with_context(|| format!("adaln tag {tag} outside the plan's tag set"))
+}
+
+/// Flat element offset of pair `(t, tag)`'s `width` block in the compact table `[timesteps, tags.len() * width]`.
+fn adaln_pair_offset(tags: &[u8], width: usize, t: u32, tag: u8) -> Result<usize> {
+    Ok((t as usize * tags.len() + adaln_block(tags, tag)?) * width)
+}
+
 impl AdalnTable {
-    /// Kept blocks: `[18 * hidden, time_dim]` projection of the plan embedding, bias before output rounding,
-    /// keeping the addressed `(timestep, tag)` slices. HyperFlow's embedding is SiLU of `mix_temb` on the two f32
+    /// Kept blocks: `[6 * hidden * tags, time_dim]` projection of the plan embedding over the plan's addressed
+    /// modality tags (full 3-tag tables read every block), bias before output rounding, keeping the addressed
+    /// `(timestep, tag)` slices. HyperFlow's embedding is SiLU of `mix_temb` on the two f32
     /// time embedders, rounded to BF16. A dropped block's modulation rows stay zero.
     pub(crate) fn build(
         d: &Device,
@@ -528,37 +549,62 @@ impl AdalnTable {
             adaln_input(spec, &time, &plan.timesteps)
         };
         let x = s.clone_htod(&x_host)?;
-        let mut weight = s.alloc_zeros::<bf16>(modulation * spec.time_dim)?;
-        let mut bias = s.alloc_zeros::<bf16>(modulation)?;
-        let y = s.alloc_zeros::<bf16>(timesteps * modulation)?;
+        let tags = adaln_tags(&plan.pairs);
+        let compact = width * tags.len();
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_adaln_spans": {"tags": tags, "compact_modulation": compact,
+                "full_modulation": modulation, "weight_block_bytes": width * spec.time_dim * 2,
+                "bias_block_bytes": 2 * width}})
+            );
+        }
+        let mut weight = s.alloc_zeros::<bf16>(compact * spec.time_dim)?;
+        let mut bias = s.alloc_zeros::<bf16>(compact)?;
+        let y = s.alloc_zeros::<bf16>(timesteps * compact)?;
         let mut blocks = s.alloc_zeros::<bf16>(spec.layers * plan.pairs.len() * width)?;
         let mode = LinearBiasMode::BeforeOutputRound;
         blas.prepare_biased(
             u32::try_from(timesteps)?,
-            u32::try_from(modulation)?,
+            u32::try_from(compact)?,
             u32::try_from(spec.time_dim)?,
             vector(&bias, s)?,
             mode,
         )?;
         let dropped = spec.dropped_blocks.as_deref().unwrap_or(&[]);
+        let weight_block = width * spec.time_dim * 2;
         for layer in 0..spec.layers {
             if dropped.contains(&layer) {
                 continue;
             }
             let base = format!("transformer_blocks.{layer}.adaln_proj.linear");
-            for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
-                let name = format!("{base}.{suffix}");
-                source.fill(s, &name, &mut buffer.slice_mut(..))?;
+            for (index, &tag) in tags.iter().enumerate() {
+                let first = usize::from(tag);
+                source.fill_span(
+                    s,
+                    &format!("{base}.weight"),
+                    first * weight_block,
+                    weight_block,
+                    &mut weight.slice_mut(index * width * spec.time_dim
+                        ..(index + 1) * width * spec.time_dim),
+                )?;
+                source.fill_span(
+                    s,
+                    &format!("{base}.bias"),
+                    first * 2 * width,
+                    2 * width,
+                    &mut bias.slice_mut(index * width..(index + 1) * width),
+                )?;
             }
             blas.linear_biased(
-                matrix(&weight, s, modulation, spec.time_dim)?,
+                matrix(&weight, s, compact, spec.time_dim)?,
                 vector(&bias, s)?,
                 matrix(&x, s, timesteps, spec.time_dim)?,
-                &mut TensorMut(matrix(&y, s, timesteps, modulation)?),
+                &mut TensorMut(matrix(&y, s, timesteps, compact)?),
                 mode,
             )?;
             for (pair, &(t, tag)) in plan.pairs.iter().enumerate() {
-                let source = (t as usize * MODALITIES as usize + usize::from(tag)) * width;
+                let source = adaln_pair_offset(&tags, width, t, tag)?;
                 let target = (layer * plan.pairs.len() + pair) * width;
                 s.memcpy_dtod(
                     &y.slice(source..source + width),
@@ -772,6 +818,43 @@ impl<'a> Source<'a> {
             }
             other => bail!("{name}: unsupported GGUF type {other:?}"),
         }
+    }
+
+    /// `bytes` of an unquantized tensor at entry-relative byte `first`, read through the shared staging path
+    /// (`EntryReader::read_range`) into `destination`; no second reader.
+    fn fill_span<T: Element>(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        first: usize,
+        bytes: usize,
+        destination: &mut CudaViewMut<'_, T>,
+    ) -> Result<()> {
+        let entry = self
+            .manifest
+            .entries
+            .get(name)
+            .with_context(|| format!("manifest lacks {name}"))?;
+        ensure!(
+            entry.quant.is_none() && entry.dtype == T::DTYPE,
+            "{name}: span fill needs an unquantized {:?} tensor, found {:?} quant {:?}",
+            T::DTYPE,
+            entry.dtype,
+            entry.quant
+        );
+        ensure!(
+            destination.len() * std::mem::size_of::<T>() == bytes,
+            "{name}: span {bytes} B does not fill a {}-element {:?} buffer",
+            destination.len(),
+            T::DTYPE
+        );
+        let slice = self.reader.read_range(name, entry, first, bytes)?;
+        ensure!(T::finite(slice), "{name}: nonfinite value");
+        let (pointer, _record) = destination.device_ptr_mut(s);
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(pointer, slice, s.cu_stream())?;
+        }
+        Ok(())
     }
 
     fn tensor<T: Element + crate::backend::gpu::ValidAsZeroBits>(
@@ -5452,15 +5535,91 @@ mod tests {
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::checkpoint::MappedCheckpoint;
     use crate::minimax_h3::{
-        AUDIO_TAG, Geometry, IMAGE_MIN_GENERATION_AREA, ImageLayout, ImageSchedule, ImageSpec,
-        KEYFRAME_NOISE_AUG, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, TEXT_TAG,
-        VIDEO_TAG, hyperflow_steps, image_canvas, image_latent_extent, image_layout,
+        AUDIO_TAG, Geometry, IMAGE_MIN_GENERATION_AREA, IMAGE_TAG, ImageLayout, ImageSchedule,
+        ImageSpec, KEYFRAME_NOISE_AUG, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule,
+        TEXT_TAG, VIDEO_TAG, hyperflow_steps, image_canvas, image_latent_extent, image_layout,
         image_reference_latent_extent, image_vae_reference_size, noise_draws, patchify_latents,
         rotary_rows, row_timestep_plan, unpatchify_latents,
     };
     use anyhow::bail;
     use safetensors::SafeTensors;
     use std::{collections::BTreeMap, fs, rc::Rc};
+
+    /// The H3-Image adaln span derivation: a plan addressing only IMAGE and TEXT reads two modality
+    /// blocks of the published [96768, 2688] BF16 weight, never the audio rows; the counted extents
+    /// match the safetensors headers of `transformer_diffusers`.
+    #[test]
+    fn adaln_spans_read_only_the_addressed_modality_blocks() {
+        let pairs = [(0, TEXT_TAG), (0, IMAGE_TAG), (1, IMAGE_TAG), (1, TEXT_TAG), (5, TEXT_TAG)];
+        let tags = adaln_tags(&pairs);
+        assert_eq!(tags, vec![IMAGE_TAG, TEXT_TAG]);
+        let (rows, cols) = (96_768usize, 2_688usize);
+        let width = 6 * 5_376usize;
+        assert_eq!(width, rows / MODALITIES as usize);
+        let weight_block = width * cols * 2;
+        let bias_block = 2 * width;
+        let weight_spans: Vec<(usize, usize)> = tags
+            .iter()
+            .map(|&tag| (usize::from(tag) * weight_block, weight_block))
+            .collect();
+        let bias_spans: Vec<(usize, usize)> = tags
+            .iter()
+            .map(|&tag| (usize::from(tag) * bias_block, bias_block))
+            .collect();
+        assert_eq!(
+            weight_spans,
+            vec![(0, 173_408_256), (173_408_256, 173_408_256)]
+        );
+        assert_eq!(bias_spans, vec![(0, 64_512), (64_512, 64_512)]);
+        assert_eq!(
+            rows * cols * 2 - weight_spans.iter().map(|&(_, n)| n).sum::<usize>(),
+            173_408_256
+        );
+        assert_eq!(
+            rows * 2 - bias_spans.iter().map(|&(_, n)| n).sum::<usize>(),
+            64_512
+        );
+        assert_eq!(50usize * (173_408_256 + 64_512), 8_673_638_400usize);
+    }
+
+    /// The compact pair offsets pick the same tag blocks as the full 3-slot table, and a perturbed
+    /// audio block changes no gathered pair.
+    #[test]
+    fn adaln_compact_pairs_match_the_full_table() {
+        let (width, timesteps) = (4usize, 2usize);
+        let full: Vec<u16> = (0..timesteps * MODALITIES as usize * width)
+            .map(|i| i as u16)
+            .collect();
+        let tags = adaln_tags(&[(0, TEXT_TAG), (0, IMAGE_TAG), (1, IMAGE_TAG)]);
+        assert_eq!(tags, vec![IMAGE_TAG, TEXT_TAG]);
+        let gather = |table: &[u16]| -> Vec<u16> {
+            (0..timesteps)
+                .flat_map(|t| {
+                    tags.iter().flat_map(move |&tag| {
+                        table
+                            [t * MODALITIES as usize * width + usize::from(tag) * width..]
+                            [..width]
+                            .to_vec()
+                    })
+                })
+                .collect()
+        };
+        let compact = gather(&full);
+        for &(t, tag) in &[(0, IMAGE_TAG), (0, TEXT_TAG), (1, IMAGE_TAG)] {
+            let at = adaln_pair_offset(&tags, width, t, tag).unwrap();
+            let from = (t as usize * MODALITIES as usize + usize::from(tag)) * width;
+            assert_eq!(&compact[at..at + width], &full[from..from + width]);
+        }
+        assert!(adaln_block(&tags, AUDIO_TAG).is_err());
+        let mut perturbed = full.clone();
+        for t in 0..timesteps {
+            let at = (t * MODALITIES as usize + usize::from(AUDIO_TAG)) * width;
+            for value in &mut perturbed[at..at + width] {
+                *value = 999;
+            }
+        }
+        assert_eq!(gather(&perturbed), compact);
+    }
 
     #[test]
     fn stored_placement_preserves_the_physical_reserve() -> Result<()> {
