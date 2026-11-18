@@ -7,7 +7,7 @@ mod gates {
     use super::super::Device;
     use super::super::engine_music3_syn::Music3Syn;
     use anyhow::Context;
-
+    use cudarc::driver::PushKernelArg;
     fn model_dir() -> anyhow::Result<std::path::PathBuf> {
         let dir = std::env::var("FF_MUSIC3_MODEL").context("FF_MUSIC3_MODEL not set")?;
         Ok(std::path::PathBuf::from(dir))
@@ -41,6 +41,43 @@ mod gates {
         let bias_got = device.stream.clone_dtoh(&d_output)?;
         anyhow::ensure!(bias_got == bias_want, "biased linear is not bit-exact");
         println!("MUSIC3_BIAS bit_identical=true count={}", bias_got.len());
+        let rotary_input = super::tensor_bf16(&view, "rotary_input")?;
+        let rotary_want = super::tensor_bf16(&view, "rotary_output")?;
+        let rotary_cos = super::tensor_bf16(&view, "rotary_cos")?;
+        let rotary_sin = super::tensor_bf16(&view, "rotary_sin")?;
+        let rows = 87usize;
+        let heads = engine.spec.flow_heads as usize;
+        let head_dim = engine.spec.flow_head_dim as usize;
+        let rotary_dim = engine.spec.rotary_dim as usize;
+        anyhow::ensure!(
+            rotary_input.len() == rows * heads * head_dim
+                && rotary_want != rotary_input
+                && rotary_cos.len() == rows * rotary_dim
+                && rotary_sin.len() == rows * rotary_dim,
+            "rotary fixture extent or negative control"
+        );
+        let rope_module = super::super::cubin::module(&device.ctx, "rope")?;
+        let rope = rope_module.load_function("partial_rotary_bf16")?;
+        let mut d_query = device.stream.clone_htod(&rotary_input)?;
+        let d_cos = device.stream.clone_htod(&rotary_cos)?;
+        let d_sin = device.stream.clone_htod(&rotary_sin)?;
+        unsafe {
+            device
+                .stream
+                .launch_builder(&rope)
+                .arg(&mut d_query)
+                .arg(&d_cos)
+                .arg(&d_sin)
+                .arg(&(rows as i32))
+                .arg(&(heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(rotary_dim as i32))
+                .launch(super::super::ops::flat(rows * heads * rotary_dim))?;
+        }
+        let rotary_got = device.stream.clone_dtoh(&d_query)?;
+        anyhow::ensure!(rotary_got != rotary_input, "rotary negative control");
+        anyhow::ensure!(rotary_got == rotary_want, "rotary output is not bit-exact");
+        println!("MUSIC3_ROPE bit_identical=true count={}", rotary_got.len());
         assert_eq!(
             engine.weights.flow.blocks.len(),
             engine.spec.flow_layers as usize
