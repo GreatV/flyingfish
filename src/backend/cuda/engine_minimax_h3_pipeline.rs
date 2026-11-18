@@ -4,8 +4,8 @@
 use super::super::vision_runtime::LayerNormTower;
 use super::audio::AudioDecoder;
 use super::vae::{
-    EncodeWork, ImageDecodeStage, ImageEncodeStage, KeyframeEncoder, LatentVideo, TileWork,
-    VideoDecoder, decode_bytes, image_decoder_sizes, image_vae_manifest,
+    EncodeWork, ImageDecodeStage, ImageEncodeSetup, ImageEncodeStage, KeyframeEncoder, LatentVideo,
+    TileWork, VideoDecoder, decode_bytes, image_decoder_sizes, image_vae_manifest,
     video_decoder_weight_bytes,
 };
 use super::{
@@ -1331,43 +1331,8 @@ impl ImageSession {
             image_decoder_sizes(&vae_manifest, vae.layers);
         let (disk_probe_bytes, disk) = image_fill_rate(&dir, &text_manifest)?;
         let pcie = crate::backend::cuda::calibrate::pinned_h2d_rate(&d)?;
-        let floor = |layers: &[usize]| -> Result<usize> {
-            let largest = *layers
-                .iter()
-                .max()
-                .context("resident stage has no layers")?;
-            Ok((2 * largest).min(layers.iter().sum()))
-        };
-        let device_after = conditioner_fixed
-            + floor(&conditioner_layers)?
-            + decoder_fixed
-            + floor(&decoder_layers)?
-            + temporary;
         let decode_blas = blas("image VAE")?;
         let text_blas = blas("MiniMax-H3-Image conditioner")?;
-        let decoder_work = ImageDecodeStage::prepare_work(&d, &vae, shape.canvas, device_after)?;
-        let decoder_visits = decoder_work.visits();
-        let encode = shape
-            .reference
-            .map(|extent| -> Result<_> {
-                let encoder_blas = blas("image VAE encoder")?;
-                let encoder = ImageEncodeStage::new(
-                    &d,
-                    (&vae_dir, &vae, &vae_manifest),
-                    extent,
-                    device_after,
-                )?;
-                Ok((encoder, encoder_blas))
-            })
-            .transpose()?;
-        let temporary = stored_allocation_bytes(
-            temporary.max(
-                encode
-                    .as_ref()
-                    .map_or(0, |(encoder, _)| encoder.transient_bytes),
-            ),
-            device_page,
-        )?;
         let device_fixed = stored_allocation_bytes(conditioner_fixed, device_page)?
             .checked_add(stored_allocation_bytes(decoder_fixed, device_page)?)
             .context("resident image fixed weights overflow")?;
@@ -1384,18 +1349,12 @@ impl ImageSession {
             (&spec, &image),
             &layout,
             (&transformer, &manifest),
-            &mut |sizing, owned| {
+            &mut |sizing, owned, bind_ffn| {
                 use crate::prefill::{DensePlacement, DenseStage, PricedDense, price_dense_stages};
-                let (free, total) = d.ctx.mem_get_info()?;
-                let host_available = usize::try_from(
-                    crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
-                )?;
-                let host = host_available.saturating_sub(4 << 30);
                 let fixed = device_fixed
                     .checked_add(stored_allocation_bytes(owned, device_page)?)
                     .context("resident image fixed weights overflow")?;
-                let device = DensePlacement::device_budget(free, total, fixed, 0, temporary)?;
-                let stages = [
+                let mut stages = [
                     DenseStage {
                         device: &conditioner_layers,
                         source: &conditioner_layers,
@@ -1411,10 +1370,61 @@ impl ImageSession {
                     DenseStage {
                         device: &decoder_layers,
                         source: &decoder_layers,
-                        visits: decoder_visits,
+                        visits: 1,
                         load_scratch: decoder_largest,
                     },
                 ];
+                let encoder = shape
+                    .reference
+                    .map(|extent| -> Result<_> {
+                        let encoder_blas = blas("image VAE encoder")?;
+                        let setup =
+                            ImageEncodeSetup::new(&d, (&vae_dir, &vae, &vae_manifest), extent)?;
+                        Ok((setup, encoder_blas))
+                    })
+                    .transpose()?;
+                let (encoder_work, encoder_transient) =
+                    encoder.as_ref().map_or((0, 0), |(setup, _)| {
+                        (setup.minimum_work(), setup.transient_bytes)
+                    });
+                let temporary =
+                    stored_allocation_bytes(temporary.max(encoder_transient), device_page)?;
+                let fixed_and_transient = fixed
+                    .checked_add(temporary)
+                    .context("resident image fixed and transient reserve overflow")?;
+                let pending = stages
+                    .iter()
+                    .try_fold(fixed_and_transient, |bytes, stage| {
+                        bytes
+                            .checked_add(stage.minimum_device_bytes(device_page)?)
+                            .context("resident image tier floor overflow")
+                    })?;
+                let decoder_floor = stored_allocation_bytes(
+                    ImageDecodeStage::minimum_work(&vae, shape.canvas)?,
+                    device_page,
+                )?;
+                let decoder_pending = pending
+                    .checked_add(decoder_floor)
+                    .context("resident image decoder floor overflow")?;
+                let ffn_pending = decoder_pending
+                    .checked_add(stored_allocation_bytes(encoder_work, device_page)?)
+                    .context("resident image encoder floor overflow")?;
+                let ffn = bind_ffn(ffn_pending)?;
+                let encode = encoder
+                    .map(|(setup, blas)| -> Result<_> {
+                        Ok((setup.bind(&d, decoder_pending)?, blas))
+                    })
+                    .transpose()?;
+                let decoder_work = ImageDecodeStage::prepare_work(&d, &vae, shape.canvas, pending)?;
+                let decoder_visits = decoder_work.visits();
+                stages[2].visits = decoder_visits;
+                d.ctx.synchronize()?;
+                let (free, total) = d.ctx.mem_get_info()?;
+                let host_available = usize::try_from(
+                    crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+                )?;
+                let host = host_available.saturating_sub(4 << 30);
+                let device = DensePlacement::device_budget(free, total, fixed, 0, temporary)?;
                 let PricedDense {
                     plans: [text, dit, decode],
                     device_bytes,
@@ -1438,11 +1448,12 @@ impl ImageSession {
                         "dit_visits": schedule.timesteps.len(), "decoder_visits": decoder_visits,
                     }})
                 );
-                later = Some((text, decode));
-                Ok((dit, device_after))
+                later = Some((text, decode, decoder_work, encode, temporary));
+                Ok((dit, device_after, ffn))
             },
         )?;
-        let (text_plan, decode_plan) = later.context("resident image placement was not bound")?;
+        let (text_plan, decode_plan, decoder_work, encode, temporary) =
+            later.context("resident image placement was not bound")?;
         let conditioner = Conditioner::with_plan(
             &d,
             &text_spec,

@@ -365,6 +365,14 @@ pub(crate) struct DenseStage<'a> {
 
 #[cfg(feature = "cuda")]
 impl DenseStage<'_> {
+    pub(crate) fn minimum_device_bytes(self, page: usize) -> Result<usize> {
+        self.choices(usize::MAX, page)?
+            .into_iter()
+            .map(|(bytes, _)| bytes)
+            .min()
+            .context("resident stage has no legal device tier")
+    }
+
     fn choices(self, limit: usize, page: usize) -> Result<Vec<(usize, DensePlacement)>> {
         ensure!(
             !self.device.is_empty()

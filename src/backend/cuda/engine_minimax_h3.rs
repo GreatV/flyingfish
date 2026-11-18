@@ -4582,8 +4582,12 @@ pub(crate) struct ImageDit {
 
 type ImageCaptured<'a> = (Option<&'a mut Vec<Vec<f32>>>, Option<&'a [Vec<f32>]>);
 
-type ImagePlacementChooser<'a> =
-    dyn FnMut(&DenseSizing, usize) -> Result<(crate::prefill::DensePlacement, usize)> + 'a;
+type ImagePlacementChooser<'a> = dyn FnMut(
+        &DenseSizing,
+        usize,
+        &mut dyn FnMut(usize) -> Result<FfnPlan>,
+    ) -> Result<(crate::prefill::DensePlacement, usize, FfnPlan)>
+    + 'a;
 
 enum ImagePlacement<'a> {
     Single(Placement),
@@ -4753,11 +4757,14 @@ impl ImageDit {
                 None,
             ),
             ImagePlacement::Resident(choose) => {
-                let (free, total) = d.ctx.mem_get_info()?;
-                let budget = d.workspace_budget(free, free, total / 16)?;
-                let chosen = bind_ffn(&mut work, blas, budget)?;
-                d.ctx.synchronize()?;
-                let (plan, device_after) = choose(&sizing, owned)?;
+                let (plan, device_after, chosen) = choose(&sizing, owned, &mut |later| {
+                    let (free, total) = d.ctx.mem_get_info()?;
+                    let reserved = (total / 16)
+                        .checked_add(later)
+                        .context("resident image FFN reserve overflow")?;
+                    let budget = d.workspace_budget(free, free, reserved)?;
+                    bind_ffn(&mut work, blas, budget)
+                })?;
                 #[cfg(test)]
                 let facts = {
                     let (free, total) = d.ctx.mem_get_info()?;
@@ -13554,6 +13561,7 @@ mod tests {
             (&layers, &layers, 8, fixed, later),
             super::Placement::Derived,
             (free, total, host),
+            2,
         )?;
         assert_eq!(facts.device_budget, 16);
         assert_eq!(plan.resident_bytes, 0);
@@ -13564,6 +13572,7 @@ mod tests {
                 (&layers, &layers, 8, fixed, later),
                 super::Placement::Derived,
                 (free - 1, total, host),
+                2,
             )
             .is_err()
         );

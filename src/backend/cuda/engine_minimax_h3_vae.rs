@@ -60,6 +60,7 @@ impl ImageKernels {
 
 struct ImageLimits {
     budget: usize,
+    reserved: usize,
     l2: usize,
     sms: usize,
     grid: usize,
@@ -76,12 +77,7 @@ struct ImagePlan {
 }
 
 impl ImagePlan {
-    fn derive(
-        spec: &VaeSpec,
-        tiles: &VaeTiles,
-        canvas: [usize; 2],
-        limits: ImageLimits,
-    ) -> Result<Self> {
+    fn sizing(spec: &VaeSpec, tiles: &VaeTiles, canvas: [usize; 2]) -> (usize, [u128; 3]) {
         let slots = tiles.count();
         let patches = tiles.height / spec.spatial_ratio * (tiles.width / spec.spatial_ratio);
         let tokens = patches + spec.registers + 1;
@@ -94,31 +90,36 @@ impl ImagePlan {
             * tiles.width as u128
             + 8 * pixels * spec.out_channels as u128
             + 4u128 * (grid_words + tokens * spec.rope_dims + spec.head_dim) as u128;
-        Self::derive_counts(spec, slots, patches, fixed, limits)
-    }
-
-    fn derive_counts(
-        spec: &VaeSpec,
-        slots: usize,
-        patches: usize,
-        fixed: u128,
-        limits: ImageLimits,
-    ) -> Result<Self> {
-        let tokens = patches + spec.registers + 1;
-        let s = 4u128 * tokens as u128 * spec.dim as u128;
-        let p = 4u128 * spec.heads as u128 * (tokens as u128).pow(2);
         let per_tile = 4u128 * tokens as u128 * (7 * spec.dim + 3 * spec.ffn) as u128
             + 4u128 * tokens as u128 * spec.patch_width() as u128
             + 8u128 * patches as u128 * spec.latent_channels as u128;
+        let scores = 4u128 * spec.heads as u128 * (tokens as u128).pow(2);
+        (patches, [fixed, per_tile, scores])
+    }
+
+    fn derive(
+        spec: &VaeSpec,
+        tiles: &VaeTiles,
+        canvas: [usize; 2],
+        limits: ImageLimits,
+    ) -> Result<Self> {
+        let slots = tiles.count();
+        let (patches, [fixed, per_tile, p]) = Self::sizing(spec, tiles, canvas);
+        let tokens = patches + spec.registers + 1;
+        let s = 4u128 * tokens as u128 * spec.dim as u128;
+        let budget = limits
+            .budget
+            .checked_sub(limits.reserved)
+            .context("image VAE budget holds no space after pending stages")?;
         ensure!(
             slots > 0 && patches > 0 && limits.sms > 0 && limits.grid > 0,
             "image VAE setup has an empty shape or device limit"
         );
         ensure!(
-            fixed + per_tile + p <= limits.budget as u128,
+            fixed + per_tile + p <= budget as u128,
             "image VAE serial tile requires {} bytes; workspace budget {}",
             fixed + per_tile + p,
-            limits.budget
+            budget
         );
         let cache_cap = (limits.l2 as u128 / (4 * s + p)).max(1) as usize;
         let wave = limits.sms.div_ceil(spec.heads);
@@ -127,14 +128,14 @@ impl ImagePlan {
         } else {
             cache_cap
         };
-        let score_cap = ((limits.budget as u128 - fixed - per_tile) / p) as usize;
+        let score_cap = ((budget as u128 - fixed - per_tile) / p) as usize;
         let mut attention = cache_cap.min(slots).min(score_cap).max(1);
         let launch_cap = (u32::MAX as usize / tokens / (2 * spec.ffn))
             .min(i32::MAX as usize / tokens)
             .min(limits.grid / tokens / spec.heads)
             .min(limits.grid.saturating_mul(256) / tokens / (2 * spec.ffn));
         loop {
-            let available = limits.budget as u128 - fixed - attention as u128 * p;
+            let available = budget as u128 - fixed - attention as u128 * p;
             let mut linear = (available / per_tile) as usize;
             linear = linear.min(slots).min(launch_cap);
             ensure!(
@@ -472,14 +473,14 @@ impl ImageDecoder {
     }
 
     fn work(&self, device: &Device, canvas: [usize; 2], budget: usize) -> Result<ImageWork> {
-        Self::work_for(device, &self.spec, canvas, budget)
+        Self::work_for(device, &self.spec, canvas, (budget, 0))
     }
 
     fn work_for(
         device: &Device,
         spec: &VaeSpec,
         canvas: [usize; 2],
-        budget: usize,
+        (budget, reserved): (usize, usize),
     ) -> Result<ImageWork> {
         use cudarc::driver::sys::CUdevice_attribute as A;
         ensure!(
@@ -499,6 +500,7 @@ impl ImageDecoder {
             canvas,
             ImageLimits {
                 budget,
+                reserved,
                 l2: usize::try_from(device.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?)?,
                 sms: usize::try_from(
                     device
@@ -1088,6 +1090,16 @@ pub(super) struct ImageDecodeStage {
 }
 
 impl ImageDecodeStage {
+    pub(super) fn minimum_work(spec: &VaeSpec, canvas: [usize; 2]) -> Result<usize> {
+        let tiles = VaeTiles::released(spec, canvas[0], canvas[1])?;
+        Ok(usize::try_from(
+            ImagePlan::sizing(spec, &tiles, canvas)
+                .1
+                .into_iter()
+                .sum::<u128>(),
+        )?)
+    }
+
     pub(super) fn prepare_work(
         device: &Device,
         spec: &VaeSpec,
@@ -1095,11 +1107,8 @@ impl ImageDecodeStage {
         later: usize,
     ) -> Result<ImageWork> {
         let (free, total) = device.ctx.mem_get_info()?;
-        let reserved = (total / 16)
-            .checked_add(later)
-            .context("resident image decoder reserve overflow")?;
-        let budget = device.workspace_budget(free, free, reserved)?;
-        ImageDecoder::work_for(device, spec, canvas, budget)
+        let budget = device.workspace_budget(free, free, total / 16)?;
+        ImageDecoder::work_for(device, spec, canvas, (budget, later))
     }
 
     pub(super) fn bind(
@@ -1137,15 +1146,21 @@ pub(super) struct ImageEncodeStage {
     work: EncodeWork,
     tiles: VaeTiles,
     extent: [usize; 2],
+}
+
+pub(super) struct ImageEncodeSetup {
+    encoder: KeyframeEncoder,
+    tiles: VaeTiles,
+    extent: [usize; 2],
+    sizing: (usize, [usize; 2]),
     pub(super) transient_bytes: usize,
 }
 
-impl ImageEncodeStage {
+impl ImageEncodeSetup {
     pub(super) fn new(
         device: &Device,
         (dir, spec, manifest): (&Path, &VaeSpec, &TensorManifest),
         extent: [usize; 2],
-        later: usize,
     ) -> Result<Self> {
         let [height, width] = extent;
         let pixels = height
@@ -1165,27 +1180,43 @@ impl ImageEncodeStage {
             .and_then(|n| n.checked_mul(4))
             .and_then(|n| n.checked_add(future))
             .context("resident image encoder transient extent overflow")?;
-        let (free, total) = device.ctx.mem_get_info()?;
-        let reserved = (total / 16)
-            .checked_add(later)
-            .and_then(|n| n.checked_add(transient_bytes))
-            .context("resident image encoder reserve overflow")?;
-        let budget = device.workspace_budget(free, free, reserved)?;
-        let work = EncodeWork::with_budget(
-            &device.stream,
-            &encoder,
-            (tiles.height, tiles.width),
-            budget,
-        )?;
+        let sizing = EncodeWork::sizing(&encoder, (tiles.height, tiles.width))?;
         Ok(Self {
             encoder,
-            work,
             tiles,
             extent,
+            sizing,
             transient_bytes,
         })
     }
 
+    pub(super) fn minimum_work(&self) -> usize {
+        let (activations, [minimum_columns, _]) = self.sizing;
+        4 * (5 * activations + minimum_columns)
+    }
+
+    pub(super) fn bind(self, device: &Device, later: usize) -> Result<ImageEncodeStage> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        let reserved = (total / 16)
+            .checked_add(later)
+            .context("resident image encoder reserve overflow")?;
+        let budget = device.workspace_budget(free, free, reserved)?;
+        let work = EncodeWork::allocate(
+            &device.stream,
+            (self.tiles.height, self.tiles.width),
+            self.sizing,
+            budget,
+        )?;
+        Ok(ImageEncodeStage {
+            encoder: self.encoder,
+            work,
+            tiles: self.tiles,
+            extent: self.extent,
+        })
+    }
+}
+
+impl ImageEncodeStage {
     pub(super) fn run(
         &mut self,
         device: &Device,
@@ -3272,9 +3303,16 @@ impl EncodeWork {
     fn with_budget(
         s: &Arc<CudaStream>,
         encoder: &KeyframeEncoder,
-        (height, width): (usize, usize),
+        tile: (usize, usize),
         budget: usize,
     ) -> Result<Self> {
+        Self::allocate(s, tile, Self::sizing(encoder, tile)?, budget)
+    }
+
+    fn sizing(
+        encoder: &KeyframeEncoder,
+        (height, width): (usize, usize),
+    ) -> Result<(usize, [usize; 2])> {
         let activations = encoder
             .convolutions((height, width))
             .iter()
@@ -3294,13 +3332,6 @@ impl EncodeWork {
                 .max()
                 .context("encoder without spatial convolutions")
         };
-        let fixed = 5 * activations * 4;
-        let available = budget
-            .checked_sub(fixed)
-            .context("encoder budget holds no activation set")?;
-        let workspace = columns((height, width))?
-            .min(columns((VAE_TILE, VAE_TILE))?)
-            .min(available / 4);
         let minimum = encoder
             .convolutions((height, width))
             .iter()
@@ -3308,6 +3339,21 @@ impl EncodeWork {
             .map(|(c, ..)| 4 * c.columns())
             .max()
             .context("encoder without spatial convolutions")?;
+        let maximum = columns((height, width))?.min(columns((VAE_TILE, VAE_TILE))?);
+        Ok((activations, [minimum, maximum]))
+    }
+
+    fn allocate(
+        s: &Arc<CudaStream>,
+        (height, width): (usize, usize),
+        (activations, [minimum, maximum]): (usize, [usize; 2]),
+        budget: usize,
+    ) -> Result<Self> {
+        let fixed = 5 * activations * 4;
+        let available = budget
+            .checked_sub(fixed)
+            .context("encoder budget holds no activation set")?;
+        let workspace = maximum.min(available / 4);
         ensure!(
             workspace >= minimum,
             "encoder im2col budget needs at least {} bytes",
@@ -3375,6 +3421,7 @@ mod image_tests {
         let tiles = VaeTiles::released(&spec, 4096, 4096)?;
         let limits = |budget, grid| ImageLimits {
             budget,
+            reserved: 0,
             l2: 75_497_472,
             sms: 128,
             grid,
@@ -3391,6 +3438,38 @@ mod image_tests {
             1_841_616
         );
         let serial_bytes = 775_026_440;
+        assert_eq!(
+            ImageDecodeStage::minimum_work(&spec, [4096, 4096])?,
+            serial_bytes
+        );
+        assert_eq!(plan.bytes, 10_117_268_168);
+        let available = 8 << 30;
+        let pending = 4 << 30;
+        let old = ImagePlan::derive(
+            &spec,
+            &tiles,
+            [4096, 4096],
+            limits(available, i32::MAX as usize),
+        )?;
+        assert_eq!(
+            (old.linear, old.attention, old.bytes),
+            (368, 8, 8_572_368_584)
+        );
+        assert!(old.bytes + pending > available);
+        let constrained = ImagePlan::derive(
+            &spec,
+            &tiles,
+            [4096, 4096],
+            ImageLimits {
+                reserved: pending,
+                ..limits(available, i32::MAX as usize)
+            },
+        )?;
+        assert_eq!(
+            (constrained.linear, constrained.attention, constrained.bytes),
+            (160, 8, 4_170_462_920)
+        );
+        assert!(constrained.bytes + pending <= available);
         assert!(
             ImagePlan::derive(
                 &spec,
