@@ -115,17 +115,21 @@ fn condition(
         device,
         blas,
         model,
-        &ConditionerPrompt {
-            modality: request
-                .token_ids
-                .iter()
-                .map(|&id| u8::from(id == image_token))
-                .collect(),
-            tokens: request.token_ids.clone(),
-            grids: request.grids.clone(),
-            pixels: request.pixel_values.clone(),
-        },
+        &video_conditioner_prompt(request, image_token),
     )
+}
+
+fn video_conditioner_prompt(request: &H3Request, image_token: u32) -> ConditionerPrompt {
+    ConditionerPrompt {
+        modality: request
+            .token_ids
+            .iter()
+            .map(|&id| u8::from(id == image_token))
+            .collect(),
+        tokens: request.token_ids.clone(),
+        grids: request.grids.clone(),
+        pixels: request.pixel_values.clone(),
+    }
 }
 
 fn condition_prompt(
@@ -282,27 +286,62 @@ fn keyframes(
         return Ok(Vec::new());
     }
     let eps = eps.context("keyframes require posterior noise")?;
-    let s = &device.stream;
     let spec = VaeSpec::read(model)?;
     let vae_dir = model.join("vae");
     let manifest = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?
         .minimax_h3_vae_manifest(&spec)?;
-    let encoder = KeyframeEncoder::new(device, &spec, &vae_dir, &manifest)?;
-    let tiles = VaeTiles::released(&spec, request.height, request.width)?;
-    let mut work = EncodeWork::new(s, &encoder, (tiles.height, tiles.width))?;
-    let mut anchors = Vec::with_capacity(request.keyframes.len());
-    for (_, pixels) in &request.keyframes {
-        let frame = s.clone_htod(pixels)?;
-        let [_, _, latents] = encoder.encode(
-            (s, blas),
-            &mut work,
-            &tiles,
-            (&frame, request.height, request.width),
-            eps,
-        )?;
-        anchors.push(s.clone_dtoh(&latents)?);
+    let mut stage = VideoEncodeStage::new(
+        device,
+        (&spec, &vae_dir, &manifest),
+        [request.height, request.width],
+    )?;
+    stage.run(device, blas, request, eps)
+}
+
+struct VideoEncodeStage {
+    encoder: KeyframeEncoder,
+    tiles: VaeTiles,
+    work: EncodeWork,
+}
+
+impl VideoEncodeStage {
+    fn new(
+        device: &Device,
+        (spec, dir, manifest): (&VaeSpec, &Path, &TensorManifest),
+        [height, width]: [usize; 2],
+    ) -> Result<Self> {
+        let encoder = KeyframeEncoder::new(device, spec, dir, manifest)?;
+        let tiles = VaeTiles::released(spec, height, width)?;
+        let work = EncodeWork::new(&device.stream, &encoder, (tiles.height, tiles.width))?;
+        Ok(Self {
+            encoder,
+            tiles,
+            work,
+        })
     }
-    Ok(anchors)
+
+    fn run(
+        &mut self,
+        device: &Device,
+        blas: &Blas,
+        request: &H3Request,
+        eps: &CudaSlice<f32>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let s = &device.stream;
+        let mut anchors = Vec::with_capacity(request.keyframes.len());
+        for (_, pixels) in &request.keyframes {
+            let frame = s.clone_htod(pixels)?;
+            let [_, _, latents] = self.encoder.encode(
+                (s, blas),
+                &mut self.work,
+                &self.tiles,
+                (&frame, request.height, request.width),
+                eps,
+            )?;
+            anchors.push(s.clone_dtoh(&latents)?);
+        }
+        Ok(anchors)
+    }
 }
 
 /// Resident BF16 and F32 video weights plus the published F32 audio weights.
@@ -491,6 +530,119 @@ fn prepare_transformer(
     Ok((dit, table, adaln_plan, video_grid, audio_grid, scale))
 }
 
+struct VideoNoise {
+    posterior_eps: Option<CudaSlice<f32>>,
+    anchor: Vec<f32>,
+    video: Vec<f32>,
+    audio: CudaSlice<f32>,
+}
+
+fn video_noise(
+    (device, normal): (&Device, &crate::backend::gpu::CudaFunction),
+    (spec, vae): (&H3Spec, &VaeSpec),
+    (geometry, layout): (&Geometry, &PackedLayout),
+    request: &H3Request,
+    draws: &NoiseDraws,
+) -> Result<VideoNoise> {
+    let s = &device.stream;
+    let (r, lc) = (vae.spatial_ratio, vae.latent_channels);
+    let (lh, lw) = (request.height / r, request.width / r);
+    let plane = lh * lw;
+    let latent_frames = geometry.latent_frames;
+    let (anchor_count, video_count) = (lc * plane, lc * latent_frames * plane);
+    let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
+
+    let condition_count = anchor_count
+        .checked_mul(request.keyframes.len())
+        .context("conditioning noise extent overflow")?;
+    let posterior_eps = if request.keyframes.is_empty() {
+        None
+    } else {
+        Some(draws.draw(device, normal, 0, anchor_count)?)
+    };
+    let anchor_noise = if condition_count == 0 {
+        Vec::new()
+    } else {
+        let draw = draws.draw(device, normal, 1, condition_count)?;
+        s.clone_dtoh(&draw)?
+    };
+    let video_noise = {
+        let draw = draws.draw(device, normal, 2, video_count)?;
+        s.clone_dtoh(&draw)?
+    };
+    let audio = draws.draw(device, normal, 3, audio_count)?;
+
+    Ok(VideoNoise {
+        posterior_eps,
+        anchor: anchor_noise,
+        video: video_noise,
+        audio,
+    })
+}
+
+fn video_rows(
+    (spec, vae): (&H3Spec, &VaeSpec),
+    (geometry, layout): (&Geometry, &PackedLayout),
+    request: &H3Request,
+    noise: &VideoNoise,
+    (anchors, text): (&[Vec<f32>], &[bf16]),
+) -> Result<Vec<f32>> {
+    let (r, lc) = (vae.spatial_ratio, vae.latent_channels);
+    let (lh, lw) = (request.height / r, request.width / r);
+    let plane = lh * lw;
+    let latent_frames = geometry.latent_frames;
+    let (anchor_count, video_count) = (lc * plane, lc * latent_frames * plane);
+    let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
+
+    let VideoNoise {
+        anchor: anchor_noise,
+        video: video_noise,
+        audio,
+        ..
+    } = noise;
+    let condition_count = anchor_count
+        .checked_mul(request.keyframes.len())
+        .context("conditioning noise extent overflow")?;
+    let patch = spec.patch;
+    let condition_rows = {
+        let t = KEYFRAME_NOISE_AUG as f32;
+        let mixed: Vec<f32> = anchors
+            .iter()
+            .flatten()
+            .zip(anchor_noise)
+            .map(|(&x, &n)| t * x + (1.0 - t) * n)
+            .collect();
+        let mut rows = Vec::with_capacity(condition_count);
+        for anchor in mixed.chunks_exact(anchor_count) {
+            patchify_latents_into(anchor, (lc, 1, lh, lw), [1, patch[1], patch[2]], &mut rows);
+        }
+        rows
+    };
+    let width = spec.video_row_width();
+    ensure!(
+        anchors.len() == request.keyframes.len()
+            && anchors.iter().all(|anchor| anchor.len() == anchor_count)
+            && condition_rows.len() == layout.condition_video_rows * width
+            && video_noise.len() == video_count
+            && (layout.video_indices.len() - layout.condition_video_rows) * width == video_count
+            && audio.len() == audio_count
+            && request.text_tags.len() == text.len() / spec.text_dim,
+        "native draws do not match the packed layout: anchor {}, video {}, audio {}, text rows {}",
+        anchor_noise.len(),
+        video_noise.len(),
+        audio.len(),
+        request.text_tags.len()
+    );
+    let mut video_rows = condition_rows;
+    patchify_latents_into(
+        video_noise,
+        (lc, latent_frames, lh, lw),
+        patch,
+        &mut video_rows,
+    );
+    Ok(video_rows)
+}
+
 fn run_mode<const SETUP_ONLY: bool>(
     (model, transformer): (&Path, &Path),
     lora: Option<&Path>,
@@ -525,45 +677,20 @@ fn run_mode<const SETUP_ONLY: bool>(
     let vae = VaeSpec::read(model)?;
     let audio_spec = AudioVaeSpec::read(model)?;
     let (geometry, layout) = request.layout(&spec)?;
-    let (r, lc) = (vae.spatial_ratio, vae.latent_channels);
-    let (lh, lw) = (request.height / r, request.width / r);
-    let plane = lh * lw;
-    let latent_frames = geometry.latent_frames;
-    let (anchor_count, video_count) = (lc * plane, lc * latent_frames * plane);
-    let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
-
     let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
-    let condition_count = anchor_count
-        .checked_mul(request.keyframes.len())
-        .context("conditioning noise extent overflow")?;
-    let posterior_eps = if request.keyframes.is_empty() {
-        None
-    } else {
-        Some(draws.draw(&device, &normal, 0, anchor_count)?)
-    };
-    let anchor_noise = if condition_count == 0 {
-        Vec::new()
-    } else {
-        let draw = draws.draw(&device, &normal, 1, condition_count)?;
-        s.clone_dtoh(&draw)?
-    };
-    let video_noise = {
-        let draw = draws.draw(&device, &normal, 2, video_count)?;
-        s.clone_dtoh(&draw)?
-    };
-    let audio = draws.draw(&device, &normal, 3, audio_count)?;
-
-    #[cfg(not(test))]
-    let (text, anchors) = (
-        condition(&device, &mut blas, model, request)?,
-        keyframes(&device, &blas, model, request, posterior_eps.as_ref())?,
-    );
-    #[cfg(test)]
+    let noise = video_noise(
+        (&device, &normal),
+        (&spec, &vae),
+        (&geometry, &layout),
+        request,
+        &draws,
+    )?;
     let (text, anchors) = match &draws {
+        #[cfg(test)]
         NoiseDraws::Recorded(input) => (input.conditioner.clone(), input.anchors.clone()),
         NoiseDraws::Seed(_) => (
             condition(&device, &mut blas, model, request)?,
-            keyframes(&device, &blas, model, request, posterior_eps.as_ref())?,
+            keyframes(&device, &blas, model, request, noise.posterior_eps.as_ref())?,
         ),
     };
     #[cfg(test)]
@@ -577,46 +704,17 @@ fn run_mode<const SETUP_ONLY: bool>(
         NoiseDraws::Seed(_) => None,
     };
 
-    let patch = spec.patch;
-    let condition_rows = {
-        let t = KEYFRAME_NOISE_AUG as f32;
-        let mixed: Vec<f32> = anchors
-            .iter()
-            .flatten()
-            .zip(&anchor_noise)
-            .map(|(&x, &n)| t * x + (1.0 - t) * n)
-            .collect();
-        let mut rows = Vec::with_capacity(condition_count);
-        for anchor in mixed.chunks_exact(anchor_count) {
-            patchify_latents_into(anchor, (lc, 1, lh, lw), [1, patch[1], patch[2]], &mut rows);
-        }
-        rows
-    };
-    let width = spec.video_row_width();
-    ensure!(
-        anchors.len() == request.keyframes.len()
-            && anchors.iter().all(|anchor| anchor.len() == anchor_count)
-            && condition_rows.len() == layout.condition_video_rows * width
-            && video_noise.len() == video_count
-            && (layout.video_indices.len() - layout.condition_video_rows) * width == video_count
-            && audio.len() == audio_count
-            && request.text_tags.len() == text.len() / spec.text_dim,
-        "native draws do not match the packed layout: anchor {}, video {}, audio {}, text rows {}",
-        anchor_noise.len(),
-        video_noise.len(),
-        audio.len(),
-        request.text_tags.len()
-    );
-    let mut video_rows = condition_rows;
-    patchify_latents_into(
-        &video_noise,
-        (lc, latent_frames, lh, lw),
-        patch,
-        &mut video_rows,
-    );
+    let video_rows = video_rows(
+        (&spec, &vae),
+        (&geometry, &layout),
+        request,
+        &noise,
+        (&anchors, &text),
+    )?;
+    let audio = &noise.audio;
     #[cfg(test)]
     if let Some(replay) = &mut replay {
-        replay.initial = (video_rows.clone(), s.clone_dtoh(&audio)?);
+        replay.initial = (video_rows.clone(), s.clone_dtoh(audio)?);
     }
 
     let (video, audio, free_before, mut hoist) = {
@@ -651,7 +749,7 @@ fn run_mode<const SETUP_ONLY: bool>(
             &context,
             (&table, &adaln_plan),
             (&video_grid, &audio_grid),
-            (&video, &audio),
+            (&video, audio),
             &text,
         )?;
         #[cfg(test)]
@@ -665,7 +763,7 @@ fn run_mode<const SETUP_ONLY: bool>(
                 .take()
                 .context("RUNNER_FAIL refiner trace missing")?;
         }
-        let (video, audio) = (s.clone_dtoh(&video)?, s.clone_dtoh(&audio)?);
+        let (video, audio) = (s.clone_dtoh(&video)?, s.clone_dtoh(audio)?);
         (video, audio, device.ctx.mem_get_info()?.0, hoist)
     };
     s.synchronize()?;
@@ -1181,7 +1279,7 @@ impl ImageInput {
     }
 }
 
-struct ImageTextStage {
+struct ConditionerStage {
     dir: PathBuf,
     spec: crate::model_spec::ModelSpec,
     manifest: TensorManifest,
@@ -1191,7 +1289,9 @@ struct ImageTextStage {
     image_token: u32,
 }
 
-fn image_vision_input(prompt: &ConditionerPrompt) -> crate::vision_input::MultimodalInput<'_> {
+fn conditioner_vision_input(
+    prompt: &ConditionerPrompt,
+) -> crate::vision_input::MultimodalInput<'_> {
     crate::vision_input::MultimodalInput {
         input_ids: &prompt.tokens,
         modality_ids: &prompt.modality,
@@ -1201,12 +1301,12 @@ fn image_vision_input(prompt: &ConditionerPrompt) -> crate::vision_input::Multim
     }
 }
 
-impl ImageTextStage {
+impl ConditionerStage {
     fn run(&mut self, device: &Device, prompt: &ConditionerPrompt) -> Result<Vec<bf16>> {
         let runs = image_runs(&prompt.tokens, self.image_token);
         ensure!(
             runs.is_empty() == self.vision.is_none(),
-            "resident image vision input changed"
+            "resident vision input changed"
         );
         let table = conditioner_table(
             &self.dir,
@@ -1219,7 +1319,7 @@ impl ImageTextStage {
             .vision
             .as_ref()
             .map(|tower| -> Result<_> {
-                let input = image_vision_input(prompt);
+                let input = conditioner_vision_input(prompt);
                 let prepared =
                     tower.prepare(device, &mut self.blas, &input, prompt.tokens.len(), 0)?;
                 let encoded = tower.encode(&device.stream, &self.blas, prepared, None)?;
@@ -1258,7 +1358,7 @@ pub struct ImageSession {
     layout: ImageLayout,
     d: Device,
     normal: crate::backend::gpu::CudaFunction,
-    text: ImageTextStage,
+    text: ConditionerStage,
     dit: ImageDit,
     table: AdalnTable,
     adaln: AdalnPlan,
@@ -1293,7 +1393,11 @@ impl ImageSession {
             let ImageInput { shape, prompt } = ImageInput::read(model, &image, &first)?;
             let count = prompt.tokens.len();
             let media = if shape.reference.is_some() {
-                LayerNormTower::request_bytes(&text_spec, &image_vision_input(&prompt), count)?
+                LayerNormTower::request_bytes(
+                    &text_spec,
+                    &conditioner_vision_input(&prompt),
+                    count,
+                )?
             } else {
                 0
             };
@@ -1511,7 +1615,7 @@ impl ImageSession {
             free >= required,
             "resident image setup needs {required} free bytes for transient work and reserve, found {free}"
         );
-        let text = ImageTextStage {
+        let text = ConditionerStage {
             dir,
             spec: text_spec,
             manifest: text_manifest,
