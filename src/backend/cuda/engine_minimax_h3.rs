@@ -272,9 +272,9 @@ impl EntryReader {
         self.read_range(name, entry, 0, entry.bytes)
     }
 
-    /// Fills the pinned windows with one aligned direct read each, four shards in flight.
-    /// Readers are opened first on this thread; each worker then owns whole shard queues,
-    /// so every destination is touched by exactly one thread.
+    /// Fills the pinned windows with one aligned direct read each. Readers are opened
+    /// first on this thread; workers then claim single tensors round-robin across the
+    /// shard queues, so every destination is written by exactly one worker.
     fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>]) -> Result<()> {
         let mut spans: Vec<(*mut u8, usize)> = requests
             .iter()
@@ -302,7 +302,17 @@ impl EntryReader {
                 .push(index);
         }
         let queues: Vec<Vec<usize>> = queues.into_values().collect();
-        let in_flight = queues.len().clamp(1, 4);
+        let total: usize = queues.iter().map(Vec::len).sum();
+        let mut order = Vec::with_capacity(total);
+        let deepest = queues.iter().map(Vec::len).max().unwrap_or(0);
+        for position in 0..deepest {
+            for queue in &queues {
+                if let Some(&index) = queue.get(position) {
+                    order.push(index);
+                }
+            }
+        }
+        let in_flight = (2 * queues.len()).clamp(4, 8).min(order.len()).max(1);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let batch = DirectBatch(requests.as_mut_ptr().cast::<u8>());
         let batch = &batch;
@@ -310,28 +320,25 @@ impl EntryReader {
             let handles: Vec<_> = (0..in_flight)
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {
+                        let mut bounce = AlignedBytes::new(align_min(), align_min())?;
                         loop {
-                            let queue = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let Some(queue) = queues.get(queue) else {
+                            let claimed = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let Some(&index) = order.get(claimed) else {
                                 return Ok(());
                             };
-                            let mut bounce = AlignedBytes::new(align_min(), align_min())?;
-                            for &index in queue {
-                                // SAFETY: each index is owned by exactly one queue and
-                                // therefore one worker; the window is within the arena.
-                                let request =
-                                    unsafe { &mut *(batch.0 as *mut DirectRead).add(index) };
-                                let destination = unsafe {
-                                    std::slice::from_raw_parts_mut(request.dest, request.dest_len)
-                                };
-                                Self::read_bounced(
-                                    readers,
-                                    request.name,
-                                    request.entry,
-                                    destination,
-                                    &mut bounce,
-                                )?;
-                            }
+                            // SAFETY: each index is claimed by exactly one worker;
+                            // the window is within the arena.
+                            let request = unsafe { &mut *(batch.0 as *mut DirectRead).add(index) };
+                            let destination = unsafe {
+                                std::slice::from_raw_parts_mut(request.dest, request.dest_len)
+                            };
+                            Self::read_bounced(
+                                readers,
+                                request.name,
+                                request.entry,
+                                destination,
+                                &mut bounce,
+                            )?;
                         }
                     })
                 })
