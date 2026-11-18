@@ -930,7 +930,7 @@ __device__ __forceinline__ void frame_im2col(
                     value.w = value_at(col + 3);
                     *reinterpret_cast<float4*>(a + r * cols + col) = value;
                 } else {
-                    const uint64_t end = (col + 4).min(cols);
+                    const uint64_t end = col + 4 < cols ? col + 4 : cols;
                     for (uint64_t index = col; index < end; ++index) a[r * cols + index] = T(value_at(index));
                 }
             }
