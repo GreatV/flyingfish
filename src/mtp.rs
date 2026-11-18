@@ -268,6 +268,55 @@ impl AttachmentBudget {
 pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
     use crate::{model_spec::Mixer, op_contract::GdnSpec};
     ensure!(rows > 0, "empty checkpoint window");
+    if spec.architecture == Architecture::DeepseekV41 {
+        let ds = spec
+            .deepseek_v41
+            .as_ref()
+            .context("latent journal model geometry")?;
+        ensure!(
+            spec.head_dim == 512 && rows <= ds.window_size as usize,
+            "latent journal ring geometry"
+        );
+        let mut bytes = 36usize;
+        for _ in &spec.layers {
+            bytes = rows
+                .checked_mul(528)
+                .and_then(|n| bytes.checked_add(n))
+                .context("latent ring journal bytes overflow")?;
+        }
+        for &owner in &ds.kv_source_layer_ids {
+            if owner as usize >= spec.layers.len() {
+                continue;
+            }
+            let ratio = usize::from(ds.compress_ratios[owner as usize]);
+            if ratio == 0 {
+                continue;
+            }
+            bytes = rows
+                .div_ceil(ratio)
+                .checked_mul(356)
+                .and_then(|n| n.checked_add(8192 + 24))
+                .and_then(|n| bytes.checked_add(n))
+                .context("compressed journal bytes overflow")?;
+        }
+        for &owner in &ds.index_source_layer_ids {
+            if owner as usize >= spec.layers.len() || ds.compress_ratios[owner as usize] == 0 {
+                continue;
+            }
+            bytes = rows
+                .checked_mul(ds.selection.index_topk as usize)
+                .and_then(|n| n.checked_mul(4))
+                .and_then(|n| n.checked_add(20))
+                .and_then(|n| bytes.checked_add(n))
+                .context("selection journal bytes overflow")?;
+        }
+        return rows
+            .checked_mul(ds.selection.candidate_topk_blocks as usize)
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_add(24))
+            .and_then(|n| bytes.checked_add(n))
+            .context("candidate journal bytes overflow");
+    }
     let kv = rows
         .checked_mul(spec.kv_heads as usize)
         .and_then(|n| n.checked_mul(spec.head_dim as usize))

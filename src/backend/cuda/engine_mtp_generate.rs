@@ -55,8 +55,11 @@ impl Engine {
         let spec = crate::model_spec::ModelSpec::read(dir)?;
         ensure!(
             spec.architecture.mtp_decode(),
-            "MTP generation is supported only for Qwen3.8 text"
+            "MTP generation architecture is not bound"
         );
+        if spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            ensure!((1..=3).contains(&depth), "D1 DSpark depth must be 1..=3");
+        }
         if let Some(ids) = prompt {
             ensure!(
                 ids.iter().all(|&t| t < spec.vocab),
@@ -67,7 +70,8 @@ impl Engine {
         let load_start = Instant::now();
         let mut settings = options.backend.clone();
         settings.spec_budget = SpecBudget::Chain;
-        settings.spec_graph = false;
+        settings.spec_graph =
+            spec.architecture == crate::model_spec::Architecture::DeepseekV41 && graph;
         let mut engine = Self::load_kind_for(
             dir,
             options.device,
@@ -77,14 +81,27 @@ impl Engine {
             SetupMode::Mtp { verify_rows },
         )?;
         ensure!(prompt.is_none_or(|p| p > 0), "empty MTP prompt");
-        engine.mtp_enable_resident(mtp)?;
-        if engine.model_spec.architecture != crate::model_spec::Architecture::Glm5Next {
-            engine.mtp_batch_enable()?;
+        if engine.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            let native = engine
+                .spec
+                .as_ref()
+                .and_then(|s| s.staged.as_ref())
+                .context("staged target state missing")?;
+            ensure!(
+                native.options.depth == depth && native.options.graph == graph,
+                "staged request differs from setup"
+            );
+            engine.closure.assert_ready()?;
+        } else {
+            engine.mtp_enable_resident(mtp)?;
+            if engine.model_spec.architecture != crate::model_spec::Architecture::Glm5Next {
+                engine.mtp_batch_enable()?;
+            }
+            if graph {
+                engine.capture()?;
+            }
+            engine.closure.ready(load_start)?;
         }
-        if graph {
-            engine.capture()?;
-        }
-        engine.closure.ready(load_start)?;
         let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
         Ok((engine, load_ms))
     }

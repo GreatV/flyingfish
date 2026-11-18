@@ -56,6 +56,8 @@ pub struct W8A8Inputs<'a> {
     pub weights: &'a W8A8SharedWeights,
     /// The SwiGLU clamp limit.
     pub swiglu_limit: f32,
+    #[cfg(test)]
+    pub projection_capture: Option<Tensor<bf16, 2>>,
 }
 
 /// Derived extents of one call.
@@ -195,8 +197,8 @@ fn validate(
 /// The shared expert's W8A8 decode contribution.
 pub struct MoeSharedW8A8 {
     act_quant: CudaFunction,
-    gate_up: CudaFunction,
-    down: CudaFunction,
+    gate_up: [CudaFunction; 2],
+    down: [CudaFunction; 2],
 }
 
 pub(crate) struct W8A8BlockCall<'a> {
@@ -256,8 +258,14 @@ impl MoeSharedW8A8 {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             act_quant: module.load_function("moe_act_quant_e4m0")?,
-            gate_up: module.load_function("moe_ffn_gate_up_e4m3_block32")?,
-            down: module.load_function("moe_ffn_down_e4m3_block32")?,
+            gate_up: [
+                module.load_function("moe_ffn_gate_up_e4m3_block32")?,
+                module.load_function("moe_ffn_gate_up_e4m3_block32_exact")?,
+            ],
+            down: [
+                module.load_function("moe_ffn_down_e4m3_block32")?,
+                module.load_function("moe_ffn_down_e4m3_block32_exact")?,
+            ],
         })
     }
 
@@ -265,7 +273,7 @@ impl MoeSharedW8A8 {
     ///
     /// `scratch` holds the activation codes and scales, the BF16 hidden state
     /// and the down-input codes and scales; `scratch_bytes` sizes it.
-    pub fn run(
+    pub fn run<const ACCURATE: bool>(
         &self,
         stream: &Arc<CudaStream>,
         input: W8A8Inputs<'_>,
@@ -275,6 +283,7 @@ impl MoeSharedW8A8 {
         let dims = validate(input, scratch, &out.0)?;
         let hidden = dims.hidden;
         let intermediate = dims.intermediate;
+        let (hidden_i32, intermediate_i32) = (hidden as i32, intermediate as i32);
         let (offsets, _) = scratch_layout(hidden, intermediate);
         let codes = scratch.ptr + offsets[0];
         let scales = scratch.ptr + offsets[1];
@@ -284,6 +293,22 @@ impl MoeSharedW8A8 {
         let groups = hidden / W8A8_SCALE_BLOCK;
         let shared_gate_up = u64::from(hidden) + u64::from(groups);
         let shared_down = u64::from(intermediate) + u64::from(intermediate / W8A8_SCALE_BLOCK);
+        let projected = 0u64;
+        #[cfg(test)]
+        let projected = if let Some(capture) = input.projection_capture {
+            capture.validate()?;
+            ensure!(
+                capture.shape == [3, intermediate]
+                    && capture.stride == [u64::from(intermediate), 1],
+                "W8A8 projection capture extent"
+            );
+            no_overlap(&capture, scratch, "capture", "scratch")?;
+            no_overlap(&capture, &input.x, "capture", "x")?;
+            no_overlap(&capture, &out.0, "capture", "out")?;
+            capture.ptr
+        } else {
+            projected
+        };
         unsafe {
             stream
                 .launch_builder(&self.act_quant)
@@ -296,23 +321,25 @@ impl MoeSharedW8A8 {
                     block_dim: (W8A8_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
-            stream
-                .launch_builder(&self.gate_up)
-                .arg(&codes)
+            let mut gate = stream.launch_builder(&self.gate_up[usize::from(ACCURATE)]);
+            gate.arg(&codes)
                 .arg(&scales)
                 .arg(&input.weights.gate_codes.ptr)
                 .arg(&input.weights.gate_scales.ptr)
                 .arg(&input.weights.up_codes.ptr)
                 .arg(&input.weights.up_scales.ptr)
                 .arg(&state)
-                .arg(&(hidden as i32))
-                .arg(&(intermediate as i32))
-                .arg(&input.swiglu_limit)
-                .launch(LaunchConfig {
-                    grid_dim: (intermediate.div_ceil(W8A8_ROWS), 1, 1),
-                    block_dim: (W8A8_THREADS, 1, 1),
-                    shared_mem_bytes: shared_gate_up as u32,
-                })?;
+                .arg(&hidden_i32)
+                .arg(&intermediate_i32)
+                .arg(&input.swiglu_limit);
+            if ACCURATE {
+                gate.arg(&projected);
+            }
+            gate.launch(LaunchConfig {
+                grid_dim: (intermediate.div_ceil(W8A8_ROWS), 1, 1),
+                block_dim: (W8A8_THREADS, 1, 1),
+                shared_mem_bytes: shared_gate_up as u32,
+            })?;
             stream
                 .launch_builder(&self.act_quant)
                 .arg(&state)
@@ -325,7 +352,7 @@ impl MoeSharedW8A8 {
                     shared_mem_bytes: 0,
                 })?;
             stream
-                .launch_builder(&self.down)
+                .launch_builder(&self.down[usize::from(ACCURATE)])
                 .arg(&down_codes)
                 .arg(&down_scales)
                 .arg(&input.weights.down_codes.ptr)
@@ -742,6 +769,7 @@ mod tests {
             x,
             weights: &weights,
             swiglu_limit: LIMIT,
+            projection_capture: None,
         };
         validate(input, &scratch.0, &out.0).expect("valid w8a8 extents");
         let check = |error: Result<W8A8Dims>, expected: &str| {
@@ -910,15 +938,16 @@ mod tests {
                 x,
                 weights: &weights,
                 swiglu_limit: LIMIT,
+                projection_capture: None,
             };
-            ops.run(s, input, &scratch_view.0, &mut out_view)?;
+            ops.run::<false>(s, input, &scratch_view.0, &mut out_view)?;
             let mut wrong_weights = weights;
             wrong_weights.gate_scales = wrong_scales;
             let wrong_input = W8A8Inputs {
                 weights: &wrong_weights,
                 ..input
             };
-            ops.run(s, wrong_input, &scratch_view.0, &mut wrong_view)?;
+            ops.run::<false>(s, wrong_input, &scratch_view.0, &mut wrong_view)?;
             s.synchronize()?;
             let host = s.clone_dtoh(&out)?;
             let wrong_host = s.clone_dtoh(&wrong_out)?;

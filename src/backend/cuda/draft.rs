@@ -50,7 +50,7 @@ struct BlockAttention {
 }
 
 impl BlockAttention {
-    fn new(draft: &Draft, device: &Device) -> Result<Self> {
+    fn new(draft: &Dense, device: &Device) -> Result<Self> {
         use crate::op_contract::{AttentionLimits, FullAttentionSpec};
         let c = &draft.config;
         let s = &device.stream;
@@ -235,7 +235,331 @@ struct Kv {
     v: CudaSlice<bf16>,
 }
 
+type StagedDraft = super::engine::deepseek::staged::StagedDraft;
+
 pub struct Draft {
+    pub config: DraftConfig,
+    runtime: Runtime,
+}
+
+enum Runtime {
+    Dense(Box<Dense>),
+    Staged(Box<StagedDraft>),
+}
+
+impl Draft {
+    #[cfg(all(test, feature = "cuda"))]
+    pub(super) fn staged_bits(&self) -> Result<Vec<u8>> {
+        match &self.runtime {
+            Runtime::Staged(d) => d.test_bits(),
+            Runtime::Dense(_) => anyhow::bail!("staged output gate requires a native draft"),
+        }
+    }
+
+    pub fn new(
+        path: &Path,
+        device: &Device,
+        target: &Config,
+        capacity: usize,
+        rows: usize,
+        blas: &mut Blas,
+        rounding: super::markov::ScoreRounding,
+    ) -> Result<Self> {
+        let config = DraftConfig::read(path, target)?;
+        let runtime = if config.staged.is_some() {
+            ensure!(
+                rounding == super::markov::ScoreRounding::F32,
+                "native DSpark requires F32 scores"
+            );
+            Runtime::Staged(Box::new(StagedDraft::load(
+                path,
+                device,
+                config.clone(),
+                capacity,
+                rows,
+                blas,
+            )?))
+        } else {
+            Runtime::Dense(Box::new(Dense::new(
+                path, device, target, capacity, rows, blas, rounding,
+            )?))
+        };
+        Ok(Self { config, runtime })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn prepare_linears(
+        &self,
+        head: &CudaSlice<bf16>,
+        blas: &mut Blas,
+        profile: &super::closure::Profile,
+        write: bool,
+    ) -> Result<()> {
+        match &self.runtime {
+            Runtime::Dense(d) => d.prepare_linears(head, blas, profile, write),
+            Runtime::Staged(_) => {
+                ensure!(!write, "native DSpark uses derived projection plans");
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn calibrate_shape(
+        &self,
+        blas: &mut Blas,
+        input: &crate::backend::gpu::CudaView<'_, bf16>,
+        shape: crate::backend::setup::LinearShape,
+    ) -> Result<()> {
+        match &self.runtime {
+            Runtime::Dense(d) => d.calibrate_shape(blas, input, shape),
+            Runtime::Staged(_) => anyhow::bail!("native DSpark uses derived projection plans"),
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    pub(super) fn calibration_weight(
+        &self,
+        shape: crate::backend::setup::LinearShape,
+    ) -> Result<crate::backend::gpu::CudaView<'_, bf16>> {
+        match &self.runtime {
+            Runtime::Dense(d) => d.calibration_weight(shape),
+            Runtime::Staged(_) => anyhow::bail!("native DSpark uses original FP8 projections"),
+        }
+    }
+
+    pub(super) fn reset_setup(&mut self) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.reset_setup(),
+            Runtime::Staged(d) => d.reset_setup(),
+        }
+    }
+    pub(super) fn grow(&mut self, rows: usize) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.grow(rows),
+            Runtime::Staged(d) => d.grow(rows),
+        }
+    }
+    pub(super) fn checkpoint_kv(&mut self, start: usize) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.checkpoint_kv(start),
+            Runtime::Staged(d) => d.checkpoint_kv(start),
+        }
+    }
+    pub(super) fn restore_kv(&mut self, start: usize, accepted: usize) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.restore_kv(start, accepted),
+            Runtime::Staged(d) => d.restore_kv(start, accepted),
+        }
+    }
+    pub fn inject(
+        &mut self,
+        input: &CudaSlice<bf16>,
+        rows: usize,
+        start: usize,
+        compute: Compute<'_>,
+        trace: Option<(&mut Trace, &str)>,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.inject(input, rows, start, compute, trace),
+            Runtime::Staged(d) => {
+                d.inject(input, rows, start, None, compute, trace.map(|(t, _)| t))
+            }
+        }
+    }
+    pub fn inject_device(
+        &mut self,
+        input: &CudaSlice<bf16>,
+        rows: usize,
+        start: usize,
+        position: &CudaSlice<i32>,
+        compute: Compute<'_>,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.inject_device(input, rows, start, position, compute),
+            Runtime::Staged(d) => d.inject(input, rows, start, Some(position), compute, None),
+        }
+    }
+    pub fn setup_attention(
+        &mut self,
+        device: &Device,
+        ops: &Ops,
+        target: &Config,
+        dir: &Path,
+        closure: &super::closure::Closure,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.setup_attention(device, ops, target, dir, closure),
+            Runtime::Staged(_) => Ok(()),
+        }
+    }
+    pub fn propose(
+        &mut self,
+        anchor: u32,
+        start: usize,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
+        compute: Compute<'_>,
+        trace: Option<(&mut Trace, &str)>,
+        forced: Option<&[u32]>,
+    ) -> Result<Vec<u32>> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.propose(anchor, start, target, compute, trace, forced),
+            Runtime::Staged(d) => d.propose(
+                anchor,
+                start,
+                target,
+                compute,
+                trace.map(|(t, _)| t),
+                forced,
+            ),
+        }
+    }
+    #[cfg(feature = "cuda")]
+    pub(super) fn capture_staged(
+        &mut self,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
+        compute: Compute<'_>,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Staged(d) => d.capture(target, compute),
+            Runtime::Dense(_) => anyhow::bail!("staged capture requires a native draft"),
+        }
+    }
+
+    pub(super) fn bind_staged_slots(&mut self, slots: super::engine::moe::Slots) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Staged(d) => d.bind_slots(slots),
+            Runtime::Dense(_) => anyhow::bail!("dense draft cannot bind a staged expert catalogue"),
+        }
+    }
+
+    pub(super) fn propose_joint(
+        &mut self,
+        owner: &mut super::engine::moe::Slots,
+        anchor: u32,
+        start: usize,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
+        compute: Compute<'_>,
+        graph: bool,
+    ) -> Result<Vec<u32>> {
+        match &mut self.runtime {
+            Runtime::Staged(d) => d.propose_joint(owner, anchor, start, target, compute, graph),
+            Runtime::Dense(_) => anyhow::bail!("joint native pool requires a staged draft"),
+        }
+    }
+
+    pub fn propose_device(
+        &mut self,
+        anchor: &CudaSlice<u32>,
+        position: &CudaSlice<i32>,
+        start: usize,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
+        compute: Compute<'_>,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.propose_device(anchor, position, start, target, compute),
+            Runtime::Staged(d) => d.propose_device(anchor, position, start, target, compute),
+        }
+    }
+    pub fn forward_base(
+        &mut self,
+        anchor: u32,
+        start: usize,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
+        compute: Compute<'_>,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.forward_base(anchor, start, target, compute),
+            Runtime::Staged(_) => {
+                anyhow::bail!("native DSpark exposes a greedy chain, not tree distributions")
+            }
+        }
+    }
+    pub fn forward_base_device(
+        &mut self,
+        anchor: &CudaSlice<u32>,
+        position: &CudaSlice<i32>,
+        start: usize,
+        target: (&CudaSlice<bf16>, &CudaSlice<bf16>),
+        compute: Compute<'_>,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.forward_base_device(anchor, position, start, target, compute),
+            Runtime::Staged(_) => {
+                anyhow::bail!("native DSpark exposes a greedy chain, not tree distributions")
+            }
+        }
+    }
+    pub fn setup_markov(
+        &mut self,
+        device: &Device,
+        ops: &Ops,
+        dir: &Path,
+        closure: &super::closure::Closure,
+    ) -> Result<()> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.setup_markov(device, ops, dir, closure),
+            Runtime::Staged(_) => Ok(()),
+        }
+    }
+    pub(super) fn markov_shape(&self) -> super::markov::MarkovShape {
+        match &self.runtime {
+            Runtime::Dense(d) => d.markov_shape(),
+            Runtime::Staged(_) => super::markov::MarkovShape {
+                rows: self.config.block_size,
+                vocab: self.config.vocab_size,
+                rank: self.config.markov_rank,
+                rounding: super::markov::ScoreRounding::F32,
+            },
+        }
+    }
+    pub fn distributions_batch(
+        &mut self,
+        requests: &[(u8, u32)],
+    ) -> Result<Vec<crate::backend::Top4>> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.distributions_batch(requests),
+            Runtime::Staged(_) => {
+                anyhow::bail!("native DSpark exposes a greedy chain, not tree distributions")
+            }
+        }
+    }
+    pub fn proposals(&mut self) -> Result<Vec<u32>> {
+        match &mut self.runtime {
+            Runtime::Dense(d) => d.proposals(),
+            Runtime::Staged(d) => d.proposals(),
+        }
+    }
+    pub fn confidences(&self) -> Result<Vec<f32>> {
+        match &self.runtime {
+            Runtime::Dense(d) => d.confidences(),
+            Runtime::Staged(d) => Ok(d.confidences()),
+        }
+    }
+    pub fn copy_proposals(
+        &self,
+        ids: &mut crate::backend::gpu::CudaViewMut<'_, u32>,
+    ) -> Result<()> {
+        match &self.runtime {
+            Runtime::Dense(d) => d.copy_proposals(ids),
+            Runtime::Staged(d) => d.copy_proposals(ids),
+        }
+    }
+    pub fn state_bits(&self, start: usize, rows: usize, output: &mut Vec<u8>) -> Result<()> {
+        match &self.runtime {
+            Runtime::Dense(d) => d.state_bits(start, rows, output),
+            Runtime::Staged(d) => d.state_bits(start, rows, output),
+        }
+    }
+    pub fn snapshot_kv(&self, trace: &mut Trace, start: usize, rows: usize) -> Result<()> {
+        match &self.runtime {
+            Runtime::Dense(d) => d.snapshot_kv(trace, start, rows),
+            Runtime::Staged(d) => d.cache_trace(&mut Some(trace), "cache"),
+        }
+    }
+}
+
+struct Dense {
     markov: Option<super::markov::Markov>,
     score_rounding: super::markov::ScoreRounding,
     pub config: DraftConfig,
@@ -304,7 +628,7 @@ fn norm(
     Ok(())
 }
 
-impl Draft {
+impl Dense {
     #[cfg(feature = "cuda")]
     pub(super) fn prepare_linears(
         &self,
@@ -841,7 +1165,7 @@ fn add_trace(
     )
 }
 
-impl Draft {
+impl Dense {
     pub fn setup_attention(
         &mut self,
         d: &Device,
@@ -1709,6 +2033,391 @@ mod tests {
         Ok((complete, isolated))
     }
 
+    fn staged_fixture(root: &Path, name: &str, shape: &[usize], dtype: &str) -> Result<Vec<u8>> {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        let entry = &manifest[name];
+        ensure!(
+            entry["dtype"] == dtype && entry["shape"] == serde_json::json!(shape),
+            "staged fixture {name} layout"
+        );
+        let file = entry["file"].as_str().context("staged fixture filename")?;
+        ensure!(
+            Path::new(file)
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new(file)),
+            "staged fixture filename escapes case"
+        );
+        let bytes = std::fs::read(root.join(file))?;
+        ensure!(
+            Some(bytes.len() as u64) == entry["bytes"].as_u64(),
+            "staged fixture {name} byte extent"
+        );
+        Ok(bytes)
+    }
+
+    fn staged_bf16(root: &Path, name: &str, shape: &[usize]) -> Result<Vec<bf16>> {
+        let raw = staged_fixture(root, name, shape, "torch.bfloat16")?;
+        ensure!(raw.len() == shape.iter().product::<usize>() * 2);
+        let values: Vec<_> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|word| bf16::from_bits(u16::from_le_bytes(*word)))
+            .collect();
+        ensure!(values.iter().all(|v| v.is_finite()), "nonfinite {name}");
+        Ok(values)
+    }
+
+    fn staged_f64(path: &Path, cells: usize) -> Result<Vec<f64>> {
+        let raw = std::fs::read(path)?;
+        ensure!(raw.len() == cells * 8, "staged FP64 certificate extent");
+        let result: Vec<_> = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| f64::from_le_bytes(*word))
+            .collect();
+        ensure!(
+            result.iter().all(|v| v.is_finite()),
+            "nonfinite FP64 oracle"
+        );
+        Ok(result)
+    }
+
+    #[test]
+    #[ignore = "GPU lease; FF_DS41_MODEL and FF_MARKOV_FIXTURES with the frozen staged oracle"]
+    fn staged_native_heads_gpu() -> Result<()> {
+        use super::super::{contracts::view, linear::Bf16F32Plan, moe::testing::capture};
+        ensure!(
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model = PathBuf::from(std::env::var("FF_DS41_MODEL")?);
+        let root = PathBuf::from(std::env::var("FF_MARKOV_FIXTURES")?);
+        let oracle = root.join("head-oracle-r2");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(oracle.join("manifest.json"))?)?;
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("reference-tolerances-r2.json"))?)?;
+        ensure!(
+            manifest["candidate_seen"] == false
+                && manifest["factor"] == 2
+                && manifest["freeze"] == "reference-tolerances-r2.json"
+                && frozen["candidate_seen"] == false
+                && frozen["tolerances_frozen"] == true
+                && frozen["factor"] == 2,
+            "staged numerical contract is not frozen r2"
+        );
+        let spec = crate::model_spec::ModelSpec::read(&model)?;
+        let ds = spec.deepseek_v41.as_ref().context("staged geometry")?;
+        let (h, v, rank, rows) = (
+            spec.hidden as usize,
+            spec.vocab as usize,
+            ds.dspark_markov_rank as usize,
+            ds.dspark_block_size as usize,
+        );
+        ensure!(
+            (h, v, rank, rows) == (5120, 129280, 256, 5),
+            "staged head production geometry"
+        );
+        let cases = manifest["fixtures"].as_array().context("head fixtures")?;
+        ensure!(cases.len() == 20, "staged head fixture count");
+        for (name, width, columns) in [
+            ("base_head", h, v),
+            ("markov_head", rank, v),
+            ("confidence", h + rank, 1),
+        ] {
+            ensure!(
+                manifest["linear"][name]["rows"] == 100
+                    && manifest["linear"][name]["columns"] == columns
+                    && manifest["linear"][name]["width"] == width
+                    && frozen["linear_certificates"][name]["width"] == width,
+                "staged {name} certificate geometry"
+            );
+        }
+        let read_certificate = |name: &str, kind: &str, columns| {
+            staged_f64(&oracle.join(format!("{name}.{kind}.f64")), 100 * columns)
+        };
+        let base_exact = read_certificate("base_head", "exact", v)?;
+        let base_bound = read_certificate("base_head", "bound", v)?;
+        let markov_exact = read_certificate("markov_head", "exact", v)?;
+        let markov_bound = read_certificate("markov_head", "bound", v)?;
+        let confidence_exact = read_certificate("confidence", "exact", 1)?;
+        let confidence_bound = read_certificate("confidence", "bound", 1)?;
+        ensure!(
+            base_bound
+                .iter()
+                .chain(&markov_bound)
+                .chain(&confidence_bound)
+                .all(|v| *v >= 0.0),
+            "negative staged arithmetic bound"
+        );
+        let d = Device::new(0)?;
+        let s = &d.stream;
+        let head = native(&d, &model, "head.weight", &[v, h])?;
+        let embedding = native(&d, &model, "mtp.2.markov_head.embed.weight", &[v, rank])?;
+        let markov = native(&d, &model, "mtp.2.markov_head.head.weight", &[v, rank])?;
+        let confidence = native(
+            &d,
+            &model,
+            "mtp.2.confidence_head.proj.weight",
+            &[1, h + rank],
+        )?;
+        let module = super::super::cubin::module(&d.ctx, "markov")?;
+        let sum = module.load_function("sum_argmax_f32")?;
+        let old_sum = module.load_function("sum_argmax")?;
+        let dot = module.load_function("concat_dot")?;
+        d.finish_upload()?;
+        let mut defects = 0usize;
+        let mut projections = 0usize;
+        let mut graph_cases = 0usize;
+        let mut control = 0usize;
+        let mut min_margin = f32::INFINITY;
+        let mut check = |name: &str, actual: &[f32], exact: &[f64], bound: &[f64]| -> Result<()> {
+            ensure!(
+                actual.len() == exact.len() && actual.len() == bound.len(),
+                "{name} certificate layout"
+            );
+            ensure!(actual.iter().all(|v| v.is_finite()), "nonfinite {name}");
+            let violations = actual
+                .iter()
+                .zip(exact.iter().zip(bound))
+                .filter(|(a, (e, b))| (f64::from(**a) - **e).abs() > **b)
+                .count();
+            defects += violations;
+            println!(
+                "STAGED_HEAD name={name} cells={} violations={violations}",
+                actual.len()
+            );
+            Ok(())
+        };
+        let mut bit_defects = 0usize;
+        for (case_index, case) in cases.iter().enumerate() {
+            let folder = case["folder"].as_str().context("head case folder")?;
+            let case_root = root.join(folder);
+            ensure!(
+                case_root.canonicalize()?.starts_with(root.canonicalize()?),
+                "head case outside fixture root"
+            );
+            let start = case["row_start"].as_u64().context("head row start")? as usize;
+            ensure!(start == case_index * rows && case["rows"] == rows);
+            let x = s.clone_htod(&staged_bf16(&case_root, "final_norm.0", &[1, rows, h])?)?;
+            let hidden = s.clone_htod(&staged_bf16(
+                &case_root,
+                "stage2.collapse.2",
+                &[1, rows, h],
+            )?)?;
+            let mut parents = Vec::with_capacity(rows * rank);
+            for row in 0..rows {
+                parents.extend(staged_bf16(
+                    &case_root,
+                    &format!("markov.{row}.1"),
+                    &[1, rank],
+                )?);
+            }
+            let parent_embeddings = s.clone_htod(&parents)?;
+            let raw_ids = staged_fixture(&case_root, "output.0.0", &[1, rows + 1], "torch.int64")?;
+            ensure!(raw_ids.len() == (rows + 1) * 8);
+            let ids = raw_ids
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|word| Ok(u32::try_from(i64::from_le_bytes(*word))?))
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(ids.iter().all(|id| (*id as usize) < v), "head parent id");
+            let ids = s.clone_htod(&ids)?;
+            let mut base = s.clone_htod(&vec![123.0f32; rows * v + 16])?;
+            let mut biases = s.clone_htod(&vec![123.0f32; rows * v + 16])?;
+            let mut combined = s.alloc_zeros::<f32>(rows * v)?;
+            let mut tokens = s.alloc_zeros::<u32>(rows)?;
+            let mut confidences = s.alloc_zeros::<f32>(rows)?;
+            let mut plans = Vec::new();
+            for (name, inputs, weights, width, output, exact, bound) in [
+                ("base", &x, &head, h, &base, &base_exact, &base_bound),
+                (
+                    "markov",
+                    &parent_embeddings,
+                    &markov,
+                    rank,
+                    &biases,
+                    &markov_exact,
+                    &markov_bound,
+                ),
+            ] {
+                for m in [rows, 1] {
+                    for row in (0..rows).step_by(m) {
+                        let plan = Bf16F32Plan::new(
+                            &d.ctx,
+                            view(
+                                inputs,
+                                s,
+                                row * width,
+                                [m as u32, width as u32],
+                                [width as u64, 1],
+                            )?,
+                            view(weights, s, 0, [v as u32, width as u32], [width as u64, 1])?,
+                            view(output, s, row * v, [m as u32, v as u32], [v as u64, 1])?,
+                        )?;
+                        plan.run(s)?;
+                        let actual = s.clone_dtoh(&output.slice(row * v..(row + m) * v))?;
+                        let range = (start + row) * v..(start + row + m) * v;
+                        check(name, &actual, &exact[range.clone()], &bound[range])?;
+                        projections += 1;
+                        if m == rows {
+                            plans.push(plan);
+                        }
+                    }
+                }
+                bit_defects += s
+                    .clone_dtoh(&output.slice(rows * v..))?
+                    .iter()
+                    .filter(|v| **v != 123.0)
+                    .count();
+            }
+            let run_heads = |combined: &mut CudaSlice<f32>,
+                             tokens: &mut CudaSlice<u32>,
+                             confidences: &mut CudaSlice<f32>|
+             -> Result<()> {
+                for row in 0..rows {
+                    unsafe {
+                        s.launch_builder(&sum)
+                            .arg(&base.slice(row * v..(row + 1) * v))
+                            .arg(&biases.slice(row * v..(row + 1) * v))
+                            .arg(&mut combined.slice_mut(row * v..(row + 1) * v))
+                            .arg(&mut tokens.slice_mut(row..row + 1))
+                            .arg(&(v as i32))
+                            .launch(grid(1, 1024))?;
+                    }
+                }
+                unsafe {
+                    s.launch_builder(&dot)
+                        .arg(&hidden)
+                        .arg(&embedding)
+                        .arg(&ids.slice(..1))
+                        .arg(&ids.slice(1..))
+                        .arg(&confidence)
+                        .arg(&mut *confidences)
+                        .arg(&(rows as i32))
+                        .arg(&(h as i32))
+                        .arg(&(rank as i32))
+                        .arg(&(v as i32))
+                        .launch(grid(rows, 256))?;
+                }
+                Ok(())
+            };
+            run_heads(&mut combined, &mut tokens, &mut confidences)?;
+            let scores = s.clone_dtoh(&combined)?;
+            let eager_confidence = s.clone_dtoh(&confidences)?;
+            check(
+                "confidence",
+                &eager_confidence,
+                &confidence_exact[start..start + rows],
+                &confidence_bound[start..start + rows],
+            )?;
+            let actual_tokens = s.clone_dtoh(&tokens)?;
+            let base_values = s.clone_dtoh(&base.slice(..rows * v))?;
+            let bias_values = s.clone_dtoh(&biases.slice(..rows * v))?;
+            for (row, &actual_token) in actual_tokens.iter().enumerate() {
+                let mut top = [(f32::NEG_INFINITY, u32::MAX); 2];
+                for token in 0..v {
+                    let index = row * v + token;
+                    let expected = base_values[index] + bias_values[index];
+                    bit_defects += usize::from(scores[index].to_bits() != expected.to_bits());
+                    if let Some(slot) = top.iter().position(|&(score, id)| {
+                        expected > score || (expected == score && (token as u32) < id)
+                    }) {
+                        top[slot..].rotate_right(1);
+                        top[slot] = (expected, token as u32);
+                    }
+                }
+                bit_defects += usize::from(actual_token != top[0].1);
+                min_margin = min_margin.min(top[0].0 - top[1].0);
+            }
+            let graph = capture(s, || {
+                for plan in &plans {
+                    plan.run(s)?;
+                }
+                run_heads(&mut combined, &mut tokens, &mut confidences)
+            })
+            .context("staged head graph capture")?;
+            let poison = vec![f32::NAN; rows * v];
+            s.memcpy_htod(&poison, &mut base.slice_mut(..rows * v))?;
+            s.memcpy_htod(&poison, &mut biases.slice_mut(..rows * v))?;
+            s.memcpy_htod(&poison, &mut combined)?;
+            s.memcpy_htod(&vec![f32::NAN; rows], &mut confidences)?;
+            s.memcpy_htod(&vec![u32::MAX; rows], &mut tokens)?;
+            graph.launch()?;
+            let replay = s.clone_dtoh(&combined)?;
+            let graph_confidence = s.clone_dtoh(&confidences)?;
+            ensure!(
+                replay
+                    .iter()
+                    .chain(&graph_confidence)
+                    .all(|v| v.is_finite()),
+                "nonfinite staged graph output"
+            );
+            bit_defects += replay
+                .iter()
+                .zip(&scores)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            bit_defects += graph_confidence
+                .iter()
+                .zip(&eager_confidence)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            bit_defects += usize::from(s.clone_dtoh(&tokens)? != actual_tokens);
+            graph_cases += 1;
+            if case_index == 0 {
+                let rounded_base = s.clone_htod(
+                    &base_values[..v]
+                        .iter()
+                        .copied()
+                        .map(bf16::from_f32)
+                        .collect::<Vec<_>>(),
+                )?;
+                let rounded_bias = s.clone_htod(
+                    &bias_values[..v]
+                        .iter()
+                        .copied()
+                        .map(bf16::from_f32)
+                        .collect::<Vec<_>>(),
+                )?;
+                unsafe {
+                    s.launch_builder(&old_sum)
+                        .arg(&rounded_base)
+                        .arg(&rounded_bias)
+                        .arg(&mut combined.slice_mut(..v))
+                        .arg(&mut tokens.slice_mut(..1))
+                        .arg(&(v as i32))
+                        .arg(&1i32)
+                        .launch(grid(1, 1024))?;
+                }
+                control = s
+                    .clone_dtoh(&combined.slice(..v))?
+                    .iter()
+                    .zip(&scores[..v])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(control > 0, "premature BF16 score control escaped");
+            }
+        }
+        println!(
+            "STAGED_NATIVE_HEADS cases={} projections={projections} graph_cases={graph_cases} full_vocabulary={v} min_argmax_margin={min_margin} premature_bf16_control={control} numerical_defects={defects} bit_defects={bit_defects}",
+            cases.len()
+        );
+        ensure!(
+            defects == 0 && bit_defects == 0,
+            "staged native head DEFECT"
+        );
+        println!(
+            "PASS STAGED_NATIVE_HEADS cases={} projections={projections} graph_cases={graph_cases} full_vocabulary={v} premature_bf16_detected=true",
+            cases.len()
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a GPU window and native target/draft, T14 fixtures and frozen reference floors"]
     fn fixture_forward_gpu() -> Result<()> {
@@ -1804,7 +2513,7 @@ mod tests {
             "T19 frozen native fixture calibration".into(),
         ));
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        let mut draft = Draft::new(
+        let mut draft = Dense::new(
             &draft_path,
             &device,
             &config,

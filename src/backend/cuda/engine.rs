@@ -53,7 +53,7 @@ pub(crate) use self::diffusion::{
 #[cfg(feature = "cuda")]
 pub mod minimax_h3;
 #[path = "engine_moe.rs"]
-mod moe;
+pub(super) mod moe;
 pub(in crate::backend::cuda) use moe::{Events, ReadAhead, Reader};
 #[path = "engine_mtp.rs"]
 #[cfg(feature = "cuda")]
@@ -457,6 +457,8 @@ impl HiddenCapture {
 }
 
 struct Spec {
+    #[cfg(feature = "cuda")]
+    staged: Option<deepseek::staged::TargetState>,
     #[cfg(test)]
     forced_proposals: Option<Vec<u32>>,
     eos: Vec<u32>,
@@ -537,7 +539,7 @@ impl Spec {
                 super::state::StateCheckpoint::new(&engine.state, &engine.model_spec, rows, stream)
             })
             .transpose()?;
-        let gdn_inputs = if checkpoint.is_some() {
+        let gdn_inputs = if checkpoint.is_some() && !engine.state.gdn.is_empty() {
             let gdn_spec = crate::op_contract::GdnSpec::from_model(&engine.model_spec)?;
             engine
                 .state
@@ -549,6 +551,8 @@ impl Spec {
             Vec::new()
         };
         let spec = Self {
+            #[cfg(feature = "cuda")]
+            staged: None,
             #[cfg(test)]
             forced_proposals: None,
             eos: Vec::new(),
@@ -1131,6 +1135,7 @@ impl Engine {
                     requested_chunk,
                     settings,
                     model_spec,
+                    mode,
                 );
             }
             LoadDispatch::Qwen => {
@@ -1829,6 +1834,13 @@ impl Engine {
 
     #[cfg(feature = "cuda")]
     fn prepare(&mut self, rows: usize) -> Result<()> {
+        if self.deepseek_ffn.is_some() {
+            ensure!(
+                (1..=self.workspace_rows).contains(&rows),
+                "native prepare row extent"
+            );
+            return self.ensure_decode();
+        }
         if self.qwen.is_some() {
             return self.prepare_qwen(rows);
         }
@@ -1927,7 +1939,9 @@ impl Engine {
                 .spec
                 .as_ref()
                 .context("causal verification requires draft geometry")?;
-            let valid = if self.model_spec.moe.is_some() {
+            let valid = if spec.draft.config.staged.is_some() {
+                (1..=spec.max_verify_rows).contains(&step.rows)
+            } else if self.model_spec.moe.is_some() {
                 (crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows).contains(&step.rows)
             } else {
                 step.rows == spec.max_verify_rows
@@ -1955,6 +1969,7 @@ impl Engine {
         }
         // HIP Gemma prefill heads execute at the bucket bound by prepare_prefill_rows.
         if step.head == Head::All
+            && self.deepseek_ffn.is_none()
             && !(cfg!(feature = "rocm")
                 && step.input == crate::backend::Input::Ids
                 && self.model_spec.architecture == crate::model_spec::Architecture::Gemma4)
@@ -2596,6 +2611,9 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
+        if self.deepseek_engram.is_some() {
+            self.capture_deepseek_input(layer, step.rows)?;
+        }
         if let Some(engram) = &self.deepseek_engram {
             engram.run(
                 &self.device.stream,
@@ -4654,6 +4672,13 @@ impl Drop for Engine {
 impl Engine {
     fn ensure_verification(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
+        if self.deepseek_ffn.is_some() {
+            ensure!(
+                spec.draft.config.staged.is_some() && spec.checkpoint.is_some(),
+                "native verification lacks staged transaction state"
+            );
+            return Ok(());
+        }
         if self.qwen.is_some() {
             ensure!(
                 spec.checkpoint.is_some() && spec.gdn_inputs.len() == self.state.gdn.len(),
@@ -6894,6 +6919,7 @@ impl Engine {
                     requested_chunk,
                     settings,
                     model_spec,
+                    mode,
                 );
             }
             LoadDispatch::Canvas => {

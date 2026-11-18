@@ -685,7 +685,7 @@ pub(in crate::backend::cuda::engine) struct RouteStamp {
     pub experts: Vec<u32>,
 }
 
-pub(in crate::backend::cuda::engine) struct Slots {
+pub(in crate::backend::cuda) struct Slots {
     pub storage: super::super::super::weights::ExpertStorage,
     gate_up: CudaSlice<u64>,
     down: CudaSlice<u64>,
@@ -703,7 +703,7 @@ pub(in crate::backend::cuda::engine) struct Slots {
     streamed: Vec<bool>,
     pool: Vec<Physical>,
     leased: Vec<(u32, usize)>,
-    leased_layer: u32,
+    leased_namespace: Option<(Arc<ExpertCatalogue>, u32)>,
     publish: CudaFunction,
     routes: Vec<crate::experts::runtime::Route>,
     host_experts: Vec<u32>,
@@ -791,6 +791,150 @@ pub(in crate::backend::cuda::engine) fn delay_stream(stream: &Arc<CudaStream>) -
 }
 
 impl Slots {
+    pub(in crate::backend::cuda::engine) fn load_joint(
+        device: &Device,
+        model: &crate::model_spec::ModelSpec,
+        manifest: &crate::checkpoint::TensorManifest,
+        draft: &crate::dspark::DraftConfig,
+        directory: &Path,
+        rows: u32,
+    ) -> Result<[Self; 2]> {
+        let target_geometry = ExpertGeometry::from_model(model)?;
+        let target = Arc::new(ExpertCatalogue::from_manifest(
+            manifest,
+            target_geometry,
+            model.expert_format.context("joint expert format missing")?,
+        )?);
+        let suffix = draft
+            .staged
+            .as_ref()
+            .context("joint staged catalogue missing")?
+            .catalogue
+            .clone();
+        ensure!(
+            target.layout() == suffix.layout(),
+            "joint native catalogue layouts differ"
+        );
+        let (free, total) = device.ctx.mem_get_info()?;
+        let device_bytes = free
+            .checked_sub(total / 16)
+            .context("joint device reserve exceeds free memory")?;
+        let host = host_memory(Path::new("/"))?;
+        let host_bytes = host - host / 16;
+        let copies = super::super::super::calibrate::copy_engines(device)?;
+        let geometry = [target.geometry(), suffix.geometry()];
+        let live_rows = [rows, u32::try_from(draft.block_size)?];
+        let alignment = crate::experts::disk::directory_alignment(directory)?;
+        let ring_slot = crate::experts::disk::ring_slot_bytes(target.layout(), alignment)?;
+        let depths = [
+            crate::experts::disk::disk_read_depth(directory, geometry[0].top_k)?,
+            crate::experts::disk::disk_read_depth(directory, geometry[1].top_k)?,
+        ];
+        let plans = crate::experts::plan::joint_staging_capacity(
+            geometry,
+            target.layout().clone(),
+            live_rows,
+            device_bytes as u64,
+            host_bytes,
+            copies,
+            depths.map(|depth| (depth, ring_slot)),
+        )?;
+        let mut slots = Vec::with_capacity(2);
+        for (i, ((capacity, admission), catalogue)) in
+            plans.into_iter().zip([target, suffix]).enumerate()
+        {
+            let frequency =
+                vec![vec![0.0; geometry[i].experts as usize]; geometry[i].layers as usize];
+            let initial = crate::experts::plan::initial_residency(
+                &frequency,
+                &capacity.slots_per_layer,
+                &geometry[i],
+            )?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"joint_native_capacity": {
+                    "catalogue": i, "layers": geometry[i].layers, "experts": geometry[i].experts,
+                    "rows": live_rows[i], "gpu_slots": capacity.slots_total(),
+                    "pool_slots": capacity.prefill_staging_slots, "host_blocks": capacity.host_blocks,
+                    "spare_blocks": capacity.spare_blocks, "disk_bytes": capacity.disk_bytes,
+                    "slot_bytes": catalogue.slot_bytes(), "joint_device_budget_bytes": device_bytes,
+                    "joint_host_budget_bytes": host_bytes, "free_after_graphs": free,
+                    "disk_depth": depths[i], "ring_slot_bytes": ring_slot,
+                    "ring_bytes": u64::from(depths[i]) * ring_slot
+                }})
+            );
+            slots.push(Self::load(
+                device,
+                None,
+                geometry[i],
+                Load {
+                    capacity: &capacity,
+                    admission,
+                    initial: &initial,
+                    catalogue,
+                    directory,
+                    engines: copies,
+                    disk_depth: depths[i],
+                    max_rows: live_rows[i],
+                    swiglu_rounding: model.swiglu_rounding(),
+                    swiglu_limit: model.swiglu_limit(),
+                    routed_weight: model.routed_weight_boundary(),
+                },
+            )?);
+        }
+        let [target, mut suffix]: [Self; 2] = slots
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("joint catalogue count"))?;
+        suffix.prepare_shared_pool(&target)?;
+        Ok([target, suffix])
+    }
+
+    pub(in crate::backend::cuda::engine) fn prepare_shared_pool(
+        &mut self,
+        owner: &Self,
+    ) -> Result<()> {
+        ensure!(
+            self.pool.is_empty() && self.leased.is_empty() && self.leased_namespace.is_none(),
+            "borrower already owns a native pool lease"
+        );
+        ensure!(
+            self.catalogue.slot_bytes() == owner.catalogue.slot_bytes()
+                && self.catalogue.layout() == owner.catalogue.layout()
+                && self.peer.is_none()
+                && owner.peer.is_none(),
+            "shared native pool layout differs"
+        );
+        let events = 2usize
+            .checked_mul(owner.pool.len())
+            .and_then(|n| n.checked_add(self.events.pool.len()))
+            .context("shared native event capacity overflow")?;
+        self.events = Events::new(self.transfers.h2d.context(), events)?;
+        Ok(())
+    }
+
+    pub(in crate::backend::cuda::engine) fn with_shared_pool<T>(
+        &mut self,
+        owner: &mut Self,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        ensure!(
+            self.pool.is_empty() && self.leased.is_empty() && self.leased_namespace.is_none(),
+            "nested native pool loan"
+        );
+        ensure!(
+            !owner.pool.is_empty() && self.events.pool.len() >= 2 * owner.pool.len() + 4,
+            "shared native pool was not prepared"
+        );
+        std::mem::swap(&mut self.pool, &mut owner.pool);
+        std::mem::swap(&mut self.leased, &mut owner.leased);
+        std::mem::swap(&mut self.leased_namespace, &mut owner.leased_namespace);
+        let result = operation(self);
+        std::mem::swap(&mut self.pool, &mut owner.pool);
+        std::mem::swap(&mut self.leased, &mut owner.leased);
+        std::mem::swap(&mut self.leased_namespace, &mut owner.leased_namespace);
+        result
+    }
+
     pub(in crate::backend::cuda::engine) fn begin_staging_request(&mut self) -> Result<()> {
         let geometry = self.catalogue.geometry();
         self.begin_request(&vec![
@@ -1069,7 +1213,7 @@ impl Slots {
             .iter()
             .map(|&count| count == 0)
             .collect();
-        let pool = if streamed.contains(&true) {
+        let pool = if input.capacity.prefill_staging_slots > 0 {
             (0..input.capacity.prefill_staging_slots)
                 .map(|slot| {
                     Ok(Physical {
@@ -1146,7 +1290,7 @@ impl Slots {
             streamed,
             pool,
             leased: Vec::new(),
-            leased_layer: u32::MAX,
+            leased_namespace: None,
             publish: super::super::super::cubin::module(&device.ctx, "moe_route")?
                 .load_function("moe_slot_publish")?,
             routes: Vec::with_capacity(input.max_rows as usize * geometry.top_k as usize),
@@ -1222,7 +1366,11 @@ impl Slots {
         Ok(slots)
     }
 
-    pub fn bindings(&self, layer: usize, stream: &Arc<CudaStream>) -> Result<SlotBindings> {
+    pub(in crate::backend::cuda::engine) fn bindings(
+        &self,
+        layer: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<SlotBindings> {
         let geometry = self.storage.layout().geometry();
         ensure!(
             layer < geometry.layers as usize,
@@ -1404,6 +1552,11 @@ impl Slots {
                 self.transfers
                     .copy_host_block(admit.block, |dst| guard.copy_logical(dst))?;
                 self.policy.commit_host_admit(admit)?;
+                #[cfg(test)]
+                super::super::deepseek::census_record(serde_json::json!({
+                    "kind": "host_admit", "experts": self.catalogue.geometry().experts,
+                    "layer": layer, "expert": expert, "bytes": self.catalogue.slot_bytes(),
+                }));
                 self.pending_admits.swap_remove(index);
                 None
             }
@@ -1478,6 +1631,12 @@ impl Slots {
                 .context("copy native host expert into its physical slot")?;
             }
         }
+        #[cfg(test)]
+        super::super::deepseek::census_record(serde_json::json!({
+            "kind": "htod", "experts": self.catalogue.geometry().experts,
+            "layer": layer, "expert": expert, "disk": matches!(source, MoveSource::Disk),
+            "bytes": self.catalogue.slot_bytes(),
+        }));
         Ok(staging)
     }
 
@@ -1526,6 +1685,12 @@ impl Slots {
                 usize::try_from(self.catalogue.slot_bytes())?,
                 &mut self.events,
             )?;
+            #[cfg(test)]
+            super::super::deepseek::census_record(serde_json::json!({
+                "kind": "dtoh", "experts": self.catalogue.geometry().experts,
+                "layer": movement.layer, "expert": movement.victim,
+                "host_block": block, "bytes": self.catalogue.slot_bytes(),
+            }));
             self.transfers.h2d.wait(&event.event)?;
         }
         self.install(
@@ -1680,14 +1845,19 @@ impl Slots {
     }
 
     fn lease_native(&mut self, layer: u32, experts: &[u32]) -> Result<usize> {
-        let leased = self.policy.lease(layer, experts)?;
+        let leased = self.policy.lease(layer, experts, self.pool.len())?;
         ensure!(
             leased.len() <= self.pool.len(),
             "layer {layer} routes {} experts; the pool holds {}",
             leased.len(),
             self.pool.len()
         );
-        let same_layer = self.leased_layer == layer;
+        let same_layer = self
+            .leased_namespace
+            .as_ref()
+            .is_some_and(|(catalogue, leased_layer)| {
+                Arc::ptr_eq(catalogue, &self.catalogue) && *leased_layer == layer
+            });
         let mut new_leased = Vec::with_capacity(leased.len());
         let mut available_slots: Vec<usize> = (0..self.pool.len()).collect();
         if same_layer {
@@ -1711,7 +1881,7 @@ impl Slots {
             #[cfg(test)]
             let reader = reader.filter(|_| self.pool_control != PoolControl::SkipReaderWait);
             if let Some(reader) = reader {
-                self.events.wait(&self.transfers.h2d, reader.id)?;
+                self.transfers.h2d.wait(&reader.event)?;
             }
             jobs.push((lease.expert, lease.source_block, index));
         }
@@ -1782,7 +1952,12 @@ impl Slots {
                 .map(|(expert, _, index)| (expert, index)),
         );
         self.leased = new_leased;
-        self.leased_layer = layer;
+        match &mut self.leased_namespace {
+            Some((catalogue, leased_layer)) if Arc::ptr_eq(catalogue, &self.catalogue) => {
+                *leased_layer = layer;
+            }
+            key => *key = Some((self.catalogue.clone(), layer)),
+        }
         if refills > 0 {
             self.refill.record(&self.transfers.h2d)?;
         }
@@ -1863,7 +2038,13 @@ impl Slots {
 
     #[cfg(test)]
     pub fn can_native_dispatch(&self, layer: u32) -> bool {
-        !self.streamed.get(layer as usize).copied().unwrap_or(false) || self.leased_layer == layer
+        !self.streamed.get(layer as usize).copied().unwrap_or(false)
+            || self
+                .leased_namespace
+                .as_ref()
+                .is_some_and(|(catalogue, leased_layer)| {
+                    Arc::ptr_eq(catalogue, &self.catalogue) && *leased_layer == layer
+                })
     }
 
     pub fn native_dispatch(&self, layer: u32) -> Result<(Vec<u64>, Vec<u32>)> {
@@ -1894,7 +2075,14 @@ impl Slots {
         };
         let streamed = self.streamed[layer as usize];
         ensure!(
-            !streamed || self.leased_layer == layer,
+            !streamed
+                || self
+                    .leased_namespace
+                    .as_ref()
+                    .is_some_and(|(catalogue, leased_layer)| Arc::ptr_eq(
+                        catalogue,
+                        &self.catalogue
+                    ) && *leased_layer == layer),
             "native dispatch of layer {layer} without its pool lease"
         );
         let mut pointers = Vec::with_capacity(geometry.experts as usize * offsets.len());
@@ -2102,7 +2290,7 @@ impl Slots {
         Ok(())
     }
 
-    pub fn run(
+    pub(in crate::backend::cuda::engine) fn run(
         &mut self,
         device: &Device,
         decode: &mut Decode,

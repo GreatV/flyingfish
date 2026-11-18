@@ -1156,7 +1156,7 @@ mod native {
             #[cfg(feature = "rocm")]
             self.route
                 .logits_f32(stream, x, self.weights.router, &mut TensorMut(logits))?;
-            self.route.topk_noaux_f32(
+            self.route.topk_noaux_f32::<_, false>(
                 logits,
                 Some(self.weights.bias),
                 &mut TensorMut(ids),

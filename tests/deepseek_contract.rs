@@ -86,6 +86,10 @@ fn deepseek41_normalizes_geometry_and_quant_formats() {
     assert_eq!(ds.engram_num_embeddings, vec![384_006_168u32, 384_016_682]);
     assert_eq!(ds.nextn_layers, 3);
     assert_eq!(ds.dspark_experts, 128);
+    assert_eq!(ds.dspark_experts_per_tok, 3);
+    assert_eq!(ds.dspark_block_size, 5);
+    assert_eq!(ds.dspark_noise_token_id, 128799);
+    assert_eq!(ds.dspark_target_layer_ids, [37, 38, 39]);
     assert_eq!(ds.dspark_markov_rank, 256);
     assert_eq!((ds.vision_layers, ds.vision_hidden), (32, 1024));
     assert_eq!((ds.vision_intermediate, ds.vision_patch), (2816, 14));
@@ -356,6 +360,63 @@ fn deepseek41_manifest_covers_the_published_tensor_set() {
     assert!(!expected.contains_key("layers.20.attn.compressor.wgate.weight"));
     assert!(!expected.contains_key("layers.1.attn.compressor.norm.weight"));
     assert!(expected.contains_key("layers.1.engram.wkv.weight"));
+    let manifest = flyingfish::checkpoint::TensorManifest {
+        entries: expected
+            .into_iter()
+            .filter(|(name, (_, _, scope))| *scope == TensorScope::Mtp || name == "head.weight")
+            .map(|(name, (dtype, shape, scope))| {
+                let bytes = shape.iter().product::<usize>() * dtype.bitsize() / 8;
+                let entry = flyingfish::checkpoint::TensorEntry {
+                    dtype,
+                    shape,
+                    shard: "fixture.safetensors".into(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope,
+                    layer: None,
+                    role: name.clone(),
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                };
+                (name, entry)
+            })
+            .collect(),
+        resident_bytes: 0,
+    };
+    let target = spec();
+    let experts =
+        flyingfish::experts::catalogue::ExpertCatalogue::from_draft_manifest(&manifest, &target)
+            .unwrap();
+    assert_eq!(
+        (
+            experts.geometry().layers,
+            experts.geometry().experts,
+            experts.geometry().top_k
+        ),
+        (3, 128, 3)
+    );
+    assert_eq!(experts.slot_bytes(), 18800640);
+    assert!(experts.range(2, 127).is_ok());
+    assert!(experts.range(2, 128).is_err());
+    let draft = flyingfish::dspark::DraftConfig::in_checkpoint(&target, &manifest).unwrap();
+    assert_eq!((draft.block_size, draft.verify_rows().unwrap()), (5, 4));
+    assert_eq!((draft.num_hidden_layers, draft.capture_width()), (3, 15360));
+    assert_eq!((draft.vocab_size, draft.draft_vocab_size), (129280, 129280));
+    assert_eq!(draft.target_rows(&target).unwrap(), 4);
+    assert_eq!(
+        draft.staged.as_ref().unwrap().resident_weight_bytes,
+        713427336
+    );
+    assert_eq!(draft.round_weight_bytes().unwrap(), 3081911176);
+    let mut control = target.clone();
+    control.deepseek_v41.as_mut().unwrap().dspark_block_size = 4;
+    assert!(flyingfish::dspark::DraftConfig::in_checkpoint(&control, &manifest).is_err());
+    control = target.clone();
+    control.deepseek_v41.as_mut().unwrap().compress_ratios[40] = 1;
+    assert!(flyingfish::dspark::DraftConfig::in_checkpoint(&control, &manifest).is_err());
 }
 
 #[test]

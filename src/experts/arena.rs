@@ -334,10 +334,11 @@ impl SlotLayout {
         let mut slots = Vec::new();
         slots.try_reserve_exact(geometry.layers as usize)?;
         for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
-            // Zero-slot layers form a suffix and lease from the staging pool.
+            // Zero-slot layers form a suffix; an empty layout owns no pool.
             ensure!(
                 (count > 0
-                    || (capacity.prefill_staging_slots > 0
+                    || ((capacity.prefill_staging_slots > 0
+                        || (gpu0_count == 0 && peer_count == 0))
                         && capacity.slots_per_layer[layer..].iter().all(|&n| n == 0)))
                     && count <= geometry.experts,
                 "slot layout layer={layer} slots={count} experts={}",

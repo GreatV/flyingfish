@@ -30,6 +30,24 @@ mod dsa;
 mod layer_certificate;
 
 #[cfg(test)]
+thread_local! {
+    pub(super) static SUPPLY_CENSUS: std::cell::RefCell<Option<Vec<serde_json::Value>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn census_record(record: serde_json::Value) {
+    SUPPLY_CENSUS.with(|records| {
+        if let Some(records) = records.borrow_mut().as_mut() {
+            records.push(record);
+        }
+    });
+}
+#[path = "engine_deepseek_draft.rs"]
+pub(crate) mod staged;
+
+#[cfg(test)]
 pub(super) fn census_range(
     enabled: bool,
     position: usize,
@@ -650,7 +668,7 @@ impl DeepseekMixer {
             .context("recorded window slots")?;
         let sink = weight_view::<f32, 1>(&weights.attn_sink, s, [g.heads as u32], "attn_sink")?;
         self.ops
-            .run(
+            .run::<false>(
                 s,
                 LwaInputs {
                     q: view(
@@ -725,7 +743,7 @@ impl DeepseekMixer {
             )
             .context("recorded replay o quantization")?;
         self.ops
-            .group_project(
+            .group_project::<false>(
                 s,
                 view(
                     &self.o_codes,
@@ -863,6 +881,7 @@ pub(crate) struct MixerStep<'a> {
     pub(crate) qkv: &'a mut CudaSlice<bf16>,
     pub(crate) out: &'a mut CudaSlice<bf16>,
     pub(crate) seq: SeqRef,
+    pub(crate) block: Option<&'a mut super::super::latent_window_attention::BlockWindow>,
 }
 
 /// Dense view over owned mixer weight bytes.
@@ -903,13 +922,24 @@ impl DeepseekMixer {
         layers: usize,
         rows: usize,
     ) -> Result<Self> {
+        Self::new_range(ctx, s, spec, 0..layers, rows)
+    }
+
+    fn new_range(
+        ctx: &Arc<CudaContext>,
+        s: &Arc<CudaStream>,
+        spec: &ModelSpec,
+        range: std::ops::Range<usize>,
+        rows: usize,
+    ) -> Result<Self> {
         let ds = spec
             .deepseek_v41
             .as_ref()
             .context("DeepSeek-V4.1 geometry missing")?;
         let geometry = MixerGeometry::new(spec)?;
+        let layers = range.len();
         ensure!(
-            layers > 0 && layers <= ds.compress_ratios.len(),
+            layers > 0 && range.end <= ds.compress_ratios.len(),
             "DeepSeek-V4.1 mixer layer count {layers} is zero or exceeds the compress_ratios extent {}",
             ds.compress_ratios.len()
         );
@@ -918,7 +948,7 @@ impl DeepseekMixer {
             "DeepSeek-V4.1 mixer needs at least one row (workspace capacity)"
         );
         let mut inv_freq = Vec::with_capacity(layers);
-        for layer in 0..layers {
+        for layer in range.clone() {
             let ratio = ds.compress_ratios[layer];
             let freqs = rotary_inv_freq(spec, ds, ratio)?;
             inv_freq.push(s.clone_htod(&freqs)?);
@@ -947,7 +977,7 @@ impl DeepseekMixer {
         Ok(Self {
             ops: LatentWindowAttention::new(ctx)?,
             dsa: None,
-            compress_ratios: ds.compress_ratios[..layers].to_vec(),
+            compress_ratios: ds.compress_ratios[range].to_vec(),
             common: CommonOpsRef::new(ctx)?,
             geometry,
             layout,
@@ -1051,12 +1081,42 @@ impl DeepseekMixer {
         Ok(())
     }
 
+    fn project<const ACCURATE: bool>(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        weight: &Fp8Projection,
+        input: (Tensor<u8, 2>, Tensor<u8, 2>),
+        output: TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let n = output.0.shape[1];
+        let k = input.0.shape[1];
+        let weight = super::super::linear::LinearWeightRef::Fp8 {
+            codes: weight_view::<u8, 2>(&weight.codes, s, [n, k], "projection codes")?,
+            scale: super::super::linear::Fp8ScaleRef::E8m0(weight_view::<u8, 2>(
+                &weight.scale,
+                s,
+                [n.div_ceil(32), k.div_ceil(32)],
+                "projection scales",
+            )?),
+            layout: self.layout,
+        };
+        let ops = blas.fp8_ops()?;
+        let scale = super::super::linear::Fp8ScaleRef::E8m0(input.1);
+        let plan = if ACCURATE {
+            ops.bind_accurate_block(weight, input.0, scale, &output)?
+        } else {
+            ops.bind_block(weight, input.0, scale, &output)?
+        };
+        plan.run(s)
+    }
+
     /// One decode step of `step.rows` rows at positions
     /// `step.position..step.position+step.rows` (model definition
     /// Attention.forward with start_pos = position): the projections run over
     /// the row batch, then each row writes its ring slot and attends over the
     /// visible window ending at its own position, oldest first.
-    pub(crate) fn run(
+    pub(crate) fn run<const ACCURATE: bool>(
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
@@ -1072,6 +1132,7 @@ impl DeepseekMixer {
             qkv,
             out,
             seq,
+            block,
         } = step;
         let g = &self.geometry;
         let q_width = g.heads * g.head_dim;
@@ -1114,17 +1175,19 @@ impl DeepseekMixer {
                 && out.len() >= rows * g.hidden,
             "DeepSeek-V4.1 mixer work buffers do not hold {rows} rows"
         );
-        let fp8 = blas.fp8_ops()?;
         #[cfg(test)]
         let capture_query = |stage: &str, values: &CudaSlice<bf16>, width: usize| -> Result<()> {
-            if layer == 4
-                && position == 128
-                && rows == 1
-                && std::env::var_os("FF_DS41_LAYERS_FIXTURE").is_some()
+            let staged = self.query_stores.borrow().contains_key("staged");
+            if staged
+                || (layer == 4
+                    && position == 128
+                    && rows == 1
+                    && std::env::var_os("FF_DS41_LAYERS_FIXTURE").is_some())
             {
+                let count = if staged { rows * width } else { width };
                 self.query_stores
                     .borrow_mut()
-                    .insert(stage.to_owned(), s.clone_dtoh(&values.slice(..width))?);
+                    .insert(stage.to_owned(), s.clone_dtoh(&values.slice(..count))?);
             }
             Ok(())
         };
@@ -1136,37 +1199,28 @@ impl DeepseekMixer {
                     x_scales: &CudaSlice<u8>,
                     y: TensorMut<bf16, 2>|
          -> Result<()> {
-            let weight_codes = weight_view::<u8, 2>(
-                &weight.codes,
+            ensure!(
+                y.0.shape == [rows as u32, n as u32],
+                "projection output extent"
+            );
+            Self::project::<ACCURATE>(
+                self,
                 s,
-                [n as u32, k as u32],
-                &format!("{name} codes"),
-            )?;
-            let weight_scales = weight_view::<u8, 2>(
-                &weight.scale,
-                s,
-                [n.div_ceil(32) as u32, k.div_ceil(32) as u32],
-                &format!("{name} scales"),
-            )?;
-            let act_codes = view(x_codes, s, 0, [rows as u32, k as u32], [k as u64, 1])?;
-            let act_scales = view(
-                x_scales,
-                s,
-                0,
-                [rows as u32, k.div_ceil(32) as u32],
-                [k.div_ceil(32) as u64, 1],
-            )?;
-            let plan = fp8.bind_block(
-                crate::backend::cuda::linear::LinearWeightRef::Fp8 {
-                    codes: weight_codes,
-                    scale: crate::backend::cuda::linear::Fp8ScaleRef::E8m0(weight_scales),
-                    layout: self.layout,
-                },
-                act_codes,
-                crate::backend::cuda::linear::Fp8ScaleRef::E8m0(act_scales),
-                &y,
-            )?;
-            plan.run(s)
+                blas,
+                weight,
+                (
+                    view(x_codes, s, 0, [rows as u32, k as u32], [k as u64, 1])?,
+                    view(
+                        x_scales,
+                        s,
+                        0,
+                        [rows as u32, k.div_ceil(32) as u32],
+                        [k.div_ceil(32) as u64, 1],
+                    )?,
+                ),
+                y,
+            )
+            .with_context(|| format!("DeepSeek {name}"))
         };
         let x_view = view(
             x,
@@ -1299,6 +1353,13 @@ impl DeepseekMixer {
             &self.act_hidden_scales,
             TensorMut(kv),
         )?;
+        #[cfg(test)]
+        if self.query_stores.borrow().contains_key("staged") {
+            self.query_stores.borrow_mut().insert(
+                "kv_a".into(),
+                s.clone_dtoh(&qkv.slice(rows * q_width..rows * (q_width + g.head_dim)))?,
+            );
+        }
         let kv3 = view(
             qkv,
             s,
@@ -1314,6 +1375,13 @@ impl DeepseekMixer {
             &mut TensorMut(kv3),
             options,
         )?;
+        #[cfg(test)]
+        if self.query_stores.borrow().contains_key("staged") {
+            self.query_stores.borrow_mut().insert(
+                "kv_norm".into(),
+                s.clone_dtoh(&qkv.slice(rows * q_width..rows * (q_width + g.head_dim)))?,
+            );
+        }
         // Rotary rows for this step's positions, then the tail rotation on q
         // and kv (model definition apply_rotary_emb, adjacent pairs).
         let mut fwd = TensorMut(view(
@@ -1351,6 +1419,10 @@ impl DeepseekMixer {
             rotary,
         )?;
         rope.rope_pair_tail(s, &mut TensorMut(kv3), rotary)?;
+        ensure!(
+            block.is_none() || self.compress_ratios[layer] == 0,
+            "block attention requires uncompressed KV"
+        );
         let indexed = if self.compress_ratios[layer] != 0 {
             let runtime = self
                 .dsa
@@ -1361,78 +1433,180 @@ impl DeepseekMixer {
         } else {
             None
         };
-        // Per row: write the ring slot, list the visible slots oldest first,
-        // attend. Later rows see earlier rows' writes and never the reverse.
-        let mut codes = TensorMut(view(
-            &ring.codes,
-            s,
-            0,
-            [g.window as u32, g.head_dim as u32],
-            [g.head_dim as u64, 1],
-        )?);
-        let mut scales = TensorMut(view(
-            &ring.scales,
-            s,
-            0,
-            [g.window as u32, (g.head_dim / 32) as u32],
-            [(g.head_dim / 32) as u64, 1],
-        )?);
-        let sink = weight_view::<f32, 1>(&weights.attn_sink, s, [g.heads as u32], "attn_sink")?;
-        let p_mode: i32 = 0;
-        for row in 0..rows {
-            let position = Position::Sequence {
-                meta: seq,
-                row: row as u32,
-            };
-            self.ops.ring_write(
+        if let Some(block) = block {
+            let capacity = g.window + rows;
+            ensure!(
+                block.codes.len() == capacity * g.head_dim
+                    && block.scales.len() == capacity * g.head_dim / 32
+                    && block.slots.len() == capacity,
+                "block attention workspace extent"
+            );
+            s.memcpy_dtod(
+                &ring.codes,
+                &mut block.codes.slice_mut(..g.window * g.head_dim),
+            )?;
+            s.memcpy_dtod(
+                &ring.scales,
+                &mut block.scales.slice_mut(..g.window * g.head_dim / 32),
+            )?;
+            self.ops.act_quant(
                 s,
-                view(
-                    qkv,
+                kv,
+                &mut TensorMut(view(
+                    &block.codes,
                     s,
-                    rows * q_width + row * g.head_dim,
-                    [1, g.head_dim as u32],
+                    g.window * g.head_dim,
+                    [rows as u32, g.head_dim as u32],
                     [g.head_dim as u64, 1],
-                )?,
-                position,
-                &mut codes,
-                &mut scales,
+                )?),
+                &mut TensorMut(view(
+                    &block.scales,
+                    s,
+                    g.window * g.head_dim / 32,
+                    [rows as u32, (g.head_dim / 32) as u32],
+                    [(g.head_dim / 32) as u64, 1],
+                )?),
             )?;
-            if let Some(runtime) = indexed {
-                runtime.attention(s, layer, rows, row)?;
-                continue;
-            }
-            let visible = g.window;
-            self.ops.window_slots(
+            self.ops.block_slots(
                 s,
-                &mut TensorMut(view(&self.slots, s, 0, [visible as u32], [1])?),
-                position,
+                &mut TensorMut(view(&block.slots, s, 0, [capacity as u32], [1])?),
+                seq,
+                g.window,
+                rows,
             )?;
-            self.ops.run(
+            let codes = view(
+                &block.codes,
                 s,
-                LwaInputs {
-                    q: view(
-                        qkv,
+                0,
+                [capacity as u32, g.head_dim as u32],
+                [g.head_dim as u64, 1],
+            )?;
+            let scales = view(
+                &block.scales,
+                s,
+                0,
+                [capacity as u32, (g.head_dim / 32) as u32],
+                [(g.head_dim / 32) as u64, 1],
+            )?;
+            let slots = view(&block.slots, s, 0, [capacity as u32], [1])?;
+            let sink = weight_view::<f32, 1>(&weights.attn_sink, s, [g.heads as u32], "attn_sink")?;
+            for row in 0..rows {
+                self.ops.run::<ACCURATE>(
+                    s,
+                    LwaInputs {
+                        q: view(
+                            qkv,
+                            s,
+                            row * q_width,
+                            [g.heads as u32, g.head_dim as u32],
+                            [g.head_dim as u64, 1],
+                        )?,
+                        k_codes: codes,
+                        k_scales: scales,
+                        slot_ids: slots,
+                        sink,
+                        inv_rotary: view(
+                            &self.rotary_inv,
+                            s,
+                            row * g.rotary,
+                            [g.rotary as u32],
+                            [1],
+                        )?,
+                    },
+                    &mut TensorMut(view(
+                        &self.o,
                         s,
                         row * q_width,
                         [g.heads as u32, g.head_dim as u32],
                         [g.head_dim as u64, 1],
-                    )?,
-                    k_codes: codes.0,
-                    k_scales: scales.0,
-                    slot_ids: view(&self.slots, s, 0, [visible as u32], [1])?,
-                    sink,
-                    inv_rotary: view(&self.rotary_inv, s, row * g.rotary, [g.rotary as u32], [1])?,
-                },
-                &mut TensorMut(view(
-                    &self.o,
+                    )?),
+                    0,
+                    Position::Sequence {
+                        meta: seq,
+                        row: (rows - 1) as u32,
+                    },
+                )?;
+            }
+        } else {
+            // Per row: write the ring slot, list the visible slots oldest first,
+            // attend. Later rows see earlier rows' writes and never the reverse.
+            let mut codes = TensorMut(view(
+                &ring.codes,
+                s,
+                0,
+                [g.window as u32, g.head_dim as u32],
+                [g.head_dim as u64, 1],
+            )?);
+            let mut scales = TensorMut(view(
+                &ring.scales,
+                s,
+                0,
+                [g.window as u32, (g.head_dim / 32) as u32],
+                [(g.head_dim / 32) as u64, 1],
+            )?);
+            let sink = weight_view::<f32, 1>(&weights.attn_sink, s, [g.heads as u32], "attn_sink")?;
+            let p_mode: i32 = 0;
+            for row in 0..rows {
+                let position = Position::Sequence {
+                    meta: seq,
+                    row: row as u32,
+                };
+                self.ops.ring_write(
                     s,
-                    row * q_width,
-                    [g.heads as u32, g.head_dim as u32],
-                    [g.head_dim as u64, 1],
-                )?),
-                p_mode,
-                position,
-            )?;
+                    view(
+                        qkv,
+                        s,
+                        rows * q_width + row * g.head_dim,
+                        [1, g.head_dim as u32],
+                        [g.head_dim as u64, 1],
+                    )?,
+                    position,
+                    &mut codes,
+                    &mut scales,
+                )?;
+                if let Some(runtime) = indexed {
+                    runtime.attention(s, layer, rows, row)?;
+                    continue;
+                }
+                let visible = g.window;
+                self.ops.window_slots(
+                    s,
+                    &mut TensorMut(view(&self.slots, s, 0, [visible as u32], [1])?),
+                    position,
+                )?;
+                self.ops.run::<false>(
+                    s,
+                    LwaInputs {
+                        q: view(
+                            qkv,
+                            s,
+                            row * q_width,
+                            [g.heads as u32, g.head_dim as u32],
+                            [g.head_dim as u64, 1],
+                        )?,
+                        k_codes: codes.0,
+                        k_scales: scales.0,
+                        slot_ids: view(&self.slots, s, 0, [visible as u32], [1])?,
+                        sink,
+                        inv_rotary: view(
+                            &self.rotary_inv,
+                            s,
+                            row * g.rotary,
+                            [g.rotary as u32],
+                            [1],
+                        )?,
+                    },
+                    &mut TensorMut(view(
+                        &self.o,
+                        s,
+                        row * q_width,
+                        [g.heads as u32, g.head_dim as u32],
+                        [g.head_dim as u64, 1],
+                    )?),
+                    p_mode,
+                    position,
+                )?;
+            }
         }
         // Attention output: per-32 quantization before the einsum, then the
         // block-diagonal wo_a per group and wo_b (model definition :786-790).
@@ -1460,7 +1634,7 @@ impl DeepseekMixer {
                 [(q_width / 32) as u64, 1],
             )?),
         )?;
-        self.ops.group_project(
+        self.ops.group_project::<ACCURATE>(
             s,
             view(
                 &self.o_codes,
@@ -1716,15 +1890,24 @@ pub struct DeepseekFfn {
     shared_out: CudaSlice<bf16>,
     routed_scratch: CudaSlice<u8>,
     shared_scratch: CudaSlice<u8>,
+    #[cfg(test)]
+    capture_projections: bool,
+    #[cfg(test)]
+    projected_routed: Option<CudaSlice<bf16>>,
+    #[cfg(test)]
+    projected_shared: Option<CudaSlice<bf16>>,
     eps: f32,
     tiered: bool,
     #[cfg(feature = "cuda")]
     pub(super) graphs: Vec<(CudaGraph, CudaGraph)>,
+    #[cfg(feature = "cuda")]
+    verify_graphs: std::collections::BTreeMap<usize, Vec<(CudaGraph, CudaGraph)>>,
 }
 
 struct DeepseekFfnRun<'a> {
     s: &'a Arc<CudaStream>,
     rows: usize,
+    route_rows: usize,
     x: &'a CudaSlice<bf16>,
     out: &'a mut CudaSlice<bf16>,
     layer: usize,
@@ -1790,12 +1973,38 @@ impl DeepseekFfn {
             .deepseek_v41
             .as_ref()
             .context("DeepSeek-V4.1 geometry missing")?;
-        let geometry = FfnGeometry::new(spec)?;
         ensure!(
             layers > 0 && layers <= ds.num_hidden_layers as usize,
             "DeepSeek-V4.1 FFN layer count {layers} is zero or exceeds the depth {}",
             ds.num_hidden_layers
         );
+        let mut scope = crate::experts::catalogue::ExpertGeometry::from_model(spec)?;
+        scope.layers = u32::try_from(layers)?;
+        Self::new_scoped(ctx, s, spec, scope, rows)
+    }
+
+    fn new_scoped(
+        ctx: &Arc<CudaContext>,
+        s: &Arc<CudaStream>,
+        spec: &ModelSpec,
+        scope: crate::experts::catalogue::ExpertGeometry,
+        rows: usize,
+    ) -> Result<Self> {
+        let mut geometry = FfnGeometry::new(spec)?;
+        ensure!(
+            scope.layers > 0
+                && scope.hidden as usize == geometry.hidden
+                && scope.intermediate as usize == geometry.expert_intermediate
+                && scope.experts > 0
+                && scope.experts <= 1024
+                && scope.top_k > 0
+                && scope.top_k <= scope.experts
+                && scope.top_k <= 32,
+            "scoped FFN geometry mismatch"
+        );
+        geometry.experts = scope.experts as usize;
+        geometry.top_k = scope.top_k as usize;
+        let layers = scope.layers as usize;
         ensure!(
             rows > 0,
             "DeepSeek-V4.1 FFN needs at least one row (workspace capacity)"
@@ -1809,6 +2018,8 @@ impl DeepseekFfn {
         Ok(Self {
             #[cfg(feature = "cuda")]
             graphs: Vec::new(),
+            #[cfg(feature = "cuda")]
+            verify_graphs: std::collections::BTreeMap::new(),
             route,
             experts: w4a8::MoeExpertW4A8::new(ctx)?,
             shared: w8a8::MoeSharedW8A8::new(ctx)?,
@@ -1826,6 +2037,12 @@ impl DeepseekFfn {
             route_weights: s.alloc_zeros(rows * top_k)?,
             contributions: s.alloc_zeros(rows * top_k * hidden)?,
             shared_out: s.alloc_zeros(rows * hidden)?,
+            #[cfg(test)]
+            capture_projections: false,
+            #[cfg(test)]
+            projected_routed: None,
+            #[cfg(test)]
+            projected_shared: None,
             routed_scratch: s.alloc_zeros(
                 usize::try_from(w4a8::scratch_bytes(
                     hidden as u32,
@@ -2064,7 +2281,7 @@ impl DeepseekFfn {
         }
         #[cfg(feature = "cuda")]
         ensure!(
-            self.graphs.is_empty(),
+            self.graphs.is_empty() && self.verify_graphs.is_empty(),
             "DeepSeek graph workspace growth requires setup rebinding"
         );
         let g = &self.geometry;
@@ -2256,7 +2473,9 @@ impl DeepseekFfn {
         rows: usize,
         x: &CudaSlice<bf16>,
         layer: usize,
+        route_rows: usize,
     ) -> Result<()> {
+        ensure!(route_rows > 0 && route_rows <= rows, "router row extent");
         let g = &self.geometry;
         let bound = self
             .layers
@@ -2264,27 +2483,52 @@ impl DeepseekFfn {
             .with_context(|| format!("DeepSeek-V4.1 FFN layer {layer} has no bound weights"))?
             .as_ref()
             .with_context(|| format!("DeepSeek-V4.1 FFN layer {layer} has no bound weights"))?;
-        let x2 = view(
-            x,
-            s,
-            0,
-            [rows as u32, g.hidden as u32],
-            [g.hidden as u64, 1],
-        )?;
         let router = weight_view::<bf16, 2>(
             &bound.weights.gate_weight,
             s,
             [g.experts as u32, g.hidden as u32],
             "gate_weight",
         )?;
-        let mut logits = TensorMut(view(
+        for first in (0..rows).step_by(route_rows) {
+            let count = route_rows.min(rows - first);
+            let input = view(
+                x,
+                s,
+                first * g.hidden,
+                [count as u32, g.hidden as u32],
+                [g.hidden as u64, 1],
+            )?;
+            let mut logits = TensorMut(view(
+                &self.logits,
+                s,
+                first * g.experts,
+                [count as u32, g.experts as u32],
+                [g.experts as u64, 1],
+            )?);
+            self.route.logits_f32(s, input, router, &mut logits)?;
+        }
+        self.select_only::<false>(s, rows, layer)
+    }
+
+    fn select_only<const LITERAL_THREE: bool>(
+        &self,
+        s: &Arc<CudaStream>,
+        rows: usize,
+        layer: usize,
+    ) -> Result<()> {
+        let g = &self.geometry;
+        let bound = self
+            .layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .context("route selection weights missing")?;
+        let logits = view(
             &self.logits,
             s,
             0,
             [rows as u32, g.experts as u32],
             [g.experts as u64, 1],
-        )?);
-        self.route.logits_f32(s, x2, router, &mut logits)?;
+        )?;
         let bias = view(
             &bound.bias_expanded,
             s,
@@ -2306,8 +2550,8 @@ impl DeepseekFfn {
             [rows as u32, g.top_k as u32],
             [g.top_k as u64, 1],
         )?);
-        self.route.topk_noaux_f32(
-            logits.0,
+        self.route.topk_noaux_f32::<_, LITERAL_THREE>(
+            logits,
             Some(bias),
             &mut ids,
             &mut route_weights,
@@ -2328,6 +2572,7 @@ impl DeepseekFfn {
         self.run_with_tier(DeepseekFfnRun {
             s,
             rows,
+            route_rows: rows,
             x,
             out,
             layer,
@@ -2342,6 +2587,7 @@ impl DeepseekFfn {
         let DeepseekFfnRun {
             s,
             rows,
+            route_rows,
             x,
             out,
             layer,
@@ -2362,7 +2608,7 @@ impl DeepseekFfn {
         );
         #[cfg(test)]
         let route_range = super::super::profile::Range::new(true, c"D1 FFN route");
-        self.route_only(s, rows, x, layer)?;
+        self.route_only(s, rows, x, layer, route_rows)?;
         #[cfg(test)]
         drop(route_range);
         #[cfg(test)]
@@ -2381,7 +2627,7 @@ impl DeepseekFfn {
         }
         #[cfg(test)]
         drop(service_range);
-        self.contribute(s, rows, (x, out), layer, accumulator, tier)
+        self.contribute::<false>(s, rows, (x, out), layer, accumulator, tier)
     }
 
     fn service_tier(
@@ -2395,12 +2641,40 @@ impl DeepseekFfn {
         let count = rows * self.geometry.top_k;
         let ids = s.clone_dtoh(&self.ids.slice(..count))?;
         let weights = s.clone_dtoh(&self.route_weights.slice(..count))?;
-        slots.resolve_native(u32::try_from(layer)?, &ids, &weights)?;
+        #[cfg(test)]
+        let tiers = SUPPLY_CENSUS.with(|records| -> Result<Option<Vec<u8>>> {
+            if records.borrow().is_none() {
+                return Ok(None);
+            }
+            let tiers = (0..self.geometry.experts)
+                .map(|expert| {
+                    Ok(
+                        match slots.tier(u32::try_from(layer)?, u32::try_from(expert)?)? {
+                            crate::experts::plan::Tier::Gpu => 0,
+                            crate::experts::plan::Tier::Host => 1,
+                            crate::experts::plan::Tier::Disk => 2,
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(tiers))
+        })?;
+        let refills = slots.resolve_native(u32::try_from(layer)?, &ids, &weights)?;
+        #[cfg(not(test))]
+        let _ = refills;
+        #[cfg(test)]
+        if let Some(tiers) = tiers {
+            census_record(serde_json::json!({
+                "kind": "route", "experts": self.geometry.experts,
+                "top_k": self.geometry.top_k, "layer": layer, "rows": rows,
+                "ids": ids, "weights": weights, "tiers_before": tiers, "refills": refills,
+            }));
+        }
         slots.wait_refill(s)?;
         self.sync_tier(s, layer, slots)
     }
 
-    fn contribute(
+    fn contribute<const ACCURATE: bool>(
         &self,
         s: &Arc<CudaStream>,
         rows: usize,
@@ -2493,8 +2767,29 @@ impl DeepseekFfn {
                 intermediate: g.expert_intermediate as u32,
                 swiglu_limit: g.limit,
                 contributions: &mut contributions,
+                #[cfg(test)]
+                projection_capture: self
+                    .projected_routed
+                    .as_ref()
+                    .filter(|_| self.capture_projections)
+                    .map(|data| {
+                        view(
+                            data,
+                            s,
+                            0,
+                            [rows as u32, g.top_k as u32, 3, g.expert_intermediate as u32],
+                            [
+                                (g.top_k * 3 * g.expert_intermediate) as u64,
+                                (3 * g.expert_intermediate) as u64,
+                                g.expert_intermediate as u64,
+                                1,
+                            ],
+                        )
+                    })
+                    .transpose()?,
             };
-            self.experts.run_dispatch(s, dispatch, &routed_scratch.0)?;
+            self.experts
+                .run_dispatch::<ACCURATE>(s, dispatch, &routed_scratch.0)?;
         }
         if let Some(slots) = tier.as_mut()
             && slots.has_pool()
@@ -2555,11 +2850,26 @@ impl DeepseekFfn {
                 x: view(x, s, row * g.hidden, [hidden], [1])?,
                 weights: &shared_weights,
                 swiglu_limit: g.limit,
+                #[cfg(test)]
+                projection_capture: self
+                    .projected_shared
+                    .as_ref()
+                    .filter(|_| self.capture_projections)
+                    .map(|data| {
+                        view(
+                            data,
+                            s,
+                            row * 3 * g.shared_intermediate,
+                            [3, sinter],
+                            [u64::from(sinter), 1],
+                        )
+                    })
+                    .transpose()?,
             };
             let mut shared_row =
                 TensorMut(view(&self.shared_out, s, row * g.hidden, [hidden], [1])?);
             self.shared
-                .run(s, input, &shared_scratch.0, &mut shared_row)?;
+                .run::<ACCURATE>(s, input, &shared_scratch.0, &mut shared_row)?;
         }
         self.combine.combine_accum(
             s,
@@ -2602,38 +2912,75 @@ impl DeepseekFfn {
             shared_out: &self.shared_out,
         }
     }
+
+    #[cfg(test)]
+    fn set_projection_capture(&mut self, s: &Arc<CudaStream>, enabled: bool) -> Result<()> {
+        self.capture_projections = enabled;
+        if enabled && self.projected_routed.is_none() {
+            self.projected_routed = Some(s.alloc_zeros(
+                self.rows * self.geometry.top_k * 3 * self.geometry.expert_intermediate,
+            )?);
+            self.projected_shared =
+                Some(s.alloc_zeros(self.rows * 3 * self.geometry.shared_intermediate)?);
+        }
+        Ok(())
+    }
 }
 
 impl Engine {
     #[cfg(feature = "cuda")]
     pub(super) fn capture_deepseek(&mut self) -> Result<()> {
+        let rows = if self.spec.as_ref().is_some_and(|s| s.staged.is_some()) {
+            4
+        } else {
+            1
+        };
+        for rows in 1..=rows {
+            self.capture_deepseek_rows(rows)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn capture_deepseek_rows(&mut self, rows: usize) -> Result<()> {
         ensure!(!self.poisoned, "DeepSeek capture requires healthy state");
         ensure!(
             self.position < self.capacity,
             "DeepSeek capture exceeds capacity"
         );
-        ensure!(self.spec.is_none(), "DeepSeek graph draft is not bound");
+        ensure!(
+            self.spec.is_none() || self.spec.as_ref().is_some_and(|s| s.staged.is_some()),
+            "DeepSeek graph draft is not bound"
+        );
         let ffn = self
             .deepseek_ffn
             .as_ref()
             .context("DeepSeek graph FFN missing")?;
         ensure!(ffn.tiered, "DeepSeek graph tier binding missing");
-        if ffn.graphs.len() == self.config.num_hidden_layers {
+        let bound = if rows == 1 {
+            Some(&ffn.graphs)
+        } else {
+            ffn.verify_graphs.get(&rows)
+        };
+        if bound.is_some_and(|g| g.len() == self.config.num_hidden_layers) {
             return Ok(());
         }
-        ensure!(ffn.graphs.is_empty(), "partial DeepSeek graph publication");
+        ensure!(
+            bound.is_none_or(Vec::is_empty),
+            "partial DeepSeek graph publication"
+        );
         let mut graphs = Vec::with_capacity(self.config.num_hidden_layers);
         let result = (|| -> Result<()> {
             self.ensure_decode()?;
-            self.prepare(1)?;
+            self.prepare(rows)?;
             self.device.finish_upload()?;
             let before = self.device.ctx.mem_get_info()?.0;
             for layer in 0..self.config.num_hidden_layers {
                 let prefix = super::moe::graphs::record(self, |engine| {
-                    engine.deepseek_graph_segment(layer, false)
+                    engine.deepseek_graph_segment(layer, false, rows)
                 })?;
                 let suffix = super::moe::graphs::record(self, |engine| {
-                    engine.deepseek_graph_segment(layer, true)
+                    engine.deepseek_graph_segment(layer, true, rows)
                 })?;
                 graphs.push((prefix, suffix));
             }
@@ -2641,7 +2988,7 @@ impl Engine {
             eprintln!(
                 "{}",
                 serde_json::json!({"deepseek_graph_binding": {
-                    "segments": graphs.len() * 2,
+                    "rows": rows, "segments": graphs.len() * 2,
                     "allocation_bytes": before.saturating_sub(after),
                     "free_before_bytes": before, "free_after_bytes": after,
                     "capacity_basis": "free memory after graph allocation"
@@ -2653,21 +3000,34 @@ impl Engine {
             self.poisoned = true;
             return Err(error.context("DeepSeek graph capture transaction"));
         }
-        self.deepseek_ffn
+        let ffn = self
+            .deepseek_ffn
             .as_mut()
-            .context("DeepSeek graph FFN missing")?
-            .graphs = graphs;
+            .context("DeepSeek graph FFN missing")?;
+        if rows == 1 {
+            ffn.graphs = graphs;
+        } else {
+            ffn.verify_graphs.insert(rows, graphs);
+        }
         Ok(())
     }
 
     #[cfg(feature = "cuda")]
-    fn deepseek_graph_segment(&mut self, layer: usize, suffix: bool) -> Result<()> {
+    fn deepseek_graph_segment(&mut self, layer: usize, suffix: bool, rows: usize) -> Result<()> {
         use crate::model::{LayerProgram, LayerStage};
         let step = crate::backend::Step {
-            rows: 1,
-            input: crate::backend::Input::Token,
+            rows,
+            input: if rows == 1 {
+                crate::backend::Input::Token
+            } else {
+                crate::backend::Input::Ids
+            },
             mask: crate::backend::Mask::Causal,
-            head: Head::Last,
+            head: if self.spec.as_ref().is_some_and(|s| s.staged.is_some()) {
+                Head::All
+            } else {
+                Head::Last
+            },
         };
         let LayerProgram::Hc(stages) = crate::model::layer_program(&self.model_spec, layer)? else {
             anyhow::bail!("DeepSeek graph requires mHC layer program");
@@ -2680,9 +3040,9 @@ impl Engine {
             self.deepseek_ffn
                 .as_ref()
                 .context("DeepSeek graph FFN missing")?
-                .contribute(
+                .contribute::<false>(
                     &self.device.stream,
-                    1,
+                    rows,
                     (&self.work.n, &mut self.work.out),
                     layer,
                     Accumulator::Fp32,
@@ -2692,11 +3052,12 @@ impl Engine {
             if layer == 0 {
                 self.deepseek_embed(step)?;
             }
+            self.capture_deepseek_input(layer, rows)?;
             if let Some(engram) = &self.deepseek_engram {
                 engram.run(
                     &self.device.stream,
                     layer,
-                    1,
+                    rows,
                     self.hc.as_mut().context("DeepSeek graph mHC missing")?,
                 )?;
             }
@@ -2715,28 +3076,48 @@ impl Engine {
             self.deepseek_ffn
                 .as_mut()
                 .context("DeepSeek graph FFN missing")?
-                .route_only(&self.device.stream, 1, &self.work.n, layer)?;
+                .route_only(
+                    &self.device.stream,
+                    rows,
+                    &self.work.n,
+                    layer,
+                    if step.head == Head::All { 1 } else { rows },
+                )?;
         } else if layer + 1 == self.config.num_hidden_layers {
             self.deepseek_operator(crate::backend::Operator::Head, 0, step)?;
-            self.work.advance(&self.ops, &self.device.stream)?;
+            if self.spec.is_none() {
+                self.work.advance(&self.ops, &self.device.stream)?;
+            }
         }
         Ok(())
     }
 
     #[cfg(feature = "cuda")]
     pub(super) fn run_deepseek_graph(&mut self) -> Result<()> {
+        self.run_deepseek_graph_rows(1)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn run_deepseek_graph_rows(&mut self, rows: usize) -> Result<()> {
         ensure!(
             self.deepseek_engram
                 .as_ref()
-                .is_some_and(|e| e.prepared == Some((self.position, 1))),
+                .is_some_and(|e| e.prepared == Some((self.position, rows))),
             "DeepSeek graph Engram records are stale"
         );
         let ffn = self
             .deepseek_ffn
             .as_mut()
             .context("DeepSeek graph FFN missing")?;
+        let graphs = if rows == 1 {
+            std::mem::take(&mut ffn.graphs)
+        } else {
+            ffn.verify_graphs
+                .remove(&rows)
+                .context("DeepSeek verify graph shape missing")?
+        };
         ensure!(
-            ffn.graphs.len() == self.config.num_hidden_layers,
+            graphs.len() == self.config.num_hidden_layers,
             "DeepSeek decode graphs are not captured"
         );
         let slots = self
@@ -2748,24 +3129,24 @@ impl Engine {
         }
         slots.begin_token()?;
         let executed = (|| -> Result<()> {
-            for layer in 0..ffn.graphs.len() {
+            for (layer, (prefix, suffix)) in graphs.iter().enumerate() {
                 #[cfg(test)]
                 let prefix_range = census_range(
                     true,
                     self.position,
                     &format!("layer={layer} segment=prefix"),
                 );
-                ffn.graphs[layer].0.launch()?;
+                prefix.launch()?;
                 #[cfg(test)]
                 drop(prefix_range);
-                ffn.service_tier(&self.device.stream, 1, layer, slots)?;
+                ffn.service_tier(&self.device.stream, rows, layer, slots)?;
                 #[cfg(test)]
                 let suffix_range = census_range(
                     true,
                     self.position,
                     &format!("layer={layer} segment=suffix"),
                 );
-                ffn.graphs[layer].1.launch()?;
+                suffix.launch()?;
                 #[cfg(test)]
                 drop(suffix_range);
                 slots.record_all_readers(&self.device.stream)?;
@@ -2773,8 +3154,40 @@ impl Engine {
             Ok(())
         })();
         let completed = slots.finish_token();
+        if rows == 1 {
+            ffn.graphs = graphs;
+        } else {
+            ffn.verify_graphs.insert(rows, graphs);
+        }
         executed?;
         completed
+    }
+
+    pub(super) fn capture_deepseek_input(&mut self, layer: usize, rows: usize) -> Result<()> {
+        let Some(capture) = self.hidden_capture.as_mut() else {
+            return Ok(());
+        };
+        let Some(slot) = capture.layer_slots[layer] else {
+            return Ok(());
+        };
+        let s = &self.device.stream;
+        self.hc
+            .as_ref()
+            .context("draft input mHC missing")?
+            .mean(s, rows, &mut self.work.x)?;
+        copy::columns(
+            s,
+            &self.work.x,
+            &mut capture.values.slice_mut(..rows * capture.width),
+            copy::Rect {
+                rows,
+                width: self.config.hidden_size,
+                src_pitch: self.config.hidden_size,
+                src_col: 0,
+                dst_pitch: capture.width,
+                dst_col: slot as usize * self.config.hidden_size,
+            },
+        )
     }
 
     fn deepseek_embed(&mut self, step: crate::backend::Step<'_>) -> Result<()> {
@@ -2826,6 +3239,10 @@ impl Engine {
             "DeepSeek-V4.1 tree execution is not bound yet"
         );
         if matches!(op, crate::backend::Operator::Head) {
+            #[cfg(feature = "cuda")]
+            if step.head == Head::All {
+                return self.staged_head(step.rows);
+            }
             ensure!(
                 step.head != Head::All,
                 "DeepSeek-V4.1 Head::All is not bound"
@@ -2948,6 +3365,13 @@ impl Engine {
             !matches!(step.mask, crate::backend::Mask::Tree { .. }),
             "DeepSeek-V4.1 tree execution is not bound yet"
         );
+        let route_rows = if step.head == Head::All
+            && self.spec.as_ref().is_some_and(|spec| spec.staged.is_some())
+        {
+            1
+        } else {
+            step.rows
+        };
         let Engine {
             deepseek_ffn,
             moe_slots,
@@ -2965,6 +3389,7 @@ impl Engine {
             ffn.run_with_tier(DeepseekFfnRun {
                 s: &device.stream,
                 rows: step.rows,
+                route_rows,
                 x: &work.n,
                 out: &mut work.out,
                 layer,
@@ -3012,7 +3437,7 @@ impl Engine {
         let mixer = deepseek_mixer
             .as_ref()
             .context("DeepSeek-V4.1 mixer runtime is not bound")?;
-        mixer.run(
+        mixer.run::<false>(
             &device.stream,
             blas,
             ops,
@@ -3024,6 +3449,7 @@ impl Engine {
                 qkv: &mut work.qkv,
                 out: &mut work.out,
                 seq,
+                block: None,
             },
             layer,
         )
@@ -3079,7 +3505,23 @@ impl Engine {
         requested_chunk: Option<usize>,
         settings: Settings,
         model_spec: crate::model_spec::ModelSpec,
+        mode: SetupMode,
     ) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        let staged_depth = match mode {
+            SetupMode::Mtp { verify_rows } => {
+                ensure!(
+                    (2..=4).contains(&verify_rows),
+                    "D1 DSpark depth must be 1..=3"
+                );
+                Some(verify_rows - 1)
+            }
+            _ => None,
+        };
+        #[cfg(feature = "cuda")]
+        let staged = staged_depth.is_some();
+        #[cfg(feature = "rocm")]
+        let _ = mode;
         let started = Instant::now();
         ensure!(
             (1..=model_spec.max_position as usize).contains(&capacity),
@@ -3152,6 +3594,15 @@ impl Engine {
             workspace_rows,
             s,
         )?);
+        #[cfg(feature = "cuda")]
+        if staged {
+            state
+                .compressed
+                .as_mut()
+                .context("D1 compression state missing")?
+                .enable_prefixes(4, s)?;
+        }
+
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model_spec)?.row_bytes()?;
         let dsa_shape = model_spec
             .deepseek_v41
@@ -3235,15 +3686,7 @@ impl Engine {
         }
         let mix = MixerGeometry::new(&model_spec)?;
         let ffng = FfnGeometry::new(&model_spec)?;
-        let experts = geometry.experts as usize;
-        let (hidden, shared_i, inter) = (
-            ffng.hidden,
-            ffng.shared_intermediate,
-            ffng.expert_intermediate,
-        );
-        let basis = usize::try_from(crate::backend::cuda::mhc::mix_rows(ds.hc_mult))
-            .context("DeepSeek-V4.1 mHC basis rows overflow")?;
-        let hc_width = ds.hc_mult as usize * hidden;
+        let (hidden, inter) = (ffng.hidden, ffng.expert_intermediate);
         let mut hc = HcRuntime::new(
             &device.ctx,
             s,
@@ -3273,162 +3716,21 @@ impl Engine {
             Some(&manifest),
             false,
             |loader| {
-                fn tensor(
-                    loader: &mut crate::backend::cuda::weights::Loader,
-                    name: &str,
-                    shape: &[usize],
-                    dtype: safetensors::Dtype,
-                ) -> Result<CudaSlice<u8>> {
-                    loader.load_bytes(name, shape, dtype)
-                }
-                let f32_tensor = |loader: &mut crate::backend::cuda::weights::Loader,
-                                  name: &str,
-                                  shape: &[usize]|
-                 -> Result<CudaSlice<u8>> {
-                    tensor(loader, name, shape, safetensors::Dtype::F32)
-                };
-                let e4m3 = |loader: &mut crate::backend::cuda::weights::Loader,
-                            name: &str,
-                            shape: &[usize]|
-                 -> Result<CudaSlice<u8>> {
-                    tensor(loader, name, shape, safetensors::Dtype::F8_E4M3)
-                };
-                let e8m0 = |loader: &mut crate::backend::cuda::weights::Loader,
-                            name: &str,
-                            shape: &[usize]|
-                 -> Result<CudaSlice<u8>> {
-                    tensor(loader, name, shape, safetensors::Dtype::F8_E8M0)
-                };
-                let bf16 = |loader: &mut crate::backend::cuda::weights::Loader,
-                            name: &str,
-                            shape: &[usize]|
-                 -> Result<CudaSlice<u8>> {
-                    tensor(loader, name, shape, safetensors::Dtype::BF16)
-                };
-                let fp8_projection = |loader: &mut crate::backend::cuda::weights::Loader,
-                                      name: &str,
-                                      n: usize,
-                                      k: usize|
-                 -> Result<Fp8Projection> {
-                    Ok(Fp8Projection {
-                        codes: e4m3(loader, &format!("{name}.weight"), &[n, k])?,
-                        scale: e8m0(
-                            loader,
-                            &format!("{name}.scale"),
-                            &[n.div_ceil(32), k.div_ceil(32)],
-                        )?,
-                    })
-                };
                 let mut ffn_layers = Vec::with_capacity(layers);
                 engram.load_weights(loader)?;
                 let dsa = dsa::load_weights(loader, &model_spec)?;
                 for layer in 0..layers {
                     let p = format!("layers.{layer}");
-                    let hc_sublayer = |loader: &mut crate::backend::cuda::weights::Loader,
-                                       role: &str|
-                     -> Result<HcSublayerWeights> {
-                        Ok(HcSublayerWeights {
-                            fn_w: f32_tensor(
-                                loader,
-                                &format!("{p}.hc_{role}_fn"),
-                                &[basis, hc_width],
-                            )?,
-                            base: f32_tensor(loader, &format!("{p}.hc_{role}_base"), &[basis])?,
-                            scale: f32_tensor(loader, &format!("{p}.hc_{role}_scale"), &[3])?,
-                        })
-                    };
-                    hc.bind_layer(
-                        layer,
-                        hc_sublayer(loader, "attn")?,
-                        hc_sublayer(loader, "ffn")?,
+                    let (a, f, m, w) = staged::load_layer(
+                        loader,
+                        &p,
+                        &mix,
+                        &ffng,
+                        deepseek_hc_binding(&model_spec)?,
                     )?;
-                    // Mixer: every projection binds its native codes and scales.
-                    let attn = |role: &str| format!("{p}.attn.{role}");
-                    mixer.bind_layer(
-                        layer,
-                        MixerWeights {
-                            wq_a: fp8_projection(loader, &attn("wq_a"), mix.q_lora, mix.hidden)?,
-                            q_norm: bf16(
-                                loader,
-                                &format!("{p}.attn.q_norm.weight"),
-                                &[mix.q_lora],
-                            )?,
-                            wq_b: fp8_projection(
-                                loader,
-                                &attn("wq_b"),
-                                mix.heads * mix.head_dim,
-                                mix.q_lora,
-                            )?,
-                            wkv: fp8_projection(loader, &attn("wkv"), mix.head_dim, mix.hidden)?,
-                            kv_norm: bf16(
-                                loader,
-                                &format!("{p}.attn.kv_norm.weight"),
-                                &[mix.head_dim],
-                            )?,
-                            attn_sink: f32_tensor(
-                                loader,
-                                &format!("{p}.attn.attn_sink"),
-                                &[mix.heads],
-                            )?,
-                            wo_a: e4m3(
-                                loader,
-                                &format!("{p}.attn.wo_a.weight"),
-                                &[mix.o_groups * mix.o_rank, mix.o_in],
-                            )?,
-                            wo_a_scale: e8m0(
-                                loader,
-                                &format!("{p}.attn.wo_a.scale"),
-                                &[mix.o_groups * mix.o_rank / 32, mix.o_in / 32],
-                            )?,
-                            wo_b: fp8_projection(
-                                loader,
-                                &attn("wo_b"),
-                                mix.hidden,
-                                mix.o_groups * mix.o_rank,
-                            )?,
-                        },
-                    )?;
-                    let blocks = |rows: usize, cols: usize| [rows.div_ceil(32), cols.div_ceil(32)];
-                    ffn_layers.push(FfnWeights {
-                        gate_weight: bf16(
-                            loader,
-                            &format!("{p}.ffn.gate.weight"),
-                            &[experts, hidden],
-                        )?,
-                        gate_bias: f32_tensor(loader, &format!("{p}.ffn.gate.bias"), &[experts])?,
-                        norm: bf16(loader, &format!("{p}.attn_norm.weight"), &[hidden])?,
-                        post_norm: bf16(loader, &format!("{p}.ffn_norm.weight"), &[hidden])?,
-                        shared_gate_codes: e4m3(
-                            loader,
-                            &format!("{p}.ffn.shared_experts.w1.weight"),
-                            &[shared_i, hidden],
-                        )?,
-                        shared_gate_scales: e8m0(
-                            loader,
-                            &format!("{p}.ffn.shared_experts.w1.scale"),
-                            &blocks(shared_i, hidden),
-                        )?,
-                        shared_up_codes: e4m3(
-                            loader,
-                            &format!("{p}.ffn.shared_experts.w3.weight"),
-                            &[shared_i, hidden],
-                        )?,
-                        shared_up_scales: e8m0(
-                            loader,
-                            &format!("{p}.ffn.shared_experts.w3.scale"),
-                            &blocks(shared_i, hidden),
-                        )?,
-                        shared_down_codes: e4m3(
-                            loader,
-                            &format!("{p}.ffn.shared_experts.w2.weight"),
-                            &[hidden, shared_i],
-                        )?,
-                        shared_down_scales: e8m0(
-                            loader,
-                            &format!("{p}.ffn.shared_experts.w2.scale"),
-                            &blocks(hidden, shared_i),
-                        )?,
-                    });
+                    hc.bind_layer(layer, a, f)?;
+                    mixer.bind_layer(layer, m)?;
+                    ffn_layers.push(w);
                 }
                 let mut routed = Vec::with_capacity(layers);
                 let mut expert_uploads = 0usize;
@@ -3446,41 +3748,7 @@ impl Engine {
                     let mut slots = Vec::with_capacity(layer_resident);
                     for expert in 0..layer_resident {
                         let e = format!("{p}.{expert}");
-                        slots.push(RoutedExpertWeights {
-                            gate_codes: tensor(
-                                loader,
-                                &format!("{e}.w1.weight"),
-                                &[inter, hidden.div_ceil(2)],
-                                safetensors::Dtype::I8,
-                            )?,
-                            gate_scales: e8m0(
-                                loader,
-                                &format!("{e}.w1.scale"),
-                                &[inter, hidden.div_ceil(32)],
-                            )?,
-                            up_codes: tensor(
-                                loader,
-                                &format!("{e}.w3.weight"),
-                                &[inter, hidden.div_ceil(2)],
-                                safetensors::Dtype::I8,
-                            )?,
-                            up_scales: e8m0(
-                                loader,
-                                &format!("{e}.w3.scale"),
-                                &[inter, hidden.div_ceil(32)],
-                            )?,
-                            down_codes: tensor(
-                                loader,
-                                &format!("{e}.w2.weight"),
-                                &[hidden, inter.div_ceil(2)],
-                                safetensors::Dtype::I8,
-                            )?,
-                            down_scales: e8m0(
-                                loader,
-                                &format!("{e}.w2.scale"),
-                                &[hidden, inter.div_ceil(32)],
-                            )?,
-                        });
+                        slots.push(staged::routed(loader, &e, hidden, inter)?);
                         expert_uploads += 1;
                     }
                     routed.push(slots);
@@ -3643,10 +3911,50 @@ impl Engine {
             #[cfg(test)]
             diffusion_forced_draws: None,
         };
+        #[cfg(feature = "cuda")]
+        if staged {
+            engine.attach_staged(dir, staged_depth.context("staged depth missing")?)?;
+        }
         engine.closure.freeze_fixed()?;
         if tiered {
             #[cfg(feature = "cuda")]
             engine.capture_deepseek()?;
+            #[cfg(feature = "cuda")]
+            let (slots, admitted_rows) = if staged {
+                if engine.spec_graph {
+                    engine.capture_staged()?;
+                }
+                let [target, suffix] = super::moe::Slots::load_joint(
+                    &engine.device,
+                    &engine.model_spec,
+                    &manifest,
+                    &engine
+                        .spec
+                        .as_ref()
+                        .context("staged attachment missing")?
+                        .draft
+                        .config,
+                    dir,
+                    workspace_rows as u32,
+                )?;
+                engine
+                    .spec
+                    .as_mut()
+                    .context("staged attachment missing")?
+                    .draft
+                    .bind_staged_slots(suffix)?;
+                (target, workspace_rows as u32)
+            } else {
+                super::moe::Slots::load_staging(
+                    &engine.device,
+                    &engine.model_spec,
+                    &manifest,
+                    dir,
+                    workspace_rows as u32,
+                    0,
+                )?
+            };
+            #[cfg(feature = "rocm")]
             let (slots, admitted_rows) = super::moe::Slots::load_staging(
                 &engine.device,
                 &engine.model_spec,
@@ -3947,7 +4255,7 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    fn composition_native_state(engine: &Engine) -> Result<Vec<u8>> {
+    pub(super) fn composition_native_state(engine: &Engine) -> Result<Vec<u8>> {
         let s = &engine.device.stream;
         let mut bytes = Vec::new();
         macro_rules! integers {
@@ -4170,7 +4478,7 @@ mod tests {
         Ok(())
     }
 
-    fn composition_state(
+    pub(super) fn composition_state(
         engine: &Engine,
         end: usize,
         rows: usize,
@@ -7518,6 +7826,7 @@ mod tests {
             ffn.run_with_tier(DeepseekFfnRun {
                 s,
                 rows: 1,
+                route_rows: 1,
                 x: &work.n,
                 out: &mut work.out,
                 layer,
@@ -7531,7 +7840,7 @@ mod tests {
                 return Ok(expected);
             }
             let graph = crate::backend::cuda::moe::testing::capture(s, || {
-                ffn.contribute(
+                ffn.contribute::<false>(
                     s,
                     1,
                     (&work.n, &mut work.out),
@@ -7845,6 +8154,7 @@ mod tests {
             ffn.run_with_tier(DeepseekFfnRun {
                 s,
                 rows: 1,
+                route_rows: 1,
                 x: &work.n,
                 out: &mut work.out,
                 layer: 0,
@@ -7944,7 +8254,7 @@ mod tests {
             let ffn = deepseek_ffn.as_mut().context("DeepSeek-V4.1 FFN missing")?;
             let s = &device.stream;
             crate::backend::cuda::moe::testing::capture(s, || {
-                ffn.route_only(s, 1, &work.n, 0)?;
+                ffn.route_only(s, 1, &work.n, 0, 1)?;
                 Ok(())
             })?
         };

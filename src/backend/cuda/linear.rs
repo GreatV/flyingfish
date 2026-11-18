@@ -166,10 +166,23 @@ impl Bf16F32Plan {
         weight: Tensor<bf16, 2>,
         output: Tensor<f32, 2>,
     ) -> Result<Self> {
+        Self::bind(
+            super::cubin::module(ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16_f32")?,
+            input,
+            weight,
+            output,
+        )
+    }
+
+    pub(crate) fn bind(
+        kernel: CudaFunction,
+        input: Tensor<bf16, 2>,
+        weight: Tensor<bf16, 2>,
+        output: Tensor<f32, 2>,
+    ) -> Result<Self> {
         let shape = bf16_f32_shape(input, weight, output)?;
         Ok(Self {
-            kernel: super::cubin::module(ctx, "gemm_skinny")?
-                .load_function("gemm_skinny_bf16_f32")?,
+            kernel,
             input,
             weight,
             output,
@@ -549,6 +562,7 @@ pub(crate) struct Fp8Ops {
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
     native_block: [[CudaFunction; 2]; 2],
+    accurate_block: CudaFunction,
 }
 
 /// Bound native codes/scales and prepared activations; storage remains caller-owned.
@@ -642,6 +656,30 @@ impl Fp8Ops {
             shape: [m as i32, n as i32, k as i32],
         })
     }
+
+    pub(crate) fn bind_accurate_block(
+        &self,
+        weight: LinearWeightRef,
+        codes: Tensor<u8, 2>,
+        scale: Fp8ScaleRef,
+        output: &TensorMut<bf16, 2>,
+    ) -> Result<Fp8BlockPlan> {
+        ensure!(
+            matches!(weight, LinearWeightRef::Fp8 { layout: Fp8ScaleLayout::Block(block), .. }
+                if block.block() == [32, 32] && block.dtype() == safetensors::Dtype::F8_E8M0),
+            "accurate FP8 projection requires block32 E8M0 scales"
+        );
+        ensure!(
+            codes.shape[1].is_multiple_of(32),
+            "exact FP8 projection requires complete 32-element groups"
+        );
+        let mut plan = self.bind_block(weight, codes, scale, output)?;
+        let blocks = u64::from(codes.shape[0]) * u64::from(output.0.shape[1].div_ceil(8));
+        ensure!(blocks <= i32::MAX as u64, "accurate FP8 grid overflow");
+        plan.kernel = self.accurate_block.clone();
+        plan.grid = super::ops::grid(blocks as usize, 256);
+        Ok(plan)
+    }
     #[cfg(feature = "cuda")]
     pub(super) fn require_rows(&self, rows: usize) -> Result<()> {
         ensure!(
@@ -682,6 +720,7 @@ impl Fp8Ops {
                 module.load_function("fp8_dequant_bf16_per_channel")?,
             ],
             small: [load("")?, load("_per_channel")?],
+            accurate_block: module.load_function("fp8_block_e8m0_32_exact")?,
             native_block: [
                 [
                     module.load_function("fp8_block_f32_128_decode")?,
@@ -719,6 +758,7 @@ impl Fp8Ops {
             block,
             context: ctx.clone(),
             fake_quant: module.load_function("e4m3_fake_quant_bf16")?,
+            accurate_block: module.load_function("fp8_block_e8m0_32_exact")?,
             native_block: [
                 [
                     module.load_function("fp8_block_f32_128_decode")?,
@@ -2310,6 +2350,221 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+        let (m, n, k) = (5usize, 8usize, 64usize);
+        let mut input = vec![0u8; m * k];
+        let mut weight = vec![0u8; n * k];
+        for row in input.chunks_exact_mut(k) {
+            row[0] = 0x38;
+            row[1] = 0x18;
+            row[32] = 0x38;
+        }
+        for (col, row) in weight.chunks_exact_mut(k).enumerate() {
+            let sign = if col % 4 >= 2 { 128 } else { 0 };
+            row[0] = 0x38 | sign;
+            row[1] = 0x18 | sign;
+            row[32] = 0x38 | if matches!(col % 4, 1 | 2) { 128 } else { 0 };
+        }
+        let xc = stream.clone_htod(&input)?;
+        let wc = stream.clone_htod(&weight)?;
+        let xs = stream.clone_htod(&[127u8, 97].repeat(m))?;
+        let ws = stream.clone_htod(&[127u8, 127])?;
+        let canary = bf16::from_bits(0x7fc1);
+        let output = stream.clone_htod(&vec![canary; m * n + 16])?;
+        let codes =
+            super::super::contracts::view(&xc, stream, 0, [m as u32, k as u32], [k as u64, 1])?;
+        let weight = LinearWeightRef::Fp8 {
+            codes: super::super::contracts::view(
+                &wc,
+                stream,
+                0,
+                [n as u32, k as u32],
+                [k as u64, 1],
+            )?,
+            scale: Fp8ScaleRef::E8m0(super::super::contracts::view(
+                &ws,
+                stream,
+                0,
+                [1, 2],
+                [2, 1],
+            )?),
+            layout: Fp8ScaleLayout::Block(Fp8BlockScale::new([32, 32], Dtype::F8_E8M0)?),
+        };
+        let scales = Fp8ScaleRef::E8m0(super::super::contracts::view(
+            &xs,
+            stream,
+            0,
+            [m as u32, 2],
+            [2, 1],
+        )?);
+        let out = TensorMut(super::super::contracts::view(
+            &output,
+            stream,
+            0,
+            [m as u32, n as u32],
+            [n as u64, 1],
+        )?);
+        let exact = ops.bind_accurate_block(weight, codes, scales, &out)?;
+        let mut rounded = ops.bind_block(weight, codes, scales, &out)?;
+        rounded.kernel = super::super::cubin::module(&device.ctx, "fp8_linear")?
+            .load_function("fp8_block_e8m0_32_compensated")?;
+        let expected: Vec<_> = (0..m * n)
+            .map(|i| bf16::from_f32([1.0078125, 1.0, -1.0078125, -1.0][i % 4]))
+            .collect();
+        device.finish_upload()?;
+        rounded.run(stream)?;
+        let control = stream.clone_dtoh(&output)?[..m * n]
+            .iter()
+            .zip(&expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        ensure!(control == 20, "FP32 midpoint control did not discriminate");
+        for graph in [false, true] {
+            if graph {
+                super::super::moe::testing::capture(stream, || exact.run(stream))?.launch()?;
+            } else {
+                exact.run(stream)?;
+            }
+            let got = stream.clone_dtoh(&output)?;
+            ensure!(
+                got[..m * n] == expected
+                    && got[m * n..].iter().all(|v| v.to_bits() == canary.to_bits()),
+                "exact FP8 midpoint/guard defect"
+            );
+            cases += 1;
+            println!(
+                "FP8_EXACT_MIDPOINT rows=5 columns=8 input=64 graph={graph} values=40 bit_defects=0 rounded_control={control}"
+            );
+        }
+        {
+            use super::super::contracts::view;
+            let (m, groups, rank, k) = (5usize, 8usize, 1024usize, 4096usize);
+            let n = groups * rank;
+            let mut input = vec![0u8; m * groups * k];
+            for row in input.chunks_exact_mut(k) {
+                for (pair, values) in row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let value = 0x30 + (pair % 17) as u8;
+                    values.copy_from_slice(&[value, value | 128]);
+                }
+                row[0] = 0x38;
+                row[1] = 0x18;
+                row[32] = 0x38;
+                row[33] = 0;
+            }
+            let mut weight = vec![0u8; n * k];
+            for (col, row) in weight.chunks_exact_mut(k).enumerate() {
+                let sign = if col % 4 >= 2 { 128 } else { 0 };
+                for (pair, values) in row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let value = (0x30 + ((pair * 7 + col * 3) % 17) as u8) | sign;
+                    values.fill(value);
+                }
+                row[0] = 0x38 | sign;
+                row[1] = 0x18 | sign;
+                row[32] = 0x38 | if matches!(col % 4, 1 | 2) { 128 } else { 0 };
+            }
+            let mut scales = vec![0u8; m * groups * (k / 32)];
+            for (row, values) in scales.chunks_exact_mut(k / 32).enumerate() {
+                let exponent = (row / groups + row % groups) as u8;
+                for (block, value) in values.iter_mut().enumerate() {
+                    *value = 127 + ((block * 5 + row * 3) % 7) as u8;
+                }
+                values[0] = 127 + exponent;
+                values[1] = 97 + exponent;
+            }
+            let xc = stream.clone_htod(&input)?;
+            let wc = stream.clone_htod(&weight)?;
+            let xs = stream.clone_htod(&scales)?;
+            let ws = stream.clone_htod(&vec![127u8; (n / 32) * (k / 32)])?;
+            let output = stream.clone_htod(&vec![canary; m * n + 16])?;
+            let codes = view(
+                &xc,
+                stream,
+                0,
+                [m as u32, groups as u32, k as u32],
+                [(groups * k) as u64, k as u64, 1],
+            )?;
+            let scales = view(
+                &xs,
+                stream,
+                0,
+                [m as u32, groups as u32, (k / 32) as u32],
+                [(groups * k / 32) as u64, (k / 32) as u64, 1],
+            )?;
+            let weights = view(&wc, stream, 0, [n as u32, k as u32], [k as u64, 1])?;
+            let weight_scales = view(
+                &ws,
+                stream,
+                0,
+                [(n / 32) as u32, (k / 32) as u32],
+                [(k / 32) as u64, 1],
+            )?;
+            let out = TensorMut(view(
+                &output,
+                stream,
+                0,
+                [m as u32, n as u32],
+                [n as u64, 1],
+            )?);
+            let operation =
+                super::super::latent_window_attention::LatentWindowAttention::new(&device.ctx)?;
+            let expected: Vec<_> = (0..m * n)
+                .map(|index| {
+                    let row = index / n;
+                    let col = index % n;
+                    let exponent = (row + col / rank) as i32;
+                    bf16::from_f32(
+                        [1.0078125, 1.0, -1.0078125, -1.0][col % 4] * 2f32.powi(exponent),
+                    )
+                })
+                .collect();
+            device.finish_upload()?;
+            let run = |exact| {
+                if exact {
+                    operation.group_project::<true>(
+                        stream,
+                        codes,
+                        scales,
+                        weights,
+                        weight_scales,
+                        &mut TensorMut(out.0),
+                    )
+                } else {
+                    operation.group_project::<false>(
+                        stream,
+                        codes,
+                        scales,
+                        weights,
+                        weight_scales,
+                        &mut TensorMut(out.0),
+                    )
+                }
+            };
+            run(false)?;
+            let control = stream.clone_dtoh(&output)?[..m * n]
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(control == 20480, "grouped FP32 midpoint control");
+            for graph in [false, true] {
+                if graph {
+                    super::super::moe::testing::capture(stream, || run(true))?.launch()?;
+                } else {
+                    run(true)?;
+                }
+                let actual = stream.clone_dtoh(&output)?;
+                ensure!(
+                    actual[..m * n] == expected
+                        && actual[m * n..]
+                            .iter()
+                            .all(|v| v.to_bits() == canary.to_bits()),
+                    "grouped exact FP8 midpoint/index/guard defect"
+                );
+                cases += 1;
+                println!(
+                    "FP8_EXACT_GROUPED input=[5,8,4096] weight=[8192,4096] graph={graph} values=40960 bit_defects=0 rounded_control={control}"
+                );
             }
         }
         println!(

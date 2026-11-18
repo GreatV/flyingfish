@@ -326,6 +326,13 @@ impl Engine {
         remaining: usize,
         #[cfg(test)] fault: Option<policy::Fault>,
     ) -> Result<BatchRound> {
+        if self.spec.as_ref().is_some_and(|s| s.staged.is_some()) {
+            return self.staged_round(
+                remaining,
+                #[cfg(test)]
+                fault,
+            );
+        }
         self.closure.assert_ready()?;
         ensure!(!self.poisoned, "M2b requires healthy Engine");
         let mut chain = self.mtp.take().context("MTP missing")?;

@@ -1005,7 +1005,99 @@ pub struct EngramService {
     generation: Arc<AtomicU64>,
 }
 
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) struct HistoryCheckpoint {
+    values: Vec<(i64, bool)>,
+    start: usize,
+    rows: usize,
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    generation: u64,
+    valid: bool,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+impl HistoryCheckpoint {
+    pub(crate) fn new(rows: usize) -> Result<Self> {
+        ensure!((1..=4).contains(&rows), "engram checkpoint row capacity");
+        Ok(Self {
+            values: vec![(0, false); rows],
+            start: 0,
+            rows: 0,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            generation: 0,
+            valid: false,
+        })
+    }
+
+    fn save(&mut self, history: &NgramHistory, start: usize, rows: usize) -> Result<()> {
+        self.valid = false;
+        ensure!(
+            rows > 0
+                && rows <= self.values.len()
+                && start
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= history.compressed.len()),
+            "engram checkpoint range"
+        );
+        for i in 0..rows {
+            self.values[i] = (
+                history.compressed[start + i],
+                history.initialized[start + i],
+            );
+        }
+        self.start = start;
+        self.rows = rows;
+        self.valid = true;
+        Ok(())
+    }
+
+    fn select(&self, history: &mut NgramHistory, accepted: usize) -> Result<()> {
+        ensure!(
+            self.valid && accepted <= self.rows,
+            "engram checkpoint prefix"
+        );
+        for i in accepted..self.rows {
+            (
+                history.compressed[self.start + i],
+                history.initialized[self.start + i],
+            ) = self.values[i];
+        }
+        Ok(())
+    }
+}
+
 impl EngramService {
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn save_history(
+        &self,
+        checkpoint: &mut HistoryCheckpoint,
+        start: usize,
+        rows: usize,
+    ) -> Result<()> {
+        checkpoint.save(&self.history, start, rows)?;
+        checkpoint.generation = self.generation.load(Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn select_history(
+        &mut self,
+        checkpoint: &mut HistoryCheckpoint,
+        accepted: usize,
+    ) -> Result<()> {
+        ensure!(
+            checkpoint.generation == self.generation.load(Ordering::SeqCst),
+            "stale engram checkpoint generation"
+        );
+        checkpoint.select(&mut self.history, accepted)?;
+        checkpoint.generation = self
+            .generation
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .context("engram request generation exhausted")?;
+        Ok(())
+    }
+
     #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(crate) fn write_history(&self, output: &mut impl std::io::Write) -> Result<()> {
         for (&value, &initialized) in self
@@ -1302,6 +1394,23 @@ mod tests {
             second[0].to_vec(),
             reference[0][18..24].to_vec()
         );
+        let mut candidate = NgramHistory::new(hash_setup(), 8)?;
+        candidate.prepare(&[1, 2], 0, None)?;
+        let mut checkpoint = HistoryCheckpoint::new(4)?;
+        checkpoint.save(&candidate, 2, 4)?;
+        candidate.prepare(&[3, 4, 5, 6], 2, None)?;
+        let mut expected = NgramHistory::new(hash_setup(), 8)?;
+        expected.prepare(&[1, 2, 3, 4], 0, None)?;
+        assert_ne!(candidate.initialized, expected.initialized);
+        checkpoint.select(&mut candidate, 2)?;
+        assert_eq!(candidate.compressed, expected.compressed);
+        assert_eq!(candidate.initialized, expected.initialized);
+        checkpoint.select(&mut candidate, 0)?;
+        let mut original = NgramHistory::new(hash_setup(), 8)?;
+        original.prepare(&[1, 2], 0, None)?;
+        assert_eq!(candidate.compressed, original.compressed);
+        assert_eq!(candidate.initialized, original.initialized);
+        assert!(checkpoint.select(&mut candidate, 5).is_err());
         Ok(())
     }
 

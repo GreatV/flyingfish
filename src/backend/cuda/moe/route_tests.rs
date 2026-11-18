@@ -1034,7 +1034,7 @@ fn noaux_fp32_route(device: &Device, ops: &RouteOps) -> Result<()> {
         let ib = testing::zeros::<i32>(s, rows * top_k)?;
         let wb = testing::zeros::<f32>(s, rows * top_k)?;
         let run = || {
-            ops.topk_noaux_f32(
+            ops.topk_noaux_f32::<_, false>(
                 testing::dense(&lb, s, rows as u32, experts as u32)?,
                 Some(testing::dense(&bb, s, rows as u32, experts as u32)?),
                 &mut testing::dense_mut(&ib, s, rows as u32, top_k as u32)?,

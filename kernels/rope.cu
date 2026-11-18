@@ -139,9 +139,10 @@ extern "C" __global__ void rope_2d_qk(__nv_bfloat16* qkv, const int* positions,
 #endif
 }
 
-extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,
-                                                int* axes, int rows, int capacity,
-                                                int rotary_shift) {
+template<bool Causal>
+__device__ __forceinline__ void sequence_positions_body(const int* prefix, int* metadata,
+                                                        int* axes, int rows, int capacity,
+                                                        int rotary_shift) {
     const int p = *prefix;
     if (p < 0 || rows < 1 || rows > 64 || p > capacity - rows || p + rotary_shift < 0)
         __trap();
@@ -151,13 +152,25 @@ extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,
         metadata[1] = rows;
         metadata[2] = p + rows;
         metadata[3] = capacity;
-        metadata[4] = 0;
+        metadata[4] = Causal ? 1 : 0;
         metadata[5] = metadata[6] = metadata[7] = 0;
     }
     if (row < rows) {
         const int position = p + row + rotary_shift;
         axes[row * 3] = axes[row * 3 + 1] = axes[row * 3 + 2] = position;
     }
+}
+
+extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,
+                                                int* axes, int rows, int capacity,
+                                                int rotary_shift) {
+    sequence_positions_body<false>(prefix, metadata, axes, rows, capacity, rotary_shift);
+}
+
+extern "C" __global__ void sequence_positions_causal(const int* prefix, int* metadata,
+                                                       int* axes, int rows, int capacity,
+                                                       int rotary_shift) {
+    sequence_positions_body<true>(prefix, metadata, axes, rows, capacity, rotary_shift);
 }
 
 extern "C" __global__ void rope(__nv_bfloat16* qkv, const int* start,
@@ -635,6 +648,13 @@ extern "C" __global__ void qknorm_rope_table_kv_skip(__nv_bfloat16* qkv,
         qkv, k, v, q_norm_w, k_norm_w, start, cache_start, rows, q_heads, kv_heads, dim,
         capacity, ring_tokens, 1.0f, eps, q_row_stride, k_offset, k_row_stride, v_offset,
         v_row_stride, table);
+}
+
+extern "C" __global__ void rope_inv_freq(float* out, float theta, int dim) {
+  if (!(theta > 0.0f) || !isfinite(theta) || dim < 2 || dim % 2) __trap();
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (d < dim / 2)
+    out[d] = __fdiv_rn(1.0f, powf(theta, float(2 * d) / float(dim)));
 }
 
 // Adjacent-pair layout mode of the rope op (the model definition's complex

@@ -747,6 +747,20 @@ impl Binding<'_> {
                     pooled,
                 },
             )?);
+            if let Some(prefixes) = &kv.prefixes {
+                let capacity = prefixes[0].len() / (2 * 512);
+                if rows <= capacity {
+                    pool.as_mut()
+                        .context("compression plan missing")?
+                        .bind_prefixes(
+                            ctx,
+                            [
+                                dense(&prefixes[0], s, [capacity as u32, 2, 512])?,
+                                dense(&prefixes[1], s, [capacity as u32, 2, 512])?,
+                            ],
+                        )?;
+                }
+            }
         } else {
             plain_values = Some(Bf16Projection::new(self.blas, x, weight, pooled)?);
         }
@@ -1683,7 +1697,7 @@ mod live_tests {
                             .map(bf16::from_bits)
                             .collect::<Vec<_>>();
                         s.memcpy_htod(&x, &mut work.n.slice_mut(..rows * 5120))?;
-                        mixer.run(
+                        mixer.run::<false>(
                             s,
                             &blas,
                             &ops,
@@ -1695,6 +1709,7 @@ mod live_tests {
                                 qkv: &mut work.qkv,
                                 out: &mut work.out,
                                 seq: state.seq_ref(s)?,
+                                block: None,
                             },
                             layer.layer,
                         )?;

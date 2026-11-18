@@ -312,7 +312,7 @@ __device__ __forceinline__ void moe_route_weight_store(
   }
 }
 
-template <class Weight>
+template <class Weight, bool LITERAL_THREE = false>
 __device__ __forceinline__ void moe_route_select_noaux(
     float logit, float bias, int* __restrict__ ids, Weight* __restrict__ weights,
     int experts, int top_k, int score_mode, float routed_scaling) {
@@ -329,7 +329,9 @@ __device__ __forceinline__ void moe_route_select_noaux(
     if (score_mode == 0) {
       score = 1.0f / (1.0f + expf(-logit));
     } else {
-      const float softplus = fmaxf(logit, 0.0f) + log1pf(expf(-fabsf(logit)));
+      const float softplus = LITERAL_THREE
+          ? (logit > 20.0f ? logit : log1pf(expf(logit)))
+          : fmaxf(logit, 0.0f) + log1pf(expf(-fabsf(logit)));
       score = sqrtf(softplus);
     }
   }
@@ -374,6 +376,11 @@ __device__ __forceinline__ void moe_route_select_noaux(
     __syncthreads();
   }
 
+  if constexpr (LITERAL_THREE) {
+    if (tid == 0)
+      s_tsum = __fadd_rn(__fadd_rn(s_sel_p[0], s_sel_p[2]), s_sel_p[1]);
+    __syncthreads();
+  }
   if (tid < top_k) {
     ids[(size_t)row * top_k + tid] = s_sel_id[tid];
     moe_route_weight_store(
@@ -618,6 +625,24 @@ extern "C" __global__ void moe_route_topk_noaux_f32(
   }
   moe_route_select_noaux(logit, correction, ids, weights, experts, top_k,
                          score_mode, routed_scaling);
+}
+
+extern "C" __global__ void moe_route_topk_sqrtsoftplus_f32(
+    const float* logits, const float* bias, int* ids, float* weights,
+    int rows, int experts, int top_k, int score_mode, float routed_scaling) {
+  if ((int)blockIdx.x >= rows || experts < 3 || experts > 1024 || top_k != 3 ||
+      score_mode != 1 || (blockDim.x & 31) != 0 || (int)blockDim.x < experts ||
+      !isfinite(routed_scaling) || routed_scaling <= 0.0f ||
+      (reinterpret_cast<uintptr_t>(logits) & 3) != 0 ||
+      (reinterpret_cast<uintptr_t>(bias) & 3) != 0 ||
+      (reinterpret_cast<uintptr_t>(weights) & 3) != 0)
+    __trap();
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  const float logit = tid < experts ? logits[(size_t)row * experts + tid] : -INFINITY;
+  const float correction = tid < experts ? bias[(size_t)row * experts + tid] : 0.0f;
+  moe_route_select_noaux<float, true>(logit, correction, ids, weights, experts,
+                                    top_k, score_mode, routed_scaling);
 }
 
 // Stream-ordered publication of one native expert slot and its generation.

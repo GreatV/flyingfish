@@ -16,6 +16,41 @@ use anyhow::{Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
+pub(crate) struct BlockWindow {
+    pub codes: crate::backend::gpu::CudaSlice<u8>,
+    pub scales: crate::backend::gpu::CudaSlice<u8>,
+    pub slots: crate::backend::gpu::CudaSlice<i32>,
+}
+
+impl BlockWindow {
+    pub(crate) fn new(
+        stream: &Arc<CudaStream>,
+        window: usize,
+        width: usize,
+        rows: usize,
+    ) -> Result<Self> {
+        ensure!(
+            window > 0 && rows > 0 && width > 0 && width.is_multiple_of(32),
+            "block window geometry"
+        );
+        let capacity = window
+            .checked_add(rows)
+            .ok_or_else(|| anyhow::anyhow!("block window extent overflow"))?;
+        let bytes = capacity
+            .checked_mul(width)
+            .ok_or_else(|| anyhow::anyhow!("block window byte overflow"))?;
+        ensure!(
+            capacity <= i32::MAX as usize,
+            "block window capacity overflow"
+        );
+        Ok(Self {
+            codes: stream.alloc_zeros(bytes)?,
+            scales: stream.alloc_zeros(bytes / 32)?,
+            slots: stream.alloc_zeros(capacity)?,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct IndexedInputs {
     pub window: LwaInputs,
@@ -380,10 +415,13 @@ fn validate_group_project(
 /// Latent window attention over a ring of FP8 latent K rows.
 pub struct LatentWindowAttention {
     kernel: CudaFunction,
+    kernel_mma: CudaFunction,
     ring_write: CudaFunction,
     act_quant: CudaFunction,
     window_slots: CudaFunction,
+    block_slots: CudaFunction,
     group_project: CudaFunction,
+    exact_group_project: CudaFunction,
 }
 
 impl LatentWindowAttention {
@@ -391,10 +429,14 @@ impl LatentWindowAttention {
         let module = cubin::module(ctx, "latent_window_attention")?;
         Ok(Self {
             kernel: module.load_function("latent_window_attention")?,
+            kernel_mma: module.load_function("latent_window_attention_mma")?,
             ring_write: module.load_function("latent_ring_write")?,
             act_quant: module.load_function("latent_act_quant")?,
             window_slots: module.load_function("latent_window_slots")?,
+            block_slots: module.load_function("latent_block_slots")?,
             group_project: module.load_function("latent_group_project")?,
+            exact_group_project: cubin::module(ctx, "fp8_linear")?
+                .load_function("fp8_block_grouped_e8m0_32_exact")?,
         })
     }
 
@@ -402,7 +444,7 @@ impl LatentWindowAttention {
     ///
     /// `slot_ids` holds the visible ring slot ids oldest first, `inv_rotary`
     /// the interleaved (cos, sin) factors of the inverse RoPE angle.
-    pub fn run(
+    pub fn run<const MMA: bool>(
         &self,
         stream: &Arc<CudaStream>,
         inputs: LwaInputs,
@@ -412,13 +454,18 @@ impl LatentWindowAttention {
     ) -> Result<()> {
         let (sequence, position) = position.arguments()?;
         let dims = validate(inputs, &out.0)?;
+        ensure!(
+            !MMA || (dims.head_dim.is_multiple_of(64) && p_mode == 0),
+            "MMA window attention requires width divisible by 64 and BF16 probabilities"
+        );
         no_overlap(&inputs.q, &out.0, "q", "out")?;
         no_overlap(&inputs.k_codes, &out.0, "k_codes", "out")?;
         no_overlap(&inputs.k_scales, &out.0, "k_scales", "out")?;
         no_overlap(&inputs.slot_ids, &out.0, "slot_ids", "out")?;
         no_overlap(&inputs.sink, &out.0, "sink", "out")?;
         no_overlap(&inputs.inv_rotary, &out.0, "inv_rotary", "out")?;
-        let shared = (2 * u64::from(dims.head_dim) + u64::from(dims.window)) * 4;
+        let shared =
+            (2 * u64::from(dims.head_dim) + u64::from(dims.window)) * 4 + if MMA { 512 } else { 0 };
         ensure!(
             shared <= LWA_SHARED_LIMIT,
             "latent window attention shared staging {shared} B exceeds the {LWA_SHARED_LIMIT} B limit (head_dim {}, window {})",
@@ -436,7 +483,7 @@ impl LatentWindowAttention {
         );
         unsafe {
             stream
-                .launch_builder(&self.kernel)
+                .launch_builder(if MMA { &self.kernel_mma } else { &self.kernel })
                 .arg(&inputs.q.ptr)
                 .arg(&inputs.k_codes.ptr)
                 .arg(&inputs.k_scales.ptr)
@@ -552,6 +599,36 @@ impl LatentWindowAttention {
         Ok(())
     }
 
+    pub(crate) fn block_slots(
+        &self,
+        stream: &Arc<CudaStream>,
+        slots: &mut TensorMut<i32, 1>,
+        sequence: crate::backend::cuda::contracts::SeqRef,
+        window: usize,
+        rows: usize,
+    ) -> Result<()> {
+        sequence.validate()?;
+        require_dense(&slots.0, "block window slots")?;
+        ensure!(
+            window > 0 && rows > 0 && window.checked_add(rows) == Some(slots.0.shape[0] as usize),
+            "block slot extent"
+        );
+        ensure!(
+            slots.0.shape[0] <= i32::MAX as u32,
+            "block slot capacity overflow"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.block_slots)
+                .arg(&slots.0.ptr)
+                .arg(&sequence.ptr)
+                .arg(&(window as i32))
+                .arg(&(rows as i32))
+                .launch(super::ops::flat(window + rows))?;
+        }
+        Ok(())
+    }
+
     /// The visible ring slots of the query at `position`, oldest first; the
     /// caller exposes `min(position + 1, window)` of the buffer.
     pub fn window_slots(
@@ -585,11 +662,9 @@ impl LatentWindowAttention {
 
     /// Block-diagonal group projection of the quantized attention output:
     /// group `g` of each row is projected by weight rows `[g*rank, (g+1)*rank)`
-    /// with one E8M0 scale per 32x32 weight block (model definition einsum
-    /// `bsgd,grd->bsgr` over the per-32 quantized o). The dot accumulates exact
-    /// 16-element sums into eight contiguous FP32 partials, the definition's
-    /// mma k-step, then reduces the partials in a five-level tree.
-    pub fn group_project(
+    /// with one E8M0 scale per 32x32 weight block. EXACT uses integer block
+    /// products, FP64 outer accumulation and direct BF16 rounding.
+    pub fn group_project<const EXACT: bool>(
         &self,
         stream: &Arc<CudaStream>,
         act_codes: Tensor<u8, 3>,
@@ -605,9 +680,14 @@ impl LatentWindowAttention {
         let rank = (rank_rows / groups) as usize;
         let width = act_codes.shape[2];
         let warps = rows as usize * rank_rows as usize;
+        let kernel = if EXACT {
+            &self.exact_group_project
+        } else {
+            &self.group_project
+        };
         unsafe {
             stream
-                .launch_builder(&self.group_project)
+                .launch_builder(kernel)
                 .arg(&act_codes.ptr)
                 .arg(&act_scales.ptr)
                 .arg(&w_codes.ptr)
@@ -1237,7 +1317,7 @@ mod tests {
                 &mut testing::mut_view(forward, s, [1, ROPE_TAIL as u32], [ROPE_TAIL as u64, 1])?,
                 &mut testing::mut_view(inverse, s, [1, ROPE_TAIL as u32], [ROPE_TAIL as u64, 1])?,
             )?;
-            latent.run(
+            latent.run::<false>(
                 s,
                 LwaInputs {
                     q: testing::view(
@@ -1425,7 +1505,7 @@ mod tests {
                 sink,
                 inv_rotary: rotary,
             };
-            ops.run(
+            ops.run::<false>(
                 s,
                 inputs,
                 &mut out_view,
@@ -1436,7 +1516,7 @@ mod tests {
                 slot_ids: wrong_ids,
                 ..inputs
             };
-            ops.run(
+            ops.run::<false>(
                 s,
                 wrong_inputs,
                 &mut wrong_view,
@@ -1455,7 +1535,7 @@ mod tests {
                 ptr: testing::view(&metadata, s, [8], [1])?.ptr,
             };
             let graph = testing::capture(s, || {
-                ops.run(
+                ops.run::<false>(
                     s,
                     inputs,
                     &mut out_view,

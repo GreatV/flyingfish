@@ -25,6 +25,16 @@ pub struct DraftConfig {
     pub markov_head_type: String,
     pub projector_type: String,
     pub rope_parameters: Rope,
+    #[serde(skip)]
+    pub staged: Option<Staged>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Staged {
+    pub geometry: crate::model_spec::DeepseekV41Config,
+    pub catalogue: std::sync::Arc<crate::experts::catalogue::ExpertCatalogue>,
+    pub resident_weight_bytes: u64,
+    pub round_weight_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -349,13 +359,138 @@ fn moe_dram_bytes(distinct: f64, total_choices: f64, proj_bytes: (u64, u64), l2_
 }
 
 impl DraftConfig {
+    pub fn in_checkpoint(
+        target: &crate::model_spec::ModelSpec,
+        manifest: &crate::checkpoint::TensorManifest,
+    ) -> Result<Self> {
+        use crate::checkpoint::TensorScope;
+        ensure!(
+            target.architecture == crate::model_spec::Architecture::DeepseekV41,
+            "in-checkpoint DSpark requires DeepSeek-V4.1"
+        );
+        let ds = target
+            .deepseek_v41
+            .as_ref()
+            .context("DSpark geometry missing")?;
+        let moe = target
+            .moe
+            .as_ref()
+            .context("DSpark expert format missing")?;
+        ensure!(
+            ds.nextn_layers == 3
+                && ds.dspark_block_size == 5
+                && ds.dspark_markov_rank == 256
+                && ds.dspark_experts == 128
+                && ds.dspark_experts_per_tok == 3
+                && ds.dspark_target_layer_ids.len() == 3
+                && ds.compress_ratios.get(ds.num_hidden_layers as usize..)
+                    == Some([0, 0, 0].as_slice()),
+            "unsupported in-checkpoint DSpark geometry"
+        );
+        let mut resident_weight_bytes = 0u64;
+        let mut round_weight_bytes = 0u64;
+        for (name, entry) in &manifest.entries {
+            if entry.scope != TensorScope::Mtp
+                || name.contains(".ffn.experts.")
+                || name.ends_with(".ffn.gate.bias_vl")
+            {
+                continue;
+            }
+            let bytes = u64::try_from(entry.bytes)?;
+            resident_weight_bytes = resident_weight_bytes
+                .checked_add(bytes)
+                .context("DSpark resident weight bytes overflow")?;
+            if !name.ends_with(".markov_head.embed.weight") {
+                let reads = if name.ends_with(".markov_head.head.weight") {
+                    u64::from(ds.dspark_block_size)
+                } else {
+                    1
+                };
+                round_weight_bytes = bytes
+                    .checked_mul(reads)
+                    .and_then(|n| round_weight_bytes.checked_add(n))
+                    .context("DSpark round weight bytes overflow")?;
+            }
+        }
+        ensure!(
+            resident_weight_bytes > 0,
+            "manifest has no DSpark nonexpert weights"
+        );
+        let catalogue = std::sync::Arc::new(
+            crate::experts::catalogue::ExpertCatalogue::from_draft_manifest(manifest, target)?,
+        );
+        let selections = u64::from(ds.nextn_layers)
+            * u64::from(ds.dspark_block_size)
+            * u64::from(ds.dspark_experts_per_tok);
+        let head = manifest
+            .entries
+            .get("head.weight")
+            .context("DSpark shared full head missing")?;
+        let lookups =
+            u64::from(ds.dspark_block_size) * u64::from(target.hidden + ds.dspark_markov_rank) * 2;
+        round_weight_bytes = catalogue
+            .slot_bytes()
+            .checked_mul(selections)
+            .and_then(|n| n.checked_add(round_weight_bytes))
+            .and_then(|n| n.checked_add(head.bytes as u64))
+            .and_then(|n| n.checked_add(lookups))
+            .context("DSpark native round weight bytes overflow")?;
+        Ok(Self {
+            model_type: "deepseek_v41".into(),
+            architectures: vec!["DeepseekV41ForCausalLM".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: target.hidden as usize,
+            intermediate_size: moe.expert_intermediate as usize,
+            num_hidden_layers: ds.nextn_layers as usize,
+            num_attention_heads: target.q_heads as usize,
+            num_key_value_heads: target.kv_heads as usize,
+            head_dim: target.head_dim as usize,
+            vocab_size: target.vocab as usize,
+            draft_vocab_size: target.vocab as usize,
+            rms_norm_eps: target.rms_eps,
+            block_size: ds.dspark_block_size as usize,
+            mask_token_id: ds.dspark_noise_token_id,
+            target_layer_ids: ds
+                .dspark_target_layer_ids
+                .iter()
+                .map(|&n| n as usize)
+                .collect(),
+            num_target_layers: ds.num_hidden_layers as usize,
+            markov_rank: ds.dspark_markov_rank as usize,
+            markov_head_type: "vanilla".into(),
+            projector_type: "dspark".into(),
+            rope_parameters: Rope {
+                rope_theta: target.rope_theta,
+                rope_type: "default".into(),
+                rope_dim: Some(target.rotary_dim as usize),
+            },
+            staged: Some(Staged {
+                geometry: ds.clone(),
+                catalogue,
+                resident_weight_bytes,
+                round_weight_bytes,
+            }),
+        })
+    }
     pub fn verify_rows(&self) -> Result<usize> {
+        if self.staged.is_some() {
+            return Ok(4);
+        }
         self.block_size
             .checked_add(1)
             .context("DSpark block_size+1 overflow")
     }
     pub fn target_rows(&self, spec: &crate::model_spec::ModelSpec) -> Result<usize> {
         let rows = self.verify_rows()?;
+        if self.staged.is_some() {
+            ensure!(
+                spec.architecture == crate::model_spec::Architecture::DeepseekV41
+                    && self.hidden_size == spec.hidden as usize
+                    && self.vocab_size == spec.vocab as usize,
+                "staged DSpark target geometry mismatch"
+            );
+            return Ok(rows);
+        }
         ensure!(
             spec.moe.is_some()
                 && self.head_dim == 256
@@ -383,11 +518,14 @@ impl DraftConfig {
             .iter()
             .filter(|layer| layer.mixer == crate::model_spec::Mixer::Gdn)
             .count();
-        let replay_inputs =
+        let replay_inputs = if layers == 0 {
+            0
+        } else {
             usize::try_from(crate::op_contract::GdnSpec::from_model(spec)?.input_row_bytes()?)?
                 .checked_mul(layers)
                 .and_then(|n| n.checked_mul(rows - 1))
-                .context("DSpark GDN replay input overflow")?;
+                .context("DSpark GDN replay input overflow")?
+        };
         crate::mtp::checkpoint_bytes(spec, rows)?
             .checked_add(replay_inputs)
             .context("DSpark target transaction byte overflow")
@@ -414,6 +552,9 @@ impl DraftConfig {
         (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim
     }
     pub fn round_weight_bytes(&self) -> Result<u64> {
+        if let Some(staged) = &self.staged {
+            return Ok(staged.round_weight_bytes);
+        }
         let hidden = u64::try_from(self.hidden_size)?;
         let inter = u64::try_from(self.intermediate_size)?;
         let layers = u64::try_from(self.num_hidden_layers)?;
@@ -527,7 +668,20 @@ impl DraftConfig {
             .context("DSpark rejection replay byte overflow")
     }
     pub fn read(path: &Path, target: &Config) -> Result<Self> {
-        let c: Self = serde_json::from_value(read_config(path)?)?;
+        let value = read_config(path)?;
+        if value.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41") {
+            let spec = crate::model_spec::ModelSpec::read(path)?;
+            ensure!(
+                spec.hidden as usize == target.hidden_size
+                    && spec.vocab as usize == target.vocab_size
+                    && spec.layers.len() == target.num_hidden_layers,
+                "DSpark/target geometry mismatch"
+            );
+            let mapped = crate::checkpoint::MappedCheckpoint::open(path)?;
+            let manifest = mapped.manifest(&spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+            return Self::in_checkpoint(&spec, &manifest);
+        }
+        let c: Self = serde_json::from_value(value)?;
         ensure!(
             c.model_type == "qwen3" && c.architectures == ["Qwen3DSparkModel"],
             "unsupported DSpark architecture"
@@ -916,6 +1070,7 @@ mod tests {
                 rope_type: "default".into(),
                 rope_dim: Some(256),
             },
+            staged: None,
         };
         let cold_freq = vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize];
         let skewed_freq: Vec<Vec<f64>> = (0..geometry.layers as usize)
