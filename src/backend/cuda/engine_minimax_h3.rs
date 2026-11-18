@@ -720,6 +720,9 @@ impl FfnPlan {
 const HIDDEN_NORM_THREADS: u32 = 768;
 /// Threads per head-width RMSNorm row.
 const HEAD_NORM_THREADS: u32 = 32;
+/// Heads per CTA (`8` warps) and threads per CTA for fused DiT head RMSNorm + split-half RoPE.
+const QK_ROPE_WARPS: usize = 8;
+const QK_ROPE_THREADS: u32 = 256;
 
 /// A vector view and its owned allocation or shared byte arena.
 struct VectorWeight<T> {
@@ -2413,6 +2416,11 @@ pub(crate) fn block_forward<const LORA: bool>(
         }
     }
     let head_rows = rows * spec.heads;
+    let qk_rope_cfg = LaunchConfig {
+        grid_dim: (u32::try_from(head_rows.div_ceil(QK_ROPE_WARPS))?, 1, 1),
+        block_dim: (QK_ROPE_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
     unsafe {
         s.launch_builder(&kernels.rotary_q)
             .arg(&pointer(&work.q_raw, s))
@@ -2426,11 +2434,7 @@ pub(crate) fn block_forward<const LORA: bool>(
             .arg(&i32::try_from(rotary_width)?)
             .arg(&rows_i)
             .arg(&spec.qk_norm_eps)
-            .launch(LaunchConfig {
-                grid_dim: (u32::try_from(head_rows)?, 1, 1),
-                block_dim: (HEAD_NORM_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
+            .launch(qk_rope_cfg)?;
         s.launch_builder(&kernels.rotary_kv)
             .arg(&pointer(&work.k_raw, s))
             .arg(&w.norm_k.tensor.ptr)
@@ -2445,11 +2449,7 @@ pub(crate) fn block_forward<const LORA: bool>(
             .arg(&i32::try_from(rotary_width)?)
             .arg(&rows_i)
             .arg(&spec.qk_norm_eps)
-            .launch(LaunchConfig {
-                grid_dim: (u32::try_from(head_rows)?, 1, 1),
-                block_dim: (HEAD_NORM_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            })?;
+            .launch(qk_rope_cfg)?;
     }
     flash.run(
         &work.q,
@@ -6461,22 +6461,75 @@ mod tests {
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn qk_rope_fusion_matches_parent_gpu() -> Result<()> {
+        use cudarc::driver::sys::{CUdevice_attribute as DA, CUfunction_attribute as FA};
         let device = Device::new(0)?;
         let s = &device.stream;
         let kernels = BlockKernels::new(&device.ctx)?;
-        for rows in [14usize, 1000] {
-            let heads = 56usize;
-            let dim = 128usize;
-            let rotary = 96usize;
+        let max_threads_sm = u32::try_from(
+            device
+                .ctx
+                .attribute(DA::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
+        )?;
+        for (label, func) in [
+            ("rotary_q", &kernels.rotary_q),
+            ("rotary_kv", &kernels.rotary_kv),
+        ] {
+            let local_bytes = func.get_attribute(FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+            let regs = func.get_attribute(FA::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+            let smem = func.get_attribute(FA::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+            let active_blocks =
+                func.occupancy_max_active_blocks_per_multiprocessor(QK_ROPE_THREADS, 0, None)?;
+            let active_warps = active_blocks * (QK_ROPE_THREADS / 32);
+            println!(
+                "H3_QK_ROPE_OCCUPANCY kernel={label} threads={QK_ROPE_THREADS} active_blocks={active_blocks} active_warps={active_warps} regs={regs} smem={smem} local={local_bytes}"
+            );
+            ensure!(
+                local_bytes == 0,
+                "{label} spills to local memory ({local_bytes} B)"
+            );
+            ensure!(
+                active_blocks * QK_ROPE_THREADS >= max_threads_sm.min(1536),
+                "{label} occupancy {active_warps} warps/SM below target on max_threads={max_threads_sm}"
+            );
+        }
+
+        let cases = [
+            (
+                "prod", 1000usize, 56usize, 128usize, 96usize, 0i32, 1000usize,
+            ),
+            (
+                "refiner", 14usize, 56usize, 128usize, 96usize, 0i32, 14usize,
+            ),
+            (
+                "ragged_start",
+                13usize,
+                57usize,
+                128usize,
+                96usize,
+                5i32,
+                29usize,
+            ),
+            (
+                "plain_no_rope",
+                9usize,
+                7usize,
+                128usize,
+                0usize,
+                2i32,
+                15usize,
+            ),
+        ];
+        for (label, rows, heads, dim, rotary, start, capacity) in cases {
             let elements = rows * heads * dim;
+            let kv_elements = heads * capacity * dim;
             let head_rows = rows * heads;
             let rows_i = i32::try_from(rows)?;
             let head_rows_i = i32::try_from(head_rows)?;
             let dim_i = i32::try_from(dim)?;
             let heads_i = i32::try_from(heads)?;
             let rotary_i = i32::try_from(rotary)?;
+            let capacity_i = i32::try_from(capacity)?;
             let eps = 1.0e-5f32;
-            let start = 0i32;
             let host = |offset: usize| -> Vec<bf16> {
                 (0..elements)
                     .map(|i| bf16::from_f32((((i * 37 + offset) % 509) as f32 - 254.0) / 127.0))
@@ -6485,22 +6538,30 @@ mod tests {
             let q = host(0);
             let k = host(71);
             let v = host(143);
+            let mut q_init = vec![bf16::ZERO; kv_elements];
+            q_init[..elements].copy_from_slice(&q);
             let weight: Vec<bf16> = (0..dim)
                 .map(|i| bf16::from_f32(0.5 + (i * 13 % 29) as f32 / 29.0))
                 .collect();
-            let table: Vec<bf16> = (0..=rows * rotary)
+            let table: Vec<bf16> = (0..=(capacity * rotary.max(1)))
                 .map(|i| bf16::from_f32((i as f32 * 0.017).cos()))
                 .collect();
             let weight = s.clone_htod(&weight)?;
             let table = s.clone_htod(&table)?;
-            let mut q_parent = s.clone_htod(&q)?;
-            let mut k_parent = s.clone_htod(&k)?;
+            let mut q_parent = s.clone_htod(&q_init)?;
+            let mut k_parent = s.alloc_zeros::<bf16>(kv_elements)?;
             let v_parent = s.clone_htod(&v)?;
+            let k_fused = s.clone_htod(&k)?;
             let mut q_norm_parent = s.alloc_zeros::<bf16>(elements)?;
             let mut k_norm_parent = s.alloc_zeros::<bf16>(elements)?;
             let norm_grid = LaunchConfig {
                 grid_dim: (u32::try_from(head_rows)?, 1, 1),
                 block_dim: (HEAD_NORM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let qk_rope_cfg = LaunchConfig {
+                grid_dim: (u32::try_from(head_rows.div_ceil(QK_ROPE_WARPS))?, 1, 1),
+                block_dim: (QK_ROPE_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe {
@@ -6513,7 +6574,7 @@ mod tests {
                     .arg(&eps)
                     .launch(norm_grid)?;
                 s.launch_builder(&kernels.norm_f32)
-                    .arg(&k_parent)
+                    .arg(&k_fused)
                     .arg(&weight)
                     .arg(&mut k_norm_parent)
                     .arg(&head_rows_i)
@@ -6533,14 +6594,13 @@ mod tests {
                     .arg(&heads_i)
                     .arg(&dim_i)
                     .arg(&rotary_i)
-                    .arg(&rows_i)
+                    .arg(&capacity_i)
                     .launch(flat(2 * elements))?;
             }
-            let q_fused = s.clone_htod(&q)?;
-            let k_fused = s.clone_htod(&k)?;
+            let q_fused = s.clone_htod(&q_init)?;
             let v_fused = s.clone_htod(&v)?;
             let mut q_norm_fused = s.alloc_zeros::<bf16>(elements)?;
-            let k_norm_fused = s.alloc_zeros::<bf16>(elements)?;
+            let k_norm_fused = s.alloc_zeros::<bf16>(kv_elements)?;
             unsafe {
                 s.launch_builder(&kernels.rotary_q)
                     .arg(&pointer(&q_fused, s))
@@ -6552,9 +6612,9 @@ mod tests {
                     .arg(&heads_i)
                     .arg(&dim_i)
                     .arg(&rotary_i)
-                    .arg(&rows_i)
+                    .arg(&capacity_i)
                     .arg(&eps)
-                    .launch(norm_grid)?;
+                    .launch(qk_rope_cfg)?;
                 s.launch_builder(&kernels.rotary_kv)
                     .arg(&pointer(&k_fused, s))
                     .arg(&weight)
@@ -6567,64 +6627,163 @@ mod tests {
                     .arg(&heads_i)
                     .arg(&dim_i)
                     .arg(&rotary_i)
-                    .arg(&rows_i)
+                    .arg(&capacity_i)
                     .arg(&eps)
-                    .launch(norm_grid)?;
+                    .launch(qk_rope_cfg)?;
             }
-            let v_parent = s.clone_dtoh(&q_parent)?;
-            let q_parent = s.clone_dtoh(&q_norm_parent)?;
-            let k_parent = s.clone_dtoh(&k_parent)?;
-            let v_fused = s.clone_dtoh(&q_fused)?;
-            let q_fused = s.clone_dtoh(&q_norm_fused)?;
-            let k_fused = s.clone_dtoh(&k_norm_fused)?;
-            let q_mismatch = q_parent
+            let v_ref = s.clone_dtoh(&q_parent)?;
+            let q_ref = s.clone_dtoh(&q_norm_parent)?;
+            let k_ref = s.clone_dtoh(&k_parent)?;
+            let v_got = s.clone_dtoh(&q_fused)?;
+            let q_got = s.clone_dtoh(&q_norm_fused)?;
+            let k_got = s.clone_dtoh(&k_norm_fused)?;
+            let q_mismatch = q_ref
                 .iter()
-                .zip(&q_fused)
-                .filter(|(a, b)| a != b)
+                .zip(&q_got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            let k_mismatch = k_parent
+            let k_mismatch = k_ref
                 .iter()
-                .zip(&k_fused)
-                .filter(|(a, b)| a != b)
+                .zip(&k_got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            let v_mismatch = v_parent
+            let v_mismatch = v_ref
                 .iter()
-                .zip(&v_fused)
-                .filter(|(a, b)| a != b)
+                .zip(&v_got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
             ensure!(
                 q_mismatch == 0 && k_mismatch == 0 && v_mismatch == 0,
-                "Q/K/V fusion mismatches rows={rows}: {q_mismatch}/{k_mismatch}/{v_mismatch}"
+                "Q/K/V fusion mismatches {label} rows={rows}: {q_mismatch}/{k_mismatch}/{v_mismatch}"
             );
-            let q_mutant = s.clone_htod(&q)?;
-            let mut q_norm_mutant = s.alloc_zeros::<bf16>(elements)?;
-            unsafe {
-                s.launch_builder(&kernels.rotary_q)
-                    .arg(&q_mutant)
-                    .arg(&weight)
-                    .arg(&mut q_norm_mutant)
-                    .arg(&(pointer(&table, s) + 2))
-                    .arg(&start)
-                    .arg(&rows_i)
-                    .arg(&heads_i)
-                    .arg(&dim_i)
-                    .arg(&rotary_i)
-                    .arg(&rows_i)
-                    .arg(&eps)
-                    .launch(norm_grid)?;
+            let mut mutant_mismatch = 0usize;
+            if rotary > 0 {
+                let q_mutant = s.clone_htod(&q)?;
+                let mut q_norm_mutant = s.alloc_zeros::<bf16>(elements)?;
+                unsafe {
+                    s.launch_builder(&kernels.rotary_q)
+                        .arg(&q_mutant)
+                        .arg(&weight)
+                        .arg(&mut q_norm_mutant)
+                        .arg(&(pointer(&table, s) + 2))
+                        .arg(&start)
+                        .arg(&rows_i)
+                        .arg(&heads_i)
+                        .arg(&dim_i)
+                        .arg(&rotary_i)
+                        .arg(&capacity_i)
+                        .arg(&eps)
+                        .launch(qk_rope_cfg)?;
+                }
+                let q_mutant = s.clone_dtoh(&q_norm_mutant)?;
+                mutant_mismatch = q_ref
+                    .iter()
+                    .zip(&q_mutant)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(
+                    mutant_mismatch > 0,
+                    "one-position RoPE mutant was not detected on {label}"
+                );
             }
-            let q_mutant = s.clone_dtoh(&q_norm_mutant)?;
-            let mutant_mismatch = q_parent
-                .iter()
-                .zip(&q_mutant)
-                .filter(|(a, b)| a != b)
-                .count();
-            ensure!(
-                mutant_mismatch > 0,
-                "one-position RoPE mutant was not detected"
-            );
+            if label == "refiner" {
+                // Perturb one input element in [row=0, head=2] (inside CTA 0) and assert 0 bleed to sibling warps.
+                let (p_row, p_head, p_col) = (0usize, 2usize, 5usize);
+                let idx = (p_row * heads + p_head) * dim + p_col;
+                let mut q_p_host = q_init.clone();
+                let mut k_p_host = k.clone();
+                let mut v_p_host = v.clone();
+                q_p_host[idx] = bf16::from_f32(q_p_host[idx].to_f32() + 1.0);
+                k_p_host[idx] = bf16::from_f32(k_p_host[idx].to_f32() + 1.0);
+                v_p_host[idx] = bf16::from_f32(v_p_host[idx].to_f32() + 1.0);
+                let q_p_dev = s.clone_htod(&q_p_host)?;
+                let k_p_dev = s.clone_htod(&k_p_host)?;
+                let v_p_dev = s.clone_htod(&v_p_host)?;
+                let mut q_out_p = s.alloc_zeros::<bf16>(elements)?;
+                let k_out_p = s.alloc_zeros::<bf16>(kv_elements)?;
+                unsafe {
+                    s.launch_builder(&kernels.rotary_q)
+                        .arg(&pointer(&q_p_dev, s))
+                        .arg(&weight)
+                        .arg(&mut q_out_p)
+                        .arg(&table)
+                        .arg(&start)
+                        .arg(&rows_i)
+                        .arg(&heads_i)
+                        .arg(&dim_i)
+                        .arg(&rotary_i)
+                        .arg(&capacity_i)
+                        .arg(&eps)
+                        .launch(qk_rope_cfg)?;
+                    s.launch_builder(&kernels.rotary_kv)
+                        .arg(&pointer(&k_p_dev, s))
+                        .arg(&weight)
+                        .arg(&v_p_dev)
+                        .arg(&pointer(&k_out_p, s))
+                        .arg(&pointer(&q_p_dev, s))
+                        .arg(&table)
+                        .arg(&start)
+                        .arg(&rows_i)
+                        .arg(&heads_i)
+                        .arg(&dim_i)
+                        .arg(&rotary_i)
+                        .arg(&capacity_i)
+                        .arg(&eps)
+                        .launch(qk_rope_cfg)?;
+                }
+                let q_p_got = s.clone_dtoh(&q_out_p)?;
+                let k_p_got = s.clone_dtoh(&k_out_p)?;
+                let v_p_got = s.clone_dtoh(&q_p_dev)?;
+                let q_target_start = (p_row * heads + p_head) * dim;
+                let kv_target_start = (p_head * capacity + usize::try_from(start)? + p_row) * dim;
+                let mut q_hit = 0usize;
+                let mut q_bleed = 0usize;
+                for (i, (a, b)) in q_ref.iter().zip(&q_p_got).enumerate() {
+                    if a.to_bits() != b.to_bits() {
+                        if (q_target_start..q_target_start + dim).contains(&i) {
+                            q_hit += 1;
+                        } else {
+                            q_bleed += 1;
+                        }
+                    }
+                }
+                let mut k_hit = 0usize;
+                let mut k_bleed = 0usize;
+                for (i, (a, b)) in k_ref.iter().zip(&k_p_got).enumerate() {
+                    if a.to_bits() != b.to_bits() {
+                        if (kv_target_start..kv_target_start + dim).contains(&i) {
+                            k_hit += 1;
+                        } else {
+                            k_bleed += 1;
+                        }
+                    }
+                }
+                let mut v_hit = 0usize;
+                let mut v_bleed = 0usize;
+                for (i, (a, b)) in v_ref.iter().zip(&v_p_got).enumerate() {
+                    if a.to_bits() != b.to_bits() {
+                        if (kv_target_start..kv_target_start + dim).contains(&i) {
+                            v_hit += 1;
+                        } else {
+                            v_bleed += 1;
+                        }
+                    }
+                }
+                ensure!(
+                    q_hit > 0
+                        && k_hit > 0
+                        && v_hit == 1
+                        && q_bleed == 0
+                        && k_bleed == 0
+                        && v_bleed == 0,
+                    "CTA warp isolation failed: hit={q_hit}/{k_hit}/{v_hit} bleed={q_bleed}/{k_bleed}/{v_bleed}"
+                );
+                println!(
+                    "H3_QK_ROPE_ISOLATION case={label} hit={q_hit}/{k_hit}/{v_hit} bleed={q_bleed}/{k_bleed}/{v_bleed}"
+                );
+            }
             println!(
-                "H3_QK_ROPE_FUSION rows={rows} q_mismatch={q_mismatch} k_mismatch={k_mismatch} v_mismatch={v_mismatch} mutant_mismatch={mutant_mismatch}"
+                "H3_QK_ROPE_FUSION case={label} rows={rows} heads={heads} start={start} cap={capacity} rotary={rotary} q_mismatch={q_mismatch} k_mismatch={k_mismatch} v_mismatch={v_mismatch} mutant_mismatch={mutant_mismatch}"
             );
         }
         Ok(())
