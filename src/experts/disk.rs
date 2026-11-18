@@ -470,6 +470,11 @@ impl SpanReader {
         })
     }
 
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn file_len(&self) -> u64 {
+        self.len
+    }
+
     pub(crate) fn plan(&self, requests: &[(u64, u64)], chunk: u64) -> Result<Vec<ReadSpan>> {
         plan_spans(
             requests,
@@ -544,7 +549,7 @@ impl SpanReader {
 
     /// Direct read of `[begin, begin+width)` into `dest`. `dest` holds the next multiple of the
     /// alignment. A short read is accepted when `got == width`.
-    fn read_direct(&self, begin: u64, width: u64, dest: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_direct(&self, begin: u64, width: u64, dest: &mut [u8]) -> Result<()> {
         ensure!(self.direct, "buffered reader issued a direct window");
         let align = self.alignment;
         ensure!(

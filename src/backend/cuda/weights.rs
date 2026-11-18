@@ -1961,8 +1961,7 @@ impl DenseStreaming {
                 .bytes
                 .checked_add(device_bytes)
                 .context("dense layer bytes overflow")?;
-            layer.source_bytes = layer
-                .source_bytes
+            layer.source_bytes = source_offset
                 .checked_add(entry.bytes)
                 .context("dense layer source bytes overflow")?;
             layer.entries.push(DenseEntry {

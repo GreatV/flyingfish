@@ -156,6 +156,32 @@ struct EntryReader {
     staging: Option<AlignedBytes>,
 }
 
+/// One batched direct-read destination: tensor identity plus a disjoint writable
+/// window of the pinned arena at the tensor's packed offset, exactly its
+/// `entry.bytes`; only the owning worker thread dereferences it.
+struct DirectRead<'a> {
+    name: &'a str,
+    entry: &'a TensorEntry,
+    dest: *mut u8,
+    dest_len: usize,
+}
+
+fn align_min() -> usize {
+    4096
+}
+
+/// The batch base pointer, Send by the disjoint-index discipline of `read_many_direct`.
+struct DirectBatch(*mut u8);
+
+impl Copy for DirectBatch {}
+impl Clone for DirectBatch {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+unsafe impl Send for DirectBatch {}
+unsafe impl Sync for DirectBatch {}
+
 impl EntryReader {
     fn new(dir: &Path) -> Self {
         Self {
@@ -244,6 +270,121 @@ impl EntryReader {
     /// The tensor's bytes, read with O_DIRECT into the reusable aligned staging buffer.
     fn read(&mut self, name: &str, entry: &TensorEntry) -> Result<&[u8]> {
         self.read_range(name, entry, 0, entry.bytes)
+    }
+
+    /// Fills the pinned windows with one aligned direct read each, four shards in flight.
+    /// Readers are opened first on this thread; each worker then owns whole shard queues,
+    /// so every destination is touched by exactly one thread.
+    fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>]) -> Result<()> {
+        let mut spans: Vec<(*mut u8, usize)> = requests
+            .iter()
+            .map(|request| (request.dest, request.dest_len))
+            .collect();
+        spans.sort_unstable();
+        for window in spans.windows(2) {
+            ensure!(
+                window[0].0.wrapping_add(window[0].1) <= window[1].0,
+                "direct batch destination windows overlap"
+            );
+        }
+        for request in requests.iter() {
+            if !self.readers.contains_key(&request.entry.shard) {
+                let reader = SpanReader::open(&self.dir.join(&request.entry.shard), true)?;
+                self.readers.insert(request.entry.shard.clone(), reader);
+            }
+        }
+        let readers = &self.readers;
+        let mut queues: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, request) in requests.iter().enumerate() {
+            queues
+                .entry(request.entry.shard.clone())
+                .or_default()
+                .push(index);
+        }
+        let queues: Vec<Vec<usize>> = queues.into_values().collect();
+        let in_flight = queues.len().clamp(1, 4);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let batch = DirectBatch(requests.as_mut_ptr().cast::<u8>());
+        let batch = &batch;
+        std::thread::scope(|scope| -> Result<()> {
+            let handles: Vec<_> = (0..in_flight)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        loop {
+                            let queue = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let Some(queue) = queues.get(queue) else {
+                                return Ok(());
+                            };
+                            let mut bounce = AlignedBytes::new(align_min(), align_min())?;
+                            for &index in queue {
+                                // SAFETY: each index is owned by exactly one queue and
+                                // therefore one worker; the window is within the arena.
+                                let request =
+                                    unsafe { &mut *(batch.0 as *mut DirectRead).add(index) };
+                                let destination = unsafe {
+                                    std::slice::from_raw_parts_mut(request.dest, request.dest_len)
+                                };
+                                Self::read_bounced(
+                                    readers,
+                                    request.name,
+                                    request.entry,
+                                    destination,
+                                    &mut bounce,
+                                )?;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("direct batch worker panicked"))??;
+            }
+            Ok(())
+        })
+    }
+
+    /// One tensor through an aligned worker bounce into its packed destination.
+    fn read_bounced(
+        readers: &BTreeMap<String, SpanReader>,
+        name: &str,
+        entry: &TensorEntry,
+        destination: &mut [u8],
+        bounce: &mut AlignedBytes,
+    ) -> Result<()> {
+        let reader = readers
+            .get(&entry.shard)
+            .with_context(|| format!("{name}: shard {} not open", entry.shard))?;
+        let start = entry
+            .data_start
+            .checked_add(entry.data_offsets[0])
+            .context("tensor offset overflow")?;
+        let align = reader.alignment as usize;
+        let head = start as usize % align;
+        let begin = start - head as u64;
+        let width = entry
+            .bytes
+            .checked_add(head)
+            .and_then(|v| v.checked_add(align - 1))
+            .context("pinned span overflow")?
+            & !(align - 1);
+        let width = width
+            .min(usize::try_from(reader.file_len() - begin)?)
+            .max(entry.bytes + head);
+        ensure!(
+            destination.len() >= entry.bytes,
+            "{name}: dense slot holds {} of {}",
+            destination.len(),
+            entry.bytes
+        );
+        if bounce.len() < width + align {
+            *bounce = AlignedBytes::new(width + align, align)?;
+        }
+        let span = bounce.as_mut();
+        reader.read_direct(begin, width as u64, span)?;
+        destination[..entry.bytes].copy_from_slice(&span[head..head + entry.bytes]);
+        Ok(())
     }
 
     /// Bytes `start..start + bytes` of the tensor, read with O_DIRECT into the reusable aligned staging buffer.
@@ -2863,6 +3004,8 @@ fn place_layers(
         let host_tier = plan.host.clone();
         let mut dense =
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
+        let mut requests = Vec::new();
+        let mut checks = Vec::new();
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
             let (layout, _) = matrix_layout(base.manifest, &name, roles)?;
@@ -2870,27 +3013,51 @@ fn place_layers(
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
             ensure!(
-                host.len() == source_layers[layer],
+                host.len() >= source_layers[layer],
                 "{name}: pinned copy size"
             );
             let mut source_offset = 0usize;
             for (role, (offset, _)) in &layout {
                 let tensor = format!("{name}.{role}");
                 let entry = &base.manifest.entries[&tensor];
-                if entry.quant.is_some() {
-                    base.reader.read_raw(
-                        &tensor,
-                        entry,
-                        &mut host[source_offset..source_offset + entry.bytes],
-                    )?;
+
+                let at = if entry.quant.is_some() {
+                    source_offset
                 } else {
-                    base.reader.read_into(
-                        &tensor,
-                        entry,
-                        &mut host[2 * offset..2 * offset + entry.bytes],
-                    )?;
-                }
+                    2 * offset
+                };
+                requests.push((tensor.clone(), (entry.clone(), host.as_mut_ptr(), at)));
+                checks.push((layer, tensor, entry.clone(), at));
                 source_offset += entry.bytes;
+            }
+        }
+        let mut batch = requests
+            .iter_mut()
+            .map(|(tensor, (entry, base, at))| DirectRead {
+                name: tensor,
+                entry,
+                dest: unsafe { base.add(*at) },
+                dest_len: entry.bytes,
+            })
+            .collect::<Vec<_>>();
+        base.reader.read_many_direct(&mut batch)?;
+        for (layer, tensor, entry, at) in &checks {
+            let host = dense
+                .host_layer(*layer)?
+                .with_context(|| format!("{tensor}: host tier vanished"))?;
+            let filled = &host[*at..*at + entry.bytes];
+            if entry.quant.is_none() {
+                ensure!(
+                    matches!(entry.dtype, Dtype::BF16 | Dtype::F32),
+                    "{tensor}: {:?} is not a finite-checkable dtype",
+                    entry.dtype
+                );
+                let finite = if entry.dtype == Dtype::F32 {
+                    <f32 as Element>::finite(filled)
+                } else {
+                    <bf16 as Element>::finite(filled)
+                };
+                ensure!(finite, "{tensor}: nonfinite value");
             }
         }
         Some(dense)
@@ -14003,5 +14170,87 @@ mod tests {
             println!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}");
             bail!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}")
         }
+    }
+}
+
+#[cfg(test)]
+mod h3_direct_batch_tests {
+    use super::*;
+
+    #[test]
+    fn direct_batch_matches_the_serial_read() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-direct-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let shard = dir.join("shard.bin");
+        let align = 4096usize;
+        let len = 64 * align;
+        let file: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&shard, &file)?;
+        let entry = |start: u64, bytes: usize| TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![bytes / 2],
+            shard: "shard.bin".to_owned(),
+            bytes,
+            load: true,
+            data_start: start,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let entries = [
+            entry(align as u64 + 96, 5 * align / 2),
+            entry(32 * align as u64 + 33, 3 * align),
+        ];
+        let mut reader = EntryReader::new(&dir);
+        // Packed destinations at arbitrary offsets, as the dense fill produces.
+        let mut offsets = [0usize; 2];
+        let mut cursor = 0usize;
+        for (index, entry) in entries.iter().enumerate() {
+            offsets[index] = cursor + 123;
+            cursor += entry.bytes + 123;
+        }
+        let total = cursor + 2 * align;
+        let mut arena = AlignedBytes::new(total, align)?;
+        let mut requests = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            requests.push(DirectRead {
+                name: "t",
+                entry,
+                dest: unsafe { arena.as_mut().as_mut_ptr().add(offsets[index]) },
+                dest_len: entry.bytes,
+            });
+        }
+        reader.read_many_direct(&mut requests)?;
+        for (index, entry) in entries.iter().enumerate() {
+            let got = &arena.as_mut()[offsets[index]..offsets[index] + entry.bytes];
+            let want = &file[entry.data_start as usize..entry.data_start as usize + entry.bytes];
+            ensure!(got == want, "tensor {index}: batch bytes differ");
+        }
+        reader.read_many_direct(&mut [])?;
+        let entry = &entries[0];
+        let mut overlap = [
+            DirectRead {
+                name: "t",
+                entry,
+                dest: arena.as_mut().as_mut_ptr(),
+                dest_len: total,
+            },
+            DirectRead {
+                name: "t",
+                entry,
+                dest: unsafe { arena.as_mut().as_mut_ptr().add(offsets[0]) },
+                dest_len: entry.bytes,
+            },
+        ];
+        ensure!(
+            reader.read_many_direct(&mut overlap).is_err(),
+            "overlapping destination windows accepted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }
