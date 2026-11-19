@@ -182,6 +182,307 @@ impl Clone for DirectBatch {
 unsafe impl Send for DirectBatch {}
 unsafe impl Sync for DirectBatch {}
 
+/// One owned direct-read destination: a tensor identity plus a disjoint writable window of a
+/// pinned arena, exactly `entry.bytes`. Ownership lets the batch cross into a fill thread.
+#[derive(Clone)]
+struct OwnedRead {
+    name: String,
+    entry: TensorEntry,
+    dest: *mut u8,
+    dest_len: usize,
+}
+
+// SAFETY: every destination window is disjoint; only the fill batch touches it before the join.
+unsafe impl Send for OwnedRead {}
+unsafe impl Sync for OwnedRead {}
+
+/// Workers a fill batch runs across: twice the shard count, clamped to `[4, 8]`, bounded by the
+/// tensor count.
+fn fill_in_flight(shards: usize, tensors: usize) -> usize {
+    (2 * shards).clamp(4, 8).min(tensors.max(1))
+}
+
+/// Runs one fill batch through a fresh reader on the calling thread.
+fn run_fill_batch(dir: &Path, requests: &[OwnedRead]) -> Result<()> {
+    let mut reader = EntryReader::new(dir);
+    let mut batch: Vec<DirectRead<'_>> = requests
+        .iter()
+        .map(|request| DirectRead {
+            name: &request.name,
+            entry: &request.entry,
+            dest: request.dest,
+            dest_len: request.dest_len,
+        })
+        .collect();
+    reader.read_many_direct(&mut batch)
+}
+
+/// A fill batch running on its own thread; a failed read surfaces at [`FillThread::join`] with
+/// the reader's error text.
+struct FillThread {
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl FillThread {
+    fn spawn(dir: &Path, requests: Vec<OwnedRead>) -> Result<Self> {
+        let dir = dir.to_path_buf();
+        let handle = std::thread::Builder::new()
+            .name("h3-fill".to_owned())
+            .spawn(move || run_fill_batch(&dir, &requests))?;
+        Ok(Self {
+            handle: Some(handle),
+        })
+    }
+
+    fn join(&mut self) -> Result<()> {
+        let handle = self.handle.take().context("fill thread joined twice")?;
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("h3-fill worker panicked"))?
+    }
+}
+
+impl Drop for FillThread {
+    /// An abandoned fill still completes its reads; its result surfaces only through `join`.
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("h3-fill worker panicked"));
+        }
+    }
+}
+
+/// Bounce buffers reserved by live background fills; the upper bound is one largest-tensor
+/// buffer per worker.
+static LIVE_FILL_BOUNCE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The host reserve a dense tier keeps beside its pinned layer copies: `slot_count` device
+/// slots, the largest single tensor, and 4 GiB.
+fn pinned_host_reserve(slot_count: usize, slot_bytes: usize, largest: usize) -> Result<usize> {
+    slot_count
+        .checked_mul(slot_bytes)
+        .and_then(|slots| slots.checked_add(largest))
+        .and_then(|bytes| bytes.checked_add(4 << 30))
+        .context("pinned host reserve overflow")
+}
+
+enum FillSchedule {
+    Background(FillThread),
+    Serial(Vec<OwnedRead>),
+}
+
+/// Derives whether a fill of `requests` runs beside the live fills within the sensed host
+/// budget, and the bounce bound it reserves. `reserve` mirrors the caller's host-tier reserve
+/// ([`pinned_host_reserve`]). Serial keeps the inline order; nothing is retried.
+fn schedule_fill(
+    component: &str,
+    dir: &Path,
+    requests: Vec<OwnedRead>,
+    reserve: usize,
+) -> Result<(FillSchedule, usize)> {
+    let shards = requests
+        .iter()
+        .map(|request| request.entry.shard.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let in_flight = fill_in_flight(shards, requests.len());
+    let largest = requests
+        .iter()
+        .map(|request| request.dest_len)
+        .max()
+        .unwrap_or(0);
+    let bounce = in_flight
+        .checked_mul(largest)
+        .context("fill bounce bound overflow")?;
+    let live = LIVE_FILL_BOUNCE_BYTES.fetch_add(bounce, std::sync::atomic::Ordering::SeqCst);
+    let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
+        "/",
+    ))?)?;
+    let background = !requests.is_empty()
+        && available
+            .checked_sub(live)
+            .and_then(|bytes| bytes.checked_sub(bounce))
+            .is_some_and(|bytes| bytes >= reserve);
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_fill_schedule": {
+                "component": component, "decision": if background { "background" } else { "serial" },
+                "requests": requests.len(), "shards": shards, "in_flight": in_flight,
+                "bounce_bound_bytes": bounce, "live_fill_bounce_bytes": live,
+                "host_available_bytes": available, "host_reserve_bytes": reserve}})
+        );
+    }
+    if !background {
+        LIVE_FILL_BOUNCE_BYTES.fetch_sub(bounce, std::sync::atomic::Ordering::SeqCst);
+        return Ok((FillSchedule::Serial(requests), 0));
+    }
+    Ok((
+        FillSchedule::Background(FillThread::spawn(dir, requests)?),
+        bounce,
+    ))
+}
+
+/// One post-join finite check: `bytes` at arena offset `at` of `layer`.
+struct FillCheck {
+    layer: usize,
+    tensor: String,
+    dtype: Dtype,
+    quant: Option<GgmlType>,
+    at: usize,
+    bytes: usize,
+}
+
+/// Validates filled host-tier windows: unquantized BF16 and F32 tensors are finite.
+fn check_filled_tier(
+    dense: &mut crate::backend::cuda::weights::DenseStreaming,
+    checks: &[FillCheck],
+) -> Result<()> {
+    for check in checks {
+        if check.quant.is_some() {
+            continue;
+        }
+        ensure!(
+            matches!(check.dtype, Dtype::BF16 | Dtype::F32),
+            "{}: {:?} is not a finite-checkable dtype",
+            check.tensor,
+            check.dtype
+        );
+        let host = dense
+            .host_layer(check.layer)?
+            .with_context(|| format!("{}: host tier vanished", check.tensor))?;
+        let filled = &host[check.at..check.at + check.bytes];
+        let finite = if check.dtype == Dtype::F32 {
+            <f32 as Element>::finite(filled)
+        } else {
+            <bf16 as Element>::finite(filled)
+        };
+        ensure!(finite, "{}: nonfinite value", check.tensor);
+    }
+    Ok(())
+}
+
+/// A background fill plus the validation that runs once it joins. A failed read or check
+/// stores its error text and replays it on every later [`PendingFill::finish`].
+pub(crate) struct PendingFill {
+    thread: Option<FillThread>,
+    bounce: usize,
+    checks: Vec<FillCheck>,
+    failure: Option<String>,
+}
+
+impl PendingFill {
+    /// Joins the fill thread; a failed read stores the reader's error text and replays it
+    /// on every later call.
+    fn join_fill(&mut self) -> Result<()> {
+        if let Some(text) = &self.failure {
+            bail!("{text}");
+        }
+        if let Some(thread) = self.thread.as_mut() {
+            let joined = thread.join();
+            LIVE_FILL_BOUNCE_BYTES.fetch_sub(self.bounce, std::sync::atomic::Ordering::SeqCst);
+            self.thread = None;
+            if let Err(error) = joined {
+                let text = format!("{error:#}");
+                self.failure = Some(text.clone());
+                bail!("{text}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Joins the fill and validates the filled windows; a failed read or check propagates
+    /// the reader's error text and stays failed.
+    fn finish(&mut self, dense: &mut crate::backend::cuda::weights::DenseStreaming) -> Result<()> {
+        self.join_fill()?;
+        if let Err(error) = check_filled_tier(dense, &self.checks) {
+            self.failure = Some(format!("{error:#}"));
+            return Err(error);
+        }
+        self.checks.clear();
+        Ok(())
+    }
+}
+
+impl Drop for PendingFill {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            LIVE_FILL_BOUNCE_BYTES.fetch_sub(self.bounce, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Device slots the placement uses: the largest slot index plus one.
+fn used_dense_slots(plan: &crate::prefill::DensePlacement) -> usize {
+    plan.slots
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .map_or(0, |index| index + 1)
+}
+
+/// The dense streaming tier and its background fill. `Drop` joins a pending fill before the
+/// field drops free the pinned arena the fill writes into; `ready` hands out the tier only
+/// after a pending fill joined and validated.
+pub(crate) struct DenseTier {
+    fill: Option<PendingFill>,
+    dense: crate::backend::cuda::weights::DenseStreaming,
+}
+
+impl DenseTier {
+    /// Fills `dense`'s host tier: in the background when the derived host budget holds,
+    /// otherwise inline. Inline fills validate before returning; background fills defer
+    /// their checks to the join before the tier's first consumer.
+    fn schedule(
+        component: &'static str,
+        mut dense: crate::backend::cuda::weights::DenseStreaming,
+        dir: &Path,
+        requests: Vec<OwnedRead>,
+        checks: Vec<FillCheck>,
+        (slot_count, slot_bytes, largest): (usize, usize, usize),
+    ) -> Result<Self> {
+        let reserve = pinned_host_reserve(slot_count, slot_bytes, largest)?;
+        let (schedule, bounce) = schedule_fill(component, dir, requests, reserve)?;
+        let fill = match schedule {
+            FillSchedule::Background(thread) => Some(PendingFill {
+                thread: Some(thread),
+                bounce,
+                checks,
+                failure: None,
+            }),
+            FillSchedule::Serial(requests) => {
+                run_fill_batch(dir, &requests)?;
+                check_filled_tier(&mut dense, &checks)?;
+                None
+            }
+        };
+        Ok(Self { fill, dense })
+    }
+
+    /// The streaming tier, joining and validating a pending fill first. A failed fill
+    /// replays its error on every call.
+    fn ready(&mut self) -> Result<&mut crate::backend::cuda::weights::DenseStreaming> {
+        if self.fill.is_some() {
+            let mut pending = self.fill.take().expect("fill presence checked");
+            if let Err(error) = pending.finish(&mut self.dense) {
+                self.fill = Some(pending);
+                return Err(error);
+            }
+        }
+        Ok(&mut self.dense)
+    }
+}
+
+impl Drop for DenseTier {
+    fn drop(&mut self) {
+        // Joins a running fill before `dense` drops and frees the arena it writes into.
+        self.fill.take();
+    }
+}
+
 impl EntryReader {
     fn new(dir: &Path) -> Self {
         Self {
@@ -255,26 +556,14 @@ impl EntryReader {
         Ok(())
     }
 
-    /// Copies a quantized tensor's stored source bytes into host memory of exactly its size.
-    fn read_raw(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
-        ensure!(
-            entry.bytes == destination.len(),
-            "{name}: {} B does not fill {} B",
-            entry.bytes,
-            destination.len()
-        );
-        destination.copy_from_slice(self.read(name, entry)?);
-        Ok(())
-    }
-
     /// The tensor's bytes, read with O_DIRECT into the reusable aligned staging buffer.
     fn read(&mut self, name: &str, entry: &TensorEntry) -> Result<&[u8]> {
         self.read_range(name, entry, 0, entry.bytes)
     }
 
-    /// Fills the pinned windows with one aligned direct read each, four shards in flight.
-    /// Readers are opened first on this thread; each worker then owns whole shard queues,
-    /// so every destination is touched by exactly one thread.
+    /// Fills the pinned windows with one aligned direct read each. Readers are opened
+    /// first on this thread; workers then claim single tensors round-robin across the
+    /// shard queues, so every destination is written by exactly one worker.
     fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>]) -> Result<()> {
         let mut spans: Vec<(*mut u8, usize)> = requests
             .iter()
@@ -302,7 +591,17 @@ impl EntryReader {
                 .push(index);
         }
         let queues: Vec<Vec<usize>> = queues.into_values().collect();
-        let in_flight = queues.len().clamp(1, 4);
+        let total: usize = queues.iter().map(Vec::len).sum();
+        let mut order = Vec::with_capacity(total);
+        let deepest = queues.iter().map(Vec::len).max().unwrap_or(0);
+        for position in 0..deepest {
+            for queue in &queues {
+                if let Some(&index) = queue.get(position) {
+                    order.push(index);
+                }
+            }
+        }
+        let in_flight = fill_in_flight(queues.len(), order.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let batch = DirectBatch(requests.as_mut_ptr().cast::<u8>());
         let batch = &batch;
@@ -310,28 +609,25 @@ impl EntryReader {
             let handles: Vec<_> = (0..in_flight)
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {
+                        let mut bounce = AlignedBytes::new(align_min(), align_min())?;
                         loop {
-                            let queue = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let Some(queue) = queues.get(queue) else {
+                            let claimed = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let Some(&index) = order.get(claimed) else {
                                 return Ok(());
                             };
-                            let mut bounce = AlignedBytes::new(align_min(), align_min())?;
-                            for &index in queue {
-                                // SAFETY: each index is owned by exactly one queue and
-                                // therefore one worker; the window is within the arena.
-                                let request =
-                                    unsafe { &mut *(batch.0 as *mut DirectRead).add(index) };
-                                let destination = unsafe {
-                                    std::slice::from_raw_parts_mut(request.dest, request.dest_len)
-                                };
-                                Self::read_bounced(
-                                    readers,
-                                    request.name,
-                                    request.entry,
-                                    destination,
-                                    &mut bounce,
-                                )?;
-                            }
+                            // SAFETY: each index is claimed by exactly one worker;
+                            // the window is within the arena.
+                            let request = unsafe { &mut *(batch.0 as *mut DirectRead).add(index) };
+                            let destination = unsafe {
+                                std::slice::from_raw_parts_mut(request.dest, request.dest_len)
+                            };
+                            Self::read_bounced(
+                                readers,
+                                request.name,
+                                request.entry,
+                                destination,
+                                &mut bounce,
+                            )?;
                         }
                     })
                 })
@@ -3211,7 +3507,7 @@ struct PlacementFacts {
 }
 
 struct PlacedLayers {
-    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    tier: Option<DenseTier>,
     #[cfg(test)]
     facts: PlacementFacts,
 }
@@ -3245,11 +3541,7 @@ fn plan_dense_layers(
     )?;
     let (host_budget, host_available) = if probe.slot_bytes > 0 {
         let available = host_available.context("host tier without a measured host budget")?;
-        let reserved = slot_count
-            .checked_mul(probe.slot_bytes)
-            .and_then(|bytes| bytes.checked_add(largest))
-            .and_then(|bytes| bytes.checked_add(4 << 30))
-            .context("dense host reserve overflow")?;
+        let reserved = pinned_host_reserve(slot_count, probe.slot_bytes, largest)?;
         ensure!(
             available >= reserved,
             "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
@@ -3297,6 +3589,7 @@ fn plan_dense_layers(
 /// host/disk tier; it equals `layers` for a native BF16 manifest and is the stored source size for a quantized one.
 /// Host-tier copies are filled from `base` in `roles` order before the first `begin`.
 fn place_layers(
+    component: &'static str,
     d: &Device,
     base: &mut Source<'_>,
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
@@ -3346,32 +3639,34 @@ fn place_layers(
             serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "streaming_slots": used_slots, "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
         );
     }
-    let dense = bind_layers(d, base, source_layers, plan, name, roles)?;
+    let tier = bind_layers(component, d, base, source_layers, plan, name, roles)?;
     #[cfg(test)]
     {
-        Ok(PlacedLayers { dense, facts })
+        Ok(PlacedLayers { tier, facts })
     }
     #[cfg(not(test))]
     {
-        Ok(PlacedLayers { dense })
+        Ok(PlacedLayers { tier })
     }
 }
 
 fn bind_layers(
+    component: &'static str,
     d: &Device,
     base: &mut Source<'_>,
     source_layers: &[usize],
     plan: crate::prefill::DensePlacement,
     name: impl Fn(usize) -> String,
     roles: &[&str],
-) -> Result<Option<crate::backend::cuda::weights::DenseStreaming>> {
-    let dense = if plan.slot_bytes > 0 {
+) -> Result<Option<DenseTier>> {
+    let tier = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
         let mut dense =
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         let mut requests = Vec::new();
         let mut checks = Vec::new();
+        let mut largest = 0usize;
         for layer in (0..source_layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
             let (layout, _) = matrix_layout(base.manifest, &name, roles)?;
@@ -3392,45 +3687,38 @@ fn bind_layers(
                 } else {
                     2 * offset
                 };
-                requests.push((tensor.clone(), (entry.clone(), host.as_mut_ptr(), at)));
-                checks.push((layer, tensor, entry.clone(), at));
+                requests.push(OwnedRead {
+                    name: tensor.clone(),
+                    entry: entry.clone(),
+                    dest: unsafe { host.as_mut_ptr().add(at) },
+                    dest_len: entry.bytes,
+                });
+                checks.push(FillCheck {
+                    layer,
+                    tensor,
+                    dtype: entry.dtype,
+                    quant: entry.quant,
+                    at,
+                    bytes: entry.bytes,
+                });
+                largest = largest.max(entry.bytes);
                 source_offset += entry.bytes;
             }
         }
-        let mut batch = requests
-            .iter_mut()
-            .map(|(tensor, (entry, base, at))| DirectRead {
-                name: tensor,
-                entry,
-                dest: unsafe { base.add(*at) },
-                dest_len: entry.bytes,
-            })
-            .collect::<Vec<_>>();
-        base.reader.read_many_direct(&mut batch)?;
-        for (layer, tensor, entry, at) in &checks {
-            let host = dense
-                .host_layer(*layer)?
-                .with_context(|| format!("{tensor}: host tier vanished"))?;
-            let filled = &host[*at..*at + entry.bytes];
-            if entry.quant.is_none() {
-                ensure!(
-                    matches!(entry.dtype, Dtype::BF16 | Dtype::F32),
-                    "{tensor}: {:?} is not a finite-checkable dtype",
-                    entry.dtype
-                );
-                let finite = if entry.dtype == Dtype::F32 {
-                    <f32 as Element>::finite(filled)
-                } else {
-                    <bf16 as Element>::finite(filled)
-                };
-                ensure!(finite, "{tensor}: nonfinite value");
-            }
-        }
-        Some(dense)
+        let slot_count = used_dense_slots(&dense.plan);
+        let slot_bytes = dense.plan.slot_bytes;
+        Some(DenseTier::schedule(
+            component,
+            dense,
+            &dir,
+            requests,
+            checks,
+            (slot_count, slot_bytes, largest),
+        )?)
     } else {
         None
     };
-    Ok(dense)
+    Ok(tier)
 }
 
 type StoredOffsets = Vec<Vec<(String, usize)>>;
@@ -3775,10 +4063,7 @@ fn place_stored_layers(
     sizing: &DenseSizing,
     owned: usize,
     placement: Placement,
-) -> Result<(
-    Option<crate::backend::cuda::weights::DenseStreaming>,
-    StoredOffsets,
-)> {
+) -> Result<(Option<DenseTier>, StoredOffsets)> {
     use crate::prefill::DensePlacement;
     let dropped = spec
         .dropped_blocks
@@ -3975,7 +4260,8 @@ fn place_stored_layers(
         "{}",
         serde_json::json!({"h3_dense_placement_tail": {"before_resident": before_resident, "before_host": before_host, "before_slots": before_slots, "before_slot_bytes": before_slot_bytes, "after_resident": after_resident, "after_host": after_host, "after_slots": after_slots, "after_slot_bytes": slot_bytes, "last_short_overread_bytes": last_short_overread, "max_past_end_bytes": max_past_end, "layer_tail_bytes": layer_tail_bytes}})
     );
-    let dense = if plan.slot_bytes > 0 {
+    let mut tier = None;
+    if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
             &dir,
@@ -3984,6 +4270,9 @@ fn place_stored_layers(
             d,
             Some(&order),
         )?;
+        let mut requests = Vec::new();
+        let mut checks = Vec::new();
+        let mut largest = 0usize;
         for (layer, names) in order.iter().enumerate() {
             if !dense.plan.host[layer] {
                 continue;
@@ -4004,15 +4293,31 @@ fn place_stored_layers(
                     .with_context(|| format!("manifest lacks {name}"))?
                     .clone();
                 ensure!(offset.is_multiple_of(16), "stored factor alignment");
+                ensure!(
+                    matches!(entry.dtype, Dtype::BF16 | Dtype::I8),
+                    "{name}: stored dtype {:?}",
+                    entry.dtype
+                );
                 let end = offset
                     .checked_add(entry.bytes)
                     .with_context(|| format!("{name} stored host offset"))?;
-                let dest = &mut host[offset..end];
-                match entry.dtype {
-                    Dtype::BF16 => base.reader.read_into(name, &entry, dest)?,
-                    Dtype::I8 => base.reader.read_raw(name, &entry, dest)?,
-                    other => bail!("{name}: stored dtype {other:?}"),
+                requests.push(OwnedRead {
+                    name: name.clone(),
+                    entry: entry.clone(),
+                    dest: unsafe { host.as_mut_ptr().add(offset) },
+                    dest_len: entry.bytes,
+                });
+                if entry.dtype == Dtype::BF16 {
+                    checks.push(FillCheck {
+                        layer,
+                        tensor: name.clone(),
+                        dtype: entry.dtype,
+                        quant: entry.quant,
+                        at: offset,
+                        bytes: entry.bytes,
+                    });
                 }
+                largest = largest.max(entry.bytes);
                 offset = end;
             }
             ensure!(
@@ -4020,11 +4325,18 @@ fn place_stored_layers(
                 "transformer_blocks.{layer}: pinned copy size"
             );
         }
-        Some(dense)
-    } else {
-        None
-    };
-    Ok((dense, packed))
+        let slot_count = used_dense_slots(&dense.plan);
+        let slot_bytes = dense.plan.slot_bytes;
+        tier = Some(DenseTier::schedule(
+            "dit",
+            dense,
+            &dir,
+            requests,
+            checks,
+            (slot_count, slot_bytes, largest),
+        )?);
+    }
+    Ok((tier, packed))
 }
 
 fn forward_block<const LORA: bool>(
@@ -4061,7 +4373,7 @@ pub(crate) struct Dit {
     norm_out: CudaSlice<bf16>,
     refiners: Vec<BlockWeights>,
     blocks: Vec<BlockWeights>,
-    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    tier: Option<DenseTier>,
     rotary: CudaSlice<bf16>,
     x: CudaSlice<bf16>,
     work: BlockWork,
@@ -4231,8 +4543,8 @@ impl Dit {
                 .checked_add(wscale)
                 .context("HyperFlow wscale bytes")?;
         }
-        let (dense, blocks) = if hyperflow {
-            let (dense, packed) =
+        let (tier, blocks) = if hyperflow {
+            let (tier, packed) =
                 place_stored_layers(d, &mut base, spec, &sizing, owned, placement)?;
             #[cfg(test)]
             trace_placement_pool(d, "after_streaming_slots")?;
@@ -4261,7 +4573,7 @@ impl Dit {
                 }
                 let name = format!("transformer_blocks.{layer}");
                 let bytes = sizing.layers[layer];
-                let slot = match &dense {
+                let slot = match tier.as_ref().map(|tier| &tier.dense) {
                     Some(streaming) if streaming.plan.slots[layer].is_some() => Some((
                         streaming.pointer(layer, 0, bytes)?,
                         factors.as_slice(),
@@ -4284,9 +4596,10 @@ impl Dit {
             }
             #[cfg(test)]
             trace_placement_pool(d, "after_stored_blocks")?;
-            (dense, blocks)
+            (tier, blocks)
         } else {
-            let dense = place_layers(
+            let placed = place_layers(
+                "dit",
                 d,
                 &mut base,
                 (
@@ -4299,12 +4612,12 @@ impl Dit {
                 placement,
                 |layer| format!("transformer_blocks.{layer}"),
                 &LINEAR_ROLES,
-            )?
-            .dense;
+            )?;
+            let tier = placed.tier;
             let mut blocks = Vec::with_capacity(spec.layers);
             for (layer, &bytes) in sizing.layers.iter().enumerate() {
                 let name = format!("transformer_blocks.{layer}");
-                let slot = match &dense {
+                let slot = match tier.as_ref().map(|tier| &tier.dense) {
                     Some(streaming) if streaming.plan.slots[layer].is_some() => {
                         Some(streaming.pointer(layer, 0, bytes)?)
                     }
@@ -4325,7 +4638,7 @@ impl Dit {
                     }
                 });
             }
-            (dense, blocks)
+            (tier, blocks)
         };
         let (free, total) = d.ctx.mem_get_info()?;
         let reserve = (total / 16)
@@ -4451,7 +4764,7 @@ impl Dit {
             norm_out,
             refiners,
             blocks,
-            dense,
+            tier,
             rotary,
             x,
             work,
@@ -4587,6 +4900,9 @@ impl Dit {
         (pairs, timesteps): (u32, u32),
         inputs: &StepInputs<'_>,
     ) -> Result<()> {
+        if let Some(tier) = self.tier.as_mut() {
+            tier.ready()?;
+        }
         let (s, spec, r) = (c.s, c.spec, self.ranges);
         let h = spec.hidden;
         let video_rows = r.condition + (r.rows - r.video_start);
@@ -4693,8 +5009,8 @@ impl Dit {
 
         let block_rows = 6 * h * pairs as usize;
         for (layer, block) in self.blocks.iter().enumerate() {
-            if let Some(dense) = self.dense.as_mut() {
-                dense.begin(layer, s)?;
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.begin(layer, s)?;
             }
             let modulation = Modulation {
                 table: &adaln.blocks,
@@ -4727,8 +5043,8 @@ impl Dit {
                     &mut self.work,
                 )?;
             }
-            if let Some(dense) = self.dense.as_mut() {
-                dense.end(layer, s)?;
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.end(layer, s)?;
             }
         }
         let normed = pointer(&self.work.normed, s);
@@ -4847,7 +5163,7 @@ pub(crate) struct ImageDit {
     norm_out: CudaSlice<bf16>,
     refiners: Vec<BlockWeights>,
     blocks: Vec<BlockWeights>,
-    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    tier: Option<DenseTier>,
     #[cfg(test)]
     placement: PlacementFacts,
     rotary: CudaSlice<bf16>,
@@ -5026,6 +5342,7 @@ impl ImageDit {
         let (placed, device_after, prepared_ffn) = match placement {
             ImagePlacement::Single(mode) => (
                 place_layers(
+                    "dit",
                     d,
                     &mut base,
                     (
@@ -5064,7 +5381,8 @@ impl ImageDit {
                         host_budget: plan.host_bytes,
                     }
                 };
-                let dense = bind_layers(
+                let tier = bind_layers(
+                    "dit",
                     d,
                     &mut base,
                     &sizing.source_layers,
@@ -5074,7 +5392,7 @@ impl ImageDit {
                 )?;
                 (
                     PlacedLayers {
-                        dense,
+                        tier,
                         #[cfg(test)]
                         facts,
                     },
@@ -5085,13 +5403,13 @@ impl ImageDit {
         };
         #[cfg(test)]
         let placement_facts = placed.facts;
-        let dense = placed.dense;
+        let tier = placed.tier;
         let mut blocks = Vec::with_capacity(spec.layers);
         for (layer, &bytes) in sizing.layers.iter().enumerate() {
             let name = format!("transformer_blocks.{layer}");
-            let slot = match &dense {
-                Some(dense) if dense.plan.slots[layer].is_some() => {
-                    Some(dense.pointer(layer, 0, bytes)?)
+            let slot = match tier.as_ref().map(|tier| &tier.dense) {
+                Some(streaming) if streaming.plan.slots[layer].is_some() => {
+                    Some(streaming.pointer(layer, 0, bytes)?)
                 }
                 _ => None,
             };
@@ -5145,7 +5463,7 @@ impl ImageDit {
             norm_out,
             refiners,
             blocks,
-            dense,
+            tier,
             #[cfg(test)]
             placement: placement_facts,
             rotary,
@@ -5233,6 +5551,9 @@ impl ImageDit {
         head: usize,
         inputs: &ImageStepInputs<'_>,
     ) -> Result<()> {
+        if let Some(tier) = self.tier.as_mut() {
+            tier.ready()?;
+        }
         let (s, spec) = (c.s, c.spec);
         let h = spec.hidden;
         let (text_rows, image_rows, rows) = (
@@ -5295,8 +5616,8 @@ impl ImageDit {
         )?;
         let block_rows = 6 * h * pairs as usize;
         for (layer, block) in self.blocks.iter().enumerate() {
-            if let Some(dense) = self.dense.as_mut() {
-                dense.begin(layer, s)?;
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.begin(layer, s)?;
             }
             let modulation = Modulation {
                 table: &adaln.blocks,
@@ -5315,8 +5636,8 @@ impl ImageDit {
                 &mut self.x,
                 &mut self.work,
             )?;
-            if let Some(dense) = self.dense.as_mut() {
-                dense.end(layer, s)?;
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.end(layer, s)?;
             }
         }
         let normed = pointer(&self.work.normed, s);
@@ -5553,7 +5874,7 @@ pub(crate) struct Conditioner {
     eps: f32,
     capacity: usize,
     layers: Vec<TextLayer>,
-    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    tier: Option<DenseTier>,
     kernels: BlockKernels,
     flash: Flash,
     x: CudaSlice<bf16>,
@@ -5651,10 +5972,11 @@ impl Conditioner {
         let (gate_up, gated) = (rows(2 * ffn)?, rows(ffn)?);
         let flash = Flash::new(s.clone(), capacity, q_heads, kv_heads, head_dim)?;
         let owned = layers * 2 * (2 * hidden + 2 * head_dim);
-        let dense = if let Some(plan) = plan {
-            bind_layers(d, &mut base, &bytes, plan, name, &TEXT_ROLES)?
+        let tier = if let Some(plan) = plan {
+            bind_layers("conditioner", d, &mut base, &bytes, plan, name, &TEXT_ROLES)?
         } else {
             place_layers(
+                "conditioner",
                 d,
                 &mut base,
                 (&bytes, &bytes, largest, owned, media),
@@ -5662,13 +5984,13 @@ impl Conditioner {
                 name,
                 &TEXT_ROLES,
             )?
-            .dense
+            .tier
         };
         let mut text_layers = Vec::with_capacity(layers);
         for (layer, &layer_bytes) in bytes.iter().enumerate() {
-            let slot = match &dense {
-                Some(dense) if dense.plan.slots[layer].is_some() => {
-                    Some(dense.pointer(layer, 0, layer_bytes)?)
+            let slot = match tier.as_ref().map(|tier| &tier.dense) {
+                Some(streaming) if streaming.plan.slots[layer].is_some() => {
+                    Some(streaming.pointer(layer, 0, layer_bytes)?)
                 }
                 _ => None,
             };
@@ -5689,7 +6011,7 @@ impl Conditioner {
             eps: spec.rms_eps,
             capacity,
             layers: text_layers,
-            dense,
+            tier,
             kernels: BlockKernels::new(s.context())?,
             flash,
             x,
@@ -5732,6 +6054,9 @@ impl Conditioner {
         input: &ConditionerInput<'_>,
         taps: &[usize],
     ) -> Result<Vec<Vec<bf16>>> {
+        if let Some(tier) = self.tier.as_mut() {
+            tier.ready()?;
+        }
         let (h, d) = (self.hidden, self.head_dim);
         let (qw, kvw) = (self.q_heads * d, self.kv_heads * d);
         ensure!(
@@ -5807,8 +6132,8 @@ impl Conditioner {
         let x = pointer(&self.x, s);
         let normed = pointer(&self.normed, s);
         for (index, layer) in self.layers.iter().enumerate() {
-            if let Some(dense) = self.dense.as_mut() {
-                dense.begin(index, s)?;
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.begin(index, s)?;
             }
             norm(
                 &self.x,
@@ -5908,8 +6233,8 @@ impl Conditioner {
                     feature += n;
                 }
             }
-            if let Some(dense) = self.dense.as_mut() {
-                dense.end(index, s)?;
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.end(index, s)?;
             }
             if taps.contains(&(index + 1)) {
                 tapped.push((index + 1, s.clone_dtoh(&self.x.slice(..rows * h))?));
@@ -9747,7 +10072,8 @@ mod tests {
         let mismatches =
             |placement: Placement, perturb: Option<(usize, &str, isize)>| -> Result<Vec<usize>> {
                 let mut base = Source::new(&gguf_dir, &manifest);
-                let mut dense = place_layers(
+                let placed = place_layers(
+                    "dit",
                     &device,
                     &mut base,
                     (
@@ -9760,11 +10086,11 @@ mod tests {
                     placement,
                     |layer| format!("transformer_blocks.{layer}"),
                     &LINEAR_ROLES,
-                )?
-                .dense
-                .context("streamed placement")?;
+                )?;
+                let mut tier = placed.tier.context("streamed placement")?;
+                tier.ready()?;
                 if let Some((layer, name, delta)) = perturb {
-                    dense.shift_source_offset(layer, name, delta)?;
+                    tier.dense.shift_source_offset(layer, name, delta)?;
                 }
                 let mut mismatches = Vec::new();
                 for (layer, &layer_bytes) in sizing.layers.iter().enumerate() {
@@ -9779,8 +10105,8 @@ mod tests {
                     )?;
                     let expected = stream
                         .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
-                    dense.begin(layer, stream)?;
-                    let pointer = dense.pointer(layer, 0, layer_bytes)?;
+                    tier.dense.begin(layer, stream)?;
+                    let pointer = tier.dense.pointer(layer, 0, layer_bytes)?;
                     let actual = stream.alloc_zeros::<bf16>(expected.len())?;
                     unsafe {
                         cudarc::driver::result::memcpy_dtod_async(
@@ -9790,7 +10116,7 @@ mod tests {
                             stream.cu_stream(),
                         )?;
                     }
-                    dense.end(layer, stream)?;
+                    tier.dense.end(layer, stream)?;
                     let actual = stream.clone_dtoh(&actual)?;
                     if actual
                         .iter()
@@ -12828,8 +13154,9 @@ mod tests {
         {
             let facts = dit.placement;
             let dense = dit
-                .dense
+                .tier
                 .as_ref()
+                .map(|tier| &tier.dense)
                 .context("4096 placement kept every block resident")?;
             ensure!(
                 facts.largest_bytes == sizing.largest && facts.owned_bytes == owned,
@@ -15629,6 +15956,288 @@ mod h3_direct_batch_tests {
         ensure!(
             reader.read_many_direct(&mut overlap).is_err(),
             "overlapping destination windows accepted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    fn owned(entry: TensorEntry, arena: &mut AlignedBytes, at: usize) -> OwnedRead {
+        let bytes = entry.bytes;
+        OwnedRead {
+            name: "t".to_owned(),
+            entry,
+            dest: unsafe { arena.as_mut().as_mut_ptr().add(at) },
+            dest_len: bytes,
+        }
+    }
+
+    #[test]
+    fn background_fill_failure_propagates_the_readers_text() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-fillfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let align = 4096usize;
+        let entry = TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![align / 2],
+            shard: "missing.bin".to_owned(),
+            bytes: align,
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let mut arena = AlignedBytes::new(2 * align, align)?;
+        let request = owned(entry, &mut arena, 0);
+        let mut thread = FillThread::spawn(&dir, vec![request.clone()])?;
+        let error = thread
+            .join()
+            .expect_err("fill of a missing shard succeeded");
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains("open native shard") && text.contains("missing.bin"),
+            "background fill error lacks the reader's text: {text}"
+        );
+        let error = run_fill_batch(&dir, std::slice::from_ref(&request))
+            .expect_err("serial fill of a missing shard succeeded");
+        ensure!(
+            format!("{error:#}").contains("open native shard"),
+            "serial fill error lacks the reader's text: {error:#}"
+        );
+        // A failed pending fill stays failed: every later entry replays the reader's text.
+        let mut pending = PendingFill {
+            thread: Some(FillThread::spawn(&dir, vec![request.clone()])?),
+            bounce: 0,
+            checks: Vec::new(),
+            failure: None,
+        };
+        let first = format!(
+            "{:#}",
+            pending.join_fill().expect_err("first entry succeeded")
+        );
+        let second = format!(
+            "{:#}",
+            pending.join_fill().expect_err("second entry succeeded")
+        );
+        ensure!(
+            first == second && first.contains("open native shard"),
+            "replayed fill error differs: first={first} second={second}"
+        );
+        // The resident-session form: after a successful join the pending is spent, so a
+        // second entry finds the joined tier without rejoining or erroring.
+        let mut arena_ok = AlignedBytes::new(2 * align, align)?;
+        let good = TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![align],
+            shard: "shard.bin".to_owned(),
+            bytes: 2 * align,
+            load: true,
+            data_start: align as u64,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let file: Vec<u8> = (0..16 * align).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("shard.bin"), &file)?;
+        let mut spent = PendingFill {
+            thread: Some(FillThread::spawn(
+                &dir,
+                vec![owned(good, &mut arena_ok, 0)],
+            )?),
+            bounce: 0,
+            checks: Vec::new(),
+            failure: None,
+        };
+        spent.join_fill()?;
+        ensure!(spent.thread.is_none(), "successful join kept the thread");
+        spent.join_fill()?;
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// The arena a blocked fill writes into must not free before the fill joins. A FIFO
+    /// shard blocks the worker in its O_DIRECT open until a writer appears, so the owner's
+    /// drop is observed in two orders: the tier's (join first) and the freed-arena-first
+    /// control that mirrors the reversed declaration order.
+    #[test]
+    fn dropping_a_tier_joins_its_fill_before_the_arena_frees() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-filldrop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let fifo = dir.join("blocked.bin");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .context("fifo path encoding")?;
+        let rc = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        ensure!(rc == 0, "mkfifo {fifo:?} failed: {rc}");
+        let align = 4096usize;
+        let entry = TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![align / 2],
+            shard: "blocked.bin".to_owned(),
+            bytes: align,
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        struct ArenaFreed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ArenaFreed {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        /// Mirrors `DenseTier`: the pending fill joins before the arena drops.
+        struct TierOrder {
+            fill: Option<PendingFill>,
+            arena: ArenaFreed,
+        }
+        impl Drop for TierOrder {
+            fn drop(&mut self) {
+                self.fill.take();
+            }
+        }
+        /// The reversed order: the arena frees while the fill has not joined.
+        struct TierFreedFirst {
+            arena: ArenaFreed,
+            fill: Option<PendingFill>,
+        }
+        let spawn_pending = |arena: &mut AlignedBytes| -> Result<PendingFill> {
+            Ok(PendingFill {
+                thread: Some(FillThread::spawn(
+                    &dir,
+                    vec![owned(entry.clone(), arena, 0)],
+                )?),
+                bounce: 0,
+                checks: Vec::new(),
+                failure: None,
+            })
+        };
+
+        let mut arena = AlignedBytes::new(2 * align, align)?;
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tier = TierOrder {
+            fill: Some(spawn_pending(&mut arena)?),
+            arena: ArenaFreed(std::sync::Arc::clone(&freed)),
+        };
+        ensure!(
+            tier.fill.is_some() && !tier.arena.0.load(std::sync::atomic::Ordering::SeqCst),
+            "tier starts with a pending fill over a live arena"
+        );
+        let joined = std::thread::spawn(move || drop(tier));
+        for _ in 0..150 {
+            ensure!(
+                !freed.load(std::sync::atomic::Ordering::SeqCst),
+                "arena freed while the fill had not joined"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut control_arena = AlignedBytes::new(2 * align, align)?;
+        let control_freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control = TierFreedFirst {
+            arena: ArenaFreed(std::sync::Arc::clone(&control_freed)),
+            fill: Some(spawn_pending(&mut control_arena)?),
+        };
+        ensure!(
+            control.fill.is_some() && !control.arena.0.load(std::sync::atomic::Ordering::SeqCst),
+            "control starts with a pending fill over a live arena"
+        );
+        let control_joined = std::thread::spawn(move || drop(control));
+        let mut observed = false;
+        for _ in 0..200 {
+            if control_freed.load(std::sync::atomic::Ordering::SeqCst) {
+                observed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ensure!(
+            observed,
+            "control order never freed the arena; the observation is blind"
+        );
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .context("open fifo writer")?;
+        joined
+            .join()
+            .map_err(|_| anyhow::anyhow!("tier dropper panicked"))?;
+        control_joined
+            .join()
+            .map_err(|_| anyhow::anyhow!("control dropper panicked"))?;
+        ensure!(
+            freed.load(std::sync::atomic::Ordering::SeqCst),
+            "arena not freed after the fill joined"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn fill_schedule_keeps_serial_when_the_derived_host_budget_does_not_fit() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-fillsched-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let align = 4096usize;
+        let file: Vec<u8> = (0..16 * align).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("shard.bin"), &file)?;
+        let entry = TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![align],
+            shard: "shard.bin".to_owned(),
+            bytes: 2 * align,
+            load: true,
+            data_start: align as u64,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let mut arena = AlignedBytes::new(4 * align, align)?;
+        let request = owned(entry, &mut arena, 0);
+        let (schedule, bounce) = schedule_fill("gate", &dir, Vec::new(), 0)?;
+        ensure!(
+            matches!(schedule, FillSchedule::Serial(_)) && bounce == 0,
+            "empty batch scheduled in the background"
+        );
+        let (schedule, _) = schedule_fill("gate", &dir, vec![request.clone()], usize::MAX / 2)?;
+        ensure!(
+            matches!(schedule, FillSchedule::Serial(_)),
+            "unusable host budget scheduled in the background"
+        );
+        let before = LIVE_FILL_BOUNCE_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        let (schedule, bounce) = schedule_fill("gate", &dir, vec![request], 0)?;
+        match schedule {
+            FillSchedule::Background(mut thread) => {
+                ensure!(bounce > 0, "background fill reserved no bounce bound");
+                ensure!(
+                    LIVE_FILL_BOUNCE_BYTES.load(std::sync::atomic::Ordering::SeqCst)
+                        == before + bounce,
+                    "background fill did not reserve its bounce bound"
+                );
+                thread.join()?;
+                LIVE_FILL_BOUNCE_BYTES.fetch_sub(bounce, std::sync::atomic::Ordering::SeqCst);
+            }
+            FillSchedule::Serial(_) => bail!("zero reserve stayed serial on a healthy host"),
+        }
+        ensure!(
+            LIVE_FILL_BOUNCE_BYTES.load(std::sync::atomic::Ordering::SeqCst) == before,
+            "fill bounce reservation leaked"
         );
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
