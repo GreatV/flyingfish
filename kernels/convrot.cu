@@ -121,13 +121,13 @@ extern "C" __global__ void convrot_hadamard_table(__nv_bfloat16* table, int grou
     table[idx] = value;
 }
 
-// 17 rows and above. One block owns 16 rows and one group. Block is 256.
+// 17 rows and above. One block owns 16*SLABS rows and one group. Block is 256.
 // group is a power of 4 and k is a multiple of group.
 // Activations and table[col * group + row] are ld.global.v4.u32.
 // The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
-// grid: (ceil(rows/16), 1, k/group).
-// Dynamic smem is 16*group bf16, then 8*8*16 bf16. Bytes are 32*group+2048.
-template <bool SILU>
+// Grid: (ceil(rows/(16*SLABS)), 1, k/group).
+// Dynamic smem is SLABS contiguous 16*group BF16 tiles, then 8*8*16 BF16.
+template <bool SILU, int SLABS>
 __device__ __forceinline__ void convrot_group_dot_tile(
     const __nv_bfloat16* __restrict__ x, float* __restrict__ y,
     const __nv_bfloat16* __restrict__ table, int rows, int k, int group) {
@@ -140,14 +140,15 @@ __device__ __forceinline__ void convrot_group_dot_tile(
         __trap();
     extern __shared__ __align__(16) __nv_bfloat16 tile[];
     __nv_bfloat16* atile = tile;
-    __nv_bfloat16* bsmem = tile + 16 * group;
+    const int slab_stride = 16 * group;
+    __nv_bfloat16* bsmem = tile + SLABS * slab_stride;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row0 = static_cast<int>(blockIdx.x) * 16;
+    const int row0 = static_cast<int>(blockIdx.x) * (16 * SLABS);
     const int x_col0 = static_cast<int>(blockIdx.z) * group;
     const int vshift = static_cast<int>(exp) - 3;
     const int vecs_per_row = static_cast<int>(real >> 3);
-    const int vectors = 16 * vecs_per_row;
+    const int vectors = (16 * SLABS) * vecs_per_row;
     for (int i = static_cast<int>(threadIdx.x); i < vectors; i += THREADS) {
         const int r = i >> vshift;
         const int c = (i & (vecs_per_row - 1)) << 3;
@@ -169,7 +170,10 @@ __device__ __forceinline__ void convrot_group_dot_tile(
         }
         const int panel = c >> 4;
         const int local = c & 15;
-        *reinterpret_cast<uint4*>(atile + panel * (16 * STRIDE) + r * STRIDE + local) = packed;
+        const int slab = SLABS == 1 ? 0 : r >> 4;
+        const int row = SLABS == 1 ? r : (r & 15);
+        __nv_bfloat16* a = atile + slab * slab_stride;
+        *reinterpret_cast<uint4*>(a + panel * (16 * STRIDE) + row * STRIDE + local) = packed;
     }
     __syncthreads();
     __nv_bfloat16* bt = bsmem + warp * (8 * STRIDE);
@@ -177,7 +181,7 @@ __device__ __forceinline__ void convrot_group_dot_tile(
     const int ksteps = static_cast<int>(real >> 4);
     for (int sub = warp; sub < nsub; sub += 8) {
         const int n0 = sub << 3;
-        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        float acc[SLABS][4] = {};
         for (int step = 0; step < ksteps; ++step) {
             const int k0 = step << 4;
             if (lane < 16) {
@@ -187,35 +191,54 @@ __device__ __forceinline__ void convrot_group_dot_tile(
                 *reinterpret_cast<uint4*>(bt + n * STRIDE + c0) = convrot_load_u128(src);
             }
             __syncwarp();
+            const __nv_bfloat16* ap =
+                atile + (k0 >> 4) * (16 * STRIDE) + (lane & 15) * STRIDE + (lane >> 4) * 8;
             unsigned a[4];
-            const __nv_bfloat16* ap = atile + (k0 >> 4) * (16 * STRIDE);
-            convrot_ldsm_x4(a, ap + (lane & 15) * STRIDE + (lane >> 4) * 8);
+            convrot_ldsm_x4(a, ap);
             unsigned b[2];
             convrot_ldsm_x2(b, bt + (lane & 7) * STRIDE + ((lane >> 3) & 1) * 8);
-            convrot_mma_16816(acc, a, b);
+            convrot_mma_16816(acc[0], a, b);
+            #pragma unroll
+            for (int slab = 1; slab < SLABS; ++slab) {
+                convrot_ldsm_x4(a, ap + slab * slab_stride);
+                convrot_mma_16816(acc[slab], a, b);
+            }
             __syncwarp();
         }
         const int rbase = lane >> 2;
         const int cbase = (lane & 3) * 2;
         const int rows_out[4] = {rbase, rbase, rbase + 8, rbase + 8};
         const int cols_out[4] = {cbase, cbase + 1, cbase, cbase + 1};
-        for (int t = 0; t < 4; ++t) {
-            const int r = rows_out[t];
-            const int c = cols_out[t];
-            if (row0 + r < rows && n0 + c < group)
-                y[static_cast<long long>(row0 + r) * k + x_col0 + n0 + c] = acc[t];
+        #pragma unroll
+        for (int slab = 0; slab < SLABS; ++slab) {
+            for (int t = 0; t < 4; ++t) {
+                const int r = row0 + 16 * slab + rows_out[t];
+                const int c = cols_out[t];
+                if (r < rows && n0 + c < group)
+                    y[static_cast<long long>(r) * k + x_col0 + n0 + c] = acc[slab][t];
+            }
         }
     }
 }
 
 extern "C" __global__ void convrot_group_dot(
     const __nv_bfloat16* x, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<false>(x, y, table, rows, k, group);
+    convrot_group_dot_tile<false, 1>(x, y, table, rows, k, group);
 }
 
 extern "C" __global__ void convrot_group_dot_silu(
     const __nv_bfloat16* gu, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<true>(gu, y, table, rows, k, group);
+    convrot_group_dot_tile<true, 1>(gu, y, table, rows, k, group);
+}
+
+extern "C" __global__ void convrot_group_dot_32(
+    const __nv_bfloat16* x, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
+    convrot_group_dot_tile<false, 2>(x, y, table, rows, k, group);
+}
+
+extern "C" __global__ void convrot_group_dot_silu_32(
+    const __nv_bfloat16* gu, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
+    convrot_group_dot_tile<true, 2>(gu, y, table, rows, k, group);
 }
 
 // Block 256. Dynamic smem is tile_rows * k f32. Each live row is loaded once, coalesced.

@@ -193,6 +193,22 @@ pub(crate) fn group_dot_smem(group: u32) -> u32 {
     32 * group + 2048
 }
 
+// A 32-row grid must fill at least one wave of resident CTAs.
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn group_dot_32_fills_wave(rows: usize, k: usize, wave: Option<usize>) -> bool {
+    let ctas = rows.div_ceil(32) * (k / 256);
+    let enabled = rows >= TENSOR_CORE_ROWS && wave.is_some_and(|wave| ctas >= wave);
+    #[cfg(feature = "cuda")]
+    if crate::backend::diagnostics_enabled() {
+        let tile_rows = if enabled { 32 } else { 16 };
+        let wave = wave.unwrap_or(0);
+        eprintln!(
+            "CONVROT_ROTATE_32_SELECT rows={rows} k={k} ctas={ctas} wave={wave} tile_rows={tile_rows}"
+        );
+    }
+    enabled
+}
+
 /// Largest multiple of 16 whose [`group_dot_smem`] fits in `optin` bytes.
 #[cfg(any(test, feature = "cuda"))]
 pub(crate) fn max_group(optin: usize) -> Result<u32> {
@@ -236,6 +252,13 @@ mod tests {
     use super::{hadamard, linear, linear_omitting_rotation};
     use anyhow::{Result, ensure};
     use half::bf16;
+
+    #[test]
+    fn group_dot_32_requires_a_full_wave() {
+        assert!(!super::group_dot_32_fills_wave(960, 5376, Some(640)));
+        assert!(super::group_dot_32_fills_wave(961, 5376, Some(640)));
+        assert!(super::group_dot_32_fills_wave(960, 5376, Some(630)));
+    }
 
     fn row(r: usize, i: usize) -> f32 {
         ((((r * 17 + i * 3) % 23) as f64) * 0.05 - 0.4) as f32
@@ -359,6 +382,7 @@ pub struct ConvrotFns {
     linear: crate::backend::gpu::CudaFunction,
     hadamard: crate::backend::gpu::CudaFunction,
     group_dot: [crate::backend::gpu::CudaFunction; 2],
+    group_dot_32: [crate::backend::gpu::CudaFunction; 2],
     quantize: crate::backend::gpu::CudaFunction,
     product: [crate::backend::gpu::CudaFunction; 3],
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
@@ -408,6 +432,7 @@ pub struct ConvrotArgs {
     pub group: i32,
     pub product: ProductKernel,
     pub fuse_silu: bool,
+    pub rotate_32: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -473,6 +498,44 @@ pub(crate) fn gate_up_product_order(
 }
 
 #[cfg(feature = "cuda")]
+const GROUP_DOT_32_SMEM: u32 = 2 * 8192 + 2048;
+
+#[cfg(feature = "cuda")]
+const GROUP_DOT_32_NAMES: [&str; 2] = ["convrot_group_dot_32", "convrot_group_dot_silu_32"];
+
+#[cfg(feature = "cuda")]
+pub(crate) fn group_dot_32_wave_sizes(
+    device: &crate::backend::cuda::Device,
+) -> Result<[Option<usize>; 2]> {
+    if device.info.arch != crate::backend::setup::DeviceArchitecture::Cuda(89) {
+        return Ok([None; 2]);
+    }
+    use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+    let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
+    let mut waves = [None; 2];
+    for (wave, name) in waves.iter_mut().zip(GROUP_DOT_32_NAMES) {
+        let function = module.load_function(name)?;
+        let registers = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+        let local = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+        let active = function.occupancy_max_active_blocks_per_multiprocessor(
+            256,
+            GROUP_DOT_32_SMEM as usize,
+            None,
+        )?;
+        let enabled = registers <= 48 && local == 0 && active >= 5;
+        if enabled {
+            *wave = Some(device.info.sms * usize::try_from(active)?);
+        }
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "CONVROT_ROTATE_32_RESOURCE kernel={name} regs={registers} local={local} active_ctas={active} enabled={enabled}"
+            );
+        }
+    }
+    Ok(waves)
+}
+
+#[cfg(feature = "cuda")]
 pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
     let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
     let product = [
@@ -505,6 +568,10 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         linear: module.load_function("convrot_linear")?,
         hadamard,
         group_dot,
+        group_dot_32: [
+            module.load_function(GROUP_DOT_32_NAMES[0])?,
+            module.load_function(GROUP_DOT_32_NAMES[1])?,
+        ],
         quantize,
         product,
         table: std::sync::Mutex::new(None),
@@ -603,10 +670,10 @@ pub(crate) fn launch_product(
     Ok(())
 }
 
-/// Grid of `convrot_group_dot`: one block owns 16 rows and one whole group.
+/// Grid of `convrot_group_dot`: one block owns one row tile and one whole group.
 #[cfg(feature = "cuda")]
-pub(crate) fn group_dot_grid(rows: u32, k: u32, group: u32) -> (u32, u32, u32) {
-    (rows.div_ceil(16), 1, k / group)
+fn group_dot_grid(rows: u32, k: u32, group: u32, tile_rows: u32) -> (u32, u32, u32) {
+    (rows.div_ceil(tile_rows), 1, k / group)
 }
 
 #[cfg(feature = "cuda")]
@@ -619,6 +686,10 @@ fn launch_group_dot(
     group: u32,
 ) -> Result<()> {
     use crate::backend::gpu::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+    ensure!(
+        !args.rotate_32 || group == 256,
+        "32-row ConvRot requires group 256, got group {group}"
+    );
     let flip = HADAMARD_FLIP.with(|cell| cell.get());
     let mut slot = fns.table.lock().unwrap_or_else(|err| err.into_inner());
     let hit = slot.as_ref().is_some_and(|(cached_group, cached_flip, _)| {
@@ -649,9 +720,15 @@ fn launch_group_dot(
     let cached = slot.as_ref().context("convrot hadamard table")?;
     let read = cached.2.device_ptr(stream);
     let table_ptr = read.0;
+    let entry = usize::from(args.fuse_silu);
+    let (function, tile_rows, shared_mem_bytes) = if args.rotate_32 {
+        (&fns.group_dot_32[entry], 32, GROUP_DOT_32_SMEM)
+    } else {
+        (&fns.group_dot[entry], 16, group_dot_smem(group))
+    };
     unsafe {
         stream
-            .launch_builder(&fns.group_dot[usize::from(args.fuse_silu)])
+            .launch_builder(function)
             .arg(&args.x)
             .arg(&args.rotated)
             .arg(&table_ptr)
@@ -659,9 +736,9 @@ fn launch_group_dot(
             .arg(&args.k)
             .arg(&args.group)
             .launch(LaunchConfig {
-                grid_dim: group_dot_grid(rows, k, group),
+                grid_dim: group_dot_grid(rows, k, group, tile_rows),
                 block_dim: (256, 1, 1),
-                shared_mem_bytes: group_dot_smem(group),
+                shared_mem_bytes,
             })?;
     }
     drop(read);
@@ -1058,6 +1135,10 @@ mod device {
     }
 
     fn launch_kept(device: &Device, input: HostLaunch<'_>) -> Result<Ran> {
+        launch_kept_tile(device, input, false)
+    }
+
+    fn launch_kept_tile(device: &Device, input: HostLaunch<'_>, rotate_32: bool) -> Result<Ran> {
         let HostLaunch {
             x,
             k,
@@ -1105,6 +1186,7 @@ mod device {
                 group: i32::try_from(group)?,
                 product: ProductKernel::NFast,
                 fuse_silu: false,
+                rotate_32,
             },
         )?;
         stream.synchronize()?;
@@ -1404,6 +1486,7 @@ mod device {
                     u32::try_from(rows)?,
                     u32::try_from(k)?,
                     u32::try_from(group)?,
+                    16,
                 );
                 ensure!(
                     gx == u32::try_from(rows)?.div_ceil(16)
@@ -1515,6 +1598,7 @@ mod device {
             u32::try_from(rows)?,
             u32::try_from(k)?,
             u32::try_from(wide)?,
+            16,
         );
         ensure!(
             gx == u32::try_from(rows)?.div_ceil(16)
@@ -1761,6 +1845,7 @@ mod device {
                 group: 256,
                 product,
                 fuse_silu: false,
+                rotate_32: false,
             },
         )?;
         stream.synchronize()?;
@@ -2136,6 +2221,76 @@ mod device {
             + got.len().abs_diff(expected.len())
     }
 
+    fn check_rotation_bits(
+        base: &Ran,
+        wide: &Ran,
+        (rows, k, n): (usize, usize, usize),
+        fused: bool,
+    ) -> Result<()> {
+        let xr = count_f32(&base.rotated, &wide.rotated);
+        let codes = count_i8(&base.codes, &wide.codes);
+        let scales = count_f32(&base.scales, &wide.scales);
+        let y = bit_diff(&base.y, &wide.y);
+        println!(
+            "CONVROT_ROTATE_32 rows={rows} k={k} n={n} fused={fused} xr={xr} codes={codes} scales={scales} y={y}"
+        );
+        ensure!(
+            xr == 0 && codes == 0 && scales == 0 && y == 0,
+            "32-row ConvRot differs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn convrot_32_rows_matches_16_rows() -> Result<()> {
+        let device = Device::new(0)?;
+        let [ordinary, _] = super::group_dot_32_wave_sizes(&device)?;
+        if device.info.arch != crate::backend::setup::DeviceArchitecture::Cuda(89) {
+            return Ok(());
+        }
+        ensure!(
+            ordinary.is_some(),
+            "32-row ConvRot resource gate did not admit the ordinary kernel"
+        );
+        for (rows, k, n) in [
+            (17, 256, 40),
+            (37717, 5376, 7168),
+            (37717, 7168, 5376),
+            (1509, 5376, 28672),
+            (1501, 5376, 28672),
+        ] {
+            let x = activation(rows, k);
+            let qweight = weight(n, k);
+            let wscale = wscale_row(n);
+            let input = |group| HostLaunch {
+                x: &x,
+                k,
+                group,
+                qweight: &qweight,
+                n,
+                wscale: &wscale,
+                keep: true,
+            };
+            let selected = super::group_dot_32_fills_wave(rows, k, ordinary);
+            ensure!(
+                selected == (rows != 17),
+                "ordinary 32-row selection M={rows} K={k}"
+            );
+            let base = launch_kept_tile(&device, input(256), false)?;
+            let wide = launch_kept_tile(&device, input(256), true)?;
+            check_rotation_bits(&base, &wide, (rows, k, n), false)?;
+            if rows == 17 {
+                launch_kept_tile(&device, input(64), false)?;
+                ensure!(
+                    launch_kept_tile(&device, input(64), true).is_err(),
+                    "32-row ConvRot accepted group 64"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn convrot_silu_matches_separate_activation() -> Result<()> {
@@ -2146,6 +2301,7 @@ mod device {
         let fns = load_convrot(&device.ctx)?;
         let silu =
             crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
+        let [ordinary_32, fused_32] = super::group_dot_32_wave_sizes(&device)?;
         let (k, n, group) = (14336usize, 5376usize, 256usize);
         let weight = stream.clone_htod(&salted_weight(n, k, 0))?;
         let scale = stream.clone_htod(&salted_wscale(n, 0))?;
@@ -2185,7 +2341,7 @@ mod device {
                     .launch(cfg)?;
             }
 
-            let run = |x, fuse_silu| -> Result<Ran> {
+            let run = |x, fuse_silu, rotate_32| -> Result<Ran> {
                 let rotated = stream.alloc_zeros::<f32>((rows + 1) * k)?;
                 let codes = stream.alloc_zeros::<i8>((rows + 1) * k)?;
                 let scales = stream.alloc_zeros::<f32>(rows + 1)?;
@@ -2207,6 +2363,7 @@ mod device {
                         group: i32::try_from(group)?,
                         product: ProductKernel::NFast,
                         fuse_silu,
+                        rotate_32,
                     },
                 )?;
                 stream.synchronize()?;
@@ -2226,8 +2383,8 @@ mod device {
                 Ok(ran)
             };
 
-            let separate = run(gap, false)?;
-            let fused = run(gup, true)?;
+            let separate = run(gap, false, false)?;
+            let fused = run(gup, true, false)?;
             let xr = count_f32(&separate.rotated, &fused.rotated);
             let codes = count_i8(&separate.codes, &fused.codes);
             let scales = count_f32(&separate.scales, &fused.scales);
@@ -2239,6 +2396,15 @@ mod device {
                 xr == 0 && codes == 0 && scales == 0 && y == 0,
                 "fused SiLU rows={rows} differs"
             );
+            if fused_32.is_some() {
+                let selected = super::group_dot_32_fills_wave(rows, k, fused_32);
+                ensure!(
+                    selected == (rows != 17),
+                    "fused 32-row selection M={rows} K={k}"
+                );
+                let wide = run(gup, true, true)?;
+                check_rotation_bits(&fused, &wide, (rows, k, n), true)?;
+            }
 
             if rows == 1501 {
                 let actual = stream.clone_dtoh(&gated.slice(control..control + 1))?;
@@ -2250,7 +2416,7 @@ mod device {
                     &[bf16::from_f32(1.65625)],
                     &mut gated.slice_mut(control..control + 1),
                 )?;
-                let mutant = run(gap, false)?;
+                let mutant = run(gap, false, ordinary_32.is_some())?;
                 let differing = count_f32(&separate.rotated, &mutant.rotated);
                 let target = control..control + group;
                 let inside = count_f32(&separate.rotated[target.clone()], &mutant.rotated[target]);
@@ -2314,6 +2480,7 @@ mod device {
                 group: i32::try_from(group)?,
                 product: ProductKernel::NFast,
                 fuse_silu: false,
+                rotate_32: false,
             },
         )?;
         stream.synchronize()?;
@@ -2358,6 +2525,7 @@ mod device {
                 group: i32::try_from(group)?,
                 product: ProductKernel::NFast,
                 fuse_silu: false,
+                rotate_32: false,
             },
         )?;
         stream.synchronize()?;
@@ -2397,6 +2565,7 @@ mod device {
                     group: i32::try_from(group)?,
                     product,
                     fuse_silu: false,
+                    rotate_32: false,
                 },
             )?;
             stream.synchronize()?;
