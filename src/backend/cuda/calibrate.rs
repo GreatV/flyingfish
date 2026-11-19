@@ -1194,6 +1194,14 @@ fn measure_peer_transfer(
     anyhow::bail!("HIP expert peer transfer calibration is not implemented")
 }
 
+#[cfg(feature = "cuda")]
+pub(super) fn pinned_h2d_rate(device: &Device) -> Result<f64> {
+    let transfer = measure_expert_transfer(device, usize::try_from(PEER_TRANSFER_BYTES[2])?)?;
+    let mut seconds = transfer.h2d_seconds;
+    seconds.sort_by(f64::total_cmp);
+    Ok(transfer.bytes as f64 / seconds[seconds.len() / 2])
+}
+
 fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     let mut host = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(bytes, 0) }
         .with_context(|| format!("allocate expert transfer pinned bytes={bytes}"))?;

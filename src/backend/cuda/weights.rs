@@ -3832,6 +3832,51 @@ mod tests {
                     4 - host_layers
                 );
             }
+            let plan = crate::prefill::DensePlacement::new(
+                &[per_layer; 4],
+                None,
+                2 * per_layer,
+                2 * per_layer,
+            )?;
+            let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
+            let layer = dense
+                .layers
+                .iter()
+                .position(|layer| layer.slot.is_some() && layer.host.is_none())
+                .context("mixed dense test needs a disk layer")?;
+            for _ in 0..2 {
+                let ring = dense.read_ahead.demand_item(
+                    &mut dense.disk,
+                    dense.upload.context(),
+                    layer as u32,
+                    0,
+                )?;
+                let reader = dense
+                    .disk
+                    .as_mut()
+                    .context("dense test lost the disk reader")?;
+                let values = reader.disk.values(ring)?;
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), per_layer) };
+                ensure!(
+                    bytes == expected[layer],
+                    "repeated disk key read different bytes"
+                );
+                let copied = dense
+                    .events
+                    .as_mut()
+                    .context("dense test lost the ring events")?
+                    .record(&dense.upload)?;
+                values.copied(copied.id)?;
+                reader.copied[ring as usize] = Some(copied);
+            }
+            ensure!(
+                dense.flush_ring_counts()? == (2, 2),
+                "repeated disk key did not retire both copies"
+            );
+            drop(dense);
+            println!("PASS dense_repeated_disk_key claims=2 reclaims=2 byte_mismatches=0");
+
             unsafe extern "C" fn wait_for_gate(user_data: *mut std::ffi::c_void) {
                 let gate = unsafe { &*(user_data as *const std::sync::atomic::AtomicU32) };
                 while gate.load(std::sync::atomic::Ordering::Acquire) == 0 {

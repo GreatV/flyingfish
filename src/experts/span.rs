@@ -695,6 +695,13 @@ impl Prefetch {
         Some(slot)
     }
 
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn taken_slot(&self, layer: u32, expert: u32) -> Option<u32> {
+        self.taken.iter().find_map(|(entry, slot)| {
+            (entry.layer == layer && entry.expert == expert).then_some(*slot)
+        })
+    }
+
     /// Frees a taken ring slot after the consumer released it and admits deferred demands.
     pub fn release(&mut self, slot: u32) -> bool {
         let released = self
@@ -960,6 +967,8 @@ mod tests {
         prefetch.complete(0, 0, 5)?;
         assert_eq!(prefetch.take(0, 0), Some(5));
         assert_eq!(prefetch.take(0, 0), None);
+        assert_eq!(prefetch.taken_slot(0, 0), Some(5));
+        assert_eq!(prefetch.taken_slot(0, 1), None);
         assert_eq!(prefetch.entries(), 1);
         let error = prefetch
             .request(0, 1, false, false)
@@ -968,6 +977,16 @@ mod tests {
         assert!(error.contains("prefetch queue full at depth 1"), "{error}");
         assert!(prefetch.release(5));
         assert!(!prefetch.release(5));
+        assert_eq!(prefetch.taken_slot(0, 0), None);
+        assert_eq!(
+            prefetch.request(0, 0, true, false)?,
+            (Requested::Queued, None)
+        );
+        assert_eq!(prefetch.begin_read(), Some((0, 0)));
+        prefetch.complete(0, 0, 7)?;
+        assert_eq!(prefetch.take(0, 0), Some(7));
+        assert_eq!(prefetch.taken_slot(0, 0), Some(7));
+        assert!(prefetch.release(7));
         prefetch.request(0, 1, false, false)?;
         assert_eq!(prefetch.entries(), 1);
         Ok(())

@@ -1,14 +1,18 @@
 //! MiniMax-H3 i2va generation on one GPU: conditioner, keyframe encoder, transformer chain, then the video and audio
 //! decoders after the transformer and conditioner are released. Stages run in that order and each stage's weights are
 //! dropped before the next stage's placement is derived from the then-free device memory.
+use super::super::vision_runtime::LayerNormTower;
 use super::audio::AudioDecoder;
 use super::vae::{
-    EncodeWork, KeyframeEncoder, LatentVideo, TileWork, VideoDecoder, decode_bytes,
+    EncodeWork, ImageDecodeStage, ImageEncodeSetup, ImageEncodeStage, KeyframeEncoder, LatentVideo,
+    TileWork, VideoDecoder, decode_bytes, image_decoder_sizes, image_vae_manifest,
     video_decoder_weight_bytes,
 };
 use super::{
     AdalnTable, BlockContext, BlockKernels, Conditioner, ConditionerInput, ConditionerPrompt, Dit,
-    Placement, Source, conditioner_embeds, conditioner_rope, embedding_rows, image_runs,
+    ImageDit, Placement, Source, conditioner_embeds, conditioner_rope, embedding_rows,
+    image_block_spec, image_fill_rate, image_runs, stored_allocation_bytes,
+    stored_allocation_granularity,
 };
 use crate::backend::cuda::{
     Device, blas::Blas, closure::Closure, cubin, ops::Ops, weights::WeightCatalog,
@@ -16,14 +20,17 @@ use crate::backend::cuda::{
 use crate::backend::gpu::CudaSlice;
 use crate::checkpoint::{LoadPolicy, MappedCheckpoint, TensorManifest};
 use crate::minimax_h3::{
-    AdalnPlan, AudioVaeSpec, Geometry, H3Output, H3Request, H3Spec, KEYFRAME_NOISE_AUG,
-    PackedLayout, RowTimesteps, Schedule, TEXT_ENCODER_LAYER, VaeSpec, VaeTiles,
-    hyperflow_schedules, hyperflow_steps, patchify_latents_into, row_timestep_plan,
-    unpatchify_latents,
+    AdalnPlan, AudioVaeSpec, Geometry, H3Output, H3Request, H3Spec, ImageLatents, ImageLayout,
+    ImageRequest, ImageRunOptions, ImageSchedule, ImageSpec, KEYFRAME_NOISE_AUG, PackedLayout,
+    RowTimesteps, Schedule, TEXT_ENCODER_LAYER, VaeSpec, VaeTiles, hyperflow_schedules,
+    hyperflow_steps, patchify_latents_into, row_timestep_plan, unpatchify_latents,
 };
 use anyhow::{Context, Result, ensure};
 use half::bf16;
-use std::{path::Path, rc::Rc};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 /// Generated media and, in test builds, the denormalised decoder inputs and the video decoder output (the PCM is the
 /// audio decoder output) that the splice gate scores.
@@ -138,25 +145,7 @@ fn condition_prompt(
     let manifest = MappedCheckpoint::open_component(&encoder, "model")?
         .minimax_h3_conditioner_manifest(&spec, TEXT_ENCODER_LAYER)?;
     let hidden = spec.hidden as usize;
-    let ids: Vec<u32> = prompt
-        .tokens
-        .iter()
-        .copied()
-        .filter(|&id| id != image_token)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let rows = embedding_rows(
-        &mut Source::new(&encoder, &manifest),
-        "model.language_model.embed_tokens.weight",
-        hidden,
-        &ids,
-    )?;
-    let table = ids
-        .iter()
-        .zip(rows.chunks(hidden))
-        .map(|(&id, row)| (id, row.to_vec()))
-        .collect();
+    let table = conditioner_table(&encoder, &manifest, prompt, image_token, hidden)?;
     let runs = image_runs(&prompt.tokens, image_token);
     ensure!(
         runs.is_empty() == prompt.grids.is_empty()
@@ -214,16 +203,64 @@ fn condition_prompt(
         (conditioner, merged, Some(encoded))
     };
     conditioner.prepare(blas, count)?;
-    let embeds = conditioner_embeds(prompt, image_token, &table, &merged, hidden)?;
-    let rope = conditioner_rope(&spec, prompt)?;
-    let deepstack = encoded.as_ref().map(|item| item.deepstack.as_slice());
+    finish_conditioner(
+        (device, blas),
+        &mut conditioner,
+        (&spec, prompt, image_token),
+        &table,
+        (&merged, &runs),
+        encoded
+            .as_ref()
+            .map_or(&[], |item| item.deepstack.as_slice()),
+    )
+}
+
+fn conditioner_table(
+    encoder: &Path,
+    manifest: &TensorManifest,
+    prompt: &ConditionerPrompt,
+    image_token: u32,
+    hidden: usize,
+) -> Result<std::collections::BTreeMap<u32, Vec<bf16>>> {
+    let ids: Vec<u32> = prompt
+        .tokens
+        .iter()
+        .copied()
+        .filter(|&id| id != image_token)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rows = embedding_rows(
+        &mut Source::new(encoder, manifest),
+        "model.language_model.embed_tokens.weight",
+        hidden,
+        &ids,
+    )?;
+    Ok(ids
+        .iter()
+        .zip(rows.chunks(hidden))
+        .map(|(&id, row)| (id, row.to_vec()))
+        .collect())
+}
+
+fn finish_conditioner(
+    (device, blas): (&Device, &Blas),
+    conditioner: &mut Conditioner,
+    (spec, prompt, image_token): (&crate::model_spec::ModelSpec, &ConditionerPrompt, u32),
+    table: &std::collections::BTreeMap<u32, Vec<bf16>>,
+    (merged, runs): (&[bf16], &[(usize, usize)]),
+    deepstack: &[CudaSlice<bf16>],
+) -> Result<Vec<bf16>> {
+    let hidden = spec.hidden as usize;
+    let embeds = conditioner_embeds(prompt, image_token, table, merged, hidden)?;
+    let rope = conditioner_rope(spec, prompt)?;
     let mut taps = conditioner.forward(
         &device.stream,
         blas,
         &ConditionerInput {
             embeds: &embeds,
-            deepstack: deepstack.unwrap_or(&[]),
-            runs: &runs,
+            deepstack,
+            runs,
             rope: &rope,
         },
         &[TEXT_ENCODER_LAYER],
@@ -876,9 +913,18 @@ fn image_noise(
 ) -> Result<Vec<f32>> {
     let device = Device::new(options.device)?;
     let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
+    image_noise_draws(&device, &normal, seed, count)
+}
+
+fn image_noise_draws(
+    device: &Device,
+    normal: &crate::backend::gpu::CudaFunction,
+    seed: u64,
+    count: usize,
+) -> Result<Vec<f32>> {
     let draw = super::draw_normals(
         &device.stream,
-        &normal,
+        normal,
         (seed, crate::minimax_h3::STREAM_IMAGE_NOISE),
         count,
         256,
@@ -1020,6 +1066,583 @@ fn image_presentation(
     ))
 }
 
+#[derive(PartialEq)]
+struct ImageShape {
+    canvas: [usize; 2],
+    latent: [usize; 2],
+    output: [usize; 2],
+    reference: Option<[usize; 2]>,
+    grids: Vec<crate::vision_input::ImageGrid>,
+    tags: Vec<u8>,
+}
+
+impl ImageShape {
+    fn check(&self, actual: &Self) -> Result<()> {
+        ensure!(
+            self == actual,
+            "image request differs from admitted canvas {:?}, output {:?}, reference {:?}, text rows {}, and grids {:?}",
+            self.canvas,
+            self.output,
+            self.reference,
+            self.tags.len(),
+            self.grids
+        );
+        Ok(())
+    }
+
+    fn layout(&self, spec: &ImageSpec) -> Result<ImageLayout> {
+        let reference = self
+            .reference
+            .map(|[height, width]| {
+                crate::minimax_h3::image_reference_latent_extent(spec, height, width)
+            })
+            .transpose()?;
+        crate::minimax_h3::image_layout(
+            spec,
+            &self.tags,
+            reference.as_slice(),
+            self.latent[0],
+            self.latent[1],
+        )
+    }
+}
+
+struct ImageInput {
+    shape: ImageShape,
+    prompt: ConditionerPrompt,
+}
+
+impl ImageInput {
+    fn read(model: &Path, spec: &ImageSpec, request: &ImageRequest) -> Result<Self> {
+        ensure!(
+            !request.prompt.is_empty() && request.references.len() <= 1,
+            "resident image requests require a prompt and at most one reference"
+        );
+        ensure!(
+            request.expander.is_none(),
+            "prompt expander is outside the resident workload"
+        );
+        let (height, width) = crate::minimax_h3::image_canvas(
+            spec,
+            request.height,
+            request.width,
+            request.min_generation_area,
+        )?;
+        let (lh, lw) = crate::minimax_h3::image_latent_extent(spec, height, width)?;
+        let reference = request
+            .references
+            .first()
+            .map(|reference| {
+                crate::minimax_h3::image_vae_reference_size(
+                    spec,
+                    reference.image.width,
+                    reference.image.height,
+                )
+                .map(|(width, height)| [height, width])
+            })
+            .transpose()?;
+        let (_, tags, prompt) =
+            image_presentation(model, spec, &request.prompt, &request.references)?;
+        Ok(Self {
+            shape: ImageShape {
+                canvas: [height, width],
+                latent: [lh, lw],
+                output: [request.height, request.width],
+                reference,
+                grids: prompt.grids.clone(),
+                tags,
+            },
+            prompt,
+        })
+    }
+}
+
+struct ImageTextStage {
+    dir: PathBuf,
+    spec: crate::model_spec::ModelSpec,
+    manifest: TensorManifest,
+    vision: Option<LayerNormTower>,
+    conditioner: Conditioner,
+    blas: Blas,
+    image_token: u32,
+}
+
+fn image_vision_input(prompt: &ConditionerPrompt) -> crate::vision_input::MultimodalInput<'_> {
+    crate::vision_input::MultimodalInput {
+        input_ids: &prompt.tokens,
+        modality_ids: &prompt.modality,
+        pixel_values: &prompt.pixels,
+        grids: &prompt.grids,
+        audio: &[],
+    }
+}
+
+impl ImageTextStage {
+    fn run(&mut self, device: &Device, prompt: &ConditionerPrompt) -> Result<Vec<bf16>> {
+        let runs = image_runs(&prompt.tokens, self.image_token);
+        ensure!(
+            runs.is_empty() == self.vision.is_none(),
+            "resident image vision input changed"
+        );
+        let table = conditioner_table(
+            &self.dir,
+            &self.manifest,
+            prompt,
+            self.image_token,
+            self.spec.hidden as usize,
+        )?;
+        let encoded = self
+            .vision
+            .as_ref()
+            .map(|tower| -> Result<_> {
+                let input = image_vision_input(prompt);
+                let prepared =
+                    tower.prepare(device, &mut self.blas, &input, prompt.tokens.len(), 0)?;
+                let encoded = tower.encode(&device.stream, &self.blas, prepared, None)?;
+                #[cfg(test)]
+                println!(
+                    "HYPERFLOW_VISION_ENCODER_CALL rows={} calls=1",
+                    prompt.tokens.len()
+                );
+                Ok(encoded)
+            })
+            .transpose()?;
+        let merged = encoded
+            .as_ref()
+            .map(|encoded| device.stream.clone_dtoh(&encoded.features))
+            .transpose()?
+            .unwrap_or_default();
+        finish_conditioner(
+            (device, &self.blas),
+            &mut self.conditioner,
+            (&self.spec, prompt, self.image_token),
+            &table,
+            (&merged, &runs),
+            encoded
+                .as_ref()
+                .map_or(&[], |item| item.deepstack.as_slice()),
+        )
+    }
+}
+
+/// Image requests sharing one packed geometry and one set of loaded weights.
+pub struct ImageSession {
+    model: PathBuf,
+    image: ImageSpec,
+    spec: H3Spec,
+    shape: ImageShape,
+    layout: ImageLayout,
+    d: Device,
+    normal: crate::backend::gpu::CudaFunction,
+    text: ImageTextStage,
+    dit: ImageDit,
+    table: AdalnTable,
+    adaln: AdalnPlan,
+    schedule: ImageSchedule,
+    kernels: BlockKernels,
+    sample_blas: Blas,
+    decode: ImageDecodeStage,
+    decode_blas: Blas,
+    encode: Option<(ImageEncodeStage, Blas)>,
+}
+
+impl ImageSession {
+    pub fn open(
+        model: &Path,
+        options: &ImageRunOptions,
+        requests: impl IntoIterator<Item = Result<ImageRequest>>,
+    ) -> Result<Self> {
+        use crate::backend::cuda::ops::CommonOpsRef;
+        let image = ImageSpec::read(model)?;
+        let dir = model.join("text_encoder");
+        let text_spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let image_token = text_spec
+            .vision
+            .as_ref()
+            .context("text encoder without vision")?
+            .image_token;
+        let mut requests = requests.into_iter();
+        let (shape, count, media) = {
+            let first = requests
+                .next()
+                .context("resident image workload is empty")??;
+            let ImageInput { shape, prompt } = ImageInput::read(model, &image, &first)?;
+            let count = prompt.tokens.len();
+            let media = if shape.reference.is_some() {
+                LayerNormTower::request_bytes(&text_spec, &image_vision_input(&prompt), count)?
+            } else {
+                0
+            };
+            (shape, count, media)
+        };
+        for request in requests {
+            let input = ImageInput::read(model, &image, &request?)?;
+            shape.check(&input.shape)?;
+        }
+        let spec = image_block_spec(&image);
+        let schedule = ImageSchedule::published()?;
+        let layout = shape.layout(&image)?;
+        let plan = crate::minimax_h3::image_row_plan(&layout, &schedule)?;
+        let adaln = AdalnPlan::from_tags(&layout.token_tags, &plan)?;
+        let d = Device::new(options.device)?;
+        let device_page = stored_allocation_granularity(&d)?;
+        let ops = Ops::new(&d.ctx)?;
+        let blas = |name: &str| {
+            Blas::new(
+                &d,
+                &ops,
+                &options.runtime_dir,
+                Rc::new(Closure::new(true, name.into())),
+            )
+        };
+        let normal = cubin::module(&d.ctx, "sample")?.load_function("philox_normal_f32")?;
+        let text_manifest = MappedCheckpoint::open_component(&dir, "model")?
+            .minimax_h3_conditioner_manifest(&text_spec, TEXT_ENCODER_LAYER)?;
+        let vision = if shape.reference.is_some() {
+            let mut catalog =
+                WeightCatalog::load_with_policy(&dir, &text_spec, &d, LoadPolicy::VisionOnly)?;
+            let tower = LayerNormTower::from_catalog(
+                &text_spec,
+                &mut catalog,
+                &d,
+                CommonOpsRef::new(&d.ctx)?,
+            )?;
+            ensure!(
+                catalog.tensors.is_empty(),
+                "vision binding left unloaded owners"
+            );
+            d.finish_upload()?;
+            Some(tower)
+        } else {
+            None
+        };
+        let (conditioner_layers, conditioner_largest) =
+            Conditioner::layer_sizes(&text_manifest, TEXT_ENCODER_LAYER)?;
+        let conditioner_fixed =
+            Conditioner::resident_fixed_bytes(&d, &text_spec, (TEXT_ENCODER_LAYER, count))?;
+        let sample_input_bytes = layout.image_indices.len() * image.row_width() * 4
+            + layout.text_indices.len() * spec.text_dim * 2
+            + layout.rows() * 2 * size_of::<u32>();
+        let latents_bytes = shape.latent[0] * shape.latent[1] * image.in_channels * 4;
+        let temporary = media.max(sample_input_bytes).max(latents_bytes);
+        let (vae_dir, vae_spec, vae_manifest) = image_vae_manifest(model)?;
+        let vae = vae_spec.single_frame();
+        let (decoder_layers, decoder_fixed, decoder_largest) =
+            image_decoder_sizes(&vae_manifest, vae.layers);
+        let (disk_probe_bytes, disk) = image_fill_rate(&dir, &text_manifest)?;
+        let pcie = crate::backend::cuda::calibrate::pinned_h2d_rate(&d)?;
+        let decode_blas = blas("image VAE")?;
+        let text_blas = blas("MiniMax-H3-Image conditioner")?;
+        let device_fixed = stored_allocation_bytes(conditioner_fixed, device_page)?
+            .checked_add(stored_allocation_bytes(decoder_fixed, device_page)?)
+            .context("resident image fixed weights overflow")?;
+        let transformer = model.join("transformer_diffusers");
+        let manifest = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_image_manifest(&image)?;
+        let mut sample_blas = blas("MiniMax-H3-Image")?;
+        let table =
+            AdalnTable::build(&d, &mut sample_blas, &transformer, &manifest, &spec, &adaln)?;
+        let mut later = None;
+        let dit = ImageDit::resident(
+            &d,
+            &mut sample_blas,
+            (&spec, &image),
+            &layout,
+            (&transformer, &manifest),
+            &mut |sizing, owned, bind_ffn| {
+                use crate::prefill::{DensePlacement, DenseStage, PricedDense, price_dense_stages};
+                let fixed = device_fixed
+                    .checked_add(stored_allocation_bytes(owned, device_page)?)
+                    .context("resident image fixed weights overflow")?;
+                let mut stages = [
+                    DenseStage {
+                        device: &conditioner_layers,
+                        source: &conditioner_layers,
+                        visits: 1,
+                        load_scratch: conditioner_largest,
+                    },
+                    DenseStage {
+                        device: &sizing.layers,
+                        source: &sizing.source_layers,
+                        visits: schedule.timesteps.len(),
+                        load_scratch: sizing.largest,
+                    },
+                    DenseStage {
+                        device: &decoder_layers,
+                        source: &decoder_layers,
+                        visits: 1,
+                        load_scratch: decoder_largest,
+                    },
+                ];
+                let encoder = shape
+                    .reference
+                    .map(|extent| -> Result<_> {
+                        let encoder_blas = blas("image VAE encoder")?;
+                        let setup =
+                            ImageEncodeSetup::new(&d, (&vae_dir, &vae, &vae_manifest), extent)?;
+                        Ok((setup, encoder_blas))
+                    })
+                    .transpose()?;
+                let (encoder_work, encoder_transient) =
+                    encoder.as_ref().map_or((0, 0), |(setup, _)| {
+                        (setup.minimum_work(), setup.transient_bytes)
+                    });
+                let temporary =
+                    stored_allocation_bytes(temporary.max(encoder_transient), device_page)?;
+                let fixed_and_transient = fixed
+                    .checked_add(temporary)
+                    .context("resident image fixed and transient reserve overflow")?;
+                let pending = stages
+                    .iter()
+                    .try_fold(fixed_and_transient, |bytes, stage| {
+                        bytes
+                            .checked_add(stage.minimum_device_bytes(device_page)?)
+                            .context("resident image tier floor overflow")
+                    })?;
+                let decoder_floor = stored_allocation_bytes(
+                    ImageDecodeStage::minimum_work(&vae, shape.canvas)?,
+                    device_page,
+                )?;
+                let decoder_pending = pending
+                    .checked_add(decoder_floor)
+                    .context("resident image decoder floor overflow")?;
+                let ffn_pending = decoder_pending
+                    .checked_add(stored_allocation_bytes(encoder_work, device_page)?)
+                    .context("resident image encoder floor overflow")?;
+                let ffn = bind_ffn(ffn_pending)?;
+                let encode = encoder
+                    .map(|(setup, blas)| -> Result<_> {
+                        Ok((setup.bind(&d, decoder_pending)?, blas))
+                    })
+                    .transpose()?;
+                let decoder_work = ImageDecodeStage::prepare_work(&d, &vae, shape.canvas, pending)?;
+                let decoder_visits = decoder_work.visits();
+                stages[2].visits = decoder_visits;
+                d.ctx.synchronize()?;
+                let (free, total) = d.ctx.mem_get_info()?;
+                let host_available = usize::try_from(
+                    crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+                )?;
+                let host = host_available.saturating_sub(4 << 30);
+                let device = DensePlacement::device_budget(free, total, fixed, 0, temporary)?;
+                let PricedDense {
+                    plans: [text, dit, decode],
+                    device_bytes,
+                    decoder_resident_seconds,
+                    decoder_streamed_seconds,
+                } = price_dense_stages(stages, (device, host, device_page), (pcie, disk))?;
+                let device_after = device_fixed + temporary + device_bytes[0] + device_bytes[2];
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"h3_image_resident_plan": {
+                        "canvas": shape.canvas, "packed_rows": layout.rows(),
+                        "device_free_before_placement": free, "device_budget": device, "host_available_bytes": host_available, "host_budget": host,
+                        "transient_device_bytes": temporary, "decoder_fixed_gpu_bytes": decoder_fixed,
+                        "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes,
+                        "device_allocation_granularity": device_page,
+                        "conditioner_charged_device_bytes": device_bytes[0],
+                        "dit_charged_device_bytes": device_bytes[1],
+                        "decoder_charged_device_bytes": device_bytes[2],
+                        "decoder_resident_seconds": decoder_resident_seconds, "decoder_streamed_seconds": decoder_streamed_seconds,
+                        "conditioner": &text, "dit": &dit, "decoder": &decode,
+                        "dit_visits": schedule.timesteps.len(), "decoder_visits": decoder_visits,
+                    }})
+                );
+                later = Some((text, decode, decoder_work, encode, temporary));
+                Ok((dit, device_after, ffn))
+            },
+        )?;
+        let (text_plan, decode_plan, decoder_work, encode, temporary) =
+            later.context("resident image placement was not bound")?;
+        let conditioner = Conditioner::with_plan(
+            &d,
+            &text_spec,
+            (TEXT_ENCODER_LAYER, count, temporary),
+            Source::new(&dir, &text_manifest),
+            (Placement::Derived, Some(text_plan)),
+        )?;
+        conditioner.prepare(&text_blas, count)?;
+        let decode = ImageDecodeStage::bind(
+            &d,
+            (&vae_dir, &vae, &vae_manifest),
+            decoder_work,
+            decode_plan,
+        )?;
+        let kernels = BlockKernels::new(&d.ctx)?;
+        d.finish_upload()?;
+        let (free, total) = d.ctx.mem_get_info()?;
+        let required = (total / 16)
+            .checked_add(temporary)
+            .context("resident reserve overflow")?;
+        ensure!(
+            free >= required,
+            "resident image setup needs {required} free bytes for transient work and reserve, found {free}"
+        );
+        let text = ImageTextStage {
+            dir,
+            spec: text_spec,
+            manifest: text_manifest,
+            vision,
+            conditioner,
+            blas: text_blas,
+            image_token,
+        };
+        Ok(Self {
+            model: model.to_path_buf(),
+            image,
+            spec,
+            shape,
+            layout,
+            d,
+            normal,
+            text,
+            dit,
+            table,
+            adaln,
+            schedule,
+            kernels,
+            sample_blas,
+            decode,
+            decode_blas,
+            encode,
+        })
+    }
+
+    pub fn render(&mut self, request: &ImageRequest) -> Result<ImageLatents> {
+        let input = ImageInput::read(&self.model, &self.image, request)?;
+        self.shape.check(&input.shape)?;
+        image_render(
+            request,
+            &self.image.clone(),
+            None,
+            ImageStages::Resident(self, &input),
+        )
+        .map(|(image, _)| image)
+    }
+}
+
+enum ImageStages<'a> {
+    Single {
+        model: &'a Path,
+        options: &'a ImageRunOptions,
+        prompt: String,
+    },
+    Resident(&'a mut ImageSession, &'a ImageInput),
+}
+
+impl ImageStages<'_> {
+    fn noise(&self, seed: u64, count: usize) -> Result<Vec<f32>> {
+        match self {
+            Self::Single { options, .. } => image_noise(options, seed, count),
+            Self::Resident(session, _) => {
+                image_noise_draws(&session.d, &session.normal, seed, count)
+            }
+        }
+    }
+
+    fn encode(
+        &mut self,
+        extent: [usize; 2],
+        rgb: &[f32],
+        epsilon: &[f32],
+    ) -> Result<(Vec<f32>, [usize; 2])> {
+        match self {
+            Self::Single { model, options, .. } => super::image_encode(
+                model,
+                (options.device, &options.runtime_dir),
+                extent,
+                rgb,
+                epsilon,
+            ),
+            Self::Resident(session, _) => {
+                let (stage, blas) = session
+                    .encode
+                    .as_mut()
+                    .context("resident image encoder not admitted")?;
+                stage.run(&session.d, blas, extent, rgb, epsilon)
+            }
+        }
+    }
+
+    fn condition(
+        &mut self,
+        spec: &ImageSpec,
+        request: &ImageRequest,
+        reference_extents: &[(usize, usize)],
+        [lh, lw]: [usize; 2],
+    ) -> Result<(ImageLayout, Vec<bf16>)> {
+        let (layout, text) = match self {
+            Self::Single {
+                model,
+                options,
+                prompt,
+            } => {
+                let (ids, tags, prompt) =
+                    image_presentation(model, spec, prompt, &request.references)?;
+                let layout =
+                    crate::minimax_h3::image_layout(spec, &tags, reference_extents, lh, lw)?;
+                ensure!(
+                    ids.len() == tags.len() && ids.len() == layout.text_indices.len(),
+                    "image presentation rows"
+                );
+                let text = image_condition(model, options, &prompt)?;
+                (layout, text)
+            }
+            Self::Resident(session, input) => {
+                let text = session.text.run(&session.d, &input.prompt)?;
+                (session.layout.clone(), text)
+            }
+        };
+        ensure!(
+            text.len() == layout.text_indices.len() * spec.text_dim,
+            "conditioner row width"
+        );
+        Ok((layout, text))
+    }
+
+    fn sample(&mut self, layout: &ImageLayout, rows: &[f32], text: &[bf16]) -> Result<Vec<f32>> {
+        match self {
+            Self::Single { model, options, .. } => super::image_sample(
+                model,
+                layout,
+                (options.device, &options.runtime_dir),
+                rows,
+                text,
+            ),
+            Self::Resident(session, _) => {
+                let context = BlockContext {
+                    s: &session.d.stream,
+                    blas: &session.sample_blas,
+                    kernels: &session.kernels,
+                    spec: &session.spec,
+                    lora_scale: 1.0,
+                };
+                session.dit.sample_host(
+                    &context,
+                    (&session.table, &session.adaln),
+                    &session.schedule,
+                    (rows, text),
+                    (None, None),
+                )
+            }
+        }
+    }
+
+    fn decode(&self, extent: [usize; 2], values: &[f32]) -> Result<Vec<f32>> {
+        match self {
+            Self::Single { model, options, .. } => super::image_decode(
+                model,
+                (options.device, &options.runtime_dir),
+                extent,
+                values,
+            ),
+            Self::Resident(session, _) => {
+                session.decode.run(&session.d, &session.decode_blas, values)
+            }
+        }
+    }
+}
+
 /// Normalised generated latent and the finished RGB8. One Philox draw on `STREAM_IMAGE_NOISE` is each
 /// reference's posterior epsilon, the generated rows, then each reference's mix. `image_encode` returns before
 /// the conditioner loads, and `image_sample` returns before `image_decode` loads the decoder. Reference rows are
@@ -1045,21 +1668,39 @@ pub(crate) fn image_pass(
         Some(dir) => expand_prompt(dir, &request.prompt, options)?,
         None => request.prompt.clone(),
     };
-    let spec = crate::minimax_h3::ImageSpec::read(model)?;
-    let (canvas_h, canvas_w) = crate::minimax_h3::image_canvas(
+    let spec = ImageSpec::read(model)?;
+    image_render(
+        request,
         &spec,
+        supplied,
+        ImageStages::Single {
+            model,
+            options,
+            prompt,
+        },
+    )
+}
+
+fn image_render(
+    request: &ImageRequest,
+    spec: &ImageSpec,
+    supplied: Option<&[f32]>,
+    mut stages: ImageStages<'_>,
+) -> Result<(ImageLatents, Vec<bf16>)> {
+    let (canvas_h, canvas_w) = crate::minimax_h3::image_canvas(
+        spec,
         request.height,
         request.width,
         request.min_generation_area,
     )?;
-    let (latent_h, latent_w) = crate::minimax_h3::image_latent_extent(&spec, canvas_h, canvas_w)?;
+    let (latent_h, latent_w) = crate::minimax_h3::image_latent_extent(spec, canvas_h, canvas_w)?;
     let width = spec.row_width();
     let mut prepared = Vec::with_capacity(request.references.len());
     let mut noise_count = 0usize;
     for reference in &request.references {
-        let (rgb, extent, posterior) = vae_rgb(&spec, &reference.image)?;
+        let (rgb, extent, posterior) = vae_rgb(spec, &reference.image)?;
         let (lat_h, lat_w) =
-            crate::minimax_h3::image_reference_latent_extent(&spec, extent[0], extent[1])?;
+            crate::minimax_h3::image_reference_latent_extent(spec, extent[0], extent[1])?;
         let cropped = spec
             .in_channels
             .checked_mul(lat_h)
@@ -1089,7 +1730,7 @@ pub(crate) fn image_pass(
             );
             values.to_vec()
         }
-        None => image_noise(options, request.seed, noise_count)?,
+        None => stages.noise(request.seed, noise_count)?,
     };
     let mut cursor = 0usize;
     let mut reference_rows = Vec::new();
@@ -1098,13 +1739,7 @@ pub(crate) fn image_pass(
     for (rgb, extent, posterior, lat_h, lat_w, cropped) in &prepared {
         let epsilon = &noise[cursor..cursor + posterior];
         cursor += posterior;
-        let (latent, shape) = super::image_encode(
-            model,
-            (options.device, &options.runtime_dir),
-            *extent,
-            rgb,
-            epsilon,
-        )?;
+        let (latent, shape) = stages.encode(*extent, rgb, epsilon)?;
         ensure!(
             shape == [*lat_h, *lat_w] && latent.len() == *cropped,
             "reference latent extent"
@@ -1134,18 +1769,8 @@ pub(crate) fn image_pass(
         ));
     }
     ensure!(mix_cursor == noise.len(), "mix draw extent");
-    let (ids, tags, prompt_rows) = image_presentation(model, &spec, &prompt, &request.references)?;
-    let layout =
-        crate::minimax_h3::image_layout(&spec, &tags, &reference_extents, latent_h, latent_w)?;
-    ensure!(
-        ids.len() == tags.len() && ids.len() == layout.text_indices.len(),
-        "image presentation rows"
-    );
-    let text = image_condition(model, options, &prompt_rows)?;
-    ensure!(
-        text.len() == ids.len() * spec.text_dim,
-        "conditioner row width"
-    );
+    let (layout, text) =
+        stages.condition(spec, request, &reference_extents, [latent_h, latent_w])?;
     let generated = &noise[generated_at..mix_at];
     ensure!(
         reference_rows.len() == layout.reference_rows * width,
@@ -1153,13 +1778,7 @@ pub(crate) fn image_pass(
     );
     let mut rows = reference_rows.clone();
     rows.extend_from_slice(generated);
-    let sampled = super::image_sample(
-        model,
-        &layout,
-        (options.device, &options.runtime_dir),
-        &rows,
-        &text,
-    )?;
+    let sampled = stages.sample(&layout, &rows, &text)?;
     let prefix = layout.reference_rows * width;
     ensure!(
         sampled.len() == rows.len() && sampled[..prefix] == reference_rows[..],
@@ -1174,12 +1793,7 @@ pub(crate) fn image_pass(
         values.len() == spec.in_channels * latent_h * latent_w,
         "unpatchified latent extent"
     );
-    let canvas = super::image_decode(
-        model,
-        (options.device, &options.runtime_dir),
-        [latent_h, latent_w],
-        &values,
-    )?;
+    let canvas = stages.decode([latent_h, latent_w], &values)?;
     let rgb = crate::minimax_h3::image_rgb8(
         &canvas,
         [canvas_h, canvas_w],

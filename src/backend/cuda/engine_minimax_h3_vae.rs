@@ -60,6 +60,7 @@ impl ImageKernels {
 
 struct ImageLimits {
     budget: usize,
+    reserved: usize,
     l2: usize,
     sms: usize,
     grid: usize,
@@ -76,12 +77,7 @@ struct ImagePlan {
 }
 
 impl ImagePlan {
-    fn derive(
-        spec: &VaeSpec,
-        tiles: &VaeTiles,
-        canvas: [usize; 2],
-        limits: ImageLimits,
-    ) -> Result<Self> {
+    fn sizing(spec: &VaeSpec, tiles: &VaeTiles, canvas: [usize; 2]) -> (usize, [u128; 3]) {
         let slots = tiles.count();
         let patches = tiles.height / spec.spatial_ratio * (tiles.width / spec.spatial_ratio);
         let tokens = patches + spec.registers + 1;
@@ -94,31 +90,36 @@ impl ImagePlan {
             * tiles.width as u128
             + 8 * pixels * spec.out_channels as u128
             + 4u128 * (grid_words + tokens * spec.rope_dims + spec.head_dim) as u128;
-        Self::derive_counts(spec, slots, patches, fixed, limits)
-    }
-
-    fn derive_counts(
-        spec: &VaeSpec,
-        slots: usize,
-        patches: usize,
-        fixed: u128,
-        limits: ImageLimits,
-    ) -> Result<Self> {
-        let tokens = patches + spec.registers + 1;
-        let s = 4u128 * tokens as u128 * spec.dim as u128;
-        let p = 4u128 * spec.heads as u128 * (tokens as u128).pow(2);
         let per_tile = 4u128 * tokens as u128 * (7 * spec.dim + 3 * spec.ffn) as u128
             + 4u128 * tokens as u128 * spec.patch_width() as u128
             + 8u128 * patches as u128 * spec.latent_channels as u128;
+        let scores = 4u128 * spec.heads as u128 * (tokens as u128).pow(2);
+        (patches, [fixed, per_tile, scores])
+    }
+
+    fn derive(
+        spec: &VaeSpec,
+        tiles: &VaeTiles,
+        canvas: [usize; 2],
+        limits: ImageLimits,
+    ) -> Result<Self> {
+        let slots = tiles.count();
+        let (patches, [fixed, per_tile, p]) = Self::sizing(spec, tiles, canvas);
+        let tokens = patches + spec.registers + 1;
+        let s = 4u128 * tokens as u128 * spec.dim as u128;
+        let budget = limits
+            .budget
+            .checked_sub(limits.reserved)
+            .context("image VAE budget holds no space after pending stages")?;
         ensure!(
             slots > 0 && patches > 0 && limits.sms > 0 && limits.grid > 0,
             "image VAE setup has an empty shape or device limit"
         );
         ensure!(
-            fixed + per_tile + p <= limits.budget as u128,
+            fixed + per_tile + p <= budget as u128,
             "image VAE serial tile requires {} bytes; workspace budget {}",
             fixed + per_tile + p,
-            limits.budget
+            budget
         );
         let cache_cap = (limits.l2 as u128 / (4 * s + p)).max(1) as usize;
         let wave = limits.sms.div_ceil(spec.heads);
@@ -127,14 +128,14 @@ impl ImagePlan {
         } else {
             cache_cap
         };
-        let score_cap = ((limits.budget as u128 - fixed - per_tile) / p) as usize;
+        let score_cap = ((budget as u128 - fixed - per_tile) / p) as usize;
         let mut attention = cache_cap.min(slots).min(score_cap).max(1);
         let launch_cap = (u32::MAX as usize / tokens / (2 * spec.ffn))
             .min(i32::MAX as usize / tokens)
             .min(limits.grid / tokens / spec.heads)
             .min(limits.grid.saturating_mul(256) / tokens / (2 * spec.ffn));
         loop {
-            let available = limits.budget as u128 - fixed - attention as u128 * p;
+            let available = budget as u128 - fixed - attention as u128 * p;
             let mut linear = (available / per_tile) as usize;
             linear = linear.min(slots).min(launch_cap);
             ensure!(
@@ -214,7 +215,7 @@ impl DecoderWork {
     }
 }
 
-struct ImageWork {
+pub(super) struct ImageWork {
     core: DecoderWork,
     tiles: VaeTiles,
     canvas: [usize; 2],
@@ -222,6 +223,12 @@ struct ImageWork {
     raw: CudaSlice<f32>,
     planar: CudaSlice<f32>,
     rgb: CudaSlice<f32>,
+}
+
+impl ImageWork {
+    pub(super) fn visits(&self) -> usize {
+        self.tiles.count().div_ceil(self.plan.linear)
+    }
 }
 
 impl std::ops::Deref for ImageWork {
@@ -245,6 +252,7 @@ pub(crate) struct ImageDecoder {
     pixel_affine: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     kernels: ImageKernels,
     _weights: Vec<CudaSlice<f32>>,
+    dense: Option<std::cell::RefCell<crate::backend::cuda::weights::DenseStreaming>>,
 }
 
 impl<T: DeviceRepr + Copy> Linear<T> {
@@ -302,6 +310,16 @@ impl ImageDecoder {
         component: &Path,
         manifest: &TensorManifest,
     ) -> Result<Self> {
+        Self::with_placement(device, spec, component, manifest, None)
+    }
+
+    fn with_placement(
+        device: &Device,
+        spec: VaeSpec,
+        component: &Path,
+        manifest: &TensorManifest,
+        placement: Option<crate::prefill::DensePlacement>,
+    ) -> Result<Self> {
         let s = &device.stream;
         ensure!(
             spec.out_channels == VAE_PIXEL_STD.len(),
@@ -322,10 +340,47 @@ impl ImageDecoder {
         let mut source = Source::new(component, manifest);
         let mut weights = Vec::new();
         let mut consumed = std::collections::BTreeSet::new();
-        ensure!(
-            weight_bytes <= device.workspace_budget(free, free, total / 16)?,
-            "image VAE decoder weights need {weight_bytes} bytes"
-        );
+        let mut offsets = std::collections::BTreeMap::new();
+        let dense = match placement {
+            Some(plan) if plan.slot_bytes > 0 => {
+                let order = image_decoder_layer_names(manifest, spec.layers);
+                let keep = plan.slots.clone();
+                let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
+                    component,
+                    manifest,
+                    plan,
+                    device,
+                    Some(&order),
+                )?;
+                for (layer, names) in order.iter().enumerate() {
+                    if keep[layer].is_none() {
+                        continue;
+                    }
+                    let mut offset = 0;
+                    let mut host = dense.host_layer(layer)?;
+                    for name in names {
+                        let entry = &manifest.entries[name];
+                        offsets.insert(name.as_str().to_owned(), (layer, offset));
+                        if let Some(w) = host.as_deref_mut() {
+                            source.reader.read_into(
+                                name,
+                                entry,
+                                &mut w[offset..offset + entry.bytes],
+                            )?;
+                        }
+                        offset += entry.bytes;
+                    }
+                }
+                Some(dense)
+            }
+            _ => {
+                ensure!(
+                    weight_bytes <= device.workspace_budget(free, free, total / 16)?,
+                    "image VAE decoder weights need {weight_bytes} bytes"
+                );
+                None
+            }
+        };
         let mut load = |name: &str, count: usize| -> Result<Tensor<f32, 1>> {
             ensure!(
                 consumed.insert(name.to_owned()),
@@ -341,6 +396,20 @@ impl ImageDecoder {
                     && entry.bytes == 4 * count,
                 "VAE tensor {name} is not published F32"
             );
+            if let Some(&(layer, offset)) = offsets.get(name) {
+                let pointer = dense
+                    .as_ref()
+                    .context("image decoder weight slot missing")?
+                    .pointer(layer, offset, entry.bytes)?;
+                return unsafe {
+                    Tensor::new(
+                        pointer,
+                        [u32::try_from(count)?],
+                        [1],
+                        u64::try_from(entry.bytes)?,
+                    )
+                };
+            }
             let data = source.tensor::<f32>(s, name, count)?;
             let tensor = vector(&data, s)?;
             weights.push(data);
@@ -384,6 +453,7 @@ impl ImageDecoder {
         Ok(Self {
             spec: spec.clone(),
             _weights: weights,
+            dense: dense.map(std::cell::RefCell::new),
             post_quant,
             proj_in,
             registers,
@@ -403,8 +473,16 @@ impl ImageDecoder {
     }
 
     fn work(&self, device: &Device, canvas: [usize; 2], budget: usize) -> Result<ImageWork> {
+        Self::work_for(device, &self.spec, canvas, (budget, 0))
+    }
+
+    fn work_for(
+        device: &Device,
+        spec: &VaeSpec,
+        canvas: [usize; 2],
+        (budget, reserved): (usize, usize),
+    ) -> Result<ImageWork> {
         use cudarc::driver::sys::CUdevice_attribute as A;
-        let spec = &self.spec;
         ensure!(
             canvas
                 .into_iter()
@@ -422,6 +500,7 @@ impl ImageDecoder {
             canvas,
             ImageLimits {
                 budget,
+                reserved,
                 l2: usize::try_from(device.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?)?,
                 sms: usize::try_from(
                     device
@@ -789,8 +868,33 @@ impl ImageDecoder {
         blas: &Blas,
         w: &ImageWork,
         input: &CudaSlice<f32>,
+        observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if self.dense.is_some() {
+            self.launch_inner::<true>(s, blas, w, input, observe)
+        } else {
+            self.launch_inner::<false>(s, blas, w, input, observe)
+        }
+    }
+
+    fn launch_inner<const STREAMED: bool>(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        w: &ImageWork,
+        input: &CudaSlice<f32>,
         mut observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
+        let mut dense = if STREAMED {
+            Some(
+                self.dense
+                    .as_ref()
+                    .context("image decoder stream plan missing")?
+                    .borrow_mut(),
+            )
+        } else {
+            None
+        };
         let latent_affine = self
             .latent_affine
             .as_ref()
@@ -868,7 +972,13 @@ impl ImageDecoder {
                     .launch(p.flat(rows * spec.dim))?;
             }
             for (layer, block) in self.blocks.iter().enumerate() {
+                if let Some(dense) = &mut dense {
+                    dense.begin(layer, s)?;
+                }
                 self.block(s, blas, block, w, (first, active, layer), &mut observe)?;
+                if let Some(dense) = &mut dense {
+                    dense.end(layer, s)?;
+                }
             }
             self.output_rows(s, blas, w, rows)?;
             observe("norm_out", first, active, (&w.norm, 0, p.tokens, spec.dim))?;
@@ -917,14 +1027,13 @@ impl ImageDecoder {
     }
 }
 
-/// Normalized F32 `[24, latent_h, latent_w]` to F32 `[height, width, 3]`, before clamp and quantization.
-pub(super) fn decode_image_device(
-    device: &Device,
-    blas: &Blas,
+pub(super) fn image_vae_manifest(
     model: &Path,
-    latent: &CudaSlice<f32>,
-    extent: [usize; 2],
-) -> Result<CudaSlice<f32>> {
+) -> Result<(
+    std::path::PathBuf,
+    crate::minimax_h3::ImageVaeSpec,
+    TensorManifest,
+)> {
     let component = model.join("vae_diffusers");
     let config = component.join("config.json");
     let spec = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
@@ -933,6 +1042,233 @@ pub(super) fn decode_image_device(
     let checkpoint =
         crate::checkpoint::MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?;
     let manifest = checkpoint.minimax_h3_image_vae_manifest(&spec)?;
+    Ok((component, spec, manifest))
+}
+
+fn image_decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec<String>> {
+    (0..depth)
+        .map(|layer| {
+            let prefix = format!("decoder.transformer_blocks.{layer}.");
+            manifest
+                .entries
+                .keys()
+                .filter(|name| name.starts_with(&prefix))
+                .cloned()
+                .collect()
+        })
+        .collect()
+}
+
+pub(super) fn image_decoder_sizes(
+    manifest: &TensorManifest,
+    depth: usize,
+) -> (Vec<usize>, usize, usize) {
+    let order = image_decoder_layer_names(manifest, depth);
+    let layers: Vec<_> = order
+        .iter()
+        .map(|names| names.iter().map(|name| manifest.entries[name].bytes).sum())
+        .collect();
+    let total: usize = manifest
+        .entries
+        .iter()
+        .filter(|(name, _)| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+        .map(|(_, entry)| entry.bytes)
+        .sum();
+    let fixed = total - layers.iter().sum::<usize>();
+    let largest = order
+        .iter()
+        .flatten()
+        .map(|name| manifest.entries[name].bytes)
+        .max()
+        .unwrap_or(0);
+    (layers, fixed, largest)
+}
+
+pub(super) struct ImageDecodeStage {
+    decoder: ImageDecoder,
+    work: ImageWork,
+}
+
+impl ImageDecodeStage {
+    pub(super) fn minimum_work(spec: &VaeSpec, canvas: [usize; 2]) -> Result<usize> {
+        let tiles = VaeTiles::released(spec, canvas[0], canvas[1])?;
+        Ok(usize::try_from(
+            ImagePlan::sizing(spec, &tiles, canvas)
+                .1
+                .into_iter()
+                .sum::<u128>(),
+        )?)
+    }
+
+    pub(super) fn prepare_work(
+        device: &Device,
+        spec: &VaeSpec,
+        canvas: [usize; 2],
+        later: usize,
+    ) -> Result<ImageWork> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        let budget = device.workspace_budget(free, free, total / 16)?;
+        ImageDecoder::work_for(device, spec, canvas, (budget, later))
+    }
+
+    pub(super) fn bind(
+        device: &Device,
+        (dir, spec, manifest): (&Path, &VaeSpec, &TensorManifest),
+        work: ImageWork,
+        plan: crate::prefill::DensePlacement,
+    ) -> Result<Self> {
+        let decoder =
+            ImageDecoder::with_placement(device, spec.clone(), dir, manifest, Some(plan))?;
+        Ok(Self { decoder, work })
+    }
+
+    pub(super) fn run(&self, device: &Device, blas: &Blas, latent: &[f32]) -> Result<Vec<f32>> {
+        ensure!(
+            latent.iter().all(|v| v.is_finite()),
+            "image VAE input is nonfinite"
+        );
+        let s = &device.stream;
+        let input = s.clone_htod(latent)?;
+        self.decoder
+            .launch(s, blas, &self.work, &input, |_, _, _, _| Ok(()))?;
+        s.synchronize()?;
+        let output = s.clone_dtoh(&self.work.rgb)?;
+        ensure!(
+            output.iter().all(|v| v.is_finite()),
+            "image VAE output is nonfinite"
+        );
+        Ok(output)
+    }
+}
+
+pub(super) struct ImageEncodeStage {
+    encoder: KeyframeEncoder,
+    work: EncodeWork,
+    tiles: VaeTiles,
+    extent: [usize; 2],
+}
+
+pub(super) struct ImageEncodeSetup {
+    encoder: KeyframeEncoder,
+    tiles: VaeTiles,
+    extent: [usize; 2],
+    sizing: (usize, [usize; 2]),
+    pub(super) transient_bytes: usize,
+}
+
+impl ImageEncodeSetup {
+    pub(super) fn new(
+        device: &Device,
+        (dir, spec, manifest): (&Path, &VaeSpec, &TensorManifest),
+        extent: [usize; 2],
+    ) -> Result<Self> {
+        let [height, width] = extent;
+        let pixels = height
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(spec.in_channels))
+            .context("resident image encoder input extent overflow")?;
+        let noise = (height / spec.spatial_ratio)
+            .checked_mul(width / spec.spatial_ratio)
+            .and_then(|n| n.checked_mul(spec.latent_channels))
+            .context("resident image encoder noise extent overflow")?;
+        let (frame, output) = image_encode_shape(spec, extent, pixels, noise)?;
+        let encoder = KeyframeEncoder::load(device, spec, dir, manifest, true)?;
+        let tiles = VaeTiles::released(spec, frame[0], frame[1])?;
+        let future = image_encode_future(spec, &tiles, frame, output)?;
+        let transient_bytes = pixels
+            .checked_add(noise)
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_add(future))
+            .context("resident image encoder transient extent overflow")?;
+        let sizing = EncodeWork::sizing(&encoder, (tiles.height, tiles.width))?;
+        Ok(Self {
+            encoder,
+            tiles,
+            extent,
+            sizing,
+            transient_bytes,
+        })
+    }
+
+    pub(super) fn minimum_work(&self) -> usize {
+        let (activations, [minimum_columns, _]) = self.sizing;
+        4 * (5 * activations + minimum_columns)
+    }
+
+    pub(super) fn bind(self, device: &Device, later: usize) -> Result<ImageEncodeStage> {
+        let (free, total) = device.ctx.mem_get_info()?;
+        let reserved = (total / 16)
+            .checked_add(later)
+            .context("resident image encoder reserve overflow")?;
+        let budget = device.workspace_budget(free, free, reserved)?;
+        let work = EncodeWork::allocate(
+            &device.stream,
+            (self.tiles.height, self.tiles.width),
+            self.sizing,
+            budget,
+        )?;
+        Ok(ImageEncodeStage {
+            encoder: self.encoder,
+            work,
+            tiles: self.tiles,
+            extent: self.extent,
+        })
+    }
+}
+
+impl ImageEncodeStage {
+    pub(super) fn run(
+        &mut self,
+        device: &Device,
+        blas: &Blas,
+        extent: [usize; 2],
+        rgb: &[f32],
+        noise: &[f32],
+    ) -> Result<(Vec<f32>, [usize; 2])> {
+        ensure!(
+            extent == self.extent,
+            "reference extent {extent:?} differs from admitted {:?}",
+            self.extent
+        );
+        ensure!(
+            rgb.iter()
+                .all(|v| v.is_finite() && (0.0..=255.0).contains(v)),
+            "image VAE RGB outside [0,255]"
+        );
+        ensure!(
+            noise.iter().all(|v| v.is_finite()),
+            "image VAE posterior noise is nonfinite"
+        );
+        let shape = image_encode_shape(&self.encoder.spec, extent, rgb.len(), noise.len())?;
+        let s = &device.stream;
+        let pixels = s.clone_htod(rgb)?;
+        let noise = s.clone_htod(noise)?;
+        let [_, _, latents] = self.encoder.encode_frame(
+            (s, blas),
+            &mut self.work,
+            &self.tiles,
+            (&pixels, extent[0], extent[1]),
+            &noise,
+            shape.0,
+        )?;
+        let output = s.clone_dtoh(&latents)?;
+        ensure!(
+            output.iter().all(|v| v.is_finite()),
+            "image VAE encoder output is nonfinite"
+        );
+        Ok((output, shape.1))
+    }
+}
+
+/// Normalized F32 `[24, latent_h, latent_w]` to F32 `[height, width, 3]`, before clamp and quantization.
+pub(super) fn decode_image_device(
+    device: &Device,
+    blas: &Blas,
+    model: &Path,
+    latent: &CudaSlice<f32>,
+    extent: [usize; 2],
+) -> Result<CudaSlice<f32>> {
+    let (component, spec, manifest) = image_vae_manifest(model)?;
     let canvas = [
         extent[0]
             .checked_mul(spec.spatial_ratio)
@@ -2967,9 +3303,16 @@ impl EncodeWork {
     fn with_budget(
         s: &Arc<CudaStream>,
         encoder: &KeyframeEncoder,
-        (height, width): (usize, usize),
+        tile: (usize, usize),
         budget: usize,
     ) -> Result<Self> {
+        Self::allocate(s, tile, Self::sizing(encoder, tile)?, budget)
+    }
+
+    fn sizing(
+        encoder: &KeyframeEncoder,
+        (height, width): (usize, usize),
+    ) -> Result<(usize, [usize; 2])> {
         let activations = encoder
             .convolutions((height, width))
             .iter()
@@ -2989,13 +3332,6 @@ impl EncodeWork {
                 .max()
                 .context("encoder without spatial convolutions")
         };
-        let fixed = 5 * activations * 4;
-        let available = budget
-            .checked_sub(fixed)
-            .context("encoder budget holds no activation set")?;
-        let workspace = columns((height, width))?
-            .min(columns((VAE_TILE, VAE_TILE))?)
-            .min(available / 4);
         let minimum = encoder
             .convolutions((height, width))
             .iter()
@@ -3003,6 +3339,21 @@ impl EncodeWork {
             .map(|(c, ..)| 4 * c.columns())
             .max()
             .context("encoder without spatial convolutions")?;
+        let maximum = columns((height, width))?.min(columns((VAE_TILE, VAE_TILE))?);
+        Ok((activations, [minimum, maximum]))
+    }
+
+    fn allocate(
+        s: &Arc<CudaStream>,
+        (height, width): (usize, usize),
+        (activations, [minimum, maximum]): (usize, [usize; 2]),
+        budget: usize,
+    ) -> Result<Self> {
+        let fixed = 5 * activations * 4;
+        let available = budget
+            .checked_sub(fixed)
+            .context("encoder budget holds no activation set")?;
+        let workspace = maximum.min(available / 4);
         ensure!(
             workspace >= minimum,
             "encoder im2col budget needs at least {} bytes",
@@ -3070,6 +3421,7 @@ mod image_tests {
         let tiles = VaeTiles::released(&spec, 4096, 4096)?;
         let limits = |budget, grid| ImageLimits {
             budget,
+            reserved: 0,
             l2: 75_497_472,
             sms: 128,
             grid,
@@ -3086,6 +3438,38 @@ mod image_tests {
             1_841_616
         );
         let serial_bytes = 775_026_440;
+        assert_eq!(
+            ImageDecodeStage::minimum_work(&spec, [4096, 4096])?,
+            serial_bytes
+        );
+        assert_eq!(plan.bytes, 10_117_268_168);
+        let available = 8 << 30;
+        let pending = 4 << 30;
+        let old = ImagePlan::derive(
+            &spec,
+            &tiles,
+            [4096, 4096],
+            limits(available, i32::MAX as usize),
+        )?;
+        assert_eq!(
+            (old.linear, old.attention, old.bytes),
+            (368, 8, 8_572_368_584)
+        );
+        assert!(old.bytes + pending > available);
+        let constrained = ImagePlan::derive(
+            &spec,
+            &tiles,
+            [4096, 4096],
+            ImageLimits {
+                reserved: pending,
+                ..limits(available, i32::MAX as usize)
+            },
+        )?;
+        assert_eq!(
+            (constrained.linear, constrained.attention, constrained.bytes),
+            (160, 8, 4_170_462_920)
+        );
+        assert!(constrained.bytes + pending <= available);
         assert!(
             ImagePlan::derive(
                 &spec,

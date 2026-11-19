@@ -210,6 +210,17 @@ impl ReadAhead {
         self.receive_reader(&mut slots.disk, wait)
     }
 
+    fn reclaim_copy(&mut self, reader: &mut Reader, ring: usize, wait: bool) -> Result<()> {
+        let copy = reader.copied[ring]
+            .take()
+            .context("prefetch copied ring has no event")?;
+        if wait {
+            copy.event.synchronize()?;
+        }
+        reader.disk.reclaim(ring as u32, copy.id)?;
+        self.release(ring as u32)
+    }
+
     pub(in crate::backend::cuda) fn reclaim_reader(
         &mut self,
         disk: &mut Option<Reader>,
@@ -223,11 +234,7 @@ impl ReadAhead {
             if let Some(copy) = &reader.copied[ring]
                 && copy.event.try_is_complete()?
             {
-                let copy = reader.copied[ring]
-                    .take()
-                    .context("prefetch completed copy disappeared")?;
-                reader.disk.reclaim(ring as u32, copy.id)?;
-                self.release(ring as u32)?;
+                self.reclaim_copy(reader, ring, false)?;
                 reclaimed = true;
             }
         }
@@ -240,12 +247,7 @@ impl ReadAhead {
                 .min()
                 .map(|(_, ring)| ring);
             if let Some(ring) = ring {
-                let copy = reader.copied[ring]
-                    .take()
-                    .context("prefetch busy ring has no event")?;
-                copy.event.synchronize()?;
-                reader.disk.reclaim(ring as u32, copy.id)?;
-                self.release(ring as u32)?;
+                self.reclaim_copy(reader, ring, true)?;
                 reclaimed = true;
             }
         }
@@ -345,6 +347,16 @@ impl ReadAhead {
             "disk demand layer={layer} expert={item} has no setup ring"
         );
         self.receive_reader(disk, true)?;
+        if let Some(ring) = self
+            .queue
+            .as_ref()
+            .and_then(|queue| queue.taken_slot(layer, item))
+        {
+            let reader = disk
+                .as_mut()
+                .context("prefetch copied ring has no reader")?;
+            self.reclaim_copy(reader, ring as usize, true)?;
+        }
         let (_, retired) = self
             .queue
             .as_mut()

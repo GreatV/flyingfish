@@ -38,7 +38,7 @@ use std::{
 mod audio;
 #[path = "engine_minimax_h3_pipeline.rs"]
 mod pipeline;
-pub use pipeline::image_latents;
+pub use pipeline::{ImageSession, image_latents};
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
@@ -3065,8 +3065,49 @@ fn upcast_from(
     Ok(())
 }
 
-/// Per-layer device slot bytes, stored source bytes, the largest slot and the staging/transient bytes of a
+fn image_fill_rate(dir: &Path, manifest: &TensorManifest) -> Result<(usize, f64)> {
+    let mut shards = BTreeMap::<&str, (&str, &TensorEntry)>::new();
+    for (name, entry) in &manifest.entries {
+        if entry.load && (4 << 20..=64 << 20).contains(&entry.bytes) {
+            let sample = shards.entry(entry.shard.as_str()).or_insert((name, entry));
+            if sample.1.bytes < entry.bytes {
+                *sample = (name, entry);
+            }
+        }
+    }
+    let samples: Vec<_> = shards.into_values().take(4).collect();
+    ensure!(
+        !samples.is_empty(),
+        "resident disk rate needs a published conditioner read sample"
+    );
+    let mut bufs: Vec<_> = samples
+        .iter()
+        .map(|(_, entry)| vec![0u8; entry.bytes])
+        .collect();
+    let bytes = bufs.iter().map(Vec::len).sum::<usize>();
+    let mut requests = samples
+        .iter()
+        .zip(&mut bufs)
+        .map(|(&(name, entry), buf)| DirectRead {
+            name,
+            entry,
+            dest: buf.as_mut_ptr(),
+            dest_len: buf.len(),
+        })
+        .collect::<Vec<_>>();
+    let mut source = Source::new(dir, manifest);
+    let began = std::time::Instant::now();
+    source.reader.read_many_direct(&mut requests)?;
+    let seconds = began.elapsed().as_secs_f64();
+    ensure!(
+        seconds.is_finite() && seconds > 0.0,
+        "invalid resident I1 fill duration"
+    );
+    Ok((bytes, bytes as f64 / seconds))
+}
+
 /// manifest's dense linears.
+/// Device and source bytes of every block, plus its staging and transfer workspace.
 struct DenseSizing {
     layers: Vec<usize>,
     source_layers: Vec<usize>,
@@ -3267,6 +3308,25 @@ fn place_layers(
             serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "streaming_slots": used_slots, "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes})
         );
     }
+    let dense = bind_layers(d, base, source_layers, plan, name, roles)?;
+    #[cfg(test)]
+    {
+        Ok(PlacedLayers { dense, facts })
+    }
+    #[cfg(not(test))]
+    {
+        Ok(PlacedLayers { dense })
+    }
+}
+
+fn bind_layers(
+    d: &Device,
+    base: &mut Source<'_>,
+    source_layers: &[usize],
+    plan: crate::prefill::DensePlacement,
+    name: impl Fn(usize) -> String,
+    roles: &[&str],
+) -> Result<Option<crate::backend::cuda::weights::DenseStreaming>> {
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
@@ -3274,7 +3334,7 @@ fn place_layers(
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         let mut requests = Vec::new();
         let mut checks = Vec::new();
-        for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
+        for layer in (0..source_layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
             let (layout, _) = matrix_layout(base.manifest, &name, roles)?;
             let host = dense
@@ -3332,14 +3392,7 @@ fn place_layers(
     } else {
         None
     };
-    #[cfg(test)]
-    {
-        Ok(PlacedLayers { dense, facts })
-    }
-    #[cfg(not(test))]
-    {
-        Ok(PlacedLayers { dense })
-    }
+    Ok(dense)
 }
 
 type StoredOffsets = Vec<Vec<(String, usize)>>;
@@ -4776,6 +4829,18 @@ pub(crate) struct ImageDit {
 
 type ImageCaptured<'a> = (Option<&'a mut Vec<Vec<f32>>>, Option<&'a [Vec<f32>]>);
 
+type ImagePlacementChooser<'a> = dyn FnMut(
+        &DenseSizing,
+        usize,
+        &mut dyn FnMut(usize) -> Result<FfnPlan>,
+    ) -> Result<(crate::prefill::DensePlacement, usize, FfnPlan)>
+    + 'a;
+
+enum ImagePlacement<'a> {
+    Single(Placement),
+    Resident(&'a mut ImagePlacementChooser<'a>),
+}
+
 impl ImageDit {
     pub(crate) fn new(
         d: &Device,
@@ -4785,6 +4850,45 @@ impl ImageDit {
         dir: &Path,
         manifest: &TensorManifest,
         placement: Placement,
+    ) -> Result<Self> {
+        Self::with_placement(
+            d,
+            blas,
+            (spec, image),
+            layout,
+            dir,
+            manifest,
+            ImagePlacement::Single(placement),
+        )
+    }
+
+    fn resident(
+        d: &Device,
+        blas: &mut Blas,
+        specs: (&H3Spec, &ImageSpec),
+        layout: &ImageLayout,
+        source: (&Path, &TensorManifest),
+        choose: &mut ImagePlacementChooser<'_>,
+    ) -> Result<Self> {
+        Self::with_placement(
+            d,
+            blas,
+            specs,
+            layout,
+            source.0,
+            source.1,
+            ImagePlacement::Resident(choose),
+        )
+    }
+
+    fn with_placement(
+        d: &Device,
+        blas: &mut Blas,
+        (spec, image): (&H3Spec, &ImageSpec),
+        layout: &ImageLayout,
+        dir: &Path,
+        manifest: &TensorManifest,
+        placement: ImagePlacement<'_>,
     ) -> Result<Self> {
         ensure!(
             image_block_spec(image) == *spec,
@@ -4870,20 +4974,76 @@ impl ImageDit {
         let sizing = dense_sizing(manifest, spec.layers)?;
         let owned =
             spec.layers * 2 * (2 * h + 2 * spec.head_dim) + sizing.staging + sizing.transient;
-        let placed = place_layers(
-            d,
-            &mut base,
-            (
-                &sizing.layers,
-                &sizing.source_layers,
-                sizing.largest,
-                owned,
+        let name = |layer| format!("transformer_blocks.{layer}");
+        let bind_ffn = |work: &mut BlockWork, blas: &mut Blas, budget| -> Result<FfnPlan> {
+            let choices = work.ffn_choices::<false>(blas, spec, budget)?;
+            let owned_plan = FfnPlan::select(&choices, budget)?;
+            let aliases = work.alias_choices::<false>(blas, spec, owned_plan)?;
+            let plan = FfnPlan::select(&aliases, budget)?;
+            blas.bind_workspace(plan.workspace)?;
+            work.bind_ffn::<false>(s, blas, spec, plan, &x)?;
+            Ok(plan)
+        };
+        let (placed, device_after, prepared_ffn) = match placement {
+            ImagePlacement::Single(mode) => (
+                place_layers(
+                    d,
+                    &mut base,
+                    (
+                        &sizing.layers,
+                        &sizing.source_layers,
+                        sizing.largest,
+                        owned,
+                        0,
+                    ),
+                    mode,
+                    name,
+                    &LINEAR_ROLES,
+                )?,
                 0,
+                None,
             ),
-            placement,
-            |layer| format!("transformer_blocks.{layer}"),
-            &LINEAR_ROLES,
-        )?;
+            ImagePlacement::Resident(choose) => {
+                let (plan, device_after, chosen) = choose(&sizing, owned, &mut |later| {
+                    let (free, total) = d.ctx.mem_get_info()?;
+                    let reserved = (total / 16)
+                        .checked_add(later)
+                        .context("resident image FFN reserve overflow")?;
+                    let budget = d.workspace_budget(free, free, reserved)?;
+                    bind_ffn(&mut work, blas, budget)
+                })?;
+                #[cfg(test)]
+                let facts = {
+                    let (free, total) = d.ctx.mem_get_info()?;
+                    PlacementFacts {
+                        free_bytes: free,
+                        total_bytes: total,
+                        owned_bytes: owned,
+                        largest_bytes: sizing.largest,
+                        host_available_bytes: None,
+                        device_budget: plan.resident_bytes + 2 * plan.slot_bytes,
+                        host_budget: plan.host_bytes,
+                    }
+                };
+                let dense = bind_layers(
+                    d,
+                    &mut base,
+                    &sizing.source_layers,
+                    plan,
+                    name,
+                    &LINEAR_ROLES,
+                )?;
+                (
+                    PlacedLayers {
+                        dense,
+                        #[cfg(test)]
+                        facts,
+                    },
+                    device_after,
+                    Some(chosen),
+                )
+            }
+        };
         #[cfg(test)]
         let placement_facts = placed.facts;
         let dense = placed.dense;
@@ -4903,14 +5063,22 @@ impl ImageDit {
                 None => BlockWeights::resident::<false>(s, spec, 0, &name, &mut base, None)?,
             });
         }
-        let (free, _) = d.ctx.mem_get_info()?;
-        let budget = d.workspace_budget(free, free, sizing.transient)?;
-        let choices = work.ffn_choices::<false>(blas, spec, budget)?;
-        let owned_plan = FfnPlan::select(&choices, budget)?;
-        let aliases = work.alias_choices::<false>(blas, spec, owned_plan)?;
-        let chosen = FfnPlan::select(&aliases, budget)?;
-        blas.bind_workspace(chosen.workspace)?;
-        work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
+        let (free, total) = d.ctx.mem_get_info()?;
+        let chosen = match prepared_ffn {
+            Some(plan) => {
+                let reserve = (total / 16)
+                    .checked_add(sizing.transient)
+                    .and_then(|n| n.checked_add(device_after))
+                    .context("FFN live reserve overflow")?;
+                d.workspace_budget(free, free, reserve)?;
+                plan
+            }
+            None => bind_ffn(
+                &mut work,
+                blas,
+                d.workspace_budget(free, free, sizing.transient)?,
+            )?,
+        };
         s.synchronize()?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
@@ -4955,6 +5123,32 @@ impl ImageDit {
             round: vision.load_function("vision_affine_cast_bf16")?,
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
         })
+    }
+
+    pub(crate) fn sample_host(
+        &mut self,
+        context: &BlockContext<'_>,
+        modulation: (&AdalnTable, &AdalnPlan),
+        schedule: &ImageSchedule,
+        (rows, text): (&[f32], &[bf16]),
+        captured: ImageCaptured<'_>,
+    ) -> Result<Vec<f32>> {
+        let mut image_rows = context.s.clone_htod(rows)?;
+        let text = context.s.clone_htod(text)?;
+        self.sample(
+            context,
+            modulation,
+            schedule,
+            &mut image_rows,
+            &text,
+            captured,
+        )?;
+        let out = context.s.clone_dtoh(&image_rows)?;
+        ensure!(
+            out.len() == rows.len() && out.iter().all(|v| v.is_finite()),
+            "non-finite image sample"
+        );
+        Ok(out)
     }
 
     /// `x = r * x + (1 - r) * (x + sigma * v)` on the generated image rows. Reference rows stay put.
@@ -5337,12 +5531,64 @@ pub(crate) struct Conditioner {
 }
 
 impl Conditioner {
+    pub(super) fn layer_sizes(
+        manifest: &TensorManifest,
+        layers: usize,
+    ) -> Result<(Vec<usize>, usize)> {
+        let mut bytes = vec![0usize; layers];
+        let mut largest = 0usize;
+        for entry in manifest.entries.values() {
+            if let Some(layer) = entry.layer
+                && entry.load
+                && entry.shape.len() == 2
+            {
+                let layer = layer as usize;
+                ensure!(layer < layers, "manifest loads decoder layer {layer}");
+                bytes[layer] += entry.bytes;
+                largest = largest.max(entry.bytes);
+            }
+        }
+        Ok((bytes, largest))
+    }
+
+    pub(super) fn resident_fixed_bytes(
+        device: &Device,
+        spec: &crate::model_spec::ModelSpec,
+        (layers, capacity): (usize, usize),
+    ) -> Result<usize> {
+        let (hidden, d, ffn) = (
+            spec.hidden as usize,
+            spec.head_dim as usize,
+            spec.intermediate as usize,
+        );
+        let heads = spec.q_heads as usize;
+        let kv = spec.kv_heads as usize;
+        let widths = 2 * hidden + d + 2 * heads * d + 4 * kv * d + 3 * ffn;
+        let norm = layers * 2 * (2 * hidden + 2 * d);
+        let flash = Flash::workspace(&device.stream, capacity, heads, d, capacity)?;
+        capacity
+            .checked_mul(2 * widths)
+            .and_then(|n| n.checked_add(norm))
+            .and_then(|n| n.checked_add(flash))
+            .context("conditioner fixed device extent overflow")
+    }
+
     pub(crate) fn new(
         d: &Device,
         spec: &crate::model_spec::ModelSpec,
         (layers, capacity, media): (usize, usize, usize),
-        mut base: Source<'_>,
+        base: Source<'_>,
         placement: Placement,
+    ) -> Result<Self> {
+        Self::with_plan(d, spec, (layers, capacity, media), base, (placement, None))
+    }
+
+    pub(super) fn with_plan(
+        d: &Device,
+        spec: &crate::model_spec::ModelSpec,
+        (layers, capacity, media): (usize, usize, usize),
+        mut base: Source<'_>,
+        (placement, plan): (Placement, Option<crate::prefill::DensePlacement>),
     ) -> Result<Self> {
         ensure!(
             spec.architecture == crate::model_spec::Architecture::Qwen3Vl
@@ -5357,19 +5603,7 @@ impl Conditioner {
         );
         let (q_heads, kv_heads) = (spec.q_heads as usize, spec.kv_heads as usize);
         let name = |layer: usize| format!("model.language_model.layers.{layer}");
-        let mut bytes = vec![0usize; layers];
-        let mut largest = 0usize;
-        for entry in base.manifest.entries.values() {
-            if let Some(layer) = entry.layer
-                && entry.load
-                && entry.shape.len() == 2
-            {
-                let layer = layer as usize;
-                ensure!(layer < layers, "manifest loads decoder layer {layer}");
-                bytes[layer] += entry.bytes;
-                largest = largest.max(entry.bytes);
-            }
-        }
+        let (bytes, largest) = Self::layer_sizes(base.manifest, layers)?;
         let rows = |width: usize| s.alloc_zeros::<bf16>(capacity * width);
         let (x, normed, rope) = (rows(hidden)?, rows(hidden)?, rows(head_dim)?);
         let (q, attention) = (rows(q_heads * head_dim)?, rows(q_heads * head_dim)?);
@@ -5378,15 +5612,19 @@ impl Conditioner {
         let (gate_up, gated) = (rows(2 * ffn)?, rows(ffn)?);
         let flash = Flash::new(s.clone(), capacity, q_heads, kv_heads, head_dim)?;
         let owned = layers * 2 * (2 * hidden + 2 * head_dim);
-        let dense = place_layers(
-            d,
-            &mut base,
-            (&bytes, &bytes, largest, owned, media),
-            placement,
-            name,
-            &TEXT_ROLES,
-        )?
-        .dense;
+        let dense = if let Some(plan) = plan {
+            bind_layers(d, &mut base, &bytes, plan, name, &TEXT_ROLES)?
+        } else {
+            place_layers(
+                d,
+                &mut base,
+                (&bytes, &bytes, largest, owned, media),
+                placement,
+                name,
+                &TEXT_ROLES,
+            )?
+            .dense
+        };
         let mut text_layers = Vec::with_capacity(layers);
         for (layer, &layer_bytes) in bytes.iter().enumerate() {
             let slot = match &dense {
@@ -5805,22 +6043,13 @@ pub(crate) fn image_sample_trace(
         spec: &spec,
         lora_scale: 1.0,
     };
-    let mut image_rows = s.clone_htod(rows)?;
-    let text = s.clone_htod(text)?;
-    dit.sample(
+    dit.sample_host(
         &context,
         (&table, &adaln),
         &schedule,
-        &mut image_rows,
-        &text,
+        (rows, text),
         (trace, entering),
-    )?;
-    let out = s.clone_dtoh(&image_rows)?;
-    ensure!(
-        out.len() == rows.len() && out.iter().all(|v| v.is_finite()),
-        "non-finite image sample"
-    );
-    Ok(out)
+    )
 }
 
 /// One Qwen3-VL conditioner prompt: prompt tokens with their image grids and packed `pixel_values`.
@@ -13565,6 +13794,190 @@ mod tests {
             defects.push(label);
         }
         Ok(decision)
+    }
+
+    #[test]
+    fn resident_dense_placement_charges_the_next_stage() -> Result<()> {
+        let layers = [8; 3];
+        let total = 256;
+        let fixed = 4;
+        let later = 32;
+        let free = total / 16 + fixed + later + 16;
+        let host = Some((4 << 30) + 16 + 8 + 8);
+        let (plan, facts) = super::plan_dense_layers(
+            (&layers, &layers, 8, fixed, later),
+            super::Placement::Derived,
+            (free, total, host),
+            2,
+        )?;
+        assert_eq!(facts.device_budget, 16);
+        assert_eq!(plan.resident_bytes, 0);
+        assert_eq!(plan.host_bytes, 8);
+        assert_eq!(plan.disk_bytes, 16);
+        assert!(
+            super::plan_dense_layers(
+                (&layers, &layers, 8, fixed, later),
+                super::Placement::Derived,
+                (free - 1, total, host),
+                2,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE"]
+    fn resident_image_request_two_matches_fresh_and_bounds_allocations() -> Result<()> {
+        use crate::minimax_h3::{ImageReference, ImageRequest, ImageRunOptions};
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let model = image_e2e_env("FF_H3_IMAGE")?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-resident-{}", std::process::id()));
+        std::fs::create_dir(&runtime)?;
+        let options = ImageRunOptions {
+            device: 0,
+            runtime_dir: runtime.clone(),
+        };
+        let result = (|| -> Result<()> {
+            for edit in [false, true] {
+                let make_request = |right: bool| {
+                    let prompt = match (edit, right) {
+                        (false, false) => "a red cube on a white table",
+                        (false, true) => "a blue cube on a white table",
+                        (true, false) => "replace the left half of <Picture 1> with a blue square",
+                        (true, true) => "replace the right half of <Picture 1> with a blue square",
+                    };
+                    let mut request =
+                        ImageRequest::new(prompt, 1024, 1024, 20261112 + u64::from(right));
+                    if edit {
+                        let width = 1536;
+                        let height = 1024;
+                        let phase = usize::from(right) * 97;
+                        let pixels = (0..width * height)
+                            .flat_map(|i| {
+                                let (x, y) = (i % width, i / width);
+                                [
+                                    (3 * x + y + phase) as u8,
+                                    (x + 5 * y) as u8,
+                                    (7 * x + 11 * y) as u8,
+                                ]
+                            })
+                            .collect();
+                        request.references.push(ImageReference {
+                            image: crate::serve::image::RgbImage {
+                                width,
+                                height,
+                                pixels,
+                            },
+                        });
+                    }
+                    request
+                };
+                let (a, b) = (make_request(false), make_request(true));
+                let fresh = super::image_latents(&model, &options, &b)?;
+                let workload = [Ok(make_request(false)), Ok(make_request(true))].into_iter();
+                let mut resident = super::ImageSession::open(&model, &options, workload)?;
+                let first = resident.render(&a)?;
+                ensure!(
+                    first.rgb != fresh.rgb,
+                    "resident stale-request control matched the fresh output"
+                );
+                drop(first);
+                let ctx = crate::backend::cuda::Device::new(0)?.ctx;
+                use cudarc::driver::sys::{self, CUmemPool_attribute};
+                let mut pool = std::ptr::null_mut();
+                unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()).result()? };
+                let media_control = edit.then(|| {
+                    let mut alternate = make_request(true);
+                    alternate.references = make_request(false).references;
+                    alternate
+                });
+                let mut boundary_bytes = None;
+                let mut latent_bits_exact = true;
+                for request_number in 2..=8 {
+                    let mut peak = 0u64;
+                    unsafe {
+                        sys::cuMemPoolSetAttribute(
+                            pool,
+                            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                            (&mut peak as *mut u64).cast(),
+                        )
+                        .result()?;
+                    }
+                    let different_media = media_control.as_ref().filter(|_| request_number == 3);
+                    let got = resident.render(different_media.unwrap_or(&b))?;
+                    if different_media.is_some() {
+                        ensure!(
+                            got.rgb != fresh.rgb,
+                            "resident edit ignored the changed reference"
+                        );
+                    } else {
+                        ensure!(
+                            got.rgb == fresh.rgb,
+                            "resident request {request_number} RGB differs from the fresh request"
+                        );
+                        latent_bits_exact &= got
+                            .values
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .eq(fresh.values.iter().map(|v| v.to_bits()));
+                    }
+                    drop(got);
+                    ctx.synchronize()?;
+                    let (free, total) = ctx.mem_get_info()?;
+                    let mut used = 0u64;
+                    unsafe {
+                        sys::cuMemPoolGetAttribute(
+                            pool,
+                            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                            (&mut used as *mut u64).cast(),
+                        )
+                        .result()?;
+                        sys::cuMemPoolGetAttribute(
+                            pool,
+                            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                            (&mut peak as *mut u64).cast(),
+                        )
+                        .result()?;
+                    }
+                    ensure!(
+                        free >= total / 16 && u64::try_from(total - total / 16)? >= peak,
+                        "resident request {request_number} exhausted the device reserve: free={free}, pool_peak={peak}, total={total}"
+                    );
+                    ensure!(
+                        boundary_bytes.is_none_or(|baseline| used == baseline),
+                        "resident request {request_number} changed live allocation bytes: {used} vs {boundary_bytes:?}"
+                    );
+                    boundary_bytes = Some(used);
+                    let host_remaining =
+                        crate::backend::cuda::calibrate::host_memory(Path::new("/"))?;
+                    ensure!(
+                        host_remaining >= 4 << 30,
+                        "resident request {request_number} exhausted host headroom: {host_remaining}"
+                    );
+                    println!(
+                        "H3_IMAGE_RESIDENT_BOUNDARY edit={edit} request={request_number} free={free} used={used} pool_peak={peak} host_remaining={host_remaining}"
+                    );
+                }
+                let mut outside = make_request(true);
+                outside.width += 1;
+                ensure!(
+                    resident.render(&outside).is_err(),
+                    "resident admitted a different output extent"
+                );
+                println!(
+                    "H3_IMAGE_RESIDENT PASS edit={edit} requests=8 request2_rgb_exact=true latent_bits_exact={latent_bits_exact} control=distinct"
+                );
+            }
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(runtime);
+        result?;
+        cleanup?;
+        Ok(())
     }
 
     /// Cells (a), (b) and (e). Cell (d) is the contract `image_rgb8` test. Cell (c) has no tau.

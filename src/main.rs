@@ -256,25 +256,41 @@ enum Command {
         output: PathBuf,
     },
     Image {
-        #[arg(long, help = "Image description in natural language")]
-        prompt: String,
-        #[arg(long, value_parser = parse_image_size, help = "Requested output size WIDTHxHEIGHT")]
-        size: (usize, usize),
-        #[arg(long, help = "Image noise seed (required; no documented default)")]
-        seed: u64,
         #[arg(
             long,
+            required_unless_present = "requests",
+            help = "Image description in natural language"
+        )]
+        prompt: Option<String>,
+        #[arg(long, value_parser = parse_image_size, help = "Requested output size WIDTHxHEIGHT")]
+        size: (usize, usize),
+        #[arg(
+            long,
+            required_unless_present = "requests",
+            help = "Image noise seed (required; no documented default)"
+        )]
+        seed: Option<u64>,
+        #[arg(
+            long,
+            conflicts_with = "requests",
             help = "Prompt-expander model directory; replaces the input prompt"
         )]
         expand: Option<PathBuf>,
-        #[arg(long, action = clap::ArgAction::Append, help = "Upright RGB8 edit reference; repeat for multiple images")]
+        #[arg(long, action = clap::ArgAction::Append, conflicts_with = "requests", help = "Upright RGB8 edit reference; repeat for multiple images")]
         edit: Vec<PathBuf>,
         #[arg(
             short = 'o',
             long = "output",
+            required_unless_present = "requests",
             help = "Output .png at the requested size"
         )]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with_all = ["prompt", "seed", "output"],
+            help = "Image requests as JSONL with prompt, seed, output, and optional edit paths"
+        )]
+        requests: Option<PathBuf>,
         #[arg(long, help = "Print output size, seed and reference count as JSON")]
         json: bool,
     },
@@ -1093,71 +1109,165 @@ fn image(cli: &Cli, request: ImageCliRequest, output: &Path, json: bool) -> Resu
     flyingfish::backend::with_verbose(cli.verbose, || {
         png_output(output)?;
         let output = output_path(output, &cli.model)?;
-        let expander = request
-            .expander
-            .as_ref()
-            .map(|path| {
-                path.canonicalize()
-                    .with_context(|| format!("resolve prompt expander {}", path.display()))
-            })
-            .transpose()?;
-        let references = request
-            .references
-            .iter()
-            .map(|path| {
-                let path = path
-                    .canonicalize()
-                    .with_context(|| format!("resolve edit reference {}", path.display()))?;
-                let bytes = fs::read(&path)
-                    .with_context(|| format!("read edit reference {}", path.display()))?;
-                Ok(flyingfish::minimax_h3::ImageReference {
-                    image: flyingfish::serve::image::decode_image(&bytes, None)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut request = flyingfish::minimax_h3::ImageRequest::new(
-            request.prompt,
-            request.width,
-            request.height,
-            request.seed,
-        );
-        request.expander = expander;
-        request.references = references;
-        let options = flyingfish::minimax_h3::ImageRunOptions {
-            device: cli.device,
-            runtime_dir: cli
-                .kernels
-                .runtime_dir
-                .clone()
-                .context("--runtime-dir is required for image")?,
-        };
+        let request = prepare_image_request(request)?;
+        let options = image_options(cli)?;
         let generated = flyingfish::minimax_h3::image_latents(&cli.model, &options, &request)?;
-        ensure!(
-            generated.rgb.len() == request.width * request.height * 3,
-            "image entry RGB extent"
+        write_image(&output, &request, &generated.rgb, json)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn prepare_image_request(request: ImageCliRequest) -> Result<flyingfish::minimax_h3::ImageRequest> {
+    let expander = request
+        .expander
+        .as_ref()
+        .map(|path| {
+            path.canonicalize()
+                .with_context(|| format!("resolve prompt expander {}", path.display()))
+        })
+        .transpose()?;
+    let references = request
+        .references
+        .iter()
+        .map(|path| {
+            let path = path
+                .canonicalize()
+                .with_context(|| format!("resolve edit reference {}", path.display()))?;
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read edit reference {}", path.display()))?;
+            Ok(flyingfish::minimax_h3::ImageReference {
+                image: flyingfish::serve::image::decode_image(&bytes, None)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut request = flyingfish::minimax_h3::ImageRequest::new(
+        request.prompt,
+        request.width,
+        request.height,
+        request.seed,
+    );
+    request.expander = expander;
+    request.references = references;
+    Ok(request)
+}
+
+#[cfg(feature = "cuda")]
+fn image_options(cli: &Cli) -> Result<flyingfish::minimax_h3::ImageRunOptions> {
+    Ok(flyingfish::minimax_h3::ImageRunOptions {
+        device: cli.device,
+        runtime_dir: cli
+            .kernels
+            .runtime_dir
+            .clone()
+            .context("--runtime-dir is required for image")?,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn write_image(
+    output: &Path,
+    request: &flyingfish::minimax_h3::ImageRequest,
+    rgb: &[u8],
+    json: bool,
+) -> Result<()> {
+    ensure!(
+        rgb.len() == request.width * request.height * 3,
+        "image entry RGB extent"
+    );
+    if let Err(error) = flyingfish::media::write_png(
+        fs::File::create(output)?,
+        request.width,
+        request.height,
+        rgb,
+    ) {
+        let _ = fs::remove_file(output);
+        return Err(error);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"image": {
+                "output": output.display().to_string(),
+                "width": request.width,
+                "height": request.height,
+                "seed": request.seed,
+                "references": request.references.len(),
+            }})
         );
-        if let Err(error) = flyingfish::media::write_png(
-            fs::File::create(&output)?,
-            request.width,
-            request.height,
-            &generated.rgb,
-        ) {
-            let _ = fs::remove_file(&output);
-            return Err(error);
+    } else {
+        println!("{}", output.display());
+    }
+    Ok(())
+}
+
+fn image_requests(
+    cli: &Cli,
+    path: &Path,
+    (width, height): (usize, usize),
+    json: bool,
+) -> Result<()> {
+    let _ = (cli, path, width, height, json);
+    #[cfg(not(feature = "cuda"))]
+    bail!("image requires CUDA");
+    #[cfg(feature = "cuda")]
+    flyingfish::backend::with_verbose(cli.verbose, || {
+        use std::io::BufRead;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            prompt: String,
+            seed: u64,
+            output: PathBuf,
+            #[serde(default)]
+            edit: Vec<PathBuf>,
+            #[serde(default)]
+            expand: Option<PathBuf>,
         }
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({"image": {
-                    "output": output.display().to_string(),
-                    "width": request.width,
-                    "height": request.height,
-                    "seed": request.seed,
-                    "references": request.references.len(),
-                }})
-            );
-        } else {
-            println!("{}", output.display());
+        let read_requests = || -> Result<_> {
+            let file = fs::File::open(path)
+                .with_context(|| format!("open image requests {}", path.display()))?;
+            Ok(std::io::BufReader::new(file)
+                .lines()
+                .enumerate()
+                .map(|(index, line)| {
+                    let line = line.with_context(|| format!("read image request {}", index + 1))?;
+                    let record: Request = serde_json::from_str(&line)
+                        .with_context(|| format!("parse image request {}", index + 1))?;
+                    let request = ImageCliRequest {
+                        prompt: record.prompt,
+                        width,
+                        height,
+                        seed: record.seed,
+                        expander: record.expand,
+                        references: record.edit,
+                    };
+                    Ok::<_, anyhow::Error>((request, record.output))
+                }))
+        };
+        let mut inputs = read_requests()?;
+        let (request, output) = inputs.next().context("image requests file is empty")??;
+        let Some(second) = inputs.next().transpose()? else {
+            return image(cli, request, &output, json);
+        };
+        let options = image_options(cli)?;
+        let check_requests = [Ok((request, output)), Ok(second)]
+            .into_iter()
+            .chain(inputs)
+            .map(|entry| {
+                let (request, output) = entry?;
+                png_output(&output)?;
+                output_path(&output, &cli.model)?;
+                prepare_image_request(request)
+            });
+        let mut session =
+            flyingfish::minimax_h3::ImageSession::open(&cli.model, &options, check_requests)?;
+        for entry in read_requests()? {
+            let (request, output) = entry?;
+            png_output(&output)?;
+            let output = output_path(&output, &cli.model)?;
+            let request = prepare_image_request(request)?;
+            let generated = session.render(&request)?;
+            write_image(&output, &request, &generated.rgb, json)?;
         }
         Ok(())
     })
@@ -1504,17 +1614,26 @@ fn run() -> Result<()> {
             expand,
             edit,
             output,
+            requests,
             json,
         } => {
+            if let Some(path) = requests {
+                return image_requests(&cli, path, *size, *json);
+            }
             let request = ImageCliRequest {
-                prompt: prompt.clone(),
+                prompt: prompt.clone().context("image prompt is required")?,
                 width: size.0,
                 height: size.1,
-                seed: *seed,
+                seed: seed.context("image seed is required")?,
                 expander: expand.clone(),
                 references: edit.clone(),
             };
-            image(&cli, request, output, *json)
+            image(
+                &cli,
+                request,
+                output.as_deref().context("image output is required")?,
+                *json,
+            )
         }
         #[cfg(feature = "cuda")]
         Command::To3d {
@@ -2323,17 +2442,19 @@ mod tests {
                 expand,
                 edit,
                 output,
+                requests,
                 json,
             } => {
-                assert_eq!(prompt, "a red cube");
+                assert_eq!(prompt.as_deref(), Some("a red cube"));
+                assert!(requests.is_none());
                 assert_eq!(size, (1536, 1024));
-                assert_eq!(seed, 42);
+                assert_eq!(seed, Some(42));
                 assert_eq!(expand, Some(PathBuf::from("pe")));
                 assert_eq!(
                     edit,
                     [PathBuf::from("first.png"), PathBuf::from("second.png")]
                 );
-                assert_eq!(output, PathBuf::from("out.png"));
+                assert_eq!(output, Some(PathBuf::from("out.png")));
                 assert!(json);
             }
             _ => panic!("image subcommand was not selected"),
