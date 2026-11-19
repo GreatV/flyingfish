@@ -344,6 +344,9 @@ impl ImageDecoder {
     }
 }
 
+// Kept fixed outside streamed block slots so fused scale2 -> next.norm1 reads blocks[L+1].norm1 before begin(L+1).
+const DECODER_RESIDENT_BLOCK_WEIGHT: &str = "norm1.weight";
+
 fn image_decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec<String>> {
     (0..depth)
         .map(|layer| {
@@ -351,7 +354,10 @@ fn image_decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec
             manifest
                 .entries
                 .keys()
-                .filter(|name| name.starts_with(&prefix))
+                .filter(|name| {
+                    name.strip_prefix(&prefix)
+                        .is_some_and(|field| field != DECODER_RESIDENT_BLOCK_WEIGHT)
+                })
                 .cloned()
                 .collect()
         })
@@ -879,6 +885,7 @@ struct VaeKernels {
     head_pack: CudaFunction,
     norm_out: CudaFunction,
     residual: CudaFunction,
+    residual_rms: CudaFunction,
     patches: CudaFunction,
     swiglu: CudaFunction,
 }
@@ -1085,6 +1092,7 @@ fn video_weight_load<'a>(
 ) -> Result<DecoderWeightLoad<'a>> {
     let mut order = vec![Vec::new(); spec.layers];
     let mut sizes = vec![0; spec.layers];
+    let mut fixed_norm1 = 0usize;
     for (name, entry) in manifest
         .entries
         .iter()
@@ -1097,17 +1105,19 @@ fn video_weight_load<'a>(
             "video decoder weight {name} is not published F32"
         );
         if let Some(rest) = name.strip_prefix("decoder.transformer_blocks.") {
-            let (layer, _) = rest.split_once('.').context("video block role")?;
+            let (layer, field) = rest.split_once('.').context("video block role")?;
             let layer = layer.parse::<usize>()?;
-            order
-                .get_mut(layer)
-                .context("video block index")?
-                .push(name);
+            let dst = order.get_mut(layer).context("video block index")?;
+            if field == DECODER_RESIDENT_BLOCK_WEIGHT {
+                fixed_norm1 += 1;
+                continue;
+            }
+            dst.push(name);
             sizes[layer] += decoder_tensor_bytes(manifest, name);
         }
     }
     ensure!(
-        order.iter().all(|names| names.len() == 16),
+        fixed_norm1 == spec.layers && order.iter().all(|names| names.len() == 15),
         "video block weight inventory"
     );
     let weights = decoder_weight_bytes(manifest);
@@ -1204,6 +1214,11 @@ impl VideoDecoder {
         let common = cubin::module(&d.ctx, "q38_common")?;
         let s = &d.stream;
         let manifest = load.manifest;
+        ensure!(
+            spec.dim <= 2048,
+            "VAE decoder dim {} exceeds residual RMSNorm limit",
+            spec.dim
+        );
         let (dim, latent, ffn) = (spec.dim, spec.latent_channels, spec.ffn);
         let post_quant = load.linear(s, "post_quant_conv", latent, latent)?;
         let proj_in = load.linear(s, "decoder.proj_in", dim, latent)?;
@@ -1258,6 +1273,7 @@ impl VideoDecoder {
                 head_pack: vision.load_function("rms_rotary_pack_qkv_bf16")?,
                 norm_out: common.load_function("layer_norm_f32_to_bf16")?,
                 residual: vision.load_function("scaled_residual_f32")?,
+                residual_rms: vision.load_function("scaled_residual_rms_f32")?,
                 patches: vision.load_function("unpatchify_bf16")?,
                 swiglu: cubin::module(&d.ctx, "act")?.load_function("silu_mul")?,
             },
@@ -1388,10 +1404,10 @@ impl VideoDecoder {
         s: &Arc<CudaStream>,
         blas: &Blas,
         w: &mut TileWork,
-        (b, active): (&DecoderBlock<bf16>, usize),
-        #[cfg(test)] capture: bool,
+        (layer, active): (usize, usize),
         #[cfg(test)] observe: &mut impl FnMut(&str, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
+        let b = &self.blocks[layer];
         let spec = &self.spec;
         let rows = active * w.tokens;
         let dim = spec.dim;
@@ -1423,7 +1439,24 @@ impl VideoDecoder {
             }
             Ok(())
         };
-        norm(b.norm1)?;
+        let residual_norm = |res_scale: Tensor<f32, 1>, norm_scale: Tensor<f32, 1>| -> Result<()> {
+            unsafe {
+                s.launch_builder(&self.kernels.residual_rms)
+                    .arg(&pointer(&w.x, s))
+                    .arg(&pointer(&w.o, s))
+                    .arg(&res_scale.ptr)
+                    .arg(&norm_scale.ptr)
+                    .arg(&0u64)
+                    .arg(&pointer(&w.norm, s))
+                    .arg(&(dim as u32))
+                    .arg(&spec.norm_eps)
+                    .launch(ops::grid(rows, 256))?;
+            }
+            Ok(())
+        };
+        if layer == 0 {
+            norm(b.norm1)?;
+        }
         for (j, linear) in [&b.q, &b.k, &b.v].into_iter().enumerate() {
             linear.apply(
                 blas,
@@ -1432,7 +1465,7 @@ impl VideoDecoder {
             )?;
         }
         #[cfg(test)]
-        if capture {
+        if layer == 0 {
             observe("q0", (DecoderRows::Bf16(&w.ff), 0, w.tokens, dim))?;
             observe("k0", (DecoderRows::Bf16(&w.ff), n, w.tokens, dim))?;
         }
@@ -1474,8 +1507,7 @@ impl VideoDecoder {
             },
         )?;
         b.out.apply(blas, mat(&w.attn)?, mat(&w.o)?)?;
-        residual(b.scale1)?;
-        norm(b.norm2)?;
+        residual_norm(b.scale1, b.norm2)?;
         let f = spec.ffn;
         b.ff_in.apply(
             blas,
@@ -1494,7 +1526,11 @@ impl VideoDecoder {
         }
         b.ff_out
             .apply(blas, rows_view(&w.gated, s, 0, rows, f, f)?, mat(&w.o)?)?;
-        residual(b.scale2)
+        if let Some(next) = self.blocks.get(layer + 1) {
+            residual_norm(b.scale2, next.norm1)
+        } else {
+            residual(b.scale2)
+        }
     }
 
     fn tile(
@@ -1594,19 +1630,15 @@ impl VideoDecoder {
                 .arg(&(spec.dim as u32))
                 .launch(flat(rows * spec.dim))?;
         }
-        for (layer, block) in self.blocks.iter().enumerate() {
+        for layer in 0..self.blocks.len() {
             if let Some(dense) = &self.dense {
                 dense.borrow_mut().begin(layer, s)?;
             }
-            #[cfg(test)]
-            let first_layer = layer == 0;
             self.block(
                 s,
                 blas,
                 w,
-                (block, active),
-                #[cfg(test)]
-                first_layer,
+                (layer, active),
                 #[cfg(test)]
                 &mut observe,
             )?;
@@ -4333,6 +4365,316 @@ mod image_tests {
             "PASS C1_NEGATIVE_CONTROL row={} head={} q_exceed={} k_exceed={} v_diff={}",
             bad_row, bad_head, bad_counts[0], bad_counts[1], bad_counts[2]
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn vae_residual_rms_fusion_matches_parent_gpu() -> Result<()> {
+        use cudarc::driver::sys::{CUdevice_attribute as DA, CUfunction_attribute as FA};
+        let d = Device::new(0)?;
+        let s = &d.stream;
+        let vision = cubin::module(&d.ctx, "vision_ops")?;
+        let residual = vision.load_function("scaled_residual_f32")?;
+        let rms = vision.load_function("vision_rms_scale_f32")?;
+        let fused = vision.load_function("scaled_residual_rms_f32")?;
+
+        let max_threads_sm = u32::try_from(
+            d.ctx
+                .attribute(DA::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
+        )?;
+        let local_bytes = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+        let regs = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+        let smem = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+        let active_blocks = fused.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?;
+        let active_warps = active_blocks * 8;
+        println!(
+            "H3_VAE_RESIDUAL_RMS_OCCUPANCY threads=256 active_blocks={active_blocks} active_warps={active_warps} regs={regs} smem={smem} local={local_bytes}"
+        );
+        ensure!(
+            local_bytes == 0,
+            "scaled_residual_rms_f32 spills to local memory ({local_bytes} B)"
+        );
+        ensure!(
+            active_blocks * 256 >= max_threads_sm.min(1536),
+            "scaled_residual_rms_f32 occupancy {active_warps} warps/SM below target on max_threads={max_threads_sm}"
+        );
+
+        let cases = [
+            ("video_prod", 50316usize, 2048usize, false),
+            ("video_ragged", 17usize, 768usize, false),
+            ("image_prod_f32out", 31581usize, 1024usize, true),
+            ("image_ragged_f32out", 19usize, 512usize, true),
+        ];
+        for (label, rows, width, out_f32) in cases {
+            let count = rows * width;
+            let eps = 1.0e-6f32;
+            let x_host: Vec<f32> = (0..count)
+                .map(|i| (((i * 29 + 7) % 509) as f32 - 254.0) / 64.0)
+                .collect();
+            let delta_host: Vec<bf16> = (0..count)
+                .map(|i| bf16::from_f32((((i * 43 + 11) % 389) as f32 - 194.0) / 128.0))
+                .collect();
+            let res_scale_host: Vec<f32> = (0..width)
+                .map(|i| 0.25 + ((i * 17) % 61) as f32 / 64.0)
+                .collect();
+            let norm_scale_host: Vec<f32> = (0..width)
+                .map(|i| 0.5 + ((i * 13 + 3) % 47) as f32 / 32.0)
+                .collect();
+
+            let x_ref = s.clone_htod(&x_host)?;
+            let x_got = s.clone_htod(&x_host)?;
+            let delta = s.clone_htod(&delta_host)?;
+            let res_scale = s.clone_htod(&res_scale_host)?;
+            let norm_scale = s.clone_htod(&norm_scale_host)?;
+            let y_f32_ref = s.alloc_zeros::<f32>(if out_f32 { count } else { 1 })?;
+            let y_bf16_ref = s.alloc_zeros::<bf16>(if out_f32 { 1 } else { count })?;
+            let y_f32_got = s.alloc_zeros::<f32>(if out_f32 { count } else { 1 })?;
+            let y_bf16_got = s.alloc_zeros::<bf16>(if out_f32 { 1 } else { count })?;
+
+            let out_f32_ref_ptr = if out_f32 { pointer(&y_f32_ref, s) } else { 0 };
+            let out_bf16_ref_ptr = if out_f32 { 0 } else { pointer(&y_bf16_ref, s) };
+            let out_f32_got_ptr = if out_f32 { pointer(&y_f32_got, s) } else { 0 };
+            let out_bf16_got_ptr = if out_f32 { 0 } else { pointer(&y_bf16_got, s) };
+            let width_u = u32::try_from(width)?;
+            let count_u = u64::try_from(count)?;
+            let row_grid = ops::grid(rows, 256);
+
+            unsafe {
+                s.launch_builder(&residual)
+                    .arg(&pointer(&x_ref, s))
+                    .arg(&delta)
+                    .arg(&res_scale)
+                    .arg(&count_u)
+                    .arg(&width_u)
+                    .launch(flat(count))?;
+                s.launch_builder(&rms)
+                    .arg(&pointer(&x_ref, s))
+                    .arg(&norm_scale)
+                    .arg(&1u32)
+                    .arg(&out_f32_ref_ptr)
+                    .arg(&out_bf16_ref_ptr)
+                    .arg(&width_u)
+                    .arg(&eps)
+                    .launch(row_grid)?;
+                s.launch_builder(&fused)
+                    .arg(&pointer(&x_got, s))
+                    .arg(&delta)
+                    .arg(&res_scale)
+                    .arg(&norm_scale)
+                    .arg(&out_f32_got_ptr)
+                    .arg(&out_bf16_got_ptr)
+                    .arg(&width_u)
+                    .arg(&eps)
+                    .launch(row_grid)?;
+            }
+
+            let res_ref_h = s.clone_dtoh(&x_ref)?;
+            let res_got_h = s.clone_dtoh(&x_got)?;
+            let res_diff = res_ref_h
+                .iter()
+                .zip(&res_got_h)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let out_diff = if out_f32 {
+                let a = s.clone_dtoh(&y_f32_ref)?;
+                let b = s.clone_dtoh(&y_f32_got)?;
+                a.iter()
+                    .zip(&b)
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count()
+            } else {
+                let a = s.clone_dtoh(&y_bf16_ref)?;
+                let b = s.clone_dtoh(&y_bf16_got)?;
+                a.iter()
+                    .zip(&b)
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count()
+            };
+            ensure!(
+                res_diff == 0 && out_diff == 0,
+                "scaled_residual_rms_f32 mismatch on {label}: res_diff={res_diff} out_diff={out_diff}"
+            );
+
+            if label == "video_ragged" {
+                let norm_ref_h = s.clone_dtoh(&y_bf16_ref)?;
+                // Control A: perturb delta[row=7, col=13]; assert zero cross-row bleed.
+                let (p_row, p_col) = (7usize, 13usize);
+                let idx = p_row * width + p_col;
+                let mut delta_mut_h = delta_host.clone();
+                delta_mut_h[idx] = bf16::from_f32(delta_mut_h[idx].to_f32() + 1.0);
+                let delta_mut = s.clone_htod(&delta_mut_h)?;
+                let x_mut = s.clone_htod(&x_host)?;
+                let y_mut = s.alloc_zeros::<bf16>(count)?;
+                unsafe {
+                    s.launch_builder(&fused)
+                        .arg(&pointer(&x_mut, s))
+                        .arg(&delta_mut)
+                        .arg(&res_scale)
+                        .arg(&norm_scale)
+                        .arg(&0u64)
+                        .arg(&pointer(&y_mut, s))
+                        .arg(&width_u)
+                        .arg(&eps)
+                        .launch(row_grid)?;
+                }
+                let x_mut_h = s.clone_dtoh(&x_mut)?;
+                let y_mut_h = s.clone_dtoh(&y_mut)?;
+                let mut res_hit = 0usize;
+                let mut res_bleed = 0usize;
+                for (i, (a, b)) in res_ref_h.iter().zip(&x_mut_h).enumerate() {
+                    if a.to_bits() != b.to_bits() {
+                        if i == idx {
+                            res_hit += 1;
+                        } else {
+                            res_bleed += 1;
+                        }
+                    }
+                }
+                let row_range = p_row * width..(p_row + 1) * width;
+                let mut norm_hit = 0usize;
+                let mut norm_bleed = 0usize;
+                for (i, (a, b)) in norm_ref_h.iter().zip(&y_mut_h).enumerate() {
+                    if a.to_bits() != b.to_bits() {
+                        if row_range.contains(&i) {
+                            norm_hit += 1;
+                        } else {
+                            norm_bleed += 1;
+                        }
+                    }
+                }
+                ensure!(
+                    res_hit == 1 && res_bleed == 0 && norm_hit > 0 && norm_bleed == 0,
+                    "delta control failed: res=({res_hit},{res_bleed}) norm=({norm_hit},{norm_bleed})"
+                );
+
+                // Control B: perturb norm_scale[col=13]; assert residual unchanged and norm differs only at col=13.
+                let mut ns_mut_h = norm_scale_host.clone();
+                ns_mut_h[p_col] += 0.5;
+                let ns_mut = s.clone_htod(&ns_mut_h)?;
+                let x_ns = s.clone_htod(&x_host)?;
+                let y_ns = s.alloc_zeros::<bf16>(count)?;
+                unsafe {
+                    s.launch_builder(&fused)
+                        .arg(&pointer(&x_ns, s))
+                        .arg(&delta)
+                        .arg(&res_scale)
+                        .arg(&ns_mut)
+                        .arg(&0u64)
+                        .arg(&pointer(&y_ns, s))
+                        .arg(&width_u)
+                        .arg(&eps)
+                        .launch(row_grid)?;
+                }
+                let x_ns_h = s.clone_dtoh(&x_ns)?;
+                let y_ns_h = s.clone_dtoh(&y_ns)?;
+                let ns_res_diff = res_ref_h
+                    .iter()
+                    .zip(&x_ns_h)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let mut col_hit = 0usize;
+                let mut col_bleed = 0usize;
+                for (i, (a, b)) in norm_ref_h.iter().zip(&y_ns_h).enumerate() {
+                    if a.to_bits() != b.to_bits() {
+                        if i % width == p_col {
+                            col_hit += 1;
+                        } else {
+                            col_bleed += 1;
+                        }
+                    }
+                }
+                ensure!(
+                    ns_res_diff == 0 && col_hit == rows && col_bleed == 0,
+                    "norm_scale control failed: res_diff={ns_res_diff} col=({col_hit},{col_bleed})"
+                );
+                println!(
+                    "H3_VAE_RESIDUAL_RMS_CONTROLS res_hit={res_hit}/{res_bleed} norm_row_hit={norm_hit}/{norm_bleed} col_hit={col_hit}/{col_bleed}"
+                );
+            }
+            println!(
+                "H3_VAE_RESIDUAL_RMS_PARITY case={label} rows={rows} width={width} out_f32={out_f32} res_diff={res_diff} out_diff={out_diff}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU; FF_MODEL, Derived vs Streamed full video decoder block parity"]
+    fn video_decoder_streamed_matches_derived_gpu() -> Result<()> {
+        let model = path("FF_MODEL")?;
+        let spec = VaeSpec::read(&model)?;
+        let component = model.join("vae");
+        let manifest = MappedCheckpoint::open_component(&component, "diffusion_pytorch_model")?
+            .minimax_h3_vae_manifest(&spec)?;
+        let shape = (
+            spec.chunk_latents() + spec.overlap_latents(),
+            VAE_TILE / spec.spatial_ratio,
+            VAE_TILE / spec.spatial_ratio,
+        );
+        let count = spec.latent_channels * shape.0 * shape.1 * shape.2;
+        let input_host: Vec<_> = (0..count)
+            .map(|i| bf16::from_f32((((i * 73 + 17) % 65521) as f32 - 32760.0) / 8192.0))
+            .collect();
+        let runtime =
+            std::env::temp_dir().join(format!("ff-video-streamed-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            let d = Device::new(0)?;
+            let s = &d.stream;
+            let ops = Ops::new(&d.ctx)?;
+            let mut blas = Blas::new(
+                &d,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(false, "BF16 video full tile".into())),
+            )?;
+            let run = |blas: &mut Blas, placement| -> Result<Vec<bf16>> {
+                let future = TileWork::bytes(&spec, shape) + (1 << 30);
+                let decoder =
+                    VideoDecoder::new(&d, &spec, &component, &manifest, (future, placement))?;
+                let mut work = TileWork::new(s, &spec, shape, (1, 1))?;
+                decoder.bind(blas, &work)?;
+                let input = s.clone_htod(&input_host)?;
+                let raw = s.alloc_zeros::<bf16>(work.pixels())?;
+                decoder.tile(
+                    s,
+                    blas,
+                    &mut work,
+                    &LatentVideo {
+                        data: &input,
+                        frames: shape.0,
+                        height: shape.1,
+                        width: shape.2,
+                    },
+                    (&[(0, 0)], 0),
+                    (&raw, 0),
+                )?;
+                let out = s.clone_dtoh(&raw)?;
+                drop((raw, input, work, decoder));
+                s.synchronize()?;
+                Ok(out)
+            };
+            let derived = run(&mut blas, super::super::Placement::Derived)?;
+            let streamed = run(&mut blas, super::super::Placement::Streamed)?;
+            let differing = derived
+                .iter()
+                .zip(&streamed)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            println!(
+                "VIDEO_DERIVED_VS_STREAMED_FULL_TILE len={} differing={differing}",
+                derived.len()
+            );
+            ensure!(
+                differing == 0,
+                "DEFECT Derived vs Streamed full-block parity mismatch: {differing} differing bits"
+            );
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
+        result?;
+        cleanup?;
         Ok(())
     }
 }

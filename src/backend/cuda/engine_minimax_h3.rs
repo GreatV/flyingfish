@@ -11576,8 +11576,8 @@ mod tests {
             assert!(vae::TileWork::batch_bytes(&spec, shape, 1, 28).is_err());
         }
         assert!(vae::TileWork::batch_bytes(&spec, (usize::MAX, 16, 16), 1, 28).is_err());
-        let block = 134_303_744;
-        let fixed = 12_725_424;
+        let block = 134_295_552;
+        let fixed = 13_020_336;
         let future = 7_192_309_556;
         let total = 16_000_000_000;
         let budget = crate::prefill::DensePlacement::device_budget(total, total, fixed, 0, future)?;
