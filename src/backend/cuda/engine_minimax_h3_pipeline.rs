@@ -604,7 +604,7 @@ fn run_mode<const SETUP_ONLY: bool>(
         replay.initial = (video_rows.clone(), s.clone_dtoh(&audio)?);
     }
 
-    let (video, audio, free_before) = {
+    let (video, audio, free_before, mut hoist) = {
         let (mut dit, table, adaln_plan, video_grid, audio_grid, scale) = prepare_transformer(
             (&device, &mut blas),
             (transformer, lora, gguf),
@@ -628,6 +628,10 @@ fn run_mode<const SETUP_ONLY: bool>(
         };
         let video = s.clone_htod(&video_rows)?;
         let text = s.clone_htod(&text)?;
+        let hoist = {
+            let disk_tier = !dit.hoist_ready()?;
+            super::vae::hoist_video_vae(model, disk_tier)?
+        };
         dit.sample(
             &context,
             (&table, &adaln_plan),
@@ -647,7 +651,7 @@ fn run_mode<const SETUP_ONLY: bool>(
                 .context("RUNNER_FAIL refiner trace missing")?;
         }
         let (video, audio) = (s.clone_dtoh(&video)?, s.clone_dtoh(&audio)?);
-        (video, audio, device.ctx.mem_get_info()?.0)
+        (video, audio, device.ctx.mem_get_info()?.0, hoist)
     };
     s.synchronize()?;
     ensure!(
@@ -663,8 +667,7 @@ fn run_mode<const SETUP_ONLY: bool>(
     let generated = decode::<SETUP_ONLY, false>(
         &device,
         &mut blas,
-        model,
-        request,
+        (model, request, hoist.as_mut()),
         (&geometry, &vae, &audio_spec),
         (video_latents, audio_latents),
         (free_before, super::Placement::Derived),
@@ -680,8 +683,7 @@ fn run_mode<const SETUP_ONLY: bool>(
 fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
     device: &Device,
     blas: &mut Blas,
-    model: &Path,
-    request: &H3Request,
+    (model, request, hoist): (&Path, &H3Request, Option<&mut super::vae::VaeHoist>),
     (geometry, vae, audio_spec): (&Geometry, &VaeSpec, &AudioVaeSpec),
     (video_latents, audio_latents): (Vec<f32>, Vec<f32>),
     (free_before, placement): (usize, super::Placement),
@@ -732,7 +734,14 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
     let decoder_weights = decoder_weight_bytes(&vae_manifest);
     let future =
         work_bytes + weights - decoder_weights + 3 * decode_plan.frames * pixels + (1 << 30);
-    let decoder = VideoDecoder::new(device, vae, &vae_dir, &vae_manifest, (future, placement))?;
+    let decoder = VideoDecoder::new(
+        device,
+        vae,
+        &vae_dir,
+        &vae_manifest,
+        (future, placement),
+        hoist,
+    )?;
     #[cfg(test)]
     if SETUP_ONLY {
         decoder.batch_setup(device, blas, &tiles, (latent_frames, lh, lw))?;
@@ -2709,8 +2718,7 @@ fn conv_decoder_gate<const SERIAL: bool>(
         let generated = decode::<false, SERIAL>(
             &device,
             &mut blas,
-            &model,
-            &request,
+            (&model, &request, None),
             (&geometry, &vae, &audio),
             (video, audio_input),
             (device.ctx.mem_get_info()?.0, placement),
@@ -3141,8 +3149,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
                 decode::<false, false>(
                     &device,
                     &mut blas,
-                    &model,
-                    request,
+                    (&model, request, None),
                     (&geometry, &vae, &audio_spec),
                     latents,
                     (device.ctx.mem_get_info()?.0, super::Placement::Derived),

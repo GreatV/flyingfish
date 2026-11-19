@@ -5330,6 +5330,18 @@ impl Dit {
         s.synchronize()?;
         Ok(())
     }
+    /// Joins the streaming fills and reports whether the placement keeps every layer off the
+    /// disk tier (the hoist guard).
+    pub(crate) fn hoist_ready(&mut self) -> Result<bool> {
+        match self.tier.as_mut() {
+            Some(tier) => {
+                tier.ready()?;
+                Ok(tier.dense.plan.disk_bytes == 0)
+            }
+            None => Ok(true),
+        }
+    }
+
     /// One teacher-forced evaluation; the velocities land in `self.video` and `self.audio`.
     pub(crate) fn step(
         &mut self,
@@ -12469,6 +12481,7 @@ mod tests {
                         &dir,
                         &manifest,
                         (0, Placement::Derived),
+                        None,
                     )?;
                     let tiles = crate::minimax_h3::VaeTiles::released(
                         &spec,
