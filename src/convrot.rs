@@ -442,7 +442,14 @@ const PRODUCT_BM: u32 = 128;
 #[cfg(feature = "cuda")]
 const PRODUCT_BN: u32 = 256;
 #[cfg(feature = "cuda")]
-const PRODUCT_SMEM: u32 = 61_440;
+impl ProductKernel {
+    const fn shared_mem_bytes(self) -> u32 {
+        match self {
+            Self::MFastLdsm => 49_152,
+            Self::NFast | Self::NFastLdsm => 61_440,
+        }
+    }
+}
 
 #[cfg(feature = "cuda")]
 fn product_function(
@@ -454,12 +461,12 @@ fn product_function(
         ProductKernel::MFastLdsm => "convrot_product_m_fast",
         ProductKernel::NFastLdsm => "convrot_product_n_fast_ldsm",
     };
-    let product = module.load_function(name)?;
-    product.set_attribute(
+    let function = module.load_function(name)?;
+    function.set_attribute(
         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        i32::try_from(PRODUCT_SMEM)?,
+        i32::try_from(product.shared_mem_bytes())?,
     )?;
-    Ok(product)
+    Ok(function)
 }
 
 #[cfg(feature = "cuda")]
@@ -476,7 +483,7 @@ pub(crate) fn gate_up_product_order(
     let active = product_function(&module, ProductKernel::MFastLdsm)?
         .occupancy_max_active_blocks_per_multiprocessor(
             PRODUCT_THREADS,
-            PRODUCT_SMEM as usize,
+            ProductKernel::MFastLdsm.shared_mem_bytes() as usize,
             None,
         )?;
     ensure!(active > 0, "convrot M-fast product has no resident CTA");
@@ -664,7 +671,7 @@ pub(crate) fn launch_product(
             .launch(LaunchConfig {
                 grid_dim: grid,
                 block_dim: (PRODUCT_THREADS, 1, 1),
-                shared_mem_bytes: PRODUCT_SMEM,
+                shared_mem_bytes: args.product.shared_mem_bytes(),
             })?;
     }
     Ok(())
