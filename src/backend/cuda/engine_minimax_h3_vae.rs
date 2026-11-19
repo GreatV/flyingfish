@@ -1500,7 +1500,14 @@ pub(super) fn hoist_video_vae(model: &Path, disk_tier: bool) -> Result<Option<Va
     let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
         "/",
     ))?)?;
-    let fits = available >= total + (4 << 30);
+    // The arena stays live while decode senses host memory for the decoder's pinned tier,
+    // so admission reserves that tier too (bounded by the full runtime bytes).
+    let fits = available
+        >= total
+            .checked_mul(2)
+            .context("video hoist admission overflow")?
+            .checked_add(4 << 30)
+            .context("video hoist admission overflow")?;
     let decision = if !reason.is_empty() {
         reason
     } else if fits {
