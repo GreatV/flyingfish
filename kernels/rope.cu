@@ -1,4 +1,18 @@
 #include "rotary.cuh"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+// sm75 16-bit load is cvt.f32.f16. sm75 16-bit store is cvt.rn.f16.f32.
+#include "ff_sm75_f16.cuh"
+#define __bfloat162float(v) ff_f32_from_f16((v))
+#define __bfloat1622float2(v) ff_f32x2((v))
+#define __float2bfloat16(v) ff_f16_from_f32<__nv_bfloat16>((v))
+#define __float2bfloat16_rn(v) ff_f16_from_f32<__nv_bfloat16>((v))
+#define __floats2bfloat162_rn(a, b) ff_f16x2((a), (b))
+#define __hadd(a, b) ff_hadd((a), (b))
+#define __hadd2(a, b) ff_hadd2((a), (b))
+#define __hsub(a, b) ff_hsub((a), (b))
+#define __hmul(a, b) ff_hmul((a), (b))
+#endif
+
 
 extern "C" __global__ void rotary_prefix_kv_f32(float* q,
     const float* key, const float* value, float* k, float* v, const float* table,

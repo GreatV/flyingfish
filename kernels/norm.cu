@@ -1,3 +1,911 @@
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+// sm75 16-bit load is cvt.f32.f16. sm75 16-bit store is cvt.rn.f16.f32.
+// RMSNorm, fused residual-add + RMSNorm, and residual add. BF16 in / BF16 out with
+// FP32 internal math; 16-byte vector I/O (8 bf16 per load/store), warp-shuffle block
+// reduction, register-cached single pass (re-reads the row only when it does not fit
+// in registers).
+//
+// Semantics
+//   rms_norm:    y[r][d] = x[r][d] * rsqrt(mean_d(x[r][.]^2) + eps) * w[d]
+//   gated_add_rms_norm_modulate:
+//                x[r][d] = bf16(x[r][d] + bf16(gate[pg][d] * y[r][d]))
+//                out[r] = rms_norm_modulate(stored x[r], w, shift[pn], scale[pn])
+//                pg = gate_index[r], pn = norm_index[r]. Variance reads the stored BF16 x.
+//   add_rmsnorm: res_out[r][d] = bf16(res[r][d] + x[r][d])   (add in fp32, one round)
+//                y[r][d] = bf16(res_out[r][d]) * rsqrt(mean_d(res_out[r][.]^2) + eps) * w[d]
+//                (the norm consumes the rounded residual as stored)
+//   add_rmsnorm_fp32: same BF16 residual store; variance and normalization
+//                consume the unrounded FP32 sum.
+//   residual:    x[i] = bf16(x[i] + y[i])   (__hadd2 per pair)
+//   rms_norm/add_rmsnorm compute x*rstd*w in fp32 and round once at the store.
+//   All reductions accumulate in fp32.
+//
+// Layout / contract
+//   * All tensors contiguous BF16 device buffers, element stride 1. x, y, res,
+//     res_out are row-major [rows][dim]; w is one shared row of length dim.
+//   * The 8-wide vector path is taken when dim % 8 == 0 (rms_norm, add_rmsnorm)
+//     or n % 8 == 0 (residual) and requires 16-byte base alignment; any other
+//     extent takes the scalar path.
+//   * rms_norm / add_rmsnorm: one block per row, gridDim.x == rows. blockDim.x
+//     must be a multiple of 32 and <= 1024.
+//   * add_rmsnorm: res_out may equal res (in place); res/res_out are not
+//     __restrict__. x, w, y must not alias any output.
+//   * residual: grid-stride over ceil(n/8) chunks (vector) or n elements
+//     (scalar); any grid >= 1 block is correct.
+//   * No global state; 128 B static __shared__ scratch per block. CUDA-Graph
+//     capturable.
+
+#include "gpu_compat.cuh"
+#include "rotary.cuh"
+#include "ff_sm75_f16.cuh"
+#define __bfloat162float(v) ff_f32_from_f16((v))
+#define __bfloat1622float2(v) ff_f32x2((v))
+#define __float2bfloat16(v) ff_f16_from_f32<__nv_bfloat16>((v))
+#define __float2bfloat16_rn(v) ff_f16_from_f32<__nv_bfloat16>((v))
+#define __floats2bfloat162_rn(a, b) ff_f16x2((a), (b))
+#define __hadd(a, b) ff_hadd((a), (b))
+#define __hadd2(a, b) ff_hadd2((a), (b))
+#define __hsub(a, b) ff_hsub((a), (b))
+#define __hmul(a, b) ff_hmul((a), (b))
+
+namespace {
+
+// Max elements cached per thread in registers. Rows that do not fit take a
+// strided loop that re-reads the row.
+constexpr int kMaxPerThread = 8;
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FF_WARP_MASK, v, o);
+  return v;
+}
+
+// blockDim.x must be a multiple of 32.
+__device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
+  const int tid = threadIdx.x;
+  const int nw = blockDim.x >> 5;
+  v = warp_reduce_sum(v);
+  if ((tid & 31) == 0) smem[tid >> 5] = v;
+  __syncthreads();
+  if (tid < 32) {
+    float t = (tid < nw) ? smem[tid] : 0.0f;
+    t = warp_reduce_sum(t);
+    if (tid == 0) smem[0] = t;
+  }
+  __syncthreads();
+  return smem[0];
+}
+
+// Load VEC contiguous bf16 -> float[VEC]. Requires n % VEC == 0 and
+// VEC*2-byte pointer alignment.
+template <int VEC>
+__device__ __forceinline__ void ld_vec(const __nv_bfloat16* __restrict__ p,
+                                       float* __restrict__ f) {
+  if constexpr (VEC % 8 == 0) {
+    union U { float4 v; __nv_bfloat162 h[4]; } u;
+    u.v = *reinterpret_cast<const float4*>(p);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      float2 t = __bfloat1622float2(u.h[k]);
+      f[2 * k] = t.x;
+      f[2 * k + 1] = t.y;
+    }
+  } else if constexpr (VEC % 4 == 0) {
+    union U { float2 v; __nv_bfloat162 h[2]; } u;
+    u.v = *reinterpret_cast<const float2*>(p);
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      float2 t = __bfloat1622float2(u.h[k]);
+      f[2 * k] = t.x;
+      f[2 * k + 1] = t.y;
+    }
+  } else if constexpr (VEC % 2 == 0) {
+    __nv_bfloat162 h = *reinterpret_cast<const __nv_bfloat162*>(p);
+    float2 t = __bfloat1622float2(h);
+    f[0] = t.x;
+    f[1] = t.y;
+  } else {
+#pragma unroll
+    for (int k = 0; k < VEC; ++k) f[k] = __bfloat162float(p[k]);
+  }
+}
+
+template <int VEC>
+__device__ __forceinline__ void st_vec(__nv_bfloat16* __restrict__ p,
+                                       const float* __restrict__ f) {
+  if constexpr (VEC % 8 == 0) {
+    union U { float4 v; __nv_bfloat162 h[4]; } u;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) u.h[k] = __floats2bfloat162_rn(f[2 * k], f[2 * k + 1]);
+    *reinterpret_cast<float4*>(p) = u.v;
+  } else if constexpr (VEC % 4 == 0) {
+    union U { float2 v; __nv_bfloat162 h[2]; } u;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) u.h[k] = __floats2bfloat162_rn(f[2 * k], f[2 * k + 1]);
+    *reinterpret_cast<float2*>(p) = u.v;
+  } else if constexpr (VEC % 2 == 0) {
+    *reinterpret_cast<__nv_bfloat162*>(p) = __floats2bfloat162_rn(f[0], f[1]);
+  } else {
+#pragma unroll
+    for (int k = 0; k < VEC; ++k) p[k] = __float2bfloat16(f[k]);
+  }
+}
+
+// Store BF16 bits already rounded by __float2bfloat16_rn. VEC is 8.
+template <int VEC>
+__device__ __forceinline__ void st_raw_vec(__nv_bfloat16* __restrict__ p,
+                                          const __nv_bfloat16* __restrict__ h) {
+  static_assert(VEC == 8, "gated residual store is 8-wide");
+  union U { float4 v; __nv_bfloat16 e[8]; } u;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) u.e[k] = h[k];
+  *reinterpret_cast<float4*>(p) = u.v;
+}
+
+template <bool BF16_SCALE>
+__device__ __forceinline__ float norm_scale(float x, float inv, float weight) {
+  const float normalized = x * inv;
+  if constexpr (BF16_SCALE) return __bfloat162float(__float2bfloat16(normalized)) * weight;
+  return normalized * weight;
+}
+
+// One block normalizes one row of n elements (nthr = blockDim.x, gid = threadIdx.x).
+template <bool MODULATE>
+__device__ __forceinline__ float rmsnorm_epilogue(float value,
+                                                const __nv_bfloat16* shift,
+                                                const __nv_bfloat16* scale,
+                                                size_t at) {
+  if constexpr (MODULATE) {
+    const float weighted = __bfloat162float(__float2bfloat16(value));
+    const float factor = __bfloat162float(__float2bfloat16(1.0f + __bfloat162float(scale[at])));
+    const float scaled = __bfloat162float(__float2bfloat16(weighted * factor));
+    return scaled + __bfloat162float(shift[at]);
+  }
+  return value;
+}
+
+template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true, bool MODULATE = false>
+__device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
+                                            const __nv_bfloat16* __restrict__ w,
+                                            __nv_bfloat16* __restrict__ y, int n,
+                                            float eps,
+                                            const __nv_bfloat16* shift = nullptr,
+                                            const __nv_bfloat16* scale = nullptr) {
+  __shared__ float smem[32];
+  const int nthr = blockDim.x;
+  const int gid = threadIdx.x;
+  const int nv = n / VEC;                              // caller guarantees n % VEC == 0
+  const bool cached = (nv <= nthr * (kMaxPerThread / VEC));   // block-uniform
+
+  float r[kMaxPerThread];
+  float ssq = 0.0f;
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        ld_vec<VEC>(x + (size_t)c * VEC, r + i * VEC);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) ssq += r[i * VEC + j] * r[i * VEC + j];
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      ld_vec<VEC>(x + (size_t)c * VEC, r);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) ssq += r[j] * r[j];
+    }
+  }
+  const float rstd = rsqrtf(block_reduce_sum(ssq, smem) / (float)n + eps);
+
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        const size_t idx = (size_t)c * VEC;
+        float ww[VEC], out[VEC];
+        ld_vec<VEC>(w + idx, ww);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j)
+          out[j] = rmsnorm_epilogue<MODULATE>(
+              norm_scale<BF16_SCALE>(r[i * VEC + j], rstd, ww[j]), shift, scale, idx + j);
+        st_vec<VEC>(y + idx, out);
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      const size_t idx = (size_t)c * VEC;
+      float ww[VEC], out[VEC];
+      ld_vec<VEC>(x + idx, r);
+      ld_vec<VEC>(w + idx, ww);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j)
+        out[j] = rmsnorm_epilogue<MODULATE>(
+            norm_scale<BF16_SCALE>(r[j], rstd, ww[j]), shift, scale, idx + j);
+      st_vec<VEC>(y + idx, out);
+    }
+  }
+}
+
+// One block: gated residual into x, then rmsnorm_row<VEC, false, true, true> on that row.
+// ROUND_VARIANCE false squares the pre-round f32 sum and is the parity control.
+template <int VEC, bool ROUND_VARIANCE>
+__device__ __forceinline__ void gated_add_rmsnorm_row(
+    __nv_bfloat16* x, const __nv_bfloat16* y, const __nv_bfloat16* gate_row,
+    const __nv_bfloat16* __restrict__ w, __nv_bfloat16* out,
+    const __nv_bfloat16* shift, const __nv_bfloat16* scale, int n, float eps) {
+  __shared__ float smem[32];
+  const int nthr = blockDim.x;
+  const int gid = threadIdx.x;
+  const int nv = n / VEC;
+  const bool cached = (nv <= nthr * (kMaxPerThread / VEC));
+  if (!ROUND_VARIANCE && !cached) __trap();
+
+  float r[kMaxPerThread];
+  float ssq = 0.0f;
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        const size_t idx = (size_t)c * VEC;
+        float xv[VEC], yv[VEC], gv[VEC];
+        __nv_bfloat16 bits[VEC];
+        ld_vec<VEC>(x + idx, xv);
+        ld_vec<VEC>(y + idx, yv);
+        ld_vec<VEC>(gate_row + idx, gv);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+          const __nv_bfloat16 gated = __float2bfloat16_rn(gv[j] * yv[j]);
+          const float pre = xv[j] + __bfloat162float(gated);
+          bits[j] = __float2bfloat16_rn(pre);
+          const float variance = ROUND_VARIANCE ? __bfloat162float(bits[j]) : pre;
+          r[i * VEC + j] = variance;
+          ssq += variance * variance;
+        }
+        st_raw_vec<VEC>(x + idx, bits);
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      const size_t idx = (size_t)c * VEC;
+      float xv[VEC], yv[VEC], gv[VEC];
+      __nv_bfloat16 bits[VEC];
+      ld_vec<VEC>(x + idx, xv);
+      ld_vec<VEC>(y + idx, yv);
+      ld_vec<VEC>(gate_row + idx, gv);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        const __nv_bfloat16 gated = __float2bfloat16_rn(gv[j] * yv[j]);
+        const float pre = xv[j] + __bfloat162float(gated);
+        bits[j] = __float2bfloat16_rn(pre);
+        const float variance = __bfloat162float(bits[j]);
+        ssq += variance * variance;
+      }
+      st_raw_vec<VEC>(x + idx, bits);
+    }
+  }
+  const float rstd = rsqrtf(block_reduce_sum(ssq, smem) / (float)n + eps);
+
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        const size_t idx = (size_t)c * VEC;
+        float ww[VEC], outv[VEC];
+        ld_vec<VEC>(w + idx, ww);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j)
+          outv[j] = rmsnorm_epilogue<true>(
+              norm_scale<false>(r[i * VEC + j], rstd, ww[j]), shift, scale, idx + j);
+        st_vec<VEC>(out + idx, outv);
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      const size_t idx = (size_t)c * VEC;
+      float xv[VEC], ww[VEC], outv[VEC];
+      ld_vec<VEC>(x + idx, xv);
+      ld_vec<VEC>(w + idx, ww);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j)
+        outv[j] = rmsnorm_epilogue<true>(
+            norm_scale<false>(xv[j], rstd, ww[j]), shift, scale, idx + j);
+      st_vec<VEC>(out + idx, outv);
+    }
+  }
+}
+
+// Fused residual add + RMSNorm over one row per block. res/res_out are not
+// __restrict__: res_out == res (in-place residual stream) is supported.
+template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true, bool WEIGHTED = true>
+__device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict__ x,
+                                                const __nv_bfloat16* res,
+                                                const __nv_bfloat16* __restrict__ w,
+                                                __nv_bfloat16* __restrict__ y,
+                                                __nv_bfloat16* res_out, int n,
+                                                float eps, float* unrounded) {
+  __shared__ float smem[32];
+  const int nthr = blockDim.x;
+  const int gid = threadIdx.x;
+  const int nv = n / VEC;
+  const bool cached = (nv <= nthr * (kMaxPerThread / VEC));
+
+  float rr[kMaxPerThread];
+  float ssq = 0.0f;
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        const size_t idx = (size_t)c * VEC;
+        float a[VEC], b[VEC];
+        ld_vec<VEC>(x + idx, a);
+        ld_vec<VEC>(res + idx, b);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+          const float summed = b[j] + a[j];
+          const __nv_bfloat16 s = __float2bfloat16(summed);
+          res_out[idx + j] = s;
+          if constexpr (ROUND_RESIDUAL) b[j] = __bfloat162float(s);
+          else {
+            if (!cached) unrounded[idx + j] = summed;
+            b[j] = summed;
+          }
+          rr[i * VEC + j] = b[j];
+          ssq += b[j] * b[j];
+        }
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      const size_t idx = (size_t)c * VEC;
+      float a[VEC], b[VEC];
+      ld_vec<VEC>(x + idx, a);
+      ld_vec<VEC>(res + idx, b);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        const float summed = b[j] + a[j];
+        const __nv_bfloat16 s = __float2bfloat16(summed);
+        res_out[idx + j] = s;
+        if constexpr (ROUND_RESIDUAL) b[j] = __bfloat162float(s);
+        else unrounded[idx + j] = summed;
+        ssq += b[j] * b[j];
+      }
+    }
+  }
+  const float rstd = rsqrtf(block_reduce_sum(ssq, smem) / (float)n + eps);
+
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        const size_t idx = (size_t)c * VEC;
+        float ww[VEC], out[VEC];
+        if constexpr (WEIGHTED) ld_vec<VEC>(w + idx, ww);
+        else {
+#pragma unroll
+          for (int j = 0; j < VEC; ++j) ww[j] = 1.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(rr[i * VEC + j], rstd, ww[j]);
+        st_vec<VEC>(y + idx, out);
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      const size_t idx = (size_t)c * VEC;
+        float b[VEC], ww[VEC], out[VEC];
+        if constexpr (ROUND_RESIDUAL) ld_vec<VEC>(res_out + idx, b);
+        else {
+#pragma unroll
+          for (int j = 0; j < VEC; ++j) b[j] = unrounded[idx + j];
+        }
+      if constexpr (WEIGHTED) ld_vec<VEC>(w + idx, ww);
+      else {
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) ww[j] = 1.0f;
+      }
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(b[j], rstd, ww[j]);
+      st_vec<VEC>(y + idx, out);
+    }
+  }
+}
+
+}  // namespace
+
+extern "C" {
+
+// y[r][:] = rmsnorm(x[r][:], w) — one block per row, grid == rows.
+__global__ __launch_bounds__(1024) void rms_norm(const __nv_bfloat16* x,
+                                                 const __nv_bfloat16* w,
+                                                 __nv_bfloat16* y, int rows, int dim,
+                                                 float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0) rmsnorm_row<8>(x + off, w, y + off, dim, eps);
+  else                rmsnorm_row<1>(x + off, w, y + off, dim, eps);
+}
+
+// res_out[r][:] = bf16(res[r][:] + x[r][:]); y[r][:] = rmsnorm(res_out[r][:], w).
+// One block per row, grid == rows. res_out may alias res (in place).
+__global__ __launch_bounds__(1024) void add_rmsnorm(const __nv_bfloat16* x,
+                                                    const __nv_bfloat16* res,
+                                                    const __nv_bfloat16* w,
+                                                    __nv_bfloat16* y,
+                                                    __nv_bfloat16* res_out, int rows,
+                                                    int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+}
+
+// The residual stream stores BF16; RMS variance and normalization consume the
+// unrounded FP32 sum.
+__global__ __launch_bounds__(1024) void add_rmsnorm_fp32(const __nv_bfloat16* x,
+                                                          const __nv_bfloat16* res,
+                                                          const __nv_bfloat16* w,
+                                                          __nv_bfloat16* y,
+                                                          __nv_bfloat16* res_out,
+                                                          int rows, int dim,
+                                                          float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8, false, false>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1, false, false>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+}
+
+// Normalized values round to BF16 before multiplication by the BF16 weight.
+__global__ __launch_bounds__(1024) void rms_norm_bf16(const __nv_bfloat16* x,
+                                                    const __nv_bfloat16* w,
+                                                    __nv_bfloat16* y, int rows, int dim,
+                                                    float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0) rmsnorm_row<8, true>(x + off, w, y + off, dim, eps);
+  else                rmsnorm_row<1, true>(x + off, w, y + off, dim, eps);
+}
+
+// Dense indices select BF16 shift/scale rows; each arithmetic boundary rounds to BF16.
+__global__ __launch_bounds__(768, 2) void rms_norm_modulate_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y,
+    const __nv_bfloat16* shift, const __nv_bfloat16* scale, const unsigned* index,
+    int rows, int dim, float eps, unsigned long long stride, unsigned entries) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned p = index[row];
+  if (p >= entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  const size_t param = (size_t)p * stride;
+  rmsnorm_row<8, true, true, true>(x + off, w, y + off, dim, eps,
+                                  shift + param, scale + param);
+}
+
+// Weight multiplies in f32. Stores round the weighted value, 1+scale, that product, and the shift add to BF16.
+__global__ __launch_bounds__(768, 2) void rms_norm_modulate(
+    const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* y,
+    const __nv_bfloat16* shift, const __nv_bfloat16* scale, const unsigned* index,
+    int rows, int dim, float eps, unsigned long long stride, unsigned entries) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned p = index[row];
+  if (p >= entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  const size_t param = (size_t)p * stride;
+  rmsnorm_row<8, false, true, true>(x + off, w, y + off, dim, eps,
+                                   shift + param, scale + param);
+}
+
+// x is updated in place. out may alias y. Variance reads the stored BF16 residual.
+__global__ __launch_bounds__(768, 2) void gated_add_rms_norm_modulate(
+    __nv_bfloat16* x, const __nv_bfloat16* y, const __nv_bfloat16* gate,
+    const unsigned* gate_index, unsigned long long gate_stride, unsigned gate_entries,
+    const __nv_bfloat16* w, __nv_bfloat16* out, const __nv_bfloat16* shift,
+    const __nv_bfloat16* scale, const unsigned* norm_index, unsigned long long norm_stride,
+    unsigned norm_entries, int rows, int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned pg = gate_index[row];
+  const unsigned pn = norm_index[row];
+  if (pg >= gate_entries || pn >= norm_entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  gated_add_rmsnorm_row<8, true>(
+      x + off, y + off, gate + (size_t)pg * gate_stride, w, out + off,
+      shift + (size_t)pn * norm_stride, scale + (size_t)pn * norm_stride, dim, eps);
+}
+
+// Residual store matches gated_add_rms_norm_modulate. Variance uses the pre-round f32 sum.
+__global__ __launch_bounds__(768, 2) void gated_add_rms_norm_modulate_raw_var(
+    __nv_bfloat16* x, const __nv_bfloat16* y, const __nv_bfloat16* gate,
+    const unsigned* gate_index, unsigned long long gate_stride, unsigned gate_entries,
+    const __nv_bfloat16* w, __nv_bfloat16* out, const __nv_bfloat16* shift,
+    const __nv_bfloat16* scale, const unsigned* norm_index, unsigned long long norm_stride,
+    unsigned norm_entries, int rows, int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned pg = gate_index[row];
+  const unsigned pn = norm_index[row];
+  if (pg >= gate_entries || pn >= norm_entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  gated_add_rmsnorm_row<8, false>(
+      x + off, y + off, gate + (size_t)pg * gate_stride, w, out + off,
+      shift + (size_t)pn * norm_stride, scale + (size_t)pn * norm_stride, dim, eps);
+}
+
+__global__ __launch_bounds__(1024) void add_rmsnorm_bf16(const __nv_bfloat16* x,
+                                                       const __nv_bfloat16* res,
+                                                       const __nv_bfloat16* w,
+                                                       __nv_bfloat16* y,
+                                                       __nv_bfloat16* res_out, int rows,
+                                                       int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8, true>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1, true>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+}
+
+// x[i] += y[i] in bf16, flat grid-stride.
+__global__ __launch_bounds__(1024) void residual(__nv_bfloat16* x,
+                                                 const __nv_bfloat16* y, int n) {
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nthr = blockDim.x * gridDim.x;
+  if ((n & 7) == 0) {
+    const int nv = n >> 3;
+    for (int c = gid; c < nv; c += nthr) {
+      union U { float4 v; __nv_bfloat162 h[4]; } a, b;
+      a.v = *reinterpret_cast<const float4*>(x + (size_t)c * 8);
+      b.v = *reinterpret_cast<const float4*>(y + (size_t)c * 8);
+#pragma unroll
+      for (int k = 0; k < 4; ++k) a.h[k] = __hadd2(a.h[k], b.h[k]);
+      *reinterpret_cast<float4*>(x + (size_t)c * 8) = a.v;
+    }
+  } else {
+    for (int i = gid; i < n; i += nthr) x[i] = __hadd(x[i], y[i]);
+  }
+}
+
+}  // extern "C"
+
+extern "C" __global__ void add_rmsnorm_unit(const __nv_bfloat16* x,
+    const __nv_bfloat16* res, __nv_bfloat16* y, __nv_bfloat16* res_out,
+    int rows, int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8, false, true, false>(x + off, res + off, nullptr, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1, false, true, false>(x + off, res + off, nullptr, y + off, res_out + off, dim, eps, nullptr);
+}
+
+namespace {
+
+__device__ __forceinline__ float l2_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float l2_to_f32(__half v) { return __half2float(v); }
+__device__ __forceinline__ float l2_to_f32(float v) { return v; }
+
+template <typename T>
+__device__ __forceinline__ T l2_from_f32(float v);
+template <>
+__device__ __forceinline__ __nv_bfloat16 l2_from_f32<__nv_bfloat16>(float v) {
+  return __float2bfloat16_rn(v);
+}
+template <>
+__device__ __forceinline__ __half l2_from_f32<__half>(float v) {
+  return __float2half_rn(v);
+}
+template <>
+__device__ __forceinline__ float l2_from_f32<float>(float v) {
+  return v;
+}
+
+template <typename InT, typename OutT, bool ascending_warp = false>
+__device__ __forceinline__ void l2_norm_scale_impl(
+    const InT* x, const float* gamma, OutT* y, int rows, int heads, int dim,
+    float scale, float eps, int head_major_seq_len) {
+  if (!x || !gamma || !y || rows < 1 || heads < 1 || dim < 1 ||
+      (blockDim.x & 31) != 0 || blockDim.x > 1024 || !(eps > 0.0f) ||
+      !isfinite(scale) || head_major_seq_len < 0 ||
+      (head_major_seq_len > 0 && (rows % head_major_seq_len) != 0)) {
+    __trap();
+    return;
+  }
+  const int slice = blockIdx.x;
+  if (slice >= rows * heads) return;
+  const int row = slice / heads;
+  const int head = slice % heads;
+  const InT* xs = x + (size_t)slice * dim;
+  const float* gs = gamma + (size_t)head * dim;
+  size_t dst_slice = (size_t)slice;
+  if (head_major_seq_len > 0) {
+    const int b = row / head_major_seq_len;
+    const int l = row % head_major_seq_len;
+    dst_slice = ((size_t)(b * heads + head) * (size_t)head_major_seq_len + (size_t)l);
+  }
+  OutT* ys = y + dst_slice * dim;
+  __shared__ float smem[32];
+  float ssq = 0.0f;
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float v = l2_to_f32(xs[d]);
+    ssq = __fadd_rn(ssq, __fmul_rn(v, v));
+  }
+  float total;
+  if constexpr (ascending_warp) {
+    if (blockDim.x != 32) { __trap(); return; }
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(FF_WARP_MASK, ssq, offset));
+    total = ssq;
+  } else {
+    total = block_reduce_sum(ssq, smem);
+  }
+  const float denom = fmaxf(__fsqrt_rn(total), eps);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float v = l2_to_f32(xs[d]);
+    const float normed = __fdiv_rn(v, denom);
+    const float scaled = __fmul_rn(__fmul_rn(normed, gs[d]), scale);
+    ys[d] = l2_from_f32<OutT>(scaled);
+  }
+}
+
+}  // namespace
+
+extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_f16(
+    const __half* x, const float* gamma, __half* y, int rows, int heads,
+    int dim, float scale, float eps, int head_major_seq_len) {
+  l2_norm_scale_impl<__half, __half>(
+      x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
+}
+
+extern "C" __global__ __launch_bounds__(128, 12) void qkv_rope_l2_d96_f16(
+    const __half* packed, const float* rotary, const float* q_gamma,
+    const float* k_gamma, __half* q, __half* k, __half* v,
+    int rows, int heads, float scale, float eps) {
+  if (!packed || !rotary || !q_gamma || !k_gamma || !q || !k || !v ||
+      rows < 1 || heads < 1 || blockDim.x != 128 || blockDim.y != 1 ||
+      blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+      !isfinite(scale) || !(eps > 0.0f)) { __trap(); return; }
+  const int slice = blockIdx.x * 4 + threadIdx.x / 32;
+  if (slice >= rows * heads) return;
+  const int lane = threadIdx.x & 31;
+  const int row = slice / heads;
+  const int head = slice % heads;
+  const size_t input = ((size_t)row * 3 * heads + head) * 96;
+  const size_t head_major = ((size_t)head * rows + row) * 96;
+  for (int part = 0; part < 2; ++part) {
+    float values[3];
+    float ssq = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const int d = lane + 32 * i;
+      const float value = __half2float(packed[input + (size_t)part * heads * 96 + d]);
+      const float mate = __shfl_xor_sync(FF_WARP_MASK, value, 1);
+      const float a = (lane & 1) ? mate : value;
+      const float b = (lane & 1) ? value : mate;
+      const float phase = rotary[(size_t)row * 96 + d];
+      const float phase_mate = __shfl_xor_sync(FF_WARP_MASK, phase, 1);
+      const float c = (lane & 1) ? phase_mate : phase;
+      const float s = (lane & 1) ? phase : phase_mate;
+      const float rotated = (lane & 1) ? a * s + b * c : a * c - b * s;
+      values[i] = __half2float(__float2half_rn(rotated));
+      ssq = __fadd_rn(ssq, __fmul_rn(values[i], values[i]));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(FF_WARP_MASK, ssq, offset));
+    ssq = lane == 0 ? ssq : 0.0f;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(FF_WARP_MASK, ssq, offset));
+    const float denom = fmaxf(__fsqrt_rn(ssq), eps);
+    const float* gamma = part == 0 ? q_gamma : k_gamma;
+    __half* output = part == 0 ? q : k;
+    const size_t base = part == 0 ? (size_t)slice * 96 : head_major;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const int d = lane + 32 * i;
+      const float normed = __fdiv_rn(values[i], denom);
+      const float scaled = __fmul_rn(__fmul_rn(normed, gamma[head * 96 + d]), scale);
+      output[base + d] = __float2half_rn(scaled);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const int d = lane + 32 * i;
+    v[head_major + d] = packed[input + (size_t)2 * heads * 96 + d];
+  }
+}
+
+extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_f32(
+    const float* x, const float* gamma, float* y, int rows, int heads,
+    int dim, float scale, float eps, int head_major_seq_len) {
+  l2_norm_scale_impl<float, float>(
+      x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
+}
+
+extern "C" __global__ __launch_bounds__(1024) void residual_f16(
+    __half* x, const __half* y, int n) {
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nthr = blockDim.x * gridDim.x;
+  for (int i = gid; i < n; i += nthr) {
+    x[i] = __float2half_rn(__fadd_rn(__half2float(x[i]), __half2float(y[i])));
+  }
+}
+
+extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_bf16(
+    const __nv_bfloat16* x, const float* gamma, __nv_bfloat16* y, int rows,
+    int heads, int dim, float scale, float eps, int head_major_seq_len) {
+  l2_norm_scale_impl<__nv_bfloat16, __nv_bfloat16, true>(
+      x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
+}
+extern "C" __global__ __launch_bounds__(256) void sample_std_f32(
+    const float* x, float* output, unsigned long long count, int population) {
+  if (!x || !output || count < 2 || blockDim.x != 256 || gridDim.x != 1 ||
+      population < 0 || population > 1) { __trap(); return; }
+  __shared__ float partial[32];
+  float sum = 0.0f;
+  for (unsigned long long i = threadIdx.x; i < count; i += 256)
+    sum = __fadd_rn(sum, x[i]);
+  const float mean = __fdiv_rn(block_reduce_sum(sum, partial), (float)count);
+  __syncthreads();
+  float squares = 0.0f;
+  for (unsigned long long i = threadIdx.x; i < count; i += 256) {
+    const float value = population ? x[i] : __fsub_rn(x[i], mean);
+    squares = __fadd_rn(squares, __fmul_rn(value, value));
+  }
+  const float total = block_reduce_sum(squares, partial);
+  const float variance = population
+      ? __fsub_rn(__fdiv_rn(total, (float)count), __fmul_rn(mean, mean))
+      : __fdiv_rn(total, (float)(count - 1));
+  if (!(variance >= 0.0f) || !isfinite(variance)) { __trap(); return; }
+  if (threadIdx.x == 0) *output = __fsqrt_rn(variance);
+}
+
+namespace {
+
+constexpr int kQkRopeWarps = 8;
+constexpr int kQkRopeThreads = kQkRopeWarps * 32;
+constexpr int kQkRopeMaxDim = 256;
+
+__device__ __forceinline__ bool qk_rope_aligned(const void* p) {
+  return ((uintptr_t)p & 15) == 0;
+}
+
+__device__ __forceinline__ int qk_rope_setup(
+    const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ s_w,
+    int rows, int heads, int dim, int rotary, int capacity, int start,
+    size_t* out_hr, int* out_head, int* out_pos) {
+  if (blockDim.x != kQkRopeThreads || rows <= 0 || heads <= 0 || dim <= 0 ||
+      dim > kQkRopeMaxDim || (dim & 7) != 0 || rotary < 0 || rotary > dim || (rotary & 1) != 0 ||
+      !qk_rope_aligned(w)) {
+    __trap();
+    return 0;
+  }
+  const int tid = threadIdx.x;
+  const int nv = dim >> 3;
+  if (tid < nv) {
+    *reinterpret_cast<uint4*>(&s_w[tid * 8]) = *reinterpret_cast<const uint4*>(&w[tid * 8]);
+  }
+  __syncthreads();
+  const int warp = tid >> 5;
+  const size_t total = (size_t)rows * heads;
+  const size_t hr = (size_t)blockIdx.x * kQkRopeWarps + warp;
+  if (hr >= total) return 0;
+  const int row = (int)(hr / heads);
+  const int head = (int)(hr % heads);
+  const int pos = start + row;
+  if (pos < 0 || pos >= capacity) {
+    __trap();
+    return 0;
+  }
+  *out_hr = hr;
+  *out_head = head;
+  *out_pos = pos;
+  return 1;
+}
+
+// Normalizes one [row, head] via 32-lane warp_reduce_sum over ld_vec<8> and applies split-half RoPE in s_buf.
+__device__ __forceinline__ void qk_rope_norm_head(
+    const __nv_bfloat16* x_head, const __nv_bfloat16* __restrict__ s_w,
+    __nv_bfloat16* buf, const __nv_bfloat16* __restrict__ table,
+    int pos, int dim, int rotary, float eps) {
+  const int lane = threadIdx.x & 31;
+  const int nv = dim >> 3;
+  float r[kMaxPerThread];
+  float ssq = 0.0f;
+  if (lane < nv) {
+    ld_vec<8>(x_head + lane * 8, r);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) ssq += r[j] * r[j];
+  }
+  const float rstd = rsqrtf(warp_reduce_sum(ssq) / (float)dim + eps);
+  if (lane < nv) {
+    float ww[8];
+    ld_vec<8>(&s_w[lane * 8], ww);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) r[j] = norm_scale<false>(r[j], rstd, ww[j]);
+    st_vec<8>(&buf[lane * 8], r);
+  }
+  __syncwarp();
+  const int half = rotary >> 1;
+  const __nv_bfloat16* const t_row = table + (size_t)pos * rotary;
+  for (int d = lane; d < half; d += 32) {
+    __nv_bfloat16 lo, hi;
+    rotary_pair(buf[d], buf[d + half], t_row[d], t_row[d + half], &lo, &hi);
+    buf[d] = lo;
+    buf[d + half] = hi;
+  }
+  __syncwarp();
+}
+
+}  // namespace
+
+extern "C" __global__ __launch_bounds__(kQkRopeThreads, 6) void rmsnorm_rotary_q(
+    const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* q,
+    const __nv_bfloat16* table, int start, int rows, int q_heads, int dim,
+    int rotary, int capacity, float eps) {
+  if (!qk_rope_aligned(x) || !qk_rope_aligned(q)) {
+    __trap();
+    return;
+  }
+  __shared__ alignas(16) __nv_bfloat16 s_w[kQkRopeMaxDim];
+  __shared__ alignas(16) __nv_bfloat16 s_buf[kQkRopeWarps][kQkRopeMaxDim];
+  size_t hr = 0;
+  int head = 0, pos = 0;
+  if (!qk_rope_setup(w, s_w, rows, q_heads, dim, rotary, capacity, start, &hr, &head, &pos)) return;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const size_t off = hr * dim;
+  __nv_bfloat16* const buf = s_buf[warp];
+  qk_rope_norm_head(x + off, s_w, buf, table, pos, dim, rotary, eps);
+  if (lane < (dim >> 3)) {
+    *reinterpret_cast<uint4*>(q + off + lane * 8) = *reinterpret_cast<const uint4*>(&buf[lane * 8]);
+  }
+}
+
+extern "C" __global__ __launch_bounds__(kQkRopeThreads, 6) void rmsnorm_rotary_kv(
+    const __nv_bfloat16* x, const __nv_bfloat16* w,
+    const __nv_bfloat16* value, __nv_bfloat16* k, __nv_bfloat16* v,
+    const __nv_bfloat16* table, int start, int rows, int kv_heads, int dim,
+    int rotary, int capacity, float eps) {
+  if (!qk_rope_aligned(x) || !qk_rope_aligned(value) || !qk_rope_aligned(k) || !qk_rope_aligned(v)) {
+    __trap();
+    return;
+  }
+  __shared__ alignas(16) __nv_bfloat16 s_w[kQkRopeMaxDim];
+  __shared__ alignas(16) __nv_bfloat16 s_buf[kQkRopeWarps][kQkRopeMaxDim];
+  size_t hr = 0;
+  int head = 0, pos = 0;
+  if (!qk_rope_setup(w, s_w, rows, kv_heads, dim, rotary, capacity, start, &hr, &head, &pos)) return;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const size_t src = hr * dim;
+  const size_t dst = ((size_t)head * capacity + pos) * dim;
+  __nv_bfloat16* const buf = s_buf[warp];
+  qk_rope_norm_head(x + src, s_w, buf, table, pos, dim, rotary, eps);
+  if (lane < (dim >> 3)) {
+    *reinterpret_cast<uint4*>(k + dst + lane * 8) = *reinterpret_cast<const uint4*>(&buf[lane * 8]);
+    *reinterpret_cast<uint4*>(v + dst + lane * 8) =
+        *reinterpret_cast<const uint4*>(value + src + lane * 8);
+  }
+}
+#else /* ff-sm80 */
 // RMSNorm, fused residual-add + RMSNorm, and residual add. BF16 in / BF16 out with
 // FP32 internal math; 16-byte vector I/O (8 bf16 per load/store), warp-shuffle block
 // reduction, register-cached single pass (re-reads the row only when it does not fit
@@ -893,3 +1801,4 @@ extern "C" __global__ __launch_bounds__(kQkRopeThreads, 6) void rmsnorm_rotary_k
         *reinterpret_cast<const uint4*>(value + src + lane * 8);
   }
 }
+#endif /* ff-sm80 */

@@ -14,8 +14,8 @@ use crate::backend::cuda::{
     verification::Shape,
 };
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig,
-    PushKernelArg,
+    CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut,
+    LaunchConfig, PushKernelArg,
 };
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::convrot::ProductKernel;
@@ -2000,18 +2000,25 @@ pub(crate) struct BlockKernels {
     #[cfg(test)]
     gated_add_rms_raw: crate::backend::gpu::CudaFunction,
     residual: crate::backend::gpu::CudaFunction,
+    norm_module: Arc<CudaModule>,
+    modulate_module: Arc<CudaModule>,
+    act_module: Arc<CudaModule>,
+    rope_module: Arc<CudaModule>,
+    sm: u32,
     stored_launch: std::sync::OnceLock<StoredLaunch>,
 }
 
 impl BlockKernels {
     pub(crate) fn new(ctx: &Arc<crate::backend::gpu::CudaContext>) -> Result<Self> {
-        let modulate = cubin::module(ctx, "modulate")?;
-        let norm = cubin::module(ctx, "norm")?;
-        let plain = norm.load_function("rms_norm_bf16")?;
-        let norm_f32 = norm.load_function("rms_norm")?;
+        let modulate_module = cubin::module(ctx, "modulate")?;
+        let norm_module = cubin::module(ctx, "norm")?;
+        let act_module = cubin::module(ctx, "act")?;
+        let rope_module = cubin::module(ctx, "rope")?;
+        let plain = norm_module.load_function("rms_norm_bf16")?;
+        let norm_f32 = norm_module.load_function("rms_norm")?;
         #[cfg(test)]
-        let norm_modulate = norm.load_function("rms_norm_modulate_bf16")?;
-        let norm_modulate_f32 = norm.load_function("rms_norm_modulate")?;
+        let norm_modulate = norm_module.load_function("rms_norm_modulate_bf16")?;
+        let norm_modulate_f32 = norm_module.load_function("rms_norm_modulate")?;
         let active = |kernel: &crate::backend::gpu::CudaFunction| {
             kernel.occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)
         };
@@ -2028,7 +2035,7 @@ impl BlockKernels {
             fused_f32 >= baseline,
             "rms_norm_modulate occupancy {fused_f32} below rms_norm_bf16 {baseline}"
         );
-        let gated_add_rms = norm.load_function("gated_add_rms_norm_modulate")?;
+        let gated_add_rms = norm_module.load_function("gated_add_rms_norm_modulate")?;
         let gated_active = active(&gated_add_rms)?;
         ensure!(
             gated_active >= baseline,
@@ -2040,19 +2047,24 @@ impl BlockKernels {
             #[cfg(test)]
             norm_modulate,
             norm_modulate_f32,
-            residual: norm.load_function("residual")?,
-            rotary: cubin::module(ctx, "rope")?.load_function("rotary_prefix_kv")?,
-            rotary_q: norm.load_function("rmsnorm_rotary_q")?,
-            rotary_kv: norm.load_function("rmsnorm_rotary_kv")?,
-            swiglu: cubin::module(ctx, "act")?.load_function("silu_mul")?,
+            residual: norm_module.load_function("residual")?,
+            rotary: rope_module.load_function("rotary_prefix_kv")?,
+            rotary_q: norm_module.load_function("rmsnorm_rotary_q")?,
+            rotary_kv: norm_module.load_function("rmsnorm_rotary_kv")?,
+            swiglu: act_module.load_function("silu_mul")?,
             #[cfg(test)]
-            modulate: modulate.load_function("row_modulate")?,
+            modulate: modulate_module.load_function("row_modulate")?,
             #[cfg(test)]
             serial_norm_modulate: std::cell::Cell::new(false),
-            gated_add: modulate.load_function("row_gated_add")?,
+            gated_add: modulate_module.load_function("row_gated_add")?,
             gated_add_rms,
             #[cfg(test)]
-            gated_add_rms_raw: norm.load_function("gated_add_rms_norm_modulate_raw_var")?,
+            gated_add_rms_raw: norm_module.load_function("gated_add_rms_norm_modulate_raw_var")?,
+            norm_module,
+            modulate_module,
+            act_module,
+            rope_module,
+            sm: cubin::capability(ctx)?,
             stored_launch: std::sync::OnceLock::new(),
         })
     }
@@ -3043,6 +3055,7 @@ fn block_forward_tail<const LORA: bool>(
         }
     };
     let gated_add = |residual: u64, update: u64, gate: usize| -> Result<()> {
+        kernels.prepare_fp16_store(s, &kernels.modulate_module)?;
         unsafe {
             s.launch_builder(&kernels.gated_add)
                 .arg(&residual)
@@ -3055,9 +3068,10 @@ fn block_forward_tail<const LORA: bool>(
                 .arg(&entries)
                 .launch(row_grid)?;
         }
-        Ok(())
+        kernels.finish_fp16_store(s, &kernels.modulate_module, "gated_add")
     };
     let residual = |residual: u64, update: u64| -> Result<()> {
+        kernels.prepare_fp16_store(s, &kernels.norm_module)?;
         unsafe {
             s.launch_builder(&kernels.residual)
                 .arg(&residual)
@@ -3065,7 +3079,7 @@ fn block_forward_tail<const LORA: bool>(
                 .arg(&i32::try_from(rows * h)?)
                 .launch(flat(rows * h / 8))?;
         }
-        Ok(())
+        kernels.finish_fp16_store(s, &kernels.norm_module, "residual")
     };
     let scratch = stored_ptrs(s, work);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
@@ -3122,6 +3136,7 @@ fn block_forward_tail<const LORA: bool>(
         block_dim: (QK_ROPE_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
+    kernels.prepare_fp16_store(s, &kernels.norm_module)?;
     unsafe {
         s.launch_builder(&kernels.rotary_q)
             .arg(&pointer(&work.q_raw, s))
@@ -3136,6 +3151,10 @@ fn block_forward_tail<const LORA: bool>(
             .arg(&rows_i)
             .arg(&spec.qk_norm_eps)
             .launch(qk_rope_cfg)?;
+    }
+    kernels.finish_fp16_store(s, &kernels.norm_module, "q")?;
+    kernels.prepare_fp16_store(s, &kernels.norm_module)?;
+    unsafe {
         s.launch_builder(&kernels.rotary_kv)
             .arg(&pointer(&work.k_raw, s))
             .arg(&w.norm_k.tensor.ptr)
@@ -3152,6 +3171,7 @@ fn block_forward_tail<const LORA: bool>(
             .arg(&spec.qk_norm_eps)
             .launch(qk_rope_cfg)?;
     }
+    kernels.finish_fp16_store(s, &kernels.norm_module, "k")?;
     flash.run(
         &work.q,
         width,
@@ -3317,6 +3337,7 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
         let hidden = work.hidden.ptr + if SHIFT_INPUT { 256 } else { 0 };
         let gated = work.gated.ptr;
         let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
+        c.kernels.prepare_fp16_store(s, &c.kernels.act_module)?;
         unsafe {
             s.launch_builder(&c.kernels.swiglu)
                 .arg(&hidden)
@@ -3326,6 +3347,8 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
                 .arg(&3i32)
                 .launch(cfg)?;
         }
+        c.kernels
+            .finish_fp16_store(s, &c.kernels.act_module, "ffn")?;
         base(FF_OUT, work.gated.prefix_rows(u32::try_from(n)?)?, output)?;
         if LORA {
             lora_pair(
@@ -3414,6 +3437,45 @@ struct ModulateRows {
 }
 
 impl BlockKernels {
+    // sm >= 80 cubins do not define ff_fp16_store_fault.
+    fn prepare_fp16_store(&self, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
+        if self.sm >= 80 {
+            return Ok(());
+        }
+        let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+        ensure!(
+            symbol.len() == 4,
+            "ff_fp16_store_fault is {} bytes",
+            symbol.len()
+        );
+        s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+        Ok(())
+    }
+
+    fn finish_fp16_store(
+        &self,
+        s: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        tensor: &str,
+    ) -> Result<()> {
+        if self.sm >= 80 {
+            return Ok(());
+        }
+        let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+        ensure!(
+            symbol.len() == 4,
+            "ff_fp16_store_fault is {} bytes",
+            symbol.len()
+        );
+        let bytes = s.clone_dtoh(&symbol)?;
+        s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+        ensure!(
+            bytes == [0u8; 4],
+            "FP16 store of {tensor} is non-finite or above 65504"
+        );
+        Ok(())
+    }
+
     #[cfg(test)]
     fn rms_norm_modulate(&self, s: &Arc<CudaStream>, n: NormRows, m: ModulateRows) -> Result<()> {
         self.prepare_norm_modulate(&n, &m)?;
@@ -3478,6 +3540,7 @@ impl BlockKernels {
         n: &NormRows,
         m: &ModulateRows,
     ) -> Result<()> {
+        self.prepare_fp16_store(s, &self.norm_module)?;
         unsafe {
             s.launch_builder(kernel)
                 .arg(&n.input)
@@ -3497,7 +3560,7 @@ impl BlockKernels {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(())
+        self.finish_fp16_store(s, &self.norm_module, "rms_norm_modulate")
     }
 
     fn gated_add_rms(&self, s: &Arc<CudaStream>, g: &GatedAddRms) -> Result<()> {
@@ -3548,6 +3611,7 @@ impl BlockKernels {
             .context("norm table extent overflow")?;
         let rows = i32::try_from(g.rows)?;
         let dim = i32::try_from(g.dim)?;
+        self.prepare_fp16_store(s, &self.norm_module)?;
         unsafe {
             s.launch_builder(kernel)
                 .arg(&g.x)
@@ -3572,7 +3636,7 @@ impl BlockKernels {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(())
+        self.finish_fp16_store(s, &self.norm_module, "gated_residual")
     }
 
     fn rms_norm(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
@@ -3590,6 +3654,7 @@ impl BlockKernels {
         kernel: &crate::backend::gpu::CudaFunction,
         n: NormRows,
     ) -> Result<()> {
+        self.prepare_fp16_store(s, &self.norm_module)?;
         unsafe {
             s.launch_builder(kernel)
                 .arg(&n.input)
@@ -3604,7 +3669,7 @@ impl BlockKernels {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(())
+        self.finish_fp16_store(s, &self.norm_module, "rms_norm")
     }
 
     #[cfg(test)]
@@ -6881,6 +6946,7 @@ impl Conditioner {
             )
         };
         let residual = |residual: u64, update: u64, count: usize| -> Result<()> {
+            kernels.prepare_fp16_store(s, &kernels.norm_module)?;
             unsafe {
                 s.launch_builder(&kernels.residual)
                     .arg(&residual)
@@ -6888,7 +6954,7 @@ impl Conditioner {
                     .arg(&i32::try_from(count)?)
                     .launch(flat(count / 8))?;
             }
-            Ok(())
+            kernels.finish_fp16_store(s, &kernels.norm_module, "residual")
         };
         let mut tapped = Vec::with_capacity(taps.len());
         let x = pointer(&self.x, s);
@@ -6919,6 +6985,7 @@ impl Conditioner {
                 (rows * self.kv_heads, d, HEAD_NORM_THREADS),
             )?;
             // q rotates in place; k and v land head-major [kv_heads, rows, head_dim] in keys and values.
+            kernels.prepare_fp16_store(s, &kernels.rope_module)?;
             unsafe {
                 s.launch_builder(&kernels.rotary)
                     .arg(&pointer(&self.q, s))
@@ -6936,6 +7003,7 @@ impl Conditioner {
                     .arg(&rows_i)
                     .launch(flat(rows * (self.q_heads + self.kv_heads) * d))?;
             }
+            kernels.finish_fp16_store(s, &kernels.rope_module, "qk")?;
             self.flash.run(
                 &self.q,
                 qw,
@@ -6964,6 +7032,7 @@ impl Conditioner {
             linear(layer.gate_up, &self.normed, h, &self.gate_up, 2 * self.ffn)?;
             let (gate_up, gated) = (pointer(&self.gate_up, s), pointer(&self.gated, s));
             let cfg = ops::silu_mul_grid(rows, self.ffn, gate_up, gated)?;
+            kernels.prepare_fp16_store(s, &kernels.act_module)?;
             unsafe {
                 s.launch_builder(&kernels.swiglu)
                     .arg(&gate_up)
@@ -6973,6 +7042,7 @@ impl Conditioner {
                     .arg(&0i32)
                     .launch(cfg)?;
             }
+            kernels.finish_fp16_store(s, &kernels.act_module, "ffn")?;
             linear(layer.down, &self.gated, self.ffn, &self.normed, h)?;
             #[cfg(test)]
             if index == 43 && rows > 20 && h > 731 {
