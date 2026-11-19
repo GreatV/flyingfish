@@ -541,7 +541,11 @@ fn prepare_transformer(
         (rank, layout),
         base,
         lora,
-        (Placement::Derived, crate::prefill::placement_visits(plan.len(), 1)?, choose),
+        (
+            Placement::Derived,
+            crate::prefill::placement_visits(plan.len(), 1)?,
+            choose,
+        ),
     )?;
     Ok(VideoTransformer {
         dit,
@@ -1614,8 +1618,10 @@ impl VideoSession {
             LayerNormTower::request_bytes(&text_spec, &conditioner_vision_input(&prompt), count)?
         };
         drop(first);
+        let mut request_count = 1;
         for request in requests {
             shape.check(&spec, &request?)?;
+            request_count += 1;
         }
         let device = Device::new(options.device)?;
         let page = stored_allocation_granularity(&device)?;
@@ -1676,11 +1682,8 @@ impl VideoSession {
         let decode_geometry = VideoDecodeGeometry::new(&vae, &geometry)?;
         let rgb = unsafe { device.stream.alloc::<u8>(decode_geometry.rgb_bytes)? };
         let slots = decode_geometry.tiles.count();
-        // Decoder GEMM plans depend on the active tile count.
-        let batch = VideoDecoder::work_batch_cap(&device, &vae, decode_geometry.tile, slots)?;
-        let bytes = TileWork::batch_bytes(&vae, decode_geometry.tile, batch, slots)?;
-        let tier_work = stored_allocation_bytes(bytes, page)?;
-        let decoder_visits = decode_geometry.chunks * slots.div_ceil(batch);
+        let cap = VideoDecoder::work_batch_cap(&device, &vae, decode_geometry.tile, slots)?;
+        let one_tile = TileWork::batch_bytes(&vae, decode_geometry.tile, 1, slots)?;
         let audio_input = 4 * layout.audio_indices.len() * spec.audio_in_channels;
         let posterior = 4 * vae.latent_channels * geometry.latent_height * geometry.latent_width;
         let anchor = encode.as_ref().map_or(0, |(stage, _)| {
@@ -1734,7 +1737,7 @@ impl VideoSession {
                     .filter(|&(_, source)| source != 0)
                     .unzip();
                 let fixed = fixed + stored_allocation_bytes(owned, page)?;
-                let stages = [
+                let mut stages = [
                     DenseStage {
                         device: &text_layers,
                         source: &text_layers,
@@ -1752,19 +1755,27 @@ impl VideoSession {
                     DenseStage {
                         device: &decoder_layers,
                         source: &decoder_source,
-                        visits: decoder_visits,
+                        visits: decode_geometry.chunks,
                         load_scratch: decoder_largest,
                         device_staging: decoder_staging,
                     },
                 ];
-                let floors = stages
-                    .iter()
-                    .try_fold(fixed + transient + tier_work, |sum, stage| {
-                        Ok::<_, anyhow::Error>(sum + stage.minimum_device_bytes(page)?)
-                    })?;
-                bind_ffn(floors).with_context(|| {
-                    format!("resident video reserves {bytes} bytes for {batch} decoder tiles")
+                let floors = stages.iter().try_fold(fixed + transient, |sum, stage| {
+                    Ok::<_, anyhow::Error>(sum + stage.minimum_device_bytes(page)?)
                 })?;
+                bind_ffn(floors + stored_allocation_bytes(one_tile, page)?).with_context(|| {
+                    format!(
+                        "resident video FFN with {one_tile} bytes reserved for one decoder tile"
+                    )
+                })?;
+                device.ctx.synchronize()?;
+                let (free, total) = device.ctx.mem_get_info()?;
+                let remaining = DensePlacement::device_budget(free, total, floors, 0, 0)?;
+                let budget = remaining - remaining % page;
+                let (batch, bytes) =
+                    VideoDecoder::work_batch(&vae, decode_geometry.tile, slots, cap, budget)?;
+                let decoder_visits = decode_geometry.chunks * slots.div_ceil(batch);
+                stages[2].visits = decoder_visits;
                 let work =
                     TileWork::new(&device.stream, &vae, decode_geometry.tile, (batch, slots))?;
                 device.ctx.synchronize()?;
@@ -1801,7 +1812,7 @@ impl VideoSession {
                             "conditioner": demand(&text, 1), "dit": demand(&dit, evaluations),
                             "decoder": demand(&decoder, decoder_visits),
                         },
-                        "decoder_tile_batch": batch, "decoder_work_bytes": bytes,
+                        "decoder_tile_batch": batch, "decoder_tile_cap": cap, "decoder_work_budget": budget, "decoder_work_bytes": bytes,
                         "decoder_resident_seconds": decoder_resident_seconds, "decoder_streamed_seconds": decoder_streamed_seconds,
                         "dit_visits": evaluations, "decoder_visits": decoder_visits,
                     }})
@@ -1818,10 +1829,11 @@ impl VideoSession {
             (TEXT_ENCODER_LAYER, count, transient),
             Source::new(&text_dir, &text_manifest),
             (Placement::Derived, Some(text_plan)),
+            request_count,
         )?;
         conditioner.prepare(&text_blas, count)?;
         let video = VideoDecoder::with_plan(&device, (&vae, &vae_dir, &vae_manifest), decode_plan)?;
-        video.bind(&mut sample_blas, &work)?;
+        video.bind_groups(&mut sample_blas, &work, cap)?;
         let kernels = BlockKernels::new(&device.ctx)?;
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
@@ -4609,7 +4621,7 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
 
 #[cfg(test)]
 #[test]
-fn video_placement_charges_the_full_decoder_group() -> Result<()> {
+fn video_placement_sizes_decoder_groups_from_remaining_memory() -> Result<()> {
     let spec = H3Spec::parse(&serde_json::from_str(include_str!(
         "../../../tests/data/minimax-h3-transformer-config.json"
     ))?)?;
@@ -4625,6 +4637,16 @@ fn video_placement_charges_the_full_decoder_group() -> Result<()> {
     let bytes = TileWork::batch_bytes(&vae, decoder.tile, slots, slots)?;
     assert_eq!(bytes, 4_442_630_708);
     let work = stored_allocation_bytes(bytes, 2 << 20)?;
+    let select = |budget| VideoDecoder::work_batch(&vae, decoder.tile, slots, slots, budget);
+    assert_eq!(select(work)?, (slots, bytes));
+    let remaining = work - (11_013_382_144 - 10_806_362_112);
+    let (batch, chosen) = select(remaining - remaining % (2 << 20))?;
+    assert_eq!(batch, 26);
+    assert!(stored_allocation_bytes(chosen, 2 << 20)? <= remaining);
+    assert!(TileWork::batch_bytes(&vae, decoder.tile, batch + 1, slots)? > remaining);
+    let one = TileWork::batch_bytes(&vae, decoder.tile, 1, slots)?;
+    assert_eq!(select(one)?, (1, one));
+    assert!(select(one - 1).is_err());
     let total = 25_252_724_736;
     let budget = crate::prefill::DensePlacement::device_budget;
     let minimum = total / 16 + work + decoder.transient;

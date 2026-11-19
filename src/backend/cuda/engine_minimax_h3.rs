@@ -5117,6 +5117,7 @@ type VideoPlacementChooser<'a> = dyn FnMut(
     + 'a;
 
 impl Dit {
+    #[cfg(test)]
     pub(crate) fn new(
         d: &Device,
         blas: &mut Blas,
@@ -5294,8 +5295,14 @@ impl Dit {
         };
         let resident = selected.is_some();
         let (tier, blocks) = if hyperflow {
-            let (tier, packed) =
-                place_stored_layers(d, &mut base, spec, &sizing, owned, (placement, visits, selected))?;
+            let (tier, packed) = place_stored_layers(
+                d,
+                &mut base,
+                spec,
+                &sizing,
+                owned,
+                (placement, visits, selected),
+            )?;
             #[cfg(test)]
             trace_placement_pool(d, "after_streaming_slots")?;
             base.pack_vectors(s, spec)?;

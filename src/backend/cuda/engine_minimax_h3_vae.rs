@@ -1982,7 +1982,8 @@ impl VideoDecoder {
             + 2 * spec.latent_channels * shape.0 * shape.1 * shape.2;
         let (free, total) = d.ctx.mem_get_info()?;
         let budget = crate::prefill::DensePlacement::device_budget(free, total, mandatory, 0, 0)?;
-        let (batch, bytes) = Self::work_batch(d, spec, tile, tiles.count(), budget)?;
+        let cap = Self::work_batch_cap(d, spec, tile, tiles.count())?;
+        let (batch, bytes) = Self::work_batch(spec, tile, tiles.count(), cap, budget)?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
                 "{}",
@@ -1994,20 +1995,23 @@ impl VideoDecoder {
     }
 
     pub(super) fn work_batch(
-        d: &Device,
         spec: &VaeSpec,
         tile: (usize, usize, usize),
         slots: usize,
+        cap: usize,
         budget: usize,
     ) -> Result<(usize, usize)> {
-        let cap = Self::work_batch_cap(d, spec, tile, slots)?;
+        ensure!(cap > 0, "video BF16 decoder launch limits exclude one tile");
         for batch in (1..=cap).rev() {
             let bytes = TileWork::batch_bytes(spec, tile, batch, slots)?;
             if bytes <= budget {
                 return Ok((batch, bytes));
             }
         }
-        anyhow::bail!("video BF16 decoder cannot fit one tile")
+        anyhow::bail!(
+            "video BF16 decoder needs {} bytes for one tile; budget {budget}",
+            TileWork::batch_bytes(spec, tile, 1, slots)?
+        )
     }
 
     pub(super) fn work_batch_cap(
@@ -2026,14 +2030,27 @@ impl VideoDecoder {
     }
 
     pub(crate) fn bind(&self, blas: &mut Blas, work: &TileWork) -> Result<()> {
+        self.bind_groups(blas, work, work.batch)
+    }
+
+    pub(super) fn bind_groups(&self, blas: &mut Blas, work: &TileWork, cap: usize) -> Result<()> {
         for &(active, _) in &work.attention {
-            self.post_quant.bind(blas, active * work.patches)?;
-            self.proj_in.bind(blas, active * work.patches)?;
-            let rows = active * work.tokens;
-            self.proj_out.bind(blas, rows)?;
+            let mut bind = |linear: &Linear<bf16>, stride| {
+                if work.batch == cap {
+                    return linear.bind(blas, active * stride);
+                }
+                blas.prepare_biased_group(
+                    (active * stride, cap * stride),
+                    linear.weight.shape,
+                    linear.bias,
+                )
+            };
+            bind(&self.post_quant, work.patches)?;
+            bind(&self.proj_in, work.patches)?;
+            bind(&self.proj_out, work.tokens)?;
             for b in &self.blocks {
                 for linear in [&b.q, &b.k, &b.v, &b.out, &b.ff_in, &b.ff_out] {
-                    linear.bind(blas, rows)?;
+                    bind(linear, work.tokens)?;
                 }
             }
         }
