@@ -1,5 +1,7 @@
 //! MiniMax-H3 image/video VAEs: tiled ViT decoders and the causal CNN keyframe encoder.
-use super::{Element, EntryReader, Source, pointer, rows_view};
+use super::{
+    DenseTier, Element, EntryReader, FillCast, FillCheck, OwnedRead, Source, pointer, rows_view,
+};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
@@ -436,6 +438,9 @@ impl ImageDecodeStage {
                 DenseStreaming::with_f32_cast(dir, manifest, plan, device, &order, |name| {
                     decoder_weight_width(name) == 2
                 })?;
+            let mut requests = Vec::new();
+            let mut checks = Vec::new();
+            let mut largest = 0usize;
             for (layer, names) in order
                 .iter()
                 .enumerate()
@@ -444,12 +449,24 @@ impl ImageDecodeStage {
                 let mut pinned = dense.host_layer(layer)?;
                 let (mut source, mut runtime) = (0, 0);
                 for name in names {
-                    let entry = &manifest.entries[name];
+                    let entry = &manifest.entries[name.as_str()];
                     let end = source + entry.bytes;
                     if let Some(bytes) = &mut pinned {
-                        loader
-                            .reader
-                            .read_into(name, entry, &mut bytes[source..end])?;
+                        requests.push(OwnedRead::new(
+                            name,
+                            entry,
+                            unsafe { bytes.as_mut_ptr().add(source) },
+                            entry.bytes,
+                            FillCast::Raw,
+                        ));
+                        checks.push(FillCheck::finite(
+                            layer,
+                            name,
+                            entry.dtype,
+                            source,
+                            entry.bytes,
+                        ));
+                        largest = largest.max(entry.bytes);
                     }
                     loader.offsets.insert(name.clone(), (layer, runtime));
                     source = end;
@@ -460,7 +477,16 @@ impl ImageDecodeStage {
                     "image VAE pinned layer byte count"
                 );
             }
-            loader.dense = Some(dense);
+            let slot_bytes = dense.plan.slot_bytes;
+            let slot_count = slots.iter().flatten().copied().max().map_or(0, |i| i + 1);
+            loader.dense = Some(DenseTier::schedule(
+                "image-vae",
+                dense,
+                dir,
+                requests,
+                checks,
+                (slot_count, slot_bytes, largest),
+            )?);
         }
         let decoder = ImageDecoder::from_weights(device, spec, loader)?;
         decoder.core.bind(blas, &work.core)?;
@@ -898,7 +924,7 @@ pub(crate) struct VideoDecoder {
     norm_out: (Tensor<f32, 1>, Tensor<f32, 1>),
     proj_out: Linear<bf16>,
     blocks: Vec<DecoderBlock<bf16>>,
-    dense: Option<std::cell::RefCell<DenseStreaming>>,
+    tier: Option<std::cell::RefCell<DenseTier>>,
     _weights: Vec<CudaSlice<u8>>,
     kernels: VaeKernels,
     #[cfg(test)]
@@ -993,7 +1019,7 @@ fn read_decoder_weight_chunk(
 struct DecoderWeightLoad<'a> {
     manifest: &'a TensorManifest,
     reader: EntryReader,
-    dense: Option<DenseStreaming>,
+    dense: Option<DenseTier>,
     offsets: std::collections::BTreeMap<String, (usize, usize)>,
     consumed: std::collections::BTreeSet<String>,
     storage: Vec<CudaSlice<u8>>,
@@ -1039,6 +1065,7 @@ impl<'a> DecoderWeightLoad<'a> {
             self.dense
                 .as_ref()
                 .context("video pinned tensor lacks stream binding")?
+                .dense
                 .pointer(layer, offset, bytes)?
         } else {
             let buffer = unsafe { s.alloc::<u8>(bytes)? };
@@ -1162,34 +1189,64 @@ fn video_weight_load<'a>(
     }
     let mut loader = DecoderWeightLoad::new(dir, manifest);
     if plan.slot_bytes > 0 {
-        loader.dense = Some(DenseStreaming::new_preloaded(dir, plan, d, &sizes)?);
-    }
-    if let Some(dense) = &mut loader.dense {
+        let slot_count = plan
+            .slots
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .map_or(0, |index| index + 1);
+        let mut dense = DenseStreaming::new_preloaded(dir, plan, d, &sizes)?;
+        let mut requests = Vec::new();
+        let mut checks = Vec::new();
+        let mut largest = 0usize;
         for (layer, names) in order.iter().enumerate() {
             if let Some(pinned) = dense.host_layer(layer)? {
                 let mut offset = 0;
                 for name in names {
                     let width = decoder_weight_width(name);
                     let bytes = decoder_tensor_bytes(manifest, name);
+                    let entry = &manifest.entries[name.as_str()];
                     ensure!(offset % 16 == 0, "video pinned weight alignment");
                     loader.offsets.insert((*name).clone(), (layer, offset));
-                    for (i, dst) in pinned[offset..offset + bytes]
-                        .chunks_mut((32 << 20) / 4 * width)
-                        .enumerate()
-                    {
-                        read_decoder_weight_chunk(
-                            &mut loader.reader,
-                            manifest,
-                            name,
-                            i * ((32 << 20) / 4 * width),
-                            dst,
-                        )?;
-                    }
+                    let cast = if width == 2 {
+                        FillCast::F32ToBf16
+                    } else {
+                        FillCast::Raw
+                    };
+                    requests.push(OwnedRead::new(
+                        name,
+                        entry,
+                        unsafe { pinned.as_mut_ptr().add(offset) },
+                        bytes,
+                        cast,
+                    ));
+                    checks.push(FillCheck::finite(
+                        layer,
+                        name,
+                        if width == 2 {
+                            safetensors::Dtype::BF16
+                        } else {
+                            safetensors::Dtype::F32
+                        },
+                        offset,
+                        bytes,
+                    ));
+                    largest = largest.max(bytes);
                     offset += bytes;
                 }
                 ensure!(offset == pinned.len(), "video pinned layer byte count");
             }
         }
+        let slot_bytes = dense.plan.slot_bytes;
+        loader.dense = Some(DenseTier::schedule(
+            "video-vae",
+            dense,
+            dir,
+            requests,
+            checks,
+            (slot_count, slot_bytes, largest),
+        )?);
     }
     Ok(loader)
 }
@@ -1261,7 +1318,7 @@ impl VideoDecoder {
             norm_out,
             proj_out,
             blocks,
-            dense: load.dense.map(std::cell::RefCell::new),
+            tier: load.dense.map(std::cell::RefCell::new),
             _weights: load.storage,
             kernels: VaeKernels {
                 frame_blend: vision.load_function("frame_blend_bf16")?,
@@ -1631,8 +1688,8 @@ impl VideoDecoder {
                 .launch(flat(rows * spec.dim))?;
         }
         for layer in 0..self.blocks.len() {
-            if let Some(dense) = &self.dense {
-                dense.borrow_mut().begin(layer, s)?;
+            if let Some(tier) = &self.tier {
+                tier.borrow_mut().ready()?.begin(layer, s)?;
             }
             self.block(
                 s,
@@ -1647,8 +1704,8 @@ impl VideoDecoder {
                 let role = if layer == 0 { "block0" } else { "block_last" };
                 observe(role, (DecoderRows::F32(&w.x), 0, w.tokens, spec.dim))?;
             }
-            if let Some(dense) = &self.dense {
-                dense.borrow_mut().end(layer, s)?;
+            if let Some(tier) = &self.tier {
+                tier.borrow_mut().ready()?.end(layer, s)?;
             }
         }
         unsafe {

@@ -164,6 +164,7 @@ struct DirectRead<'a> {
     entry: &'a TensorEntry,
     dest: *mut u8,
     dest_len: usize,
+    cast: FillCast,
 }
 
 fn align_min() -> usize {
@@ -183,13 +184,42 @@ unsafe impl Send for DirectBatch {}
 unsafe impl Sync for DirectBatch {}
 
 /// One owned direct-read destination: a tensor identity plus a disjoint writable window of a
-/// pinned arena, exactly `entry.bytes`. Ownership lets the batch cross into a fill thread.
+/// pinned arena. `Raw` fills `entry.bytes`; `F32ToBf16` fills half of it with the narrowed
+/// values. Ownership lets the batch cross into a fill thread.
 #[derive(Clone)]
-struct OwnedRead {
+pub(crate) struct OwnedRead {
     name: String,
     entry: TensorEntry,
     dest: *mut u8,
     dest_len: usize,
+    cast: FillCast,
+}
+
+/// Destination form of one fill read: the stored bytes, or their BF16 narrowing with the
+/// loader's finite and overflow checks.
+#[derive(Clone, Copy)]
+pub(crate) enum FillCast {
+    Raw,
+    F32ToBf16,
+}
+
+impl OwnedRead {
+    /// One tensor into its `dest_len` window at `dest`.
+    pub(crate) fn new(
+        name: &str,
+        entry: &TensorEntry,
+        dest: *mut u8,
+        dest_len: usize,
+        cast: FillCast,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            entry: entry.clone(),
+            dest,
+            dest_len,
+            cast,
+        }
+    }
 }
 
 // SAFETY: every destination window is disjoint; only the fill batch touches it before the join.
@@ -212,6 +242,7 @@ fn run_fill_batch(dir: &Path, requests: &[OwnedRead]) -> Result<()> {
             entry: &request.entry,
             dest: request.dest,
             dest_len: request.dest_len,
+            cast: request.cast,
         })
         .collect();
     reader.read_many_direct(&mut batch)
@@ -326,8 +357,28 @@ fn schedule_fill(
 }
 
 /// One post-join finite check: `bytes` at arena offset `at` of `layer`.
-struct FillCheck {
-    layer: usize,
+impl FillCheck {
+    /// The finite check for a filled window: unquantized `dtype` values, `bytes` at `at`.
+    pub(crate) fn finite(
+        layer: usize,
+        tensor: &str,
+        dtype: Dtype,
+        at: usize,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            layer,
+            tensor: tensor.to_owned(),
+            dtype,
+            quant: None,
+            at,
+            bytes,
+        }
+    }
+}
+
+pub(crate) struct FillCheck {
+    pub(crate) layer: usize,
     tensor: String,
     dtype: Dtype,
     quant: Option<GgmlType>,
@@ -436,7 +487,7 @@ impl DenseTier {
     /// Fills `dense`'s host tier: in the background when the derived host budget holds,
     /// otherwise inline. Inline fills validate before returning; background fills defer
     /// their checks to the join before the tier's first consumer.
-    fn schedule(
+    pub(crate) fn schedule(
         component: &'static str,
         mut dense: crate::backend::cuda::weights::DenseStreaming,
         dir: &Path,
@@ -625,6 +676,7 @@ impl EntryReader {
                                 readers,
                                 request.name,
                                 request.entry,
+                                request.cast,
                                 destination,
                                 &mut bounce,
                             )?;
@@ -646,6 +698,7 @@ impl EntryReader {
         readers: &BTreeMap<String, SpanReader>,
         name: &str,
         entry: &TensorEntry,
+        cast: FillCast,
         destination: &mut [u8],
         bounce: &mut AlignedBytes,
     ) -> Result<()> {
@@ -668,18 +721,48 @@ impl EntryReader {
         let width = width
             .min(usize::try_from(reader.file_len() - begin)?)
             .max(entry.bytes + head);
+        let filled = match cast {
+            FillCast::Raw => entry.bytes,
+            FillCast::F32ToBf16 => {
+                ensure!(
+                    entry.dtype == Dtype::F32
+                        && entry.quant.is_none()
+                        && entry.bytes.is_multiple_of(4),
+                    "{name}: F32 to BF16 fill source"
+                );
+                entry.bytes / 2
+            }
+        };
         ensure!(
-            destination.len() >= entry.bytes,
+            destination.len() >= filled,
             "{name}: dense slot holds {} of {}",
             destination.len(),
-            entry.bytes
+            filled
         );
         if bounce.len() < width + align {
             *bounce = AlignedBytes::new(width + align, align)?;
         }
         let span = bounce.as_mut();
         reader.read_direct(begin, width as u64, span)?;
-        destination[..entry.bytes].copy_from_slice(&span[head..head + entry.bytes]);
+        let source = &span[head..head + entry.bytes];
+        match cast {
+            FillCast::Raw => destination[..entry.bytes].copy_from_slice(source),
+            FillCast::F32ToBf16 => {
+                let output = &mut destination[..filled];
+                for (value, dst) in source
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(output.as_chunks_mut::<2>().0)
+                {
+                    let value = f32::from_le_bytes(*value);
+                    ensure!(value.is_finite(), "{name}: nonfinite value");
+                    let narrowed = bf16::from_f32(value);
+                    ensure!(narrowed.is_finite(), "BF16 overflow for {name}");
+                    *dst = narrowed.to_bits().to_le_bytes();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3427,6 +3510,7 @@ fn image_fill_rate(dir: &Path, manifest: &TensorManifest) -> Result<(usize, f64)
             entry,
             dest: buf.as_mut_ptr(),
             dest_len: buf.len(),
+            cast: FillCast::Raw,
         })
         .collect::<Vec<_>>();
     let mut source = Source::new(dir, manifest);
@@ -3692,6 +3776,7 @@ fn bind_layers(
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(at) },
                     dest_len: entry.bytes,
+                    cast: FillCast::Raw,
                 });
                 checks.push(FillCheck {
                     layer,
@@ -4306,6 +4391,7 @@ fn place_stored_layers(
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(offset) },
                     dest_len: entry.bytes,
+                    cast: FillCast::Raw,
                 });
                 if entry.dtype == Dtype::BF16 {
                     checks.push(FillCheck {
@@ -15929,6 +16015,7 @@ mod h3_direct_batch_tests {
                 entry,
                 dest: unsafe { arena.as_mut().as_mut_ptr().add(offsets[index]) },
                 dest_len: entry.bytes,
+                cast: FillCast::Raw,
             });
         }
         reader.read_many_direct(&mut requests)?;
@@ -15945,12 +16032,14 @@ mod h3_direct_batch_tests {
                 entry,
                 dest: arena.as_mut().as_mut_ptr(),
                 dest_len: total,
+                cast: FillCast::Raw,
             },
             DirectRead {
                 name: "t",
                 entry,
                 dest: unsafe { arena.as_mut().as_mut_ptr().add(offsets[0]) },
                 dest_len: entry.bytes,
+                cast: FillCast::Raw,
             },
         ];
         ensure!(
@@ -15962,13 +16051,13 @@ mod h3_direct_batch_tests {
     }
 
     fn owned(entry: TensorEntry, arena: &mut AlignedBytes, at: usize) -> OwnedRead {
-        let bytes = entry.bytes;
-        OwnedRead {
-            name: "t".to_owned(),
-            entry,
-            dest: unsafe { arena.as_mut().as_mut_ptr().add(at) },
-            dest_len: bytes,
-        }
+        OwnedRead::new(
+            "t",
+            &entry,
+            unsafe { arena.as_mut().as_mut_ptr().add(at) },
+            entry.bytes,
+            FillCast::Raw,
+        )
     }
 
     #[test]
@@ -16181,6 +16270,73 @@ mod h3_direct_batch_tests {
         ensure!(
             freed.load(std::sync::atomic::Ordering::SeqCst),
             "arena not freed after the fill joined"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn converted_fill_narrows_f32_to_bf16_and_rejects_overflow() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-fillcast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let align = 4096usize;
+        let values: Vec<f32> = (0..2048).map(|i| (i as f32) * 0.25 - 128.0).collect();
+        let mut source = Vec::with_capacity(values.len() * 4);
+        for value in &values {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+        while source.len() < 2 * align {
+            source.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        std::fs::write(dir.join("shard.bin"), &source)?;
+        let entry = |shard: &str| TensorEntry {
+            dtype: Dtype::F32,
+            shape: vec![source.len() / 4],
+            shard: shard.to_owned(),
+            bytes: source.len(),
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let mut arena = AlignedBytes::new(align, align)?;
+        let request = OwnedRead::new(
+            "narrow",
+            &entry("shard.bin"),
+            arena.as_mut().as_mut_ptr(),
+            align,
+            FillCast::F32ToBf16,
+        );
+        let dir2 = dir.clone();
+        let mut thread = FillThread::spawn(&dir2, vec![request])?;
+        thread.join()?;
+        let bytes = arena.as_mut();
+        for (index, value) in values.iter().enumerate() {
+            let got = bf16::from_le_bytes([bytes[2 * index], bytes[2 * index + 1]]);
+            ensure!(got == bf16::from_f32(*value), "element {index}: {got}");
+        }
+        // The overflow arm: a value beyond BF16 range must fail with the loader's text.
+        let mut hot = source.clone();
+        hot[..4].copy_from_slice(&f32::MAX.to_le_bytes());
+        std::fs::write(dir.join("shard.bin"), &hot)?;
+        let mut overflow = AlignedBytes::new(align, align)?;
+        let request = OwnedRead::new(
+            "narrow",
+            &entry("shard.bin"),
+            overflow.as_mut().as_mut_ptr(),
+            align,
+            FillCast::F32ToBf16,
+        );
+        let mut thread = FillThread::spawn(&dir, vec![request])?;
+        let error = thread.join().expect_err("overflowing F32 narrowed to BF16");
+        ensure!(
+            format!("{error:#}").contains("BF16 overflow for narrow"),
+            "overflow error lacks the loader's text: {error:#}"
         );
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
