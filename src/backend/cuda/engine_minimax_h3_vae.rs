@@ -16,7 +16,7 @@ use crate::backend::cuda::{
 use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
 };
-use crate::checkpoint::{MappedCheckpoint, TensorManifest};
+use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, VaeSpec, VaeTiles};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -1463,6 +1463,109 @@ impl Drop for VaeHoist {
 /// fill thread. The derivation hoists only when the DiT placement has no disk tier
 /// (`disk_tier` false, after the DiT fills joined) and the sensed host budget covers the
 /// arena plus a 4 GiB reserve; a skip prints its reason. Nothing is retried.
+/// Validates one hoisted pinned window (the loader's finite checks) and copies it into the
+/// dense pinned tier.
+fn hoisted_pinned_window(
+    name: &str,
+    entry: &TensorEntry,
+    hoisted: &[u8],
+    pinned: &mut [u8],
+) -> Result<()> {
+    super::resident_raw_finite(
+        name,
+        entry,
+        if decoder_weight_width(name) == 2 {
+            super::FillCast::F32ToBf16
+        } else {
+            super::FillCast::Raw
+        },
+        hoisted,
+    )?;
+    ensure!(
+        pinned.len() == hoisted.len(),
+        "video hoist pinned window for {name}"
+    );
+    pinned.copy_from_slice(hoisted);
+    Ok(())
+}
+
+/// Hoist admission: the arena stays live while decode senses host memory for the decoder's
+/// pinned tier, so both must fit beside the reserve.
+fn hoist_fits(available: usize, total: usize) -> Result<bool> {
+    Ok(available
+        >= total
+            .checked_mul(2)
+            .context("video hoist admission overflow")?
+            .checked_add(4 << 30)
+            .context("video hoist admission overflow")?)
+}
+
+#[cfg(test)]
+mod hoist_tests {
+    use super::*;
+
+    #[test]
+    fn hoisted_pinned_window_rejects_nonfinite_f32_naming_the_tensor() -> Result<()> {
+        let entry = crate::checkpoint::TensorEntry {
+            dtype: safetensors::Dtype::F32,
+            shape: vec![8],
+            shard: "s".to_owned(),
+            bytes: 32,
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let mut hoisted = vec![0u8; 32];
+        hoisted[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let mut pinned = vec![0u8; 32];
+        let error = hoisted_pinned_window(
+            "decoder.transformer_blocks.0.norm2.weight",
+            &entry,
+            &hoisted,
+            &mut pinned,
+        )
+        .expect_err("nonfinite hoisted pinned F32 accepted");
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains("decoder.transformer_blocks.0.norm2.weight")
+                && text.contains("nonfinite"),
+            "error lacks the tensor name: {text}"
+        );
+        let finite = vec![0u8; 32];
+        hoisted_pinned_window(
+            "decoder.transformer_blocks.0.norm2.weight",
+            &entry,
+            &finite,
+            &mut pinned,
+        )?;
+        ensure!(pinned == finite, "hoisted pinned copy mismatch");
+        Ok(())
+    }
+
+    #[test]
+    fn hoist_admission_skips_where_the_arena_starves_the_pinned_tier() -> Result<()> {
+        let total = 4_847_660_208usize;
+        // The pre-fix bound (arena + reserve) fits, but the pinned tier beside the live
+        // arena does not: the admission must skip.
+        let constrained = total + (4 << 30) + 1;
+        ensure!(
+            constrained >= total + (4 << 30) && !hoist_fits(constrained, total)?,
+            "constrained budget admitted the hoist"
+        );
+        ensure!(
+            hoist_fits(total.saturating_mul(2) + (4 << 30), total)?,
+            "healthy budget skipped the hoist"
+        );
+        Ok(())
+    }
+}
+
 pub(super) fn hoist_video_vae(model: &Path, disk_tier: bool) -> Result<Option<VaeHoist>> {
     let dir = model.join("vae");
     let spec = VaeSpec::read(model)?;
@@ -1500,14 +1603,7 @@ pub(super) fn hoist_video_vae(model: &Path, disk_tier: bool) -> Result<Option<Va
     let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
         "/",
     ))?)?;
-    // The arena stays live while decode senses host memory for the decoder's pinned tier,
-    // so admission reserves that tier too (bounded by the full runtime bytes).
-    let fits = available
-        >= total
-            .checked_mul(2)
-            .context("video hoist admission overflow")?
-            .checked_add(4 << 30)
-            .context("video hoist admission overflow")?;
+    let fits = hoist_fits(available, total)?;
     let decision = if !reason.is_empty() {
         reason
     } else if fits {
@@ -1694,8 +1790,12 @@ fn video_weight_load<'a>(
                             hoisted == bytes && at + bytes <= source.arena.len(),
                             "video hoist window for {name}"
                         );
-                        pinned[offset..offset + bytes]
-                            .copy_from_slice(&source.arena[at..at + bytes]);
+                        hoisted_pinned_window(
+                            name,
+                            &manifest.entries[name.as_str()],
+                            &source.arena[at..at + bytes],
+                            &mut pinned[offset..offset + bytes],
+                        )?;
                         offset += bytes;
                     }
                     ensure!(offset == pinned.len(), "video pinned layer byte count");
