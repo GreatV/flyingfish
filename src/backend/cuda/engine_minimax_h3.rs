@@ -3939,8 +3939,7 @@ fn place_layers(
     d: &Device,
     base: &mut Source<'_>,
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
-    placement: Placement,
-    visits: usize,
+    (placement, visits): (Placement, usize),
     name: impl Fn(usize) -> String,
     roles: &[&str],
 ) -> Result<PlacedLayers> {
@@ -4312,14 +4311,13 @@ fn low_rank_layer_tail(
 
 /// `(plan, device budget, host budget, available host bytes)` for one charged table.
 fn stored_compact(
-    placement: Placement,
+    (placement, visits): (Placement, usize),
     charged_device: &[usize],
     charged_slots: &[usize],
     kept_source: &[usize],
     device_cap: usize,
     largest: usize,
     granularity: usize,
-    visits: usize,
 ) -> Result<(crate::prefill::DensePlacement, usize, usize, Option<usize>)> {
     use crate::prefill::DensePlacement;
     ensure!(
@@ -4516,24 +4514,22 @@ fn place_stored_layers(
     let (free, total) = d.ctx.mem_get_info()?;
     let device_cap = DensePlacement::device_budget(free, total, owned, 0, 0)?;
     let (before, ..) = stored_compact(
-        placement,
+        (placement, visits),
         &charged_device,
         &charged_slots,
         &kept_source,
         device_cap,
         sizing.largest,
         granularity,
-        visits,
     )?;
     let (compact, device_budget, host_budget, host_available) = stored_compact(
-        placement,
+        (placement, visits),
         &charged_device_after,
         &charged_slots_after,
         &kept_source,
         device_cap,
         sizing.largest,
         granularity,
-        visits,
     )?;
     let facts = PlacementFacts {
         free_bytes: free,
@@ -5052,8 +5048,7 @@ impl Dit {
                     owned,
                     0,
                 ),
-                placement,
-                visits,
+                (placement, visits),
                 |layer| format!("transformer_blocks.{layer}"),
                 &LINEAR_ROLES,
             )?;
@@ -5828,8 +5823,7 @@ impl ImageDit {
                         owned,
                         0,
                     ),
-                    mode,
-                    visits,
+                    (mode, visits),
                     name,
                     &LINEAR_ROLES,
                 )?,
@@ -6495,8 +6489,7 @@ impl Conditioner {
                 d,
                 &mut base,
                 (&bytes, &bytes, largest, owned, media),
-                placement,
-                visits,
+                (placement, visits),
                 name,
                 &TEXT_ROLES,
             )?
@@ -10921,8 +10914,7 @@ mod tests {
                         owned,
                         0,
                     ),
-                    placement,
-                    crate::prefill::placement_visits(2, 1)?,
+                    (placement, crate::prefill::placement_visits(2, 1)?),
                     |layer| format!("transformer_blocks.{layer}"),
                     &LINEAR_ROLES,
                 )?;
@@ -13730,7 +13722,10 @@ mod tests {
                     &t2i_layout,
                     &dir,
                     &manifest,
-                    Placement::Streamed,
+                    (
+                        Placement::Streamed,
+                        crate::prefill::placement_visits(schedule.timesteps.len(), 1)?,
+                    ),
                 )?;
                 let context = BlockContext {
                     s,
@@ -15123,6 +15118,7 @@ mod tests {
             super::Placement::Derived,
             (free, total, host),
             2,
+            2,
         )?;
         assert_eq!(facts.device_budget, 16);
         assert_eq!(plan.resident_bytes, 0);
@@ -15133,6 +15129,7 @@ mod tests {
                 (&layers, &layers, 8, fixed, later),
                 super::Placement::Derived,
                 (free - 1, total, host),
+                2,
                 2,
             )
             .is_err()
