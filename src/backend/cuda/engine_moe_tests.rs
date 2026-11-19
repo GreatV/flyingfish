@@ -705,6 +705,114 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
     result
 }
 
+#[test]
+fn expert_host_profile_reads_the_mounted_cgroup2_controller() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "flyingfish-host-memory-cgroup2-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> Result<()> {
+        let write = |path: &str, value: &str| -> Result<()> {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().context("fixture parent missing")?)?;
+            Ok(std::fs::write(path, value)?)
+        };
+        write("proc/meminfo", "MemAvailable: 67108864 kB\n")?;
+        write(
+            "proc/self/limits",
+            "Max resident set unlimited unlimited bytes\n",
+        )?;
+        write(
+            "proc/self/mountinfo",
+            "1077 1076 0:27 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot\n1088 1082 0:27 /../../jupyter-children /var/colab/cgroup/jupyter-children ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n",
+        )?;
+        write("proc/self/cgroup", "0::/../../jupyter-children/leaf\n")?;
+        write("sys/fs/cgroup/memory.max", "1048576\n")?;
+        write("sys/fs/cgroup/memory.current", "0\n")?;
+        write("sys/fs/cgroup/memory.stat", "file 0\nshmem 0\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.max",
+            "107374182400\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.high",
+            "max\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.current",
+            "4294967296\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.stat",
+            "file 0\nshmem 0\n",
+        )?;
+        write("var/colab/cgroup/jupyter-children/memory.max", "max\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.high",
+            "21474836480\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.current",
+            "8589934592\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.stat",
+            "file 0\nshmem 0\n",
+        )?;
+        let child = super::host_memory(&root)?;
+        ensure!(
+            child == 12 << 30,
+            "mounted cgroup2 high watermark did not bind: {child}"
+        );
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/leaf/memory.max"))?;
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/leaf/memory.high"))?;
+        let ancestor = super::host_memory(&root)?;
+        ensure!(
+            ancestor == 12 << 30,
+            "missing leaf controller did not keep the ancestor high watermark: {ancestor}"
+        );
+        write("proc/self/cgroup", "0::/../../jupyter-children\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.max",
+            "8589934592\n",
+        )?;
+        write("var/colab/cgroup/jupyter-children/memory.high", "max\n")?;
+        write("var/colab/cgroup/jupyter-children/memory.current", "0\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.stat",
+            "file 0\nshmem 0\n",
+        )?;
+        let mounted = super::host_memory(&root)?;
+        ensure!(
+            mounted == 8 << 30,
+            "mounted cgroup2 memory.max did not bind: {mounted}"
+        );
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/memory.max"))?;
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/memory.high"))?;
+        let error = super::host_memory(&root)
+            .expect_err("missing mounted controller admitted")
+            .to_string();
+        ensure!(
+            error.contains("tried")
+                && error.contains("var/colab/cgroup/jupyter-children")
+                && !error.contains("sys/fs/cgroup"),
+            "missing controller names the wrong path: {error}"
+        );
+        println!(
+            "PASS host_memory_cgroup2_mount child_available_bytes={} mount_available_bytes={} leaf_max=107374182400 mount_high=21474836480 mount_used=8589934592 decoy_max=1048576 missing_controller_rejected=true",
+            12u64 << 30,
+            8u64 << 30
+        );
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
+}
+
 fn native_fixture(
     fixture: &MoeFixture,
     directory: &Path,

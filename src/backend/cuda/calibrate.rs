@@ -16,7 +16,7 @@ use crate::{
     },
     config::Config,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 #[cfg(feature = "cuda")]
 use cudarc::driver::{DevicePtr, PushKernelArg, sys};
 #[cfg(feature = "cuda")]
@@ -580,6 +580,101 @@ fn measure(
     })
 }
 
+fn decode_mount_field(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn cgroup_path_parts(path: &str) -> Vec<&str> {
+    path.split('/').filter(|part| !part.is_empty()).collect()
+}
+
+fn cgroup_v2_directory(root: &Path, group: &str, mounts: &str) -> Result<(PathBuf, PathBuf)> {
+    let group_parts = cgroup_path_parts(group);
+    let mut tried = Vec::new();
+    let mut selected: Option<(usize, String, Vec<String>)> = None;
+    for line in mounts.lines() {
+        let Some((paths, options)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut options = options.split_whitespace();
+        if options.next() != Some("cgroup2") {
+            continue;
+        }
+        let mut paths = paths.split_whitespace().skip(3);
+        let (Some(base_field), Some(point_field)) = (paths.next(), paths.next()) else {
+            continue;
+        };
+        let base = decode_mount_field(base_field);
+        let point = decode_mount_field(point_field);
+        let base_parts = cgroup_path_parts(&base);
+        tried.push(format!("{point} (root {base})"));
+        let Some(rest) = group_parts.strip_prefix(base_parts.as_slice()) else {
+            continue;
+        };
+        // Remainder `..` is outside this mount.
+        if rest.contains(&"..") {
+            continue;
+        }
+        let length = base_parts.len();
+        if selected.as_ref().is_none_or(|best| length > best.0) {
+            selected = Some((
+                length,
+                point,
+                rest.iter().map(|part| (*part).to_string()).collect(),
+            ));
+        }
+    }
+    let Some((_, point, rest)) = selected else {
+        let tried = tried.join(", ");
+        bail!("expert cgroup v2 mount missing for {group}; tried {tried}");
+    };
+    let mount = root.join(point.trim_start_matches('/'));
+    let mut directory = mount.clone();
+    for part in rest {
+        directory.push(part);
+    }
+    Ok((mount, directory))
+}
+
+fn cgroup_charged_bytes(directory: &Path, current_name: &str, v1: bool) -> Result<u64> {
+    let current = directory.join(current_name);
+    let used = std::fs::read_to_string(&current)
+        .with_context(|| format!("read expert cgroup usage {}", current.display()))?
+        .trim()
+        .parse::<u64>()?;
+    let statistics = directory.join("memory.stat");
+    let statistics = std::fs::read_to_string(&statistics)
+        .with_context(|| format!("read expert cgroup statistics {}", statistics.display()))?;
+    let counter = |name: &str| -> Result<u64> {
+        statistics
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == name).then(|| fields.next()).flatten()
+            })
+            .with_context(|| {
+                format!(
+                    "expert cgroup statistics missing {name} in {}",
+                    directory.display()
+                )
+            })?
+            .parse::<u64>()
+            .with_context(|| format!("invalid expert cgroup counter {name}"))
+    };
+    let reclaimable = if v1 {
+        counter("total_active_file")?
+            .checked_add(counter("total_inactive_file")?)
+            .context("expert cgroup file LRU bytes overflow")?
+    } else {
+        counter("file")?.saturating_sub(counter("shmem")?)
+    };
+    Ok(used.saturating_sub(reclaimable))
+}
+
 pub(crate) fn host_memory(root: &Path) -> Result<u64> {
     let meminfo = std::fs::read_to_string(root.join("proc/meminfo"))?;
     let mut available = meminfo
@@ -599,15 +694,8 @@ pub(crate) fn host_memory(root: &Path) -> Result<u64> {
             .any(|controller| controller == "memory")
             .then_some(group)
     });
-    let (mount, mut directory, maximum_name, current_name) = if let Some(group) = memory {
+    let (mount, mut directory, v2) = if let Some(group) = memory {
         let mounts = std::fs::read_to_string(root.join("proc/self/mountinfo"))?;
-        let decode = |field: &str| {
-            field
-                .replace("\\040", " ")
-                .replace("\\011", "\t")
-                .replace("\\012", "\n")
-                .replace("\\134", "\\")
-        };
         let (_, point, relative) = mounts
             .lines()
             .filter_map(|line| {
@@ -621,8 +709,8 @@ pub(crate) fn host_memory(root: &Path) -> Result<u64> {
                     return None;
                 }
                 let mut paths = paths.split_whitespace().skip(3);
-                let base = decode(paths.next()?);
-                let point = decode(paths.next()?);
+                let base = decode_mount_field(paths.next()?);
+                let point = decode_mount_field(paths.next()?);
                 let relative = Path::new(group).strip_prefix(&base).ok()?.to_path_buf();
                 Some((Path::new(&base).components().count(), point, relative))
             })
@@ -630,62 +718,61 @@ pub(crate) fn host_memory(root: &Path) -> Result<u64> {
             .with_context(|| format!("expert v1 memory controller mount missing for {group}"))?;
         let mount = root.join(point.trim_start_matches('/'));
         let directory = mount.join(relative);
-        (
-            mount,
-            directory,
-            "memory.limit_in_bytes",
-            "memory.usage_in_bytes",
-        )
+        (mount, directory, false)
     } else {
         let group = groups
             .lines()
             .find_map(|line| line.strip_prefix("0::"))
             .context("expert memory controller missing from v1 and v2 cgroup memberships")?;
-        let mount = root.join("sys/fs/cgroup");
-        let directory = mount.join(group.trim_start_matches('/'));
-        (mount, directory, "memory.max", "memory.current")
+        let mounts = std::fs::read_to_string(root.join("proc/self/mountinfo"))?;
+        let (mount, directory) = cgroup_v2_directory(root, group, &mounts)?;
+        (mount, directory, true)
     };
+    let mut tried = Vec::new();
+    let mut saw_v2_controller = false;
     loop {
-        let maximum = directory.join(maximum_name);
-        if directory == mount && !maximum.try_exists()? {
-            break;
-        }
-        let limit = std::fs::read_to_string(&maximum)
-            .with_context(|| format!("read expert cgroup limit {}", maximum.display()))?;
-        if memory.is_some() || limit.trim() != "max" {
-            let current = directory.join(current_name);
-            let used = std::fs::read_to_string(&current)
-                .with_context(|| format!("read expert cgroup usage {}", current.display()))?
-                .trim()
-                .parse::<u64>()?;
-            let statistics = directory.join("memory.stat");
-            let statistics = std::fs::read_to_string(&statistics).with_context(|| {
-                format!("read expert cgroup statistics {}", statistics.display())
-            })?;
-            let counter = |name: &str| -> Result<u64> {
-                statistics
-                    .lines()
-                    .find_map(|line| {
-                        let mut fields = line.split_whitespace();
-                        (fields.next()? == name).then(|| fields.next()).flatten()
-                    })
-                    .with_context(|| {
-                        format!(
-                            "expert cgroup statistics missing {name} in {}",
-                            directory.display()
-                        )
-                    })?
-                    .parse::<u64>()
-                    .with_context(|| format!("invalid expert cgroup counter {name}"))
-            };
-            let reclaimable = if memory.is_some() {
-                counter("total_active_file")?
-                    .checked_add(counter("total_inactive_file")?)
-                    .context("expert cgroup file LRU bytes overflow")?
-            } else {
-                counter("file")?.saturating_sub(counter("shmem")?)
-            };
-            let used = used.saturating_sub(reclaimable);
+        if v2 {
+            let maximum = directory.join("memory.max");
+            match std::fs::read_to_string(&maximum) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tried.push(maximum.display().to_string());
+                }
+                Err(error) => {
+                    Err(error).with_context(|| {
+                        format!("read expert cgroup limit {}", maximum.display())
+                    })?;
+                }
+                Ok(limit) => {
+                    saw_v2_controller = true;
+                    let high_path = directory.join("memory.high");
+                    let high = match std::fs::read_to_string(&high_path) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        other => Some(other.with_context(|| {
+                            format!("read expert cgroup limit {}", high_path.display())
+                        })?),
+                    };
+                    let finite = |text: &str| text.trim() != "max";
+                    if finite(&limit) || high.as_ref().is_some_and(|text| finite(text)) {
+                        let used = cgroup_charged_bytes(&directory, "memory.current", false)?;
+                        if finite(&limit) {
+                            available =
+                                available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
+                        }
+                        if let Some(text) = high.as_deref().filter(|text| finite(text)) {
+                            available =
+                                available.min(text.trim().parse::<u64>()?.saturating_sub(used));
+                        }
+                    }
+                }
+            }
+        } else {
+            let maximum = directory.join("memory.limit_in_bytes");
+            if directory == mount && !maximum.try_exists()? {
+                break;
+            }
+            let limit = std::fs::read_to_string(&maximum)
+                .with_context(|| format!("read expert cgroup limit {}", maximum.display()))?;
+            let used = cgroup_charged_bytes(&directory, "memory.usage_in_bytes", true)?;
             available = available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
         }
         if directory == mount {
@@ -697,6 +784,11 @@ pub(crate) fn host_memory(root: &Path) -> Result<u64> {
             mount.display()
         );
     }
+    let tried = tried.join(", ");
+    ensure!(
+        !v2 || saw_v2_controller,
+        "expert cgroup v2 memory controller missing; tried {tried}"
+    );
     let limits = std::fs::read_to_string(root.join("proc/self/limits"))?;
     let resident_limit = limits
         .lines()
