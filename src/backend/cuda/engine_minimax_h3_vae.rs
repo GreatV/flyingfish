@@ -16,7 +16,7 @@ use crate::backend::cuda::{
 use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
 };
-use crate::checkpoint::TensorManifest;
+use crate::checkpoint::{MappedCheckpoint, TensorManifest};
 use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, VaeSpec, VaeTiles};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -1050,6 +1050,68 @@ impl<'a> DecoderWeightLoad<'a> {
     /// `in_flight` slots of the largest tensor; a host budget that denies it keeps the
     /// serial chunked staging in [`DecoderWeightLoad::tensor`]. Nothing is retried.
     fn preload_resident(&mut self, d: &Device, component: &'static str) -> Result<()> {
+        self.preload_resident_from(d, component, &mut None)
+    }
+
+    /// `hoist` sources every resident tensor from the arena instead of the ring.
+    fn preload_resident_from(
+        &mut self,
+        d: &Device,
+        component: &'static str,
+        hoist: &mut Option<&mut VaeHoist>,
+    ) -> Result<()> {
+        if let Some(hoist) = hoist.as_deref_mut() {
+            let names: Vec<String> = self
+                .manifest
+                .entries
+                .keys()
+                .filter(|name| {
+                    (name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+                        && !self.offsets.contains_key(*name)
+                })
+                .cloned()
+                .collect();
+            for name in &names {
+                let entry = &self.manifest.entries[name.as_str()];
+                let bytes = decoder_tensor_bytes(self.manifest, name);
+                let (at, hoisted) = hoist.windows[name.as_str()];
+                ensure!(
+                    hoisted == bytes && at + bytes <= hoist.arena.len(),
+                    "video hoist window for {name}"
+                );
+                super::resident_raw_finite(
+                    name,
+                    entry,
+                    if decoder_weight_width(name) == 2 {
+                        super::FillCast::F32ToBf16
+                    } else {
+                        super::FillCast::Raw
+                    },
+                    &hoist.arena[at..at + bytes],
+                )?;
+                let buffer = unsafe { d.upload.alloc::<u8>(bytes)? };
+                let ptr = buffer.device_ptr(&d.upload).0;
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(
+                        ptr,
+                        &hoist.arena[at..at + bytes],
+                        d.upload.cu_stream(),
+                    )?;
+                }
+                self.resident.insert(name.clone(), ptr);
+                self.storage.push(buffer);
+            }
+            d.upload.synchronize()?;
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"h3_fill_schedule": {
+                        "component": component, "decision": "hoisted",
+                        "requests": names.len()}})
+                );
+            }
+            return Ok(());
+        }
         let names: Vec<(String, usize)> = self
             .manifest
             .entries
@@ -1371,13 +1433,125 @@ impl<'a> DecoderWeightLoad<'a> {
     }
 }
 
+/// The video VAE weights read and narrowed beside the DiT compute: a pageable arena of
+/// runtime-form windows plus the fill thread that produces it. No H2D happens before the
+/// DiT drops; `video_weight_load` joins the thread before its first byte leaves the arena.
+pub(super) struct VaeHoist {
+    arena: Vec<u8>,
+    windows: std::collections::BTreeMap<String, (usize, usize)>,
+    thread: Option<super::FillThread>,
+}
+
+impl VaeHoist {
+    /// Joins the fill; a failed read propagates the reader's error text.
+    fn join(&mut self) -> Result<()> {
+        if let Some(thread) = self.thread.as_mut() {
+            thread.join()?;
+            self.thread = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VaeHoist {
+    fn drop(&mut self) {
+        self.join().ok();
+    }
+}
+
+/// Reads and narrows every video VAE decoder tensor into a pageable arena on a background
+/// fill thread. The derivation hoists only when the DiT placement has no disk tier
+/// (`disk_tier` false, after the DiT fills joined) and the sensed host budget covers the
+/// arena plus a 4 GiB reserve; a skip prints its reason. Nothing is retried.
+pub(super) fn hoist_video_vae(model: &Path, disk_tier: bool) -> Result<Option<VaeHoist>> {
+    let dir = model.join("vae");
+    let spec = VaeSpec::read(model)?;
+    let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+        .minimax_h3_vae_manifest(&spec)?;
+    let names: Vec<&String> = manifest
+        .entries
+        .keys()
+        .filter(|name| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+        .collect();
+    let mut windows = std::collections::BTreeMap::new();
+    let mut requests = Vec::new();
+    let mut arena = Vec::new();
+    let mut total = 0usize;
+    for name in &names {
+        let entry = &manifest.entries[name.as_str()];
+        let bytes = decoder_tensor_bytes(&manifest, name);
+        ensure!(total.is_multiple_of(16), "video hoist weight alignment");
+        windows.insert((*name).clone(), (total, bytes));
+        let cast = if decoder_weight_width(name) == 2 {
+            FillCast::F32ToBf16
+        } else {
+            FillCast::Raw
+        };
+        requests.push(OwnedRead::new(
+            name,
+            entry,
+            std::ptr::null_mut(),
+            bytes,
+            cast,
+        ));
+        total += bytes;
+    }
+    let reason = if disk_tier { "skip:disk-tier" } else { "" };
+    let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
+        "/",
+    ))?)?;
+    let fits = available >= total + (4 << 30);
+    let decision = if !reason.is_empty() {
+        reason
+    } else if fits {
+        "hoist"
+    } else {
+        "skip:host-budget"
+    };
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_fill_schedule": {
+                "component": "video-vae-hoist", "decision": decision,
+                "arena_bytes": total, "requests": requests.len(),
+                "host_available_bytes": available, "host_reserve_bytes": 4 << 30}})
+        );
+    }
+    if decision != "hoist" {
+        return Ok(None);
+    }
+    arena.resize(total, 0);
+    let mut filled: Vec<OwnedRead> = Vec::with_capacity(requests.len());
+    for mut request in requests {
+        let (at, bytes) = windows[request.name()];
+        request = OwnedRead::new(
+            request.name(),
+            request.entry(),
+            unsafe { arena.as_mut_ptr().add(at) },
+            bytes,
+            request.cast(),
+        );
+        filled.push(request);
+    }
+    let thread = super::FillThread::spawn(&dir, filled)?;
+    Ok(Some(VaeHoist {
+        arena,
+        windows,
+        thread: Some(thread),
+    }))
+}
+
 fn video_weight_load<'a>(
     d: &Device,
     spec: &VaeSpec,
     dir: &Path,
     manifest: &'a TensorManifest,
     (future, mode): (usize, super::Placement),
+    hoist: &mut Option<&mut VaeHoist>,
 ) -> Result<DecoderWeightLoad<'a>> {
+    if let Some(hoist) = hoist.as_deref_mut() {
+        hoist.join()?;
+    }
     let mut order = vec![Vec::new(); spec.layers];
     let mut sizes = vec![0; spec.layers];
     let mut fixed_norm1 = 0usize;
@@ -1499,6 +1673,31 @@ fn video_weight_load<'a>(
                 ensure!(offset == pinned.len(), "video pinned layer byte count");
             }
         }
+        if hoist.is_some() {
+            let source = hoist.as_deref_mut().expect("checked");
+            for (layer, names) in order.iter().enumerate() {
+                if let Some(pinned) = dense.host_layer(layer)? {
+                    let mut offset = 0;
+                    for name in names {
+                        let bytes = decoder_tensor_bytes(manifest, name);
+                        ensure!(offset % 16 == 0, "video pinned weight alignment");
+                        loader.offsets.insert((*name).clone(), (layer, offset));
+                        let (at, hoisted) = source.windows[name.as_str()];
+                        ensure!(
+                            hoisted == bytes && at + bytes <= source.arena.len(),
+                            "video hoist window for {name}"
+                        );
+                        pinned[offset..offset + bytes]
+                            .copy_from_slice(&source.arena[at..at + bytes]);
+                        offset += bytes;
+                    }
+                    ensure!(offset == pinned.len(), "video pinned layer byte count");
+                }
+            }
+            loader.dense = Some(DenseTier { fill: None, dense });
+            loader.preload_resident_from(d, "video-vae", hoist)?;
+            return Ok(loader);
+        }
         let slot_bytes = dense.plan.slot_bytes;
         loader.dense = Some(DenseTier::schedule(
             "video-vae",
@@ -1509,7 +1708,7 @@ fn video_weight_load<'a>(
             (slot_count, slot_bytes, largest),
         )?);
     }
-    loader.preload_resident(d, "video-vae")?;
+    loader.preload_resident_from(d, "video-vae", hoist)?;
     Ok(loader)
 }
 
@@ -1520,11 +1719,12 @@ impl VideoDecoder {
         dir: &Path,
         manifest: &TensorManifest,
         placement: (usize, super::Placement),
+        mut hoist: Option<&mut VaeHoist>,
     ) -> Result<Self> {
         Self::from_weights(
             d,
             spec,
-            video_weight_load(d, spec, dir, manifest, placement)?,
+            video_weight_load(d, spec, dir, manifest, placement, &mut hoist)?,
         )
     }
 
@@ -3374,8 +3574,14 @@ pub(crate) mod image_tests {
                     super::super::Placement::Derived,
                     super::super::Placement::Streamed,
                 ] {
-                    let mut decoder =
-                        VideoDecoder::new(&d, &spec, &component, &manifest, (future, placement))?;
+                    let mut decoder = VideoDecoder::new(
+                        &d,
+                        &spec,
+                        &component,
+                        &manifest,
+                        (future, placement),
+                        None,
+                    )?;
                     decoder.prefix_only = true;
                     let mut work =
                         decoder.work(&d, &tiles, (latent_frames, height / r, width / r))?;
@@ -3528,6 +3734,7 @@ pub(crate) mod image_tests {
                     TileWork::bytes(&spec, shape),
                     super::super::Placement::Derived,
                 ),
+                None,
             )?;
             decoder.prefix_only = true;
             let mut work = TileWork::new(s, &spec, shape, (1, 1))?;
@@ -4996,7 +5203,7 @@ pub(crate) mod image_tests {
             let run = |blas: &mut Blas, placement| -> Result<Vec<bf16>> {
                 let future = TileWork::bytes(&spec, shape) + (1 << 30);
                 let decoder =
-                    VideoDecoder::new(&d, &spec, &component, &manifest, (future, placement))?;
+                    VideoDecoder::new(&d, &spec, &component, &manifest, (future, placement), None)?;
                 let mut work = TileWork::new(s, &spec, shape, (1, 1))?;
                 decoder.bind(blas, &work)?;
                 let input = s.clone_htod(&input_host)?;
