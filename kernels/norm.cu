@@ -5,6 +5,10 @@
 //
 // Semantics
 //   rms_norm:    y[r][d] = x[r][d] * rsqrt(mean_d(x[r][.]^2) + eps) * w[d]
+//   gated_add_rms_norm_modulate:
+//                x[r][d] = bf16(x[r][d] + bf16(gate[pg][d] * y[r][d]))
+//                out[r] = rms_norm_modulate(stored x[r], w, shift[pn], scale[pn])
+//                pg = gate_index[r], pn = norm_index[r]. Variance reads the stored BF16 x.
 //   add_rmsnorm: res_out[r][d] = bf16(res[r][d] + x[r][d])   (add in fp32, one round)
 //                y[r][d] = bf16(res_out[r][d]) * rsqrt(mean_d(res_out[r][.]^2) + eps) * w[d]
 //                (the norm consumes the rounded residual as stored)
@@ -115,6 +119,17 @@ __device__ __forceinline__ void st_vec(__nv_bfloat16* __restrict__ p,
   }
 }
 
+// Store BF16 bits already rounded by __float2bfloat16_rn. VEC is 8.
+template <int VEC>
+__device__ __forceinline__ void st_raw_vec(__nv_bfloat16* __restrict__ p,
+                                          const __nv_bfloat16* __restrict__ h) {
+  static_assert(VEC == 8, "gated residual store is 8-wide");
+  union U { float4 v; __nv_bfloat16 e[8]; } u;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) u.e[k] = h[k];
+  *reinterpret_cast<float4*>(p) = u.v;
+}
+
 template <bool BF16_SCALE>
 __device__ __forceinline__ float norm_scale(float x, float inv, float weight) {
   const float normalized = x * inv;
@@ -197,6 +212,96 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
         out[j] = rmsnorm_epilogue<MODULATE>(
             norm_scale<BF16_SCALE>(r[j], rstd, ww[j]), shift, scale, idx + j);
       st_vec<VEC>(y + idx, out);
+    }
+  }
+}
+
+// One block: gated residual into x, then rmsnorm_row<VEC, false, true, true> on that row.
+// ROUND_VARIANCE false squares the pre-round f32 sum and is the parity control.
+template <int VEC, bool ROUND_VARIANCE>
+__device__ __forceinline__ void gated_add_rmsnorm_row(
+    __nv_bfloat16* x, const __nv_bfloat16* y, const __nv_bfloat16* gate_row,
+    const __nv_bfloat16* __restrict__ w, __nv_bfloat16* out,
+    const __nv_bfloat16* shift, const __nv_bfloat16* scale, int n, float eps) {
+  __shared__ float smem[32];
+  const int nthr = blockDim.x;
+  const int gid = threadIdx.x;
+  const int nv = n / VEC;
+  const bool cached = (nv <= nthr * (kMaxPerThread / VEC));
+  if (!ROUND_VARIANCE && !cached) __trap();
+
+  float r[kMaxPerThread];
+  float ssq = 0.0f;
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        const size_t idx = (size_t)c * VEC;
+        float xv[VEC], yv[VEC], gv[VEC];
+        __nv_bfloat16 bits[VEC];
+        ld_vec<VEC>(x + idx, xv);
+        ld_vec<VEC>(y + idx, yv);
+        ld_vec<VEC>(gate_row + idx, gv);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+          const __nv_bfloat16 gated = __float2bfloat16_rn(gv[j] * yv[j]);
+          const float pre = xv[j] + __bfloat162float(gated);
+          bits[j] = __float2bfloat16_rn(pre);
+          const float variance = ROUND_VARIANCE ? __bfloat162float(bits[j]) : pre;
+          r[i * VEC + j] = variance;
+          ssq += variance * variance;
+        }
+        st_raw_vec<VEC>(x + idx, bits);
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      const size_t idx = (size_t)c * VEC;
+      float xv[VEC], yv[VEC], gv[VEC];
+      __nv_bfloat16 bits[VEC];
+      ld_vec<VEC>(x + idx, xv);
+      ld_vec<VEC>(y + idx, yv);
+      ld_vec<VEC>(gate_row + idx, gv);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        const __nv_bfloat16 gated = __float2bfloat16_rn(gv[j] * yv[j]);
+        const float pre = xv[j] + __bfloat162float(gated);
+        bits[j] = __float2bfloat16_rn(pre);
+        const float variance = __bfloat162float(bits[j]);
+        ssq += variance * variance;
+      }
+      st_raw_vec<VEC>(x + idx, bits);
+    }
+  }
+  const float rstd = rsqrtf(block_reduce_sum(ssq, smem) / (float)n + eps);
+
+  if (cached) {
+#pragma unroll
+    for (int i = 0; i < kMaxPerThread / VEC; ++i) {
+      const int c = gid + i * nthr;
+      if (c < nv) {
+        const size_t idx = (size_t)c * VEC;
+        float ww[VEC], outv[VEC];
+        ld_vec<VEC>(w + idx, ww);
+#pragma unroll
+        for (int j = 0; j < VEC; ++j)
+          outv[j] = rmsnorm_epilogue<true>(
+              norm_scale<false>(r[i * VEC + j], rstd, ww[j]), shift, scale, idx + j);
+        st_vec<VEC>(out + idx, outv);
+      }
+    }
+  } else {
+    for (int c = gid; c < nv; c += nthr) {
+      const size_t idx = (size_t)c * VEC;
+      float xv[VEC], ww[VEC], outv[VEC];
+      ld_vec<VEC>(x + idx, xv);
+      ld_vec<VEC>(w + idx, ww);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j)
+        outv[j] = rmsnorm_epilogue<true>(
+            norm_scale<false>(xv[j], rstd, ww[j]), shift, scale, idx + j);
+      st_vec<VEC>(out + idx, outv);
     }
   }
 }
@@ -390,6 +495,42 @@ __global__ __launch_bounds__(768, 2) void rms_norm_modulate(
   const size_t param = (size_t)p * stride;
   rmsnorm_row<8, false, true, true>(x + off, w, y + off, dim, eps,
                                    shift + param, scale + param);
+}
+
+// x is updated in place. out may alias y. Variance reads the stored BF16 residual.
+__global__ __launch_bounds__(768, 2) void gated_add_rms_norm_modulate(
+    __nv_bfloat16* x, const __nv_bfloat16* y, const __nv_bfloat16* gate,
+    const unsigned* gate_index, unsigned long long gate_stride, unsigned gate_entries,
+    const __nv_bfloat16* w, __nv_bfloat16* out, const __nv_bfloat16* shift,
+    const __nv_bfloat16* scale, const unsigned* norm_index, unsigned long long norm_stride,
+    unsigned norm_entries, int rows, int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned pg = gate_index[row];
+  const unsigned pn = norm_index[row];
+  if (pg >= gate_entries || pn >= norm_entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  gated_add_rmsnorm_row<8, true>(
+      x + off, y + off, gate + (size_t)pg * gate_stride, w, out + off,
+      shift + (size_t)pn * norm_stride, scale + (size_t)pn * norm_stride, dim, eps);
+}
+
+// Residual store matches gated_add_rms_norm_modulate. Variance uses the pre-round f32 sum.
+__global__ __launch_bounds__(768, 2) void gated_add_rms_norm_modulate_raw_var(
+    __nv_bfloat16* x, const __nv_bfloat16* y, const __nv_bfloat16* gate,
+    const unsigned* gate_index, unsigned long long gate_stride, unsigned gate_entries,
+    const __nv_bfloat16* w, __nv_bfloat16* out, const __nv_bfloat16* shift,
+    const __nv_bfloat16* scale, const unsigned* norm_index, unsigned long long norm_stride,
+    unsigned norm_entries, int rows, int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const unsigned pg = gate_index[row];
+  const unsigned pn = norm_index[row];
+  if (pg >= gate_entries || pn >= norm_entries || (dim & 7) != 0) __trap();
+  const size_t off = (size_t)row * dim;
+  gated_add_rmsnorm_row<8, false>(
+      x + off, y + off, gate + (size_t)pg * gate_stride, w, out + off,
+      shift + (size_t)pn * norm_stride, scale + (size_t)pn * norm_stride, dim, eps);
 }
 
 __global__ __launch_bounds__(1024) void add_rmsnorm_bf16(const __nv_bfloat16* x,

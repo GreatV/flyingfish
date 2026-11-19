@@ -951,6 +951,12 @@ impl AdalnTable {
             mode,
         )?;
         s.synchronize()?;
+        for (name, table) in [("adaln.blocks", &blocks), ("adaln.norm_out", &norm_out)] {
+            ensure!(
+                !table.is_empty() && pointer(table, s) != 0,
+                "{name} is not device-resident"
+            );
+        }
         Ok(Self { blocks, norm_out })
     }
 }
@@ -1760,6 +1766,9 @@ pub(crate) struct BlockKernels {
     #[cfg(test)]
     serial_norm_modulate: std::cell::Cell<bool>,
     gated_add: crate::backend::gpu::CudaFunction,
+    gated_add_rms: crate::backend::gpu::CudaFunction,
+    #[cfg(test)]
+    gated_add_rms_raw: crate::backend::gpu::CudaFunction,
     residual: crate::backend::gpu::CudaFunction,
     stored_launch: std::sync::OnceLock<StoredLaunch>,
 }
@@ -1789,6 +1798,12 @@ impl BlockKernels {
             fused_f32 >= baseline,
             "rms_norm_modulate occupancy {fused_f32} below rms_norm_bf16 {baseline}"
         );
+        let gated_add_rms = norm.load_function("gated_add_rms_norm_modulate")?;
+        let gated_active = active(&gated_add_rms)?;
+        ensure!(
+            gated_active >= baseline,
+            "gated_add_rms_norm_modulate occupancy {gated_active} below rms_norm_bf16 {baseline}"
+        );
         Ok(Self {
             norm: plain,
             norm_f32,
@@ -1805,6 +1820,9 @@ impl BlockKernels {
             #[cfg(test)]
             serial_norm_modulate: std::cell::Cell::new(false),
             gated_add: modulate.load_function("row_gated_add")?,
+            gated_add_rms,
+            #[cfg(test)]
+            gated_add_rms_raw: norm.load_function("gated_add_rms_norm_modulate_raw_var")?,
             stored_launch: std::sync::OnceLock::new(),
         })
     }
@@ -1841,6 +1859,8 @@ pub(crate) struct BlockWork {
     qkv_product: crate::convrot::ProductKernel,
     #[cfg(test)]
     repeat_ffn_input: bool,
+    /// The previous live block already wrote this block's norm1 into `normed`.
+    skip_norm1: bool,
     /// When set, `block_forward` copies the modulated norm2 rows out right
     /// after they are written (the FFN overwrites them otherwise).
     #[cfg(test)]
@@ -2251,6 +2271,7 @@ impl BlockWork {
             qkv_product: crate::convrot::ProductKernel::NFast,
             #[cfg(test)]
             repeat_ffn_input: false,
+            skip_norm1: false,
             normed,
             q_raw,
             k_raw,
@@ -2695,6 +2716,18 @@ pub(crate) fn block_forward<const LORA: bool>(
     x: &mut CudaSlice<bf16>,
     work: &mut BlockWork,
 ) -> Result<()> {
+    block_forward_tail::<LORA>(c, flash, w, conditioning, x, work, None)
+}
+
+fn block_forward_tail<const LORA: bool>(
+    c: &BlockContext<'_>,
+    flash: &mut Flash,
+    w: &BlockWeights,
+    conditioning: &Conditioning<'_>,
+    x: &mut CudaSlice<bf16>,
+    work: &mut BlockWork,
+    tail: Option<NormTail>,
+) -> Result<()> {
     let (s, blas, kernels, spec, lora_scale) = (c.s, c.blas, c.kernels, c.spec, c.lora_scale);
     let rows = work.rows;
     let (h, width, r) = (spec.hidden, spec.heads * spec.head_dim, w.rank);
@@ -2716,6 +2749,11 @@ pub(crate) fn block_forward<const LORA: bool>(
     if w.dropped {
         return Ok(());
     }
+    let skip_norm1 = std::mem::replace(&mut work.skip_norm1, false);
+    #[cfg(test)]
+    let serial_norm = kernels.serial_norm_modulate.get();
+    #[cfg(not(test))]
+    let serial_norm = false;
     let stride = 6 * h;
     let (table, index, entries) = match modulation {
         Some(m) => (
@@ -2793,7 +2831,14 @@ pub(crate) fn block_forward<const LORA: bool>(
         });
         apply_linear(c, &w.linears[index], x, y, scratch)
     };
-    hidden_norm(&w.norm1, 0, 1)?;
+    if skip_norm1 {
+        ensure!(
+            modulation.is_some(),
+            "skipped norm1 on an unmodulated block"
+        );
+    } else {
+        hidden_norm(&w.norm1, 0, 1)?;
+    }
     if !apply_shared_qkv(c, w, work, scratch)? {
         for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
             base(
@@ -2894,19 +2939,60 @@ pub(crate) fn block_forward<const LORA: bool>(
             false,
         )?;
     }
-    if modulation.is_some() {
+    let fuse_norm = |gate_chunk: usize, tail: NormTail| -> Result<()> {
+        kernels.gated_add_rms(
+            s,
+            &GatedAddRms {
+                x: xp,
+                y: normed,
+                gate: chunk(gate_chunk),
+                gate_index: index,
+                gate_stride: stride,
+                gate_entries: entries,
+                weight: tail.weight,
+                output: normed,
+                shift: tail.shift,
+                scale: tail.scale,
+                norm_index: tail.index,
+                norm_stride: tail.stride,
+                norm_entries: tail.entries,
+                rows,
+                dim: h,
+                eps: tail.eps,
+            },
+        )
+    };
+    if modulation.is_some() && !serial_norm {
+        fuse_norm(
+            2,
+            NormTail {
+                weight: w.norm2.tensor.ptr,
+                shift: chunk(3),
+                scale: chunk(4),
+                index,
+                stride,
+                entries,
+                eps: spec.norm_eps,
+                arms_norm1: false,
+            },
+        )?;
+    } else if modulation.is_some() {
         gated_add(xp, normed, 2)?;
+        hidden_norm(&w.norm2, 3, 4)?;
     } else {
         residual(xp, normed)?;
+        hidden_norm(&w.norm2, 3, 4)?;
     }
-
-    hidden_norm(&w.norm2, 3, 4)?;
     #[cfg(test)]
     if work.keep_normed {
         work.normed_probe = s.clone_dtoh(&work.normed)?;
     }
     ffn_forward::<false, LORA>(c, w, work, scratch)?;
-    if modulation.is_some() {
+    if let Some(tail) = tail.filter(|_| modulation.is_some() && !serial_norm) {
+        let arms_norm1 = tail.arms_norm1;
+        fuse_norm(5, tail)?;
+        work.skip_norm1 = arms_norm1;
+    } else if modulation.is_some() {
         gated_add(xp, normed, 5)?;
     } else {
         residual(xp, normed)?;
@@ -3018,6 +3104,55 @@ struct NormRows {
     eps: f32,
 }
 
+/// Gated residual plus the RMSNorm that reads the stored BF16 row. `output` may alias `y`.
+struct GatedAddRms {
+    x: u64,
+    y: u64,
+    gate: u64,
+    gate_index: u64,
+    gate_stride: usize,
+    gate_entries: u32,
+    weight: u64,
+    output: u64,
+    shift: u64,
+    scale: u64,
+    norm_index: u64,
+    norm_stride: usize,
+    norm_entries: u32,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+}
+
+/// Norm applied to the gated residual: the next live block's norm1, or `norm_out` on the last live block.
+#[derive(Clone, Copy)]
+struct NormTail {
+    weight: u64,
+    shift: u64,
+    scale: u64,
+    index: u64,
+    stride: usize,
+    entries: u32,
+    eps: f32,
+    arms_norm1: bool,
+}
+
+struct Scale2Sources {
+    hidden: usize,
+    block_rows: usize,
+    pairs: u32,
+    timesteps: u32,
+    norm_eps: f32,
+    final_eps: f32,
+    table: u64,
+    block_table_len: usize,
+    norm_out_weight: u64,
+    norm_out_table: u64,
+    norm_table_len: usize,
+    row_pairs: u64,
+    row_timesteps: u64,
+}
+
 /// One `row_modulate` launch over dense `[rows, dim]` data with table rows of `stride` elements.
 struct ModulateRows {
     data: u64,
@@ -3111,6 +3246,81 @@ impl BlockKernels {
                 .launch(LaunchConfig {
                     grid_dim: (u32::try_from(n.rows)?, 1, 1),
                     block_dim: (n.threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn gated_add_rms(&self, s: &Arc<CudaStream>, g: &GatedAddRms) -> Result<()> {
+        self.launch_gated_add_rms(s, &self.gated_add_rms, g)
+    }
+
+    #[cfg(test)]
+    fn gated_add_rms_raw(&self, s: &Arc<CudaStream>, g: &GatedAddRms) -> Result<()> {
+        self.launch_gated_add_rms(s, &self.gated_add_rms_raw, g)
+    }
+
+    fn launch_gated_add_rms(
+        &self,
+        s: &Arc<CudaStream>,
+        kernel: &crate::backend::gpu::CudaFunction,
+        g: &GatedAddRms,
+    ) -> Result<()> {
+        ensure!(
+            g.rows > 0
+                && g.dim > 0
+                && g.dim.is_multiple_of(8)
+                && g.dim / 8 <= HIDDEN_NORM_THREADS as usize
+                && g.gate_stride >= g.dim
+                && g.norm_stride >= g.dim
+                && g.gate_stride.is_multiple_of(8)
+                && g.norm_stride.is_multiple_of(8)
+                && g.gate_entries > 0
+                && g.norm_entries > 0
+                && g.gate_index != 0
+                && g.norm_index != 0
+                && g.gate_index.is_multiple_of(4)
+                && g.norm_index.is_multiple_of(4)
+                && g.x != g.y
+                && g.x != g.output,
+            "gated RMSNorm launch extent"
+        );
+        for p in [g.x, g.y, g.gate, g.weight, g.output, g.shift, g.scale] {
+            ensure!(p != 0 && p.is_multiple_of(16), "gated RMSNorm alignment");
+        }
+        g.rows
+            .checked_mul(g.dim)
+            .context("gated RMSNorm element extent overflow")?;
+        g.gate_stride
+            .checked_mul(g.gate_entries as usize)
+            .context("gate table extent overflow")?;
+        g.norm_stride
+            .checked_mul(g.norm_entries as usize)
+            .context("norm table extent overflow")?;
+        let rows = i32::try_from(g.rows)?;
+        let dim = i32::try_from(g.dim)?;
+        unsafe {
+            s.launch_builder(kernel)
+                .arg(&g.x)
+                .arg(&g.y)
+                .arg(&g.gate)
+                .arg(&g.gate_index)
+                .arg(&(g.gate_stride as u64))
+                .arg(&g.gate_entries)
+                .arg(&g.weight)
+                .arg(&g.output)
+                .arg(&g.shift)
+                .arg(&g.scale)
+                .arg(&g.norm_index)
+                .arg(&(g.norm_stride as u64))
+                .arg(&g.norm_entries)
+                .arg(&rows)
+                .arg(&dim)
+                .arg(&g.eps)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(g.rows)?, 1, 1),
+                    block_dim: (HIDDEN_NORM_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
         }
@@ -4339,6 +4549,94 @@ fn place_stored_layers(
     Ok((tier, packed))
 }
 
+fn require_resident_norms(
+    s: &Arc<CudaStream>,
+    blocks: &[BlockWeights],
+    norm_out: &CudaSlice<bf16>,
+    hidden: usize,
+) -> Result<()> {
+    ensure!(
+        norm_out.len() == hidden && pointer(norm_out, s) != 0,
+        "norm_out.norm.weight is not device-resident"
+    );
+    for (layer, block) in blocks.iter().enumerate() {
+        for (name, weight) in [("norm1", &block.norm1), ("norm2", &block.norm2)] {
+            let owner = weight
+                ._owned
+                .as_ref()
+                .map(|v| (pointer(v, s), v.len() * std::mem::size_of::<bf16>()))
+                .or_else(|| weight._arena.as_ref().map(|v| (pointer(v, s), v.len())));
+            let bytes = hidden * std::mem::size_of::<bf16>();
+            ensure!(
+                weight.tensor.span_bytes == bytes as u64
+                    && owner.is_some_and(|(base, len)| {
+                        weight
+                            .tensor
+                            .ptr
+                            .checked_sub(base)
+                            .and_then(|offset| offset.checked_add(bytes as u64))
+                            .is_some_and(|end| end <= len as u64)
+                    }),
+                "transformer_blocks.{layer}.{name}.weight is not device-resident"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn fuse_cross_block(kernels: &BlockKernels) -> bool {
+    #[cfg(test)]
+    return !kernels.serial_norm_modulate.get();
+    #[cfg(not(test))]
+    {
+        let _ = kernels;
+        true
+    }
+}
+
+fn scale2_tail(
+    blocks: &[BlockWeights],
+    layer: usize,
+    src: &Scale2Sources,
+) -> Result<Option<NormTail>> {
+    if blocks[layer].dropped {
+        return Ok(None);
+    }
+    if let Some(next) = (layer + 1..blocks.len()).find(|&i| !blocks[i].dropped) {
+        let end = next
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(src.block_rows))
+            .context("modulation table extent")?;
+        ensure!(end <= src.block_table_len, "modulation table extent");
+        let base = src.table + 2 * (next * src.block_rows) as u64;
+        Ok(Some(NormTail {
+            weight: blocks[next].norm1.tensor.ptr,
+            shift: base,
+            scale: base + (2 * src.hidden) as u64,
+            index: src.row_pairs,
+            stride: 6 * src.hidden,
+            entries: src.pairs,
+            eps: src.norm_eps,
+            arms_norm1: true,
+        }))
+    } else {
+        ensure!(
+            src.norm_table_len == src.timesteps as usize * 2 * src.hidden,
+            "output-norm table extent"
+        );
+        Ok(Some(NormTail {
+            weight: src.norm_out_weight,
+            shift: src.norm_out_table,
+            scale: src.norm_out_table + (2 * src.hidden) as u64,
+            index: src.row_timesteps,
+            stride: 2 * src.hidden,
+            entries: src.timesteps,
+            eps: src.final_eps,
+            arms_norm1: false,
+        }))
+    }
+}
+
 fn forward_block<const LORA: bool>(
     c: &BlockContext<'_>,
     flash: &mut Flash,
@@ -4753,6 +5051,7 @@ impl Dit {
                 }})
             );
         }
+        require_resident_norms(s, &blocks, &norm_out, h)?;
         Ok(Self {
             ranges,
             proj_in,
@@ -5008,7 +5307,25 @@ impl Dit {
         )?;
 
         let block_rows = 6 * h * pairs as usize;
-        for (layer, block) in self.blocks.iter().enumerate() {
+        let sources = Scale2Sources {
+            hidden: h,
+            block_rows,
+            pairs,
+            timesteps,
+            norm_eps: spec.norm_eps,
+            final_eps: spec.final_norm_eps,
+            table: pointer(&adaln.blocks, s),
+            block_table_len: adaln.blocks.len(),
+            norm_out_weight: pointer(&self.norm_out, s),
+            norm_out_table: pointer(&adaln.norm_out, s),
+            norm_table_len: adaln.norm_out.len(),
+            row_pairs: pointer(inputs.row_pairs, s),
+            row_timesteps: pointer(inputs.row_timesteps, s),
+        };
+        let fuse = fuse_cross_block(c.kernels);
+        let mut fused_norm_out = false;
+        self.work.skip_norm1 = false;
+        for layer in 0..self.blocks.len() {
             if let Some(tier) = self.tier.as_mut() {
                 tier.ready()?.begin(layer, s)?;
             }
@@ -5018,63 +5335,71 @@ impl Dit {
                 entries: pairs,
                 index: inputs.row_pairs,
             };
+            let tail = if fuse {
+                scale2_tail(&self.blocks, layer, &sources)?
+            } else {
+                None
+            };
+            fused_norm_out |= tail.as_ref().is_some_and(|tail| !tail.arms_norm1);
+            let conditioning = Conditioning::Modulated {
+                rotary: &self.rotary,
+                modulation: &modulation,
+            };
             if spec.is_hyperflow()? {
-                forward_block::<false>(
+                block_forward_tail::<false>(
                     c,
                     &mut self.flash,
-                    block,
-                    &Conditioning::Modulated {
-                        rotary: &self.rotary,
-                        modulation: &modulation,
-                    },
+                    &self.blocks[layer],
+                    &conditioning,
                     &mut self.x,
                     &mut self.work,
+                    tail,
                 )?;
             } else {
-                forward_block::<true>(
+                block_forward_tail::<true>(
                     c,
                     &mut self.flash,
-                    block,
-                    &Conditioning::Modulated {
-                        rotary: &self.rotary,
-                        modulation: &modulation,
-                    },
+                    &self.blocks[layer],
+                    &conditioning,
                     &mut self.x,
                     &mut self.work,
+                    tail,
                 )?;
             }
             if let Some(tier) = self.tier.as_mut() {
                 tier.ready()?.end(layer, s)?;
             }
         }
-        let normed = pointer(&self.work.normed, s);
-        ensure!(
-            adaln.norm_out.len() == timesteps as usize * 2 * h,
-            "output-norm table extent"
-        );
-        let table = pointer(&adaln.norm_out, s);
-        c.kernels.rms_norm_modulate_f32(
-            s,
-            NormRows {
-                input: pointer(&self.x, s),
-                weight: pointer(&self.norm_out, s),
-                output: normed,
-                rows: r.rows,
-                dim: h,
-                threads: HIDDEN_NORM_THREADS,
-                eps: spec.final_norm_eps,
-            },
-            ModulateRows {
-                data: normed,
-                shift: table,
-                scale: table + 2 * h as u64,
-                index: pointer(inputs.row_timesteps, s),
-                rows: r.rows,
-                dim: h,
-                stride: 2 * h,
-                entries: timesteps,
-            },
-        )?;
+        if !fused_norm_out {
+            let normed = pointer(&self.work.normed, s);
+            ensure!(
+                adaln.norm_out.len() == timesteps as usize * 2 * h,
+                "output-norm table extent"
+            );
+            let table = pointer(&adaln.norm_out, s);
+            c.kernels.rms_norm_modulate_f32(
+                s,
+                NormRows {
+                    input: pointer(&self.x, s),
+                    weight: pointer(&self.norm_out, s),
+                    output: normed,
+                    rows: r.rows,
+                    dim: h,
+                    threads: HIDDEN_NORM_THREADS,
+                    eps: spec.final_norm_eps,
+                },
+                ModulateRows {
+                    data: normed,
+                    shift: table,
+                    scale: table + 2 * h as u64,
+                    index: pointer(inputs.row_timesteps, s),
+                    rows: r.rows,
+                    dim: h,
+                    stride: 2 * h,
+                    entries: timesteps,
+                },
+            )?;
+        }
         let generated = r.rows - r.video_start;
         upcast_from(
             s,
@@ -5451,6 +5776,7 @@ impl ImageDit {
             );
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
+        require_resident_norms(s, &blocks, &norm_out, h)?;
         Ok(Self {
             text_rows,
             image_rows,
@@ -5615,7 +5941,25 @@ impl ImageDit {
             image_rows * h,
         )?;
         let block_rows = 6 * h * pairs as usize;
-        for (layer, block) in self.blocks.iter().enumerate() {
+        let sources = Scale2Sources {
+            hidden: h,
+            block_rows,
+            pairs,
+            timesteps,
+            norm_eps: spec.norm_eps,
+            final_eps: spec.final_norm_eps,
+            table: pointer(&adaln.blocks, s),
+            block_table_len: adaln.blocks.len(),
+            norm_out_weight: pointer(&self.norm_out, s),
+            norm_out_table: pointer(&adaln.norm_out, s),
+            norm_table_len: adaln.norm_out.len(),
+            row_pairs: pointer(inputs.row_pairs, s),
+            row_timesteps: pointer(inputs.row_timesteps, s),
+        };
+        let fuse = fuse_cross_block(c.kernels);
+        let mut fused_norm_out = false;
+        self.work.skip_norm1 = false;
+        for layer in 0..self.blocks.len() {
             if let Some(tier) = self.tier.as_mut() {
                 tier.ready()?.begin(layer, s)?;
             }
@@ -5625,49 +5969,58 @@ impl ImageDit {
                 entries: pairs,
                 index: inputs.row_pairs,
             };
-            block_forward::<false>(
+            let tail = if fuse {
+                scale2_tail(&self.blocks, layer, &sources)?
+            } else {
+                None
+            };
+            fused_norm_out |= tail.as_ref().is_some_and(|tail| !tail.arms_norm1);
+            block_forward_tail::<false>(
                 c,
                 &mut self.flash,
-                block,
+                &self.blocks[layer],
                 &Conditioning::Modulated {
                     rotary: &self.rotary,
                     modulation: &modulation,
                 },
                 &mut self.x,
                 &mut self.work,
+                tail,
             )?;
             if let Some(tier) = self.tier.as_mut() {
                 tier.ready()?.end(layer, s)?;
             }
         }
-        let normed = pointer(&self.work.normed, s);
-        ensure!(
-            adaln.norm_out.len() == timesteps as usize * 2 * h,
-            "output-norm table extent"
-        );
-        let table = pointer(&adaln.norm_out, s);
-        c.kernels.rms_norm_modulate_f32(
-            s,
-            NormRows {
-                input: pointer(&self.x, s),
-                weight: pointer(&self.norm_out, s),
-                output: normed,
-                rows,
-                dim: h,
-                threads: HIDDEN_NORM_THREADS,
-                eps: spec.final_norm_eps,
-            },
-            ModulateRows {
-                data: normed,
-                shift: table,
-                scale: table + 2 * h as u64,
-                index: pointer(inputs.row_timesteps, s),
-                rows,
-                dim: h,
-                stride: 2 * h,
-                entries: timesteps,
-            },
-        )?;
+        if !fused_norm_out {
+            let normed = pointer(&self.work.normed, s);
+            ensure!(
+                adaln.norm_out.len() == timesteps as usize * 2 * h,
+                "output-norm table extent"
+            );
+            let table = pointer(&adaln.norm_out, s);
+            c.kernels.rms_norm_modulate_f32(
+                s,
+                NormRows {
+                    input: pointer(&self.x, s),
+                    weight: pointer(&self.norm_out, s),
+                    output: normed,
+                    rows,
+                    dim: h,
+                    threads: HIDDEN_NORM_THREADS,
+                    eps: spec.final_norm_eps,
+                },
+                ModulateRows {
+                    data: normed,
+                    shift: table,
+                    scale: table + 2 * h as u64,
+                    index: pointer(inputs.row_timesteps, s),
+                    rows,
+                    dim: h,
+                    stride: 2 * h,
+                    entries: timesteps,
+                },
+            )?;
+        }
         upcast_from(
             s,
             &self.upcast,
@@ -7081,8 +7434,15 @@ mod tests {
         let fused_active = kernels
             .norm_modulate
             .occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)?;
+        let gated_active = kernels
+            .gated_add_rms
+            .occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)?;
         println!(
-            "H3_NORM_MODULATE_RESOURCE threads={HIDDEN_NORM_THREADS} plain_active={plain_active} fused_active={fused_active}"
+            "H3_NORM_MODULATE_RESOURCE threads={HIDDEN_NORM_THREADS} plain_active={plain_active} fused_active={fused_active} gated_active={gated_active}"
+        );
+        ensure!(
+            gated_active >= plain_active,
+            "gated_add_rms_norm_modulate occupancy {gated_active} below rms_norm_bf16 {plain_active}"
         );
         let dim = 5376;
         let guard = bf16::from_f32(-23.0);
@@ -7255,7 +7615,319 @@ mod tests {
             defects == 0,
             "DEFECT norm/modulation bitwise cells={defects}"
         );
+        let mut gated_cells = 0usize;
+        let mut gated_defects = 0usize;
+        for cell in [
+            GatedRmsCell {
+                rows: 4_103,
+                gate_stride: 6 * dim,
+                gate_entries: 7,
+                norm_stride: 6 * dim,
+                norm_entries: 7,
+                alias_output: false,
+            },
+            GatedRmsCell {
+                rows: 4_103,
+                gate_stride: 6 * dim,
+                gate_entries: 7,
+                norm_stride: 2 * dim,
+                norm_entries: 4,
+                alias_output: true,
+            },
+            GatedRmsCell {
+                rows: 39_741,
+                gate_stride: 6 * dim,
+                gate_entries: 4,
+                norm_stride: 6 * dim,
+                norm_entries: 4,
+                alias_output: false,
+            },
+        ] {
+            let bits = gated_rms_parent_bits(s, &kernels, dim, &cell)?;
+            gated_defects += usize::from(bits > 0);
+            gated_cells += 1;
+            println!(
+                "H3_GATED_RMS_CELL rows={} gate_stride={} norm_stride={} alias={} bit_differences={bits}",
+                cell.rows, cell.gate_stride, cell.norm_stride, cell.alias_output
+            );
+        }
+        let control_rows = gated_rms_raw_control(s, &kernels, dim)?;
+        println!(
+            "H3_GATED_RMS_GATE cells={gated_cells} defects={gated_defects} bit_limit=0 raw_variance_rows={control_rows}"
+        );
+        ensure!(
+            control_rows == 1,
+            "RUNNER_FAIL raw-variance control rows={control_rows}"
+        );
+        ensure!(
+            gated_defects == 0,
+            "DEFECT gated RMSNorm bitwise cells={gated_defects}"
+        );
         Ok(())
+    }
+
+    struct GatedRmsCell {
+        rows: usize,
+        gate_stride: usize,
+        gate_entries: u32,
+        norm_stride: usize,
+        norm_entries: u32,
+        alias_output: bool,
+    }
+
+    fn gated_bit_diffs(name: &str, dim: usize, expected: &[bf16], actual: &[bf16]) -> usize {
+        let mut n = 0usize;
+        let mut shown = 0usize;
+        for (i, (a, b)) in expected.iter().zip(actual).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                if shown < 8 {
+                    println!(
+                        "H3_GATED_RMS_DIFF name={name} index={i} row={} col={} expected_bits={:#06x} actual_bits={:#06x}",
+                        i / dim,
+                        i % dim,
+                        a.to_bits(),
+                        b.to_bits()
+                    );
+                    shown += 1;
+                }
+                n += 1;
+            }
+        }
+        if n > shown {
+            println!("H3_GATED_RMS_DIFF name={name} further={n}");
+        }
+        n
+    }
+
+    fn parent_gated_rms(
+        s: &Arc<CudaStream>,
+        kernels: &BlockKernels,
+        g: &GatedAddRms,
+    ) -> Result<()> {
+        let rows = i32::try_from(g.rows)?;
+        let dim = i32::try_from(g.dim)?;
+        unsafe {
+            s.launch_builder(&kernels.gated_add)
+                .arg(&g.x)
+                .arg(&g.y)
+                .arg(&g.gate)
+                .arg(&g.gate_index)
+                .arg(&rows)
+                .arg(&dim)
+                .arg(&(g.gate_stride as u64))
+                .arg(&g.gate_entries)
+                .launch(LaunchConfig {
+                    grid_dim: (
+                        u32::try_from(g.rows)?,
+                        u32::try_from(g.dim.div_ceil(256))?,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        kernels.rms_norm_modulate_f32(
+            s,
+            NormRows {
+                input: g.x,
+                weight: g.weight,
+                output: g.output,
+                rows: g.rows,
+                dim: g.dim,
+                threads: HIDDEN_NORM_THREADS,
+                eps: g.eps,
+            },
+            ModulateRows {
+                data: g.output,
+                shift: g.shift,
+                scale: g.scale,
+                index: g.norm_index,
+                rows: g.rows,
+                dim: g.dim,
+                stride: g.norm_stride,
+                entries: g.norm_entries,
+            },
+        )
+    }
+
+    fn gated_rms_parent_bits(
+        s: &Arc<CudaStream>,
+        kernels: &BlockKernels,
+        dim: usize,
+        cell: &GatedRmsCell,
+    ) -> Result<usize> {
+        let rows = cell.rows;
+        let x_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32(((i * 17 + 3) % 251) as f32 / 64.0 - 1.5))
+            .collect();
+        let y_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32(((i * 13 + 9) % 239) as f32 / 32.0 - 2.0))
+            .collect();
+        let gate_index: Vec<u32> = (0..rows)
+            .map(|r| ((r * 3 + 1) % cell.gate_entries as usize) as u32)
+            .collect();
+        let norm_index: Vec<u32> = (0..rows)
+            .map(|r| ((r * 5 + r / 7) % cell.norm_entries as usize) as u32)
+            .collect();
+        let weight: Vec<bf16> = (0..dim)
+            .map(|d| bf16::from_f32(0.75 + (d * 31 % 257) as f32 / 512.0))
+            .collect();
+        let gate_table: Vec<bf16> = (0..cell.gate_stride * cell.gate_entries as usize)
+            .map(|i| bf16::from_f32(((i * 19 + 5) % 191) as f32 / 96.0 - 0.4))
+            .collect();
+        let norm_table: Vec<bf16> = (0..cell.norm_stride * cell.norm_entries as usize)
+            .map(|i| bf16::from_f32(((i * 23 + 11) % 181) as f32 / 80.0 - 0.7))
+            .collect();
+        let x_parent = s.clone_htod(&x_host)?;
+        let x_fused = s.clone_htod(&x_host)?;
+        let y_parent = s.clone_htod(&y_host)?;
+        let y_fused = s.clone_htod(&y_host)?;
+        let out_parent = s.alloc_zeros::<bf16>(rows * dim)?;
+        let out_fused = s.alloc_zeros::<bf16>(rows * dim)?;
+        let gate = s.clone_htod(&gate_table)?;
+        let norm = s.clone_htod(&norm_table)?;
+        let gamma = s.clone_htod(&weight)?;
+        let gate_ids = s.clone_htod(&gate_index)?;
+        let norm_ids = s.clone_htod(&norm_index)?;
+        let spec = |x: u64, y: u64, separate: u64| GatedAddRms {
+            x,
+            y,
+            gate: pointer(&gate, s),
+            gate_index: pointer(&gate_ids, s),
+            gate_stride: cell.gate_stride,
+            gate_entries: cell.gate_entries,
+            weight: pointer(&gamma, s),
+            output: if cell.alias_output { y } else { separate },
+            shift: pointer(&norm, s),
+            scale: pointer(&norm, s) + 2 * dim as u64,
+            norm_index: pointer(&norm_ids, s),
+            norm_stride: cell.norm_stride,
+            norm_entries: cell.norm_entries,
+            rows,
+            dim,
+            eps: 1e-5,
+        };
+        let parent = spec(
+            pointer(&x_parent, s),
+            pointer(&y_parent, s),
+            pointer(&out_parent, s),
+        );
+        let fused = spec(
+            pointer(&x_fused, s),
+            pointer(&y_fused, s),
+            pointer(&out_fused, s),
+        );
+        parent_gated_rms(s, kernels, &parent)?;
+        kernels.gated_add_rms(s, &fused)?;
+        let x_bits = gated_bit_diffs(
+            "x",
+            dim,
+            &s.clone_dtoh(&x_parent)?,
+            &s.clone_dtoh(&x_fused)?,
+        );
+        let norm_expected = if cell.alias_output {
+            s.clone_dtoh(&y_parent)?
+        } else {
+            s.clone_dtoh(&out_parent)?
+        };
+        let norm_actual = if cell.alias_output {
+            s.clone_dtoh(&y_fused)?
+        } else {
+            s.clone_dtoh(&out_fused)?
+        };
+        ensure!(
+            norm_expected
+                .iter()
+                .chain(&norm_actual)
+                .all(|v| v.is_finite()),
+            "RUNNER_FAIL nonfinite gated RMSNorm"
+        );
+        Ok(x_bits + gated_bit_diffs("norm", dim, &norm_expected, &norm_actual))
+    }
+
+    fn gated_rms_raw_control(
+        s: &Arc<CudaStream>,
+        kernels: &BlockKernels,
+        dim: usize,
+    ) -> Result<usize> {
+        let rows = 2usize;
+        let special = bf16::from_f32(1.01);
+        let mut x_host = vec![bf16::ONE; rows * dim];
+        let mut y_host = vec![bf16::ONE; rows * dim];
+        let mut gate_host = vec![bf16::ONE; dim];
+        x_host[0] = special;
+        y_host[0] = special;
+        gate_host[0] = special;
+        let weight = vec![bf16::ONE; dim];
+        let shift = vec![bf16::ZERO; dim];
+        let scale = vec![bf16::ZERO; dim];
+        let index = vec![0u32; rows];
+        let x_rounded = s.clone_htod(&x_host)?;
+        let x_raw = s.clone_htod(&x_host)?;
+        let y = s.clone_htod(&y_host)?;
+        let out_rounded = s.alloc_zeros::<bf16>(rows * dim)?;
+        let out_raw = s.alloc_zeros::<bf16>(rows * dim)?;
+        let gate = s.clone_htod(&gate_host)?;
+        let gamma = s.clone_htod(&weight)?;
+        let shift = s.clone_htod(&shift)?;
+        let scale = s.clone_htod(&scale)?;
+        let ids = s.clone_htod(&index)?;
+        let spec = |x: u64, out: u64| GatedAddRms {
+            x,
+            y: pointer(&y, s),
+            gate: pointer(&gate, s),
+            gate_index: pointer(&ids, s),
+            gate_stride: dim,
+            gate_entries: 1,
+            weight: pointer(&gamma, s),
+            output: out,
+            shift: pointer(&shift, s),
+            scale: pointer(&scale, s),
+            norm_index: pointer(&ids, s),
+            norm_stride: dim,
+            norm_entries: 1,
+            rows,
+            dim,
+            eps: 1e-5,
+        };
+        let rounded = spec(pointer(&x_rounded, s), pointer(&out_rounded, s));
+        let raw = spec(pointer(&x_raw, s), pointer(&out_raw, s));
+        kernels.gated_add_rms(s, &rounded)?;
+        kernels.gated_add_rms_raw(s, &raw)?;
+        let x_bits = gated_bit_diffs(
+            "control_x",
+            dim,
+            &s.clone_dtoh(&x_rounded)?,
+            &s.clone_dtoh(&x_raw)?,
+        );
+        ensure!(
+            x_bits == 0,
+            "RUNNER_FAIL raw-variance control changed the stored residual"
+        );
+        let expected = s.clone_dtoh(&out_rounded)?;
+        let actual = s.clone_dtoh(&out_raw)?;
+        ensure!(
+            expected.iter().chain(&actual).all(|v| v.is_finite()),
+            "RUNNER_FAIL nonfinite raw-variance control"
+        );
+        let mut rows_differ = 0usize;
+        for row in 0..rows {
+            let start = row * dim;
+            let differ = expected[start..start + dim]
+                .iter()
+                .zip(&actual[start..start + dim])
+                .any(|(a, b)| a.to_bits() != b.to_bits());
+            if differ {
+                rows_differ += 1;
+                let _ = gated_bit_diffs(
+                    "control_norm",
+                    dim,
+                    &expected[start..start + dim],
+                    &actual[start..start + dim],
+                );
+            }
+        }
+        Ok(rows_differ)
     }
 
     fn bf16_round(value: f32) -> f32 {
@@ -12771,29 +13443,33 @@ mod tests {
             );
             let rows_d = s.clone_htod(&t2i_rows)?;
             let text_d = s.clone_htod(&t2i_text)?;
-            let velocity =
-                |head: usize, text: &CudaSlice<bf16>, dit: &mut ImageDit| -> Result<Vec<f32>> {
-                    let row_pairs = s.clone_htod(&t2i_plan.row_pairs[head])?;
-                    let row_timesteps = s.clone_htod(&t2i_plan.row_timesteps[head])?;
-                    dit.step(
-                        &context,
-                        &table,
-                        counts,
-                        head,
-                        &ImageStepInputs {
-                            image: &rows_d,
-                            text,
-                            row_pairs: &row_pairs,
-                            row_timesteps: &row_timesteps,
-                        },
-                    )?;
-                    Ok(s.clone_dtoh(&dit.velocity)?)
-                };
-            let step0 = velocity(0, &text_d, &mut dit)?;
+            let velocity = |context: &BlockContext,
+                            head: usize,
+                            text: &CudaSlice<bf16>,
+                            dit: &mut ImageDit|
+             -> Result<Vec<f32>> {
+                let row_pairs = s.clone_htod(&t2i_plan.row_pairs[head])?;
+                let row_timesteps = s.clone_htod(&t2i_plan.row_timesteps[head])?;
+                dit.step(
+                    context,
+                    &table,
+                    counts,
+                    head,
+                    &ImageStepInputs {
+                        image: &rows_d,
+                        text,
+                        row_pairs: &row_pairs,
+                        row_timesteps: &row_timesteps,
+                    },
+                )?;
+                Ok(s.clone_dtoh(&dit.velocity)?)
+            };
+            let step0 = velocity(&context, 0, &text_d, &mut dit)?;
+            let residual = s.clone_dtoh(&dit.x)?;
             let euler_rows = s.clone_htod(&t2i_rows)?;
             dit.euler(s, &euler_rows, &schedule, 0)?;
             let euler = s.clone_dtoh(&euler_rows)?;
-            let step5 = velocity(5, &text_d, &mut dit)?;
+            let step5 = velocity(&context, 5, &text_d, &mut dit)?;
             let mut fresh = s.clone_htod(&t2i_rows)?;
             dit.sample(
                 &context,
@@ -12844,13 +13520,86 @@ mod tests {
                 dit.rotary.len()
             );
             dit.rotary = s.clone_htod(&shifted_table)?;
-            let shift = velocity(0, &text_d, &mut dit)?;
+            let shift = velocity(&context, 0, &text_d, &mut dit)?;
             dit.rotary = s.clone_htod(&transposed_table)?;
-            let control = velocity(0, &text_d, &mut dit)?;
+            let control = velocity(&context, 0, &text_d, &mut dit)?;
             let (shift_max, shift_rmse) = image_max_rmse(&shift, &step0_ref)?;
             let (shift_vs_max, shift_vs_rmse) = image_max_rmse(&shift, &step0)?;
             let (control_max, control_rmse) = image_max_rmse(&control, &step0_ref)?;
             let (versus_max, versus_rmse) = image_max_rmse(&control, &step0)?;
+            if placement == Placement::Derived {
+                drop(dit);
+                let mut streamed = ImageDit::new(
+                    &device,
+                    &mut blas,
+                    (&spec, &image_spec),
+                    &t2i_layout,
+                    &dir,
+                    &manifest,
+                    Placement::Streamed,
+                )?;
+                let context = BlockContext {
+                    s,
+                    blas: &blas,
+                    kernels: &kernels,
+                    spec: &spec,
+                    lora_scale: 1.0,
+                };
+                let clean = velocity(&context, 0, &text_d, &mut streamed)?;
+                let bit_diffs = |actual: &[bf16]| -> Result<usize> {
+                    ensure!(
+                        actual.len() == residual.len()
+                            && actual.iter().chain(&residual).all(|v| v.is_finite()),
+                        "invalid full-block residual"
+                    );
+                    Ok(actual
+                        .iter()
+                        .zip(&residual)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count())
+                };
+                let clean_diff = bit_diffs(&s.clone_dtoh(&streamed.x)?)?;
+                let velocity_diff = clean
+                    .iter()
+                    .zip(&step0)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                ensure!(
+                    clean.len() == step0.len() && clean_diff == 0 && velocity_diff == 0,
+                    "Streamed/Derived residual differences {clean_diff}, velocity differences {velocity_diff}"
+                );
+                let dense = streamed
+                    .tier
+                    .as_mut()
+                    .context("forced streamed tier missing")?
+                    .ready()?;
+                ensure!(
+                    dense.plan.slots[1].is_some() && dense.plan.slots[1] == dense.plan.slots[3],
+                    "control requires layers 1 and 3 to reuse one slot"
+                );
+                // At the tail of layer 2 the layer-3 slot still holds layer 1.
+                streamed.blocks[3].norm1.tensor.ptr = dense.pointer(3, 0, 2 * spec.hidden)?;
+                let error =
+                    require_resident_norms(s, &streamed.blocks, &streamed.norm_out, spec.hidden)
+                        .unwrap_err();
+                ensure!(
+                    error
+                        .to_string()
+                        .contains("transformer_blocks.3.norm1.weight"),
+                    "wrong residency error: {error}"
+                );
+                velocity(&context, 0, &text_d, &mut streamed)?;
+                let control = bit_diffs(&s.clone_dtoh(&streamed.x)?)?;
+                ensure!(
+                    control > 0,
+                    "full-block residual missed the next-slot norm read"
+                );
+                println!(
+                    "H3_GATED_STREAMED_GATE PASS layers={} residual_elements={} residual_diff={clean_diff} velocity_diff={velocity_diff} next_slot_control={control}",
+                    streamed.blocks.len(),
+                    residual.len()
+                );
+            }
             (
                 shift_max,
                 shift_rmse,
