@@ -1240,13 +1240,13 @@ impl BlockWeights {
         })
     }
 
-    /// Stored HyperFlow factors. `slot` is the layer's streaming base; resident factors are owned.
+    /// Stored HyperFlow factors. `slot` is `(base, packed offsets, allocation bytes)`; resident factors are owned.
     fn stored(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
         block: &str,
         base: &mut Source<'_>,
-        slot: Option<(u64, &[(String, usize)])>,
+        slot: Option<FactorSlot<'_>>,
     ) -> Result<Self> {
         let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
         for role in LINEAR_ROLES {
@@ -1264,6 +1264,8 @@ impl BlockWeights {
         Self::with_linears_ready::<false>(s, spec, 0, block, linears, base, None)
     }
 }
+
+type FactorSlot<'a> = (u64, &'a [(String, usize)], usize);
 
 fn packed_offset(packed: &[(String, usize)], name: &str) -> Result<usize> {
     packed
@@ -1311,11 +1313,11 @@ fn factor_shape(base: &Source<'_>, name: &str, dtype: Dtype) -> Result<(usize, u
 fn dense_factor(
     s: &Arc<CudaStream>,
     base: &mut Source<'_>,
-    slot: Option<(u64, &[(String, usize)])>,
+    slot: Option<FactorSlot<'_>>,
     name: &str,
 ) -> Result<BlockLinear> {
     let (rows, cols) = factor_shape(base, name, Dtype::BF16)?;
-    if let Some((ptr, packed)) = slot {
+    if let Some((ptr, packed, _)) = slot {
         Ok(BlockLinear::Dense {
             weight: view_at(ptr, packed_offset(packed, name)?, rows, cols)?,
             owned: None,
@@ -1333,7 +1335,7 @@ fn dense_factor(
 fn int8_factor(
     s: &Arc<CudaStream>,
     base: &mut Source<'_>,
-    slot: Option<(u64, &[(String, usize)])>,
+    slot: Option<FactorSlot<'_>>,
     name: &str,
     group: u32,
 ) -> Result<BlockLinear> {
@@ -1349,7 +1351,7 @@ fn int8_factor(
     )?)?;
     crate::convrot::ensure_group(group, optin).with_context(|| format!("{name} convrot group"))?;
     let wscale = base.vector::<f32>(s, &format!("{name}.wscale"), rows)?;
-    let (qweight, owned) = if let Some((ptr, packed)) = slot {
+    let (qweight, owned) = if let Some((ptr, packed, _)) = slot {
         (
             view_at(ptr, packed_offset(packed, &qname)?, rows, cols)?,
             None,
@@ -1373,10 +1375,19 @@ fn int8_factor(
     })
 }
 
+fn low_rank_overread(name: &str, rank: usize, k: usize) -> Result<(usize, usize)> {
+    let pitch = crate::minimax_h3::stored_low_rank_pitch(rank);
+    let bytes = pitch
+        .checked_mul(k)
+        .and_then(|n| n.checked_mul(2))
+        .with_context(|| format!("{name} low-rank down allocation"))?;
+    Ok((pitch, bytes))
+}
+
 fn low_rank_factor(
     s: &Arc<CudaStream>,
     base: &mut Source<'_>,
-    slot: Option<(u64, &[(String, usize)])>,
+    slot: Option<FactorSlot<'_>>,
     name: &str,
     rank: usize,
 ) -> Result<BlockLinear> {
@@ -1388,21 +1399,47 @@ fn low_rank_factor(
         down_rows == rank && up_cols == rank && rank > 0,
         "{name} low-rank {rank}"
     );
-    if let Some((ptr, packed)) = slot {
+    let (pitch, bytes) = low_rank_overread(&down_name, rank, down_cols)?;
+    if let Some((ptr, packed, allocation)) = slot {
+        let offset = packed_offset(packed, &down_name)?;
+        ensure!(
+            offset
+                .checked_add(bytes)
+                .is_some_and(|end| end <= allocation),
+            "{down_name}: low-rank over-read exceeds the allocation"
+        );
         Ok(BlockLinear::LowRank {
-            down: view_at(
-                ptr,
-                packed_offset(packed, &down_name)?,
-                down_rows,
-                down_cols,
-            )?,
+            down: view_at(ptr, offset, pitch, down_cols)?,
             up: view_at(ptr, packed_offset(packed, &up_name)?, up_rows, up_cols)?,
             owned: Vec::new(),
         })
     } else {
-        let down_owned = base.tensor::<bf16>(s, &down_name, down_rows * down_cols)?;
+        let elements = pitch
+            .checked_mul(down_cols)
+            .with_context(|| format!("{down_name} low-rank down allocation"))?;
+        let stored = rank
+            .checked_mul(down_cols)
+            .with_context(|| format!("{down_name} low-rank down allocation"))?;
+        let mut down_owned = s.alloc_zeros::<bf16>(elements)?;
+        base.fill(s, &down_name, &mut down_owned.slice_mut(..stored))?;
+        let base_ptr = pointer(&down_owned, s);
+        let span = u64::try_from(
+            down_owned
+                .len()
+                .checked_mul(2)
+                .context("resident factor bytes")?,
+        )?;
+        let end = base_ptr
+            .checked_add(span)
+            .context("resident factor bytes")?;
+        ensure!(
+            base_ptr
+                .checked_add(u64::try_from(bytes)?)
+                .is_some_and(|stop| stop <= end),
+            "{down_name}: low-rank over-read exceeds the allocation"
+        );
+        let down = matrix(&down_owned, s, pitch, down_cols)?;
         let up_owned = base.tensor::<bf16>(s, &up_name, up_rows * up_cols)?;
-        let down = matrix(&down_owned, s, down_rows, down_cols)?;
         let up = matrix(&up_owned, s, up_rows, up_cols)?;
         Ok(BlockLinear::LowRank {
             down,
@@ -1534,6 +1571,7 @@ struct StoredScratch {
     mid: CudaSlice<bf16>,
     k: usize,
     rank: usize,
+    mid_pitch: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1547,6 +1585,7 @@ struct StoredPtrs {
     k: usize,
     rank: usize,
     product_m_fast: bool,
+    mid_pitch: usize,
 }
 
 impl BlockWork {
@@ -1607,6 +1646,8 @@ impl BlockWork {
                 "ff.net.2" => (spec.hidden, spec.ffn, true),
                 _ => bail!("{name} is not a block linear"),
             };
+            ensure!(rank > 0, "{name} low-rank 0");
+            let pitch = crate::minimax_h3::stored_low_rank_pitch(rank);
             let mut row_sets = vec![self.rows];
             if ffn {
                 row_sets = [self.chunk, self.rows % self.chunk]
@@ -1617,14 +1658,23 @@ impl BlockWork {
             for rows in row_sets {
                 blas.prepare_fixed(
                     u32::try_from(rows)?,
-                    u32::try_from(rank)?,
+                    u32::try_from(pitch)?,
                     u32::try_from(input)?,
                 )?;
-                blas.prepare_fixed(
-                    u32::try_from(rows)?,
-                    u32::try_from(out)?,
-                    u32::try_from(rank)?,
-                )?;
+                if pitch == rank {
+                    blas.prepare_fixed(
+                        u32::try_from(rows)?,
+                        u32::try_from(out)?,
+                        u32::try_from(rank)?,
+                    )?;
+                } else {
+                    blas.prepare_fixed_b_ld(
+                        u32::try_from(rows)?,
+                        u32::try_from(out)?,
+                        u32::try_from(rank)?,
+                        u32::try_from(pitch)?,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1853,13 +1903,17 @@ impl BlockWork {
         let hidden_view = matrix(&hidden, s, chunk, 2 * spec.ffn)?;
         let gated_view = matrix(&gated, s, chunk, spec.ffn)?;
         let stored = if let Some((k, low_rank)) = crate::minimax_h3::stored_scratch_extents(spec)? {
+            let pitch = crate::minimax_h3::stored_low_rank_pitch(low_rank);
             Some(StoredScratch {
                 x: s.alloc_zeros::<f32>(rows * k)?,
                 rotated: s.alloc_zeros::<f32>(rows * k)?,
                 scales: s.alloc_zeros::<f32>(rows)?,
-                mid: s.alloc_zeros::<bf16>(rows * low_rank.max(1))?,
+                mid: s.alloc_zeros::<bf16>(
+                    rows.checked_mul(pitch).context("low-rank scratch rows")?,
+                )?,
                 k,
                 rank: low_rank,
+                mid_pitch: pitch,
             })
         } else {
             None
@@ -1990,6 +2044,7 @@ fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
         k: scratch.k,
         rank: scratch.rank,
         product_m_fast: false,
+        mid_pitch: scratch.mid_pitch,
     })
 }
 
@@ -2248,25 +2303,31 @@ fn apply_low_rank(
     let rows = x.shape[0] as usize;
     let k = x.shape[1] as usize;
     let n = y.shape[1] as usize;
-    let rank = down.shape[0] as usize;
+    let rank = up.shape[1] as usize;
+    let pitch = down.shape[0] as usize;
     ensure!(
-        down.shape[1] as usize == k
-            && up.shape == [u32::try_from(n)?, u32::try_from(rank)?]
+        pitch == crate::minimax_h3::stored_low_rank_pitch(rank)
+            && down.shape[1] as usize == k
+            && up.shape[0] as usize == n
             && y.shape[0] as usize == rows
             && rows <= ptrs.rows
             && rank > 0
-            && rank <= ptrs.rank,
+            && rank <= ptrs.rank
+            && pitch <= ptrs.mid_pitch,
         "low-rank shape"
     );
+    let span = |cols: usize| -> Result<u64> {
+        u64::try_from(rows)?
+            .checked_mul(u64::try_from(cols)?)
+            .and_then(|elements| elements.checked_mul(2))
+            .context("low-rank scratch bytes")
+    };
     let mid = unsafe {
         Tensor::new(
             ptrs.mid,
-            [u32::try_from(rows)?, u32::try_from(rank)?],
-            [u64::try_from(rank)?, 1],
-            u64::try_from(rows)?
-                .checked_mul(u64::try_from(rank)?)
-                .and_then(|elements| elements.checked_mul(2))
-                .context("low-rank scratch bytes")?,
+            [u32::try_from(rows)?, u32::try_from(pitch)?],
+            [u64::try_from(pitch)?, 1],
+            span(pitch)?,
         )?
     };
     c.blas.linear_typed(
@@ -2275,12 +2336,28 @@ fn apply_low_rank(
         x,
         &mut TensorMut(mid),
     )?;
-    c.blas.linear_typed(
-        crate::op_contract::ExecutionPhase::Prefill,
-        crate::backend::cuda::linear::LinearWeightRef::Bf16(up),
-        mid,
-        &mut TensorMut(y),
-    )
+    let up_x = if pitch == rank {
+        mid
+    } else {
+        unsafe {
+            Tensor::new(
+                ptrs.mid,
+                [u32::try_from(rows)?, u32::try_from(rank)?],
+                [u64::try_from(pitch)?, 1],
+                span(pitch)?,
+            )?
+        }
+    };
+    if pitch == rank {
+        c.blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            crate::backend::cuda::linear::LinearWeightRef::Bf16(up),
+            up_x,
+            &mut TensorMut(y),
+        )
+    } else {
+        c.blas.linear_bf16_b_ld(up, up_x, &mut TensorMut(y), pitch)
+    }
 }
 
 /// One MiniMax-H3 transformer or token refiner block over `x [rows, hidden]` in place, BF16. The `LORA` monomorph
@@ -3420,6 +3497,184 @@ fn trace_placement_pool(d: &Device, phase: &str) -> Result<()> {
     Ok(())
 }
 
+/// Charged device bytes of one layer. A `.down.weight` charges `stored_low_rank_pitch(rank) * K * 2`, then the allocation granule.
+fn stored_layer_charge(
+    manifest: &TensorManifest,
+    layer: usize,
+    granularity: usize,
+) -> Result<usize> {
+    let layer_id = u32::try_from(layer).context("stored layer id")?;
+    let mut sum = 0usize;
+    for (name, entry) in &manifest.entries {
+        if entry.layer != Some(layer_id) || !entry.load || entry.shape.len() != 2 {
+            continue;
+        }
+        let bytes = if name.ends_with(".down.weight") {
+            ensure!(
+                entry.dtype == Dtype::BF16 && entry.shape.len() == 2,
+                "{name} low-rank down layout"
+            );
+            let (rank, k) = (entry.shape[0], entry.shape[1]);
+            let stored = rank
+                .checked_mul(k)
+                .and_then(|n| n.checked_mul(2))
+                .with_context(|| format!("{name} low-rank down bytes"))?;
+            ensure!(
+                entry.bytes == stored && rank > 0,
+                "{name} low-rank down bytes"
+            );
+            low_rank_overread(name, rank, k)?.1
+        } else {
+            entry.bytes
+        };
+        sum = sum
+            .checked_add(stored_allocation_bytes(bytes, granularity)?)
+            .with_context(|| format!("{name} stored layer charge"))?;
+    }
+    Ok(sum)
+}
+
+/// `(over-read of the last short down, largest past-end over-read)` in packed order, in bytes.
+fn low_rank_layer_tail(
+    packed: &[(String, usize)],
+    manifest: &TensorManifest,
+    packed_bytes: usize,
+) -> Result<(usize, usize)> {
+    let mut last_short = 0usize;
+    let mut max_past_end = 0usize;
+    for item in packed {
+        let name = &item.0;
+        let offset = item.1;
+        if !name.ends_with(".down.weight") {
+            continue;
+        }
+        let entry = manifest
+            .entries
+            .get(name)
+            .with_context(|| format!("manifest lacks {name}"))?;
+        ensure!(
+            entry.dtype == Dtype::BF16 && entry.shape.len() == 2,
+            "{name} low-rank down layout"
+        );
+        let (rank, k) = (entry.shape[0], entry.shape[1]);
+        let stored = rank
+            .checked_mul(k)
+            .and_then(|n| n.checked_mul(2))
+            .with_context(|| format!("{name} low-rank down bytes"))?;
+        ensure!(
+            entry.bytes == stored && rank > 0,
+            "{name} low-rank down bytes"
+        );
+        let (pitch, pitched) = low_rank_overread(name, rank, k)?;
+        if pitch == rank {
+            continue;
+        }
+        let overread = pitched
+            .checked_sub(stored)
+            .with_context(|| format!("{name} low-rank over-read"))?;
+        last_short = overread;
+        let after = packed_bytes
+            .checked_sub(offset)
+            .and_then(|n| n.checked_sub(stored))
+            .with_context(|| format!("{name} low-rank tail"))?;
+        max_past_end = max_past_end.max(overread.saturating_sub(after));
+    }
+    Ok((last_short, max_past_end))
+}
+
+/// `(plan, device budget, host budget, available host bytes)` for one charged table.
+fn stored_compact(
+    placement: Placement,
+    charged_device: &[usize],
+    charged_slots: &[usize],
+    kept_source: &[usize],
+    device_cap: usize,
+    largest: usize,
+    granularity: usize,
+) -> Result<(crate::prefill::DensePlacement, usize, usize, Option<usize>)> {
+    use crate::prefill::DensePlacement;
+    ensure!(
+        charged_device.len() == charged_slots.len() && charged_device.len() == kept_source.len(),
+        "stored placement extent"
+    );
+    let mut device_budget = device_cap;
+    if placement != Placement::Derived {
+        let slots = 2 * charged_slots
+            .iter()
+            .copied()
+            .max()
+            .context("no stored transformer block")?;
+        ensure!(
+            slots <= device_budget,
+            "two block slots exceed the device budget"
+        );
+        device_budget = slots
+            .checked_add(
+                charged_device
+                    .len()
+                    .checked_mul(granularity)
+                    .context("stored streaming setup extent")?,
+            )
+            .context("stored streaming setup extent")?;
+        ensure!(
+            device_budget <= device_cap,
+            "stored streaming setup exceeds the device budget"
+        );
+    }
+    let probe = DensePlacement::with_allocations(
+        charged_device,
+        charged_slots,
+        Some(kept_source),
+        device_budget,
+        0,
+        granularity,
+        2,
+    )?;
+    let host_available = if probe.slot_bytes > 0 {
+        Some(usize::try_from(
+            crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+        )?)
+    } else {
+        None
+    };
+    let host_budget = if let Some(available) = host_available {
+        let reserve = 2usize
+            .checked_mul(probe.slot_bytes)
+            .and_then(|bytes| bytes.checked_add(largest))
+            .and_then(|bytes| bytes.checked_add(4 << 30))
+            .context("stored host reserve overflow")?;
+        let budget = available
+            .checked_sub(reserve)
+            .context("stored pinned staging and host reserve exceed available RAM")?;
+        match placement {
+            Placement::Derived => budget,
+            #[cfg(test)]
+            Placement::Streamed => budget,
+            #[cfg(test)]
+            Placement::StreamedDisk => 0,
+        }
+    } else {
+        0
+    };
+    let compact = DensePlacement::with_allocations(
+        charged_device,
+        charged_slots,
+        Some(kept_source),
+        device_budget,
+        host_budget,
+        granularity,
+        2,
+    )?;
+    Ok((compact, device_budget, host_budget, host_available))
+}
+
+/// `(resident, host tier, streamed)` among the kept layers.
+fn placement_counts(compact: &crate::prefill::DensePlacement) -> (usize, usize, usize) {
+    let slots = compact.slots.iter().filter(|slot| slot.is_some()).count();
+    let host = compact.host.iter().filter(|flag| **flag).count();
+    (compact.slots.len() - slots, host, slots)
+}
+
 /// HyperFlow transformer blocks. Dropped layers stay out of `DensePlacement` and come back as empty slots.
 /// `packed` contains stored byte offsets; placement prices allocations at the reported granularity.
 fn place_stored_layers(
@@ -3505,76 +3760,51 @@ fn place_stored_layers(
         .iter()
         .map(|&bytes| stored_allocation_bytes(bytes, granularity))
         .collect::<Result<_>>()?;
+    let mut last_short_overread = 0usize;
+    let mut max_past_end = 0usize;
+    let mut layer_tails = vec![0usize; spec.layers];
+    for &layer in &kept_index {
+        let (last, past) = low_rank_layer_tail(&packed[layer], base.manifest, cursor[layer])?;
+        last_short_overread = last_short_overread.max(last);
+        max_past_end = max_past_end.max(past);
+        layer_tails[layer] = last.max(past);
+    }
+    let layer_tail_bytes = layer_tails.iter().copied().max().unwrap_or(0);
+    let charged_device_after = kept_index
+        .iter()
+        .map(|&layer| stored_layer_charge(base.manifest, layer, granularity))
+        .collect::<Result<Vec<_>>>()?;
+    let charged_slots_after = kept_index
+        .iter()
+        .map(|&layer| {
+            let bytes = cursor[layer]
+                .checked_add(layer_tails[layer])
+                .context("stored layer tail")?;
+            stored_allocation_bytes(bytes, granularity)
+        })
+        .collect::<Result<Vec<_>>>()?;
     #[cfg(test)]
     trace_placement_pool(d, "before_placement")?;
     let (free, total) = d.ctx.mem_get_info()?;
-    let mut device_budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
-    if placement != Placement::Derived {
-        let slots = 2 * charged_slots
-            .iter()
-            .copied()
-            .max()
-            .context("no stored transformer block")?;
-        ensure!(
-            slots <= device_budget,
-            "two block slots exceed the device budget"
-        );
-        device_budget = slots
-            .checked_add(kept_device.len() * granularity)
-            .context("stored streaming setup extent")?;
-        ensure!(
-            device_budget <= DensePlacement::device_budget(free, total, owned, 0, 0)?,
-            "stored streaming setup exceeds the device budget"
-        );
-    }
-    let attempt = |slot_count: usize| -> Result<(DensePlacement, usize, Option<usize>)> {
-        let probe = DensePlacement::with_allocations(
-            &charged_device,
-            &charged_slots,
-            Some(&kept_source),
-            device_budget,
-            0,
-            granularity,
-            slot_count,
-        )?;
-        let host_available = if probe.slot_bytes > 0 {
-            Some(usize::try_from(
-                crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
-            )?)
-        } else {
-            None
-        };
-        let host_budget = if let Some(available) = host_available {
-            let reserve = slot_count
-                .checked_mul(probe.slot_bytes)
-                .and_then(|bytes| bytes.checked_add(sizing.largest))
-                .and_then(|bytes| bytes.checked_add(4 << 30))
-                .context("stored host reserve overflow")?;
-            let budget = available
-                .checked_sub(reserve)
-                .context("stored pinned staging and host reserve exceed available RAM")?;
-            match placement {
-                Placement::Derived => budget,
-                #[cfg(test)]
-                Placement::Streamed => budget,
-                #[cfg(test)]
-                Placement::StreamedDisk => 0,
-            }
-        } else {
-            0
-        };
-        let compact = DensePlacement::with_allocations(
-            &charged_device,
-            &charged_slots,
-            Some(&kept_source),
-            device_budget,
-            host_budget,
-            granularity,
-            slot_count,
-        )?;
-        Ok((compact, host_budget, host_available))
-    };
-    let (compact, host_budget, host_available) = attempt(2)?;
+    let device_cap = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+    let (before, ..) = stored_compact(
+        placement,
+        &charged_device,
+        &charged_slots,
+        &kept_source,
+        device_cap,
+        sizing.largest,
+        granularity,
+    )?;
+    let (compact, device_budget, host_budget, host_available) = stored_compact(
+        placement,
+        &charged_device_after,
+        &charged_slots_after,
+        &kept_source,
+        device_cap,
+        sizing.largest,
+        granularity,
+    )?;
     let facts = PlacementFacts {
         free_bytes: free,
         total_bytes: total,
@@ -3594,12 +3824,21 @@ fn place_stored_layers(
         slots[layer] = compact.slots[index];
         host_flags[layer] = compact.host[index];
     }
-    let slot_bytes = kept_device
-        .iter()
-        .zip(&compact.slots)
-        .filter_map(|(&bytes, slot)| slot.is_some().then_some(bytes))
-        .max()
-        .unwrap_or(0);
+    let mut before_slot_bytes = 0usize;
+    for (&layer, slot) in kept_index.iter().zip(&before.slots) {
+        if slot.is_some() {
+            before_slot_bytes = before_slot_bytes.max(cursor[layer]);
+        }
+    }
+    let mut slot_bytes = 0usize;
+    for (&layer, slot) in kept_index.iter().zip(&compact.slots) {
+        if slot.is_some() {
+            let bytes = cursor[layer]
+                .checked_add(layer_tails[layer])
+                .context("stored slot tail")?;
+            slot_bytes = slot_bytes.max(bytes);
+        }
+    }
     let resident_bytes = kept_device
         .iter()
         .zip(&compact.slots)
@@ -3635,9 +3874,15 @@ fn place_stored_layers(
             )
         })
         .context("stored placement physical extent exceeds free VRAM")?;
+    let (before_resident, before_host, before_slots) = placement_counts(&before);
+    let (after_resident, after_host, after_slots) = placement_counts(&compact);
     eprintln!(
         "{}",
         serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "streaming_slots": used_slots, "free_bytes": facts.free_bytes, "total_bytes": facts.total_bytes, "owned_block_bytes": facts.owned_bytes, "largest_bytes": facts.largest_bytes, "device_budget": facts.device_budget, "host_budget": facts.host_budget, "host_available_bytes": facts.host_available_bytes, "allocation_granularity": granularity, "charged_resident_bytes": compact.resident_bytes, "charged_slot_bytes": compact.slot_bytes, "predicted_min_driver_free_after_placement": predicted_free})
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_dense_placement_tail": {"before_resident": before_resident, "before_host": before_host, "before_slots": before_slots, "before_slot_bytes": before_slot_bytes, "after_resident": after_resident, "after_host": after_host, "after_slots": after_slots, "after_slot_bytes": slot_bytes, "last_short_overread_bytes": last_short_overread, "max_past_end_bytes": max_past_end, "layer_tail_bytes": layer_tail_bytes}})
     );
     let dense = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
@@ -3926,9 +4171,11 @@ impl Dit {
                 let name = format!("transformer_blocks.{layer}");
                 let bytes = sizing.layers[layer];
                 let slot = match &dense {
-                    Some(streaming) if streaming.plan.slots[layer].is_some() => {
-                        Some((streaming.pointer(layer, 0, bytes)?, factors.as_slice()))
-                    }
+                    Some(streaming) if streaming.plan.slots[layer].is_some() => Some((
+                        streaming.pointer(layer, 0, bytes)?,
+                        factors.as_slice(),
+                        streaming.plan.slot_bytes,
+                    )),
                     _ => None,
                 };
                 blocks.push(BlockWeights::stored(s, spec, &name, &mut base, slot)?);
@@ -14739,6 +14986,116 @@ mod tests {
             println!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}");
             bail!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}")
         }
+    }
+
+    /// Block 2 resident downs. Rank 3137 pitches to 3144 and rank 2092 pitches to 2096, inside each allocation.
+    #[test]
+    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_Q38_GPU_WINDOW=granted"]
+    fn hyperflow_low_rank_overread_stays_in_allocation() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model = env_dir("FF_HYPERFLOW_MODEL")?;
+        let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+            model.join("config.json"),
+        )?)?)?;
+        ensure!(spec.is_hyperflow()?, "transformer config is not HyperFlow");
+        let rank_of = |name: &str| -> Result<usize> {
+            match spec.linear_storage(name)? {
+                LinearStorage::LowRank { rank } => Ok(rank),
+                _ => bail!("{name} is not low-rank"),
+            }
+        };
+        let down_rank = rank_of("transformer_blocks.2.ff.net.0.proj")?;
+        let out_rank = rank_of("transformer_blocks.2.attn.to_out.0")?;
+        ensure!(
+            down_rank == 3137 && out_rank == 2092,
+            "block 2 production ranks {down_rank} {out_rank}"
+        );
+        let manifest = MappedCheckpoint::open_component(&model, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-hyperflow-overread-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let _runtime = BlockRuntime(runtime.clone());
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "HyperFlow low-rank over-read".into())),
+        )?;
+        let mut source = Source::new(&model, &manifest);
+        source.pack_vectors(s, &spec)?;
+        let weights = BlockWeights::stored(s, &spec, "transformer_blocks.2", &mut source, None)?;
+        let check = |linear: &BlockLinear, rank: usize| -> Result<()> {
+            let BlockLinear::LowRank { down, owned, .. } = linear else {
+                bail!("block 2 factor is not low-rank");
+            };
+            let pitch = rank.div_ceil(8) * 8;
+            let k = down.shape[1] as usize;
+            ensure!(
+                down.shape[0] as usize == pitch
+                    && owned.len() == 2
+                    && owned[0].len() == pitch * k
+                    && down.span_bytes == u64::try_from(pitch * k * 2)?,
+                "block 2 down allocation rank={rank} pitch={pitch} k={k} owned={}",
+                owned.len()
+            );
+            Ok(())
+        };
+        check(&weights.linears[FF_IN], down_rank)?;
+        check(&weights.linears[OUT], out_rank)?;
+        let rows = 20usize;
+        let mut work = BlockWork::new(s, &spec, 0, rows)?;
+        work.prepare::<false>(&blas, &spec)?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
+        let hidden = s.clone_htod(&vec![bf16::from_f32(1.0); rows * spec.hidden])?;
+        let rotary = s.alloc_zeros::<bf16>(rows * 6 * spec.rope_freq_dim)?;
+        let entries = MODALITIES;
+        let table = s.alloc_zeros::<bf16>(entries as usize * 6 * spec.hidden)?;
+        let index = s.alloc_zeros::<u32>(rows)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+        let mut row = hidden;
+        block_forward::<false>(
+            &context,
+            &mut flash,
+            &weights,
+            &Conditioning::Modulated {
+                rotary: &rotary,
+                modulation: &Modulation {
+                    table: &table,
+                    offset: 0,
+                    entries,
+                    index: &index,
+                },
+            },
+            &mut row,
+            &mut work,
+        )?;
+        let host = s.clone_dtoh(&row)?;
+        ensure!(
+            host.len() == rows * spec.hidden && host.iter().all(|v| v.to_f32().is_finite()),
+            "block 2 output extent or a non-finite value"
+        );
+        println!(
+            "HYPERFLOW_LOW_RANK_OVERREAD PASS block=2 down_rank={down_rank} down_pitch={} out_rank={out_rank} out_pitch={} rows={rows}",
+            down_rank.div_ceil(8) * 8,
+            out_rank.div_ceil(8) * 8
+        );
+        Ok(())
     }
 }
 
