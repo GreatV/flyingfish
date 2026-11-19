@@ -197,10 +197,24 @@ pub(crate) struct OwnedRead {
 
 /// Destination form of one fill read: the stored bytes, or their BF16 narrowing with the
 /// loader's finite and overflow checks.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillCast {
     Raw,
     F32ToBf16,
+}
+
+/// The resident ring's raw windows keep the loader's finite check: unquantized F32 kept as
+/// F32 is scanned before the window is published as a completed tensor.
+pub(super) fn resident_raw_finite(
+    name: &str,
+    entry: &TensorEntry,
+    cast: FillCast,
+    window: &[u8],
+) -> Result<()> {
+    if cast == FillCast::Raw && entry.quant.is_none() && entry.dtype == Dtype::F32 {
+        ensure!(<f32 as Element>::finite(window), "{name}: nonfinite value");
+    }
+    Ok(())
 }
 
 /// Round-robin claim order across the shard queues of `requests`: position-major over the
@@ -16306,6 +16320,34 @@ mod h3_direct_batch_tests {
             "arena not freed after the fill joined"
         );
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn resident_raw_finite_rejects_nan_kept_as_f32() -> Result<()> {
+        let entry = |dtype: Dtype| TensorEntry {
+            dtype,
+            shape: vec![8],
+            shard: "s".to_owned(),
+            bytes: 32,
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let mut nan = vec![0u8; 32];
+        nan[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        resident_raw_finite("t", &entry(Dtype::F32), FillCast::Raw, &nan)
+            .expect_err("nonfinite raw F32 accepted");
+        let finite = vec![0u8; 32];
+        resident_raw_finite("t", &entry(Dtype::F32), FillCast::Raw, &finite)?;
+        // The narrowed form validates inside the cast, not here.
+        resident_raw_finite("t", &entry(Dtype::F32), FillCast::F32ToBf16, &nan)?;
         Ok(())
     }
 

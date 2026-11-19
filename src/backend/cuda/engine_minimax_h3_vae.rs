@@ -1204,7 +1204,15 @@ impl<'a> DecoderWeightLoad<'a> {
                                         request.cast(),
                                         window,
                                         &mut bounce,
-                                    );
+                                    )
+                                    .and_then(|()| {
+                                        super::resident_raw_finite(
+                                            request.name(),
+                                            request.entry(),
+                                            request.cast(),
+                                            window,
+                                        )
+                                    });
                                     if let Err(error) = result {
                                         abort.store(true, std::sync::atomic::Ordering::SeqCst);
                                         let _ = done.send(Err(error));
@@ -1228,15 +1236,24 @@ impl<'a> DecoderWeightLoad<'a> {
         let error = loop {
             // Return slots whose upload completed.
             let mut still = Vec::new();
+            let mut polled = Ok(());
             for &slot in &inflight {
-                if events[slot].try_is_complete()? {
-                    free.0.lock().unwrap().push(slot);
-                    free.1.notify_all();
-                } else {
-                    still.push(slot);
+                match events[slot].try_is_complete() {
+                    Ok(true) => {
+                        free.0.lock().unwrap().push(slot);
+                        free.1.notify_all();
+                    }
+                    Ok(false) => still.push(slot),
+                    Err(error) => {
+                        polled = Err(error);
+                        still.push(slot);
+                    }
                 }
             }
             inflight = still;
+            if let Err(error) = polled {
+                break Err(anyhow::Error::from(error).context("vae-ring slot event query"));
+            }
             match done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(Ok((index, slot))) => {
                     let window = unsafe {
@@ -1245,14 +1262,17 @@ impl<'a> DecoderWeightLoad<'a> {
                             names[index].1,
                         )
                     };
-                    unsafe {
+                    let upload = unsafe {
                         cudarc::driver::result::memcpy_htod_async(
                             destinations[index],
                             window,
                             d.upload.cu_stream(),
-                        )?;
+                        )
+                    };
+                    let recorded = upload.and_then(|()| events[slot].record(&d.upload));
+                    if let Err(error) = recorded {
+                        break Err(anyhow::Error::from(error).context("vae-ring slot upload"));
                     }
-                    events[slot].record(&d.upload)?;
                     inflight.push(slot);
                     received += 1;
                     if received == names.len() {
