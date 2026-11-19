@@ -5,8 +5,8 @@ use super::super::vision_runtime::LayerNormTower;
 use super::audio::AudioDecoder;
 use super::vae::{
     EncodeWork, ImageDecodeStage, ImageEncodeSetup, ImageEncodeStage, KeyframeEncoder, LatentVideo,
-    TileWork, VideoDecoder, decode_bytes, image_decoder_sizes, image_vae_manifest,
-    video_decoder_weight_bytes,
+    TileWork, VideoDecoder, decode_bytes, decoder_weight_bytes, image_decoder_sizes,
+    image_vae_manifest,
 };
 use super::{
     AdalnTable, BlockContext, BlockKernels, Conditioner, ConditionerInput, ConditionerPrompt, Dit,
@@ -305,7 +305,7 @@ fn keyframes(
 
 /// Resident BF16 and F32 video weights plus the published F32 audio weights.
 fn decoder_bytes(video: &TensorManifest, audio: &TensorManifest) -> usize {
-    video_decoder_weight_bytes(video)
+    decoder_weight_bytes(video)
         + audio
             .entries
             .values()
@@ -729,7 +729,7 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
                 "planned_bytes": planned, "total_bytes": total}})
         );
     }
-    let decoder_weights = video_decoder_weight_bytes(&vae_manifest);
+    let decoder_weights = decoder_weight_bytes(&vae_manifest);
     let future =
         work_bytes + weights - decoder_weights + 3 * decode_plan.frames * pixels + (1 << 30);
     let decoder = VideoDecoder::new(device, vae, &vae_dir, &vae_manifest, (future, placement))?;
@@ -1327,11 +1327,15 @@ impl ImageSession {
         let temporary = media.max(sample_input_bytes).max(latents_bytes);
         let (vae_dir, vae_spec, vae_manifest) = image_vae_manifest(model)?;
         let vae = vae_spec.single_frame();
-        let (decoder_layers, decoder_fixed, decoder_largest) =
+        let ([decoder_layers, decoder_source], decoder_fixed, decoder_largest) =
             image_decoder_sizes(&vae_manifest, vae.layers);
+        let decoder_staging = *decoder_source
+            .iter()
+            .max()
+            .context("image VAE has no decoder layers")?;
         let (disk_probe_bytes, disk) = image_fill_rate(&dir, &text_manifest)?;
         let pcie = crate::backend::cuda::calibrate::pinned_h2d_rate(&d)?;
-        let decode_blas = blas("image VAE")?;
+        let mut decode_blas = blas("image VAE")?;
         let text_blas = blas("MiniMax-H3-Image conditioner")?;
         let device_fixed = stored_allocation_bytes(conditioner_fixed, device_page)?
             .checked_add(stored_allocation_bytes(decoder_fixed, device_page)?)
@@ -1360,18 +1364,21 @@ impl ImageSession {
                         source: &conditioner_layers,
                         visits: 1,
                         load_scratch: conditioner_largest,
+                        device_staging: 0,
                     },
                     DenseStage {
                         device: &sizing.layers,
                         source: &sizing.source_layers,
                         visits: schedule.timesteps.len(),
                         load_scratch: sizing.largest,
+                        device_staging: 0,
                     },
                     DenseStage {
                         device: &decoder_layers,
-                        source: &decoder_layers,
+                        source: &decoder_source,
                         visits: 1,
                         load_scratch: decoder_largest,
+                        device_staging: decoder_staging,
                     },
                 ];
                 let encoder = shape
@@ -1464,6 +1471,7 @@ impl ImageSession {
         conditioner.prepare(&text_blas, count)?;
         let decode = ImageDecodeStage::bind(
             &d,
+            &mut decode_blas,
             (&vae_dir, &vae, &vae_manifest),
             decoder_work,
             decode_plan,
@@ -1628,7 +1636,7 @@ impl ImageStages<'_> {
         }
     }
 
-    fn decode(&self, extent: [usize; 2], values: &[f32]) -> Result<Vec<f32>> {
+    fn decode(&mut self, extent: [usize; 2], values: &[f32]) -> Result<Vec<f32>> {
         match self {
             Self::Single { model, options, .. } => super::image_decode(
                 model,

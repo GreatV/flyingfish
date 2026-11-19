@@ -579,11 +579,6 @@ __device__ __forceinline__ void unpatchify(
 }
 
 
-extern "C" __global__ void unpatchify_f32(
-    const float* rows, float* pixels, uint32_t frames, uint32_t height,
-    uint32_t width, uint32_t channels, uint32_t pt, uint32_t p) {
-    unpatchify(rows, pixels, frames, height, width, channels, pt, p);
-}
 
 extern "C" __global__ void unpatchify_bf16(
     const __nv_bfloat16* rows, __nv_bfloat16* pixels, uint32_t frames, uint32_t height,
@@ -591,9 +586,9 @@ extern "C" __global__ void unpatchify_bf16(
     unpatchify(rows, pixels, frames, height, width, channels, pt, p);
 }
 
-// NCHW image tiles -> [batch, tile_h * tile_w, channels], with per-channel F32 affine.
-extern "C" __global__ void tile_rows_f32(
-    const float* input, const float* scale, const float* bias, const uint32_t* grid, float* output,
+// NCHW image tiles -> [batch, tile_h * tile_w, channels], with per-channel F32 affine followed by BF16 rounding.
+extern "C" __global__ void tile_rows_f32_to_bf16(
+    const float* input, const float* scale, const float* bias, const uint32_t* grid, __nv_bfloat16* output,
     uint32_t channels, uint32_t height, uint32_t width, uint32_t grid_rows, uint32_t grid_cols,
     uint32_t ratio, uint32_t tile_h, uint32_t tile_w, uint32_t first_tile, uint32_t batch) {
     if (!vision_flat_launch() || !input || !scale || !bias || !grid || !output || !channels ||
@@ -610,7 +605,8 @@ extern "C" __global__ void tile_rows_f32(
         const uint32_t y0 = grid[tile / grid_cols] / ratio, x0 = col_start[tile % grid_cols] / ratio;
         if (y0 + tile_h > height || x0 + tile_w > width) { __trap(); return; }
         const uint32_t y = y0 + (pixel % pixels) / tile_w, x = x0 + pixel % tile_w;
-        output[i] = __fadd_rn(__fmul_rn(input[(uint64_t(channel) * height + y) * width + x], scale[channel]), bias[channel]);
+        output[i] = __float2bfloat16_rn(__fadd_rn(
+            __fmul_rn(input[(uint64_t(channel) * height + y) * width + x], scale[channel]), bias[channel]));
     }
 }
 
@@ -631,11 +627,6 @@ __device__ __forceinline__ void append_register_rows(
     }
 }
 
-extern "C" __global__ void append_register_rows_f32(
-    const float* input, const float* registers, float* output,
-    uint32_t batch, uint32_t rows, uint32_t suffix, uint32_t width) {
-    append_register_rows(input, registers, output, batch, rows, suffix, width);
-}
 
 extern "C" __global__ void append_register_rows_bf16_to_f32(
     const __nv_bfloat16* input, const __nv_bfloat16* registers, float* output,
@@ -644,39 +635,6 @@ extern "C" __global__ void append_register_rows_bf16_to_f32(
 }
 
 // Q/K/V [batch, tokens, heads, dim] -> [batch, heads, tokens, dim], rotating a split-half prefix of Q/K.
-extern "C" __global__ void rotary_pack_qkv_f32(
-    const float* q, const float* k, const float* v, const float* table,
-    float* q_out, float* k_out, float* v_out,
-    uint32_t batch, uint32_t tokens, uint32_t heads, uint32_t dim, uint32_t rotary) {
-    if (!vision_flat_launch() || !q || !k || !v || !table || !q_out || !k_out || !v_out ||
-        !batch || !tokens || !heads || !dim || dim % 2 || !rotary || rotary > dim || rotary % 2) { __trap(); return; }
-    const uint32_t pairs = dim / 2, half = rotary / 2;
-    const uint64_t count = uint64_t(batch) * tokens * heads * pairs;
-    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
-         i += uint64_t(gridDim.x) * 256) {
-        const uint32_t pair = i % pairs, token = (i / pairs) % tokens,
-                       head = (i / (uint64_t(pairs) * tokens)) % heads;
-        const uint64_t item = i / (uint64_t(pairs) * tokens * heads);
-        const uint32_t d0 = pair < half ? pair : rotary + (pair - half) * 2;
-        const uint32_t d1 = pair < half ? pair + half : d0 + 1;
-        const uint64_t source = ((item * tokens + token) * heads + head) * dim;
-        const uint64_t target = (i / pairs) * dim;
-        float q0 = q[source + d0], q1 = q[source + d1];
-        float k0 = k[source + d0], k1 = k[source + d1];
-        if (pair < half) {
-            const float c = table[uint64_t(token) * rotary + pair];
-            const float s = table[uint64_t(token) * rotary + half + pair];
-            const float a = q0, b = k0;
-            q0 = __fsub_rn(__fmul_rn(a, c), __fmul_rn(q1, s));
-            q1 = __fadd_rn(__fmul_rn(q1, c), __fmul_rn(a, s));
-            k0 = __fsub_rn(__fmul_rn(b, c), __fmul_rn(k1, s));
-            k1 = __fadd_rn(__fmul_rn(k1, c), __fmul_rn(b, s));
-        }
-        q_out[target + d0] = q0; q_out[target + d1] = q1;
-        k_out[target + d0] = k0; k_out[target + d1] = k1;
-        v_out[target + d0] = v[source + d0]; v_out[target + d1] = v[source + d1];
-    }
-}
 
 __device__ __forceinline__ __nv_bfloat16 bf16_mul_round(__nv_bfloat16 a, __nv_bfloat16 b) {
 #if defined(__HIP__)
@@ -782,28 +740,16 @@ extern "C" __global__ __launch_bounds__(256, 6) void rms_rotary_pack_qkv_bf16(
     }
 }
 
-// [batch, heads, tokens, dim] -> [batch * tokens, heads * dim].
-extern "C" __global__ void head_rows_f32(
-    const float* input, float* output, uint32_t batch, uint32_t tokens, uint32_t heads, uint32_t dim) {
-    if (!vision_flat_launch() || !input || !output || !batch || !tokens || !heads || !dim) { __trap(); return; }
-    const uint64_t count = uint64_t(batch) * tokens * heads * dim;
-    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
-         i += uint64_t(gridDim.x) * 256) {
-        const uint32_t d = i % dim, head = (i / dim) % heads, token = (i / (uint64_t(dim) * heads)) % tokens;
-        const uint64_t item = i / (uint64_t(dim) * heads * tokens);
-        output[i] = input[((item * heads + head) * tokens + token) * dim + d];
-    }
-}
 
 // Planar [channels, pixels] -> [pixels, channels], with F32 multiply then add.
-extern "C" __global__ void planar_affine_rows_f32(
-    const float* input, const float* scale, const float* bias, float* output,
+extern "C" __global__ void planar_bf16_affine_rows_f32(
+    const __nv_bfloat16* input, const float* scale, const float* bias, float* output,
     uint32_t channels, uint64_t pixels) {
     if (!vision_flat_launch() || !input || !scale || !bias || !output || !channels || !pixels) { __trap(); return; }
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < pixels * channels;
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t channel = i % channels;
-        output[i] = __fadd_rn(__fmul_rn(input[uint64_t(channel) * pixels + i / channels], scale[channel]), bias[channel]);
+        output[i] = __fadd_rn(__fmul_rn(__bfloat162float(input[uint64_t(channel) * pixels + i / channels]), scale[channel]), bias[channel]);
     }
 }
 

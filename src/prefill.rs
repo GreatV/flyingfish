@@ -361,6 +361,7 @@ pub(crate) struct DenseStage<'a> {
     pub source: &'a [usize],
     pub visits: usize,
     pub load_scratch: usize,
+    pub device_staging: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -399,8 +400,14 @@ impl DenseStage<'_> {
                 .checked_add(if streamed.is_empty() { 0 } else { page })
                 .and_then(|n| n.checked_mul(2))
                 .context("resident upload and mapping slots overflow")?;
+            let staging = if streamed.is_empty() {
+                0
+            } else {
+                charge(self.device_staging)?
+            };
             let device = slots
-                .checked_add(resident_device)
+                .checked_add(staging)
+                .and_then(|bytes| bytes.checked_add(resident_device))
                 .context("resident stage device extent overflow")?;
             if device <= limit {
                 let mut slots = vec![None; order.len()];
@@ -570,8 +577,9 @@ pub(crate) fn price_dense_stages(
                             if plan.slot_bytes == 0 {
                                 return Ok(reserved);
                             }
+                            let ring_slot = plan.slot_bytes.max(stage.device_staging);
                             reserved
-                                .checked_add(2 * plan.slot_bytes)
+                                .checked_add(2 * ring_slot)
                                 .and_then(|n| n.checked_add(stage.load_scratch))
                                 .context("resident host slot reserve overflow")
                         })?;
@@ -656,18 +664,21 @@ mod tests {
                 source: &conditioner,
                 visits: 1,
                 load_scratch: 1000,
+                device_staging: 0,
             },
             DenseStage {
                 device: &dit,
                 source: &dit,
                 visits: 6,
                 load_scratch: 600,
+                device_staging: 0,
             },
             DenseStage {
                 device: &decoder,
                 source: &decoder,
                 visits: 1,
                 load_scratch: 400,
+                device_staging: 0,
             },
         ];
         let slow_pcie = price_dense_stages(stages, (6032, 7000, 1), (1.0, 100.0))?;
@@ -683,6 +694,7 @@ mod tests {
             source: &layer_bytes,
             visits: 1,
             load_scratch: 0,
+            device_staging: 0,
         };
         let full = price_dense_stages([streamed; 3], (72, 150, 4), (100.0, 1.0))?;
         assert_eq!(full.device_bytes, [24; 3]);
@@ -697,6 +709,23 @@ mod tests {
                 .sum::<usize>(),
             8
         );
+        let small = DenseStage {
+            device: &[8],
+            source: &[8],
+            ..streamed
+        };
+        let casting = DenseStage {
+            device: &[80; 6],
+            source: &[160; 6],
+            device_staging: 160,
+            ..streamed
+        };
+        let stages = [small, small, casting];
+        assert!(price_dense_stages(stages, (344, 319, 4), (100.0, 1.0)).is_err());
+        let converted = price_dense_stages(stages, (344, 320, 4), (100.0, 1.0))?;
+        assert_eq!(converted.device_bytes, [8, 8, 328]);
+        assert_eq!(converted.plans[2].slot_bytes, 80);
+        assert_eq!(converted.plans[2].disk_bytes, 960);
         Ok(())
     }
 
