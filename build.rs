@@ -675,6 +675,32 @@ fn main() {
                     String::from_utf8_lossy(&result.stderr)
                 );
                 index.push_str(&format!("({name:?}, {sm}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
+                if name == "gemm_skinny" {
+                    let fp16_filename = format!("gemm_skinny_fp16_sm{sm}.cubin");
+                    let fp16 = out.join(&fp16_filename);
+                    let result = Command::new(&nvcc)
+                        .env("TMPDIR", &temp)
+                        .args([
+                            "--cubin",
+                            "--threads=1",
+                            "-O3",
+                            "--std=c++17",
+                            "-DFF_FP16_GEMM_BODY",
+                        ])
+                        .arg(format!("-arch=sm_{sm}"))
+                        .arg(&file)
+                        .arg("-o")
+                        .arg(&fp16)
+                        .output()
+                        .expect("cannot compile FP16 skinny cubin");
+                    assert!(
+                        result.status.success(),
+                        "nvcc failed for {} sm_{sm} FP16 body:\n{}\n{}",
+                        file.display(),
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
             }
         }
     }

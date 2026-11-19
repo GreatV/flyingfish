@@ -1,3 +1,246 @@
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800) || defined(FF_FP16_GEMM_BODY)
+// sm75: m16n8k16 bf16 is two m16n8k8.row.col.f32.f16.f16.f32 steps.
+// cp.async.cg 16B is ld.global.cg.v4.u32 plus st.shared.v4.u32.
+// A segment with fewer than 8 live elements is scalar u16 loads.
+// W and X elements are FP16. Accumulators are F32.
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <type_traits>
+
+constexpr int RT = 16;
+constexpr int NW = 4;
+constexpr int NT_ = NW * 32;
+constexpr int CK = 64;
+constexpr int PAD = 8;
+constexpr int LDS = CK + PAD;
+constexpr int MA = 16;
+constexpr int SPAN = NW * CK;
+
+__device__ __forceinline__ unsigned smem_u32(const void* p) {
+  return (unsigned)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(smem_u32(p)));
+}
+__device__ __forceinline__ void ldsm_x2(unsigned (&r)[2], const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(r[0]), "=r"(r[1]) : "r"(smem_u32(p)));
+}
+// PTX m16n8k16 A registers are two m16n8k8 fragments: (a0,a1) then (a2,a3).
+// B registers are the same split along K.
+__device__ __forceinline__ void mma_1688(float (&d)[4], unsigned a0, unsigned a1, unsigned b0) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(b0));
+}
+
+constexpr int WT_BYTES = NW * RT * LDS * 2;
+constexpr int XT_BYTES = NW * MA * LDS * 2;
+constexpr int MG_OFF = 2 * (WT_BYTES + XT_BYTES);
+
+__device__ __forceinline__ void stage8(void* dst, const void* src, int alive) {
+  unsigned x = 0u, y = 0u, z = 0u, w = 0u;
+  if (alive == 8 && (reinterpret_cast<uintptr_t>(src) & 15u) == 0u) {
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                 : "l"(src));
+  } else if (alive > 0) {
+    unsigned short e0 = 0, e1 = 0, e2 = 0, e3 = 0, e4 = 0, e5 = 0, e6 = 0, e7 = 0;
+    const unsigned short* p = reinterpret_cast<const unsigned short*>(src);
+    if (alive > 0) e0 = p[0];
+    if (alive > 1) e1 = p[1];
+    if (alive > 2) e2 = p[2];
+    if (alive > 3) e3 = p[3];
+    if (alive > 4) e4 = p[4];
+    if (alive > 5) e5 = p[5];
+    if (alive > 6) e6 = p[6];
+    if (alive > 7) e7 = p[7];
+    x = (unsigned)e0 | ((unsigned)e1 << 16);
+    y = (unsigned)e2 | ((unsigned)e3 << 16);
+    z = (unsigned)e4 | ((unsigned)e5 << 16);
+    w = (unsigned)e6 | ((unsigned)e7 << 16);
+  }
+  asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(smem_u32(dst)), "r"(x), "r"(y), "r"(z), "r"(w));
+}
+
+template <typename Output>
+__device__ __forceinline__ void skinny_project(const __half* __restrict__ W, const __half* __restrict__ X,
+                                                Output* __restrict__ Y, int out_features, int in_features, long ldw,
+                                                int m, int tiny) {
+  if (blockDim.x != NT_ || m < 1 || out_features < 1 || in_features < 1 || ldw < in_features) __trap();
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (tiny) {
+    if ((ldw & 1) != 0 || ((uintptr_t)W & 3u) != 0u || ((uintptr_t)X & 3u) != 0u) __trap();
+    if (gridDim.x != out_features || gridDim.y != m || gridDim.z != 1) __trap();
+    const int output = blockIdx.x;
+    const int row = blockIdx.y;
+    const __half* weights = W + (size_t)output * ldw;
+    const __half* input = X + (size_t)row * in_features;
+    float sum = 0.0f;
+    for (int k = 2 * tid; k + 1 < in_features; k += 2 * NT_) {
+      const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(weights + k));
+      const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(input + k));
+      sum = fmaf(wv.x, xv.x, sum);
+      sum = fmaf(wv.y, xv.y, sum);
+    }
+    if ((in_features & 1) != 0 && tid == 0) {
+      const int k = in_features - 1;
+      sum = fmaf(__half2float(weights[k]), __half2float(input[k]), sum);
+    }
+#pragma unroll
+    for (int delta = 16; delta > 0; delta >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, delta);
+    extern __shared__ float partials[];
+    if (lane == 0) partials[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+      float total = 0.0f;
+#pragma unroll
+      for (int w = 0; w < NW; ++w) total += partials[w];
+      if constexpr (std::is_same_v<Output, __half>)
+        Y[(size_t)row * out_features + output] = __float2half_rn(total);
+      else
+        Y[(size_t)row * out_features + output] = total;
+    }
+    return;
+  }
+  if (gridDim.x != (out_features + RT - 1) / RT || gridDim.y != 1 || gridDim.z != 1) __trap();
+
+  const int row0 = blockIdx.x * RT;
+  const int nck = (in_features + SPAN - 1) / SPAN;
+  const int kbeg = warp * nck * CK;
+
+  extern __shared__ __align__(16) __half smm[];
+  __half* wt = smm;
+  __half* xt = smm + 2 * (WT_BYTES / 2);
+  float* mg = reinterpret_cast<float*>(smm + MG_OFF / 2);
+  __half* const wt0 = wt + warp * RT * LDS;
+  __half* const wt1 = wt0 + WT_BYTES / 2;
+  __half* const xt0 = xt + warp * MA * LDS;
+  __half* const xt1 = xt0 + XT_BYTES / 2;
+
+  auto stage_w = [&](int c, int buf) {
+    __half* const wbuf = buf ? wt1 : wt0;
+    const int k0 = kbeg + c * CK;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int idx = lane + i * 32;
+      const int r = idx >> 3, seg = idx & 7;
+      const int k = k0 + seg * 8;
+      const bool row_live = row0 + r < out_features;
+      int alive = 0;
+      const __half* src = W;
+      if (row_live && k < in_features) {
+        alive = in_features - k;
+        if (alive > 8) alive = 8;
+        src = W + (size_t)(row0 + r) * ldw + k;
+      }
+      stage8(wbuf + r * LDS + seg * 8, src, alive);
+    }
+    __syncwarp();
+  };
+  auto stage_x = [&](int c, int buf, int m0, int mt) {
+    __half* const xbuf = buf ? xt1 : xt0;
+    const int k0 = kbeg + c * CK;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int idx = lane + i * 32;
+      const int r = idx >> 3, seg = idx & 7;
+      const int k = k0 + seg * 8;
+      int alive = 0;
+      const __half* src = X;
+      if (r < mt && k < in_features) {
+        alive = in_features - k;
+        if (alive > 8) alive = 8;
+        src = X + (size_t)(m0 + r) * in_features + k;
+      }
+      stage8(xbuf + r * LDS + seg * 8, src, alive);
+    }
+    __syncwarp();
+  };
+
+  for (int m0 = 0; m0 < m; m0 += MA) {
+    const int mt = m - m0 < MA ? m - m0 : MA;
+    const int nacts = (mt + 7) / 8;
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    stage_w(0, 0);
+    stage_x(0, 0, m0, mt);
+    for (int c = 0; c < nck; ++c) {
+      const int buf = c & 1;
+      if (c + 1 < nck) {
+        stage_w(c + 1, buf ^ 1);
+        stage_x(c + 1, buf ^ 1, m0, mt);
+      }
+      __half* const wbuf = buf ? wt1 : wt0;
+      __half* const xbuf = buf ? xt1 : xt0;
+#pragma unroll
+      for (int kk = 0; kk < CK / 16; ++kk) {
+        unsigned wa[4];
+        ldsm_x4(wa, wbuf + (lane & 15) * LDS + kk * 16 + (lane >> 4) * 8);
+        unsigned xb[2];
+        ldsm_x2(xb, xbuf + (lane & 7) * LDS + kk * 16 + (lane >> 3) * 8);
+        mma_1688(acc0, wa[0], wa[1], xb[0]);
+        mma_1688(acc0, wa[2], wa[3], xb[1]);
+        if (nacts > 1) {
+          ldsm_x2(xb, xbuf + (8 + (lane & 7)) * LDS + kk * 16 + (lane >> 3) * 8);
+          mma_1688(acc1, wa[0], wa[1], xb[0]);
+          mma_1688(acc1, wa[2], wa[3], xb[1]);
+        }
+      }
+    }
+    __syncthreads();
+    const int c0 = (lane & 3) * 2;
+    mg[((warp * RT) + (lane >> 2)) * MA + c0] = acc0[0];
+    mg[((warp * RT) + (lane >> 2)) * MA + c0 + 1] = acc0[1];
+    mg[((warp * RT) + (lane >> 2) + 8) * MA + c0] = acc0[2];
+    mg[((warp * RT) + (lane >> 2) + 8) * MA + c0 + 1] = acc0[3];
+    if (nacts > 1) {
+      mg[((warp * RT) + (lane >> 2)) * MA + c0 + 8] = acc1[0];
+      mg[((warp * RT) + (lane >> 2)) * MA + c0 + 9] = acc1[1];
+      mg[((warp * RT) + (lane >> 2) + 8) * MA + c0 + 8] = acc1[2];
+      mg[((warp * RT) + (lane >> 2) + 8) * MA + c0 + 9] = acc1[3];
+    }
+    __syncthreads();
+    if (warp == 0) {
+      for (int idx = lane; idx < RT * mt; idx += 32) {
+        const int r = idx / mt, a = idx % mt;
+        const int row = row0 + r;
+        if (row >= out_features) continue;
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) s += mg[(w * RT + r) * MA + a];
+        if constexpr (std::is_same_v<Output, __half>)
+          Y[(size_t)(m0 + a) * out_features + row] = __float2half_rn(s);
+        else
+          Y[(size_t)(m0 + a) * out_features + row] = s;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+extern "C" __global__ __launch_bounds__(NT_) void gemm_skinny_bf16(const __half* __restrict__ W,
+                                                                   const __half* __restrict__ X,
+                                                                   __half* __restrict__ Y, int out_features,
+                                                                   int in_features, long ldw, int m, int tiny) {
+  skinny_project(W, X, Y, out_features, in_features, ldw, m, tiny);
+}
+
+extern "C" __global__ __launch_bounds__(NT_) void gemm_skinny_bf16_f32(const __half* __restrict__ W,
+                                                                       const __half* __restrict__ X,
+                                                                       float* __restrict__ Y, int out_features,
+                                                                       int in_features, long ldw, int m) {
+  skinny_project(W, X, Y, out_features, in_features, ldw, m, 0);
+}
+#else /* ff-sm80 */
 #if defined(__HIP__)
 #include "gpu_compat.cuh"
 #include <stdint.h>
@@ -434,3 +677,4 @@ extern "C" __global__ __launch_bounds__(NT_) void gemm_skinny_bf16_f32(
 #undef FD_GUARD_SKINNY
 
 #endif
+#endif /* ff-sm80 */
