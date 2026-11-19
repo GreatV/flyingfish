@@ -5143,18 +5143,7 @@ impl Dit {
             )?;
             let width = spec.heads * spec.head_dim;
             work.plan_rotation(d, spec)?;
-            use crate::backend::setup::DeviceArchitecture::Cuda;
-            if matches!(d.info.arch, Cuda(89 | 120))
-                && work.rows >= crate::convrot::TENSOR_CORE_ROWS
-                && (h, width) == (5376, 7168)
-                && h * width <= d.info.l2_bytes
-            {
-                let product = crate::convrot::ProductKernel::NFastLdsm;
-                if d.info.arch == Cuda(120) {
-                    crate::convrot::product_active_ctas(d, product)?;
-                }
-                work.qkv_product = product;
-            }
+            work.qkv_product = crate::convrot::qkv_product(d, work.rows, (h, width))?;
         } else {
             work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
         }
