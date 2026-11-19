@@ -422,8 +422,7 @@ impl Flash {
             use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
             let ctx = self.stream.context();
             let major = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-            let minor = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-            if (major, minor) == (8, 9) {
+            if major >= 8 {
                 let name = "attention_prefill_d128_bidirectional_single_pv";
                 let module = super::cubin::module(ctx, "attention_native")?;
                 let function = module.load_function(name)?;
@@ -475,7 +474,7 @@ impl Flash {
                         "{}",
                         serde_json::json!({"attention_probability": {
                             "symbol":"attention_prefill_d128_bidirectional",
-                            "capability":[major,minor],"form":"residual"
+                            "capability":[major,ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?],"form":"residual"
                         }})
                     );
                 }
@@ -4370,8 +4369,7 @@ mod tests {
                 if case.d == 128
                     && case.mode == "bidirectional"
                     && case.scale.is_none()
-                    && ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)? == 8
-                    && ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)? == 9
+                    && ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)? >= 8
                 {
                     defects += cell(&stream, case, &root, bound, true)?;
                 }
