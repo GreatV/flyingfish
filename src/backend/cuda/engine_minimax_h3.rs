@@ -11846,6 +11846,10 @@ mod tests {
             ))
         };
         let (model, s0) = (var("FF_MODEL")?, var("FF_H3_S0")?);
+        let capture = std::env::var_os("FF_H3_CAPTURE").map(PathBuf::from);
+        if let Some(capture) = &capture {
+            fs::create_dir_all(capture)?;
+        }
         let frozen: serde_json::Value =
             serde_json::from_slice(&fs::read(var("FF_H3_N7_THRESHOLDS")?)?)?;
         let spec = crate::minimax_h3::VaeSpec::read(&model)?;
@@ -11933,6 +11937,18 @@ mod tests {
             };
             let tiles = crate::minimax_h3::VaeTiles::released(&spec, height, width)?;
             let native = encode(&tiles)?;
+            if let Some(capture) = &capture {
+                let taps: BTreeMap<String, Vec<f32>> = keys
+                    .iter()
+                    .zip(&native)
+                    .map(|(name, values)| (format!("k0.{name}"), values.clone()))
+                    .collect();
+                super::vae::image_tests::save_taps(
+                    &capture.join(format!("{cell}.safetensors")),
+                    &taps,
+                    &file,
+                )?;
+            }
             let as64 = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
             for (key, candidate) in keys.iter().zip(&native) {
                 let reference = file.tensor(&format!("k0.{key}"))?;

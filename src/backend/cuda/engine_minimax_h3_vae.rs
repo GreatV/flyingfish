@@ -2423,6 +2423,17 @@ fn rotary_table<T: Clone>(
     table
 }
 
+/// Select temporal index two from `[out, input, 3, k, k]` for a single frame.
+fn single_frame_weight(weight: &[f32], out: usize, input: usize, k: usize) -> Vec<f32> {
+    let taps = k * k;
+    let mut sliced = Vec::with_capacity(out * input * taps);
+    for outer in 0..out * input {
+        let first = (outer * 3 + 2) * taps;
+        sliced.extend_from_slice(&weight[first..first + taps]);
+    }
+    sliced
+}
+
 /// A causal 3D convolution `[out, input, k, k, k]` with bias, published F32, applied to one frame.
 struct Conv {
     weight: CudaSlice<f32>,
@@ -2437,12 +2448,28 @@ type LoadF32<'a> = dyn FnMut(&str, usize) -> Result<CudaSlice<f32>> + 'a;
 
 impl Conv {
     fn load(
+        s: &Arc<CudaStream>,
         load: &mut LoadF32<'_>,
         base: &str,
         (out, input, kernel): (usize, usize, usize),
     ) -> Result<Self> {
+        ensure!(
+            kernel == 1 || kernel == 3,
+            "single-frame convolution kernel {kernel} unsupported"
+        );
+        let weight = load(&format!("{base}.weight"), out * input * kernel.pow(3))?;
+        let weight = if kernel == 1 {
+            weight
+        } else {
+            s.clone_htod(&single_frame_weight(
+                &s.clone_dtoh(&weight)?,
+                out,
+                input,
+                kernel,
+            ))?
+        };
         Ok(Self {
-            weight: load(&format!("{base}.weight"), out * input * kernel.pow(3))?,
+            weight,
             bias: load(&format!("{base}.bias"), out)?,
             out,
             input,
@@ -2450,9 +2477,10 @@ impl Conv {
         })
     }
 
-    /// GEMM reduction width: `input x k^3` im2col columns (the input rows themselves for `k = 1`).
+    /// GEMM reduction width: `input x k^2` im2col columns after selecting the
+    /// last temporal weight slice (the input rows themselves for `k = 1`).
     fn columns(&self) -> usize {
-        self.input * self.kernel.pow(3)
+        self.input * self.kernel.pow(2)
     }
 
     /// Output extent of `size` input pixels: `size` at stride 1 (pad `k / 2` each side); at stride 2 the input carries
@@ -2591,7 +2619,7 @@ impl KeyframeEncoder {
             source.tensor::<f32>(s, name, elements)
         };
         let first = spec.block_out_channels[0];
-        let conv_in = Conv::load(load, "encoder.conv_in", (first, spec.in_channels, 3))?;
+        let conv_in = Conv::load(s, load, "encoder.conv_in", (first, spec.in_channels, 3))?;
         let mut levels = Vec::with_capacity(spec.block_out_channels.len());
         let mut input = first;
         for (i, &out) in spec.block_out_channels.iter().enumerate() {
@@ -2601,13 +2629,14 @@ impl KeyframeEncoder {
                 let channels = if j == 0 { input } else { out };
                 resnets.push(Resnet {
                     norm1: GroupNorm::load(load, &format!("{base}.norm1"), channels)?,
-                    conv1: Conv::load(load, &format!("{base}.conv1"), (out, channels, 3))?,
+                    conv1: Conv::load(s, load, &format!("{base}.conv1"), (out, channels, 3))?,
                     norm2: GroupNorm::load(load, &format!("{base}.norm2"), out)?,
-                    conv2: Conv::load(load, &format!("{base}.conv2"), (out, out, 3))?,
+                    conv2: Conv::load(s, load, &format!("{base}.conv2"), (out, out, 3))?,
                     shortcut: if channels == out {
                         None
                     } else {
                         Some(Conv::load(
+                            s,
                             load,
                             &format!("{base}.conv_shortcut"),
                             (out, channels, 1),
@@ -2617,7 +2646,7 @@ impl KeyframeEncoder {
             }
             let down = if spec.spatial_factors[i] * spec.temporal_factors[i] > 1 {
                 let base = format!("encoder.down_blocks.{i}.downsamplers.0.conv");
-                Some(Conv::load(load, &base, (out, out, 3))?)
+                Some(Conv::load(s, load, &base, (out, out, 3))?)
             } else {
                 None
             };
@@ -2626,8 +2655,8 @@ impl KeyframeEncoder {
         }
         let latent2 = 2 * spec.latent_channels;
         let norm_out = GroupNorm::load(load, "encoder.norm_out", input)?;
-        let conv_out = Conv::load(load, "encoder.conv_out", (latent2, input, 3))?;
-        let quant = Conv::load(load, "quant_conv", (latent2, latent2, 1))?;
+        let conv_out = Conv::load(s, load, "encoder.conv_out", (latent2, input, 3))?;
+        let quant = Conv::load(s, load, "quant_conv", (latent2, latent2, 1))?;
         ensure!(
             consumed == expected,
             "encoder partial loader tensor set differs"
@@ -2797,7 +2826,7 @@ impl KeyframeEncoder {
                         .arg(&u32::try_from(height)?)
                         .arg(&u32::try_from(width)?)
                         .arg(&u32::try_from(out_w)?)
-                        .arg(&u32::try_from(c.kernel)?)
+                        .arg(&1u32)
                         .arg(&u32::try_from(c.kernel)?)
                         .arg(&u32::try_from(stride)?)
                         .arg(&u32::try_from(pad)?)
@@ -3168,7 +3197,7 @@ impl EncodeWork {
 }
 
 #[cfg(test)]
-mod image_tests {
+pub(crate) mod image_tests {
     use super::*;
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::checkpoint::MappedCheckpoint;
@@ -3182,6 +3211,20 @@ mod image_tests {
             ))?)?
             .single_frame(),
         )
+    }
+
+    #[test]
+    fn single_frame_weight_selects_the_last_temporal_slice() {
+        let (out, input, k): (usize, usize, usize) = (2, 3, 3);
+        let full: Vec<f32> = (0..out * input * k.pow(3)).map(|v| v as f32).collect();
+        let sliced = single_frame_weight(&full, out, input, k);
+        assert_eq!(sliced.len(), out * input * k * k);
+        for outer in 0..out * input {
+            for j in 0..k * k {
+                assert_eq!(sliced[outer * k * k + j], full[(outer * 3 + 2) * k * k + j]);
+            }
+        }
+        assert_ne!(sliced, full);
     }
 
     #[test]
@@ -3591,7 +3634,7 @@ mod image_tests {
         tensor(&file, "normalized_latent")
     }
 
-    fn save_taps(
+    pub(crate) fn save_taps(
         path: &Path,
         taps: &BTreeMap<String, Vec<f32>>,
         reference: &SafeTensors<'_>,
@@ -4002,65 +4045,67 @@ mod image_tests {
             }
             Ok((got, want))
         };
-        for (name, layout) in [("production", 0), ("production-layout1", 1)] {
-            run(
-                &Case {
-                    name,
-                    channels: 512,
-                    height: 256,
-                    width: 256,
-                    out_w: 256,
-                    kt: 3,
+        for kt in [3, 1] {
+            for (name, layout) in [("production", 0), ("production-layout1", 1)] {
+                run(
+                    &Case {
+                        name,
+                        channels: 512,
+                        height: 256,
+                        width: 256,
+                        out_w: 256,
+                        kt,
+                        k: 3,
+                        stride: 1,
+                        pad: 1,
+                        first: 0,
+                        rows: 1024,
+                        layout,
+                    },
+                    false,
+                )?;
+            }
+            for layout in [0, 1] {
+                let ragged = Case {
+                    name: "ragged",
+                    channels: 3,
+                    height: 5,
+                    width: 7,
+                    out_w: 7,
+                    kt,
                     k: 3,
                     stride: 1,
                     pad: 1,
-                    first: 0,
-                    rows: 1024,
+                    first: 2,
+                    rows: 5,
                     layout,
-                },
-                false,
-            )?;
-        }
-        for layout in [0, 1] {
-            let ragged = Case {
-                name: "ragged",
-                channels: 3,
-                height: 5,
-                width: 7,
-                out_w: 7,
-                kt: 3,
-                k: 3,
-                stride: 1,
-                pad: 1,
-                first: 2,
-                rows: 5,
-                layout,
-            };
-            let (base, _) = run(&ragged, false)?;
-            let (negative, _) = run(&ragged, true)?;
-            ensure!(
-                base != negative,
-                "one-pixel control did not change the output"
-            );
-        }
-        for layout in [0, 1] {
-            run(
-                &Case {
-                    name: "stride2",
-                    channels: 5,
-                    height: 6,
-                    width: 8,
-                    out_w: 4,
-                    kt: 3,
-                    k: 3,
-                    stride: 2,
-                    pad: 0,
-                    first: 0,
-                    rows: 12,
-                    layout,
-                },
-                false,
-            )?;
+                };
+                let (base, _) = run(&ragged, false)?;
+                let (negative, _) = run(&ragged, true)?;
+                ensure!(
+                    base != negative,
+                    "one-pixel control did not change the output"
+                );
+            }
+            for layout in [0, 1] {
+                run(
+                    &Case {
+                        name: "stride2",
+                        channels: 5,
+                        height: 6,
+                        width: 8,
+                        out_w: 4,
+                        kt,
+                        k: 3,
+                        stride: 2,
+                        pad: 0,
+                        first: 0,
+                        rows: 12,
+                        layout,
+                    },
+                    false,
+                )?;
+            }
         }
         run(
             &Case {
@@ -4080,7 +4125,7 @@ mod image_tests {
             false,
         )?;
         println!(
-            "CAUSAL_FRAME_IM2COL_GATE PASS production=2 layouts=4 edge_cases=5 control=DIFFERS"
+            "CAUSAL_FRAME_IM2COL_GATE PASS production=4 layouts=8 edge_cases=9 control=DIFFERS"
         );
         Ok(())
     }
