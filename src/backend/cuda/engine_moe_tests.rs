@@ -705,6 +705,258 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
     result
 }
 
+#[test]
+fn expert_host_profile_reads_the_mounted_cgroup2_controller() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "flyingfish-host-memory-cgroup2-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> Result<()> {
+        let write = |path: &str, value: &str| -> Result<()> {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().context("fixture parent missing")?)?;
+            Ok(std::fs::write(path, value)?)
+        };
+        write("proc/meminfo", "MemAvailable: 67108864 kB\n")?;
+        write(
+            "proc/self/limits",
+            "Max resident set unlimited unlimited bytes\n",
+        )?;
+        write(
+            "proc/self/mountinfo",
+            "1077 1076 0:27 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot\n1088 1082 0:27 /../../jupyter-children /var/colab/cgroup/jupyter-children ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n",
+        )?;
+        write("proc/self/cgroup", "0::/../../jupyter-children/leaf\n")?;
+        write("sys/fs/cgroup/memory.max", "1048576\n")?;
+        write("sys/fs/cgroup/memory.current", "0\n")?;
+        write("sys/fs/cgroup/memory.stat", "file 0\nshmem 0\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.max",
+            "107374182400\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.high",
+            "max\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.current",
+            "4294967296\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/leaf/memory.stat",
+            "file 0\nshmem 0\n",
+        )?;
+        write("var/colab/cgroup/jupyter-children/memory.max", "max\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.high",
+            "21474836480\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.current",
+            "8589934592\n",
+        )?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.stat",
+            "file 0\nshmem 0\n",
+        )?;
+        let child = super::host_memory(&root)?;
+        ensure!(
+            child == 12 << 30,
+            "mounted cgroup2 high watermark did not bind: {child}"
+        );
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/leaf/memory.max"))?;
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/leaf/memory.high"))?;
+        let ancestor = super::host_memory(&root)?;
+        ensure!(
+            ancestor == 12 << 30,
+            "missing leaf controller did not keep the ancestor high watermark: {ancestor}"
+        );
+        write("proc/self/cgroup", "0::/../../jupyter-children\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.max",
+            "8589934592\n",
+        )?;
+        write("var/colab/cgroup/jupyter-children/memory.high", "max\n")?;
+        write("var/colab/cgroup/jupyter-children/memory.current", "0\n")?;
+        write(
+            "var/colab/cgroup/jupyter-children/memory.stat",
+            "file 0\nshmem 0\n",
+        )?;
+        let mounted = super::host_memory(&root)?;
+        ensure!(
+            mounted == 8 << 30,
+            "mounted cgroup2 memory.max did not bind: {mounted}"
+        );
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/memory.max"))?;
+        std::fs::remove_file(root.join("var/colab/cgroup/jupyter-children/memory.high"))?;
+        let error = super::host_memory(&root)
+            .expect_err("missing mounted controller admitted")
+            .to_string();
+        ensure!(
+            error.contains("tried")
+                && error.contains("var/colab/cgroup/jupyter-children")
+                && !error.contains("sys/fs/cgroup"),
+            "missing controller names the wrong path: {error}"
+        );
+        println!(
+            "PASS host_memory_cgroup2_mount child_available_bytes={} mount_available_bytes={} leaf_max=107374182400 mount_high=21474836480 mount_used=8589934592 decoy_max=1048576 missing_controller_rejected=true",
+            12u64 << 30,
+            8u64 << 30
+        );
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
+}
+
+#[test]
+fn expert_host_profile_keeps_ancestor_limits_across_overlapping_cgroup2_mounts() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "flyingfish-host-memory-cgroup2-overlap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> Result<()> {
+        let write = |path: &str, value: &str| -> Result<()> {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().context("fixture parent missing")?)?;
+            Ok(std::fs::write(path, value)?)
+        };
+        write("proc/meminfo", "MemAvailable: 67108864 kB\n")?;
+        write(
+            "proc/self/limits",
+            "Max resident set unlimited unlimited bytes\n",
+        )?;
+        write("proc/self/cgroup", "0::/job/leaf\n")?;
+        write(
+            "proc/self/mountinfo",
+            "31 22 0:27 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate\n32 22 0:27 /job/leaf /mnt/leaf rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate\n",
+        )?;
+        for path in ["sys/fs/cgroup/job/leaf", "mnt/leaf"] {
+            write(&format!("{path}/memory.max"), "8589934592\n")?;
+            write(&format!("{path}/memory.current"), "1073741824\n")?;
+            write(&format!("{path}/memory.stat"), "file 0\nshmem 0\n")?;
+        }
+        write("sys/fs/cgroup/job/memory.max", "6442450944\n")?;
+        write("sys/fs/cgroup/job/memory.current", "1073741824\n")?;
+        write("sys/fs/cgroup/job/memory.stat", "file 0\nshmem 0\n")?;
+        let overlapped = super::host_memory(&root)?;
+        ensure!(
+            overlapped == 5 << 30,
+            "overlapping mounts dropped the ancestor limit: {overlapped}"
+        );
+        std::fs::remove_file(root.join("sys/fs/cgroup/job/memory.max"))?;
+        let leaf_only = super::host_memory(&root)?;
+        ensure!(
+            leaf_only == 7 << 30,
+            "leaf headroom changed after the ancestor file was removed: {leaf_only}"
+        );
+        println!(
+            "PASS host_memory_cgroup2_overlap with_ancestor_bytes={} without_ancestor_bytes={} job_max=6442450944 leaf_max=8589934592 charged=1073741824",
+            5u64 << 30,
+            7u64 << 30
+        );
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
+}
+
+#[test]
+fn expert_host_profile_treats_the_cgroup2_hierarchy_root_as_unlimited() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "flyingfish-host-memory-cgroup2-root-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root)?;
+    let result = (|| -> Result<()> {
+        let write = |path: &str, value: &str| -> Result<()> {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().context("fixture parent missing")?)?;
+            Ok(std::fs::write(path, value)?)
+        };
+        write("proc/meminfo", "MemAvailable: 16777216 kB\n")?;
+        write(
+            "proc/self/limits",
+            "Max resident set unlimited unlimited bytes\n",
+        )?;
+        write(
+            "proc/self/mountinfo",
+            "3 0 0:3 / /sys/fs/cgroup rw - cgroup2 none rw\n",
+        )?;
+        write("proc/self/cgroup", "0::/\n")?;
+        std::fs::create_dir_all(root.join("sys/fs/cgroup"))?;
+        let root_available = super::host_memory(&root)?;
+        ensure!(
+            root_available == 16 << 30,
+            "hierarchy root bound a limit: {root_available}"
+        );
+        write(
+            "proc/self/limits",
+            "Max resident set 6442450944 unlimited bytes\n",
+        )?;
+        write("proc/self/status", "VmRSS: 1048576 kB\n")?;
+        let rss_available = super::host_memory(&root)?;
+        ensure!(
+            rss_available == 5 << 30,
+            "process resident limit did not bind at the hierarchy root: {rss_available}"
+        );
+        write(
+            "proc/self/limits",
+            "Max resident set unlimited unlimited bytes\n",
+        )?;
+        write("sys/fs/cgroup/memory.max", "8589934592\n")?;
+        write("sys/fs/cgroup/memory.current", "0\n")?;
+        write("sys/fs/cgroup/memory.stat", "file 0\nshmem 0\n")?;
+        let limited = super::host_memory(&root)?;
+        ensure!(
+            limited == 8 << 30,
+            "finite hierarchy-root memory.max did not bind: {limited}"
+        );
+        std::fs::remove_file(root.join("sys/fs/cgroup/memory.max"))?;
+        let restored = super::host_memory(&root)?;
+        ensure!(
+            restored == 16 << 30,
+            "removing hierarchy-root memory.max left a limit: {restored}"
+        );
+        write("proc/self/cgroup", "0::/job\n")?;
+        let missing = super::host_memory(&root)
+            .expect_err("missing controller below the hierarchy root admitted")
+            .to_string();
+        ensure!(
+            missing.contains("tried") && missing.contains("sys/fs/cgroup/job"),
+            "missing non-root controller names the wrong path: {missing}"
+        );
+        write("proc/self/cgroup", "0::/../../jupyter-children\n")?;
+        let unresolved = super::host_memory(&root)
+            .expect_err("unresolved cgroup path admitted")
+            .to_string();
+        ensure!(
+            unresolved.contains("mount missing"),
+            "unresolved cgroup path was not rejected: {unresolved}"
+        );
+        println!(
+            "PASS host_memory_cgroup2_root root_available_bytes={} rss_available_bytes={} root_limit_bytes={} missing_non_root_rejected=true unresolved_rejected=true",
+            16u64 << 30,
+            5u64 << 30,
+            8u64 << 30
+        );
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&root)?;
+    result
+}
+
 fn native_fixture(
     fixture: &MoeFixture,
     directory: &Path,
