@@ -203,7 +203,44 @@ pub(crate) enum FillCast {
     F32ToBf16,
 }
 
+/// Round-robin claim order across the shard queues of `requests`: position-major over the
+/// per-shard tensor queues, so concurrent claimers spread across shards.
+pub(crate) fn claim_order<T>(requests: &[T], shard: impl Fn(&T) -> &str) -> Vec<usize> {
+    let mut queues: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, request) in requests.iter().enumerate() {
+        queues.entry(shard(request)).or_default().push(index);
+    }
+    let queues: Vec<Vec<usize>> = queues.into_values().collect();
+    let total: usize = queues.iter().map(Vec::len).sum();
+    let mut order = Vec::with_capacity(total);
+    let deepest = queues.iter().map(Vec::len).max().unwrap_or(0);
+    for position in 0..deepest {
+        for queue in &queues {
+            if let Some(&index) = queue.get(position) {
+                order.push(index);
+            }
+        }
+    }
+    order
+}
+
 impl OwnedRead {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn entry(&self) -> &TensorEntry {
+        &self.entry
+    }
+
+    pub(crate) fn dest_len(&self) -> usize {
+        self.dest_len
+    }
+
+    pub(crate) fn cast(&self) -> FillCast {
+        self.cast
+    }
+
     /// One tensor into its `dest_len` window at `dest`.
     pub(crate) fn new(
         name: &str,
@@ -228,7 +265,7 @@ unsafe impl Sync for OwnedRead {}
 
 /// Workers a fill batch runs across: twice the shard count, clamped to `[4, 8]`, bounded by the
 /// tensor count.
-fn fill_in_flight(shards: usize, tensors: usize) -> usize {
+pub(crate) fn fill_in_flight(shards: usize, tensors: usize) -> usize {
     (2 * shards).clamp(4, 8).min(tensors.max(1))
 }
 
@@ -615,6 +652,20 @@ impl EntryReader {
     /// Fills the pinned windows with one aligned direct read each. Readers are opened
     /// first on this thread; workers then claim single tensors round-robin across the
     /// shard queues, so every destination is written by exactly one worker.
+    /// Opens one O_DIRECT reader per shard named by `shards`, reusing open ones.
+    fn open_shards<'i>(
+        &mut self,
+        shards: impl Iterator<Item = &'i str>,
+    ) -> Result<&BTreeMap<String, SpanReader>> {
+        for shard in shards {
+            if !self.readers.contains_key(shard) {
+                let reader = SpanReader::open(&self.dir.join(shard), true)?;
+                self.readers.insert(shard.to_owned(), reader);
+            }
+        }
+        Ok(&self.readers)
+    }
+
     fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>]) -> Result<()> {
         let mut spans: Vec<(*mut u8, usize)> = requests
             .iter()
@@ -627,32 +678,15 @@ impl EntryReader {
                 "direct batch destination windows overlap"
             );
         }
-        for request in requests.iter() {
-            if !self.readers.contains_key(&request.entry.shard) {
-                let reader = SpanReader::open(&self.dir.join(&request.entry.shard), true)?;
-                self.readers.insert(request.entry.shard.clone(), reader);
-            }
-        }
-        let readers = &self.readers;
-        let mut queues: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (index, request) in requests.iter().enumerate() {
-            queues
-                .entry(request.entry.shard.clone())
-                .or_default()
-                .push(index);
-        }
-        let queues: Vec<Vec<usize>> = queues.into_values().collect();
-        let total: usize = queues.iter().map(Vec::len).sum();
-        let mut order = Vec::with_capacity(total);
-        let deepest = queues.iter().map(Vec::len).max().unwrap_or(0);
-        for position in 0..deepest {
-            for queue in &queues {
-                if let Some(&index) = queue.get(position) {
-                    order.push(index);
-                }
-            }
-        }
-        let in_flight = fill_in_flight(queues.len(), order.len());
+        let readers =
+            self.open_shards(requests.iter().map(|request| request.entry.shard.as_str()))?;
+        let order = claim_order(requests, |request| request.entry.shard.as_str());
+        let shards = requests
+            .iter()
+            .map(|request| request.entry.shard.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let in_flight = fill_in_flight(shards, order.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let batch = DirectBatch(requests.as_mut_ptr().cast::<u8>());
         let batch = &batch;
@@ -694,7 +728,7 @@ impl EntryReader {
     }
 
     /// One tensor through an aligned worker bounce into its packed destination.
-    fn read_bounced(
+    pub(super) fn read_bounced(
         readers: &BTreeMap<String, SpanReader>,
         name: &str,
         entry: &TensorEntry,

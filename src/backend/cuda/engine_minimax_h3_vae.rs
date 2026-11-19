@@ -92,7 +92,9 @@ impl ImageDecoder {
             bytes <= device.workspace_budget(free, free, total / 16)?,
             "image VAE decoder weights need {bytes} bytes"
         );
-        Self::from_weights(device, spec, DecoderWeightLoad::new(component, manifest))
+        let mut loader = DecoderWeightLoad::new(component, manifest);
+        loader.preload_resident(device, "image-vae")?;
+        Self::from_weights(device, spec, loader)
     }
 
     fn from_weights(
@@ -488,6 +490,7 @@ impl ImageDecodeStage {
                 (slot_count, slot_bytes, largest),
             )?);
         }
+        loader.preload_resident(device, "image-vae")?;
         let decoder = ImageDecoder::from_weights(device, spec, loader)?;
         decoder.core.bind(blas, &work.core)?;
         Ok(Self { decoder, work })
@@ -1024,6 +1027,7 @@ struct DecoderWeightLoad<'a> {
     consumed: std::collections::BTreeSet<String>,
     storage: Vec<CudaSlice<u8>>,
     staging: Vec<u8>,
+    resident: std::collections::BTreeMap<String, u64>,
 }
 
 impl<'a> DecoderWeightLoad<'a> {
@@ -1036,7 +1040,242 @@ impl<'a> DecoderWeightLoad<'a> {
             consumed: Default::default(),
             storage: Vec::new(),
             staging: vec![0; 16 << 20],
+            resident: Default::default(),
         }
+    }
+
+    /// Preloads every resident decoder tensor (no pinned offset) through a bounded pinned
+    /// ring: fill workers read and narrow a tensor into a free slot, this thread uploads
+    /// the slot on the upload stream and returns it after its event. The ring holds
+    /// `in_flight` slots of the largest tensor; a host budget that denies it keeps the
+    /// serial chunked staging in [`DecoderWeightLoad::tensor`]. Nothing is retried.
+    fn preload_resident(&mut self, d: &Device, component: &'static str) -> Result<()> {
+        let names: Vec<(String, usize)> = self
+            .manifest
+            .entries
+            .iter()
+            .filter(|(name, _)| {
+                (name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+                    && !self.offsets.contains_key(*name)
+            })
+            .map(|(name, _)| (name.clone(), decoder_tensor_bytes(self.manifest, name)))
+            .collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+        let dir = self.reader.dir.clone();
+        let requests: Vec<super::OwnedRead> = names
+            .iter()
+            .map(|(name, bytes)| {
+                let entry = &self.manifest.entries[name.as_str()];
+                let cast = if decoder_weight_width(name) == 2 {
+                    super::FillCast::F32ToBf16
+                } else {
+                    super::FillCast::Raw
+                };
+                // The device buffer is allocated now; the ring fills it below.
+                super::OwnedRead::new(name, entry, std::ptr::null_mut(), *bytes, cast)
+            })
+            .collect();
+        let largest = names.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0);
+        let shards = requests
+            .iter()
+            .map(|request| request.entry().shard.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let in_flight = super::fill_in_flight(shards, requests.len());
+        let ring_bytes = in_flight
+            .checked_mul(largest)
+            .context("resident ring extent overflow")?;
+        let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
+            "/",
+        ))?)?;
+        let reserve = 4 << 30;
+        let ring = available >= ring_bytes + reserve;
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"h3_fill_schedule": {
+                    "component": component, "decision": if ring { "ring" } else { "serial" },
+                    "requests": requests.len(), "shards": shards, "in_flight": in_flight,
+                    "ring_bytes": ring_bytes, "slot_bytes": largest,
+                    "host_available_bytes": available, "host_reserve_bytes": reserve}})
+            );
+        }
+        if !ring {
+            return Ok(());
+        }
+        let mut pin = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(ring_bytes, 0)? };
+        /// The ring base, Send by the free-slot discipline: a worker writes only its claimed slot.
+        struct RingBase(*mut u8);
+        unsafe impl Send for RingBase {}
+        unsafe impl Sync for RingBase {}
+        let base = RingBase(pin.as_mut_ptr()?);
+        let events = (0..in_flight)
+            .map(|_| d.ctx.new_event(None))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut destinations = Vec::with_capacity(requests.len());
+        for (name, bytes) in &names {
+            let buffer = unsafe { d.upload.alloc::<u8>(*bytes)? };
+            let ptr = buffer.device_ptr(&d.upload).0;
+            self.resident.insert(name.clone(), ptr);
+            destinations.push(ptr);
+            self.storage.push(buffer);
+        }
+        let free = std::sync::Arc::new((
+            std::sync::Mutex::new((0..in_flight).collect::<Vec<_>>()),
+            std::sync::Condvar::new(),
+        ));
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(usize, usize)>>();
+        let slot_bytes = largest;
+        let producer_base = base;
+        let consumer_base = pin.as_mut_ptr()?;
+        let producer_dir = dir.clone();
+        let producer_requests = requests.clone();
+        let producer_free = std::sync::Arc::clone(&free);
+        let producer_abort = std::sync::Arc::clone(&abort);
+        let producer = std::thread::Builder::new()
+            .name("vae-ring".to_owned())
+            .spawn(move || -> Result<()> {
+                let base = &producer_base;
+                let mut reader = EntryReader::new(&producer_dir);
+                let readers = reader.open_shards(
+                    producer_requests
+                        .iter()
+                        .map(|request| request.entry().shard.as_str()),
+                )?;
+                let order = super::claim_order(&producer_requests, |request| {
+                    request.entry().shard.as_str()
+                });
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                std::thread::scope(|scope| -> Result<()> {
+                    let handles: Vec<_> = (0..in_flight)
+                        .map(|_| {
+                            let readers = &readers;
+                            let requests = &producer_requests;
+                            let order = &order;
+                            let next = &next;
+                            let free = &producer_free;
+                            let abort = &producer_abort;
+                            let done = &done_tx;
+                            scope.spawn(move || -> Result<()> {
+                                let mut bounce =
+                                    crate::experts::disk::AlignedBytes::new(4096, 4096)?;
+                                loop {
+                                    let claimed =
+                                        next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    let Some(&index) = order.get(claimed) else {
+                                        return Ok(());
+                                    };
+                                    if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                                        return Ok(());
+                                    }
+                                    let slot = {
+                                        let mut guard = free.0.lock().unwrap();
+                                        loop {
+                                            if let Some(slot) = guard.pop() {
+                                                break slot;
+                                            }
+                                            if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                                                return Ok(());
+                                            }
+                                            guard = free
+                                                .1
+                                                .wait_timeout(
+                                                    guard,
+                                                    std::time::Duration::from_millis(100),
+                                                )
+                                                .unwrap()
+                                                .0;
+                                        }
+                                    };
+                                    let request = &requests[index];
+                                    let window = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            base.0.add(slot * slot_bytes),
+                                            request.dest_len(),
+                                        )
+                                    };
+                                    let result = EntryReader::read_bounced(
+                                        readers,
+                                        request.name(),
+                                        request.entry(),
+                                        request.cast(),
+                                        window,
+                                        &mut bounce,
+                                    );
+                                    if let Err(error) = result {
+                                        abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        let _ = done.send(Err(error));
+                                        return Ok(());
+                                    }
+                                    done.send(Ok((index, slot)))?;
+                                }
+                            })
+                        })
+                        .collect();
+                    for handle in handles {
+                        handle
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("vae-ring worker panicked"))??;
+                    }
+                    Ok(())
+                })
+            })?;
+        let mut received = 0usize;
+        let mut inflight: Vec<usize> = Vec::new();
+        let error = loop {
+            // Return slots whose upload completed.
+            let mut still = Vec::new();
+            for &slot in &inflight {
+                if events[slot].try_is_complete()? {
+                    free.0.lock().unwrap().push(slot);
+                    free.1.notify_all();
+                } else {
+                    still.push(slot);
+                }
+            }
+            inflight = still;
+            match done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Ok((index, slot))) => {
+                    let window = unsafe {
+                        std::slice::from_raw_parts(
+                            consumer_base.add(slot * slot_bytes),
+                            names[index].1,
+                        )
+                    };
+                    unsafe {
+                        cudarc::driver::result::memcpy_htod_async(
+                            destinations[index],
+                            window,
+                            d.upload.cu_stream(),
+                        )?;
+                    }
+                    events[slot].record(&d.upload)?;
+                    inflight.push(slot);
+                    received += 1;
+                    if received == names.len() {
+                        break Ok(());
+                    }
+                }
+                Ok(Err(error)) => break Err(error),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(anyhow::anyhow!("vae-ring producer ended early"));
+                }
+            }
+        };
+        abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        free.1.notify_all();
+        let joined = producer
+            .join()
+            .map_err(|_| anyhow::anyhow!("vae-ring producer panicked"));
+        d.upload.synchronize()?;
+        drop(pin);
+        joined??;
+        error?;
+        Ok(())
     }
 
     fn tensor<T: Element + Copy>(
@@ -1067,6 +1306,8 @@ impl<'a> DecoderWeightLoad<'a> {
                 .context("video pinned tensor lacks stream binding")?
                 .dense
                 .pointer(layer, offset, bytes)?
+        } else if let Some(ptr) = self.resident.get(name) {
+            *ptr
         } else {
             let buffer = unsafe { s.alloc::<u8>(bytes)? };
             let (ptr, record) = buffer.device_ptr(s);
@@ -1248,6 +1489,7 @@ fn video_weight_load<'a>(
             (slot_count, slot_bytes, largest),
         )?);
     }
+    loader.preload_resident(d, "video-vae")?;
     Ok(loader)
 }
 
