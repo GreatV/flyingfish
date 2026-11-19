@@ -470,24 +470,44 @@ fn product_function(
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn product_active_ctas(
+    device: &crate::backend::cuda::Device,
+    product: ProductKernel,
+) -> Result<usize> {
+    use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+
+    let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
+    let function = product_function(&module, product)?;
+    let active = function.occupancy_max_active_blocks_per_multiprocessor(
+        PRODUCT_THREADS,
+        product.shared_mem_bytes() as usize,
+        None,
+    )?;
+    if device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120) {
+        let regs = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+        let local = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+        ensure!(
+            regs <= 124 && local == 0,
+            "sm120 ConvRot product regs={regs} local={local} active_ctas={active}"
+        );
+    }
+    ensure!(active > 0, "convrot product has no resident CTA");
+    Ok(usize::try_from(active)?)
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn gate_up_product_order(
     device: &crate::backend::cuda::Device,
     row_counts: [usize; 2],
     (k, n): (usize, usize),
 ) -> Result<[bool; 2]> {
+    use crate::backend::setup::DeviceArchitecture::Cuda;
     let l2 = device.info.l2_bytes;
-    if device.info.arch != crate::backend::setup::DeviceArchitecture::Cuda(89) || n * k <= l2 {
+    if !matches!(device.info.arch, Cuda(89 | 120)) || n * k <= l2 {
         return Ok([false; 2]);
     }
-    let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
-    let active = product_function(&module, ProductKernel::MFastLdsm)?
-        .occupancy_max_active_blocks_per_multiprocessor(
-            PRODUCT_THREADS,
-            ProductKernel::MFastLdsm.shared_mem_bytes() as usize,
-            None,
-        )?;
-    ensure!(active > 0, "convrot M-fast product has no resident CTA");
-    let wave = device.info.sms * active as usize;
+    let active = product_active_ctas(device, ProductKernel::MFastLdsm)?;
+    let wave = device.info.sms * active;
     let (bm, bn) = (PRODUCT_BM as usize, PRODUCT_BN as usize);
     let n_tiles = n.div_ceil(bn);
     Ok(row_counts.map(|rows| {
@@ -514,13 +534,17 @@ const GROUP_DOT_32_NAMES: [&str; 2] = ["convrot_group_dot_32", "convrot_group_do
 pub(crate) fn group_dot_32_wave_sizes(
     device: &crate::backend::cuda::Device,
 ) -> Result<[Option<usize>; 2]> {
-    if device.info.arch != crate::backend::setup::DeviceArchitecture::Cuda(89) {
-        return Ok([None; 2]);
-    }
+    use crate::backend::setup::DeviceArchitecture::Cuda;
     use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+    let limits = match device.info.arch {
+        Cuda(89) => [(48, 5), (48, 5)],
+        Cuda(120) => [(48, 5), (56, 4)],
+        _ => return Ok([None; 2]),
+    };
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
     let mut waves = [None; 2];
-    for (wave, name) in waves.iter_mut().zip(GROUP_DOT_32_NAMES) {
+    for ((wave, name), (max_regs, min_ctas)) in waves.iter_mut().zip(GROUP_DOT_32_NAMES).zip(limits)
+    {
         let function = module.load_function(name)?;
         let registers = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
         let local = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
@@ -529,7 +553,7 @@ pub(crate) fn group_dot_32_wave_sizes(
             GROUP_DOT_32_SMEM as usize,
             None,
         )?;
-        let enabled = registers <= 48 && local == 0 && active >= 5;
+        let enabled = registers <= max_regs && local == 0 && active >= min_ctas;
         if enabled {
             *wave = Some(device.info.sms * usize::try_from(active)?);
         }
@@ -2253,13 +2277,23 @@ mod device {
     fn convrot_32_rows_matches_16_rows() -> Result<()> {
         let device = Device::new(0)?;
         let [ordinary, _] = super::group_dot_32_wave_sizes(&device)?;
-        if device.info.arch != crate::backend::setup::DeviceArchitecture::Cuda(89) {
+        use crate::backend::setup::DeviceArchitecture::Cuda;
+        if !matches!(device.info.arch, Cuda(89 | 120)) {
             return Ok(());
         }
         ensure!(
             ordinary.is_some(),
             "32-row ConvRot resource gate did not admit the ordinary kernel"
         );
+        let sm120 = device.info.arch == Cuda(120);
+        if sm120 {
+            for k in [5376, 7168] {
+                ensure!(
+                    !super::group_dot_32_fills_wave(1000, k, ordinary),
+                    "sm120 ordinary 32-row grid fills a wave at M=1000 K={k}"
+                );
+            }
+        }
         for (rows, k, n) in [
             (17, 256, 40),
             (37717, 5376, 7168),
@@ -2280,10 +2314,12 @@ mod device {
                 keep: true,
             };
             let selected = super::group_dot_32_fills_wave(rows, k, ordinary);
-            ensure!(
-                selected == (rows != 17),
-                "ordinary 32-row selection M={rows} K={k}"
-            );
+            if !sm120 || matches!(rows, 17 | 37717) {
+                ensure!(
+                    selected == (rows != 17),
+                    "ordinary 32-row selection M={rows} K={k}"
+                );
+            }
             let base = launch_kept_tile(&device, input(256), false)?;
             let wide = launch_kept_tile(&device, input(256), true)?;
             check_rotation_bits(&base, &wide, (rows, k, n), false)?;
@@ -2309,11 +2345,21 @@ mod device {
         let silu =
             crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
         let [ordinary_32, fused_32] = super::group_dot_32_wave_sizes(&device)?;
+        let sm120 = device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120);
+        if sm120 {
+            ensure!(
+                super::group_dot_32_fills_wave(1000, 14336, fused_32),
+                "sm120 fused 32-row grid did not qualify at M=1000 K=14336"
+            );
+        }
         let (k, n, group) = (14336usize, 5376usize, 256usize);
         let weight = stream.clone_htod(&salted_weight(n, k, 0))?;
         let scale = stream.clone_htod(&salted_wscale(n, 0))?;
 
-        for rows in [17usize, 1509, 1501] {
+        for rows in [17usize, 1509, 1501]
+            .into_iter()
+            .chain(sm120.then_some(37717))
+        {
             let mut gu = vec![bf16::ZERO; rows * 2 * k];
             for (row, pair) in gu.chunks_exact_mut(2 * k).enumerate() {
                 let (lower, upper) = pair.split_at_mut(k);
