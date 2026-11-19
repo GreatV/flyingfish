@@ -306,13 +306,25 @@ extern "C" __global__ void convrot_quantize(const float* __restrict__ xr, int8_t
 }
 
 // m16n8k32.row.col.s32.s8.s8. BM 128, BN 256, BK 64, stride 80, 2 stages, 512 threads.
-// Dynamic smem 61440. grid (ceil(n/256), ceil(rows/128)).
+// Dynamic smem 61440 N-fast, 49152 M-fast.
 constexpr int CONVROT_BM = 128;
 constexpr int CONVROT_BN = 256;
 constexpr int CONVROT_BK = 64;
 constexpr int CONVROT_STRIDE = 80;
-constexpr int CONVROT_STAGE = (CONVROT_BM + CONVROT_BN) * CONVROT_STRIDE;
-static_assert(CONVROT_STAGE * 2 == 61440, "convrot product smem");
+template <bool SWIZZLED>
+constexpr int CONVROT_PRODUCT_STRIDE = SWIZZLED ? CONVROT_BK : CONVROT_STRIDE;
+template <bool SWIZZLED>
+constexpr int CONVROT_STAGE = (CONVROT_BM + CONVROT_BN) * CONVROT_PRODUCT_STRIDE<SWIZZLED>;
+static_assert(CONVROT_STAGE<false> * 2 == 61440 && CONVROT_STAGE<true> * 2 == 49152, "convrot product smem");
+
+template <bool SWIZZLED>
+__device__ __forceinline__ int convrot_segment_offset(int row, int column) {
+    if constexpr (SWIZZLED) {
+        return row * CONVROT_BK + (column ^ (((row >> 1) & 3) << 4));
+    } else {
+        return row * CONVROT_STRIDE + column;
+    }
+}
 
 __device__ __forceinline__ void convrot_cp16(void* dst, const void* src, int sz) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(convrot_smem(dst)), "l"(src), "r"(sz));
@@ -342,11 +354,12 @@ __device__ __forceinline__ void convrot_mma_s8(int& d0, int& d1, int& d2, int& d
 }
 
 // One 16-byte cp.async per A row segment and two per B row. srcSize 0 zero-fills an OOB row.
+template <bool SWIZZLED>
 __device__ __forceinline__ void convrot_stage(int8_t* smem, const int8_t* __restrict__ codes,
                                               const int8_t* __restrict__ qweight, int rows, int k, int n, int m0,
                                               int n0, int k0, int stage) {
-    int8_t* a = smem + stage * CONVROT_STAGE;
-    int8_t* b = a + CONVROT_BM * CONVROT_STRIDE;
+    int8_t* a = smem + stage * CONVROT_STAGE<SWIZZLED>;
+    int8_t* b = a + CONVROT_BM * CONVROT_PRODUCT_STRIDE<SWIZZLED>;
     const int t = static_cast<int>(threadIdx.x);
     const int ar = t >> 2;
     const int aseg = t & 3;
@@ -357,7 +370,7 @@ __device__ __forceinline__ void convrot_stage(int8_t* smem, const int8_t* __rest
         asrc = codes + (static_cast<long long>(gr) * k + k0 + aseg * 16);
         asz = 16;
     }
-    convrot_cp16(a + ar * CONVROT_STRIDE + aseg * 16, asrc, asz);
+    convrot_cp16(a + convrot_segment_offset<SWIZZLED>(ar, aseg * 16), asrc, asz);
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         const int linear = t + i * 512;
@@ -370,17 +383,17 @@ __device__ __forceinline__ void convrot_stage(int8_t* smem, const int8_t* __rest
             bsrc = qweight + (static_cast<long long>(gc) * k + k0 + bseg * 16);
             bsz = 16;
         }
-        convrot_cp16(b + bc * CONVROT_STRIDE + bseg * 16, bsrc, bsz);
+        convrot_cp16(b + convrot_segment_offset<SWIZZLED>(bc, bseg * 16), bsrc, bsz);
     }
 }
 
 // Lane groupID = lane>>2, thread = lane&3. A u32 at (group, thread*4), (group+8, thread*4),
 // (group, thread*4+16), (group+8, thread*4+16). B u32 at column group, K thread*4 and +16.
-template <bool MATRIX_LOAD>
+template <bool MATRIX_LOAD, bool SWIZZLED>
 __device__ __forceinline__ void convrot_mma_tile(const int8_t* stage, int (&acc)[2][8][4], int warp_m, int warp_n,
                                                  int group, int t4, int lane) {
     const int8_t* a = stage;
-    const int8_t* b = stage + CONVROT_BM * CONVROT_STRIDE;
+    const int8_t* b = stage + CONVROT_BM * CONVROT_PRODUCT_STRIDE<SWIZZLED>;
     const int row_base = warp_m * 32;
     const int col_base = warp_n * 64;
 #pragma unroll
@@ -392,7 +405,7 @@ __device__ __forceinline__ void convrot_mma_tile(const int8_t* stage, int (&acc)
             if constexpr (MATRIX_LOAD) {
                 const int r = row_base + mi * 16 + (lane & 15);
                 const int k_panel = ki * 32 + (lane >> 4) * 16;
-                convrot_ldsm_x4(af[mi], a + r * CONVROT_STRIDE + k_panel);
+                convrot_ldsm_x4(af[mi], a + convrot_segment_offset<SWIZZLED>(r, k_panel));
             } else {
                 const int r = row_base + mi * 16 + group;
                 af[mi][0] = convrot_lds(a + (r * CONVROT_STRIDE + kbase));
@@ -408,7 +421,7 @@ __device__ __forceinline__ void convrot_mma_tile(const int8_t* stage, int (&acc)
                 const int c = col_base + ni * 8 + (lane & 7) + (lane >> 4) * 8;
                 const int k_panel = ki * 32 + ((lane >> 3) & 1) * 16;
                 unsigned pair[4];
-                convrot_ldsm_x4(pair, b + c * CONVROT_STRIDE + k_panel);
+                convrot_ldsm_x4(pair, b + convrot_segment_offset<SWIZZLED>(c, k_panel));
                 bf[ni][0] = pair[0];
                 bf[ni][1] = pair[1];
                 bf[ni + 1][0] = pair[2];
@@ -449,11 +462,12 @@ __device__ __forceinline__ void convrot_store_one(__nv_bfloat16* __restrict__ y,
     }
 }
 
-template <bool MATRIX_LOAD>
+template <bool MATRIX_LOAD, bool SWIZZLED = false>
 __device__ __forceinline__ void convrot_product_tile(
     const int8_t* __restrict__ codes, const float* __restrict__ scales,
     const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
     __nv_bfloat16* __restrict__ y, int rows, int k, int n, int m_tile, int n_tile) {
+    static_assert(!SWIZZLED || MATRIX_LOAD);
     if (rows <= 0 || n <= 0 || k <= 0 || (k & (CONVROT_BK - 1))) __trap();
     extern __shared__ __align__(16) int8_t smem[];
     const int m0 = m_tile * CONVROT_BM;
@@ -476,18 +490,18 @@ __device__ __forceinline__ void convrot_product_tile(
     }
     const int tiles = k >> 6;
     int stage = 0;
-    convrot_stage(smem, codes, qweight, rows, k, n, m0, n0, 0, 0);
+    convrot_stage<SWIZZLED>(smem, codes, qweight, rows, k, n, m0, n0, 0, 0);
     convrot_cp_commit();
     for (int kt = 0; kt < tiles; ++kt) {
         if (kt + 1 < tiles) {
-            convrot_stage(smem, codes, qweight, rows, k, n, m0, n0, (kt + 1) * CONVROT_BK, stage ^ 1);
+            convrot_stage<SWIZZLED>(smem, codes, qweight, rows, k, n, m0, n0, (kt + 1) * CONVROT_BK, stage ^ 1);
             convrot_cp_commit();
             convrot_cp_wait<1>();
         } else {
             convrot_cp_wait<0>();
         }
         __syncthreads();
-        convrot_mma_tile<MATRIX_LOAD>(smem + stage * CONVROT_STAGE, acc, warp_m, warp_n, group, t4, lane);
+        convrot_mma_tile<MATRIX_LOAD, SWIZZLED>(smem + stage * CONVROT_STAGE<SWIZZLED>, acc, warp_m, warp_n, group, t4, lane);
         __syncthreads();
         stage ^= 1;
     }
@@ -529,7 +543,7 @@ extern "C" __global__ void __maxnreg__(124) convrot_product(
 extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {
-    convrot_product_tile<true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
+    convrot_product_tile<true, true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
 }
 
 extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_ldsm(
