@@ -592,10 +592,14 @@ fn cgroup_path_parts(path: &str) -> Vec<&str> {
     path.split('/').filter(|part| !part.is_empty()).collect()
 }
 
-fn cgroup_v2_directory(root: &Path, group: &str, mounts: &str) -> Result<(PathBuf, PathBuf)> {
+fn cgroup_v2_chains(
+    root: &Path,
+    group: &str,
+    mounts: &str,
+) -> Result<Vec<(PathBuf, PathBuf, bool)>> {
     let group_parts = cgroup_path_parts(group);
     let mut tried = Vec::new();
-    let mut selected: Option<(usize, String, Vec<String>)> = None;
+    let mut chains = Vec::new();
     for line in mounts.lines() {
         let Some((paths, options)) = line.split_once(" - ") else {
             continue;
@@ -619,25 +623,19 @@ fn cgroup_v2_directory(root: &Path, group: &str, mounts: &str) -> Result<(PathBu
         if rest.contains(&"..") {
             continue;
         }
-        let length = base_parts.len();
-        if selected.as_ref().is_none_or(|best| length > best.0) {
-            selected = Some((
-                length,
-                point,
-                rest.iter().map(|part| (*part).to_string()).collect(),
-            ));
+        let mount = root.join(point.trim_start_matches('/'));
+        let mut directory = mount.clone();
+        for part in rest {
+            directory.push(part);
         }
+        // Empty mount root is the hierarchy root.
+        chains.push((mount, directory, base_parts.is_empty()));
     }
-    let Some((_, point, rest)) = selected else {
+    if chains.is_empty() {
         let tried = tried.join(", ");
         bail!("expert cgroup v2 mount missing for {group}; tried {tried}");
-    };
-    let mount = root.join(point.trim_start_matches('/'));
-    let mut directory = mount.clone();
-    for part in rest {
-        directory.push(part);
     }
-    Ok((mount, directory))
+    Ok(chains)
 }
 
 fn cgroup_charged_bytes(directory: &Path, current_name: &str, v1: bool) -> Result<u64> {
@@ -694,7 +692,7 @@ pub(crate) fn host_memory(root: &Path) -> Result<u64> {
             .any(|controller| controller == "memory")
             .then_some(group)
     });
-    let (mount, mut directory, v2) = if let Some(group) = memory {
+    if let Some(group) = memory {
         let mounts = std::fs::read_to_string(root.join("proc/self/mountinfo"))?;
         let (_, point, relative) = mounts
             .lines()
@@ -717,55 +715,8 @@ pub(crate) fn host_memory(root: &Path) -> Result<u64> {
             .min_by_key(|(depth, _, _)| *depth)
             .with_context(|| format!("expert v1 memory controller mount missing for {group}"))?;
         let mount = root.join(point.trim_start_matches('/'));
-        let directory = mount.join(relative);
-        (mount, directory, false)
-    } else {
-        let group = groups
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .context("expert memory controller missing from v1 and v2 cgroup memberships")?;
-        let mounts = std::fs::read_to_string(root.join("proc/self/mountinfo"))?;
-        let (mount, directory) = cgroup_v2_directory(root, group, &mounts)?;
-        (mount, directory, true)
-    };
-    let mut tried = Vec::new();
-    let mut saw_v2_controller = false;
-    loop {
-        if v2 {
-            let maximum = directory.join("memory.max");
-            match std::fs::read_to_string(&maximum) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tried.push(maximum.display().to_string());
-                }
-                Err(error) => {
-                    Err(error).with_context(|| {
-                        format!("read expert cgroup limit {}", maximum.display())
-                    })?;
-                }
-                Ok(limit) => {
-                    saw_v2_controller = true;
-                    let high_path = directory.join("memory.high");
-                    let high = match std::fs::read_to_string(&high_path) {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                        other => Some(other.with_context(|| {
-                            format!("read expert cgroup limit {}", high_path.display())
-                        })?),
-                    };
-                    let finite = |text: &str| text.trim() != "max";
-                    if finite(&limit) || high.as_ref().is_some_and(|text| finite(text)) {
-                        let used = cgroup_charged_bytes(&directory, "memory.current", false)?;
-                        if finite(&limit) {
-                            available =
-                                available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
-                        }
-                        if let Some(text) = high.as_deref().filter(|text| finite(text)) {
-                            available =
-                                available.min(text.trim().parse::<u64>()?.saturating_sub(used));
-                        }
-                    }
-                }
-            }
-        } else {
+        let mut directory = mount.join(relative);
+        loop {
             let maximum = directory.join("memory.limit_in_bytes");
             if directory == mount && !maximum.try_exists()? {
                 break;
@@ -774,21 +725,81 @@ pub(crate) fn host_memory(root: &Path) -> Result<u64> {
                 .with_context(|| format!("read expert cgroup limit {}", maximum.display()))?;
             let used = cgroup_charged_bytes(&directory, "memory.usage_in_bytes", true)?;
             available = available.min(limit.trim().parse::<u64>()?.saturating_sub(used));
+            if directory == mount {
+                break;
+            }
+            ensure!(
+                directory.pop(),
+                "expert cgroup has no parent under {}",
+                mount.display()
+            );
         }
-        if directory == mount {
-            break;
+    } else {
+        let group = groups
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .context("expert memory controller missing from v1 and v2 cgroup memberships")?;
+        let mounts = std::fs::read_to_string(root.join("proc/self/mountinfo"))?;
+        let chains = cgroup_v2_chains(root, group, &mounts)?;
+        let root_membership = cgroup_path_parts(group).is_empty();
+        let mut tried = Vec::new();
+        let mut saw_v2_controller = false;
+        let mut root_unlimited = false;
+        for (mount, mut directory, hierarchy_root) in chains {
+            loop {
+                let maximum = directory.join("memory.max");
+                match std::fs::read_to_string(&maximum) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if root_membership && hierarchy_root && directory == mount {
+                            root_unlimited = true;
+                        } else {
+                            tried.push(maximum.display().to_string());
+                        }
+                    }
+                    Err(error) => {
+                        Err(error).with_context(|| {
+                            format!("read expert cgroup limit {}", maximum.display())
+                        })?;
+                    }
+                    Ok(limit) => {
+                        saw_v2_controller = true;
+                        let high_path = directory.join("memory.high");
+                        let high = match std::fs::read_to_string(&high_path) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            other => Some(other.with_context(|| {
+                                format!("read expert cgroup limit {}", high_path.display())
+                            })?),
+                        };
+                        let finite = |text: &str| text.trim() != "max";
+                        if finite(&limit) || high.as_ref().is_some_and(|text| finite(text)) {
+                            let used = cgroup_charged_bytes(&directory, "memory.current", false)?;
+                            if finite(&limit) {
+                                available = available
+                                    .min(limit.trim().parse::<u64>()?.saturating_sub(used));
+                            }
+                            if let Some(text) = high.as_deref().filter(|text| finite(text)) {
+                                available =
+                                    available.min(text.trim().parse::<u64>()?.saturating_sub(used));
+                            }
+                        }
+                    }
+                }
+                if directory == mount {
+                    break;
+                }
+                ensure!(
+                    directory.pop(),
+                    "expert cgroup has no parent under {}",
+                    mount.display()
+                );
+            }
         }
+        let tried = tried.join(", ");
         ensure!(
-            directory.pop(),
-            "expert cgroup has no parent under {}",
-            mount.display()
+            saw_v2_controller || root_unlimited,
+            "expert cgroup v2 memory controller missing; tried {tried}"
         );
     }
-    let tried = tried.join(", ");
-    ensure!(
-        !v2 || saw_v2_controller,
-        "expert cgroup v2 memory controller missing; tried {tried}"
-    );
     let limits = std::fs::read_to_string(root.join("proc/self/limits"))?;
     let resident_limit = limits
         .lines()
