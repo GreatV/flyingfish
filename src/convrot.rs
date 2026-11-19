@@ -260,6 +260,131 @@ mod tests {
         assert!(super::group_dot_32_fills_wave(960, 5376, Some(630)));
     }
 
+    fn mock_device_info(
+        sm: u32,
+        sms: usize,
+        l2_bytes: usize,
+        optin_shared_bytes: usize,
+    ) -> crate::backend::setup::DeviceInfo {
+        crate::backend::setup::DeviceInfo {
+            name: format!("mock-sm{sm}"),
+            arch: crate::backend::setup::DeviceArchitecture::Cuda(sm),
+            sms,
+            l2_bytes,
+            warp: 32,
+            max_threads: 1024,
+            shared_bytes: 49_152,
+            sm_shared_bytes: 102_400,
+            cooperative: true,
+            optin_shared_bytes,
+            memory_bytes_per_second: 1.0e12,
+        }
+    }
+
+    #[test]
+    fn convrot_selectors_qualify_sm80_and_decline_sm86_by_resources() {
+        use super::{
+            ProductKernel, gate_up_working_set_fits, group_dot_32_resource_limits,
+            qkv_product_eligible,
+        };
+
+        assert_eq!(ProductKernel::NFast.symbol_name(), "convrot_product");
+        assert_eq!(
+            ProductKernel::MFastLdsm.symbol_name(),
+            "convrot_product_m_fast"
+        );
+        assert_eq!(
+            ProductKernel::NFastLdsm.symbol_name(),
+            "convrot_product_n_fast_ldsm"
+        );
+        assert_eq!(ProductKernel::NFast.shared_mem_bytes(), 61_440);
+        assert_eq!(ProductKernel::MFastLdsm.shared_mem_bytes(), 49_152);
+        assert_eq!(ProductKernel::NFastLdsm.shared_mem_bytes(), 61_440);
+
+        let a100 = mock_device_info(80, 108, 40 << 20, 166_912);
+        let a4000 = mock_device_info(86, 48, 4 << 20, 101_376);
+        let a4000_large_l2 = mock_device_info(86, 48, 40 << 20, 101_376);
+        let rtx4090 = mock_device_info(89, 128, 72 << 20, 101_376);
+        let l4 = mock_device_info(89, 58, 48 << 20, 101_376);
+        let g4 = mock_device_info(120, 188, 96 << 20, 101_376);
+        let t4 = mock_device_info(75, 40, 40 << 20, 65_536);
+
+        assert!(qkv_product_eligible(&a100, 37_717, (5376, 7168)));
+        assert!(!qkv_product_eligible(&a100, 16, (5376, 7168)));
+        assert!(!qkv_product_eligible(&a100, 37_717, (5376, 7169)));
+        assert!(!qkv_product_eligible(&a4000, 37_717, (5376, 7168)));
+        assert!(qkv_product_eligible(&a4000_large_l2, 37_717, (5376, 7168)));
+        assert!(qkv_product_eligible(&rtx4090, 37_717, (5376, 7168)));
+        assert!(qkv_product_eligible(&l4, 37_717, (5376, 7168)));
+        assert!(qkv_product_eligible(&g4, 37_717, (5376, 7168)));
+        assert!(!qkv_product_eligible(&t4, 37_717, (5376, 7168)));
+        let low_smem = mock_device_info(80, 108, 40 << 20, 49_152);
+        assert!(!qkv_product_eligible(&low_smem, 37_717, (5376, 7168)));
+
+        let gate_up = (5376, 28_672);
+        assert_eq!(
+            gate_up_working_set_fits(&a100, 1, [1509, 1501], gate_up),
+            [true, true]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&a100, 1, [3057, 5400], gate_up),
+            [true, true]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&a100, 1, [5678, 39_740], gate_up),
+            [false, false]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&a100, 1, [128, 129], gate_up),
+            [false, false]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&a100, 1, [128, 513], gate_up),
+            [false, true]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&a4000, 1, [1509, 1501], gate_up),
+            [false, false]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&a4000, 1, [256, 37_717], gate_up),
+            [false, false]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&a4000_large_l2, 1, [128, 129], gate_up),
+            [false, true]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&rtx4090, 1, [9935, 39_740], gate_up),
+            [true, false]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&g4, 1, [9935, 39_740], gate_up),
+            [true, false]
+        );
+        assert_eq!(
+            gate_up_working_set_fits(&t4, 1, [1509, 1501], gate_up),
+            [false, false]
+        );
+
+        assert_eq!(
+            group_dot_32_resource_limits(&a100),
+            Some([(48, 5), (48, 5)])
+        );
+        assert_eq!(
+            group_dot_32_resource_limits(&a4000),
+            Some([(48, 5), (48, 5)])
+        );
+        assert_eq!(
+            group_dot_32_resource_limits(&rtx4090),
+            Some([(48, 5), (48, 5)])
+        );
+        assert_eq!(group_dot_32_resource_limits(&g4), Some([(48, 5), (56, 4)]));
+        assert_eq!(group_dot_32_resource_limits(&t4), None);
+        let too_small_smem = mock_device_info(80, 108, 40 << 20, 16_384);
+        assert_eq!(group_dot_32_resource_limits(&too_small_smem), None);
+    }
+
     fn row(r: usize, i: usize) -> f32 {
         ((((r * 17 + i * 3) % 23) as f64) * 0.05 - 0.4) as f32
     }
@@ -409,8 +534,8 @@ pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
     result
 }
 
-#[cfg(feature = "cuda")]
-#[derive(Clone, Copy)]
+#[cfg(any(test, feature = "cuda"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductKernel {
     NFast,
     MFastLdsm,
@@ -437,11 +562,11 @@ pub struct ConvrotArgs {
 
 #[cfg(feature = "cuda")]
 const PRODUCT_THREADS: u32 = 512;
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 const PRODUCT_BM: u32 = 128;
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 const PRODUCT_BN: u32 = 256;
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 impl ProductKernel {
     const fn shared_mem_bytes(self) -> u32 {
         match self {
@@ -449,6 +574,61 @@ impl ProductKernel {
             Self::NFast | Self::NFastLdsm => 61_440,
         }
     }
+
+    const fn symbol_name(self) -> &'static str {
+        match self {
+            Self::NFast => "convrot_product",
+            Self::MFastLdsm => "convrot_product_m_fast",
+            Self::NFastLdsm => "convrot_product_n_fast_ldsm",
+        }
+    }
+}
+
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn qkv_product_eligible(
+    info: &crate::backend::setup::DeviceInfo,
+    rows: usize,
+    (k, n): (usize, usize),
+) -> bool {
+    matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
+        && info.warp == 32
+        && info.optin_shared_bytes >= ProductKernel::NFastLdsm.shared_mem_bytes() as usize
+        && rows >= TENSOR_CORE_ROWS
+        && (k, n) == (5376, 7168)
+        && k.saturating_mul(n) <= info.l2_bytes
+}
+
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn gate_up_working_set_fits(
+    info: &crate::backend::setup::DeviceInfo,
+    active_ctas: usize,
+    row_counts: [usize; 2],
+    (k, n): (usize, usize),
+) -> [bool; 2] {
+    let l2 = info.l2_bytes;
+    if !matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
+        || info.warp != 32
+        || info.optin_shared_bytes < ProductKernel::MFastLdsm.shared_mem_bytes() as usize
+        || active_ctas == 0
+        || n.saturating_mul(k) <= l2
+    {
+        return [false; 2];
+    }
+    let wave = info.sms * active_ctas;
+    let (bm, bn) = (PRODUCT_BM as usize, PRODUCT_BN as usize);
+    let n_tiles = n.div_ceil(bn);
+    row_counts.map(|rows| {
+        let m_tiles = rows.div_ceil(bm);
+        if m_tiles < 2 {
+            return false;
+        }
+        let ctas = wave.min(m_tiles * n_tiles);
+        let columns = ((ctas + m_tiles - 1).div_ceil(m_tiles) * bn).min(n);
+        let output_bytes = ctas * bm * bn * 2;
+        let scale_bytes = (rows + columns) * size_of::<f32>();
+        let working_set = (rows + columns) * k + output_bytes + scale_bytes;
+        working_set < l2
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -456,12 +636,7 @@ fn product_function(
     module: &std::sync::Arc<crate::backend::gpu::CudaModule>,
     product: ProductKernel,
 ) -> Result<crate::backend::gpu::CudaFunction> {
-    let name = match product {
-        ProductKernel::NFast => "convrot_product",
-        ProductKernel::MFastLdsm => "convrot_product_m_fast",
-        ProductKernel::NFastLdsm => "convrot_product_n_fast_ldsm",
-    };
-    let function = module.load_function(name)?;
+    let function = module.load_function(product.symbol_name())?;
     function.set_attribute(
         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         i32::try_from(product.shared_mem_bytes())?,
@@ -474,25 +649,68 @@ pub(crate) fn product_active_ctas(
     device: &crate::backend::cuda::Device,
     product: ProductKernel,
 ) -> Result<usize> {
+    use crate::backend::setup::DeviceArchitecture::Cuda;
     use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
 
+    let smem = product.shared_mem_bytes() as usize;
+    ensure!(
+        matches!(device.info.arch, Cuda(sm) if sm >= 80)
+            && device.info.warp == 32
+            && device.info.optin_shared_bytes >= smem,
+        "ConvRot {} requires CUDA sm80+ warp32 and {} optin shared bytes (arch={} warp={} optin={})",
+        product.symbol_name(),
+        smem,
+        device.info.arch,
+        device.info.warp,
+        device.info.optin_shared_bytes,
+    );
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
     let function = product_function(&module, product)?;
-    let active = function.occupancy_max_active_blocks_per_multiprocessor(
-        PRODUCT_THREADS,
-        product.shared_mem_bytes() as usize,
-        None,
-    )?;
-    if device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120) {
-        let regs = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-        let local = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-        ensure!(
-            regs <= 124 && local == 0,
-            "sm120 ConvRot product regs={regs} local={local} active_ctas={active}"
+    let active =
+        function.occupancy_max_active_blocks_per_multiprocessor(PRODUCT_THREADS, smem, None)?;
+    let regs = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+    let local = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+    ensure!(
+        regs <= 124 && local == 0,
+        "ConvRot {} regs={regs} local={local} active_ctas={active}",
+        product.symbol_name()
+    );
+    ensure!(
+        active > 0,
+        "ConvRot {} has no resident CTA",
+        product.symbol_name()
+    );
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "CONVROT_PRODUCT_RESOURCE kernel={} regs={regs} local={local} active_ctas={active}",
+            product.symbol_name()
         );
     }
-    ensure!(active > 0, "convrot product has no resident CTA");
     Ok(usize::try_from(active)?)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qkv_product(
+    device: &crate::backend::cuda::Device,
+    rows: usize,
+    dims: (usize, usize),
+) -> Result<ProductKernel> {
+    let product = if qkv_product_eligible(&device.info, rows, dims) {
+        product_active_ctas(device, ProductKernel::NFastLdsm)?;
+        ProductKernel::NFastLdsm
+    } else {
+        ProductKernel::NFast
+    };
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "CONVROT_QKV_PRODUCT_SELECT rows={rows} k={} n={} l2_bytes={} kernel={}",
+            dims.0,
+            dims.1,
+            device.info.l2_bytes,
+            product.symbol_name()
+        );
+    }
+    Ok(product)
 }
 
 #[cfg(feature = "cuda")]
@@ -501,31 +719,43 @@ pub(crate) fn gate_up_product_order(
     row_counts: [usize; 2],
     (k, n): (usize, usize),
 ) -> Result<[bool; 2]> {
-    use crate::backend::setup::DeviceArchitecture::Cuda;
-    let l2 = device.info.l2_bytes;
-    if !matches!(device.info.arch, Cuda(89 | 120)) || n * k <= l2 {
-        return Ok([false; 2]);
+    let info = &device.info;
+    let selected = if matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
+        && info.warp == 32
+        && info.optin_shared_bytes >= ProductKernel::MFastLdsm.shared_mem_bytes() as usize
+        && n.saturating_mul(k) > info.l2_bytes
+    {
+        let active = product_active_ctas(device, ProductKernel::MFastLdsm)?;
+        gate_up_working_set_fits(info, active, row_counts, (k, n))
+    } else {
+        [false; 2]
+    };
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "CONVROT_GATE_UP_SELECT row_counts={row_counts:?} k={k} n={n} l2_bytes={} m_fast={selected:?}",
+            info.l2_bytes
+        );
     }
-    let active = product_active_ctas(device, ProductKernel::MFastLdsm)?;
-    let wave = device.info.sms * active;
-    let (bm, bn) = (PRODUCT_BM as usize, PRODUCT_BN as usize);
-    let n_tiles = n.div_ceil(bn);
-    Ok(row_counts.map(|rows| {
-        let m_tiles = rows.div_ceil(bm);
-        if m_tiles < 2 {
-            return false;
-        }
-        let ctas = wave.min(m_tiles * n_tiles);
-        let columns = ((ctas + m_tiles - 1).div_ceil(m_tiles) * bn).min(n);
-        let output_bytes = ctas * bm * bn * 2;
-        let scale_bytes = (rows + columns) * size_of::<f32>();
-        let working_set = (rows + columns) * k + output_bytes + scale_bytes;
-        working_set < l2
-    }))
+    Ok(selected)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 const GROUP_DOT_32_SMEM: u32 = 2 * 8192 + 2048;
+
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn group_dot_32_resource_limits(
+    info: &crate::backend::setup::DeviceInfo,
+) -> Option<[(i32, u32); 2]> {
+    use crate::backend::setup::DeviceArchitecture::Cuda;
+    if info.warp != 32 || info.optin_shared_bytes < GROUP_DOT_32_SMEM as usize {
+        return None;
+    }
+    match info.arch {
+        Cuda(120) => Some([(48, 5), (56, 4)]),
+        Cuda(sm) if sm >= 80 => Some([(48, 5), (48, 5)]),
+        _ => None,
+    }
+}
 
 #[cfg(feature = "cuda")]
 const GROUP_DOT_32_NAMES: [&str; 2] = ["convrot_group_dot_32", "convrot_group_dot_silu_32"];
@@ -534,12 +764,9 @@ const GROUP_DOT_32_NAMES: [&str; 2] = ["convrot_group_dot_32", "convrot_group_do
 pub(crate) fn group_dot_32_wave_sizes(
     device: &crate::backend::cuda::Device,
 ) -> Result<[Option<usize>; 2]> {
-    use crate::backend::setup::DeviceArchitecture::Cuda;
     use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
-    let limits = match device.info.arch {
-        Cuda(89) => [(48, 5), (48, 5)],
-        Cuda(120) => [(48, 5), (56, 4)],
-        _ => return Ok([None; 2]),
+    let Some(limits) = group_dot_32_resource_limits(&device.info) else {
+        return Ok([None; 2]);
     };
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
     let mut waves = [None; 2];
@@ -1885,6 +2112,18 @@ mod device {
 
     fn check_gate_up_product(device: &Device) -> Result<()> {
         let (rows, k, n) = (1509, 5376, 28672);
+        let active = super::product_active_ctas(device, ProductKernel::MFastLdsm)?;
+        let expected_order =
+            super::gate_up_working_set_fits(&device.info, active, [rows, 1501], (k, n));
+        ensure!(
+            super::gate_up_product_order(device, [rows, 1501], (k, n))? == expected_order,
+            "gate/up M-fast selection mismatch on {}",
+            device.info.arch
+        );
+        ensure!(
+            super::gate_up_product_order(device, [39_740, 42], (k, n))? == [false, false],
+            "gate/up M-fast enabled above L2 working set or below 2 M tiles"
+        );
         let (codes, scales, qweight, wscale) = fixture(rows, k, n);
         let period = PRODUCT_FIXTURE_PERIOD;
         // Codes and weight rows have period 251; scales are indexed by the original coordinates.
@@ -1982,21 +2221,31 @@ mod device {
                     host_diff == 0,
                     "host product rows={rows} n={n} differ {host_diff}"
                 );
-                let got = launch_product_at(
-                    &device,
-                    &codes,
-                    &scales,
-                    &qweight,
-                    &wscale,
-                    k,
-                    (0, 0, ProductKernel::NFast),
-                )?;
-                let differ = bit_diff(&got, &host);
-                println!("CONVROT_PRODUCT rows={rows} k={k} n={n} differ={differ}");
-                ensure!(
-                    differ == 0,
-                    "convrot product rows={rows} n={n} differ {differ}"
-                );
+                for product in [
+                    ProductKernel::NFast,
+                    ProductKernel::MFastLdsm,
+                    ProductKernel::NFastLdsm,
+                ] {
+                    let got = launch_product_at(
+                        &device,
+                        &codes,
+                        &scales,
+                        &qweight,
+                        &wscale,
+                        k,
+                        (0, 0, product),
+                    )?;
+                    let differ = bit_diff(&got, &host);
+                    println!(
+                        "CONVROT_PRODUCT kernel={} rows={rows} k={k} n={n} differ={differ}",
+                        product.symbol_name()
+                    );
+                    ensure!(
+                        differ == 0,
+                        "convrot product kernel={} rows={rows} n={n} differ {differ}",
+                        product.symbol_name()
+                    );
+                }
             }
         }
         let rows = 41_770usize;
@@ -2218,6 +2467,23 @@ mod device {
                     && local == 0,
                 "sm_{sm} convrot_group_dot LDG.E.128={ldg128} U16={u16} E64={e64} CONSTANT={constant} HMMA={hmma} LDSM2={ldsm2} LDSM4={ldsm4} MUFU={mufu} STACK={stack} LOCAL={local}"
             );
+            if sm >= 80 {
+                let max_silu_reg = if sm == 120 { 56u32 } else { 48 };
+                for (name, max_reg) in [
+                    ("convrot_group_dot_32", 48u32),
+                    ("convrot_group_dot_silu_32", max_silu_reg),
+                ] {
+                    let (reg, stack, local) = function_resources(&usage, name)
+                        .with_context(|| format!("sm_{sm} {name} resources"))?;
+                    println!(
+                        "CONVROT_GROUP_DOT_32_SASS sm_{sm} {name} REG={reg} STACK={stack} LOCAL={local}"
+                    );
+                    ensure!(
+                        reg <= max_reg && stack == 0 && local == 0,
+                        "sm_{sm} {name} REG={reg} STACK={stack} LOCAL={local}"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -2278,7 +2544,7 @@ mod device {
         let device = Device::new(0)?;
         let [ordinary, _] = super::group_dot_32_wave_sizes(&device)?;
         use crate::backend::setup::DeviceArchitecture::Cuda;
-        if !matches!(device.info.arch, Cuda(89 | 120)) {
+        if !matches!(device.info.arch, Cuda(sm) if sm >= 80) {
             return Ok(());
         }
         ensure!(
@@ -2345,20 +2611,27 @@ mod device {
         let silu =
             crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
         let [ordinary_32, fused_32] = super::group_dot_32_wave_sizes(&device)?;
-        let sm120 = device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120);
-        if sm120 {
+        if matches!(device.info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
+        {
+            ensure!(
+                fused_32.is_some(),
+                "fused 32-row ConvRot resource gate did not admit the kernel on {}",
+                device.info.arch
+            );
             ensure!(
                 super::group_dot_32_fills_wave(1000, 14336, fused_32),
-                "sm120 fused 32-row grid did not qualify at M=1000 K=14336"
+                "fused 32-row grid did not qualify at M=1000 K=14336 on {}",
+                device.info.arch
             );
         }
+        let large_fused = device.ctx.mem_get_info()?.1 >= 32 << 30;
         let (k, n, group) = (14336usize, 5376usize, 256usize);
         let weight = stream.clone_htod(&salted_weight(n, k, 0))?;
         let scale = stream.clone_htod(&salted_wscale(n, 0))?;
 
         for rows in [17usize, 1509, 1501]
             .into_iter()
-            .chain(sm120.then_some(37717))
+            .chain(large_fused.then_some(37_717))
         {
             let mut gu = vec![bf16::ZERO; rows * 2 * k];
             for (row, pair) in gu.chunks_exact_mut(2 * k).enumerate() {
@@ -2690,9 +2963,21 @@ mod device {
         let fns = load_convrot(&device.ctx)?;
         let k = 5_376usize;
         let n = 7_168usize;
+        let expected_qkv = if super::qkv_product_eligible(&device.info, 37_717, (k, n)) {
+            super::product_active_ctas(&device, ProductKernel::NFastLdsm)?;
+            ProductKernel::NFastLdsm
+        } else {
+            ProductKernel::NFast
+        };
+        ensure!(
+            super::qkv_product(&device, 37_717, (k, n))? == expected_qkv,
+            "QKV product selection mismatch on {}",
+            device.info.arch
+        );
         for rows in [17usize, 20, 42] {
             check_shared(&device, &fns, rows, k, n, ProductKernel::NFast, false)?;
         }
+        check_shared(&device, &fns, 42, k, n, ProductKernel::NFastLdsm, false)?;
         check_shared(&device, &fns, 41_770, k, n, ProductKernel::NFast, true)?;
         check_shared(&device, &fns, 37_717, k, n, ProductKernel::NFastLdsm, true)?;
         Ok(())
