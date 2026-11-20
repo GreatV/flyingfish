@@ -8,9 +8,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "cuda")]
+pub use crate::backend::cuda::engine::minimax_h3::VideoSession;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use crate::backend::cuda::engine::minimax_h3::{
-    ImageSession, VideoSession, generate, image_decode, image_encode, image_latents, image_sample,
+    ImageSession, generate, image_decode, image_encode, image_latents, image_sample,
 };
 
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.
@@ -2179,7 +2181,12 @@ impl HyperFlowH3Request {
     #[cfg(feature = "cuda")]
     pub fn prepare(&self) -> Result<H3Request> {
         let (_, spec) = load_hyperflow_component(&self.model, "fl2va_int8_convrot", true)?
-            .with_context(|| format!("CUDA HyperFlow requires fl2va_int8_convrot/config.json in {}", self.model.display()))?;
+            .with_context(|| {
+                format!(
+                    "CUDA HyperFlow requires fl2va_int8_convrot/config.json in {}",
+                    self.model.display()
+                )
+            })?;
         self.prepare_with_spec(&spec)
     }
 

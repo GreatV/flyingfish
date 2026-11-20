@@ -39,7 +39,9 @@ use std::{
 mod audio;
 #[path = "engine_minimax_h3_pipeline.rs"]
 mod pipeline;
-pub use pipeline::{ImageSession, VideoSession, image_latents};
+#[cfg(feature = "cuda")]
+pub use pipeline::VideoSession;
+pub use pipeline::{ImageSession, image_latents};
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
@@ -5070,8 +5072,7 @@ fn bind_video_ffn(
             work.plan_rotation(d, spec)?;
             work.qkv_product = crate::convrot::n_fast_product(d, work.rows, (h, width))?;
             if d.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120) {
-                work.product[OUT][0] =
-                    crate::convrot::n_fast_product(d, work.rows, (width, h))?;
+                work.product[OUT][0] = crate::convrot::n_fast_product(d, work.rows, (width, h))?;
                 for (i, rows) in [work.chunk, work.rows % work.chunk].into_iter().enumerate() {
                     work.product[FF_OUT][i] =
                         crate::convrot::n_fast_product(d, rows, (spec.ffn, h))?;
@@ -15683,6 +15684,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_VIDEO_MODEL, FF_H3_VIDEO_MODE, FF_H3_LORA or FF_HYPERFLOW_MODEL"]
     fn resident_video_requests_match_fresh_and_bound_allocations() -> Result<()> {

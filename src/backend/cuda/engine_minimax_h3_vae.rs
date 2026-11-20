@@ -1835,6 +1835,7 @@ impl VideoDecoder {
         )
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn with_plan(
         device: &Device,
         (spec, dir, manifest): (&VaeSpec, &Path, &TensorManifest),
@@ -2034,16 +2035,18 @@ impl VideoDecoder {
     }
 
     pub(super) fn bind_groups(&self, blas: &mut Blas, work: &TileWork, cap: usize) -> Result<()> {
+        debug_assert!(work.batch <= cap);
         for &(active, _) in &work.attention {
             let mut bind = |linear: &Linear<bf16>, stride| {
-                if work.batch == cap {
-                    return linear.bind(blas, active * stride);
+                #[cfg(feature = "cuda")]
+                if work.batch != cap {
+                    return blas.prepare_biased_group(
+                        (active * stride, cap * stride),
+                        linear.weight.shape,
+                        linear.bias,
+                    );
                 }
-                blas.prepare_biased_group(
-                    (active * stride, cap * stride),
-                    linear.weight.shape,
-                    linear.bias,
-                )
+                linear.bind(blas, active * stride)
             };
             bind(&self.post_quant, work.patches)?;
             bind(&self.proj_in, work.patches)?;
@@ -2730,6 +2733,7 @@ impl TileWork {
         Ok(work)
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn rgb_output(
         &mut self,
         bytes: usize,

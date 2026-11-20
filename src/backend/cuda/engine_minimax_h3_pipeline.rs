@@ -36,9 +36,9 @@ use std::{
 /// audio decoder output) that the splice gate scores.
 pub(crate) struct Generated {
     pub output: H3Output,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     conditioner: Vec<bf16>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     anchors: Vec<Vec<f32>>,
     #[cfg(test)]
     pub video_latents: (Vec<usize>, Vec<f32>),
@@ -823,7 +823,9 @@ fn run_mode<const SETUP_ONLY: bool>(
     )?;
     #[cfg(test)]
     let generated = Generated {
+        #[cfg(feature = "cuda")]
         conditioner: text,
+        #[cfg(feature = "cuda")]
         anchors,
         replay,
         ..generated
@@ -974,9 +976,9 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
             sampling_rate: audio_spec.sampling_rate,
             audio: pcm,
         },
-        #[cfg(test)]
+        #[cfg(all(test, feature = "cuda"))]
         conditioner: Vec::new(),
-        #[cfg(test)]
+        #[cfg(all(test, feature = "cuda"))]
         anchors: Vec::new(),
         #[cfg(test)]
         video_latents: (vec![1, lc, latent_frames, lh, lw], video_latents),
@@ -1409,6 +1411,7 @@ impl ConditionerStage {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct VideoShape {
     geometry: Geometry,
     tags: Vec<u8>,
@@ -1419,6 +1422,7 @@ struct VideoShape {
     pixels: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl VideoShape {
     fn new(geometry: Geometry, request: &H3Request) -> Self {
         Self {
@@ -1455,6 +1459,7 @@ impl VideoShape {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct VideoDecodeGeometry {
     tiles: VaeTiles,
     tile: (usize, usize, usize),
@@ -1464,6 +1469,7 @@ struct VideoDecodeGeometry {
     rgb_bytes: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl VideoDecodeGeometry {
     fn new(spec: &VaeSpec, geometry: &Geometry) -> Result<Self> {
         let (h, w) = (geometry.height, geometry.width);
@@ -1498,6 +1504,7 @@ impl VideoDecodeGeometry {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct DecoderVisitCost {
     weight_bytes: usize,
     weight_seconds: f64,
@@ -1506,6 +1513,7 @@ struct DecoderVisitCost {
     handoff_seconds: f64,
 }
 
+#[cfg(feature = "cuda")]
 impl DecoderVisitCost {
     fn measure(
         device: &Device,
@@ -1656,6 +1664,7 @@ impl DecoderVisitCost {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct VideoDecodeStage {
     geometry: VideoDecodeGeometry,
     video: VideoDecoder,
@@ -1663,6 +1672,7 @@ struct VideoDecodeStage {
     work: TileWork,
 }
 
+#[cfg(feature = "cuda")]
 impl VideoDecodeStage {
     fn render(
         &mut self,
@@ -1708,6 +1718,7 @@ impl VideoDecodeStage {
     }
 }
 
+#[cfg(feature = "cuda")]
 /// Video requests sharing one packed geometry, schedule and set of loaded weights.
 pub struct VideoSession {
     device: Device,
@@ -1725,6 +1736,7 @@ pub struct VideoSession {
     decode: VideoDecodeStage,
 }
 
+#[cfg(feature = "cuda")]
 impl VideoSession {
     pub fn open(
         (model, companion): (&Path, Option<&Path>),
@@ -2183,7 +2195,7 @@ impl VideoSession {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(super) fn same_f32_bits(a: &[f32], b: &[f32]) -> bool {
     a.iter()
         .map(|x| x.to_bits())
@@ -4811,7 +4823,7 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[test]
 fn video_placement_sizes_decoder_groups_from_remaining_memory() -> Result<()> {
     let spec = H3Spec::parse(&serde_json::from_str(include_str!(

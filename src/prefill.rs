@@ -559,7 +559,7 @@ pub(crate) fn price_dense_stages(
         .with_context(|| format!("resident slots and weights cannot fit device={device_limit} host={host_limit} bytes"))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn try_price_dense_stages(
     stages: [DenseStage<'_>; 3],
     (device_limit, host_limit, device_page): (usize, usize, usize),
