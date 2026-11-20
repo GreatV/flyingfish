@@ -284,9 +284,10 @@ mod tests {
     #[test]
     fn convrot_selectors_qualify_sm80_and_decline_sm86_by_resources() {
         use super::{
-            ProductKernel, gate_up_working_set_fits, group_dot_32_resource_limits,
-            qkv_product_eligible,
+            ProductKernel, gate_up_products, group_dot_32_resource_limits, qkv_product_eligible,
         };
+
+        use ProductKernel::{MFastLdsm, MFastStriped, NFast};
 
         assert_eq!(ProductKernel::NFast.symbol_name(), "convrot_product");
         assert_eq!(
@@ -306,7 +307,7 @@ mod tests {
         let a4000_large_l2 = mock_device_info(86, 48, 40 << 20, 101_376);
         let rtx4090 = mock_device_info(89, 128, 72 << 20, 101_376);
         let l4 = mock_device_info(89, 58, 48 << 20, 101_376);
-        let g4 = mock_device_info(120, 188, 96 << 20, 101_376);
+        let g4 = mock_device_info(120, 188, 128 << 20, 101_376);
         let t4 = mock_device_info(75, 40, 40 << 20, 65_536);
 
         assert!(qkv_product_eligible(&a100, 37_717, (5376, 7168)));
@@ -323,49 +324,49 @@ mod tests {
 
         let gate_up = (5376, 28_672);
         assert_eq!(
-            gate_up_working_set_fits(&a100, 1, [1509, 1501], gate_up),
-            [true, true]
+            gate_up_products(&a100, 1, [1509, 1501], gate_up),
+            [MFastLdsm; 2]
         );
         assert_eq!(
-            gate_up_working_set_fits(&a100, 1, [3057, 5400], gate_up),
-            [true, true]
+            gate_up_products(&a100, 1, [3057, 5400], gate_up),
+            [MFastLdsm; 2]
         );
         assert_eq!(
-            gate_up_working_set_fits(&a100, 1, [5678, 39_740], gate_up),
-            [false, false]
+            gate_up_products(&a100, 1, [5678, 39_740], gate_up),
+            [NFast; 2]
+        );
+        assert_eq!(gate_up_products(&a100, 1, [128, 129], gate_up), [NFast; 2]);
+        assert_eq!(
+            gate_up_products(&a100, 1, [128, 513], gate_up),
+            [NFast, MFastLdsm]
         );
         assert_eq!(
-            gate_up_working_set_fits(&a100, 1, [128, 129], gate_up),
-            [false, false]
+            gate_up_products(&a4000, 1, [1509, 1501], gate_up),
+            [NFast; 2]
         );
         assert_eq!(
-            gate_up_working_set_fits(&a100, 1, [128, 513], gate_up),
-            [false, true]
+            gate_up_products(&a4000, 1, [256, 37_717], gate_up),
+            [NFast; 2]
         );
         assert_eq!(
-            gate_up_working_set_fits(&a4000, 1, [1509, 1501], gate_up),
-            [false, false]
+            gate_up_products(&a4000_large_l2, 1, [128, 129], gate_up),
+            [NFast, MFastLdsm]
         );
         assert_eq!(
-            gate_up_working_set_fits(&a4000, 1, [256, 37_717], gate_up),
-            [false, false]
+            gate_up_products(&rtx4090, 1, [9935, 39_740], gate_up),
+            [MFastLdsm, NFast]
         );
         assert_eq!(
-            gate_up_working_set_fits(&a4000_large_l2, 1, [128, 129], gate_up),
-            [false, true]
+            gate_up_products(&g4, 1, [9935, 37_717], gate_up),
+            [
+                MFastLdsm,
+                MFastStriped {
+                    tiles: 59,
+                    stripes: 5
+                }
+            ]
         );
-        assert_eq!(
-            gate_up_working_set_fits(&rtx4090, 1, [9935, 39_740], gate_up),
-            [true, false]
-        );
-        assert_eq!(
-            gate_up_working_set_fits(&g4, 1, [9935, 39_740], gate_up),
-            [true, false]
-        );
-        assert_eq!(
-            gate_up_working_set_fits(&t4, 1, [1509, 1501], gate_up),
-            [false, false]
-        );
+        assert_eq!(gate_up_products(&t4, 1, [1509, 1501], gate_up), [NFast; 2]);
 
         assert_eq!(
             group_dot_32_resource_limits(&a100),
@@ -510,6 +511,7 @@ pub struct ConvrotFns {
     group_dot_32: [crate::backend::gpu::CudaFunction; 2],
     quantize: crate::backend::gpu::CudaFunction,
     product: [crate::backend::gpu::CudaFunction; 3],
+    product_sm: i32,
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
     optin: usize,
@@ -539,6 +541,7 @@ pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
 pub enum ProductKernel {
     NFast,
     MFastLdsm,
+    MFastStriped { tiles: u32, stripes: u32 },
     NFastLdsm,
 }
 
@@ -570,7 +573,7 @@ const PRODUCT_BN: u32 = 256;
 impl ProductKernel {
     const fn shared_mem_bytes(self) -> u32 {
         match self {
-            Self::MFastLdsm => 49_152,
+            Self::MFastLdsm | Self::MFastStriped { .. } => 49_152,
             Self::NFast | Self::NFastLdsm => 61_440,
         }
     }
@@ -578,7 +581,7 @@ impl ProductKernel {
     const fn symbol_name(self) -> &'static str {
         match self {
             Self::NFast => "convrot_product",
-            Self::MFastLdsm => "convrot_product_m_fast",
+            Self::MFastLdsm | Self::MFastStriped { .. } => "convrot_product_m_fast",
             Self::NFastLdsm => "convrot_product_n_fast_ldsm",
         }
     }
@@ -599,12 +602,12 @@ pub(crate) fn qkv_product_eligible(
 }
 
 #[cfg(any(test, feature = "cuda"))]
-pub(crate) fn gate_up_working_set_fits(
+fn gate_up_products(
     info: &crate::backend::setup::DeviceInfo,
     active_ctas: usize,
     row_counts: [usize; 2],
     (k, n): (usize, usize),
-) -> [bool; 2] {
+) -> [ProductKernel; 2] {
     let l2 = info.l2_bytes;
     if !matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
         || info.warp != 32
@@ -612,22 +615,44 @@ pub(crate) fn gate_up_working_set_fits(
         || active_ctas == 0
         || n.saturating_mul(k) <= l2
     {
-        return [false; 2];
+        return [ProductKernel::NFast; 2];
     }
     let wave = info.sms * active_ctas;
     let (bm, bn) = (PRODUCT_BM as usize, PRODUCT_BN as usize);
     let n_tiles = n.div_ceil(bn);
-    row_counts.map(|rows| {
-        let m_tiles = rows.div_ceil(bm);
-        if m_tiles < 2 {
-            return false;
-        }
+    let working_set = |rows: usize, m_tiles: usize| {
         let ctas = wave.min(m_tiles * n_tiles);
         let columns = ((ctas + m_tiles - 1).div_ceil(m_tiles) * bn).min(n);
         let output_bytes = ctas * bm * bn * 2;
         let scale_bytes = (rows + columns) * size_of::<f32>();
-        let working_set = (rows + columns) * k + output_bytes + scale_bytes;
-        working_set < l2
+        (rows + columns) * k + output_bytes + scale_bytes
+    };
+    row_counts.map(|rows| {
+        let m_tiles = rows.div_ceil(bm);
+        if m_tiles < 2 {
+            return ProductKernel::NFast;
+        }
+        if working_set(rows, m_tiles) < l2 {
+            return ProductKernel::MFastLdsm;
+        }
+        if info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120)
+            && rows.saturating_mul(k) > l2
+        {
+            for stripes in 2..=m_tiles.min(u16::MAX as usize) {
+                let tiles = m_tiles.div_ceil(stripes);
+                if tiles < 2 || tiles * n_tiles < wave {
+                    break;
+                }
+                // A wave straddles at most two stripes.
+                if working_set(tiles * bm, tiles) < l2 / 2 {
+                    return ProductKernel::MFastStriped {
+                        tiles: tiles as u32,
+                        stripes: m_tiles.div_ceil(tiles) as u32,
+                    };
+                }
+            }
+        }
+        ProductKernel::NFast
     })
 }
 
@@ -718,7 +743,7 @@ pub(crate) fn gate_up_product_order(
     device: &crate::backend::cuda::Device,
     row_counts: [usize; 2],
     (k, n): (usize, usize),
-) -> Result<[bool; 2]> {
+) -> Result<[ProductKernel; 2]> {
     let info = &device.info;
     let selected = if matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
         && info.warp == 32
@@ -726,13 +751,13 @@ pub(crate) fn gate_up_product_order(
         && n.saturating_mul(k) > info.l2_bytes
     {
         let active = product_active_ctas(device, ProductKernel::MFastLdsm)?;
-        gate_up_working_set_fits(info, active, row_counts, (k, n))
+        gate_up_products(info, active, row_counts, (k, n))
     } else {
-        [false; 2]
+        [ProductKernel::NFast; 2]
     };
     if crate::backend::diagnostics_enabled() {
         eprintln!(
-            "CONVROT_GATE_UP_SELECT row_counts={row_counts:?} k={k} n={n} l2_bytes={} m_fast={selected:?}",
+            "CONVROT_GATE_UP_SELECT row_counts={row_counts:?} k={k} n={n} l2_bytes={} products={selected:?}",
             info.l2_bytes
         );
     }
@@ -831,6 +856,9 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
             module.load_function(GROUP_DOT_32_NAMES[1])?,
         ],
         quantize,
+        product_sm: product[1].get_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
+        )?,
         product,
         table: std::sync::Mutex::new(None),
         max_group,
@@ -902,11 +930,18 @@ pub(crate) fn launch_product(
     );
     let m = (args.rows as u32).div_ceil(PRODUCT_BM);
     let n = (args.n as u32).div_ceil(PRODUCT_BN);
-    let product = &fns.product[args.product as usize];
-    let grid = if matches!(args.product, ProductKernel::MFastLdsm) {
-        (m, n, 1)
-    } else {
-        (n, m, 1)
+    let (product, grid) = match args.product {
+        ProductKernel::NFast => (&fns.product[0], (n, m, 1)),
+        ProductKernel::MFastLdsm => (&fns.product[1], (m, n, 1)),
+        ProductKernel::MFastStriped { tiles, stripes } => {
+            ensure!(
+                fns.product_sm == 120 && tiles > 0 && tiles <= m && stripes == m.div_ceil(tiles),
+                "ConvRot striped product sm={} m_tiles={m} tiles={tiles} stripes={stripes}",
+                fns.product_sm
+            );
+            (&fns.product[1], (tiles, n, stripes))
+        }
+        ProductKernel::NFastLdsm => (&fns.product[2], (n, m, 1)),
     };
     unsafe {
         stream
@@ -2113,16 +2148,15 @@ mod device {
     fn check_gate_up_product(device: &Device) -> Result<()> {
         let (rows, k, n) = (1509, 5376, 28672);
         let active = super::product_active_ctas(device, ProductKernel::MFastLdsm)?;
-        let expected_order =
-            super::gate_up_working_set_fits(&device.info, active, [rows, 1501], (k, n));
+        let expected_order = super::gate_up_products(&device.info, active, [rows, 1501], (k, n));
         ensure!(
             super::gate_up_product_order(device, [rows, 1501], (k, n))? == expected_order,
             "gate/up M-fast selection mismatch on {}",
             device.info.arch
         );
         ensure!(
-            super::gate_up_product_order(device, [39_740, 42], (k, n))? == [false, false],
-            "gate/up M-fast enabled above L2 working set or below 2 M tiles"
+            super::gate_up_product_order(device, [39_740, 42], (k, n))?[1] == ProductKernel::NFast,
+            "gate/up M-fast enabled below 2 M tiles"
         );
         let (codes, scales, qweight, wscale) = fixture(rows, k, n);
         let period = PRODUCT_FIXTURE_PERIOD;
@@ -2205,11 +2239,65 @@ mod device {
         Ok(())
     }
 
+    fn check_gate_up_stripes(device: &Device) -> Result<()> {
+        let (rows, k, n) = (37_717, 5376, 28_672);
+        let [product, _] = super::gate_up_product_order(device, [rows, 0], (k, n))?;
+        let ProductKernel::MFastStriped { tiles, stripes } = product else {
+            return Ok(());
+        };
+        let (mut codes, mut scales, weights, wscale) = fixture(rows, k, n);
+        let run = |codes: &[i8], scales: &[f32], order| {
+            launch_product_at(device, codes, scales, &weights, &wscale, k, (0, 0, order))
+        };
+        let reference = run(&codes, &scales, ProductKernel::NFast)?;
+        let diff = bit_diff(&run(&codes, &scales, product)?, &reference);
+        ensure!(diff == 0, "striped gate/up differs in {diff} elements");
+
+        let tile = super::PRODUCT_BM as usize;
+        let start = rows / tile * tile;
+        let wrong = start - tile;
+        codes.copy_within(wrong * k..(wrong + rows - start) * k, start * k);
+        scales.copy_within(wrong..wrong + rows - start, start);
+        let shifted = run(&codes, &scales, product)?;
+        ensure!(bit_diff(&shifted[..start * n], &reference[..start * n]) == 0);
+        let moved_rows = shifted[start * n..]
+            .chunks_exact(n)
+            .zip(reference[start * n..].chunks_exact(n))
+            .filter(|(a, b)| a != b)
+            .count();
+        ensure!(
+            moved_rows == rows - start,
+            "wrong tail changed {moved_rows} rows"
+        );
+        ensure!(shifted[start * n..] == reference[wrong * n..(wrong + rows - start) * n]);
+        println!(
+            "CONVROT_GATE_UP_STRIPES tiles={tiles} stripes={stripes} rows={rows} k={k} n={n} differ={diff} wrong_tail_rows={moved_rows}"
+        );
+        let padded_rows = rows + tile;
+        let (codes, scales, weights, wscale) = fixture(padded_rows, 64, 257);
+        let [padded, _] = super::gate_up_product_order(device, [padded_rows, 0], (k, n))?;
+        let narrow = |order| {
+            launch_product_at(
+                device,
+                &codes,
+                &scales,
+                &weights,
+                &wscale,
+                64,
+                (0, 0, order),
+            )
+        };
+        let diff = bit_diff(&narrow(padded)?, &narrow(ProductKernel::NFast)?);
+        ensure!(diff == 0, "partial final stripe differs in {diff} elements");
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn convrot_product_matches_host_int8() -> Result<()> {
         let device = Device::new(0)?;
         check_gate_up_product(&device)?;
+        check_gate_up_stripes(&device)?;
         for rows in [17usize, 20, 42] {
             for n in [2usize, 40] {
                 let k = 256usize;
