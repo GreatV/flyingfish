@@ -2082,7 +2082,7 @@ pub(crate) struct BlockWork {
     rank: usize,
     chunk: usize,
     fixed_lora: bool,
-    gate_up_product: [ProductKernel; 2],
+    product: [[ProductKernel; 2]; FF_OUT + 1],
     rotate_32: [[bool; 2]; FF_OUT + 1],
     qkv_product: ProductKernel,
     #[cfg(test)]
@@ -2509,7 +2509,7 @@ impl BlockWork {
             #[cfg(test)]
             normed_probe: Vec::new(),
             fixed_lora: false,
-            gate_up_product: [ProductKernel::NFast; 2],
+            product: [[ProductKernel::NFast; 2]; FF_OUT + 1],
             rotate_32: [[false; 2]; FF_OUT + 1],
             qkv_product: ProductKernel::NFast,
             #[cfg(test)]
@@ -3068,6 +3068,7 @@ fn block_forward_tail<const LORA: bool>(
     let scratch = stored_ptrs(s, work);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
         let scratch = scratch.map(|mut ptrs| {
+            ptrs.product = work.product[index][0];
             ptrs.rotate_32 = work.rotate_32[index][0];
             ptrs
         });
@@ -3250,7 +3251,8 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     scratch: Option<StoredPtrs>,
 ) -> Result<()> {
     let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
-    let (chunk, gate_up_product) = (work.chunk, work.gate_up_product);
+    let chunk = work.chunk;
+    let products = &work.product;
     let rotate_32 = work.rotate_32;
     let fused_down = if !LORA && !SHIFT_INPUT {
         int8_linear(&w.linears[FF_OUT])
@@ -3260,9 +3262,7 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
         let scratch = scratch.map(|mut ptrs| {
             let tail = usize::from(x.shape[0] as usize != chunk);
-            if index == FF_IN {
-                ptrs.product = gate_up_product[tail];
-            }
+            ptrs.product = products[index][tail];
             ptrs.rotate_32 = index == FF_IN && rotate_32[FF_IN][tail];
             ptrs
         });
@@ -3297,7 +3297,9 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
             && n >= crate::convrot::TENSOR_CORE_ROWS
         {
             let scratch = scratch.map(|mut ptrs| {
-                ptrs.rotate_32 = rotate_32[FF_OUT][usize::from(n != chunk)];
+                let tail = usize::from(n != chunk);
+                ptrs.product = products[FF_OUT][tail];
+                ptrs.rotate_32 = rotate_32[FF_OUT][tail];
                 ptrs
             });
             apply_int8(
@@ -5272,14 +5274,34 @@ impl Dit {
         if hyperflow {
             work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
             if spec.int8_convrot.is_some() {
-                work.gate_up_product = crate::convrot::gate_up_product_order(
+                work.product[FF_IN] = crate::convrot::gate_up_product_order(
                     d,
                     [work.chunk, work.rows % work.chunk],
                     (h, 2 * spec.ffn),
                 )?;
                 let width = spec.heads * spec.head_dim;
                 work.plan_rotation(d, spec)?;
-                work.qkv_product = crate::convrot::qkv_product(d, work.rows, (h, width))?;
+                work.qkv_product = crate::convrot::n_fast_product(d, work.rows, (h, width))?;
+                if d.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120) {
+                    work.product[OUT][0] =
+                        crate::convrot::n_fast_product(d, work.rows, (width, h))?;
+                    for (i, rows) in [work.chunk, work.rows % work.chunk].into_iter().enumerate() {
+                        work.product[FF_OUT][i] =
+                            crate::convrot::n_fast_product(d, rows, (spec.ffn, h))?;
+                    }
+                }
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "CONVROT_QKV_PRODUCT_SELECT rows={} k={h} n={width} l2_bytes={} kernel={}",
+                        work.rows,
+                        d.info.l2_bytes,
+                        work.qkv_product.symbol_name()
+                    );
+                    eprintln!(
+                        "CONVROT_N_FAST_PRODUCTS out={:?} down={:?}",
+                        work.product[OUT][0], work.product[FF_OUT]
+                    );
+                }
             }
         } else {
             work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
