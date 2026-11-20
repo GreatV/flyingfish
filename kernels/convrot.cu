@@ -673,6 +673,14 @@ extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_ldsm(
     __nv_bfloat16* y, int rows, int k, int n) {
     convrot_product_tile<true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
 }
+
+#if __CUDA_ARCH__ == 1200
+extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_swizzled(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile<true, true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
+}
+#endif
 #else
 // gfx11 wave32 v_wmma_i32_16x16x16_iu8. BK=64, 2 swizzled LDS stages.
 // 128x128x64: 256 threads, 32768 B LDS (2 WGs/WGP). 128x256x64: 512 threads, 49152 B LDS (1 WG/WGP).

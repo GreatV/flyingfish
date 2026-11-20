@@ -6,7 +6,7 @@
 //! back to bf16, `s_x = max(|xR|, 1e-12) / 127`, and `q` is ties-to-even of `xR / s_x`.
 //! At [`TENSOR_CORE_ROWS`] and above, `x` is bf16. The device kernel's dot is `mma.m16n8k16` (bf16 in, f32
 //! accumulator, K in groups of 16) and `q` is ties-to-even of `xR * (1/s_x)`.
-//! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 61440 bytes dynamic smem.
+//! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 49,152 or 61,440 bytes dynamic smem.
 //! [`linear`] is the below-[`TENSOR_CORE_ROWS`] form.
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 use anyhow::Context;
@@ -402,6 +402,26 @@ mod tests {
         let low_smem = mock_device_info(80, 108, 40 << 20, 49_152);
         assert!(!qkv_product_eligible(&low_smem, 37_717, (5376, 7168)));
 
+        for dims in [(5376, 7168), (7168, 5376), (14336, 5376)] {
+            assert!(super::n_fast_swizzle_fits(&g4, 37_717, dims, 1));
+            assert!(!super::n_fast_swizzle_fits(&gfx1100, 37_717, dims, 1));
+            assert!(!super::n_fast_swizzle_fits(&rtx4090, 37_717, dims, 1));
+            assert!(!super::n_fast_swizzle_fits(&g4, 17, dims, 1));
+        }
+        let small_l2 = mock_device_info(120, 188, 80 << 20, 101_376);
+        assert!(!super::n_fast_swizzle_fits(
+            &small_l2,
+            37_717,
+            (14336, 5376),
+            1
+        ));
+        assert!(super::n_fast_swizzle_fits(
+            &small_l2,
+            37_717,
+            (7168, 5376),
+            1
+        ));
+
         let gate_up = (5376, 28_672);
         assert_eq!(
             gate_up_products(&a100, 1, [1509, 1501], gate_up),
@@ -628,6 +648,7 @@ pub struct ConvrotFns {
     product: [crate::backend::gpu::CudaFunction; 3],
     arch: crate::backend::setup::DeviceArchitecture,
     striped: bool,
+    n_fast_swizzled: Option<crate::backend::gpu::CudaFunction>,
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
     optin: usize,
@@ -659,6 +680,7 @@ pub enum ProductKernel {
     MFastLdsm,
     MFastStriped { tiles: u32, stripes: u32 },
     NFastLdsm,
+    NFastSwizzled,
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -684,12 +706,12 @@ impl ProductKernel {
     fn shared_mem_bytes(self, arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
         match arch {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => match self {
-                Self::MFastLdsm | Self::MFastStriped { .. } => 49_152,
+                Self::MFastLdsm | Self::MFastStriped { .. } | Self::NFastSwizzled => 49_152,
                 Self::NFast | Self::NFastLdsm => 61_440,
             },
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
                 Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => 32_768,
-                Self::NFastLdsm => 49_152,
+                Self::NFastLdsm | Self::NFastSwizzled => 49_152,
             },
         }
     }
@@ -699,7 +721,7 @@ impl ProductKernel {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => (128, 256),
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
                 Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => (128, 128),
-                Self::NFastLdsm => (128, 256),
+                Self::NFastLdsm | Self::NFastSwizzled => (128, 256),
             },
         }
     }
@@ -710,7 +732,7 @@ impl ProductKernel {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => 512,
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
                 Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => 256,
-                Self::NFastLdsm => 512,
+                Self::NFastLdsm | Self::NFastSwizzled => 512,
             },
         }
     }
@@ -721,16 +743,17 @@ impl ProductKernel {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => (124, 1),
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
                 Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => (216, 2),
-                Self::NFastLdsm => (216, 1),
+                Self::NFastLdsm | Self::NFastSwizzled => (216, 1),
             },
         }
     }
 
-    const fn symbol_name(self) -> &'static str {
+    pub(crate) const fn symbol_name(self) -> &'static str {
         match self {
             Self::NFast => "convrot_product",
             Self::MFastLdsm | Self::MFastStriped { .. } => "convrot_product_m_fast",
             Self::NFastLdsm => "convrot_product_n_fast_ldsm",
+            Self::NFastSwizzled => "convrot_product_n_fast_swizzled",
         }
     }
 }
@@ -910,28 +933,53 @@ pub(crate) fn product_active_ctas(
     Ok(usize::try_from(active)?)
 }
 
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+fn n_fast_swizzle_fits(
+    info: &crate::backend::setup::DeviceInfo,
+    rows: usize,
+    (k, n): (usize, usize),
+    active_ctas: usize,
+) -> bool {
+    if info.arch != crate::backend::setup::DeviceArchitecture::Cuda(120)
+        || info.warp != 32
+        || rows < TENSOR_CORE_ROWS
+        || info.optin_shared_bytes
+            < ProductKernel::NFastSwizzled.shared_mem_bytes(&info.arch) as usize
+        || !matches!((k, n), (5376, 7168) | (7168 | 14336, 5376))
+    {
+        return false;
+    }
+    let (bm, bn) = ProductKernel::NFastSwizzled.tile_dims(&info.arch);
+    let (bm, bn) = (bm as usize, bn as usize);
+    let wave = info.sms * active_ctas;
+    let n_tiles = n / bn;
+    if wave == 0 || rows.div_ceil(bm).saturating_mul(n_tiles) < wave {
+        return false;
+    }
+    let live_rows = ((wave - 1).div_ceil(n_tiles) + 1) * bm;
+    let operands = n * k + live_rows.min(rows) * (k + size_of::<f32>());
+    let output = wave * bm * bn * size_of::<bf16>();
+    operands + output + n * size_of::<f32>() < info.l2_bytes
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-pub(crate) fn qkv_product(
+pub(crate) fn n_fast_product(
     device: &crate::backend::cuda::Device,
     rows: usize,
     dims: (usize, usize),
 ) -> Result<ProductKernel> {
-    let product = if qkv_product_eligible(&device.info, rows, dims) {
-        product_active_ctas(device, ProductKernel::NFastLdsm)?;
-        ProductKernel::NFastLdsm
-    } else {
-        ProductKernel::NFast
-    };
-    if crate::backend::diagnostics_enabled() {
-        eprintln!(
-            "CONVROT_QKV_PRODUCT_SELECT rows={rows} k={} n={} l2_bytes={} kernel={}",
-            dims.0,
-            dims.1,
-            device.info.l2_bytes,
-            product.symbol_name()
-        );
+    let info = &device.info;
+    if n_fast_swizzle_fits(info, rows, dims, 1) {
+        let active = product_active_ctas(device, ProductKernel::NFastSwizzled)?;
+        if n_fast_swizzle_fits(info, rows, dims, active) {
+            return Ok(ProductKernel::NFastSwizzled);
+        }
     }
-    Ok(product)
+    if qkv_product_eligible(info, rows, dims) {
+        product_active_ctas(device, ProductKernel::NFastLdsm)?;
+        return Ok(ProductKernel::NFastLdsm);
+    }
+    Ok(ProductKernel::NFast)
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1066,6 +1114,9 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     let quantize = module.load_function("convrot_quantize")?;
     let quant_dyn = u32::try_from(optin / 4 * 4).context("convrot quantize opt-in")?;
     crate::backend::cuda::set_max_dynamic_shared_bytes(&quantize, quant_dyn)?;
+    let n_fast_swizzled = (arch == crate::backend::setup::DeviceArchitecture::Cuda(120) && striped)
+        .then(|| product_function(&module, &arch, ProductKernel::NFastSwizzled))
+        .transpose()?;
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
         hadamard,
@@ -1074,6 +1125,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         quantize,
         arch,
         striped,
+        n_fast_swizzled,
         product,
         table: std::sync::Mutex::new(None),
         max_group,
@@ -1158,6 +1210,12 @@ pub(crate) fn launch_product(
             (&fns.product[1], (tiles, n, stripes))
         }
         ProductKernel::NFastLdsm => (&fns.product[2], (n, m, 1)),
+        ProductKernel::NFastSwizzled => (
+            fns.n_fast_swizzled
+                .as_ref()
+                .context("swizzled N-fast product requires sm120")?,
+            (n, m, 1),
+        ),
     };
     unsafe {
         stream
@@ -2720,6 +2778,71 @@ mod device {
         Ok(())
     }
 
+    fn check_product_tail(
+        device: &Device,
+        (rows, k, n): (usize, usize, usize),
+        baseline: ProductKernel,
+        product: ProductKernel,
+        salt: usize,
+    ) -> Result<(usize, usize)> {
+        let (mut codes, mut scales, mut weights, wscale) = fixture(rows, k, n);
+        weights.rotate_left(k * salt);
+        let run = |codes: &[i8], scales: &[f32], order| {
+            launch_product_at(device, codes, scales, &weights, &wscale, k, (0, 0, order))
+        };
+        let reference = run(&codes, &scales, baseline)?;
+        let diff = bit_diff(&run(&codes, &scales, product)?, &reference);
+        ensure!(
+            diff == 0,
+            "{product:?} k={k} n={n} differs in {diff} elements"
+        );
+
+        let tile = product.tile_dims(&device.info.arch).0 as usize;
+        let start = rows / tile * tile;
+        let wrong = start - tile;
+        codes.copy_within(wrong * k..(wrong + rows - start) * k, start * k);
+        scales.copy_within(wrong..wrong + rows - start, start);
+        let shifted = run(&codes, &scales, product)?;
+        ensure!(bit_diff(&shifted[..start * n], &reference[..start * n]) == 0);
+        let moved_rows = shifted[start * n..]
+            .chunks_exact(n)
+            .zip(reference[start * n..].chunks_exact(n))
+            .filter(|(a, b)| a != b)
+            .count();
+        ensure!(
+            moved_rows == rows - start,
+            "wrong tail changed {moved_rows} rows"
+        );
+        ensure!(shifted[start * n..] == reference[wrong * n..(wrong + rows - start) * n]);
+        Ok((diff, moved_rows))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a reserved sm120 GPU window"]
+    fn convrot_n_fast_swizzle_matches_stored_products() -> Result<()> {
+        let device = Device::new(0)?;
+        let rows = 37_717;
+        for (role, k, n, salt, baseline) in [
+            ("q", 5376, 7168, 0, ProductKernel::NFastLdsm),
+            ("k", 5376, 7168, 1, ProductKernel::NFastLdsm),
+            ("v", 5376, 7168, 2, ProductKernel::NFastLdsm),
+            ("out", 7168, 5376, 0, ProductKernel::NFast),
+            ("down", 14336, 5376, 0, ProductKernel::NFast),
+        ] {
+            let product = super::n_fast_product(&device, rows, (k, n))?;
+            ensure!(
+                product == ProductKernel::NFastSwizzled,
+                "{role} selected {product:?}"
+            );
+            let (diff, moved) = check_product_tail(&device, (rows, k, n), baseline, product, salt)?;
+            println!(
+                "CONVROT_N_FAST_SWIZZLE role={role} rows={rows} k={k} n={n} differ={diff} wrong_tail_rows={moved}"
+            );
+        }
+        Ok(())
+    }
+
     fn check_gate_up_stripes(device: &Device) -> Result<()> {
         let (rows, k, n) = (37_717, 5376, 28_672);
         let [selected, _] = super::gate_up_product_order(device, [rows, 0], (k, n))?;
@@ -2741,34 +2864,12 @@ mod device {
         let ProductKernel::MFastStriped { tiles, stripes } = product else {
             return Ok(());
         };
-        let (mut codes, mut scales, weights, wscale) = fixture(rows, k, n);
-        let run = |codes: &[i8], scales: &[f32], order| {
-            launch_product_at(device, codes, scales, &weights, &wscale, k, (0, 0, order))
-        };
-        let reference = run(&codes, &scales, ProductKernel::NFast)?;
-        let diff = bit_diff(&run(&codes, &scales, product)?, &reference);
-        ensure!(diff == 0, "striped gate/up differs in {diff} elements");
-
-        let tile = product.tile_dims(&device.info.arch).0 as usize;
-        let start = rows / tile * tile;
-        let wrong = start - tile;
-        codes.copy_within(wrong * k..(wrong + rows - start) * k, start * k);
-        scales.copy_within(wrong..wrong + rows - start, start);
-        let shifted = run(&codes, &scales, product)?;
-        ensure!(bit_diff(&shifted[..start * n], &reference[..start * n]) == 0);
-        let moved_rows = shifted[start * n..]
-            .chunks_exact(n)
-            .zip(reference[start * n..].chunks_exact(n))
-            .filter(|(a, b)| a != b)
-            .count();
-        ensure!(
-            moved_rows == rows - start,
-            "wrong tail changed {moved_rows} rows"
-        );
-        ensure!(shifted[start * n..] == reference[wrong * n..(wrong + rows - start) * n]);
+        let (diff, moved_rows) =
+            check_product_tail(device, (rows, k, n), ProductKernel::NFast, product, 0)?;
         println!(
             "CONVROT_GATE_UP_STRIPES tiles={tiles} stripes={stripes} rows={rows} k={k} n={n} forced={forced} differ={diff} wrong_tail_rows={moved_rows}"
         );
+        let tile = product.tile_dims(&device.info.arch).0 as usize;
         let padded_rows = rows + tile;
         let (codes, scales, weights, wscale) = fixture(padded_rows, 64, 257);
         let padded = if forced {
@@ -3747,14 +3848,16 @@ mod device {
         let fns = load_convrot(&device.ctx)?;
         let k = 5_376usize;
         let n = 7_168usize;
-        let expected_qkv = if super::qkv_product_eligible(&device.info, 37_717, (k, n)) {
+        let expected_qkv = if super::n_fast_swizzle_fits(&device.info, 37_717, (k, n), 1) {
+            ProductKernel::NFastSwizzled
+        } else if super::qkv_product_eligible(&device.info, 37_717, (k, n)) {
             super::product_active_ctas(&device, ProductKernel::NFastLdsm)?;
             ProductKernel::NFastLdsm
         } else {
             ProductKernel::NFast
         };
         ensure!(
-            super::qkv_product(&device, 37_717, (k, n))? == expected_qkv,
+            super::n_fast_product(&device, 37_717, (k, n))? == expected_qkv,
             "QKV product selection mismatch on {}",
             device.info.arch
         );
