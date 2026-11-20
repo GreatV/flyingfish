@@ -579,7 +579,7 @@ __device__ __forceinline__ void convrot_store_one(__nv_bfloat16* __restrict__ y,
     }
 }
 
-template <bool MATRIX_LOAD, bool SWIZZLED = false>
+template <bool MATRIX_LOAD, bool SWIZZLED = false, bool ONE_BARRIER = false>
 __device__ __forceinline__ void convrot_product_tile(
     const int8_t* __restrict__ codes, const float* __restrict__ scales,
     const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
@@ -610,16 +610,21 @@ __device__ __forceinline__ void convrot_product_tile(
     convrot_stage<SWIZZLED>(smem, codes, qweight, rows, k, n, m0, n0, 0, 0);
     convrot_cp_commit();
     for (int kt = 0; kt < tiles; ++kt) {
+        if constexpr (ONE_BARRIER) {
+            convrot_cp_wait<0>();
+            // The current slot is ready and every warp has finished reading the opposite slot.
+            __syncthreads();
+        }
         if (kt + 1 < tiles) {
             convrot_stage<SWIZZLED>(smem, codes, qweight, rows, k, n, m0, n0, (kt + 1) * CONVROT_BK, stage ^ 1);
             convrot_cp_commit();
-            convrot_cp_wait<1>();
-        } else {
+            if constexpr (!ONE_BARRIER) convrot_cp_wait<1>();
+        } else if constexpr (!ONE_BARRIER) {
             convrot_cp_wait<0>();
         }
-        __syncthreads();
+        if constexpr (!ONE_BARRIER) __syncthreads();
         convrot_mma_tile<MATRIX_LOAD, SWIZZLED>(smem + stage * CONVROT_STAGE<SWIZZLED>, acc, warp_m, warp_n, group, t4, lane);
-        __syncthreads();
+        if constexpr (!ONE_BARRIER) __syncthreads();
         stage ^= 1;
     }
     // 4 row scales and 16 column scales, one global load each.
@@ -675,6 +680,14 @@ extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_ldsm(
 }
 
 #if __CUDA_ARCH__ == 1200
+extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast_one_barrier(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    const unsigned m_tile = blockIdx.x + blockIdx.z * gridDim.x;
+    if (m_tile * CONVROT_BM >= static_cast<unsigned>(rows)) return;
+    convrot_product_tile<true, true, true>(codes, scales, qweight, wscale, y, rows, k, n, m_tile, blockIdx.y);
+}
+
 extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_swizzled(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {

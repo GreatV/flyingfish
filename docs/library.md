@@ -387,6 +387,8 @@ pub struct HyperFlowH3Request {
 - `frames`: rounds up to `17n+5`; the aligned count must lie within 5 seconds and 362 frames at 24 fps.
 - `seed`: noise seed.
 
+`convrot::ProductKernel::MFastStriped { tiles, stripes, one_barrier }` exposes the panel schedule. Setup sets `one_barrier` only for the sm120 INT8 gate/up product with 37,717 rows, 5,376 input columns, 28,672 output columns and five stripes of up to 59 row tiles each. A false value selects the two-barrier schedule.
+
 The output is `H3Output` as above. `minimax_h3::is_hyperflow_model(model: &Path) -> Result<bool>` tells a HyperFlow directory from a MiniMax-H3 directory by its published transformer component.
 
 ```rust
