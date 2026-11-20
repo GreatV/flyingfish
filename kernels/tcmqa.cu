@@ -213,11 +213,16 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned (&r)[2], const void* p) {
 }
 __device__ __forceinline__ void mma_16816(float (&d)[4], const unsigned (&a)[4],
                                           const unsigned (&b)[2]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  asm volatile("trap;" ::"f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "r"(a[0]), "r"(a[1]),
+               "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
 }
 // Pack two fp32 into one bf16x2 register (round-to-nearest).
 __device__ __forceinline__ unsigned pack_bf16x2(float lo, float hi) {
@@ -226,14 +231,33 @@ __device__ __forceinline__ unsigned pack_bf16x2(float lo, float hi) {
 }
 // cp.async 16B copy; sz = 0 zero-fills the destination (dead rows).
 __device__ __forceinline__ void cp16(void* dst, const void* src, int sz) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  unsigned x = 0u, y = 0u, z = 0u, w = 0u;
+  if (sz == 16) {
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                 : "l"(src));
+  }
+  asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(smem_u32(dst)), "r"(x), "r"(y),
+               "r"(z), "r"(w));
+#else
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                :: "r"(smem_u32(dst)), "l"(src), "r"(sz));
+#endif
 }
 __device__ __forceinline__ void cp_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  asm volatile("" ::: "memory");
+#else
   asm volatile("cp.async.commit_group;\n");
+#endif
 }
 __device__ __forceinline__ void cp_wait0() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  __syncthreads();
+#else
   asm volatile("cp.async.wait_group 0;\n");
+#endif
 }
 
 // Block (ch, kv, rt): sweeps chunk ch of kv-head kv in KT-pos tiles; warp w

@@ -193,13 +193,39 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_gemm_w8a16(
     const size_t k_off_in1 = in_live1 ? (size_t)k0 : 0;
     const unsigned in_dst0 =
         (unsigned)__cvta_generic_to_shared(&input_tile[stage][in_row0][in_col]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    {
+      unsigned x = 0u, y = 0u, z = 0u, w = 0u;
+      if (in_bytes0 == 16) {
+        asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                     : "l"(in_src0 + k_off_in));
+      }
+      asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(in_dst0), "r"(x), "r"(y),
+                   "r"(z), "r"(w));
+    }
+#else
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
         :: "r"(in_dst0), "l"(in_src0 + k_off_in), "r"(in_bytes0) : "memory");
+#endif
     if (tile_acts > 32) {
       const unsigned in_dst1 =
           (unsigned)__cvta_generic_to_shared(&input_tile[stage][in_row1][in_col]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+      {
+        unsigned x = 0u, y = 0u, z = 0u, w = 0u;
+        if (in_bytes1 == 16) {
+          asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                       : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                       : "l"(in_src1 + k_off_in1));
+        }
+        asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(in_dst1), "r"(x), "r"(y),
+                     "r"(z), "r"(w));
+      }
+#else
       asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
           :: "r"(in_dst1), "l"(in_src1 + k_off_in1), "r"(in_bytes1) : "memory");
+#endif
     }
     const size_t k_off_w0 = w_live0 ? (size_t)k0 : 0;
     const size_t k_off_w1 = w_live1 ? (size_t)k0 : 0;
@@ -207,19 +233,51 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_gemm_w8a16(
         (unsigned)__cvta_generic_to_shared(&weight_codes[stage][w_row0][w_col]);
     const unsigned w_dst1 =
         (unsigned)__cvta_generic_to_shared(&weight_codes[stage][w_row1][w_col]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    {
+      unsigned x = 0u, y = 0u, z = 0u, w = 0u;
+      if (w_bytes0 == 16) {
+        asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                     : "l"(w_src0 + k_off_w0));
+      }
+      asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(w_dst0), "r"(x), "r"(y),
+                   "r"(z), "r"(w));
+    }
+    {
+      unsigned x = 0u, y = 0u, z = 0u, w = 0u;
+      if (w_bytes1 == 16) {
+        asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                     : "l"(w_src1 + k_off_w1));
+      }
+      asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(w_dst1), "r"(x), "r"(y),
+                   "r"(z), "r"(w));
+    }
+    asm volatile("" ::: "memory");
+#else
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
         :: "r"(w_dst0), "l"(w_src0 + k_off_w0), "r"(w_bytes0) : "memory");
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
         :: "r"(w_dst1), "l"(w_src1 + k_off_w1), "r"(w_bytes1) : "memory");
     asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
   };
   stage_tile(0, 0);
   for (int k0 = 0, stage = 0; k0 < inner; k0 += CK, stage ^= 1) {
     if (k0 + CK < inner) {
       stage_tile(stage ^ 1, k0 + CK);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+      __syncthreads();
+#else
       asm volatile("cp.async.wait_group 1;" ::: "memory");
+#endif
     } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+      __syncthreads();
+#else
       asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
     }
     __syncthreads();
 #pragma unroll 2
@@ -245,10 +303,15 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_gemm_w8a16(
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
             : "=r"(b0), "=r"(b1) : "r"(address));
         float* d = accum[n];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        asm volatile("trap;" ::"f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "r"(a0), "r"(a1),
+                     "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
             : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
       }
       if (tile_acts > 32) {
 #pragma unroll
@@ -259,10 +322,15 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_gemm_w8a16(
           asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
               : "=r"(b0), "=r"(b1) : "r"(address));
           float* d = accum[n];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+          asm volatile("trap;" ::"f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "r"(a0), "r"(a1),
+                       "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
           asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
         }
       }
     }

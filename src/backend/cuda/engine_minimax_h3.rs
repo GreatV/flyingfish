@@ -253,6 +253,8 @@ struct EntryReader {
     dir: PathBuf,
     readers: BTreeMap<String, SpanReader>,
     staging: Option<AlignedBytes>,
+    /// Set once from the device capability. sm below 80 rewrites BF16 weight bytes to FP16.
+    fp16_weights: Option<bool>,
 }
 
 /// One batched direct-read destination: tensor identity plus a disjoint writable
@@ -294,12 +296,21 @@ pub(crate) struct OwnedRead {
     cast: FillCast,
 }
 
-/// Destination form of one fill read: the stored bytes, or their BF16 narrowing with the
-/// loader's finite and overflow checks.
+/// Destination form of one fill read: the stored bytes, their BF16 narrowing, or BF16
+/// weight bits rewritten as FP16. F32, I8, and U8 stay [`FillCast::Raw`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillCast {
     Raw,
     F32ToBf16,
+    Bf16ToFp16,
+}
+
+fn weight_fill_cast(fp16: bool, entry: &TensorEntry) -> FillCast {
+    if fp16 && entry.quant.is_none() && entry.dtype == Dtype::BF16 {
+        FillCast::Bf16ToFp16
+    } else {
+        FillCast::Raw
+    }
 }
 
 /// The resident ring's raw windows keep the loader's finite check: unquantized F32 kept as
@@ -690,7 +701,22 @@ impl EntryReader {
             dir: dir.to_owned(),
             readers: BTreeMap::new(),
             staging: None,
+            fp16_weights: None,
         }
+    }
+
+    fn ensure_fp16(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        if self.fp16_weights.is_none() {
+            self.fp16_weights = Some(cubin::capability(stream.context())? < 80);
+        }
+        Ok(())
+    }
+
+    fn store_bf16_as_fp16(&self, name: &str, bytes: &mut [u8]) -> Result<()> {
+        if self.fp16_weights == Some(true) {
+            crate::tensors::bf16_weight_to_fp16(name, bytes, true)?;
+        }
+        Ok(())
     }
 
     /// Copies a finite BF16 or F32 tensor into a buffer of its element type; the pageable source is consumed when the
@@ -710,11 +736,21 @@ impl EntryReader {
             destination.len(),
             T::DTYPE
         );
+        self.ensure_fp16(stream)?;
+        let convert = self.fp16_weights == Some(true) && entry.dtype == Dtype::BF16;
         let bytes = self.read(name, entry)?;
         ensure!(T::finite(bytes), "{name}: nonfinite value");
+        let mut converted = Vec::new();
+        let payload = if convert {
+            converted.extend_from_slice(bytes);
+            crate::tensors::bf16_weight_to_fp16(name, &mut converted, true)?;
+            converted.as_slice()
+        } else {
+            bytes
+        };
         let (pointer, _record) = destination.device_ptr_mut(stream);
         unsafe {
-            super::copy::htod_async(pointer, bytes, stream)?;
+            super::copy::htod_async(pointer, payload, stream)?;
         }
         Ok(())
     }
@@ -755,6 +791,9 @@ impl EntryReader {
         };
         ensure!(finite, "{name}: nonfinite value");
         destination.copy_from_slice(bytes);
+        if entry.dtype == Dtype::BF16 {
+            self.store_bf16_as_fp16(name, destination)?;
+        }
         Ok(())
     }
 
@@ -871,6 +910,15 @@ impl EntryReader {
             .max(entry.bytes + head);
         let filled = match cast {
             FillCast::Raw => entry.bytes,
+            FillCast::Bf16ToFp16 => {
+                ensure!(
+                    entry.dtype == Dtype::BF16
+                        && entry.quant.is_none()
+                        && entry.bytes.is_multiple_of(2),
+                    "{name}: BF16 to FP16 fill source"
+                );
+                entry.bytes
+            }
             FillCast::F32ToBf16 => {
                 ensure!(
                     entry.dtype == Dtype::F32
@@ -895,6 +943,11 @@ impl EntryReader {
         let source = &span[head..head + entry.bytes];
         match cast {
             FillCast::Raw => destination[..entry.bytes].copy_from_slice(source),
+            FillCast::Bf16ToFp16 => {
+                let output = &mut destination[..entry.bytes];
+                output.copy_from_slice(source);
+                crate::tensors::bf16_weight_to_fp16(name, output, true)?;
+            }
             FillCast::F32ToBf16 => {
                 let output = &mut destination[..filled];
                 for (value, dst) in source
@@ -1404,11 +1457,21 @@ impl<'a> Source<'a> {
             destination.len(),
             T::DTYPE
         );
+        self.reader.ensure_fp16(s)?;
+        let convert = self.reader.fp16_weights == Some(true) && entry.dtype == Dtype::BF16;
         let slice = self.reader.read_range(name, entry, first, bytes)?;
         ensure!(T::finite(slice), "{name}: nonfinite value");
+        let mut converted = Vec::new();
+        let payload = if convert {
+            converted.extend_from_slice(slice);
+            crate::tensors::bf16_weight_to_fp16(name, &mut converted, true)?;
+            converted.as_slice()
+        } else {
+            slice
+        };
         let (pointer, _record) = destination.device_ptr_mut(s);
         unsafe {
-            super::copy::htod_async(pointer, slice, s)?;
+            super::copy::htod_async(pointer, payload, s)?;
         }
         Ok(())
     }
@@ -1479,6 +1542,7 @@ impl<'a> Source<'a> {
 
     fn pack_vectors(&mut self, s: &Arc<CudaStream>, spec: &H3Spec) -> Result<()> {
         ensure!(self.vectors.is_none(), "vector arena already loaded");
+        self.reader.ensure_fp16(s)?;
         let layout = VectorArenaLayout::new(self.manifest, spec)?;
         let dropped = spec
             .dropped_blocks
@@ -4191,6 +4255,7 @@ fn bind_layers(
     let tier = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
+        let fp16 = cubin::capability(&d.ctx)? < 80;
         let mut dense =
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         let mut requests = Vec::new();
@@ -4221,7 +4286,7 @@ fn bind_layers(
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(at) },
                     dest_len: entry.bytes,
-                    cast: FillCast::Raw,
+                    cast: weight_fill_cast(fp16, entry),
                 });
                 checks.push(FillCheck {
                     layer,
@@ -4826,6 +4891,7 @@ fn place_stored_layers(
     let mut tier = None;
     if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
+        let fp16 = cubin::capability(&d.ctx)? < 80;
         let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
             &dir,
             base.manifest,
@@ -4869,7 +4935,7 @@ fn place_stored_layers(
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(offset) },
                     dest_len: entry.bytes,
-                    cast: FillCast::Raw,
+                    cast: weight_fill_cast(fp16, &entry),
                 });
                 if entry.dtype == Dtype::BF16 {
                     checks.push(FillCheck {
@@ -7091,6 +7157,7 @@ pub(crate) fn embedding_rows(
     embed: &str,
     hidden: usize,
     ids: &[u32],
+    fp16: bool,
 ) -> Result<Vec<bf16>> {
     let entry = base
         .manifest
@@ -7105,6 +7172,7 @@ pub(crate) fn embedding_rows(
     );
     let row = 2 * hidden;
     let mut out = Vec::with_capacity(ids.len() * hidden);
+    let mut flushed = 0u64;
     for &id in ids {
         ensure!((id as usize) < entry.shape[0], "token {id} outside {embed}");
         let bytes = base
@@ -7114,13 +7182,20 @@ pub(crate) fn embedding_rows(
             <bf16 as Element>::finite(bytes),
             "{embed}: nonfinite row {id}"
         );
+        let mut row_bytes = bytes.to_vec();
+        if fp16 {
+            flushed += crate::tensors::bf16_weight_to_fp16(embed, &mut row_bytes, false)?;
+        }
         out.extend(
-            bytes
+            row_bytes
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|b| bf16::from_le_bytes(*b)),
         );
+    }
+    if flushed > 0 {
+        eprintln!("{embed}: BF16 to FP16 flushed {flushed} values to +0");
     }
     Ok(out)
 }
@@ -12363,6 +12438,7 @@ mod tests {
                 "model.language_model.embed_tokens.weight",
                 hidden,
                 &ids,
+                false,
             )?;
             let table = ids
                 .iter()
@@ -18259,6 +18335,73 @@ mod h3_direct_batch_tests {
         assert!(!bf16_preferred_for_device(
             &sm89, &spec, &geometry, need, weights
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_to_fp16_fill_flushes_and_rejects_overflow() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-fp16-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let align = 4096usize;
+        let name = "model.language_model.layers.1.mlp.gate_proj.weight";
+        let mut source = vec![0u8; 2 * align];
+        let store = |source: &mut [u8], index: usize, bits: u16| {
+            let bytes = bits.to_le_bytes();
+            source[2 * index] = bytes[0];
+            source[2 * index + 1] = bytes[1];
+        };
+        store(&mut source, 0, 142 << 7);
+        store(&mut source, 1, (1 << 15) | (102 << 7) | 127);
+        store(&mut source, 2, 103 << 7);
+        store(&mut source, 3, 1 << 15);
+        std::fs::write(dir.join("shard.bin"), &source)?;
+        let entry = TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![source.len() / 2],
+            shard: "shard.bin".into(),
+            bytes: source.len(),
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let nbytes = source.len();
+        let read = |arena: &mut AlignedBytes, cast: FillCast| {
+            OwnedRead::new(name, &entry, arena.as_mut().as_mut_ptr(), nbytes, cast)
+        };
+        let mut raw = AlignedBytes::new(source.len(), align)?;
+        let mut raw_thread = FillThread::spawn(&dir, vec![read(&mut raw, FillCast::Raw)])?;
+        raw_thread.join()?;
+        ensure!(
+            u16::from_le_bytes([raw.as_mut()[2], raw.as_mut()[3]]) == (1 << 15) | (102 << 7) | 127,
+            "raw fill rewrote BF16 bits"
+        );
+        let mut arena = AlignedBytes::new(source.len(), align)?;
+        let mut thread = FillThread::spawn(&dir, vec![read(&mut arena, FillCast::Bf16ToFp16)])?;
+        thread.join()?;
+        let word = |bytes: &[u8], index: usize| {
+            u16::from_le_bytes([bytes[2 * index], bytes[2 * index + 1]])
+        };
+        let got = arena.as_mut();
+        ensure!(word(got, 0) == 0x7800, "exponent 142");
+        ensure!(word(got, 1) == 0, "exponent 102");
+        ensure!(word(got, 2) == 1, "exponent 103");
+        ensure!(word(got, 3) == 0x8000, "negative zero");
+        store(&mut source, 0, 143 << 7);
+        std::fs::write(dir.join("shard.bin"), &source)?;
+        let mut overflow = AlignedBytes::new(source.len(), align)?;
+        let mut thread = FillThread::spawn(&dir, vec![read(&mut overflow, FillCast::Bf16ToFp16)])?;
+        let error = thread.join().expect_err("BF16 exponent 143");
+        ensure!(
+            format!("{error:#}").contains(name),
+            "overflow error lacks the tensor name: {error:#}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

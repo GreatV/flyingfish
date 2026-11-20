@@ -3215,14 +3215,25 @@ mod device {
                     .iter()
                     .filter(|code| code.starts_with("BAR.SYNC"))
                     .count();
+                let (reg, stack, local) = function_resources(&usage, name)
+                    .with_context(|| format!("sm_{sm} {name} resources"))?;
+                if sm < 80 {
+                    let trap = count("BPT.TRAP");
+                    println!(
+                        "CONVROT_PRODUCT_SASS sm_{sm} {name} IMMA={imma} TRAP={trap} REG={reg} STACK={stack} LOCAL={local}"
+                    );
+                    ensure!(
+                        imma == 0 && trap >= 1 && reg <= 124 && stack == 0 && local == 0,
+                        "sm_{sm} {name} IMMA={imma} TRAP={trap} REG={reg} STACK={stack} LOCAL={local}"
+                    );
+                    continue;
+                }
                 ensure!(
                     imma == 32 && lds == want_lds && ldsm == want_ldsm && barriers == 2,
                     "sm_{sm} {name} IMMA={imma} LDS={lds} LDSM={ldsm} BAR={barriers}"
                 );
                 let ldg = body.matches("LDG.E.CONSTANT").count();
                 ensure!(ldg == 20, "sm_{sm} {name} scale LDG.E.CONSTANT {ldg}");
-                let (reg, stack, local) = function_resources(&usage, name)
-                    .with_context(|| format!("sm_{sm} {name} resources"))?;
                 ensure!(
                     reg <= 124 && stack == 0 && local == 0,
                     "sm_{sm} {name} REG={reg} STACK={stack} LOCAL={local}"
@@ -3299,6 +3310,21 @@ mod device {
             println!(
                 "CONVROT_GROUP_DOT_SASS sm_{sm} LDG.E.128={ldg128} U16={u16} E64={e64} CONSTANT={constant} HMMA={hmma} LDSM2={ldsm2} LDSM4={ldsm4} MUFU={mufu} REG={reg} STACK={stack} LOCAL={local}"
             );
+            if sm < 80 {
+                let trap = ops.iter().filter(|op| **op == "BPT.TRAP").count();
+                ensure!(
+                    hmma == 0
+                        && trap >= 1
+                        && u16 == 0
+                        && e64 == 0
+                        && constant == 0
+                        && mufu == 0
+                        && stack == 0
+                        && local == 0,
+                    "sm_{sm} convrot_group_dot HMMA={hmma} TRAP={trap} U16={u16} E64={e64} CONSTANT={constant} MUFU={mufu} STACK={stack} LOCAL={local}"
+                );
+                continue;
+            }
             ensure!(
                 ldg128 >= 2
                     && u16 == 0

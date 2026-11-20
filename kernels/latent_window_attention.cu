@@ -128,10 +128,15 @@ __device__ __forceinline__ void latent_window_attention_core(
         const uint32_t b1 = key < slots ? lwa_bf16_pair(
             lwa_value(k_codes[key_row * head_dim + d + 8], k_scales[key_row * nblocks + (d + 8) / 32]),
             lwa_value(k_codes[key_row * head_dim + d + 9], k_scales[key_row * nblocks + (d + 9) / 32])) : 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        asm volatile("trap;" ::"f"(accum[0]), "f"(accum[1]), "f"(accum[2]), "f"(accum[3]), "r"(a0),
+                     "r"(a1), "r"(b0), "r"(b1));
+#else
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                      "{%0,%1,%2,%3}, {%4,%4,%5,%5}, {%6,%7}, {%0,%1,%2,%3};"
                      : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3])
                      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#endif
       }
       if (group == 0) {
         if (first + part * 2 < slots) s_scores[first + part * 2] = accum[0] * scale;
@@ -212,10 +217,15 @@ __device__ __forceinline__ void latent_window_attention_core(
           const uint32_t b1 = lwa_bf16_pair(
               key + 8 < hi ? lwa_value(k_codes[row8 * head_dim + column], k_scales[row8 * nblocks + column / 32]) : 0.0f,
               key + 9 < hi ? lwa_value(k_codes[row9 * head_dim + column], k_scales[row9 * nblocks + column / 32]) : 0.0f);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+          asm volatile("trap;" ::"f"(accum[0]), "f"(accum[1]), "f"(accum[2]), "f"(accum[3]),
+                       "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
           asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                        "{%0,%1,%2,%3}, {%4,%4,%5,%5}, {%6,%7}, {%0,%1,%2,%3};"
                        : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3])
                        : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#endif
         }
         if (group == 0) {
           s_acc[first + part * 2] = accum[0];

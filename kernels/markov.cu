@@ -89,22 +89,47 @@ __device__ __forceinline__ void ldsm_x2(unsigned (&r)[2], const void* p) {
 }
 __device__ __forceinline__ void mma_16816(float (&d)[4], const unsigned (&a)[4],
                                           const unsigned (&b)[2]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  asm volatile("trap;" ::"f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "r"(a[0]), "r"(a[1]),
+               "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
 }
 __device__ __forceinline__ void cp16(void* dst, const void* src, int sz) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  unsigned x = 0u, y = 0u, z = 0u, w = 0u;
+  if (sz == 16) {
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+                 : "l"(src));
+  }
+  asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(smem_u32(dst)), "r"(x), "r"(y),
+               "r"(z), "r"(w));
+#else
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                :: "r"(smem_u32(dst)), "l"(src), "r"(sz));
+#endif
 }
 __device__ __forceinline__ void cp_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  asm volatile("" ::: "memory");
+#else
   asm volatile("cp.async.commit_group;\n");
+#endif
 }
 template <int N>
 __device__ __forceinline__ void cp_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+  asm volatile("" ::"n"(N));
+  __syncthreads();
+#else
   asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
 }
 __device__ __forceinline__ void cp_wait0() { cp_wait<0>(); }
 

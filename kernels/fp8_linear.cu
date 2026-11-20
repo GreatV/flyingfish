@@ -108,10 +108,15 @@ __device__ __forceinline__ void fp8_block_mma(
             const uint32_t a3 = fp8_block_bf16(fp8_block_codes<2>(x, row_base + group + 8, inner + 8, m, k));
             const uint32_t b0 = fp8_block_bf16(fp8_block_codes<2>(w, col_base + group, inner, n, k));
             const uint32_t b1 = fp8_block_bf16(fp8_block_codes<2>(w, col_base + group, inner + 8, n, k));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+            asm volatile("trap;" ::"f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]), "r"(a0), "r"(a1),
+                         "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                          : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
         }
 #endif
         #pragma unroll

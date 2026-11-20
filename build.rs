@@ -47,9 +47,14 @@ fn compile_device(
         ] {
             command.env_remove(key);
         }
+        let rustflags = if sm < 80 {
+            format!("-C target-cpu=sm_{sm} --cfg ff_sm75")
+        } else {
+            format!("-C target-cpu=sm_{sm}")
+        };
         let result = command
             .env("CARGO_TARGET_DIR", &target)
-            .env("RUSTFLAGS", format!("-C target-cpu=sm_{sm}"))
+            .env("RUSTFLAGS", rustflags)
             .output()
             .expect("cannot run the installed device toolchain; see README prerequisites");
         assert!(
@@ -727,7 +732,12 @@ fn main() {
         "-DFLASHATTENTION_DISABLE_SOFTCAP",
         "-Ithird_party/cutlass/include",
     ]);
-    for sm in &archs {
+    let fa_archs: Vec<u32> = archs.iter().copied().filter(|sm| *sm >= 80).collect();
+    assert!(
+        !fa_archs.is_empty(),
+        "FA2 is sm80+; the build list has no sm80+ architecture"
+    );
+    for sm in &fa_archs {
         command
             .arg("--generate-code")
             .arg(format!("arch=compute_{sm},code=sm_{sm}"));
