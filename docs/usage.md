@@ -1,6 +1,6 @@
 # CLI usage by model
 
-`flyingfish` and `ff` take the same commands and options. Keep both binaries in the same directory. [models.md](models.md) lists supported models, weight formats and backends; commands below use the published model directories without converting their weights.
+`flyingfish` and `ff` take the same commands and options. Keep both binaries in the same directory. [models.md](models.md) lists supported models, weight formats and backends; commands below use the published model directories without converting their weights. [library.md](library.md) covers calling the engine from Rust.
 
 Replace `<model-dir>` and the other placeholders with your files and directories. Put `--model` before the command. EOU and Multitalker transcription take the actual `<model.nemo>` archive instead of a directory. Keep runtime data and output files outside model directories; output parent directories must exist, and media and text output files must not already exist.
 
@@ -44,6 +44,8 @@ The default is `~/.flyingfish`, created on first use. Override it with `--runtim
 | `-V`, `--version` | Root flag | Print version |
 
 Shared options other than `--model` can also follow the command. The CLI exposes generation and speculation options globally; media and speech commands use their family-specific request paths.
+
+For `video`, `image`, `speak`, `music`, `transcribe`, `diarize` and `embed`, default stderr contains progress and errors only, with timing fields hidden unless `--verbose` is enabled; other commands keep their existing diagnostics.
 
 ## Language and multimodal models
 
@@ -206,6 +208,8 @@ ff --model <Breeze-TTS-2-dir> speak "Hello, world." > <speech.wav>
 
 The positional `<TEXT>` is required; `-` reads UTF-8 text from stdin. `--seed <SEED>` defaults to `42`. `-o, --output <OUTPUT>` writes mono 24 kHz PCM16 WAV; omitted output writes WAV bytes to stdout. The command runs free-running text-to-speech with published-config sampling and seeded Philox draws, followed by audio tokenizer decode. Greedy decode over supplied audio-code frames remains available through the library.
 
+Sampling uses the plain `[S0]` prompt and the checkpoint's `generation_config.json`: temperature 0.9 for backbone and depth, top-k 50 and top-p 1.0 from the omitted library defaults, repetition penalty 1.1 on generated backbone codebook-0 tokens, at most 750 frames, and backbone EOS 2051.
+
 ## Media generation
 
 These commands use CUDA. Default stderr contains progress and errors only, with timing fields hidden unless `--verbose` is enabled. `--verbose` prints placement, Lt and decode-plan diagnostics.
@@ -315,9 +319,9 @@ Hi3D requires `--dino <DINOv2>`, `--clip <CLIP>` and `--mesh <PLY>`, a coarse me
 
 The result is a hole-filled, simplified and normalized mesh, and same-seed reruns are bit-stable.
 
-### Library-only image-to-3D entries
+### Idol
 
-Idol uses `flyingfish::backend::IdolPipelineRuntime`: a preprocessed 1024 px image to a Gaussian splat and a camera. It is not selected by the current `to-3d` command.
+Idol (a preprocessed 1024 px image to a Gaussian splat and a camera) is not selected by `to-3d`. Its `flyingfish::backend::IdolPipelineRuntime` is exported but cannot yet be opened from outside the crate; see [library.md](library.md).
 
 ## Inspection, verification and profiling commands
 
