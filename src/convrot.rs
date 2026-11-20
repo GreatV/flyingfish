@@ -511,6 +511,7 @@ pub struct ConvrotFns {
     group_dot_32: [crate::backend::gpu::CudaFunction; 2],
     quantize: crate::backend::gpu::CudaFunction,
     product: [crate::backend::gpu::CudaFunction; 3],
+    product_sm: i32,
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
     optin: usize,
@@ -855,6 +856,9 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
             module.load_function(GROUP_DOT_32_NAMES[1])?,
         ],
         quantize,
+        product_sm: product[1].get_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
+        )?,
         product,
         table: std::sync::Mutex::new(None),
         max_group,
@@ -929,7 +933,14 @@ pub(crate) fn launch_product(
     let (product, grid) = match args.product {
         ProductKernel::NFast => (&fns.product[0], (n, m, 1)),
         ProductKernel::MFastLdsm => (&fns.product[1], (m, n, 1)),
-        ProductKernel::MFastStriped { tiles, stripes } => (&fns.product[1], (tiles, n, stripes)),
+        ProductKernel::MFastStriped { tiles, stripes } => {
+            ensure!(
+                fns.product_sm == 120 && tiles > 0 && tiles <= m && stripes == m.div_ceil(tiles),
+                "ConvRot striped product sm={} m_tiles={m} tiles={tiles} stripes={stripes}",
+                fns.product_sm
+            );
+            (&fns.product[1], (tiles, n, stripes))
+        }
         ProductKernel::NFastLdsm => (&fns.product[2], (n, m, 1)),
     };
     unsafe {
