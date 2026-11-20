@@ -858,11 +858,7 @@ fn transcribe(cli: &Cli, args: &TranscribeArgs) -> Result<()> {
         }
         let options = flyingfish::RunOptions {
             device: cli.device,
-            runtime_dir: cli
-                .kernels
-                .runtime_dir
-                .clone()
-                .context("--runtime-dir is required for transcribe")?,
+            runtime_dir: cli.runtime_dir(),
             verbose: cli.verbose,
         };
         let bytes = if let Some(diar_model) = &args.diar_model {
@@ -988,11 +984,7 @@ fn diarize(cli: &Cli, args: &DiarizeArgs) -> Result<()> {
         );
         let options = flyingfish::RunOptions {
             device: cli.device,
-            runtime_dir: cli
-                .kernels
-                .runtime_dir
-                .clone()
-                .context("--runtime-dir is required for diarize")?,
+            runtime_dir: cli.runtime_dir(),
             verbose: cli.verbose,
         };
         let segments = flyingfish::diarization::diarize(
@@ -1037,11 +1029,7 @@ fn embed(cli: &Cli, args: &EmbedArgs) -> Result<()> {
         );
         let options = flyingfish::RunOptions {
             device: cli.device,
-            runtime_dir: cli
-                .kernels
-                .runtime_dir
-                .clone()
-                .context("--runtime-dir is required for embed")?,
+            runtime_dir: cli.runtime_dir(),
             verbose: cli.verbose,
         };
         let values = flyingfish::model::embed_text(&cli.model, &text, options)?;
@@ -1155,11 +1143,7 @@ fn prepare_image_request(request: ImageCliRequest) -> Result<flyingfish::minimax
 fn image_options(cli: &Cli) -> Result<flyingfish::minimax_h3::ImageRunOptions> {
     Ok(flyingfish::minimax_h3::ImageRunOptions {
         device: cli.device,
-        runtime_dir: cli
-            .kernels
-            .runtime_dir
-            .clone()
-            .context("--runtime-dir is required for image")?,
+        runtime_dir: cli.runtime_dir(),
     })
 }
 
@@ -1288,11 +1272,7 @@ fn speak(cli: &Cli, text: &str, seed: u64, output: Option<&Path>) -> Result<()> 
         };
         let options = flyingfish::RunOptions {
             device: cli.device,
-            runtime_dir: cli
-                .kernels
-                .runtime_dir
-                .clone()
-                .context("--runtime-dir is required for speak")?,
+            runtime_dir: cli.runtime_dir(),
             verbose: cli.verbose,
         };
         let speech = flyingfish::breeze::speak(&cli.model, &text, seed, options)?;
@@ -1339,11 +1319,7 @@ fn music(
         };
         let prompt_ids = flyingfish::music3::prompt_ids(&cli.model, prompt, &lyrics)?;
         let spec = flyingfish::music3::SynSpec::read(&cli.model)?;
-        let runtime_dir = cli
-            .kernels
-            .runtime_dir
-            .clone()
-            .context("--runtime-dir is required for music")?;
+        let runtime_dir = cli.runtime_dir();
         let result = flyingfish::music3::generate(
             &cli.model,
             &flyingfish::music3::Music3Request {
@@ -1426,11 +1402,7 @@ fn video(cli: &Cli) -> Result<()> {
         }
         let options = flyingfish::RunOptions {
             device: cli.device,
-            runtime_dir: cli
-                .kernels
-                .runtime_dir
-                .clone()
-                .context("--runtime-dir is required for video")?,
+            runtime_dir: cli.runtime_dir(),
             verbose: cli.verbose,
         };
         let generated = if let Some(base_model) = &base {
@@ -1559,9 +1531,34 @@ fn video(cli: &Cli) -> Result<()> {
     })
 }
 
+fn resolve_runtime_dir(given: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = given.filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(path);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".flyingfish")),
+        _ => bail!("HOME is unset or empty"),
+    }
+}
+
+impl Cli {
+    #[cfg(feature = "cuda")]
+    fn runtime_dir(&self) -> PathBuf {
+        self.kernels
+            .runtime_dir
+            .clone()
+            .expect("runtime directory resolved at startup")
+    }
+}
+
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
     normalize_budget(&mut cli);
+    let runtime_dir = resolve_runtime_dir(cli.kernels.runtime_dir.take())?;
+    if cli.verbose {
+        eprintln!("runtime_dir={}", runtime_dir.display());
+    }
+    cli.kernels.runtime_dir = Some(runtime_dir);
     cli.model = cli
         .model
         .canonicalize()
@@ -1649,11 +1646,7 @@ fn run() -> Result<()> {
             seed,
             output,
         } => {
-            let runtime_dir = cli
-                .kernels
-                .runtime_dir
-                .clone()
-                .context("--runtime-dir is required for to-3d")?;
+            let runtime_dir = cli.runtime_dir();
             // Model-class dispatch on the published configs: Hi3D ships a
             // diffusers-style model_index.json (Sparc3DPipeline); the Trellis2
             // pipelines ship pipeline.json, and Pixal3D's single-view pipeline
