@@ -3436,7 +3436,6 @@ mod tests {
         let reference_lse = reference_f64(&tensors, "lse")?;
         let mut buffers = case.buffers(stream)?;
         let mut op = case.binding(stream)?;
-        #[cfg(feature = "cuda")]
         if single_probability {
             op = op.with_full_single_probability()?;
         }
