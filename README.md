@@ -144,40 +144,40 @@ See [CLI usage by model](https://github.com/GreatV/flyingfish/blob/main/docs/usa
 
 ```sh
 # One-time per machine and model: measure kernels and transfer rates.
-ff --model <model-dir> --runtime-dir <dir> calibrate
+ff --model <model-dir> calibrate
 
 # Generate from a prompt.
-ff --model <model-dir> --runtime-dir <dir> generate --prompt "Hello" --max-new-tokens 64 --graph
+ff --model <model-dir> generate --prompt "Hello" --max-new-tokens 64 --graph
 
 # Transcribe a 16 kHz WAV (PCM16, PCM24 or F32) with duration-derived SRT cues.
-ff --model <parakeet-dir> --runtime-dir <dir> transcribe <clip.wav> --format srt
+ff --model <parakeet-dir> transcribe <clip.wav> --format srt
 
 # Write speaker segments as RTTM.
-ff --model <diarization-dir> --runtime-dir <dir> diarize <meeting.wav> -o <meeting.rttm>
+ff --model <diarization-dir> diarize <meeting.wav> -o <meeting.rttm>
 
 # Embed raw text as a 768-value JSON vector.
-ff --model <EmbeddingGemma-2-dir> --runtime-dir <dir> embed --text "a red cube"
+ff --model <EmbeddingGemma-2-dir> embed --text "a red cube"
 
 # OpenAI-compatible server: http://<host>:<port>/v1/completions and http://<host>:<port>/v1/chat/completions.
-ff --model <model-dir> --runtime-dir <dir> serve --port 8080
+ff --model <model-dir> serve --port 8080
 
 # Generate MiniMax-H3 video and audio from a keyframe.
-ff --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.mp4>
+ff --model <MiniMax-H3-dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.mp4>
 
 # Raw output: <out.y4m> and <out.wav>. Add --json to print output metadata as JSON.
-ff --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.y4m> --json
+ff --model <MiniMax-H3-dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.y4m> --json
 
 # Generate a MiniMax-H3-Image PNG, optionally with --expand or repeated --edit references.
-ff --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o <cube.png> --json
+ff --model <MiniMax-H3-Image-dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o <cube.png> --json
 
 # Synthesize Breeze-TTS-2 speech with the published sampling configuration.
-ff --model <Breeze-TTS-2-dir> --runtime-dir <dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o <speech.wav>
+ff --model <Breeze-TTS-2-dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o <speech.wav>
 
 # Generate MiniMax-Music3 stereo audio from a caption and lyrics.
-ff --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o <song.wav>
+ff --model <MiniMax-Music3-dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o <song.wav>
 
 # Generate HyperFlow video and audio; either keyframe option can be omitted.
-ff --model <HyperFlow-H3-Flash-dir> --runtime-dir <dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o <out.mp4>
+ff --model <HyperFlow-H3-Flash-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o <out.mp4>
 ```
 
 Common options:
@@ -187,7 +187,7 @@ Common options:
 - MiniMax-Music3 `music` requires a caption, lyrics and seed. `--frames` defaults to 1500 (60 seconds at 25 fps); output is stereo 44.1 kHz PCM16 WAV, or WAV bytes to stdout when `-o` is omitted.
 - Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video, image, speak, music, transcribe, diarize and embed default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
 - Breeze-TTS-2 `speak` uses the plain `[S0]` prompt and reads `<generation_config.json>`: temperature 0.9 for backbone and depth, top-k 50 and top-p 1.0 from the omitted library defaults, repetition penalty 1.1 on generated backbone codebook-0 tokens, at most 750 frames, and backbone EOS 2051. The default seed is 42. Output is mono 24 kHz PCM16 WAV; omit `-o` to write WAV bytes to stdout.
-- `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
+- The runtime directory defaults to `~/.flyingfish`. `--runtime-dir` or `FLYINGFISH_RUNTIME_DIR` overrides it. It must be outside any model directory, and no path component is named `models`.
 - `--draft-model <dir>` enables a DSpark draft model.
 - `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8, GLM-5.3-Flash); 0 selects plain decoding. GLM-5.3-Flash drafts one token per round at any nonzero depth. MTP decode is CUDA-only, so ROCm builds need `--mtp 0` for such checkpoints.
 - `--kv-format affine8` stores an 8-bit KV cache for long contexts. The default is `bf16`.
