@@ -22,9 +22,12 @@ use cudarc::driver::HostSlice;
 mod residency;
 pub(super) use residency::Prefill;
 pub(in crate::backend::cuda) use residency::Slots;
-pub(in crate::backend::cuda) use residency::{Events, ReadAhead, Reader};
 #[cfg(test)]
-pub(super) use residency::{PoolControl, delay_stream, group_route_stamps};
+pub(super) use residency::group_route_stamps;
+#[cfg(feature = "cuda")]
+pub(in crate::backend::cuda) use residency::{Events, ReadAhead, Reader};
+#[cfg(all(test, feature = "cuda"))]
+pub(super) use residency::{PoolControl, delay_stream};
 #[path = "engine_moe_graph.rs"]
 pub(super) mod graphs;
 

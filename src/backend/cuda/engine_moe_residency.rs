@@ -14,6 +14,7 @@ use std::cell::RefCell;
 #[path = "engine_moe_prefill.rs"]
 mod prefill;
 pub(in crate::backend::cuda::engine) use prefill::Prefill;
+#[cfg(feature = "cuda")]
 pub(in crate::backend::cuda) use prefill::ReadAhead;
 pub(super) use prefill::{cpu_bound, peer_prefill_bytes};
 
@@ -174,6 +175,7 @@ impl Reader {
         Ok(reader)
     }
 
+    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda) fn new_ranges(
         device: &Device,
         disk: DiskReader,
@@ -791,6 +793,7 @@ pub(in crate::backend::cuda::engine) fn delay_stream(stream: &Arc<CudaStream>) -
 }
 
 impl Slots {
+    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn load_joint(
         device: &Device,
         model: &crate::model_spec::ModelSpec,
@@ -889,6 +892,7 @@ impl Slots {
         Ok([target, suffix])
     }
 
+    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn prepare_shared_pool(
         &mut self,
         owner: &Self,
@@ -912,6 +916,7 @@ impl Slots {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn with_shared_pool<T>(
         &mut self,
         owner: &mut Self,
@@ -2036,7 +2041,7 @@ impl Slots {
         Ok(count)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub fn can_native_dispatch(&self, layer: u32) -> bool {
         !self.streamed.get(layer as usize).copied().unwrap_or(false)
             || self

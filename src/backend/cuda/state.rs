@@ -651,6 +651,7 @@ impl LatentCompressedState {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn enable_prefixes(&mut self, rows: usize, s: &Arc<CudaStream>) -> Result<()> {
         ensure!(
             (1..=4).contains(&rows) && rows <= self.rows,
@@ -815,6 +816,7 @@ pub struct StateStore {
     kv_rings: Vec<usize>,
 }
 impl StateStore {
+    #[cfg(feature = "cuda")]
     pub(crate) fn empty(capacity: usize) -> Result<Self> {
         ensure!(capacity > 0, "empty state requires a positive capacity");
         Ok(Self {
@@ -1640,6 +1642,7 @@ impl StateCheckpoint {
         stream.memcpy_dtod(&self.token, token)?;
         Ok(())
     }
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn select_prefix(
         &self,
         store: &mut StateStore,

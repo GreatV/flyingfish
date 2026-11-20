@@ -34,6 +34,7 @@ pub struct BlockRoutePlan {
 }
 
 impl BlockRoutePlan {
+    #[cfg(feature = "cuda")]
     pub(crate) fn causal_rows(&self, ctx: &Arc<CudaContext>, rows: u32) -> Result<Self> {
         ensure!(
             self.top_p.is_none() && rows > 0 && rows <= self.rows as u32,
@@ -187,6 +188,7 @@ impl BlockRoutePlan {
 /// Affine-prescaled block router call: x [rows, hidden] residual rows,
 /// scale [hidden], proj [experts, hidden], per_expert [experts]; outputs
 /// ids/weights [rows, top_k] with prescaled/logits caller scratch.
+#[cfg(feature = "cuda")]
 pub(crate) struct DiffusionRoute<'a> {
     pub x: &'a CudaSlice<bf16>,
     pub scale: &'a CudaSlice<bf16>,
@@ -205,8 +207,11 @@ pub(crate) struct DiffusionRoute<'a> {
 pub(crate) struct RouteOps {
     decode: CudaFunction,
     launch: Vec<(u32, LaunchConfig)>,
+    #[cfg(feature = "cuda")]
     prescale: CudaFunction,
+    #[cfg(feature = "cuda")]
     logits_bf16: CudaFunction,
+    #[cfg(feature = "cuda")]
     topk_scale: CudaFunction,
     completed: CudaSlice<u32>,
     experts: u32,
@@ -327,8 +332,11 @@ impl RouteOps {
         Ok(Self {
             decode,
             launch,
+            #[cfg(feature = "cuda")]
             prescale: module.load_function("moe_route_prescale_bf16")?,
+            #[cfg(feature = "cuda")]
             logits_bf16: module.load_function("moe_route_logits_bf16")?,
+            #[cfg(feature = "cuda")]
             topk_scale: module.load_function("moe_route_topk_softmax_scale_f32")?,
             completed: stream.alloc_zeros(max_rows)?,
             experts,
@@ -346,6 +354,7 @@ impl RouteOps {
         })
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn allocation_bytes(&self) -> usize {
         #[cfg(feature = "cuda")]
         let lt = if self.logits_gemm.is_some() {
@@ -361,6 +370,7 @@ impl RouteOps {
     /// Affine-prescaled block router: weightless RMS x per-dimension scale
     /// x hidden^-0.5, BF16 logits GEMM, FP32 softmax top-k renormalised and
     /// scaled per expert. `prescaled` and `logits` are caller scratch.
+    #[cfg(feature = "cuda")]
     pub fn diffusion_topk(&self, stream: &Arc<CudaStream>, call: DiffusionRoute<'_>) -> Result<()> {
         let DiffusionRoute {
             x,

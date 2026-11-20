@@ -1005,17 +1005,17 @@ pub struct EngramService {
     generation: Arc<AtomicU64>,
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct HistoryCheckpoint {
     values: Vec<(i64, bool)>,
     start: usize,
     rows: usize,
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[cfg(feature = "cuda")]
     generation: u64,
     valid: bool,
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", test))]
 impl HistoryCheckpoint {
     pub(crate) fn new(rows: usize) -> Result<Self> {
         ensure!((1..=4).contains(&rows), "engram checkpoint row capacity");
@@ -1023,7 +1023,7 @@ impl HistoryCheckpoint {
             values: vec![(0, false); rows],
             start: 0,
             rows: 0,
-            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            #[cfg(feature = "cuda")]
             generation: 0,
             valid: false,
         })
@@ -1067,7 +1067,7 @@ impl HistoryCheckpoint {
 }
 
 impl EngramService {
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[cfg(feature = "cuda")]
     pub(crate) fn save_history(
         &self,
         checkpoint: &mut HistoryCheckpoint,
@@ -1079,7 +1079,7 @@ impl EngramService {
         Ok(())
     }
 
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[cfg(feature = "cuda")]
     pub(crate) fn select_history(
         &mut self,
         checkpoint: &mut HistoryCheckpoint,

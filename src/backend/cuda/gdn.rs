@@ -85,6 +85,7 @@ pub enum GdnBlockMode {
 }
 
 pub struct GdnBlockPlan {
+    #[cfg(feature = "cuda")]
     spec: GdnSpec,
     bindings: GdnBlockBindings,
     mode: GdnBlockMode,
@@ -214,6 +215,7 @@ impl GdnBlockPlan {
             );
         }
         Ok(Self {
+            #[cfg(feature = "cuda")]
             spec,
             bindings,
             mode,
@@ -225,6 +227,7 @@ impl GdnBlockPlan {
         })
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn causal_rows(&self, ctx: &Arc<CudaContext>, rows: u32) -> Result<Self> {
         ensure!(
             rows > 0 && rows <= self.bindings.qkv.shape[0],

@@ -1,7 +1,7 @@
 //! Vision weights, patch/position preparation, and image-feature splice for Engine.
-use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
-};
+#[cfg(feature = "cuda")]
+use crate::backend::gpu::LaunchConfig;
+use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use crate::{
     backend::cuda::{
         Device,
@@ -1854,7 +1854,7 @@ struct BlockRun<'a> {
 
 impl LayerNormTower {
     /// Moves every deepstack tap one encoder block later.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn shift_deepstack_taps(&mut self) -> Result<()> {
         let taps = self
             .geometry
@@ -3925,7 +3925,9 @@ struct SafetensorsLoader<'a> {
     loaded_tensors: usize,
     loaded_elements: usize,
     runtime_bytes: usize,
+    #[cfg(feature = "cuda")]
     f16_tensors: usize,
+    #[cfg(feature = "cuda")]
     f16_bytes: usize,
     f32_tensors: usize,
     f32_bytes: usize,
@@ -3941,7 +3943,9 @@ impl<'a> SafetensorsLoader<'a> {
             loaded_tensors: 0,
             loaded_elements: 0,
             runtime_bytes: 0,
+            #[cfg(feature = "cuda")]
             f16_tensors: 0,
+            #[cfg(feature = "cuda")]
             f16_bytes: 0,
             f32_tensors: 0,
             f32_bytes: 0,
@@ -4133,9 +4137,11 @@ impl<'a> SafetensorsLoader<'a> {
         self.loaded_tensors += 1;
         self.loaded_elements += host.len();
         self.runtime_bytes += host.len() * size_of::<T>();
-        Ok(s.clone_htod(&host)?)
+        let dev = s.clone_htod(&host)?;
+        Ok(dev)
     }
 
+    #[cfg(feature = "cuda")]
     fn take_f16(
         &mut self,
         s: &Arc<CudaStream>,
@@ -4175,7 +4181,8 @@ impl<'a> SafetensorsLoader<'a> {
         self.runtime_bytes += bytes;
         self.f16_tensors += 1;
         self.f16_bytes += bytes;
-        Ok(s.clone_htod(&host)?)
+        let dev = s.clone_htod(&host)?;
+        Ok(dev)
     }
 
     fn take_f32_host(&mut self, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
@@ -4210,6 +4217,7 @@ impl<'a> SafetensorsLoader<'a> {
         Ok(host)
     }
 
+    #[cfg(feature = "cuda")]
     fn take_f32(
         &mut self,
         s: &Arc<CudaStream>,
@@ -4217,7 +4225,8 @@ impl<'a> SafetensorsLoader<'a> {
         expected_shape: &[usize],
     ) -> Result<CudaSlice<f32>> {
         let host = self.take_f32_host(name, expected_shape)?;
-        Ok(s.clone_htod(&host)?)
+        let dev = s.clone_htod(&host)?;
+        Ok(dev)
     }
 
     fn remove_unused(&mut self, name: &str, expected_shape: &[usize]) -> Result<()> {
@@ -4287,6 +4296,7 @@ impl<T: DinoScalar> UnbiasedWeight<T> {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl UnbiasedWeight<f32> {
     fn load_f32(
         loader: &mut SafetensorsLoader<'_>,
@@ -4305,6 +4315,7 @@ impl UnbiasedWeight<f32> {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl BiasedWeight<half::f16> {
     fn load_f16(
         loader: &mut SafetensorsLoader<'_>,
@@ -4349,6 +4360,7 @@ impl BiasedWeight<half::f16> {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl BiasedWeight<f32> {
     fn load_f32(
         loader: &mut SafetensorsLoader<'_>,
@@ -4372,6 +4384,7 @@ impl BiasedWeight<f32> {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl AffineWeights<f32> {
     fn load_f32(
         loader: &mut SafetensorsLoader<'_>,
@@ -6178,6 +6191,7 @@ impl Flux2VaeEncoder {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolVisionEncoderRuntime {
     pub dinov3: DinoV3Encoder,
     pub dinov3_ws: DinoV3Workspace,
@@ -6185,6 +6199,7 @@ pub struct IdolVisionEncoderRuntime {
     pub vae_ws: Flux2VaeWorkspace,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolVisionEncoderRuntime {
     /// Device bytes `load` holds before the VAE im2col strip: BF16 weights (2 B per loaded element) and the
     /// DINOv3 and FLUX.2 VAE fixed workspaces.
@@ -7959,6 +7974,7 @@ impl PixalConditioningRuntime {
     }
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct IdolDenoiserArgs {
     pub q_token_length: u32,
@@ -7973,12 +7989,14 @@ pub struct IdolDenoiserArgs {
     pub mlp_ratio: u32,
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct IdolComponentSpec<T> {
     pub name: String,
     pub args: T,
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct IdolOctreeDecoderArgs {
     pub model_channels: u32,
@@ -7988,6 +8006,7 @@ pub struct IdolOctreeDecoderArgs {
     pub mlp_ratio: u32,
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct IdolGsLrConfig {
     #[serde(rename = "_xyz")]
@@ -8002,6 +8021,7 @@ pub struct IdolGsLrConfig {
     pub rotation: f32,
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct IdolGsRepConfig {
     pub num_gaussians: usize,
@@ -8013,6 +8033,7 @@ pub struct IdolGsRepConfig {
     pub opacity_bias: f32,
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct IdolGaussianDecoderArgs {
     pub in_channels: u32,
@@ -8024,6 +8045,7 @@ pub struct IdolGaussianDecoderArgs {
     pub representation_config: IdolGsRepConfig,
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct IdolConfig {
     pub denoiser: IdolComponentSpec<IdolDenoiserArgs>,
@@ -8033,6 +8055,7 @@ pub struct IdolConfig {
     pub max_voxel_level: u32,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolConfig {
     pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
         let cfg: Self = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
@@ -8071,6 +8094,7 @@ impl IdolConfig {
 }
 
 /// Grid of `row_modulate*` / `row_gated_add*`: one row per block row, `ceil(dim / 256)` column blocks of 256 threads.
+#[cfg(feature = "cuda")]
 fn row_grid(rows: u32, dim: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (rows, dim.div_ceil(256), 1),
@@ -8079,6 +8103,7 @@ fn row_grid(rows: u32, dim: u32) -> LaunchConfig {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct IdolRepoLayer {
     norm: AffineWeights<f32>,
     gate_map: UnbiasedWeight<f32>,
@@ -8088,6 +8113,7 @@ struct IdolRepoLayer {
     freqs: CudaSlice<f32>,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolRepoLayer {
     fn load(loader: &mut SafetensorsLoader<'_>, s: &Arc<CudaStream>, prefix: &str) -> Result<Self> {
         Ok(Self {
@@ -8122,6 +8148,7 @@ impl IdolRepoLayer {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct IdolUnifiedBlock {
     shift_table: Option<CudaSlice<f32>>,
     norm1: Option<AffineWeights<f32>>,
@@ -8134,6 +8161,7 @@ struct IdolUnifiedBlock {
     mlp2: BiasedWeight<half::f16>,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolUnifiedBlock {
     fn load(
         loader: &mut SafetensorsLoader<'_>,
@@ -8198,6 +8226,7 @@ impl IdolUnifiedBlock {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct IdolSharedKernels {
     bias_f16: CudaFunction,
     ln_f16: CudaFunction,
@@ -8223,6 +8252,7 @@ struct IdolSharedKernels {
     philox_normal_bf16: CudaFunction,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolSharedKernels {
     fn new(device: &Device) -> Result<Self> {
         let vis = cubin::module(&device.ctx, "vision_ops")?;
@@ -8331,6 +8361,7 @@ impl IdolSharedKernels {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolDenoiserWorkspace {
     pub cfg_batch: usize,
     latent_in_f32: CudaSlice<f32>,
@@ -8370,6 +8401,7 @@ pub struct IdolDenoiserWorkspace {
     prefill_f16: Flash,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolDenoiserWorkspace {
     pub fn byte_size(b: usize) -> usize {
         let l_lat = 8192usize;
@@ -8414,6 +8446,7 @@ impl IdolDenoiserWorkspace {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolDenoiser {
     pub args: IdolDenoiserArgs,
     pub weight_bytes: usize,
@@ -8439,6 +8472,7 @@ pub struct IdolDenoiser {
     kernels: IdolSharedKernels,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolDenoiser {
     pub fn load(
         device: &Device,
@@ -9456,6 +9490,7 @@ impl IdolDenoiser {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolFlowTrajectory {
     pub step0_latent: Vec<f32>,
     pub step0_camera: Vec<f32>,
@@ -9467,6 +9502,7 @@ pub struct IdolFlowTrajectory {
     pub step49_camera: Vec<f32>,
 }
 
+#[cfg(feature = "cuda")]
 struct IdolCrossOnlyBlock {
     to_q: BiasedWeight<half::f16>,
     to_kv: BiasedWeight<half::f16>,
@@ -9477,6 +9513,7 @@ struct IdolCrossOnlyBlock {
     mlp2: BiasedWeight<half::f16>,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolCrossOnlyBlock {
     fn load(loader: &mut SafetensorsLoader<'_>, s: &Arc<CudaStream>, prefix: &str) -> Result<Self> {
         Ok(Self {
@@ -9524,6 +9561,7 @@ impl IdolCrossOnlyBlock {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolOctreeWorkspace {
     cond_in_f32: CudaSlice<f32>,
     context_f16: CudaSlice<half::f16>,
@@ -9551,6 +9589,7 @@ pub struct IdolOctreeWorkspace {
     prefill_f16: Flash,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolOctreeWorkspace {
     pub fn byte_size() -> usize {
         let n_max = 8192usize;
@@ -9581,6 +9620,7 @@ impl IdolOctreeWorkspace {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolOctreeDecoder {
     pub args: IdolOctreeDecoderArgs,
     pub weight_bytes: usize,
@@ -9596,6 +9636,7 @@ pub struct IdolOctreeDecoder {
     kernels: IdolSharedKernels,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolOctreeDecoder {
     pub fn load(
         device: &Device,
@@ -10243,6 +10284,7 @@ impl IdolOctreeDecoder {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct IdolCrossBlock {
     self_qkv: BiasedWeight<half::f16>,
     self_q_norm: CudaSlice<f32>,
@@ -10258,6 +10300,7 @@ struct IdolCrossBlock {
     mlp2: BiasedWeight<half::f16>,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolCrossBlock {
     fn load(loader: &mut SafetensorsLoader<'_>, s: &Arc<CudaStream>, prefix: &str) -> Result<Self> {
         Ok(Self {
@@ -10328,6 +10371,7 @@ impl IdolCrossBlock {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolGaussianWorkspace {
     cond_in_f32: CudaSlice<f32>,
     context_f16: CudaSlice<half::f16>,
@@ -10350,6 +10394,7 @@ pub struct IdolGaussianWorkspace {
     prefill_f16: Flash,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolGaussianWorkspace {
     pub fn byte_size() -> usize {
         let n = 8192usize;
@@ -10371,6 +10416,7 @@ impl IdolGaussianWorkspace {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolGaussianSplat {
     pub xyz: Vec<f32>,
     pub features_dc: Vec<f32>,
@@ -10380,6 +10426,7 @@ pub struct IdolGaussianSplat {
     pub ply_mat: Vec<f32>,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolGaussianSplat {
     pub fn save_ply(&self, path: &std::path::Path) -> Result<()> {
         let n_verts = self.xyz.len() / 3;
@@ -10401,6 +10448,7 @@ impl IdolGaussianSplat {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolGaussianDecoder {
     pub args: IdolGaussianDecoderArgs,
     pub weight_bytes: usize,
@@ -10414,6 +10462,7 @@ pub struct IdolGaussianDecoder {
     kernels: IdolSharedKernels,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolGaussianDecoder {
     pub fn load(
         device: &Device,
@@ -10913,6 +10962,7 @@ impl IdolGaussianDecoder {
     }
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug)]
 pub struct IdolCamera {
     pub yaw: f64,
@@ -10921,6 +10971,7 @@ pub struct IdolCamera {
     pub fov: f64,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolCamera {
     pub fn from_raw(cam: &[f32]) -> Result<Self> {
         ensure!(
@@ -10959,6 +11010,7 @@ impl IdolCamera {
 /// Device bytes the Idol denoiser, octree decoder and Gaussian decoder loaders hold for one F32 checkpoint: the
 /// attention and MLP linears (weight and bias) of the block stacks (`blocks.N`, `context_refiner.N`,
 /// `noise_refiner.N`) are F16, every other tensor stays F32.
+#[cfg(feature = "cuda")]
 fn idol_resident_bytes(checkpoint: &[u8]) -> Result<usize> {
     let st = safetensors::SafeTensors::deserialize(checkpoint)?;
     let mut bytes = 0usize;
@@ -10979,6 +11031,7 @@ fn idol_resident_bytes(checkpoint: &[u8]) -> Result<usize> {
     Ok(bytes)
 }
 
+#[cfg(feature = "cuda")]
 pub struct IdolPipelineRuntime {
     pub cfg: IdolConfig,
     pub vision: IdolVisionEncoderRuntime,
@@ -10990,6 +11043,7 @@ pub struct IdolPipelineRuntime {
     pub gaussian_ws: IdolGaussianWorkspace,
 }
 
+#[cfg(feature = "cuda")]
 impl IdolPipelineRuntime {
     pub fn open(
         device: &Device,
@@ -13723,6 +13777,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn decode_rgb_png_chw_f32(path: &std::path::Path, side: usize) -> Result<Vec<f32>> {
         let bytes = std::fs::read(path)?;
         let decoded = crate::serve::image::decode_image(&bytes, None)?;
@@ -13744,10 +13799,12 @@ mod tests {
         Ok(chw)
     }
 
+    #[cfg(feature = "cuda")]
     fn max_abs_and_rmse(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
         crate::verify::max_abs_rmse("vision.metric", actual, expected)
     }
 
+    #[cfg(feature = "cuda")]
     fn read_f32_tensor(st: &safetensors::SafeTensors<'_>, key: &str) -> Result<Vec<f32>> {
         let v = st.tensor(key)?;
         ensure!(
@@ -13763,6 +13820,7 @@ mod tests {
             .collect())
     }
 
+    #[cfg(feature = "cuda")]
     fn read_bf16_tensor(st: &safetensors::SafeTensors<'_>, key: &str) -> Result<Vec<bf16>> {
         let v = st.tensor(key)?;
         ensure!(
@@ -13778,6 +13836,7 @@ mod tests {
             .collect())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires local GPU window and FF_DINOV3_MODEL, FF_FLUX2_VAE_MODEL, FF_IDOL_FIXTURE_DIR, FF_IDOL_THRESHOLDS"]
     fn dinov3_and_flux2_vae_match_definition_gpu() -> Result<()> {
@@ -15174,6 +15233,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn read_i64_tensor(st: &safetensors::SafeTensors<'_>, key: &str) -> Result<Vec<i64>> {
         let v = st.tensor(key)?;
         ensure!(
@@ -15189,10 +15249,12 @@ mod tests {
             .collect())
     }
 
+    #[cfg(feature = "cuda")]
     struct KdTree3d {
         pts: Vec<[f64; 3]>,
     }
 
+    #[cfg(feature = "cuda")]
     impl KdTree3d {
         fn build(flat_xyz: &[f32]) -> Self {
             let mut pts: Vec<[f64; 3]> = flat_xyz
@@ -15256,6 +15318,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn anchor_means_from_xyz(xyz: &[f32]) -> Vec<f32> {
         let mut out = Vec::with_capacity(8192 * 3);
         for a in 0..8192 {
@@ -15275,6 +15338,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "cuda")]
     fn coarse_tv_from_xyz(xyz_a: &[f32], xyz_b: &[f32], grid_res: usize) -> f64 {
         let anc_a = anchor_means_from_xyz(xyz_a);
         let anc_b = anchor_means_from_xyz(xyz_b);
@@ -15300,6 +15364,7 @@ mod tests {
         0.5 * l1 / 8192.0
     }
 
+    #[cfg(feature = "cuda")]
     fn chamfer_l2_and_rms(xyz_a: &[f32], xyz_b: &[f32]) -> (f64, f64) {
         let tree_b = KdTree3d::build(xyz_b);
         let tree_a = KdTree3d::build(xyz_a);
@@ -15324,6 +15389,7 @@ mod tests {
         (chamfer_l2, chamfer_rms)
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires local GPU window and FF_IDOL_MODEL, FF_DINOV3_MODEL, FF_FLUX2_VAE_MODEL, FF_IDOL_FIXTURE_DIR, FF_IDOL_THRESHOLDS"]
     fn idol_m3_gates_and_e2e_match_definition_gpu() -> Result<()> {

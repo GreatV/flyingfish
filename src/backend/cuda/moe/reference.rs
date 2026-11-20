@@ -705,6 +705,7 @@ impl CloverMoeFixture {
         })
     }
 
+    #[cfg(feature = "cuda")]
     pub fn archive(&self) -> Result<safetensors::SafeTensors<'_>> {
         Ok(safetensors::SafeTensors::deserialize(&self.bytes)?)
     }

@@ -54,7 +54,7 @@ pub(crate) fn dense_prompt_bytes(
         .context("dense prefill prompt buffer extent overflow")
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize) -> Result<usize> {
     ensure!(
         start == expected && rows > 0,

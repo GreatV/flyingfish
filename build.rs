@@ -207,6 +207,8 @@ const ROCM_KERNELS: &[&str] = &[
     "markov",
     "tree/meta",
     "tree/tree_rope_kv",
+    "flow",
+    "modulate",
 ];
 
 fn wave32_rdna_arch(arch: &str) -> bool {

@@ -944,13 +944,13 @@ extern "C" __global__ void weight_norm_fold_f32(const float* __restrict__ g,
     }
     __shared__ float scratch[8];
     for (int delta = 16; delta; delta /= 2)
-        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+        sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
     if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = sum;
     __syncthreads();
     sum = threadIdx.x < 8 ? scratch[threadIdx.x] : 0.0f;
     if (threadIdx.x < 32) {
         for (int delta = 16; delta; delta /= 2)
-            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+            sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
         if (threadIdx.x == 0) scratch[0] = sum;
     }
     __syncthreads();
@@ -1520,13 +1520,13 @@ extern "C" __global__ void weight_norm_fold_bf16(const __nv_bfloat16* __restrict
     }
     __shared__ float scratch[8];
     for (int delta = 16; delta; delta /= 2)
-        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+        sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
     if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = sum;
     __syncthreads();
     sum = threadIdx.x < 8 ? scratch[threadIdx.x] : 0.0f;
     if (threadIdx.x < 32) {
         for (int delta = 16; delta; delta /= 2)
-            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+            sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
         if (threadIdx.x == 0) scratch[0] = sum;
     }
     __syncthreads();

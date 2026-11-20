@@ -818,7 +818,7 @@ impl StagedDraft {
         Ok(output)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn resident(
         path: &Path,
         d: &Device,
@@ -891,6 +891,7 @@ impl StagedDraft {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda) fn bind_slots(
         &mut self,
         slots: super::super::moe::Slots,
@@ -1888,6 +1889,7 @@ impl StagedDraft {
         self.proposals()
     }
 
+    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda) fn propose_joint(
         &mut self,
         owner: &mut super::super::moe::Slots,

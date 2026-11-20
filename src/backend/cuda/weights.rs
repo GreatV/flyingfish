@@ -1,15 +1,18 @@
 use super::Device;
-use crate::backend::gpu::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, PushKernelArg,
-};
+use crate::backend::gpu::{CudaContext, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
+#[cfg(feature = "cuda")]
+use crate::backend::gpu::{CudaFunction, PushKernelArg};
 use crate::config::Config;
 use crate::experts::{
     arena::{HostBlocks, SlotLayout},
     catalogue::ExpertGeometry,
     plan::Capacity,
 };
+#[cfg(feature = "cuda")]
 use crate::gguf::GgmlType;
-use anyhow::{Context, Result, bail, ensure};
+#[cfg(feature = "cuda")]
+use anyhow::bail;
+use anyhow::{Context, Result, ensure};
 #[cfg(feature = "cuda")]
 use cudarc::driver::sys;
 use half::bf16;
@@ -115,11 +118,6 @@ fn slice_stream(s: &CudaSlice<bf16>) -> &Arc<CudaStream> {
     s.stream()
 }
 
-#[cfg(feature = "rocm")]
-fn slice_stream(s: &CudaSlice<bf16>) -> &Arc<CudaStream> {
-    s.stream()
-}
-
 fn classic_order(
     dir: &Path,
     spec: &crate::model_spec::ModelSpec,
@@ -202,9 +200,11 @@ fn emit_classic_resident(
 
 pub(crate) struct ClassicCatalog {
     order: Vec<Vec<String>>,
+    #[cfg(feature = "cuda")]
     bindings: Vec<ClassicLayer>,
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) struct ClassicLayer {
     pub qkv: super::linear::LinearWeightRef,
     pub o: super::linear::LinearWeightRef,
@@ -300,12 +300,14 @@ pub(crate) struct LoopvlVisionWeights {
 
 /// MiniMax-Music3 synthesis weights, all F32 as published (raw byte slices;
 /// the engine reinterprets them as f32 at setup).
+#[cfg(feature = "cuda")]
 pub struct Music3SynWeights {
     pub flow: Music3FlowWeights,
     pub cond: Music3CondWeights,
     pub vocoder: Music3VocoderWeights,
 }
 
+#[cfg(feature = "cuda")]
 pub struct Music3FlowWeights {
     pub blocks: Vec<Music3FlowBlock>,
     /// k=1 conv over the concat channels, stored [out, in].
@@ -321,6 +323,7 @@ pub struct Music3FlowWeights {
     pub time_l2_b: CudaSlice<u8>,
 }
 
+#[cfg(feature = "cuda")]
 pub struct Music3FlowBlock {
     pub to_q: CudaSlice<u8>,
     pub to_k: CudaSlice<u8>,
@@ -336,6 +339,7 @@ pub struct Music3FlowBlock {
     pub ff_out_b: CudaSlice<u8>,
 }
 
+#[cfg(feature = "cuda")]
 pub struct Music3CondWeights {
     /// Conv1d k=3 over the fused condition layers, stored [out, in, 3].
     pub proj_w: CudaSlice<u8>,
@@ -344,6 +348,7 @@ pub struct Music3CondWeights {
     pub layer_scale: CudaSlice<u8>,
 }
 
+#[cfg(feature = "cuda")]
 pub struct Music3VocoderWeights {
     pub dec_in_proj_w: CudaSlice<u8>,
     pub dec_in_proj_b: CudaSlice<u8>,
@@ -357,6 +362,7 @@ pub struct Music3VocoderWeights {
     pub conv_out_b: CudaSlice<u8>,
 }
 
+#[cfg(feature = "cuda")]
 pub struct Music3VocoderBlock {
     pub snake1_alpha: CudaSlice<u8>,
     /// Weight-norm transposed conv: g [out, 1, 1], v [in, out, kernel].
@@ -367,6 +373,7 @@ pub struct Music3VocoderBlock {
     pub units: Vec<Music3VocoderResUnit>,
 }
 
+#[cfg(feature = "cuda")]
 pub struct Music3VocoderResUnit {
     pub snake1_alpha: CudaSlice<u8>,
     pub snake2_alpha: CudaSlice<u8>,
@@ -390,6 +397,7 @@ pub struct ExpertStorage {
     registered: bool,
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) struct CohortStorage {
     storage: ExpertStorage,
     policy: crate::experts::runtime::Residency,
@@ -404,6 +412,7 @@ pub(crate) struct CohortStorage {
     staging: u32,
 }
 
+#[cfg(feature = "cuda")]
 impl CohortStorage {
     pub(crate) fn load(
         device: &Device,
@@ -1438,6 +1447,7 @@ impl LoopvlVisionWeights {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Music3SynWeights {
     pub(crate) fn load(dir: &Path, spec: &crate::music3::SynSpec, d: &Device) -> Result<Self> {
         let dim = spec.flow_dim() as usize;
@@ -1689,6 +1699,7 @@ impl Loader<'_> {
         dst.handoff(&self.compute)?;
         Ok(dst)
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn load_bytes_bf16_from_f32(
         &mut self,
         name: &str,
@@ -3091,6 +3102,7 @@ impl WeightCatalog {
             .map_or(0, |classic| classic.order.len())
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn classic_layer(&self, layer: usize) -> Result<&ClassicLayer> {
         self.classic
             .as_ref()
@@ -3098,6 +3110,7 @@ impl WeightCatalog {
             .with_context(|| format!("classic layer {layer} binding missing"))
     }
 
+    #[cfg(feature = "cuda")]
     fn classic_norm_view(
         &self,
         layer: usize,
@@ -3109,6 +3122,7 @@ impl WeightCatalog {
         super::contracts::view(weight, stream, 0, [elements], [1])
     }
 
+    #[cfg(feature = "cuda")]
     fn bind_classic(mut self, stream: &Arc<CudaStream>) -> Result<Self> {
         let bindings = (0..self.classic_layers())
             .map(|layer| self.classic_binding(layer, stream))
@@ -3119,6 +3133,7 @@ impl WeightCatalog {
         Ok(self)
     }
 
+    #[cfg(feature = "cuda")]
     fn classic_weight(
         &self,
         name: &str,
@@ -3172,6 +3187,7 @@ impl WeightCatalog {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn classic_binding(&self, layer: usize, stream: &Arc<CudaStream>) -> Result<ClassicLayer> {
         let order = self
             .classic
@@ -3362,8 +3378,8 @@ impl WeightCatalog {
                 }})
             );
         }
-        Self {
-            #[cfg(feature = "cuda")]
+        #[cfg(feature = "cuda")]
+        let catalog = Self {
             dense: None,
             classic: classic.map(|order| ClassicCatalog {
                 order,
@@ -3373,14 +3389,24 @@ impl WeightCatalog {
             tensors,
             manifest,
             bytes,
-            #[cfg(feature = "cuda")]
             upload_content_sha256: upload_digest.as_ref().map(|x| x.1.clone()),
             upload_hashed_bytes: upload_digest.map(|x| x.0),
             load_wall_ms,
-        }
-        .bind_classic(&d.stream)
+        };
+        #[cfg(feature = "cuda")]
+        return catalog.bind_classic(&d.stream);
+        #[cfg(not(feature = "cuda"))]
+        Ok(Self {
+            classic: classic.map(|order| ClassicCatalog { order }),
+            linear_format: spec.linear_format,
+            tensors,
+            manifest,
+            bytes,
+            upload_hashed_bytes: upload_digest.map(|x| x.0),
+            load_wall_ms,
+        })
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn bf16_mut(&mut self, name: &str) -> Result<&mut CudaSlice<bf16>> {
         match self.tensors.get_mut(name) {
             Some(StoredTensor::Bf16(v)) => Ok(v),
@@ -3395,6 +3421,7 @@ impl WeightCatalog {
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn matrix(
         &self,
         stream: &Arc<CudaStream>,
@@ -3445,6 +3472,7 @@ impl WeightCatalog {
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn vector(
         &self,
         stream: &Arc<CudaStream>,
@@ -4423,6 +4451,7 @@ mod tests {
         assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn quantized_device_slot_and_source_finite_checks() {
         let entry = |shape: Vec<usize>, bytes: usize, quant: Option<GgmlType>| TensorEntry {
@@ -4688,6 +4717,7 @@ LOOP:
 /// layers pack q|k and derive V from the shared projection (k_eq_v). Experts
 /// hold the fused [experts, 2*inter, hidden] / [experts, hidden, inter] form
 /// of the checkpoint, device-resident.
+#[cfg(feature = "cuda")]
 pub(crate) struct DiffusionLayer {
     pub qkv: CudaSlice<bf16>,
     pub q_norm: CudaSlice<bf16>,
@@ -4708,6 +4738,7 @@ pub(crate) struct DiffusionLayer {
     pub layer_scalar: CudaSlice<bf16>,
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) struct DiffusionWeights {
     pub embed: CudaSlice<bf16>,
     pub final_norm: CudaSlice<bf16>,
@@ -4718,6 +4749,7 @@ pub(crate) struct DiffusionWeights {
     pub sc_down: CudaSlice<bf16>,
 }
 
+#[cfg(feature = "cuda")]
 impl DiffusionWeights {
     pub(crate) fn load(
         dir: &Path,

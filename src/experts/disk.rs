@@ -470,7 +470,7 @@ impl SpanReader {
         })
     }
 
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[cfg(feature = "cuda")]
     pub(crate) fn file_len(&self) -> u64 {
         self.len
     }

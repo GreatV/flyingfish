@@ -98,12 +98,14 @@ pub struct HcRuntime {
     one_hot: Option<CudaSlice<f32>>,
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) struct HcCheckpoint {
     stream: CudaSlice<bf16>,
     mixes: Vec<CudaSlice<f32>>,
     rows: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl HcCheckpoint {
     pub(crate) fn bytes(&self) -> usize {
         self.stream.len() * 2 + self.mixes.iter().map(|v| v.len() * 4).sum::<usize>()
@@ -142,6 +144,7 @@ fn alloc_one_hot(s: &Arc<CudaStream>, rows: usize, mult: usize) -> Result<CudaSl
 }
 
 impl HcRuntime {
+    #[cfg(feature = "cuda")]
     fn state_f32(&self) -> impl Iterator<Item = &CudaSlice<f32>> {
         self.carry.iter().chain(self.attn_pre.iter()).chain([
             &self.mix_pre,
@@ -150,6 +153,7 @@ impl HcRuntime {
         ])
     }
 
+    #[cfg(feature = "cuda")]
     fn state_f32_mut(&mut self) -> impl Iterator<Item = &mut CudaSlice<f32>> {
         self.carry
             .iter_mut()
@@ -157,6 +161,7 @@ impl HcRuntime {
             .chain([&mut self.mix_pre, &mut self.mix_post, &mut self.mix_comb])
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn checkpoint(&self, rows: usize, s: &Arc<CudaStream>) -> Result<HcCheckpoint> {
         self.check_rows(rows)?;
         Ok(HcCheckpoint {
@@ -169,6 +174,7 @@ impl HcRuntime {
         })
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn save_checkpoint(
         &self,
         saved: &mut HcCheckpoint,
@@ -182,6 +188,7 @@ impl HcRuntime {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn select_checkpoint(
         &mut self,
         saved: &HcCheckpoint,

@@ -4747,7 +4747,7 @@ fn clover_layer_cohorts(
     ensure!(x_cpu == x_host, "Runner FAIL CPU cohort input transfer");
     let router = s.clone_htod(&fixture.bf16(&format!("{weight_tag}.gate.weight"))?)?;
     let logits = s.alloc_zeros::<bf16>(32 * 256)?;
-    let valid = s.clone_htod(&vec![1i32; 32])?;
+    let valid = s.clone_htod(&[1i32; 32])?;
     let ids = s.alloc_zeros::<i32>(32 * 8)?;
     let weights = s.alloc_zeros::<f32>(32 * 8)?;
     let allowed = s.alloc_zeros::<u32>(256)?;
