@@ -14,7 +14,6 @@ use std::cell::RefCell;
 #[path = "engine_moe_prefill.rs"]
 mod prefill;
 pub(in crate::backend::cuda::engine) use prefill::Prefill;
-#[cfg(any(feature = "cuda", test))]
 pub(in crate::backend::cuda) use prefill::ReadAhead;
 pub(super) use prefill::{cpu_bound, peer_prefill_bytes};
 
@@ -175,7 +174,6 @@ impl Reader {
         Ok(reader)
     }
 
-    #[cfg(any(feature = "cuda", test))]
     pub(in crate::backend::cuda) fn new_ranges(
         device: &Device,
         disk: DiskReader,

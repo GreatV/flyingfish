@@ -104,6 +104,9 @@ unsafe extern "C" {
         shared: usize,
     ) -> i32;
     fn ff_hip_device_properties(device: i32, output: *mut Properties) -> i32;
+    fn ff_hip_allocation_granularity(device: i32, out: *mut usize) -> i32;
+    #[cfg(test)]
+    fn ff_hip_default_mem_pool_usage(device: i32, reserved: *mut u64, used: *mut u64) -> i32;
 }
 
 #[derive(Debug)]
@@ -310,6 +313,33 @@ impl Context {
             check(hipMemGetInfo(&mut free, &mut total), "hipMemGetInfo")?;
         }
         Ok((free, total))
+    }
+    pub(crate) fn allocation_granularity(&self) -> Result<usize> {
+        self.bind_to_thread()?;
+        let mut granularity = 0usize;
+        unsafe {
+            check(
+                ff_hip_allocation_granularity(i32::try_from(self.ordinal)?, &mut granularity),
+                "hipMemGetAllocationGranularity",
+            )?;
+        }
+        Ok(granularity)
+    }
+    #[cfg(test)]
+    pub(crate) fn default_mem_pool_usage(&self) -> Result<(u64, u64)> {
+        self.bind_to_thread()?;
+        let (mut reserved, mut used) = (0u64, 0u64);
+        unsafe {
+            check(
+                ff_hip_default_mem_pool_usage(
+                    i32::try_from(self.ordinal)?,
+                    &mut reserved,
+                    &mut used,
+                ),
+                "hipMemPoolGetAttribute",
+            )?;
+        }
+        Ok((reserved, used))
     }
     /// # Safety
     /// The host span must remain live and exclusively registered until unregister completes.

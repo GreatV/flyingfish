@@ -1878,7 +1878,7 @@ impl LayerLinearPlan {
 }
 
 /// `ceil(waves) / waves` for a positive finite wave count.
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn wave_multiplier(waves: f64) -> Result<f64> {
     ensure!(
         waves.is_finite() && waves > 0.0,
@@ -1888,7 +1888,7 @@ pub(crate) fn wave_multiplier(waves: f64) -> Result<f64> {
 }
 
 /// Index of the strictly lower whole-wave multiplier. Equal multipliers keep index 0.
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn lower_wave_index(waves: &[f64]) -> Result<usize> {
     ensure!(!waves.is_empty(), "empty Lt wave list");
     let mut best = 0usize;

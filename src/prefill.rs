@@ -67,7 +67,7 @@ pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize
     Ok(end)
 }
 /// Schedule visits of one component times the workload's request count. A one-shot request count is 1.
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn placement_visits(per_request: usize, requests: usize) -> Result<usize> {
     ensure!(
         per_request > 0 && requests > 0,
@@ -115,7 +115,7 @@ impl DensePlacement {
     }
 
     /// Host bytes spent for `visits`. One visit spends none.
-    #[cfg(any(test, feature = "cuda"))]
+    #[cfg(any(test, feature = "cuda", feature = "rocm"))]
     pub(crate) fn host_budget_for_visits(host_bytes: usize, visits: usize) -> Result<usize> {
         ensure!(visits > 0, "dense placement visit count");
         Ok(if visits == 1 { 0 } else { host_bytes })
@@ -373,7 +373,7 @@ impl Plan {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[derive(Clone, Copy)]
 pub(crate) struct DenseStage<'a> {
     pub device: &'a [usize],
@@ -383,7 +383,7 @@ pub(crate) struct DenseStage<'a> {
     pub device_staging: usize,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl DenseStage<'_> {
     pub(crate) fn minimum_device_bytes(self, page: usize) -> Result<usize> {
         self.choices(usize::MAX, page)?
@@ -534,14 +534,14 @@ impl DenseStage<'_> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 struct HostChoice {
     bytes: usize,
     layers: usize,
     seconds: f64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) struct PricedDense {
     pub plans: [DensePlacement; 3],
     pub device_bytes: [usize; 3],
@@ -549,7 +549,7 @@ pub(crate) struct PricedDense {
     pub decoder_streamed_seconds: Option<f64>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn price_dense_stages(
     stages: [DenseStage<'_>; 3],
     (device_limit, host_limit, device_page): (usize, usize, usize),
@@ -670,7 +670,7 @@ pub(crate) fn price_dense_stages(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     #[test]
     fn resident_stage_rates_select_different_decoder_tiers() -> anyhow::Result<()> {
         use super::{DenseStage, price_dense_stages};

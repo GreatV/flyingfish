@@ -141,7 +141,6 @@ unsafe extern "C" {
         stream: Handle,
     ) -> i32;
     fn ff_hip_lt_index(algorithm: *mut Algorithm) -> i32;
-    #[cfg(test)]
     fn ff_hip_lt_algo_from_index(handle: Handle, index: i32, algorithm: *mut Algorithm) -> i32;
     fn ff_hip_lt_supported(
         handle: Handle,
@@ -153,7 +152,6 @@ unsafe extern "C" {
         algorithm: *mut Algorithm,
         workspace: *mut usize,
     ) -> i32;
-    #[cfg(test)]
     fn ff_hip_lt_algo_names(
         handle: Handle,
         algorithm: *mut Algorithm,
@@ -163,10 +161,31 @@ unsafe extern "C" {
         kernel_len: usize,
     ) -> i32;
 }
-#[cfg(test)]
 pub(crate) use crate::backend::cuda::linear::{lower_wave_index, wave_multiplier};
+
+const HIPBLAS_STATUS_NOT_SUPPORTED: i32 = 7;
+
+#[derive(Debug)]
+struct HipBlasStatus {
+    status: i32,
+    op: String,
+}
+
+impl std::fmt::Display for HipBlasStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed: hipBLAS status {}", self.op, self.status)
+    }
+}
+
+impl std::error::Error for HipBlasStatus {}
+
 fn check(status: i32, name: &str) -> Result<()> {
-    ensure!(status == 0, "{name} failed: hipBLAS status {status}");
+    if status != 0 {
+        return Err(anyhow::Error::new(HipBlasStatus {
+            status,
+            op: name.to_owned(),
+        }));
+    }
     Ok(())
 }
 
@@ -268,7 +287,6 @@ impl Drop for Handles {
 }
 
 type Binding = (LinearShape, Option<u64>, LinearBiasMode);
-#[cfg(test)]
 type PitchedBinding = (usize, usize, usize, usize);
 
 fn checked_dims(rows: usize, output: usize, input: usize) -> Result<()> {
@@ -295,14 +313,17 @@ pub struct Blas {
     fp8: Option<crate::backend::gpu::linear::Fp8Ops>,
     invariant_rows: usize,
     plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
-    #[cfg(test)]
     pitched_b: RefCell<BTreeMap<PitchedBinding, Arc<Plan>>>,
-    #[cfg(test)]
     row_families: RefCell<BTreeMap<(usize, usize), (i32, usize)>>,
-    #[cfg(test)]
     family_plans: RefCell<BTreeMap<LinearShape, Arc<Plan>>>,
 }
 impl Blas {
+    pub(crate) fn is_not_supported(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<HipBlasStatus>()
+            .is_some_and(|e| e.status == HIPBLAS_STATUS_NOT_SUPPORTED)
+    }
+
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         stream.context().bind_to_thread()?;
         let p = &stream.context().properties;
@@ -345,11 +366,8 @@ impl Blas {
             fp8: None,
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
-            #[cfg(test)]
             pitched_b: RefCell::new(BTreeMap::new()),
-            #[cfg(test)]
             row_families: RefCell::new(BTreeMap::new()),
-            #[cfg(test)]
             family_plans: RefCell::new(BTreeMap::new()),
         };
         let handles =
@@ -566,48 +584,38 @@ impl Blas {
                 "hipblasLtMatmulPreferenceSetAttribute(workspace)",
             )?;
             let (index, mut algorithm) = if let Some(fixed) = fixed_algo {
-                #[cfg(test)]
-                {
-                    let mut algorithm = Algorithm::default();
-                    check(
-                        ff_hip_lt_algo_from_index(self.handles.lt, fixed, &mut algorithm),
-                        "ff_hip_lt_algo_from_index",
-                    )?;
-                    let mut candidates = [Heuristic::default(); 64];
-                    let mut count = 0;
-                    check(
-                        hipblasLtMatmulAlgoGetHeuristic(
-                            self.handles.lt,
-                            plan.desc,
-                            plan.a,
-                            plan.b,
-                            plan.c,
-                            plan.c,
-                            plan.preference,
-                            candidates.len() as i32,
-                            candidates.as_mut_ptr(),
-                            &mut count,
-                        ),
-                        "hipblasLtMatmulAlgoGetHeuristic",
-                    )?;
-                    let mut waves = 0.0f32;
-                    for candidate in &mut candidates[..count.max(0) as usize] {
-                        if candidate.status == 0
-                            && ff_hip_lt_index(&mut candidate.algorithm) == fixed
-                        {
-                            waves = candidate.waves;
-                            break;
-                        }
+                let mut algorithm = Algorithm::default();
+                check(
+                    ff_hip_lt_algo_from_index(self.handles.lt, fixed, &mut algorithm),
+                    "ff_hip_lt_algo_from_index",
+                )?;
+                let mut candidates = [Heuristic::default(); 64];
+                let mut count = 0;
+                check(
+                    hipblasLtMatmulAlgoGetHeuristic(
+                        self.handles.lt,
+                        plan.desc,
+                        plan.a,
+                        plan.b,
+                        plan.c,
+                        plan.c,
+                        plan.preference,
+                        candidates.len() as i32,
+                        candidates.as_mut_ptr(),
+                        &mut count,
+                    ),
+                    "hipblasLtMatmulAlgoGetHeuristic",
+                )?;
+                let mut waves = 0.0f32;
+                for candidate in &mut candidates[..count.max(0) as usize] {
+                    if candidate.status == 0 && ff_hip_lt_index(&mut candidate.algorithm) == fixed {
+                        waves = candidate.waves;
+                        break;
                     }
-                    plan.waves = waves;
-                    plan.algo_count = 1;
-                    (fixed, algorithm)
                 }
-                #[cfg(not(test))]
-                {
-                    let _ = fixed;
-                    anyhow::bail!("fixed HIP algorithm index requires test build");
-                }
+                plan.waves = waves;
+                plan.algo_count = 1;
+                (fixed, algorithm)
             } else {
                 let mut candidates = [Heuristic::default(); 64];
                 let mut count = 0;
@@ -665,12 +673,7 @@ impl Blas {
                 plan.waves = if selected.waves > 0.0 {
                     selected.waves
                 } else {
-                    #[cfg(test)]
-                    {
-                        self.solution_metrics(s, &selected.algorithm)?.0 as f32
-                    }
-                    #[cfg(not(test))]
-                    0.0
+                    self.solution_metrics(s, &selected.algorithm)?.0 as f32
                 };
                 (index, selected.algorithm)
             };
@@ -1457,7 +1460,6 @@ impl Blas {
         "HIP BLAS BF16 with FP32 accumulation"
     }
 
-    #[cfg(test)]
     fn build_lt_plan(
         &self,
         shape: LinearShape,
@@ -1500,7 +1502,6 @@ impl Blas {
         Ok(plan)
     }
 
-    #[cfg(test)]
     fn algo_names(&self, algo: &Algorithm) -> Result<(String, String)> {
         let mut raw = *algo;
         let mut sol = [0i8; 1024];
@@ -1524,7 +1525,6 @@ impl Blas {
         }
     }
 
-    #[cfg(test)]
     fn solution_metrics(&self, shape: LinearShape, algo: &Algorithm) -> Result<(f64, usize)> {
         let (sol, _kern) = self.algo_names(algo)?;
         let mt = sol
@@ -1567,7 +1567,6 @@ impl Blas {
         Ok((waves, reduction))
     }
 
-    #[cfg(test)]
     fn launch_lt_plan(
         &self,
         plan: &Arc<Plan>,
@@ -1616,7 +1615,6 @@ impl Blas {
         self.workspace.borrow().len()
     }
 
-    #[cfg(test)]
     pub(crate) fn bind_workspace(&self, bytes: usize) -> Result<()> {
         if bytes > self.workspace.borrow().len() {
             let workspace = self.stream.alloc_zeros::<u8>(bytes)?;
@@ -1625,7 +1623,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn prepare_fixed_b_ld(
         &self,
         rows: u32,
@@ -1663,7 +1660,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn linear_bf16_b_ld(
         &self,
         weight: crate::backend::gpu::contracts::Tensor<bf16, 2>,
@@ -1708,7 +1704,6 @@ impl Blas {
         self.launch_lt_plan(plan, [weight.ptr, x.ptr, y.0.ptr], 1.0, 0.0)
     }
 
-    #[cfg(test)]
     pub(crate) fn bind_row_family(&self, shape: LinearShape) -> Result<()> {
         checked_dims(shape.rows, shape.output, shape.input)?;
         let key = (shape.output, shape.input);
@@ -1727,7 +1722,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn prepare_row_family(&self, shape: LinearShape) -> Result<()> {
         checked_dims(shape.rows, shape.output, shape.input)?;
         if !self.family_plans.borrow().contains_key(&shape) {
@@ -1744,7 +1738,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn fixed_workspace(&self, shape: LinearShape, family: bool) -> Result<usize> {
         let plan_ws = if family {
             self.prepare_row_family(shape)?;
@@ -1774,7 +1767,6 @@ impl Blas {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn bind_lower_wave(&self, shape: LinearShape) -> Result<()> {
         let key = (shape, None, LinearBiasMode::BeforeOutputRound);
         let (waves, algo_count) = {
@@ -1804,7 +1796,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn fixed_plan_cost(
         &self,
         shape: LinearShape,
@@ -1859,7 +1850,6 @@ impl Blas {
         Ok((wave_multiplier(waves)?, split_k))
     }
 
-    #[cfg(test)]
     pub(crate) fn linear_accumulate(
         &self,
         weight: crate::backend::gpu::contracts::Tensor<bf16, 2>,
@@ -1870,7 +1860,6 @@ impl Blas {
         self.accumulate_bound(weight, x, y, alpha, 1.0, false)
     }
 
-    #[cfg(test)]
     pub(crate) fn linear_row_family(
         &self,
         weight: crate::backend::gpu::contracts::Tensor<bf16, 2>,
@@ -1882,7 +1871,6 @@ impl Blas {
         self.accumulate_bound(weight, x, y, alpha, beta, true)
     }
 
-    #[cfg(test)]
     fn accumulate_bound(
         &self,
         weight: crate::backend::gpu::contracts::Tensor<bf16, 2>,

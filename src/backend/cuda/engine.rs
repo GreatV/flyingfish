@@ -51,11 +51,9 @@ pub(crate) use self::diffusion::{
     commit_window as diffusion_commit_window, contribute_tiered,
 };
 #[path = "engine_minimax_h3.rs"]
-#[cfg(feature = "cuda")]
 pub mod minimax_h3;
 #[path = "engine_moe.rs"]
 pub(super) mod moe;
-#[cfg(any(feature = "cuda", test))]
 pub(in crate::backend::cuda) use moe::{Events, ReadAhead, Reader};
 #[path = "engine_mtp.rs"]
 #[cfg(feature = "cuda")]

@@ -315,12 +315,10 @@ impl ReadAhead {
         self.drive_reader(&mut slots.disk, slots.transfers.h2d.context())
     }
 
-    #[cfg(any(feature = "cuda", test))]
     pub(in crate::backend::cuda) fn is_pending(&self) -> bool {
         self.pending
     }
 
-    #[cfg(any(feature = "cuda", test))]
     pub(in crate::backend::cuda) fn try_enqueue(&mut self, layer: u32, item: u32) -> Result<bool> {
         let queue = self
             .queue
@@ -337,7 +335,6 @@ impl ReadAhead {
         Ok(requested == Requested::Queued)
     }
 
-    #[cfg(any(feature = "cuda", test))]
     pub(in crate::backend::cuda) fn demand_item(
         &mut self,
         disk: &mut Option<Reader>,

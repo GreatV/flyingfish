@@ -1860,6 +1860,27 @@ fn hyperflow_config_reads_the_published_fields_without_defaults() -> Result<()> 
         .context("linears")?
         .push("transformer_blocks.0.attn.to_q".into());
     ensure!(H3Spec::parse(&duplicate).is_err(), "duplicate int8 name");
+    let mut bf16_json = hyperflow_json();
+    bf16_json
+        .as_object_mut()
+        .context("object")?
+        .remove("quantization");
+    let bf16 = H3Spec::parse(&bf16_json)?;
+    ensure!(
+        bf16.is_hyperflow()?
+            && bf16.int8_convrot.is_none()
+            && bf16.linear_storage("transformer_blocks.0.attn.to_q")? == LinearStorage::Dense
+            && bf16.linear_storage("transformer_blocks.2.ff.net.2")?
+                == LinearStorage::LowRank { rank: 2 },
+        "fl2va_bf16 roles"
+    );
+    let mut only_quant = mini;
+    only_quant.hyperflow_gate = None;
+    only_quant.int8_convrot = Some((256, BTreeSet::new()));
+    ensure!(
+        only_quant.is_hyperflow().is_err(),
+        "quantization without HyperFlow fields"
+    );
     Ok(())
 }
 
@@ -2134,6 +2155,19 @@ fn hyperflow_stored_placement_prints_124_resident_and_345_streamed() -> Result<(
         report_stored_placement(&hyper, &short, weights + hyper_act, weights)?,
         "exact 124 hyperflow budget streamed"
     );
+    let mut bf16_hyper = hyper.clone();
+    bf16_hyper.int8_convrot = None;
+    ensure!(
+        stored_scratch_extents(&bf16_hyper)? == Some((0, 2)),
+        "bf16 hyperflow scratch extents"
+    );
+    let bf16_mid_only = u64::try_from(packed + text_rows)? * 8 * 2;
+    ensure!(
+        stored_scratch_bytes(&bf16_hyper, packed)? + stored_scratch_bytes(&bf16_hyper, text_rows)?
+            == bf16_mid_only
+            && unchunked_activation_bytes(&bf16_hyper, &short)? == short_act + bf16_mid_only,
+        "bf16 hyperflow allocated convrot scratch"
+    );
     Ok(())
 }
 
@@ -2145,30 +2179,33 @@ fn hyperflow_fl2va_role_table_matches_the_published_shards() -> Result<()> {
         dir.join("config.json"),
     )?)?)?;
     ensure!(spec.is_hyperflow()?, "published config");
+    let quantized = spec.int8_convrot.is_some();
     ensure!(
         spec.hyperflow_gate == Some(0.25)
             && spec.dropped_blocks.as_deref() == Some(&[6, 21, 22][..])
-            && spec.int8_convrot.as_ref().context("int8")?.1.len() == 180
             && spec.lowrank_ranks.as_ref().context("ranks")?.len() == 102
             && spec.block_linears().len() == 294,
         "published role counts"
     );
-    let group = spec.int8_convrot.as_ref().context("int8")?.0;
-    let mut shared = 0usize;
-    for index in 0..spec.layers {
-        let q = format!("transformer_blocks.{index}.attn.to_q");
-        let k = format!("transformer_blocks.{index}.attn.to_k");
-        let q_int8 = spec.linear_storage(&q)? == LinearStorage::Int8 { group };
-        let k_int8 = spec.linear_storage(&k)? == LinearStorage::Int8 { group };
-        ensure!(q_int8 == k_int8, "block {index} splits to_q and to_k");
-        shared += usize::from(q_int8);
+    if let Some((group, names)) = spec.int8_convrot.as_ref() {
+        ensure!(names.len() == 180, "int8 role count {}", names.len());
+        let mut shared = 0usize;
+        for index in 0..spec.layers {
+            let q = format!("transformer_blocks.{index}.attn.to_q");
+            let k = format!("transformer_blocks.{index}.attn.to_k");
+            let q_int8 = spec.linear_storage(&q)? == LinearStorage::Int8 { group: *group };
+            let k_int8 = spec.linear_storage(&k)? == LinearStorage::Int8 { group: *group };
+            ensure!(q_int8 == k_int8, "block {index} splits to_q and to_k");
+            shared += usize::from(q_int8);
+        }
+        ensure!(shared == 30, "shared rotate-quant blocks {shared}");
     }
-    ensure!(shared == 30, "shared rotate-quant blocks {shared}");
     let checkpoint = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?;
     let manifest = checkpoint.minimax_h3_manifest(&spec)?;
+    let (expected_entries, expected_qweight) = if quantized { (888, 180) } else { (708, 0) };
     ensure!(
-        manifest.entries.len() == 888,
-        "names {}",
+        manifest.entries.len() == expected_entries,
+        "names {} != {expected_entries}",
         manifest.entries.len()
     );
     let qweight = manifest
@@ -2182,7 +2219,7 @@ fn hyperflow_fl2va_role_table_matches_the_published_shards() -> Result<()> {
         .filter(|name| name.ends_with(".down.weight"))
         .count();
     ensure!(
-        qweight == 180 && down == 102,
+        qweight == expected_qweight && down == 102,
         "qweight {qweight} down {down}"
     );
     for block in [6, 21, 22] {
@@ -2196,7 +2233,15 @@ fn hyperflow_fl2va_role_table_matches_the_published_shards() -> Result<()> {
         );
     }
     let bytes: usize = manifest.entries.values().map(|entry| entry.bytes).sum();
-    ensure!(bytes == 15_880_568_448, "payload {bytes}");
+    let expected_bytes = if quantized {
+        15_880_568_448
+    } else {
+        27_433_807_488
+    };
+    ensure!(
+        bytes == expected_bytes,
+        "payload {bytes} != {expected_bytes}"
+    );
     let ranks = spec.lowrank_ranks.as_ref().context("ranks")?;
     for (name, entry) in &manifest.entries {
         if let Some(base) = name.strip_suffix(".qweight") {

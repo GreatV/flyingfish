@@ -1854,7 +1854,7 @@ struct BlockRun<'a> {
 
 impl LayerNormTower {
     /// Moves every deepstack tap one encoder block later.
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(super) fn shift_deepstack_taps(&mut self) -> Result<()> {
         let taps = self
             .geometry

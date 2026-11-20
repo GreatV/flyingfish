@@ -209,7 +209,7 @@ pub(crate) fn group_dot_smem(group: u32) -> u32 {
 }
 
 // A 32-row grid must fill at least one wave of resident CTAs.
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn group_dot_32_fills_wave(rows: usize, k: usize, wave: Option<usize>) -> bool {
     let ctas = rows.div_ceil(32) * (k / 256);
     let enabled = rows >= TENSOR_CORE_ROWS && wave.is_some_and(|wave| ctas >= wave);
@@ -244,7 +244,7 @@ pub(crate) fn max_group(optin: usize) -> Result<u32> {
 }
 
 /// `group` fits the tile derived from `optin`. Returns that tile.
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn ensure_group(group: u32, optin: usize) -> Result<u32> {
     let max = max_group(optin)?;
     ensure!(
@@ -715,7 +715,7 @@ impl ProductKernel {
         }
     }
 
-    #[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn resource_limits(self, arch: &crate::backend::setup::DeviceArchitecture) -> (i32, u32) {
         match arch {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => (124, 1),
@@ -735,7 +735,7 @@ impl ProductKernel {
     }
 }
 
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 fn arch_supported(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
     use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
     match arch {
@@ -744,7 +744,7 @@ fn arch_supported(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
     }
 }
 
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 fn arch_supports_striped(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
     use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
     match arch {
@@ -754,7 +754,7 @@ fn arch_supports_striped(arch: &crate::backend::setup::DeviceArchitecture) -> bo
     }
 }
 
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn qkv_product_eligible(
     info: &crate::backend::setup::DeviceInfo,
     rows: usize,
@@ -768,7 +768,7 @@ pub(crate) fn qkv_product_eligible(
         && k.saturating_mul(n) <= info.l2_bytes
 }
 
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 fn gate_up_products(
     info: &crate::backend::setup::DeviceInfo,
     active_ctas: usize,
@@ -822,7 +822,7 @@ fn gate_up_products(
     })
 }
 
-#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn function_regs_and_local(function: &crate::backend::gpu::CudaFunction) -> Result<(i32, i32)> {
     #[cfg(feature = "cuda")]
     {
@@ -841,7 +841,7 @@ fn function_regs_and_local(function: &crate::backend::gpu::CudaFunction) -> Resu
     }
 }
 
-#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn active_blocks(
     function: &crate::backend::gpu::CudaFunction,
     threads: u32,
@@ -869,7 +869,7 @@ fn product_function(
     Ok(function)
 }
 
-#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn product_active_ctas(
     device: &crate::backend::cuda::Device,
     product: ProductKernel,
@@ -910,7 +910,7 @@ pub(crate) fn product_active_ctas(
     Ok(usize::try_from(active)?)
 }
 
-#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn qkv_product(
     device: &crate::backend::cuda::Device,
     rows: usize,
@@ -934,7 +934,7 @@ pub(crate) fn qkv_product(
     Ok(product)
 }
 
-#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn gate_up_product_order(
     device: &crate::backend::cuda::Device,
     row_counts: [usize; 2],
@@ -965,7 +965,7 @@ fn group_dot_32_smem(arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
     2 * 8192 + group_dot_b_smem(arch)
 }
 
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn group_dot_32_resource_limits(
     info: &crate::backend::setup::DeviceInfo,
 ) -> Option<[(i32, u32); 2]> {
@@ -984,7 +984,7 @@ pub(crate) fn group_dot_32_resource_limits(
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 const GROUP_DOT_32_NAMES: [&str; 2] = ["convrot_group_dot_32", "convrot_group_dot_silu_32"];
 
-#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn group_dot_32_wave_sizes(
     device: &crate::backend::cuda::Device,
 ) -> Result<[Option<usize>; 2]> {

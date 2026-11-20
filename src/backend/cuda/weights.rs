@@ -1,6 +1,5 @@
 use super::Device;
 use crate::backend::gpu::{CudaContext, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
-#[cfg(any(feature = "cuda", test))]
 use crate::backend::gpu::{CudaFunction, PushKernelArg};
 use crate::config::Config;
 use crate::experts::{
@@ -8,9 +7,7 @@ use crate::experts::{
     catalogue::ExpertGeometry,
     plan::Capacity,
 };
-#[cfg(any(feature = "cuda", test))]
 use crate::gguf::GgmlType;
-#[cfg(any(feature = "cuda", test))]
 use anyhow::bail;
 use anyhow::{Context, Result, ensure};
 #[cfg(feature = "cuda")]
@@ -1718,7 +1715,6 @@ impl Loader<'_> {
 }
 
 /// The GGUF dequant kernels, loaded once from the `q4_0_linear` cubin.
-#[cfg(any(feature = "cuda", test))]
 pub(crate) struct QuantKernels {
     dequant_bf16: CudaFunction,
     dequant_f32: CudaFunction,
@@ -1727,7 +1723,6 @@ pub(crate) struct QuantKernels {
 }
 
 /// One dequant launch: the source bytes, the destination buffer and its element type.
-#[cfg(any(feature = "cuda", test))]
 pub(crate) struct DequantCopy {
     pub source: u64,
     pub destination: u64,
@@ -1735,7 +1730,6 @@ pub(crate) struct DequantCopy {
     pub dtype: Dtype,
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl QuantKernels {
     pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = super::cubin::module(ctx, "q4_0_linear")?;
@@ -1824,13 +1818,11 @@ impl QuantKernels {
 }
 
 /// Whether a stored GGUF type dequantizes into its device slot; the other accepted types pass through.
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn dequantizes(quant: Option<GgmlType>) -> bool {
     matches!(quant, Some(GgmlType::Q4_0 | GgmlType::F16))
 }
 
 /// Device slot bytes of a streamed linear: the BF16 tile for a dequantized entry, the stored bytes otherwise.
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn device_slot_bytes(name: &str, entry: &TensorEntry) -> Result<usize> {
     match entry.quant {
         Some(quant) if dequantizes(Some(quant)) => {
@@ -1844,7 +1836,6 @@ pub(crate) fn device_slot_bytes(name: &str, entry: &TensorEntry) -> Result<usize
 }
 
 /// Finiteness of a quantized entry's stored source: every F16 value for F16, each 18-byte Q4_0 block's scale.
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8]) -> Result<()> {
     match entry.quant {
         None if entry.dtype == safetensors::Dtype::F32 => {
@@ -1887,7 +1878,6 @@ pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8])
 }
 
 /// Finiteness of a streamed layer's quantized source, over every entry's stored bytes.
-#[cfg(any(feature = "cuda", test))]
 fn check_layer_source(layer: &DenseLayer, source: &[u8]) -> Result<()> {
     for entry in &layer.entries {
         let bytes = &source[entry.source_offset..entry.source_offset + entry.entry.bytes];
@@ -1896,7 +1886,6 @@ fn check_layer_source(layer: &DenseLayer, source: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", test))]
 struct DenseEntry {
     name: String,
     device_offset: usize,
@@ -1905,7 +1894,6 @@ struct DenseEntry {
     narrow_f32: bool,
 }
 
-#[cfg(any(feature = "cuda", test))]
 struct DenseLayer {
     slot: Option<usize>,
     next: Option<usize>,
@@ -1918,7 +1906,6 @@ struct DenseLayer {
     checked: bool,
 }
 
-#[cfg(any(feature = "cuda", test))]
 struct DenseSlot {
     device: CudaSlice<u8>,
     ready: crate::backend::gpu::CudaEvent,
@@ -1927,7 +1914,6 @@ struct DenseSlot {
     loaded: Option<usize>,
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) struct DenseStreaming {
     layers: Vec<DenseLayer>,
     slots: Vec<DenseSlot>,
@@ -1944,7 +1930,6 @@ pub(crate) struct DenseStreaming {
     skip_reclaim: bool,
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl Drop for DenseStreaming {
     fn drop(&mut self) {
         let context = self.upload.context();
@@ -1953,7 +1938,6 @@ impl Drop for DenseStreaming {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl DenseStreaming {
     pub(crate) fn new(
         dir: &Path,
@@ -2245,6 +2229,7 @@ impl DenseStreaming {
         })
     }
 
+    #[cfg(any(feature = "cuda", test))]
     fn defer(
         &mut self,
         loader: &mut Loader<'_>,
@@ -2319,6 +2304,7 @@ impl DenseStreaming {
         Ok(())
     }
 
+    #[cfg(any(feature = "cuda", test))]
     fn prime(&mut self) -> Result<()> {
         for slot in 0..self.slots.len() {
             if let Some(first) = self

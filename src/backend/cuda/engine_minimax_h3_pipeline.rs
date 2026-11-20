@@ -419,6 +419,11 @@ fn prepare_transformer(
     (spec, layout, request): (&H3Spec, &PackedLayout, &H3Request),
 ) -> Result<(Dit, AdalnTable, AdalnPlan, Schedule, Schedule, f32)> {
     let hyperflow = spec.is_hyperflow()?;
+    #[cfg(feature = "cuda")]
+    ensure!(
+        !hyperflow || spec.int8_convrot.is_some(),
+        "CUDA HyperFlow requires fl2va_int8_convrot"
+    );
     let manifest = match gguf {
         Some(path) => {
             let gguf = crate::gguf::GgufFile::open(path)?;
@@ -497,7 +502,7 @@ fn run_mode<const SETUP_ONLY: bool>(
     let device = Device::new(index)?;
     let ops = Ops::new(&device.ctx)?;
     let s = &device.stream;
-    let mut blas = Blas::new(
+    let mut blas = super::open_blas(
         &device,
         &ops,
         runtime,
@@ -508,6 +513,11 @@ fn run_mode<const SETUP_ONLY: bool>(
         &std::fs::read(&config).with_context(|| format!("read {}", config.display()))?,
     )?)?;
     let hyperflow = spec.is_hyperflow()?;
+    #[cfg(feature = "cuda")]
+    ensure!(
+        !hyperflow || spec.int8_convrot.is_some(),
+        "CUDA HyperFlow requires fl2va_int8_convrot"
+    );
     ensure!(
         hyperflow == lora.is_none() && (!hyperflow || gguf.is_none()),
         "HyperFlow requires stored fl2va weights without LoRA or GGUF; MiniMax-H3 requires LoRA"
@@ -911,7 +921,7 @@ fn image_condition(
 ) -> Result<Vec<bf16>> {
     let device = Device::new(options.device)?;
     let ops = Ops::new(&device.ctx)?;
-    let mut blas = Blas::new(
+    let mut blas = super::open_blas(
         &device,
         &ops,
         &options.runtime_dir,
@@ -1302,7 +1312,7 @@ impl ImageSession {
         let device_page = stored_allocation_granularity(&d)?;
         let ops = Ops::new(&d.ctx)?;
         let blas = |name: &str| {
-            Blas::new(
+            super::open_blas(
                 &d,
                 &ops,
                 &options.runtime_dir,
@@ -2676,7 +2686,7 @@ fn conv_decoder_gate<const SERIAL: bool>(
     let result = (|| -> Result<()> {
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
+        let mut blas = super::open_blas(
             &device,
             &ops,
             &runtime,
@@ -2969,7 +2979,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
             {
                 let device = Device::new(0)?;
                 let ops = Ops::new(&device.ctx)?;
-                let mut blas = Blas::new(
+                let mut blas = super::open_blas(
                     &device,
                     &ops,
                     &runtime,
@@ -3030,7 +3040,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
             let mut gate = shared_gate.borrow_mut();
             let device = Device::new(0)?;
             let ops = Ops::new(&device.ctx)?;
-            let mut blas = Blas::new(
+            let mut blas = super::open_blas(
                 &device,
                 &ops,
                 &runtime,
@@ -3125,7 +3135,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
             let decoded = {
                 let device = Device::new(0)?;
                 let ops = Ops::new(&device.ctx)?;
-                let mut blas = Blas::new(
+                let mut blas = super::open_blas(
                     &device,
                     &ops,
                     &runtime,
@@ -3602,7 +3612,7 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
         let native_conditioner = if phase == "native" {
             let device = Device::new(0)?;
             let ops = Ops::new(&device.ctx)?;
-            let mut blas = Blas::new(
+            let mut blas = super::open_blas(
                 &device,
                 &ops,
                 &runtime,
@@ -3614,7 +3624,7 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
         };
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
+        let mut blas = super::open_blas(
             &device,
             &ops,
             &runtime,

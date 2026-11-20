@@ -38,13 +38,13 @@ impl ImageWork {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 enum DecoderRows<'a> {
     Bf16(&'a CudaSlice<bf16>),
     F32(&'a CudaSlice<f32>),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 type ImageRows<'a> = (DecoderRows<'a>, usize, usize, usize);
 
 struct ImageDecoder {
@@ -267,7 +267,7 @@ impl ImageDecoder {
             blas,
             &mut w,
             input,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             |_, _, _, _| Ok(()),
         )?;
         s.synchronize()?;
@@ -280,7 +280,12 @@ impl ImageDecoder {
         blas: &Blas,
         w: &mut ImageWork,
         input: &CudaSlice<f32>,
-        #[cfg(test)] mut observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
+        #[cfg(all(test, feature = "cuda"))] mut observe: impl FnMut(
+            &str,
+            usize,
+            usize,
+            ImageRows<'_>,
+        ) -> Result<()>,
     ) -> Result<()> {
         let spec = &self.core.spec;
         let [height, width] = w.canvas;
@@ -316,7 +321,7 @@ impl ImageDecoder {
                 &mut w.core,
                 active,
                 (&w.raw, first),
-                #[cfg(test)]
+                #[cfg(all(test, feature = "cuda"))]
                 |role, rows| observe(role, first, active, rows),
             )?;
         }
@@ -506,7 +511,7 @@ impl ImageDecodeStage {
             blas,
             &mut self.work,
             &input,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             |_, _, _, _| Ok(()),
         )?;
         s.synchronize()?;
@@ -820,22 +825,18 @@ pub(crate) fn planar_f32_to_rgb_u8<T: DeviceRepr>(
         mean.into_iter().chain(std).all(f32::is_finite),
         "RGB affine parameters are nonfinite"
     );
-    use cudarc::driver::sys::CUdevice_attribute as A;
     let active = kernel.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?;
-    let sms = u32::try_from(
-        device
-            .ctx
-            .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-    )?;
+    ensure!(active > 0, "RGB has no resident blocks");
+    let sms = device.info.sms;
     let grid_limit = crate::backend::cuda::max_grid_dim(&device.ctx)?[0];
-    let resident = active
+    let resident = (active as usize)
         .checked_mul(sms)
         .context("RGB resident grid overflow")?;
     ensure!(resident > 0 && grid_limit > 0, "RGB has no resident blocks");
     let grid = u32::try_from(
         elements
             .div_ceil(256)
-            .min(resident.min(grid_limit) as usize),
+            .min(resident.min(grid_limit as usize)),
     )?;
     let s = &device.stream;
     let source = input.device_ptr(s).0;
@@ -1086,11 +1087,7 @@ impl<'a> DecoderWeightLoad<'a> {
                 let buffer = unsafe { d.upload.alloc::<u8>(bytes)? };
                 let ptr = buffer.device_ptr(&d.upload).0;
                 unsafe {
-                    cudarc::driver::result::memcpy_htod_async(
-                        ptr,
-                        &hoist.arena[at..at + bytes],
-                        d.upload.cu_stream(),
-                    )?;
+                    super::super::copy::htod_async(ptr, &hoist.arena[at..at + bytes], &d.upload)?;
                 }
                 self.resident.insert(name.clone(), ptr);
                 self.storage.push(buffer);
@@ -1292,7 +1289,7 @@ impl<'a> DecoderWeightLoad<'a> {
         let error = loop {
             // Return slots whose upload completed.
             let mut still = Vec::new();
-            let mut polled = Ok(());
+            let mut polled: Result<()> = Ok(());
             for &slot in &inflight {
                 match events[slot].try_is_complete() {
                     Ok(true) => {
@@ -1301,14 +1298,14 @@ impl<'a> DecoderWeightLoad<'a> {
                     }
                     Ok(false) => still.push(slot),
                     Err(error) => {
-                        polled = Err(error);
+                        polled = Err::<(), _>(error).context("vae-ring slot event query");
                         still.push(slot);
                     }
                 }
             }
             inflight = still;
             if let Err(error) = polled {
-                break Err(anyhow::Error::from(error).context("vae-ring slot event query"));
+                break Err(error);
             }
             match done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(Ok((index, slot))) => {
@@ -1318,16 +1315,15 @@ impl<'a> DecoderWeightLoad<'a> {
                             names[index].1,
                         )
                     };
-                    let upload = unsafe {
-                        cudarc::driver::result::memcpy_htod_async(
-                            destinations[index],
-                            window,
-                            d.upload.cu_stream(),
-                        )
-                    };
-                    let recorded = upload.and_then(|()| events[slot].record(&d.upload));
+                    let recorded: Result<()> = (|| {
+                        unsafe {
+                            super::super::copy::htod_async(destinations[index], window, &d.upload)?;
+                        }
+                        events[slot].record(&d.upload)?;
+                        Ok(())
+                    })();
                     if let Err(error) = recorded {
-                        break Err(anyhow::Error::from(error).context("vae-ring slot upload"));
+                        break Err(error.context("vae-ring slot upload"));
                     }
                     inflight.push(slot);
                     received += 1;
@@ -1386,21 +1382,19 @@ impl<'a> DecoderWeightLoad<'a> {
             *ptr
         } else {
             let buffer = unsafe { s.alloc::<u8>(bytes)? };
-            let (ptr, record) = buffer.device_ptr(s);
-            let chunk = self.staging.len();
-            for offset in (0..bytes).step_by(chunk) {
-                let end = (offset + chunk).min(bytes);
-                let dst = &mut self.staging[..end - offset];
-                read_decoder_weight_chunk(&mut self.reader, self.manifest, name, offset, dst)?;
-                unsafe {
-                    cudarc::driver::result::memcpy_htod_async(
-                        ptr + offset as u64,
-                        dst,
-                        s.cu_stream(),
-                    )?;
+            let ptr = {
+                let (ptr, _record) = buffer.device_ptr(s);
+                let chunk = self.staging.len();
+                for offset in (0..bytes).step_by(chunk) {
+                    let end = (offset + chunk).min(bytes);
+                    let dst = &mut self.staging[..end - offset];
+                    read_decoder_weight_chunk(&mut self.reader, self.manifest, name, offset, dst)?;
+                    unsafe {
+                        super::super::copy::htod_async(ptr + offset as u64, dst, s)?;
+                    }
                 }
-            }
-            drop(record);
+                ptr
+            };
             self.storage.push(buffer);
             ptr
         };
@@ -2024,7 +2018,7 @@ impl VideoDecoder {
         blas: &Blas,
         w: &mut TileWork,
         (layer, active): (usize, usize),
-        #[cfg(test)] observe: &mut impl FnMut(&str, ImageRows<'_>) -> Result<()>,
+        #[cfg(all(test, feature = "cuda"))] observe: &mut impl FnMut(&str, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
         let b = &self.blocks[layer];
         let spec = &self.spec;
@@ -2083,7 +2077,7 @@ impl VideoDecoder {
                 rows_view(&w.ff, s, j * n, rows, dim, dim)?,
             )?;
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "cuda"))]
         if layer == 0 {
             observe("q0", (DecoderRows::Bf16(&w.ff), 0, w.tokens, dim))?;
             observe("k0", (DecoderRows::Bf16(&w.ff), n, w.tokens, dim))?;
@@ -2199,7 +2193,7 @@ impl VideoDecoder {
             w,
             active,
             (raw, slot),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             |_, _| Ok(()),
         )
     }
@@ -2210,7 +2204,7 @@ impl VideoDecoder {
         w: &mut TileWork,
         active: usize,
         (raw, slot): (&CudaSlice<bf16>, usize),
-        #[cfg(test)] mut observe: impl FnMut(&str, ImageRows<'_>) -> Result<()>,
+        #[cfg(all(test, feature = "cuda"))] mut observe: impl FnMut(&str, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
         let spec = &self.spec;
         let p = w.patches;
@@ -2231,7 +2225,7 @@ impl VideoDecoder {
             latent(&w.latent_q)?,
             rows_view(&w.o, s, 0, active * p, spec.dim, spec.dim)?,
         )?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "cuda"))]
         observe("proj_in", (DecoderRows::Bf16(&w.o), 0, p, spec.dim))?;
         #[cfg(test)]
         if self.prefix_only {
@@ -2258,10 +2252,10 @@ impl VideoDecoder {
                 blas,
                 w,
                 (layer, active),
-                #[cfg(test)]
+                #[cfg(all(test, feature = "cuda"))]
                 &mut observe,
             )?;
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             if layer == 0 || layer + 1 == spec.layers {
                 let role = if layer == 0 { "block0" } else { "block_last" };
                 observe(role, (DecoderRows::F32(&w.x), 0, w.tokens, spec.dim))?;
@@ -3588,6 +3582,7 @@ pub(crate) mod image_tests {
             .collect())
     }
 
+    #[cfg(feature = "cuda")]
     fn score(
         label: &str,
         actual: &[f32],
@@ -3638,7 +3633,7 @@ pub(crate) mod image_tests {
             let d = Device::new(0)?;
             let s = &d.stream;
             let ops = Ops::new(&d.ctx)?;
-            let mut blas = Blas::new(
+            let mut blas = super::super::open_blas(
                 &d,
                 &ops,
                 &runtime,
@@ -3816,7 +3811,7 @@ pub(crate) mod image_tests {
             let device = Device::new(0)?;
             let s = &device.stream;
             let ops = Ops::new(&device.ctx)?;
-            let mut blas = Blas::new(
+            let mut blas = super::super::open_blas(
                 &device,
                 &ops,
                 &runtime,
@@ -3931,6 +3926,7 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn input(root: &Path, name: &str, shape: [usize; 2]) -> Result<Vec<f32>> {
         let bytes = fs::read(root.join(format!("inputs/decode-{name}.safetensors")))?;
         let file = SafeTensors::deserialize(&bytes)?;
@@ -3976,6 +3972,7 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn reference_gate(root: &Path, model: &Path, runtime: &Path, capture: &Path) -> Result<()> {
         let spec = geometry()?;
         let component = model.join("vae_diffusers");
@@ -4009,7 +4006,7 @@ pub(crate) mod image_tests {
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
-        let mut blas = Blas::new(
+        let mut blas = super::super::open_blas(
             &device,
             &ops,
             runtime,
@@ -4124,13 +4121,10 @@ pub(crate) mod image_tests {
                     &expected,
                 )?;
                 if name == "2048" && !low {
-                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let launched = decoder.launch(s, &blas, &mut work, &z, |_, _, _, _| Ok(()));
-                    let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                    launched?;
-                    graph?
-                        .context("RUNNER_FAIL image VAE graph empty")?
-                        .launch()?;
+                    super::super::capture_graph(s, false, || {
+                        decoder.launch(s, &blas, &mut work, &z, |_, _, _, _| Ok(()))
+                    })?
+                    .launch()?;
                     let actual = s.clone_dtoh(&work.rgb)?;
                     let bits = actual
                         .iter()
@@ -4216,6 +4210,7 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_S0 frozen references, FF_H3_CAPTURE output"]
     fn image_decoder_matches_the_frozen_reference() -> Result<()> {
@@ -4437,6 +4432,7 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn encoder_layouts(device: &Device, encoder: &KeyframeEncoder) -> Result<usize> {
         let s = &device.stream;
         let rgb: Vec<f32> = (0..60).map(|i| ((i * 37) % 251) as f32 / 8.0).collect();
@@ -4566,6 +4562,7 @@ pub(crate) mod image_tests {
         Ok(defects)
     }
 
+    #[cfg(feature = "cuda")]
     fn encoder_reference_gate(
         root: &Path,
         model: &Path,
@@ -4587,7 +4584,7 @@ pub(crate) mod image_tests {
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
-        let blas = Blas::new(
+        let blas = super::super::open_blas(
             &device,
             &ops,
             runtime,
@@ -4737,6 +4734,7 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_S0 encoder references, FF_H3_CAPTURE output"]
     fn image_encoder_matches_the_frozen_reference() -> Result<()> {
@@ -5039,6 +5037,7 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn vae_residual_rms_fusion_matches_parent_gpu() -> Result<()> {
@@ -5294,7 +5293,7 @@ pub(crate) mod image_tests {
             let d = Device::new(0)?;
             let s = &d.stream;
             let ops = Ops::new(&d.ctx)?;
-            let mut blas = Blas::new(
+            let mut blas = super::super::open_blas(
                 &d,
                 &ops,
                 &runtime,

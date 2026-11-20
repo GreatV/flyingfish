@@ -391,10 +391,14 @@ fn build_rocm(out: &std::path::Path) {
                 let result = Command::new(&hipcc)
                     .env("TMPDIR", &temp)
                     .args(["--genco", "-O3", "--std=c++17", "-mno-wavefrontsize64"])
-                    .args(
-                        matches!(*name, "mhc" | "latent_compress" | "latent_window_attention")
-                            .then_some("-ffp-contract=off"),
-                    )
+                    .args(match *name {
+                        "mhc" | "latent_compress" | "latent_window_attention" => {
+                            Some("-ffp-contract=off")
+                        }
+                        // Standard contraction preserves explicit BF16 rounding boundaries between multiply and add.
+                        "norm" | "modulate" => Some("-ffp-contract=on"),
+                        _ => None,
+                    })
                     .args(*defines)
                     .arg(format!("--offload-arch={arch}"))
                     .arg(&file)

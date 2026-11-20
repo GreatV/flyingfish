@@ -46,6 +46,7 @@ static_assert(HIP_R_32F == 0 && HIP_R_16BF == 14);
 static_assert(HIPBLAS_COMPUTE_32F == 2);
 static_assert(HIP_R_64F == 1 && HIPBLAS_COMPUTE_64F == 7);
 static_assert(HIPBLAS_OP_N == 111 && HIPBLAS_OP_T == 112);
+static_assert(HIPBLAS_STATUS_NOT_SUPPORTED == 7);
 static_assert(HIPBLAS_GEMM_DEFAULT == 160 && HIPBLASLT_EPILOGUE_BIAS == 4);
 static_assert(HIPBLASLT_MATMUL_DESC_TRANSA == 0 && HIPBLASLT_MATMUL_DESC_EPILOGUE == 2);
 static_assert(HIPBLASLT_MATMUL_DESC_BIAS_POINTER == 3 && HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE == 4);
@@ -126,4 +127,23 @@ extern "C" int ff_hip_lt_algo_names(hipblasLtHandle_t handle,
         return HIPBLAS_STATUS_INVALID_VALUE;
     }
     return HIPBLAS_STATUS_SUCCESS;
+}
+
+extern "C" int ff_hip_allocation_granularity(int device, size_t* out) {
+    if (!out) return hipErrorInvalidValue;
+    hipMemAllocationProp prop{};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = device;
+    return hipMemGetAllocationGranularity(out, &prop, hipMemAllocationGranularityRecommended);
+}
+
+extern "C" int ff_hip_default_mem_pool_usage(int device, uint64_t* reserved, uint64_t* used) {
+    if (!reserved || !used) return hipErrorInvalidValue;
+    hipMemPool_t pool = nullptr;
+    auto status = hipDeviceGetDefaultMemPool(&pool, device);
+    if (status != hipSuccess) return status;
+    status = hipMemPoolGetAttribute(pool, hipMemPoolAttrReservedMemCurrent, reserved);
+    if (status != hipSuccess) return status;
+    return hipMemPoolGetAttribute(pool, hipMemPoolAttrUsedMemCurrent, used);
 }

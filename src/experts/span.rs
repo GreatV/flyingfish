@@ -695,7 +695,7 @@ impl Prefetch {
         Some(slot)
     }
 
-    #[cfg(any(feature = "cuda", test))]
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn taken_slot(&self, layer: u32, expert: u32) -> Option<u32> {
         self.taken.iter().find_map(|(entry, slot)| {
             (entry.layer == layer && entry.expert == expert).then_some(*slot)
