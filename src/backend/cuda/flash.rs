@@ -518,7 +518,33 @@ impl Flash {
         }
         #[cfg(feature = "rocm")]
         {
-            Ok(self)
+            let mut this = self;
+            let ctx = this.stream.context();
+            let name = "attention_prefill_d128_bidirectional_single_pv";
+            let module = super::cubin::module(ctx, "attention")?;
+            let function = module.load_function(name)?;
+            check_native_function(ctx, &function, name, 0, true)?;
+            let resident = function.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)?;
+            let previous =
+                this.native[1].occupancy_max_active_blocks_per_multiprocessor(128, 0, None)?;
+            ensure!(
+                resident >= previous && resident > 0,
+                "single-probability attention occupancy decreased"
+            );
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"attention_probability": {
+                        "symbol": name,
+                        "local_bytes": function.local_size_bytes()?,
+                        "shared_bytes": function.shared_size_bytes()?,
+                        "resident_blocks": resident,
+                        "previous_resident_blocks": previous
+                    }})
+                );
+            }
+            this.native[1] = function;
+            Ok(this)
         }
     }
 
@@ -4376,6 +4402,12 @@ mod tests {
                     defects += cell(&stream, case, &root, bound, true)?;
                 }
             }
+            #[cfg(feature = "rocm")]
+            {
+                if case.d == 128 && case.mode == "bidirectional" && case.scale.is_none() {
+                    defects += cell(&stream, case, &root, bound, true)?;
+                }
+            }
         }
         println!(
             "FFA_HIP_RESULT cells={} defects={defects} frozen_limits=true",
@@ -4407,6 +4439,7 @@ mod tests {
                 32,
                 None,
                 "128-causal",
+                false,
             ),
             (
                 "d128-gqa64-8-bidir",
@@ -4419,6 +4452,7 @@ mod tests {
                 33,
                 None,
                 "128-bidirectional",
+                false,
             ),
             (
                 "d128-mha56-causal",
@@ -4431,6 +4465,7 @@ mod tests {
                 32,
                 None,
                 "128-causal",
+                false,
             ),
             (
                 "d128-mha56-bidir",
@@ -4443,6 +4478,33 @@ mod tests {
                 33,
                 None,
                 "128-bidirectional",
+                false,
+            ),
+            (
+                "d128-mha56-bidir-single-pv-33",
+                128,
+                56,
+                56,
+                "bidirectional",
+                33,
+                0,
+                33,
+                None,
+                "128-bidirectional",
+                true,
+            ),
+            (
+                "d128-mha56-bidir-single-pv-129",
+                128,
+                56,
+                56,
+                "bidirectional",
+                129,
+                0,
+                129,
+                None,
+                "128-bidirectional",
+                true,
             ),
             (
                 "d64-mha32-bidir-17",
@@ -4455,6 +4517,7 @@ mod tests {
                 17,
                 Some(0.125f32),
                 "128-bidirectional",
+                false,
             ),
             (
                 "d64-mha32-bidir-1",
@@ -4467,6 +4530,7 @@ mod tests {
                 33,
                 Some(0.125f32),
                 "128-bidirectional",
+                false,
             ),
             (
                 "d64-mha32-bidir-129",
@@ -4479,9 +4543,10 @@ mod tests {
                 129,
                 Some(0.125f32),
                 "128-bidirectional",
+                false,
             ),
         ];
-        for (name, d, hq, hkv, mode, rows, start, keys, scale, family) in cases {
+        for (name, d, hq, hkv, mode, rows, start, keys, scale, family, single_pv) in cases {
             let capacity = keys + 16;
             let case = Case {
                 name: name.into(),
@@ -4500,6 +4565,9 @@ mod tests {
             };
             let mut buffers = case.buffers(&stream)?;
             let mut op = case.binding(&stream)?;
+            if single_pv {
+                op = op.with_full_single_probability()?;
+            }
             case.run(&mut op, &mut buffers)?;
             let eager = stream.clone_dtoh(&buffers.out)?;
             let capture = stream.begin_capture()?;
@@ -4595,12 +4663,36 @@ mod tests {
                 wrong_err > max_lim,
                 "RUNNER_FAIL head-permutation control did not fail for {name}: err={wrong_err:e}"
             );
-            if d == 128 {
+            if single_pv && rows == 129 {
+                let mut shifted_q = q_host.clone();
+                for r in 0..rows {
+                    let src = (r + 64) % rows;
+                    shifted_q[r * case.pitch..(r + 1) * case.pitch]
+                        .copy_from_slice(&q_host[src * case.pitch..(src + 1) * case.pitch]);
+                }
+                stream.memcpy_htod(&v_host, &mut buffers.v)?;
+                stream.memcpy_htod(&shifted_q, &mut buffers.q)?;
+                case.run(&mut op, &mut buffers)?;
+                let wrong_q_actual: Vec<f64> = stream.clone_dtoh(&buffers.out)?[..rows * hq * d]
+                    .iter()
+                    .map(|v| v.to_f64())
+                    .collect();
+                let (wq_max, wq_rms) = errors(&wrong_q_actual, &ref_out, true)?;
+                let detected = wq_max > max_lim || wq_rms > rms_lim;
+                ensure!(
+                    detected,
+                    "RUNNER_FAIL single-probability Q-row control did not fail for {name}"
+                );
+                println!(
+                    "FFA_SINGLE_PV_CONTROL name={name} max={wq_max:e} rms={wq_rms:e} detected={detected}"
+                );
+            }
+            if d == 128 && !single_pv {
                 defects += mask_control(&stream, &case, &limits)?;
             }
         }
         ensure!(defects == 0, "ROCm Flash attention DEFECT count={defects}");
-        println!("PASS HIP_FLASH cells=6 disjoint_windows=8 defects=0");
+        println!("PASS HIP_FLASH cells=8 disjoint_windows=8 defects=0");
         Ok(())
     }
 }
