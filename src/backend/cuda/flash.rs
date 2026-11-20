@@ -736,11 +736,16 @@ impl Flash {
                     "attention_prefill_d512_bidirectional",
                 ]
             } else if head_dim == 256 && score.is_some() {
-                &["attention_prefill_d256_window"]
+                &[
+                    "attention_prefill_d256_window",
+                    "attention_prefill_d256_bidirectional",
+                    "attention_prefill_d256_symmetric",
+                ]
             } else if head_dim == 256 {
                 &[
                     "attention_prefill_d256",
                     "attention_prefill_d256_bidirectional",
+                    "attention_prefill_d256_symmetric",
                 ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
