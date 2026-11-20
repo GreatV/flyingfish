@@ -898,11 +898,7 @@ impl GdnOps {
         #[cfg(feature = "rocm")]
         let sms = u32::try_from(ctx.properties.compute_units)?;
         ensure!(sms > 0, "GDN device has no multiprocessors");
-        #[cfg(feature = "cuda")]
-        let optin =
-            ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u64;
-        #[cfg(feature = "rocm")]
-        let optin = ctx.properties.optin_shared_bytes;
+        let optin = super::optin_shared_bytes(ctx)? as u64;
         for (name, bytes) in [
             ("recurrent", u64::from(RECURRENT_SMEM)),
             ("chunked", u64::from(CHUNKED_SMEM)),

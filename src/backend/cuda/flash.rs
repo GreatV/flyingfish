@@ -237,7 +237,7 @@ impl Split {
             );
             ensure!(
                 shared + function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?
-                    <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
                 "D512 split shared memory does not fit"
             );
             function.set_attribute(F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared)?;
@@ -436,9 +436,7 @@ impl Flash {
                     "{name} registers={registers} local={local}"
                 );
                 ensure!(
-                    shared + self.shared as i32
-                        <= ctx
-                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    shared + self.shared as i32 <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
                     "single-probability attention shared memory exceeds capacity"
                 );
                 function.set_attribute(
@@ -591,93 +589,91 @@ impl Flash {
             "attention_prefill_d256_bidirectional"
         };
         #[cfg(feature = "cuda")]
-        let native = if matches!(head_dim, 64 | 72 | 256 | 512)
-            || native_d128(heads, kv_heads, head_dim)
-        {
-            use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
-            let ctx = stream.context();
-            ensure!(
-                heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
-                "prefill heads exceed grid limit"
-            );
-            let names: &[&str] = if matches!(head_dim, 64 | 72) {
-                if head_dim == 72 {
-                    &["attention_prefill_d72_bidirectional"]
-                } else {
-                    &["attention_prefill_d64_bidirectional"]
-                }
-            } else if head_dim == 512 {
-                &[
-                    "attention_prefill_d512",
-                    "attention_prefill_d512_bidirectional",
-                ]
-            } else if let Some(score) = score {
-                if score.window_left.is_some() {
+        let native =
+            if matches!(head_dim, 64 | 72 | 256 | 512) || native_d128(heads, kv_heads, head_dim) {
+                use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+                let ctx = stream.context();
+                ensure!(
+                    heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
+                    "prefill heads exceed grid limit"
+                );
+                let names: &[&str] = if matches!(head_dim, 64 | 72) {
+                    if head_dim == 72 {
+                        &["attention_prefill_d72_bidirectional"]
+                    } else {
+                        &["attention_prefill_d64_bidirectional"]
+                    }
+                } else if head_dim == 512 {
                     &[
-                        "attention_prefill_d256_window",
+                        "attention_prefill_d512",
+                        "attention_prefill_d512_bidirectional",
+                    ]
+                } else if let Some(score) = score {
+                    if score.window_left.is_some() {
+                        &[
+                            "attention_prefill_d256_window",
+                            bidirectional_256,
+                            "attention_prefill_d256_symmetric",
+                            "attention_prefill_d256_blocks",
+                        ]
+                    } else {
+                        &[
+                            "attention_prefill_d256_scored",
+                            bidirectional_256,
+                            "attention_prefill_d256_symmetric",
+                            "attention_prefill_d256_blocks",
+                        ]
+                    }
+                } else if head_dim == 256 {
+                    &[
+                        "attention_prefill_d256",
                         bidirectional_256,
                         "attention_prefill_d256_symmetric",
                         "attention_prefill_d256_blocks",
                     ]
+                } else if (heads, kv_heads) == (32, 4) {
+                    &["attention_prefill_d128", "attention_prefill_d128_window"]
                 } else {
                     &[
-                        "attention_prefill_d256_scored",
-                        bidirectional_256,
-                        "attention_prefill_d256_symmetric",
-                        "attention_prefill_d256_blocks",
+                        "attention_prefill_d128",
+                        "attention_prefill_d128_bidirectional",
+                        "attention_prefill_d128_prefix",
                     ]
+                };
+                let module = super::cubin::module(ctx, "attention_native")?;
+                let mut functions = Vec::with_capacity(names.len());
+                for name in names {
+                    let function = module.load_function(name)?;
+                    let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+                    let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+                    let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+                    ensure!(
+                        local == 0 && registers <= 255,
+                        "native prefill {name} resource limit: registers={registers} local={local}"
+                    );
+                    ensure!(
+                        dynamic_shared as i32 + shared
+                            <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
+                        "native prefill {name} shared memory does not fit"
+                    );
+                    function.set_attribute(
+                        F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        dynamic_shared as i32,
+                    )?;
+                    ensure!(
+                        function.occupancy_max_active_blocks_per_multiprocessor(
+                            128,
+                            dynamic_shared as usize,
+                            None
+                        )? > 0,
+                        "native prefill {name} has zero resident blocks"
+                    );
+                    functions.push(function);
                 }
-            } else if head_dim == 256 {
-                &[
-                    "attention_prefill_d256",
-                    bidirectional_256,
-                    "attention_prefill_d256_symmetric",
-                    "attention_prefill_d256_blocks",
-                ]
-            } else if (heads, kv_heads) == (32, 4) {
-                &["attention_prefill_d128", "attention_prefill_d128_window"]
+                functions
             } else {
-                &[
-                    "attention_prefill_d128",
-                    "attention_prefill_d128_bidirectional",
-                    "attention_prefill_d128_prefix",
-                ]
+                Vec::new()
             };
-            let module = super::cubin::module(ctx, "attention_native")?;
-            let mut functions = Vec::with_capacity(names.len());
-            for name in names {
-                let function = module.load_function(name)?;
-                let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
-                let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-                let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-                ensure!(
-                    local == 0 && registers <= 255,
-                    "native prefill {name} resource limit: registers={registers} local={local}"
-                );
-                ensure!(
-                    dynamic_shared as i32 + shared
-                        <= ctx
-                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
-                    "native prefill {name} shared memory does not fit"
-                );
-                function.set_attribute(
-                    F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    dynamic_shared as i32,
-                )?;
-                ensure!(
-                    function.occupancy_max_active_blocks_per_multiprocessor(
-                        128,
-                        dynamic_shared as usize,
-                        None
-                    )? > 0,
-                    "native prefill {name} has zero resident blocks"
-                );
-                functions.push(function);
-            }
-            functions
-        } else {
-            Vec::new()
-        };
         #[cfg(feature = "rocm")]
         let native = {
             let ctx = stream.context();
@@ -814,9 +810,7 @@ impl Flash {
                     "native prefill {name} resource limit: registers={registers} local={local}"
                 );
                 ensure!(
-                    shared
-                        <= ctx
-                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    shared <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
                     "native prefill {name} shared memory does not fit"
                 );
                 ensure!(
@@ -944,9 +938,7 @@ impl Flash {
         ensure!(
             local == 0
                 && registers <= 255
-                && self.shared + static_shared
-                    <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?
-                        as u32,
+                && self.shared + static_shared <= u32::try_from(super::optin_shared_bytes(ctx)?)?,
             "grouped attention resource limit {name} registers={registers} local={local}"
         );
         ensure!(

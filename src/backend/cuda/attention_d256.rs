@@ -351,10 +351,7 @@ impl FullAttentionOps {
         #[cfg(feature = "rocm")]
         let sms = u64::try_from(ctx.properties.compute_units)?;
         ensure!(sms > 0, "decode attention device has no multiprocessors");
-        #[cfg(feature = "cuda")]
-        let optin = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?;
-        #[cfg(feature = "rocm")]
-        let optin = i32::try_from(ctx.properties.optin_shared_bytes)?;
+        let optin = i32::try_from(super::optin_shared_bytes(ctx)?)?;
         ensure!(
             optin >= PHASE1_SMEM as i32,
             "decode attention phase1 shared memory exceeds opt-in limit"
@@ -452,13 +449,7 @@ impl FullAttentionOps {
                 .context("phase-2 shared memory overflow")?,
         )
         .context("phase-2 shared memory exceeds u32")?;
-        #[cfg(feature = "cuda")]
-        use cudarc::driver::sys::CUdevice_attribute as Attribute;
-        #[cfg(feature = "cuda")]
-        let optin =
-            ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u64;
-        #[cfg(feature = "rocm")]
-        let optin = ctx.properties.optin_shared_bytes;
+        let optin = super::optin_shared_bytes(ctx)? as u64;
         for (name, bytes) in [
             ("phase 1", u64::from(PHASE1_SMEM)),
             ("phase 2", u64::from(phase2_smem)),

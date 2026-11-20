@@ -8,7 +8,7 @@
 //! accumulator, K in groups of 16) and `q` is ties-to-even of `xR * (1/s_x)`.
 //! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 61440 bytes dynamic smem.
 //! [`linear`] is the below-[`TENSOR_CORE_ROWS`] form.
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 use anyhow::Context;
 use anyhow::{Result, ensure};
 use half::bf16;
@@ -187,10 +187,25 @@ fn linear_omitting_rotation(
     int8_product(&codes, &scales, k, qweight, n, wscale)
 }
 
-/// Dynamic shared bytes of one group: a 16-row bf16 tile plus eight 8×16 bf16 Hadamard tiles.
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+fn group_dot_b_smem(arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
+    match arch {
+        crate::backend::setup::DeviceArchitecture::Cuda(_) => 2048,
+        crate::backend::setup::DeviceArchitecture::Hip(_) => 0,
+    }
+}
+
+/// Dynamic shared bytes of one 16-row group tile (CUDA adds eight 8×16 bf16 Hadamard tiles).
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn group_dot_smem(group: u32) -> u32 {
-    32 * group + 2048
+    #[cfg(feature = "rocm")]
+    {
+        32 * group
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        32 * group + 2048
+    }
 }
 
 // A 32-row grid must fill at least one wave of resident CTAs.
@@ -198,7 +213,7 @@ pub(crate) fn group_dot_smem(group: u32) -> u32 {
 pub(crate) fn group_dot_32_fills_wave(rows: usize, k: usize, wave: Option<usize>) -> bool {
     let ctas = rows.div_ceil(32) * (k / 256);
     let enabled = rows >= TENSOR_CORE_ROWS && wave.is_some_and(|wave| ctas >= wave);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     if crate::backend::diagnostics_enabled() {
         let tile_rows = if enabled { 32 } else { 16 };
         let wave = wave.unwrap_or(0);
@@ -210,11 +225,15 @@ pub(crate) fn group_dot_32_fills_wave(rows: usize, k: usize, wave: Option<usize>
 }
 
 /// Largest multiple of 16 whose [`group_dot_smem`] fits in `optin` bytes.
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn max_group(optin: usize) -> Result<u32> {
     let bytes = u32::try_from(optin).context("convrot opt-in shared memory")?;
-    ensure!(bytes >= 2048 + 512, "convrot opt-in shared memory {optin}");
-    let raw = (bytes - 2048) / 32;
+    let b_smem = group_dot_smem(0);
+    ensure!(
+        bytes >= b_smem + 512,
+        "convrot opt-in shared memory {optin}"
+    );
+    let raw = (bytes - b_smem) / 32;
     let group = raw / 16 * 16;
     ensure!(group >= 16, "convrot opt-in shared memory {optin}");
     ensure!(
@@ -236,7 +255,7 @@ pub(crate) fn ensure_group(group: u32, optin: usize) -> Result<u32> {
 }
 
 /// Rows in one `convrot_quantize` tile: `optin / (k * 4)`.
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn quantize_rows(optin: usize, k: u32) -> Result<u32> {
     let bytes = u32::try_from(optin).context("convrot opt-in shared memory")?;
     let width = k.checked_mul(4).context("convrot quantize row")?;
@@ -281,6 +300,27 @@ mod tests {
         }
     }
 
+    fn mock_hip_device_info(
+        gfx: &str,
+        sms: usize,
+        l2_bytes: usize,
+        optin_shared_bytes: usize,
+    ) -> crate::backend::setup::DeviceInfo {
+        crate::backend::setup::DeviceInfo {
+            name: format!("mock-{gfx}"),
+            arch: crate::backend::setup::DeviceArchitecture::Hip(gfx.to_owned()),
+            sms,
+            l2_bytes,
+            warp: 32,
+            max_threads: 1024,
+            shared_bytes: 65_536,
+            sm_shared_bytes: 65_536,
+            cooperative: true,
+            optin_shared_bytes,
+            memory_bytes_per_second: 8.64e11,
+        }
+    }
+
     #[test]
     fn convrot_selectors_qualify_sm80_and_decline_sm86_by_resources() {
         use super::{
@@ -288,6 +328,18 @@ mod tests {
         };
 
         use ProductKernel::{MFastLdsm, MFastStriped, NFast};
+
+        let a100 = mock_device_info(80, 108, 40 << 20, 166_912);
+        let a4000 = mock_device_info(86, 48, 4 << 20, 101_376);
+        let a4000_large_l2 = mock_device_info(86, 48, 40 << 20, 101_376);
+        let rtx4090 = mock_device_info(89, 128, 72 << 20, 101_376);
+        let l4 = mock_device_info(89, 58, 48 << 20, 101_376);
+        let g4 = mock_device_info(120, 188, 128 << 20, 101_376);
+        let t4 = mock_device_info(75, 40, 40 << 20, 65_536);
+        let gfx1100 = mock_hip_device_info("gfx1100", 48, 6 << 20, 65_536);
+        let gfx1100_large_l2 = mock_hip_device_info("gfx1100", 48, 40 << 20, 65_536);
+        let gfx1100_low_smem = mock_hip_device_info("gfx1100", 48, 40 << 20, 32_768);
+        let gfx1030 = mock_hip_device_info("gfx1030", 48, 40 << 20, 65_536);
 
         assert_eq!(ProductKernel::NFast.symbol_name(), "convrot_product");
         assert_eq!(
@@ -298,17 +350,33 @@ mod tests {
             ProductKernel::NFastLdsm.symbol_name(),
             "convrot_product_n_fast_ldsm"
         );
-        assert_eq!(ProductKernel::NFast.shared_mem_bytes(), 61_440);
-        assert_eq!(ProductKernel::MFastLdsm.shared_mem_bytes(), 49_152);
-        assert_eq!(ProductKernel::NFastLdsm.shared_mem_bytes(), 61_440);
-
-        let a100 = mock_device_info(80, 108, 40 << 20, 166_912);
-        let a4000 = mock_device_info(86, 48, 4 << 20, 101_376);
-        let a4000_large_l2 = mock_device_info(86, 48, 40 << 20, 101_376);
-        let rtx4090 = mock_device_info(89, 128, 72 << 20, 101_376);
-        let l4 = mock_device_info(89, 58, 48 << 20, 101_376);
-        let g4 = mock_device_info(120, 188, 128 << 20, 101_376);
-        let t4 = mock_device_info(75, 40, 40 << 20, 65_536);
+        assert_eq!(ProductKernel::NFast.shared_mem_bytes(&rtx4090.arch), 61_440);
+        assert_eq!(
+            ProductKernel::MFastLdsm.shared_mem_bytes(&rtx4090.arch),
+            49_152
+        );
+        assert_eq!(
+            ProductKernel::NFastLdsm.shared_mem_bytes(&rtx4090.arch),
+            61_440
+        );
+        assert_eq!(ProductKernel::NFast.shared_mem_bytes(&gfx1100.arch), 32_768);
+        assert_eq!(
+            ProductKernel::MFastLdsm.shared_mem_bytes(&gfx1100.arch),
+            32_768
+        );
+        assert_eq!(
+            ProductKernel::NFastLdsm.shared_mem_bytes(&gfx1100.arch),
+            49_152
+        );
+        assert_eq!(ProductKernel::NFast.tile_dims(&gfx1100.arch), (128, 128));
+        assert_eq!(
+            ProductKernel::MFastLdsm.tile_dims(&gfx1100.arch),
+            (128, 128)
+        );
+        assert_eq!(
+            ProductKernel::NFastLdsm.tile_dims(&gfx1100.arch),
+            (128, 256)
+        );
 
         assert!(qkv_product_eligible(&a100, 37_717, (5376, 7168)));
         assert!(!qkv_product_eligible(&a100, 16, (5376, 7168)));
@@ -319,6 +387,18 @@ mod tests {
         assert!(qkv_product_eligible(&l4, 37_717, (5376, 7168)));
         assert!(qkv_product_eligible(&g4, 37_717, (5376, 7168)));
         assert!(!qkv_product_eligible(&t4, 37_717, (5376, 7168)));
+        assert!(!qkv_product_eligible(&gfx1100, 37_717, (5376, 7168)));
+        assert!(qkv_product_eligible(
+            &gfx1100_large_l2,
+            37_717,
+            (5376, 7168)
+        ));
+        assert!(!qkv_product_eligible(
+            &gfx1100_low_smem,
+            37_717,
+            (5376, 7168)
+        ));
+        assert!(!qkv_product_eligible(&gfx1030, 37_717, (5376, 7168)));
         let low_smem = mock_device_info(80, 108, 40 << 20, 49_152);
         assert!(!qkv_product_eligible(&low_smem, 37_717, (5376, 7168)));
 
@@ -367,6 +447,28 @@ mod tests {
             ]
         );
         assert_eq!(gate_up_products(&t4, 1, [1509, 1501], gate_up), [NFast; 2]);
+        assert_eq!(
+            gate_up_products(&gfx1100, 2, [1509, 1501], gate_up),
+            [NFast; 2]
+        );
+        assert_eq!(
+            gate_up_products(&gfx1100, 2, [9935, 37_717], gate_up),
+            [NFast; 2]
+        );
+        assert_eq!(
+            gate_up_products(&gfx1100_large_l2, 2, [1509, 37_717], gate_up),
+            [
+                MFastLdsm,
+                MFastStriped {
+                    tiles: 19,
+                    stripes: 16
+                }
+            ]
+        );
+        assert_eq!(
+            gate_up_products(&gfx1030, 2, [1509, 37_717], gate_up),
+            [NFast; 2]
+        );
 
         assert_eq!(
             group_dot_32_resource_limits(&a100),
@@ -382,8 +484,15 @@ mod tests {
         );
         assert_eq!(group_dot_32_resource_limits(&g4), Some([(48, 5), (56, 4)]));
         assert_eq!(group_dot_32_resource_limits(&t4), None);
+        assert_eq!(
+            group_dot_32_resource_limits(&gfx1100),
+            Some([(96, 4), (96, 4)])
+        );
+        assert_eq!(group_dot_32_resource_limits(&gfx1030), None);
         let too_small_smem = mock_device_info(80, 108, 40 << 20, 16_384);
         assert_eq!(group_dot_32_resource_limits(&too_small_smem), None);
+        let tiny_hip_smem = mock_hip_device_info("gfx1100", 48, 6 << 20, 8_192);
+        assert_eq!(group_dot_32_resource_limits(&tiny_hip_smem), None);
     }
 
     fn row(r: usize, i: usize) -> f32 {
@@ -472,11 +581,17 @@ mod tests {
     fn group_tile_fits_the_optin() -> Result<()> {
         let optin = 99usize << 10;
         let max = super::max_group(optin)?;
+        let expected_1024 = if cfg!(feature = "rocm") {
+            32_768
+        } else {
+            34_816
+        };
         ensure!(
             max >= 1024
-                && super::group_dot_smem(1024) == 34_816
+                && super::group_dot_smem(1024) == expected_1024
                 && usize::try_from(super::group_dot_smem(max))? <= optin
-                && super::ensure_group(1024, optin)? == max,
+                && super::ensure_group(1024, optin)? == max
+                && super::max_group(64usize << 10)? >= 1024,
             "group tile optin={optin} max={max}"
         );
         ensure!(
@@ -503,7 +618,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub struct ConvrotFns {
     linear: crate::backend::gpu::CudaFunction,
     hadamard: crate::backend::gpu::CudaFunction,
@@ -511,18 +626,19 @@ pub struct ConvrotFns {
     group_dot_32: [crate::backend::gpu::CudaFunction; 2],
     quantize: crate::backend::gpu::CudaFunction,
     product: [crate::backend::gpu::CudaFunction; 3],
-    product_sm: i32,
+    arch: crate::backend::setup::DeviceArchitecture,
+    striped: bool,
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
     optin: usize,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 std::thread_local! {
     static HADAMARD_FLIP: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
 pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
     struct Restore(i32);
     impl Drop for Restore {
@@ -536,7 +652,7 @@ pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
     result
 }
 
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductKernel {
     NFast,
@@ -545,7 +661,7 @@ pub enum ProductKernel {
     NFastLdsm,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub struct ConvrotArgs {
     pub x: u64,
     pub qweight: u64,
@@ -563,18 +679,50 @@ pub struct ConvrotArgs {
     pub rotate_32: bool,
 }
 
-#[cfg(feature = "cuda")]
-const PRODUCT_THREADS: u32 = 512;
-#[cfg(any(test, feature = "cuda"))]
-const PRODUCT_BM: u32 = 128;
-#[cfg(any(test, feature = "cuda"))]
-const PRODUCT_BN: u32 = 256;
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 impl ProductKernel {
-    const fn shared_mem_bytes(self) -> u32 {
-        match self {
-            Self::MFastLdsm | Self::MFastStriped { .. } => 49_152,
-            Self::NFast | Self::NFastLdsm => 61_440,
+    fn shared_mem_bytes(self, arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
+        match arch {
+            crate::backend::setup::DeviceArchitecture::Cuda(_) => match self {
+                Self::MFastLdsm | Self::MFastStriped { .. } => 49_152,
+                Self::NFast | Self::NFastLdsm => 61_440,
+            },
+            crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
+                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => 32_768,
+                Self::NFastLdsm => 49_152,
+            },
+        }
+    }
+
+    fn tile_dims(self, arch: &crate::backend::setup::DeviceArchitecture) -> (u32, u32) {
+        match arch {
+            crate::backend::setup::DeviceArchitecture::Cuda(_) => (128, 256),
+            crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
+                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => (128, 128),
+                Self::NFastLdsm => (128, 256),
+            },
+        }
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    fn threads(self, arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
+        match arch {
+            crate::backend::setup::DeviceArchitecture::Cuda(_) => 512,
+            crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
+                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => 256,
+                Self::NFastLdsm => 512,
+            },
+        }
+    }
+
+    #[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+    fn resource_limits(self, arch: &crate::backend::setup::DeviceArchitecture) -> (i32, u32) {
+        match arch {
+            crate::backend::setup::DeviceArchitecture::Cuda(_) => (124, 1),
+            crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
+                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => (216, 2),
+                Self::NFastLdsm => (216, 1),
+            },
         }
     }
 
@@ -588,14 +736,33 @@ impl ProductKernel {
 }
 
 #[cfg(any(test, feature = "cuda"))]
+fn arch_supported(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
+    use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
+    match arch {
+        Cuda(sm) => *sm >= 80,
+        Hip(gfx) => gfx.starts_with("gfx11"),
+    }
+}
+
+#[cfg(any(test, feature = "cuda"))]
+fn arch_supports_striped(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
+    use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
+    match arch {
+        Cuda(120) => true,
+        Hip(gfx) => gfx.starts_with("gfx11"),
+        _ => false,
+    }
+}
+
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) fn qkv_product_eligible(
     info: &crate::backend::setup::DeviceInfo,
     rows: usize,
     (k, n): (usize, usize),
 ) -> bool {
-    matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
+    arch_supported(&info.arch)
         && info.warp == 32
-        && info.optin_shared_bytes >= ProductKernel::NFastLdsm.shared_mem_bytes() as usize
+        && info.optin_shared_bytes >= ProductKernel::NFastLdsm.shared_mem_bytes(&info.arch) as usize
         && rows >= TENSOR_CORE_ROWS
         && (k, n) == (5376, 7168)
         && k.saturating_mul(n) <= info.l2_bytes
@@ -609,16 +776,17 @@ fn gate_up_products(
     (k, n): (usize, usize),
 ) -> [ProductKernel; 2] {
     let l2 = info.l2_bytes;
-    if !matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
+    if !arch_supported(&info.arch)
         || info.warp != 32
-        || info.optin_shared_bytes < ProductKernel::MFastLdsm.shared_mem_bytes() as usize
+        || info.optin_shared_bytes < ProductKernel::MFastLdsm.shared_mem_bytes(&info.arch) as usize
         || active_ctas == 0
         || n.saturating_mul(k) <= l2
     {
         return [ProductKernel::NFast; 2];
     }
     let wave = info.sms * active_ctas;
-    let (bm, bn) = (PRODUCT_BM as usize, PRODUCT_BN as usize);
+    let (bm_u32, bn_u32) = ProductKernel::MFastLdsm.tile_dims(&info.arch);
+    let (bm, bn) = (bm_u32 as usize, bn_u32 as usize);
     let n_tiles = n.div_ceil(bn);
     let working_set = |rows: usize, m_tiles: usize| {
         let ctas = wave.min(m_tiles * n_tiles);
@@ -635,9 +803,7 @@ fn gate_up_products(
         if working_set(rows, m_tiles) < l2 {
             return ProductKernel::MFastLdsm;
         }
-        if info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120)
-            && rows.saturating_mul(k) > l2
-        {
+        if arch_supports_striped(&info.arch) && rows.saturating_mul(k) > l2 {
             for stripes in 2..=m_tiles.min(u16::MAX as usize) {
                 let tiles = m_tiles.div_ceil(stripes);
                 if tiles < 2 || tiles * n_tiles < wave {
@@ -656,33 +822,64 @@ fn gate_up_products(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+fn function_regs_and_local(function: &crate::backend::gpu::CudaFunction) -> Result<(i32, i32)> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+        Ok((
+            function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+            function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
+        ))
+    }
+    #[cfg(feature = "rocm")]
+    {
+        Ok((
+            function.registers_per_thread()?,
+            function.local_size_bytes()?,
+        ))
+    }
+}
+
+#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
+fn active_blocks(
+    function: &crate::backend::gpu::CudaFunction,
+    threads: u32,
+    shared: usize,
+) -> Result<u32> {
+    let raw = function.occupancy_max_active_blocks_per_multiprocessor(threads, shared, None)?;
+    #[cfg(feature = "cuda")]
+    {
+        Ok(raw)
+    }
+    #[cfg(feature = "rocm")]
+    {
+        Ok(u32::try_from(raw)?)
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn product_function(
     module: &std::sync::Arc<crate::backend::gpu::CudaModule>,
+    arch: &crate::backend::setup::DeviceArchitecture,
     product: ProductKernel,
 ) -> Result<crate::backend::gpu::CudaFunction> {
     let function = module.load_function(product.symbol_name())?;
-    function.set_attribute(
-        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        i32::try_from(product.shared_mem_bytes())?,
-    )?;
+    crate::backend::cuda::set_max_dynamic_shared_bytes(&function, product.shared_mem_bytes(arch))?;
     Ok(function)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
 pub(crate) fn product_active_ctas(
     device: &crate::backend::cuda::Device,
     product: ProductKernel,
 ) -> Result<usize> {
-    use crate::backend::setup::DeviceArchitecture::Cuda;
-    use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
-
-    let smem = product.shared_mem_bytes() as usize;
+    let smem = product.shared_mem_bytes(&device.info.arch) as usize;
     ensure!(
-        matches!(device.info.arch, Cuda(sm) if sm >= 80)
+        arch_supported(&device.info.arch)
             && device.info.warp == 32
             && device.info.optin_shared_bytes >= smem,
-        "ConvRot {} requires CUDA sm80+ warp32 and {} optin shared bytes (arch={} warp={} optin={})",
+        "ConvRot {} requires supported warp32 arch and {} optin shared bytes (arch={} warp={} optin={})",
         product.symbol_name(),
         smem,
         device.info.arch,
@@ -690,19 +887,18 @@ pub(crate) fn product_active_ctas(
         device.info.optin_shared_bytes,
     );
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
-    let function = product_function(&module, product)?;
-    let active =
-        function.occupancy_max_active_blocks_per_multiprocessor(PRODUCT_THREADS, smem, None)?;
-    let regs = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-    let local = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+    let function = product_function(&module, &device.info.arch, product)?;
+    let active = active_blocks(&function, product.threads(&device.info.arch), smem)?;
+    let (regs, local) = function_regs_and_local(&function)?;
+    let (max_regs, min_ctas) = product.resource_limits(&device.info.arch);
     ensure!(
-        regs <= 124 && local == 0,
+        regs <= max_regs && local == 0,
         "ConvRot {} regs={regs} local={local} active_ctas={active}",
         product.symbol_name()
     );
     ensure!(
-        active > 0,
-        "ConvRot {} has no resident CTA",
+        active >= min_ctas,
+        "ConvRot {} has {active} resident CTAs (min {min_ctas})",
         product.symbol_name()
     );
     if crate::backend::diagnostics_enabled() {
@@ -714,7 +910,7 @@ pub(crate) fn product_active_ctas(
     Ok(usize::try_from(active)?)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
 pub(crate) fn qkv_product(
     device: &crate::backend::cuda::Device,
     rows: usize,
@@ -738,16 +934,16 @@ pub(crate) fn qkv_product(
     Ok(product)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
 pub(crate) fn gate_up_product_order(
     device: &crate::backend::cuda::Device,
     row_counts: [usize; 2],
     (k, n): (usize, usize),
 ) -> Result<[ProductKernel; 2]> {
     let info = &device.info;
-    let selected = if matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
+    let selected = if arch_supported(&info.arch)
         && info.warp == 32
-        && info.optin_shared_bytes >= ProductKernel::MFastLdsm.shared_mem_bytes() as usize
+        && info.optin_shared_bytes >= ProductKernel::MFastLdsm.shared_mem_bytes(&info.arch) as usize
         && n.saturating_mul(k) > info.l2_bytes
     {
         let active = product_active_ctas(device, ProductKernel::MFastLdsm)?;
@@ -764,47 +960,45 @@ pub(crate) fn gate_up_product_order(
     Ok(selected)
 }
 
-#[cfg(any(test, feature = "cuda"))]
-const GROUP_DOT_32_SMEM: u32 = 2 * 8192 + 2048;
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+fn group_dot_32_smem(arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
+    2 * 8192 + group_dot_b_smem(arch)
+}
 
 #[cfg(any(test, feature = "cuda"))]
 pub(crate) fn group_dot_32_resource_limits(
     info: &crate::backend::setup::DeviceInfo,
 ) -> Option<[(i32, u32); 2]> {
-    use crate::backend::setup::DeviceArchitecture::Cuda;
-    if info.warp != 32 || info.optin_shared_bytes < GROUP_DOT_32_SMEM as usize {
+    use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
+    if info.warp != 32 || info.optin_shared_bytes < group_dot_32_smem(&info.arch) as usize {
         return None;
     }
-    match info.arch {
+    match &info.arch {
         Cuda(120) => Some([(48, 5), (56, 4)]),
-        Cuda(sm) if sm >= 80 => Some([(48, 5), (48, 5)]),
+        Cuda(sm) if *sm >= 80 => Some([(48, 5), (48, 5)]),
+        Hip(gfx) if gfx.starts_with("gfx11") => Some([(96, 4), (96, 4)]),
         _ => None,
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 const GROUP_DOT_32_NAMES: [&str; 2] = ["convrot_group_dot_32", "convrot_group_dot_silu_32"];
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(test, feature = "rocm")))]
 pub(crate) fn group_dot_32_wave_sizes(
     device: &crate::backend::cuda::Device,
 ) -> Result<[Option<usize>; 2]> {
-    use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
     let Some(limits) = group_dot_32_resource_limits(&device.info) else {
         return Ok([None; 2]);
     };
+    let smem = group_dot_32_smem(&device.info.arch) as usize;
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
     let mut waves = [None; 2];
     for ((wave, name), (max_regs, min_ctas)) in waves.iter_mut().zip(GROUP_DOT_32_NAMES).zip(limits)
     {
         let function = module.load_function(name)?;
-        let registers = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-        let local = function.get_attribute(Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-        let active = function.occupancy_max_active_blocks_per_multiprocessor(
-            256,
-            GROUP_DOT_32_SMEM as usize,
-            None,
-        )?;
+        let (registers, local) = function_regs_and_local(&function)?;
+        let active = active_blocks(&function, 256, smem)?;
         let enabled = registers <= max_regs && local == 0 && active >= min_ctas;
         if enabled {
             *wave = Some(device.info.sms * usize::try_from(active)?);
@@ -818,47 +1012,68 @@ pub(crate) fn group_dot_32_wave_sizes(
     Ok(waves)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
+    #[cfg(feature = "rocm")]
+    ctx.require_wmma()?;
+    let arch = {
+        #[cfg(feature = "cuda")]
+        {
+            crate::backend::setup::DeviceArchitecture::Cuda(
+                crate::backend::cuda::cubin::capability(ctx)?,
+            )
+        }
+        #[cfg(feature = "rocm")]
+        {
+            crate::backend::setup::DeviceArchitecture::Hip(ctx.architecture().to_owned())
+        }
+    };
     let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
     let product = [
-        product_function(&module, ProductKernel::NFast)?,
-        product_function(&module, ProductKernel::MFastLdsm)?,
-        product_function(&module, ProductKernel::NFastLdsm)?,
+        product_function(&module, &arch, ProductKernel::NFast)?,
+        product_function(&module, &arch, ProductKernel::MFastLdsm)?,
+        product_function(&module, &arch, ProductKernel::NFastLdsm)?,
     ];
+    let striped = {
+        #[cfg(feature = "cuda")]
+        {
+            product[1].get_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
+            )? == 120
+        }
+        #[cfg(feature = "rocm")]
+        {
+            ctx.architecture().starts_with("gfx11")
+        }
+    };
     let hadamard = module.load_function("convrot_hadamard_table")?;
     let group_dot = [
         module.load_function("convrot_group_dot")?,
         module.load_function("convrot_group_dot_silu")?,
     ];
-    let optin = usize::try_from(ctx.attribute(
-        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-    )?)?;
+    let group_dot_32 = [
+        module.load_function(GROUP_DOT_32_NAMES[0])?,
+        module.load_function(GROUP_DOT_32_NAMES[1])?,
+    ];
+    let optin = crate::backend::cuda::optin_shared_bytes(ctx)?;
     let max_group = max_group(optin)?;
     for function in &group_dot {
-        function.set_attribute(
-            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            i32::try_from(group_dot_smem(max_group))?,
-        )?;
+        crate::backend::cuda::set_max_dynamic_shared_bytes(function, group_dot_smem(max_group))?;
+    }
+    for function in &group_dot_32 {
+        crate::backend::cuda::set_max_dynamic_shared_bytes(function, group_dot_32_smem(&arch))?;
     }
     let quantize = module.load_function("convrot_quantize")?;
-    let quant_dyn = optin / 4 * 4;
-    quantize.set_attribute(
-        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        i32::try_from(quant_dyn).context("convrot quantize opt-in")?,
-    )?;
+    let quant_dyn = u32::try_from(optin / 4 * 4).context("convrot quantize opt-in")?;
+    crate::backend::cuda::set_max_dynamic_shared_bytes(&quantize, quant_dyn)?;
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
         hadamard,
         group_dot,
-        group_dot_32: [
-            module.load_function(GROUP_DOT_32_NAMES[0])?,
-            module.load_function(GROUP_DOT_32_NAMES[1])?,
-        ],
+        group_dot_32,
         quantize,
-        product_sm: product[1].get_attribute(
-            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
-        )?,
+        arch,
+        striped,
         product,
         table: std::sync::Mutex::new(None),
         max_group,
@@ -866,7 +1081,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn launch_device(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
@@ -888,7 +1103,7 @@ pub fn launch_device(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn launch_rows(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     function: &crate::backend::gpu::CudaFunction,
@@ -917,7 +1132,7 @@ fn launch_rows(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn launch_product(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
@@ -928,16 +1143,17 @@ pub(crate) fn launch_product(
         args.rows > 0 && args.n > 0 && args.k > 0 && args.k % 64 == 0,
         "convrot product shape"
     );
-    let m = (args.rows as u32).div_ceil(PRODUCT_BM);
-    let n = (args.n as u32).div_ceil(PRODUCT_BN);
+    let (bm, bn) = args.product.tile_dims(&fns.arch);
+    let m = (args.rows as u32).div_ceil(bm);
+    let n = (args.n as u32).div_ceil(bn);
     let (product, grid) = match args.product {
         ProductKernel::NFast => (&fns.product[0], (n, m, 1)),
         ProductKernel::MFastLdsm => (&fns.product[1], (m, n, 1)),
         ProductKernel::MFastStriped { tiles, stripes } => {
             ensure!(
-                fns.product_sm == 120 && tiles > 0 && tiles <= m && stripes == m.div_ceil(tiles),
-                "ConvRot striped product sm={} m_tiles={m} tiles={tiles} stripes={stripes}",
-                fns.product_sm
+                fns.striped && tiles > 0 && tiles <= m && stripes == m.div_ceil(tiles),
+                "ConvRot striped product arch={} m_tiles={m} tiles={tiles} stripes={stripes}",
+                fns.arch
             );
             (&fns.product[1], (tiles, n, stripes))
         }
@@ -956,20 +1172,20 @@ pub(crate) fn launch_product(
             .arg(&args.n)
             .launch(LaunchConfig {
                 grid_dim: grid,
-                block_dim: (PRODUCT_THREADS, 1, 1),
-                shared_mem_bytes: args.product.shared_mem_bytes(),
+                block_dim: (args.product.threads(&fns.arch), 1, 1),
+                shared_mem_bytes: args.product.shared_mem_bytes(&fns.arch),
             })?;
     }
     Ok(())
 }
 
 /// Grid of `convrot_group_dot`: one block owns one row tile and one whole group.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn group_dot_grid(rows: u32, k: u32, group: u32, tile_rows: u32) -> (u32, u32, u32) {
     (rows.div_ceil(tile_rows), 1, k / group)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn launch_group_dot(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
@@ -993,53 +1209,54 @@ fn launch_group_dot(
         let count = u32::try_from(entries).context("convrot hadamard table")?;
         let mut table = stream.alloc_zeros::<u16>(usize::try_from(count)?)?;
         let group_i = i32::try_from(group)?;
-        let (ptr, wrote) = table.device_ptr_mut(stream);
-        let threads = 256u32;
-        unsafe {
-            stream
-                .launch_builder(&fns.hadamard)
-                .arg(&ptr)
-                .arg(&group_i)
-                .arg(&flip)
-                .launch(LaunchConfig {
-                    grid_dim: (count.div_ceil(threads), 1, 1),
-                    block_dim: (threads, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        {
+            let (ptr, _wrote) = table.device_ptr_mut(stream);
+            let threads = 256u32;
+            unsafe {
+                stream
+                    .launch_builder(&fns.hadamard)
+                    .arg(&ptr)
+                    .arg(&group_i)
+                    .arg(&flip)
+                    .launch(LaunchConfig {
+                        grid_dim: (count.div_ceil(threads), 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
         }
-        drop(wrote);
         *slot = Some((group, flip, table));
     }
     let cached = slot.as_ref().context("convrot hadamard table")?;
-    let read = cached.2.device_ptr(stream);
-    let table_ptr = read.0;
     let entry = usize::from(args.fuse_silu);
     let (function, tile_rows, shared_mem_bytes) = if args.rotate_32 {
-        (&fns.group_dot_32[entry], 32, GROUP_DOT_32_SMEM)
+        (&fns.group_dot_32[entry], 32, group_dot_32_smem(&fns.arch))
     } else {
         (&fns.group_dot[entry], 16, group_dot_smem(group))
     };
-    unsafe {
-        stream
-            .launch_builder(function)
-            .arg(&args.x)
-            .arg(&args.rotated)
-            .arg(&table_ptr)
-            .arg(&args.rows)
-            .arg(&args.k)
-            .arg(&args.group)
-            .launch(LaunchConfig {
-                grid_dim: group_dot_grid(rows, k, group, tile_rows),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes,
-            })?;
+    {
+        let (table_ptr, _read) = cached.2.device_ptr(stream);
+        unsafe {
+            stream
+                .launch_builder(function)
+                .arg(&args.x)
+                .arg(&args.rotated)
+                .arg(&table_ptr)
+                .arg(&args.rows)
+                .arg(&args.k)
+                .arg(&args.group)
+                .launch(LaunchConfig {
+                    grid_dim: group_dot_grid(rows, k, group, tile_rows),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes,
+                })?;
+        }
     }
-    drop(read);
     Ok(())
 }
 
 /// `convrot_group_dot` then `convrot_quantize`. The product is a separate launch.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn launch_rotate_quant(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
@@ -1081,7 +1298,7 @@ pub(crate) fn launch_rotate_quant(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn launch_groups(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
     fns: &ConvrotFns,
@@ -1091,7 +1308,7 @@ fn launch_groups(
     launch_product(stream, fns, args)
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
 mod device {
     use crate::backend::cuda::Device;
     use crate::backend::gpu::DevicePtr;
@@ -1107,12 +1324,14 @@ mod device {
         16435, -16199, -16213, -15994, -16089, -16161, -16219, -16128,
     ];
 
+    #[cfg(feature = "cuda")]
     const M17: [i16; 34] = [
         16483, 16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
         -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
         16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529,
     ];
 
+    #[cfg(feature = "cuda")]
     const M20: [i16; 40] = [
         16483, 16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
         -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
@@ -1120,6 +1339,7 @@ mod device {
         -16508, -16299, 16675, 16585, 16782,
     ];
 
+    #[cfg(feature = "cuda")]
     const M256: [i16; 512] = [
         16483, 16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
         -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
@@ -1200,6 +1420,7 @@ mod device {
             .collect()
     }
 
+    #[cfg(feature = "cuda")]
     fn embedded(rows: usize, k: usize, n: usize) -> Option<&'static [i16]> {
         if k != 256 || n != 2 {
             return None;
@@ -1214,6 +1435,7 @@ mod device {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn definition_bits(rows: usize, k: usize, n: usize) -> Result<Vec<i16>> {
         if let Some(bits) = embedded(rows, k, n) {
             return Ok(bits.to_vec());
@@ -1301,6 +1523,7 @@ mod device {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn rotated_mismatch(x: &[f32], got: &[f32], k: usize, group: usize) -> Result<usize> {
         ensure!(
             k > 0 && x.len() == got.len() && x.len().is_multiple_of(k),
@@ -1330,6 +1553,134 @@ mod device {
                 .count();
         }
         Ok(differ)
+    }
+
+    // 2x measured gfx1100 v_wmma_f32_16x16x16_bf16 vs exact f64 floor (activation / silu).
+    #[cfg(feature = "rocm")]
+    const ROCM_WMMA_ROT_MAX_ABS: f64 = 1.192_092_896e-7;
+    #[cfg(feature = "rocm")]
+    const ROCM_WMMA_ROT_RMSE: f64 = 2.132_190_794e-8;
+    #[cfg(feature = "rocm")]
+    const ROCM_WMMA_SILU_ROT_MAX_ABS: f64 = 2.086_162_568e-6;
+    #[cfg(feature = "rocm")]
+    const ROCM_WMMA_SILU_ROT_RMSE: f64 = 3.529_518_472e-7;
+
+    #[cfg(feature = "rocm")]
+    fn f64_rotated_stats(
+        x: &[f32],
+        got: &[f32],
+        k: usize,
+        group: usize,
+        row_period: Option<usize>,
+    ) -> Result<(f64, f64)> {
+        ensure!(
+            k > 0
+                && group >= 16
+                && k.is_multiple_of(group)
+                && x.len() == got.len()
+                && x.len().is_multiple_of(k),
+            "convrot f64 rotated shape"
+        );
+        let rows = x.len() / k;
+        let unique = row_period.map_or(rows, |period| rows.min(period));
+        let mut table = vec![0.0f64; group * group];
+        for col in 0..group {
+            for r in 0..group {
+                table[col * group + r] =
+                    f64::from(bf16::from_f32(super::hadamard(group, r, col)).to_f32());
+            }
+        }
+        let mut reference = vec![0.0f64; unique * k];
+        let groups = k / group;
+        let threads = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(unique.max(1));
+        let rows_per = unique.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut row0 = 0usize;
+            for part in reference.chunks_mut(rows_per * k) {
+                let rows_here = part.len() / k;
+                let start = row0;
+                row0 += rows_here;
+                let table = table.as_slice();
+                scope.spawn(move || {
+                    let mut x_bf16 = vec![0.0f64; k];
+                    for r in 0..rows_here {
+                        let src = &x[(start + r) * k..(start + r + 1) * k];
+                        for (dst, &v) in x_bf16.iter_mut().zip(src) {
+                            *dst = f64::from(bf16::from_f32(v).to_f32());
+                        }
+                        let out = &mut part[r * k..(r + 1) * k];
+                        for g in 0..groups {
+                            let base = g * group;
+                            for col in 0..group {
+                                let mut sum = 0.0f64;
+                                let hcol = &table[col * group..(col + 1) * group];
+                                for i in 0..group {
+                                    sum += x_bf16[base + i] * hcol[i];
+                                }
+                                out[base + col] = sum;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let mut max_abs = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for r in 0..rows {
+            let ref_row = &reference[(r % unique) * k..(r % unique + 1) * k];
+            let got_row = &got[r * k..(r + 1) * k];
+            for (&want, &actual) in ref_row.iter().zip(got_row) {
+                ensure!(actual.is_finite(), "non-finite convrot rotated value");
+                let err = (f64::from(actual) - want).abs();
+                if err > max_abs {
+                    max_abs = err;
+                }
+                sum_sq += err * err;
+            }
+        }
+        let rmse = (sum_sq / (rows * k) as f64).sqrt();
+        Ok((max_abs, rmse))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn check_rocm_rotation_and_product(
+        input: &HostLaunch<'_>,
+        ran: &Ran,
+        row_period: Option<usize>,
+    ) -> Result<()> {
+        let HostLaunch {
+            x,
+            k,
+            group,
+            qweight,
+            n,
+            wscale,
+            ..
+        } = *input;
+        let rows = x.len() / k;
+        let (max_abs, rmse) = f64_rotated_stats(x, &ran.rotated, k, group, row_period)?;
+        emit(&format!(
+            "CONVROT_ROCM_ROTATED rows={rows} k={k} group={group} max_abs={max_abs:.9e} rmse={rmse:.9e}"
+        ));
+        ensure!(
+            max_abs <= ROCM_WMMA_ROT_MAX_ABS && rmse <= ROCM_WMMA_ROT_RMSE,
+            "convrot rocm rotated rows={rows} k={k} group={group} max_abs={max_abs:.9e} rmse={rmse:.9e}"
+        );
+        check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
+        let host = host_product(&ran.codes, &ran.scales, k, qweight, n, wscale)?;
+        let mismatched = bit_diff(&ran.y, &host);
+        emit(&format!(
+            "CONVROT_MMA rows={rows} k={k} n={n} group={group} differ={mismatched}"
+        ));
+        ensure!(
+            mismatched == 0,
+            "convrot rocm product rows={rows} k={k} n={n} group={group} differing bits {mismatched}"
+        );
+        Ok(())
     }
 
     fn tile_row_offset_diff(rotated: &[f32], codes: &[i8], k: usize) -> usize {
@@ -1502,6 +1853,7 @@ mod device {
         })
     }
 
+    #[cfg(feature = "cuda")]
     fn exp2i(exp: i32) -> f64 {
         if (-1022..=1023).contains(&exp) {
             f64::from_bits(((exp + 1023) as u64) << 52)
@@ -1514,6 +1866,7 @@ mod device {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn frexp_half(x: f64) -> (f64, i32) {
         let bits = x.to_bits();
         let exp_field = ((bits >> 52) & 0x7ff) as i32;
@@ -1528,6 +1881,7 @@ mod device {
         (f64::from_bits(mag).copysign(x), exp_field - 1022)
     }
 
+    #[cfg(feature = "cuda")]
     fn sig_exp(x: f64) -> (f64, i32) {
         if x.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
             return (0.0, -126);
@@ -1545,6 +1899,7 @@ mod device {
         (significand, exponent)
     }
 
+    #[cfg(feature = "cuda")]
     fn rz_f32(sum: f64, e_max: i32) -> f32 {
         let (mut significand, exp) = sig_exp(sum * exp2i(e_max));
         significand = (significand * exp2i(23)).trunc() * exp2i(-23);
@@ -1558,6 +1913,7 @@ mod device {
 
     // m16n8k16 f32 accumulator: T-FDPA length 8, F=24, e_zero=-132, round toward zero to f32.
     // k = 0..7, then k = 8..15, each consuming the running accumulator.
+    #[cfg(feature = "cuda")]
     fn t_fdpa8(a: &[(f64, i32)], b: &[(f64, i32)], c: f32) -> f32 {
         const F: i32 = 24;
         const E_ZERO: i32 = -132;
@@ -1590,6 +1946,7 @@ mod device {
         rz_f32(sum, e_max)
     }
 
+    #[cfg(feature = "cuda")]
     fn mma_k16(a: &[f32; 16], b: &[f32; 16], c: f32) -> f32 {
         let mut at = [(0.0f64, 0i32); 16];
         let mut bt = [(0.0f64, 0i32); 16];
@@ -1601,6 +1958,7 @@ mod device {
         t_fdpa8(&at[8..], &bt[8..], mid)
     }
 
+    #[cfg(feature = "cuda")]
     fn mma_k16_points() -> (f32, f32, f32) {
         let mut a = [0.0f32; 16];
         let mut b = [0.0f32; 16];
@@ -1624,6 +1982,7 @@ mod device {
         (paper, one, two)
     }
 
+    #[cfg(feature = "cuda")]
     fn hadamard_terms(group: usize) -> Vec<(f64, i32)> {
         let mut terms = vec![(0.0f64, 0i32); group * group];
         for col in 0..group {
@@ -1635,6 +1994,7 @@ mod device {
         terms
     }
 
+    #[cfg(feature = "cuda")]
     fn mma_quantize_row(
         src: &[f32],
         group: usize,
@@ -1683,6 +2043,7 @@ mod device {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn mma_rotate_quant(x: &[f32], k: usize, group: usize) -> Result<(Vec<i8>, Vec<f32>)> {
         ensure!(
             k > 0
@@ -1792,49 +2153,66 @@ mod device {
                 let x = activation(rows, k);
                 let qweight = weight(n, k);
                 let wscale = wscale_row(n);
+                #[cfg(feature = "cuda")]
                 let (host_codes, host_scales) = mma_rotate_quant(&x, k, group)?;
+                #[cfg(feature = "cuda")]
                 let host = host_product(&host_codes, &host_scales, k, &qweight, n, &wscale)?;
-                let quant = rows == 17 || rows == 20 || rows == 42;
-                let ran = launch_kept(
-                    device,
-                    HostLaunch {
+                let quant = cfg!(feature = "rocm") || rows == 17 || rows == 20 || rows == 42;
+                let launch_input = HostLaunch {
+                    x: &x,
+                    k,
+                    group,
+                    qweight: &qweight,
+                    n,
+                    wscale: &wscale,
+                    keep: quant,
+                };
+                let ran = launch_kept(device, launch_input)?;
+                #[cfg(feature = "cuda")]
+                {
+                    let mismatched = bit_diff(&ran.y, &host);
+                    emit(&format!(
+                        "CONVROT_MMA rows={rows} k={k} n={n} differ={mismatched}"
+                    ));
+                    ensure!(
+                        mismatched == 0,
+                        "convrot mma rows={rows} k={k} n={n} differing bits {mismatched}"
+                    );
+                    if quant {
+                        check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
+                        let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
+                        emit(&format!(
+                            "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
+                        ));
+                        ensure!(
+                            rotated_diff == 0,
+                            "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
+                        );
+                        let host_code_diff = count_i8(&host_codes, &ran.codes);
+                        let host_scale_diff = count_f32(&host_scales, &ran.scales);
+                        emit(&format!(
+                            "CONVROT_HOST rows={rows} k={k} codes={host_code_diff} scales={host_scale_diff}"
+                        ));
+                        ensure!(
+                            host_code_diff == 0 && host_scale_diff == 0,
+                            "convrot host rows={rows} k={k} codes {host_code_diff} scales {host_scale_diff}"
+                        );
+                    }
+                }
+                #[cfg(feature = "rocm")]
+                check_rocm_rotation_and_product(
+                    &HostLaunch {
                         x: &x,
                         k,
                         group,
                         qweight: &qweight,
                         n,
                         wscale: &wscale,
-                        keep: quant,
+                        keep: true,
                     },
+                    &ran,
+                    Some(23),
                 )?;
-                let mismatched = bit_diff(&ran.y, &host);
-                emit(&format!(
-                    "CONVROT_MMA rows={rows} k={k} n={n} differ={mismatched}"
-                ));
-                ensure!(
-                    mismatched == 0,
-                    "convrot mma rows={rows} k={k} n={n} differing bits {mismatched}"
-                );
-                if quant {
-                    check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
-                    let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
-                    emit(&format!(
-                        "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
-                    ));
-                    ensure!(
-                        rotated_diff == 0,
-                        "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
-                    );
-                    let host_code_diff = count_i8(&host_codes, &ran.codes);
-                    let host_scale_diff = count_f32(&host_scales, &ran.scales);
-                    emit(&format!(
-                        "CONVROT_HOST rows={rows} k={k} codes={host_code_diff} scales={host_scale_diff}"
-                    ));
-                    ensure!(
-                        host_code_diff == 0 && host_scale_diff == 0,
-                        "convrot host rows={rows} k={k} codes {host_code_diff} scales {host_scale_diff}"
-                    );
-                }
                 if rows == 20 && k == 5376 {
                     let (seq_codes, seq_scales) = super::rotate_quant(&x, k, group)?;
                     let sequential =
@@ -1855,7 +2233,22 @@ mod device {
                             shifted[r * k + c] = x[r * k + (c + 1) % k];
                         }
                     }
-                    let (shift_codes, _) = mma_rotate_quant(&shifted, k, group)?;
+                    #[cfg(feature = "cuda")]
+                    let shift_codes = mma_rotate_quant(&shifted, k, group)?.0;
+                    #[cfg(feature = "rocm")]
+                    let shift_codes = launch_kept(
+                        device,
+                        HostLaunch {
+                            x: &shifted,
+                            k,
+                            group,
+                            qweight: &qweight,
+                            n,
+                            wscale: &wscale,
+                            keep: true,
+                        },
+                    )?
+                    .codes;
                     let col_diff = count_i8(&shift_codes, &ran.codes);
                     emit(&format!(
                         "CONVROT_BF16_COL rows=20 k=5376 differ={col_diff}"
@@ -1906,32 +2299,66 @@ mod device {
         let x = activation(rows, k);
         let qweight = weight(n, k);
         let wscale = wscale_row(n);
-        let host = {
-            let (codes, scales) = mma_rotate_quant(&x, k, wide)?;
-            host_product(&codes, &scales, k, &qweight, n, &wscale)?
-        };
-        let y = launch(device, &x, k, wide, &qweight, n, &wscale)?;
-        let mismatched = bit_diff(&y, &host);
-        emit(&format!(
-            "CONVROT_MMA rows={rows} k={k} n={n} group={wide} differ={mismatched}"
-        ));
-        ensure!(
-            mismatched == 0,
-            "convrot mma rows={rows} k={k} n={n} group={wide} differing bits {mismatched}"
-        );
+        #[cfg(feature = "cuda")]
+        {
+            let host = {
+                let (codes, scales) = mma_rotate_quant(&x, k, wide)?;
+                host_product(&codes, &scales, k, &qweight, n, &wscale)?
+            };
+            let y = launch(device, &x, k, wide, &qweight, n, &wscale)?;
+            let mismatched = bit_diff(&y, &host);
+            emit(&format!(
+                "CONVROT_MMA rows={rows} k={k} n={n} group={wide} differ={mismatched}"
+            ));
+            ensure!(
+                mismatched == 0,
+                "convrot mma rows={rows} k={k} n={n} group={wide} differing bits {mismatched}"
+            );
+        }
+        #[cfg(feature = "rocm")]
+        {
+            let ran = launch_kept(
+                device,
+                HostLaunch {
+                    x: &x,
+                    k,
+                    group: wide,
+                    qweight: &qweight,
+                    n,
+                    wscale: &wscale,
+                    keep: true,
+                },
+            )?;
+            check_rocm_rotation_and_product(
+                &HostLaunch {
+                    x: &x,
+                    k,
+                    group: wide,
+                    qweight: &qweight,
+                    n,
+                    wscale: &wscale,
+                    keep: true,
+                },
+                &ran,
+                Some(23),
+            )?;
+        }
         Ok(())
     }
 
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn convrot_kernel_matches_the_definition() -> Result<()> {
-        let (paper, one, two) = mma_k16_points();
-        ensure!(
-            paper.to_bits() == (-0.5f32).to_bits()
-                && one.to_bits() == 1.0f32.to_bits()
-                && two.to_bits() == 2.0f32.to_bits(),
-            "mma k16 self-check paper={paper} one={one} two={two}"
-        );
+        #[cfg(feature = "cuda")]
+        {
+            let (paper, one, two) = mma_k16_points();
+            ensure!(
+                paper.to_bits() == (-0.5f32).to_bits()
+                    && one.to_bits() == 1.0f32.to_bits()
+                    && two.to_bits() == 2.0f32.to_bits(),
+                "mma k16 self-check paper={paper} one={one} two={two}"
+            );
+        }
         let device = Device::new(0)?;
         let group = 256usize;
         let shapes = [
@@ -1945,36 +2372,78 @@ mod device {
             (17, 14336, 5376),
         ];
         for (rows, k, n) in shapes {
-            let expected = definition_bits(rows, k, n)?;
-            let quant = rows == 17 && k != 256;
             let x = activation(rows, k);
-            let ran = launch_kept(
-                &device,
-                HostLaunch {
-                    x: &x,
-                    k,
-                    group,
-                    qweight: &weight(n, k),
-                    n,
-                    wscale: &wscale_row(n),
-                    keep: quant,
-                },
-            )?;
-            let mismatched = differ(&ran.y, &expected);
-            ensure!(
-                mismatched == 0,
-                "convrot kernel M={rows} K={k} N={n} differing bits {mismatched}"
-            );
-            if quant {
-                check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
-                let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
-                emit(&format!(
-                    "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
-                ));
+            let qweight = weight(n, k);
+            let wscale = wscale_row(n);
+            #[cfg(feature = "cuda")]
+            {
+                let expected = definition_bits(rows, k, n)?;
+                let quant = rows == 17 && k != 256;
+                let ran = launch_kept(
+                    &device,
+                    HostLaunch {
+                        x: &x,
+                        k,
+                        group,
+                        qweight: &qweight,
+                        n,
+                        wscale: &wscale,
+                        keep: quant,
+                    },
+                )?;
+                let mismatched = differ(&ran.y, &expected);
                 ensure!(
-                    rotated_diff == 0,
-                    "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
+                    mismatched == 0,
+                    "convrot kernel M={rows} K={k} N={n} differing bits {mismatched}"
                 );
+                if quant {
+                    check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
+                    let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
+                    emit(&format!(
+                        "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
+                    ));
+                    ensure!(
+                        rotated_diff == 0,
+                        "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
+                    );
+                }
+            }
+            #[cfg(feature = "rocm")]
+            {
+                let keep = rows >= super::TENSOR_CORE_ROWS;
+                let ran = launch_kept(
+                    &device,
+                    HostLaunch {
+                        x: &x,
+                        k,
+                        group,
+                        qweight: &qweight,
+                        n,
+                        wscale: &wscale,
+                        keep,
+                    },
+                )?;
+                if rows == 1 {
+                    let mismatched = differ(&ran.y, &M1);
+                    ensure!(mismatched == 0, "convrot M=1 differing bits {mismatched}");
+                } else if rows == 16 {
+                    let mismatched = differ(&ran.y, &M16);
+                    ensure!(mismatched == 0, "convrot M=16 differing bits {mismatched}");
+                } else {
+                    check_rocm_rotation_and_product(
+                        &HostLaunch {
+                            x: &x,
+                            k,
+                            group,
+                            qweight: &qweight,
+                            n,
+                            wscale: &wscale,
+                            keep: true,
+                        },
+                        &ran,
+                        Some(23),
+                    )?;
+                }
             }
         }
         check_group_dot_tiles(&device)?;
@@ -1988,11 +2457,18 @@ mod device {
         let mut shifted = wscale.clone();
         shifted[0] *= 2.0;
         let scale_off = launch(&device, &x, k, group, &qweight, n, &shifted)?;
+        #[cfg(feature = "cuda")]
         ensure!(
             differ(&scale_off, &definition_bits(rows, k, n)?) > 0,
             "a doubled wscale reproduced the definition bits"
         );
+        #[cfg(feature = "rocm")]
+        ensure!(
+            bit_diff(&scale_off, &y) > 0,
+            "a doubled wscale reproduced the device output"
+        );
         let omitted = super::linear_omitting_rotation(&x, k, &qweight, n, &wscale)?;
+        #[cfg(feature = "cuda")]
         ensure!(
             differ(&omitted, &definition_bits(rows, k, n)?) > 0
                 && differ(
@@ -2000,6 +2476,11 @@ mod device {
                     &y.iter().map(|v| v.to_bits() as i16).collect::<Vec<_>>()
                 ) > 0,
             "omitting the rotation reproduced the definition bits"
+        );
+        #[cfg(feature = "rocm")]
+        ensure!(
+            bit_diff(&omitted, &y) > 0,
+            "omitting the rotation reproduced the device output"
         );
         Ok(())
     }
@@ -2142,7 +2623,7 @@ mod device {
             },
         )?;
         stream.synchronize()?;
-        Ok(stream.clone_dtoh(&y_d)?)
+        stream.clone_dtoh(&y_d).context("convrot product download")
     }
 
     fn check_gate_up_product(device: &Device) -> Result<()> {
@@ -2241,7 +2722,22 @@ mod device {
 
     fn check_gate_up_stripes(device: &Device) -> Result<()> {
         let (rows, k, n) = (37_717, 5376, 28_672);
-        let [product, _] = super::gate_up_product_order(device, [rows, 0], (k, n))?;
+        let [selected, _] = super::gate_up_product_order(device, [rows, 0], (k, n))?;
+        let forced = match selected {
+            ProductKernel::MFastStriped { .. } => false,
+            _ if matches!(&device.info.arch, crate::backend::setup::DeviceArchitecture::Hip(gfx) if gfx.starts_with("gfx11")) => {
+                true
+            }
+            _ => return Ok(()),
+        };
+        let product = if forced {
+            ProductKernel::MFastStriped {
+                tiles: 59,
+                stripes: 5,
+            }
+        } else {
+            selected
+        };
         let ProductKernel::MFastStriped { tiles, stripes } = product else {
             return Ok(());
         };
@@ -2253,7 +2749,7 @@ mod device {
         let diff = bit_diff(&run(&codes, &scales, product)?, &reference);
         ensure!(diff == 0, "striped gate/up differs in {diff} elements");
 
-        let tile = super::PRODUCT_BM as usize;
+        let tile = product.tile_dims(&device.info.arch).0 as usize;
         let start = rows / tile * tile;
         let wrong = start - tile;
         codes.copy_within(wrong * k..(wrong + rows - start) * k, start * k);
@@ -2271,11 +2767,18 @@ mod device {
         );
         ensure!(shifted[start * n..] == reference[wrong * n..(wrong + rows - start) * n]);
         println!(
-            "CONVROT_GATE_UP_STRIPES tiles={tiles} stripes={stripes} rows={rows} k={k} n={n} differ={diff} wrong_tail_rows={moved_rows}"
+            "CONVROT_GATE_UP_STRIPES tiles={tiles} stripes={stripes} rows={rows} k={k} n={n} forced={forced} differ={diff} wrong_tail_rows={moved_rows}"
         );
         let padded_rows = rows + tile;
         let (codes, scales, weights, wscale) = fixture(padded_rows, 64, 257);
-        let [padded, _] = super::gate_up_product_order(device, [padded_rows, 0], (k, n))?;
+        let padded = if forced {
+            ProductKernel::MFastStriped {
+                tiles: 60,
+                stripes: 5,
+            }
+        } else {
+            super::gate_up_product_order(device, [padded_rows, 0], (k, n))?[0]
+        };
         let narrow = |order| {
             launch_product_at(
                 device,
@@ -2391,6 +2894,7 @@ mod device {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn cuobjdump_bin() -> std::path::PathBuf {
         if let Some(home) = std::env::var_os("CUDA_HOME") {
             let candidate = std::path::Path::new(&home).join("bin/cuobjdump");
@@ -2401,6 +2905,7 @@ mod device {
         std::path::PathBuf::from("cuobjdump")
     }
 
+    #[cfg(feature = "cuda")]
     fn function_sass<'a>(dump: &'a str, name: &str) -> Option<&'a str> {
         let marker = format!("Function : {name}\n");
         let start = dump.find(&marker)? + marker.len();
@@ -2409,6 +2914,7 @@ mod device {
         Some(&rest[..end])
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn convrot_product_sass_is_imma16832() -> Result<()> {
         let sms = crate::backend::cuda::cubin::arches();
@@ -2480,6 +2986,7 @@ mod device {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn sass_ops(body: &str) -> Vec<&str> {
         body.split_whitespace()
             .map(|word| word.trim_end_matches(';'))
@@ -2487,6 +2994,7 @@ mod device {
             .collect()
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn convrot_group_dot_sass_loads_the_table() -> Result<()> {
         let sms = crate::backend::cuda::cubin::arches();
@@ -2576,6 +3084,7 @@ mod device {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn function_resources(dump: &str, function: &str) -> Result<(u32, u32, u32)> {
         let marker = format!("Function {function}:");
         let rest = dump
@@ -2591,6 +3100,177 @@ mod device {
                 .with_context(|| format!("missing {name}"))
         };
         Ok((field("REG:")?, field("STACK:")?, field("LOCAL:")?))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_llvm_bin(tool: &str) -> std::path::PathBuf {
+        for var in ["HIP_HOME", "ROCM_PATH"] {
+            if let Some(home) = std::env::var_os(var) {
+                for rel in [format!("llvm/bin/{tool}"), format!("bin/{tool}")] {
+                    let candidate = std::path::Path::new(&home).join(rel);
+                    if candidate.is_file() {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                let direct = dir.join(tool);
+                if direct.is_file() {
+                    return direct;
+                }
+                if let Some(parent) = dir.parent() {
+                    let llvm = parent.join("llvm/bin").join(tool);
+                    if llvm.is_file() {
+                        return llvm;
+                    }
+                }
+            }
+        }
+        std::path::PathBuf::from(tool)
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_kernel_disasm<'a>(dump: &'a str, name: &str) -> Option<&'a str> {
+        let marker = format!("<{name}>:\n");
+        let start = dump.find(&marker)? + marker.len();
+        let rest = &dump[start..];
+        let end = rest
+            .lines()
+            .scan(0usize, |offset, line| {
+                let pos = *offset;
+                *offset += line.len() + 1;
+                Some((pos, line))
+            })
+            .find(|(_, line)| line.ends_with(">:") && line.contains('<'))
+            .map(|(pos, _)| pos)
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_kernel_metadata(notes: &str, name: &str) -> Result<(u32, u32)> {
+        let block = notes
+            .split("\n  - .")
+            .find(|chunk| {
+                chunk
+                    .lines()
+                    .any(|line| line.trim().strip_prefix(".name:").map(str::trim) == Some(name))
+            })
+            .with_context(|| format!("{name} missing from llvm-readelf --notes"))?;
+        let field = |key: &str| -> Result<u32> {
+            block
+                .lines()
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix(key)
+                        .and_then(|rest| rest.trim().parse().ok())
+                })
+                .with_context(|| format!("missing {key} for {name}"))
+        };
+        Ok((
+            field(".vgpr_count:")?,
+            field(".private_segment_fixed_size:")?,
+        ))
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn convrot_rocm_hsaco_is_wmma_and_spill_free() -> Result<()> {
+        let arches: Vec<&str> = crate::backend::cuda::cubin::rocm_arches()
+            .iter()
+            .copied()
+            .filter(|arch| arch.starts_with("gfx11"))
+            .collect();
+        ensure!(!arches.is_empty(), "convrot gfx11 hsaco missing");
+        for arch in arches {
+            let bytes = crate::backend::cuda::cubin::rocm_bytes("convrot", arch)
+                .with_context(|| format!("convrot hsaco {arch}"))?;
+            let pid = std::process::id();
+            let hsaco = std::env::temp_dir().join(format!("convrot-{pid}-{arch}.hsaco"));
+            let elf = std::env::temp_dir().join(format!("convrot-{pid}-{arch}.elf"));
+            std::fs::write(&hsaco, bytes).context("write convrot hsaco")?;
+            let unbundle = std::process::Command::new(rocm_llvm_bin("clang-offload-bundler"))
+                .arg("--type=o")
+                .arg(format!("--targets=hipv4-amdgcn-amd-amdhsa--{arch}"))
+                .arg(format!("--input={}", hsaco.display()))
+                .arg(format!("--output={}", elf.display()))
+                .arg("--unbundle")
+                .output()
+                .context("clang-offload-bundler")?;
+            let _ = std::fs::remove_file(&hsaco);
+            ensure!(
+                unbundle.status.success(),
+                "clang-offload-bundler {arch} failed: {}",
+                String::from_utf8_lossy(&unbundle.stderr)
+            );
+            let disasm = std::process::Command::new(rocm_llvm_bin("llvm-objdump"))
+                .arg("--disassemble")
+                .arg(format!("--mcpu={arch}"))
+                .arg(&elf)
+                .output()
+                .context("llvm-objdump")?;
+            let notes = std::process::Command::new(rocm_llvm_bin("llvm-readelf"))
+                .arg("--notes")
+                .arg(&elf)
+                .output()
+                .context("llvm-readelf")?;
+            let _ = std::fs::remove_file(&elf);
+            ensure!(
+                disasm.status.success() && notes.status.success(),
+                "llvm-objdump/llvm-readelf {arch} failed"
+            );
+            let disasm_text = String::from_utf8_lossy(&disasm.stdout);
+            let notes_text = String::from_utf8_lossy(&notes.stdout);
+            for (name, want_bf16, max_vgprs) in [
+                ("convrot_group_dot", 1usize, 96u32),
+                ("convrot_group_dot_silu", 1, 96),
+                ("convrot_group_dot_32", 2, 96),
+                ("convrot_group_dot_silu_32", 2, 96),
+            ] {
+                let body = rocm_kernel_disasm(&disasm_text, name)
+                    .with_context(|| format!("{arch} {name} missing from llvm-objdump"))?;
+                let bf16 = body.matches("v_wmma_f32_16x16x16_bf16").count();
+                let scratch =
+                    body.matches("scratch_load").count() + body.matches("scratch_store").count();
+                let (vgprs, priv_bytes) = rocm_kernel_metadata(&notes_text, name)?;
+                println!(
+                    "CONVROT_GROUP_DOT_ISA {arch} {name} BF16_WMMA={bf16} VGPR={vgprs} PRIV={priv_bytes} SCRATCH={scratch}"
+                );
+                ensure!(
+                    bf16 == want_bf16 && vgprs <= max_vgprs && priv_bytes == 0 && scratch == 0,
+                    "{arch} {name} BF16_WMMA={bf16} VGPR={vgprs} PRIV={priv_bytes} SCRATCH={scratch}"
+                );
+            }
+            for name in [
+                "convrot_product",
+                "convrot_product_m_fast",
+                "convrot_product_n_fast_ldsm",
+            ] {
+                let body = rocm_kernel_disasm(&disasm_text, name)
+                    .with_context(|| format!("{arch} {name} missing from llvm-objdump"))?;
+                let iu8 = body.matches("v_wmma_i32_16x16x16_iu8").count();
+                let ds_ld128 = body.matches("ds_load_b128").count();
+                let barriers = body.matches("s_barrier").count();
+                let scratch =
+                    body.matches("scratch_load").count() + body.matches("scratch_store").count();
+                let (vgprs, priv_bytes) = rocm_kernel_metadata(&notes_text, name)?;
+                println!(
+                    "CONVROT_PRODUCT_ISA {arch} {name} IU8_WMMA={iu8} DS_LD128={ds_ld128} BAR={barriers} VGPR={vgprs} PRIV={priv_bytes} SCRATCH={scratch}"
+                );
+                ensure!(
+                    iu8 == 32
+                        && ds_ld128 == 24
+                        && barriers == 2
+                        && vgprs <= 216
+                        && priv_bytes == 0
+                        && scratch == 0,
+                    "{arch} {name} IU8_WMMA={iu8} DS_LD128={ds_ld128} BAR={barriers} VGPR={vgprs} PRIV={priv_bytes} SCRATCH={scratch}"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn count_i8(got: &[i8], expected: &[i8]) -> usize {
@@ -2632,7 +3312,7 @@ mod device {
         let device = Device::new(0)?;
         let [ordinary, _] = super::group_dot_32_wave_sizes(&device)?;
         use crate::backend::setup::DeviceArchitecture::Cuda;
-        if !matches!(device.info.arch, Cuda(sm) if sm >= 80) {
+        if !super::arch_supported(&device.info.arch) {
             return Ok(());
         }
         ensure!(
@@ -2699,8 +3379,7 @@ mod device {
         let silu =
             crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
         let [ordinary_32, fused_32] = super::group_dot_32_wave_sizes(&device)?;
-        if matches!(device.info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
-        {
+        if super::arch_supported(&device.info.arch) {
             ensure!(
                 fused_32.is_some(),
                 "fused 32-row ConvRot resource gate did not admit the kernel on {}",
@@ -2810,6 +3489,23 @@ mod device {
                 xr == 0 && codes == 0 && scales == 0 && y == 0,
                 "fused SiLU rows={rows} differs"
             );
+            #[cfg(feature = "rocm")]
+            if rows == 17 {
+                let gated_host: Vec<f32> = stream
+                    .clone_dtoh(&gated)?
+                    .into_iter()
+                    .map(bf16::to_f32)
+                    .collect();
+                let (max_abs, rmse) =
+                    f64_rotated_stats(&gated_host, &fused.rotated[..rows * k], k, group, None)?;
+                println!(
+                    "CONVROT_SILU_ROCM_F64 rows={rows} k={k} max_abs={max_abs:.9e} rmse={rmse:.9e}"
+                );
+                ensure!(
+                    max_abs <= ROCM_WMMA_SILU_ROT_MAX_ABS && rmse <= ROCM_WMMA_SILU_ROT_RMSE,
+                    "fused SiLU rocm f64 rows={rows} k={k} max_abs={max_abs:.9e} rmse={rmse:.9e}"
+                );
+            }
             if fused_32.is_some() {
                 let selected = super::group_dot_32_fills_wave(rows, k, fused_32);
                 ensure!(

@@ -20,6 +20,16 @@ pub fn arches() -> &'static [u32] {
     binaries::ARCHES
 }
 
+#[cfg(all(test, feature = "rocm"))]
+pub fn rocm_bytes(name: &str, gfx: &str) -> Option<&'static [u8]> {
+    binaries::hsaco(name, gfx)
+}
+
+#[cfg(all(test, feature = "rocm"))]
+pub fn rocm_arches() -> &'static [&'static str] {
+    binaries::ARCHES
+}
+
 #[cfg(feature = "cuda")]
 pub fn check(sm: u32) -> Result<()> {
     ensure!(
