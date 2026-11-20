@@ -735,12 +735,20 @@ impl Flash {
                     "attention_prefill_d512",
                     "attention_prefill_d512_bidirectional",
                 ]
-            } else if head_dim == 256 && score.is_some() {
-                &[
-                    "attention_prefill_d256_window",
-                    "attention_prefill_d256_bidirectional",
-                    "attention_prefill_d256_symmetric",
-                ]
+            } else if let Some(score) = score.filter(|_| head_dim == 256) {
+                if score.window_left.is_some() {
+                    &[
+                        "attention_prefill_d256_window",
+                        "attention_prefill_d256_bidirectional_scored",
+                        "attention_prefill_d256_symmetric",
+                    ]
+                } else {
+                    &[
+                        "attention_prefill_d256_scored",
+                        "attention_prefill_d256_bidirectional_scored",
+                        "attention_prefill_d256_symmetric",
+                    ]
+                }
             } else if head_dim == 256 {
                 &[
                     "attention_prefill_d256",
@@ -4549,6 +4557,32 @@ mod tests {
                 "128-bidirectional",
                 false,
             ),
+            (
+                "d256-bidir-scale1",
+                256,
+                16,
+                8,
+                "bidirectional",
+                17,
+                0,
+                33,
+                Some(1.0f32),
+                "e256-unit",
+                false,
+            ),
+            (
+                "d256-causal-scale1",
+                256,
+                16,
+                8,
+                "causal",
+                17,
+                15,
+                32,
+                Some(1.0f32),
+                "e256-unit",
+                false,
+            ),
         ];
         for (name, d, hq, hkv, mode, rows, start, keys, scale, family, single_pv) in cases {
             let capacity = keys + 16;
@@ -4696,7 +4730,10 @@ mod tests {
             }
         }
         ensure!(defects == 0, "ROCm Flash attention DEFECT count={defects}");
-        println!("PASS HIP_FLASH cells=8 disjoint_windows=8 defects=0");
+        println!(
+            "PASS HIP_FLASH cells={} disjoint_windows=8 defects=0",
+            cases.len()
+        );
         Ok(())
     }
 }

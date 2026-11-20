@@ -1398,6 +1398,8 @@ extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill:
 extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }
 extern "C" __global__ __launch_bounds__(128, 2) void attention_prefill_d128_bidirectional_single_pv(prefill::Problem p, uint32_t keys) { prefill::run_d128_bidir_single_pv(p,keys); }
 extern "C" __global__ void attention_prefill_d256_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<256,1>(p,keys); }
+extern "C" __global__ void attention_prefill_d256_scored(prefill::Problem p, float scale) { prefill::run<256,0,true>(p,0,scale); }
+extern "C" __global__ void attention_prefill_d256_bidirectional_scored(prefill::Problem p, uint32_t keys, float scale) { prefill::run<256,1,true>(p,keys,scale); }
 extern "C" __global__ void attention_prefill_d128_prefix(prefill::Problem p, uint32_t prefix) { prefill::run<128,2>(p,prefix); }
 extern "C" __global__ void attention_prefill_d128_window(prefill::Problem p, uint32_t window) { prefill::run<128,3>(p,window); }
 #endif
