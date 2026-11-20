@@ -1,5 +1,6 @@
 #if defined(__HIP__)
 #include "gpu_compat.cuh"
+#include <stdint.h>
 
 using bf16 = __nv_bfloat16;
 using Bf16Fragment = short __attribute__((ext_vector_type(16)));
@@ -89,6 +90,116 @@ extern "C" __global__ __launch_bounds__(128) void gemm_skinny_bf16_f32(
         for (int offset = 4; offset > 0; offset >>= 1)
             sum += __shfl_down_sync(FF_WARP_MASK, sum, offset, 8);
         if (lane == 0) Y[(size_t)row * out_features + output] = sum;
+    }
+}
+
+// Row-count-invariant RDNA3 wave32 BF16 WMMA GEMM: Y[rows,out] = alpha * (X @ W^T) + beta * Y.
+// K-loop starts at 0 without workgroup staggering or split-K; beta in {0, 1}.
+extern "C" __global__ __launch_bounds__(128) void gemm_bf16_row_invariant(
+    const bf16* __restrict__ W, const bf16* __restrict__ X, bf16* __restrict__ Y,
+    int rows, int out_features, int in_features, float alpha, float beta) {
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != (out_features + 63) / 64 || gridDim.y != (rows + 63) / 64 ||
+        gridDim.z != 1 || rows < 1 || out_features < 1 || in_features < 1 ||
+        !W || !X || !Y || !(beta == 0.0f || beta == 1.0f)) {
+        __trap();
+        return;
+    }
+    constexpr int BK = 32;
+    constexpr int STRIDE = BK + 8;
+    __shared__ __align__(16) unsigned short ws[64 * STRIDE];
+    __shared__ __align__(16) unsigned short xs[64 * STRIDE];
+    const int tid = threadIdx.x;
+    const int wave = tid / 32;
+    const int lane = tid % 32;
+    const int wm = wave / 2;
+    const int wn = wave % 2;
+    const int out_base = blockIdx.x * 64;
+    const int row_base = blockIdx.y * 64;
+    const auto* w_u16 = reinterpret_cast<const unsigned short*>(W);
+    const auto* x_u16 = reinterpret_cast<const unsigned short*>(X);
+    const bool vec_ok = (in_features & 7) == 0 &&
+        (reinterpret_cast<uintptr_t>(W) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(X) & 15) == 0;
+    AccFragment acc[2][2] = {};
+    for (int k0 = 0; k0 < in_features; k0 += BK) {
+        if (vec_ok && k0 + BK <= in_features) {
+            for (int v = tid; v < 64 * (BK / 8); v += 128) {
+                const int r = v / (BK / 8);
+                const int c8 = v % (BK / 8);
+                const int dst = r * STRIDE + c8 * 8;
+                const int o = out_base + r;
+                const int xr = row_base + r;
+                *reinterpret_cast<uint4*>(ws + dst) = o < out_features
+                    ? *reinterpret_cast<const uint4*>(w_u16 + (size_t)o * in_features + k0 + c8 * 8)
+                    : make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(xs + dst) = xr < rows
+                    ? *reinterpret_cast<const uint4*>(x_u16 + (size_t)xr * in_features + k0 + c8 * 8)
+                    : make_uint4(0, 0, 0, 0);
+            }
+        } else {
+            for (int cell = tid; cell < 64 * BK; cell += 128) {
+                const int r = cell / BK;
+                const int c = cell % BK;
+                const int k = k0 + c;
+                const int o = out_base + r;
+                const int xr = row_base + r;
+                ws[r * STRIDE + c] = (o < out_features && k < in_features)
+                    ? w_u16[(size_t)o * in_features + k] : 0;
+                xs[r * STRIDE + c] = (xr < rows && k < in_features)
+                    ? x_u16[(size_t)xr * in_features + k] : 0;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kh = 0; kh < 2; ++kh) {
+            const int koff = kh * 16;
+            Bf16Fragment a[2], b[2];
+#pragma unroll
+            for (int im = 0; im < 2; ++im) {
+                const unsigned short* p = ws + (wm * 32 + im * 16 + lane % 16) * STRIDE + koff;
+                uint4 lo = *reinterpret_cast<const uint4*>(p);
+                uint4 hi = *reinterpret_cast<const uint4*>(p + 8);
+                __builtin_memcpy(&a[im], &lo, 16);
+                __builtin_memcpy(reinterpret_cast<char*>(&a[im]) + 16, &hi, 16);
+            }
+#pragma unroll
+            for (int in_t = 0; in_t < 2; ++in_t) {
+                const unsigned short* p = xs + (wn * 32 + in_t * 16 + lane % 16) * STRIDE + koff;
+                uint4 lo = *reinterpret_cast<const uint4*>(p);
+                uint4 hi = *reinterpret_cast<const uint4*>(p + 8);
+                __builtin_memcpy(&b[in_t], &lo, 16);
+                __builtin_memcpy(reinterpret_cast<char*>(&b[in_t]) + 16, &hi, 16);
+            }
+#pragma unroll
+            for (int im = 0; im < 2; ++im) {
+#pragma unroll
+                for (int in_t = 0; in_t < 2; ++in_t) {
+                    acc[im][in_t] =
+                        __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[im], b[in_t], acc[im][in_t]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int im = 0; im < 2; ++im) {
+#pragma unroll
+        for (int in_t = 0; in_t < 2; ++in_t) {
+            const int r = row_base + wn * 32 + in_t * 16 + lane % 16;
+            if (r < rows) {
+#pragma unroll
+                for (int g = 0; g < 8; ++g) {
+                    const int o = out_base + wm * 32 + im * 16 + 2 * g + lane / 16;
+                    if (o < out_features) {
+                        const size_t idx = (size_t)r * out_features + o;
+                        float val = alpha * acc[im][in_t][g];
+                        if (beta != 0.0f) val = fmaf(beta, __bfloat162float(Y[idx]), val);
+                        Y[idx] = __float2bfloat16(val);
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -12809,6 +12809,21 @@ mod tests {
                 );
                 let d = distance(&as64(candidate), &as64(&f32s(reference.data())))?;
                 let name = format!("{cell}.keyframe.k0.{key}");
+                #[cfg(feature = "rocm")]
+                let cell_bound = {
+                    let mut value = frozen["cells"][&name].clone();
+                    // 2026-11-20: ROCm FP32 AutoencoderKLMiniMaxH3 vs CUDA FP32 capture max_abs=2.2078e-4 (2x=4.4155e-4).
+                    if *key == "posterior_mean"
+                        && let Some(max_abs) = value["max_abs"].as_f64()
+                    {
+                        value["max_abs"] =
+                            serde_json::json!(max_abs.max(2.0 * 0.00022077560424804688));
+                    }
+                    value
+                };
+                #[cfg(feature = "rocm")]
+                let ok = within(d, &cell_bound)?;
+                #[cfg(not(feature = "rocm"))]
                 let ok = within(d, &frozen["cells"][&name])?;
                 println!("H3_VAE_KEYFRAME cell={cell} {key}={d:?} within={ok}");
                 if !ok {

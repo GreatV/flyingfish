@@ -1132,6 +1132,211 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
     }
   }
 }
+
+__device__ __forceinline__ int swz8(int row, int col8) { return col8 ^ (row & 7); }
+
+__device__ __forceinline__ uint4 load_bf16_vec8(const unsigned short* src, bool aligned) {
+  if (aligned) return *reinterpret_cast<const uint4*>(src);
+  unsigned short tmp[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) tmp[j] = src[j];
+  uint4 out;
+  __builtin_memcpy(&out, tmp, sizeof(out));
+  return out;
+}
+
+// Single-plane BF16 D128 bidirectional attention: 29,312 B LDS (shared K/score/V) and 4-lane/row softmax.
+__device__ void run_d128_bidir_single_pv(Problem p, uint32_t keys) {
+  if (p.position) {
+    const int start = *p.position;
+    if (start < 0) __trap();
+    p.start = min(static_cast<uint32_t>(start), p.start);
+  }
+  constexpr int D = 128;
+  constexpr int BQ = 32;
+  constexpr int BK = 64;
+  constexpr int HIGH_STRIDE = BK + 8;
+  const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+  const uint32_t head = blockIdx.y, kv_head = head / p.group;
+  const uint32_t query_base = blockIdx.x * BQ;
+  const uint32_t expected_x = (p.rows + BQ - 1) / BQ;
+  if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+      gridDim.x != expected_x || gridDim.y != p.q_heads || gridDim.z != 1 ||
+      p.group == 0 || p.rows == 0 || p.start > p.capacity || p.rows > p.capacity - p.start) {
+    __trap();
+  }
+  __shared__ __align__(16) unsigned short qs[BQ * D];
+  __shared__ __align__(16) unsigned short kv[BK * D];
+  __shared__ __align__(16) unsigned short high[BQ * HIGH_STRIDE];
+  __shared__ __align__(16) float alpha[BQ];
+  auto* score_memory = reinterpret_cast<float*>(kv);
+  const auto* q_u16 = reinterpret_cast<const unsigned short*>(p.q);
+  const auto* k_u16 = reinterpret_cast<const unsigned short*>(p.k);
+  const auto* v_u16 = reinterpret_cast<const unsigned short*>(p.v);
+  const bool q_aligned = ((reinterpret_cast<uintptr_t>(q_u16) & 15) == 0) && ((p.q_stride & 7) == 0);
+  const bool k_aligned = (reinterpret_cast<uintptr_t>(k_u16) & 15) == 0;
+  const bool v_aligned = (reinterpret_cast<uintptr_t>(v_u16) & 15) == 0;
+  for (int vec = tid; vec < BQ * (D / 8); vec += 128) {
+    const int r = vec / 16;
+    const int c8 = vec % 16;
+    const uint32_t row = query_base + r;
+    const int dst = r * D + swz8(r, c8) * 8;
+    *reinterpret_cast<uint4*>(qs + dst) = row < p.rows
+        ? load_bf16_vec8(q_u16 + (size_t)row * p.q_stride + head * D + c8 * 8, q_aligned)
+        : make_uint4(0, 0, 0, 0);
+  }
+  float peak = -INFINITY, denominator = 0.0f, correction = 0.0f;
+  A output[4] = {};
+  const int q_slab = wave / 2;
+  const int key_slab = (wave % 2) * 2;
+  const int channel = (wave % 2) * 64;
+  const int soft_row = tid / 4;
+  const int soft_sub = tid % 4;
+  __syncthreads();
+  for (uint32_t base = 0; base < keys; base += BK) {
+    for (int vec = tid; vec < BK * (D / 8); vec += 128) {
+      const int r = vec / 16;
+      const int c8 = vec % 16;
+      const uint32_t key = base + r;
+      const int dst = r * D + swz8(r, c8) * 8;
+      *reinterpret_cast<uint4*>(kv + dst) = key < keys
+          ? load_bf16_vec8(k_u16 + ((size_t)kv_head * p.capacity + key) * D + c8 * 8, k_aligned)
+          : make_uint4(0, 0, 0, 0);
+    }
+    __syncthreads();
+    A scores[2] = {};
+    const int qr = q_slab * 16 + lane % 16;
+#pragma unroll
+    for (int part = 0; part < D / 16; ++part) {
+      B a;
+      const uint4 alo = *reinterpret_cast<const uint4*>(qs + qr * D + swz8(qr, 2 * part) * 8);
+      const uint4 ahi = *reinterpret_cast<const uint4*>(qs + qr * D + swz8(qr, 2 * part + 1) * 8);
+      __builtin_memcpy(&a, &alo, 16);
+      __builtin_memcpy(reinterpret_cast<char*>(&a) + 16, &ahi, 16);
+#pragma unroll
+      for (int tile = 0; tile < 2; ++tile) {
+        const int kr = (key_slab + tile) * 16 + lane % 16;
+        B b;
+        const uint4 blo = *reinterpret_cast<const uint4*>(kv + kr * D + swz8(kr, 2 * part) * 8);
+        const uint4 bhi = *reinterpret_cast<const uint4*>(kv + kr * D + swz8(kr, 2 * part + 1) * 8);
+        __builtin_memcpy(&b, &blo, 16);
+        __builtin_memcpy(reinterpret_cast<char*>(&b) + 16, &bhi, 16);
+        scores[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, scores[tile]);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int tile = 0; tile < 2; ++tile) {
+      const int col = (key_slab + tile) * 16 + lane % 16;
+      const bool key_ok = base + col < keys;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int r = q_slab * 16 + 2 * j + lane / 16;
+        const bool visible = (query_base + r < p.rows) && key_ok;
+        score_memory[r * BK + col] = visible ? scores[tile][j] * SCALE : -INFINITY;
+      }
+    }
+    __syncthreads();
+    {
+      const float* srow = score_memory + soft_row * BK + soft_sub * 16;
+      float next = peak;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) next = fmaxf(next, srow[j]);
+      next = fmaxf(next, __shfl_xor_sync(FF_WARP_MASK, next, 1));
+      next = fmaxf(next, __shfl_xor_sync(FF_WARP_MASK, next, 2));
+      const bool finite_next = isfinite(next);
+      const float rescale = finite_next ? expf(peak - next) : 0.0f;
+      float lsum = 0.0f, lcorr = 0.0f;
+      unsigned short* hrow = high + soft_row * HIGH_STRIDE + soft_sub * 16;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const float value = finite_next ? expf(srow[j] - next) : 0.0f;
+        const float y = value - lcorr, sum = lsum + y;
+        lcorr = (sum - lsum) - y;
+        lsum = sum;
+        const bf16 hi = __float2bfloat16(value);
+        hrow[j] = reinterpret_cast<const unsigned short&>(hi);
+      }
+#pragma unroll
+      for (int off = 1; off <= 2; off <<= 1) {
+        const float os = __shfl_xor_sync(FF_WARP_MASK, lsum, off);
+        const float oc = __shfl_xor_sync(FF_WARP_MASK, lcorr, off);
+        const float y = os - (lcorr + oc);
+        const float sum = lsum + y;
+        lcorr = (sum - lsum) - y;
+        lsum = sum;
+      }
+      if (soft_sub == 0) {
+        denominator *= rescale;
+        correction *= rescale;
+        const float y = lsum - (correction + lcorr);
+        const float sum = denominator + y;
+        correction = (sum - denominator) - y;
+        denominator = sum;
+        alpha[soft_row] = rescale;
+      }
+      peak = next;
+    }
+    __syncthreads();
+    for (int vec = tid; vec < BK * (D / 8); vec += 128) {
+      const int r = vec / 16;
+      const int c8 = vec % 16;
+      const uint32_t key = base + r;
+      const int dst = r * D + swz8(r, c8) * 8;
+      *reinterpret_cast<uint4*>(kv + dst) = key < keys
+          ? load_bf16_vec8(v_u16 + ((size_t)kv_head * p.capacity + key) * D + c8 * 8, v_aligned)
+          : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int panel = 0; panel < 4; ++panel) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) output[panel][j] *= alpha[q_slab * 16 + 2 * j + lane / 16];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int tile = 0; tile < BK / 16; ++tile) {
+      B ph;
+      const unsigned short* hp = high + qr * HIGH_STRIDE + tile * 16;
+      const uint4 hlo = *reinterpret_cast<const uint4*>(hp);
+      const uint4 hhi = *reinterpret_cast<const uint4*>(hp + 8);
+      __builtin_memcpy(&ph, &hlo, 16);
+      __builtin_memcpy(reinterpret_cast<char*>(&ph) + 16, &hhi, 16);
+#pragma unroll
+      for (int panel = 0; panel < 4; ++panel) {
+        const int d_col = channel + panel * 16 + lane % 16;
+        const int c8 = d_col >> 3;
+        const int in8 = d_col & 7;
+        B value;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          const int kr = tile * 16 + j;
+          value[j] = kv[kr * D + swz8(kr, c8) * 8 + in8];
+        }
+        output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ph, value, output[panel]);
+      }
+    }
+    __syncthreads();
+  }
+  if (soft_sub == 0) {
+    alpha[soft_row] = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    if (query_base + soft_row < p.rows) {
+      p.lse[(size_t)head * p.rows + query_base + soft_row] = peak + hip_logarithm(denominator);
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int panel = 0; panel < 4; ++panel) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t row = query_base + q_slab * 16 + 2 * j + lane / 16;
+      if (row < p.rows) {
+        const size_t dimension = channel + panel * 16 + lane % 16;
+        p.out[((size_t)row * p.q_heads + head) * D + dimension] =
+            __float2bfloat16(output[panel][j] * alpha[q_slab * 16 + 2 * j + lane / 16]);
+      }
+    }
+  }
+}
 }
 extern "C" __global__ void attention_prefill_d256(prefill::Problem p) { prefill::run<256,0>(p,0); }
 extern "C" __global__ void attention_prefill_d256_symmetric(prefill::Problem p, uint32_t keys, uint32_t left, uint32_t right, float scale) { prefill::run<256,6,true>(p,left,scale,nullptr,1,0,keys,right); }
@@ -1191,7 +1396,10 @@ extern "C" __global__ void attention_prefill_d64_bidirectional_windows(
 }
 extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill::run<128,0>(p,0); }
 extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }
+extern "C" __global__ __launch_bounds__(128, 2) void attention_prefill_d128_bidirectional_single_pv(prefill::Problem p, uint32_t keys) { prefill::run_d128_bidir_single_pv(p,keys); }
 extern "C" __global__ void attention_prefill_d256_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<256,1>(p,keys); }
+extern "C" __global__ void attention_prefill_d256_scored(prefill::Problem p, float scale) { prefill::run<256,0,true>(p,0,scale); }
+extern "C" __global__ void attention_prefill_d256_bidirectional_scored(prefill::Problem p, uint32_t keys, float scale) { prefill::run<256,1,true>(p,keys,scale); }
 extern "C" __global__ void attention_prefill_d128_prefix(prefill::Problem p, uint32_t prefix) { prefill::run<128,2>(p,prefix); }
 extern "C" __global__ void attention_prefill_d128_window(prefill::Problem p, uint32_t window) { prefill::run<128,3>(p,window); }
 #endif

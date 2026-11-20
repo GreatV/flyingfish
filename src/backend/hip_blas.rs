@@ -1,7 +1,7 @@
 //! BF16 HIP library plans are bound by library algorithm index, not heuristic order.
 use crate::backend::gpu::linear::LinearBiasMode;
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg,
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg,
 };
 use crate::backend::{hip::drop_result, setup::LinearShape};
 use anyhow::{Context, Result, ensure};
@@ -9,7 +9,7 @@ use half::bf16;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{CStr, c_char, c_void},
     hash::Hasher,
     io::Read,
@@ -141,7 +141,6 @@ unsafe extern "C" {
         stream: Handle,
     ) -> i32;
     fn ff_hip_lt_index(algorithm: *mut Algorithm) -> i32;
-    fn ff_hip_lt_algo_from_index(handle: Handle, index: i32, algorithm: *mut Algorithm) -> i32;
     fn ff_hip_lt_supported(
         handle: Handle,
         desc: Handle,
@@ -308,14 +307,15 @@ pub struct Blas {
     identity: Identity,
     workspace: RefCell<CudaSlice<u8>>,
     skinny: Option<CudaFunction>,
+    row_invariant: Option<CudaFunction>,
     bias_add: Option<CudaFunction>,
     rounded_output: RefCell<Option<CudaSlice<f32>>>,
     fp8: Option<crate::backend::gpu::linear::Fp8Ops>,
     invariant_rows: usize,
     plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
     pitched_b: RefCell<BTreeMap<PitchedBinding, Arc<Plan>>>,
-    row_families: RefCell<BTreeMap<(usize, usize), (i32, usize)>>,
-    family_plans: RefCell<BTreeMap<LinearShape, Arc<Plan>>>,
+    row_families: RefCell<BTreeSet<(usize, usize)>>,
+    family_plans: RefCell<BTreeSet<LinearShape>>,
 }
 impl Blas {
     pub(crate) fn is_not_supported(error: &anyhow::Error) -> bool {
@@ -338,18 +338,26 @@ impl Blas {
             binary: binary_key()?,
         };
         let workspace = RefCell::new(stream.alloc_zeros(4 * 1024 * 1024)?);
-        let skinny = if stream.context().supports_wmma() {
-            let function = crate::backend::gpu::cubin::module(stream.context(), "gemm_skinny")?
-                .load_function("gemm_skinny_bf16")?;
+        let (skinny, row_invariant) = if stream.context().supports_wmma() {
+            let module = crate::backend::gpu::cubin::module(stream.context(), "gemm_skinny")?;
+            let function = module.load_function("gemm_skinny_bf16")?;
             ensure!(
                 function.max_threads_per_block()? >= 128
                     && p.shared_bytes >= 8192
                     && function.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? > 0,
                 "HIP BF16 WMMA requires 128 threads and 8192 bytes resident LDS"
             );
-            Some(function)
+            let invariant = module.load_function("gemm_bf16_row_invariant")?;
+            ensure!(
+                invariant.max_threads_per_block()? >= 128
+                    && invariant.local_size_bytes()? == 0
+                    && invariant.shared_size_bytes()? <= p.shared_bytes
+                    && invariant.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? > 0,
+                "HIP row-invariant BF16 WMMA requires 128 threads, zero local spills and resident LDS"
+            );
+            (Some(function), Some(invariant))
         } else {
-            None
+            (None, None)
         };
         let mut result = Self {
             handles: Arc::new(Handles {
@@ -361,14 +369,15 @@ impl Blas {
             identity,
             workspace,
             skinny,
+            row_invariant,
             bias_add: None,
             rounded_output: RefCell::new(None),
             fp8: None,
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
             pitched_b: RefCell::new(BTreeMap::new()),
-            row_families: RefCell::new(BTreeMap::new()),
-            family_plans: RefCell::new(BTreeMap::new()),
+            row_families: RefCell::new(BTreeSet::new()),
+            family_plans: RefCell::new(BTreeSet::new()),
         };
         let handles =
             Arc::get_mut(&mut result.handles).context("HIP library handles already shared")?;
@@ -508,7 +517,7 @@ impl Blas {
     }
 
     fn prepare_lt(&self, plan: &mut Plan, frozen: Option<&Choice>) -> Result<()> {
-        self.prepare_lt_plan(plan, plan.choice.shape.input, 0, None, &[0.0], frozen)
+        self.prepare_lt_plan(plan, plan.choice.shape.input, 0, &[0.0], frozen)
     }
 
     fn prepare_lt_plan(
@@ -516,7 +525,6 @@ impl Blas {
         plan: &mut Plan,
         b_ld: usize,
         candidate_rank: usize,
-        fixed_algo: Option<i32>,
         check_betas: &[f32],
         frozen: Option<&Choice>,
     ) -> Result<()> {
@@ -583,100 +591,65 @@ impl Blas {
                 ),
                 "hipblasLtMatmulPreferenceSetAttribute(workspace)",
             )?;
-            let (index, mut algorithm) = if let Some(fixed) = fixed_algo {
-                let mut algorithm = Algorithm::default();
-                check(
-                    ff_hip_lt_algo_from_index(self.handles.lt, fixed, &mut algorithm),
-                    "ff_hip_lt_algo_from_index",
-                )?;
-                let mut candidates = [Heuristic::default(); 64];
-                let mut count = 0;
-                check(
-                    hipblasLtMatmulAlgoGetHeuristic(
-                        self.handles.lt,
-                        plan.desc,
-                        plan.a,
-                        plan.b,
-                        plan.c,
-                        plan.c,
-                        plan.preference,
-                        candidates.len() as i32,
-                        candidates.as_mut_ptr(),
-                        &mut count,
-                    ),
-                    "hipblasLtMatmulAlgoGetHeuristic",
-                )?;
-                let mut waves = 0.0f32;
-                for candidate in &mut candidates[..count.max(0) as usize] {
-                    if candidate.status == 0 && ff_hip_lt_index(&mut candidate.algorithm) == fixed {
-                        waves = candidate.waves;
-                        break;
-                    }
+            let mut candidates = [Heuristic::default(); 64];
+            let mut count = 0;
+            check(
+                hipblasLtMatmulAlgoGetHeuristic(
+                    self.handles.lt,
+                    plan.desc,
+                    plan.a,
+                    plan.b,
+                    plan.c,
+                    plan.c,
+                    plan.preference,
+                    candidates.len() as i32,
+                    candidates.as_mut_ptr(),
+                    &mut count,
+                ),
+                "hipblasLtMatmulAlgoGetHeuristic",
+            )?;
+            ensure!(
+                (1..=candidates.len() as i32).contains(&count),
+                "hipBLASLt heuristic returned invalid candidate count {count}"
+            );
+            let mut choices = Vec::new();
+            for candidate in &mut candidates[..count as usize] {
+                if candidate.status != 0 {
+                    continue;
                 }
-                plan.waves = waves;
-                plan.algo_count = 1;
-                (fixed, algorithm)
-            } else {
-                let mut candidates = [Heuristic::default(); 64];
-                let mut count = 0;
-                check(
-                    hipblasLtMatmulAlgoGetHeuristic(
-                        self.handles.lt,
-                        plan.desc,
-                        plan.a,
-                        plan.b,
-                        plan.c,
-                        plan.c,
-                        plan.preference,
-                        candidates.len() as i32,
-                        candidates.as_mut_ptr(),
-                        &mut count,
-                    ),
-                    "hipblasLtMatmulAlgoGetHeuristic",
-                )?;
+                let index = ff_hip_lt_index(&mut candidate.algorithm);
                 ensure!(
-                    (1..=candidates.len() as i32).contains(&count),
-                    "hipBLASLt heuristic returned invalid candidate count {count}"
+                    index >= 0,
+                    "hipBLASLt heuristic algorithm has no stable index"
                 );
-                let mut choices = Vec::new();
-                for candidate in &mut candidates[..count as usize] {
-                    if candidate.status != 0 {
-                        continue;
-                    }
-                    let index = ff_hip_lt_index(&mut candidate.algorithm);
-                    ensure!(
-                        index >= 0,
-                        "hipBLASLt heuristic algorithm has no stable index"
-                    );
-                    choices.push((index, *candidate));
-                }
-                plan.algo_count = choices.len();
-                let (index, selected) = if let Some(frozen) = frozen {
-                    let index = frozen
-                        .algorithm
-                        .context("HIP multirow frozen choice lacks algorithm index")?;
-                    let matches: Vec<_> = choices.iter().filter(|(id, _)| *id == index).collect();
-                    ensure!(
-                        matches.len() == 1,
-                        "HIP frozen algorithm index {index} has {} heuristic matches",
-                        matches.len()
-                    );
-                    *matches[0]
-                } else {
-                    *choices.get(candidate_rank).with_context(|| {
-                        format!(
-                            "hipBLASLt heuristic rank {candidate_rank} missing from {} candidates",
-                            choices.len()
-                        )
-                    })?
-                };
-                plan.waves = if selected.waves > 0.0 {
-                    selected.waves
-                } else {
-                    self.solution_metrics(s, &selected.algorithm)?.0 as f32
-                };
-                (index, selected.algorithm)
+                choices.push((index, *candidate));
+            }
+            plan.algo_count = choices.len();
+            let (index, selected) = if let Some(frozen) = frozen {
+                let index = frozen
+                    .algorithm
+                    .context("HIP multirow frozen choice lacks algorithm index")?;
+                let matches: Vec<_> = choices.iter().filter(|(id, _)| *id == index).collect();
+                ensure!(
+                    matches.len() == 1,
+                    "HIP frozen algorithm index {index} has {} heuristic matches",
+                    matches.len()
+                );
+                *matches[0]
+            } else {
+                *choices.get(candidate_rank).with_context(|| {
+                    format!(
+                        "hipBLASLt heuristic rank {candidate_rank} missing from {} candidates",
+                        choices.len()
+                    )
+                })?
             };
+            plan.waves = if selected.waves > 0.0 {
+                selected.waves
+            } else {
+                self.solution_metrics(s, &selected.algorithm)?.0 as f32
+            };
+            let mut algorithm = selected.algorithm;
             let mut required = 0usize;
             for &beta in check_betas {
                 let mut one = 0usize;
@@ -695,12 +668,10 @@ impl Blas {
                 )?;
                 required = required.max(one);
             }
-            if fixed_algo.is_none() {
-                ensure!(
-                    required <= current_workspace,
-                    "HIP algorithm {index} workspace {required} exceeds allocation {current_workspace}"
-                );
-            }
+            ensure!(
+                required <= current_workspace,
+                "HIP algorithm {index} workspace {required} exceeds allocation {current_workspace}"
+            );
             plan.algorithm = algorithm;
             plan.choice.algorithm = Some(index);
             plan.choice.workspace = required;
@@ -1465,7 +1436,6 @@ impl Blas {
         shape: LinearShape,
         b_ld: usize,
         candidate_rank: usize,
-        fixed_algo: Option<i32>,
         check_betas: &[f32],
     ) -> Result<Plan> {
         let mut plan = Plan {
@@ -1491,14 +1461,7 @@ impl Blas {
             bias_binding: None,
             output_f32: false,
         };
-        self.prepare_lt_plan(
-            &mut plan,
-            b_ld,
-            candidate_rank,
-            fixed_algo,
-            check_betas,
-            None,
-        )?;
+        self.prepare_lt_plan(&mut plan, b_ld, candidate_rank, check_betas, None)?;
         Ok(plan)
     }
 
@@ -1652,7 +1615,6 @@ impl Blas {
                 },
                 key.3,
                 0,
-                None,
                 &[0.0],
             )?);
             self.pitched_b.borrow_mut().insert(key, plan);
@@ -1704,62 +1666,71 @@ impl Blas {
         self.launch_lt_plan(plan, [weight.ptr, x.ptr, y.0.ptr], 1.0, 0.0)
     }
 
+    fn row_family_waves(&self, shape: LinearShape) -> Result<f64> {
+        let cu = usize::try_from(self.stream.context().properties.compute_units)
+            .ok()
+            .filter(|&n| n > 0)
+            .context("HIP device compute_units must be positive")?;
+        let blocks = shape
+            .output
+            .div_ceil(64)
+            .checked_mul(shape.rows.div_ceil(64))
+            .context("HIP row-family grid block count overflow")?;
+        Ok(blocks as f64 / cu as f64)
+    }
+
     pub(crate) fn bind_row_family(&self, shape: LinearShape) -> Result<()> {
         checked_dims(shape.rows, shape.output, shape.input)?;
+        self.stream.context().require_wmma()?;
+        ensure!(
+            self.row_invariant.is_some(),
+            "HIP row-invariant WMMA kernel not bound"
+        );
         let key = (shape.output, shape.input);
         ensure!(
-            !self.row_families.borrow().contains_key(&key),
+            !self.row_families.borrow().contains(&key),
             "row family already bound {key:?}"
         );
-        let plan = self.build_lt_plan(shape, shape.input, 0, None, &[0.0, 1.0])?;
-        let algo = plan
-            .choice
-            .algorithm
-            .context("canonical HIP Lt algorithm missing")?;
-        self.row_families
-            .borrow_mut()
-            .insert(key, (algo, self.workspace.borrow().len()));
+        self.row_families.borrow_mut().insert(key);
         Ok(())
     }
 
     pub(crate) fn prepare_row_family(&self, shape: LinearShape) -> Result<()> {
         checked_dims(shape.rows, shape.output, shape.input)?;
-        if !self.family_plans.borrow().contains_key(&shape) {
-            let algo = self
-                .row_families
+        ensure!(
+            self.row_families
                 .borrow()
-                .get(&(shape.output, shape.input))
-                .map(|&(algo, _)| algo)
-                .context("row family was not bound")?;
-            let plan =
-                Arc::new(self.build_lt_plan(shape, shape.input, 0, Some(algo), &[0.0, 1.0])?);
-            self.family_plans.borrow_mut().insert(shape, plan);
-        }
+                .contains(&(shape.output, shape.input)),
+            "row family was not bound"
+        );
+        let [max_grid_x, max_grid_y, _] =
+            crate::backend::cuda::max_grid_dim(self.stream.context())?;
+        ensure!(
+            shape.output.div_ceil(64) <= max_grid_x as usize
+                && shape.rows.div_ceil(64) <= max_grid_y as usize,
+            "HIP row-family grid exceeds device limit for {shape:?}"
+        );
+        self.family_plans.borrow_mut().insert(shape);
         Ok(())
     }
 
     pub(crate) fn fixed_workspace(&self, shape: LinearShape, family: bool) -> Result<usize> {
-        let plan_ws = if family {
+        if family {
             self.prepare_row_family(shape)?;
-            self.family_plans
-                .borrow()
-                .get(&shape)
-                .context("fixed family workspace plan missing")?
-                .choice
-                .workspace
-        } else {
-            self.prepare_fixed(
-                u32::try_from(shape.rows)?,
-                u32::try_from(shape.output)?,
-                u32::try_from(shape.input)?,
-            )?;
-            self.plans
-                .borrow()
-                .get(&(shape, None, LinearBiasMode::BeforeOutputRound))
-                .context("fixed workspace plan missing")?
-                .choice
-                .workspace
-        };
+            return Ok(0);
+        }
+        self.prepare_fixed(
+            u32::try_from(shape.rows)?,
+            u32::try_from(shape.output)?,
+            u32::try_from(shape.input)?,
+        )?;
+        let plan_ws = self
+            .plans
+            .borrow()
+            .get(&(shape, None, LinearBiasMode::BeforeOutputRound))
+            .context("fixed workspace plan missing")?
+            .choice
+            .workspace;
         Ok(if plan_ws > self.workspace.borrow().len() {
             plan_ws
         } else {
@@ -1777,7 +1748,7 @@ impl Blas {
         if algo_count < 2 {
             return Ok(());
         }
-        let alternative = Arc::new(self.build_lt_plan(shape, shape.input, 1, None, &[0.0])?);
+        let alternative = Arc::new(self.build_lt_plan(shape, shape.input, 1, &[0.0])?);
         let index = lower_wave_index(&[waves, f64::from(alternative.waves)])?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
@@ -1802,31 +1773,37 @@ impl Blas {
         describe: bool,
         family: bool,
     ) -> Result<(f64, usize)> {
-        let plan = if family {
+        if family {
             self.prepare_row_family(shape)?;
-            Arc::clone(
-                self.family_plans
-                    .borrow()
-                    .get(&shape)
-                    .context("fixed family cost plan missing")?,
-            )
-        } else {
-            self.prepare_fixed(
-                u32::try_from(shape.rows)?,
-                u32::try_from(shape.output)?,
-                u32::try_from(shape.input)?,
-            )?;
-            Arc::clone(
-                self.plans
-                    .borrow()
-                    .get(&(shape, None, LinearBiasMode::BeforeOutputRound))
-                    .context("fixed linear cost plan missing")?,
-            )
-        };
+            let waves = self.row_family_waves(shape)?;
+            if describe && crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"hipblaslt_plan":{
+                        "rows": shape.rows, "output": shape.output, "input": shape.input,
+                        "family": true, "algorithm": null,
+                        "solution": "gemm_bf16_row_invariant", "kernel": "gemm_bf16_row_invariant",
+                        "estimated_waves": waves, "workspace_bytes": 0
+                    }})
+                );
+            }
+            return Ok((wave_multiplier(waves)?, 0));
+        }
+        self.prepare_fixed(
+            u32::try_from(shape.rows)?,
+            u32::try_from(shape.output)?,
+            u32::try_from(shape.input)?,
+        )?;
+        let plan = Arc::clone(
+            self.plans
+                .borrow()
+                .get(&(shape, None, LinearBiasMode::BeforeOutputRound))
+                .context("fixed linear cost plan missing")?,
+        );
         let lt_plan = if plan.choice.algorithm.is_some() {
             None
         } else {
-            Some(self.build_lt_plan(shape, shape.input, 0, None, &[0.0])?)
+            Some(self.build_lt_plan(shape, shape.input, 0, &[0.0])?)
         };
         let active = lt_plan.as_ref().unwrap_or(&*plan);
         let (derived_waves, split_k) = self.solution_metrics(shape, &active.algorithm)?;
@@ -1841,7 +1818,7 @@ impl Blas {
                 "{}",
                 serde_json::json!({"hipblaslt_plan":{
                     "rows": shape.rows, "output": shape.output, "input": shape.input,
-                    "family": family, "algorithm": active.choice.algorithm,
+                    "family": false, "algorithm": active.choice.algorithm,
                     "solution": sol, "kernel": kern,
                     "estimated_waves": waves, "workspace_bytes": active.choice.workspace
                 }})
@@ -1915,7 +1892,7 @@ impl Blas {
                 "fixed family pointer alignment"
             );
             ensure!(
-                self.row_families.borrow().contains_key(&(output, input)),
+                self.row_families.borrow().contains(&(output, input)),
                 "accumulating row family not bound"
             );
             ensure!(
@@ -1927,11 +1904,35 @@ impl Blas {
                 output,
                 input,
             };
-            let plans = self.family_plans.borrow();
-            let plan = plans
-                .get(&shape)
-                .context("accumulating family was not prepared")?;
-            return self.launch_lt_plan(plan, [weight.ptr, x.ptr, y.0.ptr], alpha, beta);
+            ensure!(
+                self.family_plans.borrow().contains(&shape),
+                "accumulating family was not prepared"
+            );
+            let function = self
+                .row_invariant
+                .as_ref()
+                .context("HIP row-invariant WMMA kernel not bound")?;
+            let (rows_i, out_i, in_i) = (rows as i32, output as i32, input as i32);
+            let grid_x = u32::try_from(output.div_ceil(64))?;
+            let grid_y = u32::try_from(rows.div_ceil(64))?;
+            unsafe {
+                self.stream
+                    .launch_builder(function)
+                    .arg(&weight.ptr)
+                    .arg(&x.ptr)
+                    .arg(&y.0.ptr)
+                    .arg(&rows_i)
+                    .arg(&out_i)
+                    .arg(&in_i)
+                    .arg(&alpha)
+                    .arg(&beta)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_x, grid_y, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            return Ok(());
         }
         unsafe {
             self.bf16_gemm_scaled(
@@ -2038,19 +2039,18 @@ impl Blas {
                 "kernel": kern,
             }));
         }
-        for (shape, p) in self.family_plans.borrow().iter() {
-            let (sol, kern) = self.algo_names(&p.algorithm)?;
+        for &shape in self.family_plans.borrow().iter() {
             lt.push(serde_json::json!({
                 "rows": shape.rows,
                 "output": shape.output,
                 "input": shape.input,
                 "bias": false,
-                "algo_index": p.choice.algorithm,
+                "algo_index": serde_json::Value::Null,
                 "row_family": true,
-                "workspace_bytes": p.choice.workspace,
-                "waves": p.waves,
-                "solution": sol,
-                "kernel": kern,
+                "workspace_bytes": 0,
+                "waves": self.row_family_waves(shape)? as f32,
+                "solution": "gemm_bf16_row_invariant",
+                "kernel": "gemm_bf16_row_invariant",
             }));
         }
         ensure!(!lt.is_empty(), "fixed HIP Lt plans missing");
@@ -2697,7 +2697,7 @@ mod tests {
                     input: 3072,
                 },
             ] {
-                let probe_plan = blas.build_lt_plan(probe, probe.input, 0, None, &[0.0])?;
+                let probe_plan = blas.build_lt_plan(probe, probe.input, 0, &[0.0])?;
                 let (sol, kern) = blas.algo_names(&probe_plan.algorithm)?;
                 println!(
                     "HIP_LT_PROBE shape=[{},{},{}] algo={:?} waves={} algos={} ws={} sol={sol} kern={kern}",

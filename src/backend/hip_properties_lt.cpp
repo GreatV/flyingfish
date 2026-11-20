@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <vector>
 
 struct Properties {
     char name[256];
@@ -85,18 +84,6 @@ extern "C" int ff_hip_device_properties(int device, Properties* output) {
 
 extern "C" int ff_hip_lt_index(hipblasLtMatmulAlgo_t* algorithm) {
     return hipblaslt_ext::getIndexFromAlgo(*algorithm);
-}
-
-extern "C" int ff_hip_lt_algo_from_index(hipblasLtHandle_t handle, int index,
-    hipblasLtMatmulAlgo_t* algorithm) {
-    std::vector<int> indices{index};
-    std::vector<hipblasLtMatmulHeuristicResult_t> results;
-    auto status = hipblaslt_ext::getAlgosFromIndex(handle, indices, results);
-    if (status != HIPBLAS_STATUS_SUCCESS) return status;
-    if (results.size() != 1) return HIPBLAS_STATUS_INVALID_VALUE;
-    if (results[0].state != HIPBLAS_STATUS_SUCCESS) return results[0].state;
-    *algorithm = results[0].algo;
-    return HIPBLAS_STATUS_SUCCESS;
 }
 
 extern "C" int ff_hip_lt_supported(hipblasLtHandle_t handle,

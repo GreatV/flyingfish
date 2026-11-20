@@ -5037,11 +5037,9 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn vae_residual_rms_fusion_matches_parent_gpu() -> Result<()> {
-        use cudarc::driver::sys::{CUdevice_attribute as DA, CUfunction_attribute as FA};
         let d = Device::new(0)?;
         let s = &d.stream;
         let vision = cubin::module(&d.ctx, "vision_ops")?;
@@ -5049,26 +5047,49 @@ pub(crate) mod image_tests {
         let rms = vision.load_function("vision_rms_scale_f32")?;
         let fused = vision.load_function("scaled_residual_rms_f32")?;
 
-        let max_threads_sm = u32::try_from(
-            d.ctx
-                .attribute(DA::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
-        )?;
-        let local_bytes = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-        let regs = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-        let smem = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
-        let active_blocks = fused.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?;
-        let active_warps = active_blocks * 8;
-        println!(
-            "H3_VAE_RESIDUAL_RMS_OCCUPANCY threads=256 active_blocks={active_blocks} active_warps={active_warps} regs={regs} smem={smem} local={local_bytes}"
-        );
-        ensure!(
-            local_bytes == 0,
-            "scaled_residual_rms_f32 spills to local memory ({local_bytes} B)"
-        );
-        ensure!(
-            active_blocks * 256 >= max_threads_sm.min(1536),
-            "scaled_residual_rms_f32 occupancy {active_warps} warps/SM below target on max_threads={max_threads_sm}"
-        );
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::{CUdevice_attribute as DA, CUfunction_attribute as FA};
+            let max_threads_sm = u32::try_from(
+                d.ctx
+                    .attribute(DA::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
+            )?;
+            let local_bytes = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+            let regs = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+            let smem = fused.get_attribute(FA::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+            let active_blocks =
+                fused.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?;
+            let active_warps = active_blocks * 8;
+            println!(
+                "H3_VAE_RESIDUAL_RMS_OCCUPANCY threads=256 active_blocks={active_blocks} active_warps={active_warps} regs={regs} smem={smem} local={local_bytes}"
+            );
+            ensure!(
+                local_bytes == 0,
+                "scaled_residual_rms_f32 spills to local memory ({local_bytes} B)"
+            );
+            ensure!(
+                active_blocks * 256 >= max_threads_sm.min(1536),
+                "scaled_residual_rms_f32 occupancy {active_warps} warps/SM below target on max_threads={max_threads_sm}"
+            );
+        }
+        #[cfg(feature = "rocm")]
+        {
+            let local_bytes = fused.local_size_bytes()?;
+            let smem = fused.shared_size_bytes()?;
+            let active_blocks =
+                fused.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?;
+            println!(
+                "H3_VAE_RESIDUAL_RMS_OCCUPANCY threads=256 active_blocks={active_blocks} smem={smem} local={local_bytes}"
+            );
+            ensure!(
+                local_bytes == 0,
+                "scaled_residual_rms_f32 spills to local memory ({local_bytes} B)"
+            );
+            ensure!(
+                active_blocks > 0,
+                "scaled_residual_rms_f32 has zero resident blocks"
+            );
+        }
 
         let cases = [
             ("video_prod", 50316usize, 2048usize, false),
