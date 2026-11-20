@@ -555,6 +555,17 @@ pub(crate) fn price_dense_stages(
     (device_limit, host_limit, device_page): (usize, usize, usize),
     rates: (f64, f64),
 ) -> Result<PricedDense> {
+    try_price_dense_stages(stages, (device_limit, host_limit, device_page), rates, 0.0)?
+        .with_context(|| format!("resident slots and weights cannot fit device={device_limit} host={host_limit} bytes"))
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn try_price_dense_stages(
+    stages: [DenseStage<'_>; 3],
+    (device_limit, host_limit, device_page): (usize, usize, usize),
+    rates: (f64, f64),
+    decoder_stream_layer_seconds: f64,
+) -> Result<Option<PricedDense>> {
     ensure!(
         [rates.0, rates.1]
             .into_iter()
@@ -567,6 +578,13 @@ pub(crate) fn price_dense_stages(
         stages[1].choices(device_limit, device_page)?,
         stages[2].choices(device_limit, device_page)?,
     ];
+    let decoder_dispatch: Vec<_> = choices[2]
+        .iter()
+        .map(|(_, plan)| {
+            decoder_stream_layer_seconds
+                * (stages[2].visits * plan.slots.iter().flatten().count()) as f64
+        })
+        .collect();
     let host_choices = std::array::from_fn::<_, 3, _>(|index| {
         choices[index]
             .iter()
@@ -623,7 +641,8 @@ pub(crate) fn price_dense_stages(
                         let last = &decoder_options[decoder_options.partition_point(|choice| {
                             choice.bytes <= rest && choice.layers <= mappings
                         }) - 1];
-                        let seconds = first.seconds + second.seconds + last.seconds;
+                        let seconds =
+                            first.seconds + second.seconds + last.seconds + decoder_dispatch[k];
                         let alternative = if c2.slot_bytes == 0 {
                             &mut decoder_resident_seconds
                         } else {
@@ -655,17 +674,12 @@ pub(crate) fn price_dense_stages(
             }
         }
     }
-    let (_, plans, device_bytes) = best.with_context(|| {
-        format!(
-            "resident slots and weights cannot fit device={device_limit} host={host_limit} bytes"
-        )
-    })?;
-    Ok(PricedDense {
+    Ok(best.map(|(_, plans, device_bytes)| PricedDense {
         plans,
         device_bytes,
         decoder_resident_seconds,
         decoder_streamed_seconds,
-    })
+    }))
 }
 
 #[cfg(test)]

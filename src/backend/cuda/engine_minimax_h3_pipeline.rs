@@ -1481,7 +1481,7 @@ impl VideoDecodeGeometry {
         let decoded = 2 * spec.out_channels * total_frames * pixels;
         let latent = 2 * spec.latent_channels * geometry.latent_frames * (h / r) * (w / r);
         let grid = 4 * (2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2);
-        let transient = decoded + decode_bytes(spec, &tiles, (h, w)) + latent + grid;
+        let tile_scratch = decode_bytes(spec, &tiles, (h, w)) + latent + grid;
         let rgb_bytes = plan
             .frames
             .checked_mul(pixels)
@@ -1492,9 +1492,160 @@ impl VideoDecodeGeometry {
             tile,
             total_frames,
             chunks: plan.chunks,
-            transient,
+            transient: decoded + tile_scratch.max(rgb_bytes),
             rgb_bytes,
         })
+    }
+}
+
+struct DecoderVisitCost {
+    weight_bytes: usize,
+    weight_seconds: f64,
+    launches: usize,
+    launch_seconds: f64,
+    handoff_seconds: f64,
+}
+
+impl DecoderVisitCost {
+    fn measure(
+        device: &Device,
+        normal: &crate::backend::gpu::CudaFunction,
+        layers: usize,
+        weight_bytes: usize,
+    ) -> Result<Self> {
+        use cudarc::driver::PushKernelArg;
+        use std::time::Instant;
+        let stream = &device.stream;
+        let out = stream.alloc_zeros::<f32>(1)?;
+        let ready = device.ctx.new_event(None)?;
+        let retired = device.ctx.new_event(None)?;
+        let mut launches = [0.0; 5];
+        let mut handoffs = [0.0; 5];
+        for trial in 0..=launches.len() {
+            stream.synchronize()?;
+            let start = Instant::now();
+            for _ in 0..128 {
+                unsafe {
+                    stream
+                        .launch_builder(normal)
+                        .arg(&0u64)
+                        .arg(&0u64)
+                        .arg(&out)
+                        .arg(&0i64)
+                        .launch(crate::backend::cuda::ops::grid(1, 1))?;
+                }
+            }
+            stream.synchronize()?;
+            let launch = start.elapsed().as_secs_f64() / 128.0;
+            let start = Instant::now();
+            for _ in 0..128 {
+                ready.record(&device.upload)?;
+                stream.wait(&ready)?;
+                retired.record(stream)?;
+                device.upload.wait(&retired)?;
+            }
+            device.upload.synchronize()?;
+            if trial > 0 {
+                launches[trial - 1] = launch;
+                handoffs[trial - 1] = start.elapsed().as_secs_f64() / 256.0;
+            }
+        }
+        launches.sort_by(f64::total_cmp);
+        handoffs.sort_by(f64::total_cmp);
+        Ok(Self {
+            weight_bytes,
+            weight_seconds: weight_bytes as f64 / device.info.memory_bytes_per_second,
+            // Six outer submissions and six GEMMs plus five kernels per decoder block.
+            launches: 6 + 11 * layers,
+            launch_seconds: launches[2],
+            handoff_seconds: handoffs[2],
+        })
+    }
+
+    fn price_groups(
+        &self,
+        (vae, geometry, cap): (&VaeSpec, &VideoDecodeGeometry, usize),
+        mut stages: [crate::prefill::DenseStage<'_>; 3],
+        (stage_and_work, budget, host, page): (usize, usize, usize, usize),
+        rates: (f64, f64),
+    ) -> Result<(
+        usize,
+        usize,
+        crate::prefill::PricedDense,
+        Vec<serde_json::Value>,
+    )> {
+        use crate::prefill::{PricedDense, try_price_dense_stages};
+        let slots = geometry.tiles.count();
+        let mut best = None;
+        let mut alternatives = Vec::new();
+        for batch in (1..=cap).rev() {
+            let groups = slots.div_ceil(batch);
+            // Within a visit count the smallest workspace leaves the most space for weights.
+            if batch < cap.saturating_sub(1) && batch > slots.div_ceil(groups) {
+                continue;
+            }
+            let charged = TileWork::charged_bytes(vae, geometry.tile, batch, slots, page)?;
+            if charged > budget {
+                continue;
+            }
+            let visits = geometry.chunks * groups;
+            stages[2].visits = visits;
+            let stage_limit = stage_and_work - charged;
+            let Some(priced) = try_price_dense_stages(
+                stages,
+                (stage_limit, host, page),
+                rates,
+                self.streamed_block_seconds(),
+            )?
+            else {
+                continue;
+            };
+            let tier_seconds = priced
+                .decoder_streamed_seconds
+                .into_iter()
+                .chain(priced.decoder_resident_seconds)
+                .min_by(f64::total_cmp)
+                .context("decoder placement lacks a price")?;
+            let seconds = tier_seconds + visits as f64 * self.group_seconds();
+            let streamed = priced.plans[2].slots.iter().flatten().count();
+            let demand = |disk_only| {
+                priced
+                    .plans
+                    .iter()
+                    .zip(stages)
+                    .map(|(plan, stage)| {
+                        stage.visits
+                            * (plan.disk_bytes + if disk_only { 0 } else { plan.host_bytes })
+                    })
+                    .sum::<usize>()
+            };
+            alternatives.push(serde_json::json!({
+                "batch": batch, "visits": visits, "work_charge": charged, "stage_limit": stage_limit,
+                "source_bytes": demand(false), "disk_bytes": demand(true),
+                "decoder_weight_bytes": visits * self.weight_bytes,
+                "decoder_launches": visits * (self.launches + 12 * streamed),
+                "decoder_stream_handoffs": visits * 2 * streamed, "seconds": seconds,
+            }));
+            if best
+                .as_ref()
+                .is_none_or(|(previous, ..): &(f64, usize, usize, PricedDense)| seconds < *previous)
+            {
+                best = Some((seconds, batch, stage_limit, priced));
+            }
+        }
+        let (_, batch, device_budget, priced) = best.with_context(|| format!(
+            "resident video has no decoder group and dense placement within device={stage_and_work} host={host} bytes"
+        ))?;
+        Ok((batch, device_budget, priced, alternatives))
+    }
+
+    fn group_seconds(&self) -> f64 {
+        self.weight_seconds + self.launches as f64 * self.launch_seconds
+    }
+
+    fn streamed_block_seconds(&self) -> f64 {
+        // Six BF16 projections narrow one weight and bias each. Ready and retired cross streams.
+        12.0 * self.launch_seconds + 2.0 * self.handoff_seconds
     }
 }
 
@@ -1503,7 +1654,6 @@ struct VideoDecodeStage {
     video: VideoDecoder,
     audio: AudioDecoder,
     work: TileWork,
-    rgb: CudaSlice<u8>,
 }
 
 impl VideoDecodeStage {
@@ -1520,17 +1670,17 @@ impl VideoDecodeStage {
             video,
         )?;
         let s = &device.stream;
-        self.video.rgb_into(
+        let rgb = self.video.rgb(
             device,
             &decoded,
-            &self.rgb,
             (
                 geometry.frames,
                 self.geometry.total_frames,
                 geometry.height * geometry.width,
             ),
         )?;
-        let video = s.clone_dtoh(&self.rgb)?;
+        let video = s.clone_dtoh(&rgb)?;
+        drop(rgb);
         drop(decoded);
         let input = s.clone_htod(audio)?;
         let audio = s.clone_dtoh(&self.audio.decode(
@@ -1575,7 +1725,7 @@ impl VideoSession {
         requests: impl IntoIterator<Item = Result<H3Request>>,
     ) -> Result<Self> {
         use crate::backend::cuda::ops::CommonOpsRef;
-        use crate::prefill::{DensePlacement, DenseStage, PricedDense, price_dense_stages};
+        use crate::prefill::{DensePlacement, DenseStage, PricedDense};
         let companion_model = companion.unwrap_or(model);
         let transformer = model.join(if companion.is_some() {
             "fl2va_int8_convrot"
@@ -1680,10 +1830,9 @@ impl VideoSession {
                 .minimax_h3_audio_vae_manifest(&audio)?;
         let audio_decoder = AudioDecoder::new(&device, &audio, &audio_dir, &audio_manifest)?;
         let decode_geometry = VideoDecodeGeometry::new(&vae, &geometry)?;
-        let rgb = unsafe { device.stream.alloc::<u8>(decode_geometry.rgb_bytes)? };
         let slots = decode_geometry.tiles.count();
         let cap = VideoDecoder::work_batch_cap(&device, &vae, decode_geometry.tile, slots)?;
-        let one_tile = TileWork::batch_bytes(&vae, decode_geometry.tile, 1, slots)?;
+        let one_tile = TileWork::charged_bytes(&vae, decode_geometry.tile, 1, slots, page)?;
         let audio_input = 4 * layout.audio_indices.len() * spec.audio_in_channels;
         let posterior = 4 * vae.latent_channels * geometry.latent_height * geometry.latent_width;
         let anchor = encode.as_ref().map_or(0, |(stage, _)| {
@@ -1721,6 +1870,12 @@ impl VideoSession {
             + stored_allocation_bytes(decoder_fixed, page)?;
         let (disk_probe_bytes, disk) = image_fill_rate(&text_dir, &text_manifest)?;
         let pcie = crate::backend::cuda::calibrate::pinned_h2d_rate(&device)?;
+        let visit = DecoderVisitCost::measure(
+            &device,
+            &normal,
+            vae.layers,
+            decoder_weight_bytes(&vae_manifest),
+        )?;
         let text_blas = blas("H3 conditioner")?;
         let mut sample_blas = blas("MiniMax-H3 generate")?;
         let mut later = None;
@@ -1737,7 +1892,7 @@ impl VideoSession {
                     .filter(|&(_, source)| source != 0)
                     .unzip();
                 let fixed = fixed + stored_allocation_bytes(owned, page)?;
-                let mut stages = [
+                let stages = [
                     DenseStage {
                         device: &text_layers,
                         source: &text_layers,
@@ -1772,15 +1927,7 @@ impl VideoSession {
                 let (free, total) = device.ctx.mem_get_info()?;
                 let remaining = DensePlacement::device_budget(free, total, floors, 0, 0)?;
                 let budget = remaining - remaining % page;
-                let (batch, bytes) =
-                    VideoDecoder::work_batch(&vae, decode_geometry.tile, slots, cap, budget)?;
-                let decoder_visits = decode_geometry.chunks * slots.div_ceil(batch);
-                stages[2].visits = decoder_visits;
-                let work =
-                    TileWork::new(&device.stream, &vae, decode_geometry.tile, (batch, slots))?;
-                device.ctx.synchronize()?;
-                let (free, total) = device.ctx.mem_get_info()?;
-                let device_budget =
+                let stage_and_work =
                     DensePlacement::device_budget(free, total, fixed, 0, transient)?;
                 let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(
                     Path::new("/"),
@@ -1788,12 +1935,29 @@ impl VideoSession {
                 let host = available
                     .checked_sub(4 << 30)
                     .context("resident video host reserve")?;
+                let (batch, device_budget, priced, alternatives) = visit.price_groups(
+                    (&vae, &decode_geometry, cap),
+                    stages,
+                    (stage_and_work, budget, host, page),
+                    (pcie, disk),
+                )?;
+                let decoder_visits = decode_geometry.chunks * slots.div_ceil(batch);
+                let bytes = TileWork::batch_bytes(&vae, decode_geometry.tile, batch, slots)?;
+                let work =
+                    TileWork::new(&device.stream, &vae, decode_geometry.tile, (batch, slots))?;
+                device.ctx.synchronize()?;
+                let (free, total) = device.ctx.mem_get_info()?;
+                let live_budget = DensePlacement::device_budget(free, total, fixed, 0, transient)?;
+                ensure!(
+                    priced.device_bytes.iter().sum::<usize>() <= live_budget,
+                    "resident video stage placement exceeds the live budget {live_budget} after allocating {batch} tiles"
+                );
                 let PricedDense {
                     plans: [text, dit, decoder],
                     device_bytes,
                     decoder_resident_seconds,
                     decoder_streamed_seconds,
-                } = price_dense_stages(stages, (device_budget, host, page), (pcie, disk))?;
+                } = priced;
                 let demand = |plan: &DensePlacement, visits: usize| {
                     serde_json::json!({
                         "source_bytes": visits * (plan.host_bytes + plan.disk_bytes),
@@ -1804,7 +1968,9 @@ impl VideoSession {
                     "{}",
                     serde_json::json!({"h3_video_resident_plan": {
                         "device_budget": device_budget, "host_budget": host, "transient_bytes": transient,
-                        "resident_rgb_bytes": rgb.len(),
+                        "transient_rgb_bytes": decode_geometry.rgb_bytes, "decoder_group_prices": alternatives,
+                        "decoder_launch_seconds": visit.launch_seconds, "decoder_handoff_seconds": visit.handoff_seconds,
+                        "device_memory_bytes_per_second": device.info.memory_bytes_per_second,
                         "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes,
                         "device_allocation_granularity": page, "per_stage_device_bytes": device_bytes,
                         "conditioner": &text, "dit": &dit, "decoder": &decoder,
@@ -1868,7 +2034,6 @@ impl VideoSession {
                 video,
                 audio: audio_decoder,
                 work,
-                rgb,
             },
         })
     }
@@ -4647,6 +4812,51 @@ fn video_placement_sizes_decoder_groups_from_remaining_memory() -> Result<()> {
     let one = TileWork::batch_bytes(&vae, decoder.tile, 1, slots)?;
     assert_eq!(select(one)?, (1, one));
     assert!(select(one - 1).is_err());
+    let page = 2 << 20;
+    let full = TileWork::charged_bytes(&vae, decoder.tile, slots, slots, page)?;
+    let visit = DecoderVisitCost {
+        weight_bytes: 1 << 30,
+        weight_seconds: 0.001,
+        launches: 6 + 11 * vae.layers,
+        launch_seconds: 0.000002,
+        handoff_seconds: 0.000001,
+    };
+    let small = crate::prefill::DenseStage {
+        device: &[16 << 20],
+        source: &[16 << 20],
+        visits: 1,
+        load_scratch: 0,
+        device_staging: 0,
+    };
+    let stages = [
+        small,
+        crate::prefill::DenseStage {
+            device: &[64 << 20; 6],
+            source: &[64 << 20; 6],
+            visits: 6,
+            ..small
+        },
+        small,
+    ];
+    let select_priced = |available| {
+        visit.price_groups(
+            (&vae, &decoder, slots),
+            stages,
+            (available, full, 1 << 30, page),
+            (10e9, 1e9),
+        )
+    };
+    let (batch, _, _, alternatives) = select_priced(full + (180 << 20))?;
+    let price = |tiles| {
+        alternatives
+            .iter()
+            .find(|p| p["batch"].as_u64() == Some(tiles))
+            .and_then(|p| p["seconds"].as_f64())
+            .context("missing decoder comparison")
+    };
+    assert!(price(27)? < price(28)?);
+    assert!(price(batch as u64)? <= price(27)?);
+    assert_eq!(select_priced(full + (1 << 30))?.0, 28);
     let total = 25_252_724_736;
     let budget = crate::prefill::DensePlacement::device_budget;
     let minimum = total / 16 + work + decoder.transient;

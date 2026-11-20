@@ -1934,28 +1934,18 @@ impl VideoDecoder {
             "RGB output exceeds memory budget"
         );
         let output = unsafe { d.stream.alloc::<u8>(count)? };
-        self.rgb_into(d, decoded, &output, shape)?;
-        Ok(output)
-    }
-
-    pub(super) fn rgb_into(
-        &self,
-        d: &Device,
-        decoded: &CudaSlice<bf16>,
-        output: &CudaSlice<u8>,
-        shape: (usize, usize, usize),
-    ) -> Result<()> {
         planar_f32_to_rgb_u8(
             d,
             &self.kernels.rgb,
             decoded,
-            output,
+            &output,
             shape,
             (
                 VAE_PIXEL_MEAN.map(|v| v as f32),
                 VAE_PIXEL_STD.map(|v| v as f32),
             ),
-        )
+        )?;
+        Ok(output)
     }
 
     pub(crate) fn work(
@@ -2607,6 +2597,17 @@ impl TileWork {
         batch: usize,
         slots: usize,
     ) -> Result<usize> {
+        Self::charged_bytes(spec, shape, batch, slots, 1)
+    }
+
+    pub(super) fn charged_bytes(
+        spec: &VaeSpec,
+        shape: (usize, usize, usize),
+        batch: usize,
+        slots: usize,
+        page: usize,
+    ) -> Result<usize> {
+        ensure!(page > 0, "invalid video allocation page");
         ensure!(batch > 0 && batch <= slots, "invalid video tile batch");
         let (f, h, w) = shape;
         ensure!(f > 0 && h > 0 && w > 0, "empty video tile");
@@ -2619,16 +2620,25 @@ impl TileWork {
             "video patch count exceeds layout capacity"
         );
         let t = p + spec.registers as u128 + 1;
-        let per = 2 * t * (8 * spec.dim + 3 * spec.ffn + spec.patch_width()) as u128
-            + 4 * p * spec.latent_channels as u128;
-        let tail = slots % batch;
-        let attention = [batch, tail]
+        let rows = batch as u128 * t;
+        let dim = rows * spec.dim as u128;
+        let ffn = rows * spec.ffn as u128;
+        let latent = 2 * batch as u128 * p * spec.latent_channels as u128;
+        let charge = |n: u128| n.div_ceil(page as u128) * page as u128;
+        let attention = [batch, slots % batch]
             .into_iter()
             .filter(|&n| n != 0)
-            .map(|n| 4 * (n as u128 * t * spec.heads as u128 + n as u128 + 1))
+            .map(|n| charge(4 * n as u128 * t * spec.heads as u128) + charge(4 * (n as u128 + 1)))
             .sum::<u128>();
         Ok(usize::try_from(
-            batch as u128 * per + attention + 4 * (t * spec.rope_dims as u128),
+            charge(4 * t * spec.rope_dims as u128)
+                + charge(4 * dim)
+                + 6 * charge(2 * dim)
+                + charge(4 * ffn)
+                + charge(2 * ffn)
+                + 2 * charge(latent)
+                + charge(2 * rows * spec.patch_width() as u128)
+                + attention,
         )?)
     }
 
