@@ -1,6 +1,6 @@
 # CLI usage by model
 
-`flyingfish` and `ff` take the same commands and options. Keep both binaries in the same directory. The README model table lists supported weight formats and backends; commands below use the published model directories without converting their weights.
+`flyingfish` and `ff` take the same commands and options. Keep both binaries in the same directory. [models.md](models.md) lists supported models, weight formats and backends; commands below use the published model directories without converting their weights.
 
 Replace `<model-dir>` and the other placeholders with your files and directories. Put `--model` before the command. EOU and Multitalker transcription take the actual `<model.nemo>` archive instead of a directory. Keep runtime data and output files outside model directories; output parent directories must exist, and media and text output files must not already exist.
 
