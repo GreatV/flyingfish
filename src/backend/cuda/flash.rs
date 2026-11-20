@@ -444,16 +444,17 @@ impl Flash {
         )
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn with_full_single_probability(mut self) -> Result<Self> {
+    pub(crate) fn with_full_single_probability(self) -> Result<Self> {
         ensure!(
             self.geometry[2] == 128 && self.score.is_none() && self.native.len() == 3,
             "single-probability attention requires the BF16 D128 full binding"
         );
         #[cfg(feature = "cuda")]
+        let mut this = self;
+        #[cfg(feature = "cuda")]
         {
             use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
-            let ctx = self.stream.context();
+            let ctx = this.stream.context();
             let major = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
             if major >= 8 {
                 let name = "attention_prefill_d128_bidirectional_single_pv";
@@ -467,21 +468,21 @@ impl Flash {
                     "{name} registers={registers} local={local}"
                 );
                 ensure!(
-                    shared + self.shared as i32 <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
+                    shared + this.shared as i32 <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
                     "single-probability attention shared memory exceeds capacity"
                 );
                 function.set_attribute(
                     F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    self.shared as i32,
+                    this.shared as i32,
                 )?;
                 let resident = function.occupancy_max_active_blocks_per_multiprocessor(
                     128,
-                    self.shared as usize,
+                    this.shared as usize,
                     None,
                 )?;
-                let previous = self.native[1].occupancy_max_active_blocks_per_multiprocessor(
+                let previous = this.native[1].occupancy_max_active_blocks_per_multiprocessor(
                     128,
-                    self.shared as usize,
+                    this.shared as usize,
                     None,
                 )?;
                 ensure!(
@@ -493,12 +494,12 @@ impl Flash {
                         "{}",
                         serde_json::json!({"attention_probability": {
                             "symbol":name,"registers":registers,"local_bytes":local,
-                            "dynamic_shared_bytes":self.shared,"resident_blocks":resident,
+                            "dynamic_shared_bytes":this.shared,"resident_blocks":resident,
                             "previous_resident_blocks":previous
                         }})
                     );
                 }
-                self.native[1] = function;
+                this.native[1] = function;
             } else {
                 if crate::backend::diagnostics_enabled() {
                     eprintln!(
@@ -511,7 +512,14 @@ impl Flash {
                 }
             }
         }
-        Ok(self)
+        #[cfg(feature = "cuda")]
+        {
+            Ok(this)
+        }
+        #[cfg(feature = "rocm")]
+        {
+            Ok(self)
+        }
     }
 
     pub fn new_with_score(
@@ -873,7 +881,6 @@ impl Flash {
         )
     }
 
-    #[cfg(any(feature = "cuda", test))]
     pub fn bind_bf16_windows(&mut self, offsets: &[u32]) -> Result<()> {
         ensure!(self.geometry[2] == 64, "grouped BF16 windows require D64");
         ensure!(
@@ -889,7 +896,6 @@ impl Flash {
         )
     }
 
-    #[cfg(any(feature = "cuda", test))]
     fn window_geometry(
         offsets: &[u32],
         max_rows: u32,
@@ -923,7 +929,6 @@ impl Flash {
         Ok((rows, count, longest.div_ceil(tile)))
     }
 
-    #[cfg(any(feature = "cuda", test))]
     fn bind_windows(&mut self, offsets: &[u32], max_rows: u32, name: &str) -> Result<()> {
         let tile = u32::try_from(Self::tile(self.geometry[2])?)?;
         let (rows, count, tiles) =

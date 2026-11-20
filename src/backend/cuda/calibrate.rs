@@ -1297,7 +1297,6 @@ fn measure_peer_transfer(
     anyhow::bail!("HIP expert peer transfer calibration is not implemented")
 }
 
-#[cfg(feature = "cuda")]
 pub(super) fn pinned_h2d_rate(device: &Device) -> Result<f64> {
     let transfer = measure_expert_transfer(device, usize::try_from(PEER_TRANSFER_BYTES[2])?)?;
     let mut seconds = transfer.h2d_seconds;

@@ -1306,6 +1306,14 @@ impl Blas {
         }
         Ok(())
     }
+
+    pub(crate) fn is_not_supported(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<cudarc::cublaslt::result::CublasError>()
+            .is_some_and(|e| {
+                e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED
+            })
+    }
 }
 
 pub(crate) use super::linear::{lower_wave_index, wave_multiplier};

@@ -271,7 +271,7 @@ fn render_chat(
 }
 
 /// Renders `chat_template.jinja` for one system message and one user message, with thinking enabled.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn render_image_messages(
     model_dir: &std::path::Path,
     system: &str,

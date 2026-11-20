@@ -43,6 +43,102 @@ pub use pipeline::{ImageSession, image_latents};
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
+pub(super) fn open_blas(
+    device: &Device,
+    ops: &ops::Ops,
+    runtime: &Path,
+    closure: Rc<Closure>,
+) -> Result<Blas> {
+    #[cfg(feature = "cuda")]
+    {
+        Blas::new(device, ops, runtime, closure)
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let _ = (ops, runtime, closure);
+        Blas::new(Arc::clone(&device.stream))
+    }
+}
+
+fn equal_int8_bf16_rate(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
+    matches!(
+        arch,
+        crate::backend::setup::DeviceArchitecture::Hip(name) if name.starts_with("gfx11")
+    )
+}
+
+fn bf16_preferred_for_device(
+    arch: &crate::backend::setup::DeviceArchitecture,
+    spec: &H3Spec,
+    geometry: &crate::minimax_h3::Geometry,
+    free_bytes: u64,
+    weight_bytes: u64,
+) -> Result<bool> {
+    if !equal_int8_bf16_rate(arch) {
+        return Ok(false);
+    }
+    let activation_bytes = crate::minimax_h3::unchunked_activation_bytes(spec, geometry)?;
+    let sum = weight_bytes
+        .checked_add(activation_bytes)
+        .context("placement byte sum")?;
+    Ok(sum <= free_bytes)
+}
+
+/// Selects `fl2va_bf16` over `fl2va_int8_convrot` when detected hardware has equal BF16/INT8 tensor-core rate
+/// and the BF16 checkpoint plus activations fit in device memory.
+pub(crate) fn prefer_hyperflow_bf16(
+    ordinal: usize,
+    spec: &H3Spec,
+    component: &Path,
+    geometry: &crate::minimax_h3::Geometry,
+) -> Result<bool> {
+    let device = Device::new(ordinal)?;
+    if !equal_int8_bf16_rate(&device.info.arch) {
+        return Ok(false);
+    }
+    let manifest = MappedCheckpoint::open_component(component, "diffusion_pytorch_model")?
+        .minimax_h3_manifest(spec)?;
+    let (free, _total) = device.ctx.mem_get_info()?;
+    bf16_preferred_for_device(
+        &device.info.arch,
+        spec,
+        geometry,
+        u64::try_from(free)?,
+        u64::try_from(manifest.resident_bytes)?,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn capture_graph(
+    stream: &Arc<CudaStream>,
+    auto_free: bool,
+    launch: impl FnOnce() -> Result<()>,
+) -> Result<crate::backend::gpu::CudaGraph> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::{CUgraphInstantiate_flags as F, CUstreamCaptureMode as M};
+        stream.begin_capture(M::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let launched = launch();
+        let flags = if auto_free {
+            F::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+        } else {
+            F(0)
+        };
+        let captured = stream.end_capture(flags);
+        launched?;
+        captured?.context("stream capture produced no graph")
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let _ = auto_free;
+        let capture = stream.begin_capture()?;
+        let launched = launch();
+        let captured = capture.finish();
+        launched?;
+        captured
+    }
+}
+
 /// Decode normalized F32 NCHW image latents to F32 RGB HWC before clamp and quantization.
 pub fn image_decode(
     model: &Path,
@@ -57,7 +153,7 @@ pub fn image_decode(
     let device = Device::new(ordinal)?;
     let ops = ops::Ops::new(&device.ctx)?;
     device.finish_upload()?;
-    let mut blas = Blas::new(
+    let mut blas = open_blas(
         &device,
         &ops,
         runtime,
@@ -93,7 +189,7 @@ pub fn image_encode(
     let device = Device::new(ordinal)?;
     let ops = ops::Ops::new(&device.ctx)?;
     device.finish_upload()?;
-    let blas = Blas::new(
+    let blas = open_blas(
         &device,
         &ops,
         runtime,
@@ -616,7 +712,7 @@ impl EntryReader {
         ensure!(T::finite(bytes), "{name}: nonfinite value");
         let (pointer, _record) = destination.device_ptr_mut(stream);
         unsafe {
-            cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
+            super::copy::htod_async(pointer, bytes, stream)?;
         }
         Ok(())
     }
@@ -631,11 +727,12 @@ impl EntryReader {
         let bytes = self.read(name, entry)?;
         quant_source_finite(name, entry, bytes)?;
         let mut buffer = stream.alloc_zeros::<u8>(entry.bytes)?;
-        let (pointer, record) = buffer.device_ptr_mut(stream);
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
+        {
+            let (pointer, _record) = buffer.device_ptr_mut(stream);
+            unsafe {
+                super::copy::htod_async(pointer, bytes, stream)?;
+            }
         }
-        drop(record);
         Ok(buffer)
     }
 
@@ -1309,7 +1406,7 @@ impl<'a> Source<'a> {
         ensure!(T::finite(slice), "{name}: nonfinite value");
         let (pointer, _record) = destination.device_ptr_mut(s);
         unsafe {
-            cudarc::driver::result::memcpy_htod_async(pointer, slice, s.cu_stream())?;
+            super::copy::htod_async(pointer, slice, s)?;
         }
         Ok(())
     }
@@ -1339,7 +1436,8 @@ impl<'a> Source<'a> {
 
     fn host_f32(&mut self, s: &Arc<CudaStream>, name: &str, elements: usize) -> Result<Vec<f32>> {
         let tensor = self.tensor::<f32>(s, name, elements)?;
-        Ok(s.clone_dtoh(&tensor)?)
+        s.clone_dtoh(&tensor)
+            .with_context(|| format!("copy {name} to host"))
     }
 
     fn vector<T: Element + crate::backend::gpu::ValidAsZeroBits + Copy>(
@@ -2010,11 +2108,9 @@ pub(crate) struct BlockWork {
     stored: Option<StoredScratch>,
 }
 
-/// Convrot and low-rank scratch for one block forward. `codes` aliases `x`.
+/// Convrot and low-rank scratch for one block forward. `codes` aliases `x`; `convrot` is absent when `k == 0`.
 struct StoredScratch {
-    x: CudaSlice<f32>,
-    rotated: CudaSlice<f32>,
-    scales: CudaSlice<f32>,
+    convrot: Option<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
     mid: CudaSlice<bf16>,
     k: usize,
     rank: usize,
@@ -2227,13 +2323,17 @@ impl BlockWork {
             }
             match self.ffn_cost::<LORA>(blas, spec, chunk, false) {
                 Ok(plan) => choices.push(plan),
-                Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
-                    .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
+                Err(error) if Blas::is_not_supported(&error) => {
                     if crate::backend::diagnostics_enabled() {
-                        eprintln!("FFN_PLAN_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                        eprintln!(
+                            "FFN_PLAN_REJECT rows={} chunk={chunk} error={error:#}",
+                            self.rows
+                        );
                     }
                 }
-                Err(error) => return Err(error.context(format!("FFN plan rows={} chunk={chunk}",self.rows))),
+                Err(error) => {
+                    return Err(error.context(format!("FFN plan rows={} chunk={chunk}", self.rows)));
+                }
             }
         }
         ensure!(
@@ -2261,14 +2361,20 @@ impl BlockWork {
             }
             let mut plan = match self.ffn_cost::<LORA>(blas, spec, chunk, false) {
                 Ok(plan) => plan,
-                Err(error) if error.downcast_ref::<cudarc::cublaslt::result::CublasError>()
-                    .is_some_and(|e| e.0 == cudarc::cublaslt::sys::cublasStatus_t::CUBLAS_STATUS_NOT_SUPPORTED) => {
+                Err(error) if Blas::is_not_supported(&error) => {
                     if crate::backend::diagnostics_enabled() {
-                        eprintln!("FFN_ALIAS_REJECT rows={} chunk={chunk} error={error:#}",self.rows);
+                        eprintln!(
+                            "FFN_ALIAS_REJECT rows={} chunk={chunk} error={error:#}",
+                            self.rows
+                        );
                     }
                     continue;
                 }
-                Err(error) => return Err(error.context(format!("FFN alias rows={} chunk={chunk}",self.rows))),
+                Err(error) => {
+                    return Err(
+                        error.context(format!("FFN alias rows={} chunk={chunk}", self.rows))
+                    );
+                }
             };
             if plan.tensor_cost <= owned.tensor_cost && plan.launches <= owned.launches {
                 plan.borrowed = true;
@@ -2373,10 +2479,17 @@ impl BlockWork {
         let gated_view = matrix(&gated, s, chunk, spec.ffn)?;
         let stored = if let Some((k, low_rank)) = crate::minimax_h3::stored_scratch_extents(spec)? {
             let pitch = crate::minimax_h3::stored_low_rank_pitch(low_rank);
+            let convrot = if k > 0 {
+                Some((
+                    s.alloc_zeros::<f32>(rows * k)?,
+                    s.alloc_zeros::<f32>(rows * k)?,
+                    s.alloc_zeros::<f32>(rows)?,
+                ))
+            } else {
+                None
+            };
             Some(StoredScratch {
-                x: s.alloc_zeros::<f32>(rows * k)?,
-                rotated: s.alloc_zeros::<f32>(rows * k)?,
-                scales: s.alloc_zeros::<f32>(rows)?,
+                convrot,
                 mid: s.alloc_zeros::<bf16>(
                     rows.checked_mul(pitch).context("low-rank scratch rows")?,
                 )?,
@@ -2504,12 +2617,15 @@ fn lora_pair(
 
 fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
     let scratch = work.stored.as_ref()?;
-    let x = pointer(&scratch.x, s);
+    let (x, rotated, scales) = match scratch.convrot.as_ref() {
+        Some((x, rotated, scales)) => (pointer(x, s), pointer(rotated, s), pointer(scales, s)),
+        None => (0, 0, 0),
+    };
     Some(StoredPtrs {
         x,
-        rotated: pointer(&scratch.rotated, s),
+        rotated,
         codes: x,
-        scales: pointer(&scratch.scales, s),
+        scales,
         mid: pointer(&scratch.mid, s),
         rows: work.rows,
         k: scratch.k,
@@ -4128,20 +4244,26 @@ impl VectorArenaLayout {
 }
 
 fn stored_allocation_granularity(d: &Device) -> Result<usize> {
-    use cudarc::driver::sys::{self, CUmemAllocationGranularity_flags as G};
-    let mut properties: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
-    properties.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
-    properties.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-    properties.location.__bindgen_anon_1.id = d.ctx.cu_device();
-    let mut granularity = 0;
-    unsafe {
-        sys::cuMemGetAllocationGranularity(
-            &mut granularity,
-            &properties,
-            G::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
-        )
-        .result()?;
-    }
+    #[cfg(feature = "cuda")]
+    let granularity = {
+        use cudarc::driver::sys::{self, CUmemAllocationGranularity_flags as G};
+        let mut properties: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+        properties.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        properties.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        properties.location.__bindgen_anon_1.id = d.ctx.cu_device();
+        let mut granularity = 0;
+        unsafe {
+            sys::cuMemGetAllocationGranularity(
+                &mut granularity,
+                &properties,
+                G::CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+            )
+            .result()?;
+        }
+        granularity
+    };
+    #[cfg(feature = "rocm")]
+    let granularity = d.ctx.allocation_granularity()?;
     ensure!(granularity > 0, "zero stored allocation granularity");
     Ok(granularity)
 }
@@ -4192,30 +4314,39 @@ fn stored_allocation_costs(
 
 #[cfg(test)]
 fn trace_placement_pool(d: &Device, phase: &str) -> Result<()> {
-    use cudarc::driver::sys::{self, CUmemPool_attribute};
-    let mut pool = std::ptr::null_mut();
-    let (mut reserved, mut used) = (0u64, 0u64);
-    unsafe {
-        sys::cuDeviceGetDefaultMemPool(&mut pool, d.ctx.cu_device()).result()?;
-        sys::cuMemPoolGetAttribute(
-            pool,
-            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
-            (&mut reserved as *mut u64).cast(),
-        )
-        .result()?;
-        sys::cuMemPoolGetAttribute(
-            pool,
-            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
-            (&mut used as *mut u64).cast(),
-        )
-        .result()?;
-    }
+    #[cfg(feature = "cuda")]
+    let (reserved, used, event_tracking) = {
+        use cudarc::driver::sys::{self, CUmemPool_attribute};
+        let mut pool = std::ptr::null_mut();
+        let (mut reserved, mut used) = (0u64, 0u64);
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, d.ctx.cu_device()).result()?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+                (&mut reserved as *mut u64).cast(),
+            )
+            .result()?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                (&mut used as *mut u64).cast(),
+            )
+            .result()?;
+        }
+        (reserved, used, d.ctx.is_event_tracking())
+    };
+    #[cfg(feature = "rocm")]
+    let (reserved, used, event_tracking) = {
+        let (reserved, used) = d.ctx.default_mem_pool_usage()?;
+        (reserved, used, false)
+    };
     eprintln!(
         "{}",
         serde_json::json!({"h3_placement_pool": {
             "phase": phase, "reserved_bytes": reserved, "used_bytes": used,
             "free_bytes": d.ctx.mem_get_info()?.0,
-            "event_tracking": d.ctx.is_event_tracking(), "synchronized": false
+            "event_tracking": event_tracking, "synchronized": false
         }})
     );
     Ok(())
@@ -5140,14 +5271,16 @@ impl Dit {
         blas.bind_workspace(chosen.workspace)?;
         if hyperflow {
             work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
-            work.gate_up_product = crate::convrot::gate_up_product_order(
-                d,
-                [work.chunk, work.rows % work.chunk],
-                (h, 2 * spec.ffn),
-            )?;
-            let width = spec.heads * spec.head_dim;
-            work.plan_rotation(d, spec)?;
-            work.qkv_product = crate::convrot::qkv_product(d, work.rows, (h, width))?;
+            if spec.int8_convrot.is_some() {
+                work.gate_up_product = crate::convrot::gate_up_product_order(
+                    d,
+                    [work.chunk, work.rows % work.chunk],
+                    (h, 2 * spec.ffn),
+                )?;
+                let width = spec.heads * spec.head_dim;
+                work.plan_rotation(d, spec)?;
+                work.qkv_product = crate::convrot::qkv_product(d, work.rows, (h, width))?;
+            }
         } else {
             work.bind_ffn::<true>(s, blas, spec, chosen, &x)?;
         }
@@ -6889,7 +7022,7 @@ pub(crate) fn image_sample_trace(
     let device = Device::new(device)?;
     let ops = ops::Ops::new(&device.ctx)?;
     device.finish_upload()?;
-    let mut blas = Blas::new(
+    let mut blas = open_blas(
         &device,
         &ops,
         runtime,
@@ -7384,7 +7517,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-refiner-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -7653,13 +7786,7 @@ mod tests {
                 let launch =
                     || kernels.rms_norm_modulate_f32(s, norm(fused_at), modulation(fused_at));
                 s.synchronize()?;
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-                let capture_result = launch();
-                let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)?
-                    .context("RMSNorm modulation graph")?;
-                capture_result?;
+                let graph = capture_graph(s, true, launch)?;
                 for replay in 0..2 {
                     let host: Vec<bf16> = (0..rows * dim + 16)
                         .map(|i| {
@@ -8141,6 +8268,7 @@ mod tests {
         (n, max)
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn qk_rope_fusion_matches_parent_gpu() -> Result<()> {
@@ -8812,7 +8940,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-normctl-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -9015,7 +9143,7 @@ mod tests {
         let s = &device.stream;
         device.finish_upload()?;
         let ops = Ops::new(&device.ctx)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &std::env::temp_dir(),
@@ -9390,7 +9518,7 @@ mod tests {
         device.finish_upload()?;
         let runtime = std::env::temp_dir().join(format!("ff-h3-adaln-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -9551,7 +9679,7 @@ mod tests {
             );
             let input = stream.clone_htod(&host)?;
             let output = stream.alloc_zeros::<bf16>(rows * adapter.rank)?;
-            let preservation = Blas::new(
+            let preservation = open_blas(
                 &device,
                 &ops,
                 &runtime,
@@ -9575,7 +9703,9 @@ mod tests {
                     matrix(&input, stream, rows, spec.hidden)?,
                     &mut TensorMut(matrix(&output, stream, rows, adapter.rank)?),
                 )?;
-                Ok(stream.clone_dtoh(&output)?)
+                stream
+                    .clone_dtoh(&output)
+                    .context("copy ordinary low-rank output to host")
             };
             let expected = ordinary()?;
             let before = preservation.bound_plan_receipt()?;
@@ -9662,7 +9792,7 @@ mod tests {
                 .map(|i| bf16::from_f32(((i * 19 % 257) as f32 - 128.0) / 131.0))
                 .collect();
             let make_blas = || {
-                Blas::new(
+                open_blas(
                     &device,
                     &ops,
                     &runtime,
@@ -9740,10 +9870,7 @@ mod tests {
              -> Result<Vec<bf16>> {
                 let y = stream.clone_htod(&initial)?;
                 let intermediate = stream.alloc_zeros::<bf16>(total * input)?;
-                if graph {
-                    stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                }
-                let launch = (|| -> Result<()> {
+                let launch = || -> Result<()> {
                     for start in (0..total).step_by(chunk) {
                         let rows = chunk.min(total - start);
                         let w = matrix(&weight, stream, output, input)?;
@@ -9788,14 +9915,11 @@ mod tests {
                         }
                     }
                     Ok(())
-                })();
+                };
                 if graph {
-                    let captured =
-                        stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                    launch?;
-                    captured?.context("row gate captured no graph")?.launch()?;
+                    capture_graph(stream, false, launch)?.launch()?;
                 } else {
-                    launch?;
+                    launch()?;
                 }
                 let actual = stream.clone_dtoh(&y)?;
                 ensure!(
@@ -9878,7 +10002,7 @@ mod tests {
         let runtime =
             std::env::temp_dir().join(format!("ff-h3-base-row-gate-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -10057,7 +10181,7 @@ mod tests {
             let runtime =
                 std::env::temp_dir().join(format!("ff-h3-alias-{}-{case}", std::process::id()));
             fs::create_dir(&runtime)?;
-            let blas = Blas::new(
+            let blas = open_blas(
                 &device,
                 &ops,
                 &runtime,
@@ -10189,11 +10313,7 @@ mod tests {
                     Ok(())
                 };
                 if graph {
-                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let result = launch();
-                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                    result?;
-                    let captured = captured?.context("alias gate captured no graph")?;
+                    let captured = capture_graph(s, false, launch)?;
                     captured.launch()?;
                     captured.launch()?;
                 } else {
@@ -10401,7 +10521,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-block0-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -10714,7 +10834,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-block-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -10938,11 +11058,11 @@ mod tests {
                     let pointer = tier.dense.pointer(layer, 0, layer_bytes)?;
                     let actual = stream.alloc_zeros::<bf16>(expected.len())?;
                     unsafe {
-                        cudarc::driver::result::memcpy_dtod_async(
+                        crate::backend::cuda::copy::dtod_raw(
                             actual.device_ptr(stream).0,
                             pointer,
                             layer_bytes,
-                            stream.cu_stream(),
+                            stream,
                         )?;
                     }
                     tier.dense.end(layer, stream)?;
@@ -11069,7 +11189,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-adaln-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -11162,7 +11282,7 @@ mod tests {
         let runtime =
             std::env::temp_dir().join(format!("ff-h3-gguf-adaln-build-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -11286,7 +11406,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-dit-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -11553,7 +11673,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-chain-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -11774,7 +11894,7 @@ mod tests {
         device.finish_upload()?;
         let runtime = std::env::temp_dir().join(format!("ff-h3-vision-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -12092,7 +12212,7 @@ mod tests {
             let device = Device::new(0)?;
             let ops = Ops::new(&device.ctx)?;
             device.finish_upload()?;
-            let blas = Blas::new(
+            let blas = open_blas(
                 &device,
                 &ops,
                 &runtime,
@@ -12121,7 +12241,12 @@ mod tests {
             {
                 conditioner.prepare(&blas, inputs.tokens.len())?;
                 let deepstack = (0..3)
-                    .map(|k| Ok(device.stream.clone_htod(&vision[k + 1])?))
+                    .map(|k| {
+                        device
+                            .stream
+                            .clone_htod(&vision[k + 1])
+                            .context("upload deepstack tap")
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let embeds =
                     conditioner_embeds(inputs, image_token, &gate.table, &vision[0], hidden)?;
@@ -12261,7 +12386,7 @@ mod tests {
         let runtime =
             std::env::temp_dir().join(format!("ff-h3-composition-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -12483,7 +12608,7 @@ mod tests {
                     let device = Device::new(0)?;
                     let ops = Ops::new(&device.ctx)?;
                     device.finish_upload()?;
-                    let mut blas = Blas::new(
+                    let mut blas = open_blas(
                         &device,
                         &ops,
                         &runtime,
@@ -12582,7 +12707,7 @@ mod tests {
         let ops = Ops::new(&device.ctx)?;
         let runtime = std::env::temp_dir().join(format!("ff-h3-vae-enc-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -12632,7 +12757,9 @@ mod tests {
                 let out =
                     encoder.encode((s, &blas), &mut work, tiles, (&frame, height, width), &eps)?;
                 s.synchronize()?;
-                out.iter().map(|b| Ok(s.clone_dtoh(b)?)).collect()
+                out.iter()
+                    .map(|b| s.clone_dtoh(b).context("copy encoded VAE band to host"))
+                    .collect()
             };
             let tiles = crate::minimax_h3::VaeTiles::released(&spec, height, width)?;
             let native = encode(&tiles)?;
@@ -12734,7 +12861,7 @@ mod tests {
         let ops = Ops::new(&device.ctx)?;
         let runtime = std::env::temp_dir().join(format!("ff-h3-audio-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -13583,7 +13710,7 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-image-dit-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -13647,7 +13774,8 @@ mod tests {
                         row_timesteps: &row_timesteps,
                     },
                 )?;
-                Ok(s.clone_dtoh(&dit.velocity)?)
+                s.clone_dtoh(&dit.velocity)
+                    .context("copy DiT velocity to host")
             };
             let step0 = velocity(&context, 0, &text_d, &mut dit)?;
             let residual = s.clone_dtoh(&dit.x)?;
@@ -14067,7 +14195,7 @@ mod tests {
         let runtime =
             std::env::temp_dir().join(format!("ff-h3-image-dit-4096-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -14217,7 +14345,8 @@ mod tests {
                     row_timesteps: &row_timesteps,
                 },
             )?;
-            Ok(s.clone_dtoh(&dit.velocity)?)
+            s.clone_dtoh(&dit.velocity)
+                .context("copy DiT velocity to host")
         };
         let step0 = velocity(0, &mut dit)?;
         score("dit_step0", &step0, &step0_ref)?;
@@ -15136,6 +15265,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE"]
     fn resident_image_request_two_matches_fresh_and_bounds_allocations() -> Result<()> {
@@ -15657,7 +15787,7 @@ mod tests {
             std::env::temp_dir().join(format!("ff-hyperflow-block-{}", std::process::id()));
         fs::create_dir(&runtime)?;
         let _runtime = BlockRuntime(runtime.clone());
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -16330,19 +16460,285 @@ mod tests {
         },
     ];
 
-    fn step_tau(name: &str) -> Result<&'static StepTau> {
-        STEP_TAUS
-            .iter()
+    /// 2 × measured `rocm-bf16-default` vs `rocm-bf16-math` floor on `fl2va_bf16` (gfx1100, 2026-11-20).
+    const STEP_BF16_TAUS: &[StepTau] = &[
+        StepTau {
+            name: "refiner.bf16",
+            abs: 0.5,
+            rmse: 0.017668256077534167,
+            rel: 0.00832016298328559,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-0.f32",
+            abs: 0.42182040214538574,
+            rmse: 0.03774369037645171,
+            rel: 0.016575089152730343,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-0.f32",
+            abs: 0.7517321109771729,
+            rmse: 0.1687024932763922,
+            rel: 0.06024474022760859,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-0.f32",
+            abs: 0.007316112518310547,
+            rmse: 0.0006546278958366227,
+            rel: 0.000135457263608369,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-0.f32",
+            abs: 0.04957318305969238,
+            rmse: 0.011125090310132427,
+            rel: 0.002373297814451077,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-0.f32",
+            abs: 0.42182040214538574,
+            rmse: 0.03774369037645171,
+            rel: 0.016575089152730343,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-0.f32",
+            abs: 0.7517321109771729,
+            rmse: 0.1687024932763922,
+            rel: 0.06024474022760859,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-1.f32",
+            abs: 0.2743256688117981,
+            rmse: 0.03531438478702691,
+            rel: 0.014842983183751128,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-1.f32",
+            abs: 1.8866877555847168,
+            rmse: 0.18829725965940894,
+            rel: 0.06927082231579365,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-1.f32",
+            abs: 0.018365368247032166,
+            rmse: 0.002501225302131081,
+            rel: 0.0005327886361772385,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-1.f32",
+            abs: 0.3870220184326172,
+            rmse: 0.04005478176087406,
+            rel: 0.009654786920627711,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-1.f32",
+            abs: 0.2743256688117981,
+            rmse: 0.03531438478702691,
+            rel: 0.014842983183751128,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-1.f32",
+            abs: 1.8866877555847168,
+            rmse: 0.18829725965940894,
+            rel: 0.06927082231579365,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-2.f32",
+            abs: 0.36568450927734375,
+            rmse: 0.041601498633534004,
+            rel: 0.01649239066771905,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-2.f32",
+            abs: 0.5907998085021973,
+            rmse: 0.16724169116595536,
+            rel: 0.06546250094106436,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-2.f32",
+            abs: 0.09511947631835938,
+            rmse: 0.0102221699456616,
+            rel: 0.002413908253208725,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-2.f32",
+            abs: 0.4305868148803711,
+            rmse: 0.07353032736929174,
+            rel: 0.02270540814631225,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-2.f32",
+            abs: 0.36568450927734375,
+            rmse: 0.041601498633534004,
+            rel: 0.01649239066771905,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-2.f32",
+            abs: 0.5907998085021973,
+            rmse: 0.16724169116595536,
+            rel: 0.06546250094106436,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-3.f32",
+            abs: 0.48323917388916016,
+            rmse: 0.05016238961624561,
+            rel: 0.021480094513262625,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-3.f32",
+            abs: 1.0220494270324707,
+            rmse: 0.20547608984167087,
+            rel: 0.09529300634760446,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-3.f32",
+            abs: 0.14125442504882812,
+            rmse: 0.01717454837784889,
+            rel: 0.004483965147549544,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-3.f32",
+            abs: 0.41321659088134766,
+            rmse: 0.07934092694877547,
+            rel: 0.027703147232461704,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-3.f32",
+            abs: 0.48323917388916016,
+            rmse: 0.05016238961624561,
+            rel: 0.021480094513262625,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-3.f32",
+            abs: 1.0220494270324707,
+            rmse: 0.20547608984167087,
+            rel: 0.09529300634760446,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-4.f32",
+            abs: 0.7903573513031006,
+            rmse: 0.05641515715899659,
+            rel: 0.026205407239694712,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-4.f32",
+            abs: 1.454193115234375,
+            rmse: 0.24726022475978954,
+            rel: 0.1242327634348767,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-4.f32",
+            abs: 0.19100284576416016,
+            rmse: 0.019096461467947093,
+            rel: 0.0052730921097817116,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-4.f32",
+            abs: 0.4078845977783203,
+            rmse: 0.07943999013351834,
+            rel: 0.029086524921537866,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-4.f32",
+            abs: 0.7903573513031006,
+            rmse: 0.05641515715899659,
+            rel: 0.026205407239694712,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-4.f32",
+            abs: 1.454193115234375,
+            rmse: 0.24726022475978954,
+            rel: 0.1242327634348767,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-video-5.f32",
+            abs: 0.5896859169006348,
+            rmse: 0.05956043506078154,
+            rel: 0.02773268014888072,
+            relative: false,
+        },
+        StepTau {
+            name: "vel-audio-5.f32",
+            abs: 2.207589864730835,
+            rmse: 0.32115949128539045,
+            rel: 0.15805906485702587,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-video-5.f32",
+            abs: 0.1738595962524414,
+            rmse: 0.01980567231133328,
+            rel: 0.00564289666015423,
+            relative: false,
+        },
+        StepTau {
+            name: "lat-audio-5.f32",
+            abs: 0.39391422271728516,
+            rmse: 0.0792716483548706,
+            rel: 0.029776176996678807,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-video-5.f32",
+            abs: 0.5896859169006348,
+            rmse: 0.05956043506078154,
+            rel: 0.02773268014888072,
+            relative: false,
+        },
+        StepTau {
+            name: "teacher-vel-audio-5.f32",
+            abs: 2.207589864730835,
+            rmse: 0.32115949128539045,
+            rel: 0.15805906485702587,
+            relative: false,
+        },
+    ];
+
+    fn step_tau(taus: &'static [StepTau], name: &str) -> Result<&'static StepTau> {
+        taus.iter()
             .find(|tau| tau.name == name)
             .with_context(|| format!("no tau for {name}"))
     }
 
     type StepF32 = BTreeMap<String, Vec<f32>>;
 
-    fn step_references(dir: &Path, hidden: usize) -> Result<(Vec<bf16>, StepF32)> {
+    fn step_references(
+        dir: &Path,
+        hidden: usize,
+        taus: &'static [StepTau],
+    ) -> Result<(Vec<bf16>, StepF32)> {
         let mut saved = BTreeMap::new();
         let mut refiner = None;
-        for tau in STEP_TAUS {
+        for tau in taus {
             if tau.name.ends_with(".bf16") {
                 refiner = Some(read_bf16(&dir.join(tau.name), STEP_TEXT * hidden)?);
             } else {
@@ -16399,14 +16795,14 @@ mod tests {
     }
 
     fn score_f32(
-        arm: &str,
+        (arm, taus): (&str, &'static [StepTau]),
         name: &str,
         candidate: &[f32],
         saved: &StepF32,
         scored: &mut Vec<&'static str>,
         defects: &mut Vec<&'static str>,
     ) -> Result<()> {
-        let tau = step_tau(name)?;
+        let tau = step_tau(taus, name)?;
         let reference = saved.get(name).with_context(|| format!("saved {name}"))?;
         record_step(
             arm,
@@ -16499,7 +16895,12 @@ mod tests {
                     .all(|row| row.len() == STEP_ROWS),
             "adaln plan extent"
         );
-        let (refiner_ref, saved) = step_references(&reference, spec.hidden)?;
+        let taus = if spec.int8_convrot.is_some() {
+            STEP_TAUS
+        } else {
+            STEP_BF16_TAUS
+        };
+        let (refiner_ref, saved) = step_references(&reference, spec.hidden, taus)?;
         let manifest = MappedCheckpoint::open_component(&model, "diffusion_pytorch_model")?
             .minimax_h3_manifest(&spec)?;
         let device = Device::new(0)?;
@@ -16510,7 +16911,7 @@ mod tests {
             std::env::temp_dir().join(format!("ff-hyperflow-step-{}", std::process::id()));
         fs::create_dir(&runtime)?;
         let _runtime = BlockRuntime(runtime.clone());
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -16529,6 +16930,13 @@ mod tests {
                 crate::prefill::placement_visits(video_grid.timesteps.len(), 1)?,
             ),
         )?;
+        ensure!(
+            dit.work
+                .stored
+                .as_ref()
+                .is_some_and(|s| s.convrot.is_some() == spec.int8_convrot.is_some()),
+            "convrot scratch allocation disagrees with quantization presence"
+        );
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
             s,
@@ -16584,7 +16992,7 @@ mod tests {
             if k == 0 {
                 record_step(
                     &arm,
-                    step_tau("refiner.bf16")?,
+                    step_tau(taus, "refiner.bf16")?,
                     &f64_of_bf16(&refiner),
                     &f64_of_bf16(&refiner_ref),
                     &mut scored,
@@ -16594,7 +17002,7 @@ mod tests {
             let vel_video = s.clone_dtoh(&dit.video)?;
             let vel_audio = s.clone_dtoh(&dit.audio)?;
             score_f32(
-                &arm,
+                (&arm, taus),
                 &format!("vel-video-{k}.f32"),
                 &vel_video,
                 &saved,
@@ -16602,7 +17010,7 @@ mod tests {
                 &mut defects,
             )?;
             score_f32(
-                &arm,
+                (&arm, taus),
                 &format!("vel-audio-{k}.f32"),
                 &vel_audio,
                 &saved,
@@ -16628,7 +17036,7 @@ mod tests {
                 "free step {k} keyframe changed"
             );
             score_f32(
-                &arm,
+                (&arm, taus),
                 &format!("lat-video-{k}.f32"),
                 &video_now[key_elems..],
                 &saved,
@@ -16636,7 +17044,7 @@ mod tests {
                 &mut defects,
             )?;
             score_f32(
-                &arm,
+                (&arm, taus),
                 &format!("lat-audio-{k}.f32"),
                 &audio_now,
                 &saved,
@@ -16684,7 +17092,7 @@ mod tests {
             let vel_video = s.clone_dtoh(&dit.video)?;
             let vel_audio = s.clone_dtoh(&dit.audio)?;
             score_f32(
-                &arm,
+                (&arm, taus),
                 &format!("teacher-vel-video-{k}.f32"),
                 &vel_video,
                 &saved,
@@ -16692,7 +17100,7 @@ mod tests {
                 &mut defects,
             )?;
             score_f32(
-                &arm,
+                (&arm, taus),
                 &format!("teacher-vel-audio-{k}.f32"),
                 &vel_audio,
                 &saved,
@@ -16701,14 +17109,13 @@ mod tests {
             )?;
         }
         ensure!(
-            scored.len() == STEP_TAUS.len()
-                && STEP_TAUS.iter().all(|tau| scored.contains(&tau.name)),
+            scored.len() == taus.len() && taus.iter().all(|tau| scored.contains(&tau.name)),
             "scored {} of {}",
             scored.len(),
-            STEP_TAUS.len()
+            taus.len()
         );
         if defects.is_empty() {
-            println!("HYPERFLOW_STEP_GATE PASS cells={}", STEP_TAUS.len());
+            println!("HYPERFLOW_STEP_GATE PASS cells={}", taus.len());
             Ok(())
         } else {
             println!("HYPERFLOW_STEP_GATE DEFECT cells={defects:?}");
@@ -16751,7 +17158,7 @@ mod tests {
             std::env::temp_dir().join(format!("ff-hyperflow-overread-{}", std::process::id()));
         fs::create_dir(&runtime)?;
         let _runtime = BlockRuntime(runtime.clone());
-        let blas = Blas::new(
+        let blas = open_blas(
             &device,
             &ops,
             &runtime,
@@ -17285,6 +17692,39 @@ mod h3_direct_batch_tests {
             "fill bounce reservation leaked"
         );
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prefer_hyperflow_bf16_follows_arch_and_memory_fit() -> Result<()> {
+        let mut spec = H3Spec::parse(&serde_json::from_str(include_str!(
+            "../../../tests/data/minimax-h3-transformer-config.json"
+        ))?)?;
+        spec.hyperflow_gate = Some(0.25);
+        spec.dropped_blocks = Some(vec![6, 21, 22]);
+        spec.lowrank_ranks = Some(std::collections::BTreeMap::from([(
+            "transformer_blocks.1.attn.to_q".to_owned(),
+            1024usize,
+        )]));
+        let geometry = crate::minimax_h3::Geometry::resolve(&spec, 768, 1280, 124)?;
+        let weights = 27_433_807_488u64;
+        let activations = crate::minimax_h3::unchunked_activation_bytes(&spec, &geometry)?;
+        let need = weights + activations;
+        let gfx11 = crate::backend::setup::DeviceArchitecture::Hip("gfx1100".into());
+        let sm89 = crate::backend::setup::DeviceArchitecture::Cuda(89);
+        assert!(bf16_preferred_for_device(
+            &gfx11, &spec, &geometry, need, weights
+        )?);
+        assert!(!bf16_preferred_for_device(
+            &gfx11,
+            &spec,
+            &geometry,
+            need - 1,
+            weights
+        )?);
+        assert!(!bf16_preferred_for_device(
+            &sm89, &spec, &geometry, need, weights
+        )?);
         Ok(())
     }
 }

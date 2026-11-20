@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use crate::backend::cuda::engine::minimax_h3::{
     ImageSession, generate, image_decode, image_encode, image_latents, image_sample,
 };
@@ -167,7 +167,7 @@ pub struct H3Spec {
     pub norm_eps: f32,
     pub qk_norm_eps: f32,
     pub final_norm_eps: f32,
-    /// Absent on MiniMax-H3. Present only together with the other three HyperFlow fields.
+    /// Absent on MiniMax-H3. Present together with `dropped_blocks` and `lowrank_ranks`; `int8_convrot` is present on quantized checkpoints.
     pub hyperflow_gate: Option<f32>,
     pub dropped_blocks: Option<Vec<usize>>,
     pub lowrank_ranks: Option<BTreeMap<String, usize>>,
@@ -200,7 +200,12 @@ impl H3Spec {
             other => bail!("unsupported transformer class {other}"),
         };
         if hyperflow {
-            exact_keys(root, &HYPERFLOW_KEYS, "HyperFlow transformer config")?;
+            let keys = if root.get("quantization").is_some() {
+                &HYPERFLOW_KEYS[..]
+            } else {
+                &HYPERFLOW_KEYS[..HYPERFLOW_KEYS.len() - 1]
+            };
+            exact_keys(root, keys, "HyperFlow transformer config")?;
         } else {
             exact_keys(root, &TRANSFORMER_KEYS, "MiniMax-H3 transformer config")?;
             equal(root, "_class_name", "MiniMaxH3Transformer3DModel".into())?;
@@ -265,19 +270,19 @@ impl H3Spec {
         Ok(spec)
     }
 
-    /// All four HyperFlow fields are set, or none are.
+    /// `hyperflow_gate`, `dropped_blocks` and `lowrank_ranks` are all set or all absent; `int8_convrot` requires them.
     pub fn is_hyperflow(&self) -> Result<bool> {
-        let flags = [
+        let core = [
             self.hyperflow_gate.is_some(),
             self.dropped_blocks.is_some(),
             self.lowrank_ranks.is_some(),
-            self.int8_convrot.is_some(),
         ];
         ensure!(
-            flags.iter().all(|set| *set) || flags.iter().all(|set| !*set),
+            (core.iter().all(|set| *set) || core.iter().all(|set| !*set))
+                && (core[0] || self.int8_convrot.is_none()),
             "HyperFlow config fields are partially set"
         );
-        Ok(flags[0])
+        Ok(core[0])
     }
 
     /// Storage of one block linear. MiniMax-H3 is dense. A HyperFlow name outside both sets is dense.
@@ -285,11 +290,9 @@ impl H3Spec {
         if !self.is_hyperflow()? {
             return Ok(LinearStorage::Dense);
         }
-        let (group, names) = self
-            .int8_convrot
-            .as_ref()
-            .context("HyperFlow quantization set")?;
-        if names.contains(name) {
+        if let Some((group, names)) = self.int8_convrot.as_ref()
+            && names.contains(name)
+        {
             return Ok(LinearStorage::Int8 { group: *group });
         }
         let ranks = self.lowrank_ranks.as_ref().context("HyperFlow rank set")?;
@@ -361,7 +364,10 @@ fn bind_hyperflow(spec: &mut H3Spec, root: &Value) -> Result<()> {
     spec.hyperflow_gate = Some(gate);
     spec.dropped_blocks = Some(parse_dropped(root, spec.layers)?);
     spec.lowrank_ranks = Some(parse_ranks(root)?);
-    spec.int8_convrot = Some(parse_quantization(root)?);
+    spec.int8_convrot = root
+        .get("quantization")
+        .map(|_| parse_quantization(root))
+        .transpose()?;
     check_roles(spec)
 }
 
@@ -434,21 +440,19 @@ fn parse_quantization(root: &Value) -> Result<(u32, BTreeSet<String>)> {
 }
 
 fn check_roles(spec: &H3Spec) -> Result<()> {
-    let (group, names) = spec
-        .int8_convrot
-        .as_ref()
-        .context("HyperFlow quantization set")?;
     let ranks = spec.lowrank_ranks.as_ref().context("HyperFlow rank set")?;
-    for name in names {
-        let input = linear_extent(spec, name)?;
-        ensure!(
-            input % usize::try_from(*group)? == 0,
-            "{name} in_features {input} is not a multiple of group {group}"
-        );
-        ensure!(
-            !ranks.contains_key(name),
-            "{name} is both int8 and low-rank"
-        );
+    if let Some((group, names)) = spec.int8_convrot.as_ref() {
+        for name in names {
+            let input = linear_extent(spec, name)?;
+            ensure!(
+                input % usize::try_from(*group)? == 0,
+                "{name} in_features {input} is not a multiple of group {group}"
+            );
+            ensure!(
+                !ranks.contains_key(name),
+                "{name} is both int8 and low-rank"
+            );
+        }
     }
     for name in ranks.keys() {
         linear_extent(spec, name)?;
@@ -538,16 +542,22 @@ pub fn stored_low_rank_pitch(low_rank: usize) -> usize {
     }
 }
 
-/// `(k, low_rank)` of the HyperFlow convrot scratch one block workspace allocates. `k` is `max(hidden, width, ffn)`. `low_rank` is the maximum stored rank, or 0 when the rank map is empty. `None` when the spec is not HyperFlow.
+/// `(k, low_rank)` of the HyperFlow stored scratch one block workspace allocates. `k` is `max(hidden, width, ffn)`
+/// when `int8_convrot` is present and 0 otherwise. `low_rank` is the maximum stored rank, or 0 when the rank map is
+/// empty. `None` when the spec is not HyperFlow.
 pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
     if !spec.is_hyperflow()? {
         return Ok(None);
     }
-    let width = spec
-        .heads
-        .checked_mul(spec.head_dim)
-        .context("stored scratch width")?;
-    let k = spec.hidden.max(width).max(spec.ffn);
+    let k = if spec.int8_convrot.is_some() {
+        let width = spec
+            .heads
+            .checked_mul(spec.head_dim)
+            .context("stored scratch width")?;
+        spec.hidden.max(width).max(spec.ffn)
+    } else {
+        0
+    };
     let low_rank = spec
         .lowrank_ranks
         .as_ref()
@@ -556,7 +566,8 @@ pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
     Ok(Some((k, low_rank)))
 }
 
-/// Bytes of one HyperFlow convrot scratch for `rows`: two f32 buffers of `rows * k`, one f32 scale per row, and `rows * stored_low_rank_pitch(low_rank)` bf16 elements. Zero when the spec is not HyperFlow.
+/// Bytes of one HyperFlow stored scratch for `rows`: when `k > 0`, two f32 buffers of `rows * k` and one f32 scale
+/// per row; plus `rows * stored_low_rank_pitch(low_rank)` bf16 elements. Zero when the spec is not HyperFlow.
 pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
     let Some((k, low_rank)) = stored_scratch_extents(spec)? else {
         return Ok(0);
@@ -564,11 +575,14 @@ pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
     let rows = u64::try_from(rows)?;
     let k = u64::try_from(k)?;
     let mid = u64::try_from(stored_low_rank_pitch(low_rank))?;
-    let f32_elems = rows
-        .checked_mul(k)
-        .and_then(|n| n.checked_mul(2))
-        .and_then(|n| n.checked_add(rows))
-        .context("stored scratch elements")?;
+    let f32_elems = if k > 0 {
+        rows.checked_mul(k)
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(rows))
+            .context("stored scratch elements")?
+    } else {
+        0
+    };
     f32_elems
         .checked_mul(4)
         .and_then(|n| n.checked_add(rows.checked_mul(mid)?.checked_mul(2)?))
@@ -1797,7 +1811,7 @@ pub struct H3Request {
 }
 
 impl H3Request {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub(crate) fn layout(&self, spec: &H3Spec) -> Result<(Geometry, PackedLayout)> {
         let frame_bytes = self
             .height
@@ -2081,7 +2095,11 @@ pub struct HyperFlowH3Request {
 
 pub fn is_hyperflow_model(model: &Path) -> Result<bool> {
     let mut family = None;
-    for (component, hyperflow) in [("transformer", false), ("fl2va_int8_convrot", true)] {
+    for (component, hyperflow) in [
+        ("transformer", false),
+        ("fl2va_int8_convrot", true),
+        ("fl2va_bf16", true),
+    ] {
         let path = model.join(component).join("config.json");
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -2097,7 +2115,7 @@ pub fn is_hyperflow_model(model: &Path) -> Result<bool> {
             path.display()
         );
         ensure!(
-            family.is_none(),
+            family.is_none() || family == Some(actual),
             "ambiguous video transformer components in {}",
             model.display()
         );
@@ -2105,13 +2123,13 @@ pub fn is_hyperflow_model(model: &Path) -> Result<bool> {
     }
     family.with_context(|| {
         format!(
-            "video needs transformer/config.json or fl2va_int8_convrot/config.json in {}",
+            "video needs transformer/config.json, fl2va_int8_convrot/config.json or fl2va_bf16/config.json in {}",
             model.display()
         )
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn run_minimax_h3_i2va(
     request: &MiniMaxH3I2vaRequest,
     options: crate::RunOptions,
@@ -2140,18 +2158,92 @@ pub fn run_minimax_h3_i2va(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn load_hyperflow_component(
+    model: &Path,
+    name: &str,
+    expect_quantized: bool,
+) -> Result<Option<(PathBuf, H3Spec)>> {
+    let component = model.join(name);
+    let path = component.join("config.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let spec = H3Spec::parse(
+        &serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?,
+    )?;
+    ensure!(spec.is_hyperflow()?, "{name} component is not HyperFlow");
+    ensure!(
+        spec.int8_convrot.is_some() == expect_quantized,
+        "{name} quantization presence disagrees with component name"
+    );
+    Ok(Some((component, spec)))
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+fn select_hyperflow_component<'a>(
+    model: &Path,
+    bf16: Option<&'a (PathBuf, H3Spec)>,
+    int8: Option<&'a (PathBuf, H3Spec)>,
+    cuda: bool,
+    prefer_bf16: impl FnOnce(&Path, &H3Spec) -> Result<bool>,
+) -> Result<&'a Path> {
+    if cuda {
+        return int8.map(|(dir, _)| dir.as_path()).with_context(|| {
+            format!(
+                "CUDA HyperFlow requires fl2va_int8_convrot/config.json in {}",
+                model.display()
+            )
+        });
+    }
+    match (bf16, int8) {
+        (Some((bf16_dir, bf16_spec)), Some((int8_dir, _))) => {
+            if prefer_bf16(bf16_dir, bf16_spec)? {
+                Ok(bf16_dir.as_path())
+            } else {
+                Ok(int8_dir.as_path())
+            }
+        }
+        (Some((dir, _)), None) | (None, Some((dir, _))) => Ok(dir.as_path()),
+        (None, None) => bail!(
+            "HyperFlow needs fl2va_int8_convrot/config.json or fl2va_bf16/config.json in {}",
+            model.display()
+        ),
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn run_hyperflow_h3_video(
     request: &HyperFlowH3Request,
     options: crate::RunOptions,
 ) -> Result<H3Output> {
     crate::backend::with_verbose(options.verbose, || {
-        let component = request.model.join("fl2va_int8_convrot");
-        let path = component.join("config.json");
-        let spec = H3Spec::parse(&serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-        )?)?;
-        ensure!(spec.is_hyperflow()?, "fl2va component is not HyperFlow");
+        let bf16 = load_hyperflow_component(&request.model, "fl2va_bf16", false)?;
+        let int8 = load_hyperflow_component(&request.model, "fl2va_int8_convrot", true)?;
+        let cuda = cfg!(feature = "cuda");
+        let spec = if cuda {
+            &int8
+                .as_ref()
+                .with_context(|| {
+                    format!(
+                        "CUDA HyperFlow requires fl2va_int8_convrot/config.json in {}",
+                        request.model.display()
+                    )
+                })?
+                .1
+        } else {
+            bf16.as_ref()
+                .or(int8.as_ref())
+                .map(|(_, spec)| spec)
+                .with_context(|| {
+                    format!(
+                        "HyperFlow needs fl2va_int8_convrot/config.json or fl2va_bf16/config.json in {}",
+                        request.model.display()
+                    )
+                })?
+        };
         let image = |path: &Option<PathBuf>| {
             path.as_ref()
                 .map(|path| {
@@ -2173,14 +2265,29 @@ pub fn run_hyperflow_h3_video(
         .collect();
         let prepared = prepare_video(
             &request.base_model,
-            &spec,
+            spec,
             &request.prompt,
             &anchors,
             ((request.frames, request.seed), (6, (12.0, 3.0))),
         )?;
+        let component = select_hyperflow_component(
+            &request.model,
+            bf16.as_ref(),
+            int8.as_ref(),
+            cuda,
+            |bf16_dir, bf16_spec| {
+                let (geometry, _) = prepared.layout(bf16_spec)?;
+                crate::backend::cuda::engine::minimax_h3::prefer_hyperflow_bf16(
+                    options.device,
+                    bf16_spec,
+                    bf16_dir,
+                    &geometry,
+                )
+            },
+        )?;
         crate::backend::cuda::engine::minimax_h3::generate_hyperflow(
             &request.base_model,
-            &component,
+            component,
             &prepared,
             (options.device, &options.runtime_dir),
         )
@@ -3411,7 +3518,7 @@ fn video_keyframes_preserve_cover_crop_and_anchor_bounds() -> Result<()> {
         )
         .is_err()
     );
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     {
         let spec = H3Spec::parse(&serde_json::from_str(include_str!(
             "../tests/data/minimax-h3-transformer-config.json"
@@ -3445,5 +3552,41 @@ fn video_keyframes_preserve_cover_crop_and_anchor_bounds() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn hyperflow_component_selection_rejects_bf16_only_on_cuda() -> Result<()> {
+    let spec = H3Spec::parse(&serde_json::from_str(include_str!(
+        "../tests/data/minimax-h3-transformer-config.json"
+    ))?)?;
+    let root = Path::new("hyperflow-root");
+    let bf16 = (root.join("fl2va_bf16"), spec.clone());
+    let int8 = (root.join("fl2va_int8_convrot"), spec);
+    let err = select_hyperflow_component(root, Some(&bf16), None, true, |_, _| {
+        bail!("cuda must not probe fl2va_bf16")
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("fl2va_int8_convrot"), "{err}");
+    assert_eq!(
+        select_hyperflow_component(root, Some(&bf16), None, false, |_, _| Ok(false))?,
+        bf16.0.as_path()
+    );
+    assert_eq!(
+        select_hyperflow_component(root, Some(&bf16), Some(&int8), true, |_, _| {
+            bail!("cuda must not probe fl2va_bf16")
+        })?,
+        int8.0.as_path()
+    );
+    assert_eq!(
+        select_hyperflow_component(root, Some(&bf16), Some(&int8), false, |_, _| Ok(true))?,
+        bf16.0.as_path()
+    );
+    assert_eq!(
+        select_hyperflow_component(root, Some(&bf16), Some(&int8), false, |_, _| Ok(false))?,
+        int8.0.as_path()
+    );
     Ok(())
 }
