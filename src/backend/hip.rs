@@ -18,6 +18,7 @@ const HIP_EVENT_DISABLE_TIMING: u32 = 2;
 const HIP_STREAM_CAPTURE_THREAD_LOCAL: i32 = 1;
 const HIP_ERROR_NOT_READY: i32 = 600;
 const HIP_FUNC_SHARED_SIZE_BYTES: i32 = 1;
+const HIP_FUNC_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 pub(crate) const HIP_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 pub(crate) const HIP_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 pub(crate) const HIP_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
@@ -94,6 +95,7 @@ unsafe extern "C" {
         extra: *mut Handle,
     ) -> i32;
     fn hipFuncGetAttribute(value: *mut i32, attribute: i32, function: Handle) -> i32;
+    fn hipFuncSetAttribute(function: Handle, attribute: i32, value: i32) -> i32;
     fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
         blocks: *mut i32,
         function: Handle,
@@ -227,7 +229,8 @@ impl Context {
             properties.warp
         );
         ensure!(
-            properties.compute_units > 0
+            properties.optin_shared_bytes > 0
+                && properties.compute_units > 0
                 && properties.max_threads >= 32
                 && properties.shared_bytes > 0
                 && properties.unit_shared_bytes > 0
@@ -939,6 +942,7 @@ plain!(
     u16,
     u32,
     u64,
+    i8,
     i32,
     i64,
     f32,
@@ -1337,6 +1341,29 @@ impl Function {
             )?;
         }
         Ok(value)
+    }
+    pub fn set_max_dynamic_shared_bytes(&self, bytes: usize) -> Result<()> {
+        let static_shared = usize::try_from(self.shared_size_bytes()?)?;
+        let optin = usize::try_from(self.module.context.properties.optin_shared_bytes)?;
+        ensure!(optin > 0, "HIP device sharedMemPerBlockOptin returned 0");
+        let total = static_shared
+            .checked_add(bytes)
+            .context("HIP dynamic shared memory extent overflow")?;
+        ensure!(
+            total <= optin,
+            "HIP dynamic shared memory {bytes} + static {static_shared} exceeds sharedMemPerBlockOptin {optin}"
+        );
+        self.module.context.bind_to_thread()?;
+        unsafe {
+            check(
+                hipFuncSetAttribute(
+                    self.handle as Handle,
+                    HIP_FUNC_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    i32::try_from(bytes)?,
+                ),
+                "hipFuncSetAttribute(maxDynamicSharedMemorySize)",
+            )
+        }
     }
     pub fn occupancy_max_active_blocks_per_multiprocessor(
         &self,

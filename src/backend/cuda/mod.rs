@@ -80,12 +80,38 @@ pub mod verification;
 pub(crate) mod vision;
 pub mod weights;
 
-use crate::backend::gpu::{CudaContext, CudaStream};
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream};
 #[cfg(feature = "cuda")]
 use crate::backend::setup::CacheKey;
 use crate::backend::setup::DeviceInfo;
 use anyhow::{Context, Result, ensure};
 use std::sync::Arc;
+
+pub(crate) fn optin_shared_bytes(ctx: &CudaContext) -> Result<usize> {
+    #[cfg(feature = "cuda")]
+    let bytes = usize::try_from(ctx.attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    )?)?;
+    #[cfg(feature = "rocm")]
+    let bytes = usize::try_from(ctx.properties.optin_shared_bytes)?;
+    ensure!(bytes > 0, "device opt-in shared memory is 0");
+    Ok(bytes)
+}
+
+pub(crate) fn set_max_dynamic_shared_bytes(function: &CudaFunction, bytes: u32) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        function.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            i32::try_from(bytes)?,
+        )?;
+        Ok(())
+    }
+    #[cfg(feature = "rocm")]
+    {
+        function.set_max_dynamic_shared_bytes(bytes as usize)
+    }
+}
 
 #[derive(Clone)]
 pub struct Device {
@@ -154,9 +180,7 @@ impl Device {
             sms: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize,
             l2_bytes: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)? as usize,
             cooperative: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH)? != 0,
-            optin_shared_bytes: ctx
-                .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?
-                as usize,
+            optin_shared_bytes: optin_shared_bytes(&ctx)?,
             warp: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_WARP_SIZE)? as usize,
             max_threads: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)? as u32,
             shared_bytes: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?

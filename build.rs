@@ -185,6 +185,7 @@ const ROCM_KERNELS: &[&str] = &[
     "vision_ops",
     "gemm_skinny",
     "fp8_linear",
+    "convrot",
     "mhc",
     "quantize",
     "latent_compress",
@@ -377,6 +378,7 @@ fn build_rocm(out: &std::path::Path) {
                         | "tcmqa_d256"
                         | "markov"
                         | "fp8_linear"
+                        | "convrot"
                         | "moe_prefill"
                         | "vision_attn"
                 ) && !arch.starts_with("gfx11")
