@@ -1308,29 +1308,7 @@ impl Blas {
     }
 }
 
-/// `ceil(waves) / waves` for a positive finite wave count.
-pub(crate) fn wave_multiplier(waves: f64) -> Result<f64> {
-    ensure!(
-        waves.is_finite() && waves > 0.0,
-        "invalid Lt wave count {waves}"
-    );
-    Ok(waves.ceil() / waves)
-}
-
-/// Index of the strictly lower whole-wave multiplier. Equal multipliers keep index 0.
-pub(crate) fn lower_wave_index(waves: &[f64]) -> Result<usize> {
-    ensure!(!waves.is_empty(), "empty Lt wave list");
-    let mut best = 0usize;
-    let mut best_cost = wave_multiplier(waves[0])?;
-    for (index, &count) in waves.iter().enumerate().skip(1) {
-        let cost = wave_multiplier(count)?;
-        if cost < best_cost {
-            best = index;
-            best_cost = cost;
-        }
-    }
-    Ok(best)
-}
+pub(crate) use super::linear::{lower_wave_index, wave_multiplier};
 
 impl Blas {
     /// Stores the lower whole-wave heuristic of this down shape at plan index 0. A tie keeps 0. `algo_count < 2` keeps 0.
@@ -2458,20 +2436,6 @@ impl Blas {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lower_wave_keeps_index_zero_on_a_tie() -> Result<()> {
-        let partial = 189.0 / 128.0;
-        assert_eq!(wave_multiplier(partial)?, 256.0 / 189.0);
-        assert_eq!(wave_multiplier(1.0)?, 1.0);
-        assert!(wave_multiplier(1.0)? < wave_multiplier(partial)?);
-        assert_eq!(lower_wave_index(&[partial, 1.0])?, 1);
-        assert_eq!(lower_wave_index(&[1.0, partial])?, 0);
-        assert_eq!(lower_wave_index(&[partial, partial])?, 0);
-        assert!(wave_multiplier(0.0).is_err());
-        assert!(wave_multiplier(f64::NAN).is_err());
-        Ok(())
-    }
 
     #[test]
     #[ignore = "exclusive CUDA window and an empty FLYINGFISH_RUNTIME_DIR"]

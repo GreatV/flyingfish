@@ -208,9 +208,7 @@ impl ImageDecoder {
             "image VAE canvas exceeds the layout index range"
         );
         let tiles = VaeTiles::released(spec, canvas[0], canvas[1])?;
-        let grid_limit = usize::try_from(device.ctx.attribute(
-            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
-        )?)?;
+        let grid_limit = crate::backend::cuda::max_grid_dim(&device.ctx)?[0] as usize;
         let (batch, bytes) = Self::batch(spec, &tiles, canvas, budget, grid_limit)?;
         let s = &device.stream;
         let grid: Vec<u32> = tiles
@@ -829,11 +827,7 @@ pub(crate) fn planar_f32_to_rgb_u8<T: DeviceRepr>(
             .ctx
             .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
     )?;
-    let grid_limit = u32::try_from(
-        device
-            .ctx
-            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?,
-    )?;
+    let grid_limit = crate::backend::cuda::max_grid_dim(&device.ctx)?[0];
     let resident = active
         .checked_mul(sms)
         .context("RGB resident grid overflow")?;
@@ -1945,7 +1939,6 @@ impl VideoDecoder {
         tiles: &VaeTiles,
         shape: (usize, usize, usize),
     ) -> Result<TileWork> {
-        use cudarc::driver::sys::CUdevice_attribute as A;
         let spec = &self.spec;
         let tile = (
             spec.chunk_latents() + spec.overlap_latents(),
@@ -1965,8 +1958,8 @@ impl VideoDecoder {
         let (free, total) = d.ctx.mem_get_info()?;
         let budget = crate::prefill::DensePlacement::device_budget(free, total, mandatory, 0, 0)?;
         let tokens = tile.0 * tile.1 * tile.2 + spec.registers + 1;
-        let grid_x = usize::try_from(d.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?)?;
-        let grid_z = usize::try_from(d.ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)?)?;
+        let [grid_x, _, grid_z] = crate::backend::cuda::max_grid_dim(&d.ctx)?;
+        let (grid_x, grid_z) = (grid_x as usize, grid_z as usize);
         let cap = tiles
             .count()
             .min(grid_z)

@@ -140,9 +140,57 @@ struct Split {
 }
 
 // D128 native prefill requires head_dim 128 and q_heads a multiple of kv_heads.
-#[cfg(feature = "cuda")]
 fn native_d128(heads: usize, kv_heads: usize, head_dim: usize) -> bool {
     head_dim == 128 && kv_heads > 0 && heads.is_multiple_of(kv_heads)
+}
+
+fn check_native_function(
+    ctx: &Arc<crate::backend::gpu::CudaContext>,
+    function: &CudaFunction,
+    name: &str,
+    dynamic_shared: u32,
+    set_dynamic: bool,
+) -> Result<()> {
+    let optin = super::optin_shared_bytes(ctx)?;
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::CUfunction_attribute as F;
+        let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+        let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+        let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+        ensure!(
+            local == 0 && registers <= 255,
+            "native prefill {name} resource limit: registers={registers} local={local}"
+        );
+        ensure!(
+            usize::try_from(dynamic_shared as i32 + shared)? <= optin,
+            "native prefill {name} shared memory does not fit"
+        );
+        if set_dynamic {
+            super::set_max_dynamic_shared_bytes(function, dynamic_shared)?;
+        }
+    }
+    #[cfg(feature = "rocm")]
+    {
+        ensure!(
+            function.max_threads_per_block()? >= 128
+                && function.local_size_bytes()? == 0
+                && function.shared_size_bytes()? as usize <= optin,
+            "HIP native prefill {name} resources exceed device limits"
+        );
+        if set_dynamic {
+            super::set_max_dynamic_shared_bytes(function, dynamic_shared)?;
+        }
+    }
+    ensure!(
+        function.occupancy_max_active_blocks_per_multiprocessor(
+            128,
+            dynamic_shared as usize,
+            None
+        )? > 0,
+        "native prefill {name} has zero resident blocks"
+    );
+    Ok(())
 }
 
 fn split_extent(capacity: usize, heads: usize, resident: usize) -> Result<(usize, usize)> {
@@ -171,13 +219,7 @@ impl Split {
         let partial = module.load_function("attention_partial_d512")?;
         let merge = module.load_function("attention_merge_d512")?;
         for function in [&partial, &merge] {
-            ensure!(
-                function.max_threads_per_block()? >= 128
-                    && function.local_size_bytes()? == 0
-                    && function.shared_size_bytes()? as usize
-                        <= ctx.properties.optin_shared_bytes as usize,
-                "HIP D512 split resource limit"
-            );
+            check_native_function(ctx, function, "attention_d512_split", 0, true)?;
         }
         let resident =
             partial.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? as usize;
@@ -190,7 +232,7 @@ impl Split {
                 .context("HIP D512 resident grid overflow")?,
         )?;
         ensure!(
-            parts <= ctx.properties.max_grid_x as usize,
+            parts <= super::max_grid_dim(ctx)?[0] as usize,
             "HIP D512 partition grid exceeds device limit"
         );
         let elements = rows
@@ -223,24 +265,13 @@ impl Split {
 #[cfg(feature = "cuda")]
 impl Split {
     fn new(stream: &Arc<CudaStream>, rows: usize, heads: usize, capacity: usize) -> Result<Self> {
-        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+        use cudarc::driver::sys::CUdevice_attribute as A;
         let ctx = stream.context();
         let module = super::cubin::module(ctx, "attention_native")?;
         let partial = module.load_function("attention_partial_d512")?;
         let merge = module.load_function("attention_merge_d512")?;
         for (function, shared) in [(&partial, 90112), (&merge, 0)] {
-            let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-            let regs = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-            ensure!(
-                local == 0 && regs <= 255,
-                "D512 split resource limit: regs={regs} local={local}"
-            );
-            ensure!(
-                shared + function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?
-                    <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
-                "D512 split shared memory does not fit"
-            );
-            function.set_attribute(F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared)?;
+            check_native_function(ctx, function, "attention_d512_split", shared, true)?;
         }
         let resident =
             partial.occupancy_max_active_blocks_per_multiprocessor(128, 90112, None)? as usize;
@@ -252,7 +283,7 @@ impl Split {
                 .context("D512 resident grid overflow")?,
         )?;
         ensure!(
-            parts <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as usize,
+            parts <= super::max_grid_dim(ctx)?[2] as usize,
             "D512 split grid exceeds device limit"
         );
         let elements = rows
@@ -380,7 +411,7 @@ impl Flash {
         }
         #[cfg(feature = "rocm")]
         {
-            ensure!(head_dim != 64, "HIP D64 prefill is not bound");
+            ensure!(head_dim != 72, "HIP D72 prefill is not bound");
             Ok(if head_dim == 128 { 32 } else { 16 })
         }
     }
@@ -591,10 +622,9 @@ impl Flash {
         #[cfg(feature = "cuda")]
         let native =
             if matches!(head_dim, 64 | 72 | 256 | 512) || native_d128(heads, kv_heads, head_dim) {
-                use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
                 let ctx = stream.context();
                 ensure!(
-                    heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
+                    heads <= super::max_grid_dim(ctx)?[1] as usize,
                     "prefill heads exceed grid limit"
                 );
                 let names: &[&str] = if matches!(head_dim, 64 | 72) {
@@ -644,30 +674,7 @@ impl Flash {
                 let mut functions = Vec::with_capacity(names.len());
                 for name in names {
                     let function = module.load_function(name)?;
-                    let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
-                    let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-                    let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-                    ensure!(
-                        local == 0 && registers <= 255,
-                        "native prefill {name} resource limit: registers={registers} local={local}"
-                    );
-                    ensure!(
-                        dynamic_shared as i32 + shared
-                            <= i32::try_from(super::optin_shared_bytes(ctx)?)?,
-                        "native prefill {name} shared memory does not fit"
-                    );
-                    function.set_attribute(
-                        F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        dynamic_shared as i32,
-                    )?;
-                    ensure!(
-                        function.occupancy_max_active_blocks_per_multiprocessor(
-                            128,
-                            dynamic_shared as usize,
-                            None
-                        )? > 0,
-                        "native prefill {name} has zero resident blocks"
-                    );
+                    check_native_function(ctx, &function, name, dynamic_shared, true)?;
                     functions.push(function);
                 }
                 functions
@@ -678,15 +685,18 @@ impl Flash {
         let native = {
             let ctx = stream.context();
             ctx.require_wmma().context("native prefill attention")?;
+            let [max_grid_x, max_grid_y, _] = super::max_grid_dim(ctx)?;
             ensure!(
-                heads <= ctx.properties.max_grid_y as usize,
+                heads <= max_grid_y as usize,
                 "prefill heads exceed grid limit"
             );
             ensure!(
-                rows.div_ceil(Self::tile(head_dim)?) <= ctx.properties.max_grid_x as usize,
+                rows.div_ceil(tile) <= max_grid_x as usize,
                 "prefill query tiles exceed grid limit"
             );
-            let names: &[&str] = if head_dim == 512 {
+            let names: &[&str] = if head_dim == 64 {
+                &["attention_prefill_d64_bidirectional"]
+            } else if head_dim == 512 {
                 &[
                     "attention_prefill_d512",
                     "attention_prefill_d512_bidirectional",
@@ -702,7 +712,7 @@ impl Flash {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
             } else {
                 ensure!(
-                    matches!((heads, kv_heads), (16, 2) | (16, 8) | (12, 12)),
+                    native_d128(heads, kv_heads, head_dim),
                     "HIP native D128 prefill geometry is not bound"
                 );
                 &[
@@ -716,16 +726,7 @@ impl Flash {
                 .iter()
                 .map(|name| {
                     let function = module.load_function(name)?;
-                    ensure!(
-                        function.max_threads_per_block()? >= 128
-                            && function.local_size_bytes()? == 0
-                            && function.shared_size_bytes()? as usize
-                                <= ctx.properties.optin_shared_bytes as usize
-                            && function
-                                .occupancy_max_active_blocks_per_multiprocessor(128, 0, None)?
-                                > 0,
-                        "HIP native prefill {name} resources exceed device limits"
-                    );
+                    check_native_function(ctx, &function, name, 0, true)?;
                     Ok(function)
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -788,10 +789,10 @@ impl Flash {
         #[cfg(feature = "cuda")]
         {
             let native = {
-                use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+                use cudarc::driver::sys::CUfunction_attribute as F;
                 let ctx = stream.context();
                 ensure!(
-                    heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
+                    heads <= super::max_grid_dim(ctx)?[1] as usize,
                     "prefill heads exceed grid limit"
                 );
                 let module = super::cubin::module(ctx, "attention_native")?;
@@ -872,7 +873,7 @@ impl Flash {
         )
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     pub fn bind_bf16_windows(&mut self, offsets: &[u32]) -> Result<()> {
         ensure!(self.geometry[2] == 64, "grouped BF16 windows require D64");
         ensure!(
@@ -888,15 +889,17 @@ impl Flash {
         )
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     fn window_geometry(
         offsets: &[u32],
         max_rows: u32,
         heads: usize,
         lse: usize,
+        tile: u32,
     ) -> Result<(usize, u32, u32)> {
         ensure!(
-            max_rows > 0
+            tile > 0
+                && max_rows > 0
                 && offsets.len() >= 2
                 && offsets[0] == 0
                 && offsets
@@ -917,38 +920,27 @@ impl Flash {
             .map(|v| v[1] - v[0])
             .max()
             .context("attention windows empty")?;
-        Ok((rows, count, longest.div_ceil(64)))
+        Ok((rows, count, longest.div_ceil(tile)))
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     fn bind_windows(&mut self, offsets: &[u32], max_rows: u32, name: &str) -> Result<()> {
-        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+        let tile = u32::try_from(Self::tile(self.geometry[2])?)?;
         let (rows, count, tiles) =
-            Self::window_geometry(offsets, max_rows, self.geometry[0], self.lse.len())?;
+            Self::window_geometry(offsets, max_rows, self.geometry[0], self.lse.len(), tile)?;
         let ctx = self.stream.context();
+        let [max_grid_x, _, max_grid_z] = super::max_grid_dim(ctx)?;
         ensure!(
-            count <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as u32
-                && tiles <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as u32,
+            count <= max_grid_z && tiles <= max_grid_x,
             "attention windows exceed device grid limits"
         );
-        let function = super::cubin::module(ctx, "attention_native")?.load_function(name)?;
-        let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-        let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-        let static_shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)? as u32;
-        ensure!(
-            local == 0
-                && registers <= 255
-                && self.shared + static_shared <= u32::try_from(super::optin_shared_bytes(ctx)?)?,
-            "grouped attention resource limit {name} registers={registers} local={local}"
-        );
-        ensure!(
-            function.occupancy_max_active_blocks_per_multiprocessor(
-                128,
-                self.shared as usize,
-                None
-            )? > 0,
-            "grouped attention {name} has zero resident blocks"
-        );
+        let module = if cfg!(feature = "rocm") {
+            "attention"
+        } else {
+            "attention_native"
+        };
+        let function = super::cubin::module(ctx, module)?.load_function(name)?;
+        check_native_function(ctx, &function, name, self.shared, false)?;
         let offsets = self.stream.clone_htod(offsets)?;
         if self.native.len() == 1 {
             self.native.push(function);
@@ -1987,23 +1979,28 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn disjoint_windows_enforce_capacity_and_ragged_bounds() -> Result<()> {
+        let tile = u32::try_from(Flash::tile(64)?)?;
         assert_eq!(
-            Flash::window_geometry(&[0, 17, 48], 48, 12, 48 * 12)?,
+            Flash::window_geometry(&[0, 17, 48], 48, 12, 48 * 12, 64)?,
             (48, 2, 1)
         );
         assert_eq!(
-            Flash::window_geometry(&[0, 64, 129, 1926], 1797, 32, 1926 * 32)?,
-            (1926, 3, 29)
+            Flash::window_geometry(&[0, 64, 129, 1926], 1797, 32, 1926 * 32, tile)?,
+            (1926, 3, 1797u32.div_ceil(tile))
+        );
+        assert_eq!(
+            Flash::window_geometry(&[0, 65], 65, 32, 65 * 32, 16)?,
+            (65, 1, 5)
         );
         for offsets in [&[][..], &[0], &[1, 17], &[0, 0], &[0, 65, 64], &[0, 1798]] {
-            assert!(Flash::window_geometry(offsets, 1797, 32, 65536).is_err());
+            assert!(Flash::window_geometry(offsets, 1797, 32, 65536, tile).is_err());
         }
-        assert!(Flash::window_geometry(&[0, 64, 129], 1797, 32, 128 * 32).is_err());
-        assert!(Flash::window_geometry(&[0, u32::MAX], u32::MAX, 32, usize::MAX).is_err());
-        assert!(Flash::window_geometry(&[0, 1], 1, usize::MAX, 1).is_err());
-        assert!(Flash::window_geometry(&[0, 49], 48, 1, 49).is_err());
+        assert!(Flash::window_geometry(&[0, 64, 129], 1797, 32, 128 * 32, tile).is_err());
+        assert!(Flash::window_geometry(&[0, u32::MAX], u32::MAX, 32, usize::MAX, tile).is_err());
+        assert!(Flash::window_geometry(&[0, 1], 1, usize::MAX, 1, tile).is_err());
+        assert!(Flash::window_geometry(&[0, 49], 48, 1, 49, tile).is_err());
+        assert!(Flash::window_geometry(&[0, 1], 48, 1, 1, 0).is_err());
         Ok(())
     }
 
@@ -2112,7 +2109,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn native_d128_admits_integral_gqa() {
         for (heads, kv_heads) in [
             (16, 2),
@@ -4121,7 +4117,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn bf16_disjoint_window_cell(
         stream: &Arc<CudaStream>,
         lengths: &[usize],
@@ -4242,19 +4237,27 @@ mod tests {
             stream.memset_zeros(&mut buffers.out.slice_mut(..rows * width))?;
             stream.memset_zeros(&mut grouped.lse.slice_mut(..rows * 32))?;
             if graph {
-                stream.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-            }
-            let launched = case.run(&mut grouped, &mut buffers);
-            if graph {
-                let captured = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                launched?;
-                captured?
-                    .context("RUNNER_FAIL disjoint window graph empty")?
-                    .launch()?;
+                #[cfg(feature = "cuda")]
+                {
+                    stream.begin_capture(
+                        cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let launched = case.run(&mut grouped, &mut buffers);
+                    let captured =
+                        stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    launched?;
+                    captured?
+                        .context("RUNNER_FAIL disjoint window graph empty")?
+                        .launch()?;
+                }
+                #[cfg(feature = "rocm")]
+                {
+                    let capture = stream.begin_capture()?;
+                    case.run(&mut grouped, &mut buffers)?;
+                    capture.finish()?.launch()?;
+                }
             } else {
-                launched?;
+                case.run(&mut grouped, &mut buffers)?;
             }
             let output = stream.clone_dtoh(&buffers.out)?;
             let lse = stream.clone_dtoh(&grouped.lse)?;
@@ -4302,7 +4305,6 @@ mod tests {
         Ok(defects)
     }
 
-    #[cfg(feature = "cuda")]
     fn bf16_disjoint_windows(
         stream: &Arc<CudaStream>,
         limits: &serde_json::Value,
@@ -4345,10 +4347,7 @@ mod tests {
         }
         let stream = ctx.new_stream()?;
         let mut defects = mask_controls(&stream, &limits)?;
-        #[cfg(feature = "cuda")]
-        {
-            defects += bf16_disjoint_windows(&stream, &limits)?;
-        }
+        defects += bf16_disjoint_windows(&stream, &limits)?;
         for case in &cases {
             let family = if let Some(scale) = case.scale {
                 if case.d == 256 && scale == 0.0625 {
@@ -4378,6 +4377,225 @@ mod tests {
             cases.len()
         );
         ensure!(defects == 0, "native prefill attention DEFECT");
+        Ok(())
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    #[ignore = "authorized HIP window; Flash D128 (64,8)/(56,56), D64 and disjoint windows"]
+    fn rocm_flash_attention_gpu() -> Result<()> {
+        let limits: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/attention_reference.json"
+        ))?;
+        let ctx = crate::backend::gpu::CudaContext::new(0)?;
+        let stream = ctx.new_stream()?;
+        let mut defects = bf16_disjoint_windows(&stream, &limits)?;
+        let cases = [
+            (
+                "d128-gqa64-8-causal",
+                128,
+                64,
+                8,
+                "causal",
+                17,
+                15,
+                32,
+                None,
+                "128-causal",
+            ),
+            (
+                "d128-gqa64-8-bidir",
+                128,
+                64,
+                8,
+                "bidirectional",
+                33,
+                0,
+                33,
+                None,
+                "128-bidirectional",
+            ),
+            (
+                "d128-mha56-causal",
+                128,
+                56,
+                56,
+                "causal",
+                17,
+                15,
+                32,
+                None,
+                "128-causal",
+            ),
+            (
+                "d128-mha56-bidir",
+                128,
+                56,
+                56,
+                "bidirectional",
+                33,
+                0,
+                33,
+                None,
+                "128-bidirectional",
+            ),
+            (
+                "d64-mha32-bidir-17",
+                64,
+                32,
+                32,
+                "bidirectional",
+                17,
+                0,
+                17,
+                Some(0.125f32),
+                "128-bidirectional",
+            ),
+            (
+                "d64-mha32-bidir-1",
+                64,
+                32,
+                32,
+                "bidirectional",
+                1,
+                0,
+                33,
+                Some(0.125f32),
+                "128-bidirectional",
+            ),
+            (
+                "d64-mha32-bidir-129",
+                64,
+                32,
+                32,
+                "bidirectional",
+                17,
+                0,
+                129,
+                Some(0.125f32),
+                "128-bidirectional",
+            ),
+        ];
+        for (name, d, hq, hkv, mode, rows, start, keys, scale, family) in cases {
+            let capacity = keys + 16;
+            let case = Case {
+                name: name.into(),
+                d,
+                hq,
+                hkv,
+                mode: mode.into(),
+                seed: 47,
+                rows,
+                start,
+                keys,
+                extent: 0,
+                capacity,
+                pitch: hq * d + 64,
+                scale,
+            };
+            let mut buffers = case.buffers(&stream)?;
+            let mut op = case.binding(&stream)?;
+            case.run(&mut op, &mut buffers)?;
+            let eager = stream.clone_dtoh(&buffers.out)?;
+            let capture = stream.begin_capture()?;
+            case.run(&mut op, &mut buffers)?;
+            capture.finish()?.launch()?;
+            let graph = stream.clone_dtoh(&buffers.out)?;
+            ensure!(
+                eager
+                    .iter()
+                    .zip(&graph)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "DEFECT graph/eager mismatch for {name}"
+            );
+            let q_host = stream.clone_dtoh(&buffers.q)?;
+            let k_host = stream.clone_dtoh(&buffers.k)?;
+            let v_host = stream.clone_dtoh(&buffers.v)?;
+            let lse_host = stream.clone_dtoh(&op.lse)?;
+            let inv_scale = f64::from(scale.unwrap_or_else(|| {
+                if d == 256 {
+                    0.0625
+                } else {
+                    std::f32::consts::FRAC_1_SQRT_2 / 8.0
+                }
+            }));
+            let mut ref_out = Vec::with_capacity(rows * hq * d);
+            let mut ref_lse = Vec::with_capacity(rows * hq);
+            for row in 0..rows {
+                for h in 0..hq {
+                    let kvh = h * hkv / hq;
+                    let valid_keys: Vec<usize> =
+                        (0..keys).filter(|&k| visible(&case, row, k)).collect();
+                    let mut scores = Vec::with_capacity(valid_keys.len());
+                    for &k_idx in &valid_keys {
+                        let mut dot = 0.0f64;
+                        for dim in 0..d {
+                            let qv = q_host[row * case.pitch + h * d + dim].to_f64();
+                            let kv = k_host[(kvh * capacity + k_idx) * d + dim].to_f64();
+                            dot += qv * kv;
+                        }
+                        scores.push(dot * inv_scale);
+                    }
+                    let max_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let weights: Vec<f64> = scores.iter().map(|s| (s - max_score).exp()).collect();
+                    let sum: f64 = weights.iter().sum();
+                    ref_lse.push(max_score + sum.ln());
+                    for dim in 0..d {
+                        let acc: f64 = weights
+                            .iter()
+                            .zip(&valid_keys)
+                            .map(|(w, &k_idx)| {
+                                (w / sum) * v_host[(kvh * capacity + k_idx) * d + dim].to_f64()
+                            })
+                            .sum();
+                        ref_out.push(acc);
+                    }
+                }
+            }
+            let actual: Vec<f64> = eager[..rows * hq * d].iter().map(|v| v.to_f64()).collect();
+            let lse_ref = &lse_host;
+            let actual_lse: Vec<f64> = (0..rows)
+                .flat_map(|r| (0..hq).map(move |h| f64::from(lse_ref[h * rows + r])))
+                .collect::<Vec<_>>();
+            let (out_max, out_rms) = errors(&actual, &ref_out, scale.is_none())?;
+            let (lse_max, _) = errors(&actual_lse, &ref_lse, true)?;
+            let (lse_abs, _) = errors(&actual_lse, &ref_lse, false)?;
+            let bound = &limits["limits"][family];
+            let max_lim = bound["output_max"].as_f64().context("output_max")?;
+            let rms_lim = bound["output_rms"].as_f64().context("output_rms")?;
+            let lse_lim = bound["lse_max"].as_f64().context("lse_max")?;
+            let lse_abs_lim = limits["limits"]["e256-unit"]["lse_max"]
+                .as_f64()
+                .context("e256-unit lse_max")?;
+            let bad = out_max > max_lim
+                || out_rms > rms_lim
+                || lse_max > lse_lim
+                || (scale.is_some() && lse_abs > lse_abs_lim);
+            defects += usize::from(bad);
+            println!(
+                "HIP_FLASH name={name} d={d} hq={hq} hkv={hkv} mode={mode} rows={rows} start={start} out_max={out_max:e} out_rms={out_rms:e} lse_max={lse_max:e} status={}",
+                if bad { "DEFECT" } else { "PASS" }
+            );
+            // Negative control: permute V heads and confirm error exceeds the frozen tolerance.
+            let mut wrong_v = v_host.clone();
+            wrong_v.rotate_left(capacity * d);
+            stream.memcpy_htod(&wrong_v, &mut buffers.v)?;
+            case.run(&mut op, &mut buffers)?;
+            let wrong_actual: Vec<f64> = stream.clone_dtoh(&buffers.out)?[..rows * hq * d]
+                .iter()
+                .map(|v| v.to_f64())
+                .collect();
+            let (wrong_err, _) = errors(&wrong_actual, &ref_out, scale.is_none())?;
+            ensure!(
+                wrong_err > max_lim,
+                "RUNNER_FAIL head-permutation control did not fail for {name}: err={wrong_err:e}"
+            );
+            if d == 128 {
+                defects += mask_control(&stream, &case, &limits)?;
+            }
+        }
+        ensure!(defects == 0, "ROCm Flash attention DEFECT count={defects}");
+        println!("PASS HIP_FLASH cells=6 disjoint_windows=8 defects=0");
         Ok(())
     }
 }

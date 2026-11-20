@@ -15,6 +15,7 @@ type Handle = *mut c_void;
 
 const HIP_STREAM_NON_BLOCKING: u32 = 1;
 const HIP_EVENT_DISABLE_TIMING: u32 = 2;
+pub(crate) const EVENT_DISABLE_TIMING: u32 = HIP_EVENT_DISABLE_TIMING;
 const HIP_STREAM_CAPTURE_THREAD_LOCAL: i32 = 1;
 const HIP_ERROR_NOT_READY: i32 = 600;
 const HIP_FUNC_SHARED_SIZE_BYTES: i32 = 1;
@@ -163,6 +164,7 @@ pub struct Properties {
     pub async_engines: i32,
     pub host_register_supported: i32,
     pub max_grid_x: i32,
+    pub max_grid_z: i32,
 }
 
 pub struct Context {
@@ -238,7 +240,8 @@ impl Context {
                 && properties.memory_clock_khz > 0
                 && properties.memory_bus_bits > 0
                 && properties.max_grid_y > 0
-                && properties.max_grid_x > 0,
+                && properties.max_grid_x > 0
+                && properties.max_grid_z > 0,
             "invalid HIP device resource attributes"
         );
         Ok(Arc::new(Self {

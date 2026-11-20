@@ -927,9 +927,28 @@ static_assert(__builtin_offsetof(Problem, position) == 64);
 using B = short __attribute__((ext_vector_type(16)));
 using A = float __attribute__((ext_vector_type(8)));
 
+// Matches device::logarithm (6-term atanh F32); gfx1100 OCML logf reaches lse_max=2.53e-7/2.83e-7 > 2.216e-7 limit.
+__device__ __forceinline__ float hip_logarithm(float a) {
+  uint32_t bits;
+  __builtin_memcpy(&bits, &a, sizeof(bits));
+  int exponent = static_cast<int>((bits >> 23) & 0xffu) - 127;
+  uint32_t m_bits = (bits & 0x007fffffu) | 0x3f800000u;
+  float mantissa;
+  __builtin_memcpy(&mantissa, &m_bits, sizeof(mantissa));
+  if (mantissa > 1.4142135623730951f) {
+    mantissa *= 0.5f;
+    exponent += 1;
+  }
+  const float t = (mantissa - 1.0f) / (mantissa + 1.0f);
+  const float square = t * t;
+  const float series = 1.0f + square * (1.0f / 3.0f + square * (1.0f / 5.0f
+      + square * (1.0f / 7.0f + square * (1.0f / 9.0f + square * (1.0f / 11.0f)))));
+  return 2.0f * t * series + static_cast<float>(exponent) * 0.6931471805599453f;
+}
+
 // D256 uses eight-lane FP32 QK dots and BF16 WMMA PV.
 // D128 reuses K storage for scores and keeps two BF16 probability planes.
-template<int D, int MODE, bool EXPLICIT = false, bool PARTIAL = false>
+template<int D, int MODE, bool EXPLICIT = false, bool PARTIAL = false, bool WINDOWED = false>
 __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
     float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0, uint32_t keys = 0,
     uint32_t right = 0) {
@@ -942,7 +961,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
   constexpr int BK = D == 128 ? 64 : (D == 256 ? 32 : 16);
   constexpr int KS = D == 128 ? D : D+8;
   constexpr int PLANES = D == 256 && !EXPLICIT ? 1 : 2;
-  constexpr int PANELS = D == 512 ? 8 : 4;
+  constexpr int PANELS = D == 512 ? 8 : (D == 64 ? 1 : 4);
   __shared__ __align__(16) unsigned short memory[BQ*D + BK*KS + BK*D +
       PLANES*BQ*BK + 2*BQ + (D != 128 ? 2*BQ*BK : 0)];
   auto* qs = memory;
@@ -956,8 +975,11 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
   const uint32_t head = blockIdx.y, kv = head/p.group;
   const uint32_t query_base = PARTIAL ? 0 : blockIdx.x*BQ;
   const uint32_t partition = PARTIAL ? blockIdx.x : 0;
+  const uint32_t expected_x = PARTIAL ? parts : (p.rows+BQ-1)/BQ;
   if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
-      gridDim.x != (PARTIAL ? parts : (p.rows+BQ-1)/BQ) || gridDim.y != p.q_heads || gridDim.z != 1 ||
+      (WINDOWED ? (gridDim.x < expected_x || gridDim.z == 0)
+                : (gridDim.x != expected_x || gridDim.z != 1)) ||
+      gridDim.y != p.q_heads ||
       p.group == 0 || p.rows == 0 || p.start > p.capacity || p.rows > p.capacity-p.start ||
       (PARTIAL && (p.rows > BQ || parts == 0 || chunk == 0 || chunk % BK != 0))) __trap();
   const uint32_t end = MODE == 6 ? keys : MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
@@ -1036,11 +1058,11 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
     if (tid < BQ) {
       float next = peak;
       for (int key = 0; key < BK; ++key) next = fmaxf(next,score_memory[tid*BK+key]);
-      const float rescale = isfinite(next) ? __expf(peak-next) : 0.0f;
+      const float rescale = isfinite(next) ? expf(peak-next) : 0.0f;
       denominator *= rescale;
       correction *= rescale;
       for (int key = 0; key < BK; ++key) {
-        const float value = isfinite(next) ? __expf(score_memory[tid*BK+key]-next) : 0.0f;
+        const float value = isfinite(next) ? expf(score_memory[tid*BK+key]-next) : 0.0f;
         const float y = value-correction, sum = denominator+y;
         correction = (sum-denominator)-y;
         denominator = sum;
@@ -1088,7 +1110,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
         partials[offset+512] = peak;
         partials[offset+513] = denominator;
       } else {
-        p.lse[(size_t)head*p.rows+query_base+tid] = peak+logf(denominator);
+        p.lse[(size_t)head*p.rows+query_base+tid] = peak+hip_logarithm(denominator);
       }
     }
   }
@@ -1129,7 +1151,7 @@ extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float*
   for (uint32_t part = 0; part < parts; ++part) {
     const float* source = partials+base+part*514;
     if (source[513] > 0.0f) {
-      const float weight = __expf(source[512]-peak);
+      const float weight = expf(source[512]-peak);
       const float value = weight*source[513]-correction, next = sum+value;
       correction = (next-sum)-value;
       sum = next;
@@ -1139,7 +1161,33 @@ extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float*
   }
 #pragma unroll
   for (int j = 0; j < 4; ++j) p.out[((size_t)row*p.q_heads+head)*512+tid*4+j] = __float2bfloat16(output[j]/sum);
-  if (tid == 0) p.lse[(size_t)head*p.rows+row] = peak+logf(sum);
+  if (tid == 0) p.lse[(size_t)head*p.rows+row] = peak+prefill::hip_logarithm(sum);
+}
+extern "C" __global__ void attention_prefill_d64_bidirectional(prefill::Problem p, uint32_t keys, float scale) {
+  prefill::run<64, 1, true>(p, keys, scale);
+}
+extern "C" __global__ void attention_prefill_d64_bidirectional_windows(
+    prefill::Problem p, uint32_t keys, float scale, const uint32_t* offsets, uint32_t windows) {
+  const uint32_t window = blockIdx.z;
+  if (!offsets || windows == 0 || gridDim.z != windows || gridDim.y != p.q_heads || keys != p.rows) {
+    __trap();
+  }
+  const uint32_t first = offsets[window];
+  const uint32_t end = offsets[window + 1];
+  if (first >= end || end > p.rows) {
+    __trap();
+  }
+  p.q += (size_t)first * p.q_stride;
+  p.k += (size_t)first * 64;
+  p.v += (size_t)first * 64;
+  p.out += (size_t)first * p.q_heads * 64;
+  p.lse += (size_t)first * p.q_heads;
+  p.rows = end - first;
+  p.start = 0;
+  if (blockIdx.x * 16 >= p.rows) {
+    return;
+  }
+  prefill::run<64, 1, true, false, true>(p, p.rows, scale);
 }
 extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill::run<128,0>(p,0); }
 extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }

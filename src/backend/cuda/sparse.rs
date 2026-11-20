@@ -371,22 +371,15 @@ impl BatchGroupNorm {
         let sms = device
             .ctx
             .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+        let [max_grid, max_grid_y, max_grid_z] = super::max_grid_dim(&device.ctx)?;
         let bg = batches
             .checked_mul(groups)
             .context("group norm group count overflow")?;
         ensure!(
             resident > 0
                 && sms > 0
-                && batches
-                    <= device
-                        .ctx
-                        .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)?
-                        as usize
-                && groups
-                    <= device
-                        .ctx
-                        .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?
-                        as usize,
+                && batches <= max_grid_z as usize
+                && groups <= max_grid_y as usize,
             "group norm grid or occupancy exceeds device limits"
         );
         let group_tile = groups.min(8);
@@ -399,9 +392,7 @@ impl BatchGroupNorm {
             .div_ceil(256)
             .min(sms * resident * 2)
             .max(1);
-        let max_grid = device
-            .ctx
-            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as usize;
+        let max_grid = max_grid as usize;
         ensure!(
             reduce_blocks <= max_grid,
             "group norm reduction grid exceeds device limit"

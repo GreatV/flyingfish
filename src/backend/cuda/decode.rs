@@ -99,24 +99,21 @@ impl RingDecode {
         );
         #[cfg(feature = "cuda")]
         use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+        let [max_x, max_y, _] = super::max_grid_dim(ctx)?;
         #[cfg(feature = "cuda")]
-        let (sms, warp, max_x, max_y, shared_limit) = (
+        let (sms, warp, shared_limit) = (
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?,
-            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?,
-            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?,
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         );
         #[cfg(feature = "rocm")]
-        let (sms, warp, max_x, max_y, shared_limit) = (
+        let (sms, warp, shared_limit) = (
             ctx.properties.compute_units,
             ctx.properties.warp,
-            ctx.properties.max_grid_x,
-            ctx.properties.max_grid_y,
             ctx.properties.shared_bytes,
         );
         ensure!(
-            sms > 0 && warp == 32 && max_x > 0 && max_y > 0 && shared_limit > 0,
+            sms > 0 && warp == 32 && shared_limit > 0,
             "ring decode requires positive SM/CU count and 32-lane warps"
         );
         let sms = sms as usize;
@@ -171,7 +168,7 @@ impl RingDecode {
                 let parts = ring.div_ceil(chunk);
                 let blocks = (heads / pack) as usize * parts as usize;
                 ensure!(
-                    parts <= max_x as u32 && heads / pack <= max_y as u32,
+                    parts <= max_x && heads / pack <= max_y,
                     "ring decode grid exceeds device bounds"
                 );
                 let score = (
@@ -452,24 +449,21 @@ impl CausalDecodeD512 {
         );
         #[cfg(feature = "cuda")]
         use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+        let [max_x, max_y, _] = super::max_grid_dim(ctx)?;
         #[cfg(feature = "cuda")]
-        let (sms, warp, max_x, max_y, shared_limit) = (
+        let (sms, warp, shared_limit) = (
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?,
-            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?,
-            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?,
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         );
         #[cfg(feature = "rocm")]
-        let (sms, warp, max_x, max_y, shared_limit) = (
+        let (sms, warp, shared_limit) = (
             ctx.properties.compute_units,
             ctx.properties.warp,
-            ctx.properties.max_grid_x,
-            ctx.properties.max_grid_y,
             ctx.properties.shared_bytes,
         );
         ensure!(
-            sms > 0 && warp == 32 && max_x > 0 && max_y > 0 && shared_limit > 0,
+            sms > 0 && warp == 32 && shared_limit > 0,
             "causal decode d512 requires positive SM/CU count and 32-lane warps"
         );
         let sms = sms as usize;
@@ -554,7 +548,7 @@ impl CausalDecodeD512 {
             capacity,
             sms,
             merge_shared_room,
-            (max_x as u32, max_y as u32),
+            (max_x, max_y),
             &residents,
         )?;
         let first = functions

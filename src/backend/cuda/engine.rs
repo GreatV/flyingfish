@@ -55,7 +55,7 @@ pub(crate) use self::diffusion::{
 pub mod minimax_h3;
 #[path = "engine_moe.rs"]
 pub(super) mod moe;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(in crate::backend::cuda) use moe::{Events, ReadAhead, Reader};
 #[path = "engine_mtp.rs"]
 #[cfg(feature = "cuda")]

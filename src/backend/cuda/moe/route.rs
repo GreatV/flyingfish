@@ -261,17 +261,16 @@ impl RouteOps {
         );
         let module = cubin::module(ctx, "moe_route")?;
         let decode = module.load_function("moe_route_decode_bf16")?;
+        let grid_y = crate::backend::cuda::max_grid_dim(ctx)?[1];
         #[cfg(feature = "cuda")]
-        let (sms, grid_y, max_threads, shared_limit) = (
+        let (sms, max_threads, shared_limit) = (
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?,
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?,
             ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         );
         #[cfg(feature = "rocm")]
-        let (sms, grid_y, max_threads, shared_limit) = (
+        let (sms, max_threads, shared_limit) = (
             ctx.properties.compute_units,
-            ctx.properties.max_grid_y,
             ctx.properties.max_threads,
             ctx.properties.shared_bytes,
         );
@@ -279,7 +278,7 @@ impl RouteOps {
         let threads = experts.div_ceil(32) * 32;
         ensure!(sms > 0, "route device has no SMs");
         ensure!(
-            max_rows <= usize::try_from(grid_y)?,
+            max_rows <= grid_y as usize,
             "route capacity exceeds device grid row limit"
         );
         ensure!(
