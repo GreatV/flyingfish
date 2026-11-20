@@ -8,36 +8,18 @@ Inference engine in Rust for language, multimodal, speech, diffusion, media-gene
 - **Published weights only.** Checkpoints are computed in their published format (BF16, F16, F32, FP8, E2M1 experts, ModelOpt NVFP4, GGUF Q4_0 for the MiniMax-H3 diffusion transformer). Nothing is requantized or converted.
 - **One kernel source for two vendors.** The CUDA C++ kernels compile with `nvcc` for NVIDIA and with `hipcc` for AMD; the host engine is shared and the device layer is selected at build time.
 
-## Models
+## Documentation
 
-Supported models, their formats and backends are listed in [docs/models.md](docs/models.md).
-
-## Library entry points
-
-Library callers use two entry layers:
-
-| Layer | Public surface | Backends | Resource contract |
-|---|---|---|---|
-| Model request | `RunOptions` with `minimax_h3::run_minimax_h3_i2va`; family types such as `minimax_h3::ImageRunOptions` and `music3::Music3Request` | CUDA for these examples; other families follow the model tables above | The caller supplies request inputs, device ordinal and runtime directory through the entry's arguments. The entry constructs and manages the stages for that request. |
-| Stage | `backend::BackendDevice` and the encoder, flow, decoder and workspace types exported by `backend` | `BackendDevice` is exported with CUDA or ROCm; individual stages retain their model and backend restrictions | The caller constructs the device and stage objects, supplies stage inputs, and owns the runtime and workspace lifetimes. The device carries GPU identity, context, execution stream and upload stream. |
-
-The generic `backend::Backend` loader and the autoregressive `model::layer_program` walker have these execution-domain errors:
-
-| `Architecture` | Entry | Exact error |
-|---|---|---|
-| `Qwen3` | `Backend` load | `Qwen3 AR execution is not bound` |
-| `Qwen3Vl` | `Backend` load and AR layer walker | `Qwen3-VL runs only as the MiniMax-H3 conditioner` |
-| `Clover` | AR layer walker | `Clover canvas execution is not bound` |
-| `DiffusionGemma` | AR layer walker | `DiffusionGemma layer program is not bound yet` |
-
-Clover and DiffusionGemma load on the separate eager canvas path. Their graph capture returns `canvas graph execution is not bound`.
+- [Models](docs/models.md): supported models, published formats and backends.
+- [CLI usage](docs/usage.md): commands, required inputs, options, defaults and output formats for each model.
+- [Library](docs/library.md): calling the engine from Rust, with the entry point, request and output of each model family.
 
 ## Platforms
 
 | Platform | Backend | Status |
 |---|---|---|
 | NVIDIA Ampere and Ada (sm_86, sm_89) | CUDA | Supported |
-| AMD RDNA3 (gfx1100) | ROCm and HIP | Supported for the models marked ROCm above |
+| AMD RDNA3 (gfx1100) | ROCm and HIP | Supported for the models whose backends in [docs/models.md](docs/models.md) include ROCm |
 | NVIDIA Blackwell (sm_120) | CUDA | In progress |
 | Apple Silicon | Metal | Planned |
 
@@ -45,48 +27,47 @@ Two-GPU MoE expert residency with peer compute is supported.
 
 ## Build
 
+### NVIDIA (CUDA, the default)
+
 Requirements:
-- the Rust toolchain pinned in `<rust-toolchain.toml>`;
+- the stable Rust toolchain pinned in the repository's `rust-toolchain.toml`;
+- the device nightly toolchain below;
 - a CUDA toolkit with `nvcc` on `PATH` or under `CUDA_HOME`;
 - an NVIDIA driver;
 - ffmpeg on `PATH` for MP4 output. Y4M+WAV output does not require it.
 
-CUDA builds also require the device-only `nightly-2026-10-06` toolchain, with
-`rust-src`, `llvm-tools`, `llvm-bitcode-linker`, and the `nvptx64-nvidia-cuda`
-target. Install it and populate its core-build dependencies before the first
-host build. Replace `<device-manifest>` with the device crate's `<Cargo.toml>` file:
+The device crate, which compiles the Rust GPU kernels to PTX, needs the pinned `nightly-2026-10-06` toolchain with `rust-src`, `llvm-tools`, `llvm-bitcode-linker` and the `nvptx64-nvidia-cuda` target: the `ptx-kernel` ABI, inline assembly on NVPTX and `-Z build-std=core` are not available on stable Rust. Install it and build the device crate once to populate its core-build dependencies before the first host build. `<device-manifest>` is the device crate's `Cargo.toml`:
 
 ```sh
 rustup toolchain install nightly-2026-10-06 --profile minimal --component rust-src,llvm-tools,llvm-bitcode-linker,rustfmt,clippy --target nvptx64-nvidia-cuda
 RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 build --manifest-path <device-manifest> --target nvptx64-nvidia-cuda -Z build-std=core --release
 ```
 
-The host build uses the stable pin and builds native attention cubins for each
-selected architecture with the device pin. Its device subprocess is offline;
-it does not install toolchains or download dependencies. No-CUDA builds do not
-invoke the device compiler.
+Then build the engine with the stable toolchain:
 
 ```sh
 cargo build --release
 ```
 
-This builds `flyingfish` and `ff`. `ff` is a short alias: it runs the `flyingfish` binary in the same directory, so keep the two together.
+The host build compiles native attention cubins for each selected architecture with the device toolchain. That step runs offline; it does not install toolchains or download dependencies. Kernels are compiled for the GPUs that `nvidia-smi` reports; to build without a GPU visible, set the targets explicitly, for example `CUDA_ARCH_LIST=89`.
 
-Kernels are compiled for the GPUs that `nvidia-smi` reports. To build without a GPU visible, set the target explicitly, for example `CUDA_ARCH_LIST=89`.
+The build produces `flyingfish` and `ff`. `ff` is a short alias that runs the `flyingfish` binary in the same directory, so keep the two together.
 
-`cargo build --no-default-features` builds the host-side code without CUDA. It has no GPU inference path.
-
-For AMD GPUs, build the ROCm backend instead of CUDA:
+### AMD (ROCm)
 
 ```sh
 cargo build --release --no-default-features --features rocm
 ```
 
-It needs `hipcc` (found through `HIP_HOME`, `ROCM_PATH` or `PATH`) and the hipBLAS and hipBLASLt libraries. Kernels are compiled for the architectures that `rocminfo` reports; set `ROCM_ARCH_LIST` (for example `gfx1100`) to build without a GPU visible.
+It needs `hipcc` (found through `HIP_HOME`, `ROCM_PATH` or `PATH`) and the hipBLAS and hipBLASLt libraries; it does not use the device nightly toolchain. Kernels are compiled for the architectures that `rocminfo` reports; set `ROCM_ARCH_LIST` (for example `gfx1100`) to build without a GPU visible.
+
+### Host-only
+
+`cargo build --no-default-features` builds the host-side code without a GPU backend and does not invoke the device compiler. It has no GPU inference path.
 
 ## Usage
 
-See [CLI usage by model](https://github.com/GreatV/flyingfish/blob/main/docs/usage.md) for required inputs, options, defaults and output formats.
+Common commands; [docs/usage.md](docs/usage.md) documents every command and option.
 
 ```sh
 # One-time per machine and model: measure kernels and transfer rates.
@@ -120,26 +101,15 @@ ff --model <MiniMax-H3-Image-dir> image --prompt "A red cube on a wooden table" 
 ff --model <Breeze-TTS-2-dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o <speech.wav>
 
 # Generate MiniMax-Music3 stereo audio from a caption and lyrics.
-ff --model <MiniMax-Music3-dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o <song.wav>
+ff --model <MiniMax-Music3-dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse] Morning light" --seed 7 --frames 25 -o <song.wav>
 
 # Generate HyperFlow video and audio; either keyframe option can be omitted.
 ff --model <HyperFlow-H3-Flash-dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o <out.mp4>
 ```
 
-Common options:
-- MiniMax-H3 video requires a keyframe, a frame count and a seed. Requested frames round up to `17n+5`, so 136 resolves to 141; the published duration is 5-15 seconds at 24 fps. No documented frame-count or seed defaults exist.
-- HyperFlow uses the published `fl2va_int8_convrot` component and MiniMax-H3 companion files supplied by `--base-model`, without an external LoRA or GGUF replacement. It supports text-only, first, last and first+last keyframes; ref2va media inputs are not supported. Frames round up to `17n+5`, within 124-362 aligned frames at 24 fps. The sampler uses the published six-step grid with video and audio shifts 12 and 3, respectively.
-- MiniMax-H3-Image `image` requires a prompt, `WIDTHxHEIGHT` size and seed. `--expand <dir>` replaces the prompt through the expander; repeated `--edit <image>` supplies upright RGB8 references. Output is PNG at the requested size, and `--json` reports size, seed and reference count.
-- MiniMax-Music3 `music` requires a caption, lyrics and seed. `--frames` defaults to 1500 (60 seconds at 25 fps); output is stereo 44.1 kHz PCM16 WAV, or WAV bytes to stdout when `-o` is omitted.
-- Media commands accept `--verbose` for placement, Lt and decode-plan diagnostics. Video, image, speak, music, transcribe, diarize and embed default stderr contains progress and errors only, with timing fields hidden unless verbose is enabled; other commands retain their existing diagnostics.
-- Breeze-TTS-2 `speak` uses the plain `[S0]` prompt and reads `<generation_config.json>`: temperature 0.9 for backbone and depth, top-k 50 and top-p 1.0 from the omitted library defaults, repetition penalty 1.1 on generated backbone codebook-0 tokens, at most 750 frames, and backbone EOS 2051. The default seed is 42. Output is mono 24 kHz PCM16 WAV; omit `-o` to write WAV bytes to stdout.
-- The runtime directory defaults to `~/.flyingfish`. `--runtime-dir` or `FLYINGFISH_RUNTIME_DIR` overrides it. It must be outside any model directory, and no path component is named `models`.
-- `--draft-model <dir>` enables a DSpark draft model.
-- `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8, GLM-5.3-Flash); 0 selects plain decoding. GLM-5.3-Flash drafts one token per round at any nonzero depth. MTP decode is CUDA-only, so ROCm builds need `--mtp 0` for such checkpoints.
-- `--kv-format affine8` stores an 8-bit KV cache for long contexts. The default is `bf16`.
-- `--device <n>` selects the GPU.
+`--model` goes before the command; other shared options may also follow it. `--device <n>` selects the GPU, `--runtime-dir` (default `~/.flyingfish`, or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration and must be outside any model directory, `--verbose` prints placement, Lt and decode-plan diagnostics, and `--draft-model`, `--mtp` and `--kv-format` control speculative decoding and the KV cache. Each model's required inputs, defaults and output formats are in [docs/usage.md](docs/usage.md).
 
-`ff` takes the same commands and options as `flyingfish`, and uses the same calibration. `ff --help` lists them all.
+`ff` takes the same commands and options as `flyingfish` and uses the same calibration. `ff --help` lists them all.
 
 ## Development
 
