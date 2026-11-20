@@ -914,7 +914,7 @@ fn expand_prompt(
     Ok(caption.to_string())
 }
 
-fn image_condition(
+pub(super) fn image_condition(
     model: &Path,
     options: &crate::minimax_h3::ImageRunOptions,
     prompt: &ConditionerPrompt,
