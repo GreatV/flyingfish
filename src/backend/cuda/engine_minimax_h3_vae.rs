@@ -228,7 +228,7 @@ impl ImageDecoder {
             tiles.width / spec.spatial_ratio,
         );
         let work = ImageWork {
-            core: TileWork::with_rope_axes(s, spec, tile, (batch, tiles.count()), 2)?,
+            core: TileWork::with_output(s, spec, tile, (batch, tiles.count()), (2, 0))?,
             grid: s.clone_htod(&grid)?,
             raw: unsafe { s.alloc(raw)? },
             planar: unsafe { s.alloc(pixels)? },
@@ -1934,18 +1934,28 @@ impl VideoDecoder {
             "RGB output exceeds memory budget"
         );
         let output = unsafe { d.stream.alloc::<u8>(count)? };
+        self.rgb_into(d, decoded, &output, shape)?;
+        Ok(output)
+    }
+
+    pub(super) fn rgb_into(
+        &self,
+        d: &Device,
+        decoded: &CudaSlice<bf16>,
+        output: &impl DevicePtr<u8>,
+        shape: (usize, usize, usize),
+    ) -> Result<()> {
         planar_f32_to_rgb_u8(
             d,
             &self.kernels.rgb,
             decoded,
-            &output,
+            output,
             shape,
             (
                 VAE_PIXEL_MEAN.map(|v| v as f32),
                 VAE_PIXEL_STD.map(|v| v as f32),
             ),
-        )?;
-        Ok(output)
+        )
     }
 
     pub(crate) fn work(
@@ -2597,7 +2607,7 @@ impl TileWork {
         batch: usize,
         slots: usize,
     ) -> Result<usize> {
-        Self::charged_bytes(spec, shape, batch, slots, 1)
+        Self::charged_bytes(spec, shape, batch, slots, 1, 0)
     }
 
     pub(super) fn charged_bytes(
@@ -2606,6 +2616,7 @@ impl TileWork {
         batch: usize,
         slots: usize,
         page: usize,
+        rgb_bytes: usize,
     ) -> Result<usize> {
         ensure!(page > 0, "invalid video allocation page");
         ensure!(batch > 0 && batch <= slots, "invalid video tile batch");
@@ -2634,7 +2645,7 @@ impl TileWork {
             charge(4 * t * spec.rope_dims as u128)
                 + charge(4 * dim)
                 + 6 * charge(2 * dim)
-                + charge(4 * ffn)
+                + charge((4 * ffn).max(2 * rgb_bytes.div_ceil(2) as u128))
                 + charge(2 * ffn)
                 + 2 * charge(latent)
                 + charge(2 * rows * spec.patch_width() as u128)
@@ -2652,17 +2663,17 @@ impl TileWork {
         shape: (usize, usize, usize),
         (batch, slots): (usize, usize),
     ) -> Result<Self> {
-        Self::with_rope_axes(s, spec, shape, (batch, slots), 3)
+        Self::with_output(s, spec, shape, (batch, slots), (3, 0))
     }
 
-    fn with_rope_axes(
+    pub(super) fn with_output(
         s: &Arc<CudaStream>,
         spec: &VaeSpec,
         shape: (usize, usize, usize),
         (batch, slots): (usize, usize),
-        axes: usize,
+        (axes, rgb_bytes): (usize, usize),
     ) -> Result<Self> {
-        let bytes = Self::batch_bytes(spec, shape, batch, slots)?;
+        let bytes = Self::charged_bytes(spec, shape, batch, slots, 1, rgb_bytes)?;
         let (frames, height, width) = shape;
         let patches = frames * height * width;
         let tokens = patches + spec.registers + 1;
@@ -2698,7 +2709,7 @@ impl TileWork {
             k: alloc(n)?,
             v: alloc(n)?,
             attn: alloc(n)?,
-            ff: alloc(rows * 2 * spec.ffn)?,
+            ff: alloc((rows * 2 * spec.ffn).max(rgb_bytes.div_ceil(2)))?,
             gated: alloc(rows * spec.ffn)?,
             latent: alloc(latent)?,
             latent_q: alloc(latent)?,
@@ -2717,6 +2728,14 @@ impl TileWork {
             "video work differs from counted plan"
         );
         Ok(work)
+    }
+
+    pub(super) fn rgb_output(
+        &mut self,
+        bytes: usize,
+    ) -> Result<cudarc::driver::CudaViewMut<'_, u8>> {
+        // The final projection and all previous FFN reads precede RGB conversion on this stream.
+        unsafe { self.ff.transmute_mut(bytes) }.context("decoder FFN storage is too small for RGB")
     }
 
     fn allocated_bytes(&self) -> usize {

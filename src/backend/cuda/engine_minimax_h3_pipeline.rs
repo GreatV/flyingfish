@@ -1492,7 +1492,7 @@ impl VideoDecodeGeometry {
             tile,
             total_frames,
             chunks: plan.chunks,
-            transient: decoded + tile_scratch.max(rgb_bytes),
+            transient: decoded + tile_scratch,
             rgb_bytes,
         })
     }
@@ -1584,7 +1584,14 @@ impl DecoderVisitCost {
             if batch < cap.saturating_sub(1) && batch > slots.div_ceil(groups) {
                 continue;
             }
-            let charged = TileWork::charged_bytes(vae, geometry.tile, batch, slots, page)?;
+            let charged = TileWork::charged_bytes(
+                vae,
+                geometry.tile,
+                batch,
+                slots,
+                page,
+                geometry.rgb_bytes,
+            )?;
             if charged > budget {
                 continue;
             }
@@ -1670,9 +1677,11 @@ impl VideoDecodeStage {
             video,
         )?;
         let s = &device.stream;
-        let rgb = self.video.rgb(
+        let rgb = self.work.rgb_output(self.geometry.rgb_bytes)?;
+        self.video.rgb_into(
             device,
             &decoded,
+            &rgb,
             (
                 geometry.frames,
                 self.geometry.total_frames,
@@ -1680,7 +1689,6 @@ impl VideoDecodeStage {
             ),
         )?;
         let video = s.clone_dtoh(&rgb)?;
-        drop(rgb);
         drop(decoded);
         let input = s.clone_htod(audio)?;
         let audio = s.clone_dtoh(&self.audio.decode(
@@ -1832,7 +1840,14 @@ impl VideoSession {
         let decode_geometry = VideoDecodeGeometry::new(&vae, &geometry)?;
         let slots = decode_geometry.tiles.count();
         let cap = VideoDecoder::work_batch_cap(&device, &vae, decode_geometry.tile, slots)?;
-        let one_tile = TileWork::charged_bytes(&vae, decode_geometry.tile, 1, slots, page)?;
+        let one_tile = TileWork::charged_bytes(
+            &vae,
+            decode_geometry.tile,
+            1,
+            slots,
+            page,
+            decode_geometry.rgb_bytes,
+        )?;
         let audio_input = 4 * layout.audio_indices.len() * spec.audio_in_channels;
         let posterior = 4 * vae.latent_channels * geometry.latent_height * geometry.latent_width;
         let anchor = encode.as_ref().map_or(0, |(stage, _)| {
@@ -1942,9 +1957,21 @@ impl VideoSession {
                     (pcie, disk),
                 )?;
                 let decoder_visits = decode_geometry.chunks * slots.div_ceil(batch);
-                let bytes = TileWork::batch_bytes(&vae, decode_geometry.tile, batch, slots)?;
-                let work =
-                    TileWork::new(&device.stream, &vae, decode_geometry.tile, (batch, slots))?;
+                let bytes = TileWork::charged_bytes(
+                    &vae,
+                    decode_geometry.tile,
+                    batch,
+                    slots,
+                    1,
+                    decode_geometry.rgb_bytes,
+                )?;
+                let work = TileWork::with_output(
+                    &device.stream,
+                    &vae,
+                    decode_geometry.tile,
+                    (batch, slots),
+                    (3, decode_geometry.rgb_bytes),
+                )?;
                 device.ctx.synchronize()?;
                 let (free, total) = device.ctx.mem_get_info()?;
                 let live_budget = DensePlacement::device_budget(free, total, fixed, 0, transient)?;
@@ -1968,7 +1995,7 @@ impl VideoSession {
                     "{}",
                     serde_json::json!({"h3_video_resident_plan": {
                         "device_budget": device_budget, "host_budget": host, "transient_bytes": transient,
-                        "transient_rgb_bytes": decode_geometry.rgb_bytes, "decoder_group_prices": alternatives,
+                        "shared_ffn_rgb_bytes": decode_geometry.rgb_bytes, "decoder_group_prices": alternatives,
                         "decoder_launch_seconds": visit.launch_seconds, "decoder_handoff_seconds": visit.handoff_seconds,
                         "device_memory_bytes_per_second": device.info.memory_bytes_per_second,
                         "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes,
@@ -4813,7 +4840,18 @@ fn video_placement_sizes_decoder_groups_from_remaining_memory() -> Result<()> {
     assert_eq!(select(one)?, (1, one));
     assert!(select(one - 1).is_err());
     let page = 2 << 20;
-    let full = TileWork::charged_bytes(&vae, decoder.tile, slots, slots, page)?;
+    let full = TileWork::charged_bytes(&vae, decoder.tile, slots, slots, page, decoder.rgb_bytes)?;
+    assert_eq!(
+        full,
+        TileWork::charged_bytes(&vae, decoder.tile, slots, slots, page, 0)?
+    );
+    let ffn_bytes =
+        4 * (decoder.tile.0 * decoder.tile.1 * decoder.tile.2 + vae.registers + 1) * vae.ffn;
+    let odd_rgb = decoder.rgb_bytes + 1;
+    assert_eq!(
+        TileWork::charged_bytes(&vae, decoder.tile, 1, slots, 1, odd_rgb)? - one,
+        2 * odd_rgb.div_ceil(2) - ffn_bytes
+    );
     let visit = DecoderVisitCost {
         weight_bytes: 1 << 30,
         weight_seconds: 0.001,
