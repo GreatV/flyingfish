@@ -1,7 +1,6 @@
 // GGUF Q4_0: 18 bytes per 32 weights. F16 scale d at byte 0; low nibble = j, high nibble = j+16.
 // Blocks run along the official row-major [out, in] flat order; no transpose.
 #include "gpu_compat.cuh"
-#include <cuda_fp16.h>
 #include <stdint.h>
 
 __device__ __forceinline__ float q4_0_scale(const uint8_t* block) {

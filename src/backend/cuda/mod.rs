@@ -123,6 +123,62 @@ pub struct Device {
     pub upload: Arc<CudaStream>,
 }
 
+pub(crate) fn max_grid_dim(ctx: &Arc<CudaContext>) -> Result<[u32; 3]> {
+    #[cfg(feature = "cuda")]
+    let raw = {
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        [
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)?,
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?,
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)?,
+        ]
+    };
+    #[cfg(feature = "rocm")]
+    let raw = [
+        ctx.properties.max_grid_x,
+        ctx.properties.max_grid_y,
+        ctx.properties.max_grid_z,
+    ];
+    let dims = [
+        u32::try_from(raw[0])?,
+        u32::try_from(raw[1])?,
+        u32::try_from(raw[2])?,
+    ];
+    ensure!(
+        dims.iter().all(|&d| d > 0),
+        "device grid limits must be positive"
+    );
+    Ok(dims)
+}
+
+/// # Safety
+/// `callback` and `data` must be host-safe and stay valid until the queued callback returns.
+#[cfg(test)]
+pub(crate) unsafe fn launch_host_func(
+    stream: &Arc<CudaStream>,
+    callback: unsafe extern "C" fn(*mut std::ffi::c_void),
+    data: *mut std::ffi::c_void,
+) -> Result<()> {
+    stream.context().bind_to_thread()?;
+    unsafe {
+        #[cfg(feature = "cuda")]
+        cudarc::driver::sys::cuLaunchHostFunc(stream.cu_stream(), Some(callback), data).result()?;
+        #[cfg(feature = "rocm")]
+        {
+            unsafe extern "C" {
+                fn hipLaunchHostFunc(
+                    stream: *mut std::ffi::c_void,
+                    callback: unsafe extern "C" fn(*mut std::ffi::c_void),
+                    data: *mut std::ffi::c_void,
+                ) -> i32;
+            }
+            let status = hipLaunchHostFunc(stream.raw(), callback, data);
+            ensure!(status == 0, "HIP host callback status={status}");
+        }
+    }
+    Ok(())
+}
+
 impl Device {
     pub(crate) fn workspace_budget(
         &self,
@@ -276,9 +332,9 @@ impl Device {
 
     #[cfg(feature = "cuda")]
     pub fn finish_upload(&self) -> Result<()> {
-        let event = self.upload.record_event(Some(
-            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
-        ))?;
+        let event = self
+            .upload
+            .record_event(Some(crate::backend::gpu::EVENT_DISABLE_TIMING))?;
         self.stream.wait(&event)?;
         self.stream.synchronize()?;
         unsafe {
@@ -953,7 +1009,11 @@ impl Device {
         })
     }
     pub fn finish_upload(&self) -> Result<()> {
-        self.stream.wait(&self.upload.record_event(Some(2))?)?;
+        self.stream.wait(
+            &self
+                .upload
+                .record_event(Some(crate::backend::gpu::EVENT_DISABLE_TIMING))?,
+        )?;
         self.stream.synchronize()
     }
     pub fn peer(&self) -> Result<Option<Self>> {

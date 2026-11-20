@@ -14,7 +14,7 @@ use std::cell::RefCell;
 #[path = "engine_moe_prefill.rs"]
 mod prefill;
 pub(in crate::backend::cuda::engine) use prefill::Prefill;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(in crate::backend::cuda) use prefill::ReadAhead;
 pub(super) use prefill::{cpu_bound, peer_prefill_bytes};
 
@@ -175,7 +175,7 @@ impl Reader {
         Ok(reader)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     pub(in crate::backend::cuda) fn new_ranges(
         device: &Device,
         disk: DiskReader,
@@ -767,29 +767,8 @@ pub(in crate::backend::cuda::engine) fn delay_stream(stream: &Arc<CudaStream>) -
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     stream.context().bind_to_thread()?;
-    // SAFETY: the callback uses no CUDA API, shared data, or outstanding device work.
-    unsafe {
-        #[cfg(feature = "cuda")]
-        cudarc::driver::sys::cuLaunchHostFunc(
-            stream.cu_stream(),
-            Some(delay),
-            std::ptr::null_mut(),
-        )
-        .result()?;
-        #[cfg(feature = "rocm")]
-        {
-            unsafe extern "C" {
-                fn hipLaunchHostFunc(
-                    stream: *mut std::ffi::c_void,
-                    callback: unsafe extern "C" fn(*mut std::ffi::c_void),
-                    data: *mut std::ffi::c_void,
-                ) -> i32;
-            }
-            let status = hipLaunchHostFunc(stream.raw(), delay, std::ptr::null_mut());
-            ensure!(status == 0, "HIP delayed-copy callback status={status}");
-        }
-    }
-    Ok(())
+    // SAFETY: the callback uses no CUDA/HIP API, shared data, or outstanding device work.
+    unsafe { crate::backend::cuda::launch_host_func(stream, delay, std::ptr::null_mut()) }
 }
 
 impl Slots {

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 struct Properties {
     char name[256];
@@ -17,6 +18,7 @@ struct Properties {
     int32_t max_grid_y;
     int32_t async_engines, host_register_supported;
     int32_t max_grid_x;
+    int32_t max_grid_z;
 };
 static_assert(sizeof(Properties) == 600 && alignof(Properties) == 8);
 static_assert(offsetof(Properties, optin_shared_bytes) == 528);
@@ -24,6 +26,7 @@ static_assert(offsetof(Properties, warp) == 536);
 static_assert(offsetof(Properties, max_grid_y) == 580);
 static_assert(offsetof(Properties, async_engines) == 584);
 static_assert(offsetof(Properties, max_grid_x) == 592);
+static_assert(offsetof(Properties, max_grid_z) == 596);
 static_assert(hipErrorOutOfMemory == 2);
 static_assert(hipErrorNotReady == 600);
 static_assert(hipHostMallocPortable == 1 && hipHostRegisterPortable == 1);
@@ -63,12 +66,13 @@ extern "C" int ff_hip_device_properties(int device, Properties* output) {
         hipDeviceAttributeMemoryClockRate, hipDeviceAttributeMemoryBusWidth,
         hipDeviceAttributeCooperativeLaunch, hipDeviceAttributeMaxGridDimY,
         hipDeviceAttributeAsyncEngineCount, hipDeviceAttributeHostRegisterSupported,
-        hipDeviceAttributeMaxGridDimX
+        hipDeviceAttributeMaxGridDimX, hipDeviceAttributeMaxGridDimZ
     };
     int* values[] = {&output->warp, &output->compute_units, &output->max_threads,
         &output->shared_bytes, &output->unit_shared_bytes, &output->l2_bytes,
         &output->memory_clock_khz, &output->memory_bus_bits, &output->cooperative,
-        &output->max_grid_y, &output->async_engines, &output->host_register_supported, &output->max_grid_x};
+        &output->max_grid_y, &output->async_engines, &output->host_register_supported,
+        &output->max_grid_x, &output->max_grid_z};
     for (size_t i = 0; i < sizeof(attributes) / sizeof(attributes[0]); ++i) {
         status = hipDeviceGetAttribute(values[i], attributes[i], device);
         if (status != hipSuccess) return status;
@@ -82,11 +86,44 @@ extern "C" int ff_hip_lt_index(hipblasLtMatmulAlgo_t* algorithm) {
     return hipblaslt_ext::getIndexFromAlgo(*algorithm);
 }
 
+extern "C" int ff_hip_lt_algo_from_index(hipblasLtHandle_t handle, int index,
+    hipblasLtMatmulAlgo_t* algorithm) {
+    std::vector<int> indices{index};
+    std::vector<hipblasLtMatmulHeuristicResult_t> results;
+    auto status = hipblaslt_ext::getAlgosFromIndex(handle, indices, results);
+    if (status != HIPBLAS_STATUS_SUCCESS) return status;
+    if (results.size() != 1) return HIPBLAS_STATUS_INVALID_VALUE;
+    if (results[0].state != HIPBLAS_STATUS_SUCCESS) return results[0].state;
+    *algorithm = results[0].algo;
+    return HIPBLAS_STATUS_SUCCESS;
+}
+
 extern "C" int ff_hip_lt_supported(hipblasLtHandle_t handle,
     hipblasLtMatmulDesc_t desc, hipblasLtMatrixLayout_t a,
     hipblasLtMatrixLayout_t b, hipblasLtMatrixLayout_t c,
-    hipblasLtMatmulAlgo_t* algorithm, size_t* workspace) {
-    const float alpha = 1.0f, beta = 0.0f;
+    float beta, hipblasLtMatmulAlgo_t* algorithm, size_t* workspace) {
+    const float alpha = 1.0f;
     return hipblaslt_ext::matmulIsAlgoSupported(handle, desc, &alpha, a, b,
         &beta, c, c, *algorithm, *workspace);
+}
+
+extern "C" int ff_hip_lt_algo_names(hipblasLtHandle_t handle,
+    hipblasLtMatmulAlgo_t* algorithm,
+    char* solution, size_t solution_len,
+    char* kernel, size_t kernel_len) {
+    if (!algorithm || (!solution && solution_len) || (!kernel && kernel_len)) {
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    }
+    auto copy_str = [](const std::string& src, char* dst, size_t cap) -> bool {
+        if (!dst) return cap == 0;
+        if (src.size() >= cap) return false;
+        std::memcpy(dst, src.data(), src.size());
+        dst[src.size()] = '\0';
+        return true;
+    };
+    if (!copy_str(hipblaslt_ext::getSolutionNameFromAlgo(handle, *algorithm), solution, solution_len) ||
+        !copy_str(hipblaslt_ext::getKernelNameFromAlgo(handle, *algorithm), kernel, kernel_len)) {
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    }
+    return HIPBLAS_STATUS_SUCCESS;
 }

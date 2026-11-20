@@ -1,6 +1,6 @@
 use super::Device;
 use crate::backend::gpu::{CudaContext, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use crate::backend::gpu::{CudaFunction, PushKernelArg};
 use crate::config::Config;
 use crate::experts::{
@@ -8,9 +8,9 @@ use crate::experts::{
     catalogue::ExpertGeometry,
     plan::Capacity,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use crate::gguf::GgmlType;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use anyhow::bail;
 use anyhow::{Context, Result, ensure};
 #[cfg(feature = "cuda")]
@@ -1718,7 +1718,7 @@ impl Loader<'_> {
 }
 
 /// The GGUF dequant kernels, loaded once from the `q4_0_linear` cubin.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct QuantKernels {
     dequant_bf16: CudaFunction,
     dequant_f32: CudaFunction,
@@ -1727,7 +1727,7 @@ pub(crate) struct QuantKernels {
 }
 
 /// One dequant launch: the source bytes, the destination buffer and its element type.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct DequantCopy {
     pub source: u64,
     pub destination: u64,
@@ -1735,7 +1735,7 @@ pub(crate) struct DequantCopy {
     pub dtype: Dtype,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 impl QuantKernels {
     pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = super::cubin::module(ctx, "q4_0_linear")?;
@@ -1824,13 +1824,13 @@ impl QuantKernels {
 }
 
 /// Whether a stored GGUF type dequantizes into its device slot; the other accepted types pass through.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn dequantizes(quant: Option<GgmlType>) -> bool {
     matches!(quant, Some(GgmlType::Q4_0 | GgmlType::F16))
 }
 
 /// Device slot bytes of a streamed linear: the BF16 tile for a dequantized entry, the stored bytes otherwise.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn device_slot_bytes(name: &str, entry: &TensorEntry) -> Result<usize> {
     match entry.quant {
         Some(quant) if dequantizes(Some(quant)) => {
@@ -1844,7 +1844,7 @@ pub(crate) fn device_slot_bytes(name: &str, entry: &TensorEntry) -> Result<usize
 }
 
 /// Finiteness of a quantized entry's stored source: every F16 value for F16, each 18-byte Q4_0 block's scale.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8]) -> Result<()> {
     match entry.quant {
         None if entry.dtype == safetensors::Dtype::F32 => {
@@ -1887,7 +1887,7 @@ pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8])
 }
 
 /// Finiteness of a streamed layer's quantized source, over every entry's stored bytes.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn check_layer_source(layer: &DenseLayer, source: &[u8]) -> Result<()> {
     for entry in &layer.entries {
         let bytes = &source[entry.source_offset..entry.source_offset + entry.entry.bytes];
@@ -1896,7 +1896,7 @@ fn check_layer_source(layer: &DenseLayer, source: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 struct DenseEntry {
     name: String,
     device_offset: usize,
@@ -1905,7 +1905,7 @@ struct DenseEntry {
     narrow_f32: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 struct DenseLayer {
     slot: Option<usize>,
     next: Option<usize>,
@@ -1918,16 +1918,16 @@ struct DenseLayer {
     checked: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 struct DenseSlot {
     device: CudaSlice<u8>,
-    ready: cudarc::driver::CudaEvent,
-    retired: cudarc::driver::CudaEvent,
+    ready: crate::backend::gpu::CudaEvent,
+    retired: crate::backend::gpu::CudaEvent,
     retired_valid: bool,
     loaded: Option<usize>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct DenseStreaming {
     layers: Vec<DenseLayer>,
     slots: Vec<DenseSlot>,
@@ -1938,13 +1938,13 @@ pub(crate) struct DenseStreaming {
     upload: Arc<CudaStream>,
     staging: Option<CudaSlice<u8>>,
     quant: Option<QuantKernels>,
-    narrow_f32: Option<cudarc::driver::CudaFunction>,
+    narrow_f32: Option<CudaFunction>,
     pub plan: crate::prefill::DensePlacement,
     #[cfg(test)]
     skip_reclaim: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 impl Drop for DenseStreaming {
     fn drop(&mut self) {
         let context = self.upload.context();
@@ -1953,7 +1953,7 @@ impl Drop for DenseStreaming {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 impl DenseStreaming {
     pub(crate) fn new(
         dir: &Path,
@@ -2193,12 +2193,12 @@ impl DenseStreaming {
                 allocation_record("slot_tensor", plan.slot_bytes, 0)?;
                 let ready = d
                     .ctx
-                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+                    .new_event(Some(crate::backend::gpu::EVENT_DISABLE_TIMING))?;
                 #[cfg(test)]
                 allocation_record("slot_ready_event", 0, 0)?;
                 let retired = d
                     .ctx
-                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+                    .new_event(Some(crate::backend::gpu::EVENT_DISABLE_TIMING))?;
                 #[cfg(test)]
                 allocation_record("slot_retired_event", 0, 0)?;
                 Ok(DenseSlot {
@@ -2218,13 +2218,14 @@ impl DenseStreaming {
             .any(|entry| dequantizes(entry.entry.quant))
             .then(|| QuantKernels::new(&d.ctx))
             .transpose()?;
-        let narrow_f32 = entries()
-            .any(|entry| entry.narrow_f32)
-            .then(|| -> Result<_> {
-                Ok(super::cubin::module(&d.ctx, "vision_ops")?
-                    .load_function("vision_downcast_f32_to_bf16_checked")?)
-            })
-            .transpose()?;
+        let narrow_f32 = if entries().any(|entry| entry.narrow_f32) {
+            Some(
+                super::cubin::module(&d.ctx, "vision_ops")?
+                    .load_function("vision_downcast_f32_to_bf16_checked")?,
+            )
+        } else {
+            None
+        };
         #[cfg(test)]
         allocation_record("staging_and_quant_modules", staging_bytes, 0)?;
         Ok(Self {
@@ -2436,11 +2437,7 @@ impl DenseStreaming {
                 check_layer_source(&self.layers[index], source)?;
             }
             unsafe {
-                cudarc::driver::result::memcpy_htod_async(
-                    source_pointer,
-                    source,
-                    self.upload.cu_stream(),
-                )?;
+                super::copy::htod_async(source_pointer, source, &self.upload)?;
             }
         } else {
             if self.next_disk_read == Some(index) {
@@ -2464,11 +2461,7 @@ impl DenseStreaming {
                 check_layer_source(&self.layers[index], raw)?;
             }
             unsafe {
-                cudarc::driver::result::memcpy_htod_async(
-                    source_pointer,
-                    raw,
-                    self.upload.cu_stream(),
-                )?;
+                super::copy::htod_async(source_pointer, raw, &self.upload)?;
             }
             #[cfg(test)]
             if self.skip_reclaim {
@@ -2530,11 +2523,11 @@ impl DenseStreaming {
                     )?;
                 } else {
                     unsafe {
-                        cudarc::driver::result::memcpy_dtod_async(
+                        super::copy::dtod_raw(
                             destination,
                             source_pointer + entry.source_offset as u64,
                             entry.entry.bytes,
-                            self.upload.cu_stream(),
+                            &self.upload,
                         )?;
                     }
                 }
@@ -2767,7 +2760,7 @@ pub(crate) struct WeightCatalog {
     pub load_wall_ms: f64,
 }
 impl WeightCatalog {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     fn dense_host_fixed(
         layers: &[usize],
         ranges: &[(usize, u64, u64, u64)],
@@ -3483,12 +3476,13 @@ impl WeightCatalog {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use half::bf16;
     use sha2::{Digest, Sha256};
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn classic_streamed_slots_bind_fused_order_per_layer() -> Result<()> {
         use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope, classic_layer_names};
@@ -3625,8 +3619,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA and a dense streaming window"]
+    #[ignore = "requires GPU and a dense streaming window"]
     fn dense_slots_preserve_native_bytes_across_host_disk_reuse_gpu() -> Result<()> {
+        #[cfg(feature = "cuda")]
         use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as bs};
         use std::io::Write;
         let root = std::env::temp_dir().join(format!("ff-dense-slots-{}", std::process::id()));
@@ -3771,8 +3766,17 @@ mod tests {
             let mut outputs = (0..4)
                 .map(|_| stream.alloc_zeros::<u8>(per_layer))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            #[cfg(feature = "cuda")]
             let blas = CudaBlas::new(stream.clone())?;
             let (n, k) = (shapes[1][0], shapes[1][1]);
+            #[cfg(feature = "rocm")]
+            let blas = {
+                let blas = super::super::blas::Blas::new(stream.clone())?;
+                for rows in [1u32, 17] {
+                    blas.prepare_fixed(rows, n as u32, k as u32)?;
+                }
+                blas
+            };
             let input = stream.clone_htod(
                 &(0..18 * k)
                     .map(|i| bf16::from_f32(((i * 37 % 997) as f32 - 498.0) / 512.0))
@@ -3781,6 +3785,7 @@ mod tests {
             let mut products = (0..4)
                 .map(|_| stream.alloc_zeros::<bf16>(18 * n))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            #[cfg(feature = "cuda")]
             let product = |weights: &CudaSlice<u8>, output: &mut CudaSlice<bf16>| -> Result<()> {
                 let weight = unsafe { weights.transmute::<bf16>(per_layer / 2) }
                     .context("dense test matrix extent")?;
@@ -3809,6 +3814,41 @@ mod tests {
                 }
                 Ok(())
             };
+            #[cfg(feature = "rocm")]
+            let product = |weight_base: u64, output: &mut CudaSlice<bf16>| -> Result<()> {
+                let matrix0_elems = shapes[0].iter().product::<usize>();
+                let weight_ptr = weight_base + (matrix0_elems * size_of::<bf16>()) as u64;
+                let weight = unsafe {
+                    super::super::contracts::Tensor::new(
+                        weight_ptr,
+                        [n as u32, k as u32],
+                        [k as u64, 1],
+                        (n * k * size_of::<bf16>()) as u64,
+                    )?
+                };
+                let input_ptr = input.device_ptr(stream).0;
+                let out_ptr = output.device_ptr(stream).0;
+                for (start, rows) in [(0usize, 1usize), (1usize, 17usize)] {
+                    let x = unsafe {
+                        super::super::contracts::Tensor::new(
+                            input_ptr + (start * k * size_of::<bf16>()) as u64,
+                            [rows as u32, k as u32],
+                            [k as u64, 1],
+                            (rows * k * size_of::<bf16>()) as u64,
+                        )?
+                    };
+                    let mut y = super::super::contracts::TensorMut(unsafe {
+                        super::super::contracts::Tensor::new(
+                            out_ptr + (start * n * size_of::<bf16>()) as u64,
+                            [rows as u32, n as u32],
+                            [n as u64, 1],
+                            (rows * n * size_of::<bf16>()) as u64,
+                        )?
+                    });
+                    blas.linear_bf16(weight, x, &mut y)?;
+                }
+                Ok(())
+            };
             let mut resident_products = Vec::new();
             for (layer, (values, output)) in expected.iter().zip(&mut outputs).enumerate() {
                 let resident = stream.clone_htod(values)?;
@@ -3817,7 +3857,10 @@ mod tests {
                     stream.clone_dtoh(output)? == *values,
                     "resident native byte baseline differs"
                 );
+                #[cfg(feature = "cuda")]
                 product(&resident, &mut products[layer])?;
+                #[cfg(feature = "rocm")]
+                product(resident.device_ptr(stream).0, &mut products[layer])?;
                 let values = stream.clone_dtoh(&products[layer])?;
                 ensure!(
                     values.iter().all(|v| v.is_finite()),
@@ -3859,15 +3902,16 @@ mod tests {
                         let source = dense.pointer(layer, 0, per_layer)?;
                         let target = output.device_ptr(stream).0;
                         unsafe {
-                            cudarc::driver::result::memcpy_dtod_async(
-                                target,
-                                source,
-                                per_layer,
-                                stream.cu_stream(),
-                            )?;
+                            super::super::copy::dtod_raw(target, source, per_layer, stream)?;
                         }
-                        let slot = dense.plan.slots[layer].context("streamed test slot missing")?;
-                        product(&dense.slots[slot].device, &mut products[layer])?;
+                        #[cfg(feature = "cuda")]
+                        {
+                            let slot =
+                                dense.plan.slots[layer].context("streamed test slot missing")?;
+                            product(&dense.slots[slot].device, &mut products[layer])?;
+                        }
+                        #[cfg(feature = "rocm")]
+                        product(source, &mut products[layer])?;
                         dense.end(layer, stream)?;
                     }
                     for (layer, output) in outputs.iter().enumerate() {
@@ -3892,7 +3936,7 @@ mod tests {
                     }
                     device.upload.synchronize()?;
                     for slot in &dense.slots {
-                        let guard = stream.clone_dtoh(&slot.device.slice(per_layer..))?;
+                        let guard = device.upload.clone_dtoh(&slot.device.slice(per_layer..))?;
                         ensure!(
                             guard == [0xcd; 64],
                             "dense upload overwrote unused slot capacity"
@@ -3975,12 +4019,11 @@ mod tests {
                 dense.skip_reclaim = skip_reclaim;
                 let gate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 unsafe {
-                    sys::cuLaunchHostFunc(
-                        dense.upload.cu_stream(),
-                        Some(wait_for_gate),
+                    super::super::launch_host_func(
+                        &dense.upload,
+                        wait_for_gate,
                         std::sync::Arc::as_ptr(&gate) as *mut std::ffi::c_void,
                     )
-                    .result()
                     .context("hold dense upload stream")?;
                 }
                 dense.prefetch(0)?;
@@ -3990,7 +4033,7 @@ mod tests {
                 }
                 gate.store(1, std::sync::atomic::Ordering::Release);
                 dense.upload.synchronize()?;
-                let actual = stream.clone_dtoh(&dense.slots[0].device)?;
+                let actual = dense.upload.clone_dtoh(&dense.slots[0].device)?;
                 if skip_reclaim {
                     ensure!(
                         actual == expected[2] && actual != expected[0],
@@ -4012,6 +4055,426 @@ mod tests {
         result
     }
 
+    #[test]
+    #[ignore = "requires GPU"]
+    fn dense_streaming_staging_dequant_cast_and_preloaded_gpu() -> Result<()> {
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ff-dense-stage-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let result = (|| -> Result<()> {
+            let entry = |shape: Vec<usize>,
+                         bytes: usize,
+                         dtype: Dtype,
+                         quant: Option<GgmlType>,
+                         swap_halves: bool,
+                         layer: u32,
+                         role: &str| TensorEntry {
+                dtype,
+                bytes,
+                shape,
+                shard: "model.safetensors".into(),
+                load: true,
+                data_start: 0,
+                data_offsets: [0, bytes as u64],
+                scope: crate::checkpoint::TensorScope::Text,
+                layer: Some(layer),
+                role: role.into(),
+                scale_name: None,
+                quant,
+                swap_halves,
+            };
+
+            // 1) with_f32_cast + passthrough BF16 + shift_source_offset negative control + nonfinite reject
+            let elems = 32usize;
+            let mut cast_entries = BTreeMap::new();
+            let mut order = Vec::new();
+            for l in 0..3u32 {
+                let cast_name = format!("model.layers.{l}.cast.weight");
+                let pass_name = format!("model.layers.{l}.pass.weight");
+                cast_entries.insert(
+                    cast_name.clone(),
+                    entry(
+                        vec![4, 8],
+                        elems * 4,
+                        Dtype::F32,
+                        None,
+                        false,
+                        l,
+                        "cast.weight",
+                    ),
+                );
+                cast_entries.insert(
+                    pass_name.clone(),
+                    entry(
+                        vec![4, 8],
+                        elems * 2,
+                        Dtype::BF16,
+                        None,
+                        false,
+                        l,
+                        "pass.weight",
+                    ),
+                );
+                order.push(vec![cast_name, pass_name]);
+            }
+            let cast_manifest = TensorManifest {
+                entries: cast_entries,
+                resident_bytes: 0,
+            };
+            let per_layer_slot = elems * 2 + elems * 2;
+            let per_layer_host = elems * 4 + elems * 2;
+            let cast_plan = crate::prefill::DensePlacement::with_allocations(
+                &[per_layer_slot; 3],
+                &[per_layer_slot; 3],
+                Some(&[per_layer_host; 3]),
+                2 * per_layer_slot,
+                3 * per_layer_host,
+                0,
+                2,
+            )?;
+            ensure!(
+                cast_plan.slots == [Some(0), Some(1), Some(0)] && cast_plan.disk_bytes == 0,
+                "expected 3 host layers sharing 2 slots: {cast_plan:?}"
+            );
+            let mut cast_dense = DenseStreaming::with_f32_cast(
+                &root,
+                &cast_manifest,
+                cast_plan.clone(),
+                &device,
+                &order,
+                |name| name.ends_with(".cast.weight"),
+            )?;
+            let mut f32_inputs = Vec::new();
+            let mut bf16_inputs = Vec::new();
+            for l in 0..3usize {
+                let host = cast_dense
+                    .host_layer(l)?
+                    .context("missing cast host layer")?;
+                let floats: Vec<f32> = (0..elems)
+                    .map(|i| {
+                        let raw = if i % 7 == 0 && l == 0 {
+                            0x3f80_8000u32
+                        } else {
+                            let v = ((i as f32 - 15.5) * 0.125) + (l as f32) * 1.375;
+                            v.to_bits()
+                        };
+                        f32::from_bits(raw)
+                    })
+                    .collect();
+                for (i, &val) in floats.iter().enumerate() {
+                    host[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+                }
+                let pass: Vec<u16> = (0..elems)
+                    .map(|i| 0x3c00u16 + ((i * 11 + l * 43) % 199) as u16)
+                    .collect();
+                let base = elems * 4;
+                for (i, &w) in pass.iter().enumerate() {
+                    host[base + i * 2..base + (i + 1) * 2].copy_from_slice(&w.to_le_bytes());
+                }
+                f32_inputs.push(floats);
+                bf16_inputs.push(pass);
+            }
+            for l in 0..3usize {
+                cast_dense.begin(l, stream)?;
+                let cast_ptr = cast_dense.pointer(l, 0, elems * 2)?;
+                let pass_ptr = cast_dense.pointer(l, elems * 2, elems * 2)?;
+                let mut got_cast = vec![0u16; elems];
+                let mut got_pass = vec![0u16; elems];
+                unsafe {
+                    super::super::copy::dtoh_async(&mut got_cast, cast_ptr, stream)?;
+                    super::super::copy::dtoh_async(&mut got_pass, pass_ptr, stream)?;
+                }
+                stream.synchronize()?;
+                cast_dense.end(l, stream)?;
+                let exp_cast: Vec<u16> = f32_inputs[l]
+                    .iter()
+                    .map(|&v| bf16::from_f32(v).to_bits())
+                    .collect();
+                ensure!(
+                    got_cast == exp_cast,
+                    "F32->BF16 streamed cast bits differ on layer {l}"
+                );
+                ensure!(
+                    got_pass == bf16_inputs[l],
+                    "BF16 passthrough bits differ on layer {l}"
+                );
+            }
+            // Negative control: shift layer 0 cast offset by 4 bytes while slot 0 holds layer 1.
+            cast_dense.shift_source_offset(0, "model.layers.0.cast.weight", 4)?;
+            cast_dense.begin(0, stream)?;
+            let mut shifted_cast = vec![0u16; elems];
+            unsafe {
+                super::super::copy::dtoh_async(
+                    &mut shifted_cast,
+                    cast_dense.pointer(0, 0, elems * 2)?,
+                    stream,
+                )?;
+            }
+            stream.synchronize()?;
+            cast_dense.end(0, stream)?;
+            let exp_cast0: Vec<u16> = f32_inputs[0]
+                .iter()
+                .map(|&v| bf16::from_f32(v).to_bits())
+                .collect();
+            ensure!(
+                shifted_cast != exp_cast0 && shifted_cast[0] == exp_cast0[1],
+                "shift_source_offset negative control did not shift layer 0 cast output"
+            );
+            // Non-finite F32 rejection in unchecked host_layer.
+            let mut nan_dense = DenseStreaming::with_f32_cast(
+                &root,
+                &cast_manifest,
+                cast_plan,
+                &device,
+                &order,
+                |name| name.ends_with(".cast.weight"),
+            )?;
+            nan_dense.host_layer(0)?.context("nan host")?[0..4]
+                .copy_from_slice(&f32::NAN.to_le_bytes());
+            ensure!(
+                nan_dense.begin(0, stream).is_err(),
+                "non-finite F32 cast input must be rejected"
+            );
+
+            // 2) Q4_0 / Q4_0 swap_halves / F16 dequant via DenseStreaming + Q4_0->F32 via QuantKernels
+            let mut q_entries = BTreeMap::new();
+            let q4_name = "model.layers.0.q4.weight".to_owned();
+            let swap_name = "model.layers.0.swap.weight".to_owned();
+            let f16_name = "model.layers.0.f16.weight".to_owned();
+            let q4_shape = vec![2usize, 64];
+            let swap_shape = vec![4usize, 32];
+            let f16_shape = vec![2usize, 16];
+            q_entries.insert(
+                f16_name.clone(),
+                entry(
+                    f16_shape.clone(),
+                    64,
+                    Dtype::BF16,
+                    Some(GgmlType::F16),
+                    false,
+                    0,
+                    "f16.weight",
+                ),
+            );
+            q_entries.insert(
+                q4_name.clone(),
+                entry(
+                    q4_shape.clone(),
+                    72,
+                    Dtype::BF16,
+                    Some(GgmlType::Q4_0),
+                    false,
+                    0,
+                    "q4.weight",
+                ),
+            );
+            q_entries.insert(
+                swap_name.clone(),
+                entry(
+                    swap_shape.clone(),
+                    72,
+                    Dtype::BF16,
+                    Some(GgmlType::Q4_0),
+                    true,
+                    0,
+                    "swap.weight",
+                ),
+            );
+            for l in 1..3u32 {
+                let extra = format!("model.layers.{l}.q4.weight");
+                q_entries.insert(
+                    extra.clone(),
+                    entry(
+                        q4_shape.clone(),
+                        72,
+                        Dtype::BF16,
+                        Some(GgmlType::Q4_0),
+                        false,
+                        l,
+                        "q4.weight",
+                    ),
+                );
+            }
+            let q_manifest = TensorManifest {
+                entries: q_entries,
+                resident_bytes: 0,
+            };
+            let q_order = [
+                vec![q4_name.clone(), swap_name.clone(), f16_name.clone()],
+                vec!["model.layers.1.q4.weight".to_owned()],
+                vec!["model.layers.2.q4.weight".to_owned()],
+            ];
+            let q_slot_bytes = 2 * (128 + 128 + 32);
+            let q_host_bytes = 72 + 72 + 64;
+            let q_plan = crate::prefill::DensePlacement::with_allocations(
+                &[q_slot_bytes; 3],
+                &[q_slot_bytes; 3],
+                Some(&[q_host_bytes, 72, 72]),
+                2 * q_slot_bytes,
+                q_host_bytes + 144,
+                0,
+                2,
+            )?;
+            ensure!(
+                q_plan.slots == [Some(0), Some(1), Some(0)],
+                "expected quant test 3 layers across 2 streaming slots: {q_plan:?}"
+            );
+            let mut q_dense =
+                DenseStreaming::new(&root, &q_manifest, q_plan, &device, Some(&q_order))?;
+            let make_q4_blocks = |blocks: usize, seed: usize| -> (Vec<u8>, Vec<f32>) {
+                let scales = [0x3c00u16, 0x3800, 0xbc00, 0x4000];
+                let mut raw = vec![0u8; blocks * 18];
+                let mut f32_ref = vec![0.0f32; blocks * 32];
+                for b in 0..blocks {
+                    let sb = scales[(b + seed) % scales.len()];
+                    let d = half::f16::from_bits(sb).to_f32();
+                    raw[b * 18..b * 18 + 2].copy_from_slice(&sb.to_le_bytes());
+                    for j in 0..16 {
+                        let lo = ((j * 3 + b + seed) % 16) as u8;
+                        let hi = ((j * 5 + b * 2 + seed) % 16) as u8;
+                        raw[b * 18 + 2 + j] = lo | (hi << 4);
+                        f32_ref[b * 32 + j] = f32::from(i16::from(lo) - 8) * d;
+                        f32_ref[b * 32 + 16 + j] = f32::from(i16::from(hi) - 8) * d;
+                    }
+                }
+                (raw, f32_ref)
+            };
+            let (q4_raw, q4_f32) = make_q4_blocks(4, 1);
+            let (swap_raw, swap_f32) = make_q4_blocks(4, 3);
+            let f16_bits: Vec<u16> = (0..32)
+                .map(|i| half::f16::from_f32(((i as f32) - 12.0) * 0.25).to_bits())
+                .collect();
+            {
+                let host = q_dense.host_layer(0)?.context("missing quant host layer")?;
+                host[..72].copy_from_slice(&q4_raw);
+                host[72..144].copy_from_slice(&swap_raw);
+                for (i, &bits) in f16_bits.iter().enumerate() {
+                    host[144 + i * 2..144 + (i + 1) * 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            q_dense.begin(0, stream)?;
+            let mut got_q4 = vec![0u16; 128];
+            let mut got_swap = vec![0u16; 128];
+            let mut got_f16 = vec![0u16; 32];
+            unsafe {
+                super::super::copy::dtoh_async(&mut got_q4, q_dense.pointer(0, 0, 256)?, stream)?;
+                super::super::copy::dtoh_async(
+                    &mut got_swap,
+                    q_dense.pointer(0, 256, 256)?,
+                    stream,
+                )?;
+                super::super::copy::dtoh_async(&mut got_f16, q_dense.pointer(0, 512, 64)?, stream)?;
+            }
+            stream.synchronize()?;
+            q_dense.end(0, stream)?;
+            let exp_q4: Vec<u16> = q4_f32
+                .iter()
+                .map(|&v| bf16::from_f32(v).to_bits())
+                .collect();
+            ensure!(got_q4 == exp_q4, "Q4_0 -> BF16 dequant bits differ");
+            let mut exp_swap = vec![0u16; 128];
+            for row in 0..4usize {
+                let dst_row = if row < 2 { row + 2 } else { row - 2 };
+                for c in 0..32usize {
+                    exp_swap[dst_row * 32 + c] = bf16::from_f32(swap_f32[row * 32 + c]).to_bits();
+                }
+            }
+            ensure!(got_swap == exp_swap, "Q4_0 swap_halves dequant bits differ");
+            let exp_f16: Vec<u16> = f16_bits
+                .iter()
+                .map(|&b| bf16::from_f32(half::f16::from_bits(b).to_f32()).to_bits())
+                .collect();
+            ensure!(got_f16 == exp_f16, "F16 -> BF16 dequant bits differ");
+
+            // Also verify QuantKernels F32 dequant path.
+            let quant = QuantKernels::new(&device.ctx)?;
+            let dev_src = stream.clone_htod(&q4_raw)?;
+            let dev_dst = stream.alloc_zeros::<f32>(128)?;
+            quant.dequant(
+                stream,
+                "q4_f32",
+                &entry(
+                    q4_shape,
+                    72,
+                    Dtype::F32,
+                    Some(GgmlType::Q4_0),
+                    false,
+                    0,
+                    "q4.weight",
+                ),
+                DequantCopy {
+                    source: dev_src.device_ptr(stream).0,
+                    destination: dev_dst.device_ptr(stream).0,
+                    elements: 128,
+                    dtype: Dtype::F32,
+                },
+            )?;
+            let got_f32 = stream.clone_dtoh(&dev_dst)?;
+            ensure!(
+                got_f32.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    == q4_f32.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "Q4_0 -> F32 dequant bits differ"
+            );
+
+            // 3) DenseStreaming::new_preloaded
+            let pre_bytes = 64usize;
+            let pre_plan = crate::prefill::DensePlacement::with_allocations(
+                &[pre_bytes; 3],
+                &[pre_bytes; 3],
+                None,
+                2 * pre_bytes,
+                3 * pre_bytes,
+                0,
+                2,
+            )?;
+            let mut pre = DenseStreaming::new_preloaded(&root, pre_plan, &device, &[pre_bytes; 3])?;
+            let p0: Vec<u8> = (0..pre_bytes)
+                .map(|i| (i as u8).wrapping_mul(3).wrapping_add(1))
+                .collect();
+            let p1: Vec<u8> = (0..pre_bytes)
+                .map(|i| (i as u8).wrapping_mul(7).wrapping_add(5))
+                .collect();
+            let p2: Vec<u8> = (0..pre_bytes)
+                .map(|i| (i as u8).wrapping_mul(11).wrapping_add(9))
+                .collect();
+            pre.host_layer(0)?
+                .context("pre host 0")?
+                .copy_from_slice(&p0);
+            pre.host_layer(1)?
+                .context("pre host 1")?
+                .copy_from_slice(&p1);
+            pre.host_layer(2)?
+                .context("pre host 2")?
+                .copy_from_slice(&p2);
+            for (layer, expected) in [(0usize, &p0), (1, &p1), (2, &p2), (0, &p0)] {
+                pre.begin(layer, stream)?;
+                let mut got = vec![0u8; pre_bytes];
+                unsafe {
+                    super::super::copy::dtoh_async(
+                        &mut got,
+                        pre.pointer(layer, 0, pre_bytes)?,
+                        stream,
+                    )?;
+                }
+                stream.synchronize()?;
+                pre.end(layer, stream)?;
+                ensure!(got == *expected, "new_preloaded layer {layer} bytes differ");
+            }
+            println!(
+                "PASS dense_streaming_staging_dequant_cast_and_preloaded f32_cast=exact q4_bf16=exact q4_swap=exact q4_f32=exact f16_bf16=exact preloaded=exact shift_control=detected nan_control=rejected"
+            );
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
+    }
+
+    #[cfg(feature = "cuda")]
     fn expert_storage_case(geometry: crate::experts::catalogue::ExpertGeometry) -> Result<()> {
         use crate::experts::plan::Capacity;
         use cudarc::driver::result;
@@ -4193,6 +4656,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires CUDA"]
     fn expert_storage_smoke_gpu() -> Result<()> {
@@ -4206,6 +4670,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires CUDA"]
     fn expert_storage_native_gpu() -> Result<()> {
@@ -4217,6 +4682,7 @@ mod tests {
         )?)
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires CUDA"]
     fn native_f32_upload_gpu() -> Result<()> {
@@ -4451,7 +4917,6 @@ mod tests {
         assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     fn quantized_device_slot_and_source_finite_checks() {
         let entry = |shape: Vec<usize>, bytes: usize, quant: Option<GgmlType>| TensorEntry {
@@ -4582,6 +5047,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires CUDA"]
     fn checkpoint_manifestless_upload_waits_for_staging_dma_gpu() -> Result<()> {

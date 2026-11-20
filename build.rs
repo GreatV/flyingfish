@@ -186,6 +186,7 @@ const ROCM_KERNELS: &[&str] = &[
     "gemm_skinny",
     "fp8_linear",
     "convrot",
+    "q4_0_linear",
     "mhc",
     "quantize",
     "latent_compress",
