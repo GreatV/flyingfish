@@ -1581,6 +1581,7 @@ impl Engine {
             deepseek_ffn: None,
             deepseek_engram: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             hc: None,
             glm_dsa: None,
@@ -1613,6 +1614,7 @@ impl Engine {
             graph: None,
             weights,
             catalog: None,
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             capture_checkpoint,
@@ -1639,9 +1641,9 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
         };
         let scratch = engine.device.stream.alloc_zeros(qwen::Runtime::workspace(

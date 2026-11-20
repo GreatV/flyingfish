@@ -426,6 +426,7 @@ impl Draft {
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn bind_staged_slots(&mut self, slots: super::engine::moe::Slots) -> Result<()> {
         match &mut self.runtime {
             Runtime::Staged(d) => d.bind_slots(slots),
@@ -433,6 +434,7 @@ impl Draft {
         }
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn propose_joint(
         &mut self,
         owner: &mut super::engine::moe::Slots,
@@ -502,6 +504,7 @@ impl Draft {
             Runtime::Staged(_) => Ok(()),
         }
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn markov_shape(&self) -> super::markov::MarkovShape {
         match &self.runtime {
             Runtime::Dense(d) => d.markov_shape(),

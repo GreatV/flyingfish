@@ -90,7 +90,11 @@ __device__ __forceinline__ void latent_window_attention_core(
   // Every thread writes its own s_q elements and then reads all of them in the score loop.
   __syncthreads();
 
+#if defined(__HIP__)
+  if constexpr (MMA) { __trap(); return; }
+#else
   if constexpr (MMA) { if (head_dim % 64 || p_mode != 0) __trap(); }
+#endif
   if constexpr (!MMA) {
   for (int s = warp; s < slots; s += nwarp) {
     const int row = slot_ids[s];
@@ -105,7 +109,9 @@ __device__ __forceinline__ void latent_window_attention_core(
       acc += __shfl_down_sync(FF_WARP_MASK, acc, off);
     if (lane == 0) s_scores[s] = acc * scale;
   }
-  } else {
+  }
+#if !defined(__HIP__)
+  else {
     const int group = lane / 4;
     const int part = lane % 4;
     for (int first = warp * 8; first < slots; first += nwarp * 8) {
@@ -133,6 +139,7 @@ __device__ __forceinline__ void latent_window_attention_core(
       }
     }
   }
+#endif
   __syncthreads();
   float* softmax_probabilities = s_acc + head_dim;
   float* denominator_parts = softmax_probabilities + 64;
@@ -181,6 +188,7 @@ __device__ __forceinline__ void latent_window_attention_core(
         s_acc[d] = fmaf(w, lwa_value(k_row[d], sc_row[d / LWA_SCALE_BLOCK]), s_acc[d]);
       }
     }
+#if !defined(__HIP__)
     if constexpr (MMA) {
       __syncthreads();
       const int group = lane / 4;
@@ -216,6 +224,7 @@ __device__ __forceinline__ void latent_window_attention_core(
       }
       __syncthreads();
     }
+#endif
     if constexpr (MMA) {
       __syncthreads();
       if (tid < 32) {

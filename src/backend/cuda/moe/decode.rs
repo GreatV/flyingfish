@@ -1042,6 +1042,7 @@ mod native {
             })
         }
 
+        #[cfg(feature = "cuda")]
         pub(crate) fn allocation_bytes(&self) -> usize {
             let b = &self._buffers;
             self.route.allocation_bytes()

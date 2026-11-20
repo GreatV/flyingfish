@@ -14,7 +14,7 @@ use std::{
     path::{Component, Path},
 };
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 mod glm_roles {
     pub const GLM_INPUT_LAYERNORM: &str = "input_layernorm.weight";
     pub(crate) const GLM_POST_ATTENTION_LAYERNORM: &str = "post_attention_layernorm.weight";
@@ -71,7 +71,7 @@ pub(crate) const GLM_HC_FFN_FN: &str = "hc_ffn_fn";
 pub(crate) const GLM_HC_FFN_BASE: &str = "hc_ffn_base";
 pub(crate) const GLM_HC_FFN_SCALE: &str = "hc_ffn_scale";
 pub(crate) const GLM_DSA_INDEX_GATE: &str = "self_attn.indexer.index_kpool_compress_gate";
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) use glm_roles::*;
 
 fn unique_map<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -396,7 +396,7 @@ impl MappedCheckpoint {
         Ok(())
     }
     /// Host copy of one published F32 tensor with the given shape.
-    #[cfg(any(feature = "cuda", feature = "rocm", test))]
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn f32_tensor(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
         let tensor = self.tensor(name)?;
         ensure!(

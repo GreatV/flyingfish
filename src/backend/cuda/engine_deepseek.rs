@@ -3365,9 +3365,11 @@ impl Engine {
             !matches!(step.mask, crate::backend::Mask::Tree { .. }),
             "DeepSeek-V4.1 tree execution is not bound yet"
         );
-        let route_rows = if step.head == Head::All
-            && self.spec.as_ref().is_some_and(|spec| spec.staged.is_some())
-        {
+        #[cfg(feature = "cuda")]
+        let staged = self.spec.as_ref().is_some_and(|spec| spec.staged.is_some());
+        #[cfg(feature = "rocm")]
+        let staged = false;
+        let route_rows = if step.head == Head::All && staged {
             1
         } else {
             step.rows
@@ -3855,6 +3857,7 @@ impl Engine {
             deepseek_engram: Some(engram),
             qwen: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             moe: None,
             moe_slots: None,
@@ -3879,6 +3882,7 @@ impl Engine {
                 bytes: dense.uploaded,
             },
             catalog: None,
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             capture_checkpoint: None,
@@ -3906,9 +3910,9 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
         };
         #[cfg(feature = "cuda")]
@@ -8486,6 +8490,7 @@ mod tests {
             deepseek_engram: None,
             qwen: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             moe: None,
             moe_slots: None,
@@ -8508,6 +8513,7 @@ mod tests {
                 bytes: 0,
             },
             catalog: None,
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             capture_checkpoint: None,
@@ -8548,9 +8554,9 @@ mod tests {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
         };
         device.finish_upload()?;
@@ -9347,6 +9353,7 @@ mod tests {
             deepseek_engram: None,
             qwen: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             moe: None,
             moe_slots: None,
@@ -9372,6 +9379,7 @@ mod tests {
                 bytes: 0,
             },
             catalog: None,
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             capture_checkpoint: None,
@@ -9412,9 +9420,9 @@ mod tests {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
         };
         device.finish_upload()?;
@@ -10488,6 +10496,7 @@ mod tests {
             deepseek_engram: None,
             qwen: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             moe: None,
             moe_slots: None,
@@ -10513,6 +10522,7 @@ mod tests {
                 bytes: 0,
             },
             catalog: None,
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             capture_checkpoint: None,
@@ -10553,9 +10563,9 @@ mod tests {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
         };
         device.finish_upload()?;

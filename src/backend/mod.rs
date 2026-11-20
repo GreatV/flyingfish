@@ -32,15 +32,15 @@ pub use cuda::engine::TextPrefixSaveOutput;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use cuda::engine::vision_runtime::{
     DinoV3Encoder, DinoV3Output, DinoV3Workspace, Flux2VaeConfig, Flux2VaeEncoder, Flux2VaeOutput,
-    Flux2VaeWorkspace, IdolCamera, IdolConfig, IdolDenoiser, IdolDenoiserWorkspace,
-    IdolFlowTrajectory, IdolGaussianDecoder, IdolGaussianSplat, IdolGaussianWorkspace,
-    IdolOctreeDecoder, IdolOctreeWorkspace, IdolPipelineRuntime, IdolVisionEncoderRuntime,
-    VisionEncoderConfig,
+    Flux2VaeWorkspace, VisionEncoderConfig,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::engine::vision_runtime::{
-    Hi3DImageConditioner, PixalConditioningRuntime, PixalConditioningShape, ProjectedConditioning,
-    ProjectionCamera, TrellisConditioningStages, TrellisImageConditioner,
+    Hi3DImageConditioner, IdolCamera, IdolConfig, IdolDenoiser, IdolDenoiserWorkspace,
+    IdolFlowTrajectory, IdolGaussianDecoder, IdolGaussianSplat, IdolGaussianWorkspace,
+    IdolOctreeDecoder, IdolOctreeWorkspace, IdolPipelineRuntime, IdolVisionEncoderRuntime,
+    PixalConditioningRuntime, PixalConditioningShape, ProjectedConditioning, ProjectionCamera,
+    TrellisConditioningStages, TrellisImageConditioner,
 };
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};

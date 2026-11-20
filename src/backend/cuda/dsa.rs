@@ -65,6 +65,7 @@ impl DsaState {
             capacity,
         })
     }
+    #[cfg(any(feature = "cuda", test))]
     pub(super) fn spec(&self) -> DsaSpec {
         self.spec
     }

@@ -391,8 +391,8 @@ pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
     snapshot_bytes_for_rows(spec, MAX_VERIFY_ROWS)
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct GlmMtpCommitPlan {
     pub accepted: usize,
     pub consumed: usize,
@@ -405,7 +405,7 @@ pub(crate) struct GlmMtpCommitPlan {
     pub next_pending_token: u32,
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn glm_mtp_commit_plan(
     start_pos: usize,
     draft_token: u32,
@@ -440,8 +440,8 @@ pub(crate) fn glm_mtp_commit_plan(
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct GlmMtpDsaTruncation {
     pub restore_slots: Vec<usize>,
     pub incomplete_pool: Option<usize>,
@@ -449,7 +449,7 @@ pub(crate) struct GlmMtpDsaTruncation {
     pub meta: crate::op_contract::DsaMeta,
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn glm_mtp_dense_indices(position: usize) -> Option<Vec<i32>> {
     let width = crate::op_contract::DsaSpec::glm53().selected_width() as usize;
     if position >= width {
@@ -462,7 +462,7 @@ pub(crate) fn glm_mtp_dense_indices(position: usize) -> Option<Vec<i32>> {
     Some(indices)
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn glm_mtp_dsa_truncation(
     spec: crate::op_contract::DsaSpec,
     capacity: usize,
@@ -518,7 +518,7 @@ pub(crate) fn glm_mtp_break_even_alpha(
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn glm_attachment_bytes(
     spec: &ModelSpec,
     capacity: usize,

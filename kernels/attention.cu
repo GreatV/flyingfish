@@ -53,8 +53,8 @@ extern "C" __global__ void relative_window_attention_d128(
             bd = __fmul_rn(query, __bfloat162float(relative[uint64_t(int(relative_rows)-1-lag)*hidden+head*128+d]));
         }
         for (int offset = 16; offset > 0; offset /= 2) {
-            ac += __shfl_down_sync(0xffffffffu, ac, offset);
-            bd += __shfl_down_sync(0xffffffffu, bd, offset);
+            ac += __shfl_down_sync(FF_WARP_MASK, ac, offset);
+            bd += __shfl_down_sync(FF_WARP_MASK, bd, offset);
         }
         if ((d & 31) == 0) { reduction[d/32] = ac; reduction[4+d/32] = bd; }
         __syncthreads();

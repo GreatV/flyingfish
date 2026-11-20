@@ -90,6 +90,7 @@ impl Score {
 }
 
 /// Inclusive radii for a bidirectional window of `window` tokens: keys `q-left..=q+right`.
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn window_radii(window: usize) -> (usize, usize) {
     (window.div_ceil(2) - 1, window / 2)
 }
@@ -300,6 +301,7 @@ struct Attention {
 unsafe impl DeviceRepr for Attention {}
 
 impl Flash {
+    #[cfg(feature = "cuda")]
     pub(super) fn allocated_bytes(&self) -> usize {
         4 * (self.lse.len()
             + self.split.as_ref().map_or(0, |split| split.workspace.len())
@@ -782,65 +784,69 @@ impl Flash {
             elements <= u32::MAX as usize,
             "prefill LSE indexing exceeds u32"
         );
-        #[cfg(feature = "cuda")]
-        let native = {
-            use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
-            let ctx = stream.context();
-            ensure!(
-                heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
-                "prefill heads exceed grid limit"
-            );
-            let module = super::cubin::module(ctx, "attention_native")?;
-            let name = match head_dim {
-                16 => "attention_prefill_d16_bidirectional_f16",
-                64 => "attention_prefill_d64_bidirectional_f16",
-                96 => "attention_prefill_d96_bidirectional_f16",
-                _ => unreachable!(),
-            };
-            let function = module.load_function(name)?;
-            let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
-            let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-            let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-            ensure!(
-                local == 0 && registers <= 255,
-                "native prefill {name} resource limit: registers={registers} local={local}"
-            );
-            ensure!(
-                shared
-                    <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
-                "native prefill {name} shared memory does not fit"
-            );
-            ensure!(
-                function.occupancy_max_active_blocks_per_multiprocessor(
-                    128,
-                    dynamic_shared as usize,
-                    None
-                )? > 0,
-                "native prefill {name} has zero resident blocks"
-            );
-            vec![function]
-        };
         #[cfg(feature = "rocm")]
-        let native = {
+        {
+            let _ = (stream, score, tile, dynamic_shared);
             anyhow::bail!("HIP native F16 prefill geometry is not bound");
-        };
-        let lse = stream.alloc_zeros(elements)?;
-        let sink_rescale = super::cubin::module(stream.context(), "attention")?
-            .load_function("attention_sink_rescale")?;
-        Ok(Self {
-            stream,
-            lse,
-            sink_rescale,
-            native,
-            geometry: [heads, kv_heads, head_dim],
-            score: Some(score),
-            tile,
-            shared: dynamic_shared,
-            split: None,
-            windows: None,
-            position: 0,
-            position_limit: 0,
-        })
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let native = {
+                use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+                let ctx = stream.context();
+                ensure!(
+                    heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
+                    "prefill heads exceed grid limit"
+                );
+                let module = super::cubin::module(ctx, "attention_native")?;
+                let name = match head_dim {
+                    16 => "attention_prefill_d16_bidirectional_f16",
+                    64 => "attention_prefill_d64_bidirectional_f16",
+                    96 => "attention_prefill_d96_bidirectional_f16",
+                    _ => unreachable!(),
+                };
+                let function = module.load_function(name)?;
+                let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+                let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+                let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+                ensure!(
+                    local == 0 && registers <= 255,
+                    "native prefill {name} resource limit: registers={registers} local={local}"
+                );
+                ensure!(
+                    shared
+                        <= ctx
+                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    "native prefill {name} shared memory does not fit"
+                );
+                ensure!(
+                    function.occupancy_max_active_blocks_per_multiprocessor(
+                        128,
+                        dynamic_shared as usize,
+                        None
+                    )? > 0,
+                    "native prefill {name} has zero resident blocks"
+                );
+                vec![function]
+            };
+            let lse = stream.alloc_zeros(elements)?;
+            let sink_rescale = super::cubin::module(stream.context(), "attention")?
+                .load_function("attention_sink_rescale")?;
+            Ok(Self {
+                stream,
+                lse,
+                sink_rescale,
+                native,
+                geometry: [heads, kv_heads, head_dim],
+                score: Some(score),
+                tile,
+                shared: dynamic_shared,
+                split: None,
+                windows: None,
+                position: 0,
+                position_limit: 0,
+            })
+        }
     }
 
     #[cfg(all(test, feature = "cuda"))]

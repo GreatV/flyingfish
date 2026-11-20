@@ -97,6 +97,7 @@ mod gates {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn tensor_bf16(view: &safetensors::SafeTensors, name: &str) -> anyhow::Result<Vec<half::bf16>> {
     let t = view.tensor(name)?;
     anyhow::ensure!(t.dtype() == safetensors::Dtype::F32, "{name} not F32");
@@ -110,6 +111,7 @@ fn tensor_bf16(view: &safetensors::SafeTensors, name: &str) -> anyhow::Result<Ve
         .collect())
 }
 
+#[cfg(feature = "cuda")]
 fn to_f32(values: Vec<half::bf16>) -> Vec<f32> {
     values.into_iter().map(|v| v.to_f32()).collect()
 }

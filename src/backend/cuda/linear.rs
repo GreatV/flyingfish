@@ -324,7 +324,9 @@ pub(crate) enum LinearWeightRef {
     },
     NvFp4 {
         codes: Tensor<u8, 2>,
+        #[cfg(feature = "cuda")]
         scale: Tensor<u8, 2>,
+        #[cfg(feature = "cuda")]
         global_scale: Tensor<f32, 1>,
     },
 }
@@ -1234,9 +1236,15 @@ impl WeightCatalog {
                     let global_scale =
                         unsafe { Tensor::new(gp, [1], [1], size_of::<f32>() as u64)? };
                     validate_nvfp4(&codes, &scale, &global_scale)?;
+                    ensure!(
+                        cfg!(feature = "cuda"),
+                        "NVFP4 native linear weights require CUDA: {name}"
+                    );
                     Ok(LinearWeightRef::NvFp4 {
                         codes,
+                        #[cfg(feature = "cuda")]
                         scale,
+                        #[cfg(feature = "cuda")]
                         global_scale,
                     })
                 }
@@ -1336,6 +1344,7 @@ impl NativeProjection {
         })
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn allocation_bytes(&self) -> usize {
         self._keepalive.0.len() + self._keepalive.1.len() * std::mem::size_of::<f32>()
     }
@@ -4054,6 +4063,7 @@ mod tests {
     }
 
     /// The first `blocks` Q4_0 blocks of a real target tensor, read from the published file.
+    #[cfg(feature = "cuda")]
     fn real_q4_0_blocks(
         file: &crate::gguf::GgufFile,
         tensor: &str,

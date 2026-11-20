@@ -716,6 +716,7 @@ pub(super) struct Runtime {
     layers: Vec<Layer>,
     head: Option<LinearWeightRef>,
     common: CommonOpsRef,
+    #[cfg(feature = "cuda")]
     joint: Option<crate::backend::cuda::joint_schema::JointWeights>,
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
@@ -2260,6 +2261,7 @@ impl Runtime {
             layers,
             head,
             common,
+            #[cfg(feature = "cuda")]
             joint: checkpoint_dir
                 .join("joint_head.safetensors")
                 .is_file()
@@ -2282,10 +2284,10 @@ impl Runtime {
     }
     /// cfg(test) control readback: nonzero element count and absmax of the
     /// first catalog tensor of `layer` whose name contains `needle`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn plant_readback(
         &self,
-        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         layer: usize,
         needle: &str,
     ) -> Result<(usize, f32)> {
@@ -2475,7 +2477,7 @@ impl Runtime {
         let bound = bucketed_prefill_rows(rows, self.workspace_rows)?;
         self.prepare_dimensions(blas, bound, vocab, hidden)
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn gemma_logits(
         &self,
         stream: &Arc<CudaStream>,
@@ -2492,7 +2494,7 @@ impl Runtime {
             .context("Gemma device readback failed")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn gemma_rope_table(
         &self,
         stream: &Arc<CudaStream>,
@@ -3670,7 +3672,7 @@ impl Engine {
         if let Some(identity) = prefix_identity.as_mut() {
             identity.attention_kv_dtype = settings.kv_format.tag().into();
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "cuda"))]
         crate::backend::cuda::clef_flash_gates::apply_test_plants(&mut catalog, &device)?;
         let weights = catalog.take_globals()?;
         let (mut kv_scratch, capture_checkpoint) = match early_kv {
@@ -4215,6 +4217,7 @@ impl Engine {
             hidden_capture,
             weights,
             catalog: None,
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             capture_checkpoint,
@@ -4241,15 +4244,16 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
             qwen: None,
             deepseek_mixer: None,
             deepseek_ffn: None,
             deepseek_engram: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             hc: glm_hc,
             glm_dsa,
@@ -5154,7 +5158,10 @@ impl Engine {
                     if let Some(q) = self.qwen.as_mut() {
                         q.dense_graphs = graphs;
                     } else {
-                        self.dense_graphs = graphs;
+                        #[cfg(feature = "cuda")]
+                        {
+                            self.dense_graphs = graphs;
+                        }
                     }
                 }
                 Err(error) => {
@@ -6703,7 +6710,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_final_probe(
         &mut self,
         input: &[bf16],
@@ -6776,7 +6783,7 @@ impl Engine {
         Ok(output)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     /// Probe rows are packed as [rows, kv_heads, head_dim].
     pub(crate) fn gemma_kv_rows(
         &self,
@@ -6812,7 +6819,7 @@ impl Engine {
         Ok((k, v))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_linear_probe(&mut self, role: &str, input: &[bf16]) -> Result<Vec<bf16>> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
         let s = &self.device.stream;
@@ -6862,7 +6869,7 @@ impl Engine {
         s.clone_dtoh(&y).context("Gemma device readback failed")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_mlp_activation_probe(
         &self,
         gate: &[bf16],
@@ -7850,12 +7857,14 @@ impl Engine {
                     .arg(&cap)
                     .launch(flat(vocab))?;
             }
-            return Ok(s.clone_dtoh(&staged)?);
+            let out = s.clone_dtoh(&staged)?;
+            return Ok(out);
         }
-        Ok(s.clone_dtoh(&slice)?)
+        let out = s.clone_dtoh(&slice)?;
+        Ok(out)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_raw_and_softcapped_work_logits(&self) -> Result<(Vec<bf16>, Vec<bf16>)> {
         let s = &self.device.stream;
         let vocab = self.model_spec.vocab as usize;
@@ -7878,6 +7887,7 @@ impl Engine {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Engine {
     /// Binds the joint schema head plan for one scored-record fixture.
     pub fn joint_plan(
@@ -8119,7 +8129,7 @@ impl Engine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "engine_glm_tests.rs"]
 mod composition_tests;
 

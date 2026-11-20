@@ -4,6 +4,7 @@ pub mod blas;
 #[cfg(feature = "rocm")]
 #[path = "../hip_blas.rs"]
 pub mod blas;
+#[cfg(feature = "cuda")]
 pub mod block;
 pub mod calibrate;
 mod closure;
@@ -24,7 +25,9 @@ pub mod engine_canary;
 mod engine_canary_tests;
 #[cfg(feature = "cuda")]
 pub mod engine_diarization;
+#[cfg(feature = "cuda")]
 pub mod engine_eou;
+#[cfg(feature = "cuda")]
 pub mod engine_multitalker;
 #[cfg(feature = "cuda")]
 pub(crate) mod engine_music3_syn;
@@ -43,6 +46,7 @@ pub mod gated_residual;
 pub(crate) mod gdn;
 pub mod hc;
 pub mod index_score;
+#[cfg(feature = "cuda")]
 mod joint_schema;
 #[cfg(test)]
 #[cfg(feature = "cuda")]
@@ -80,9 +84,7 @@ use crate::backend::gpu::{CudaContext, CudaStream};
 #[cfg(feature = "cuda")]
 use crate::backend::setup::CacheKey;
 use crate::backend::setup::DeviceInfo;
-#[cfg(feature = "cuda")]
-use anyhow::ensure;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -96,7 +98,6 @@ pub struct Device {
 }
 
 impl Device {
-    #[cfg(feature = "cuda")]
     pub(crate) fn workspace_budget(
         &self,
         initial_free: usize,
@@ -653,9 +654,9 @@ mod q38_tests;
 
 #[cfg(all(test, feature = "cuda"))]
 mod clef_flash_gates;
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod diffusion_ops_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod gemma4_ops_tests;
 #[cfg(test)]
 mod music3_syn_ops_tests;
@@ -943,7 +944,7 @@ impl Device {
 #[cfg(all(test, feature = "cuda"))]
 mod engine_glm_gate;
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 pub(super) fn env_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
     Ok(std::path::PathBuf::from(
@@ -967,4 +968,56 @@ pub(super) fn fixture_reference(
         _ => case.to_ascii_uppercase().replace('-', "_"),
     };
     env_path(&format!("{prefix}_{label}_{suffix}"))
+}
+
+#[cfg(all(test, feature = "rocm"))]
+mod rocm_m0_tests {
+    use super::*;
+    use crate::backend::gpu::{DevicePtr, DevicePtrMut, PushKernelArg};
+
+    #[test]
+    #[ignore = "requires ROCm GPU; verifies H3 flow and modulate HSACO modules"]
+    fn m0_flow_and_modulate_kernels_gpu() -> Result<()> {
+        let d = Device::new(0)?;
+        let (free, total) = d.ctx.mem_get_info()?;
+        let workspace = d.workspace_budget(free, free, 0)?;
+        ensure!(total >= free && workspace > 0);
+
+        let flow = cubin::module(&d.ctx, "flow")?.load_function("euler_blend_f32")?;
+        let modulate = cubin::module(&d.ctx, "modulate")?.load_function("row_modulate")?;
+        let flow_regs = flow.registers_per_thread()?;
+        let mod_regs = modulate.registers_per_thread()?;
+
+        let mut x = d.stream.clone_htod(&[1.0f32, 2.0, -3.5, 4.25])?;
+        let v = d.stream.clone_htod(&[0.5f32, -1.0, 2.0, 0.75])?;
+        let (x_ptr, _xg) = x.device_ptr_mut(&d.stream);
+        let (v_ptr, _vg) = v.device_ptr(&d.stream);
+        let count = 4u64;
+        let (s, r, q) = (2.0f32, 0.0f32, 1.0f32);
+        unsafe {
+            d.stream
+                .launch_builder(&flow)
+                .arg(&x_ptr)
+                .arg(&v_ptr)
+                .arg(&count)
+                .arg(&s)
+                .arg(&r)
+                .arg(&q)
+                .launch(crate::backend::gpu::LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        d.stream.synchronize()?;
+        let out = d.stream.clone_dtoh(&x)?;
+        ensure!(
+            out == [2.0f32, 0.0, 0.5, 5.75],
+            "euler_blend_f32 mismatch: {out:?}"
+        );
+        println!(
+            "PASS m0_flow_and_modulate_kernels_gpu free={free} total={total} workspace={workspace} flow_regs={flow_regs} mod_regs={mod_regs}"
+        );
+        Ok(())
+    }
 }

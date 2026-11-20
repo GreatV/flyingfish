@@ -42,9 +42,10 @@ use std::{
 pub(super) mod audio_runtime;
 #[path = "engine_deepseek.rs"]
 pub(crate) mod deepseek;
+#[cfg(feature = "cuda")]
 #[path = "engine_diffusion.rs"]
 mod diffusion;
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) use self::diffusion::{
     DISK_MARK, HOST_MARK, TieredCall, canvas_window as diffusion_canvas_window,
     commit_window as diffusion_commit_window, contribute_tiered,
@@ -54,6 +55,7 @@ pub(crate) use self::diffusion::{
 pub mod minimax_h3;
 #[path = "engine_moe.rs"]
 pub(super) mod moe;
+#[cfg(feature = "cuda")]
 pub(in crate::backend::cuda) use moe::{Events, ReadAhead, Reader};
 #[path = "engine_mtp.rs"]
 #[cfg(feature = "cuda")]
@@ -183,6 +185,7 @@ impl MixerWork {
 }
 
 impl Work {
+    #[cfg(feature = "cuda")]
     fn bytes(&self) -> usize {
         2 * [
             &self.x,
@@ -718,6 +721,7 @@ pub struct Engine {
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
     recurrent: Option<recurrent::Runtime>,
+    #[cfg(feature = "cuda")]
     diffusion: Option<diffusion::Runtime>,
     deepseek_mixer: Option<deepseek::DeepseekMixer>,
     deepseek_ffn: Option<deepseek::DeepseekFfn>,
@@ -741,6 +745,7 @@ pub struct Engine {
     images: Option<vision_runtime::EncodedImages>,
     weights: Weights,
     catalog: Option<WeightCatalog>,
+    #[cfg(feature = "cuda")]
     dense_graphs: Vec<CudaGraph>,
     state: super::state::StateStore,
     capture_checkpoint: Option<super::state::StateCheckpoint>,
@@ -767,9 +772,9 @@ pub struct Engine {
     pending_token: Option<u32>,
     resident_ids_len: usize,
     last_input_kind: Option<PrefixLastInputKind>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) diffusion_single_step: bool,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) diffusion_forced_draws: Option<(&'static [i32], &'static [i32])>,
 }
 
@@ -1105,6 +1110,7 @@ impl Engine {
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
         match load_dispatch(model_spec.architecture)? {
             LoadDispatch::Canvas => {
+                #[cfg(feature = "cuda")]
                 return Self::load_diffusion(
                     dir,
                     ordinal,
@@ -1113,6 +1119,18 @@ impl Engine {
                     settings,
                     model_spec,
                 );
+                #[cfg(feature = "rocm")]
+                {
+                    let _ = (
+                        dir,
+                        ordinal,
+                        capacity,
+                        requested_chunk,
+                        settings,
+                        model_spec,
+                    );
+                    anyhow::bail!("canvas diffusion requires CUDA backend");
+                }
             }
             LoadDispatch::Recurrent => {
                 return Self::load_recurrent(
@@ -1334,6 +1352,7 @@ impl Engine {
             deepseek_ffn: None,
             deepseek_engram: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             hc: None,
             glm_dsa: None,
@@ -1376,6 +1395,7 @@ impl Engine {
             graph: None,
             weights,
             catalog: Some(catalog),
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             #[cfg(feature = "cuda")]
@@ -1404,9 +1424,9 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
         };
         if let Some(path) = settings.draft_model {
@@ -2196,7 +2216,7 @@ impl Engine {
         self.profile_rounds = enabled;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_prefill_all(&mut self, ids: &[u32]) -> Result<()> {
         ensure!(!ids.is_empty(), "Gemma 4 prefill requires token IDs");
         self.device.stream.memcpy_htod(ids, &mut self.work.ids)?;
@@ -2227,7 +2247,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_prefill_trace(
         &mut self,
         ids: &[u32],
@@ -2266,7 +2286,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_vision_trace(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -2299,7 +2319,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     fn gemma_media_features_trace(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -2322,7 +2342,7 @@ impl Engine {
         Ok((q.vision_encode_calls, q.audio_encode_calls))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_decode_trace(
         &mut self,
         token: u32,
@@ -2339,7 +2359,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_rope_table(&self, full: bool, positions: &[usize]) -> Result<Vec<bf16>> {
         self.qwen
             .as_ref()
@@ -2347,7 +2367,7 @@ impl Engine {
             .gemma_rope_table(&self.device.stream, full, positions, self.capacity)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_position(&self) -> Result<(usize, i32)> {
         Ok((
             self.position,
@@ -2355,7 +2375,7 @@ impl Engine {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_hidden_state(&self) -> Result<(Vec<bf16>, Vec<bf16>)> {
         let h = self.model_spec.hidden as usize;
         Ok((
@@ -2406,7 +2426,7 @@ impl Engine {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_all_logits(&self, row: usize) -> Result<Vec<bf16>> {
         self.qwen
             .as_ref()
@@ -2419,7 +2439,7 @@ impl Engine {
         self.blas.bound_plan_receipt()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_workspace(&self, rows: usize, capacity: usize) -> Result<usize> {
         qwen::Runtime::workspace(
             &self.model_spec,
@@ -2431,14 +2451,14 @@ impl Engine {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_scratch_len(&self) -> usize {
         self.qwen
             .as_ref()
             .map_or(0, |runtime| runtime.scratch.len())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_layers_probe(
         &mut self,
         ids: &[u32],
@@ -3474,6 +3494,7 @@ impl Engine {
             if let Some(recurrent) = self.recurrent.as_mut() {
                 recurrent.reset(&self.device.stream, self.capacity)?;
             }
+            #[cfg(feature = "cuda")]
             if let Some(diffusion) = self.diffusion.as_mut() {
                 diffusion.reset(&self.device)?;
             }
@@ -4012,6 +4033,7 @@ impl Engine {
         if self.recurrent.is_some() {
             return self.prefill_recurrent(ids, ids.len(), trace, keep);
         }
+        #[cfg(feature = "cuda")]
         if self.diffusion.is_some() {
             ensure!(keep == ids.len(), "Clover trace tail is not bound");
             return self.prefill_diffusion(ids, trace);
@@ -4240,6 +4262,7 @@ impl Engine {
     }
 
     pub fn decode(&mut self, graph: bool, trace: Option<(&mut Trace, &str)>) -> Result<u32> {
+        #[cfg(feature = "cuda")]
         if self.diffusion.is_some() {
             ensure!(trace.is_none(), "Clover decode trace is not bound");
             return self.decode_diffusion(graph);
@@ -4256,7 +4279,7 @@ impl Engine {
 
     /// cfg(test) control: the in-memory conv-weight mutant of the gate
     /// module (no file is written).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn control_readback(&self, layer: usize, needle: &str) -> Result<(usize, f32)> {
         let qwen = self.qwen.as_ref().context("qwen runtime missing")?;
         qwen.plant_readback(&self.device.stream, layer, needle)
@@ -4264,7 +4287,7 @@ impl Engine {
 
     /// cfg(test) decode gates: the GDN recurrent state and conv history
     /// of the layer under test after the decode steps.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn decode_gdn_state(&self, layer: usize) -> Result<(Vec<f32>, Vec<f32>)> {
         let index = self.model_spec.layers[layer].state_index as usize;
         let state = &self.state.gdn[index];
@@ -4517,6 +4540,7 @@ impl Engine {
 
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
+        #[cfg(feature = "cuda")]
         if self.diffusion.is_some() {
             return self.canvas_logits_f32();
         }
@@ -4535,6 +4559,16 @@ impl Engine {
                 .clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?
         };
         Ok(values.into_iter().map(bf16::to_f32).collect())
+    }
+
+    #[cfg(feature = "rocm")]
+    pub fn mtp_graph_mode(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "rocm")]
+    pub(crate) fn generation_request(&mut self, _: usize, _: bool, _: bool) -> Result<()> {
+        Ok(())
     }
 
     pub fn event(&self) -> Result<Event> {
@@ -4576,11 +4610,14 @@ impl Engine {
                 .is_some_and(|n| n <= dst.0.len()),
             "logit sample destination size mismatch"
         );
+        #[cfg(feature = "cuda")]
         let source = if self.diffusion.is_some() {
             self.canvas_logits()?
         } else {
             self.work.logits.slice(..width)
         };
+        #[cfg(feature = "rocm")]
+        let source = self.work.logits.slice(..width);
         self.device.stream.memcpy_dtod(
             &source,
             &mut dst.0.slice_mut(step * width..(step + 1) * width),
@@ -6923,6 +6960,7 @@ impl Engine {
                 );
             }
             LoadDispatch::Canvas => {
+                #[cfg(feature = "cuda")]
                 return Self::load_diffusion(
                     dir,
                     ordinal,
@@ -6931,6 +6969,18 @@ impl Engine {
                     settings,
                     model_spec,
                 );
+                #[cfg(feature = "rocm")]
+                {
+                    let _ = (
+                        dir,
+                        ordinal,
+                        capacity,
+                        requested_chunk,
+                        settings,
+                        model_spec,
+                    );
+                    anyhow::bail!("canvas diffusion requires CUDA backend");
+                }
             }
             LoadDispatch::Recurrent => {
                 return Self::load_recurrent(
@@ -7030,6 +7080,7 @@ impl Engine {
             deepseek_engram: None,
             qwen: None,
             recurrent: None,
+            #[cfg(feature = "cuda")]
             diffusion: None,
             hc: None,
             glm_dsa: None,
@@ -7064,6 +7115,7 @@ impl Engine {
             runtime,
             weights,
             catalog: None,
+            #[cfg(feature = "cuda")]
             dense_graphs: Vec::new(),
             state,
             work,
@@ -7083,9 +7135,9 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_single_step: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             diffusion_forced_draws: None,
             flash: None,
         };
