@@ -543,7 +543,12 @@ extern "C" __global__ void __maxnreg__(124) convrot_product(
 extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {
-    convrot_product_tile<true, true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
+    unsigned m_tile = blockIdx.x;
+#if __CUDA_ARCH__ == 1200
+    m_tile += blockIdx.z * gridDim.x;
+    if (m_tile * CONVROT_BM >= static_cast<unsigned>(rows)) return;
+#endif
+    convrot_product_tile<true, true>(codes, scales, qweight, wscale, y, rows, k, n, m_tile, blockIdx.y);
 }
 
 extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_ldsm(

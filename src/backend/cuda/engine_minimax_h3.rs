@@ -18,6 +18,7 @@ use crate::backend::gpu::{
     PushKernelArg,
 };
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
+use crate::convrot::ProductKernel;
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::gguf::GgmlType;
 use crate::minimax_h3::{
@@ -1985,9 +1986,9 @@ pub(crate) struct BlockWork {
     rank: usize,
     chunk: usize,
     fixed_lora: bool,
-    gate_up_m_fast: [bool; 2],
+    gate_up_product: [ProductKernel; 2],
     rotate_32: [[bool; 2]; FF_OUT + 1],
-    qkv_product: crate::convrot::ProductKernel,
+    qkv_product: ProductKernel,
     #[cfg(test)]
     repeat_ffn_input: bool,
     /// The previous live block already wrote this block's norm1 into `normed`.
@@ -2032,7 +2033,7 @@ struct StoredPtrs {
     rows: usize,
     k: usize,
     rank: usize,
-    product_m_fast: bool,
+    product: ProductKernel,
     mid_pitch: usize,
     rotate_32: bool,
 }
@@ -2397,9 +2398,9 @@ impl BlockWork {
             #[cfg(test)]
             normed_probe: Vec::new(),
             fixed_lora: false,
-            gate_up_m_fast: [false; 2],
+            gate_up_product: [ProductKernel::NFast; 2],
             rotate_32: [[false; 2]; FF_OUT + 1],
-            qkv_product: crate::convrot::ProductKernel::NFast,
+            qkv_product: ProductKernel::NFast,
             #[cfg(test)]
             repeat_ffn_input: false,
             skip_norm1: false,
@@ -2515,7 +2516,7 @@ fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
         rows: work.rows,
         k: scratch.k,
         rank: scratch.rank,
-        product_m_fast: false,
+        product: ProductKernel::NFast,
         mid_pitch: scratch.mid_pitch,
         rotate_32: false,
     })
@@ -2649,11 +2650,7 @@ fn apply_int8(
             k: i32::try_from(k)?,
             n: i32::try_from(n)?,
             group: i32::try_from(group)?,
-            product: if ptrs.product_m_fast {
-                crate::convrot::ProductKernel::MFastLdsm
-            } else {
-                crate::convrot::ProductKernel::NFast
-            },
+            product: ptrs.product,
             fuse_silu,
             rotate_32: ptrs.rotate_32,
         },
@@ -2733,7 +2730,7 @@ fn apply_shared_qkv(
             k: k_i,
             n: 0,
             group,
-            product: crate::convrot::ProductKernel::NFast,
+            product: ProductKernel::NFast,
             fuse_silu: false,
             rotate_32: work.rotate_32[Q][0],
         },
@@ -3139,7 +3136,7 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     scratch: Option<StoredPtrs>,
 ) -> Result<()> {
     let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
-    let (chunk, gate_up_m_fast) = (work.chunk, work.gate_up_m_fast);
+    let (chunk, gate_up_product) = (work.chunk, work.gate_up_product);
     let rotate_32 = work.rotate_32;
     let fused_down = if !LORA && !SHIFT_INPUT {
         int8_linear(&w.linears[FF_OUT])
@@ -3149,7 +3146,9 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
         let scratch = scratch.map(|mut ptrs| {
             let tail = usize::from(x.shape[0] as usize != chunk);
-            ptrs.product_m_fast = index == FF_IN && gate_up_m_fast[tail];
+            if index == FF_IN {
+                ptrs.product = gate_up_product[tail];
+            }
             ptrs.rotate_32 = index == FF_IN && rotate_32[FF_IN][tail];
             ptrs
         });
@@ -5143,7 +5142,7 @@ impl Dit {
         blas.bind_workspace(chosen.workspace)?;
         if hyperflow {
             work.bind_ffn::<false>(s, blas, spec, chosen, &x)?;
-            work.gate_up_m_fast = crate::convrot::gate_up_product_order(
+            work.gate_up_product = crate::convrot::gate_up_product_order(
                 d,
                 [work.chunk, work.rows % work.chunk],
                 (h, 2 * spec.ffn),
