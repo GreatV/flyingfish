@@ -60,9 +60,9 @@ Image to 3D (library entry points and CLI):
 | Model | Notes | Backends |
 |---|---|---|
 | Idol | DINOv3 and FLUX.2 VAE encoders, latent flow denoiser, octree and Gaussian decoders: a preprocessed 1024 px image to a Gaussian splat and a camera; `flyingfish::backend::IdolPipelineRuntime` | CUDA |
-| Pixal3D | Single-view and multiview: RGBA views with camera parameters, through sparse-structure, shape and texture flows, to a raw mesh with six material channels; CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --naf <dir> --camera <cam.json> [--view <image2.png> --camera <cam2.json> ...] [--resolution 1024|1536] --seed 42 -o <mesh.ply>`; the camera JSON carries camera_angle_x, mesh_scale and a world_to_camera extrinsic (flat 12 floats or the 4x4 nested form; required for multiview, where a shared look-at would project every view from one direction; without it the single view uses the look-at at (0,0,distance)); MoGe-2 estimation is not integrated and a missing camera errors; the four stage noise draws are flyingfish's philox counter-stream convention (streams 1-4), not the publisher's torch RNG; `flyingfish::backend::PixalGeneration` and `PixalSeededRequest` | CUDA |
-| Hi3D | DINOv2 and CLIP image conditioning, sparse flow and sparse VAE decoder at 512, 1024 or 1536, refining a supplied coarse mesh; raw mesh or a hole-filled, simplified and normalized mesh; same-seed reruns are bit-stable; CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --clip <dir> --mesh <coarse.ply> [--resolution 512|1024|1536] [--orientation 1] --seed 42 -o <mesh.ply>`; `flyingfish::backend::Hi3DGeneration` | CUDA |
-| TRELLIS.2-4B | Image to a textured mesh on the default 1024-cascade pipeline: DINOv3 conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders, seeded stage noise; raw mesh only (no fill, simplify, UV, bake or render), RGBA input with the background already removed, and the decoder and structure-latent outputs differ from the reference at F16 quanta; `flyingfish::backend::TrellisTo3d`, CLI `flyingfish --model <dir> to-3d <image.png> --dino <dir> --seed 42 -o <mesh.ply>` | CUDA |
+| Pixal3D | Single-view and multiview: RGBA views with camera parameters, through sparse-structure, shape and texture flows, to a raw mesh with six material channels; CLI `ff --model <dir> to-3d <image.png> --dino <dir> --naf <dir> --camera <cam.json> [--view <image2.png> --camera <cam2.json> ...] [--resolution 1024|1536] --seed 42 -o <mesh.ply>`; the camera JSON carries camera_angle_x, mesh_scale and a world_to_camera extrinsic (flat 12 floats or the 4x4 nested form; required for multiview, where a shared look-at would project every view from one direction; without it the single view uses the look-at at (0,0,distance)); MoGe-2 estimation is not integrated and a missing camera errors; the four stage noise draws are flyingfish's philox counter-stream convention (streams 1-4), not the publisher's torch RNG; `flyingfish::backend::PixalGeneration` and `PixalSeededRequest` | CUDA |
+| Hi3D | DINOv2 and CLIP image conditioning, sparse flow and sparse VAE decoder at 512, 1024 or 1536, refining a supplied coarse mesh; raw mesh or a hole-filled, simplified and normalized mesh; same-seed reruns are bit-stable; CLI `ff --model <dir> to-3d <image.png> --dino <dir> --clip <dir> --mesh <coarse.ply> [--resolution 512|1024|1536] [--orientation 1] --seed 42 -o <mesh.ply>`; `flyingfish::backend::Hi3DGeneration` | CUDA |
+| TRELLIS.2-4B | Image to a textured mesh on the default 1024-cascade pipeline: DINOv3 conditioning, sparse-structure flow with Euler interval-CFG sampling, cascade shape and texture structured-latent flows, FlexiDualGrid mesh and SparseUnet texture decoders, seeded stage noise; raw mesh only (no fill, simplify, UV, bake or render), RGBA input with the background already removed, and the decoder and structure-latent outputs differ from the reference at F16 quanta; `flyingfish::backend::TrellisTo3d`, CLI `ff --model <dir> to-3d <image.png> --dino <dir> --seed 42 -o <mesh.ply>` | CUDA |
 
 In progress: TRELLIS.2 image-to-3D (flow sampling and the structured-latent, mesh and texture stages landed; remaining: render, GLB and bake, the shape and texture encoders, and closing the decoder and structure-latent differences from the reference).
 
@@ -144,40 +144,40 @@ See [CLI usage by model](https://github.com/GreatV/flyingfish/blob/main/docs/usa
 
 ```sh
 # One-time per machine and model: measure kernels and transfer rates.
-flyingfish --model <model-dir> --runtime-dir <dir> calibrate
+ff --model <model-dir> --runtime-dir <dir> calibrate
 
 # Generate from a prompt.
-flyingfish --model <model-dir> --runtime-dir <dir> generate --prompt "Hello" --max-new-tokens 64 --graph
+ff --model <model-dir> --runtime-dir <dir> generate --prompt "Hello" --max-new-tokens 64 --graph
 
 # Transcribe a 16 kHz WAV (PCM16, PCM24 or F32) with duration-derived SRT cues.
-flyingfish --model <parakeet-dir> --runtime-dir <dir> transcribe <clip.wav> --format srt
+ff --model <parakeet-dir> --runtime-dir <dir> transcribe <clip.wav> --format srt
 
 # Write speaker segments as RTTM.
-flyingfish --model <diarization-dir> --runtime-dir <dir> diarize <meeting.wav> -o <meeting.rttm>
+ff --model <diarization-dir> --runtime-dir <dir> diarize <meeting.wav> -o <meeting.rttm>
 
 # Embed raw text as a 768-value JSON vector.
-flyingfish --model <EmbeddingGemma-2-dir> --runtime-dir <dir> embed --text "a red cube"
+ff --model <EmbeddingGemma-2-dir> --runtime-dir <dir> embed --text "a red cube"
 
 # OpenAI-compatible server: http://<host>:<port>/v1/completions and http://<host>:<port>/v1/chat/completions.
-flyingfish --model <model-dir> --runtime-dir <dir> serve --port 8080
+ff --model <model-dir> --runtime-dir <dir> serve --port 8080
 
 # Generate MiniMax-H3 video and audio from a keyframe.
-flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.mp4>
+ff --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.mp4>
 
 # Raw output: <out.y4m> and <out.wav>. Add --json to print output metadata as JSON.
-flyingfish --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.y4m> --json
+ff --model <MiniMax-H3-dir> --runtime-dir <dir> video --prompt "A boat crosses a quiet lake" --image <keyframe.png> --frames 136 --seed 42 --lora <minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16.safetensors> -o <out.y4m> --json
 
 # Generate a MiniMax-H3-Image PNG, optionally with --expand or repeated --edit references.
-flyingfish --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o <cube.png> --json
+ff --model <MiniMax-H3-Image-dir> --runtime-dir <dir> image --prompt "A red cube on a wooden table" --size 1024x1024 --seed 42 -o <cube.png> --json
 
 # Synthesize Breeze-TTS-2 speech with the published sampling configuration.
-flyingfish --model <Breeze-TTS-2-dir> --runtime-dir <dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o <speech.wav>
+ff --model <Breeze-TTS-2-dir> --runtime-dir <dir> speak "Welcome aboard. Your journey begins now." --seed 42 -o <speech.wav>
 
 # Generate MiniMax-Music3 stereo audio from a caption and lyrics.
-flyingfish --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o <song.wav>
+ff --model <MiniMax-Music3-dir> --runtime-dir <dir> music --prompt "A warm acoustic pop song" --lyrics "[Verse]\nMorning light" --seed 7 --frames 25 -o <song.wav>
 
 # Generate HyperFlow video and audio; either keyframe option can be omitted.
-flyingfish --model <HyperFlow-H3-Flash-dir> --runtime-dir <dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o <out.mp4>
+ff --model <HyperFlow-H3-Flash-dir> --runtime-dir <dir> video --base-model <MiniMax-H3-dir> --prompt "A boat crosses a quiet lake" --image <first.png> --last-image <last.png> --frames 124 --seed 42 -o <out.mp4>
 ```
 
 Common options:
@@ -193,7 +193,7 @@ Common options:
 - `--kv-format affine8` stores an 8-bit KV cache for long contexts. The default is `bf16`.
 - `--device <n>` selects the GPU.
 
-`ff` takes the same commands and options as `flyingfish`, and uses the same calibration. `flyingfish --help` lists them all.
+`ff` takes the same commands and options as `flyingfish`, and uses the same calibration. `ff --help` lists them all.
 
 ## Development
 
