@@ -13921,6 +13921,88 @@ mod tests {
         },
     ];
 
+    /// Twice the 2026-11-19T10:35:51Z FP16-versus-BF16 floor. prod64 is the production cell.
+    const FP16_BF16_FLOOR: &[(&str, f64, f64)] = &[
+        ("tiny1", 0.015625, 0.0126576966),
+        ("tiny7", 0.5, 0.123593084),
+        ("full16", 1.0, 0.167570942),
+        ("m1", 0.375, 0.142660596),
+        ("m17", 0.5, 0.154278528),
+        ("m64", 1.0, 0.2326228),
+        ("prod64", 4.0, 0.73971736),
+        ("tail12", 0.125, 0.037559314),
+    ];
+
+    fn fp16_dit_bound() -> (f64, f64) {
+        (4.0, 0.73971736)
+    }
+
+    fn scored_image_tau(
+        sm: u32,
+        name: &str,
+        published_max: f64,
+        published_rmse: f64,
+    ) -> (f64, f64) {
+        if sm < 80 && name.starts_with("dit_") {
+            fp16_dit_bound()
+        } else {
+            (published_max, published_rmse)
+        }
+    }
+
+    #[test]
+    fn fp16_dit_bound_matches_the_frozen_gemm_floor() {
+        let frozen = [
+            ("tiny1", 0.015625, 0.0126576966),
+            ("tiny7", 0.5, 0.123593084),
+            ("full16", 1.0, 0.167570942),
+            ("m1", 0.375, 0.142660596),
+            ("m17", 0.5, 0.154278528),
+            ("m64", 1.0, 0.2326228),
+            ("prod64", 4.0, 0.73971736),
+            ("tail12", 0.125, 0.037559314),
+        ];
+        assert_eq!(FP16_BF16_FLOOR, &frozen[..]);
+        assert_eq!(fp16_dit_bound(), (4.0, 0.73971736));
+        assert_eq!(
+            FP16_BF16_FLOOR
+                .iter()
+                .find(|cell| cell.0 == "prod64")
+                .map(|cell| (cell.1, cell.2)),
+            Some(fp16_dit_bound())
+        );
+        assert_eq!(
+            scored_image_tau(75, "dit_step0", 1.0, 0.1),
+            fp16_dit_bound()
+        );
+        assert_eq!(
+            scored_image_tau(75, "dit_step5", 1.0, 0.1),
+            fp16_dit_bound()
+        );
+        assert_eq!(
+            scored_image_tau(75, "dit_edit_step0", 1.0, 0.1),
+            fp16_dit_bound()
+        );
+        assert_eq!(scored_image_tau(75, "euler_step0", 1.0, 0.1), (1.0, 0.1));
+        assert_eq!(
+            scored_image_tau(75, "euler_edit_step0", 2.0, 0.2),
+            (2.0, 0.2)
+        );
+        assert_eq!(scored_image_tau(89, "dit_step0", 1.0, 0.1), (1.0, 0.1));
+        assert_eq!(scored_image_tau(80, "dit_step5", 3.0, 0.3), (3.0, 0.3));
+    }
+
+    #[test]
+    fn t4_standard_pin_matches_the_counted_budget() {
+        let slot = 770_703_360usize;
+        let pin = 7_768_899_584usize;
+        let host_pins = pin / slot;
+        let disk_layers = 50 - host_pins;
+        assert_eq!(host_pins, 10);
+        assert_eq!(disk_layers, 40);
+        assert_eq!(disk_layers * slot * 6, 184_968_806_400);
+    }
+
     fn image_dit_tau(cross: f64) -> f64 {
         (2.0 * cross).max(1e-6)
     }
@@ -13971,7 +14053,9 @@ mod tests {
     /// rows. Euler step 0 writes generated rows only. `inputs.safetensors` supplies `t2i_rows` and `edit_rows`.
     /// Image row `i` takes the `(h, w)` of image row `i + 1`. That line is printed.
     /// Every image row's `(h, w)` is swapped to `(w, h)`.
-    /// Control bar dated 2026-11-12: both metrics must exceed `3 * tau`.
+    /// On sm >= 80 the control bar is `3 * tau` against the BF16 reference.
+    /// On sm < 80 a `dit_*` cell uses the prod64 floor. Euler stays on `image_dit_tau`.
+    /// On sm < 80 the transpose must differ from the unshifted candidate by more than that floor.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_DEVICE0, FF_H3_PLACEMENT"]
     fn image_dit_512_matches_the_frozen_cells() -> Result<()> {
@@ -14115,6 +14199,8 @@ mod tests {
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
             .minimax_h3_image_manifest(&image_spec)?;
         let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        println!("H3_IMAGE_DIT sm={sm}");
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
@@ -14219,8 +14305,12 @@ mod tests {
                     .find(|cell| cell.name == name)
                     .context(name)?;
                 let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
-                let tau_max = image_dit_tau(cell.cross_max_abs);
-                let tau_rmse = image_dit_tau(cell.cross_rmse);
+                let (tau_max, tau_rmse) = scored_image_tau(
+                    sm,
+                    name,
+                    image_dit_tau(cell.cross_max_abs),
+                    image_dit_tau(cell.cross_rmse),
+                );
                 let ok = candidate.iter().all(|v| v.is_finite())
                     && max_abs <= tau_max
                     && rmse <= tau_rmse;
@@ -14401,8 +14491,12 @@ mod tests {
                     .find(|cell| cell.name == name)
                     .context(name)?;
                 let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
-                let tau_max = image_dit_tau(cell.cross_max_abs);
-                let tau_rmse = image_dit_tau(cell.cross_rmse);
+                let (tau_max, tau_rmse) = scored_image_tau(
+                    sm,
+                    name,
+                    image_dit_tau(cell.cross_max_abs),
+                    image_dit_tau(cell.cross_rmse),
+                );
                 let ok = candidate.iter().all(|v| v.is_finite())
                     && max_abs <= tau_max
                     && rmse <= tau_rmse;
@@ -14419,17 +14513,35 @@ mod tests {
             .iter()
             .find(|cell| cell.name == "dit_step0")
             .context("dit_step0")?;
-        let bar_max = 3.0 * image_dit_tau(step0_cell.cross_max_abs);
-        let bar_rmse = 3.0 * image_dit_tau(step0_cell.cross_rmse);
-        let shift_gt = shift_max > bar_max && shift_rmse > bar_rmse;
-        let caught = control_max > bar_max && control_rmse > bar_rmse;
+        let (bar_max, bar_rmse, shift_gt, caught) = if sm < 80 {
+            let (bar_max, bar_rmse) = fp16_dit_bound();
+            (
+                bar_max,
+                bar_rmse,
+                shift_vs_max > bar_max && shift_vs_rmse > bar_rmse,
+                versus_max > bar_max && versus_rmse > bar_rmse,
+            )
+        } else {
+            let bar_max = 3.0 * image_dit_tau(step0_cell.cross_max_abs);
+            let bar_rmse = 3.0 * image_dit_tau(step0_cell.cross_rmse);
+            (
+                bar_max,
+                bar_rmse,
+                shift_max > bar_max && shift_rmse > bar_rmse,
+                control_max > bar_max && control_rmse > bar_rmse,
+            )
+        };
         println!(
             "H3_IMAGE_DIT rope_shift max_abs={shift_max:.8e} rmse={shift_rmse:.8e} vs_step0_max={shift_vs_max:.8e} vs_step0_rmse={shift_vs_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={shift_gt} sample_changed={sample_changed}"
         );
         println!(
             "H3_IMAGE_DIT rope_transpose max_abs={control_max:.8e} rmse={control_rmse:.8e} vs_step0_max={versus_max:.8e} vs_step0_rmse={versus_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught} sample_changed={sample_changed}"
         );
-        ensure!(caught, "rope-transpose control stayed within 3x tau");
+        ensure!(
+            caught,
+            "rope-transpose control stayed within {}",
+            if sm < 80 { "the FP16 floor" } else { "3x tau" }
+        );
         ensure!(sample_changed, "image sample left the input unchanged");
         ensure!(
             defects.is_empty(),
@@ -14488,7 +14600,9 @@ mod tests {
     /// Canvas 4096, latent 256, 16384 image rows, S=16391. Placement is `Derived`.
     /// Step 0, Euler of a copy of those rows, then step 5. The reference is the G4 sdpa B=1 arm.
     /// Every image row swaps `(h, w)` to `(w, h)`.
-    /// Control bar dated 2026-11-12: both metrics must exceed `3 * tau`.
+    /// On sm >= 80 the control bar is `3 * tau` against the BF16 reference.
+    /// On sm < 80 a `dit_*` cell uses the prod64 floor. Euler stays on the frozen 4096 tau.
+    /// On sm < 80 the transpose must differ from the unshifted candidate by more than that floor.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_4096"]
     fn image_dit_4096_matches_the_frozen_cells() -> Result<()> {
@@ -14599,6 +14713,8 @@ mod tests {
             + sizing.staging
             + sizing.transient;
         let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        println!("H3_IMAGE_4096 sm={sm}");
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
@@ -14730,7 +14846,7 @@ mod tests {
                 .find(|cell| cell.name == name)
                 .context(name)?;
             let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
-            let (tau_max, tau_rmse) = (cell.tau_max, cell.tau_rmse);
+            let (tau_max, tau_rmse) = scored_image_tau(sm, name, cell.tau_max, cell.tau_rmse);
             let ok = max_abs <= tau_max && rmse <= tau_rmse;
             println!(
                 "H3_IMAGE_4096 {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
@@ -14788,18 +14904,182 @@ mod tests {
             .iter()
             .find(|cell| cell.name == "dit_step0")
             .context("dit_step0")?;
-        let bar_max = 3.0 * step0_cell.tau_max;
-        let bar_rmse = 3.0 * step0_cell.tau_rmse;
-        let caught = control_max > bar_max && control_rmse > bar_rmse;
+        let (bar_max, bar_rmse, caught) = if sm < 80 {
+            let (bar_max, bar_rmse) = fp16_dit_bound();
+            (
+                bar_max,
+                bar_rmse,
+                versus_max > bar_max && versus_rmse > bar_rmse,
+            )
+        } else {
+            let bar_max = 3.0 * step0_cell.tau_max;
+            let bar_rmse = 3.0 * step0_cell.tau_rmse;
+            (
+                bar_max,
+                bar_rmse,
+                control_max > bar_max && control_rmse > bar_rmse,
+            )
+        };
         println!(
             "H3_IMAGE_4096 rope_transpose max_abs={control_max:.8e} rmse={control_rmse:.8e} vs_step0_max={versus_max:.8e} vs_step0_rmse={versus_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught}"
         );
-        ensure!(caught, "rope-transpose control stayed within 3x tau");
+        ensure!(
+            caught,
+            "rope-transpose control stayed within {}",
+            if sm < 80 { "the FP16 floor" } else { "3x tau" }
+        );
         ensure!(
             defects.is_empty(),
             "H3_IMAGE_4096_GATE DEFECT cells outside the frozen taus: {defects:?}"
         );
         println!("H3_IMAGE_4096_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// Canvas 2048, latent 128, 4096 image rows. Placement is `Streamed`.
+    /// One step of constant 0.1. The velocity is finite. Two device slots and no resident block.
+    /// Host pins follow the sensed host budget. The counted re-read is `disk_layers * slot_bytes * 6`.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE"]
+    fn image_dit_2048_streamed_admission() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let model = PathBuf::from(std::env::var_os("FF_H3_IMAGE").context("FF_H3_IMAGE missing")?);
+        let image_spec = ImageSpec::read(&model)?;
+        let spec = super::image_block_spec(&image_spec);
+        let width = image_spec.row_width();
+        let tokens = 64usize;
+        let latent = tokens * image_spec.patch[1];
+        ensure!(
+            width == 96 && latent == 128 && image_spec.patch == [1, 2, 2] && spec.layers == 50,
+            "2048 image geometry width={width} latent={latent} layers={} patch={:?}",
+            spec.layers,
+            image_spec.patch
+        );
+        let image_rows = tokens * tokens;
+        let tags = vec![TEXT_TAG; 7];
+        let text = vec![bf16::from_f32(0.1); tags.len() * image_spec.text_dim];
+        let rows_host = vec![0.1f32; image_rows * width];
+        let layout = image_layout(&image_spec, &tags, &[], latent, latent)?;
+        ensure!(
+            layout.image_indices.len() == image_rows
+                && layout.text_indices.len() == tags.len()
+                && layout.reference_rows == 0,
+            "2048 layout extents"
+        );
+        let schedule = ImageSchedule::published()?;
+        let row_plan =
+            AdalnPlan::from_tags(&layout.token_tags, &image_row_plan(&layout, &schedule)?)?;
+        let steps = row_plan.row_pairs.len();
+        ensure!(steps == 6, "evaluation count");
+        let dir = model.join("transformer_diffusers");
+        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+            .minimax_h3_image_manifest(&image_spec)?;
+        let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-image-2048-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3-Image 2048 admission".into())),
+        )?;
+        let visits = crate::prefill::placement_visits(schedule.timesteps.len(), 1)?;
+        let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &row_plan)?;
+        let mut dit = ImageDit::new(
+            &device,
+            &mut blas,
+            (&spec, &image_spec),
+            &layout,
+            &dir,
+            &manifest,
+            (Placement::Streamed, visits),
+        )?;
+        let host_budget = dit.placement.host_budget;
+        let plan = dit
+            .tier
+            .as_ref()
+            .context("2048 streamed tier missing")?
+            .dense
+            .plan
+            .clone();
+        let host_pins = plan.host.iter().filter(|flag| **flag).count();
+        let disk_layers = plan
+            .slots
+            .iter()
+            .zip(&plan.host)
+            .filter(|(slot, flag)| slot.is_some() && !**flag)
+            .count();
+        let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
+        let slot_n = plan
+            .slots
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .map(|index| index + 1)
+            .context("2048 streamed slots missing")?;
+        let reread = disk_layers
+            .checked_mul(plan.slot_bytes)
+            .and_then(|bytes| bytes.checked_mul(steps))
+            .context("2048 re-read bytes overflow")?;
+        println!(
+            "H3_IMAGE_2048_PLACEMENT sm={sm} resident={resident} resident_bytes={} host_pins={host_pins} disk_layers={disk_layers} slot_bytes={} slot_count={slot_n} host_bytes={} disk_bytes={} host_budget={host_budget} visits={visits} reread_bytes={reread}",
+            plan.resident_bytes, plan.slot_bytes, plan.host_bytes, plan.disk_bytes
+        );
+        ensure!(
+            plan.slot_bytes == 770_703_360
+                && plan.resident_bytes == 0
+                && resident == 0
+                && slot_n == 2
+                && host_pins + disk_layers == spec.layers,
+            "2048 streamed placement slot_bytes={} resident_bytes={} resident={resident} slots={slot_n} host_pins={host_pins} disk_layers={disk_layers}",
+            plan.slot_bytes,
+            plan.resident_bytes
+        );
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 1.0,
+        };
+        let counts = (
+            u32::try_from(row_plan.pairs.len())?,
+            u32::try_from(row_plan.timesteps.len())?,
+        );
+        let rows_d = s.clone_htod(&rows_host)?;
+        let text_d = s.clone_htod(&text)?;
+        let row_pairs = s.clone_htod(&row_plan.row_pairs[0])?;
+        let row_timesteps = s.clone_htod(&row_plan.row_timesteps[0])?;
+        dit.step(
+            &context,
+            &table,
+            counts,
+            0,
+            &ImageStepInputs {
+                image: &rows_d,
+                text: &text_d,
+                row_pairs: &row_pairs,
+                row_timesteps: &row_timesteps,
+            },
+        )?;
+        let velocity = s.clone_dtoh(&dit.velocity)?;
+        drop(dit);
+        fs::remove_dir_all(&runtime)?;
+        ensure!(
+            velocity.len() == image_rows * width && velocity.iter().all(|value| value.is_finite()),
+            "2048 velocity length {} or a non-finite value",
+            velocity.len()
+        );
+        println!("H3_IMAGE_2048_ADMISSION finite=true rows={image_rows} width={width} sm={sm}");
         Ok(())
     }
 
