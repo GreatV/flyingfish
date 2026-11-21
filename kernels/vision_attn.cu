@@ -1,4 +1,4 @@
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
 // sm75: cp.async.cg 16B is ld.global.cg.v4.u32 plus st.shared.v4.u32. mma.bf16 traps.
 // Vision attention: MHA 16 x 72, non-causal, per-image blocks, BF16.
 // Model definition geometry: 16 Q heads = 16 KV heads, head_dim 72, scaling head_dim**-0.5,
