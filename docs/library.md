@@ -4,7 +4,7 @@ The `flyingfish` crate exposes the same model entries the `ff` command uses. Lib
 
 | Layer | Public surface | Backends | Resource contract |
 |---|---|---|---|
-| Model request | `RunOptions` with `minimax_h3::run_minimax_h3_i2va`; family types such as `minimax_h3::ImageRunOptions` and `music3::Music3Request` | CUDA for these examples; other families follow [docs/models.md](models.md) | The caller supplies request inputs, device ordinal and runtime directory through the entry's arguments. The entry constructs and manages the stages for that request. |
+| Model request | `RunOptions` with `minimax_h3::run_minimax_h3_i2va` or `backend::IdolPipelineRuntime::open`; family types such as `minimax_h3::ImageRunOptions` and `music3::Music3Request` | CUDA for these examples; other families follow [docs/models.md](models.md) | The caller supplies request inputs, device ordinal and runtime directory through the entry's arguments. The entry manages its stages. The Idol runtime can serve successive requests on the same device. |
 | Stage | `backend::BackendDevice` and the encoder, flow, decoder and workspace types exported by `backend` | `BackendDevice` is exported with CUDA or ROCm; individual stages retain their model and backend restrictions | The caller constructs the device and stage objects, supplies stage inputs, and owns the runtime and workspace lifetimes. The device carries GPU identity, context, execution stream and upload stream. The speech, Breeze-TTS-2 and MiniMax-Music3 stages can be constructed this way; the vision and image-to-3D stages need a `Blas`, which only the crate constructs. |
 
 [docs/models.md](models.md) lists the backends each model runs on. [docs/usage.md](usage.md) documents the CLI for the same models.
@@ -51,7 +51,7 @@ pub struct RunOptions {
 
 - `device`: GPU ordinal.
 - `runtime_dir`: per-machine directory for calibration and measured plans, keyed by model config and build.
-- `verbose`: diagnostics switch; `run_minimax_h3_i2va` and `run_hyperflow_h3_video` apply it. The other entries do not read it.
+- `verbose`: diagnostics switch; `run_minimax_h3_i2va`, `run_hyperflow_h3_video` and `IdolPipelineRuntime::open` apply it.
 
 Fields each `RunOptions` entry reads:
 
@@ -59,7 +59,7 @@ Fields each `RunOptions` entry reads:
 |---|---|---|---|
 | `parakeet::transcribe`, `canary::transcribe`, `nemotron::transcribe`, `eou::transcribe`, `diarization::diarize`, `diarization::speaker_masks`, `multitalker::transcribe` | Yes | No | No |
 | `breeze::speak`, `model::embed_text` | Yes | Yes | No |
-| `minimax_h3::run_minimax_h3_i2va`, `minimax_h3::run_hyperflow_h3_video` | Yes | Yes | Yes |
+| `minimax_h3::run_minimax_h3_i2va`, `minimax_h3::run_hyperflow_h3_video`, `backend::IdolPipelineRuntime::open` | Yes | Yes | Yes |
 
 Diagnostics are on by default on each thread. `backend::with_verbose(verbose: bool, run: impl FnOnce() -> T) -> T` sets them for the duration of `run` and restores the previous value; the CLI wraps every media, speech and embedding command in it.
 
@@ -766,7 +766,30 @@ let mesh = flyingfish::backend::TrellisTo3d {
 
 ### Idol
 
-`backend::IdolPipelineRuntime` is exported with `open(device: &Device, blas: &mut Blas, common: CommonOpsRef, idol_dir: &Path, dinov3_dir: &Path, vae_dir: &Path) -> Result<Self>` and `generate_from_rgb(&mut self, s: &Arc<CudaStream>, blas: &Blas, chw_f32: &[f32], seed: u64) -> Result<(IdolGaussianSplat, IdolCamera)>`. `Blas` (`backend::gpu::blas::Blas`) has no public constructor, so the pipeline cannot be opened from outside the crate, and Idol has no CLI command.
+On CUDA, `backend::IdolPipelineRuntime::open` takes the Idol checkpoint directory, the DINOv3 ViT-H/16+ directory, the FLUX.2-dev `vae` subdirectory and `&RunOptions`. Open once on the selected device and reuse the runtime with a prepared image and a seed for each request. The result contains a Gaussian splat and a camera with yaw and pitch in radians, radius, and field of view in degrees.
+
+```rust
+use flyingfish::{RunOptions, backend::{IdolCamera, IdolPipelineRuntime}};
+use std::path::Path;
+
+pub fn generate_idol(
+    idol: &Path, dinov3: &Path, vae: &Path, options: &RunOptions,
+    prepared_rgb: &[f32], seed: u64, output: &Path,
+) -> anyhow::Result<IdolCamera> {
+    let mut runtime = IdolPipelineRuntime::open(idol, dinov3, vae, options)?;
+    let (splat, camera) = runtime.generate_from_rgb(prepared_rgb, seed)?;
+    splat.save_ply(output)?;
+    Ok(camera)
+}
+```
+
+`prepared_rgb` contains three contiguous planes (red, green, blue), each 1024 × 1024 pixels, with finite F32 values in [0, 1]. Callers can use the publisher's saved preprocessed RGB image directly by dividing each channel byte by 255 and arranging the values in that order.
+
+Raw-image background removal and framing are caller-side steps. To match the Idol model definition, prepare the image as follows.
+
+1. Resize with Lanczos, preserving aspect ratio and rounding each scaled dimension to the nearest integer so the short side is 1024. Use the resized alpha channel if any pixel has alpha below 255. Otherwise obtain an alpha matte from the publisher's BiRefNet background remover on the RGB image.
+2. Erode alpha with a 3 × 3 minimum filter. Find the inclusive bounds of its nonzero pixels. An empty mask is an error. Center a square on the midpoint of those bounds, with side equal to the longer coordinate span (max minus min) times the crop margin. The default margin is 1.2 for a synthetic image or 1.7 for a real photo. Truncate each crop edge toward zero and pad beyond the image with transparent black.
+3. Resize the RGBA crop to 1024 × 1024 with Lanczos and composite onto black using the resized alpha mask. Convert the RGB bytes to planar F32 as above. The runtime applies DINOv3's ImageNet mean and standard deviation and maps the FLUX.2 VAE input to [-1, 1] internally.
 
 ## Language models
 
@@ -972,7 +995,7 @@ The caller owns every object it constructs: the device, each stage runtime and e
 - MiniMax-Music3: `music3::Runtime::load(model: &Path, runtime: &Path, prompt: usize, frames: usize, device_limit: usize, ordinal: usize) -> Result<Self>` for the autoregressive stage and `backend::Music3Syn::load(dir: &Path, d: &Device, max_length: usize) -> Result<Self>` for synthesis.
 - Vision and image-to-3D: `DinoV3Encoder`, `DinoV3Workspace`, `Flux2VaeEncoder`, `Flux2VaeWorkspace`, `IdolVisionEncoderRuntime`, `IdolDenoiser`, `IdolDenoiserWorkspace`, `IdolOctreeDecoder`, `IdolOctreeWorkspace`, `IdolGaussianDecoder`, `IdolGaussianWorkspace`, `Hi3DImageConditioner`, `TrellisImageConditioner`, `TrellisSsFlow`, `PixalConditioningRuntime`, `PixalDecoder` and `Flow`.
 
-`DinoV3Encoder::load`, `Flux2VaeEncoder::load`, `IdolVisionEncoderRuntime::load`, `Hi3DImageConditioner::load`, `TrellisImageConditioner::load`, `PixalConditioningRuntime::load`, `TrellisSsFlow::load` and `IdolPipelineRuntime::open` take `&mut Blas`, which has no public constructor; those stages are usable only through the request entries above.
+`DinoV3Encoder::load`, `Flux2VaeEncoder::load`, `IdolVisionEncoderRuntime::load`, `Hi3DImageConditioner::load`, `TrellisImageConditioner::load`, `PixalConditioningRuntime::load`, and `TrellisSsFlow::load` take `&mut Blas`, which has no public constructor; those stages are usable only through the request entries above.
 
 ## Errors
 
