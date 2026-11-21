@@ -721,7 +721,15 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
         if tile * 64 >= p.rows {
             return;
         }
-        attention::<64, 8, 1, 64, SM75_F16, true, false>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
+        attention::<64, 8, 1, 64, SM75_F16, true, false>(
+            p,
+            p.rows,
+            0,
+            0,
+            scale,
+            core::ptr::null(),
+            0,
+        );
     }
 }
 
