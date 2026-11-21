@@ -164,26 +164,15 @@ impl Plan {
         input: usize,
         workspace: usize,
         algo_index: u32,
-    ) -> Result<Self> {
-        Self::new_with_bias(handle, rows, output, input, workspace, algo_index, None)
-    }
-
-    fn new_with_bias(
-        handle: sys::cublasLtHandle_t,
-        rows: usize,
-        output: usize,
-        input: usize,
-        workspace: usize,
-        algo_index: u32,
-        bias: Option<u64>,
+        ab: sys::cudaDataType_t,
     ) -> Result<Self> {
         Self::build(
             handle,
             (rows, output, input, input),
             workspace,
-            bias,
-            sys::cudaDataType_t::CUDA_R_16BF,
-            sys::cudaDataType_t::CUDA_R_16BF,
+            None,
+            ab,
+            ab,
             PlanAlgo::Heuristic(algo_index),
         )
     }
@@ -260,7 +249,7 @@ impl Plan {
         };
         p.desc = lt::create_matmul_desc(
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cudaDataType_t::CUDA_R_32F,
+            cuda_lt_dtype(crate::backend::setup::lt_compute_operand()),
         )?;
         let transpose = 1i32;
         unsafe {
@@ -501,6 +490,15 @@ impl Drop for RouteLogits {
 
 type LinearPlans = RefCell<BTreeMap<(usize, usize, usize, u32, bool), Plan>>;
 
+fn cuda_lt_dtype(operand: crate::backend::setup::LtOperand) -> sys::cudaDataType_t {
+    use crate::backend::setup::LtOperand;
+    match operand {
+        LtOperand::F32 => sys::cudaDataType_t::CUDA_R_32F,
+        LtOperand::F16 => sys::cudaDataType_t::CUDA_R_16F,
+        LtOperand::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+    }
+}
+
 pub struct Blas {
     choices: RefCell<BTreeMap<LinearShape, (LinearChoice, u32)>>,
     coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
@@ -520,6 +518,7 @@ pub struct Blas {
     bias_add: Option<CudaFunction>,
     bias_fill_f16: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
+    half_dtype: sys::cudaDataType_t,
     decode: CudaBlas,
     workspace: RefCell<CudaSlice<u8>>,
     stream: Arc<CudaStream>,
@@ -699,6 +698,11 @@ impl Blas {
         closure: Rc<super::closure::Closure>,
     ) -> Result<Self> {
         device.info.require_cuda_tensor_ops("gemm_skinny")?;
+        let half_dtype = cuda_lt_dtype(device.info.arch.published_bf16_lt());
+        ensure!(
+            cuda_lt_dtype(device.info.arch.published_f32_lt()) == sys::cudaDataType_t::CUDA_R_32F,
+            "published F32 Lt operand is CUDA_R_32F"
+        );
         let stream = device.stream.clone();
         let calibration =
             linear_calibrate::Environment::new(device, ops, runtime, closure.clone())?;
@@ -731,6 +735,7 @@ impl Blas {
             bias_add: None,
             bias_fill_f16: None,
             handle,
+            half_dtype,
             decode,
             workspace: RefCell::new(workspace),
             stream,
@@ -793,6 +798,7 @@ impl Blas {
                 input,
                 self.workspace.borrow().len(),
                 algo_index,
+                self.half_dtype,
             )
             .with_context(|| format!("Lt plan rows={rows} output={output} input={input}"))?;
             p.describe(rows, output, input)?;
@@ -1221,8 +1227,8 @@ impl Blas {
                 (key.0, key.1, key.2, key.3),
                 self.workspace.borrow().len(),
                 None,
-                sys::cudaDataType_t::CUDA_R_16BF,
-                sys::cudaDataType_t::CUDA_R_16BF,
+                self.half_dtype,
+                self.half_dtype,
                 PlanAlgo::Heuristic(0),
             )?;
             self.pitched_b.borrow_mut().insert(key, plan);
@@ -1244,6 +1250,7 @@ impl Blas {
             shape.input,
             self.workspace.borrow().len(),
             0,
+            self.half_dtype,
         )?;
         let algo = plan.algo.context("canonical Lt algorithm missing")?;
         self.row_families
@@ -1268,8 +1275,8 @@ impl Blas {
                 (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
                 None,
-                sys::cudaDataType_t::CUDA_R_16BF,
-                sys::cudaDataType_t::CUDA_R_16BF,
+                self.half_dtype,
+                self.half_dtype,
                 PlanAlgo::Fixed(algo),
             )?;
             self.plans.borrow_mut().insert(key, plan);
@@ -1337,6 +1344,7 @@ impl Blas {
             shape.input,
             self.workspace.borrow().len(),
             1,
+            self.half_dtype,
         )?;
         let index = lower_wave_index(&[waves, f64::from(alternative.waves)])?;
         if crate::backend::diagnostics_enabled() {
@@ -1392,6 +1400,7 @@ impl Blas {
                     shape.input,
                     original_workspace,
                     0,
+                    self.half_dtype,
                 )?;
                 if crate::backend::diagnostics_enabled() {
                     eprintln!(
@@ -1437,6 +1446,7 @@ impl Blas {
                 key.2,
                 self.workspace.borrow().len(),
                 0,
+                self.half_dtype,
             )?;
             self.plans.borrow_mut().insert(key, p);
         }
@@ -2131,14 +2141,14 @@ impl Blas {
         let key = (shape, bias.ptr, mode);
         let mut plans = self.biased_plans.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
-            let plan = Plan::new_with_bias(
+            let plan = Plan::build(
                 self.handle,
-                shape.rows,
-                shape.output,
-                shape.input,
+                (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
-                0,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
+                self.half_dtype,
+                self.half_dtype,
+                PlanAlgo::Heuristic(0),
             )?;
             plan.describe(shape.rows, shape.output, shape.input)?;
             entry.insert(plan);
@@ -2227,14 +2237,14 @@ impl Blas {
         let key = (shape, bias.ptr, mode);
         let mut plans = self.biased_plans.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
-            let plan = Plan::new_with_bias(
+            let plan = Plan::build(
                 self.handle,
-                shape.rows,
-                shape.output,
-                shape.input,
+                (shape.rows, shape.output, shape.input, shape.input),
                 1 << 20,
-                0,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
+                self.half_dtype,
+                self.half_dtype,
+                PlanAlgo::Heuristic(0),
             )?;
             plan.describe(shape.rows, shape.output, shape.input)?;
             entry.insert(plan);
@@ -2491,6 +2501,27 @@ impl Blas {
 mod tests {
     use super::*;
     use half::f16;
+
+    #[test]
+    fn lt_operand_maps_to_cublas_data_type() {
+        use crate::backend::setup::{LtOperand, lt_compute_operand};
+        assert_eq!(
+            cuda_lt_dtype(LtOperand::F16),
+            sys::cudaDataType_t::CUDA_R_16F
+        );
+        assert_eq!(
+            cuda_lt_dtype(LtOperand::Bf16),
+            sys::cudaDataType_t::CUDA_R_16BF
+        );
+        assert_eq!(
+            cuda_lt_dtype(LtOperand::F32),
+            sys::cudaDataType_t::CUDA_R_32F
+        );
+        assert_eq!(
+            cuda_lt_dtype(lt_compute_operand()),
+            sys::cudaDataType_t::CUDA_R_32F
+        );
+    }
 
     #[test]
     #[ignore = "exclusive CUDA window and an empty FLYINGFISH_RUNTIME_DIR"]

@@ -45,6 +45,91 @@ impl DeviceInfo {
     }
 }
 
+/// Operand type of a published BF16 or F32 Lt plan. Compute stays F32.
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LtOperand {
+    F32,
+    F16,
+    Bf16,
+}
+
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) const fn lt_compute_operand() -> LtOperand {
+    LtOperand::F32
+}
+
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) const IMAGE_D128_RESIDUAL: &str = "attention_prefill_d128_bidirectional";
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) const IMAGE_D128_SINGLE_PV: &str = "attention_prefill_d128_bidirectional_single_pv";
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) const CONDITIONER_D128: &str = "attention_prefill_d128";
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) const VAE_D64_WINDOWS: &str = "attention_prefill_d64_bidirectional_windows";
+
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) const DECODER_F32_NARROW_FP16: &str = "vision_downcast_f32_to_f16_checked";
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) const DECODER_F32_NARROW_BF16: &str = "vision_downcast_f32_to_bf16_checked";
+
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecoderNarrow {
+    RawF32,
+    F32ToBf16,
+    F32ToFp16,
+}
+
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) fn decoder_weight_is_raw_f32(name: &str) -> bool {
+    name.split('.')
+        .any(|part| matches!(part, "norm1" | "norm2" | "norm_out" | "scale1" | "scale2"))
+}
+
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+impl DeviceArchitecture {
+    /// Published BF16 weights are FP16 operands below sm80. sm80+ and HIP stay BF16.
+    pub(crate) fn published_bf16_lt(&self) -> LtOperand {
+        match self {
+            Self::Cuda(sm) if *sm < 80 => LtOperand::F16,
+            Self::Cuda(_) | Self::Hip(_) => LtOperand::Bf16,
+        }
+    }
+
+    pub(crate) fn published_f32_lt(&self) -> LtOperand {
+        match self {
+            Self::Cuda(_) | Self::Hip(_) => LtOperand::F32,
+        }
+    }
+
+    /// Image D128 full attention. sm80+ keeps the single-probability body.
+    pub(crate) fn image_d128_full_symbol(&self) -> &'static str {
+        match self {
+            Self::Cuda(sm) if *sm >= 80 => IMAGE_D128_SINGLE_PV,
+            Self::Cuda(_) | Self::Hip(_) => IMAGE_D128_RESIDUAL,
+        }
+    }
+
+    pub(crate) fn decoder_weight_narrow(&self, name: &str) -> DecoderNarrow {
+        if decoder_weight_is_raw_f32(name) {
+            DecoderNarrow::RawF32
+        } else {
+            match self {
+                Self::Cuda(sm) if *sm < 80 => DecoderNarrow::F32ToFp16,
+                Self::Cuda(_) | Self::Hip(_) => DecoderNarrow::F32ToBf16,
+            }
+        }
+    }
+
+    pub(crate) fn decoder_f32_narrow_symbol(&self) -> &'static str {
+        match self {
+            Self::Cuda(sm) if *sm < 80 => DECODER_F32_NARROW_FP16,
+            Self::Cuda(_) | Self::Hip(_) => DECODER_F32_NARROW_BF16,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKey {
     pub device_uuid: String,
@@ -400,5 +485,109 @@ mod long_tests {
             assert_eq!(selected.is_ok(), valid, "merge_threads={merge_threads}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn sm75_published_bf16_selects_fp16_operands() {
+        let info89 = DeviceInfo {
+            name: String::new(),
+            arch: DeviceArchitecture::Cuda(89),
+            sms: 128,
+            l2_bytes: 72 << 20,
+            warp: 32,
+            max_threads: 1024,
+            shared_bytes: 48 << 10,
+            sm_shared_bytes: 100 << 10,
+            cooperative: true,
+            optin_shared_bytes: 99 << 10,
+            memory_bytes_per_second: 1_008_096_000_000.0,
+        };
+        let mut info75 = info89.clone();
+        info75.arch = DeviceArchitecture::Cuda(75);
+        let mut info70 = info89.clone();
+        info70.arch = DeviceArchitecture::Cuda(70);
+        let mut info80 = info89.clone();
+        info80.arch = DeviceArchitecture::Cuda(80);
+        let mut hip = info89.clone();
+        hip.arch = DeviceArchitecture::Hip("gfx1100".into());
+        let mut warp64 = info89.clone();
+        warp64.warp = 64;
+
+        assert!(info75.require_cuda_tensor_ops("gemm_skinny").is_err());
+        assert!(info70.require_cuda_tensor_ops("gemm_skinny").is_err());
+        assert!(warp64.require_cuda_tensor_ops("gemm_skinny").is_err());
+        assert!(hip.require_cuda_tensor_ops("gemm_skinny").is_err());
+        assert!(info80.require_cuda_tensor_ops("gemm_skinny").is_ok());
+        assert!(info89.require_cuda_tensor_ops("gemm_skinny").is_ok());
+
+        assert_eq!(info75.arch.published_bf16_lt(), LtOperand::F16);
+        assert_eq!(info70.arch.published_bf16_lt(), LtOperand::F16);
+        assert_eq!(info80.arch.published_bf16_lt(), LtOperand::Bf16);
+        assert_eq!(info89.arch.published_bf16_lt(), LtOperand::Bf16);
+        assert_eq!(hip.arch.published_bf16_lt(), LtOperand::Bf16);
+        assert_eq!(info75.arch.published_f32_lt(), LtOperand::F32);
+        assert_eq!(info89.arch.published_f32_lt(), LtOperand::F32);
+        assert_eq!(hip.arch.published_f32_lt(), LtOperand::F32);
+        assert_eq!(lt_compute_operand(), LtOperand::F32);
+
+        assert_eq!(info89.arch.image_d128_full_symbol(), IMAGE_D128_SINGLE_PV);
+        assert_eq!(info80.arch.image_d128_full_symbol(), IMAGE_D128_SINGLE_PV);
+        assert_eq!(info75.arch.image_d128_full_symbol(), IMAGE_D128_RESIDUAL);
+        assert_eq!(hip.arch.image_d128_full_symbol(), IMAGE_D128_RESIDUAL);
+        assert_eq!(CONDITIONER_D128, "attention_prefill_d128");
+        assert_eq!(
+            VAE_D64_WINDOWS,
+            "attention_prefill_d64_bidirectional_windows"
+        );
+
+        let narrow = "decoder.mid_block.resnets.0.conv1.weight";
+        let raw = "decoder.transformer_blocks.0.norm1.weight";
+        assert!(!decoder_weight_is_raw_f32(narrow));
+        assert!(decoder_weight_is_raw_f32(raw));
+        assert_eq!(
+            info75.arch.decoder_weight_narrow(narrow),
+            DecoderNarrow::F32ToFp16
+        );
+        assert_eq!(
+            info89.arch.decoder_weight_narrow(narrow),
+            DecoderNarrow::F32ToBf16
+        );
+        assert_eq!(
+            hip.arch.decoder_weight_narrow(narrow),
+            DecoderNarrow::F32ToBf16
+        );
+        assert_eq!(
+            info75.arch.decoder_weight_narrow(raw),
+            DecoderNarrow::RawF32
+        );
+        assert_eq!(
+            info89.arch.decoder_weight_narrow(raw),
+            DecoderNarrow::RawF32
+        );
+        assert_eq!(
+            info75.arch.decoder_f32_narrow_symbol(),
+            DECODER_F32_NARROW_FP16
+        );
+        assert_eq!(
+            info89.arch.decoder_f32_narrow_symbol(),
+            DECODER_F32_NARROW_BF16
+        );
+        assert_eq!(
+            hip.arch.decoder_f32_narrow_symbol(),
+            DECODER_F32_NARROW_BF16
+        );
+
+        assert!(!crate::convrot::qkv_product_eligible(
+            &info75,
+            263,
+            (5376, 7168)
+        ));
+        assert!(crate::convrot::qkv_product_eligible(
+            &info89,
+            263,
+            (5376, 7168)
+        ));
+        assert!(!crate::gdn_plan::GdnPolicy::for_device(&info75).cw_p2_for_step(5));
+        assert!(crate::gdn_plan::GdnPolicy::for_device(&info89).cw_p2_for_step(5));
     }
 }
