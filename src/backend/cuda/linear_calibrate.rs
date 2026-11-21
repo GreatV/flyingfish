@@ -88,6 +88,10 @@ impl Environment {
         })
     }
 
+    pub(super) fn runtime(&self) -> &Path {
+        &self.runtime
+    }
+
     pub fn path(&self, shape: LinearShape) -> PathBuf {
         self.runtime.join(format!(
             "linear-v2-m{}-o{}-i{}-{}.json",

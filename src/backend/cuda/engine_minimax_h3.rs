@@ -5350,12 +5350,66 @@ type VideoPlacementChooser<'a> = dyn FnMut(
     + 'a;
 
 impl Dit {
+    #[cfg(feature = "cuda")]
+    fn qualify_projections(&self, blas: &Blas, table: &AdalnTable) -> Result<()> {
+        let work = &self.work;
+        let stream = blas.stream();
+        let block = self
+            .blocks
+            .iter()
+            .chain(&self.refiners)
+            .find(|b| b.storage.is_some())
+            .context("MiniMax dense setup requires a resident published block")?;
+        let qualify = |role: usize, rows: usize, output: Tensor<bf16, 2>| -> Result<()> {
+            let BlockLinear::Dense { weight, .. } = block.linears[role] else {
+                bail!("MiniMax qualification expected a dense projection");
+            };
+            let width = weight.shape[0] as usize;
+            let elements = rows.checked_mul(width).context("dense setup extent")?;
+            if elements > work.k_raw.len().min(work.v_raw.len()) {
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"dense_lt":{"rows":rows,"output":width,"choice":"incumbent","required_comparison_elements":elements,"available_elements":work.k_raw.len().min(work.v_raw.len())}})
+                    );
+                }
+                return Ok(());
+            }
+            let input = rows_view(
+                &work.normed,
+                stream,
+                0,
+                rows,
+                weight.shape[1] as usize,
+                weight.shape[1] as usize,
+            )?;
+            let copies = [
+                rows_view(&work.k_raw, stream, 0, rows, width, width)?,
+                rows_view(&work.v_raw, stream, 0, rows, width, width)?,
+            ];
+            blas.bind_dense_projection(
+                [weight, input, output.prefix_rows(u32::try_from(rows)?)?],
+                copies,
+                &table.blocks,
+                (role == FF_IN).then_some(work.rows % work.chunk),
+            )
+        };
+        let q = matrix(&work.q_raw, stream, work.rows, work.q_raw.len() / work.rows)?;
+        qualify(Q, work.rows, q)?;
+        qualify(FF_IN, work.chunk, work.hidden)?;
+        let tail = work.rows % work.chunk;
+        if tail > 0 {
+            qualify(FF_IN, tail, work.hidden)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         d: &Device,
         blas: &mut Blas,
         spec: &H3Spec,
-        layout: (usize, &crate::minimax_h3::PackedLayout),
+        layout: (usize, &crate::minimax_h3::PackedLayout, &AdalnTable),
         base: Source<'_>,
         lora: Option<Source<'_>>,
         (placement, visits): (Placement, usize),
@@ -5367,7 +5421,7 @@ impl Dit {
         d: &Device,
         blas: &mut Blas,
         spec: &H3Spec,
-        (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
+        (rank, layout, table): (usize, &crate::minimax_h3::PackedLayout, &AdalnTable),
         mut base: Source<'_>,
         mut lora: Option<Source<'_>>,
         (placement, visits, choose): (Placement, usize, Option<&mut VideoPlacementChooser<'_>>),
@@ -5677,7 +5731,7 @@ impl Dit {
             );
         }
         require_resident_norms(s, &blocks, &norm_out, h)?;
-        Ok(Self {
+        let dit = Self {
             ranges,
             proj_in,
             audio_proj_in,
@@ -5710,7 +5764,14 @@ impl Dit {
             trace_gate: None,
             #[cfg(test)]
             refiner_trace: None,
-        })
+        };
+        #[cfg(feature = "cuda")]
+        if !hyperflow && !d.info.arch.fp16_stored_half() {
+            dit.qualify_projections(blas, table)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = table;
+        Ok(dit)
     }
 
     /// `x = r * x + (1 - r) * (x + (1 - t) * v)` over `count` F32 latents at element `offset` of `x`, from grid
@@ -11943,7 +12004,7 @@ mod tests {
             &device,
             &mut blas,
             &spec,
-            (adapter.rank, &layout),
+            (adapter.rank, &layout, &table),
             Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
             Some(Source::new(
                 &lora_dir,
@@ -12224,7 +12285,7 @@ mod tests {
             &device,
             &mut blas,
             &spec,
-            (adapter.rank, &layout),
+            (adapter.rank, &layout, &table),
             Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
             Some(Source::new(
                 &lora_dir,
@@ -18188,7 +18249,7 @@ mod tests {
             &device,
             &mut blas,
             &spec,
-            (0, &layout),
+            (0, &layout, &table),
             Source::new(&model, &manifest, device.info.arch.fp16_stored_half()),
             None,
             (

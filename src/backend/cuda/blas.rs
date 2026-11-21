@@ -1,3 +1,5 @@
+mod dense;
+
 use super::{Device, cubin, linear_calibrate, ops::Ops};
 
 /// cuBLASLt heuristic candidates trialled per linear shape, alongside Skinny.
@@ -10,10 +12,11 @@ unsafe fn heuristic_algos(
     b: sys::cublasLtMatrixLayout_t,
     c: sys::cublasLtMatrixLayout_t,
     pref: sys::cublasLtMatmulPreference_t,
+    limit: u32,
 ) -> Result<Vec<sys::cublasLtMatmulHeuristicResult_t>> {
     let mut results = vec![
         std::mem::MaybeUninit::<sys::cublasLtMatmulHeuristicResult_t>::uninit();
-        LT_CANDIDATES as usize
+        limit as usize
     ];
     let mut count = 0i32;
     unsafe {
@@ -25,7 +28,7 @@ unsafe fn heuristic_algos(
             c,
             c,
             pref,
-            LT_CANDIDATES as i32,
+            limit as i32,
             results.as_mut_ptr().cast(),
             &mut count,
         )
@@ -305,7 +308,8 @@ impl Plan {
             )?;
             let checked = match select {
                 PlanAlgo::Heuristic(index) => {
-                    let algos = heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref)?;
+                    let algos =
+                        heuristic_algos(handle, p.desc, p.a, p.b, p.c, p.pref, LT_CANDIDATES)?;
                     ensure!(
                         (index as usize) < algos.len(),
                         "Lt heuristic returned {} algos; index {index} unavailable",
@@ -2123,7 +2127,6 @@ impl Blas {
 }
 
 impl Blas {
-    #[cfg(test)]
     pub(crate) fn workspace_bytes(&self) -> usize {
         self.workspace.borrow().len()
     }
