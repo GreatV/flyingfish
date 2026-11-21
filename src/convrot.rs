@@ -462,7 +462,8 @@ mod tests {
                 MFastLdsm,
                 MFastStriped {
                     tiles: 59,
-                    stripes: 5
+                    stripes: 5,
+                    one_barrier: true,
                 }
             ]
         );
@@ -481,7 +482,8 @@ mod tests {
                 MFastLdsm,
                 MFastStriped {
                     tiles: 19,
-                    stripes: 16
+                    stripes: 16,
+                    one_barrier: false,
                 }
             ]
         );
@@ -648,6 +650,7 @@ pub struct ConvrotFns {
     product: [crate::backend::gpu::CudaFunction; 3],
     arch: crate::backend::setup::DeviceArchitecture,
     striped: bool,
+    m_fast_one_barrier: Option<crate::backend::gpu::CudaFunction>,
     n_fast_swizzled: Option<crate::backend::gpu::CudaFunction>,
     table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
     max_group: u32,
@@ -678,7 +681,11 @@ pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
 pub enum ProductKernel {
     NFast,
     MFastLdsm,
-    MFastStriped { tiles: u32, stripes: u32 },
+    MFastStriped {
+        tiles: u32,
+        stripes: u32,
+        one_barrier: bool,
+    },
     NFastLdsm,
     NFastSwizzled,
 }
@@ -748,9 +755,14 @@ impl ProductKernel {
         }
     }
 
+    const ONE_BARRIER_SYMBOL: &'static str = "convrot_product_m_fast_one_barrier";
+
     pub(crate) const fn symbol_name(self) -> &'static str {
         match self {
             Self::NFast => "convrot_product",
+            Self::MFastStriped {
+                one_barrier: true, ..
+            } => Self::ONE_BARRIER_SYMBOL,
             Self::MFastLdsm | Self::MFastStriped { .. } => "convrot_product_m_fast",
             Self::NFastLdsm => "convrot_product_n_fast_ldsm",
             Self::NFastSwizzled => "convrot_product_n_fast_swizzled",
@@ -837,6 +849,10 @@ fn gate_up_products(
                     return ProductKernel::MFastStriped {
                         tiles: tiles as u32,
                         stripes: m_tiles.div_ceil(tiles) as u32,
+                        one_barrier: info.arch
+                            == crate::backend::setup::DeviceArchitecture::Cuda(120)
+                            && (rows, k, n, tiles, m_tiles.div_ceil(tiles))
+                                == (37_717, 5376, 28_672, 59, 5),
                     };
                 }
             }
@@ -995,7 +1011,22 @@ pub(crate) fn gate_up_product_order(
         && n.saturating_mul(k) > info.l2_bytes
     {
         let active = product_active_ctas(device, ProductKernel::MFastLdsm)?;
-        gate_up_products(info, active, row_counts, (k, n))
+        let selected = gate_up_products(info, active, row_counts, (k, n));
+        if let Some(&kernel) = selected.iter().find(|p| {
+            matches!(
+                p,
+                ProductKernel::MFastStriped {
+                    one_barrier: true,
+                    ..
+                }
+            )
+        }) {
+            ensure!(
+                product_active_ctas(device, kernel)? == active,
+                "one-barrier stripe residency changed"
+            );
+        }
+        selected
     } else {
         [ProductKernel::NFast; 2]
     };
@@ -1117,6 +1148,16 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     let n_fast_swizzled = (arch == crate::backend::setup::DeviceArchitecture::Cuda(120) && striped)
         .then(|| product_function(&module, &arch, ProductKernel::NFastSwizzled))
         .transpose()?;
+    let m_fast_one_barrier = if n_fast_swizzled.is_some() {
+        let f = module.load_function(ProductKernel::ONE_BARRIER_SYMBOL)?;
+        crate::backend::cuda::set_max_dynamic_shared_bytes(
+            &f,
+            ProductKernel::MFastLdsm.shared_mem_bytes(&arch),
+        )?;
+        Some(f)
+    } else {
+        None
+    };
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
         hadamard,
@@ -1126,6 +1167,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         arch,
         striped,
         n_fast_swizzled,
+        m_fast_one_barrier,
         product,
         table: std::sync::Mutex::new(None),
         max_group,
@@ -1201,13 +1243,24 @@ pub(crate) fn launch_product(
     let (product, grid) = match args.product {
         ProductKernel::NFast => (&fns.product[0], (n, m, 1)),
         ProductKernel::MFastLdsm => (&fns.product[1], (m, n, 1)),
-        ProductKernel::MFastStriped { tiles, stripes } => {
+        ProductKernel::MFastStriped {
+            tiles,
+            stripes,
+            one_barrier,
+        } => {
             ensure!(
                 fns.striped && tiles > 0 && tiles <= m && stripes == m.div_ceil(tiles),
                 "ConvRot striped product arch={} m_tiles={m} tiles={tiles} stripes={stripes}",
                 fns.arch
             );
-            (&fns.product[1], (tiles, n, stripes))
+            let kernel = if one_barrier {
+                fns.m_fast_one_barrier
+                    .as_ref()
+                    .context("one-barrier product requires sm120")?
+            } else {
+                &fns.product[1]
+            };
+            (kernel, (tiles, n, stripes))
         }
         ProductKernel::NFastLdsm => (&fns.product[2], (n, m, 1)),
         ProductKernel::NFastSwizzled => (
@@ -2684,20 +2737,14 @@ mod device {
         stream.clone_dtoh(&y_d).context("convrot product download")
     }
 
-    fn check_gate_up_product(device: &Device) -> Result<()> {
-        let (rows, k, n) = (1509, 5376, 28672);
-        let active = super::product_active_ctas(device, ProductKernel::MFastLdsm)?;
-        let expected_order = super::gate_up_products(&device.info, active, [rows, 1501], (k, n));
-        ensure!(
-            super::gate_up_product_order(device, [rows, 1501], (k, n))? == expected_order,
-            "gate/up M-fast selection mismatch on {}",
-            device.info.arch
-        );
-        ensure!(
-            super::gate_up_product_order(device, [39_740, 42], (k, n))?[1] == ProductKernel::NFast,
-            "gate/up M-fast enabled below 2 M tiles"
-        );
-        let (codes, scales, qweight, wscale) = fixture(rows, k, n);
+    fn fixture_product_oracle<'a>(
+        codes: &[i8],
+        scales: &'a [f32],
+        qweight: &[i8],
+        wscale: &'a [f32],
+        k: usize,
+    ) -> impl Fn(&[bf16]) -> usize + use<'a> {
+        let n = wscale.len();
         let period = PRODUCT_FIXTURE_PERIOD;
         // Codes and weight rows have period 251; scales are indexed by the original coordinates.
         let mut accumulators = Vec::with_capacity(period * period);
@@ -2711,7 +2758,7 @@ mod device {
                 );
             }
         }
-        let diff = |output: &[bf16]| {
+        move |output: &[bf16]| {
             output
                 .chunks_exact(n)
                 .enumerate()
@@ -2728,7 +2775,76 @@ mod device {
                         .count()
                 })
                 .sum::<usize>()
-        };
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "sm120 GPU window; validates the prime, drain and first shared-slot reuse"]
+    fn convrot_gate_up_one_barrier_panels() -> Result<()> {
+        let device = Device::new(0)?;
+        ensure!(device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120));
+        for rows in [127usize, 128, 129] {
+            for k in [64, 128, 192] {
+                let n = 257;
+                let (mut codes, scales, mut weights, wscale) = fixture(rows, k, n);
+                let diff = fixture_product_oracle(&codes, &scales, &weights, &wscale, k);
+                let stripes = u32::try_from(rows.div_ceil(128))?;
+                let order = |one_barrier| ProductKernel::MFastStriped {
+                    tiles: 1,
+                    stripes,
+                    one_barrier,
+                };
+                for flag in [false, true] {
+                    let output = launch_product_at(
+                        &device,
+                        &codes,
+                        &scales,
+                        &weights,
+                        &wscale,
+                        k,
+                        (0, 0, order(flag)),
+                    )?;
+                    ensure!(
+                        output.len() == rows * n && diff(&output) == 0,
+                        "panel oracle rows={rows} k={k} one_barrier={flag}"
+                    );
+                }
+                if k == 192 {
+                    for row in codes.chunks_exact_mut(k).chain(weights.chunks_exact_mut(k)) {
+                        row.copy_within(0..64, 128);
+                    }
+                    let stale = launch_product_at(
+                        &device,
+                        &codes,
+                        &scales,
+                        &weights,
+                        &wscale,
+                        k,
+                        (0, 0, order(true)),
+                    )?;
+                    ensure!(diff(&stale) > 0, "stale third panel matched at {rows} rows");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_gate_up_product(device: &Device) -> Result<()> {
+        let (rows, k, n) = (1509, 5376, 28672);
+        let active = super::product_active_ctas(device, ProductKernel::MFastLdsm)?;
+        let expected_order = super::gate_up_products(&device.info, active, [rows, 1501], (k, n));
+        ensure!(
+            super::gate_up_product_order(device, [rows, 1501], (k, n))? == expected_order,
+            "gate/up M-fast selection mismatch on {}",
+            device.info.arch
+        );
+        ensure!(
+            super::gate_up_product_order(device, [39_740, 42], (k, n))?[1] == ProductKernel::NFast,
+            "gate/up M-fast enabled below 2 M tiles"
+        );
+        let (codes, scales, qweight, wscale) = fixture(rows, k, n);
+        let diff = fixture_product_oracle(&codes, &scales, &qweight, &wscale, k);
         for (rows, m_fast) in [(rows, false), (rows, true), (1501, false), (1501, true)] {
             let output = launch_product_at(
                 device,
@@ -2857,13 +2973,44 @@ mod device {
             ProductKernel::MFastStriped {
                 tiles: 59,
                 stripes: 5,
+                one_barrier: false,
             }
         } else {
             selected
         };
-        let ProductKernel::MFastStriped { tiles, stripes } = product else {
+        let ProductKernel::MFastStriped { tiles, stripes, .. } = product else {
             return Ok(());
         };
+        if matches!(
+            product,
+            ProductKernel::MFastStriped {
+                one_barrier: true,
+                ..
+            }
+        ) {
+            let (codes, scales, weights, wscale) = fixture(rows, k, n);
+            let diff = fixture_product_oracle(&codes, &scales, &weights, &wscale, k);
+            let baseline = ProductKernel::MFastStriped {
+                tiles,
+                stripes,
+                one_barrier: false,
+            };
+            for order in [baseline, product] {
+                let output = launch_product_at(
+                    device,
+                    &codes,
+                    &scales,
+                    &weights,
+                    &wscale,
+                    k,
+                    (0, 0, order),
+                )?;
+                ensure!(
+                    output.len() == rows * n && diff(&output) == 0,
+                    "production gate/up oracle {order:?}"
+                );
+            }
+        }
         let (diff, moved_rows) =
             check_product_tail(device, (rows, k, n), ProductKernel::NFast, product, 0)?;
         println!(
@@ -2876,6 +3023,7 @@ mod device {
             ProductKernel::MFastStriped {
                 tiles: 60,
                 stripes: 5,
+                one_barrier: false,
             }
         } else {
             super::gate_up_product_order(device, [padded_rows, 0], (k, n))?[0]
