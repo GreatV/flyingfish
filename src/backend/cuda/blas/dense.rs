@@ -313,13 +313,13 @@ struct Descriptor {
     shape: LinearShape,
     alignment: [u32; 4],
     workspace: usize,
-    incumbent: LtAlgorithm,
     ffn_tail: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Selection {
     descriptor: Descriptor,
+    incumbent: LtAlgorithm,
     algorithm: LtAlgorithm,
     required_workspace: usize,
     medians_ms: Vec<(LtAlgorithm, f32)>,
@@ -604,12 +604,49 @@ impl Blas {
         )?;
         Ok(Selection {
             descriptor: desc,
+            incumbent: medians_ms[0].0,
             algorithm,
             required_workspace: fixed.workspace,
             medians_ms,
             challenger_margin,
             fill_seconds: start.elapsed().as_secs_f64(),
         })
+    }
+}
+
+impl Descriptor {
+    fn selection(
+        &self,
+        runtime: &std::path::Path,
+        measure: impl FnOnce() -> Result<Selection>,
+    ) -> Result<(Selection, bool)> {
+        std::fs::create_dir_all(runtime)?;
+        // dense-v1 uses packed BF16 TN, FP32 compute/scale and the unbiased default epilogue.
+        let path = runtime.join(format!(
+            "dense-v1-{}.json",
+            crate::backend::cuda::closure::hash(&serde_json::to_vec(self)?)
+        ));
+        let read = || -> Result<(Selection, bool)> {
+            let entry: Selection = serde_json::from_slice(&std::fs::read(&path)?)?;
+            entry.validate(self)?;
+            Ok((entry, false))
+        };
+        if path.try_exists()? {
+            return read();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        lock.lock()?;
+        if path.try_exists()? {
+            return read();
+        }
+        let result = measure()?;
+        result.validate(self)?;
+        crate::backend::cuda::closure::write_cache(&path, &result)?;
+        Ok((result, true))
     }
 }
 
@@ -623,7 +660,7 @@ impl Selection {
         ensure!(
             self.fill_seconds.is_finite()
                 && self.fill_seconds >= 0.0
-                && self.medians_ms[0].0 == desc.incumbent
+                && self.medians_ms[0].0 == self.incumbent
                 && self.medians_ms[winner].0 == self.algorithm
                 && self
                     .medians_ms
@@ -707,56 +744,28 @@ impl Blas {
             shape,
             alignment: operands.alignments(),
             workspace: self.workspace_bytes(),
-            incumbent: plan.identity()?,
             ffn_tail,
         };
-        let runtime = self.calibration.runtime();
-        std::fs::create_dir_all(runtime)?;
-        // dense-v1 is packed BF16 TN, FP32 compute/scale, unbiased default epilogue.
-        let path = runtime.join(format!(
-            "dense-v1-{}.json",
-            crate::backend::cuda::closure::hash(&serde_json::to_vec(&desc)?)
-        ));
-        let read = || -> Result<Selection> { Ok(serde_json::from_slice(&std::fs::read(&path)?)?) };
-        let mut filled = false;
-        let choice = if path.try_exists()? {
-            read()?
-        } else {
-            let lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(path.with_extension("lock"))?;
-            lock.lock()?;
-            if path.try_exists()? {
-                read()?
-            } else {
-                let bytes = input
-                    .span_bytes
-                    .min(u64::from(input.shape[0]) * u64::from(input.shape[1]) * 2)
-                    as usize;
-                let (src, _guard) = source.device_ptr(&self.stream);
-                let source_bytes = std::mem::size_of::<bf16>() * source.len();
-                ensure!(source_bytes > 0, "dense setup activation is empty");
-                for at in (0..bytes).step_by(source_bytes) {
-                    unsafe {
-                        cudarc::driver::result::memcpy_dtod_async(
-                            input.ptr + at as u64,
-                            src,
-                            source_bytes.min(bytes - at),
-                            self.stream.cu_stream(),
-                        )?;
-                    }
+        let (choice, filled) = desc.selection(self.calibration.runtime(), || {
+            let bytes = input
+                .span_bytes
+                .min(u64::from(input.shape[0]) * u64::from(input.shape[1]) * 2)
+                as usize;
+            let (src, _guard) = source.device_ptr(&self.stream);
+            let source_bytes = std::mem::size_of::<bf16>() * source.len();
+            ensure!(source_bytes > 0, "dense setup activation is empty");
+            for at in (0..bytes).step_by(source_bytes) {
+                unsafe {
+                    cudarc::driver::result::memcpy_dtod_async(
+                        input.ptr + at as u64,
+                        src,
+                        source_bytes.min(bytes - at),
+                        self.stream.cu_stream(),
+                    )?;
                 }
-                let result =
-                    self.fill_dense(plan, desc.clone(), &operands, copies.map(|t| t.ptr))?;
-                result.validate(&desc)?;
-                crate::backend::cuda::closure::write_cache(&path, &result)?;
-                filled = true;
-                result
             }
-        };
-        choice.validate(&desc)?;
+            self.fill_dense(plan, desc.clone(), &operands, copies.map(|t| t.ptr))
+        })?;
         let algo = self.restore_dense_algo(choice.algorithm)?;
         let bound = Plan::build(
             self.handle,
@@ -833,11 +842,11 @@ mod tests {
             },
             alignment: [256; 4],
             workspace: 0,
-            incumbent: parent,
             ffn_tail: None,
         };
         let mut cached = Selection {
             descriptor: descriptor.clone(),
+            incumbent: parent,
             algorithm: alt,
             required_workspace: 0,
             medians_ms: vec![(parent, 100.0), (alt, 97.0)],
@@ -855,6 +864,23 @@ mod tests {
         cached.validate(&descriptor)?;
         cached.challenger_margin = Some(0.04);
         assert!(cached.validate(&descriptor).is_err());
+        cached.challenger_margin = Some(0.02);
+        let dir = std::env::temp_dir().join(format!("ff-dense-lt-reorder-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let (first, filled) = descriptor.selection(&dir, || Ok(cached))?;
+        assert!(filled);
+        let reordered = [alt, parent];
+        let (warm, filled) = descriptor.selection(&dir, || {
+            anyhow::bail!(
+                "reordered rank zero {:?} triggered a new fill",
+                reordered[0]
+            )
+        })?;
+        assert!(!filled);
+        assert_eq!(warm.incumbent, first.incumbent);
+        assert_eq!(warm.algorithm, first.algorithm);
+        assert_ne!(warm.algorithm, reordered[0]);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 }
