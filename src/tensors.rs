@@ -251,6 +251,16 @@ mod tests {
         assert_eq!(one[0].to_bits(), 0x3c00);
     }
 
+    #[test]
+    fn sm75_conditioner_text_stores_fp16_one() {
+        let mut one = [half::bf16::from_f32(1.0)];
+        bf16_table_to_runtime_half("image_text", &mut one).unwrap();
+        assert_eq!(one[0].to_bits(), 0x3c00);
+        let mut video = [half::bf16::from_f32(1.0)];
+        bf16_table_to_runtime_half("video_text", &mut video).unwrap();
+        assert_eq!(video[0].to_bits(), 0x3c00);
+    }
+
     fn word(sign: u16, exp: u16, man: u16) -> [u8; 2] {
         ((sign << 15) | (exp << 7) | man).to_le_bytes()
     }

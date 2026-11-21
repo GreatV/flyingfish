@@ -717,7 +717,13 @@ fn run_mode<const SETUP_ONLY: bool>(
     )?;
     let (text, anchors) = match &draws {
         #[cfg(test)]
-        NoiseDraws::Recorded(input) => (input.conditioner.clone(), input.anchors.clone()),
+        NoiseDraws::Recorded(input) => {
+            let mut text = input.conditioner.clone();
+            if super::fp16_stored_half(&device.info.arch) {
+                crate::tensors::bf16_table_to_runtime_half("video_text", &mut text)?;
+            }
+            (text, input.anchors.clone())
+        }
         NoiseDraws::Seed(_) => (
             condition(&device, &mut blas, model, request)?,
             keyframes(&device, &blas, model, request, noise.posterior_eps.as_ref())?,
@@ -836,6 +842,29 @@ fn run_mode<const SETUP_ONLY: bool>(
     Ok(generated)
 }
 
+pub(super) fn video_latent_entry(values: &[f32], fp16: bool) -> Result<Vec<bf16>> {
+    let mut rounded: Vec<bf16> = values.iter().copied().map(bf16::from_f32).collect();
+    ensure!(
+        rounded.iter().all(|x| x.is_finite()),
+        "video latent input is nonfinite after BF16 entry cast"
+    );
+    if fp16 {
+        crate::tensors::bf16_table_to_runtime_half("video_latent", &mut rounded)?;
+    }
+    Ok(rounded)
+}
+
+#[cfg(test)]
+#[test]
+fn sm75_vae_latent_entry_stores_fp16_one() {
+    let fp16 = video_latent_entry(&[1.0, 0.5, -1.0], true).unwrap();
+    assert_eq!(fp16[0].to_bits(), 0x3c00);
+    assert_eq!(fp16[1].to_bits(), 0x3800);
+    assert_eq!(fp16[2].to_bits(), 0xbc00);
+    let kept = video_latent_entry(&[1.0], false).unwrap();
+    assert_eq!(kept[0].to_bits(), 0x3f80);
+}
+
 fn video_decode_device(
     (device, blas): (&Device, &Blas),
     (decoder, work, tiles): (&VideoDecoder, &mut TileWork, &VaeTiles),
@@ -845,11 +874,7 @@ fn video_decode_device(
     let s = &device.stream;
     let mut decoded =
         s.alloc_zeros::<bf16>(vae.out_channels * total_frames * geometry.height * geometry.width)?;
-    let rounded: Vec<_> = video_latents.iter().copied().map(bf16::from_f32).collect();
-    ensure!(
-        rounded.iter().all(|x| x.is_finite()),
-        "video latent input is nonfinite after BF16 entry cast"
-    );
+    let rounded = video_latent_entry(video_latents, super::fp16_stored_half(&device.info.arch))?;
     let latents = s.clone_htod(&rounded)?;
     drop(rounded);
     let plan = decoder.decode(
@@ -4034,7 +4059,12 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
                 spec: &spec,
                 lora_scale: scale,
             };
-            let text = device.stream.clone_htod(&input.conditioner)?;
+            let text = super::upload_runtime_half(
+                &device.stream,
+                super::fp16_stored_half(&device.info.arch),
+                "video_text",
+                &input.conditioner,
+            )?;
             println!(
                 "HYPERFLOW_CASE_START case={case} phase=teacher steps=6 utc={}",
                 composition_stamp()?
@@ -4689,7 +4719,16 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
         let row_timesteps = s.clone_htod(&plan.row_timesteps[0])?;
         let mut velocities = std::collections::BTreeMap::new();
         for (name, values) in conditioning {
-            let text = s.clone_htod(&values)?;
+            let text = if name == "native" {
+                s.clone_htod(&values)?
+            } else {
+                super::upload_runtime_half(
+                    s,
+                    super::fp16_stored_half(&device.info.arch),
+                    "video_text",
+                    &values,
+                )?
+            };
             dit.step(
                 &context,
                 &table,

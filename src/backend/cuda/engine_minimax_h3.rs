@@ -7920,7 +7920,12 @@ mod tests {
             let input: Vec<bf16> = (0..rows * spec.hidden)
                 .map(|i| bf16::from_f32(((i * 37 % 509) as f32 - 254.0) / 127.0))
                 .collect();
-            let mut x = s.clone_htod(&input)?;
+            let mut x = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "block_hidden",
+                &input,
+            )?;
             let context = BlockContext {
                 s,
                 blas: &blas,
@@ -10081,7 +10086,12 @@ mod tests {
                 host.iter().all(|v| v.is_finite()),
                 "RUNNER_FAIL nonfinite refiner input"
             );
-            let input = stream.clone_htod(&host)?;
+            let input = upload_runtime_half(
+                stream,
+                fp16_stored_half(&device.info.arch),
+                "block_hidden",
+                &host,
+            )?;
             let output = stream.alloc_zeros::<bf16>(rows * adapter.rank)?;
             let preservation = open_blas(
                 &device,
@@ -10191,7 +10201,12 @@ mod tests {
                     })
                     .collect()
             };
-            let x = stream.clone_htod(&host)?;
+            let x = upload_runtime_half(
+                stream,
+                fp16_stored_half(&device.info.arch),
+                "block_hidden",
+                &host,
+            )?;
             let initial: Vec<bf16> = (0..total * output)
                 .map(|i| bf16::from_f32(((i * 19 % 257) as f32 - 128.0) / 131.0))
                 .collect();
@@ -10243,7 +10258,12 @@ mod tests {
                         bf16::from_f32((((i * 37 + i / width * 11) % 251) as f32 - 125.0) / 127.0)
                     })
                     .collect();
-                let raw = stream.clone_htod(&values)?;
+                let raw = upload_runtime_half(
+                    stream,
+                    fp16_stored_half(&device.info.arch),
+                    "block_hidden",
+                    &values,
+                )?;
                 fixed.bind_row_family(LinearShape {
                     rows: FFN_CHUNK_ROWS,
                     output: input,
@@ -10272,7 +10292,12 @@ mod tests {
                        fixed_b: bool,
                        composed: bool|
              -> Result<Vec<bf16>> {
-                let y = stream.clone_htod(&initial)?;
+                let y = upload_runtime_half(
+                    stream,
+                    fp16_stored_half(&device.info.arch),
+                    "block_hidden",
+                    &initial,
+                )?;
                 let intermediate = stream.alloc_zeros::<bf16>(total * input)?;
                 let launch = || -> Result<()> {
                     for start in (0..total).step_by(chunk) {
@@ -10444,7 +10469,12 @@ mod tests {
                                     )
                                 })
                                 .collect();
-                            let x = stream.clone_htod(&host)?;
+                            let x = upload_runtime_half(
+                                stream,
+                                fp16_stored_half(&device.info.arch),
+                                "block_hidden",
+                                &host,
+                            )?;
                             let y = stream.alloc_zeros::<bf16>(n * output)?;
                             blas.linear_typed(
                                 crate::op_contract::ExecutionPhase::Prefill,
@@ -10579,9 +10609,12 @@ mod tests {
             let chunk = frozen["runs"][format!("{case}-derived")]["plan"]["main"]["chunk"]
                 .as_u64()
                 .context("frozen main chunk")? as usize;
-            let input: Vec<bf16> = (0..rows * spec.hidden)
+            let mut input: Vec<bf16> = (0..rows * spec.hidden)
                 .map(|i| common[((i / spec.hidden + 17) % 1511) * spec.hidden + i % spec.hidden])
                 .collect();
+            if fp16_stored_half(&device.info.arch) {
+                crate::tensors::bf16_table_to_runtime_half("block_hidden", &mut input)?;
+            }
             let runtime =
                 std::env::temp_dir().join(format!("ff-h3-alias-{}-{case}", std::process::id()));
             fs::create_dir(&runtime)?;
@@ -10649,7 +10682,15 @@ mod tests {
                         .iter()
                         .map(|b| bf16::from_le_bytes(*b))
                         .collect();
-                    Ok((s.clone_htod(&values)?, u32::try_from(view.shape()[0])?))
+                    Ok((
+                        upload_runtime_half(
+                            s,
+                            fp16_stored_half(&device.info.arch),
+                            "adaln",
+                            &values,
+                        )?,
+                        u32::try_from(view.shape()[0])?,
+                    ))
                 })
                 .collect::<Result<_>>()?;
             ensure!(
@@ -10834,7 +10875,7 @@ mod tests {
             hidden.dtype(),
             hidden.shape()
         );
-        let input: Vec<bf16> = hidden
+        let mut input: Vec<bf16> = hidden
             .data()
             .as_chunks::<2>()
             .0
@@ -10862,7 +10903,7 @@ mod tests {
         let rows_table = adaln.tensor("block0.step0")?;
         ensure!(rows_table.dtype() == Dtype::BF16, "block0.step0 dtype");
         let entries = u32::try_from(rows_table.shape()[0])?;
-        let table_host: Vec<bf16> = rows_table
+        let mut table_host: Vec<bf16> = rows_table
             .data()
             .as_chunks::<2>()
             .0
@@ -10871,9 +10912,9 @@ mod tests {
             .collect();
         let (
             final_index_host,
-            final_hidden_host,
+            mut final_hidden_host,
             final_entries,
-            final_table_host,
+            mut final_table_host,
             reference,
             captured,
         ) = {
@@ -10956,6 +10997,12 @@ mod tests {
             "rotary",
             &rotary_host,
         )?;
+        if fp16_stored_half(&device.info.arch) {
+            crate::tensors::bf16_table_to_runtime_half("block_hidden", &mut input)?;
+            crate::tensors::bf16_table_to_runtime_half("adaln", &mut table_host)?;
+            crate::tensors::bf16_table_to_runtime_half("block_hidden", &mut final_hidden_host)?;
+            crate::tensors::bf16_table_to_runtime_half("adaln", &mut final_table_host)?;
+        }
         let table = s.clone_htod(&table_host)?;
         let index = s.clone_htod(&index)?;
         let mut captured_norm_defects = 0;
@@ -11297,7 +11344,8 @@ mod tests {
             "rotary",
             &rotary_host,
         )?;
-        let table_device = s.clone_htod(&table_host)?;
+        let table_device =
+            upload_runtime_half(s, fp16_stored_half(&device.info.arch), "adaln", &table_host)?;
         let index_device = s.clone_htod(&index_host)?;
         let modulation = Modulation {
             table: &table_device,
@@ -11317,7 +11365,12 @@ mod tests {
             lora_scale: 0.0,
         };
         let mut run = |weights: &BlockWeights| -> Result<Vec<f64>> {
-            let mut x = s.clone_htod(&input_host)?;
+            let mut x = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "block_hidden",
+                &input_host,
+            )?;
             block_forward::<true>(
                 &context,
                 &mut flash,
@@ -11863,13 +11916,23 @@ mod tests {
             u32::try_from(adaln_plan.pairs.len())?,
             u32::try_from(adaln_plan.timesteps.len())?,
         );
-        let text = s.clone_htod(&text_host)?;
+        let text = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "video_text",
+            &text_host,
+        )?;
         let rotated: Vec<bf16> = text_host[spec.text_dim..]
             .iter()
             .chain(&text_host[..spec.text_dim])
             .copied()
             .collect();
-        let rotated = s.clone_htod(&rotated)?;
+        let rotated = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "video_text",
+            &rotated,
+        )?;
         let condition = layout.condition_video_rows;
         let patch = spec.video_row_width();
         let (mut control_failed, mut defects) = (false, vec![]);
@@ -12126,7 +12189,12 @@ mod tests {
             spec: &spec,
             lora_scale: adapter.scale,
         };
-        let text = s.clone_htod(&text_host)?;
+        let text = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "video_text",
+            &text_host,
+        )?;
         let condition = layout.condition_video_rows * patch;
         let mut chain = |grids: (&Schedule, &Schedule)| -> Result<[Vec<f64>; 2]> {
             let video = s.clone_htod(&video0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
@@ -12694,7 +12762,7 @@ mod tests {
             std::env::temp_dir().join(format!("ff-h3-text-{}-{layers}", std::process::id()));
         fs::create_dir(&runtime)?;
         let outcome = (|| -> Result<()> {
-            let gate = TextGate::new(layers)?;
+            let mut gate = TextGate::new(layers)?;
             let mut text_refs = Vec::new();
             let mut vision_bf16 = Vec::new();
             for (cell, _) in &gate.cells {
@@ -12723,6 +12791,11 @@ mod tests {
                 .context("hidden_states_50")?;
             let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
             let device = Device::new(0)?;
+            if fp16_stored_half(&device.info.arch) {
+                for row in gate.table.values_mut() {
+                    crate::tensors::bf16_table_to_runtime_half("image_text", row)?;
+                }
+            }
             let ops = Ops::new(&device.ctx)?;
             device.finish_upload()?;
             let blas = open_blas(
@@ -12753,16 +12826,22 @@ mod tests {
                 gate.cells.iter().zip(&text_refs).zip(&vision_bf16)
             {
                 conditioner.prepare(&blas, inputs.tokens.len())?;
+                let mut features = vision.clone();
+                if fp16_stored_half(&device.info.arch) {
+                    for row in &mut features {
+                        crate::tensors::bf16_table_to_runtime_half("vision_features", row)?;
+                    }
+                }
                 let deepstack = (0..3)
                     .map(|k| {
                         device
                             .stream
-                            .clone_htod(&vision[k + 1])
+                            .clone_htod(&features[k + 1])
                             .context("upload deepstack tap")
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let embeds =
-                    conditioner_embeds(inputs, image_token, &gate.table, &vision[0], hidden)?;
+                    conditioner_embeds(inputs, image_token, &gate.table, &features[0], hidden)?;
                 let runs = image_runs(&inputs.tokens, image_token);
                 let rope = conditioner_rope(&gate.spec, inputs)?;
                 let input = ConditionerInput {
@@ -14402,7 +14481,12 @@ mod tests {
                 u32::try_from(t2i_plan.timesteps.len())?,
             );
             let rows_d = s.clone_htod(&t2i_rows)?;
-            let text_d = s.clone_htod(&t2i_text)?;
+            let text_d = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "image_text",
+                &t2i_text,
+            )?;
             let velocity = |context: &BlockContext,
                             head: usize,
                             text: &CudaSlice<bf16>,
@@ -14617,7 +14701,12 @@ mod tests {
                 u32::try_from(edit_plan.timesteps.len())?,
             );
             let rows_d = s.clone_htod(&edit_rows)?;
-            let text_d = s.clone_htod(&edit_text)?;
+            let text_d = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "image_text",
+                &edit_text,
+            )?;
             let row_pairs = s.clone_htod(&edit_plan.row_pairs[0])?;
             let row_timesteps = s.clone_htod(&edit_plan.row_timesteps[0])?;
             dit.step(
@@ -14995,7 +15084,8 @@ mod tests {
             u32::try_from(row_plan.timesteps.len())?,
         );
         let rows_d = s.clone_htod(&rows_host)?;
-        let text_d = s.clone_htod(&text)?;
+        let text_d =
+            upload_runtime_half(s, fp16_stored_half(&device.info.arch), "image_text", &text)?;
         let mut defects = Vec::new();
         let mut score = |name: &'static str, candidate: &[f32], reference: &[f32]| -> Result<()> {
             ensure!(
@@ -15223,7 +15313,8 @@ mod tests {
             u32::try_from(row_plan.timesteps.len())?,
         );
         let rows_d = s.clone_htod(&rows_host)?;
-        let text_d = s.clone_htod(&text)?;
+        let text_d =
+            upload_runtime_half(s, fp16_stored_half(&device.info.arch), "image_text", &text)?;
         let row_pairs = s.clone_htod(&row_plan.row_pairs[0])?;
         let row_timesteps = s.clone_htod(&row_plan.row_timesteps[0])?;
         dit.step(
@@ -15797,12 +15888,20 @@ mod tests {
         } else {
             None
         };
+        let fp16 = {
+            let device = Device::new(0)?;
+            fp16_stored_half(&device.info.arch)
+        };
+        let mut text = job.text.to_vec();
+        if fp16 {
+            crate::tensors::bf16_table_to_runtime_half("image_text", &mut text)?;
+        }
         let sampled = super::image_sample_trace(
             job.model,
             job.layout,
             (0, job.runtime),
             job.rows,
-            job.text,
+            &text,
             Some(&mut trace),
             entering.as_deref(),
         )?;
@@ -16958,7 +17057,12 @@ mod tests {
                 lora_scale: 0.0,
             };
             let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
-                let mut row = s.clone_htod(&hidden)?;
+                let mut row = upload_runtime_half(
+                    s,
+                    fp16_stored_half(&device.info.arch),
+                    "block_hidden",
+                    &hidden,
+                )?;
                 let modulation = Modulation {
                     table: &projected,
                     offset: 0,
@@ -17007,7 +17111,12 @@ mod tests {
             spec: &spec,
             lora_scale: 0.0,
         };
-        let mut row = s.clone_htod(&hidden)?;
+        let mut row = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "block_hidden",
+            &hidden,
+        )?;
         let modulation = Modulation {
             table: &projected,
             offset: 0,
@@ -17107,7 +17216,12 @@ mod tests {
                 lora_scale: 0.0,
             };
             let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
-                let mut row = s.clone_htod(&ragged_hidden)?;
+                let mut row = upload_runtime_half(
+                    s,
+                    fp16_stored_half(&device.info.arch),
+                    "block_hidden",
+                    &ragged_hidden,
+                )?;
                 let modulation = Modulation {
                     table: &projected,
                     offset: 0,
@@ -18029,7 +18143,12 @@ mod tests {
             .collect();
         let key_elems = STEP_KEY * STEP_VIDEO_WIDTH;
         let generated_elems = STEP_GENERATED * STEP_VIDEO_WIDTH;
-        let text = s.clone_htod(&text_host)?;
+        let text = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "video_text",
+            &text_host,
+        )?;
         let video = s.clone_htod(&video_host)?;
         let audio = s.clone_htod(&audio_init)?;
         let mut refiner_seen = None;
@@ -18258,7 +18377,12 @@ mod tests {
         let kernels = BlockKernels::new(&device.ctx)?;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
-        let hidden = s.clone_htod(&vec![bf16::from_f32(1.0); rows * spec.hidden])?;
+        let hidden = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "block_hidden",
+            &vec![bf16::from_f32(1.0); rows * spec.hidden],
+        )?;
         let rotary = s.alloc_zeros::<bf16>(rows * 6 * spec.rope_freq_dim)?;
         let entries = MODALITIES;
         let table = s.alloc_zeros::<bf16>(entries as usize * 6 * spec.hidden)?;

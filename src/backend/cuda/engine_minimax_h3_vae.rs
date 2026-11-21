@@ -3875,9 +3875,12 @@ pub(crate) mod image_tests {
                             == TileWork::batch_bytes(&spec, tile, work.batch, tiles.count())?,
                         "RUNNER_FAIL capacity workspace count"
                     );
-                    let input: Vec<_> = (0..count)
+                    let mut input: Vec<_> = (0..count)
                         .map(|i| bf16::from_f32(((i * 73 % 65521) as f32 - 32760.0) / 8192.0))
                         .collect();
+                    if super::super::fp16_stored_half(&d.info.arch) {
+                        crate::tensors::bf16_table_to_runtime_half("video_latent", &mut input)?;
+                    }
                     let input_device = s.clone_htod(&input)?;
                     let output = s.alloc_zeros::<bf16>(output_count)?;
                     let raw = s.alloc_zeros::<bf16>(tiles.count() * work.pixels())?;
@@ -4022,7 +4025,10 @@ pub(crate) mod image_tests {
             decoder.prefix_only = true;
             let mut work = TileWork::new(s, &spec, shape, (1, 1))?;
             decoder.bind(&mut blas, &work)?;
-            let rounded: Vec<_> = values.iter().copied().map(bf16::from_f32).collect();
+            let rounded = super::super::pipeline::video_latent_entry(
+                &values,
+                super::super::fp16_stored_half(&device.info.arch),
+            )?;
             let input = s.clone_htod(&rounded)?;
             let raw = s.alloc_zeros::<bf16>(work.pixels())?;
             decoder.tile(
@@ -5485,7 +5491,7 @@ pub(crate) mod image_tests {
             VAE_TILE / spec.spatial_ratio,
         );
         let count = spec.latent_channels * shape.0 * shape.1 * shape.2;
-        let input_host: Vec<_> = (0..count)
+        let mut input_host: Vec<_> = (0..count)
             .map(|i| bf16::from_f32((((i * 73 + 17) % 65521) as f32 - 32760.0) / 8192.0))
             .collect();
         let runtime =
@@ -5495,6 +5501,9 @@ pub(crate) mod image_tests {
             let d = Device::new(0)?;
             let s = &d.stream;
             let ops = Ops::new(&d.ctx)?;
+            if super::super::fp16_stored_half(&d.info.arch) {
+                crate::tensors::bf16_table_to_runtime_half("video_latent", &mut input_host)?;
+            }
             let mut blas = super::super::open_blas(
                 &d,
                 &ops,
