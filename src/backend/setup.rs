@@ -49,19 +49,20 @@ impl DeviceInfo {
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LtOperand {
+    #[cfg(any(test, feature = "cuda"))]
     F32,
     F16,
     Bf16,
 }
 
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) const fn lt_compute_operand() -> LtOperand {
     LtOperand::F32
 }
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) const IMAGE_D128_RESIDUAL: &str = "attention_prefill_d128_bidirectional";
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) const IMAGE_D128_SINGLE_PV: &str = "attention_prefill_d128_bidirectional_single_pv";
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) const CONDITIONER_D128: &str = "attention_prefill_d128";
@@ -97,6 +98,7 @@ impl DeviceArchitecture {
         }
     }
 
+    #[cfg(any(test, feature = "cuda"))]
     pub(crate) fn published_f32_lt(&self) -> LtOperand {
         match self {
             Self::Cuda(_) | Self::Hip(_) => LtOperand::F32,
@@ -104,6 +106,7 @@ impl DeviceArchitecture {
     }
 
     /// Image D128 full attention. sm80+ keeps the single-probability body.
+    #[cfg(any(test, feature = "cuda"))]
     pub(crate) fn image_d128_full_symbol(&self) -> &'static str {
         match self {
             Self::Cuda(sm) if *sm >= 80 => IMAGE_D128_SINGLE_PV,

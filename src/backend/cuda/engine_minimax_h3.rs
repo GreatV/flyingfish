@@ -80,7 +80,9 @@ fn upload_runtime_half(
     } else {
         table
     };
-    Ok(stream.clone_htod(bits)?)
+    stream
+        .clone_htod(bits)
+        .with_context(|| format!("upload {name}"))
 }
 
 fn equal_int8_bf16_rate(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
@@ -749,10 +751,17 @@ impl EntryReader {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn ensure_fp16(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
         if self.fp16_weights.is_none() {
             self.fp16_weights = Some(cubin::capability(stream.context())? < 80);
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "rocm")]
+    fn ensure_fp16(&mut self, _stream: &Arc<CudaStream>) -> Result<()> {
+        self.fp16_weights = Some(false);
         Ok(())
     }
 
@@ -2162,6 +2171,10 @@ impl BlockKernels {
             gated_active >= baseline,
             "gated_add_rms_norm_modulate occupancy {gated_active} below rms_norm_bf16 {baseline}"
         );
+        #[cfg(feature = "cuda")]
+        let sm = cubin::capability(ctx)?;
+        #[cfg(not(feature = "cuda"))]
+        let sm = 80u32;
         Ok(Self {
             norm: plain,
             norm_f32,
@@ -2185,7 +2198,7 @@ impl BlockKernels {
             modulate_module,
             act_module,
             rope_module,
-            sm: cubin::capability(ctx)?,
+            sm,
             stored_launch: std::sync::OnceLock::new(),
         })
     }
@@ -3558,6 +3571,7 @@ struct ModulateRows {
 }
 
 // sm >= 80 cubins do not define ff_fp16_store_fault.
+#[cfg(feature = "cuda")]
 fn prepare_fp16_store_at(sm: u32, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
     if sm >= 80 {
         return Ok(());
@@ -3572,6 +3586,13 @@ fn prepare_fp16_store_at(sm: u32, s: &Arc<CudaStream>, module: &Arc<CudaModule>)
     Ok(())
 }
 
+#[cfg(feature = "rocm")]
+fn prepare_fp16_store_at(sm: u32, _s: &Arc<CudaStream>, _module: &Arc<CudaModule>) -> Result<()> {
+    ensure!(sm >= 80, "ROCm keeps BF16; FP16 store check requires CUDA");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn finish_fp16_store_at(
     sm: u32,
     s: &Arc<CudaStream>,
@@ -3593,6 +3614,17 @@ fn finish_fp16_store_at(
         bytes == [0u8; 4],
         "FP16 store of {tensor} is non-finite or above 65504"
     );
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn finish_fp16_store_at(
+    sm: u32,
+    _s: &Arc<CudaStream>,
+    _module: &Arc<CudaModule>,
+    _tensor: &str,
+) -> Result<()> {
+    ensure!(sm >= 80, "ROCm keeps BF16; FP16 store check requires CUDA");
     Ok(())
 }
 
@@ -4334,7 +4366,7 @@ fn bind_layers(
     let tier = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
-        let fp16 = cubin::capability(&d.ctx)? < 80;
+        let fp16 = fp16_stored_half(&d.info.arch);
         let mut dense =
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         let mut requests = Vec::new();
@@ -4971,7 +5003,7 @@ fn place_stored_layers(
     let mut tier = None;
     if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
-        let fp16 = cubin::capability(&d.ctx)? < 80;
+        let fp16 = fp16_stored_half(&d.info.arch);
         let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
             &dir,
             base.manifest,
@@ -14430,7 +14462,10 @@ mod tests {
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
             .minimax_h3_image_manifest(&image_spec)?;
         let device = Device::new(0)?;
+        #[cfg(feature = "cuda")]
         let sm = cubin::capability(&device.ctx)?;
+        #[cfg(not(feature = "cuda"))]
+        let sm = 80u32;
         println!("H3_IMAGE_DIT sm={sm}");
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
@@ -14964,7 +14999,10 @@ mod tests {
             + sizing.staging
             + sizing.transient;
         let device = Device::new(0)?;
+        #[cfg(feature = "cuda")]
         let sm = cubin::capability(&device.ctx)?;
+        #[cfg(not(feature = "cuda"))]
+        let sm = 80u32;
         println!("H3_IMAGE_4096 sm={sm}");
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
@@ -15235,13 +15273,16 @@ mod tests {
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
             .minimax_h3_image_manifest(&image_spec)?;
         let device = Device::new(0)?;
+        #[cfg(feature = "cuda")]
         let sm = cubin::capability(&device.ctx)?;
+        #[cfg(not(feature = "cuda"))]
+        let sm = 80u32;
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-image-2048-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let mut blas = open_blas(
             &device,
             &ops,
             &runtime,
